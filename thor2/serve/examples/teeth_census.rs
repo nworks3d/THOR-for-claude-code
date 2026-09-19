@@ -93,13 +93,20 @@ use thor_core::event_store::EventStore;
 /// above the write gate's own length bar. The one definition this file
 /// uses, so the printed `"answered"` field and the summary counts on stderr
 /// can never disagree about which items count.
+/// A heavy item anchored to a command answers with its own, sharper tag
+/// (ground 11, continued, 2026-09-20), so a census that only knows the
+/// generic one reports a correctly answered item as unanswered.
 fn is_answered(item: &Item) -> bool {
     if item.check.is_some() {
         return true;
     }
+    // A heavy item anchored to a COMMAND answers with its own, sharper tag
+    // (ground 11 continued, 2026-09-20). A census that only knows the generic
+    // answer reports such an item as unanswered forever, which is the opposite
+    // of what this census is for.
     item.tags.iter().any(|tag| {
         matches!(
-            teeth_answer(tag),
+            teeth_answer(tag).or_else(|| model::gate::command_teeth_answer(tag)),
             Some(TeethAnswer::Reasoned(reason)) if reason.chars().count() >= NO_LITERAL_REASON_MIN
         )
     })

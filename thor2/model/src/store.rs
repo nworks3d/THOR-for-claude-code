@@ -1263,6 +1263,22 @@ pub fn teeth_answer(tag: &str) -> Option<TeethAnswer<'_>> {
     (tag == NO_LITERAL_TAG).then_some(TeethAnswer::Bare)
 }
 
+/// The command-anchored counterpart to `NO_LITERAL_TAG`. A heavy Rule or
+/// Orientation with no check ordinarily answers the teeth question with
+/// `NO_LITERAL_TAG`/`NO_LITERAL_REASON_PREFIX` above - but not once it is
+/// also anchored to a Command: there, two concrete checks almost always
+/// exist to try first (a forbidden fragment, or a requires check for
+/// something forgotten), so the generic answer is no longer enough. See
+/// `gate::shape_problems`, ground 11 (continued, command), for the full
+/// reasoning and the refusal a writer actually sees.
+pub const NO_CATCH_ON_COMMAND_TAG: &str = "no-catch-on-command";
+
+/// The same answer, with its reason: `no-catch-on-command:<why>`. Held to
+/// the exact same shape as `NO_LITERAL_REASON_PREFIX`'s own reason (see
+/// `gate::no_literal_reason_problem`, reused rather than duplicated) - only
+/// the prefix differs.
+pub const NO_CATCH_ON_COMMAND_REASON_PREFIX: &str = "no-catch-on-command:";
+
 /// Sometimes a fact belongs exactly where it is and the place is honestly full
 /// of heavier things. The crowding debt has always SAID so - "leave it and say
 /// why" is the third of the three ways out it offers - but saying why happened
@@ -2497,10 +2513,22 @@ mod tests {
             let mut sitting = sample_with(&format!("cmd-{i}"), DISTINCT[i % DISTINCT.len()]);
             sitting.bindings =
                 vec![Binding::Target { kind: TargetKind::Command, value: "terraform apply".to_string() }];
+            // Heavy and anchored to a command, so ground 11 (continued) asks
+            // its own sharper question here - this fixture is about a FULL
+            // anchor, not about teeth, and answers it so the two grounds stay
+            // testable apart.
+            sitting.tags.push(format!(
+                "{}this fixture exists to fill an anchor and never to catch anything",
+                crate::store::NO_CATCH_ON_COMMAND_REASON_PREFIX
+            ));
             declare(&mut store, "s", "l", "t", &sitting).expect("fixture must store");
         }
         let mut newcomer = sample_with("cmd-newcomer", "a webhook retry backs off before it gives up entirely");
         newcomer.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "terraform apply".to_string() }];
+        newcomer.tags.push(format!(
+            "{}this fixture exists to fill an anchor and never to catch anything",
+            crate::store::NO_CATCH_ON_COMMAND_REASON_PREFIX
+        ));
         declare(&mut store, "s", "l", "t", &newcomer).expect_err("a full Command anchor refuses too");
     }
 

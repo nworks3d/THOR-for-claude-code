@@ -787,6 +787,48 @@ fn no_literal_reason_problem(reason: &str) -> Option<Refusal> {
     None
 }
 
+/// Whether `tag` answers the COMMAND version of the teeth question - see
+/// ground 11 (continued, command) in `shape_problems` below for when this
+/// sharper question is asked instead of the plain one `store::teeth_answer`
+/// reads. Mirrors that function exactly, one prefix pair instead of the
+/// other. `pub`: `ops::health`'s own doctor line counts this same
+/// population and must read the identical decision, never keep a second
+/// copy that could silently drift from this one.
+pub fn command_teeth_answer(tag: &str) -> Option<crate::store::TeethAnswer<'_>> {
+    if let Some(reason) = tag.strip_prefix(crate::store::NO_CATCH_ON_COMMAND_REASON_PREFIX) {
+        return Some(crate::store::TeethAnswer::Reasoned(reason.trim()));
+    }
+    (tag == crate::store::NO_CATCH_ON_COMMAND_TAG).then_some(crate::store::TeethAnswer::Bare)
+}
+
+/// The refusal ground 11 (continued, command) gives a heavy, command-anchored,
+/// checkless item - see `shape_problems` below for when this fires instead of
+/// the generic no-check refusal above it. Names the item's OWN command
+/// against both shapes that can actually catch something there, because a
+/// writer who is told what to try usually finds one.
+fn command_no_catch_refusal(command: &str) -> Refusal {
+    Refusal::new(
+        format!(
+            "this item is anchored to the command '{command}' and carries no check, so the generic \
+             '{}<why>' answer is no longer enough for it",
+            crate::store::NO_LITERAL_REASON_PREFIX
+        ),
+        format!(
+            "first TRY one of the two checks that can actually catch something at a command: a \
+             forbidden check, whose literal is the fragment that must never appear in '{command}' or \
+             in what it writes, or a requires check, whose trigger is '{command}' and whose required \
+             answers name what must be present - for something FORGOTTEN rather than written. Only \
+             once neither fits, say why: put '{}<why not>' in its tags, one plain phrase of {} to {} \
+             characters, no comma and no line break, because it travels as a tag, and only that tag \
+             lets the write through - a plain '{}<why>' no longer does.",
+            crate::store::NO_CATCH_ON_COMMAND_REASON_PREFIX,
+            crate::store::NO_LITERAL_REASON_MIN,
+            crate::store::ARCHIVE_REASON_LIMIT,
+            crate::store::NO_LITERAL_REASON_PREFIX,
+        ),
+    )
+}
+
 /// The text's own last sentence, split on a plain full stop followed by a
 /// space: `(dropped, kept)`, where `dropped` is that sentence's own length
 /// and `kept` is what the text would be with it gone. `None` for a text with
@@ -931,49 +973,109 @@ fn shape_problems(
     // doctrine forbids elsewhere: never stretch a trigger to buy a catch: it
     // would have refused three legitimate items to close a gap the
     // measurement above never found (all 7 real misses carried a severity).
+    let is_heavy =
+        item.kind.can_fire() && matches!(item.severity, Some(Severity::Irreversible) | Some(Severity::Costly));
     let names_something = candidate_literal(&item.text).is_some();
-    if ((item.kind.can_fire() && matches!(item.severity, Some(Severity::Irreversible) | Some(Severity::Costly)))
-        || (item.kind == Kind::Rule && names_something))
+    if (is_heavy || (item.kind == Kind::Rule && names_something))
         && item.check.is_none()
         && !item.tags.iter().any(|t| t.starts_with(crate::store::ANSWER_GUARD_TAG_PREFIX))
     {
-        match item.tags.iter().find_map(|t| crate::store::teeth_answer(t)) {
-            None => problems.push(Refusal::new(
-                "this item carries no check, so it can only inform while the mistake happens - and it is \
-                 either marked expensive or names something concrete in its own text",
-                format!(
-                    "first TRY a check: is there a text whose presence MEANS the mistake is happening? \
-                     If yes, add a check with that literal and revise it in - forbidden for a command or \
-                     for any file, absent for one named file, absent_all for a set of literals in one \
-                     file or directory, contains for text that must stay, requires for a trigger that \
-                     must be answered. Only once that fails, say why: put '{}<why not>' in its tags, one \
-                     plain phrase of {} to {} characters, no comma and no line break, because it travels \
-                     as a tag - and the only two honest reasons are that the same fragment also appears \
-                     in legitimate use of that command (name the legitimate form), or that the mistake \
-                     leaves no text at all, an omission or a judgement. A bare '{}' no longer counts.",
-                    crate::store::NO_LITERAL_REASON_PREFIX,
-                    crate::store::NO_LITERAL_REASON_MIN,
-                    crate::store::ARCHIVE_REASON_LIMIT,
-                    crate::store::NO_LITERAL_TAG
-                ),
-            )),
-            // Only an item that already carried the bare word keeps it, and
-            // only `revise` ever says so. Re-asking every item written before
-            // the reason existed would be the wall the backlog burn was built
-            // to avoid; refusing to accept a NEW bare one costs nobody a
-            // second turn.
-            Some(crate::store::TeethAnswer::Bare) if !bare_answer_allowed => problems.push(Refusal::new(
-                format!("this item answers the teeth question with a bare '{}' and no reason", crate::store::NO_LITERAL_TAG),
-                format!(
-                    "say why nothing can catch it: tag it '{}<why not>' instead. Nothing here can verify \
-                     the reason - the point is that the next reader can disagree with it, which a bare \
-                     word gives them no way to do.",
-                    crate::store::NO_LITERAL_REASON_PREFIX
-                ),
-            )),
-            Some(crate::store::TeethAnswer::Bare) => {}
-            Some(crate::store::TeethAnswer::Reasoned(reason)) => {
-                problems.extend(no_literal_reason_problem(reason));
+        // GROUND 11 (CONTINUED, COMMAND): the plain "nothing can catch this"
+        // escape is too cheap for the one shape that almost always has
+        // something to try.
+        //
+        // MEASURED on the owner's real store, 2026-09-19: 647 rules answered
+        // the teeth question with the generic no-literal tag, and 45 of
+        // those are HEAVY facts anchored to a Command. A sample of the 45
+        // found plainly catchable ones behind that same bare escape -
+        // "never copy to the live share yourself" (a forbidden fragment,
+        // never written down) and "always run git archive with a pathspec"
+        // (a requires check, simply missing) - while only 31 of 280 heavy
+        // rules in the whole store can refuse anything at all. Teeth were
+        // then retrofitted a day later by the evaluation, the most
+        // expensive moment to add them; the cheapest is the write itself,
+        // by the person who already knows what the fact is about.
+        //
+        // So for exactly this shape - heavy, anchored to a Command, no
+        // check - the plain `no-literal:<why>` no longer satisfies the
+        // question: it takes the sharper `no-catch-on-command:<why>`
+        // instead, held to the same reason-shape rule
+        // (`no_literal_reason_problem`, reused rather than copied). Every
+        // other shape ground 11 already covers - a check present, a light
+        // fact, a heavy fact anchored only to a path, a directory, a moment
+        // or Always - is untouched: the `else` branch below is exactly the
+        // code this ground always ran.
+        let command_anchor = if is_heavy {
+            item.bindings.iter().find_map(|b| match b {
+                Binding::Target { kind: TargetKind::Command, value } => Some(value.as_str()),
+                _ => None,
+            })
+        } else {
+            None
+        };
+        if let Some(command) = command_anchor {
+            match item.tags.iter().find_map(|t| command_teeth_answer(t)) {
+                None => problems.push(command_no_catch_refusal(command)),
+                // Unlike the generic tag below, a bare command answer has no
+                // grandfathered item to protect - this tag did not exist
+                // before this ground did, so nothing could have carried it
+                // in honestly before a reason was required. It is refused
+                // unconditionally, fresh write or revise alike.
+                Some(crate::store::TeethAnswer::Bare) => problems.push(Refusal::new(
+                    format!(
+                        "this item answers the command teeth question with a bare '{}' and no reason",
+                        crate::store::NO_CATCH_ON_COMMAND_TAG
+                    ),
+                    format!(
+                        "say why nothing can catch it at this command: tag it '{}<why not>' instead. \
+                         Nothing here can verify the reason - the point is that the next reader can \
+                         disagree with it, which a bare word gives them no way to do.",
+                        crate::store::NO_CATCH_ON_COMMAND_REASON_PREFIX
+                    ),
+                )),
+                Some(crate::store::TeethAnswer::Reasoned(reason)) => {
+                    problems.extend(no_literal_reason_problem(reason));
+                }
+            }
+        } else {
+            match item.tags.iter().find_map(|t| crate::store::teeth_answer(t)) {
+                None => problems.push(Refusal::new(
+                    "this item carries no check, so it can only inform while the mistake happens - and it is \
+                     either marked expensive or names something concrete in its own text",
+                    format!(
+                        "first TRY a check: is there a text whose presence MEANS the mistake is happening? \
+                         If yes, add a check with that literal and revise it in - forbidden for a command or \
+                         for any file, absent for one named file, absent_all for a set of literals in one \
+                         file or directory, contains for text that must stay, requires for a trigger that \
+                         must be answered. Only once that fails, say why: put '{}<why not>' in its tags, one \
+                         plain phrase of {} to {} characters, no comma and no line break, because it travels \
+                         as a tag - and the only two honest reasons are that the same fragment also appears \
+                         in legitimate use of that command (name the legitimate form), or that the mistake \
+                         leaves no text at all, an omission or a judgement. A bare '{}' no longer counts.",
+                        crate::store::NO_LITERAL_REASON_PREFIX,
+                        crate::store::NO_LITERAL_REASON_MIN,
+                        crate::store::ARCHIVE_REASON_LIMIT,
+                        crate::store::NO_LITERAL_TAG
+                    ),
+                )),
+                // Only an item that already carried the bare word keeps it, and
+                // only `revise` ever says so. Re-asking every item written before
+                // the reason existed would be the wall the backlog burn was built
+                // to avoid; refusing to accept a NEW bare one costs nobody a
+                // second turn.
+                Some(crate::store::TeethAnswer::Bare) if !bare_answer_allowed => problems.push(Refusal::new(
+                    format!("this item answers the teeth question with a bare '{}' and no reason", crate::store::NO_LITERAL_TAG),
+                    format!(
+                        "say why nothing can catch it: tag it '{}<why not>' instead. Nothing here can verify \
+                         the reason - the point is that the next reader can disagree with it, which a bare \
+                         word gives them no way to do.",
+                        crate::store::NO_LITERAL_REASON_PREFIX
+                    ),
+                )),
+                Some(crate::store::TeethAnswer::Bare) => {}
+                Some(crate::store::TeethAnswer::Reasoned(reason)) => {
+                    problems.extend(no_literal_reason_problem(reason));
+                }
             }
         }
     }
@@ -3489,6 +3591,159 @@ mod tests {
             value: "scripts/deploy.sh:8080".to_string(),
         }];
         assert!(declare(&item).is_ok());
+    }
+
+    // ---------------------------------------- ground 11 (continued, command)
+    //
+    // THE DEFECT THIS CLOSES. Measured on the owner's real store, 2026-09-19:
+    // 647 rules answered the teeth question with the generic no-literal tag,
+    // and 45 of those are HEAVY facts anchored to a Command. A sample of the
+    // 45 found plainly catchable ones sitting behind that same bare escape -
+    // "never copy to the live share yourself" (a forbidden fragment, never
+    // written down) and "always run git archive with a pathspec" (a requires
+    // check, simply missing) - while only 31 of 280 heavy rules in the whole
+    // store can refuse anything at all. Teeth were then retrofitted a day
+    // later by the evaluation, the most expensive moment to add them; the
+    // cheapest is the write itself, by the person who already knows what the
+    // fact is about.
+
+    /// The generic tag is no longer enough for exactly this shape: heavy,
+    /// anchored to a Command, no check. Proven with a `no-literal:<reason>`
+    /// tag already attached - a fully honest answer to the OLD question -
+    /// so the refusal is shown to fire on the SHAPE, not merely on a tag
+    /// being absent.
+    #[test]
+    fn a_heavy_command_anchored_rule_is_refused_even_with_the_generic_no_literal_tag() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "git archive".to_string() }];
+        item.severity = Some(Severity::Irreversible);
+        item.tags = vec![format!(
+            "{}an authorised run looks exactly like an unauthorised one",
+            crate::store::NO_LITERAL_REASON_PREFIX
+        )];
+        let err = declare(&item).unwrap_err();
+        assert!(err.fix.contains("forbidden check"), "names the forbidden shape: {}", err.fix);
+        assert!(err.fix.contains("requires check"), "names the requires shape: {}", err.fix);
+        assert!(err.fix.contains("git archive"), "names the item's own command: {}", err.fix);
+    }
+
+    #[test]
+    fn a_reasoned_no_catch_on_command_tag_lets_a_heavy_command_anchored_rule_in() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "git archive".to_string() }];
+        item.severity = Some(Severity::Irreversible);
+        item.tags = vec![format!(
+            "{}the pathspec is chosen at call time and is never one fixed fragment",
+            crate::store::NO_CATCH_ON_COMMAND_REASON_PREFIX
+        )];
+        assert!(
+            declare(&item).is_ok(),
+            "a properly reasoned command-teeth answer must satisfy the sharper question"
+        );
+    }
+
+    /// The defect the plain ground already closed for `no-literal`, proven
+    /// again for the sharper tag: a bare answer with no reason must be
+    /// refused, never silently accepted the way the generic tag's bare form
+    /// once was.
+    #[test]
+    fn a_bare_no_catch_on_command_answer_with_no_reason_is_refused() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "git archive".to_string() }];
+        item.severity = Some(Severity::Irreversible);
+        item.tags = vec![crate::store::NO_CATCH_ON_COMMAND_TAG.to_string()];
+        let err = declare(&item).unwrap_err();
+        assert!(err.problem.contains("no reason"), "names what is missing: {}", err.problem);
+        assert!(
+            err.fix.contains(crate::store::NO_CATCH_ON_COMMAND_REASON_PREFIX),
+            "names the way out: {}",
+            err.fix
+        );
+    }
+
+    /// A check already answers the question regardless of anchor - this
+    /// narrower ground must never ask AGAIN once one is present, whichever
+    /// of the two shapes its own refusal text names above.
+    #[test]
+    fn a_heavy_command_anchored_fact_with_a_check_is_unaffected() {
+        let mut forbidden_item = base(Kind::Rule);
+        forbidden_item.bindings =
+            vec![Binding::Target { kind: TargetKind::Command, value: "git archive".to_string() }];
+        forbidden_item.severity = Some(Severity::Irreversible);
+        forbidden_item.check = Some(Check::Forbidden { literals: vec!["--force".to_string()] });
+        assert!(declare(&forbidden_item).is_ok(), "a forbidden check still needs no teeth tag at all");
+
+        let mut requires_item = base(Kind::Rule);
+        requires_item.bindings =
+            vec![Binding::Target { kind: TargetKind::Command, value: "git archive".to_string() }];
+        requires_item.severity = Some(Severity::Costly);
+        requires_item.check =
+            Some(Check::Requires { when: "git archive".to_string(), required: vec!["pathspec".to_string()] });
+        assert!(declare(&requires_item).is_ok(), "a requires check still needs no teeth tag at all");
+    }
+
+    /// Proves the escape was NARROWED, not replaced: a heavy fact anchored
+    /// only to a path, or only to a moment, still passes with the plain
+    /// `no-literal:<reason>` exactly as ground 11 always accepted it.
+    #[test]
+    fn a_heavy_fact_anchored_to_a_path_or_a_moment_still_uses_the_plain_no_literal_escape() {
+        let mut path_item = base(Kind::Orientation);
+        path_item.severity = Some(Severity::Irreversible);
+        path_item.bindings =
+            vec![Binding::Target { kind: TargetKind::Path, value: "server/lib/deploy.js".to_string() }];
+        path_item.tags = vec![format!(
+            "{}an authorised deploy looks exactly like an unauthorised one",
+            crate::store::NO_LITERAL_REASON_PREFIX
+        )];
+        assert!(declare(&path_item).is_ok(), "a path anchor keeps the plain no-literal escape");
+
+        let mut moment_item = base(Kind::Rule);
+        moment_item.severity = Some(Severity::Costly);
+        moment_item.bindings = vec![Binding::Moment(Action::Push)];
+        moment_item.tags = vec![format!(
+            "{}an authorised push looks exactly like an unauthorised one",
+            crate::store::NO_LITERAL_REASON_PREFIX
+        )];
+        assert!(declare(&moment_item).is_ok(), "a moment anchor keeps the plain no-literal escape");
+    }
+
+    /// An unrated fact claims nothing about cost, command anchor or not - it
+    /// needs neither the generic nor the sharper tag.
+    #[test]
+    fn a_command_anchored_fact_with_no_severity_needs_neither_tag() {
+        let mut item = base(Kind::Orientation);
+        item.severity = None;
+        item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "git archive".to_string() }];
+        assert!(declare(&item).is_ok());
+    }
+
+    /// Mirrors `raising_an_existing_light_rule_to_heavy_asks_the_question_
+    /// before_it_lands` above: a revise that turns an existing fact into
+    /// THIS shape (heavy, Command-anchored, checkless) is refused the same
+    /// way a fresh write is - the generic tag alone does not satisfy it on a
+    /// revise any more than it does on a declare.
+    #[test]
+    fn revising_a_command_anchored_fact_into_heavy_asks_the_command_question_before_it_lands() {
+        let mut light = base(Kind::Rule);
+        light.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "git archive".to_string() }];
+        light.severity = Some(Severity::HouseStyle);
+        assert!(declare(&light).is_ok(), "fixture sanity: it goes in as it stands");
+
+        let mut now_heavy = light.clone();
+        now_heavy.severity = Some(Severity::Costly);
+        let err = revise(&light, &now_heavy).unwrap_err();
+        assert!(
+            err.fix.contains("requires check"),
+            "calling a command-anchored fact expensive must trigger the sharper question: {}",
+            err.fix
+        );
+
+        let mut answered = now_heavy.clone();
+        answered.tags = vec![format!(
+            "{}the pathspec is chosen at call time and is never one fixed fragment",
+            crate::store::NO_CATCH_ON_COMMAND_REASON_PREFIX
+        )];
+        assert!(revise(&light, &answered).is_ok(), "and the sharper answer lets the re-rating through");
     }
 
     // -------------------------------------------------------- ground 16

@@ -378,13 +378,40 @@ pub fn proof_line(db: &Path) -> String {
             None => {}
         }
     }
+    // THE NEW POPULATION, since gate ground 11 (continued, command) started
+    // asking a heavy Command-anchored fact the SHARPER question
+    // (`model::gate::command_teeth_answer`) instead of the plain one just
+    // above (`model::store::teeth_answer`): how many answered it with
+    // `no-catch-on-command:<why>`. Counted separately, never folded into
+    // `answered_no` above - the two loops read two different tags, on
+    // purpose, the same way the gate itself now reads only one of them
+    // depending on the item's own shape.
+    let mut command_answered_no = 0usize;
+    for i in &fireable {
+        let heavy = matches!(
+            i.item.severity,
+            Some(model::item::Severity::Irreversible) | Some(model::item::Severity::Costly)
+        );
+        let command_bound = i.item.bindings.iter().any(|b| {
+            matches!(b, model::item::Binding::Target { kind: model::item::TargetKind::Command, .. })
+        });
+        if heavy
+            && command_bound
+            && i.item.check.is_none()
+            && i.item.tags.iter().find_map(|t| model::gate::command_teeth_answer(t)).is_some()
+        {
+            command_answered_no += 1;
+        }
+    }
     format!(
         "provable rules: {} of {} rule(s)/orientation(s) carry a runnable check ({:.1}%) - of those, \
          {forbidding} can refuse a write that introduces something forbidden, {location} can refuse a \
          write for landing in a place that is out of bounds, {protecting} can only refuse one that \
          removes a required line from their own file, and {blocks_nothing} block nothing at all; \
          {answered_no} other rule(s) were asked and answered that nothing can catch them, {without_reason} \
-         of those without saying why (a bare answer nothing will ask about again)",
+         of those without saying why (a bare answer nothing will ask about again), and \
+         {command_answered_no} of those anchored to a command answered with the sharper \
+         no-catch-on-command tag instead",
         with_check,
         fireable.len(),
         100.0 * with_check as f64 / fireable.len() as f64
@@ -3312,6 +3339,46 @@ mod tests {
         let line = proof_line(&db);
         assert!(line.contains("0 of 1"), "a store with no provable rule must say so: {line}");
         assert!(line.contains("block"), "and say what the number decides: {line}");
+    }
+
+    /// THE NEW POPULATION, since gate ground 11 (continued, command) started
+    /// asking a heavy Command-anchored fact the SHARPER question instead of
+    /// the plain one: how many answered it with `no-catch-on-command:<why>`
+    /// must show up on this same line, not just the plainer
+    /// `no-literal:<why>` bucket the line already counted - and a plain
+    /// no-literal answer on a PATH anchor must not be mistaken for one.
+    #[test]
+    fn the_proof_line_counts_heavy_command_anchored_rules_answered_with_the_sharper_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut s = EventStore::new(&db).unwrap();
+
+            let mut command_answered = rule("command-anchored-no-catch");
+            command_answered.text = "an archive run never skips the owner's own pathspec".to_string();
+            command_answered.severity = Some(model::item::Severity::Irreversible);
+            command_answered.bindings =
+                vec![Binding::Target { kind: TargetKind::Command, value: "git archive".to_string() }];
+            command_answered.tags = vec![format!(
+                "{}the pathspec is chosen at call time and is never one fixed fragment",
+                store::NO_CATCH_ON_COMMAND_REASON_PREFIX
+            )];
+            store::declare(&mut s, "s", "l", "a", &command_answered).unwrap();
+
+            let mut path_answered = rule("path-anchored-no-literal");
+            path_answered.text = "a webhook retry backs off before it gives up entirely".to_string();
+            path_answered.project = Some("fixture-project".to_string());
+            path_answered.severity = Some(model::item::Severity::Irreversible);
+            path_answered.bindings =
+                vec![Binding::Target { kind: TargetKind::Path, value: "server/lib/mail.js".to_string() }];
+            path_answered.tags = vec![format!(
+                "{}an authorised send looks exactly like an unauthorised one",
+                store::NO_LITERAL_REASON_PREFIX
+            )];
+            store::declare(&mut s, "s", "l", "a", &path_answered).unwrap();
+        }
+        let line = proof_line(&db);
+        assert!(line.contains("1 of those anchored to a command"), "names the new population: {line}");
     }
 
     /// THE INVERSION THIS REPORTS. Severity is the first ranking key, so a

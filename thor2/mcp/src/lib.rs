@@ -2930,7 +2930,17 @@ mod tests {
             // one is bound Always, so there is no literal to forbid: banning
             // "--force" everywhere would refuse the sentence that documents the
             // rule. The tag is the honest answer, not a way around the gate.
-            tags: vec![format!("{}a test fixture with nothing literal to catch", model::store::NO_LITERAL_REASON_PREFIX)],
+            // Carries BOTH teeth answers on purpose: the tests below rebind this
+            // fixture to a command target, and a heavy command-anchored item needs
+            // the sharper answer (ground 11, continued) while the unbound form needs
+            // the generic one. Saying both keeps one fixture usable for either shape.
+            tags: vec![
+                format!("{}a test fixture with nothing literal to catch", model::store::NO_LITERAL_REASON_PREFIX),
+                format!(
+                    "{}a test fixture whose command has nothing to catch either",
+                    model::store::NO_CATCH_ON_COMMAND_REASON_PREFIX
+                ),
+            ],
             expires: None,
             key: None,
             falsifier: Some("a force-push to main lands clean, nobody reverts it".to_string()),

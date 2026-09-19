@@ -2144,13 +2144,30 @@ const TEETH_DEBT_BATCH_MAX: usize = 5;
 /// below for good, in every future session - which already subsumes
 /// anything a same-session floor would add.
 fn teeth_debt(store: &EventStore, current_project: Option<&str>) -> Option<String> {
-    let mut candidates: Vec<(String, String, String)> = serve::live::live_items(store)
+    let mut candidates: Vec<(String, String, String, bool)> = serve::live::live_items(store)
         .into_iter()
         .filter(|li| li.item.kind.can_fire())
         .filter(|li| project::applies_to(li.item.project.as_deref(), current_project))
         .filter(|li| li.item.check.is_none())
-        .filter(|li| !li.item.tags.iter().any(|t| model::store::teeth_answer(t).is_some()))
-        .filter_map(|li| model::gate::candidate_literal(&li.item.text).map(|lit| (li.id.clone(), li.item.text.clone(), lit)))
+        .filter(|li| {
+            !li.item
+                .tags
+                .iter()
+                .any(|t| model::store::teeth_answer(t).is_some() || model::gate::command_teeth_answer(t).is_some())
+        })
+        .filter_map(|li| {
+            // Which answer this item needs, decided by the gate's own rule rather
+            // than guessed here: heavy plus a command anchor means the sharper tag.
+            let heavy = li
+                .item
+                .severity
+                .is_some_and(|s| matches!(s, model::item::Severity::Irreversible | model::item::Severity::Costly));
+            let on_command = li.item.bindings.iter().any(|b| {
+                matches!(b, model::item::Binding::Target { kind: model::item::TargetKind::Command, .. })
+            });
+            model::gate::candidate_literal(&li.item.text)
+                .map(|lit| (li.id.clone(), li.item.text.clone(), lit, heavy && on_command))
+        })
         .collect();
     // Lowest id first: a stable order, so the same fact is asked until it is
     // answered rather than a different one every turn.
@@ -2161,8 +2178,14 @@ fn teeth_debt(store: &EventStore, current_project: Option<&str>) -> Option<Strin
     let batch_len = candidates.len().min(TEETH_DEBT_BATCH_MAX);
     let left = candidates.len() - batch_len;
     let mut items_block = String::new();
-    for (id, text, literal) in candidates.iter().take(TEETH_DEBT_BATCH_MAX) {
-        items_block.push_str(&format!("\n- '{id}' names \"{literal}\": {text}"));
+    for (id, text, literal, needs_command_answer) in candidates.iter().take(TEETH_DEBT_BATCH_MAX) {
+        // A heavy item anchored to a COMMAND cannot be settled with the generic
+        // answer any more (ground 11 continued, 2026-09-20): the gate refuses it.
+        // Saying so per item is the difference between a nudge that can be obeyed
+        // and one that walks the reader into a refusal.
+        let which = if *needs_command_answer { " [needs the command answer]" } else { "" };
+        items_block.push_str(&format!("
+- '{id}' names \"{literal}\"{which}: {text}"));
     }
     let left_note = if left > 0 {
         format!(" {left} more are waiting behind this batch.")
@@ -2171,10 +2194,10 @@ fn teeth_debt(store: &EventStore, current_project: Option<&str>) -> Option<Strin
     };
     Some(format!(
         "[THOR] {batch_len} rule(s) have never been asked whether they can refuse anything, and each one's own text names something a guard could look for - listed below. Answer ALL {batch_len} before ending the turn.{left_note} \
-         Is there a text whose presence MEANS the mistake is happening? If YES, give that rule a check with that literal - forbidden for a command or for any file, absent for one named file - and re-anchor it if the check needs a command it does not have. If NO (an authorised action looks identical to an unauthorised one, or the rule is about something forgotten rather than something typed), add '{}<why not>' to its tags with revise - one plain phrase of 20 to 120 characters, no comma and no line break, because it travels as a tag. The reason IS the answer, a bare '{}' is refused, and mark is a verdict on where an item fired and cannot tag anything - and it stays exactly as it is. \
+         Is there a text whose presence MEANS the mistake is happening? If YES, give that rule a check with that literal - forbidden for a command or for any file, absent for one named file - and re-anchor it if the check needs a command it does not have. If NO (an authorised action looks identical to an unauthorised one, or the rule is about something forgotten rather than something typed), add '{}<why not>' to its tags with revise - one plain phrase of 20 to 120 characters, no comma and no line break, because it travels as a tag. An item marked [needs the command answer] above is heavy AND anchored to a command, and for those the gate takes only '{}<why not>' in that same shape. The reason IS the answer, a bare tag is refused, and mark is a verdict on where an item fired and cannot tag anything - and it stays exactly as it is. \
          Both answers settle a rule for good; only leaving one unanswered brings it back.{items_block}",
         model::store::NO_LITERAL_REASON_PREFIX,
-        model::store::NO_LITERAL_TAG
+        model::store::NO_CATCH_ON_COMMAND_REASON_PREFIX
     ))
 }
 
