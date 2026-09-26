@@ -115,7 +115,7 @@ use thor_core::event_store::{EventKind, EventStore};
 // REACH: an attempt is built out of the rule's own anchor and its own
 // literal, and handed to the guard. That can never tell a real tooth from an
 // invented one. Measured on a copy of a real store: a rule about
-// repartitioning a disk was given the forbidden literal "zqxj-nooit-getypt"
+// repartitioning a disk was given the forbidden literal "zqxj-never-typed"
 // - a string no command will ever carry - and came back a proven guard,
 // because the attempt built from that literal carried it by construction.
 // The doctor's count of proven guards rose by four that way without a single

@@ -198,7 +198,7 @@ fn a_heavy_rules_teeth_reason_that_fits_any_rule_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
     let db = store_with(tmp.path(), &[report("seed-p", "p", &[])]);
     let mut mcp = Mcp::start(&db, tmp.path());
-    for thin in ["no-literal:dit is een oordeelsregel en geen vaste tekst", "no-literal:het is een omissie dus er valt niets te typen"] {
+    for thin in ["no-literal:this is a judgement rule and not a fixed text", "no-literal:it is an omission so there is nothing to type"] {
         let reply = mcp.call(
             "remember",
             serde_json::json!({
@@ -225,7 +225,7 @@ fn an_informing_label_alone_never_lets_an_evaluation_through_and_the_refusal_nam
         Some("p"),
         Some(Severity::Costly),
         vec![path("files/README.md")],
-        vec!["no-literal:dit is een oordeelsregel en geen vaste tekst".to_string(), "teeth:informing".to_string()],
+        vec!["no-literal:this is a judgement rule and not a fixed text".to_string(), "teeth:informing".to_string()],
     );
     let db = store_with(tmp.path(), &[report("eval-old", "p", &["evaluation-report"]), heavy]);
     with_store(&db, |s| served(s, "labelled-heavy", 1));
@@ -309,7 +309,7 @@ fn a_heavy_rule_is_not_retracted_on_a_reason_that_fits_any_rule() {
     );
     let db = store_with(tmp.path(), &[report("seed-p", "p", &[]), heavy]);
     let mut mcp = Mcp::start(&db, tmp.path());
-    let reply = mcp.call("retract", serde_json::json!({"id": "heavy-c", "reason": "niet meer relevant voor dit project"}));
+    let reply = mcp.call("retract", serde_json::json!({"id": "heavy-c", "reason": "no longer relevant for this project"}));
     assert!(!reply.starts_with("retracted"), "{reply}");
 }
 

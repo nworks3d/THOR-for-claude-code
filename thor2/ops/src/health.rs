@@ -1548,7 +1548,7 @@ pub fn teeth_line(db: &Path, full: bool) -> String {
         })
         .unwrap_or(0);
     let mut out = vec![format!(
-        "teeth: {heavy_with_teeth} of {heavy} rule(s) marked irreversible or costly can actually refuse something - the other {} can only inform, and they are the ones where being wrong was already called expensive; {proven} rule(s) of any weight have ever actually refused a write, which is the only count here that is proven rather than claimed",
+        "teeth: {heavy_with_teeth} of {heavy} rule(s) marked irreversible or costly carry a check shaped to refuse - a claim about shape only, which an invented literal satisfies as well as a real one (the next line judges them against the log) - the other {} can only inform, and they are the ones where being wrong was already called expensive; {proven} rule(s) of any weight have ever actually refused a write, which is the only count here that is proven rather than claimed",
         heavy - heavy_with_teeth
     )];
     // CHANGE 2's own line, kept separate from the shape-only sentence above

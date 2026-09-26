@@ -6344,7 +6344,7 @@ mod tests {
         let mut item = base(Kind::Rule);
         item.severity = Some(Severity::Irreversible);
         item.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "files/README.md".to_string() }];
-        for thin in ["dit is een oordeelsregel en geen vaste tekst", "het is een omissie dus er valt niets te typen"] {
+        for thin in ["this is a judgement rule and not a fixed text", "it is an omission so there is nothing to type"] {
             item.tags = vec![format!("{}{thin}", crate::store::NO_LITERAL_REASON_PREFIX)];
             let err = declare(&item).expect_err(thin);
             assert!(err.problem.contains("says nothing about this rule"), "{}", err.problem);
@@ -6352,8 +6352,8 @@ mod tests {
             assert!(!teeth_answer_settles(&item), "and it settles nothing");
         }
         for real in [
-            "wissen van README.md laat geen tekst achter in een commando",
-            "hetzelfde fragment staat in 'git rm --cached files/README.md' dat legitiem is",
+            "wiping README.md leaves no text in any command",
+            "the same fragment is in 'git rm --cached files/README.md' which is legitimate",
         ] {
             item.tags = vec![format!("{}{real}", crate::store::NO_LITERAL_REASON_PREFIX)];
             assert!(declare(&item).is_ok(), "{real}");
@@ -6372,10 +6372,10 @@ mod tests {
         let mut item = base(Kind::Rule);
         item.severity = Some(Severity::Irreversible);
         item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "wevtutil cl".to_string() }];
-        item.tags = vec![format!("{}het is een oordeelsregel zonder vaste tekst", crate::store::NO_CATCH_ON_COMMAND_REASON_PREFIX)];
+        item.tags = vec![format!("{}it is a judgement rule with no fixed text", crate::store::NO_CATCH_ON_COMMAND_REASON_PREFIX)];
         assert!(declare(&item).is_err());
         item.tags = vec![format!(
-            "{}een geautoriseerde wevtutil cl ziet er net zo uit als een foute",
+            "{}an authorised wevtutil cl looks just like a wrong one",
             crate::store::NO_CATCH_ON_COMMAND_REASON_PREFIX
         )];
         assert!(declare(&item).is_ok());

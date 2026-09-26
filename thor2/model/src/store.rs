@@ -4272,7 +4272,7 @@ mod tests {
         let mut store = EventStore::in_memory().unwrap();
         let item = sample();
         declare(&mut store, "s", "l", "a", &item).unwrap();
-        assert!(retract(&mut store, "s", "l", "a", &item.id, "niet meer relevant voor dit project").is_err());
+        assert!(retract(&mut store, "s", "l", "a", &item.id, "no longer relevant for this project").is_err());
         retract(&mut store, "s", "l", "a", &item.id, "config/app.toml no longer exists").unwrap();
     }
 }
