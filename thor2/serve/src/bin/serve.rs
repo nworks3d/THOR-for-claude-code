@@ -947,18 +947,6 @@ fn payload_says_the_owner_reads_the_answer(payload: &Value) -> bool {
     payload.get("owner_reads_answer").and_then(|v| v.as_bool()).unwrap_or(false)
 }
 
-/// The owner's own last typed prompt, for `respond::guard_verdict`'s
-/// `list_request_any_of` exemption (FALSE BLOCK A - see
-/// `respond::last_user_prompt`'s own doc comment for the full story).
-/// Unlike the reply text (`last_assistant_message`, read
-/// straight off the Stop payload), Claude Code does not hand the prompt over
-/// the same way - it names the session's transcript file in
-/// `transcript_path` instead, so this reads THAT and hands the raw text to
-/// `respond::last_user_prompt`, the pure parser. Empty string on anything
-/// unreadable (no `transcript_path`, the file is gone or unparseable) -
-/// fail-open, same stance as every other optional signal on this path: the
-/// exemption then simply does not apply, exactly the behaviour this project
-/// had before it existed, never a NEW block.
 /// Whether a `path:line` citation from an answer names a real line: `cited`
 /// resolves (relative to `root`, or as written when absolute) to a file that
 /// lies under `root` - the session's own working directory, already
@@ -980,6 +968,64 @@ fn cited_line_exists(root: &Path, cited: &str, line: u64) -> bool {
     line <= lines
 }
 
+/// Which of `candidates` (sha-shaped tokens from an answer) name a real commit
+/// in the git repository `cwd` stands in - `None` when no repository answers
+/// (git missing, `cwd` in no repository, any error), so the Response Guard
+/// judges a sha by its shape instead (see `respond`'s own "checked evidence"
+/// section). One `git cat-file --batch-check` for the whole list, reading only
+/// the local object store: nothing is fetched, nothing is written. An
+/// ambiguous short sha names real objects, so it counts as real.
+fn real_commits(cwd: &Path, candidates: &[String]) -> Option<std::collections::HashSet<String>> {
+    use std::io::Write as _;
+    let mut command = std::process::Command::new("git");
+    command
+        .arg("-C")
+        .arg(cwd)
+        .args(["cat-file", "--batch-check"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        // CREATE_NO_WINDOW: a hook never opens a console window.
+        command.creation_flags(0x0800_0000);
+    }
+    let mut child = command.spawn().ok()?;
+    let input: String = candidates.iter().map(|c| format!("{c}^{{commit}}\n")).collect();
+    // A write error (git already gone) shows up in the exit status below.
+    let _ = child.stdin.take()?.write_all(input.as_bytes());
+    let out = child.wait_with_output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let answers: Vec<&str> = text.lines().collect();
+    if answers.len() != candidates.len() {
+        return None;
+    }
+    Some(
+        candidates
+            .iter()
+            .zip(answers)
+            .filter(|(_, answer)| !answer.ends_with(" missing"))
+            .map(|(c, _)| c.clone())
+            .collect(),
+    )
+}
+
+/// The owner's own last typed prompt, for `respond::guard_verdict`'s
+/// `list_request_any_of` exemption (FALSE BLOCK A - see
+/// `respond::last_user_prompt`'s own doc comment for the full story).
+/// Unlike the reply text (`last_assistant_message`, read
+/// straight off the Stop payload), Claude Code does not hand the prompt over
+/// the same way - it names the session's transcript file in
+/// `transcript_path` instead, so this reads THAT and hands the raw text to
+/// `respond::last_user_prompt`, the pure parser. Empty string on anything
+/// unreadable (no `transcript_path`, the file is gone or unparseable) -
+/// fail-open, same stance as every other optional signal on this path: the
+/// exemption then simply does not apply, exactly the behaviour this project
+/// had before it existed, never a NEW block.
 fn last_user_prompt_from_payload(payload: &Value) -> String {
     let Some(path) = payload.get("transcript_path").and_then(|v| v.as_str()) else {
         return String::new();
@@ -1196,17 +1242,25 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
         // Guard's reader-scoped rules read this; every debt below keeps
         // reading `is_subagent`, so the agent's own session separation holds.
         let reader_is_an_agent = is_subagent && !payload_says_the_owner_reads_the_answer(&payload);
-        // A `path:line` citation in the answer counts as evidence only when it
-        // names a real line under the session's own working directory - and
-        // only when the payload names one that exists; without it the Response
-        // Guard judges a citation by its shape, as before. See `respond`'s own
-        // "checked citations" section and `cited_line_exists`.
-        let evidence_root: Option<PathBuf> =
-            payload.get("cwd").and_then(|v| v.as_str()).and_then(|cwd| Path::new(cwd).canonicalize().ok());
+        // A `path:line` citation, a line number next to a file name, or a
+        // commit in the answer counts as evidence only when it is real: a line
+        // under the session's own working directory, a commit in its git
+        // repository - and only when the payload names a working directory
+        // that exists; without it the Response Guard judges all of them by
+        // their shape, as before. See `respond`'s own "checked evidence"
+        // section, `cited_line_exists` and `real_commits`.
+        let payload_cwd = payload.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from);
+        let evidence_root: Option<PathBuf> = payload_cwd.as_deref().and_then(|cwd| cwd.canonicalize().ok());
         let look_up_citation =
             |cited: &str, line: u64| evidence_root.as_deref().is_some_and(|root| cited_line_exists(root, cited, line));
-        let citation_lookup: Option<&dyn Fn(&str, u64) -> bool> =
-            if evidence_root.is_some() { Some(&look_up_citation) } else { None };
+        // git is handed the working directory as the payload names it, never
+        // the canonical form: on Windows that is a `\\?\` path, which is not
+        // one every git build reads.
+        let look_up_commits = |candidates: &[String]| payload_cwd.as_deref().and_then(|cwd| real_commits(cwd, candidates));
+        let evidence_lookup =
+            respond::EvidenceLookup { line_exists: &look_up_citation, real_commits: &look_up_commits };
+        let citation_lookup: Option<&respond::EvidenceLookup> =
+            if evidence_root.is_some() { Some(&evidence_lookup) } else { None };
         // THE DEFECT THIS CLOSES, reported by the owner on 2026-08-09: "my
         // TLDR rules worked an hour ago and now they are gone."
         //

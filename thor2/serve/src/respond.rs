@@ -33,6 +33,7 @@
 
 use regex::Regex;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -184,34 +185,31 @@ pub fn last_user_prompt(transcript_jsonl: &str) -> Option<String> {
 }
 
 /// Whether `rule`'s AND/OR/NOT/min_chars conditions hold against this
-/// haystack - the whole non-positional matcher, factored out of `evaluate`
-/// so `evaluate_opt_in` (further down) can reuse it verbatim rather than
+/// haystack - the whole non-positional matcher, built from the two halves
+/// below so `evaluate_opt_in` (further down) reuses them rather than
 /// reimplementing AND/OR/NOT next to a second copy that could drift from
 /// this one.
 fn rule_matches(rule: &Rule, haystack_lower: &str) -> bool {
-    rule_matches_with_escapes_in(rule, haystack_lower, haystack_lower)
+    trigger_holds(rule, haystack_lower, &|term| haystack_lower.contains(term)) && !none_of_escaped(rule, haystack_lower)
 }
 
-/// `rule_matches`, with the `none_of` escapes read from `escapes_lower`
-/// instead of the full haystack - the reply with every `path:line` citation
-/// that did not check out blanked (see "checked citations" below). The
-/// trigger side (`min_chars`, `all_of`, `any_of`) always reads the full reply.
-fn rule_matches_with_escapes_in(rule: &Rule, haystack_lower: &str, escapes_lower: &str) -> bool {
+/// The trigger side: `min_chars`, then every `all_of` term and (when there
+/// are any) one `any_of` term present, where `present` answers for one
+/// lowercased term - a plain substring test, or `in_own_voice` for a rule
+/// that counts only the assistant's own claims (see "reported speech").
+fn trigger_holds(rule: &Rule, haystack_lower: &str, present: &dyn Fn(&str) -> bool) -> bool {
     if rule.min_chars > 0 && haystack_lower.chars().count() < rule.min_chars {
         return false;
     }
-    if !rule.all_of.iter().all(|s| haystack_lower.contains(&s.to_lowercase())) {
+    if !rule.all_of.iter().all(|s| present(&s.to_lowercase())) {
         return false;
     }
-    let any_ok =
-        rule.any_of.is_empty() || rule.any_of.iter().any(|s| haystack_lower.contains(&s.to_lowercase()));
-    if !any_ok {
-        return false;
-    }
-    if rule.none_of.iter().any(|s| escapes_lower.contains(&s.to_lowercase())) {
-        return false;
-    }
-    true
+    rule.any_of.is_empty() || rule.any_of.iter().any(|s| present(&s.to_lowercase()))
+}
+
+/// The `none_of` side: any escape term present in `text`.
+fn none_of_escaped(rule: &Rule, text: &str) -> bool {
+    rule.none_of.iter().any(|s| text.contains(&s.to_lowercase()))
 }
 
 /// The pure matcher: every rule's reminder that fires for this haystack, in
@@ -369,6 +367,12 @@ pub struct OptInRule {
     /// direction this field fails in, and `parse_opt_in_rules` for exactly
     /// how a malformed value is read as `false` rather than rejected.
     pub owner_reading_only: bool,
+    /// `true` marks this rule as being about the assistant's OWN claims: a
+    /// trigger term counts only where the assistant says it in its own voice,
+    /// never where it reports or quotes what another party said. See this
+    /// file's own "reported speech" section. Missing, `false` or malformed all
+    /// mean the rule reads every occurrence, as before this field existed.
+    pub own_claims_only: bool,
 }
 
 /// Parse the rulebook into `OptInRule`s: every field `parse_rules` reads,
@@ -398,7 +402,18 @@ pub fn parse_opt_in_rules(text: &str) -> Vec<OptInRule> {
             // rule applying rather than toward it going quiet.
             let owner_reading_only =
                 r.get("owner_reading_only").and_then(|v| v.as_bool()).unwrap_or(false);
-            Some(OptInRule { base, before, tier, none_of_patterns, list_request_any_of, owner_reading_only })
+            // Same direction as `owner_reading_only`: anything but a literal
+            // `true` keeps the rule reading every occurrence of its terms.
+            let own_claims_only = r.get("own_claims_only").and_then(|v| v.as_bool()).unwrap_or(false);
+            Some(OptInRule {
+                base,
+                before,
+                tier,
+                none_of_patterns,
+                list_request_any_of,
+                owner_reading_only,
+                own_claims_only,
+            })
         })
         .collect()
 }
@@ -507,7 +522,7 @@ fn pattern_escaped(rule: &OptInRule, haystack_lower: &str) -> bool {
     rule.none_of_patterns.iter().any(|name| pattern_matches(name, haystack_lower))
 }
 
-// ------------------------------------------------------ checked citations
+/// ------------------------------------------------------- checked evidence
 //
 // THE ESCAPE THIS CLOSES (found 2026-09-26). `checked-claim-needs-evidence`
 // accepts a `path:line` citation as evidence, twice over: the `path_line`
@@ -517,19 +532,60 @@ fn pattern_escaped(rule: &OptInRule, haystack_lower: &str) -> bool {
 // claim of checking that nobody checked.
 //
 // So when the caller can look (it knows the session's working directory and
-// hands over `cited_line_exists`), a citation only counts when it names a real
+// hands over an `EvidenceLookup`), a citation only counts when it names a real
 // file under that directory and a line that file really has. A citation that
 // does not check out counts for nothing: it is blanked from the text the
 // rule's escapes are read in, so neither the pattern nor a literal term inside
 // it (".rs:", a hex-looking file name the `commit_sha` shape would take for a
-// sha) can let the answer through. Everything else stays as it was: the other
-// escapes ("not checked", a real commit sha elsewhere in the answer), and a
-// rule that does not name `path_line` among its `none_of_patterns` at all -
-// it never treated a citation as evidence, so there is nothing to check.
-// Without a way to look, a citation is judged by its shape exactly as before.
+// sha) can let the answer through.
 //
-// This file does no I/O of its own: `cited_line_exists` is the caller's (see
-// `serve/src/bin/serve.rs`'s own `cited_line_exists`).
+// THE SAME DAY, THE REST OF THE ESCAPES. The rule's other evidence words were
+// still read by shape: the literals "commit ", "line " and "regel " (anywhere -
+// "pipeline " carries "line ", "vuistregel " carries "regel "), any typed
+// sha-shaped token through `commit_sha`, and a bare "name.rs:" with no line at
+// all through the ".rs:" literal. When the caller can look, each of them now
+// counts only when it is real, the way a citation does:
+// - a sha-shaped token, and the literal "commit", count only when a token names
+//   a commit that exists in the working directory's git repository. Where no
+//   repository answers (no git, no repository there), a sha cannot be looked up
+//   and is judged by its shape, as before - the same stance as a citation with
+//   no working directory to look in;
+// - the literals "line"/"regel" count only for a line number that a file named
+//   on the same line of the answer really has ("line 3 of src/lib.rs", "regel 4
+//   van src/lib.rs", "src/lib.rs, line 3");
+// - an extension literal such as ".rs:" counts only inside a citation that
+//   checked out.
+// Everything else stays as it was: the honest escapes ("not checked"), and a
+// rule that names neither `path_line` nor `commit_sha` among its
+// `none_of_patterns` - it never treated a citation or a sha as evidence, so
+// there is nothing to check. Without a way to look, every escape is judged by
+// its shape exactly as before.
+//
+// KNOWN LIMIT, stated rather than left to be rediscovered: a commit of ANOTHER
+// repository than the working directory's does not count, the same way a file
+// outside the working directory does not. An answer about another repository
+// names a real line under the working directory, or says plainly that it was
+// not checked.
+//
+// This file does no I/O of its own: the lookups are the caller's (see
+// `serve/src/bin/serve.rs`'s own `cited_line_exists` and `real_commits`).
+
+/// How the caller looks evidence up, handed in because this file does no I/O.
+pub struct EvidenceLookup<'a> {
+    /// Whether `path` names a real file under the session's working directory
+    /// with at least `line` lines.
+    pub line_exists: &'a dyn Fn(&str, u64) -> bool,
+    /// Which of `candidates` (lowercase sha-shaped tokens) name a real commit
+    /// in the working directory's git repository - `None` when no repository
+    /// answers, so the caller cannot look.
+    pub real_commits: &'a dyn Fn(&[String]) -> Option<HashSet<String>>,
+}
+
+/// At most this many distinct sha-shaped tokens, and this many line-number
+/// lookups, are tried for one answer: enough for any real report, and a bound
+/// on the work one hook call can be made to do.
+const MAX_SHA_LOOKUPS: usize = 16;
+const MAX_LINE_LOOKUPS: usize = 24;
 
 /// A `path:line` citation as written in the ORIGINAL reply (a file name keeps
 /// its case, which matters on most systems): the same shape as `path_line`,
@@ -540,27 +596,47 @@ fn citation_regex() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"(?i)(?:\b[a-z]:)?[a-z0-9_./\\-]+\.[a-z0-9]{1,8}:\d+").unwrap())
 }
 
-/// What a reply's citations turned out to prove.
-struct CheckedCitations {
-    /// At least one citation names a real line of a real file.
-    verified: bool,
-    /// The citations that did not check out, as written, for the reason.
+/// "line 3", "lines 3-9", "regel 4", "regels 4 tot 9": the number a line
+/// reference names.
+fn line_reference_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i)\b(?:lines?|regels?)\s+(\d{1,12})\b").unwrap())
+}
+
+/// A file name with an extension, as a line reference names it: the citation
+/// shape without its `:line`.
+fn file_name_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i)(?:\b[a-z]:)?[a-z0-9_./\\-]*[a-z0-9_]\.[a-z0-9]{1,8}\b").unwrap())
+}
+
+/// What a reply's evidence turned out to prove.
+struct CheckedEvidence {
+    /// The citations that name a real line of a real file, lowercased.
+    verified_citations: Vec<String>,
+    /// Whether a sha-shaped token names a real commit: `Some` when the caller
+    /// could look, `None` when it could not (judged by shape then).
+    real_sha: Option<bool>,
+    /// Whether a "line N"/"regel N" names a line a file on the same line of
+    /// the answer really has.
+    real_line_reference: bool,
+    /// What did not check out, as written, for the reason.
     unverified: Vec<String>,
     /// The reply with every unverified citation blanked, as a haystack - what
     /// a verifying rule's escapes are read in.
     escapes_lower: String,
 }
 
-fn check_citations(message: &str, cited_line_exists: &dyn Fn(&str, u64) -> bool) -> CheckedCitations {
-    let mut verified = false;
+fn check_evidence(message: &str, lookup: &EvidenceLookup) -> CheckedEvidence {
+    let mut verified_citations = Vec::new();
     let mut unverified = Vec::new();
     let mut kept = String::with_capacity(message.len());
     let mut last = 0;
     for m in citation_regex().find_iter(message) {
         let (path, line) = m.as_str().rsplit_once(':').expect("the pattern always ends in ':' and digits");
         // A number too long for u64 names no real line either.
-        if cited_line_exists(path, line.parse::<u64>().unwrap_or(u64::MAX)) {
-            verified = true;
+        if (lookup.line_exists)(path, line.parse::<u64>().unwrap_or(u64::MAX)) {
+            verified_citations.push(m.as_str().to_lowercase());
             continue;
         }
         unverified.push(m.as_str().to_string());
@@ -569,23 +645,391 @@ fn check_citations(message: &str, cited_line_exists: &dyn Fn(&str, u64) -> bool)
         last = m.end();
     }
     kept.push_str(&message[last..]);
-    CheckedCitations { verified, unverified, escapes_lower: haystack(&kept) }
+    let escapes_lower = haystack(&kept);
+
+    let real_line_reference = check_line_references(message, lookup, &mut unverified);
+
+    let mut candidates: Vec<String> = Vec::new();
+    for m in commit_sha_regex().find_iter(&escapes_lower) {
+        let s = m.as_str();
+        let shaped = s.bytes().any(|b| b.is_ascii_digit()) && s.bytes().any(|b| b.is_ascii_alphabetic());
+        if shaped && !candidates.iter().any(|c| c == s) && candidates.len() < MAX_SHA_LOOKUPS {
+            candidates.push(s.to_string());
+        }
+    }
+    // Asked even with no candidates: whether a repository answers at all
+    // decides how the bare word "commit" is read.
+    let real_sha = (lookup.real_commits)(&candidates).map(|real| {
+        for c in candidates.iter().filter(|c| !real.contains(*c)) {
+            unverified.push(format!("{c} (no such commit in this repository)"));
+        }
+        !real.is_empty()
+    });
+    CheckedEvidence { verified_citations, real_sha, real_line_reference, unverified, escapes_lower }
 }
 
-/// Whether this rule takes a `path:line` citation as evidence, which is what
-/// makes its citations worth checking.
-fn takes_citations_as_evidence(rule: &OptInRule) -> bool {
-    rule.none_of_patterns.iter().any(|p| p == "path_line")
+/// Whether some "line N"/"regel N" in `message` names a line that a file named
+/// on the same line of the answer really has. A reference that names no file
+/// there, or none that has that line, goes into `unverified`.
+fn check_line_references(message: &str, lookup: &EvidenceLookup, unverified: &mut Vec<String>) -> bool {
+    let mut lookups = 0usize;
+    for m in line_reference_regex().captures_iter(message) {
+        let whole = m.get(0).expect("group 0 always exists");
+        let line: u64 = m[1].parse().unwrap_or(u64::MAX);
+        let text_line_start = message[..whole.start()].rfind('\n').map_or(0, |i| i + 1);
+        let text_line_end = message[whole.end()..].find('\n').map_or(message.len(), |i| whole.end() + i);
+        for file in file_name_regex().find_iter(&message[text_line_start..text_line_end]) {
+            if lookups >= MAX_LINE_LOOKUPS {
+                return false;
+            }
+            lookups += 1;
+            if (lookup.line_exists)(file.as_str(), line) {
+                return true;
+            }
+        }
+        unverified.push(whole.as_str().to_string());
+    }
+    false
 }
 
-/// `pattern_escaped` for a rule whose citations were checked: `path_line`
-/// holds only for a citation that checked out, and every other shape is read
-/// in the reply with the unverified citations blanked.
-fn pattern_escaped_checked(rule: &OptInRule, checked: &CheckedCitations) -> bool {
+/// Whether this rule takes a citation or a sha as evidence, which is what
+/// makes its evidence worth checking.
+fn takes_evidence(rule: &OptInRule) -> bool {
+    rule.none_of_patterns.iter().any(|p| p == "path_line" || p == "commit_sha")
+}
+
+/// `pattern_escaped` for a rule whose evidence was checked: `path_line` holds
+/// only for a citation that checked out, `commit_sha` only for a real commit
+/// (by shape when no repository answers), and every other shape is read in
+/// the reply with the unverified citations blanked.
+fn pattern_escaped_checked(rule: &OptInRule, checked: &CheckedEvidence) -> bool {
     rule.none_of_patterns.iter().any(|name| match name.as_str() {
-        "path_line" => checked.verified,
+        "path_line" => !checked.verified_citations.is_empty(),
+        "commit_sha" => checked.real_sha.unwrap_or_else(|| contains_commit_sha(&checked.escapes_lower)),
         other => pattern_matches(other, &checked.escapes_lower),
     })
+}
+
+/// The evidence a literal `none_of` term stands for, when it stands for any:
+/// the word "commit", a line word, or a file extension followed by a colon.
+enum EvidenceWord {
+    Commit,
+    Line,
+    ExtensionColon,
+}
+
+fn evidence_word(term_lower: &str) -> Option<EvidenceWord> {
+    match term_lower.trim() {
+        "commit" | "commits" => Some(EvidenceWord::Commit),
+        "line" | "lines" | "regel" | "regels" => Some(EvidenceWord::Line),
+        t if t.len() >= 3
+            && t.starts_with('.')
+            && t.ends_with(':')
+            && t[1..t.len() - 1].chars().all(|c| c.is_ascii_alphanumeric()) =>
+        {
+            Some(EvidenceWord::ExtensionColon)
+        }
+        _ => None,
+    }
+}
+
+/// The `none_of` side of a rule whose evidence was checked: an evidence word
+/// counts only when what it stands for is real (see this section's own
+/// comment); every other term is read in the reply with the unverified
+/// citations blanked, as before.
+fn none_of_escaped_checked(rule: &Rule, checked: &CheckedEvidence) -> bool {
+    rule.none_of.iter().any(|term| {
+        let t = term.to_lowercase();
+        match evidence_word(&t) {
+            Some(EvidenceWord::Commit) => checked.real_sha.unwrap_or_else(|| checked.escapes_lower.contains(&t)),
+            Some(EvidenceWord::Line) => checked.real_line_reference,
+            Some(EvidenceWord::ExtensionColon) => checked.verified_citations.iter().any(|c| c.contains(&t)),
+            None => checked.escapes_lower.contains(&t),
+        }
+    })
+}
+
+// -------------------------------------------------------- reported speech
+//
+// THE FALSE BLOCK THIS CLOSES (reported by the owner, 2026-09-26). The rule
+// that demands "verify before claiming you cannot" held an answer in which the
+// assistant QUOTED what another model had said ("het model meldde geen toegang
+// te hebben") and claimed nothing itself. Its trigger is a plain substring, so
+// it cannot tell the assistant's own "I cannot" from a report of someone
+// else's.
+//
+// A rule opts in with `own_claims_only: true` (no rule changes by itself: a
+// rule about the SHAPE of a reply, such as the summary or the length rule,
+// still reads every word, whoever said it). For such a rule, one occurrence of
+// a trigger term does not count when it sits in another party's words:
+// - REPORTED: earlier in the same sentence a reporting word ("meldde", "zei",
+//   "volgens", "said", "reported", "according to", ...) introduces it, with no
+//   clause boundary (a comma, a semicolon, "en", "maar", "and", "but", ...)
+//   between that word and the trigger, and no first-person word ("ik", "we",
+//   "I", "my", ...) in the clause of the reporting word - nor in the trigger
+//   itself, unless a colon after the reporting word has opened the other
+//   party's own words ("the agent said: I don't have access");
+// - QUOTED: it sits inside quotation marks, inline code, a blockquote or a
+//   fenced block, and the words framing the quote (the clause before it, or an
+//   attribution right after it such as '"...", zei ik') carry no first-person
+//   word.
+// Everything else is the assistant's own voice, and the rule fires on it as
+// before. The rule fires when at least one occurrence is in the assistant's
+// own voice, so a report next to a real claim still fires.
+//
+// Deliberately biased toward firing: a first-person word anywhere in the
+// frame keeps the occurrence the assistant's own, even where a person would
+// read it as a report ("het model zei dat ik geen toegang had"), and a
+// reporting word cut off by a comma no longer governs what follows. A false
+// block costs a rewrite; a real "I cannot" slipping through is what the rule
+// exists to stop. One gap the other way, also deliberate: a quotation with no
+// frame at all ('de NAS gaf "geen toegang"') counts as a quote, because a
+// quotation mark is itself the sign of a mention.
+
+/// The marks a quote is opened and closed with: straight and curly double
+/// quotes, the low opening quote, guillemets, and a backtick.
+const QUOTE_MARKS: &[char] = &['"', '\u{201c}', '\u{201d}', '\u{201e}', '\u{ab}', '\u{bb}', '`'];
+
+/// Words that make the speaker the assistant itself (or a group it is in).
+const FIRST_PERSON: &[&str] =
+    &["ik", "mij", "me", "mijn", "m'n", "wij", "we", "ons", "onze", "i", "i'm", "i've", "i'd", "i'll", "my", "mine", "us", "our"];
+
+/// One-word reporting words: another party's words follow.
+const REPORTING_WORDS: &[&str] = &[
+    "meldde", "meldden", "meldt", "melden", "vermeldde", "vermeldt", "zei", "zeiden", "zegt", "zeggen", "schreef",
+    "schreven", "schrijft", "antwoordde", "antwoordden", "antwoordt", "beweerde", "beweerden", "beweert", "claimde",
+    "claimt", "rapporteerde", "rapporteert", "verklaarde", "verklaart", "volgens", "aldus", "concludeerde",
+    "concludeert", "dacht", "denkt", "klaagde", "waarschuwde", "said", "says", "reported", "reports", "claimed",
+    "claims", "wrote", "writes", "replied", "replies", "answered", "answers", "stated", "states", "told", "tells",
+    "concluded", "concludes", "thought", "thinks", "believed", "believes", "complained", "insisted", "responded",
+    "responds", "mentioned", "mentions", "warned",
+];
+
+/// Two-word reporting phrases.
+const REPORTING_PHRASES: &[(&str, &str)] =
+    &[("gaf", "aan"), ("geeft", "aan"), ("liet", "weten"), ("laat", "weten"), ("according", "to")];
+
+/// Reporting words that open an attribution phrase, closed by a comma that is
+/// no clause boundary ("Volgens de agent, ...", "According to the log, ...").
+const ATTRIBUTION_WORDS: &[&str] = &["volgens", "aldus", "according"];
+
+/// Words that open a new clause, cutting a reporting word off from what follows.
+const CLAUSE_WORDS: &[&str] = &["en", "maar", "want", "dus", "and", "but", "so"];
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '\'' || c == '\u{2019}'
+}
+
+/// The words of `text` with their byte offsets (start, end), a curly
+/// apostrophe read as a straight one.
+fn words(text: &str) -> Vec<(usize, usize, String)> {
+    let mut out = Vec::new();
+    let mut start: Option<usize> = None;
+    for (i, c) in text.char_indices() {
+        match (is_word_char(c), start) {
+            (true, None) => start = Some(i),
+            (false, Some(s)) => {
+                out.push((s, i, text[s..i].replace('\u{2019}', "'")));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        out.push((s, text.len(), text[s..].replace('\u{2019}', "'")));
+    }
+    out
+}
+
+fn has_first_person(text: &str) -> bool {
+    words(text).iter().any(|(_, _, w)| FIRST_PERSON.contains(&w.as_str()))
+}
+
+/// The byte span of the LAST reporting word or phrase in `text`.
+fn last_reporting_word(text: &str) -> Option<(usize, usize)> {
+    let ws = words(text);
+    let mut found = None;
+    for (i, (start, end, w)) in ws.iter().enumerate() {
+        if REPORTING_WORDS.contains(&w.as_str()) {
+            found = Some((*start, *end));
+        }
+        if let Some((_, next_end, next)) = ws.get(i + 1) {
+            if REPORTING_PHRASES.iter().any(|(a, b)| a == w && b == next) {
+                found = Some((*start, *next_end));
+            }
+        }
+    }
+    found
+}
+
+fn starts_with_reporting_word(text: &str) -> bool {
+    let ws = words(text);
+    match ws.first() {
+        Some((_, _, w)) if REPORTING_WORDS.contains(&w.as_str()) => true,
+        Some((_, _, w)) => {
+            ws.get(1).is_some_and(|(_, _, next)| REPORTING_PHRASES.iter().any(|(a, b)| a == w && b == next))
+        }
+        None => false,
+    }
+}
+
+/// The byte offset just past the last clause boundary in `text` (a comma, a
+/// semicolon, or a clause word), or 0.
+fn last_clause_start(text: &str) -> usize {
+    let punct = text.rfind([',', ';']).map_or(0, |i| i + 1);
+    let word =
+        words(text).iter().rev().find(|(_, _, w)| CLAUSE_WORDS.contains(&w.as_str())).map_or(0, |(_, end, _)| *end);
+    punct.max(word)
+}
+
+fn has_clause_boundary(text: &str) -> bool {
+    text.contains([',', ';']) || words(text).iter().any(|(_, _, w)| CLAUSE_WORDS.contains(&w.as_str()))
+}
+
+/// The frame the last reporting word in `lead` opens: the words from the start
+/// of its clause up to where the other party's words begin, and whether a
+/// colon opened them. `None` when there is no reporting word, or a clause
+/// boundary after it cuts it off from the end of `lead` - except the one comma
+/// that closes an attribution phrase ("According to the agent, ...").
+fn reporting_frame(lead: &str) -> Option<(&str, bool)> {
+    let (word_start, word_end) = last_reporting_word(lead)?;
+    let after_word = &lead[word_end..];
+    let opens_attribution = words(&lead[word_start..word_end])
+        .first()
+        .is_some_and(|(_, _, w)| ATTRIBUTION_WORDS.contains(&w.as_str()));
+    let cut_off =
+        if opens_attribution { has_clause_boundary(&after_word.replacen(',', " ", 1)) } else { has_clause_boundary(after_word) };
+    if cut_off {
+        return None;
+    }
+    let clause_start = last_clause_start(&lead[..word_start]);
+    Some(match after_word.find(':') {
+        Some(colon) => (&lead[clause_start..word_end + colon], true),
+        None => (&lead[clause_start..], false),
+    })
+}
+
+/// Whether a reporting word in `lead` (the sentence up to the trigger) hands
+/// `trigger` to another party - see this section's own comment.
+fn reported_by_another_party(lead: &str, trigger: &str) -> bool {
+    match reporting_frame(lead) {
+        Some((frame, speech_opened)) => !has_first_person(frame) && (speech_opened || !has_first_person(trigger)),
+        None => false,
+    }
+}
+
+/// Whether the words framing a quote leave it another party's: no
+/// first-person word in the clause before it (from the reporting word's clause
+/// when there is one), and no first-person word in an attribution right after
+/// it ('"...", zei ik').
+fn quote_frame_is_another_party(before: &str, after: &str) -> bool {
+    let frame = reporting_frame(before).map_or(&before[last_clause_start(before)..], |(frame, _)| frame);
+    if has_first_person(frame) {
+        return false;
+    }
+    let attribution = after.trim_start_matches(|c: char| c.is_whitespace() || ",.:;!?".contains(c));
+    let attribution = &attribution[..attribution.find([',', ';', '.', '!', '?', '\n']).unwrap_or(attribution.len())];
+    !(starts_with_reporting_word(attribution) && has_first_person(attribution))
+}
+
+/// `text` with the inside of every closed quote left out, so a quote's own
+/// words are never read as its frame's.
+fn blank_closed_quotes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut open: Option<usize> = None;
+    for c in text.chars() {
+        if QUOTE_MARKS.contains(&c) {
+            match open {
+                None => {
+                    out.push(c);
+                    open = Some(out.len());
+                }
+                Some(at) => {
+                    out.truncate(at);
+                    out.push(c);
+                    open = None;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The start of the sentence byte `at` sits in, never before `floor`.
+fn sentence_start(hay: &str, floor: usize, at: usize) -> usize {
+    ["! ", "? ", ". "]
+        .iter()
+        .filter_map(|end| hay[floor..at].rfind(end).map(|i| floor + i + end.len()))
+        .max()
+        .unwrap_or(floor)
+}
+
+/// Whether the occurrence of a trigger term at byte `at` (length `len`) in
+/// `hay` sits in another party's words - see this section's own comment.
+fn occurrence_is_another_partys(hay: &str, at: usize, len: usize) -> bool {
+    // A fenced block, or a blockquote line: its frame is the last plain line
+    // before it.
+    let mut in_fence = false;
+    let mut fence_frame = "";
+    let mut plain_before = "";
+    let mut offset = 0usize;
+    for line in hay.split('\n') {
+        let end = offset + line.len();
+        let trimmed = line.trim_start();
+        let is_fence = trimmed.starts_with("```");
+        if at >= offset && at <= end {
+            if in_fence && !is_fence {
+                return quote_frame_is_another_party(fence_frame, "");
+            }
+            if trimmed.starts_with('>') {
+                return quote_frame_is_another_party(plain_before, "");
+            }
+            break;
+        }
+        if is_fence {
+            if !in_fence {
+                fence_frame = plain_before;
+            }
+            in_fence = !in_fence;
+        } else if !in_fence && !trimmed.is_empty() && !trimmed.starts_with('>') {
+            plain_before = line;
+        }
+        offset = end + 1;
+    }
+    let line_start = hay[..at].rfind('\n').map_or(0, |i| i + 1);
+    let line_end = hay[at..].find('\n').map_or(hay.len(), |i| at + i);
+    let quote_marks_before: Vec<usize> =
+        hay[line_start..at].char_indices().filter(|(_, c)| QUOTE_MARKS.contains(c)).map(|(i, _)| line_start + i).collect();
+    if quote_marks_before.len() % 2 == 1 {
+        let open_at = *quote_marks_before.last().expect("an odd count is at least one");
+        let before = blank_closed_quotes(&hay[sentence_start(hay, line_start, open_at)..open_at]);
+        let rest = &hay[at + len..line_end];
+        let after = rest.char_indices().find(|(_, c)| QUOTE_MARKS.contains(c)).map_or("", |(i, c)| &rest[i + c.len_utf8()..]);
+        return quote_frame_is_another_party(&before, after);
+    }
+    let lead = blank_closed_quotes(&hay[sentence_start(hay, line_start, at)..at]);
+    reported_by_another_party(&lead, &hay[at..at + len])
+}
+
+/// Whether `term_lower` occurs in `hay` at least once in the assistant's own
+/// voice. An empty term is present everywhere, as `str::contains` has it.
+fn in_own_voice(hay: &str, term_lower: &str) -> bool {
+    if term_lower.is_empty() {
+        return true;
+    }
+    hay.match_indices(term_lower).any(|(at, t)| !occurrence_is_another_partys(hay, at, t.len()))
+}
+
+/// The trigger side of a rule (`trigger_holds`) with `own_claims_only`
+/// honoured.
+fn trigger_fires(rule: &OptInRule, haystack_lower: &str) -> bool {
+    if rule.own_claims_only {
+        trigger_holds(&rule.base, haystack_lower, &|term| in_own_voice(haystack_lower, term))
+    } else {
+        trigger_holds(&rule.base, haystack_lower, &|term| haystack_lower.contains(term))
+    }
 }
 
 // --------------------------------------------------------- list exemption
@@ -719,18 +1163,19 @@ fn list_exempted(rule: &OptInRule, prompt_lower: &str, haystack_lower: &str) -> 
 // that goes quiet. `parse_opt_in_rules`'s own `.as_bool().unwrap_or(false)`
 // is where this is actually enforced.
 
-/// `evaluate`'s own AND/OR/NOT/min_chars matcher, reused verbatim
-/// (`rule_matches`), plus the positional escape, the pattern escape
-/// (`pattern_escaped`), the list exemption (`list_exempted`) and the reader
-/// scope (this section's own doc comment above) layered on top. Returns
-/// every fired rule's tier and reminder, in rulebook order - the same order
-/// `evaluate` returns its reminders in. `prompt_lower` is the owner's own
-/// last prompt, already lowercased, or an empty string when it could not be
-/// read - `list_exempted` treats that exactly like "the field is absent",
-/// never as a match. `is_subagent` is the caller's own answer to "is this
-/// payload from a Task-tool subagent" (`serve/src/bin/serve.rs`'s own
-/// `payload_is_from_a_subagent`) - `true` drops every fired rule whose
-/// `owner_reading_only` is `true`, `false` drops none of them.
+/// `evaluate`'s own AND/OR/NOT/min_chars matcher (`trigger_fires` for the
+/// trigger side, which also honours `own_claims_only`), plus the positional
+/// escape, the pattern escape (`pattern_escaped`), the list exemption
+/// (`list_exempted`) and the reader scope (this section's own doc comment
+/// above) layered on top. Returns every fired rule's tier and reminder, in
+/// rulebook order - the same order `evaluate` returns its reminders in.
+/// `prompt_lower` is the owner's own last prompt, already lowercased, or an
+/// empty string when it could not be read - `list_exempted` treats that
+/// exactly like "the field is absent", never as a match. `is_subagent` is the
+/// caller's own answer to "is this payload from a Task-tool subagent"
+/// (`serve/src/bin/serve.rs`'s own `payload_is_from_a_subagent`) - `true`
+/// drops every fired rule whose `owner_reading_only` is `true`, `false` drops
+/// none of them.
 pub fn evaluate_opt_in(
     rules: &[OptInRule],
     haystack_lower: &str,
@@ -740,38 +1185,48 @@ pub fn evaluate_opt_in(
     evaluate_opt_in_checked(rules, haystack_lower, prompt_lower, is_subagent, None)
 }
 
-/// `evaluate_opt_in`, plus the reply's checked citations when the caller could
-/// look (see "checked citations" above): a rule that takes a citation as
-/// evidence then reads its escapes in `checked`, and its reminder names the
-/// citations that did not check out, so the writer sees why they did not count.
+/// `evaluate_opt_in`, plus the reply's evidence checked when the caller could
+/// look (see "checked evidence" above): a rule that takes a citation or a sha
+/// as evidence then reads its escapes against what checked out, and its
+/// reminder names what did not, so the writer sees why it did not count.
+/// `evidence` is the original reply with the caller's lookup; the reply is
+/// checked at most once, and only when a rule that takes evidence has
+/// otherwise fired, so an answer no such rule is about costs no lookup at all.
 fn evaluate_opt_in_checked(
     rules: &[OptInRule],
     haystack_lower: &str,
     prompt_lower: &str,
     is_subagent: bool,
-    checked: Option<&CheckedCitations>,
+    evidence: Option<(&str, &EvidenceLookup)>,
 ) -> Vec<(Tier, String)> {
+    let checked: std::cell::OnceCell<Option<CheckedEvidence>> = std::cell::OnceCell::new();
     rules
         .iter()
         .filter_map(|r| {
-            let checked = checked.filter(|_| takes_citations_as_evidence(r));
-            let escapes_lower = checked.map_or(haystack_lower, |c| c.escapes_lower.as_str());
-            let pattern_escape = match checked {
-                Some(c) => pattern_escaped_checked(r, c),
-                None => pattern_escaped(r, haystack_lower),
-            };
-            let fires = rule_matches_with_escapes_in(&r.base, haystack_lower, escapes_lower)
+            let fires_before_escapes = trigger_fires(r, haystack_lower)
                 && !positionally_escaped(r, haystack_lower)
-                && !pattern_escape
                 && !list_exempted(r, prompt_lower, haystack_lower)
                 && !(r.owner_reading_only && is_subagent);
-            if !fires {
+            if !fires_before_escapes {
+                return None;
+            }
+            let checked = if takes_evidence(r) {
+                checked.get_or_init(|| evidence.map(|(message, lookup)| check_evidence(message, lookup))).as_ref()
+            } else {
+                None
+            };
+            let escaped = match checked {
+                Some(c) => none_of_escaped_checked(&r.base, c) || pattern_escaped_checked(r, c),
+                None => none_of_escaped(&r.base, haystack_lower) || pattern_escaped(r, haystack_lower),
+            };
+            if escaped {
                 return None;
             }
             let reminder = match checked.filter(|c| !c.unverified.is_empty()) {
                 Some(c) => format!(
-                    "{} (A path:line counts only when that file exists under the session's working directory and \
-                     has that line; these did not: {}.)",
+                    "{} (Evidence counts only when it checks out: a path:line, or a line number next to a file \
+                     name, must name a line that file really has under the session's working directory, and a \
+                     commit must exist in its git repository; these did not: {}.)",
                     r.base.reminder,
                     c.unverified.iter().take(3).map(String::as_str).collect::<Vec<_>>().join(", ")
                 ),
@@ -800,35 +1255,36 @@ pub struct GuardVerdict {
 /// `block_reason`'s richer sibling: same fail-open stance (no rulebook, or
 /// zero parseable rules, yields both fields `None`), but reads a rulebook
 /// that may carry `before`/`tier`/`none_of_patterns`/`list_request_any_of`/
-/// `owner_reading_only` and keeps a WARN-tier fire out of the block reason
-/// entirely, instead of discarding the tier and treating every fire alike.
-/// `last_user_prompt` is the owner's own last typed prompt (see the
-/// `last_user_prompt` function above for where a caller reads this from), or
-/// an empty string when it is not available - the ONLY thing that ever reads
-/// it, the list exemption, treats an empty string exactly like "the prompt
-/// did not ask for a list". `is_subagent` is threaded straight through to
-/// `evaluate_opt_in` - see this file's own "READER SCOPE" doc comment, right
-/// above it, for what it does and why its default (`false`, from every
-/// existing caller that predates this parameter) must never silently narrow
-/// what a rulebook already blocks or warns about for the owner's own main
-/// session, only ever for a subagent's. `cited_line_exists` is the caller's
-/// way to look a `path:line` citation up (`Some` only when it knows the
-/// session's working directory - see "checked citations" above); `None`
-/// judges a citation by its shape alone, as before that existed.
+/// `owner_reading_only`/`own_claims_only` and keeps a WARN-tier fire out of
+/// the block reason entirely, instead of discarding the tier and treating
+/// every fire alike. `last_user_prompt` is the owner's own last typed prompt
+/// (see the `last_user_prompt` function above for where a caller reads this
+/// from), or an empty string when it is not available - the ONLY thing that
+/// ever reads it, the list exemption, treats an empty string exactly like
+/// "the prompt did not ask for a list". `is_subagent` is threaded straight
+/// through to `evaluate_opt_in` - see this file's own "READER SCOPE" doc
+/// comment, right above it, for what it does and why its default (`false`,
+/// from every existing caller that predates this parameter) must never
+/// silently narrow what a rulebook already blocks or warns about for the
+/// owner's own main session, only ever for a subagent's. `evidence` is the
+/// caller's way to look a citation, a line number or a commit up (`Some` only
+/// when it knows the session's working directory - see "checked evidence"
+/// above); `None` judges all of them by their shape alone, as before that
+/// existed.
 pub fn guard_verdict(
     rulebook_text: Option<&str>,
     message: &str,
     last_user_prompt: &str,
     is_subagent: bool,
-    cited_line_exists: Option<&dyn Fn(&str, u64) -> bool>,
+    evidence: Option<&EvidenceLookup>,
 ) -> GuardVerdict {
     let rules = rulebook_text.map(parse_opt_in_rules).unwrap_or_default();
     if rules.is_empty() {
         return GuardVerdict { block_reason: None, warn_reason: None };
     }
     let prompt_lower = last_user_prompt.to_lowercase();
-    let checked = cited_line_exists.map(|check| check_citations(message, check));
-    let fired = evaluate_opt_in_checked(&rules, &haystack(message), &prompt_lower, is_subagent, checked.as_ref());
+    let fired =
+        evaluate_opt_in_checked(&rules, &haystack(message), &prompt_lower, is_subagent, evidence.map(|e| (message, e)));
     let format_tier = |tier: Tier| -> Option<String> {
         let reasons: Vec<&str> = fired.iter().filter(|(t, _)| *t == tier).map(|(_, r)| r.as_str()).collect();
         if reasons.is_empty() {
@@ -1101,6 +1557,20 @@ mod tests {
         path == "src/real.rs" && (1..=10).contains(&line)
     }
 
+    /// The repository, stood in for: `a2770f8e` is its one commit.
+    fn only_a2770f8e(candidates: &[String]) -> Option<HashSet<String>> {
+        Some(candidates.iter().filter(|c| c.as_str() == "a2770f8e").cloned().collect())
+    }
+
+    /// No repository answers for the working directory.
+    fn no_repository(_: &[String]) -> Option<HashSet<String>> {
+        None
+    }
+
+    fn lookup() -> EvidenceLookup<'static> {
+        EvidenceLookup { line_exists: &only_real_rs, real_commits: &only_a2770f8e }
+    }
+
     /// THE ESCAPE THIS CLOSES: a claim of having verified something, backed by
     /// a citation nobody opened - a line the file does not have, or a file
     /// that is not there - is held once the caller can look, and the reason
@@ -1108,7 +1578,7 @@ mod tests {
     #[test]
     fn a_verified_claim_citing_a_line_that_is_not_there_is_held_when_the_caller_can_look() {
         for msg in ["Verified: src/real.rs:99 has the fix.", "Verified: src/made_up.rs:12 has the fix."] {
-            let v = guard_verdict(Some(EVIDENCE_RULEBOOK), msg, "", false, Some(&only_real_rs));
+            let v = guard_verdict(Some(EVIDENCE_RULEBOOK), msg, "", false, Some(&lookup()));
             let reason = v.block_reason.unwrap_or_else(|| panic!("an unchecked citation must not count: {msg}"));
             assert!(reason.contains("these did not"), "{reason}");
         }
@@ -1116,7 +1586,7 @@ mod tests {
 
     #[test]
     fn a_verified_claim_citing_a_real_line_passes() {
-        let v = guard_verdict(Some(EVIDENCE_RULEBOOK), "Verified: src/real.rs:3 has the fix.", "", false, Some(&only_real_rs));
+        let v = guard_verdict(Some(EVIDENCE_RULEBOOK), "Verified: src/real.rs:3 has the fix.", "", false, Some(&lookup()));
         assert!(v.block_reason.is_none(), "{:?}", v.block_reason);
     }
 
@@ -1133,13 +1603,13 @@ mod tests {
     /// was not checked, both still count.
     #[test]
     fn an_unchecked_citation_counts_for_nothing_but_the_other_escapes_still_do() {
-        let held = guard_verdict(Some(EVIDENCE_RULEBOOK), "Verified: src/deadbeef42.rs:7 has the fix.", "", false, Some(&only_real_rs));
+        let held = guard_verdict(Some(EVIDENCE_RULEBOOK), "Verified: src/deadbeef42.rs:7 has the fix.", "", false, Some(&lookup()));
         assert!(held.block_reason.is_some(), "a hex-looking made-up file name must not pass as a sha");
         for msg in [
             "Verified in a2770f8e, see src/made_up.rs:12.",
             "Verified: src/made_up.rs:12 looks right, but this is unverified.",
         ] {
-            let v = guard_verdict(Some(EVIDENCE_RULEBOOK), msg, "", false, Some(&only_real_rs));
+            let v = guard_verdict(Some(EVIDENCE_RULEBOOK), msg, "", false, Some(&lookup()));
             assert!(v.block_reason.is_none(), "{msg}: {:?}", v.block_reason);
         }
     }
@@ -1147,7 +1617,8 @@ mod tests {
     /// An absolute Windows path is read whole, drive letter included.
     #[test]
     fn an_absolute_windows_citation_reaches_the_lookup_whole() {
-        let lookup = |path: &str, line: u64| path == r"C:\repo\src\real.rs" && line == 3;
+        let line_exists = |path: &str, line: u64| path == r"C:\repo\src\real.rs" && line == 3;
+        let lookup = EvidenceLookup { line_exists: &line_exists, real_commits: &no_repository };
         let v = guard_verdict(Some(EVIDENCE_RULEBOOK), r"Verified: C:\repo\src\real.rs:3 has the fix.", "", false, Some(&lookup));
         assert!(v.block_reason.is_none(), "{:?}", v.block_reason);
     }
@@ -1157,8 +1628,144 @@ mod tests {
     #[test]
     fn a_rule_that_takes_no_citation_as_evidence_is_untouched_by_the_lookup() {
         let rulebook = r#"[{"id":"plain","any_of":["verified"],"none_of":[".rs:"],"reminder":"plain rule"}]"#;
-        let v = guard_verdict(Some(rulebook), "Verified: src/made_up.rs:12 has the fix.", "", false, Some(&only_real_rs));
+        let v = guard_verdict(Some(rulebook), "Verified: src/made_up.rs:12 has the fix.", "", false, Some(&lookup()));
         assert!(v.block_reason.is_none(), "{:?}", v.block_reason);
+    }
+
+    // ---------------------------------- commits, line numbers (2026-09-26)
+
+    fn held(msg: &str) -> bool {
+        guard_verdict(Some(EVIDENCE_RULEBOOK), msg, "", false, Some(&lookup())).block_reason.is_some()
+    }
+
+    /// THE ESCAPE THIS CLOSES: the word "commit" and a typed sha let a claim
+    /// through by their shape; now only a commit the repository has counts.
+    #[test]
+    fn a_commit_counts_only_when_the_repository_has_it() {
+        assert!(!held("Verified: commit a2770f8e has the fix."));
+        assert!(!held("Gecontroleerd: a2770f8e bevat de fix."));
+        assert!(held("Verified: commit 1b2c3d4e has the fix."));
+        assert!(held("Verified: the last commit has the fix."));
+        let reason = guard_verdict(Some(EVIDENCE_RULEBOOK), "Verified in 1b2c3d4e.", "", false, Some(&lookup()))
+            .block_reason
+            .expect("a made-up sha must not count");
+        assert!(reason.contains("1b2c3d4e"), "the reason names the sha that did not count: {reason}");
+    }
+
+    /// Where no repository answers, a sha is judged by its shape, as before.
+    #[test]
+    fn without_a_repository_a_sha_and_the_word_commit_count_by_their_shape() {
+        let lookup = EvidenceLookup { line_exists: &only_real_rs, real_commits: &no_repository };
+        for msg in ["Verified in 1b2c3d4e.", "Verified: the last commit has the fix."] {
+            let v = guard_verdict(Some(EVIDENCE_RULEBOOK), msg, "", false, Some(&lookup));
+            assert!(v.block_reason.is_none(), "{msg}: {:?}", v.block_reason);
+        }
+    }
+
+    /// THE ESCAPE THIS CLOSES: "line " and "regel " counted anywhere, even
+    /// inside another word; now only a line number a named file really has.
+    #[test]
+    fn a_line_number_counts_only_when_a_named_file_has_that_line() {
+        assert!(!held("Verified: line 3 of src/real.rs has the fix."));
+        assert!(!held("Geverifieerd: regel 4 van src/real.rs klopt."));
+        assert!(!held("Verified: src/real.rs, lines 2-5, has the fix."));
+        assert!(held("Verified: line 30 of src/real.rs has the fix."));
+        assert!(held("Verified: line 3 of src/made_up.rs has the fix."));
+        assert!(held("Verified: regel 2 klopt."));
+        assert!(held("Verified: the pipeline is green."));
+        assert!(held("Geverifieerd: de vuistregel klopt."));
+    }
+
+    /// A file named on another line of the answer does not vouch for a line
+    /// number here.
+    #[test]
+    fn a_line_number_needs_its_file_on_the_same_line_of_the_answer() {
+        assert!(held("See src/real.rs.\nVerified: line 3 has the fix."));
+    }
+
+    /// THE ESCAPE THIS CLOSES: ".rs:" matched a file name followed by a colon
+    /// with no line at all.
+    #[test]
+    fn an_extension_with_a_colon_counts_only_inside_a_citation_that_checked_out() {
+        assert!(held("Verified: src/real.rs: the fix is there."));
+        assert!(!held("Verified: src/real.rs:3 has the fix."));
+    }
+
+    /// The honest escapes are untouched.
+    #[test]
+    fn saying_it_was_not_checked_still_passes() {
+        assert!(!held("Verified: the pipeline, although line 30 is not checked."));
+    }
+
+    // ------------------------------------------ reported speech (2026-09-26)
+
+    /// Mirrors the owner's own `claim-no-access-without-checking` rule, with
+    /// the new field set, and a twin without it.
+    const OWN_CLAIMS_RULEBOOK: &str = r#"[
+      {"id":"claim-no-access-without-checking","own_claims_only":true,
+       "any_of":["kan ik van hieruit niet","geen tailnet","geen nas-toegang","geen toegang","ik heb geen toegang",
+                 "i can't reach","i don't have access","no access to the nas"],
+       "none_of":["read-only","alleen-lezen","vals alarm","false positive","any_of"],
+       "reminder":"Verify before claiming you cannot."}
+    ]"#;
+
+    fn own_claim_held(msg: &str) -> bool {
+        guard_verdict(Some(OWN_CLAIMS_RULEBOOK), msg, "", false, None).block_reason.is_some()
+    }
+
+    /// THE FALSE BLOCK THIS CLOSES, in the shapes a report takes.
+    #[test]
+    fn another_partys_reported_or_quoted_words_do_not_fire() {
+        for msg in [
+            "Het model meldde geen toegang te hebben tot de NAS.",
+            "Volgens de agent is er geen toegang tot de share.",
+            "Ik heb het model gevraagd en het meldde geen toegang te hebben.",
+            "Het model meldde: ik heb geen toegang tot de NAS.",
+            "The subagent said it had no access to the NAS.",
+            "The subagent reported: I don't have access to the NAS.",
+            "According to the agent, there is no access to the NAS.",
+            "\"Ik heb geen toegang\", zei de agent.",
+            "De agent schreef \"geen toegang\" terug.",
+            "The tool answered `I don't have access` and stopped.",
+            "Het model schreef:\n> ik heb geen toegang tot de NAS",
+            "De uitvoer van het model:\n```\nik heb geen toegang\n```",
+        ] {
+            assert!(!own_claim_held(msg), "reported speech must not fire: {msg}");
+        }
+    }
+
+    /// The other half: the assistant's own claim still fires, also next to a
+    /// report, also when it reports its own words.
+    #[test]
+    fn the_assistants_own_claim_still_fires() {
+        for msg in [
+            "Ik heb geen toegang tot de NAS.",
+            "Daar heb ik geen toegang toe.",
+            "I don't have access to the NAS from here.",
+            "Het model meldde niets bijzonders en ik heb geen toegang tot de NAS.",
+            "Het model meldde niets, ik heb geen toegang.",
+            "The agent said it was fine, but I can't reach the NAS.",
+            "Ik meldde al: geen toegang.",
+            "Volgens mij heb ik geen toegang.",
+            "\"Geen toegang\", zei ik.",
+            "Ik kreeg \"geen toegang\" terug.",
+            "Ik kreeg deze melding:\n> geen toegang",
+        ] {
+            assert!(own_claim_held(msg), "the assistant's own claim must still fire: {msg}");
+        }
+    }
+
+    /// No rule changes by itself: without the field, a report fires exactly
+    /// as before, and a malformed value reads as absent.
+    #[test]
+    fn without_own_claims_only_a_report_still_fires() {
+        for field in ["", r#""own_claims_only":"yes","#] {
+            let rulebook = format!(
+                r#"[{{"id":"r",{field}"any_of":["geen toegang"],"none_of":["any_of"],"reminder":"no access claim"}}]"#
+            );
+            let v = guard_verdict(Some(&rulebook), "Het model meldde geen toegang te hebben.", "", false, None);
+            assert!(v.block_reason.is_some(), "{field}");
+        }
     }
 
     /// An ordinary Dutch/English word that happens to use only hex-alphabet

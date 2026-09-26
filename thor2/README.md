@@ -242,11 +242,26 @@ rule is one entry with:
 - `none_of_patterns` - shape-based escapes rather than exact words; the
   evidence rule uses these to recognise a commit hash or a `file:line`
   citation however it happens to be written. A rule that names `path_line`
-  here has its citations looked up whenever the `Stop` payload says which
-  directory the session works in: a `file:line` counts only when that file
-  exists under that directory and has that line, and one that does not
-  check out counts for nothing - not even through a literal such as `.rs:`
-  in `none_of`. The block reason then names the citations that did not count.
+  or `commit_sha` here has its evidence looked up whenever the `Stop` payload
+  says which directory the session works in: a `file:line` counts only when
+  that file exists under that directory and has that line; a commit hash, and
+  the word `commit` in `none_of`, count only when the hash names a commit that
+  exists in that directory's git repository; the words `line` and `regel` in
+  `none_of` count only for a line number that a file named on the same line
+  of the reply really has ("line 3 of src/lib.rs"); and a literal such as
+  `.rs:` counts only inside a citation that checked out. Evidence that does
+  not check out counts for nothing, and the block reason names it. Where no
+  git repository answers for that directory, a commit hash is judged by its
+  shape, as it was before. A commit of a different repository than the one
+  the session works in does not count either: name a real line there, or say
+  plainly that it was not checked.
+- `own_claims_only` - `true` marks a rule about the agent's OWN claims, such
+  as "do not say you cannot reach something without trying". Such a rule does
+  not fire on words the reply reports or quotes from someone else ("the other
+  model said it had no access", a quote, a blockquote, a code block), only on
+  what the agent says itself; a first-person word ("I", "ik", "we") in the
+  sentence that frames the report keeps it the agent's own. Left out, the
+  rule reads every word of the reply, whoever said it.
 - `tier` - `block` holds the reply back until it is fixed; `warn` only
   leaves a note behind. Every rule seeded here is `block`.
 - `owner_reading_only` - `true` marks a rule about how a reply reads to the

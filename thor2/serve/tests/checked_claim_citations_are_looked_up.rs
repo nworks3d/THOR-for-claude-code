@@ -98,3 +98,94 @@ fn without_a_working_directory_a_citation_counts_by_its_shape() {
     let out = run_hook(&db, &stop(None, "Verified: src/lib.rs:9 has the fix."));
     assert!(!blocked(&out), "{out}");
 }
+
+// ------------------------------------------- commits and line numbers (2026-09-26)
+//
+// THE ESCAPES THIS CLOSES: after citations were looked up, the rule still let an
+// unchecked claim through on the literal words "commit ", "line " and "regel "
+// (anywhere: "pipeline " carries "line "), on any typed sha-shaped token, and on a
+// bare "name.rs:" with no line at all.
+
+fn git(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.name=test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false"])
+        .args(args)
+        .output()
+        .expect("git must be on PATH");
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+/// The fixture's working directory made a git repository with one commit.
+fn fixture_in_git(tmp: &Path) -> (PathBuf, PathBuf, String) {
+    let (db, work) = fixture(tmp);
+    git(&work, &["init", "-q"]);
+    git(&work, &["add", "-A"]);
+    git(&work, &["commit", "-q", "-m", "init"]);
+    let sha = git(&work, &["rev-parse", "HEAD"]);
+    (db, work, sha)
+}
+
+#[test]
+fn a_commit_counts_only_when_it_exists_in_the_working_directorys_repository() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (db, work, sha) = fixture_in_git(tmp.path());
+    for message in [format!("Verified: commit {} has the fix.", &sha[..8]), format!("Verified: {sha} has the fix.")] {
+        let out = run_hook(&db, &stop(Some(&work), &message));
+        assert!(!blocked(&out), "a real commit must count: {message}: {out}");
+    }
+    for (message, named) in [
+        ("Verified: commit 1a2b3c4d has the fix.", Some("1a2b3c4d")),
+        ("Verified: see 9f8e7d6c5b.", Some("9f8e7d6c5b")),
+        ("Verified: see the last commit on main.", None),
+    ] {
+        let out = run_hook(&db, &stop(Some(&work), message));
+        assert!(blocked(&out), "{message} must be held: {out}");
+        if let Some(named) = named {
+            assert!(out.contains(named), "the reason must name the sha that did not count: {out}");
+        }
+    }
+}
+
+#[test]
+fn a_line_number_counts_only_when_a_named_file_has_that_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (db, work) = fixture(tmp.path());
+    for message in ["Verified: line 3 of src/lib.rs has the fix.", "Geverifieerd: regel 4 van src/lib.rs klopt."] {
+        let out = run_hook(&db, &stop(Some(&work), message));
+        assert!(!blocked(&out), "a real line must count: {message}: {out}");
+    }
+    for message in [
+        "Verified: line 30 of src/lib.rs has the fix.",
+        "Verified: regel 2 klopt.",
+        "Verified: the pipeline is green.",
+        "Verified: src/lib.rs: the fix is there.",
+    ] {
+        let out = run_hook(&db, &stop(Some(&work), message));
+        assert!(blocked(&out), "{message} must be held: {out}");
+    }
+}
+
+/// Where no git repository answers for the working directory, a sha cannot be
+/// looked up and is judged by its shape, as before.
+#[test]
+fn without_a_git_repository_a_sha_is_judged_by_its_shape() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (db, work) = fixture(tmp.path());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_serve"))
+        .arg("--db")
+        .arg(&db)
+        .arg("hook")
+        .env("GIT_CEILING_DIRECTORIES", tmp.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn serve");
+    let payload = stop(Some(&work), "Verified: see 1a2b3c4d.");
+    let _ = child.stdin.take().unwrap().write_all(payload.to_string().as_bytes());
+    let out = String::from_utf8(child.wait_with_output().unwrap().stdout).unwrap();
+    assert!(!blocked(&out), "{out}");
+}
