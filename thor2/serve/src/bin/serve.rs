@@ -1739,8 +1739,14 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
             // for the identical reason: this fires on the COMMAND about to
             // run, never on a stated decision, so it is never gated on
             // `payload_is_from_a_subagent` either.
-            if let Some(reason) = command_guard_block(&store, db_path, &session_id, tool_input, session_cwd.as_deref())
-            {
+            if let Some(reason) = command_guard_block(
+                &store,
+                db_path,
+                &session_id,
+                tool_input,
+                session_cwd.as_deref(),
+                session_project.as_deref(),
+            ) {
                 return Some(HookOutput::Decision(serde_json::json!({
                     "decision": "block",
                     "reason": reason,
@@ -1754,7 +1760,7 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
             // thing it is about - a field that was left out - exists nowhere
             // else. Runs after both arms above so an actual forbidden
             // fragment, which is the more specific complaint, still wins.
-            if let Some(reason) = requires_guard_block(&store, tool_name, tool_input) {
+            if let Some(reason) = requires_guard_block(&store, db_path, &session_id, tool_name, tool_input, session_project.as_deref()) {
                 return Some(HookOutput::Decision(serde_json::json!({
                     "decision": "block",
                     "reason": reason,
@@ -3130,8 +3136,11 @@ fn absent_guard_block(
     // Always binding means every write to every file. It runs last because
     // an anchored rule is the more specific statement about this particular
     // file, and the more specific reason is the more useful one to report.
-    // It needs no root: there is nothing to resolve.
-    let always_candidates = serve::live::always_candidates(store);
+    // It needs no root: there is nothing to resolve. It does need the
+    // session's project, for the same reason the command arms do: the literal
+    // carries no location, so without this one project's forbidden text would
+    // refuse a write in every other checkout (see `in_session_project`).
+    let always_candidates = in_session_project(serve::live::always_candidates(store), project);
     // Location first of the five, and now genuinely first: nothing returns
     // before it any more. It was the arm the old marker placement could
     // silence, which was the wrong way round - it is also the arm with the
@@ -3236,7 +3245,28 @@ fn record_absent_guard_staleness(
 /// Any failure - no input, no matching item, no check of this form - falls
 /// through to `None`, the same "any error is silence" doctrine every other
 /// guard here follows.
-fn requires_guard_block(store: &EventStore, tool: &str, tool_input: Option<&Value>) -> Option<String> {
+///
+/// SCOPED TO THE SESSION'S OWN PROJECT (2026-09-26). This used to read every
+/// live item in the store, whatever project it belonged to, so a rule written
+/// for one checkout refused an ordinary call in another: a rule about how one
+/// repository installs its own fork ("pip must carry --no-deps") refused a
+/// plain `pip install` in an unrelated repository. That is a false block, the
+/// most expensive thing this system can do. Only an item that applies to this
+/// session (`project::applies_to`: its own project, or global) can refuse here
+/// now - the same rule every serving surface already follows.
+///
+/// A refusal is recorded in the log (`record_gate`), exactly like the other two
+/// command-arm refusals: that record is what lets a rule's teeth count as proven
+/// against a real call later (`serve::prove`), and before this a `requires`
+/// refusal left no trace at all.
+fn requires_guard_block(
+    store: &EventStore,
+    db_path: &Path,
+    session_id: &str,
+    tool: &str,
+    tool_input: Option<&Value>,
+    session_project: Option<&str>,
+) -> Option<String> {
     let content = tool_input_values(tool_input?);
     if content.is_empty() {
         return None;
@@ -3248,8 +3278,25 @@ fn requires_guard_block(store: &EventStore, tool: &str, tool_input: Option<&Valu
     // style "command" field), the tool name otherwise, exactly the way the
     // sibling command guard (`command_guard_block` below) already resolves
     // its own target text.
-    let candidates = serve::live::live_items(store);
-    absent_guard::find_requires_violation(&candidates, tool, absent_guard::proposed_command(tool_input), &content)
+    let candidates = in_session_project(serve::live::live_items(store), session_project);
+    let command = absent_guard::proposed_command(tool_input);
+    let reason = absent_guard::find_requires_violation(&candidates, tool, command, &content)?;
+    if let Some(id) = absent_guard::rule_id_of(&reason) {
+        record_gate(db_path, session_id, true, id, command.unwrap_or(tool));
+    }
+    Some(reason)
+}
+
+/// Only the items that apply to a session in `session_project` - its own
+/// project's, and the global ones (`project::applies_to`). Used by every hard
+/// guard whose match reads only the TEXT of a call (a command, or content
+/// with no path of its own): nothing about that text says which checkout it
+/// belongs to, so without this a rule from one project refuses an ordinary
+/// call in another. A path-anchored arm needs no such filter - its own anchor
+/// is resolved against the session's root already (see
+/// `absent_guard::scoped_target_matches`).
+fn in_session_project(items: Vec<serve::live::LiveItem>, session_project: Option<&str>) -> Vec<serve::live::LiveItem> {
+    items.into_iter().filter(|li| project::applies_to(li.item.project.as_deref(), session_project)).collect()
 }
 
 /// How deep `tool_input_values` will recurse into a nested array/object
@@ -3383,6 +3430,7 @@ fn command_guard_block(
     session_id: &str,
     tool_input: Option<&Value>,
     root: Option<&Path>,
+    session_project: Option<&str>,
 ) -> Option<String> {
     let command = absent_guard::proposed_command(tool_input)?;
 
@@ -3464,6 +3512,11 @@ fn command_guard_block(
     // running the match below, so there is no equivalent early exit to take.
     record_command_guard_staleness(store, db_path, &candidates, command, root);
 
+    // Scoped to this session's own project before anything can refuse - see
+    // `in_session_project`. The staleness scan above still reads the whole
+    // pool on purpose: whether an anchor has rotted is true of the store, not
+    // of which checkout happens to be asking.
+    let candidates = in_session_project(candidates, session_project);
     let (reason, anchor) = absent_guard::find_command_violation(&candidates, command, root)?;
 
     // WHAT THIS USED TO DO, AND WHY IT WAS THE WORSE HALF OF A FIXED DEFECT.
