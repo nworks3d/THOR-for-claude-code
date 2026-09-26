@@ -1482,12 +1482,14 @@ pub const OWNER_SETUP_ANSWERS_ID: &str = "owner-setup-answers";
 // anything by existing.
 //
 // Three conditions, all of them per-project: the project's judgement debt is
-// zero, every heavy (irreversible/costly) Rule or Orientation that applies to
-// this project and has fired since the PREVIOUS report carries one of the
-// four reserved `TEETH_*_TAG`s (Change 2's own box - proven, informing,
-// refuses-legitimate, anchor-collapsed all count; only a missing box blocks),
-// and every open point (see below) older than the previous report is either
-// closed (retracted) or has been carried forward exactly once.
+// zero, every heavy (irreversible/costly) Rule or Orientation in this
+// filing's batch - at most `EVALUATION_TEETH_BATCH` of the ones that apply to
+// this project and have fired since the PREVIOUS report, the ones written
+// longest ago first (`teeth_batch_since`) - is settled (`teeth_state`), and
+// every open point (see below) older than the previous report is either
+// closed (retracted) or has been carried forward exactly once. The heavy rules
+// beyond the batch stay owed and are named by `doctor`; the next filing
+// asks for them first.
 //
 // WHAT "PER-PROJECT" MEANS FOR THE FIRST TWO. An item applies to a project
 // when it names that project or names none at all (global) - the same
@@ -1652,26 +1654,101 @@ fn newest_evaluation_report_seq(store: &EventStore, project: Option<&str>) -> i6
         .unwrap_or(0)
 }
 
+/// How many heavy rules one evaluation filing is held to.
+///
+/// WHY A BATCH (2026-09-26). The filing gate used to demand every heavy rule
+/// that fired since the previous report, all at once. Measured on a copy of a
+/// real store: the next evaluation of one project would first have had to
+/// settle about 80 of them - a wall that size is exactly what invites the
+/// dodging this gate exists to stop (a label in bulk, a reason that fits any
+/// rule). Eight is about what one evaluation can settle honestly, one real
+/// check or one checkable reason per rule, and it still clears a backlog of 80
+/// in ten evaluations; the rest stays owed, named by `doctor`, and comes first
+/// next time.
+pub const EVALUATION_TEETH_BATCH: usize = 8;
+
+/// The heavy rules one evaluation filing is held to (see
+/// `EVALUATION_TEETH_BATCH`), and the ones left for a later filing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TeethBatch {
+    /// In this filing's batch and not settled yet, each with what is missing.
+    pub owed_now: Vec<(String, &'static str)>,
+    /// In this filing's batch and settled since the previous report.
+    pub settled: Vec<String>,
+    /// Not settled, and beyond this filing's batch: still owed, asked first
+    /// by a later filing.
+    pub owed_later: Vec<(String, &'static str)>,
+}
+
+/// The batch the NEXT evaluation report for `project` is held to - what the
+/// filing gate refuses on, and what `doctor` shows.
+pub fn evaluation_teeth_batch(store: &EventStore, project: Option<&str>) -> TeethBatch {
+    teeth_batch_since(store, project, newest_evaluation_report_seq(store, project))
+}
+
+/// The kinds of event that WRITE an item (create, correct, settle a
+/// divergence, move it to another project), as opposed to the telemetry kinds
+/// (served, marked, refused) that only record what happened to it.
+fn writes_the_item(kind: EventKind) -> bool {
+    matches!(kind, EventKind::FactCreated | EventKind::FactRevised | EventKind::FactResolved | EventKind::FactReprojected)
+}
+
 /// Every live, heavy (irreversible/costly) Rule or Orientation that applies
-/// to `project` and has fired (any `ItemServed` event, whatever the actor -
-/// a firing to a local model is still a firing its own teeth mattered for)
-/// with a seq strictly greater than `cutoff_seq`, and that still carries
-/// none of the four reserved `TEETH_*_TAG`s - sorted by id for a
-/// deterministic refusal message.
+/// to `project`, has fired (any `ItemServed` event, whatever the actor - a
+/// firing to a local model is still a firing its own teeth mattered for) with
+/// a seq strictly greater than `cutoff_seq`, and was not settled as of that
+/// seq or is not settled now (`teeth_state`) - split into one filing's batch
+/// and the rest.
+///
+/// THE ORDER, AND WHY IT ROTATES. The rules written longest ago come first:
+/// each rule's key is its last write at or before `cutoff_seq`, so a rule
+/// created after the previous report waits behind every older one. Nothing
+/// that happens after the cutoff moves a key, so settling a rule never pulls
+/// the next one into the batch while this evaluation works through it - a
+/// settled batch member stays in its place and counts as done. At the next
+/// filing the cutoff moves to that report: every rule settled in this round
+/// was settled as of that cutoff and drops out, and the ones left unsettled
+/// lead, oldest first. That is the "least recently asked first" the Stop
+/// hook's teeth question keeps with a sidecar, computed here from the log
+/// alone, because this gate reads nothing but the log. The one thing that
+/// can still change the batch mid-evaluation is a rule firing for the first
+/// time since the cutoff - during the evaluation itself - with an older key.
+///
+/// WHY "SETTLED AS OF THE CUTOFF" IS ASKED AT ALL: a rule settled before the
+/// previous report and still settled is not this filing's business, and must
+/// not take a batch place either, or a handful of long-settled rules that
+/// fire often would fill every batch and the backlog behind them would never
+/// be asked. The state as of the cutoff is the item's last created or revised
+/// body at or before it; open points are read as they stand now.
 ///
 /// NEVER RE-COMPUTES THE BOX ITSELF. `serve::prove::teeth_box` needs
-/// `serve::absent_guard`/`serve::rank`, both unreachable from here - see
-/// this section's own top-of-file doc comment. This asks only whether the
-/// write path (`mcp::remember`/`revise`'s own `apply_teeth_test`) or the
-/// maintenance backfill has EVER recorded an answer, which is exactly what
-/// "must carry a machine-assigned teeth box" means: any of the four tags,
-/// not specifically the proven one.
-fn heavy_rules_fired_since_unsettled(store: &EventStore, project: Option<&str>, cutoff_seq: i64) -> Vec<(String, &'static str)> {
-    let Ok(events) = store.get_all_events() else { return Vec::new() };
+/// `serve::absent_guard`/`serve::rank`, both unreachable from here - see this
+/// section's own top-of-file doc comment. `teeth_state` reads only what the
+/// write path or the maintenance backfill recorded on the item.
+fn teeth_batch_since(store: &EventStore, project: Option<&str>, cutoff_seq: i64) -> TeethBatch {
+    let Ok(events) = store.get_all_events() else { return TeethBatch::default() };
     let mut fired_after: HashSet<String> = HashSet::new();
-    for e in &events {
+    // Per item: the seq of its last write at or before the cutoff, of its
+    // first write ever (the key of an item born after the cutoff), and the
+    // index of its last created/revised body at or before the cutoff.
+    let mut last_write_by_cutoff: HashMap<&str, i64> = HashMap::new();
+    let mut first_write: HashMap<&str, i64> = HashMap::new();
+    let mut body_by_cutoff: HashMap<&str, usize> = HashMap::new();
+    for (i, e) in events.iter().enumerate() {
         if e.kind == EventKind::ItemServed && e.seq > cutoff_seq {
             fired_after.insert(e.entity_id.clone());
+        }
+        if !writes_the_item(e.kind) {
+            continue;
+        }
+        first_write.entry(e.entity_id.as_str()).and_modify(|s| *s = (*s).min(e.seq)).or_insert(e.seq);
+        if e.seq <= cutoff_seq {
+            last_write_by_cutoff.entry(e.entity_id.as_str()).and_modify(|s| *s = (*s).max(e.seq)).or_insert(e.seq);
+            if matches!(e.kind, EventKind::FactCreated | EventKind::FactRevised)
+                && body_by_cutoff.get(e.entity_id.as_str()).map_or(true, |&j| events[j].seq < e.seq)
+            {
+                body_by_cutoff.insert(e.entity_id.as_str(), i);
+            }
         }
     }
     let live = all_live_items(store);
@@ -1685,7 +1762,8 @@ fn heavy_rules_fired_since_unsettled(store: &EventStore, project: Option<&str>, 
         .filter(|(_, item)| item.tags.iter().any(|t| t == OPEN_POINT_TAG))
         .map(|(_, item)| item.text.to_lowercase())
         .collect();
-    let mut out: Vec<(String, &'static str)> = live
+    // (key, id, what is missing now - `None` when settled)
+    let mut candidates: Vec<(i64, String, Option<&'static str>)> = live
         .into_iter()
         .filter(|(_, item)| item.kind.can_fire())
         .filter(|(_, item)| project_applies_to(item.project.as_deref(), project))
@@ -1693,11 +1771,36 @@ fn heavy_rules_fired_since_unsettled(store: &EventStore, project: Option<&str>, 
         .filter(|(id, _)| fired_after.contains(id))
         .filter_map(|(id, item)| {
             let named_in_open_point = open_point_texts.iter().any(|t| t.contains(&id.to_lowercase()));
-            teeth_state(&item, named_in_open_point).map(|state| (id, state))
+            let now = teeth_state(&item, named_in_open_point);
+            // An item with no body at or before the cutoff did not exist then,
+            // and one whose old body will not parse cannot prove it was
+            // settled: both count as unsettled as of the cutoff.
+            let settled_at_cutoff = body_by_cutoff
+                .get(id.as_str())
+                .and_then(|&i| parse_body(&events[i].body).ok())
+                .is_some_and(|then| teeth_state(&then, named_in_open_point).is_none());
+            if now.is_none() && settled_at_cutoff {
+                return None;
+            }
+            let key = last_write_by_cutoff
+                .get(id.as_str())
+                .or_else(|| first_write.get(id.as_str()))
+                .copied()
+                .unwrap_or(i64::MAX);
+            Some((key, id, now))
         })
         .collect();
-    out.sort();
-    out
+    candidates.sort();
+    let mut batch = TeethBatch::default();
+    for (place, (_, id, now)) in candidates.into_iter().enumerate() {
+        match (place < EVALUATION_TEETH_BATCH, now) {
+            (true, Some(missing)) => batch.owed_now.push((id, missing)),
+            (true, None) => batch.settled.push(id),
+            (false, Some(missing)) => batch.owed_later.push((id, missing)),
+            (false, None) => {}
+        }
+    }
+    batch
 }
 
 /// Whether one heavy rule's teeth question is SETTLED for an evaluation
@@ -1861,13 +1964,21 @@ fn check_evaluation_report_filing(store: &EventStore, item: &Item) -> Option<Ref
     }
 
     let cutoff_seq = newest_evaluation_report_seq(store, project);
-    let unsettled = heavy_rules_fired_since_unsettled(store, project, cutoff_seq);
-    if !unsettled.is_empty() {
-        let named = unsettled.iter().map(|(id, why)| format!("'{id}' ({why})")).collect::<Vec<_>>().join(", ");
+    let batch = teeth_batch_since(store, project, cutoff_seq);
+    if !batch.owed_now.is_empty() {
+        let named = batch.owed_now.iter().map(|(id, why)| format!("'{id}' ({why})")).collect::<Vec<_>>().join(", ");
+        let later = match batch.owed_later.len() {
+            0 => String::new(),
+            n => format!(
+                " {n} more heavy rule(s) in the same state are not this report's to settle: they stay owed, doctor \
+                 names them, and a later evaluation asks for them first."
+            ),
+        };
         missing.push(format!(
-            "{} heavy rule(s) that apply to this project (its own or global) have fired since the previous report \
-             - the log records when a rule fired, never in which project - and still have neither a real tooth \
-             nor a real reason why they cannot: {named}. For each one, do the work, in this order: (1) find the \
+            "{} heavy rule(s) in this report's batch (at most {EVALUATION_TEETH_BATCH}, the ones written longest ago \
+             first) apply to this project (its own or global), have fired since the previous report - the log \
+             records when a rule fired, never in which project - and still have neither a real tooth nor a real \
+             reason why they cannot: {named}.{later} For each one, do the work, in this order: (1) find the \
              text whose presence MEANS the mistake is happening and give the rule a check with it (forbidden, \
              absent, absent_all, contains or requires) - it counts as proven once the log shows it biting a real \
              call, and until then add an open point naming the rule's id and what real call would prove it; (2) \
@@ -1876,7 +1987,7 @@ fn check_evaluation_report_filing(store: &EventStore, item: &Item) -> Option<Ref
              command, file or moment the rule is about - a reason that would fit any rule does not count; (3) \
              retract it with a reason if it is simply wrong. A label a maintenance pass writes ('teeth:informing') \
              is not an answer: it only says nothing could be tried",
-            unsettled.len()
+            batch.owed_now.len()
         ));
     }
 
@@ -4071,6 +4182,130 @@ mod tests {
         let err = declare(&mut store, "s", "l", "a", &eval_report("eval-r-new", "r")).unwrap_err();
         let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
         assert!(refusal.problem.contains("boxed-heavy"), "{}", refusal.problem);
+    }
+
+    // ------------------------------------ the batch one filing is held to
+
+    /// Settles a heavy fixture rule the honest way: a reason that names its
+    /// own command.
+    fn settle_by_naming_the_trigger(store: &mut EventStore, id: &str) {
+        let existing = show(store, id).unwrap();
+        let mut settled = existing.clone();
+        settled.tags = vec![format!(
+            "{}an authorised fixture-command-{id} run is typed exactly like a wrong one",
+            NO_CATCH_ON_COMMAND_REASON_PREFIX
+        )];
+        revise(store, "s", "l", "a", &existing, &settled).unwrap();
+    }
+
+    fn filing_refusal(store: &mut EventStore, report: &str, project: &str) -> Option<String> {
+        match declare(store, "s", "l", "a", &eval_report(report, project)) {
+            Ok(_) => None,
+            Err(WriteError::Refused(refusal)) => Some(refusal.problem),
+            Err(other) => panic!("expected a refusal or a filing: {other}"),
+        }
+    }
+
+    /// `n` heavy rules without a tooth or a real reason, written in order
+    /// (`w-00` first), each fired once.
+    fn unsettled_fired_rules(store: &mut EventStore, project: &str, n: usize) -> Vec<String> {
+        let ids: Vec<String> = (0..n).map(|i| format!("w-{i:02}")).collect();
+        for id in &ids {
+            legacy_thinly_answered(store, id, Some(project));
+        }
+        for id in &ids {
+            serve_n(store, id, "hook", 1);
+        }
+        ids
+    }
+
+    /// THE WALL THIS REMOVES: with twelve heavy rules owed since the previous
+    /// report, one filing is held to a batch - the eight written longest ago -
+    /// and files once those eight are settled, while the other four stay owed.
+    #[test]
+    fn a_filing_is_held_to_one_batch_and_the_rest_stays_owed() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "s", "l", "a", &eval_report("eval-w-0", "w")).unwrap();
+        let ids = unsettled_fired_rules(&mut store, "w", 12);
+
+        let (batch, rest) = ids.split_at(EVALUATION_TEETH_BATCH.min(ids.len()));
+        let problem = filing_refusal(&mut store, "eval-w-1", "w").expect("the batch is owed");
+        for id in batch {
+            assert!(problem.contains(&format!("'{id}'")), "the batch must name {id}: {problem}");
+        }
+        for id in rest {
+            assert!(!problem.contains(&format!("'{id}'")), "{id} is beyond the batch: {problem}");
+        }
+        assert!(problem.contains("4 more heavy rule(s)"), "the rest must be counted, not hidden: {problem}");
+
+        for id in batch {
+            settle_by_naming_the_trigger(&mut store, id);
+        }
+        assert_eq!(filing_refusal(&mut store, "eval-w-1", "w"), None, "a settled batch must let the report through");
+        let owed: Vec<String> = evaluation_teeth_batch(&store, Some("w")).owed_now.into_iter().map(|(id, _)| id).collect();
+        assert!(owed.is_empty(), "nothing has fired since the new report: {owed:?}");
+    }
+
+    /// Settling one rule of the batch never pulls the next one in: the batch
+    /// holds still while an evaluation works through it.
+    #[test]
+    fn settling_a_batch_member_does_not_pull_the_next_rule_in() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "s", "l", "a", &eval_report("eval-s-0", "s")).unwrap();
+        let ids = unsettled_fired_rules(&mut store, "s", 10);
+        settle_by_naming_the_trigger(&mut store, &ids[0]);
+
+        let batch = evaluation_teeth_batch(&store, Some("s"));
+        assert_eq!(batch.settled, vec![ids[0].clone()]);
+        let owed: Vec<&str> = batch.owed_now.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(owed, ids[1..EVALUATION_TEETH_BATCH].iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(batch.owed_later.len(), 2);
+    }
+
+    /// The next filing asks for what the last one left, first.
+    #[test]
+    fn the_next_filing_asks_first_for_what_the_last_one_left() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "s", "l", "a", &eval_report("eval-r0", "rot")).unwrap();
+        let ids = unsettled_fired_rules(&mut store, "rot", 11);
+        for id in &ids[..EVALUATION_TEETH_BATCH] {
+            settle_by_naming_the_trigger(&mut store, id);
+        }
+        declare(&mut store, "s", "l", "a", &eval_report("eval-r1", "rot")).unwrap();
+        // Every rule fires again, and one more heavy rule is written after the
+        // report: the three left behind lead, and the new one waits behind.
+        legacy_thinly_answered(&mut store, "z-newer", Some("rot"));
+        for id in ids.iter().map(String::as_str).chain(["z-newer"]) {
+            serve_n(&mut store, id, "hook", 1);
+        }
+        let batch = evaluation_teeth_batch(&store, Some("rot"));
+        let owed: Vec<&str> = batch.owed_now.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(owed, vec!["w-08", "w-09", "w-10", "z-newer"], "left-behind rules first, then the newer one");
+        assert!(batch.settled.is_empty(), "rules settled before the previous report take no place: {:?}", batch.settled);
+    }
+
+    /// Rules settled long ago that keep firing never fill the batch, or the
+    /// backlog behind them would never be asked.
+    #[test]
+    fn rules_settled_before_the_previous_report_take_no_place_in_the_batch() {
+        let mut store = EventStore::in_memory().unwrap();
+        for i in 0..EVALUATION_TEETH_BATCH {
+            let mut settled = heavy_command_rule(&format!("old-{i}"), "k");
+            settled.tags = vec![format!(
+                "{}an authorised fixture-command-old-{i} run is typed exactly like a wrong one",
+                NO_CATCH_ON_COMMAND_REASON_PREFIX
+            )];
+            declare(&mut store, "s", "l", "a", &settled).unwrap();
+        }
+        declare(&mut store, "s", "l", "a", &eval_report("eval-k-0", "k")).unwrap();
+        let ids = unsettled_fired_rules(&mut store, "k", 3);
+        for i in 0..EVALUATION_TEETH_BATCH {
+            serve_n(&mut store, &format!("old-{i}"), "hook", 3);
+        }
+        let batch = evaluation_teeth_batch(&store, Some("k"));
+        let owed: Vec<String> = batch.owed_now.into_iter().map(|(id, _)| id).collect();
+        assert_eq!(owed, ids);
+        assert!(batch.settled.is_empty(), "{:?}", batch.settled);
     }
 
     /// A reason a reader can check against the rule - it names the rule's own

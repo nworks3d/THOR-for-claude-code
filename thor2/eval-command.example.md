@@ -160,6 +160,14 @@ and decide for each. `get` shows you `severity`; a fact with no `check`
 field can stop nothing. Note the `teeth` line from the health check before
 you start this step and again once you finish it - the report names both.
 
+Start with this report's batch: at most eight heavy facts that fired since
+the previous report without a real tooth or a real reason, the ones written
+longest ago first. The ask for this evaluation names them, the health check
+names them on its `evaluation batch` line, and the report cannot be filed
+until each one is settled. The heavy facts beyond the batch stay owed, are
+named on that same line, and lead the next report's batch - settle more of
+them when there is time, but never fewer than the batch.
+
 The burden of proof is reversed: for every heavy fact with no check, TRY to
 give it one before anything else. Work out, in writing, which literal
 fragment marks the mistake, at which file or command it belongs (a fact
@@ -217,8 +225,9 @@ anchor full after moving it? Correct the check until it holds, or store the
 fact without a check and put the reason nothing can catch it in the tags
 (quoting the legitimate call or naming the trigger, as above); a full anchor
 is solved with a route from step 6. That happens in the same turn, not as a
-line in the report. Step 4 is done once every heavy fact that fired has a
-decision - a check that bit reality, a wired check carried by a named open
+line in the report. Step 4 is done once every heavy fact in this report's
+batch, and every other one you took on, has a decision - a check that bit
+reality, a wired check carried by a named open
 point, or a tried-and-justified no-literal tag - every fact that already
 carried a no-literal tag has been re-checked this session, and nothing is
 left hanging on a refusal. Retracting a heavy fact takes a reason that says

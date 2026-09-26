@@ -3014,6 +3014,10 @@ fn evaluation_debt(
              Run the THOR evaluation before you finish: {ask} \
              A turn cannot end until the evaluation report for this project is filed."
         );
+        if let Some(batch) = teeth_batch_note(store, current_project) {
+            message.push_str("\n\n");
+            message.push_str(&batch);
+        }
         if let Some(points) = open_points_full_block(store, current_project) {
             message.push_str("\n\n");
             message.push_str(&points);
@@ -3040,12 +3044,38 @@ fn evaluation_debt(
              A turn cannot end until the evaluation report for this project is filed. After that it is quiet for {covers_hours} hours.",
             usefulness::days_ago(now, first_asked)
         );
+        if let Some(batch) = teeth_batch_note(store, current_project) {
+            message.push_str("\n\n");
+            message.push_str(&batch);
+        }
         if let Some(points) = open_points_full_block(store, current_project) {
             message.push_str("\n\n");
             message.push_str(&points);
         }
         Some(message)
     }
+}
+
+/// The heavy rules this evaluation's report is held to
+/// (`model::store::evaluation_teeth_batch`), named in the message that asks
+/// for the evaluation, so a session sees the batch before it starts rather
+/// than only in the refusal at the end. `None` when the batch owes nothing.
+fn teeth_batch_note(store: &EventStore, project: Option<&str>) -> Option<String> {
+    let batch = model::store::evaluation_teeth_batch(store, project);
+    if batch.owed_now.is_empty() {
+        return None;
+    }
+    let named = batch.owed_now.iter().map(|(id, why)| format!("\n- '{id}': {why}")).collect::<String>();
+    let later = match batch.owed_later.len() {
+        0 => String::new(),
+        n => format!(" {n} more stay owed for a later report; doctor names them."),
+    };
+    Some(format!(
+        "This report's batch of heavy rules (at most {}, the ones written longest ago first) - each has fired \
+         since the previous report and has neither a real tooth nor a real reason why it cannot, and the report \
+         cannot be filed until each one is settled.{later}{named}",
+        model::store::EVALUATION_TEETH_BATCH
+    ))
 }
 
 /// How many open points `SessionStart`'s own note names in full before
@@ -5413,6 +5443,39 @@ mod evaluation_debt_tests {
         assert!(asked.contains("It has been asked 1 time(s)"), "{asked}");
         assert!(asked.contains("A turn cannot end until the evaluation report for this project is filed"), "{asked}");
         assert!(asked.contains("After that it is quiet for 16 hours"), "{asked}");
+    }
+
+    /// The ask names the batch of heavy rules the report will be held to, and
+    /// counts the ones that stay owed beyond it (2026-09-26).
+    #[test]
+    fn the_ask_names_the_batch_of_heavy_rules_and_counts_the_rest() {
+        let (_dir, db, mut store) = new_store();
+        let owed = model::store::EVALUATION_TEETH_BATCH + 2;
+        for i in 0..owed {
+            let id = format!("heavy-{i:02}");
+            let item = Item {
+                id: id.clone(),
+                kind: Kind::Rule,
+                text: format!("a heavy fixture rule {id}"),
+                bindings: vec![Binding::Moment(intent::Action::Commit)],
+                severity: Some(model::item::Severity::Irreversible),
+                project: Some("thor".to_string()),
+                tags: vec![],
+                expires: None,
+                key: None,
+                falsifier: Some("it stops being true".to_string()),
+                check: None,
+            };
+            // Straight into the log: the write gate would ask this heavy rule
+            // for a tooth or a reason, which is exactly what it still lacks.
+            let body = serde_json::to_string(&item).unwrap();
+            store.append_event("legacy", &id, "migration", thor_core::event_store::EventKind::FactCreated, &id, None, &body).unwrap();
+            serve_it(&mut store, &id, 1);
+        }
+        let asked = evaluation_debt(&store, &db, Some("thor"), &work_minutes(90)).expect("the evaluation is owed");
+        assert!(asked.contains("This report's batch of heavy rules"), "{asked}");
+        assert_eq!(asked.matches("\n- 'heavy-").count(), model::store::EVALUATION_TEETH_BATCH, "{asked}");
+        assert!(asked.contains("2 more stay owed for a later report"), "{asked}");
     }
 
     /// Case named in the build brief: zero items owed must still fire once

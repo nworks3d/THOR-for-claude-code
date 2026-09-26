@@ -1128,6 +1128,41 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool
     Some(out.join("\n"))
 }
 
+/// The heavy rules the next evaluation report of this checkout's project is
+/// held to (`model::store::evaluation_teeth_batch`), and the ones that stay
+/// owed beyond that batch - named, so nothing the batch leaves out is hidden.
+/// Silent outside a project (no report can be filed there) and when nothing
+/// that fired since the previous report still owes a tooth or a reason.
+pub fn evaluation_batch_line(db: &Path, checkout_project: Option<&str>, full: bool) -> Option<String> {
+    let project = checkout_project?;
+    let store = EventStore::open_existing(db).ok()?;
+    let batch = model::store::evaluation_teeth_batch(&store, Some(project));
+    if batch.owed_now.is_empty() && batch.owed_later.is_empty() {
+        return None;
+    }
+    let mut out = vec![format!(
+        "evaluation batch: the next evaluation report for '{project}' must settle {} heavy rule(s) - its batch holds at \
+         most {}, the ones written longest ago first, and {} of it already settled since the previous report; {} more \
+         heavy rule(s) that fired since then still have neither a real tooth nor a real reason, stay owed, and lead \
+         the batch of a later report",
+        batch.owed_now.len(),
+        model::store::EVALUATION_TEETH_BATCH,
+        batch.settled.len(),
+        batch.owed_later.len()
+    )];
+    for (id, why) in &batch.owed_now {
+        out.push(format!("  batch: {id} - {why}"));
+    }
+    let cap = name_cap(full);
+    for (id, why) in batch.owed_later.iter().take(cap) {
+        out.push(format!("  owed later: {id} - {why}"));
+    }
+    if batch.owed_later.len() > cap {
+        out.push(format!("  owed later: and {} more, not named here (use --full)", batch.owed_later.len() - cap));
+    }
+    Some(out.join("\n"))
+}
+
 fn short(hash: &str) -> &str {
     &hash[..hash.len().min(8)]
 }
@@ -2033,6 +2068,7 @@ pub fn report(
     // rather than in place of it. `full` also lifts its named-items cap, the
     // same flag `decay_line`/`crowding_line` already take it from.
     lines.extend(judgement_debt_line(db, checkout_project, full));
+    lines.extend(evaluation_batch_line(db, checkout_project, full));
     // Silent unless two live checks on the same file actually disagree right
     // now - see `contradiction_line`'s own doc comment for how this differs
     // from GROUND 29 (`model::gate::opposing_literals`), which refuses a
@@ -2173,6 +2209,38 @@ mod tests {
         store
             .append_event("legacy", &item.id, "migration", thor_core::event_store::EventKind::FactCreated, &item.id, None, &body)
             .unwrap();
+    }
+
+    /// The batch the next report is held to, and what stays owed beyond it,
+    /// are both named - the summary count and the named lists agree.
+    #[test]
+    fn the_evaluation_batch_line_names_the_batch_and_every_rule_left_owed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut s = EventStore::new(&db).unwrap();
+        let mut report = rule("eval-batch-0");
+        report.kind = Kind::Report;
+        report.bindings = vec![];
+        report.falsifier = None;
+        report.project = Some("proj".to_string());
+        report.tags = vec![store::EVALUATION_REPORT_TAG.to_string()];
+        legacy_declare(&mut s, &report);
+        let owed = store::EVALUATION_TEETH_BATCH + 3;
+        for i in 0..owed {
+            let mut heavy = rule(&format!("heavy-{i:02}"));
+            heavy.severity = Some(model::item::Severity::Irreversible);
+            heavy.project = Some("proj".to_string());
+            legacy_declare(&mut s, &heavy);
+            s.append_event("s", "l", "hook", EventKind::ItemServed, &heavy.id, None, "{}").unwrap();
+        }
+        drop(s);
+
+        let line = evaluation_batch_line(&db, Some("proj"), true).expect("rules are owed");
+        assert_eq!(number_before(&line, " heavy rule(s) - its batch"), store::EVALUATION_TEETH_BATCH, "{line}");
+        assert_eq!(line.matches("\n  batch: ").count(), store::EVALUATION_TEETH_BATCH, "{line}");
+        assert_eq!(number_before(&line, " more heavy rule(s)"), 3, "{line}");
+        assert_eq!(line.matches("\n  owed later: ").count(), 3, "{line}");
+        assert!(evaluation_batch_line(&db, None, true).is_none(), "no project, no report to file, no line");
     }
 
     /// Pulls the plain integer immediately before `marker` out of a report

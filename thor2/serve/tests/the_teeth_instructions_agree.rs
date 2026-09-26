@@ -37,6 +37,17 @@ fn the_routine_and_the_stop_hook_accept_the_same_answers() {
     );
 }
 
+/// The routine names the batch size in words; the filing gate holds a report
+/// to the constant. Changing one without the other fails here.
+#[test]
+fn the_routine_names_the_batch_size_the_filing_gate_holds_a_report_to() {
+    let words = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"];
+    let size = model::store::EVALUATION_TEETH_BATCH;
+    let word = words.get(size).unwrap_or_else(|| panic!("name a batch of {size} in the routine and extend this list"));
+    let routine = read("eval-command.example.md");
+    assert!(routine.contains(&format!("at most {word} heavy facts")), "the routine must say the batch holds at most {word}");
+}
+
 #[test]
 fn neither_sends_an_agent_to_a_bulk_relabel() {
     let refusal = read("model/src/store.rs");
