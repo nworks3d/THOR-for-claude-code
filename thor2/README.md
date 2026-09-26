@@ -450,7 +450,12 @@ stdout, exit 0 always, silent on any failure - and it branches on the
 payload's own `hook_event_name`: `SessionStart`, `UserPromptSubmit`, and
 anything else is treated as a tool call about to happen. Only `hook` records
 that an item actually fired, so the counts you later read in `doctor` come
-from that door alone.
+from that door alone. A tool call names its place in `file_path` (Read, Write,
+Edit) or, for a search, in `path` (Grep, Glob): a search that names a file or
+folder brings up the facts anchored there - a folder's own rules, or a file's
+and those of the folders it sits in - but only to inform. A search is never
+refused, and it never counts as touching every file under the folder it
+searches.
 
 One trap costs an evening if you meet it blind: a payload carrying a Windows
 path in single backslashes is not valid JSON, and this program then prints

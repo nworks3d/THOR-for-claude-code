@@ -1937,6 +1937,14 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
             if let Some(file_path) = file_path {
                 input.add_file(file_path);
             }
+            let searched = searched_path(tool_name, tool_input);
+            if let Some(searched) = searched {
+                // Only the PLACE, never the moments a file touch derives: a
+                // search acts on nothing, so it informs about what is anchored
+                // there and nothing more. `file` makes the `why` hint name it.
+                input.add_target(TargetKind::Path, searched);
+                input.file = Some(searched.to_string());
+            }
             // The Remember moment (`intent::Action::Remember`): nothing
             // derives it from a command or file path (see `intent`'s own
             // closed vocabulary doc comment), so this is the one place a
@@ -1993,7 +2001,7 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
             // Bash-style call never carries both at once in a real payload
             // (see the comment above `input.add_command`/`add_file` a few
             // lines up), so the order only matters for a hand-built input.
-            let trigger = absent_guard::proposed_command(tool_input).or(file_path);
+            let trigger = absent_guard::proposed_command(tool_input).or(file_path).or(searched);
             if !no_record {
                 deliver::record_delivery_with_trigger(
                     &mut store,
@@ -3918,6 +3926,20 @@ fn stale_guard_stop_check(db_path: &Path, session_id: &str) -> Option<HookOutput
 /// `mcp/src/lib.rs` must be echoed here by hand.
 const MCP_REMEMBER_TOOL: &str = "remember"; // mirrors mcp::Mcp::remember
 const MCP_REVISE_TOOL: &str = "revise"; // mirrors mcp::Mcp::revise
+
+/// The file or folder a Grep or Glob call searches, when it names one: those
+/// two tools carry it in `path`, never in the `file_path` Read, Write and Edit
+/// carry - so until this existed no search ever fired a rule anchored at the
+/// place it searched (measured 2026-09-26: no shape of either did). Used ONLY
+/// for the informing surface: it is never handed to a guard, so a search is
+/// never refused, whatever is anchored there. `None` for every other tool, and
+/// for a search that names no path (the session's own directory).
+fn searched_path<'a>(tool_name: &str, tool_input: Option<&'a Value>) -> Option<&'a str> {
+    if !matches!(tool_name, "Grep" | "Glob") {
+        return None;
+    }
+    tool_input?.get("path")?.as_str().map(str::trim).filter(|p| !p.is_empty())
+}
 
 /// The tool-name half of a namespaced MCP tool call. Claude Code calls an MCP
 /// tool as `mcp__<server-name>__<tool-name>` - the server-name half is
