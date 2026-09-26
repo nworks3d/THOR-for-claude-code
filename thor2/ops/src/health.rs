@@ -2076,6 +2076,27 @@ mod tests {
             .unwrap();
     }
 
+    /// Pulls the plain integer immediately before `marker` out of a report
+    /// line - e.g. `number_before("teeth: 3 of 9 ... the other 6 can only
+    /// inform", " can only inform")` returns `6`. Used only by the two
+    /// summary-versus-named-list invariant tests below: reading the actual
+    /// claimed number out of the real sentence, rather than re-deriving it
+    /// from the fixture, is what makes those tests catch a REAL drift
+    /// between the two - a test that instead hard-codes what the summary
+    /// "should" say would not notice the summary computing a different
+    /// number than the list it sits next to.
+    fn number_before(text: &str, marker: &str) -> usize {
+        let idx = text.find(marker).expect("marker must appear in the line");
+        text[..idx]
+            .trim_end()
+            .rsplit(|c: char| !c.is_ascii_digit())
+            .next()
+            .filter(|s| !s.is_empty())
+            .expect("a number must precede the marker")
+            .parse()
+            .expect("the token right before the marker must be a plain number")
+    }
+
     // ---------------------------------------------------- checkouts root
     //
     // THE DEFECT THESE PREVENT, reported at the end of two separate
@@ -3533,6 +3554,43 @@ mod tests {
         assert!(!full.contains("not named here"), "{full}");
     }
 
+    /// THE CLASS OF BUG THIS CLOSES: a summary count and the named list
+    /// sitting right under it silently disagreeing about what they counted -
+    /// this project has already hit exactly that once, on `unjudged_line`,
+    /// where the summary said none were open while a fuller read still
+    /// found some. `without_reason` and `bare` are built in the SAME branch of the
+    /// SAME loop over the SAME `fireable` population (see `proof_line`'s own
+    /// body), so within one call they cannot disagree - this test pins that
+    /// down as a standing invariant, not an accident of today's code, by
+    /// reading the actual claimed number back out of the real sentence
+    /// (`number_before`) rather than hard-coding what it "should" say.
+    #[test]
+    fn proof_line_the_bare_no_catch_count_in_its_own_summary_always_equals_its_named_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut s = EventStore::new(&db).unwrap();
+            for n in 0..7 {
+                let mut item = rule(&format!("bare-invariant-{n:02}"));
+                item.tags = vec![store::NO_LITERAL_TAG.to_string()];
+                legacy_declare(&mut s, &item);
+            }
+            // A reasoned answer too - a bug that folded the two answers
+            // together would inflate the count without inflating the list,
+            // and this is what would catch that.
+            let mut reasoned = rule("reasoned-invariant");
+            reasoned.tags = vec![format!("{}this fixture spells out its own reason", store::NO_LITERAL_REASON_PREFIX)];
+            legacy_declare(&mut s, &reasoned);
+        }
+        // --full: the named list must never be capped, or a real mismatch
+        // past the cap would hide behind the tail line instead of failing.
+        let line = proof_line(&db, true);
+        let claimed = number_before(&line, " of those without saying why");
+        let named = line.lines().filter(|l| l.starts_with("  bare no-catch:")).count();
+        assert_eq!(claimed, named, "the summary count and its own named list must agree: {line}");
+        assert_eq!(claimed, 7, "sanity: exactly the seven bare fixtures, never the reasoned one: {line}");
+    }
+
     /// THE INVERSION THIS REPORTS. Severity is the first ranking key, so a
     /// heavy item takes a place from every lighter one at the same trigger -
     /// and measured on the owner's real store, not one heavy rule could refuse
@@ -3636,6 +3694,43 @@ mod tests {
         let full_named = full.lines().filter(|l| l.starts_with("  toothless: toothless-")).count();
         assert_eq!(full_named, 25, "--full must name every one of them: {full}");
         assert!(!full.contains("not named here"), "{full}");
+    }
+
+    /// THE SAME INVARIANT `proof_line_the_bare_no_catch_count_in_its_own_
+    /// summary_always_equals_its_named_list` pins down for `proof_line`,
+    /// here for `teeth_line`'s own pair: `heavy - heavy_with_teeth` in the
+    /// summary sentence and the `toothless` list built alongside it in the
+    /// same loop. Both new named lists this change added carry the identical
+    /// risk - a summary and its own list drifting apart - so both get the
+    /// identical regression test, reading the real claimed number back out
+    /// of the sentence (`number_before`) rather than hard-coding it.
+    #[test]
+    fn teeth_line_the_toothless_count_in_its_own_summary_always_equals_its_named_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut s = EventStore::new(&db).unwrap();
+            for n in 0..7 {
+                let mut item = rule(&format!("toothless-invariant-{n:02}"));
+                item.severity = Some(model::item::Severity::Costly);
+                legacy_declare(&mut s, &item);
+            }
+            // A heavy, armed rule too - a bug that folded the toothed and
+            // toothless populations together would inflate the claimed
+            // count without inflating the list, and this is what would
+            // catch that.
+            let mut armed = rule("armed-invariant");
+            armed.severity = Some(model::item::Severity::Irreversible);
+            armed.check = Some(model::item::Check::Forbidden { literals: vec!["nope".to_string()] });
+            legacy_declare(&mut s, &armed);
+        }
+        // --full: the named list must never be capped, or a real mismatch
+        // past the cap would hide behind the tail line instead of failing.
+        let line = teeth_line(&db, true);
+        let claimed = number_before(&line, " can only inform");
+        let named = line.lines().filter(|l| l.starts_with("  toothless:")).count();
+        assert_eq!(claimed, named, "the summary count and its own named list must agree: {line}");
+        assert_eq!(claimed, 7, "sanity: exactly the seven toothless fixtures, never the armed one: {line}");
     }
 
     /// THE BLIND SPOT THIS REPORTS. A pinned item is skipped by decay outright
