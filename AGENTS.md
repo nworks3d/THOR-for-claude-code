@@ -189,8 +189,12 @@ naming any of the answers is refused. If there is genuinely nothing to catch
 either way - a judgement rule like "check with me first" has nothing to catch -
 tag it `no-literal:<why not>` and it goes in unchanged.
 The reason is the answer: a bare `no-literal` is refused, because an exit that
-costs nothing is the one that gets taken instead of the work. Nothing can verify
-your reason; the point is that the next reader can disagree with it. Never widen
+costs nothing is the one that gets taken instead of the work. On a rule marked
+expensive the reason also has to be about THAT rule: quote the legitimate call
+that carries the same fragment (between quotes), or name the command, file or
+moment the rule is about. "It is a judgement rule" fits every rule, so it is
+refused. Nothing can verify your reason is true; the point is that the next
+reader can check it against the rule and disagree with it. Never widen
 the text to catch more: a rule that blocks legitimate work is the most expensive
 thing this system can do.
 

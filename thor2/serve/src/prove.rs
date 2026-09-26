@@ -107,6 +107,171 @@ use crate::live::LiveItem;
 use crate::rank::{self, RankedItem};
 use model::item::{Binding, Check, Item, Severity, TargetKind};
 use std::path::Path;
+use thor_core::event_store::{EventKind, EventStore};
+
+// ------------------------------------------------------------- against reality
+//
+// THE DEFECT THIS CLOSES (2026-09-26). Everything below this section proves
+// REACH: an attempt is built out of the rule's own anchor and its own
+// literal, and handed to the guard. That can never tell a real tooth from an
+// invented one. Measured on a copy of a real store: a rule about
+// repartitioning a disk was given the forbidden literal "zqxj-nooit-getypt"
+// - a string no command will ever carry - and came back a proven guard,
+// because the attempt built from that literal carried it by construction.
+// The doctor's count of proven guards rose by four that way without a single
+// real tooth being added.
+//
+// So a guard is PROVEN only against something the rule's author did not
+// write for the purpose: the log of what actually happened.
+//
+// - A REAL REFUSAL: a `gate_refused` event for this item - the real hook
+//   refused a real call (or a recorded trial run through the real hook, which
+//   leaves the same record with its exact text for anyone to read). For a
+//   check that reads a command, the recorded call is tried again against the
+//   check as it stands now, so a refusal earned by an older literal never
+//   vouches for a newer one. For a check on a file, whose written content the
+//   log does not keep, the refusal only counts when it came AFTER the current
+//   check was set.
+// - A REAL EARLIER TRIGGER: a call this rule was served on (`item_served`,
+//   with the command it fired at) that the current check WOULD refuse - the
+//   mistake happened for real before the check existed, and now it would be
+//   caught. Held to a second condition, because a literal can be chosen to
+//   match ordinary use just as easily: at least as many of the rule's real
+//   calls must pass as are caught. A check that would refuse most of what
+//   its own rule really fired on is refusing the rule's ordinary use, not its
+//   mistake, and proves nothing.
+//
+// A check that reaches correctly both ways but has never met either is
+// `TeethBox::Wired`: honest about being wired, and never counted as proven.
+
+/// What the log says one item's check has met in the real world - see this
+/// section's own comment. Built by `reality`; `Reality::default()` is an item
+/// the log knows nothing about (a brand-new write), which can never be proven.
+#[derive(Debug, Clone, Default)]
+pub struct Reality {
+    /// Every `gate_refused` event for this item: (seq, the refused target).
+    pub refusals: Vec<(i64, String)>,
+    /// Every distinct trigger this item was served on: (seq of its newest
+    /// serving, the trigger text).
+    pub served: Vec<(i64, String)>,
+    /// The seq from which the check being judged has stood unchanged in the
+    /// log - `i64::MAX` when that check is not the one the log holds (a revise
+    /// that is about to change it, or a fresh write).
+    pub check_since: i64,
+}
+
+/// Read `id`'s real record from the log, judged for `check` - the check about
+/// to be stored, which may differ from the one the log holds. Fails open to
+/// "nothing on record", never to evidence: an unreadable log proves nothing.
+pub fn reality(store: &EventStore, id: &str, check: Option<&Check>) -> Reality {
+    let Ok(events) = store.get_events_by_entity(id) else {
+        return Reality { check_since: i64::MAX, ..Default::default() };
+    };
+    let mut refusals = Vec::new();
+    let mut served: Vec<(i64, String)> = Vec::new();
+    let mut logged_check: Option<Option<Check>> = None;
+    let mut since = i64::MAX;
+    for e in &events {
+        match e.kind {
+            EventKind::FactCreated | EventKind::FactRevised => {
+                let Ok(item) = model::store::parse_body(&e.body) else { continue };
+                if logged_check.as_ref() != Some(&item.check) {
+                    since = e.seq;
+                    logged_check = Some(item.check);
+                }
+            }
+            EventKind::FactRetracted => {
+                logged_check = None;
+                since = i64::MAX;
+            }
+            EventKind::GateRefused => {
+                let target = serde_json::from_str::<serde_json::Value>(&e.body)
+                    .ok()
+                    .and_then(|v| v.get("target").and_then(|t| t.as_str()).map(str::to_string));
+                if let Some(target) = target.filter(|t| !t.trim().is_empty()) {
+                    refusals.push((e.seq, target));
+                }
+            }
+            EventKind::ItemServed => {
+                let trigger = serde_json::from_str::<model::served::ItemServed>(&e.body).ok().and_then(|s| s.trigger);
+                if let Some(trigger) = trigger.filter(|t| !t.trim().is_empty()) {
+                    match served.iter_mut().find(|(_, t)| *t == trigger) {
+                        Some(slot) => slot.0 = e.seq,
+                        None => served.push((e.seq, trigger)),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let check_since = if logged_check.as_ref().map(|c| c.as_ref()) == Some(check) { since } else { i64::MAX };
+    Reality { refusals, served, check_since }
+}
+
+/// Whether `item`'s CURRENT check would refuse the real call `text` - the
+/// same guard function the hook runs, never a second matcher. `None` when the
+/// check does not read a call at all (a file check), so a caller knows the
+/// question could not be asked rather than reading it as "let through".
+fn refuses_real_call(id: &str, item: &Item, text: &str) -> Option<bool> {
+    let one = [LiveItem { id: id.to_string(), item: item.clone() }];
+    match (&item.check, forbidden_reach(item)) {
+        (Some(Check::Forbidden { .. }), ForbiddenReach::Command(_)) => {
+            Some(absent_guard::find_command_violation(&one, text, Some(Path::new("."))).is_some())
+        }
+        (Some(Check::Requires { .. }), _) => Some(absent_guard::find_requires_violation(&one, text, Some(text), text).is_some()),
+        _ => None,
+    }
+}
+
+/// Whether one of `item`'s own command anchors reaches `text` at all - a
+/// served trigger that is a file path, or `session start`, is no call of this
+/// rule's own and says nothing either way about its check.
+fn anchor_reaches(item: &Item, text: &str) -> bool {
+    item.bindings.iter().any(|b| match b {
+        Binding::Target { kind: TargetKind::Command, value } => absent_guard::command_anchor_names(value, text),
+        _ => false,
+    })
+}
+
+/// The real-world evidence that `item`'s current check bites, or `None` - see
+/// this section's own comment for the two kinds that count and why nothing
+/// else does. The returned sentence names the exact call and its log seq, so
+/// a reader can disagree with it.
+pub fn bitten(id: &str, item: &Item, reality: &Reality) -> Option<String> {
+    item.check.as_ref()?;
+    for (seq, target) in &reality.refusals {
+        match refuses_real_call(id, item, target) {
+            Some(true) => {
+                return Some(format!("the real hook refused `{target}` (log seq {seq}), and this check still refuses it"));
+            }
+            Some(false) => {}
+            None if *seq > reality.check_since => {
+                return Some(format!("the real hook refused a write to {target} (log seq {seq}) under this same check"));
+            }
+            None => {}
+        }
+    }
+    let mut caught: Vec<&(i64, String)> = Vec::new();
+    let mut passed = 0usize;
+    for call in &reality.served {
+        if !anchor_reaches(item, &call.1) {
+            continue;
+        }
+        match refuses_real_call(id, item, &call.1) {
+            Some(true) => caught.push(call),
+            Some(false) => passed += 1,
+            None => {}
+        }
+    }
+    let (seq, text) = caught.first().map(|c| (c.0, c.1.as_str()))?;
+    if passed < caught.len() {
+        return None;
+    }
+    Some(format!(
+        "it would have refused the real call `{text}` this rule fired on (log seq {seq}), and it lets {passed} other real \
+         call(s) of this same rule through"
+    ))
+}
 
 /// What trying the check actually showed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -496,11 +661,19 @@ pub enum TeethBox {
     /// module also decided the other three: a `Forbidden` check that can
     /// never reach anything, whatever it looks like.
     KeepRefusing(String),
-    /// BOTH sides held: the guard refused the forbidden form (`forbidden_
-    /// tried`) AND let the clean, legitimate form (`clean_tried`) straight
-    /// through. The write receipt shows both - never just the one side that
-    /// used to be the whole story.
-    ProvenGuard { forbidden_tried: String, clean_tried: String },
+    /// PROVEN AGAINST REALITY (2026-09-26): the check has bitten a real call
+    /// on record - `evidence` names it (see `bitten`) - and, where a
+    /// synthesised two-sided test can be built at all, that test held too
+    /// (`forbidden_tried`/`clean_tried`, `None` for a file check that only a
+    /// real write can try). The only box a counter of real teeth may count.
+    ProvenGuard { evidence: String, forbidden_tried: Option<String>, clean_tried: Option<String> },
+    /// WIRED, NOT PROVEN (2026-09-26): BOTH synthesised sides held - the
+    /// forbidden form was refused and the clean one let through - but nothing
+    /// in the log shows this check ever meeting a real call. It is reach,
+    /// never a tooth: the attempt was built from the rule's own literal, so a
+    /// literal no command will ever carry lands here exactly as a good one
+    /// does. Never counted as proven; `note` says what would prove it.
+    Wired { forbidden_tried: String, clean_tried: String, note: String },
     /// THE THIRD OUTCOME (2026-09-24): the guard refused the forbidden form
     /// AND the clean, legitimate one - it cannot tell a genuine violation of
     /// this fact apart from ordinary, authorised use of the very same
@@ -618,12 +791,29 @@ fn over_blocking_hint(item: &Item) -> String {
 /// runs ONLY when the forbidden side actually fired - if it did not, the
 /// fact is already toothless from that one side alone, and testing legitimate
 /// use of a check that catches nothing yet would add nothing but confusion.
-pub fn teeth_box(id: &str, item: &Item, root: Option<&Path>) -> TeethBox {
+pub fn teeth_box(id: &str, item: &Item, root: Option<&Path>, reality: &Reality) -> TeethBox {
     if !is_heavy(item.severity) && !is_refusing_kind(item.check.as_ref()) {
         return TeethBox::NotApplicable;
     }
     if let Some((anchor, literals)) = anchor_and_literals_for_collapse(item) {
         if let Some(literal) = collapsed_literal(anchor, literals) {
+            // A collapsed anchor refuses every call on it, by construction. When
+            // the log shows it doing exactly that to a real call, that is a
+            // tooth that bit - the question of whether the anchor is meant to be
+            // that specific is still named, but no longer a reason to count
+            // this as unproven and push someone into swapping a working check
+            // for an invented one (measured: exactly that happened, on request
+            // of the Stop hook, in a test on a copy of a real store).
+            if let Some(evidence) = bitten(id, item, reality) {
+                return TeethBox::ProvenGuard {
+                    evidence: format!(
+                        "{evidence}; its anchor '{anchor}' contains its own literal '{literal}', so it refuses every call \
+                         on that anchor - which is what it did"
+                    ),
+                    forbidden_tried: None,
+                    clean_tried: None,
+                };
+            }
             return TeethBox::AnchorCollapsed {
                 anchor: anchor.to_string(),
                 literal: literal.to_string(),
@@ -639,7 +829,24 @@ pub fn teeth_box(id: &str, item: &Item, root: Option<&Path>) -> TeethBox {
     }
     match prove(id, item, root) {
         Proof::Fires(forbidden_tried) => match prove_clean(id, item, root) {
-            Proof::Silent(clean_tried) => TeethBox::ProvenGuard { forbidden_tried, clean_tried },
+            Proof::Silent(clean_tried) => match bitten(id, item, reality) {
+                Some(evidence) => TeethBox::ProvenGuard {
+                    evidence,
+                    forbidden_tried: Some(forbidden_tried),
+                    clean_tried: Some(clean_tried),
+                },
+                None => TeethBox::Wired {
+                    note: format!(
+                        "tried forbidden: {forbidden_tried}; refused. Tried clean: {clean_tried}; let through. That is \
+                         reach only: both attempts were built from this rule's own literal, so they prove the check is \
+                         wired, never that the literal is the mistake. Nothing in the log shows it meeting a real call \
+                         yet - it counts as proven the first time the real hook refuses a real call with it, or when a \
+                         real call this rule already fired on carries the literal"
+                    ),
+                    forbidden_tried,
+                    clean_tried,
+                },
+            },
             Proof::Fires(clean_tried) => {
                 let note = format!(
                     "tried forbidden: {forbidden_tried}; the guard refused it, correctly. Tried clean: \
@@ -678,7 +885,14 @@ pub fn teeth_box(id: &str, item: &Item, root: Option<&Path>) -> TeethBox {
         Proof::NotProvable(why) if why.starts_with("a forbidden check reaches only") => {
             TeethBox::KeepRefusing(format!("REFUSED: {why}. As written it can never fire, whatever it looks like."))
         }
-        Proof::NotProvable(why) => TeethBox::Informing { tried: None, note: format!("nothing to try: {why}") },
+        // No synthesised attempt is possible here (a check that reads a file,
+        // with no working copy, or one that can only be proven against real
+        // content) - but the log may still hold the real thing: the real hook
+        // refusing a real write under this very check.
+        Proof::NotProvable(why) => match bitten(id, item, reality) {
+            Some(evidence) => TeethBox::ProvenGuard { evidence, forbidden_tried: None, clean_tried: None },
+            None => TeethBox::Informing { tried: None, note: format!("nothing to try: {why}") },
+        },
     }
 }
 
@@ -919,7 +1133,7 @@ mod tests {
     fn a_light_item_with_no_check_is_not_applicable() {
         let mut item = rule("just a note", vec![Binding::Always], None);
         item.severity = None;
-        assert_eq!(teeth_box("r1", &item, None), TeethBox::NotApplicable);
+        assert_eq!(teeth_box("r1", &item, None, &Reality::default()), TeethBox::NotApplicable);
     }
 
     #[test]
@@ -930,29 +1144,30 @@ mod tests {
             Some(Check::Contains { path: "NOTES.md".to_string(), literal: "TODO".to_string() }),
         );
         item.severity = Some(Severity::HouseStyle);
-        assert_eq!(teeth_box("r1", &item, None), TeethBox::NotApplicable);
+        assert_eq!(teeth_box("r1", &item, None, &Reality::default()), TeethBox::NotApplicable);
     }
 
     #[test]
     fn a_heavy_item_with_no_check_lands_in_the_informing_box_with_nothing_tried() {
         let item = rule("ask before pushing to main", vec![Binding::Always], None);
-        match teeth_box("r1", &item, None) {
+        match teeth_box("r1", &item, None, &Reality::default()) {
             TeethBox::Informing { tried: None, note } => assert!(note.contains("nothing to try"), "{note}"),
             other => panic!("{other:?}"),
         }
     }
 
     #[test]
-    fn a_light_item_with_a_reachable_forbidden_check_is_still_tried_and_still_proven() {
+    fn a_light_item_with_a_reachable_forbidden_check_is_still_tried_and_comes_back_wired() {
         // A refusing-kind check applies regardless of severity - the second,
-        // independent half of the applicability rule.
+        // independent half of the applicability rule. With nothing on record
+        // it is wired, never proven (see "against reality").
         let mut item = rule(
             "never force-push",
             vec![cmd("git push")],
             Some(Check::Forbidden { literals: vec!["--force".to_string()] }),
         );
         item.severity = Some(Severity::HouseStyle);
-        assert!(matches!(teeth_box("r1", &item, None), TeethBox::ProvenGuard { .. }));
+        assert!(matches!(teeth_box("r1", &item, None, &Reality::default()), TeethBox::Wired { .. }));
     }
 
     #[test]
@@ -962,7 +1177,7 @@ mod tests {
             vec![Binding::Moment(intent::Action::Push)],
             Some(Check::Forbidden { literals: vec!["--force".to_string()] }),
         );
-        match teeth_box("r1", &item, None) {
+        match teeth_box("r1", &item, None, &Reality::default()) {
             TeethBox::KeepRefusing(msg) => assert!(msg.starts_with("REFUSED:"), "{msg}"),
             other => panic!("the one preserved refusal must still fire: {other:?}"),
         }
@@ -984,7 +1199,7 @@ mod tests {
             vec![path("other.txt")],
             Some(Check::Absent { path: "README.md".to_string(), literal: "TODO".to_string() }),
         );
-        match teeth_box("r1", &item, Some(dir.path())) {
+        match teeth_box("r1", &item, Some(dir.path()), &Reality::default()) {
             TeethBox::Informing { tried: Some(tried), note } => {
                 assert!(tried.contains("TODO") && tried.contains("README.md"), "{tried}");
                 assert!(note.contains("tried:"), "{note}");
@@ -1002,7 +1217,7 @@ mod tests {
             vec![path("README.md")],
             Some(Check::Absent { path: "README.md".to_string(), literal: "TODO".to_string() }),
         );
-        match teeth_box("r1", &item, Some(dir.path())) {
+        match teeth_box("r1", &item, Some(dir.path()), &Reality::default()) {
             TeethBox::Informing { tried: None, note } => {
                 assert!(note.contains("does not currently exist"), "{note}");
             }
@@ -1044,14 +1259,14 @@ mod tests {
     /// tried`/`clean_tried` pair) carries both, never just the one side that
     /// used to be the whole story.
     #[test]
-    fn a_proven_guard_carries_both_the_forbidden_and_the_clean_attempt() {
+    fn a_wired_guard_carries_both_the_forbidden_and_the_clean_attempt() {
         let item = rule(
             "never force-push",
             vec![cmd("git push")],
             Some(Check::Forbidden { literals: vec!["--force".to_string()] }),
         );
-        match teeth_box("r1", &item, None) {
-            TeethBox::ProvenGuard { forbidden_tried, clean_tried } => {
+        match teeth_box("r1", &item, None, &Reality::default()) {
+            TeethBox::Wired { forbidden_tried, clean_tried, .. } => {
                 assert!(forbidden_tried.contains("--force"), "{forbidden_tried}");
                 assert_eq!(clean_tried, "git push", "the clean form is the anchor alone, nothing appended: {clean_tried}");
             }
@@ -1060,7 +1275,7 @@ mod tests {
     }
 
     #[test]
-    fn an_absent_proven_guard_carries_both_the_forbidden_and_the_clean_attempt() {
+    fn an_absent_wired_guard_carries_both_the_forbidden_and_the_clean_attempt() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("README.md"), "hello").unwrap();
         let item = rule(
@@ -1068,8 +1283,8 @@ mod tests {
             vec![path("README.md")],
             Some(Check::Absent { path: "README.md".to_string(), literal: "TODO".to_string() }),
         );
-        match teeth_box("r1", &item, Some(dir.path())) {
-            TeethBox::ProvenGuard { forbidden_tried, clean_tried } => {
+        match teeth_box("r1", &item, Some(dir.path()), &Reality::default()) {
+            TeethBox::Wired { forbidden_tried, clean_tried, .. } => {
                 assert!(forbidden_tried.contains("TODO"), "{forbidden_tried}");
                 assert!(clean_tried.contains("README.md") && !clean_tried.contains("TODO"), "{clean_tried}");
             }
@@ -1081,14 +1296,14 @@ mod tests {
     /// top-of-file doc comment names: the forgotten form (no answer) refuses,
     /// the satisfied form (one acceptable answer present) does not.
     #[test]
-    fn a_requires_check_is_proven_both_ways_forgotten_refuses_satisfied_passes() {
+    fn a_requires_check_is_wired_both_ways_forgotten_refuses_satisfied_passes() {
         let item = rule(
             "a deploy names its target",
             vec![cmd("deploy")],
             Some(Check::Requires { when: "deploy".to_string(), required: vec!["--staging".to_string(), "--production".to_string()] }),
         );
-        match teeth_box("r1", &item, None) {
-            TeethBox::ProvenGuard { forbidden_tried, clean_tried } => {
+        match teeth_box("r1", &item, None, &Reality::default()) {
+            TeethBox::Wired { forbidden_tried, clean_tried, .. } => {
                 assert_eq!(forbidden_tried, "deploy");
                 assert!(clean_tried.contains("deploy") && clean_tried.contains("--staging"), "{clean_tried}");
             }
@@ -1107,7 +1322,7 @@ mod tests {
             vec![cmd("git push --force")],
             Some(Check::Forbidden { literals: vec!["--force".to_string()] }),
         );
-        match teeth_box("r1", &item, None) {
+        match teeth_box("r1", &item, None, &Reality::default()) {
             TeethBox::AnchorCollapsed { anchor, literal, note } => {
                 assert_eq!(anchor, "git push --force");
                 assert_eq!(literal, "--force");
@@ -1124,7 +1339,7 @@ mod tests {
             vec![path("TODO.md")],
             Some(Check::Absent { path: "TODO.md".to_string(), literal: "TODO".to_string() }),
         );
-        match teeth_box("r1", &item, None) {
+        match teeth_box("r1", &item, None, &Reality::default()) {
             TeethBox::AnchorCollapsed { anchor, literal, .. } => {
                 assert_eq!(anchor, "TODO.md");
                 assert_eq!(literal, "TODO");
@@ -1153,7 +1368,7 @@ mod tests {
             vec![cmd("git push")],
             Some(Check::Forbidden { literals: vec![String::new()] }),
         );
-        match teeth_box("r1", &item, None) {
+        match teeth_box("r1", &item, None, &Reality::default()) {
             TeethBox::RefusesLegitimateUse { forbidden_tried, clean_tried, note } => {
                 assert!(forbidden_tried.contains("git push"), "{forbidden_tried}");
                 assert_eq!(clean_tried, "git push");
@@ -1172,12 +1387,180 @@ mod tests {
             vec![path("README.md")],
             Some(Check::Absent { path: "README.md".to_string(), literal: String::new() }),
         );
-        match teeth_box("r1", &item, Some(dir.path())) {
+        match teeth_box("r1", &item, Some(dir.path()), &Reality::default()) {
             TeethBox::RefusesLegitimateUse { forbidden_tried, clean_tried, .. } => {
                 assert!(forbidden_tried.contains("README.md"), "{forbidden_tried}");
                 assert!(clean_tried.contains("README.md"), "{clean_tried}");
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    // ------------------------------------------------------- against reality
+
+    fn on_record(refusals: &[(i64, &str)], served: &[(i64, &str)], check_since: i64) -> Reality {
+        Reality {
+            refusals: refusals.iter().map(|(s, t)| (*s, t.to_string())).collect(),
+            served: served.iter().map(|(s, t)| (*s, t.to_string())).collect(),
+            check_since,
+        }
+    }
+
+    /// THE ATTACK THIS CLOSES, measured on a copy of a real store: a literal
+    /// no command will ever carry came back a proven guard, because the
+    /// attempt was built from it. Now it is wired at most.
+    #[test]
+    fn an_invented_literal_with_nothing_on_record_is_never_proven() {
+        let item = rule(
+            "never repartition the data disk without a fresh backup",
+            vec![cmd("diskpart")],
+            Some(Check::Forbidden { literals: vec!["zqxj-never-typed".to_string()] }),
+        );
+        let real_calls = on_record(&[], &[(10, "diskpart /s list-disks.txt"), (20, "diskpart /s volumes.txt")], 5);
+        match teeth_box("r1", &item, None, &real_calls) {
+            TeethBox::Wired { note, .. } => assert!(note.contains("never that the literal is the mistake"), "{note}"),
+            other => panic!("an invented literal must never come back proven: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_real_refusal_the_current_check_still_makes_proves_the_guard() {
+        let item = rule(
+            "never force-push",
+            vec![cmd("git push")],
+            Some(Check::Forbidden { literals: vec!["--force".to_string()] }),
+        );
+        match teeth_box("r1", &item, None, &on_record(&[(42, "git push --force origin main")], &[], i64::MAX)) {
+            TeethBox::ProvenGuard { evidence, forbidden_tried, clean_tried } => {
+                assert!(evidence.contains("git push --force origin main") && evidence.contains("42"), "{evidence}");
+                assert!(forbidden_tried.is_some() && clean_tried.is_some(), "the synthesised test held too");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A working check swapped for an invented one keeps none of the old
+    /// check's record: the old refusal is tried again against the NEW check,
+    /// which does not refuse it. Measured on a copy of a real store: the Stop
+    /// hook pushed exactly this swap, to earn a "proven" label.
+    #[test]
+    fn a_refusal_earned_by_an_older_literal_never_vouches_for_a_new_one() {
+        let item = rule(
+            "never run the old importer",
+            vec![cmd("thor")],
+            Some(Check::Forbidden { literals: vec!["zqxj-invented-import".to_string()] }),
+        );
+        let old_refusal = on_record(&[(7, "thor import --from old")], &[], i64::MAX);
+        assert!(!matches!(teeth_box("r1", &item, None, &old_refusal), TeethBox::ProvenGuard { .. }));
+    }
+
+    #[test]
+    fn a_real_earlier_call_it_would_catch_proves_it_while_ordinary_calls_still_pass() {
+        let item = rule(
+            "never force-push",
+            vec![cmd("git push")],
+            Some(Check::Forbidden { literals: vec!["--force".to_string()] }),
+        );
+        let served = [(1, "git push origin main"), (2, "git push --force origin main"), (3, "git push origin topic")];
+        match teeth_box("r1", &item, None, &on_record(&[], &served, i64::MAX)) {
+            TeethBox::ProvenGuard { evidence, .. } => {
+                assert!(evidence.contains("git push --force origin main") && evidence.contains("2 other"), "{evidence}")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A literal can be picked to match ORDINARY use just as easily as the
+    /// mistake. One that would refuse most of what its own rule really fired
+    /// on is refusing the rule's ordinary work, and proves nothing.
+    #[test]
+    fn a_literal_that_would_refuse_most_of_its_rules_real_calls_is_not_proven() {
+        let item = rule(
+            "never push without green tests",
+            vec![cmd("git push")],
+            Some(Check::Forbidden { literals: vec!["origin".to_string()] }),
+        );
+        let served = [(1, "git push origin main"), (2, "git push origin topic"), (3, "git push")];
+        assert!(!matches!(teeth_box("r1", &item, None, &on_record(&[], &served, i64::MAX)), TeethBox::ProvenGuard { .. }));
+    }
+
+    /// A served trigger that is not a call of this rule's own anchor (a file
+    /// path, `session start`) says nothing either way, so it is not counted as
+    /// a call that "passed".
+    #[test]
+    fn a_trigger_the_anchor_never_reaches_is_not_counted_as_ordinary_use() {
+        let item = rule(
+            "never force-push",
+            vec![cmd("git push"), path("README.md")],
+            Some(Check::Forbidden { literals: vec!["--force".to_string()] }),
+        );
+        let served = [(1, "git push --force origin main"), (2, "README.md"), (3, "session start")];
+        assert!(!matches!(teeth_box("r1", &item, None, &on_record(&[], &served, i64::MAX)), TeethBox::ProvenGuard { .. }));
+    }
+
+    /// A file check cannot be tried again against content the log never
+    /// kept, so a real refusal counts only when it came after the current
+    /// check was set.
+    #[test]
+    fn a_file_check_is_proven_only_by_a_refusal_after_its_check_was_set() {
+        let item = rule(
+            "the index keeps its header",
+            vec![path("files/README.md")],
+            Some(Check::Contains { path: "files/README.md".to_string(), literal: "agent zone".to_string() }),
+        );
+        let after = on_record(&[(30, "files/README.md")], &[], 20);
+        assert!(matches!(teeth_box("r1", &item, None, &after), TeethBox::ProvenGuard { .. }));
+        let before = on_record(&[(10, "files/README.md")], &[], 20);
+        assert!(matches!(teeth_box("r1", &item, None, &before), TeethBox::Informing { .. }));
+    }
+
+    /// A collapsed anchor that refused a real call is a tooth that bit - it is
+    /// not pushed into being swapped for an invented literal any more.
+    #[test]
+    fn a_collapsed_anchor_that_refused_a_real_call_is_proven() {
+        let item = rule(
+            "never run the old importer",
+            vec![cmd("thor import")],
+            Some(Check::Forbidden { literals: vec!["thor import".to_string()] }),
+        );
+        match teeth_box("r1", &item, None, &on_record(&[(5, "thor import --from old")], &[], i64::MAX)) {
+            TeethBox::ProvenGuard { evidence, .. } => assert!(evidence.contains("contains its own literal"), "{evidence}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(teeth_box("r1", &item, None, &Reality::default()), TeethBox::AnchorCollapsed { .. }));
+    }
+
+    #[test]
+    fn a_requires_refusal_on_record_proves_the_requires_check() {
+        let item = rule(
+            "a deploy names its target",
+            vec![cmd("deploy")],
+            Some(Check::Requires { when: "deploy".to_string(), required: vec!["--staging".to_string()] }),
+        );
+        assert!(matches!(teeth_box("r1", &item, None, &on_record(&[(9, "deploy now")], &[], i64::MAX)), TeethBox::ProvenGuard { .. }));
+    }
+
+    /// `reality` itself, against a real log: refusals, distinct served
+    /// triggers, and the seq from which the check being judged has stood -
+    /// `i64::MAX` for a check the log does not hold.
+    #[test]
+    fn reality_reads_the_log_and_dates_the_current_check() {
+        let mut store = EventStore::in_memory().unwrap();
+        let mut item = rule(
+            "never force-push",
+            vec![cmd("git push")],
+            Some(Check::Forbidden { literals: vec!["--force".to_string()] }),
+        );
+        item.tags = vec!["no-literal:probe with 'git push origin main' as the legitimate call".to_string()];
+        let created = model::store::declare(&mut store, "s", "l", "a", &item).unwrap();
+        crate::deliver::record_delivery_with_trigger(&mut store, "s", "l", "hook", "2026-09-26T00:00:00Z", &["r1".to_string()], Some("git push origin main"));
+        crate::deliver::record_delivery_with_trigger(&mut store, "s", "l", "hook", "2026-09-26T00:00:01Z", &["r1".to_string()], Some("git push origin main"));
+        crate::deliver::record_gate_outcome(&mut store, "s", "l", "hook", "2026-09-26T00:00:02Z", true, "r1", "git push --force");
+        let r = reality(&store, "r1", item.check.as_ref());
+        assert_eq!(r.check_since, created.seq);
+        assert_eq!(r.served.len(), 1, "a trigger seen twice is one distinct call: {:?}", r.served);
+        assert_eq!(r.refusals.len(), 1);
+        let other = Check::Forbidden { literals: vec!["--mirror".to_string()] };
+        assert_eq!(reality(&store, "r1", Some(&other)).check_since, i64::MAX, "a check the log does not hold has no date");
     }
 }

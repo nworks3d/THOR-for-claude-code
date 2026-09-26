@@ -1926,7 +1926,7 @@ mod tests {
         rule.severity = Some(Severity::Irreversible);
         // Gate ground 11: bound Always there is no literal to forbid, so the
         // tag is the honest answer. This test is about search, not teeth.
-        rule.tags = vec![format!("{}a test fixture with nothing literal to catch", store::NO_LITERAL_REASON_PREFIX)];
+        rule.tags = vec![format!("{}a test fixture where 'the same call' is also the legitimate one", store::NO_LITERAL_REASON_PREFIX)];
         store::declare(&mut db, "s", "l", "a", &rule).unwrap();
         let hits = search(&db, "force-push");
         assert_eq!(hits.len(), 1);

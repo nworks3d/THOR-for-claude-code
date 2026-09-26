@@ -1375,6 +1375,26 @@ pub fn project_eval_state(db: &Path, project: Option<&str>) -> ProjectEvalState 
     read_eval_debt_state(db).remove(project_key(project)).unwrap_or_default()
 }
 
+/// The project `session_id` last did work in, read from this same sidecar -
+/// `None` when the session never worked inside any project at all.
+///
+/// THE DEFECT THIS CLOSES (2026-09-26). Every debt resolved "which project"
+/// from the payload's CURRENT working directory alone, so a session that had
+/// worked in a project for an hour and then changed directory to a folder
+/// that belongs to no project - a scratch folder, a temp dir - made every
+/// debt about that project fall silent: the work was still owed, the Stop
+/// that should ask for it simply no longer knew where it belonged. A caller
+/// falls back to this only when the working directory resolves to nothing;
+/// a directory that resolves to a real project always wins.
+pub fn last_project_of_session(db: &Path, session_id: &str) -> Option<String> {
+    read_eval_debt_state(db)
+        .into_iter()
+        .filter(|(key, _)| !key.is_empty())
+        .filter_map(|(key, state)| state.sessions.get(session_id).map(|s| (key, s.last_event_unix.unwrap_or(i64::MIN))))
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+        .map(|(key, _)| key)
+}
+
 /// Every id of a live Report, scoped to EXACTLY `project` (not
 /// `project::applies_to`'s "or global" rule: a report filed for one project
 /// must never silence a different project's own debt, and - moot in

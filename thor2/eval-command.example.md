@@ -172,14 +172,31 @@ re-anchoring, not by writing a new rule.
 
 Only after that attempt may you answer "no literal", and only with one of
 two reasons written into the tag: the fragment also appears in legitimate
-use of that command (name the legitimate form), or the mistake leaves no
-text at all - an omission, a judgement. "It is a judgement rule" without
-having made the attempt is not an answer.
+use of that command - QUOTE that legitimate call between quotes, for
+example `no-literal:the same fragment is in 'git push origin main' which is
+allowed` - or the mistake leaves no text at all, an omission or a judgement -
+then NAME what the rule is about: its command, its file, or the moment it
+fires at. The gate refuses a reason on a heavy fact that does neither: "it
+is a judgement rule" fits every rule in the store, so it says nothing about
+this one. A reason that quotes the call or names the trigger is a settled
+answer; the Stop hook and the report gate stop asking about that fact.
 
 A heavy fact that already carries a no-literal tag is re-checked, not waved
-through: read the reason again against the fact. If the fact names a
+through: read the reason again against the fact. An older reason that
+neither quotes a call nor names the trigger does not count any more - the
+debts keep naming that fact until you rewrite it. If the fact names a
 command or a file, the reason is suspect and the attempt above applies
 again. Say per fact whether the reason held.
+
+A label the tool writes is never an answer. `teeth:informing` only says
+nothing could be tried; `teeth:wired-not-proven` says the check reaches the
+right place both ways, but was tried only with attempts built from its own
+literal, which an invented literal passes just as well. A check counts as a
+real tooth - `teeth:proven-guard` - only once the log shows it biting
+reality: the real hook refused a real call under it, or a real call the rule
+already fired on carries its literal while the rule's ordinary calls still
+pass. Never run the dangerous command itself to "prove" a check: if the
+check does not catch your form of it, the command runs.
 
 What you NEVER do here: stretch the literal to catch more. If it catches one
 form and not another, that is the honest answer - write down the gap you
@@ -188,17 +205,24 @@ outcome this system knows (see step 6), and the doctrine forbids widening a
 trigger to buy a catch.
 
 This evaluation cannot probe anything itself; that needs a real command. So
-every check you add here goes on step 8's list as "still to be probed". A
-check that has never been probed is an assumption.
+every check you add here that comes back `teeth: wired, not proven` goes on
+the report's open points: file one open point per fact, naming its id and
+the real call that would prove it. That open point is what lets the report
+through while the check has not met reality yet, and the next evaluation
+has to close it - with the real refusal, or by retracting the check with a
+reason. A check that has never met a real call is an assumption.
 
 Does the gate refuse the check you are adding - does it not hold, or is the
 anchor full after moving it? Correct the check until it holds, or store the
-fact without a check and put the reason nothing can catch it in the tags; a
-full anchor is solved with a route from step 6. That happens in the same
-turn, not as a line in the report. Step 4 is done once every heavy fact that
-fired has a decision - a check that holds, or a tried-and-justified
-no-literal tag - every fact that already carried a no-literal tag has been
-re-checked this session, and nothing is left hanging on a refusal.
+fact without a check and put the reason nothing can catch it in the tags
+(quoting the legitimate call or naming the trigger, as above); a full anchor
+is solved with a route from step 6. That happens in the same turn, not as a
+line in the report. Step 4 is done once every heavy fact that fired has a
+decision - a check that bit reality, a wired check carried by a named open
+point, or a tried-and-justified no-literal tag - every fact that already
+carried a no-literal tag has been re-checked this session, and nothing is
+left hanging on a refusal. Retracting a heavy fact takes a reason that says
+what changed about THAT fact; "no longer relevant" is refused.
 
 ## 5. Capture what was missing
 

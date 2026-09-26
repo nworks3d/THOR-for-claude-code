@@ -33,7 +33,7 @@ fn rule_always(id: &str, project: Option<&str>) -> Item {
         // Gate ground 11 asks every heavy rule whether it can refuse. These
         // fixtures exist to test DELIVERY, and a generic "standing rule N" has
         // no literal to catch, so the tag is the truthful answer.
-        tags: vec![format!("{}a test fixture with nothing literal to catch", model::store::NO_LITERAL_REASON_PREFIX)],
+        tags: vec![format!("{}a test fixture where 'the same call' is also the legitimate one", model::store::NO_LITERAL_REASON_PREFIX)],
         expires: None,
         key: None,
         falsifier: Some(format!("standing rule {id} turns out to be wrong")),
@@ -50,7 +50,7 @@ fn rule_moment(id: &str, action: Action) -> Item {
         severity: Some(Severity::Irreversible),
         project: None,
         // Same as rule_always: asked, and there is nothing literal to catch.
-        tags: vec![format!("{}a test fixture with nothing literal to catch", model::store::NO_LITERAL_REASON_PREFIX)],
+        tags: vec![format!("{}a test fixture where 'the same call' is also the legitimate one", model::store::NO_LITERAL_REASON_PREFIX)],
         expires: None,
         key: None,
         falsifier: Some(format!("{id} turns out to be safe without checking first")),

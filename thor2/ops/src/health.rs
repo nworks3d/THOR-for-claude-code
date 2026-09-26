@@ -1452,8 +1452,15 @@ pub fn teeth_line(db: &Path, full: bool) -> String {
     // below, is what keeps this sentence honest for that shape too.
     let (mut informing_tested, mut proven_tested, mut refuses_legit_tested, mut anchor_collapsed_tested) =
         (0usize, 0usize, 0usize, 0usize);
+    let mut wired_tested = 0usize;
     let mut refuses_legit: Vec<Rot> = Vec::new();
     let mut anchor_collapsed: Vec<Rot> = Vec::new();
+    // THE TWO NUMBERS THAT ANSWER THE OWNER'S QUESTION (2026-09-26): how many
+    // heavy rules have REALLY refused something - judged fresh against the
+    // log, never read off a label (`serve::prove::bitten`, via `teeth_box`) -
+    // and how many carry a reason a reader can check that they cannot have a
+    // tooth (`model::gate::teeth_answer_settles`). Everything else is neither.
+    let (mut really_refuses, mut honest_no) = (0usize, 0usize);
     for li in live.iter().filter(|li| li.item.kind.can_fire()) {
         if !matches!(
             li.item.severity,
@@ -1462,6 +1469,19 @@ pub fn teeth_line(db: &Path, full: bool) -> String {
             continue;
         }
         heavy += 1;
+        let reality = if li.item.check.is_some() {
+            serve::prove::reality(&store, &li.id, li.item.check.as_ref())
+        } else {
+            serve::prove::Reality::default()
+        };
+        if matches!(serve::prove::teeth_box(&li.id, &li.item, None, &reality), serve::prove::TeethBox::ProvenGuard { .. }) {
+            really_refuses += 1;
+        } else if model::gate::teeth_answer_settles(&li.item) {
+            honest_no += 1;
+        }
+        if li.item.tags.iter().any(|t| t == model::store::TEETH_WIRED_TAG) {
+            wired_tested += 1;
+        }
         let check_desc = match &li.item.check {
             None => "no check".to_string(),
             Some(c) => format!("check: {c:?}"),
@@ -1542,16 +1562,26 @@ pub fn teeth_line(db: &Path, full: bool) -> String {
     // the check looks like), so these five numbers always sum to `heavy`:
     // proven both ways, refuses legitimate use too, anchor collapsed into
     // its own literal, informing only, or never tested at all.
-    let never_tested = heavy - proven_tested - refuses_legit_tested - anchor_collapsed_tested - informing_tested;
     out.push(format!(
-        "teeth tested at the write, of {heavy} heavy rule(s): {proven_tested} are proven guards - refused the bad \
-         form and let the clean, legitimate one through ('{}'); {refuses_legit_tested} refuse legitimate use too, \
-         which is as bad as no check at all ('{}'); {anchor_collapsed_tested} have an anchor that already \
+        "teeth against reality, of {heavy} heavy rule(s): {really_refuses} have really refused something - the log \
+         holds a real call the real hook refused under their current check, or a real call they fired on that it \
+         would now refuse while still letting their ordinary calls through; {honest_no} carry a reason, checkable \
+         against the rule, why they cannot have a tooth (it quotes the legitimate call or names their trigger); the \
+         other {} have neither",
+        heavy - really_refuses - honest_no
+    ));
+    let never_tested =
+        heavy - proven_tested - wired_tested - refuses_legit_tested - anchor_collapsed_tested - informing_tested;
+    out.push(format!(
+        "teeth labels, as last written, of {heavy} heavy rule(s): {proven_tested} proven against reality ('{}'); \
+         {wired_tested} wired both ways but never met a real call ('{}'); {refuses_legit_tested} refuse legitimate \
+         use too, which is as bad as no check at all ('{}'); {anchor_collapsed_tested} have an anchor that already \
          contains their own literal, so the two-sided test could not even run on them ('{}'); {informing_tested} \
          were tried and are confirmed toothless, or confirmed to have nothing to try ('{}'); the remaining \
-         {never_tested} predate this check or were never revised since, so doctor cannot yet tell a proof from a \
-         claim for them",
+         {never_tested} predate this check or were never revised since. A label is what trying found when it was \
+         written, never an answer - the line above is the one judged now",
         model::store::TEETH_PROVEN_TAG,
+        model::store::TEETH_WIRED_TAG,
         model::store::TEETH_REFUSES_LEGITIMATE_TAG,
         model::store::TEETH_ANCHOR_COLLAPSED_TAG,
         model::store::TEETH_INFORMING_TAG
@@ -3543,7 +3573,7 @@ mod tests {
             command_answered.bindings =
                 vec![Binding::Target { kind: TargetKind::Command, value: "git archive".to_string() }];
             command_answered.tags = vec![format!(
-                "{}the pathspec is chosen at call time and is never one fixed fragment",
+                "{}the pathspec in 'git archive HEAD' is chosen at call time",
                 store::NO_CATCH_ON_COMMAND_REASON_PREFIX
             )];
             store::declare(&mut s, "s", "l", "a", &command_answered).unwrap();
@@ -3555,7 +3585,7 @@ mod tests {
             path_answered.bindings =
                 vec![Binding::Target { kind: TargetKind::Path, value: "server/lib/mail.js".to_string() }];
             path_answered.tags = vec![format!(
-                "{}an authorised send looks exactly like an unauthorised one",
+                "{}an authorised mail.js send looks exactly like an unauthorised one",
                 store::NO_LITERAL_REASON_PREFIX
             )];
             store::declare(&mut s, "s", "l", "a", &path_answered).unwrap();
@@ -3598,7 +3628,7 @@ mod tests {
             // show up in the bare list, however old it is.
             let mut reasoned = rule("reasoned-not-bare");
             reasoned.text = "a rule that actually said why nothing can catch it".to_string();
-            reasoned.tags = vec![format!("{}this fixture spells out its own reason", store::NO_LITERAL_REASON_PREFIX)];
+            reasoned.tags = vec![format!("{}this fixture quotes 'the same call' as its reason", store::NO_LITERAL_REASON_PREFIX)];
             store::declare(&mut s, "s", "l", "a", &reasoned).unwrap();
         }
         let line = proof_line(&db, false);
@@ -3660,7 +3690,7 @@ mod tests {
             // together would inflate the count without inflating the list,
             // and this is what would catch that.
             let mut reasoned = rule("reasoned-invariant");
-            reasoned.tags = vec![format!("{}this fixture spells out its own reason", store::NO_LITERAL_REASON_PREFIX)];
+            reasoned.tags = vec![format!("{}this fixture quotes 'the same call' as its reason", store::NO_LITERAL_REASON_PREFIX)];
             legacy_declare(&mut s, &reasoned);
         }
         // --full: the named list must never be capped, or a real mismatch
@@ -3689,7 +3719,7 @@ mod tests {
             heavy_prose.severity = Some(model::item::Severity::Irreversible);
             // Since gate ground 11 this is the only way a heavy rule carries no
             // check: asked, and the answer was that there is nothing to catch.
-            heavy_prose.tags = vec![format!("{}a test fixture with nothing literal to catch", store::NO_LITERAL_REASON_PREFIX)];
+            heavy_prose.tags = vec![format!("{}a test fixture where 'the same call' is also the legitimate one", store::NO_LITERAL_REASON_PREFIX)];
             store::declare(&mut s, "s", "l", "a", &heavy_prose).unwrap();
 
             let mut heavy_armed = rule("heavy-and-armed");
@@ -3707,6 +3737,49 @@ mod tests {
         let line = teeth_line(&db, false);
         assert!(line.contains("1 of 2"), "{line}");
         assert!(line.contains("the other 1 can only inform"), "{line}");
+    }
+
+    /// THE TWO NUMBERS (2026-09-26), judged now against the log and never
+    /// read off a label: a heavy rule whose check the real hook refused a real
+    /// call under counts as really refusing; a PROVEN label with nothing on
+    /// record does not (it may predate the rule that proof comes from
+    /// reality); a heavy rule with a reason that names its own trigger counts
+    /// as an honest "it cannot"; a thin reason counts as neither.
+    #[test]
+    fn teeth_line_counts_real_refusals_and_real_reasons_never_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut s = EventStore::new(&db).unwrap();
+            let mut bitten = rule("bitten-fixture");
+            bitten.severity = Some(model::item::Severity::Irreversible);
+            bitten.bindings = vec![model::item::Binding::Target {
+                kind: model::item::TargetKind::Command,
+                value: "git push".to_string(),
+            }];
+            bitten.check = Some(model::item::Check::Forbidden { literals: vec!["--force".to_string()] });
+            legacy_declare(&mut s, &bitten);
+            serve::deliver::record_gate_outcome(&mut s, "s", "l", "hook", "2026-09-26T00:00:00Z", true, "bitten-fixture", "git push --force origin main");
+
+            let mut labelled = bitten.clone();
+            labelled.id = "labelled-only-fixture".to_string();
+            labelled.tags = vec![store::TEETH_PROVEN_TAG.to_string()];
+            legacy_declare(&mut s, &labelled);
+
+            let mut honest = rule("honest-no-fixture");
+            honest.severity = Some(model::item::Severity::Costly);
+            honest.tags = vec![format!("{}an authorised 'git push origin main' reads the same", store::NO_LITERAL_REASON_PREFIX)];
+            legacy_declare(&mut s, &honest);
+
+            let mut thin = rule("thin-fixture");
+            thin.severity = Some(model::item::Severity::Costly);
+            thin.tags = vec![format!("{}this is a judgement rule and not a fixed text", store::NO_LITERAL_REASON_PREFIX)];
+            legacy_declare(&mut s, &thin);
+        }
+        let line = teeth_line(&db, true);
+        assert!(line.contains("of 4 heavy rule(s): 1 have really refused something"), "{line}");
+        assert!(line.contains("1 carry a reason, checkable against the rule"), "{line}");
+        assert!(line.contains("the other 2 have neither"), "{line}");
     }
 
     /// CHANGE 2's TWO-SIDED extension: the write-time sentence must show all
@@ -3749,7 +3822,7 @@ mod tests {
             legacy_declare(&mut s, &never_tested);
         }
         let line = teeth_line(&db, true);
-        assert!(line.contains("1 are proven guards"), "{line}");
+        assert!(line.contains("1 proven against reality"), "{line}");
         assert!(line.contains("1 refuse legitimate use too"), "{line}");
         assert!(line.contains("1 have an anchor that already contains"), "{line}");
         assert!(line.contains("1 were tried and are confirmed toothless"), "{line}");

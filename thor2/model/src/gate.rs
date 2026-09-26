@@ -787,6 +787,212 @@ fn no_literal_reason_problem(reason: &str) -> Option<Refusal> {
     None
 }
 
+// ------------------------------------------------ what a teeth reason must say
+//
+// THE DEFECT THIS CLOSES (2026-09-26). A `no-literal:<why>` answer used to be
+// held to its LENGTH alone: twenty characters of anything went through. A
+// test on a copy of a real store wrote "this is a judgement rule and not a
+// fixed text" on a rule about deleting one named file, and "it is an omission
+// so there is nothing to type" on another - both accepted, both saying
+// nothing about the rule they were attached to. A reason that fits every rule
+// in the store is not a reason about this one.
+//
+// The two honest reasons a heavy rule has no check are named in the gate's
+// own refusal: the fragment also appears in LEGITIMATE use (so quote that
+// legitimate call), or the mistake leaves no text at all (so name what the
+// rule is about - the command, the file, the moment it fires at). Either one
+// can be seen in the words themselves, without trusting them: a quoted call,
+// or a mention of one of the rule's own triggers. That is still not a proof
+// that the reason is TRUE - nothing here can be - but it is the difference
+// between a reason a reader can check against the rule and one that could
+// have been pasted onto any rule at all.
+
+/// Whether `needle` occurs in `haystack` (both already lowercased). A needle
+/// shorter than four characters must stand as its own word, so a command like
+/// `gh` does not count as named inside "ghost".
+fn mentions(haystack: &str, needle: &str) -> bool {
+    let needle = needle.trim();
+    if needle.is_empty() {
+        return false;
+    }
+    if needle.chars().count() >= 4 {
+        return haystack.contains(needle);
+    }
+    let is_word = |c: char| c.is_alphanumeric() || c == '_' || c == '-';
+    let mut from = 0;
+    while let Some(pos) = haystack[from..].find(needle) {
+        let start = from + pos;
+        let end = start + needle.len();
+        let before_ok = haystack[..start].chars().next_back().map_or(true, |c| !is_word(c));
+        let after_ok = haystack[end..].chars().next().map_or(true, |c| !is_word(c));
+        if before_ok && after_ok {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
+/// Whether `reason` quotes something: a span of at least three characters
+/// between a matching pair of `'`, `"` or a backtick. That is where the
+/// legitimate call goes ("the same fragment appears in 'git push origin
+/// main'"). An unpaired apostrophe ("don't") opens nothing.
+fn quotes_a_call(reason: &str) -> bool {
+    for quote in ['\'', '"', '`'] {
+        let parts: Vec<&str> = reason.split(quote).collect();
+        // parts[1], parts[3], ... sit inside a pair only when a closing quote
+        // follows them, which is exactly when a later part exists.
+        let mut i = 1;
+        while i + 1 < parts.len() {
+            if parts[i].trim().chars().count() >= 3 {
+                return true;
+            }
+            i += 2;
+        }
+    }
+    false
+}
+
+/// Everything a reason may name to count as naming what THIS rule is about:
+/// its command anchors, its files and directories (whole and by their last
+/// segment), its hosts and symbols, the moments it fires at, its check's own
+/// literals, and the one concrete thing its own text names
+/// (`candidate_literal`). Lowercased. `pub` so a refusal elsewhere can list
+/// the exact words a reader could use.
+pub fn teeth_triggers(item: &Item) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |s: &str| {
+        let s = s.trim().to_lowercase();
+        if s.chars().count() >= 2 && !out.contains(&s) {
+            out.push(s);
+        }
+    };
+    for binding in &item.bindings {
+        match binding {
+            Binding::Moment(action) => push(action.as_str()),
+            Binding::Target { kind: TargetKind::Path | TargetKind::Dir, value } => {
+                push(value);
+                if let Some(last) = value.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next() {
+                    if last.chars().count() >= 3 {
+                        push(last);
+                    }
+                }
+            }
+            Binding::Target { value, .. } => push(value),
+            Binding::Always => {}
+        }
+    }
+    if let Some(check) = &item.check {
+        match check {
+            Check::Forbidden { literals } | Check::AbsentAll { literals, .. } => {
+                literals.iter().for_each(|l| push(l));
+            }
+            Check::Absent { literal, .. } | Check::Contains { literal, .. } => push(literal),
+            Check::Requires { when, required } => {
+                push(when);
+                required.iter().for_each(|r| push(r));
+            }
+            Check::PathExists { path } => push(path),
+        }
+    }
+    if let Some(literal) = candidate_literal(&item.text) {
+        push(&literal);
+    }
+    out
+}
+
+/// Whether a teeth answer's reason says something about THIS rule: it quotes
+/// the legitimate call, or it names one of the rule's own triggers
+/// (`teeth_triggers`). See this section's own comment for why length alone
+/// never could.
+pub fn reason_names_its_subject(reason: &str, item: &Item) -> bool {
+    if quotes_a_call(reason) {
+        return true;
+    }
+    let lower = reason.to_lowercase();
+    teeth_triggers(item).iter().any(|t| mentions(&lower, t))
+}
+
+/// The refusal for a reason that fills the length and says nothing about the
+/// rule it is attached to - names the words that would count.
+fn reason_says_nothing_about_this_rule(reason: &str, item: &Item) -> Refusal {
+    let triggers = teeth_triggers(item);
+    let named = if triggers.is_empty() {
+        "- this rule names nothing concrete of its own, so the quote is the only way".to_string()
+    } else {
+        format!(
+            "or name what this rule is about - one of: {}",
+            triggers.iter().take(8).map(|t| format!("'{t}'")).collect::<Vec<_>>().join(" ")
+        )
+    };
+    Refusal::new(
+        format!("the reason '{reason}' on this rule's teeth answer says nothing about this rule - it would fit any rule in the store"),
+        format!(
+            "an answer that nothing can catch this has to be checkable against the rule: quote the LEGITIMATE call \
+             that carries the same fragment, between quotes (for example: same text as 'git push origin main'), \
+             {named}. And first try a check once more - a reason is the answer only when no text marks the mistake."
+        ),
+    )
+}
+
+/// Whether `item`'s own tags already answer the teeth question well enough
+/// to SETTLE it for a heavy rule: an `answer-guard:<entry>` link (the catching
+/// happens in the response guard), or a `no-literal:<why>` /
+/// `no-catch-on-command:<why>` whose reason passes both the shape rule
+/// (`no_literal_reason_problem`) and the content rule
+/// (`reason_names_its_subject`). A bare `no-literal` never settles anything,
+/// and neither does a machine label like `teeth:informing` - that only says
+/// nothing could be tried, which is the question, not an answer to it.
+///
+/// ONE DEFINITION for every place that asks: the evaluation-filing gate
+/// (`store::check_evaluation_report_filing`), the Stop hook's teeth debt and
+/// doctor's teeth line all call this, so none of them can quietly accept an
+/// answer the others would refuse.
+pub fn teeth_answer_settles(item: &Item) -> bool {
+    for tag in &item.tags {
+        if let Some(entry) = tag.strip_prefix(crate::store::ANSWER_GUARD_TAG_PREFIX) {
+            if !entry.trim().is_empty() {
+                return true;
+            }
+        }
+        let reason = match (crate::store::teeth_answer(tag), command_teeth_answer(tag)) {
+            (Some(crate::store::TeethAnswer::Reasoned(r)), _) | (_, Some(crate::store::TeethAnswer::Reasoned(r))) => r,
+            _ => continue,
+        };
+        if no_literal_reason_problem(reason).is_none() && reason_names_its_subject(reason, item) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Both halves a NEW reason is held to at the write: the shape rule, then the
+/// content rule. A reason the item already carried before this write
+/// (`carried_tags`) keeps only the shape rule - refusing every correction of
+/// an older rule until its reason is rewritten would lock the whole backlog
+/// out of maintenance; the debts that ASK about teeth (`teeth_answer_settles`)
+/// still refuse to count it, so it keeps being asked instead of being waved
+/// through.
+fn reason_problems(reason: &str, item: &Item, carried_tags: Option<&[String]>) -> Option<Refusal> {
+    if let Some(shape) = no_literal_reason_problem(reason) {
+        return Some(shape);
+    }
+    // The content rule is for the rules the owner called expensive. A light
+    // rule is only asked the teeth question because its text names something
+    // concrete (ground 11's second half), and holding its answer to the same
+    // bar would tax every small note for a question nobody's debt ever asks.
+    let heavy = item.kind.can_fire() && matches!(item.severity, Some(Severity::Irreversible) | Some(Severity::Costly));
+    if !heavy {
+        return None;
+    }
+    let carried = carried_tags
+        .is_some_and(|tags| tags.iter().any(|t| crate::store::teeth_answer(t).or_else(|| command_teeth_answer(t)) == Some(crate::store::TeethAnswer::Reasoned(reason))));
+    if carried || reason_names_its_subject(reason, item) {
+        return None;
+    }
+    Some(reason_says_nothing_about_this_rule(reason, item))
+}
+
 /// Whether `tag` answers the COMMAND version of the teeth question - see
 /// ground 11 (continued, command) in `shape_problems` below for when this
 /// sharper question is asked instead of the plain one `store::teeth_answer`
@@ -893,6 +1099,7 @@ fn shape_problems(
     command_generic_answer_allowed: bool,
     symbol_only_allowed: bool,
     carried_bindings: Option<&[Binding]>,
+    carried_tags: Option<&[String]>,
 ) -> Vec<Refusal> {
     let mut problems = Vec::new();
     if item.kind == Kind::Rule && item.bindings.is_empty() {
@@ -1045,7 +1252,7 @@ fn shape_problems(
                         None => problems.push(command_no_catch_refusal(command)),
                         Some(crate::store::TeethAnswer::Bare) => {}
                         Some(crate::store::TeethAnswer::Reasoned(reason)) => {
-                            problems.extend(no_literal_reason_problem(reason));
+                            problems.extend(reason_problems(reason, item, carried_tags));
                         }
                     }
                 }
@@ -1067,7 +1274,7 @@ fn shape_problems(
                     ),
                 )),
                 Some(crate::store::TeethAnswer::Reasoned(reason)) => {
-                    problems.extend(no_literal_reason_problem(reason));
+                    problems.extend(reason_problems(reason, item, carried_tags));
                 }
             }
         } else {
@@ -1107,7 +1314,7 @@ fn shape_problems(
                 )),
                 Some(crate::store::TeethAnswer::Bare) => {}
                 Some(crate::store::TeethAnswer::Reasoned(reason)) => {
-                    problems.extend(no_literal_reason_problem(reason));
+                    problems.extend(reason_problems(reason, item, carried_tags));
                 }
             }
         }
@@ -1223,7 +1430,7 @@ fn combined(problems: Vec<Refusal>) -> Refusal {
 pub const NO_SCOPE_PROBLEM: &str = "this is archive material with no scope, so it joins the unscoped pile: it belongs to no collection, and opening one will never show it";
 
 pub fn declare(item: &Item) -> Result<(), Refusal> {
-    declare_inner(item, false, false, false, false, None)
+    declare_inner(item, false, false, false, false, None, None)
 }
 
 fn declare_inner(
@@ -1233,6 +1440,7 @@ fn declare_inner(
     symbol_only_allowed: bool,
     unscoped_allowed: bool,
     carried_bindings: Option<&[Binding]>,
+    carried_tags: Option<&[String]>,
 ) -> Result<(), Refusal> {
     let problems = shape_problems(
         item,
@@ -1240,6 +1448,7 @@ fn declare_inner(
         command_generic_answer_allowed,
         symbol_only_allowed,
         carried_bindings,
+        carried_tags,
     );
     match problems.len() {
         0 => {}
@@ -1566,6 +1775,7 @@ pub fn revise(existing: &Item, updated: &Item) -> Result<(), Refusal> {
         carried_symbol_only,
         carried_unscoped,
         Some(&existing.bindings),
+        Some(&existing.tags),
     )?;
     if !existing.bindings.is_empty() && updated.bindings.is_empty() {
         return Err(dropped_field("bindings"));
@@ -1598,6 +1808,27 @@ pub fn revise(existing: &Item, updated: &Item) -> Result<(), Refusal> {
     // revise that adds the tag AND an over-limit count in the same call is
     // refused exactly like one that only bumped the count on an item that
     // already had it.
+    // GROUND 30 (CONTINUED, 2026-09-26): an open point stays one until it is
+    // CLOSED, and closing is a retraction with a reason. Dropping the tag
+    // made the point vanish from every list that asks about it, with no
+    // reason recorded - measured on a copy of a real store, one revise did
+    // it. Lowering the carried count re-opened the one carry the point has.
+    if existing.tags.iter().any(|t| t == crate::store::OPEN_POINT_TAG) {
+        if !updated.tags.iter().any(|t| t == crate::store::OPEN_POINT_TAG) {
+            return Err(Refusal::new(
+                format!("this revise drops the '{}' tag from an open point", crate::store::OPEN_POINT_TAG),
+                "an open point is closed by retracting it with a reason that says how it was resolved - never by \
+                 taking its tag away, which hides it from every list that asks about it",
+            ));
+        }
+        if crate::store::open_point_carried_count(&updated.tags) < crate::store::open_point_carried_count(&existing.tags) {
+            return Err(Refusal::new(
+                "this revise lowers an open point's own carried count",
+                "a carry, once made, stays on record - close the point by retracting it with a reason, or ask the \
+                 owner what to do with it",
+            ));
+        }
+    }
     if existing.tags.iter().any(|t| t == crate::store::OPEN_POINT_TAG)
         || updated.tags.iter().any(|t| t == crate::store::OPEN_POINT_TAG)
     {
@@ -1700,11 +1931,12 @@ pub struct Weakening {
 }
 
 /// Every way `updated` weakens `before` - a Rule or Orientation that CARRIES
-/// A CHECK, i.e. `before.check.is_some()`. An item with no check has nothing
-/// this function protects: it returns empty for one regardless of what else
-/// changes, exactly the grandfather `revise_weakening` below relies on to
-/// leave clearing a check-less item's severity, or dropping one of its
-/// bindings, or narrowing its scope, exactly as unquestioned as it always was.
+/// A CHECK, i.e. `before.check.is_some()`, or one marked irreversible or
+/// costly. A LIGHT item with no check has nothing this function protects: it
+/// returns empty for one regardless of what else changes. A HEAVY one with no
+/// check is protected on two of the five shapes since 2026-09-26 - lowering
+/// or clearing its severity, and removing a binding (see the branch below for
+/// why); narrowing its scope stays free.
 ///
 /// Five shapes, decided by task report 2026-09-08 and not re-opened here:
 /// clearing the check; changing its kind, path or literal(s); lowering or
@@ -1727,6 +1959,33 @@ pub struct Weakening {
 pub fn weakenings(before: &Item, updated: &Item) -> Vec<Weakening> {
     let mut found = Vec::new();
     if before.check.is_none() {
+        // A HEAVY RULE IS NOT FREE TO WEAKEN JUST BECAUSE IT HAS NO CHECK
+        // (2026-09-26). The grandfather above let a rule marked irreversible
+        // or costly be lowered to house style, have its severity cleared, or
+        // be moved off the one anchor it fires on, with no word of why -
+        // measured on a copy of a real store, all three went straight
+        // through. The severity IS the owner's statement that being wrong
+        // here is expensive; dropping it, or the place the rule fires, is
+        // the same act as dropping a check, and it owes the same one
+        // sentence.
+        let heavy = before.kind.can_fire()
+            && matches!(before.severity, Some(Severity::Irreversible) | Some(Severity::Costly));
+        if heavy {
+            if severity_rank(before.severity) < severity_rank(updated.severity) {
+                found.push(Weakening {
+                    label: if updated.severity.is_none() { "severity cleared" } else { "severity lowered" },
+                    problem: "this lowers the severity of a rule marked irreversible or costly".to_string(),
+                });
+            }
+            if binding_removed(&before.bindings, &updated.bindings) {
+                found.push(Weakening {
+                    label: "binding removed",
+                    problem: "this removes a binding from a rule marked irreversible or costly, narrowing where it \
+                              can ever fire"
+                        .to_string(),
+                });
+            }
+        }
         return found;
     }
     match (&before.check, &updated.check) {
@@ -3000,7 +3259,7 @@ mod tests {
         item.bindings = vec![Binding::Always];
         item.severity = Some(Severity::Irreversible);
         item.tags = vec![format!(
-            "{}an authorised action looks exactly like an unauthorised one",
+            "{}an authorised 'git push' looks exactly like an unauthorised one",
             crate::store::NO_LITERAL_REASON_PREFIX
         )];
         assert!(
@@ -3152,7 +3411,7 @@ mod tests {
 
         let mut answered = now_heavy.clone();
         answered.tags = vec![format!(
-            "{}an authorised action looks exactly like an unauthorised one",
+            "{}an authorised 'git push' looks exactly like an unauthorised one",
             crate::store::NO_LITERAL_REASON_PREFIX
         )];
         assert!(revise(&light, &answered).is_ok(), "and answering it lets the re-rating through");
@@ -3208,7 +3467,7 @@ mod tests {
         let mut item = base(Kind::Orientation);
         item.severity = Some(Severity::Irreversible);
         item.tags = vec![format!(
-            "{}an authorised action looks exactly like an unauthorised one",
+            "{}an authorised 'git push' looks exactly like an unauthorised one",
             crate::store::NO_LITERAL_REASON_PREFIX
         )];
         assert!(
@@ -3253,7 +3512,7 @@ mod tests {
 
         let mut answered = now_heavy.clone();
         answered.tags = vec![format!(
-            "{}an authorised action looks exactly like an unauthorised one",
+            "{}an authorised 'git push' looks exactly like an unauthorised one",
             crate::store::NO_LITERAL_REASON_PREFIX
         )];
         assert!(revise(&light, &answered).is_ok(), "and answering it lets the re-rating through");
@@ -3710,7 +3969,7 @@ mod tests {
         item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "git archive".to_string() }];
         item.severity = Some(Severity::Irreversible);
         item.tags = vec![format!(
-            "{}an authorised run looks exactly like an unauthorised one",
+            "{}an authorised 'git archive HEAD' looks exactly like an unauthorised one",
             crate::store::NO_LITERAL_REASON_PREFIX
         )];
         let err = declare(&item).unwrap_err();
@@ -3725,7 +3984,7 @@ mod tests {
         item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "git archive".to_string() }];
         item.severity = Some(Severity::Irreversible);
         item.tags = vec![format!(
-            "{}the pathspec is chosen at call time and is never one fixed fragment",
+            "{}the pathspec in 'git archive HEAD' is chosen at call time",
             crate::store::NO_CATCH_ON_COMMAND_REASON_PREFIX
         )];
         assert!(
@@ -3784,7 +4043,7 @@ mod tests {
         path_item.bindings =
             vec![Binding::Target { kind: TargetKind::Path, value: "server/lib/deploy.js".to_string() }];
         path_item.tags = vec![format!(
-            "{}an authorised deploy looks exactly like an unauthorised one",
+            "{}an authorised 'deploy' looks exactly like an unauthorised one",
             crate::store::NO_LITERAL_REASON_PREFIX
         )];
         assert!(declare(&path_item).is_ok(), "a path anchor keeps the plain no-literal escape");
@@ -3793,7 +4052,7 @@ mod tests {
         moment_item.severity = Some(Severity::Costly);
         moment_item.bindings = vec![Binding::Moment(Action::Push)];
         moment_item.tags = vec![format!(
-            "{}an authorised push looks exactly like an unauthorised one",
+            "{}an authorised 'git push' looks exactly like an unauthorised one",
             crate::store::NO_LITERAL_REASON_PREFIX
         )];
         assert!(declare(&moment_item).is_ok(), "a moment anchor keeps the plain no-literal escape");
@@ -3832,7 +4091,7 @@ mod tests {
 
         let mut answered = now_heavy.clone();
         answered.tags = vec![format!(
-            "{}the pathspec is chosen at call time and is never one fixed fragment",
+            "{}the pathspec in 'git archive HEAD' is chosen at call time",
             crate::store::NO_CATCH_ON_COMMAND_REASON_PREFIX
         )];
         assert!(revise(&light, &answered).is_ok(), "and the sharper answer lets the re-rating through");
@@ -3877,7 +4136,7 @@ mod tests {
         existing.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "git archive".to_string() }];
         existing.severity = Some(Severity::Irreversible);
         existing.tags = vec![format!(
-            "{}the pathspec is chosen at call time and is never one fixed fragment",
+            "{}the pathspec in 'git archive HEAD' is chosen at call time",
             crate::store::NO_LITERAL_REASON_PREFIX
         )];
 
@@ -3936,7 +4195,7 @@ mod tests {
         existing.severity = Some(Severity::Irreversible);
         existing.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "src/deploy.js".to_string() }];
         existing.tags = vec![format!(
-            "{}an authorised deploy looks exactly like an unauthorised one",
+            "{}an authorised 'deploy' looks exactly like an unauthorised one",
             crate::store::NO_LITERAL_REASON_PREFIX
         )];
         assert!(declare(&existing).is_ok(), "fixture sanity: the path anchor form goes in as it stands");
@@ -3960,7 +4219,7 @@ mod tests {
         let mut now_heavy = light.clone();
         now_heavy.severity = Some(Severity::Costly);
         now_heavy.tags = vec![format!(
-            "{}an authorised run looks exactly like an unauthorised one",
+            "{}an authorised 'git archive HEAD' looks exactly like an unauthorised one",
             crate::store::NO_LITERAL_REASON_PREFIX
         )];
         assert!(
@@ -3984,7 +4243,7 @@ mod tests {
         let mut checkless = checked.clone();
         checkless.check = None;
         checkless.tags = vec![format!(
-            "{}an authorised run looks exactly like an unauthorised one",
+            "{}an authorised 'git archive HEAD' looks exactly like an unauthorised one",
             crate::store::NO_LITERAL_REASON_PREFIX
         )];
         assert!(
@@ -4750,7 +5009,7 @@ mod tests {
             // answer, and it keeps this test about scope, which is its subject.
             let mut item = global(Kind::Rule, text);
             item.tags = vec![format!(
-                "{}an omission has no text whose presence betrays it",
+                "{}an omission in 'the call' has no text whose presence betrays it",
                 crate::store::NO_LITERAL_REASON_PREFIX
             )];
             assert!(declare(&item).is_ok(), "must stay writable: {text}");
@@ -6029,22 +6288,121 @@ mod tests {
         item
     }
 
-    /// THE GRANDFATHER THIS GROUND MUST NEVER TOUCH: an item with no check
-    /// has nothing GROUND 28 protects - clearing its severity, dropping a
-    /// binding and narrowing its scope all stay exactly as unquestioned as
-    /// they were before this ground existed (see
+    /// THE GRANDFATHER THIS GROUND MUST NEVER TOUCH: a LIGHT item with no
+    /// check has nothing GROUND 28 protects - dropping a binding and
+    /// narrowing its scope stay exactly as unquestioned as they were before
+    /// this ground existed (see
     /// `a_severity_named_cleared_lets_revise_accept_dropping_it` above,
     /// proven again here at the `weakenings` layer, for every shape at once).
+    /// Narrowed 2026-09-26 from "any item with no check": see the next test.
     #[test]
-    fn weakenings_is_empty_when_the_existing_item_carries_no_check() {
+    fn weakenings_is_empty_when_the_existing_item_is_light_and_carries_no_check() {
         let mut before = checked_item();
         before.check = None;
+        before.severity = Some(Severity::HouseStyle);
         let mut updated = before.clone();
         updated.severity = None;
         updated.bindings = vec![Binding::Always];
         updated.project = None;
         assert!(weakenings(&before, &updated).is_empty());
-        assert!(revise_weakening(&before, &updated, None).is_ok(), "no check means nothing to explain");
+        assert!(revise_weakening(&before, &updated, None).is_ok(), "a light rule with no check has nothing to explain");
+    }
+
+    /// E (2026-09-26): a rule marked irreversible or costly is not free to
+    /// weaken just because it carries no check. Measured on a copy of a real
+    /// store: lowering one to house style, clearing another's severity and
+    /// moving a third onto an anchor that never fires all went straight
+    /// through with no word of why.
+    #[test]
+    fn weakening_a_heavy_rule_with_no_check_needs_a_because() {
+        let mut before = checked_item();
+        before.check = None;
+        before.severity = Some(Severity::Costly);
+        let mut lowered = before.clone();
+        lowered.severity = Some(Severity::HouseStyle);
+        let mut cleared = before.clone();
+        cleared.severity = None;
+        let mut moved = before.clone();
+        moved.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "never/there.md".to_string() }];
+        for updated in [&lowered, &cleared, &moved] {
+            assert!(!weakenings(&before, updated).is_empty(), "{updated:?}");
+            assert!(revise_weakening(&before, updated, None).is_err());
+            assert!(revise_weakening(&before, updated, Some("the rule moved to the new deploy script")).is_ok());
+        }
+        let mut narrowed = before.clone();
+        narrowed.project = Some("one-project".to_string());
+        assert!(weakenings(&before, &narrowed).is_empty(), "narrowing the scope of a checkless rule stays free");
+    }
+
+    /// B2 (2026-09-26): the teeth reason on a heavy rule is judged on what it
+    /// says, not on its length. A reason that fits any rule is refused; one
+    /// that quotes the legitimate call, or names the rule's own trigger, goes
+    /// through. The exact reasons below were written, and accepted, in a test
+    /// on a copy of a real store.
+    #[test]
+    fn a_heavy_rules_teeth_reason_must_quote_the_call_or_name_the_trigger() {
+        let mut item = base(Kind::Rule);
+        item.severity = Some(Severity::Irreversible);
+        item.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "files/README.md".to_string() }];
+        for thin in ["dit is een oordeelsregel en geen vaste tekst", "het is een omissie dus er valt niets te typen"] {
+            item.tags = vec![format!("{}{thin}", crate::store::NO_LITERAL_REASON_PREFIX)];
+            let err = declare(&item).expect_err(thin);
+            assert!(err.problem.contains("says nothing about this rule"), "{}", err.problem);
+            assert!(err.fix.contains("'files/readme.md'") || err.fix.contains("'readme.md'"), "names the words that would count: {}", err.fix);
+            assert!(!teeth_answer_settles(&item), "and it settles nothing");
+        }
+        for real in [
+            "wissen van README.md laat geen tekst achter in een commando",
+            "hetzelfde fragment staat in 'git rm --cached files/README.md' dat legitiem is",
+        ] {
+            item.tags = vec![format!("{}{real}", crate::store::NO_LITERAL_REASON_PREFIX)];
+            assert!(declare(&item).is_ok(), "{real}");
+            assert!(teeth_answer_settles(&item), "{real}");
+        }
+        // A bare label is never an answer, and neither is a machine one.
+        item.tags = vec![crate::store::TEETH_INFORMING_TAG.to_string()];
+        assert!(!teeth_answer_settles(&item));
+    }
+
+    /// The command version of the same question is held to the same content
+    /// rule: a reason about a command that names neither the command nor a
+    /// quoted legitimate call is refused.
+    #[test]
+    fn a_heavy_command_rules_reason_must_name_the_command_or_quote_a_call() {
+        let mut item = base(Kind::Rule);
+        item.severity = Some(Severity::Irreversible);
+        item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "wevtutil cl".to_string() }];
+        item.tags = vec![format!("{}het is een oordeelsregel zonder vaste tekst", crate::store::NO_CATCH_ON_COMMAND_REASON_PREFIX)];
+        assert!(declare(&item).is_err());
+        item.tags = vec![format!(
+            "{}een geautoriseerde wevtutil cl ziet er net zo uit als een foute",
+            crate::store::NO_CATCH_ON_COMMAND_REASON_PREFIX
+        )];
+        assert!(declare(&item).is_ok());
+    }
+
+    /// A reason an older rule already carried is not re-judged on every
+    /// correction - that would lock the backlog out of maintenance - but it
+    /// still settles nothing, so the debts keep asking about it.
+    #[test]
+    fn an_old_thin_reason_stays_correctable_but_settles_nothing() {
+        let mut before = base(Kind::Rule);
+        before.severity = Some(Severity::Irreversible);
+        before.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "files/README.md".to_string() }];
+        before.tags = vec![format!("{}this is a judgement rule and not a fixed text", crate::store::NO_LITERAL_REASON_PREFIX)];
+        let mut updated = before.clone();
+        updated.text = format!("{} (typo fixed)", before.text);
+        assert!(revise(&before, &updated).is_ok(), "a correction must not be held hostage");
+        assert!(!teeth_answer_settles(&updated), "but the thin reason is still no answer");
+    }
+
+    #[test]
+    fn a_quote_needs_a_matching_pair_and_a_short_command_must_stand_alone() {
+        assert!(quotes_a_call("same as 'git push' here"));
+        assert!(!quotes_a_call("don't do it"));
+        assert!(!quotes_a_call("a '' b"));
+        assert!(mentions("run gh repo edit", "gh"));
+        assert!(!mentions("a ghost story", "gh"));
     }
 
     #[test]

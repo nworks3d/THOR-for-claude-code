@@ -744,17 +744,30 @@ fn refuse_a_forged_teeth_tag(tags: &[String]) -> Result<(), String> {
 fn teeth_test(
     item: &model::item::Item,
     root: Option<&std::path::Path>,
+    store: &EventStore,
 ) -> Result<(Option<&'static str>, Option<String>), String> {
-    match serve::prove::teeth_box(&item.id, item, root) {
+    // What the log already holds for this id - real refusals, real calls it
+    // fired on, and whether the check about to be stored is the one those
+    // were recorded under. A brand-new id has nothing, so it can be wired but
+    // never proven at the moment it is written: proof comes from reality, not
+    // from the writer (see `serve::prove`'s "against reality" section).
+    let reality = serve::prove::reality(store, &item.id, item.check.as_ref());
+    match serve::prove::teeth_box(&item.id, item, root, &reality) {
         serve::prove::TeethBox::NotApplicable => Ok((None, None)),
         serve::prove::TeethBox::KeepRefusing(msg) => Err(msg),
-        serve::prove::TeethBox::ProvenGuard { forbidden_tried, clean_tried } => Ok((
-            Some(model::store::TEETH_PROVEN_TAG),
-            Some(format!(
-                "teeth: proven guard - tried forbidden: {forbidden_tried}; the guard refused it. Tried clean: \
-                 {clean_tried}; the guard let it through, as legitimate use should be."
-            )),
-        )),
+        serve::prove::TeethBox::ProvenGuard { evidence, forbidden_tried, clean_tried } => {
+            let tried = match (forbidden_tried, clean_tried) {
+                (Some(f), Some(c)) => format!(
+                    " Tried forbidden: {f}; the guard refused it. Tried clean: {c}; the guard let it through, as \
+                     legitimate use should be."
+                ),
+                _ => String::new(),
+            };
+            Ok((Some(model::store::TEETH_PROVEN_TAG), Some(format!("teeth: proven guard - {evidence}.{tried}"))))
+        }
+        serve::prove::TeethBox::Wired { note, .. } => {
+            Ok((Some(model::store::TEETH_WIRED_TAG), Some(format!("teeth: wired, not proven - {note}"))))
+        }
         // THE THIRD OUTCOME (2026-09-24): never filed under the proven tag,
         // and never filed quietly under the informing one either - see
         // `model::store::TEETH_REFUSES_LEGITIMATE_TAG`'s own doc comment. The
@@ -779,8 +792,12 @@ fn teeth_test(
 /// there is no existing item whose check/bindings could already have settled
 /// the question. Mutates `item.tags` in place (pushing the tag `teeth_test`
 /// decided, if any) and returns the receipt line for a successful write.
-fn apply_teeth_test(item: &mut model::item::Item, root: Option<&std::path::Path>) -> Result<Option<String>, String> {
-    let (tag, note) = teeth_test(item, root)?;
+fn apply_teeth_test(
+    item: &mut model::item::Item,
+    root: Option<&std::path::Path>,
+    store: &EventStore,
+) -> Result<Option<String>, String> {
+    let (tag, note) = teeth_test(item, root, store)?;
     if let Some(tag) = tag {
         item.tags.push(tag.to_string());
     }
@@ -805,11 +822,25 @@ fn apply_teeth_test_for_revise(
     existing: &model::item::Item,
     updated: &mut model::item::Item,
     root: Option<&std::path::Path>,
+    store: &EventStore,
 ) -> Result<Option<String>, String> {
     let inputs_unchanged = existing.check == updated.check
         && existing.bindings == updated.bindings
         && existing.severity == updated.severity;
-    let old_tag = existing.tags.iter().find(|t| t.starts_with(model::store::TEETH_TAG_PREFIX));
+    // Only a PROVEN box is carried forward untried. Any other box may have
+    // been overtaken by the log since it was written - a real refusal, or a
+    // real call the check would have caught - and a revise with nothing else
+    // changed is exactly how a writer asks for that to be looked at again
+    // (the evaluation-filing refusal tells them so). Proof, once the log
+    // holds it, does not expire while the check stays the same: the log is
+    // append-only.
+    // A rule with no check cannot meet reality at all, so its old box is as
+    // true as a fresh one would be and is carried forward the same way.
+    let old_tag = existing
+        .tags
+        .iter()
+        .find(|t| t.starts_with(model::store::TEETH_TAG_PREFIX))
+        .filter(|t| t.as_str() == model::store::TEETH_PROVEN_TAG || updated.check.is_none());
     if let (true, Some(old_tag)) = (inputs_unchanged, old_tag) {
         if updated.tags.iter().any(|t| t.starts_with(model::store::TEETH_TAG_PREFIX)) {
             return Ok(None);
@@ -843,7 +874,7 @@ fn apply_teeth_test_for_revise(
     // `TeethBox::NotApplicable` therefore leaves an old tag standing rather
     // than risk it - stale in that one narrow, both-at-once edge case, never
     // a refusal nobody asked for.
-    let (tag, note) = teeth_test(updated, root)?;
+    let (tag, note) = teeth_test(updated, root, store)?;
     if let Some(tag) = tag {
         updated.tags.retain(|t| !t.starts_with(model::store::TEETH_TAG_PREFIX));
         updated.tags.push(tag.to_string());
@@ -1686,7 +1717,7 @@ impl ThorMcpServer {
             // `declare_in` below - never refusing on that account alone (see
             // `apply_teeth_test`'s own doc comment for the ONE exception,
             // which was already a refusal before this change).
-            let teeth_note = match apply_teeth_test(&mut item, root.as_deref().map(|p| p.as_path())) {
+            let teeth_note = match apply_teeth_test(&mut item, root.as_deref().map(|p| p.as_path()), s) {
                 Ok(note) => note,
                 Err(why) => return Err(why),
             };
@@ -1950,7 +1981,7 @@ impl ThorMcpServer {
             // against the TRUE `existing`, never `gate_existing`, for the
             // identical reason `weakenings` below is: a field blanked for a
             // legitimate clear must still read as the change it is.
-            let teeth_note = match apply_teeth_test_for_revise(&existing, &mut updated, revise_root.as_deref().map(|p| p.as_path())) {
+            let teeth_note = match apply_teeth_test_for_revise(&existing, &mut updated, revise_root.as_deref().map(|p| p.as_path()), s) {
                 Ok(note) => note,
                 Err(why) => return Err(why),
             };
@@ -2502,6 +2533,25 @@ impl ThorMcpServer {
                 return Err(format!(
                     "pinned: '{}' is served at every session start by the owner's choice, so a verdict changes \
                      nothing - `unpin` it if it should stop appearing",
+                    args.id
+                ));
+            }
+            // A VERDICT ON SOMETHING THAT NEVER FIRED IS NOT A VERDICT
+            // (2026-09-26). The question a mark answers is "did it belong
+            // where it fired", and an item that has never been served
+            // anywhere has no answer to give. Measured on a copy of a real
+            // store: blind marks went through on items picked by name, which
+            // turns the judgement debt into a count anyone can pay without
+            // reading anything.
+            let ever_served = s
+                .get_events_by_entity(&args.id)
+                .map(|events| events.iter().any(|e| e.kind == thor_core::event_store::EventKind::ItemServed))
+                .unwrap_or(false);
+            if !ever_served {
+                return Err(format!(
+                    "'{}' has never fired anywhere - it was never served to a session, so there is no place it \
+                     fired to judge. Nothing was recorded. Judge an item once it has actually come up; if you \
+                     meant a different item, check the id in the block you were served.",
                     args.id
                 ));
             }
@@ -3081,6 +3131,22 @@ mod tests {
         ThorMcpServer::new(store)
     }
 
+    /// One real firing of `id`, recorded the way the hook records it - a
+    /// verdict needs something it fired on (see `mark`'s never-served
+    /// refusal).
+    fn fired_once(srv: &ThorMcpServer, id: &str) {
+        let mut store = srv.store.lock().unwrap();
+        serve::deliver::record_delivery_with_trigger(
+            &mut store,
+            "s",
+            "l",
+            "hook",
+            "2026-09-26T00:00:00Z",
+            &[id.to_string()],
+            Some("a test call"),
+        );
+    }
+
     fn base_remember(id: &str) -> RememberArgs {
         RememberArgs {
             new_collection_named_by_owner: None,
@@ -3098,9 +3164,9 @@ mod tests {
             // the sharper answer (ground 11, continued) while the unbound form needs
             // the generic one. Saying both keeps one fixture usable for either shape.
             tags: vec![
-                format!("{}a test fixture with nothing literal to catch", model::store::NO_LITERAL_REASON_PREFIX),
+                format!("{}a test fixture where 'the same call' is also the legitimate one", model::store::NO_LITERAL_REASON_PREFIX),
                 format!(
-                    "{}a test fixture whose command has nothing to catch either",
+                    "{}a test fixture where 'the same command' is also the legitimate one",
                     model::store::NO_CATCH_ON_COMMAND_REASON_PREFIX
                 ),
             ],
@@ -3576,10 +3642,12 @@ mod tests {
         assert!(reply.contains(model::store::TEETH_TAG_PREFIX), "{reply}");
     }
 
-    /// THE PRIMARY CLAIM: a fact whose check actually reaches and matches is
-    /// stored as a PROVEN GUARD, labelled by the tool, never the writer.
+    /// THE PRIMARY CLAIM, REVISED 2026-09-26: a fact whose check reaches and
+    /// matches is stored WIRED, labelled by the tool, never the writer - and
+    /// never proven, because both attempts were built from its own literal.
+    /// Proof comes from the log (see `serve::prove`'s "against reality").
     #[tokio::test]
-    async fn remember_with_a_reachable_forbidden_check_is_stored_as_a_proven_guard() {
+    async fn remember_with_a_reachable_forbidden_check_is_stored_wired_never_proven() {
         let srv = server();
         let args = RememberArgs {
             new_collection_named_by_owner: None,
@@ -3602,16 +3670,50 @@ mod tests {
         };
         let reply = srv.remember(Parameters(args)).await;
         assert!(reply.starts_with("stored "), "{reply}");
-        assert!(reply.contains("teeth: proven guard"), "{reply}");
+        assert!(reply.contains("teeth: wired, not proven"), "{reply}");
+        assert!(!reply.contains("teeth: proven guard"), "{reply}");
         assert!(reply.contains("--force"), "{reply}");
 
         let get_reply = srv.get(Parameters(GetArgs { id: "proven-1".to_string() })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert!(
-            item.tags.iter().any(|t| t == model::store::TEETH_PROVEN_TAG),
-            "the stored item must carry the reserved proven-guard tag: {:?}",
+            item.tags.iter().any(|t| t == model::store::TEETH_WIRED_TAG),
+            "the stored item must carry the reserved wired tag: {:?}",
             item.tags
         );
+        assert!(!item.tags.iter().any(|t| t == model::store::TEETH_PROVEN_TAG), "{:?}", item.tags);
+    }
+
+    /// A check that has bitten a real call on record IS proven at the write:
+    /// the log already holds the real hook refusing a real call under it.
+    #[tokio::test]
+    async fn remember_is_proven_when_the_log_already_holds_a_real_refusal_under_the_check() {
+        let srv = server();
+        {
+            let mut s = srv.store.lock().unwrap();
+            serve::deliver::record_gate_outcome(&mut s, "s", "l", "hook", "2026-09-26T00:00:00Z", true, "real-1", "git push --force origin main");
+        }
+        let args = RememberArgs {
+            new_collection_named_by_owner: None,
+            id: "real-1".to_string(),
+            kind: "rule".to_string(),
+            text: "never force-push".to_string(),
+            severity: Some("irreversible".to_string()),
+            project: None,
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some("a force-push lands with no incident".to_string()),
+            check_kind: Some("forbidden".to_string()),
+            check_path: None,
+            check_literal: None,
+            check_literals: vec!["--force".to_string()],
+            moments: vec![],
+            targets: vec![TargetArg { kind: "command".to_string(), value: "git push".to_string() }],
+            always: false,
+        };
+        let reply = srv.remember(Parameters(args)).await;
+        assert!(reply.contains("teeth: proven guard") && reply.contains("git push --force origin main"), "{reply}");
     }
 
     /// THE COLLAPSED CASE, end to end, with a worked example:
@@ -3749,6 +3851,12 @@ mod tests {
             targets: vec![TargetArg { kind: "command".to_string(), value: "git push".to_string() }],
             always: false,
         };
+        // Proven by a real refusal on record, so the label is one the tool
+        // carries forward untried - the case this test is about.
+        {
+            let mut s = srv.store.lock().unwrap();
+            serve::deliver::record_gate_outcome(&mut s, "s", "l", "hook", "2026-09-26T00:00:00Z", true, "stable-checked-1", "git push --force");
+        }
         srv.remember(Parameters(args)).await;
         let before = srv.get(Parameters(GetArgs { id: "stable-checked-1".to_string() })).await;
         let before_item: Item = serde_json::from_str(&before).unwrap();
@@ -3820,13 +3928,24 @@ mod tests {
 
         let reply = srv.revise(Parameters(bare_revise("legacy-guard"))).await;
         assert!(reply.starts_with("revised"), "{reply}");
-        assert!(reply.contains("teeth: proven guard"), "a bare revise of an unboxed rule must try its teeth: {reply}");
+        assert!(reply.contains("teeth: wired, not proven"), "a bare revise of an unboxed rule must try its teeth: {reply}");
+        let refused = srv.remember(Parameters(report("eval-new"))).await;
+        assert!(refused.contains("REFUSED") && refused.contains("legacy-guard"), "wired is not proven: {refused}");
+
+        // The real hook refuses a real call under this check - reality - and a
+        // bare revise now finds it.
+        {
+            let mut s = srv.store.lock().unwrap();
+            serve::deliver::record_gate_outcome(&mut s, "s", "l", "hook", "2026-09-26T00:00:00Z", true, "legacy-guard", "git push --force origin main");
+        }
+        let reply = srv.revise(Parameters(bare_revise("legacy-guard"))).await;
+        assert!(reply.contains("teeth: proven guard"), "{reply}");
         let item: Item =
             serde_json::from_str(&srv.get(Parameters(GetArgs { id: "legacy-guard".to_string() })).await).unwrap();
         assert!(item.tags.iter().any(|t| t == model::store::TEETH_PROVEN_TAG), "{:?}", item.tags);
 
         let filed = srv.remember(Parameters(report("eval-new"))).await;
-        assert!(filed.starts_with("stored "), "the advice was followed, so filing must now go through: {filed}");
+        assert!(filed.starts_with("stored "), "the rule has a real tooth now, so filing must go through: {filed}");
     }
 
     /// Severity decides whether a teeth test is owed at all, so a revise that
@@ -4853,7 +4972,9 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
-            because: None,
+            // Since 2026-09-26 clearing a heavy rule's severity is a weakening
+            // even with no check, so it owes one sentence of why.
+            because: Some("the fixture is only about the clear convention".to_string()),
             new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
@@ -5409,6 +5530,7 @@ mod tests {
             .revise(Parameters(ReviseArgs {
                 id: "clear-severity-flag-1".to_string(),
                 clear_severity: true,
+                because: Some("the fixture is only about the clear flag".to_string()),
                 ..Default::default()
             }))
             .await;
@@ -7018,6 +7140,7 @@ mod tests {
         args.always = false;
         args.targets = vec![TargetArg { kind: "command".to_string(), value: "force-push".to_string() }];
         srv.remember(Parameters(args)).await;
+        fired_once(&srv, "mark-1");
         let reply = srv.mark(Parameters(MarkArgs { id: "mark-1".to_string(), noise: false })).await;
         assert!(reply.contains("marked useful: mark-1"), "{reply}");
 
@@ -7064,6 +7187,7 @@ mod tests {
         args.always = false;
         args.targets = vec![TargetArg { kind: "command".to_string(), value: "force-push".to_string() }];
         srv.remember(Parameters(args)).await;
+        fired_once(&srv, "trigger-mark-1");
 
         let reply = srv.mark(Parameters(MarkArgs { id: "trigger-mark-1".to_string(), noise: false })).await;
         assert!(reply.contains("marked useful: trigger-mark-1"), "{reply}");
@@ -7134,6 +7258,7 @@ mod tests {
         args.project = Some("some-project".to_string()); // see the note in the pin test
         args.targets = vec![TargetArg { kind: "path".to_string(), value: "src/noisy.rs".to_string() }];
         srv.remember(Parameters(args)).await;
+        fired_once(&srv, "noisy-1");
         for _ in 0..serve::decay::NOISE_MARKS_BEFORE_STALE {
             // A fresh server per verdict: a different SESSION judging the
             // same item once, never the same session asked twice.
@@ -7174,6 +7299,7 @@ mod tests {
         args.always = false;
         args.targets = vec![TargetArg { kind: "command".to_string(), value: "force-push".to_string() }];
         srv.remember(Parameters(args)).await;
+        fired_once(&srv, "repeat-noise");
 
         let first = srv.mark(Parameters(MarkArgs { id: "repeat-noise".to_string(), noise: true })).await;
         assert!(first.contains("marked noise"), "{first}");
@@ -7204,6 +7330,7 @@ mod tests {
         args.always = false;
         args.targets = vec![TargetArg { kind: "command".to_string(), value: "owed-again-command".to_string() }];
         srv.remember(Parameters(args)).await;
+        fired_once(&srv, "owed-again");
 
         let first = srv.mark(Parameters(MarkArgs { id: "owed-again".to_string(), noise: true })).await;
         assert!(first.contains("marked noise"), "{first}");
@@ -7244,6 +7371,7 @@ mod tests {
         args.always = false;
         args.targets = vec![TargetArg { kind: "command".to_string(), value: "not-owed-again-command".to_string() }];
         srv.remember(Parameters(args)).await;
+        fired_once(&srv, "not-owed-again");
 
         let first = srv.mark(Parameters(MarkArgs { id: "not-owed-again".to_string(), noise: true })).await;
         assert!(first.contains("marked noise"), "{first}");
@@ -7281,6 +7409,7 @@ mod tests {
         args.always = false;
         args.targets = vec![TargetArg { kind: "command".to_string(), value: "force-push".to_string() }];
         srv.remember(Parameters(args)).await;
+        fired_once(&srv, "change-of-mind");
 
         let first = srv.mark(Parameters(MarkArgs { id: "change-of-mind".to_string(), noise: false })).await;
         assert!(first.contains("marked useful"), "{first}");
@@ -7322,6 +7451,7 @@ mod tests {
 
         let srv1 = server();
         srv1.remember(Parameters(trigger_bound("fresh-process-1"))).await;
+        fired_once(&srv1, "fresh-process-1");
         let on_first = srv1.mark(Parameters(MarkArgs { id: "fresh-process-1".to_string(), noise: false })).await;
         assert!(on_first.contains("marked useful"), "{on_first}");
         let repeat_same_instance =
@@ -7330,6 +7460,7 @@ mod tests {
 
         let srv2 = server();
         srv2.remember(Parameters(trigger_bound("fresh-process-1"))).await;
+        fired_once(&srv2, "fresh-process-1");
         let on_fresh_instance =
             srv2.mark(Parameters(MarkArgs { id: "fresh-process-1".to_string(), noise: false })).await;
         assert!(

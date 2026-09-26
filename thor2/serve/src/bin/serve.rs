@@ -1237,7 +1237,14 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
         // `serve::prove::teeth_box`'s own `root` parameter).
         let stop_root: Option<PathBuf> =
             payload.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from).or_else(|| std::env::current_dir().ok());
-        let stop_project = stop_root.as_deref().and_then(project::resolve_project);
+        // A working directory that belongs to no project falls back to the
+        // project this session last worked in (`usefulness::last_project_of_
+        // session`) - otherwise a `cd` into a scratch folder silences every
+        // debt the session still owes there.
+        let stop_project = stop_root
+            .as_deref()
+            .and_then(project::resolve_project)
+            .or_else(|| usefulness::last_project_of_session(db_path, &session_id));
         // GATED ON `is_subagent`: a fact landing on an already-full anchor is
         // still true of the STORE no matter who wrote it, but PAYING this
         // debt (fold or re-anchor with `revise`, retract, or the
@@ -1434,7 +1441,7 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
             if let Some(reason) = EventStore::open_existing(db_path)
                 .ok()
                 .filter(|_| teeth_not_yet_asked_this_session(db_path, &session_id))
-                .and_then(|s| teeth_debt(&s, stop_project.as_deref(), stop_root.as_deref()))
+                .and_then(|s| teeth_debt(&s, db_path, stop_project.as_deref(), stop_root.as_deref()))
             {
                 record_teeth_asked(db_path, &session_id);
                 return Some(HookOutput::Decision(
@@ -1510,14 +1517,20 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
     // read the same generic way the informational surface below already
     // does (`absent_guard::proposed_command` - "nothing here hard-codes
     // that name"), so a `Bash` or `PowerShell` call alike is recognised.
-    if session_project.is_some() {
+    // The same fallback the Stop arm uses: work done after a `cd` into a
+    // folder that belongs to no project still counts toward the project this
+    // session was working in. Only the accrual uses it - the guards and the
+    // serving surfaces below keep the directory's own answer.
+    let work_project =
+        session_project.clone().or_else(|| usefulness::last_project_of_session(db_path, &session_id));
+    if work_project.is_some() {
         let hook_tool_input = payload.get("tool_input");
         let hook_tool_name = payload.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
         let hook_file_path = hook_tool_input.and_then(|t| t.get("file_path")).and_then(|v| v.as_str());
         let hook_command = absent_guard::proposed_command(hook_tool_input);
         let hook_source = payload.get("source").and_then(|v| v.as_str());
         let event_kind = usefulness::classify_hook_event(&event_name, hook_tool_name, hook_file_path, hook_command, hook_source);
-        usefulness::record_hook_event(db_path, session_project.as_deref(), &session_id, false, time::now_unix(), event_kind);
+        usefulness::record_hook_event(db_path, work_project.as_deref(), &session_id, false, time::now_unix(), event_kind);
     }
 
     let mut store = EventStore::new(db_path).ok()?;
@@ -2217,78 +2230,148 @@ const TEETH_DEBT_BATCH_MAX: usize = 5;
 /// block later the same session - reintroducing the exact "every single turn
 /// ends held, forever" wall its own 2026-08-14 fix closed.
 ///
-/// RE-DERIVED, NEVER SETTLED BY A WORD (2026-09-25, replacing the shape this
-/// function had before). It used to drop an item out of `candidates` for
-/// good the moment it carried ANY check at all - even one that could never
-/// refuse anything about the item's own subject - or a written `no-literal`/
-/// `no-catch-on-command` tag, and said so as a permanent exit in this very
-/// doc comment. That is exactly the loophole that let rules come to rest on
-/// a written reason with no teeth at all: a lazy answer and an
-/// honest one looked identical the moment either was written down. This asks
-/// the question the write path itself already answers for every new fact -
-/// `serve::prove::teeth_box`, the SAME function `mcp::remember`/`revise` run
-/// before a write is even stored (see `model::store::TEETH_TAG_PREFIX`'s own
-/// doc comment) - fresh, every time this runs, against the item as it
-/// stands RIGHT NOW. A rule is settled only once that box comes back
-/// `ProvenGuard`: both a synthesised forbidden payload was refused AND a
-/// clean, legitimate one was let through. `Informing`, `RefusesLegitimateUse`
-/// and `AnchorCollapsed` are NOT settled, whatever tag or check the item
-/// carries - a check that cannot refuse no longer settles anything, and
-/// neither does any tag, because neither one is IN this computation at all
-/// any more. The concrete correction named below is the box's own note, the
-/// identical text a fresh `remember`/`revise` would receive as its receipt -
-/// never re-derived a second way here. The only remaining exit is fixing the
-/// anchor until it proves out, or retracting the fact.
-fn teeth_debt(store: &EventStore, current_project: Option<&str>, root: Option<&Path>) -> Option<String> {
-    let mut candidates: Vec<(String, String)> = serve::live::live_items(store)
-        .into_iter()
-        .filter(|li| li.item.kind.can_fire())
-        .filter(|li| project::applies_to(li.item.project.as_deref(), current_project))
-        .filter_map(|li| match serve::prove::teeth_box(&li.id, &li.item, root) {
-            // Never owed a proof at all (light, no refusing-kind check), or
-            // already proven both ways: settled, not a candidate.
-            serve::prove::TeethBox::NotApplicable | serve::prove::TeethBox::ProvenGuard { .. } => None,
-            // Structurally can never reach anything - a shape a fresh write
-            // can no longer even create (`mcp`'s own `teeth_test` refuses
-            // it outright), but a live item written before that door closed
-            // can still carry it. Its own message already explains why;
-            // only the stray "REFUSED: " lead-in is trimmed, since nothing
-            // is being refused here, only named.
-            serve::prove::TeethBox::KeepRefusing(msg) => {
-                Some((li.id, msg.strip_prefix("REFUSED: ").unwrap_or(&msg).to_string()))
+/// RE-DERIVED EVERY TIME, SETTLED ONLY BY REALITY OR A REAL REASON
+/// (2026-09-26, replacing the 2026-09-25 shape). The 2026-09-25 version
+/// settled a rule only once `serve::prove::teeth_box` came back a proven
+/// guard - and "proven" then meant an attempt built from the rule's own
+/// literal had been refused, which an invented literal passes just as well
+/// as a real one. At the same time it stopped counting ANY written reason,
+/// so a rule that honestly cannot have a check could never be settled at
+/// all, except by retracting a true fact. Both halves were backwards.
+///
+/// Now exactly three things settle a rule here, the same three the
+/// evaluation-filing gate accepts (`model::store`'s `teeth_state`):
+/// - a check that has bitten a real call on record (`TeethBox::ProvenGuard`,
+///   computed fresh against the log - see `serve::prove`'s "against
+///   reality" section);
+/// - a teeth answer whose reason quotes the legitimate call or names the
+///   rule's own trigger (`model::gate::teeth_answer_settles`);
+/// - a check that is wired but has not met a real call yet (or whose anchor
+///   needs a person to look at it) AND a live open point of this project
+///   naming the rule's id - the honest "still to be proven", carried where
+///   the next evaluation has to close it.
+///
+/// ROTATES, so a fix-nothing session does not see the same five forever
+/// (2026-09-26): measured on a copy of a real store, this named the same five
+/// lowest ids at every session start in a project with nearly a hundred
+/// waiting, because it sorted by id alone. Now the ones asked about least
+/// often come first (`teeth_items_asked_counts`, a sidecar beside the store),
+/// then the heaviest, then the ones that fired most since their last verdict.
+fn teeth_debt(store: &EventStore, db_path: &Path, current_project: Option<&str>, root: Option<&Path>) -> Option<String> {
+    let open_points: Vec<String> =
+        model::store::open_points(store, current_project).into_iter().map(|p| p.text.to_lowercase()).collect();
+    let fired = usefulness::served_since_last_verdict(store);
+    let asked = teeth_items_asked_counts(db_path);
+    // (asked count, severity rank, fired count, id, what to do)
+    let mut candidates: Vec<(usize, u8, usize, String, String)> = Vec::new();
+    for li in serve::live::live_items(store) {
+        if !li.item.kind.can_fire() || !project::applies_to(li.item.project.as_deref(), current_project) {
+            continue;
+        }
+        if model::gate::teeth_answer_settles(&li.item) {
+            continue;
+        }
+        let named_in_open_point = open_points.iter().any(|t| t.contains(&li.id.to_lowercase()));
+        // Only a check can meet reality; reading the log for an item with no
+        // check would be paid for and thrown away.
+        let reality = if li.item.check.is_some() {
+            serve::prove::reality(store, &li.id, li.item.check.as_ref())
+        } else {
+            serve::prove::Reality::default()
+        };
+        let todo = match serve::prove::teeth_box(&li.id, &li.item, root, &reality) {
+            serve::prove::TeethBox::NotApplicable | serve::prove::TeethBox::ProvenGuard { .. } => continue,
+            serve::prove::TeethBox::Wired { .. }
+            | serve::prove::TeethBox::AnchorCollapsed { .. }
+            | serve::prove::TeethBox::RefusesLegitimateUse { .. }
+                if named_in_open_point =>
+            {
+                continue
             }
-            serve::prove::TeethBox::RefusesLegitimateUse { note, .. }
-            | serve::prove::TeethBox::AnchorCollapsed { note, .. }
-            | serve::prove::TeethBox::Informing { note, .. } => Some((li.id, note)),
-        })
-        .collect();
-    // Lowest id first: a stable order, so the same fact is asked until it is
-    // answered rather than a different one every turn.
-    candidates.sort_by(|a, b| a.0.cmp(&b.0));
+            serve::prove::TeethBox::Wired { note, .. } => format!(
+                "wired, never met a real call - {note}. Add an open point naming '{}' and the real call that would \
+                 prove it, so the next evaluation closes it",
+                li.id
+            ),
+            // Structurally can never reach anything - a shape a fresh write
+            // can no longer even create (`mcp`'s own `teeth_test` refuses it
+            // outright), but a live item written before that door closed can
+            // still carry it.
+            serve::prove::TeethBox::KeepRefusing(msg) => msg.strip_prefix("REFUSED: ").unwrap_or(&msg).to_string(),
+            serve::prove::TeethBox::RefusesLegitimateUse { note, .. } | serve::prove::TeethBox::AnchorCollapsed { note, .. } => {
+                format!("{note} Fix it, or add an open point naming '{}' so a person looks at it", li.id)
+            }
+            serve::prove::TeethBox::Informing { note, .. } => note,
+        };
+        let count = fired.get(&li.id).copied().unwrap_or(0);
+        candidates.push((
+            asked.get(&li.id).copied().unwrap_or(0),
+            model::item::severity_rank(li.item.severity),
+            count,
+            li.id,
+            todo,
+        ));
+    }
     if candidates.is_empty() {
         return None;
     }
+    candidates.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(b.2.cmp(&a.2)).then(a.3.cmp(&b.3)));
     let batch_len = candidates.len().min(TEETH_DEBT_BATCH_MAX);
     let left = candidates.len() - batch_len;
     let mut items_block = String::new();
-    for (id, correction) in candidates.iter().take(TEETH_DEBT_BATCH_MAX) {
-        items_block.push_str(&format!("\n- '{id}': {correction}"));
+    for (_, _, _, id, todo) in candidates.iter().take(TEETH_DEBT_BATCH_MAX) {
+        items_block.push_str(&format!("\n- '{id}': {todo}"));
     }
+    record_teeth_items_asked(db_path, candidates.iter().take(TEETH_DEBT_BATCH_MAX).map(|c| c.3.as_str()));
     let left_note = if left > 0 {
-        format!(" {left} more are waiting behind this batch.")
+        format!(" {left} more are waiting behind this batch; the next session is asked about others first.")
     } else {
         String::new()
     };
     Some(format!(
-        "[THOR] {batch_len} heavy rule(s) or checks-that-should-refuse still do not come back a PROVEN guard when tried \
-         right now - listed below, each with the concrete correction its own machine-tested box already found. Fix ALL \
-         {batch_len} before ending the turn: revise the check or the anchor the correction names (even with no other field \
-         changed, so the write path tries the teeth again), then confirm the reply says 'teeth: proven guard'.{left_note} \
-         Carrying SOME check, or a written 'no-literal'/'no-catch-on-command' tag from an older answer, no longer settles \
-         this on its own - only a box that comes back proven guard does; if a rule truly can never be given real teeth \
-         (an authorised action looks identical to an unauthorised one), retract it instead of leaving it standing as if it \
-         could refuse something.{items_block}"
+        "[THOR] {batch_len} heavy rule(s), or checks that should refuse, have neither a real tooth nor a real reason \
+         why they cannot have one - listed below with what their own test found. For each one, do the work: (1) give \
+         it a check whose literal is the text that MEANS the mistake is happening; it counts as proven once the log \
+         shows it refusing a real call, and until then an open point naming its id carries it; (2) only when no text \
+         marks the mistake, tag it 'no-literal:<why>' (on a command: 'no-catch-on-command:<why>') with a reason that \
+         QUOTES the legitimate call carrying the same fragment, or NAMES the command, file or moment the rule is \
+         about - a reason that would fit any rule does not count; (3) retract it, saying what changed about it, if \
+         it is simply wrong. A label such as 'teeth:informing' is not an answer: it only records that nothing could \
+         be tried.{left_note}{items_block}"
     ))
+}
+
+/// Where `teeth_debt` keeps how often it has named each rule - beside the
+/// store, one id per line, newest last. Its own file, never `teeth-asked.json`
+/// (that one is the once-per-session gate and holds session ids).
+fn teeth_items_asked_path(db: &Path) -> std::path::PathBuf {
+    db.parent().unwrap_or_else(|| Path::new(".")).join("teeth-asked-items.txt")
+}
+
+/// How often each rule has been named by `teeth_debt`, from its sidecar. An
+/// unreadable sidecar reads as "never asked", which only changes the order.
+fn teeth_items_asked_counts(db: &Path) -> std::collections::HashMap<String, usize> {
+    let mut counts = std::collections::HashMap::new();
+    if let Ok(text) = std::fs::read_to_string(teeth_items_asked_path(db)) {
+        for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            *counts.entry(line.to_string()).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+/// Best effort, like every sidecar here. Keeps the newest 2000 lines: enough
+/// history to rotate through a backlog of hundreds, never an unbounded file.
+fn record_teeth_items_asked<'a>(db: &Path, ids: impl Iterator<Item = &'a str>) {
+    let path = teeth_items_asked_path(db);
+    let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+    for id in ids {
+        text.push_str(id);
+        text.push('\n');
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let kept = &lines[lines.len().saturating_sub(2000)..];
+    let _ = std::fs::write(&path, format!("{}\n", kept.join("\n")));
 }
 
 /// Does this item ACTUALLY reach a block at one of its own bindings, as the
@@ -4247,15 +4330,15 @@ mod judgement_debt_tests {
             Some("acme"),
         );
         assert!(
-            teeth_debt(&store, Some("acme"), None).is_some(),
+            teeth_debt(&store, &db, Some("acme"), None).is_some(),
             "fixture sanity: it applies inside its own checkout"
         );
         assert!(
-            teeth_debt(&store, Some("thor"), None).is_none(),
+            teeth_debt(&store, &db, Some("thor"), None).is_none(),
             "a different checkout's project must never be asked about acme's own rule"
         );
         assert!(
-            teeth_debt(&store, None, None).is_none(),
+            teeth_debt(&store, &db, None, None).is_none(),
             "a checkout that resolves to no project at all gets the global layer only"
         );
     }
@@ -4274,9 +4357,9 @@ mod judgement_debt_tests {
             "Draai npm audit fix --force nooit op deze repo",
             None,
         );
-        assert!(teeth_debt(&store, Some("acme"), None).is_some(), "a global rule reaches acme's checkout");
-        assert!(teeth_debt(&store, Some("thor"), None).is_some(), "and thor's checkout too");
-        assert!(teeth_debt(&store, None, None).is_some(), "and a checkout with no project at all");
+        assert!(teeth_debt(&store, &db, Some("acme"), None).is_some(), "a global rule reaches acme's checkout");
+        assert!(teeth_debt(&store, &db, Some("thor"), None).is_some(), "and thor's checkout too");
+        assert!(teeth_debt(&store, &db, None, None).is_some(), "and a checkout with no project at all");
     }
 
     #[test]
@@ -4305,7 +4388,7 @@ mod judgement_debt_tests {
         legacy_unanswered(&mut store, "names-a-flag", "Draai npm audit fix --force nooit op deze repo");
 
         let asked =
-            teeth_debt(&store, Some("p"), None).expect("a heavy checkless rule must be found by the sweep itself");
+            teeth_debt(&store, &db, Some("p"), None).expect("a heavy checkless rule must be found by the sweep itself");
         assert!(asked.contains("names-a-flag"), "it must name which rule: {asked}");
         assert!(asked.contains("nothing to try"), "and say what its own teeth box found: {asked}");
     }
@@ -4323,7 +4406,7 @@ mod judgement_debt_tests {
             legacy_unanswered(&mut store, &format!("unarmed-{i}"), &format!("Draai npm audit fix --force-{i} nooit"));
         }
 
-        let asked = teeth_debt(&store, Some("p"), None).expect("several rules are unanswered");
+        let asked = teeth_debt(&store, &db, Some("p"), None).expect("several rules are unanswered");
         for i in 0..TEETH_DEBT_BATCH_MAX {
             assert!(asked.contains(&format!("unarmed-{i}")), "the whole batch is named: {asked}");
         }
@@ -4334,44 +4417,52 @@ mod judgement_debt_tests {
         assert!(asked.contains("2 more are waiting"), "silence about the rest would read as done: {asked}");
     }
 
-    /// REPLACES `either_answer_settles_it_and_only_silence_brings_it_back`
-    /// (2026-09-25): that test proved the exact defect this rebuild closes -
-    /// a written `no-literal` reason used to drop an item out of
-    /// `candidates` FOR GOOD, in every future session, which is how rules
-    /// came to rest on a written reason with no teeth at all (see
-    /// `teeth_debt`'s own doc comment). This proves the replacement: a
-    /// written reason no longer settles anything by itself - the item keeps
-    /// being named, with its own box's concrete correction, until its box
-    /// actually comes back a proven guard.
+    /// REPLACES `a_written_reason_no_longer_settles_it_only_a_proven_guard_does`
+    /// (2026-09-26): that test pinned both halves of the defect this rebuild
+    /// closes - a reason that is checkable against the rule could never settle
+    /// it, while a check proven only against its own literal did. Now: a reason
+    /// that fits any rule is refused at the write and settles nothing; one that
+    /// names the rule's own trigger settles it.
     #[test]
-    fn a_written_reason_no_longer_settles_it_only_a_proven_guard_does() {
+    fn a_reason_settles_it_only_when_it_names_what_the_rule_is_about() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
         let mut store = EventStore::new(&db).unwrap();
         legacy_unanswered(&mut store, "answer-me", "Draai npm audit fix --force nooit op deze repo");
-        assert!(teeth_debt(&store, Some("p"), None).is_some(), "fixture sanity");
+        assert!(teeth_debt(&store, &db, Some("p"), None).is_some(), "fixture sanity");
 
         let item = model::store::show(&store, "answer-me").unwrap();
-        let mut answered_no = item.clone();
-        answered_no
-            .tags
-            .push(format!("{}a test fixture with nothing literal to catch", model::store::NO_LITERAL_REASON_PREFIX));
-        model::store::revise(&mut store, "s", "l", "a", &item, &answered_no).unwrap();
-        let still_asked = teeth_debt(&store, Some("p"), None);
+        let mut thin = item.clone();
+        thin.tags.push(format!("{}this is a judgement rule and not a fixed text", model::store::NO_LITERAL_REASON_PREFIX));
         assert!(
-            still_asked.is_some(),
-            "a written reason must NOT settle it any more - only a proven-guard box does"
+            model::store::revise(&mut store, "s", "l", "a", &item, &thin).is_err(),
+            "a reason that would fit any rule is refused at the write"
         );
-        assert!(
-            still_asked.unwrap().contains("answer-me"),
-            "the same rule keeps being named, not silently dropped"
-        );
+        assert!(teeth_debt(&store, &db, Some("p"), None).unwrap().contains("answer-me"), "and it is still asked");
 
-        // Now genuinely arm it - a Command-bound Forbidden check that
-        // actually proves out both ways - and confirm THAT is what finally
-        // settles it. Re-read the live item first, the way a real caller
-        // (`mcp::revise`) always does, rather than reusing a stale snapshot.
-        let current = model::store::show(&store, "answer-me").unwrap();
+        let mut real = item.clone();
+        real.tags.push(format!(
+            "{}the same --force also appears in the legitimate lockfile repair run",
+            model::store::NO_LITERAL_REASON_PREFIX
+        ));
+        model::store::revise(&mut store, "s", "l", "a", &item, &real).unwrap();
+        assert!(
+            teeth_debt(&store, &db, Some("p"), None).is_none(),
+            "a reason that names the rule's own trigger settles it"
+        );
+    }
+
+    /// A check that is only WIRED - its two synthesised attempts held, but it
+    /// has never met a real call - settles nothing on its own: the attempts
+    /// were built from its own literal. Two honest ways out: a real refusal on
+    /// record, or an open point that names it so the next evaluation closes it.
+    #[test]
+    fn a_wired_check_settles_only_by_a_real_refusal_or_an_open_point_naming_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        legacy_unanswered(&mut store, "arm-me", "Draai npm audit fix --force nooit op deze repo");
+        let current = model::store::show(&store, "arm-me").unwrap();
         let mut armed = current.clone();
         armed.bindings = vec![model::item::Binding::Target {
             kind: model::item::TargetKind::Command,
@@ -4379,10 +4470,53 @@ mod judgement_debt_tests {
         }];
         armed.check = Some(model::item::Check::Forbidden { literals: vec!["--force".to_string()] });
         model::store::revise(&mut store, "s", "l", "a", &current, &armed).unwrap();
-        assert!(
-            teeth_debt(&store, Some("p"), None).is_none(),
-            "a check that actually proves out as a guard must settle it"
-        );
+        let asked = teeth_debt(&store, &db, Some("p"), None).expect("wired is not proven");
+        assert!(asked.contains("arm-me") && asked.contains("wired, never met a real call"), "{asked}");
+
+        serve::deliver::record_gate_outcome(&mut store, "s", "l", "hook", "2026-09-26T00:00:00Z", true, "arm-me", "npm audit fix --force");
+        assert!(teeth_debt(&store, &db, Some("p"), None).is_none(), "a real refusal on record settles it");
+
+        // The same, carried by an open point instead of a refusal.
+        let mut store = EventStore::new(&dir.path().join("t2.db")).unwrap();
+        legacy_unanswered(&mut store, "arm-me", "Draai npm audit fix --force nooit op deze repo");
+        let current = model::store::show(&store, "arm-me").unwrap();
+        model::store::revise(&mut store, "s", "l", "a", &current, &armed).unwrap();
+        let point = model::item::Item {
+            id: "open-arm-me".to_string(),
+            kind: model::item::Kind::Report,
+            text: "arm-me: its --force check is wired and still has to refuse a real call".to_string(),
+            bindings: vec![],
+            severity: None,
+            project: Some("p".to_string()),
+            tags: vec![model::store::OPEN_POINT_TAG.to_string()],
+            expires: None,
+            key: None,
+            falsifier: None,
+            check: None,
+        };
+        model::store::declare(&mut store, "s", "l", "a", &point).unwrap();
+        assert!(teeth_debt(&store, &db, Some("p"), None).is_none(), "an open point naming it carries it");
+    }
+
+    /// THE DEFECT THIS CLOSES (H): sorted by id alone, every session was asked
+    /// about the same five rules. The ones asked least often come first now.
+    #[test]
+    fn the_burn_rotates_so_the_next_session_is_asked_about_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        for i in 0..TEETH_DEBT_BATCH_MAX * 2 {
+            legacy_unanswered(&mut store, &format!("unarmed-{i:02}"), &format!("Draai npm audit fix --force-{i} nooit"));
+        }
+        let first = teeth_debt(&store, &db, Some("p"), None).unwrap();
+        let second = teeth_debt(&store, &db, Some("p"), None).unwrap();
+        for i in 0..TEETH_DEBT_BATCH_MAX {
+            assert!(first.contains(&format!("'unarmed-{i:02}'")), "{first}");
+            assert!(!second.contains(&format!("'unarmed-{i:02}'")), "the second ask must move on: {second}");
+        }
+        for i in TEETH_DEBT_BATCH_MAX..TEETH_DEBT_BATCH_MAX * 2 {
+            assert!(second.contains(&format!("'unarmed-{i:02}'")), "{second}");
+        }
     }
 
     /// UPDATED FOR THE 2026-09-25 REBUILD: this used to prove `candidate_
@@ -4401,7 +4535,7 @@ mod judgement_debt_tests {
         let mut item = crowded_newcomer("pure-judgement", "p");
         item.text = "Vraag eerst toestemming voor je iets onomkeerbaars doet".to_string();
         model::store::declare(&mut store, "s", "l", "a", &item).unwrap();
-        assert!(teeth_debt(&store, Some("p"), None).is_none(), "a light item with no check owes no proof at all");
+        assert!(teeth_debt(&store, &db, Some("p"), None).is_none(), "a light item with no check owes no proof at all");
     }
 
     #[test]
@@ -4436,7 +4570,7 @@ mod judgement_debt_tests {
         item.text = "Draai npm audit fix --force nooit op deze repo".to_string();
         item.check = Some(model::item::Check::Forbidden { literals: vec!["--force".to_string()] });
         model::store::declare(&mut store, "s", "l", "a", &item).unwrap();
-        let asked = teeth_debt(&store, Some("p"), None);
+        let asked = teeth_debt(&store, &db, Some("p"), None);
         assert!(asked.is_some(), "a check that can never reach anything must still be named");
         assert!(asked.unwrap().contains("looks-armed-fires-nothing"));
     }

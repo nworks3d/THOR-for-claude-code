@@ -637,10 +637,7 @@ pub fn revise(
     // held hostage to conditions that were only ever about the FILING
     // moment) - exactly the same "moment, not the item's whole life"
     // distinction `declare` itself draws.
-    if !existing.tags.iter().any(|t| t == EVALUATION_REPORT_TAG)
-        && updated.kind == Kind::Report
-        && updated.tags.iter().any(|t| t == EVALUATION_REPORT_TAG)
-    {
+    if newly_filed_as_evaluation(&existing, &updated) {
         if let Some(refusal) = check_evaluation_report_filing(store, &updated) {
             return Err(WriteError::Refused(refusal));
         }
@@ -649,6 +646,21 @@ pub fn revise(
     store
         .append_mutate_checked(session_id, lineage_id, actor, EventKind::FactRevised, &updated.id, None, &body)
         .map_err(WriteError::Store)
+}
+
+/// Whether this revise FILES an evaluation report for a project it was not
+/// filed for before: the tag is newly added, OR a report that already
+/// carried it is moved to a different project.
+///
+/// THE HOLE THE SECOND HALF CLOSES (2026-09-26). The filing gate ran only
+/// when the tag was newly added, so an evaluation report already filed for
+/// ANOTHER project, revised onto this one, counted as this project's report
+/// without a single condition ever being checked here - measured on a copy
+/// of a real store: an old report of one project re-scoped to another went
+/// straight through. A move is a filing for the project it lands in.
+fn newly_filed_as_evaluation(existing: &Item, updated: &Item) -> bool {
+    let tagged = |item: &Item| item.tags.iter().any(|t| t == EVALUATION_REPORT_TAG);
+    updated.kind == Kind::Report && tagged(updated) && (!tagged(existing) || existing.project != updated.project)
 }
 
 /// The `revise` entry point for a caller that can explain a WEAKENING
@@ -689,6 +701,18 @@ pub fn revise_because(
         capacity(store, &updated).map_err(WriteError::Store)?
     {
         return Err(WriteError::Refused(refusal));
+    }
+    // The same evaluation-filing gate `revise` runs. This entry point - the
+    // one the assistant's own `revise` tool uses - never ran it at all, so
+    // adding the tag to an existing report, or moving a tagged report to
+    // another project, filed an evaluation with no condition checked. Judged
+    // against `before`, the item exactly as stored: `existing` may be a
+    // cleared baseline (see this function's own doc comment) whose project
+    // was blanked on purpose.
+    if newly_filed_as_evaluation(&before, &updated) {
+        if let Some(refusal) = check_evaluation_report_filing(store, &updated) {
+            return Err(WriteError::Refused(refusal));
+        }
     }
     let reason = because.map(str::trim).filter(|r| !r.is_empty());
     let body = match reason {
@@ -1367,10 +1391,13 @@ pub const ANSWER_GUARD_TAG_PREFIX: &str = "answer-guard:";
 /// the one a writer's arguments pass through.
 pub const TEETH_TAG_PREFIX: &str = "teeth:";
 
-/// The guard was tried and it refused the synthesised, FORBIDDEN payload -
-/// AND it let the synthesised, CLEAN payload (the identical anchor, none of
-/// the check's own literals) straight through: this fact is a proven guard,
-/// not merely a claimed one, on both sides of the question.
+/// The check has bitten REALITY: the log holds a real call the real hook
+/// refused under it, or a real call its rule fired on that it would now
+/// refuse while still letting that rule's ordinary calls through - and where
+/// a synthesised two-sided test can be built at all, it held too. Since
+/// 2026-09-26 the synthesised test alone earns `TEETH_WIRED_TAG` instead: an
+/// attempt built from the writer's own literal can never tell a real tooth
+/// from an invented one.
 pub const TEETH_PROVEN_TAG: &str = "teeth:proven-guard";
 
 /// THE THIRD OUTCOME (2026-09-24): the guard refused BOTH the forbidden
@@ -1406,6 +1433,15 @@ pub const TEETH_ANCHOR_COLLAPSED_TAG: &str = "teeth:anchor-collapsed";
 /// to meet again - the receipt at write time is where they are told apart,
 /// in prose, with the concrete correction a reader needs.
 pub const TEETH_INFORMING_TAG: &str = "teeth:informing";
+
+/// WIRED, NOT PROVEN (2026-09-26): both synthesised attempts held - the
+/// forbidden one refused, the clean one let through - but the log holds no
+/// real call the check ever met. That is reach, and reach is all a writer
+/// can show at the moment of writing: the attempt is built from the writer's
+/// own literal, so an invented literal nobody will ever type comes back
+/// exactly as wired as a real one. Only `TEETH_PROVEN_TAG` means a real tooth
+/// (see `serve::prove`'s "against reality" section for what counts).
+pub const TEETH_WIRED_TAG: &str = "teeth:wired-not-proven";
 
 /// The id of the first-session note `ops::install::working_contract` seeds
 /// (`walk-through-the-answer-guard-once`), and the id an agent files the
@@ -1577,17 +1613,24 @@ fn served_since_last_verdict_local(store: &EventStore) -> HashMap<String, usize>
 /// half exactly (threshold, pinned exclusion, project scoping all
 /// identical), reimplemented for the identical reason every other function
 /// in this section is.
-fn judgement_debt_in_project(store: &EventStore, project: Option<&str>) -> usize {
+/// NAMED, not counted (2026-09-26): the ids themselves, sorted, so the filing
+/// refusal can hand a writer the exact list to judge instead of sending them
+/// to another tool to find it - a refusal that only counts is a refusal that
+/// gets answered by marking whatever comes to hand.
+fn judgement_debt_in_project(store: &EventStore, project: Option<&str>) -> Vec<String> {
     let served = served_since_last_verdict_local(store);
     let live = all_live_items(store);
     let live_by_id: HashMap<&str, &Item> = live.iter().map(|(id, it)| (id.as_str(), it)).collect();
-    served
+    let mut owed: Vec<String> = served
         .into_iter()
         .filter(|(_, count)| *count >= JUDGEMENT_DEBT_AFTER)
         .filter_map(|(id, _)| live_by_id.get(id.as_str()).map(|it| (id, *it)))
         .filter(|(_, it)| !it.bindings.iter().any(|b| matches!(b, Binding::Always)))
         .filter(|(_, it)| project_applies_to(it.project.as_deref(), project))
-        .count()
+        .map(|(id, _)| id)
+        .collect();
+    owed.sort();
+    owed
 }
 
 /// The highest creation seq among this project's own live evaluation
@@ -1623,7 +1666,7 @@ fn newest_evaluation_report_seq(store: &EventStore, project: Option<&str>) -> i6
 /// maintenance backfill has EVER recorded an answer, which is exactly what
 /// "must carry a machine-assigned teeth box" means: any of the four tags,
 /// not specifically the proven one.
-fn heavy_rules_fired_since_without_teeth_box(store: &EventStore, project: Option<&str>, cutoff_seq: i64) -> Vec<String> {
+fn heavy_rules_fired_since_unsettled(store: &EventStore, project: Option<&str>, cutoff_seq: i64) -> Vec<(String, &'static str)> {
     let Ok(events) = store.get_all_events() else { return Vec::new() };
     let mut fired_after: HashSet<String> = HashSet::new();
     for e in &events {
@@ -1631,17 +1674,72 @@ fn heavy_rules_fired_since_without_teeth_box(store: &EventStore, project: Option
             fired_after.insert(e.entity_id.clone());
         }
     }
-    let mut out: Vec<String> = all_live_items(store)
+    let live = all_live_items(store);
+    // Every live open point of this project, lowercased once: a wired or
+    // doubtful check is settled for THIS filing only when an open point
+    // names it (see `teeth_state` below).
+    let open_point_texts: Vec<String> = live
+        .iter()
+        .filter(|(_, item)| item.kind == Kind::Report)
+        .filter(|(_, item)| item.project.as_deref() == project)
+        .filter(|(_, item)| item.tags.iter().any(|t| t == OPEN_POINT_TAG))
+        .map(|(_, item)| item.text.to_lowercase())
+        .collect();
+    let mut out: Vec<(String, &'static str)> = live
         .into_iter()
         .filter(|(_, item)| item.kind.can_fire())
         .filter(|(_, item)| project_applies_to(item.project.as_deref(), project))
         .filter(|(_, item)| matches!(item.severity, Some(Severity::Irreversible) | Some(Severity::Costly)))
         .filter(|(id, _)| fired_after.contains(id))
-        .filter(|(_, item)| !item.tags.iter().any(|t| t.starts_with(TEETH_TAG_PREFIX)))
-        .map(|(id, _)| id)
+        .filter_map(|(id, item)| {
+            let named_in_open_point = open_point_texts.iter().any(|t| t.contains(&id.to_lowercase()));
+            teeth_state(&item, named_in_open_point).map(|state| (id, state))
+        })
         .collect();
     out.sort();
     out
+}
+
+/// Whether one heavy rule's teeth question is SETTLED for an evaluation
+/// filing - `None` when it is, or the plain name of what is still missing.
+///
+/// THE RULE (2026-09-26): more real teeth, or a clear proof it cannot have
+/// one - never a label that only satisfies the count. So exactly three things
+/// settle it:
+/// - `TEETH_PROVEN_TAG`: the check has bitten a real call on record;
+/// - a teeth answer whose reason quotes the legitimate call or names the
+///   rule's own trigger (`gate::teeth_answer_settles`) - a reason that only
+///   fills the length does not;
+/// - a check that is wired but not yet proven (or whose anchor needs a
+///   person to look at it) AND a live open point of this project naming the
+///   rule's id: the honest "this still has to meet a real call", carried where
+///   the next evaluation must close it (see `open_points_needing_action`).
+///
+/// `TEETH_INFORMING_TAG` alone settles nothing: it only records that nothing
+/// could be tried, which is the question, not an answer to it. Before this,
+/// ANY machine label settled the filing, so a maintenance pass that labelled
+/// every heavy rule "informing" lifted the gate for the whole store at once.
+fn teeth_state(item: &Item, named_in_open_point: bool) -> Option<&'static str> {
+    if item.tags.iter().any(|t| t == TEETH_PROVEN_TAG) || gate::teeth_answer_settles(item) {
+        return None;
+    }
+    let doubtful = [TEETH_WIRED_TAG, TEETH_ANCHOR_COLLAPSED_TAG, TEETH_REFUSES_LEGITIMATE_TAG];
+    if item.tags.iter().any(|t| doubtful.contains(&t.as_str())) {
+        if named_in_open_point {
+            return None;
+        }
+        if item.tags.iter().any(|t| t == TEETH_REFUSES_LEGITIMATE_TAG) {
+            return Some("its check refuses legitimate use too");
+        }
+        if item.tags.iter().any(|t| t == TEETH_ANCHOR_COLLAPSED_TAG) {
+            return Some("its anchor contains its own literal and it has not refused a real call yet");
+        }
+        return Some("its check is wired but has never met a real call");
+    }
+    if item.check.is_some() {
+        return Some("its check has never been tried, or cannot refuse anything");
+    }
+    Some("no check, and no reason that quotes the legitimate call or names its trigger")
 }
 
 /// Every live open point for `project`, exactly scoped (never `project_
@@ -1649,26 +1747,40 @@ fn heavy_rules_fired_since_without_teeth_box(store: &EventStore, project: Option
 /// report_seq` is exact) whose own creation seq is at or before
 /// `cutoff_seq` (it already existed as of the previous report - a point
 /// raised THIS session, while preparing the report about to be filed, is
-/// never held against that same filing) and that has never once been
-/// carried forward (`open_point_carried_count` is `0`). A point already
-/// carried once satisfies "closed or carried exactly once" as a standing
-/// fact about it and stops blocking here - it keeps being handed to the
-/// session regardless (`serve::bin::serve`'s own open-points messages), so
-/// it is never silently forgotten, only no longer a hard stop once one
-/// conscious carry decision has been made about it.
+/// never held against that same filing) and that has not been carried
+/// forward since that previous report. It keeps being handed to the session
+/// regardless (`serve::bin::serve`'s own open-points messages), so it is
+/// never silently forgotten.
+///
+/// A CARRY BUYS ONE CYCLE, NOT FOREVER (2026-09-26). A point carried once
+/// used to stop blocking for good the moment its tag read `carried:1` - one
+/// revise, and the point could ride along unanswered through every later
+/// evaluation. Now the carry is dated: it covers the ONE filing that follows
+/// it. Once a report has been filed after the carry, the point blocks again,
+/// and since a second carry is refused (`gate::revise`, ground 30) the only
+/// way on is to close it, or to take it to the owner.
 fn open_points_needing_action(store: &EventStore, project: Option<&str>, cutoff_seq: i64) -> Vec<String> {
     let mut out: Vec<String> = all_live_items(store)
         .into_iter()
         .filter(|(_, item)| item.kind == Kind::Report)
         .filter(|(_, item)| item.project.as_deref() == project)
         .filter(|(_, item)| item.tags.iter().any(|t| t == OPEN_POINT_TAG))
-        .filter(|(_, item)| open_point_carried_count(&item.tags) == 0)
         .filter(|(id, _)| {
-            store
-                .get_events_by_entity(id)
-                .ok()
-                .and_then(|events| events.first().map(|e| e.seq))
-                .is_some_and(|seq| seq <= cutoff_seq)
+            let Ok(events) = store.get_events_by_entity(id) else { return false };
+            let Some(created) = events.first().map(|e| e.seq) else { return false };
+            if created > cutoff_seq {
+                return false;
+            }
+            // The first revision that recorded a carry, if any.
+            let carried_at = events
+                .iter()
+                .filter(|e| e.kind == EventKind::FactRevised)
+                .find(|e| parse_body(&e.body).is_ok_and(|item| open_point_carried_count(&item.tags) >= 1))
+                .map(|e| e.seq);
+            match carried_at {
+                None => true,
+                Some(seq) => seq <= cutoff_seq,
+            }
         })
         .map(|(id, _)| id)
         .collect();
@@ -1736,26 +1848,35 @@ fn check_evaluation_report_filing(store: &EventStore, item: &Item) -> Option<Ref
     let mut missing: Vec<String> = Vec::new();
 
     let owed = judgement_debt_in_project(store, project);
-    if owed > 0 {
+    if !owed.is_empty() {
+        let named = owed.iter().map(|id| format!("'{id}'")).collect::<Vec<_>>().join(", ");
         missing.push(format!(
-            "{owed} item(s) that apply to this project (its own or global) still owe a judgement (served \
-             {JUDGEMENT_DEBT_AFTER}+ times since \
-             their last verdict) - settle each with mcp__thor__mark(id: \"<id>\") or mcp__thor__mark(id: \"<id>\", \
-             noise: true); doctor's own `judgement debt` line names them"
+            "{} item(s) that apply to this project (its own or global) still owe a judgement - each fired \
+             {JUDGEMENT_DEBT_AFTER}+ times since its last verdict: {named}. For each one, read where it last fired \
+             (`get` shows the item, doctor's judgement-debt line shows the place) and decide whether it belonged \
+             there: mcp__thor__mark(id: \"<id>\") when it did, mcp__thor__mark(id: \"<id>\", noise: true) when it \
+             did not. A verdict you did not read the item for is a false record, and it is worse than the debt",
+            owed.len()
         ));
     }
 
     let cutoff_seq = newest_evaluation_report_seq(store, project);
-    let unboxed = heavy_rules_fired_since_without_teeth_box(store, project, cutoff_seq);
-    if !unboxed.is_empty() {
-        let named = unboxed.iter().map(|id| format!("'{id}'")).collect::<Vec<_>>().join(", ");
+    let unsettled = heavy_rules_fired_since_unsettled(store, project, cutoff_seq);
+    if !unsettled.is_empty() {
+        let named = unsettled.iter().map(|(id, why)| format!("'{id}' ({why})")).collect::<Vec<_>>().join(", ");
         missing.push(format!(
             "{} heavy rule(s) that apply to this project (its own or global) have fired since the previous report \
-             - the log records when a rule fired, never in which project - and still carry no machine-tested \
-             teeth box: {named} - revise each one (even with no other field changed, so the write path tries its \
-             teeth again) or run `backfill_teeth --db <this store>` to see what it would label, then again with \
-             `--apply` to label it",
-            unboxed.len()
+             - the log records when a rule fired, never in which project - and still have neither a real tooth \
+             nor a real reason why they cannot: {named}. For each one, do the work, in this order: (1) find the \
+             text whose presence MEANS the mistake is happening and give the rule a check with it (forbidden, \
+             absent, absent_all, contains or requires) - it counts as proven once the log shows it biting a real \
+             call, and until then add an open point naming the rule's id and what real call would prove it; (2) \
+             only when no text marks the mistake, tag it 'no-literal:<why>' (or 'no-catch-on-command:<why>' on a \
+             command) with a reason that QUOTES the legitimate call that carries the same fragment, or NAMES the \
+             command, file or moment the rule is about - a reason that would fit any rule does not count; (3) \
+             retract it with a reason if it is simply wrong. A label a maintenance pass writes ('teeth:informing') \
+             is not an answer: it only says nothing could be tried",
+            unsettled.len()
         ));
     }
 
@@ -1776,9 +1897,10 @@ fn check_evaluation_report_filing(store: &EventStore, item: &Item) -> Option<Ref
     }
     Some(Refusal {
         problem: format!("this evaluation report cannot be filed yet: {}", missing.join("; ")),
-        fix: "settle every item named above, then file this report again - each condition is computed fresh from \
-              the log, never from what this report's own text says, so nothing here can be answered by rewording \
-              the report"
+        fix: "settle every item named above by doing the work it names, then file this report again - each \
+              condition is computed fresh from the log and from the items themselves, never from what this \
+              report's own text says, so nothing here can be answered by rewording the report or by relabelling \
+              in bulk"
             .to_string(),
     })
 }
@@ -2023,7 +2145,40 @@ pub fn retract(
     // Reading first turns "no such id" and "already retracted" into their own
     // honest errors instead of a CAS conflict that says neither.
     match show(store, entity_id) {
-        Ok(_) => {}
+        Ok(item) => {
+            // A HEAVY RULE IS NOT RETRACTED ON A REASON THAT FITS ANY RULE
+            // (2026-09-26). Measured on a copy of a real store: a rule marked
+            // costly went out on "no longer relevant for this project". That
+            // is the one exit left once weakening needs a reason, and it has
+            // to cost the same honesty: say what changed about THIS rule -
+            // name its command, file or moment, or quote what replaced it or
+            // what is gone. The same test a teeth reason is held to.
+            let heavy = item.kind.can_fire()
+                && matches!(item.severity, Some(Severity::Irreversible) | Some(Severity::Costly));
+            if heavy && !gate::reason_names_its_subject(reason, &item) {
+                let triggers = gate::teeth_triggers(&item);
+                let words = if triggers.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " - for this rule that means naming one of: {}",
+                        triggers.iter().take(8).map(|t| format!("'{t}'")).collect::<Vec<_>>().join(" ")
+                    )
+                };
+                return Err(WriteError::Refused(Refusal {
+                    problem: format!(
+                        "'{entity_id}' is marked {} and the reason '{reason}' says nothing about this rule - it would \
+                         fit any rule in the store",
+                        severity_word(item.severity)
+                    ),
+                    fix: format!(
+                        "say what changed about THIS rule: name what it is about, or quote (between quotes) the item \
+                         that replaces it or the thing that is gone{words}. If the rule is still true, keep it and \
+                         give it teeth or a reason instead"
+                    ),
+                }));
+            }
+        }
         Err(ReadError::Parse(_)) => {} // unreadable body, still retractable
         Err(e) => return Err(WriteError::Store(anyhow::anyhow!("{e}"))),
     }
@@ -2127,7 +2282,7 @@ mod tests {
             // bearing for the crowding and near-duplicate tests that reuse
             // this fixture, so only the field ground 11 actually asks about
             // changes.
-            tags: vec!["config".to_string(), format!("{}a fixture describing where a file lives with nothing literal to catch", crate::store::NO_LITERAL_REASON_PREFIX)],
+            tags: vec!["config".to_string(), format!("{}a fixture where 'the same text' is also the legitimate one", crate::store::NO_LITERAL_REASON_PREFIX)],
             expires: None,
             key: None,
             falsifier: Some("config/app.toml is removed or the app stops reading it".to_string()),
@@ -2332,11 +2487,11 @@ mod tests {
         declare(&mut store, "s1", "l1", "test", &item).unwrap();
         show(&store, &item.id).expect("live before the retraction");
 
-        retract(&mut store, "s1", "l1", "test", &item.id, "the config moved").unwrap();
+        retract(&mut store, "s1", "l1", "test", &item.id, "config/app.toml moved").unwrap();
 
         match show(&store, &item.id) {
             Err(ReadError::Retracted(why)) => assert!(
-                why.contains("the config moved"),
+                why.contains("config/app.toml moved"),
                 "the reason given at retraction must come back out, got {why:?}"
             ),
             other => panic!("a retracted item must report itself retracted, got {other:?}"),
@@ -2371,7 +2526,7 @@ mod tests {
         let mut updated = item.clone();
         updated.text = "the config lives in config/app.toml, and is read once at start".to_string();
         revise(&mut store, "s1", "l1", "test", &item, &updated).unwrap();
-        retract(&mut store, "s1", "l1", "test", &item.id, "superseded by the new layout").unwrap();
+        retract(&mut store, "s1", "l1", "test", &item.id, "app.toml was superseded by the new layout").unwrap();
 
         let log = history(&store, &item.id).unwrap();
         assert_eq!(log.len(), 3, "declare, revise and retract must all still be there");
@@ -2971,7 +3126,7 @@ mod tests {
             // anchor, not about teeth, and answers it so the two grounds stay
             // testable apart.
             sitting.tags.push(format!(
-                "{}this fixture exists to fill an anchor and never to catch anything",
+                "{}this fixture fills an anchor where 'the same text' is also legitimate",
                 crate::store::NO_CATCH_ON_COMMAND_REASON_PREFIX
             ));
             declare(&mut store, "s", "l", "t", &sitting).expect("fixture must store");
@@ -2979,7 +3134,7 @@ mod tests {
         let mut newcomer = sample_with("cmd-newcomer", "a webhook retry backs off before it gives up entirely");
         newcomer.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "terraform apply".to_string() }];
         newcomer.tags.push(format!(
-            "{}this fixture exists to fill an anchor and never to catch anything",
+            "{}this fixture fills an anchor where 'the same text' is also legitimate",
             crate::store::NO_CATCH_ON_COMMAND_REASON_PREFIX
         ));
         declare(&mut store, "s", "l", "t", &newcomer).expect_err("a full Command anchor refuses too");
@@ -2999,7 +3154,7 @@ mod tests {
         let newcomer = path_bound("newcomer", 8, "src/shared/queue.rs", Some(Severity::Costly));
         declare(&mut store, "s", "l", "t", &newcomer).expect_err("fixture sanity: the anchor starts full");
 
-        retract(&mut store, "s", "l", "t", "sit-0", "folded into sit-1").unwrap();
+        retract(&mut store, "s", "l", "t", "sit-0", "folded into 'sit-1'").unwrap();
         declare(&mut store, "s", "l", "t", &newcomer).expect("one retraction is enough room");
     }
 
@@ -3330,7 +3485,7 @@ mod tests {
         // check, same as sample() itself.
         item.tags = vec![
             DELIBERATE_ANCHOR_TAG.to_string(),
-            format!("{}a fixture describing an anchor that is absent on purpose", crate::store::NO_LITERAL_REASON_PREFIX),
+            format!("{}a fixture about app.toml being absent on purpose", crate::store::NO_LITERAL_REASON_PREFIX),
         ];
         declare(&mut store, "s1", "l1", "test", &item).unwrap();
 
@@ -3509,7 +3664,7 @@ mod tests {
         // p3: retracted - a tombstone, must be absent from both paths.
         let p3 = sample_with("p3", "run linting before every commit");
         declare(&mut store, "s1", "l1", "test", &p3).unwrap();
-        retract(&mut store, "s1", "l1", "test", &p3.id, "superseded by the new layout").unwrap();
+        retract(&mut store, "s1", "l1", "test", &p3.id, "app.toml was superseded by the new layout").unwrap();
 
         // p4: diverged (hand-crafted, same shape as
         // `serve::live`'s own equivalence test) - must be absent too.
@@ -3620,7 +3775,7 @@ mod tests {
         let item = sample();
         declare(&mut store, "s", "l", "a", &item).unwrap();
 
-        retract(&mut store, "s", "l", "a", &item.id, "no longer true").unwrap();
+        retract(&mut store, "s", "l", "a", &item.id, "config/app.toml is no longer true").unwrap();
     }
 
     /// A store that never had the seeded note at all (an old install, or one
@@ -3653,7 +3808,7 @@ mod tests {
             bindings: vec![Binding::Target { kind: TargetKind::Command, value: format!("fixture-command-{id}") }],
             severity: Some(Severity::Irreversible),
             project: Some(project.to_string()),
-            tags: vec![format!("{}a fixture with nothing literal to catch", NO_CATCH_ON_COMMAND_REASON_PREFIX)],
+            tags: vec![format!("{}a fixture where 'the same command' is also the legitimate one", NO_CATCH_ON_COMMAND_REASON_PREFIX)],
             expires: None,
             key: None,
             falsifier: Some("this turns out to be safe after all".to_string()),
@@ -3809,23 +3964,62 @@ mod tests {
         declare(&mut store, "s", "l", "a", &eval_report("eval-p-2", "p")).expect("debt is settled, filing must succeed");
     }
 
+    /// A heavy rule that predates the content rule for reasons: its answer
+    /// fits any rule at all. Written straight into the log, the way such a
+    /// rule really sits in an older store - the write gate would refuse it
+    /// fresh today.
+    fn legacy_thinly_answered(store: &mut EventStore, id: &str, project: Option<&str>) {
+        let mut item = heavy_command_rule(id, project.unwrap_or("unused"));
+        item.project = project.map(str::to_string);
+        item.tags = vec![format!("{}a fixture reason that fits any rule at all", NO_CATCH_ON_COMMAND_REASON_PREFIX)];
+        let body = serde_json::to_string(&item).unwrap();
+        store.append_event("legacy", id, "migration", EventKind::FactCreated, id, None, &body).unwrap();
+    }
+
     #[test]
-    fn evaluation_report_filing_is_refused_when_a_heavy_rule_fired_since_the_previous_report_carries_no_teeth_box() {
+    fn evaluation_report_filing_is_refused_when_a_fired_heavy_rule_has_neither_a_real_tooth_nor_a_real_reason() {
         let mut store = EventStore::in_memory().unwrap();
         declare(&mut store, "s", "l", "a", &eval_report("eval-q-old", "q")).unwrap();
-        let heavy = heavy_command_rule("unboxed-heavy", "q");
-        declare(&mut store, "s", "l", "a", &heavy).unwrap();
+        legacy_thinly_answered(&mut store, "unboxed-heavy", Some("q"));
         serve_n(&mut store, "unboxed-heavy", "hook", 1);
 
         let err = declare(&mut store, "s", "l", "a", &eval_report("eval-q-new", "q")).unwrap_err();
         let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
         assert!(refusal.problem.contains("unboxed-heavy"), "{}", refusal.problem);
-        assert!(refusal.problem.contains("no machine-tested"), "{}", refusal.problem);
-        assert!(
-            refusal.problem.contains("`backfill_teeth --db"),
-            "the refusal must name the program exactly as it is built and shipped: {}",
-            refusal.problem
-        );
+        assert!(refusal.problem.contains("neither a real tooth nor a real reason"), "{}", refusal.problem);
+    }
+
+    /// C (2026-09-26): the refusal used to point at a maintenance pass that
+    /// labels in bulk as the way out. It must send a fresh agent to the real
+    /// work instead - a check that bites, or a reason that quotes the
+    /// legitimate call or names the trigger - and never to relabelling.
+    #[test]
+    fn the_filing_refusal_names_the_real_work_and_never_the_bulk_relabel() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "s", "l", "a", &eval_report("eval-c-old", "c")).unwrap();
+        legacy_thinly_answered(&mut store, "needs-work", Some("c"));
+        serve_n(&mut store, "needs-work", "hook", 1);
+        let err = declare(&mut store, "s", "l", "a", &eval_report("eval-c-new", "c")).unwrap_err();
+        let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
+        let text = format!("{} {}", refusal.problem, refusal.fix);
+        assert!(!text.contains("backfill_teeth"), "a bulk relabel is never the way out: {text}");
+        assert!(text.contains("QUOTES the legitimate call"), "{text}");
+        assert!(text.contains("open point naming the rule's id"), "{text}");
+    }
+
+    /// C (2026-09-26): the judgement half names the owed items, so a writer
+    /// does not have to go and find them - and says what a verdict must rest
+    /// on.
+    #[test]
+    fn the_filing_refusal_names_every_item_that_owes_a_judgement() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "s", "l", "a", &light_command_rule("owed-a", "o")).unwrap();
+        declare(&mut store, "s", "l", "a", &light_command_rule("owed-b", "o")).unwrap();
+        serve_n(&mut store, "owed-a", ASSISTANT_DELIVERY_ACTOR, JUDGEMENT_DEBT_AFTER);
+        serve_n(&mut store, "owed-b", ASSISTANT_DELIVERY_ACTOR, JUDGEMENT_DEBT_AFTER);
+        let err = declare(&mut store, "s", "l", "a", &eval_report("eval-o-1", "o")).unwrap_err();
+        let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
+        assert!(refusal.problem.contains("'owed-a'") && refusal.problem.contains("'owed-b'"), "{}", refusal.problem);
     }
 
     /// THE SCOPE THIS CONDITION ACTUALLY HAS, stated where it is enforced. An
@@ -3840,9 +4034,7 @@ mod tests {
     fn a_fired_global_heavy_rule_blocks_filing_and_the_refusal_names_the_scope_it_really_counts() {
         let mut store = EventStore::in_memory().unwrap();
         declare(&mut store, "s", "l", "a", &eval_report("eval-g-old", "g")).unwrap();
-        let mut global = heavy_command_rule("global-heavy", "g");
-        global.project = None;
-        declare(&mut store, "s", "l", "a", &global).unwrap();
+        legacy_thinly_answered(&mut store, "global-heavy", None);
         serve_n(&mut store, "global-heavy", "hook", 1);
 
         let err = declare(&mut store, "s", "l", "a", &eval_report("eval-g-new", "g")).unwrap_err();
@@ -3860,17 +4052,70 @@ mod tests {
         );
     }
 
+    /// REPLACES `evaluation_report_filing_succeeds_once_the_fired_heavy_rule_
+    /// carries_any_teeth_box` (2026-09-26): that test pinned the defect. Any
+    /// machine label settled the filing, so a pass that labelled every heavy
+    /// rule "informing" lifted the gate for a whole store at once. "Informing"
+    /// only says nothing could be tried - it is the question, not an answer.
     #[test]
-    fn evaluation_report_filing_succeeds_once_the_fired_heavy_rule_carries_any_teeth_box() {
+    fn an_informing_label_alone_never_settles_a_fired_heavy_rule() {
         let mut store = EventStore::in_memory().unwrap();
         declare(&mut store, "s", "l", "a", &eval_report("eval-r-old", "r")).unwrap();
-        let mut heavy = heavy_command_rule("boxed-heavy", "r");
-        heavy.tags.push(TEETH_INFORMING_TAG.to_string());
-        declare(&mut store, "s", "l", "a", &heavy).unwrap();
+        legacy_thinly_answered(&mut store, "boxed-heavy", Some("r"));
+        let existing = show(&store, "boxed-heavy").unwrap();
+        let mut labelled = existing.clone();
+        labelled.tags.push(TEETH_INFORMING_TAG.to_string());
+        revise(&mut store, "s", "l", "a", &existing, &labelled).unwrap();
         serve_n(&mut store, "boxed-heavy", "hook", 1);
 
-        declare(&mut store, "s", "l", "a", &eval_report("eval-r-new", "r"))
-            .expect("a fired heavy rule carrying ANY reserved teeth tag must not block filing");
+        let err = declare(&mut store, "s", "l", "a", &eval_report("eval-r-new", "r")).unwrap_err();
+        let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
+        assert!(refusal.problem.contains("boxed-heavy"), "{}", refusal.problem);
+    }
+
+    /// A reason a reader can check against the rule - it names the rule's own
+    /// command - settles it: that is the clear proof it cannot have a tooth.
+    #[test]
+    fn a_reason_that_names_the_trigger_settles_a_fired_heavy_rule() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "s", "l", "a", &eval_report("eval-n-old", "n")).unwrap();
+        let mut heavy = heavy_command_rule("named-heavy", "n");
+        heavy.tags = vec![format!(
+            "{}an authorised fixture-command-named-heavy run is typed exactly like a wrong one",
+            NO_CATCH_ON_COMMAND_REASON_PREFIX
+        )];
+        declare(&mut store, "s", "l", "a", &heavy).unwrap();
+        serve_n(&mut store, "named-heavy", "hook", 1);
+        declare(&mut store, "s", "l", "a", &eval_report("eval-n-new", "n")).expect("a real reason settles it");
+    }
+
+    /// A check that is wired but has not met a real call yet settles the
+    /// filing only when an open point carries it by name - the honest "still
+    /// to be proven" the next evaluation has to close. A proven label settles
+    /// it on its own.
+    #[test]
+    fn a_wired_check_settles_only_when_an_open_point_names_it_and_a_proven_one_settles_alone() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "s", "l", "a", &eval_report("eval-w9-old", "w9")).unwrap();
+        let mut wired = heavy_command_rule("wired-heavy", "w9");
+        wired.tags = vec![TEETH_WIRED_TAG.to_string()];
+        wired.check = Some(Check::Forbidden { literals: vec!["--force".to_string()] });
+        declare(&mut store, "s", "l", "a", &wired).unwrap();
+        let mut proven = heavy_command_rule("proven-heavy", "w9");
+        proven.tags = vec![TEETH_PROVEN_TAG.to_string()];
+        proven.check = Some(Check::Forbidden { literals: vec!["--mirror".to_string()] });
+        declare(&mut store, "s", "l", "a", &proven).unwrap();
+        serve_n(&mut store, "wired-heavy", "hook", 1);
+        serve_n(&mut store, "proven-heavy", "hook", 1);
+
+        let err = declare(&mut store, "s", "l", "a", &eval_report("eval-w9-new", "w9")).unwrap_err();
+        let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
+        assert!(refusal.problem.contains("wired-heavy") && !refusal.problem.contains("proven-heavy"), "{}", refusal.problem);
+
+        let mut point = open_point("open-wired", "w9");
+        point.text = "wired-heavy still has to refuse a real --force push".to_string();
+        declare(&mut store, "s", "l", "a", &point).unwrap();
+        declare(&mut store, "s", "l", "a", &eval_report("eval-w9-new", "w9")).expect("the open point carries it");
     }
 
     #[test]
@@ -3940,5 +4185,94 @@ mod tests {
         let points = open_points(&store, Some("x"));
         assert_eq!(points.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), vec!["open-x-1", "open-x-2"]);
         assert!(points.iter().all(|p| p.carried == 0));
+    }
+
+    /// G (2026-09-26): a carry covers ONE filing. Once a report was filed
+    /// after the carry, the point blocks again - it used to stop blocking for
+    /// good the moment its tag read `carried:1`.
+    #[test]
+    fn a_carried_open_point_blocks_again_once_a_report_was_filed_after_the_carry() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "s", "l", "a", &open_point("open-g-1", "gg")).unwrap();
+        declare(&mut store, "s", "l", "a", &eval_report("eval-gg-1", "gg")).unwrap();
+        let existing = show(&store, "open-g-1").unwrap();
+        let mut carried = existing.clone();
+        carried.tags.push(format!("{OPEN_POINT_CARRIED_PREFIX}1"));
+        revise(&mut store, "s", "l", "a", &existing, &carried).unwrap();
+        declare(&mut store, "s", "l", "a", &eval_report("eval-gg-2", "gg")).expect("the one carry covers this filing");
+
+        let err = declare(&mut store, "s", "l", "a", &eval_report("eval-gg-3", "gg")).unwrap_err();
+        let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
+        assert!(refusal.problem.contains("open-g-1"), "the carry is used up: {}", refusal.problem);
+    }
+
+    /// G (2026-09-26): an open point is closed by a retraction with a reason,
+    /// never by revising its tag away or its carry count down.
+    #[test]
+    fn an_open_point_cannot_lose_its_tag_or_its_carry_by_revise() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "s", "l", "a", &open_point("open-h-1", "hh")).unwrap();
+        let existing = show(&store, "open-h-1").unwrap();
+        let mut untagged = existing.clone();
+        untagged.tags = vec!["from-report:eval-hh-1".to_string()];
+        assert!(revise(&mut store, "s", "l", "a", &existing, &untagged).is_err(), "dropping the tag must be refused");
+
+        let mut carried = existing.clone();
+        carried.tags.push(format!("{OPEN_POINT_CARRIED_PREFIX}1"));
+        revise(&mut store, "s", "l", "a", &existing, &carried).unwrap();
+        let now = show(&store, "open-h-1").unwrap();
+        let mut uncarried = now.clone();
+        uncarried.tags.retain(|t| !t.starts_with(OPEN_POINT_CARRIED_PREFIX));
+        assert!(revise(&mut store, "s", "l", "a", &now, &uncarried).is_err(), "lowering the carry must be refused");
+    }
+
+    /// D (2026-09-26): an evaluation report already filed for ANOTHER
+    /// project, moved onto this one, is a filing for this one - through both
+    /// revise doors.
+    #[test]
+    fn moving_a_filed_report_to_another_project_is_held_to_that_projects_filing_gate() {
+        let mut store = EventStore::in_memory().unwrap();
+        let light = light_command_rule("owed-d", "dd");
+        declare(&mut store, "s", "l", "a", &light).unwrap();
+        serve_n(&mut store, "owed-d", ASSISTANT_DELIVERY_ACTOR, JUDGEMENT_DEBT_AFTER);
+        declare(&mut store, "s", "l", "a", &eval_report("eval-elsewhere", "other")).unwrap();
+
+        let filed = show(&store, "eval-elsewhere").unwrap();
+        let mut moved = filed.clone();
+        moved.project = Some("dd".to_string());
+        let err = revise(&mut store, "s", "l", "a", &filed, &moved).unwrap_err();
+        let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
+        assert!(refusal.problem.contains("owe a judgement"), "{}", refusal.problem);
+
+        let err = revise_because(&mut store, "s", "l", "a", &filed, &moved, &filed, None).unwrap_err();
+        let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
+        assert!(refusal.problem.contains("owe a judgement"), "the assistant's own revise door too: {}", refusal.problem);
+        assert_eq!(show(&store, "eval-elsewhere").unwrap().project.as_deref(), Some("other"), "nothing moved");
+    }
+
+    /// D, the other half: adding the tag through the assistant's own door
+    /// (`revise_because`) is a filing too - it never ran the gate at all.
+    #[test]
+    fn tagging_a_report_through_the_assistants_revise_door_is_gated() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "s", "l", "a", &light_command_rule("owed-e", "ee")).unwrap();
+        serve_n(&mut store, "owed-e", ASSISTANT_DELIVERY_ACTOR, JUDGEMENT_DEBT_AFTER);
+        let mut plain = eval_report("plain-e", "ee");
+        plain.tags = vec!["notes".to_string()];
+        declare(&mut store, "s", "l", "a", &plain).unwrap();
+        let mut tagged = plain.clone();
+        tagged.tags.push(EVALUATION_REPORT_TAG.to_string());
+        assert!(revise_because(&mut store, "s", "l", "a", &plain, &tagged, &plain, None).is_err());
+    }
+
+    /// E (2026-09-26): a heavy rule is not retracted on a reason that fits
+    /// any rule; one that names what changed about it goes through.
+    #[test]
+    fn a_heavy_rule_needs_a_reason_about_itself_to_be_retracted() {
+        let mut store = EventStore::in_memory().unwrap();
+        let item = sample();
+        declare(&mut store, "s", "l", "a", &item).unwrap();
+        assert!(retract(&mut store, "s", "l", "a", &item.id, "niet meer relevant voor dit project").is_err());
+        retract(&mut store, "s", "l", "a", &item.id, "config/app.toml no longer exists").unwrap();
     }
 }
