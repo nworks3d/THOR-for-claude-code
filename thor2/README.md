@@ -241,7 +241,12 @@ rule is one entry with:
   stands aside instead of firing on it.
 - `none_of_patterns` - shape-based escapes rather than exact words; the
   evidence rule uses these to recognise a commit hash or a `file:line`
-  citation however it happens to be written.
+  citation however it happens to be written. A rule that names `path_line`
+  here has its citations looked up whenever the `Stop` payload says which
+  directory the session works in: a `file:line` counts only when that file
+  exists under that directory and has that line, and one that does not
+  check out counts for nothing - not even through a literal such as `.rs:`
+  in `none_of`. The block reason then names the citations that did not count.
 - `tier` - `block` holds the reply back until it is fixed; `warn` only
   leaves a note behind. Every rule seeded here is `block`.
 - `owner_reading_only` - `true` marks a rule about how a reply reads to the

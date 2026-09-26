@@ -134,7 +134,7 @@ fn main() {
         let rule_key = case.rule.unwrap_or(0);
         let entry = by_rule.entry(rule_key).or_insert((0, 0));
         entry.1 += 1;
-        match respond::guard_verdict(Some(&rulebook_text), &case.reply, &case.prompt, false).block_reason {
+        match respond::guard_verdict(Some(&rulebook_text), &case.reply, &case.prompt, false, None).block_reason {
             Some(reason) => {
                 caught_total += 1;
                 entry.0 += 1;
@@ -177,7 +177,7 @@ fn main() {
     for case in &should_pass {
         let entry = by_class.entry(case.class.clone()).or_insert((0, 0));
         entry.1 += 1;
-        if let Some(reason) = respond::guard_verdict(Some(&rulebook_text), &case.reply, &case.prompt, false).block_reason {
+        if let Some(reason) = respond::guard_verdict(Some(&rulebook_text), &case.reply, &case.prompt, false, None).block_reason {
             false_block_total += 1;
             entry.0 += 1;
             false_block_examples.push((case.id.clone(), case.class.clone(), reason));

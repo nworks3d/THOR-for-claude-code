@@ -959,6 +959,27 @@ fn payload_says_the_owner_reads_the_answer(payload: &Value) -> bool {
 /// fail-open, same stance as every other optional signal on this path: the
 /// exemption then simply does not apply, exactly the behaviour this project
 /// had before it existed, never a NEW block.
+/// Whether a `path:line` citation from an answer names a real line: `cited`
+/// resolves (relative to `root`, or as written when absolute) to a file that
+/// lies under `root` - the session's own working directory, already
+/// canonicalized by the caller - and that file has at least `line` lines.
+/// Line 0, a directory, a path that climbs out of `root` (`../`), and anything
+/// that cannot be read all answer `false`: a citation has to be checkable to
+/// count as evidence (see `respond`'s own "checked citations" section).
+fn cited_line_exists(root: &Path, cited: &str, line: u64) -> bool {
+    if line == 0 {
+        return false;
+    }
+    let Ok(file) = root.join(cited).canonicalize() else { return false };
+    if !file.starts_with(root) || !file.is_file() {
+        return false;
+    }
+    let Ok(bytes) = std::fs::read(&file) else { return false };
+    let newlines = bytes.iter().filter(|&&b| b == b'\n').count() as u64;
+    let lines = if bytes.last().is_some_and(|&b| b != b'\n') { newlines + 1 } else { newlines };
+    line <= lines
+}
+
 fn last_user_prompt_from_payload(payload: &Value) -> String {
     let Some(path) = payload.get("transcript_path").and_then(|v| v.as_str()) else {
         return String::new();
@@ -1175,6 +1196,17 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
         // Guard's reader-scoped rules read this; every debt below keeps
         // reading `is_subagent`, so the agent's own session separation holds.
         let reader_is_an_agent = is_subagent && !payload_says_the_owner_reads_the_answer(&payload);
+        // A `path:line` citation in the answer counts as evidence only when it
+        // names a real line under the session's own working directory - and
+        // only when the payload names one that exists; without it the Response
+        // Guard judges a citation by its shape, as before. See `respond`'s own
+        // "checked citations" section and `cited_line_exists`.
+        let evidence_root: Option<PathBuf> =
+            payload.get("cwd").and_then(|v| v.as_str()).and_then(|cwd| Path::new(cwd).canonicalize().ok());
+        let look_up_citation =
+            |cited: &str, line: u64| evidence_root.as_deref().is_some_and(|root| cited_line_exists(root, cited, line));
+        let citation_lookup: Option<&dyn Fn(&str, u64) -> bool> =
+            if evidence_root.is_some() { Some(&look_up_citation) } else { None };
         // THE DEFECT THIS CLOSES, reported by the owner on 2026-08-09: "my
         // TLDR rules worked an hour ago and now they are gone."
         //
@@ -1202,7 +1234,7 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
             }
             let rulebook_text = std::fs::read_to_string(respond::default_rulebook_path(db_path)).ok();
             let last_prompt = last_user_prompt_from_payload(&payload);
-            let verdict = respond::guard_verdict(rulebook_text.as_deref(), msg, &last_prompt, reader_is_an_agent);
+            let verdict = respond::guard_verdict(rulebook_text.as_deref(), msg, &last_prompt, reader_is_an_agent, citation_lookup);
             let text = verdict.block_reason.or(verdict.warn_reason)?;
             return Some(HookOutput::Warn { event_name, text });
         }
@@ -1218,7 +1250,7 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
         } else {
             let rulebook_text = std::fs::read_to_string(respond::default_rulebook_path(db_path)).ok();
             let last_prompt = last_user_prompt_from_payload(&payload);
-            let verdict = respond::guard_verdict(rulebook_text.as_deref(), msg, &last_prompt, reader_is_an_agent);
+            let verdict = respond::guard_verdict(rulebook_text.as_deref(), msg, &last_prompt, reader_is_an_agent, citation_lookup);
             if let Some(reason) = verdict.block_reason {
                 return Some(HookOutput::Decision(serde_json::json!({
                     "decision": "block",

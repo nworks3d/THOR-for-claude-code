@@ -189,6 +189,14 @@ pub fn last_user_prompt(transcript_jsonl: &str) -> Option<String> {
 /// reimplementing AND/OR/NOT next to a second copy that could drift from
 /// this one.
 fn rule_matches(rule: &Rule, haystack_lower: &str) -> bool {
+    rule_matches_with_escapes_in(rule, haystack_lower, haystack_lower)
+}
+
+/// `rule_matches`, with the `none_of` escapes read from `escapes_lower`
+/// instead of the full haystack - the reply with every `path:line` citation
+/// that did not check out blanked (see "checked citations" below). The
+/// trigger side (`min_chars`, `all_of`, `any_of`) always reads the full reply.
+fn rule_matches_with_escapes_in(rule: &Rule, haystack_lower: &str, escapes_lower: &str) -> bool {
     if rule.min_chars > 0 && haystack_lower.chars().count() < rule.min_chars {
         return false;
     }
@@ -200,7 +208,7 @@ fn rule_matches(rule: &Rule, haystack_lower: &str) -> bool {
     if !any_ok {
         return false;
     }
-    if rule.none_of.iter().any(|s| haystack_lower.contains(&s.to_lowercase())) {
+    if rule.none_of.iter().any(|s| escapes_lower.contains(&s.to_lowercase())) {
         return false;
     }
     true
@@ -499,6 +507,87 @@ fn pattern_escaped(rule: &OptInRule, haystack_lower: &str) -> bool {
     rule.none_of_patterns.iter().any(|name| pattern_matches(name, haystack_lower))
 }
 
+// ------------------------------------------------------ checked citations
+//
+// THE ESCAPE THIS CLOSES (found 2026-09-26). `checked-claim-needs-evidence`
+// accepts a `path:line` citation as evidence, twice over: the `path_line`
+// pattern above, and literal `none_of` terms such as ".rs:". Both only look at
+// the SHAPE, so an answer could type any file name and any line number, never
+// having opened either, and walk through a rule whose whole job is to catch a
+// claim of checking that nobody checked.
+//
+// So when the caller can look (it knows the session's working directory and
+// hands over `cited_line_exists`), a citation only counts when it names a real
+// file under that directory and a line that file really has. A citation that
+// does not check out counts for nothing: it is blanked from the text the
+// rule's escapes are read in, so neither the pattern nor a literal term inside
+// it (".rs:", a hex-looking file name the `commit_sha` shape would take for a
+// sha) can let the answer through. Everything else stays as it was: the other
+// escapes ("not checked", a real commit sha elsewhere in the answer), and a
+// rule that does not name `path_line` among its `none_of_patterns` at all -
+// it never treated a citation as evidence, so there is nothing to check.
+// Without a way to look, a citation is judged by its shape exactly as before.
+//
+// This file does no I/O of its own: `cited_line_exists` is the caller's (see
+// `serve/src/bin/serve.rs`'s own `cited_line_exists`).
+
+/// A `path:line` citation as written in the ORIGINAL reply (a file name keeps
+/// its case, which matters on most systems): the same shape as `path_line`,
+/// plus an optional drive letter in front so an absolute Windows path is read
+/// whole.
+fn citation_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i)(?:\b[a-z]:)?[a-z0-9_./\\-]+\.[a-z0-9]{1,8}:\d+").unwrap())
+}
+
+/// What a reply's citations turned out to prove.
+struct CheckedCitations {
+    /// At least one citation names a real line of a real file.
+    verified: bool,
+    /// The citations that did not check out, as written, for the reason.
+    unverified: Vec<String>,
+    /// The reply with every unverified citation blanked, as a haystack - what
+    /// a verifying rule's escapes are read in.
+    escapes_lower: String,
+}
+
+fn check_citations(message: &str, cited_line_exists: &dyn Fn(&str, u64) -> bool) -> CheckedCitations {
+    let mut verified = false;
+    let mut unverified = Vec::new();
+    let mut kept = String::with_capacity(message.len());
+    let mut last = 0;
+    for m in citation_regex().find_iter(message) {
+        let (path, line) = m.as_str().rsplit_once(':').expect("the pattern always ends in ':' and digits");
+        // A number too long for u64 names no real line either.
+        if cited_line_exists(path, line.parse::<u64>().unwrap_or(u64::MAX)) {
+            verified = true;
+            continue;
+        }
+        unverified.push(m.as_str().to_string());
+        kept.push_str(&message[last..m.start()]);
+        kept.push(' ');
+        last = m.end();
+    }
+    kept.push_str(&message[last..]);
+    CheckedCitations { verified, unverified, escapes_lower: haystack(&kept) }
+}
+
+/// Whether this rule takes a `path:line` citation as evidence, which is what
+/// makes its citations worth checking.
+fn takes_citations_as_evidence(rule: &OptInRule) -> bool {
+    rule.none_of_patterns.iter().any(|p| p == "path_line")
+}
+
+/// `pattern_escaped` for a rule whose citations were checked: `path_line`
+/// holds only for a citation that checked out, and every other shape is read
+/// in the reply with the unverified citations blanked.
+fn pattern_escaped_checked(rule: &OptInRule, checked: &CheckedCitations) -> bool {
+    rule.none_of_patterns.iter().any(|name| match name.as_str() {
+        "path_line" => checked.verified,
+        other => pattern_matches(other, &checked.escapes_lower),
+    })
+}
+
 // --------------------------------------------------------- list exemption
 //
 // FALSE BLOCK A, reported by the owner from other sessions, fixed
@@ -648,16 +737,48 @@ pub fn evaluate_opt_in(
     prompt_lower: &str,
     is_subagent: bool,
 ) -> Vec<(Tier, String)> {
+    evaluate_opt_in_checked(rules, haystack_lower, prompt_lower, is_subagent, None)
+}
+
+/// `evaluate_opt_in`, plus the reply's checked citations when the caller could
+/// look (see "checked citations" above): a rule that takes a citation as
+/// evidence then reads its escapes in `checked`, and its reminder names the
+/// citations that did not check out, so the writer sees why they did not count.
+fn evaluate_opt_in_checked(
+    rules: &[OptInRule],
+    haystack_lower: &str,
+    prompt_lower: &str,
+    is_subagent: bool,
+    checked: Option<&CheckedCitations>,
+) -> Vec<(Tier, String)> {
     rules
         .iter()
-        .filter(|r| {
-            rule_matches(&r.base, haystack_lower)
+        .filter_map(|r| {
+            let checked = checked.filter(|_| takes_citations_as_evidence(r));
+            let escapes_lower = checked.map_or(haystack_lower, |c| c.escapes_lower.as_str());
+            let pattern_escape = match checked {
+                Some(c) => pattern_escaped_checked(r, c),
+                None => pattern_escaped(r, haystack_lower),
+            };
+            let fires = rule_matches_with_escapes_in(&r.base, haystack_lower, escapes_lower)
                 && !positionally_escaped(r, haystack_lower)
-                && !pattern_escaped(r, haystack_lower)
+                && !pattern_escape
                 && !list_exempted(r, prompt_lower, haystack_lower)
-                && !(r.owner_reading_only && is_subagent)
+                && !(r.owner_reading_only && is_subagent);
+            if !fires {
+                return None;
+            }
+            let reminder = match checked.filter(|c| !c.unverified.is_empty()) {
+                Some(c) => format!(
+                    "{} (A path:line counts only when that file exists under the session's working directory and \
+                     has that line; these did not: {}.)",
+                    r.base.reminder,
+                    c.unverified.iter().take(3).map(String::as_str).collect::<Vec<_>>().join(", ")
+                ),
+                None => r.base.reminder.clone(),
+            };
+            Some((r.tier, reminder))
         })
-        .map(|r| (r.tier, r.base.reminder.clone()))
         .collect()
 }
 
@@ -690,19 +811,24 @@ pub struct GuardVerdict {
 /// above it, for what it does and why its default (`false`, from every
 /// existing caller that predates this parameter) must never silently narrow
 /// what a rulebook already blocks or warns about for the owner's own main
-/// session, only ever for a subagent's.
+/// session, only ever for a subagent's. `cited_line_exists` is the caller's
+/// way to look a `path:line` citation up (`Some` only when it knows the
+/// session's working directory - see "checked citations" above); `None`
+/// judges a citation by its shape alone, as before that existed.
 pub fn guard_verdict(
     rulebook_text: Option<&str>,
     message: &str,
     last_user_prompt: &str,
     is_subagent: bool,
+    cited_line_exists: Option<&dyn Fn(&str, u64) -> bool>,
 ) -> GuardVerdict {
     let rules = rulebook_text.map(parse_opt_in_rules).unwrap_or_default();
     if rules.is_empty() {
         return GuardVerdict { block_reason: None, warn_reason: None };
     }
     let prompt_lower = last_user_prompt.to_lowercase();
-    let fired = evaluate_opt_in(&rules, &haystack(message), &prompt_lower, is_subagent);
+    let checked = cited_line_exists.map(|check| check_citations(message, check));
+    let fired = evaluate_opt_in_checked(&rules, &haystack(message), &prompt_lower, is_subagent, checked.as_ref());
     let format_tier = |tier: Tier| -> Option<String> {
         let reasons: Vec<&str> = fired.iter().filter(|(t, _)| *t == tier).map(|(_, r)| r.as_str()).collect();
         if reasons.is_empty() {
@@ -814,7 +940,7 @@ mod tests {
     #[test]
     fn a_reply_that_opens_with_a_summary_then_jargon_does_not_trip_the_rule() {
         let msg = format!("TLDR: it works. {}", long_suffix("commit "));
-        assert!(guard_verdict(Some(POSITIONED_RULEBOOK), &msg, "", false).block_reason.is_none());
+        assert!(guard_verdict(Some(POSITIONED_RULEBOOK), &msg, "", false, None).block_reason.is_none());
     }
 
     /// Same words, reversed order: the jargon now comes first, so the rule
@@ -823,7 +949,7 @@ mod tests {
     #[test]
     fn the_same_words_in_the_other_order_trips_the_rule() {
         let msg = format!("{} TLDR: it works.", long_prefix("commit "));
-        let reason = guard_verdict(Some(POSITIONED_RULEBOOK), &msg, "", false).block_reason.expect("must fire");
+        let reason = guard_verdict(Some(POSITIONED_RULEBOOK), &msg, "", false, None).block_reason.expect("must fire");
         assert!(reason.contains("before the jargon"), "{reason}");
     }
 
@@ -833,7 +959,7 @@ mod tests {
     #[test]
     fn a_reply_with_no_jargon_at_all_never_trips_the_position_aware_rule() {
         let msg = format!("TLDR: it works. {}", "detail ".repeat(100));
-        assert!(guard_verdict(Some(POSITIONED_RULEBOOK), &msg, "", false).block_reason.is_none());
+        assert!(guard_verdict(Some(POSITIONED_RULEBOOK), &msg, "", false, None).block_reason.is_none());
     }
 
     /// A rulebook that never mentions `before` at all - every rule the owner
@@ -843,16 +969,16 @@ mod tests {
     #[test]
     fn a_rulebook_without_the_before_field_behaves_exactly_as_before() {
         let blocked = long("the commit fsck run is done, all gepusht");
-        assert_eq!(block_reason(Some(RULEBOOK), &blocked), guard_verdict(Some(RULEBOOK), &blocked, "", false).block_reason);
+        assert_eq!(block_reason(Some(RULEBOOK), &blocked), guard_verdict(Some(RULEBOOK), &blocked, "", false, None).block_reason);
 
         let compliant = long("TLDR: it works. the commit fsck run is done, all gepusht");
         assert_eq!(
             block_reason(Some(RULEBOOK), &compliant),
-            guard_verdict(Some(RULEBOOK), &compliant, "", false).block_reason
+            guard_verdict(Some(RULEBOOK), &compliant, "", false, None).block_reason
         );
 
         let short = "commit done, gepusht";
-        assert_eq!(block_reason(Some(RULEBOOK), short), guard_verdict(Some(RULEBOOK), short, "", false).block_reason);
+        assert_eq!(block_reason(Some(RULEBOOK), short), guard_verdict(Some(RULEBOOK), short, "", false, None).block_reason);
     }
 
     // ------------------------------------------------------------- tier
@@ -873,7 +999,7 @@ mod tests {
     /// then discarded it.
     #[test]
     fn a_warn_tier_rule_never_blocks() {
-        let v = guard_verdict(Some(TIERED_RULEBOOK), "ik zou liever dit anders zien", "", false);
+        let v = guard_verdict(Some(TIERED_RULEBOOK), "ik zou liever dit anders zien", "", false, None);
         assert!(v.block_reason.is_none(), "{:?}", v.block_reason);
         let warn = v.warn_reason.expect("the warn tier must still say something");
         assert!(warn.contains("preference"), "{warn}");
@@ -881,7 +1007,7 @@ mod tests {
 
     #[test]
     fn a_block_tier_rule_still_blocks() {
-        let v = guard_verdict(Some(TIERED_RULEBOOK), "dat nooit meer doen, begrepen?", "", false);
+        let v = guard_verdict(Some(TIERED_RULEBOOK), "dat nooit meer doen, begrepen?", "", false, None);
         let reason = v.block_reason.expect("a block-tier match must still block");
         assert!(reason.contains("hard rule"), "{reason}");
     }
@@ -893,10 +1019,10 @@ mod tests {
     /// absent or misspelled.
     #[test]
     fn an_unknown_or_missing_tier_defaults_to_block() {
-        let missing = guard_verdict(Some(TIERED_RULEBOOK), "a mystery phrase appears here", "", false);
+        let missing = guard_verdict(Some(TIERED_RULEBOOK), "a mystery phrase appears here", "", false, None);
         assert!(missing.block_reason.is_some(), "no tier key at all must still block");
 
-        let bogus = guard_verdict(Some(TIERED_RULEBOOK), "a bogus phrase appears here", "", false);
+        let bogus = guard_verdict(Some(TIERED_RULEBOOK), "a bogus phrase appears here", "", false, None);
         assert!(bogus.block_reason.is_some(), "an unrecognised tier value must still block");
     }
 
@@ -907,7 +1033,7 @@ mod tests {
     #[test]
     fn block_and_warn_reasons_never_mix() {
         let msg = "ik zou liever dit anders zien, en dat nooit meer doen, begrepen?";
-        let v = guard_verdict(Some(TIERED_RULEBOOK), msg, "", false);
+        let v = guard_verdict(Some(TIERED_RULEBOOK), msg, "", false, None);
         let block = v.block_reason.expect("block-example must still fire");
         let warn = v.warn_reason.expect("warn-example must still fire");
         assert!(!block.contains("preference"), "{block}");
@@ -943,7 +1069,7 @@ mod tests {
                     proxy-fix), 0dca539b (1.0.24), 9b3d5132 (onbekende plaat blokkeert dispatch niet), \
                     faa6d10a (1.0.25); werkmap schoon, server/package.json versie 1.0.25, en \
                     server/public/dashboard.html bevat de knop btn-nav-fleet. Niets verloren.";
-        let v = guard_verdict(Some(EVIDENCE_RULEBOOK), msg, "", false);
+        let v = guard_verdict(Some(EVIDENCE_RULEBOOK), msg, "", false, None);
         assert!(v.block_reason.is_none(), "{:?}", v.block_reason);
     }
 
@@ -953,7 +1079,7 @@ mod tests {
     #[test]
     fn a_bare_checked_claim_with_no_sha_or_path_still_blocks() {
         let msg = "Ja, dat heb ik gecheckt, het klopt allemaal.";
-        let v = guard_verdict(Some(EVIDENCE_RULEBOOK), msg, "", false);
+        let v = guard_verdict(Some(EVIDENCE_RULEBOOK), msg, "", false, None);
         assert!(v.block_reason.is_some(), "a bare claim with nothing to point at must still block");
     }
 
@@ -963,7 +1089,75 @@ mod tests {
     #[test]
     fn a_path_line_citation_in_an_unlisted_extension_escapes_the_rule() {
         let msg = "Gecheckt: config/settings.yaml:42 bevat de verkeerde waarde.";
-        let v = guard_verdict(Some(EVIDENCE_RULEBOOK), msg, "", false);
+        let v = guard_verdict(Some(EVIDENCE_RULEBOOK), msg, "", false, None);
+        assert!(v.block_reason.is_none(), "{:?}", v.block_reason);
+    }
+
+    // ------------------------------------------ checked citations (2026-09-26)
+
+    /// The caller's lookup, stood in for: only `src/real.rs` exists, and it
+    /// has ten lines.
+    fn only_real_rs(path: &str, line: u64) -> bool {
+        path == "src/real.rs" && (1..=10).contains(&line)
+    }
+
+    /// THE ESCAPE THIS CLOSES: a claim of having verified something, backed by
+    /// a citation nobody opened - a line the file does not have, or a file
+    /// that is not there - is held once the caller can look, and the reason
+    /// names the citation that did not count.
+    #[test]
+    fn a_verified_claim_citing_a_line_that_is_not_there_is_held_when_the_caller_can_look() {
+        for msg in ["Verified: src/real.rs:99 has the fix.", "Verified: src/made_up.rs:12 has the fix."] {
+            let v = guard_verdict(Some(EVIDENCE_RULEBOOK), msg, "", false, Some(&only_real_rs));
+            let reason = v.block_reason.unwrap_or_else(|| panic!("an unchecked citation must not count: {msg}"));
+            assert!(reason.contains("these did not"), "{reason}");
+        }
+    }
+
+    #[test]
+    fn a_verified_claim_citing_a_real_line_passes() {
+        let v = guard_verdict(Some(EVIDENCE_RULEBOOK), "Verified: src/real.rs:3 has the fix.", "", false, Some(&only_real_rs));
+        assert!(v.block_reason.is_none(), "{:?}", v.block_reason);
+    }
+
+    /// Unchanged when the caller cannot look: the citation is judged by its
+    /// shape, as before.
+    #[test]
+    fn without_a_lookup_a_citation_still_counts_by_its_shape() {
+        let v = guard_verdict(Some(EVIDENCE_RULEBOOK), "Verified: src/made_up.rs:12 has the fix.", "", false, None);
+        assert!(v.block_reason.is_none(), "{:?}", v.block_reason);
+    }
+
+    /// A made-up file name that looks like hex must not pass as a commit sha,
+    /// while a real sha elsewhere in the answer, and saying plainly that it
+    /// was not checked, both still count.
+    #[test]
+    fn an_unchecked_citation_counts_for_nothing_but_the_other_escapes_still_do() {
+        let held = guard_verdict(Some(EVIDENCE_RULEBOOK), "Verified: src/deadbeef42.rs:7 has the fix.", "", false, Some(&only_real_rs));
+        assert!(held.block_reason.is_some(), "a hex-looking made-up file name must not pass as a sha");
+        for msg in [
+            "Verified in a2770f8e, see src/made_up.rs:12.",
+            "Verified: src/made_up.rs:12 looks right, but this is unverified.",
+        ] {
+            let v = guard_verdict(Some(EVIDENCE_RULEBOOK), msg, "", false, Some(&only_real_rs));
+            assert!(v.block_reason.is_none(), "{msg}: {:?}", v.block_reason);
+        }
+    }
+
+    /// An absolute Windows path is read whole, drive letter included.
+    #[test]
+    fn an_absolute_windows_citation_reaches_the_lookup_whole() {
+        let lookup = |path: &str, line: u64| path == r"C:\repo\src\real.rs" && line == 3;
+        let v = guard_verdict(Some(EVIDENCE_RULEBOOK), r"Verified: C:\repo\src\real.rs:3 has the fix.", "", false, Some(&lookup));
+        assert!(v.block_reason.is_none(), "{:?}", v.block_reason);
+    }
+
+    /// A rule that never took a citation as evidence (no `path_line` among its
+    /// patterns) is judged exactly as before, lookup or not.
+    #[test]
+    fn a_rule_that_takes_no_citation_as_evidence_is_untouched_by_the_lookup() {
+        let rulebook = r#"[{"id":"plain","any_of":["verified"],"none_of":[".rs:"],"reminder":"plain rule"}]"#;
+        let v = guard_verdict(Some(rulebook), "Verified: src/made_up.rs:12 has the fix.", "", false, Some(&only_real_rs));
         assert!(v.block_reason.is_none(), "{:?}", v.block_reason);
     }
 
@@ -1023,7 +1217,7 @@ mod tests {
     /// ("lijst", "alle"), reply genuinely is one - must pass.
     #[test]
     fn a_long_list_reply_after_a_prompt_that_asked_for_one_is_not_blocked() {
-        let v = guard_verdict(Some(LIST_RULEBOOK), &long_list_reply(), "Kun je een lijst geven van alle stappen?", false);
+        let v = guard_verdict(Some(LIST_RULEBOOK), &long_list_reply(), "Kun je een lijst geven van alle stappen?", false, None);
         assert!(v.block_reason.is_none(), "{:?}", v.block_reason);
     }
 
@@ -1032,7 +1226,7 @@ mod tests {
     /// list-shaped; it needs the owner to have asked.
     #[test]
     fn the_same_long_list_reply_still_blocks_when_the_prompt_never_asked_for_one() {
-        let v = guard_verdict(Some(LIST_RULEBOOK), &long_list_reply(), "Hoe los ik dit probleem op?", false);
+        let v = guard_verdict(Some(LIST_RULEBOOK), &long_list_reply(), "Hoe los ik dit probleem op?", false, None);
         assert!(v.block_reason.is_some(), "no list was ever requested, so the length rule must still apply");
     }
 
@@ -1042,7 +1236,7 @@ mod tests {
     /// reply's SHAPE, not just about what the prompt said.
     #[test]
     fn a_long_prose_reply_still_blocks_even_when_the_prompt_asked_for_an_overview() {
-        let v = guard_verdict(Some(LIST_RULEBOOK), &long_prose_reply(), "Geef je me nog een overzicht van de opties?", false);
+        let v = guard_verdict(Some(LIST_RULEBOOK), &long_prose_reply(), "Geef je me nog een overzicht van de opties?", false, None);
         assert!(v.block_reason.is_some(), "the reply is prose, not a list, so it must still block");
     }
 
@@ -1051,7 +1245,7 @@ mod tests {
     /// same behaviour this rule had before the field existed.
     #[test]
     fn an_empty_last_prompt_never_grants_the_list_exemption() {
-        let v = guard_verdict(Some(LIST_RULEBOOK), &long_list_reply(), "", false);
+        let v = guard_verdict(Some(LIST_RULEBOOK), &long_list_reply(), "", false, None);
         assert!(v.block_reason.is_some());
     }
 
@@ -1132,7 +1326,7 @@ mod tests {
     /// the field genuinely doing what it says, not merely existing.
     #[test]
     fn a_rule_marked_owner_reading_only_is_skipped_for_a_subagent() {
-        let v = guard_verdict(Some(READER_SCOPE_RULEBOOK), "dit was te formeel geschreven voor mijn smaak", "", true);
+        let v = guard_verdict(Some(READER_SCOPE_RULEBOOK), "dit was te formeel geschreven voor mijn smaak", "", true, None);
         assert!(v.block_reason.is_none(), "{:?}", v.block_reason);
     }
 
@@ -1140,7 +1334,7 @@ mod tests {
     /// fire for the owner's own main session (`is_subagent: false`).
     #[test]
     fn the_same_owner_reading_only_rule_still_fires_for_the_main_session() {
-        let v = guard_verdict(Some(READER_SCOPE_RULEBOOK), "dit was te formeel geschreven voor mijn smaak", "", false);
+        let v = guard_verdict(Some(READER_SCOPE_RULEBOOK), "dit was te formeel geschreven voor mijn smaak", "", false, None);
         let reason = v.block_reason.expect("must still fire for the owner's own reading");
         assert!(reason.contains("own reading"), "{reason}");
     }
@@ -1151,7 +1345,7 @@ mod tests {
     /// argues for (a gate going quiet is the worst failure class here).
     #[test]
     fn an_unmarked_rule_still_fires_for_a_subagent() {
-        let v = guard_verdict(Some(READER_SCOPE_RULEBOOK), "ik kon dit niet bereiken vanaf hier", "", true);
+        let v = guard_verdict(Some(READER_SCOPE_RULEBOOK), "ik kon dit niet bereiken vanaf hier", "", true, None);
         let reason = v.block_reason.expect("an unmarked rule must still catch a subagent");
         assert!(reason.contains("no owner_reading_only key"), "{reason}");
     }
@@ -1174,7 +1368,7 @@ mod tests {
         assert_eq!(parsed.len(), 1, "a malformed owner_reading_only must not drop the whole rule");
         assert!(!parsed[0].owner_reading_only, "a non-bool value must read as false, not panic or default true");
 
-        let v = guard_verdict(Some(MALFORMED_RULEBOOK), "deze regel heeft een kapotte waarde erin", "", true);
+        let v = guard_verdict(Some(MALFORMED_RULEBOOK), "deze regel heeft een kapotte waarde erin", "", true, None);
         assert!(v.block_reason.is_some(), "a malformed value must be treated as not-marked, so it still catches a subagent");
     }
 }
