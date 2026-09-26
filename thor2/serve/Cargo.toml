@@ -46,6 +46,10 @@ name = "import_noise"
 path = "src/bin/import_noise.rs"
 required-features = ["semantic"]
 
+[[bin]]
+name = "backfill_teeth"
+path = "src/bin/backfill_teeth.rs"
+
 [[example]]
 name = "recall2_eval"
 required-features = ["semantic"]

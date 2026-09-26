@@ -221,8 +221,16 @@ fn with_warnings(
     existing: Option<&model::item::Item>,
     root: Option<&std::path::Path>,
     store: Option<&thor_core::event_store::EventStore>,
+    teeth_note: Option<String>,
 ) -> String {
-    let mut notes: Vec<String> = model::gate::warnings(item).iter().map(|w| w.to_string()).collect();
+    // CHANGE 2's own receipt, first among the notes: what trying this fact's
+    // teeth actually showed - see `teeth_test`/`apply_teeth_test`/
+    // `apply_teeth_test_for_revise`, the only callers that ever pass
+    // `Some(_)` here. `None` either because Change 2 does not apply to this
+    // fact at all, or because a revise changed neither its check nor its
+    // bindings and so carried its old answer forward without asking again.
+    let mut notes: Vec<String> = teeth_note.into_iter().collect();
+    notes.extend(model::gate::warnings(item).iter().map(|w| w.to_string()));
     // The half of the capacity check that is a note rather than a refusal.
     // Without this call it was dead code: constructed in `model::store` and
     // read by nothing but its own unit test, so a writer filling a pool that
@@ -396,10 +404,6 @@ pub struct TargetArg {
 /// `Binding` list `model::item::Item` actually stores. The one place both
 /// `remember` and `revise` build a binding list, so the two tools can never
 /// disagree about what a moment/target name means.
-/// A check that claims to refuse must be shown to refuse, here, before the
-/// write lands. See `serve::prove` for the defect this closes; the short
-/// version is that "important" was a word anybody could write, and the store
-/// counted it as protection without ever trying it.
 ///
 /// Append the scopes that exist to the one refusal that needs them.
 ///
@@ -699,25 +703,146 @@ fn open_a_new_shelf_if_named_by_owner(
     ))
 }
 
-/// Only a check that is TRIED and stays SILENT is refused. A check that cannot
-/// be tried without a working copy passes - reporting it as unproven belongs
-/// to `doctor`, not to a door that would otherwise refuse every file-reading
-/// proof this store has.
-fn refuse_an_unproven_check(item: &model::item::Item) -> Result<(), String> {
-    match serve::prove::prove(&item.id, item) {
-        serve::prove::Proof::Silent(attempt) => Err(format!(
-            "REFUSED: this check does not actually refuse anything. The attempt it should have stopped - {attempt} - \
-             went straight through the guard. A rule that looks armed and fires nothing is worse than one with no \
-             check at all, because it is counted as protection. Fix the literal so it appears verbatim in the \
-             command or content that makes the mistake, or anchor the rule to the command it is really about."
-        )),
-        serve::prove::Proof::NotProvable(why)
-            if why.starts_with("a forbidden check reaches only") =>
-        {
-            Err(format!("REFUSED: {why}. As written it can never fire, whatever it looks like."))
-        }
-        _ => Ok(()),
+/// CHANGE 2 (2026-09-24): the writer may never set, clear or fake the box a
+/// fact falls into - see `model::store::TEETH_TAG_PREFIX`'s own doc comment.
+/// Checked against the CALLER'S OWN tags, as given in `args`, before either
+/// `remember` or `revise` ever constructs the `Item` it hands to `teeth_test`
+/// below - the one place this tool later appends its own tag of the identical
+/// shape, so re-checking the FINISHED item here would refuse its own
+/// legitimate write.
+fn refuse_a_forged_teeth_tag(tags: &[String]) -> Result<(), String> {
+    if let Some(bad) = tags.iter().find(|t| t.starts_with(model::store::TEETH_TAG_PREFIX)) {
+        return Err(format!(
+            "invalid 'tags': '{bad}' starts with '{prefix}', which this tool reserves for itself - whether a \
+             fact is a proven guard, refuses legitimate use, has a collapsed anchor, or is merely informing is \
+             decided by actually trying its teeth, never by what a caller writes in 'tags'. Drop it; if this fact \
+             is heavy or carries a refusing check (forbidden, absent, absent_all, requires), the label is added \
+             automatically once the write goes through.",
+            prefix = model::store::TEETH_TAG_PREFIX
+        ));
     }
+    Ok(())
+}
+
+/// CHANGE 2's mechanism, replacing the narrower `refuse_an_unproven_check`
+/// this tool used to run: whether `item` owes a teeth test at all
+/// (`serve::prove::teeth_box`'s own applicability rule - heavy, or a
+/// refusing-kind check, regardless of the other), and which box trying it
+/// actually lands it in.
+///
+/// `Ok` carries the tag to append (`None` when Change 2 does not apply at
+/// all - light, and no refusing-kind check) and the receipt line a
+/// successful write appends to its own reply. `Err` is the ONE shape still
+/// refused outright and unchanged from before this write also tried
+/// `Absent`/`AbsentAll`/`Requires`: a `Forbidden` check that can never reach
+/// anything, whatever it looks like (`serve::prove::TeethBox::KeepRefusing`).
+/// Every OTHER outcome - tried and toothless, or nothing to try at all - is
+/// `Ok`: "the knowledge always gets in" holds for every box but this one
+/// single, pre-existing exception, which was never about lacking teeth at
+/// all, only about a shape that cannot mean anything.
+fn teeth_test(
+    item: &model::item::Item,
+    root: Option<&std::path::Path>,
+) -> Result<(Option<&'static str>, Option<String>), String> {
+    match serve::prove::teeth_box(&item.id, item, root) {
+        serve::prove::TeethBox::NotApplicable => Ok((None, None)),
+        serve::prove::TeethBox::KeepRefusing(msg) => Err(msg),
+        serve::prove::TeethBox::ProvenGuard { forbidden_tried, clean_tried } => Ok((
+            Some(model::store::TEETH_PROVEN_TAG),
+            Some(format!(
+                "teeth: proven guard - tried forbidden: {forbidden_tried}; the guard refused it. Tried clean: \
+                 {clean_tried}; the guard let it through, as legitimate use should be."
+            )),
+        )),
+        // THE THIRD OUTCOME (2026-09-24): never filed under the proven tag,
+        // and never filed quietly under the informing one either - see
+        // `model::store::TEETH_REFUSES_LEGITIMATE_TAG`'s own doc comment. The
+        // write still goes through; `note` already carries both sides of what
+        // was tried.
+        serve::prove::TeethBox::RefusesLegitimateUse { note, .. } => {
+            Ok((Some(model::store::TEETH_REFUSES_LEGITIMATE_TAG), Some(format!("teeth: refuses legitimate use - {note}"))))
+        }
+        // THE COLLAPSED CASE (2026-09-24): the anchor and the literal are not
+        // two separable things, so the two-sided test never ran at all - see
+        // `model::store::TEETH_ANCHOR_COLLAPSED_TAG`'s own doc comment.
+        serve::prove::TeethBox::AnchorCollapsed { note, .. } => {
+            Ok((Some(model::store::TEETH_ANCHOR_COLLAPSED_TAG), Some(format!("teeth: anchor collapsed - {note}"))))
+        }
+        serve::prove::TeethBox::Informing { note, .. } => {
+            Ok((Some(model::store::TEETH_INFORMING_TAG), Some(format!("teeth: informing only - {note}"))))
+        }
+    }
+}
+
+/// `teeth_test` above, run for a NEW item (`remember`): always tried, since
+/// there is no existing item whose check/bindings could already have settled
+/// the question. Mutates `item.tags` in place (pushing the tag `teeth_test`
+/// decided, if any) and returns the receipt line for a successful write.
+fn apply_teeth_test(item: &mut model::item::Item, root: Option<&std::path::Path>) -> Result<Option<String>, String> {
+    let (tag, note) = teeth_test(item, root)?;
+    if let Some(tag) = tag {
+        item.tags.push(tag.to_string());
+    }
+    Ok(note)
+}
+
+/// `teeth_test` above, run for a REVISE: a revision that changes neither the
+/// check nor the bindings `existing` carried must not be re-labelled or
+/// slowed by this step - re-testing is real work (an anchored check's
+/// currency is proved fresh every time), and neither of the two things a
+/// teeth test is ABOUT changed, so its old answer is still the true one.
+/// Whatever tag `existing` already carried (if any - an item written before
+/// this change, or one Change 2 never applied to, carries none) is copied
+/// forward untouched, and nothing is tried. Otherwise - the check changed,
+/// the bindings changed, or both - exactly `apply_teeth_test`'s own fresh
+/// test, on the REVISED item.
+fn apply_teeth_test_for_revise(
+    existing: &model::item::Item,
+    updated: &mut model::item::Item,
+    root: Option<&std::path::Path>,
+) -> Result<Option<String>, String> {
+    if existing.check == updated.check && existing.bindings == updated.bindings {
+        let already_present = updated.tags.iter().any(|t| t.starts_with(model::store::TEETH_TAG_PREFIX));
+        if already_present {
+            return Ok(None);
+        }
+        let Some(old_tag) = existing.tags.iter().find(|t| t.starts_with(model::store::TEETH_TAG_PREFIX)) else {
+            return Ok(None);
+        };
+        // The caller's own `tags` (an explicit clear, or a new list that
+        // simply omitted it) did not carry this label forward - restored
+        // anyway, and said so, because clearing it is exactly one of the
+        // three things a writer may never do to it (set, clear, or fake by
+        // wording - see `model::store::TEETH_TAG_PREFIX`'s own doc comment).
+        // Silent restoration would look like the clear worked when it did
+        // not.
+        updated.tags.push(old_tag.clone());
+        return Ok(Some(format!(
+            "teeth: '{old_tag}' is not part of 'tags' - it survives a clear or a replacement that omits it, \
+             restored here, because neither the check nor the bindings changed"
+        )));
+    }
+    // Something Change 2 cares about DID change: never trust an old label
+    // that answered a different question, even if the writer's own new tags
+    // list happened to still carry it forward from `existing.tags` (the
+    // omit-keeps-current-tags convention `revise` already documents).
+    //
+    // The old tag is dropped ONLY once a new one is ready to take its place
+    // - never on its own, and never before `teeth_test` has already decided
+    // there IS a replacement. `model::gate::revise`'s ground 9 refuses a
+    // revise that drops every tag `existing` carried, and an item whose only
+    // tag happens to be this one (say, it stopped being heavy and its check
+    // was cleared in the same call) would trip that refusal for a field the
+    // caller never even mentioned, over bookkeeping this tool did to itself.
+    // `TeethBox::NotApplicable` therefore leaves an old tag standing rather
+    // than risk it - stale in that one narrow, both-at-once edge case, never
+    // a refusal nobody asked for.
+    let (tag, note) = teeth_test(updated, root)?;
+    if let Some(tag) = tag {
+        updated.tags.retain(|t| !t.starts_with(model::store::TEETH_TAG_PREFIX));
+        updated.tags.push(tag.to_string());
+    }
+    Ok(note)
 }
 
 fn build_bindings(moments: &[String], targets: &[TargetArg], always: bool) -> Result<Vec<Binding>, String> {
@@ -1516,6 +1641,12 @@ impl ThorMcpServer {
         let root = self.root.clone();
         let library = self.library.clone();
         self.blocking(move |s| {
+            // CHANGE 2, checked first and against the CALLER'S OWN tags,
+            // before anything else even looks at them: see
+            // `refuse_a_forged_teeth_tag`'s own doc comment.
+            if let Err(why) = refuse_a_forged_teeth_tag(&args.tags) {
+                return Err(why);
+            }
             let kind = Kind::from_str(&args.kind).map_err(|e| format!("invalid 'kind': {e}"))?;
             let severity = match args.severity.as_deref() {
                 None => None,
@@ -1530,7 +1661,7 @@ impl ThorMcpServer {
                 args.check_literals.clone(),
             )
             .map_err(|e| format!("invalid check: {e}"))?;
-            let item = Item {
+            let mut item = Item {
                 id: args.id.clone(),
                 kind,
                 text: args.text.clone(),
@@ -1543,9 +1674,16 @@ impl ThorMcpServer {
                 falsifier: args.falsifier.clone(),
                 check,
             };
-            if let Err(why) = refuse_an_unproven_check(&item) {
-                return Err(why);
-            }
+            // CHANGE 2: heavy or refusing-kind-checked, the tool tries this
+            // fact's own teeth right here, before anything is stored, and
+            // appends the box it lands in as a tag `item` carries into
+            // `declare_in` below - never refusing on that account alone (see
+            // `apply_teeth_test`'s own doc comment for the ONE exception,
+            // which was already a refusal before this change).
+            let teeth_note = match apply_teeth_test(&mut item, root.as_deref().map(|p| p.as_path())) {
+                Ok(note) => note,
+                Err(why) => return Err(why),
+            };
             if let Err(why) = refuse_a_new_collection(
                 &item,
                 s,
@@ -1562,6 +1700,7 @@ impl ThorMcpServer {
                     None,
                     root.as_deref().map(|p| p.as_path()),
                     Some(s),
+                    teeth_note,
                 )),
                 Err(e) => Err(with_scope_menu(format!("REFUSED: {e}"), s)),
             }
@@ -1581,6 +1720,16 @@ impl ThorMcpServer {
         let revise_library = self.library.clone();
         self.blocking(move |s| {
             let existing = model::store::show(s, &args.id).map_err(|e| format!("cannot revise: {e}"))?;
+            // CHANGE 2, checked first and only against a NEW tags list the
+            // caller actually supplies (an omitted `tags` carries `existing.
+            // tags` forward untouched, which may legitimately already carry
+            // this tool's own earlier answer - that is not a forgery, it is
+            // the label surviving a revise that never mentioned tags at all).
+            if let Some(new_tags) = args.tags.as_deref() {
+                if let Err(why) = refuse_a_forged_teeth_tag(new_tags) {
+                    return Err(why);
+                }
+            }
             let bindings = if args.moments.is_some() || args.targets.is_some() || args.always.is_some() {
                 build_bindings(
                     args.moments.as_deref().unwrap_or(&[]),
@@ -1742,7 +1891,7 @@ impl ThorMcpServer {
             // that keys on "REFUSED" must not have to learn a second shape
             // just because the reason came from the edit modes.
             let text = edited_text(&existing.text, &args).map_err(|e| format!("REFUSED: {e}"))?;
-            let updated = Item {
+            let mut updated = Item {
                 id: existing.id.clone(),
                 kind: existing.kind,
                 text,
@@ -1787,11 +1936,17 @@ impl ThorMcpServer {
             if tags_cleared {
                 gate_existing.tags = Vec::new();
             }
-            // Same door as remember: a correction must not be able to swap a
-            // working lock for one that fires nothing.
-            if let Err(why) = refuse_an_unproven_check(&updated) {
-                return Err(why);
-            }
+            // CHANGE 2: unless this revise touches neither the check nor the
+            // bindings `existing` carried, in which case its old answer is
+            // carried forward untouched and nothing is tried again - see
+            // `apply_teeth_test_for_revise`'s own doc comment. Computed
+            // against the TRUE `existing`, never `gate_existing`, for the
+            // identical reason `weakenings` below is: a field blanked for a
+            // legitimate clear must still read as the change it is.
+            let teeth_note = match apply_teeth_test_for_revise(&existing, &mut updated, revise_root.as_deref().map(|p| p.as_path())) {
+                Ok(note) => note,
+                Err(why) => return Err(why),
+            };
             // And the same door as remember on where this gets FILED: moving an
             // item into a collection nobody has named is opening one, whichever
             // tool does it.
@@ -1849,6 +2004,7 @@ impl ThorMcpServer {
                         Some(&existing),
                         revise_root.as_deref().map(|p| p.as_path()),
                         Some(s),
+                        teeth_note,
                     ))
                 }
                 Err(e) => Err(with_scope_menu(format!("REFUSED: {e}"), s)),
@@ -3313,12 +3469,300 @@ mod tests {
 
     /// A clean item must stay clean: no note, no trailing whitespace, nothing
     /// for a reader to wonder about.
+    ///
+    /// UPDATED FOR CHANGE 2 (2026-09-24): `base_remember`'s own fixture is
+    /// `severity: irreversible` with no check - exactly the shape Change 2
+    /// now requires a teeth note for (heavy, nothing to synthesise, the
+    /// informing box). "No note at all" stopped being true for THAT fixture
+    /// the moment this tool started trying teeth unasked; this test's own
+    /// point - that a write with nothing ELSE wrong about it carries no
+    /// OTHER note - still holds, proven here with severity lowered so Change
+    /// 2 itself does not apply and the original assertion is exactly true
+    /// again.
     #[tokio::test]
     async fn a_clean_write_gets_no_note_at_all() {
         let srv = server();
-        let reply = srv.remember(Parameters(base_remember("clean-item"))).await;
+        let mut args = base_remember("clean-item");
+        args.severity = Some("house_style".to_string());
+        let reply = srv.remember(Parameters(args)).await;
         assert!(reply.starts_with("stored "), "{reply}");
         assert!(!reply.contains("note:"), "nothing to warn about, so nothing may be said: {reply}");
+    }
+
+    /// The companion case Change 2 actually adds: `base_remember`'s own
+    /// fixture, UNCHANGED (heavy, no check), now carries exactly one note -
+    /// the teeth receipt, landing it in the informing box because there was
+    /// nothing to synthesise at all - and the stored item carries the
+    /// reserved tag nothing but this tool could have set.
+    #[tokio::test]
+    async fn a_heavy_checkless_write_now_carries_the_teeth_informing_note_and_tag() {
+        let srv = server();
+        let reply = srv.remember(Parameters(base_remember("heavy-checkless"))).await;
+        assert!(reply.starts_with("stored "), "{reply}");
+        assert!(reply.contains("note:"), "a heavy checkless write now owes a teeth receipt: {reply}");
+        assert!(reply.contains("teeth: informing only"), "{reply}");
+        assert!(reply.contains("nothing to try"), "{reply}");
+
+        let get_reply = srv.get(Parameters(GetArgs { id: "heavy-checkless".to_string() })).await;
+        let item: Item = serde_json::from_str(&get_reply).unwrap();
+        assert!(
+            item.tags.iter().any(|t| t == model::store::TEETH_INFORMING_TAG),
+            "the stored item must carry the reserved informing tag: {:?}",
+            item.tags
+        );
+    }
+
+    // --------------------------------------------------------- CHANGE 2 tests
+
+    fn bare_revise(id: &str) -> ReviseArgs {
+        ReviseArgs {
+            because: None,
+            new_collection_named_by_owner: None,
+            append: None,
+            replace_from: None,
+            replace_to: None,
+            id: id.to_string(),
+            text: None,
+            severity: None,
+            project: None,
+            tags: None,
+            expires: None,
+            key: None,
+            falsifier: None,
+            check_kind: None,
+            check_path: None,
+            check_literal: None,
+            check_literals: vec![],
+            moments: None,
+            targets: None,
+            always: None,
+            clear_severity: false,
+            clear_project: false,
+            clear_expires: false,
+            clear_key: false,
+            clear_falsifier: false,
+            clear_check: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn remember_refuses_a_caller_supplied_teeth_tag_and_writes_nothing() {
+        let srv = server();
+        let mut args = base_remember("forged-1");
+        args.tags = vec![model::store::TEETH_PROVEN_TAG.to_string()];
+        let reply = srv.remember(Parameters(args)).await;
+        assert!(reply.contains("invalid 'tags'"), "{reply}");
+        assert!(reply.contains(model::store::TEETH_TAG_PREFIX), "{reply}");
+
+        let events = srv.store.lock().unwrap().get_all_events().unwrap();
+        assert!(events.is_empty(), "a refused remember must write nothing at all, found: {events:?}");
+    }
+
+    #[tokio::test]
+    async fn revise_refuses_a_caller_supplied_teeth_tag_and_changes_nothing() {
+        let srv = server();
+        srv.remember(Parameters(base_remember("forged-2"))).await;
+        let mut args = bare_revise("forged-2");
+        args.tags = Some(vec![model::store::TEETH_INFORMING_TAG.to_string()]);
+        let reply = srv.revise(Parameters(args)).await;
+        assert!(reply.contains("invalid 'tags'"), "{reply}");
+        assert!(reply.contains(model::store::TEETH_TAG_PREFIX), "{reply}");
+    }
+
+    /// THE PRIMARY CLAIM: a fact whose check actually reaches and matches is
+    /// stored as a PROVEN GUARD, labelled by the tool, never the writer.
+    #[tokio::test]
+    async fn remember_with_a_reachable_forbidden_check_is_stored_as_a_proven_guard() {
+        let srv = server();
+        let args = RememberArgs {
+            new_collection_named_by_owner: None,
+            id: "proven-1".to_string(),
+            kind: "rule".to_string(),
+            text: "never force-push".to_string(),
+            severity: Some("irreversible".to_string()),
+            project: None,
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some("a force-push lands with no incident".to_string()),
+            check_kind: Some("forbidden".to_string()),
+            check_path: None,
+            check_literal: None,
+            check_literals: vec!["--force".to_string()],
+            moments: vec![],
+            targets: vec![TargetArg { kind: "command".to_string(), value: "git push".to_string() }],
+            always: false,
+        };
+        let reply = srv.remember(Parameters(args)).await;
+        assert!(reply.starts_with("stored "), "{reply}");
+        assert!(reply.contains("teeth: proven guard"), "{reply}");
+        assert!(reply.contains("--force"), "{reply}");
+
+        let get_reply = srv.get(Parameters(GetArgs { id: "proven-1".to_string() })).await;
+        let item: Item = serde_json::from_str(&get_reply).unwrap();
+        assert!(
+            item.tags.iter().any(|t| t == model::store::TEETH_PROVEN_TAG),
+            "the stored item must carry the reserved proven-guard tag: {:?}",
+            item.tags
+        );
+    }
+
+    /// THE COLLAPSED CASE, end to end, with a worked example:
+    /// an anchor that already carries the literal it forbids leaves no
+    /// literal-free form to test as legitimate use. Stored (the knowledge
+    /// still gets in), but labelled with its own reserved tag, never the
+    /// proven one.
+    #[tokio::test]
+    async fn remember_with_a_collapsed_anchor_is_stored_with_its_own_tag_never_proven() {
+        let srv = server();
+        let args = RememberArgs {
+            new_collection_named_by_owner: None,
+            id: "collapsed-1".to_string(),
+            kind: "rule".to_string(),
+            text: "never force-push".to_string(),
+            severity: Some("irreversible".to_string()),
+            project: None,
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some("a force-push lands with no incident".to_string()),
+            check_kind: Some("forbidden".to_string()),
+            check_path: None,
+            check_literal: None,
+            check_literals: vec!["--force".to_string()],
+            moments: vec![],
+            targets: vec![TargetArg { kind: "command".to_string(), value: "git push --force".to_string() }],
+            always: false,
+        };
+        let reply = srv.remember(Parameters(args)).await;
+        assert!(reply.starts_with("stored "), "{reply}");
+        assert!(reply.contains("teeth: anchor collapsed"), "{reply}");
+        assert!(!reply.contains("teeth: proven guard"), "{reply}");
+
+        let get_reply = srv.get(Parameters(GetArgs { id: "collapsed-1".to_string() })).await;
+        let item: Item = serde_json::from_str(&get_reply).unwrap();
+        assert!(
+            item.tags.iter().any(|t| t == model::store::TEETH_ANCHOR_COLLAPSED_TAG),
+            "the stored item must carry the reserved anchor-collapsed tag, never the proven one: {:?}",
+            item.tags
+        );
+        assert!(!item.tags.iter().any(|t| t == model::store::TEETH_PROVEN_TAG), "{:?}", item.tags);
+    }
+
+    /// THE ONE PRESERVED REFUSAL: a `Forbidden` check reaching neither
+    /// `Always` nor a `Command` target is still refused outright, unchanged
+    /// from before this write also tried `Absent`/`AbsentAll`/`Requires`.
+    #[tokio::test]
+    async fn remember_with_an_unreachable_forbidden_check_is_still_refused_and_writes_nothing() {
+        let srv = server();
+        let args = RememberArgs {
+            new_collection_named_by_owner: None,
+            id: "unreachable-1".to_string(),
+            kind: "rule".to_string(),
+            text: "never force-push".to_string(),
+            severity: Some("irreversible".to_string()),
+            project: None,
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some("a force-push lands with no incident".to_string()),
+            check_kind: Some("forbidden".to_string()),
+            check_path: None,
+            check_literal: None,
+            check_literals: vec!["--force".to_string()],
+            moments: vec![],
+            targets: vec![TargetArg { kind: "path".to_string(), value: "some/file.rs".to_string() }],
+            always: false,
+        };
+        let reply = srv.remember(Parameters(args)).await;
+        assert!(reply.contains("REFUSED"), "{reply}");
+        assert!(reply.contains("reaches only"), "{reply}");
+
+        let events = srv.store.lock().unwrap().get_all_events().unwrap();
+        assert!(events.is_empty(), "a refused remember must write nothing at all, found: {events:?}");
+    }
+
+    /// A revise that touches neither the check nor the bindings must not be
+    /// re-labelled or slowed: the existing teeth tag survives byte for byte,
+    /// and no fresh teeth note appears (nothing was tried again).
+    #[tokio::test]
+    async fn revise_that_changes_only_text_carries_the_existing_teeth_tag_forward_untouched() {
+        let srv = server();
+        srv.remember(Parameters(base_remember("stable-1"))).await;
+        let before = srv.get(Parameters(GetArgs { id: "stable-1".to_string() })).await;
+        let before_item: Item = serde_json::from_str(&before).unwrap();
+        assert!(
+            before_item.tags.iter().any(|t| t == model::store::TEETH_INFORMING_TAG),
+            "fixture sanity - base_remember is heavy with no check: {:?}",
+            before_item.tags
+        );
+
+        let mut args = bare_revise("stable-1");
+        args.text = Some("never force-push to main, ever".to_string());
+        let reply = srv.revise(Parameters(args)).await;
+        assert!(reply.starts_with("revised"), "{reply}");
+        assert!(!reply.contains("teeth:"), "an unrelated revise must not be re-tested or re-labelled: {reply}");
+
+        let after = srv.get(Parameters(GetArgs { id: "stable-1".to_string() })).await;
+        let after_item: Item = serde_json::from_str(&after).unwrap();
+        assert_eq!(after_item.tags, before_item.tags, "the teeth tag must survive byte for byte");
+    }
+
+    /// THE SECOND WAY A WRITER MUST NOT BE ABLE TO TOUCH THE LABEL: an
+    /// explicit `tags: []` clear - the harness-level way to clear the whole
+    /// list - must not be able to erase the teeth tag either, on a revise
+    /// that changes neither the check nor the bindings. The tag survives,
+    /// restored, and the reply says so.
+    ///
+    /// A CHECKED fixture, deliberately, never `base_remember`'s own checkless
+    /// one: that fixture answers ground 11's OLDER, unrelated teeth question
+    /// with its own self-report tags, and clearing every tag would trip THAT
+    /// gate before Change 2 ever got a say - a real interaction between the
+    /// two mechanisms, not a defect this test exists to prove.
+    #[tokio::test]
+    async fn revise_clearing_tags_on_a_checked_item_still_keeps_the_existing_teeth_tag() {
+        let srv = server();
+        let args = RememberArgs {
+            new_collection_named_by_owner: None,
+            id: "stable-checked-1".to_string(),
+            kind: "rule".to_string(),
+            text: "never force-push".to_string(),
+            severity: Some("irreversible".to_string()),
+            project: None,
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some("a force-push lands with no incident".to_string()),
+            check_kind: Some("forbidden".to_string()),
+            check_path: None,
+            check_literal: None,
+            check_literals: vec!["--force".to_string()],
+            moments: vec![],
+            targets: vec![TargetArg { kind: "command".to_string(), value: "git push".to_string() }],
+            always: false,
+        };
+        srv.remember(Parameters(args)).await;
+        let before = srv.get(Parameters(GetArgs { id: "stable-checked-1".to_string() })).await;
+        let before_item: Item = serde_json::from_str(&before).unwrap();
+        assert_eq!(before_item.tags, vec![model::store::TEETH_PROVEN_TAG.to_string()], "fixture sanity");
+
+        let mut args = bare_revise("stable-checked-1");
+        args.tags = Some(vec![]); // an explicit clear, never a caller-supplied teeth tag
+        let reply = srv.revise(Parameters(args)).await;
+        assert!(reply.starts_with("revised"), "{reply}");
+        assert!(reply.contains("tags cleared"), "{reply}");
+        assert!(
+            reply.contains("is not part of 'tags'") && reply.contains("restored"),
+            "the reply must say the teeth tag survived the clear: {reply}"
+        );
+
+        let after = srv.get(Parameters(GetArgs { id: "stable-checked-1".to_string() })).await;
+        let after_item: Item = serde_json::from_str(&after).unwrap();
+        assert_eq!(
+            after_item.tags,
+            vec![model::store::TEETH_PROVEN_TAG.to_string()],
+            "the teeth tag must be the one thing an explicit clear cannot remove"
+        );
     }
 
     // ------------------------------------------------- remember/get round trip

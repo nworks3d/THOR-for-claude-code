@@ -407,6 +407,21 @@ fn no_longer_covered() -> i64 {
     serve::time::now_unix() - (serve::usefulness::EVAL_REPORT_COVERS_HOURS + 1) * 3600
 }
 
+/// Settles the judgement debt `declare_owed_items` creates, by giving every
+/// id it returns a plain "useful" verdict - step 2 ("Judge what fired") of
+/// `eval-command.example.md`, in miniature. Needed (2026-09-25) by any
+/// test that both creates owed items for a project AND then files that
+/// SAME project's evaluation report: `model::store`'s own evaluation-filing
+/// gate now refuses to declare a live `evaluation-report` while real
+/// judgement debt remains, so `declare_report` below would otherwise be
+/// refused for the exact reason this whole rebuild exists - see that
+/// gate's own doc comment (`model::store::check_evaluation_report_filing`).
+fn pay_down_judgement_debt(store: &mut EventStore, ids: &[String]) {
+    for id in ids {
+        serve::mark::record_useful(store, "fixture", "fixture", "fixture", "2026-09-17T00:00:00Z", id).unwrap();
+    }
+}
+
 /// A live evaluation-report Report, correctly tagged and scoped - the exact
 /// shape `eval-command.example.md`'s own final step now writes with
 /// `remember`. `model::gate`'s ground 21 refuses a Report with no project
@@ -459,7 +474,11 @@ fn declare_teeth_eligible_item(store: &mut EventStore, id: &str) {
         kind: Kind::Rule,
         text: format!("Never run the deploy script with --force-{id} on this repo"),
         bindings: vec![Binding::Always],
-        severity: None,
+        // Heavy: since the 2026-09-25 rebuild, `teeth_debt` only ever owes a
+        // proof to the population `serve::prove::teeth_box` does (heavy, or
+        // a refusing-kind check) - see that function's own doc comment. A
+        // light item with no check is `NotApplicable` and never asked.
+        severity: Some(model::item::Severity::Irreversible),
         project: None,
         tags: vec![],
         expires: None,
@@ -631,7 +650,7 @@ fn the_ask_counter_increments_per_turn_and_resets_once_a_report_is_seen() {
     let project_dir = sandbox.project_dir("thor-fixture");
 
     let mut store = EventStore::new(&db).unwrap();
-    declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
+    let owed_ids = declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
     seed_session_work(&db, Some("thor-fixture"), "s1", 90);
     drop(store);
 
@@ -642,7 +661,10 @@ fn the_ask_counter_increments_per_turn_and_resets_once_a_report_is_seen() {
         assert!(state.first_asked_since_report.is_some(), "turn {turn}: the first-asked clock must be set");
     }
 
+    // Settle the judgement debt before filing - see `pay_down_judgement_
+    // debt`'s own doc comment: the filing gate now refuses otherwise.
     let mut store = EventStore::open_existing(&db).unwrap();
+    pay_down_judgement_debt(&mut store, &owed_ids);
     declare_report(&mut store, "eval-thor-fixture-2026-09-17", "thor-fixture");
     seed_session_work(&db, Some("thor-fixture"), "s2", 90);
     drop(store);
@@ -1077,7 +1099,7 @@ fn a_new_evaluation_report_for_the_project_silences_it() {
     let project_dir = sandbox.project_dir("thor-fixture");
 
     let mut store = EventStore::new(&db).unwrap();
-    declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
+    let owed_ids = declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
     seed_session_work(&db, Some("thor-fixture"), "s1", 90);
     drop(store);
 
@@ -1088,7 +1110,11 @@ fn a_new_evaluation_report_for_the_project_silences_it() {
     // File the evaluation report through the store directly - the same
     // shape `eval-command.example.md`'s own final step files with
     // `remember`: kind Report, this project, tagged `evaluation-report`.
+    // The judgement debt fixture sanity just proved above must be settled
+    // FIRST - see `pay_down_judgement_debt`'s own doc comment - a real
+    // evaluation pays it down before it ever files the report too.
     let mut store = EventStore::open_existing(&db).unwrap();
+    pay_down_judgement_debt(&mut store, &owed_ids);
     declare_report(&mut store, "eval-thor-fixture-2026-09-17", "thor-fixture");
     // A fresh session, so a stale minutes-worked timestamp is not what is
     // silencing the second call - it must clear the "served this project"
@@ -1310,5 +1336,9 @@ fn teeth_debt_still_fires_after_the_evaluation_debt_check() {
     assert_eq!(v["decision"], "block", "{out}");
     let reason = v["reason"].as_str().unwrap();
     assert!(reason.contains("names-a-flag"), "teeth_debt must still name the rule: {reason}");
-    assert!(reason.contains("--force-names-a-flag"), "and quote what it spotted: {reason}");
+    // UPDATED FOR THE 2026-09-25 REBUILD: `teeth_debt` no longer mines the
+    // item's own text for a literal to quote - it reports what the item's
+    // own teeth box actually found, which for a checkless item is "nothing
+    // to try", not a guess pulled from prose.
+    assert!(reason.contains("nothing to try"), "and say what its own teeth box found: {reason}");
 }

@@ -308,10 +308,16 @@ struct TargetArgs {
     /// none), "verdict" ("prohibition" or "advice" - see this binary's own
     /// classifier, `absent_guard::classify_moment`, for the doctrine), only
     /// ever "matched_literal" (a string) when the verdict is a prohibition,
-    /// never for advice, and "text" (string). `check` emits one row per item
-    /// the block would actually show; `why` emits one row per item that
-    /// applies at all, shown or withheld - the same distinction their own
-    /// prose forms already keep.
+    /// never for advice, "text" (string), and "shown" (bool: true when the
+    /// block would actually include this item, false when it applies but a
+    /// heavier item is holding its place). BOTH `check` and `why` emit one
+    /// row per item that applies at all, shown or withheld - never only the
+    /// ones the block shows, so a rule that would genuinely refuse the thing
+    /// being asked about is never invisible here just because it lost its
+    /// four slots to heavier items; "shown" is what tells the two apart.
+    /// `check`'s own prose form marks a not-shown prohibition the identical
+    /// way, underneath the block it never changes; `why`'s prose form always
+    /// did.
     #[arg(long)]
     json: bool,
 }
@@ -582,6 +588,15 @@ fn decay_notice(store: &EventStore, db: &Path, cwd: Option<&Path>) -> Option<Str
 /// `None` for advice and skipped entirely by serde rather than written as
 /// `null` - "present only for a prohibition" means the KEY is absent, not
 /// merely empty (see `json_rows_carry_exactly_the_documented_keys` below).
+///
+/// `shown` (added alongside the fix that makes every row build from `served.
+/// all`, never only `served.selection.shown` - see `check_rows`'s own doc
+/// comment below) is a PLAIN ADDITION, never a rename or removal: an existing
+/// reader that only ever looked at the six keys this row used to carry sees
+/// them completely unchanged, plus one more it can ignore. That is what makes
+/// this safe to add without a version bump - see this file's own
+/// `json_rows_carry_exactly_the_documented_keys` test for the exact key set,
+/// now seven.
 #[derive(Debug, serde::Serialize)]
 struct CheckRow {
     id: String,
@@ -591,25 +606,44 @@ struct CheckRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     matched_literal: Option<String>,
     text: String,
+    shown: bool,
 }
 
-/// `absent_guard::classify_moment` run over `ranked` against `command`/
-/// `content`, translated into the documented `CheckRow` shape - the one
-/// function `check --json`, `why --json`, `mark_prohibitions` and `why_lines`
-/// (the prose markers) and `hook`'s own `verdicts` field all build on, so
-/// none of them can drift from what the classifier itself decided.
-fn check_rows(ranked: &[RankedItem], command: &str, content: Option<&str>) -> Vec<CheckRow> {
-    let verdicts = absent_guard::classify_moment(ranked, command, content);
-    ranked
-        .iter()
+/// `absent_guard::classify_moment` run over EVERY item that applies - `all`,
+/// never only the ones the context block actually shows - translated into
+/// the documented `CheckRow` shape and marked with whether each one is among
+/// `shown_ids`. The one function `check --json`, `why --json` and `hook`'s
+/// own `verdicts` field all build on, so none of them can drift from what
+/// the classifier itself decided, or from each other about which items it
+/// ever even asks the question of.
+///
+/// THE DEFECT THIS CLOSES. Before this, `check --json` and `hook`'s own
+/// `verdicts` built their rows from `served.selection.shown` alone - at most
+/// `model::item::MAX_ITEMS` (4) rows, the same cap the injected context
+/// block itself is held to. A rule that really would refuse the very command
+/// being asked about, but that lost the four slots to heavier items, was
+/// therefore invisible to anyone reading `--json` or the hook's `verdicts` -
+/// including any program that reads exactly those two doors and nothing
+/// else. `why --json` already read
+/// `served.all` (see this binary's own `--help` text on `TargetArgs::json`,
+/// before this change: "`check` emits one row per item the block would
+/// actually show; `why` emits one row per item that applies at all, shown or
+/// withheld"), so the fix is not a new capability, only bringing `check` and
+/// `hook` up to the standard `why` already held itself to - by having every
+/// caller build rows from the same full list `why` always used, with `shown`
+/// now saying, per row, which half of `why`'s own distinction it falls on.
+fn check_rows(all: &[RankedItem], shown_ids: &std::collections::HashSet<&str>, command: &str, content: Option<&str>) -> Vec<CheckRow> {
+    let verdicts = absent_guard::classify_moment(all, command, content);
+    all.iter()
         .zip(verdicts)
         .map(|(r, (id, verdict))| {
-            debug_assert_eq!(r.id, id, "classify_moment must return one verdict per item, in ranked's own order");
+            debug_assert_eq!(r.id, id, "classify_moment must return one verdict per item, in all's own order");
             let (verdict, matched_literal) = match verdict {
                 absent_guard::Verdict::Prohibition { literal } => ("prohibition", Some(literal)),
                 absent_guard::Verdict::Advice => ("advice", None),
             };
-            CheckRow { id, kind: r.item.kind, severity: r.item.severity, verdict, matched_literal, text: r.item.text.clone() }
+            let shown = shown_ids.contains(id.as_str());
+            CheckRow { id, kind: r.item.kind, severity: r.item.severity, verdict, matched_literal, text: r.item.text.clone(), shown }
         })
         .collect()
 }
@@ -658,8 +692,12 @@ mod check_rows_json_tests {
     /// task's own instructions name - its shape has to be boring and stable.
     /// Proves the exact key SET the task documents, both ways: a prohibition
     /// row carries `matched_literal`, an advice row does not carry the key AT
-    /// ALL (not `null` - an absent key), and `severity` is always present,
-    /// `null` only when the item carries none.
+    /// ALL (not `null` - an absent key), `severity` is always present, `null`
+    /// only when the item carries none, and `shown` is always present - a
+    /// plain bool, `true` when the id is in `shown_ids`, `false` when it is
+    /// not, never skipped either way (unlike `matched_literal`, this key is
+    /// not optional: a reader must be able to tell "not shown" from "field
+    /// omitted").
     #[test]
     fn json_rows_carry_exactly_the_documented_keys() {
         let prohibited = ranked(
@@ -668,7 +706,8 @@ mod check_rows_json_tests {
             Some(Severity::Irreversible),
         );
         let advice = ranked("a1", None, None);
-        let rows = check_rows(&[prohibited, advice], "git push --force", None);
+        let shown_ids: std::collections::HashSet<&str> = ["p1"].into_iter().collect();
+        let rows = check_rows(&[prohibited, advice], &shown_ids, "git push --force", None);
         let json = serde_json::to_value(&rows).unwrap();
         let arr = json.as_array().expect("must be a JSON array");
         assert_eq!(arr.len(), 2);
@@ -676,31 +715,34 @@ mod check_rows_json_tests {
         let p = arr[0].as_object().expect("row must be a JSON object");
         let mut p_keys: Vec<&str> = p.keys().map(String::as_str).collect();
         p_keys.sort_unstable();
-        assert_eq!(p_keys, vec!["id", "kind", "matched_literal", "severity", "text", "verdict"]);
+        assert_eq!(p_keys, vec!["id", "kind", "matched_literal", "severity", "shown", "text", "verdict"]);
         assert_eq!(p["id"], "p1");
         assert_eq!(p["kind"], "rule");
         assert_eq!(p["severity"], "irreversible");
         assert_eq!(p["verdict"], "prohibition");
         assert_eq!(p["matched_literal"], "--force");
+        assert_eq!(p["shown"], true, "p1 is in shown_ids");
 
         let a = arr[1].as_object().expect("row must be a JSON object");
         let mut a_keys: Vec<&str> = a.keys().map(String::as_str).collect();
         a_keys.sort_unstable();
         assert_eq!(
             a_keys,
-            vec!["id", "kind", "severity", "text", "verdict"],
-            "matched_literal must be ABSENT for advice, not merely null"
+            vec!["id", "kind", "severity", "shown", "text", "verdict"],
+            "matched_literal must be ABSENT for advice, not merely null - shown stays present either way"
         );
         assert_eq!(a["severity"], serde_json::Value::Null, "a missing severity serialises as null, never omitted");
         assert_eq!(a["verdict"], "advice");
+        assert_eq!(a["shown"], false, "a1 is not in shown_ids");
     }
 
     /// `check --json` and `why --json` must build rows through the identical
     /// function - proven here by exercising `check_rows` directly against a
-    /// SET (`served.selection.shown` vs `served.all` in production), never
-    /// against a single hand-picked item, so an ordering bug in the
-    /// zip-based construction (`check_rows`'s own `.zip(verdicts)`) would
-    /// show up as a wrong id/verdict pairing rather than passing by luck.
+    /// SET (`served.all` in production, marked against `served.selection.
+    /// shown`), never against a single hand-picked item, so an ordering bug
+    /// in the zip-based construction (`check_rows`'s own `.zip(verdicts)`)
+    /// would show up as a wrong id/verdict pairing rather than passing by
+    /// luck.
     #[test]
     fn rows_stay_paired_with_the_right_item_across_several_at_once() {
         let items = vec![
@@ -708,15 +750,19 @@ mod check_rows_json_tests {
             ranked("i1", Some(Check::Forbidden { literals: vec!["bad".to_string()] }), None),
             ranked("i2", None, Some(Severity::HouseStyle)),
         ];
-        let rows = check_rows(&items, "this command is bad", None);
+        let shown_ids: std::collections::HashSet<&str> = ["i0", "i2"].into_iter().collect();
+        let rows = check_rows(&items, &shown_ids, "this command is bad", None);
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].id, "i0");
         assert_eq!(rows[0].verdict, "advice");
+        assert!(rows[0].shown, "i0 is in shown_ids");
         assert_eq!(rows[1].id, "i1");
         assert_eq!(rows[1].verdict, "prohibition");
         assert_eq!(rows[1].matched_literal.as_deref(), Some("bad"));
+        assert!(!rows[1].shown, "i1 is NOT in shown_ids - a prohibition can be unshown too");
         assert_eq!(rows[2].id, "i2");
         assert_eq!(rows[2].verdict, "advice");
+        assert!(rows[2].shown, "i2 is in shown_ids");
     }
 }
 
@@ -1184,13 +1230,14 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
         // resolved here because the shared `session_project` below is computed
         // after this early Stop branch returns. It routes the crowding nag to
         // the session whose project the fact belongs to (see crowding_debt).
-        let stop_project = payload
-            .get("cwd")
-            .and_then(|v| v.as_str())
-            .map(PathBuf::from)
-            .or_else(|| std::env::current_dir().ok())
-            .as_deref()
-            .and_then(project::resolve_project);
+        // The same cwd resolution, kept as an owned `PathBuf` rather than
+        // collapsed straight into a project key: `teeth_debt` below needs a
+        // real root to try an `Absent`/`AbsentAll` check's own anchor
+        // against, the same way `mcp::remember`'s own `self.root` does (see
+        // `serve::prove::teeth_box`'s own `root` parameter).
+        let stop_root: Option<PathBuf> =
+            payload.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from).or_else(|| std::env::current_dir().ok());
+        let stop_project = stop_root.as_deref().and_then(project::resolve_project);
         // GATED ON `is_subagent`: a fact landing on an already-full anchor is
         // still true of the STORE no matter who wrote it, but PAYING this
         // debt (fold or re-anchor with `revise`, retract, or the
@@ -1387,7 +1434,7 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
             if let Some(reason) = EventStore::open_existing(db_path)
                 .ok()
                 .filter(|_| teeth_not_yet_asked_this_session(db_path, &session_id))
-                .and_then(|s| teeth_debt(&s, stop_project.as_deref()))
+                .and_then(|s| teeth_debt(&s, stop_project.as_deref(), stop_root.as_deref()))
             {
                 record_teeth_asked(db_path, &session_id);
                 return Some(HookOutput::Decision(
@@ -1529,7 +1576,20 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
                 (Some(rules), Some(reminder)) => format!("{rules}\n\n{reminder}"),
                 (Some(rules), None) => rules,
                 (None, Some(reminder)) => reminder,
-                (None, None) => return None,
+                (None, None) => String::new(),
+            };
+            // Handed over (2026-09-25), capped: this project's own open
+            // points, so a fresh session is never held by the evaluation
+            // debt later and given no list at all - see `open_points_
+            // session_start_note`'s own doc comment. Combined with the
+            // block above AFTER it is built, never inside the match above,
+            // so a session with nothing else to show still gets this on its
+            // own rather than staying silent.
+            let block = match (block.is_empty(), open_points_session_start_note(&store, session_project.as_deref())) {
+                (true, None) => return None,
+                (true, Some(note)) => note,
+                (false, None) => block,
+                (false, Some(note)) => format!("{block}\n\n{note}"),
             };
 
             let ids: Vec<String> = items.iter().map(|r| r.id.clone()).collect();
@@ -1770,7 +1830,18 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
             // call carries one. See `check_rows`/`CheckRow` for the shape and
             // `Context`'s own doc comment for why this can never leak into
             // `block` itself.
-            let verdicts = check_rows(&served.selection.shown, input.command.as_deref().unwrap_or(""), absent_guard::proposed_content(tool_name, tool_input));
+            //
+            // Built from `served.all`, never `served.selection.shown` alone -
+            // see `check_rows`'s own doc comment for the defect that left a
+            // real prohibition, outranked at its own anchor by heavier items,
+            // invisible to any program reading this exact field. `shown_ids`
+            // is the same set `ids` above already
+            // names, read back out of `served.selection.shown` a second time
+            // rather than reused from `ids` directly, because `check_rows`
+            // wants `&str` borrows and `ids` is already-owned `String`s.
+            let shown_ids: std::collections::HashSet<&str> =
+                served.selection.shown.iter().map(|r| r.id.as_str()).collect();
+            let verdicts = check_rows(&served.all, &shown_ids, input.command.as_deref().unwrap_or(""), absent_guard::proposed_content(tool_name, tool_input));
             // The command as typed wins over the file, never the tool-name
             // fallback `input.add_command` used above when there was no real
             // command (`absent_guard::proposed_command` returns `None` for
@@ -2138,35 +2209,51 @@ const TEETH_DEBT_BATCH_MAX: usize = 5;
 /// nothing more this session, about any item, answered or not. Loosening it
 /// to per-item would let a fresh batch of newly-eligible ids reopen the
 /// block later the same session - reintroducing the exact "every single turn
-/// ends held, forever" wall its own 2026-08-14 fix closed. A verdict here is
-/// also already permanent, unlike a judgement-debt mark: adding a check, or
-/// `revise`-ing in the `no-literal` tag, drops the item out of `candidates`
-/// below for good, in every future session - which already subsumes
-/// anything a same-session floor would add.
-fn teeth_debt(store: &EventStore, current_project: Option<&str>) -> Option<String> {
-    let mut candidates: Vec<(String, String, String, bool)> = serve::live::live_items(store)
+/// ends held, forever" wall its own 2026-08-14 fix closed.
+///
+/// RE-DERIVED, NEVER SETTLED BY A WORD (2026-09-25, replacing the shape this
+/// function had before). It used to drop an item out of `candidates` for
+/// good the moment it carried ANY check at all - even one that could never
+/// refuse anything about the item's own subject - or a written `no-literal`/
+/// `no-catch-on-command` tag, and said so as a permanent exit in this very
+/// doc comment. That is exactly the loophole that let rules come to rest on
+/// a written reason with no teeth at all: a lazy answer and an
+/// honest one looked identical the moment either was written down. This asks
+/// the question the write path itself already answers for every new fact -
+/// `serve::prove::teeth_box`, the SAME function `mcp::remember`/`revise` run
+/// before a write is even stored (see `model::store::TEETH_TAG_PREFIX`'s own
+/// doc comment) - fresh, every time this runs, against the item as it
+/// stands RIGHT NOW. A rule is settled only once that box comes back
+/// `ProvenGuard`: both a synthesised forbidden payload was refused AND a
+/// clean, legitimate one was let through. `Informing`, `RefusesLegitimateUse`
+/// and `AnchorCollapsed` are NOT settled, whatever tag or check the item
+/// carries - a check that cannot refuse no longer settles anything, and
+/// neither does any tag, because neither one is IN this computation at all
+/// any more. The concrete correction named below is the box's own note, the
+/// identical text a fresh `remember`/`revise` would receive as its receipt -
+/// never re-derived a second way here. The only remaining exit is fixing the
+/// anchor until it proves out, or retracting the fact.
+fn teeth_debt(store: &EventStore, current_project: Option<&str>, root: Option<&Path>) -> Option<String> {
+    let mut candidates: Vec<(String, String)> = serve::live::live_items(store)
         .into_iter()
         .filter(|li| li.item.kind.can_fire())
         .filter(|li| project::applies_to(li.item.project.as_deref(), current_project))
-        .filter(|li| li.item.check.is_none())
-        .filter(|li| {
-            !li.item
-                .tags
-                .iter()
-                .any(|t| model::store::teeth_answer(t).is_some() || model::gate::command_teeth_answer(t).is_some())
-        })
-        .filter_map(|li| {
-            // Which answer this item needs, decided by the gate's own rule rather
-            // than guessed here: heavy plus a command anchor means the sharper tag.
-            let heavy = li
-                .item
-                .severity
-                .is_some_and(|s| matches!(s, model::item::Severity::Irreversible | model::item::Severity::Costly));
-            let on_command = li.item.bindings.iter().any(|b| {
-                matches!(b, model::item::Binding::Target { kind: model::item::TargetKind::Command, .. })
-            });
-            model::gate::candidate_literal(&li.item.text)
-                .map(|lit| (li.id.clone(), li.item.text.clone(), lit, heavy && on_command))
+        .filter_map(|li| match serve::prove::teeth_box(&li.id, &li.item, root) {
+            // Never owed a proof at all (light, no refusing-kind check), or
+            // already proven both ways: settled, not a candidate.
+            serve::prove::TeethBox::NotApplicable | serve::prove::TeethBox::ProvenGuard { .. } => None,
+            // Structurally can never reach anything - a shape a fresh write
+            // can no longer even create (`mcp`'s own `teeth_test` refuses
+            // it outright), but a live item written before that door closed
+            // can still carry it. Its own message already explains why;
+            // only the stray "REFUSED: " lead-in is trimmed, since nothing
+            // is being refused here, only named.
+            serve::prove::TeethBox::KeepRefusing(msg) => {
+                Some((li.id, msg.strip_prefix("REFUSED: ").unwrap_or(&msg).to_string()))
+            }
+            serve::prove::TeethBox::RefusesLegitimateUse { note, .. }
+            | serve::prove::TeethBox::AnchorCollapsed { note, .. }
+            | serve::prove::TeethBox::Informing { note, .. } => Some((li.id, note)),
         })
         .collect();
     // Lowest id first: a stable order, so the same fact is asked until it is
@@ -2178,14 +2265,8 @@ fn teeth_debt(store: &EventStore, current_project: Option<&str>) -> Option<Strin
     let batch_len = candidates.len().min(TEETH_DEBT_BATCH_MAX);
     let left = candidates.len() - batch_len;
     let mut items_block = String::new();
-    for (id, text, literal, needs_command_answer) in candidates.iter().take(TEETH_DEBT_BATCH_MAX) {
-        // A heavy item anchored to a COMMAND cannot be settled with the generic
-        // answer any more (ground 11 continued, 2026-09-20): the gate refuses it.
-        // Saying so per item is the difference between a nudge that can be obeyed
-        // and one that walks the reader into a refusal.
-        let which = if *needs_command_answer { " [needs the command answer]" } else { "" };
-        items_block.push_str(&format!("
-- '{id}' names \"{literal}\"{which}: {text}"));
+    for (id, correction) in candidates.iter().take(TEETH_DEBT_BATCH_MAX) {
+        items_block.push_str(&format!("\n- '{id}': {correction}"));
     }
     let left_note = if left > 0 {
         format!(" {left} more are waiting behind this batch.")
@@ -2193,11 +2274,14 @@ fn teeth_debt(store: &EventStore, current_project: Option<&str>) -> Option<Strin
         String::new()
     };
     Some(format!(
-        "[THOR] {batch_len} rule(s) have never been asked whether they can refuse anything, and each one's own text names something a guard could look for - listed below. Answer ALL {batch_len} before ending the turn.{left_note} \
-         Is there a text whose presence MEANS the mistake is happening? If YES, give that rule a check with that literal - forbidden for a command or for any file, absent for one named file - and re-anchor it if the check needs a command it does not have. If NO (an authorised action looks identical to an unauthorised one, or the rule is about something forgotten rather than something typed), add '{}<why not>' to its tags with revise - one plain phrase of 20 to 120 characters, no comma and no line break, because it travels as a tag. An item marked [needs the command answer] above is heavy AND anchored to a command, and for those the gate takes only '{}<why not>' in that same shape. The reason IS the answer, a bare tag is refused, and mark is a verdict on where an item fired and cannot tag anything - and it stays exactly as it is. \
-         Both answers settle a rule for good; only leaving one unanswered brings it back.{items_block}",
-        model::store::NO_LITERAL_REASON_PREFIX,
-        model::store::NO_CATCH_ON_COMMAND_REASON_PREFIX
+        "[THOR] {batch_len} heavy rule(s) or checks-that-should-refuse still do not come back a PROVEN guard when tried \
+         right now - listed below, each with the concrete correction its own machine-tested box already found. Fix ALL \
+         {batch_len} before ending the turn: revise the check or the anchor the correction names (even with no other field \
+         changed, so the write path tries the teeth again), then confirm the reply says 'teeth: proven guard'.{left_note} \
+         Carrying SOME check, or a written 'no-literal'/'no-catch-on-command' tag from an older answer, no longer settles \
+         this on its own - only a box that comes back proven guard does; if a rule truly can never be given real teeth \
+         (an authorised action looks identical to an unauthorised one), retract it instead of leaving it standing as if it \
+         could refuse something.{items_block}"
     ))
 }
 
@@ -2763,14 +2847,19 @@ fn evaluation_debt(
             risk_reasons.push("the context was summarized".to_string());
         }
         let risk_text = risk_reasons.join(" and ");
-        Some(format!(
+        let mut message = format!(
             "[THOR] This session has worked here for {hours:.1} hour(s) since the last evaluation report ('{report_id}'), \
              and {risk_text}. \
              A new evaluation is due, covering only what happened since then plus the state of the work; \
              {owed_in_project} item(s) currently owe a verdict here. \
              Run the THOR evaluation before you finish: {ask} \
              A turn cannot end until the evaluation report for this project is filed."
-        ))
+        );
+        if let Some(points) = open_points_full_block(store, current_project) {
+            message.push_str("\n\n");
+            message.push_str(&points);
+        }
+        Some(message)
     } else {
         // How many times this project has already been asked since its
         // last report, and since when - the count and clock this very ask
@@ -2784,15 +2873,69 @@ fn evaluation_debt(
         let first_asked = state.first_asked_since_report.unwrap_or(now);
         let asked_count = state.asked_count + 1;
         let covers_hours = usefulness::EVAL_REPORT_COVERS_HOURS;
-        Some(format!(
+        let mut message = format!(
             "[THOR] This project has had no evaluation in the last {covers_hours} hours. This session has worked here for {accrued_minutes} minute(s); \
              {owed_in_project} item(s) currently owe a verdict here. It has been asked {asked_count} time(s) - the first \
              {} day(s) ago - with no report filed yet. \
              Run the THOR evaluation before you finish: {ask} \
              A turn cannot end until the evaluation report for this project is filed. After that it is quiet for {covers_hours} hours.",
             usefulness::days_ago(now, first_asked)
-        ))
+        );
+        if let Some(points) = open_points_full_block(store, current_project) {
+            message.push_str("\n\n");
+            message.push_str(&points);
+        }
+        Some(message)
     }
+}
+
+/// How many open points `SessionStart`'s own note names in full before
+/// falling back to a bare count of the rest - the session-start block is
+/// already the largest thing this tool injects (`session_start::render`'s
+/// own doc comment), so this stays small on purpose, the same reasoning
+/// `TEETH_DEBT_BATCH_MAX` already gives the backlog burn's own batch.
+const OPEN_POINTS_SESSION_START_CAP: usize = 5;
+
+/// This project's own open points (`model::store::open_points`), formatted
+/// for the ONE message that HOLDS A TURN - `evaluation_debt`'s own two
+/// branches above - so it carries the full list, untruncated: a session
+/// about to be blocked on filing (or actually filing) an evaluation report
+/// needs everything it must act on, not a teaser. `None` when the project
+/// has none open right now.
+fn open_points_full_block(store: &EventStore, project: Option<&str>) -> Option<String> {
+    let points = model::store::open_points(store, project);
+    if points.is_empty() {
+        return None;
+    }
+    let mut lines = vec![format!("This project's own open point(s) from earlier evaluations ({}):", points.len())];
+    for p in &points {
+        let carried = if p.carried > 0 { format!(" [carried {}x]", p.carried) } else { String::new() };
+        lines.push(format!("- '{}'{carried}: {}", p.id, p.text));
+    }
+    Some(lines.join("\n"))
+}
+
+/// The same open points, formatted instead for `SessionStart` - capped at
+/// `OPEN_POINTS_SESSION_START_CAP`, id plus one short line each, a bare
+/// count for whatever does not fit. `None` when the project has none open.
+fn open_points_session_start_note(store: &EventStore, project: Option<&str>) -> Option<String> {
+    let points = model::store::open_points(store, project);
+    if points.is_empty() {
+        return None;
+    }
+    let mut lines = vec![format!("[THOR] {} open point(s) from earlier evaluations in this project:", points.len())];
+    for p in points.iter().take(OPEN_POINTS_SESSION_START_CAP) {
+        let short: String = p.text.chars().take(80).collect();
+        let ellipsis = if p.text.chars().count() > 80 { "..." } else { "" };
+        lines.push(format!("- '{}': {short}{ellipsis}", p.id));
+    }
+    if points.len() > OPEN_POINTS_SESSION_START_CAP {
+        lines.push(format!(
+            "...{} more (the evaluation report or `lookup` has the rest).",
+            points.len() - OPEN_POINTS_SESSION_START_CAP
+        ));
+    }
+    Some(lines.join("\n"))
 }
 
 /// Which capture-guard mode is live right now, for THIS store
@@ -4004,6 +4147,13 @@ mod judgement_debt_tests {
     fn legacy_unanswered(store: &mut EventStore, id: &str, text: &str) {
         let mut item = crowded_newcomer(id, "p");
         item.text = text.to_string();
+        // Heavy: since the 2026-09-25 rebuild, the backlog burn only ever
+        // owes a proof to the same population `serve::prove::teeth_box`
+        // does (heavy, or a refusing-kind check) - see `teeth_debt`'s own
+        // doc comment. `crowded_newcomer`'s own default (`severity: None`)
+        // would make every fixture below `NotApplicable` and silently stop
+        // testing anything.
+        item.severity = Some(model::item::Severity::Irreversible);
         let body = serde_json::to_string(&item).unwrap();
         store
             .append_event("legacy", id, "migration", thor_core::event_store::EventKind::FactCreated, id, None, &body)
@@ -4019,6 +4169,9 @@ mod judgement_debt_tests {
         let mut item = crowded_newcomer(id, "unused");
         item.project = project.map(str::to_string);
         item.text = text.to_string();
+        // See `legacy_unanswered`'s own comment just above: heavy, so Change
+        // 2's applicability gate actually reaches this fixture.
+        item.severity = Some(model::item::Severity::Irreversible);
         let body = serde_json::to_string(&item).unwrap();
         store
             .append_event("legacy", id, "migration", thor_core::event_store::EventKind::FactCreated, id, None, &body)
@@ -4041,15 +4194,15 @@ mod judgement_debt_tests {
             Some("acme"),
         );
         assert!(
-            teeth_debt(&store, Some("acme")).is_some(),
+            teeth_debt(&store, Some("acme"), None).is_some(),
             "fixture sanity: it applies inside its own checkout"
         );
         assert!(
-            teeth_debt(&store, Some("thor")).is_none(),
+            teeth_debt(&store, Some("thor"), None).is_none(),
             "a different checkout's project must never be asked about acme's own rule"
         );
         assert!(
-            teeth_debt(&store, None).is_none(),
+            teeth_debt(&store, None, None).is_none(),
             "a checkout that resolves to no project at all gets the global layer only"
         );
     }
@@ -4068,9 +4221,9 @@ mod judgement_debt_tests {
             "Draai npm audit fix --force nooit op deze repo",
             None,
         );
-        assert!(teeth_debt(&store, Some("acme")).is_some(), "a global rule reaches acme's checkout");
-        assert!(teeth_debt(&store, Some("thor")).is_some(), "and thor's checkout too");
-        assert!(teeth_debt(&store, None).is_some(), "and a checkout with no project at all");
+        assert!(teeth_debt(&store, Some("acme"), None).is_some(), "a global rule reaches acme's checkout");
+        assert!(teeth_debt(&store, Some("thor"), None).is_some(), "and thor's checkout too");
+        assert!(teeth_debt(&store, None, None).is_some(), "and a checkout with no project at all");
     }
 
     #[test]
@@ -4083,16 +4236,25 @@ mod judgement_debt_tests {
         assert!(teeth_not_yet_asked_this_session(&db, "s2"), "a different session gets its own turn");
     }
 
+    /// UPDATED FOR THE 2026-09-25 REBUILD: this used to prove `candidate_
+    /// literal`'s own text-mining heuristic surfaced the flag it spotted.
+    /// The rebuilt debt no longer mines the TEXT at all - it tries the
+    /// item's own teeth (`serve::prove::teeth_box`) and reports what THAT
+    /// found, which for a checkless heavy item is "nothing to try" rather
+    /// than a guess at what the check should look for. The point this test
+    /// still proves - a heavy rule with no check is found by the sweep
+    /// itself, with nobody pointing at it - still holds.
     #[test]
-    fn a_rule_naming_a_command_is_found_without_anybody_pointing_at_it() {
+    fn a_heavy_checkless_rule_is_found_without_anybody_pointing_at_it() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
         let mut store = EventStore::new(&db).unwrap();
         legacy_unanswered(&mut store, "names-a-flag", "Draai npm audit fix --force nooit op deze repo");
 
-        let asked = teeth_debt(&store, Some("p")).expect("a rule naming a flag must be found by the sweep itself");
+        let asked =
+            teeth_debt(&store, Some("p"), None).expect("a heavy checkless rule must be found by the sweep itself");
         assert!(asked.contains("names-a-flag"), "it must name which rule: {asked}");
-        assert!(asked.contains("--force"), "and quote what it spotted: {asked}");
+        assert!(asked.contains("nothing to try"), "and say what its own teeth box found: {asked}");
     }
 
     /// One rule per session is a burn that never finishes: 336 were waiting on
@@ -4108,7 +4270,7 @@ mod judgement_debt_tests {
             legacy_unanswered(&mut store, &format!("unarmed-{i}"), &format!("Draai npm audit fix --force-{i} nooit"));
         }
 
-        let asked = teeth_debt(&store, Some("p")).expect("several rules are unanswered");
+        let asked = teeth_debt(&store, Some("p"), None).expect("several rules are unanswered");
         for i in 0..TEETH_DEBT_BATCH_MAX {
             assert!(asked.contains(&format!("unarmed-{i}")), "the whole batch is named: {asked}");
         }
@@ -4119,33 +4281,74 @@ mod judgement_debt_tests {
         assert!(asked.contains("2 more are waiting"), "silence about the rest would read as done: {asked}");
     }
 
+    /// REPLACES `either_answer_settles_it_and_only_silence_brings_it_back`
+    /// (2026-09-25): that test proved the exact defect this rebuild closes -
+    /// a written `no-literal` reason used to drop an item out of
+    /// `candidates` FOR GOOD, in every future session, which is how rules
+    /// came to rest on a written reason with no teeth at all (see
+    /// `teeth_debt`'s own doc comment). This proves the replacement: a
+    /// written reason no longer settles anything by itself - the item keeps
+    /// being named, with its own box's concrete correction, until its box
+    /// actually comes back a proven guard.
     #[test]
-    fn either_answer_settles_it_and_only_silence_brings_it_back() {
+    fn a_written_reason_no_longer_settles_it_only_a_proven_guard_does() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
         let mut store = EventStore::new(&db).unwrap();
         legacy_unanswered(&mut store, "answer-me", "Draai npm audit fix --force nooit op deze repo");
-        assert!(teeth_debt(&store, Some("p")).is_some(), "fixture sanity");
+        assert!(teeth_debt(&store, Some("p"), None).is_some(), "fixture sanity");
 
         let item = model::store::show(&store, "answer-me").unwrap();
         let mut answered_no = item.clone();
-        answered_no.tags.push(format!("{}a test fixture with nothing literal to catch", model::store::NO_LITERAL_REASON_PREFIX));
+        answered_no
+            .tags
+            .push(format!("{}a test fixture with nothing literal to catch", model::store::NO_LITERAL_REASON_PREFIX));
         model::store::revise(&mut store, "s", "l", "a", &item, &answered_no).unwrap();
-        assert!(teeth_debt(&store, Some("p")).is_none(), "answering 'nothing to catch' must settle it for good");
+        let still_asked = teeth_debt(&store, Some("p"), None);
+        assert!(
+            still_asked.is_some(),
+            "a written reason must NOT settle it any more - only a proven-guard box does"
+        );
+        assert!(
+            still_asked.unwrap().contains("answer-me"),
+            "the same rule keeps being named, not silently dropped"
+        );
+
+        // Now genuinely arm it - a Command-bound Forbidden check that
+        // actually proves out both ways - and confirm THAT is what finally
+        // settles it. Re-read the live item first, the way a real caller
+        // (`mcp::revise`) always does, rather than reusing a stale snapshot.
+        let current = model::store::show(&store, "answer-me").unwrap();
+        let mut armed = current.clone();
+        armed.bindings = vec![model::item::Binding::Target {
+            kind: model::item::TargetKind::Command,
+            value: "npm audit fix".to_string(),
+        }];
+        armed.check = Some(model::item::Check::Forbidden { literals: vec!["--force".to_string()] });
+        model::store::revise(&mut store, "s", "l", "a", &current, &armed).unwrap();
+        assert!(
+            teeth_debt(&store, Some("p"), None).is_none(),
+            "a check that actually proves out as a guard must settle it"
+        );
     }
 
-    /// The ground must not become noise. A rule that names nothing concrete
-    /// has no question to answer, and asking anyway would teach the reader to
-    /// dismiss this debt on sight.
+    /// UPDATED FOR THE 2026-09-25 REBUILD: this used to prove `candidate_
+    /// literal`'s own text heuristic found nothing worth asking about in
+    /// prose text. The rebuilt debt never reads the text at all any more -
+    /// this fixture's own `severity` (`crowded_newcomer`'s default, `None`)
+    /// is what now keeps it out: `serve::prove::teeth_box`'s own
+    /// applicability rule is heavy-or-a-refusing-check, and this fixture is
+    /// neither, so Change 2 simply does not apply to it - `TeethBox::
+    /// NotApplicable`, never asked.
     #[test]
-    fn a_rule_that_names_nothing_concrete_is_never_asked() {
+    fn a_light_item_with_no_check_is_never_asked() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
         let mut store = EventStore::new(&db).unwrap();
         let mut item = crowded_newcomer("pure-judgement", "p");
         item.text = "Vraag eerst toestemming voor je iets onomkeerbaars doet".to_string();
         model::store::declare(&mut store, "s", "l", "a", &item).unwrap();
-        assert!(teeth_debt(&store, Some("p")).is_none(), "there is nothing here a guard could look for");
+        assert!(teeth_debt(&store, Some("p"), None).is_none(), "a light item with no check owes no proof at all");
     }
 
     #[test]
@@ -4158,18 +4361,31 @@ mod judgement_debt_tests {
         );
     }
 
-    /// A rule that already carries a check has been armed; asking again would
-    /// be asking a settled question.
+    /// REPLACES `a_rule_that_already_has_teeth_is_left_alone` (2026-09-25):
+    /// that test's own fixture LOOKED armed (a `Forbidden` check) but its
+    /// binding is `crowded_newcomer`'s own `Moment(Deploy)` - never a
+    /// `Command` or `Always`, the only two shapes a `Forbidden` check can
+    /// ever reach (`serve::prove::forbidden_reach`). A check that cannot be
+    /// tried without a real checkout is asked again forever until anchored;
+    /// this one can never be tried AT ALL, so leaving it alone was exactly
+    /// the defect this rebuild closes - proven here by inverting the
+    /// original assertion. `model::store::declare` still accepts this
+    /// shape (the unreachable-check refusal lives at the MCP/`serve::prove`
+    /// layer - see `mcp::teeth_test` - never inside the pure write gate),
+    /// which is exactly how a rule like this can exist live in the store at
+    /// all.
     #[test]
-    fn a_rule_that_already_has_teeth_is_left_alone() {
+    fn a_check_that_cannot_reach_anything_is_named_again_not_left_alone() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
         let mut store = EventStore::new(&db).unwrap();
-        let mut item = crowded_newcomer("already-armed", "p");
+        let mut item = crowded_newcomer("looks-armed-fires-nothing", "p");
         item.text = "Draai npm audit fix --force nooit op deze repo".to_string();
         item.check = Some(model::item::Check::Forbidden { literals: vec!["--force".to_string()] });
         model::store::declare(&mut store, "s", "l", "a", &item).unwrap();
-        assert!(teeth_debt(&store, Some("p")).is_none());
+        let asked = teeth_debt(&store, Some("p"), None);
+        assert!(asked.is_some(), "a check that can never reach anything must still be named");
+        assert!(asked.unwrap().contains("looks-armed-fires-nothing"));
     }
 
     /// The THIRD way out, and until 2026-08-09 the only one the message
@@ -5563,6 +5779,7 @@ mod hook_verdicts_tests {
             verdict: "prohibition",
             matched_literal: Some("\u{2014}".to_string()),
             text: "never write an em dash".to_string(),
+            shown: true,
         }];
         let output = HookOutput::Context { event_name: "PreToolUse".to_string(), block: block.clone(), verdicts };
 
@@ -5592,6 +5809,7 @@ mod hook_verdicts_tests {
                 verdict: "prohibition",
                 matched_literal: Some("bad".to_string()),
                 text: "x".to_string(),
+                shown: true,
             }],
         };
         let json = hook_output_json(output);
@@ -5762,8 +5980,17 @@ fn open_store_or_die(db_path: &Path) -> EventStore {
 /// calls a prohibition. `check` and `hook` therefore agree on which items
 /// are prohibitions only because both ultimately call the SAME classifier;
 /// only `check`'s own prose is ever marked with it.
-fn mark_prohibitions(block: &str, shown: &[RankedItem], command: &str, content: Option<&str>) -> String {
-    let verdicts = absent_guard::classify_moment(shown, command, content);
+///
+/// THEN, UNDERNEATH THE EXISTING BLOCK, UNCHANGED: one more line per
+/// prohibition among `all` that is NOT in `shown` - the gap where a rule,
+/// outranked at its own anchor by heavier items, never appeared in the
+/// block, so anything reading only the block concluded nothing was wrong.
+/// The block itself - every line the loop above
+/// produces - is never touched by this second pass; it only ever appends
+/// after it, one line per outranked prohibition, naming the rule, the
+/// matched literal, and why it is missing from the block above.
+fn mark_prohibitions(block: &str, all: &[RankedItem], shown: &[RankedItem], command: &str, content: Option<&str>) -> String {
+    let verdicts = absent_guard::classify_moment(all, command, content);
     let mut lines: Vec<String> = Vec::new();
     for line in block.lines() {
         // `render_text`'s own bullet shape is `"- [{id}] {text}"` - the id
@@ -5776,6 +6003,18 @@ fn mark_prohibitions(block: &str, shown: &[RankedItem], command: &str, content: 
         if let Some(absent_guard::Verdict::Prohibition { literal }) = verdict {
             lines.push(format!("  [PROHIBITS] matched \"{literal}\""));
         }
+    }
+    let shown_ids: std::collections::HashSet<&str> = shown.iter().map(|r| r.id.as_str()).collect();
+    for (id, verdict) in &verdicts {
+        if shown_ids.contains(id.as_str()) {
+            continue; // already marked above, inside the block itself
+        }
+        let absent_guard::Verdict::Prohibition { literal } = verdict else { continue };
+        let text = all.iter().find(|r| &r.id == id).map(|r| r.item.text.as_str()).unwrap_or("");
+        lines.push(format!(
+            "[NOT SHOWN] rule {id} (\"{text}\") also forbids this - matched \"{literal}\" - but is not \
+             shown above because heavier items hold the block"
+        ));
     }
     lines.join("\n")
 }
@@ -5793,7 +6032,9 @@ fn cmd_check(db_path: &Path, input: &ServeInput, json: bool) {
     let served = serve::serve(&store, input);
     let command = input.command.as_deref().unwrap_or("");
     if json {
-        print_json_rows(&check_rows(&served.selection.shown, command, None));
+        let shown_ids: std::collections::HashSet<&str> =
+            served.selection.shown.iter().map(|r| r.id.as_str()).collect();
+        print_json_rows(&check_rows(&served.all, &shown_ids, command, None));
         return;
     }
     if input.moments.is_empty() {
@@ -5802,7 +6043,7 @@ fn cmd_check(db_path: &Path, input: &ServeInput, json: bool) {
         println!("detected: {}", input.moments.iter().map(Action::as_str).collect::<Vec<_>>().join(", "));
     }
     match render::render_text(&served.selection, input, db_path) {
-        Some(block) => println!("\n{}", mark_prohibitions(&block, &served.selection.shown, command, None)),
+        Some(block) => println!("\n{}", mark_prohibitions(&block, &served.all, &served.selection.shown, command, None)),
         None => println!("\n(no item governs this)"),
     }
 }
@@ -5833,12 +6074,12 @@ fn cmd_why(db_path: &Path, input: &ServeInput, json: bool) {
     let store = open_store_or_die(db_path);
     let served = serve::serve(&store, input);
     let command = input.command.as_deref().unwrap_or("");
-    if json {
-        print_json_rows(&check_rows(&served.all, command, None));
-        return;
-    }
     let shown_ids: std::collections::HashSet<&str> =
         served.selection.shown.iter().map(|r| r.id.as_str()).collect();
+    if json {
+        print_json_rows(&check_rows(&served.all, &shown_ids, command, None));
+        return;
+    }
     println!("{} item(s) apply; the block would show {}.\n", served.all.len(), served.selection.shown.len());
     for line in why_lines(&served.all, &shown_ids, command) {
         println!("{line}");
@@ -5889,7 +6130,7 @@ mod prose_marking_tests {
         let before = render::render_text(&selection, &input, Path::new("does-not-need-to-exist.db"))
             .expect("fixture must render a block");
 
-        let after = mark_prohibitions(&before, &shown, "git push --force origin main", None);
+        let after = mark_prohibitions(&before, &shown, &shown, "git push --force origin main", None);
 
         for line in before.lines() {
             assert!(after.contains(line), "an original line went missing: {line:?}\nafter:\n{after}");
@@ -5912,8 +6153,54 @@ mod prose_marking_tests {
         let input = ServeInput { command: Some("git status".to_string()), ..Default::default() };
         let before = render::render_text(&selection, &input, Path::new("does-not-need-to-exist.db")).unwrap();
 
-        let after = mark_prohibitions(&before, &shown, "git status", None);
+        let after = mark_prohibitions(&before, &shown, &shown, "git status", None);
         assert_eq!(before, after, "nothing to mark means nothing added");
+    }
+
+    /// THE EXACT DEFECT THIS CLOSES: a rule that really would refuse the
+    /// command being asked about, but lost its place in the shown block to
+    /// heavier items, used to be invisible to `check`'s own prose - a
+    /// reader of that prose was told nothing was wrong. Four
+    /// heavier, unrelated items fill `MAX_ITEMS`; a fifth, lighter one
+    /// carries a real `Forbidden` check matching the command but never makes
+    /// the block. The existing block (the four heavier items' own bullets)
+    /// must stay byte-for-byte what it always was; the fifth is named
+    /// UNDERNEATH it, never inside it.
+    #[test]
+    fn a_prohibition_outranked_at_its_own_anchor_is_named_underneath_the_block_instead_of_staying_invisible() {
+        let heavier: Vec<RankedItem> = (0..model::item::MAX_ITEMS)
+            .map(|i| ranked_command_item(&format!("heavy{i}"), None))
+            .collect();
+        let outranked = ranked_command_item(
+            "skip-hooks-rule",
+            Some(Check::Forbidden { literals: vec!["--no-verify".to_string()] }),
+        );
+        let mut all = heavier.clone();
+        all.push(outranked.clone());
+        let selection = render::Selection { shown: heavier.clone(), withheld: 1 };
+        let command = "git commit -m \"fix: thing\" --no-verify";
+        let input = ServeInput { command: Some(command.to_string()), ..Default::default() };
+        let before = render::render_text(&selection, &input, Path::new("does-not-need-to-exist.db"))
+            .expect("fixture must render a block");
+        assert!(
+            !before.contains("skip-hooks-rule"),
+            "sanity: the outranked rule must not already be in the shown block: {before}"
+        );
+
+        let after = mark_prohibitions(&before, &all, &heavier, command, None);
+
+        for line in before.lines() {
+            assert!(after.contains(line), "an original line went missing: {line:?}\nafter:\n{after}");
+        }
+        assert!(
+            after.contains("NOT SHOWN") && after.contains("skip-hooks-rule"),
+            "the outranked prohibition must be named, marked as not shown: {after}"
+        );
+        assert!(after.contains("--no-verify"), "the marker must name the matched literal: {after}");
+        assert!(
+            after.contains("heavier items hold the block"),
+            "the marker must say WHY it is missing from the block above: {after}"
+        );
     }
 
     // --------------------------------------------------- why's own marking

@@ -8,7 +8,7 @@
 //! the caller, never swallowed.
 
 use crate::gate::{self, Refusal};
-use crate::item::{Binding, Check, Item, Kind};
+use crate::item::{Binding, Check, Item, Kind, Severity};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use thor_core::cas::compute_head_sets;
@@ -587,6 +587,12 @@ pub fn declare(
     {
         return Err(WriteError::Refused(refusal));
     }
+    // THE EVALUATION-FILING GATE (2026-09-25) - see this file's own
+    // "evaluation obligation" section, right above `OWNER_SETUP_ANSWERS_ID`.
+    // A no-op for every write that is not itself an evaluation report.
+    if let Some(refusal) = check_evaluation_report_filing(store, &item) {
+        return Err(WriteError::Refused(refusal));
+    }
     let body = canonical_body(&item).map_err(WriteError::Serialize)?;
     store
         .append_event(session_id, lineage_id, actor, EventKind::FactCreated, &item.id, None, &body)
@@ -621,6 +627,23 @@ pub fn revise(
         capacity(store, &updated).map_err(WriteError::Store)?
     {
         return Err(WriteError::Refused(refusal));
+    }
+    // THE SAME EVALUATION-FILING GATE `declare` RUNS - see this file's own
+    // "evaluation obligation" section - for the one OTHER way a write could
+    // file a report: revising an EXISTING item onto the `EVALUATION_REPORT_
+    // TAG` it did not carry before. Gated on the tag being NEWLY added
+    // (`existing` lacked it, `updated` carries it) so an already-filed
+    // report stays freely correctable afterwards (a typo fix must never be
+    // held hostage to conditions that were only ever about the FILING
+    // moment) - exactly the same "moment, not the item's whole life"
+    // distinction `declare` itself draws.
+    if !existing.tags.iter().any(|t| t == EVALUATION_REPORT_TAG)
+        && updated.kind == Kind::Report
+        && updated.tags.iter().any(|t| t == EVALUATION_REPORT_TAG)
+    {
+        if let Some(refusal) = check_evaluation_report_filing(store, &updated) {
+            return Err(WriteError::Refused(refusal));
+        }
     }
     let body = canonical_body(&updated).map_err(WriteError::Serialize)?;
     store
@@ -1306,6 +1329,84 @@ pub const CROWDED_ON_PURPOSE_TAG: &str = "crowded-on-purpose";
 /// gate being right about the question and wrong about the vocabulary.
 pub const ANSWER_GUARD_TAG_PREFIX: &str = "answer-guard:";
 
+/// THE BOX A FACT FALLS INTO, ONCE THE TOOL HAS ACTUALLY TRIED ITS TEETH -
+/// never a question a writer answers, unlike every tag above this one.
+///
+/// `ANSWER_GUARD_TAG_PREFIX`/`NO_LITERAL_TAG`/`NO_CATCH_ON_COMMAND_TAG` all
+/// exist because the write gate could only ask whether a writer had been
+/// ASKED the teeth question - it could never verify the answer, so a lazy
+/// "nothing to catch here" and an honest one look identical on the page.
+/// This prefix is the different, compulsory half: whenever a fact is heavy
+/// (irreversible/costly) or carries a check of a refusing kind (Forbidden,
+/// Absent, AbsentAll, Requires), the tool itself synthesises payloads from
+/// the fact's OWN binding and literals and runs them through the SAME guard
+/// functions the real door runs (see `serve::prove`) - never something the
+/// writer supplies. The outcome, never the writer's wording, decides which
+/// of the four values below gets appended, and a write is never refused for
+/// which one it gets: the knowledge always gets in, only the label is
+/// compulsory.
+///
+/// TWO SIDES, NOT ONE (2026-09-24, continued): a claim now has to survive
+/// BOTH a FORBIDDEN payload (the anchor carrying one of its own literals,
+/// which the guard must refuse) AND a CLEAN one (the identical anchor with
+/// none of them, which the guard must let through) - see `serve::prove`'s
+/// own top-of-file doc comment for why one side alone could never tell a
+/// working guard apart from a rule that refuses everything. `TEETH_PROVEN_
+/// TAG` is the only one of the four below that means both sides held;
+/// `TEETH_REFUSES_LEGITIMATE_TAG` and `TEETH_ANCHOR_COLLAPSED_TAG` are the
+/// two ways a check that DOES reach can still fail to earn it.
+///
+/// RESERVED FROM A WRITER: `mcp::remember`/`mcp::revise` refuse outright a
+/// tag starting with this prefix among the tags a CALLER supplies, before
+/// either tool ever constructs the `Item` it hands to the write gate - the
+/// gate itself never re-decides this, because by the time an item reaches
+/// `gate::declare`/`gate::revise` it may already carry the tool's OWN
+/// legitimate tag, appended after testing, and a second check there could
+/// not tell that apart from a forged one. This is why the label cannot be
+/// set, cleared or faked by wording: the one door that ever writes it is not
+/// the one a writer's arguments pass through.
+pub const TEETH_TAG_PREFIX: &str = "teeth:";
+
+/// The guard was tried and it refused the synthesised, FORBIDDEN payload -
+/// AND it let the synthesised, CLEAN payload (the identical anchor, none of
+/// the check's own literals) straight through: this fact is a proven guard,
+/// not merely a claimed one, on both sides of the question.
+pub const TEETH_PROVEN_TAG: &str = "teeth:proven-guard";
+
+/// THE THIRD OUTCOME (2026-09-24): the guard refused BOTH the forbidden
+/// payload AND the clean, legitimate one - it cannot tell this fact's own
+/// genuine violation apart from ordinary, authorised use of the very same
+/// anchor. Never filed under `TEETH_PROVEN_TAG` (it is not one) and never
+/// filed quietly under `TEETH_INFORMING_TAG` either: a rule that refuses
+/// legitimate work is the most expensive failure this system has - see
+/// `serve::prove`'s own top-of-file doc comment - and it earns its own
+/// plain label so the daily health review can never mistake it for either
+/// of the other two. The write still goes through; only the label says what
+/// was found, exactly like every other value here.
+pub const TEETH_REFUSES_LEGITIMATE_TAG: &str = "teeth:refuses-legitimate-use";
+
+/// THE COLLAPSED CASE (2026-09-24): the fact's own anchor already contains
+/// one of the check's own literals (an anchor "git push --force" whose
+/// own literal is "--force", for example, or an anchor that simply IS
+/// the literal) - there is no
+/// literal-free form of the anchor left to build a clean payload from at
+/// all, so the two-sided test never even ran. Structurally as
+/// indistinguishable from an over-blocking rule as `TEETH_REFUSES_
+/// LEGITIMATE_TAG` is, it just gets there without running anything - never
+/// dressed up as `TEETH_PROVEN_TAG`.
+pub const TEETH_ANCHOR_COLLAPSED_TAG: &str = "teeth:anchor-collapsed";
+
+/// Any of: the guard was tried and let the synthesised forbidden payload
+/// straight through (a check that looks like a lock and is not one, never
+/// even reaching the clean side - see `serve::prove::teeth_box`'s own doc
+/// comment on why the clean side is only tried once the forbidden one
+/// fires), or there was nothing to try at all (a heavy fact with no
+/// refusing check, or one whose check can only be proven against a real
+/// working copy). All land here, in the one box the daily health review has
+/// to meet again - the receipt at write time is where they are told apart,
+/// in prose, with the concrete correction a reader needs.
+pub const TEETH_INFORMING_TAG: &str = "teeth:informing";
+
 /// The id of the first-session note `ops::install::working_contract` seeds
 /// (`walk-through-the-answer-guard-once`), and the id an agent files the
 /// owner's own setup answers under once he has actually been asked - see
@@ -1329,6 +1430,345 @@ pub const SETUP_NOTE_ID: &str = "walk-through-the-answer-guard-once";
 /// id is first written to, has declared no project yet and so holds no
 /// scope this could possibly be filed under.
 pub const OWNER_SETUP_ANSWERS_ID: &str = "owner-setup-answers";
+
+// ------------------------------------------------------- evaluation obligation
+//
+// WHAT THIS SECTION CLOSES (2026-09-25). Filing an evaluation report used to
+// discharge the Stop hook's evaluation debt (`serve::usefulness::
+// eval_debt_owed`/`newest_evaluation_report`) by merely EXISTING: a live
+// `Report` scoped to the project and carrying `EVALUATION_REPORT_TAG`.
+// Nobody read it, and nothing checked the log for the work the evaluation
+// routine actually demands, so a session could discharge the
+// whole obligation with prose. `check_evaluation_report_filing` below is the
+// machine-checked replacement, called from `declare` - every condition is
+// computed from the EVENT LOG, never from what the report's own text claims,
+// and the report's prose stays completely unchecked; it no longer discharges
+// anything by existing.
+//
+// Three conditions, all of them per-project: the project's judgement debt is
+// zero, every heavy (irreversible/costly) Rule or Orientation that fired in
+// this project since the PREVIOUS report carries one of the four reserved
+// `TEETH_*_TAG`s (Change 2's own box - proven, informing, refuses-legitimate,
+// anchor-collapsed all count; only a missing box blocks), and every open
+// point (see below) older than the previous report is either closed
+// (retracted) or has been carried forward exactly once.
+
+/// The tag `EVALUATION_REPORT_TAG`-carrying `Report`s already used
+/// (`serve::usefulness::evaluation_report_ids` matches the identical string
+/// literal) - given a name here too so this file's own gate check and that
+/// one can never drift apart in spelling. Not re-exported from there: `model`
+/// cannot depend on `serve` (the dependency runs the other way), so this is
+/// the same "reimplemented, not imported" concession `live_items_from_
+/// projection`'s own doc comment already makes.
+pub const EVALUATION_REPORT_TAG: &str = "evaluation-report";
+
+/// How many times a live item must have fired since its own last verdict
+/// before it counts as judgement debt - mirrors `serve::usefulness::
+/// JUDGEMENT_DEBT_AFTER` exactly (kept equal by hand: `model` cannot import
+/// it, for the same reason every other constant in this section is
+/// reimplemented rather than shared).
+pub const JUDGEMENT_DEBT_AFTER: usize = 40;
+
+/// The actor a real delivery is stamped with - mirrors `serve::usefulness::
+/// ASSISTANT_DELIVERY_ACTOR` exactly, same reason.
+pub const ASSISTANT_DELIVERY_ACTOR: &str = "hook";
+
+/// An open point: a small, project-scoped `Report` tagged with this, holding
+/// one sentence naming something an evaluation could not finish - see this
+/// section's own doc comment. Never served at a gate (it is a `Report`,
+/// archive-kind, exactly like an evaluation report itself), found by
+/// `lookup` and handed to a session directly by `serve::bin::serve`'s own
+/// SessionStart and evaluation-debt messages instead - see that file's
+/// `open_points_line`/`open_points_block`.
+pub const OPEN_POINT_TAG: &str = "open-point";
+
+/// Prefix for the tag naming the evaluation report an open point was raised
+/// in, e.g. `from-report:eval-acme-2026-01-01`. Informational only - nothing
+/// in this file matches on it - but it is what lets a reader trace an open
+/// point back to the evaluation that found it.
+pub const OPEN_POINT_SOURCE_PREFIX: &str = "from-report:";
+
+/// Prefix for the tag recording how many times an open point has been
+/// carried forward, e.g. `carried:1`. `open_point_carried_count` below reads
+/// it; `gate::revise`'s own GROUND 30 refuses ever writing a count above 1 -
+/// see that ground's doc comment for why a second carry needs the owner
+/// rather than another automated pass.
+pub const OPEN_POINT_CARRIED_PREFIX: &str = "carried:";
+
+/// The carried-forward count a set of tags records, `0` when none of them
+/// match `OPEN_POINT_CARRIED_PREFIX` at all (never carried) or the tag's own
+/// number does not parse (never written by this system, so never trusted as
+/// a count either).
+pub fn open_point_carried_count(tags: &[String]) -> u32 {
+    tags.iter()
+        .find_map(|t| t.strip_prefix(OPEN_POINT_CARRIED_PREFIX))
+        .and_then(|n| n.parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+/// Every live item, current single head, not a retraction tombstone, body
+/// parses as a valid `Item` - as `(id, item)` pairs, in NO particular order
+/// (unlike `live_items_from_projection`/`live_items_from_fold`'s own id-
+/// sorted contract: nothing below needs that order, and sorting here would
+/// only be paid for and thrown away).
+///
+/// FAILS OPEN: an unreadable log reads back as "no live items" rather than
+/// an error. Deliberately, and differently from `declare`'s other store-
+/// level checks (`find_near_duplicate`/`find_opposing_check`/`capacity`,
+/// all of which propagate a read failure as `WriteError::Store` and refuse
+/// the write): every condition built on this helper exists to stop a report
+/// from being filed while real work sits undone, and a store this cannot
+/// even read is not evidence that the work is undone - refusing on that
+/// account would trade a maintenance question for a permanently wedged
+/// project no evaluation could ever again be filed for. See this section's
+/// own top-of-file doc comment.
+fn all_live_items(store: &EventStore) -> Vec<(String, Item)> {
+    let read = if store.heads_projection_current() {
+        live_items_from_projection(store)
+    } else {
+        live_items_from_fold(store)
+    };
+    read.unwrap_or_default()
+}
+
+/// Mirrors `serve::project::applies_to` exactly (an item with no project of
+/// its own is global and applies everywhere; one that names a project
+/// applies only inside it) - reimplemented rather than imported for the
+/// identical reason every other function in this section is.
+fn project_applies_to(item_project: Option<&str>, checkout_project: Option<&str>) -> bool {
+    item_project.is_none() || item_project == checkout_project
+}
+
+/// Mirrors `serve::usefulness::served_since_last_verdict` exactly: how many
+/// times each item has fired (`ItemServed`, stamped by `ASSISTANT_DELIVERY_
+/// ACTOR`) since its own last verdict (`ItemMarkedUseful`/`ItemMarkedNoise`
+/// reset the count to zero, from any actor - a verdict is about the item,
+/// not the audience). Fails open to an empty map, the same stance
+/// `all_live_items` takes and for the same reason.
+fn served_since_last_verdict_local(store: &EventStore) -> HashMap<String, usize> {
+    let Ok(events) = store.event_kinds_with_actor() else { return HashMap::new() };
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for (kind, id, actor) in events {
+        match kind {
+            EventKind::ItemServed if actor == ASSISTANT_DELIVERY_ACTOR => {
+                *counts.entry(id).or_default() += 1;
+            }
+            EventKind::ItemMarkedUseful | EventKind::ItemMarkedNoise => {
+                counts.insert(id, 0);
+            }
+            _ => {}
+        }
+    }
+    counts
+}
+
+/// How many live, non-pinned items THIS project owes a verdict on right now
+/// - mirrors `serve::usefulness::judgement_debt_counts`'s own `in_project`
+/// half exactly (threshold, pinned exclusion, project scoping all
+/// identical), reimplemented for the identical reason every other function
+/// in this section is.
+fn judgement_debt_in_project(store: &EventStore, project: Option<&str>) -> usize {
+    let served = served_since_last_verdict_local(store);
+    let live = all_live_items(store);
+    let live_by_id: HashMap<&str, &Item> = live.iter().map(|(id, it)| (id.as_str(), it)).collect();
+    served
+        .into_iter()
+        .filter(|(_, count)| *count >= JUDGEMENT_DEBT_AFTER)
+        .filter_map(|(id, _)| live_by_id.get(id.as_str()).map(|it| (id, *it)))
+        .filter(|(_, it)| !it.bindings.iter().any(|b| matches!(b, Binding::Always)))
+        .filter(|(_, it)| project_applies_to(it.project.as_deref(), project))
+        .count()
+}
+
+/// The highest creation seq among this project's own live evaluation
+/// reports - `0` when it has none yet, so "since the previous report" reads
+/// as "since the beginning of the log" for a project's first-ever
+/// evaluation. Mirrors `serve::usefulness::newest_evaluation_report`'s own
+/// EXACT-project match (never `project_applies_to`'s "or global" rule: a
+/// report filed for one project must never silence another's debt),
+/// reimplemented for the identical reason every other function in this
+/// section is.
+fn newest_evaluation_report_seq(store: &EventStore, project: Option<&str>) -> i64 {
+    all_live_items(store)
+        .into_iter()
+        .filter(|(_, item)| item.kind == Kind::Report)
+        .filter(|(_, item)| item.project.as_deref() == project)
+        .filter(|(_, item)| item.tags.iter().any(|t| t == EVALUATION_REPORT_TAG))
+        .filter_map(|(id, _)| store.get_events_by_entity(&id).ok()?.first().map(|e| e.seq))
+        .max()
+        .unwrap_or(0)
+}
+
+/// Every live, heavy (irreversible/costly) Rule or Orientation that applies
+/// to `project` and has fired (any `ItemServed` event, whatever the actor -
+/// a firing to a local model is still a firing its own teeth mattered for)
+/// with a seq strictly greater than `cutoff_seq`, and that still carries
+/// none of the four reserved `TEETH_*_TAG`s - sorted by id for a
+/// deterministic refusal message.
+///
+/// NEVER RE-COMPUTES THE BOX ITSELF. `serve::prove::teeth_box` needs
+/// `serve::absent_guard`/`serve::rank`, both unreachable from here - see
+/// this section's own top-of-file doc comment. This asks only whether the
+/// write path (`mcp::remember`/`revise`'s own `apply_teeth_test`) or the
+/// maintenance backfill has EVER recorded an answer, which is exactly what
+/// "must carry a machine-assigned teeth box" means: any of the four tags,
+/// not specifically the proven one.
+fn heavy_rules_fired_since_without_teeth_box(store: &EventStore, project: Option<&str>, cutoff_seq: i64) -> Vec<String> {
+    let Ok(events) = store.get_all_events() else { return Vec::new() };
+    let mut fired_after: HashSet<String> = HashSet::new();
+    for e in &events {
+        if e.kind == EventKind::ItemServed && e.seq > cutoff_seq {
+            fired_after.insert(e.entity_id.clone());
+        }
+    }
+    let mut out: Vec<String> = all_live_items(store)
+        .into_iter()
+        .filter(|(_, item)| item.kind.can_fire())
+        .filter(|(_, item)| project_applies_to(item.project.as_deref(), project))
+        .filter(|(_, item)| matches!(item.severity, Some(Severity::Irreversible) | Some(Severity::Costly)))
+        .filter(|(id, _)| fired_after.contains(id))
+        .filter(|(_, item)| !item.tags.iter().any(|t| t.starts_with(TEETH_TAG_PREFIX)))
+        .map(|(id, _)| id)
+        .collect();
+    out.sort();
+    out
+}
+
+/// Every live open point for `project`, exactly scoped (never `project_
+/// applies_to`'s "or global" rule - the same reason `newest_evaluation_
+/// report_seq` is exact) whose own creation seq is at or before
+/// `cutoff_seq` (it already existed as of the previous report - a point
+/// raised THIS session, while preparing the report about to be filed, is
+/// never held against that same filing) and that has never once been
+/// carried forward (`open_point_carried_count` is `0`). A point already
+/// carried once satisfies "closed or carried exactly once" as a standing
+/// fact about it and stops blocking here - it keeps being handed to the
+/// session regardless (`serve::bin::serve`'s own open-points messages), so
+/// it is never silently forgotten, only no longer a hard stop once one
+/// conscious carry decision has been made about it.
+fn open_points_needing_action(store: &EventStore, project: Option<&str>, cutoff_seq: i64) -> Vec<String> {
+    let mut out: Vec<String> = all_live_items(store)
+        .into_iter()
+        .filter(|(_, item)| item.kind == Kind::Report)
+        .filter(|(_, item)| item.project.as_deref() == project)
+        .filter(|(_, item)| item.tags.iter().any(|t| t == OPEN_POINT_TAG))
+        .filter(|(_, item)| open_point_carried_count(&item.tags) == 0)
+        .filter(|(id, _)| {
+            store
+                .get_events_by_entity(id)
+                .ok()
+                .and_then(|events| events.first().map(|e| e.seq))
+                .is_some_and(|seq| seq <= cutoff_seq)
+        })
+        .map(|(id, _)| id)
+        .collect();
+    out.sort();
+    out
+}
+
+/// One live open point, as handed to a reader rather than only to the
+/// filing gate above: its id (so a writer can `retract` or `revise` it),
+/// its one-sentence text, and how many times it has already been carried
+/// forward (`open_point_carried_count`) - `serve::bin::serve`'s own
+/// SessionStart and evaluation-debt messages format this, never the raw
+/// `Item`, so a display change on either surface never has to relearn the
+/// tag shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenPoint {
+    pub id: String,
+    pub text: String,
+    pub carried: u32,
+}
+
+/// Every live open point scoped EXACTLY to `project` (never `project_
+/// applies_to`'s "or global" rule - an open point belongs to the project
+/// that raised it, the same exact-match every other function in this
+/// section uses), oldest first (ascending creation seq, so the point that
+/// has waited longest leads) - a failed per-item seq lookup sorts an item
+/// last rather than dropping it, so a read glitch narrows the order, never
+/// the membership.
+pub fn open_points(store: &EventStore, project: Option<&str>) -> Vec<OpenPoint> {
+    let mut with_seq: Vec<(i64, OpenPoint)> = all_live_items(store)
+        .into_iter()
+        .filter(|(_, item)| item.kind == Kind::Report)
+        .filter(|(_, item)| item.project.as_deref() == project)
+        .filter(|(_, item)| item.tags.iter().any(|t| t == OPEN_POINT_TAG))
+        .map(|(id, item)| {
+            let seq = store.get_events_by_entity(&id).ok().and_then(|e| e.first().map(|e| e.seq)).unwrap_or(i64::MAX);
+            let carried = open_point_carried_count(&item.tags);
+            (seq, OpenPoint { id, text: item.text, carried })
+        })
+        .collect();
+    with_seq.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.id.cmp(&b.1.id)));
+    with_seq.into_iter().map(|(_, p)| p).collect()
+}
+
+/// THE GATE ITSELF. `Ok(None)` for every write that is not an evaluation
+/// report (`item.kind != Kind::Report`, or a `Report` with no
+/// `EVALUATION_REPORT_TAG`) - untouched. For one that is, the three
+/// conditions this section's own top-of-file doc comment names, each
+/// computed fresh from the event log; `Ok(Some(refusal))` names every
+/// condition that is not yet met, with the concrete action that settles it,
+/// never just the first one found (the same "collect every problem, not
+/// just the first" stance `gate::declare_inner`'s own doc comment explains
+/// and measures).
+///
+/// `item.project` is read as given rather than asserted `Some`: `gate::
+/// declare`'s own ground 21 already refuses a scopeless `Report`, but this
+/// function is cheap to make correct for a scopeless one too (every helper
+/// above already takes `Option<&str>`) rather than relying on a guarantee
+/// from a call it does not control the order against.
+fn check_evaluation_report_filing(store: &EventStore, item: &Item) -> Option<Refusal> {
+    if item.kind != Kind::Report || !item.tags.iter().any(|t| t == EVALUATION_REPORT_TAG) {
+        return None;
+    }
+    let project = item.project.as_deref();
+    let mut missing: Vec<String> = Vec::new();
+
+    let owed = judgement_debt_in_project(store, project);
+    if owed > 0 {
+        missing.push(format!(
+            "{owed} item(s) in this project still owe a judgement (served {JUDGEMENT_DEBT_AFTER}+ times since \
+             their last verdict) - settle each with mcp__thor__mark(id: \"<id>\") or mcp__thor__mark(id: \"<id>\", \
+             noise: true); doctor's own `judgement debt` line names them"
+        ));
+    }
+
+    let cutoff_seq = newest_evaluation_report_seq(store, project);
+    let unboxed = heavy_rules_fired_since_without_teeth_box(store, project, cutoff_seq);
+    if !unboxed.is_empty() {
+        let named = unboxed.iter().map(|id| format!("'{id}'")).collect::<Vec<_>>().join(", ");
+        missing.push(format!(
+            "{} heavy rule(s) fired in this project since the previous report and still carry no machine-tested \
+             teeth box: {named} - revise each one (even with no other field changed, so the write path tries its \
+             teeth again) or run the backfill maintenance pass against this store",
+            unboxed.len()
+        ));
+    }
+
+    let stuck = open_points_needing_action(store, project, cutoff_seq);
+    if !stuck.is_empty() {
+        let named = stuck.iter().map(|id| format!("'{id}'")).collect::<Vec<_>>().join(", ");
+        missing.push(format!(
+            "{} open point(s) from an earlier report are still neither closed nor carried: {named} - retract \
+             each with a reason if it is resolved, or revise it to add the tag '{}1' if it is being carried \
+             forward for the first time",
+            stuck.len(),
+            OPEN_POINT_CARRIED_PREFIX
+        ));
+    }
+
+    if missing.is_empty() {
+        return None;
+    }
+    Some(Refusal {
+        problem: format!("this evaluation report cannot be filed yet: {}", missing.join("; ")),
+        fix: "settle every item named above, then file this report again - each condition is computed fresh from \
+              the log, never from what this report's own text says, so nothing here can be answered by rewording \
+              the report"
+            .to_string(),
+    })
+}
 
 /// Turn a fireable item into archive material: same id, same text, same
 /// history, still fully findable by `lookup` - but it stops claiming to fire.
@@ -3179,5 +3619,276 @@ mod tests {
         let mut store = EventStore::in_memory().unwrap();
         let err = retract(&mut store, "s", "l", "a", SETUP_NOTE_ID, "cleanup").unwrap_err();
         assert!(matches!(err, WriteError::Store(_)), "an id that was never declared is NotFound, not Refused: {err}");
+    }
+
+    // --------------------------------------- the evaluation-filing gate (2026-09-25)
+
+    /// A heavy, command-bound, checkless Rule - carrying the pre-existing
+    /// ground 11 (continued, command) answer by default (`no-catch-on-
+    /// command:<why>`), the ONLY tag that ground accepts for a heavy item
+    /// anchored to a command with no check. Unrelated to, and never
+    /// satisfying, the evaluation-filing gate's own condition 2 below: that
+    /// gate only ever reads a `TEETH_TAG_PREFIX` tag, a completely different
+    /// vocabulary - see `evaluation_report_filing_is_refused_when_a_heavy_
+    /// rule_fired_since_the_previous_report_carries_no_teeth_box`, which
+    /// proves exactly that this tag alone does not satisfy it.
+    fn heavy_command_rule(id: &str, project: &str) -> Item {
+        Item {
+            id: id.to_string(),
+            kind: Kind::Rule,
+            text: format!("fixture heavy rule {id}"),
+            bindings: vec![Binding::Target { kind: TargetKind::Command, value: format!("fixture-command-{id}") }],
+            severity: Some(Severity::Irreversible),
+            project: Some(project.to_string()),
+            tags: vec![format!("{}a fixture with nothing literal to catch", NO_CATCH_ON_COMMAND_REASON_PREFIX)],
+            expires: None,
+            key: None,
+            falsifier: Some("this turns out to be safe after all".to_string()),
+            check: None,
+        }
+    }
+
+    /// A LIGHT (no severity), command-bound, checkless Rule - judgement
+    /// debt (`judgement_debt_in_project`) never looks at severity at all,
+    /// so this is enough to owe a verdict on its own, and being light means
+    /// it owes no teeth box (`TeethBox::NotApplicable`) and so can never
+    /// ALSO trip the evaluation-filing gate's condition 2 - the isolation
+    /// `evaluation_report_filing_is_refused_while_judgement_debt_is_
+    /// outstanding`/`..._succeeds_once_judgement_debt_is_paid_down` need to
+    /// each prove exactly one condition.
+    fn light_command_rule(id: &str, project: &str) -> Item {
+        let mut item = heavy_command_rule(id, project);
+        item.severity = None;
+        item.tags = vec![];
+        item
+    }
+
+    fn eval_report(id: &str, project: &str) -> Item {
+        Item {
+            id: id.to_string(),
+            kind: Kind::Report,
+            text: format!("fixture evaluation report {id}"),
+            bindings: vec![],
+            severity: None,
+            project: Some(project.to_string()),
+            tags: vec![EVALUATION_REPORT_TAG.to_string()],
+            expires: None,
+            key: None,
+            falsifier: None,
+            check: None,
+        }
+    }
+
+    fn open_point(id: &str, project: &str) -> Item {
+        Item {
+            id: id.to_string(),
+            kind: Kind::Report,
+            text: format!("fixture open point sentence {id}"),
+            bindings: vec![],
+            severity: None,
+            project: Some(project.to_string()),
+            tags: vec![OPEN_POINT_TAG.to_string()],
+            expires: None,
+            key: None,
+            falsifier: None,
+            check: None,
+        }
+    }
+
+    fn serve_n(store: &mut EventStore, id: &str, actor: &str, n: usize) {
+        for _ in 0..n {
+            store.append_event("s", "l", actor, EventKind::ItemServed, id, None, "{}").unwrap();
+        }
+    }
+
+    fn mark_useful(store: &mut EventStore, id: &str) {
+        store.append_event("s", "l", "a", EventKind::ItemMarkedUseful, id, None, "{}").unwrap();
+    }
+
+    #[test]
+    fn a_write_that_is_not_an_evaluation_report_is_never_touched_by_this_gate() {
+        let mut store = EventStore::in_memory().unwrap();
+        // Real, outstanding judgement debt for "p" - would refuse an
+        // evaluation report, must never so much as be consulted for an
+        // ordinary Rule or for a Report that carries no evaluation-report
+        // tag at all.
+        let heavy = heavy_command_rule("heavy-1", "p");
+        declare(&mut store, "s", "l", "a", &heavy).unwrap();
+        serve_n(&mut store, "heavy-1", ASSISTANT_DELIVERY_ACTOR, JUDGEMENT_DEBT_AFTER);
+        declare(&mut store, "s", "l", "a", &heavy_command_rule("heavy-2", "p")).expect("an ordinary Rule must never consult this gate");
+
+        let mut untagged_report = eval_report("plain-report-not-tagged", "p");
+        untagged_report.tags = vec![];
+        declare(&mut store, "s", "l", "a", &untagged_report)
+            .expect("a Report with no evaluation-report tag must never be touched by this gate");
+    }
+
+    /// THE OTHER DOOR. `declare` is not the only way an item could end up
+    /// carrying `EVALUATION_REPORT_TAG` - a `revise` that adds the tag to
+    /// an item that did not have it is filing exactly as much as a fresh
+    /// `declare` is, and must be held to the identical conditions.
+    #[test]
+    fn revising_an_ordinary_report_onto_the_evaluation_report_tag_is_also_gated() {
+        let mut store = EventStore::in_memory().unwrap();
+        let light = light_command_rule("owed-3", "z");
+        declare(&mut store, "s", "l", "a", &light).unwrap();
+        serve_n(&mut store, "owed-3", ASSISTANT_DELIVERY_ACTOR, JUDGEMENT_DEBT_AFTER);
+
+        let mut plain = eval_report("not-yet-an-eval-report", "z");
+        plain.tags = vec!["some-other-tag".to_string()];
+        declare(&mut store, "s", "l", "a", &plain).expect("an ordinary, untagged Report may be declared freely");
+
+        let mut now_tagged = plain.clone();
+        now_tagged.tags.push(EVALUATION_REPORT_TAG.to_string());
+        let err = revise(&mut store, "s", "l", "a", &plain, &now_tagged).unwrap_err();
+        let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
+        assert!(refusal.problem.contains("owe a judgement"), "{}", refusal.problem);
+    }
+
+    /// THE CONCESSION THIS MUST NOT COST: a report that has ALREADY been
+    /// filed (it already carries the tag) must stay freely correctable
+    /// afterwards - conditions that were only ever about the FILING moment
+    /// must never re-hold a plain typo fix hostage, the same distinction
+    /// `declare` draws between "may this be created" and "the finished
+    /// item's own later life".
+    #[test]
+    fn revising_an_already_filed_report_that_keeps_the_tag_is_never_gated() {
+        let mut store = EventStore::in_memory().unwrap();
+        let light = light_command_rule("owed-4", "y");
+        declare(&mut store, "s", "l", "a", &light).unwrap();
+        serve_n(&mut store, "owed-4", ASSISTANT_DELIVERY_ACTOR, JUDGEMENT_DEBT_AFTER);
+
+        // A filed report exists (bypassing declare's own gate on purpose -
+        // this fixture is about proving `revise`'s own SEPARATE gate stays
+        // out of the way once the tag is already there, not about how it
+        // got there).
+        let filed = eval_report("already-filed", "y");
+        let body = serde_json::to_string(&filed).unwrap();
+        store.append_event("legacy", "already-filed", "migration", EventKind::FactCreated, "already-filed", None, &body).unwrap();
+
+        let mut typo_fixed = filed.clone();
+        typo_fixed.text = format!("{} (typo fixed)", filed.text);
+        revise(&mut store, "s", "l", "a", &filed, &typo_fixed)
+            .expect("a report that already carried the tag must stay correctable regardless of live debt");
+    }
+
+    #[test]
+    fn evaluation_report_filing_is_refused_while_judgement_debt_is_outstanding() {
+        let mut store = EventStore::in_memory().unwrap();
+        let light = light_command_rule("owed-1", "p");
+        declare(&mut store, "s", "l", "a", &light).unwrap();
+        serve_n(&mut store, "owed-1", ASSISTANT_DELIVERY_ACTOR, JUDGEMENT_DEBT_AFTER);
+
+        let err = declare(&mut store, "s", "l", "a", &eval_report("eval-p-1", "p")).unwrap_err();
+        let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
+        assert!(refusal.problem.contains("owe a judgement"), "{}", refusal.problem);
+        assert!(show(&store, "eval-p-1").is_err(), "a refused report must not be live");
+    }
+
+    #[test]
+    fn evaluation_report_filing_succeeds_once_judgement_debt_is_paid_down() {
+        let mut store = EventStore::in_memory().unwrap();
+        let light = light_command_rule("owed-2", "p");
+        declare(&mut store, "s", "l", "a", &light).unwrap();
+        serve_n(&mut store, "owed-2", ASSISTANT_DELIVERY_ACTOR, JUDGEMENT_DEBT_AFTER);
+        mark_useful(&mut store, "owed-2");
+
+        declare(&mut store, "s", "l", "a", &eval_report("eval-p-2", "p")).expect("debt is settled, filing must succeed");
+    }
+
+    #[test]
+    fn evaluation_report_filing_is_refused_when_a_heavy_rule_fired_since_the_previous_report_carries_no_teeth_box() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "s", "l", "a", &eval_report("eval-q-old", "q")).unwrap();
+        let heavy = heavy_command_rule("unboxed-heavy", "q");
+        declare(&mut store, "s", "l", "a", &heavy).unwrap();
+        serve_n(&mut store, "unboxed-heavy", "hook", 1);
+
+        let err = declare(&mut store, "s", "l", "a", &eval_report("eval-q-new", "q")).unwrap_err();
+        let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
+        assert!(refusal.problem.contains("unboxed-heavy"), "{}", refusal.problem);
+        assert!(refusal.problem.contains("no machine-tested"), "{}", refusal.problem);
+    }
+
+    #[test]
+    fn evaluation_report_filing_succeeds_once_the_fired_heavy_rule_carries_any_teeth_box() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "s", "l", "a", &eval_report("eval-r-old", "r")).unwrap();
+        let mut heavy = heavy_command_rule("boxed-heavy", "r");
+        heavy.tags.push(TEETH_INFORMING_TAG.to_string());
+        declare(&mut store, "s", "l", "a", &heavy).unwrap();
+        serve_n(&mut store, "boxed-heavy", "hook", 1);
+
+        declare(&mut store, "s", "l", "a", &eval_report("eval-r-new", "r"))
+            .expect("a fired heavy rule carrying ANY reserved teeth tag must not block filing");
+    }
+
+    #[test]
+    fn a_heavy_rule_that_never_fired_since_the_previous_report_is_never_named() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "s", "l", "a", &eval_report("eval-t-old", "t")).unwrap();
+        // Declared AFTER the previous report but never actually served -
+        // must not be treated as owing a fresh box.
+        declare(&mut store, "s", "l", "a", &heavy_command_rule("never-fired", "t")).unwrap();
+
+        declare(&mut store, "s", "l", "a", &eval_report("eval-t-new", "t"))
+            .expect("an unfired heavy rule must never hold up filing");
+    }
+
+    #[test]
+    fn evaluation_report_filing_is_refused_by_an_open_point_older_than_the_previous_report() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "s", "l", "a", &open_point("open-u-1", "u")).unwrap();
+        declare(&mut store, "s", "l", "a", &eval_report("eval-u-1", "u")).expect("a brand-new open point must never block its own contemporaneous report");
+
+        let err = declare(&mut store, "s", "l", "a", &eval_report("eval-u-2", "u")).unwrap_err();
+        let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
+        assert!(refusal.problem.contains("open-u-1"), "{}", refusal.problem);
+        assert!(refusal.problem.contains("neither closed nor carried"), "{}", refusal.problem);
+    }
+
+    #[test]
+    fn closing_the_open_point_with_a_retraction_lets_filing_through() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "s", "l", "a", &open_point("open-v-1", "v")).unwrap();
+        declare(&mut store, "s", "l", "a", &eval_report("eval-v-1", "v")).unwrap();
+        retract(&mut store, "s", "l", "a", "open-v-1", "resolved during the next evaluation").unwrap();
+
+        declare(&mut store, "s", "l", "a", &eval_report("eval-v-2", "v")).expect("a closed open point must never block filing");
+    }
+
+    #[test]
+    fn carrying_the_open_point_forward_once_lets_filing_through() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "s", "l", "a", &open_point("open-w-1", "w")).unwrap();
+        declare(&mut store, "s", "l", "a", &eval_report("eval-w-1", "w")).unwrap();
+        let existing = show(&store, "open-w-1").unwrap();
+        let mut carried = existing.clone();
+        carried.tags.push(format!("{OPEN_POINT_CARRIED_PREFIX}1"));
+        revise(&mut store, "s", "l", "a", &existing, &carried).unwrap();
+
+        declare(&mut store, "s", "l", "a", &eval_report("eval-w-2", "w"))
+            .expect("an open point carried forward exactly once must not block filing");
+    }
+
+    #[test]
+    fn open_point_carried_count_reads_the_tag_and_defaults_to_zero() {
+        assert_eq!(open_point_carried_count(&[]), 0);
+        assert_eq!(open_point_carried_count(&["open-point".to_string()]), 0);
+        assert_eq!(open_point_carried_count(&["carried:1".to_string()]), 1);
+        assert_eq!(open_point_carried_count(&["carried:2".to_string()]), 2);
+        assert_eq!(open_point_carried_count(&["carried:not-a-number".to_string()]), 0);
+    }
+
+    #[test]
+    fn open_points_lists_only_the_named_projects_own_points_oldest_first() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "s", "l", "a", &open_point("open-x-1", "x")).unwrap();
+        declare(&mut store, "s", "l", "a", &open_point("open-x-2", "x")).unwrap();
+        declare(&mut store, "s", "l", "a", &open_point("open-y-1", "y")).unwrap();
+
+        let points = open_points(&store, Some("x"));
+        assert_eq!(points.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), vec!["open-x-1", "open-x-2"]);
+        assert!(points.iter().all(|p| p.carried == 0));
     }
 }

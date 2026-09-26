@@ -877,17 +877,20 @@ pub fn is_dead_moment(action: Action) -> bool {
     DEAD_MOMENTS.contains(&action)
 }
 
-/// `bare_answer_allowed` and `symbol_only_allowed` are two of the three things
-/// about an item this cannot see for itself: whether the bare `no-literal` it
-/// carries, and whether the symbol-only anchor it has, were already there.
-/// `carried_bindings` is the third and is richer than a bool - GROUND 25
-/// below needs to know WHICH bindings were already there, not just whether
-/// some single shape was. Only `revise` knows any of the three, and only
-/// `revise` passes something other than the "nothing was already there"
-/// default (`false`/`false`/`None`).
+/// `bare_answer_allowed`, `command_generic_answer_allowed` and
+/// `symbol_only_allowed` are three of the four things about an item this
+/// cannot see for itself: whether the bare `no-literal` it carries, whether
+/// a command-anchored item's own generic teeth answer, and whether the
+/// symbol-only anchor it has, were already there. `carried_bindings` is the
+/// fourth and is richer than a bool - GROUND 25 below needs to know WHICH
+/// bindings were already there, not just whether some single shape was.
+/// Only `revise` knows any of the four, and only `revise` passes something
+/// other than the "nothing was already there" default (`false`/`false`/
+/// `false`/`None`).
 fn shape_problems(
     item: &Item,
     bare_answer_allowed: bool,
+    command_generic_answer_allowed: bool,
     symbol_only_allowed: bool,
     carried_bindings: Option<&[Binding]>,
 ) -> Vec<Refusal> {
@@ -1015,7 +1018,37 @@ fn shape_problems(
         };
         if let Some(command) = command_anchor {
             match item.tags.iter().find_map(|t| command_teeth_answer(t)) {
-                None => problems.push(command_no_catch_refusal(command)),
+                None => {
+                    // GRANDFATHER (2026-09-25): the sharp tag above has
+                    // nothing to protect - it did not exist before this
+                    // ground did, so nothing could have carried it in
+                    // honestly - but the PLAIN `no-literal` answer this
+                    // ground replaced is a different story: live heavy,
+                    // command-anchored facts may have answered the old
+                    // question with it before the sharper one was ever
+                    // demanded. Refusing every revise of those, forever,
+                    // until each is hand-answered again, would lock them out
+                    // of every future correction - the exact backlog
+                    // `revise`'s own other concessions already exist to
+                    // drain (see that function's "the one concession to the
+                    // store as it already is"). So this looks only at
+                    // whether the EXISTING item already had this shape with
+                    // the generic answer, never at whether the UPDATED one
+                    // reaches for the concession fresh - `revise` is the
+                    // only caller that ever passes `true` here.
+                    let grandfathered_answer = if command_generic_answer_allowed {
+                        item.tags.iter().find_map(|t| crate::store::teeth_answer(t))
+                    } else {
+                        None
+                    };
+                    match grandfathered_answer {
+                        None => problems.push(command_no_catch_refusal(command)),
+                        Some(crate::store::TeethAnswer::Bare) => {}
+                        Some(crate::store::TeethAnswer::Reasoned(reason)) => {
+                            problems.extend(no_literal_reason_problem(reason));
+                        }
+                    }
+                }
                 // Unlike the generic tag below, a bare command answer has no
                 // grandfathered item to protect - this tag did not exist
                 // before this ground did, so nothing could have carried it
@@ -1190,17 +1223,24 @@ fn combined(problems: Vec<Refusal>) -> Refusal {
 pub const NO_SCOPE_PROBLEM: &str = "this is archive material with no scope, so it joins the unscoped pile: it belongs to no collection, and opening one will never show it";
 
 pub fn declare(item: &Item) -> Result<(), Refusal> {
-    declare_inner(item, false, false, false, None)
+    declare_inner(item, false, false, false, false, None)
 }
 
 fn declare_inner(
     item: &Item,
     bare_answer_allowed: bool,
+    command_generic_answer_allowed: bool,
     symbol_only_allowed: bool,
     unscoped_allowed: bool,
     carried_bindings: Option<&[Binding]>,
 ) -> Result<(), Refusal> {
-    let problems = shape_problems(item, bare_answer_allowed, symbol_only_allowed, carried_bindings);
+    let problems = shape_problems(
+        item,
+        bare_answer_allowed,
+        command_generic_answer_allowed,
+        symbol_only_allowed,
+        carried_bindings,
+    );
     match problems.len() {
         0 => {}
         1 => return Err(problems.into_iter().next().expect("length checked")),
@@ -1481,6 +1521,24 @@ pub fn revise(existing: &Item, updated: &Item) -> Result<(), Refusal> {
     // correcting an old fact never costs a round trip over a question that
     // was answered - badly, but answered - long before.
     let carried_bare = existing.tags.iter().any(|t| t == crate::store::NO_LITERAL_TAG);
+    // The same concession for ground 11 (continued, command), added
+    // 2026-09-25: live items exist that are heavy, anchored to a Command,
+    // checkless, and already answered the teeth question with the generic
+    // `no-literal`/`no-literal:<why>` tag before the sharper
+    // `no-catch-on-command` tag was ever demanded. `shape_problems`'s own
+    // command branch cannot see the store, only the two items handed to it
+    // here, so it cannot tell "never answered" apart from "answered
+    // honestly, under the old, looser question" without being told - the
+    // same blindness `carried_bare` above exists to correct for the plain
+    // ground. Computed from `existing` alone: a revise that CREATES this
+    // shape fresh (adds a Command anchor, raises severity into
+    // Irreversible/Costly, or drops the check) gets no concession, because
+    // `existing` never had the shape to carry forward.
+    let command_generic_answer_allowed = existing.kind.can_fire()
+        && matches!(existing.severity, Some(Severity::Irreversible) | Some(Severity::Costly))
+        && existing.bindings.iter().any(|b| matches!(b, Binding::Target { kind: TargetKind::Command, .. }))
+        && existing.check.is_none()
+        && existing.tags.iter().any(|t| crate::store::teeth_answer(t).is_some());
     // The same concession for ground 20: an item that was ALREADY anchored to
     // nothing but a symbol stays correctable. Refusing those would lock the
     // very backlog this ground exists to drain - you could no longer fix a
@@ -1501,7 +1559,14 @@ pub fn revise(existing: &Item, updated: &Item) -> Result<(), Refusal> {
     // (never a filtered-down "just the dead ones"): ground 25 only ever
     // checks membership of one exact binding at a time, so handing it
     // everything already there costs nothing and needs no separate filter.
-    declare_inner(updated, carried_bare, carried_symbol_only, carried_unscoped, Some(&existing.bindings))?;
+    declare_inner(
+        updated,
+        carried_bare,
+        command_generic_answer_allowed,
+        carried_symbol_only,
+        carried_unscoped,
+        Some(&existing.bindings),
+    )?;
     if !existing.bindings.is_empty() && updated.bindings.is_empty() {
         return Err(dropped_field("bindings"));
     }
@@ -1525,6 +1590,33 @@ pub fn revise(existing: &Item, updated: &Item) -> Result<(), Refusal> {
     }
     if existing.check.is_some() && updated.check.is_none() {
         return Err(dropped_field("check"));
+    }
+    // GROUND 30 (2026-09-25): an open point (`crate::store::OPEN_POINT_TAG`)
+    // may be carried forward exactly once - see `crate::store::
+    // OPEN_POINT_CARRIED_PREFIX`'s own doc comment for why. Checked against
+    // `updated.tags` alone, whichever item carried the open-point tag: a
+    // revise that adds the tag AND an over-limit count in the same call is
+    // refused exactly like one that only bumped the count on an item that
+    // already had it.
+    if existing.tags.iter().any(|t| t == crate::store::OPEN_POINT_TAG)
+        || updated.tags.iter().any(|t| t == crate::store::OPEN_POINT_TAG)
+    {
+        let new_count = crate::store::open_point_carried_count(&updated.tags);
+        if new_count > 1 {
+            return Err(Refusal::new(
+                format!(
+                    "this revise would set an open point's own carried count to {new_count}, but an open point \
+                     may be carried forward exactly once"
+                ),
+                format!(
+                    "a second carry needs the owner's own decision, not another automated pass: retract this open \
+                     point with a reason if it is resolved, or ask the owner directly what to do with it - never \
+                     raise the \
+                     '{}' tag past 1",
+                    crate::store::OPEN_POINT_CARRIED_PREFIX
+                ),
+            ));
+        }
     }
     Ok(())
 }
@@ -3744,6 +3836,161 @@ mod tests {
             crate::store::NO_CATCH_ON_COMMAND_REASON_PREFIX
         )];
         assert!(revise(&light, &answered).is_ok(), "and the sharper answer lets the re-rating through");
+    }
+
+    // ---------------------------- ground 11 (continued, command) grandfather
+    //
+    // THE DEFECT THIS CLOSES (2026-09-25). The sharpening above shipped with
+    // no concession for facts already stored: live items exist that are
+    // heavy, Command-anchored, checkless, and already answered with the
+    // generic `no-literal` tag before the sharper `no-catch-on-command` tag
+    // was ever demanded. Every one became unrevisable - any correction was
+    // refused for not carrying a tag that did not exist when it was written.
+    // These tests prove the concession reaches exactly those items and
+    // nothing wider: a fresh write still demands the sharp tag, and a revise
+    // that only newly ARRIVES at this shape gets no free pass either.
+
+    /// The core claim: an item that already carried the bare generic answer
+    /// in this exact shape stays correctable, the same way
+    /// `a_bare_answer_already_on_an_item_survives_a_revise_of_something_else`
+    /// already proves for the plain (non-command) ground.
+    #[test]
+    fn a_command_anchored_fact_that_already_carried_the_bare_generic_tag_stays_correctable() {
+        let mut existing = base(Kind::Rule);
+        existing.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "git archive".to_string() }];
+        existing.severity = Some(Severity::Irreversible);
+        existing.tags = vec![crate::store::NO_LITERAL_TAG.to_string()];
+
+        let mut updated = existing.clone();
+        updated.text = "always run git archive with an explicit pathspec".to_string();
+        assert!(
+            revise(&existing, &updated).is_ok(),
+            "correcting an old fact must not cost a round trip over a question it already answered"
+        );
+    }
+
+    /// The same claim for the reasoned form of the generic tag - grandfathered
+    /// exactly as it stands, not merely tolerated as a bare word.
+    #[test]
+    fn a_command_anchored_fact_that_already_carried_a_reasoned_generic_tag_stays_correctable() {
+        let mut existing = base(Kind::Rule);
+        existing.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "git archive".to_string() }];
+        existing.severity = Some(Severity::Irreversible);
+        existing.tags = vec![format!(
+            "{}the pathspec is chosen at call time and is never one fixed fragment",
+            crate::store::NO_LITERAL_REASON_PREFIX
+        )];
+
+        let mut updated = existing.clone();
+        updated.text = "always run git archive with an explicit pathspec".to_string();
+        assert!(
+            revise(&existing, &updated).is_ok(),
+            "a reasoned generic answer already on the item is grandfathered exactly like the bare one"
+        );
+    }
+
+    /// The grandfather needs the ANSWER, not merely the shape: an item that
+    /// was already heavy, Command-anchored and checkless but never actually
+    /// answered the teeth question - plausible for one written before ground
+    /// 11 existed at all - gets no free pass just because a revise is where
+    /// it is finally asked. Mirrors "the exemption is per item, not global"
+    /// from the plain ground's own test.
+    #[test]
+    fn a_command_anchored_fact_with_no_prior_answer_gets_no_grandfather_on_revise() {
+        let mut existing = base(Kind::Rule);
+        existing.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "git archive".to_string() }];
+        existing.severity = Some(Severity::Irreversible);
+        existing.tags = vec!["safety".to_string()];
+
+        let mut updated = existing.clone();
+        updated.tags = vec![crate::store::NO_LITERAL_TAG.to_string()];
+        assert!(
+            revise(&existing, &updated).is_err(),
+            "reaching for the generic tag for the first time on this revise must still be refused"
+        );
+    }
+
+    /// Invariant this fix must never touch: a FRESH write carrying only the
+    /// generic answer is refused exactly as before, sharp tag or nothing.
+    /// Restated here beside the new concession (see also
+    /// `a_heavy_command_anchored_rule_is_refused_even_with_the_generic_no_literal_tag`
+    /// above) so the two invariants this concession must respect sit next to
+    /// its own tests.
+    #[test]
+    fn a_fresh_write_still_refuses_the_generic_tag_after_the_grandfather_concession() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "git archive".to_string() }];
+        item.severity = Some(Severity::Irreversible);
+        item.tags = vec![crate::store::NO_LITERAL_TAG.to_string()];
+        let err = declare(&item).unwrap_err();
+        assert!(err.fix.contains("forbidden check"), "still asks for the sharper answer: {}", err.fix);
+    }
+
+    /// Invariant this fix must never touch, example one of three the brief
+    /// itself names: a revise that ADDS a command anchor where there was
+    /// none creates this shape fresh, so the generic tag already on the item
+    /// does not carry over.
+    #[test]
+    fn adding_a_command_anchor_on_revise_asks_the_command_question_even_with_the_old_generic_tag() {
+        let mut existing = base(Kind::Orientation);
+        existing.severity = Some(Severity::Irreversible);
+        existing.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "src/deploy.js".to_string() }];
+        existing.tags = vec![format!(
+            "{}an authorised deploy looks exactly like an unauthorised one",
+            crate::store::NO_LITERAL_REASON_PREFIX
+        )];
+        assert!(declare(&existing).is_ok(), "fixture sanity: the path anchor form goes in as it stands");
+
+        let mut updated = existing.clone();
+        updated.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "git archive".to_string() }];
+        let err = revise(&existing, &updated).unwrap_err();
+        assert!(err.fix.contains("git archive"), "names the item's own command: {}", err.fix);
+    }
+
+    /// Example two of three: a revise that RAISES severity into the heavy
+    /// range creates this shape fresh, so arriving with the generic tag in
+    /// that same call is still refused.
+    #[test]
+    fn raising_severity_on_revise_asks_the_command_question_even_with_the_old_generic_tag() {
+        let mut light = base(Kind::Rule);
+        light.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "git archive".to_string() }];
+        light.severity = Some(Severity::HouseStyle);
+        assert!(declare(&light).is_ok(), "fixture sanity: it goes in as it stands");
+
+        let mut now_heavy = light.clone();
+        now_heavy.severity = Some(Severity::Costly);
+        now_heavy.tags = vec![format!(
+            "{}an authorised run looks exactly like an unauthorised one",
+            crate::store::NO_LITERAL_REASON_PREFIX
+        )];
+        assert!(
+            revise(&light, &now_heavy).is_err(),
+            "the generic tag arriving in the same revise that first makes the fact heavy must not satisfy it"
+        );
+    }
+
+    /// Example three of three: a revise that REMOVES a checked item's only
+    /// check creates this shape fresh - the item never had occasion to carry
+    /// a generic answer while the check was still there, so one added in the
+    /// same breath as dropping the check does not satisfy it either.
+    #[test]
+    fn removing_a_command_anchored_facts_check_on_revise_asks_the_question_even_with_the_old_generic_tag() {
+        let mut checked = base(Kind::Rule);
+        checked.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "git archive".to_string() }];
+        checked.severity = Some(Severity::Irreversible);
+        checked.check = Some(Check::Forbidden { literals: vec!["--force".to_string()] });
+        assert!(declare(&checked).is_ok(), "fixture sanity: a checked item needs no teeth tag at all");
+
+        let mut checkless = checked.clone();
+        checkless.check = None;
+        checkless.tags = vec![format!(
+            "{}an authorised run looks exactly like an unauthorised one",
+            crate::store::NO_LITERAL_REASON_PREFIX
+        )];
+        assert!(
+            revise(&checked, &checkless).is_err(),
+            "dropping the last check and reaching for the generic tag in the same revise must not satisfy it"
+        );
     }
 
     // -------------------------------------------------------- ground 16
@@ -6058,5 +6305,67 @@ mod tests {
         let item_check = contains("LICENSE", "GPLv3");
         let rival_check = absent("LICENSE", "MIT");
         assert!(check_opposition(&item_check, "rival-id", "the rival's own text", &rival_check).is_ok());
+    }
+
+    // ------------------------------------------------------------- ground 30
+
+    /// `base(Kind::Report)` tagged as an open point - `Report`'s own
+    /// mandatory-empty bindings (see the archive-kind ground above) are
+    /// already exactly what `base` provides.
+    fn open_point_base() -> Item {
+        let mut item = base(Kind::Report);
+        item.tags = vec![crate::store::OPEN_POINT_TAG.to_string()];
+        item
+    }
+
+    #[test]
+    fn an_open_point_may_be_carried_forward_exactly_once() {
+        let existing = open_point_base();
+        let mut carried_once = existing.clone();
+        carried_once.tags.push(format!("{}1", crate::store::OPEN_POINT_CARRIED_PREFIX));
+        revise(&existing, &carried_once).expect("the first carry must be allowed");
+    }
+
+    /// THE PRIMARY CLAIM: an open point already carrying `carried:1` may
+    /// never be bumped to `carried:2` by a writer - the count this task's
+    /// own brief calls "allowed exactly once".
+    #[test]
+    fn a_second_carry_on_an_open_point_is_refused() {
+        let mut existing = open_point_base();
+        existing.tags.push(format!("{}1", crate::store::OPEN_POINT_CARRIED_PREFIX));
+        let mut second_carry = existing.clone();
+        second_carry.tags.retain(|t| !t.starts_with(crate::store::OPEN_POINT_CARRIED_PREFIX));
+        second_carry.tags.push(format!("{}2", crate::store::OPEN_POINT_CARRIED_PREFIX));
+
+        let err = revise(&existing, &second_carry).expect_err("a second carry must be refused");
+        assert!(err.problem.contains('2'), "the refusal must name the count it refused: {}", err.problem);
+        assert!(
+            err.fix.to_lowercase().contains("owner"),
+            "the fix must say this needs the owner, not another automated pass: {}",
+            err.fix
+        );
+    }
+
+    /// Adding the tag AND an over-limit count in the very same revise is
+    /// refused identically - `existing` need not already carry the
+    /// open-point tag itself for this ground to apply, only `updated`.
+    #[test]
+    fn jumping_straight_to_carried_two_on_a_fresh_open_point_is_also_refused() {
+        let existing = open_point_base();
+        let mut jumped = existing.clone();
+        jumped.tags.push(format!("{}2", crate::store::OPEN_POINT_CARRIED_PREFIX));
+        revise(&existing, &jumped).expect_err("carried:2 must be refused even on a first-ever carry");
+    }
+
+    /// THE NARROW SCOPE THIS GROUND MUST KEEP: an ordinary item with no
+    /// open-point tag on either side must never even notice this ground
+    /// exists, however its OWN tags happen to be spelled.
+    #[test]
+    fn ground_30_never_touches_an_item_with_no_open_point_tag_on_either_side() {
+        let mut existing = base(Kind::Rule);
+        existing.bindings = vec![Binding::Always];
+        let mut updated = existing.clone();
+        updated.text = "a plain edit that has nothing to do with open points".to_string();
+        revise(&existing, &updated).expect("ground 30 must never fire for a non-open-point item");
     }
 }

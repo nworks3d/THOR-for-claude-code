@@ -1428,6 +1428,32 @@ pub fn teeth_line(db: &Path, full: bool) -> String {
     // most often since its last verdict (most exercised, most worth a check
     // first), then to id, so the order is fully deterministic across runs.
     let mut toothless: Vec<(u8, usize, Rot)> = Vec::new();
+    // CHANGE 2 (2026-09-24): `heavy_with_teeth`/`toothless` above are a claim
+    // about SHAPE (`can_refuse`, structural, decided without ever running
+    // anything - see that function's own doc comment). `informing_tested`,
+    // `proven_tested`, `refuses_legit_tested` and `anchor_collapsed_tested`
+    // are the DIFFERENT claim this store can now actually back: how many
+    // already carry one of the four reserved tags the write gate itself
+    // appends only after actually trying a fact's own teeth (`model::store::
+    // TEETH_INFORMING_TAG`/`TEETH_PROVEN_TAG`/`TEETH_REFUSES_LEGITIMATE_TAG`/
+    // `TEETH_ANCHOR_COLLAPSED_TAG` - see each constant's own doc comment for
+    // why a writer can never set, clear or fake it). An item written before
+    // this mechanism shipped, or one Change 2 never applied to, carries none
+    // of the four - that gap is exactly what "never tested" below names.
+    //
+    // COUNTED INDEPENDENTLY of the armed/toothless split just below, on
+    // purpose: `can_refuse` is a claim about REACH alone, and for `Absent`/
+    // `AbsentAll` it is unconditionally `true` regardless of whether this
+    // item's own binding actually reaches its check's own path - so a
+    // "wrong anchor" item (armed by shape, toothless in fact, carrying
+    // `TEETH_INFORMING_TAG`) would otherwise fall into neither branch's own
+    // tag check and vanish from this count entirely. Checking every tag
+    // against every heavy item, regardless of which branch it lands in
+    // below, is what keeps this sentence honest for that shape too.
+    let (mut informing_tested, mut proven_tested, mut refuses_legit_tested, mut anchor_collapsed_tested) =
+        (0usize, 0usize, 0usize, 0usize);
+    let mut refuses_legit: Vec<Rot> = Vec::new();
+    let mut anchor_collapsed: Vec<Rot> = Vec::new();
     for li in live.iter().filter(|li| li.item.kind.can_fire()) {
         if !matches!(
             li.item.severity,
@@ -1436,22 +1462,38 @@ pub fn teeth_line(db: &Path, full: bool) -> String {
             continue;
         }
         heavy += 1;
+        let check_desc = match &li.item.check {
+            None => "no check".to_string(),
+            Some(c) => format!("check: {c:?}"),
+        };
+        let project = li.item.project.clone().unwrap_or_else(|| "global".to_string());
+        if li.item.tags.iter().any(|t| t == model::store::TEETH_PROVEN_TAG) {
+            proven_tested += 1;
+        } else if li.item.tags.iter().any(|t| t == model::store::TEETH_INFORMING_TAG) {
+            informing_tested += 1;
+        } else if li.item.tags.iter().any(|t| t == model::store::TEETH_REFUSES_LEGITIMATE_TAG) {
+            refuses_legit_tested += 1;
+            refuses_legit.push(Rot {
+                id: li.id.clone(),
+                project: project.clone(),
+                what: format!("{:?}, {check_desc} - refuses ordinary use of its own anchor too", li.item.severity),
+            });
+        } else if li.item.tags.iter().any(|t| t == model::store::TEETH_ANCHOR_COLLAPSED_TAG) {
+            anchor_collapsed_tested += 1;
+            anchor_collapsed.push(Rot {
+                id: li.id.clone(),
+                project: project.clone(),
+                what: format!("{:?}, {check_desc} - anchor and literal cannot be told apart", li.item.severity),
+            });
+        }
         if can_refuse(&li.item) {
             heavy_with_teeth += 1;
         } else {
-            let check_desc = match &li.item.check {
-                None => "no check".to_string(),
-                Some(c) => format!("check: {c:?}"),
-            };
             let count = fired.get(&li.id).copied().unwrap_or(0);
             toothless.push((
                 model::item::severity_rank(li.item.severity),
                 count,
-                Rot {
-                    id: li.id.clone(),
-                    project: li.item.project.clone().unwrap_or_else(|| "global".to_string()),
-                    what: format!("{:?}, {check_desc}, fired {count}x since its last verdict", li.item.severity),
-                },
+                Rot { id: li.id.clone(), project, what: format!("{:?}, {check_desc}, fired {count}x since its last verdict", li.item.severity) },
             ));
         }
     }
@@ -1489,6 +1531,32 @@ pub fn teeth_line(db: &Path, full: bool) -> String {
         "teeth: {heavy_with_teeth} of {heavy} rule(s) marked irreversible or costly can actually refuse something - the other {} can only inform, and they are the ones where being wrong was already called expensive; {proven} rule(s) of any weight have ever actually refused a write, which is the only count here that is proven rather than claimed",
         heavy - heavy_with_teeth
     )];
+    // CHANGE 2's own line, kept separate from the shape-only sentence above
+    // rather than folded into it: the four counts below are WRITE-TIME facts
+    // (this tool actually tried both sides, and said so in a tag that
+    // survives only as long as neither the check nor the bindings change),
+    // never a re-derivation of `heavy_with_teeth`/`toothless` at report time.
+    // Every heavy rule owes a teeth test (`serve::prove::teeth_box`'s own
+    // applicability rule - `is_heavy` alone already satisfies it, whatever
+    // the check looks like), so these five numbers always sum to `heavy`:
+    // proven both ways, refuses legitimate use too, anchor collapsed into
+    // its own literal, informing only, or never tested at all.
+    let never_tested = heavy - proven_tested - refuses_legit_tested - anchor_collapsed_tested - informing_tested;
+    out.push(format!(
+        "teeth tested at the write, of {heavy} heavy rule(s): {proven_tested} are proven guards - refused the bad \
+         form and let the clean, legitimate one through ('{}'); {refuses_legit_tested} refuse legitimate use too, \
+         which is as bad as no check at all ('{}'); {anchor_collapsed_tested} have an anchor that already \
+         contains their own literal, so the two-sided test could not even run on them ('{}'); {informing_tested} \
+         were tried and are confirmed toothless, or confirmed to have nothing to try ('{}'); the remaining \
+         {never_tested} predate this check or were never revised since, so doctor cannot yet tell a proof from a \
+         claim for them",
+        model::store::TEETH_PROVEN_TAG,
+        model::store::TEETH_REFUSES_LEGITIMATE_TAG,
+        model::store::TEETH_ANCHOR_COLLAPSED_TAG,
+        model::store::TEETH_INFORMING_TAG
+    ));
+    out.extend(name_rot("refuses-legitimate-use", &refuses_legit, full));
+    out.extend(name_rot("anchor-collapsed", &anchor_collapsed, full));
     out.extend(name_rot("toothless", &toothless, full));
     out.join("\n")
 }
@@ -2471,6 +2539,18 @@ mod tests {
     /// this straight from the STORE, never only from the sidecar - see its
     /// own doc comment for why the tests below need a real report here, not
     /// only a hand-written `seed_eval_debt_state` entry.
+    ///
+    /// GOES THROUGH `legacy_declare`, NOT `store::declare` (2026-09-25): the
+    /// tests calling this pair it with `declare_owed_for_eval_debt` on the
+    /// SAME project, on purpose, to give `judgement_debt_line` something to
+    /// report - which is now exactly the shape `model::store`'s own
+    /// evaluation-filing gate refuses at a real write (judgement debt not
+    /// zero). What every caller of this helper actually tests is doctor's
+    /// own report-line formatting for a report already sitting live in the
+    /// store, never the moment of filing one - `legacy_declare`'s own doc
+    /// comment already names this exact situation: reading has to stay
+    /// correct for a shape the gate would now refuse to CREATE but a real
+    /// store can still HOLD (a report filed before that gate existed).
     fn declare_report(store: &mut EventStore, id: &str, project: &str) {
         let item = Item {
             id: id.to_string(),
@@ -2485,7 +2565,7 @@ mod tests {
             falsifier: None,
             check: None,
         };
-        store::declare(store, "s", "l", "a", &item).unwrap();
+        legacy_declare(store, &item);
     }
 
     /// Write the evaluation-debt sidecar directly, the same JSON shape
@@ -3626,6 +3706,55 @@ mod tests {
         let line = teeth_line(&db, false);
         assert!(line.contains("1 of 2"), "{line}");
         assert!(line.contains("the other 1 can only inform"), "{line}");
+    }
+
+    /// CHANGE 2's TWO-SIDED extension: the write-time sentence must show all
+    /// five categories separately - proven, refuses legitimate use too,
+    /// anchor collapsed, informing only, never tested - and the two new
+    /// dangerous ones must be NAMED, not just counted, the same standard
+    /// `toothless` already meets.
+    #[test]
+    fn teeth_line_shows_all_five_teeth_categories_separately_and_names_the_two_new_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut s = EventStore::new(&db).unwrap();
+
+            let mut proven = rule("proven-fixture");
+            proven.severity = Some(model::item::Severity::Irreversible);
+            proven.check = Some(model::item::Check::Forbidden { literals: vec!["--force".to_string()] });
+            proven.tags = vec![store::TEETH_PROVEN_TAG.to_string()];
+            legacy_declare(&mut s, &proven);
+
+            let mut refuses = rule("refuses-legit-fixture");
+            refuses.severity = Some(model::item::Severity::Costly);
+            refuses.check = Some(model::item::Check::Forbidden { literals: vec!["--force".to_string()] });
+            refuses.tags = vec![store::TEETH_REFUSES_LEGITIMATE_TAG.to_string()];
+            legacy_declare(&mut s, &refuses);
+
+            let mut collapsed = rule("collapsed-fixture");
+            collapsed.severity = Some(model::item::Severity::Irreversible);
+            collapsed.check = Some(model::item::Check::Forbidden { literals: vec!["--force".to_string()] });
+            collapsed.tags = vec![store::TEETH_ANCHOR_COLLAPSED_TAG.to_string()];
+            legacy_declare(&mut s, &collapsed);
+
+            let mut informing = rule("informing-fixture");
+            informing.severity = Some(model::item::Severity::Costly);
+            informing.tags = vec![store::TEETH_INFORMING_TAG.to_string()];
+            legacy_declare(&mut s, &informing);
+
+            let mut never_tested = rule("never-tested-fixture");
+            never_tested.severity = Some(model::item::Severity::Irreversible);
+            legacy_declare(&mut s, &never_tested);
+        }
+        let line = teeth_line(&db, true);
+        assert!(line.contains("1 are proven guards"), "{line}");
+        assert!(line.contains("1 refuse legitimate use too"), "{line}");
+        assert!(line.contains("1 have an anchor that already contains"), "{line}");
+        assert!(line.contains("1 were tried and are confirmed toothless"), "{line}");
+        assert!(line.contains("remaining 1 predate"), "{line}");
+        assert!(line.contains("  refuses-legitimate-use: refuses-legit-fixture"), "{line}");
+        assert!(line.contains("  anchor-collapsed: collapsed-fixture"), "{line}");
     }
 
     /// THE ORDERING THIS ENFORCES: heaviest severity first (`model::item::
