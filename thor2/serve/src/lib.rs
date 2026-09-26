@@ -106,6 +106,7 @@ pub mod serving;
 pub mod session_start;
 pub mod stale_guard;
 pub mod status;
+pub mod store_dir;
 pub mod time;
 pub mod usefulness;
 #[cfg(feature = "semantic")]

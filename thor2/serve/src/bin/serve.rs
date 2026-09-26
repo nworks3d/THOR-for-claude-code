@@ -71,9 +71,12 @@ enum Command {
         /// Produce the exact same stdout as a normal run, but record NO
         /// delivery at all, on every arm - for a measurement run that has
         /// to be able to call this boundary hundreds of times with invented
-        /// questions and leave no trace in the log. Combines with
-        /// `--actor`; neither flag changes anything about the default
-        /// behaviour (actor "hook", delivery recorded) when left off.
+        /// questions and leave no trace in the log. Nothing in the store's
+        /// directory changes either: the store is opened read-only and no
+        /// state file beside it (evaluation accrual, watermarks, markers) is
+        /// written - see `serve::store_dir`. Combines with `--actor`;
+        /// neither flag changes anything about the default behaviour (actor
+        /// "hook", delivery recorded) when left off.
         #[arg(long)]
         no_record: bool,
     },
@@ -537,7 +540,7 @@ fn decay_notice(store: &EventStore, db: &Path, cwd: Option<&Path>) -> Option<Str
             &scanned_ids,
             next_seq.saturating_sub(1),
         ) {
-            let _ = std::fs::write(&stale_path, text);
+            let _ = serve::store_dir::write(&stale_path, text);
         }
     }
     if dead == 0 && failing == 0 {
@@ -560,7 +563,7 @@ fn decay_notice(store: &EventStore, db: &Path, cwd: Option<&Path>) -> Option<Str
     // go in - a dead anchor means a fact fires nowhere, which is bad but is
     // not evidence that it is wrong, and some of them are dead on purpose.
 
-    let _ = std::fs::write(&stamp, &today);
+    let _ = serve::store_dir::write(&stamp, &today);
     let doctor = sibling("doctor").unwrap_or_else(|| PathBuf::from("doctor"));
     let checkouts = root.parent().unwrap_or(&root);
     Some(format!(
@@ -1054,8 +1057,11 @@ mod resolve_session_id_tests {
 /// every one of the three `deliver::record_delivery*` calls below entirely -
 /// for a measurement run - while leaving everything else, stdout included,
 /// completely unaffected: `ids` is computed exactly as before either way,
-/// only the write itself is skipped.
+/// only the write itself is skipped. It also holds the store's directory
+/// read-only for the whole call (`serve::store_dir`), so no state file beside
+/// the store is written either and the store is opened read-only.
 fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_record: bool) -> Option<HookOutput> {
+    let _hold = no_record.then(|| serve::store_dir::hold(db_path));
     // `payload_text` is `Some` only when the caller already read stdin (see
     // `cmd_hook`'s `--diagnose` path, which has to read it to say anything
     // about it). stdin can only be consumed once, so it is read HERE for a
@@ -1211,7 +1217,7 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
         // Guard's own subagent behaviour (see the rule about a loop guard
         // blinding a whole hook, and `is_subagent`'s own doc comment above).
         if !is_subagent {
-            if let Some(reason) = EventStore::open_existing(db_path).ok().and_then(|s| setup_debt(&s)) {
+            if let Some(reason) = serve::store_dir::open_existing(db_path).ok().and_then(|s| setup_debt(&s)) {
                 return Some(HookOutput::Decision(
                     serde_json::json!({ "decision": "block", "reason": reason }),
                 ));
@@ -1260,7 +1266,7 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
         // asked for. Agents among themselves are not held by this; it
         // applies only to what is addressed to him.
         if !is_subagent {
-            if let Some(reason) = EventStore::open_existing(db_path)
+            if let Some(reason) = serve::store_dir::open_existing(db_path)
                 .ok()
                 .and_then(|s| crowding_debt(&s, db_path, &session_id, stop_project.as_deref()))
             {
@@ -1373,7 +1379,7 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
         if stop_project.is_some() {
             let now = time::now_unix();
             if !is_subagent {
-                if let Ok(store) = EventStore::open_existing(db_path) {
+                if let Ok(store) = serve::store_dir::open_existing(db_path) {
                     usefulness::update_eval_debt_state(&store, db_path, stop_project.as_deref(), now);
                     // A `Stop` event carries no tool call, so it is never
                     // itself an edit, a test/build command, or a compaction -
@@ -1421,7 +1427,7 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
         // agent run. Agents among themselves are not held by this debt; it
         // applies only to what is addressed to him.
         if !is_subagent {
-            if let Some(reason) = EventStore::open_existing(db_path)
+            if let Some(reason) = serve::store_dir::open_existing(db_path)
                 .ok()
                 .and_then(|s| judgement_debt(&s, db_path, &session_id, stop_project.as_deref()))
             {
@@ -1438,7 +1444,7 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
         // unchanged by today's fix: not one of the four debts it names, left
         // exactly as it already stood.
         if !is_subagent {
-            if let Some(reason) = EventStore::open_existing(db_path)
+            if let Some(reason) = serve::store_dir::open_existing(db_path)
                 .ok()
                 .filter(|_| teeth_not_yet_asked_this_session(db_path, &session_id))
                 .and_then(|s| teeth_debt(&s, db_path, stop_project.as_deref(), stop_root.as_deref()))
@@ -1533,7 +1539,7 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
         usefulness::record_hook_event(db_path, work_project.as_deref(), &session_id, false, time::now_unix(), event_kind);
     }
 
-    let mut store = EventStore::new(db_path).ok()?;
+    let mut store = serve::store_dir::open_for_hook(db_path)?;
 
     match event_name.as_str() {
         "SessionStart" => {
@@ -1931,7 +1937,7 @@ fn capture_flag(store: &thor_core::event_store::EventStore, db_path: &Path, sess
     else {
         return;
     };
-    let _ = std::fs::write(&marker_path, new_text);
+    let _ = serve::store_dir::write(&marker_path, new_text);
 }
 
 /// C2 (SPEC-ENFORCEMENT.md 2.2): the one Stop path allowed to open the
@@ -1964,7 +1970,7 @@ fn capture_stop_check(db_path: &Path, session_id: &str) -> Option<HookOutput> {
     let mut markers = capture::read_markers(&marker_text);
     let marker = markers.get(session_id)?.clone();
 
-    let store = thor_core::event_store::EventStore::open_existing(db_path).ok()?;
+    let store = serve::store_dir::open_existing(db_path).ok()?;
     let kinds: Vec<_> = store.events_since(marker.seq_at_flag).ok()?.into_iter().map(|e| e.kind).collect();
     let paid = capture::debt_paid(&kinds);
 
@@ -1994,7 +2000,7 @@ fn capture_stop_check(db_path: &Path, session_id: &str) -> Option<HookOutput> {
         }
     }
     if let Ok(text) = serde_json::to_string(&markers) {
-        let _ = std::fs::write(&marker_path, text);
+        let _ = serve::store_dir::write(&marker_path, text);
     }
 
     match verdict {
@@ -2074,7 +2080,7 @@ fn watermark_path(db: &Path) -> std::path::PathBuf {
 /// cannot be written means the crowding debt stays quiet, never that a turn
 /// breaks.
 fn record_session_watermark(db_path: &Path, session_id: &str) {
-    let Ok(store) = EventStore::open_existing(db_path) else { return };
+    let Ok(store) = serve::store_dir::open_existing(db_path) else { return };
     let Ok((tip, _)) = store.contiguous_tip() else { return };
     let path = watermark_path(db_path);
     let mut marks: std::collections::BTreeMap<String, i64> = std::fs::read_to_string(&path)
@@ -2085,7 +2091,7 @@ fn record_session_watermark(db_path: &Path, session_id: &str) {
     // twice (a resume, a compact) must not forgive what was written between.
     marks.entry(session_id.to_string()).or_insert(tip);
     if let Ok(text) = serde_json::to_string(&marks) {
-        let _ = std::fs::write(&path, text);
+        let _ = serve::store_dir::write(&path, text);
     }
 }
 
@@ -2179,7 +2185,7 @@ fn record_teeth_asked(db: &Path, session_id: &str) {
     // Keep the tail only: this file is a set of recent sessions, not history.
     let kept: Vec<&str> = text.lines().rev().take(200).collect();
     let trimmed: String = kept.into_iter().rev().collect::<Vec<_>>().join("\n");
-    let _ = std::fs::write(&path, format!("{trimmed}\n"));
+    let _ = serve::store_dir::write(&path, format!("{trimmed}\n"));
 }
 
 /// How many unanswered rules one turn is asked about at once.
@@ -2371,7 +2377,7 @@ fn record_teeth_items_asked<'a>(db: &Path, ids: impl Iterator<Item = &'a str>) {
     }
     let lines: Vec<&str> = text.lines().collect();
     let kept = &lines[lines.len().saturating_sub(2000)..];
-    let _ = std::fs::write(&path, format!("{}\n", kept.join("\n")));
+    let _ = serve::store_dir::write(&path, format!("{}\n", kept.join("\n")));
 }
 
 /// Does this item ACTUALLY reach a block at one of its own bindings, as the
@@ -3154,7 +3160,7 @@ fn capture_sink_check(
 /// Head-neutral either way, so neither can ever create or move an item.
 fn record_gate(db_path: &Path, session_id: &str, refused: bool, subject: &str, target: &str) {
     let rule_id = subject.to_string();
-    let Ok(mut store) = thor_core::event_store::EventStore::open_existing(db_path) else { return };
+    let Ok(mut store) = serve::store_dir::open_existing(db_path) else { return };
     deliver::record_gate_outcome(
         &mut store,
         session_id,
@@ -3262,7 +3268,7 @@ fn absent_guard_block(
     let repeat = absent_guard::already_blocked(&markers, session_id, &attempt);
     if !repeat {
         if let Some(text) = absent_guard::mark_blocked_text(marker_text.as_deref(), session_id, &attempt) {
-            let _ = std::fs::write(&marker_path, text);
+            let _ = serve::store_dir::write(&marker_path, text);
         }
     }
     let reason = if repeat { absent_guard::escalated(&reason) } else { reason };
@@ -3311,7 +3317,7 @@ fn record_absent_guard_staleness(
     let stale_path = absent_guard::default_stale_path(db_path);
     let existing = std::fs::read_to_string(&stale_path).ok();
     if let Some(text) = absent_guard::record_stale_text(existing.as_deref(), &findings, &scanned, now_seq) {
-        let _ = std::fs::write(&stale_path, text);
+        let _ = serve::store_dir::write(&stale_path, text);
     }
 }
 
@@ -3624,7 +3630,7 @@ fn command_guard_block(
     let repeat = absent_guard::already_blocked(&markers, session_id, &attempt);
     if !repeat {
         if let Some(text) = absent_guard::mark_blocked_text(marker_text.as_deref(), session_id, &attempt) {
-            let _ = std::fs::write(&marker_path, text);
+            let _ = serve::store_dir::write(&marker_path, text);
         }
     }
     let reason = if repeat { absent_guard::escalated(&reason) } else { reason };
@@ -3655,7 +3661,7 @@ fn record_command_guard_staleness(
     let stale_path = absent_guard::default_stale_path(db_path);
     let existing = std::fs::read_to_string(&stale_path).ok();
     if let Some(text) = absent_guard::record_stale_text(existing.as_deref(), &findings, &scanned, now_seq) {
-        let _ = std::fs::write(&stale_path, text);
+        let _ = serve::store_dir::write(&stale_path, text);
     }
 }
 
@@ -3713,7 +3719,7 @@ fn stale_guard_stop_check(db_path: &Path, session_id: &str) -> Option<HookOutput
         return None;
     }
 
-    let store = thor_core::event_store::EventStore::open_existing(db_path).ok()?;
+    let store = serve::store_dir::open_existing(db_path).ok()?;
     let mut settled_ids = std::collections::HashSet::new();
     for (id, record) in &stale {
         let events = store.get_events_by_entity(id).ok()?;
@@ -3743,7 +3749,7 @@ fn stale_guard_stop_check(db_path: &Path, session_id: &str) -> Option<HookOutput
 
     let reason = stale_guard::block_message(&remaining);
     if let Some(text) = stale_guard::mark_blocked_text(marker_text.as_deref(), session_id) {
-        let _ = std::fs::write(&marker_path, text);
+        let _ = serve::store_dir::write(&marker_path, text);
     }
 
     Some(HookOutput::Decision(serde_json::json!({
@@ -5717,7 +5723,7 @@ fn hook_preflight(raw: &str, db_path: &Path) -> Result<(), String> {
  if !db_path.exists() {
  return Err(format!("could not look: there is no memory at {}", db_path.display()));
  }
- if let Err(e) = EventStore::open_existing(db_path) {
+ if let Err(e) = serve::store_dir::open_existing(db_path) {
  return Err(format!("could not look: the memory at {} would not open ({e})", db_path.display()));
  }
  Ok(())
@@ -6097,6 +6103,9 @@ fn cmd_hook(db_path: &Path, diagnose: bool, actor: Option<String>, no_record: bo
  }
  std::process::exit(0);
  }
+ // `--no-record` holds the store's directory for the whole call, the
+ // diagnosing open below included - see `serve::store_dir`.
+ let _hold = no_record.then(|| serve::store_dir::hold(db_path));
  // Read stdin HERE only for the diagnosing path, which has to inspect the
  // payload before the surfaces run; a normal run lets `hook_once` read it,
  // exactly as before.

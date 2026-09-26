@@ -1504,7 +1504,7 @@ pub fn update_eval_debt_state(store: &EventStore, db: &Path, project: Option<&st
     }
     all.insert(key, entry.clone());
     if let Ok(text) = serde_json::to_string(&all) {
-        let _ = std::fs::write(eval_debt_state_path(db), text);
+        let _ = crate::store_dir::write(&eval_debt_state_path(db), text);
     }
     entry
 }
@@ -1536,7 +1536,7 @@ pub fn record_eval_debt_asked(db: &Path, project: Option<&str>, now_unix: i64) {
     entry.first_asked_since_report.get_or_insert(now_unix);
     all.insert(key, entry);
     if let Ok(text) = serde_json::to_string(&all) {
-        let _ = std::fs::write(eval_debt_state_path(db), text);
+        let _ = crate::store_dir::write(&eval_debt_state_path(db), text);
     }
 }
 
@@ -1622,7 +1622,7 @@ pub fn record_hook_event(
     entry.sessions.insert(session_id.to_string(), after.clone());
     all.insert(key, entry);
     if let Ok(text) = serde_json::to_string(&all) {
-        let _ = std::fs::write(eval_debt_state_path(db), text);
+        let _ = crate::store_dir::write(&eval_debt_state_path(db), text);
     }
     Some(after)
 }

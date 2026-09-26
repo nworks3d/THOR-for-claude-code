@@ -534,6 +534,38 @@ pub struct EventStore {
     conn: Connection,
 }
 
+/// A `file:` URI for `path` with `immutable=1` (see `EventStore::open_read_only`).
+/// Only the characters a URI gives a meaning of its own are escaped; on Windows
+/// a backslash becomes a slash and an extended-length `\\?\` prefix is dropped,
+/// because SQLite reads `file:///C:/...` as the local path `C:/...`.
+fn immutable_uri(path: &Path) -> String {
+    let mut raw = path.to_string_lossy().into_owned();
+    if cfg!(windows) {
+        if let Some(rest) = raw.strip_prefix(r"\\?\") {
+            raw = rest.to_string();
+        }
+        raw = raw.replace('\\', "/");
+    }
+    let mut encoded = String::with_capacity(raw.len() + 16);
+    for c in raw.chars() {
+        match c {
+            '%' => encoded.push_str("%25"),
+            '?' => encoded.push_str("%3F"),
+            '#' => encoded.push_str("%23"),
+            ' ' => encoded.push_str("%20"),
+            _ => encoded.push(c),
+        }
+    }
+    let prefix = if encoded.starts_with('/') {
+        "file://"
+    } else if path.is_absolute() {
+        "file:///"
+    } else {
+        "file:"
+    };
+    format!("{prefix}{encoded}?immutable=1")
+}
+
 impl EventStore {
     pub fn new(path: &Path) -> SqlResult<Self> {
         let conn = Connection::open(path)?;
@@ -604,6 +636,40 @@ impl EventStore {
         // so it holds within this constructor's own "never changes what is
         // in it" guarantee.
         conn.execute_batch("PRAGMA journal_size_limit = 67108864")?;
+        Ok(EventStore { conn })
+    }
+
+    /// Open an EXISTING store so that nothing in its directory changes: no
+    /// create, no schema work, no checkpoint, and no write can succeed (the
+    /// connection itself is read-only, so an append fails instead of landing).
+    /// For a caller that promised to leave no trace (`serve hook --no-record`).
+    ///
+    /// WHY TWO SHAPES. A read-only SQLite connection to a WAL-mode store still
+    /// creates the `-wal` and `-shm` companions when they are missing, and
+    /// leaves them behind (measured 2026-09-26 on a closed copy: two new files
+    /// after one read). So:
+    /// - no `-wal` beside the store: nothing is writing to it right now and
+    ///   every committed page is in the main file, so it is opened
+    ///   `immutable` - read straight from the file, no companion created. The
+    ///   price, stated rather than hidden: a writer that starts DURING this
+    ///   read is not seen, and in the worst case the read fails, which a
+    ///   hook caller treats as "nothing to say".
+    /// - a `-wal` present: another connection is live (or one was copied along
+    ///   with the store), so the companions already exist and are read
+    ///   through normally. Every reader of a live WAL store takes its read
+    ///   lock in the `-shm` index; that is SQLite's own coordination file,
+    ///   not store content, and it is the one file a read can still touch.
+    pub fn open_read_only(path: &Path) -> anyhow::Result<Self> {
+        anyhow::ensure!(path.is_file(), "no THOR store at {} - a read-only open never creates one", path.display());
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let mut wal = path.as_os_str().to_owned();
+        wal.push("-wal");
+        let conn = if Path::new(&wal).exists() {
+            Connection::open_with_flags(path, flags)?
+        } else {
+            Connection::open_with_flags(immutable_uri(path), flags)?
+        };
+        conn.busy_timeout(Duration::from_secs(5))?;
         Ok(EventStore { conn })
     }
 
@@ -2228,6 +2294,75 @@ mod tests {
 
         let store = EventStore::open_existing(&db_path).unwrap();
         expect_cap(&store.conn, "open_existing()");
+    }
+
+    /// Every file in `dir`, by name, with its full contents.
+    fn dir_snapshot(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.is_file())
+            .map(|p| (p.file_name().unwrap().to_string_lossy().into_owned(), std::fs::read(&p).unwrap()))
+            .collect()
+    }
+
+    /// THE DEFECT THIS PREVENTS: a read-only SQLite connection to a closed
+    /// WAL-mode store creates `-wal` and `-shm` beside it and leaves them there,
+    /// so a caller that promised to change nothing in the store's directory
+    /// still changed it. The directory also carries a space and a `#`, the two
+    /// characters a hand-built URI most often gets wrong.
+    #[test]
+    fn a_read_only_open_of_a_closed_store_changes_nothing_in_its_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("a store #1");
+        std::fs::create_dir(&sub).unwrap();
+        let db_path = sub.join("ro.db");
+        let mut store = EventStore::new(&db_path).unwrap();
+        store.append_event("s", "l", "t", EventKind::FactCreated, "P:a", None, "a v1").unwrap();
+        drop(store);
+        let before = dir_snapshot(&sub);
+        assert_eq!(before.len(), 1, "fixture sanity: a closed store is one file: {:?}", before.keys());
+
+        let mut ro = EventStore::open_read_only(&db_path).unwrap();
+        assert_eq!(ro.get_next_seq().unwrap(), 2, "the read must see what was written");
+        assert!(
+            ro.append_event("s", "l", "t", EventKind::FactCreated, "P:b", None, "b v1").is_err(),
+            "a read-only store must refuse an append rather than take it"
+        );
+        drop(ro);
+
+        assert_eq!(dir_snapshot(&sub), before, "the store's directory must be byte-identical after a read-only open");
+    }
+
+    /// With a live writer (a `-wal` on disk) the read goes through the WAL, so
+    /// it sees what is committed there but not yet in the main file, and it
+    /// leaves the main file and the WAL exactly as they were.
+    #[test]
+    fn a_read_only_open_beside_a_live_writer_sees_the_wal_and_changes_neither_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("live.db");
+        let mut writer = EventStore::new(&db_path).unwrap();
+        writer.conn.execute_batch("PRAGMA wal_autocheckpoint = 0").unwrap();
+        writer.append_event("s", "l", "t", EventKind::FactCreated, "P:a", None, "a v1").unwrap();
+        let main_before = std::fs::read(&db_path).unwrap();
+        let wal_path = dir.path().join("live.db-wal");
+        let wal_before = std::fs::read(&wal_path).unwrap();
+
+        let ro = EventStore::open_read_only(&db_path).unwrap();
+        assert_eq!(ro.get_next_seq().unwrap(), 2, "the committed event lives in the WAL and must be seen");
+        drop(ro);
+
+        assert_eq!(std::fs::read(&db_path).unwrap(), main_before, "the main file must not change");
+        assert_eq!(std::fs::read(&wal_path).unwrap(), wal_before, "the WAL must not change");
+        drop(writer);
+    }
+
+    #[test]
+    fn a_read_only_open_never_creates_a_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("missing.db");
+        assert!(EventStore::open_read_only(&db_path).is_err());
+        assert!(!db_path.exists(), "a read-only open must never create the file");
     }
 
     /// The projection tables must equal the cas fold after EVERY append,
