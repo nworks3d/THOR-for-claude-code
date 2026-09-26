@@ -1446,12 +1446,22 @@ pub const OWNER_SETUP_ANSWERS_ID: &str = "owner-setup-answers";
 // anything by existing.
 //
 // Three conditions, all of them per-project: the project's judgement debt is
-// zero, every heavy (irreversible/costly) Rule or Orientation that fired in
-// this project since the PREVIOUS report carries one of the four reserved
-// `TEETH_*_TAG`s (Change 2's own box - proven, informing, refuses-legitimate,
-// anchor-collapsed all count; only a missing box blocks), and every open
-// point (see below) older than the previous report is either closed
-// (retracted) or has been carried forward exactly once.
+// zero, every heavy (irreversible/costly) Rule or Orientation that applies to
+// this project and has fired since the PREVIOUS report carries one of the
+// four reserved `TEETH_*_TAG`s (Change 2's own box - proven, informing,
+// refuses-legitimate, anchor-collapsed all count; only a missing box blocks),
+// and every open point (see below) older than the previous report is either
+// closed (retracted) or has been carried forward exactly once.
+//
+// WHAT "PER-PROJECT" MEANS FOR THE FIRST TWO. An item applies to a project
+// when it names that project or names none at all (global) - the same
+// `applies_to` rule judgement debt has always used. A firing is counted
+// wherever it happened: an `ItemServed` event records when an item fired and
+// on what trigger, never in which project, so "fired in this project" is not
+// a question the log can answer, and a gate that claims to compute everything
+// from the log must not pretend it can. A global heavy rule that fired in
+// another checkout therefore also holds this project's report until it
+// carries a box - one revise, or one backfill run, settles it everywhere.
 
 /// The tag `EVALUATION_REPORT_TAG`-carrying `Report`s already used
 /// (`serve::usefulness::evaluation_report_ids` matches the identical string
@@ -1728,7 +1738,8 @@ fn check_evaluation_report_filing(store: &EventStore, item: &Item) -> Option<Ref
     let owed = judgement_debt_in_project(store, project);
     if owed > 0 {
         missing.push(format!(
-            "{owed} item(s) in this project still owe a judgement (served {JUDGEMENT_DEBT_AFTER}+ times since \
+            "{owed} item(s) that apply to this project (its own or global) still owe a judgement (served \
+             {JUDGEMENT_DEBT_AFTER}+ times since \
              their last verdict) - settle each with mcp__thor__mark(id: \"<id>\") or mcp__thor__mark(id: \"<id>\", \
              noise: true); doctor's own `judgement debt` line names them"
         ));
@@ -1739,7 +1750,8 @@ fn check_evaluation_report_filing(store: &EventStore, item: &Item) -> Option<Ref
     if !unboxed.is_empty() {
         let named = unboxed.iter().map(|id| format!("'{id}'")).collect::<Vec<_>>().join(", ");
         missing.push(format!(
-            "{} heavy rule(s) fired in this project since the previous report and still carry no machine-tested \
+            "{} heavy rule(s) that apply to this project (its own or global) have fired since the previous report \
+             - the log records when a rule fired, never in which project - and still carry no machine-tested \
              teeth box: {named} - revise each one (even with no other field changed, so the write path tries its \
              teeth again) or run the backfill maintenance pass against this store",
             unboxed.len()
@@ -3808,6 +3820,38 @@ mod tests {
         let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
         assert!(refusal.problem.contains("unboxed-heavy"), "{}", refusal.problem);
         assert!(refusal.problem.contains("no machine-tested"), "{}", refusal.problem);
+    }
+
+    /// THE SCOPE THIS CONDITION ACTUALLY HAS, stated where it is enforced. An
+    /// `ItemServed` event records when an item fired and on what trigger,
+    /// never in which project, so "fired in this project" is not something
+    /// the log can answer. What the gate counts is every heavy rule that
+    /// APPLIES to the project (its own, and global ones - the same
+    /// `applies_to` rule judgement debt uses) and has fired since the
+    /// previous report. A global rule is therefore named here too, and the
+    /// refusal must say that scope instead of claiming the rule fired here.
+    #[test]
+    fn a_fired_global_heavy_rule_blocks_filing_and_the_refusal_names_the_scope_it_really_counts() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "s", "l", "a", &eval_report("eval-g-old", "g")).unwrap();
+        let mut global = heavy_command_rule("global-heavy", "g");
+        global.project = None;
+        declare(&mut store, "s", "l", "a", &global).unwrap();
+        serve_n(&mut store, "global-heavy", "hook", 1);
+
+        let err = declare(&mut store, "s", "l", "a", &eval_report("eval-g-new", "g")).unwrap_err();
+        let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
+        assert!(refusal.problem.contains("global-heavy"), "a global rule applies here too: {}", refusal.problem);
+        assert!(
+            refusal.problem.contains("apply to this project (its own or global)"),
+            "the refusal must name the scope it really counts: {}",
+            refusal.problem
+        );
+        assert!(
+            !refusal.problem.contains("fired in this project"),
+            "the log cannot tell where a rule fired, so the refusal must not claim it: {}",
+            refusal.problem
+        );
     }
 
     #[test]
