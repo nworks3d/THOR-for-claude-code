@@ -81,10 +81,15 @@ fn main() {
     // `resolve_code_index` above already makes about the working directory.
     // An HTTP connector has no meaningful working directory, so it gets none.
     let root = std::env::current_dir().ok().and_then(|cwd| serve::project::git_root(&cwd));
+    // When that directory is a linked worktree, `root` above is its MAIN
+    // checkout; the worktree itself is kept too, so a check that holds only
+    // here can be refused before it is written (see `mcp`'s own
+    // `refuse_a_worktree_only_check`).
+    let worktree = std::env::current_dir().ok().and_then(|cwd| serve::project::linked_worktree_root(&cwd));
 
     let result = match cli.http {
         Some(bind) => mcp::run_http(&cli.db, &bind, code, cli.capture_inbox, cli.allowed_hosts),
-        None => mcp::run_in(&cli.db, code, root),
+        None => mcp::run_in(&cli.db, code, root, worktree),
     };
     if let Err(e) = result {
         eprintln!("mcp: fatal: {e}");

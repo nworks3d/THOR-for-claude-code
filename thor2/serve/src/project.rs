@@ -164,6 +164,49 @@ pub fn git_root(start_dir: &Path) -> Option<std::path::PathBuf> {
     None
 }
 
+/// The root of the LINKED WORKTREE `start_dir` sits in - the directory that
+/// carries the `.git` file - or `None` when the nearest `.git` above it is a
+/// real repository (a directory) or a file this does not recognise as a
+/// worktree pointer.
+///
+/// Exists for the one question `git_root` deliberately hides: "is the place
+/// I am working in a worktree, and where is it". Every check is judged
+/// against the main checkout (`git_root`), which is what doctor and the
+/// commit gates see - and measured on 2026-09-26, a session attached a
+/// `contains` check to code that existed only in its own worktree: stored
+/// without complaint, it then blocked every commit on main for eleven
+/// minutes. A caller that knows the worktree can refuse that before it is
+/// written (the tool server's `remember`/`revise`).
+pub fn linked_worktree_root(start_dir: &Path) -> Option<std::path::PathBuf> {
+    let mut dir: Option<&Path> = Some(start_dir);
+    while let Some(d) = dir {
+        let dot_git = d.join(".git");
+        if dot_git.is_dir() {
+            return None;
+        }
+        if dot_git.is_file() {
+            return main_root_of_worktree(&dot_git).map(|_| d.to_path_buf());
+        }
+        dir = d.parent();
+    }
+    None
+}
+
+/// The checkout a directory of checkouts should be judged as: the main
+/// repository for a linked worktree's root, the directory itself otherwise.
+/// Never walks upward - only a directory whose OWN `.git` is a worktree
+/// pointer is redirected, so a plain folder is never swapped for some
+/// unrelated repository above it.
+pub fn checkout_for(dir: &Path) -> std::path::PathBuf {
+    let dot_git = dir.join(".git");
+    if dot_git.is_file() {
+        if let Some(main) = main_root_of_worktree(&dot_git) {
+            return main;
+        }
+    }
+    dir.to_path_buf()
+}
+
 /// The main repository root a linked worktree points at, read from its `.git`
 /// file. `None` for any shape this does not recognise, so the caller keeps
 /// the old answer instead of inventing one.
@@ -380,6 +423,28 @@ mod tests {
 ", gitdir.display())).unwrap();
 
         assert_eq!(resolve_project(&wt).as_deref(), Some("Real-Project"));
+    }
+
+    /// The worktree itself is still findable - the one thing `git_root`
+    /// hides on purpose - and a directory of checkouts judges it as its main
+    /// checkout. A real repository is never mistaken for a worktree.
+    #[test]
+    fn a_worktree_is_found_as_itself_and_judged_as_its_main_checkout() {
+        let dir = tempdir();
+        let main = dir.path().join("acme-shop");
+        fs::create_dir_all(main.join(".git").join("worktrees").join("slug")).unwrap();
+        let wt = dir.path().join("slug");
+        fs::create_dir_all(wt.join("src")).unwrap();
+        let gitdir = main.join(".git").join("worktrees").join("slug");
+        fs::write(wt.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+
+        assert_eq!(linked_worktree_root(&wt.join("src")).as_deref(), Some(wt.as_path()));
+        assert_eq!(linked_worktree_root(&main), None, "a real repository is not a worktree");
+        assert_eq!(checkout_for(&wt), main, "judged as its main checkout");
+        assert_eq!(checkout_for(&main), main);
+        let plain = dir.path().join("plain");
+        fs::create_dir_all(&plain).unwrap();
+        assert_eq!(checkout_for(&plain), plain, "a plain folder is never swapped for anything");
     }
 
     /// A `.git` file this does not recognise must never make things worse

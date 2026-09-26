@@ -488,6 +488,21 @@ pub fn declare_in(
     item: &Item,
     root: Option<&Path>,
 ) -> Result<Event, WriteError> {
+    declare_in_scoped(store, session_id, lineage_id, actor, item, root, None)
+}
+
+/// `declare_in`, for a write that may FILE an evaluation report: `scope`
+/// says which session files it and where its evaluation started (see
+/// `EvaluationScope`). Every other write passes `None` and is untouched.
+pub fn declare_in_scoped(
+    store: &mut EventStore,
+    session_id: &str,
+    lineage_id: &str,
+    actor: &str,
+    item: &Item,
+    root: Option<&Path>,
+    scope: Option<&EvaluationScope>,
+) -> Result<Event, WriteError> {
     if let Some(root) = root {
         // A `Contains`/`Absent`/`AbsentAll` check_path may now name a
         // DIRECTORY (see `Check::Absent`'s own doc comment) - checked ONLY
@@ -531,7 +546,7 @@ pub fn declare_in(
             }));
         }
     }
-    declare(store, session_id, lineage_id, actor, item)
+    declare_scoped(store, session_id, lineage_id, actor, item, scope)
 }
 
 pub fn declare(
@@ -540,6 +555,18 @@ pub fn declare(
     lineage_id: &str,
     actor: &str,
     item: &Item,
+) -> Result<Event, WriteError> {
+    declare_scoped(store, session_id, lineage_id, actor, item, None)
+}
+
+/// `declare`, with the evaluation scope `declare_in_scoped` describes.
+pub fn declare_scoped(
+    store: &mut EventStore,
+    session_id: &str,
+    lineage_id: &str,
+    actor: &str,
+    item: &Item,
+    scope: Option<&EvaluationScope>,
 ) -> Result<Event, WriteError> {
     let item = normalized(item);
     gate::declare(&item).map_err(WriteError::Refused)?;
@@ -590,7 +617,7 @@ pub fn declare(
     // THE EVALUATION-FILING GATE (2026-09-25) - see this file's own
     // "evaluation obligation" section, right above `OWNER_SETUP_ANSWERS_ID`.
     // A no-op for every write that is not itself an evaluation report.
-    if let Some(refusal) = check_evaluation_report_filing(store, &item) {
+    if let Some(refusal) = check_evaluation_report_filing(store, &item, scope) {
         return Err(WriteError::Refused(refusal));
     }
     let body = canonical_body(&item).map_err(WriteError::Serialize)?;
@@ -638,7 +665,7 @@ pub fn revise(
     // moment) - exactly the same "moment, not the item's whole life"
     // distinction `declare` itself draws.
     if newly_filed_as_evaluation(&existing, &updated) {
-        if let Some(refusal) = check_evaluation_report_filing(store, &updated) {
+        if let Some(refusal) = check_evaluation_report_filing(store, &updated, None) {
             return Err(WriteError::Refused(refusal));
         }
     }
@@ -692,6 +719,23 @@ pub fn revise_because(
     before: &Item,
     because: Option<&str>,
 ) -> Result<Event, WriteError> {
+    revise_because_scoped(store, session_id, lineage_id, actor, existing, updated, before, because, None)
+}
+
+/// `revise_because`, with the evaluation scope `declare_in_scoped`
+/// describes - for a revise that files an evaluation report.
+#[allow(clippy::too_many_arguments)]
+pub fn revise_because_scoped(
+    store: &mut EventStore,
+    session_id: &str,
+    lineage_id: &str,
+    actor: &str,
+    existing: &Item,
+    updated: &Item,
+    before: &Item,
+    because: Option<&str>,
+    scope: Option<&EvaluationScope>,
+) -> Result<Event, WriteError> {
     let existing = normalized(existing);
     let updated = normalized(updated);
     let before = normalized(before);
@@ -710,7 +754,7 @@ pub fn revise_because(
     // cleared baseline (see this function's own doc comment) whose project
     // was blanked on purpose.
     if newly_filed_as_evaluation(&before, &updated) {
-        if let Some(refusal) = check_evaluation_report_filing(store, &updated) {
+        if let Some(refusal) = check_evaluation_report_filing(store, &updated, scope) {
             return Err(WriteError::Refused(refusal));
         }
     }
@@ -1610,16 +1654,15 @@ fn served_since_last_verdict_local(store: &EventStore) -> HashMap<String, usize>
     counts
 }
 
-/// How many live, non-pinned items THIS project owes a verdict on right now
-/// - mirrors `serve::usefulness::judgement_debt_counts`'s own `in_project`
-/// half exactly (threshold, pinned exclusion, project scoping all
+/// How many live, non-pinned items THIS project owes a verdict on right now,
+/// store-wide - mirrors `serve::usefulness::judgement_debt_counts`'s own
+/// `in_project` half exactly (threshold, pinned exclusion, project scoping all
 /// identical), reimplemented for the identical reason every other function
-/// in this section is.
-/// NAMED, not counted (2026-09-26): the ids themselves, sorted, so the filing
-/// refusal can hand a writer the exact list to judge instead of sending them
-/// to another tool to find it - a refusal that only counts is a refusal that
-/// gets answered by marking whatever comes to hand.
-fn judgement_debt_in_project(store: &EventStore, project: Option<&str>) -> Vec<String> {
+/// in this section is. No longer what the filing gate refuses on (see
+/// `evaluation_judgement_owed` below); kept as the store-wide count the
+/// filing receipt reports, so a report that files is still told how much
+/// stays owed elsewhere.
+pub fn judgement_debt_in_project(store: &EventStore, project: Option<&str>) -> Vec<String> {
     let served = served_since_last_verdict_local(store);
     let live = all_live_items(store);
     let live_by_id: HashMap<&str, &Item> = live.iter().map(|(id, it)| (id.as_str(), it)).collect();
@@ -1633,6 +1676,161 @@ fn judgement_debt_in_project(store: &EventStore, project: Option<&str>) -> Vec<S
         .collect();
     owed.sort();
     owed
+}
+
+/// Which evaluation a filing belongs to: the session that runs it, and the
+/// log position at which it started.
+///
+/// WHY THE FILING GATE NEEDS THIS (2026-09-26). The judgement condition used
+/// to be computed live and store-wide at every filing attempt. Measured in a
+/// fresh evaluation that day: a session filed its report eight times and was
+/// refused eight times, each time on a different, growing list (14, 6, 13, 4,
+/// 4, 1, 5, 4). Two things fed it. The rules bound to the `remember` moment
+/// fire on every one of the evaluation's own writes, so the evaluation pushed
+/// items over the threshold by doing its work; and parallel sessions in the
+/// same repository did the same, for items this session never saw fire. It
+/// ended up marking sixty items useful against two noise, including items it
+/// had never seen - the exact false record the verdict exists to prevent.
+///
+/// So the set a report must settle is fixed when its evaluation STARTS, the
+/// same way the teeth batch is fixed by the previous report, and it holds only
+/// what fired in the evaluating session itself. The log already records the
+/// session of every firing (the hook stamps it); what it cannot record is
+/// which session is FILING, because every write through the tool server is
+/// stamped with one shared constant. The hook knows, and hands it over in a
+/// small sidecar (`serve::eval_session`); the tool server reads that back and
+/// passes it in here. `None` - no hook record of the filing at all - means no
+/// session is known, and then no verdict can honestly be demanded: a session
+/// the hook never saw has no firings on record either. The store-wide debt
+/// stays with doctor and the Stop hook's own per-turn ask either way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvaluationScope {
+    /// The Claude Code session id the hook stamped on this session's firings.
+    pub session_id: String,
+    /// The highest log seq that existed when the evaluation started. Nothing
+    /// after it can add to the set this report must settle.
+    pub started_seq: i64,
+}
+
+/// The tag an evaluation report carries for one item it could not judge,
+/// shaped `not-judgeable:<id>:<reason>`. The explicit "when in doubt, skip"
+/// the evaluation routine asks for: a guessed verdict is worse than none, so
+/// a skip with a reason settles the item for THIS filing, and the item stays
+/// owed store-wide, where doctor and the Stop hook keep asking about it.
+pub const NOT_JUDGEABLE_TAG_PREFIX: &str = "not-judgeable:";
+
+/// How long a `not-judgeable` reason must be, trimmed. A reason, not a
+/// placeholder: "no" or "skip" say nothing a reader could check.
+pub const NOT_JUDGEABLE_REASON_MIN_CHARS: usize = 12;
+
+/// The reason `tags` gives for skipping `id`, when it gives one long enough
+/// to count (`NOT_JUDGEABLE_REASON_MIN_CHARS`). Matched against the id as a
+/// whole, so an id that itself contains a colon still parses.
+pub fn not_judgeable_reason<'a>(tags: &'a [String], id: &str) -> Option<&'a str> {
+    tags.iter().find_map(|t| {
+        let reason = t.strip_prefix(NOT_JUDGEABLE_TAG_PREFIX)?.strip_prefix(id)?.strip_prefix(':')?.trim();
+        (reason.chars().count() >= NOT_JUDGEABLE_REASON_MIN_CHARS).then_some(reason)
+    })
+}
+
+/// The judgement half of one evaluation's filing: every item this evaluation
+/// must settle, and whether each one already is.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EvaluationJudgement {
+    /// Still owed: fired in this session before the evaluation started, 40+
+    /// times since its last verdict as of that moment, no verdict since, and
+    /// not skipped with a reason.
+    pub owed: Vec<String>,
+    /// Given a verdict since the evaluation started, or no longer live.
+    pub settled: Vec<String>,
+    /// Skipped with a `not-judgeable` reason on the report being filed.
+    pub skipped: Vec<String>,
+}
+
+/// The set one evaluation must settle (see `EvaluationScope`), split by
+/// state. `report_tags` are the tags of the report being filed - only its
+/// `not-judgeable` entries are read. FAILS OPEN to an empty result on an
+/// unreadable log, the same stance `all_live_items` takes.
+///
+/// THE SET, computed from the log alone: an item belongs to it when, counting
+/// only events at or before `scope.started_seq`, it had fired
+/// `JUDGEMENT_DEBT_AFTER`+ times (assistant deliveries only, exactly as the
+/// store-wide debt counts) since its own last verdict, AND it fired in
+/// `scope.session_id` at least once at or before the start - the same "was
+/// the reader being asked ever in the room" test the Stop hook's own per-turn
+/// ask applies (`EventStore::served_ids_in_session`). It must also still be live, still apply to `project`
+/// and still not be pinned. A firing after the start never adds anything,
+/// whichever session it came from, which is what keeps the evaluation's own
+/// writes - and every rule bound to the `remember` moment they fire - from
+/// growing the list while it is being paid.
+pub fn evaluation_judgement_owed(
+    store: &EventStore,
+    project: Option<&str>,
+    scope: &EvaluationScope,
+    report_tags: &[String],
+) -> EvaluationJudgement {
+    let Ok(events) = store.firings_and_verdicts() else { return EvaluationJudgement::default() };
+    let mut count_at_start: HashMap<&str, usize> = HashMap::new();
+    let mut fired_here: HashSet<&str> = HashSet::new();
+    let mut judged_after: HashSet<&str> = HashSet::new();
+    for (seq, kind, id, actor, session) in &events {
+        let after = *seq > scope.started_seq;
+        match kind {
+            EventKind::ItemServed if !after && actor == ASSISTANT_DELIVERY_ACTOR => {
+                *count_at_start.entry(id.as_str()).or_default() += 1;
+                if *session == scope.session_id {
+                    fired_here.insert(id.as_str());
+                }
+            }
+            EventKind::ItemMarkedUseful | EventKind::ItemMarkedNoise => {
+                if after {
+                    judged_after.insert(id.as_str());
+                } else {
+                    count_at_start.insert(id.as_str(), 0);
+                }
+            }
+            _ => {}
+        }
+    }
+    let live = all_live_items(store);
+    let live_by_id: HashMap<&str, &Item> = live.iter().map(|(id, it)| (id.as_str(), it)).collect();
+    let mut result = EvaluationJudgement::default();
+    let mut ids: Vec<&str> = count_at_start
+        .iter()
+        .filter(|(id, count)| **count >= JUDGEMENT_DEBT_AFTER && fired_here.contains(**id))
+        .map(|(id, _)| *id)
+        .collect();
+    ids.sort();
+    for id in ids {
+        let Some(item) = live_by_id.get(id) else {
+            // Retracted since: a verdict on something gone is no verdict,
+            // and nothing is left to ask about.
+            result.settled.push(id.to_string());
+            continue;
+        };
+        if item.bindings.iter().any(|b| matches!(b, Binding::Always)) || !project_applies_to(item.project.as_deref(), project) {
+            continue;
+        }
+        if judged_after.contains(id) {
+            result.settled.push(id.to_string());
+        } else if not_judgeable_reason(report_tags, id).is_some() {
+            result.skipped.push(id.to_string());
+        } else {
+            result.owed.push(id.to_string());
+        }
+    }
+    result
+}
+
+/// Every item whose history on the log shows a check was ever attached to it
+/// - the evidence `gate::teeth_answer_settles` needs before a no-literal
+/// reason can count (see its own "A REASON COUNTS ONLY AFTER A REAL TRY").
+/// Read from the stored bodies of the item's own writes: a check is only
+/// ever serialized as `"check":{`, never as a null, so an item that never
+/// carried one never matches. FAILS OPEN to an empty set, which only ever
+/// makes a reason count LESS, never more.
+pub fn ids_whose_check_was_tried(store: &EventStore) -> HashSet<String> {
+    store.ids_with_a_write_containing("\"check\":{").unwrap_or_default()
 }
 
 /// The highest creation seq among this project's own live evaluation
@@ -1752,6 +1950,13 @@ fn teeth_batch_since(store: &EventStore, project: Option<&str>, cutoff_seq: i64)
         }
     }
     let live = all_live_items(store);
+    // A no-literal reason counts only for an item whose history shows a
+    // check was tried (`gate::teeth_answer_settles`). Read once, from the
+    // same log, as of NOW, and used for the state at the cutoff too. That
+    // only matters for a rule that is settled now (an unsettled one takes
+    // its place either way), and such a rule then simply keeps no batch
+    // place - the same as any rule settled before the cutoff.
+    let tried = ids_whose_check_was_tried(store);
     // Every live open point of this project, lowercased once: a wired or
     // doubtful check is settled for THIS filing only when an open point
     // names it (see `teeth_state` below).
@@ -1771,14 +1976,15 @@ fn teeth_batch_since(store: &EventStore, project: Option<&str>, cutoff_seq: i64)
         .filter(|(id, _)| fired_after.contains(id))
         .filter_map(|(id, item)| {
             let named_in_open_point = open_point_texts.iter().any(|t| t.contains(&id.to_lowercase()));
-            let now = teeth_state(&item, named_in_open_point);
+            let check_tried = tried.contains(&id);
+            let now = teeth_state(&item, named_in_open_point, check_tried);
             // An item with no body at or before the cutoff did not exist then,
             // and one whose old body will not parse cannot prove it was
             // settled: both count as unsettled as of the cutoff.
             let settled_at_cutoff = body_by_cutoff
                 .get(id.as_str())
                 .and_then(|&i| parse_body(&events[i].body).ok())
-                .is_some_and(|then| teeth_state(&then, named_in_open_point).is_none());
+                .is_some_and(|then| teeth_state(&then, named_in_open_point, check_tried).is_none());
             if now.is_none() && settled_at_cutoff {
                 return None;
             }
@@ -1822,8 +2028,8 @@ fn teeth_batch_since(store: &EventStore, project: Option<&str>, cutoff_seq: i64)
 /// could be tried, which is the question, not an answer to it. Before this,
 /// ANY machine label settled the filing, so a maintenance pass that labelled
 /// every heavy rule "informing" lifted the gate for the whole store at once.
-fn teeth_state(item: &Item, named_in_open_point: bool) -> Option<&'static str> {
-    if item.tags.iter().any(|t| t == TEETH_PROVEN_TAG) || gate::teeth_answer_settles(item) {
+fn teeth_state(item: &Item, named_in_open_point: bool, check_tried: bool) -> Option<&'static str> {
+    if item.tags.iter().any(|t| t == TEETH_PROVEN_TAG) || gate::teeth_answer_settles(item, check_tried) {
         return None;
     }
     let doubtful = [TEETH_WIRED_TAG, TEETH_ANCHOR_COLLAPSED_TAG, TEETH_REFUSES_LEGITIMATE_TAG];
@@ -1943,23 +2149,34 @@ pub fn open_points(store: &EventStore, project: Option<&str>) -> Vec<OpenPoint> 
 /// function is cheap to make correct for a scopeless one too (every helper
 /// above already takes `Option<&str>`) rather than relying on a guarantee
 /// from a call it does not control the order against.
-fn check_evaluation_report_filing(store: &EventStore, item: &Item) -> Option<Refusal> {
+///
+/// THE JUDGEMENT CONDITION IS SCOPED (2026-09-26): only the set
+/// `evaluation_judgement_owed` fixes for `scope` - what fired in the filing
+/// session before its evaluation started. `scope: None` (no hook record of
+/// which session files this) demands no verdict at all; see
+/// `EvaluationScope`'s own doc comment for why that is the honest answer.
+fn check_evaluation_report_filing(store: &EventStore, item: &Item, scope: Option<&EvaluationScope>) -> Option<Refusal> {
     if item.kind != Kind::Report || !item.tags.iter().any(|t| t == EVALUATION_REPORT_TAG) {
         return None;
     }
     let project = item.project.as_deref();
     let mut missing: Vec<String> = Vec::new();
 
-    let owed = judgement_debt_in_project(store, project);
-    if !owed.is_empty() {
-        let named = owed.iter().map(|id| format!("'{id}'")).collect::<Vec<_>>().join(", ");
+    let judgement = scope.map(|scope| (scope, evaluation_judgement_owed(store, project, scope, &item.tags)));
+    if let Some((scope, judgement)) = judgement.as_ref().filter(|(_, j)| !j.owed.is_empty()) {
+        let named = judgement.owed.iter().map(|id| format!("'{id}'")).collect::<Vec<_>>().join(", ");
         missing.push(format!(
-            "{} item(s) that apply to this project (its own or global) still owe a judgement - each fired \
-             {JUDGEMENT_DEBT_AFTER}+ times since its last verdict: {named}. For each one, read where it last fired \
-             (`get` shows the item, doctor's judgement-debt line shows the place) and decide whether it belonged \
-             there: mcp__thor__mark(id: \"<id>\") when it did, mcp__thor__mark(id: \"<id>\", noise: true) when it \
-             did not. A verdict you did not read the item for is a false record, and it is worse than the debt",
-            owed.len()
+            "{} item(s) fired in this session before this evaluation started (log position {}) and still owe a \
+             judgement - each had fired {JUDGEMENT_DEBT_AFTER}+ times since its last verdict by then: {named}. This \
+             list was fixed when the evaluation started and cannot grow: nothing that fires after that, and nothing \
+             that fired only in another session, is this report's to settle. For each one, read where it fired \
+             (`get` shows the item) and decide whether it belonged there: mcp__thor__mark(id: \"<id>\") when it \
+             did, mcp__thor__mark(id: \"<id>\", noise: true) when it did not. If you cannot honestly judge one \
+             here, do not guess - add the tag '{NOT_JUDGEABLE_TAG_PREFIX}<id>:<reason>' to this report (a reason \
+             of at least {NOT_JUDGEABLE_REASON_MIN_CHARS} characters); it then stays owed store-wide instead. A \
+             verdict you did not read the item for is a false record, and it is worse than the debt",
+            judgement.owed.len(),
+            scope.started_seq
         ));
     }
 
@@ -3984,6 +4201,22 @@ mod tests {
         store.append_event("s", "l", "a", EventKind::ItemMarkedUseful, id, None, "{}").unwrap();
     }
 
+    /// Firings under a named session, the way the hook stamps them.
+    fn serve_in(store: &mut EventStore, session: &str, id: &str, n: usize) {
+        for _ in 0..n {
+            store.append_event(session, session, ASSISTANT_DELIVERY_ACTOR, EventKind::ItemServed, id, None, "{}").unwrap();
+        }
+    }
+
+    /// An evaluation by `session`, started right now (at the log's tip).
+    fn started_now(store: &EventStore, session: &str) -> EvaluationScope {
+        EvaluationScope { session_id: session.to_string(), started_seq: store.get_next_seq().unwrap() - 1 }
+    }
+
+    fn file(store: &mut EventStore, report: &Item, scope: &EvaluationScope) -> Result<Event, WriteError> {
+        declare_scoped(store, "s", "l", "a", report, Some(scope))
+    }
+
     #[test]
     fn a_write_that_is_not_an_evaluation_report_is_never_touched_by_this_gate() {
         let mut store = EventStore::in_memory().unwrap();
@@ -4009,9 +4242,11 @@ mod tests {
     #[test]
     fn revising_an_ordinary_report_onto_the_evaluation_report_tag_is_also_gated() {
         let mut store = EventStore::in_memory().unwrap();
-        let light = light_command_rule("owed-3", "z");
-        declare(&mut store, "s", "l", "a", &light).unwrap();
-        serve_n(&mut store, "owed-3", ASSISTANT_DELIVERY_ACTOR, JUDGEMENT_DEBT_AFTER);
+        // The teeth condition, not the judgement one: this door carries no
+        // evaluation scope, so only the conditions every filing is held to
+        // can refuse here (see `EvaluationScope`).
+        legacy_thinly_answered(&mut store, "unboxed-3", Some("z"));
+        serve_n(&mut store, "unboxed-3", "hook", 1);
 
         let mut plain = eval_report("not-yet-an-eval-report", "z");
         plain.tags = vec!["some-other-tag".to_string()];
@@ -4021,7 +4256,7 @@ mod tests {
         now_tagged.tags.push(EVALUATION_REPORT_TAG.to_string());
         let err = revise(&mut store, "s", "l", "a", &plain, &now_tagged).unwrap_err();
         let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
-        assert!(refusal.problem.contains("owe a judgement"), "{}", refusal.problem);
+        assert!(refusal.problem.contains("neither a real tooth nor a real reason"), "{}", refusal.problem);
     }
 
     /// THE CONCESSION THIS MUST NOT COST: a report that has ALREADY been
@@ -4058,7 +4293,8 @@ mod tests {
         declare(&mut store, "s", "l", "a", &light).unwrap();
         serve_n(&mut store, "owed-1", ASSISTANT_DELIVERY_ACTOR, JUDGEMENT_DEBT_AFTER);
 
-        let err = declare(&mut store, "s", "l", "a", &eval_report("eval-p-1", "p")).unwrap_err();
+        let scope = started_now(&store, "s");
+        let err = file(&mut store, &eval_report("eval-p-1", "p"), &scope).unwrap_err();
         let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
         assert!(refusal.problem.contains("owe a judgement"), "{}", refusal.problem);
         assert!(show(&store, "eval-p-1").is_err(), "a refused report must not be live");
@@ -4072,7 +4308,8 @@ mod tests {
         serve_n(&mut store, "owed-2", ASSISTANT_DELIVERY_ACTOR, JUDGEMENT_DEBT_AFTER);
         mark_useful(&mut store, "owed-2");
 
-        declare(&mut store, "s", "l", "a", &eval_report("eval-p-2", "p")).expect("debt is settled, filing must succeed");
+        let scope = started_now(&store, "s");
+        file(&mut store, &eval_report("eval-p-2", "p"), &scope).expect("debt is settled, filing must succeed");
     }
 
     /// A heavy rule that predates the content rule for reasons: its answer
@@ -4128,9 +4365,116 @@ mod tests {
         declare(&mut store, "s", "l", "a", &light_command_rule("owed-b", "o")).unwrap();
         serve_n(&mut store, "owed-a", ASSISTANT_DELIVERY_ACTOR, JUDGEMENT_DEBT_AFTER);
         serve_n(&mut store, "owed-b", ASSISTANT_DELIVERY_ACTOR, JUDGEMENT_DEBT_AFTER);
-        let err = declare(&mut store, "s", "l", "a", &eval_report("eval-o-1", "o")).unwrap_err();
+        let scope = started_now(&store, "s");
+        let err = file(&mut store, &eval_report("eval-o-1", "o"), &scope).unwrap_err();
         let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
         assert!(refusal.problem.contains("'owed-a'") && refusal.problem.contains("'owed-b'"), "{}", refusal.problem);
+        assert!(refusal.problem.contains("not-judgeable:<id>:<reason>"), "the refusal names the honest skip: {}", refusal.problem);
+    }
+
+    // ------------------------------------------ the scoped, frozen judgement
+    //
+    // MEASURED 2026-09-26 in a fresh evaluation: eight filing attempts, eight
+    // refusals, on a list that kept growing (14, 6, 13, 4, 4, 1, 5, 4) - the
+    // evaluation's own writes fired the remember-bound rules, and parallel
+    // sessions fired items this session never saw. It ended up stamping sixty
+    // items useful. These pin the fix (see `EvaluationScope`).
+
+    /// Items that fired only in another session stay owed store-wide, but
+    /// never hold this session's report.
+    #[test]
+    fn an_item_that_fired_only_in_another_session_never_holds_this_report() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "s", "l", "a", &light_command_rule("elsewhere", "w")).unwrap();
+        serve_in(&mut store, "other-session", "elsewhere", JUDGEMENT_DEBT_AFTER);
+        let scope = started_now(&store, "this-session");
+
+        file(&mut store, &eval_report("eval-w-1", "w"), &scope).expect("another session's firings are not this report's to settle");
+        assert_eq!(
+            judgement_debt_in_project(&store, Some("w")),
+            vec!["elsewhere".to_string()],
+            "it stays owed store-wide, where doctor keeps naming it"
+        );
+    }
+
+    /// The list is fixed when the evaluation starts: an item pushed over the
+    /// threshold afterwards - by the evaluation's own writes firing the
+    /// remember-bound rules, or by anything else - never joins it.
+    #[test]
+    fn nothing_that_fires_after_the_evaluation_started_can_add_to_its_list() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "s", "l", "a", &light_command_rule("owed-before", "f")).unwrap();
+        declare(&mut store, "s", "l", "a", &light_command_rule("remember-bound", "f")).unwrap();
+        serve_in(&mut store, "eval-session", "owed-before", JUDGEMENT_DEBT_AFTER);
+        serve_in(&mut store, "eval-session", "remember-bound", JUDGEMENT_DEBT_AFTER - 1);
+        let scope = started_now(&store, "eval-session");
+        // The evaluation's own writes fire it again, well past the threshold.
+        serve_in(&mut store, "eval-session", "remember-bound", 10);
+
+        let err = file(&mut store, &eval_report("eval-f-1", "f"), &scope).unwrap_err();
+        let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
+        assert!(refusal.problem.contains("'owed-before'"), "{}", refusal.problem);
+        assert!(!refusal.problem.contains("remember-bound"), "the list cannot grow: {}", refusal.problem);
+
+        mark_useful(&mut store, "owed-before");
+        file(&mut store, &eval_report("eval-f-1", "f"), &scope).expect("the fixed list is settled, so the report files");
+    }
+
+    /// "When in doubt, skip" and "the list must be settled" no longer
+    /// collide: an explicit skip with a reason settles an item for this
+    /// filing, and the item stays owed store-wide. A skip without a real
+    /// reason settles nothing.
+    #[test]
+    fn a_skip_with_a_reason_settles_an_item_for_this_filing_only() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "s", "l", "a", &light_command_rule("unsure", "n")).unwrap();
+        serve_in(&mut store, "eval-session", "unsure", JUDGEMENT_DEBT_AFTER);
+        let scope = started_now(&store, "eval-session");
+
+        let mut thin = eval_report("eval-n-1", "n");
+        thin.tags.push(format!("{NOT_JUDGEABLE_TAG_PREFIX}unsure:no"));
+        assert!(file(&mut store, &thin, &scope).is_err(), "a skip with no real reason settles nothing");
+
+        let mut honest = eval_report("eval-n-1", "n");
+        honest.tags.push(format!("{NOT_JUDGEABLE_TAG_PREFIX}unsure:it fired on a grep of a log I never opened"));
+        file(&mut store, &honest, &scope).expect("an honest skip settles it for this filing");
+        assert!(judgement_debt_in_project(&store, Some("n")).contains(&"unsure".to_string()), "and it stays owed store-wide");
+    }
+
+    /// No hook record of the filing session: no verdict can honestly be
+    /// demanded (see `EvaluationScope`), so none is.
+    #[test]
+    fn a_filing_with_no_known_session_demands_no_verdict() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "s", "l", "a", &light_command_rule("owed-x", "x")).unwrap();
+        serve_n(&mut store, "owed-x", ASSISTANT_DELIVERY_ACTOR, JUDGEMENT_DEBT_AFTER);
+        declare(&mut store, "s", "l", "a", &eval_report("eval-x-1", "x")).expect("no session known, no verdict demanded");
+    }
+
+    /// The smaller half of 2026-09-26: a reason that passes both the shape
+    /// and the content rule still settles nothing on a rule whose history
+    /// never carried a check. Once the log shows a check was tried on it,
+    /// the same reason counts.
+    #[test]
+    fn a_no_literal_reason_settles_a_heavy_rule_only_after_a_check_was_tried() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "s", "l", "a", &eval_report("eval-t-old", "t")).unwrap();
+        let mut rule = heavy_command_rule("never-tried", "t");
+        rule.tags = vec![format!("{NO_CATCH_ON_COMMAND_REASON_PREFIX}the same text is in 'fixture-command-never-tried --help' which is legitimate")];
+        let body = serde_json::to_string(&rule).unwrap();
+        store.append_event("legacy", "never-tried", "migration", EventKind::FactCreated, "never-tried", None, &body).unwrap();
+        serve_n(&mut store, "never-tried", "hook", 1);
+
+        let err = declare(&mut store, "s", "l", "a", &eval_report("eval-t-new", "t")).unwrap_err();
+        let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
+        assert!(refusal.problem.contains("'never-tried'"), "untried, so the reason is no answer yet: {}", refusal.problem);
+
+        // The history now shows a check was attached once, and later
+        // removed with the same reason: the try is on record.
+        try_a_check_then_give_it_up(&mut store, &rule);
+        assert!(ids_whose_check_was_tried(&store).contains("never-tried"));
+        assert!(show(&store, "never-tried").unwrap().check.is_none(), "the rule itself carries no check now");
+        declare(&mut store, "s", "l", "a", &eval_report("eval-t-new", "t")).expect("tried, and the reason quotes the legitimate call");
     }
 
     /// THE SCOPE THIS CONDITION ACTUALLY HAS, stated where it is enforced. An
@@ -4188,6 +4532,17 @@ mod tests {
 
     /// Settles a heavy fixture rule the honest way: a reason that names its
     /// own command.
+    /// The honest route to a no-literal answer since 2026-09-26: a check is
+    /// attached first (a real try, on the log), and only then given up for
+    /// the reason `rule` carries. Written through the checked revise path.
+    fn try_a_check_then_give_it_up(store: &mut EventStore, rule: &Item) {
+        let mut with_check = rule.clone();
+        with_check.check = Some(Check::Forbidden { literals: vec![format!("{} --force", rule.id)] });
+        for body in [serde_json::to_string(&with_check).unwrap(), serde_json::to_string(rule).unwrap()] {
+            store.append_mutate_checked("legacy", &rule.id, "migration", EventKind::FactRevised, &rule.id, None, &body).unwrap();
+        }
+    }
+
     fn settle_by_naming_the_trigger(store: &mut EventStore, id: &str) {
         let existing = show(store, id).unwrap();
         let mut settled = existing.clone();
@@ -4195,7 +4550,7 @@ mod tests {
             "{}an authorised fixture-command-{id} run is typed exactly like a wrong one",
             NO_CATCH_ON_COMMAND_REASON_PREFIX
         )];
-        revise(store, "s", "l", "a", &existing, &settled).unwrap();
+        try_a_check_then_give_it_up(store, &settled);
     }
 
     fn filing_refusal(store: &mut EventStore, report: &str, project: &str) -> Option<String> {
@@ -4296,6 +4651,7 @@ mod tests {
                 NO_CATCH_ON_COMMAND_REASON_PREFIX
             )];
             declare(&mut store, "s", "l", "a", &settled).unwrap();
+            try_a_check_then_give_it_up(&mut store, &settled);
         }
         declare(&mut store, "s", "l", "a", &eval_report("eval-k-0", "k")).unwrap();
         let ids = unsettled_fired_rules(&mut store, "k", 3);
@@ -4321,7 +4677,12 @@ mod tests {
         )];
         declare(&mut store, "s", "l", "a", &heavy).unwrap();
         serve_n(&mut store, "named-heavy", "hook", 1);
-        declare(&mut store, "s", "l", "a", &eval_report("eval-n-new", "n")).expect("a real reason settles it");
+        assert!(
+            declare(&mut store, "s", "l", "a", &eval_report("eval-n-new", "n")).is_err(),
+            "the reason alone, with no check ever tried, is not the answer yet"
+        );
+        try_a_check_then_give_it_up(&mut store, &heavy);
+        declare(&mut store, "s", "l", "a", &eval_report("eval-n-new", "n")).expect("a real reason after a real try settles it");
     }
 
     /// A check that is wired but has not met a real call yet settles the
@@ -4467,9 +4828,8 @@ mod tests {
     #[test]
     fn moving_a_filed_report_to_another_project_is_held_to_that_projects_filing_gate() {
         let mut store = EventStore::in_memory().unwrap();
-        let light = light_command_rule("owed-d", "dd");
-        declare(&mut store, "s", "l", "a", &light).unwrap();
-        serve_n(&mut store, "owed-d", ASSISTANT_DELIVERY_ACTOR, JUDGEMENT_DEBT_AFTER);
+        legacy_thinly_answered(&mut store, "unboxed-d", Some("dd"));
+        serve_n(&mut store, "unboxed-d", "hook", 1);
         declare(&mut store, "s", "l", "a", &eval_report("eval-elsewhere", "other")).unwrap();
 
         let filed = show(&store, "eval-elsewhere").unwrap();
@@ -4477,11 +4837,11 @@ mod tests {
         moved.project = Some("dd".to_string());
         let err = revise(&mut store, "s", "l", "a", &filed, &moved).unwrap_err();
         let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
-        assert!(refusal.problem.contains("owe a judgement"), "{}", refusal.problem);
+        assert!(refusal.problem.contains("neither a real tooth"), "{}", refusal.problem);
 
         let err = revise_because(&mut store, "s", "l", "a", &filed, &moved, &filed, None).unwrap_err();
         let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
-        assert!(refusal.problem.contains("owe a judgement"), "the assistant's own revise door too: {}", refusal.problem);
+        assert!(refusal.problem.contains("neither a real tooth"), "the assistant's own revise door too: {}", refusal.problem);
         assert_eq!(show(&store, "eval-elsewhere").unwrap().project.as_deref(), Some("other"), "nothing moved");
     }
 
@@ -4497,7 +4857,8 @@ mod tests {
         declare(&mut store, "s", "l", "a", &plain).unwrap();
         let mut tagged = plain.clone();
         tagged.tags.push(EVALUATION_REPORT_TAG.to_string());
-        assert!(revise_because(&mut store, "s", "l", "a", &plain, &tagged, &plain, None).is_err());
+        let scope = started_now(&store, "s");
+        assert!(revise_because_scoped(&mut store, "s", "l", "a", &plain, &tagged, &plain, None, Some(&scope)).is_err());
     }
 
     /// E (2026-09-26): a heavy rule is not retracted on a reason that fits

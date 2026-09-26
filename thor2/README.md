@@ -147,6 +147,15 @@ there the day writes are turned on. An existing copy - the owner's own
 edited version, or one an earlier install already wrote - is left exactly
 as it is.
 
+Opening that routine starts an evaluation, and the judgement list its
+report is held to is fixed right then: only what fired in that session, 40
+times or more since its last verdict, and nothing that fires afterwards.
+The hook records the start in `evaluation-sessions.json` beside the store,
+because only the hook knows which session is which; the tool server reads it
+back when the report is filed. Keep the routine under a name of your own as
+well? List that name, one per line, in `eval-command-names.txt` beside the
+store, and opening it under that name starts an evaluation too.
+
 Once a project has gone 16 hours without an evaluation report, and the
 session has accrued at least an hour of work in that project, the `Stop`
 hook asks for this whole routine by name instead of one more item at a time

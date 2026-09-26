@@ -48,6 +48,23 @@ fn the_routine_names_the_batch_size_the_filing_gate_holds_a_report_to() {
     assert!(routine.contains(&format!("at most {word} heavy facts")), "the routine must say the batch holds at most {word}");
 }
 
+/// The routine must spell the skip tag exactly as the filing gate parses it,
+/// and say the two things the gate now holds a report to (2026-09-26): the
+/// judgement list is fixed when the evaluation starts, and a no-literal
+/// reason counts only after a check was tried.
+#[test]
+fn the_routine_describes_the_judgement_list_and_the_skip_the_gate_accepts() {
+    let routine = read("eval-command.example.md");
+    let skip = format!("{}<id>:<reason>", model::store::NOT_JUDGEABLE_TAG_PREFIX);
+    assert!(routine.contains(&skip), "the routine must name the skip tag as '{skip}'");
+    assert!(routine.contains("Your list is fixed the moment this evaluation starts"), "the routine must say the list is fixed");
+    assert!(routine.contains("A reason counts only after a real try"), "the routine must say a reason needs a real try");
+    assert!(
+        routine.contains(&format!("at least {}", ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve"][model::store::NOT_JUDGEABLE_REASON_MIN_CHARS])),
+        "the routine must name the minimum reason length the gate holds a skip to"
+    );
+}
+
 #[test]
 fn neither_sends_an_agent_to_a_bulk_relabel() {
     let refusal = read("model/src/store.rs");

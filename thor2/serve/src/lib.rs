@@ -87,6 +87,7 @@ pub mod decay;
 pub mod deliver;
 #[cfg(feature = "semantic")]
 pub mod embed;
+pub mod eval_session;
 pub mod input;
 pub mod judge;
 pub mod live;

@@ -114,9 +114,45 @@ fn with_store(db: &Path, f: impl FnOnce(&mut EventStore)) {
 }
 
 fn served(store: &mut EventStore, id: &str, n: usize) {
+    served_in(store, "s", id, n);
+}
+
+/// Firings under a named session, the way the hook stamps them.
+fn served_in(store: &mut EventStore, session: &str, id: &str, n: usize) {
     for _ in 0..n {
-        store.append_event("s", "l", "hook", EventKind::ItemServed, id, None, "{}").unwrap();
+        store.append_event(session, "l", "hook", EventKind::ItemServed, id, None, "{}").unwrap();
     }
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
+}
+
+/// The hook's evaluation handover, written the way the hook writes it
+/// (`serve::eval_session`): `session` started evaluating `project` at the
+/// log's current tip, and is filing `report_id`. The file is the contract
+/// between the hook and this server, so it is written by hand here.
+fn handover(db: &Path, session: &str, project: &str, report_id: &str) {
+    let tip = EventStore::open_existing(db).unwrap().get_next_seq().unwrap() - 1;
+    let now = now_unix();
+    let json = serde_json::json!({
+        "evaluations": [{"session_id": session, "project": project, "started_seq": tip, "started_unix": now, "started_by": "skill"}],
+        "filings": [{"report_id": report_id, "session_id": session, "project": project, "at_unix": now}],
+    });
+    std::fs::write(db.parent().unwrap().join("evaluation-sessions.json"), json.to_string()).unwrap();
+}
+
+/// A check attached to `id` once and then given up, written straight into
+/// the log: the history a no-literal reason needs before it counts
+/// (2026-09-26, `model::gate::teeth_answer_settles`).
+fn a_check_was_tried(db: &Path, item: &Item) {
+    let mut tried = item.clone();
+    tried.check = Some(model::item::Check::Forbidden { literals: vec![format!("{} --force", item.id)] });
+    with_store(db, |s| {
+        for body in [serde_json::to_string(&tried).unwrap(), serde_json::to_string(item).unwrap()] {
+            s.append_mutate_checked("legacy", &item.id, "migration", EventKind::FactRevised, &item.id, None, &body).unwrap();
+        }
+    });
 }
 
 fn rule(id: &str, project: Option<&str>, severity: Option<Severity>, bindings: Vec<Binding>, tags: Vec<String>) -> Item {
@@ -248,11 +284,17 @@ fn a_reason_that_names_the_trigger_settles_a_fired_heavy_rule() {
         vec![path("files/README.md")],
         vec!["no-literal:wiping files/README.md leaves no text in any command".to_string()],
     );
-    let db = store_with(tmp.path(), &[report("eval-old", "p", &["evaluation-report"]), heavy]);
+    let db = store_with(tmp.path(), &[report("eval-old", "p", &["evaluation-report"]), heavy.clone()]);
     with_store(&db, |s| served(s, "honest-heavy", 1));
     let mut mcp = Mcp::start(&db, tmp.path());
     let reply = mcp.call("remember", eval_report_args("eval-new", "p"));
-    assert!(reply.starts_with("stored"), "a real reason settles it: {reply}");
+    assert!(
+        reply.contains("REFUSED") && reply.contains("honest-heavy"),
+        "a reason on a rule that never carried a check is not the answer yet: {reply}"
+    );
+    a_check_was_tried(&db, &heavy);
+    let reply = mcp.call("remember", eval_report_args("eval-new", "p"));
+    assert!(reply.starts_with("stored"), "a real reason after a real try settles it: {reply}");
 }
 
 // ------------------------------------------------------------------ C
@@ -263,9 +305,105 @@ fn the_filing_refusal_names_the_items_that_owe_a_judgement() {
     let light = rule("owed-light", Some("p"), None, vec![command("fixture-cmd")], vec![]);
     let db = store_with(tmp.path(), &[report("seed-p", "p", &[]), light]);
     with_store(&db, |s| served(s, "owed-light", 40));
+    handover(&db, "s", "p", "eval-new");
     let mut mcp = Mcp::start(&db, tmp.path());
     let reply = mcp.call("remember", eval_report_args("eval-new", "p"));
     assert!(reply.contains("REFUSED") && reply.contains("'owed-light'"), "the owed item is named: {reply}");
+}
+
+// ---------------------------------------- the scoped, frozen judgement
+//
+// MEASURED 2026-09-26: a fresh evaluation filed its report eight times and
+// was refused eight times on a list that kept growing, then stamped sixty
+// items useful, some it never saw fire. These drive the fix through the
+// real server, with the hook's handover written by hand.
+
+#[test]
+fn a_report_is_never_held_for_items_that_fired_only_in_another_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let elsewhere = rule("fired-elsewhere", Some("p"), None, vec![command("fixture-cmd")], vec![]);
+    let db = store_with(tmp.path(), &[report("seed-p", "p", &[]), elsewhere]);
+    with_store(&db, |s| served_in(s, "a-parallel-session", "fired-elsewhere", 40));
+    handover(&db, "this-session", "p", "eval-new");
+    let mut mcp = Mcp::start(&db, tmp.path());
+    let reply = mcp.call("remember", eval_report_args("eval-new", "p"));
+    assert!(reply.starts_with("stored"), "another session's firings are not this report's to settle: {reply}");
+    assert!(reply.contains("1 item(s) stay owed store-wide"), "and the receipt says what stays owed: {reply}");
+}
+
+#[test]
+fn the_judgement_list_is_fixed_when_the_evaluation_starts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let before = rule("owed-before-start", Some("p"), None, vec![command("fixture-cmd-a")], vec![]);
+    let during = rule("remember-bound-during", Some("p"), None, vec![command("fixture-cmd-b")], vec![]);
+    let db = store_with(tmp.path(), &[report("seed-p", "p", &[]), before, during]);
+    with_store(&db, |s| {
+        served(s, "owed-before-start", 40);
+        served(s, "remember-bound-during", 39);
+    });
+    handover(&db, "s", "p", "eval-new");
+    // The evaluation's own writes fire it past the threshold, after the start.
+    with_store(&db, |s| served(s, "remember-bound-during", 5));
+    let mut mcp = Mcp::start(&db, tmp.path());
+    let reply = mcp.call("remember", eval_report_args("eval-new", "p"));
+    assert!(reply.contains("REFUSED") && reply.contains("'owed-before-start'"), "{reply}");
+    assert!(!reply.contains("remember-bound-during"), "nothing after the start joins the list: {reply}");
+
+    let marked = mcp.call("mark", serde_json::json!({"id": "owed-before-start"}));
+    assert!(!marked.contains("REFUSED"), "{marked}");
+    let reply = mcp.call("remember", eval_report_args("eval-new", "p"));
+    assert!(reply.starts_with("stored"), "the fixed list is settled: {reply}");
+}
+
+#[test]
+fn an_honest_skip_lets_the_report_file_and_the_item_stays_owed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let unsure = rule("unsure-item", Some("p"), None, vec![command("fixture-cmd")], vec![]);
+    let db = store_with(tmp.path(), &[report("seed-p", "p", &[]), unsure]);
+    with_store(&db, |s| served(s, "unsure-item", 40));
+    handover(&db, "s", "p", "eval-new");
+    let mut mcp = Mcp::start(&db, tmp.path());
+    let mut args = eval_report_args("eval-new", "p");
+    args["tags"] = serde_json::json!(["evaluation-report", "not-judgeable:unsure-item:it fired on a log grep I never opened"]);
+    let reply = mcp.call("remember", args);
+    assert!(reply.starts_with("stored"), "an explicit skip with a reason settles it for this filing: {reply}");
+    assert!(reply.contains("1 skipped"), "{reply}");
+    assert!(reply.contains("1 item(s) stay owed store-wide"), "{reply}");
+}
+
+// ------------------------------------------------------------ worktrees
+
+/// MEASURED 2026-09-26: a session in a worktree attached a `contains` check
+/// to code that existed only there; stored, it blocked every commit on main
+/// for eleven minutes. The server, started in the worktree, judges checks
+/// against the main checkout and refuses one that holds only in the worktree.
+#[test]
+fn a_check_that_holds_only_in_the_worktree_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let main = tmp.path().join("Main-Repo");
+    let worktree = tmp.path().join("wt-slug");
+    let gitdir = main.join(".git").join("worktrees").join("wt-slug");
+    std::fs::create_dir_all(&gitdir).unwrap();
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::write(worktree.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+    std::fs::write(main.join("panel.js"), "showSuccess();\n").unwrap();
+    std::fs::write(worktree.join("panel.js"), "if (!res.ok) showError(); else showSuccess();\n").unwrap();
+
+    let db = store_with(tmp.path(), &[report("seed-p", "Main-Repo", &[])]);
+    let mut mcp = Mcp::start(&db, &worktree);
+    let fact = |literal: &str| {
+        serde_json::json!({
+            "id": "panel-checks-res-ok", "kind": "rule", "project": "Main-Repo",
+            "text": "The device panel checks res.ok before it reports success.",
+            "falsifier": "the panel reports success on a failed reply",
+            "check_kind": "contains", "check_path": "panel.js", "check_literal": literal,
+            "targets": [{"kind": "path", "value": "panel.js"}]
+        })
+    };
+    let reply = mcp.call("remember", fact("res.ok"));
+    assert!(reply.contains("REFUSED") && reply.contains("only in your worktree"), "{reply}");
+    let reply = mcp.call("remember", fact("showSuccess();"));
+    assert!(reply.starts_with("stored"), "a check that holds on main too goes through: {reply}");
 }
 
 // ------------------------------------------------------------------ D
@@ -276,6 +414,7 @@ fn moving_another_projects_report_here_is_held_to_this_projects_gate() {
     let light = rule("owed-here", Some("p"), None, vec![command("fixture-cmd")], vec![]);
     let db = store_with(tmp.path(), &[report("seed-p", "p", &[]), report("eval-elsewhere", "q", &["evaluation-report"]), light]);
     with_store(&db, |s| served(s, "owed-here", 40));
+    handover(&db, "s", "p", "eval-elsewhere");
     let mut mcp = Mcp::start(&db, tmp.path());
     let reply = mcp.call("revise", serde_json::json!({"id": "eval-elsewhere", "project": "p"}));
     assert!(reply.contains("REFUSED"), "moving a filed report is a filing for the project it lands in: {reply}");

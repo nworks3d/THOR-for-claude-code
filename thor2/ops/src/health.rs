@@ -460,17 +460,49 @@ pub fn proof_line(db: &Path, full: bool) -> String {
 /// scope `serve::project::resolve_project` gives a marker) or a `.git` entry,
 /// directory or file (a linked worktree's own shape). `None` all the way to
 /// the filesystem root.
+///
+/// A LINKED WORKTREE counts as its MAIN checkout (`serve::project::
+/// checkout_for`). Measured 2026-09-26: a session standing in a detached
+/// worktree kept in a scratch folder got that scratch folder as its inferred
+/// checkouts root, so doctor judged every check against a worktree six
+/// commits behind main, called a true fact false, and the session revised
+/// the fact backwards. What doctor measures is the main checkout, the same
+/// one the commit gates read.
 fn nearest_repo_root(start_dir: &Path) -> Option<std::path::PathBuf> {
     let mut dir: Option<&Path> = Some(start_dir);
     while let Some(d) = dir {
         let has_marker = serve::project::MARKER_FILE_NAMES.iter().any(|name| d.join(name).is_file());
         let dot_git = d.join(".git");
         if has_marker || dot_git.is_dir() || dot_git.is_file() {
-            return Some(d.to_path_buf());
+            return Some(serve::project::checkout_for(d));
         }
         dir = d.parent();
     }
     None
+}
+
+/// Every project under `root` - an immediate subdirectory that resolves to a
+/// project key - mapped to the checkout its checks are judged against. The
+/// one place decay, contradictions and crowding learn where a project lives.
+///
+/// A linked worktree is judged as its MAIN checkout (`serve::project::
+/// checkout_for`), and a main checkout found under `root` always wins over
+/// a worktree of it: a worktree is a place someone works, its files lag or
+/// lead main, and a check read there says nothing about the memory's own
+/// truth (see `nearest_repo_root` for the day that mattered).
+fn checkout_roots(root: &Path) -> std::collections::BTreeMap<String, std::path::PathBuf> {
+    let mut roots: std::collections::BTreeMap<String, std::path::PathBuf> = Default::default();
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(key) = serve::project::resolve_project(&path) {
+                    roots.insert(key, serve::project::checkout_for(&path));
+                }
+            }
+        }
+    }
+    roots
 }
 
 /// Doctor's own inferred `--checkouts` root when the flag itself is absent:
@@ -650,17 +682,7 @@ fn decay_check(db: &Path, checkouts: Option<&Path>, project_filter: Option<&str>
         return DecayCheck::NoCheckouts;
     };
 
-    let mut roots: std::collections::BTreeMap<String, std::path::PathBuf> = Default::default();
-    if let Ok(entries) = std::fs::read_dir(root) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if let Some(key) = serve::project::resolve_project(&path) {
-                    roots.insert(key, path);
-                }
-            }
-        }
-    }
+    let roots = checkout_roots(root);
 
     let items = serve::live::live_items(&store);
     let (mut dead, mut failing, mut judged) = (Vec::new(), Vec::new(), 0usize);
@@ -1276,17 +1298,7 @@ pub fn contradiction_line(db: &Path, checkouts: Option<&Path>) -> Option<String>
     let store = EventStore::open_existing(db).ok()?;
     let root = checkouts?;
 
-    let mut roots: std::collections::BTreeMap<String, std::path::PathBuf> = Default::default();
-    if let Ok(entries) = std::fs::read_dir(root) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if let Some(key) = serve::project::resolve_project(&path) {
-                    roots.insert(key, path);
-                }
-            }
-        }
-    }
+    let roots = checkout_roots(root);
 
     let mut by_file: std::collections::BTreeMap<(String, String), Vec<model::item::Check>> = Default::default();
     for li in serve::live::live_items(&store) {
@@ -1496,6 +1508,9 @@ pub fn teeth_line(db: &Path, full: bool) -> String {
     // and how many carry a reason a reader can check that they cannot have a
     // tooth (`model::gate::teeth_answer_settles`). Everything else is neither.
     let (mut really_refuses, mut honest_no) = (0usize, 0usize);
+    // A reason counts only after a real try (`model::gate::teeth_answer_
+    // settles`) - the same history the filing gate reads.
+    let tried = model::store::ids_whose_check_was_tried(&store);
     for li in live.iter().filter(|li| li.item.kind.can_fire()) {
         if !matches!(
             li.item.severity,
@@ -1511,7 +1526,7 @@ pub fn teeth_line(db: &Path, full: bool) -> String {
         };
         if matches!(serve::prove::teeth_box(&li.id, &li.item, None, &reality), serve::prove::TeethBox::ProvenGuard { .. }) {
             really_refuses += 1;
-        } else if model::gate::teeth_answer_settles(&li.item) {
+        } else if model::gate::teeth_answer_settles(&li.item, tried.contains(&li.id)) {
             honest_no += 1;
         }
         if li.item.tags.iter().any(|t| t == model::store::TEETH_WIRED_TAG) {
@@ -1812,17 +1827,7 @@ pub fn crowding_line(db: &Path, checkouts: Option<&Path>, full: bool) -> String 
         return "crowding: pass --checkouts <dir> to see how many facts never win a place".to_string();
     };
 
-    let mut roots: std::collections::BTreeMap<String, std::path::PathBuf> = Default::default();
-    if let Ok(entries) = std::fs::read_dir(root) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if let Some(key) = serve::project::resolve_project(&path) {
-                    roots.insert(key, path);
-                }
-            }
-        }
-    }
+    let roots = checkout_roots(root);
 
     // Every distinct anchor that resolves, and the pool it stands for.
     let mut anchors: std::collections::BTreeSet<(String, String)> = Default::default();
@@ -3837,7 +3842,14 @@ mod tests {
             let mut honest = rule("honest-no-fixture");
             honest.severity = Some(model::item::Severity::Costly);
             honest.tags = vec![format!("{}an authorised 'git push origin main' reads the same", store::NO_LITERAL_REASON_PREFIX)];
-            legacy_declare(&mut s, &honest);
+            // The reason counts only after a real try (2026-09-26): the
+            // history shows a check attached once, then given up for it.
+            let mut tried = honest.clone();
+            tried.check = Some(model::item::Check::Forbidden { literals: vec!["git push origin main".to_string()] });
+            legacy_declare(&mut s, &tried);
+            let body = serde_json::to_string(&honest).unwrap();
+            s.append_mutate_checked("legacy", "honest-no-fixture", "migration", thor_core::event_store::EventKind::FactRevised, "honest-no-fixture", None, &body)
+                .unwrap();
 
             let mut thin = rule("thin-fixture");
             thin.severity = Some(model::item::Severity::Costly);
@@ -4352,6 +4364,57 @@ mod tests {
             store::declare(&mut s, "s", "l", "a", &item).unwrap();
         }
         assert_eq!(gate_verdict(&db, Some(&checkouts), None), GateVerdict::Failing);
+    }
+
+    /// A main checkout at `main` holding `file` with `main_text`, and a
+    /// linked worktree of it at `worktree` holding the same file with
+    /// `worktree_text` - the `.git` file and the `.git/worktrees/<slug>`
+    /// directory laid out the way git itself lays them out.
+    fn main_and_worktree(main: &Path, worktree: &Path, file: &str, main_text: &str, worktree_text: &str) {
+        let slug = worktree.file_name().unwrap().to_string_lossy().to_string();
+        std::fs::create_dir_all(main.join(".git").join("worktrees").join(&slug)).unwrap();
+        std::fs::create_dir_all(worktree).unwrap();
+        let gitdir = main.join(".git").join("worktrees").join(&slug);
+        std::fs::write(worktree.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+        std::fs::write(main.join(file), main_text).unwrap();
+        std::fs::write(worktree.join(file), worktree_text).unwrap();
+    }
+
+    /// THE DEFECT THIS PREVENTS (2026-09-26): doctor, run from a detached
+    /// worktree kept in a scratch folder, took that scratch folder as its
+    /// checkouts root and judged every check against a worktree that was
+    /// behind main - it called a true fact false, and the session revised
+    /// the fact backwards. Standing in a worktree must infer the parent of
+    /// the MAIN checkout.
+    #[test]
+    fn standing_in_a_worktree_infers_the_main_checkouts_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let dev = dir.path().join("dev");
+        let main = dev.join("Real-Repo");
+        let worktree = dir.path().join("scratch").join("fresh-1");
+        main_and_worktree(&main, &worktree, "code.js", "new code\n", "old code\n");
+        assert_eq!(infer_checkouts_root(&worktree).as_deref(), Some(dev.as_path()));
+    }
+
+    /// And a worktree met under a checkouts root is judged as its main
+    /// checkout: the proof below holds on main, is false in the lagging
+    /// worktree, and must read as clean.
+    #[test]
+    fn a_worktree_under_the_checkouts_root_is_judged_as_its_main_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let main = dir.path().join("elsewhere").join("Real-Repo");
+        let scratch = dir.path().join("scratch");
+        main_and_worktree(&main, &scratch.join("fresh-1"), "code.js", "handles res.ok\n", "ignores the reply\n");
+        {
+            let mut s = EventStore::new(&db).unwrap();
+            let mut item = rule("true-on-main");
+            item.project = Some("Real-Repo".to_string());
+            item.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "code.js".to_string() }];
+            item.check = Some(model::item::Check::Contains { path: "code.js".to_string(), literal: "res.ok".to_string() });
+            store::declare(&mut s, "s", "l", "a", &item).unwrap();
+        }
+        assert_eq!(gate_verdict(&db, Some(&scratch), None), GateVerdict::Clean, "judged on main, where it holds");
     }
 
     /// The contrast case for the test above: an anchor that DOES resolve

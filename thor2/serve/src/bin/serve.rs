@@ -1512,6 +1512,19 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
                     {
                         if let Some(reason) = evaluation_debt(&store, db_path, stop_project.as_deref(), &work) {
                             usefulness::record_eval_debt_asked(db_path, stop_project.as_deref(), now);
+                            // The ask is where this evaluation starts: the
+                            // list its report is held to is fixed here and
+                            // named with the ask (`serve::eval_session`). A
+                            // later turn's ask finds it open and keeps it.
+                            let reason = match stop_project
+                                .as_deref()
+                                .and_then(|p| serve::eval_session::start(db_path, &store, &session_id, p, now, "stop-ask"))
+                            {
+                                Some(evaluation) => {
+                                    format!("{reason}\n\n{}", serve::eval_session::start_note(&store, &evaluation))
+                                }
+                                None => reason,
+                            };
                             return Some(HookOutput::Decision(
                                 serde_json::json!({ "decision": "block", "reason": reason }),
                             ));
@@ -1777,16 +1790,35 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
                 capture_flag(&store, db_path, &session_id, prompt_text);
             }
 
+            // The owner typed the evaluation command: the evaluation starts
+            // here, and the session is told the list its report is held to
+            // (`serve::eval_session`). Only the command itself counts - a
+            // task that merely says to end with it has not started one.
+            let eval_note = if serve::eval_session::prompt_starts_evaluation(prompt_text, &serve::eval_session::command_names(db_path)) {
+                work_project
+                    .as_deref()
+                    .and_then(|p| serve::eval_session::start(db_path, &store, &session_id, p, time::now_unix(), "command"))
+                    .map(|evaluation| serve::eval_session::start_note(&store, &evaluation))
+            } else {
+                None
+            };
+
             let candidates = serve::live::live_items(&store);
             let mut input = prompt::resolve(prompt_text, &candidates);
             input.project = session_project.clone();
             if input.is_empty() {
-                return None;
+                return eval_note.map(|block| HookOutput::Context { event_name, block, verdicts: Vec::new() });
             }
             let decay = DecayContext::load(&store);
             let all = serve::decay::retain_live(serve::rank::select(&candidates, &input), &decay);
             let selection = render::cap(all);
-            let block = render::render_text(&selection, &input, db_path)?;
+            let rendered = render::render_text(&selection, &input, db_path);
+            let block = match (rendered, eval_note) {
+                (Some(rendered), Some(note)) => format!("{note}\n\n{rendered}"),
+                (Some(rendered), None) => rendered,
+                (None, Some(note)) => return Some(HookOutput::Context { event_name, block: note, verdicts: Vec::new() }),
+                (None, None) => return None,
+            };
             let ids: Vec<String> = selection.shown.iter().map(|r| r.id.clone()).collect();
             // No trigger: a prompt is neither a command nor a file, the two
             // shapes `ItemServed::trigger` names - plain `record_delivery`
@@ -1808,6 +1840,34 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
             let tool_input = payload.get("tool_input");
             let file_path = tool_input.and_then(|t| t.get("file_path")).and_then(|v| v.as_str());
             let tool_name = payload.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
+
+            // THE EVALUATION HANDOVER (`serve::eval_session`), before any
+            // guard can return: opening the evaluation routine as a skill
+            // starts an evaluation (and names its fixed list below), and a
+            // call that files an evaluation report records which session
+            // files it - the one fact the tool server cannot know itself.
+            // Recorded before the guards on purpose: a filing a guard then
+            // refuses never reaches the tool server, so the record is inert.
+            let now_unix = time::now_unix();
+            let eval_note = if serve::eval_session::call_starts_evaluation(tool_name, tool_input, &serve::eval_session::command_names(db_path)) {
+                work_project
+                    .as_deref()
+                    .and_then(|p| serve::eval_session::start(db_path, &store, &session_id, p, now_unix, "skill"))
+                    .map(|evaluation| serve::eval_session::start_note(&store, &evaluation))
+            } else {
+                None
+            };
+            if let Some((report_id, named_project)) = serve::eval_session::filing_in_call(mcp_tool_suffix(tool_name), tool_input) {
+                // The report's own project: named on the call, or - for a
+                // revise that leaves it out - the item's own, and only then
+                // the session's.
+                let project = named_project
+                    .or_else(|| model::store::show(&store, &report_id).ok().and_then(|item| item.project))
+                    .or_else(|| work_project.clone());
+                if let Some(project) = project {
+                    serve::eval_session::record_filing(db_path, &store, &session_id, &project, &report_id, now_unix);
+                }
+            }
 
             // Lane C, C3 (SPEC-ENFORCEMENT.md 2.3): the wrong-sink check,
             // BEFORE anything else in this arm. Deliberately narrow - see
@@ -1954,6 +2014,11 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
             if is_remember_moment(tool_name) {
                 input.add_moment(Action::Remember);
             }
+            // The evaluation's start note leads whatever else this call says.
+            let sink_warning = match (eval_note, sink_warning) {
+                (Some(note), Some(warning)) => Some(format!("{note}\n\n{warning}")),
+                (note, warning) => note.or(warning),
+            };
             if input.is_empty() {
                 // Nothing else would render, but a provisional sink warning
                 // may still stand entirely on its own. Nothing was ever
@@ -2394,13 +2459,16 @@ fn teeth_debt(store: &EventStore, db_path: &Path, current_project: Option<&str>,
         model::store::open_points(store, current_project).into_iter().map(|p| p.text.to_lowercase()).collect();
     let fired = usefulness::served_since_last_verdict(store);
     let asked = teeth_items_asked_counts(db_path);
+    // A reason counts only after a real try - see `model::gate::
+    // teeth_answer_settles`'s own doc comment.
+    let tried = model::store::ids_whose_check_was_tried(store);
     // (asked count, severity rank, fired count, id, what to do)
     let mut candidates: Vec<(usize, u8, usize, String, String)> = Vec::new();
     for li in serve::live::live_items(store) {
         if !li.item.kind.can_fire() || !project::applies_to(li.item.project.as_deref(), current_project) {
             continue;
         }
-        if model::gate::teeth_answer_settles(&li.item) {
+        if model::gate::teeth_answer_settles(&li.item, tried.contains(&li.id)) {
             continue;
         }
         let named_in_open_point = open_points.iter().any(|t| t.contains(&li.id.to_lowercase()));
@@ -4623,8 +4691,23 @@ mod judgement_debt_tests {
         ));
         model::store::revise(&mut store, "s", "l", "a", &item, &real).unwrap();
         assert!(
+            teeth_debt(&store, &db, Some("p"), None).unwrap().contains("answer-me"),
+            "a good reason on a rule that never carried a check is not the answer yet (2026-09-26)"
+        );
+
+        // A real try on record - a check attached, then given up for the
+        // same reason - and the reason counts.
+        let now = model::store::show(&store, "answer-me").unwrap();
+        let mut tried = now.clone();
+        tried.check = Some(model::item::Check::Forbidden { literals: vec!["npm audit fix --force".to_string()] });
+        for body in [serde_json::to_string(&tried).unwrap(), serde_json::to_string(&now).unwrap()] {
+            store
+                .append_mutate_checked("legacy", "answer-me", "migration", thor_core::event_store::EventKind::FactRevised, "answer-me", None, &body)
+                .unwrap();
+        }
+        assert!(
             teeth_debt(&store, &db, Some("p"), None).is_none(),
-            "a reason that names the rule's own trigger settles it"
+            "a reason that names the rule's own trigger settles it, after a real try"
         );
     }
 

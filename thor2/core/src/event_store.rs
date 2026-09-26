@@ -1771,6 +1771,43 @@ impl EventStore {
         rows.collect()
     }
 
+    /// Every firing and every verdict on the log, oldest first, as
+    /// `(seq, kind, entity_id, actor, session_id)` - never a body.
+    ///
+    /// Exists for the evaluation filing gate (`model::store`), which has to
+    /// answer two questions `event_kinds_with_actor` cannot: WHERE on the log
+    /// an item crossed the judgement threshold (so the set a report must
+    /// settle can be fixed at the moment the evaluation started), and in
+    /// WHICH session it fired (so a session is only asked about what it was
+    /// there to see). Same scan shape as `event_kinds_with_actor`: three
+    /// small columns more, still no bodies.
+    pub fn firings_and_verdicts(&self) -> SqlResult<Vec<(i64, EventKind, String, String, String)>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT seq, kind, entity_id, actor, session_id FROM event \
+             WHERE kind IN ('item_served', 'item_marked_useful', 'item_marked_noise') ORDER BY seq",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let seq: i64 = row.get(0)?;
+            let kind_str: &str = row.get_ref(1)?.as_str()?;
+            let kind = EventKind::from_str(kind_str).ok_or(rusqlite::Error::InvalidQuery)?;
+            Ok((seq, kind, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?))
+        })?;
+        rows.collect()
+    }
+
+    /// The ids of every item one of whose WRITES (create, revise, resolve)
+    /// carried `needle` somewhere in its body. Used to ask the log whether an
+    /// item ever carried a check at all (`model::store::ids_whose_check_was_
+    /// tried`) without loading and parsing every body on the log.
+    pub fn ids_with_a_write_containing(&self, needle: &str) -> SqlResult<HashSet<String>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT DISTINCT entity_id FROM event \
+             WHERE kind IN ('fact_created', 'fact_revised', 'fact_resolved') AND instr(body, ?1) > 0",
+        )?;
+        let rows = stmt.query_map([needle], |row| row.get::<_, String>(0))?;
+        rows.collect()
+    }
+
     /// The ids this session was actually served, once each.
     ///
     /// Exists so a caller can ask about something the CURRENT reader has

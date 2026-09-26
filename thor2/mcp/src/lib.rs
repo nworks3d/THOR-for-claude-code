@@ -882,6 +882,85 @@ fn apply_teeth_test_for_revise(
     Ok(note)
 }
 
+/// The evaluation a filing belongs to, from the hook's handover
+/// (`serve::eval_session`): `None` for every item that is not an evaluation
+/// report, and for one the hook recorded no filing of.
+fn evaluation_scope(item: &model::item::Item, handover_db: Option<&std::path::Path>) -> Option<model::store::EvaluationScope> {
+    let is_evaluation = item.kind == Kind::Report && item.tags.iter().any(|t| t == model::store::EVALUATION_REPORT_TAG);
+    if !is_evaluation {
+        return None;
+    }
+    serve::eval_session::scope_for_filing(handover_db?, &item.id, serve::time::now_unix())
+}
+
+/// The line a filed evaluation report's receipt carries about judgement:
+/// what its own list held, and how much stays owed store-wide - so a report
+/// that files is never read as "the debt is paid". Empty for every other
+/// write.
+fn evaluation_receipt(
+    store: &EventStore,
+    item: &model::item::Item,
+    scope: Option<&model::store::EvaluationScope>,
+) -> String {
+    if item.kind != Kind::Report || !item.tags.iter().any(|t| t == model::store::EVALUATION_REPORT_TAG) {
+        return String::new();
+    }
+    let project = item.project.as_deref();
+    let store_wide = model::store::judgement_debt_in_project(store, project).len();
+    match scope {
+        Some(scope) => {
+            let judgement = model::store::evaluation_judgement_owed(store, project, scope, &item.tags);
+            format!(
+                "\njudgement: this evaluation's list (fixed at log position {}) held {} item(s): {} settled, {} skipped \
+                 as not judgeable here. {store_wide} item(s) stay owed store-wide for this project - doctor names them.",
+                scope.started_seq,
+                judgement.settled.len() + judgement.skipped.len() + judgement.owed.len(),
+                judgement.settled.len(),
+                judgement.skipped.len()
+            )
+        }
+        None => format!(
+            "\njudgement: no hook record says which session filed this report, so no verdict was required here. \
+             {store_wide} item(s) stay owed store-wide for this project - doctor names them."
+        ),
+    }
+}
+
+/// Refuse a check that holds only in the linked worktree this server was
+/// started in, and not in its main checkout.
+///
+/// THE DEFECT THIS CLOSES (2026-09-26). Every check is judged against the
+/// main checkout - by doctor, and by the commit gates that sweep a
+/// project's checks. A session working in a worktree attached a `contains`
+/// check to code that existed only in its own, uncommitted worktree: the
+/// write went through, and the check, false on main, blocked every commit
+/// there for eleven minutes until someone found and replaced the literal.
+/// A check whose literal or file exists only in the worktree is a claim
+/// about work that has not landed; it belongs after the merge.
+fn refuse_a_worktree_only_check(
+    check: Option<&model::item::Check>,
+    root: Option<&std::path::Path>,
+    worktree: Option<&std::path::Path>,
+) -> Result<(), String> {
+    let (Some(check), Some(root), Some(worktree)) = (check, root, worktree) else { return Ok(()) };
+    if worktree == root {
+        return Ok(());
+    }
+    let here = model::check::run(check, worktree);
+    let main = model::check::run(check, root);
+    if here == model::check::Outcome::Holds && main != model::check::Outcome::Holds {
+        return Err(format!(
+            "REFUSED: this check holds only in your worktree ('{}') and not in the main checkout ('{}') - the one \
+             every check is judged against, by doctor and by the commit gates. Stored now, it would read as a false \
+             memory there and block unrelated commits. Attach it once this change is merged into the main checkout; \
+             until then, store the fact without the check (its falsifier still says what would prove it wrong).",
+            worktree.display(),
+            root.display()
+        ));
+    }
+    Ok(())
+}
+
 fn build_bindings(moments: &[String], targets: &[TargetArg], always: bool) -> Result<Vec<Binding>, String> {
     let mut bindings = Vec::new();
     for name in moments {
@@ -1475,6 +1554,18 @@ pub struct ThorMcpServer {
     /// `None` simply means no toll - the same fail-open rule every other
     /// check in this system follows when its anchor does not resolve.
     root: Option<Arc<PathBuf>>,
+    /// The linked worktree this server was started in, when it was started
+    /// in one - `root` above is then its MAIN checkout (`serve::project::
+    /// git_root` follows the worktree's pointer). Kept so `remember`/`revise`
+    /// can refuse a check that holds only here (see
+    /// `refuse_a_worktree_only_check`).
+    worktree: Option<Arc<PathBuf>>,
+    /// The store's own path, when this server runs against a real file: where
+    /// the hook's evaluation handover lives (`serve::eval_session`), so a
+    /// filing can be tied to the session that files it. `None` (an in-memory
+    /// store, a replica) means no handover, and the filing gate then demands
+    /// no verdict - see `model::store::EvaluationScope`.
+    handover_db: Option<Arc<PathBuf>>,
     /// Replica divert mode: when set, `remember`, `revise` and `retract` do
     /// NOT write to this store. They append the call to the capture inbox at
     /// this path instead, for the authority to replay (see
@@ -1536,6 +1627,8 @@ impl ThorMcpServer {
             #[cfg(feature = "semantic")]
             embedder_cache: Arc::new(Mutex::new(None)),
             root: None,
+            worktree: None,
+            handover_db: None,
             inbox: None,
             library: None,
             asked_piles: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -1556,6 +1649,8 @@ impl ThorMcpServer {
             #[cfg(feature = "semantic")]
             embedder_cache: Arc::new(Mutex::new(None)),
             root: None,
+            worktree: None,
+            handover_db: None,
             inbox: None,
             library: None,
             asked_piles: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -1597,6 +1692,20 @@ impl ThorMcpServer {
     /// `model::store::declare_in`). Without this the toll does not exist.
     pub fn with_root(mut self, root: PathBuf) -> Self {
         self.root = Some(Arc::new(root));
+        self
+    }
+
+    /// Name the linked worktree this server was started in (see the
+    /// `worktree` field).
+    pub fn with_worktree(mut self, worktree: PathBuf) -> Self {
+        self.worktree = Some(Arc::new(worktree));
+        self
+    }
+
+    /// Read the hook's evaluation handover beside the store at `db` (see the
+    /// `handover_db` field).
+    pub fn with_evaluation_handover(mut self, db: PathBuf) -> Self {
+        self.handover_db = Some(Arc::new(db));
         self
     }
 
@@ -1679,6 +1788,8 @@ impl ThorMcpServer {
         }
         let root = self.root.clone();
         let library = self.library.clone();
+        let worktree = self.worktree.clone();
+        let handover_db = self.handover_db.clone();
         self.blocking(move |s| {
             // CHANGE 2, checked first and against the CALLER'S OWN tags,
             // before anything else even looks at them: see
@@ -1713,6 +1824,11 @@ impl ThorMcpServer {
                 falsifier: args.falsifier.clone(),
                 check,
             };
+            refuse_a_worktree_only_check(
+                item.check.as_ref(),
+                root.as_deref().map(|p| p.as_path()),
+                worktree.as_deref().map(|p| p.as_path()),
+            )?;
             // CHANGE 2: heavy or refusing-kind-checked, the tool tries this
             // fact's own teeth right here, before anything is stored, and
             // appends the box it lands in as a tag `item` carries into
@@ -1732,9 +1848,24 @@ impl ThorMcpServer {
             ) {
                 return Err(why);
             }
-            match model::store::declare_in(s, SESSION_ID, LINEAGE_ID, ACTOR, &item, root.as_deref().map(|p| p.as_path())) {
+            let scope = evaluation_scope(&item, handover_db.as_deref().map(|p| p.as_path()));
+            match model::store::declare_in_scoped(
+                s,
+                SESSION_ID,
+                LINEAGE_ID,
+                ACTOR,
+                &item,
+                root.as_deref().map(|p| p.as_path()),
+                scope.as_ref(),
+            ) {
                 Ok(event) => Ok(with_warnings(
-                    format!("stored '{}' ({:?}, event seq {})", item.id, item.kind, event.seq),
+                    format!(
+                        "stored '{}' ({:?}, event seq {}){}",
+                        item.id,
+                        item.kind,
+                        event.seq,
+                        evaluation_receipt(s, &item, scope.as_ref())
+                    ),
                     &item,
                     None,
                     root.as_deref().map(|p| p.as_path()),
@@ -1757,6 +1888,8 @@ impl ThorMcpServer {
         // cannot borrow self.
         let revise_root = self.root.clone();
         let revise_library = self.library.clone();
+        let revise_worktree = self.worktree.clone();
+        let revise_handover_db = self.handover_db.clone();
         self.blocking(move |s| {
             let existing = model::store::show(s, &args.id).map_err(|e| format!("cannot revise: {e}"))?;
             // CHANGE 2, checked first and only against a NEW tags list the
@@ -1983,6 +2116,15 @@ impl ThorMcpServer {
             // against the TRUE `existing`, never `gate_existing`, for the
             // identical reason `weakenings` below is: a field blanked for a
             // legitimate clear must still read as the change it is.
+            // Only a check this call attaches or changes: a revise that leaves
+            // an existing check alone is not attaching anything.
+            if updated.check != existing.check {
+                refuse_a_worktree_only_check(
+                    updated.check.as_ref(),
+                    revise_root.as_deref().map(|p| p.as_path()),
+                    revise_worktree.as_deref().map(|p| p.as_path()),
+                )?;
+            }
             let teeth_note = match apply_teeth_test_for_revise(&existing, &mut updated, revise_root.as_deref().map(|p| p.as_path()), s) {
                 Ok(note) => note,
                 Err(why) => return Err(why),
@@ -2005,7 +2147,8 @@ impl ThorMcpServer {
             // clear must still be named here, and `gate_existing` is
             // precisely the value that blanking hides it behind.
             let weakenings = model::gate::weakenings(&existing, &updated);
-            match model::store::revise_because(
+            let scope = evaluation_scope(&updated, revise_handover_db.as_deref().map(|p| p.as_path()));
+            match model::store::revise_because_scoped(
                 s,
                 SESSION_ID,
                 LINEAGE_ID,
@@ -2014,6 +2157,7 @@ impl ThorMcpServer {
                 &updated,
                 &existing,
                 args.because.as_deref(),
+                scope.as_ref(),
             ) {
                 Ok(event) => {
                     // A deliberate clear is the one revise outcome that is
@@ -2966,14 +3110,14 @@ impl ServerHandler for ThorMcpServer {
 /// never quietly produce a brand-new, healthy-looking empty store) and serve
 /// stdio, blocking until the client disconnects.
 pub fn run(db: &Path, code: Option<CodeIndexPaths>) -> anyhow::Result<()> {
-    run_in(db, code, None)
+    run_in(db, code, None, None)
 }
 
 /// `run`, told which checkout it was started in so the write gate's
 /// neighbourhood toll has somewhere to run its checks (see
 /// `model::store::declare_in`). `None` means the toll does not exist for
 /// this session, exactly like every other check with no anchor to resolve.
-pub fn run_in(db: &Path, code: Option<CodeIndexPaths>, root: Option<PathBuf>) -> anyhow::Result<()> {
+pub fn run_in(db: &Path, code: Option<CodeIndexPaths>, root: Option<PathBuf>, worktree: Option<PathBuf>) -> anyhow::Result<()> {
     let store = EventStore::open_existing(db)?;
     let server = match code {
         Some(paths) => ThorMcpServer::with_code_index(store, paths),
@@ -2988,9 +3132,15 @@ pub fn run_in(db: &Path, code: Option<CodeIndexPaths>, root: Option<PathBuf>) ->
     // inbox to divert a filing into. There the two tools say plainly that no
     // library is configured, which is the truth, rather than writing a second
     // copy that could never be reconciled.
-    .with_library(library::default_path(db));
+    .with_library(library::default_path(db))
+    // The hook's evaluation handover lives beside the store.
+    .with_evaluation_handover(db.to_path_buf());
     let server = match root {
         Some(root) => server.with_root(root),
+        None => server,
+    };
+    let server = match worktree {
+        Some(worktree) => server.with_worktree(worktree),
         None => server,
     };
     let runtime = tokio::runtime::Runtime::new()?;

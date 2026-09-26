@@ -974,7 +974,19 @@ fn reason_says_nothing_about_this_rule(reason: &str, item: &Item) -> Refusal {
 /// (`store::check_evaluation_report_filing`), the Stop hook's teeth debt and
 /// doctor's teeth line all call this, so none of them can quietly accept an
 /// answer the others would refuse.
-pub fn teeth_answer_settles(item: &Item) -> bool {
+///
+/// A REASON COUNTS ONLY AFTER A REAL TRY (2026-09-26). `check_tried` says
+/// whether the item's own history on the log shows a check was ever attached
+/// to it (`store::ids_whose_check_was_tried`). Measured in two fresh
+/// evaluations that day: two no-literal reasons passed both rules above and
+/// were still wrong - one said in so many words that the syntax was not
+/// found, the other rested on a wrong idea of what `requires` reads - and
+/// neither rule had ever carried a check. The shape and content rules judge
+/// how a reason is written; only the log can say a check was actually tried
+/// before the answer became "nothing can catch this". An `answer-guard:` link
+/// is not a reason but a pointer to where the catching happens, so it needs
+/// no such history.
+pub fn teeth_answer_settles(item: &Item, check_tried: bool) -> bool {
     for tag in &item.tags {
         if let Some(entry) = tag.strip_prefix(crate::store::ANSWER_GUARD_TAG_PREFIX) {
             if !entry.trim().is_empty() {
@@ -985,7 +997,7 @@ pub fn teeth_answer_settles(item: &Item) -> bool {
             (Some(crate::store::TeethAnswer::Reasoned(r)), _) | (_, Some(crate::store::TeethAnswer::Reasoned(r))) => r,
             _ => continue,
         };
-        if no_literal_reason_problem(reason).is_none() && reason_names_its_subject(reason, item) {
+        if check_tried && no_literal_reason_problem(reason).is_none() && reason_names_its_subject(reason, item) {
             return true;
         }
     }
@@ -6426,7 +6438,7 @@ mod tests {
             let err = declare(&item).expect_err(thin);
             assert!(err.problem.contains("says nothing about this rule"), "{}", err.problem);
             assert!(err.fix.contains("'files/readme.md'") || err.fix.contains("'readme.md'"), "names the words that would count: {}", err.fix);
-            assert!(!teeth_answer_settles(&item), "and it settles nothing");
+            assert!(!teeth_answer_settles(&item, true), "and it settles nothing, even after a real try");
         }
         for real in [
             "wiping README.md leaves no text in any command",
@@ -6434,11 +6446,15 @@ mod tests {
         ] {
             item.tags = vec![format!("{}{real}", crate::store::NO_LITERAL_REASON_PREFIX)];
             assert!(declare(&item).is_ok(), "{real}");
-            assert!(teeth_answer_settles(&item), "{real}");
+            assert!(teeth_answer_settles(&item, true), "{real}");
+            // The same good reason on a rule whose history never carried a
+            // check is still no answer - see `teeth_answer_settles`'s own
+            // "A REASON COUNTS ONLY AFTER A REAL TRY".
+            assert!(!teeth_answer_settles(&item, false), "untried: {real}");
         }
         // A bare label is never an answer, and neither is a machine one.
         item.tags = vec![crate::store::TEETH_INFORMING_TAG.to_string()];
-        assert!(!teeth_answer_settles(&item));
+        assert!(!teeth_answer_settles(&item, true));
     }
 
     /// The command version of the same question is held to the same content
@@ -6470,7 +6486,7 @@ mod tests {
         let mut updated = before.clone();
         updated.text = format!("{} (typo fixed)", before.text);
         assert!(revise(&before, &updated).is_ok(), "a correction must not be held hostage");
-        assert!(!teeth_answer_settles(&updated), "but the thin reason is still no answer");
+        assert!(!teeth_answer_settles(&updated, true), "but the thin reason is still no answer");
     }
 
     #[test]

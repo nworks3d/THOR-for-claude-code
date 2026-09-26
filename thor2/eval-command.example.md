@@ -112,17 +112,35 @@ The argument is called `id`, not `entity_id`. On an "unknown entity" error,
 retry the call, first with and then without a project prefix - the local
 mcp__thor__ server is the authority.
 
-Start by pulling the debt: run the health check (its full path is at the
-bottom, by the report) and read the items it lists under `judgement debt`
-for this checkout - with `--full` if there are more than it shows. A pinned
-item never appears on that list: the owner already answered whether it
-belongs there by pinning it. Every item on that list gets a verdict: useful
-if it belonged where it fired,
-noise if it did not. On top of that: every fact you recognised as noise
-this session, and every useful fact the Stop hook itself never asked about.
-Do not re-mark something that already carries a verdict - that would count
-twice. Step 2 is done once this project's debt is at zero, or every item
-still left is named in the report with the reason you could not judge it.
+Your list is fixed the moment this evaluation starts. It starts when you
+open this routine (as a skill, or when the owner types the command), when
+the Stop hook asks for it - or, if none of those happened, at your first
+attempt to file the report. From that moment the list holds exactly the
+items that fired in THIS session and had fired 40 times or more since their
+last verdict, and it never grows: nothing that fires after the start (your
+own remember and revise calls fire the rules bound to the `remember` moment
+on every write) and nothing that fired only in another session is added.
+The note that starts the evaluation names the list; if you missed it, the
+gate names it when it refuses the report. A pinned item is never on it: the
+owner already answered whether it belongs there by pinning it.
+
+Every item on your list gets one of two answers. A verdict: useful if it
+belonged where it fired, noise if it did not. Or, when you cannot honestly
+judge it - "when in doubt, skip" above - an explicit skip, written as a tag
+on the report itself: `not-judgeable:<id>:<reason>`, with a reason of
+at least twelve characters that says why, for example
+`not-judgeable:a-1f2e3d:it fired on a grep of a log I never opened`. A skip
+settles that item for this report only; it stays owed store-wide, and the
+next session that sees it fire is asked again. On top of your list: every
+fact you recognised as noise this session, and every useful fact the Stop
+hook itself never asked about. Do not re-mark something that already
+carries a verdict - that would count twice.
+
+The health check's `judgement debt` line names the debt of the whole store
+for this checkout, including items that only fired in other sessions. Those
+are not this report's to settle and never hold it; judge one only if you
+saw it fire yourself and know where. Step 2 is done once every item on your
+list carries a verdict or a skip tag with a reason.
 
 ## 3. Repair what has rotted (this is not noise)
 
@@ -195,6 +213,16 @@ is a judgement rule" fits every rule in the store, so it says nothing about
 this one. A reason that quotes the call or names the trigger is a settled
 answer; the Stop hook and the report gate stop asking about that fact.
 
+A reason counts only after a real try, and the log is what shows the try: a
+no-literal reason settles a heavy fact only when that fact's own history
+carries a check at some point. So the order is not optional. Attach the
+check you worked out with `revise` first. If it then turns out it cannot
+hold, or it would refuse legitimate use too, revise it away again - with
+`because` saying what went wrong - and add the reason tag. A reason on a
+fact that never carried a check settles nothing, however well it is
+written: two such reasons slipped through on 2026-09-26, one of them saying
+in so many words that the syntax was never found.
+
 A heavy fact that already carries a no-literal tag is re-checked, not waved
 through: read the reason again against the fact. An older reason that
 neither quotes a call nor names the trigger does not count any more - the
@@ -211,6 +239,13 @@ reality: the real hook refused a real call under it, or a real call the rule
 already fired on carries its literal while the rule's ordinary calls still
 pass. Never run the dangerous command itself to "prove" a check: if the
 check does not catch your form of it, the command runs.
+
+Working in a git worktree? Every check is judged against the MAIN checkout -
+the health check and the commit gates read that one, never your worktree. A
+check whose literal or file exists only in your worktree is refused at the
+write: it would read as a false memory on main and block unrelated commits
+there. Attach it once your change is merged; until then the fact stays
+without that check.
 
 What you NEVER do here: stretch the literal to catch more. If it catches one
 form and not another, that is the honest answer - write down the gap you
@@ -414,7 +449,13 @@ report, id `eval-<project>-<YYYY-MM-DD>` (a second one the same day gets
 `-2`), project set to the project you evaluated, tags `evaluation-report`,
 and text the full report exactly as you gave it to the owner. This is a
 dated record, not a rule - the health-check numbers may appear in it, and it
-never fires on its own. It is also what tells THOR the evaluation happened:
+never fires on its own. Add a `not-judgeable:<id>:<reason>` tag for every
+item of your list you skipped (step 2). If the gate refuses the report, it
+names what is still open - each item is either settled by the work it names
+or honestly skipped; the list it holds you to cannot grow between attempts.
+The reply to a filed report says how many items of your list you settled
+and skipped, and how many stay owed store-wide. It is also what tells THOR
+the evaluation happened:
 the Stop hook reads it back, and filing it is what lets a blocked turn end
 and stays quiet for the next 16 hours - a report filed now never buys more
 than that in advance.
