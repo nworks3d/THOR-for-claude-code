@@ -935,8 +935,8 @@ fn payload_is_from_a_subagent(payload: &Value) -> bool {
 /// session that spawned it, so a Stop that carries `agent_id` skips every
 /// rulebook rule marked `owner_reading_only` (short, a plain summary first, no
 /// reflexive disclaimers). A program that drives a local model for the owner
-/// sends `agent_id` for a different reason: so its calls never count toward a
-/// Claude session's upkeep or judgement debt. But the owner reads that
+/// sends `agent_id` for a different reason: so its calls never count toward an
+/// assistant session's upkeep or judgement debt. But the owner reads that
 /// model's answers directly, in his own chat, and those are exactly the
 /// answers the reading rules are for. With this field set, the Response Guard
 /// judges the answer as one the owner reads, while every debt in the Stop arm

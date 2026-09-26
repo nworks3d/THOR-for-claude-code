@@ -8,7 +8,7 @@
 //! a plain summary first, no reflexive disclaimers) step aside for it. A local
 //! model's answer is different: the owner reads it himself, in his own chat,
 //! with no session in between. Its conductor calls the Stop hook as an agent
-//! so the call never counts toward a Claude session's upkeep or judgement
+//! so the call never counts toward an assistant session's upkeep or judgement
 //! debt, and needs a way to say "the owner reads this one".
 
 use std::io::Write;

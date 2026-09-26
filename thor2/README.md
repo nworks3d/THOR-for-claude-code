@@ -261,7 +261,7 @@ Who reads a reply is decided from the `Stop` payload. Claude Code adds
 `owner_reading_only` rules step aside - and so do all of the memory-upkeep
 questions the `Stop` hook asks, since those belong to the owner's own session.
 A program that drives a local model for the owner sends `agent_id` too, so its
-calls never count toward a Claude session's upkeep, but the owner reads those
+calls never count toward an assistant session's upkeep, but the owner reads those
 answers himself. Such a program adds one more field to its `Stop` payload:
 
 ```json
