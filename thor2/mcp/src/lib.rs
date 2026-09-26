@@ -982,7 +982,9 @@ pub struct RememberArgs {
     /// punctuation character) is ONE item with a set here, never several near-identical items each
     /// forbidding one literal. Each literal is its own array entry, never joined into one delimited
     /// string. Refused together with check_literal, refused empty, and refused with any other
-    /// check_kind.
+    /// check_kind except requires, which takes the trigger first - one of this item's own command
+    /// bindings, or a specific literal inside the bound command such as "-p my-dev" in an ssh call -
+    /// then every answer that satisfies it.
     #[serde(default)]
     pub check_literals: Vec<String>,
     /// Action names this item fires on (repeatable), e.g. ["push"]. Only a Rule/Orientation may

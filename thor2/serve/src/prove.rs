@@ -456,12 +456,25 @@ fn prove_requires(id: &str, item: &Item) -> Proof {
         // guess as a proof - see `Proof::NotProvable`'s own doc comment.
         return Proof::NotProvable("a requires check has no command binding to try it against");
     };
-    let attempt = anchor.to_string();
+    let attempt = requires_attempt(item, anchor);
     let one = [LiveItem { id: id.to_string(), item: item.clone() }];
     if absent_guard::find_requires_violation(&one, &attempt, Some(&attempt), "").is_some() {
         return Proof::Fires(attempt);
     }
     Proof::Silent(attempt)
+}
+
+/// The call a `Requires` check is tried with: its binding, carrying the
+/// trigger when the trigger is a literal INSIDE the bound command rather than
+/// the binding itself (`model::gate::requires_trigger_names_a_binding`) - a
+/// call without that literal is not one the check is about.
+fn requires_attempt(item: &Item, anchor: &str) -> String {
+    match &item.check {
+        Some(Check::Requires { when, .. }) if !model::gate::requires_trigger_names_a_binding(when, &item.bindings) => {
+            format!("{anchor} {when}")
+        }
+        _ => anchor.to_string(),
+    }
 }
 
 /// The CLEAN side of a `Requires` check - INVERTED from every other clean
@@ -472,6 +485,11 @@ fn prove_requires(id: &str, item: &Item) -> Proof {
 /// the call's content, never absent. `Fires` here means the guard refused a
 /// call that satisfied its own stated requirement - over-blocking, never a
 /// proof.
+///
+/// An INNER trigger (see `requires_attempt`) is tried clean both ways: the
+/// call carrying the trigger and the answer, and the bare binding with neither
+/// - the ordinary call on that binding the literal exists to leave alone.
+/// Refusing either one is over-blocking.
 fn prove_requires_clean(id: &str, item: &Item, required: &[String]) -> Proof {
     let Some(anchor) = requires_anchor(item) else {
         return Proof::NotProvable("a requires check has no command binding to try it against");
@@ -479,11 +497,15 @@ fn prove_requires_clean(id: &str, item: &Item, required: &[String]) -> Proof {
     let Some(satisfies) = required.first() else {
         return Proof::NotProvable("the required set is empty");
     };
+    let attempt = requires_attempt(item, anchor);
     let one = [LiveItem { id: id.to_string(), item: item.clone() }];
-    if absent_guard::find_requires_violation(&one, anchor, Some(anchor), satisfies).is_some() {
-        return Proof::Fires(format!("{anchor}, carrying {satisfies:?}"));
+    if absent_guard::find_requires_violation(&one, &attempt, Some(&attempt), satisfies).is_some() {
+        return Proof::Fires(format!("{attempt}, carrying {satisfies:?}"));
     }
-    Proof::Silent(format!("{anchor}, carrying {satisfies:?}"))
+    if attempt != anchor && absent_guard::find_requires_violation(&one, anchor, Some(anchor), anchor).is_some() {
+        return Proof::Fires(format!("{anchor}, without the trigger"));
+    }
+    Proof::Silent(format!("{attempt}, carrying {satisfies:?}"))
 }
 
 /// Currency plus reach, shared by BOTH sides of an `Absent`/`AbsentAll`
@@ -1306,6 +1328,25 @@ mod tests {
             TeethBox::Wired { forbidden_tried, clean_tried, .. } => {
                 assert_eq!(forbidden_tried, "deploy");
                 assert!(clean_tried.contains("deploy") && clean_tried.contains("--staging"), "{clean_tried}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// An INNER trigger (2026-09-26) is tried as the binding carrying the
+    /// trigger: without an answer it refuses, with one it passes, and the bare
+    /// binding - any other call on it - passes too.
+    #[test]
+    fn an_inner_trigger_is_tried_inside_its_binding_and_leaves_the_bare_binding_alone() {
+        let item = rule(
+            "a dev compose over ssh names its compose file",
+            vec![cmd("ssh")],
+            Some(Check::Requires { when: "-p acme-dev".to_string(), required: vec!["-f docker-compose.dev.yml".to_string()] }),
+        );
+        match teeth_box("r1", &item, None, &Reality::default()) {
+            TeethBox::Wired { forbidden_tried, clean_tried, .. } => {
+                assert_eq!(forbidden_tried, "ssh -p acme-dev");
+                assert!(clean_tried.contains("docker-compose.dev.yml"), "{clean_tried}");
             }
             other => panic!("{other:?}"),
         }

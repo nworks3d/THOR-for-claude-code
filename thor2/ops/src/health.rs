@@ -3531,10 +3531,10 @@ mod tests {
     /// nothing else.
     ///
     /// THE "CANNOT" ITEM IS LEGACY ON PURPOSE. Ground 24 (`gate::declare`)
-    /// now also requires a `Requires` check's own trigger to name one of the
-    /// item's OWN Command bindings - which makes a Path-bound `Requires`
-    /// item like this one impossible to CREATE through `declare` any more
-    /// (there is no Command binding for any trigger to name). A real store
+    /// now also requires a `Requires` check to carry a Command binding, for
+    /// its trigger to name or to sit inside - which makes a Path-bound
+    /// `Requires` item like this one impossible to CREATE through `declare`
+    /// any more. A real store
     /// can still hold one from before that ground existed, and `can_refuse`
     /// has to read it correctly regardless, so this fixture is written
     /// straight to the log (`legacy_declare`) rather than through the gate.

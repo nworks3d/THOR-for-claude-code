@@ -186,12 +186,14 @@ pub enum Check {
     /// decided entirely by this item's own `Command` bindings (`gate::
     /// declare`'s ground 23 forces every `Requires` check onto one, never
     /// `Always`) - when a call matches ANY of them, at least one of
-    /// `required` must appear in it too, or the call is refused. `when` is
-    /// never compared against the call itself: it names WHICH of the
-    /// item's own bindings is the trigger being described, and the write
-    /// gate (ground 24) requires it to equal one of them, so a reader is
-    /// never pointed at a binding this item does not actually carry. The
-    /// set is what was forgotten.
+    /// `required` must appear in it too, or the call is refused. `when`
+    /// either names WHICH of the item's own bindings is the trigger being
+    /// described (then it is never compared against the call itself), or is
+    /// a specific literal INSIDE the bound command - "-p my-dev" inside an
+    /// `ssh` call - and then only a reached call that carries it owes an
+    /// answer. The write gate (ground 24) allows exactly those two, so a
+    /// reader is never pointed at a binding this item does not actually
+    /// carry. The set is what was forgotten.
     ///
     /// The set, rather than one word, is the other half of the same measured
     /// case: "name a model" is satisfied by any of the cheap ones, and a rule

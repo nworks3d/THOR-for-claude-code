@@ -587,12 +587,22 @@ fragment to look for. It carries a trigger plus a set of acceptable answers (in
 Command bindings, at least one answer has to appear in it too, or the call is
 refused. It only ever binds to a Command target naming the exact command or
 tool it is about, never `always` (which names nothing for a trigger to compare
-against), and the trigger itself has to equal one of those bindings. For
-example: a rule bound to the commands `Agent` and `Workflow`, with literals
-`["Agent", "haiku", "sonnet", "opus"]` - an `Agent` call naming none of the
-three cheap models is refused, and so is a `Workflow` call, because the rule
-watches both bindings it is bound to, not only the one spelled out as the
-trigger.
+against), and the trigger itself either equals one of those bindings or is a
+literal that sits INSIDE the bound command. For example: a rule bound to the
+commands `Agent` and `Workflow`, with literals `["Agent", "haiku", "sonnet",
+"opus"]` - an `Agent` call naming none of the three cheap models is refused,
+and so is a `Workflow` call, because the rule watches both bindings it is bound
+to, not only the one spelled out as the trigger.
+
+A trigger inside the command is for the case where the command that runs says
+too little on its own. A rule bound to `ssh` with literals `["-p my-dev",
+"-f docker-compose.dev.yml"]` asks for the dev compose file only on an `ssh`
+call that carries `-p my-dev`; every other `ssh` call goes through untouched,
+and so does `-p my-dev-old`, because the trigger has to appear as whole words.
+Such a trigger has to be specific: at least four characters, and two or more
+words or a flag, name or path with a digit or punctuation in it. One plain
+word such as `dev` is refused, since inside a command it would pick out far
+more calls than the ones meant.
 
 One more thing `revise` refuses without asking first: weakening a rule that
 already carries a check - clearing or changing the check, lowering its

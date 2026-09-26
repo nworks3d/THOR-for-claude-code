@@ -502,6 +502,32 @@ fn same_trigger_words(when: &str, binding: &str) -> bool {
     when_words == binding_words
 }
 
+/// Whether a `requires` trigger names one of `bindings`' own Command targets
+/// (`same_trigger_words`): then every call reaching a binding is the trigger.
+/// When it names none, the trigger is a literal INSIDE the bound command, and
+/// only a call that carries it is (see ground 24). The one definition both
+/// the write gate and `serve::absent_guard::find_requires_violation` read.
+pub fn requires_trigger_names_a_binding(when: &str, bindings: &[Binding]) -> bool {
+    bindings.iter().any(|b| matches!(b, Binding::Target { kind: TargetKind::Command, value } if same_trigger_words(when, value)))
+}
+
+/// Whether an inner `requires` trigger is specific enough to mean something
+/// inside a command: at least four characters, and either two or more words
+/// ("docker compose", "-p my-dev") or one word carrying a character a plain
+/// word never has - a digit or punctuation, as a flag, a name or a path does
+/// ("--force", "compose.dev.yml", "stack2"). One plain word ("dev", "push",
+/// "production") is refused: inside a command it matches far more calls than
+/// the ones meant, or none of them.
+pub fn inner_trigger_is_specific(when: &str) -> bool {
+    let trigger = when.trim();
+    if trigger.chars().count() < 4 {
+        return false;
+    }
+    let words = trigger.split_whitespace().count();
+    let marked = trigger.chars().any(|c| !c.is_alphabetic() && !c.is_whitespace());
+    words >= 2 || marked
+}
+
 // GROUND 7 WAS HERE, AND THE DATA KILLED IT (2026-08-02).
 //
 // The rule was "a Target must be named in the item's own sentence, otherwise
@@ -1652,7 +1678,8 @@ fn declare_inner(
         ));
     }
     // GROUND 24: a `requires` check's own trigger must equal one of the
-    // item's OWN Command bindings, or it names a phantom.
+    // item's OWN Command bindings, or be a specific literal inside one (the
+    // last paragraph below) - anything else names a phantom.
     //
     // Ground 23 just above already forces every `Requires` check onto a
     // Command binding, and the serve-time guard (`serve::absent_guard::
@@ -1680,22 +1707,41 @@ fn declare_inner(
     // but this is EXACT equality of the whole word sequence, never a prefix:
     // the question here is "does the trigger literally name one of the
     // bindings", never "would it match a real invocation of one" (that
-    // looser question stays the guard's own, at serve time). A rule that
-    // needs a narrower trigger binds to the narrower command instead (e.g.
-    // "git commit", not "git") and sets the trigger to match it.
+    // looser question stays the guard's own, at serve time).
     //
     // Reimplemented here rather than shared: `model` cannot depend on
     // `serve` (the dependency the other three crates all take runs the
     // opposite way - see `serve/Cargo.toml`), so `same_trigger_words` below
     // is its own small comparison, not a call into `command_anchor_names`.
+    //
+    // THE INNER TRIGGER (2026-09-26). Equal to a binding was the only shape
+    // allowed, and it made one real catch impossible: "a dev compose run
+    // over ssh must name the dev compose file". The call that runs is `ssh`;
+    // the only thing marking it as the dev stack is a literal deep inside it
+    // ("-p <dev project>"), and no binding can say that. So a trigger that
+    // names none of the bindings is now read as a literal INSIDE the bound
+    // command: the rule stays bound to `ssh`, and demands its answers only
+    // from a call that carries the literal (`serve::absent_guard::
+    // find_requires_violation`). Such a trigger must be specific enough to
+    // mean something inside a command - see `inner_trigger_is_specific` -
+    // and the item still needs a Command binding for it to live in.
     if let Some(Check::Requires { when, .. }) = &item.check {
-        let names_a_binding = item.bindings.iter().any(|b| {
-            matches!(b, Binding::Target { kind: TargetKind::Command, value } if same_trigger_words(when, value))
-        });
-        if !names_a_binding {
+        let has_command_binding =
+            item.bindings.iter().any(|b| matches!(b, Binding::Target { kind: TargetKind::Command, .. }));
+        if !has_command_binding {
             return Err(Refusal::new(
-                format!("a requires check's trigger '{when}' does not name any of this item's own Command bindings"),
-                "the trigger must name one of the commands or tools this rule is bound to; a rule that needs a narrower trigger binds to the narrower command instead (e.g. 'git commit', not 'git') and sets the trigger to match it",
+                "a requires check has no Command binding, so no call can ever reach it",
+                "bind it to the command or tool it is about - a Target of kind Command naming the exact command or subcommand, or the tool's own bare name",
+            ));
+        }
+        if !requires_trigger_names_a_binding(when, &item.bindings) && !inner_trigger_is_specific(when) {
+            return Err(Refusal::new(
+                format!(
+                    "a requires check's trigger '{when}' names none of this item's own Command bindings, and as a \
+                     literal inside the bound command it is not specific enough - one plain word, or under four \
+                     characters, picks out far more calls than the one meant"
+                ),
+                "the trigger must name one of the commands or tools this rule is bound to, or be a literal that only the calls meant carry inside that command: two or more words, or a flag, name or path with a digit or punctuation in it (e.g. '-p my-dev', 'compose.dev.yml')",
             ));
         }
     }
@@ -2336,9 +2382,10 @@ pub fn build_check(
         if literals.len() < 2 {
             return Err(format!(
                 "check_kind 'requires' needs at least two literals and was given {} - the first is \
-                 the trigger, which must name one of this item's own Command bindings (the exact \
-                 command/subcommand or tool this rule is about, never Always - see ground 24), and \
-                 every one after it is an answer that satisfies it",
+                 the trigger, which names one of this item's own Command bindings (the exact \
+                 command/subcommand or tool this rule is about, never Always) or a specific literal \
+                 that only the calls meant carry inside that command (see ground 24), and every one \
+                 after it is an answer that satisfies it",
                 literals.len()
             ));
         }
@@ -5233,32 +5280,62 @@ mod tests {
     // STORED trigger honest, so a reader (or any future code that reads
     // `when` again) is never pointed at a binding this item does not carry.
 
+    /// A trigger that names none of the bindings is read as a literal INSIDE
+    /// the bound command (2026-09-26), so it has to be specific enough to
+    /// mean something there: one plain word ("push", "dev") would pick out
+    /// half of all calls, or none of the ones meant.
     #[test]
-    fn a_requires_check_whose_trigger_names_no_binding_at_all_is_refused() {
-        let mut item = base(Kind::Rule);
-        item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "git commit".to_string() }];
-        item.check = Some(Check::Requires { when: "git push".to_string(), required: vec!["issue:".to_string()] });
-        let err = declare(&item).unwrap_err();
-        assert!(err.problem.contains("git push"), "names the orphan trigger: {}", err.problem);
-        assert!(err.fix.contains("commands or tools this rule is bound to"), "{}", err.fix);
+    fn a_requires_check_whose_trigger_is_one_plain_word_is_refused() {
+        for (binding, when) in [("git commit", "push"), ("ssh", "dev"), ("ssh", "-p")] {
+            let mut item = base(Kind::Rule);
+            item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: binding.to_string() }];
+            item.check = Some(Check::Requires { when: when.to_string(), required: vec!["issue:".to_string()] });
+            let err = declare(&item).unwrap_err();
+            assert!(err.problem.contains(&format!("'{when}'")), "names the trigger: {}", err.problem);
+            assert!(err.problem.contains("not specific enough"), "{}", err.problem);
+            assert!(err.fix.contains("commands or tools this rule is bound to"), "{}", err.fix);
+        }
     }
 
-    /// THE FLIP FROM THE OLD DESIGN. Before `find_requires_violation` moved
-    /// REACH onto the bindings alone, this exact shape (a broader binding,
-    /// a narrower trigger) was the documented way to keep a trigger tight
-    /// without a second rule. It is refused now: the trigger and the
-    /// binding must be the SAME words, never one a prefix of the other -
-    /// the fix the message itself names is to bind the narrower command
-    /// directly ("git commit"), not to keep "git" and hope the trigger
-    /// narrows it.
+    /// THE CATCH THIS MAKES POSSIBLE (2026-09-26): "a dev compose run over ssh
+    /// must name the dev compose file". The rule stays bound to `ssh` - the
+    /// command that actually runs - and demands its answer only when the
+    /// literal that marks the dev stack appears inside it.
     #[test]
-    fn a_binding_that_is_only_a_prefix_of_the_trigger_is_refused() {
+    fn a_specific_trigger_inside_the_bound_command_is_accepted() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "ssh".to_string() }];
+        item.check = Some(Check::Requires {
+            when: "-p acme-dev".to_string(),
+            required: vec!["-f docker-compose.dev.yml".to_string()],
+        });
+        assert!(declare(&item).is_ok(), "{:?}", declare(&item));
+    }
+
+    /// THE FLIP FROM THE PREVIOUS DESIGN. A broader binding with a narrower
+    /// trigger was refused while the trigger had to equal a binding; it is
+    /// the ordinary inner-trigger shape now, and the guard demands the
+    /// answer only on a call that carries the narrower words.
+    #[test]
+    fn a_trigger_narrower_than_its_binding_is_an_inner_trigger() {
         let mut item = base(Kind::Rule);
         item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "git".to_string() }];
         item.check = Some(Check::Requires { when: "git commit".to_string(), required: vec!["issue:".to_string()] });
+        assert!(declare(&item).is_ok(), "{:?}", declare(&item));
+    }
+
+    /// An inner trigger lives inside a command, so a requires check still
+    /// needs a Command binding to live in.
+    #[test]
+    fn a_requires_check_with_no_command_binding_is_refused() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "deploy/compose.yml".to_string() }];
+        item.check = Some(Check::Requires {
+            when: "-p acme-dev".to_string(),
+            required: vec!["-f docker-compose.dev.yml".to_string()],
+        });
         let err = declare(&item).unwrap_err();
-        assert!(err.problem.contains("git commit"), "{}", err.problem);
-        assert!(err.fix.contains("git commit"), "names the exact fix: bind the narrower command: {}", err.fix);
+        assert!(err.problem.contains("no Command binding"), "{}", err.problem);
     }
 
     #[test]

@@ -845,13 +845,13 @@ fn requires_pair(check: &Check) -> Option<(&str, &[String])> {
 /// bindings already say exactly which calls this rule watches (that is
 /// what ground 23 forces `Requires` onto a `Command` target for in the
 /// first place), so ANY one of them reaching is the whole trigger. `when`
-/// is still read here (`requires_pair`) but only because that is the
-/// shared shape `Check::Requires` carries - it plays no part in deciding
-/// reach any more (see `model::gate`'s own ground 24, which is what keeps
-/// the STORED `when` honest instead: it must equal one of the item's own
-/// bindings, a write-time check, never a serve-time one). The message below
-/// quotes the binding that actually matched, never `when`, so it can never
-/// claim a call tripped a spelling it did not.
+/// plays no part in deciding reach any more (see `model::gate`'s own ground
+/// 24, which is what keeps the STORED `when` honest instead: it must equal
+/// one of the item's own bindings, or be a specific literal inside one - the
+/// inner trigger below, the one case where `when` narrows which reached
+/// calls owe an answer). The message below quotes the binding that actually
+/// matched, never a `when` that merely names a binding, so it can never claim
+/// a call tripped a spelling it did not.
 ///
 /// Matching used to be `content.contains(when)` before ANY of this: a
 /// weaker defect than the one above, but still worth remembering.
@@ -866,6 +866,17 @@ fn requires_pair(check: &Check) -> Option<(&str, &[String])> {
 /// never narrowed to the field the trigger matched - a missed case here
 /// costs far less than a false refusal, the rule this whole project holds to
 /// throughout.
+///
+/// THE INNER TRIGGER (2026-09-26), the one case where `when` is read again.
+/// A trigger that names none of the item's bindings (`model::gate::
+/// requires_trigger_names_a_binding`) is a literal INSIDE the bound command -
+/// "-p my-dev" inside an `ssh` call - and the write gate has already held it
+/// to being specific enough (`model::gate::inner_trigger_is_specific`). Reach
+/// is still the binding, exactly as above, so no second binding can go dead;
+/// the literal only narrows which of the reached calls owe an answer. It is
+/// looked for in the command itself (the flattened input for a tool with no
+/// command), as whole words (`contains_as_words`): "-p my-dev" never matches
+/// "-p my-dev-old".
 pub fn find_requires_violation(items: &[LiveItem], tool: &str, command: Option<&str>, content: &str) -> Option<String> {
     let target = command.unwrap_or(tool);
     for candidate in items {
@@ -878,13 +889,18 @@ pub fn find_requires_violation(items: &[LiveItem], tool: &str, command: Option<&
             continue;
         };
         let Some(check) = candidate.item.check.as_ref() else { continue };
-        let Some((_when, required)) = requires_pair(check) else { continue };
+        let Some((when, required)) = requires_pair(check) else { continue };
+        let inner = !model::gate::requires_trigger_names_a_binding(when, &candidate.item.bindings);
+        if inner && !contains_as_words(command.unwrap_or(content), when) {
+            continue;
+        }
         if required.iter().any(|r| content.contains(r.as_str())) {
             continue;
         }
         let answers: Vec<String> = required.iter().map(|r| format!("{r:?}")).collect();
+        let trips = if inner { format!("{anchor:?} carrying {when:?}") } else { format!("{anchor:?}") };
         return Some(format!(
-            "[THOR] rule {} applies here: this call trips {anchor:?} and says none of {}. {} \
+            "[THOR] rule {} applies here: this call trips {trips} and says none of {}. {} \
              Nothing was done. Add one and run the call again.",
             candidate.id,
             answers.join(" or "),
@@ -892,6 +908,26 @@ pub fn find_requires_violation(items: &[LiveItem], tool: &str, command: Option<&
         ));
     }
     None
+}
+
+/// Whether `needle` occurs in `haystack` as whole words: the characters right
+/// around it are not part of a word, a flag, a name or a path (letters,
+/// digits, `-`, `_`, `.`, `/`, `\`), so "-p my-dev" is found in `compose -p
+/// my-dev up` and in `"-p my-dev"`, but never in `-p my-dev-old`. An empty
+/// needle is never found.
+fn contains_as_words(haystack: &str, needle: &str) -> bool {
+    let needle = needle.trim();
+    if needle.is_empty() {
+        return false;
+    }
+    let joins = |c: char| c.is_alphanumeric() || "-_./\\".contains(c);
+    haystack.match_indices(needle).any(|(at, _)| {
+        let before = haystack[..at].chars().next_back();
+        let after = haystack[at + needle.len()..].chars().next();
+        let starts_clean = before.is_none_or(|c| !joins(c) || !needle.starts_with(joins));
+        let ends_clean = after.is_none_or(|c| !joins(c) || !needle.ends_with(joins));
+        starts_clean && ends_clean
+    })
 }
 
 /// The block reason for the first live item among `items` carrying a
@@ -2397,6 +2433,75 @@ mod tests {
             value: "Workflow".to_string(),
         });
         assert!(find_requires_violation(&items, "Grep", None, "Workflow").is_none());
+    }
+
+    // ------------------------------------------- inner triggers (2026-09-26)
+
+    /// A rule bound to `ssh` whose trigger is a literal INSIDE the command:
+    /// a dev compose run over ssh must name the dev compose file.
+    fn dev_compose_over_ssh() -> Vec<LiveItem> {
+        let item = model::item::Item {
+            id: "dev-compose-names-its-file".to_string(),
+            kind: model::item::Kind::Rule,
+            text: "a dev docker compose over ssh must carry -f docker-compose.dev.yml".to_string(),
+            bindings: vec![model::item::Binding::Target {
+                kind: model::item::TargetKind::Command,
+                value: "ssh".to_string(),
+            }],
+            severity: Some(model::item::Severity::Costly),
+            project: None,
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some("the dev stack starts correctly without naming its compose file".to_string()),
+            check: Some(model::item::Check::Requires {
+                when: "-p acme-dev".to_string(),
+                required: vec!["-f docker-compose.dev.yml".to_string()],
+            }),
+        };
+        vec![LiveItem { id: item.id.clone(), item }]
+    }
+
+    fn requires_on(items: &[LiveItem], command: &str) -> Option<String> {
+        find_requires_violation(items, "Bash", Some(command), command)
+    }
+
+    /// THE CATCH THIS MAKES POSSIBLE: the rule fires on the ssh call that
+    /// carries the inner trigger and forgot the answer.
+    #[test]
+    fn an_inner_trigger_fires_when_it_appears_and_the_answer_is_missing() {
+        let items = dev_compose_over_ssh();
+        let reason = requires_on(&items, "ssh admin@host \"cd /srv/app && docker compose -p acme-dev up -d\"")
+            .expect("the dev compose run without its file must be refused");
+        assert!(reason.contains("dev-compose-names-its-file"), "{reason}");
+        assert!(reason.contains("-p acme-dev"), "the reason names the inner trigger that tripped: {reason}");
+    }
+
+    #[test]
+    fn an_inner_trigger_passes_when_the_answer_is_there() {
+        let items = dev_compose_over_ssh();
+        assert!(requires_on(
+            &items,
+            "ssh admin@host \"cd /srv/app && docker compose -f docker-compose.dev.yml -p acme-dev up -d\""
+        )
+        .is_none());
+    }
+
+    /// THE FALSE BLOCK THIS MUST NEVER BECOME: every other ssh call - the
+    /// prod stack, a status check, a project whose name merely starts with
+    /// the trigger's - goes through untouched.
+    #[test]
+    fn an_inner_trigger_never_blocks_another_call_on_the_same_binding() {
+        let items = dev_compose_over_ssh();
+        for command in [
+            "ssh admin@host \"docker ps\"",
+            "ssh admin@host \"cd /srv/app && docker compose -p acme-prod up -d\"",
+            "ssh admin@host \"docker compose -p acme-dev-old logs\"",
+            "ssh admin@host uptime",
+        ] {
+            assert!(requires_on(&items, command).is_none(), "{command} must pass");
+        }
+        assert!(requires_on(&items, "scp -p acme-dev host:/x .").is_none(), "another command is never reached");
     }
 
     /// THE REAL RULE ALREADY ON THE OWNER'S OWN MACHINE, proven at the guard
