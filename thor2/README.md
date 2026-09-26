@@ -244,7 +244,29 @@ rule is one entry with:
   citation however it happens to be written.
 - `tier` - `block` holds the reply back until it is fixed; `warn` only
   leaves a note behind. Every rule seeded here is `block`.
+- `owner_reading_only` - `true` marks a rule about how a reply reads to the
+  owner (its length, a summary first, a tone), not about whether the agent
+  told the truth. Such a rule steps aside for an agent's reply, which the
+  session that spawned the agent reads, not the owner. Left out, the rule
+  applies to everyone.
 - `reminder` - the plain-language nudge the agent sees when the rule fires.
+
+Who reads a reply is decided from the `Stop` payload. Claude Code adds
+`agent_id` only when the reply comes from a subagent, and then the
+`owner_reading_only` rules step aside - and so do all of the memory-upkeep
+questions the `Stop` hook asks, since those belong to the owner's own session.
+A program that drives a local model for the owner sends `agent_id` too, so its
+calls never count toward a Claude session's upkeep, but the owner reads those
+answers himself. Such a program adds one more field to its `Stop` payload:
+
+```json
+{"hook_event_name": "Stop", "agent_id": "local-model", "owner_reads_answer": true, "...": "..."}
+```
+
+`owner_reads_answer: true` brings the `owner_reading_only` rules back for that
+one answer and changes nothing else: the call is still an agent's, so no
+upkeep question of the owner's session is asked of it. Only a literal `true`
+counts, and without `agent_id` the field changes nothing.
 
 ## Check it
 

@@ -45,7 +45,11 @@ enum Command {
     /// 2 (moment of action) and 3 (per prompt): JSON on stdin, JSON on
     /// stdout, exit 0 always, silent on any failure. Branches on the JSON
     /// payload's `hook_event_name` ("SessionStart" / "UserPromptSubmit" /
-    /// anything else, treated as a PreToolUse-shaped tool call).
+    /// anything else, treated as a PreToolUse-shaped tool call). A `Stop`
+    /// payload from an agent (`agent_id`) whose answer the owner reads
+    /// himself may add `"owner_reads_answer": true`: the rules about how an
+    /// answer reads to the owner then apply to it, and it stays an agent's
+    /// call for everything else.
     Hook {
         /// Say on stderr whether this run could look at all, and exit 2 when it
         /// could not. For a caller that is NOT an assistant harness: the
@@ -922,6 +926,27 @@ fn payload_is_from_a_subagent(payload: &Value) -> bool {
     payload.get("agent_id").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty())
 }
 
+/// Whether a Stop payload says the OWNER reads this answer himself:
+/// `"owner_reads_answer": true`, a field THOR defines (Claude Code never sends
+/// it). Only a literal JSON `true` counts; absent, `false` or anything else
+/// reads as "no".
+///
+/// WHY IT EXISTS (2026-09-26). An agent's answer is normally read by the
+/// session that spawned it, so a Stop that carries `agent_id` skips every
+/// rulebook rule marked `owner_reading_only` (short, a plain summary first, no
+/// reflexive disclaimers). A program that drives a local model for the owner
+/// sends `agent_id` for a different reason: so its calls never count toward a
+/// Claude session's upkeep or judgement debt. But the owner reads that
+/// model's answers directly, in his own chat, and those are exactly the
+/// answers the reading rules are for. With this field set, the Response Guard
+/// judges the answer as one the owner reads, while every debt in the Stop arm
+/// still sees an agent (`payload_is_from_a_subagent`) and leaves it alone.
+/// Without `agent_id` the field changes nothing: the owner's own session
+/// already gets every rule.
+fn payload_says_the_owner_reads_the_answer(payload: &Value) -> bool {
+    payload.get("owner_reads_answer").and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
 /// The owner's own last typed prompt, for `respond::guard_verdict`'s
 /// `list_request_any_of` exemption (FALSE BLOCK A - see
 /// `respond::last_user_prompt`'s own doc comment for the full story).
@@ -1143,6 +1168,13 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
         // the backlog burn (`teeth_debt`) reuses this same value but decides
         // its own subagent scope independently, at its own call site.
         let is_subagent = payload_is_from_a_subagent(&payload);
+        // Who READS this answer, which is a different question from who
+        // wrote it: an agent's answer is normally read by the session that
+        // spawned it, but a caller can say the owner reads it himself
+        // (`payload_says_the_owner_reads_the_answer`). Only the Response
+        // Guard's reader-scoped rules read this; every debt below keeps
+        // reading `is_subagent`, so the agent's own session separation holds.
+        let reader_is_an_agent = is_subagent && !payload_says_the_owner_reads_the_answer(&payload);
         // THE DEFECT THIS CLOSES, reported by the owner on 2026-08-09: "my
         // TLDR rules worked an hour ago and now they are gone."
         //
@@ -1170,7 +1202,7 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
             }
             let rulebook_text = std::fs::read_to_string(respond::default_rulebook_path(db_path)).ok();
             let last_prompt = last_user_prompt_from_payload(&payload);
-            let verdict = respond::guard_verdict(rulebook_text.as_deref(), msg, &last_prompt, is_subagent);
+            let verdict = respond::guard_verdict(rulebook_text.as_deref(), msg, &last_prompt, reader_is_an_agent);
             let text = verdict.block_reason.or(verdict.warn_reason)?;
             return Some(HookOutput::Warn { event_name, text });
         }
@@ -1186,7 +1218,7 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
         } else {
             let rulebook_text = std::fs::read_to_string(respond::default_rulebook_path(db_path)).ok();
             let last_prompt = last_user_prompt_from_payload(&payload);
-            let verdict = respond::guard_verdict(rulebook_text.as_deref(), msg, &last_prompt, is_subagent);
+            let verdict = respond::guard_verdict(rulebook_text.as_deref(), msg, &last_prompt, reader_is_an_agent);
             if let Some(reason) = verdict.block_reason {
                 return Some(HookOutput::Decision(serde_json::json!({
                     "decision": "block",
