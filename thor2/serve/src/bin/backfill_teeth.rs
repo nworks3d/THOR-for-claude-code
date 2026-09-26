@@ -54,7 +54,7 @@ use thor_core::event_store::EventStore;
 
 #[derive(Parser)]
 #[command(
-    name = "backfill-teeth",
+    name = "backfill_teeth",
     version = env!("CARGO_PKG_VERSION"),
     about = "Compute and record the teeth box (proven guard / informing / refuses-legitimate-use / anchor-collapsed) \
              for every live fact that owes one, using the identical function the write path already runs"
@@ -77,7 +77,7 @@ struct Cli {
     projects: Vec<String>,
 }
 
-const ACTOR: &str = "backfill-teeth";
+const ACTOR: &str = "backfill_teeth";
 
 /// The box `backfill_teeth` actually records, collapsing `TeethBox`'s five
 /// write-time variants into the four STORED tags - `KeepRefusing` folds into

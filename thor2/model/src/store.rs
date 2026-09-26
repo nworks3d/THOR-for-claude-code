@@ -1753,7 +1753,8 @@ fn check_evaluation_report_filing(store: &EventStore, item: &Item) -> Option<Ref
             "{} heavy rule(s) that apply to this project (its own or global) have fired since the previous report \
              - the log records when a rule fired, never in which project - and still carry no machine-tested \
              teeth box: {named} - revise each one (even with no other field changed, so the write path tries its \
-             teeth again) or run the backfill maintenance pass against this store",
+             teeth again) or run `backfill_teeth --db <this store>` to see what it would label, then again with \
+             `--apply` to label it",
             unboxed.len()
         ));
     }
@@ -3820,6 +3821,11 @@ mod tests {
         let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
         assert!(refusal.problem.contains("unboxed-heavy"), "{}", refusal.problem);
         assert!(refusal.problem.contains("no machine-tested"), "{}", refusal.problem);
+        assert!(
+            refusal.problem.contains("`backfill_teeth --db"),
+            "the refusal must name the program exactly as it is built and shipped: {}",
+            refusal.problem
+        );
     }
 
     /// THE SCOPE THIS CONDITION ACTUALLY HAS, stated where it is enforced. An

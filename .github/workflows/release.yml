@@ -36,7 +36,7 @@ env:
   # measurement tooling that only makes sense inside a checkout, so it is
   # deliberately NOT shipped: apply_pins, fake_judge, footer_read, import_noise,
   # repair_project, restore_attribution, verify.
-  SHIPPED_BINS: install doctor serve mcp codeindex backup sync migrate
+  SHIPPED_BINS: install doctor serve mcp codeindex backup sync migrate backfill_teeth
 
 jobs:
   # A tag that does not build or does not pass its tests must never become a
