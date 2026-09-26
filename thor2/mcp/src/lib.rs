@@ -788,6 +788,59 @@ fn teeth_test(
     }
 }
 
+/// What trying a check on `revise` with `trial_check` showed (see
+/// `ReviseArgs::trial_check`): `trial` is the item as it would be with the
+/// tried check and bindings. The write gate's own grounds and the capacity
+/// check run first, then the same write-time proof a stored check gets
+/// (`teeth_test`); a refusal from any of them is a try that failed, and is
+/// recorded with its reason. A check that comes back wired or proven is no
+/// failed try at all, so the call is refused and told to hang it instead.
+/// The reason tags a trial is sent with are taken off the tried item first:
+/// the gate refuses a refusing check and a reason together, which is the
+/// very pair a trial exists to keep apart.
+fn trial_outcome(
+    existing: &model::item::Item,
+    trial: &model::item::Item,
+    root: Option<&std::path::Path>,
+    store: &EventStore,
+) -> Result<model::store::TriedCheck, String> {
+    let Some(check) = trial.check.clone() else {
+        return Err("REFUSED: trial_check needs the check to try in this same call".to_string());
+    };
+    if !model::gate::is_refusing_check(Some(&check)) {
+        return Err("REFUSED: only a check that can refuse (forbidden, absent, absent_all, requires) can be tried - \
+                    contains and path_exists never stop anything, so trying one shows nothing"
+            .to_string());
+    }
+    let is_reason = |t: &String| model::store::teeth_answer(t).is_some() || model::gate::command_teeth_answer(t).is_some();
+    let mut trial = trial.clone();
+    trial.tags.retain(|t| !is_reason(t));
+    // The same tags off the baseline too, so the gate never reads their
+    // removal as a dropped field of the trial's own making.
+    let mut base = existing.clone();
+    base.tags.retain(|t| !is_reason(t));
+    let outcome = if let Err(refusal) = model::gate::revise(&base, &trial) {
+        format!("the write gate refused it: {refusal}")
+    } else if let Ok(model::store::Capacity::Full(refusal) | model::store::Capacity::DeadOnArrival(refusal)) =
+        model::store::capacity(store, &trial)
+    {
+        format!("the write gate refused it: {refusal}")
+    } else {
+        match teeth_test(&trial, root, store) {
+            Err(msg) => format!("the write gate refused it: {msg}"),
+            Ok((Some(tag), note)) if tag == model::store::TEETH_PROVEN_TAG || tag == model::store::TEETH_WIRED_TAG => {
+                return Err(format!(
+                    "REFUSED: the check you tried works ({}), so it is no failed try - hang it for real: send the same \
+                     revise without trial_check, and without a reason tag",
+                    note.unwrap_or_default()
+                ));
+            }
+            Ok((_, note)) => note.unwrap_or_else(|| "tried, and the proof had nothing to say".to_string()),
+        }
+    };
+    Ok(model::store::TriedCheck { check, outcome })
+}
+
 /// `teeth_test` above, run for a NEW item (`remember`): always tried, since
 /// there is no existing item whose check/bindings could already have settled
 /// the question. Mutates `item.tags` in place (pushing the tag `teeth_test`
@@ -1232,6 +1285,21 @@ pub struct ReviseArgs {
     /// check instead.
     #[serde(default)]
     pub clear_check: bool,
+    /// Set true to only TRY the check given in this call (check_kind plus its
+    /// path/literals), together with any bindings given in this call, never
+    /// store them: the item keeps its current check and bindings, and every
+    /// other field in this call is written as usual. This is how a reason
+    /// that nothing can catch a rule's mistake ('no-literal:<why>' or
+    /// 'no-catch-on-command:<why>') earns its real try without hanging a
+    /// check live that you already expect to be wrong: send the reason tag
+    /// and the check you tried in the same call. THOR runs its own
+    /// write-time proof on the tried check and records the check and what the
+    /// proof found in this item's history. A tried check that turns out to
+    /// work (wired or proven) is refused as a trial - hang it for real
+    /// instead. Only a check that can refuse (forbidden, absent, absent_all,
+    /// requires) can be tried.
+    #[serde(default)]
+    pub trial_check: bool,
     /// Replaces the moment bindings. Give this, `targets`, and/or `always`
     /// TOGETHER to replace the WHOLE binding list in one call - when none of
     /// the three are given, the existing bindings are kept untouched. See
@@ -2108,6 +2176,21 @@ impl ThorMcpServer {
             if tags_cleared {
                 gate_existing.tags = Vec::new();
             }
+            // A TRIAL (see `ReviseArgs::trial_check`): the check and bindings
+            // named in this call are only tried, and the item keeps its own.
+            let tried = if args.trial_check {
+                if check_kind_arg.as_deref().is_none_or(|k| k.trim().is_empty()) {
+                    return Err("REFUSED: trial_check needs the check to try in this same call: check_kind plus its \
+                                check_path, check_literal or check_literals (clear_check cannot be tried)"
+                        .to_string());
+                }
+                let trial_item = updated.clone();
+                updated.check = existing.check.clone();
+                updated.bindings = existing.bindings.clone();
+                Some(trial_outcome(&existing, &trial_item, revise_root.as_deref().map(|p| p.as_path()), s)?)
+            } else {
+                None
+            };
             // CHANGE 2: unless this revise touches none of the check, the
             // bindings or the severity of an item that already carries a
             // box, in which case that box is carried forward untouched and
@@ -2148,7 +2231,7 @@ impl ThorMcpServer {
             // precisely the value that blanking hides it behind.
             let weakenings = model::gate::weakenings(&existing, &updated);
             let scope = evaluation_scope(&updated, revise_handover_db.as_deref().map(|p| p.as_path()));
-            match model::store::revise_because_scoped(
+            match model::store::revise_tried_scoped(
                 s,
                 SESSION_ID,
                 LINEAGE_ID,
@@ -2158,6 +2241,7 @@ impl ThorMcpServer {
                 &existing,
                 args.because.as_deref(),
                 scope.as_ref(),
+                tried.as_ref(),
             ) {
                 Ok(event) => {
                     // A deliberate clear is the one revise outcome that is
@@ -2171,6 +2255,13 @@ impl ThorMcpServer {
                     } else {
                         format!("revised '{}' (event seq {})", updated.id, event.seq)
                     };
+                    if let Some(tried) = &tried {
+                        success.push_str(&format!(
+                            "\n  trial: the check you tried was not stored - {}. The try is recorded in this item's \
+                             history.",
+                            tried.outcome
+                        ));
+                    }
                     // Named here too, for the identical reason: "revised"
                     // alone does not say a checked rule just lost its teeth,
                     // and the caller should not have to `history` the item
@@ -3436,6 +3527,7 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
+            trial_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.contains("REFUSED"), "expected a loud refusal, got: {reply}");
@@ -3767,6 +3859,7 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
+            trial_check: false,
         }
     }
 
@@ -4185,6 +4278,7 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
+            trial_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
@@ -4239,6 +4333,10 @@ mod tests {
     async fn remember_accepts_an_absent_check_and_it_round_trips() {
         let srv = server();
         let mut args = base_remember("check-absent-1");
+        // A check that refuses and a reason that nothing can catch the
+        // mistake may not be introduced together (2026-09-27): this rule
+        // answers the teeth question with its check.
+        args.tags = vec![];
         args.text = "the main config file must never contain a hardcoded api key".to_string();
         args.check_kind = Some("absent".to_string());
         args.check_path = Some("config/app.toml".to_string());
@@ -4362,6 +4460,7 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
+            trial_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
@@ -4412,6 +4511,7 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
+            trial_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
@@ -4467,6 +4567,7 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
+            trial_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
@@ -4512,6 +4613,7 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
+            trial_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.contains("invalid check"), "{reply}");
@@ -4577,6 +4679,7 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
+            trial_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "expected a deliberate clear to succeed, got: {reply}");
@@ -4687,6 +4790,10 @@ mod tests {
     async fn remember_accepts_an_absent_all_check_and_it_round_trips() {
         let srv = server();
         let mut args = base_remember("check-absent-all-1");
+        // A check that refuses and a reason that nothing can catch the
+        // mistake may not be introduced together (2026-09-27): this rule
+        // answers the teeth question with its check.
+        args.tags = vec![];
         args.text = "docs/STYLE.md never carries an em dash, en dash or ellipsis".to_string();
         args.check_kind = Some("absent_all".to_string());
         args.check_path = Some("docs/STYLE.md".to_string());
@@ -4763,6 +4870,10 @@ mod tests {
         // None` and refusing the whole revise outright.
         let srv = server();
         let mut args = base_remember("check-keep-absent-all-1");
+        // A check that refuses and a reason that nothing can catch the
+        // mistake may not be introduced together (2026-09-27): this rule
+        // answers the teeth question with its check.
+        args.tags = vec![];
         args.text = "docs/STYLE.md never carries an em dash, en dash or ellipsis".to_string();
         args.check_kind = Some("absent_all".to_string());
         args.check_path = Some("docs/STYLE.md".to_string());
@@ -4796,6 +4907,7 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
+            trial_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
@@ -4821,6 +4933,10 @@ mod tests {
         // accepted` in gate.rs, one layer down).
         let srv = server();
         let mut args = base_remember("check-upgrade-to-set-1");
+        // A check that refuses and a reason that nothing can catch the
+        // mistake may not be introduced together (2026-09-27): this rule
+        // answers the teeth question with its check.
+        args.tags = vec![];
         args.text = "docs/STYLE.md never carries an em dash".to_string();
         args.check_kind = Some("absent".to_string());
         args.check_path = Some("docs/STYLE.md".to_string());
@@ -4854,6 +4970,7 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
+            trial_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
@@ -4884,6 +5001,10 @@ mod tests {
     async fn remember_accepts_a_forbidden_check_and_it_round_trips() {
         let srv = server();
         let mut args = base_remember("check-forbidden-1");
+        // A check that refuses and a reason that nothing can catch the
+        // mistake may not be introduced together (2026-09-27): this rule
+        // answers the teeth question with its check.
+        args.tags = vec![];
         args.text = "never write an em dash, en dash or ellipsis, anywhere".to_string();
         args.check_kind = Some("forbidden".to_string());
         args.check_literals = vec!["\u{2014}".to_string(), "\u{2013}".to_string(), "\u{2026}".to_string()];
@@ -4950,6 +5071,10 @@ mod tests {
         // holds for the path-less form too.
         let srv = server();
         let mut args = base_remember("check-keep-forbidden-1");
+        // A check that refuses and a reason that nothing can catch the
+        // mistake may not be introduced together (2026-09-27): this rule
+        // answers the teeth question with its check.
+        args.tags = vec![];
         args.text = "never write an em dash, en dash or ellipsis, anywhere".to_string();
         args.check_kind = Some("forbidden".to_string());
         args.check_literals = vec!["\u{2014}".to_string(), "\u{2013}".to_string(), "\u{2026}".to_string()];
@@ -4982,6 +5107,7 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
+            trial_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
@@ -5009,6 +5135,10 @@ mod tests {
         // is the same property proven through the real MCP tool surface.
         let srv = server();
         let mut args = base_remember("check-downgrade-to-forbidden-1");
+        // A check that refuses and a reason that nothing can catch the
+        // mistake may not be introduced together (2026-09-27): this rule
+        // answers the teeth question with its check.
+        args.tags = vec![];
         args.text = "docs/STYLE.md never carries an em dash".to_string();
         args.check_kind = Some("absent_all".to_string());
         args.check_path = Some("docs/STYLE.md".to_string());
@@ -5042,6 +5172,7 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
+            trial_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
@@ -5059,6 +5190,10 @@ mod tests {
         // the path-less form either.
         let srv = server();
         let mut args = base_remember("check-clear-populated-forbidden-1");
+        // A check that refuses and a reason that nothing can catch the
+        // mistake may not be introduced together (2026-09-27): this rule
+        // answers the teeth question with its check.
+        args.tags = vec![];
         args.text = "never write an em dash, anywhere".to_string();
         args.check_kind = Some("forbidden".to_string());
         args.check_literals = vec!["\u{2014}".to_string()];
@@ -5074,7 +5209,9 @@ mod tests {
             text: None,
             severity: None,
             project: None,
-            tags: None,
+            // Clearing the check of a heavy rule takes the reason that
+            // nothing can catch its mistake, in the same call.
+            tags: Some(base_remember("unused").tags),
             expires: None,
             key: None,
             falsifier: None,
@@ -5091,6 +5228,7 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
+            trial_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
@@ -5152,6 +5290,7 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
+            trial_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "expected a deliberate clear to succeed, got: {reply}");
@@ -5203,6 +5342,7 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
+            trial_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "expected a deliberate clear to succeed, got: {reply}");
@@ -5254,6 +5394,7 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
+            trial_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "a whitespace-only value must clear, got: {reply}");
@@ -5297,6 +5438,7 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
+            trial_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "expected a deliberate clear to succeed, got: {reply}");
@@ -5346,6 +5488,7 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
+            trial_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "expected a deliberate clear to succeed, got: {reply}");
@@ -5394,6 +5537,7 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
+            trial_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "expected a deliberate clear to succeed, got: {reply}");
@@ -5462,6 +5606,7 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
+            trial_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.contains("REFUSED"), "expected the bindings drop to still be refused, got: {reply}");
@@ -5534,6 +5679,7 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
+            trial_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
@@ -5586,6 +5732,7 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
+            trial_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "expected a deliberate clear to succeed, got: {reply}");
@@ -5632,6 +5779,7 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
+            trial_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");

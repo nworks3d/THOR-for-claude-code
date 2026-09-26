@@ -736,6 +736,46 @@ pub fn revise_because_scoped(
     because: Option<&str>,
     scope: Option<&EvaluationScope>,
 ) -> Result<Event, WriteError> {
+    revise_tried_scoped(store, session_id, lineage_id, actor, existing, updated, before, because, scope, None)
+}
+
+/// A check that was only TRIED on a revise, never stored - see
+/// `revise_tried_scoped`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TriedCheck {
+    /// The check that was tried.
+    pub check: Check,
+    /// What THOR's own write-time proof found, in its own words.
+    pub outcome: String,
+}
+
+/// `revise_because_scoped`, for a revise that also carries a TRIED check
+/// (2026-09-27). The revised item is written exactly as `revise_because_
+/// scoped` writes it; the tried check and what the proof found travel in the
+/// same event body under `"tried"`, beside `because`, so `history` shows the
+/// try and `ids_whose_check_was_tried` counts it. The tried check never
+/// becomes the item's own and never guards anything.
+///
+/// WHY THIS EXISTS. A reason that nothing can catch a rule's mistake counts
+/// only after a real try (`gate::teeth_answer_settles`), and the only try the
+/// log could show was a check hung live on the rule. Measured in a fresh
+/// evaluation: a session hung a check it already knew was too broad, only to
+/// be allowed its reason afterwards, and for about a minute that check
+/// refused every write that mentioned the file it named. A try now runs
+/// through the proof alone.
+#[allow(clippy::too_many_arguments)]
+pub fn revise_tried_scoped(
+    store: &mut EventStore,
+    session_id: &str,
+    lineage_id: &str,
+    actor: &str,
+    existing: &Item,
+    updated: &Item,
+    before: &Item,
+    because: Option<&str>,
+    scope: Option<&EvaluationScope>,
+    tried: Option<&TriedCheck>,
+) -> Result<Event, WriteError> {
     let existing = normalized(existing);
     let updated = normalized(updated);
     let before = normalized(before);
@@ -759,13 +799,29 @@ pub fn revise_because_scoped(
         }
     }
     let reason = because.map(str::trim).filter(|r| !r.is_empty());
-    let body = match reason {
+    let mut body = match reason {
         Some(reason) => body_with_because(&updated, reason).map_err(WriteError::Serialize)?,
         None => canonical_body(&updated).map_err(WriteError::Serialize)?,
     };
+    if let Some(tried) = tried {
+        body = body_with_tried(&body, tried).map_err(WriteError::Serialize)?;
+    }
     store
         .append_mutate_checked(session_id, lineage_id, actor, EventKind::FactRevised, &updated.id, None, &body)
         .map_err(WriteError::Store)
+}
+
+/// `body` with one more trailing key: `"tried":{"check":{...},"outcome":"..."}`
+/// - spliced on exactly the way `body_with_because` splices `because`, so the
+/// item fields keep their order and `parse_body` ignores the extra key. The
+/// check is serialised the way an item's own check is, so the log's own
+/// needle for "a check was ever attached" (`ids_whose_check_was_tried`) finds
+/// a try too.
+fn body_with_tried(body: &str, tried: &TriedCheck) -> Result<String, serde_json::Error> {
+    let check = serde_json::to_string(&tried.check)?;
+    let outcome = serde_json::to_string(&tried.outcome)?;
+    debug_assert!(body.ends_with('}'), "canonical_body always produces a JSON object");
+    Ok(format!("{},\"tried\":{{\"check\":{check},\"outcome\":{outcome}}}}}", &body[..body.len() - 1]))
 }
 
 /// `canonical_body`, with one extra trailing key appended: `"because":
@@ -1827,8 +1883,11 @@ pub fn evaluation_judgement_owed(
 /// reason can count (see its own "A REASON COUNTS ONLY AFTER A REAL TRY").
 /// Read from the stored bodies of the item's own writes: a check is only
 /// ever serialized as `"check":{`, never as a null, so an item that never
-/// carried one never matches. FAILS OPEN to an empty set, which only ever
-/// makes a reason count LESS, never more.
+/// carried one never matches. A check that was only TRIED on a revise
+/// (`revise_tried_scoped`, its `"tried":{"check":{...}}` key) matches the same
+/// needle on purpose: the try is on record, and it never hung live. FAILS
+/// OPEN to an empty set, which only ever makes a reason count LESS, never
+/// more.
 pub fn ids_whose_check_was_tried(store: &EventStore) -> HashSet<String> {
     store.ids_with_a_write_containing("\"check\":{").unwrap_or_default()
 }
@@ -1957,6 +2016,9 @@ fn teeth_batch_since(store: &EventStore, project: Option<&str>, cutoff_seq: i64)
     // its place either way), and such a rule then simply keeps no batch
     // place - the same as any rule settled before the cutoff.
     let tried = ids_whose_check_was_tried(store);
+    // Real refusals on record, read from the same log - see
+    // `refused_under_check`.
+    let refusals = RefusalRecord::from_events(&events);
     // Every live open point of this project, lowercased once: a wired or
     // doubtful check is settled for THIS filing only when an open point
     // names it (see `teeth_state` below).
@@ -1977,14 +2039,17 @@ fn teeth_batch_since(store: &EventStore, project: Option<&str>, cutoff_seq: i64)
         .filter_map(|(id, item)| {
             let named_in_open_point = open_point_texts.iter().any(|t| t.contains(&id.to_lowercase()));
             let check_tried = tried.contains(&id);
-            let now = teeth_state(&item, named_in_open_point, check_tried);
+            let now = teeth_state(&item, named_in_open_point, check_tried, refusals.refused_under_check(&id, i64::MAX));
             // An item with no body at or before the cutoff did not exist then,
             // and one whose old body will not parse cannot prove it was
             // settled: both count as unsettled as of the cutoff.
             let settled_at_cutoff = body_by_cutoff
                 .get(id.as_str())
                 .and_then(|&i| parse_body(&events[i].body).ok())
-                .is_some_and(|then| teeth_state(&then, named_in_open_point, check_tried).is_none());
+                .is_some_and(|then| {
+                    teeth_state(&then, named_in_open_point, check_tried, refusals.refused_under_check(&id, cutoff_seq))
+                        .is_none()
+                });
             if now.is_none() && settled_at_cutoff {
                 return None;
             }
@@ -2028,27 +2093,115 @@ fn teeth_batch_since(store: &EventStore, project: Option<&str>, cutoff_seq: i64)
 /// could be tried, which is the question, not an answer to it. Before this,
 /// ANY machine label settled the filing, so a maintenance pass that labelled
 /// every heavy rule "informing" lifted the gate for the whole store at once.
-fn teeth_state(item: &Item, named_in_open_point: bool, check_tried: bool) -> Option<&'static str> {
-    if item.tags.iter().any(|t| t == TEETH_PROVEN_TAG) || gate::teeth_answer_settles(item, check_tried) {
+///
+/// PROVEN BY THE LOG, NOT ONLY BY THE LABEL (2026-09-27). `refused_on_record`
+/// is whether the real hook refused a call under this item's CURRENT check
+/// (`RefusalRecord::refused_under_check`). The label is written only when the
+/// item itself is written, so a check that bit a real call during the
+/// evaluation still read "wired" at filing time - measured in a fresh
+/// evaluation: three real refusals on record, and the gate named all three
+/// rules as never having met a real call.
+///
+/// A REASON NEVER SETTLES A RULE WHOSE CHECK CAN REFUSE (2026-09-27). Such a
+/// rule is answered by its check - proven, or carried by an open point - and
+/// a reason beside it saying nothing can catch the mistake contradicts it.
+/// Measured: a reason saying the bare call is legitimate settled a rule whose
+/// requires check refused exactly that call. The write gate no longer lets
+/// the two meet (`gate::teeth_answer_contradictions`); this is the filing
+/// half, for an item that carried both before that existed. The Stop hook's
+/// own teeth question is deliberately left as it was.
+///
+/// AN OPEN POINT CARRIES ANY RULE THAT HANGS A CHECK (2026-09-27), no longer
+/// only a wired one: a check that cannot reach its file because that file's
+/// place is full, or one nobody could try here, is exactly the "could not
+/// finish this here" an open point exists for, and the next evaluation has to
+/// close or carry it. A rule with no check at all is not carried this way -
+/// it owes a try first.
+fn teeth_state(item: &Item, named_in_open_point: bool, check_tried: bool, refused_on_record: bool) -> Option<&'static str> {
+    if item.tags.iter().any(|t| t == TEETH_PROVEN_TAG) || (refused_on_record && item.check.is_some()) {
         return None;
     }
-    let doubtful = [TEETH_WIRED_TAG, TEETH_ANCHOR_COLLAPSED_TAG, TEETH_REFUSES_LEGITIMATE_TAG];
-    if item.tags.iter().any(|t| doubtful.contains(&t.as_str())) {
-        if named_in_open_point {
-            return None;
-        }
-        if item.tags.iter().any(|t| t == TEETH_REFUSES_LEGITIMATE_TAG) {
-            return Some("its check refuses legitimate use too");
-        }
-        if item.tags.iter().any(|t| t == TEETH_ANCHOR_COLLAPSED_TAG) {
-            return Some("its anchor contains its own literal and it has not refused a real call yet");
-        }
-        return Some("its check is wired but has never met a real call");
+    let refusing = gate::is_refusing_check(item.check.as_ref());
+    if !refusing && gate::teeth_answer_settles(item, check_tried) {
+        return None;
+    }
+    if item.check.is_some() && named_in_open_point {
+        return None;
+    }
+    if refusing && gate::teeth_reason_tag(item).is_some() {
+        return Some(
+            "it carries a check that refuses AND a reason that nothing can catch it: keep the check (drop the reason \
+             tag, file an open point) or clear the check with a because and keep the reason",
+        );
+    }
+    if item.tags.iter().any(|t| t == TEETH_REFUSES_LEGITIMATE_TAG) {
+        return Some("its check refuses legitimate use too: narrow it, or file an open point");
+    }
+    if item.tags.iter().any(|t| t == TEETH_ANCHOR_COLLAPSED_TAG) {
+        return Some("its anchor contains its own literal and it has not refused a real call yet: file an open point");
+    }
+    if item.tags.iter().any(|t| t == TEETH_WIRED_TAG) {
+        return Some("its check is wired but no real call has met it yet: file an open point");
     }
     if item.check.is_some() {
-        return Some("its check has never been tried, or cannot refuse anything");
+        return Some(
+            "its check cannot refuse anything as it stands (revise it with nothing changed and the receipt says \
+             why): make it reach, or file an open point naming what blocks it",
+        );
     }
-    Some("no check, and no reason that quotes the legitimate call or names its trigger")
+    Some("no check, and no reason that quotes the legitimate call or names its trigger: try a check first")
+}
+
+/// Every real refusal on the log, per item, with the writes that changed that
+/// item's check - enough to say whether the real hook refused a call under
+/// the check an item carries NOW (or carried at some earlier seq). The same
+/// rule `serve::prove::reality`/`bitten` apply to a file check: a refusal
+/// counts once it came after the current check was set, and a changed check
+/// starts over. For a command check `bitten` also re-runs the refused call
+/// against the check as it stands; with the check unchanged since the
+/// refusal, that is the same check refusing the same call, so the answer is
+/// the same. `serve` is out of reach from here (see this section's own
+/// top-of-file comment), which is why this reads the log and never the guard.
+struct RefusalRecord {
+    /// id -> (refusal seqs, every write that changed its check: (seq, a check is set)).
+    by_item: HashMap<String, (Vec<i64>, Vec<(i64, bool)>)>,
+}
+
+impl RefusalRecord {
+    fn from_events(events: &[Event]) -> Self {
+        let mut by_item: HashMap<String, (Vec<i64>, Vec<(i64, bool)>)> = HashMap::new();
+        for e in events.iter().filter(|e| e.kind == EventKind::GateRefused) {
+            by_item.entry(e.entity_id.clone()).or_default().0.push(e.seq);
+        }
+        let mut last_check: HashMap<&str, Option<Check>> = HashMap::new();
+        for e in events {
+            let Some(entry) = by_item.get_mut(&e.entity_id) else { continue };
+            match e.kind {
+                EventKind::FactCreated | EventKind::FactRevised => {
+                    let Ok(item) = parse_body(&e.body) else { continue };
+                    if last_check.get(e.entity_id.as_str()) != Some(&item.check) {
+                        entry.1.push((e.seq, item.check.is_some()));
+                        last_check.insert(e.entity_id.as_str(), item.check);
+                    }
+                }
+                EventKind::FactRetracted => {
+                    entry.1.push((e.seq, false));
+                    last_check.remove(e.entity_id.as_str());
+                }
+                _ => {}
+            }
+        }
+        RefusalRecord { by_item }
+    }
+
+    /// Whether the real hook refused a call under `id`'s check as it stood at
+    /// `upto` (`i64::MAX` for now): a refusal after that check was set, and at
+    /// or before `upto`.
+    fn refused_under_check(&self, id: &str, upto: i64) -> bool {
+        let Some((refusals, changes)) = self.by_item.get(id) else { return false };
+        let Some(&(since, has_check)) = changes.iter().rev().find(|(seq, _)| *seq <= upto) else { return false };
+        has_check && refusals.iter().any(|&r| r > since && r <= upto)
+    }
 }
 
 /// Every live open point for `project`, exactly scoped (never `project_
@@ -2191,19 +2344,31 @@ fn check_evaluation_report_filing(store: &EventStore, item: &Item, scope: Option
                  names them, and a later evaluation asks for them first."
             ),
         };
+        let project_arg = match project {
+            Some(p) => format!("project \"{p}\""),
+            None => "no project".to_string(),
+        };
         missing.push(format!(
             "{} heavy rule(s) in this report's batch (at most {EVALUATION_TEETH_BATCH}, the ones written longest ago \
              first) apply to this project (its own or global), have fired since the previous report - the log \
              records when a rule fired, never in which project - and still have neither a real tooth nor a real \
-             reason why they cannot: {named}.{later} For each one, do the work, in this order: (1) find the \
-             text whose presence MEANS the mistake is happening and give the rule a check with it (forbidden, \
-             absent, absent_all, contains or requires) - it counts as proven once the log shows it biting a real \
-             call, and until then add an open point naming the rule's id and what real call would prove it; (2) \
-             only when no text marks the mistake, tag it 'no-literal:<why>' (or 'no-catch-on-command:<why>' on a \
-             command) with a reason that QUOTES the legitimate call that carries the same fragment, or NAMES the \
-             command, file or moment the rule is about - a reason that would fit any rule does not count; (3) \
-             retract it with a reason if it is simply wrong. A label a maintenance pass writes ('teeth:informing') \
-             is not an answer: it only says nothing could be tried",
+             reason why they cannot: {named}.{later} What settles one, and nothing else does: (1) A CHECK THAT \
+             BIT: the rule's check refused a real call through the real hook - any refusal on record under the \
+             check it carries now counts by itself, no revise needed. Never write the mistake into a real file to \
+             provoke one; for a command check a harmless form of the command is enough. (2) AN OPEN POINT, for a \
+             rule that hangs a check that has not bitten yet, or cannot be made to work here: a separate small \
+             Report, never a tag on the rule - mcp__thor__remember with kind \"report\", {project_arg}, tags \
+             [\"{OPEN_POINT_TAG}\"], an id such as \"open-<rule id>\", and a text that names the rule's id and \
+             the real call that would prove it (or what blocks the fix, such as a full anchor). The next \
+             evaluation closes it (retract with a reason) or carries it once. (3) A REASON, only for a rule \
+             whose check cannot refuse (none, contains or path_exists): tag it 'no-literal:<why>' (on a \
+             command: 'no-catch-on-command:<why>'), with a reason that QUOTES the legitimate call carrying the \
+             same fragment or NAMES the command, file or moment the rule is about. A reason counts only after a \
+             real try: pass the check you tried in the same revise with trial_check true - THOR tries it and \
+             records the try, and it is never stored; a check that turns out to work is refused as a reason and \
+             must be hung instead. A reason never settles a rule whose check can refuse. (4) Retract the rule \
+             with a reason if it is simply wrong. A label a maintenance pass writes ('teeth:informing') is not an \
+             answer: it only says nothing could be tried",
             batch.owed_now.len()
         ));
     }
@@ -4352,7 +4517,7 @@ mod tests {
         let text = format!("{} {}", refusal.problem, refusal.fix);
         assert!(!text.contains("backfill_teeth"), "a bulk relabel is never the way out: {text}");
         assert!(text.contains("QUOTES the legitimate call"), "{text}");
-        assert!(text.contains("open point naming the rule's id"), "{text}");
+        assert!(text.contains("names the rule's id"), "{text}");
     }
 
     /// C (2026-09-26): the judgement half names the owed items, so a writer
@@ -4870,5 +5035,189 @@ mod tests {
         declare(&mut store, "s", "l", "a", &item).unwrap();
         assert!(retract(&mut store, "s", "l", "a", &item.id, "no longer relevant for this project").is_err());
         retract(&mut store, "s", "l", "a", &item.id, "config/app.toml no longer exists").unwrap();
+    }
+
+    // ------------------------------------------------ the batch gate, 2026-09-27
+    //
+    // A fresh evaluation could not file its report: a check that really bit
+    // still read "wired", nobody knew what an open point was, a reason stood
+    // beside a check that contradicted it, and an open point was tagged onto
+    // the rule itself. Each test below is one of those, end to end through
+    // the public write path.
+
+    /// Written straight into the log, the way an older store holds it - the
+    /// write gate of today may refuse the same shape fresh.
+    fn legacy(store: &mut EventStore, item: &Item) {
+        let body = serde_json::to_string(item).unwrap();
+        store.append_event("legacy", &item.id, "migration", EventKind::FactCreated, &item.id, None, &body).unwrap();
+    }
+
+    fn wired_forbidden(id: &str, project: &str, literal: &str) -> Item {
+        let mut item = heavy_command_rule(id, project);
+        item.tags = vec![TEETH_WIRED_TAG.to_string()];
+        item.check = Some(Check::Forbidden { literals: vec![literal.to_string()] });
+        item
+    }
+
+    fn refused(store: &mut EventStore, id: &str, target: &str) {
+        let body = serde_json::json!({"at": "2026-09-27T00:00:00Z", "target": target}).to_string();
+        store.append_event("s", "l", "hook", EventKind::GateRefused, id, None, &body).unwrap();
+    }
+
+    /// Fix 2: the real hook refused a call under the check the rule carries
+    /// now. That is a tooth that bit, and it settles the filing without
+    /// anyone writing the rule again - the label is only recomputed on a
+    /// write, the log is read every time.
+    #[test]
+    fn a_real_refusal_under_the_current_check_settles_the_filing_without_a_new_write() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "s", "l", "a", &eval_report("eval-bit-old", "bit")).unwrap();
+        legacy(&mut store, &wired_forbidden("bit-rule", "bit", "--force"));
+        serve_n(&mut store, "bit-rule", "hook", 1);
+        refused(&mut store, "bit-rule", "fixture-command-bit-rule --force");
+        declare(&mut store, "s", "l", "a", &eval_report("eval-bit-new", "bit"))
+            .expect("a check that really refused a call is proven, whatever its label says");
+    }
+
+    /// Fix 2, the other side: a refusal earned under an OLDER check never
+    /// vouches for the one the rule carries now.
+    #[test]
+    fn a_refusal_under_an_older_check_does_not_settle_the_filing() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "s", "l", "a", &eval_report("eval-oc-old", "oc")).unwrap();
+        legacy(&mut store, &wired_forbidden("oc-rule", "oc", "--force"));
+        refused(&mut store, "oc-rule", "fixture-command-oc-rule --force");
+        let before = wired_forbidden("oc-rule", "oc", "--force");
+        revise(&mut store, "s", "l", "a", &before, &wired_forbidden("oc-rule", "oc", "--mirror")).unwrap();
+        serve_n(&mut store, "oc-rule", "hook", 1);
+        let err = declare(&mut store, "s", "l", "a", &eval_report("eval-oc-new", "oc")).unwrap_err();
+        let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
+        assert!(refusal.problem.contains("oc-rule"), "{}", refusal.problem);
+    }
+
+    /// Fix 1: the refusal says what an open point IS and how to file one -
+    /// kind, project, tag, id and text - and that it is never a tag on the
+    /// rule itself. Measured: two fresh sessions could not tell.
+    #[test]
+    fn the_filing_refusal_says_exactly_how_to_file_an_open_point() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "s", "l", "a", &eval_report("eval-op-old", "op")).unwrap();
+        legacy(&mut store, &wired_forbidden("op-rule", "op", "--force"));
+        serve_n(&mut store, "op-rule", "hook", 1);
+        let err = declare(&mut store, "s", "l", "a", &eval_report("eval-op-new", "op")).unwrap_err();
+        let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
+        let text = refusal.problem;
+        assert!(text.contains("never a tag on the rule"), "{text}");
+        assert!(text.contains("kind \"report\""), "{text}");
+        assert!(text.contains("project \"op\""), "{text}");
+        assert!(text.contains("tags [\"open-point\"]"), "{text}");
+        assert!(text.contains("names the rule's id"), "{text}");
+        assert!(text.contains("trial_check"), "{text}");
+    }
+
+    /// Fix 3: a reason saying nothing can catch the mistake never settles a
+    /// rule whose own check can refuse - the check is the answer, and the
+    /// reason beside it contradicts it.
+    #[test]
+    fn a_reason_beside_a_refusing_check_never_settles_the_filing() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "s", "l", "a", &eval_report("eval-rc-old", "rc")).unwrap();
+        let mut both = wired_forbidden("rc-rule", "rc", "--force");
+        both.tags.push(format!(
+            "{}same text as 'fixture-command-rc-rule --force' in a legitimate call",
+            NO_CATCH_ON_COMMAND_REASON_PREFIX
+        ));
+        legacy(&mut store, &both);
+        serve_n(&mut store, "rc-rule", "hook", 1);
+        let err = declare(&mut store, "s", "l", "a", &eval_report("eval-rc-new", "rc")).unwrap_err();
+        let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
+        assert!(refusal.problem.contains("rc-rule"), "{}", refusal.problem);
+        assert!(refusal.problem.contains("AND a reason"), "{}", refusal.problem);
+    }
+
+    /// Fix 3: the write gate refuses hanging a refusing check beside such a
+    /// reason, or adding the reason beside the check - and leaves a rule that
+    /// already carried both correctable.
+    #[test]
+    fn the_write_gate_refuses_a_refusing_check_and_a_reason_introduced_together() {
+        let mut store = EventStore::in_memory().unwrap();
+        let mut both = heavy_command_rule("wg-both", "wg");
+        both.check = Some(Check::Forbidden { literals: vec!["--force".to_string()] });
+        let err = declare(&mut store, "s", "l", "a", &both).unwrap_err();
+        assert!(err.to_string().contains("one of the two is wrong"), "{err}");
+
+        let plain = heavy_command_rule("wg-plain", "wg");
+        declare(&mut store, "s", "l", "a", &plain).unwrap();
+        let mut hung = plain.clone();
+        hung.check = Some(Check::Forbidden { literals: vec!["--force".to_string()] });
+        let err = revise(&mut store, "s", "l", "a", &plain, &hung).unwrap_err();
+        assert!(err.to_string().contains("one of the two is wrong"), "{err}");
+
+        let mut old = heavy_command_rule("wg-old", "wg");
+        old.check = Some(Check::Forbidden { literals: vec!["--force".to_string()] });
+        legacy(&mut store, &old);
+        let mut corrected = old.clone();
+        corrected.text = "fixture heavy rule wg-old, corrected".to_string();
+        revise(&mut store, "s", "l", "a", &old, &corrected).expect("a rule that already carried both stays correctable");
+    }
+
+    /// Fix 1: an open point tagged onto the rule itself counts for nothing,
+    /// so the write gate says so and names the recipe that counts.
+    #[test]
+    fn an_open_point_tag_on_the_rule_itself_is_refused_with_the_recipe() {
+        let mut store = EventStore::in_memory().unwrap();
+        let rule = wired_forbidden("tag-rule", "tg", "--force");
+        legacy(&mut store, &rule);
+        let mut tagged = rule.clone();
+        tagged.tags.push("open:tag-rule:a real push with --force would prove it".to_string());
+        let err = revise(&mut store, "s", "l", "a", &rule, &tagged).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("never a tag on the rule itself"), "{text}");
+        assert!(text.contains("kind \"report\""), "{text}");
+    }
+
+    /// Fix 3: an open point carries any rule that hangs a check - also one
+    /// whose check cannot reach its file because that place is full - but
+    /// never a rule with no check at all, which owes a try first.
+    #[test]
+    fn an_open_point_carries_a_check_that_cannot_reach_but_never_a_rule_without_one() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "s", "l", "a", &eval_report("eval-ci-old", "ci")).unwrap();
+        let mut informing = heavy_command_rule("ci-check", "ci");
+        informing.tags = vec![TEETH_INFORMING_TAG.to_string()];
+        informing.check = Some(Check::AbsentAll { path: "deploy/watch.sh".to_string(), literals: vec!["up -d --build".to_string()] });
+        legacy(&mut store, &informing);
+        let mut bare = heavy_command_rule("ci-bare", "ci");
+        bare.tags = vec![TEETH_INFORMING_TAG.to_string()];
+        legacy(&mut store, &bare);
+        serve_n(&mut store, "ci-check", "hook", 1);
+        serve_n(&mut store, "ci-bare", "hook", 1);
+        let mut point = open_point("open-ci", "ci");
+        point.text = "ci-check and ci-bare: the path binding deploy/watch.sh is full".to_string();
+        declare(&mut store, "s", "l", "a", &point).unwrap();
+        let err = declare(&mut store, "s", "l", "a", &eval_report("eval-ci-new", "ci")).unwrap_err();
+        let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
+        assert!(!refusal.problem.contains("'ci-check'"), "the open point carries the rule with a check: {}", refusal.problem);
+        assert!(refusal.problem.contains("'ci-bare'"), "a rule with no check owes a try first: {}", refusal.problem);
+    }
+
+    /// Fix 3: a check that was only TRIED on a revise counts as the try a
+    /// reason needs, and the tried check is never stored.
+    #[test]
+    fn a_tried_check_counts_as_the_try_and_is_never_stored() {
+        let mut store = EventStore::in_memory().unwrap();
+        let mut item = heavy_command_rule("tried-rule", "tr");
+        item.tags = vec![format!("{}same text as 'fixture-command-tried-rule --dry-run' in a legitimate call", NO_CATCH_ON_COMMAND_REASON_PREFIX)];
+        legacy(&mut store, &item);
+        assert!(!ids_whose_check_was_tried(&store).contains("tried-rule"));
+        let mut updated = item.clone();
+        updated.text = "fixture heavy rule tried-rule, reason after a try".to_string();
+        let tried = TriedCheck {
+            check: Check::Forbidden { literals: vec!["fixture-command-tried-rule".to_string()] },
+            outcome: "anchor collapsed".to_string(),
+        };
+        revise_tried_scoped(&mut store, "s", "l", "a", &item, &updated, &item, None, None, Some(&tried)).unwrap();
+        assert!(ids_whose_check_was_tried(&store).contains("tried-rule"), "the try is on record");
+        assert!(show(&store, "tried-rule").unwrap().check.is_none(), "the tried check never hangs");
     }
 }

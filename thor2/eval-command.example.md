@@ -184,11 +184,15 @@ longest ago first. You do not pick them: the health check names them on its
 `evaluation batch` line, each on its own `batch: <id>` line, and the ask for
 this evaluation names the same ones. The report cannot be filed until each
 one is settled; until then the gate refuses it and counts what is left.
-Settled means what the gate counts: a check that bit reality
-(`teeth:proven-guard`), a wired check carried by an open point that names
-its id, or a no-literal reason that quotes the legitimate call or names the
-trigger (see below). A label the tool wrote itself, such as
-`teeth:informing`, settles nothing. The heavy facts on the `owed later:`
+Settled means what the gate counts, and nothing else: a check that bit
+reality (the real hook refused a call under the check the rule carries now -
+that counts by itself, even while the label still reads wired); a rule that
+hangs a check carried by an open point that names its id (see below for what
+an open point is); or, only for a rule whose check cannot refuse (none,
+`contains` or `path_exists`), a no-literal reason that quotes the legitimate
+call or names the trigger, after a real try. A reason never settles a rule
+whose check can refuse, and the gate refuses the two side by side. A label
+the tool wrote itself, such as `teeth:informing`, settles nothing. The heavy facts on the `owed later:`
 lines stay owed and lead the next report's batch - settle more of them when
 there is time, but never fewer than the batch.
 
@@ -215,13 +219,18 @@ answer; the Stop hook and the report gate stop asking about that fact.
 
 A reason counts only after a real try, and the log is what shows the try: a
 no-literal reason settles a heavy fact only when that fact's own history
-carries a check at some point. So the order is not optional. Attach the
-check you worked out with `revise` first. If it then turns out it cannot
-hold, or it would refuse legitimate use too, revise it away again - with
-`because` saying what went wrong - and add the reason tag. A reason on a
-fact that never carried a check settles nothing, however well it is
-written: two such reasons slipped through on 2026-09-26, one of them saying
-in so many words that the syntax was never found.
+carries a check at some point. So the order is not optional - but the try
+never hangs live. Send the reason tag and the check you worked out in ONE
+`revise`, with `trial_check: true`: the tool runs its own write-time proof on
+that check, records the check and what the proof found in the fact's
+history, and never stores it. If the tried check turns out to work, the
+revise is refused and tells you to hang it for real instead - then that is
+your answer, not the reason. Never hang a check you already expect to be
+wrong just to earn a reason: measured 2026-09-27, one such check refused
+every write that mentioned the file it named for about a minute. A reason on
+a fact that never carried or tried a check settles nothing, however well it
+is written: two such reasons slipped through on 2026-09-26, one of them
+saying in so many words that the syntax was never found.
 
 A heavy fact that already carries a no-literal tag is re-checked, not waved
 through: read the reason again against the fact. An older reason that
@@ -253,19 +262,27 @@ left open. A broader rule that blocks legitimate work is the most expensive
 outcome this system knows (see step 6), and the doctrine forbids widening a
 trigger to buy a catch.
 
-This evaluation cannot probe anything itself; that needs a real command. So
-every check you add here that comes back `teeth: wired, not proven` goes on
-the report's open points: file one open point per fact, naming its id and
-the real call that would prove it. That open point is what lets the report
-through while the check has not met reality yet, and the next evaluation
-has to close it - with the real refusal, or by retracting the check with a
-reason. A check that has never met a real call is an assumption.
+Never write the mistake into a real file to make a check bite: if the check
+misses, the mistake is now in the code. A command check may be proven with a
+harmless form of its command (step 8); a refusal that happened on its own
+this session counts by itself. So every check here that has not bitten -
+`teeth: wired, not proven`, or one you could not make work here - goes on an
+open point, one per fact. An open point is a separate small Report, never a
+tag on the rule (the gate refuses a tag such as `open:<id>` for exactly that
+reason). File it with `remember`: kind `report`, the same project as this
+report, tags `["open-point"]`, an id such as `open-<rule id>`, and one
+sentence that names the rule's id and the real call that would prove it, or
+what blocks the fix (a full anchor, say). That open point is what lets the
+report through while the check has not met reality yet, and the next
+evaluation has to close it - retract it with a reason once the check bit, or
+once the check itself was retracted - or carry it forward once. A check that
+has never met a real call is an assumption.
 
 Does the gate refuse the check you are adding - does it not hold, or is the
-anchor full after moving it? Correct the check until it holds, or store the
-fact without a check and put the reason nothing can catch it in the tags
-(quoting the legitimate call or naming the trigger, as above); a full anchor
-is solved with a route from step 6. That happens in the same turn, not as a
+anchor full after moving it? Correct the check until it holds. A full anchor
+is solved with a route from step 6; if that cannot happen in this session,
+the open point names the full anchor and its occupants - never a no-literal
+reason that hides the real cause. That happens in the same turn, not as a
 line in the report. Step 4 is done once every heavy fact in this report's
 batch, and every other one you took on, has a decision - a check that bit
 reality, a wired check carried by a named open
@@ -380,9 +397,10 @@ Name explicitly what you are assuming but have not checked. If you added a
 fact bound to a target, this evaluation only ever sees what FIRED - a
 silently displaced binding shows up nowhere here. Flag such a fact as
 "still to be probed": the probe itself happens outside this evaluation, by
-putting the forbidden fragment literally into a command and seeing whether
-the gate responds. Never test with a file check or with free prose - that
-proves nothing.
+putting the forbidden fragment literally into a harmless form of the bound
+command and seeing whether the gate responds. Never test with a file check
+or with free prose - that proves nothing, and writing the mistake into a
+file only risks it; a check on a file waits on an open point (step 4).
 
 Step 8 is done once every untested addition from this session is on that
 list, named with what should make it refuse.

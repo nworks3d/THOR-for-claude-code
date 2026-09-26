@@ -891,7 +891,7 @@ pub fn find_requires_violation(items: &[LiveItem], tool: &str, command: Option<&
         let Some(check) = candidate.item.check.as_ref() else { continue };
         let Some((when, required)) = requires_pair(check) else { continue };
         let inner = !model::gate::requires_trigger_names_a_binding(when, &candidate.item.bindings);
-        if inner && !contains_as_words(command.unwrap_or(content), when) {
+        if inner && !requires_trigger_in(command.unwrap_or(content), when) {
             continue;
         }
         if required.iter().any(|r| content.contains(r.as_str())) {
@@ -910,17 +910,35 @@ pub fn find_requires_violation(items: &[LiveItem], tool: &str, command: Option<&
     None
 }
 
+/// Whether an inner `requires` trigger `when` occurs in `command` the way the
+/// live guard reads it - THE one definition, shared with the write-time proof
+/// (`serve::prove`), so the two can never disagree about whether a real call
+/// carries the trigger. See `contains_as_words` for the matching itself.
+pub fn requires_trigger_in(command: &str, when: &str) -> bool {
+    contains_as_words(command, when)
+}
+
 /// Whether `needle` occurs in `haystack` as whole words: the characters right
-/// around it are not part of a word, a flag, a name or a path (letters,
-/// digits, `-`, `_`, `.`, `/`, `\`), so "-p my-dev" is found in `compose -p
-/// my-dev up` and in `"-p my-dev"`, but never in `-p my-dev-old`. An empty
-/// needle is never found.
+/// around it are not part of a word, a flag or a name (letters, digits, `-`,
+/// `_`, `.`), so "-p my-dev" is found in `compose -p my-dev up` and in
+/// `"-p my-dev"`, but never in `-p my-dev-old`. An empty needle is never
+/// found.
+///
+/// A PATH SEPARATOR IS A BOUNDARY (2026-09-27). `/` and `\` used to count as
+/// part of a word too, so a trigger could never sit inside a URL or a path:
+/// "/health" was never found in `curl -s http://10.0.0.5:3002/health` (the
+/// character before it is a digit), and "compose.dev.yml" never in `-f
+/// ./compose.dev.yml`. Measured on a real store: a rule with exactly that
+/// trigger looked wired at write time and could never refuse the one call it
+/// was written for. A separator starts or ends a path segment, so a trigger
+/// may sit right after or before one; "/health" still never matches
+/// `/healthz`, and "-p my-dev" still never matches `-p my-dev-old`.
 fn contains_as_words(haystack: &str, needle: &str) -> bool {
     let needle = needle.trim();
     if needle.is_empty() {
         return false;
     }
-    let joins = |c: char| c.is_alphanumeric() || "-_./\\".contains(c);
+    let joins = |c: char| c.is_alphanumeric() || "-_.".contains(c);
     haystack.match_indices(needle).any(|(at, _)| {
         let before = haystack[..at].chars().next_back();
         let after = haystack[at + needle.len()..].chars().next();

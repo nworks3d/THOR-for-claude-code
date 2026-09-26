@@ -468,10 +468,27 @@ fn prove_requires(id: &str, item: &Item) -> Proof {
 /// trigger when the trigger is a literal INSIDE the bound command rather than
 /// the binding itself (`model::gate::requires_trigger_names_a_binding`) - a
 /// call without that literal is not one the check is about.
+///
+/// WHERE THE TRIGGER SITS (2026-09-27). The trigger used to be appended as a
+/// word of its own, always. A real call never looks like that when the
+/// binding already carries the trigger text - a binding `curl -s
+/// http://10.0.0.5:3002/health` with the trigger "/health" - and the live
+/// guard then decided on the copy inside the URL while the proof decided on
+/// the appended one: measured on a real store, the proof said wired and the
+/// live guard could never match. So when the binding's own text already holds
+/// the trigger, the binding alone IS the real call; the trigger is appended
+/// only when it is not there, as the argument it then has to be. Either way
+/// the one matcher the live guard uses (`absent_guard::requires_trigger_in`)
+/// decides, so a proof can no longer be built from a shape the guard never
+/// sees.
 fn requires_attempt(item: &Item, anchor: &str) -> String {
     match &item.check {
         Some(Check::Requires { when, .. }) if !model::gate::requires_trigger_names_a_binding(when, &item.bindings) => {
-            format!("{anchor} {when}")
+            if anchor.contains(when.trim()) {
+                anchor.to_string()
+            } else {
+                format!("{anchor} {when}")
+            }
         }
         _ => anchor.to_string(),
     }
@@ -1592,7 +1609,9 @@ mod tests {
             vec![cmd("git push")],
             Some(Check::Forbidden { literals: vec!["--force".to_string()] }),
         );
-        item.tags = vec!["no-literal:probe with 'git push origin main' as the legitimate call".to_string()];
+        // No reason tag beside the check: the write gate refuses a check that
+        // refuses and "nothing can catch this" introduced together.
+        item.tags = vec![];
         let created = model::store::declare(&mut store, "s", "l", "a", &item).unwrap();
         crate::deliver::record_delivery_with_trigger(&mut store, "s", "l", "hook", "2026-09-26T00:00:00Z", &["r1".to_string()], Some("git push origin main"));
         crate::deliver::record_delivery_with_trigger(&mut store, "s", "l", "hook", "2026-09-26T00:00:01Z", &["r1".to_string()], Some("git push origin main"));

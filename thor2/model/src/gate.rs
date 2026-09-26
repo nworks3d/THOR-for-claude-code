@@ -1468,7 +1468,82 @@ fn combined(problems: Vec<Refusal>) -> Refusal {
 pub const NO_SCOPE_PROBLEM: &str = "this is archive material with no scope, so it joins the unscoped pile: it belongs to no collection, and opening one will never show it";
 
 pub fn declare(item: &Item) -> Result<(), Refusal> {
+    teeth_answer_contradictions(None, item)?;
     declare_inner(item, false, false, false, false, None, None)
+}
+
+/// Whether `check` is one that can REFUSE a write or a call on its own:
+/// forbidden, absent, absent_all or requires. `contains` and `path_exists`
+/// only prove that something is still there; they never stop anything.
+pub fn is_refusing_check(check: Option<&Check>) -> bool {
+    matches!(
+        check,
+        Some(Check::Forbidden { .. }) | Some(Check::Absent { .. }) | Some(Check::AbsentAll { .. }) | Some(Check::Requires { .. })
+    )
+}
+
+/// The written reason on an item that nothing can catch its mistake
+/// (`no-literal:<why>` or `no-catch-on-command:<why>`), if it carries one.
+pub fn teeth_reason_tag(item: &Item) -> Option<&str> {
+    item.tags.iter().map(String::as_str).find(|tag| {
+        matches!(crate::store::teeth_answer(tag), Some(crate::store::TeethAnswer::Reasoned(r)) if !r.is_empty())
+            || matches!(command_teeth_answer(tag), Some(crate::store::TeethAnswer::Reasoned(r)) if !r.is_empty())
+    })
+}
+
+/// Two shapes a write may not INTRODUCE (2026-09-27), both measured in a
+/// fresh evaluation that could not file its report. `existing` is the item
+/// before a revise (`None` for a new item); a shape it already carried is
+/// left alone, so correcting an older item never costs a round trip over a
+/// question it answered before this existed.
+///
+/// A CHECK AND "NOTHING CAN CATCH THIS" AT ONCE. A rule carrying a check that
+/// refuses (forbidden, absent, absent_all, requires) and a reason tag saying
+/// no text can catch its mistake contradicts itself: one of the two is wrong.
+/// Measured: a session hung a requires check on a rule and kept, beside it,
+/// a reason saying the bare call is legitimate; the filing gate took the
+/// reason and never looked at the check. The writer has to pick one.
+///
+/// AN OPEN POINT TAGGED ONTO THE RULE ITSELF. An open point is a separate
+/// Report (`crate::store::OPEN_POINT_TAG`); a tag `open:<id>:...` on the rule
+/// looks like one and counts for nothing. Measured: a session did exactly
+/// that on four rules and was refused again for all four, with no word on
+/// why. Refused here, with the recipe that does count.
+fn teeth_answer_contradictions(existing: Option<&Item>, updated: &Item) -> Result<(), Refusal> {
+    let is_new = |tag: &str| existing.is_none_or(|e| !e.tags.iter().any(|t| t == tag));
+    if updated.kind != Kind::Report {
+        if let Some(tag) = updated.tags.iter().find(|t| {
+            (t.starts_with("open:") || t.starts_with("open-point:") || t.as_str() == crate::store::OPEN_POINT_TAG)
+                && is_new(t)
+        }) {
+            return Err(Refusal::new(
+                format!("the tag '{tag}' looks like an open point, but an open point is never a tag on the rule itself"),
+                format!(
+                    "leave the rule's tags alone and file the open point as its own small Report instead: remember \
+                     with kind \"report\", the same project as the evaluation report, tags [\"{}\"], and a text that \
+                     names this rule's id and the real call that would prove it (or what blocks the fix)",
+                    crate::store::OPEN_POINT_TAG
+                ),
+            ));
+        }
+    }
+    if updated.kind.can_fire() && is_refusing_check(updated.check.as_ref()) {
+        if let Some(reason) = teeth_reason_tag(updated) {
+            let carried = existing.is_some_and(|e| is_refusing_check(e.check.as_ref()) && teeth_reason_tag(e).is_some());
+            if !carried {
+                return Err(Refusal::new(
+                    format!(
+                        "this item carries a check that refuses AND the tag '{reason}' saying nothing can catch its \
+                         mistake - one of the two is wrong"
+                    ),
+                    "keep the check and drop the reason tag (a wired check that has not met a real call yet is \
+                     carried by an open point), or clear the check with clear_check and a because that says why it \
+                     cannot work, and keep the reason",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn declare_inner(
@@ -1783,6 +1858,7 @@ fn dropped_field(name: &'static str) -> Refusal {
 /// The write-time gate for a revise: everything `declare` requires, PLUS no
 /// field the existing item had may silently vanish (refusal ground 9).
 pub fn revise(existing: &Item, updated: &Item) -> Result<(), Refusal> {
+    teeth_answer_contradictions(Some(existing), updated)?;
     // The one concession to the store as it already is: a rule that carried
     // the bare `no-literal` before the reason was required keeps it, so
     // correcting an old fact never costs a round trip over a question that
