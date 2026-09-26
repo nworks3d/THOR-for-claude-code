@@ -273,7 +273,7 @@ pub fn falsifier_line(db: &Path) -> String {
 /// health check reported falsifier coverage at 100% and read as healthy
 /// while proof coverage sat at 2 items out of 2999 (measured 2026-08-06).
 /// A capability nothing is wired into looks exactly like one that works.
-pub fn proof_line(db: &Path) -> String {
+pub fn proof_line(db: &Path, full: bool) -> String {
     let store = match EventStore::open_existing(db) {
         Ok(s) => s,
         Err(_) => return "provable rules: memory store not available - nothing to count".to_string(),
@@ -367,17 +367,39 @@ pub fn proof_line(db: &Path) -> String {
     // that was taken on a bare word, before the reason was required. Bare ones
     // are grandfathered by `gate::revise`, never re-asked by the backlog burn,
     // and would otherwise be invisible forever.
+    // NAMED, not just counted, since this is the second half of the same gap
+    // `judgement_debt_named` already closed for the debt list below: a bare
+    // `no-literal` is grandfathered by `gate::revise` and never re-asked by
+    // any backlog burn (see `TeethAnswer::Bare`'s own doc comment), so
+    // nothing else in this system will ever surface it again on its own.
+    // Sorted OLDEST first - by `first_seq`, the earliest event this store
+    // holds for the id, since no event carries a wall-clock timestamp to
+    // sort by more precisely - because this is exactly the population nothing
+    // ever revisits automatically: the longer one of these has sat bare, the
+    // less likely anyone still remembers why, and the more it is the one
+    // worth a second look before the next 20 push it off the list.
     let (mut answered_no, mut without_reason) = (0usize, 0usize);
+    let mut bare: Vec<(i64, Rot)> = Vec::new();
     for i in &fireable {
         match i.item.tags.iter().find_map(|t| model::store::teeth_answer(t)) {
             Some(model::store::TeethAnswer::Bare) => {
                 answered_no += 1;
                 without_reason += 1;
+                bare.push((
+                    first_seq(&store, &i.id),
+                    Rot {
+                        id: i.id.clone(),
+                        project: i.item.project.clone().unwrap_or_else(|| "global".to_string()),
+                        what: format!("{:?}, tagged '{}' with no reason", i.item.severity, model::store::NO_LITERAL_TAG),
+                    },
+                ));
             }
             Some(model::store::TeethAnswer::Reasoned(_)) => answered_no += 1,
             None => {}
         }
     }
+    bare.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.id.cmp(&b.1.id)));
+    let bare: Vec<Rot> = bare.into_iter().map(|(_, r)| r).collect();
     // THE NEW POPULATION, since gate ground 11 (continued, command) started
     // asking a heavy Command-anchored fact the SHARPER question
     // (`model::gate::command_teeth_answer`) instead of the plain one just
@@ -403,7 +425,7 @@ pub fn proof_line(db: &Path) -> String {
             command_answered_no += 1;
         }
     }
-    format!(
+    let mut out = vec![format!(
         "provable rules: {} of {} rule(s)/orientation(s) carry a runnable check ({:.1}%) - of those, \
          {forbidding} can refuse a write that introduces something forbidden, {location} can refuse a \
          write for landing in a place that is out of bounds, {protecting} can only refuse one that \
@@ -415,7 +437,9 @@ pub fn proof_line(db: &Path) -> String {
         with_check,
         fireable.len(),
         100.0 * with_check as f64 / fireable.len() as f64
-    )
+    )];
+    out.extend(name_rot("bare no-catch", &bare, full));
+    out.join("\n")
 }
 
 // ------------------------------------------------------ the checkouts root
@@ -588,6 +612,25 @@ fn name_rot(label: &str, rot: &[Rot], full: bool) -> Vec<String> {
         out.push(format!("  {label}: and {} more, not named here (use --full)", rot.len() - cap));
     }
     out
+}
+
+/// The `seq` of the earliest event on record for `id` - the closest thing to
+/// an age this store can answer, since no event carries a wall-clock
+/// timestamp of its own (`thor_core::event_store::Event`'s own fields).
+/// `get_events_by_entity` orders its rows `ORDER BY seq`, oldest first (the
+/// same fact `model::served::last_trigger`'s own doc comment already relies
+/// on), so the first row back is the item's own declaration - the point this
+/// function exists to find, without adding a timestamp column nothing else
+/// in this store has ever needed.
+///
+/// Fails open to `i64::MAX` on anything that goes wrong (a broken log, an id
+/// with no events on record) - the same fail-open reasoning `model::served::
+/// served_count` already gives for the identical query: the only thing this
+/// number ever feeds is the ORDER of an advisory list, never a refusal, and
+/// sorting a lookup failure to the very end is safer than guessing it is the
+/// oldest thing in the store.
+fn first_seq(store: &EventStore, id: &str) -> i64 {
+    store.get_events_by_entity(id).ok().and_then(|events| events.first().map(|e| e.seq)).unwrap_or(i64::MAX)
 }
 
 /// For every live, fireable item whose project resolves to a checkout under
@@ -1360,12 +1403,31 @@ pub fn wal_line(db: &Path) -> Option<String> {
 /// This is a worklist, not a fault: these are exactly the rules where a check
 /// is worth writing, because being wrong about them is what the owner already
 /// said is expensive.
-pub fn teeth_line(db: &Path) -> String {
+pub fn teeth_line(db: &Path, full: bool) -> String {
     let Ok(store) = EventStore::open_existing(db) else {
         return "teeth: store unreadable, not checked".to_string();
     };
     let live = serve::live::live_items(&store);
+    // How often each item has fired since its own last verdict - the exact
+    // fold `judgement_debt_line` already reads for the identical reason: a
+    // toothless rule that fires often is a live, exercised risk, not a
+    // theoretical one, and worth naming ahead of one nobody has seen in a
+    // long time. One fold, shared, so this and the judgement debt line can
+    // never silently disagree about what "fires often" means.
+    let fired = serve::usefulness::served_since_last_verdict(&store);
     let (mut heavy, mut heavy_with_teeth) = (0usize, 0usize);
+    // NAMED, not just counted - the same gap `judgement_debt_named` and the
+    // bare-no-catch list in `proof_line` both close: a bare count gives
+    // nothing anyone can act on, because nothing says which rules make it
+    // up. Sorted heaviest first - `severity_
+    // rank`, the exact ranking `serve::rank` itself already selects delivery
+    // order by - because severity is the whole reason this line exists: an
+    // Irreversible rule with no teeth is a worse gap than a Costly one, and
+    // showing only a handful must not let that difference wash out into an
+    // arbitrary pick. Ties within the same severity go to whichever fired
+    // most often since its last verdict (most exercised, most worth a check
+    // first), then to id, so the order is fully deterministic across runs.
+    let mut toothless: Vec<(u8, usize, Rot)> = Vec::new();
     for li in live.iter().filter(|li| li.item.kind.can_fire()) {
         if !matches!(
             li.item.severity,
@@ -1376,11 +1438,28 @@ pub fn teeth_line(db: &Path) -> String {
         heavy += 1;
         if can_refuse(&li.item) {
             heavy_with_teeth += 1;
+        } else {
+            let check_desc = match &li.item.check {
+                None => "no check".to_string(),
+                Some(c) => format!("check: {c:?}"),
+            };
+            let count = fired.get(&li.id).copied().unwrap_or(0);
+            toothless.push((
+                model::item::severity_rank(li.item.severity),
+                count,
+                Rot {
+                    id: li.id.clone(),
+                    project: li.item.project.clone().unwrap_or_else(|| "global".to_string()),
+                    what: format!("{:?}, {check_desc}, fired {count}x since its last verdict", li.item.severity),
+                },
+            ));
         }
     }
     if heavy == 0 {
         return "teeth: no rule is marked irreversible or costly yet".to_string();
     }
+    toothless.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)).then_with(|| a.2.id.cmp(&b.2.id)));
+    let toothless: Vec<Rot> = toothless.into_iter().map(|(_, _, r)| r).collect();
     // Armed is a claim about shape. Having refused something is a fact about
     // the world, and it is the only one of the two that cannot be wrong.
     //
@@ -1406,10 +1485,12 @@ pub fn teeth_line(db: &Path) -> String {
                 .len()
         })
         .unwrap_or(0);
-    format!(
+    let mut out = vec![format!(
         "teeth: {heavy_with_teeth} of {heavy} rule(s) marked irreversible or costly can actually refuse something - the other {} can only inform, and they are the ones where being wrong was already called expensive; {proven} rule(s) of any weight have ever actually refused a write, which is the only count here that is proven rather than claimed",
         heavy - heavy_with_teeth
-    )
+    )];
+    out.extend(name_rot("toothless", &toothless, full));
+    out.join("\n")
 }
 
 /// What the only maintenance loop in this system almost never looks at.
@@ -1838,9 +1919,9 @@ pub fn report(
     lines.extend(ship_line(db));
     lines.extend([
         falsifier_line(db),
-        proof_line(db),
+        proof_line(db, full),
         gate_line(db),
-        teeth_line(db),
+        teeth_line(db, full),
         pinned_line(db),
         decay_line(db, checkouts, full),
         crowding_line(db, checkouts, full),
@@ -3237,7 +3318,7 @@ mod tests {
             cannot.check = Some(model::item::Check::Forbidden { literals: vec!["\u{2014}".to_string()] });
             store::declare(&mut s, "s", "l", "a", &cannot).unwrap();
         }
-        let line = proof_line(&db);
+        let line = proof_line(&db, false);
         assert!(line.contains("1 can refuse a write that introduces"), "{line}");
         assert!(line.contains("1 block nothing at all"), "{line}");
     }
@@ -3286,7 +3367,7 @@ mod tests {
                 Some(model::item::Check::Requires { when: "Agent".to_string(), required: vec!["haiku".to_string()] });
             legacy_declare(&mut s, &cannot);
         }
-        let line = proof_line(&db);
+        let line = proof_line(&db, false);
         assert!(line.contains("1 can refuse a write that introduces"), "{line}");
         assert!(line.contains("1 block nothing at all"), "{line}");
     }
@@ -3319,7 +3400,7 @@ mod tests {
             currency.check = Some(model::item::Check::PathExists { path: "server/lib/quote.js".to_string() });
             store::declare(&mut s, "s", "l", "a", &currency).unwrap();
         }
-        let line = proof_line(&db);
+        let line = proof_line(&db, false);
         assert!(line.contains("1 can refuse a write for landing in a place"), "{line}");
         assert!(line.contains("1 block nothing at all"), "severity below Irreversible does not block: {line}");
     }
@@ -3336,7 +3417,7 @@ mod tests {
             let mut s = EventStore::new(&db).unwrap();
             store::declare(&mut s, "s", "l", "a", &rule("prose-only")).unwrap();
         }
-        let line = proof_line(&db);
+        let line = proof_line(&db, false);
         assert!(line.contains("0 of 1"), "a store with no provable rule must say so: {line}");
         assert!(line.contains("block"), "and say what the number decides: {line}");
     }
@@ -3377,8 +3458,79 @@ mod tests {
             )];
             store::declare(&mut s, "s", "l", "a", &path_answered).unwrap();
         }
-        let line = proof_line(&db);
+        let line = proof_line(&db, false);
         assert!(line.contains("1 of those anchored to a command"), "names the new population: {line}");
+    }
+
+    /// THE GAP THIS CLOSES: `without_reason` was a bare count nobody could
+    /// act on, because nothing said which rules made it up. Sorted OLDEST
+    /// first (`first_seq` - the earliest event this
+    /// store holds for the id), because a bare answer is never re-asked by
+    /// any backlog burn (`TeethAnswer::Bare`'s own doc comment): the longer
+    /// one has sat bare, the less likely anyone still remembers why, and the
+    /// more it deserves the next look. A REASONED answer must never appear in
+    /// this list at all - it already said why, which is the whole point of
+    /// the distinction this line draws.
+    #[test]
+    fn proof_line_names_the_bare_no_catch_rules_oldest_first_and_never_a_reasoned_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut s = EventStore::new(&db).unwrap();
+
+            // Declared first, so its own first event carries the lowest seq
+            // in this store - the oldest thing here, bare with no reason.
+            let mut oldest = rule("bare-and-oldest");
+            oldest.text = "the first bare rule this fixture ever declared".to_string();
+            oldest.tags = vec![store::NO_LITERAL_TAG.to_string()];
+            legacy_declare(&mut s, &oldest);
+
+            // Declared second: bare too, but newer, so it must sort after
+            // the one above.
+            let mut newer = rule("bare-and-newer");
+            newer.text = "a second bare rule this fixture declared afterward".to_string();
+            newer.tags = vec![store::NO_LITERAL_TAG.to_string()];
+            legacy_declare(&mut s, &newer);
+
+            // A reasoned answer, declared through the real gate - must never
+            // show up in the bare list, however old it is.
+            let mut reasoned = rule("reasoned-not-bare");
+            reasoned.text = "a rule that actually said why nothing can catch it".to_string();
+            reasoned.tags = vec![format!("{}this fixture spells out its own reason", store::NO_LITERAL_REASON_PREFIX)];
+            store::declare(&mut s, "s", "l", "a", &reasoned).unwrap();
+        }
+        let line = proof_line(&db, false);
+        let named: Vec<&str> = line.lines().filter(|l| l.starts_with("  bare no-catch:")).collect();
+        assert_eq!(named.len(), 2, "only the bare items, never a reasoned one: {line}");
+        assert!(named[0].contains("bare-and-oldest"), "the older bare item must be named first: {line}");
+        assert!(named[1].contains("bare-and-newer"), "{line}");
+    }
+
+    /// THE TWENTY-ITEM CAP, the same `NAMES_AT_MOST`/`name_cap` mechanism
+    /// `decay_line`'s and `judgement_debt_line`'s own named lists already
+    /// share: past twenty, the rest are held back and counted in a tail line
+    /// - `--full` lifts it, same as it already does for those two.
+    #[test]
+    fn proof_line_caps_the_bare_no_catch_list_at_twenty_with_a_tail_and_full_names_them_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut s = EventStore::new(&db).unwrap();
+            for n in 0..25 {
+                let mut item = rule(&format!("bare-{n:02}"));
+                item.tags = vec![store::NO_LITERAL_TAG.to_string()];
+                legacy_declare(&mut s, &item);
+            }
+        }
+        let capped = proof_line(&db, false);
+        let capped_named = capped.lines().filter(|l| l.starts_with("  bare no-catch: bare-")).count();
+        assert_eq!(capped_named, NAMES_AT_MOST, "must name at most twenty: {capped}");
+        assert!(capped.contains("  bare no-catch: and 5 more, not named here"), "{capped}");
+
+        let full = proof_line(&db, true);
+        let full_named = full.lines().filter(|l| l.starts_with("  bare no-catch: bare-")).count();
+        assert_eq!(full_named, 25, "--full must name every one of them: {full}");
+        assert!(!full.contains("not named here"), "{full}");
     }
 
     /// THE INVERSION THIS REPORTS. Severity is the first ranking key, so a
@@ -3413,9 +3565,77 @@ mod tests {
             light_armed.check = Some(model::item::Check::Forbidden { literals: vec!["\u{2026}".to_string()] });
             store::declare(&mut s, "s", "l", "a", &light_armed).unwrap();
         }
-        let line = teeth_line(&db);
+        let line = teeth_line(&db, false);
         assert!(line.contains("1 of 2"), "{line}");
         assert!(line.contains("the other 1 can only inform"), "{line}");
+    }
+
+    /// THE ORDERING THIS ENFORCES: heaviest severity first (`model::item::
+    /// severity_rank`, the same ranking `serve::rank` itself already selects
+    /// delivery order by), because severity is the whole reason this line
+    /// exists - an Irreversible rule with no teeth is a worse gap than a
+    /// Costly one, and showing only a handful must not let that difference
+    /// wash out into an arbitrary pick. Within the same severity, the item
+    /// fired most often since its last verdict goes first: a live, exercised
+    /// risk outranks a merely theoretical one.
+    #[test]
+    fn teeth_line_names_the_toothless_heavy_rules_heaviest_first_then_by_how_often_they_fired() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut s = EventStore::new(&db).unwrap();
+
+            let mut costly_rare = rule("costly-and-rarely-served");
+            costly_rare.severity = Some(model::item::Severity::Costly);
+            legacy_declare(&mut s, &costly_rare);
+
+            let mut irreversible_busy = rule("irreversible-and-often-served");
+            irreversible_busy.severity = Some(model::item::Severity::Irreversible);
+            legacy_declare(&mut s, &irreversible_busy);
+            for _ in 0..3 {
+                serve::deliver::record_delivery(
+                    &mut s, "s", "l", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z",
+                    &["irreversible-and-often-served".to_string()],
+                );
+            }
+
+            let mut irreversible_rare = rule("irreversible-and-never-served");
+            irreversible_rare.severity = Some(model::item::Severity::Irreversible);
+            legacy_declare(&mut s, &irreversible_rare);
+        }
+        let line = teeth_line(&db, false);
+        let named: Vec<&str> = line.lines().filter(|l| l.starts_with("  toothless:")).collect();
+        assert_eq!(named.len(), 3, "{line}");
+        assert!(named[0].contains("irreversible-and-often-served"), "heaviest and busiest first: {line}");
+        assert!(named[1].contains("irreversible-and-never-served"), "same severity, less busy, second: {line}");
+        assert!(named[2].contains("costly-and-rarely-served"), "lighter severity last: {line}");
+    }
+
+    /// THE TWENTY-ITEM CAP, the same `NAMES_AT_MOST`/`name_cap` mechanism
+    /// `decay_line`'s and `judgement_debt_line`'s own named lists already
+    /// share: past twenty, the rest are held back and counted in a tail line
+    /// - `--full` lifts it, same as it already does for those two.
+    #[test]
+    fn teeth_line_caps_the_toothless_list_at_twenty_with_a_tail_and_full_names_them_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut s = EventStore::new(&db).unwrap();
+            for n in 0..25 {
+                let mut item = rule(&format!("toothless-{n:02}"));
+                item.severity = Some(model::item::Severity::Costly);
+                legacy_declare(&mut s, &item);
+            }
+        }
+        let capped = teeth_line(&db, false);
+        let capped_named = capped.lines().filter(|l| l.starts_with("  toothless: toothless-")).count();
+        assert_eq!(capped_named, NAMES_AT_MOST, "must name at most twenty: {capped}");
+        assert!(capped.contains("  toothless: and 5 more, not named here"), "{capped}");
+
+        let full = teeth_line(&db, true);
+        let full_named = full.lines().filter(|l| l.starts_with("  toothless: toothless-")).count();
+        assert_eq!(full_named, 25, "--full must name every one of them: {full}");
+        assert!(!full.contains("not named here"), "{full}");
     }
 
     /// THE BLIND SPOT THIS REPORTS. A pinned item is skipped by decay outright
