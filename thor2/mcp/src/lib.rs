@@ -227,8 +227,9 @@ fn with_warnings(
     // teeth actually showed - see `teeth_test`/`apply_teeth_test`/
     // `apply_teeth_test_for_revise`, the only callers that ever pass
     // `Some(_)` here. `None` either because Change 2 does not apply to this
-    // fact at all, or because a revise changed neither its check nor its
-    // bindings and so carried its old answer forward without asking again.
+    // fact at all, or because a revise changed none of its check, bindings
+    // or severity on an item that already carried a box, and so carried
+    // that answer forward without asking again.
     let mut notes: Vec<String> = teeth_note.into_iter().collect();
     notes.extend(model::gate::warnings(item).iter().map(|w| w.to_string()));
     // The half of the capacity check that is a note rather than a refusal.
@@ -786,29 +787,33 @@ fn apply_teeth_test(item: &mut model::item::Item, root: Option<&std::path::Path>
     Ok(note)
 }
 
-/// `teeth_test` above, run for a REVISE: a revision that changes neither the
-/// check nor the bindings `existing` carried must not be re-labelled or
+/// `teeth_test` above, run for a REVISE. Three fields are the teeth test's
+/// own inputs: the check and the bindings it tries, and the severity that
+/// decides whether a test is owed at all. A revision that changes none of
+/// them, on an item that ALREADY carries a box, must not be re-labelled or
 /// slowed by this step - re-testing is real work (an anchored check's
-/// currency is proved fresh every time), and neither of the two things a
-/// teeth test is ABOUT changed, so its old answer is still the true one.
-/// Whatever tag `existing` already carried (if any - an item written before
-/// this change, or one Change 2 never applied to, carries none) is copied
-/// forward untouched, and nothing is tried. Otherwise - the check changed,
-/// the bindings changed, or both - exactly `apply_teeth_test`'s own fresh
-/// test, on the REVISED item.
+/// currency is proved fresh every time), and the old answer is still the
+/// true one, so that tag is copied forward untouched and nothing is tried.
+/// Everything else gets exactly `apply_teeth_test`'s own fresh test, on the
+/// REVISED item: any of the three inputs changed (raising the severity into
+/// irreversible or costly is how a rule starts to owe a box), or the item
+/// carries no box yet (it predates this mechanism, or it was light until
+/// now). The no-box half is what the evaluation-filing refusal in
+/// `model::store::check_evaluation_report_filing` relies on when it tells a
+/// writer that a revise with no other field changed labels an unboxed rule.
 fn apply_teeth_test_for_revise(
     existing: &model::item::Item,
     updated: &mut model::item::Item,
     root: Option<&std::path::Path>,
 ) -> Result<Option<String>, String> {
-    if existing.check == updated.check && existing.bindings == updated.bindings {
-        let already_present = updated.tags.iter().any(|t| t.starts_with(model::store::TEETH_TAG_PREFIX));
-        if already_present {
+    let inputs_unchanged = existing.check == updated.check
+        && existing.bindings == updated.bindings
+        && existing.severity == updated.severity;
+    let old_tag = existing.tags.iter().find(|t| t.starts_with(model::store::TEETH_TAG_PREFIX));
+    if let (true, Some(old_tag)) = (inputs_unchanged, old_tag) {
+        if updated.tags.iter().any(|t| t.starts_with(model::store::TEETH_TAG_PREFIX)) {
             return Ok(None);
         }
-        let Some(old_tag) = existing.tags.iter().find(|t| t.starts_with(model::store::TEETH_TAG_PREFIX)) else {
-            return Ok(None);
-        };
         // The caller's own `tags` (an explicit clear, or a new list that
         // simply omitted it) did not carry this label forward - restored
         // anyway, and said so, because clearing it is exactly one of the
@@ -819,11 +824,12 @@ fn apply_teeth_test_for_revise(
         updated.tags.push(old_tag.clone());
         return Ok(Some(format!(
             "teeth: '{old_tag}' is not part of 'tags' - it survives a clear or a replacement that omits it, \
-             restored here, because neither the check nor the bindings changed"
+             restored here, because neither the check, the bindings nor the severity changed"
         )));
     }
-    // Something Change 2 cares about DID change: never trust an old label
-    // that answered a different question, even if the writer's own new tags
+    // Something Change 2 cares about DID change, or there is no box yet to
+    // carry: never trust an old label that answered a different question,
+    // even if the writer's own new tags
     // list happened to still carry it forward from `existing.tags` (the
     // omit-keeps-current-tags convention `revise` already documents).
     //
@@ -1936,9 +1942,10 @@ impl ThorMcpServer {
             if tags_cleared {
                 gate_existing.tags = Vec::new();
             }
-            // CHANGE 2: unless this revise touches neither the check nor the
-            // bindings `existing` carried, in which case its old answer is
-            // carried forward untouched and nothing is tried again - see
+            // CHANGE 2: unless this revise touches none of the check, the
+            // bindings or the severity of an item that already carries a
+            // box, in which case that box is carried forward untouched and
+            // nothing is tried again - see
             // `apply_teeth_test_for_revise`'s own doc comment. Computed
             // against the TRUE `existing`, never `gate_existing`, for the
             // identical reason `weakenings` below is: a field blanked for a
@@ -3682,8 +3689,9 @@ mod tests {
         assert!(events.is_empty(), "a refused remember must write nothing at all, found: {events:?}");
     }
 
-    /// A revise that touches neither the check nor the bindings must not be
-    /// re-labelled or slowed: the existing teeth tag survives byte for byte,
+    /// A revise that touches none of the check, the bindings or the severity
+    /// of an item that already carries a box must not be re-labelled or
+    /// slowed: the existing teeth tag survives byte for byte,
     /// and no fresh teeth note appears (nothing was tried again).
     #[tokio::test]
     async fn revise_that_changes_only_text_carries_the_existing_teeth_tag_forward_untouched() {
@@ -3711,7 +3719,7 @@ mod tests {
     /// THE SECOND WAY A WRITER MUST NOT BE ABLE TO TOUCH THE LABEL: an
     /// explicit `tags: []` clear - the harness-level way to clear the whole
     /// list - must not be able to erase the teeth tag either, on a revise
-    /// that changes neither the check nor the bindings. The tag survives,
+    /// that changes none of the check, the bindings or the severity. The tag survives,
     /// restored, and the reply says so.
     ///
     /// A CHECKED fixture, deliberately, never `base_remember`'s own checkless
@@ -3762,6 +3770,90 @@ mod tests {
             after_item.tags,
             vec![model::store::TEETH_PROVEN_TAG.to_string()],
             "the teeth tag must be the one thing an explicit clear cannot remove"
+        );
+    }
+
+    /// THE ADVICE THE FILING GATE GIVES MUST WORK. `model::store`'s
+    /// evaluation-filing refusal names every fired heavy rule with no teeth
+    /// box and tells the writer to revise it "even with no other field
+    /// changed". A rule stored before teeth boxes existed carries no box, so
+    /// a bare revise of it has nothing to carry forward and must try the
+    /// teeth itself - otherwise the advice changes nothing and the report can
+    /// never be filed. End to end: refused, bare revise, labelled, filed.
+    #[tokio::test]
+    async fn a_bare_revise_of_an_unboxed_heavy_rule_tries_its_teeth_and_unblocks_filing() {
+        let srv = server_knowing(&["test-project"]);
+        {
+            let mut s = srv.store.lock().unwrap();
+            let mut previous = model::store::show(&s, "seed-test-project").unwrap();
+            previous.id = "eval-previous".to_string();
+            previous.text = "the previous evaluation of test-project".to_string();
+            previous.tags = vec![model::store::EVALUATION_REPORT_TAG.to_string()];
+            model::store::declare(&mut s, "seed", "seed", "owner", &previous).unwrap();
+            // Written straight into the store, the way every rule stored
+            // before the write path tried teeth got there: no teeth tag.
+            let legacy = Item {
+                id: "legacy-guard".to_string(),
+                kind: Kind::Rule,
+                text: "never force-push".to_string(),
+                bindings: vec![Binding::Target { kind: TargetKind::Command, value: "git push".to_string() }],
+                severity: Some(Severity::Irreversible),
+                project: Some("test-project".to_string()),
+                tags: vec![],
+                expires: None,
+                key: None,
+                falsifier: Some("a force-push lands with no incident".to_string()),
+                check: Some(Check::Forbidden { literals: vec!["--force".to_string()] }),
+            };
+            model::store::declare(&mut s, "seed", "seed", "owner", &legacy).unwrap();
+            s.append_event("s", "l", "hook", thor_core::event_store::EventKind::ItemServed, "legacy-guard", None, "{}")
+                .unwrap();
+        }
+        let report = |id: &str| RememberArgs {
+            tags: vec![model::store::EVALUATION_REPORT_TAG.to_string()],
+            text: format!("evaluation {id} of test-project"),
+            ..blank_report(id)
+        };
+
+        let refused = srv.remember(Parameters(report("eval-new"))).await;
+        assert!(refused.contains("REFUSED") && refused.contains("legacy-guard"), "{refused}");
+
+        let reply = srv.revise(Parameters(bare_revise("legacy-guard"))).await;
+        assert!(reply.starts_with("revised"), "{reply}");
+        assert!(reply.contains("teeth: proven guard"), "a bare revise of an unboxed rule must try its teeth: {reply}");
+        let item: Item =
+            serde_json::from_str(&srv.get(Parameters(GetArgs { id: "legacy-guard".to_string() })).await).unwrap();
+        assert!(item.tags.iter().any(|t| t == model::store::TEETH_PROVEN_TAG), "{:?}", item.tags);
+
+        let filed = srv.remember(Parameters(report("eval-new"))).await;
+        assert!(filed.starts_with("stored "), "the advice was followed, so filing must now go through: {filed}");
+    }
+
+    /// Severity decides whether a teeth test is owed at all, so a revise that
+    /// changes ONLY the severity - light to irreversible here, check and
+    /// bindings untouched - changes an input of the test and must try the
+    /// teeth. Otherwise the rule turns heavy with no box, and the
+    /// evaluation-filing gate later refuses every report while it fires.
+    #[tokio::test]
+    async fn a_revise_that_only_raises_severity_into_heavy_tries_the_teeth_and_labels_it() {
+        let srv = server();
+        let mut args = base_remember("raised-1");
+        args.severity = Some("house_style".to_string());
+        let stored = srv.remember(Parameters(args)).await;
+        assert!(stored.starts_with("stored ") && !stored.contains("teeth:"), "fixture sanity: light, no check: {stored}");
+
+        let mut raise = bare_revise("raised-1");
+        raise.severity = Some("irreversible".to_string());
+        let reply = srv.revise(Parameters(raise)).await;
+        assert!(reply.starts_with("revised"), "{reply}");
+        assert!(reply.contains("teeth: informing only"), "raising severity must try the teeth: {reply}");
+
+        let item: Item =
+            serde_json::from_str(&srv.get(Parameters(GetArgs { id: "raised-1".to_string() })).await).unwrap();
+        assert!(
+            item.tags.iter().any(|t| t == model::store::TEETH_INFORMING_TAG),
+            "the now-heavy rule must carry a teeth box: {:?}",
+            item.tags
         );
     }
 

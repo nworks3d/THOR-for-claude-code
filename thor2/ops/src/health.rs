@@ -1534,7 +1534,8 @@ pub fn teeth_line(db: &Path, full: bool) -> String {
     // CHANGE 2's own line, kept separate from the shape-only sentence above
     // rather than folded into it: the four counts below are WRITE-TIME facts
     // (this tool actually tried both sides, and said so in a tag that
-    // survives only as long as neither the check nor the bindings change),
+    // survives only as long as none of the check, the bindings or the
+    // severity changes),
     // never a re-derivation of `heavy_with_teeth`/`toothless` at report time.
     // Every heavy rule owes a teeth test (`serve::prove::teeth_box`'s own
     // applicability rule - `is_heavy` alone already satisfies it, whatever
