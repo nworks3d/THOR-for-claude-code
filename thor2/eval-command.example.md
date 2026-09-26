@@ -162,11 +162,17 @@ you start this step and again once you finish it - the report names both.
 
 Start with this report's batch: at most eight heavy facts that fired since
 the previous report without a real tooth or a real reason, the ones written
-longest ago first. The ask for this evaluation names them, the health check
-names them on its `evaluation batch` line, and the report cannot be filed
-until each one is settled. The heavy facts beyond the batch stay owed, are
-named on that same line, and lead the next report's batch - settle more of
-them when there is time, but never fewer than the batch.
+longest ago first. You do not pick them: the health check names them on its
+`evaluation batch` line, each on its own `batch: <id>` line, and the ask for
+this evaluation names the same ones. The report cannot be filed until each
+one is settled; until then the gate refuses it and counts what is left.
+Settled means what the gate counts: a check that bit reality
+(`teeth:proven-guard`), a wired check carried by an open point that names
+its id, or a no-literal reason that quotes the legitimate call or names the
+trigger (see below). A label the tool wrote itself, such as
+`teeth:informing`, settles nothing. The heavy facts on the `owed later:`
+lines stay owed and lead the next report's batch - settle more of them when
+there is time, but never fewer than the batch.
 
 The burden of proof is reversed: for every heavy fact with no check, TRY to
 give it one before anything else. Work out, in writing, which literal
