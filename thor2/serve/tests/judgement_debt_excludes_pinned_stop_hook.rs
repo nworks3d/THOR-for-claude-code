@@ -125,6 +125,10 @@ fn declare_pinned_items(store: &mut EventStore, n: usize, session_id: &str) {
             check: None,
         };
         model::store::declare(store, "fixture", "fixture", "fixture", &item).unwrap();
+        // Decided by THOR's trial (a note): since step 9 the teeth question
+        // asks about every rule without a verdict, and this file is about
+        // the judgement ask and the evaluation obligation only.
+        serve::teeth::fixture::decide(store, &id);
         for _ in 0..AFTER {
             serve::deliver::record_delivery(store, session_id, session_id, serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &[id.clone()]);
         }
@@ -153,6 +157,10 @@ fn declare_trigger_items(store: &mut EventStore, n: usize, session_id: &str) {
             check: None,
         };
         model::store::declare(store, "fixture", "fixture", "fixture", &item).unwrap();
+        // Decided by THOR's trial (a note): since step 9 the teeth question
+        // asks about every rule without a verdict, and this file is about
+        // the judgement ask and the evaluation obligation only.
+        serve::teeth::fixture::decide(store, &id);
         for _ in 0..AFTER {
             serve::deliver::record_delivery(store, session_id, session_id, serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &[id.clone()]);
         }

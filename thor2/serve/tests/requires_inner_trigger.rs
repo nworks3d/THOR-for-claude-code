@@ -32,7 +32,7 @@ fn fixture(dir: &Path) -> PathBuf {
             required: vec!["-f docker-compose.dev.yml".to_string()],
         }),
     };
-    model::store::declare(&mut store, "s", "l", "a", &item).expect("the write gate must accept an inner trigger");
+    model::store::declare(&mut store, "s", "l", "a", &named(&item)).expect("the write gate must accept an inner trigger");
     db
 }
 
@@ -97,4 +97,18 @@ fn every_other_ssh_call_passes() {
         let out = run_bash(&db, dir.path(), command);
         assert!(!blocked(&out), "{command} must pass: {out}");
     }
+}
+
+/// `item` with every check literal its text does not name appended to the
+/// text (in `U+XXXX` form for a glyph): since step 8 of the two tracks the
+/// write gate refuses a check whose literal the rule's own words never name
+/// (A4), and these fixtures are about the hook, not about naming.
+fn named(item: &model::item::Item) -> model::item::Item {
+    let mut out = item.clone();
+    let unnamed = model::gate::unnamed_literals(&out);
+    if !unnamed.is_empty() {
+        let shown: Vec<String> = unnamed.iter().map(|l| format!("'{}'", model::gate::shown_literal(l))).collect();
+        out.text = format!("{} (names {})", out.text, shown.join(" "));
+    }
+    out
 }

@@ -9,8 +9,9 @@
 
 use crate::gate::{self, Refusal};
 use crate::item::{Binding, Check, Item, Kind, Severity};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use thor_core::cas::compute_head_sets;
 use thor_core::event_store::{Event, EventKind, EventStore};
 
@@ -76,6 +77,230 @@ impl std::fmt::Display for ReadError {
 }
 
 impl std::error::Error for ReadError {}
+
+// ------------------------------------------------------------ the actor fence
+//
+// THE LEAK THIS CLOSES (D1). Reserved actor names used to be refused by one
+// binary at a time, so any other binary - a repair tool, the pins tool, a
+// migration, a mark - could still write as `eval-machine` or `installer`, and
+// a reader that trusts an actor then trusts a forgery. The fence now lives
+// HERE, in the one module every write goes through: each public write
+// function refuses a reserved name passed as a plain string, and THOR's own
+// writers pass a `SystemActor` instead - a token whose constructor a grep test
+// (`system_actor_is_built_only_in_the_named_modules`, below) allows in a short
+// list of modules only.
+
+/// The actor THOR's installer writes as. The only actor a project's
+/// working-copy registration is ever read from (`root_registrations`).
+pub const INSTALLER_ACTOR: &str = "installer";
+
+/// Every actor name that belongs to THOR itself. None of them may be passed as
+/// a plain string to a write function in this module (see `fence`).
+///
+/// `teeth-probe` is a legacy name that is never written again, and `hook` is
+/// the name the hook itself stamps its own recorded events with: both stay
+/// reserved so nothing else can write under them. Spelled as literals on
+/// purpose - the constants that carry the same names elsewhere in this file may
+/// retire, and the reservation must not retire with them.
+pub const RESERVED_ACTORS: &[&str] = &[
+    INSTALLER_ACTOR,
+    "retest",
+    "teeth-eval",
+    "teeth-write",
+    "eval-machine",
+    "eval-validator",
+    "attester",
+    "teeth-probe",
+    "hook",
+];
+
+/// A write by THOR itself. The field is private, so the only way to hold one
+/// is `SystemActor::new`, and a grep test fails when that is called outside
+/// the modules allowed to (see `system_actor_is_built_only_in_the_named_modules`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SystemActor {
+    name: &'static str,
+}
+
+impl SystemActor {
+    /// Panics when `name` is not one of `RESERVED_ACTORS`: a system actor
+    /// with an ordinary name would be a token that means nothing, and that is
+    /// a programming mistake, never a runtime condition.
+    pub fn new(name: &'static str) -> Self {
+        assert!(RESERVED_ACTORS.contains(&name), "SystemActor::new: '{name}' is not a reserved actor name");
+        Self { name }
+    }
+
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+}
+
+/// Who is writing: an ordinary name (the tool server, a CLI's `--actor`, a
+/// repair tool) or THOR itself. Every write function in this module takes
+/// `impl Into<WriteActor>`, so a plain `&str` still reads exactly as before
+/// and only the reserved names are refused (see `fence`).
+#[derive(Debug, Clone, Copy)]
+pub enum WriteActor<'a> {
+    Named(&'a str),
+    System(SystemActor),
+}
+
+impl<'a> WriteActor<'a> {
+    pub fn name(&self) -> &'a str {
+        match self {
+            WriteActor::Named(name) => name,
+            WriteActor::System(actor) => actor.name(),
+        }
+    }
+}
+
+impl<'a> From<&'a str> for WriteActor<'a> {
+    fn from(name: &'a str) -> Self {
+        WriteActor::Named(name)
+    }
+}
+
+impl<'a> From<&'a String> for WriteActor<'a> {
+    fn from(name: &'a String) -> Self {
+        WriteActor::Named(name.as_str())
+    }
+}
+
+impl<'a> From<SystemActor> for WriteActor<'a> {
+    fn from(actor: SystemActor) -> Self {
+        WriteActor::System(actor)
+    }
+}
+
+impl<'a> From<&SystemActor> for WriteActor<'a> {
+    fn from(actor: &SystemActor) -> Self {
+        WriteActor::System(*actor)
+    }
+}
+
+/// The refusal for a reserved actor name passed as a plain string, or `Ok`.
+/// Public so a binary can refuse the name EARLY, before it opens anything,
+/// with the very same sentence the store gives (`model.exe --actor`,
+/// `serve hook --actor`).
+pub fn refuse_reserved_actor(actor: &str) -> Result<(), Refusal> {
+    if RESERVED_ACTORS.contains(&actor) {
+        return Err(Refusal {
+            problem: format!("the actor name {actor} is reserved for THOR itself"),
+            fix: "write without --actor, or with your own name".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// The id of project `key`'s working-copy record, written by the installer.
+pub fn project_opened_id(key: &str) -> String {
+    format!("project-{key}-opened-by-install")
+}
+
+/// The id the installer registers a working copy under when the project's
+/// own record (`project_opened_id`) was retracted before this build - a
+/// tombstone can never be revised, so the registration needs a record of its
+/// own.
+pub fn project_root_id(key: &str) -> String {
+    format!("project-{key}-root-by-install")
+}
+
+/// The one actor allowed to write any event on `entity_id`, when the id is
+/// reserved for THOR itself; `None` for every ordinary id.
+///
+/// - `project-<key>-opened-by-install` and `project-<key>-root-by-install`:
+///   only `installer`. Retracting the project record would otherwise
+///   tombstone it, and no registration could ever land again (D2).
+/// - `evaluation-start-*`: only `eval-machine`.
+/// - `teeth-a4-cutoff` (`A4_CUTOFF_ID`): only `retest` - THOR's record of the
+///   one point before which a contains check counts as old stock (Q24).
+pub fn reserved_id_owner(entity_id: &str) -> Option<&'static str> {
+    let project_record = entity_id.starts_with("project-")
+        && (entity_id.ends_with("-opened-by-install") || entity_id.ends_with("-root-by-install"));
+    if project_record {
+        return Some(INSTALLER_ACTOR);
+    }
+    if entity_id.starts_with("evaluation-start-") {
+        return Some("eval-machine");
+    }
+    if entity_id == A4_CUTOFF_ID {
+        return Some(RETEST_ACTOR);
+    }
+    None
+}
+
+/// The command a reader runs, from inside a checkout, to register it as its
+/// project's working copy - always with `--db`, so it registers into the
+/// memory the printing process has open and never into a default one (F7).
+///
+/// Lives here rather than in `ops` because `serve` and `mcp` print it too, and
+/// neither can depend on `ops` (it depends on both of them);
+/// `ops::install::register_command_for` is this same function.
+pub fn register_command_for(db: Option<&Path>) -> String {
+    format!("install{} --register-root --db \"{}\"", std::env::consts::EXE_SUFFIX, db_argument(db))
+}
+
+/// The full per-project install command, run from inside a checkout, with
+/// `--db` for the same reason `register_command_for` carries it.
+pub fn install_command_for(db: Option<&Path>) -> String {
+    format!("install{} --db \"{}\"", std::env::consts::EXE_SUFFIX, db_argument(db))
+}
+
+/// The store path a printed command names, or a placeholder that says what
+/// belongs there when the printing process has no file of its own open.
+fn db_argument(db: Option<&Path>) -> String {
+    match db {
+        Some(db) => db.display().to_string(),
+        None => "<path to thor.db>".to_string(),
+    }
+}
+
+/// Let a write through the fence, or refuse it. Returns the actor name the
+/// event is stamped with.
+///
+/// Two grounds, both refused before anything is read or appended:
+/// - a reserved actor name passed as a plain string (`refuse_reserved_actor`);
+/// - an event on a reserved id (`reserved_id_owner`) by any other actor - a
+///   `SystemActor` of the wrong name included.
+///
+/// Public so a write outside this module that appends an event on an item
+/// (the mark writers in `serve::mark`) goes through the very same fence.
+pub fn fence<'a>(store: &EventStore, actor: WriteActor<'a>, entity_id: &str) -> Result<&'a str, WriteError> {
+    if let WriteActor::Named(name) = actor {
+        refuse_reserved_actor(name).map_err(WriteError::Refused)?;
+    }
+    let name = actor.name();
+    match reserved_id_owner(entity_id) {
+        Some(owner) if owner != name => Err(WriteError::Refused(reserved_id_refusal(store, entity_id, owner))),
+        _ => Ok(name),
+    }
+}
+
+fn reserved_id_refusal(store: &EventStore, entity_id: &str, owner: &str) -> Refusal {
+    if owner == INSTALLER_ACTOR {
+        Refusal {
+            problem: format!("this record is THOR's own registration of a project's working copy ('{entity_id}')"),
+            fix: format!(
+                "run {} from inside the checkout instead",
+                register_command_for(store.path().as_deref())
+            ),
+        }
+    } else if owner == RETEST_ACTOR {
+        Refusal {
+            problem: format!(
+                "'{entity_id}' is THOR's own record of the A4 cutoff for old contains checks, written once by THOR's \
+                 retest and never moved"
+            ),
+            fix: format!("give your own item an id other than '{A4_CUTOFF_ID}'"),
+        }
+    } else {
+        Refusal {
+            problem: format!("'{entity_id}' is THOR's own record of an evaluation start, written only by THOR itself"),
+            fix: "give your own item an id that does not begin with 'evaluation-start-'".to_string(),
+        }
+    }
+}
 
 /// The canonical JSON body for an item: `serde_json::to_string` on the
 /// struct directly, never through a `serde_json::Value` map, so the field
@@ -480,29 +705,37 @@ pub fn unsettled_neighbours(
 /// - It needs a root. Without one there is nothing to run a check against
 ///   and the toll simply does not exist, exactly like every other check in
 ///   this system when its anchor does not resolve.
-pub fn declare_in(
+pub fn declare_in<'a>(
     store: &mut EventStore,
     session_id: &str,
     lineage_id: &str,
-    actor: &str,
+    actor: impl Into<WriteActor<'a>>,
     item: &Item,
     root: Option<&Path>,
 ) -> Result<Event, WriteError> {
-    declare_in_scoped(store, session_id, lineage_id, actor, item, root, None)
+    declare_in_scoped(store, session_id, lineage_id, actor, item, root, None, None)
 }
 
 /// `declare_in`, for a write that may FILE an evaluation report: `scope`
 /// says which session files it and where its evaluation started (see
 /// `EvaluationScope`). Every other write passes `None` and is untouched.
-pub fn declare_in_scoped(
+///
+/// `trial` is the record of THOR's own trial of this item, spliced into the
+/// event body as `"teeth_trial"` (`body_with_trial`). Every caller passes
+/// `None` until the trial is switched on for the writes.
+#[allow(clippy::too_many_arguments)]
+pub fn declare_in_scoped<'a>(
     store: &mut EventStore,
     session_id: &str,
     lineage_id: &str,
-    actor: &str,
+    actor: impl Into<WriteActor<'a>>,
     item: &Item,
     root: Option<&Path>,
     scope: Option<&EvaluationScope>,
+    trial: Option<&TrialRecord>,
 ) -> Result<Event, WriteError> {
+    let actor = actor.into();
+    fence(store, actor, &item.id)?;
     if let Some(root) = root {
         // A `Contains`/`Absent`/`AbsentAll` check_path may now name a
         // DIRECTORY (see `Check::Absent`'s own doc comment) - checked ONLY
@@ -546,30 +779,51 @@ pub fn declare_in_scoped(
             }));
         }
     }
-    declare_scoped(store, session_id, lineage_id, actor, item, scope)
+    declare_gated(store, session_id, lineage_id, actor, item, scope, trial, None)
 }
 
-pub fn declare(
+pub fn declare<'a>(
     store: &mut EventStore,
     session_id: &str,
     lineage_id: &str,
-    actor: &str,
+    actor: impl Into<WriteActor<'a>>,
     item: &Item,
 ) -> Result<Event, WriteError> {
     declare_scoped(store, session_id, lineage_id, actor, item, None)
 }
 
 /// `declare`, with the evaluation scope `declare_in_scoped` describes.
-pub fn declare_scoped(
+pub fn declare_scoped<'a>(
     store: &mut EventStore,
     session_id: &str,
     lineage_id: &str,
-    actor: &str,
+    actor: impl Into<WriteActor<'a>>,
     item: &Item,
     scope: Option<&EvaluationScope>,
 ) -> Result<Event, WriteError> {
+    declare_gated(store, session_id, lineage_id, actor.into(), item, scope, None, None)
+}
+
+/// Everything `declare_scoped` does, plus the trial record `declare_in_scoped`
+/// carries (`body_with_trial`) and - for the installer's project record only
+/// (`declare_project_record`) - the registered working copy spliced onto the
+/// body as the trailing `"root"`/`"root_at"` keys.
+#[allow(clippy::too_many_arguments)]
+fn declare_gated(
+    store: &mut EventStore,
+    session_id: &str,
+    lineage_id: &str,
+    actor: WriteActor<'_>,
+    item: &Item,
+    scope: Option<&EvaluationScope>,
+    trial: Option<&TrialRecord>,
+    root: Option<(&str, &str)>,
+) -> Result<Event, WriteError> {
+    let actor = fence(store, actor, &item.id)?;
     let item = normalized(item);
     gate::declare(&item).map_err(WriteError::Refused)?;
+    old_stock_ground(None, trial).map_err(WriteError::Refused)?;
+    teeth_tag_ground(None, &item, trial).map_err(WriteError::Refused)?;
     if let Some((existing_id, why)) = find_near_duplicate(store, &item).map_err(WriteError::Store)? {
         return Err(WriteError::Refused(match why {
             Collision::Text => Refusal {
@@ -602,6 +856,12 @@ pub fn declare_scoped(
     if let Some(refusal) = find_opposing_check(store, &item).map_err(WriteError::Store)? {
         return Err(WriteError::Refused(refusal));
     }
+    // GROUND 30, CONTINUED (2026-09-27): a fresh open point naming a rule an
+    // earlier one (any id, live or retracted) already carried must start at
+    // that count - see `check_open_point_carry_inherited`'s own doc comment.
+    if let Some(refusal) = check_open_point_carry_inherited(store, &item) {
+        return Err(WriteError::Refused(refusal));
+    }
     // CONTRACT R1's own refusal class, unpaid until 2026-08-08: an item that
     // cannot reach a block is cover that looks real and never fires. Only the
     // provable half refuses here; the rest comes back as a note on the write
@@ -620,7 +880,13 @@ pub fn declare_scoped(
     if let Some(refusal) = check_evaluation_report_filing(store, &item, scope) {
         return Err(WriteError::Refused(refusal));
     }
-    let body = canonical_body(&item).map_err(WriteError::Serialize)?;
+    let mut body = canonical_body(&item).map_err(WriteError::Serialize)?;
+    if let Some(trial) = trial {
+        body = body_with_trial(&body, trial).map_err(WriteError::Serialize)?;
+    }
+    if let Some((root, at)) = root {
+        body = body_with_root(&body, root, at).map_err(WriteError::Serialize)?;
+    }
     store
         .append_event(session_id, lineage_id, actor, EventKind::FactCreated, &item.id, None, &body)
         .map_err(WriteError::Store)
@@ -631,14 +897,15 @@ pub fn declare_scoped(
 /// `fact_revised` event. `existing` should be the item just read with
 /// `show`, so the field-preservation check has something real to compare
 /// against.
-pub fn revise(
+pub fn revise<'a>(
     store: &mut EventStore,
     session_id: &str,
     lineage_id: &str,
-    actor: &str,
+    actor: impl Into<WriteActor<'a>>,
     existing: &Item,
     updated: &Item,
 ) -> Result<Event, WriteError> {
+    let actor = fence(store, actor.into(), &updated.id)?;
     // BOTH sides are normalised before the dropped-field check. An item
     // already stored with project "global" is a global item; rewriting it as
     // `None` says the same thing, so it must not read as dropping the field.
@@ -647,6 +914,8 @@ pub fn revise(
     let existing = normalized(existing);
     let updated = normalized(updated);
     gate::revise(&existing, &updated).map_err(WriteError::Refused)?;
+    gate::a4_ground(Some(&existing), &updated, None).map_err(WriteError::Refused)?;
+    teeth_tag_ground(Some(&existing), &updated, None).map_err(WriteError::Refused)?;
     // The same capacity refusal `declare` makes. Without this the gate was
     // one door wide: declare refused an item that could never be shown, and
     // revise walked the identical binding in through the back.
@@ -669,7 +938,7 @@ pub fn revise(
             return Err(WriteError::Refused(refusal));
         }
     }
-    let body = canonical_body(&updated).map_err(WriteError::Serialize)?;
+    let body = canonical_body(&without_stale_teeth_tags(&existing, &updated, None)).map_err(WriteError::Serialize)?;
     store
         .append_mutate_checked(session_id, lineage_id, actor, EventKind::FactRevised, &updated.id, None, &body)
         .map_err(WriteError::Store)
@@ -709,11 +978,11 @@ fn newly_filed_as_evaluation(existing: &Item, updated: &Item) -> bool {
 /// for every caller with nothing to explain - `pin`, `unpin`, every one-off
 /// repair binary, every test written before this existed. This is strictly
 /// additive.
-pub fn revise_because(
+pub fn revise_because<'a>(
     store: &mut EventStore,
     session_id: &str,
     lineage_id: &str,
-    actor: &str,
+    actor: impl Into<WriteActor<'a>>,
     existing: &Item,
     updated: &Item,
     before: &Item,
@@ -725,62 +994,61 @@ pub fn revise_because(
 /// `revise_because`, with the evaluation scope `declare_in_scoped`
 /// describes - for a revise that files an evaluation report.
 #[allow(clippy::too_many_arguments)]
-pub fn revise_because_scoped(
+pub fn revise_because_scoped<'a>(
     store: &mut EventStore,
     session_id: &str,
     lineage_id: &str,
-    actor: &str,
+    actor: impl Into<WriteActor<'a>>,
     existing: &Item,
     updated: &Item,
     before: &Item,
     because: Option<&str>,
     scope: Option<&EvaluationScope>,
 ) -> Result<Event, WriteError> {
-    revise_tried_scoped(store, session_id, lineage_id, actor, existing, updated, before, because, scope, None)
+    revise_tried_scoped(store, session_id, lineage_id, actor, existing, updated, before, because, scope, None, None)
 }
 
-/// A check that was only TRIED on a revise, never stored - see
-/// `revise_tried_scoped`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TriedCheck {
-    /// The check that was tried.
-    pub check: Check,
-    /// What THOR's own write-time proof found, in its own words.
-    pub outcome: String,
-}
-
-/// `revise_because_scoped`, for a revise that also carries a TRIED check
-/// (2026-09-27). The revised item is written exactly as `revise_because_
-/// scoped` writes it; the tried check and what the proof found travel in the
-/// same event body under `"tried"`, beside `because`, so `history` shows the
-/// try and `ids_whose_check_was_tried` counts it. The tried check never
-/// becomes the item's own and never guards anything.
+/// `revise_because_scoped`, for a revise that carries THOR's trial record.
 ///
-/// WHY THIS EXISTS. A reason that nothing can catch a rule's mistake counts
-/// only after a real try (`gate::teeth_answer_settles`), and the only try the
-/// log could show was a check hung live on the rule. Measured in a fresh
-/// evaluation: a session hung a check it already knew was too broad, only to
-/// be allowed its reason afterwards, and for about a minute that check
-/// refused every write that mentioned the file it named. A try now runs
-/// through the proof alone.
+/// `trial` is the record of THOR's own trial of `updated`, spliced into the
+/// event body as `"teeth_trial"`, right after `because` (`body_with_trial`).
+/// `parent_rev` is the head the caller read the item from: the write lands
+/// only while that is still the head, so an item that changed between the
+/// read and this write is refused (the log's own compare-and-swap,
+/// `append_mutate_checked`) and nothing is appended. `None` keeps the old
+/// behaviour: the single current head.
+///
+/// The grounds the two tracks switched on (step 8), for every writer that
+/// comes through here: `gate::revise_weakening` (every widened weakening
+/// needs a because), `gate::a4_ground` (a check whose literal the text does
+/// not name, when this write attaches or changes it or unnames it),
+/// `old_stock_ground` (THOR's old-stock mark, Q24, only from its retest),
+/// `teeth_tag_ground` (a new `teeth:` label only with the record that
+/// implies it), and `without_stale_teeth_tags` (a revise that changes what a
+/// trial tried, with no record, drops every old label).
 #[allow(clippy::too_many_arguments)]
-pub fn revise_tried_scoped(
+pub fn revise_tried_scoped<'a>(
     store: &mut EventStore,
     session_id: &str,
     lineage_id: &str,
-    actor: &str,
+    actor: impl Into<WriteActor<'a>>,
     existing: &Item,
     updated: &Item,
     before: &Item,
     because: Option<&str>,
     scope: Option<&EvaluationScope>,
-    tried: Option<&TriedCheck>,
+    trial: Option<&TrialRecord>,
+    parent_rev: Option<&str>,
 ) -> Result<Event, WriteError> {
+    let actor = fence(store, actor.into(), &updated.id)?;
     let existing = normalized(existing);
     let updated = normalized(updated);
     let before = normalized(before);
     gate::revise(&existing, &updated).map_err(WriteError::Refused)?;
     gate::revise_weakening(&before, &updated, because).map_err(WriteError::Refused)?;
+    gate::a4_ground(Some(&before), &updated, None).map_err(WriteError::Refused)?;
+    old_stock_ground(Some(actor), trial).map_err(WriteError::Refused)?;
+    teeth_tag_ground(Some(&before), &updated, trial).map_err(WriteError::Refused)?;
     if let Capacity::DeadOnArrival(refusal) | Capacity::Full(refusal) =
         capacity(store, &updated).map_err(WriteError::Store)?
     {
@@ -799,29 +1067,94 @@ pub fn revise_tried_scoped(
         }
     }
     let reason = because.map(str::trim).filter(|r| !r.is_empty());
+    let written = without_stale_teeth_tags(&before, &updated, trial);
     let mut body = match reason {
-        Some(reason) => body_with_because(&updated, reason).map_err(WriteError::Serialize)?,
-        None => canonical_body(&updated).map_err(WriteError::Serialize)?,
+        Some(reason) => body_with_because(&written, reason).map_err(WriteError::Serialize)?,
+        None => canonical_body(&written).map_err(WriteError::Serialize)?,
     };
-    if let Some(tried) = tried {
-        body = body_with_tried(&body, tried).map_err(WriteError::Serialize)?;
+    if let Some(trial) = trial {
+        body = body_with_trial(&body, trial).map_err(WriteError::Serialize)?;
     }
     store
-        .append_mutate_checked(session_id, lineage_id, actor, EventKind::FactRevised, &updated.id, None, &body)
+        .append_mutate_checked(session_id, lineage_id, actor, EventKind::FactRevised, &updated.id, parent_rev, &body)
         .map_err(WriteError::Store)
 }
 
-/// `body` with one more trailing key: `"tried":{"check":{...},"outcome":"..."}`
-/// - spliced on exactly the way `body_with_because` splices `because`, so the
-/// item fields keep their order and `parse_body` ignores the extra key. The
-/// check is serialised the way an item's own check is, so the log's own
-/// needle for "a check was ever attached" (`ids_whose_check_was_tried`) finds
-/// a try too.
-fn body_with_tried(body: &str, tried: &TriedCheck) -> Result<String, serde_json::Error> {
-    let check = serde_json::to_string(&tried.check)?;
-    let outcome = serde_json::to_string(&tried.outcome)?;
-    debug_assert!(body.ends_with('}'), "canonical_body always produces a JSON object");
-    Ok(format!("{},\"tried\":{{\"check\":{check},\"outcome\":{outcome}}}}}", &body[..body.len() - 1]))
+/// THE K16 GROUND (step 8): a `teeth:` tag that is new on this write - not
+/// carried by the head it replaces - is refused unless the write carries a
+/// trial record whose verdict implies exactly that tag. Removing a tag is
+/// always allowed. The label is only a readable copy of the record, so a
+/// writer (a bin, the CLI, a hand-built call) can never set one THOR's trial
+/// did not decide: `model.exe declare --tags teeth:proven-guard` used to
+/// store a proven label nothing had ever tried.
+fn teeth_tag_ground(before: Option<&Item>, updated: &Item, trial: Option<&TrialRecord>) -> Result<(), Refusal> {
+    let implied = trial.and_then(implied_teeth_tag);
+    for tag in updated.tags.iter().filter(|t| t.starts_with(TEETH_TAG_PREFIX)) {
+        let carried = before.is_some_and(|b| b.tags.contains(tag));
+        if carried || implied == Some(tag.as_str()) {
+            continue;
+        }
+        return Err(Refusal {
+            problem: format!("'{tag}' starts with '{TEETH_TAG_PREFIX}', which only THOR's own trial writes"),
+            fix: "drop it from the tags - write the rule through remember or revise, and THOR tries it and adds the \
+                  one label its verdict implies"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// THE Q24 FENCE: a trial record carrying THOR's old-stock mark
+/// (`TrialFields::a4_old_stock`) is written only by THOR's own retest, on an
+/// item that already exists - never by a declare, and never by any other
+/// writer, a write tool's own trial included. `actor` is the name `fence`
+/// let through (`None` for a declare); a reserved name only ever gets that
+/// far as a `SystemActor`, so `retest` here is THOR's retest itself.
+fn old_stock_ground(actor: Option<&str>, trial: Option<&TrialRecord>) -> Result<(), Refusal> {
+    let Some(mark) = trial.and_then(|t| t.fields().a4_old_stock.as_ref()) else { return Ok(()) };
+    if actor == Some(RETEST_ACTOR) {
+        return Ok(());
+    }
+    Err(Refusal {
+        problem: format!(
+            "this write carries THOR's mark that an old contains check ('{}' in {}) counts as a tooth although the \
+             text does not name it - only THOR's retest writes that mark, on a rule that already exists",
+            gate::shown_literal(&mark.literal),
+            mark.path
+        ),
+        fix: "write the rule without it: name the literal in the text, and THOR's trial of the write decides the rest"
+            .to_string(),
+    })
+}
+
+/// The one `teeth:` label a trial record implies: proven with evidence,
+/// wired, or note - none while an A4 failure keeps the verdict undecided,
+/// unless THOR's retest counted it as old contains stock (Q24).
+fn implied_teeth_tag(record: &TrialRecord) -> Option<&'static str> {
+    let fields = record.fields();
+    if !fields.a4.is_empty() && fields.a4_old_stock.is_none() {
+        return None;
+    }
+    Some(match fields.verdict {
+        RecordedVerdict::RuleProven if !fields.evidence.is_empty() => TEETH_PROVEN_TAG,
+        RecordedVerdict::RuleProven | RecordedVerdict::RuleWired => TEETH_WIRED_TAG,
+        RecordedVerdict::Note => TEETH_NOTE_TAG,
+    })
+}
+
+/// STRIP-ON-CHANGE (step 8): `updated` as it is written. A revise that changes
+/// what a trial tries (its `fingerprint`: kind, text, anchors, check, project
+/// or severity) and carries no trial record drops every `teeth:` tag, so a bin
+/// that copies tags forward can never carry a stale label onto an item nobody
+/// tried again. The item is then undecided until it is tried, which doctor
+/// shows.
+fn without_stale_teeth_tags(before: &Item, updated: &Item, trial: Option<&TrialRecord>) -> Item {
+    if trial.is_some() || fingerprint(before) == fingerprint(updated) {
+        return updated.clone();
+    }
+    let mut written = updated.clone();
+    written.tags.retain(|t| !t.starts_with(TEETH_TAG_PREFIX));
+    written
 }
 
 /// `canonical_body`, with one extra trailing key appended: `"because":
@@ -841,6 +1174,22 @@ fn body_with_because(item: &Item, because: &str) -> Result<String, serde_json::E
     Ok(format!("{},\"because\":{reason}}}", &body[..body.len() - 1]))
 }
 
+/// `body` with two more trailing keys, `"root":"<path>","root_at":"<time>"` -
+/// the working copy the installer registered, and when. Spliced on exactly
+/// the way `body_with_because` splices `because`. Only `declare_project_record`
+/// and `revise_project_root` ever call this; `root_registrations` is the one
+/// place that reads it back.
+///
+/// `root_at` exists because an event carries no wall-clock time of its own
+/// (see `Revision`): without it neither doctor nor the session start could
+/// say since when a working copy is registered.
+fn body_with_root(body: &str, root: &str, at: &str) -> Result<String, serde_json::Error> {
+    let root = serde_json::to_string(root)?;
+    let at = serde_json::to_string(at)?;
+    debug_assert!(body.ends_with('}'), "canonical_body always produces a JSON object");
+    Ok(format!("{},\"root\":{root},\"root_at\":{at}}}", &body[..body.len() - 1]))
+}
+
 /// The `because` a `fact_revised` event body carries, if any - present only
 /// on one written by `revise_because` for a revision `gate::revise_weakening`
 /// judged a weakening; `None` for every other event, an ordinary `revise`
@@ -848,6 +1197,741 @@ fn body_with_because(item: &Item, because: &str) -> Result<String, serde_json::E
 /// cannot parse simply carries none.
 fn because_reason(body: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(body).ok()?.get("because")?.as_str().map(str::to_string)
+}
+
+// ------------------------------------------------ the verdict in the log (A1, A6)
+//
+// A rule's verdict - on the rule track (proven or wired) or on the note
+// track - lives in ONE place: a trial record spliced into the fact event it
+// was written with, as the trailing key `"teeth_trial"` (after `because`, by
+// the same byte splice). It counts only while its fingerprint equals the
+// current head's: change the kind, the text, an anchor, the check, the
+// project or the severity and it stops counting, and `current_verdict` says
+// which one changed. Tags never decide it.
+//
+// SEALED, because a record is data that is built in another crate and read
+// back from the log, so no type can hold it alone (X6):
+// - `TrialRecord` has a private field and no `Deserialize`. From the log a
+//   record comes only through `trial_of`; a new one only through
+//   `TrialRecord::seal`; and its fields are read-only (`fields`), so a record
+//   read back can never be edited into another one.
+// - Two grep tests below (`trial_record_is_built_only_in_teeth_rs`,
+//   `trial_record_is_deserialized_only_in_trial_of`) fail when `seal` is
+//   called, a record is built, or the key is read anywhere else.
+//
+// Nothing writes a record yet: every caller of the write functions passes
+// `None`, so no write changes behaviour until the trial is switched on.
+
+/// The version of `TrialFields` this build writes and `trial_of` reads. A
+/// record of any other version reads as unreadable, never as this one.
+pub const TRIAL_RECORD_VERSION: u32 = 1;
+
+/// The verdict a trial recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordedVerdict {
+    /// On the rule track, and reality agrees: see `TrialFields::evidence`.
+    /// Without evidence it reads as `RuleWired` (`current_verdict`).
+    RuleProven,
+    /// On the rule track: the forbidden form was refused and every clean
+    /// form let through, and nothing real has met the check yet.
+    RuleWired,
+    /// On the note track: no tooth held. A note carries no check.
+    Note,
+}
+
+/// What the hook's own pipeline did with one form a trial tried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptOutcome {
+    Refused,
+    LetThrough,
+}
+
+/// One form a trial tried.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrialAttempt {
+    /// What was tried, in words a reader can repeat ("git push --force x",
+    /// "an Edit of NOTES.md removing every 'keep me'").
+    pub form: String,
+    /// The tool the synthetic call was made as ("Bash", "Edit", "Write").
+    pub via: String,
+    pub outcome: AttemptOutcome,
+}
+
+/// A real call that stopped a derived tooth from forcing (K8(c)).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoppedForcing {
+    pub call: String,
+    pub session: String,
+    pub seq: i64,
+}
+
+/// What the trial read from the real calls in the log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrialCorpus {
+    /// Real calls the check's anchor reaches.
+    pub reached: usize,
+    /// Of those, the ones that carry the literal as a whole token.
+    pub whole_hits: usize,
+    /// Reached calls cut at 120 characters, which prove nothing absent.
+    pub cut: usize,
+    pub stopped_forcing: Vec<StoppedForcing>,
+}
+
+/// The writer's disputes (K22), kept for the owner to read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrialDisputes {
+    pub legitimate_calls: Vec<String>,
+    pub may_change: Vec<String>,
+}
+
+/// An earlier check on the rule's own log, and whether a revise that carried
+/// a because removed it (D7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrialHistory {
+    pub seq: i64,
+    pub check: Check,
+    /// The because of the revise that removed or replaced it; `None` when no
+    /// revise with a because did.
+    pub removed_with_because: Option<String>,
+}
+
+/// Why a note keeps a check it could not try or could not hang yet (K20).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingWhy {
+    /// The project has no registered working copy on this machine.
+    NoWorkingCopy,
+    /// The check holds in the session's own checkout, not in the registered one.
+    NotTrueInRegisteredCheckout,
+}
+
+/// A check a note keeps in its record only - never live, never on the item.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingCheck {
+    pub check: Check,
+    pub why: PendingWhy,
+}
+
+/// What made a rule proven rather than wired.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrialEvidence {
+    /// A refusal by the real hook in a real session, at this log seq.
+    FieldRefusal { seq: i64 },
+    /// A contains literal present in the file at this commit of the
+    /// registered checkout.
+    InHead { commit: String },
+    /// A literal that really lived in the checked file, at this commit.
+    LivedInHistory { commit: String },
+}
+
+/// Everything a trial records, in the order it is written. Only ever held
+/// inside a `TrialRecord` once it is written; building one of these alone
+/// proves nothing and writes nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrialFields {
+    /// Always `TRIAL_RECORD_VERSION` for a record this build writes.
+    pub v: u32,
+    /// `fingerprint` of the item exactly as it was tried.
+    pub fingerprint: String,
+    /// The registered checkout the trial ran against, when it needed one.
+    pub root: Option<String>,
+    pub project: Option<String>,
+    /// The commit at the top of `root` when the trial ran.
+    pub head_commit: Option<String>,
+    /// `gate::teeth_candidates` of the item as it was tried.
+    pub candidates: Vec<gate::Candidate>,
+    pub attempts: Vec<TrialAttempt>,
+    pub corpus: TrialCorpus,
+    /// The clean forms the writer's own check refused.
+    pub clean_failed: Vec<String>,
+    pub disputes: TrialDisputes,
+    /// Real calls the writer accepted being refused (K8(d)).
+    pub accept_refusing: Vec<String>,
+    pub history: Vec<TrialHistory>,
+    pub pending: Option<PendingCheck>,
+    /// `gate::unnamed_literals` of the item as it was tried: empty when its
+    /// check's every literal is named in its text. Anything here keeps the
+    /// verdict undecided (K23).
+    pub a4: Vec<String>,
+    pub verdict: RecordedVerdict,
+    pub evidence: Vec<TrialEvidence>,
+    /// A contains literal found in the working tree but not in HEAD.
+    pub uncommitted: bool,
+    /// The head the trial read the item from (the compare-and-swap of X4).
+    pub parent_rev: Option<String>,
+    /// For a file check: the git blob hash of the checked file in `root` as it
+    /// was tried (`git hash-object`), so a later pass can tell the file
+    /// changed. Absent from a record written before this field existed.
+    #[serde(default)]
+    pub file_blob: Option<String>,
+    /// THOR's own mark (Q24) that this rule's OLD contains check counts as a
+    /// tooth although `a4` names its literal as unnamed: the guarded fragment,
+    /// shown to every reader so they can judge whether it guards the rule's
+    /// subject. Only THOR's retest writes it (`old_stock_ground`), and
+    /// `current_verdict` re-reads the log before it counts. Left out of the
+    /// JSON when absent, so every record without it reads and writes exactly
+    /// as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub a4_old_stock: Option<OldContainsStock>,
+}
+
+/// THE Q24 EXEMPTION, in one value: an OLD contains check - one that stood on
+/// the rule, with its text and anchors, at the A4 cutoff (`a4_cutoff`) and
+/// that nothing changed since - whose text does not name its literal. THOR's
+/// retest counts it as a tooth when it bites in the working copy registered
+/// for the rule's project (the file proves the literal is real), and writes
+/// this into the record so the fragment it guards is visible to every reader.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OldContainsStock {
+    /// The guarded fragment: the literal the check keeps in its file.
+    pub literal: String,
+    /// The file (or directory) the check reads, relative to the checkout.
+    pub path: String,
+    /// The log seq of the fact event that gave the check this value.
+    pub set_at: i64,
+    /// The A4 cutoff it was judged against.
+    pub cutoff: i64,
+}
+
+impl OldContainsStock {
+    /// The fragment in words, for a receipt, `history` and doctor: "it guards
+    /// 'keep me' in NOTES.md (its check was set at log seq 12, before the A4
+    /// cutoff at log seq 40)".
+    pub fn describe(&self) -> String {
+        format!(
+            "it guards '{}' in {} (its check was set at log seq {}, before the A4 cutoff at log seq {})",
+            gate::shown_literal(&self.literal),
+            self.path,
+            self.set_at,
+            self.cutoff
+        )
+    }
+}
+
+/// A trial record: `TrialFields`, sealed. See this section's banner for why
+/// it has a private field and no `Deserialize`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct TrialRecord {
+    fields: TrialFields,
+}
+
+impl TrialRecord {
+    /// Seal a new record. Called only by THOR's own trial
+    /// (`serve/src/teeth.rs`); a grep test fails on any other caller.
+    pub fn seal(fields: TrialFields) -> Self {
+        Self { fields }
+    }
+
+    /// The record's fields, read-only.
+    pub fn fields(&self) -> &TrialFields {
+        &self.fields
+    }
+
+    /// A record read back from the log - `trial_of` only.
+    fn from_log(fields: TrialFields) -> Self {
+        Self { fields }
+    }
+}
+
+/// Keeps the fingerprint of one thing from ever equalling the hash of
+/// another thing `hash_event` is used for.
+const FINGERPRINT_DOMAIN: &str = "thor-teeth-fingerprint-v1";
+
+/// The fingerprint a trial record is matched on: the existing
+/// `thor_core::event_store::hash_event` over the canonical JSON of exactly
+/// the item's kind, text, bindings, check, project (normalised, the way every
+/// write stores it) and severity. Tags, falsifier, expires and key are not
+/// part of it: changing them changes nothing a trial tried.
+pub fn fingerprint(item: &Item) -> String {
+    #[derive(Serialize)]
+    struct Tried<'a> {
+        kind: Kind,
+        text: &'a str,
+        bindings: &'a [Binding],
+        check: Option<&'a Check>,
+        project: Option<String>,
+        severity: Option<Severity>,
+    }
+    let tried = Tried {
+        kind: item.kind,
+        text: &item.text,
+        bindings: &item.bindings,
+        check: item.check.as_ref(),
+        project: crate::normalize::normalize_project(item.project.as_deref()),
+        severity: item.severity,
+    };
+    let json = serde_json::to_string(&tried).expect("an item's own fields always serialize");
+    thor_core::event_store::hash_event(FINGERPRINT_DOMAIN, &json)
+}
+
+/// `body` with one more trailing key, `"teeth_trial":{...}`, spliced on
+/// exactly the way `body_with_because` splices `because`, so the item's
+/// fields keep their order and `parse_body` reads the body unchanged. The one
+/// writer of the key; `trial_of` is its one reader.
+fn body_with_trial(body: &str, trial: &TrialRecord) -> Result<String, serde_json::Error> {
+    let record = serde_json::to_string(trial)?;
+    debug_assert!(body.ends_with('}'), "canonical_body always produces a JSON object");
+    Ok(format!("{},\"teeth_trial\":{record}}}", &body[..body.len() - 1]))
+}
+
+/// The trial record `event` carries: `Ok(None)` when it carries none (or its
+/// body is not JSON at all), `Err` with the reason when it carries one this
+/// build cannot read - a record of another version, or one that does not
+/// parse - so a reader never mistakes an unreadable record for no record.
+/// The ONE place a record is read back from the log.
+pub fn trial_of(event: &Event) -> Result<Option<TrialRecord>, String> {
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(&event.body) else { return Ok(None) };
+    let Some(raw) = body.get("teeth_trial") else { return Ok(None) };
+    let version = raw.get("v").and_then(serde_json::Value::as_u64);
+    if version != Some(u64::from(TRIAL_RECORD_VERSION)) {
+        let found = version.map_or_else(|| "without a version".to_string(), |v| format!("version {v}"));
+        return Err(format!(
+            "its trial record at log seq {} is {found}, and this THOR reads version {TRIAL_RECORD_VERSION} only",
+            event.seq
+        ));
+    }
+    let fields = TrialFields::deserialize(raw)
+        .map_err(|e| format!("its trial record at log seq {} does not read ({e})", event.seq))?;
+    Ok(Some(TrialRecord::from_log(fields)))
+}
+
+/// Where a rule stands right now, read from the log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CurrentVerdict {
+    RuleProven,
+    RuleWired,
+    Note,
+    /// No verdict counts: `why` says what is missing, in words a reader can
+    /// act on.
+    Undecided { why: String },
+}
+
+/// `a`, `a and b`, `a, b and c`.
+fn and_list(words: &[&str]) -> String {
+    match words {
+        [] => String::new(),
+        [one] => (*one).to_string(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// Why the head no longer matches its last trial: the fields that differ
+/// between the item that trial was written with (`carrier`) and the head.
+fn changed_since_trial(carrier: &Event, head: &Item) -> String {
+    let Ok(tried) = parse_body(&carrier.body) else {
+        return "its last trial record rides on an event that no longer reads as an item".to_string();
+    };
+    let mut changed = Vec::new();
+    if tried.kind != head.kind {
+        changed.push("kind");
+    }
+    if tried.text != head.text {
+        changed.push("text");
+    }
+    if tried.bindings != head.bindings {
+        changed.push("anchors");
+    }
+    if tried.check != head.check {
+        changed.push("check");
+    }
+    let project = |item: &Item| crate::normalize::normalize_project(item.project.as_deref());
+    if project(&tried) != project(head) {
+        changed.push("project");
+    }
+    if tried.severity != head.severity {
+        changed.push("severity");
+    }
+    if changed.is_empty() {
+        return "its last trial record was made for a different version of it".to_string();
+    }
+    format!("its {} changed after its last trial", and_list(&changed))
+}
+
+/// The verdict of rule `id` right now: the LAST trial record on the item's
+/// own line (its head, then each parent in turn), and only when that
+/// record's fingerprint equals the head's. A tags-, falsifier-, expires- or
+/// key-only revise keeps it; any other change makes the item Undecided until
+/// it is tried again. Tags are never read, so a reason tag or an old
+/// `teeth:` label changes nothing here.
+///
+/// Also Undecided, each with its reason: no item, a diverged or retracted
+/// one, a kind that is never tried, a record this build cannot read, a
+/// record whose `a4` names an unnamed literal (K23) - unless it carries
+/// THOR's old-stock mark and the log still bears it out (`old_stock_stands`,
+/// Q24) - and a record that contradicts the item it matches (a rule verdict
+/// on an item with no check, a note that still carries one). A proven verdict
+/// with no evidence reads as wired.
+pub fn current_verdict(store: &EventStore, id: &str) -> CurrentVerdict {
+    verdict_and_record(store, id).verdict
+}
+
+/// What one read of an item's log answers: `current_verdict`, the trial
+/// record it counted (`Some` only for a verdict that is not Undecided), and
+/// the head as it stands - read once, so `settlement` never reads the log of
+/// an item twice.
+struct VerdictRead {
+    verdict: CurrentVerdict,
+    record: Option<TrialRecord>,
+    /// The head item, when there is exactly one head and it reads as an item.
+    head: Option<Item>,
+    /// The one head is a tombstone.
+    retracted: bool,
+}
+
+fn verdict_and_record(store: &EventStore, id: &str) -> VerdictRead {
+    let undecided = |why: String| VerdictRead { verdict: CurrentVerdict::Undecided { why }, record: None, head: None, retracted: false };
+    let events = match store.get_events_by_entity(id) {
+        Ok(events) => events,
+        Err(e) => return undecided(format!("its log could not be read ({e})")),
+    };
+    let heads = compute_head_sets(&events);
+    let Some(head_set) = heads.get(id) else { return undecided(format!("there is no item '{id}'")) };
+    if head_set.heads.len() != 1 {
+        return undecided(format!("its log has {} heads - resolve it first", head_set.heads.len()));
+    }
+    let by_hash: HashMap<&str, &Event> = events.iter().map(|e| (e.this_hash.as_str(), e)).collect();
+    let head_hash = head_set.heads.iter().next().expect("checked len == 1 above");
+    let Some(head) = by_hash.get(head_hash.as_str()).copied() else {
+        return undecided(format!("there is no item '{id}'"));
+    };
+    if head.kind == EventKind::FactRetracted {
+        return VerdictRead { retracted: true, ..undecided("it was retracted".to_string()) };
+    }
+    let Ok(item) = parse_body(&head.body) else {
+        return undecided("its current body does not read as an item".to_string());
+    };
+    // From here on the head reads as an item: every answer carries it.
+    let undecided = |why: String, item: Item| VerdictRead {
+        verdict: CurrentVerdict::Undecided { why },
+        record: None,
+        head: Some(item),
+        retracted: false,
+    };
+    if !item.kind.can_fire() {
+        let kind = serde_json::to_value(item.kind).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
+        return undecided(format!("a {kind} is never tried - only a rule or an orientation carries a verdict"), item);
+    }
+    // The last trial on the item's own line. Bounded by the number of events,
+    // so a malformed chain can never loop.
+    let mut at = Some(head);
+    let mut found = None;
+    for _ in 0..events.len() {
+        let Some(event) = at else { break };
+        match trial_of(event) {
+            Err(why) => return undecided(why, item),
+            Ok(Some(record)) => {
+                found = Some((record, event));
+                break;
+            }
+            Ok(None) => at = event.parent_rev.as_deref().and_then(|p| by_hash.get(p).copied()),
+        }
+    }
+    let Some((record, carrier)) = found else {
+        return undecided("it has never been tried - there is no trial record on its log".to_string(), item);
+    };
+    let fields = record.fields();
+    if fields.fingerprint != fingerprint(&item) {
+        let why = changed_since_trial(carrier, &item);
+        return undecided(why, item);
+    }
+    if !fields.a4.is_empty() && !old_stock_stands(store, &events, carrier, &item, fields) {
+        let list = fields.a4.iter().map(|l| format!("'{}'", gate::shown_literal(l))).collect::<Vec<_>>().join(", ");
+        let (verb, pronoun) = if fields.a4.len() == 1 { ("is", "it") } else { ("are", "them") };
+        return undecided(
+            format!(
+                "A4: {list} {verb} not named in the text - revise the text to name {pronoun}, or clear the check with \
+                 a because"
+            ),
+            item,
+        );
+    }
+    let verdict = match (fields.verdict, item.check.is_some()) {
+        (RecordedVerdict::Note, true) => {
+            return undecided("its last trial made it a note, yet it carries a check - a note carries none".to_string(), item)
+        }
+        (RecordedVerdict::RuleProven | RecordedVerdict::RuleWired, false) => {
+            return undecided("its last trial put it on the rule track, yet it carries no check".to_string(), item)
+        }
+        (RecordedVerdict::RuleProven, true) if fields.evidence.is_empty() => CurrentVerdict::RuleWired,
+        (RecordedVerdict::RuleProven, true) => CurrentVerdict::RuleProven,
+        (RecordedVerdict::RuleWired, true) => CurrentVerdict::RuleWired,
+        (RecordedVerdict::Note, false) => CurrentVerdict::Note,
+    };
+    VerdictRead { verdict, record: Some(record), head: Some(item), retracted: false }
+}
+
+/// The trial record `current_verdict` counts for `id` right now, `None` while
+/// it is Undecided - for a reader that lists what the verdict rests on
+/// (disputes, accepted refusals, a pending check).
+pub fn current_record(store: &EventStore, id: &str) -> Option<TrialRecord> {
+    verdict_and_record(store, id).record
+}
+
+// ------------------------------------------------ old contains stock (Q24)
+//
+// THE OWNER'S DECISION (Q24). A4 keeps an agent from tying a meaningless
+// literal to a rule: a check's literal has to be named in the rule's own
+// text. Exempting `contains` from A4 outright would open a new exit - any
+// line of any file hung on any rule as a "tooth". So:
+// - A4 stays in force for every new write and every revise that sets or
+//   changes a check, of every kind (`gate::a4_ground`, untouched here).
+// - The OLD stock gets a one-time exemption: a contains check that stood on
+//   the rule, with its text and anchors, at a FIXED cutoff, and that THOR's
+//   retest finds biting both ways in the working copy registered for the
+//   rule's project, counts as a tooth although its text does not name it.
+// - The cutoff is recorded ONCE, by THOR's retest, as its own record on the
+//   reserved id `A4_CUTOFF_ID` in the log the migration keeps its state in
+//   (the trial records); the first record is the only one ever read, so no
+//   later write can move it (`a4_cutoff`).
+// - The record carries the guarded fragment (`OldContainsStock`) - which
+//   literal, in which file - in a form only THOR's retest writes
+//   (`old_stock_ground`), so every reader can judge whether it guards the
+//   rule's subject.
+// - Any revise of the rule's check, text or anchors after the cutoff ends it
+//   for good: `old_contains_stock` reads the whole log, so even a revise that
+//   puts them back does not bring it back, and A4 applies from then on.
+// - No other check kind is ever exempt.
+
+/// The reserved id THOR's record of the A4 cutoff lives on (Q24). Only
+/// `retest` writes it (`reserved_id_owner`).
+pub const A4_CUTOFF_ID: &str = "teeth-a4-cutoff";
+
+/// The actor of THOR's own retest (`serve retest --apply`), which alone
+/// records the cutoff and writes the old-stock mark.
+const RETEST_ACTOR: &str = "retest";
+
+/// The A4 cutoff recorded on this store: the log seq at or before which a
+/// contains check counts as old stock. `None` until THOR's retest records it.
+///
+/// Only the FIRST record by `retest` on `A4_CUTOFF_ID` is ever read - a later
+/// one, however it got there, changes nothing - and a record can never claim
+/// a point after its own place in the log.
+pub fn a4_cutoff(store: &EventStore) -> Option<i64> {
+    let events = store.get_events_by_entity(A4_CUTOFF_ID).ok()?;
+    a4_cutoff_in(&events)
+}
+
+/// `a4_cutoff`, over the events of `A4_CUTOFF_ID` already in hand.
+fn a4_cutoff_in(events: &[Event]) -> Option<i64> {
+    let first = events
+        .iter()
+        .filter(|e| e.kind == EventKind::GateStoodAside && e.actor == RETEST_ACTOR)
+        .min_by_key(|e| e.seq)?;
+    let body = serde_json::from_str::<serde_json::Value>(&first.body).ok()?;
+    let cutoff = body.get("cutoff_seq")?.as_i64()?;
+    Some(cutoff.min(first.seq - 1))
+}
+
+/// The cutoff a retest judges old stock by when none is recorded yet: the
+/// last event of the log right now - what `record_a4_cutoff` records when
+/// the first old-stock verdict is written.
+pub fn prospective_a4_cutoff(store: &EventStore) -> i64 {
+    store.get_next_seq().map(|next| next - 1).unwrap_or(0)
+}
+
+/// Record the A4 cutoff, once: `cutoff` is the point the retest judged by
+/// (`prospective_a4_cutoff` when it read the store). Returns the cutoff that
+/// stands - the one already recorded when there is one, which is never
+/// replaced. Only THOR's retest records it; a cutoff after the last event of
+/// the log is refused.
+pub fn record_a4_cutoff(store: &mut EventStore, actor: SystemActor, cutoff: i64) -> Result<i64, WriteError> {
+    if actor.name() != RETEST_ACTOR {
+        return Err(WriteError::Refused(Refusal {
+            problem: format!("the A4 cutoff is recorded by THOR's retest only, not by '{}'", actor.name()),
+            fix: "let `serve retest --apply` record it when it first counts an old contains check".to_string(),
+        }));
+    }
+    if let Some(recorded) = a4_cutoff(store) {
+        return Ok(recorded);
+    }
+    let last = store.get_next_seq().map_err(|e| WriteError::Store(e.into()))? - 1;
+    if !(0..=last).contains(&cutoff) {
+        return Err(WriteError::Refused(Refusal {
+            problem: format!("an A4 cutoff at log seq {cutoff} lies outside the log (its last event is seq {last})"),
+            fix: "run `serve retest --apply` again: it reads the log afresh".to_string(),
+        }));
+    }
+    let name = fence(store, actor.into(), A4_CUTOFF_ID)?;
+    let body = serde_json::json!({
+        "cutoff_seq": cutoff,
+        "why": "a contains check that stood on its rule, with its text and anchors, at this log seq and that nothing \
+                changed since is old stock: THOR's retest counts it as a tooth when it bites, although its text does \
+                not name its literal (Q24)",
+    })
+    .to_string();
+    store
+        .append_event(RETEST_ACTOR, RETEST_ACTOR, name, EventKind::GateStoodAside, A4_CUTOFF_ID, None, &body)
+        .map_err(|e| WriteError::Store(e.into()))?;
+    Ok(cutoff)
+}
+
+/// Whether a fact event moves an item's head: the only events whose body
+/// can change its check, text or anchors.
+fn moves_the_head(kind: EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::FactCreated
+            | EventKind::FactRevised
+            | EventKind::FactSuperseded
+            | EventKind::FactRetracted
+            | EventKind::FactResolved
+    )
+}
+
+/// Whether an item's own log (`events`, every event on its id) makes its
+/// check OLD CONTAINS STOCK under `cutoff`: the last fact event at or before
+/// the cutoff holds a contains check, and every fact event after it holds
+/// exactly the same check, text and anchors - a retraction, or any change to
+/// one of the three, ends it for good, even when a later revise puts them
+/// back. The answer carries the guarded fragment and the seq the check got
+/// this value; `None` for anything else, every other check kind included.
+pub fn old_contains_stock(events: &[Event], cutoff: i64) -> Option<OldContainsStock> {
+    let mut facts: Vec<&Event> = events.iter().filter(|e| moves_the_head(e.kind)).collect();
+    facts.sort_by_key(|e| e.seq);
+    let shape = |e: &Event| -> Option<(Option<Check>, String, Vec<Binding>)> {
+        if e.kind == EventKind::FactRetracted {
+            return None;
+        }
+        parse_body(&e.body).ok().map(|i| (i.check, i.text, i.bindings))
+    };
+    let (before, after): (Vec<&Event>, Vec<&Event>) = facts.into_iter().partition(|e| e.seq <= cutoff);
+    let last = *before.last()?;
+    let at_cutoff = shape(last)?;
+    let Some(Check::Contains { path, literal }) = at_cutoff.0.clone() else { return None };
+    if after.iter().any(|e| shape(*e).as_ref() != Some(&at_cutoff)) {
+        return None;
+    }
+    let mut set_at = last.seq;
+    for e in before.iter().rev() {
+        match shape(*e) {
+            Some((check, ..)) if check == at_cutoff.0 => set_at = e.seq,
+            _ => break,
+        }
+    }
+    Some(OldContainsStock { literal, path, set_at, cutoff })
+}
+
+/// Whether a record's old-stock mark still counts for `item` (Q24): THOR's
+/// retest wrote the record, the mark names exactly the item's contains check
+/// and the one literal A4 finds unnamed, and the log still bears it out under
+/// the RECORDED cutoff - so a revise of the check, text or anchors after the
+/// cutoff ends it, even a bin's revise that carries no record at all.
+fn old_stock_stands(store: &EventStore, events: &[Event], carrier: &Event, item: &Item, fields: &TrialFields) -> bool {
+    let Some(mark) = &fields.a4_old_stock else { return false };
+    if carrier.actor != RETEST_ACTOR {
+        return false;
+    }
+    let Some(Check::Contains { path, literal }) = &item.check else { return false };
+    if *path != mark.path || *literal != mark.literal || fields.a4.as_slice() != std::slice::from_ref(literal) {
+        return false;
+    }
+    let Some(cutoff) = a4_cutoff(store) else { return false };
+    old_contains_stock(events, cutoff).is_some_and(|now| now.path == mark.path && now.literal == mark.literal)
+}
+
+// ------------------------------------------------ settlement (step 9, F9, D8)
+//
+// THE ONE READER. The evaluation-filing gate, the Stop hook's teeth question
+// and doctor all ask `settlement` whether a rule is settled - never a tag,
+// never a reason, never a refusal on record, never a probe event. A rule is
+// settled by its current verdict (a trial record whose fingerprint equals the
+// head's), by being retracted or taken off the rule track, or - only while it
+// holds - by a machine blocker, judged at READ time
+// (`checkout::read_time_blocker`) the same way the retest judges it, so no
+// reader ever demands a retest whose answer is "blocked" (F9). Severity plays
+// no part: lowering it changes the fingerprint, so the rule is owed again
+// (D8).
+
+/// Why a maintenance verdict cannot be reached right now, on the machine's
+/// side (K10) - nothing the agent can run settles it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Blocker {
+    /// The rule's project has no usable registered working copy on this
+    /// machine, and its check reads a file.
+    NoWorkingCopy { project: String },
+    /// A `contains` literal is missing from the registered working tree while
+    /// the default branch's HEAD still has it.
+    WorkingTreeDiffers { path: String },
+}
+
+impl std::fmt::Display for Blocker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Blocker::NoWorkingCopy { project } => write!(f, "{project} - no registered working copy"),
+            Blocker::WorkingTreeDiffers { path } => {
+                write!(f, "{path} - the registered working tree lacks the literal the default branch still has")
+            }
+        }
+    }
+}
+
+/// How a rule is settled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Settled {
+    /// On the rule track, by its current verdict.
+    Rule { proven: bool },
+    /// On the note track, by its current verdict - a note keeping a pending
+    /// check (K20) and a note by dispute (K22) included.
+    Note { pending: Option<PendingWhy>, by_dispute: bool },
+    /// Held by a machine blocker, only while it holds.
+    Blocked(Blocker),
+    /// Retracted: no longer live.
+    Retracted,
+    /// Its kind can no longer fire (archived, or moved to a Report).
+    OffTheRuleTrack,
+}
+
+/// Whether a rule is settled, and if not, why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Settlement {
+    Settled(Settled),
+    /// Owed: `why` is what `current_verdict` says is missing.
+    Owed { why: String },
+}
+
+impl Settlement {
+    pub fn is_owed(&self) -> bool {
+        matches!(self, Settlement::Owed { .. })
+    }
+}
+
+/// Whether rule `id` is settled right now - the one reader (see this
+/// section's banner).
+pub fn settlement(store: &EventStore, id: &str) -> Settlement {
+    let read = verdict_and_record(store, id);
+    if read.retracted {
+        return Settlement::Settled(Settled::Retracted);
+    }
+    let Some(item) = read.head else {
+        let why = match read.verdict {
+            CurrentVerdict::Undecided { why } => why,
+            _ => format!("'{id}' does not read as an item"),
+        };
+        return Settlement::Owed { why };
+    };
+    if !item.kind.can_fire() {
+        return Settlement::Settled(Settled::OffTheRuleTrack);
+    }
+    match (read.verdict, read.record) {
+        (CurrentVerdict::RuleProven, _) => Settlement::Settled(Settled::Rule { proven: true }),
+        (CurrentVerdict::RuleWired, _) => Settlement::Settled(Settled::Rule { proven: false }),
+        (CurrentVerdict::Note, record) => {
+            let fields = record.as_ref().map(TrialRecord::fields);
+            Settlement::Settled(Settled::Note {
+                pending: fields.and_then(|f| f.pending.as_ref().map(|p| p.why)),
+                by_dispute: fields
+                    .is_some_and(|f| !f.disputes.legitimate_calls.is_empty() || !f.disputes.may_change.is_empty()),
+            })
+        }
+        (CurrentVerdict::Undecided { why }, _) => match crate::checkout::read_time_blocker(store, &item) {
+            Some(blocker) => Settlement::Settled(Settled::Blocked(blocker)),
+            None => Settlement::Owed { why },
+        },
+    }
 }
 
 /// What the capacity check concluded about a new item's chances of ever
@@ -1527,12 +2611,41 @@ pub const TEETH_ANCHOR_COLLAPSED_TAG: &str = "teeth:anchor-collapsed";
 /// straight through (a check that looks like a lock and is not one, never
 /// even reaching the clean side - see `serve::prove::teeth_box`'s own doc
 /// comment on why the clean side is only tried once the forbidden one
-/// fires), or there was nothing to try at all (a heavy fact with no
-/// refusing check, or one whose check can only be proven against a real
-/// working copy). All land here, in the one box the daily health review has
-/// to meet again - the receipt at write time is where they are told apart,
-/// in prose, with the concrete correction a reader needs.
+/// fires), or there is genuinely nothing that could ever refuse anything
+/// here (no check at all, or `path_exists`, which blocks nothing on its own
+/// - see `serve::absent_guard::location_anchor`'s own doc comment for what
+/// actually turns IT into a block). NEVER used any more for a check that
+/// simply could not be TRIED here - see `TEETH_NOT_TRIED_TAG` for that,
+/// added 2026-09-27 for exactly the shape this tag used to swallow.
 pub const TEETH_INFORMING_TAG: &str = "teeth:informing";
+
+/// THE LABEL THIS CLOSES (2026-09-27). `TEETH_INFORMING_TAG` used to also
+/// cover a check that reads a file - `contains`, or an anchored
+/// `absent`/`absent_all` with no working-copy root to try it against - and
+/// the write receipt read "informing only - nothing to try: this check
+/// reads a file, so it can only be proven against a real working copy" for
+/// it, with the Stop hook then demanding "its check cannot refuse anything
+/// as it stands". Measured: four rules labelled exactly that way all refused
+/// a real edit that removed their literal, and let one through that left it,
+/// once actually tried through the real hook in a real working copy. The
+/// label and the demand were both false, and both sent a session to repair a
+/// guard that already worked.
+///
+/// So a check this module's own write-time proof genuinely could not TRY -
+/// `contains`, `path_exists` is excluded (see `TEETH_INFORMING_TAG`, it
+/// truly refuses nothing), or an `absent`/`absent_all`/`forbidden`/
+/// `requires` check the proof could not reach here (no root resolved, a
+/// missing anchor) - gets this tag instead: NOT TRIED, never `TEETH_
+/// INFORMING_TAG`. The distinction `mcp::teeth_test` makes it on: a refusing
+/// kind (`gate::is_refusing_check`) or `contains`, whose synthesised attempt
+/// never ran at all (`serve::prove::TeethBox::Informing`'s own `tried: None`)
+/// - a check that WAS tried and came back silent (`tried: Some(_)`) is a
+/// real, working test that found nothing, and stays `TEETH_INFORMING_TAG`.
+///
+/// RESERVED FROM A WRITER exactly like every other `TEETH_TAG_PREFIX` tag -
+/// see that constant's own doc comment; nothing new is needed to protect it,
+/// the existing prefix check already covers it.
+pub const TEETH_NOT_TRIED_TAG: &str = "teeth:not-tried";
 
 /// WIRED, NOT PROVEN (2026-09-26): both synthesised attempts held - the
 /// forbidden one refused, the clean one let through - but the log holds no
@@ -1542,6 +2655,15 @@ pub const TEETH_INFORMING_TAG: &str = "teeth:informing";
 /// exactly as wired as a real one. Only `TEETH_PROVEN_TAG` means a real tooth
 /// (see `serve::prove`'s "against reality" section for what counts).
 pub const TEETH_WIRED_TAG: &str = "teeth:wired-not-proven";
+
+/// THE NOTE TRACK: the rule's trial found no tooth that holds, so it stands
+/// as a note - it still surfaces at its moment and in search, keeps its
+/// severity, and claims no guard. A note carries no check; a check it dropped
+/// or keeps pending lives only in its trial record (`TrialFields`). Written
+/// only by THOR's own trial, never by a writer, like every
+/// `TEETH_TAG_PREFIX` tag. Nothing writes it yet: the writes start carrying
+/// trial records in one later step, all at once.
+pub const TEETH_NOTE_TAG: &str = "teeth:note";
 
 /// The id of the first-session note `ops::install::working_contract` seeds
 /// (`walk-through-the-answer-guard-once`), and the id an agent files the
@@ -1582,14 +2704,14 @@ pub const OWNER_SETUP_ANSWERS_ID: &str = "owner-setup-answers";
 // anything by existing.
 //
 // Three conditions, all of them per-project: the project's judgement debt is
-// zero, every heavy (irreversible/costly) Rule or Orientation in this
-// filing's batch - at most `EVALUATION_TEETH_BATCH` of the ones that apply to
-// this project and have fired since the PREVIOUS report, the ones written
-// longest ago first (`teeth_batch_since`) - is settled (`teeth_state`), and
-// every open point (see below) older than the previous report is either
-// closed (retracted) or has been carried forward exactly once. The heavy rules
-// beyond the batch stay owed and are named by `doctor`; the next filing
-// asks for them first.
+// zero, every Rule or Orientation in this filing's batch - at most
+// `EVALUATION_TEETH_BATCH` of the owed ones that apply to this project,
+// whatever their weight, the ones that fired since the PREVIOUS report first
+// and the ones written longest ago first (`teeth_batch_since`) - is settled
+// (`settlement`), and every open point (see below) older than the previous
+// report is either closed (retracted) or has been carried forward exactly
+// once. The rules beyond the batch stay owed and are named by `doctor`; the
+// next filing asks for them first.
 //
 // WHAT "PER-PROJECT" MEANS FOR THE FIRST TWO. An item applies to a project
 // when it names that project or names none at all (global) - the same
@@ -1620,6 +2742,130 @@ pub const JUDGEMENT_DEBT_AFTER: usize = 40;
 /// The actor a real delivery is stamped with - mirrors `serve::usefulness::
 /// ASSISTANT_DELIVERY_ACTOR` exactly, same reason.
 pub const ASSISTANT_DELIVERY_ACTOR: &str = "hook";
+
+// ------------------------------------------- field evidence, recorded once (X3)
+//
+// Whether a refusal of the real hook was a REAL refusal of a real tool call -
+// its session's own transcript holds that call and the error the block left -
+// is decided once, by `serve::attest`, and recorded here as one
+// `gate_stood_aside` event by actor `attester` per refusal (entity = the rule,
+// body `{refusal_seq, field, why}`). Transcripts are deleted after about 30
+// days (N8), so readers use only the recorded verdict: a refusal with no
+// recorded verdict is never proof, however real it was.
+
+/// The actor a refusal's verification is recorded under.
+pub const ATTESTER_ACTOR: &str = "attester";
+
+/// The actor THOR's own trial stamps a refused write with (`GateRefused`,
+/// body `{id, code, forcing, text_sha}`) - telemetry, never field evidence.
+pub const TEETH_WRITE_ACTOR: &str = "teeth-write";
+
+/// Record the verification of the refusal at log seq `refusal_seq`, once.
+/// Only THOR's attester writes this (`actor` must be `ATTESTER_ACTOR`, held as
+/// a `SystemActor`); a second verification of the same refusal appends
+/// nothing and returns `Ok(None)` - the first recorded verdict is the one
+/// every reader uses.
+pub fn record_refusal_verification(
+    store: &mut EventStore,
+    session_id: &str,
+    actor: SystemActor,
+    rule_id: &str,
+    refusal_seq: i64,
+    field: bool,
+    why: &str,
+) -> Result<Option<Event>, WriteError> {
+    if actor.name() != ATTESTER_ACTOR {
+        return Err(WriteError::Refused(Refusal {
+            problem: format!("a refusal's verification is recorded by THOR's attester only, not by '{}'", actor.name()),
+            fix: "let the Stop hook record it (serve::attest::record_refusal_verifications)".to_string(),
+        }));
+    }
+    let name = fence(store, actor.into(), rule_id)?;
+    let events = store.get_events_by_entity(rule_id).map_err(|e| WriteError::Store(e.into()))?;
+    if recorded_refusal_verdicts(&events).contains_key(&refusal_seq) {
+        return Ok(None);
+    }
+    let body = serde_json::json!({ "refusal_seq": refusal_seq, "field": field, "why": why }).to_string();
+    store
+        .append_event(session_id, session_id, name, EventKind::GateStoodAside, rule_id, None, &body)
+        .map(Some)
+        .map_err(|e| WriteError::Store(e.into()))
+}
+
+/// REFUSED-WRITE TELEMETRY (step 8, K5): a write THOR's trial refused, as one
+/// `GateRefused` by `TEETH_WRITE_ACTOR` on the rule's own id - body `{id,
+/// code, forcing, text_sha}`. No new event kind (an older binary still reads
+/// the log), head-neutral (a `GateRefused` never writes the item), never field
+/// evidence (the actor is not the hook), and the trial reads it back for
+/// K8(c): a real call made after an id's first refused write never stops a
+/// derived tooth from forcing. `text_sha` is a hash of the refused text, so
+/// doctor can say "refused, then stored as a note that no longer names it"
+/// without keeping the text itself.
+pub fn record_refused_write(
+    store: &mut EventStore,
+    session_id: &str,
+    actor: SystemActor,
+    id: &str,
+    code: &str,
+    forcing: &[String],
+    text: &str,
+) -> Result<Event, WriteError> {
+    if actor.name() != TEETH_WRITE_ACTOR {
+        return Err(WriteError::Refused(Refusal {
+            problem: format!("a refused write is recorded by THOR's trial only, not by '{}'", actor.name()),
+            fix: "let the write tool record it (serve::teeth::record_refused_write)".to_string(),
+        }));
+    }
+    let name = fence(store, actor.into(), id)?;
+    let text_sha = thor_core::event_store::hash_event("thor-teeth-refused-text-v1", text);
+    let body = serde_json::json!({ "id": id, "code": code, "forcing": forcing, "text_sha": text_sha }).to_string();
+    store
+        .append_event(session_id, session_id, name, EventKind::GateRefused, id, None, &body)
+        .map_err(|e| WriteError::Store(e.into()))
+}
+
+/// Every recorded refusal verification in `events`: refusal seq -> (field,
+/// why). The first verdict recorded for a refusal is the one that counts; a
+/// later one never overrides it. Only events by `ATTESTER_ACTOR` are read.
+pub fn recorded_refusal_verdicts(events: &[Event]) -> HashMap<i64, (bool, String)> {
+    let mut out: HashMap<i64, (bool, String)> = HashMap::new();
+    for e in events.iter().filter(|e| e.kind == EventKind::GateStoodAside && e.actor == ATTESTER_ACTOR) {
+        let Ok(body) = serde_json::from_str::<serde_json::Value>(&e.body) else { continue };
+        let (Some(seq), Some(field)) = (body.get("refusal_seq").and_then(|v| v.as_i64()), body.get("field").and_then(|v| v.as_bool()))
+        else {
+            continue;
+        };
+        let why = body.get("why").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        out.entry(seq).or_insert((field, why));
+    }
+    out
+}
+
+/// The seqs of every refusal in `events` whose recorded verification says it
+/// was field evidence - the verified set a model-level reader receives, since
+/// `model` cannot run `serve`'s transcript check itself. A refusal only ever
+/// sets the "proven" label of a trial; it settles nothing by itself.
+pub fn attested_field_refusals(events: &[Event]) -> HashSet<i64> {
+    recorded_refusal_verdicts(events).into_iter().filter(|(_, (field, _))| *field).map(|(seq, _)| seq).collect()
+}
+
+/// An in-memory store holding exactly `item`, written as a raw `fact_created`
+/// with no gate at all: THOR's trial runs the hook's own pipeline against a
+/// store like this one, so it tries the item exactly as it would be written,
+/// never as the gate would have shaped it. It is a store of its own, in
+/// memory: nothing here can reach any store on disk.
+pub fn one_item_store(item: &Item) -> anyhow::Result<EventStore> {
+    let mut store = EventStore::in_memory()?;
+    let body = canonical_body(item)?;
+    store.append_event("trial", "trial", "trial", EventKind::FactCreated, &item.id, None, &body)?;
+    Ok(store)
+}
+
+/// The actor of the retired `serve probe-teeth` subcommand (step 9 replaced it
+/// with `serve retest`). Kept as a RESERVED name only, so nothing can ever
+/// write as it again; a probe event on the log settles nothing and is never
+/// field evidence - doctor counts it apart.
+pub const TEETH_PROBE_ACTOR: &str = "teeth-probe";
 
 /// An open point: a small, project-scoped `Report` tagged with this, holding
 /// one sentence naming something an evaluation could not finish - see this
@@ -1652,6 +2898,115 @@ pub fn open_point_carried_count(tags: &[String]) -> u32 {
         .find_map(|t| t.strip_prefix(OPEN_POINT_CARRIED_PREFIX))
         .and_then(|n| n.parse::<u32>().ok())
         .unwrap_or(0)
+}
+
+/// THE DEFECT THIS CLOSES (2026-09-27). Ground 30 (`gate::revise`) ties a
+/// carry to ONE entity's own id, comparing that same id's tags across a
+/// revise. Measured on a copy of a real store: 12 open points carry an id
+/// ending `-2`, and for every one of them the original (ending in no suffix
+/// at all) was RETRACTED first, then a brand-new id filed fresh - never a
+/// revise of the old one, so ground 30 never even ran, and the new point's
+/// own carry count started at 0 again. "Carried at most once" held only
+/// against a fixed id, which is a formality once retracting and re-filing
+/// under a new id is this easy.
+///
+/// So the carry ties to what the point is ABOUT - the rule id its own text
+/// names - never to the note's own id. `named_rule_id` finds that rule id
+/// with the IDENTICAL substring match `teeth_batch_since` already uses to
+/// decide an open point names a rule (never a second matcher, per this
+/// task's own instruction); `every_open_point_ever` reads every open point
+/// this project has held, live or since retracted, from the log itself
+/// (retracting one leaves its last real body on the log untouched - only a
+/// `fact_retracted` event is added - so what it carried right before being
+/// closed is still exactly readable). A new open point naming the same rule
+/// as an earlier one must declare AT LEAST that earlier one's own count;
+/// `gate::revise`'s own ground 30 still refuses ever carrying it past 1, so
+/// this only ever closes the gap ground 30 could not reach on its own -
+/// crossing entities - never loosens what ground 30 already refuses.
+fn named_rule_id(store: &EventStore, project: Option<&str>, text: &str) -> Option<String> {
+    let lower = text.to_lowercase();
+    let mut matches: Vec<String> = all_live_items(store)
+        .into_iter()
+        .filter(|(_, item)| item.kind.can_fire())
+        .filter(|(_, item)| project_applies_to(item.project.as_deref(), project))
+        .filter(|(id, _)| lower.contains(&id.to_lowercase()))
+        .map(|(id, _)| id)
+        .collect();
+    matches.sort();
+    matches.dedup();
+    // More than one live rule id matches: which one this point is really
+    // about is ambiguous from the text alone, and guessing wrong would
+    // either force a false starting count or miss inheriting a real one -
+    // this fails to "no rule found", the same stance every other best-effort
+    // read in this section takes, never a refusal on a guess.
+    (matches.len() == 1).then(|| matches.remove(0))
+}
+
+/// Every open point (`Report`, `OPEN_POINT_TAG`) `project` has EVER held,
+/// live or since retracted, as `(id, its own last real body)` - one entry
+/// per entity id, the latest `fact_created`/`fact_revised` body on the log
+/// winning, exactly the body it carried right before any later retraction
+/// (a `fact_retracted` event carries no body of its own to prefer instead).
+/// Fails open to an empty list on an unreadable log, the same stance
+/// `all_live_items` takes.
+fn every_open_point_ever(store: &EventStore, project: Option<&str>) -> Vec<(String, Item)> {
+    let Ok(events) = store.get_all_events() else { return Vec::new() };
+    let mut by_id: HashMap<String, (i64, Item)> = HashMap::new();
+    for e in &events {
+        if !matches!(e.kind, EventKind::FactCreated | EventKind::FactRevised) {
+            continue;
+        }
+        let Ok(item) = parse_body(&e.body) else { continue };
+        if item.kind != Kind::Report || !item.tags.iter().any(|t| t == OPEN_POINT_TAG) || item.project.as_deref() != project {
+            continue;
+        }
+        by_id
+            .entry(e.entity_id.clone())
+            .and_modify(|(seq, cur)| {
+                if e.seq > *seq {
+                    *seq = e.seq;
+                    *cur = item.clone();
+                }
+            })
+            .or_insert((e.seq, item));
+    }
+    by_id.into_iter().map(|(id, (_, item))| (id, item)).collect()
+}
+
+/// `Some(refusal)` when `item` is a brand-new open point naming a rule an
+/// EARLIER open point (live or since retracted, any id) already carried
+/// forward, and this one's own count starts BELOW that - see `named_rule_id`/
+/// `every_open_point_ever`'s own doc comments. `None` for everything else,
+/// including an open point naming no rule this store can identify at all -
+/// this never refuses on a guess, only on a real, matched carry history.
+fn check_open_point_carry_inherited(store: &EventStore, item: &Item) -> Option<Refusal> {
+    if item.kind != Kind::Report || !item.tags.iter().any(|t| t == OPEN_POINT_TAG) {
+        return None;
+    }
+    let rule_id = named_rule_id(store, item.project.as_deref(), &item.text)?;
+    let prior_max = every_open_point_ever(store, item.project.as_deref())
+        .into_iter()
+        .filter(|(id, _)| id != &item.id)
+        .filter(|(_, prior)| prior.text.to_lowercase().contains(&rule_id.to_lowercase()))
+        .map(|(_, prior)| open_point_carried_count(&prior.tags))
+        .max()
+        .unwrap_or(0);
+    let own = open_point_carried_count(&item.tags);
+    if own >= prior_max {
+        return None;
+    }
+    Some(Refusal {
+        problem: format!(
+            "this open point names '{rule_id}', which an earlier open point about the same rule (live or since \
+             retracted) already carried forward {prior_max} time(s) - filing it under a fresh id does not reset \
+             that count back to zero"
+        ),
+        fix: format!(
+            "add the tag '{OPEN_POINT_CARRIED_PREFIX}{prior_max}' to this open point so it starts where the \
+             earlier one about '{rule_id}' left off - carrying it any further than that still needs the owner \
+             directly, exactly as `gate::revise`'s own ground 30 already refuses"
+        ),
+    })
 }
 
 /// Every live item, current single head, not a retraction tombstone, body
@@ -1878,20 +3233,6 @@ pub fn evaluation_judgement_owed(
     result
 }
 
-/// Every item whose history on the log shows a check was ever attached to it
-/// - the evidence `gate::teeth_answer_settles` needs before a no-literal
-/// reason can count (see its own "A REASON COUNTS ONLY AFTER A REAL TRY").
-/// Read from the stored bodies of the item's own writes: a check is only
-/// ever serialized as `"check":{`, never as a null, so an item that never
-/// carried one never matches. A check that was only TRIED on a revise
-/// (`revise_tried_scoped`, its `"tried":{"check":{...}}` key) matches the same
-/// needle on purpose: the try is on record, and it never hung live. FAILS
-/// OPEN to an empty set, which only ever makes a reason count LESS, never
-/// more.
-pub fn ids_whose_check_was_tried(store: &EventStore) -> HashSet<String> {
-    store.ids_with_a_write_containing("\"check\":{").unwrap_or_default()
-}
-
 /// The highest creation seq among this project's own live evaluation
 /// reports - `0` when it has none yet, so "since the previous report" reads
 /// as "since the beginning of the log" for a project's first-ever
@@ -1924,17 +3265,32 @@ fn newest_evaluation_report_seq(store: &EventStore, project: Option<&str>) -> i6
 /// next time.
 pub const EVALUATION_TEETH_BATCH: usize = 8;
 
-/// The heavy rules one evaluation filing is held to (see
-/// `EVALUATION_TEETH_BATCH`), and the ones left for a later filing.
+/// Prefixed onto a filler candidate's own reason (`teeth_batch_since`'s own
+/// doc comment, "THE BATCH MUST ALSO REACH A RULE THAT NEVER FIRES") so a
+/// reader - the Stop hook's own teeth question, or the filing gate's own
+/// refusal - can tell a rule filling a place because the primary pool ran
+/// short apart from one that is actually owed for firing recently. Both
+/// surfaces read the identical `TeethBatch` this same function builds, so
+/// they can never say something different about the same rule.
+pub const TEETH_NOT_FIRED_RECENTLY_NOTE: &str = "it did not fire since the previous report, and this batch had room left, so: ";
+
+/// The owed rules one evaluation filing is held to (see
+/// `EVALUATION_TEETH_BATCH`), and the ones left for a later filing - each
+/// with `settlement`'s own reason, and a filler candidate's prefixed with
+/// `TEETH_NOT_FIRED_RECENTLY_NOTE`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TeethBatch {
     /// In this filing's batch and not settled yet, each with what is missing.
-    pub owed_now: Vec<(String, &'static str)>,
-    /// In this filing's batch and settled since the previous report.
+    pub owed_now: Vec<(String, String)>,
+    /// SETTLED SINCE THE PREVIOUS REPORT (2026-09-27: no longer "in this
+    /// filing's batch and settled" - a settled rule never took a batch place
+    /// to begin with, see `teeth_batch_since`'s own doc comment, "A SETTLED
+    /// RULE NEVER TAKES A PLACE"). Listed here regardless of how many there
+    /// are; only `owed_now` is held to `EVALUATION_TEETH_BATCH`.
     pub settled: Vec<String>,
     /// Not settled, and beyond this filing's batch: still owed, asked first
     /// by a later filing.
-    pub owed_later: Vec<(String, &'static str)>,
+    pub owed_later: Vec<(String, String)>,
 }
 
 /// The batch the NEXT evaluation report for `project` is held to - what the
@@ -1950,48 +3306,43 @@ fn writes_the_item(kind: EventKind) -> bool {
     matches!(kind, EventKind::FactCreated | EventKind::FactRevised | EventKind::FactResolved | EventKind::FactReprojected)
 }
 
-/// Every live, heavy (irreversible/costly) Rule or Orientation that applies
-/// to `project`, has fired (any `ItemServed` event, whatever the actor - a
-/// firing to a local model is still a firing its own teeth mattered for) with
-/// a seq strictly greater than `cutoff_seq`, and was not settled as of that
-/// seq or is not settled now (`teeth_state`) - split into one filing's batch
-/// and the rest.
+/// Every live Rule or Orientation that applies to `project` and is owed
+/// (`settlement`), whatever its severity (D8) - split into one filing's batch
+/// (at most `EVALUATION_TEETH_BATCH`) and the rest. A rule held by a machine
+/// blocker is settled while the blocker holds and never takes a place (F9).
 ///
 /// THE ORDER, AND WHY IT ROTATES. The rules written longest ago come first:
 /// each rule's key is its last write at or before `cutoff_seq`, so a rule
 /// created after the previous report waits behind every older one. Nothing
-/// that happens after the cutoff moves a key, so settling a rule never pulls
-/// the next one into the batch while this evaluation works through it - a
-/// settled batch member stays in its place and counts as done. At the next
-/// filing the cutoff moves to that report: every rule settled in this round
-/// was settled as of that cutoff and drops out, and the ones left unsettled
-/// lead, oldest first. That is the "least recently asked first" the Stop
-/// hook's teeth question keeps with a sidecar, computed here from the log
-/// alone, because this gate reads nothing but the log. The one thing that
-/// can still change the batch mid-evaluation is a rule firing for the first
-/// time since the cutoff - during the evaluation itself - with an older key.
+/// that happens after the cutoff moves a key. At the next filing the cutoff
+/// moves to that report, and the ones left owed lead the new batch, oldest
+/// first - "least recently asked first", computed from the log alone.
 ///
-/// WHY "SETTLED AS OF THE CUTOFF" IS ASKED AT ALL: a rule settled before the
-/// previous report and still settled is not this filing's business, and must
-/// not take a batch place either, or a handful of long-settled rules that
-/// fire often would fill every batch and the backlog behind them would never
-/// be asked. The state as of the cutoff is the item's last created or revised
-/// body at or before it; open points are read as they stand now.
+/// A SETTLED RULE NEVER TAKES A PLACE: it is listed in `TeethBatch::settled`
+/// when its current verdict was written after `cutoff_seq`, with no cap.
+/// Settling a rule during an evaluation therefore pulls the next owed rule
+/// into `owed_now` for that same filing; the cap bounds how many are asked of
+/// one filing at once, never which ones are asked at all.
 ///
-/// NEVER RE-COMPUTES THE BOX ITSELF. `serve::prove::teeth_box` needs
-/// `serve::absent_guard`/`serve::rank`, both unreachable from here - see this
-/// section's own top-of-file doc comment. `teeth_state` reads only what the
-/// write path or the maintenance backfill recorded on the item.
+/// TWO POOLS, in order: every owed rule that fired since `cutoff_seq` fills
+/// the batch first, oldest write first; only when fewer than
+/// `EVALUATION_TEETH_BATCH` of those are owed does an owed rule that did NOT
+/// fire since then fill the remaining places (named with
+/// `TEETH_NOT_FIRED_RECENTLY_NOTE`), so a rule that never fires can still be
+/// reached.
+///
+/// WHY NO SEVERITY FILTER (D8). With "heavy only", a bin that lowers a rule's
+/// severity took it out of the batch without any trial. The severity is part
+/// of the fingerprint, so lowering it makes the rule owed again, and it stays
+/// in this batch until THOR's trial decides it.
 fn teeth_batch_since(store: &EventStore, project: Option<&str>, cutoff_seq: i64) -> TeethBatch {
     let Ok(events) = store.get_all_events() else { return TeethBatch::default() };
     let mut fired_after: HashSet<String> = HashSet::new();
-    // Per item: the seq of its last write at or before the cutoff, of its
-    // first write ever (the key of an item born after the cutoff), and the
-    // index of its last created/revised body at or before the cutoff.
+    // Per item: the seq of its last write at or before the cutoff, and of its
+    // first write ever (the key of an item born after the cutoff).
     let mut last_write_by_cutoff: HashMap<&str, i64> = HashMap::new();
     let mut first_write: HashMap<&str, i64> = HashMap::new();
-    let mut body_by_cutoff: HashMap<&str, usize> = HashMap::new();
-    for (i, e) in events.iter().enumerate() {
+    for e in &events {
         if e.kind == EventKind::ItemServed && e.seq > cutoff_seq {
             fired_after.insert(e.entity_id.clone());
         }
@@ -2001,207 +3352,90 @@ fn teeth_batch_since(store: &EventStore, project: Option<&str>, cutoff_seq: i64)
         first_write.entry(e.entity_id.as_str()).and_modify(|s| *s = (*s).min(e.seq)).or_insert(e.seq);
         if e.seq <= cutoff_seq {
             last_write_by_cutoff.entry(e.entity_id.as_str()).and_modify(|s| *s = (*s).max(e.seq)).or_insert(e.seq);
-            if matches!(e.kind, EventKind::FactCreated | EventKind::FactRevised)
-                && body_by_cutoff.get(e.entity_id.as_str()).map_or(true, |&j| events[j].seq < e.seq)
-            {
-                body_by_cutoff.insert(e.entity_id.as_str(), i);
-            }
         }
     }
-    let live = all_live_items(store);
-    // A no-literal reason counts only for an item whose history shows a
-    // check was tried (`gate::teeth_answer_settles`). Read once, from the
-    // same log, as of NOW, and used for the state at the cutoff too. That
-    // only matters for a rule that is settled now (an unsettled one takes
-    // its place either way), and such a rule then simply keeps no batch
-    // place - the same as any rule settled before the cutoff.
-    let tried = ids_whose_check_was_tried(store);
-    // Real refusals on record, read from the same log - see
-    // `refused_under_check`.
-    let refusals = RefusalRecord::from_events(&events);
-    // Every live open point of this project, lowercased once: a wired or
-    // doubtful check is settled for THIS filing only when an open point
-    // names it (see `teeth_state` below).
-    let open_point_texts: Vec<String> = live
-        .iter()
-        .filter(|(_, item)| item.kind == Kind::Report)
-        .filter(|(_, item)| item.project.as_deref() == project)
-        .filter(|(_, item)| item.tags.iter().any(|t| t == OPEN_POINT_TAG))
-        .map(|(_, item)| item.text.to_lowercase())
-        .collect();
-    // (key, id, what is missing now - `None` when settled)
-    let mut candidates: Vec<(i64, String, Option<&'static str>)> = live
+
+    // Pool 1: fired since the cutoff and owed; pool 2: did not fire since the
+    // cutoff and owed. Each (key, id, why).
+    let mut fired_owed: Vec<(i64, String, String)> = Vec::new();
+    let mut not_fired_owed: Vec<(i64, String, String)> = Vec::new();
+    let mut settled: Vec<String> = Vec::new();
+    for (id, _) in all_live_items(store)
         .into_iter()
         .filter(|(_, item)| item.kind.can_fire())
         .filter(|(_, item)| project_applies_to(item.project.as_deref(), project))
-        .filter(|(_, item)| matches!(item.severity, Some(Severity::Irreversible) | Some(Severity::Costly)))
-        .filter(|(id, _)| fired_after.contains(id))
-        .filter_map(|(id, item)| {
-            let named_in_open_point = open_point_texts.iter().any(|t| t.contains(&id.to_lowercase()));
-            let check_tried = tried.contains(&id);
-            let now = teeth_state(&item, named_in_open_point, check_tried, refusals.refused_under_check(&id, i64::MAX));
-            // An item with no body at or before the cutoff did not exist then,
-            // and one whose old body will not parse cannot prove it was
-            // settled: both count as unsettled as of the cutoff.
-            let settled_at_cutoff = body_by_cutoff
-                .get(id.as_str())
-                .and_then(|&i| parse_body(&events[i].body).ok())
-                .is_some_and(|then| {
-                    teeth_state(&then, named_in_open_point, check_tried, refusals.refused_under_check(&id, cutoff_seq))
-                        .is_none()
-                });
-            if now.is_none() && settled_at_cutoff {
-                return None;
+    {
+        let key = last_write_by_cutoff.get(id.as_str()).or_else(|| first_write.get(id.as_str())).copied().unwrap_or(i64::MAX);
+        match settlement(store, &id) {
+            Settlement::Owed { why } => {
+                if fired_after.contains(&id) {
+                    fired_owed.push((key, id, why));
+                } else {
+                    not_fired_owed.push((key, id, why));
+                }
             }
-            let key = last_write_by_cutoff
-                .get(id.as_str())
-                .or_else(|| first_write.get(id.as_str()))
-                .copied()
-                .unwrap_or(i64::MAX);
-            Some((key, id, now))
-        })
-        .collect();
-    candidates.sort();
-    let mut batch = TeethBatch::default();
-    for (place, (_, id, now)) in candidates.into_iter().enumerate() {
-        match (place < EVALUATION_TEETH_BATCH, now) {
-            (true, Some(missing)) => batch.owed_now.push((id, missing)),
-            (true, None) => batch.settled.push(id),
-            (false, Some(missing)) => batch.owed_later.push((id, missing)),
-            (false, None) => {}
+            // Held by a machine blocker: not this filing's business, and
+            // never listed as settled by work either.
+            Settlement::Settled(Settled::Blocked(_)) => {}
+            Settlement::Settled(_) => {
+                if verdict_written_after(store, &id, cutoff_seq) {
+                    settled.push(id);
+                }
+            }
+        }
+    }
+
+    fired_owed.sort();
+    not_fired_owed.sort();
+    settled.sort();
+    let mut batch = TeethBatch { settled, ..TeethBatch::default() };
+    for (place, (_, id, why)) in fired_owed.into_iter().enumerate() {
+        if place < EVALUATION_TEETH_BATCH {
+            batch.owed_now.push((id, why));
+        } else {
+            batch.owed_later.push((id, why));
+        }
+    }
+    let remaining = EVALUATION_TEETH_BATCH.saturating_sub(batch.owed_now.len());
+    for (place, (_, id, why)) in not_fired_owed.into_iter().enumerate() {
+        // See `TEETH_NOT_FIRED_RECENTLY_NOTE`'s own doc comment: named as a
+        // filler, so the Stop hook and the filing gate can never say
+        // anything different about the same rule for the same reason - both
+        // read this one function.
+        let why = format!("{TEETH_NOT_FIRED_RECENTLY_NOTE}{why}");
+        if place < remaining {
+            batch.owed_now.push((id, why));
+        } else {
+            batch.owed_later.push((id, why));
         }
     }
     batch
 }
 
-/// Whether one heavy rule's teeth question is SETTLED for an evaluation
-/// filing - `None` when it is, or the plain name of what is still missing.
-///
-/// THE RULE (2026-09-26): more real teeth, or a clear proof it cannot have
-/// one - never a label that only satisfies the count. So exactly three things
-/// settle it:
-/// - `TEETH_PROVEN_TAG`: the check has bitten a real call on record;
-/// - a teeth answer whose reason quotes the legitimate call or names the
-///   rule's own trigger (`gate::teeth_answer_settles`) - a reason that only
-///   fills the length does not;
-/// - a check that is wired but not yet proven (or whose anchor needs a
-///   person to look at it) AND a live open point of this project naming the
-///   rule's id: the honest "this still has to meet a real call", carried where
-///   the next evaluation must close it (see `open_points_needing_action`).
-///
-/// `TEETH_INFORMING_TAG` alone settles nothing: it only records that nothing
-/// could be tried, which is the question, not an answer to it. Before this,
-/// ANY machine label settled the filing, so a maintenance pass that labelled
-/// every heavy rule "informing" lifted the gate for the whole store at once.
-///
-/// PROVEN BY THE LOG, NOT ONLY BY THE LABEL (2026-09-27). `refused_on_record`
-/// is whether the real hook refused a call under this item's CURRENT check
-/// (`RefusalRecord::refused_under_check`). The label is written only when the
-/// item itself is written, so a check that bit a real call during the
-/// evaluation still read "wired" at filing time - measured in a fresh
-/// evaluation: three real refusals on record, and the gate named all three
-/// rules as never having met a real call.
-///
-/// A REASON NEVER SETTLES A RULE WHOSE CHECK CAN REFUSE (2026-09-27). Such a
-/// rule is answered by its check - proven, or carried by an open point - and
-/// a reason beside it saying nothing can catch the mistake contradicts it.
-/// Measured: a reason saying the bare call is legitimate settled a rule whose
-/// requires check refused exactly that call. The write gate no longer lets
-/// the two meet (`gate::teeth_answer_contradictions`); this is the filing
-/// half, for an item that carried both before that existed. The Stop hook's
-/// own teeth question is deliberately left as it was.
-///
-/// AN OPEN POINT CARRIES ANY RULE THAT HANGS A CHECK (2026-09-27), no longer
-/// only a wired one: a check that cannot reach its file because that file's
-/// place is full, or one nobody could try here, is exactly the "could not
-/// finish this here" an open point exists for, and the next evaluation has to
-/// close or carry it. A rule with no check at all is not carried this way -
-/// it owes a try first.
-fn teeth_state(item: &Item, named_in_open_point: bool, check_tried: bool, refused_on_record: bool) -> Option<&'static str> {
-    if item.tags.iter().any(|t| t == TEETH_PROVEN_TAG) || (refused_on_record && item.check.is_some()) {
-        return None;
-    }
-    let refusing = gate::is_refusing_check(item.check.as_ref());
-    if !refusing && gate::teeth_answer_settles(item, check_tried) {
-        return None;
-    }
-    if item.check.is_some() && named_in_open_point {
-        return None;
-    }
-    if refusing && gate::teeth_reason_tag(item).is_some() {
-        return Some(
-            "it carries a check that refuses AND a reason that nothing can catch it: keep the check (drop the reason \
-             tag, file an open point) or clear the check with a because and keep the reason",
-        );
-    }
-    if item.tags.iter().any(|t| t == TEETH_REFUSES_LEGITIMATE_TAG) {
-        return Some("its check refuses legitimate use too: narrow it, or file an open point");
-    }
-    if item.tags.iter().any(|t| t == TEETH_ANCHOR_COLLAPSED_TAG) {
-        return Some("its anchor contains its own literal and it has not refused a real call yet: file an open point");
-    }
-    if item.tags.iter().any(|t| t == TEETH_WIRED_TAG) {
-        return Some("its check is wired but no real call has met it yet: file an open point");
-    }
-    if item.check.is_some() {
-        return Some(
-            "its check cannot refuse anything as it stands (revise it with nothing changed and the receipt says \
-             why): make it reach, or file an open point naming what blocks it",
-        );
-    }
-    Some("no check, and no reason that quotes the legitimate call or names its trigger: try a check first")
+/// Whether the trial record `id`'s current verdict rests on was written after
+/// `cutoff_seq` - "settled since the previous report".
+fn verdict_written_after(store: &EventStore, id: &str, cutoff_seq: i64) -> bool {
+    let Ok(events) = store.get_events_by_entity(id) else { return false };
+    events.iter().rev().find(|e| matches!(trial_of(e), Ok(Some(_)))).is_some_and(|e| e.seq > cutoff_seq)
 }
 
-/// Every real refusal on the log, per item, with the writes that changed that
-/// item's check - enough to say whether the real hook refused a call under
-/// the check an item carries NOW (or carried at some earlier seq). The same
-/// rule `serve::prove::reality`/`bitten` apply to a file check: a refusal
-/// counts once it came after the current check was set, and a changed check
-/// starts over. For a command check `bitten` also re-runs the refused call
-/// against the check as it stands; with the check unchanged since the
-/// refusal, that is the same check refusing the same call, so the answer is
-/// the same. `serve` is out of reach from here (see this section's own
-/// top-of-file comment), which is why this reads the log and never the guard.
-struct RefusalRecord {
-    /// id -> (refusal seqs, every write that changed its check: (seq, a check is set)).
-    by_item: HashMap<String, (Vec<i64>, Vec<(i64, bool)>)>,
-}
-
-impl RefusalRecord {
-    fn from_events(events: &[Event]) -> Self {
-        let mut by_item: HashMap<String, (Vec<i64>, Vec<(i64, bool)>)> = HashMap::new();
-        for e in events.iter().filter(|e| e.kind == EventKind::GateRefused) {
-            by_item.entry(e.entity_id.clone()).or_default().0.push(e.seq);
-        }
-        let mut last_check: HashMap<&str, Option<Check>> = HashMap::new();
-        for e in events {
-            let Some(entry) = by_item.get_mut(&e.entity_id) else { continue };
-            match e.kind {
-                EventKind::FactCreated | EventKind::FactRevised => {
-                    let Ok(item) = parse_body(&e.body) else { continue };
-                    if last_check.get(e.entity_id.as_str()) != Some(&item.check) {
-                        entry.1.push((e.seq, item.check.is_some()));
-                        last_check.insert(e.entity_id.as_str(), item.check);
-                    }
-                }
-                EventKind::FactRetracted => {
-                    entry.1.push((e.seq, false));
-                    last_check.remove(e.entity_id.as_str());
-                }
-                _ => {}
-            }
-        }
-        RefusalRecord { by_item }
-    }
-
-    /// Whether the real hook refused a call under `id`'s check as it stood at
-    /// `upto` (`i64::MAX` for now): a refusal after that check was set, and at
-    /// or before `upto`.
-    fn refused_under_check(&self, id: &str, upto: i64) -> bool {
-        let Some((refusals, changes)) = self.by_item.get(id) else { return false };
-        let Some(&(since, has_check)) = changes.iter().rev().find(|(seq, _)| *seq <= upto) else { return false };
-        has_check && refusals.iter().any(|&r| r > since && r <= upto)
-    }
+/// The command that shows THOR's trial of rule `id` without writing anything,
+/// always with `--db` (F7). Add `--apply` to write the rule or the note it
+/// decides.
+///
+/// Names `serve` by its full path when it sits next to the running program
+/// (every installed THOR binary does), so a reader can run the line as it
+/// stands - on Windows with PowerShell's `&` call operator, which a quoted
+/// path needs; else the bare program name.
+pub fn retest_command_for(db: Option<&Path>, id: &str) -> String {
+    let name = format!("serve{}", std::env::consts::EXE_SUFFIX);
+    let beside = std::env::current_exe().ok().and_then(|exe| exe.parent().map(|dir| dir.join(&name))).filter(|p| p.is_file());
+    let program = match beside {
+        Some(path) if cfg!(windows) => format!("& \"{}\"", path.display()),
+        Some(path) => format!("\"{}\"", path.display()),
+        None => name,
+    };
+    format!("{program} --db \"{}\" retest --id '{id}'", db_argument(db))
 }
 
 /// Every live open point for `project`, exactly scoped (never `project_
@@ -2340,36 +3574,23 @@ fn check_evaluation_report_filing(store: &EventStore, item: &Item, scope: Option
         let later = match batch.owed_later.len() {
             0 => String::new(),
             n => format!(
-                " {n} more heavy rule(s) in the same state are not this report's to settle: they stay owed, doctor \
-                 names them, and a later evaluation asks for them first."
+                " {n} more rule(s) in the same state are not this report's to settle: they stay owed, doctor names \
+                 them, and a later evaluation asks for them first."
             ),
         };
-        let project_arg = match project {
-            Some(p) => format!("project \"{p}\""),
-            None => "no project".to_string(),
-        };
+        let first = &batch.owed_now[0].0;
         missing.push(format!(
-            "{} heavy rule(s) in this report's batch (at most {EVALUATION_TEETH_BATCH}, the ones written longest ago \
-             first) apply to this project (its own or global), have fired since the previous report - the log \
-             records when a rule fired, never in which project - and still have neither a real tooth nor a real \
-             reason why they cannot: {named}.{later} What settles one, and nothing else does: (1) A CHECK THAT \
-             BIT: the rule's check refused a real call through the real hook - any refusal on record under the \
-             check it carries now counts by itself, no revise needed. Never write the mistake into a real file to \
-             provoke one; for a command check a harmless form of the command is enough. (2) AN OPEN POINT, for a \
-             rule that hangs a check that has not bitten yet, or cannot be made to work here: a separate small \
-             Report, never a tag on the rule - mcp__thor__remember with kind \"report\", {project_arg}, tags \
-             [\"{OPEN_POINT_TAG}\"], an id such as \"open-<rule id>\", and a text that names the rule's id and \
-             the real call that would prove it (or what blocks the fix, such as a full anchor). The next \
-             evaluation closes it (retract with a reason) or carries it once. (3) A REASON, only for a rule \
-             whose check cannot refuse (none, contains or path_exists): tag it 'no-literal:<why>' (on a \
-             command: 'no-catch-on-command:<why>'), with a reason that QUOTES the legitimate call carrying the \
-             same fragment or NAMES the command, file or moment the rule is about. A reason counts only after a \
-             real try: pass the check you tried in the same revise with trial_check true - THOR tries it and \
-             records the try, and it is never stored; a check that turns out to work is refused as a reason and \
-             must be hung instead. A reason never settles a rule whose check can refuse. (4) Retract the rule \
-             with a reason if it is simply wrong. A label a maintenance pass writes ('teeth:informing') is not an \
-             answer: it only says nothing could be tried",
-            batch.owed_now.len()
+            "{} rule(s) in this report's batch (at most {EVALUATION_TEETH_BATCH}, the ones written longest ago \
+             first; every live rule and orientation counts, whatever its weight) apply to this project (its own or \
+             global) and have no current verdict from THOR's trial: {named}.{later} What settles one, and nothing \
+             else does: THOR's trial, run on the rule as it stands. See what it decides with `{}` - it prints the \
+             registered working copy it used, every attempt, and a rule, a note, or the one fix you have to make \
+             yourself - then run the same command with --apply to write the rule or the note it decided. Or \
+             mcp__thor__revise with only the rule's id, which runs the same trial and writes its verdict. A tag, a \
+             reason, an open point, a refusal on record or a probe settles nothing. Retract the rule with a reason if \
+             it is simply wrong",
+            batch.owed_now.len(),
+            retest_command_for(store.path().as_deref(), first)
         ));
     }
 
@@ -2439,15 +3660,16 @@ fn check_evaluation_report_filing(store: &EventStore, item: &Item, scope: Option
 /// at something that is not there gives way - and `root: None` (nowhere to
 /// look) keeps the old, strict refusal, because a check that cannot be judged
 /// must never be assumed dead.
-pub fn archive(
+pub fn archive<'a>(
     store: &mut EventStore,
     session_id: &str,
     lineage_id: &str,
-    actor: &str,
+    actor: impl Into<WriteActor<'a>>,
     entity_id: &str,
     reason: &str,
     root: Option<&Path>,
 ) -> Result<Event, WriteError> {
+    let actor = fence(store, actor.into(), entity_id)?;
     let reason = reason.trim();
     if reason.is_empty() {
         return Err(WriteError::Refused(Refusal {
@@ -2530,15 +3752,16 @@ pub fn archive(
 /// one anchor explicitly rather than digging them out of history - because
 /// undoing a mistake should be an act someone states in full, not a magic
 /// rewind that might restore something nobody looked at.
-pub fn restore_deliberate_anchor(
+pub fn restore_deliberate_anchor<'a>(
     store: &mut EventStore,
     session_id: &str,
     lineage_id: &str,
-    actor: &str,
+    actor: impl Into<WriteActor<'a>>,
     entity_id: &str,
     kind: Kind,
     anchor: &str,
 ) -> Result<Event, WriteError> {
+    let actor = fence(store, actor.into(), entity_id)?;
     let existing = show(store, entity_id).map_err(|e| WriteError::Store(anyhow::anyhow!("{e}")))?;
     if existing.kind.can_fire() {
         return Err(WriteError::Refused(Refusal {
@@ -2618,14 +3841,15 @@ fn tombstone_reason(body: &str) -> String {
 /// seeded first-session note) is refused until `OWNER_SETUP_ANSWERS_ID`
 /// exists as a live item - see `gate::retract`'s own doc comment for why.
 /// Every other id is retracted exactly as before.
-pub fn retract(
+pub fn retract<'a>(
     store: &mut EventStore,
     session_id: &str,
     lineage_id: &str,
-    actor: &str,
+    actor: impl Into<WriteActor<'a>>,
     entity_id: &str,
     reason: &str,
 ) -> Result<Event, WriteError> {
+    let actor = fence(store, actor.into(), entity_id)?;
     let reason = reason.trim();
     if reason.is_empty() {
         return Err(WriteError::Refused(Refusal {
@@ -2700,15 +3924,16 @@ pub fn retract(
 /// `core` recomputes that set under the write lock, so a head that appeared
 /// while the caller was deciding makes this fail instead of silently dropping
 /// someone else's revision.
-pub fn resolve(
+pub fn resolve<'a>(
     store: &mut EventStore,
     session_id: &str,
     lineage_id: &str,
-    actor: &str,
+    actor: impl Into<WriteActor<'a>>,
     entity_id: &str,
     keep: &str,
     discard: &[String],
 ) -> Result<Event, WriteError> {
+    let actor = fence(store, actor.into(), entity_id)?;
     store
         .append_resolve(session_id, lineage_id, actor, entity_id, keep, discard)
         .map_err(WriteError::Store)
@@ -2732,6 +3957,10 @@ pub struct Revision {
     /// retraction (see `tombstone_reason` for that one's own reason) alike.
     /// See `because_reason`, the one place that reads it out of the body.
     pub because: Option<String>,
+    /// THOR's old-stock mark (Q24), when this step's trial record carries
+    /// one: the fragment an old contains check guards although the rule's
+    /// text does not name it - shown on the step's own line.
+    pub a4_old_stock: Option<OldContainsStock>,
 }
 
 /// The whole revision log for one id, oldest first, including retractions.
@@ -2748,8 +3977,112 @@ pub fn history(store: &EventStore, entity_id: &str) -> Result<Vec<Revision>, Rea
             actor: e.actor.clone(),
             item: parse_body(&e.body).ok(),
             because: because_reason(&e.body),
+            a4_old_stock: trial_of(&e).ok().flatten().and_then(|r| r.fields().a4_old_stock.clone()),
         })
         .collect())
+}
+
+// ------------------------------------ a project's registered working copy (A2, Z3)
+//
+// Where a project's checkout lives on this machine, written by the installer
+// only: as the trailing `"root"`/`"root_at"` keys of the project's own record
+// (`project_opened_id`, or `project_root_id` when that record was retracted
+// before this build). `fence` refuses every other actor on those ids, so an
+// ordinary revise or retract can never move or remove a registration, and
+// `root_registrations` reads installer events only, so an event some other
+// actor wrote before this build can never be mistaken for one.
+
+/// One registration of a project's working copy, as the installer wrote it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootRegistration {
+    /// The record it was written on.
+    pub id: String,
+    pub seq: i64,
+    /// The top of the checkout, with forward slashes, exactly as registered.
+    pub root: String,
+    /// When, as `YYYY-MM-DDTHH:MM:SSZ`; `None` when the body carries none.
+    pub at: Option<String>,
+}
+
+/// Every registration of project `key`'s working copy, oldest first: every
+/// event by `INSTALLER_ACTOR` whose body carries a `"root"` key, on
+/// `project_opened_id(key)` - or, when that record was retracted before this
+/// build, on `project_root_id(key)` instead. The last one is the current
+/// registration; an earlier one is where the project lived before a move.
+pub fn root_registrations(store: &EventStore, key: &str) -> Vec<RootRegistration> {
+    let opened = project_opened_id(key);
+    let id = if matches!(show(store, &opened), Err(ReadError::Retracted(_))) { project_root_id(key) } else { opened };
+    let Ok(events) = store.get_events_by_entity(&id) else { return Vec::new() };
+    let mut out: Vec<RootRegistration> = events
+        .iter()
+        .filter(|e| e.actor == INSTALLER_ACTOR)
+        .filter_map(|e| {
+            let body: serde_json::Value = serde_json::from_str(&e.body).ok()?;
+            let root = body.get("root")?.as_str()?.to_string();
+            let at = body.get("root_at").and_then(|v| v.as_str()).map(str::to_string);
+            Some(RootRegistration { id: id.clone(), seq: e.seq, root, at })
+        })
+        .collect();
+    out.sort_by_key(|r| r.seq);
+    out
+}
+
+/// The working copy project `key` is registered at, and the seq of the event
+/// that registered it - the newest of `root_registrations`. Raw: nothing here
+/// checks that the path still exists or is still that project's checkout;
+/// `serve::project::registered_checkout` does, every time it is read.
+pub fn registered_root_raw(store: &EventStore, key: &str) -> Option<(PathBuf, i64)> {
+    root_registrations(store, key).pop().map(|r| (PathBuf::from(r.root), r.seq))
+}
+
+/// Refused unless `id` is a project record - the only kind of item that
+/// carries a working copy.
+fn refuse_unless_project_record(id: &str) -> Result<(), WriteError> {
+    if reserved_id_owner(id) == Some(INSTALLER_ACTOR) {
+        return Ok(());
+    }
+    Err(WriteError::Refused(Refusal {
+        problem: format!("'{id}' is not a project record, and only a project record carries a working copy"),
+        fix: "register a working copy through install.exe, run from inside the checkout".to_string(),
+    }))
+}
+
+/// Create a project record that carries its registered working copy from its
+/// first event: everything `declare` checks, then the body with `root` and
+/// `root_at` spliced on. `id` must be a project record id, and `actor` must be
+/// the installer (`fence`).
+pub fn declare_project_record(
+    store: &mut EventStore,
+    item: &Item,
+    root: &str,
+    at: &str,
+    actor: SystemActor,
+) -> Result<Event, WriteError> {
+    fence(store, actor.into(), &item.id)?;
+    refuse_unless_project_record(&item.id)?;
+    declare_gated(store, "install", "install", actor.into(), item, None, None, Some((root, at)))
+}
+
+/// Register (or move) the working copy on an existing project record: one
+/// `fact_revised` event whose body is the record exactly as it stands, with
+/// `root` and `root_at` spliced on. The one revise entry point that ever
+/// writes a `"root"` key (X5). Nothing about the item itself changes, so the
+/// write gate has nothing new to judge; the fence decides who may write.
+pub fn revise_project_root(
+    store: &mut EventStore,
+    id: &str,
+    root: &str,
+    at: &str,
+    actor: SystemActor,
+) -> Result<Event, WriteError> {
+    let name = fence(store, actor.into(), id)?;
+    refuse_unless_project_record(id)?;
+    let existing = show(store, id).map_err(|e| WriteError::Store(anyhow::anyhow!("{e}")))?;
+    let body = canonical_body(&existing).map_err(WriteError::Serialize)?;
+    let body = body_with_root(&body, root, at).map_err(WriteError::Serialize)?;
+    store
+        .append_mutate_checked("install", "install", name, EventKind::FactRevised, id, None, &body)
+        .map_err(WriteError::Store)
 }
 
 #[cfg(test)]
@@ -3927,13 +5260,13 @@ mod tests {
         let mut store = EventStore::in_memory().unwrap();
         let mut live = sample_with("still-there", "the config lives in here.toml");
         live.check = Some(Check::PathExists { path: "here.toml".to_string() });
-        declare(&mut store, "s1", "l1", "test", &live).unwrap();
+        legacy(&mut store, &live);
         let mut dead = sample_with("file-gone", "the tree this one watched was deleted");
         dead.check = Some(Check::Contains {
             path: "gone/src/lib.rs".to_string(),
             literal: "fn main".to_string(),
         });
-        declare(&mut store, "s1", "l1", "test", &dead).unwrap();
+        legacy(&mut store, &dead);
 
         assert!(
             archive(&mut store, "s1", "l1", "test", "still-there", "tidying up", Some(dir.path()))
@@ -4311,10 +5644,11 @@ mod tests {
 
     /// A LIGHT (no severity), command-bound, checkless Rule - judgement
     /// debt (`judgement_debt_in_project`) never looks at severity at all,
-    /// so this is enough to owe a verdict on its own, and being light means
-    /// it owes no teeth box (`TeethBox::NotApplicable`) and so can never
-    /// ALSO trip the evaluation-filing gate's condition 2 - the isolation
-    /// `evaluation_report_filing_is_refused_while_judgement_debt_is_
+    /// so this is enough to owe a verdict on its own. Declared through
+    /// `declare_noted` (a Note verdict from a trial record), so it can never
+    /// ALSO trip the evaluation-filing gate's condition 2 - since step 9 a
+    /// light rule WITHOUT a verdict is owed like any other (D8) - the
+    /// isolation `evaluation_report_filing_is_refused_while_judgement_debt_is_
     /// outstanding`/`..._succeeds_once_judgement_debt_is_paid_down` need to
     /// each prove exactly one condition.
     fn light_command_rule(id: &str, project: &str) -> Item {
@@ -4421,7 +5755,7 @@ mod tests {
         now_tagged.tags.push(EVALUATION_REPORT_TAG.to_string());
         let err = revise(&mut store, "s", "l", "a", &plain, &now_tagged).unwrap_err();
         let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
-        assert!(refusal.problem.contains("neither a real tooth nor a real reason"), "{}", refusal.problem);
+        assert!(refusal.problem.contains("no current verdict from THOR's trial"), "{}", refusal.problem);
     }
 
     /// THE CONCESSION THIS MUST NOT COST: a report that has ALREADY been
@@ -4434,7 +5768,7 @@ mod tests {
     fn revising_an_already_filed_report_that_keeps_the_tag_is_never_gated() {
         let mut store = EventStore::in_memory().unwrap();
         let light = light_command_rule("owed-4", "y");
-        declare(&mut store, "s", "l", "a", &light).unwrap();
+        declare_noted(&mut store, &light);
         serve_n(&mut store, "owed-4", ASSISTANT_DELIVERY_ACTOR, JUDGEMENT_DEBT_AFTER);
 
         // A filed report exists (bypassing declare's own gate on purpose -
@@ -4455,7 +5789,7 @@ mod tests {
     fn evaluation_report_filing_is_refused_while_judgement_debt_is_outstanding() {
         let mut store = EventStore::in_memory().unwrap();
         let light = light_command_rule("owed-1", "p");
-        declare(&mut store, "s", "l", "a", &light).unwrap();
+        declare_noted(&mut store, &light);
         serve_n(&mut store, "owed-1", ASSISTANT_DELIVERY_ACTOR, JUDGEMENT_DEBT_AFTER);
 
         let scope = started_now(&store, "s");
@@ -4469,7 +5803,7 @@ mod tests {
     fn evaluation_report_filing_succeeds_once_judgement_debt_is_paid_down() {
         let mut store = EventStore::in_memory().unwrap();
         let light = light_command_rule("owed-2", "p");
-        declare(&mut store, "s", "l", "a", &light).unwrap();
+        declare_noted(&mut store, &light);
         serve_n(&mut store, "owed-2", ASSISTANT_DELIVERY_ACTOR, JUDGEMENT_DEBT_AFTER);
         mark_useful(&mut store, "owed-2");
 
@@ -4499,13 +5833,13 @@ mod tests {
         let err = declare(&mut store, "s", "l", "a", &eval_report("eval-q-new", "q")).unwrap_err();
         let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
         assert!(refusal.problem.contains("unboxed-heavy"), "{}", refusal.problem);
-        assert!(refusal.problem.contains("neither a real tooth nor a real reason"), "{}", refusal.problem);
+        assert!(refusal.problem.contains("no current verdict from THOR's trial"), "{}", refusal.problem);
     }
 
     /// C (2026-09-26): the refusal used to point at a maintenance pass that
     /// labels in bulk as the way out. It must send a fresh agent to the real
-    /// work instead - a check that bites, or a reason that quotes the
-    /// legitimate call or names the trigger - and never to relabelling.
+    /// work instead - since step 9 THOR's trial, by the retest command that
+    /// decides the rule - and never to relabelling.
     #[test]
     fn the_filing_refusal_names_the_real_work_and_never_the_bulk_relabel() {
         let mut store = EventStore::in_memory().unwrap();
@@ -4516,8 +5850,9 @@ mod tests {
         let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
         let text = format!("{} {}", refusal.problem, refusal.fix);
         assert!(!text.contains("backfill_teeth"), "a bulk relabel is never the way out: {text}");
-        assert!(text.contains("QUOTES the legitimate call"), "{text}");
-        assert!(text.contains("names the rule's id"), "{text}");
+        assert!(text.contains("retest --id 'needs-work'"), "the command that decides it: {text}");
+        assert!(text.contains("mcp__thor__revise with only the rule's id"), "{text}");
+        assert!(text.contains("A tag, a reason, an open point, a refusal on record or a probe settles nothing"), "{text}");
     }
 
     /// C (2026-09-26): the judgement half names the owed items, so a writer
@@ -4526,8 +5861,8 @@ mod tests {
     #[test]
     fn the_filing_refusal_names_every_item_that_owes_a_judgement() {
         let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "s", "l", "a", &light_command_rule("owed-a", "o")).unwrap();
-        declare(&mut store, "s", "l", "a", &light_command_rule("owed-b", "o")).unwrap();
+        declare_noted(&mut store, &light_command_rule("owed-a", "o"));
+        declare_noted(&mut store, &light_command_rule("owed-b", "o"));
         serve_n(&mut store, "owed-a", ASSISTANT_DELIVERY_ACTOR, JUDGEMENT_DEBT_AFTER);
         serve_n(&mut store, "owed-b", ASSISTANT_DELIVERY_ACTOR, JUDGEMENT_DEBT_AFTER);
         let scope = started_now(&store, "s");
@@ -4550,7 +5885,7 @@ mod tests {
     #[test]
     fn an_item_that_fired_only_in_another_session_never_holds_this_report() {
         let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "s", "l", "a", &light_command_rule("elsewhere", "w")).unwrap();
+        declare_noted(&mut store, &light_command_rule("elsewhere", "w"));
         serve_in(&mut store, "other-session", "elsewhere", JUDGEMENT_DEBT_AFTER);
         let scope = started_now(&store, "this-session");
 
@@ -4568,8 +5903,8 @@ mod tests {
     #[test]
     fn nothing_that_fires_after_the_evaluation_started_can_add_to_its_list() {
         let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "s", "l", "a", &light_command_rule("owed-before", "f")).unwrap();
-        declare(&mut store, "s", "l", "a", &light_command_rule("remember-bound", "f")).unwrap();
+        declare_noted(&mut store, &light_command_rule("owed-before", "f"));
+        declare_noted(&mut store, &light_command_rule("remember-bound", "f"));
         serve_in(&mut store, "eval-session", "owed-before", JUDGEMENT_DEBT_AFTER);
         serve_in(&mut store, "eval-session", "remember-bound", JUDGEMENT_DEBT_AFTER - 1);
         let scope = started_now(&store, "eval-session");
@@ -4592,7 +5927,7 @@ mod tests {
     #[test]
     fn a_skip_with_a_reason_settles_an_item_for_this_filing_only() {
         let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "s", "l", "a", &light_command_rule("unsure", "n")).unwrap();
+        declare_noted(&mut store, &light_command_rule("unsure", "n"));
         serve_in(&mut store, "eval-session", "unsure", JUDGEMENT_DEBT_AFTER);
         let scope = started_now(&store, "eval-session");
 
@@ -4611,17 +5946,16 @@ mod tests {
     #[test]
     fn a_filing_with_no_known_session_demands_no_verdict() {
         let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "s", "l", "a", &light_command_rule("owed-x", "x")).unwrap();
+        declare_noted(&mut store, &light_command_rule("owed-x", "x"));
         serve_n(&mut store, "owed-x", ASSISTANT_DELIVERY_ACTOR, JUDGEMENT_DEBT_AFTER);
         declare(&mut store, "s", "l", "a", &eval_report("eval-x-1", "x")).expect("no session known, no verdict demanded");
     }
 
-    /// The smaller half of 2026-09-26: a reason that passes both the shape
-    /// and the content rule still settles nothing on a rule whose history
-    /// never carried a check. Once the log shows a check was tried on it,
-    /// the same reason counts.
+    /// Since step 8 a reason tag settles NOTHING, before or after a check was
+    /// tried (K14): the trial decides whether a rule can have a tooth. The
+    /// same rule, put on the note track by a trial record, settles.
     #[test]
-    fn a_no_literal_reason_settles_a_heavy_rule_only_after_a_check_was_tried() {
+    fn a_no_literal_reason_settles_nothing_and_a_note_verdict_settles() {
         let mut store = EventStore::in_memory().unwrap();
         declare(&mut store, "s", "l", "a", &eval_report("eval-t-old", "t")).unwrap();
         let mut rule = heavy_command_rule("never-tried", "t");
@@ -4632,14 +5966,17 @@ mod tests {
 
         let err = declare(&mut store, "s", "l", "a", &eval_report("eval-t-new", "t")).unwrap_err();
         let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
-        assert!(refusal.problem.contains("'never-tried'"), "untried, so the reason is no answer yet: {}", refusal.problem);
+        assert!(refusal.problem.contains("'never-tried'"), "a reason is no answer: {}", refusal.problem);
 
-        // The history now shows a check was attached once, and later
-        // removed with the same reason: the try is on record.
+        // A check tried once and given up again: the reason still settles
+        // nothing (the old "after a real try" arm is gone).
         try_a_check_then_give_it_up(&mut store, &rule);
-        assert!(ids_whose_check_was_tried(&store).contains("never-tried"));
-        assert!(show(&store, "never-tried").unwrap().check.is_none(), "the rule itself carries no check now");
-        declare(&mut store, "s", "l", "a", &eval_report("eval-t-new", "t")).expect("tried, and the reason quotes the legitimate call");
+        let err = declare(&mut store, "s", "l", "a", &eval_report("eval-t-new", "t")).unwrap_err();
+        assert!(err.to_string().contains("'never-tried'"), "{err}");
+
+        settle_by_naming_the_trigger(&mut store, "never-tried");
+        assert_eq!(current_verdict(&store, "never-tried"), CurrentVerdict::Note);
+        declare(&mut store, "s", "l", "a", &eval_report("eval-t-new", "t")).expect("a note verdict settles the rule");
     }
 
     /// THE SCOPE THIS CONDITION ACTUALLY HAS, stated where it is enforced. An
@@ -4685,7 +6022,7 @@ mod tests {
         let existing = show(&store, "boxed-heavy").unwrap();
         let mut labelled = existing.clone();
         labelled.tags.push(TEETH_INFORMING_TAG.to_string());
-        revise(&mut store, "s", "l", "a", &existing, &labelled).unwrap();
+        legacy_revise(&mut store, &labelled);
         serve_n(&mut store, "boxed-heavy", "hook", 1);
 
         let err = declare(&mut store, "s", "l", "a", &eval_report("eval-r-new", "r")).unwrap_err();
@@ -4708,14 +6045,19 @@ mod tests {
         }
     }
 
+    /// Settle a heavy rule the one way a checkless rule settles since step 8
+    /// of the two tracks: THOR's trial put it on the note track - a revise
+    /// carrying a Note record, the check cleared and the label `teeth:note`
+    /// (a reason tag settles nothing any more).
     fn settle_by_naming_the_trigger(store: &mut EventStore, id: &str) {
         let existing = show(store, id).unwrap();
-        let mut settled = existing.clone();
-        settled.tags = vec![format!(
-            "{}an authorised fixture-command-{id} run is typed exactly like a wrong one",
-            NO_CATCH_ON_COMMAND_REASON_PREFIX
-        )];
-        try_a_check_then_give_it_up(store, &settled);
+        let mut noted = existing.clone();
+        noted.check = None;
+        noted.tags = vec![TEETH_NOTE_TAG.to_string()];
+        let record = TrialRecord::seal(trial_fields(&noted, RecordedVerdict::Note));
+        let baseline = gate::ClearedFields { check: true, ..Default::default() }.baseline(&existing);
+        revise_tried_scoped(store, "s", "l", "a", &baseline, &noted, &existing, Some("fixture: the trial found no tooth"), None, Some(&record), None)
+            .unwrap();
     }
 
     fn filing_refusal(store: &mut EventStore, report: &str, project: &str) -> Option<String> {
@@ -4756,20 +6098,39 @@ mod tests {
         for id in rest {
             assert!(!problem.contains(&format!("'{id}'")), "{id} is beyond the batch: {problem}");
         }
-        assert!(problem.contains("4 more heavy rule(s)"), "the rest must be counted, not hidden: {problem}");
+        assert!(problem.contains("4 more rule(s)"), "the rest must be counted, not hidden: {problem}");
 
         for id in batch {
             settle_by_naming_the_trigger(&mut store, id);
         }
-        assert_eq!(filing_refusal(&mut store, "eval-w-1", "w"), None, "a settled batch must let the report through");
+        // UPDATED FOR CHANGE 3 (2026-09-27): a settled rule no longer takes a
+        // place, so the 4 left behind - only 4 owed candidates now, well
+        // inside the cap of 8 - move into `owed_now` for THIS SAME filing the
+        // moment the first 8 clear, rather than waiting for a later report's
+        // own cutoff. Settling only the named 8 therefore no longer lets this
+        // report through; every one of the 12 still has to be settled first.
+        let problem = filing_refusal(&mut store, "eval-w-1", "w").expect("the 4 left behind are still owed");
+        for id in rest {
+            assert!(problem.contains(&format!("'{id}'")), "the 4 left behind must now be named too: {problem}");
+        }
+        for id in rest {
+            settle_by_naming_the_trigger(&mut store, id);
+        }
+        assert_eq!(filing_refusal(&mut store, "eval-w-1", "w"), None, "a fully settled pool must let the report through");
         let owed: Vec<String> = evaluation_teeth_batch(&store, Some("w")).owed_now.into_iter().map(|(id, _)| id).collect();
         assert!(owed.is_empty(), "nothing has fired since the new report: {owed:?}");
     }
 
-    /// Settling one rule of the batch never pulls the next one in: the batch
-    /// holds still while an evaluation works through it.
+    /// UPDATED FOR CHANGE 3 (2026-09-27): settling one rule of the batch now
+    /// DOES pull the next one in, on purpose - see `teeth_batch_since`'s own
+    /// doc comment, "A SETTLED RULE NEVER TAKES A PLACE" / "CONSEQUENCE,
+    /// NAMED SO NOBODY IS SURPRISED BY IT". Of 10 fired rules, settling the
+    /// first leaves 9 owed; the cap of 8 now applies to THOSE 9 alone, so the
+    /// 8th-oldest of them (`ids[8]`, previously left for a later report)
+    /// moves into `owed_now` for this same filing, and only the 9th
+    /// (`ids[9]`) still waits.
     #[test]
-    fn settling_a_batch_member_does_not_pull_the_next_rule_in() {
+    fn settling_a_batch_member_pulls_the_next_owed_rule_in() {
         let mut store = EventStore::in_memory().unwrap();
         declare(&mut store, "s", "l", "a", &eval_report("eval-s-0", "s")).unwrap();
         let ids = unsettled_fired_rules(&mut store, "s", 10);
@@ -4778,29 +6139,44 @@ mod tests {
         let batch = evaluation_teeth_batch(&store, Some("s"));
         assert_eq!(batch.settled, vec![ids[0].clone()]);
         let owed: Vec<&str> = batch.owed_now.iter().map(|(id, _)| id.as_str()).collect();
-        assert_eq!(owed, ids[1..EVALUATION_TEETH_BATCH].iter().map(String::as_str).collect::<Vec<_>>());
-        assert_eq!(batch.owed_later.len(), 2);
+        assert_eq!(owed, ids[1..=EVALUATION_TEETH_BATCH].iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(batch.owed_later.len(), 1);
+        assert_eq!(batch.owed_later[0].0, ids[9]);
     }
 
-    /// The next filing asks for what the last one left, first.
+    /// UPDATED FOR CHANGE 3 (2026-09-27): a report can only file once EVERY
+    /// candidate it fired is settled - a settled one no longer wastes a
+    /// place that would otherwise defer an owed one to `owed_later` (see
+    /// `teeth_batch_since`'s own doc comment), so `owed_now` always surfaces
+    /// up to `EVALUATION_TEETH_BATCH` of whatever is CURRENTLY owed. Settling
+    /// only the first 8 of 11 therefore no longer lets `eval-r1` through -
+    /// all 11 have to be settled first. What still holds, and is what this
+    /// test now proves: once that report is filed, a FRESH batch of rules
+    /// that fire afterwards is still asked oldest-write-first, with a rule
+    /// written even later waiting behind them.
     #[test]
     fn the_next_filing_asks_first_for_what_the_last_one_left() {
         let mut store = EventStore::in_memory().unwrap();
         declare(&mut store, "s", "l", "a", &eval_report("eval-r0", "rot")).unwrap();
         let ids = unsettled_fired_rules(&mut store, "rot", 11);
-        for id in &ids[..EVALUATION_TEETH_BATCH] {
+        for id in &ids {
             settle_by_naming_the_trigger(&mut store, id);
         }
         declare(&mut store, "s", "l", "a", &eval_report("eval-r1", "rot")).unwrap();
-        // Every rule fires again, and one more heavy rule is written after the
-        // report: the three left behind lead, and the new one waits behind.
+
+        // A fresh batch, written and fired only after `eval-r1` - oldest
+        // first, and a rule written later waits behind the older ones.
+        let fresh_ids: Vec<String> = (0..3).map(|i| format!("v-{i:02}")).collect();
+        for id in &fresh_ids {
+            legacy_thinly_answered(&mut store, id, Some("rot"));
+        }
         legacy_thinly_answered(&mut store, "z-newer", Some("rot"));
-        for id in ids.iter().map(String::as_str).chain(["z-newer"]) {
+        for id in fresh_ids.iter().map(String::as_str).chain(["z-newer"]) {
             serve_n(&mut store, id, "hook", 1);
         }
         let batch = evaluation_teeth_batch(&store, Some("rot"));
         let owed: Vec<&str> = batch.owed_now.iter().map(|(id, _)| id.as_str()).collect();
-        assert_eq!(owed, vec!["w-08", "w-09", "w-10", "z-newer"], "left-behind rules first, then the newer one");
+        assert_eq!(owed, vec!["v-00", "v-01", "v-02", "z-newer"], "oldest write first, the newer one waits behind");
         assert!(batch.settled.is_empty(), "rules settled before the previous report take no place: {:?}", batch.settled);
     }
 
@@ -4816,7 +6192,7 @@ mod tests {
                 NO_CATCH_ON_COMMAND_REASON_PREFIX
             )];
             declare(&mut store, "s", "l", "a", &settled).unwrap();
-            try_a_check_then_give_it_up(&mut store, &settled);
+            settle_by_naming_the_trigger(&mut store, &settled.id);
         }
         declare(&mut store, "s", "l", "a", &eval_report("eval-k-0", "k")).unwrap();
         let ids = unsettled_fired_rules(&mut store, "k", 3);
@@ -4829,10 +6205,11 @@ mod tests {
         assert!(batch.settled.is_empty(), "{:?}", batch.settled);
     }
 
-    /// A reason a reader can check against the rule - it names the rule's own
-    /// command - settles it: that is the clear proof it cannot have a tooth.
+    /// Since step 8 a reason that names the rule's own command settles
+    /// NOTHING, before or after a check was tried (K14) - THOR's trial
+    /// decides. The same rule on the note track settles.
     #[test]
-    fn a_reason_that_names_the_trigger_settles_a_fired_heavy_rule() {
+    fn a_reason_that_names_the_trigger_no_longer_settles_and_a_note_does() {
         let mut store = EventStore::in_memory().unwrap();
         declare(&mut store, "s", "l", "a", &eval_report("eval-n-old", "n")).unwrap();
         let mut heavy = heavy_command_rule("named-heavy", "n");
@@ -4842,53 +6219,231 @@ mod tests {
         )];
         declare(&mut store, "s", "l", "a", &heavy).unwrap();
         serve_n(&mut store, "named-heavy", "hook", 1);
+        assert!(declare(&mut store, "s", "l", "a", &eval_report("eval-n-new", "n")).is_err(), "a reason is no answer");
+        try_a_check_then_give_it_up(&mut store, &heavy);
         assert!(
             declare(&mut store, "s", "l", "a", &eval_report("eval-n-new", "n")).is_err(),
-            "the reason alone, with no check ever tried, is not the answer yet"
+            "not after a try either"
         );
-        try_a_check_then_give_it_up(&mut store, &heavy);
-        declare(&mut store, "s", "l", "a", &eval_report("eval-n-new", "n")).expect("a real reason after a real try settles it");
+        settle_by_naming_the_trigger(&mut store, "named-heavy");
+        declare(&mut store, "s", "l", "a", &eval_report("eval-n-new", "n")).expect("a note verdict settles it");
     }
-
-    /// A check that is wired but has not met a real call yet settles the
-    /// filing only when an open point carries it by name - the honest "still
-    /// to be proven" the next evaluation has to close. A proven label settles
-    /// it on its own.
+    /// Step 9, the one reader: no label, reason or open point settles a rule
+    /// any more - not `teeth:proven-guard`, not `teeth:wired-not-proven`, not
+    /// an old engine's `teeth:informing`/`not-tried`/`refuses-legitimate-use`
+    /// /`anchor-collapsed`, not a no-literal reason, not an answer-guard tag,
+    /// and not an open point naming it. Only a current verdict does.
     #[test]
-    fn a_wired_check_settles_only_when_an_open_point_names_it_and_a_proven_one_settles_alone() {
+    fn settlement_ignores_tags_and_reasons() {
         let mut store = EventStore::in_memory().unwrap();
         declare(&mut store, "s", "l", "a", &eval_report("eval-w9-old", "w9")).unwrap();
-        let mut wired = heavy_command_rule("wired-heavy", "w9");
-        wired.tags = vec![TEETH_WIRED_TAG.to_string()];
-        wired.check = Some(Check::Forbidden { literals: vec!["--force".to_string()] });
-        declare(&mut store, "s", "l", "a", &wired).unwrap();
-        let mut proven = heavy_command_rule("proven-heavy", "w9");
-        proven.tags = vec![TEETH_PROVEN_TAG.to_string()];
-        proven.check = Some(Check::Forbidden { literals: vec!["--mirror".to_string()] });
-        declare(&mut store, "s", "l", "a", &proven).unwrap();
-        serve_n(&mut store, "wired-heavy", "hook", 1);
-        serve_n(&mut store, "proven-heavy", "hook", 1);
-
+        let labels = [
+            TEETH_PROVEN_TAG.to_string(),
+            TEETH_WIRED_TAG.to_string(),
+            TEETH_INFORMING_TAG.to_string(),
+            TEETH_NOT_TRIED_TAG.to_string(),
+            TEETH_REFUSES_LEGITIMATE_TAG.to_string(),
+            TEETH_ANCHOR_COLLAPSED_TAG.to_string(),
+            format!("{NO_LITERAL_REASON_PREFIX}an authorised run of this command reads exactly like a wrong one"),
+            format!("{ANSWER_GUARD_TAG_PREFIX}some-rulebook-entry"),
+        ];
+        let mut ids = Vec::new();
+        for (i, label) in labels.iter().enumerate() {
+            let mut rule = heavy_command_rule(&format!("labelled-{i}"), "w9");
+            rule.text = format!("fixture heavy rule labelled-{i}: never with --force");
+            rule.tags = vec![label.clone()];
+            rule.check = Some(Check::Forbidden { literals: vec!["--force".to_string()] });
+            legacy(&mut store, &rule);
+            serve_n(&mut store, &rule.id, "hook", 1);
+            assert!(settlement(&store, &rule.id).is_owed(), "{label} settles nothing: {:?}", settlement(&store, &rule.id));
+            ids.push(rule.id);
+        }
+        let mut point = open_point("open-labelled", "w9");
+        point.text = format!("{} still has to refuse a real --force push", ids.join(", "));
+        declare(&mut store, "s", "l", "a", &point).unwrap();
         let err = declare(&mut store, "s", "l", "a", &eval_report("eval-w9-new", "w9")).unwrap_err();
         let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
-        assert!(refusal.problem.contains("wired-heavy") && !refusal.problem.contains("proven-heavy"), "{}", refusal.problem);
+        for id in &ids {
+            assert!(refusal.problem.contains(&format!("'{id}'")), "an open point carries nothing: {}", refusal.problem);
+        }
 
-        let mut point = open_point("open-wired", "w9");
-        point.text = "wired-heavy still has to refuse a real --force push".to_string();
-        declare(&mut store, "s", "l", "a", &point).unwrap();
-        declare(&mut store, "s", "l", "a", &eval_report("eval-w9-new", "w9")).expect("the open point carries it");
+        // Green: the same rules with a verdict of THOR's trial settle.
+        for id in &ids {
+            let rule = show(&store, id).unwrap();
+            let record = sealed(&rule, RecordedVerdict::RuleWired);
+            revise_tried_scoped(&mut store, "s", "l", "a", &rule, &rule, &rule, None, None, Some(&record), None).unwrap();
+            assert_eq!(settlement(&store, id), Settlement::Settled(Settled::Rule { proven: false }));
+        }
+        declare(&mut store, "s", "l", "a", &eval_report("eval-w9-new", "w9")).expect("verdicts settle them");
     }
 
+    /// A verdict counts only while the rule is the one tried: a rewrite of
+    /// its text makes it owed again, with the reason named.
     #[test]
-    fn a_heavy_rule_that_never_fired_since_the_previous_report_is_never_named() {
+    fn settlement_resets_when_the_rule_is_rewritten() {
+        let mut store = EventStore::in_memory().unwrap();
+        let rule = force_push_rule("rewritten");
+        declare_tried(&mut store, &rule, &sealed(&rule, RecordedVerdict::RuleWired));
+        assert_eq!(settlement(&store, "rewritten"), Settlement::Settled(Settled::Rule { proven: false }));
+        let mut changed = rule.clone();
+        changed.text = "Never run `git push --force`, not even on a branch of your own.".to_string();
+        legacy_revise(&mut store, &changed);
+        assert_eq!(
+            settlement(&store, "rewritten"),
+            Settlement::Owed { why: "its text changed after its last trial".to_string() }
+        );
+        // Back to the text it was tried with: the same record counts again.
+        legacy_revise(&mut store, &rule);
+        assert_eq!(settlement(&store, "rewritten"), Settlement::Settled(Settled::Rule { proven: false }));
+    }
+
+    /// D8: lowering a heavy rule's severity (a raw fixture event, the shape
+    /// any bin can write) never takes it out of rot - the severity is part of
+    /// the fingerprint, so a settled rule is owed again, and an owed one
+    /// stays owed and stays in the filing's batch, light or not.
+    #[test]
+    fn lowering_severity_never_takes_a_rule_out_of_rot() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "s", "l", "a", &eval_report("eval-ls-old", "ls")).unwrap();
+        let mut noted = heavy_command_rule("noted-heavy", "ls");
+        noted.tags = vec![];
+        declare_noted(&mut store, &noted);
+        assert!(!settlement(&store, "noted-heavy").is_owed());
+        let mut lowered = noted.clone();
+        lowered.severity = None;
+        legacy_revise(&mut store, &lowered);
+        assert_eq!(
+            settlement(&store, "noted-heavy"),
+            Settlement::Owed { why: "its severity changed after its last trial".to_string() }
+        );
+
+        legacy_thinly_answered(&mut store, "owed-heavy", Some("ls"));
+        let mut light = show(&store, "owed-heavy").unwrap();
+        light.severity = None;
+        legacy_revise(&mut store, &light);
+        assert!(settlement(&store, "owed-heavy").is_owed());
+        let owed: Vec<String> = evaluation_teeth_batch(&store, Some("ls")).owed_now.into_iter().map(|(id, _)| id).collect();
+        assert!(owed.contains(&"owed-heavy".to_string()) && owed.contains(&"noted-heavy".to_string()), "{owed:?}");
+    }
+
+    /// F9: a file check of a project with no usable registered working copy
+    /// is settled while that blocker holds - it takes no batch place, since
+    /// nothing the agent runs settles it - and owed again the moment the
+    /// project is registered. A contains literal missing from the registered
+    /// working tree while the default branch still has it blocks the same
+    /// way, until the tree has it again. A global rule's file check is never
+    /// blocked: it needs a project, which the agent can give it.
+    #[test]
+    fn a_blocked_rule_is_settled_only_while_its_blocker_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "s", "l", "a", &eval_report("eval-gamma-old", "gamma")).unwrap();
+        let mut rule = heavy_command_rule("gamma-keeps", "gamma");
+        rule.text = "NOTES.md must keep the line `keep me`.".to_string();
+        rule.tags = vec![];
+        rule.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "NOTES.md".to_string() }];
+        rule.check = Some(Check::Contains { path: "NOTES.md".to_string(), literal: "keep me".to_string() });
+        legacy(&mut store, &rule);
+        serve_n(&mut store, "gamma-keeps", "hook", 1);
+        assert_eq!(
+            settlement(&store, "gamma-keeps"),
+            Settlement::Settled(Settled::Blocked(Blocker::NoWorkingCopy { project: "gamma".to_string() }))
+        );
+        declare(&mut store, "s", "l", "a", &eval_report("eval-gamma-1", "gamma")).expect("a blocked rule holds no filing");
+
+        // Registered: a real checkout named gamma, NOTES.md committed on main.
+        let checkout = dir.path().join("gamma");
+        std::fs::create_dir_all(&checkout).unwrap();
+        let hooks = dir.path().join("no-hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git").arg("-C").arg(&checkout).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "core.hooksPath", hooks.to_str().unwrap()]);
+        git(&["config", "user.email", "fixture@example.invalid"]);
+        git(&["config", "user.name", "fixture"]);
+        std::fs::write(checkout.join("NOTES.md"), "keep me\nplain line\n").unwrap();
+        git(&["add", "NOTES.md"]);
+        git(&["commit", "-q", "-m", "notes"]);
+        let record = project_record("gamma");
+        let body = body_with_root(&canonical_body(&record).unwrap(), checkout.to_str().unwrap(), "2026-09-29T00:00:00Z").unwrap();
+        store.append_event("install", "install", INSTALLER_ACTOR, EventKind::FactCreated, &record.id, None, &body).unwrap();
+        assert!(settlement(&store, "gamma-keeps").is_owed(), "registered: owed again");
+        let err = declare(&mut store, "s", "l", "a", &eval_report("eval-gamma-2", "gamma")).unwrap_err();
+        assert!(err.to_string().contains("'gamma-keeps'"), "{err}");
+
+        // Mid-change in the owner's checkout: the default branch still has it.
+        std::fs::write(checkout.join("NOTES.md"), "plain line\n").unwrap();
+        assert_eq!(
+            settlement(&store, "gamma-keeps"),
+            Settlement::Settled(Settled::Blocked(Blocker::WorkingTreeDiffers { path: "NOTES.md".to_string() }))
+        );
+        std::fs::write(checkout.join("NOTES.md"), "keep me\nplain line\n").unwrap();
+        assert!(settlement(&store, "gamma-keeps").is_owed(), "the tree has it again: owed");
+
+        // A global rule's file check: never blocked.
+        let mut global = rule.clone();
+        global.id = "global-keeps".to_string();
+        global.project = None;
+        legacy(&mut store, &global);
+        assert!(settlement(&store, "global-keeps").is_owed());
+    }
+
+    /// Retracted, or taken off the rule track: settled; a rule with a note
+    /// verdict by dispute or with a pending check: settled as such.
+    #[test]
+    fn a_retracted_or_archived_rule_and_every_note_shape_are_settled() {
+        let mut store = EventStore::in_memory().unwrap();
+        legacy_thinly_answered(&mut store, "to-retract", Some("rt"));
+        retract(&mut store, "s", "l", "a", "to-retract", "fixture-command-to-retract no longer exists").unwrap();
+        assert_eq!(settlement(&store, "to-retract"), Settlement::Settled(Settled::Retracted));
+
+        let mut report = heavy_command_rule("now-a-report", "rt");
+        report.kind = Kind::Report;
+        report.bindings = vec![];
+        report.severity = None;
+        report.tags = vec![];
+        legacy(&mut store, &report);
+        assert_eq!(settlement(&store, "now-a-report"), Settlement::Settled(Settled::OffTheRuleTrack));
+
+        let mut disputed = heavy_command_rule("disputed", "rt");
+        disputed.tags = vec![];
+        let mut fields = trial_fields(&disputed, RecordedVerdict::Note);
+        fields.disputes.legitimate_calls = vec!["fixture-command-disputed --dry-run".to_string()];
+        fields.pending = Some(PendingCheck {
+            check: Check::Contains { path: "NOTES.md".to_string(), literal: "x".to_string() },
+            why: PendingWhy::NoWorkingCopy,
+        });
+        declare_tried(&mut store, &disputed, &TrialRecord::seal(fields));
+        assert_eq!(
+            settlement(&store, "disputed"),
+            Settlement::Settled(Settled::Note { pending: Some(PendingWhy::NoWorkingCopy), by_dispute: true })
+        );
+    }
+
+    /// UPDATED FOR CHANGE 3 (2026-09-27), REVERSED ON PURPOSE - see
+    /// `teeth_batch_since`'s own doc comment, "THE BATCH MUST ALSO REACH A
+    /// RULE THAT NEVER FIRES". This used to prove the opposite: an unfired
+    /// heavy rule could never hold up filing at all, which was measured to
+    /// leave about 126 of roughly 260 heavy rules permanently unreachable by
+    /// any evaluation. It now DOES hold up filing, exactly like a rule that
+    /// fired and is owed - it simply fills a place from the second pool.
+    #[test]
+    fn a_heavy_rule_that_never_fired_since_the_previous_report_now_fills_a_place() {
         let mut store = EventStore::in_memory().unwrap();
         declare(&mut store, "s", "l", "a", &eval_report("eval-t-old", "t")).unwrap();
-        // Declared AFTER the previous report but never actually served -
-        // must not be treated as owing a fresh box.
+        // Declared after the previous report and never served at all.
         declare(&mut store, "s", "l", "a", &heavy_command_rule("never-fired", "t")).unwrap();
 
-        declare(&mut store, "s", "l", "a", &eval_report("eval-t-new", "t"))
-            .expect("an unfired heavy rule must never hold up filing");
+        let err = declare(&mut store, "s", "l", "a", &eval_report("eval-t-new", "t")).unwrap_err();
+        let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
+        assert!(refusal.problem.contains("never-fired"), "{}", refusal.problem);
+        assert!(refusal.problem.contains("did not fire since the previous report"), "{}", refusal.problem);
+
+        settle_by_naming_the_trigger(&mut store, "never-fired");
+        declare(&mut store, "s", "l", "a", &eval_report("eval-t-newer", "t")).expect("settled, so it fills its place cleanly");
     }
 
     #[test]
@@ -4987,6 +6542,52 @@ mod tests {
         assert!(revise(&mut store, "s", "l", "a", &now, &uncarried).is_err(), "lowering the carry must be refused");
     }
 
+    /// CHANGE 4 (2026-09-27): retracting a carried open point and filing a
+    /// fresh one under a new id, naming the same rule, must not reset the
+    /// carry count to zero - see `check_open_point_carry_inherited`'s own
+    /// doc comment. Measured on a copy of a real store: 12 open points carry
+    /// an id ending `-2`, and for every one the original was retracted
+    /// first, exactly this shape.
+    #[test]
+    fn retracting_a_carried_open_point_and_filing_a_new_one_about_the_same_rule_inherits_the_carry() {
+        let mut store = EventStore::in_memory().unwrap();
+        // A real live rule the open point's own text can name - settled by a
+        // Note verdict, so it cannot confuse this test with a second,
+        // unrelated refusal.
+        declare_noted(&mut store, &light_command_rule("carry-rule", "cr"));
+
+        let mut point = open_point("open-carry-rule", "cr");
+        point.text = "carry-rule still needs a real refusal through the real hook".to_string();
+        declare(&mut store, "s", "l", "a", &point).unwrap();
+        declare(&mut store, "s", "l", "a", &eval_report("eval-cr-1", "cr")).unwrap();
+        let existing = show(&store, "open-carry-rule").unwrap();
+        let mut carried = existing.clone();
+        carried.tags.push(format!("{OPEN_POINT_CARRIED_PREFIX}1"));
+        revise(&mut store, "s", "l", "a", &existing, &carried).unwrap();
+        retract(&mut store, "s", "l", "a", "open-carry-rule", "closing it to reopen fresh").unwrap();
+
+        // A brand-new id, same rule named, carrying nothing of its own.
+        let mut fresh = open_point("open-carry-rule-2", "cr");
+        fresh.text = "carry-rule still has not met a real call".to_string();
+        let err = declare(&mut store, "s", "l", "a", &fresh).unwrap_err();
+        let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
+        assert!(refusal.problem.contains("carry-rule"), "{}", refusal.problem);
+        assert!(refusal.problem.contains("carried forward 1 time"), "{}", refusal.problem);
+
+        // Starting it at the inherited count is accepted.
+        fresh.tags.push(format!("{OPEN_POINT_CARRIED_PREFIX}1"));
+        declare(&mut store, "s", "l", "a", &fresh).expect("starting at the inherited count must be accepted");
+
+        // And ground 30 still refuses carrying THIS one past 1, exactly as
+        // it always has - the fix closes the cross-entity gap, never
+        // ground 30's own limit.
+        let fresh_existing = show(&store, "open-carry-rule-2").unwrap();
+        let mut over = fresh_existing.clone();
+        over.tags.retain(|t| !t.starts_with(OPEN_POINT_CARRIED_PREFIX));
+        over.tags.push(format!("{OPEN_POINT_CARRIED_PREFIX}2"));
+        assert!(revise(&mut store, "s", "l", "a", &fresh_existing, &over).is_err(), "a second carry still needs the owner");
+    }
+
     /// D (2026-09-26): an evaluation report already filed for ANOTHER
     /// project, moved onto this one, is a filing for this one - through both
     /// revise doors.
@@ -5002,11 +6603,11 @@ mod tests {
         moved.project = Some("dd".to_string());
         let err = revise(&mut store, "s", "l", "a", &filed, &moved).unwrap_err();
         let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
-        assert!(refusal.problem.contains("neither a real tooth"), "{}", refusal.problem);
+        assert!(refusal.problem.contains("no current verdict from THOR's trial"), "{}", refusal.problem);
 
         let err = revise_because(&mut store, "s", "l", "a", &filed, &moved, &filed, None).unwrap_err();
         let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
-        assert!(refusal.problem.contains("neither a real tooth"), "the assistant's own revise door too: {}", refusal.problem);
+        assert!(refusal.problem.contains("no current verdict from THOR's trial"), "the assistant's own revise door too: {}", refusal.problem);
         assert_eq!(show(&store, "eval-elsewhere").unwrap().project.as_deref(), Some("other"), "nothing moved");
     }
 
@@ -5015,7 +6616,7 @@ mod tests {
     #[test]
     fn tagging_a_report_through_the_assistants_revise_door_is_gated() {
         let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "s", "l", "a", &light_command_rule("owed-e", "ee")).unwrap();
+        declare_noted(&mut store, &light_command_rule("owed-e", "ee"));
         serve_n(&mut store, "owed-e", ASSISTANT_DELIVERY_ACTOR, JUDGEMENT_DEBT_AFTER);
         let mut plain = eval_report("plain-e", "ee");
         plain.tags = vec!["notes".to_string()];
@@ -5052,6 +6653,22 @@ mod tests {
         store.append_event("legacy", &item.id, "migration", EventKind::FactCreated, &item.id, None, &body).unwrap();
     }
 
+    /// A raw `fact_revised`, the shape an older binary could have written -
+    /// for tests about what the log already holds, not about what a write
+    /// through the gate may do today.
+    fn legacy_revise(store: &mut EventStore, item: &Item) {
+        let body = serde_json::to_string(item).unwrap();
+        store.append_mutate_checked("legacy", &item.id, "migration", EventKind::FactRevised, &item.id, None, &body).unwrap();
+    }
+
+    /// A raw `fact_created` carrying a trial record, past every ground - for
+    /// a test about how a record is READ back (an A4 failure recorded by a
+    /// trial), never about what the gate lets in.
+    fn legacy_tried(store: &mut EventStore, item: &Item, trial: &TrialRecord) {
+        let body = body_with_trial(&canonical_body(item).unwrap(), trial).unwrap();
+        store.append_event("legacy", &item.id, "migration", EventKind::FactCreated, &item.id, None, &body).unwrap();
+    }
+
     fn wired_forbidden(id: &str, project: &str, literal: &str) -> Item {
         let mut item = heavy_command_rule(id, project);
         item.tags = vec![TEETH_WIRED_TAG.to_string()];
@@ -5059,60 +6676,175 @@ mod tests {
         item
     }
 
-    fn refused(store: &mut EventStore, id: &str, target: &str) {
-        let body = serde_json::json!({"at": "2026-09-27T00:00:00Z", "target": target}).to_string();
-        store.append_event("s", "l", "hook", EventKind::GateRefused, id, None, &body).unwrap();
+    /// A heavy Rule anchored to a file, carrying a `Contains` check on it -
+    /// the one kind `probe_both_sides_settle` may settle from a probe alone
+    /// (see that function's own doc comment). The binding is a `Path`, not
+    /// the `Command` `heavy_command_rule` starts from, so a fixture built
+    /// from this one is never mistaken for a command-anchored rule by
+    /// anything that reads `item.bindings`.
+    fn wired_contains(id: &str, project: &str, path: &str, literal: &str) -> Item {
+        let mut item = heavy_command_rule(id, project);
+        item.bindings = vec![Binding::Target { kind: TargetKind::Path, value: path.to_string() }];
+        item.tags = vec![TEETH_WIRED_TAG.to_string()];
+        item.check = Some(Check::Contains { path: path.to_string(), literal: literal.to_string() });
+        item
     }
 
-    /// Fix 2: the real hook refused a call under the check the rule carries
-    /// now. That is a tooth that bit, and it settles the filing without
-    /// anyone writing the rule again - the label is only recomputed on a
-    /// write, the log is read every time.
+    /// A Claude Code session id, the shape `serve::attest` requires.
+    const REAL_SESSION: &str = "0de7dc52-1b97-4b66-948f-61e4438043b2";
+
+    fn refused_in(store: &mut EventStore, session: &str, id: &str, target: &str) -> i64 {
+        let body = serde_json::json!({"at": "2026-09-27T00:00:00Z", "target": target, "tool_use_id": "toolu_fixture"})
+            .to_string();
+        store.append_event(session, session, "hook", EventKind::GateRefused, id, None, &body).unwrap().seq
+    }
+
+    fn served_in(store: &mut EventStore, session: &str, id: &str) {
+        store.append_event(session, session, "hook", EventKind::ItemServed, id, None, "{}").unwrap();
+    }
+
+    /// The verification `serve::attest` records for a refusal, written raw
+    /// the way a test writes any fixture event (a test holds no
+    /// `SystemActor`).
+    fn attested(store: &mut EventStore, session: &str, id: &str, refusal_seq: i64, field: bool) {
+        let body = serde_json::json!({"refusal_seq": refusal_seq, "field": field, "why": "fixture"}).to_string();
+        store.append_event(session, session, ATTESTER_ACTOR, EventKind::GateStoodAside, id, None, &body).unwrap();
+    }
+
+    /// Step 9: a refusal on record settles NOTHING - not an unverified one,
+    /// not one whose verification says no, and not even one verified as
+    /// field evidence from the session's own transcript. A refusal only sets
+    /// the "proven" label of a trial; the rule is settled by the trial's
+    /// verdict.
     #[test]
-    fn a_real_refusal_under_the_current_check_settles_the_filing_without_a_new_write() {
+    fn no_refusal_settles_anything_attested_or_not() {
         let mut store = EventStore::in_memory().unwrap();
         declare(&mut store, "s", "l", "a", &eval_report("eval-bit-old", "bit")).unwrap();
         legacy(&mut store, &wired_forbidden("bit-rule", "bit", "--force"));
-        serve_n(&mut store, "bit-rule", "hook", 1);
-        refused(&mut store, "bit-rule", "fixture-command-bit-rule --force");
-        declare(&mut store, "s", "l", "a", &eval_report("eval-bit-new", "bit"))
-            .expect("a check that really refused a call is proven, whatever its label says");
+        served_in(&mut store, REAL_SESSION, "bit-rule");
+        let seq = refused_in(&mut store, REAL_SESSION, "bit-rule", "fixture-command-bit-rule --force");
+        assert!(settlement(&store, "bit-rule").is_owed(), "unverified");
+        attested(&mut store, REAL_SESSION, "bit-rule", seq, true);
+        assert_eq!(attested_field_refusals(&store.get_all_events().unwrap()), HashSet::from([seq]));
+        assert!(settlement(&store, "bit-rule").is_owed(), "verified as field evidence, still no verdict");
+        let err = declare(&mut store, "s", "l", "a", &eval_report("eval-bit-new", "bit")).unwrap_err();
+        assert!(err.to_string().contains("'bit-rule'"), "{err}");
+
+        // A refusal under a non-hook actor, and one from a session with no
+        // other activity, are the same: nothing.
+        refused_in(&mut store, "lonely", "bit-rule", "fixture-command-bit-rule --force");
+        store
+            .append_event("s", "l", "probe", EventKind::GateRefused, "bit-rule", None, &serde_json::json!({"target": "x --force"}).to_string())
+            .unwrap();
+        assert!(settlement(&store, "bit-rule").is_owed());
+
+        // Green: the trial's verdict settles it.
+        let rule = show(&store, "bit-rule").unwrap();
+        let mut named = rule.clone();
+        named.text = "fixture heavy rule bit-rule: never with --force".to_string();
+        revise_tried_scoped(&mut store, "s", "l", "a", &rule, &named, &rule, None, None, Some(&sealed(&named, RecordedVerdict::RuleWired)), None)
+            .unwrap();
+        declare(&mut store, "s", "l", "a", &eval_report("eval-bit-new", "bit")).expect("the verdict settles it");
     }
 
-    /// Fix 2, the other side: a refusal earned under an OLDER check never
-    /// vouches for the one the rule carries now.
+    /// The writer of a verification: only THOR's attester, once per refusal.
+    /// A second verification of the same refusal appends nothing, and any
+    /// other system actor is refused before anything is read.
     #[test]
-    fn a_refusal_under_an_older_check_does_not_settle_the_filing() {
+    fn a_refusal_verification_is_recorded_by_the_attester_once() {
         let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "s", "l", "a", &eval_report("eval-oc-old", "oc")).unwrap();
-        legacy(&mut store, &wired_forbidden("oc-rule", "oc", "--force"));
-        refused(&mut store, "oc-rule", "fixture-command-oc-rule --force");
-        let before = wired_forbidden("oc-rule", "oc", "--force");
-        revise(&mut store, "s", "l", "a", &before, &wired_forbidden("oc-rule", "oc", "--mirror")).unwrap();
-        serve_n(&mut store, "oc-rule", "hook", 1);
-        let err = declare(&mut store, "s", "l", "a", &eval_report("eval-oc-new", "oc")).unwrap_err();
-        let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
-        assert!(refusal.problem.contains("oc-rule"), "{}", refusal.problem);
+        let before = store.get_all_events().unwrap().len();
+        let first = record_refusal_verification(&mut store, REAL_SESSION, SystemActor::new(ATTESTER_ACTOR), "r", 7, true, "held")
+            .unwrap();
+        assert!(first.is_some());
+        let again = record_refusal_verification(&mut store, REAL_SESSION, SystemActor::new(ATTESTER_ACTOR), "r", 7, false, "no")
+            .unwrap();
+        assert!(again.is_none(), "a refusal is verified once");
+        let wrong = record_refusal_verification(&mut store, REAL_SESSION, SystemActor::new("retest"), "r", 8, true, "x");
+        assert!(matches!(wrong, Err(WriteError::Refused(_))), "{wrong:?}");
+        let events = store.get_all_events().unwrap();
+        assert_eq!(events.len(), before + 1);
+        let verdicts = recorded_refusal_verdicts(&events);
+        assert_eq!(verdicts.get(&7), Some(&(true, "held".to_string())));
+        assert_eq!(attested_field_refusals(&events), HashSet::from([7]));
     }
 
-    /// Fix 1: the refusal says what an open point IS and how to file one -
-    /// kind, project, tag, id and text - and that it is never a tag on the
-    /// rule itself. Measured: two fresh sessions could not tell.
+    /// A verification written raw under any other actor is never read.
     #[test]
-    fn the_filing_refusal_says_exactly_how_to_file_an_open_point() {
+    fn only_the_attester_s_verdicts_are_read() {
         let mut store = EventStore::in_memory().unwrap();
+        let body = serde_json::json!({"refusal_seq": 3, "field": true, "why": "forged"}).to_string();
+        store.append_event("s", "s", "hook", EventKind::GateStoodAside, "r", None, &body).unwrap();
+        assert!(attested_field_refusals(&store.get_all_events().unwrap()).is_empty());
+    }
+
+    /// The trial's store holds exactly the item, as written, and nothing else.
+    #[test]
+    fn one_item_store_holds_exactly_the_item_as_written() {
+        let item = force_push_rule("solo");
+        let store = one_item_store(&item).unwrap();
+        assert_eq!(show(&store, "solo").unwrap(), item);
+        assert_eq!(store.get_all_events().unwrap().len(), 1);
+        assert!(store.item_binding_projection_current());
+    }
+
+    /// R9.10: an event of the retired probe (actor `teeth-probe`, both of its
+    /// sides holding - the receipt shape it used to write) settles nothing,
+    /// on a contains check too, and is never field evidence.
+    #[test]
+    fn a_probe_event_is_never_field_evidence() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "s", "l", "a", &eval_report("eval-co-old", "co")).unwrap();
+        // Global, so no missing working copy holds it (that would settle it
+        // as blocked): owed, and a probe changes nothing about that.
+        let mut rule = wired_contains("co-rule", "co", "NOTES.md", "keep me");
+        rule.project = None;
+        legacy(&mut store, &rule);
+        serve_n(&mut store, "co-rule", "hook", 1);
+        for kind in [EventKind::GateRefused, EventKind::GateStoodAside] {
+            store
+                .append_event(
+                    "probe-session",
+                    "probe-session",
+                    TEETH_PROBE_ACTOR,
+                    kind,
+                    "co-rule",
+                    None,
+                    &serde_json::json!({
+                        "at": "2026-09-27T00:00:00Z",
+                        "target": "probe-teeth co-rule",
+                        "forbidden_holds": true,
+                        "clean_holds": true,
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+        }
+        assert!(attested_field_refusals(&store.get_all_events().unwrap()).is_empty(), "never field evidence");
+        assert!(settlement(&store, "co-rule").is_owed(), "{:?}", settlement(&store, "co-rule"));
+        let err = declare(&mut store, "s", "l", "a", &eval_report("eval-co-new", "co")).unwrap_err();
+        assert!(err.to_string().contains("'co-rule'"), "the filing stays refused: {err}");
+    }
+
+    /// The filing refusal names the one command that decides each rule, on
+    /// the very store the refusing process has open (F7), and nothing that
+    /// no longer settles anything.
+    #[test]
+    fn the_filing_refusal_names_the_retest_command_on_this_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
         declare(&mut store, "s", "l", "a", &eval_report("eval-op-old", "op")).unwrap();
         legacy(&mut store, &wired_forbidden("op-rule", "op", "--force"));
         serve_n(&mut store, "op-rule", "hook", 1);
         let err = declare(&mut store, "s", "l", "a", &eval_report("eval-op-new", "op")).unwrap_err();
         let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
         let text = refusal.problem;
-        assert!(text.contains("never a tag on the rule"), "{text}");
-        assert!(text.contains("kind \"report\""), "{text}");
-        assert!(text.contains("project \"op\""), "{text}");
-        assert!(text.contains("tags [\"open-point\"]"), "{text}");
-        assert!(text.contains("names the rule's id"), "{text}");
-        assert!(text.contains("trial_check"), "{text}");
+        assert!(text.contains(&format!("--db \"{}\" retest --id 'op-rule'", db.display())), "{text}");
+        assert!(text.contains("--apply"), "{text}");
+        assert!(!text.contains("probe-teeth"), "a retired command is never named: {text}");
+        assert!(!text.contains("tags [\"open-point\"]"), "an open point settles nothing any more: {text}");
+        assert!(!text.contains("trial_check"), "no field that does not exist any more: {text}");
     }
 
     /// Fix 3: a reason saying nothing can catch the mistake never settles a
@@ -5132,7 +6864,6 @@ mod tests {
         let err = declare(&mut store, "s", "l", "a", &eval_report("eval-rc-new", "rc")).unwrap_err();
         let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
         assert!(refusal.problem.contains("rc-rule"), "{}", refusal.problem);
-        assert!(refusal.problem.contains("AND a reason"), "{}", refusal.problem);
     }
 
     /// Fix 3: the write gate refuses hanging a refusing check beside such a
@@ -5176,16 +6907,16 @@ mod tests {
         assert!(text.contains("kind \"report\""), "{text}");
     }
 
-    /// Fix 3: an open point carries any rule that hangs a check - also one
-    /// whose check cannot reach its file because that place is full - but
-    /// never a rule with no check at all, which owes a try first.
+    /// Step 9: an open point naming a rule carries nothing any more - with a
+    /// check or without one, the rule stays owed until THOR's trial decides
+    /// it.
     #[test]
-    fn an_open_point_carries_a_check_that_cannot_reach_but_never_a_rule_without_one() {
+    fn an_open_point_never_settles_a_rule_with_or_without_a_check() {
         let mut store = EventStore::in_memory().unwrap();
         declare(&mut store, "s", "l", "a", &eval_report("eval-ci-old", "ci")).unwrap();
         let mut informing = heavy_command_rule("ci-check", "ci");
         informing.tags = vec![TEETH_INFORMING_TAG.to_string()];
-        informing.check = Some(Check::AbsentAll { path: "deploy/watch.sh".to_string(), literals: vec!["up -d --build".to_string()] });
+        informing.check = Some(Check::Forbidden { literals: vec!["up -d --build".to_string()] });
         legacy(&mut store, &informing);
         let mut bare = heavy_command_rule("ci-bare", "ci");
         bare.tags = vec![TEETH_INFORMING_TAG.to_string()];
@@ -5197,27 +6928,1628 @@ mod tests {
         declare(&mut store, "s", "l", "a", &point).unwrap();
         let err = declare(&mut store, "s", "l", "a", &eval_report("eval-ci-new", "ci")).unwrap_err();
         let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
-        assert!(!refusal.problem.contains("'ci-check'"), "the open point carries the rule with a check: {}", refusal.problem);
-        assert!(refusal.problem.contains("'ci-bare'"), "a rule with no check owes a try first: {}", refusal.problem);
+        assert!(refusal.problem.contains("'ci-check'"), "{}", refusal.problem);
+        assert!(refusal.problem.contains("'ci-bare'"), "{}", refusal.problem);
     }
 
-    /// Fix 3: a check that was only TRIED on a revise counts as the try a
-    /// reason needs, and the tried check is never stored.
+    // ---------------------------------------------- the actor fence (D1, D2)
+
+    /// A project record the way the installer writes one - a Report, scoped
+    /// to its project, no binding.
+    fn project_record(key: &str) -> Item {
+        Item {
+            id: project_opened_id(key),
+            kind: Kind::Report,
+            text: format!("Project {key}: a fixture record of a registered working copy."),
+            bindings: Vec::new(),
+            severity: None,
+            project: Some(key.to_string()),
+            tags: vec!["project-record".to_string()],
+            expires: None,
+            key: None,
+            falsifier: None,
+            check: None,
+        }
+    }
+
+    fn installer() -> SystemActor {
+        SystemActor::new(INSTALLER_ACTOR)
+    }
+
+    /// THE LEAK THIS CLOSES (D1): the reserved names were refused by one
+    /// binary at a time, so any other caller of this module could write as
+    /// `eval-machine`. Now every public write function refuses a reserved
+    /// name passed as a plain string, before anything is read or appended -
+    /// `declare_scoped` called directly, as any bin would, included - and
+    /// THOR's own writer, holding a `SystemActor`, still gets through.
     #[test]
-    fn a_tried_check_counts_as_the_try_and_is_never_stored() {
+    fn a_reserved_actor_is_refused_at_the_store() {
+        for name in RESERVED_ACTORS {
+            let mut store = EventStore::in_memory().unwrap();
+            let item = sample_with(&format!("fenced-{name}"), "a fixture written under a name only THOR may use");
+            let err = declare_scoped(&mut store, "S1", "S1", *name, &item, None).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!("the actor name {name} is reserved for THOR itself - write without --actor, or with your own name")
+            );
+            assert!(store.get_all_events().unwrap().is_empty(), "{name}: a refused write must append nothing");
+        }
+
         let mut store = EventStore::in_memory().unwrap();
-        let mut item = heavy_command_rule("tried-rule", "tr");
-        item.tags = vec![format!("{}same text as 'fixture-command-tried-rule --dry-run' in a legitimate call", NO_CATCH_ON_COMMAND_REASON_PREFIX)];
-        legacy(&mut store, &item);
-        assert!(!ids_whose_check_was_tried(&store).contains("tried-rule"));
+        let item = sample();
+        declare(&mut store, "s", "l", "a", &item).unwrap();
+        let before = store.get_all_events().unwrap().len();
         let mut updated = item.clone();
-        updated.text = "fixture heavy rule tried-rule, reason after a try".to_string();
-        let tried = TriedCheck {
-            check: Check::Forbidden { literals: vec!["fixture-command-tried-rule".to_string()] },
-            outcome: "anchor collapsed".to_string(),
+        updated.text = "the config now lives in config/app.toml, read once at startup".to_string();
+        let reserved = "eval-machine";
+        let other = sample_with("other-id", "an entirely different fixture sentence");
+        let refusals: Vec<(&str, Result<Event, WriteError>)> = vec![
+            ("declare", declare(&mut store, "s", "l", reserved, &other)),
+            ("declare_in", declare_in(&mut store, "s", "l", reserved, &other, None)),
+            ("revise", revise(&mut store, "s", "l", reserved, &item, &updated)),
+            ("revise_because", revise_because(&mut store, "s", "l", reserved, &item, &updated, &item, None)),
+            (
+                "revise_because_scoped",
+                revise_because_scoped(&mut store, "s", "l", reserved, &item, &updated, &item, None, None),
+            ),
+            (
+                "revise_tried_scoped",
+                revise_tried_scoped(&mut store, "s", "l", reserved, &item, &updated, &item, None, None, None, None),
+            ),
+            ("archive", archive(&mut store, "s", "l", reserved, &item.id, "its subject is gone", None)),
+            (
+                "restore_deliberate_anchor",
+                restore_deliberate_anchor(&mut store, "s", "l", reserved, &item.id, Kind::Rule, "config/app.toml"),
+            ),
+            ("retract", retract(&mut store, "s", "l", reserved, &item.id, "a fixture retraction")),
+            ("resolve", resolve(&mut store, "s", "l", reserved, &item.id, "x", &[])),
+        ];
+        for (door, result) in refusals {
+            let err = result.expect_err(door);
+            assert!(err.to_string().contains("is reserved for THOR itself"), "{door}: {err}");
+        }
+        assert_eq!(store.get_all_events().unwrap().len(), before, "no door may append under a reserved name");
+
+        // THOR's own writer: the same name, carried as a token, is let through.
+        revise(&mut store, "s", "l", SystemActor::new(reserved), &item, &updated).expect("a SystemActor writes");
+        let head = history(&store, &item.id).unwrap().pop().unwrap();
+        assert_eq!(head.actor, reserved);
+    }
+
+    /// THE LEAK THIS CLOSES (D2): a retract through the tool server would
+    /// tombstone a project's record, and a tombstone can never be revised, so
+    /// no registration could ever land again. Every event on a reserved id
+    /// by any other actor - an ordinary name, or THOR's own token under the
+    /// wrong name - is refused with the sentence that names the one fix.
+    #[test]
+    fn a_reserved_id_refuses_every_other_actor() {
+        let mut store = EventStore::in_memory().unwrap();
+        let record = project_record("demo");
+
+        for actor in [WriteActor::Named("mcp"), WriteActor::System(SystemActor::new("teeth-eval"))] {
+            let err = declare(&mut store, "s", "l", actor, &record).unwrap_err().to_string();
+            assert!(err.contains("this record is THOR's own registration of a project's working copy"), "{err}");
+            assert!(err.contains("--register-root --db"), "the fix names the store to register in: {err}");
+        }
+        assert!(store.get_all_events().unwrap().is_empty());
+
+        declare_project_record(&mut store, &record, "C:/tmp/demo", "2026-09-28T10:00:00Z", installer()).unwrap();
+        let before = store.get_all_events().unwrap().len();
+        let mut changed = record.clone();
+        changed.tags.push("checkout-root:C:/tmp/copy".to_string());
+        let doors: Vec<(&str, Result<Event, WriteError>)> = vec![
+            ("revise", revise(&mut store, "mcp", "mcp", "mcp", &record, &changed)),
+            ("retract", retract(&mut store, "mcp", "mcp", "mcp", &record.id, "a project record nobody wants")),
+            ("archive", archive(&mut store, "mcp", "mcp", "mcp", &record.id, "moved", None)),
+            ("resolve", resolve(&mut store, "mcp", "mcp", "mcp", &record.id, "x", &[])),
+            (
+                "revise_project_root",
+                revise_project_root(&mut store, &record.id, "C:/tmp/copy", "2026-09-28T11:00:00Z", SystemActor::new("retest")),
+            ),
+        ];
+        for (door, result) in doors {
+            let err = result.expect_err(door).to_string();
+            assert!(err.contains("THOR's own registration"), "{door}: {err}");
+        }
+        assert_eq!(store.get_all_events().unwrap().len(), before, "no refused door may append");
+        assert!(show(&store, &record.id).is_ok(), "the record stays live");
+        assert_eq!(registered_root_raw(&store, "demo").unwrap().0, PathBuf::from("C:/tmp/demo"));
+
+        let mut fallback = project_record("gamma");
+        fallback.id = project_root_id("gamma");
+        assert!(declare(&mut store, "s", "l", "mcp", &fallback).is_err(), "root-by-install is reserved too");
+
+        let mut start = project_record("demo");
+        start.id = "evaluation-start-demo-1".to_string();
+        start.text = "A fixture evaluation start for demo.".to_string();
+        start.tags = Vec::new();
+        let err = declare(&mut store, "s", "l", "mcp", &start).unwrap_err().to_string();
+        assert!(err.contains("does not begin with 'evaluation-start-'"), "{err}");
+        declare(&mut store, "s", "l", SystemActor::new("eval-machine"), &start).expect("eval-machine writes its own start");
+
+        assert_eq!(reserved_id_owner("project-demo-notes"), None);
+        assert_eq!(reserved_id_owner("demo-opened-by-install"), None);
+        assert_eq!(reserved_id_owner("project-demo-opened-by-install"), Some(INSTALLER_ACTOR));
+    }
+
+    /// Only the installer's own events say where a working copy is. An event
+    /// by any other actor that carries a `"root"` key - a raw write from
+    /// before the fence, planted straight into the log - is ignored, before
+    /// and after a real registration; a record retracted before this build
+    /// is read from `project_root_id` instead.
+    #[test]
+    fn registered_root_raw_ignores_non_installer_events() {
+        let mut store = EventStore::in_memory().unwrap();
+        let record = project_record("demo");
+        declare(&mut store, "install", "install", installer(), &record).unwrap();
+        assert_eq!(registered_root_raw(&store, "demo"), None, "a record with no root registers nothing");
+
+        let forged = body_with_root(&canonical_body(&record).unwrap(), "C:/tmp/copy", "2026-09-28T10:00:00Z").unwrap();
+        store.append_mutate_checked("mcp", "mcp", "mcp", EventKind::FactRevised, &record.id, None, &forged).unwrap();
+        assert_eq!(registered_root_raw(&store, "demo"), None, "a root written by another actor never counts");
+
+        revise_project_root(&mut store, &record.id, "C:/tmp/demo", "2026-09-28T10:05:00Z", installer()).unwrap();
+        let (root, seq) = registered_root_raw(&store, "demo").unwrap();
+        assert_eq!(root, PathBuf::from("C:/tmp/demo"));
+
+        store.append_mutate_checked("mcp", "mcp", "mcp", EventKind::FactRevised, &record.id, None, &forged).unwrap();
+        assert_eq!(
+            registered_root_raw(&store, "demo"),
+            Some((PathBuf::from("C:/tmp/demo"), seq)),
+            "a later forgery moves nothing"
+        );
+        let regs = root_registrations(&store, "demo");
+        assert_eq!(regs.len(), 1);
+        assert_eq!(regs[0].at.as_deref(), Some("2026-09-28T10:05:00Z"));
+
+        // Retracted before this build (a raw tombstone, as the tool server could once write).
+        let mut old = EventStore::in_memory().unwrap();
+        let beta = project_record("beta");
+        declare(&mut old, "install", "install", installer(), &beta).unwrap();
+        revise_project_root(&mut old, &beta.id, "C:/tmp/beta-old", "2026-09-01T00:00:00Z", installer()).unwrap();
+        let tomb = serde_json::json!({ "retracted": beta.id, "reason": "a fixture retraction" }).to_string();
+        old.append_mutate_checked("mcp", "mcp", "mcp", EventKind::FactRetracted, &beta.id, None, &tomb).unwrap();
+        assert_eq!(registered_root_raw(&old, "beta"), None, "a tombstoned record's own events no longer count");
+        let mut fallback = project_record("beta");
+        fallback.id = project_root_id("beta");
+        declare_project_record(&mut old, &fallback, "C:/tmp/beta", "2026-09-28T10:00:00Z", installer()).unwrap();
+        assert_eq!(registered_root_raw(&old, "beta").unwrap().0, PathBuf::from("C:/tmp/beta"));
+    }
+
+    #[test]
+    fn a_system_actor_carries_only_a_reserved_name() {
+        assert!(RESERVED_ACTORS.contains(&TEETH_PROBE_ACTOR));
+        assert!(RESERVED_ACTORS.contains(&ASSISTANT_DELIVERY_ACTOR));
+        assert_eq!(SystemActor::new(INSTALLER_ACTOR).name(), "installer");
+        assert!(std::panic::catch_unwind(|| SystemActor::new("mcp")).is_err(), "an ordinary name is no system actor");
+    }
+
+    #[test]
+    fn the_register_command_always_names_the_store() {
+        let cmd = register_command_for(Some(Path::new("C:/data/thor.db")));
+        assert!(cmd.starts_with("install"), "{cmd}");
+        assert!(cmd.ends_with("--register-root --db \"C:/data/thor.db\""), "{cmd}");
+        assert!(register_command_for(None).contains("--db \""), "even without a path it asks for one");
+    }
+
+    // ---------------------------------------------- grep tests over the workspace
+
+    /// The workspace's own crates: the only code that is built.
+    const WORKSPACE_MEMBERS: &[&str] = &["core", "intent", "model", "serve", "codeindex", "mcp", "ops", "library"];
+
+    fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|n| n == "target") {
+                    continue;
+                }
+                collect_rs(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Every `.rs` file under the members of `root`, with its path relative
+    /// to `root` in forward slashes, and its text.
+    fn member_files(root: &Path) -> Vec<(String, String)> {
+        let mut files = Vec::new();
+        for member in WORKSPACE_MEMBERS {
+            collect_rs(&root.join(member), &mut files);
+        }
+        let mut out: Vec<(String, String)> = files
+            .into_iter()
+            .filter_map(|p| {
+                let rel = p.strip_prefix(root).ok()?.to_string_lossy().replace('\\', "/");
+                Some((rel, std::fs::read_to_string(&p).ok()?))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// `text` with every inline test module blanked out: a `#[cfg(test)]` or
+    /// `#[cfg(all(test, ...))]` attribute on a `mod name {`, up to the first
+    /// line that is exactly `}` (rustfmt closes a top-level module there). A
+    /// module file whose first line of code is `#![cfg(test)]` (a test module
+    /// kept in a file of its own, like `serve/src/teeth/tests.rs`) is test
+    /// code as a whole; the attribute anywhere else changes nothing.
+    fn without_test_modules(text: &str) -> String {
+        let first_code = text.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with("//"));
+        if first_code == Some("#![cfg(test)]") {
+            return String::new();
+        }
+        let lines: Vec<&str> = text.lines().collect();
+        let mut out = Vec::with_capacity(lines.len());
+        let mut i = 0;
+        while i < lines.len() {
+            let t = lines[i].trim();
+            if t == "#[cfg(test)]" || t.starts_with("#[cfg(all(test") {
+                let mut j = i + 1;
+                while j < lines.len() && (lines[j].trim().is_empty() || lines[j].trim().starts_with("#[")) {
+                    j += 1;
+                }
+                let head = lines.get(j).map(|l| l.trim_start()).unwrap_or("");
+                let head = head.strip_prefix("pub ").unwrap_or(head);
+                if head.starts_with("mod ") && head.trim_end().ends_with('{') {
+                    let mut k = j + 1;
+                    while k < lines.len() && lines[k] != "}" {
+                        k += 1;
+                    }
+                    out.extend(std::iter::repeat("").take(k + 1 - i));
+                    i = k + 1;
+                    continue;
+                }
+            }
+            out.push(lines[i]);
+            i += 1;
+        }
+        out.join("\n")
+    }
+
+    /// The modules allowed to build a `SystemActor` - THOR's own writers:
+    /// the installer, the teeth trial, the evaluation's session and filing,
+    /// and the attester - plus this file, which defines it and tests it.
+    const SYSTEM_ACTOR_MODULES: &[&str] = &[
+        "model/src/store.rs",
+        "ops/src/install.rs",
+        "serve/src/teeth.rs",
+        "serve/src/eval_session.rs",
+        "serve/src/eval_filing.rs",
+        "serve/src/attest.rs",
+    ];
+
+    /// Every file under `root` that builds a `SystemActor` (or renames the
+    /// type, which is how a grep would be walked around) outside the allowed
+    /// modules - test code included: a test has no business holding THOR's
+    /// own token either, it writes a fixture event raw instead.
+    fn system_actor_offenders(root: &Path) -> Vec<String> {
+        member_files(root)
+            .into_iter()
+            .filter(|(rel, _)| !SYSTEM_ACTOR_MODULES.contains(&rel.as_str()))
+            .filter(|(_, text)| text.contains("SystemActor::new(") || text.contains("SystemActor as "))
+            .map(|(rel, _)| rel)
+            .collect()
+    }
+
+    fn workspace_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("model sits inside the workspace").to_path_buf()
+    }
+
+    #[test]
+    fn system_actor_is_built_only_in_the_named_modules() {
+        let root = workspace_root();
+        assert!(member_files(&root).len() > 50, "the workspace sources must be found under {}", root.display());
+        assert_eq!(system_actor_offenders(&root), Vec::<String>::new());
+
+        // Red: the same scan over a fixture tree that builds one where it may not.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("serve/src/bin")).unwrap();
+        std::fs::write(tmp.path().join("serve/src/bin/repair.rs"), "fn f() { let a = SystemActor::new(\"installer\"); }\n")
+            .unwrap();
+        std::fs::create_dir_all(tmp.path().join("ops/src")).unwrap();
+        std::fs::write(tmp.path().join("ops/src/install.rs"), "fn f() { let a = SystemActor::new(\"installer\"); }\n").unwrap();
+        std::fs::create_dir_all(tmp.path().join("mcp/src")).unwrap();
+        std::fs::write(tmp.path().join("mcp/src/lib.rs"), "use model::store::SystemActor as Token;\n").unwrap();
+        assert_eq!(
+            system_actor_offenders(tmp.path()),
+            vec!["mcp/src/lib.rs".to_string(), "serve/src/bin/repair.rs".to_string()]
+        );
+    }
+
+    /// Every production call site of core's raw append functions outside
+    /// this module, their definitions in `core/src/event_store.rs`, and the
+    /// hook's own recorders (`serve/src/deliver.rs`). A new call site fails
+    /// `every_raw_append_call_site_is_listed` until someone has looked at it
+    /// and added it here, with the reason it may write around the fence.
+    const REVIEWED_RAW_APPENDS: &[(&str, usize)] = &[
+        // Restoring a backup replays its events into an empty store.
+        ("core/src/backup.rs", 1),
+        // The mark writers: each goes through `fence` before it appends.
+        ("serve/src/mark.rs", 2),
+        // (`probe-teeth`'s one event in serve/src/bin/serve.rs went with the
+        // subcommand in step 9: `retest --apply` writes through the fenced
+        // `revise_tried_scoped`.)
+    ];
+
+    fn raw_append_sites(root: &Path) -> std::collections::BTreeMap<String, usize> {
+        let needles = [".append_event(", ".append_resolve(", ".append_mutate_checked(", ".append_created_unique("];
+        let excluded = ["core/src/event_store.rs", "model/src/store.rs", "serve/src/deliver.rs"];
+        let mut out = std::collections::BTreeMap::new();
+        for (rel, text) in member_files(root) {
+            if rel.contains("/tests/") || excluded.contains(&rel.as_str()) {
+                continue;
+            }
+            let production = without_test_modules(&text);
+            let count: usize = needles.iter().map(|n| production.matches(n).count()).sum();
+            if count > 0 {
+                out.insert(rel, count);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn every_raw_append_call_site_is_listed() {
+        let found = raw_append_sites(&workspace_root());
+        let reviewed: std::collections::BTreeMap<String, usize> =
+            REVIEWED_RAW_APPENDS.iter().map(|(f, n)| (f.to_string(), *n)).collect();
+        assert_eq!(
+            found, reviewed,
+            "a raw append call site outside model::store changed - review it (it writes around the actor fence) \
+             and update REVIEWED_RAW_APPENDS"
+        );
+
+        // Red: one planted production call site is found; the same call inside
+        // a test module, or in a tests/ file, is not.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("serve/src")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("serve/tests")).unwrap();
+        std::fs::write(
+            tmp.path().join("serve/src/side_door.rs"),
+            "fn f(s: &mut S) {\n    s\n        .append_event(\"s\", \"l\", \"eval-machine\", K, \"x\", None, \"{}\");\n}\n\
+             \n#[cfg(test)]\nmod tests {\n    fn t(s: &mut S) {\n        s.append_event();\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("serve/tests/fixture.rs"), "fn t(s: &mut S) { s.append_event(); }\n").unwrap();
+        std::fs::create_dir_all(tmp.path().join("serve/src/trial")).unwrap();
+        std::fs::write(
+            tmp.path().join("serve/src/trial/tests.rs"),
+            "//! Units.\n\n#![cfg(test)]\n\nfn t(s: &mut S) { s.append_event(); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("serve/src/trial/late.rs"),
+            "fn f(s: &mut S) { s.append_event(); }\n#![cfg(test)]\n",
+        )
+        .unwrap();
+        let planted = raw_append_sites(tmp.path());
+        assert_eq!(
+            planted.into_iter().collect::<Vec<_>>(),
+            vec![("serve/src/side_door.rs".to_string(), 1), ("serve/src/trial/late.rs".to_string(), 1)],
+            "a file that opens with #![cfg(test)] is test code; the attribute further down changes nothing"
+        );
+    }
+
+    // ------------------------------------------ the verdict in the log (step 6)
+
+    /// A light rule bound to 'git push', carrying a forbidden check its text
+    /// names - the shape the trial will store as wired.
+    fn force_push_rule(id: &str) -> Item {
+        Item {
+            id: id.to_string(),
+            kind: Kind::Rule,
+            text: "Never run `git push --force` on main.".to_string(),
+            bindings: vec![Binding::Target { kind: TargetKind::Command, value: "git push".to_string() }],
+            severity: None,
+            project: Some("demo".to_string()),
+            tags: Vec::new(),
+            expires: None,
+            key: None,
+            falsifier: Some("A force push to main turns out harmless.".to_string()),
+            check: Some(Check::Forbidden { literals: vec!["--force".to_string()] }),
+        }
+    }
+
+    /// A light rule with nothing to build a tooth from - the shape the trial
+    /// will store as a note.
+    fn plain_note(id: &str) -> Item {
+        Item {
+            id: id.to_string(),
+            kind: Kind::Rule,
+            text: "Keep commit subjects under 60 characters.".to_string(),
+            bindings: vec![Binding::Moment(Action::Commit)],
+            severity: None,
+            project: Some("demo".to_string()),
+            tags: Vec::new(),
+            expires: None,
+            key: None,
+            falsifier: Some("Long commit subjects turn out to read fine.".to_string()),
+            check: None,
+        }
+    }
+
+    fn trial_fields(item: &Item, verdict: RecordedVerdict) -> TrialFields {
+        TrialFields {
+            v: TRIAL_RECORD_VERSION,
+            fingerprint: fingerprint(item),
+            root: None,
+            project: item.project.clone(),
+            head_commit: None,
+            candidates: gate::teeth_candidates(item),
+            attempts: vec![
+                TrialAttempt { form: "git push --force x".to_string(), via: "Bash".to_string(), outcome: AttemptOutcome::Refused },
+                TrialAttempt { form: "git push".to_string(), via: "Bash".to_string(), outcome: AttemptOutcome::LetThrough },
+            ],
+            corpus: TrialCorpus { reached: 0, whole_hits: 0, cut: 0, stopped_forcing: Vec::new() },
+            clean_failed: Vec::new(),
+            disputes: TrialDisputes { legitimate_calls: Vec::new(), may_change: Vec::new() },
+            accept_refusing: Vec::new(),
+            history: Vec::new(),
+            pending: None,
+            a4: gate::unnamed_literals(item),
+            verdict,
+            evidence: Vec::new(),
+            uncommitted: false,
+            parent_rev: None,
+            file_blob: None,
+            a4_old_stock: None,
+        }
+    }
+
+    fn sealed(item: &Item, verdict: RecordedVerdict) -> TrialRecord {
+        TrialRecord::seal(trial_fields(item, verdict))
+    }
+
+    fn declare_tried(store: &mut EventStore, item: &Item, trial: &TrialRecord) -> Event {
+        declare_in_scoped(store, "s", "l", "a", item, None, None, Some(trial)).unwrap()
+    }
+
+    /// Declare `item` (checkless) with a Note verdict from a trial record -
+    /// settled, so it takes no place in a filing's batch.
+    fn declare_noted(store: &mut EventStore, item: &Item) -> Event {
+        declare_tried(store, item, &sealed(item, RecordedVerdict::Note))
+    }
+
+    fn undecided(why: &str) -> CurrentVerdict {
+        CurrentVerdict::Undecided { why: why.to_string() }
+    }
+
+    /// Whether changing `item` with `change` changes its fingerprint.
+    fn fingerprint_moves(change: impl Fn(&mut Item)) -> bool {
+        let base = force_push_rule("fp");
+        let mut other = base.clone();
+        change(&mut other);
+        assert_ne!(base, other, "the change must change the item");
+        fingerprint(&base) != fingerprint(&other)
+    }
+
+    #[test]
+    fn the_fingerprint_changes_with_the_kind() {
+        assert!(fingerprint_moves(|i| i.kind = Kind::Orientation));
+    }
+
+    #[test]
+    fn the_fingerprint_changes_with_the_text() {
+        assert!(fingerprint_moves(|i| i.text = "Never run `git push --force` on the main branch.".to_string()));
+    }
+
+    #[test]
+    fn the_fingerprint_changes_with_the_bindings() {
+        assert!(fingerprint_moves(|i| i.bindings.push(Binding::Moment(Action::Push))));
+        assert!(fingerprint_moves(|i| {
+            i.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "git pull".to_string() }]
+        }));
+    }
+
+    #[test]
+    fn the_fingerprint_changes_with_the_check() {
+        assert!(fingerprint_moves(|i| i.check = Some(Check::Forbidden { literals: vec!["--mirror".to_string()] })));
+        assert!(fingerprint_moves(|i| i.check = None));
+    }
+
+    #[test]
+    fn the_fingerprint_changes_with_the_project() {
+        assert!(fingerprint_moves(|i| i.project = Some("other".to_string())));
+        assert!(fingerprint_moves(|i| i.project = None));
+    }
+
+    #[test]
+    fn the_fingerprint_changes_with_the_severity() {
+        assert!(fingerprint_moves(|i| i.severity = Some(Severity::Irreversible)));
+    }
+
+    #[test]
+    fn the_fingerprint_ignores_the_tags() {
+        assert!(!fingerprint_moves(|i| i.tags = vec![TEETH_PROVEN_TAG.to_string(), "no-literal:a fixture reason".to_string()]));
+    }
+
+    #[test]
+    fn the_fingerprint_ignores_the_falsifier() {
+        assert!(!fingerprint_moves(|i| i.falsifier = Some("Another falsifier entirely.".to_string())));
+    }
+
+    #[test]
+    fn the_fingerprint_ignores_the_expiry() {
+        assert!(!fingerprint_moves(|i| i.expires = Some("2030-01-01".to_string())));
+    }
+
+    #[test]
+    fn the_fingerprint_ignores_the_key() {
+        assert!(!fingerprint_moves(|i| i.key = Some("force-push".to_string())));
+    }
+
+    #[test]
+    fn the_fingerprint_reads_the_project_the_way_a_write_stores_it() {
+        let mut global = force_push_rule("fp");
+        global.project = None;
+        let mut spelled = global.clone();
+        spelled.project = Some("global".to_string());
+        assert_eq!(fingerprint(&global), fingerprint(&spelled), "'global' is stored as no project at all");
+    }
+
+    #[test]
+    fn a_trial_record_rides_in_the_event_body_and_reads_back_unchanged() {
+        let mut store = EventStore::in_memory().unwrap();
+        let item = force_push_rule("splice");
+        let trial = sealed(&item, RecordedVerdict::RuleWired);
+        let event = declare_tried(&mut store, &item, &trial);
+        let canonical = canonical_body(&item).unwrap();
+        let record = serde_json::to_string(&trial).unwrap();
+        assert_eq!(event.body, format!("{},\"teeth_trial\":{record}}}", &canonical[..canonical.len() - 1]));
+        assert!(record.starts_with("{\"v\":1,\"fingerprint\":\""), "the record keeps its field order: {record}");
+        assert_eq!(parse_body(&event.body).unwrap(), item, "the item reads exactly as before");
+        assert_eq!(show(&store, "splice").unwrap(), item);
+        assert_eq!(trial_of(&event), Ok(Some(trial)));
+
+        // Green: an event written without a record carries none.
+        let plain = declare(&mut store, "s", "l", "a", &plain_note("no-record")).unwrap();
+        assert_eq!(trial_of(&plain), Ok(None));
+        assert!(!plain.body.contains("teeth_trial"));
+    }
+
+    #[test]
+    fn the_trial_record_follows_because_in_the_body() {
+        let mut store = EventStore::in_memory().unwrap();
+        let item = force_push_rule("ordered");
+        declare(&mut store, "s", "l", "a", &item).unwrap();
+        let mut updated = item.clone();
+        updated.check = Some(Check::Forbidden { literals: vec!["--force".to_string(), "-f".to_string()] });
+        updated.text = "Never run `git push --force` or `git push -f` on main.".to_string();
+        let trial = sealed(&updated, RecordedVerdict::RuleWired);
+        let event = revise_tried_scoped(
+            &mut store,
+            "s",
+            "l",
+            "a",
+            &item,
+            &updated,
+            &item,
+            Some("the short flag does the same"),
+            None,
+            Some(&trial),
+            None,
+        )
+        .unwrap();
+        let because = event.body.find(",\"because\":").expect("because is on the body");
+        let record = event.body.find(",\"teeth_trial\":").expect("the record is on the body");
+        assert!(because < record, "because first, then the record: {}", event.body);
+        assert!(event.body.ends_with(&format!(",\"teeth_trial\":{}}}", serde_json::to_string(&trial).unwrap())));
+        assert_eq!(history(&store, "ordered").unwrap()[1].because.as_deref(), Some("the short flag does the same"));
+        assert_eq!(trial_of(&event), Ok(Some(trial)));
+        assert_eq!(show(&store, "ordered").unwrap(), updated);
+    }
+
+    /// An older binary reads a body through the very same `parse_body`: a
+    /// plain `Item` deserialize with no `deny_unknown_fields`, so the extra
+    /// key is skipped. Proven on the exact bytes a write produces.
+    #[test]
+    fn an_old_binary_parse_body_reads_a_body_carrying_teeth_trial_unchanged() {
+        let item = force_push_rule("old-reader");
+        let body = body_with_trial(&canonical_body(&item).unwrap(), &sealed(&item, RecordedVerdict::RuleWired)).unwrap();
+        assert_eq!(parse_body(&body).unwrap(), item);
+        let because = body_with_because(&item, "a reason").unwrap();
+        let both = body_with_trial(&because, &sealed(&item, RecordedVerdict::Note)).unwrap();
+        assert_eq!(parse_body(&both).unwrap(), item);
+        assert_eq!(because_reason(&both).as_deref(), Some("a reason"));
+    }
+
+    #[test]
+    fn a_record_this_build_cannot_read_is_unreadable_never_absent() {
+        let mut store = EventStore::in_memory().unwrap();
+        let item = force_push_rule("unreadable");
+        let canonical = canonical_body(&item).unwrap();
+        let open = &canonical[..canonical.len() - 1];
+        let newer = store
+            .append_event("s", "l", "a", EventKind::FactCreated, "v2", None, &format!("{open},\"teeth_trial\":{{\"v\":2}}}}"))
+            .unwrap();
+        let err = trial_of(&newer).unwrap_err();
+        assert!(err.contains("is version 2, and this THOR reads version 1 only"), "{err}");
+        let broken = store
+            .append_event(
+                "s",
+                "l",
+                "a",
+                EventKind::FactCreated,
+                "broken",
+                None,
+                &format!("{open},\"teeth_trial\":{{\"v\":1,\"fingerprint\":\"x\"}}}}"),
+            )
+            .unwrap();
+        assert!(trial_of(&broken).unwrap_err().contains("does not read"));
+        let prose = store.append_event("s", "l", "a", EventKind::FactCreated, "prose", None, "a 1.0 prose body").unwrap();
+        assert_eq!(trial_of(&prose), Ok(None));
+        assert_eq!(
+            current_verdict(&store, "v2"),
+            undecided(&format!(
+                "its trial record at log seq {} is version 2, and this THOR reads version 1 only",
+                newer.seq
+            ))
+        );
+    }
+
+    #[test]
+    fn g6_2_a_record_counts_only_while_its_fingerprint_equals_the_heads() {
+        let mut store = EventStore::in_memory().unwrap();
+        let item = force_push_rule("cv");
+        declare_tried(&mut store, &item, &sealed(&item, RecordedVerdict::RuleWired));
+        assert_eq!(current_verdict(&store, "cv"), CurrentVerdict::RuleWired);
+
+        // A text change written the way a bin writes it: no trial.
+        let mut changed = item.clone();
+        changed.text = "Never run `git push --force` on the main branch.".to_string();
+        revise(&mut store, "s", "l", "a", &item, &changed).unwrap();
+        assert_eq!(current_verdict(&store, "cv"), undecided("its text changed after its last trial"));
+
+        // Back to exactly what was tried: the last trial matches again.
+        revise(&mut store, "s", "l", "a", &changed, &item).unwrap();
+        assert_eq!(current_verdict(&store, "cv"), CurrentVerdict::RuleWired);
+    }
+
+    #[test]
+    fn g6_2_a_reason_tag_never_changes_the_verdict() {
+        let mut store = EventStore::in_memory().unwrap();
+        let item = force_push_rule("tagged");
+        declare_tried(&mut store, &item, &sealed(&item, RecordedVerdict::RuleWired));
+        let mut tagged = item.clone();
+        tagged.tags = vec![TEETH_PROVEN_TAG.to_string(), "gotcha".to_string()];
+        // Since step 8 the store refuses the label outright (K16)...
+        let err = revise(&mut store, "s", "l", "a", &item, &tagged).unwrap_err();
+        assert!(err.to_string().contains("which only THOR's own trial writes"), "{err}");
+        // ...and a label an older binary wrote changes nothing either.
+        legacy_revise(&mut store, &tagged);
+        assert_eq!(current_verdict(&store, "tagged"), CurrentVerdict::RuleWired, "a proven label is only a label");
+
+        let note = plain_note("tagged-note");
+        declare_tried(&mut store, &note, &sealed(&note, RecordedVerdict::Note));
+        let mut reasoned = note.clone();
+        reasoned.tags = vec![format!("{NO_LITERAL_REASON_PREFIX}a commit subject leaves no fixed text"), TEETH_WIRED_TAG.to_string()];
+        legacy_revise(&mut store, &reasoned);
+        assert_eq!(current_verdict(&store, "tagged-note"), CurrentVerdict::Note);
+
+        // Red: the same tags on an item never tried settle nothing.
+        let mut store = EventStore::in_memory().unwrap();
+        let mut never = force_push_rule("never-tried");
+        never.tags = vec![TEETH_PROVEN_TAG.to_string()];
+        legacy(&mut store, &never);
+        assert_eq!(
+            current_verdict(&store, "never-tried"),
+            undecided("it has never been tried - there is no trial record on its log")
+        );
+    }
+    #[test]
+    fn the_verdict_names_every_field_that_changed_since_the_trial() {
+        let cases: Vec<(&str, Box<dyn Fn(&mut Item)>, &str)> = vec![
+            ("k", Box::new(|i: &mut Item| i.kind = Kind::Orientation), "its kind changed after its last trial"),
+            (
+                "b",
+                Box::new(|i: &mut Item| i.bindings.push(Binding::Moment(Action::Push))),
+                "its anchors changed after its last trial",
+            ),
+            ("p", Box::new(|i: &mut Item| i.project = Some("other".to_string())), "its project changed after its last trial"),
+            (
+                "cs",
+                Box::new(|i: &mut Item| {
+                    i.check = Some(Check::Forbidden { literals: vec!["--force".to_string(), "main".to_string()] });
+                    i.severity = Some(Severity::Costly);
+                }),
+                "its check and severity changed after its last trial",
+            ),
+        ];
+        for (id, change, why) in cases {
+            let mut store = EventStore::in_memory().unwrap();
+            let item = force_push_rule(id);
+            declare_tried(&mut store, &item, &sealed(&item, RecordedVerdict::RuleWired));
+            let mut changed = item.clone();
+            change(&mut changed);
+            // Raw, as an older binary could have written it: the write gate's
+            // own view of the change is not what is under test here.
+            let body = canonical_body(&changed).unwrap();
+            store.append_mutate_checked("s", "l", "a", EventKind::FactRevised, id, None, &body).unwrap();
+            assert_eq!(current_verdict(&store, id), undecided(why), "{id}");
+        }
+    }
+
+    #[test]
+    fn the_last_trial_decides_never_an_older_matching_one() {
+        let mut store = EventStore::in_memory().unwrap();
+        let first = force_push_rule("last");
+        declare_tried(&mut store, &first, &sealed(&first, RecordedVerdict::RuleWired));
+        let mut second = first.clone();
+        second.text = "Never run `git push --force` on main or release.".to_string();
+        let trial = sealed(&second, RecordedVerdict::RuleWired);
+        revise_tried_scoped(&mut store, "s", "l", "a", &first, &second, &first, None, None, Some(&trial), None).unwrap();
+        assert_eq!(current_verdict(&store, "last"), CurrentVerdict::RuleWired);
+        // Back to the first text without a trial: the first record matches it,
+        // but the LAST trial was of the second text.
+        revise(&mut store, "s", "l", "a", &second, &first).unwrap();
+        assert_eq!(current_verdict(&store, "last"), undecided("its text changed after its last trial"));
+    }
+
+    #[test]
+    fn a_proven_verdict_needs_evidence() {
+        let mut store = EventStore::in_memory().unwrap();
+        let item = force_push_rule("proven");
+        let mut fields = trial_fields(&item, RecordedVerdict::RuleProven);
+        fields.evidence = vec![TrialEvidence::FieldRefusal { seq: 7 }];
+        declare_tried(&mut store, &item, &TrialRecord::seal(fields));
+        assert_eq!(current_verdict(&store, "proven"), CurrentVerdict::RuleProven);
+
+        let mut store = EventStore::in_memory().unwrap();
+        let bare = force_push_rule("proven-bare");
+        declare_tried(&mut store, &bare, &sealed(&bare, RecordedVerdict::RuleProven));
+        assert_eq!(current_verdict(&store, "proven-bare"), CurrentVerdict::RuleWired, "no evidence, no proof");
+    }
+
+    #[test]
+    fn k23_an_a4_failure_keeps_the_verdict_undecided() {
+        let mut store = EventStore::in_memory().unwrap();
+        let mut item = force_push_rule("a4");
+        item.check = Some(Check::Forbidden { literals: vec!["--force".to_string(), "zqxj-never-typed".to_string()] });
+        let trial = sealed(&item, RecordedVerdict::RuleWired);
+        assert_eq!(trial.fields().a4, vec!["zqxj-never-typed".to_string()]);
+        // The gate refuses to write it (A4, step 8)...
+        let err = declare_in_scoped(&mut store, "s", "l", "a", &item, None, None, Some(&trial)).unwrap_err();
+        assert!(err.to_string().contains("not named anywhere in the rule's own text"), "{err}");
+        // ...and a record like it on the log (an older write) reads undecided.
+        legacy_tried(&mut store, &item, &trial);
+        assert_eq!(
+            current_verdict(&store, "a4"),
+            undecided(
+                "A4: 'zqxj-never-typed' is not named in the text - revise the text to name it, or clear the check with a \
+                 because"
+            )
+        );
+        // Green: the same rule whose text names both.
+        let mut named = item.clone();
+        named.id = "a4-named".to_string();
+        named.text = "Never run `git push --force` on main, and never zqxj-never-typed.".to_string();
+        declare_tried(&mut store, &named, &sealed(&named, RecordedVerdict::RuleWired));
+        assert_eq!(current_verdict(&store, "a4-named"), CurrentVerdict::RuleWired);
+    }
+
+    #[test]
+    fn a_record_that_contradicts_its_item_is_undecided() {
+        let mut store = EventStore::in_memory().unwrap();
+        let checked = force_push_rule("note-with-check");
+        declare_tried(&mut store, &checked, &sealed(&checked, RecordedVerdict::Note));
+        assert_eq!(
+            current_verdict(&store, "note-with-check"),
+            undecided("its last trial made it a note, yet it carries a check - a note carries none")
+        );
+        let bare = plain_note("rule-without-check");
+        declare_tried(&mut store, &bare, &sealed(&bare, RecordedVerdict::RuleWired));
+        assert_eq!(
+            current_verdict(&store, "rule-without-check"),
+            undecided("its last trial put it on the rule track, yet it carries no check")
+        );
+        let mut store = EventStore::in_memory().unwrap();
+        let note = plain_note("a-real-note");
+        declare_tried(&mut store, &note, &sealed(&note, RecordedVerdict::Note));
+        assert_eq!(current_verdict(&store, "a-real-note"), CurrentVerdict::Note);
+    }
+
+    #[test]
+    fn no_item_a_retracted_or_diverged_one_and_a_report_are_undecided() {
+        let mut store = EventStore::in_memory().unwrap();
+        assert_eq!(current_verdict(&store, "nothing"), undecided("there is no item 'nothing'"));
+
+        let gone = force_push_rule("gone");
+        declare_tried(&mut store, &gone, &sealed(&gone, RecordedVerdict::RuleWired));
+        retract(&mut store, "s", "l", "a", "gone", "a fixture retraction of the git push rule").unwrap();
+        assert_eq!(current_verdict(&store, "gone"), undecided("it was retracted"));
+
+        let split = force_push_rule("split");
+        declare_tried(&mut store, &split, &sealed(&split, RecordedVerdict::RuleWired));
+        let body = canonical_body(&split).unwrap();
+        store.append_event("s", "l", "a", EventKind::FactRevised, "split", None, &body).unwrap();
+        assert_eq!(current_verdict(&store, "split"), undecided("its log has 2 heads - resolve it first"));
+
+        let mut report = plain_note("a-report");
+        report.kind = Kind::Report;
+        report.bindings = Vec::new();
+        report.tags = vec!["a-report".to_string()];
+        declare(&mut store, "s", "l", "a", &report).unwrap();
+        assert_eq!(
+            current_verdict(&store, "a-report"),
+            undecided("a report is never tried - only a rule or an orientation carries a verdict")
+        );
+    }
+
+    #[test]
+    fn r6_2_a_revise_citing_a_head_that_moved_is_refused_and_appends_nothing() {
+        let mut store = EventStore::in_memory().unwrap();
+        let item = force_push_rule("cas");
+        let first = declare(&mut store, "s", "l", "a", &item).unwrap();
+        let mut moved = item.clone();
+        moved.text = "Never run `git push --force` on main or release.".to_string();
+        revise(&mut store, "s", "l", "a", &item, &moved).unwrap();
+        let count = store.get_all_events().unwrap().len();
+
+        let mut tried = moved.clone();
+        tried.text = "Never run `git push --force` on any shared branch.".to_string();
+        let trial = sealed(&tried, RecordedVerdict::RuleWired);
+        let err = revise_tried_scoped(
+            &mut store,
+            "s",
+            "l",
+            "a",
+            &moved,
+            &tried,
+            &moved,
+            None,
+            None,
+            Some(&trial),
+            Some(&first.this_hash),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, WriteError::Store(e) if e.to_string().contains("parent_rev is not a current head")),
+            "{err}"
+        );
+        assert_eq!(store.get_all_events().unwrap().len(), count, "a refused write appends nothing");
+        assert_eq!(show(&store, "cas").unwrap(), moved);
+    }
+
+    #[test]
+    fn g6_5_a_revise_citing_the_current_head_lands() {
+        let mut store = EventStore::in_memory().unwrap();
+        let item = force_push_rule("cas-ok");
+        let head = declare(&mut store, "s", "l", "a", &item).unwrap();
+        let mut tried = item.clone();
+        tried.text = "Never run `git push --force` on any shared branch.".to_string();
+        let trial = sealed(&tried, RecordedVerdict::RuleWired);
+        let event = revise_tried_scoped(
+            &mut store,
+            "s",
+            "l",
+            "a",
+            &item,
+            &tried,
+            &item,
+            None,
+            None,
+            Some(&trial),
+            Some(&head.this_hash),
+        )
+        .unwrap();
+        assert_eq!(event.parent_rev.as_deref(), Some(head.this_hash.as_str()));
+        assert_eq!(show(&store, "cas-ok").unwrap(), tried);
+        assert_eq!(current_verdict(&store, "cas-ok"), CurrentVerdict::RuleWired);
+    }
+
+    #[test]
+    fn the_note_tag_is_a_teeth_tag() {
+        assert_eq!(TEETH_NOTE_TAG, "teeth:note");
+        assert!(TEETH_NOTE_TAG.starts_with(TEETH_TAG_PREFIX));
+    }
+
+    // ------------------------------------ the record's two fences (X6)
+
+    /// The one module allowed to seal a new trial record: THOR's own trial.
+    const TRIAL_RECORD_BUILDERS: &[&str] = &["serve/src/teeth.rs"];
+
+    /// `text` with its test modules blanked and its comment lines dropped: a
+    /// comment builds and reads nothing.
+    fn production_lines(text: &str) -> Vec<String> {
+        without_test_modules(text)
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Whether `line` builds a trial record, or opens a way to: a struct
+    /// literal, `seal`, a trait impl for the type (a `From`, a `Default`), or
+    /// a rename the needles would miss.
+    fn builds_a_trial_record(line: &str) -> bool {
+        let t = line.trim_start();
+        let declares = t.starts_with("pub struct TrialRecord") || t.starts_with("impl TrialRecord");
+        (!declares && line.contains("TrialRecord {"))
+            || line.contains("TrialRecord::seal(")
+            || line.contains("for TrialRecord")
+            || line.contains("TrialRecord as ")
+            || line.contains("= TrialRecord")
+    }
+
+    /// Every production file under `root` that builds a trial record outside
+    /// the allowed module. Test modules and `tests/` files are allowed: a
+    /// fixture needs a record.
+    fn trial_record_builders(root: &Path) -> Vec<String> {
+        member_files(root)
+            .into_iter()
+            .filter(|(rel, _)| !rel.contains("/tests/") && !TRIAL_RECORD_BUILDERS.contains(&rel.as_str()))
+            .filter(|(_, text)| production_lines(text).iter().any(|line| builds_a_trial_record(line)))
+            .map(|(rel, _)| rel)
+            .collect()
+    }
+
+    /// The functions of every inherent `impl TrialRecord` block under `root`,
+    /// each as `<file>: <fn>`. A new function there could build a record for
+    /// anyone, so the list is fixed.
+    fn trial_record_impl_fns(root: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        for (rel, text) in member_files(root) {
+            let lines = production_lines(&text);
+            let mut inside = false;
+            for line in &lines {
+                if line.starts_with("impl TrialRecord") {
+                    inside = true;
+                    continue;
+                }
+                if inside && line == "}" {
+                    inside = false;
+                }
+                if inside {
+                    if let Some(rest) = line.trim_start().strip_prefix("pub fn ").or_else(|| line.trim_start().strip_prefix("fn ")) {
+                        let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                        out.push(format!("{rel}: {name}"));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn trial_record_is_built_only_in_teeth_rs() {
+        let root = workspace_root();
+        assert!(member_files(&root).len() > 50, "the workspace sources must be found under {}", root.display());
+        assert_eq!(trial_record_builders(&root), Vec::<String>::new());
+        assert_eq!(
+            trial_record_impl_fns(&root),
+            vec![
+                "model/src/store.rs: seal".to_string(),
+                "model/src/store.rs: fields".to_string(),
+                "model/src/store.rs: from_log".to_string(),
+            ]
+        );
+
+        // Red: every way in, planted in a fixture tree; the allowed places
+        // are not named.
+        let tmp = tempfile::tempdir().unwrap();
+        let plant = |rel: &str, text: &str| {
+            let path = tmp.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
         };
-        revise_tried_scoped(&mut store, "s", "l", "a", &item, &updated, &item, None, None, Some(&tried)).unwrap();
-        assert!(ids_whose_check_was_tried(&store).contains("tried-rule"), "the try is on record");
-        assert!(show(&store, "tried-rule").unwrap().check.is_none(), "the tried check never hangs");
+        plant("mcp/src/lib.rs", "fn f(fields: TrialFields) -> TrialRecord { TrialRecord { fields } }\n");
+        plant("serve/src/bin/forge.rs", "fn f(x: TrialFields) { let r = model::store::TrialRecord::seal(x); }\n");
+        // A trait impl with a where clause: only the `for TrialRecord` needle
+        // sees its first line.
+        plant(
+            "ops/src/health.rs",
+            "impl<T> From<T> for TrialRecord\nwhere\n    T: Into<TrialFields>,\n{\n    fn from(t: T) -> Self { todo!() }\n}\n",
+        );
+        plant("serve/src/rename.rs", "use model::store::TrialRecord as Box;\n");
+        plant("serve/src/teeth.rs", "fn f(x: TrialFields) -> TrialRecord { TrialRecord::seal(x) }\n");
+        plant("serve/tests/fixture.rs", "fn f(x: TrialFields) -> TrialRecord { TrialRecord::seal(x) }\n");
+        plant(
+            "serve/src/fixture_in_a_test_module.rs",
+            "fn g() {}\n\n#[cfg(test)]\nmod tests {\n    fn f(x: TrialFields) { let _ = TrialRecord::seal(x); }\n}\n",
+        );
+        plant("serve/src/commented.rs", "// TrialRecord::seal(fields) is called in teeth.rs only\nfn g() {}\n");
+        plant(
+            "model/src/store.rs",
+            "pub struct TrialRecord {\n    fields: TrialFields,\n}\n\nimpl TrialRecord {\n    pub fn seal(fields: TrialFields) -> Self {\n        Self { fields }\n    }\n\n    pub fn forge(fields: TrialFields) -> Self {\n        Self { fields }\n    }\n}\n",
+        );
+        assert_eq!(
+            trial_record_builders(tmp.path()),
+            vec![
+                "mcp/src/lib.rs".to_string(),
+                "ops/src/health.rs".to_string(),
+                "serve/src/bin/forge.rs".to_string(),
+                "serve/src/rename.rs".to_string(),
+            ]
+        );
+        assert_eq!(
+            trial_record_impl_fns(tmp.path()),
+            vec!["model/src/store.rs: seal".to_string(), "model/src/store.rs: forge".to_string()]
+        );
+    }
+
+    /// The functions of `model/src/store.rs` allowed to touch the record's
+    /// key or read one back: its one writer and its one reader.
+    const TRIAL_RECORD_KEY_FNS: &[&str] = &["fn body_with_trial(", "fn trial_of(", "fn from_log("];
+
+    /// `lines` with the body of every function named in `fns` blanked, from
+    /// its signature to the closing brace at the signature's own indent.
+    fn without_fns(lines: Vec<String>, fns: &[&str]) -> Vec<String> {
+        let mut out = Vec::with_capacity(lines.len());
+        let mut closing: Option<String> = None;
+        for line in lines {
+            if let Some(end) = &closing {
+                if &line == end {
+                    closing = None;
+                }
+                out.push(String::new());
+                continue;
+            }
+            if fns.iter().any(|f| line.contains(f)) {
+                let indent: String = line.chars().take_while(|c| *c == ' ').collect();
+                closing = Some(format!("{indent}}}"));
+                out.push(String::new());
+                continue;
+            }
+            out.push(line);
+        }
+        out
+    }
+
+    /// Whether `line` reads a trial record back, or the key that holds one.
+    fn reads_a_trial_record(line: &str) -> bool {
+        let names_the_type = line.contains("TrialRecord") || line.contains("TrialFields");
+        let deserializes = ["from_str", "from_value", "from_slice", "from_reader", "deserialize"]
+            .iter()
+            .any(|d| line.contains(d));
+        line.contains("teeth_trial") || line.contains("from_log(") || (names_the_type && deserializes)
+    }
+
+    /// Every production file under `root` that reads a trial record or its
+    /// key anywhere but `trial_of` (and the one writer of the key,
+    /// `body_with_trial`).
+    fn trial_record_readers(root: &Path) -> Vec<String> {
+        member_files(root)
+            .into_iter()
+            .filter(|(rel, _)| !rel.contains("/tests/"))
+            .filter_map(|(rel, text)| {
+                let mut lines = production_lines(&text);
+                if rel == "model/src/store.rs" {
+                    lines = without_fns(lines, TRIAL_RECORD_KEY_FNS);
+                }
+                lines.iter().any(|line| reads_a_trial_record(line)).then_some(rel)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn trial_record_is_deserialized_only_in_trial_of() {
+        let root = workspace_root();
+        assert!(member_files(&root).len() > 50, "the workspace sources must be found under {}", root.display());
+        assert_eq!(trial_record_readers(&root), Vec::<String>::new());
+        let store_rs = std::fs::read_to_string(root.join("model/src/store.rs")).unwrap();
+        let production = production_lines(&store_rs);
+        for f in TRIAL_RECORD_KEY_FNS {
+            assert_eq!(production.iter().filter(|l| l.contains(f)).count(), 1, "{f} is defined once in store.rs");
+        }
+
+        // Red: every way in, planted in a fixture tree.
+        let tmp = tempfile::tempdir().unwrap();
+        let plant = |rel: &str, text: &str| {
+            let path = tmp.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        plant("serve/src/lib.rs", "fn f(s: &str) { let _ = serde_json::from_str::<TrialRecord>(s); }\n");
+        plant("ops/src/health.rs", "fn f(v: &serde_json::Value) -> bool { v.get(\"teeth_trial\").is_some() }\n");
+        plant("mcp/src/lib.rs", "fn f(v: serde_json::Value) { let r: TrialFields = serde_json::from_value(v).unwrap(); }\n");
+        plant("serve/src/body.rs", "#[derive(Deserialize)]\nstruct Body {\n    teeth_trial: TrialFields,\n}\n");
+        plant("serve/tests/fixture.rs", "fn f(s: &str) { let _ = serde_json::from_str::<TrialFields>(s); }\n");
+        plant(
+            "model/src/store.rs",
+            "fn body_with_trial(body: &str) -> String {\n    format!(\"{body},\\\"teeth_trial\\\":1\")\n}\n\n\
+             pub fn trial_of(v: &serde_json::Value) -> Option<TrialRecord> {\n    let raw = v.get(\"teeth_trial\")?;\n    \
+             Some(TrialRecord::from_log(TrialFields::deserialize(raw).ok()?))\n}\n\n\
+             pub fn side_door(v: &serde_json::Value) -> bool {\n    v.get(\"teeth_trial\").is_some()\n}\n",
+        );
+        assert_eq!(
+            trial_record_readers(tmp.path()),
+            vec![
+                "mcp/src/lib.rs".to_string(),
+                "model/src/store.rs".to_string(),
+                "ops/src/health.rs".to_string(),
+                "serve/src/body.rs".to_string(),
+                "serve/src/lib.rs".to_string(),
+            ]
+        );
+    }
+
+    // ------------------------------------------ the grounds switched on in step 8
+
+    fn head_tags(store: &EventStore, id: &str) -> Vec<String> {
+        show(store, id).unwrap().tags
+    }
+
+    /// STRIP-ON-CHANGE: a revise with no trial record that changes one field
+    /// of the fingerprint drops every `teeth:` label from the new body - one
+    /// case per field - and one that changes only tags, falsifier, expires or
+    /// key keeps it.
+    #[test]
+    fn a_revise_without_a_record_that_changes_the_fingerprint_drops_every_teeth_label() {
+        let changes: Vec<(&str, Box<dyn Fn(&mut Item)>)> = vec![
+            ("kind", Box::new(|i: &mut Item| i.kind = Kind::Orientation)),
+            ("text", Box::new(|i: &mut Item| i.text = "Never run `git push --force` on main, ever.".to_string())),
+            ("bindings", Box::new(|i: &mut Item| i.bindings.push(Binding::Always))),
+            ("check", Box::new(|i: &mut Item| i.check = Some(Check::Forbidden { literals: vec!["--force".to_string(), "push".to_string()] }))),
+            ("project", Box::new(|i: &mut Item| i.project = Some("other".to_string()))),
+            ("severity", Box::new(|i: &mut Item| i.severity = Some(Severity::Costly))),
+        ];
+        for (field, change) in changes {
+            let mut store = EventStore::in_memory().unwrap();
+            let mut item = force_push_rule(&format!("strip-{field}"));
+            item.tags = vec![TEETH_WIRED_TAG.to_string(), "gotcha".to_string()];
+            let record = sealed(&item, RecordedVerdict::RuleWired);
+            declare_tried(&mut store, &item, &record);
+            let mut updated = item.clone();
+            change(&mut updated);
+            revise(&mut store, "s", "l", "a", &item, &updated).unwrap_or_else(|e| panic!("{field}: {e}"));
+            assert_eq!(head_tags(&store, &item.id), vec!["gotcha".to_string()], "{field}: the stale label is gone");
+            assert!(matches!(current_verdict(&store, &item.id), CurrentVerdict::Undecided { .. }), "{field}");
+        }
+        let keeps: Vec<(&str, Box<dyn Fn(&mut Item)>)> = vec![
+            ("tags", Box::new(|i: &mut Item| i.tags.push("more".to_string()))),
+            ("falsifier", Box::new(|i: &mut Item| i.falsifier = Some("A force push to main turns out harmless, twice.".to_string()))),
+            ("key", Box::new(|i: &mut Item| i.key = Some("k".to_string()))),
+        ];
+        for (field, change) in keeps {
+            let mut store = EventStore::in_memory().unwrap();
+            let mut item = force_push_rule(&format!("keep-{field}"));
+            item.tags = vec![TEETH_WIRED_TAG.to_string()];
+            declare_tried(&mut store, &item, &sealed(&item, RecordedVerdict::RuleWired));
+            let mut updated = item.clone();
+            change(&mut updated);
+            revise(&mut store, "s", "l", "a", &item, &updated).unwrap_or_else(|e| panic!("{field}: {e}"));
+            assert!(head_tags(&store, &item.id).contains(&TEETH_WIRED_TAG.to_string()), "{field}: kept");
+            assert_eq!(current_verdict(&store, &item.id), CurrentVerdict::RuleWired, "{field}");
+        }
+    }
+
+    /// R8.21: a text change written by a bin through `revise` - on a note, or
+    /// on a wired rule - leaves the item undecided with no `teeth:` label.
+    #[test]
+    fn r8_21_a_bin_text_change_leaves_a_note_or_a_wired_rule_undecided_and_unlabelled() {
+        let mut store = EventStore::in_memory().unwrap();
+        let mut note = plain_note("bin-note");
+        note.tags = vec![TEETH_NOTE_TAG.to_string()];
+        declare_tried(&mut store, &note, &sealed(&note, RecordedVerdict::Note));
+        let mut rewritten = note.clone();
+        rewritten.text = format!("{} Also on tags.", note.text);
+        revise(&mut store, "bin", "bin", "repair-project", &note, &rewritten).unwrap();
+        assert!(matches!(current_verdict(&store, "bin-note"), CurrentVerdict::Undecided { .. }));
+        assert!(!head_tags(&store, "bin-note").iter().any(|t| t.starts_with(TEETH_TAG_PREFIX)));
+
+        let mut wired = force_push_rule("bin-wired");
+        wired.tags = vec![TEETH_WIRED_TAG.to_string()];
+        declare_tried(&mut store, &wired, &sealed(&wired, RecordedVerdict::RuleWired));
+        let mut rewritten = wired.clone();
+        rewritten.text = "Never run `git push --force` on main or on a release branch.".to_string();
+        revise(&mut store, "bin", "bin", "restore-attribution", &wired, &rewritten).unwrap();
+        assert_eq!(
+            current_verdict(&store, "bin-wired"),
+            undecided("its text changed after its last trial")
+        );
+        assert!(!head_tags(&store, "bin-wired").iter().any(|t| t.starts_with(TEETH_TAG_PREFIX)));
+    }
+
+    /// R8.20: a direct `revise` (as a bin would do it) that keeps `teeth:note`
+    /// and adds a forbidden check is refused with the note-track sentence.
+    #[test]
+    fn r8_20_a_bin_hanging_a_check_on_a_note_is_refused() {
+        let mut store = EventStore::in_memory().unwrap();
+        let mut note = force_push_rule("bin-hang");
+        note.check = None;
+        note.tags = vec![TEETH_NOTE_TAG.to_string()];
+        declare_tried(&mut store, &note, &sealed(&note, RecordedVerdict::Note));
+        let mut hung = note.clone();
+        hung.check = Some(Check::Forbidden { literals: vec!["--force".to_string()] });
+        let err = revise(&mut store, "bin", "bin", "repair-project", &note, &hung).unwrap_err();
+        assert!(err.to_string().contains("an item on the note track carries no check"), "{err}");
+        assert!(err.to_string().contains("write it through remember/revise so THOR can try the new one"), "{err}");
+        assert!(show(&store, "bin-hang").unwrap().check.is_none(), "nothing written");
+    }
+
+    /// K16 and R8.22: a `teeth:` label no record implies is refused on
+    /// declare and on revise; the record that implies it lets it in; a
+    /// label the head already carries is not new; removing one is allowed.
+    #[test]
+    fn k16_a_teeth_label_needs_the_record_that_implies_it() {
+        let mut store = EventStore::in_memory().unwrap();
+        let mut forged = force_push_rule("forged");
+        forged.tags = vec![TEETH_PROVEN_TAG.to_string()];
+        let before = store.get_all_events().unwrap().len();
+        let err = declare(&mut store, "s", "l", "model", &forged).unwrap_err();
+        assert!(err.to_string().contains("'teeth:proven-guard' starts with 'teeth:', which only THOR's own trial writes"), "{err}");
+        assert_eq!(store.get_all_events().unwrap().len(), before, "nothing written");
+        for retired in [TEETH_INFORMING_TAG, TEETH_NOT_TRIED_TAG, TEETH_REFUSES_LEGITIMATE_TAG, TEETH_ANCHOR_COLLAPSED_TAG, "teeth:hard"] {
+            forged.tags = vec![retired.to_string()];
+            assert!(declare(&mut store, "s", "l", "model", &forged).is_err(), "{retired} is never written again");
+        }
+
+        // The record implies wired: wired goes in, proven does not.
+        let mut wired = force_push_rule("wired-by-record");
+        wired.tags = vec![TEETH_PROVEN_TAG.to_string()];
+        let record = sealed(&wired, RecordedVerdict::RuleWired);
+        assert!(declare_in_scoped(&mut store, "s", "l", "a", &wired, None, None, Some(&record)).is_err(), "the record does not imply proven");
+        wired.tags = vec![TEETH_WIRED_TAG.to_string()];
+        declare_tried(&mut store, &wired, &sealed(&wired, RecordedVerdict::RuleWired));
+
+        // Carried: not new. Differing: refused. Removed: allowed.
+        let mut carried = wired.clone();
+        carried.tags.push("gotcha".to_string());
+        revise(&mut store, "s", "l", "a", &wired, &carried).expect("a label the head carries is not new");
+        let mut differing = carried.clone();
+        differing.tags = vec![TEETH_PROVEN_TAG.to_string(), "gotcha".to_string()];
+        assert!(revise(&mut store, "s", "l", "a", &carried, &differing).unwrap_err().to_string().contains("only THOR's own trial writes"));
+        let mut removed = carried.clone();
+        removed.tags = vec!["gotcha".to_string()];
+        revise(&mut store, "s", "l", "a", &carried, &removed).expect("removing a label is always allowed");
+    }
+
+    /// R8.25 (D16): revising a wired rule into a Report is taken off the rule
+    /// track - refused without a because, landing with one.
+    #[test]
+    fn r8_25_moving_a_wired_rule_to_a_report_needs_a_because() {
+        let mut store = EventStore::in_memory().unwrap();
+        let mut rule = force_push_rule("to-report");
+        rule.check = None;
+        rule.tags = vec![TEETH_NOTE_TAG.to_string()];
+        declare_tried(&mut store, &rule, &sealed(&rule, RecordedVerdict::Note));
+        let mut report = rule.clone();
+        report.kind = Kind::Report;
+        report.bindings = vec![];
+        report.tags = vec!["archived".to_string()];
+        let baseline = rule.clone();
+        let err = revise_because(&mut store, "s", "l", "a", &Item { bindings: vec![], tags: vec![], ..baseline.clone() }, &report, &rule, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("takes the rule off the rule track exactly like a retract"), "{err}");
+        revise_because(
+            &mut store,
+            "s",
+            "l",
+            "a",
+            &Item { bindings: vec![], tags: vec![], ..baseline },
+            &report,
+            &rule,
+            Some("the release branch this guarded is gone"),
+        )
+        .expect("with a because it lands");
+        assert_eq!(show(&store, "to-report").unwrap().kind, Kind::Report);
+    }
+
+    /// R8.17 at the store: a refused write is one `GateRefused` by
+    /// `teeth-write` on the id - head-neutral, the item does not exist, and
+    /// only THOR's `teeth-write` actor may record one.
+    #[test]
+    fn a_refused_write_is_recorded_once_and_never_writes_the_item() {
+        let mut store = EventStore::in_memory().unwrap();
+        record_refused_write(&mut store, "s", SystemActor::new(TEETH_WRITE_ACTOR), "never-stored", "forcing", &["forbidden '--force'".to_string()], "the text")
+            .unwrap();
+        let events = store.get_events_by_entity("never-stored").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, EventKind::GateRefused);
+        assert_eq!(events[0].actor, TEETH_WRITE_ACTOR);
+        let body: serde_json::Value = serde_json::from_str(&events[0].body).unwrap();
+        assert_eq!(body["code"], "forcing");
+        assert_eq!(body["id"], "never-stored");
+        assert!(body["text_sha"].as_str().is_some_and(|h| !h.is_empty() && !h.contains("the text")));
+        assert!(show(&store, "never-stored").is_err(), "the item does not exist");
+        assert!(record_refused_write(&mut store, "s", SystemActor::new(ATTESTER_ACTOR), "x", "a4", &[], "t").is_err());
+        // Stored later: its history has one fact write, the refusal is no head.
+        let item = force_push_rule("never-stored");
+        declare_tried(&mut store, &item, &sealed(&item, RecordedVerdict::RuleWired));
+        let heads = compute_head_sets(&store.get_events_by_entity("never-stored").unwrap());
+        assert_eq!(heads["never-stored"].heads.len(), 1);
+        assert_eq!(current_verdict(&store, "never-stored"), CurrentVerdict::RuleWired);
+    }
+
+    /// No write path emits the four retired labels any more: in production
+    /// code they are only ever read (compared), never pushed onto tags.
+    #[test]
+    fn no_write_path_emits_a_retired_teeth_label() {
+        let root = workspace_root();
+        let retired = [
+            "TEETH_INFORMING_TAG",
+            "TEETH_NOT_TRIED_TAG",
+            "TEETH_REFUSES_LEGITIMATE_TAG",
+            "TEETH_ANCHOR_COLLAPSED_TAG",
+            "\"teeth:informing\"",
+            "\"teeth:not-tried\"",
+            "\"teeth:refuses-legitimate-use\"",
+            "\"teeth:anchor-collapsed\"",
+        ];
+        let writes = [".push(", "vec![", ".insert(", ".extend(", "tags ="];
+        let mut found = Vec::new();
+        for (rel, text) in member_files(&root) {
+            if rel.contains("/tests/") || rel.contains("/examples/") {
+                continue;
+            }
+            for (n, line) in without_test_modules(&text).lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                if retired.iter().any(|r| code.contains(r)) && writes.iter().any(|w| code.contains(w)) {
+                    found.push(format!("{rel}:{}", n + 1));
+                }
+            }
+        }
+        assert_eq!(found, Vec::<String>::new(), "a retired label is written here");
+    }
+
+    /// No code reads the log's old `"check":{` needle (the tried-set that let
+    /// a reason count after a "real try"): a reason settles nothing now.
+    #[test]
+    fn no_code_reads_the_old_check_needle() {
+        let root = workspace_root();
+        let needles = ["\"\\\"check\\\":{\"", "ids_with_a_write_containing", "ids_whose_check_was_tried"];
+        let mut found = Vec::new();
+        for (rel, text) in member_files(&root) {
+            if rel.contains("/tests/") || rel.contains("/examples/") {
+                continue;
+            }
+            for (n, line) in without_test_modules(&text).lines().enumerate() {
+                if needles.iter().any(|needle| line.contains(needle)) {
+                    found.push(format!("{rel}:{}", n + 1));
+                }
+            }
+        }
+        assert_eq!(found, Vec::<String>::new());
+    }
+
+    // ------------------------------------------ old contains stock (Q24)
+
+    /// A rule bound to NOTES.md whose contains check keeps 'keep me' there,
+    /// while its text never names the literal - the old stock Q24 is about.
+    fn old_contains_rule(id: &str) -> Item {
+        Item {
+            id: id.to_string(),
+            kind: Kind::Rule,
+            text: "NOTES.md keeps its opening line.".to_string(),
+            bindings: vec![Binding::Target { kind: TargetKind::Path, value: "NOTES.md".to_string() }],
+            severity: None,
+            project: Some("demo".to_string()),
+            tags: Vec::new(),
+            expires: None,
+            key: None,
+            falsifier: Some("The opening line turns out not to matter.".to_string()),
+            check: Some(Check::Contains { path: "NOTES.md".to_string(), literal: "keep me".to_string() }),
+        }
+    }
+
+    /// `item` written straight into the log, the way an older build wrote it:
+    /// a created event first, a revise after that.
+    fn raw_write(store: &mut EventStore, item: &Item) -> Event {
+        let body = canonical_body(item).unwrap();
+        if store.get_events_by_entity(&item.id).unwrap().is_empty() {
+            store.append_event("legacy", &item.id, "migration", EventKind::FactCreated, &item.id, None, &body).unwrap()
+        } else {
+            store.append_mutate_checked("legacy", &item.id, "migration", EventKind::FactRevised, &item.id, None, &body).unwrap()
+        }
+    }
+
+    fn retest_actor() -> SystemActor {
+        SystemActor::new(RETEST_ACTOR)
+    }
+
+    /// THE CUTOFF NEVER MOVES (Q24, 2): recorded once by THOR's retest; a
+    /// second call, a later raw record on the same id, or a record claiming a
+    /// point after its own place in the log changes nothing. If any of these
+    /// could move it, this test fails.
+    #[test]
+    fn the_a4_cutoff_is_recorded_once_and_never_moves() {
+        let mut store = EventStore::in_memory().unwrap();
+        assert_eq!(a4_cutoff(&store), None, "nothing is recorded until the retest records it");
+        raw_write(&mut store, &old_contains_rule("a"));
+        raw_write(&mut store, &old_contains_rule("b"));
+        let last = prospective_a4_cutoff(&store);
+        assert_eq!(last, 2);
+        assert_eq!(record_a4_cutoff(&mut store, retest_actor(), last).unwrap(), 2);
+        assert_eq!(a4_cutoff(&store), Some(2));
+
+        // Later writes, a second recording, and a raw later record on the id.
+        raw_write(&mut store, &old_contains_rule("c"));
+        let now = prospective_a4_cutoff(&store);
+        assert_eq!(record_a4_cutoff(&mut store, retest_actor(), now).unwrap(), 2);
+        let later = serde_json::json!({ "cutoff_seq": 99, "why": "moved" }).to_string();
+        store.append_event("x", "x", RETEST_ACTOR, EventKind::GateStoodAside, A4_CUTOFF_ID, None, &later).unwrap();
+        assert_eq!(a4_cutoff(&store), Some(2), "only the first record is ever read");
+        assert_eq!(store.get_events_by_entity(A4_CUTOFF_ID).unwrap().len(), 2, "the second call wrote nothing");
+
+        // A first record can never claim a point after its own place.
+        let mut other = EventStore::in_memory().unwrap();
+        raw_write(&mut other, &old_contains_rule("a"));
+        let future = serde_json::json!({ "cutoff_seq": 50 }).to_string();
+        let at = other.append_event("x", "x", RETEST_ACTOR, EventKind::GateStoodAside, A4_CUTOFF_ID, None, &future).unwrap();
+        assert_eq!(a4_cutoff(&other), Some(at.seq - 1));
+    }
+
+    /// Only THOR's retest records the cutoff or writes on its id; a cutoff
+    /// outside the log is refused.
+    #[test]
+    fn only_the_retest_records_the_a4_cutoff() {
+        let mut store = EventStore::in_memory().unwrap();
+        raw_write(&mut store, &old_contains_rule("a"));
+        let err = record_a4_cutoff(&mut store, SystemActor::new(ATTESTER_ACTOR), 1).unwrap_err();
+        assert!(err.to_string().contains("recorded by THOR's retest only"), "{err}");
+        let err = record_a4_cutoff(&mut store, retest_actor(), 5).unwrap_err();
+        assert!(err.to_string().contains("lies outside the log"), "{err}");
+        let mut squatter = plain_note(A4_CUTOFF_ID);
+        squatter.project = Some("demo".to_string());
+        let err = declare(&mut store, "s", "l", "mcp", &squatter).unwrap_err();
+        assert!(err.to_string().contains("THOR's own record of the A4 cutoff"), "{err}");
+        assert_eq!(a4_cutoff(&store), None);
+        assert_eq!(store.get_events_by_entity(A4_CUTOFF_ID).unwrap().len(), 0, "nothing written");
+    }
+
+    /// OLD STOCK is read from the whole log: the check stood at the cutoff,
+    /// with its text and anchors, and nothing changed any of the three since.
+    #[test]
+    fn old_contains_stock_reads_the_whole_log() {
+        let stock = |store: &EventStore, id: &str, cutoff: i64| {
+            old_contains_stock(&store.get_events_by_entity(id).unwrap(), cutoff)
+        };
+        let mut store = EventStore::in_memory().unwrap();
+        let rule = old_contains_rule("old");
+        let set = raw_write(&mut store, &rule);
+        let mut tagged = rule.clone();
+        tagged.tags.push("gotcha".to_string());
+        raw_write(&mut store, &tagged);
+        let cutoff = prospective_a4_cutoff(&store);
+        let mut tagged_after = tagged.clone();
+        tagged_after.falsifier = Some("A reworded falsifier changes nothing tried.".to_string());
+        raw_write(&mut store, &tagged_after);
+        let got = stock(&store, "old", cutoff).expect("set before the cutoff and untouched since");
+        assert_eq!((got.literal.as_str(), got.path.as_str(), got.set_at, got.cutoff), ("keep me", "NOTES.md", set.seq, cutoff));
+
+        // The text changed after the cutoff: gone - and putting it back does
+        // not bring it back.
+        let mut reworded = tagged_after.clone();
+        reworded.text = "NOTES.md keeps its first line.".to_string();
+        raw_write(&mut store, &reworded);
+        assert_eq!(stock(&store, "old", cutoff), None);
+        raw_write(&mut store, &tagged_after);
+        assert_eq!(stock(&store, "old", cutoff), None, "a revise that puts the text back does not undo the change");
+
+        // Anchors and check alike.
+        let mut store = EventStore::in_memory().unwrap();
+        raw_write(&mut store, &rule);
+        let cutoff = prospective_a4_cutoff(&store);
+        let mut rebound = rule.clone();
+        rebound.bindings.push(Binding::Always);
+        raw_write(&mut store, &rebound);
+        assert_eq!(stock(&store, "old", cutoff), None, "a pin changes the anchors");
+        let mut store = EventStore::in_memory().unwrap();
+        raw_write(&mut store, &rule);
+        let cutoff = prospective_a4_cutoff(&store);
+        let mut moved = rule.clone();
+        moved.check = Some(Check::Contains { path: "NOTES.md".to_string(), literal: "keep me too".to_string() });
+        raw_write(&mut store, &moved);
+        assert_eq!(stock(&store, "old", cutoff), None);
+
+        // A check attached after the cutoff, and a rule written after it.
+        let mut store = EventStore::in_memory().unwrap();
+        let mut bare = rule.clone();
+        bare.check = None;
+        raw_write(&mut store, &bare);
+        let cutoff = prospective_a4_cutoff(&store);
+        raw_write(&mut store, &rule);
+        assert_eq!(stock(&store, "old", cutoff), None, "a check attached after the cutoff is never old stock");
+        raw_write(&mut store, &old_contains_rule("young"));
+        assert_eq!(stock(&store, "young", cutoff), None);
+
+        // Retracted after the cutoff.
+        let mut store = EventStore::in_memory().unwrap();
+        raw_write(&mut store, &rule);
+        let cutoff = prospective_a4_cutoff(&store);
+        retract(&mut store, "s", "l", "a", "old", "gone").unwrap();
+        assert_eq!(stock(&store, "old", cutoff), None);
+    }
+
+    /// No other check kind is ever old stock.
+    #[test]
+    fn no_other_check_kind_is_old_contains_stock() {
+        let checks = [
+            Check::Forbidden { literals: vec!["--mirr0r-zz".to_string()] },
+            Check::Absent { path: "NOTES.md".to_string(), literal: "drop me".to_string() },
+            Check::AbsentAll { path: "NOTES.md".to_string(), literals: vec!["drop me".to_string()] },
+            Check::PathExists { path: "NOTES.md".to_string() },
+            Check::Requires { when: "git tag".to_string(), required: vec!["-s".to_string()] },
+        ];
+        for check in checks {
+            let mut store = EventStore::in_memory().unwrap();
+            let mut rule = old_contains_rule("old");
+            rule.check = Some(check.clone());
+            raw_write(&mut store, &rule);
+            let cutoff = prospective_a4_cutoff(&store);
+            assert_eq!(old_contains_stock(&store.get_events_by_entity("old").unwrap(), cutoff), None, "{check:?}");
+        }
+    }
+
+    /// `rule`'s record as THOR's retest writes it for old stock, sealed.
+    fn old_stock_record(rule: &Item, mark: OldContainsStock) -> TrialRecord {
+        let mut fields = trial_fields(rule, RecordedVerdict::RuleWired);
+        fields.a4_old_stock = Some(mark);
+        TrialRecord::seal(fields)
+    }
+
+    /// THE MARK IS THOR'S (Q24, 3): a record carrying it is refused from a
+    /// declare, and from every writer of a revise but THOR's retest - nothing
+    /// is written. Only the retest's own write lands.
+    #[test]
+    fn a_record_carrying_the_old_stock_mark_is_refused_from_every_writer_but_the_retest() {
+        let mut store = EventStore::in_memory().unwrap();
+        let rule = old_contains_rule("old");
+        raw_write(&mut store, &rule);
+        let cutoff = prospective_a4_cutoff(&store);
+        let mark = old_contains_stock(&store.get_events_by_entity("old").unwrap(), cutoff).unwrap();
+        let record = old_stock_record(&rule, mark.clone());
+        let before = store.get_all_events().unwrap().len();
+
+        // A new rule is never old stock, even one whose text names its literal.
+        let mut named = old_contains_rule("new");
+        named.text = "NOTES.md keeps `keep me`.".to_string();
+        let err = declare_in_scoped(&mut store, "s", "l", "mcp", &named, None, None, Some(&record)).unwrap_err();
+        assert!(err.to_string().contains("only THOR's retest writes that mark"), "{err}");
+        for actor in [WriteActor::Named("mcp"), WriteActor::System(SystemActor::new("teeth-eval"))] {
+            let err = revise_tried_scoped(&mut store, "s", "l", actor, &rule, &rule, &rule, None, None, Some(&record), None).unwrap_err();
+            assert!(err.to_string().contains("only THOR's retest writes that mark"), "{err}");
+        }
+        assert_eq!(store.get_all_events().unwrap().len(), before, "nothing written");
+
+        record_a4_cutoff(&mut store, retest_actor(), cutoff).unwrap();
+        revise_tried_scoped(&mut store, "retest", "old", retest_actor(), &rule, &rule, &rule, None, None, Some(&record), None)
+            .expect("THOR's retest writes its own mark");
+        assert_eq!(current_verdict(&store, "old"), CurrentVerdict::RuleWired);
+        let log = history(&store, "old").unwrap();
+        assert_eq!(log.last().unwrap().a4_old_stock.as_ref(), Some(&mark), "the step shows the fragment it guards");
+    }
+
+    /// THE MARK COUNTS ONLY WHILE THE LOG BEARS IT OUT (Q24, 4): a tags-only
+    /// revise keeps it; a revise of the text ends it for good, even one that
+    /// carries no record and a later one that puts the text back; and with no
+    /// recorded cutoff it never counts.
+    #[test]
+    fn the_old_stock_mark_counts_only_while_the_log_bears_it_out() {
+        let mut store = EventStore::in_memory().unwrap();
+        let rule = old_contains_rule("old");
+        raw_write(&mut store, &rule);
+        let cutoff = prospective_a4_cutoff(&store);
+        let mark = old_contains_stock(&store.get_events_by_entity("old").unwrap(), cutoff).unwrap();
+        let record = old_stock_record(&rule, mark);
+
+        // No cutoff recorded: the mark alone counts for nothing.
+        let mut unrecorded = EventStore::in_memory().unwrap();
+        raw_write(&mut unrecorded, &rule);
+        let body = body_with_trial(&canonical_body(&rule).unwrap(), &record).unwrap();
+        unrecorded.append_mutate_checked("retest", "old", RETEST_ACTOR, EventKind::FactRevised, "old", None, &body).unwrap();
+        assert!(matches!(current_verdict(&unrecorded, "old"), CurrentVerdict::Undecided { why } if why.starts_with("A4: 'keep me'")));
+
+        record_a4_cutoff(&mut store, retest_actor(), cutoff).unwrap();
+        revise_tried_scoped(&mut store, "retest", "old", retest_actor(), &rule, &rule, &rule, None, None, Some(&record), None).unwrap();
+        assert_eq!(current_verdict(&store, "old"), CurrentVerdict::RuleWired);
+
+        let mut tagged = rule.clone();
+        tagged.tags.push("gotcha".to_string());
+        revise(&mut store, "s", "l", "a", &rule, &tagged).unwrap();
+        assert_eq!(current_verdict(&store, "old"), CurrentVerdict::RuleWired, "a tags-only revise keeps it");
+
+        let mut reworded = tagged.clone();
+        reworded.text = "NOTES.md keeps its first line.".to_string();
+        raw_write(&mut store, &reworded);
+        assert!(matches!(current_verdict(&store, "old"), CurrentVerdict::Undecided { .. }));
+        raw_write(&mut store, &tagged);
+        assert!(
+            matches!(current_verdict(&store, "old"), CurrentVerdict::Undecided { why } if why.starts_with("A4: 'keep me'")),
+            "the old record matches the text again, and still counts for nothing"
+        );
     }
 }

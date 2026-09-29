@@ -84,6 +84,12 @@ fn classify_refusal(refusal: &Refusal) -> &'static str {
         "target_bare_host_name"
     } else if p.contains("root path") {
         "target_root_route"
+    } else if p.contains("not named anywhere in the rule's own text") || p.contains("is not one of the rule's own path or dir anchors") {
+        "check_literal_not_named_in_text"
+    } else if p.contains("neither one of the rule's own command anchors nor named") {
+        "check_trigger_not_named_in_text"
+    } else if p.contains("an item on the note track carries no check") {
+        "note_carries_a_check"
     } else {
         // Every ground `model::gate::declare` can return is matched above
         // (see its own doc comment: "a refusal reason with no test does not
@@ -115,13 +121,18 @@ fn migrate_one(
     raw_line: &str,
     report: &mut MigrationReport,
 ) {
-    let item: Item = match serde_json::from_str(raw_line) {
+    let mut item: Item = match serde_json::from_str(raw_line) {
         Ok(item) => item,
         Err(_) => {
             report.malformed += 1;
             return;
         }
     };
+    // A `teeth:` label is a readable copy of a trial record on THIS log, and
+    // an export carries no record: an imported label would claim a verdict
+    // nothing here ever reached (and the store refuses one with no record).
+    // Dropped on import; the item is undecided until THOR tries it.
+    item.tags.retain(|t| !t.starts_with(model::store::TEETH_TAG_PREFIX));
     if already_migrated(store, &item.id) {
         report.already_present += 1;
         return;
@@ -404,5 +415,53 @@ mod tests {
         let report = run(&mut store, &json_line(&no_falsifier), "s", "l", "migration-test");
         assert_eq!(report.refused.get("rule_or_orientation_without_falsifier"), Some(&1));
         assert!(store.get_events_by_entity("mig-falsifier-1").unwrap().is_empty());
+    }
+
+    // ------------------------------------------------------ the two tracks (step 8)
+
+    /// An export carries no trial record, so a `teeth:` label on an imported
+    /// item would claim a verdict this log never reached - and the store
+    /// refuses a label no record implies (K16). Import drops the label and
+    /// keeps everything else; the item is undecided until THOR tries it.
+    #[test]
+    fn import_strips_teeth_labels_and_keeps_the_rest() {
+        let mut store = EventStore::in_memory().unwrap();
+        let mut labelled = good_rule("mig-teeth-1");
+        labelled.tags = vec![
+            "source:fixture-a".to_string(),
+            model::store::TEETH_PROVEN_TAG.to_string(),
+            model::store::TEETH_NOTE_TAG.to_string(),
+        ];
+        let report = run(&mut store, &json_line(&labelled), "s", "l", "migration-test");
+        assert_eq!(report.written, 1, "{report:?}");
+        let stored = model::store::show(&store, "mig-teeth-1").unwrap();
+        assert_eq!(stored.tags, vec!["source:fixture-a".to_string()], "every teeth: label is gone, the rest kept");
+        assert!(matches!(
+            model::store::current_verdict(&store, "mig-teeth-1"),
+            model::store::CurrentVerdict::Undecided { .. }
+        ));
+    }
+
+    /// The control: without the strip, the same line is refused by the store
+    /// (K16) - so the strip is what lets an old export in at all.
+    #[test]
+    fn a_teeth_label_with_no_record_is_refused_by_the_store_itself() {
+        let mut store = EventStore::in_memory().unwrap();
+        let mut labelled = good_rule("mig-teeth-2");
+        labelled.tags.push(model::store::TEETH_PROVEN_TAG.to_string());
+        let err = model::store::declare(&mut store, "s", "l", "migration-test", &labelled).expect_err("K16");
+        assert!(err.to_string().contains("which only THOR's own trial writes"), "{err}");
+    }
+
+    /// A check whose literal the text does not name (A4) is refused on import
+    /// like any other write, and counted under its own ground.
+    #[test]
+    fn an_unnamed_check_literal_is_classified_and_the_item_is_not_written() {
+        let mut store = EventStore::in_memory().unwrap();
+        let mut unnamed = good_rule("mig-a4-1");
+        unnamed.check = Some(model::item::Check::Forbidden { literals: vec!["zqxj-never-typed".to_string()] });
+        let report = run(&mut store, &json_line(&unnamed), "s", "l", "migration-test");
+        assert_eq!(report.refused.get("check_literal_not_named_in_text"), Some(&1), "{report:?}");
+        assert!(store.get_events_by_entity("mig-a4-1").unwrap().is_empty());
     }
 }

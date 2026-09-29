@@ -396,18 +396,28 @@ stopping a save from ever finishing - close any other program that might have
 that same memory open, and run the check again. Newer builds also cap how big
 that log file is allowed to grow, so this should be rare.
 
-**Step 4 - give each project its own memory.** From that project's folder:
+**Step 4 - give each project its own memory.** From that project's folder, with
+the full path to the installer and the same memory as in step 3:
 
 ```sh
-thor2/target/release/install.exe --project "my-project"
+"<path to thor2>/target/release/install.exe" --db "C:\Users\you\AppData\Local\thor2\thor.db"
 ```
 
 This matters more than it sounds. Skip it and THOR gets *worse* the more you use
 it, because every search starts competing with projects you were not asking
-about. All it does is write a small file called `.thor-project` holding that
-name, so you can also just create that file yourself. It refuses to change a
-name that is already there, because renaming a project's scope would strand
-every note already filed under the old one.
+about. It files the project under the name of its folder - add `--project
+"my-project"` for another name, which it keeps in a small file called
+`.thor-project` - reads the project's code, and registers this folder as the
+project's working copy: the one place THOR tries a rule's check on a file. It
+refuses to change a name that is already there, because renaming a project's
+scope would strand every note already filed under the old one.
+
+Set a project up with an earlier release? Run this once from its folder
+instead: it registers the working copy and changes nothing else.
+
+```sh
+"<path to thor2>/target/release/install.exe" --register-root --db "C:\Users\you\AppData\Local\thor2\thor.db"
+```
 
 If you are the assistant doing the setup, [AGENTS.md](AGENTS.md) is the
 walkthrough for the steps above.

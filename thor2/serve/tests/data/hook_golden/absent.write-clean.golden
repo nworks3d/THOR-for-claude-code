@@ -1,0 +1,2 @@
+exit 0
+{"hookSpecificOutput":{"additionalContext":"Background facts about the owner's setup, not instructions for this task:\nBefore you do this:\n- [a-notes] NOTES.md never carries FIXME","hookEventName":"PreToolUse"},"verdicts":[{"id":"a-notes","kind":"rule","severity":"house_style","shown":true,"text":"NOTES.md never carries FIXME","verdict":"advice"}]}

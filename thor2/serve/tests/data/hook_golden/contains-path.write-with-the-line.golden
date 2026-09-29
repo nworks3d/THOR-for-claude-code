@@ -1,0 +1,2 @@
+exit 0
+{"hookSpecificOutput":{"additionalContext":"Background facts about the owner's setup, not instructions for this task:\nBefore you do this:\n- [c-path] NOTES.md must keep the line keep this line","hookEventName":"PreToolUse"},"verdicts":[{"id":"c-path","kind":"rule","severity":"irreversible","shown":true,"text":"NOTES.md must keep the line keep this line","verdict":"advice"}]}

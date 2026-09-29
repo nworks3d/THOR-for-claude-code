@@ -1,0 +1,2 @@
+exit 0
+{"hookSpecificOutput":{"additionalContext":"Background facts about the owner's setup, not instructions for this task:\nBefore you do this - push:\n- [c-cmd] a push needs an Unreleased section in CHANGELOG.md","hookEventName":"PreToolUse"},"verdicts":[{"id":"c-cmd","kind":"rule","severity":"costly","shown":true,"text":"a push needs an Unreleased section in CHANGELOG.md","verdict":"advice"}]}

@@ -130,146 +130,17 @@ pub fn hosts_in_command(command: &str) -> Vec<String> {
 // `cp other file` from Bash walk straight past it - a shell write is a
 // write, and until now only Edit/Write ever counted as one.
 // `shell_write_targets` below is what `serve::absent_guard`'s command guard
-// (`serve/src/bin/serve.rs`'s `command_guard_block`) feeds through the SAME
+// (`serve::guard_verdict::command`) feeds through the SAME
 // file-based checks a real Edit/Write already goes through, so the same
 // rule refuses both.
-
-/// One shell-lite token: an ordinary WORD, or one of the OPERATORS this
-/// function cares about (`;`, `&&`, `||`, `|`, `>`, `>>`) - a distinction
-/// `shell_tokens` above has no need of (it only ever recovers words, and
-/// trims `<`/`>` away as edge punctuation) and `shell_write_targets` cannot
-/// do without: a filename that merely SITS next to a redirect must never be
-/// read as the redirect's own target, and only keeping the operator as its
-/// own token tells the two apart.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ShTok {
-    Word(String),
-    Op(&'static str),
-}
-
-fn flush_word(word: &mut String, out: &mut Vec<ShTok>) {
-    if !word.is_empty() {
-        out.push(ShTok::Word(std::mem::take(word)));
-    }
-}
-
-/// Split `command` into shell-lite tokens: a quoted region (single or double
-/// quotes) becomes ONE word token with its quotes stripped, even across
-/// internal spaces - the one thing `shell_tokens` above cannot do, because it
-/// starts from `str::split_whitespace`, which has already torn a quoted path
-/// with a space into pieces before any quote logic could run. `;`, `&&`,
-/// `||`, `|`, `>>` and `>` are recognised as their OWN tokens even with no
-/// surrounding whitespace ("f>out" -> "f", ">", "out"), which is what lets a
-/// redirect be told apart from a filename that merely touches one. `<` is a
-/// silent word boundary (this function never reads input redirection, only
-/// output), and a lone `&` (background) is dropped the same way. Not a shell
-/// parser, the same declared scope `shell_tokens` above carries: no variable
-/// expansion, no globbing, no nested quoting, no backslash escapes inside a
-/// quote - only as much structure as telling an operator from a word needs.
-fn sh_tokenize(command: &str) -> Vec<ShTok> {
-    let mut out = Vec::new();
-    let mut chars = command.chars().peekable();
-    let mut word = String::new();
-    while let Some(c) = chars.next() {
-        match c {
-            '\'' | '"' => {
-                let quote = c;
-                for qc in chars.by_ref() {
-                    if qc == quote {
-                        break;
-                    }
-                    word.push(qc);
-                }
-            }
-            c if c.is_whitespace() => flush_word(&mut word, &mut out),
-            '<' => flush_word(&mut word, &mut out),
-            ';' => {
-                flush_word(&mut word, &mut out);
-                out.push(ShTok::Op(";"));
-            }
-            '|' => {
-                flush_word(&mut word, &mut out);
-                if chars.peek() == Some(&'|') {
-                    chars.next();
-                    out.push(ShTok::Op("||"));
-                } else {
-                    out.push(ShTok::Op("|"));
-                }
-            }
-            '&' => {
-                flush_word(&mut word, &mut out);
-                if chars.peek() == Some(&'&') {
-                    chars.next();
-                    out.push(ShTok::Op("&&"));
-                }
-                // A lone '&' backgrounds the command and names no path
-                // either way, so it just ends whatever came before it.
-            }
-            '>' => {
-                flush_word(&mut word, &mut out);
-                if chars.peek() == Some(&'>') {
-                    chars.next();
-                    out.push(ShTok::Op(">>"));
-                } else {
-                    out.push(ShTok::Op(">"));
-                }
-            }
-            _ => word.push(c),
-        }
-    }
-    flush_word(&mut word, &mut out);
-    out
-}
-
-/// `toks`, cut at every top-level `;`, `&&`, `||` and `|` - a compound or
-/// piped command is one write per stage, never one write for the whole line
-/// (`cat a.txt | tee b.txt` writes `b.txt`, not `a.txt`).
-fn split_segments(toks: &[ShTok]) -> Vec<Vec<ShTok>> {
-    let mut segments = Vec::new();
-    let mut current = Vec::new();
-    for t in toks {
-        match t {
-            ShTok::Op(";") | ShTok::Op("&&") | ShTok::Op("||") | ShTok::Op("|") => {
-                segments.push(std::mem::take(&mut current));
-            }
-            _ => current.push(t.clone()),
-        }
-    }
-    segments.push(current);
-    segments
-}
-
-/// The wrapper-shells whose `-c`/`-lc`/`-Command` argument is itself a real
-/// command to analyse, never the wrapper's own literal words. Matched
-/// case-insensitively against the SAME normalised leading word
-/// `absent_guard::strip_invocation_wrapper` already computes (directory and
-/// `.exe` suffix stripped), so `/bin/sh`, `bash.exe` and a bare `pwsh` are
-/// all recognised the same way that function already recognises any other
-/// command's own name.
-const SHELL_WRAPPER_NAMES: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "powershell", "pwsh"];
-
-/// If `command` invokes one of the known wrapper shells with a `-c`/`-lc`/
-/// `-Command` flag, the quoted argument that follows - the REAL command a
-/// caller meant to run, which is what `shell_write_targets` must actually
-/// see. `None` for anything else, including a wrapper invoked WITHOUT that
-/// flag (an interactive-shell shape this project never receives from a tool
-/// call) or one where the flag carries no following word.
-fn unwrap_shell_c(command: &str) -> Option<String> {
-    let normalised = crate::absent_guard::strip_invocation_wrapper(command);
-    let head = normalised.split_whitespace().next()?;
-    if !SHELL_WRAPPER_NAMES.contains(&head.to_lowercase().as_str()) {
-        return None;
-    }
-    let toks = sh_tokenize(command);
-    let flag_idx = toks.iter().position(|t| match t {
-        ShTok::Word(w) => w == "-c" || w == "-lc" || w.eq_ignore_ascii_case("-command"),
-        ShTok::Op(_) => false,
-    })?;
-    match toks.get(flag_idx + 1) {
-        Some(ShTok::Word(inner)) => Some(inner.clone()),
-        _ => None,
-    }
-}
+//
+// THE SAME SEGMENTS AS EVERY COMMAND TOOTH (the door, 2026-09-28). The call
+// is read with `serve::shell::segments`, the one tokenizer: a write on its
+// own line after a `cd` (`cd x<NL>rm f`), inside `$(...)`, or inside a
+// `bash -lc '...'` that is not at the head of the line is found, where the
+// old whitespace-and-operator tokenizer missed all three. A heredoc body fed
+// to `cat` is data, never a write; a command sent over `ssh` runs on another
+// machine, so a file it names is never a local file.
 
 /// A candidate argument names a real path, never a flag or a glob - the two
 /// filters every verb-specific reader below shares. GLOBS ARE IGNORED
@@ -306,42 +177,59 @@ pub struct ShellWrite {
     pub effect: ShellWriteEffect,
 }
 
-const MAX_UNWRAP_DEPTH: usize = 8;
+/// A shell write together with a directory of the segment that makes it
+/// (`shell::Segment::dir`, or `shell::Segment::any_cd_dir` when an earlier
+/// `cd` may not have run): a relative path in it is relative to that folder,
+/// not to the session's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellWriteAt {
+    pub write: ShellWrite,
+    pub dir: Option<std::sync::Arc<str>>,
+}
 
 /// Every real WRITE a shell command performs directly, bypassing the
 /// Edit/Write tool entirely, paired with what actually happens to the file -
 /// see this module's own "the shell write hole" section above for the
 /// measurement this closes, and `ShellWriteEffect`'s own doc comment for why
-/// the effect is never collapsed to a bare "written".
+/// the effect is never collapsed to a bare "written". Read in the sh dialect;
+/// the hook reads the call's own segments with [`shell_writes_in`].
 ///
 /// FLAGS ARE SKIPPED (a token starting with `-` is never read as a path -
 /// `rm -rf` names one flag and zero files on its own). GLOBS ARE IGNORED
 /// (see `is_path_arg`'s own doc comment for why guessing would cost more
-/// than it catches). A QUOTED PATH WITH A SPACE is read whole
-/// (`sh_tokenize`).
+/// than it catches). A QUOTED PATH WITH A SPACE is read whole.
 ///
-/// `sh -c "..."`, `bash -lc "..."` and `powershell -Command "..."` are
-/// unwrapped FIRST (`unwrap_shell_c`): the write this function must see is
-/// whatever the wrapped string actually runs, never the wrapper's own
-/// words - a Bash tool call routed through one of these would otherwise
-/// name no file at all. Capped at `MAX_UNWRAP_DEPTH`, the same defensive
-/// stance `serve/src/bin/serve.rs`'s own `MAX_TOOL_INPUT_WALK_DEPTH` takes
-/// for a payload this project does not control the shape of: a missed case
-/// past the cap is acceptable, an unbounded recursive walk is not.
+/// `sh -c "..."`, `bash -lc "..."`, `powershell -Command "..."` and every
+/// other wrapper `serve::shell` descends are read as the command they run,
+/// never as the wrapper's own words - a Bash tool call routed through one of
+/// these would otherwise name no file at all.
 pub fn shell_write_targets(command: &str) -> Vec<ShellWrite> {
-    shell_write_targets_at_depth(command, 0)
+    shell_writes_in(&crate::shell::segments(command, crate::shell::Dialect::Sh)).into_iter().map(|w| w.write).collect()
 }
 
-fn shell_write_targets_at_depth(command: &str, depth: usize) -> Vec<ShellWrite> {
-    if depth < MAX_UNWRAP_DEPTH {
-        if let Some(inner) = unwrap_shell_c(command) {
-            return shell_write_targets_at_depth(&inner, depth + 1);
-        }
-    }
-    let toks = sh_tokenize(command);
+/// [`shell_write_targets`] over a call already cut into `segments`, each
+/// write paired with its segment's directory - twice when an earlier `cd`
+/// that may not have run would put it elsewhere (`Segment::any_cd_dir`), so
+/// it is judged in both folders. A segment reached through `ssh` is skipped:
+/// the file it names is on another machine. So is the whole call read flat
+/// (`Segment::flat`), whose words are not one command.
+pub fn shell_writes_in(segments: &[crate::shell::Segment]) -> Vec<ShellWriteAt> {
     let mut out = Vec::new();
-    for segment in split_segments(&toks) {
-        collect_segment_writes(&segment, &mut out);
+    for segment in segments {
+        if segment.remote || segment.flat {
+            continue;
+        }
+        let mut writes = Vec::new();
+        collect_segment_writes(&segment.head, &mut writes);
+        for redirect in &segment.redirects {
+            collect_redirect(redirect, &mut writes);
+        }
+        for write in writes {
+            out.push(ShellWriteAt { write: write.clone(), dir: segment.dir.clone() });
+            if segment.any_cd_dir != segment.dir {
+                out.push(ShellWriteAt { write, dir: segment.any_cd_dir.clone() });
+            }
+        }
     }
     out
 }
@@ -398,52 +286,28 @@ fn collect_sed_i(rest: &[&str], out: &mut Vec<ShellWrite>) {
     }
 }
 
-/// The `>`/`>>` redirection in `segment`, if any: the LAST one (a
-/// double-redirect is vanishingly unlikely, and the last is also the one a
-/// real shell would actually leave the stream pointed at). Everything before
-/// it is the "producer"; a bare `:` there is the shell no-op idiom for
-/// "truncate this file, run nothing", so it counts as no producer at all -
-/// `: > f` and a bare `> f` both EMPTY the file, while any real command in
-/// front of the `>` (`echo x`, `printf ...`) REWRITES it, and `>>` always
-/// rewrites regardless, since append can never simply empty a file.
-fn collect_redirect(segment: &[ShTok], out: &mut Vec<ShellWrite>) {
-    let mut redirect: Option<(bool, usize)> = None;
-    for (i, t) in segment.iter().enumerate() {
-        match t {
-            ShTok::Op(">") => redirect = Some((false, i)),
-            ShTok::Op(">>") => redirect = Some((true, i)),
-            _ => {}
-        }
-    }
-    let Some((is_append, idx)) = redirect else { return };
-    let target = segment[idx + 1..].iter().find_map(|t| match t {
-        ShTok::Word(w) => Some(w.as_str()),
-        ShTok::Op(_) => None,
-    });
-    let Some(target) = target else { return };
-    if !is_path_arg(target) {
+/// One `>`/`>>` redirection (`shell::Redirect`, recorded by the scanner with
+/// whether a real producer runs in its segment). A bare `:` is the shell
+/// no-op idiom for "truncate this file, run nothing", so it counts as no
+/// producer at all - `: > f` and a bare `> f` both EMPTY the file, while any
+/// real command in the segment (`echo x`, `printf ...`) REWRITES it, and `>>`
+/// always rewrites regardless, since append can never simply empty a file.
+fn collect_redirect(redirect: &crate::shell::Redirect, out: &mut Vec<ShellWrite>) {
+    if !is_path_arg(&redirect.target) {
         return;
     }
-    let has_producer = segment[..idx].iter().any(|t| matches!(t, ShTok::Word(w) if w != ":"));
-    let effect = if is_append || has_producer { ShellWriteEffect::Rewritten } else { ShellWriteEffect::Emptied };
-    out.push(ShellWrite { path: target.to_string(), effect });
+    let effect =
+        if redirect.append || redirect.producer { ShellWriteEffect::Rewritten } else { ShellWriteEffect::Emptied };
+    out.push(ShellWrite { path: redirect.target.clone(), effect });
 }
 
-/// One segment's own writes: the verb-shaped ones (`rm`, `git rm`,
-/// `truncate -s 0`, `sed -i`, `tee`, `mv`/`cp`'s own destination) PLUS
-/// whatever `>`/`>>` redirection the segment carries - checked independently
-/// of each other (never `else`), so a segment like `tee f > log` (unusual,
-/// but not impossible) reports BOTH targets rather than one silently
-/// winning.
-fn collect_segment_writes(segment: &[ShTok], out: &mut Vec<ShellWrite>) {
-    let words: Vec<&str> = segment
-        .iter()
-        .filter_map(|t| match t {
-            ShTok::Word(w) => Some(w.as_str()),
-            ShTok::Op(_) => None,
-        })
-        .collect();
-
+/// One segment's own verb-shaped writes (`rm`, `git rm`, `truncate -s 0`,
+/// `sed -i`, `tee`, `mv`/`cp`'s own destination), read from its HEAD - so
+/// `sudo rm f` and `/bin/rm f` are the same write as `rm f`. Its redirections
+/// are read separately (`collect_redirect`), never `else`, so a segment like
+/// `tee f > log` reports BOTH targets rather than one silently winning.
+fn collect_segment_writes(head: &[String], out: &mut Vec<ShellWrite>) {
+    let words: Vec<&str> = head.iter().map(String::as_str).collect();
     match words.as_slice() {
         ["rm", rest @ ..] => {
             for w in rest {
@@ -477,8 +341,6 @@ fn collect_segment_writes(segment: &[ShTok], out: &mut Vec<ShellWrite>) {
         }
         _ => {}
     }
-
-    collect_redirect(segment, out);
 }
 
 #[derive(Debug, Clone, Default)]
@@ -842,5 +704,117 @@ mod tests {
     #[test]
     fn a_status_check_yields_nothing() {
         assert_eq!(shell_write_targets("git status"), Vec::<ShellWrite>::new());
+    }
+
+    // ------------------------------------- the same segments as every tooth
+    //
+    // The shapes the old tokenizer missed (measured against it: a newline was
+    // a space, `$(...)` was never read, and a wrapper was unwrapped only at
+    // the head of the line), and the ones that must stay data.
+
+    /// sh form: a newline ends a command, so `rm` is the head of its own line.
+    #[test]
+    fn a_write_on_its_own_line_after_a_cd_is_found() {
+        assert_eq!(shell_write_targets("cd x\nrm CLAUDE.md"), vec![removed("CLAUDE.md")]);
+    }
+
+    /// sh form: command substitution `$(...)` runs its command.
+    #[test]
+    fn a_write_inside_a_command_substitution_is_found() {
+        assert_eq!(shell_write_targets("x=$(rm CLAUDE.md)"), vec![removed("CLAUDE.md")]);
+    }
+
+    /// sh form: `bash -lc '...'` after `&&`, not at the head of the line.
+    #[test]
+    fn a_wrapper_that_is_not_at_the_head_of_the_line_is_read() {
+        assert_eq!(shell_write_targets("cd x && bash -lc 'rm CLAUDE.md'"), vec![removed("CLAUDE.md")]);
+    }
+
+    /// sh form: a heredoc body fed to `cat` is data, never a command.
+    #[test]
+    fn a_heredoc_body_is_never_a_write() {
+        assert_eq!(shell_write_targets("cat > notes.md <<'EOF'\nrm CLAUDE.md\nEOF"), vec![rewritten("notes.md")]);
+    }
+
+    /// sh form: `ssh host 'cmd'` runs on another machine.
+    #[test]
+    fn a_write_sent_over_ssh_is_never_a_local_write() {
+        assert_eq!(shell_write_targets("ssh nas 'rm /srv/CLAUDE.md'"), Vec::<ShellWrite>::new());
+        assert_eq!(shell_write_targets("ssh nas bash -s <<'EOF'\nrm CLAUDE.md\nEOF"), Vec::<ShellWrite>::new());
+    }
+
+    /// sh form: a mention in an echo or a search pattern writes nothing.
+    #[test]
+    fn a_mention_of_a_write_is_not_a_write() {
+        assert_eq!(shell_write_targets("echo 'rm CLAUDE.md'"), Vec::<ShellWrite>::new());
+        assert_eq!(shell_write_targets("grep -n 'rm CLAUDE.md' notes.md"), Vec::<ShellWrite>::new());
+    }
+
+    /// sh form: `: > f` on its own line after a cd empties the file.
+    #[test]
+    fn an_emptying_redirect_on_its_own_line_is_found() {
+        assert_eq!(shell_write_targets("cd x\n: > CLAUDE.md"), vec![emptied("CLAUDE.md")]);
+    }
+
+    /// sh form: `sudo rm` and `/bin/rm` are the same write as `rm`.
+    #[test]
+    fn a_write_under_sudo_or_by_full_path_is_found() {
+        assert_eq!(shell_write_targets("sudo rm CLAUDE.md"), vec![removed("CLAUDE.md")]);
+        assert_eq!(shell_write_targets("/bin/rm CLAUDE.md"), vec![removed("CLAUDE.md")]);
+    }
+
+    /// sh form: a file descriptor redirection names no file of its own, and
+    /// the redirect target is never a word of the verb it follows.
+    #[test]
+    fn a_redirect_target_is_not_an_argument_of_the_verb() {
+        assert_eq!(shell_write_targets("rm a 2>/dev/null"), vec![removed("a"), rewritten("/dev/null")]);
+        assert_eq!(shell_write_targets("rm a 2>&1"), vec![removed("a")]);
+    }
+
+    /// Each write carries the folder its segment runs in: the cd chain, or a
+    /// git call's own `-C`.
+    #[test]
+    fn each_write_carries_the_folder_of_its_segment() {
+        let at = |c: &str| {
+            shell_writes_in(&crate::shell::segments(c, crate::shell::Dialect::Sh))
+                .into_iter()
+                .map(|w| (w.write.path, w.dir.as_deref().map(str::to_string)))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(at("cd x && rm other.md"), vec![("other.md".to_string(), Some("x".to_string()))]);
+        assert_eq!(at("cd x\ncd y\nrm a"), vec![("a".to_string(), Some("x/y".to_string()))]);
+        assert_eq!(at("git -C sub rm a"), vec![("a".to_string(), Some("sub".to_string()))]);
+        assert_eq!(at("rm a"), vec![("a".to_string(), None)]);
+    }
+
+    /// A `cd` the shell refuses moves nothing (an operand too many, an
+    /// option bash does not know, a `chdir` bash does not have): the write
+    /// lands where the call already was, and is judged there.
+    #[test]
+    fn a_write_after_a_cd_the_shell_refuses_stays_where_it_was() {
+        let at = |c: &str| {
+            shell_writes_in(&crate::shell::segments(c, crate::shell::Dialect::Sh))
+                .into_iter()
+                .map(|w| (w.write.path, w.dir.as_deref().map(str::to_string)))
+                .collect::<Vec<_>>()
+        };
+        for c in ["cd x extra; rm a", "cd -x x; rm a", "chdir x; rm a", "sudo cd x; rm a"] {
+            assert_eq!(at(c), vec![("a".to_string(), None)], "{c}");
+        }
+        assert_eq!(at("cd -P x; rm a"), vec![("a".to_string(), Some("x".to_string()))]);
+    }
+
+    /// sh form: arithmetic is no heredoc. A `<<` in `(( ... ))` or `$[ ... ]`
+    /// is a shift, so the write on the next line is read; a command inside
+    /// arithmetic runs, so its write is read too.
+    #[test]
+    fn a_write_after_or_inside_arithmetic_is_read() {
+        assert_eq!(shell_write_targets("(( y = 1 << 2 ))
+rm CLAUDE.md"), vec![removed("CLAUDE.md")]);
+        assert_eq!(shell_write_targets("echo $[1<<2]
+rm CLAUDE.md"), vec![removed("CLAUDE.md")]);
+        assert_eq!(shell_write_targets("for ((i=0; i<<1; i++)); do :; done
+rm CLAUDE.md"), vec![removed("CLAUDE.md")]);
+        assert_eq!(shell_write_targets("(( $(rm CLAUDE.md) ))"), vec![removed("CLAUDE.md")]);
     }
 }

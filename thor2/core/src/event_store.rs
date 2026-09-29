@@ -684,6 +684,14 @@ impl EventStore {
         Ok(EventStore { conn })
     }
 
+    /// The file this store lives in, as SQLite reports it; `None` for an
+    /// in-memory store. For a message that has to name the very memory this
+    /// process has open, so a command it prints never lands in another one
+    /// (`model::store::register_command_for`).
+    pub fn path(&self) -> Option<std::path::PathBuf> {
+        self.conn.path().filter(|p| !p.is_empty()).map(std::path::PathBuf::from)
+    }
+
     fn init_schema(conn: &Connection) -> SqlResult<()> {
         // Projections stance: head-sets WERE a pure fold recomputed from the
         // event log on every read (M0/M1a, see cas::compute_head_sets). M2
@@ -1795,19 +1803,6 @@ impl EventStore {
         rows.collect()
     }
 
-    /// The ids of every item one of whose WRITES (create, revise, resolve)
-    /// carried `needle` somewhere in its body. Used to ask the log whether an
-    /// item ever carried a check at all (`model::store::ids_whose_check_was_
-    /// tried`) without loading and parsing every body on the log.
-    pub fn ids_with_a_write_containing(&self, needle: &str) -> SqlResult<HashSet<String>> {
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT DISTINCT entity_id FROM event \
-             WHERE kind IN ('fact_created', 'fact_revised', 'fact_resolved') AND instr(body, ?1) > 0",
-        )?;
-        let rows = stmt.query_map([needle], |row| row.get::<_, String>(0))?;
-        rows.collect()
-    }
-
     /// The ids this session was actually served, once each.
     ///
     /// Exists so a caller can ask about something the CURRENT reader has
@@ -1861,6 +1856,25 @@ impl EventStore {
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
+    }
+
+    /// Every event of one of `kinds` with seq > `since_seq`, in log order,
+    /// bodies included. Read only. For a reader that needs the bodies of a few
+    /// kinds out of a long log (the real-call corpus reads `item_served` and
+    /// `gate_refused` only) without paying for every other row, and that can
+    /// refresh itself later from the last seq it saw. An empty `kinds` reads
+    /// nothing.
+    pub fn events_of_kinds(&self, kinds: &[EventKind], since_seq: i64) -> SqlResult<Vec<Event>> {
+        if kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let marks = vec!["?"; kinds.len()].join(", ");
+        let sql = format!("SELECT {} FROM event WHERE seq > ? AND kind IN ({marks}) ORDER BY seq", EVENT_COLUMNS);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut args: Vec<rusqlite::types::Value> = vec![rusqlite::types::Value::Integer(since_seq)];
+        args.extend(kinds.iter().map(|k| rusqlite::types::Value::Text(k.as_str().to_string())));
+        let events = stmt.query_map(rusqlite::params_from_iter(args), row_to_event)?;
+        events.collect()
     }
 
     /// The shipper's read side: every event with seq > `after_seq`, in chain
@@ -3196,6 +3210,32 @@ mod tests {
             3,
             "the hole at seq 4 must still cap the frontier at 3, not jump to 5 via the seq-0 offset"
         );
+    }
+}
+
+#[cfg(test)]
+mod events_of_kinds_tests {
+    use super::*;
+
+    /// Only the kinds asked for, only after `since_seq`, in log order, bodies
+    /// kept - and an empty kind list reads nothing rather than everything.
+    #[test]
+    fn events_of_kinds_reads_only_the_named_kinds_after_the_seq() {
+        let mut store = EventStore::in_memory().unwrap();
+        let served = store.append_event("s", "l", "hook", EventKind::ItemServed, "a", None, r#"{"n":1}"#).unwrap();
+        store.append_event("s", "l", "hook", EventKind::GateStoodAside, "a", None, r#"{"n":2}"#).unwrap();
+        let refused = store.append_event("s", "l", "hook", EventKind::GateRefused, "b", None, r#"{"n":3}"#).unwrap();
+        let later = store.append_event("s", "l", "hook", EventKind::ItemServed, "c", None, r#"{"n":4}"#).unwrap();
+
+        let both = store.events_of_kinds(&[EventKind::ItemServed, EventKind::GateRefused], 0).unwrap();
+        let seqs: Vec<i64> = both.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![served.seq, refused.seq, later.seq]);
+        assert_eq!(both[1].body, r#"{"n":3}"#);
+
+        let since = store.events_of_kinds(&[EventKind::ItemServed], served.seq).unwrap();
+        assert_eq!(since.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![later.seq]);
+        assert!(store.events_of_kinds(&[], 0).unwrap().is_empty());
+        assert!(store.events_of_kinds(&[EventKind::FactRetracted], 0).unwrap().is_empty());
     }
 }
 

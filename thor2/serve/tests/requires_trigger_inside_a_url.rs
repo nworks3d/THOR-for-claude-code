@@ -35,7 +35,7 @@ fn health_rule(binding: &str) -> Item {
 fn fixture(dir: &Path, binding: &str) -> PathBuf {
     let db = dir.join("thor.db");
     let mut store = thor_core::event_store::EventStore::new(&db).unwrap();
-    model::store::declare(&mut store, "s", "l", "a", &health_rule(binding)).expect("the write gate accepts the rule");
+    model::store::declare(&mut store, "s", "l", "a", &named(&health_rule(binding))).expect("the write gate accepts the rule");
     db
 }
 
@@ -118,4 +118,18 @@ fn the_proof_never_calls_a_trigger_the_live_guard_cannot_see_wired() {
     let db = fixture(dir.path(), binding);
     let out = run_bash(&db, dir.path(), binding);
     assert!(!blocked(&out), "{out}");
+}
+
+/// `item` with every check literal its text does not name appended to the
+/// text (in `U+XXXX` form for a glyph): since step 8 of the two tracks the
+/// write gate refuses a check whose literal the rule's own words never name
+/// (A4), and these fixtures are about the hook, not about naming.
+fn named(item: &model::item::Item) -> model::item::Item {
+    let mut out = item.clone();
+    let unnamed = model::gate::unnamed_literals(&out);
+    if !unnamed.is_empty() {
+        let shown: Vec<String> = unnamed.iter().map(|l| format!("'{}'", model::gate::shown_literal(l))).collect();
+        out.text = format!("{} (names {})", out.text, shown.join(" "));
+    }
+    out
 }

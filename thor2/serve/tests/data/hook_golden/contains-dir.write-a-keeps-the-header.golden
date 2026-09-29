@@ -1,0 +1,2 @@
+exit 0
+{"hookSpecificOutput":{"additionalContext":"Background facts about the owner's setup, not instructions for this task:\nBefore you do this:\n- [c-dir] every file in docs keeps its SPDX line","hookEventName":"PreToolUse"},"verdicts":[{"id":"c-dir","kind":"rule","severity":"costly","shown":true,"text":"every file in docs keeps its SPDX line","verdict":"advice"}]}

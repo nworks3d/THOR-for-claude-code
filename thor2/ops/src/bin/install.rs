@@ -20,10 +20,11 @@ use clap::Parser;
 use std::path::Path;
 use ops::githooks;
 use ops::install::{
-    default_data_dir, default_eval_command_path, default_settings_path, default_user_mcp_path, ensure_store,
-    install_hooks, install_tool_server, record_project_opened, seed_eval_command, seed_response_rulebook,
-    seed_working_contract, standard_hooks, write_project_marker, EvalCommandOutcome, HookOutcome, MarkerOutcome,
-    ProjectRecordOutcome, RulebookOutcome, ServerOutcome, StoreOutcome,
+    check_registration, default_data_dir, default_eval_command_path, default_settings_path, default_user_mcp_path,
+    ensure_store, install_hooks, install_tool_server, record_project_opened, register_command_for, register_root,
+    seed_eval_command, seed_response_rulebook, seed_working_contract, standard_hooks, write_project_marker,
+    EvalCommandOutcome, HookOutcome, MarkerOutcome, RegisterOutcome, RegisterRefusal, RulebookOutcome, ServerOutcome,
+    StoreOutcome,
 };
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -80,6 +81,18 @@ struct Cli {
     /// that every project sees.
     #[arg(long)]
     project: Option<String>,
+
+    /// Register ONLY: record the checkout this is run from as its project's
+    /// working copy, and nothing else - no settings, no hooks, no tool server,
+    /// no code index. Run it from inside the checkout. Needs --db, so it
+    /// registers into the memory your assistant really uses. The project is
+    /// the one the checkout already resolves to (its .thor-project marker,
+    /// else its folder name).
+    #[arg(
+        long = "register-root",
+        conflicts_with_all = ["project", "settings", "mcp_json", "no_mcp", "serve_exe", "mcp_exe", "code_index_root"]
+    )]
+    register_root: bool,
 }
 
 /// The binary named `name` sitting next to this installer, with the
@@ -120,8 +133,92 @@ fn existing_index_file_count(index_root: &Path, key: &str) -> anyhow::Result<usi
     Ok(usize::try_from(files).unwrap_or(0))
 }
 
+/// A folder as a registration names it: forward slashes.
+fn slashed(path: &Path) -> String {
+    path.display().to_string().replace('\\', "/")
+}
+
+/// `install --register-root`: register the checkout this is run from, and
+/// nothing else. Refuses without `--db` before anything is touched (F7): a
+/// registration in the default memory, when the assistant uses another one,
+/// would be a registration nobody ever reads.
+fn register_only(db: Option<PathBuf>) -> ExitCode {
+    let Some(db) = db else {
+        let default = default_data_dir()
+            .map(|d| d.join("thor.db").display().to_string())
+            .unwrap_or_else(|| "a default memory".to_string());
+        eprintln!(
+            "name the memory to register in: {} - without --db it would register into {default}, which may not be \
+             the memory your assistant uses",
+            register_command_for(None)
+        );
+        return ExitCode::from(2);
+    };
+    if !db.is_file() {
+        eprintln!(
+            "REFUSED: there is no memory at {} - check the path given with --db (the one your assistant's hooks \
+             name). Nothing was changed.",
+            db.display()
+        );
+        return ExitCode::FAILURE;
+    }
+    let here = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let key = serve::project::git_root(&here).and_then(|top| serve::project::resolve_project(&top));
+    let Some(key) = key else {
+        eprintln!("{}", RegisterRefusal::NotACheckout { cwd: slashed(&here) });
+        return ExitCode::FAILURE;
+    };
+    let mut store = match thor_core::event_store::EventStore::open_existing(&db) {
+        Ok(store) => store,
+        Err(e) => {
+            eprintln!("{}", RegisterRefusal::Store(e.to_string()));
+            return ExitCode::FAILURE;
+        }
+    };
+    match register_root(&mut store, &here, &key, None) {
+        Ok(
+            RegisterOutcome::Created { root }
+            | RegisterOutcome::Registered { root }
+            | RegisterOutcome::CreatedUnderRootRecord { root },
+        ) => println!("registered '{key}' -> {root}"),
+        Ok(RegisterOutcome::AlreadyHere { root }) => {
+            println!("= '{key}' is already registered here ({root}) - nothing to do")
+        }
+        Ok(RegisterOutcome::Moved { from, to }) => {
+            println!("moved '{key}' from {from} to {to} (the old checkout is gone)")
+        }
+        Err(refusal) => {
+            eprintln!("{refusal}");
+            return ExitCode::FAILURE;
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// The line the per-project install prints for what registering this
+/// checkout did.
+fn print_record_outcome(key: &str, outcome: Result<RegisterOutcome, RegisterRefusal>) {
+    match outcome {
+        Ok(RegisterOutcome::Created { root }) => {
+            println!("+ recorded this project, '{key}', in the memory: notes filed under it land without a naming question");
+            println!("+ registered its working copy: {root}");
+        }
+        Ok(RegisterOutcome::CreatedUnderRootRecord { root }) | Ok(RegisterOutcome::Registered { root }) => {
+            println!("+ registered the working copy of '{key}': {root}")
+        }
+        Ok(RegisterOutcome::AlreadyHere { .. }) => println!("= project record already names this checkout"),
+        Ok(RegisterOutcome::Moved { from, to }) => {
+            println!("+ moved '{key}' from {from} to {to} (the old checkout is gone)")
+        }
+        Err(e) => println!("  ! could not record this project in the memory: {e}"),
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if cli.register_root {
+        return register_only(cli.db);
+    }
 
     let data_dir = default_data_dir();
     let serve_exe = match cli.serve_exe.or_else(|| sibling("serve")) {
@@ -176,6 +273,19 @@ fn main() -> ExitCode {
             }
         }
     };
+    // A SECOND COPY NEVER TAKES OVER A REGISTRATION (Z3, D3), and the check
+    // runs here, before this run writes anything at all - settings, hooks,
+    // the marker, the code index or the store - so "Nothing was changed" in
+    // the refusal is literally true. A project already registered at another
+    // folder that still exists is refused; see `ops::install::register_root`.
+    let here = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    if let Some(key) = cli.project.clone().or_else(|| serve::project::resolve_project(&here)) {
+        if let Err(refusal) = check_registration(&db, &here, &key) {
+            eprintln!("{refusal}");
+            return ExitCode::FAILURE;
+        }
+    }
+
     // ~/.claude may not exist yet on a machine where Claude Code has never run.
     // install_hooks writes the file, so its parent has to be there first;
     // best-effort, because install_hooks reports the real error if it is not.
@@ -430,7 +540,6 @@ fn main() -> ExitCode {
     // under it regardless. The flag keeps its two jobs and gains no third:
     // it writes the marker that overrides the folder-derived name, and it
     // still refuses to change a name that is already there.
-    let here = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     if let Some(key) = &cli.project {
         match write_project_marker(&here, key) {
             Ok(MarkerOutcome::Written) => println!("+ this folder now has its own memory, under {key:?}"),
@@ -452,15 +561,7 @@ fn main() -> ExitCode {
                 // this closes). Idempotent - a rerun that hits this same
                 // branch (the code index was rebuilt, but the record already
                 // exists) writes nothing more.
-                match record_project_opened(&db, &key, files) {
-                    Ok(ProjectRecordOutcome::Written) => println!(
-                        "+ recorded this project, '{key}', in the memory: notes filed under it land without a naming question"
-                    ),
-                    Ok(ProjectRecordOutcome::AlreadyThere) => {
-                        println!("= this project was already recorded in the memory")
-                    }
-                    Err(e) => println!("  ! could not record this project in the memory: {e}"),
-                }
+                print_record_outcome(&key, record_project_opened(&db, &here, &key, files));
             }
             Ok(Some(None)) => {
                 println!("= this project's code was already read; every commit keeps it fresh");
@@ -477,15 +578,7 @@ fn main() -> ExitCode {
                 // more (see `record_project_opened`'s own doc comment).
                 if let Some(root) = code_index_root.as_deref() {
                     match existing_index_file_count(root, &key) {
-                        Ok(files) => match record_project_opened(&db, &key, files) {
-                            Ok(ProjectRecordOutcome::Written) => println!(
-                                "+ recorded this project, '{key}', in the memory: notes filed under it land without a naming question"
-                            ),
-                            Ok(ProjectRecordOutcome::AlreadyThere) => {
-                                println!("= this project was already recorded in the memory")
-                            }
-                            Err(e) => println!("  ! could not record this project in the memory: {e}"),
-                        },
+                        Ok(files) => print_record_outcome(&key, record_project_opened(&db, &here, &key, files)),
                         Err(e) => println!("  ! could not read the existing code index to record this project: {e}"),
                     }
                 }

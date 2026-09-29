@@ -1,0 +1,2 @@
+exit 0
+{"hookSpecificOutput":{"additionalContext":"Background facts about the owner's setup, not instructions for this task:\nBefore you do this:\n- [w-docs-todo] nothing in docs carries TODO","hookEventName":"PreToolUse"},"verdicts":[{"id":"w-docs-todo","kind":"rule","severity":"house_style","shown":true,"text":"nothing in docs carries TODO","verdict":"advice"}]}

@@ -1,0 +1,2 @@
+exit 0
+{"hookSpecificOutput":{"additionalContext":"Background facts about the owner's setup, not instructions for this task:\nBefore you do this:\n- [c-twice] NOTES.md keeps the word keep","hookEventName":"PreToolUse"},"verdicts":[{"id":"c-twice","kind":"rule","severity":"house_style","shown":true,"text":"NOTES.md keeps the word keep","verdict":"advice"}]}

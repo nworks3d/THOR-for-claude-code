@@ -1,0 +1,2 @@
+exit 0
+{"decision":"block","reason":"[THOR] rule l-vendor forbids writing here (\"nothing under vendor is edited by hand\"); vendor is a protected location and <BASE>/location/alpha/vendor/lock.json may not be written."}

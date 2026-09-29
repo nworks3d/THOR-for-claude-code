@@ -73,7 +73,7 @@ fn fixture_with_agent_bound_orientation(dir: &Path) -> std::path::PathBuf {
         falsifier: Some("a swarm without that field turns out to be cheap anyway".to_string()),
         check: None,
     };
-    model::store::declare(&mut store, "s", "l", "a", &item).unwrap();
+    model::store::declare(&mut store, "s", "l", "a", &named(&item)).unwrap();
     db
 }
 
@@ -114,7 +114,7 @@ fn a_command_bound_rule_is_not_served_on_an_unrelated_tools_call() {
 /// this exercises the general serving path with a Command-anchored rule
 /// that ALSO carries a hard-guard-shaped `Absent` check, proving the bare
 /// tool name reaching the informational surface never trips a BLOCK - the
-/// hard guard (`command_guard_block`) only ever reads a real "command"
+/// hard guard (`serve::guard_verdict::command`) only ever reads a real "command"
 /// field, never `tool_name`, so it cannot see this call at all.
 #[test]
 fn a_forbidden_literal_check_against_a_bare_tool_name_never_blocks() {
@@ -138,7 +138,7 @@ fn a_forbidden_literal_check_against_a_bare_tool_name_never_blocks() {
         falsifier: Some("an em dash lands in an Agent call and nobody notices".to_string()),
         check: Some(model::item::Check::Absent { path: "POLICY.md".to_string(), literal: "\u{2014}".to_string() }),
     };
-    model::store::declare(&mut store, "s", "l", "a", &item).unwrap();
+    model::store::declare(&mut store, "s", "l", "a", &named(&item)).unwrap();
 
     let out = run_hook(&db, &tool_payload("s1", dir.path(), "Agent", serde_json::json!({"prompt": "summarise"})));
     let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("expected JSON: {e}: {out}"));
@@ -147,4 +147,18 @@ fn a_forbidden_literal_check_against_a_bare_tool_name_never_blocks() {
         Some(&serde_json::Value::String("block".to_string())),
         "a bare tool name reaching the informational surface must never block: {out}"
     );
+}
+
+/// `item` with every check literal its text does not name appended to the
+/// text (in `U+XXXX` form for a glyph): since step 8 of the two tracks the
+/// write gate refuses a check whose literal the rule's own words never name
+/// (A4), and these fixtures are about the hook, not about naming.
+fn named(item: &model::item::Item) -> model::item::Item {
+    let mut out = item.clone();
+    let unnamed = model::gate::unnamed_literals(&out);
+    if !unnamed.is_empty() {
+        let shown: Vec<String> = unnamed.iter().map(|l| format!("'{}'", model::gate::shown_literal(l))).collect();
+        out.text = format!("{} (names {})", out.text, shown.join(" "));
+    }
+    out
 }

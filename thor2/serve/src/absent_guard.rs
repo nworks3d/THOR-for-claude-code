@@ -13,7 +13,7 @@
 //! below for why), but they DO share one thing on purpose: the marker file
 //! (see the "At most one block" paragraph below), and the caller's own
 //! ordering, which prefers a location block over a content one whenever
-//! both would fire - see `serve/src/bin/serve.rs`'s `absent_guard_block`.
+//! both would fire - see `serve::guard_verdict::file_write`.
 //!
 //! Governing doctrine the CONTENT guard exists to prove:
 //! - Only a rule that carries a runnable check may block. Prose alone (a
@@ -155,30 +155,30 @@
 //! ...`, never through a file write the other two CONTENT arms could already
 //! see.
 //!
-//! Matching (`command_anchor_matches`) is its OWN comparison, never
-//! `rank::target_matches` - for the SAME underlying reason the LOCATION guard
-//! just above already refuses that function, but a different symptom:
-//! `target_matches` decides whole-string-or-last-path-segment equality,
-//! built to answer "is this the same file or command AS A WHOLE" - a real,
-//! argument-bearing Bash invocation is essentially never equal, as a whole
-//! string, to a short anchor like "git commit", and (having no `/`) gets no
-//! help from last-segment matching either, so reusing it here would mean
-//! this arm almost never fires at all. `command_anchor_matches` instead
-//! checks a WHITESPACE-TOKENIZED PREFIX, case-insensitively: "git commit"
-//! matches "git commit -m ..." and "git commit --amend" (every real way of
-//! running that subcommand) while still refusing "git push" (second word
-//! differs) and "git commit-graph verify" (`commit-graph` is one whole word,
-//! not `commit` followed by more text - why this compares WORDS, never
-//! `command.contains(anchor)`). PREFIX, deliberately, never "anywhere in the
-//! command": `echo "remember to git commit later"` must never match - that
-//! command's own first word is "echo", not "git", and a prefix check is what
-//! tells RUNNING a subcommand apart from merely mentioning it in passing
-//! (inside an echo, a comment, a search pattern). This is the guard's main
-//! defence against its own worst false-positive shape: the forbidden literal
-//! CAN genuinely, innocently appear in an unrelated command for a good
-//! reason, and this guard cannot read intent, only text - a narrow anchor (a
-//! full subcommand, never a bare "git") is most of what keeps that residual
-//! risk small, not this function.
+//! Matching is `serve::shell`'s, never `rank::target_matches` - for the SAME
+//! underlying reason the LOCATION guard just above already refuses that
+//! function, but a different symptom: `target_matches` decides
+//! whole-string-or-last-path-segment equality, built to answer "is this the
+//! same file or command AS A WHOLE", and a real, argument-bearing invocation
+//! is essentially never equal to a short anchor like "git commit". The call
+//! is cut into the simple commands it runs (`shell::segments`: every `;`,
+//! `&&`, `|`, newline, loop body, `$(...)`, `sh -c`, `ssh host cmd`, heredoc
+//! fed to a shell ...), and an anchor REACHES a segment when its words are a
+//! WORD PREFIX of that segment, case-insensitively, as typed or with shell
+//! syntax taken off the front (`sudo`, `NAME=value`, the program's directory
+//! and `.exe`, git's global options): "git commit" reaches `git commit -m ...`
+//! and `cd repo && git commit --amend`, never `git push` (second word differs)
+//! or `git commit-graph verify` (`commit-graph` is one whole word). A PREFIX of
+//! a segment, deliberately, never "anywhere": `echo "remember to git commit
+//! later"` runs `echo`, and a prefix is what tells RUNNING a subcommand apart
+//! from mentioning it (inside an echo, a comment, a search pattern, a heredoc
+//! fed to `cat`). The literal is then looked for in the reached segment's UNIT
+//! (its pipeline, the heredoc bodies it feeds, the last `cd` before it, or a
+//! whole loop), on token boundaries (`shell::literal_in`): a literal that sits
+//! in a LATER, unrelated command of the same line is none of this rule's
+//! business, and `--force` never matches inside `--force-with-lease`. See
+//! `serve::shell`'s own doc comment for all of it and for what it still cannot
+//! see.
 //!
 //! Currency is UNCHANGED: the check's own path resolves through the exact
 //! same `anchor_is_current` every other arm already uses, via the SAME
@@ -588,6 +588,18 @@ fn command_literals(check: &Check) -> Option<(Option<&str>, &[String])> {
     }
 }
 
+/// `quote_with_context`, around the occurrence at byte `at` rather than the
+/// first one - the command guard quotes the occurrence that sits on a token
+/// boundary, which need not be the first.
+fn quote_with_context_at(content: &str, at: usize, literal: &str) -> String {
+    let match_char_idx = content[..at].chars().count();
+    let literal_char_len = literal.chars().count();
+    let chars: Vec<char> = content.chars().collect();
+    let start = match_char_idx.saturating_sub(CONTEXT_CHARS);
+    let end = (match_char_idx + literal_char_len + CONTEXT_CHARS).min(chars.len());
+    chars[start..end].iter().collect()
+}
+
 /// The first literal, in the check's own declared order, that is actually
 /// present in `content` - never simply the first literal in the list
 /// regardless of whether IT matched. For a single-literal `Absent` check
@@ -817,83 +829,108 @@ fn requires_pair(check: &Check) -> Option<(&str, &[String])> {
 /// `tool` is the bare tool name; `command` is the real command string when
 /// the call carries one (a Bash/PowerShell-style "command" field read via
 /// `proposed_command`), `None` otherwise. `content` is every value the
-/// call's own input carries, flattened (`tool_input_values`) - used ONLY for
+/// call's own input carries, flattened (`guard_verdict`'s `tool_input_values`) - used ONLY for
 /// the requirement side below, never for the trigger.
+///
+/// A thin reader over [`find_requires_violation_in`], which the hook itself
+/// calls: a call with a command is cut into its segments in the dialect of
+/// `tool` (`shell::segments`); a call without one is ONE pseudo-segment, the
+/// tool's own name, whose unit is `content` (`shell::tool_segment`) - so an
+/// Agent, Workflow, WebFetch or MCP rule reaches exactly the calls it always
+/// did. No project scope is applied here (every item applies): the hook's own
+/// caller passes each segment's project instead.
+pub fn find_requires_violation(items: &[LiveItem], tool: &str, command: Option<&str>, content: &str) -> Option<String> {
+    let segments = match command {
+        Some(command) => crate::shell::segments(command, crate::shell::dialect_for(tool)),
+        None => vec![crate::shell::tool_segment(tool, content)],
+    };
+    find_requires_violation_in(items, &segments, None, content)
+}
+
+/// [`find_requires_violation`] over a call already cut into `segments`, each
+/// judged under its own project when `scope` is given (`scope[i]` is the
+/// project `segments[i]` runs in - see `guard_verdict::segment_projects`; an
+/// item scoped to another project is not this segment's business). `None`
+/// applies every item to every segment.
 ///
 /// THE REACH IS A `Command` TARGET, and ONLY a `Command` target. Always used
 /// to be a second reach here, and it is gone: `gate::declare`/`revise` now
 /// refuse a `Requires` check on an Always-bound item outright (ground 23),
 /// so a live store should never hold one - and this function does not
 /// special-case Always even defensively, because `command_bindings` below
-/// only ever returns a `Command`-kind target in the first place.
+/// only ever returns a `Command`-kind target in the first place. A binding
+/// reaches the call when it reaches ANY segment of it (`shell::anchor_reaches`),
+/// so `cd server && node --test x` and `ssh host "docker exec c ls"` are
+/// reached like the bare command.
 ///
 /// THE TRIGGER IS THE REACH, AND NOTHING ELSE COMPARES IT TO THE CALL.
 /// `when` used to be checked a SECOND time here, against the exact same
-/// text the reach itself already matched (`command_anchor_names(when,
-/// target)`) - and that second comparison is what quietly killed a second
-/// binding on the same item. MEASURED on the owner's own store:
-/// `zwerm-noemt-altijd-een-model` is bound to TWO commands, "Agent" and
-/// "Workflow", with `when: "Agent"`. Splitting it into two rules (one
-/// trigger each) is not an escape either - the near-duplicate gate refuses
-/// a second rule whose text says the same thing. So a call through the
-/// "Workflow" binding reached this function (the binding matched), then
-/// failed the second `when`-against-"Workflow" comparison and passed
-/// through unwatched - silently, because the item's own text never changed
-/// and nothing about it looked broken.
+/// text the reach itself already matched - and that second comparison is
+/// what quietly killed a second binding on the same item. MEASURED on the
+/// owner's own store: `zwerm-noemt-altijd-een-model` is bound to TWO
+/// commands, "Agent" and "Workflow", with `when: "Agent"`. So a call through
+/// the "Workflow" binding reached this function (the binding matched), then
+/// failed the second `when`-against-"Workflow" comparison and passed through
+/// unwatched - silently, because the item's own text never changed and
+/// nothing about it looked broken. The bindings already say exactly which
+/// calls this rule watches, so ANY one of them reaching is the whole trigger;
+/// `model::gate`'s ground 24 keeps the STORED `when` honest instead (it must
+/// equal one of the bindings, or be a specific literal inside one - the inner
+/// trigger below). The message quotes the binding that actually matched,
+/// never a `when` that merely names a binding.
 ///
-/// The fix removes the second comparison rather than patching it: the
-/// bindings already say exactly which calls this rule watches (that is
-/// what ground 23 forces `Requires` onto a `Command` target for in the
-/// first place), so ANY one of them reaching is the whole trigger. `when`
-/// plays no part in deciding reach any more (see `model::gate`'s own ground
-/// 24, which is what keeps the STORED `when` honest instead: it must equal
-/// one of the item's own bindings, or be a specific literal inside one - the
-/// inner trigger below, the one case where `when` narrows which reached
-/// calls owe an answer). The message below quotes the binding that actually
-/// matched, never a `when` that merely names a binding, so it can never claim
-/// a call tripped a spelling it did not.
-///
-/// Matching used to be `content.contains(when)` before ANY of this: a
-/// weaker defect than the one above, but still worth remembering.
+/// Matching used to be `content.contains(when)` before ANY of this:
 /// "reagent(" tripped "agent(", a Grep call searching FOR the trigger text
 /// tripped it on its own pattern (`a_grep_for_the_trigger_text_is_never_
-/// refused` below reproduces this verbatim), and a comment merely mentioning
-/// the trigger tripped it under an Always binding (no longer even
-/// constructible - see ground 23).
+/// refused` below reproduces this verbatim).
 ///
 /// The requirement side stays lenient on purpose: satisfied as soon as any
-/// of `required` appears ANYWHERE in the call's flattened input values,
-/// never narrowed to the field the trigger matched - a missed case here
-/// costs far less than a false refusal, the rule this whole project holds to
-/// throughout.
+/// of `required` appears ANYWHERE in the call's flattened input values, as a
+/// plain substring, never narrowed to the segment the trigger matched - a
+/// missed case here costs far less than a false refusal, the rule this whole
+/// project holds to throughout.
 ///
 /// THE INNER TRIGGER (2026-09-26), the one case where `when` is read again.
 /// A trigger that names none of the item's bindings (`model::gate::
 /// requires_trigger_names_a_binding`) is a literal INSIDE the bound command -
 /// "-p my-dev" inside an `ssh` call - and the write gate has already held it
 /// to being specific enough (`model::gate::inner_trigger_is_specific`). Reach
-/// is still the binding, exactly as above, so no second binding can go dead;
-/// the literal only narrows which of the reached calls owe an answer. It is
-/// looked for in the command itself (the flattened input for a tool with no
-/// command), as whole words (`contains_as_words`): "-p my-dev" never matches
-/// "-p my-dev-old".
-pub fn find_requires_violation(items: &[LiveItem], tool: &str, command: Option<&str>, content: &str) -> Option<String> {
-    let target = command.unwrap_or(tool);
+/// is still the binding, so no second binding can go dead; the literal only
+/// narrows which reached calls owe an answer, and it must sit in a REACHED
+/// segment's unit (`shell::trigger_in_segment`), on token boundaries: "-p
+/// my-dev" never matches "-p my-dev-old". A trigger ending in one `*` is a
+/// prefix ("/thor*" finds "/thor-probe-eval").
+///
+/// A PURE HELP OR VERSION CALL is never refused here (`shell::is_pure_help_call`):
+/// `install.exe --help` asks the program about itself and runs nothing.
+pub fn find_requires_violation_in(
+    items: &[LiveItem],
+    segments: &[crate::shell::Segment],
+    scope: Option<&[Option<String>]>,
+    content: &str,
+) -> Option<String> {
     for candidate in items {
         if !candidate.item.kind.can_fire() {
             continue;
         }
-        let Some(anchor) =
-            command_bindings(&candidate.item).into_iter().find(|anchor| command_anchor_names(anchor, target))
-        else {
-            continue;
-        };
         let Some(check) = candidate.item.check.as_ref() else { continue };
         let Some((when, required)) = requires_pair(check) else { continue };
+        let anchors = command_bindings(&candidate.item);
         let inner = !model::gate::requires_trigger_names_a_binding(when, &candidate.item.bindings);
-        if inner && !requires_trigger_in(command.unwrap_or(content), when) {
-            continue;
-        }
+        let hit = segments.iter().enumerate().find_map(|(i, segment)| {
+            if !in_scope(&candidate.item, scope, i) {
+                return None;
+            }
+            let anchor = anchors.iter().find(|a| crate::shell::anchor_reaches(a, segment))?;
+            if inner && !crate::shell::trigger_in_segment(segment, when) {
+                return None;
+            }
+            if crate::shell::is_pure_help_call(anchor, segment) {
+                return None;
+            }
+            Some(*anchor)
+        });
+        let Some(anchor) = hit else { continue };
         if required.iter().any(|r| content.contains(r.as_str())) {
             continue;
         }
@@ -910,42 +947,14 @@ pub fn find_requires_violation(items: &[LiveItem], tool: &str, command: Option<&
     None
 }
 
-/// Whether an inner `requires` trigger `when` occurs in `command` the way the
-/// live guard reads it - THE one definition, shared with the write-time proof
-/// (`serve::prove`), so the two can never disagree about whether a real call
-/// carries the trigger. See `contains_as_words` for the matching itself.
-pub fn requires_trigger_in(command: &str, when: &str) -> bool {
-    contains_as_words(command, when)
-}
-
-/// Whether `needle` occurs in `haystack` as whole words: the characters right
-/// around it are not part of a word, a flag or a name (letters, digits, `-`,
-/// `_`, `.`), so "-p my-dev" is found in `compose -p my-dev up` and in
-/// `"-p my-dev"`, but never in `-p my-dev-old`. An empty needle is never
-/// found.
-///
-/// A PATH SEPARATOR IS A BOUNDARY (2026-09-27). `/` and `\` used to count as
-/// part of a word too, so a trigger could never sit inside a URL or a path:
-/// "/health" was never found in `curl -s http://10.0.0.5:3002/health` (the
-/// character before it is a digit), and "compose.dev.yml" never in `-f
-/// ./compose.dev.yml`. Measured on a real store: a rule with exactly that
-/// trigger looked wired at write time and could never refuse the one call it
-/// was written for. A separator starts or ends a path segment, so a trigger
-/// may sit right after or before one; "/health" still never matches
-/// `/healthz`, and "-p my-dev" still never matches `-p my-dev-old`.
-fn contains_as_words(haystack: &str, needle: &str) -> bool {
-    let needle = needle.trim();
-    if needle.is_empty() {
-        return false;
+/// Whether segment `i` of a call is `item`'s business: `scope` names the
+/// project each segment runs in, and an item scoped to another project is
+/// not (`project::applies_to`). No `scope`: every item applies everywhere.
+fn in_scope(item: &Item, scope: Option<&[Option<String>]>, i: usize) -> bool {
+    match scope {
+        None => true,
+        Some(projects) => crate::project::applies_to(item.project.as_deref(), projects.get(i).and_then(|p| p.as_deref())),
     }
-    let joins = |c: char| c.is_alphanumeric() || "-_.".contains(c);
-    haystack.match_indices(needle).any(|(at, _)| {
-        let before = haystack[..at].chars().next_back();
-        let after = haystack[at + needle.len()..].chars().next();
-        let starts_clean = before.is_none_or(|c| !joins(c) || !needle.starts_with(joins));
-        let ends_clean = after.is_none_or(|c| !joins(c) || !needle.ends_with(joins));
-        starts_clean && ends_clean
-    })
 }
 
 /// The block reason for the first live item among `items` carrying a
@@ -1125,7 +1134,8 @@ fn path_is_or_contains(anchor_abs: &Path, file_abs: &Path) -> bool {
 /// refuses) keeps the plain, root-blind `target_matches` comparison
 /// completely unchanged. `Command` never reaches here at all - `rank::
 /// binding_matches` already gives it its own comparison
-/// (`command_anchor_names`), which has nothing to do with a filesystem root.
+/// (`shell::reaches_any` over the call's segments), which has nothing to do
+/// with a filesystem root.
 pub fn scoped_target_matches(
     item_project: Option<&str>,
     item_kind: TargetKind,
@@ -1557,9 +1567,9 @@ fn first_dir_violation<'a>(
 /// The `Path`-anchored counterpart, `find_violation` above, is left
 /// completely untouched by this function's existence: a caller wanting full
 /// CONTENT-guard coverage calls both and takes whichever fires (mirrors
-/// `serve/src/bin/serve.rs`'s own `absent_guard_block`, which already
-/// combines `find_location_violation` and `find_violation` the identical
-/// way, via `Option::or_else`) - never merged into one function, so the
+/// `serve::guard_verdict::file_write`, which already combines
+/// `find_location_violation` and `find_violation` the identical way, via
+/// `Option::or_else`) - never merged into one function, so the
 /// pre-existing `Path` behaviour stays provably exactly what it was.
 pub fn find_dir_content_violation(items: &[LiveItem], file_path: &str, content: &str, root: Option<&Path>) -> Option<String> {
     if let Some((item, literal)) = first_dir_violation(items, file_path, content, root) {
@@ -1641,37 +1651,25 @@ fn first_check_path_dir_violation<'a>(
 // The CONTENT guard's THIRD anchor shape (see this module's own top-of-file
 // doc comment, "THE COMMAND guard", for the full doctrine): a rule whose
 // `Target` binding is a `Command`, whose currency is still provable, and
-// whose forbidden literal appears in the COMMAND STRING itself, never a
-// file's proposed content - there is none here. Structured as a close
-// mirror of "the block (dir-anchored)" section just above (same
-// `&[LiveItem]` candidate-pool shape, never `rank::select`'s output, same
-// reuse of `absent_literals`/`anchor_is_current`/`first_present_literal`),
-// but matching by `command_anchor_matches` instead of `path_is_or_contains` -
-// a command has no filesystem containment to test.
-
-/// The one `Command`-kind target binding's own value on `item`, if any -
-/// mirrors `dir_binding`'s own shape exactly, including its reasoning: this
-/// guard's own candidate pool never goes through `rank::select` either (see
-/// this module's own top-of-file doc comment), so nothing else would stop a
-/// `Report`/`Chunk`/`Lookup` from reaching this far without the
-/// `Kind::can_fire` gate repeated here.
-fn command_binding(item: &Item) -> Option<&str> {
-    if !item.kind.can_fire() {
-        return None;
-    }
-    item.bindings.iter().find_map(|b| match b {
-        Binding::Target { kind: TargetKind::Command, value } => Some(value.as_str()),
-        _ => None,
-    })
-}
+// whose forbidden literal appears in the call itself, never a file's
+// proposed content - there is none here. Structured as a close mirror of
+// "the block (dir-anchored)" section just above (same `&[LiveItem]`
+// candidate-pool shape, never `rank::select`'s output, same reuse of
+// `absent_literals`/`anchor_is_current`), but matching by `serve::shell`
+// (an anchor reaching a segment, a literal in that segment's unit) instead of
+// `path_is_or_contains` - a command has no filesystem containment to test.
 
 /// EVERY command anchor an item carries, not just the first.
 ///
-/// `command_binding` above returns one, which was fine while nothing declared
-/// two - and silently wrong the moment something did. Measured on the owner's
-/// own store: a rule given two spellings of the same command only ever
-/// considered the first, so the spelling actually typed went unguarded while
-/// the second binding read as protection that was not there.
+/// A single-anchor reader was fine while nothing declared two - and silently
+/// wrong the moment something did. Measured on the owner's own store: a rule
+/// given two spellings of the same command only ever considered the first,
+/// so the spelling actually typed went unguarded while the second binding
+/// read as protection that was not there.
+///
+/// The `Kind::can_fire` gate is repeated here (mirroring `dir_binding`): this
+/// guard's own candidate pool never goes through `rank::select`, so nothing
+/// else would stop a `Report`/`Chunk`/`Lookup` from reaching this far.
 fn command_bindings(item: &Item) -> Vec<&str> {
     if !item.kind.can_fire() {
         return Vec::new();
@@ -1685,164 +1683,121 @@ fn command_bindings(item: &Item) -> Vec<&str> {
         .collect()
 }
 
-/// The command as the RULE means it, with the wrapping that shell syntax adds
-/// taken off: a leading `sudo`, leading `VAR=value` assignments, the directory
-/// part of the executable, and a `.exe` suffix.
-///
-/// WHY THIS IS NOT A WIDENING. Running a program under `sudo`, by absolute
-/// path, or by its Windows spelling is the same act; only the typing differs.
-/// A matcher that treats them as different commands is not being strict, it is
-/// mistaking shell syntax for intent - and it fails in the one direction that
-/// matters, because the dangerous form is usually the one typed with a full
-/// path or under sudo. The prohibition still lives entirely in the literal;
-/// this only decides which rules get to look.
-///
-/// KNOWN GAP, stated rather than left to be rediscovered: a command run
-/// THROUGH another one, such as a container exec, still does not match an
-/// anchor naming the inner command, because the anchor would have to match in
-/// the middle rather than at the front. Making an anchor match anywhere is a
-/// real widening, and this project has twice measured what unvalidated
-/// widening costs, so it needs a blind hold-out first, not an argument.
-///
-/// `pub(crate)` for a second caller: `serve::input::shell_write_targets`
-/// reuses this SAME normalisation to recognise `sh -c "..."`, `bash -lc
-/// "..."` and `powershell -Command "..."` as wrapper invocations before it
-/// scans the string a wrapper carries, rather than growing a second,
-/// independently-maintained idea of what counts as "the same command
-/// underneath the typing".
-pub(crate) fn strip_invocation_wrapper(command: &str) -> String {
-    let mut words: Vec<&str> = command.split_whitespace().collect();
-    while let Some(first) = words.first() {
-        if *first == "sudo" || (first.contains('=') && !first.starts_with('-')) {
-            words.remove(0);
-        } else {
-            break;
-        }
-    }
-    if let Some(first) = words.first_mut() {
-        let base = first.rsplit(['/', '\\']).next().unwrap_or(first);
-        *first = base.strip_suffix(".exe").or_else(|| base.strip_suffix(".EXE")).unwrap_or(base);
-    }
-    words.join(" ")
-}
-
-/// Whether `anchor` (a rule's own declared `Command` target value, e.g. "git
-/// commit") names the command actually about to run (`command`, the raw
-/// string read off the tool payload) - deliberately its OWN comparison,
-/// never `rank::target_matches` (see this module's own top-of-file doc
-/// comment, "THE COMMAND guard", for why that function's whole-string-or-
-/// last-path-segment equality was built to answer a different question and
-/// would in practice almost never match a real, argument-bearing
-/// invocation).
-///
-/// A WHITESPACE-TOKENIZED PREFIX, case-insensitively: holds when `command`'s
-/// own leading words are EXACTLY `anchor`'s words, in order. "git commit"
-/// then matches "git commit -m ..." and "git commit --amend" (every real way
-/// of running that subcommand) while still refusing "git push" (the second
-/// word differs) and "git commit-graph verify" (`commit-graph` is one whole
-/// word, not the word `commit` followed by more text - the reason this
-/// compares WORDS, never `command.contains(anchor)`). PREFIX, deliberately,
-/// never "anywhere in the command": `echo "remember to git commit later"`
-/// must never match an anchor of "git commit" - it only MENTIONS the
-/// subcommand, it does not run it, and a prefix check is what tells the
-/// difference (that command's own first word is "echo"). An empty anchor
-/// never matches anything (mirrors `ServeInput::add_command`'s own refusal
-/// to treat an empty string as a command at all, so this is defence in depth
-/// rather than a reachable case for a live item - the write gate already
-/// refuses an empty Target value).
-/// The ONE definition of "this rule's `Command` anchor names the command about
-/// to run", raw spelling or with its shell wrapper taken off - the composition
-/// `first_command_violation` always used inline, given a name so a second
-/// caller cannot drift from it.
+/// "This rule's `Command` anchor names the command about to run", for a
+/// reader that has only the command's text: `command` is cut into its
+/// segments in the sh dialect (`shell::segments`) and the anchor reaches it
+/// when it reaches ANY of them (`shell::anchor_reaches`). Every production
+/// reader now cuts the call itself and asks `shell` directly (serving in
+/// `rank::select`, the hard guards in `guard_verdict`, a rule's trial in
+/// `teeth`), so this stays only for the tests below that pin the comparison.
 ///
 /// THE DEFECT THIS CLOSES, reproduced against the real store on 2026-08-14.
 /// The blocking arm used this comparison; the SERVING path used
 /// `rank::target_matches`, which decides whole-string-or-path-segment
 /// equality. So a rule anchored to "gh repo edit" was served for a bare
 /// `gh repo edit` and stayed silent for `gh repo edit <repo> --visibility
-/// public` - the real invocation, the one it was written for. A whole binding
-/// kind quietly did not do what it says, and the store's most dangerous rule
-/// was in it. See this module's top-of-file doc comment for why the two
-/// comparisons exist at all; the fix is that command matching now has one
-/// definition, not that `target_matches` was wrong about paths.
+/// public` - the real invocation, the one it was written for. See this
+/// module's top-of-file doc comment for why the two comparisons exist at all;
+/// the fix is that command matching has one definition, not that
+/// `target_matches` was wrong about paths.
+#[cfg(test)]
 pub(crate) fn command_anchor_names(anchor: &str, command: &str) -> bool {
-    command_anchor_matches(anchor, command)
-        || command_anchor_matches(anchor, &strip_invocation_wrapper(command))
+    crate::shell::reaches_any(anchor, &crate::shell::segments(command, crate::shell::Dialect::Sh))
 }
 
-fn command_anchor_matches(anchor: &str, command: &str) -> bool {
-    let anchor_words: Vec<String> = anchor.split_whitespace().map(str::to_lowercase).collect();
-    if anchor_words.is_empty() {
-        return false;
-    }
-    let command_words: Vec<String> =
-        command.split_whitespace().take(anchor_words.len()).map(str::to_lowercase).collect();
-    command_words == anchor_words
+/// What the command guard found: the item, the anchor that reached the call,
+/// the literal, and where it was found (the text quoted in the refusal and
+/// the literal as it sits there).
+struct CommandHit<'a> {
+    item: &'a LiveItem,
+    anchor: &'a str,
+    literal: &'a str,
+    site: (String, String),
 }
 
 /// The first candidate among `items` (in whatever deterministic order the
 /// caller's own candidate fetch produced - `live::candidates_for`/
 /// `live::live_items` are both id-ordered, never hashmap order, mirroring
-/// `first_location_violation`'s own ordering note) whose `Command` binding
-/// (`command_binding`) matches the command about to run
-/// (`command_anchor_matches`), whose check is a still-current
-/// `Check::Absent`/`Check::AbsentAll` (`absent_literals` + `anchor_is_current`
-/// - the SAME two steps `first_violation`/`first_dir_violation` already use),
-/// and at least one of whose literals is present in `command` ITSELF - never
-/// a file's proposed content, there is none here. Returns the matched item,
-/// its own anchor value (the caller needs this for the once-per-session
-/// marker key - see this module's own top-of-file doc comment for why) and
-/// the literal that matched.
+/// `first_location_violation`'s own ordering note) one of whose `Command`
+/// anchors (`command_bindings`) reaches a segment of the call that is in its
+/// scope (see [`find_requires_violation_in`] on `scope`), whose check is a
+/// `Forbidden`, or a still-current `Absent`/`AbsentAll` (`command_literals` +
+/// `anchor_is_current`), and one of whose literals sits in that segment's
+/// unit on token boundaries (`shell::literal_site`).
 fn first_command_violation<'a>(
     items: &'a [LiveItem],
-    command: &str,
+    segments: &[crate::shell::Segment],
+    scope: Option<&[Option<String>]>,
     root: Option<&Path>,
-) -> Option<(&'a LiveItem, &'a str, &'a str)> {
+) -> Option<CommandHit<'a>> {
     let root = root?;
-    let normalised = strip_invocation_wrapper(command);
     for candidate in items {
-        // EVERY anchor the item carries, and the command with its shell
-        // wrapping taken off - see `command_bindings` and
-        // `strip_invocation_wrapper` for what each of those two fixed.
-        let Some(anchor) = command_bindings(&candidate.item)
-            .into_iter()
-            .find(|a| command_anchor_matches(a, command) || command_anchor_matches(a, &normalised))
-        // `command_anchor_names` is this same pair, and the serving path now
-        // calls it; the inline form is kept here only because `normalised` is
-        // hoisted out of the loop.
-        else {
+        let anchors = command_bindings(&candidate.item);
+        if anchors.is_empty() {
             continue;
-        };
+        }
         let Some(check) = &candidate.item.check else { continue };
         let Some((check_path, literals)) = command_literals(check) else { continue };
-        // A path, when the check names one, still has to be there. A
-        // `Forbidden` check names none and needs none: see `command_literals`.
-        if let Some(check_path) = check_path {
-            if !anchor_is_current(check_path, root) {
+        let mut current: Option<bool> = None;
+        for (i, segment) in segments.iter().enumerate() {
+            if !in_scope(&candidate.item, scope, i) {
                 continue;
             }
-        }
-        if let Some(literal) = first_present_literal(literals, command) {
-            return Some((candidate, anchor, literal));
+            let Some(anchor) = anchors.iter().find(|a| crate::shell::anchor_reaches(a, segment)) else { continue };
+            // A path, when the check names one, still has to be there. A
+            // `Forbidden` check names none and needs none: see `command_literals`.
+            if let Some(check_path) = check_path {
+                if !*current.get_or_insert_with(|| anchor_is_current(check_path, root)) {
+                    break;
+                }
+            }
+            for literal in literals {
+                if let Some(site) = crate::shell::literal_site(segment, literal) {
+                    return Some(CommandHit { item: candidate, anchor, literal, site });
+                }
+            }
         }
     }
     None
 }
 
-/// The full block reason for the first command-anchored violation
-/// `first_command_violation` finds among `items`, paired with the matched
-/// item's own anchor value - `None` when nothing currently violates (no
-/// candidate's `Command` binding matches `command`, none is current, or the
-/// literal is simply not present in `command` itself). Reuses `block_message`
-/// - the SAME message shape `find_violation`/`find_dir_content_violation`
-/// already produce - quoted against the command string itself rather than a
-/// file's proposed content. Returns the anchor ALONGSIDE the reason (unlike
-/// its two siblings, which return only the reason) because the caller cannot
-/// know the once-per-session marker key up front the way it can for a file
-/// path - see this module's own top-of-file doc comment.
+/// The full block reason for the first command-anchored violation among
+/// `items`, paired with the matched item's own anchor value - `None` when
+/// nothing currently violates. A thin reader over
+/// [`find_command_violation_in`] for a caller holding only the command's text:
+/// it is cut in the sh dialect, and every item applies to every segment.
 pub fn find_command_violation(items: &[LiveItem], command: &str, root: Option<&Path>) -> Option<(String, String)> {
-    let (item, anchor, literal) = first_command_violation(items, command, root)?;
-    Some((block_message(&item.id, &item.item.text, command, literal), anchor.to_string()))
+    let segments = crate::shell::segments(command, crate::shell::Dialect::Sh);
+    find_command_violation_in(items, &segments, None, root)
+}
+
+/// [`find_command_violation`] over a call already cut into `segments`, each
+/// judged under its own project when `scope` is given. Reuses `block_message`
+/// - the SAME message shape `find_violation`/`find_dir_content_violation`
+/// already produce - quoted from the reached segment's unit, around the
+/// occurrence that sits on a token boundary. Returns the anchor ALONGSIDE the
+/// reason (unlike its two siblings, which return only the reason) because the
+/// caller cannot know the once-per-session marker key up front the way it can
+/// for a file path - see this module's own top-of-file doc comment.
+pub fn find_command_violation_in(
+    items: &[LiveItem],
+    segments: &[crate::shell::Segment],
+    scope: Option<&[Option<String>]>,
+    root: Option<&Path>,
+) -> Option<(String, String)> {
+    let hit = first_command_violation(items, segments, scope, root)?;
+    let (text, found) = &hit.site;
+    let quote = match crate::shell::find_at_boundary(text, found) {
+        Some(at) => quote_with_context_at(text, at, found),
+        None => hit.literal.to_string(),
+    };
+    Some((
+        format!(
+            "[THOR] rule {} forbids this text (\"{}\"); found in what is about to be written: \"{quote}\"",
+            hit.item.id, hit.item.item.text
+        ),
+        hit.anchor.to_string(),
+    ))
 }
 
 /// Where the command guard's OWN once-per-session marker lives - never the
@@ -1887,16 +1842,19 @@ pub fn default_command_marker_path(db: &Path) -> PathBuf {
 // currency is a file-system question, proven against a path, never a
 // question the text of a command or a proposed write can answer on its own.
 //
-// REUSES `command_literals`/`first_present_literal` - the exact matching
-// `first_command_violation` already runs - rather than a second copy of
+// REUSES `command_literals` and the command guard's own reach and unit
+// (`shell::anchor_reaches`, `shell::literal_in`) rather than a second copy of
 // either. `command_literals` returns `Some((None, literals))` for ONE check
 // form only (`Forbidden`; every anchored form comes back `Some((Some(path),
 // ..))`, every unrelated form `None`), so testing its path half for `None`
 // IS "is this check a Forbidden check", with nothing here re-deciding that
-// question a second way. A prohibition found here can therefore never
+// question a second way. For an item bound to a `Command` anchor the literal
+// is looked for exactly where the guard looks: in the unit of a segment the
+// anchor reaches, on token boundaries. So a prohibition found here can never
 // disagree with a refusal `find_command_violation` finds for the very same
-// item and command: both ask the identical question of the identical check
-// (see `the_classifier_and_the_command_guard_never_disagree` below).
+// item and command (see `the_classifier_and_the_command_guard_never_disagree`
+// below). An item with no Command anchor (an Always-bound check) is read
+// against the whole command, on token boundaries too.
 
 /// One served fact's classification for a proposed action - see this
 /// section's own doc comment for the full doctrine. `Prohibition` names the
@@ -1908,14 +1866,15 @@ pub enum Verdict {
 }
 
 /// Whether `check` is a prohibition for `command` (and, where the surface
-/// carries one, `content`) - the per-check half of `classify_moment` below,
-/// kept separate so a test can drive one check at a time with no
-/// `RankedItem` to build. `content` is tried only when `command` itself did
-/// not already match: a Bash-style call has no content at all (see
-/// `proposed_content`'s own doc comment on the two tool shapes that do), and
-/// checking it unconditionally would cost nothing wrong today but would
-/// invite exactly that "just search everything" drift this module's own
-/// doctrine warns against elsewhere.
+/// carries one, `content`), read against the WHOLE command - the reading for
+/// a check whose item has no Command anchor (an Always-bound `Forbidden`
+/// check), kept separate so a test can drive one check at a time with no
+/// item to build. The command side matches on token boundaries
+/// (`shell::literal_at_boundary`), like every literal matched against a call;
+/// `content` (a Write/Edit fragment) keeps plain substring matching, like every
+/// file-content check. `content` is tried only when `command` itself did not
+/// already match: a Bash-style call has no content at all (see
+/// `proposed_content`'s own doc comment on the two tool shapes that do).
 pub fn classify_check(check: Option<&Check>, command: &str, content: Option<&str>) -> Verdict {
     let Some(check) = check else { return Verdict::Advice };
     // See this section's own doc comment: `Some((None, literals))` is
@@ -1924,18 +1883,43 @@ pub fn classify_check(check: Option<&Check>, command: &str, content: Option<&str
     // `None`. Both fall through to Advice below, never a second match arm
     // re-deciding what `command_literals` already decided.
     let Some((None, literals)) = command_literals(check) else { return Verdict::Advice };
-    if let Some(literal) = first_present_literal(literals, command) {
+    if let Some(literal) = literals.iter().find(|l| crate::shell::literal_at_boundary(command, l)) {
         return Verdict::Prohibition { literal: literal.to_string() };
     }
-    if let Some(content) = content {
-        if let Some(literal) = first_present_literal(literals, content) {
-            return Verdict::Prohibition { literal: literal.to_string() };
-        }
+    content_prohibition(literals, content)
+}
+
+fn content_prohibition(literals: &[String], content: Option<&str>) -> Verdict {
+    if let Some(literal) = content.and_then(|content| first_present_literal(literals, content)) {
+        return Verdict::Prohibition { literal: literal.to_string() };
     }
     Verdict::Advice
 }
 
-/// The classifier itself: `classify_check` above, run over every one of
+/// Whether `item`'s check is a prohibition for `command` (and `content`): for
+/// an item bound to a `Command` anchor, the literal must sit in the unit of a
+/// segment one of those anchors reaches (`command` is cut in the sh dialect,
+/// the reading of every surface that has only a command's text), exactly as
+/// the command guard reads it; for any other item, `classify_check`.
+pub fn classify_item(item: &Item, command: &str, content: Option<&str>) -> Verdict {
+    let anchors = command_bindings(item);
+    if anchors.is_empty() {
+        return classify_check(item.check.as_ref(), command, content);
+    }
+    let Some(check) = &item.check else { return Verdict::Advice };
+    let Some((None, literals)) = command_literals(check) else { return Verdict::Advice };
+    for segment in crate::shell::segments(command, crate::shell::Dialect::Sh) {
+        if !anchors.iter().any(|a| crate::shell::anchor_reaches(a, &segment)) {
+            continue;
+        }
+        if let Some(literal) = literals.iter().find(|l| crate::shell::literal_in(&segment, l)) {
+            return Verdict::Prohibition { literal: literal.to_string() };
+        }
+    }
+    content_prohibition(literals, content)
+}
+
+/// The classifier itself: `classify_item` above, run over every one of
 /// `ranked` - the items a moment already selected (`rank::select`'s own
 /// output, exactly as `check`/`why`/`hook` already serve it) - paired with
 /// each item's own id so a caller never has to zip two lists back together
@@ -1943,7 +1927,7 @@ pub fn classify_check(check: Option<&Check>, command: &str, content: Option<&str
 /// never this function (see `serve/src/bin/serve.rs`'s own `check_rows`,
 /// `mark_prohibitions` and `why_lines`, the only places that do).
 pub fn classify_moment(ranked: &[RankedItem], command: &str, content: Option<&str>) -> Vec<(String, Verdict)> {
-    ranked.iter().map(|r| (r.id.clone(), classify_check(r.item.check.as_ref(), command, content))).collect()
+    ranked.iter().map(|r| (r.id.clone(), classify_item(&r.item, command, content))).collect()
 }
 
 // ----------------------------------------------------- staleness sidecar
@@ -2146,8 +2130,9 @@ pub fn stale_in_dir_content(items: &[LiveItem], file_path: &str, root: Option<&P
 }
 
 /// The command guard's own mirror of `stale_in_dir_content` above (matching
-/// here is `command_binding`/`command_anchor_matches`, never `dir_binding`/
-/// `path_is_or_contains` - a command has no filesystem containment to test).
+/// here is the command guard's own reach - an anchor reaching a segment of
+/// the call, `shell::anchor_reaches` - never `dir_binding`/
+/// `path_is_or_contains`: a command has no filesystem containment to test).
 /// Anchor-matching is checked BEFORE currency, the same deliberately-reversed
 /// order `stale_in_location`/`stale_in_dir_content` already use and for the
 /// identical reason (see their own doc comments): skipping it would flag
@@ -2159,13 +2144,25 @@ pub fn stale_in_dir_content(items: &[LiveItem], file_path: &str, root: Option<&P
 /// two arms already write (via the caller's own `record_stale_text`):
 /// `StaleRecord`/`StaleFinding` are keyed by item id, never by "file" vs
 /// "command", so this needs no sidecar of its own the way the BLOCK marker
-/// does (`default_command_marker_path` above).
+/// does (`default_command_marker_path` above). This reader cuts `command` in
+/// the sh dialect; the hook passes the call's own segments to
+/// [`stale_in_command_in`].
 pub fn stale_in_command(items: &[LiveItem], command: &str, root: Option<&Path>) -> Vec<StaleFinding> {
+    stale_in_command_in(items, &crate::shell::segments(command, crate::shell::Dialect::Sh), command, root)
+}
+
+/// [`stale_in_command`] over a call already cut into `segments`.
+pub fn stale_in_command_in(
+    items: &[LiveItem],
+    segments: &[crate::shell::Segment],
+    command: &str,
+    root: Option<&Path>,
+) -> Vec<StaleFinding> {
     let Some(root) = root else { return Vec::new() };
     let mut out = Vec::new();
     for candidate in items {
-        let Some(anchor) = command_binding(&candidate.item) else { continue };
-        if !command_anchor_matches(anchor, command) {
+        let anchors = command_bindings(&candidate.item);
+        if !anchors.iter().any(|a| crate::shell::reaches_any(a, segments)) {
             continue;
         }
         let Some(check) = &candidate.item.check else { continue };
@@ -2855,7 +2852,9 @@ sonnet").is_none(),
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("NOTES.md"), "# notes\n").unwrap();
         let mut db = thor_core::event_store::EventStore::in_memory().unwrap();
-        let item = item_with_check("r1", "NOTES.md", "forbidden").item;
+        let mut item = item_with_check("r1", "NOTES.md", "forbidden").item;
+        // A rule's tooth is named in its own text (A4, since step 8).
+        item.text.push_str(" - never write forbidden into it");
         model::store::declare(&mut db, "s", "l", "a", &item).unwrap();
 
         let mut input = crate::input::ServeInput::default();
@@ -4185,7 +4184,7 @@ sonnet").is_none(),
 
     /// A live Rule bound to `command_anchor` via a `Command` target, carrying
     /// a `Check::Absent` for `check_path` forbidding `literal` - the minimal
-    /// shape `command_binding`/`first_command_violation` require. Unlike
+    /// shape `command_bindings`/`first_command_violation` require. Unlike
     /// `item_with_check`/`dir_item_with_check` above, `check_path` is
     /// deliberately a DIFFERENT string from `command_anchor`, never one
     /// reused twice: a command anchor ("git commit") is not a file path, and
@@ -4288,18 +4287,22 @@ sonnet").is_none(),
         // A different subcommand of the same program is not this rule.
         assert!(find_command_violation(&items, "sudo git pull --ff-only", Some(dir.path())).is_none());
 
-        // THE LIMIT, pinned rather than hidden: an executable path containing
-        // a SPACE is split into two words before anything else runs, so the
-        // first word is not the program at all and the anchor cannot match.
-        // Handling it properly means parsing shell quoting, which is the one
-        // thing both reviews of this guard said not to build - a false
-        // positive machine aimed at exactly the place false positives teach
-        // people to route around the gate. Stated here so the next reader
-        // knows it is a decision, not an oversight.
+        // UPDATED ON PURPOSE (the door, 2026-09-28): the matcher now reads
+        // shell quoting (`serve::shell`), so a QUOTED executable path with a
+        // space in it is one word, the program is git, and the call is
+        // refused like any other spelling of it.
+        assert!(
+            find_command_violation(&items, r#""C:\Program Files\Git\git.exe" reset --hard x"#, Some(dir.path()))
+                .is_some(),
+            "a quoted path with a space names one program"
+        );
+        // An UNQUOTED path with a space is still two words - the shell itself
+        // splits it there - so the first word is not the program and the
+        // anchor does not reach it.
         assert!(
             find_command_violation(&items, r"C:\Program Files\Git\git.exe reset --hard x", Some(dir.path()))
                 .is_none(),
-            "if this starts blocking, someone taught the matcher about quoting - update this test on purpose"
+            "an unquoted path with a space is two words to the shell too"
         );
     }
 
@@ -4517,12 +4520,15 @@ sonnet").is_none(),
 
     // ------------------------------------------- command-anchor matching
     //
-    // Direct, pure-function-level tests of `command_anchor_matches` - the
+    // Direct, pure-function-level tests of `command_anchor_names` - the
     // precision the CONTENT guard's other two arms get for free from
     // filesystem containment/full-path equality, but a command has neither,
     // so this comparison earns its own focused tests, mirroring how
     // `rank.rs`'s own `target_matches_is_the_only_definition_used_here` tests
     // `target_matches` directly, alongside `select`'s own higher-level tests.
+    // The reach is now per segment (`serve::shell`), so each "prefix" below is
+    // a prefix of one simple command of the call; `serve/src/shell/tests.rs`
+    // holds the compound shapes.
 
     /// The realistic case, at realistic length: a heredoc-wrapped commit
     /// message (the exact shape this workspace's own commit instructions
@@ -4532,14 +4538,14 @@ sonnet").is_none(),
     #[test]
     fn an_anchor_matches_a_long_heredoc_wrapped_commit_command() {
         let command = "git commit -m \"$(cat <<'EOF'\nSubject line with a forbidden word\n\nEOF\n)\"";
-        assert!(command_anchor_matches("git commit", command));
+        assert!(command_anchor_names("git commit", command));
     }
 
     #[test]
     fn an_anchor_matches_every_flag_variant_of_its_own_subcommand() {
-        assert!(command_anchor_matches("git commit", "git commit -m \"fine\""));
-        assert!(command_anchor_matches("git commit", "git commit --amend"));
-        assert!(command_anchor_matches("git commit", "git commit"));
+        assert!(command_anchor_names("git commit", "git commit -m \"fine\""));
+        assert!(command_anchor_names("git commit", "git commit --amend"));
+        assert!(command_anchor_names("git commit", "git commit"));
     }
 
     /// THE DEFECT THIS PREVENTS - the task's own worked concern: an anchor of
@@ -4547,8 +4553,8 @@ sonnet").is_none(),
     /// committing fires on every git command.
     #[test]
     fn an_anchor_does_not_match_a_different_git_subcommand() {
-        assert!(!command_anchor_matches("git commit", "git push origin main"));
-        assert!(!command_anchor_matches("git commit", "git status"));
+        assert!(!command_anchor_names("git commit", "git push origin main"));
+        assert!(!command_anchor_names("git commit", "git status"));
     }
 
     /// THE DEFECT THIS PREVENTS: a plain substring test
@@ -4557,7 +4563,7 @@ sonnet").is_none(),
     /// whole word, never the word `commit` followed by more text.
     #[test]
     fn an_anchor_does_not_match_a_lookalike_subcommand_sharing_a_text_prefix() {
-        assert!(!command_anchor_matches("git commit", "git commit-graph verify"));
+        assert!(!command_anchor_names("git commit", "git commit-graph verify"));
     }
 
     /// THE DEFECT THIS PREVENTS - the guard's own worst false-positive shape
@@ -4569,25 +4575,42 @@ sonnet").is_none(),
     /// words appear anywhere in the command".
     #[test]
     fn an_anchor_does_not_match_when_its_words_appear_later_in_the_command_not_as_a_prefix() {
-        assert!(!command_anchor_matches("git commit", "echo remember to git commit later"));
+        assert!(!command_anchor_names("git commit", "echo remember to git commit later"));
     }
 
     #[test]
     fn command_anchor_matching_is_case_insensitive() {
-        assert!(command_anchor_matches("git commit", "GIT COMMIT -m \"fine\""));
-        assert!(command_anchor_matches("GIT COMMIT", "git commit -m \"fine\""));
+        assert!(command_anchor_names("git commit", "GIT COMMIT -m \"fine\""));
+        assert!(command_anchor_names("GIT COMMIT", "git commit -m \"fine\""));
     }
 
     #[test]
     fn an_empty_anchor_never_matches_any_command() {
-        assert!(!command_anchor_matches("", "git commit -m \"fine\""));
-        assert!(!command_anchor_matches("", ""));
+        assert!(!command_anchor_names("", "git commit -m \"fine\""));
+        assert!(!command_anchor_names("", ""));
+    }
+
+    /// THE DOOR (2026-09-28): the anchor reaches ANY segment of the call,
+    /// not only the head of the line - and the staleness sidecar reads the
+    /// same reach.
+    #[test]
+    fn an_anchor_reaches_a_segment_after_a_cd_a_pipe_or_a_wrapper() {
+        assert!(command_anchor_names("git commit", "cd repo && git commit -m \"fine\""));
+        assert!(command_anchor_names("git commit", "git add -A; git commit -m \"fine\""));
+        assert!(command_anchor_names("git commit", "bash -lc 'git commit -m fine'"));
+        assert!(!command_anchor_names("git commit", "cd repo && git status"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let items = vec![command_item_with_check("cmd16", "git commit", "COMMIT-POLICY.md", "forbidden")];
+        let findings = stale_in_command(&items, "cd repo && git commit -m x", Some(dir.path()));
+        assert_eq!(findings.len(), 1, "a compound call reaching the anchor is looked at for staleness too");
+        assert!(stale_in_command(&items, "cd repo && git push", Some(dir.path())).is_empty());
     }
 
     #[test]
     fn a_command_shorter_than_the_anchor_never_matches() {
-        assert!(!command_anchor_matches("git commit", "git"));
-        assert!(!command_anchor_matches("git commit", ""));
+        assert!(!command_anchor_names("git commit", "git"));
+        assert!(!command_anchor_names("git commit", ""));
     }
 
     // ---------------------------- block, AbsentAll (set form), command-anchored
@@ -4799,7 +4822,9 @@ sonnet").is_none(),
         // the matching step entirely (and jumped straight to a currency
         // check) would still be caught here.
         let mut db = thor_core::event_store::EventStore::in_memory().unwrap();
-        let item = item_with_check("r4", "NOTES.md", "forbidden").item;
+        let mut item = item_with_check("r4", "NOTES.md", "forbidden").item;
+        // A rule's tooth is named in its own text (A4, since step 8).
+        item.text.push_str(" - never write forbidden into it");
         model::store::declare(&mut db, "s", "l", "a", &item).unwrap();
 
         let mut input = crate::input::ServeInput::default();
@@ -5047,6 +5072,24 @@ sonnet").is_none(),
             verdicts,
             vec![(live.id.clone(), Verdict::Prohibition { literal: "--visibility public".to_string() })],
             "a command the guard refuses must be the classifier's own prohibition for the same item"
+        );
+
+        // The other side, on a compound command: the literal sits in ANOTHER
+        // list element than the one the anchor reaches. The guard reads only
+        // the reached segment's unit, so it lets this through - and the
+        // classifier, reading the same unit, must call it advice.
+        let compound = "gh repo edit --description x; echo --visibility public";
+        assert!(
+            find_command_violation(std::slice::from_ref(&live), compound, Some(dir.path())).is_none(),
+            "sanity: the guard lets the compound through"
+        );
+        assert_eq!(classify_moment(&ranked, compound, None), vec![(live.id.clone(), Verdict::Advice)]);
+        // And the reached segment carrying it after a cd: both refuse.
+        let after_cd = "cd repo && gh repo edit --visibility public";
+        assert!(find_command_violation(std::slice::from_ref(&live), after_cd, Some(dir.path())).is_some());
+        assert_eq!(
+            classify_moment(&ranked, after_cd, None),
+            vec![(live.id.clone(), Verdict::Prohibition { literal: "--visibility public".to_string() })]
         );
     }
 }

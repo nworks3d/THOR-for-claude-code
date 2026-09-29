@@ -20,8 +20,8 @@ use serve::decay::DecayContext;
 use serve::input::ServeInput;
 use serve::rank::RankedItem;
 use serve::{
-    absent_guard, capture, deliver, judge, lookup, mark, project, prompt, render, respond, session_start, stale_guard,
-    status, time, usefulness,
+    absent_guard, capture, deliver, guard_verdict, judge, lookup, mark, project, prompt, render, respond, session_start,
+    stale_guard, status, time, usefulness,
 };
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -213,6 +213,38 @@ enum Command {
         index_db: Option<PathBuf>,
         #[arg(long)]
         repo: Option<PathBuf>,
+    },
+    /// THOR's trial of a rule as it stands (`serve::teeth::retest`), run
+    /// against the rule's REGISTERED working copy and the real calls in the
+    /// log - never a folder named on the command line, so the answer is the
+    /// same from any working folder. Prints the registered root, every form
+    /// it tried with what the hook's own pipeline did with it, and the
+    /// verdict. Writes nothing unless `--apply` is given: then a rule or a
+    /// note is written as ONE `fact_revised` by THOR's `retest` actor,
+    /// carrying the trial record, and only while the rule is still exactly
+    /// the one tried. A blocked rule and one that needs the agent are never
+    /// written. Exit codes: 0 a verdict the tool can apply (rule or note), 3
+    /// blocked, 4 needs the agent, 1 an error, 2 a usage error. With
+    /// `--project` or `--all`, every live rule and orientation without a
+    /// current verdict is tried in turn, and the exit code is the worst of
+    /// them (1, then 4, then 3, then 0).
+    #[command(group(clap::ArgGroup::new("which").required(true).args(["id", "project", "all"])))]
+    Retest {
+        /// The rule's own id, exactly as `remember`/`revise` filed it.
+        #[arg(long)]
+        id: Option<String>,
+        /// Every live rule and orientation of this project (exactly this
+        /// key) that has no current verdict.
+        #[arg(long)]
+        project: Option<String>,
+        /// Every live rule and orientation in the store that has no current
+        /// verdict.
+        #[arg(long)]
+        all: bool,
+        /// Write the rule or the note the trial decides. Without it, nothing
+        /// is written.
+        #[arg(long)]
+        apply: bool,
     },
     /// Record that a served item actually helped. Recorded in the log and
     /// reported by `status`; it does NOT decide whether anything fires - see
@@ -414,6 +446,7 @@ fn main() {
         Command::Outline { index_db, path } => cmd_outline(&index_db, &path),
         Command::Status { index_db, repo } => cmd_status(&cli.db, index_db.as_deref(), repo.as_deref()),
         Command::Mark { id, noise } => cmd_mark(&cli.db, &id, noise),
+        Command::Retest { id, project, all, apply } => cmd_retest(&cli.db, id.as_deref(), project.as_deref(), all, apply),
         #[cfg(feature = "semantic")]
         Command::VectorsBuild { model_dir, vectors_db } => cmd_vectors_build(&cli.db, model_dir.as_deref(), vectors_db.as_deref()),
         #[cfg(feature = "semantic")]
@@ -758,7 +791,10 @@ mod check_rows_json_tests {
             ranked("i2", None, Some(Severity::HouseStyle)),
         ];
         let shown_ids: std::collections::HashSet<&str> = ["i0", "i2"].into_iter().collect();
-        let rows = check_rows(&items, &shown_ids, "this command is bad", None);
+        // A command the fixtures' own anchor ("git push") reaches: a
+        // Command-bound check is classified in the unit of a segment its
+        // anchor reaches, exactly as the command guard reads it.
+        let rows = check_rows(&items, &shown_ids, "git push this is bad", None);
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].id, "i0");
         assert_eq!(rows[0].verdict, "advice");
@@ -1202,6 +1238,18 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
     // capture check below (still on this Stop event) or, for every other
     // event name, past this whole block.
     if event_name == "Stop" {
+        // FIELD EVIDENCE, RECORDED ONCE (X3). Every refusal of this session
+        // with no recorded verdict yet is checked against the session's own
+        // transcript and the answer written to the log, at every Stop,
+        // `stop_hook_active` or not: it never holds a turn, and transcripts
+        // are deleted after about 30 days, so the answer has to be kept while
+        // it can still be given. The main session's Stop also covers its
+        // subagents' files (`serve::attest`'s reader walks them).
+        if !no_record {
+            if let Ok(mut store) = serve::store_dir::open_existing(db_path) {
+                serve::attest::record_refusal_verifications(&mut store, &session_id);
+            }
+        }
         let already_fired = payload.get("stop_hook_active").and_then(|v| v.as_bool()).unwrap_or(false);
         let msg = payload.get("last_assistant_message").and_then(|v| v.as_str()).unwrap_or("");
         // The Response Guard's rulebook judges the SHAPE of a reply (length,
@@ -1354,21 +1402,18 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
         // resolved here because the shared `session_project` below is computed
         // after this early Stop branch returns. It routes the crowding nag to
         // the session whose project the fact belongs to (see crowding_debt).
-        // The same cwd resolution, kept as an owned `PathBuf` rather than
-        // collapsed straight into a project key: `teeth_debt` below needs a
-        // real root to try an `Absent`/`AbsentAll` check's own anchor
-        // against, the same way `mcp::remember`'s own `self.root` does (see
-        // `serve::prove::teeth_box`'s own `root` parameter).
+        // The same cwd resolution, as the folder the session's project is
+        // resolved from. (`teeth_debt` no longer takes it: since step 9 it
+        // reads `model::store::settlement`, which judges a rule against its
+        // project's REGISTERED working copy, never the folder a Stop ran in.)
         let stop_root: Option<PathBuf> =
             payload.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from).or_else(|| std::env::current_dir().ok());
         // A working directory that belongs to no project falls back to the
-        // project this session last worked in (`usefulness::last_project_of_
-        // session`) - otherwise a `cd` into a scratch folder silences every
-        // debt the session still owes there.
-        let stop_project = stop_root
-            .as_deref()
-            .and_then(project::resolve_project)
-            .or_else(|| usefulness::last_project_of_session(db_path, &session_id));
+        // project this session last worked in (`project::session_project`,
+        // the same answer the work clock and the hard guards use) - otherwise
+        // a `cd` into a scratch folder silences every debt the session still
+        // owes there.
+        let stop_project = project::session_project(db_path, &session_id, stop_root.as_deref());
         // GATED ON `is_subagent`: a fact landing on an already-full anchor is
         // still true of the STORE no matter who wrote it, but PAYING this
         // debt (fold or re-anchor with `revise`, retract, or the
@@ -1578,7 +1623,7 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
             if let Some(reason) = serve::store_dir::open_existing(db_path)
                 .ok()
                 .filter(|_| teeth_not_yet_asked_this_session(db_path, &session_id))
-                .and_then(|s| teeth_debt(&s, db_path, stop_project.as_deref(), stop_root.as_deref()))
+                .and_then(|s| teeth_debt(&s, db_path, stop_project.as_deref()))
             {
                 record_teeth_asked(db_path, &session_id);
                 return Some(HookOutput::Decision(
@@ -1603,30 +1648,41 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
         // only once NEITHER has anything to say does the WARN, if any,
         // finally reach the owner, on the very last line below.
         if !is_subagent {
-            if let Some(output) = stale_guard_stop_check(db_path, &session_id) {
+            if let Some(output) = stale_guard_stop_check(db_path, &session_id, actor) {
                 return Some(output);
             }
         }
         return warn_text.map(|text| HookOutput::Warn { event_name, text });
     }
 
-    // The session's own working directory, and the project resolved from it -
-    // both resolved ONCE for every surface below. Claude Code puts the
-    // session's working directory in "cwd" on every hook payload; a payload
-    // without one falls back to this process' own directory rather than
-    // assuming. `session_cwd` is kept (not just consumed into a project key)
-    // because the Absent-check guard (`absent_guard_block` below) also needs
-    // a real filesystem root to prove a check's own currency against. An
-    // unresolvable project means the global layer only (project::applies_to
-    // says why that is the safe direction); an unresolvable cwd means that
-    // guard can never prove currency for anything, so it never blocks either
-    // (see `absent_guard::find_violation`'s own `root: Option<&Path>`).
+    // The session's own working directory, and the two project answers
+    // resolved from it - all resolved ONCE for every surface below. Claude
+    // Code puts the session's working directory in "cwd" on every hook
+    // payload; a payload without one falls back to this process' own
+    // directory rather than assuming. `session_cwd` is kept (not just
+    // consumed into a project key) because the hard guards
+    // (`pre_tool_guard_block` below) also need a real filesystem root to
+    // prove a check's own currency against - the top of its checkout
+    // (`project::guard_root`), not the folder itself. An unresolvable
+    // project means the global layer only (project::applies_to says why that
+    // is the safe direction); an unresolvable cwd means that guard can never
+    // prove currency for anything, so it never blocks either (see
+    // `absent_guard::find_violation`'s own `root: Option<&Path>`).
+    //
+    // TWO PROJECT ANSWERS, on purpose. `folder_project` is the folder's own
+    // answer: what a session is SHOWN (session start, the prompt and
+    // pre-tool serving) stays scoped to where it stands. `session_project`
+    // (`project::session_project`) falls back to the project this session
+    // last worked in when the folder belongs to none - the answer the work
+    // clock, the evaluation and the hard guards use, so a `cd` into a scratch
+    // folder never switches a project's guards off (D4): its text guards
+    // through this answer, its path guards through `project::guard_root`.
     let session_cwd = payload
         .get("cwd")
         .and_then(|v| v.as_str())
         .map(PathBuf::from)
         .or_else(|| std::env::current_dir().ok());
-    let session_project = session_cwd.as_deref().and_then(project::resolve_project);
+    let folder_project = session_cwd.as_deref().and_then(project::resolve_project);
 
     // THE EVALUATION DEBT'S OWN ACCRUAL (`usefulness::record_hook_event`,
     // fifth rewrite, 2026-09-17 - see `usefulness`'s own "evaluation debt"
@@ -1656,18 +1712,17 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
     // that name"), so a `Bash` or `PowerShell` call alike is recognised.
     // The same fallback the Stop arm uses: work done after a `cd` into a
     // folder that belongs to no project still counts toward the project this
-    // session was working in. Only the accrual uses it - the guards and the
-    // serving surfaces below keep the directory's own answer.
-    let work_project =
-        session_project.clone().or_else(|| usefulness::last_project_of_session(db_path, &session_id));
-    if work_project.is_some() {
+    // session was working in. The evaluation and the hard guards below use
+    // this same answer; only serving keeps the folder's own.
+    let session_project = project::session_project(db_path, &session_id, session_cwd.as_deref());
+    if session_project.is_some() {
         let hook_tool_input = payload.get("tool_input");
         let hook_tool_name = payload.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
         let hook_file_path = hook_tool_input.and_then(|t| t.get("file_path")).and_then(|v| v.as_str());
         let hook_command = absent_guard::proposed_command(hook_tool_input);
         let hook_source = payload.get("source").and_then(|v| v.as_str());
         let event_kind = usefulness::classify_hook_event(&event_name, hook_tool_name, hook_file_path, hook_command, hook_source);
-        usefulness::record_hook_event(db_path, work_project.as_deref(), &session_id, false, time::now_unix(), event_kind);
+        usefulness::record_hook_event(db_path, session_project.as_deref(), &session_id, false, time::now_unix(), event_kind);
     }
 
     let mut store = serve::store_dir::open_for_hook(db_path)?;
@@ -1704,7 +1759,7 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
             let candidates = serve::live::always_candidates(&store);
             let decay = DecayContext::load(&store);
             let items = serve::decay::retain_live(
-                session_start::select(&candidates, session_project.as_deref()),
+                session_start::select(&candidates, folder_project.as_deref()),
                 &decay,
             );
             let rules_block = session_start::render(&items);
@@ -1728,6 +1783,15 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
                 (None, Some(reminder)) => reminder,
                 (None, None) => String::new(),
             };
+            // One line, for seven days after this project's working copy was
+            // registered or moved: the first registration is first-come
+            // (N11), so whoever made it is named where the owner looks - see
+            // `project::registration_notice`.
+            let block = match (block.is_empty(), project::registration_notice(&store, folder_project.as_deref(), time::now_unix())) {
+                (_, None) => block,
+                (true, Some(line)) => line,
+                (false, Some(line)) => format!("{block}\n\n{line}"),
+            };
             // Handed over (2026-09-25), capped: this project's own open
             // points, so a fresh session is never held by the evaluation
             // debt later and given no list at all - see `open_points_
@@ -1735,7 +1799,7 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
             // block above AFTER it is built, never inside the match above,
             // so a session with nothing else to show still gets this on its
             // own rather than staying silent.
-            let block = match (block.is_empty(), open_points_session_start_note(&store, session_project.as_deref())) {
+            let block = match (block.is_empty(), open_points_session_start_note(&store, folder_project.as_deref())) {
                 (true, None) => return None,
                 (true, Some(note)) => note,
                 (false, None) => block,
@@ -1795,7 +1859,7 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
             // (`serve::eval_session`). Only the command itself counts - a
             // task that merely says to end with it has not started one.
             let eval_note = if serve::eval_session::prompt_starts_evaluation(prompt_text, &serve::eval_session::command_names(db_path)) {
-                work_project
+                session_project
                     .as_deref()
                     .and_then(|p| serve::eval_session::start(db_path, &store, &session_id, p, time::now_unix(), "command"))
                     .map(|evaluation| serve::eval_session::start_note(&store, &evaluation))
@@ -1805,7 +1869,7 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
 
             let candidates = serve::live::live_items(&store);
             let mut input = prompt::resolve(prompt_text, &candidates);
-            input.project = session_project.clone();
+            input.project = folder_project.clone();
             if input.is_empty() {
                 return eval_note.map(|block| HookOutput::Context { event_name, block, verdicts: Vec::new() });
             }
@@ -1850,7 +1914,7 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
             // refuses never reaches the tool server, so the record is inert.
             let now_unix = time::now_unix();
             let eval_note = if serve::eval_session::call_starts_evaluation(tool_name, tool_input, &serve::eval_session::command_names(db_path)) {
-                work_project
+                session_project
                     .as_deref()
                     .and_then(|p| serve::eval_session::start(db_path, &store, &session_id, p, now_unix, "skill"))
                     .map(|evaluation| serve::eval_session::start_note(&store, &evaluation))
@@ -1863,7 +1927,7 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
                 // the session's.
                 let project = named_project
                     .or_else(|| model::store::show(&store, &report_id).ok().and_then(|item| item.project))
-                    .or_else(|| work_project.clone());
+                    .or_else(|| session_project.clone());
                 if let Some(project) = project {
                     serve::eval_session::record_filing(db_path, &store, &session_id, &project, &report_id, now_unix);
                 }
@@ -1894,70 +1958,45 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
                 _ => None,
             };
 
-            // The Absent-check guard (see `serve::absent_guard`'s own module
-            // doc comment for the full doctrine) - independent of Lane C
-            // above: it fires on the CONTENT about to be written, never on a
-            // stated decision, so unlike C3 it is never gated on
-            // `payload_is_from_a_subagent` - it has no notion of "the
-            // owner's own debt" to gate on in the first place, and a
+            // THE HARD GUARDS, all decided by `serve::guard_verdict::pre_tool`
+            // in hook order: the file write, then the command (its shell writes
+            // first, then a forbidden literal in the command itself), then the
+            // conditional guard - the only arm that catches an OMISSION. See
+            // that module's own doc comment for each arm's doctrine and for why
+            // the order stands. Independent of Lane C above: they fire on the
+            // write or command about to happen, never on a stated decision, so
+            // unlike C3 they are never gated on `payload_is_from_a_subagent` -
+            // there is no notion of "the owner's own debt" to gate on, and a
             // subagent's write can violate an anchored, still-current rule
             // exactly as easily as the owner's own.
-            if let Some(reason) = absent_guard_block(
+            //
+            // THE ROOT IS THE TOP OF THE CHECKOUT (`project::guard_root`),
+            // not the working folder: a session standing in a subfolder
+            // resolved every check path under that subfolder, so a required
+            // line in the checkout's own NOTES.md was never guarded from
+            // there. After a drift into a folder of no project it is the
+            // registered checkout of the project the session kept, so the
+            // path-anchored guards stay on for that project's own files too
+            // (D4). A relative path in the call is still read against the
+            // working folder itself (`guard_verdict::pre_tool`'s `cwd`).
+            let guard_root = project::guard_root(
+                &store,
+                session_cwd.as_deref(),
+                folder_project.as_deref(),
+                session_project.as_deref(),
+            );
+            if let Some(reason) = pre_tool_guard_block(
                 &store,
                 db_path,
                 &session_id,
                 tool_name,
-                file_path,
                 tool_input,
                 session_project.as_deref(),
+                guard_root.as_deref(),
                 session_cwd.as_deref(),
+                actor,
+                payload.get("tool_use_id").and_then(|v| v.as_str()),
             ) {
-                return Some(HookOutput::Decision(serde_json::json!({
-                    "decision": "block",
-                    "reason": reason,
-                })));
-            }
-
-            // The command guard - the Absent-check guard's own THIRD anchor
-            // shape (see `serve::absent_guard`'s own module doc comment,
-            // "THE COMMAND guard"): a live Rule/Orientation bound to a
-            // `Command` target blocks a Bash-style call whose own command
-            // string carries a forbidden literal. Tried AFTER the file-based
-            // guard above, never before it: in every real Claude Code
-            // payload the two guards' own domains never overlap (a
-            // Write/Edit carries a file_path and no command, a Bash call
-            // carries a command and no file_path), so ordering has no
-            // observable effect in the cases that actually occur; where it
-            // theoretically could (a hand-built tool_input carrying both
-            // fields at once), this keeps the pre-existing file-based
-            // guard's own precedence completely unchanged rather than
-            // letting a brand new prohibition preempt an already-shipped
-            // one. Same subagent stance as `absent_guard_block` just above,
-            // for the identical reason: this fires on the COMMAND about to
-            // run, never on a stated decision, so it is never gated on
-            // `payload_is_from_a_subagent` either.
-            if let Some(reason) = command_guard_block(
-                &store,
-                db_path,
-                &session_id,
-                tool_input,
-                session_cwd.as_deref(),
-                session_project.as_deref(),
-            ) {
-                return Some(HookOutput::Decision(serde_json::json!({
-                    "decision": "block",
-                    "reason": reason,
-                })));
-            }
-
-            // THE CONDITIONAL GUARD, and the only arm that catches an
-            // OMISSION. Every arm above asks whether some text is present;
-            // this one asks whether a call that already said A also said B.
-            // It reads the call's own input rather than a file, because the
-            // thing it is about - a field that was left out - exists nowhere
-            // else. Runs after both arms above so an actual forbidden
-            // fragment, which is the more specific complaint, still wins.
-            if let Some(reason) = requires_guard_block(&store, db_path, &session_id, tool_name, tool_input, session_project.as_deref()) {
                 return Some(HookOutput::Decision(serde_json::json!({
                     "decision": "block",
                     "reason": reason,
@@ -1965,7 +2004,7 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
             }
 
             let mut input = ServeInput {
-                project: session_project.clone(),
+                project: folder_project.clone(),
                 root: session_cwd.clone(),
                 ..Default::default()
             };
@@ -1975,7 +2014,7 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
                 // THE TOOL-NAME REACH THIS CLOSES. MEASURED: a Rule bound to
                 // Target command "Agent"/"Artifact"/"SendUserFile" was only
                 // ever matched inside the requires guard
-                // (`requires_guard_block`, which already reads the bare tool
+                // (`guard_verdict::requires`, which already reads the bare tool
                 // name as its own reach) - this surface built `input` from a
                 // Bash-style "command" field alone, so such a rule was never
                 // SERVED when the tool it names was actually called, and
@@ -1989,7 +2028,7 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
                 // gets, and a forbidden-literal check against a bare tool
                 // name stays harmless: this is the informational surface
                 // (`serve::serve`, rendered as context) - the hard guard
-                // (`command_guard_block`) still reads only a real "command"
+                // (`guard_verdict::command`) still reads only a real "command"
                 // field via `absent_guard::proposed_command`, completely
                 // unaffected by this branch.
                 input.add_command(tool_name);
@@ -2427,26 +2466,18 @@ const TEETH_DEBT_BATCH_MAX: usize = 5;
 /// block later the same session - reintroducing the exact "every single turn
 /// ends held, forever" wall its own 2026-08-14 fix closed.
 ///
-/// RE-DERIVED EVERY TIME, SETTLED ONLY BY REALITY OR A REAL REASON
-/// (2026-09-26, replacing the 2026-09-25 shape). The 2026-09-25 version
-/// settled a rule only once `serve::prove::teeth_box` came back a proven
-/// guard - and "proven" then meant an attempt built from the rule's own
-/// literal had been refused, which an invented literal passes just as well
-/// as a real one. At the same time it stopped counting ANY written reason,
-/// so a rule that honestly cannot have a check could never be settled at
-/// all, except by retracting a true fact. Both halves were backwards.
+/// SETTLED BY THE ONE READER (step 9). A rule leaves this debt exactly when
+/// `model::store::settlement` calls it settled - the same answer the
+/// evaluation-filing gate and doctor read: a current verdict from THOR's
+/// trial (rule track or note), or a machine blocker while it holds (a file
+/// check of a project with no usable registered working copy - never named
+/// here, because nothing the agent runs can settle it, F9). A tag, a reason,
+/// an open point, a refusal on record or a probe settles nothing. Every
+/// live rule and orientation counts, whatever its weight (D8): lowering a
+/// severity changes the fingerprint, so it is owed again.
 ///
-/// Now exactly three things settle a rule here, the same three the
-/// evaluation-filing gate accepts (`model::store`'s `teeth_state`):
-/// - a check that has bitten a real call on record (`TeethBox::ProvenGuard`,
-///   computed fresh against the log - see `serve::prove`'s "against
-///   reality" section);
-/// - a teeth answer whose reason quotes the legitimate call or names the
-///   rule's own trigger (`model::gate::teeth_answer_settles`);
-/// - a check that is wired but has not met a real call yet (or whose anchor
-///   needs a person to look at it) AND a live open point of this project
-///   naming the rule's id - the honest "still to be proven", carried where
-///   the next evaluation has to close it.
+/// The demand names the one command that settles it: `serve retest --id
+/// <id>` (with `--db`), then the same with `--apply`.
 ///
 /// ROTATES, so a fix-nothing session does not see the same five forever
 /// (2026-09-26): measured on a copy of a real store, this named the same five
@@ -2454,62 +2485,23 @@ const TEETH_DEBT_BATCH_MAX: usize = 5;
 /// waiting, because it sorted by id alone. Now the ones asked about least
 /// often come first (`teeth_items_asked_counts`, a sidecar beside the store),
 /// then the heaviest, then the ones that fired most since their last verdict.
-fn teeth_debt(store: &EventStore, db_path: &Path, current_project: Option<&str>, root: Option<&Path>) -> Option<String> {
-    let open_points: Vec<String> =
-        model::store::open_points(store, current_project).into_iter().map(|p| p.text.to_lowercase()).collect();
+fn teeth_debt(store: &EventStore, db_path: &Path, current_project: Option<&str>) -> Option<String> {
     let fired = usefulness::served_since_last_verdict(store);
     let asked = teeth_items_asked_counts(db_path);
-    // A reason counts only after a real try - see `model::gate::
-    // teeth_answer_settles`'s own doc comment.
-    let tried = model::store::ids_whose_check_was_tried(store);
-    // (asked count, severity rank, fired count, id, what to do)
+    // (asked count, severity rank, fired count, id, why it is owed)
     let mut candidates: Vec<(usize, u8, usize, String, String)> = Vec::new();
     for li in serve::live::live_items(store) {
         if !li.item.kind.can_fire() || !project::applies_to(li.item.project.as_deref(), current_project) {
             continue;
         }
-        if model::gate::teeth_answer_settles(&li.item, tried.contains(&li.id)) {
-            continue;
-        }
-        let named_in_open_point = open_points.iter().any(|t| t.contains(&li.id.to_lowercase()));
-        // Only a check can meet reality; reading the log for an item with no
-        // check would be paid for and thrown away.
-        let reality = if li.item.check.is_some() {
-            serve::prove::reality(store, &li.id, li.item.check.as_ref())
-        } else {
-            serve::prove::Reality::default()
-        };
-        let todo = match serve::prove::teeth_box(&li.id, &li.item, root, &reality) {
-            serve::prove::TeethBox::NotApplicable | serve::prove::TeethBox::ProvenGuard { .. } => continue,
-            serve::prove::TeethBox::Wired { .. }
-            | serve::prove::TeethBox::AnchorCollapsed { .. }
-            | serve::prove::TeethBox::RefusesLegitimateUse { .. }
-                if named_in_open_point =>
-            {
-                continue
-            }
-            serve::prove::TeethBox::Wired { note, .. } => format!(
-                "wired, never met a real call - {note}. Add an open point naming '{}' and the real call that would \
-                 prove it, so the next evaluation closes it",
-                li.id
-            ),
-            // Structurally can never reach anything - a shape a fresh write
-            // can no longer even create (`mcp`'s own `teeth_test` refuses it
-            // outright), but a live item written before that door closed can
-            // still carry it.
-            serve::prove::TeethBox::KeepRefusing(msg) => msg.strip_prefix("REFUSED: ").unwrap_or(&msg).to_string(),
-            serve::prove::TeethBox::RefusesLegitimateUse { note, .. } | serve::prove::TeethBox::AnchorCollapsed { note, .. } => {
-                format!("{note} Fix it, or add an open point naming '{}' so a person looks at it", li.id)
-            }
-            serve::prove::TeethBox::Informing { note, .. } => note,
-        };
+        let model::store::Settlement::Owed { why } = model::store::settlement(store, &li.id) else { continue };
         let count = fired.get(&li.id).copied().unwrap_or(0);
         candidates.push((
             asked.get(&li.id).copied().unwrap_or(0),
             model::item::severity_rank(li.item.severity),
             count,
             li.id,
-            todo,
+            why,
         ));
     }
     if candidates.is_empty() {
@@ -2519,8 +2511,8 @@ fn teeth_debt(store: &EventStore, db_path: &Path, current_project: Option<&str>,
     let batch_len = candidates.len().min(TEETH_DEBT_BATCH_MAX);
     let left = candidates.len() - batch_len;
     let mut items_block = String::new();
-    for (_, _, _, id, todo) in candidates.iter().take(TEETH_DEBT_BATCH_MAX) {
-        items_block.push_str(&format!("\n- '{id}': {todo}"));
+    for (_, _, _, id, why) in candidates.iter().take(TEETH_DEBT_BATCH_MAX) {
+        items_block.push_str(&format!("\n- '{id}': {why}. Run: {}", model::store::retest_command_for(Some(db_path), id)));
     }
     record_teeth_items_asked(db_path, candidates.iter().take(TEETH_DEBT_BATCH_MAX).map(|c| c.3.as_str()));
     let left_note = if left > 0 {
@@ -2529,15 +2521,14 @@ fn teeth_debt(store: &EventStore, db_path: &Path, current_project: Option<&str>,
         String::new()
     };
     Some(format!(
-        "[THOR] {batch_len} heavy rule(s), or checks that should refuse, have neither a real tooth nor a real reason \
-         why they cannot have one - listed below with what their own test found. For each one, do the work: (1) give \
-         it a check whose literal is the text that MEANS the mistake is happening; it counts as proven once the log \
-         shows it refusing a real call, and until then an open point naming its id carries it; (2) only when no text \
-         marks the mistake, tag it 'no-literal:<why>' (on a command: 'no-catch-on-command:<why>') with a reason that \
-         QUOTES the legitimate call carrying the same fragment, or NAMES the command, file or moment the rule is \
-         about - a reason that would fit any rule does not count; (3) retract it, saying what changed about it, if \
-         it is simply wrong. A label such as 'teeth:informing' is not an answer: it only records that nothing could \
-         be tried.{left_note}{items_block}"
+        "[THOR] {batch_len} rule(s) have no current verdict from THOR's trial - listed below, each with why and the \
+         command that decides it. For each one: run the command shown. It prints the registered working copy it \
+         used, every form it tried, and its verdict - a rule, a note, or the one fix you have to make yourself. When \
+         it says rule track or note, run the same command again with --apply to write that verdict. When it names a \
+         fix, make it (for example revise the text to name the literal, or hang the tooth it names), then run it \
+         again. mcp__thor__revise with only the rule's id runs the same trial too. Retract a rule, saying what \
+         changed about it, if it is simply wrong. A tag, a reason, an open point or a refusal on record settles \
+         nothing.{left_note}{items_block}"
     ))
 }
 
@@ -3109,8 +3100,12 @@ fn evaluation_debt(
         Some(p) if p.exists() => {
             format!("read '{}' and do what it says. The owner can type /thor-eval to run it.", p.display())
         }
-        _ => "no evaluation routine is installed at `~/.claude/commands/thor-eval.md` - `install` writes one there (usable as /thor-eval), or the owner runs their own routine."
-            .to_string(),
+        // The command names this very store (`--db`, F7), so running it never
+        // sets up a second, default memory beside the one this hook reads.
+        _ => format!(
+            "no evaluation routine is installed at `~/.claude/commands/thor-eval.md` - `{}` writes one there (usable as /thor-eval), or the owner runs their own routine.",
+            model::store::install_command_for(Some(db_path))
+        ),
     };
 
     if usefulness::eval_report_covers(state.last_evaluation_seen, now) {
@@ -3186,7 +3181,7 @@ fn evaluation_debt(
     }
 }
 
-/// The heavy rules this evaluation's report is held to
+/// The rules this evaluation's report is held to
 /// (`model::store::evaluation_teeth_batch`), named in the message that asks
 /// for the evaluation, so a session sees the batch before it starts rather
 /// than only in the refusal at the end. `None` when the batch owes nothing.
@@ -3195,15 +3190,21 @@ fn teeth_batch_note(store: &EventStore, project: Option<&str>) -> Option<String>
     if batch.owed_now.is_empty() {
         return None;
     }
-    let named = batch.owed_now.iter().map(|(id, why)| format!("\n- '{id}': {why}")).collect::<String>();
+    let db = store.path();
+    let named = batch
+        .owed_now
+        .iter()
+        .map(|(id, why)| format!("\n- '{id}': {why}. Run: {}", model::store::retest_command_for(db.as_deref(), id)))
+        .collect::<String>();
     let later = match batch.owed_later.len() {
         0 => String::new(),
         n => format!(" {n} more stay owed for a later report; doctor names them."),
     };
     Some(format!(
-        "This report's batch of heavy rules (at most {}, the ones written longest ago first) - each has fired \
-         since the previous report and has neither a real tooth nor a real reason why it cannot, and the report \
-         cannot be filed until each one is settled.{later}{named}",
+        "This report's batch of rules (at most {}, the ones that fired since the previous report first, then the \
+         ones written longest ago) - each has no current verdict from THOR's trial, and the report cannot be filed \
+         until each one is settled. Run the command shown for each: it prints its verdict, and the same command \
+         with --apply writes a rule or a note.{later}{named}",
         model::store::EVALUATION_TEETH_BATCH
     ))
 }
@@ -3325,44 +3326,6 @@ fn capture_sink_check(
     capture::sink_verdict(Some(marker), paid, file_path)
 }
 
-/// The Absent-check guard's own I/O wrapper (see `serve::absent_guard`'s
-/// module doc comment for the full doctrine): read the once-per-session
-/// marker and the store, then decide the LOCATION prohibition before the
-/// CONTENT one - LOCATION FIRST, deliberately: it is the broader refusal (a
-/// file need not carry any particular text to be refused, only to sit in
-/// the wrong place), so when a write would trip both, the reason reported is
-/// the one that would have refused it regardless of what it said. Only when
-/// location finds nothing does this fall through to the pre-existing content
-/// check (`absent_guard::find_violation`), unchanged. Both share the SAME
-/// once-per-session-per-file marker - never two - so whichever finds a
-/// violation first is also the only one that ever marks the file, and
-/// neither fires again on it this session.
-///
-/// The location candidate pool is fetched separately from the content one:
-/// `live::candidates_for` narrows by target KIND only (see its own doc
-/// comment), so a `Path`-only fetch (what `ServeInput::add_file` builds)
-/// would never even surface a `Dir`-bound item. A `Path` AND a `Dir`
-/// placeholder target are added here instead - the VALUE never matters for
-/// this narrowing, only the kind, and `absent_guard::find_location_violation`
-/// alone decides real containment afterward. This candidate pool
-/// deliberately never goes through `rank::select` at all (unlike the content
-/// pool below it) - see `serve::absent_guard`'s own module doc comment for
-/// why that function's approximate matching is the wrong tool for a location
-/// prohibition, and so also carries no project scoping: a rule prohibiting
-/// writes to a specific place is either true or not, regardless of which
-/// project the current session happens to resolve to - scoping it out by
-/// project would silently defeat the exact mistake this guard exists to
-/// catch (working in the wrong project's session while still touching a
-/// place a DIFFERENT project's rule protects).
-///
-/// Every failure - no file path, a tool this guard has no notion of, a
-/// payload missing the field it needs, an unresolvable root, no matching
-/// item, no check, a check of another form/severity/path, a stale anchor, an
-/// unreadable marker file - falls through to `None` (ALLOW/nothing), never a
-/// block: the same "any error, anywhere, is silence" doctrine every other
-/// guard in this file already follows. Mirrors `capture_sink_check`'s own
-/// shape (read store/marker, decide, no side effect on the non-block path).
-#[allow(clippy::too_many_arguments)]
 /// Write down what the gate just DID.
 ///
 /// This is the measurement that did not exist until 2026-08-08. Every other
@@ -3379,127 +3342,136 @@ fn capture_sink_check(
 /// take a measurement must never cost a refusal.
 /// `subject` is the id the outcome is filed under: a rule id for a real
 /// prohibition (read back out of the wording with `absent_guard::rule_id_of`
-/// by the caller, which is where that knowledge belongs), or the NAME of a
+/// - for the PreToolUse guards by `serve::guard_verdict`, into
+/// `Verdict::rule_id`), or the NAME of a
 /// guard when what stood aside was the guard itself rather than any one rule.
 /// Head-neutral either way, so neither can ever create or move an item.
-fn record_gate(db_path: &Path, session_id: &str, refused: bool, subject: &str, target: &str) {
+/// `actor` is the REAL actor this hook run is stamped with (`hook_once`'s own
+/// `actor` argument - "hook" for a normal Claude Code run, whatever
+/// `--actor` validated otherwise) - never the literal `"hook"` this function
+/// used to hardcode regardless of who actually called it.
+///
+/// THE DEFECT THIS CLOSES (2026-09-27). Piping a hand-built payload into
+/// `serve hook --actor probe` produced a real refusal, and the log recorded
+/// it with actor `"hook"` anyway - the flag never reached this write. Since a
+/// refusal on record newer than a rule's last revision settles that rule
+/// (`model::store::teeth_state`), a probe left no trace of being one: any
+/// session could settle a heavy rule with a self-built, even one-sided,
+/// payload. See `model::store::ASSISTANT_DELIVERY_ACTOR`'s own use in
+/// `RefusalRecord` for the other half of the fix - only a refusal actually
+/// stamped this way counts as field evidence at all.
+///
+/// `tool_use_id` is the payload's own id of the tool call the outcome is
+/// about. A refusal carries it so the call can be found later in the
+/// session's own transcript (`serve::attest::verify_refusal`): without it a
+/// refusal can never be checked, and is never counted as field evidence.
+fn record_gate(
+    db_path: &Path,
+    session_id: &str,
+    actor: &str,
+    refused: bool,
+    subject: &str,
+    target: &str,
+    tool_use_id: Option<&str>,
+) {
     let rule_id = subject.to_string();
     let Ok(mut store) = serve::store_dir::open_existing(db_path) else { return };
-    deliver::record_gate_outcome(
+    deliver::record_gate_outcome_for_call(
         &mut store,
         session_id,
         session_id,
-        "hook",
+        actor,
         &time::now_iso8601(),
         refused,
         &rule_id,
         target,
+        tool_use_id,
     );
 }
 
-fn absent_guard_block(
+
+/// The PreToolUse guards' own I/O wrapper. Every decision is made by
+/// `serve::guard_verdict::pre_tool` (see that module's own doc comment for
+/// the arms, their doctrine and their order); this keeps only what is not a
+/// decision:
+///
+/// - the staleness sidecar (`record_absent_guard_staleness`,
+///   `record_command_guard_staleness`), recorded from the SAME candidate pools
+///   the decision was made on - never a second fetch - for each arm that got
+///   as far as fetching them, whether or not anything is refused. Observation
+///   only: it never influences the refusal;
+/// - the once-per-session marker, which changes only the WORDING of a refusal
+///   (`with_repeat_wording`), never whether it happens;
+/// - the refusal's record in the log (`record_gate`), under the rule the
+///   refusal names.
+///
+/// In that order, as when the hook decided these itself: the staleness
+/// sidecar stamps its findings with the store's current last seq, and the
+/// refusal record is an append to that same store.
+///
+/// Every failure is silence (`None`), never a block - the same "any error,
+/// anywhere, is silence" doctrine every other guard in this file follows.
+#[allow(clippy::too_many_arguments)]
+fn pre_tool_guard_block(
     store: &EventStore,
     db_path: &Path,
     session_id: &str,
     tool_name: &str,
-    file_path: Option<&str>,
     tool_input: Option<&Value>,
     project: Option<&str>,
     root: Option<&Path>,
+    cwd: Option<&Path>,
+    actor: &str,
+    tool_use_id: Option<&str>,
 ) -> Option<String> {
-    let file_path = file_path?;
-    let content = absent_guard::proposed_content(tool_name, tool_input)?;
-
-    // NOTE THE ABSENCE. The marker used to be read HERE, and an attempt it
-    // recognised returned before a single rule was evaluated. It now lives at
-    // the bottom of this function, after a verdict exists, where the only
-    // thing it can still change is the WORDING of a refusal. Two defects died
-    // with that move: a repeat no longer passes unexamined (see
-    // `absent_guard::escalated`), and a LOCATION prohibition can no longer be
-    // suppressed by a marker set for a content one - it says the path is out
-    // of bounds, so there is no such thing as "the same attempt again" for it
-    // and every write there is the same violation.
-    let mut location_input = ServeInput::default();
-    location_input.add_target(TargetKind::Path, file_path);
-    location_input.add_target(TargetKind::Dir, file_path);
-    let location_candidates = serve::live::candidates_for(store, &location_input);
-
-    let mut input =
-        ServeInput { project: project.map(str::to_string), root: root.map(Path::to_path_buf), ..Default::default() };
-    input.add_file(file_path);
-    let candidates = serve::live::candidates_for(store, &input);
-    let ranked = serve::rank::select(&candidates, &input);
-
-    // The staleness half of the doctrine (see `serve::absent_guard`'s own
-    // module doc comment): observation only, decided from the SAME two
-    // candidate pools already fetched above for the real block decision
-    // below, but never influencing it - recorded (best effort, silent on any
-    // I/O error) regardless of what `reason` ends up being.
-    record_absent_guard_staleness(store, db_path, &location_candidates, &ranked, file_path, root);
-
-    // The third arm is the content check for a rule bound to a DIRECTORY.
-    // `rank::select` drops such an item on a KIND mismatch before it ever
-    // compares a path, so the ranked pool above can never surface one - it
-    // has to come from the same kind-narrowed pool the location check uses,
-    // with `absent_guard` deciding real containment. Path-anchored content
-    // rules keep their precedence: this only runs when neither arm above
-    // found anything.
-    // The last arm is the self-contained form: a rule carrying a `Forbidden`
-    // check has no anchor to prove, so its BINDING carries its reach, and an
-    // Always binding means every write to every file. It runs last because
-    // an anchored rule is the more specific statement about this particular
-    // file, and the more specific reason is the more useful one to report.
-    // It needs no root: there is nothing to resolve. It does need the
-    // session's project, for the same reason the command arms do: the literal
-    // carries no location, so without this one project's forbidden text would
-    // refuse a write in every other checkout (see `in_session_project`).
-    let always_candidates = in_session_project(serve::live::always_candidates(store), project);
-    // Location first of the five, and now genuinely first: nothing returns
-    // before it any more. It was the arm the old marker placement could
-    // silence, which was the wrong way round - it is also the arm with the
-    // least excuse for being silenced, because the way out of it is not to
-    // satisfy the rule, it is to write somewhere else.
-    let reason = absent_guard::find_location_violation(&location_candidates, file_path, root)
-        .or_else(|| absent_guard::find_violation(&ranked, file_path, content, root))
-        .or_else(|| absent_guard::find_dir_content_violation(&location_candidates, file_path, content, root))
-        .or_else(|| absent_guard::find_forbidden_violation(&always_candidates, content))
-        // And the mirror image of all four: not a literal that must not
-        // appear, but one that must not disappear. A document that mirrors
-        // this memory, and a fact about code that names something which has
-        // to still be there, are the same case. Runs last because an
-        // offending fragment someone can see beats an absence they cannot.
-        // Fed the file's content AFTER the call, never the fragment the call
-        // carries: the three arms above ask whether a forbidden literal
-        // APPEARS, and the fragment is exactly right for that, but this one
-        // asks whether a required literal REMAINS, and a replacement fragment
-        // almost never contains it. See `absent_guard::content_after_write`
-        // for the defect that cost, and for why a content it cannot resolve
-        // means this arm simply does not run.
-        .or_else(|| {
-            absent_guard::content_after_write(tool_name, tool_input, root, file_path)
-                .and_then(|after| absent_guard::find_missing_required(&location_candidates, file_path, &after, root))
-        })?;
-
-    // Per ATTEMPT, not per file: see `absent_guard::attempt_key`. Keying on
-    // the file alone disarmed this guard for the rest of the session after
-    // one block, so a second, different, genuinely forbidden write passed
-    // unexamined.
-    let attempt_text = absent_guard::attempt_text(tool_name, tool_input);
-    let attempt = absent_guard::attempt_key(file_path, attempt_text.as_deref());
-    let marker_path = absent_guard::default_marker_path(db_path);
-    let marker_text = std::fs::read_to_string(&marker_path).ok();
-    let markers = marker_text.as_deref().map(absent_guard::read_blocked).unwrap_or_default();
-    let repeat = absent_guard::already_blocked(&markers, session_id, &attempt);
-    if !repeat {
-        if let Some(text) = absent_guard::mark_blocked_text(marker_text.as_deref(), session_id, &attempt) {
-            let _ = serve::store_dir::write(&marker_path, text);
-        }
+    let judgement = guard_verdict::pre_tool(store, tool_name, tool_input, project, root, cwd);
+    if let Some(file) = &judgement.pools.file {
+        record_absent_guard_staleness(store, db_path, &file.location, &file.ranked, &file.file_path, root);
     }
-    let reason = if repeat { absent_guard::escalated(&reason) } else { reason };
-    if let Some(id) = absent_guard::rule_id_of(&reason) {
-        record_gate(db_path, session_id, true, id, file_path);
+    if let Some(pool) = &judgement.pools.command {
+        record_command_guard_staleness(store, db_path, &pool.items, &pool.segments, &pool.command, root);
+    }
+    let verdict = judgement.verdict?;
+    let reason = match &verdict.repeat {
+        Some(guard_verdict::RepeatKey::File(attempt)) => {
+            with_repeat_wording(&absent_guard::default_marker_path(db_path), session_id, attempt, verdict.reason)
+        }
+        Some(guard_verdict::RepeatKey::Command(attempt)) => {
+            with_repeat_wording(&absent_guard::default_command_marker_path(db_path), session_id, attempt, verdict.reason)
+        }
+        None => verdict.reason,
+    };
+    if let Some(id) = &verdict.rule_id {
+        record_gate(db_path, session_id, actor, true, id, &verdict.target, tool_use_id);
     }
     Some(reason)
+}
+
+/// A refusal's wording once its marker has been read: a repeat of an attempt
+/// this session already had refused gets `absent_guard::escalated`'s wording,
+/// and a first attempt is marked so that its repeat will. Keyed per ATTEMPT
+/// (`absent_guard::attempt_key`), never per file or per rule alone.
+///
+/// THE MARKER NEVER DECIDES WHETHER, ONLY WHAT IT SAYS. Until 2026-08-08 the
+/// marker was read before any rule was, and an attempt it recognised passed
+/// unexamined - the file arm keyed on the file and the command arm on the
+/// anchor, so ONE refusal disarmed that rule for the whole session. A repeat
+/// is now refused like the first; its text differs only so a caller that
+/// reads it learns to stop resending the same thing.
+fn with_repeat_wording(marker_path: &Path, session_id: &str, attempt: &str, reason: String) -> String {
+    let marker_text = std::fs::read_to_string(marker_path).ok();
+    let markers = marker_text.as_deref().map(absent_guard::read_blocked).unwrap_or_default();
+    let repeat = absent_guard::already_blocked(&markers, session_id, attempt);
+    if !repeat {
+        if let Some(text) = absent_guard::mark_blocked_text(marker_text.as_deref(), session_id, attempt) {
+            let _ = serve::store_dir::write(marker_path, text);
+        }
+    }
+    if repeat {
+        absent_guard::escalated(&reason)
+    } else {
+        reason
+    }
 }
 
 /// The staleness sidecar's own I/O wrapper (see `absent_guard::StaleRecord`'s
@@ -3508,9 +3480,9 @@ fn absent_guard_block(
 /// write it back - best effort throughout, exactly like every other marker
 /// file in this binary (an unreadable or unwritable sidecar is silence,
 /// never a panic and never a reason to change what the caller does). Called
-/// for its side effect alone, from a point in `absent_guard_block` that runs
-/// whether or not a block is about to fire, and its result is never
-/// inspected by anything that decides one.
+/// for its side effect alone, from `pre_tool_guard_block`, on every call
+/// whose file arm fetched its pools - whether or not a block is about to
+/// fire - and its result is never inspected by anything that decides one.
 ///
 /// Also stamps every finding it folds in with `now_seq` - the store's own
 /// current max seq, the exact computation `capture_flag` already uses for
@@ -3545,326 +3517,8 @@ fn record_absent_guard_staleness(
     }
 }
 
-/// The conditional guard: a live Always-bound Rule/Orientation carrying a
-/// `Check::Requires` blocks a call whose own input contains the trigger and
-/// not the requirement.
-///
-/// WHAT IT READS. Every VALUE in `tool_input`, flattened to one string -
-/// never the field names, so a rule cannot accidentally match the shape of
-/// the payload instead of what the caller wrote (the same stance the answer
-/// guard already takes). That makes it work for any tool: a script, a
-/// prompt, a command, an argument list.
-///
-/// Any failure - no input, no matching item, no check of this form - falls
-/// through to `None`, the same "any error is silence" doctrine every other
-/// guard here follows.
-///
-/// SCOPED TO THE SESSION'S OWN PROJECT (2026-09-26). This used to read every
-/// live item in the store, whatever project it belonged to, so a rule written
-/// for one checkout refused an ordinary call in another: a rule about how one
-/// repository installs its own fork ("pip must carry --no-deps") refused a
-/// plain `pip install` in an unrelated repository. That is a false block, the
-/// most expensive thing this system can do. Only an item that applies to this
-/// session (`project::applies_to`: its own project, or global) can refuse here
-/// now - the same rule every serving surface already follows.
-///
-/// A refusal is recorded in the log (`record_gate`), exactly like the other two
-/// command-arm refusals: that record is what lets a rule's teeth count as proven
-/// against a real call later (`serve::prove`), and before this a `requires`
-/// refusal left no trace at all.
-fn requires_guard_block(
-    store: &EventStore,
-    db_path: &Path,
-    session_id: &str,
-    tool: &str,
-    tool_input: Option<&Value>,
-    session_project: Option<&str>,
-) -> Option<String> {
-    let content = tool_input_values(tool_input?);
-    if content.is_empty() {
-        return None;
-    }
-    // Every live item, not just the Always pool: a conditional rule about one
-    // tool hangs on a Command target, and narrowing the pool first would drop
-    // exactly those. `find_requires_violation` decides the reach - against
-    // the real command text when this call carries one (a Bash/PowerShell-
-    // style "command" field), the tool name otherwise, exactly the way the
-    // sibling command guard (`command_guard_block` below) already resolves
-    // its own target text.
-    let candidates = in_session_project(serve::live::live_items(store), session_project);
-    let command = absent_guard::proposed_command(tool_input);
-    let reason = absent_guard::find_requires_violation(&candidates, tool, command, &content)?;
-    if let Some(id) = absent_guard::rule_id_of(&reason) {
-        record_gate(db_path, session_id, true, id, command.unwrap_or(tool));
-    }
-    Some(reason)
-}
 
-/// Only the items that apply to a session in `session_project` - its own
-/// project's, and the global ones (`project::applies_to`). Used by every hard
-/// guard whose match reads only the TEXT of a call (a command, or content
-/// with no path of its own): nothing about that text says which checkout it
-/// belongs to, so without this a rule from one project refuses an ordinary
-/// call in another. A path-anchored arm needs no such filter - its own anchor
-/// is resolved against the session's root already (see
-/// `absent_guard::scoped_target_matches`).
-fn in_session_project(items: Vec<serve::live::LiveItem>, session_project: Option<&str>) -> Vec<serve::live::LiveItem> {
-    items.into_iter().filter(|li| project::applies_to(li.item.project.as_deref(), session_project)).collect()
-}
-
-/// How deep `tool_input_values` will recurse into a nested array/object
-/// before it gives up and stops descending. `input` is the model's own tool
-/// call, not something this project controls the shape of, so an unbounded
-/// walk over one nested deep enough (deliberately or not) is a stack
-/// overflow waiting to happen - the same "never trust a payload's own shape
-/// to stay reasonable" stance `model::check::run`'s own file-size limit
-/// takes for an unbounded read.
-const MAX_TOOL_INPUT_WALK_DEPTH: usize = 32;
-
-/// Every string VALUE inside a tool input, joined with newlines. Field names
-/// are deliberately left out: a rule must match what the caller wrote, not
-/// the shape of the payload it travelled in. Recursion is capped at
-/// `MAX_TOOL_INPUT_WALK_DEPTH`: anything nested deeper is silently left out
-/// of the flattened text rather than walked - the same "a missed case is
-/// acceptable, a crash is not" stance this whole guard file takes throughout.
-fn tool_input_values(input: &Value) -> String {
-    fn walk(v: &Value, out: &mut Vec<String>, depth: usize) {
-        if depth > MAX_TOOL_INPUT_WALK_DEPTH {
-            return;
-        }
-        match v {
-            Value::String(s) => out.push(s.clone()),
-            Value::Number(n) => out.push(n.to_string()),
-            Value::Bool(b) => out.push(b.to_string()),
-            Value::Array(items) => items.iter().for_each(|i| walk(i, out, depth + 1)),
-            Value::Object(map) => map.values().for_each(|i| walk(i, out, depth + 1)),
-            Value::Null => {}
-        }
-    }
-    let mut out = Vec::new();
-    walk(input, &mut out, 0);
-    out.join("\n")
-}
-
-#[cfg(test)]
-mod tool_input_values_tests {
-    use super::*;
-
-    /// A `serde_json::Value` nested `depth` arrays deep, with `leaf` as the
-    /// innermost value - built so `MAX_TOOL_INPUT_WALK_DEPTH`'s own tests
-    /// below can pick an exact depth relative to the cap, rather than
-    /// guessing at a real payload's shape.
-    fn nested(depth: usize, leaf: &str) -> Value {
-        let mut v = serde_json::json!(leaf);
-        for _ in 0..depth {
-            v = serde_json::json!([v]);
-        }
-        v
-    }
-
-    #[test]
-    fn nested_values_are_flattened_regardless_of_shape() {
-        let input = serde_json::json!({
-            "a": "one",
-            "b": {"c": "two", "d": ["three", "four"]},
-            "e": 5,
-            "f": true,
-            "g": null,
-        });
-        let flat = tool_input_values(&input);
-        for expected in ["one", "two", "three", "four", "5", "true"] {
-            assert!(flat.contains(expected), "missing {expected:?} in {flat:?}");
-        }
-        assert!(!flat.contains("null"), "Null must contribute nothing: {flat:?}");
-    }
-
-    #[test]
-    fn a_value_exactly_at_the_depth_cap_is_still_reached() {
-        let input = nested(MAX_TOOL_INPUT_WALK_DEPTH, "reachable");
-        assert!(tool_input_values(&input).contains("reachable"));
-    }
-
-    /// THE CRASH THIS PREVENTS: `input` is the model's own tool call, not a
-    /// shape this project controls, so an unbounded recursive walk over one
-    /// nested deep enough is a stack overflow waiting to happen. Proven at
-    /// the exact boundary rather than at some very large depth: constructing
-    /// (and later dropping) a `serde_json::Value` nested tens of thousands of
-    /// levels deep is itself a known way to overflow the stack, in the
-    /// ordinary recursive `Drop` every such tree type gets - a risk that has
-    /// nothing to do with `tool_input_values` and would make a "very deep"
-    /// version of this test dangerous in exactly the way this fix exists to
-    /// avoid. One level past the cap is enough to prove the walk stops
-    /// there, without going anywhere near that unrelated risk.
-    #[test]
-    fn a_value_one_level_past_the_depth_cap_is_left_out_rather_than_reached() {
-        let input = nested(MAX_TOOL_INPUT_WALK_DEPTH + 1, "too-deep");
-        assert!(
-            !tool_input_values(&input).contains("too-deep"),
-            "a value past the cap must be left out, not walked into"
-        );
-    }
-}
-
-/// The command guard: the Absent-check guard's THIRD anchor shape (see
-/// `serve::absent_guard`'s own top-of-file doc comment, "THE COMMAND
-/// guard") - a live Rule/Orientation bound to a `Command` target, carrying a
-/// still-current `Check::Absent`/`Check::AbsentAll`, blocks a Bash-style tool
-/// call whose own command string carries one of the check's forbidden
-/// literals. Wired separately from `absent_guard_block` above, never folded
-/// into it: that function's own early return (`file_path?`) already makes it
-/// a no-op for every real command call (a Bash payload carries no
-/// `file_path`), and this guard's own marker key (the matched item's own
-/// anchor - see `absent_guard::find_command_violation`'s own doc comment)
-/// is only known AFTER matching, unlike the file guard's, which is known
-/// before any matching runs - the two shapes do not fit one function.
-///
-/// Every failure - no "command" field, an unresolvable root, no matching
-/// item, no check, a check of another form, a stale anchor, an unreadable
-/// marker file - falls through to `None` (ALLOW/nothing), never a block, the
-/// same "any error, anywhere, is silence" doctrine `absent_guard_block`
-/// itself already follows. Never emits a permission decision of "allow"
-/// either, mirroring every other guard in this file.
-///
-/// ALSO THE SHELL WRITE HOLE'S OWN GUARD, checked FIRST, before any of the
-/// above: `serve::input::shell_write_targets` reads `rm`/`git rm`/
-/// `truncate -s 0`/`sed -i`/`tee`/a `>`/`>>` redirection/`mv`/`cp`'s own
-/// destination out of the SAME command string, and every path it finds is
-/// fed through `absent_guard::find_location_violation` (and, for a write
-/// that empties or removes the file, `find_missing_required`) exactly as if
-/// it were the `file_path` of a real Edit/Write - because a rule anchored at
-/// a file must refuse a write to it however that write actually arrived.
-/// Same fail-open stance as everything else in this function: a shell write
-/// that reaches no rule falls straight through to the command-anchored
-/// checks below at no measurable cost, since `shell_write_targets` itself
-/// touches neither the store nor the filesystem.
-fn command_guard_block(
-    store: &EventStore,
-    db_path: &Path,
-    session_id: &str,
-    tool_input: Option<&Value>,
-    root: Option<&Path>,
-    session_project: Option<&str>,
-) -> Option<String> {
-    let command = absent_guard::proposed_command(tool_input)?;
-
-    // THE SHELL WRITE HOLE. MEASURED: a rule anchored at a file with a
-    // `contains` or `absent` check refuses an Edit/Write of that file, but
-    // `rm file`, `truncate -s 0 file`, `sed -i ... file`, `echo x > file`,
-    // `tee file`, `mv other file` and `cp other file` from Bash walk
-    // straight past it - a shell write is a write. Checked BEFORE the
-    // command-anchored rule system below (`find_command_violation`): a
-    // location prohibition or a lost required literal is a stronger, more
-    // specific complaint than a forbidden-literal-in-the-command-string
-    // check, mirroring `absent_guard_block`'s own location-before-content
-    // ordering. `shell_write_targets` itself is pure string parsing - for
-    // the common case (no rm/mv/cp/sed/tee/truncate/redirect in the
-    // command) it returns immediately and this loop never opens the store
-    // at all, so a shell write that reaches no rule costs nothing
-    // measurable.
-    for write in serve::input::shell_write_targets(command) {
-        let mut location_input = ServeInput::default();
-        location_input.add_target(TargetKind::Path, &write.path);
-        location_input.add_target(TargetKind::Dir, &write.path);
-        let location_candidates = serve::live::candidates_for(store, &location_input);
-
-        // Location first (a place out of bounds is out of bounds whatever
-        // the write does to it), then - only for Removed/Emptied, where the
-        // resulting content is KNOWN to be empty, never guessed at - a
-        // `Contains` check whose required literal that emptiness would
-        // erase. Rewritten is deliberately never fed to `find_missing_
-        // required`: unlike an Edit, this project cannot know what a
-        // `sed`/`tee`/redirect-with-a-producer actually leaves behind
-        // without running it, and guessing would risk the false refusal
-        // this whole guard file refuses to make anywhere else.
-        let shell_reason = absent_guard::find_location_violation(&location_candidates, &write.path, root).or_else(
-            || {
-                matches!(
-                    write.effect,
-                    serve::input::ShellWriteEffect::Removed | serve::input::ShellWriteEffect::Emptied
-                )
-                .then(|| absent_guard::find_missing_required(&location_candidates, &write.path, "", root))
-                .flatten()
-            },
-        );
-        let Some(shell_reason) = shell_reason else { continue };
-
-        let verb = match write.effect {
-            serve::input::ShellWriteEffect::Removed => "removed",
-            serve::input::ShellWriteEffect::Emptied => "emptied",
-            serve::input::ShellWriteEffect::Rewritten => "rewritten",
-        };
-        if let Some(id) = absent_guard::rule_id_of(&shell_reason) {
-            record_gate(db_path, session_id, true, id, command);
-        }
-        return Some(format!("{shell_reason} The command `{command}` would have {verb} {}. Nothing was done.", write.path));
-    }
-
-    let mut input = ServeInput::default();
-    input.add_target(TargetKind::Command, command);
-    // The files and hosts the command NAMES, as doelen of their own. Without
-    // these, a fact anchored at a file fired when that file was opened with a
-    // file tool and stayed silent when a shell command read the same file -
-    // measured 2026-08-07, and it cost a real mistake in a log-grep the very
-    // fact warned about. Deliberately only the targets: the moments a command
-    // implies are the file guard's business, and adding them here would change
-    // what fires far beyond this defect.
-    for path in serve::input::paths_in_command(command) {
-        input.add_target(TargetKind::Path, &path);
-    }
-    for host in serve::input::hosts_in_command(command) {
-        input.add_target(TargetKind::Host, &host);
-    }
-    let candidates = serve::live::candidates_for(store, &input);
-
-    // The staleness half of the doctrine, scanned every call over the SAME
-    // candidate pool the block decision below uses - never gated on the
-    // marker check further down, unlike the file guard's own ordering: that
-    // guard can cheaply skip its whole scan once its file is already
-    // blocked because it knows its marker key (the file path) up front; this
-    // guard only learns its own key (the matched anchor) as a side effect of
-    // running the match below, so there is no equivalent early exit to take.
-    record_command_guard_staleness(store, db_path, &candidates, command, root);
-
-    // Scoped to this session's own project before anything can refuse - see
-    // `in_session_project`. The staleness scan above still reads the whole
-    // pool on purpose: whether an anchor has rotted is true of the store, not
-    // of which checkout happens to be asking.
-    let candidates = in_session_project(candidates, session_project);
-    let (reason, anchor) = absent_guard::find_command_violation(&candidates, command, root)?;
-
-    // WHAT THIS USED TO DO, AND WHY IT WAS THE WORSE HALF OF A FIXED DEFECT.
-    // This arm stood aside on a repeat, keyed on the ANCHOR alone, so ONE
-    // refusal disarmed that rule for the whole session no matter what the next
-    // command carried. The file arm had the same defect and lost it earlier the
-    // same day; this arm kept it, and this is the arm that covers shell work -
-    // where the irreversible rules live. Two independent reviews found it the
-    // same evening, and both put it first.
-    //
-    // The old reasoning was about the KEY: a commit message differs on every
-    // retry, so keying on the command text would suppress almost nothing. That
-    // was true, and it stopped mattering the moment nothing gets suppressed.
-    // The key now only decides the WORDING, so it carries the command's own
-    // fingerprint alongside the anchor: the same command again is told it is a
-    // repeat, a different one tripping the same rule gets its own plain
-    // verdict, and neither of them gets through.
-    let attempt = absent_guard::attempt_key(&anchor, Some(command));
-    let marker_path = absent_guard::default_command_marker_path(db_path);
-    let marker_text = std::fs::read_to_string(&marker_path).ok();
-    let markers = marker_text.as_deref().map(absent_guard::read_blocked).unwrap_or_default();
-    let repeat = absent_guard::already_blocked(&markers, session_id, &attempt);
-    if !repeat {
-        if let Some(text) = absent_guard::mark_blocked_text(marker_text.as_deref(), session_id, &attempt) {
-            let _ = serve::store_dir::write(&marker_path, text);
-        }
-    }
-    let reason = if repeat { absent_guard::escalated(&reason) } else { reason };
-    if let Some(id) = absent_guard::rule_id_of(&reason) {
-        record_gate(db_path, session_id, true, id, command);
-    }
-    Some(reason)
-}
-
-/// `command_guard_block`'s own staleness I/O wrapper - mirrors
+/// The command arm's own staleness I/O wrapper - mirrors
 /// `record_absent_guard_staleness` exactly (best effort throughout: an
 /// unreadable or unwritable sidecar is silence, never a panic and never a
 /// reason to change what the caller does), folding into the SAME
@@ -3875,10 +3529,11 @@ fn record_command_guard_staleness(
     store: &EventStore,
     db_path: &Path,
     command_candidates: &[serve::live::LiveItem],
+    segments: &[serve::shell::Segment],
     command: &str,
     root: Option<&Path>,
 ) {
-    let findings = absent_guard::stale_in_command(command_candidates, command, root);
+    let findings = absent_guard::stale_in_command_in(command_candidates, segments, command, root);
     let scanned: Vec<String> = command_candidates.iter().map(|li| li.id.clone()).collect();
     let Ok(next_seq) = store.get_next_seq() else { return };
     let now_seq = next_seq.saturating_sub(1);
@@ -3919,7 +3574,7 @@ fn record_command_guard_staleness(
 /// end silently. A single failed per-item lookup aborts the WHOLE check
 /// (via `?`, propagating `None` immediately) rather than guessing for just
 /// that one entry - the simplest rule that still never blocks on a doubt.
-fn stale_guard_stop_check(db_path: &Path, session_id: &str) -> Option<HookOutput> {
+fn stale_guard_stop_check(db_path: &Path, session_id: &str, actor: &str) -> Option<HookOutput> {
     let mode_text = std::fs::read_to_string(stale_guard::default_mode_config_path(db_path)).ok();
     if stale_guard::resolve_mode(mode_text.as_deref()) == stale_guard::Mode::Off {
         return None;
@@ -3967,7 +3622,7 @@ fn stale_guard_stop_check(db_path: &Path, session_id: &str) -> Option<HookOutput
     // whole of 2.0, so it is counted. Filed under the guard's own name rather
     // than a rule id, because what stands aside is the guard, not one rule.
     if already_nudged {
-        record_gate(db_path, session_id, false, "stale-guard", "stop");
+        record_gate(db_path, session_id, actor, false, "stale-guard", "stop", None);
         return None;
     }
 
@@ -4574,15 +4229,15 @@ mod judgement_debt_tests {
             Some("acme"),
         );
         assert!(
-            teeth_debt(&store, &db, Some("acme"), None).is_some(),
+            teeth_debt(&store, &db, Some("acme")).is_some(),
             "fixture sanity: it applies inside its own checkout"
         );
         assert!(
-            teeth_debt(&store, &db, Some("thor"), None).is_none(),
+            teeth_debt(&store, &db, Some("thor")).is_none(),
             "a different checkout's project must never be asked about acme's own rule"
         );
         assert!(
-            teeth_debt(&store, &db, None, None).is_none(),
+            teeth_debt(&store, &db, None).is_none(),
             "a checkout that resolves to no project at all gets the global layer only"
         );
     }
@@ -4601,9 +4256,9 @@ mod judgement_debt_tests {
             "Draai npm audit fix --force nooit op deze repo",
             None,
         );
-        assert!(teeth_debt(&store, &db, Some("acme"), None).is_some(), "a global rule reaches acme's checkout");
-        assert!(teeth_debt(&store, &db, Some("thor"), None).is_some(), "and thor's checkout too");
-        assert!(teeth_debt(&store, &db, None, None).is_some(), "and a checkout with no project at all");
+        assert!(teeth_debt(&store, &db, Some("acme")).is_some(), "a global rule reaches acme's checkout");
+        assert!(teeth_debt(&store, &db, Some("thor")).is_some(), "and thor's checkout too");
+        assert!(teeth_debt(&store, &db, None).is_some(), "and a checkout with no project at all");
     }
 
     #[test]
@@ -4616,14 +4271,9 @@ mod judgement_debt_tests {
         assert!(teeth_not_yet_asked_this_session(&db, "s2"), "a different session gets its own turn");
     }
 
-    /// UPDATED FOR THE 2026-09-25 REBUILD: this used to prove `candidate_
-    /// literal`'s own text-mining heuristic surfaced the flag it spotted.
-    /// The rebuilt debt no longer mines the TEXT at all - it tries the
-    /// item's own teeth (`serve::prove::teeth_box`) and reports what THAT
-    /// found, which for a checkless heavy item is "nothing to try" rather
-    /// than a guess at what the check should look for. The point this test
-    /// still proves - a heavy rule with no check is found by the sweep
-    /// itself, with nobody pointing at it - still holds.
+    /// A rule with no verdict is found by the sweep itself, with nobody
+    /// pointing at it, and named with why it is owed (`settlement`'s own
+    /// reason) and the one command that decides it (step 9).
     #[test]
     fn a_heavy_checkless_rule_is_found_without_anybody_pointing_at_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -4632,9 +4282,13 @@ mod judgement_debt_tests {
         legacy_unanswered(&mut store, "names-a-flag", "Draai npm audit fix --force nooit op deze repo");
 
         let asked =
-            teeth_debt(&store, &db, Some("p"), None).expect("a heavy checkless rule must be found by the sweep itself");
+            teeth_debt(&store, &db, Some("p")).expect("a heavy checkless rule must be found by the sweep itself");
         assert!(asked.contains("names-a-flag"), "it must name which rule: {asked}");
-        assert!(asked.contains("nothing to try"), "and say what its own teeth box found: {asked}");
+        assert!(asked.contains("it has never been tried"), "and say why it is owed: {asked}");
+        assert!(
+            asked.contains(&format!("--db \"{}\" retest --id 'names-a-flag'", db.display())),
+            "and the command that decides it, on this very store: {asked}"
+        );
     }
 
     /// One rule per session is a burn that never finishes: 336 were waiting on
@@ -4650,7 +4304,7 @@ mod judgement_debt_tests {
             legacy_unanswered(&mut store, &format!("unarmed-{i}"), &format!("Draai npm audit fix --force-{i} nooit"));
         }
 
-        let asked = teeth_debt(&store, &db, Some("p"), None).expect("several rules are unanswered");
+        let asked = teeth_debt(&store, &db, Some("p")).expect("several rules are unanswered");
         for i in 0..TEETH_DEBT_BATCH_MAX {
             assert!(asked.contains(&format!("unarmed-{i}")), "the whole batch is named: {asked}");
         }
@@ -4661,42 +4315,26 @@ mod judgement_debt_tests {
         assert!(asked.contains("2 more are waiting"), "silence about the rest would read as done: {asked}");
     }
 
-    /// REPLACES `a_written_reason_no_longer_settles_it_only_a_proven_guard_does`
-    /// (2026-09-26): that test pinned both halves of the defect this rebuild
-    /// closes - a reason that is checkable against the rule could never settle
-    /// it, while a check proven only against its own literal did. Now: a reason
-    /// that fits any rule is refused at the write and settles nothing; one that
-    /// names the rule's own trigger settles it.
+    /// Step 8 of the two tracks: a reason tag settles NOTHING any more -
+    /// thin or checkable, before or after a check was tried - because THOR's
+    /// trial decides whether a rule can have a tooth. A thin reason is no
+    /// longer refused at the write either (it is just a tag). The rule leaves
+    /// the debt once the trial puts it on the note track.
     #[test]
-    fn a_reason_settles_it_only_when_it_names_what_the_rule_is_about() {
+    fn a_reason_settles_nothing_and_a_note_verdict_does() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
         let mut store = EventStore::new(&db).unwrap();
         legacy_unanswered(&mut store, "answer-me", "Draai npm audit fix --force nooit op deze repo");
-        assert!(teeth_debt(&store, &db, Some("p"), None).is_some(), "fixture sanity");
+        assert!(teeth_debt(&store, &db, Some("p")).is_some(), "fixture sanity");
 
         let item = model::store::show(&store, "answer-me").unwrap();
-        let mut thin = item.clone();
-        thin.tags.push(format!("{}this is a judgement rule and not a fixed text", model::store::NO_LITERAL_REASON_PREFIX));
-        assert!(
-            model::store::revise(&mut store, "s", "l", "a", &item, &thin).is_err(),
-            "a reason that would fit any rule is refused at the write"
-        );
-        assert!(teeth_debt(&store, &db, Some("p"), None).unwrap().contains("answer-me"), "and it is still asked");
-
         let mut real = item.clone();
         real.tags.push(format!(
             "{}the same --force also appears in the legitimate lockfile repair run",
             model::store::NO_LITERAL_REASON_PREFIX
         ));
-        model::store::revise(&mut store, "s", "l", "a", &item, &real).unwrap();
-        assert!(
-            teeth_debt(&store, &db, Some("p"), None).unwrap().contains("answer-me"),
-            "a good reason on a rule that never carried a check is not the answer yet (2026-09-26)"
-        );
-
-        // A real try on record - a check attached, then given up for the
-        // same reason - and the reason counts.
+        model::store::revise(&mut store, "s", "l", "a", &item, &real).expect("a reason tag is just a tag now");
         let now = model::store::show(&store, "answer-me").unwrap();
         let mut tried = now.clone();
         tried.check = Some(model::item::Check::Forbidden { literals: vec!["npm audit fix --force".to_string()] });
@@ -4705,18 +4343,22 @@ mod judgement_debt_tests {
                 .append_mutate_checked("legacy", "answer-me", "migration", thor_core::event_store::EventKind::FactRevised, "answer-me", None, &body)
                 .unwrap();
         }
-        assert!(
-            teeth_debt(&store, &db, Some("p"), None).is_none(),
-            "a reason that names the rule's own trigger settles it, after a real try"
-        );
-    }
+        let asked = teeth_debt(&store, &db, Some("p")).unwrap();
+        assert!(asked.contains("answer-me"), "a reason, even after a try, settles nothing: {asked}");
+        assert!(asked.contains("retest --id 'answer-me'"), "the way on is the trial: {asked}");
 
-    /// A check that is only WIRED - its two synthesised attempts held, but it
-    /// has never met a real call - settles nothing on its own: the attempts
-    /// were built from its own literal. Two honest ways out: a real refusal on
-    /// record, or an open point that names it so the next evaluation closes it.
+        let corpus = serve::legit::Corpus::load(&store);
+        let retest = serve::teeth::retest(&store, Some(db.as_path()), "answer-me", &corpus).unwrap();
+        assert!(matches!(retest.outcome, serve::teeth::Maintenance::Note { .. }), "{:?}", retest.outcome);
+        serve::teeth::apply_as_retest(&mut store, &retest).unwrap();
+        assert!(teeth_debt(&store, &db, Some("p")).is_none(), "a note verdict settles it");
+    }
+    /// Step 9: a refusal on record and an open point naming the rule settle
+    /// NOTHING - not even a field refusal, verified from the session's own
+    /// transcript (it only sets the "proven" label of a trial). The one
+    /// thing that settles it is a verdict from THOR's trial.
     #[test]
-    fn a_wired_check_settles_only_by_a_real_refusal_or_an_open_point_naming_it() {
+    fn a_refusal_or_an_open_point_settles_nothing_and_a_verdict_does() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
         let mut store = EventStore::new(&db).unwrap();
@@ -4729,17 +4371,22 @@ mod judgement_debt_tests {
         }];
         armed.check = Some(model::item::Check::Forbidden { literals: vec!["--force".to_string()] });
         model::store::revise(&mut store, "s", "l", "a", &current, &armed).unwrap();
-        let asked = teeth_debt(&store, &db, Some("p"), None).expect("wired is not proven");
-        assert!(asked.contains("arm-me") && asked.contains("wired, never met a real call"), "{asked}");
+        let asked = teeth_debt(&store, &db, Some("p")).expect("a check with no verdict is owed");
+        assert!(asked.contains("arm-me"), "{asked}");
 
-        serve::deliver::record_gate_outcome(&mut store, "s", "l", "hook", "2026-09-26T00:00:00Z", true, "arm-me", "npm audit fix --force");
-        assert!(teeth_debt(&store, &db, Some("p"), None).is_none(), "a real refusal on record settles it");
+        let transcripts = tempfile::tempdir().unwrap();
+        serve::attest::fixture::field_refusal(
+            &mut store,
+            transcripts.path(),
+            "0de7dc52-1b97-4b66-948f-61e4438043b2",
+            "arm-me",
+            "toolu_arm",
+            "Bash",
+            serde_json::json!({"command": "npm audit fix --force"}),
+            "npm audit fix --force",
+        );
+        assert!(teeth_debt(&store, &db, Some("p")).is_some_and(|a| a.contains("arm-me")), "a field refusal settles nothing");
 
-        // The same, carried by an open point instead of a refusal.
-        let mut store = EventStore::new(&dir.path().join("t2.db")).unwrap();
-        legacy_unanswered(&mut store, "arm-me", "Draai npm audit fix --force nooit op deze repo");
-        let current = model::store::show(&store, "arm-me").unwrap();
-        model::store::revise(&mut store, "s", "l", "a", &current, &armed).unwrap();
         let point = model::item::Item {
             id: "open-arm-me".to_string(),
             kind: model::item::Kind::Report,
@@ -4754,7 +4401,62 @@ mod judgement_debt_tests {
             check: None,
         };
         model::store::declare(&mut store, "s", "l", "a", &point).unwrap();
-        assert!(teeth_debt(&store, &db, Some("p"), None).is_none(), "an open point naming it carries it");
+        assert!(teeth_debt(&store, &db, Some("p")).is_some_and(|a| a.contains("arm-me")), "an open point settles nothing");
+
+        let corpus = serve::legit::Corpus::load(&store);
+        let retest = serve::teeth::retest(&store, Some(db.as_path()), "arm-me", &corpus).unwrap();
+        assert!(matches!(retest.outcome, serve::teeth::Maintenance::Rule { proven: true, .. }), "{:?}", retest.outcome);
+        serve::teeth::apply_as_retest(&mut store, &retest).unwrap();
+        assert!(teeth_debt(&store, &db, Some("p")).is_none(), "the trial's verdict - proven by that refusal - settles it");
+    }
+
+    /// F9: a file check of a project with no registered working copy is
+    /// held by that blocker - never named, because nothing the agent runs
+    /// settles it - and owed again the moment the project is registered.
+    #[test]
+    fn a_blocked_rule_is_named_only_once_its_blocker_lifts() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        let checkout = dir.path().join("gamma");
+        std::fs::create_dir_all(checkout.join(".git")).unwrap();
+        std::fs::write(checkout.join("NOTES.md"), "keep me\nplain line\n").unwrap();
+        let mut item = crowded_newcomer("gamma-keeps", "gamma");
+        item.text = "NOTES.md must keep the line `keep me`.".to_string();
+        item.severity = Some(model::item::Severity::Irreversible);
+        item.bindings = vec![model::item::Binding::Target { kind: model::item::TargetKind::Path, value: "NOTES.md".to_string() }];
+        item.check = Some(model::item::Check::Contains { path: "NOTES.md".to_string(), literal: "keep me".to_string() });
+        let body = serde_json::to_string(&item).unwrap();
+        store
+            .append_event("legacy", "gamma-keeps", "migration", thor_core::event_store::EventKind::FactCreated, "gamma-keeps", None, &body)
+            .unwrap();
+        assert!(teeth_debt(&store, &db, Some("gamma")).is_none(), "blocked: never named");
+        // The installer's registration, as its own event lands on the log (a
+        // raw append: THOR's actor token is built in the installer only).
+        let record = model::item::Item {
+            id: model::store::project_opened_id("gamma"),
+            kind: model::item::Kind::Report,
+            text: "Project gamma: a fixture record.".to_string(),
+            bindings: Vec::new(),
+            severity: None,
+            project: Some("gamma".to_string()),
+            tags: vec!["project-record".to_string()],
+            expires: None,
+            key: None,
+            falsifier: None,
+            check: None,
+        };
+        let body = model::store::canonical_body(&record).unwrap();
+        let body = format!(
+            "{},\"root\":{},\"root_at\":\"2026-09-29T00:00:00Z\"}}",
+            &body[..body.len() - 1],
+            serde_json::to_string(checkout.to_str().unwrap()).unwrap()
+        );
+        store
+            .append_event("install", "install", model::store::INSTALLER_ACTOR, thor_core::event_store::EventKind::FactCreated, &record.id, None, &body)
+            .unwrap();
+        let asked = teeth_debt(&store, &db, Some("gamma")).expect("registered: owed again");
+        assert!(asked.contains("gamma-keeps"), "{asked}");
     }
 
     /// THE DEFECT THIS CLOSES (H): sorted by id alone, every session was asked
@@ -4767,8 +4469,8 @@ mod judgement_debt_tests {
         for i in 0..TEETH_DEBT_BATCH_MAX * 2 {
             legacy_unanswered(&mut store, &format!("unarmed-{i:02}"), &format!("Draai npm audit fix --force-{i} nooit"));
         }
-        let first = teeth_debt(&store, &db, Some("p"), None).unwrap();
-        let second = teeth_debt(&store, &db, Some("p"), None).unwrap();
+        let first = teeth_debt(&store, &db, Some("p")).unwrap();
+        let second = teeth_debt(&store, &db, Some("p")).unwrap();
         for i in 0..TEETH_DEBT_BATCH_MAX {
             assert!(first.contains(&format!("'unarmed-{i:02}'")), "{first}");
             assert!(!second.contains(&format!("'unarmed-{i:02}'")), "the second ask must move on: {second}");
@@ -4778,23 +4480,23 @@ mod judgement_debt_tests {
         }
     }
 
-    /// UPDATED FOR THE 2026-09-25 REBUILD: this used to prove `candidate_
-    /// literal`'s own text heuristic found nothing worth asking about in
-    /// prose text. The rebuilt debt never reads the text at all any more -
-    /// this fixture's own `severity` (`crowded_newcomer`'s default, `None`)
-    /// is what now keeps it out: `serve::prove::teeth_box`'s own
-    /// applicability rule is heavy-or-a-refusing-check, and this fixture is
-    /// neither, so Change 2 simply does not apply to it - `TeethBox::
-    /// NotApplicable`, never asked.
+    /// D8 (step 9): a light rule with no check and no verdict is owed like
+    /// any other - weight plays no part, so lowering a severity never takes
+    /// a rule out of this debt. The trial's note settles it.
     #[test]
-    fn a_light_item_with_no_check_is_never_asked() {
+    fn a_light_item_without_a_verdict_is_asked_until_the_trial_decides_it() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
         let mut store = EventStore::new(&db).unwrap();
         let mut item = crowded_newcomer("pure-judgement", "p");
         item.text = "Vraag eerst toestemming voor je iets onomkeerbaars doet".to_string();
         model::store::declare(&mut store, "s", "l", "a", &item).unwrap();
-        assert!(teeth_debt(&store, &db, Some("p"), None).is_none(), "a light item with no check owes no proof at all");
+        assert!(teeth_debt(&store, &db, Some("p")).is_some_and(|a| a.contains("pure-judgement")), "light and owed");
+        let corpus = serve::legit::Corpus::load(&store);
+        let retest = serve::teeth::retest(&store, Some(db.as_path()), "pure-judgement", &corpus).unwrap();
+        assert!(matches!(retest.outcome, serve::teeth::Maintenance::Note { .. }), "{:?}", retest.outcome);
+        serve::teeth::apply_as_retest(&mut store, &retest).unwrap();
+        assert!(teeth_debt(&store, &db, Some("p")).is_none(), "a note verdict settles it");
     }
 
     #[test]
@@ -4829,7 +4531,7 @@ mod judgement_debt_tests {
         item.text = "Draai npm audit fix --force nooit op deze repo".to_string();
         item.check = Some(model::item::Check::Forbidden { literals: vec!["--force".to_string()] });
         model::store::declare(&mut store, "s", "l", "a", &item).unwrap();
-        let asked = teeth_debt(&store, &db, Some("p"), None);
+        let asked = teeth_debt(&store, &db, Some("p"));
         assert!(asked.is_some(), "a check that can never reach anything must still be named");
         assert!(asked.unwrap().contains("looks-armed-fires-nothing"));
     }
@@ -5604,7 +5306,7 @@ mod evaluation_debt_tests {
         assert!(asked.contains("After that it is quiet for 16 hours"), "{asked}");
     }
 
-    /// The ask names the batch of heavy rules the report will be held to, and
+    /// The ask names the batch of rules the report will be held to, and
     /// counts the ones that stay owed beyond it (2026-09-26).
     #[test]
     fn the_ask_names_the_batch_of_heavy_rules_and_counts_the_rest() {
@@ -5632,8 +5334,9 @@ mod evaluation_debt_tests {
             serve_it(&mut store, &id, 1);
         }
         let asked = evaluation_debt(&store, &db, Some("thor"), &work_minutes(90)).expect("the evaluation is owed");
-        assert!(asked.contains("This report's batch of heavy rules"), "{asked}");
+        assert!(asked.contains("This report's batch of rules"), "{asked}");
         assert_eq!(asked.matches("\n- 'heavy-").count(), model::store::EVALUATION_TEETH_BATCH, "{asked}");
+        assert!(asked.contains("retest --id 'heavy-00'"), "each one with the command that decides it: {asked}");
         assert!(asked.contains("2 more stay owed for a later report"), "{asked}");
     }
 
@@ -6026,9 +5729,49 @@ fn valid_actor_label(s: &str) -> bool {
         && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
 }
 
+/// The actor `serve hook` stamps its recorded events with: `--actor` when
+/// given and acceptable, else `usefulness::ASSISTANT_DELIVERY_ACTOR`
+/// ("hook"). `Err` is the one line printed before exiting 2.
+///
+/// A name reserved for THOR itself is refused with the store's own sentence
+/// (`model::store::refuse_reserved_actor`): the events this hook records are
+/// written raw, below the store's fence, so this is where that fence has to
+/// stand for them. Its own default, `hook`, stays accepted - this IS the hook.
+fn hook_actor(actor: Option<String>) -> Result<String, String> {
+    match actor {
+        None => Ok(usefulness::ASSISTANT_DELIVERY_ACTOR.to_string()),
+        Some(a) if !valid_actor_label(&a) => Err(format!(
+            "--actor must be 1 to 32 characters of lowercase ascii letters, digits, dash or underscore, got '{a}'"
+        )),
+        Some(a) if a == usefulness::ASSISTANT_DELIVERY_ACTOR => Ok(a),
+        Some(a) => match model::store::refuse_reserved_actor(&a) {
+            Ok(()) => Ok(a),
+            Err(refusal) => Err(refusal.to_string()),
+        },
+    }
+}
+
 #[cfg(test)]
 mod valid_actor_label_tests {
     use super::*;
+
+    /// THE LEAK THIS CLOSES (D1): `serve hook --actor teeth-eval` stamped
+    /// every event it recorded with a name only THOR may use. Refused now
+    /// with the store's sentence; the hook's own default and an ordinary
+    /// probe name still pass.
+    #[test]
+    fn a_reserved_actor_is_refused_before_the_hook_runs() {
+        for name in ["teeth-eval", "eval-machine", "installer", "attester", "teeth-write"] {
+            assert_eq!(
+                hook_actor(Some(name.to_string())),
+                Err(format!("the actor name {name} is reserved for THOR itself - write without --actor, or with your own name"))
+            );
+        }
+        assert_eq!(hook_actor(Some("hook".to_string())), Ok("hook".to_string()));
+        assert_eq!(hook_actor(None), Ok("hook".to_string()));
+        assert_eq!(hook_actor(Some("probe".to_string())), Ok("probe".to_string()));
+        assert!(hook_actor(Some("Hook".to_string())).unwrap_err().starts_with("--actor must be"));
+    }
 
     #[test]
     fn an_empty_label_is_rejected() {
@@ -6375,13 +6118,12 @@ fn cmd_hook(db_path: &Path, diagnose: bool, actor: Option<String>, no_record: bo
  // reentry or `--diagnose`. `None` (the flag was left off) is the default,
  // `usefulness::ASSISTANT_DELIVERY_ACTOR` ("hook"), byte for byte what
  // every call site below already wrote before this flag existed.
- let actor = match actor {
- Some(a) if valid_actor_label(&a) => a,
- Some(a) => {
- eprintln!("--actor must be 1 to 32 characters of lowercase ascii letters, digits, dash or underscore, got '{a}'");
+ let actor = match hook_actor(actor) {
+ Ok(actor) => actor,
+ Err(line) => {
+ eprintln!("{line}");
  std::process::exit(2);
  }
- None => usefulness::ASSISTANT_DELIVERY_ACTOR.to_string(),
  };
  if serve::reentry::is_reentrant() {
  if diagnose {
@@ -6531,7 +6273,7 @@ fn cmd_check(db_path: &Path, input: &ServeInput, json: bool) {
 }
 
 /// One item's two-line description in `why`'s own prose form, plus - only
-/// when `classify_check` calls it a prohibition for `command` - a short
+/// when `classify_item` calls it a prohibition for `command` - a short
 /// third line marking it. Split out of `cmd_why` so a test can inspect the
 /// exact lines it produces without capturing real stdout; every original
 /// line stays exactly as it always read (see this file's own `mark_
@@ -6543,9 +6285,7 @@ fn why_lines(all: &[RankedItem], shown_ids: &std::collections::HashSet<&str>, co
         let severity = ranked.item.severity.map(|s| format!("{s:?}")).unwrap_or_else(|| "none".to_string());
         lines.push(format!("{mark} [{severity}] {}", ranked.item.text));
         lines.push(format!("    id {}   kind {:?}", ranked.id, ranked.item.kind));
-        if let absent_guard::Verdict::Prohibition { literal } =
-            absent_guard::classify_check(ranked.item.check.as_ref(), command, None)
-        {
+        if let absent_guard::Verdict::Prohibition { literal } = absent_guard::classify_item(&ranked.item, command, None) {
             lines.push(format!("    [PROHIBITS] matched \"{literal}\""));
         }
     }
@@ -6660,7 +6400,9 @@ mod prose_marking_tests {
         let mut all = heavier.clone();
         all.push(outranked.clone());
         let selection = render::Selection { shown: heavier.clone(), withheld: 1 };
-        let command = "git commit -m \"fix: thing\" --no-verify";
+        // A command the fixtures' own anchor ("git push") reaches - see
+        // `rows_stay_paired_with_the_right_item_across_several_at_once`.
+        let command = "git push --no-verify origin main";
         let input = ServeInput { command: Some(command.to_string()), ..Default::default() };
         let before = render::render_text(&selection, &input, Path::new("does-not-need-to-exist.db"))
             .expect("fixture must render a block");
@@ -7214,6 +6956,121 @@ fn cmd_mark(db_path: &Path, id: &str, noise: bool) {
         Err(e) => {
             eprintln!("could not record the mark for {id}: {e}");
             std::process::exit(1);
+        }
+    }
+}
+
+/// `Command::Retest` - see that variant's own doc comment. Opens an existing
+/// store only (never creates one), tries each rule, prints what it found, and
+/// exits with the code the variant's doc comment names.
+fn cmd_retest(db_path: &Path, id: Option<&str>, project: Option<&str>, all: bool, apply: bool) {
+    let mut store = match EventStore::open_existing(db_path) {
+        Ok(store) => store,
+        Err(e) => {
+            eprintln!("could not open the store at {}: {e}", db_path.display());
+            std::process::exit(1);
+        }
+    };
+    let corpus = serve::legit::Corpus::load(&store);
+    if let Some(id) = id {
+        std::process::exit(retest_one(&mut store, db_path, id, &corpus, apply));
+    }
+    let wanted = project.and_then(|p| model::normalize::normalize_project(Some(p)));
+    let ids: Vec<String> = serve::live::live_items(&store)
+        .into_iter()
+        .filter(|li| li.item.kind.can_fire())
+        .filter(|li| all || model::normalize::normalize_project(li.item.project.as_deref()) == wanted)
+        .map(|li| li.id)
+        .collect();
+    let (mut decided, mut tried) = (0usize, 0usize);
+    let mut worst = 0;
+    for id in &ids {
+        if !matches!(model::store::current_verdict(&store, id), model::store::CurrentVerdict::Undecided { .. }) {
+            decided += 1;
+            continue;
+        }
+        tried += 1;
+        let code = retest_one(&mut store, db_path, id, &corpus, apply);
+        worst = worse_exit(worst, code);
+        println!();
+    }
+    println!("tried {tried} rule(s) without a current verdict; {decided} already have one and were left as they are");
+    std::process::exit(worst);
+}
+
+/// The worse of two `retest` exit codes: an error, then needs the agent, then
+/// blocked, then a verdict.
+fn worse_exit(a: i32, b: i32) -> i32 {
+    let rank = |c: i32| match c {
+        1 => 3,
+        4 => 2,
+        3 => 1,
+        _ => 0,
+    };
+    if rank(b) > rank(a) {
+        b
+    } else {
+        a
+    }
+}
+
+/// Retest one rule, print it, write it with `apply`; the exit code.
+fn retest_one(store: &mut EventStore, db_path: &Path, id: &str, corpus: &serve::legit::Corpus, apply: bool) -> i32 {
+    let retest = match serve::teeth::retest(store, Some(db_path), id, corpus) {
+        Ok(retest) => retest,
+        Err(why) => {
+            println!("{id}: cannot be tried - {why}");
+            return 1;
+        }
+    };
+    println!("{id}:");
+    match (&retest.root, retest.project.as_deref()) {
+        (Ok(root), Some(project)) => println!("  root: {} (registered for '{project}')", root.display()),
+        (Ok(root), None) => println!("  root: {}", root.display()),
+        (Err(problem), Some(project)) => println!("  root: none - {problem} for '{project}'"),
+        (Err(problem), None) => println!("  root: none - {problem}"),
+    }
+    for attempt in &retest.attempts {
+        let outcome = match attempt.outcome {
+            model::store::AttemptOutcome::Refused => "refused",
+            model::store::AttemptOutcome::LetThrough => "let through",
+        };
+        println!("  tried {} (as a {} call): {outcome}", attempt.form, attempt.via);
+    }
+    for line in &retest.lines {
+        println!("  {line}");
+    }
+    let (verdict, code) = match &retest.outcome {
+        serve::teeth::Maintenance::Rule { proven: true, .. } => ("rule track, proven".to_string(), 0),
+        serve::teeth::Maintenance::Rule { proven: false, .. } => ("rule track, wired".to_string(), 0),
+        serve::teeth::Maintenance::Note { because } => (format!("note - {because}"), 0),
+        serve::teeth::Maintenance::Blocked(blocker) => (format!("blocked: {blocker}; nothing written"), 3),
+        serve::teeth::Maintenance::NeedsAgent(fix) => (format!("needs the agent - {fix}; nothing written"), 4),
+    };
+    println!("  verdict: {verdict}");
+    if code != 0 {
+        return code;
+    }
+    if retest.write.is_none() {
+        println!("  nothing to write: it stays the note it is");
+        return 0;
+    }
+    if !apply {
+        println!("  nothing written - run this again with --apply to write this verdict");
+        return 0;
+    }
+    match serve::teeth::apply_as_retest(store, &retest) {
+        Ok(event) => {
+            println!("  written: fact_revised at log seq {} by '{}'", event.seq, event.actor);
+            0
+        }
+        Err(serve::teeth::ApplyError::NeedsAgent(fix)) => {
+            println!("  needs the agent - {fix}; nothing written");
+            4
+        }
+        Err(e) => {
+            println!("  {e}");
+            1
         }
     }
 }

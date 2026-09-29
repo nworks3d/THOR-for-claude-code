@@ -1,5 +1,5 @@
 //! "Which project is this session in", resolved from a filesystem location -
-//! the ONE place in the workspace that performs this resolution. Before this
+//! the ONE door the serving crates use for this resolution. Before this
 //! module existed, `serve session-start` and the `hook` channel's SessionStart
 //! branch both required the caller to name the project explicitly (see
 //! `bin/serve.rs`'s old doc comment: "there is no cwd-to-project resolver in
@@ -28,14 +28,19 @@
 //! injection surface (session start), so it must never block and never speak
 //! on failure (R5), exactly like `live::live_items`.
 //!
-//! `serve/tests/single_project_resolution.rs` greps the whole workspace for a
-//! second definition of this function and fails if one appears anywhere but here.
+//! The resolution itself, and the check of a project's registered working
+//! copy, live in `model::checkout` since step 9 of the two-tracks build (a
+//! rule's settlement, read by the filing gate inside `model::store`, needs the
+//! same judgement the retest makes) and are re-exported here unchanged, so
+//! every caller keeps this path. `serve/tests/single_project_resolution.rs`
+//! greps the whole workspace for a second definition and fails if one appears.
 
 use std::path::Path;
 
-/// A file named this, sitting directly in a directory, wins over any git-root
-/// inference for that directory - see [`resolve_project`].
-pub const MARKER_FILE_NAME: &str = ".thor-project";
+pub use model::checkout::{
+    checkout_for, checkout_top, git_root, linked_worktree_root, registered_checkout, resolve_project, validate_checkout,
+    RootProblem, MARKER_FILE_NAME, MARKER_FILE_NAMES,
+};
 
 /// May an item declared under `item_project` be served to a session sitting in
 /// `session_project`? The ONE place that answers this - every injection
@@ -65,165 +70,107 @@ pub fn applies_to(item_project: Option<&str>, session_project: Option<&str>) -> 
     }
 }
 
-/// Resolve the project key for `start_dir`, or `None` for "global only".
-/// Never panics, never blocks, never returns an error: every failure mode
-/// (missing directory, unreadable marker file, no git root anywhere above
-/// `start_dir`) collapses to `None`, the same "nothing to say" the rest of
-/// the read/serve boundary uses.
-pub fn resolve_project(start_dir: &Path) -> Option<String> {
-    if let Some(name) = read_marker(start_dir) {
-        return Some(name);
-    }
-    // A worktree's root is not the project - see `git_root`'s own note.
-    let root = git_root(start_dir)?;
-    if root != start_dir {
-        if let Some(name) = read_marker(&root) {
-            return Some(name);
-        }
-    }
-    root.file_name().and_then(|n| n.to_str()).map(str::to_string)
+
+/// The project a session is working in: the project its working folder
+/// resolves to, else the project this session last did work in
+/// (`usefulness::last_project_of_session`). The ONE answer the Stop hook's
+/// debts, the work clock and the hard guards all use.
+///
+/// THE DODGE THIS CLOSES (D4). The guards used the folder's own answer alone,
+/// so one `cd` into a folder of no project - a scratch folder, a temp dir -
+/// switched off every guard scoped to the project the session was working
+/// in, while the Stop hook and the work clock already kept it. A folder that
+/// resolves to a project still wins, so a session that moves into ANOTHER
+/// project is judged under that project's rules.
+///
+/// This answer keeps the guards that read only the TEXT of a call (a
+/// command, a requires trigger, an always-forbidden literal). The guards
+/// anchored at a PATH are kept by the other half, `guard_root`: after a drift
+/// they resolve against the project's registered checkout, not the folder.
+///
+/// The fallback reads a sidecar beside the store, which any local process can
+/// write (N3): forging it can drop the fallback or name another project, but
+/// never overrides a folder that resolves to one. Serving (what a session is
+/// shown) keeps the folder's own answer and does not use this.
+pub fn session_project(db: &Path, session_id: &str, cwd: Option<&Path>) -> Option<String> {
+    cwd.and_then(resolve_project).or_else(|| crate::usefulness::last_project_of_session(db, session_id))
 }
 
-/// Marker file names, in the order they are tried. `.thor-project` is this
-/// build's own name; `.thor` is 1.0's, and it is honoured because it is the
-/// one that actually exists on disk.
+/// The folder every hard guard resolves a check path against: the top of the
+/// checkout the session works in.
 ///
-/// THE DEFECT THIS CLOSES, found by auditing the migration (2026-08-03).
-/// 2.0 invented a new marker name and nothing ever wrote it: a filesystem
-/// walk finds five `.thor` markers and zero `.thor-project`. So resolution
-/// always fell through to the git-root basename. For four of the five repos
-/// the basename happens to equal the key, which is why this stayed hidden.
-/// For the fifth the directory is spelled with a space where the key has a
-/// hyphen, so `applies_to` compared two different strings and 110 fireable
-/// items - 92 rules and 18 orientations, one of them irreversible - could
-/// never be selected in their own checkout. Reproduced live: asking that
-/// repo what governs one of its own files answered "no item governs this".
+/// - The working folder resolves to a project (`folder_project` is
+///   `Some`): the top of the checkout it sits in (`checkout_top`), a linked
+///   worktree's own root included.
+/// - It resolves to none, but the session kept a project (the answer of
+///   `session_project()` came from its fallback): that project's registered
+///   checkout (`registered_checkout`), when it is registered and still valid.
+/// - Anything else: `checkout_top(cwd)`, which for a folder of no project is
+///   the folder itself - exactly as before.
 ///
-/// Harmless until the moment surface started scoping by project earlier the
-/// same day, exactly like the `project: "global"` case. A correct filter over
-/// an identity nobody translated deletes whatever the identity names.
+/// THE HALF OF D4 THIS CLOSES. The path-anchored guards (contains, absent,
+/// absent_all, location) take no project filter: their anchors are resolved
+/// against this root. With the folder as the root, a session that worked in
+/// a checkout and then stood in a scratch folder could Edit or `rm` that
+/// checkout's own files by their absolute path with every one of those
+/// guards off - the fallback project kept only the text guards. With the
+/// registered checkout as the root, the project's real files keep their
+/// guards from anywhere, and a scratch COPY of one of them is no longer
+/// judged as if it were the project's file.
 ///
-/// Public so `ops::health`'s own `--checkouts` inference (walking ancestors
-/// for "is this directory a repo" - a THOR marker or a `.git` entry) can ask
-/// the same two names this module already treats as authoritative, instead
-/// of keeping a second, driftable copy of the list.
-pub const MARKER_FILE_NAMES: &[&str] = &[MARKER_FILE_NAME, ".thor"];
-
-/// The first marker file's first non-blank line, trimmed - `None` when none
-/// is present, unreadable, or empty/whitespace-only (an empty marker names
-/// nothing, so resolution falls through rather than stopping on a blank
-/// answer).
-fn read_marker(dir: &Path) -> Option<String> {
-    for name in MARKER_FILE_NAMES {
-        let Ok(content) = std::fs::read_to_string(dir.join(name)) else { continue };
-        let Some(line) = content.lines().next().map(str::trim) else { continue };
-        if !line.is_empty() {
-            return Some(line.to_string());
+/// Only the registration is trusted for this (`registered_checkout`, the
+/// installer's own events, validated on every read), never the sidecar that
+/// supplied the fallback project: that sidecar is writable by any local
+/// process (N3), so a root read from it could be pointed at a copy. A project
+/// with no valid registration keeps the folder as its root, and so keeps only
+/// its text guards after a drift until its checkout is registered
+/// (`install.exe --register-root --db "<store>"`, run from the checkout).
+pub fn guard_root(
+    store: &thor_core::event_store::EventStore,
+    cwd: Option<&Path>,
+    folder_project: Option<&str>,
+    session_project: Option<&str>,
+) -> Option<std::path::PathBuf> {
+    if folder_project.is_none() {
+        if let Ok(registered) = registered_checkout(store, session_project) {
+            return Some(registered);
         }
     }
-    None
+    cwd.map(checkout_top)
 }
 
-/// Walk `start_dir` and its ancestors (inclusive) looking for the nearest one
-/// that contains a `.git` entry, and return THAT DIRECTORY. `None` when no
-/// ancestor up to the filesystem root has one.
-///
-/// Public because the checkout a project lives in is the other half of
-/// resolving it, and callers that need both (the MCP server picking which
-/// code index applies to the directory it was started in) must not walk for
-/// it themselves - the whole point of this module is that project resolution
-/// happens in exactly one place (CONTRACT R6).
-/// A LINKED WORKTREE resolves to the repository it belongs to, not to itself.
-///
-/// THE DEFECT THIS CLOSES, found by auditing the migration (2026-08-03). In a
-/// linked worktree `.git` is a FILE, not a directory, holding a line like
-/// `gitdir: <main>/.git/worktrees/<slug>`. The old walk stopped there and
-/// handed back the worktree directory, whose basename is a generated slug.
-/// Reproduced live: starting a session inside one of the owner's worktrees
-/// resolved the project to `hungry-wright-171e5d`, so every rule that repo
-/// owns was scoped out of every pushed surface - in the very checkout where
-/// the work was happening. This build's own agent tooling creates worktrees,
-/// so it is not a corner case.
-///
-/// Read from the file rather than by running git: this is on the path of a
-/// hook that fires on every tool call, and it must never block on a
-/// subprocess. Anything unexpected in the file falls back to the directory
-/// itself, which is the old behaviour and never worse than it.
-pub fn git_root(start_dir: &Path) -> Option<std::path::PathBuf> {
-    let mut dir: Option<&Path> = Some(start_dir);
-    while let Some(d) = dir {
-        let dot_git = d.join(".git");
-        if dot_git.is_dir() {
-            return Some(d.to_path_buf());
-        }
-        if dot_git.is_file() {
-            return Some(main_root_of_worktree(&dot_git).unwrap_or_else(|| d.to_path_buf()));
-        }
-        dir = d.parent();
-    }
-    None
-}
 
-/// The root of the LINKED WORKTREE `start_dir` sits in - the directory that
-/// carries the `.git` file - or `None` when the nearest `.git` above it is a
-/// real repository (a directory) or a file this does not recognise as a
-/// worktree pointer.
-///
-/// Exists for the one question `git_root` deliberately hides: "is the place
-/// I am working in a worktree, and where is it". Every check is judged
-/// against the main checkout (`git_root`), which is what doctor and the
-/// commit gates see - and measured on 2026-09-26, a session attached a
-/// `contains` check to code that existed only in its own worktree: stored
-/// without complaint, it then blocked every commit on main for eleven
-/// minutes. A caller that knows the worktree can refuse that before it is
-/// written (the tool server's `remember`/`revise`).
-pub fn linked_worktree_root(start_dir: &Path) -> Option<std::path::PathBuf> {
-    let mut dir: Option<&Path> = Some(start_dir);
-    while let Some(d) = dir {
-        let dot_git = d.join(".git");
-        if dot_git.is_dir() {
-            return None;
-        }
-        if dot_git.is_file() {
-            return main_root_of_worktree(&dot_git).map(|_| d.to_path_buf());
-        }
-        dir = d.parent();
-    }
-    None
-}
+/// How many days after a working copy was registered or moved the session
+/// start still names it.
+pub const REGISTRATION_NOTICE_DAYS: i64 = 7;
 
-/// The checkout a directory of checkouts should be judged as: the main
-/// repository for a linked worktree's root, the directory itself otherwise.
-/// Never walks upward - only a directory whose OWN `.git` is a worktree
-/// pointer is redirected, so a plain folder is never swapped for some
-/// unrelated repository above it.
-pub fn checkout_for(dir: &Path) -> std::path::PathBuf {
-    let dot_git = dir.join(".git");
-    if dot_git.is_file() {
-        if let Some(main) = main_root_of_worktree(&dot_git) {
-            return main;
-        }
-    }
-    dir.to_path_buf()
-}
-
-/// The main repository root a linked worktree points at, read from its `.git`
-/// file. `None` for any shape this does not recognise, so the caller keeps
-/// the old answer instead of inventing one.
-fn main_root_of_worktree(dot_git_file: &Path) -> Option<std::path::PathBuf> {
-    let content = std::fs::read_to_string(dot_git_file).ok()?;
-    let gitdir = content.lines().find_map(|l| l.trim().strip_prefix("gitdir:"))?.trim();
-    let gitdir = Path::new(gitdir);
-    // <main>/.git/worktrees/<slug>  ->  <main>
-    let worktrees = gitdir.parent()?;
-    if worktrees.file_name()? != "worktrees" {
+/// The one line a session start in `project` shows for
+/// `REGISTRATION_NOTICE_DAYS` after its working copy was registered or moved
+/// (N11: the first registration is first-come, so whoever registered it is
+/// named where the owner looks). `None` outside that window, for a project
+/// with no registration, or one whose time cannot be read.
+pub fn registration_notice(
+    store: &thor_core::event_store::EventStore,
+    project: Option<&str>,
+    now_unix: i64,
+) -> Option<String> {
+    let project = project?;
+    let regs = model::store::root_registrations(store, project);
+    let last = regs.last()?;
+    let at_text = last.at.as_deref()?;
+    let at = crate::time::unix_from_iso8601(at_text)?;
+    if now_unix - at > REGISTRATION_NOTICE_DAYS * 86_400 {
         return None;
     }
-    let git_dir = worktrees.parent()?;
-    if git_dir.file_name()? != ".git" {
-        return None;
-    }
-    git_dir.parent().map(Path::to_path_buf)
+    let date: String = at_text.chars().take(10).collect();
+    let moved_from = regs.iter().rev().nth(1).map(|r| r.root.as_str()).filter(|old| *old != last.root);
+    Some(match moved_from {
+        Some(old) => format!(
+            "[THOR] the working copy of {project} is registered at {} since {date} (moved from {old}, which no longer exists)",
+            last.root
+        ),
+        None => format!("[THOR] the working copy of {project} is registered at {} since {date}", last.root),
+    })
 }
 
 /// Every project key held by a live item that NO reachable checkout resolves
@@ -457,6 +404,267 @@ mod tests {
         fs::write(odd.join(".git"), "something entirely different
 ").unwrap();
         assert_eq!(resolve_project(&odd).as_deref(), Some("odd-checkout"));
+    }
+
+    // ---------------------------------------- the registered working copy
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().expect("git must be on PATH");
+        assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// A real checkout at `dir` with one commit and a marker naming `key`.
+    /// Its hooks point at an empty folder right after `git init`, so the
+    /// machine's own shared git hooks never act on a throwaway repository.
+    fn real_checkout(dir: &Path, key: &str, hooks: &Path) {
+        fs::create_dir_all(dir).unwrap();
+        fs::create_dir_all(hooks).unwrap();
+        git(dir, &["init", "--quiet"]);
+        git(dir, &["config", "core.hooksPath", &hooks.display().to_string()]);
+        git(dir, &["config", "user.email", "fixture@example.invalid"]);
+        git(dir, &["config", "user.name", "fixture"]);
+        fs::write(dir.join(MARKER_FILE_NAME), format!("{key}\n")).unwrap();
+        fs::write(dir.join("NOTES.md"), "intro only\n").unwrap();
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "--quiet", "-m", "initial"]);
+    }
+
+    /// A registration written the way the installer writes one, straight into
+    /// the log: THOR's own token is not for tests (see `model::store`'s
+    /// `system_actor_is_built_only_in_the_named_modules`).
+    fn register_raw(store: &mut thor_core::event_store::EventStore, key: &str, actor: &str, root: &str, at: &str) {
+        let item = model::item::Item {
+            id: model::store::project_opened_id(key),
+            kind: model::item::Kind::Report,
+            text: format!("Project {key}: a fixture record."),
+            bindings: Vec::new(),
+            severity: None,
+            project: Some(key.to_string()),
+            tags: vec!["project-record".to_string()],
+            expires: None,
+            key: None,
+            falsifier: None,
+            check: None,
+        };
+        let body = model::store::canonical_body(&item).unwrap();
+        let body = format!(
+            "{},\"root\":{},\"root_at\":{}}}",
+            &body[..body.len() - 1],
+            serde_json::to_string(root).unwrap(),
+            serde_json::to_string(at).unwrap()
+        );
+        if store.get_events_by_entity(&item.id).unwrap().is_empty() {
+            let kind = thor_core::event_store::EventKind::FactCreated;
+            store.append_event(actor, actor, actor, kind, &item.id, None, &body).unwrap();
+        } else {
+            let kind = thor_core::event_store::EventKind::FactRevised;
+            store.append_mutate_checked(actor, actor, actor, kind, &item.id, None, &body).unwrap();
+        }
+    }
+
+    fn slashes(p: &Path) -> String {
+        p.display().to_string().replace('\\', "/")
+    }
+
+    #[test]
+    fn a_registered_checkout_that_is_a_real_top_resolving_to_its_project_is_ok() {
+        let dir = tempdir();
+        let hooks = dir.path().join("no-hooks");
+        let beta = dir.path().join("beta");
+        real_checkout(&beta, "beta", &hooks);
+        assert_eq!(validate_checkout(&beta, "beta"), Ok(beta.clone()));
+
+        // A folder with a space in its name, spelled with forward slashes the
+        // way a registration stores it.
+        let spaced = dir.path().join("acme shop");
+        real_checkout(&spaced, "acme-shop", &hooks);
+        let stored = std::path::PathBuf::from(slashes(&spaced));
+        assert_eq!(validate_checkout(&stored, "acme-shop"), Ok(stored.clone()));
+    }
+
+    #[test]
+    fn a_registered_folder_that_is_gone_is_named_gone() {
+        let dir = tempdir();
+        let ghost = dir.path().join("beta-moved-away");
+        assert_eq!(validate_checkout(&ghost, "beta"), Err(RootProblem::Gone(ghost.clone())));
+    }
+
+    #[test]
+    fn a_registered_folder_that_is_not_the_top_of_a_checkout_is_refused() {
+        let dir = tempdir();
+        let hooks = dir.path().join("no-hooks");
+        let beta = dir.path().join("beta");
+        real_checkout(&beta, "beta", &hooks);
+        let sub = beta.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join(MARKER_FILE_NAME), "beta\n").unwrap();
+        assert_eq!(validate_checkout(&sub, "beta"), Err(RootProblem::NotCheckoutTop(sub.clone())));
+
+        let plain = dir.path().join("plain");
+        fs::create_dir_all(&plain).unwrap();
+        fs::write(plain.join(MARKER_FILE_NAME), "beta\n").unwrap();
+        assert_eq!(validate_checkout(&plain, "beta"), Err(RootProblem::NotCheckoutTop(plain.clone())));
+    }
+
+    #[test]
+    fn a_registered_linked_worktree_is_refused() {
+        let dir = tempdir();
+        let hooks = dir.path().join("no-hooks");
+        let beta = dir.path().join("beta");
+        real_checkout(&beta, "beta", &hooks);
+        let wt = dir.path().join("beta-wt");
+        git(&beta, &["worktree", "add", "--quiet", &wt.display().to_string(), "-b", "side"]);
+        assert_eq!(validate_checkout(&wt, "beta"), Err(RootProblem::Worktree(wt.clone())));
+        // And the top a session in that worktree works in is the worktree itself.
+        let deep = wt.join("src");
+        fs::create_dir_all(&deep).unwrap();
+        assert_eq!(checkout_top(&deep), wt);
+        assert_eq!(checkout_top(&beta.join("sub-not-there")), beta, "a folder inside the main checkout");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        assert_eq!(checkout_top(&outside), outside, "no checkout at all: the folder itself");
+    }
+
+    #[test]
+    fn a_registered_folder_whose_marker_now_names_another_project_is_refused() {
+        let dir = tempdir();
+        let hooks = dir.path().join("no-hooks");
+        let beta = dir.path().join("beta");
+        real_checkout(&beta, "beta", &hooks);
+        fs::write(beta.join(MARKER_FILE_NAME), "other\n").unwrap();
+        assert_eq!(
+            validate_checkout(&beta, "beta"),
+            Err(RootProblem::ResolvesTo(beta.clone(), Some("other".to_string())))
+        );
+    }
+
+    #[test]
+    fn registered_checkout_reads_the_installers_registration_only() {
+        let dir = tempdir();
+        let hooks = dir.path().join("no-hooks");
+        let beta = dir.path().join("beta");
+        real_checkout(&beta, "beta", &hooks);
+        let copy = dir.path().join("beta-copy");
+        real_checkout(&copy, "beta", &hooks);
+        let mut store = thor_core::event_store::EventStore::in_memory().unwrap();
+
+        assert_eq!(registered_checkout(&store, None), Err(RootProblem::GlobalRule));
+        assert_eq!(registered_checkout(&store, Some("beta")), Err(RootProblem::NotRegistered));
+
+        register_raw(&mut store, "beta", "mcp", &slashes(&copy), "2026-09-28T10:00:00Z");
+        assert_eq!(registered_checkout(&store, Some("beta")), Err(RootProblem::NotRegistered), "not the installer's");
+
+        register_raw(&mut store, "beta", "installer", &slashes(&beta), "2026-09-28T10:00:00Z");
+        let got = registered_checkout(&store, Some("beta")).unwrap();
+        assert_eq!(slashes(&got), slashes(&beta));
+
+        register_raw(&mut store, "beta", "mcp", &slashes(&copy), "2026-09-28T11:00:00Z");
+        assert_eq!(slashes(&registered_checkout(&store, Some("beta")).unwrap()), slashes(&beta), "a later forgery moves nothing");
+    }
+
+    #[test]
+    fn the_registration_notice_shows_for_seven_days_and_names_a_move() {
+        let mut store = thor_core::event_store::EventStore::in_memory().unwrap();
+        let now = crate::time::unix_from_iso8601("2026-09-28T12:00:00Z").unwrap();
+        assert_eq!(registration_notice(&store, Some("beta"), now), None, "nothing registered");
+
+        register_raw(&mut store, "beta", "installer", "C:/tmp/beta", "2026-09-25T12:00:00Z");
+        assert_eq!(
+            registration_notice(&store, Some("beta"), now).as_deref(),
+            Some("[THOR] the working copy of beta is registered at C:/tmp/beta since 2026-09-25")
+        );
+        assert_eq!(registration_notice(&store, None, now), None, "a session in no project");
+        let eight_days_later = now + 5 * 86_400;
+        assert_eq!(registration_notice(&store, Some("beta"), eight_days_later), None, "after seven days it stops");
+
+        register_raw(&mut store, "beta", "installer", "C:/tmp/beta-moved", "2026-09-28T09:00:00Z");
+        assert_eq!(
+            registration_notice(&store, Some("beta"), now).as_deref(),
+            Some(
+                "[THOR] the working copy of beta is registered at C:/tmp/beta-moved since 2026-09-28 \
+                 (moved from C:/tmp/beta, which no longer exists)"
+            )
+        );
+    }
+
+    // ------------------------------------------------ the session's project
+
+    /// D4: a folder of no project keeps the project the session last worked
+    /// in; a folder that resolves to a project always wins, another one
+    /// included; a session that never worked in a project has none.
+    #[test]
+    fn a_session_keeps_its_project_in_a_folder_of_none_and_switches_to_another_one() {
+        let dir = tempdir();
+        let db = dir.path().join("thor.db");
+        let alpha = dir.path().join("alpha");
+        fs::create_dir_all(&alpha).unwrap();
+        fs::write(alpha.join(MARKER_FILE_NAME), "alpha\n").unwrap();
+        let beta = dir.path().join("beta");
+        fs::create_dir_all(&beta).unwrap();
+        fs::write(beta.join(MARKER_FILE_NAME), "beta\n").unwrap();
+        let scratch = dir.path().join("scratch");
+        fs::create_dir_all(&scratch).unwrap();
+
+        assert_eq!(session_project(&db, "s1", Some(&scratch)), None, "no project anywhere yet");
+        assert_eq!(session_project(&db, "s1", None), None, "no folder and no history");
+
+        let now = 1_790_000_000;
+        crate::usefulness::record_hook_event(&db, Some("alpha"), "s1", false, now, crate::usefulness::HookEventKind::Other);
+        assert_eq!(session_project(&db, "s1", Some(&alpha)).as_deref(), Some("alpha"));
+        assert_eq!(session_project(&db, "s1", Some(&scratch)).as_deref(), Some("alpha"), "drifted out: keeps alpha");
+        assert_eq!(session_project(&db, "s1", None).as_deref(), Some("alpha"), "no folder at all: keeps alpha");
+        assert_eq!(session_project(&db, "s1", Some(&beta)).as_deref(), Some("beta"), "another project's folder wins");
+        assert_eq!(session_project(&db, "s2", Some(&scratch)), None, "another session never inherits alpha");
+    }
+
+    /// D4, the path half: after a drift into a folder of no project the
+    /// guards resolve against the kept project's REGISTERED checkout; in
+    /// every other case against the top of the folder's own checkout.
+    #[test]
+    fn the_guard_root_after_a_drift_is_the_registered_checkout_and_the_folders_own_top_otherwise() {
+        let dir = tempdir();
+        let hooks = dir.path().join("no-hooks");
+        let beta = dir.path().join("beta");
+        real_checkout(&beta, "beta", &hooks);
+        let sub = beta.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        let gamma = dir.path().join("gamma");
+        real_checkout(&gamma, "gamma", &hooks);
+        let scratch = dir.path().join("scratch");
+        fs::create_dir_all(&scratch).unwrap();
+        let mut store = thor_core::event_store::EventStore::in_memory().unwrap();
+
+        // No registration: nothing but the folder can be trusted.
+        assert_eq!(guard_root(&store, Some(&scratch), None, Some("beta")), Some(scratch.clone()), "not registered");
+
+        // A registration by anyone but the installer moves nothing.
+        register_raw(&mut store, "beta", "mcp", &slashes(&gamma), "2026-09-28T09:00:00Z");
+        assert_eq!(guard_root(&store, Some(&scratch), None, Some("beta")), Some(scratch.clone()), "not the installer's");
+
+        register_raw(&mut store, "beta", "installer", &slashes(&beta), "2026-09-28T10:00:00Z");
+        let drifted = guard_root(&store, Some(&scratch), None, Some("beta")).unwrap();
+        assert_eq!(slashes(&drifted), slashes(&beta), "drifted out of beta: beta's registered checkout");
+        let no_folder = guard_root(&store, None, None, Some("beta")).unwrap();
+        assert_eq!(slashes(&no_folder), slashes(&beta), "no folder at all: still beta's checkout");
+
+        // A folder that resolves to a project is judged at the top of its own
+        // checkout, whatever is registered - a linked worktree of the
+        // registered project included: its files are where it works.
+        assert_eq!(guard_root(&store, Some(&sub), Some("beta"), Some("beta")), Some(beta.clone()), "a subfolder of beta");
+        assert_eq!(guard_root(&store, Some(&gamma), Some("gamma"), Some("gamma")), Some(gamma.clone()), "another project");
+        let wt = dir.path().join("beta-wt");
+        git(&beta, &["worktree", "add", "--quiet", &wt.display().to_string(), "-b", "side"]);
+        let deep = wt.join("src");
+        fs::create_dir_all(&deep).unwrap();
+        assert_eq!(guard_root(&store, Some(&deep), Some("beta"), Some("beta")), Some(wt.clone()), "beta's linked worktree");
+
+        // A session that never had a project: the folder itself.
+        assert_eq!(guard_root(&store, Some(&scratch), None, None), Some(scratch.clone()), "no project at all");
+
+        // A registration that no longer holds (the folder now names another
+        // project) is not trusted: the folder again.
+        fs::write(beta.join(MARKER_FILE_NAME), "other\n").unwrap();
+        assert_eq!(guard_root(&store, Some(&scratch), None, Some("beta")), Some(scratch.clone()), "registration invalid");
     }
 
     /// The inventory that makes the NEXT one of these visible instead of

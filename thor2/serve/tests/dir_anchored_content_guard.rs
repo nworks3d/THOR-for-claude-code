@@ -13,7 +13,8 @@
 //! single path, so the content guard's Path-only pool could never surface
 //! one. Every content rule anchored to a directory was therefore dead, and
 //! nothing told the author. These two tests were written against that gap
-//! and failed with empty stdout before `absent_guard_block` was wired to
+//! and failed with empty stdout before the file guard (now
+//! `serve::guard_verdict::file_write`) was wired to
 //! call `find_dir_content_violation` from the Path+Dir-narrowed pool it
 //! already fetches for the location guard. They pass because that wiring
 //! landed; if either ever goes silent again, the same class of rule has
@@ -77,7 +78,7 @@ fn fixture_with_dir_anchored_em_dash_rule(dir: &Path) -> std::path::PathBuf {
         falsifier: Some("an em dash lands under thor2/ and nobody notices".to_string()),
         check: Some(model::item::Check::Absent { path: "thor2".to_string(), literal: "\u{2014}".to_string() }),
     };
-    model::store::declare(&mut store, "s", "l", "a", &item).unwrap();
+    model::store::declare(&mut store, "s", "l", "a", &named(&item)).unwrap();
     db
 }
 
@@ -114,4 +115,18 @@ fn a_write_several_levels_under_a_protected_directory_is_blocked_end_to_end() {
     let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("expected a decision JSON: {e}: {out}"));
     assert_eq!(v["decision"], "block", "{out}");
     assert!(v["reason"].as_str().unwrap().contains("no-em-dash-under-thor2"), "{out}");
+}
+
+/// `item` with every check literal its text does not name appended to the
+/// text (in `U+XXXX` form for a glyph): since step 8 of the two tracks the
+/// write gate refuses a check whose literal the rule's own words never name
+/// (A4), and these fixtures are about the hook, not about naming.
+fn named(item: &model::item::Item) -> model::item::Item {
+    let mut out = item.clone();
+    let unnamed = model::gate::unnamed_literals(&out);
+    if !unnamed.is_empty() {
+        let shown: Vec<String> = unnamed.iter().map(|l| format!("'{}'", model::gate::shown_literal(l))).collect();
+        out.text = format!("{} (names {})", out.text, shown.join(" "));
+    }
+    out
 }

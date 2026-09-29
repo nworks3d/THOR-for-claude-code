@@ -14,7 +14,19 @@ use serde_json::{json, Value};
 use serve::respond;
 use std::fs;
 use std::path::{Path, PathBuf};
+use model::store::{SystemActor, INSTALLER_ACTOR};
 use thor_core::event_store::EventStore;
+
+/// The command a reader runs to register a checkout, always naming the store
+/// (`--db`) - the one definition, in `model::store` so `serve` and `mcp` can
+/// print it too (neither can depend on this crate).
+pub use model::store::register_command_for;
+
+/// THOR's installer, as the actor its own writes carry - the only writer the
+/// store lets touch a project record (`model::store::fence`).
+fn installer() -> SystemActor {
+    SystemActor::new(INSTALLER_ACTOR)
+}
 
 /// The per-user directory this installer puts a store in when it was not told
 /// where to put one: `LOCALAPPDATA` / `XDG_DATA_HOME` / `HOME/.local/share`,
@@ -616,72 +628,40 @@ pub fn working_contract() -> Vec<model::item::Item> {
             "Storing a second copy of an existing fact turns out to serve a reader better than \
              revising the original.",
         ),
-        model::item::Item {
-            tags: vec![
-                "working-contract".to_string(),
-                format!(
-                    "{}a forgotten setup step leaves no text behind to catch",
-                    model::store::NO_LITERAL_REASON_PREFIX
-                ),
-            ],
-            ..rule(
-                "a-new-project-is-one-command",
-                "Giving a folder its own memory is ONE command, run FROM the folder holding the                  code: `install --project <name>`. It writes the marker, reads the code once, and                  keeps that reading fresh on every commit. The owner names it - never you.",
-                "A folder set up with that one command turns out to be missing its marker, its                  code reading or its refresh on commit.",
-            )
-        },
-        model::item::Item {
-            tags: vec![
-                "working-contract".to_string(),
-                format!(
-                    "{}a life fact and a work fact are written in the same words",
-                    model::store::NO_LITERAL_REASON_PREFIX
-                ),
-            ],
-            ..rule(
-                "two-lanes-work-and-life",
-                "Two memories live here. Anything about the owner's own life - a recipe, a book, \
-                 a training log, an expense - goes to the library with `shelve`, never \
-                 `remember`. The work memory is for code and projects.",
-                "A recipe stored with remember turns out to be found as easily as one filed \
-                 with shelve.",
-            )
-        },
-        model::item::Item {
-            tags: vec![
-                "working-contract".to_string(),
-                format!(
-                    "{}an invented name looks exactly like a real one, there is no text to catch",
-                    model::store::NO_LITERAL_REASON_PREFIX
-                ),
-            ],
-            ..rule(
-                "never-open-a-place-the-owner-did-not-name",
-                "Never invent a place to file something - not a scope, not a shelf, not a register \
-                 key. Put it where something already lives, and if honestly nothing fits, ASK the \
-                 owner what the new one should be called and use his word. A name you thought of \
-                 is a name he will never look under.",
-                "An agent opens a scope or a shelf under a name of its own and the owner finds it \
-                 again later without being told where it went.",
-            )
-        },
-        model::item::Item {
-            tags: vec![
-                "working-contract".to_string(),
-                format!(
-                    "{}a pile and one long thing are the same characters, only their subject differs",
-                    model::store::NO_LITERAL_REASON_PREFIX
-                ),
-            ],
-            ..rule(
-                "one-entry-is-one-thing",
-                "One entry is ONE thing. Given a schema AND an injury AND the equipment AND a \
-                 measurement, file them as separate entries with labels, not as one block: an \
-                 entry holding five things is found by one of them and corrected by none.",
-                "A single entry holding several subjects turns out to be as findable and as \
-                 correctable as the same content split into one entry per subject.",
-            )
-        },
+        rule(
+            "a-new-project-is-one-command",
+            "Giving a folder its own memory is ONE command, run FROM the folder holding the \
+             code: `install --db <your store> --project <name>`. It writes the marker, registers \
+             this working copy, reads the code once, and keeps that reading fresh on every commit. \
+             The owner names it - never you.",
+            "A folder set up with that one command turns out to be missing its marker, its \
+             registration, its code reading or its refresh on commit.",
+        ),
+        rule(
+            "two-lanes-work-and-life",
+            "Two memories live here. Anything about the owner's own life - a recipe, a book, \
+             a training log, an expense - goes to the library with `shelve`, never \
+             `remember`. The work memory is for code and projects.",
+            "A recipe stored with remember turns out to be found as easily as one filed \
+             with shelve.",
+        ),
+        rule(
+            "never-open-a-place-the-owner-did-not-name",
+            "Never invent a place to file something - not a scope, not a shelf, not a register \
+             key. Put it where something already lives, and if honestly nothing fits, ASK the \
+             owner what the new one should be called and use his word. A name you thought of \
+             is a name he will never look under.",
+            "An agent opens a scope or a shelf under a name of its own and the owner finds it \
+             again later without being told where it went.",
+        ),
+        rule(
+            "one-entry-is-one-thing",
+            "One entry is ONE thing. Given a schema AND an injury AND the equipment AND a \
+             measurement, file them as separate entries with labels, not as one block: an \
+             entry holding five things is found by one of them and corrected by none.",
+            "A single entry holding several subjects turns out to be as findable and as \
+             correctable as the same content split into one entry per subject.",
+        ),
         rule(
             "a-refusal-is-the-gate-working",
             "A refusal names the exact reason and what to do instead, and nothing is written when \
@@ -693,9 +673,9 @@ pub fn working_contract() -> Vec<model::item::Item> {
         rule(
             "words-inform-a-proof-forbids",
             "A rule backed by words alone can inform, never forbid. Only a check that runs and \
-             holds may refuse. contains proves the rule still describes this project; absent, \
-             absent_all and forbidden refuse a write that introduces the forbidden text. Most \
-             rules carry none, by design.",
+             holds may refuse, and THOR tries every check when its rule is written: one that bites \
+             is kept, one that cannot is dropped and the rule stays a note. Most rules carry none, \
+             by design.",
             "A rule carrying no runnable check is found blocking a write.",
         ),
         // The fifth, and the only one here that is not about WRITING a fact.
@@ -714,19 +694,17 @@ pub fn working_contract() -> Vec<model::item::Item> {
             "A report omits a step that produced nothing and the reader turns out not to be misled \
              by the omission.",
         ),
-        // The sixth, added 2026-08-09, and the only one a newcomer meets as a
-        // REFUSAL before they meet it as advice. Without it the very first
-        // serious rule someone writes is turned away by a question they have
-        // never been asked, which is the worst possible first impression of a
-        // gate that is doing exactly the right thing.
+        // The sixth, added 2026-08-09 and rewritten for the two tracks (step 8):
+        // the one a newcomer meets as a REFUSAL before they meet it as advice.
+        // Every rule is tried when it is written, so the first serious rule
+        // someone writes may come back refused with the check to hang - and
+        // this says, before that happens, that it is the trial working.
         rule(
             "answer-whether-a-rule-can-refuse",
-            "A rule you call expensive, or that names a command, flag or path, is asked one \
-             question first: is there a text whose presence MEANS the mistake is happening? If \
-             yes, add a check with that literal. If no, tag it no-literal:<why not> - the reason \
-             is the answer. Both answers are fine; silence is not.",
-            "A rule marked irreversible or costly is stored without ever being asked whether it \
-             can refuse anything.",
+            "Every rule is tried when written. A check that bites keeps it a RULE; with no \
+             working tooth it is a NOTE; REFUSED names the check to hang. Name a check's literal \
+             in the rule's own text (U+2014 for a glyph). A no-literal tag answers nothing.",
+            "A rule is stored on the rule track with a check that THOR never tried.",
         ),
         // Eleven more below, all bound Always like the ten above. Not about
         // WRITING a fact this time - these are the generic honesty,
@@ -860,7 +838,7 @@ pub fn seed_working_contract(db: &Path) -> anyhow::Result<Vec<SeededItem>> {
     let mut out = Vec::new();
     for item in working_contract() {
         let id = item.id.clone();
-        match model::store::declare(&mut store, "install", "install", "installer", &item) {
+        match model::store::declare(&mut store, "install", "install", installer(), &item) {
             Ok(_) => out.push(SeededItem { id, stored: true, refusal: None }),
             Err(e) => out.push(SeededItem { id, stored: false, refusal: Some(e.to_string()) }),
         }
@@ -1060,7 +1038,9 @@ pub fn write_project_marker(dir: &Path, key: &str) -> anyhow::Result<MarkerOutco
 }
 
 /// The id `record_project_opened` writes under for project `key` - one
-/// record per project, forever, unless the owner retracts it by hand.
+/// record per project, forever. Only the installer may write any event on it
+/// (`model::store::reserved_id_owner`), so no retract or revise from anywhere
+/// else can tombstone it or move its working copy.
 ///
 /// Ids in this store carry no character restriction of their own to derive
 /// around: `model::gate::declare` validates an item's SHAPE (its bindings,
@@ -1073,20 +1053,29 @@ pub fn write_project_marker(dir: &Path, key: &str) -> anyhow::Result<MarkerOutco
 /// newline), so it is used exactly as given, with no separate normalisation
 /// step to invent.
 pub fn project_opened_record_id(key: &str) -> String {
-    format!("project-{key}-opened-by-install")
+    model::store::project_opened_id(key)
 }
 
 /// The record itself, pure: its exact id/kind/project/tags/text are
-/// testable with no store at all. `today` is `YYYY-MM-DD`.
-fn project_opened_record(key: &str, files: usize, today: &str) -> model::item::Item {
-    model::item::Item {
-        id: project_opened_record_id(key),
-        kind: model::item::Kind::Report,
-        text: format!(
+/// testable with no store at all. `today` is `YYYY-MM-DD`. `files` is how
+/// many files the code read found; `None` for a registration that read no
+/// code at all (`install --register-root`), whose text then says only that.
+fn project_record(id: String, key: &str, files: Option<usize>, today: &str) -> model::item::Item {
+    let text = match files {
+        Some(files) => format!(
             "Project {key}: install read its code on {today} ({files} file(s)) so it can be \
              searched with search_code and kept fresh on every commit. Notes filed under '{key}' \
              belong to this repository."
         ),
+        None => format!(
+            "Project {key}: install registered its working copy on {today}. Notes filed under \
+             '{key}' belong to this repository."
+        ),
+    };
+    model::item::Item {
+        id,
+        kind: model::item::Kind::Report,
+        text,
         bindings: Vec::new(),
         severity: None,
         project: Some(key.to_string()),
@@ -1098,15 +1087,233 @@ fn project_opened_record(key: &str, files: usize, today: &str) -> model::item::I
     }
 }
 
-/// What happened writing the project-opened record on this run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProjectRecordOutcome {
-    Written,
-    AlreadyThere,
+// ------------------------------------------------ the registered working copy
+//
+// WHY A PROJECT HAS ONE REGISTERED CHECKOUT (A2, Z3). A rule's file check is
+// only worth trusting when it is tried against the project's real checkout -
+// and "real" was whatever folder the session happened to run in, so a second
+// copy with a planted line could prove anything. The installer now records,
+// once, where the project's checkout lives (`model::store`'s trailing
+// `"root"` key on the project record, installer events only), and a second
+// copy can never take that over: a registration moves only when the folder it
+// names is gone.
+
+/// What `register_root` did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegisterOutcome {
+    /// The project had no record yet: it now has one, carrying this checkout.
+    Created { root: String },
+    /// The record existed without a working copy: it now carries this one.
+    Registered { root: String },
+    /// The project's record was retracted before this build, so the working
+    /// copy is registered on a record of its own
+    /// (`model::store::project_root_id`).
+    CreatedUnderRootRecord { root: String },
+    /// This checkout is already the registered one: nothing was written.
+    AlreadyHere { root: String },
+    /// The registered folder no longer exists, so the registration moved here.
+    Moved { from: String, to: String },
 }
 
-/// Record, in the memory itself, that this project's code was read - closing
-/// the gap `mcp::refuse_a_new_collection` otherwise leaves open.
+/// Why `register_root` wrote nothing. `Display` is the exact line printed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegisterRefusal {
+    /// The folder is not inside a git checkout.
+    NotACheckout { cwd: String },
+    /// The registered folder still exists and is still a checkout of this
+    /// project: a second copy.
+    StillACheckout { key: String, old: String },
+    /// The registered folder still exists but no longer resolves to this
+    /// project - editing its marker is not a move (D3).
+    StillExists { key: String, old: String },
+    /// The top of this checkout resolves to another project, or to none.
+    ResolvesElsewhere { key: String, root: String, resolved: Option<String> },
+    /// The store could not be read or written.
+    Store(String),
+}
+
+impl std::fmt::Display for RegisterRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RegisterRefusal::NotACheckout { cwd } => write!(
+                f,
+                "REFUSED: {cwd} is not inside a git checkout, and a working copy is registered as the top of one. \
+                 Start a repository there first (git init, then one commit), then run this again. Nothing was changed."
+            ),
+            RegisterRefusal::StillACheckout { key, old } => write!(
+                f,
+                "REFUSED: '{key}' is registered at {old}, which is still a checkout of it - a second copy cannot take \
+                 over its registration. Nothing was changed."
+            ),
+            RegisterRefusal::StillExists { key, old } => write!(
+                f,
+                "REFUSED: '{key}' is registered at {old}, which still exists. Moving a registration is the owner's \
+                 call: if the project really moved, the owner removes or renames the old folder, then runs this \
+                 again. Nothing was changed."
+            ),
+            RegisterRefusal::ResolvesElsewhere { key, root, resolved } => {
+                let resolved = match resolved {
+                    Some(other) => format!("project '{other}'"),
+                    None => "no project".to_string(),
+                };
+                write!(
+                    f,
+                    "REFUSED: the checkout at {root} resolves to {resolved}, not '{key}' - run this from inside a \
+                     checkout of '{key}' (its .thor-project marker, or else its folder name, is what names it). \
+                     Nothing was changed."
+                )
+            }
+            RegisterRefusal::Store(e) => write!(f, "REFUSED: the memory could not be read or written: {e}. Nothing was changed."),
+        }
+    }
+}
+
+impl std::error::Error for RegisterRefusal {}
+
+/// A folder path the way a registration stores it: forward slashes, no
+/// trailing slash. Never through `std::fs::canonicalize`, which on Windows
+/// prefixes `\\?\` and would make the same folder compare unequal.
+fn root_string(path: &Path) -> String {
+    let s = path.display().to_string().replace('\\', "/");
+    match s.strip_suffix('/') {
+        Some(stripped) if !stripped.is_empty() && !stripped.ends_with(':') => stripped.to_string(),
+        _ => s,
+    }
+}
+
+/// Whether two registered folder paths name the same folder: separators
+/// already equal (`root_string`), and on Windows compared without regard to
+/// case, the way the filesystem itself compares them.
+fn same_root(a: &str, b: &str) -> bool {
+    if cfg!(windows) {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
+}
+
+/// What a registration of a checkout would do, decided before anything is
+/// written.
+enum Plan {
+    /// Nothing is registered for the project yet: first come.
+    First,
+    /// This checkout is already the registered one.
+    AlreadyHere,
+    /// The registered folder is gone: the registration moves here.
+    MoveFrom(String),
+}
+
+/// The plan for registering `root` as `key`'s working copy, or the refusal.
+/// A registered folder that still exists is never taken over (D3), whether
+/// it still resolves to `key` or not: editing a marker is not a move.
+fn registration_plan(store: &EventStore, root: &str, key: &str) -> Result<Plan, RegisterRefusal> {
+    let Some((old, _seq)) = model::store::registered_root_raw(store, key) else { return Ok(Plan::First) };
+    let old_text = root_string(&old);
+    if same_root(&old_text, root) {
+        return Ok(Plan::AlreadyHere);
+    }
+    if old.exists() {
+        return Err(if serve::project::resolve_project(&old).as_deref() == Some(key) {
+            RegisterRefusal::StillACheckout { key: key.to_string(), old: old_text }
+        } else {
+            RegisterRefusal::StillExists { key: key.to_string(), old: old_text }
+        });
+    }
+    Ok(Plan::MoveFrom(old_text))
+}
+
+/// Refuse, BEFORE anything is written anywhere (settings, marker, code index,
+/// store), a per-project install from a folder whose project is already
+/// registered at another folder that still exists. `Ok` when there is nothing
+/// to protect: no store yet, no git checkout here, or no registration that
+/// this folder would take over.
+pub fn check_registration(db: &Path, cwd: &Path, key: &str) -> Result<(), RegisterRefusal> {
+    if !db.exists() {
+        return Ok(());
+    }
+    let Some(top) = serve::project::git_root(cwd) else { return Ok(()) };
+    let store = EventStore::open_existing(db).map_err(|e| RegisterRefusal::Store(e.to_string()))?;
+    registration_plan(&store, &root_string(&top), key).map(|_| ())
+}
+
+/// Register the checkout `cwd` sits in as project `key`'s working copy - the
+/// one function both entry points use: the per-project install
+/// (`record_project_opened`) and `install --register-root`.
+///
+/// The registered folder is the top of the checkout (`git_root(cwd)`), and it
+/// must resolve to `key`. Then:
+/// - no record yet: the record is created carrying the root (`files` names
+///   how much code was read, `None` when none was);
+/// - a record without a root: one `fact_revised` by the installer adds it;
+/// - a record retracted before this build: `project-<key>-root-by-install`
+///   carries it instead;
+/// - the same root: nothing is written;
+/// - another root that no longer exists: moved;
+/// - another root that still exists: refused (`registration_plan`).
+pub fn register_root(
+    store: &mut EventStore,
+    cwd: &Path,
+    key: &str,
+    files: Option<usize>,
+) -> Result<RegisterOutcome, RegisterRefusal> {
+    let Some(top) = serve::project::git_root(cwd) else {
+        return Err(RegisterRefusal::NotACheckout { cwd: root_string(cwd) });
+    };
+    let root = root_string(&top);
+    let resolved = serve::project::resolve_project(&top);
+    if resolved.as_deref() != Some(key) {
+        return Err(RegisterRefusal::ResolvesElsewhere { key: key.to_string(), root, resolved });
+    }
+    let plan = registration_plan(store, &root, key)?;
+    let at = serve::time::now_iso8601();
+    let store_err = |e: model::store::WriteError| RegisterRefusal::Store(e.to_string());
+    match plan {
+        Plan::AlreadyHere => return Ok(RegisterOutcome::AlreadyHere { root }),
+        Plan::MoveFrom(from) => {
+            let id = model::store::root_registrations(store, key)
+                .pop()
+                .map(|r| r.id)
+                .unwrap_or_else(|| project_opened_record_id(key));
+            model::store::revise_project_root(store, &id, &root, &at, installer()).map_err(store_err)?;
+            return Ok(RegisterOutcome::Moved { from, to: root });
+        }
+        Plan::First => {}
+    }
+    let today: String = at.chars().take(10).collect();
+    let opened = project_opened_record_id(key);
+    match model::store::show(store, &opened) {
+        Err(model::store::ReadError::NotFound(_)) => {
+            let item = project_record(opened, key, files, &today);
+            model::store::declare_project_record(store, &item, &root, &at, installer()).map_err(store_err)?;
+            Ok(RegisterOutcome::Created { root })
+        }
+        Ok(_) => {
+            model::store::revise_project_root(store, &opened, &root, &at, installer()).map_err(store_err)?;
+            Ok(RegisterOutcome::Registered { root })
+        }
+        Err(model::store::ReadError::Retracted(_)) => {
+            let fallback = model::store::project_root_id(key);
+            match model::store::show(store, &fallback) {
+                Err(model::store::ReadError::NotFound(_)) => {
+                    let item = project_record(fallback, key, files, &today);
+                    model::store::declare_project_record(store, &item, &root, &at, installer()).map_err(store_err)?;
+                    Ok(RegisterOutcome::CreatedUnderRootRecord { root })
+                }
+                Ok(_) => {
+                    model::store::revise_project_root(store, &fallback, &root, &at, installer()).map_err(store_err)?;
+                    Ok(RegisterOutcome::Registered { root })
+                }
+                Err(e) => Err(RegisterRefusal::Store(e.to_string())),
+            }
+        }
+        Err(e) => Err(RegisterRefusal::Store(e.to_string())),
+    }
+}
+
+/// Record, in the memory itself, that this project's code was read - and
+/// register the checkout it was read from as the project's working copy
+/// (`register_root`). This closes the gap `mcp::refuse_a_new_collection`
+/// otherwise leaves open.
 ///
 /// THE DEFECT THIS CLOSES. `build_project_index` (above) reads a project's
 /// code into its own sidecar, under project name `key`, but never told the
@@ -1126,39 +1333,28 @@ pub enum ProjectRecordOutcome {
 /// `serve::lookup::catalog`'s `Kind::Report | Kind::Chunk` arm), so nothing
 /// about the gate itself needs to change once this exists.
 ///
-/// IDEMPOTENT BY ID. `model::store::show` decides whether anything already
-/// answers to `project_opened_record_id(key)`; anything other than a plain
-/// "not found" - already live, retracted on purpose, diverged, an unparsable
-/// body - is left exactly as it is. This writes at most once, ever, per
-/// project, and it never overturns a decision (a retraction, say) already
-/// made about this id.
-///
-/// Written through `model::store::declare` - the exact call
-/// `seed_working_contract` already makes for the starting notes - so the
-/// write gate runs on this precisely as it would on anything an agent
-/// stores.
-pub fn record_project_opened(db: &Path, key: &str, files: usize) -> anyhow::Result<ProjectRecordOutcome> {
-    let mut store = EventStore::new(db)?;
-    let id = project_opened_record_id(key);
-    if !matches!(model::store::show(&store, &id), Err(model::store::ReadError::NotFound(_))) {
-        return Ok(ProjectRecordOutcome::AlreadyThere);
-    }
-    let item = project_opened_record(key, files, &today_ymd());
-    model::store::declare(&mut store, "install", "install", "installer", &item)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    Ok(ProjectRecordOutcome::Written)
-}
-
-/// Today, as `YYYY-MM-DD` - the same one-line derivation `serve::lookup`'s
-/// own (private) `today()` uses, from the one clock this workspace shares
-/// (`serve::time::now_iso8601`).
-fn today_ymd() -> String {
-    serve::time::now_iso8601().chars().take(10).collect()
+/// IDEMPOTENT. A second run from the same checkout writes nothing
+/// (`RegisterOutcome::AlreadyHere`); a record that already exists keeps its
+/// text, and only gains the working copy it did not carry yet.
+pub fn record_project_opened(
+    db: &Path,
+    cwd: &Path,
+    key: &str,
+    files: usize,
+) -> Result<RegisterOutcome, RegisterRefusal> {
+    let mut store = EventStore::new(db).map_err(|e| RegisterRefusal::Store(e.to_string()))?;
+    register_root(&mut store, cwd, key, Some(files))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Today, as `YYYY-MM-DD` - the same derivation `register_root` makes
+    /// from the one clock this workspace shares (`serve::time::now_iso8601`).
+    fn today_ymd() -> String {
+        serve::time::now_iso8601().chars().take(10).collect()
+    }
 
     fn specs() -> Vec<HookSpec> {
         standard_hooks("C:\\fake\\serve.exe", "C:\\fake\\thor.db")
@@ -1681,12 +1877,9 @@ mod tests {
     }
 
     /// The new starter note rides the same three tests above (they iterate
-    /// `working_contract()` generically), plus this one, targeted: its text
-    /// was deliberately kept free of a backtick, a `--flag`, or a path, so it
-    /// needs no `no-literal:` tag to pass Ground 11 (`model::gate::declare`'s
-    /// "was this rule ever asked whether it can refuse" check). Asserting
-    /// its tags are exactly `working-contract` proves that by construction,
-    /// not by hoping the gate happens to agree.
+    /// `working_contract()` generically), plus this one, targeted: its tags
+    /// are exactly `working-contract` - since step 8 no seed carries a
+    /// `no-literal:` reason, which answers nothing any more.
     #[test]
     fn the_answer_guard_note_is_present_and_carries_no_literal_tag() {
         let items = working_contract();
@@ -1700,8 +1893,21 @@ mod tests {
         assert_eq!(
             note.tags,
             vec!["working-contract".to_string()],
-            "a text with no backtick, flag or path needs no no-literal tag"
+            "a seed carries no reason tag"
         );
+    }
+
+    /// Step 8: every seed is written with only its own tag - no `no-literal:`
+    /// reason (it answers nothing now) - and the one install command a seed
+    /// spells out names the store it registers into (`--db`, F7).
+    #[test]
+    fn no_seed_carries_a_reason_tag_and_the_install_seed_names_its_store() {
+        for item in working_contract() {
+            assert_eq!(item.tags, vec!["working-contract".to_string()], "{}", item.id);
+            assert!(model::gate::unnamed_literals(&item).is_empty(), "{}", item.id);
+        }
+        let install = working_contract().into_iter().find(|i| i.id == "a-new-project-is-one-command").unwrap();
+        assert!(install.text.contains("`install --db <your store> --project <name>`"), "{}", install.text);
     }
 
     /// THE GAP THIS CLOSES: a fresh store got the `Stop` hook wired in from
@@ -1935,20 +2141,43 @@ mod tests {
         assert!(!evidence.base.reminder.is_empty());
     }
 
+    /// A real checkout at `dir` with one commit, named `key` by its own
+    /// marker. Its hooks point at an empty folder right after `git init`, so
+    /// the machine's shared git hooks never act on a throwaway repository.
+    fn checkout(dir: &Path, key: &str) {
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().expect("git on PATH");
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        let hooks = dir.parent().unwrap().join("no-hooks");
+        fs::create_dir_all(dir).unwrap();
+        fs::create_dir_all(&hooks).unwrap();
+        git(&["init", "--quiet"]);
+        git(&["config", "core.hooksPath", &hooks.display().to_string()]);
+        git(&["config", "user.email", "fixture@example.invalid"]);
+        git(&["config", "user.name", "fixture"]);
+        fs::write(dir.join(serve::project::MARKER_FILE_NAME), format!("{key}\n")).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "--quiet", "-m", "initial"]);
+    }
+
     /// THE DEFECT `record_project_opened` CLOSES: a successful code read
     /// opened a code-search sidecar under the project's name but never told
     /// the main store, so `mcp::refuse_a_new_collection` never saw that name
-    /// as open. Proven directly here (id, kind, project, tags, text); the
-    /// gate-level consequence (a `remember` under this project now passes
-    /// the collection check) is proven in
-    /// `ops/tests/install_records_project_opened.rs`.
+    /// as open. Proven directly here (id, kind, project, tags, text, and the
+    /// registered working copy spliced onto the body); the gate-level
+    /// consequence (a `remember` under this project now passes the
+    /// collection check) is proven in `ops/tests/install_records_project_opened.rs`.
     #[test]
     fn a_successful_read_writes_the_record_with_the_exact_shape() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("thor.db");
         ensure_store(&db).unwrap();
+        let repo = dir.path().join("demo-shop");
+        checkout(&repo, "demo-shop");
 
-        assert_eq!(record_project_opened(&db, "demo-shop", 7).unwrap(), ProjectRecordOutcome::Written);
+        let outcome = record_project_opened(&db, &repo, "demo-shop", 7).unwrap();
+        assert_eq!(outcome, RegisterOutcome::Created { root: root_string(&repo) });
 
         let store = thor_core::event_store::EventStore::open_existing(&db).unwrap();
         let item = model::store::show(&store, "project-demo-shop-opened-by-install").unwrap();
@@ -1966,24 +2195,33 @@ mod tests {
                  'demo-shop' belong to this repository."
             )
         );
+        let events = store.get_events_by_entity("project-demo-shop-opened-by-install").unwrap();
+        assert_eq!(events.len(), 1, "created carrying its root in one event");
+        assert_eq!(events[0].actor, "installer");
+        let body: serde_json::Value = serde_json::from_str(&events[0].body).unwrap();
+        assert_eq!(body["root"], serde_json::Value::String(root_string(&repo)));
+        assert!(body["root_at"].as_str().is_some_and(|t| t.starts_with(&today)));
+        assert!(!root_string(&repo).contains('\\'), "a registered root uses forward slashes");
     }
 
-    /// A second call for the same project must write nothing more: no
-    /// revision, no duplicate. Checked by item count, not merely by the
-    /// returned outcome, so a bug that revised the item instead of skipping
-    /// it would still be caught.
+    /// A second call for the same project from the same checkout must write
+    /// nothing more: no revision, no duplicate. Checked by event count, not
+    /// merely by the returned outcome, so a bug that revised the item instead
+    /// of skipping it would still be caught.
     #[test]
     fn a_second_call_for_the_same_project_writes_nothing_more() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("thor.db");
         ensure_store(&db).unwrap();
+        let repo = dir.path().join("demo-shop");
+        checkout(&repo, "demo-shop");
 
-        record_project_opened(&db, "demo-shop", 7).unwrap();
+        record_project_opened(&db, &repo, "demo-shop", 7).unwrap();
         let store = thor_core::event_store::EventStore::open_existing(&db).unwrap();
         let before = store.get_all_events().unwrap().len();
 
-        let again = record_project_opened(&db, "demo-shop", 9999).unwrap();
-        assert_eq!(again, ProjectRecordOutcome::AlreadyThere);
+        let again = record_project_opened(&db, &repo, "demo-shop", 9999).unwrap();
+        assert_eq!(again, RegisterOutcome::AlreadyHere { root: root_string(&repo) });
 
         let store = thor_core::event_store::EventStore::open_existing(&db).unwrap();
         assert_eq!(store.get_all_events().unwrap().len(), before, "a second call appended an event");
@@ -1998,12 +2236,45 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("thor.db");
         ensure_store(&db).unwrap();
+        let shop = dir.path().join("demo-shop");
+        checkout(&shop, "demo-shop");
+        let other = dir.path().join("other-repo");
+        checkout(&other, "other-repo");
 
-        assert_eq!(record_project_opened(&db, "demo-shop", 3).unwrap(), ProjectRecordOutcome::Written);
-        assert_eq!(record_project_opened(&db, "other-repo", 5).unwrap(), ProjectRecordOutcome::Written);
+        assert!(matches!(record_project_opened(&db, &shop, "demo-shop", 3), Ok(RegisterOutcome::Created { .. })));
+        assert!(matches!(record_project_opened(&db, &other, "other-repo", 5), Ok(RegisterOutcome::Created { .. })));
 
         let store = thor_core::event_store::EventStore::open_existing(&db).unwrap();
         assert!(model::store::show(&store, "project-demo-shop-opened-by-install").is_ok());
         assert!(model::store::show(&store, "project-other-repo-opened-by-install").is_ok());
+    }
+
+    /// A record written before registration existed (no root) gains its
+    /// working copy through ONE revise by the installer, text untouched.
+    #[test]
+    fn a_record_without_a_root_gains_one_revise_by_the_installer() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        ensure_store(&db).unwrap();
+        let repo = dir.path().join("demo-shop");
+        checkout(&repo, "demo-shop");
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            let old = project_record(project_opened_record_id("demo-shop"), "demo-shop", Some(4), "2026-08-01");
+            model::store::declare(&mut store, "install", "install", installer(), &old).unwrap();
+        }
+
+        let outcome = record_project_opened(&db, &repo, "demo-shop", 9).unwrap();
+        assert_eq!(outcome, RegisterOutcome::Registered { root: root_string(&repo) });
+        let store = EventStore::open_existing(&db).unwrap();
+        let history = model::store::history(&store, "project-demo-shop-opened-by-install").unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].kind, "fact_revised");
+        assert_eq!(history[1].actor, "installer");
+        assert!(history[1].item.as_ref().unwrap().text.contains("(4 file(s))"), "the text is kept");
+        assert_eq!(
+            model::store::registered_root_raw(&store, "demo-shop").map(|(p, _)| root_string(&p)),
+            Some(root_string(&repo))
+        );
     }
 }

@@ -1,0 +1,2 @@
+exit 0
+{"decision":"block","reason":"[THOR] rule a-deploy forbids this text (\"deploy.sh is never run with --prod from here\"); found in what is about to be written: \"./deploy.sh --prod\""}

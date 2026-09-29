@@ -17,13 +17,11 @@
 //!   - `absent_guard::find_violation` (the content prohibition)
 //! composed by `decide` below in the SAME order the real caller uses:
 //! location first, content second, via `.or_else` - see
-//! `serve/src/bin/serve.rs`'s own `absent_guard_block`, which documents that
-//! ordering ("LOCATION FIRST, deliberately: it is the broader refusal").
-//! `absent_guard_block` itself is a private `fn` inside a `[[bin]]` target
-//! (`serve/src/bin/serve.rs`), not part of any library surface, so it
-//! cannot be imported here - this file's own constraints also forbid
-//! editing that file to make it `pub`. `decide` below is therefore a
-//! composition of the two real, already-tested, already-public decision
+//! `serve::guard_verdict::file_write`, which documents that ordering
+//! ("LOCATION FIRST, deliberately: it is the broader refusal"). That
+//! function is the hook's whole file guard - five arms, not two - so it is
+//! not what this corpus measures. `decide` below is a composition of the
+//! two real, already-tested, already-public decision
 //! functions in their documented order, never a reimplementation of either
 //! one's own matching, currency or ranking logic - that logic all still
 //! lives, unmodified, in `serve::absent_guard`, `serve::live` and
@@ -322,8 +320,8 @@ fn case(
     Case { id, category, tool_name, tool_input, expect_block, note: note.into() }
 }
 
-/// The real decision, composed exactly the way `serve/src/bin/serve.rs`'s
-/// private `absent_guard_block` composes it (see this file's own module doc
+/// The real decision, composed exactly the way
+/// `serve::guard_verdict::file_write` composes its first two arms (see this file's own module doc
 /// comment): `file_path` and `content` are both read from `tool_input`
 /// first (a payload that resolves neither - the wrong tool, a missing
 /// field - short-circuits the WHOLE guard, location half included, exactly
@@ -755,7 +753,7 @@ fn main() {
         "measuring: serve::absent_guard::find_location_violation + serve::absent_guard::find_violation,"
     );
     println!(
-        "composed location-first-then-content, the same order serve/src/bin/serve.rs's absent_guard_block uses"
+        "composed location-first-then-content, the same order serve::guard_verdict::file_write uses"
     );
     println!();
     println!("total cases:        {}", results.len());

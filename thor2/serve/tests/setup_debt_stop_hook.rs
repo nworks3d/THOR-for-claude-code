@@ -77,7 +77,9 @@ fn declare_setup_note(store: &mut thor_core::event_store::EventStore) {
         falsifier: Some("this note is still served after the owner already answered".to_string()),
         check: None,
     };
-    model::store::declare(store, "install", "install", "installer", &item).unwrap();
+    // Not "installer": that name is reserved for THOR itself and the store
+    // refuses it from anything but the installer's own token.
+    model::store::declare(store, "install", "install", "install-fixture", &item).unwrap();
 }
 
 // ------------------------------------------------------------- the block

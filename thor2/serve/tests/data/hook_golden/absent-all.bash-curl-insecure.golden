@@ -1,0 +1,2 @@
+exit 0
+{"decision":"block","reason":"[THOR] rule aa-curl forbids this text (\"curl never skips TLS checks here\"); found in what is about to be written: \"curl --insecure https://10.0.0.5/he\""}

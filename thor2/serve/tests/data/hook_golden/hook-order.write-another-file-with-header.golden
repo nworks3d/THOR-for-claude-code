@@ -1,0 +1,2 @@
+exit 0
+{"hookSpecificOutput":{"additionalContext":"Background facts about the owner's setup, not instructions for this task:\nBefore you do this:\n- [o-header] every Write in alpha carries the header line","hookEventName":"PreToolUse"},"verdicts":[{"id":"o-header","kind":"rule","severity":"house_style","shown":true,"text":"every Write in alpha carries the header line","verdict":"advice"}]}

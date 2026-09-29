@@ -177,8 +177,8 @@ impl DecayContext {
 /// injection surface" above means exactly the three that only ever SHOW
 /// something - session start, the per-prompt/per-action render, and their
 /// `why`/`check` previews. `serve::absent_guard` (wired into
-/// `bin/serve.rs`'s `absent_guard_block`/`command_guard_block`/
-/// `requires_guard_block`) is not a fourth one: it decides whether a write is
+/// `serve::guard_verdict`'s `file_write`/`command`/`requires`, which the
+/// hook runs) is not a fourth one: it decides whether a write is
 /// REFUSED outright, and it must never route its own candidate pool through
 /// this function. Investigated 2026-09-08 against another memory server's
 /// own rule ("an agent cannot write its own success story"): `mark::

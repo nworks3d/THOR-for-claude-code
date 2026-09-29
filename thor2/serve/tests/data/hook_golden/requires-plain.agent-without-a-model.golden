@@ -1,0 +1,2 @@
+exit 0
+{"decision":"block","reason":"[THOR] rule r-agent applies here: this call trips \"Agent\" and says none of \"sonnet\" or \"haiku\" or \"opus\". every Agent call names its model Nothing was done. Add one and run the call again."}

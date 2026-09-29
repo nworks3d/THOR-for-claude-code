@@ -1,0 +1,2 @@
+exit 0
+{"hookSpecificOutput":{"additionalContext":"Background facts about the owner's setup, not instructions for this task:\nBefore you do this - install:\n- [r-pip] pip install in alpha always carries --no-deps","hookEventName":"PreToolUse"},"verdicts":[{"id":"r-pip","kind":"rule","severity":"costly","shown":true,"text":"pip install in alpha always carries --no-deps","verdict":"advice"}]}

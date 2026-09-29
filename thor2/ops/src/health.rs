@@ -241,6 +241,26 @@ pub fn ship_line(db: &Path) -> Option<String> {
     })
 }
 
+/// How many writes queued on a replica did NOT land at the drain - refused by
+/// the gate or the trial there, or not replayable - and where their copies
+/// are. The replica session that wrote them was told "queued" and can never
+/// hear the refusal (step 8, F13: the trial needs the working copy, which only
+/// this machine has), so this line is the only place anyone learns of it.
+/// Silent while nothing was ever stranded.
+pub fn drain_refusals_line(db: &Path) -> Option<String> {
+    let path = crate::drain::stranded_path(db);
+    let text = std::fs::read_to_string(&path).ok()?;
+    let count = text.lines().filter(|l| !l.trim().is_empty()).count();
+    (count > 0).then(|| {
+        format!(
+            "drain: {count} queued write(s) from a replica were refused at the drain (or could not be replayed) and \
+             never landed - the replica session was only told 'queued'. Each is kept in {}: read it, and write the \
+             ones that still matter again from a session on this machine",
+            path.display()
+        )
+    })
+}
+
 /// Component 5: how many fireable items (Rule/Orientation) still have no
 /// falsifier - the worklist number, in plain language.
 pub fn falsifier_line(db: &Path) -> String {
@@ -1150,11 +1170,11 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool
     Some(out.join("\n"))
 }
 
-/// The heavy rules the next evaluation report of this checkout's project is
-/// held to (`model::store::evaluation_teeth_batch`), and the ones that stay
-/// owed beyond that batch - named, so nothing the batch leaves out is hidden.
-/// Silent outside a project (no report can be filed there) and when nothing
-/// that fired since the previous report still owes a tooth or a reason.
+/// The rules the next evaluation report of this checkout's project is held
+/// to (`model::store::evaluation_teeth_batch`, which reads
+/// `model::store::settlement`), and the ones that stay owed beyond that batch
+/// - named, so nothing the batch leaves out is hidden. Silent outside a
+/// project (no report can be filed there) and when no rule is owed.
 pub fn evaluation_batch_line(db: &Path, checkout_project: Option<&str>, full: bool) -> Option<String> {
     let project = checkout_project?;
     let store = EventStore::open_existing(db).ok()?;
@@ -1163,10 +1183,10 @@ pub fn evaluation_batch_line(db: &Path, checkout_project: Option<&str>, full: bo
         return None;
     }
     let mut out = vec![format!(
-        "evaluation batch: the next evaluation report for '{project}' must settle {} heavy rule(s) - its batch holds at \
-         most {}, the ones written longest ago first, and {} of it already settled since the previous report; {} more \
-         heavy rule(s) that fired since then still have neither a real tooth nor a real reason, stay owed, and lead \
-         the batch of a later report",
+        "evaluation batch: the next evaluation report for '{project}' must settle {} rule(s) - its batch holds at \
+         most {}, the ones that fired since the previous report first, then the ones written longest ago - and {} \
+         were settled since the previous report; {} more rule(s) with no current verdict from THOR's trial stay \
+         owed and lead the batch of a later report",
         batch.owed_now.len(),
         model::store::EVALUATION_TEETH_BATCH,
         batch.settled.len(),
@@ -1257,6 +1277,77 @@ pub fn orphan_projects_line(db: &Path, checkouts: Option<&Path>) -> String {
         root.display(),
         detail.join(", ")
     )
+}
+
+/// The working copy each project is registered at (`install.exe
+/// --register-root`, or the per-project install), one line per project -
+/// its folder, since when, where it was before a move, and what is wrong with
+/// it when the registration can no longer be used - then one line naming the
+/// projects that own rules but have no registered working copy yet, with the
+/// command that registers one (always with `--db`, F7).
+///
+/// WHY DOCTOR SHOWS THIS. The first registration of a project is first-come
+/// (N11): whoever runs the command first fixes the path. A registration that
+/// nobody ever sees is one nobody can correct, so every registration is
+/// listed here, and at the session start for seven days after it is made.
+pub fn working_copy_lines(db: &Path) -> Vec<String> {
+    let Ok(store) = EventStore::open_existing(db) else {
+        return vec!["working copies: store unreadable, not checked".to_string()];
+    };
+    let items = serve::live::live_items(&store);
+    let mut registered: std::collections::BTreeSet<String> = Default::default();
+    let mut owners: std::collections::BTreeMap<String, usize> = Default::default();
+    for li in &items {
+        let key = li
+            .id
+            .strip_prefix("project-")
+            .and_then(|rest| rest.strip_suffix("-opened-by-install").or_else(|| rest.strip_suffix("-root-by-install")));
+        if let Some(key) = key {
+            registered.insert(key.to_string());
+        }
+        if li.item.kind.can_fire() {
+            if let Some(project) = &li.item.project {
+                *owners.entry(project.clone()).or_default() += 1;
+            }
+        }
+    }
+    // A record retracted before this build is not live, but its fallback
+    // record is - and a project that owns rules is asked about either way.
+    registered.extend(owners.keys().cloned());
+
+    let mut lines = Vec::new();
+    let mut unregistered: Vec<String> = Vec::new();
+    for key in &registered {
+        let regs = model::store::root_registrations(&store, key);
+        let Some(last) = regs.last() else {
+            if let Some(n) = owners.get(key) {
+                unregistered.push(format!("{key} ({n} rule(s))"));
+            }
+            continue;
+        };
+        let since = last.at.as_deref().map(|t| t.chars().take(10).collect::<String>()).unwrap_or_else(|| "an unknown date".to_string());
+        let mut line = format!("working copy: {key} -> {} (registered {since})", last.root);
+        if let Some(prev) = regs.iter().rev().nth(1).filter(|p| p.root != last.root) {
+            line.push_str(&format!(", moved from {}", prev.root));
+        }
+        if let Err(problem) = serve::project::validate_checkout(Path::new(&last.root), key) {
+            line.push_str(&format!(" - NOT USABLE: {problem}"));
+        }
+        lines.push(line);
+    }
+    if !unregistered.is_empty() {
+        lines.push(format!(
+            "working copies: {} project(s) own rules but have no registered working copy: {} - run {} from inside \
+             each one's checkout (a project not on this machine needs nothing)",
+            unregistered.len(),
+            unregistered.join(", "),
+            model::store::register_command_for(Some(db))
+        ));
+    }
+    if lines.is_empty() {
+        lines.push("working copies: no project has one registered, and no project owns a rule".to_string());
+    }
+    lines
 }
 
 /// Same-file pairs of live Rule/Orientation checks whose proofs currently
@@ -1414,232 +1505,501 @@ pub fn wal_line(db: &Path) -> Option<String> {
     wal_line_from_size(wal_raw_size(db), db)
 }
 
-/// The whole report: one line per component, in a fixed order, so a person
-/// (or a script) can read it top to bottom without guessing what is missing.
-/// How many items are eligible at one of their own triggers and never shown
-/// there, because the block has fewer places than the pool has claimants.
+/// Where the rules stand, read through the one reader
+/// (`model::store::settlement`), and what the log holds as field evidence
+/// (`serve::attest::is_field_refusal`). Line by line:
+/// - the SHAPE claim (kept): how many heavy rules carry a check shaped to
+///   refuse at all, the rest named as `toothless`;
+/// - ROT: every live rule and orientation, whatever its weight (D8), with no
+///   current verdict and no machine blocker holding - with its heavy subset
+///   beside the plan's starting line, and the share owing only the A4 naming
+///   fix with its drain estimate; each named as `undecided`, with the reason;
+/// - the VERDICTS: proven, wired, notes (by dispute, with a pending check),
+///   rules kept by `accept_refusing`, wired rules whose literal no real call
+///   ever carried, and the blocked ones per project and blocker;
+/// - FIELD EVIDENCE: rules holding a field refusal, beside the ones passing
+///   only its structural part, and every refusal that does not count, sorted
+///   by why (not a Claude Code session, no matching tool call, no tool call
+///   id at all, not verified yet, and the THOR actors counted apart);
+/// - rules TAKEN OFF the rule track in the last 30 days, with reason and door,
+///   and the REWORD line: refused for a tooth, then stored as a note that no
+///   longer names it - information, never a verdict on the writer.
 ///
-/// WHY THIS LINE EXISTS, and why it did not until 2026-08-08. CONTRACT R2 used
-/// to declare crowding reports unnecessary, on the reasoning that nothing is
-/// truncated at delivery because nothing delivered is long. That is true of
-/// truncation INSIDE an item and says nothing about how many items are dropped
-/// FROM the list. The contract therefore argued this project out of the one
-/// measurement that would have shown the damage, and nobody looked for months.
-/// First measurement, the day R2 was corrected: 239 items eligible somewhere
-/// and shown nowhere, out of 698; the worst single pool held 38 for 4 places.
-///
-/// It asks the REAL selector (`serve::serve`), never a second copy of the
-/// selection rule, for the same reason `why` does: a report that disagrees
-/// with the thing it reports on is worse than no report.
-///
-/// Deliberately NOT part of `gate_verdict`. This is whole-store debt, the same
-/// class as proof coverage and the unjudged count, and a commit gate that
-/// fails on those teaches people to bypass it.
-/// Whether the rules the owner marked most costly are the ones that can
-/// actually refuse - because measured on the real store, they are the exact
-/// opposite.
-///
-/// WHY THIS LINE EXISTS. Severity is the FIRST ranking key, so a heavy item
-/// takes a place from every lighter one at the same trigger. It is meant to
-/// say what it costs when this goes wrong. Measured 2026-08-08: of 228 items
-/// marked irreversible or costly, ZERO could refuse anything, while all 17
-/// that could refuse were marked house style or nothing at all. The store's
-/// own sense of danger and its actual teeth point in opposite directions, and
-/// no line said so.
-///
-/// This is a worklist, not a fault: these are exactly the rules where a check
-/// is worth writing, because being wrong about them is what the owner already
-/// said is expensive.
+/// Tags are never read here: a label is only a readable copy of a record.
 pub fn teeth_line(db: &Path, full: bool) -> String {
     let Ok(store) = EventStore::open_existing(db) else {
         return "teeth: store unreadable, not checked".to_string();
     };
+    let Ok(events) = store.get_all_events() else {
+        return "teeth: log unreadable, not checked".to_string();
+    };
     let live = serve::live::live_items(&store);
-    // How often each item has fired since its own last verdict - the exact
-    // fold `judgement_debt_line` already reads for the identical reason: a
-    // toothless rule that fires often is a live, exercised risk, not a
-    // theoretical one, and worth naming ahead of one nobody has seen in a
-    // long time. One fold, shared, so this and the judgement debt line can
-    // never silently disagree about what "fires often" means.
+    // How often each item has fired since its own last verdict - the fold
+    // `judgement_debt_line` reads too, so "fires often" means one thing.
     let fired = serve::usefulness::served_since_last_verdict(&store);
+    let project_of = |item: &model::item::Item| item.project.clone().unwrap_or_else(|| "global".to_string());
+
+    // THE SHAPE CLAIM (kept): which heavy rules carry a check shaped to
+    // refuse at all, and the ones that can only inform, heaviest first then
+    // the busiest.
     let (mut heavy, mut heavy_with_teeth) = (0usize, 0usize);
-    // NAMED, not just counted - the same gap `judgement_debt_named` and the
-    // bare-no-catch list in `proof_line` both close: a bare count gives
-    // nothing anyone can act on, because nothing says which rules make it
-    // up. Sorted heaviest first - `severity_
-    // rank`, the exact ranking `serve::rank` itself already selects delivery
-    // order by - because severity is the whole reason this line exists: an
-    // Irreversible rule with no teeth is a worse gap than a Costly one, and
-    // showing only a handful must not let that difference wash out into an
-    // arbitrary pick. Ties within the same severity go to whichever fired
-    // most often since its last verdict (most exercised, most worth a check
-    // first), then to id, so the order is fully deterministic across runs.
     let mut toothless: Vec<(u8, usize, Rot)> = Vec::new();
-    // CHANGE 2 (2026-09-24): `heavy_with_teeth`/`toothless` above are a claim
-    // about SHAPE (`can_refuse`, structural, decided without ever running
-    // anything - see that function's own doc comment). `informing_tested`,
-    // `proven_tested`, `refuses_legit_tested` and `anchor_collapsed_tested`
-    // are the DIFFERENT claim this store can now actually back: how many
-    // already carry one of the four reserved tags the write gate itself
-    // appends only after actually trying a fact's own teeth (`model::store::
-    // TEETH_INFORMING_TAG`/`TEETH_PROVEN_TAG`/`TEETH_REFUSES_LEGITIMATE_TAG`/
-    // `TEETH_ANCHOR_COLLAPSED_TAG` - see each constant's own doc comment for
-    // why a writer can never set, clear or fake it). An item written before
-    // this mechanism shipped, or one Change 2 never applied to, carries none
-    // of the four - that gap is exactly what "never tested" below names.
-    //
-    // COUNTED INDEPENDENTLY of the armed/toothless split just below, on
-    // purpose: `can_refuse` is a claim about REACH alone, and for `Absent`/
-    // `AbsentAll` it is unconditionally `true` regardless of whether this
-    // item's own binding actually reaches its check's own path - so a
-    // "wrong anchor" item (armed by shape, toothless in fact, carrying
-    // `TEETH_INFORMING_TAG`) would otherwise fall into neither branch's own
-    // tag check and vanish from this count entirely. Checking every tag
-    // against every heavy item, regardless of which branch it lands in
-    // below, is what keeps this sentence honest for that shape too.
-    let (mut informing_tested, mut proven_tested, mut refuses_legit_tested, mut anchor_collapsed_tested) =
-        (0usize, 0usize, 0usize, 0usize);
-    let mut wired_tested = 0usize;
-    let mut refuses_legit: Vec<Rot> = Vec::new();
-    let mut anchor_collapsed: Vec<Rot> = Vec::new();
-    // THE TWO NUMBERS THAT ANSWER THE OWNER'S QUESTION (2026-09-26): how many
-    // heavy rules have REALLY refused something - judged fresh against the
-    // log, never read off a label (`serve::prove::bitten`, via `teeth_box`) -
-    // and how many carry a reason a reader can check that they cannot have a
-    // tooth (`model::gate::teeth_answer_settles`). Everything else is neither.
-    let (mut really_refuses, mut honest_no) = (0usize, 0usize);
-    // A reason counts only after a real try (`model::gate::teeth_answer_
-    // settles`) - the same history the filing gate reads.
-    let tried = model::store::ids_whose_check_was_tried(&store);
+
+    // THE ONE READER (step 9): every live rule and orientation, whatever its
+    // weight, through `model::store::settlement` - the answer the filing gate
+    // and the Stop hook read too.
+    let (mut proven_n, mut wired_n, mut notes_n) = (0usize, 0usize, 0usize);
+    let mut rot: Vec<(u8, usize, Rot)> = Vec::new();
+    let (mut rot_heavy, mut a4_only) = (0usize, 0usize);
+    let mut blocked: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    let mut pending: std::collections::BTreeMap<&'static str, Vec<String>> = Default::default();
+    let mut by_dispute: Vec<Rot> = Vec::new();
+    let mut accepted: Vec<Rot> = Vec::new();
+    let mut unseen: Vec<Rot> = Vec::new();
+    // Old contains checks counted as teeth although their text does not name
+    // the literal (Q24), each with the fragment it guards.
+    let mut old_stock: Vec<Rot> = Vec::new();
+
+    // FIELD EVIDENCE (K6): a rule counts as having really refused something
+    // only through `serve::attest::is_field_refusal`, from the recorded
+    // attester verdicts; the structural part alone is shown beside it.
+    let mut field_rules = 0usize;
+    let mut structural_rules = 0usize;
+    // Only an item some refusal names can hold one: read those logs only.
+    let refused_ids: std::collections::HashSet<&str> = events
+        .iter()
+        .filter(|e| e.kind == thor_core::event_store::EventKind::GateRefused)
+        .map(|e| e.entity_id.as_str())
+        .collect();
+    // The sessions that served anything - what `served_ids_in_session` asks,
+    // answered once from the events already in hand, not per session.
+    let active = sessions_with_activity(&events);
+    let session_active = |session: &str| active.contains(session);
+
     for li in live.iter().filter(|li| li.item.kind.can_fire()) {
-        if !matches!(
+        let is_heavy = matches!(
             li.item.severity,
             Some(model::item::Severity::Irreversible) | Some(model::item::Severity::Costly)
-        ) {
-            continue;
-        }
-        heavy += 1;
-        let reality = if li.item.check.is_some() {
-            serve::prove::reality(&store, &li.id, li.item.check.as_ref())
-        } else {
-            serve::prove::Reality::default()
-        };
-        if matches!(serve::prove::teeth_box(&li.id, &li.item, None, &reality), serve::prove::TeethBox::ProvenGuard { .. }) {
-            really_refuses += 1;
-        } else if model::gate::teeth_answer_settles(&li.item, tried.contains(&li.id)) {
-            honest_no += 1;
-        }
-        if li.item.tags.iter().any(|t| t == model::store::TEETH_WIRED_TAG) {
-            wired_tested += 1;
-        }
+        );
+        let count = fired.get(&li.id).copied().unwrap_or(0);
+        let rank = model::item::severity_rank(li.item.severity);
+        let project = project_of(&li.item);
         let check_desc = match &li.item.check {
             None => "no check".to_string(),
             Some(c) => format!("check: {c:?}"),
         };
-        let project = li.item.project.clone().unwrap_or_else(|| "global".to_string());
-        if li.item.tags.iter().any(|t| t == model::store::TEETH_PROVEN_TAG) {
-            proven_tested += 1;
-        } else if li.item.tags.iter().any(|t| t == model::store::TEETH_INFORMING_TAG) {
-            informing_tested += 1;
-        } else if li.item.tags.iter().any(|t| t == model::store::TEETH_REFUSES_LEGITIMATE_TAG) {
-            refuses_legit_tested += 1;
-            refuses_legit.push(Rot {
-                id: li.id.clone(),
-                project: project.clone(),
-                what: format!("{:?}, {check_desc} - refuses ordinary use of its own anchor too", li.item.severity),
-            });
-        } else if li.item.tags.iter().any(|t| t == model::store::TEETH_ANCHOR_COLLAPSED_TAG) {
-            anchor_collapsed_tested += 1;
-            anchor_collapsed.push(Rot {
-                id: li.id.clone(),
-                project: project.clone(),
-                what: format!("{:?}, {check_desc} - anchor and literal cannot be told apart", li.item.severity),
-            });
+        if is_heavy {
+            heavy += 1;
+            if can_refuse(&li.item) {
+                heavy_with_teeth += 1;
+            } else {
+                toothless.push((
+                    rank,
+                    count,
+                    Rot {
+                        id: li.id.clone(),
+                        project: project.clone(),
+                        what: format!("{:?}, {check_desc}, fired {count}x since its last verdict", li.item.severity),
+                    },
+                ));
+            }
         }
-        if can_refuse(&li.item) {
-            heavy_with_teeth += 1;
-        } else {
-            let count = fired.get(&li.id).copied().unwrap_or(0);
-            toothless.push((
-                model::item::severity_rank(li.item.severity),
-                count,
-                Rot { id: li.id.clone(), project, what: format!("{:?}, {check_desc}, fired {count}x since its last verdict", li.item.severity) },
-            ));
+        if li.item.check.is_some() && refused_ids.contains(li.id.as_str()) {
+            if !serve::attest::field_refusals(&store, &li.id, &li.item).is_empty() {
+                field_rules += 1;
+            }
+            if let Ok(own) = store.get_events_by_entity(&li.id) {
+                let since = serve::attest::check_since(&own, li.item.check.as_ref());
+                let structural = own.iter().any(|e| {
+                    e.kind == thor_core::event_store::EventKind::GateRefused
+                        && e.actor == model::store::ASSISTANT_DELIVERY_ACTOR
+                        && since != i64::MAX
+                        && e.seq > since
+                        && serve::attest::is_uuid_shaped(&e.session_id)
+                        && session_active(&e.session_id)
+                });
+                if structural {
+                    structural_rules += 1;
+                }
+            }
+        }
+        match model::store::settlement(&store, &li.id) {
+            model::store::Settlement::Owed { why } => {
+                if is_heavy {
+                    rot_heavy += 1;
+                }
+                // Owes the A4 naming fix: its check names a literal its text
+                // does not (K23) - words only the agent can choose.
+                if why.starts_with("A4:") || !model::gate::unnamed_literals(&li.item).is_empty() {
+                    a4_only += 1;
+                }
+                rot.push((rank, count, Rot { id: li.id.clone(), project: project.clone(), what: why }));
+            }
+            model::store::Settlement::Settled(model::store::Settled::Blocked(blocker)) => {
+                blocked.entry(blocker.to_string()).or_default().push(li.id.clone());
+            }
+            model::store::Settlement::Settled(model::store::Settled::Rule { proven }) => {
+                if proven {
+                    proven_n += 1;
+                } else {
+                    wired_n += 1;
+                }
+                let record = model::store::current_record(&store, &li.id);
+                let fields = record.as_ref().map(model::store::TrialRecord::fields);
+                if let Some(f) = fields.filter(|f| !f.accept_refusing.is_empty()) {
+                    let calls = f.accept_refusing.iter().map(|c| format!("'{c}'")).collect::<Vec<_>>().join(", ");
+                    accepted.push(Rot { id: li.id.clone(), project: project.clone(), what: format!("accepts refusing {calls}") });
+                }
+                if let Some(mark) = fields.and_then(|f| f.a4_old_stock.as_ref()) {
+                    old_stock.push(Rot { id: li.id.clone(), project: project.clone(), what: mark.describe() });
+                }
+                let command_check =
+                    matches!(li.item.check, Some(model::item::Check::Forbidden { .. } | model::item::Check::Requires { .. }));
+                if !proven && command_check && fields.is_some_and(|f| f.corpus.whole_hits == 0) {
+                    unseen.push(Rot { id: li.id.clone(), project: project.clone(), what: check_desc.clone() });
+                }
+            }
+            model::store::Settlement::Settled(model::store::Settled::Note { pending: why, by_dispute: dispute }) => {
+                notes_n += 1;
+                if let Some(why) = why {
+                    let label = match why {
+                        model::store::PendingWhy::NoWorkingCopy => "no registered working copy",
+                        model::store::PendingWhy::NotTrueInRegisteredCheckout => "not true in the registered checkout",
+                    };
+                    pending.entry(label).or_default().push(li.id.clone());
+                }
+                if dispute {
+                    let record = model::store::current_record(&store, &li.id);
+                    let what = record.as_ref().map_or_else(String::new, |r| {
+                        let d = &r.fields().disputes;
+                        let list = |ls: &[String]| ls.iter().map(|c| format!("'{c}'")).collect::<Vec<_>>().join(", ");
+                        format!("legitimate_calls [{}], may_change [{}]", list(&d.legitimate_calls), list(&d.may_change))
+                    });
+                    by_dispute.push(Rot { id: li.id.clone(), project: project.clone(), what });
+                }
+            }
+            model::store::Settlement::Settled(_) => {}
         }
     }
+
+    let refusals = refusals_apart(&active, &events);
+    let taken_off = taken_off_the_rule_track(&events);
+    let reworded = reworded_after_a_refusal(&store, &events);
+
+    let mut out = Vec::new();
     if heavy == 0 {
-        return "teeth: no rule is marked irreversible or costly yet".to_string();
+        out.push(format!(
+            "teeth: no rule is marked irreversible or costly yet; {field_rules} rule(s) of any weight hold a field \
+             refusal, the only count here that is proven rather than claimed"
+        ));
+    } else {
+        out.push(format!(
+            "teeth: {heavy_with_teeth} of {heavy} rule(s) marked irreversible or costly carry a check shaped to refuse - a claim about shape only, which an invented literal satisfies as well as a real one (the lines below judge them) - the other {} can only inform, and they are the ones where being wrong was already called expensive; {field_rules} rule(s) of any weight hold a field refusal, the only count here that is proven rather than claimed",
+            heavy - heavy_with_teeth
+        ));
     }
+    let evaluations = a4_only.div_ceil(A4_PER_EVALUATION);
+    out.push(format!(
+        "teeth rot: {} live rule(s) and orientation(s) have no current verdict from THOR's trial, whatever their \
+         weight - {rot_heavy} of them heavy (the plan's starting line: 306 heavy, 171 with neither); {a4_only} of \
+         them owe only the A4 naming fix (at {A4_PER_EVALUATION} per evaluation: {evaluations} evaluation(s)). The \
+         finish line is 0; each one is decided by `serve retest --id <id>`",
+        rot.len()
+    ));
+    let pending_n: usize = pending.values().map(Vec::len).sum();
+    let blocked_n: usize = blocked.values().map(Vec::len).sum();
+    out.push(format!(
+        "teeth verdicts: {proven_n} proven and {wired_n} wired on the rule track; {notes_n} note(s), {} of them by \
+         dispute and {pending_n} with a pending check; {} rule(s) kept by accept_refusing; {} wired rule(s) whose \
+         literal no real call on record ever carried; {blocked_n} blocked, held until their blocker lifts",
+        by_dispute.len(),
+        accepted.len(),
+        unseen.len()
+    ));
+    // Said only where it can matter: an old contains check counted, a cutoff
+    // recorded, or rules still owing the A4 naming fix.
+    let recorded_cutoff = model::store::a4_cutoff(&store);
+    if !old_stock.is_empty() || recorded_cutoff.is_some() || a4_only > 0 {
+        let cutoff = match recorded_cutoff {
+            Some(seq) => format!("the A4 cutoff is log seq {seq}, recorded once and never moved"),
+            None => "no A4 cutoff is recorded yet - the first `serve retest --apply` that counts one records it"
+                .to_string(),
+        };
+        out.push(format!(
+            "teeth old contains (Q24): {} rule(s) on the rule track are old contains checks whose text does not name \
+             the literal - counted as teeth because the check bites in the registered working copy, which proves the \
+             literal real; each is named below with the fragment it guards, for the owner to judge whether it guards \
+             the rule's subject; {cutoff}",
+            old_stock.len()
+        ));
+    }
+    out.push(format!(
+        "teeth against reality: {field_rules} rule(s) hold a field refusal - the hook refused a call in a Claude \
+         Code session whose transcript holds that tool call and the hook's block of it, under the check the rule \
+         carries now; {structural_rules} rule(s) pass the structural part alone (the hook, a Claude Code session \
+         with other activity, after the check was set), which never counts on its own"
+    ));
+    out.push(format!(
+        "teeth refusals: {} of {} refusal(s) on the log count as field evidence; the other {} never count as proof",
+        refusals.counted,
+        refusals.total,
+        refusals.total - refusals.counted
+    ));
+    out.extend(refusals.lines());
+    for (blocker, ids) in &blocked {
+        out.push(format!("  blocked: {blocker}: {}", ids.join(", ")));
+    }
+    for (why, ids) in &pending {
+        out.push(format!("  note with a pending check ({why}): {}", ids.join(", ")));
+    }
+    out.extend(name_rot("note by dispute", &by_dispute, full));
+    out.extend(name_rot("kept by accept_refusing", &accepted, full));
+    out.extend(name_rot("wired, literal never seen", &unseen, full));
+    out.extend(name_rot("old contains, text does not name it", &old_stock, full));
+    let cap = name_cap(full);
+    for line in taken_off.iter().take(cap) {
+        out.push(format!("  taken off the rule track: {line}"));
+    }
+    if taken_off.len() > cap {
+        out.push(format!("  taken off the rule track: and {} more, not named here (use --full)", taken_off.len() - cap));
+    }
+    for line in &reworded {
+        out.push(format!("  reworded: {line}"));
+    }
+    rot.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)).then_with(|| a.2.id.cmp(&b.2.id)));
+    let rot: Vec<Rot> = rot.into_iter().map(|(_, _, r)| r).collect();
+    out.extend(name_rot("undecided", &rot, full));
     toothless.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)).then_with(|| a.2.id.cmp(&b.2.id)));
     let toothless: Vec<Rot> = toothless.into_iter().map(|(_, _, r)| r).collect();
-    // Armed is a claim about shape. Having refused something is a fact about
-    // the world, and it is the only one of the two that cannot be wrong.
-    //
-    // WHY BOTH NUMBERS, and the owner put it exactly right on 2026-08-09: the
-    // agent writes these rules, not him, so "a human will spot a bad literal"
-    // is not a safeguard - the human never sees it. Nothing here can check
-    // that a forbidden fragment is spelled the way the real command spells it
-    // (measured the same day: requiring the fragment to appear in the rule's
-    // own text would have refused 17 of 29 literals, including every one of
-    // the typography rule's, which cannot quote what it forbids). What CAN be
-    // known is whether a rule has ever actually stopped anything. A rule that
-    // has is proven in the field; one that has not may be perfect and merely
-    // untested, or may be a typo nobody will ever notice, and this line
-    // refuses to blur those two.
-    let proven = store
-        .get_all_events()
-        .map(|events| {
-            events
-                .iter()
-                .filter(|e| e.kind == thor_core::event_store::EventKind::GateRefused)
-                .map(|e| e.entity_id.clone())
-                .collect::<std::collections::HashSet<_>>()
-                .len()
-        })
-        .unwrap_or(0);
-    let mut out = vec![format!(
-        "teeth: {heavy_with_teeth} of {heavy} rule(s) marked irreversible or costly carry a check shaped to refuse - a claim about shape only, which an invented literal satisfies as well as a real one (the next line judges them against the log) - the other {} can only inform, and they are the ones where being wrong was already called expensive; {proven} rule(s) of any weight have ever actually refused a write, which is the only count here that is proven rather than claimed",
-        heavy - heavy_with_teeth
-    )];
-    // CHANGE 2's own line, kept separate from the shape-only sentence above
-    // rather than folded into it: the four counts below are WRITE-TIME facts
-    // (this tool actually tried both sides, and said so in a tag that
-    // survives only as long as none of the check, the bindings or the
-    // severity changes),
-    // never a re-derivation of `heavy_with_teeth`/`toothless` at report time.
-    // Every heavy rule owes a teeth test (`serve::prove::teeth_box`'s own
-    // applicability rule - `is_heavy` alone already satisfies it, whatever
-    // the check looks like), so these five numbers always sum to `heavy`:
-    // proven both ways, refuses legitimate use too, anchor collapsed into
-    // its own literal, informing only, or never tested at all.
-    out.push(format!(
-        "teeth against reality, of {heavy} heavy rule(s): {really_refuses} have really refused something - the log \
-         holds a real call the real hook refused under their current check, or a real call they fired on that it \
-         would now refuse while still letting their ordinary calls through; {honest_no} carry a reason, checkable \
-         against the rule, why they cannot have a tooth (it quotes the legitimate call or names their trigger); the \
-         other {} have neither",
-        heavy - really_refuses - honest_no
-    ));
-    let never_tested =
-        heavy - proven_tested - wired_tested - refuses_legit_tested - anchor_collapsed_tested - informing_tested;
-    out.push(format!(
-        "teeth labels, as last written, of {heavy} heavy rule(s): {proven_tested} proven against reality ('{}'); \
-         {wired_tested} wired both ways but never met a real call ('{}'); {refuses_legit_tested} refuse legitimate \
-         use too, which is as bad as no check at all ('{}'); {anchor_collapsed_tested} have an anchor that already \
-         contains their own literal, so the two-sided test could not even run on them ('{}'); {informing_tested} \
-         were tried and are confirmed toothless, or confirmed to have nothing to try ('{}'); the remaining \
-         {never_tested} predate this check or were never revised since. A label is what trying found when it was \
-         written, never an answer - the line above is the one judged now",
-        model::store::TEETH_PROVEN_TAG,
-        model::store::TEETH_WIRED_TAG,
-        model::store::TEETH_REFUSES_LEGITIMATE_TAG,
-        model::store::TEETH_ANCHOR_COLLAPSED_TAG,
-        model::store::TEETH_INFORMING_TAG
-    ));
-    out.extend(name_rot("refuses-legitimate-use", &refuses_legit, full));
-    out.extend(name_rot("anchor-collapsed", &anchor_collapsed, full));
     out.extend(name_rot("toothless", &toothless, full));
     out.join("\n")
+}
+
+/// How many rules owing only the A4 naming fix one evaluation takes on (K23,
+/// Q24) - what the drain estimate on the rot line divides by.
+const A4_PER_EVALUATION: usize = 16;
+
+/// Every refusal on the log, split by why it does or does not count (K6, EV
+/// B7, Q5).
+#[derive(Default)]
+struct RefusalsApart {
+    total: usize,
+    /// Verified field evidence: a recorded attester verdict says field.
+    counted: usize,
+    /// Stamped by the hook in a session that is not a Claude Code session.
+    not_claude_code: Vec<String>,
+    /// Verified and recorded as NOT field evidence (no matching tool call, no
+    /// block in the transcript, no other activity).
+    no_matching_call: usize,
+    /// Old: no tool call id, so never checkable.
+    no_tool_call_id: usize,
+    /// Not verified yet: no attester verdict recorded.
+    unverified: usize,
+    teeth_probe: usize,
+    teeth_eval: usize,
+    teeth_write: usize,
+    /// Under any other actor: a hand-fed payload with `--actor`.
+    other_actor: usize,
+}
+
+impl RefusalsApart {
+    fn lines(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        match self.not_claude_code.len() {
+            0 => {}
+            1 => out.push(format!(
+                "  1 refusal from a session that is not a Claude Code session ({}) - not counted",
+                self.not_claude_code[0]
+            )),
+            n => {
+                let mut sessions = self.not_claude_code.clone();
+                sessions.sort();
+                sessions.dedup();
+                let shown: Vec<&str> = sessions.iter().take(5).map(String::as_str).collect();
+                out.push(format!(
+                    "  {n} refusals from sessions that are not Claude Code sessions ({}{}) - not counted",
+                    shown.join(", "),
+                    if sessions.len() > 5 { ", ..." } else { "" }
+                ));
+            }
+        }
+        if self.no_matching_call > 0 {
+            out.push(format!(
+                "  {} refusal(s) from Claude Code sessions with no matching tool call in the transcript - never counted \
+                 as proof",
+                self.no_matching_call
+            ));
+        }
+        if self.no_tool_call_id > 0 {
+            out.push(format!(
+                "  {} old refusal(s) carry no tool call id and can never be checked",
+                self.no_tool_call_id
+            ));
+        }
+        if self.unverified > 0 {
+            out.push(format!(
+                "  {} refusal(s) not verified yet - their session's transcript is read at its next Stop; not counted \
+                 until then",
+                self.unverified
+            ));
+        }
+        let apart = self.teeth_probe + self.teeth_eval + self.teeth_write + self.other_actor;
+        if apart > 0 {
+            out.push(format!(
+                "  counted apart, never evidence: {} by teeth-probe, {} by teeth-eval, {} by teeth-write (writes THOR's \
+                 trial refused), {} hand-fed under another actor",
+                self.teeth_probe, self.teeth_eval, self.teeth_write, self.other_actor
+            ));
+        }
+        out
+    }
+}
+
+/// Every session that served anything on the log.
+fn sessions_with_activity(events: &[Event]) -> std::collections::HashSet<&str> {
+    events
+        .iter()
+        .filter(|e| e.kind == thor_core::event_store::EventKind::ItemServed)
+        .map(|e| e.session_id.as_str())
+        .collect()
+}
+
+/// Every `gate_refused` on the log, sorted into `RefusalsApart`. `active`:
+/// the sessions that served anything (`sessions_with_activity`).
+fn refusals_apart(active: &std::collections::HashSet<&str>, events: &[Event]) -> RefusalsApart {
+    use thor_core::event_store::EventKind;
+    let verdicts = model::store::recorded_refusal_verdicts(events);
+    let mut out = RefusalsApart::default();
+    for e in events.iter().filter(|e| e.kind == EventKind::GateRefused) {
+        out.total += 1;
+        match e.actor.as_str() {
+            model::store::TEETH_PROBE_ACTOR => out.teeth_probe += 1,
+            "teeth-eval" => out.teeth_eval += 1,
+            model::store::TEETH_WRITE_ACTOR => out.teeth_write += 1,
+            model::store::ASSISTANT_DELIVERY_ACTOR => {
+                let body = serde_json::from_str::<serde_json::Value>(&e.body).unwrap_or(serde_json::Value::Null);
+                let has_id = body.get("tool_use_id").and_then(|t| t.as_str()).is_some_and(|t| !t.is_empty());
+                let session_active = active.contains(e.session_id.as_str());
+                if !serve::attest::is_uuid_shaped(&e.session_id) {
+                    out.not_claude_code.push(e.session_id.clone());
+                } else if !has_id {
+                    out.no_tool_call_id += 1;
+                } else {
+                    match verdicts.get(&e.seq) {
+                        Some((true, _)) if session_active => out.counted += 1,
+                        Some(_) => out.no_matching_call += 1,
+                        None => out.unverified += 1,
+                    }
+                }
+            }
+            _ => out.other_actor += 1,
+        }
+    }
+    out
+}
+
+/// How many days back "taken off the rule track" looks.
+const TAKEN_OFF_DAYS: i64 = 30;
+
+/// Every Rule or Orientation taken off the rule track in the last
+/// `TAKEN_OFF_DAYS` days - retracted, archived, or revised to a kind that
+/// never fires (D16) - newest first, each with its reason and the door (the
+/// actor that wrote it). An event carries no time of its own, so each one is
+/// dated by the newest served or refused event before it that records one;
+/// one with none before it is listed rather than dropped.
+fn taken_off_the_rule_track(events: &[Event]) -> Vec<String> {
+    use thor_core::event_store::EventKind;
+    let now = serve::time::now_unix();
+    let mut last_at: Option<i64> = None;
+    let mut last_kind: std::collections::HashMap<&str, model::item::Kind> = Default::default();
+    let mut out: Vec<(i64, String)> = Vec::new();
+    for e in events {
+        match e.kind {
+            EventKind::ItemServed | EventKind::GateRefused | EventKind::GateStoodAside => {
+                let body = serde_json::from_str::<serde_json::Value>(&e.body).unwrap_or(serde_json::Value::Null);
+                let at = body.get("served_at").or_else(|| body.get("at")).and_then(|v| v.as_str());
+                if let Some(t) = at.and_then(serve::time::unix_from_iso8601) {
+                    last_at = Some(t);
+                }
+            }
+            EventKind::FactCreated | EventKind::FactRevised | EventKind::FactResolved => {
+                let Ok(item) = model::store::parse_body(&e.body) else { continue };
+                let before = last_kind.insert(e.entity_id.as_str(), item.kind);
+                let was_rule = before.is_some_and(|k| k.can_fire());
+                if e.kind == EventKind::FactRevised && was_rule && !item.kind.can_fire() {
+                    let reason = item
+                        .tags
+                        .iter()
+                        .find_map(|t| t.strip_prefix("archived:"))
+                        .map(|r| format!("archived: {r}"))
+                        .or_else(|| {
+                            serde_json::from_str::<serde_json::Value>(&e.body)
+                                .ok()
+                                .and_then(|v| v.get("because").and_then(|b| b.as_str()).map(|b| format!("because: {b}")))
+                        })
+                        .unwrap_or_else(|| "no reason recorded".to_string());
+                    out.push((e.seq, format!("{} - kind changed to a report at log seq {} ({reason}; door: {})", e.entity_id, e.seq, e.actor)));
+                }
+            }
+            EventKind::FactRetracted => {
+                let was_rule = last_kind.remove(e.entity_id.as_str()).is_some_and(|k| k.can_fire());
+                if was_rule {
+                    let reason = serde_json::from_str::<serde_json::Value>(&e.body)
+                        .ok()
+                        .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(str::to_string))
+                        .unwrap_or_else(|| "no reason recorded".to_string());
+                    out.push((e.seq, format!("{} - retracted at log seq {} (reason: {reason}; door: {})", e.entity_id, e.seq, e.actor)));
+                }
+            }
+            _ => continue,
+        }
+        if matches!(e.kind, EventKind::FactRevised | EventKind::FactRetracted) {
+            if let (Some((seq, _)), Some(at)) = (out.last(), last_at) {
+                if *seq == e.seq && now - at > TAKEN_OFF_DAYS * 86_400 {
+                    out.pop();
+                }
+            }
+        }
+    }
+    out.reverse();
+    out.into_iter().map(|(_, line)| line).collect()
+}
+
+/// R7: a write THOR's trial refused because a tooth it built from the text
+/// bites (a `teeth-write` refusal with code `forcing`), after which the same
+/// id was stored as a note whose text no longer names that tooth's literal -
+/// "<id>: refused with <tooth> at log seq N, then stored as a note that no
+/// longer names it". Information for the reader, never a verdict on the
+/// writer. One line per id, from its latest such refusal.
+fn reworded_after_a_refusal(store: &EventStore, events: &[Event]) -> Vec<String> {
+    use thor_core::event_store::EventKind;
+    let mut latest: std::collections::BTreeMap<&str, (i64, String)> = Default::default();
+    for e in events.iter().filter(|e| e.kind == EventKind::GateRefused && e.actor == model::store::TEETH_WRITE_ACTOR) {
+        let Ok(body) = serde_json::from_str::<serde_json::Value>(&e.body) else { continue };
+        if body.get("code").and_then(|c| c.as_str()) != Some("forcing") {
+            continue;
+        }
+        let Some(tooth) = body.get("forcing").and_then(|f| f.as_array()).and_then(|f| f.first()).and_then(|t| t.as_str()) else {
+            continue;
+        };
+        latest.insert(e.entity_id.as_str(), (e.seq, tooth.to_string()));
+    }
+    let mut out = Vec::new();
+    for (id, (seq, tooth)) in latest {
+        let Ok(item) = model::store::show(store, id) else { continue };
+        if model::store::current_verdict(store, id) != model::store::CurrentVerdict::Note {
+            continue;
+        }
+        // "forbidden '--force' on 'git push' refuses ..." -> the tooth, and
+        // its literal (the first quoted span).
+        let named = tooth.split(" refuses ").next().unwrap_or(&tooth).to_string();
+        let Some(literal) = named.split('\'').nth(1) else { continue };
+        if model::gate::literal_is_named(&item.text, literal) {
+            continue;
+        }
+        out.push(format!("{id}: refused with {named} at log seq {seq}, then stored as a note that no longer names it"));
+    }
+    out
 }
 
 /// What the only maintenance loop in this system almost never looks at.
@@ -2056,6 +2416,7 @@ pub fn report(
     // `ship_line`'s own doc comment for why "never shipped" is not itself a
     // finding worth a permanent line.
     lines.extend(ship_line(db));
+    lines.extend(drain_refusals_line(db));
     lines.extend([
         falsifier_line(db),
         proof_line(db, full),
@@ -2068,6 +2429,7 @@ pub fn report(
         semantic_line(model_dir),
         orphan_projects_line(db, checkouts),
     ]);
+    lines.extend(working_copy_lines(db));
     // Silent unless something is actually owed - see `judgement_debt_line`'s
     // own doc comment for why this exists alongside `unjudged_line` above
     // rather than in place of it. `full` also lifts its named-items cap, the
@@ -2241,9 +2603,9 @@ mod tests {
         drop(s);
 
         let line = evaluation_batch_line(&db, Some("proj"), true).expect("rules are owed");
-        assert_eq!(number_before(&line, " heavy rule(s) - its batch"), store::EVALUATION_TEETH_BATCH, "{line}");
+        assert_eq!(number_before(&line, " rule(s) - its batch"), store::EVALUATION_TEETH_BATCH, "{line}");
         assert_eq!(line.matches("\n  batch: ").count(), store::EVALUATION_TEETH_BATCH, "{line}");
-        assert_eq!(number_before(&line, " more heavy rule(s)"), 3, "{line}");
+        assert_eq!(number_before(&line, " more rule(s)"), 3, "{line}");
         assert_eq!(line.matches("\n  owed later: ").count(), 3, "{line}");
         assert!(evaluation_batch_line(&db, None, true).is_none(), "no project, no report to file, no line");
     }
@@ -3275,7 +3637,7 @@ mod tests {
             a.text = "the style guide must exist at STYLE.md".to_string();
             a.project = Some("Real-Repo".to_string());
             a.check = Some(Check::PathExists { path: "STYLE.md".to_string() });
-            store::declare(&mut s, "s", "l", "a", &a).unwrap();
+            legacy_declare(&mut s, &a);
 
             let mut b = rule("style-guide-carries-the-marker");
             b.text = "the style guide names the MARKER_TOKEN convention".to_string();
@@ -3511,10 +3873,10 @@ mod tests {
 
             let mut reaches = rule("forbidden-and-pinned");
             reaches.check = Some(model::item::Check::Forbidden { literals: vec!["\u{2014}".to_string()] });
-            store::declare(&mut s, "s", "l", "a", &reaches).unwrap();
+            legacy_declare(&mut s, &reaches);
 
             let mut cannot = rule("forbidden-but-not-pinned");
-            cannot.text = "a webhook retry backs off before it gives up entirely".to_string();
+            cannot.text = "a webhook retry backs off before it gives up entirely, and its log never carries U+2014".to_string();
             cannot.project = Some("fixture-project".to_string());
             cannot.bindings = vec![model::item::Binding::Target {
                 kind: model::item::TargetKind::Path,
@@ -3559,7 +3921,7 @@ mod tests {
                 when: "Agent".to_string(),
                 required: vec!["haiku".to_string(), "sonnet".to_string()],
             });
-            store::declare(&mut s, "s", "l", "a", &reaches).unwrap();
+            legacy_declare(&mut s, &reaches);
 
             let mut cannot = rule("requires-bound-to-a-path");
             cannot.text = "a webhook retry backs off before it gives up entirely".to_string();
@@ -3790,20 +4152,17 @@ mod tests {
 
             let mut heavy_prose = rule("heavy-but-toothless");
             heavy_prose.severity = Some(model::item::Severity::Irreversible);
-            // Since gate ground 11 this is the only way a heavy rule carries no
-            // check: asked, and the answer was that there is nothing to catch.
-            heavy_prose.tags = vec![format!("{}a test fixture where 'the same call' is also the legitimate one", store::NO_LITERAL_REASON_PREFIX)];
             store::declare(&mut s, "s", "l", "a", &heavy_prose).unwrap();
 
             let mut heavy_armed = rule("heavy-and-armed");
             heavy_armed.text = "a webhook retry backs off before it gives up entirely".to_string();
             heavy_armed.severity = Some(model::item::Severity::Costly);
             heavy_armed.check = Some(model::item::Check::Forbidden { literals: vec!["\u{2014}".to_string()] });
-            store::declare(&mut s, "s", "l", "a", &heavy_armed).unwrap();
+            legacy_declare(&mut s, &heavy_armed);
 
             // Light and armed: counted by proof_line, never by this line.
             let mut light_armed = rule("light-and-armed");
-            light_armed.text = "the estimator rounds a quote up to whole cents".to_string();
+            light_armed.text = "the estimator rounds a quote up to whole cents and never prints U+2026".to_string();
             light_armed.check = Some(model::item::Check::Forbidden { literals: vec!["\u{2026}".to_string()] });
             store::declare(&mut s, "s", "l", "a", &light_armed).unwrap();
         }
@@ -3812,19 +4171,20 @@ mod tests {
         assert!(line.contains("the other 1 can only inform"), "{line}");
     }
 
-    /// THE TWO NUMBERS (2026-09-26), judged now against the log and never
-    /// read off a label: a heavy rule whose check the real hook refused a real
-    /// call under counts as really refusing; a PROVEN label with nothing on
-    /// record does not (it may predate the rule that proof comes from
-    /// reality); a heavy rule with a reason that names its own trigger counts
-    /// as an honest "it cannot"; a thin reason counts as neither.
+    /// Step 9 (A7, K6, EV B7): the field column counts only what passes
+    /// `serve::attest::is_field_refusal` - a refusal of the hook in a Claude
+    /// Code session whose transcript holds the call and its block - and
+    /// every other refusal is counted apart, sorted by why. A label, a
+    /// reason and a note never count as a refusal.
     #[test]
-    fn teeth_line_counts_real_refusals_and_real_reasons_never_labels() {
+    fn teeth_line_counts_probe_and_hand_fed_refusals_apart() {
         let dir = tempfile::tempdir().unwrap();
+        let transcripts = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
         {
             let mut s = EventStore::new(&db).unwrap();
             let mut bitten = rule("bitten-fixture");
+            bitten.text = "never run git push with --force".to_string();
             bitten.severity = Some(model::item::Severity::Irreversible);
             bitten.bindings = vec![model::item::Binding::Target {
                 kind: model::item::TargetKind::Command,
@@ -3832,83 +4192,241 @@ mod tests {
             }];
             bitten.check = Some(model::item::Check::Forbidden { literals: vec!["--force".to_string()] });
             legacy_declare(&mut s, &bitten);
-            serve::deliver::record_gate_outcome(&mut s, "s", "l", "hook", "2026-09-26T00:00:00Z", true, "bitten-fixture", "git push --force origin main");
-
+            serve::attest::fixture::field_refusal(
+                &mut s,
+                transcripts.path(),
+                "0de7dc52-1b97-4b66-948f-61e4438043b2",
+                "bitten-fixture",
+                "toolu_bitten",
+                "Bash",
+                serde_json::json!({"command": "git push --force origin main"}),
+                "git push --force origin main",
+            );
             let mut labelled = bitten.clone();
             labelled.id = "labelled-only-fixture".to_string();
             labelled.tags = vec![store::TEETH_PROVEN_TAG.to_string()];
             legacy_declare(&mut s, &labelled);
-
-            let mut honest = rule("honest-no-fixture");
-            honest.severity = Some(model::item::Severity::Costly);
-            honest.tags = vec![format!("{}an authorised 'git push origin main' reads the same", store::NO_LITERAL_REASON_PREFIX)];
-            // The reason counts only after a real try (2026-09-26): the
-            // history shows a check attached once, then given up for it.
-            let mut tried = honest.clone();
-            tried.check = Some(model::item::Check::Forbidden { literals: vec!["git push origin main".to_string()] });
-            legacy_declare(&mut s, &tried);
-            let body = serde_json::to_string(&honest).unwrap();
-            s.append_mutate_checked("legacy", "honest-no-fixture", "migration", thor_core::event_store::EventKind::FactRevised, "honest-no-fixture", None, &body)
+            // A hand-fed refusal from a session that is not a Claude Code
+            // session, and one of the retired probe: never counted.
+            serve::deliver::record_delivery(&mut s, "probe-1", "probe-1", "hook", "2026-09-29T00:00:00Z", &["labelled-only-fixture".to_string()]);
+            serve::deliver::record_gate_outcome(&mut s, "probe-1", "probe-1", "hook", "2026-09-29T00:00:01Z", true, "labelled-only-fixture", "git push --force origin main");
+            s.append_event("cli", "cli", store::TEETH_PROBE_ACTOR, EventKind::GateRefused, "labelled-only-fixture", None, "{\"forbidden_holds\":true,\"clean_holds\":true}")
                 .unwrap();
-
-            let mut thin = rule("thin-fixture");
-            thin.severity = Some(model::item::Severity::Costly);
-            thin.tags = vec![format!("{}this is a judgement rule and not a fixed text", store::NO_LITERAL_REASON_PREFIX)];
-            legacy_declare(&mut s, &thin);
+            // An old refusal from a Claude Code session, recorded before THOR
+            // kept a tool call id: it can never be checked, so it never counts.
+            serve::deliver::record_gate_outcome(&mut s, "0de7dc52-1b97-4b66-948f-61e4438043b2", "l", "hook", "2026-09-20T00:00:00Z", true, "labelled-only-fixture", "git push --force origin main");
         }
         let line = teeth_line(&db, true);
-        assert!(line.contains("of 4 heavy rule(s): 1 have really refused something"), "{line}");
-        assert!(line.contains("1 carry a reason, checkable against the rule"), "{line}");
-        assert!(line.contains("the other 2 have neither"), "{line}");
+        assert!(line.contains("1 rule(s) of any weight hold a field refusal"), "{line}");
+        assert!(line.contains("teeth refusals: 1 of 4 refusal(s) on the log count as field evidence; the other 3 never count"), "{line}");
+        assert!(line.contains("1 old refusal(s) carry no tool call id and can never be checked"), "{line}");
+        assert!(line.contains("1 refusal from a session that is not a Claude Code session (probe-1) - not counted"), "{line}");
+        assert!(line.contains("1 by teeth-probe"), "{line}");
+        // Red half: without the transcript's verdict the same refusal is no
+        // field evidence at all.
+        let dir2 = tempfile::tempdir().unwrap();
+        let db2 = dir2.path().join("t.db");
+        {
+            let mut s = EventStore::new(&db2).unwrap();
+            let mut bitten = rule("bitten-fixture");
+            bitten.text = "never run git push with --force".to_string();
+            bitten.bindings = vec![model::item::Binding::Target {
+                kind: model::item::TargetKind::Command,
+                value: "git push".to_string(),
+            }];
+            bitten.check = Some(model::item::Check::Forbidden { literals: vec!["--force".to_string()] });
+            legacy_declare(&mut s, &bitten);
+            serve::deliver::record_delivery(&mut s, "0de7dc52-1b97-4b66-948f-61e4438043b2", "l", "hook", "2026-09-29T00:00:00Z", &["bitten-fixture".to_string()]);
+            serve::deliver::record_gate_outcome_for_call(&mut s, "0de7dc52-1b97-4b66-948f-61e4438043b2", "l", "hook", "2026-09-29T00:00:01Z", true, "bitten-fixture", "git push --force origin main", Some("toolu_x"));
+        }
+        let line = teeth_line(&db2, true);
+        assert!(line.contains("0 rule(s) of any weight hold a field refusal"), "{line}");
+        assert!(line.contains("1 rule(s) pass the structural part alone"), "{line}");
+        assert!(line.contains("1 refusal(s) not verified yet"), "{line}");
     }
 
-    /// CHANGE 2's TWO-SIDED extension: the write-time sentence must show all
-    /// five categories separately - proven, refuses legitimate use too,
-    /// anchor collapsed, informing only, never tested - and the two new
-    /// dangerous ones must be NAMED, not just counted, the same standard
-    /// `toothless` already meets.
+    /// Step 9: the ROT line - every live rule and orientation without a
+    /// current verdict, whatever its weight (D8), its heavy subset beside the
+    /// plan's starting line, and the A4-only share with its drain estimate -
+    /// and the verdict line, read through `model::store::settlement`. A
+    /// rewrite by a bin leaves the rule undecided, with the reason named.
     #[test]
-    fn teeth_line_shows_all_five_teeth_categories_separately_and_names_the_two_new_ones() {
+    fn teeth_line_counts_rot_and_verdicts_through_the_one_reader() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
         {
             let mut s = EventStore::new(&db).unwrap();
-
-            let mut proven = rule("proven-fixture");
-            proven.severity = Some(model::item::Severity::Irreversible);
-            proven.check = Some(model::item::Check::Forbidden { literals: vec!["--force".to_string()] });
-            proven.tags = vec![store::TEETH_PROVEN_TAG.to_string()];
-            legacy_declare(&mut s, &proven);
-
-            let mut refuses = rule("refuses-legit-fixture");
-            refuses.severity = Some(model::item::Severity::Costly);
-            refuses.check = Some(model::item::Check::Forbidden { literals: vec!["--force".to_string()] });
-            refuses.tags = vec![store::TEETH_REFUSES_LEGITIMATE_TAG.to_string()];
-            legacy_declare(&mut s, &refuses);
-
-            let mut collapsed = rule("collapsed-fixture");
-            collapsed.severity = Some(model::item::Severity::Irreversible);
-            collapsed.check = Some(model::item::Check::Forbidden { literals: vec!["--force".to_string()] });
-            collapsed.tags = vec![store::TEETH_ANCHOR_COLLAPSED_TAG.to_string()];
-            legacy_declare(&mut s, &collapsed);
-
-            let mut informing = rule("informing-fixture");
-            informing.severity = Some(model::item::Severity::Costly);
-            informing.tags = vec![store::TEETH_INFORMING_TAG.to_string()];
-            legacy_declare(&mut s, &informing);
-
-            let mut never_tested = rule("never-tested-fixture");
-            never_tested.severity = Some(model::item::Severity::Irreversible);
-            legacy_declare(&mut s, &never_tested);
+            let mut heavy = rule("heavy-owed");
+            heavy.severity = Some(model::item::Severity::Irreversible);
+            legacy_declare(&mut s, &heavy);
+            legacy_declare(&mut s, &rule("light-owed"));
+            let mut a4 = rule("a4-owed");
+            a4.bindings = vec![model::item::Binding::Target { kind: model::item::TargetKind::Command, value: "git push".to_string() }];
+            a4.check = Some(model::item::Check::Forbidden { literals: vec!["--mirr0r-zz".to_string()] });
+            legacy_declare(&mut s, &a4);
+            legacy_declare(&mut s, &rule("noted"));
+            serve::teeth::fixture::decide(&mut s, "noted");
+            legacy_declare(&mut s, &rule("rewritten"));
+            serve::teeth::fixture::decide(&mut s, "rewritten");
+            let existing = store::show(&s, "rewritten").unwrap();
+            let mut rewritten = existing.clone();
+            rewritten.text = format!("{} - reworded by a bin", existing.text);
+            store::revise(&mut s, "s", "l", "a", &existing, &rewritten).unwrap();
         }
         let line = teeth_line(&db, true);
-        assert!(line.contains("1 proven against reality"), "{line}");
-        assert!(line.contains("1 refuse legitimate use too"), "{line}");
-        assert!(line.contains("1 have an anchor that already contains"), "{line}");
-        assert!(line.contains("1 were tried and are confirmed toothless"), "{line}");
-        assert!(line.contains("remaining 1 predate"), "{line}");
-        assert!(line.contains("  refuses-legitimate-use: refuses-legit-fixture"), "{line}");
-        assert!(line.contains("  anchor-collapsed: collapsed-fixture"), "{line}");
+        assert!(line.contains("teeth rot: 4 live rule(s) and orientation(s) have no current verdict"), "{line}");
+        assert!(line.contains("1 of them heavy (the plan's starting line: 306 heavy, 171 with neither)"), "{line}");
+        assert!(line.contains("1 of them owe only the A4 naming fix (at 16 per evaluation: 1 evaluation(s))"), "{line}");
+        assert!(line.contains("teeth verdicts: 0 proven and 0 wired on the rule track; 1 note(s)"), "{line}");
+        assert!(line.contains("  undecided: rewritten [global] its text changed after its last trial"), "{line}");
+        assert!(!line.contains("honest_no"), "{line}");
+    }
+
+    /// Step 9: rules settled only by a machine blocker are listed per project
+    /// and blocker, and never counted as rot.
+    #[test]
+    fn teeth_line_lists_blocked_rules_per_project_and_blocker() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut s = EventStore::new(&db).unwrap();
+            let mut gamma = rule("gamma-keeps");
+            gamma.text = "NOTES.md must keep the line `keep me`.".to_string();
+            gamma.project = Some("gamma".to_string());
+            gamma.bindings = vec![model::item::Binding::Target { kind: model::item::TargetKind::Path, value: "NOTES.md".to_string() }];
+            gamma.check = Some(model::item::Check::Contains { path: "NOTES.md".to_string(), literal: "keep me".to_string() });
+            legacy_declare(&mut s, &gamma);
+        }
+        let line = teeth_line(&db, true);
+        assert!(line.contains("  blocked: gamma - no registered working copy: gamma-keeps"), "{line}");
+        assert!(line.contains("teeth rot: 0 live rule(s)"), "{line}");
+    }
+
+    /// Q24: an old contains check THOR's retest counted as a tooth although
+    /// its text does not name the literal is named on its own line, with the
+    /// fragment it guards and the recorded cutoff - for the owner to judge.
+    #[test]
+    fn teeth_line_names_old_contains_checks_with_the_fragment_they_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let beta = dir.path().join("beta");
+        let hooks = dir.path().join("no-hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        std::fs::create_dir_all(&beta).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git").arg("-C").arg(&beta).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "--quiet"]);
+        git(&["config", "core.hooksPath", &hooks.display().to_string()]);
+        git(&["config", "user.email", "fixture@example.invalid"]);
+        git(&["config", "user.name", "fixture"]);
+        std::fs::write(beta.join(".thor-project"), "beta\n").unwrap();
+        std::fs::write(beta.join("NOTES.md"), "keep me\nplain line\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "--quiet", "-m", "initial"]);
+        {
+            let mut s = EventStore::new(&db).unwrap();
+            crate::install::register_root(&mut s, &beta, "beta", None).unwrap();
+            let mut old = rule("old-keeps");
+            old.text = "NOTES.md keeps its opening line.".to_string();
+            old.project = Some("beta".to_string());
+            old.bindings = vec![model::item::Binding::Target { kind: model::item::TargetKind::Path, value: "NOTES.md".to_string() }];
+            old.check = Some(model::item::Check::Contains { path: "NOTES.md".to_string(), literal: "keep me".to_string() });
+            legacy_declare(&mut s, &old);
+            serve::teeth::fixture::decide(&mut s, "old-keeps");
+        }
+        let cutoff = model::store::a4_cutoff(&EventStore::open_existing(&db).unwrap()).expect("the retest recorded the cutoff");
+        let line = teeth_line(&db, true);
+        assert!(line.contains("teeth rot: 0 live rule(s)"), "{line}");
+        assert!(line.contains("teeth old contains (Q24): 1 rule(s) on the rule track"), "{line}");
+        assert!(line.contains(&format!("the A4 cutoff is log seq {cutoff}, recorded once and never moved")), "{line}");
+        assert!(
+            line.contains("  old contains, text does not name it: old-keeps [beta] it guards 'keep me' in NOTES.md (its check was set at log seq"),
+            "{line}"
+        );
+    }
+
+    /// Step 9 (R7): refused because a tooth THOR built from the text bites,
+    /// then stored as a note whose text no longer names it - the reword line;
+    /// and a rule taken off the rule track, with its reason and door.
+    #[test]
+    fn teeth_line_names_a_reword_after_a_refusal_and_a_rule_taken_off_the_track() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut s = EventStore::new(&db).unwrap();
+            let body = serde_json::json!({
+                "id": "force-push",
+                "code": "forcing",
+                "forcing": ["forbidden '--force' on 'git push' refuses 'git push --force' and lets 'git push' through"],
+                "text_sha": "x",
+            })
+            .to_string();
+            s.append_event("s", "s", store::TEETH_WRITE_ACTOR, EventKind::GateRefused, "force-push", None, &body).unwrap();
+            let mut noted = rule("force-push");
+            noted.text = "Never rewrite shared history.".to_string();
+            legacy_declare(&mut s, &noted);
+            serve::teeth::fixture::decide(&mut s, "force-push");
+            legacy_declare(&mut s, &rule("gone-rule"));
+            s.append_event("s", "s", "mcp", EventKind::ItemServed, "gone-rule", None, "{\"served_at\":\"2999-01-01T00:00:00Z\"}").unwrap();
+            store::retract(&mut s, "s", "l", "mcp", "gone-rule", "the thing it named was removed").unwrap();
+        }
+        let line = teeth_line(&db, true);
+        assert!(
+            line.contains("force-push: refused with forbidden '--force' on 'git push' at log seq 1, then stored as a note that no longer names it"),
+            "{line}"
+        );
+        assert!(line.contains("  taken off the rule track: gone-rule - retracted at log seq"), "{line}");
+        assert!(line.contains("(reason: the thing it named was removed; door: mcp)"), "{line}");
+
+        // Green: a refused write followed by one that hangs the named tooth
+        // is on the rule track - no reword line.
+        let dir2 = tempfile::tempdir().unwrap();
+        let db2 = dir2.path().join("t.db");
+        {
+            let mut s = EventStore::new(&db2).unwrap();
+            let body = serde_json::json!({
+                "id": "force-push",
+                "code": "forcing",
+                "forcing": ["forbidden '--force' on 'git push' refuses 'git push --force' and lets 'git push' through"],
+                "text_sha": "x",
+            })
+            .to_string();
+            s.append_event("s", "s", store::TEETH_WRITE_ACTOR, EventKind::GateRefused, "force-push", None, &body).unwrap();
+            let mut hung = rule("force-push");
+            hung.text = "Never run `git push --force` on main.".to_string();
+            hung.bindings = vec![model::item::Binding::Target { kind: model::item::TargetKind::Command, value: "git push".to_string() }];
+            hung.check = Some(model::item::Check::Forbidden { literals: vec!["--force".to_string()] });
+            legacy_declare(&mut s, &hung);
+            serve::teeth::fixture::decide(&mut s, "force-push");
+        }
+        let line = teeth_line(&db2, true);
+        assert!(!line.contains("reworded:"), "{line}");
+
+        // Green too: stored on the rule track with another tooth, whose text
+        // does not name '--force' either - a rule, never "stored as a note".
+        let dir3 = tempfile::tempdir().unwrap();
+        let db3 = dir3.path().join("t.db");
+        {
+            let mut s = EventStore::new(&db3).unwrap();
+            let body = serde_json::json!({
+                "id": "force-push",
+                "code": "forcing",
+                "forcing": ["forbidden '--force' on 'git push' refuses 'git push --force' and lets 'git push' through"],
+                "text_sha": "x",
+            })
+            .to_string();
+            s.append_event("s", "s", store::TEETH_WRITE_ACTOR, EventKind::GateRefused, "force-push", None, &body).unwrap();
+            let mut other = rule("force-push");
+            other.text = "Never run `git push --mirror` on main.".to_string();
+            other.bindings = vec![model::item::Binding::Target { kind: model::item::TargetKind::Command, value: "git push".to_string() }];
+            other.check = Some(model::item::Check::Forbidden { literals: vec!["--mirror".to_string()] });
+            legacy_declare(&mut s, &other);
+            serve::teeth::fixture::decide(&mut s, "force-push");
+        }
+        let line = teeth_line(&db3, true);
+        assert!(!line.contains("reworded:"), "{line}");
     }
 
     /// THE ORDERING THIS ENFORCES: heaviest severity first (`model::item::
@@ -4145,11 +4663,12 @@ mod tests {
         let db = dir.path().join("t.db");
         EventStore::new(&db).unwrap();
         let lines = report(&db, None, None, None, None, None, false, None);
-        // 14, not 13: `wal_line` stays silent on a fresh store (see its own
-        // doc comment - it never contributes a line unless the WAL has
-        // actually outgrown both the 64 MB floor and the store itself), but
-        // `dead_moment_bindings_line` always says something, "none" included.
-        assert_eq!(lines.len(), 14);
+        // 15: `wal_line` stays silent on a fresh store (see its own doc
+        // comment - it never contributes a line unless the WAL has actually
+        // outgrown both the 64 MB floor and the store itself), but
+        // `dead_moment_bindings_line` always says something, "none" included,
+        // and so does `working_copy_lines`.
+        assert_eq!(lines.len(), 15);
         assert!(lines[0].starts_with("memory store:"));
         assert!(lines[1].starts_with("dead moments:"));
         assert!(lines[2].starts_with("code index:"));
@@ -4169,6 +4688,65 @@ mod tests {
         assert!(lines[11].starts_with("unjudged:"));
         assert!(lines[12].starts_with("semantic search:"));
         assert!(lines[13].starts_with("project keys:"));
+        assert!(lines[14].starts_with("working copies:"));
+    }
+
+    /// Every registration is listed, with its date and where it moved from;
+    /// a registration that can no longer be used says why; and the projects
+    /// that own rules but have no registered working copy are named with the
+    /// command that registers one, carrying `--db` (F7).
+    #[test]
+    fn doctor_lists_every_working_copy_and_the_projects_without_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        EventStore::new(&db).unwrap();
+        let hooks = dir.path().join("no-hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let checkout = |path: &Path, key: &str| {
+            let git = |args: &[&str]| {
+                let out = std::process::Command::new("git").arg("-C").arg(path).args(args).output().unwrap();
+                assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            };
+            std::fs::create_dir_all(path).unwrap();
+            git(&["init", "--quiet"]);
+            git(&["config", "core.hooksPath", &hooks.display().to_string()]);
+            git(&["config", "user.email", "fixture@example.invalid"]);
+            git(&["config", "user.name", "fixture"]);
+            std::fs::write(path.join(".thor-project"), format!("{key}\n")).unwrap();
+            git(&["add", "-A"]);
+            git(&["commit", "--quiet", "-m", "initial"]);
+        };
+        let alpha = dir.path().join("alpha");
+        checkout(&alpha, "alpha");
+        let beta = dir.path().join("beta");
+        checkout(&beta, "beta");
+        {
+            let mut s = EventStore::new(&db).unwrap();
+            crate::install::register_root(&mut s, &alpha, "alpha", None).unwrap();
+            crate::install::register_root(&mut s, &beta, "beta", None).unwrap();
+            let mut owned = rule("gamma-rule");
+            owned.project = Some("gamma".to_string());
+            store::declare(&mut s, "s", "l", "a", &owned).unwrap();
+        }
+        let moved = dir.path().join("beta-moved");
+        std::fs::rename(&beta, &moved).unwrap();
+        {
+            let mut s = EventStore::new(&db).unwrap();
+            crate::install::register_root(&mut s, &moved, "beta", None).unwrap();
+        }
+        std::fs::write(alpha.join(".thor-project"), "renamed\n").unwrap();
+
+        let lines = working_copy_lines(&db);
+        let slash = |p: &Path| p.display().to_string().replace('\\', "/");
+        let alpha_line = lines.iter().find(|l| l.starts_with("working copy: alpha ->")).expect("alpha is listed");
+        assert!(alpha_line.contains(&slash(&alpha)), "{alpha_line}");
+        assert!(alpha_line.contains("NOT USABLE") && alpha_line.contains("resolves to project 'renamed'"), "{alpha_line}");
+        let beta_line = lines.iter().find(|l| l.starts_with("working copy: beta ->")).expect("beta is listed");
+        assert!(beta_line.starts_with(&format!("working copy: beta -> {} (registered ", slash(&moved))), "{beta_line}");
+        assert!(beta_line.ends_with(&format!("), moved from {}", slash(&beta))), "{beta_line}");
+        let missing = lines.iter().find(|l| l.starts_with("working copies:")).expect("the unregistered line");
+        assert!(missing.contains("1 project(s) own rules but have no registered working copy: gamma (1 rule(s))"), "{missing}");
+        assert!(missing.contains(&format!("--register-root --db \"{}\"", db.display())), "{missing}");
     }
 
     /// THE DEFECT THIS PREVENTS: a health line that goes quiet exactly when it
@@ -4412,7 +4990,7 @@ mod tests {
             item.project = Some("Real-Repo".to_string());
             item.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "code.js".to_string() }];
             item.check = Some(model::item::Check::Contains { path: "code.js".to_string(), literal: "res.ok".to_string() });
-            store::declare(&mut s, "s", "l", "a", &item).unwrap();
+            legacy_declare(&mut s, &item);
         }
         assert_eq!(gate_verdict(&db, Some(&scratch), None), GateVerdict::Clean, "judged on main, where it holds");
     }
@@ -4452,7 +5030,7 @@ mod tests {
             let mut item = rule("false-proof-1");
             item.project = Some("Real-Repo".to_string());
             item.check = Some(Check::PathExists { path: "missing.txt".to_string() });
-            store::declare(&mut s, "s", "l", "a", &item).unwrap();
+            legacy_declare(&mut s, &item);
         }
         assert_eq!(gate_verdict(&db, Some(&checkouts), None), GateVerdict::Failing);
     }

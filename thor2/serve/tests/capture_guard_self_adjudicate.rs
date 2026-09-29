@@ -164,6 +164,10 @@ fn a_paid_debt_never_blocks_even_in_self_adjudicate_mode() {
             check: None,
         };
         model::store::declare(&mut store, "s1", "s1", "assistant", &item).unwrap();
+        // Settled by THOR's trial (a note), so the teeth question - which
+        // since step 9 asks about every rule without a verdict, whatever its
+        // weight - is not what this test hears.
+        serve::teeth::fixture::decide(&mut store, &item.id);
     }
 
     let stop_out = run_hook(&db, &stop_payload("s1"));

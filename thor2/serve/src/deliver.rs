@@ -112,7 +112,30 @@ pub fn record_gate_outcome(
     entity_id: &str,
     target: &str,
 ) {
-    let body = match serde_json::to_string(&serde_json::json!({ "at": at, "target": target })) {
+    record_gate_outcome_for_call(store, session_id, lineage_id, actor, at, refused, entity_id, target, None);
+}
+
+/// `record_gate_outcome`, also carrying the id of the tool call the outcome
+/// was about (`tool_use_id` in the hook's payload), so the call can later be
+/// found in the session's own transcript (`serve::attest`). A refusal with no
+/// id can never be checked there, and is never counted as field evidence.
+#[allow(clippy::too_many_arguments)]
+pub fn record_gate_outcome_for_call(
+    store: &mut EventStore,
+    session_id: &str,
+    lineage_id: &str,
+    actor: &str,
+    at: &str,
+    refused: bool,
+    entity_id: &str,
+    target: &str,
+    tool_use_id: Option<&str>,
+) {
+    let mut body = serde_json::json!({ "at": at, "target": target });
+    if let Some(id) = tool_use_id.filter(|id| !id.trim().is_empty()) {
+        body["tool_use_id"] = serde_json::Value::String(id.to_string());
+    }
+    let body = match serde_json::to_string(&body) {
         Ok(b) => b,
         Err(_) => return,
     };

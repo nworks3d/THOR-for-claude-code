@@ -96,7 +96,7 @@ fn fixture_with_em_dash_rule(dir: &Path) -> std::path::PathBuf {
         falsifier: Some("an em dash lands in NOTES.md and nobody notices".to_string()),
         check: Some(model::item::Check::Absent { path: "NOTES.md".to_string(), literal: "\u{2014}".to_string() }),
     };
-    model::store::declare(&mut store, "s", "l", "a", &item).unwrap();
+    model::store::declare(&mut store, "s", "l", "a", &named(&item)).unwrap();
     db
 }
 
@@ -269,6 +269,222 @@ fn a_write_with_no_forbidden_character_is_never_blocked() {
     assert_not_blocked(&out);
 }
 
+// ------------------------------------------- a session in a subfolder
+//
+// Check paths resolve against the top of the checkout the session works in
+// (`project::checkout_top`), never against the folder it happens to stand in.
+// MEASURED before the change (PR, re-run by FE as H10): a rule requiring a line
+// to stay in the checkout's NOTES.md let an Edit remove it when the payload's
+// cwd was a subfolder - the check path resolved to `<checkout>/sub/NOTES.md`,
+// which does not exist.
+
+/// A checkout at `dir/real` (a `.git` folder and a marker naming `demo`), an
+/// empty subfolder `sub`, and a store beside it holding one `demo` rule that
+/// requires 'keep this line' to stay in NOTES.md.
+fn checkout_with_required_line(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let real = dir.join("real");
+    std::fs::create_dir_all(real.join(".git")).unwrap();
+    std::fs::create_dir_all(real.join("sub")).unwrap();
+    std::fs::write(real.join(".thor-project"), "demo\n").unwrap();
+    std::fs::write(real.join("NOTES.md"), "hello world\nkeep this line\n").unwrap();
+    let db = dir.join("thor.db");
+    let mut store = thor_core::event_store::EventStore::new(&db).unwrap();
+    let item = model::item::Item {
+        id: "c-path".to_string(),
+        kind: model::item::Kind::Rule,
+        text: "NOTES.md must keep the line keep this line".to_string(),
+        bindings: vec![model::item::Binding::Target {
+            kind: model::item::TargetKind::Path,
+            value: "NOTES.md".to_string(),
+        }],
+        severity: Some(model::item::Severity::Irreversible),
+        project: Some("demo".to_string()),
+        tags: vec![],
+        expires: None,
+        key: None,
+        falsifier: Some("The line may go.".to_string()),
+        check: Some(model::item::Check::Contains { path: "NOTES.md".to_string(), literal: "keep this line".to_string() }),
+    };
+    model::store::declare(&mut store, "s", "l", "a", &named(&item)).unwrap();
+    (db, real)
+}
+
+#[test]
+fn a_session_in_a_subfolder_still_refuses_losing_a_required_literal() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, real) = checkout_with_required_line(dir.path());
+    let notes = real.join("NOTES.md");
+    let sub = real.join("sub");
+
+    let out = run_hook(&db, &edit_payload("s1", &sub, &notes, "keep this line\n", ""));
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("expected a decision JSON: {e}: {out}"));
+    assert_eq!(v["decision"], "block", "removing the line from a subfolder must be refused: {out}");
+    assert!(
+        v["reason"].as_str().unwrap().starts_with("[THOR] rule c-path requires this to stay in NOTES.md"),
+        "{out}"
+    );
+
+    // The same refusal from the top of the checkout, as before.
+    let out = run_hook(&db, &edit_payload("s1", &real, &notes, "keep this line\n", ""));
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("expected a decision JSON: {e}: {out}"));
+    assert_eq!(v["decision"], "block", "{out}");
+
+    // An edit that keeps the line passes from the subfolder too.
+    assert_not_blocked(&run_hook(&db, &edit_payload("s1", &sub, &notes, "keep this line\n", "keep this line\n\n")));
+}
+
+/// A RELATIVE file path in a Write is relative to where the session stands:
+/// from `sub`, `NOTES.md` is `sub/NOTES.md` (no rule there) and `../NOTES.md`
+/// is the guarded file.
+#[test]
+fn a_relative_write_from_a_subfolder_is_judged_against_the_file_it_really_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, real) = checkout_with_required_line(dir.path());
+    let sub = real.join("sub");
+
+    let out = run_hook(&db, &write_payload("s1", &sub, Path::new("../NOTES.md"), "hello world\n"));
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("expected a decision JSON: {e}: {out}"));
+    assert_eq!(v["decision"], "block", "../NOTES.md from sub is the guarded file: {out}");
+    assert!(v["reason"].as_str().unwrap().contains("c-path"), "{out}");
+
+    assert_not_blocked(&run_hook(&db, &write_payload("s1", &sub, Path::new("NOTES.md"), "hello world\n")));
+}
+
+// ------------------------------------------- a session that drifts (D4)
+//
+// A session that worked in a checkout and then stands in a folder of no
+// project keeps that project (`project::session_project`), and its PATH
+// guards resolve against the project's registered checkout
+// (`project::guard_root`), not against the folder. MEASURED before (the
+// step 4 verifier's probe X1): from a scratch folder, an Edit of
+// `<checkout>/NOTES.md` by its absolute path removing the required line went
+// through, and so did `rm` of that file - while a scratch COPY of NOTES.md
+// was refused as if it were the project's own file.
+
+const DRIFTING_SESSION: &str = "9a3d5e70-1111-4222-8333-444455556661";
+
+/// The checkout of `checkout_with_required_line`, registered the way the
+/// installer registers one (written straight into the log: THOR's own
+/// writer token is not for tests), plus two more `demo` rules on its files:
+/// an absent check on NOTES.md and a protected directory `frozen`.
+fn registered_checkout_with_file_rules(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let (db, real) = checkout_with_required_line(dir);
+    std::fs::create_dir_all(real.join("frozen")).unwrap();
+    let mut store = thor_core::event_store::EventStore::open_existing(&db).unwrap();
+    let rule = |id: &str, text: &str, binding: model::item::Binding, check: model::item::Check| model::item::Item {
+        id: id.to_string(),
+        kind: model::item::Kind::Rule,
+        text: text.to_string(),
+        bindings: vec![binding],
+        severity: Some(model::item::Severity::Irreversible),
+        project: Some("demo".to_string()),
+        tags: vec![],
+        expires: None,
+        key: None,
+        falsifier: Some("the guard turns out to refuse nothing in its own project".to_string()),
+        check: Some(check),
+    };
+    let no_em_dash = rule(
+        "no-em-dash-in-demo-notes",
+        "NOTES.md in demo never carries an em dash character",
+        model::item::Binding::Target { kind: model::item::TargetKind::Path, value: "NOTES.md".to_string() },
+        model::item::Check::Absent { path: "NOTES.md".to_string(), literal: "\u{2014}".to_string() },
+    );
+    let frozen = rule(
+        "never-touch-demo-frozen",
+        "frozen/ in demo is a frozen archive and must never be written to",
+        model::item::Binding::Target { kind: model::item::TargetKind::Dir, value: "frozen".to_string() },
+        model::item::Check::PathExists { path: "frozen".to_string() },
+    );
+    for item in [no_em_dash, frozen] {
+        model::store::declare(&mut store, "s", "l", "a", &named(&item)).unwrap();
+    }
+
+    let record = model::item::Item {
+        id: model::store::project_opened_id("demo"),
+        kind: model::item::Kind::Report,
+        text: "Project demo: a fixture record.".to_string(),
+        bindings: vec![],
+        severity: None,
+        project: Some("demo".to_string()),
+        tags: vec!["project-record".to_string()],
+        expires: None,
+        key: None,
+        falsifier: None,
+        check: None,
+    };
+    let body = model::store::canonical_body(&record).unwrap();
+    let root = real.to_string_lossy().replace('\\', "/");
+    let body = format!(
+        "{},\"root\":{},\"root_at\":\"2026-09-28T10:00:00Z\"}}",
+        &body[..body.len() - 1],
+        serde_json::to_string(&root).unwrap()
+    );
+    let installer = model::store::INSTALLER_ACTOR;
+    let kind = thor_core::event_store::EventKind::FactCreated;
+    store.append_event(installer, installer, installer, kind, &record.id, None, &body).unwrap();
+    (db, real)
+}
+
+fn bash_payload(session_id: &str, cwd: &Path, command: &str) -> String {
+    serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": session_id,
+        "cwd": cwd.to_string_lossy(),
+        "tool_name": "Bash",
+        "tool_input": { "command": command },
+    })
+    .to_string()
+}
+
+fn refused_by(out: &str, rule_id: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(out) else { return false };
+    v["decision"] == "block" && v["reason"].as_str().is_some_and(|r| r.contains(&format!("rule {rule_id} ")))
+}
+
+#[test]
+fn a_session_that_drifted_out_of_its_project_keeps_its_file_guards() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, real) = registered_checkout_with_file_rules(dir.path());
+    let notes = real.join("NOTES.md");
+    let scratch = dir.path().join("scratch");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let slashed = |p: &Path| p.to_string_lossy().replace('\\', "/");
+
+    // The session works in the checkout first.
+    assert_not_blocked(&run_hook(&db, &bash_payload(DRIFTING_SESSION, &real, "git status")));
+
+    // Then stands in a folder of no project, and names the checkout's own
+    // files by their absolute paths: every path-anchored guard still holds.
+    let out = run_hook(&db, &edit_payload(DRIFTING_SESSION, &scratch, &notes, "keep this line\n", ""));
+    assert!(refused_by(&out, "c-path"), "an Edit removing the required line: {out}");
+    let out = run_hook(&db, &bash_payload(DRIFTING_SESSION, &scratch, &format!("rm {}", slashed(&notes))));
+    assert!(refused_by(&out, "c-path"), "rm of the checkout's NOTES.md: {out}");
+    assert!(out.contains("would have removed"), "{out}");
+    let out = run_hook(&db, &write_payload(DRIFTING_SESSION, &scratch, &notes, "hello world\nkeep this line \u{2014}\n"));
+    assert!(refused_by(&out, "no-em-dash-in-demo-notes"), "a forbidden literal written into NOTES.md: {out}");
+    let out = run_hook(&db, &write_payload(DRIFTING_SESSION, &scratch, &real.join("frozen").join("a.rs"), "fn main() {}"));
+    assert!(refused_by(&out, "never-touch-demo-frozen"), "a write into the protected folder: {out}");
+    let out = run_hook(&db, &bash_payload(DRIFTING_SESSION, &scratch, &format!("echo x > {}/frozen/a.rs", slashed(&real))));
+    assert!(refused_by(&out, "never-touch-demo-frozen"), "a redirect into the protected folder: {out}");
+
+    // What the rules allow still passes from there.
+    assert_not_blocked(&run_hook(
+        &db,
+        &edit_payload(DRIFTING_SESSION, &scratch, &notes, "keep this line\n", "keep this line\n\n"),
+    ));
+
+    // A scratch COPY of those files is not the project's file: the project's
+    // rules do not judge it.
+    let copy = scratch.join("NOTES.md");
+    std::fs::write(&copy, "hello world\nkeep this line\n").unwrap();
+    std::fs::create_dir_all(scratch.join("frozen")).unwrap();
+    assert_not_blocked(&run_hook(&db, &edit_payload(DRIFTING_SESSION, &scratch, &copy, "keep this line\n", "")));
+    assert_not_blocked(&run_hook(&db, &bash_payload(DRIFTING_SESSION, &scratch, "rm NOTES.md")));
+    assert_not_blocked(&run_hook(&db, &write_payload(DRIFTING_SESSION, &scratch, &copy, "a copy \u{2014}\n")));
+    assert_not_blocked(&run_hook(&db, &write_payload(DRIFTING_SESSION, &scratch, &scratch.join("frozen").join("a.rs"), "x")));
+}
+
 // ------------------------------------------------------ staleness sidecar
 //
 // The staleness half of the doctrine (`serve::absent_guard`'s own module doc
@@ -301,7 +517,7 @@ fn fixture_with_em_dash_rule_but_no_anchored_file(dir: &Path) -> std::path::Path
         falsifier: Some("an em dash lands in NOTES.md and nobody notices".to_string()),
         check: Some(model::item::Check::Absent { path: "NOTES.md".to_string(), literal: "\u{2014}".to_string() }),
     };
-    model::store::declare(&mut store, "s", "l", "a", &item).unwrap();
+    model::store::declare(&mut store, "s", "l", "a", &named(&item)).unwrap();
     db
 }
 
@@ -374,4 +590,18 @@ fn a_second_write_in_the_same_session_increments_the_stale_count() {
     let stale_text = std::fs::read_to_string(&stale_path).unwrap();
     let stale: serde_json::Value = serde_json::from_str(&stale_text).unwrap();
     assert_eq!(stale["no-em-dash-in-notes"]["count"].as_u64(), Some(2), "{stale_text}");
+}
+
+/// `item` with every check literal its text does not name appended to the
+/// text (in `U+XXXX` form for a glyph): since step 8 of the two tracks the
+/// write gate refuses a check whose literal the rule's own words never name
+/// (A4), and these fixtures are about the hook, not about naming.
+fn named(item: &model::item::Item) -> model::item::Item {
+    let mut out = item.clone();
+    let unnamed = model::gate::unnamed_literals(&out);
+    if !unnamed.is_empty() {
+        let shown: Vec<String> = unnamed.iter().map(|l| format!("'{}'", model::gate::shown_literal(l))).collect();
+        out.text = format!("{} (names {})", out.text, shown.join(" "));
+    }
+    out
 }

@@ -142,16 +142,18 @@ fn handover(db: &Path, session: &str, project: &str, report_id: &str) {
     std::fs::write(db.parent().unwrap().join("evaluation-sessions.json"), json.to_string()).unwrap();
 }
 
-/// A check attached to `id` once and then given up, written straight into
-/// the log: the history a no-literal reason needs before it counts
-/// (2026-09-26, `model::gate::teeth_answer_settles`).
-fn a_check_was_tried(db: &Path, item: &Item) {
-    let mut tried = item.clone();
-    tried.check = Some(model::item::Check::Forbidden { literals: vec![format!("{} --force", item.id)] });
+/// Register `root` as `key`'s working copy the way the installer writes it
+/// (raw: a test holds no THOR actor token).
+fn register(db: &Path, key: &str, root: &Path) {
+    let record = report(&model::store::project_opened_id(key), key, &["project-record"]);
+    let body = model::store::canonical_body(&record).unwrap();
+    let body = format!(
+        "{},\"root\":{},\"root_at\":\"2026-09-28T10:00:00Z\"}}",
+        &body[..body.len() - 1],
+        serde_json::to_string(&root.to_string_lossy()).unwrap()
+    );
     with_store(db, |s| {
-        for body in [serde_json::to_string(&tried).unwrap(), serde_json::to_string(item).unwrap()] {
-            s.append_mutate_checked("legacy", &item.id, "migration", EventKind::FactRevised, &item.id, None, &body).unwrap();
-        }
+        s.append_event("install", "install", "installer", EventKind::FactCreated, &record.id, None, &body).unwrap();
     });
 }
 
@@ -213,42 +215,52 @@ fn an_invented_literal_is_never_stored_as_a_proven_guard() {
     let tmp = tempfile::tempdir().unwrap();
     let db = store_with(tmp.path(), &[report("seed-p", "p", &[])]);
     let mut mcp = Mcp::start(&db, tmp.path());
-    let reply = mcp.call(
-        "remember",
+    let fact = |text: &str| {
         serde_json::json!({
             "id": "probe-a8", "kind": "rule", "severity": "irreversible", "project": "p",
-            "text": "Probe: never repartition the data disk without a fresh backup.",
+            "text": text,
             "falsifier": "repartitioning without a backup never loses data",
             "check_kind": "forbidden", "check_literals": ["zqxj-never-typed"],
             "targets": [{"kind": "command", "value": "diskpart"}]
-        }),
-    );
-    assert!(reply.starts_with("stored"), "{reply}");
+        })
+    };
+    // Red (A4, step 8): a literal the rule's own words never name is refused.
+    let reply = mcp.call("remember", fact("Probe: never repartition the data disk without a fresh backup."));
+    assert!(reply.starts_with("REFUSED") && reply.contains("'zqxj-never-typed' is not named anywhere in the rule's own text"), "{reply}");
+    // Green (K7): named, it is wired - never proven, whatever it is.
+    let reply = mcp.call("remember", fact("Probe: never run diskpart with zqxj-never-typed without a fresh backup."));
+    assert!(reply.starts_with("stored") && reply.contains("teeth: wired, not proven"), "{reply}");
     assert!(!reply.contains("teeth: proven guard"), "an invented literal must never count as a proven tooth: {reply}");
 }
-
 // ------------------------------------------------------------------ B2
 
+/// Step 8: a reason tag is neither demanded nor judged any more - the rule
+/// is TRIED, and with nothing to build a tooth from it is a note, whatever
+/// reason it carries.
 #[test]
-fn a_heavy_rules_teeth_reason_that_fits_any_rule_is_refused() {
+fn a_teeth_reason_is_no_answer_the_rule_is_tried_instead() {
     let tmp = tempfile::tempdir().unwrap();
     let db = store_with(tmp.path(), &[report("seed-p", "p", &[])]);
     let mut mcp = Mcp::start(&db, tmp.path());
-    for thin in ["no-literal:this is a judgement rule and not a fixed text", "no-literal:it is an omission so there is nothing to type"] {
+    for (id, thin) in [("probe-thin-1", "no-literal:this is a judgement rule and not a fixed text"), ("probe-thin-2", "")] {
+        let tags: Vec<&str> = if thin.is_empty() { vec![] } else { vec![thin] };
         let reply = mcp.call(
             "remember",
             serde_json::json!({
-                "id": "probe-thin", "kind": "rule", "severity": "irreversible", "project": "p",
-                "text": "Probe: never wipe the agent-zone index without a backup.",
+                "id": id, "kind": "rule", "severity": "irreversible", "project": "p",
+                "text": if id == "probe-thin-1" {
+                    "Probe: never wipe the agent-zone index without a backup.".to_string()
+                } else {
+                    "Probe: the cache folder stays out of every release archive.".to_string()
+                },
                 "falsifier": "wiping the index turns out to cost nothing",
-                "tags": [thin],
+                "tags": tags,
                 "targets": [{"kind": "path", "value": "files/README.md"}]
             }),
         );
-        assert!(reply.contains("REFUSED"), "a reason that fits any rule is no answer: {reply}");
+        assert!(reply.starts_with("stored") && reply.contains("teeth: note - "), "{id}: {reply}");
     }
 }
-
 /// The bulk-label loophole: a heavy rule that fired carries only the label a
 /// maintenance pass writes ("informing") and an old thin reason. That is the
 /// question, not an answer, so the report is refused - and the refusal sends
@@ -271,11 +283,12 @@ fn an_informing_label_alone_never_lets_an_evaluation_through_and_the_refusal_nam
     assert!(!reply.contains("backfill_teeth"), "a bulk relabel is never the way out: {reply}");
 }
 
-/// The other half of B2: a reason a reader can check against the rule - it
-/// names the rule's own file - IS the clear proof that it cannot have a
-/// tooth, and settles it.
+/// Step 8: a reason that names the rule's own file settles NOTHING, before
+/// or after a check was tried - the filing refusal names the trial as the
+/// way on, and a revise naming only the id runs it; the note it lands as
+/// settles the rule.
 #[test]
-fn a_reason_that_names_the_trigger_settles_a_fired_heavy_rule() {
+fn a_reason_settles_nothing_and_the_trial_the_refusal_names_does() {
     let tmp = tempfile::tempdir().unwrap();
     let heavy = rule(
         "honest-heavy",
@@ -284,19 +297,18 @@ fn a_reason_that_names_the_trigger_settles_a_fired_heavy_rule() {
         vec![path("files/README.md")],
         vec!["no-literal:wiping files/README.md leaves no text in any command".to_string()],
     );
-    let db = store_with(tmp.path(), &[report("eval-old", "p", &["evaluation-report"]), heavy.clone()]);
+    let db = store_with(tmp.path(), &[report("eval-old", "p", &["evaluation-report"]), heavy]);
     with_store(&db, |s| served(s, "honest-heavy", 1));
     let mut mcp = Mcp::start(&db, tmp.path());
     let reply = mcp.call("remember", eval_report_args("eval-new", "p"));
-    assert!(
-        reply.contains("REFUSED") && reply.contains("honest-heavy"),
-        "a reason on a rule that never carried a check is not the answer yet: {reply}"
-    );
-    a_check_was_tried(&db, &heavy);
+    assert!(reply.contains("REFUSED") && reply.contains("honest-heavy"), "a reason is no answer: {reply}");
+    assert!(reply.contains("mcp__thor__revise with only the rule's id"), "{reply}");
+    assert!(reply.contains("retest --id 'honest-heavy'"), "{reply}");
+    let reply = mcp.call("revise", serde_json::json!({"id": "honest-heavy"}));
+    assert!(reply.starts_with("revised") && reply.contains("teeth: note - "), "{reply}");
     let reply = mcp.call("remember", eval_report_args("eval-new", "p"));
-    assert!(reply.starts_with("stored"), "a real reason after a real try settles it: {reply}");
+    assert!(reply.starts_with("stored"), "the note the trial reached settles it: {reply}");
 }
-
 // ------------------------------------------------------------------ C
 
 #[test]
@@ -323,6 +335,12 @@ fn a_report_is_never_held_for_items_that_fired_only_in_another_session() {
     let tmp = tempfile::tempdir().unwrap();
     let elsewhere = rule("fired-elsewhere", Some("p"), None, vec![command("fixture-cmd")], vec![]);
     let db = store_with(tmp.path(), &[report("seed-p", "p", &[]), elsewhere]);
+    // Decided by THOR's trial first (a note): since step 9 a rule with no
+    // verdict holds the filing whatever its weight, and this test is about
+    // the judgement list only.
+    with_store(&db, |s| {
+        serve::teeth::fixture::decide(s, "fired-elsewhere");
+    });
     with_store(&db, |s| served_in(s, "a-parallel-session", "fired-elsewhere", 40));
     handover(&db, "this-session", "p", "eval-new");
     let mut mcp = Mcp::start(&db, tmp.path());
@@ -337,6 +355,13 @@ fn the_judgement_list_is_fixed_when_the_evaluation_starts() {
     let before = rule("owed-before-start", Some("p"), None, vec![command("fixture-cmd-a")], vec![]);
     let during = rule("remember-bound-during", Some("p"), None, vec![command("fixture-cmd-b")], vec![]);
     let db = store_with(tmp.path(), &[report("seed-p", "p", &[]), before, during]);
+    // Decided by THOR's trial first (a note): since step 9 a rule with no
+    // verdict holds the filing whatever its weight, and this test is about
+    // the judgement list only.
+    with_store(&db, |s| {
+        serve::teeth::fixture::decide(s, "owed-before-start");
+        serve::teeth::fixture::decide(s, "remember-bound-during");
+    });
     with_store(&db, |s| {
         served(s, "owed-before-start", 40);
         served(s, "remember-bound-during", 39);
@@ -360,6 +385,12 @@ fn an_honest_skip_lets_the_report_file_and_the_item_stays_owed() {
     let tmp = tempfile::tempdir().unwrap();
     let unsure = rule("unsure-item", Some("p"), None, vec![command("fixture-cmd")], vec![]);
     let db = store_with(tmp.path(), &[report("seed-p", "p", &[]), unsure]);
+    // Decided by THOR's trial first (a note): since step 9 a rule with no
+    // verdict holds the filing whatever its weight, and this test is about
+    // the judgement list only.
+    with_store(&db, |s| {
+        serve::teeth::fixture::decide(s, "unsure-item");
+    });
     with_store(&db, |s| served(s, "unsure-item", 40));
     handover(&db, "s", "p", "eval-new");
     let mut mcp = Mcp::start(&db, tmp.path());
@@ -390,11 +421,14 @@ fn a_check_that_holds_only_in_the_worktree_is_refused() {
     std::fs::write(worktree.join("panel.js"), "if (!res.ok) showError(); else showSuccess();\n").unwrap();
 
     let db = store_with(tmp.path(), &[report("seed-p", "Main-Repo", &[])]);
+    // Since step 8 a file check is tried in its project's REGISTERED working
+    // copy: the main checkout.
+    register(&db, "Main-Repo", &main);
     let mut mcp = Mcp::start(&db, &worktree);
     let fact = |literal: &str| {
         serde_json::json!({
             "id": "panel-checks-res-ok", "kind": "rule", "project": "Main-Repo",
-            "text": "The device panel checks res.ok before it reports success.",
+            "text": "The device panel checks res.ok before it calls showSuccess(); to report success.",
             "falsifier": "the panel reports success on a failed reply",
             "check_kind": "contains", "check_path": "panel.js", "check_literal": literal,
             "targets": [{"kind": "path", "value": "panel.js"}]
@@ -402,6 +436,7 @@ fn a_check_that_holds_only_in_the_worktree_is_refused() {
     };
     let reply = mcp.call("remember", fact("res.ok"));
     assert!(reply.contains("REFUSED") && reply.contains("only in your worktree"), "{reply}");
+    assert!(!reply.contains("teeth:"), "refused before any trial ran: {reply}");
     let reply = mcp.call("remember", fact("showSuccess();"));
     assert!(reply.starts_with("stored"), "a check that holds on main too goes through: {reply}");
 }

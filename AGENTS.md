@@ -69,21 +69,50 @@ thor2/target/release/doctor.exe --db "<their store>"
 One plain line per part. A missing language model is not a problem: THOR works
 without it, just with simpler matching.
 
-**5. Index the project's code.** A fresh project is scoped by the name of its
-folder already, with no setup. What this command adds is the reading of the
-code. From the project folder:
+**5. Read the project's code and register its working copy.** A fresh project
+is scoped by the name of its folder already, with no setup. This command adds
+two things. Run it from inside the project's folder, with the full path to the
+installer you built in step 1, and with `--db` naming their memory - the path
+step 2 printed on its `memory:` line:
 
 ```sh
-thor2/target/release/install.exe --project "<project-name>"
+"<path to thor2>/target/release/install.exe" --db "<their store>"
 ```
 
 It reads this project's code once, so searching the code, finding where a symbol
 is used and outlining a file answer here at all, and from then on every commit
 keeps that reading fresh by itself. That same successful read also opens the
 project in the memory itself, so the note in step 6 lands under this project's
-name without ever being asked to name a new collection. The `--project` part is
-only needed when the folder is not called what they call the project; most of the
-time, leave it off.
+name without ever being asked to name a new collection.
+
+It also registers this checkout as the project's working copy: the one folder
+THOR tries a rule's file check in when the rule is written (see "How to write a
+note" below). It says so on a line that starts with `+ registered`, naming the
+folder.
+
+Add `--project "<project-name>"` only when the folder is not called what they
+call the project; most of the time, leave it off.
+
+**A project an earlier release already read has no working copy yet.** Nothing
+registers it by itself. Run this once from inside that checkout - it records
+the folder and touches nothing else, no settings and no code reading:
+
+```sh
+"<path to thor2>/target/release/install.exe" --register-root --db "<their store>"
+```
+
+It answers `registered '<project>' -> <folder>`. Doctor names every project
+that owns rules but has no working copy registered, with this same command.
+
+One project has one working copy, and the command says so when you are in the
+wrong place. Nothing is changed when it refuses:
+
+- `REFUSED: '<project>' is registered at <folder>, which is still a checkout of
+  it` - you are in a second copy of the project. Go to that folder and run the
+  command there, or leave it: that folder is already the one THOR uses.
+- `... which still exists. Moving a registration is the owner's call` - the
+  project moved, but its old folder is still there. Ask the owner. Once he has
+  removed or renamed the old folder, run the command again from the new one.
 
 It refuses to change a name already there - renaming a scope would strand every
 note filed under the old one. Two answers you may get instead, both with the fix:
@@ -170,33 +199,68 @@ reasoning belongs in a report, not in a rule.
 **Correct, do not duplicate.** Search before you store. A second copy of a note
 takes a place a different note could have had.
 
-**If you want a rule to actually stop a wrong change**, give it a proof as well
-as words: a check THOR can run right now, like "this file still contains that
-line". A rule backed by words alone can inform, and only inform. Most rules will
-never carry a proof, and that is fine.
+**Every rule is tried the moment you write it.** A rule backed by words alone
+can inform, and only inform; only a check can refuse a wrong change. So when
+you remember or revise a rule, THOR tries its check - and every tooth its own
+words compose, such as a flag in a backtick span after the command it is bound
+to - through the very guard that watches files and commands, and the reply
+tells you which of three things happened:
 
-**You will be asked about this, so answer it.** A rule you mark expensive, or
-one that spells out a command, a flag or a filename, is refused until you say
-whether there is a text whose presence *means* the mistake is happening. If
-there is, add a proof built on that exact text: a forbidden check on a command
-target for a dangerous command, or on every file for text that must never be
-written anywhere. If the mistake is something being left OUT rather than
-written in - a call that should always name a model and sometimes just does
-not - use a `requires` check instead: bind it to the exact command or tool the
-call is (never `always`), and give it check_literals with the trigger first
-and every acceptable answer after it - a call that reaches the trigger without
-naming any of the answers is refused. If there is genuinely nothing to catch
-either way - a judgement rule like "check with me first" has nothing to catch -
-tag it `no-literal:<why not>` and it goes in unchanged.
-The reason is the answer: a bare `no-literal` is refused, because an exit that
-costs nothing is the one that gets taken instead of the work. On a rule marked
-expensive the reason also has to be about THAT rule: quote the legitimate call
-that carries the same fragment (between quotes), or name the command, file or
-moment the rule is about. "It is a judgement rule" fits every rule, so it is
-refused. Nothing can verify your reason is true; the point is that the next
-reader can check it against the rule and disagree with it. Never widen
-the text to catch more: a rule that blocks legitimate work is the most expensive
-thing this system can do.
+- **RULE** (`teeth: wired, not proven`; `teeth: proven guard` once reality
+  backs it too - a real refusal on record, or, for a file check, the file's own
+  git history): the check refused the call it forbids and let the ordinary
+  calls through. It is stored, and it can refuse a wrong change.
+- **NOTE** (`teeth: note`): no tooth holds, so the rule is stored without a
+  check. It still arrives at its moment, ranked by its severity; it can only
+  inform. Most rules end up here, and that is fine.
+- **REFUSED**: nothing was written, and the reply names the one thing to do.
+  Most often a tooth THOR built from your own text bites - "Hang it:
+  check_kind forbidden, check_literals ['--force']" - so write the rule again
+  with exactly that check.
+
+**Name the check's literal in the rule's own text.** A check whose literal the
+text never mentions is refused: a tooth has to say in its own words what it
+refuses. A character outside plain ASCII is named by its code point - write
+`U+2014` in the text for an em dash.
+
+**A check whose command already carries its literal is a whole-command ban.**
+A rule anchored to `sshpass` that forbids `sshpass` refuses every `sshpass`
+call; THOR tries it as a ban and keeps it on the rule track.
+
+**A literal in a command matches whole words only.** `--force` does not match
+inside `--force-with-lease`, and `ssh` does not match inside `sshKey.mjs`. It is
+found in every part of a command, though: after `cd x &&`, on a later line,
+inside `ssh host "..."` or `bash -c '...'`. For a `requires` trigger that names
+a family of names, end it with one `*`: `/thor*` catches `/thor-probe` and
+`/thor2`. A call that only asks for `--help` or `--version` is never refused by a
+`requires` rule.
+
+**A file check needs the project's working copy.** THOR tries it in the
+checkout registered for the rule's project (step 5 registers it). Written from
+inside that project before it is registered, the rule is refused with the one
+command to run there. Written from anywhere else, it is stored as a note that
+keeps the check pending, and so is a check that holds in your own checkout (a
+worktree, another branch) but not yet in the registered one. Doctor lists every
+such note. Once the project is registered and the check holds in its registered
+checkout, `serve --db "<their store>" retest --id <id> --apply` tries it again
+and hangs it if it bites.
+
+**When a refusal is right about the tooth but wrong about your rule**, answer it
+with one of three arguments - and only then:
+
+- `legitimate_calls: ["git bundle list-heads backup.bundle"]` - a real call
+  the tooth THOR built from your text would refuse, which is legitimate. The
+  rule is stored as a note by dispute, and doctor lists it for the owner.
+- `may_change: ["version"]` - the span of a file that a contains check THOR
+  derived would freeze, when that span is allowed to change. Also a note by
+  dispute.
+- `accept_refusing: ["git push origin main"]` - one of the real calls a refusal
+  listed, when refusing them IS the intent (a "never push this repository until
+  the owner says so" ban). The rule stays on the rule track; doctor lists it.
+
+A `no-literal:` tag answers nothing any more: the trial decides whether a rule
+can have a tooth. Never widen the text to catch more: a rule that blocks
+legitimate work is the most expensive thing this system can do.
 
 **A rule about what you SAY cannot carry a proof at all.** The gate watches
 files and commands, and an answer is neither. Put that rule in the response
@@ -248,16 +312,18 @@ the same way a full set of preferences would.
 - **How they name their projects.** Every checkout is scoped by its folder name
   automatically - facts stay inside that project and do not compete across
   projects. If a folder name does not match how they call the project, they can
-  run `install --project <name>` to override it. Only then ask what name they want
-  - never invent one.
+  run `install --project <name> --db "<their store>"` from inside the checkout
+  to override it. Only then ask what name they want - never invent one.
 - **That the memory is theirs to correct.** A changed fact is corrected with
-  `revise`, never stored a second time - though taking teeth away from a rule
-  that can already block a mistake (its check, its severity, a binding, its
-  reach) needs a reason too, the same as removing one. Clearing one of those
-  fields outright uses its own `clear_*` flag on `revise` (`clear_check`,
-  `clear_severity`, and so on), not an empty value. A fact that is simply
-  wrong is removed with `retract` and a reason. A true fact that fired in the
-  wrong place is marked as noise with `mark`, instead of being deleted.
+  `revise`, never stored a second time - though weakening any rule (clearing or
+  changing its check, lowering its severity, dropping or replacing a binding,
+  narrowing a checked rule's reach, taking a quoted call or a flag out of its
+  text, or turning it into a report) needs a reason too, the same as removing
+  one. Clearing one of those fields outright uses its own `clear_*` flag on
+  `revise` (`clear_check`, `clear_severity`, and so on), not an empty value.
+  A fact that is simply wrong is removed with `retract` and a reason. A true
+  fact that fired in the wrong place is marked as noise with `mark`, instead
+  of being deleted.
 
 Apply each answer where it belongs - a reply-shape rule in the rulebook file,
 a standing preference as a stored fact - then store a short summary of what he
@@ -279,10 +345,11 @@ instruction for the task you are doing.
 **At the end of a turn it may hold you.** THOR asks for one small thing at a
 time and will not let the turn close until it is settled: a verdict on a note
 that keeps firing, a note you just stored onto a place too full to ever show it,
-or a note that has never been asked whether it can refuse anything. Each has one
-honest way out, and the message says which. Saying it in your reply settles
-nothing - the fix has to be a real change to the note, or the tag that records
-the decision.
+or a rule THOR's own trial has not decided yet (the message names the command
+that decides it). Each has one honest way out, and the message says which.
+Saying it in your reply settles nothing - the fix has to be a real change to the
+note, or the tag that records the decision. No tag decides a rule's teeth: only
+its trial does.
 
 Once in a while it asks for something bigger instead of one more note: in
 every project a session actually works in, once that session has accrued at

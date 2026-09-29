@@ -221,16 +221,13 @@ fn with_warnings(
     existing: Option<&model::item::Item>,
     root: Option<&std::path::Path>,
     store: Option<&thor_core::event_store::EventStore>,
-    teeth_note: Option<String>,
+    teeth_notes: Vec<String>,
 ) -> String {
-    // CHANGE 2's own receipt, first among the notes: what trying this fact's
-    // teeth actually showed - see `teeth_test`/`apply_teeth_test`/
-    // `apply_teeth_test_for_revise`, the only callers that ever pass
-    // `Some(_)` here. `None` either because Change 2 does not apply to this
-    // fact at all, or because a revise changed none of its check, bindings
-    // or severity on an item that already carried a box, and so carried
-    // that answer forward without asking again.
-    let mut notes: Vec<String> = teeth_note.into_iter().collect();
+    // THOR's trial receipt first among the notes: what trying this fact's
+    // teeth showed (`serve::teeth::trial_for_write`) - its verdict line, the
+    // forms it tried, the real calls it replayed. Empty for a kind that is
+    // never tried.
+    let mut notes: Vec<String> = teeth_notes;
     notes.extend(model::gate::warnings(item).iter().map(|w| w.to_string()));
     // The half of the capacity check that is a note rather than a refusal.
     // Without this call it was dead code: constructed in `model::store` and
@@ -530,12 +527,16 @@ fn refuse_a_new_collection(
     // so the flag is no longer what opens the scope, and telling the owner to
     // pass it was pointing at a step that no longer does the job.
     let unscoped_here = root.is_some() && checkout_project(root).is_none();
+    // The printed command names this very store (`--db`, F7): without it the
+    // install would open the project in a default memory, which may not be
+    // the one this server writes to.
     let how = if unscoped_here {
         format!(
             "\nThis folder has no memory of its own yet: if it is meant to be THIS project, the owner \
-             gives it one in a single command, run from inside this repository - `install` - which reads \
+             gives it one in a single command, run from inside this repository - `{}` - which reads \
              this project's code, records it under {wanted}, and makes every later write land under that \
-             name."
+             name.",
+            model::store::install_command_for(store.path().as_deref())
         )
     } else {
         String::new()
@@ -704,236 +705,95 @@ fn open_a_new_shelf_if_named_by_owner(
     ))
 }
 
-/// CHANGE 2 (2026-09-24): the writer may never set, clear or fake the box a
-/// fact falls into - see `model::store::TEETH_TAG_PREFIX`'s own doc comment.
-/// Checked against the CALLER'S OWN tags, as given in `args`, before either
-/// `remember` or `revise` ever constructs the `Item` it hands to `teeth_test`
-/// below - the one place this tool later appends its own tag of the identical
-/// shape, so re-checking the FINISHED item here would refuse its own
-/// legitimate write.
+/// The writer may never set, clear or fake the label a fact carries (see
+/// `model::store::TEETH_TAG_PREFIX`'s own doc comment). Checked against the
+/// CALLER'S OWN tags, as given in `args`, before anything else looks at them:
+/// the label is only a readable copy of THOR's trial record, and the trial
+/// (`serve::teeth::trial_for_write`) is the one place that writes it. The
+/// store refuses a new label with no record behind it for every other writer
+/// too (K16); this is the friendlier message for the one door an agent uses.
 fn refuse_a_forged_teeth_tag(tags: &[String]) -> Result<(), String> {
     if let Some(bad) = tags.iter().find(|t| t.starts_with(model::store::TEETH_TAG_PREFIX)) {
         return Err(format!(
             "invalid 'tags': '{bad}' starts with '{prefix}', which this tool reserves for itself - whether a \
-             fact is a proven guard, refuses legitimate use, has a collapsed anchor, or is merely informing is \
-             decided by actually trying its teeth, never by what a caller writes in 'tags'. Drop it; if this fact \
-             is heavy or carries a refusing check (forbidden, absent, absent_all, requires), the label is added \
-             automatically once the write goes through.",
+             rule is on the rule track (a proven guard, or wired) or a note is decided by THOR's own trial of \
+             it, never by what a caller writes in 'tags'. Drop it: every rule and orientation is tried when it \
+             is written, and the label its verdict implies is added once the write goes through.",
             prefix = model::store::TEETH_TAG_PREFIX
         ));
     }
     Ok(())
 }
 
-/// CHANGE 2's mechanism, replacing the narrower `refuse_an_unproven_check`
-/// this tool used to run: whether `item` owes a teeth test at all
-/// (`serve::prove::teeth_box`'s own applicability rule - heavy, or a
-/// refusing-kind check, regardless of the other), and which box trying it
-/// actually lands it in.
-///
-/// `Ok` carries the tag to append (`None` when Change 2 does not apply at
-/// all - light, and no refusing-kind check) and the receipt line a
-/// successful write appends to its own reply. `Err` is the ONE shape still
-/// refused outright and unchanged from before this write also tried
-/// `Absent`/`AbsentAll`/`Requires`: a `Forbidden` check that can never reach
-/// anything, whatever it looks like (`serve::prove::TeethBox::KeepRefusing`).
-/// Every OTHER outcome - tried and toothless, or nothing to try at all - is
-/// `Ok`: "the knowledge always gets in" holds for every box but this one
-/// single, pre-existing exception, which was never about lacking teeth at
-/// all, only about a shape that cannot mean anything.
-fn teeth_test(
-    item: &model::item::Item,
-    root: Option<&std::path::Path>,
-    store: &EventStore,
-) -> Result<(Option<&'static str>, Option<String>), String> {
-    // What the log already holds for this id - real refusals, real calls it
-    // fired on, and whether the check about to be stored is the one those
-    // were recorded under. A brand-new id has nothing, so it can be wired but
-    // never proven at the moment it is written: proof comes from reality, not
-    // from the writer (see `serve::prove`'s "against reality" section).
-    let reality = serve::prove::reality(store, &item.id, item.check.as_ref());
-    match serve::prove::teeth_box(&item.id, item, root, &reality) {
-        serve::prove::TeethBox::NotApplicable => Ok((None, None)),
-        serve::prove::TeethBox::KeepRefusing(msg) => Err(msg),
-        serve::prove::TeethBox::ProvenGuard { evidence, forbidden_tried, clean_tried } => {
-            let tried = match (forbidden_tried, clean_tried) {
-                (Some(f), Some(c)) => format!(
-                    " Tried forbidden: {f}; the guard refused it. Tried clean: {c}; the guard let it through, as \
-                     legitimate use should be."
-                ),
-                _ => String::new(),
-            };
-            Ok((Some(model::store::TEETH_PROVEN_TAG), Some(format!("teeth: proven guard - {evidence}.{tried}"))))
-        }
-        serve::prove::TeethBox::Wired { note, .. } => {
-            Ok((Some(model::store::TEETH_WIRED_TAG), Some(format!("teeth: wired, not proven - {note}"))))
-        }
-        // THE THIRD OUTCOME (2026-09-24): never filed under the proven tag,
-        // and never filed quietly under the informing one either - see
-        // `model::store::TEETH_REFUSES_LEGITIMATE_TAG`'s own doc comment. The
-        // write still goes through; `note` already carries both sides of what
-        // was tried.
-        serve::prove::TeethBox::RefusesLegitimateUse { note, .. } => {
-            Ok((Some(model::store::TEETH_REFUSES_LEGITIMATE_TAG), Some(format!("teeth: refuses legitimate use - {note}"))))
-        }
-        // THE COLLAPSED CASE (2026-09-24): the anchor and the literal are not
-        // two separable things, so the two-sided test never ran at all - see
-        // `model::store::TEETH_ANCHOR_COLLAPSED_TAG`'s own doc comment.
-        serve::prove::TeethBox::AnchorCollapsed { note, .. } => {
-            Ok((Some(model::store::TEETH_ANCHOR_COLLAPSED_TAG), Some(format!("teeth: anchor collapsed - {note}"))))
-        }
-        serve::prove::TeethBox::Informing { note, .. } => {
-            Ok((Some(model::store::TEETH_INFORMING_TAG), Some(format!("teeth: informing only - {note}"))))
-        }
+/// The three dispute arguments of a write (K22, K8(d)), as the trial reads
+/// them. Each entry is a whole call or span; the trial refuses an empty one.
+fn disputes_of(legitimate_calls: &[String], may_change: &[String], accept_refusing: &[String]) -> serve::teeth::Disputes {
+    serve::teeth::Disputes {
+        legitimate_calls: legitimate_calls.to_vec(),
+        may_change: may_change.to_vec(),
+        accept_refusing: accept_refusing.to_vec(),
     }
 }
 
-/// What trying a check on `revise` with `trial_check` showed (see
-/// `ReviseArgs::trial_check`): `trial` is the item as it would be with the
-/// tried check and bindings. The write gate's own grounds and the capacity
-/// check run first, then the same write-time proof a stored check gets
-/// (`teeth_test`); a refusal from any of them is a try that failed, and is
-/// recorded with its reason. A check that comes back wired or proven is no
-/// failed try at all, so the call is refused and told to hang it instead.
-/// The reason tags a trial is sent with are taken off the tried item first:
-/// the gate refuses a refusing check and a reason together, which is the
-/// very pair a trial exists to keep apart.
-fn trial_outcome(
-    existing: &model::item::Item,
-    trial: &model::item::Item,
-    root: Option<&std::path::Path>,
-    store: &EventStore,
-) -> Result<model::store::TriedCheck, String> {
-    let Some(check) = trial.check.clone() else {
-        return Err("REFUSED: trial_check needs the check to try in this same call".to_string());
-    };
-    if !model::gate::is_refusing_check(Some(&check)) {
-        return Err("REFUSED: only a check that can refuse (forbidden, absent, absent_all, requires) can be tried - \
-                    contains and path_exists never stop anything, so trying one shows nothing"
-            .to_string());
-    }
-    let is_reason = |t: &String| model::store::teeth_answer(t).is_some() || model::gate::command_teeth_answer(t).is_some();
-    let mut trial = trial.clone();
-    trial.tags.retain(|t| !is_reason(t));
-    // The same tags off the baseline too, so the gate never reads their
-    // removal as a dropped field of the trial's own making.
-    let mut base = existing.clone();
-    base.tags.retain(|t| !is_reason(t));
-    let outcome = if let Err(refusal) = model::gate::revise(&base, &trial) {
-        format!("the write gate refused it: {refusal}")
-    } else if let Ok(model::store::Capacity::Full(refusal) | model::store::Capacity::DeadOnArrival(refusal)) =
-        model::store::capacity(store, &trial)
-    {
-        format!("the write gate refused it: {refusal}")
-    } else {
-        match teeth_test(&trial, root, store) {
-            Err(msg) => format!("the write gate refused it: {msg}"),
-            Ok((Some(tag), note)) if tag == model::store::TEETH_PROVEN_TAG || tag == model::store::TEETH_WIRED_TAG => {
-                return Err(format!(
-                    "REFUSED: the check you tried works ({}), so it is no failed try - hang it for real: send the same \
-                     revise without trial_check, and without a reason tag",
-                    note.unwrap_or_default()
-                ));
-            }
-            Ok((_, note)) => note.unwrap_or_else(|| "tried, and the proof had nothing to say".to_string()),
-        }
-    };
-    Ok(model::store::TriedCheck { check, outcome })
+/// THOR's trial of one write (`serve::teeth::trial_for_write`), with this
+/// server's cached corpus of real calls: loaded once per process and
+/// refreshed from the last seq it read on every later write (the trial does
+/// the refresh).
+#[allow(clippy::too_many_arguments)]
+fn run_trial(
+    store: &mut EventStore,
+    corpus: &Mutex<Option<serve::legit::Corpus>>,
+    session: &serve::teeth::SessionCtx,
+    item: &Item,
+    before: Option<&Item>,
+    because: Option<&str>,
+    disputes: &serve::teeth::Disputes,
+    retry_undecided: bool,
+) -> serve::teeth::WriteTrial {
+    let db = store.path();
+    let mut cached = corpus.lock().unwrap_or_else(|p| p.into_inner());
+    let corpus = cached.get_or_insert_with(|| serve::legit::Corpus::load(store));
+    serve::teeth::trial_for_write(store, db.as_deref(), session, corpus, item, before, because, disputes, retry_undecided)
 }
 
-/// `teeth_test` above, run for a NEW item (`remember`): always tried, since
-/// there is no existing item whose check/bindings could already have settled
-/// the question. Mutates `item.tags` in place (pushing the tag `teeth_test`
-/// decided, if any) and returns the receipt line for a successful write.
-fn apply_teeth_test(
-    item: &mut model::item::Item,
-    root: Option<&std::path::Path>,
-    store: &EventStore,
-) -> Result<Option<String>, String> {
-    let (tag, note) = teeth_test(item, root, store)?;
-    if let Some(tag) = tag {
-        item.tags.push(tag.to_string());
+/// A refused trial as the reply: the refusal, then what the trial learned on
+/// the way (a real call that stopped a tooth from forcing, a dropped check),
+/// one note each. Nothing was written on the item.
+fn trial_refusal(message: &str, receipt: &[String]) -> String {
+    let mut out = format!("REFUSED: {message}");
+    for line in receipt {
+        out.push_str(&format!("\n  note: {line}"));
     }
-    Ok(note)
+    out
 }
 
-/// `teeth_test` above, run for a REVISE. Three fields are the teeth test's
-/// own inputs: the check and the bindings it tries, and the severity that
-/// decides whether a test is owed at all. A revision that changes none of
-/// them, on an item that ALREADY carries a box, must not be re-labelled or
-/// slowed by this step - re-testing is real work (an anchored check's
-/// currency is proved fresh every time), and the old answer is still the
-/// true one, so that tag is copied forward untouched and nothing is tried.
-/// Everything else gets exactly `apply_teeth_test`'s own fresh test, on the
-/// REVISED item: any of the three inputs changed (raising the severity into
-/// irreversible or costly is how a rule starts to owe a box), or the item
-/// carries no box yet (it predates this mechanism, or it was light until
-/// now). The no-box half is what the evaluation-filing refusal in
-/// `model::store::check_evaluation_report_filing` relies on when it tells a
-/// writer that a revise with no other field changed labels an unboxed rule.
-fn apply_teeth_test_for_revise(
-    existing: &model::item::Item,
-    updated: &mut model::item::Item,
-    root: Option<&std::path::Path>,
-    store: &EventStore,
-) -> Result<Option<String>, String> {
-    let inputs_unchanged = existing.check == updated.check
-        && existing.bindings == updated.bindings
-        && existing.severity == updated.severity;
-    // Only a PROVEN box is carried forward untried. Any other box may have
-    // been overtaken by the log since it was written - a real refusal, or a
-    // real call the check would have caught - and a revise with nothing else
-    // changed is exactly how a writer asks for that to be looked at again
-    // (the evaluation-filing refusal tells them so). Proof, once the log
-    // holds it, does not expire while the check stays the same: the log is
-    // append-only.
-    // A rule with no check cannot meet reality at all, so its old box is as
-    // true as a fresh one would be and is carried forward the same way.
-    let old_tag = existing
-        .tags
-        .iter()
-        .find(|t| t.starts_with(model::store::TEETH_TAG_PREFIX))
-        .filter(|t| t.as_str() == model::store::TEETH_PROVEN_TAG || updated.check.is_none());
-    if let (true, Some(old_tag)) = (inputs_unchanged, old_tag) {
-        if updated.tags.iter().any(|t| t.starts_with(model::store::TEETH_TAG_PREFIX)) {
-            return Ok(None);
-        }
-        // The caller's own `tags` (an explicit clear, or a new list that
-        // simply omitted it) did not carry this label forward - restored
-        // anyway, and said so, because clearing it is exactly one of the
-        // three things a writer may never do to it (set, clear, or fake by
-        // wording - see `model::store::TEETH_TAG_PREFIX`'s own doc comment).
-        // Silent restoration would look like the clear worked when it did
-        // not.
-        updated.tags.push(old_tag.clone());
-        return Ok(Some(format!(
-            "teeth: '{old_tag}' is not part of 'tags' - it survives a clear or a replacement that omits it, \
-             restored here, because neither the check, the bindings nor the severity changed"
-        )));
-    }
-    // Something Change 2 cares about DID change, or there is no box yet to
-    // carry: never trust an old label that answered a different question,
-    // even if the writer's own new tags
-    // list happened to still carry it forward from `existing.tags` (the
-    // omit-keeps-current-tags convention `revise` already documents).
-    //
-    // The old tag is dropped ONLY once a new one is ready to take its place
-    // - never on its own, and never before `teeth_test` has already decided
-    // there IS a replacement. `model::gate::revise`'s ground 9 refuses a
-    // revise that drops every tag `existing` carried, and an item whose only
-    // tag happens to be this one (say, it stopped being heavy and its check
-    // was cleared in the same call) would trip that refusal for a field the
-    // caller never even mentioned, over bookkeeping this tool did to itself.
-    // `TeethBox::NotApplicable` therefore leaves an old tag standing rather
-    // than risk it - stale in that one narrow, both-at-once edge case, never
-    // a refusal nobody asked for.
-    let (tag, note) = teeth_test(updated, root, store)?;
-    if let Some(tag) = tag {
-        updated.tags.retain(|t| !t.starts_with(model::store::TEETH_TAG_PREFIX));
-        updated.tags.push(tag.to_string());
-    }
-    Ok(note)
+/// The working copy registered for `item`'s project, for the notes that
+/// read a check's file (`with_warnings`): the same root the trial tried it
+/// in, never this server's startup folder.
+fn registered_root(store: &EventStore, item: &Item) -> Option<PathBuf> {
+    serve::project::registered_checkout(store, item.project.as_deref()).ok()
 }
+
+/// A write that REFUSED on the gate's own grounds, as the reply - the same
+/// words the store gives (`REFUSED: <problem>. Fix: <fix>`), with the scope
+/// list when the refusal is the missing-scope one.
+fn gate_refusal(refusal: model::Refusal, store: &EventStore) -> String {
+    with_scope_menu(format!("REFUSED: {}", model::store::WriteError::Refused(refusal)), store)
+}
+
+/// `item` with its project put through the one normalisation every write
+/// applies, so a pure gate run here judges exactly what the store would.
+fn normalized_item(item: &Item) -> Item {
+    let mut out = item.clone();
+    out.project = model::normalize::normalize_project(out.project.as_deref());
+    out
+}
+
+/// The `because` an unpin carries: removing the Always binding from a rule
+/// that can refuse (or is marked expensive) is a weakening the store asks a
+/// reason for, and this tool exists to do exactly that one thing - so the
+/// reason is the tool's own, written into the item's history.
+const UNPIN_BECAUSE: &str = "unpinned with the unpin tool: the Always binding was removed on purpose, every other binding stays";
 
 /// The evaluation a filing belongs to, from the hook's handover
 /// (`serve::eval_session`): `None` for every item that is not an evaluation
@@ -1028,6 +888,392 @@ fn build_bindings(moments: &[String], targets: &[TargetArg], always: bool) -> Re
     }
     Ok(bindings)
 }
+
+/// A revise, planned from the head it replaces: the item as it would be
+/// written, and the baseline the field-preservation ground compares it with
+/// (every deliberately cleared field blanked, and `tags` too on a deliberate
+/// clear). The one place both `revise` and a replica's on-the-spot check
+/// build a revised item, so the two can never judge different items.
+struct RevisePlan {
+    updated: Item,
+    gate_existing: Item,
+    tags_cleared: bool,
+    /// The call names no field at all, only the id: `revise` then runs THOR's
+    /// trial on the rule as it stands when no trial record counts for it yet.
+    bare: bool,
+}
+
+fn plan_revise(existing: &Item, args: &ReviseArgs) -> Result<RevisePlan, String> {
+    let bindings = if args.moments.is_some() || args.targets.is_some() || args.always.is_some() {
+        build_bindings(
+            args.moments.as_deref().unwrap_or(&[]),
+            args.targets.as_deref().unwrap_or(&[]),
+            args.always.unwrap_or(false),
+        )
+        .map_err(|e| format!("invalid binding: {e}"))?
+    } else {
+        existing.bindings.clone()
+    };
+    // Each field below also records whether THIS call is what
+    // cleared it - a deliberate clear (the flag, or an explicit
+    // empty string), never merely omitted - so `cleared` (built
+    // further down) can carry that intent to
+    // the write gate. `model::gate::revise`'s field-preservation
+    // check (ground 9) compares two finished `Item`s and cannot
+    // tell "the caller forgot to mention this" from "the caller
+    // asked to clear it": both end up as `existing.field.is_some()
+    // && updated.field.is_none()`. The bool captured right here,
+    // at the one place that still knows which it was, is what lets
+    // `ClearedFields::baseline` (see `model::gate`) tell the gate
+    // the difference without weakening it for anyone who never
+    // asked for a clear at all - see that function's own doc
+    // comment for the full reasoning, and this task's own report.
+    // WHAT COUNTS AS A CLEAR, and why an empty string is not the only
+    // spelling. The documented convention has always been "pass an
+    // empty string to clear", and for a caller that can actually send
+    // one - the JSON-RPC harness - it still works exactly as before.
+    // For an ASSISTANT it never worked: measured six times on
+    // 2026-08-06, an empty string does not survive the MCP call
+    // layer, and bitten twice more since (2026-09-09, 2026-09-11) by
+    // sessions that never found a way around it and gave up,
+    // retracting the rule they meant to correct instead - see
+    // `merge_clear_flag`'s own doc comment for the fix, the six
+    // `clear_*` booleans on `ReviseArgs` that reach this server from
+    // an assistant. Each field below merges its own flag with its own
+    // raw argument FIRST, so everything from here down reads one
+    // value exactly as it always read `args.<field>` - this match,
+    // and the `is_clear` check beside it, never change. A
+    // whitespace-only value still clears too, same as before: none of
+    // these five fields has any use for a value made of spaces.
+    let is_clear = |v: Option<&str>| matches!(v, Some(s) if s.trim().is_empty());
+    let severity_arg =
+        merge_clear_flag("severity", "clear_severity", args.severity.as_deref(), args.clear_severity)?;
+    let severity = match severity_arg.as_deref() {
+        None => existing.severity,
+        Some(v) if v.trim().is_empty() => None,
+        Some(v) => Some(Severity::from_str(v).map_err(|e| format!("invalid 'severity': {e}"))?),
+    };
+    let severity_cleared = is_clear(severity_arg.as_deref());
+    let project_arg =
+        merge_clear_flag("project", "clear_project", args.project.as_deref(), args.clear_project)?;
+    let project = match project_arg.as_deref() {
+        None => existing.project.clone(),
+        Some(p) if p.trim().is_empty() => None,
+        Some(p) => Some(p.to_string()),
+    };
+    let project_cleared = is_clear(project_arg.as_deref());
+    let expires_arg =
+        merge_clear_flag("expires", "clear_expires", args.expires.as_deref(), args.clear_expires)?;
+    let expires = match expires_arg.as_deref() {
+        None => existing.expires.clone(),
+        Some(e) if e.trim().is_empty() => None,
+        Some(e) => Some(e.to_string()),
+    };
+    let expires_cleared = is_clear(expires_arg.as_deref());
+    let key_arg = merge_clear_flag("key", "clear_key", args.key.as_deref(), args.clear_key)?;
+    let key = match key_arg.as_deref() {
+        None => existing.key.clone(),
+        Some(k) if k.trim().is_empty() => None,
+        Some(k) => Some(k.to_string()),
+    };
+    let key_cleared = is_clear(key_arg.as_deref());
+    let falsifier_arg =
+        merge_clear_flag("falsifier", "clear_falsifier", args.falsifier.as_deref(), args.clear_falsifier)?;
+    let falsifier = match falsifier_arg.as_deref() {
+        None => existing.falsifier.clone(),
+        Some(f) if f.trim().is_empty() => None,
+        Some(f) => Some(f.to_string()),
+    };
+    let falsifier_cleared = is_clear(falsifier_arg.as_deref());
+    // Same "omit keeps, empty clears" convention as the five string
+    // fields above, but `tags` is a LIST: `Option<Vec<String>>`
+    // already tells "omitted" (`None`) apart from "given, but
+    // deliberately empty" (`Some(vec![])`) without any string-trim
+    // heuristic, because an empty JSON array survives the MCP call
+    // layer exactly like a non-empty one - the transport quirk
+    // `is_clear` works around for a bare empty string never applied
+    // to a list. `model::gate::ClearedFields` (the six-field signal
+    // `severity`/`project`/`expires`/`key`/`falsifier`/`check` use to
+    // tell ground 9 a deliberate clear apart from a silent drop)
+    // deliberately has no `tags` member - see that type's own doc
+    // comment - so this stays a purely local MCP-layer signal: the
+    // caller's intent is already fully captured in `args.tags`
+    // itself, and `gate_existing` below is blanked by hand the same
+    // way `ClearedFields::baseline` blanks its own six fields, for
+    // the one field that type does not cover.
+    let tags_cleared = matches!(args.tags.as_deref(), Some(t) if t.is_empty());
+    // Same convention as every flat MCP check field: omitting
+    // check_kind/check_path/check_literal/check_literals ALL FOUR
+    // keeps the existing check untouched (mirrors `bindings` above -
+    // nothing mentioned means nothing changes). check_literals is a
+    // `Vec`, not an `Option`, so it has no way to say "given, but
+    // deliberately empty" the way check_kind's "" does - an empty
+    // check_literals is therefore treated exactly like an omitted
+    // one here, consistent with how `gate::build_check` itself reads
+    // an empty list for check_kind absent_all (see that function's
+    // own doc comment). check_kind "" clears it, refused if
+    // check_path/check_literal/check_literals are also given (a
+    // self-contradictory request: clear AND set at once).
+    // `clear_check` (see its own doc comment on `ReviseArgs` for the
+    // defect it fixes) is folded into `check_kind` right here, before
+    // any of that runs, so a caller that sends the flag is refused by
+    // the exact same check_path/check_literal/check_literals branch
+    // below, for the exact same reason. Anything else runs through
+    // the same gate::build_check remember uses, replacing the check
+    // wholesale.
+    let check_kind_arg = if args.clear_check {
+        if let Some(k) = args.check_kind.as_deref() {
+            if !k.trim().is_empty() {
+                return Err(format!(
+                    "invalid 'check_kind': clear_check was true but check_kind was also \
+                     given as {k:?} - give one or the other, never both"
+                ));
+            }
+        }
+        Some(String::new())
+    } else {
+        args.check_kind.clone()
+    };
+    let check = if check_kind_arg.is_none()
+        && args.check_path.is_none()
+        && args.check_literal.is_none()
+        && args.check_literals.is_empty()
+    {
+        existing.check.clone()
+    } else if check_kind_arg.as_deref() == Some("") {
+        if args.check_path.is_some() || args.check_literal.is_some() || !args.check_literals.is_empty() {
+            return Err(
+                "invalid check: the check was cleared (check_kind \"\" or clear_check) but \
+                 check_path, check_literal or check_literals was also given - clearing a \
+                 check takes none of them; drop them to clear the check, or give a real \
+                 check_kind to replace it instead"
+                    .to_string(),
+            );
+        }
+        None
+    } else {
+        model::gate::build_check(
+            check_kind_arg.as_deref(),
+            args.check_path.clone(),
+            args.check_literal.clone(),
+            args.check_literals.clone(),
+        )
+        .map_err(|e| format!("invalid check: {e}"))?
+    };
+    let check_cleared = check_kind_arg.as_deref() == Some("");
+    // Prefixed like every other refusal on this surface: a caller
+    // that keys on "REFUSED" must not have to learn a second shape
+    // just because the reason came from the edit modes.
+    let text = edited_text(&existing.text, &args).map_err(|e| format!("REFUSED: {e}"))?;
+    let updated = Item {
+        id: existing.id.clone(),
+        kind: existing.kind,
+        text,
+        bindings,
+        severity,
+        project,
+        tags: args.tags.clone().unwrap_or_else(|| existing.tags.clone()),
+        expires,
+        key,
+        falsifier,
+        check,
+    };
+    // `existing` itself is used by `model::store::revise` for
+    // exactly one thing: the ground-9 comparison against `updated`
+    // (the persisted body always comes from `updated` - see
+    // `store::revise`'s own body). Handing it the CLEARED baseline
+    // instead of the raw `existing` is what turns a field named
+    // here into a legitimate drop, without touching `revise`
+    // itself or its own unconditional protection for every field
+    // NOT named - see `model::gate::ClearedFields` for why this is
+    // sound and `model/src/gate.rs`'s own `cleared_fields` tests.
+    let cleared = model::gate::ClearedFields {
+        severity: severity_cleared,
+        project: project_cleared,
+        expires: expires_cleared,
+        key: key_cleared,
+        falsifier: falsifier_cleared,
+        check: check_cleared,
+    };
+    let mut gate_existing = cleared.baseline(&existing);
+    // `ClearedFields::baseline` above only knows the six fields it
+    // was built for. `tags` never joined that type (see
+    // `tags_cleared`'s own comment), so its baseline is blanked
+    // right here instead, by the same reasoning: ground 9 in
+    // `model::gate::revise` sees only `gate_existing`/`updated`, and
+    // `store::revise` uses `gate_existing` for nothing but that one
+    // comparison - the persisted body always comes from `updated`
+    // (see `model::store::revise`'s own body) - so blanking `tags`
+    // on a value that is never written keeps the check honest
+    // without needing the model crate to know this call asked for a
+    // deliberate clear.
+    if tags_cleared {
+        gate_existing.tags = Vec::new();
+    }
+    let bare = args.text.is_none()
+        && args.append.is_none()
+        && args.replace_from.is_none()
+        && args.replace_to.is_none()
+        && args.severity.is_none()
+        && args.project.is_none()
+        && args.tags.is_none()
+        && args.expires.is_none()
+        && args.key.is_none()
+        && args.falsifier.is_none()
+        && args.check_kind.is_none()
+        && args.check_path.is_none()
+        && args.check_literal.is_none()
+        && args.check_literals.is_empty()
+        && args.moments.is_none()
+        && args.targets.is_none()
+        && args.always.is_none()
+        && !(args.clear_severity || args.clear_project || args.clear_expires || args.clear_key)
+        && !(args.clear_falsifier || args.clear_check);
+    Ok(RevisePlan { updated, gate_existing, tags_cleared, bare })
+}
+
+/// A remember call's item, exactly as `remember` writes it (before its
+/// trial). The one place it is built, shared with a replica's on-the-spot
+/// check.
+fn remembered_item(args: &RememberArgs) -> Result<Item, String> {
+    let kind = Kind::from_str(&args.kind).map_err(|e| format!("invalid 'kind': {e}"))?;
+    let severity = match args.severity.as_deref() {
+        None => None,
+        Some(v) => Some(Severity::from_str(v).map_err(|e| format!("invalid 'severity': {e}"))?),
+    };
+    let bindings = build_bindings(&args.moments, &args.targets, args.always).map_err(|e| format!("invalid binding: {e}"))?;
+    let check = model::gate::build_check(
+        args.check_kind.as_deref(),
+        args.check_path.clone(),
+        args.check_literal.clone(),
+        args.check_literals.clone(),
+    )
+    .map_err(|e| format!("invalid check: {e}"))?;
+    Ok(Item {
+        id: args.id.clone(),
+        kind,
+        text: args.text.clone(),
+        bindings,
+        severity,
+        project: args.project.clone(),
+        tags: args.tags.clone(),
+        expires: args.expires.clone(),
+        key: args.key.clone(),
+        falsifier: args.falsifier.clone(),
+        check,
+    })
+}
+
+/// Whether `item` is an evaluation report filing.
+fn is_evaluation_report(item: &Item) -> bool {
+    item.kind == Kind::Report && item.tags.iter().any(|t| t == model::store::EVALUATION_REPORT_TAG)
+}
+
+/// The on-the-spot refusal of an evaluation report at a replica (F13).
+const REPLICA_EVALUATION_REFUSAL: &str = "REFUSED: an evaluation is filed on the main machine, in the session that \
+ran it - a replica cannot attest it. Nothing was queued: file the report from a session on the main machine.";
+
+/// A REPLICA JUDGES WHAT IT CAN, ON THE SPOT (F13). A replica queues a write
+/// for the main machine, and a refusal there reaches only the drain's report
+/// (and doctor), never the session that wrote it. So every ground that needs
+/// no working copy runs here first and refuses right away: an evaluation
+/// report filing (it can only be attested on the main machine), a reserved
+/// id, a `teeth:` label, and the whole pure write gate - A4 (a check whose
+/// literal the text does not name) and the note track included. The trial
+/// itself needs the working copy, so it still runs at the drain.
+fn replica_refusal_for_remember(store: &EventStore, args: &RememberArgs) -> Result<(), String> {
+    refuse_a_forged_teeth_tag(&args.tags)?;
+    let item = remembered_item(args)?;
+    if is_evaluation_report(&item) {
+        return Err(REPLICA_EVALUATION_REFUSAL.to_string());
+    }
+    model::store::fence(store, ACTOR.into(), &item.id).map_err(|e| format!("REFUSED: {e}"))?;
+    model::gate::declare(&normalized_item(&item)).map_err(|r| gate_refusal(r, store))
+}
+
+/// `replica_refusal_for_remember`, for a revise: judged against the
+/// replica's own copy of the item, when it has one (a write it has not seen
+/// yet is left to the drain), including the widened weakenings and A4.
+fn replica_refusal_for_revise(store: &EventStore, args: &ReviseArgs) -> Result<(), String> {
+    if let Some(tags) = args.tags.as_deref() {
+        refuse_a_forged_teeth_tag(tags)?;
+    }
+    model::store::fence(store, ACTOR.into(), &args.id).map_err(|e| format!("REFUSED: {e}"))?;
+    let Ok(existing) = model::store::show(store, &args.id) else { return Ok(()) };
+    let plan = plan_revise(&existing, args)?;
+    if is_evaluation_report(&plan.updated) && (!is_evaluation_report(&existing) || existing.project != plan.updated.project) {
+        return Err(REPLICA_EVALUATION_REFUSAL.to_string());
+    }
+    // Judged without THOR's own label, exactly as `revise` judges it.
+    let unlabelled = |item: &Item| {
+        let mut out = normalized_item(item);
+        out.tags.retain(|t| !t.starts_with(model::store::TEETH_TAG_PREFIX));
+        out
+    };
+    let (before, updated) = (normalized_item(&existing), unlabelled(&plan.updated));
+    model::gate::revise(&unlabelled(&plan.gate_existing), &updated).map_err(|r| gate_refusal(r, store))?;
+    model::gate::revise_weakening(&before, &updated, args.because.as_deref()).map_err(|r| gate_refusal(r, store))?;
+    model::gate::a4_ground(Some(&before), &updated, None).map_err(|r| gate_refusal(r, store))
+}
+
+/// Write a pin or unpin: the binding change goes through the same gate and
+/// the same trial as any revise (it changes what a trial tries: the reach of
+/// the rule), and lands with the trial's record.
+fn write_binding_change(
+    store: &mut EventStore,
+    corpus: &Mutex<Option<serve::legit::Corpus>>,
+    session: &serve::teeth::SessionCtx,
+    existing: &Item,
+    updated: &Item,
+    because: Option<&str>,
+    verb: &str,
+) -> Result<String, String> {
+    model::gate::revise(&normalized_item(existing), &normalized_item(updated))
+        .map_err(|r| format!("REFUSED: {}", model::store::WriteError::Refused(r)))?;
+    let (written, record, notes, trial_because) = match run_trial(
+        store,
+        corpus,
+        session,
+        updated,
+        Some(existing),
+        because,
+        &serve::teeth::Disputes::default(),
+        false,
+    ) {
+        serve::teeth::WriteTrial::Refused { message, receipt, .. } => return Err(trial_refusal(&message, &receipt)),
+        serve::teeth::WriteTrial::Unchanged { item, receipt } => (item, None, receipt, None),
+        serve::teeth::WriteTrial::Tried { item, record, receipt, because, .. } => (item, Some(record), receipt, because),
+    };
+    let mut baseline = existing.clone();
+    baseline.tags.retain(|t| !t.starts_with(model::store::TEETH_TAG_PREFIX));
+    if written.check.is_none() {
+        baseline.check = None;
+    }
+    let because = because.map(str::to_string).or(trial_because);
+    match model::store::revise_tried_scoped(
+        store,
+        SESSION_ID,
+        LINEAGE_ID,
+        ACTOR,
+        &baseline,
+        &written,
+        existing,
+        because.as_deref(),
+        None,
+        record.as_ref(),
+        None,
+    ) {
+        Ok(event) => {
+            let mut out = format!("{verb} '{}' (event seq {})", written.id, event.seq);
+            for line in notes {
+                out.push_str(&format!("\n  note: {line}"));
+            }
+            Ok(out)
+        }
+        Err(e) => Err(format!("REFUSED: {e}")),
+    }
+}
+
 
 // The four flat MCP check fields (check_kind/check_path/check_literal/
 // check_literals) are turned into `model::item::Check` by
@@ -1142,6 +1388,26 @@ pub struct RememberArgs {
     /// (or key) on this same call, or the write is refused anyway.
     #[serde(default)]
     pub new_collection_named_by_owner: Option<String>,
+    /// ONLY after a refusal said THOR built a tooth from this rule's own text and it bites: a real,
+    /// whole call you name as LEGITIMATE although that tooth refuses it - e.g. ["git push
+    /// --force-with-lease origin main"] for a rule whose text names `--force`. It must reach the
+    /// tooth's command, be refused by it, differ from the forbidden form THOR built itself, and
+    /// carry something beyond the command and the literal. Then the rule is stored as a note by
+    /// dispute, which doctor lists for the owner. Leave it out otherwise.
+    #[serde(default)]
+    pub legitimate_calls: Vec<String>,
+    /// ONLY after a refusal said THOR derived a contains check from this rule's text and a file: the
+    /// span you name as one that MAY CHANGE in that file - e.g. ["version"] for a rule that names
+    /// the version line of package.json. It must be exactly the derived check's literal. Then the
+    /// rule is stored as a note by dispute, which doctor lists for the owner. Leave it out otherwise.
+    #[serde(default)]
+    pub may_change: Vec<String>,
+    /// ONLY after a refusal said your check would refuse most of the real calls it reaches: one of
+    /// the calls it listed, named because refusing it IS the intent - e.g. ["git push origin main"]
+    /// for a "never push this repository until the owner says so" ban. The rule stays on the rule
+    /// track, and doctor lists every rule kept this way. Otherwise narrow the check instead.
+    #[serde(default)]
+    pub accept_refusing: Vec<String>,
 }
 
 /// `Default` is derived on purpose. Every field added here used to break
@@ -1285,21 +1551,6 @@ pub struct ReviseArgs {
     /// check instead.
     #[serde(default)]
     pub clear_check: bool,
-    /// Set true to only TRY the check given in this call (check_kind plus its
-    /// path/literals), together with any bindings given in this call, never
-    /// store them: the item keeps its current check and bindings, and every
-    /// other field in this call is written as usual. This is how a reason
-    /// that nothing can catch a rule's mistake ('no-literal:<why>' or
-    /// 'no-catch-on-command:<why>') earns its real try without hanging a
-    /// check live that you already expect to be wrong: send the reason tag
-    /// and the check you tried in the same call. THOR runs its own
-    /// write-time proof on the tried check and records the check and what the
-    /// proof found in this item's history. A tried check that turns out to
-    /// work (wired or proven) is refused as a trial - hang it for real
-    /// instead. Only a check that can refuse (forbidden, absent, absent_all,
-    /// requires) can be tried.
-    #[serde(default)]
-    pub trial_check: bool,
     /// Replaces the moment bindings. Give this, `targets`, and/or `always`
     /// TOGETHER to replace the WHOLE binding list in one call - when none of
     /// the three are given, the existing bindings are kept untouched. See
@@ -1322,17 +1573,39 @@ pub struct ReviseArgs {
     /// item under.
     #[serde(default)]
     pub new_collection_named_by_owner: Option<String>,
-    /// Required when this revise WEAKENS a Rule/Orientation that carries a
-    /// check: clearing or changing the check, lowering or clearing severity,
-    /// removing a binding (target, moment or Always), or narrowing scope
-    /// from global to one project. Say in one sentence why - it is written
-    /// into this item's own history (see `history`), the same way retract's
-    /// reason is, so the owner can read later why a rule that could refuse a
-    /// write lost its teeth. Blank or missing on one of those five is
-    /// refused outright. Accepted and stored on any other revise too, but
-    /// never required for one.
+    /// Required when this revise WEAKENS a Rule/Orientation: clearing or
+    /// changing its check, lowering or clearing severity, removing a binding
+    /// (a command, path or dir anchor on any rule; any binding on one that
+    /// carries a check or is marked expensive), narrowing scope from global
+    /// to one project, taking a fragment THOR builds teeth from (a backtick
+    /// span, a quoted call, a flag or a path) out of its text, or moving it
+    /// off the rule track. Say in one sentence why - it is written into this
+    /// item's own history (see `history`), the same way retract's reason is,
+    /// so the owner can read later why a rule lost its teeth. Blank or
+    /// missing on one of those is refused outright. Accepted and stored on
+    /// any other revise too, but never required for one.
     #[serde(default)]
     pub because: Option<String>,
+    /// ONLY after a refusal said THOR built a tooth from this rule's own text and it bites: a real,
+    /// whole call you name as LEGITIMATE although that tooth refuses it - e.g. ["git push
+    /// --force-with-lease origin main"] for a rule whose text names `--force`. It must reach the
+    /// tooth's command, be refused by it, differ from the forbidden form THOR built itself, and
+    /// carry something beyond the command and the literal. Then the rule is stored as a note by
+    /// dispute, which doctor lists for the owner. Leave it out otherwise.
+    #[serde(default)]
+    pub legitimate_calls: Vec<String>,
+    /// ONLY after a refusal said THOR derived a contains check from this rule's text and a file: the
+    /// span you name as one that MAY CHANGE in that file - e.g. ["version"] for a rule that names
+    /// the version line of package.json. It must be exactly the derived check's literal. Then the
+    /// rule is stored as a note by dispute, which doctor lists for the owner. Leave it out otherwise.
+    #[serde(default)]
+    pub may_change: Vec<String>,
+    /// ONLY after a refusal said your check would refuse most of the real calls it reaches: one of
+    /// the calls it listed, named because refusing it IS the intent - e.g. ["git push origin main"]
+    /// for a "never push this repository until the owner says so" ban. The rule stays on the rule
+    /// track, and doctor lists every rule kept this way. Otherwise narrow the check instead.
+    #[serde(default)]
+    pub accept_refusing: Vec<String>,
 }
 
 #[derive(Deserialize, Serialize, schemars::JsonSchema)]
@@ -1681,6 +1954,18 @@ pub struct ThorMcpServer {
     /// it, which is the right amount of memory for "did THIS conversation
     /// already say this".
     mark_history: Arc<Mutex<std::collections::HashMap<String, MarkRecord>>>,
+    /// The real calls in the log (`serve::legit::Corpus`) every trial reads:
+    /// loaded on the first write that runs one, then refreshed from the last
+    /// seq it read (inside `serve::teeth::trial_for_write`) - never reloaded
+    /// whole for each write.
+    corpus: Arc<Mutex<Option<serve::legit::Corpus>>>,
+    /// The session this server writes for (K20, K8(c)): its own checkout and
+    /// project, from the folder it was started in, and its Claude Code
+    /// session id. Only the stdio server a session starts has one
+    /// (`with_session`); a drain replaying a replica's queue and every
+    /// in-process test run with none, so no write there is judged as if it
+    /// came from inside a project.
+    session: serve::teeth::SessionCtx,
     #[allow(dead_code)] // read only inside the #[tool_handler] macro expansion
     tool_router: ToolRouter<Self>,
 }
@@ -1701,6 +1986,8 @@ impl ThorMcpServer {
             library: None,
             asked_piles: Arc::new(Mutex::new(std::collections::HashSet::new())),
             mark_history: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            corpus: Arc::new(Mutex::new(None)),
+            session: serve::teeth::SessionCtx::default(),
             tool_router: Self::tool_router(),
         }
     }
@@ -1723,6 +2010,8 @@ impl ThorMcpServer {
             library: None,
             asked_piles: Arc::new(Mutex::new(std::collections::HashSet::new())),
             mark_history: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            corpus: Arc::new(Mutex::new(None)),
+            session: serve::teeth::SessionCtx::default(),
             tool_router: Self::tool_router(),
         }
     }
@@ -1767,6 +2056,12 @@ impl ThorMcpServer {
     /// `worktree` field).
     pub fn with_worktree(mut self, worktree: PathBuf) -> Self {
         self.worktree = Some(Arc::new(worktree));
+        self
+    }
+
+    /// Name the session this server writes for (see the `session` field).
+    pub fn with_session(mut self, session: serve::teeth::SessionCtx) -> Self {
+        self.session = session;
         self
     }
 
@@ -1849,8 +2144,17 @@ impl ThorMcpServer {
         }
     }
 
-    #[tool(description = "Code lane: declares a NEW item (Rule, Orientation, Report, Lookup or Chunk) through the write gate. Call lookup first so this corrects an existing item instead of storing a near-duplicate; for anything about the owner's own life use shelve, never this. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refuses, with the exact reason and the fix, when a Rule/Orientation has no binding, no falsifier, or exceeds 300 characters, or when a Report/Chunk names no project scope; nothing is written on a refusal. check_kind/check_path/check_literal(s) optionally attach a machine-runnable proof alongside the falsifier - see server instructions for the six check kinds. Replies with the stored id, kind and event sequence, or the refusal text.", annotations(title = "Remember a fact", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false))]
+    #[tool(description = "Code lane: declares a NEW item (Rule, Orientation, Report, Lookup or Chunk) through the write gate. Call lookup first so this corrects an existing item instead of storing a near-duplicate; for anything about the owner's own life use shelve, never this. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refuses, with the exact reason and the fix, when a Rule/Orientation has no binding, no falsifier, or exceeds 300 characters, or when a Report/Chunk names no project scope; nothing is written on a refusal. check_kind/check_path/check_literal(s) optionally attach a machine-runnable proof alongside the falsifier - see server instructions for the six check kinds. Every Rule/Orientation is TRIED as it is written: a check that bites is stored on the rule track, a rule with no working tooth is stored as a note (no check), and a tooth THOR builds from the rule's own words that bites refuses the write, naming the exact check to hang - the reply's 'teeth:' note says which. Replies with the stored id, kind and event sequence, or the refusal text.", annotations(title = "Remember a fact", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false))]
     async fn remember(&self, Parameters(args): Parameters<RememberArgs>) -> String {
+        if self.inbox.is_some() {
+            let judged = {
+                let store = self.store.lock().unwrap_or_else(|p| p.into_inner());
+                replica_refusal_for_remember(&store, &args)
+            };
+            if let Err(refused) = judged {
+                return refused;
+            }
+        }
         if let Some(queued) = self.capture("remember", &args) {
             return queued;
         }
@@ -1858,64 +2162,39 @@ impl ThorMcpServer {
         let library = self.library.clone();
         let worktree = self.worktree.clone();
         let handover_db = self.handover_db.clone();
+        let corpus = self.corpus.clone();
+        let session = self.session.clone();
         self.blocking(move |s| {
-            // CHANGE 2, checked first and against the CALLER'S OWN tags,
-            // before anything else even looks at them: see
+            // Checked first, against the CALLER'S OWN tags: see
             // `refuse_a_forged_teeth_tag`'s own doc comment.
-            if let Err(why) = refuse_a_forged_teeth_tag(&args.tags) {
-                return Err(why);
-            }
-            let kind = Kind::from_str(&args.kind).map_err(|e| format!("invalid 'kind': {e}"))?;
-            let severity = match args.severity.as_deref() {
-                None => None,
-                Some(v) => Some(Severity::from_str(v).map_err(|e| format!("invalid 'severity': {e}"))?),
-            };
-            let bindings =
-                build_bindings(&args.moments, &args.targets, args.always).map_err(|e| format!("invalid binding: {e}"))?;
-            let check = model::gate::build_check(
-                args.check_kind.as_deref(),
-                args.check_path.clone(),
-                args.check_literal.clone(),
-                args.check_literals.clone(),
-            )
-            .map_err(|e| format!("invalid check: {e}"))?;
-            let mut item = Item {
-                id: args.id.clone(),
-                kind,
-                text: args.text.clone(),
-                bindings,
-                severity,
-                project: args.project.clone(),
-                tags: args.tags.clone(),
-                expires: args.expires.clone(),
-                key: args.key.clone(),
-                falsifier: args.falsifier.clone(),
-                check,
-            };
+            refuse_a_forged_teeth_tag(&args.tags)?;
+            let item = remembered_item(&args)?;
             refuse_a_worktree_only_check(
                 item.check.as_ref(),
                 root.as_deref().map(|p| p.as_path()),
                 worktree.as_deref().map(|p| p.as_path()),
             )?;
-            // CHANGE 2: heavy or refusing-kind-checked, the tool tries this
-            // fact's own teeth right here, before anything is stored, and
-            // appends the box it lands in as a tag `item` carries into
-            // `declare_in` below - never refusing on that account alone (see
-            // `apply_teeth_test`'s own doc comment for the ONE exception,
-            // which was already a refusal before this change).
-            let teeth_note = match apply_teeth_test(&mut item, root.as_deref().map(|p| p.as_path()), s) {
-                Ok(note) => note,
-                Err(why) => return Err(why),
-            };
-            if let Err(why) = refuse_a_new_collection(
+            refuse_a_new_collection(
                 &item,
                 s,
                 library.as_deref().map(|p| p.as_path()),
                 root.as_deref().map(|p| p.as_path()),
                 args.new_collection_named_by_owner.as_deref(),
-            ) {
-                return Err(why);
-            }
+            )?;
+            // The gate's own grounds before the trial, so a write the gate
+            // refuses anyway is never tried, and never recorded as a refused
+            // trial.
+            model::gate::declare(&normalized_item(&item)).map_err(|r| gate_refusal(r, s))?;
+            // THOR'S TRIAL (step 8): every Rule/Orientation, whatever its
+            // severity. It decides the check it is stored with and its label,
+            // or refuses it naming the one fix (recorded, never written on the
+            // item).
+            let disputes = disputes_of(&args.legitimate_calls, &args.may_change, &args.accept_refusing);
+            let (item, record, notes) = match run_trial(s, &corpus, &session, &item, None, None, &disputes, false) {
+                serve::teeth::WriteTrial::Refused { message, receipt, .. } => return Err(trial_refusal(&message, &receipt)),
+                serve::teeth::WriteTrial::Unchanged { item, receipt } => (item, None, receipt),
+                serve::teeth::WriteTrial::Tried { item, record, receipt, .. } => (item, Some(record), receipt),
+            };
             let scope = evaluation_scope(&item, handover_db.as_deref().map(|p| p.as_path()));
             match model::store::declare_in_scoped(
                 s,
@@ -1925,280 +2204,72 @@ impl ThorMcpServer {
                 &item,
                 root.as_deref().map(|p| p.as_path()),
                 scope.as_ref(),
+                record.as_ref(),
             ) {
-                Ok(event) => Ok(with_warnings(
-                    format!(
-                        "stored '{}' ({:?}, event seq {}){}",
-                        item.id,
-                        item.kind,
-                        event.seq,
-                        evaluation_receipt(s, &item, scope.as_ref())
-                    ),
-                    &item,
-                    None,
-                    root.as_deref().map(|p| p.as_path()),
-                    Some(s),
-                    teeth_note,
-                )),
+                Ok(event) => {
+                    let files = registered_root(s, &item);
+                    Ok(with_warnings(
+                        format!(
+                            "stored '{}' ({:?}, event seq {}){}",
+                            item.id,
+                            item.kind,
+                            event.seq,
+                            evaluation_receipt(s, &item, scope.as_ref())
+                        ),
+                        &item,
+                        None,
+                        files.as_deref(),
+                        Some(s),
+                        notes,
+                    ))
+                }
                 Err(e) => Err(with_scope_menu(format!("REFUSED: {e}"), s)),
             }
         })
         .await
     }
 
-    #[tool(description = "Code lane: corrects an EXISTING item by id through the same write gate as remember; a field left unmentioned keeps its current value, and none may silently vanish - clear one with clear_severity/clear_project/clear_expires/clear_key/clear_falsifier/clear_check; an empty string on the field is the harness-only equivalent, and a flag plus a real value for that field is refused. Weakening a checked rule (its check, severity, a binding, or scope) needs because: one sentence, kept in history. On a replica this queues instead of writing ('queued for the main machine' is not an error). Prefer this over remember for an existing item that merely changed; retract, with its own reason, is for one that is simply wrong. Refuses, with the exact reason, on remember's grounds, plus a dropped field or an unexplained weakening. Replies with the revised id and event sequence, or the refusal text.", annotations(title = "Revise an item", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false))]
+    #[tool(description = "Code lane: corrects an EXISTING item by id through the same write gate as remember; a field left unmentioned keeps its current value, and none may silently vanish - clear one with clear_severity/clear_project/clear_expires/clear_key/clear_falsifier/clear_check; an empty string on the field is the harness-only equivalent, and a flag plus a real value for that field is refused. Weakening a checked rule (its check, severity, a binding, or scope) needs because: one sentence, kept in history. On a replica this queues instead of writing ('queued for the main machine' is not an error). Prefer this over remember for an existing item that merely changed; retract, with its own reason, is for one that is simply wrong. Refuses, with the exact reason, on remember's grounds, plus a dropped field or an unexplained weakening. A revise that changes its text, anchors, check, project or severity is tried again (a revise naming only the id tries a rule no trial has decided yet); one that changes only tags, falsifier, expires or key keeps its verdict. Replies with the revised id and event sequence, or the refusal text.", annotations(title = "Revise an item", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false))]
     async fn revise(&self, Parameters(args): Parameters<ReviseArgs>) -> String {
+        if self.inbox.is_some() {
+            let judged = {
+                let store = self.store.lock().unwrap_or_else(|p| p.into_inner());
+                replica_refusal_for_revise(&store, &args)
+            };
+            if let Err(refused) = judged {
+                return refused;
+            }
+        }
         if let Some(queued) = self.capture("revise", &args) {
             return queued;
         }
-        // The checkout, for the notes that need to read a file (see
-        // `file_aware_warnings`). Cloned out here because the closure below
-        // cannot borrow self.
+        // The checkout this server was started in, for the worktree check and
+        // a new collection's own marker. Cloned out here because the closure
+        // below cannot borrow self.
         let revise_root = self.root.clone();
         let revise_library = self.library.clone();
         let revise_worktree = self.worktree.clone();
         let revise_handover_db = self.handover_db.clone();
+        let corpus = self.corpus.clone();
+        let session = self.session.clone();
         self.blocking(move |s| {
             let existing = model::store::show(s, &args.id).map_err(|e| format!("cannot revise: {e}"))?;
-            // CHANGE 2, checked first and only against a NEW tags list the
-            // caller actually supplies (an omitted `tags` carries `existing.
-            // tags` forward untouched, which may legitimately already carry
-            // this tool's own earlier answer - that is not a forgery, it is
-            // the label surviving a revise that never mentioned tags at all).
+            // Checked first and only against a NEW tags list the caller
+            // actually supplies (an omitted `tags` carries `existing.tags`
+            // forward, which may carry THOR's own label - that is not a
+            // forgery, it is the label surviving a revise that never
+            // mentioned tags at all).
             if let Some(new_tags) = args.tags.as_deref() {
-                if let Err(why) = refuse_a_forged_teeth_tag(new_tags) {
-                    return Err(why);
-                }
+                refuse_a_forged_teeth_tag(new_tags)?;
             }
-            let bindings = if args.moments.is_some() || args.targets.is_some() || args.always.is_some() {
-                build_bindings(
-                    args.moments.as_deref().unwrap_or(&[]),
-                    args.targets.as_deref().unwrap_or(&[]),
-                    args.always.unwrap_or(false),
-                )
-                .map_err(|e| format!("invalid binding: {e}"))?
-            } else {
-                existing.bindings.clone()
-            };
-            // Each field below also records whether THIS call is what
-            // cleared it - a deliberate clear (the flag, or an explicit
-            // empty string), never merely omitted - so `cleared` (built
-            // further down) can carry that intent to
-            // the write gate. `model::gate::revise`'s field-preservation
-            // check (ground 9) compares two finished `Item`s and cannot
-            // tell "the caller forgot to mention this" from "the caller
-            // asked to clear it": both end up as `existing.field.is_some()
-            // && updated.field.is_none()`. The bool captured right here,
-            // at the one place that still knows which it was, is what lets
-            // `ClearedFields::baseline` (see `model::gate`) tell the gate
-            // the difference without weakening it for anyone who never
-            // asked for a clear at all - see that function's own doc
-            // comment for the full reasoning, and this task's own report.
-            // WHAT COUNTS AS A CLEAR, and why an empty string is not the only
-            // spelling. The documented convention has always been "pass an
-            // empty string to clear", and for a caller that can actually send
-            // one - the JSON-RPC harness - it still works exactly as before.
-            // For an ASSISTANT it never worked: measured six times on
-            // 2026-08-06, an empty string does not survive the MCP call
-            // layer, and bitten twice more since (2026-09-09, 2026-09-11) by
-            // sessions that never found a way around it and gave up,
-            // retracting the rule they meant to correct instead - see
-            // `merge_clear_flag`'s own doc comment for the fix, the six
-            // `clear_*` booleans on `ReviseArgs` that reach this server from
-            // an assistant. Each field below merges its own flag with its own
-            // raw argument FIRST, so everything from here down reads one
-            // value exactly as it always read `args.<field>` - this match,
-            // and the `is_clear` check beside it, never change. A
-            // whitespace-only value still clears too, same as before: none of
-            // these five fields has any use for a value made of spaces.
-            let is_clear = |v: Option<&str>| matches!(v, Some(s) if s.trim().is_empty());
-            let severity_arg =
-                merge_clear_flag("severity", "clear_severity", args.severity.as_deref(), args.clear_severity)?;
-            let severity = match severity_arg.as_deref() {
-                None => existing.severity,
-                Some(v) if v.trim().is_empty() => None,
-                Some(v) => Some(Severity::from_str(v).map_err(|e| format!("invalid 'severity': {e}"))?),
-            };
-            let severity_cleared = is_clear(severity_arg.as_deref());
-            let project_arg =
-                merge_clear_flag("project", "clear_project", args.project.as_deref(), args.clear_project)?;
-            let project = match project_arg.as_deref() {
-                None => existing.project.clone(),
-                Some(p) if p.trim().is_empty() => None,
-                Some(p) => Some(p.to_string()),
-            };
-            let project_cleared = is_clear(project_arg.as_deref());
-            let expires_arg =
-                merge_clear_flag("expires", "clear_expires", args.expires.as_deref(), args.clear_expires)?;
-            let expires = match expires_arg.as_deref() {
-                None => existing.expires.clone(),
-                Some(e) if e.trim().is_empty() => None,
-                Some(e) => Some(e.to_string()),
-            };
-            let expires_cleared = is_clear(expires_arg.as_deref());
-            let key_arg = merge_clear_flag("key", "clear_key", args.key.as_deref(), args.clear_key)?;
-            let key = match key_arg.as_deref() {
-                None => existing.key.clone(),
-                Some(k) if k.trim().is_empty() => None,
-                Some(k) => Some(k.to_string()),
-            };
-            let key_cleared = is_clear(key_arg.as_deref());
-            let falsifier_arg =
-                merge_clear_flag("falsifier", "clear_falsifier", args.falsifier.as_deref(), args.clear_falsifier)?;
-            let falsifier = match falsifier_arg.as_deref() {
-                None => existing.falsifier.clone(),
-                Some(f) if f.trim().is_empty() => None,
-                Some(f) => Some(f.to_string()),
-            };
-            let falsifier_cleared = is_clear(falsifier_arg.as_deref());
-            // Same "omit keeps, empty clears" convention as the five string
-            // fields above, but `tags` is a LIST: `Option<Vec<String>>`
-            // already tells "omitted" (`None`) apart from "given, but
-            // deliberately empty" (`Some(vec![])`) without any string-trim
-            // heuristic, because an empty JSON array survives the MCP call
-            // layer exactly like a non-empty one - the transport quirk
-            // `is_clear` works around for a bare empty string never applied
-            // to a list. `model::gate::ClearedFields` (the six-field signal
-            // `severity`/`project`/`expires`/`key`/`falsifier`/`check` use to
-            // tell ground 9 a deliberate clear apart from a silent drop)
-            // deliberately has no `tags` member - see that type's own doc
-            // comment - so this stays a purely local MCP-layer signal: the
-            // caller's intent is already fully captured in `args.tags`
-            // itself, and `gate_existing` below is blanked by hand the same
-            // way `ClearedFields::baseline` blanks its own six fields, for
-            // the one field that type does not cover.
-            let tags_cleared = matches!(args.tags.as_deref(), Some(t) if t.is_empty());
-            // Same convention as every flat MCP check field: omitting
-            // check_kind/check_path/check_literal/check_literals ALL FOUR
-            // keeps the existing check untouched (mirrors `bindings` above -
-            // nothing mentioned means nothing changes). check_literals is a
-            // `Vec`, not an `Option`, so it has no way to say "given, but
-            // deliberately empty" the way check_kind's "" does - an empty
-            // check_literals is therefore treated exactly like an omitted
-            // one here, consistent with how `gate::build_check` itself reads
-            // an empty list for check_kind absent_all (see that function's
-            // own doc comment). check_kind "" clears it, refused if
-            // check_path/check_literal/check_literals are also given (a
-            // self-contradictory request: clear AND set at once).
-            // `clear_check` (see its own doc comment on `ReviseArgs` for the
-            // defect it fixes) is folded into `check_kind` right here, before
-            // any of that runs, so a caller that sends the flag is refused by
-            // the exact same check_path/check_literal/check_literals branch
-            // below, for the exact same reason. Anything else runs through
-            // the same gate::build_check remember uses, replacing the check
-            // wholesale.
-            let check_kind_arg = if args.clear_check {
-                if let Some(k) = args.check_kind.as_deref() {
-                    if !k.trim().is_empty() {
-                        return Err(format!(
-                            "invalid 'check_kind': clear_check was true but check_kind was also \
-                             given as {k:?} - give one or the other, never both"
-                        ));
-                    }
-                }
-                Some(String::new())
-            } else {
-                args.check_kind.clone()
-            };
-            let check = if check_kind_arg.is_none()
-                && args.check_path.is_none()
-                && args.check_literal.is_none()
-                && args.check_literals.is_empty()
-            {
-                existing.check.clone()
-            } else if check_kind_arg.as_deref() == Some("") {
-                if args.check_path.is_some() || args.check_literal.is_some() || !args.check_literals.is_empty() {
-                    return Err(
-                        "invalid check: the check was cleared (check_kind \"\" or clear_check) but \
-                         check_path, check_literal or check_literals was also given - clearing a \
-                         check takes none of them; drop them to clear the check, or give a real \
-                         check_kind to replace it instead"
-                            .to_string(),
-                    );
-                }
-                None
-            } else {
-                model::gate::build_check(
-                    check_kind_arg.as_deref(),
-                    args.check_path.clone(),
-                    args.check_literal.clone(),
-                    args.check_literals.clone(),
-                )
-                .map_err(|e| format!("invalid check: {e}"))?
-            };
-            let check_cleared = check_kind_arg.as_deref() == Some("");
-            // Prefixed like every other refusal on this surface: a caller
-            // that keys on "REFUSED" must not have to learn a second shape
-            // just because the reason came from the edit modes.
-            let text = edited_text(&existing.text, &args).map_err(|e| format!("REFUSED: {e}"))?;
-            let mut updated = Item {
-                id: existing.id.clone(),
-                kind: existing.kind,
-                text,
-                bindings,
-                severity,
-                project,
-                tags: args.tags.clone().unwrap_or_else(|| existing.tags.clone()),
-                expires,
-                key,
-                falsifier,
-                check,
-            };
-            // `existing` itself is used by `model::store::revise` for
-            // exactly one thing: the ground-9 comparison against `updated`
-            // (the persisted body always comes from `updated` - see
-            // `store::revise`'s own body). Handing it the CLEARED baseline
-            // instead of the raw `existing` is what turns a field named
-            // here into a legitimate drop, without touching `revise`
-            // itself or its own unconditional protection for every field
-            // NOT named - see `model::gate::ClearedFields` for why this is
-            // sound and `model/src/gate.rs`'s own `cleared_fields` tests.
-            let cleared = model::gate::ClearedFields {
-                severity: severity_cleared,
-                project: project_cleared,
-                expires: expires_cleared,
-                key: key_cleared,
-                falsifier: falsifier_cleared,
-                check: check_cleared,
-            };
-            let mut gate_existing = cleared.baseline(&existing);
-            // `ClearedFields::baseline` above only knows the six fields it
-            // was built for. `tags` never joined that type (see
-            // `tags_cleared`'s own comment), so its baseline is blanked
-            // right here instead, by the same reasoning: ground 9 in
-            // `model::gate::revise` sees only `gate_existing`/`updated`, and
-            // `store::revise` uses `gate_existing` for nothing but that one
-            // comparison - the persisted body always comes from `updated`
-            // (see `model::store::revise`'s own body) - so blanking `tags`
-            // on a value that is never written keeps the check honest
-            // without needing the model crate to know this call asked for a
-            // deliberate clear.
-            if tags_cleared {
-                gate_existing.tags = Vec::new();
-            }
-            // A TRIAL (see `ReviseArgs::trial_check`): the check and bindings
-            // named in this call are only tried, and the item keeps its own.
-            let tried = if args.trial_check {
-                if check_kind_arg.as_deref().is_none_or(|k| k.trim().is_empty()) {
-                    return Err("REFUSED: trial_check needs the check to try in this same call: check_kind plus its \
-                                check_path, check_literal or check_literals (clear_check cannot be tried)"
-                        .to_string());
-                }
-                let trial_item = updated.clone();
-                updated.check = existing.check.clone();
-                updated.bindings = existing.bindings.clone();
-                Some(trial_outcome(&existing, &trial_item, revise_root.as_deref().map(|p| p.as_path()), s)?)
-            } else {
-                None
-            };
-            // CHANGE 2: unless this revise touches none of the check, the
-            // bindings or the severity of an item that already carries a
-            // box, in which case that box is carried forward untouched and
-            // nothing is tried again - see
-            // `apply_teeth_test_for_revise`'s own doc comment. Computed
-            // against the TRUE `existing`, never `gate_existing`, for the
-            // identical reason `weakenings` below is: a field blanked for a
-            // legitimate clear must still read as the change it is.
+            let RevisePlan { mut updated, mut gate_existing, tags_cleared, bare } = plan_revise(&existing, &args)?;
+            // THOR's own `teeth:` label is never the writer's: an omitted
+            // `tags` carries the head's label forward, and the trial replaces
+            // it (or keeps the head's when it runs none) - so the write is
+            // judged without it. Otherwise a note's label beside the check
+            // this revise hangs would read as the note track carrying a check.
+            updated.tags.retain(|t| !t.starts_with(model::store::TEETH_TAG_PREFIX));
+            gate_existing.tags.retain(|t| !t.starts_with(model::store::TEETH_TAG_PREFIX));
             // Only a check this call attaches or changes: a revise that leaves
             // an existing check alone is not attaching anything.
             if updated.check != existing.check {
@@ -2208,79 +2279,86 @@ impl ThorMcpServer {
                     revise_worktree.as_deref().map(|p| p.as_path()),
                 )?;
             }
-            let teeth_note = match apply_teeth_test_for_revise(&existing, &mut updated, revise_root.as_deref().map(|p| p.as_path()), s) {
-                Ok(note) => note,
-                Err(why) => return Err(why),
-            };
             // And the same door as remember on where this gets FILED: moving an
             // item into a collection nobody has named is opening one, whichever
             // tool does it.
-            if let Err(why) = refuse_a_new_collection(
+            refuse_a_new_collection(
                 &updated,
                 s,
                 revise_library.as_deref().map(|p| p.as_path()),
                 revise_root.as_deref().map(|p| p.as_path()),
                 args.new_collection_named_by_owner.as_deref(),
-            ) {
-                return Err(why);
-            }
-            // Computed from the TRUE `existing` (never `gate_existing`) for
-            // exactly the reason `gate::weakenings`'s own doc comment gives:
+            )?;
+            // The gate's own grounds, then the weakening ground, before the
+            // trial: a write refused on those is never tried. Judged against
+            // the TRUE `existing` for the weakenings (never `gate_existing`):
             // a check or severity `ClearedFields` blanked for a legitimate
-            // clear must still be named here, and `gate_existing` is
-            // precisely the value that blanking hides it behind.
-            let weakenings = model::gate::weakenings(&existing, &updated);
-            let scope = evaluation_scope(&updated, revise_handover_db.as_deref().map(|p| p.as_path()));
+            // clear must still read as the change it is.
+            model::gate::revise(&normalized_item(&gate_existing), &normalized_item(&updated))
+                .map_err(|r| gate_refusal(r, s))?;
+            model::gate::revise_weakening(&normalized_item(&existing), &normalized_item(&updated), args.because.as_deref())
+                .map_err(|r| gate_refusal(r, s))?;
+            let disputes = disputes_of(&args.legitimate_calls, &args.may_change, &args.accept_refusing);
+            let trial = run_trial(s, &corpus, &session, &updated, Some(&existing), args.because.as_deref(), &disputes, bare);
+            let (written, record, notes, unchanged, trial_because) = match trial {
+                serve::teeth::WriteTrial::Refused { message, receipt, .. } => return Err(trial_refusal(&message, &receipt)),
+                serve::teeth::WriteTrial::Unchanged { item, receipt } => (item, None, receipt, true, None),
+                serve::teeth::WriteTrial::Tried { item, record, receipt, because, .. } => {
+                    (item, Some(record), receipt, false, because)
+                }
+            };
+            // A trial that put the rule on the note track cleared the check
+            // it carried: the baseline says so, or the field-preservation
+            // ground would read the missing check as a silent loss. The
+            // `teeth:` label is the trial's to set or drop, never the
+            // writer's, so it is never a field this write can lose either.
+            if written.check.is_none() {
+                gate_existing.check = None;
+            }
+            gate_existing.tags.retain(|t| !t.starts_with(model::store::TEETH_TAG_PREFIX));
+            let because = args.because.clone().or(trial_because);
+            let weakenings = model::gate::weakenings_widened(&normalized_item(&existing), &normalized_item(&written));
+            let scope = evaluation_scope(&written, revise_handover_db.as_deref().map(|p| p.as_path()));
             match model::store::revise_tried_scoped(
                 s,
                 SESSION_ID,
                 LINEAGE_ID,
                 ACTOR,
                 &gate_existing,
-                &updated,
+                &written,
                 &existing,
-                args.because.as_deref(),
+                because.as_deref(),
                 scope.as_ref(),
-                tried.as_ref(),
+                record.as_ref(),
+                None,
             ) {
                 Ok(event) => {
                     // A deliberate clear is the one revise outcome that is
                     // easy to mistake for a no-op reply - "revised" alone
-                    // does not say whether the tags actually went away, so
-                    // a caller who cleared the last tag on purpose gets it
-                    // named here rather than having to `get` the item back
-                    // to confirm the list is really empty now.
+                    // does not say whether the tags actually went away.
                     let mut success = if tags_cleared {
-                        format!("revised '{}' (event seq {}, tags cleared)", updated.id, event.seq)
+                        format!("revised '{}' (event seq {}, tags cleared)", written.id, event.seq)
                     } else {
-                        format!("revised '{}' (event seq {})", updated.id, event.seq)
+                        format!("revised '{}' (event seq {})", written.id, event.seq)
                     };
-                    if let Some(tried) = &tried {
-                        success.push_str(&format!(
-                            "\n  trial: the check you tried was not stored - {}. The try is recorded in this item's \
-                             history.",
-                            tried.outcome
-                        ));
+                    // No trial ran: the one line that says so, and why the
+                    // verdict it had still stands (or that it has none).
+                    let mut notes = notes;
+                    if unchanged && !notes.is_empty() {
+                        success.push_str(&format!(" - {}", notes.remove(0)));
                     }
-                    // Named here too, for the identical reason: "revised"
-                    // alone does not say a checked rule just lost its teeth,
-                    // and the caller should not have to `history` the item
-                    // back to learn that this call was the one that did it.
+                    // Named here too: "revised" alone does not say a rule just
+                    // lost its teeth, and the caller should not have to
+                    // `history` the item back to learn that this call did it.
                     if !weakenings.is_empty() {
                         let labels: Vec<&str> = weakenings.iter().map(|w| w.label).collect();
                         success.push_str(&format!(" - weakened: {}", labels.join(", ")));
-                        if let Some(reason) = args.because.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
+                        if let Some(reason) = because.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
                             success.push_str(&format!("; because: {reason}"));
                         }
                     }
-                    Ok(with_warnings(
-                        success,
-                        &updated,
-                        Some(&existing),
-                        revise_root.as_deref().map(|p| p.as_path()),
-                        Some(s),
-                        teeth_note,
-                    ))
+                    let files = registered_root(s, &written);
+                    Ok(with_warnings(success, &written, Some(&existing), files.as_deref(), Some(s), notes))
                 }
                 Err(e) => Err(with_scope_menu(format!("REFUSED: {e}"), s)),
             }
@@ -2295,14 +2373,18 @@ impl ThorMcpServer {
     /// its own here) - but this crate had no way for an agent to add or
     /// remove that binding during a session at all. 1.0 had
     /// `pin`/`unpin`; 2.0 simply had no tool onto the same capability. Both
-    /// go through `model::store::revise`, so the write gate still governs
-    /// what may carry an `Always` binding (a Report or Chunk carrying any
-    /// binding at all is refused there, exactly as it is for `remember`).
+    /// go through `model::store`'s revise path, so the write gate still
+    /// governs what may carry an `Always` binding (a Report or Chunk carrying
+    /// any binding at all is refused there, exactly as it is for `remember`),
+    /// and both are tried like any revise: the binding is the rule's reach
+    /// (`write_binding_change`).
     #[tool(description = "Code lane: adds the Always binding to an existing item, so it is served in full at every session start; every other binding and field stays untouched. A pinned item owes no verdict from that point on - mark refuses it and points back here to unpin. Use revise instead when anything besides the binding needs to change. Idempotent - pinning an already-pinned item changes nothing and is not an error. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refused, loudly, when the item's kind may carry no binding at all (a Report or Chunk). Replies 'pinned' with the event sequence, 'already pinned', or the refusal text.", annotations(title = "Pin an item", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn pin(&self, Parameters(args): Parameters<PinArgs>) -> String {
         if let Some(queued) = self.capture("pin", &args) {
             return queued;
         }
+        let corpus = self.corpus.clone();
+        let session = self.session.clone();
         self.blocking(move |s| {
             let existing = model::store::show(s, &args.id).map_err(|e| format!("cannot pin: {e}"))?;
             if existing.bindings.contains(&Binding::Always) {
@@ -2310,10 +2392,7 @@ impl ThorMcpServer {
             }
             let mut updated = existing.clone();
             updated.bindings.push(Binding::Always);
-            match model::store::revise(s, SESSION_ID, LINEAGE_ID, ACTOR, &existing, &updated) {
-                Ok(event) => Ok(format!("pinned '{}' (event seq {})", updated.id, event.seq)),
-                Err(e) => Err(format!("REFUSED: {e}")),
-            }
+            write_binding_change(s, &corpus, &session, &existing, &updated, None, "pinned")
         })
         .await
     }
@@ -2323,6 +2402,8 @@ impl ThorMcpServer {
         if let Some(queued) = self.capture("unpin", &args) {
             return queued;
         }
+        let corpus = self.corpus.clone();
+        let session = self.session.clone();
         self.blocking(move |s| {
             let existing = model::store::show(s, &args.id).map_err(|e| format!("cannot unpin: {e}"))?;
             if !existing.bindings.contains(&Binding::Always) {
@@ -2340,10 +2421,7 @@ impl ThorMcpServer {
             }
             let mut updated = existing.clone();
             updated.bindings = remaining;
-            match model::store::revise(s, SESSION_ID, LINEAGE_ID, ACTOR, &existing, &updated) {
-                Ok(event) => Ok(format!("unpinned '{}' (event seq {})", updated.id, event.seq)),
-                Err(e) => Err(format!("REFUSED: {e}")),
-            }
+            write_binding_change(s, &corpus, &session, &existing, &updated, Some(UNPIN_BECAUSE), "unpinned")
         })
         .await
     }
@@ -2904,6 +2982,17 @@ impl ThorMcpServer {
                     if let Some(reason) = &rev.because {
                         out.push_str(&format!(" (because: {reason})"));
                     }
+                    // THOR's own mark (Q24), from the step's trial record -
+                    // never from anything a writer passes: an old contains
+                    // check counted as a tooth although the text does not
+                    // name it, and the fragment it guards, so a reader can
+                    // judge whether it guards the rule's subject.
+                    if let Some(mark) = &rev.a4_old_stock {
+                        out.push_str(&format!(
+                            " (THOR: old contains check counted as a tooth although the text does not name it - {})",
+                            mark.describe()
+                        ));
+                    }
                     out.push('\n');
                 }
                 Ok(out)
@@ -3226,6 +3315,19 @@ pub fn run_in(db: &Path, code: Option<CodeIndexPaths>, root: Option<PathBuf>, wo
     .with_library(library::default_path(db))
     // The hook's evaluation handover lives beside the store.
     .with_evaluation_handover(db.to_path_buf());
+    // The session this server writes for (K20, K8(c)): Claude Code starts it
+    // in the session's own project folder, so that folder's checkout and
+    // project are the session's own, and its session id is in the
+    // environment. Only for the refusal that names the one fix to run right
+    // here, the pending check of a worktree, and which real calls are the
+    // writer's own - the trial's root is always the project's REGISTERED
+    // working copy, never this folder.
+    let session = serve::teeth::SessionCtx {
+        own_checkout: worktree.clone().or_else(|| root.clone()),
+        own_project: std::env::current_dir().ok().and_then(|cwd| serve::project::resolve_project(&cwd)),
+        session_id: std::env::var("CLAUDE_CODE_SESSION_ID").ok().filter(|id| !id.trim().is_empty()),
+    };
+    let server = server.with_session(session);
     let server = match root {
         Some(root) => server.with_root(root),
         None => server,
@@ -3342,6 +3444,10 @@ mod tests {
     use super::*;
     use model::item::{Check, Kind as ItemKind, Severity as ItemSeverity};
 
+    /// A Claude Code session id, the shape `serve::attest` requires of a
+    /// session whose refusals count as field evidence.
+    const FIXTURE_SESSION: &str = "0de7dc52-1b97-4b66-948f-61e4438043b2";
+
     fn server() -> ThorMcpServer {
         ThorMcpServer::new(EventStore::in_memory().unwrap())
     }
@@ -3390,9 +3496,100 @@ mod tests {
         );
     }
 
+    // --------------------------------------------- two-track fixtures (step 8)
+
+    /// `tags` without THOR's own `teeth:` label - the label every tried
+    /// Rule/Orientation carries since step 8, which a test about the
+    /// writer's own tags does not care about.
+    fn teeth_free(tags: &[String]) -> Vec<String> {
+        tags.iter().filter(|t| !t.starts_with(model::store::TEETH_TAG_PREFIX)).cloned().collect()
+    }
+
+    /// The check the roadmap fixtures carry: a forbidden marker on an Always
+    /// rule, named in the text (A4) and biting through THOR's own trial (a
+    /// write carrying it is refused, an empty one is not) - so these tests
+    /// about check PLUMBING keep a real, stored check with no working copy.
+    fn roadmap_check() -> Check {
+        Check::Forbidden { literals: vec!["zz-roadmap-marker".to_string()] }
+    }
+
+    fn roadmap_rule(id: &str) -> RememberArgs {
+        let mut args = base_remember(id);
+        // A check that refuses and a reason tag saying nothing can catch the
+        // mistake are never introduced together (the gate refuses it).
+        args.tags = vec!["roadmap".to_string()];
+        args.text = "the roadmap lives in ROADMAP.md at the repo root; never write zz-roadmap-marker".to_string();
+        args.check_kind = Some("forbidden".to_string());
+        args.check_literals = vec!["zz-roadmap-marker".to_string()];
+        args
+    }
+
+    /// A git checkout of project `key` holding `files`, registered as that
+    /// project's working copy the way the installer writes it (raw: a test
+    /// holds no `SystemActor`). Its own empty hooks path (builder rule 11).
+    fn registered_checkout(srv: &ThorMcpServer, key: &str, files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(key);
+        std::fs::create_dir_all(&root).unwrap();
+        let hooks = dir.path().join("no-hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        for args in [vec!["init", "-q"], vec!["config", "core.hooksPath", hooks.to_str().unwrap()]] {
+            let out = std::process::Command::new("git").arg("-C").arg(&root).args(&args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        }
+        std::fs::write(root.join(".thor-project"), format!("{key}\n")).unwrap();
+        for (rel, content) in files {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        let top = serve::project::checkout_top(&root);
+        let record = Item {
+            id: model::store::project_opened_id(key),
+            kind: Kind::Report,
+            text: format!("Project {key}: a fixture record."),
+            bindings: vec![],
+            severity: None,
+            project: Some(key.to_string()),
+            tags: vec!["project-record".to_string()],
+            expires: None,
+            key: None,
+            falsifier: None,
+            check: None,
+        };
+        let body = model::store::canonical_body(&record).unwrap();
+        let body = format!(
+            "{},\"root\":{},\"root_at\":\"2026-09-28T10:00:00Z\"}}",
+            &body[..body.len() - 1],
+            serde_json::to_string(&top.to_string_lossy()).unwrap()
+        );
+        srv.store
+            .lock()
+            .unwrap()
+            .append_event("install", "install", "installer", thor_core::event_store::EventKind::FactCreated, &record.id, None, &body)
+            .unwrap();
+        assert!(serve::project::registered_checkout(&srv.store.lock().unwrap(), Some(key)).is_ok(), "fixture: registered");
+        dir
+    }
+
+    /// An item written straight into the log, the way an older build wrote
+    /// it - for a test about what the log already holds (a check that went
+    /// false), which the trial would refuse to write today.
+    fn seed_raw(srv: &ThorMcpServer, item: &Item) {
+        let body = serde_json::to_string(item).unwrap();
+        srv.store
+            .lock()
+            .unwrap()
+            .append_event("legacy", &item.id, "migration", thor_core::event_store::EventKind::FactCreated, &item.id, None, &body)
+            .unwrap();
+    }
+
     fn base_remember(id: &str) -> RememberArgs {
         RememberArgs {
             new_collection_named_by_owner: None,
+            legitimate_calls: vec![],
+            may_change: vec![],
+            accept_refusing: vec![],
             id: id.to_string(),
             kind: "rule".to_string(),
             text: "never force-push to main".to_string(),
@@ -3444,32 +3641,22 @@ mod tests {
         assert!(events.is_empty(), "a refused remember must write nothing at all, found: {events:?}");
     }
 
-    /// THE GAP THIS CLOSES (measured 2026-09-17 on the owner's own live
-    /// store): gate ground 11 has asked this question of a heavy Rule since
-    /// 2026-08-09, but was gated to `Kind::Rule` alone, so a heavy
-    /// Orientation could carry neither a check nor a no-literal reason and
-    /// still be remembered - 7 of them had, all written in the week before
-    /// this test. Proven at the actual MCP surface, not just against
-    /// `model::gate` directly, since that is the door a session really
-    /// writes through.
+    /// Step 8: a heavy Orientation with no check and no reason tag is no
+    /// longer refused for lacking an answer to the old teeth question - it is
+    /// TRIED like every Rule/Orientation, and with nothing to build a tooth
+    /// from it lands as a note. Proven at the MCP surface, the door a session
+    /// really writes through.
     #[tokio::test]
-    async fn a_heavy_orientation_with_no_check_is_refused_at_the_remember_surface() {
+    async fn a_heavy_orientation_with_no_check_is_tried_and_stored_as_a_note() {
         let srv = server();
         let mut args = base_remember("heavy-orientation-no-check-1");
         args.kind = "orientation".to_string();
-        args.tags = vec![]; // no no-literal answer either - the gap this closes
+        args.tags = vec![];
         let reply = srv.remember(Parameters(args)).await;
-        assert!(reply.contains("REFUSED"), "expected a loud refusal, got: {reply}");
-        assert!(reply.contains("no check"), "expected the teeth question to fire: {reply}");
-        assert!(
-            reply.contains(model::store::NO_LITERAL_REASON_PREFIX),
-            "expected the fix to name the way out: {reply}"
-        );
-
-        let events = srv.store.lock().unwrap().get_all_events().unwrap();
-        assert!(events.is_empty(), "a refused remember must write nothing at all, found: {events:?}");
+        assert!(reply.starts_with("stored "), "{reply}");
+        assert!(reply.contains("teeth: note - "), "{reply}");
+        assert!(!reply.contains(model::store::NO_LITERAL_REASON_PREFIX), "no reason tag is asked for: {reply}");
     }
-
     #[tokio::test]
     async fn a_refused_revise_that_drops_a_field_is_loud_and_writes_nothing() {
         // `tags` used to be the fixture field for this test, but it now
@@ -3527,7 +3714,9 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
-            trial_check: false,
+            legitimate_calls: vec![],
+            may_change: vec![],
+            accept_refusing: vec![],
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.contains("REFUSED"), "expected a loud refusal, got: {reply}");
@@ -3768,12 +3957,12 @@ mod tests {
         let mut args = base_remember("warned-item");
         // Six characters: past the length the gate refuses outright, still
         // short enough to be the smell `check_warnings` reports. This is the
-        // measured example - a check on "INSERT" that claimed to guard admin
-        // settings and matched seven times, including inside "INSERT OR
-        // REPLACE".
-        args.check_kind = Some("contains".to_string());
-        args.check_path = Some("src/main.rs".to_string());
-        args.check_literal = Some("INSERT".to_string());
+        // measured example - a check on "INSERT" that matched seven times,
+        // including inside "INSERT OR REPLACE". Named in the text (A4).
+        args.text = "never write INSERT into a file".to_string();
+        args.tags = vec![];
+        args.check_kind = Some("forbidden".to_string());
+        args.check_literals = vec!["INSERT".to_string()];
 
         let reply = srv.remember(Parameters(args)).await;
         assert!(reply.starts_with("stored "), "the success prefix must survive: {reply}");
@@ -3783,52 +3972,68 @@ mod tests {
         let events = srv.store.lock().unwrap().get_all_events().unwrap();
         assert_eq!(events.len(), 1, "a warned write is still a write: it must have landed");
     }
-
-    /// A clean item must stay clean: no note, no trailing whitespace, nothing
-    /// for a reader to wonder about.
-    ///
-    /// UPDATED FOR CHANGE 2 (2026-09-24): `base_remember`'s own fixture is
-    /// `severity: irreversible` with no check - exactly the shape Change 2
-    /// now requires a teeth note for (heavy, nothing to synthesise, the
-    /// informing box). "No note at all" stopped being true for THAT fixture
-    /// the moment this tool started trying teeth unasked; this test's own
-    /// point - that a write with nothing ELSE wrong about it carries no
-    /// OTHER note - still holds, proven here with severity lowered so Change
-    /// 2 itself does not apply and the original assertion is exactly true
-    /// again.
+    /// A clean item stays clean: its one note is THOR's trial receipt (every
+    /// Rule/Orientation is tried since step 8), and nothing else - no warning,
+    /// no trailing whitespace, nothing for a reader to wonder about.
     #[tokio::test]
-    async fn a_clean_write_gets_no_note_at_all() {
+    async fn a_clean_write_gets_no_note_beyond_its_trial_receipt() {
         let srv = server();
         let mut args = base_remember("clean-item");
         args.severity = Some("house_style".to_string());
         let reply = srv.remember(Parameters(args)).await;
         assert!(reply.starts_with("stored "), "{reply}");
-        assert!(!reply.contains("note:"), "nothing to warn about, so nothing may be said: {reply}");
+        let notes: Vec<&str> = reply.lines().filter(|l| l.contains("note:")).collect();
+        assert_eq!(notes.len(), 1, "one note, the trial receipt: {reply}");
+        assert!(notes[0].trim_start().starts_with("note: teeth: note - "), "{reply}");
+        assert!(!reply.ends_with(' ') && !reply.ends_with('\n'), "{reply:?}");
     }
-
-    /// The companion case Change 2 actually adds: `base_remember`'s own
-    /// fixture, UNCHANGED (heavy, no check), now carries exactly one note -
-    /// the teeth receipt, landing it in the informing box because there was
-    /// nothing to synthesise at all - and the stored item carries the
-    /// reserved tag nothing but this tool could have set.
+    /// G8.2 (note half): a rule with nothing in its text or anchors to build
+    /// a tooth from is stored as a NOTE - the receipt says why, the stored
+    /// item carries `teeth:note` and no check, and its severity is kept (a
+    /// note still surfaces at its moment, ranked by it).
     #[tokio::test]
-    async fn a_heavy_checkless_write_now_carries_the_teeth_informing_note_and_tag() {
+    async fn a_heavy_checkless_write_with_nothing_to_build_from_is_stored_as_a_note() {
         let srv = server();
         let reply = srv.remember(Parameters(base_remember("heavy-checkless"))).await;
         assert!(reply.starts_with("stored "), "{reply}");
-        assert!(reply.contains("note:"), "a heavy checkless write now owes a teeth receipt: {reply}");
-        assert!(reply.contains("teeth: informing only"), "{reply}");
-        assert!(reply.contains("nothing to try"), "{reply}");
-
+        assert!(
+            reply.contains("teeth: note - nothing in the text or anchors to build a tooth from (no flag, quoted call, backtick span or path)"),
+            "{reply}"
+        );
         let get_reply = srv.get(Parameters(GetArgs { id: "heavy-checkless".to_string() })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
-        assert!(
-            item.tags.iter().any(|t| t == model::store::TEETH_INFORMING_TAG),
-            "the stored item must carry the reserved informing tag: {:?}",
-            item.tags
-        );
+        assert!(item.tags.iter().any(|t| t == model::store::TEETH_NOTE_TAG), "{:?}", item.tags);
+        assert!(item.check.is_none());
+        assert_eq!(item.severity, Some(ItemSeverity::Irreversible), "a note keeps its severity");
+        assert_eq!(model::store::current_verdict(&srv.store.lock().unwrap(), "heavy-checkless"), model::store::CurrentVerdict::Note);
     }
-
+    /// R8.3, the "elsewhere" half (K20): a file check whose project has no
+    /// registered working copy, written by a session that is not inside that
+    /// project (here: no session at all), is stored as a NOTE with the check
+    /// kept pending in its record - never refused, never hung untried.
+    #[tokio::test]
+    async fn a_file_check_with_no_registered_working_copy_is_stored_as_a_note_with_it_pending() {
+        let srv = server_knowing(&["gamma"]);
+        let mut args = base_remember("heavy-contains");
+        args.project = Some("gamma".to_string());
+        args.text = "README.md must keep its TODO list".to_string();
+        args.check_kind = Some("contains".to_string());
+        args.check_path = Some("README.md".to_string());
+        args.check_literal = Some("TODO".to_string());
+        let reply = srv.remember(Parameters(args)).await;
+        assert!(reply.starts_with("stored "), "{reply}");
+        assert!(
+            reply.contains(
+                "teeth: note - this file check could not be tried here because 'gamma' has no registered working copy on \
+                 this machine; THOR tries it again"
+            ),
+            "{reply}"
+        );
+        let get_reply = srv.get(Parameters(GetArgs { id: "heavy-contains".to_string() })).await;
+        let item: Item = serde_json::from_str(&get_reply).unwrap();
+        assert!(item.check.is_none(), "a pending check is never on the item");
+        assert!(item.tags.iter().any(|t| t == model::store::TEETH_NOTE_TAG), "{:?}", item.tags);
+    }
     // --------------------------------------------------------- CHANGE 2 tests
 
     fn bare_revise(id: &str) -> ReviseArgs {
@@ -3859,7 +4064,9 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
-            trial_check: false,
+            legitimate_calls: vec![],
+            may_change: vec![],
+            accept_refusing: vec![],
         }
     }
 
@@ -3887,18 +4094,21 @@ mod tests {
         assert!(reply.contains(model::store::TEETH_TAG_PREFIX), "{reply}");
     }
 
-    /// THE PRIMARY CLAIM, REVISED 2026-09-26: a fact whose check reaches and
-    /// matches is stored WIRED, labelled by the tool, never the writer - and
-    /// never proven, because both attempts were built from its own literal.
-    /// Proof comes from the log (see `serve::prove`'s "against reality").
+    /// THE PRIMARY CLAIM: a fact whose check bites through THOR's own trial
+    /// is stored WIRED, labelled by the trial, never the writer - and never
+    /// proven, because every form was built from its own literal. Proof comes
+    /// from the log (a real refusal under the check).
     #[tokio::test]
     async fn remember_with_a_reachable_forbidden_check_is_stored_wired_never_proven() {
         let srv = server();
         let args = RememberArgs {
             new_collection_named_by_owner: None,
+            legitimate_calls: vec![],
+            may_change: vec![],
+            accept_refusing: vec![],
             id: "proven-1".to_string(),
             kind: "rule".to_string(),
-            text: "never force-push".to_string(),
+            text: "never force-push with --force".to_string(),
             severity: Some("irreversible".to_string()),
             project: None,
             tags: vec![],
@@ -3917,32 +4127,46 @@ mod tests {
         assert!(reply.starts_with("stored "), "{reply}");
         assert!(reply.contains("teeth: wired, not proven"), "{reply}");
         assert!(!reply.contains("teeth: proven guard"), "{reply}");
-        assert!(reply.contains("--force"), "{reply}");
+        assert!(reply.contains("git push --force (refused)") && reply.contains("git push (let through)"), "{reply}");
 
         let get_reply = srv.get(Parameters(GetArgs { id: "proven-1".to_string() })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
-        assert!(
-            item.tags.iter().any(|t| t == model::store::TEETH_WIRED_TAG),
-            "the stored item must carry the reserved wired tag: {:?}",
-            item.tags
-        );
+        assert!(item.tags.iter().any(|t| t == model::store::TEETH_WIRED_TAG), "{:?}", item.tags);
         assert!(!item.tags.iter().any(|t| t == model::store::TEETH_PROVEN_TAG), "{:?}", item.tags);
+        assert_eq!(model::store::current_verdict(&srv.store.lock().unwrap(), "proven-1"), model::store::CurrentVerdict::RuleWired);
     }
-
-    /// A check that has bitten a real call on record IS proven at the write:
-    /// the log already holds the real hook refusing a real call under it.
+    /// A check that has bitten a real call on record is PROVEN at a write
+    /// that keeps it - but only a refusal made AFTER the check was set counts
+    /// (K6): the one predicate, `serve::attest::is_field_refusal`, never lets
+    /// a refusal from before a check vouch for it. So a refusal recorded
+    /// before the rule existed leaves `remember` wired, and the same refusal
+    /// made under the stored check makes the next trial (a text change that
+    /// keeps the check) proven.
     #[tokio::test]
     async fn remember_is_proven_when_the_log_already_holds_a_real_refusal_under_the_check() {
         let srv = server();
+        let transcripts = tempfile::tempdir().unwrap();
         {
             let mut s = srv.store.lock().unwrap();
-            serve::deliver::record_gate_outcome(&mut s, "s", "l", "hook", "2026-09-26T00:00:00Z", true, "real-1", "git push --force origin main");
+            serve::attest::fixture::field_refusal(
+                &mut s,
+                transcripts.path(),
+                FIXTURE_SESSION,
+                "real-1",
+                "toolu_real1",
+                "Bash",
+                serde_json::json!({"command": "git push --force origin main"}),
+                "git push --force origin main",
+            );
         }
         let args = RememberArgs {
             new_collection_named_by_owner: None,
+            legitimate_calls: vec![],
+            may_change: vec![],
+            accept_refusing: vec![],
             id: "real-1".to_string(),
             kind: "rule".to_string(),
-            text: "never force-push".to_string(),
+            text: "never force-push with --force".to_string(),
             severity: Some("irreversible".to_string()),
             project: None,
             tags: vec![],
@@ -3958,22 +4182,42 @@ mod tests {
             always: false,
         };
         let reply = srv.remember(Parameters(args)).await;
+        assert!(reply.contains("teeth: wired, not proven"), "a refusal from before the check vouches for nothing: {reply}");
+        {
+            let mut s = srv.store.lock().unwrap();
+            serve::attest::fixture::field_refusal(
+                &mut s,
+                transcripts.path(),
+                FIXTURE_SESSION,
+                "real-1",
+                "toolu_real2",
+                "Bash",
+                serde_json::json!({"command": "git push --force origin main"}),
+                "git push --force origin main",
+            );
+        }
+        let mut args = bare_revise("real-1");
+        args.text = Some("never force-push with --force, on any branch".to_string());
+        let reply = srv.revise(Parameters(args)).await;
         assert!(reply.contains("teeth: proven guard") && reply.contains("git push --force origin main"), "{reply}");
+        assert_eq!(model::store::current_verdict(&srv.store.lock().unwrap(), "real-1"), model::store::CurrentVerdict::RuleProven);
     }
-
-    /// THE COLLAPSED CASE, end to end, with a worked example:
-    /// an anchor that already carries the literal it forbids leaves no
-    /// literal-free form to test as legitimate use. Stored (the knowledge
-    /// still gets in), but labelled with its own reserved tag, never the
-    /// proven one.
+    /// R8.5 (K19): an anchor that already carries the literal it forbids is a
+    /// WHOLE-COMMAND BAN, tried as one - its own call refused, a mention and
+    /// the shorter anchor let through - and stored wired on the rule track,
+    /// with the cleaner anchor printed as advice. The retired
+    /// `teeth:anchor-collapsed` label is never written.
     #[tokio::test]
-    async fn remember_with_a_collapsed_anchor_is_stored_with_its_own_tag_never_proven() {
+    async fn remember_with_a_collapsed_anchor_is_stored_as_a_whole_command_ban() {
         let srv = server();
         let args = RememberArgs {
             new_collection_named_by_owner: None,
+            legitimate_calls: vec![],
+            may_change: vec![],
+            accept_refusing: vec![],
             id: "collapsed-1".to_string(),
             kind: "rule".to_string(),
-            text: "never force-push".to_string(),
+            text: "never force-push with --force".to_string(),
             severity: Some("irreversible".to_string()),
             project: None,
             tags: vec![],
@@ -3990,98 +4234,33 @@ mod tests {
         };
         let reply = srv.remember(Parameters(args)).await;
         assert!(reply.starts_with("stored "), "{reply}");
-        assert!(reply.contains("teeth: anchor collapsed"), "{reply}");
-        assert!(!reply.contains("teeth: proven guard"), "{reply}");
-
+        assert!(reply.contains("teeth: wired, not proven - a whole-command ban: refuses 'git push --force x'"), "{reply}");
+        assert!(reply.contains("'echo git push --force'") && reply.contains("'git --version'") && reply.contains("'git push'"), "{reply}");
+        assert!(
+            reply.contains("Advice: bind to 'git push' with the literal '--force' - THOR tried exactly that and it bites"),
+            "{reply}"
+        );
         let get_reply = srv.get(Parameters(GetArgs { id: "collapsed-1".to_string() })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
-        assert!(
-            item.tags.iter().any(|t| t == model::store::TEETH_ANCHOR_COLLAPSED_TAG),
-            "the stored item must carry the reserved anchor-collapsed tag, never the proven one: {:?}",
-            item.tags
-        );
-        assert!(!item.tags.iter().any(|t| t == model::store::TEETH_PROVEN_TAG), "{:?}", item.tags);
+        assert!(item.tags.iter().any(|t| t == model::store::TEETH_WIRED_TAG), "{:?}", item.tags);
+        assert!(!item.tags.iter().any(|t| t == model::store::TEETH_ANCHOR_COLLAPSED_TAG), "{:?}", item.tags);
+        assert!(item.check.is_some(), "a ban is on the rule track with its check");
     }
-
-    /// THE ONE PRESERVED REFUSAL: a `Forbidden` check reaching neither
-    /// `Always` nor a `Command` target is still refused outright, unchanged
-    /// from before this write also tried `Absent`/`AbsentAll`/`Requires`.
+    /// A `Forbidden` check that reaches nothing (a path anchor only) does not
+    /// bite: since step 8 it is NOT stored, and with nothing in the text to
+    /// build a tooth from the rule lands as a note that quotes the dropped
+    /// check and why.
     #[tokio::test]
-    async fn remember_with_an_unreachable_forbidden_check_is_still_refused_and_writes_nothing() {
-        let srv = server();
-        let args = RememberArgs {
+    async fn remember_with_an_unreachable_forbidden_check_drops_it_and_stores_a_note() {
+        let srv = server_knowing(&["p"]);
+        let mut args = RememberArgs {
             new_collection_named_by_owner: None,
+            legitimate_calls: vec![],
+            may_change: vec![],
+            accept_refusing: vec![],
             id: "unreachable-1".to_string(),
             kind: "rule".to_string(),
-            text: "never force-push".to_string(),
-            severity: Some("irreversible".to_string()),
-            project: None,
-            tags: vec![],
-            expires: None,
-            key: None,
-            falsifier: Some("a force-push lands with no incident".to_string()),
-            check_kind: Some("forbidden".to_string()),
-            check_path: None,
-            check_literal: None,
-            check_literals: vec!["--force".to_string()],
-            moments: vec![],
-            targets: vec![TargetArg { kind: "path".to_string(), value: "some/file.rs".to_string() }],
-            always: false,
-        };
-        let reply = srv.remember(Parameters(args)).await;
-        assert!(reply.contains("REFUSED"), "{reply}");
-        assert!(reply.contains("reaches only"), "{reply}");
-
-        let events = srv.store.lock().unwrap().get_all_events().unwrap();
-        assert!(events.is_empty(), "a refused remember must write nothing at all, found: {events:?}");
-    }
-
-    /// A revise that touches none of the check, the bindings or the severity
-    /// of an item that already carries a box must not be re-labelled or
-    /// slowed: the existing teeth tag survives byte for byte,
-    /// and no fresh teeth note appears (nothing was tried again).
-    #[tokio::test]
-    async fn revise_that_changes_only_text_carries_the_existing_teeth_tag_forward_untouched() {
-        let srv = server();
-        srv.remember(Parameters(base_remember("stable-1"))).await;
-        let before = srv.get(Parameters(GetArgs { id: "stable-1".to_string() })).await;
-        let before_item: Item = serde_json::from_str(&before).unwrap();
-        assert!(
-            before_item.tags.iter().any(|t| t == model::store::TEETH_INFORMING_TAG),
-            "fixture sanity - base_remember is heavy with no check: {:?}",
-            before_item.tags
-        );
-
-        let mut args = bare_revise("stable-1");
-        args.text = Some("never force-push to main, ever".to_string());
-        let reply = srv.revise(Parameters(args)).await;
-        assert!(reply.starts_with("revised"), "{reply}");
-        assert!(!reply.contains("teeth:"), "an unrelated revise must not be re-tested or re-labelled: {reply}");
-
-        let after = srv.get(Parameters(GetArgs { id: "stable-1".to_string() })).await;
-        let after_item: Item = serde_json::from_str(&after).unwrap();
-        assert_eq!(after_item.tags, before_item.tags, "the teeth tag must survive byte for byte");
-    }
-
-    /// THE SECOND WAY A WRITER MUST NOT BE ABLE TO TOUCH THE LABEL: an
-    /// explicit `tags: []` clear - the harness-level way to clear the whole
-    /// list - must not be able to erase the teeth tag either, on a revise
-    /// that changes none of the check, the bindings or the severity. The tag survives,
-    /// restored, and the reply says so.
-    ///
-    /// A CHECKED fixture, deliberately, never `base_remember`'s own checkless
-    /// one: that fixture answers ground 11's OLDER, unrelated teeth question
-    /// with its own self-report tags, and clearing every tag would trip THAT
-    /// gate before Change 2 ever got a say - a real interaction between the
-    /// two mechanisms, not a defect this test exists to prove.
-    #[tokio::test]
-    async fn revise_clearing_tags_on_a_checked_item_still_keeps_the_existing_teeth_tag() {
-        let srv = server();
-        let args = RememberArgs {
-            new_collection_named_by_owner: None,
-            id: "stable-checked-1".to_string(),
-            kind: "rule".to_string(),
-            text: "never force-push".to_string(),
+            text: "never force-push with --force".to_string(),
             severity: Some("irreversible".to_string()),
             project: None,
             tags: vec![],
@@ -4096,45 +4275,113 @@ mod tests {
             targets: vec![TargetArg { kind: "command".to_string(), value: "git push".to_string() }],
             always: false,
         };
-        // Proven by a real refusal on record, so the label is one the tool
-        // carries forward untried - the case this test is about.
-        {
-            let mut s = srv.store.lock().unwrap();
-            serve::deliver::record_gate_outcome(&mut s, "s", "l", "hook", "2026-09-26T00:00:00Z", true, "stable-checked-1", "git push --force");
-        }
-        srv.remember(Parameters(args)).await;
-        let before = srv.get(Parameters(GetArgs { id: "stable-checked-1".to_string() })).await;
-        let before_item: Item = serde_json::from_str(&before).unwrap();
-        assert_eq!(before_item.tags, vec![model::store::TEETH_PROVEN_TAG.to_string()], "fixture sanity");
+        args.project = Some("p".to_string());
+        args.targets = vec![TargetArg { kind: "path".to_string(), value: "some/file.rs".to_string() }];
+        let reply = srv.remember(Parameters(args)).await;
+        assert!(reply.starts_with("stored "), "{reply}");
+        assert!(reply.contains("teeth: note - your check (forbidden '--force') was not stored: nothing could be tried"), "{reply}");
+        let item: Item = serde_json::from_str(&srv.get(Parameters(GetArgs { id: "unreachable-1".to_string() })).await).unwrap();
+        assert!(item.check.is_none());
+        assert!(item.tags.iter().any(|t| t == model::store::TEETH_NOTE_TAG));
+    }
+    /// G8.10 (PR box, MCP half): a revise that changes only the TEXT of a
+    /// wired rule changes what a trial tried, so it reruns the trial - the old
+    /// label is never carried, the new record is written with the revise.
+    #[tokio::test]
+    async fn revise_that_changes_only_text_reruns_the_trial_and_never_carries_the_old_label() {
+        let srv = server();
+        let reply = srv.remember(Parameters(RememberArgs {
+            new_collection_named_by_owner: None,
+            legitimate_calls: vec![],
+            may_change: vec![],
+            accept_refusing: vec![],
+            id: "stable-1".to_string(),
+            kind: "rule".to_string(),
+            text: "never force-push with --force".to_string(),
+            severity: Some("irreversible".to_string()),
+            project: None,
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some("a force-push lands with no incident".to_string()),
+            check_kind: Some("forbidden".to_string()),
+            check_path: None,
+            check_literal: None,
+            check_literals: vec!["--force".to_string()],
+            moments: vec![],
+            targets: vec![TargetArg { kind: "command".to_string(), value: "git push".to_string() }],
+            always: false,
+        })).await;
+        assert!(reply.contains("teeth: wired, not proven"), "{reply}");
+        let seq_before = model::store::history(&srv.store.lock().unwrap(), "stable-1").unwrap().len();
+
+        let mut args = bare_revise("stable-1");
+        args.text = Some("never force-push with --force, not even on a branch".to_string());
+        let reply = srv.revise(Parameters(args)).await;
+        assert!(reply.starts_with("revised"), "{reply}");
+        assert!(reply.contains("teeth: wired, not proven"), "the text change was tried again: {reply}");
+        assert!(!reply.contains("teeth unchanged"), "{reply}");
+        assert_eq!(model::store::current_verdict(&srv.store.lock().unwrap(), "stable-1"), model::store::CurrentVerdict::RuleWired);
+        assert_eq!(model::store::history(&srv.store.lock().unwrap(), "stable-1").unwrap().len(), seq_before + 1);
+    }
+    /// THE LABEL IS NOT THE WRITER'S: an explicit `tags: []` clear - the
+    /// harness-level way to clear the whole list - clears every tag of the
+    /// writer's, and THOR's own label survives, because a tags-only revise
+    /// runs no trial and keeps the verdict it had (G8.8).
+    #[tokio::test]
+    async fn revise_clearing_tags_on_a_checked_item_still_keeps_the_existing_teeth_tag() {
+        let srv = server();
+        let mut args = RememberArgs {
+            new_collection_named_by_owner: None,
+            legitimate_calls: vec![],
+            may_change: vec![],
+            accept_refusing: vec![],
+            id: "stable-checked-1".to_string(),
+            kind: "rule".to_string(),
+            text: "never force-push with --force".to_string(),
+            severity: Some("irreversible".to_string()),
+            project: None,
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some("a force-push lands with no incident".to_string()),
+            check_kind: Some("forbidden".to_string()),
+            check_path: None,
+            check_literal: None,
+            check_literals: vec!["--force".to_string()],
+            moments: vec![],
+            targets: vec![TargetArg { kind: "command".to_string(), value: "git push".to_string() }],
+            always: false,
+        };
+        args.tags = vec!["gotcha".to_string()];
+        assert!(srv.remember(Parameters(args)).await.starts_with("stored "));
+        let before_item: Item =
+            serde_json::from_str(&srv.get(Parameters(GetArgs { id: "stable-checked-1".to_string() })).await).unwrap();
+        assert_eq!(before_item.tags, vec!["gotcha".to_string(), model::store::TEETH_WIRED_TAG.to_string()], "fixture sanity");
 
         let mut args = bare_revise("stable-checked-1");
         args.tags = Some(vec![]); // an explicit clear, never a caller-supplied teeth tag
         let reply = srv.revise(Parameters(args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
         assert!(reply.contains("tags cleared"), "{reply}");
-        assert!(
-            reply.contains("is not part of 'tags'") && reply.contains("restored"),
-            "the reply must say the teeth tag survived the clear: {reply}"
-        );
+        assert!(reply.contains("teeth unchanged: the trial at log seq"), "{reply}");
 
-        let after = srv.get(Parameters(GetArgs { id: "stable-checked-1".to_string() })).await;
-        let after_item: Item = serde_json::from_str(&after).unwrap();
+        let after_item: Item =
+            serde_json::from_str(&srv.get(Parameters(GetArgs { id: "stable-checked-1".to_string() })).await).unwrap();
+        assert_eq!(after_item.tags, vec![model::store::TEETH_WIRED_TAG.to_string()], "only the writer's tags are cleared");
         assert_eq!(
-            after_item.tags,
-            vec![model::store::TEETH_PROVEN_TAG.to_string()],
-            "the teeth tag must be the one thing an explicit clear cannot remove"
+            model::store::current_verdict(&srv.store.lock().unwrap(), "stable-checked-1"),
+            model::store::CurrentVerdict::RuleWired
         );
     }
-
-    /// THE ADVICE THE FILING GATE GIVES MUST WORK. `model::store`'s
-    /// evaluation-filing refusal names every fired heavy rule with no teeth
-    /// box and tells the writer to revise it "even with no other field
-    /// changed". A rule stored before teeth boxes existed carries no box, so
-    /// a bare revise of it has nothing to carry forward and must try the
-    /// teeth itself - otherwise the advice changes nothing and the report can
-    /// never be filed. End to end: refused, bare revise, labelled, filed.
+    /// THE ADVICE THE FILING GATE GIVES MUST WORK (step 8). A rule stored
+    /// before the trial existed has no verdict; the filing refusal tells the
+    /// writer that a revise naming only its id runs THOR's trial on it as it
+    /// stands. End to end: refused, bare revise (tried: wired), still refused
+    /// (wired is carried by an open point or a real refusal), a real refusal
+    /// under the check, filed.
     #[tokio::test]
-    async fn a_bare_revise_of_an_unboxed_heavy_rule_tries_its_teeth_and_unblocks_filing() {
+    async fn a_bare_revise_of_an_undecided_heavy_rule_runs_the_trial_and_its_verdict_settles_filing() {
         let srv = server_knowing(&["test-project"]);
         {
             let mut s = srv.store.lock().unwrap();
@@ -4143,12 +4390,15 @@ mod tests {
             previous.text = "the previous evaluation of test-project".to_string();
             previous.tags = vec![model::store::EVALUATION_REPORT_TAG.to_string()];
             model::store::declare(&mut s, "seed", "seed", "owner", &previous).unwrap();
-            // Written straight into the store, the way every rule stored
-            // before the write path tried teeth got there: no teeth tag.
-            let legacy = Item {
+        }
+        // Written straight into the log, the way every rule stored before the
+        // trial existed got there: no record, no label.
+        seed_raw(
+            &srv,
+            &Item {
                 id: "legacy-guard".to_string(),
                 kind: Kind::Rule,
-                text: "never force-push".to_string(),
+                text: "never force-push with --force".to_string(),
                 bindings: vec![Binding::Target { kind: TargetKind::Command, value: "git push".to_string() }],
                 severity: Some(Severity::Irreversible),
                 project: Some("test-project".to_string()),
@@ -4157,70 +4407,73 @@ mod tests {
                 key: None,
                 falsifier: Some("a force-push lands with no incident".to_string()),
                 check: Some(Check::Forbidden { literals: vec!["--force".to_string()] }),
-            };
-            model::store::declare(&mut s, "seed", "seed", "owner", &legacy).unwrap();
-            s.append_event("s", "l", "hook", thor_core::event_store::EventKind::ItemServed, "legacy-guard", None, "{}")
-                .unwrap();
-        }
+            },
+        );
+        srv.store
+            .lock()
+            .unwrap()
+            .append_event("s", "l", "hook", thor_core::event_store::EventKind::ItemServed, "legacy-guard", None, "{}")
+            .unwrap();
         let report = |id: &str| RememberArgs {
             tags: vec![model::store::EVALUATION_REPORT_TAG.to_string()],
             text: format!("evaluation {id} of test-project"),
             ..blank_report(id)
         };
 
+        // A real refusal on record settles nothing (step 9): only a verdict.
+        let transcripts = tempfile::tempdir().unwrap();
+        {
+            let mut s = srv.store.lock().unwrap();
+            serve::attest::fixture::field_refusal(
+                &mut s,
+                transcripts.path(),
+                FIXTURE_SESSION,
+                "legacy-guard",
+                "toolu_legacy1",
+                "Bash",
+                serde_json::json!({"command": "git push --force origin main"}),
+                "git push --force origin main",
+            );
+        }
         let refused = srv.remember(Parameters(report("eval-new"))).await;
         assert!(refused.contains("REFUSED") && refused.contains("legacy-guard"), "{refused}");
+        assert!(refused.contains("retest --id 'legacy-guard'"), "the way on is named: {refused}");
+        assert!(refused.contains("mcp__thor__revise with only the rule's id"), "{refused}");
 
         let reply = srv.revise(Parameters(bare_revise("legacy-guard"))).await;
         assert!(reply.starts_with("revised"), "{reply}");
-        assert!(reply.contains("teeth: wired, not proven"), "a bare revise of an unboxed rule must try its teeth: {reply}");
-        let refused = srv.remember(Parameters(report("eval-new"))).await;
-        assert!(refused.contains("REFUSED") && refused.contains("legacy-guard"), "wired is not proven: {refused}");
-
-        // The real hook refuses a real call under this check - reality - and a
-        // bare revise now finds it.
-        {
-            let mut s = srv.store.lock().unwrap();
-            serve::deliver::record_gate_outcome(&mut s, "s", "l", "hook", "2026-09-26T00:00:00Z", true, "legacy-guard", "git push --force origin main");
-        }
-        let reply = srv.revise(Parameters(bare_revise("legacy-guard"))).await;
-        assert!(reply.contains("teeth: proven guard"), "{reply}");
-        let item: Item =
-            serde_json::from_str(&srv.get(Parameters(GetArgs { id: "legacy-guard".to_string() })).await).unwrap();
-        assert!(item.tags.iter().any(|t| t == model::store::TEETH_PROVEN_TAG), "{:?}", item.tags);
-
+        assert!(reply.contains("teeth: proven"), "a bare revise of an undecided rule runs the trial, and the refusal proves it: {reply}");
+        assert_eq!(
+            model::store::current_verdict(&srv.store.lock().unwrap(), "legacy-guard"),
+            model::store::CurrentVerdict::RuleProven
+        );
+        // A second bare revise runs nothing: the record still matches.
+        let again = srv.revise(Parameters(bare_revise("legacy-guard"))).await;
+        assert!(again.contains("teeth unchanged: the trial at log seq"), "{again}");
         let filed = srv.remember(Parameters(report("eval-new"))).await;
-        assert!(filed.starts_with("stored "), "the rule has a real tooth now, so filing must go through: {filed}");
+        assert!(filed.starts_with("stored "), "the trial's verdict settles it, so filing goes through: {filed}");
     }
-
-    /// Severity decides whether a teeth test is owed at all, so a revise that
-    /// changes ONLY the severity - light to irreversible here, check and
-    /// bindings untouched - changes an input of the test and must try the
-    /// teeth. Otherwise the rule turns heavy with no box, and the
-    /// evaluation-filing gate later refuses every report while it fires.
+    /// Severity is part of what a trial tries (its fingerprint), so a revise
+    /// that changes ONLY the severity runs the trial again - lowering it is no
+    /// way around one, and raising it is tried like any change.
     #[tokio::test]
-    async fn a_revise_that_only_raises_severity_into_heavy_tries_the_teeth_and_labels_it() {
+    async fn a_revise_that_only_changes_severity_runs_the_trial_again() {
         let srv = server();
         let mut args = base_remember("raised-1");
         args.severity = Some("house_style".to_string());
         let stored = srv.remember(Parameters(args)).await;
-        assert!(stored.starts_with("stored ") && !stored.contains("teeth:"), "fixture sanity: light, no check: {stored}");
+        assert!(stored.starts_with("stored ") && stored.contains("teeth: note - "), "{stored}");
+        let first = model::store::history(&srv.store.lock().unwrap(), "raised-1").unwrap().len();
 
         let mut raise = bare_revise("raised-1");
         raise.severity = Some("irreversible".to_string());
         let reply = srv.revise(Parameters(raise)).await;
         assert!(reply.starts_with("revised"), "{reply}");
-        assert!(reply.contains("teeth: informing only"), "raising severity must try the teeth: {reply}");
-
-        let item: Item =
-            serde_json::from_str(&srv.get(Parameters(GetArgs { id: "raised-1".to_string() })).await).unwrap();
-        assert!(
-            item.tags.iter().any(|t| t == model::store::TEETH_INFORMING_TAG),
-            "the now-heavy rule must carry a teeth box: {:?}",
-            item.tags
-        );
+        assert!(reply.contains("teeth: note - "), "a severity change runs the trial: {reply}");
+        assert!(!reply.contains("teeth unchanged"), "{reply}");
+        assert_eq!(model::store::current_verdict(&srv.store.lock().unwrap(), "raised-1"), model::store::CurrentVerdict::Note);
+        assert_eq!(model::store::history(&srv.store.lock().unwrap(), "raised-1").unwrap().len(), first + 1);
     }
-
     // ------------------------------------------------- remember/get round trip
 
     #[tokio::test]
@@ -4278,7 +4531,9 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
-            trial_check: false,
+            legitimate_calls: vec![],
+            may_change: vec![],
+            accept_refusing: vec![],
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
@@ -4300,11 +4555,15 @@ mod tests {
 
     #[tokio::test]
     async fn remember_accepts_a_path_exists_check_and_it_round_trips() {
-        let srv = server();
+        let srv = server_knowing(&["docs-fixture"]);
+        let _checkout = registered_checkout(&srv, "docs-fixture", &[("CHANGELOG.md", "# Changelog\n")]);
         let mut args = base_remember("check-pathexists-1");
         args.text = "the changelog lives in CHANGELOG.md at the repo root".to_string();
         args.check_kind = Some("path_exists".to_string());
         args.check_path = Some("CHANGELOG.md".to_string());
+        args.project = Some("docs-fixture".to_string());
+        args.always = false;
+        args.targets = vec![TargetArg { kind: "path".to_string(), value: "CHANGELOG.md".to_string() }];
         let reply = srv.remember(Parameters(args)).await;
         assert!(reply.starts_with("stored"), "{reply}");
 
@@ -4315,32 +4574,40 @@ mod tests {
 
     #[tokio::test]
     async fn remember_accepts_a_contains_check_and_it_round_trips() {
-        let srv = server();
+        let srv = server_knowing(&["docs-fixture"]);
+        let _checkout = registered_checkout(&srv, "docs-fixture", &[("LICENSE.md", "GPLv3 or later\n")]);
         let mut args = base_remember("check-contains-1");
         args.text = "the license file must always mention GPLv3 somewhere in it".to_string();
         args.check_kind = Some("contains".to_string());
-        args.check_path = Some("LICENSE".to_string());
+        args.check_path = Some("LICENSE.md".to_string());
         args.check_literal = Some("GPLv3".to_string());
+        args.project = Some("docs-fixture".to_string());
+        args.always = false;
+        args.targets = vec![TargetArg { kind: "path".to_string(), value: "LICENSE.md".to_string() }];
         let reply = srv.remember(Parameters(args)).await;
         assert!(reply.starts_with("stored"), "{reply}");
 
         let get_reply = srv.get(Parameters(GetArgs { id: "check-contains-1".to_string() })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
-        assert_eq!(item.check, Some(Check::Contains { path: "LICENSE".to_string(), literal: "GPLv3".to_string() }));
+        assert_eq!(item.check, Some(Check::Contains { path: "LICENSE.md".to_string(), literal: "GPLv3".to_string() }));
     }
 
     #[tokio::test]
     async fn remember_accepts_an_absent_check_and_it_round_trips() {
-        let srv = server();
+        let srv = server_knowing(&["docs-fixture"]);
+        let _checkout = registered_checkout(&srv, "docs-fixture", &[("config/app.toml", "name = \"app\"\n")]);
         let mut args = base_remember("check-absent-1");
         // A check that refuses and a reason that nothing can catch the
         // mistake may not be introduced together (2026-09-27): this rule
         // answers the teeth question with its check.
         args.tags = vec![];
-        args.text = "the main config file must never contain a hardcoded api key".to_string();
+        args.text = "the main config file must never contain a hardcoded api_key= line".to_string();
         args.check_kind = Some("absent".to_string());
         args.check_path = Some("config/app.toml".to_string());
         args.check_literal = Some("api_key=".to_string());
+        args.project = Some("docs-fixture".to_string());
+        args.always = false;
+        args.targets = vec![TargetArg { kind: "path".to_string(), value: "config/app.toml".to_string() }];
         let reply = srv.remember(Parameters(args)).await;
         assert!(reply.starts_with("stored"), "{reply}");
 
@@ -4428,9 +4695,7 @@ mod tests {
     async fn revise_that_omits_all_three_check_fields_keeps_an_existing_check() {
         let srv = server();
         let mut args = base_remember("check-keep-1");
-        args.text = "the roadmap lives in ROADMAP.md at the repo root".to_string();
-        args.check_kind = Some("path_exists".to_string());
-        args.check_path = Some("ROADMAP.md".to_string());
+        args = RememberArgs { id: args.id.clone(), ..roadmap_rule(&args.id) };
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
@@ -4460,7 +4725,9 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
-            trial_check: false,
+            legitimate_calls: vec![],
+            may_change: vec![],
+            accept_refusing: vec![],
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
@@ -4470,7 +4737,7 @@ mod tests {
         assert_eq!(item.severity, Some(ItemSeverity::Costly), "the field that WAS mentioned must change");
         assert_eq!(
             item.check,
-            Some(Check::PathExists { path: "ROADMAP.md".to_string() }),
+            Some(roadmap_check()),
             "omitting all three check fields must keep the existing check untouched"
         );
     }
@@ -4479,9 +4746,7 @@ mod tests {
     async fn revise_changing_only_text_does_not_lose_an_existing_check() {
         let srv = server();
         let mut args = base_remember("check-keep-2");
-        args.text = "the roadmap lives in ROADMAP.md at the repo root".to_string();
-        args.check_kind = Some("path_exists".to_string());
-        args.check_path = Some("ROADMAP.md".to_string());
+        args = RememberArgs { id: args.id.clone(), ..roadmap_rule(&args.id) };
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
@@ -4491,7 +4756,7 @@ mod tests {
             replace_from: None,
             replace_to: None,
             id: "check-keep-2".to_string(),
-            text: Some("the roadmap lives in ROADMAP.md, updated every quarter".to_string()),
+            text: Some("the roadmap lives in ROADMAP.md, updated every quarter; never write zz-roadmap-marker".to_string()),
             severity: None,
             project: None,
             tags: None,
@@ -4511,17 +4776,19 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
-            trial_check: false,
+            legitimate_calls: vec![],
+            may_change: vec![],
+            accept_refusing: vec![],
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
 
         let get_reply = srv.get(Parameters(GetArgs { id: "check-keep-2".to_string() })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
-        assert_eq!(item.text, "the roadmap lives in ROADMAP.md, updated every quarter");
+        assert_eq!(item.text, "the roadmap lives in ROADMAP.md, updated every quarter; never write zz-roadmap-marker");
         assert_eq!(
             item.check,
-            Some(Check::PathExists { path: "ROADMAP.md".to_string() }),
+            Some(roadmap_check()),
             "a text-only revise must not lose the existing check"
         );
     }
@@ -4567,7 +4834,9 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
-            trial_check: false,
+            legitimate_calls: vec![],
+            may_change: vec![],
+            accept_refusing: vec![],
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
@@ -4581,9 +4850,7 @@ mod tests {
     async fn revise_clearing_check_kind_while_also_giving_check_path_is_refused_and_changes_nothing() {
         let srv = server();
         let mut args = base_remember("check-clear-refuse-1");
-        args.text = "the roadmap lives in ROADMAP.md at the repo root".to_string();
-        args.check_kind = Some("path_exists".to_string());
-        args.check_path = Some("ROADMAP.md".to_string());
+        args = RememberArgs { id: args.id.clone(), ..roadmap_rule(&args.id) };
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
@@ -4613,7 +4880,9 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
-            trial_check: false,
+            legitimate_calls: vec![],
+            may_change: vec![],
+            accept_refusing: vec![],
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.contains("invalid check"), "{reply}");
@@ -4622,7 +4891,7 @@ mod tests {
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(
             item.check,
-            Some(Check::PathExists { path: "ROADMAP.md".to_string() }),
+            Some(roadmap_check()),
             "a refused clear attempt must change nothing"
         );
     }
@@ -4647,9 +4916,7 @@ mod tests {
     async fn revise_clearing_a_populated_check_succeeds() {
         let srv = server();
         let mut args = base_remember("check-clear-populated-1");
-        args.text = "the roadmap lives in ROADMAP.md at the repo root".to_string();
-        args.check_kind = Some("path_exists".to_string());
-        args.check_path = Some("ROADMAP.md".to_string());
+        args = RememberArgs { id: args.id.clone(), ..roadmap_rule(&args.id) };
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
@@ -4679,7 +4946,9 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
-            trial_check: false,
+            legitimate_calls: vec![],
+            may_change: vec![],
+            accept_refusing: vec![],
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "expected a deliberate clear to succeed, got: {reply}");
@@ -4702,9 +4971,7 @@ mod tests {
     async fn revise_refuses_weakening_a_checked_rule_with_no_because() {
         let srv = server();
         let mut args = base_remember("weaken-no-because-1");
-        args.text = "the roadmap lives in ROADMAP.md at the repo root".to_string();
-        args.check_kind = Some("path_exists".to_string());
-        args.check_path = Some("ROADMAP.md".to_string());
+        args = RememberArgs { id: args.id.clone(), ..roadmap_rule(&args.id) };
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let reply = srv
@@ -4730,9 +4997,7 @@ mod tests {
     async fn revise_accepts_weakening_a_checked_rule_with_a_because_and_the_reply_names_it() {
         let srv = server();
         let mut args = base_remember("weaken-with-because-1");
-        args.text = "the roadmap lives in ROADMAP.md at the repo root".to_string();
-        args.check_kind = Some("path_exists".to_string());
-        args.check_path = Some("ROADMAP.md".to_string());
+        args = RememberArgs { id: args.id.clone(), ..roadmap_rule(&args.id) };
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let reply = srv
@@ -4755,9 +5020,7 @@ mod tests {
     async fn history_shows_the_because_line_through_the_real_tool() {
         let srv = server();
         let mut args = base_remember("weaken-history-1");
-        args.text = "the roadmap lives in ROADMAP.md at the repo root".to_string();
-        args.check_kind = Some("path_exists".to_string());
-        args.check_path = Some("ROADMAP.md".to_string());
+        args = RememberArgs { id: args.id.clone(), ..roadmap_rule(&args.id) };
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         srv.revise(Parameters(ReviseArgs {
@@ -4788,16 +5051,20 @@ mod tests {
 
     #[tokio::test]
     async fn remember_accepts_an_absent_all_check_and_it_round_trips() {
-        let srv = server();
+        let srv = server_knowing(&["docs-fixture"]);
+        let _checkout = registered_checkout(&srv, "docs-fixture", &[("docs/STYLE.md", "# Style\n")]);
         let mut args = base_remember("check-absent-all-1");
         // A check that refuses and a reason that nothing can catch the
         // mistake may not be introduced together (2026-09-27): this rule
         // answers the teeth question with its check.
         args.tags = vec![];
-        args.text = "docs/STYLE.md never carries an em dash, en dash or ellipsis".to_string();
+        args.text = "docs/STYLE.md never carries an em dash (U+2014), en dash (U+2013) or ellipsis (U+2026)".to_string();
         args.check_kind = Some("absent_all".to_string());
         args.check_path = Some("docs/STYLE.md".to_string());
         args.check_literals = vec!["\u{2014}".to_string(), "\u{2013}".to_string(), "\u{2026}".to_string()];
+        args.project = Some("docs-fixture".to_string());
+        args.always = false;
+        args.targets = vec![TargetArg { kind: "path".to_string(), value: "docs/STYLE.md".to_string() }];
         let reply = srv.remember(Parameters(args)).await;
         assert!(reply.starts_with("stored"), "{reply}");
 
@@ -4868,17 +5135,22 @@ mod tests {
         // only, say, severity) would fall into the "replace the check
         // wholesale" branch instead, calling `build_check` with `check_kind:
         // None` and refusing the whole revise outright.
-        let srv = server();
+        let srv = server_knowing(&["docs-fixture"]);
+        let _checkout = registered_checkout(&srv, "docs-fixture", &[("docs/STYLE.md", "# Style\n")]);
         let mut args = base_remember("check-keep-absent-all-1");
         // A check that refuses and a reason that nothing can catch the
         // mistake may not be introduced together (2026-09-27): this rule
         // answers the teeth question with its check.
         args.tags = vec![];
-        args.text = "docs/STYLE.md never carries an em dash, en dash or ellipsis".to_string();
+        args.text = "docs/STYLE.md never carries an em dash (U+2014), en dash (U+2013) or ellipsis (U+2026)".to_string();
         args.check_kind = Some("absent_all".to_string());
         args.check_path = Some("docs/STYLE.md".to_string());
         args.check_literals = vec!["\u{2014}".to_string(), "\u{2013}".to_string(), "\u{2026}".to_string()];
-        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+        args.project = Some("docs-fixture".to_string());
+        args.always = false;
+        args.targets = vec![TargetArg { kind: "path".to_string(), value: "docs/STYLE.md".to_string() }];
+        let stored = srv.remember(Parameters(args)).await;
+        assert!(stored.starts_with("stored") && stored.contains("teeth: wired, not proven"), "{stored}");
 
         let revise_args = ReviseArgs {
             because: Some("lowering severity to prove an unrelated field change still lands".to_string()),
@@ -4907,7 +5179,9 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
-            trial_check: false,
+            legitimate_calls: vec![],
+            may_change: vec![],
+            accept_refusing: vec![],
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
@@ -4931,17 +5205,22 @@ mod tests {
         // a Check::Absent for a Check::AbsentAll is an ordinary correction,
         // not a drop (mirrors `a_revise_that_changes_the_check_form_is_
         // accepted` in gate.rs, one layer down).
-        let srv = server();
+        let srv = server_knowing(&["docs-fixture"]);
+        let _checkout = registered_checkout(&srv, "docs-fixture", &[("docs/STYLE.md", "# Style\n")]);
         let mut args = base_remember("check-upgrade-to-set-1");
         // A check that refuses and a reason that nothing can catch the
         // mistake may not be introduced together (2026-09-27): this rule
         // answers the teeth question with its check.
         args.tags = vec![];
-        args.text = "docs/STYLE.md never carries an em dash".to_string();
+        args.text = "docs/STYLE.md never carries an em dash (U+2014)".to_string();
         args.check_kind = Some("absent".to_string());
         args.check_path = Some("docs/STYLE.md".to_string());
         args.check_literal = Some("\u{2014}".to_string());
-        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+        args.project = Some("docs-fixture".to_string());
+        args.always = false;
+        args.targets = vec![TargetArg { kind: "path".to_string(), value: "docs/STYLE.md".to_string() }];
+        let stored = srv.remember(Parameters(args)).await;
+        assert!(stored.starts_with("stored") && stored.contains("teeth: wired, not proven"), "{stored}");
 
         let revise_args = ReviseArgs {
             because: Some("widening the typography check from one dash to the whole forbidden set".to_string()),
@@ -4950,7 +5229,7 @@ mod tests {
             replace_from: None,
             replace_to: None,
             id: "check-upgrade-to-set-1".to_string(),
-            text: Some("docs/STYLE.md never carries an em dash, en dash or ellipsis".to_string()),
+            text: Some("docs/STYLE.md never carries an em dash (U+2014), en dash (U+2013) or ellipsis (U+2026)".to_string()),
             severity: None,
             project: None,
             tags: None,
@@ -4970,7 +5249,9 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
-            trial_check: false,
+            legitimate_calls: vec![],
+            may_change: vec![],
+            accept_refusing: vec![],
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
@@ -5005,7 +5286,7 @@ mod tests {
         // mistake may not be introduced together (2026-09-27): this rule
         // answers the teeth question with its check.
         args.tags = vec![];
-        args.text = "never write an em dash, en dash or ellipsis, anywhere".to_string();
+        args.text = "never write an em dash (U+2014), en dash (U+2013) or ellipsis (U+2026), anywhere".to_string();
         args.check_kind = Some("forbidden".to_string());
         args.check_literals = vec!["\u{2014}".to_string(), "\u{2013}".to_string(), "\u{2026}".to_string()];
         let reply = srv.remember(Parameters(args)).await;
@@ -5075,7 +5356,7 @@ mod tests {
         // mistake may not be introduced together (2026-09-27): this rule
         // answers the teeth question with its check.
         args.tags = vec![];
-        args.text = "never write an em dash, en dash or ellipsis, anywhere".to_string();
+        args.text = "never write an em dash (U+2014), en dash (U+2013) or ellipsis (U+2026), anywhere".to_string();
         args.check_kind = Some("forbidden".to_string());
         args.check_literals = vec!["\u{2014}".to_string(), "\u{2013}".to_string(), "\u{2026}".to_string()];
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
@@ -5107,7 +5388,9 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
-            trial_check: false,
+            legitimate_calls: vec![],
+            may_change: vec![],
+            accept_refusing: vec![],
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
@@ -5133,17 +5416,22 @@ mod tests {
         // `gate.rs`'s own `a_revise_that_swaps_a_path_carrying_check_for_a_
         // path_less_forbidden_one_is_accepted` proves one layer down; this
         // is the same property proven through the real MCP tool surface.
-        let srv = server();
+        let srv = server_knowing(&["docs-fixture"]);
+        let _checkout = registered_checkout(&srv, "docs-fixture", &[("docs/STYLE.md", "# Style\n")]);
         let mut args = base_remember("check-downgrade-to-forbidden-1");
         // A check that refuses and a reason that nothing can catch the
         // mistake may not be introduced together (2026-09-27): this rule
         // answers the teeth question with its check.
         args.tags = vec![];
-        args.text = "docs/STYLE.md never carries an em dash".to_string();
+        args.text = "docs/STYLE.md never carries an em dash (U+2014)".to_string();
         args.check_kind = Some("absent_all".to_string());
         args.check_path = Some("docs/STYLE.md".to_string());
         args.check_literals = vec!["\u{2014}".to_string()];
-        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+        args.project = Some("docs-fixture".to_string());
+        args.always = false;
+        args.targets = vec![TargetArg { kind: "path".to_string(), value: "docs/STYLE.md".to_string() }];
+        let stored = srv.remember(Parameters(args)).await;
+        assert!(stored.starts_with("stored") && stored.contains("teeth: wired, not proven"), "{stored}");
 
         let revise_args = ReviseArgs {
             because: Some("the rule no longer depends on one file, so it drops the path-carrying form".to_string()),
@@ -5152,7 +5440,7 @@ mod tests {
             replace_from: None,
             replace_to: None,
             id: "check-downgrade-to-forbidden-1".to_string(),
-            text: Some("never write an em dash, anywhere".to_string()),
+            text: Some("never write an em dash (U+2014), anywhere".to_string()),
             severity: None,
             project: None,
             tags: None,
@@ -5164,15 +5452,17 @@ mod tests {
             check_literal: None,
             check_literals: vec!["\u{2014}".to_string()],
             moments: None,
-            targets: None,
-            always: None,
+            targets: Some(vec![]),
+            always: Some(true),
             clear_severity: false,
             clear_project: false,
             clear_expires: false,
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
-            trial_check: false,
+            legitimate_calls: vec![],
+            may_change: vec![],
+            accept_refusing: vec![],
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
@@ -5194,7 +5484,7 @@ mod tests {
         // mistake may not be introduced together (2026-09-27): this rule
         // answers the teeth question with its check.
         args.tags = vec![];
-        args.text = "never write an em dash, anywhere".to_string();
+        args.text = "never write an em dash (U+2014), anywhere".to_string();
         args.check_kind = Some("forbidden".to_string());
         args.check_literals = vec!["\u{2014}".to_string()];
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
@@ -5228,7 +5518,9 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
-            trial_check: false,
+            legitimate_calls: vec![],
+            may_change: vec![],
+            accept_refusing: vec![],
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
@@ -5290,7 +5582,9 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
-            trial_check: false,
+            legitimate_calls: vec![],
+            may_change: vec![],
+            accept_refusing: vec![],
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "expected a deliberate clear to succeed, got: {reply}");
@@ -5342,7 +5636,9 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
-            trial_check: false,
+            legitimate_calls: vec![],
+            may_change: vec![],
+            accept_refusing: vec![],
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "expected a deliberate clear to succeed, got: {reply}");
@@ -5394,7 +5690,9 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
-            trial_check: false,
+            legitimate_calls: vec![],
+            may_change: vec![],
+            accept_refusing: vec![],
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "a whitespace-only value must clear, got: {reply}");
@@ -5438,7 +5736,9 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
-            trial_check: false,
+            legitimate_calls: vec![],
+            may_change: vec![],
+            accept_refusing: vec![],
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "expected a deliberate clear to succeed, got: {reply}");
@@ -5488,7 +5788,9 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
-            trial_check: false,
+            legitimate_calls: vec![],
+            may_change: vec![],
+            accept_refusing: vec![],
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "expected a deliberate clear to succeed, got: {reply}");
@@ -5537,7 +5839,9 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
-            trial_check: false,
+            legitimate_calls: vec![],
+            may_change: vec![],
+            accept_refusing: vec![],
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "expected a deliberate clear to succeed, got: {reply}");
@@ -5606,7 +5910,9 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
-            trial_check: false,
+            legitimate_calls: vec![],
+            may_change: vec![],
+            accept_refusing: vec![],
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.contains("REFUSED"), "expected the bindings drop to still be refused, got: {reply}");
@@ -5679,7 +5985,9 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
-            trial_check: false,
+            legitimate_calls: vec![],
+            may_change: vec![],
+            accept_refusing: vec![],
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
@@ -5687,7 +5995,7 @@ mod tests {
         let get_reply = srv.get(Parameters(GetArgs { id: "keep-tags-1".to_string() })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(
-            item.tags,
+            teeth_free(&item.tags),
             vec!["safety".to_string(), "ci".to_string()],
             "an omitted tags field must keep the current tags"
         );
@@ -5732,7 +6040,9 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
-            trial_check: false,
+            legitimate_calls: vec![],
+            may_change: vec![],
+            accept_refusing: vec![],
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "expected a deliberate clear to succeed, got: {reply}");
@@ -5740,7 +6050,11 @@ mod tests {
 
         let get_reply = srv.get(Parameters(GetArgs { id: "clear-tags-1".to_string() })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
-        assert!(item.tags.is_empty(), "a deliberate clear must actually clear the tags, got: {:?}", item.tags);
+        assert_eq!(
+            item.tags,
+            vec![model::store::TEETH_NOTE_TAG.to_string()],
+            "a deliberate clear clears every tag of the writer's; THOR's own label is not the writer's to clear"
+        );
     }
 
     #[tokio::test]
@@ -5779,7 +6093,9 @@ mod tests {
             clear_key: false,
             clear_falsifier: false,
             clear_check: false,
-            trial_check: false,
+            legitimate_calls: vec![],
+            may_change: vec![],
+            accept_refusing: vec![],
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
@@ -5789,7 +6105,7 @@ mod tests {
         let get_reply = srv.get(Parameters(GetArgs { id: "replace-tags-1".to_string() })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(
-            item.tags,
+            teeth_free(&item.tags),
             vec!["reviewed".to_string(), "ci".to_string()],
             "a new list must replace the whole set, old tags included"
         );
@@ -5957,9 +6273,7 @@ mod tests {
         // recorded anywhere - the whole hole ground 28 exists to close.
         let srv = server();
         let mut args = base_remember("clear-check-flag-no-because-1");
-        args.text = "the roadmap lives in ROADMAP.md at the repo root".to_string();
-        args.check_kind = Some("path_exists".to_string());
-        args.check_path = Some("ROADMAP.md".to_string());
+        args = RememberArgs { id: args.id.clone(), ..roadmap_rule(&args.id) };
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let reply = srv
@@ -5989,9 +6303,7 @@ mod tests {
         // two tests on why that is one test, not two).
         let srv = server();
         let mut args = base_remember("clear-check-flag-with-because-1");
-        args.text = "the roadmap lives in ROADMAP.md at the repo root".to_string();
-        args.check_kind = Some("path_exists".to_string());
-        args.check_path = Some("ROADMAP.md".to_string());
+        args = RememberArgs { id: args.id.clone(), ..roadmap_rule(&args.id) };
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let reply = srv
@@ -6144,9 +6456,7 @@ mod tests {
         // `check_kind` rather than on a field of its own.
         let srv = server();
         let mut args = base_remember("clear-check-conflict-1");
-        args.text = "the roadmap lives in ROADMAP.md at the repo root".to_string();
-        args.check_kind = Some("path_exists".to_string());
-        args.check_path = Some("ROADMAP.md".to_string());
+        args = RememberArgs { id: args.id.clone(), ..roadmap_rule(&args.id) };
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let reply = srv
@@ -6164,7 +6474,7 @@ mod tests {
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(
             item.check,
-            Some(Check::PathExists { path: "ROADMAP.md".to_string() }),
+            Some(roadmap_check()),
             "a refused revise must change nothing"
         );
     }
@@ -6186,9 +6496,7 @@ mod tests {
         // `clear_check` silently stopped reaching this branch at all.
         let srv = server();
         let mut args = base_remember("clear-check-path-conflict-1");
-        args.text = "the roadmap lives in ROADMAP.md at the repo root".to_string();
-        args.check_kind = Some("path_exists".to_string());
-        args.check_path = Some("ROADMAP.md".to_string());
+        args = RememberArgs { id: args.id.clone(), ..roadmap_rule(&args.id) };
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let reply = srv
@@ -6205,7 +6513,7 @@ mod tests {
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(
             item.check,
-            Some(Check::PathExists { path: "ROADMAP.md".to_string() }),
+            Some(roadmap_check()),
             "a refused clear attempt must change nothing"
         );
     }
@@ -6221,18 +6529,15 @@ mod tests {
         // (proving the call itself works) but one of severity/project/key/
         // check would no longer match the fixture's own values.
         let srv = server_knowing(&["thor2"]);
-        let mut args = base_remember("plain-revise-no-flags-1");
+        let mut args = roadmap_rule("plain-revise-no-flags-1");
         args.project = Some("thor2".to_string());
         args.key = Some("some-key".to_string());
-        args.check_kind = Some("path_exists".to_string());
-        args.check_path = Some("ROADMAP.md".to_string());
-        args.text = "the roadmap lives in ROADMAP.md at the repo root".to_string();
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let reply = srv
             .revise(Parameters(ReviseArgs {
                 id: "plain-revise-no-flags-1".to_string(),
-                text: Some("the roadmap lives in ROADMAP.md, updated every quarter".to_string()),
+                text: Some("the roadmap lives in ROADMAP.md, updated every quarter; never write zz-roadmap-marker".to_string()),
                 ..Default::default()
             }))
             .await;
@@ -6241,13 +6546,13 @@ mod tests {
 
         let get_reply = srv.get(Parameters(GetArgs { id: "plain-revise-no-flags-1".to_string() })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
-        assert_eq!(item.text, "the roadmap lives in ROADMAP.md, updated every quarter");
+        assert_eq!(item.text, "the roadmap lives in ROADMAP.md, updated every quarter; never write zz-roadmap-marker");
         assert_eq!(item.severity, Some(ItemSeverity::Irreversible), "untouched field must be kept");
         assert_eq!(item.project, Some("thor2".to_string()), "untouched field must be kept");
         assert_eq!(item.key, Some("some-key".to_string()), "untouched field must be kept");
         assert_eq!(
             item.check,
-            Some(Check::PathExists { path: "ROADMAP.md".to_string() }),
+            Some(roadmap_check()),
             "untouched field must be kept"
         );
     }
@@ -7143,9 +7448,10 @@ mod tests {
         assert!(reply.contains("REFUSED"), "{reply}");
         assert!(!reply.contains("install --project"), "the retired --project advice must be gone: {reply}");
         assert!(
-            reply.contains("run from inside this repository") && reply.contains("`install`"),
+            reply.contains("run from inside this repository") && reply.contains("`install"),
             "the hint must point at running install from inside the checkout instead: {reply}"
         );
+        assert!(reply.contains(" --db \""), "the printed command names the store to install into (F7): {reply}");
         assert!(
             reply.contains("This folder has no memory of its own yet")
                 && reply.contains("makes every later write land under that name"),
@@ -7403,6 +7709,9 @@ mod tests {
     fn blank_report(id: &str) -> RememberArgs {
         RememberArgs {
             new_collection_named_by_owner: None,
+            legitimate_calls: vec![],
+            may_change: vec![],
+            accept_refusing: vec![],
             id: id.to_string(),
             kind: "report".to_string(),
             text: "placeholder".to_string(),
@@ -7868,31 +8177,31 @@ mod tests {
     }
 
     /// THE DEFECT THIS PREVENTS: the gate being skipped on the way in through
-    /// the back door. A capture is a normal call arriving late, so a rule the
-    /// gate would refuse in a local session has to be refused here too - and
-    /// the reason has to survive, or nobody can tell why a thought written on
-    /// a phone is missing.
+    /// the back door. Since step 8 (F13) a replica judges every ground it can
+    /// on the spot - so the rule with no falsifier is refused right there and
+    /// never queued - and a capture that still arrives with a problem (from
+    /// an older replica) is refused at the drain with its reason kept.
     #[tokio::test]
     async fn a_capture_the_gate_refuses_is_reported_with_its_reason_not_swallowed() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("inbox.jsonl");
         let mut bad = base_remember("no-falsifier-here");
         bad.falsifier = None;
-        replica(&path).remember(Parameters(bad)).await;
+        let on_the_spot = replica(&path).remember(Parameters(bad)).await;
+        assert!(on_the_spot.starts_with("REFUSED") && on_the_spot.contains("falsifier"), "{on_the_spot}");
+        assert!(!path.exists(), "a write refused on the spot is never queued");
 
+        let mut bad = base_remember("no-falsifier-here");
+        bad.falsifier = None;
+        let op = InboxOp::new("remember", serde_json::to_value(&bad).unwrap());
         let authority = server();
-        let op = &inbox::read_all(&path).unwrap()[0];
-        match authority.apply_captured(op).await {
+        match authority.apply_captured(&op).await {
             CapturedOutcome::Applied(t) => panic!("the gate must refuse a rule with no falsifier: {t}"),
             CapturedOutcome::NotApplied(text) => {
-                assert!(
-                    text.to_lowercase().contains("falsifier"),
-                    "the refusal must name what was wrong: {text}"
-                );
+                assert!(text.to_lowercase().contains("falsifier"), "the refusal must name what was wrong: {text}");
             }
         }
     }
-
     /// A capture from a newer replica must not be silently dropped, and must
     /// not look like it applied either.
     #[tokio::test]
@@ -7926,21 +8235,14 @@ mod tests {
     /// THE DEFECT THIS PREVENTS: the toll existing in the model crate and
     /// never once firing for the agent, because the root never made it from
     /// the process to the write. Silent, and indistinguishable from a store
-    /// that simply has no rot in it.
+    /// that simply has no rot in it. The stale fact is written straight into
+    /// the log (the trial refuses a false check at the write since step 8).
     #[tokio::test]
     async fn the_toll_reaches_the_agents_own_remember() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("noted.md"), "rewritten, and it says nothing of the sort
-").unwrap();
+        std::fs::write(dir.path().join("noted.md"), "rewritten, and it says nothing of the sort\n").unwrap();
         let srv = ThorMcpServer::new(EventStore::in_memory().unwrap()).with_root(dir.path().to_path_buf());
-
-        // A fact on noted.md whose own proof will come out false.
-        let mut stale = anchored_args("goes-stale");
-        stale.check_kind = Some("contains".to_string());
-        stale.check_path = Some("noted.md".to_string());
-        stale.check_literal = Some("the old name".to_string());
-        let stored = srv.remember(Parameters(stale)).await;
-        assert!(stored.starts_with("stored "), "{stored}");
+        seed_raw(&srv, &stale_neighbour("goes-stale"));
 
         // Now anything else on that same target is refused, by name.
         let refusal = srv.remember(Parameters(anchored_args("the-next-one"))).await;
@@ -7951,23 +8253,36 @@ mod tests {
         assert!(!missing.contains("\"id\""), "nothing may be written when the toll refuses: {missing}");
     }
 
+    /// A fact on noted.md whose own proof comes out false in a root where
+    /// noted.md was rewritten.
+    fn stale_neighbour(id: &str) -> Item {
+        Item {
+            id: id.to_string(),
+            kind: Kind::Orientation,
+            text: format!("something worth knowing about {id}: it says 'the old name'"),
+            bindings: vec![Binding::Target { kind: TargetKind::Path, value: "noted.md".to_string() }],
+            severity: None,
+            project: None,
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some("a force-push to main lands clean, nobody reverts it".to_string()),
+            check: Some(Check::Contains { path: "noted.md".to_string(), literal: "the old name".to_string() }),
+        }
+    }
     /// The same call from a server that was never told where the code is
     /// must go straight through. Every session outside a checkout depends on
     /// that, and a toll firing there would make this memory unwritable from
-    /// anywhere but one directory.
+    /// anywhere but one directory. The stale neighbour is written straight
+    /// into the log: since step 8 a check that is false is never written
+    /// through remember at all.
     #[tokio::test]
     async fn a_server_with_no_root_never_tolls_the_agent() {
         let srv = server();
-        let mut stale = anchored_args("goes-stale");
-        stale.check_kind = Some("contains".to_string());
-        stale.check_path = Some("noted.md".to_string());
-        stale.check_literal = Some("the old name".to_string());
-        assert!(srv.remember(Parameters(stale)).await.starts_with("stored "));
-
+        seed_raw(&srv, &stale_neighbour("goes-stale"));
         let second = srv.remember(Parameters(anchored_args("the-next-one"))).await;
         assert!(second.starts_with("stored "), "with no root there is nothing to check: {second}");
     }
-
     /// THE DEFECT THIS PREVENTS: a connector that comes up healthy, logs
     /// nothing, and answers every real request with 403 because its Host
     /// allow-list defaults to loopback. Deployed to a NAS on 2026-08-06 and

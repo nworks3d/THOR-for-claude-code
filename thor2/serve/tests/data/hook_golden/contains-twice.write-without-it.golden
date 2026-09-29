@@ -1,0 +1,2 @@
+exit 0
+{"decision":"block","reason":"[THOR] rule c-twice requires this to stay in NOTES.md (\"NOTES.md keeps the word keep\"); it is missing from what is about to be written: \"keep\""}

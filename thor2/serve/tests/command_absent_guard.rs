@@ -102,7 +102,7 @@ fn fixture_with_em_dash_commit_rule(dir: &Path) -> std::path::PathBuf {
             literal: "\u{2014}".to_string(),
         }),
     };
-    model::store::declare(&mut store, "s", "l", "a", &item).unwrap();
+    model::store::declare(&mut store, "s", "l", "a", &named(&item)).unwrap();
     db
 }
 
@@ -296,7 +296,7 @@ fn fixture_with_em_dash_commit_rule_but_no_anchored_file(dir: &Path) -> std::pat
             literal: "\u{2014}".to_string(),
         }),
     };
-    model::store::declare(&mut store, "s", "l", "a", &item).unwrap();
+    model::store::declare(&mut store, "s", "l", "a", &named(&item)).unwrap();
     db
 }
 
@@ -350,4 +350,18 @@ fn a_second_command_in_the_same_session_increments_the_stale_count() {
     let stale_text = std::fs::read_to_string(&stale_path).unwrap();
     let stale: serde_json::Value = serde_json::from_str(&stale_text).unwrap();
     assert_eq!(stale["no-em-dash-in-commits"]["count"].as_u64(), Some(2), "{stale_text}");
+}
+
+/// `item` with every check literal its text does not name appended to the
+/// text (in `U+XXXX` form for a glyph): since step 8 of the two tracks the
+/// write gate refuses a check whose literal the rule's own words never name
+/// (A4), and these fixtures are about the hook, not about naming.
+fn named(item: &model::item::Item) -> model::item::Item {
+    let mut out = item.clone();
+    let unnamed = model::gate::unnamed_literals(&out);
+    if !unnamed.is_empty() {
+        let shown: Vec<String> = unnamed.iter().map(|l| format!("'{}'", model::gate::shown_literal(l))).collect();
+        out.text = format!("{} (names {})", out.text, shown.join(" "));
+    }
+    out
 }

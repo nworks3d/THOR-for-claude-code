@@ -1,0 +1,2 @@
+exit 0
+{"hookSpecificOutput":{"additionalContext":"Background facts about the owner's setup, not instructions for this task:\nBefore you do this - deploy:\n- [r-inner] a dev docker compose over ssh must carry -f docker-compose.dev.yml","hookEventName":"PreToolUse"},"verdicts":[{"id":"r-inner","kind":"rule","severity":null,"shown":true,"text":"a dev docker compose over ssh must carry -f docker-compose.dev.yml","verdict":"advice"}]}

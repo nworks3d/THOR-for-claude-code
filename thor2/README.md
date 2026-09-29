@@ -190,11 +190,30 @@ invisible from every surface.
 
 Either way the project's name was decided, `install` also reads that project's
 code once (so `search_code`, `where_used` and `outline` can answer for it,
-refreshed automatically on every later commit) and records that same name in
-the memory itself the moment the read succeeds - so the project's first
-`remember` never has to ask which collection it belongs to. Both are
-idempotent: a later run that finds the code already indexed leaves the memory
-record exactly as it is too.
+refreshed automatically on every later commit), records that same name in the
+memory itself the moment the read succeeds - so the project's first `remember`
+never has to ask which collection it belongs to - and registers the checkout it
+runs in as that project's working copy. The working copy is the one folder THOR
+tries a rule's file check in when the rule is written (see "One thing worth
+knowing before you write a rule" below), whatever folder a session happens to
+stand in. All three are idempotent: a later run from the same checkout reads
+nothing again and writes nothing, and one that finds the code already read but
+no working copy registered - a project set up by an earlier release - registers
+it and changes nothing else.
+
+`install --register-root --db "<store>"` does the registration alone. Run from
+inside a checkout, it records that checkout as the working copy of the project
+the checkout resolves to, and touches no settings, no hooks and no code index.
+It refuses to run without `--db`, so a registration never lands in a default
+memory your assistant does not use. One project has one working copy. A second
+copy of a registered project - a clone, a copied folder - is refused by both
+commands before anything is written, naming the registered folder. A
+registration moves only once its old folder no longer exists; while it still
+does, moving it is the owner's call, made by removing or renaming the old
+folder. The registration record takes events from the installer only, so no
+retract or revise can move it or remove it. For seven days after a registration
+is made or moved, the project's session start names it in one line, and
+`doctor` lists every one.
 
 The four hooks are `SessionStart` (what the agent is handed at the start),
 `PreToolUse` (the gate that can block a write), `UserPromptSubmit`, and `Stop`
@@ -335,6 +354,23 @@ accrued work for this project, its own untested-edit count and whether a
 context summary has happened since its own last reset, and when its next
 evaluation is due, where that is known.
 
+Doctor also lists the working copy each project is registered at, since when,
+and where it was before a move - or `NOT USABLE` with the reason, when that
+folder is gone, is no longer the top of a checkout, or no longer resolves to
+that project - and it names every project that owns rules but has no working
+copy registered, with the command that registers one.
+
+Its `teeth` lines say where the rules stand, read through the same answer the
+`Stop` hook and the evaluation filing gate use: how many live rules and
+orientations have no current verdict from THOR's trial (the rot, whatever their
+weight, with the heavy ones beside it, each named as `undecided` with its
+reason); how many are proven, wired, notes, notes by dispute, notes with a
+pending check, kept by `accept_refusing`, or blocked; which refusals on the log
+count as proof, and why each of the others does not; which rules were taken off
+the rule track in the last 30 days; and which were refused for a tooth and then
+stored as a note that no longer names it. `--full` names every item instead of
+the first few.
+
 Two of those checks - whether an old reference still points at a real file,
 and whether some facts never win a place - need to know where your other
 checkouts live, normally via `--checkouts <dir>`. Leave that flag off and
@@ -426,7 +462,13 @@ The drain prints one line per queued write: `OK` with the item it stored, or
 `LOST` with the reason the write gate refused it, and it exits non-zero when
 anything was lost. That matters more than it looks: the gate runs at the
 authority, so a rule written on a phone can still be refused there, and the
-drain report is the only place that ever says why.
+drain report is the only place that ever says why. The drain tries a rule
+against its project's registered working copy, like any write on the main
+machine, and `doctor` there counts the queued writes it refused. What the copy
+can judge without a working copy - a check literal the text never names, a
+hand-written `teeth:` label, an unexplained weakening - it refuses on the spot
+instead of queueing, and an evaluation report is always refused there: it is
+filed on the main machine, in the session that ran it.
 
 The `sync recv`/`sync drain` pair shares the `THOR_SYNC_TOKEN` secret, and
 there is no other protection on that transport either. Run both transports -
@@ -474,7 +516,9 @@ you conclude the memory is empty.
 
 A fact that exists to REFUSE arrives in one of two shapes, and a program has to
 read both. When the call carries a command line and a rule's own forbidden
-fragment occurs in it, the answer is a refusal naming the rule and the fragment.
+fragment occurs in it - as whole words, in a part of the call that runs the
+command the rule is bound to - the answer is a refusal naming the rule and the
+fragment.
 When the call carries structured arguments instead, and it is the TOOL NAME that
 the rule is bound to, nothing is refused: the ordinary answer comes back with a
 prohibition row in its data, naming the same fragment. The second shape is the
@@ -535,19 +579,27 @@ by hand and only by hand, which is the design rather than a shortcoming: each
 proof is a judgement about one rule, and attaching them wholesale is exactly
 how the noise gets back in.
 
-Doctor's `teeth` line asks the same question of the narrower, heavier subset:
-rules marked `costly` or `irreversible`. It also only ever gives you a count,
-and a count does not say WHICH of those still cannot refuse anything.
-`teeth_census`, an example under `serve`, walks the identical live store and
-prints one line per heavy rule - its id, its text, whether it already has an
-answer - so you get the actual worklist instead of just the number:
+Doctor's `teeth` lines ask the sharper question: not whether a rule carries a
+check, but whether THOR's own trial has decided it - on the rule track, a note,
+or undecided. The undecided ones are the worklist, each named with its reason
+(all of them with `--full`), and one command decides them:
 
 ```bash
-TEETH_CENSUS_DB="<store>" cargo run -p serve --example teeth_census -- --unanswered
+serve --db "<store>" retest --project <name>
 ```
 
-Leave off `--unanswered` to see every heavy rule, answered or not; with it,
-you see only the ones still worth a look.
+It tries every rule and orientation of that project that has no current
+verdict, against the project's registered working copy and the real calls in
+the log, prints every form it tried with what the hook did with it and the
+verdict, and writes nothing. Read that first - above all every rule it would
+turn into a note - then run it again with `--apply` to write the verdicts it
+can: a rule whose check still bites stays on the rule
+track, and one whose check no longer bites becomes a note without it - unless
+a tooth built from its own text still bites, which it names as the fix. `--id
+<id>` does one rule, `--all` the whole store. The exit code is 0 for a verdict
+it can write, 3 when a rule is blocked (its project has no registered working
+copy, or that checkout is mid-change while the default branch still has the
+line), and 4 when only a writer can make the fix, which it names.
 
 There is a second gate that keeps the number from rotting once you start
 using it. Adding a fact to a target that already holds one whose own proof
@@ -584,15 +636,48 @@ no file to anchor to at all, like a punctuation character that is banned
 wherever it might be written. A check anchored to a file also catches a shell
 command that deletes it, empties it out, or overwrites it (`rm`, `truncate`,
 `sed -i`, `tee`, a redirect, `mv`/`cp` onto it) and not only a direct Edit or
-Write - though a glob in the command is never expanded to guess which files it
-might touch. `contains`, `absent` and `absent_all` can also point at a FOLDER
-instead of one file: then they look at every file sitting directly inside it,
+Write, in any part of the command - after a `cd`, on a later line, inside
+`$(...)` or `bash -c '...'`, with a relative path read against the folder that
+part runs in - though a glob in the command is never expanded to guess which
+files it might touch, and a command sent to another machine over `ssh` never
+counts as a write to a file here. `contains`, `absent` and `absent_all` can
+also point at a FOLDER instead of one file: then they look at every file
+sitting directly inside it,
 but never a file in a folder inside that one. Use this when the same fact
 lives in more than one file in the same place - a setting that has to match
 between two config files, say. Pointing the check at the folder they share
 covers both of them with one rule, without also reaching into an old backup
 copy of one of those files kept somewhere else in the project, which is what
 would happen with `forbidden`.
+
+A `forbidden` check bound to a command is looked for in every part of a call
+that runs that command, the way a shell splits it: after `cd x &&`, after a
+`;` or a new line, behind a pipe, inside `ssh host "..."`, `bash -c '...'`,
+`$(...)` or a loop, and past `sudo`, `timeout` and the like in front. Its
+literal matches whole words only: `--force` does not match inside
+`--force-with-lease`, and `ssh` does not match inside `sshKey.mjs`, while
+`--force=true` and `/usr/bin/ssh` still match. A command written with `.exe` in
+a binding reaches only a call that names that `.exe`. Text that only mentions
+the command - `echo "..."`, `grep "..."`, a heredoc of data, a comment - is not
+a call of it. When one part of a call runs in another project's checkout (`cd
+../other && git push`, `git -C ../other push`), that part is judged by that
+project's rules. The checks on a file's content keep matching plain text.
+
+Whatever check you give, the rule is tried the moment it is written. `remember`,
+`revise`, `pin` and `unpin` run every rule and orientation through the same
+guard the hook uses, and the reply says which of three things happened: a
+RULE (the check refused the call or write it forbids and let the ordinary ones
+through, so it is stored), a NOTE (no tooth holds, so it is stored without a
+check and can only inform), or REFUSED (nothing written, one fix named). A file
+check is tried in the project's registered working copy (see "Install it"
+above). The check's literal has to be named in the rule's own text. And THOR
+builds teeth from that text itself - a flag in a backtick span after the
+command the rule is bound to, say - so a rule whose own words compose a tooth
+that bites is refused until it hangs that tooth. `AGENTS.md`, under "How to
+write a note that actually comes back", has the whole of it: the labels each
+outcome writes, a whole-command ban, a check kept pending until its project is
+registered, and the three arguments that answer a refusal (`legitimate_calls`,
+`may_change`, `accept_refusing`).
 
 `requires` is the odd one out: every check above asks whether some text is
 present or absent, which cannot see a forgotten field - forgetting leaves no
@@ -618,11 +703,24 @@ words or a flag, name or path with a digit or punctuation in it. One plain
 word such as `dev` is refused, since inside a command it would pick out far
 more calls than the ones meant.
 
-One more thing `revise` refuses without asking first: weakening a rule that
-already carries a check - clearing or changing the check, lowering its
-severity, dropping a binding, or narrowing it from every project to one -
-needs a `because`, the same way `retract` has always needed a reason, and it
-lands in the item's own history right beside what changed. Clear a field
+Whole words cut both ways: the trigger `/thor` never sees `/thor-probe` or
+`/thor2`, because a name that goes on after it is a longer word. For a family
+of names, end the trigger with one `*` - `/thor*` catches `/thor-probe`,
+`/thor2` and `/tmp/thor_new`, and, the price of a prefix, `build/thorough`. The
+`*` is allowed only as the last character of a trigger inside the command, and
+the part before it must be specific on its own. A call whose only words after
+the command are `--help`, `-h`, `-?`, `/?`, `help`, `--version` or `-V` asks the
+program about itself and runs nothing, so a `requires` check never refuses it;
+a `forbidden` check still does.
+
+One more thing `revise` refuses without asking first: weakening a rule or an
+orientation, checked or not - clearing or changing its check, lowering its
+severity, dropping or replacing a command, path or folder binding, taking a
+flag, a quoted call or a backtick span out of its text, narrowing a checked
+rule from every project to one, or turning it into a report (which takes it off
+the rule track exactly like a retract) - needs a `because`, the same way
+`retract` has always needed a reason, and it lands in the item's own history
+right beside what changed. Clear a field
 (severity, project, expires, key, falsifier, or the check) with its own
 `clear_*` flag on `revise` - `clear_severity`, `clear_check`, and so on -
 rather than the empty string a JSON-RPC caller would otherwise send: an

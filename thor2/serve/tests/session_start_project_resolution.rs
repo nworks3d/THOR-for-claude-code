@@ -157,3 +157,86 @@ fn the_sessionstart_hook_still_fails_open_on_a_corrupt_store_after_resolving_a_r
     assert!(stdout.is_empty(), "hook must print zero bytes on failure, got: {:?}", stdout);
     assert!(stderr.is_empty());
 }
+
+/// A registration of `key`'s working copy the way the installer writes one,
+/// straight into the log (THOR's own token is not for tests): one event by
+/// actor `installer` on the project's record, with `root` and `root_at`.
+fn register_raw(store: &mut EventStore, key: &str, root: &str, at: &str) {
+    let item = Item {
+        id: store::project_opened_id(key),
+        kind: Kind::Report,
+        text: format!("Project {key}: a fixture record of a registered working copy."),
+        bindings: Vec::new(),
+        severity: None,
+        project: Some(key.to_string()),
+        tags: vec!["project-record".to_string()],
+        expires: None,
+        key: None,
+        falsifier: None,
+        check: None,
+    };
+    let body = store::canonical_body(&item).unwrap();
+    let body = format!(
+        "{},\"root\":{},\"root_at\":{}}}",
+        &body[..body.len() - 1],
+        serde_json::to_string(root).unwrap(),
+        serde_json::to_string(at).unwrap()
+    );
+    let kind = thor_core::event_store::EventKind::FactCreated;
+    if store.get_events_by_entity(&item.id).unwrap().is_empty() {
+        store.append_event("install", "install", "installer", kind, &item.id, None, &body).unwrap();
+    } else {
+        let kind = thor_core::event_store::EventKind::FactRevised;
+        store.append_mutate_checked("install", "install", "installer", kind, &item.id, None, &body).unwrap();
+    }
+}
+
+fn days_ago(days: i64) -> String {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    serve::time::iso8601_from_unix(now - days * 86_400)
+}
+
+fn session_start_in(repo: &std::path::Path, db_path: &std::path::Path) -> String {
+    let payload = serde_json::json!({
+        "session_id": "s1",
+        "hook_event_name": "SessionStart",
+        "cwd": repo.to_string_lossy(),
+    })
+    .to_string();
+    let (status, stdout, _stderr) = run_hook(db_path, repo, &payload);
+    assert_eq!(status.code(), Some(0));
+    String::from_utf8(stdout).unwrap()
+}
+
+/// N11: the first registration of a project is first-come, so the session
+/// start names it - where, and since when - for seven days after it was made
+/// or moved, and then stops. A move names the folder it moved from.
+#[test]
+fn the_session_start_names_a_fresh_registration_for_seven_days_then_stops() {
+    let workdir = tempfile::tempdir().unwrap();
+    let repo = make_repo_dir(workdir.path(), "gamma-repo");
+    let root = repo.display().to_string().replace('\\', "/");
+    let db_dir = tempfile::tempdir().unwrap();
+
+    let fresh = db_dir.path().join("fresh.db");
+    let three_days_ago = days_ago(3);
+    register_raw(&mut EventStore::new(&fresh).unwrap(), "gamma-repo", &root, &three_days_ago);
+    let out = session_start_in(&repo, &fresh);
+    let line = format!("[THOR] the working copy of gamma-repo is registered at {root} since {}", &three_days_ago[..10]);
+    assert!(out.contains(&line), "a registration three days old is named: {out}");
+
+    let old = db_dir.path().join("old.db");
+    register_raw(&mut EventStore::new(&old).unwrap(), "gamma-repo", &root, &days_ago(8));
+    let out = session_start_in(&repo, &old);
+    assert!(!out.contains("the working copy of"), "after seven days the line stops: {out}");
+
+    let moved = db_dir.path().join("moved.db");
+    {
+        let mut store = EventStore::new(&moved).unwrap();
+        register_raw(&mut store, "gamma-repo", "C:/fixture/gamma-old", &days_ago(40));
+        register_raw(&mut store, "gamma-repo", &root, &days_ago(1));
+    }
+    let out = session_start_in(&repo, &moved);
+    assert!(out.contains(&format!("registered at {root} since")), "{out}");
+    assert!(out.contains("(moved from C:/fixture/gamma-old, which no longer exists)"), "a move names both paths: {out}");
+}

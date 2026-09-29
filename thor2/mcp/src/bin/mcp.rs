@@ -76,8 +76,13 @@ fn main() {
         // clap's `requires` makes the half-given cases unreachable.
         _ => cli.code_index_root.as_deref().and_then(resolve_code_index),
     };
-    // The checkout this server was started in, for the write gate's
-    // neighbourhood toll. Resolved once at startup, the same assumption
+    // The checkout this server was started in. Used for four things only: the
+    // write gate's neighbourhood toll, the worktree-only check refusal, the
+    // code index, and as the session's OWN checkout for THOR's trial (K20).
+    // The trial itself always runs against the project's REGISTERED working
+    // copy (`serve::project::registered_checkout`), never this folder: a
+    // server started in one project tries another project's rule in that
+    // project's own checkout. Resolved once at startup, the same assumption
     // `resolve_code_index` above already makes about the working directory.
     // An HTTP connector has no meaningful working directory, so it gets none.
     let root = std::env::current_dir().ok().and_then(|cwd| serve::project::git_root(&cwd));

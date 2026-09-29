@@ -1,0 +1,2 @@
+exit 0
+{"decision":"block","reason":"[THOR] rule o-interactive applies here: this call trips \"rm\" and says none of \"-i\". rm in alpha always asks first with -i Nothing was done. Add one and run the call again."}

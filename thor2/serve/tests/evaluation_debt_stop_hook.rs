@@ -277,6 +277,10 @@ fn declare_owed_items(store: &mut EventStore, n: usize, project: Option<&str>) -
             check: None,
         };
         model::store::declare(store, "fixture", "fixture", "fixture", &item).unwrap();
+        // Decided by THOR's trial (a note): since step 9 the teeth question
+        // asks about every rule without a verdict, whatever its weight, and
+        // these fixtures are about the judgement and evaluation debts.
+        serve::teeth::fixture::decide(store, &id);
         for _ in 0..AFTER {
             serve::deliver::record_delivery(store, "fixture", "fixture", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &[id.clone()]);
         }
@@ -461,7 +465,9 @@ fn declare_setup_note(store: &mut EventStore) {
         falsifier: Some("this note is still served after the owner already answered".to_string()),
         check: None,
     };
-    model::store::declare(store, "install", "install", "installer", &item).unwrap();
+    // Not "installer": that name is reserved for THOR itself and the store
+    // refuses it from anything but the installer's own token.
+    model::store::declare(store, "install", "install", "install-fixture", &item).unwrap();
 }
 
 /// A rule naming an obvious literal (a `--flag`), declared by bypassing the
@@ -551,6 +557,10 @@ fn falls_back_to_the_generic_note_when_no_eval_file_exists() {
     );
     assert!(reason.contains("no evaluation routine is installed"), "{reason}");
     assert!(reason.contains("install"), "must say install writes one: {reason}");
+    assert!(
+        reason.contains(&format!("--db \"{}\"", db.display())),
+        "the printed install command names the store this hook reads (F7): {reason}"
+    );
     assert!(reason.contains("/thor-eval"), "{reason}");
 }
 
@@ -1336,9 +1346,8 @@ fn teeth_debt_still_fires_after_the_evaluation_debt_check() {
     assert_eq!(v["decision"], "block", "{out}");
     let reason = v["reason"].as_str().unwrap();
     assert!(reason.contains("names-a-flag"), "teeth_debt must still name the rule: {reason}");
-    // UPDATED FOR THE 2026-09-25 REBUILD: `teeth_debt` no longer mines the
-    // item's own text for a literal to quote - it reports what the item's
-    // own teeth box actually found, which for a checkless item is "nothing
-    // to try", not a guess pulled from prose.
-    assert!(reason.contains("nothing to try"), "and say what its own teeth box found: {reason}");
+    // Step 9: `teeth_debt` reads `model::store::settlement` and names why
+    // the rule is owed, and the command that decides it.
+    assert!(reason.contains("it has never been tried"), "and say why it is owed: {reason}");
+    assert!(reason.contains("retest --id 'names-a-flag'"), "and the command that decides it: {reason}");
 }

@@ -84,7 +84,7 @@ fn fixture(tmp: &Path) -> (PathBuf, PathBuf) {
             Some(Check::Forbidden { literals: vec!["--force".to_string()] }),
         ),
     ] {
-        model::store::declare(&mut store, "seed", "seed", "seed", &it).unwrap_or_else(|e| panic!("{}: {e}", it.id));
+        model::store::declare(&mut store, "seed", "seed", "seed", &named(&it)).unwrap_or_else(|e| panic!("{}: {e}", it.id));
     }
     drop(store);
     std::fs::write(
@@ -169,4 +169,18 @@ fn each_no_record_call_answers_exactly_like_a_recorded_one() {
         let unrecorded = normalize(run_hook(&db_b, &payloads(&work_b)[i], true), b.path());
         assert_eq!(recorded, unrecorded, "event {i}");
     }
+}
+
+/// `item` with every check literal its text does not name appended to the
+/// text (in `U+XXXX` form for a glyph): since step 8 of the two tracks the
+/// write gate refuses a check whose literal the rule's own words never name
+/// (A4), and these fixtures are about the hook, not about naming.
+fn named(item: &model::item::Item) -> model::item::Item {
+    let mut out = item.clone();
+    let unnamed = model::gate::unnamed_literals(&out);
+    if !unnamed.is_empty() {
+        let shown: Vec<String> = unnamed.iter().map(|l| format!("'{}'", model::gate::shown_literal(l))).collect();
+        out.text = format!("{} (names {})", out.text, shown.join(" "));
+    }
+    out
 }

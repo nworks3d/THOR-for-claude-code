@@ -68,10 +68,19 @@
 //! Orientation bound to a `Command` target, carrying the same kind of
 //! still-current `Check::Absent`/`Check::AbsentAll`, blocks the tool call
 //! outright when the command about to run carries a forbidden literal - see
-//! `absent_guard`'s own doc comment ("THE COMMAND guard") and `bin/serve.rs`'s
-//! `command_guard_block`. See `absent_guard`'s own doc comment for the full
-//! doctrine on all three, and `bin/serve.rs`'s `absent_guard_block` for how
-//! the first two are ordered.
+//! `absent_guard`'s own doc comment ("THE COMMAND guard") and
+//! `guard_verdict::command`. Which simple commands a call runs, and where a
+//! literal is looked for, is `shell`'s one definition (the door). See
+//! `absent_guard`'s own doc comment for the full doctrine on all three, and
+//! `guard_verdict` for how every PreToolUse
+//! arm is ordered - the one pipeline the hook runs.
+//!
+//! `teeth` is THOR's trial of a rule at its write and at a retest: it runs
+//! the same pipeline (`guard_verdict`) on a store holding only that rule,
+//! with forms THOR builds and the real calls in the log (`legit`), and
+//! decides rule, note or refused. `attest` answers whether a refusal of the
+//! hook was a real one - its session's own transcript holds the call and the
+//! block - and records that once, at the session's Stop.
 //!
 //! `stale_guard` reads what `absent_guard` writes but never touches surface
 //! 2 itself: it is a THIRD Stop-time check (after the Response Guard and
@@ -81,6 +90,7 @@
 //! `stale_guard_stop_check` for where it sits in the Stop arm.
 
 pub mod absent_guard;
+pub mod attest;
 pub mod audit;
 pub mod capture;
 pub mod decay;
@@ -88,8 +98,10 @@ pub mod deliver;
 #[cfg(feature = "semantic")]
 pub mod embed;
 pub mod eval_session;
+pub mod guard_verdict;
 pub mod input;
 pub mod judge;
+pub mod legit;
 pub mod live;
 pub mod lookup;
 pub mod mark;
@@ -105,9 +117,11 @@ pub mod respond;
 pub mod semantic_paths;
 pub mod serving;
 pub mod session_start;
+pub mod shell;
 pub mod stale_guard;
 pub mod status;
 pub mod store_dir;
+pub mod teeth;
 pub mod time;
 pub mod usefulness;
 #[cfg(feature = "semantic")]

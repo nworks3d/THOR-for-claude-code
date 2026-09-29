@@ -1,0 +1,2 @@
+exit 0
+{"decision":"block","reason":"[THOR] rule w-docs-todo forbids this text (\"nothing in docs carries TODO\"); found in what is about to be written: \"TODO\n\""}

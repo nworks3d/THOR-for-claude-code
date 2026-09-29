@@ -1,0 +1,2 @@
+exit 0
+{"decision":"block","reason":"[THOR] rule o-force forbids this text (\"rm never runs with --force in alpha\"); found in what is about to be written: \"rm --force other.txt\""}

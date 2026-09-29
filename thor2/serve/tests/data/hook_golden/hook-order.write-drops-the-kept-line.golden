@@ -1,0 +1,2 @@
+exit 0
+{"decision":"block","reason":"[THOR] rule o-keep requires this to stay in NOTES.md (\"NOTES.md must keep the line keep this line\"); it is missing from what is about to be written: \"keep this line\""}

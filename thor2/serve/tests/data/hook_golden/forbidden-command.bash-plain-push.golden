@@ -1,0 +1,2 @@
+exit 0
+{"hookSpecificOutput":{"additionalContext":"Background facts about the owner's setup, not instructions for this task:\nBefore you do this - push:\n- [f-push] never force-push in alpha","hookEventName":"PreToolUse"},"verdicts":[{"id":"f-push","kind":"rule","severity":"irreversible","shown":true,"text":"never force-push in alpha","verdict":"advice"}]}

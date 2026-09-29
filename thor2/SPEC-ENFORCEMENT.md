@@ -6,7 +6,9 @@ guard) and `serve/src/bin/serve.rs::hook_once` (the hook dispatcher).
 
 Scope of this spec: the SAFETY MODEL (B3) and the CAPTURE GUARD (Lane C).
 B1/B2 (the action guard with a judge model) build on the same safety model and
-are specified only far enough to make B3 binding on them.
+are specified only far enough to make B3 binding on them. Section 6 adds the
+write side of the safety model: how a check gets onto a blocking surface at
+all.
 
 ---
 
@@ -206,3 +208,155 @@ Nothing here is deployed to `C:\Users\dev\thor2\bin` or wired into
 `settings.json` without the owner saying so in-session. A surface that can block
 turn completion changes his daily work; the build and the numbers come first,
 the switch is his call.
+
+---
+
+## 6. The two tracks - how a check reaches a blocking surface
+
+Section 1.2 says a fact may only BLOCK when its currency is proven at that
+instant. This section is the write side of the same rule:
+
+> **A new or changed check reaches the store only after it refused the call or
+> write it forbids and let every clean form through, in the same pipeline the
+> hook runs.**
+
+A check stored before this trial existed stays live until `retest` decides it
+(6.5): a guard that works is never switched off only because nothing has tried
+it yet.
+
+### 6.1 Every write is a trial
+
+- `remember`, `revise`, `pin` and `unpin` run every Rule/Orientation, whatever
+  its severity, through `serve::teeth::trial`. A revise that changes only tags,
+  falsifier, expires or key runs none and keeps the verdict it had.
+- Every attempt runs through `serve::guard_verdict` - the one decision
+  pipeline `serve hook` runs - on a one-item in-memory store, with synthetic
+  payloads. The trial never writes a file and never appends to a real store.
+- Three outcomes. RULE: the forbidden form was refused and every clean form let
+  through; stored with its check. NOTE: stored with no check (`teeth:note`); it
+  keeps its severity, so it still ranks and informs as before. REFUSE: nothing
+  written; one `GateRefused` by actor `teeth-write` records it and never
+  changes the item.
+- Clean forms are built by THOR, never taken from the log: the anchor alone,
+  the listing forms (`git tag -l`, `git branch --list`, ...), the help forms
+  (`<anchor> --help`, `-h`, `--version`), and for `contains` the file as it
+  stands, an edit that keeps the literal, and the file minus its first line
+  that overlaps no occurrence of the literal (when it has one). A collapsed
+  check (its anchor contains its literal) is tried as a whole-command ban: the
+  call itself must be refused, and a mention (`echo <anchor>`) must pass - for
+  an anchor of two or more words also `<program> --version`, and for three or
+  more the anchor without its last word.
+- A tooth derived from the rule's own text - a backtick or quoted span, or a
+  flag, after a Command anchor; a span that stands in a file the rule is
+  anchored to - FORCES the write when it bites, passes every clean form, and
+  refuses no real call from the log that another session made before the id's
+  first refused write. The refusal names both polarities when both bite and
+  both exits: hang the tooth, or dispute it (`legitimate_calls`,
+  `may_change`), which lands a note by dispute.
+- A check that would refuse more than half of at least five real calls it
+  reaches in the log is refused as too broad; `accept_refusing`, naming one of
+  the listed calls, keeps it on the rule track.
+- A4: a check whose literal the rule's own text never names is refused when the
+  check is attached or changed. A pre-existing A4 failure never blocks a write
+  that leaves the check alone; the item stays undecided.
+- The verdict rides in the write's own event as a `teeth_trial` record.
+  `model::store::current_verdict` counts it only while its fingerprint (kind,
+  text, bindings, check, project, severity) equals the head's. A `teeth:` tag
+  is a readable copy only: written only together with a record that implies
+  it, dropped by any write that changes the fingerprint without one, and never
+  read to decide anything.
+- Proven versus wired is a label, never a settlement: proven needs evidence
+  from reality - a field refusal (6.4), the `contains` literal in the
+  committed file (`HEAD`), or an `absent` literal the file's git history once
+  held.
+
+### 6.2 The root a check is judged under
+
+- A file check is tried in the project's registered working copy
+  (`model::checkout::registered_checkout`, re-exported by `serve::project`).
+  It is read only from events by actor `installer` and validated at every
+  read: the folder exists, is the top of a main checkout (not a linked
+  worktree) and still resolves to the project. There is no fallback to the
+  session's folder, the tool server's startup folder or the code index.
+- No registered working copy: REFUSE, naming `install.exe --register-root
+  --db "<store>"`, when the writing session is inside that project; otherwise
+  NOTE with the check kept pending (`NoWorkingCopy`), never live. False in the
+  registered checkout but true in the session's own checkout: NOTE pending
+  (`NotTrueInRegisteredCheckout`). False in both: REFUSE, naming what is
+  missing. An OLD file check whose project has no registered working copy is
+  `Blocked(NoWorkingCopy)`: it keeps its check and is counted apart.
+- The hook's own root is the top of the checkout (`checkout_top`); a relative
+  path is read against the session's folder, and in a shell write against the
+  folder its segment runs in (6.3). The guards' project is the folder's
+  project, else the session's last project
+  (`serve::project::session_project`); a session that drifted out of its
+  project resolves its path guards under that project's registered working
+  copy (`serve::project::guard_root`).
+
+### 6.3 The door - command checks
+
+- `serve::shell::segments` is the one definition of "this anchor reaches this
+  call", used by every guard arm, serving, the trial and the real-call corpus.
+  It splits the way a shell does (separators, new lines, pipes, quoting,
+  heredocs, `$(...)`, backticks, loops) and descends into `ssh`, `sh -c`,
+  `eval`, `powershell -Command`, `cmd /c` and `Invoke-Expression`, in the Sh
+  and the PowerShell dialect.
+- A Command-bound forbidden literal is looked for in the reached segment's
+  unit: its pipeline, its heredoc bodies and the last `cd` before it on the
+  same line. An Always-bound forbidden literal reads the whole text.
+- Token boundaries: a forbidden literal and a `requires` trigger match only
+  where each word-character edge has a neighbour that is absent, whitespace, a
+  quote or one of `; | & ( ) { } < > = , : / \`; on the right, `.` counts only
+  when no word character follows it. The content checks (`contains`, `absent`,
+  `absent_all`) and a `requires` check's answers keep substring matching.
+- An anchor written with `.exe` reaches only a call that names that `.exe`. A
+  `requires` trigger ending in one `*` is a prefix. A call whose only words
+  after the anchor are help or version words is never refused by `requires`
+  (a `forbidden` check is not exempted).
+- Each reached segment is judged under the project of the folder it runs in
+  (the `cd` chain, and for git its `-C`, `--git-dir` or `GIT_DIR=`; never
+  `--work-tree`, which names no repository); a folder of no project, one
+  written with `$` or `~`, or a network path keeps the session's project.
+- The shell-write guard reads the same segments, and never treats a segment
+  behind `ssh` as a write to a local file.
+
+### 6.4 Field evidence
+
+`serve::attest::is_field_refusal`: a `gate_refused` by actor `hook`, from a
+UUID-shaped session with served activity, after the check was set, carrying a
+`tool_use_id`, AND a recorded `attester` verdict that the session's own
+transcript holds that tool_use and a tool_result for it with `is_error` true
+whose content starts "PreToolUse:<Tool> hook error: [THOR]" and names the rule
+id. The transcript is found by session id, never by a path a payload names. It
+is checked once, at that session's `Stop`, and the verdict is recorded in the
+log; a refusal never verified whose transcript is gone is never proof. A field
+refusal sets the proven label and nothing else.
+
+### 6.5 One reader, and retest
+
+- `model::store::settlement` is the one answer for the evaluation filing gate,
+  the `Stop` hook and `doctor`: Settled on a current RULE or NOTE verdict,
+  while a blocker holds (`NoWorkingCopy`, `WorkingTreeDiffers`), or when
+  retracted or archived; otherwise Owed. Rot is every live Rule/Orientation
+  that is Owed, whatever its severity. A tag, a reason, an open point or a
+  refusal on record settles nothing.
+- `serve retest --id <id> | --project <p> | --all [--apply]` runs the same
+  trial with no session. Exit 0 a verdict it can write, 3 blocked, 4 needs the
+  agent, 1 error, 2 usage. `--apply` writes one `fact_revised` by actor
+  `retest`, only while the head is still the one tried (compare-and-swap).
+
+### 6.6 Tests that pin section 6
+
+`serve/tests/hook_and_trial_share_one_pipeline.rs` (golden outputs recorded
+before the pipeline moved), `mcp/tests/two_tracks_at_the_write.rs`,
+`mcp/tests/every_refusal_names_a_way_on.rs` (every refusal names a way on the
+agent can run itself, or routes to the owner),
+`serve/tests/command_tooth_reaches_every_segment.rs`,
+`serve/tests/requires_star_trigger.rs`, `serve/tests/shell_write_guard.rs`,
+`serve/tests/hard_guards_stay_in_their_project.rs`,
+`ops/tests/install_registers_root.rs`,
+`serve/tests/stop_records_refusal_verifications.rs`,
+`serve/tests/retest_cli.rs`,
+`serve/tests/stop_hook_and_filing_gate_read_one_settlement.rs`,
+`mcp/tests/replica_refuses_what_it_can_judge.rs`,
+`model/tests/cli_cannot_forge_a_box.rs`.

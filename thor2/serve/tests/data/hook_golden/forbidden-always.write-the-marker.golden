@@ -1,0 +1,2 @@
+exit 0
+{"decision":"block","reason":"[THOR] rule f-marker forbids this text (\"no file ever carries DO-NOT-SHIP\"); found in what is about to be written: \"a DO-NOT-SHIP b\""}

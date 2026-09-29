@@ -193,6 +193,17 @@ fn open_store(path: &std::path::Path) -> EventStore {
     }
 }
 
+/// Refuse an actor name reserved for THOR itself before anything is opened,
+/// with the very sentence the store gives (`store::refuse_reserved_actor`).
+/// The store refuses it too - this only makes the answer come first, before a
+/// store is opened or created.
+fn refuse_a_reserved_actor_early(actor: &str) {
+    if let Err(refusal) = store::refuse_reserved_actor(actor) {
+        eprintln!("refused: {refusal}");
+        std::process::exit(1);
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -218,6 +229,7 @@ fn main() {
             lineage_id,
             actor,
         } => {
+            refuse_a_reserved_actor_early(&actor);
             let mut bindings = moments;
             bindings.extend(targets);
             if always {
@@ -262,6 +274,7 @@ fn main() {
             }
         }
         Command::Archive { id, reason, session_id, lineage_id, actor } => {
+            refuse_a_reserved_actor_early(&actor);
             let mut event_store = open_store(&cli.db);
             // The checkout this ran in, so a check pointing at a file that is
             // gone no longer blocks the archive - see `store::archive`.
@@ -416,6 +429,46 @@ mod tests {
         }
     }
 
+    // ------------------------------------------ reserved actors (D1, R2.4)
+
+    /// THE LEAK THIS CLOSES (measured before the fix): `model declare --actor
+    /// eval-machine` was stored like any other write, so a shell could write
+    /// under a name only THOR itself may use. `--actor` reaches the field the
+    /// early check reads, that check refuses every reserved name with the
+    /// store's own sentence, and the store refuses the same write on its own,
+    /// appending nothing. An ordinary name still stores.
+    #[test]
+    fn declare_refuses_a_reserved_actor() {
+        let cli = Cli::try_parse_from([
+            "model", "--db", "x.db", "declare", "--id", "i1", "--kind", "rule", "--text", "t", "--always", "--actor",
+            "eval-machine",
+        ])
+        .expect("--actor must parse");
+        match cli.command {
+            Command::Declare { actor, .. } => assert_eq!(actor, "eval-machine"),
+            _ => panic!("expected Declare"),
+        }
+
+        for name in ["eval-machine", "installer", "retest", "attester", "hook"] {
+            let refusal = store::refuse_reserved_actor(name).expect_err(name);
+            assert_eq!(
+                refusal.to_string(),
+                format!("the actor name {name} is reserved for THOR itself - write without --actor, or with your own name")
+            );
+            let mut db = thor_core::event_store::EventStore::in_memory().unwrap();
+            let item = declare_item_with_check(&format!("reserved-{name}"), "a fixture rule written under a reserved name", None);
+            let err = store::declare_in(&mut db, "S1", "S1", name, &item, None).expect_err(name);
+            assert!(err.to_string().contains("is reserved for THOR itself"), "{name}: {err}");
+            assert!(db.get_all_events().unwrap().is_empty(), "{name}: a refused actor must append nothing");
+        }
+
+        assert!(store::refuse_reserved_actor("alice-fixture").is_ok());
+        let mut db = thor_core::event_store::EventStore::in_memory().unwrap();
+        let item = declare_item_with_check("ordinary-actor", "a fixture rule written under an ordinary name", None);
+        store::declare_in(&mut db, "S1", "S1", "alice-fixture", &item, None).expect("an ordinary actor still stores");
+        assert_eq!(db.get_all_events().unwrap().len(), 1);
+    }
+
     // -------------------------------------------------- end-to-end (store)
     //
     // Exercises the SAME item-construction path `main`'s `Command::Declare`
@@ -444,7 +497,9 @@ mod tests {
     fn declare_with_an_accepted_check_combination_round_trips_into_the_store() {
         let mut db = thor_core::event_store::EventStore::in_memory().unwrap();
         let check = gate::build_check(Some("path_exists"), Some("CHANGELOG.md".to_string()), None, vec![]).unwrap();
-        let item = declare_item_with_check("cli-check-1", "the changelog lives in CHANGELOG.md", check);
+        let mut item = declare_item_with_check("cli-check-1", "the changelog lives in CHANGELOG.md", check);
+        // A path_exists check guards the path its rule is anchored to (A4).
+        item.bindings.push(Binding::Target { kind: model::item::TargetKind::Path, value: "CHANGELOG.md".to_string() });
 
         store::declare(&mut db, "s", "l", "test", &item).unwrap();
         let back = store::show(&db, "cli-check-1").unwrap();
@@ -485,7 +540,7 @@ mod tests {
                 .unwrap();
         let item = declare_item_with_check(
             "cli-check-absent-all-1",
-            "docs/STYLE.md never carries an em dash, en dash or ellipsis",
+            "docs/STYLE.md never carries an em dash (U+2014), en dash (U+2013) or ellipsis (...)",
             check,
         );
 
@@ -537,7 +592,7 @@ mod tests {
         let check = gate::build_check(Some("forbidden"), None, None, literals.clone()).unwrap();
         let item = declare_item_with_check(
             "cli-check-forbidden-1",
-            "never write an em dash, en dash or ellipsis, anywhere",
+            "never write an em dash (U+2014), en dash (U+2013) or ellipsis (...), anywhere",
             check,
         );
 

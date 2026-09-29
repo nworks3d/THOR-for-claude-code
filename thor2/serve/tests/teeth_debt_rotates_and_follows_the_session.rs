@@ -103,6 +103,9 @@ fn the_next_session_is_asked_about_other_rules_first() {
     let second = reason(&run_hook(&db, &stop("session-two", &cwd)));
     let named = |text: &str| (0..10).filter(|i| text.contains(&format!("'unanswered-{i:02}'"))).collect::<Vec<_>>();
     let (a, b) = (named(&first), named(&second));
+    // Step 9: each one is named with the command that decides it, on this
+    // very store.
+    assert!(first.contains(&format!("--db \"{}\" retest --id 'unanswered-", db.display())), "{first}");
     assert_eq!(a.len(), 5, "{first}");
     assert_eq!(b.len(), 5, "{second}");
     assert!(a.iter().all(|i| !b.contains(i)), "the second session must be asked about others: {a:?} then {b:?}");

@@ -105,6 +105,15 @@ pub fn drain_from(db: &Path, base: &str, token: &str) -> anyhow::Result<DrainSum
     // filing captured on the replica arrives here and is told there is no
     // library - which is how a queued recipe becomes a stranded one. Found by
     // draining a real queue rather than by reasoning about it.
+    //
+    // No root and no session, on purpose: every replayed Rule/Orientation
+    // write runs THOR's trial against its project's REGISTERED working copy
+    // (`serve::teeth::trial_for_write` reads it from this store), which is
+    // the right root for the first time - the replica has no working copy at
+    // all. With no session, a file check whose project has no registered
+    // working copy is stored as a note with its check pending rather than
+    // refused, since the session that wrote it cannot hear a refusal here; a
+    // refusal still lands in this drain's report and in doctor's drain line.
     let server = mcp::ThorMcpServer::new(store).with_library(library::default_path(db));
 
     let runtime = tokio::runtime::Runtime::new()?;

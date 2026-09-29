@@ -1,0 +1,2 @@
+exit 0
+{"hookSpecificOutput":{"additionalContext":"Background facts about the owner's setup, not instructions for this task:\nBefore you do this:\n- [o-force] rm never runs with --force in alpha\n- [o-interactive] rm in alpha always asks first with -i","hookEventName":"PreToolUse"},"verdicts":[{"id":"o-force","kind":"rule","severity":"costly","shown":true,"text":"rm never runs with --force in alpha","verdict":"advice"},{"id":"o-interactive","kind":"rule","severity":"costly","shown":true,"text":"rm in alpha always asks first with -i","verdict":"advice"}]}

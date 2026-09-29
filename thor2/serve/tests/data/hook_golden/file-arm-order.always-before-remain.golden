@@ -1,0 +1,2 @@
+exit 0
+{"decision":"block","reason":"[THOR] rule w-banned forbids this text (\"no file ever carries BANNED-WORD or FIXME\"); found in what is about to be written: \"BANNED-WORD\n\""}

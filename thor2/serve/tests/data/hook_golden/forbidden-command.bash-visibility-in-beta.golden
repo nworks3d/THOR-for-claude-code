@@ -1,0 +1,2 @@
+exit 0
+{"decision":"block","reason":"[THOR] rule f-visibility forbids this text (\"never make a repository public\"); found in what is about to be written: \"gh repo edit --visibility public\""}

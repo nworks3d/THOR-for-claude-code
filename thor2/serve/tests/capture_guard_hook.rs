@@ -189,6 +189,10 @@ fn recording_the_decision_before_stop_pays_the_debt_even_with_a_judge_configured
             check: None,
         };
         model::store::declare(&mut store, "s1", "s1", "assistant", &item).unwrap();
+        // Settled by THOR's trial (a note), so the teeth question - which
+        // since step 9 asks about every rule without a verdict, whatever its
+        // weight - is not what this test hears.
+        serve::teeth::fixture::decide(&mut store, &item.id);
     }
 
     let stop_out = run_hook(&db, &stop_payload("s1"));

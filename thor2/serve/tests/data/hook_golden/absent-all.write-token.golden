@@ -1,0 +1,2 @@
+exit 0
+{"decision":"block","reason":"[THOR] rule aa-config forbids this text (\"CONFIG.md never holds a secret\"); found in what is about to be written: \"token=abc\""}

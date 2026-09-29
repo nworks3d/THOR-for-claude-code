@@ -92,7 +92,7 @@ fn fixture_with_frozen_directory_rule(dir: &Path) -> std::path::PathBuf {
         falsifier: Some("a write to frozen/ lands with no harm done".to_string()),
         check: Some(model::item::Check::PathExists { path: "frozen".to_string() }),
     };
-    model::store::declare(&mut store, "s", "l", "a", &item).unwrap();
+    model::store::declare(&mut store, "s", "l", "a", &named(&item)).unwrap();
     db
 }
 
@@ -229,7 +229,7 @@ fn when_both_a_location_and_a_content_rule_would_fire_the_location_block_wins() 
             literal: "\u{2014}".to_string(),
         }),
     };
-    model::store::declare(&mut store, "s", "l", "a", &content_item).unwrap();
+    model::store::declare(&mut store, "s", "l", "a", &named(&content_item)).unwrap();
 
     let out = run_hook(&db, &write_payload("s1", dir.path(), &target, "a line with an em dash \u{2014} here"));
     let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("expected a decision JSON: {e}: {out}"));
@@ -239,9 +239,47 @@ fn when_both_a_location_and_a_content_rule_would_fire_the_location_block_wins() 
     assert!(!reason.contains("no-em-dash-in-notes"), "the content rule must not also fire: {reason}");
 }
 
+/// A session standing in a subfolder of the checkout keeps the location rule:
+/// the anchor `frozen` resolves against the top of the checkout
+/// (`project::checkout_top`), not against the subfolder. A relative shell
+/// write is read from where the session stands: `../frozen/cli.rs` from `sub`
+/// is inside the protected folder, `frozen/cli.rs` from `sub` is not.
+#[test]
+fn a_session_in_a_subfolder_is_still_refused_a_write_into_a_protected_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let top = dir.path().join("checkout");
+    std::fs::create_dir_all(top.join(".git")).unwrap();
+    std::fs::create_dir_all(top.join("sub")).unwrap();
+    let db = fixture_with_frozen_directory_rule(&top);
+    let sub = top.join("sub");
+    let target = top.join("frozen").join("cli.rs");
+
+    let out = run_hook(&db, &write_payload("s1", &sub, &target, "fn main() {}"));
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("expected a decision JSON: {e}: {out}"));
+    assert_eq!(v["decision"], "block", "a Write from a subfolder must be refused: {out}");
+    assert!(v["reason"].as_str().unwrap().contains("never-touch-frozen"), "{out}");
+
+    let bash = |command: &str| {
+        serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "s1",
+            "cwd": sub.to_string_lossy(),
+            "tool_name": "Bash",
+            "tool_input": { "command": command },
+        })
+        .to_string()
+    };
+    let out = run_hook(&db, &bash("echo x > ../frozen/cli.rs"));
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("expected a decision JSON: {e}: {out}"));
+    assert_eq!(v["decision"], "block", "a redirect into the protected folder from a subfolder: {out}");
+    assert!(v["reason"].as_str().unwrap().contains("never-touch-frozen"), "{out}");
+
+    assert_not_blocked(&run_hook(&db, &bash("echo x > frozen/cli.rs")));
+}
+
 /// The pre-existing content guard still fires exactly as before when NO
 /// location rule applies to the file at all - proves the new location check
-/// added ahead of it in `absent_guard_block` never swallows or changes a
+/// added ahead of it in `serve::guard_verdict::file_write` never swallows or changes a
 /// content-only block.
 #[test]
 fn the_content_guard_still_fires_on_its_own_when_no_location_rule_applies() {
@@ -262,11 +300,25 @@ fn the_content_guard_still_fires_on_its_own_when_no_location_rule_applies() {
         falsifier: Some("an em dash lands in NOTES.md and nobody notices".to_string()),
         check: Some(model::item::Check::Absent { path: "NOTES.md".to_string(), literal: "\u{2014}".to_string() }),
     };
-    model::store::declare(&mut store, "s", "l", "a", &item).unwrap();
+    model::store::declare(&mut store, "s", "l", "a", &named(&item)).unwrap();
     let notes = dir.path().join("NOTES.md");
 
     let out = run_hook(&db, &write_payload("s1", dir.path(), &notes, "a line with an em dash \u{2014} right here"));
     let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("expected a decision JSON: {e}: {out}"));
     assert_eq!(v["decision"], "block", "{out}");
     assert!(v["reason"].as_str().unwrap().contains("no-em-dash-in-notes"));
+}
+
+/// `item` with every check literal its text does not name appended to the
+/// text (in `U+XXXX` form for a glyph): since step 8 of the two tracks the
+/// write gate refuses a check whose literal the rule's own words never name
+/// (A4), and these fixtures are about the hook, not about naming.
+fn named(item: &model::item::Item) -> model::item::Item {
+    let mut out = item.clone();
+    let unnamed = model::gate::unnamed_literals(&out);
+    if !unnamed.is_empty() {
+        let shown: Vec<String> = unnamed.iter().map(|l| format!("'{}'", model::gate::shown_literal(l))).collect();
+        out.text = format!("{} (names {})", out.text, shown.join(" "));
+    }
+    out
 }

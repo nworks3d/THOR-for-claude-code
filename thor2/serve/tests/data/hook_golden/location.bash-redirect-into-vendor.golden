@@ -1,0 +1,2 @@
+exit 0
+{"decision":"block","reason":"[THOR] rule l-vendor forbids writing here (\"nothing under vendor is edited by hand\"); vendor is a protected location and vendor/lock.json may not be written. The command `echo x > vendor/lock.json` would have rewritten vendor/lock.json. Nothing was done."}

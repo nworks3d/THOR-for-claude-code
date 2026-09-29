@@ -1,0 +1,2 @@
+exit 0
+{"decision":"block","reason":"[THOR] rule r-pip applies here: this call trips \"pip install\" and says none of \"--no-deps\". pip install in alpha always carries --no-deps Nothing was done. Add one and run the call again."}

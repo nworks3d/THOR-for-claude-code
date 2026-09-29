@@ -1,0 +1,2 @@
+exit 0
+{"hookSpecificOutput":{"additionalContext":"Background facts about the owner's setup, not instructions for this task:\nBefore you do this:\n- [r-agent] every Agent call names its model","hookEventName":"PreToolUse"},"verdicts":[{"id":"r-agent","kind":"rule","severity":"costly","shown":true,"text":"every Agent call names its model","verdict":"advice"}]}

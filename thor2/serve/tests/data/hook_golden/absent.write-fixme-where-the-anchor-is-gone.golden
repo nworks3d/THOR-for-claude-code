@@ -1,0 +1,2 @@
+exit 0
+{"hookSpecificOutput":{"additionalContext":"Background facts about the owner's setup, not instructions for this task:\nBefore you do this:\n- [a-gone] GONE.md never carries FIXME","hookEventName":"PreToolUse"},"verdicts":[{"id":"a-gone","kind":"rule","severity":"house_style","shown":true,"text":"GONE.md never carries FIXME","verdict":"advice"}]}

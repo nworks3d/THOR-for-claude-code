@@ -11,6 +11,7 @@
 
 pub mod anchor_shape;
 pub mod check;
+pub mod checkout;
 pub mod gate;
 pub mod item;
 pub mod marked;

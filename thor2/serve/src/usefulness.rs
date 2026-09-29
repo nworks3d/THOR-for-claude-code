@@ -1387,11 +1387,16 @@ pub fn project_eval_state(db: &Path, project: Option<&str>) -> ProjectEvalState 
 /// falls back to this only when the working directory resolves to nothing;
 /// a directory that resolves to a real project always wins.
 pub fn last_project_of_session(db: &Path, session_id: &str) -> Option<String> {
-    read_eval_debt_state(db)
-        .into_iter()
+    newest_project_of_session(&read_eval_debt_state(db), session_id).map(str::to_string)
+}
+
+/// `last_project_of_session` on a sidecar already read: the project whose
+/// entry for `session_id` has the newest `last_event_unix`.
+fn newest_project_of_session<'a>(all: &'a EvalDebtState, session_id: &str) -> Option<&'a str> {
+    all.iter()
         .filter(|(key, _)| !key.is_empty())
-        .filter_map(|(key, state)| state.sessions.get(session_id).map(|s| (key, s.last_event_unix.unwrap_or(i64::MIN))))
-        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+        .filter_map(|(key, state)| state.sessions.get(session_id).map(|s| (key.as_str(), s.last_event_unix.unwrap_or(i64::MIN))))
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(a.0)))
         .map(|(key, _)| key)
 }
 
@@ -1588,6 +1593,13 @@ pub fn record_eval_debt_asked(db: &Path, project: Option<&str>, now_unix: i64) {
 /// telescope into the next write, which is exact by construction (the sum
 /// of gaps each under a bound, none of which individually reached `EVAL_
 /// PAUSE_MINUTES`, equals one merged gap that has not reached it either).
+///
+/// A SWITCH BACK IS WRITTEN AT ONCE TOO. `last_project_of_session` reads the
+/// newest `last_event_unix` on disk, and the hard guards fall back to it
+/// (`project::session_project`). Left to the throttle, a session that worked
+/// in alpha, touched beta and came back to alpha within a minute still read
+/// as "last in beta" on disk, so a `cd` into a folder of no project right
+/// after would be judged under beta's rules instead of alpha's.
 pub fn record_hook_event(
     db: &Path,
     project: Option<&str>,
@@ -1616,7 +1628,8 @@ pub fn record_hook_event(
     // happens to cross the plain time throttle. Losing an increment here
     // would silently understate the very risk the repeat is gated on.
     let counter_changed = after.edits_since_test != before.edits_since_test || after.compacted_since_anchor != before.compacted_since_anchor;
-    if !is_stop && !reset_happened && !write_gap_elapsed && !counter_changed {
+    let switched_here = newest_project_of_session(&all, session_id) != Some(key.as_str());
+    if !is_stop && !reset_happened && !write_gap_elapsed && !counter_changed && !switched_here {
         return Some(after);
     }
     entry.sessions.insert(session_id.to_string(), after.clone());
@@ -2195,6 +2208,28 @@ mod session_work_tests {
         record_hook_event(&db, Some("thor"), "s1", false, NOW, HookEventKind::Other).unwrap();
         let result = record_hook_event(&db, Some("thor"), "s1", true, NOW + 2, HookEventKind::Other).unwrap();
         assert_eq!(read_sidecar_session(&db, Some("thor"), "s1"), result, "a Stop must always be durable immediately");
+    }
+
+    /// The hard guards fall back to the session's last project in a folder of
+    /// none (`project::session_project`), so a switch back must be on disk at
+    /// once: alpha, beta ten seconds later, alpha again ten seconds after
+    /// that - all inside the write throttle - and the session's last project
+    /// is alpha, not beta.
+    #[test]
+    fn a_switch_back_to_a_project_is_written_inside_the_throttle() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        record_hook_event(&db, Some("alpha"), "s1", false, NOW, HookEventKind::Other).unwrap();
+        record_hook_event(&db, Some("beta"), "s1", false, NOW + 10, HookEventKind::Other).unwrap();
+        assert_eq!(last_project_of_session(&db, "s1").as_deref(), Some("beta"));
+        let back = record_hook_event(&db, Some("alpha"), "s1", false, NOW + 20, HookEventKind::Other).unwrap();
+        assert_eq!(last_project_of_session(&db, "s1").as_deref(), Some("alpha"), "the switch back must be on disk");
+        assert_eq!(read_sidecar_session(&db, Some("alpha"), "s1"), back);
+
+        // Staying put inside the throttle is still not written.
+        let sidecar = std::fs::read_to_string(eval_debt_state_path(&db)).unwrap();
+        record_hook_event(&db, Some("alpha"), "s1", false, NOW + 25, HookEventKind::Other).unwrap();
+        assert_eq!(std::fs::read_to_string(eval_debt_state_path(&db)).unwrap(), sidecar, "no switch, no write");
     }
 
     /// Proves the correctness argument in `record_hook_event`'s own doc

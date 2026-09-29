@@ -1,0 +1,2 @@
+exit 0
+{"decision":"block","reason":"[THOR] rule c-dir requires this to stay in docs (\"every file in docs keeps its SPDX line\"); it is missing from what is about to be written: \"SPDX-License-Identifier\" The command `rm docs/a.md` would have removed docs/a.md. Nothing was done."}

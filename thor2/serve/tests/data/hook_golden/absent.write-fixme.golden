@@ -1,0 +1,2 @@
+exit 0
+{"decision":"block","reason":"[THOR] rule a-notes forbids this text (\"NOTES.md never carries FIXME\"); found in what is about to be written: \"FIXME later\""}

@@ -22,7 +22,7 @@ use model::store;
 use thor_core::event_store::EventStore;
 
 fn anchored(id: &str, target: &str, check: Option<Check>) -> Item {
-    Item {
+    let mut item = Item {
         id: id.to_string(),
         kind: Kind::Orientation,
         // Distinct per id: the near-duplicate refusal is a different gate and
@@ -36,7 +36,14 @@ fn anchored(id: &str, target: &str, check: Option<Check>) -> Item {
         key: None,
         falsifier: Some("the file stops being what this says it is".to_string()),
         check,
+    };
+    // A rule's tooth is named in its own text (A4): these tests are about the
+    // toll, not about naming, so every literal the check carries is named.
+    let unnamed = model::gate::unnamed_literals(&item);
+    if !unnamed.is_empty() {
+        item.text = format!("{} ({})", item.text, unnamed.iter().map(|l| format!("'{l}'")).collect::<Vec<_>>().join(" "));
     }
+    item
 }
 
 /// A root holding one file with one known line in it, so a `Contains` check

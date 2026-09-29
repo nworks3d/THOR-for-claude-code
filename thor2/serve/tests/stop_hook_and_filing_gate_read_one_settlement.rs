@@ -1,0 +1,195 @@
+//! The Stop hook's teeth question, the evaluation-filing gate and its batch
+//! read ONE answer (`model::store::settlement`, step 9): the same rules are
+//! owed on all three, a settled rule is named by none, and a rule held by a
+//! machine blocker (a file check of a project with no registered working
+//! copy) is named by none until the blocker lifts - then by all three.
+//!
+//! (The spec names this file `stop_hook_teeth_debt_reads_the_same_settlement_
+//! as_the_filing_gate.rs`; that name makes the test binary's path pass the
+//! 260-character limit of the Windows linker in a deeply nested build folder,
+//! so it carries this shorter one.)
+//!
+//! Before step 9 the Stop hook computed its own answer (`serve::prove::
+//! teeth_box`) while the filing gate read tags, open points and probe events,
+//! so the two could disagree about the same rule in the same turn.
+
+use std::collections::BTreeSet;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+use model::item::{Binding, Check, Item, Kind, Severity, TargetKind};
+use thor_core::event_store::{EventKind, EventStore};
+
+fn run_hook(db: &Path, payload: &str) -> String {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_serve"))
+        .arg("--db")
+        .arg(db)
+        .arg("hook")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn serve");
+    let _ = child.stdin.take().unwrap().write_all(payload.as_bytes());
+    let out = child.wait_with_output().expect("wait serve");
+    assert!(out.status.success(), "the hook must always exit 0");
+    String::from_utf8(out.stdout).unwrap()
+}
+
+fn stop_reason(db: &Path, session: &str, cwd: &Path) -> String {
+    let payload = serde_json::json!({
+        "hook_event_name": "Stop",
+        "session_id": session,
+        "cwd": cwd.to_string_lossy(),
+        "stop_hook_active": false,
+        "last_assistant_message": "",
+    })
+    .to_string();
+    let out = run_hook(db, &payload);
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap_or_else(|e| panic!("expected a block: {e}: {out}"));
+    assert_eq!(v["decision"], "block", "{out}");
+    v["reason"].as_str().unwrap().to_string()
+}
+
+fn legacy(store: &mut EventStore, item: &Item) {
+    let body = serde_json::to_string(item).unwrap();
+    store.append_event("legacy", &item.id, "migration", EventKind::FactCreated, &item.id, None, &body).unwrap();
+}
+
+fn rule(id: &str, text: &str) -> Item {
+    Item {
+        id: id.to_string(),
+        kind: Kind::Rule,
+        text: text.to_string(),
+        bindings: vec![Binding::Moment(intent::Action::Deploy)],
+        severity: Some(Severity::Irreversible),
+        project: Some("p".to_string()),
+        tags: vec![],
+        expires: None,
+        key: None,
+        falsifier: Some("the mistake turns out to cost nothing".to_string()),
+        check: None,
+    }
+}
+
+const IDS: [&str; 4] = ["owed-1", "owed-2", "noted", "blocked-1"];
+
+fn named(text: &str) -> BTreeSet<String> {
+    IDS.iter().filter(|id| text.contains(&format!("'{id}'"))).map(|id| id.to_string()).collect()
+}
+
+fn set(ids: &[&str]) -> BTreeSet<String> {
+    ids.iter().map(|id| id.to_string()).collect()
+}
+
+fn eval_report(id: &str) -> Item {
+    Item {
+        id: id.to_string(),
+        kind: Kind::Report,
+        text: format!("fixture evaluation report {id}"),
+        bindings: vec![],
+        severity: None,
+        project: Some("p".to_string()),
+        tags: vec![model::store::EVALUATION_REPORT_TAG.to_string()],
+        expires: None,
+        key: None,
+        falsifier: None,
+        check: None,
+    }
+}
+
+/// What the three readers name, as sets of fixture ids.
+fn three_answers(db: &Path, session: &str, cwd: &Path) -> (BTreeSet<String>, BTreeSet<String>, BTreeSet<String>) {
+    let stop = named(&stop_reason(db, session, cwd));
+    let mut store = EventStore::open_existing(db).unwrap();
+    let batch: BTreeSet<String> = model::store::evaluation_teeth_batch(&store, Some("p"))
+        .owed_now
+        .into_iter()
+        .map(|(id, _)| id)
+        .filter(|id| IDS.contains(&id.as_str()))
+        .collect();
+    let filing = match model::store::declare(&mut store, "s", "l", "a", &eval_report(&format!("eval-{session}"))) {
+        Ok(_) => BTreeSet::new(),
+        Err(e) => named(&e.to_string()),
+    };
+    (stop, batch, filing)
+}
+
+fn git(dir: &Path, hooks: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .arg("-c")
+        .arg(format!("core.hooksPath={}", hooks.display()))
+        .args(args)
+        .output()
+        .expect("git runs");
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn the_stop_hook_the_batch_and_the_filing_gate_name_the_same_rules() {
+    let tmp = tempfile::tempdir().unwrap();
+    let checkout: PathBuf = tmp.path().join("p");
+    std::fs::create_dir_all(&checkout).unwrap();
+    std::fs::write(checkout.join("NOTES.md"), "keep me\nplain line\n").unwrap();
+    let db = tmp.path().join("thor.db");
+    let mut store = EventStore::new(&db).unwrap();
+    model::store::declare(&mut store, "s", "l", "a", &eval_report("eval-old")).unwrap();
+    legacy(&mut store, &rule("owed-1", "probe rule owed-1 about a costly mistake"));
+    legacy(&mut store, &rule("owed-2", "probe rule owed-2 about a costly mistake"));
+    legacy(&mut store, &rule("noted", "probe rule noted about a costly mistake"));
+    let mut blocked = rule("blocked-1", "NOTES.md must keep the line `keep me`.");
+    blocked.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "NOTES.md".to_string() }];
+    blocked.check = Some(Check::Contains { path: "NOTES.md".to_string(), literal: "keep me".to_string() });
+    legacy(&mut store, &blocked);
+    // The trial settles `noted` as a note.
+    let corpus = serve::legit::Corpus::load(&store);
+    let retest = serve::teeth::retest(&store, Some(db.as_path()), "noted", &corpus).unwrap();
+    assert!(matches!(retest.outcome, serve::teeth::Maintenance::Note { .. }), "{:?}", retest.outcome);
+    serve::teeth::apply_as_retest(&mut store, &retest).unwrap();
+    drop(store);
+
+    // p is not registered: blocked-1 is held by that blocker.
+    std::fs::write(checkout.join(".thor-project"), "p\n").unwrap();
+    let (stop, batch, filing) = three_answers(&db, "session-one", &checkout);
+    assert_eq!(stop, set(&["owed-1", "owed-2"]), "the Stop hook");
+    assert_eq!(batch, stop, "the batch reads the same answer");
+    assert_eq!(filing, stop, "and so does the filing gate");
+
+    // Registered: the blocker lifts, and all three name it.
+    std::fs::remove_file(checkout.join(".thor-project")).unwrap();
+    let hooks = tmp.path().join("no-hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    git(&checkout, &hooks, &["init", "-q", "-b", "main"]);
+    git(&checkout, &hooks, &["config", "core.hooksPath", hooks.to_str().unwrap()]);
+    let mut store = EventStore::open_existing(&db).unwrap();
+    let record = Item {
+        id: model::store::project_opened_id("p"),
+        kind: Kind::Report,
+        text: "Project p: a fixture record.".to_string(),
+        bindings: Vec::new(),
+        severity: None,
+        project: Some("p".to_string()),
+        tags: vec!["project-record".to_string()],
+        expires: None,
+        key: None,
+        falsifier: None,
+        check: None,
+    };
+    let body = model::store::canonical_body(&record).unwrap();
+    let body = format!(
+        "{},\"root\":{},\"root_at\":\"2026-09-29T00:00:00Z\"}}",
+        &body[..body.len() - 1],
+        serde_json::to_string(checkout.to_str().unwrap()).unwrap()
+    );
+    store
+        .append_event("install", "install", model::store::INSTALLER_ACTOR, EventKind::FactCreated, &record.id, None, &body)
+        .unwrap();
+    drop(store);
+    let (stop, batch, filing) = three_answers(&db, "session-two", &checkout);
+    assert_eq!(stop, set(&["owed-1", "owed-2", "blocked-1"]), "the Stop hook");
+    assert_eq!(batch, stop, "the batch");
+    assert_eq!(filing, stop, "the filing gate");
+}

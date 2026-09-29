@@ -1,0 +1,2 @@
+exit 0
+{"decision":"block","reason":"[THOR] rule l-vendor forbids writing here (\"nothing under vendor is edited by hand\"); vendor is a protected location and vendor/lock.json may not be written. The command `rm vendor/lock.json` would have removed vendor/lock.json. Nothing was done."}

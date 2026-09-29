@@ -1,0 +1,2 @@
+exit 0
+{"decision":"block","reason":"[THOR] rule r-inner applies here: this call trips \"ssh\" carrying \"-p acme-dev\" and says none of \"-f docker-compose.dev.yml\". a dev docker compose over ssh must carry -f docker-compose.dev.yml Nothing was done. Add one and run the call again."}

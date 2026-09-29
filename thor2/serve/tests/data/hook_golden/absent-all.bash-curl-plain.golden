@@ -1,0 +1,2 @@
+exit 0
+{"hookSpecificOutput":{"additionalContext":"Background facts about the owner's setup, not instructions for this task:\nBefore you do this:\n- [aa-curl] curl never skips TLS checks here","hookEventName":"PreToolUse"},"verdicts":[{"id":"aa-curl","kind":"rule","severity":"costly","shown":true,"text":"curl never skips TLS checks here","verdict":"advice"}]}

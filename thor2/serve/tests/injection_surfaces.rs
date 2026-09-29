@@ -13,6 +13,9 @@
 //! - `a_prompt_that_resolves_to_nothing_gets_an_empty_block` - an ordinary
 //!   prompt naming no action and no declared target renders to zero bytes,
 //!   never a "closest N" fallback.
+//! - `a_heavy_note_ranks_exactly_as_the_same_rule_did` - a rule THOR's trial
+//!   puts on the note track (step 8) keeps its severity and ranks exactly
+//!   where the same rule ranked before its trial.
 
 use intent::Action;
 use model::item::{Binding, Item, Kind, Severity, TargetKind};
@@ -37,9 +40,7 @@ fn rule_always(id: &str) -> Item {
         bindings: vec![Binding::Always],
         severity: Some(Severity::Irreversible),
         project: None,
-        // Gate ground 11: these fixtures test which surface delivers what, and
-        // a generic "standing rule N" has no literal to catch.
-        tags: vec![format!("{}a test fixture where 'the same call' is also the legitimate one", model::store::NO_LITERAL_REASON_PREFIX)],
+        tags: vec![],
         expires: None,
         key: None,
         falsifier: Some(format!("standing rule {id} turns out to be wrong")),
@@ -55,8 +56,7 @@ fn rule_moment(id: &str, action: Action) -> Item {
         bindings: vec![Binding::Moment(action)],
         severity: Some(Severity::Irreversible),
         project: None,
-        // Same as rule_always above.
-        tags: vec![format!("{}a test fixture where 'the same call' is also the legitimate one", model::store::NO_LITERAL_REASON_PREFIX)],
+        tags: vec![],
         expires: None,
         key: None,
         falsifier: Some(format!("{id} turns out to be safe without checking first")),
@@ -224,4 +224,51 @@ fn a_prompt_that_resolves_to_nothing_gets_an_empty_block() {
     let block = render::render_text(&selection, &input, test_db());
     assert!(block.is_none(), "an ordinary prompt must render to nothing, never a ranked fallback");
     assert_eq!(block.map(|s| s.len()).unwrap_or(0), 0, "zero bytes, not almost zero");
+}
+
+/// Step 8: a heavy rule whose trial finds no working tooth becomes a note -
+/// stored without a check, labelled `teeth:note`, its severity kept. A note
+/// still arrives at its moment, ranked by its severity: it must rank exactly
+/// where the same rule ranked before its trial, among heavier and lighter
+/// neighbours.
+#[test]
+fn a_heavy_note_ranks_exactly_as_the_same_rule_did() {
+    let neighbours = |db: &mut EventStore| {
+        let mut costly = rule_moment("moment-costly", Action::Push);
+        costly.severity = Some(Severity::Costly);
+        costly.text = "never push a branch nobody reviewed".to_string();
+        let mut house = rule_moment("moment-house", Action::Push);
+        house.severity = Some(Severity::HouseStyle);
+        house.text = "push small commits, one change each".to_string();
+        let mut other = rule_moment("moment-other", Action::Push);
+        other.text = "never push while a migration is half applied".to_string();
+        for item in [costly, house, other] {
+            store::declare(db, "s", "l", "a", &item).unwrap();
+        }
+    };
+    let ranked = |db: &EventStore| -> Vec<(String, Option<Severity>)> {
+        let mut input = ServeInput::default();
+        input.add_moment(Action::Push);
+        rank::select(&live::live_items(db), &input).into_iter().map(|r| (r.id.clone(), r.item.severity)).collect()
+    };
+
+    let mut before = EventStore::in_memory().unwrap();
+    store::declare(&mut before, "s", "l", "a", &rule_moment("moment-1", Action::Push)).unwrap();
+    neighbours(&mut before);
+
+    let mut after = EventStore::in_memory().unwrap();
+    store::declare(&mut after, "s", "l", "a", &rule_moment("moment-1", Action::Push)).unwrap();
+    neighbours(&mut after);
+    let corpus = serve::legit::Corpus::load(&after);
+    let retest = serve::teeth::retest(&after, None, "moment-1", &corpus).unwrap();
+    serve::teeth::apply_as_retest(&mut after, &retest).unwrap();
+
+    let note = live::live_items(&after).into_iter().find(|li| li.id == "moment-1").unwrap();
+    assert_eq!(note.item.tags, vec!["teeth:note".to_string()], "the trial put it on the note track");
+    assert!(note.item.check.is_none(), "a note carries no check");
+    assert_eq!(note.item.severity, Some(Severity::Irreversible), "a note keeps its severity");
+
+    let (was, is) = (ranked(&before), ranked(&after));
+    assert_eq!(was.len(), 4, "{was:?}");
+    assert_eq!(is, was, "the note ranks exactly where the rule did");
 }

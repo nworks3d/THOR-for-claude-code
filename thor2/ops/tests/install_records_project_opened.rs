@@ -55,9 +55,14 @@ fn git(repo: &Path, args: &[&str]) {
 }
 
 /// A throwaway git repository with one committed file - same shape
-/// `install_project_index.rs`'s own `git_repo_with_a_file` builds.
+/// `install_project_index.rs`'s own `git_repo_with_a_file` builds. Its hooks
+/// point at an empty folder right after `git init`, so the machine's own
+/// shared git hooks never act on it.
 fn git_repo_with_a_file(dir: &Path) {
     git(dir, &["init", "--quiet"]);
+    let hooks = dir.parent().unwrap().join("no-hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    git(dir, &["config", "core.hooksPath", &hooks.display().to_string()]);
     git(dir, &["config", "user.email", "test@example.invalid"]);
     git(dir, &["config", "user.name", "install cli tests"]);
     std::fs::write(dir.join("main.rs"), "fn main() { println!(\"a findable fixture sentence\"); }\n").unwrap();
@@ -105,6 +110,21 @@ async fn a_successful_install_records_the_project_and_a_remember_under_it_passes
         .expect("the project-opened record must be live in the store");
     assert_eq!(item.kind, model::item::Kind::Report);
     assert_eq!(item.project.as_deref(), Some("demo-shop"));
+
+    // The same event carries the checkout it was read from, as the project's
+    // registered working copy: written by the installer, forward slashes.
+    let root = repo.display().to_string().replace('\\', "/");
+    let events = store.get_events_by_entity("project-demo-shop-opened-by-install").unwrap();
+    assert_eq!(events.len(), 1, "created with its working copy in one event");
+    assert_eq!(events[0].actor, "installer");
+    let body: serde_json::Value = serde_json::from_str(&events[0].body).unwrap();
+    assert_eq!(body["root"].as_str(), Some(root.as_str()), "{}", events[0].body);
+    assert!(body["root_at"].as_str().is_some(), "{}", events[0].body);
+    assert!(stdout.contains(&format!("+ registered its working copy: {root}")), "{stdout}");
+    assert_eq!(
+        serve::project::registered_checkout(&store, Some("demo-shop")).map(|p| p.display().to_string().replace('\\', "/")),
+        Ok(root.clone())
+    );
 
     // No `--project` was given, so no `.thor-project` marker exists either -
     // the record above is the ONLY thing that can open the collection.
@@ -177,6 +197,11 @@ fn a_second_install_run_does_not_duplicate_the_record() {
     assert!(
         !stdout_of(&second).contains("recorded this project"),
         "a rerun must not announce recording the project a second time:\n{}",
+        stdout_of(&second)
+    );
+    assert!(
+        stdout_of(&second).contains("= project record already names this checkout"),
+        "a rerun from the registered checkout says so:\n{}",
         stdout_of(&second)
     );
 

@@ -1,0 +1,2 @@
+exit 0
+{"decision":"block","reason":"[THOR] rule f-alpha-only forbids this text (\"alpha never writes ALPHA-SECRET\"); found in what is about to be written: \"ALPHA-SECRET\""}

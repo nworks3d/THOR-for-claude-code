@@ -178,6 +178,9 @@ fn an_entry_whose_item_was_revised_after_it_was_recorded_no_longer_blocks() {
     let mut updated = existing.clone();
     updated.text = "a rule that was fixed".to_string();
     model::store::revise(&mut store, "s", "l", "a", &existing, &updated).unwrap();
+    // The rewrite leaves it without a verdict; THOR's trial decides it (a
+    // note), so the teeth question is not what this test hears.
+    serve::teeth::fixture::decide(&mut store, "r1");
     drop(store);
 
     let out = run_hook(&db, &stop_payload("s1"));

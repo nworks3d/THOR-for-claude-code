@@ -8,7 +8,7 @@
 //! injection surface once it has been called noise
 //! `decay::NOISE_MARKS_BEFORE_STALE` times since anyone last called it
 //! useful. If the write guard (`serve::absent_guard`, wired in
-//! `bin/serve.rs`'s `absent_guard_block`) ever took its own candidate pool
+//! `serve::guard_verdict`) ever took its own candidate pool
 //! AFTER that retirement, two `mark noise` calls plus the write the rule
 //! exists to stop would be all it took to get it through.
 //!

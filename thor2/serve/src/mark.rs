@@ -14,18 +14,25 @@
 //! one that counts, which is what makes a second opinion possible at all.
 
 use model::marked::{ItemMarkedNoise, ItemMarkedUseful};
+use model::store::{fence, WriteActor};
 use thor_core::event_store::{Event, EventKind, EventStore};
 
 /// Append one `item_marked_useful` event for `id`. Errors are surfaced (never
 /// swallowed): marking is an intentional write, not passive telemetry.
-pub fn record_useful(
+///
+/// Behind the same actor fence as every write in `model::store`
+/// (`model::store::fence`): a name reserved for THOR itself, passed as a plain
+/// string, is refused before anything is appended - a mark is a verdict, and a
+/// verdict under a THOR name would be read as THOR's own.
+pub fn record_useful<'a>(
     store: &mut EventStore,
     session_id: &str,
     lineage_id: &str,
-    actor: &str,
+    actor: impl Into<WriteActor<'a>>,
     marked_at: &str,
     id: &str,
 ) -> anyhow::Result<Event> {
+    let actor = fence(store, actor.into(), id).map_err(|e| anyhow::anyhow!("{e}"))?;
     let body = serde_json::to_string(&ItemMarkedUseful { marked_at: marked_at.to_string() })?;
     store.append_event(session_id, lineage_id, actor, EventKind::ItemMarkedUseful, id, None, &body)
 }
@@ -37,14 +44,15 @@ pub fn record_useful(
 /// This is the signal `crate::decay` needs and never had. Decay by silence
 /// was falsified on its first production day (see that module); an explicit
 /// negative is a real observation, where the absence of a positive is not.
-pub fn record_noise(
+pub fn record_noise<'a>(
     store: &mut EventStore,
     session_id: &str,
     lineage_id: &str,
-    actor: &str,
+    actor: impl Into<WriteActor<'a>>,
     marked_at: &str,
     id: &str,
 ) -> anyhow::Result<Event> {
+    let actor = fence(store, actor.into(), id).map_err(|e| anyhow::anyhow!("{e}"))?;
     let body = serde_json::to_string(&ItemMarkedNoise { marked_at: marked_at.to_string() })?;
     store.append_event(session_id, lineage_id, actor, EventKind::ItemMarkedNoise, id, None, &body)
 }
@@ -95,5 +103,24 @@ mod tests {
         let mut store = EventStore::in_memory().unwrap();
         record_useful(&mut store, "s", "l", "a", "2026-08-02T12:00:00Z", "ghost").unwrap();
         assert!(ever_marked_useful(&store).contains("ghost"));
+    }
+
+    /// A mark is a verdict, and a verdict stamped with a name only THOR may
+    /// use would be read as THOR's own: both writers refuse a reserved name
+    /// passed as a plain string, and a mark on THOR's own project record, and
+    /// append nothing. An ordinary name still marks (the tests above).
+    #[test]
+    fn a_mark_under_a_reserved_name_is_refused_and_appends_nothing() {
+        let mut store = EventStore::in_memory().unwrap();
+        for name in ["teeth-eval", "eval-machine", "attester"] {
+            let err = record_useful(&mut store, "s", "l", name, "2026-09-28T00:00:00Z", "x1").unwrap_err();
+            assert!(err.to_string().contains(&format!("the actor name {name} is reserved for THOR itself")), "{err}");
+            let err = record_noise(&mut store, "s", "l", name, "2026-09-28T00:00:00Z", "x1").unwrap_err();
+            assert!(err.to_string().contains("is reserved for THOR itself"), "{err}");
+        }
+        let err = record_noise(&mut store, "s", "l", "a", "2026-09-28T00:00:00Z", "project-demo-opened-by-install")
+            .unwrap_err();
+        assert!(err.to_string().contains("THOR's own registration"), "{err}");
+        assert!(store.get_all_events().unwrap().is_empty(), "a refused mark must append nothing");
     }
 }

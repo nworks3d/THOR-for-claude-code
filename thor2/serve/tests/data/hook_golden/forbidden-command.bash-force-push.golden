@@ -1,0 +1,2 @@
+exit 0
+{"decision":"block","reason":"[THOR] rule f-push forbids this text (\"never force-push in alpha\"); found in what is about to be written: \"git push --force origin main\""}

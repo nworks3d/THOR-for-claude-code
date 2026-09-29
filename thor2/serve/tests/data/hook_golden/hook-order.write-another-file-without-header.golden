@@ -1,0 +1,2 @@
+exit 0
+{"decision":"block","reason":"[THOR] rule o-header applies here: this call trips \"Write\" and says none of \"# header\". every Write in alpha carries the header line Nothing was done. Add one and run the call again."}

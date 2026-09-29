@@ -12,6 +12,7 @@
 
 use crate::input::ServeInput;
 use crate::live::LiveItem;
+use crate::shell::Segment;
 use model::item::{Binding, Item, Kind, Severity, TargetKind};
 use regex::Regex;
 use std::sync::OnceLock;
@@ -80,7 +81,7 @@ pub use model::normalize::target_matches;
 /// comparison - see that function's own doc comment for why a bare
 /// `target_matches` let a project-scoped, repo-relative anchor reach a file
 /// far outside the project (measured 2026-09-08).
-fn binding_matches(binding: &Binding, input: &ServeInput, item_project: Option<&str>) -> bool {
+fn binding_matches(binding: &Binding, input: &ServeInput, item_project: Option<&str>, commands: &[Vec<Segment>]) -> bool {
     match binding {
         Binding::Always => false,
         Binding::Moment(action) => input.moments.contains(action),
@@ -95,12 +96,14 @@ fn binding_matches(binding: &Binding, input: &ServeInput, item_project: Option<&
         //
         // The guard arm had already solved this and said so in its own doc
         // comment; the serving path simply never used it. This is that one
-        // definition, not a second one - see
-        // `absent_guard::command_anchor_names`.
-        Binding::Target { kind: TargetKind::Command, value } => input
-            .targets
-            .iter()
-            .any(|(k, v)| *k == TargetKind::Command && crate::absent_guard::command_anchor_names(value, v)),
+        // definition, not a second one - `absent_guard::command_anchor_names`,
+        // an anchor reaching ANY segment of the command (`serve::shell`), read
+        // in the sh dialect. `commands` holds each Command target already cut
+        // into its segments (`command_segments`), once per call, not once per
+        // candidate.
+        Binding::Target { kind: TargetKind::Command, value } => {
+            commands.iter().any(|segments| crate::shell::reaches_any(value, segments))
+        }
         // Path/Dir (and every other kind: Symbol/Host/Route/Project, where
         // `scoped_target_matches` itself falls straight through to the plain
         // `target_matches` below, unchanged) go through the ONE root-aware
@@ -112,6 +115,18 @@ fn binding_matches(binding: &Binding, input: &ServeInput, item_project: Option<&
             .iter()
             .any(|(k, v)| crate::absent_guard::scoped_target_matches(item_project, *kind, value, *k, v, input.root.as_deref())),
     }
+}
+
+/// Every Command target of `input`, cut into its segments in the sh dialect
+/// - the reading `absent_guard::command_anchor_names` gives a command's text,
+/// done once per call here rather than once per candidate.
+fn command_segments(input: &ServeInput) -> Vec<Vec<Segment>> {
+    input
+        .targets
+        .iter()
+        .filter(|(kind, _)| *kind == TargetKind::Command)
+        .map(|(_, command)| crate::shell::segments(command, crate::shell::Dialect::Sh))
+        .collect()
 }
 
 /// Is this item even eligible to reach a gate at all? Delegates to the ONE
@@ -137,6 +152,7 @@ fn eligible(kind: Kind) -> bool {
 /// module). This is `select` in the CONTRACT sense: the ONE function every
 /// channel (hook/check/why) calls to decide what applies, before any cap.
 pub fn select(candidates: &[LiveItem], input: &ServeInput) -> Vec<RankedItem> {
+    let commands = command_segments(input);
     let mut hits: Vec<RankedItem> = candidates
         .iter()
         .filter(|c| eligible(c.item.kind))
@@ -145,7 +161,7 @@ pub fn select(candidates: &[LiveItem], input: &ServeInput) -> Vec<RankedItem> {
         // this surface's four slots in every project - see
         // `project::applies_to` for the measurement that found it.
         .filter(|c| crate::project::applies_to(c.item.project.as_deref(), input.project.as_deref()))
-        .filter(|c| c.item.bindings.iter().any(|b| binding_matches(b, input, c.item.project.as_deref())))
+        .filter(|c| c.item.bindings.iter().any(|b| binding_matches(b, input, c.item.project.as_deref(), &commands)))
         .map(|c| RankedItem { id: c.id.clone(), item: c.item.clone() })
         .collect();
 
@@ -558,6 +574,35 @@ mod tests {
                 root: None,
             };
             assert!(select(&[c.clone_for_test()], &input).is_empty(), "must not fire on: {miss}");
+        }
+    }
+
+    /// THE DOOR (2026-09-28): serving reads the same segments the guards do,
+    /// so a rule anchored to a command is served when that command is ANY
+    /// segment of the call - after a `cd`, behind a pipe, inside `$(...)` -
+    /// and still not for a mere mention in an `echo`.
+    #[test]
+    fn a_command_binding_fires_on_every_segment_of_a_compound_call() {
+        let mut c = base("x4c", Kind::Rule);
+        c.item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "gh repo edit".to_string() }];
+        let input_for = |command: &str| ServeInput {
+            moments: vec![],
+            targets: vec![(TargetKind::Command, command.to_string())],
+            context: String::new(),
+            project: None,
+            command: None,
+            file: None,
+            root: None,
+        };
+        for hit in [
+            "cd repo && gh repo edit acme/x --visibility public",
+            "git status | head -3; gh repo edit acme/x --description y",
+            "x=$(gh repo edit acme/x --visibility public)",
+        ] {
+            assert_eq!(select(&[c.clone_for_test()], &input_for(hit)).len(), 1, "must fire on: {hit}");
+        }
+        for miss in ["echo gh repo edit acme/x; ls", "cd repo && gh repo view acme/x"] {
+            assert!(select(&[c.clone_for_test()], &input_for(miss)).is_empty(), "must not fire on: {miss}");
         }
     }
 

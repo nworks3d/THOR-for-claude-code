@@ -1,0 +1,2 @@
+exit 0
+{"hookSpecificOutput":{"additionalContext":"Background facts about the owner's setup, not instructions for this task:\nBefore you do this:\n- [a-deploy] deploy.sh is never run with --prod from here","hookEventName":"PreToolUse"},"verdicts":[{"id":"a-deploy","kind":"rule","severity":"costly","shown":true,"text":"deploy.sh is never run with --prod from here","verdict":"advice"}]}
