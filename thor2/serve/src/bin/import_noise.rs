@@ -174,7 +174,7 @@ fn main() -> ExitCode {
     let mut failed = 0usize;
     for (id, n) in &planned {
         for _ in 0..*n {
-            match serve::mark::record_noise(&mut store, "import", "import", "import-noise-1.0", &marked_at, id) {
+            match serve::mark::record_noise(&mut store, "import", "import", "import-noise-1.0", &marked_at, id, None) {
                 Ok(_) => written += 1,
                 Err(e) => {
                     eprintln!("{id}: {e}");

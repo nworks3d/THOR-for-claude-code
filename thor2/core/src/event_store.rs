@@ -1485,6 +1485,25 @@ impl EventStore {
         keep_rev: &str,
         discarded: &[String],
     ) -> anyhow::Result<Event> {
+        self.append_resolve_stamped(session_id, lineage_id, actor, entity_id, keep_rev, discarded, None)
+    }
+
+    /// `append_resolve`, with `att` - the JSON text of the tool server's
+    /// stamp of the call that makes the resolve (`model::store::Att`) -
+    /// spliced onto the body as the trailing key `"att"`. Every reader of a
+    /// resolve body reads `keep_rev` and `discarded` by name, so the extra key
+    /// changes nothing for them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_resolve_stamped(
+        &mut self,
+        session_id: &str,
+        lineage_id: &str,
+        actor: &str,
+        entity_id: &str,
+        keep_rev: &str,
+        discarded: &[String],
+        att: Option<&str>,
+    ) -> anyhow::Result<Event> {
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -1517,7 +1536,10 @@ impl EventStore {
             return Err(conflict("cited head-set does not match the current head-set").into());
         }
 
-        let body = serde_json::json!({ "keep_rev": keep_rev, "discarded": discarded }).to_string();
+        let mut body = serde_json::json!({ "keep_rev": keep_rev, "discarded": discarded }).to_string();
+        if let Some(att) = att {
+            body = format!("{},\"att\":{att}}}", &body[..body.len() - 1]);
+        }
         let event = insert_event(
             &tx,
             session_id,
@@ -1877,6 +1899,40 @@ impl EventStore {
         events.collect()
     }
 
+    /// `events_of_kinds` from seq 0, narrowed to the events written by
+    /// `actor`. Read only. For a reader of one of THOR's own record kinds (the
+    /// evaluation validator's records) that must not read every verification
+    /// the attester ever wrote to find the few it wants.
+    pub fn events_of_kinds_by_actor(&self, kinds: &[EventKind], actor: &str) -> SqlResult<Vec<Event>> {
+        if kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let marks = vec!["?"; kinds.len()].join(", ");
+        let sql = format!("SELECT {} FROM event WHERE actor = ? AND kind IN ({marks}) ORDER BY seq", EVENT_COLUMNS);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut args: Vec<rusqlite::types::Value> = vec![rusqlite::types::Value::Text(actor.to_string())];
+        args.extend(kinds.iter().map(|k| rusqlite::types::Value::Text(k.as_str().to_string())));
+        let events = stmt.query_map(rusqlite::params_from_iter(args), row_to_event)?;
+        events.collect()
+    }
+
+    /// `events_of_kinds` from seq 0, narrowed to the events whose session_id
+    /// column is `session_id`. Read only. For the Stop hook's verification of
+    /// a session's own writes, which must not read every write body of the
+    /// whole log at every turn.
+    pub fn events_of_kinds_in_session(&self, kinds: &[EventKind], session_id: &str) -> SqlResult<Vec<Event>> {
+        if kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let marks = vec!["?"; kinds.len()].join(", ");
+        let sql = format!("SELECT {} FROM event WHERE session_id = ? AND kind IN ({marks}) ORDER BY seq", EVENT_COLUMNS);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut args: Vec<rusqlite::types::Value> = vec![rusqlite::types::Value::Text(session_id.to_string())];
+        args.extend(kinds.iter().map(|k| rusqlite::types::Value::Text(k.as_str().to_string())));
+        let events = stmt.query_map(rusqlite::params_from_iter(args), row_to_event)?;
+        events.collect()
+    }
+
     /// The shipper's read side: every event with seq > `after_seq`, in chain
     /// order. Map with `Event::to_shipped` to ship the backlog to a replica.
     pub fn events_since(&self, after_seq: i64) -> SqlResult<Vec<Event>> {
@@ -1885,6 +1941,51 @@ impl EventStore {
             .prepare(&format!("SELECT {} FROM event WHERE seq > ? ORDER BY seq", EVENT_COLUMNS))?;
         let events = stmt.query_map([after_seq], row_to_event)?;
         events.collect()
+    }
+
+    /// Every event, NEWEST FIRST, handed to `visit` one at a time until it
+    /// returns false. Read only. For a reader that wants the recent end of
+    /// the log only - the events of the last hour or week - and must not read
+    /// every row of a long log to find them: rows are read lazily, so a visit
+    /// that stops early stops the read too.
+    pub fn visit_newest_first(&self, mut visit: impl FnMut(&Event) -> bool) -> SqlResult<()> {
+        let mut stmt = self.conn.prepare(&format!("SELECT {} FROM event ORDER BY seq DESC", EVENT_COLUMNS))?;
+        let mut rows = stmt.query_map([], row_to_event)?;
+        for row in rows.by_ref() {
+            if !visit(&row?) {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// The log as it stood at `until_seq`: a new in-memory store holding a
+    /// copy of every event with seq <= `until_seq`, row for row (the same
+    /// seq, uuid, hashes and bodies - nothing is re-hashed or re-stamped),
+    /// with the heads projection rebuilt over them. For a reader that has to
+    /// recompute a decision exactly as the log allowed it at one past moment
+    /// (the evaluation validator re-runs the filing gate at the filing's own
+    /// log position). The recall index is not copied: nothing that reads a
+    /// past log searches text. Writes to the copy never reach this store.
+    pub fn truncated_copy(&self, until_seq: i64) -> anyhow::Result<EventStore> {
+        let mut out = EventStore::in_memory()?;
+        {
+            let tx = out.conn.transaction()?;
+            {
+                let mut read =
+                    self.conn.prepare(&format!("SELECT {EVENT_COLUMNS} FROM event WHERE seq <= ? ORDER BY seq"))?;
+                let marks = vec!["?"; 12].join(", ");
+                let mut write = tx.prepare(&format!("INSERT INTO event ({EVENT_COLUMNS}) VALUES ({marks})"))?;
+                let mut rows = read.query([until_seq])?;
+                while let Some(row) = rows.next()? {
+                    let values = (0..12).map(|i| row.get::<_, rusqlite::types::Value>(i)).collect::<SqlResult<Vec<_>>>()?;
+                    write.execute(rusqlite::params_from_iter(values))?;
+                }
+            }
+            tx.commit()?;
+        }
+        out.rebuild_heads_projection()?;
+        Ok(out)
     }
 
     /// Log-shipping receiver: ingest a shipped batch that must CONTINUE this
@@ -2546,6 +2647,32 @@ mod tests {
         assert!(store.heads_projection_current(), "append after bypass rebuilds");
         assert!(store.verify_heads_projection().unwrap().is_empty());
         assert!(store.projected_is_head("P:mem-a", "bypass-hash"));
+    }
+
+    /// `truncated_copy`: the log as it stood at one seq, row for row, with
+    /// its own heads projection - and the store it was taken from untouched.
+    #[test]
+    fn a_truncated_copy_is_the_log_as_it_stood_at_that_seq() {
+        let mut store = EventStore::in_memory().unwrap();
+        let body = |text: &str| format!("{{\"text\":\"{text}\"}}");
+        let first = store.append_event("s", "l", "t", EventKind::FactCreated, "a", None, &body("one")).unwrap();
+        let kept = store.append_event("s", "l", "t", EventKind::FactCreated, "b", None, &body("two")).unwrap();
+        store
+            .append_event("s", "l", "t", EventKind::FactRevised, "a", Some(&first.this_hash), &body("three"))
+            .unwrap();
+        store.append_event("s", "l", "t", EventKind::FactCreated, "c", None, &body("four")).unwrap();
+
+        let copy = store.truncated_copy(kept.seq).unwrap();
+        let events = copy.get_all_events().unwrap();
+        let row = |e: &Event| (e.seq, e.event_uuid.clone(), e.actor.clone(), e.body.clone(), e.prev_hash.clone(), e.this_hash.clone());
+        let original: Vec<_> = store.get_all_events().unwrap().iter().take(2).map(row).collect();
+        assert_eq!(events.iter().map(row).collect::<Vec<_>>(), original, "the same rows, byte for byte, up to the cut");
+        assert!(copy.heads_projection_current(), "the copy reads through its own heads projection");
+        assert!(copy.verify_heads_projection().unwrap().is_empty());
+        assert!(copy.projected_is_head("a", &first.this_hash), "a's head at the cut is its first write, not the revise after it");
+        assert_eq!(copy.projected_head_count("c"), 0, "nothing written after the cut exists in the copy");
+        assert_eq!(copy.path(), None, "the copy lives in memory");
+        assert_eq!(store.get_all_events().unwrap().len(), 4, "the store itself is untouched");
     }
 
     /// `rebuild_heads_projection`'s own use case: a store copied over from

@@ -162,7 +162,7 @@ fn retracting_the_note_through_the_real_gate_silences_the_next_stop() {
         check: None,
     };
     model::store::declare(&mut store, "s1", "s1", "agent", &answers).unwrap();
-    model::store::retract(&mut store, "s1", "s1", "agent", model::store::SETUP_NOTE_ID, "owner walked through setup")
+    model::store::retract(&mut store, "s1", "s1", "agent", model::store::SETUP_NOTE_ID, "owner walked through setup", None)
         .expect("the gate must accept this retract once the answers are on record");
     drop(store);
 

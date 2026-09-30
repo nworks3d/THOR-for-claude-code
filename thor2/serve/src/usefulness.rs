@@ -60,7 +60,7 @@ mod tests {
     #[test]
     fn a_marked_item_is_present_in_the_set() {
         let mut store = EventStore::in_memory().unwrap();
-        crate::mark::record_useful(&mut store, "s", "l", "a", "2026-08-02T00:00:00Z", "x1").unwrap();
+        crate::mark::record_useful(&mut store, "s", "l", "a", "2026-08-02T00:00:00Z", "x1", None).unwrap();
         let marked = ever_marked_useful(&store);
         assert!(marked.contains("x1"));
     }
@@ -68,8 +68,8 @@ mod tests {
     #[test]
     fn marking_the_same_item_twice_still_yields_one_membership() {
         let mut store = EventStore::in_memory().unwrap();
-        crate::mark::record_useful(&mut store, "s", "l", "a", "2026-08-02T00:00:00Z", "x1").unwrap();
-        crate::mark::record_useful(&mut store, "s", "l", "a", "2026-08-03T00:00:00Z", "x1").unwrap();
+        crate::mark::record_useful(&mut store, "s", "l", "a", "2026-08-02T00:00:00Z", "x1", None).unwrap();
+        crate::mark::record_useful(&mut store, "s", "l", "a", "2026-08-03T00:00:00Z", "x1", None).unwrap();
         let marked = ever_marked_useful(&store);
         assert_eq!(marked.len(), 1);
         assert!(marked.contains("x1"));
@@ -78,7 +78,7 @@ mod tests {
     #[test]
     fn marking_one_item_never_marks_another() {
         let mut store = EventStore::in_memory().unwrap();
-        crate::mark::record_useful(&mut store, "s", "l", "a", "2026-08-02T00:00:00Z", "x1").unwrap();
+        crate::mark::record_useful(&mut store, "s", "l", "a", "2026-08-02T00:00:00Z", "x1", None).unwrap();
         let marked = ever_marked_useful(&store);
         assert!(!marked.contains("x2"));
     }
@@ -142,21 +142,49 @@ pub const ASSISTANT_DELIVERY_ACTOR: &str = "hook";
 /// in the returned map - exactly as if it had never fired at all - which is
 /// what keeps it out of `owed_items` below, and so out of the judgement debt
 /// entirely.
+///
+/// ONLY AN ATTESTED VERDICT RESETS THE COUNT (step 12, D9). Measured: a
+/// `serve mark` typed into a shell cleared an item's debt exactly as a
+/// verdict of the session that saw it fire did, so the debt could be paid by
+/// anything that can run a program. A verdict resets its item's count here
+/// only once its recorded verification (`model::store::attested_write_seqs`,
+/// written at a Stop of the session by `crate::attest::
+/// record_write_verifications`) says it was made through an attested THOR
+/// call. A verdict from the CLI, a second client or an older binary is still
+/// written, and still counts for decay, but clears no debt (`unattested_
+/// verdicts` below, which doctor names); one made this turn counts from the
+/// Stop that verifies it.
 pub fn served_since_last_verdict(store: &EventStore) -> HashMap<String, usize> {
-    let Ok(events) = store.event_kinds_with_actor() else { return HashMap::new() };
+    let Ok(events) = store.firings_and_verdicts() else { return HashMap::new() };
+    let attested = model::store::attested_write_seqs(store);
     let mut counts: HashMap<String, usize> = HashMap::new();
-    for (kind, id, actor) in events {
+    for (seq, kind, id, actor, _session) in events {
         match kind {
             EventKind::ItemServed if actor == ASSISTANT_DELIVERY_ACTOR => {
                 *counts.entry(id).or_default() += 1
             }
-            EventKind::ItemMarkedUseful | EventKind::ItemMarkedNoise => {
+            EventKind::ItemMarkedUseful | EventKind::ItemMarkedNoise if attested.contains(&seq) => {
                 counts.insert(id, 0);
             }
             _ => {}
         }
     }
     counts
+}
+
+/// How many verdicts (`ItemMarkedUseful`/`ItemMarkedNoise`) on the log have
+/// no recorded verification saying they were made through an attested THOR
+/// call - the ones `served_since_last_verdict` above never resets on. Doctor
+/// names this count, so a verdict that cleared nothing is never silent.
+pub fn unattested_verdicts(store: &EventStore) -> usize {
+    let Ok(events) = store.firings_and_verdicts() else { return 0 };
+    let attested = model::store::attested_write_seqs(store);
+    events
+        .iter()
+        .filter(|(seq, kind, ..)| {
+            matches!(kind, EventKind::ItemMarkedUseful | EventKind::ItemMarkedNoise) && !attested.contains(seq)
+        })
+        .count()
 }
 
 /// How many firings each NON-assistant actor has ever received, across
@@ -211,11 +239,12 @@ mod assistant_delivery_actor_tests {
     #[test]
     fn a_verdict_resets_the_count_even_when_the_firings_came_from_another_actor() {
         let mut store = EventStore::in_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
         crate::deliver::record_delivery(&mut store, "s", "l", ASSISTANT_DELIVERY_ACTOR, "2026-09-19T00:00:00Z", &["x1".to_string()]);
         assert_eq!(served_since_last_verdict(&store).get("x1"), Some(&1), "fixture sanity: one assistant firing counted");
 
-        crate::mark::record_useful(&mut store, "s", "l", "a", "2026-09-19T00:00:01Z", "x1").unwrap();
-        assert_eq!(served_since_last_verdict(&store).get("x1"), Some(&0), "a verdict resets the count");
+        crate::attest::fixture::attested_mark(&mut store, root.path(), crate::attest::fixture::SESSION, "x1", false, "toolu_x1");
+        assert_eq!(served_since_last_verdict(&store).get("x1"), Some(&0), "an attested verdict resets the count");
 
         crate::deliver::record_delivery(&mut store, "s", "l", "probe", "2026-09-19T00:00:02Z", &["x1".to_string()]);
         assert_eq!(
@@ -244,6 +273,80 @@ mod assistant_delivery_actor_tests {
         assert_eq!(counts.get("other-actor"), Some(&1));
         assert_eq!(counts.get(ASSISTANT_DELIVERY_ACTOR), None, "the assistant's own actor must never appear here");
         assert_eq!(counts.len(), 2);
+    }
+}
+
+/// D9 (step 12): only a verdict whose call a Stop verified as an attested
+/// THOR call clears judgement debt.
+#[cfg(test)]
+mod attested_verdict_tests {
+    use super::*;
+    use crate::attest::fixture::{attested_mark, attested_mark_unverified, SESSION};
+
+    fn declare_rule(store: &mut EventStore, id: &str) {
+        let item = model::item::Item {
+            id: id.to_string(),
+            kind: model::item::Kind::Rule,
+            text: "Run git status before a commit to see what is staged.".to_string(),
+            bindings: vec![model::item::Binding::Target {
+                kind: model::item::TargetKind::Command,
+                value: "git status".to_string(),
+            }],
+            severity: None,
+            project: None,
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some("A commit made without git status never staged the wrong file.".to_string()),
+            check: None,
+        };
+        model::store::declare(store, "s", "l", "a", &item).unwrap();
+    }
+
+    fn fired(store: &mut EventStore, id: &str, times: usize) {
+        for i in 0..times {
+            let at = format!("2026-09-28T00:{:02}:{:02}Z", i / 60, i % 60);
+            crate::deliver::record_delivery(store, SESSION, SESSION, ASSISTANT_DELIVERY_ACTOR, &at, &[id.to_string()]);
+        }
+    }
+
+    /// R12.5: a verdict from the command line (no stamp) and one from a
+    /// second client (stamped, but with no tool call id) are written, verified
+    /// at the Stop as unattested, and clear nothing.
+    #[test]
+    fn an_unattested_verdict_clears_no_debt() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = EventStore::in_memory().unwrap();
+        declare_rule(&mut store, "fx-rule");
+        fired(&mut store, "fx-rule", 41);
+        assert_eq!(served_since_last_verdict(&store).get("fx-rule"), Some(&41));
+        crate::mark::record_useful(&mut store, "cli", "cli", "cli", "2026-09-28T01:00:00Z", "fx-rule", None).unwrap();
+        let side = model::store::Att { args_sha256: "0".repeat(64), ..Default::default() };
+        crate::mark::record_useful(&mut store, SESSION, "mcp", "mcp", "2026-09-28T01:00:01Z", "fx-rule", Some(&side))
+            .unwrap();
+        crate::attest::record_write_verifications_in(&mut store, SESSION, Some(root.path()));
+        assert_eq!(served_since_last_verdict(&store).get("fx-rule"), Some(&41), "no unattested verdict resets the count");
+        assert_eq!(unattested_verdicts(&store), 2);
+        assert_eq!(model::store::judgement_debt_in_project(&store, None), vec!["fx-rule".to_string()], "the model mirror agrees");
+    }
+
+    /// G12.4: an attested verdict clears the debt - from the Stop that
+    /// verifies it, not before - and firings after it count again.
+    #[test]
+    fn an_attested_verdict_clears_it_from_the_verifying_stop() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = EventStore::in_memory().unwrap();
+        fired(&mut store, "fx-rule", 41);
+        attested_mark_unverified(&mut store, root.path(), SESSION, "fx-rule", false, "toolu_V1");
+        assert_eq!(served_since_last_verdict(&store).get("fx-rule"), Some(&41), "not verified yet");
+        assert_eq!(unattested_verdicts(&store), 1);
+        crate::attest::record_write_verifications_in(&mut store, SESSION, Some(root.path()));
+        assert_eq!(served_since_last_verdict(&store).get("fx-rule"), Some(&0), "cleared from the verifying Stop");
+        assert_eq!(unattested_verdicts(&store), 0);
+        fired(&mut store, "fx-rule", 3);
+        assert_eq!(served_since_last_verdict(&store).get("fx-rule"), Some(&3));
+        attested_mark(&mut store, root.path(), SESSION, "fx-rule", true, "toolu_V2");
+        assert_eq!(served_since_last_verdict(&store).get("fx-rule"), Some(&0), "a noise verdict clears it the same way");
     }
 }
 
@@ -475,7 +578,7 @@ mod judgement_debt_counting_tests {
         declare(&mut store, "gone", None);
         serve_n(&mut store, "gone", JUDGEMENT_DEBT_AFTER);
         assert_eq!(judgement_debt_counts(&store, None), (1, 1), "fixture sanity: owed while live");
-        model::store::retract(&mut store, "t", "t", "t", "gone", "no longer needed").unwrap();
+        model::store::retract(&mut store, "t", "t", "t", "gone", "no longer needed", None).unwrap();
         assert_eq!(judgement_debt_counts(&store, None), (0, 0), "a dead item is not a debt");
     }
 
@@ -485,7 +588,12 @@ mod judgement_debt_counting_tests {
         declare(&mut store, "settled", None);
         serve_n(&mut store, "settled", JUDGEMENT_DEBT_AFTER);
         assert_eq!(judgement_debt_counts(&store, None).0, 1);
-        crate::mark::record_useful(&mut store, "s", "s", "t", "2026-09-08T00:00:00Z", "settled").unwrap();
+        // A verdict from the command line pays nothing (step 12, D9) ...
+        crate::mark::record_useful(&mut store, "s", "s", "t", "2026-09-08T00:00:00Z", "settled", None).unwrap();
+        assert_eq!(judgement_debt_counts(&store, None).0, 1);
+        // ... one made through an attested THOR call does.
+        let root = tempfile::tempdir().unwrap();
+        crate::attest::fixture::attested_mark(&mut store, root.path(), crate::attest::fixture::SESSION, "settled", false, "toolu_S");
         assert_eq!(judgement_debt_counts(&store, None).0, 0);
     }
 
@@ -895,12 +1003,362 @@ pub fn eval_report_covers(last_evaluation_seen: Option<i64>, now_unix: i64) -> b
 /// `compacted_since_anchor` - either is enough, neither is required of the
 /// other. THE FIRST-OF-DAY BRANCH IS UNCHANGED: no risk condition at all,
 /// only the accrued-time floor, exactly as it was before this rewrite.
-pub fn eval_debt_owed(accrued_minutes: i64, last_evaluation_seen: Option<i64>, now_unix: i64, edits_since_test: u32, compacted_since_anchor: bool) -> bool {
-    if eval_report_covers(last_evaluation_seen, now_unix) {
-        accrued_minutes >= EVAL_REPEAT_WORK_MINUTES && (edits_since_test >= EVAL_REPEAT_MIN_UNTESTED_EDITS || compacted_since_anchor)
-    } else {
-        accrued_minutes >= EVAL_FIRST_WORK_MINUTES
+///
+/// STEP 17 (B8, cadence): `accrued_minutes` is the PROJECT's work clock
+/// (`ProjectEvalState::work`, every session of the project together, parallel
+/// sessions counted once), and `cadence` picks the rule. `Rolling16h` is the
+/// rule above, unchanged. `WeeklyUnlessRot` asks when the project accrued at
+/// least `EVAL_FIRST_WORK_MINUTES` since its newest valid evaluation AND that
+/// evaluation is older than `EVAL_WEEKLY_DAYS` days - or older than
+/// `EVAL_REPORT_COVERS_HOURS` while `rot` holds (`eval_filing::project_rot`,
+/// read from the log). It never asks a repeat: the risk counters play no
+/// part. The weekly floor (`weekly_floor_due`) is not part of this predicate;
+/// it applies beside it in both cadences.
+#[allow(clippy::too_many_arguments)]
+pub fn eval_debt_owed(
+    cadence: EvalCadence,
+    accrued_minutes: i64,
+    last_evaluation_seen: Option<i64>,
+    now_unix: i64,
+    edits_since_test: u32,
+    compacted_since_anchor: bool,
+    rot: bool,
+) -> bool {
+    match cadence {
+        EvalCadence::Rolling16h => {
+            if eval_report_covers(last_evaluation_seen, now_unix) {
+                accrued_minutes >= EVAL_REPEAT_WORK_MINUTES
+                    && (edits_since_test >= EVAL_REPEAT_MIN_UNTESTED_EDITS || compacted_since_anchor)
+            } else {
+                accrued_minutes >= EVAL_FIRST_WORK_MINUTES
+            }
+        }
+        EvalCadence::WeeklyUnlessRot => {
+            let older_than = |hours: i64| last_evaluation_seen.is_none_or(|seen| now_unix - seen >= hours * 3600);
+            accrued_minutes >= EVAL_FIRST_WORK_MINUTES
+                && (older_than(EVAL_WEEKLY_DAYS * 24) || (rot && older_than(EVAL_REPORT_COVERS_HOURS)))
+        }
     }
+}
+
+// ------------------------------------------------ step 17: cadence and clock
+//
+// THE PER-PROJECT WORK CLOCK (B8). Until step 17 the evaluation was asked of
+// ONE session once IT had worked an hour in the project, so two sessions of
+// forty and twenty-five minutes, one after the other or side by side, left a
+// project with more than an hour of work and no ask at all. The clock is now
+// the PROJECT's (`ProjectEvalState::work`): every hook event of every session
+// adds the gap since the project's own previous event, when that gap is a
+// working one, so parallel sessions never count twice. The ask still lands on
+// one session: a main session with at least `EVAL_OWN_WORK_MINUTES` of its own
+// work in the project since its newest valid evaluation (F14: a short
+// `claude -p` run or a scheduled task with nothing of its own is never held),
+// never at its first Stop in the project (Q10), and never while another
+// session runs the evaluation (D12, `evaluation_running_elsewhere`), for at
+// most an hour per start.
+//
+// WHAT RESETS IT. Only a new VALID evaluation, read from the log at a Stop
+// (`update_eval_debt_state`), resets the project clock and every session's
+// own accrual in the project. No hook event resets anything from the
+// sidecar's own `last_evaluation_seen` any more: that field is a copy any
+// local process can write (N3), and a hand-set value used to reset a
+// session's accrual on its next tool call (the step-16 leftover).
+//
+// WHAT A SIDECAR EDIT CAN STILL DO, AND WHAT BOUNDS IT (N3). Zeroing the
+// minutes delays the ask; it never settles anything. Two readers bound it:
+// the Stop takes this session's own minutes from its transcript tail when
+// they are larger (`attest::session_minutes_from_transcript`), and the weekly
+// floor (`weekly_floor_due`) reads the log only.
+
+/// Which rule decides when a project owes its evaluation - see
+/// `eval_debt_owed`. A code constant on purpose (`EVAL_CADENCE`): a JSON
+/// switch would be one edit away for any agent (the Z10 class).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvalCadence {
+    /// A valid evaluation covers `EVAL_REPORT_COVERS_HOURS`; after it, a
+    /// repeat after `EVAL_REPEAT_WORK_MINUTES` plus a risk. Today's rule.
+    Rolling16h,
+    /// Once a week, or daily while the project shows rot. Built, off: the
+    /// flip is the owner's (section 8 of the build spec).
+    WeeklyUnlessRot,
+}
+
+/// The cadence this build runs.
+pub const EVAL_CADENCE: EvalCadence = EvalCadence::Rolling16h;
+
+/// The one sentence doctor prints about the cadence.
+pub fn cadence_clause(cadence: EvalCadence) -> &'static str {
+    match cadence {
+        EvalCadence::Rolling16h => "evaluation cadence: rolling 16 hours (weekly-unless-rot is built but off)",
+        EvalCadence::WeeklyUnlessRot => {
+            "evaluation cadence: weekly unless rot - daily while the project shows rot (rolling 16 hours is built but off)"
+        }
+    }
+}
+
+/// How old a valid evaluation may be in `EvalCadence::WeeklyUnlessRot`
+/// before a project with nothing wrong owes the next one, in days.
+pub const EVAL_WEEKLY_DAYS: i64 = 7;
+
+/// Minutes of its OWN work a session must have in a project, since that
+/// project's newest valid evaluation, before its Stop may be held for the
+/// project's evaluation (F14, Q27).
+pub const EVAL_OWN_WORK_MINUTES: i64 = 10;
+
+/// THE WEEKLY FLOOR (D13): a project with activity in the log in the last
+/// this-many days and no valid evaluation in as many days is due, whatever
+/// the sidecar says.
+pub const EVAL_FLOOR_DAYS: i64 = 7;
+
+/// How long another session's open evaluation start exempts this session
+/// from the ask, at most (D12), in minutes.
+pub const EVAL_ELSEWHERE_MAX_MINUTES: i64 = 60;
+
+/// The time an event carries in its own body, when it carries one: a served
+/// item's `served_at`, a verdict's `marked_at`, an evaluation start's
+/// `started_unix`. Every other event (a write, an attester record) carries
+/// none: a reader dates it by the newest dated event at or before it - a
+/// lower bound, so "recent" is never read too generously.
+pub fn event_time(event: &thor_core::event_store::Event) -> Option<i64> {
+    match event.kind {
+        EventKind::ItemServed | EventKind::ItemMarkedUseful | EventKind::ItemMarkedNoise => {
+            let body: serde_json::Value = serde_json::from_str(&event.body).ok()?;
+            let at = body.get("served_at").or_else(|| body.get("marked_at"))?.as_str()?;
+            crate::time::unix_from_iso8601(at)
+        }
+        EventKind::FactCreated if event.entity_id.starts_with(model::store::EVALUATION_START_PREFIX) => {
+            model::store::frozen_of(&event.body).map(|f| f.started_unix)
+        }
+        _ => None,
+    }
+}
+
+/// The kinds of event that change an item or give a verdict: a WRITE.
+fn is_write_kind(kind: EventKind) -> bool {
+    model::store::ATTESTED_WRITE_KINDS.contains(&kind) || kind == EventKind::FactReprojected
+}
+
+/// The ids of every live item scoped to exactly `project` (the item's own
+/// `project` field).
+pub fn items_of_project(store: &EventStore, project: &str) -> HashSet<String> {
+    crate::live::live_items(store)
+        .into_iter()
+        .filter(|li| li.item.project.as_deref() == Some(project))
+        .map(|li| li.id)
+        .collect()
+}
+
+/// What the log shows of `project` since `since_unix`: whether any served
+/// item or write scoped to it came from a Claude Code session (UUID-shaped),
+/// and which sessions. A write carries no time and is dated by the newest
+/// dated event before it. Reads the log newest first and stops at the first
+/// dated event older than `since_unix`; with `first_only` it stops at the
+/// first hit.
+pub fn project_activity(store: &EventStore, project: &str, since_unix: i64, first_only: bool) -> (bool, std::collections::BTreeSet<String>) {
+    let mut sessions = std::collections::BTreeSet::new();
+    let ids = items_of_project(store, project);
+    let mut pending: Vec<String> = Vec::new();
+    let mut any = false;
+    let _ = store.visit_newest_first(|event| {
+        let ours = ids.contains(&event.entity_id)
+            && crate::attest::is_uuid_shaped(&event.session_id)
+            && (event.kind == EventKind::ItemServed
+                || (is_write_kind(event.kind) && !model::store::RESERVED_ACTORS.contains(&event.actor.as_str())));
+        match event_time(event) {
+            Some(at) if at < since_unix => return false,
+            Some(_) => {
+                if ours {
+                    sessions.insert(event.session_id.clone());
+                }
+                any |= ours || !pending.is_empty();
+                sessions.extend(pending.drain(..));
+            }
+            None if ours => pending.push(event.session_id.clone()),
+            None => {}
+        }
+        !(first_only && any)
+    });
+    (any, sessions)
+}
+
+/// THE WEEKLY FLOOR (D13, N3), from the log only: `project` showed activity
+/// in the last `EVAL_FLOOR_DAYS` days (a served item or a write scoped to
+/// it, from a Claude Code session) and has had no valid evaluation in as
+/// many days. Zeroing the work-clock sidecar can delay the ask by at most
+/// this much. Applies in both cadences.
+pub fn weekly_floor_due(store: &EventStore, project: &str, now_unix: i64) -> bool {
+    let since = now_unix - EVAL_FLOOR_DAYS * 86400;
+    let valid = crate::eval_filing::newest_valid_evaluation(store, Some(project));
+    let filed = valid.as_ref().and_then(|v| v.filed_at.as_deref()).and_then(crate::eval_filing::unix_of_timestamp);
+    if filed.is_some_and(|at| at >= since) {
+        return false;
+    }
+    project_activity(store, project, since, true).0
+}
+
+/// THE RUNNING EVALUATION ELSEWHERE (D12), from the log only: another
+/// session holds an open, not-void evaluation start for `project` that is
+/// less than `EVAL_ELSEWHERE_MAX_MINUTES` old, and that session has a log
+/// event - a served item, a verdict, a write or an attester record - within
+/// `EVAL_PAUSE_MINUTES`. No file's modification time is read. The newest such
+/// start, when there is one.
+pub fn evaluation_running_elsewhere(
+    store: &EventStore,
+    project: &str,
+    session: &str,
+    now_unix: i64,
+) -> Option<model::store::EvaluationStart> {
+    model::store::open_evaluation_starts_of_project(store, project, now_unix)
+        .into_iter()
+        .filter(|s| s.frozen.session != session)
+        .filter(|s| now_unix - s.frozen.started_unix < EVAL_ELSEWHERE_MAX_MINUTES * 60)
+        .filter(|s| session_active_since(store, &s.frozen.session, now_unix - EVAL_PAUSE_MINUTES * 60))
+        .max_by_key(|s| s.seq)
+}
+
+/// The work clock of one project as a Stop (or a skill call opening the
+/// routine) reads it, once the decision is to ask.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvalClock {
+    /// The project's clock (`ProjectEvalState::work`), its minutes never
+    /// below this session's own.
+    pub work: SessionWorkState,
+    /// This session's own minutes in the project since its newest valid
+    /// evaluation: the larger of the sidecar's and its transcript's.
+    pub own_minutes: i64,
+    /// Due by the weekly floor alone, not by the clock.
+    pub by_floor: bool,
+}
+
+/// Whether `project` owes its evaluation now, by `work` (the project's clock:
+/// its minutes and risk counters) under `cadence`, or by the weekly floor.
+/// `None`: not due; `Some(by_floor)`: due, and whether only the floor made it
+/// so. `state` is the project's sidecar entry as `update_eval_debt_state`
+/// left it (its `last_evaluation_seen` comes from the log).
+pub fn project_due(
+    store: &EventStore,
+    state: &ProjectEvalState,
+    project: &str,
+    work: &SessionWorkState,
+    now_unix: i64,
+    cadence: EvalCadence,
+) -> Option<bool> {
+    let rot = cadence == EvalCadence::WeeklyUnlessRot && crate::eval_filing::project_rot(store, project).is_some();
+    let by_clock = eval_debt_owed(
+        cadence,
+        work.accrued_secs / 60,
+        state.last_evaluation_seen,
+        now_unix,
+        work.edits_since_test,
+        work.compacted_since_anchor,
+        rot,
+    );
+    if by_clock {
+        return Some(false);
+    }
+    weekly_floor_due(store, project, now_unix).then_some(true)
+}
+
+/// What a main session's Stop decides about one project (step 17).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StopDecision {
+    /// Hold the turn with the evaluation ask.
+    Ask(EvalClock),
+    /// Due, but another session runs its evaluation (D12): one line, no hold.
+    Elsewhere(model::store::EvaluationStart),
+    /// Not this session's ask, and why.
+    Quiet(&'static str),
+}
+
+/// WHO IS ASKED (step 17), for one project `session` worked in: the project
+/// is due (`project_due`); the session has at least `EVAL_OWN_WORK_MINUTES`
+/// of its own work there since the project's newest valid evaluation - the
+/// larger of the sidecar's number and its transcript's (`timeline`, the
+/// tamper check); with `first_stop_is_free`, this is not its first Stop in
+/// the project (Q10: neither the sidecar's Stop count nor the transcript
+/// shows an earlier turn there); and no other session runs the evaluation
+/// right now (D12). `stop_here` says the Stop just counted was in this
+/// project. `state` is as `update_eval_debt_state` left it.
+#[allow(clippy::too_many_arguments)]
+pub fn stop_decision(
+    store: &EventStore,
+    state: &ProjectEvalState,
+    project: &str,
+    session: &str,
+    timeline: &[crate::attest::TimedLine],
+    stop_here: bool,
+    first_stop_is_free: bool,
+    now_unix: i64,
+    cadence: EvalCadence,
+) -> StopDecision {
+    let own_state = state.sessions.get(session).cloned().unwrap_or_default();
+    let own_minutes =
+        (own_state.accrued_secs / 60).max(crate::attest::minutes_in(timeline, project, state.last_evaluation_seen));
+    if own_minutes < EVAL_OWN_WORK_MINUTES {
+        return StopDecision::Quiet("this session has less than ten minutes of its own work here");
+    }
+    let mut work = state.work.clone();
+    work.accrued_secs = work.accrued_secs.max(own_minutes * 60);
+    let Some(by_floor) = project_due(store, state, project, &work, now_unix, cadence) else {
+        return StopDecision::Quiet("the project is not due");
+    };
+    let earlier_stops = own_state.stops.saturating_sub(u32::from(stop_here));
+    if first_stop_is_free && earlier_stops == 0 && !crate::attest::earlier_turn_in(timeline, project) {
+        return StopDecision::Quiet("this is the session's first Stop here");
+    }
+    if let Some(start) = evaluation_running_elsewhere(store, project, session, now_unix) {
+        return StopDecision::Elsewhere(start);
+    }
+    StopDecision::Ask(EvalClock { work, own_minutes, by_floor })
+}
+
+/// THE ASK FOLLOWS THE WORK (D11): every project the Stop considers for
+/// `session`, in order - the folder's own project first, then every other
+/// project the sidecar holds this session's work in (newest first), then
+/// every project its transcript attributes a line to. A `cd` into another
+/// project, or into a folder of no project, no longer moves or silences it.
+pub fn projects_of_session(all: &EvalDebtState, session: &str, folder_project: Option<&str>, from_transcript: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = folder_project.map(str::to_string).into_iter().collect();
+    let mut worked: Vec<(&String, i64)> = all
+        .iter()
+        .filter(|(key, _)| !key.is_empty())
+        .filter_map(|(key, state)| state.sessions.get(session).map(|s| (key, s.last_event_unix.unwrap_or(i64::MIN))))
+        .collect();
+    worked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    for project in worked.into_iter().map(|(key, _)| key.clone()).chain(from_transcript.iter().cloned()) {
+        if !out.contains(&project) {
+            out.push(project);
+        }
+    }
+    out
+}
+
+/// Whether `session` has a log event (a served item, a verdict, a write, an
+/// attester record - never THOR's own machine records) at or after
+/// `since_unix`, dated as `event_time` says.
+fn session_active_since(store: &EventStore, session: &str, since_unix: i64) -> bool {
+    let mut found = false;
+    let mut active = false;
+    let _ = store.visit_newest_first(|event| {
+        let its = event.session_id == session
+            && (event.kind == EventKind::ItemServed
+                || event.actor == model::store::ATTESTER_ACTOR
+                || (is_write_kind(event.kind) && !model::store::RESERVED_ACTORS.contains(&event.actor.as_str())));
+        match event_time(event) {
+            Some(at) => {
+                if its || found {
+                    active = at >= since_unix;
+                    return false;
+                }
+                at >= since_unix
+            }
+            None => {
+                found |= its;
+                true
+            }
+        }
+    });
+    active
 }
 
 /// Whole days between `then_unix` and `now_unix`, floored, never negative -
@@ -1178,6 +1636,14 @@ pub struct SessionWorkState {
     /// `accrued_secs`.
     #[serde(default)]
     pub compacted_since_anchor: bool,
+    /// How many main-session Stops of this session were seen in this project
+    /// (step 17, Q10: a session's first Stop in a project is never held).
+    /// Survives every reset: it counts Stops, not work. Always 0 in the
+    /// project clock (`ProjectEvalState::work`). A sidecar copy any local
+    /// process can write, so the Stop also asks the session's transcript
+    /// whether an earlier turn ended in the project (`attest::earlier_turn_in`).
+    #[serde(default)]
+    pub stops: u32,
 }
 
 /// Whether `session`'s own accrual must restart rather than fold one more
@@ -1247,6 +1713,7 @@ pub fn accrue_session_work(session: &SessionWorkState, now_unix: i64, last_evalu
             last_event_unix: Some(now_unix),
             edits_since_test: u32::from(event == HookEventKind::UntestedEdit),
             compacted_since_anchor: event == HookEventKind::CompactStart,
+            stops: session.stops,
         };
     }
     let gap = now_unix - session.last_event_unix.unwrap_or(now_unix);
@@ -1262,6 +1729,7 @@ pub fn accrue_session_work(session: &SessionWorkState, now_unix: i64, last_evalu
         last_event_unix: Some(now_unix),
         edits_since_test,
         compacted_since_anchor: session.compacted_since_anchor || event == HookEventKind::CompactStart,
+        stops: session.stops,
     }
 }
 
@@ -1286,31 +1754,23 @@ pub struct ProjectEvalState {
     #[serde(alias = "over_ceiling_since", default)]
     pub tracking_since: Option<i64>,
     /// Every id this project has ever had for a live Report carrying the
-    /// `evaluation-report` tag, as of the most recent Stop that looked - the
-    /// membership `last_evaluation_seen` below is measured against. Grows
-    /// only: an id is never removed just because the report was later
-    /// retracted, since a `Report`, once filed, has already done the one
-    /// thing this sidecar cares about - existed, and was seen.
+    /// `evaluation-report` tag, as of the most recent Stop that looked. Grows
+    /// only. A record of what was on file, nothing more: since step 16 a
+    /// report on file silences nothing until THOR's validator says it counts
+    /// (`last_evaluation_seen` below reads that from the log).
     #[serde(default)]
     pub known_report_ids: std::collections::BTreeSet<String>,
-    /// The time a Stop first saw an id that was not yet in
-    /// `known_report_ids` - `None` when no evaluation report has ever been
-    /// seen for this project. Deliberately NOT the report's own filing time:
-    /// the event log records no creation time for a live item, only when
-    /// each revision was appended, and a Report can be revised - "first seen
-    /// by a Stop" is the only time source this sidecar has, and it is
-    /// exactly the instant that matters here, since it is what a LATER Stop
-    /// compares "now" against to decide whether the silence it bought has
-    /// worn off.
+    /// When this project's evaluation was filed: the transcript timestamp of
+    /// the filing call's result of the newest VALID evaluation report of the
+    /// project (`eval_filing::newest_valid_evaluation`) - `None` when it has
+    /// none. Since step 16 it comes from the log only and is overwritten from
+    /// it at every main-session Stop (`update_eval_debt_state`): a value
+    /// written here by hand is gone before anything reads it.
     #[serde(default)]
     pub last_evaluation_seen: Option<i64>,
-    /// The id that set `last_evaluation_seen` - named so a reader (`doctor`,
-    /// the Stop hook's own message) can point at which report actually
-    /// silenced this, not only when. When more than one new id appears in
-    /// the same Stop (rare: reports are filed one at a time in practice),
-    /// the lexicographically greatest wins - a deterministic, testable
-    /// tie-break, and `eval-<project>-<date>`'s own shape means that is
-    /// usually also the newest by date.
+    /// The id of that report, named so a reader (`doctor`, the Stop hook's
+    /// own message) can point at which report silences this. From the log
+    /// only, like `last_evaluation_seen`.
     #[serde(default)]
     pub last_evaluation_report_id: Option<String>,
     /// How many times the Stop hook has blocked a turn for this project's
@@ -1341,6 +1801,16 @@ pub struct ProjectEvalState {
     /// session this old sidecar never heard of would read as anyway.
     #[serde(default)]
     pub sessions: std::collections::BTreeMap<String, SessionWorkState>,
+    /// THE PROJECT'S OWN WORK CLOCK (step 17, B8): every hook event of every
+    /// session in this project adds the gap since the PROJECT's previous
+    /// event, when that gap is under `EVAL_PAUSE_MINUTES` - so parallel
+    /// sessions are counted once - and the risk counters likewise per
+    /// project. `eval_debt_owed` reads this. Reset only by a new valid
+    /// evaluation read from the log (`update_eval_debt_state`). A sidecar
+    /// written before this field existed starts it from its largest session
+    /// accrual (`record_hook_event`), never from zero.
+    #[serde(default)]
+    pub work: SessionWorkState,
 }
 
 /// The whole sidecar: one [`ProjectEvalState`] per project key (see
@@ -1402,12 +1872,8 @@ fn newest_project_of_session<'a>(all: &'a EvalDebtState, session_id: &str) -> Op
 
 /// Every id of a live Report, scoped to EXACTLY `project` (not
 /// `project::applies_to`'s "or global" rule: a report filed for one project
-/// must never silence a different project's own debt, and - moot in
-/// practice, since `model::gate`'s ground 21 refuses a scopeless Report
-/// outright except for one exempt id - a global report would otherwise only
-/// ever have silenced a checkout that itself resolves to no project),
-/// carrying the `evaluation-report` tag. The set [`update_eval_debt_state`]
-/// below compares each Stop's own live set against.
+/// must never silence a different project's own debt), carrying the
+/// `evaluation-report` tag - the membership `known_report_ids` records.
 fn evaluation_report_ids(store: &EventStore, project: Option<&str>) -> Vec<String> {
     crate::live::live_items(store)
         .into_iter()
@@ -1416,37 +1882,6 @@ fn evaluation_report_ids(store: &EventStore, project: Option<&str>) -> Vec<Strin
         .filter(|li| li.item.tags.iter().any(|t| t == "evaluation-report"))
         .map(|li| li.id)
         .collect()
-}
-
-/// The newest live evaluation-report Report for `project`, paired with its
-/// own first event's seq - "newest" meaning highest creation seq, since a
-/// live item's own JSON body carries no creation timestamp anywhere in this
-/// system. `None` when the store holds none for this project.
-///
-/// WHY `doctor` (`ops::health::judgement_debt_line`) NEEDS THIS INSTEAD OF
-/// JUST READING THE SIDECAR'S OWN `last_evaluation_report_id`. The sidecar
-/// only learns about a report the next time a Stop runs in this project
-/// after it was filed - `update_eval_debt_state` above stamps it, but
-/// nothing runs that function outside a real Stop. A report filed and never
-/// yet followed by a Stop is real, live, and sitting in the store right
-/// now, but invisible to `project_eval_state`. `doctor` runs cold, with no
-/// Stop of its own, so reading only the sidecar would let it miss - and
-/// never even mention - a report that exists. This reads the store
-/// directly instead, the same store `judgement_debt_counts` already opens
-/// for the rest of this same doctor line.
-///
-/// One `get_events_by_entity` call per candidate id - cheap in practice,
-/// since a project rarely accumulates more than a handful of these over its
-/// life (one evaluation report a day, at most, is the entire point of the
-/// debt this backs).
-pub fn newest_evaluation_report(store: &EventStore, project: Option<&str>) -> Option<(String, i64)> {
-    evaluation_report_ids(store, project)
-        .into_iter()
-        .filter_map(|id| {
-            let seq = store.get_events_by_entity(&id).ok()?.first()?.seq;
-            Some((id, seq))
-        })
-        .max_by_key(|(_, seq)| *seq)
 }
 
 /// Refresh this project's own facts from `store` as it stands right now,
@@ -1484,25 +1919,51 @@ pub fn update_eval_debt_state(store: &EventStore, db: &Path, project: Option<&st
     // above).
     entry.tracking_since.get_or_insert(now_unix);
 
-    // `last_evaluation_seen`/`last_evaluation_report_id`: any id live right
-    // now that this sidecar has not seen before is "new" - stamp the moment
-    // and grow the known set, so the SAME report never re-triggers this on a
-    // later Stop just for still existing. THE SAME MOMENT ALSO SILENCES THE
-    // ASK COUNTER (2026-09-16, fourth rewrite): a new report is exactly the
-    // event that answers every unanswered ask since the last one, so
-    // `asked_count`/`first_asked_since_report` reset together with it -
-    // never on a quiet day, never on the calendar rolling over, only ever
-    // on a report actually being seen (see `record_eval_debt_asked` below
-    // for the other half, incrementing these on an ask).
-    let new_ids: Vec<String> =
-        evaluation_report_ids(store, project).into_iter().filter(|id| !entry.known_report_ids.contains(id)).collect();
-    if let Some(newest) = new_ids.iter().max().cloned() {
-        entry.last_evaluation_seen = Some(now_unix);
-        entry.last_evaluation_report_id = Some(newest);
+    // `last_evaluation_seen`/`last_evaluation_report_id` COME FROM THE LOG
+    // ONLY (step 16, Z10): the newest VALID validator record of this project
+    // whose report is still live and whose machine block still has the
+    // digest the validator recorded (`eval_filing::newest_valid_evaluation`),
+    // with the time its filing call's result was written in the transcript.
+    // Overwritten at every Stop: a hand-edited sidecar - a `last_evaluation_
+    // seen` set to "now" with no report behind it - is put back to what the
+    // log says before anything reads it. A report that is only ON FILE (an
+    // older binary, a repair tool, a side door) is never one: it has no valid
+    // record. A NEWLY VALID report also silences the ask counter
+    // (2026-09-16, fourth rewrite): it answers every unanswered ask since the
+    // last one, so `asked_count`/`first_asked_since_report` reset with it
+    // (see `record_eval_debt_asked` below for the other half).
+    let valid = crate::eval_filing::newest_valid_evaluation(store, project);
+    let seen = valid.as_ref().and_then(|v| v.filed_at.as_deref()).and_then(crate::eval_filing::unix_of_timestamp);
+    let report_id = valid.as_ref().filter(|_| seen.is_some()).map(|v| v.report.clone());
+    if report_id.is_some() && report_id != before.last_evaluation_report_id {
         entry.asked_count = 0;
         entry.first_asked_since_report = None;
     }
-    entry.known_report_ids.extend(new_ids);
+    entry.last_evaluation_seen = seen;
+    entry.last_evaluation_report_id = report_id;
+    entry.known_report_ids.extend(evaluation_report_ids(store, project));
+    // THE ONE RESET (step 17): a valid evaluation filed after an accrual
+    // began ends it - the project clock's and every session's of the
+    // project. Read from the log here, never from the sidecar's own copy
+    // (a hook event resets nothing). `stops` survives: it counts Stops.
+    if let Some(seen) = seen {
+        let fresh = |old: &SessionWorkState| SessionWorkState {
+            anchor_unix: Some(now_unix),
+            accrued_secs: 0,
+            last_event_unix: Some(now_unix),
+            edits_since_test: 0,
+            compacted_since_anchor: false,
+            stops: old.stops,
+        };
+        if entry.work.anchor_unix.is_some_and(|anchor| seen > anchor) {
+            entry.work = fresh(&entry.work);
+        }
+        for session in entry.sessions.values_mut() {
+            if session.anchor_unix.is_some_and(|anchor| seen > anchor) {
+                *session = fresh(session);
+            }
+        }
+    }
 
     if entry == before {
         return entry;
@@ -1600,6 +2061,12 @@ pub fn record_eval_debt_asked(db: &Path, project: Option<&str>, now_unix: i64) {
 /// in alpha, touched beta and came back to alpha within a minute still read
 /// as "last in beta" on disk, so a `cd` into a folder of no project right
 /// after would be judged under beta's rules instead of alpha's.
+///
+/// STEP 17: the same event also folds onto the PROJECT's clock
+/// (`ProjectEvalState::work`), measured from the project's own previous
+/// event, and nothing here resets an accrual from the sidecar's own
+/// `last_evaluation_seen` any more - only `update_eval_debt_state` does, from
+/// the log. The throttle also writes when the project's own gap reached it.
 pub fn record_hook_event(
     db: &Path,
     project: Option<&str>,
@@ -1608,15 +2075,57 @@ pub fn record_hook_event(
     now_unix: i64,
     event: HookEventKind,
 ) -> Option<SessionWorkState> {
+    record_event(db, project, session_id, is_stop, false, now_unix, event)
+}
+
+/// `record_hook_event` for a MAIN session's Stop: also counts the Stop
+/// (`SessionWorkState::stops`, Q10). A subagent's Stop is recorded with
+/// `record_hook_event` and counts no Stop.
+pub fn record_main_stop(db: &Path, project: Option<&str>, session_id: &str, now_unix: i64) -> Option<SessionWorkState> {
+    record_event(db, project, session_id, true, true, now_unix, HookEventKind::Other)
+}
+
+/// The project clock of a sidecar written before step 17: its largest
+/// session accrual since the last evaluation it knows of, so the upgrade
+/// never restarts a project's clock at zero.
+fn project_clock_from_sessions(entry: &ProjectEvalState) -> SessionWorkState {
+    let since = entry.last_evaluation_seen.unwrap_or(i64::MIN);
+    let current = entry.sessions.values().filter(|s| s.anchor_unix.is_some_and(|a| a >= since));
+    match current.max_by_key(|s| s.accrued_secs) {
+        Some(s) => SessionWorkState { stops: 0, ..s.clone() },
+        None => SessionWorkState::default(),
+    }
+}
+
+fn record_event(
+    db: &Path,
+    project: Option<&str>,
+    session_id: &str,
+    is_stop: bool,
+    main_stop: bool,
+    now_unix: i64,
+    event: HookEventKind,
+) -> Option<SessionWorkState> {
     project?;
     let mut all = read_eval_debt_state(db);
     let key = project_key(project).to_string();
     let mut entry = all.get(&key).cloned().unwrap_or_default();
     let before = entry.sessions.get(session_id).cloned().unwrap_or_default();
-    let after = accrue_session_work(&before, now_unix, entry.last_evaluation_seen, event);
+    let mut after = accrue_session_work(&before, now_unix, None, event);
+    if main_stop {
+        after.stops = after.stops.saturating_add(1);
+    }
+    let project_before = match entry.work.anchor_unix {
+        Some(_) => entry.work.clone(),
+        None => project_clock_from_sessions(&entry),
+    };
+    let project_after = accrue_session_work(&project_before, now_unix, None, event);
+    let project_gap_elapsed =
+        !entry.work.last_event_unix.is_some_and(|t| now_unix - t < EVAL_WORK_WRITE_THROTTLE_SECS);
+    entry.work = project_after;
 
     let reset_happened = after.anchor_unix != before.anchor_unix;
-    let write_gap_elapsed = !before.last_event_unix.is_some_and(|t| now_unix - t < EVAL_WORK_WRITE_THROTTLE_SECS);
+    let write_gap_elapsed = project_gap_elapsed || !before.last_event_unix.is_some_and(|t| now_unix - t < EVAL_WORK_WRITE_THROTTLE_SECS);
     // A counter change (either risk field, not merely the gap arithmetic) is
     // written immediately too, alongside `is_stop`/`reset_happened`/`write_
     // gap_elapsed` above - see this section's own "the repeat's own risk"
@@ -1772,19 +2281,19 @@ mod eval_debt_predicate_tests {
     /// proving the first-work floor alone decides the difference.
     #[test]
     fn fifty_nine_minutes_worked_is_silent_sixty_one_fires() {
-        assert!(!eval_debt_owed(59, None, NOW, 0, false), "59 minutes must not yet be enough");
-        assert!(eval_debt_owed(61, None, NOW, 0, false), "61 minutes must be enough");
+        assert!(!eval_debt_owed(EvalCadence::Rolling16h, 59, None, NOW, 0, false, false), "59 minutes must not yet be enough");
+        assert!(eval_debt_owed(EvalCadence::Rolling16h, 61, None, NOW, 0, false, false), "61 minutes must be enough");
     }
 
     #[test]
     fn exactly_the_minimum_minutes_worked_is_enough() {
         // The gate is "at least" `EVAL_FIRST_WORK_MINUTES`, not strictly more.
-        assert!(eval_debt_owed(EVAL_FIRST_WORK_MINUTES, None, NOW, 0, false));
+        assert!(eval_debt_owed(EvalCadence::Rolling16h, EVAL_FIRST_WORK_MINUTES, None, NOW, 0, false, false));
     }
 
     #[test]
     fn one_minute_under_the_minimum_is_silent_regardless_of_the_report_history() {
-        assert!(!eval_debt_owed(EVAL_FIRST_WORK_MINUTES - 1, Some(NOW - DAY), NOW, 0, false));
+        assert!(!eval_debt_owed(EvalCadence::Rolling16h, EVAL_FIRST_WORK_MINUTES - 1, Some(NOW - DAY), NOW, 0, false, false));
     }
 
     /// Case named in the build brief: a report first seen today silences
@@ -1793,19 +2302,19 @@ mod eval_debt_predicate_tests {
     /// for accrued minutes still under `EVAL_REPEAT_WORK_MINUTES`.
     #[test]
     fn a_report_first_seen_today_silences_it() {
-        assert!(!eval_debt_owed(EVAL_FIRST_WORK_MINUTES, Some(NOW - HOUR), NOW, 0, false));
+        assert!(!eval_debt_owed(EvalCadence::Rolling16h, EVAL_FIRST_WORK_MINUTES, Some(NOW - HOUR), NOW, 0, false, false));
     }
 
     /// Case named in the build brief: a report first seen yesterday does
     /// not silence today's obligation.
     #[test]
     fn a_report_first_seen_yesterday_does_not_silence_today() {
-        assert!(eval_debt_owed(EVAL_FIRST_WORK_MINUTES, Some(NOW - DAY), NOW, 0, false));
+        assert!(eval_debt_owed(EvalCadence::Rolling16h, EVAL_FIRST_WORK_MINUTES, Some(NOW - DAY), NOW, 0, false, false));
     }
 
     #[test]
     fn never_evaluated_at_all_fires_once_enough_time_is_worked() {
-        assert!(eval_debt_owed(EVAL_FIRST_WORK_MINUTES, None, NOW, 0, false));
+        assert!(eval_debt_owed(EvalCadence::Rolling16h, EVAL_FIRST_WORK_MINUTES, None, NOW, 0, false, false));
     }
 
     /// Case named in the build brief: the first evaluation of the day still
@@ -1815,7 +2324,7 @@ mod eval_debt_predicate_tests {
     /// named explicitly for this build brief's own case.
     #[test]
     fn the_first_evaluation_of_the_day_still_fires_without_any_risk() {
-        assert!(eval_debt_owed(EVAL_FIRST_WORK_MINUTES, None, NOW, 0, false));
+        assert!(eval_debt_owed(EvalCadence::Rolling16h, EVAL_FIRST_WORK_MINUTES, None, NOW, 0, false, false));
     }
 
     // ------------------------------------------- eval_debt_owed: the repeat
@@ -1831,18 +2340,18 @@ mod eval_debt_predicate_tests {
     fn with_a_report_today_179_minutes_is_silent_181_fires() {
         let seen_today = Some(NOW - HOUR);
         assert!(
-            !eval_debt_owed(179, seen_today, NOW, EVAL_REPEAT_MIN_UNTESTED_EDITS, false),
+            !eval_debt_owed(EvalCadence::Rolling16h, 179, seen_today, NOW, EVAL_REPEAT_MIN_UNTESTED_EDITS, false, false),
             "179 minutes must not yet be enough for a repeat, even with a risk already present"
         );
         assert!(
-            eval_debt_owed(181, seen_today, NOW, EVAL_REPEAT_MIN_UNTESTED_EDITS, false),
+            eval_debt_owed(EvalCadence::Rolling16h, 181, seen_today, NOW, EVAL_REPEAT_MIN_UNTESTED_EDITS, false, false),
             "181 minutes must be enough for a repeat, with a risk present"
         );
     }
 
     #[test]
     fn with_a_report_today_exactly_the_repeat_minimum_is_enough() {
-        assert!(eval_debt_owed(EVAL_REPEAT_WORK_MINUTES, Some(NOW - HOUR), NOW, 0, true));
+        assert!(eval_debt_owed(EvalCadence::Rolling16h, EVAL_REPEAT_WORK_MINUTES, Some(NOW - HOUR), NOW, 0, true, false));
     }
 
     #[test]
@@ -1854,7 +2363,7 @@ mod eval_debt_predicate_tests {
         // reads the FIRST threshold at all. A risk is present in the fixture
         // (both forms at once) to prove it is really the TIME gate stopping
         // this, never the risk gate.
-        assert!(!eval_debt_owed(90, Some(NOW - HOUR), NOW, 10, true));
+        assert!(!eval_debt_owed(EvalCadence::Rolling16h, 90, Some(NOW - HOUR), NOW, 10, true, false));
     }
 
     #[test]
@@ -1863,7 +2372,7 @@ mod eval_debt_predicate_tests {
         // (180) worth of accrued work is still just "well past the first threshold",
         // and must fire exactly as any other first-of-day case would - no
         // risk needed, since this never reaches the repeat branch at all.
-        assert!(eval_debt_owed(EVAL_REPEAT_WORK_MINUTES, None, NOW, 0, false));
+        assert!(eval_debt_owed(EvalCadence::Rolling16h, EVAL_REPEAT_WORK_MINUTES, None, NOW, 0, false, false));
     }
 
     // ------------------------------------- eval_debt_owed: the repeat's risk
@@ -1879,43 +2388,43 @@ mod eval_debt_predicate_tests {
     #[test]
     fn case_181_minutes_with_two_untested_edits_and_no_summary_stays_silent() {
         // Case named in the build brief.
-        assert!(!eval_debt_owed(181, Some(NOW - HOUR), NOW, 2, false), "two untested edits is under the risk floor");
+        assert!(!eval_debt_owed(EvalCadence::Rolling16h, 181, Some(NOW - HOUR), NOW, 2, false, false), "two untested edits is under the risk floor");
     }
 
     #[test]
     fn case_181_minutes_with_three_untested_edits_fires() {
         // Case named in the build brief.
-        assert!(eval_debt_owed(181, Some(NOW - HOUR), NOW, 3, false), "three untested edits reaches the risk floor");
+        assert!(eval_debt_owed(EvalCadence::Rolling16h, 181, Some(NOW - HOUR), NOW, 3, false, false), "three untested edits reaches the risk floor");
     }
 
     #[test]
     fn case_181_minutes_with_a_summary_and_zero_edits_fires() {
         // Case named in the build brief.
-        assert!(eval_debt_owed(181, Some(NOW - HOUR), NOW, 0, true), "a context summary is a risk on its own, with no edits at all");
+        assert!(eval_debt_owed(EvalCadence::Rolling16h, 181, Some(NOW - HOUR), NOW, 0, true, false), "a context summary is a risk on its own, with no edits at all");
     }
 
     #[test]
     fn case_181_minutes_with_neither_edits_nor_a_summary_stays_silent() {
         // THE CENTRAL CASE THIS REWRITE EXISTS FOR: accrued time alone, with
         // no risk of either kind, must never fire a repeat any more.
-        assert!(!eval_debt_owed(181, Some(NOW - HOUR), NOW, 0, false), "time alone must never fire a repeat");
+        assert!(!eval_debt_owed(EvalCadence::Rolling16h, 181, Some(NOW - HOUR), NOW, 0, false, false), "time alone must never fire a repeat");
     }
 
     #[test]
     fn exactly_the_minimum_untested_edits_is_enough() {
         // The risk gate is "at least" `EVAL_REPEAT_MIN_UNTESTED_EDITS`, not
         // strictly more.
-        assert!(eval_debt_owed(EVAL_REPEAT_WORK_MINUTES, Some(NOW - HOUR), NOW, EVAL_REPEAT_MIN_UNTESTED_EDITS, false));
+        assert!(eval_debt_owed(EvalCadence::Rolling16h, EVAL_REPEAT_WORK_MINUTES, Some(NOW - HOUR), NOW, EVAL_REPEAT_MIN_UNTESTED_EDITS, false, false));
     }
 
     #[test]
     fn one_untested_edit_under_the_minimum_with_no_summary_is_silent() {
-        assert!(!eval_debt_owed(EVAL_REPEAT_WORK_MINUTES, Some(NOW - HOUR), NOW, EVAL_REPEAT_MIN_UNTESTED_EDITS - 1, false));
+        assert!(!eval_debt_owed(EvalCadence::Rolling16h, EVAL_REPEAT_WORK_MINUTES, Some(NOW - HOUR), NOW, EVAL_REPEAT_MIN_UNTESTED_EDITS - 1, false, false));
     }
 
     #[test]
     fn both_risks_at_once_still_fires() {
-        assert!(eval_debt_owed(EVAL_REPEAT_WORK_MINUTES, Some(NOW - HOUR), NOW, EVAL_REPEAT_MIN_UNTESTED_EDITS, true));
+        assert!(eval_debt_owed(EvalCadence::Rolling16h, EVAL_REPEAT_WORK_MINUTES, Some(NOW - HOUR), NOW, EVAL_REPEAT_MIN_UNTESTED_EDITS, true, false));
     }
 
     #[test]
@@ -2412,7 +2921,17 @@ mod eval_debt_state_tests {
             falsifier: None,
             check: None,
         };
-        model::store::declare(store, "t", "t", "t", &item).expect("fixture must store");
+        if model::gate::is_evaluation_report(&item) {
+            // An evaluation report is filed only through a THOR tool call
+            // (step 15) and counts only once the Stop validated it (step
+            // 16): the shared fixture files it for a quiet evaluation of the
+            // project, the way Claude Code files one, and validates it.
+            let transcripts = tempfile::tempdir().unwrap();
+            let session = crate::attest::fixture::SESSION;
+            crate::eval_filing::fixture::valid_filing(store, transcripts.path(), session, &item, &format!("toolu_{id}"));
+        } else {
+            model::store::declare(store, "t", "t", "t", &item).expect("fixture must store");
+        }
     }
 
     fn owe(store: &mut EventStore, n: usize, project: Option<&str>) {
@@ -2524,7 +3043,7 @@ mod eval_debt_state_tests {
         owe(&mut store, 20, None);
         let with_backlog = update_eval_debt_state(&store, &db, None, 2_000);
         assert_eq!(with_backlog.tracking_since, Some(1_000), "a real backlog appearing must not move the clock either");
-        crate::mark::record_useful(&mut store, "s", "s", "t", "2026-09-08T00:00:00Z", "owed-global-0").unwrap();
+        crate::mark::record_useful(&mut store, "s", "s", "t", "2026-09-08T00:00:00Z", "owed-global-0", None).unwrap();
         let dropped = update_eval_debt_state(&store, &db, None, 3_000);
         assert_eq!(dropped.tracking_since, Some(1_000), "a verdict that drops the backlog back down must not clear the clock");
     }
@@ -2560,14 +3079,24 @@ mod eval_debt_state_tests {
 
     // --------------------------------------------------- evaluation reports
 
+    /// When the valid report's filing call's result was written, read from
+    /// the validator's record.
+    fn filed_at_of(store: &EventStore, id: &str) -> i64 {
+        let record = crate::eval_filing::current_validation(store, id).expect("validated");
+        record.filed_at.as_deref().and_then(crate::eval_filing::unix_of_timestamp).expect("a filing time")
+    }
+
+    /// Step 16: a VALID evaluation report sets `last_evaluation_seen` to the
+    /// time its filing call's result was written (from the validator's
+    /// record, never the Stop's own clock) and names its id.
     #[test]
-    fn a_new_live_evaluation_report_stamps_last_evaluation_seen_and_names_its_id() {
+    fn a_valid_evaluation_report_sets_last_evaluation_seen_from_its_filing() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
         let mut store = EventStore::new(&db).unwrap();
         declare_report(&mut store, "eval-thor-2026-09-01", "thor", &["evaluation-report"]);
         let state = update_eval_debt_state(&store, &db, Some("thor"), 5_000);
-        assert_eq!(state.last_evaluation_seen, Some(5_000));
+        assert_eq!(state.last_evaluation_seen, Some(filed_at_of(&store, "eval-thor-2026-09-01")));
         assert_eq!(state.last_evaluation_report_id.as_deref(), Some("eval-thor-2026-09-01"));
         assert!(state.known_report_ids.contains("eval-thor-2026-09-01"));
     }
@@ -2578,9 +3107,49 @@ mod eval_debt_state_tests {
         let db = dir.path().join("t.db");
         let mut store = EventStore::new(&db).unwrap();
         declare_report(&mut store, "eval-thor-2026-09-01", "thor", &["evaluation-report"]);
-        update_eval_debt_state(&store, &db, Some("thor"), 5_000);
+        let first = update_eval_debt_state(&store, &db, Some("thor"), 5_000);
         let again = update_eval_debt_state(&store, &db, Some("thor"), 9_000);
-        assert_eq!(again.last_evaluation_seen, Some(5_000), "the same, already-known report must not restamp the clock");
+        assert_eq!(again.last_evaluation_seen, first.last_evaluation_seen, "the same report never restamps the clock");
+    }
+
+    /// Z10, Z11 at the unit level: a report that is only ON FILE - written
+    /// past the tool server's gate, the way an older binary leaves one - sets
+    /// nothing; and a hand-edited sidecar is put back to what the log says at
+    /// the next Stop.
+    #[test]
+    fn only_a_valid_report_sets_the_facts_and_an_edited_sidecar_is_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        let old = Item {
+            id: "eval-thor-2026-09-01".to_string(),
+            kind: Kind::Report,
+            text: "TLDR: filed by an older binary.".to_string(),
+            bindings: vec![],
+            severity: None,
+            project: Some("thor".to_string()),
+            tags: vec!["evaluation-report".to_string()],
+            expires: None,
+            key: None,
+            falsifier: None,
+            check: None,
+        };
+        let body = model::store::canonical_body(&old).unwrap();
+        store.append_event("mcp", "mcp", "mcp", thor_core::event_store::EventKind::FactCreated, &old.id, None, &body).unwrap();
+        crate::eval_filing::validate_new_reports(&mut store, Some(dir.path()), crate::attest::fixture::SESSION);
+        let state = update_eval_debt_state(&store, &db, Some("thor"), 5_000);
+        assert_eq!((state.last_evaluation_seen, state.last_evaluation_report_id.as_deref()), (None, None));
+        assert!(state.known_report_ids.contains("eval-thor-2026-09-01"), "on file, recorded as such, silencing nothing");
+
+        let mut all = read_eval_debt_state(&db);
+        let entry = all.get_mut("thor").unwrap();
+        entry.last_evaluation_seen = Some(9_999);
+        entry.last_evaluation_report_id = Some("eval-thor-2026-09-01".to_string());
+        std::fs::write(eval_debt_state_path(&db), serde_json::to_string(&all).unwrap()).unwrap();
+        assert_eq!(project_eval_state(&db, Some("thor")).last_evaluation_seen, Some(9_999), "fixture sanity: edited");
+        let state = update_eval_debt_state(&store, &db, Some("thor"), 10_000);
+        assert_eq!((state.last_evaluation_seen, state.last_evaluation_report_id.as_deref()), (None, None), "put back from the log");
+        assert_eq!(project_eval_state(&db, Some("thor")).last_evaluation_seen, None, "and written back");
     }
 
     #[test]
@@ -2689,6 +3258,9 @@ mod eval_debt_state_tests {
         assert_eq!(state.first_asked_since_report, Some(1_000));
     }
 }
+
+#[cfg(test)]
+mod clock_tests;
 
 #[cfg(test)]
 mod eval_command_path_tests {

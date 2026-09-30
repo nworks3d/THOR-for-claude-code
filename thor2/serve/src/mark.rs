@@ -14,7 +14,7 @@
 //! one that counts, which is what makes a second opinion possible at all.
 
 use model::marked::{ItemMarkedNoise, ItemMarkedUseful};
-use model::store::{fence, WriteActor};
+use model::store::{fence, Att, WriteActor};
 use thor_core::event_store::{Event, EventKind, EventStore};
 
 /// Append one `item_marked_useful` event for `id`. Errors are surfaced (never
@@ -24,6 +24,12 @@ use thor_core::event_store::{Event, EventKind, EventStore};
 /// (`model::store::fence`): a name reserved for THOR itself, passed as a plain
 /// string, is refused before anything is appended - a mark is a verdict, and a
 /// verdict under a THOR name would be read as THOR's own.
+///
+/// `att` is the tool server's stamp of the call that makes the verdict (step
+/// 12), spliced onto the body as `"att"`: only a verdict whose call a Stop then
+/// verifies as an attested THOR call clears judgement debt (`usefulness::
+/// served_since_last_verdict`). `None` - the `serve mark` CLI, a test - writes
+/// the verdict all the same, and it clears nothing.
 pub fn record_useful<'a>(
     store: &mut EventStore,
     session_id: &str,
@@ -31,9 +37,11 @@ pub fn record_useful<'a>(
     actor: impl Into<WriteActor<'a>>,
     marked_at: &str,
     id: &str,
+    att: Option<&Att>,
 ) -> anyhow::Result<Event> {
     let actor = fence(store, actor.into(), id).map_err(|e| anyhow::anyhow!("{e}"))?;
     let body = serde_json::to_string(&ItemMarkedUseful { marked_at: marked_at.to_string() })?;
+    let body = model::store::with_att(body, att)?;
     store.append_event(session_id, lineage_id, actor, EventKind::ItemMarkedUseful, id, None, &body)
 }
 
@@ -44,6 +52,7 @@ pub fn record_useful<'a>(
 /// This is the signal `crate::decay` needs and never had. Decay by silence
 /// was falsified on its first production day (see that module); an explicit
 /// negative is a real observation, where the absence of a positive is not.
+/// `att` exactly as for `record_useful`.
 pub fn record_noise<'a>(
     store: &mut EventStore,
     session_id: &str,
@@ -51,9 +60,11 @@ pub fn record_noise<'a>(
     actor: impl Into<WriteActor<'a>>,
     marked_at: &str,
     id: &str,
+    att: Option<&Att>,
 ) -> anyhow::Result<Event> {
     let actor = fence(store, actor.into(), id).map_err(|e| anyhow::anyhow!("{e}"))?;
     let body = serde_json::to_string(&ItemMarkedNoise { marked_at: marked_at.to_string() })?;
+    let body = model::store::with_att(body, att)?;
     store.append_event(session_id, lineage_id, actor, EventKind::ItemMarkedNoise, id, None, &body)
 }
 
@@ -65,7 +76,7 @@ mod tests {
     #[test]
     fn recording_a_mark_is_queryable_immediately_after_the_write() {
         let mut store = EventStore::in_memory().unwrap();
-        record_useful(&mut store, "s", "l", "a", "2026-08-02T12:00:00Z", "x1").unwrap();
+        record_useful(&mut store, "s", "l", "a", "2026-08-02T12:00:00Z", "x1", None).unwrap();
         assert!(ever_marked_useful(&store).contains("x1"));
     }
 
@@ -89,7 +100,7 @@ mod tests {
             check: None,
         };
         model::store::declare(&mut store, "s", "l", "a", &item).unwrap();
-        record_useful(&mut store, "s", "l", "a", "2026-08-02T12:00:00Z", "x2").unwrap();
+        record_useful(&mut store, "s", "l", "a", "2026-08-02T12:00:00Z", "x2", None).unwrap();
         let live = crate::live::live_items(&store);
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].item, item);
@@ -101,7 +112,7 @@ mod tests {
         // reference from an earlier session) - it must be a harmless, real
         // event, not a crash.
         let mut store = EventStore::in_memory().unwrap();
-        record_useful(&mut store, "s", "l", "a", "2026-08-02T12:00:00Z", "ghost").unwrap();
+        record_useful(&mut store, "s", "l", "a", "2026-08-02T12:00:00Z", "ghost", None).unwrap();
         assert!(ever_marked_useful(&store).contains("ghost"));
     }
 
@@ -113,12 +124,12 @@ mod tests {
     fn a_mark_under_a_reserved_name_is_refused_and_appends_nothing() {
         let mut store = EventStore::in_memory().unwrap();
         for name in ["teeth-eval", "eval-machine", "attester"] {
-            let err = record_useful(&mut store, "s", "l", name, "2026-09-28T00:00:00Z", "x1").unwrap_err();
+            let err = record_useful(&mut store, "s", "l", name, "2026-09-28T00:00:00Z", "x1", None).unwrap_err();
             assert!(err.to_string().contains(&format!("the actor name {name} is reserved for THOR itself")), "{err}");
-            let err = record_noise(&mut store, "s", "l", name, "2026-09-28T00:00:00Z", "x1").unwrap_err();
+            let err = record_noise(&mut store, "s", "l", name, "2026-09-28T00:00:00Z", "x1", None).unwrap_err();
             assert!(err.to_string().contains("is reserved for THOR itself"), "{err}");
         }
-        let err = record_noise(&mut store, "s", "l", "a", "2026-09-28T00:00:00Z", "project-demo-opened-by-install")
+        let err = record_noise(&mut store, "s", "l", "a", "2026-09-28T00:00:00Z", "project-demo-opened-by-install", None)
             .unwrap_err();
         assert!(err.to_string().contains("THOR's own registration"), "{err}");
         assert!(store.get_all_events().unwrap().is_empty(), "a refused mark must append nothing");

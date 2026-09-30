@@ -289,9 +289,9 @@ mod tests {
         for (n, useful) in verdicts.iter().enumerate() {
             let at = format!("2026-08-{:02}T00:00:00Z", n + 1);
             if *useful {
-                crate::mark::record_useful(&mut store, "s", "l", "a", &at, id).unwrap();
+                crate::mark::record_useful(&mut store, "s", "l", "a", &at, id, None).unwrap();
             } else {
-                crate::mark::record_noise(&mut store, "s", "l", "a", &at, id).unwrap();
+                crate::mark::record_noise(&mut store, "s", "l", "a", &at, id, None).unwrap();
             }
         }
         DecayContext::load(&store)

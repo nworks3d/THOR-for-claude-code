@@ -135,13 +135,19 @@ impl DifferentialAuditor {
                 // id that never existed) must yield NO entry on either side. The
                 // spec used to keep an EMPTY entry for such an entity while the
                 // canonical fold kept none - a representation mismatch reported
-                // as a false head error (hit live on 2026-07-10).
+                // as a false head error (hit live on 2026-07-10). Gate
+                // telemetry (a refusal, a stand-aside, THOR's recorded
+                // verifications and its A4 cutoff record) says enforcement
+                // happened and never carries fact content: an entity holding
+                // only those has no entry on either side either.
                 EventKind::FactReasserted
                 | EventKind::FactEchoed
                 | EventKind::FactReprojected
                 | EventKind::ItemServed
                 | EventKind::ItemMarkedUseful
-                | EventKind::ItemMarkedNoise => {}
+                | EventKind::ItemMarkedNoise
+                | EventKind::GateRefused
+                | EventKind::GateStoodAside => {}
                 _ => per_entity
                     .entry(event.entity_id.clone())
                     .or_default()
@@ -345,6 +351,32 @@ mod tests {
         assert!(
             DifferentialAuditor::verify_consistency(&events).is_ok(),
             "an item-marked-useful-only entity must not trip the differential auditor"
+        );
+    }
+
+    #[test]
+    fn test_gate_telemetry_only_entity_is_consistent() {
+        // Same defect class, for the gate's telemetry: THOR's A4 cutoff
+        // record (`teeth-a4-cutoff`, one gate_stood_aside by `retest`) is an
+        // entity with no fact at all. The canonical fold never stores an entry
+        // for gate events; the spec kept an EMPTY one, and doctor printed
+        // "CHAIN BROKEN" on a healthy log after the first `retest --apply`
+        // (step 19, measured on a store copy).
+        let mut store = EventStore::in_memory().unwrap();
+        store
+            .append_event("s", "l", "a", EventKind::FactCreated, "real", None, "a fact")
+            .unwrap();
+        store
+            .append_event("s", "l", "retest", EventKind::GateStoodAside, "cutoff", None, r#"{"cutoff_seq":1}"#)
+            .unwrap();
+        store
+            .append_event("s", "l", "hook", EventKind::GateRefused, "refused-only", None, r#"{"target":"x"}"#)
+            .unwrap();
+        let events = store.get_all_events().unwrap();
+        assert!(
+            DifferentialAuditor::verify_consistency(&events).is_ok(),
+            "a gate-telemetry-only entity must not trip the differential auditor: {:?}",
+            DifferentialAuditor::verify_consistency(&events)
         );
     }
 

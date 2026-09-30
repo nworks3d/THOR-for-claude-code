@@ -8,7 +8,8 @@ Scope of this spec: the SAFETY MODEL (B3) and the CAPTURE GUARD (Lane C).
 B1/B2 (the action guard with a judge model) build on the same safety model and
 are specified only far enough to make B3 binding on them. Section 6 adds the
 write side of the safety model: how a check gets onto a blocking surface at
-all.
+all. Section 7 adds the evaluation: how it starts, how its report is filed and
+checked, and who is asked for it.
 
 ---
 
@@ -339,7 +340,10 @@ refusal sets the proven label and nothing else.
   while a blocker holds (`NoWorkingCopy`, `WorkingTreeDiffers`), or when
   retracted or archived; otherwise Owed. Rot is every live Rule/Orientation
   that is Owed, whatever its severity. A tag, a reason, an open point or a
-  refusal on record settles nothing.
+  refusal on record settles nothing. Read for one evaluation (`Some(start)`), a
+  rule handed to the agent (the batch, the A4 list) is settled only by a verdict
+  written after that start, by a retract or a move off the rule track, or, for a
+  `contains` check whose literal was gone, by the literal being back.
 - `serve retest --id <id> | --project <p> | --all [--apply]` runs the same
   trial with no session. Exit 0 a verdict it can write, 3 blocked, 4 needs the
   agent, 1 error, 2 usage. `--apply` writes one `fact_revised` by actor
@@ -360,3 +364,87 @@ agent can run itself, or routes to the owner),
 `serve/tests/stop_hook_and_filing_gate_read_one_settlement.rs`,
 `mcp/tests/replica_refuses_what_it_can_judge.rs`,
 `model/tests/cli_cannot_forge_a_box.rs`.
+
+## 7. The evaluation - started in the log, filed through an attested call
+
+Part B of the same build. The evaluation is the one place where an agent's own
+report decides whether a turn may end, so every step of it is read from the log
+and from Claude Code's own record of the session, never from a file or from the
+agent's word.
+
+### 7.1 Write identity
+
+Every write tool (`remember`, `revise`, `retract`, `mark`, `pin`, `unpin`,
+`resolve`) stores `att` in its event body: the call's `tool_use_id`, the digest
+of its canonical input, the server's session hint, and whether the `PreToolUse`
+hook saw the call in flight (`seen`, `unseen`, `side-door`). The hook appends
+`[THOR] write attested: <tool_use_id> <first 16 hex of the digest>` to a write it
+lets through. At the session's `Stop`, each new write is checked once against
+the session's own record (a tool call of that name, that digest, with a result
+naming the event) and the answer is written to the log as an `attester` event.
+A verdict counts toward the judgement debt, and toward an evaluation's frozen
+list, only when it was verified that way.
+
+### 7.2 The start, and the three frozen lists
+
+An evaluation starts with a start record in the log (`eval-machine`), written
+when the routine is opened or the `Stop` hook asks. It freezes the judgement
+list, the batch (at most `EVALUATION_TEETH_BATCH`) and the A4 list (at most
+`EVALUATION_A4_LIST`) - none of which grows - and is followed, inside a time box
+(`MACHINE_PASS_BOX_SECS`), by the machine pass: THOR tries the project's old rules
+itself and writes a rule or a note as `teeth-eval` (the one old-stock verdict as
+`retest`), or one open point of its own per blocker. A pass cut off is finished
+by the next `Stop`. A write to a frozen item outside an attested call of that
+evaluation voids it (D10); the next `Stop` starts a fresh one.
+
+### 7.3 The filing
+
+An evaluation report is stored only by `remember` or `revise`, through an
+attested call of the evaluating session, for an open, non-void evaluation of the
+same project. THOR puts a machine section - a pure function of the log up to the
+filing - in front of the agent's text, and refuses a later edit of it. It is
+refused while THOR is still deciding, while the frozen judgement list, batch or
+A4 list is not settled, while the turn's own writes are not verified yet, and
+when a frozen item was changed behind the evaluation. The model command line,
+a second client and an older binary are refused outright.
+
+### 7.4 The validator
+
+The first main-session `Stop` after a filing validates it once
+(`serve::eval_filing::validate`) and records an `eval-validator` event: a THOR
+call in the session's record, an evaluation started in that session with its
+start note shown to it, the machine section byte for byte as the log renders it,
+no D10 write in the window, the filing gate holding on the log as it stood.
+Only a valid report counts: for the ask, the clocks, the carry, and `doctor`. A
+missing record of the session is invalid; a record in a shape THOR cannot read
+is drift: nothing counts, no evaluation is asked for, every turn says so.
+
+### 7.5 Who is asked
+
+Per project: its own work clock (every session together, parallel minutes once)
+under the cadence the build runs (`EVAL_CADENCE`; `WeeklyUnlessRot` is built and
+off), AND at least `EVAL_OWN_WORK_MINUTES` of the session's own work there (the
+larger of the clock file and the session record), AND not its first `Stop` in the
+project, AND no other session running that project's evaluation for less than
+`EVAL_ELSEWHERE_MAX_MINUTES`. The weekly floor (`EVAL_FLOOR_DAYS`) reads the log
+alone. Only a new valid evaluation resets the clocks.
+
+### 7.6 Open points and the owner queue
+
+Open points are THOR's own (`open-no-working-copy-*`,
+`open-working-tree-differs-*`), reserved to `eval-machine` at the store, written
+and closed by the machine pass. A subject still open after a valid evaluation was
+filed is carried and is in the owner queue; over `OPEN_POINTS_OWNER_BUDGET` a
+project's session start opens with a banner. No agent can file, tag or remove
+one.
+
+### 7.7 Tests that pin section 7
+
+`mcp/tests/evaluation_end_to_end.rs`, `model/tests/cli_cannot_file_an_evaluation.rs`,
+`serve/tests/write_attestation_marker.rs`, `serve/tests/evaluation_handover_hook.rs`,
+`serve/tests/evaluation_debt_stop_hook.rs`, `serve/tests/owner_queue_banner.rs`,
+`serve/src/eval_session/pass_tests.rs`, `serve/src/eval_filing/tests.rs`,
+`serve/src/usefulness/clock_tests.rs`,
+`serve/tests/the_teeth_instructions_agree.rs` (the routine and AGENTS.md say what
+the code does), `ops/tests/install_eval_command.rs` (the seeded routine files a
+TLDR and remarks only and never asks for an open point).

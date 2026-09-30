@@ -1004,7 +1004,7 @@ fn other_actors_sentence(counts: &std::collections::HashMap<String, usize>) -> S
 /// "evaluation debt" section, third rewrite, for why - so a report clause
 /// or an ask count here would describe an obligation that can no longer
 /// fire. This line says so in one clause instead, and never reads
-/// `project_eval_state`/`newest_evaluation_report` at all for `None`:
+/// `project_eval_state`/`eval_filing::newest_valid_evaluation` at all for `None`:
 /// correct either way, since a no-project checkout's own sidecar entry is
 /// inert leftover state at best (see `update_eval_debt_state`'s own doc
 /// comment), but reading it anyway would invite exactly the drift this
@@ -1028,14 +1028,27 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool
     let store = EventStore::open_existing(db).ok()?;
     let (total, in_project) = serve::usefulness::judgement_debt_counts(&store, checkout_project);
     let other_actors = serve::usefulness::served_to_other_actors(&store);
+    // D9 (step 12): a verdict counts toward the debt only once a Stop has
+    // verified it was made through an attested THOR call. The rest are
+    // written and kept, and named here, so a verdict that cleared nothing is
+    // never silent.
+    let outside = match serve::usefulness::unattested_verdicts(&store) {
+        0 => None,
+        n => Some(format!(
+            "judgement debt: {n} verdicts outside an attested THOR call - they clear no debt (a verdict clears it only \
+             when it is made with THOR's mark tool inside the Claude Code session the item fired in)"
+        )),
+    };
     if total == 0 {
-        return if other_actors.is_empty() {
-            None
-        } else {
-            Some(format!("judgement debt: {}", other_actors_sentence(&other_actors)))
-        };
+        let mut lines: Vec<String> = Vec::new();
+        if !other_actors.is_empty() {
+            lines.push(format!("judgement debt: {}", other_actors_sentence(&other_actors)));
+        }
+        lines.extend(outside);
+        return (!lines.is_empty()).then(|| lines.join("\n"));
     }
     let threshold = serve::usefulness::JUDGEMENT_DEBT_AFTER;
+    let mut problem_lines: Vec<String> = Vec::new();
     let mut out = vec![match checkout_project {
         Some(project) => format!(
             "judgement debt: {total} item(s) store-wide are owed a verdict (fired {threshold}+ times since \
@@ -1054,27 +1067,27 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool
         Some(_) => {
             let state = serve::usefulness::project_eval_state(db, checkout_project);
             let now = serve::time::now_unix();
-            // The NEWEST report in the STORE, not merely the sidecar's own
-            // last-seen id - see `newest_evaluation_report`'s own doc
-            // comment for why: a report filed since the last Stop in this
-            // project is real right now, even though no Stop has looked at
-            // it yet.
-            let report_clause = match serve::usefulness::newest_evaluation_report(&store, checkout_project) {
-                None => "the store holds no evaluation report for this project".to_string(),
-                Some((id, _seq)) if state.last_evaluation_report_id.as_deref() == Some(id.as_str()) => {
-                    let seen = state.last_evaluation_seen.unwrap_or(now);
-                    format!(
-                        "newest evaluation report '{id}', first seen by a Stop {} day(s) ago",
-                        serve::usefulness::days_ago(now, seen)
-                    )
-                }
-                Some((id, _seq)) if state.known_report_ids.contains(&id) => {
-                    format!("newest evaluation report '{id}', already seen by an earlier Stop")
-                }
-                Some((id, _seq)) => format!("newest evaluation report '{id}' in the store, not yet seen by a Stop"),
+            // THE VALIDATOR'S ANSWER, read from the log (step 16): only a
+            // report whose filing THOR checked and found valid is this
+            // project's evaluation; one merely on file is named below with
+            // the reason it does not count.
+            let valid = serve::eval_filing::newest_valid_evaluation(&store, checkout_project);
+            let filed = valid.as_ref().and_then(|v| v.filed_at.as_deref()).and_then(serve::eval_filing::unix_of_timestamp);
+            let report_clause = match &valid {
+                None => "no evaluation report of this project counts (none on file passed THOR's check)".to_string(),
+                Some(valid) => format!(
+                    "{}, filed {} day(s) ago",
+                    valid_report_words(valid),
+                    serve::usefulness::days_ago(now, filed.unwrap_or(now))
+                ),
             };
             out[0].push_str(&format!(" - {report_clause}"));
-            let covered = serve::usefulness::eval_report_covers(state.last_evaluation_seen, now);
+            if let Some(project) = checkout_project {
+                problem_lines = report_problem_lines(&store, project);
+            }
+            // From the log too - the same time the Stop hook overwrites the
+            // sidecar's copy with, so doctor never reads a hand-edited one.
+            let covered = serve::usefulness::eval_report_covers(filed, now);
             if covered {
                 out[0].push_str(
                     "; the last evaluation still covers this project, and a repeat is due once three more hours of accrued work go by since it \
@@ -1110,7 +1123,10 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool
                 let accrued_minutes = work.accrued_secs / 60;
                 let threshold =
                     if covered { serve::usefulness::EVAL_REPEAT_WORK_MINUTES } else { serve::usefulness::EVAL_FIRST_WORK_MINUTES };
-                let due_clause = match (threshold - accrued_minutes).max(0) {
+                // Since step 17 the PROJECT's clock decides (every session
+                // together); it is never below any one session's own.
+                let project_minutes = (state.work.accrued_secs / 60).max(accrued_minutes);
+                let due_clause = match (threshold - project_minutes).max(0) {
                     0 => "already due".to_string(),
                     remaining => format!("due after {remaining} more minute(s) of accrued work"),
                 };
@@ -1125,7 +1141,8 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool
                     if work.compacted_since_anchor { "a context summary has happened" } else { "no context summary yet" };
                 out[0].push_str(&format!(
                     "; its most recently active session ('{session_id}') has accrued {accrued_minutes} minute(s) of work \
-                     here since its last reset, {due_clause}, with {} untested edit(s) since the last test or build run and \
+                     here since its last reset, the project {project_minutes} minute(s) with every session together - \
+                     {due_clause}, with {} untested edit(s) since the last test or build run and \
                      {summary_clause} - a repeat only ever fires once accrued work AND one of those two holds",
                     work.edits_since_test
                 ));
@@ -1139,6 +1156,7 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool
             out[0].push_str("; the evaluation is only ever asked inside a project, so this checkout is never asked for one");
         }
     }
+    out.extend(problem_lines);
     let named = serve::usefulness::judgement_debt_named(&store, checkout_project);
     let cap = name_cap(full);
     for item in named.iter().take(cap) {
@@ -1167,14 +1185,195 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool
     if !other_actors.is_empty() {
         out.push(format!("  judgement debt: {}", other_actors_sentence(&other_actors)));
     }
+    if let Some(outside) = outside {
+        out.push(format!("  {outside}"));
+    }
     Some(out.join("\n"))
 }
 
-/// The rules the next evaluation report of this checkout's project is held
-/// to (`model::store::evaluation_teeth_batch`, which reads
-/// `model::store::settlement`), and the ones that stay owed beyond that batch
-/// - named, so nothing the batch leaves out is hidden. Silent outside a
-/// project (no report can be filed there) and when no rule is owed.
+/// "newest evaluation report '<id>' (valid, filed by session <S>)", with the
+/// subagent that filed it when one did - the one wording doctor names a
+/// report that counts by.
+fn valid_report_words(valid: &model::store::EvaluationValidation) -> String {
+    let agent = valid.agent.as_deref().map(|a| format!(", agent {a}")).unwrap_or_default();
+    format!("newest evaluation report '{}' (valid, filed by session {}{agent})", valid.report, valid.session)
+}
+
+/// One line per evaluation report of `project` that is on file but does not
+/// count, with the validator's reason, and per report no Stop has checked
+/// yet - so a report that silences nothing is never silent itself.
+fn report_problem_lines(store: &EventStore, project: &str) -> Vec<String> {
+    serve::eval_filing::reports_of_project(store, project)
+        .into_iter()
+        .filter_map(|(id, _, validation)| match validation {
+            Some(v) if v.valid => None,
+            Some(v) => Some(format!("  evaluation report '{id}' does not count as this project's evaluation: {}", v.why)),
+            None => Some(format!(
+                "  evaluation report '{id}' is not checked yet - the next Stop of a main session checks its filing"
+            )),
+        })
+        .collect()
+}
+
+/// THE EVALUATIONS OF THIS CHECKOUT'S PROJECT (step 16, B7): the newest one
+/// that counts, then the last five valid ones, each with how its verdicts
+/// split - "eval-<id>: <u> useful, <n> noise, <s> skipped (<p>% useful)" -
+/// and a flag on one whose ten or more verdicts all went one way (a blind
+/// pass looks exactly like that). Every report on file that does not count
+/// is named with its reason, and the format-drift line when the newest
+/// check found the transcript unreadable (D14). Silent outside a project and
+/// for a project with no report and no record at all.
+pub fn evaluations_line(db: &Path, project: Option<&str>) -> Option<String> {
+    let project = project?;
+    let store = EventStore::open_existing(db).ok()?;
+    let mut valid: Vec<model::store::EvaluationValidation> = model::store::evaluation_validations(&store)
+        .into_iter()
+        .map(|(_, v)| v)
+        .filter(|v| v.valid && v.project.as_deref() == Some(project))
+        .collect();
+    valid.sort_by(|a, b| b.report_seq.cmp(&a.report_seq));
+    let problems = report_problem_lines(&store, project);
+    let drift = serve::eval_filing::drift_recorded(&store);
+    if valid.is_empty() && problems.is_empty() && !drift {
+        return None;
+    }
+    let mut out = vec![match serve::eval_filing::newest_valid_evaluation(&store, Some(project)) {
+        Some(newest) => format!(
+            "evaluations: {} - the last {} valid evaluation(s) of '{project}', newest first:",
+            valid_report_words(&newest),
+            valid.len().min(5)
+        ),
+        None => format!(
+            "evaluations: no evaluation report of '{project}' counts - a report counts only once THOR checked its filing \
+             call against the session's transcript and the log"
+        ),
+    }];
+    for v in valid.iter().take(5) {
+        let flag = if serve::eval_filing::went_one_way(v) {
+            " - every verdict went one way - a blind pass looks exactly like this; nothing here can tell whether the items \
+             were read"
+        } else {
+            ""
+        };
+        out.push(format!("  {}{flag}", serve::eval_filing::share_line(v)));
+    }
+    out.extend(problems);
+    if drift {
+        out.push(format!("  {}", serve::eval_filing::DRIFT_LINE));
+    }
+    Some(out.join("\n"))
+}
+
+/// THE CADENCE (step 17): which rule decides when a project owes its
+/// evaluation - a code constant, named on every doctor run so a flip can
+/// never go unseen.
+pub fn cadence_line() -> String {
+    serve::usefulness::cadence_clause(serve::usefulness::EVAL_CADENCE).to_string()
+}
+
+/// How many minutes the work-clock sidecar and the transcripts may disagree
+/// before doctor names it (step 17).
+pub const WORK_CLOCK_TOLERANCE_MINUTES: i64 = 15;
+
+/// At most this many sessions' transcripts are read for the cross-check.
+const WORK_CLOCK_SESSIONS_READ: usize = 40;
+
+/// THE WORK CLOCK CROSS-CHECK (step 17, N3): the project's clock in the
+/// sidecar against what the transcripts of the project's sessions say, since
+/// its newest valid evaluation (or the last `EVAL_FLOOR_DAYS` days, whichever
+/// is later) - the sessions the sidecar holds for the project and the Claude
+/// Code sessions the log shows working in it, each transcript read to its
+/// tail, parallel minutes counted once. Silent unless the two differ by more
+/// than `WORK_CLOCK_TOLERANCE_MINUTES`: a sidecar any local process can write
+/// is named when it has drifted from what really happened.
+pub fn work_clock_line(db: &Path, project: Option<&str>) -> Option<String> {
+    work_clock_line_in(db, project, serve::attest::transcripts_root().as_deref())
+}
+
+/// `work_clock_line` against the transcripts under `root`.
+pub fn work_clock_line_in(db: &Path, project: Option<&str>, root: Option<&Path>) -> Option<String> {
+    let project = project?;
+    let root = root?;
+    let store = EventStore::open_existing(db).ok()?;
+    let state = serve::usefulness::project_eval_state(db, Some(project));
+    let now = serve::time::now_unix();
+    let filed = serve::eval_filing::newest_valid_evaluation(&store, Some(project))
+        .and_then(|v| v.filed_at)
+        .as_deref()
+        .and_then(serve::eval_filing::unix_of_timestamp);
+    let since = filed.unwrap_or(i64::MIN).max(now - serve::usefulness::EVAL_FLOOR_DAYS * 86400);
+    let mut sessions: Vec<String> = state
+        .sessions
+        .iter()
+        .filter(|(id, s)| serve::attest::is_uuid_shaped(id) && s.last_event_unix.is_some_and(|t| t >= since))
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in serve::usefulness::project_activity(&store, project, since, false).1 {
+        if !sessions.contains(&id) {
+            sessions.push(id);
+        }
+    }
+    let lines: Vec<serve::attest::TimedLine> = sessions
+        .iter()
+        .take(WORK_CLOCK_SESSIONS_READ)
+        .flat_map(|id| serve::attest::session_timeline(root, id))
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let sidecar = state.work.accrued_secs / 60;
+    let transcripts = serve::attest::minutes_in(&lines, project, Some(since));
+    ((sidecar - transcripts).abs() > WORK_CLOCK_TOLERANCE_MINUTES).then(|| {
+        format!(
+            "work clock of '{project}': the work clock sidecar says {sidecar} min, the transcripts say {transcripts} min \
+             (since its last valid evaluation, or the last {} days) - the sidecar is a file any local process can write; \
+             the Stop hook takes the larger of the two, and the weekly floor reads the log only",
+            serve::usefulness::EVAL_FLOOR_DAYS
+        )
+    })
+}
+
+/// THE OWNER QUEUE (step 16, B5, B6): per project, how many of THOR's own open
+/// points wait on the owner - a subject a valid evaluation already filed past
+/// while it held - against `model::store::OPEN_POINTS_OWNER_BUDGET`. Over the
+/// budget the line opens with the same banner the owner's session start
+/// shows. Nothing is refused over it. Silent when no point waits on him.
+pub fn owner_queue_line(db: &Path) -> Option<String> {
+    let store = EventStore::open_existing(db).ok()?;
+    let mut projects: Vec<String> = serve::live::live_items(&store)
+        .into_iter()
+        .filter(|li| model::store::is_machine_point(&store, &li.id))
+        .filter_map(|li| li.item.project)
+        .collect();
+    projects.sort();
+    projects.dedup();
+    let mut out: Vec<String> = Vec::new();
+    for project in projects {
+        let queue = model::store::owner_queue(&store, &project);
+        if queue.is_empty() {
+            continue;
+        }
+        out.extend(model::store::owner_queue_banner(&project, queue.len()));
+        out.push(format!(
+            "owner queue: {} of THOR's open points in '{project}' wait on the owner (budget {}) - a valid evaluation \
+             was already filed while each one held, and no agent can lift it:",
+            queue.len(),
+            model::store::OPEN_POINTS_OWNER_BUDGET
+        ));
+        for (point, carriers) in &queue {
+            out.push(format!("  {} - carried by {}", point.id, model::store::carriers_in_words(carriers)));
+        }
+    }
+    (!out.is_empty()).then(|| out.join("\n"))
+}
+
+/// The old rules the next evaluation of this checkout's project starts with
+/// (`model::store::evaluation_teeth_batch`, which reads
+/// `model::store::settlement`): a PREVIEW of what THOR's machine pass will
+/// try at that start (step 14) - it decides what it can itself, and only
+/// what needs the agent lands in the evaluation's frozen batch. The ones
+/// behind the first eight are named too, so nothing is hidden. Silent
+/// outside a project (no report can be filed there) and when no rule is owed.
 pub fn evaluation_batch_line(db: &Path, checkout_project: Option<&str>, full: bool) -> Option<String> {
     let project = checkout_project?;
     let store = EventStore::open_existing(db).ok()?;
@@ -1183,10 +1382,12 @@ pub fn evaluation_batch_line(db: &Path, checkout_project: Option<&str>, full: bo
         return None;
     }
     let mut out = vec![format!(
-        "evaluation batch: the next evaluation report for '{project}' must settle {} rule(s) - its batch holds at \
-         most {}, the ones that fired since the previous report first, then the ones written longest ago - and {} \
-         were settled since the previous report; {} more rule(s) with no current verdict from THOR's trial stay \
-         owed and lead the batch of a later report",
+        "evaluation batch: the next evaluation of '{project}' starts with {} rule(s) - its batch of old rules with \
+         no current verdict, at most {} named here, the ones that fired since the previous report first, then the \
+         ones written longest ago. THOR tries each one itself at that start (a rule, a note, or its own open point \
+         when only the owner can release it) and hands the session only what needs a fix from it; {} were settled \
+         since the previous report; {} more rule(s) with no current verdict from THOR's trial stay owed behind \
+         these",
         batch.owed_now.len(),
         model::store::EVALUATION_TEETH_BATCH,
         batch.settled.len(),
@@ -1202,6 +1403,106 @@ pub fn evaluation_batch_line(db: &Path, checkout_project: Option<&str>, full: bo
     if batch.owed_later.len() > cap {
         out.push(format!("  owed later: and {} more, not named here (use --full)", batch.owed_later.len() - cap));
     }
+    Some(out.join("\n"))
+}
+
+/// Every open point on the store, THOR's own apart from the legacy ones
+/// (step 14). THOR writes and closes its own - one per subject a machine
+/// blocker holds, each saying in its text what clears it. A LEGACY point is
+/// one an agent filed before THOR wrote them itself: it settles nothing and
+/// holds no filing, so each is listed here for the owner to decide about.
+/// Silent when the store holds none.
+pub fn open_points_line(db: &Path, full: bool) -> Option<String> {
+    let store = EventStore::open_existing(db).ok()?;
+    let mut machine: Vec<String> = Vec::new();
+    let mut legacy: Vec<String> = Vec::new();
+    let mut points: Vec<serve::live::LiveItem> = serve::live::live_items(&store)
+        .into_iter()
+        .filter(|li| li.item.kind == model::item::Kind::Report && li.item.tags.iter().any(|t| t == model::store::OPEN_POINT_TAG))
+        .collect();
+    points.sort_by(|a, b| a.id.cmp(&b.id));
+    for li in points {
+        let project = li.item.project.clone().unwrap_or_else(|| "global".to_string());
+        if model::store::is_machine_point(&store, &li.id) {
+            let tagged = |prefix: &str| li.item.tags.iter().find_map(|t| t.strip_prefix(prefix)).unwrap_or("?").to_string();
+            machine.push(format!(
+                "{} [{project}] {} - about {}",
+                li.id,
+                tagged(model::store::OPEN_POINT_BLOCKER_PREFIX),
+                tagged(model::store::OPEN_POINT_ABOUT_PREFIX)
+            ));
+        } else {
+            let text: String = li.item.text.chars().take(100).collect();
+            let more = if li.item.text.chars().count() > 100 { "..." } else { "" };
+            legacy.push(format!("{} [{project}] {text}{more}", li.id));
+        }
+    }
+    if machine.is_empty() && legacy.is_empty() {
+        return None;
+    }
+    let mut out = vec![format!(
+        "open points: {} written by THOR itself (machine) - each holds rules only the owner can release, says in its own \
+         text what clears it, and closes itself at the next evaluation start after that; {} legacy (filed by an agent \
+         before THOR wrote them itself) - they settle nothing and hold no filing, and wait for the owner: retract each \
+         with a reason once what it names is resolved",
+        machine.len(),
+        legacy.len()
+    )];
+    let cap = name_cap(full);
+    for (label, list) in [("machine", &machine), ("legacy", &legacy)] {
+        for line in list.iter().take(cap) {
+            out.push(format!("  {label}: {line}"));
+        }
+        if list.len() > cap {
+            out.push(format!("  {label}: and {} more, not named here (use --full)", list.len() - cap));
+        }
+    }
+    Some(out.join("\n"))
+}
+
+/// Every live rule carrying an `answer-guard:<entry>` tag whose entry is not
+/// in the response rulebook beside the store (`guard-response-rulebook.json`,
+/// K14, Z8). The tag says "what this rule is about is enforced by that
+/// rulebook entry"; when the entry does not exist, nothing enforces it
+/// anywhere - and the tag settles nothing either way. Silent when every
+/// named entry exists (or no rule carries the tag).
+pub fn answer_guard_line(db: &Path) -> Option<String> {
+    let store = EventStore::open_existing(db).ok()?;
+    let rulebook = serve::respond::default_rulebook_path(db);
+    let entries: Option<std::collections::HashSet<String>> = std::fs::read_to_string(&rulebook).ok().and_then(|text| {
+        let parsed: serde_json::Value = serde_json::from_str(&text).ok()?;
+        Some(
+            parsed
+                .as_array()?
+                .iter()
+                .filter_map(|entry| entry.get("id").and_then(|id| id.as_str()).map(str::to_string))
+                .collect(),
+        )
+    });
+    let mut missing: Vec<String> = Vec::new();
+    let mut live = serve::live::live_items(&store);
+    live.sort_by(|a, b| a.id.cmp(&b.id));
+    for li in live.iter().filter(|li| li.item.kind.can_fire()) {
+        for entry in li.item.tags.iter().filter_map(|t| t.strip_prefix(model::store::ANSWER_GUARD_TAG_PREFIX)) {
+            let entry = entry.trim();
+            if !entries.as_ref().is_some_and(|known| known.contains(entry)) {
+                missing.push(format!("  {} - its answer-guard entry '{entry}' is not in the response rulebook", li.id));
+            }
+        }
+    }
+    if missing.is_empty() {
+        return None;
+    }
+    let file = match entries {
+        Some(_) => format!("{}", rulebook.display()),
+        None => format!("{} - which does not exist or does not read as a rulebook", rulebook.display()),
+    };
+    let mut out = vec![format!(
+        "answer-guard: {} rule(s) name a response-rulebook entry that is not there ({file}); the tag settles nothing, and \
+         nothing enforces what it names - add the entry to the rulebook, or drop the tag",
+        missing.len()
+    )];
+    out.extend(missing);
     Some(out.join("\n"))
 }
 
@@ -1623,7 +1924,7 @@ pub fn teeth_line(db: &Path, full: bool) -> String {
                 }
             }
         }
-        match model::store::settlement(&store, &li.id) {
+        match model::store::settlement(&store, &li.id, None) {
             model::store::Settlement::Owed { why } => {
                 if is_heavy {
                     rot_heavy += 1;
@@ -1841,6 +2142,21 @@ impl RefusalsApart {
                 "  {} refusal(s) not verified yet - their session's transcript is read at its next Stop; not counted \
                  until then",
                 self.unverified
+            ));
+        }
+        // One count for every refusal nobody's real tool call stands behind
+        // (Z9): a probe, a payload fed to the hook by hand, a session that
+        // is not a Claude Code session, a call the transcript does not hold.
+        let never_proof = self.teeth_probe + self.other_actor + self.not_claude_code.len() + self.no_matching_call;
+        if never_proof > 0 {
+            out.push(format!(
+                "  probe or hand-fed refusals (never proof): {never_proof} - {} by teeth-probe, {} hand-fed under another \
+                 actor, {} from a session that is not a Claude Code session, {} with no matching tool call in the \
+                 session's transcript",
+                self.teeth_probe,
+                self.other_actor,
+                self.not_claude_code.len(),
+                self.no_matching_call
             ));
         }
         let apart = self.teeth_probe + self.teeth_eval + self.teeth_write + self.other_actor;
@@ -2097,6 +2413,13 @@ fn can_refuse(item: &model::item::Item) -> bool {
     }
 }
 
+/// THOR's own records that share the gate's `gate_stood_aside` kind without
+/// being a stand-aside: the attester's verification of every write and every
+/// refusal at each Stop, the evaluation validator's record of a filing, and
+/// the A4 cutoff record written by `retest`. None of them is the gate holding
+/// off, so `gate_line` never counts one as a stand-aside.
+const RECORDS_NOT_STAND_ASIDES: &[&str] = &[model::store::ATTESTER_ACTOR, model::store::EVAL_VALIDATOR_ACTOR, "retest"];
+
 /// How often the gate actually did its job, read straight out of the log.
 ///
 /// THE POINT OF THIS LINE. Everything else in this report counts what the
@@ -2130,7 +2453,9 @@ pub fn gate_line(db: &Path) -> String {
                 *sessions.entry(event.session_id.clone()).or_default() += 1;
                 *actors.entry(event.actor.clone()).or_default() += 1;
             }
-            thor_core::event_store::EventKind::GateStoodAside => stood_aside += 1,
+            thor_core::event_store::EventKind::GateStoodAside if !RECORDS_NOT_STAND_ASIDES.contains(&event.actor.as_str()) => {
+                stood_aside += 1
+            }
             _ => {}
         }
     }
@@ -2435,7 +2760,15 @@ pub fn report(
     // rather than in place of it. `full` also lifts its named-items cap, the
     // same flag `decay_line`/`crowding_line` already take it from.
     lines.extend(judgement_debt_line(db, checkout_project, full));
+    lines.extend(evaluations_line(db, checkout_project));
+    lines.push(cadence_line());
+    lines.extend(work_clock_line(db, checkout_project));
     lines.extend(evaluation_batch_line(db, checkout_project, full));
+    // Silent unless the store holds an open point / a rule names a
+    // response-rulebook entry that is not there.
+    lines.extend(open_points_line(db, full));
+    lines.extend(owner_queue_line(db));
+    lines.extend(answer_guard_line(db));
     // Silent unless two live checks on the same file actually disagree right
     // now - see `contradiction_line`'s own doc comment for how this differs
     // from GROUND 29 (`model::gate::opposing_literals`), which refuses a
@@ -2591,7 +2924,10 @@ mod tests {
         report.falsifier = None;
         report.project = Some("proj".to_string());
         report.tags = vec![store::EVALUATION_REPORT_TAG.to_string()];
-        legacy_declare(&mut s, &report);
+        // Filed through THOR's remember tool, the way Claude Code files one
+        // (step 15), by the shared attested fixture.
+        serve::attest::fixture::attested_filing(&mut s, &dir.path().join("transcripts"), "doctor-fixture", &report, "toolu_batch_0")
+            .unwrap();
         let owed = store::EVALUATION_TEETH_BATCH + 3;
         for i in 0..owed {
             let mut heavy = rule(&format!("heavy-{i:02}"));
@@ -2745,7 +3081,7 @@ mod tests {
             for _ in 0..50 {
                 serve::deliver::record_delivery(&mut store, "s", "l", "t", "now", &["gone".to_string()]);
             }
-            store::retract(&mut store, "s", "l", "t", "gone", "wrong from the start").unwrap();
+            store::retract(&mut store, "s", "l", "t", "gone", "wrong from the start", None).unwrap();
         }
         let line = unjudged_line(&db);
         assert!(
@@ -3001,24 +3337,9 @@ mod tests {
 
     /// A live evaluation-report Report, correctly tagged and scoped - the
     /// exact shape `eval-command.example.md`'s own final step files with
-    /// `remember`. `newest_evaluation_report` (`serve::usefulness`) reads
-    /// this straight from the STORE, never only from the sidecar - see its
-    /// own doc comment for why the tests below need a real report here, not
-    /// only a hand-written `seed_eval_debt_state` entry.
-    ///
-    /// GOES THROUGH `legacy_declare`, NOT `store::declare` (2026-09-25): the
-    /// tests calling this pair it with `declare_owed_for_eval_debt` on the
-    /// SAME project, on purpose, to give `judgement_debt_line` something to
-    /// report - which is now exactly the shape `model::store`'s own
-    /// evaluation-filing gate refuses at a real write (judgement debt not
-    /// zero). What every caller of this helper actually tests is doctor's
-    /// own report-line formatting for a report already sitting live in the
-    /// store, never the moment of filing one - `legacy_declare`'s own doc
-    /// comment already names this exact situation: reading has to stay
-    /// correct for a shape the gate would now refuse to CREATE but a real
-    /// store can still HOLD (a report filed before that gate existed).
-    fn declare_report(store: &mut EventStore, id: &str, project: &str) {
-        let item = Item {
+    /// `remember`.
+    fn report_item(id: &str, project: &str) -> Item {
+        Item {
             id: id.to_string(),
             kind: Kind::Report,
             text: "fixture evaluation report".to_string(),
@@ -3030,9 +3351,26 @@ mod tests {
             key: None,
             falsifier: None,
             check: None,
-        };
-        legacy_declare(store, &item);
+        }
     }
+
+    /// `item` filed the way Claude Code files one (step 15: through THOR's
+    /// remember tool, for a quiet evaluation of its own session) and
+    /// validated the way the next Stop validates it (step 16), by the shared
+    /// fixture - made at unix time `at` as far as the transcript tells, the
+    /// time its coverage is measured from. The tests calling this pair it
+    /// with `declare_owed_for_eval_debt` on the SAME project, on purpose, to
+    /// give `judgement_debt_line` something to report; the filing's session
+    /// saw none of those firings, so its frozen judgement list is empty.
+    fn declare_report_at(store: &mut EventStore, item: &Item, at: i64) {
+        let transcripts = tempfile::tempdir().unwrap();
+        let session = DOCTOR_EVALUATOR;
+        serve::eval_filing::fixture::valid_filing_at(store, transcripts.path(), session, item, &format!("toolu_{}", item.id), at);
+    }
+
+    /// The evaluating session of these fixtures' reports (UUID-shaped: only
+    /// such a session has a transcript THOR reads).
+    const DOCTOR_EVALUATOR: &str = "d0c70000-0000-4000-8000-00000000d0c7";
 
     /// Write the evaluation-debt sidecar directly, the same JSON shape
     /// `serve::usefulness::update_eval_debt_state` itself writes - `doctor`
@@ -3073,7 +3411,7 @@ mod tests {
             declare_owed_for_eval_debt(&mut store, 12, "thor");
         }
         let line = judgement_debt_line(&db, Some("thor"), false).expect("a real backlog, the line must speak");
-        assert!(line.contains("the store holds no evaluation report for this project"), "{line}");
+        assert!(line.contains("no evaluation report of this project counts (none on file passed THOR's check)"), "{line}");
         assert!(line.contains("no evaluation in the last 16 hours"), "{line}");
         assert!(line.contains("not asked yet"), "{line}");
         assert!(
@@ -3100,7 +3438,7 @@ mod tests {
             serve::usefulness::ProjectEvalState { asked_count: 4, first_asked_since_report: Some(two_days_ago), ..Default::default() },
         );
         let line = judgement_debt_line(&db, Some("thor"), false).expect("a real backlog, the line must speak");
-        assert!(line.contains("the store holds no evaluation report for this project"), "{line}");
+        assert!(line.contains("no evaluation report of this project counts (none on file passed THOR's check)"), "{line}");
         assert!(line.contains("no evaluation in the last 16 hours"), "{line}");
         assert!(line.contains("asked 4 time(s), the first 2 day(s) ago"), "{line}");
         assert!(
@@ -3147,7 +3485,7 @@ mod tests {
             line.contains("the evaluation is only ever asked inside a project"),
             "must say plainly why there is nothing else here: {line}"
         );
-        assert!(!line.contains("the store holds no evaluation report"), "must never name a report clause for no project: {line}");
+        assert!(!line.contains("no evaluation report of this project"), "must never name a report clause for no project: {line}");
         assert!(
             !line.contains("still covers this project") && !line.contains("no evaluation in the last"),
             "must never claim any evaluation status for no project: {line}"
@@ -3172,21 +3510,13 @@ mod tests {
         {
             let mut store = EventStore::new(&db).unwrap();
             declare_owed_for_eval_debt(&mut store, 12, "thor");
-            declare_report(&mut store, "eval-thor-2026-09-14", "thor");
+            declare_report_at(&mut store, &report_item("eval-thor-2026-09-14", "thor"), today);
         }
-        seed_eval_debt_state(
-            &db,
-            "thor",
-            serve::usefulness::ProjectEvalState {
-                last_evaluation_seen: Some(today),
-                last_evaluation_report_id: Some("eval-thor-2026-09-14".to_string()),
-                known_report_ids: std::collections::BTreeSet::from(["eval-thor-2026-09-14".to_string()]),
-                ..Default::default()
-            },
-        );
         let line = judgement_debt_line(&db, Some("thor"), false).expect("a real backlog, the line must speak");
         assert!(
-            line.contains("newest evaluation report 'eval-thor-2026-09-14', first seen by a Stop 0 day(s) ago"),
+            line.contains(&format!(
+                "newest evaluation report 'eval-thor-2026-09-14' (valid, filed by session {DOCTOR_EVALUATOR}), filed 0 day(s) ago"
+            )),
             "{line}"
         );
         assert!(line.contains("the last evaluation still covers this project"), "{line}");
@@ -3224,6 +3554,51 @@ mod tests {
     // recently active one and how much more accrued work it needs before
     // the next evaluation is due - the closest a cold read gets to the
     // per-session detail only a real Stop can know for certain.
+
+    /// Step 17: doctor names the cadence on every run - the shipped one is
+    /// rolling 16 hours, and the weekly one is named as off.
+    #[test]
+    fn cadence_clause_names_the_mode() {
+        assert_eq!(cadence_line(), "evaluation cadence: rolling 16 hours (weekly-unless-rot is built but off)");
+        let weekly = serve::usefulness::cadence_clause(serve::usefulness::EvalCadence::WeeklyUnlessRot);
+        assert!(weekly.starts_with("evaluation cadence: weekly unless rot") && weekly.contains("rolling 16 hours is built but off"), "{weekly}");
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        drop(EventStore::new(&db).unwrap());
+        let lines = report(&db, None, None, None, None, None, false, Some("thor"));
+        assert!(lines.iter().any(|l| l == "evaluation cadence: rolling 16 hours (weekly-unless-rot is built but off)"), "{lines:?}");
+    }
+
+    /// Step 17 (N3): a work-clock sidecar that disagrees with the project's
+    /// transcripts by more than 15 minutes is named with both numbers; one
+    /// that agrees is not.
+    #[test]
+    fn work_clock_line_names_a_sidecar_the_transcripts_contradict() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        drop(EventStore::new(&db).unwrap());
+        let root = dir.path().join("projects");
+        let checkout = dir.path().join("checkouts").join("thor");
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::write(checkout.join(".thor-project"), "thor\n").unwrap();
+        let session = "5e1f0c3a-0000-4000-8000-00000000d0c7";
+        let now = serve::time::now_unix();
+        serve::attest::fixture::work_in(&root, session, &checkout, now - 50 * 60, 45);
+        let state = |minutes: i64| serve::usefulness::ProjectEvalState {
+            sessions: std::collections::BTreeMap::from([(
+                session.to_string(),
+                serve::usefulness::SessionWorkState { anchor_unix: Some(now - 3600), accrued_secs: minutes * 60, last_event_unix: Some(now), ..Default::default() },
+            )]),
+            work: serve::usefulness::SessionWorkState { anchor_unix: Some(now - 3600), accrued_secs: minutes * 60, last_event_unix: Some(now), ..Default::default() },
+            ..Default::default()
+        };
+        seed_eval_debt_state(&db, "thor", state(0));
+        let line = work_clock_line_in(&db, Some("thor"), Some(&root)).expect("zeroed: the line must speak");
+        assert!(line.contains("the work clock sidecar says 0 min, the transcripts say 45 min"), "{line}");
+        seed_eval_debt_state(&db, "thor", state(40));
+        assert_eq!(work_clock_line_in(&db, Some("thor"), Some(&root)), None, "within 15 minutes: silent");
+        assert_eq!(work_clock_line_in(&db, None, Some(&root)), None, "no project: silent");
+    }
 
     /// Case named in the build brief (doctor tail): the most recently active
     /// session's own accrued work is named, and how much more is needed
@@ -3281,6 +3656,7 @@ mod tests {
                         last_event_unix: Some(now),
                         edits_since_test: 2,
                         compacted_since_anchor: true,
+                        stops: 0,
                     },
                 )]),
                 ..Default::default()
@@ -3357,16 +3733,13 @@ mod tests {
         {
             let mut store = EventStore::new(&db).unwrap();
             declare_owed_for_eval_debt(&mut store, 12, "thor");
-            declare_report(&mut store, "eval-thor-2026-09-17", "thor");
+            declare_report_at(&mut store, &report_item("eval-thor-2026-09-17", "thor"), today);
         }
         let now = serve::time::now_unix();
         seed_eval_debt_state(
             &db,
             "thor",
             serve::usefulness::ProjectEvalState {
-                last_evaluation_seen: Some(today),
-                last_evaluation_report_id: Some("eval-thor-2026-09-17".to_string()),
-                known_report_ids: std::collections::BTreeSet::from(["eval-thor-2026-09-17".to_string()]),
                 sessions: std::collections::BTreeMap::from([(
                     "s1".to_string(),
                     serve::usefulness::SessionWorkState { anchor_unix: Some(today), accrued_secs: 100 * 60, last_event_unix: Some(now), ..Default::default() },
@@ -3387,55 +3760,48 @@ mod tests {
         );
     }
 
-    /// Case named in the build brief: a report in the store that no Stop
-    /// has seen yet. `newest_evaluation_report` reads the store directly,
-    /// so a report filed since the sidecar was last updated must still be
-    /// NAMED here, honestly, rather than silently omitted or confused with
-    /// an older report the sidecar does know about.
+    /// A report on file that no Stop has checked yet is NAMED, honestly - it
+    /// counts for nothing until a main session's Stop validates its filing.
     #[test]
-    fn judgement_debt_line_names_a_report_in_the_store_that_no_stop_has_seen_yet() {
+    fn judgement_debt_line_names_a_report_no_stop_has_checked_yet() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
         {
             let mut store = EventStore::new(&db).unwrap();
             declare_owed_for_eval_debt(&mut store, 12, "thor");
-            declare_report(&mut store, "eval-thor-2026-09-16", "thor");
+            let transcripts = tempfile::tempdir().unwrap();
+            let item = report_item("eval-thor-2026-09-16", "thor");
+            serve::attest::fixture::attested_filing(&mut store, transcripts.path(), DOCTOR_EVALUATOR, &item, "toolu_unchecked").unwrap();
         }
-        // No sidecar write at all: this report has never been seen by a
-        // Stop (`update_eval_debt_state` is what would normally stamp it).
         let line = judgement_debt_line(&db, Some("thor"), false).expect("a real backlog, the line must speak");
+        assert!(line.contains("no evaluation report of this project counts"), "{line}");
         assert!(
-            line.contains("newest evaluation report 'eval-thor-2026-09-16' in the store, not yet seen by a Stop"),
+            line.contains("evaluation report 'eval-thor-2026-09-16' is not checked yet - the next Stop of a main session checks its filing"),
             "{line}"
         );
     }
 
-    /// The rarer edge: a report KNOWN to the sidecar (in `known_report_ids`,
-    /// added by some earlier Stop) but not the id that set `last_evaluation_
-    /// report_id` at the time - reported as seen, just without a day count
-    /// neither sidecar field can honestly supply for this specific id.
+    /// Step 16: every report on file that does NOT count is named with the
+    /// validator's reason - here one written past the tool server's gate,
+    /// the way an older binary leaves one.
     #[test]
-    fn judgement_debt_line_names_a_known_but_not_last_stamped_report_without_a_day_count() {
+    fn judgement_debt_line_names_every_report_that_does_not_count_with_its_reason() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
         {
             let mut store = EventStore::new(&db).unwrap();
             declare_owed_for_eval_debt(&mut store, 12, "thor");
-            declare_report(&mut store, "eval-thor-2026-09-10", "thor");
+            let item = report_item("eval-thor-2026-09-10", "thor");
+            let body = store::canonical_body(&item).unwrap();
+            store.append_event("mcp", "mcp", "mcp", thor_core::event_store::EventKind::FactCreated, &item.id, None, &body).unwrap();
+            serve::eval_filing::validate_new_reports(&mut store, Some(dir.path()), DOCTOR_EVALUATOR);
         }
-        seed_eval_debt_state(
-            &db,
-            "thor",
-            serve::usefulness::ProjectEvalState {
-                known_report_ids: std::collections::BTreeSet::from(["eval-thor-2026-09-10".to_string()]),
-                last_evaluation_seen: Some(serve::time::now_unix()),
-                last_evaluation_report_id: Some("eval-thor-2026-09-05".to_string()),
-                ..Default::default()
-            },
-        );
         let line = judgement_debt_line(&db, Some("thor"), false).expect("a real backlog, the line must speak");
         assert!(
-            line.contains("newest evaluation report 'eval-thor-2026-09-10', already seen by an earlier Stop"),
+            line.contains(
+                "evaluation report 'eval-thor-2026-09-10' does not count as this project's evaluation: not filed through an \
+                 attested THOR tool call"
+            ),
             "{line}"
         );
     }
@@ -4222,6 +4588,7 @@ mod tests {
         assert!(line.contains("1 old refusal(s) carry no tool call id and can never be checked"), "{line}");
         assert!(line.contains("1 refusal from a session that is not a Claude Code session (probe-1) - not counted"), "{line}");
         assert!(line.contains("1 by teeth-probe"), "{line}");
+        assert!(line.contains("probe or hand-fed refusals (never proof): 2 - 1 by teeth-probe"), "{line}");
         // Red half: without the transcript's verdict the same refusal is no
         // field evidence at all.
         let dir2 = tempfile::tempdir().unwrap();
@@ -4243,6 +4610,85 @@ mod tests {
         assert!(line.contains("0 rule(s) of any weight hold a field refusal"), "{line}");
         assert!(line.contains("1 rule(s) pass the structural part alone"), "{line}");
         assert!(line.contains("1 refusal(s) not verified yet"), "{line}");
+    }
+
+    /// Step 14 (Z8, K14): doctor names every `answer-guard:` tag whose entry
+    /// is not in the response rulebook beside the store; one whose entry is
+    /// there is not named. No rulebook at all: every entry is missing.
+    #[test]
+    fn answer_guard_line_names_an_entry_missing_from_the_rulebook() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut s = EventStore::new(&db).unwrap();
+            let mut say = rule("fx-say");
+            say.tags = vec!["answer-guard:no-such-entry".to_string()];
+            legacy_declare(&mut s, &say);
+            let mut known = rule("fx-known");
+            known.tags = vec!["answer-guard:no-plain-language-tldr".to_string()];
+            legacy_declare(&mut s, &known);
+            legacy_declare(&mut s, &rule("fx-plain"));
+        }
+        let line = answer_guard_line(&db).expect("no rulebook: both entries are missing");
+        assert!(line.contains("answer-guard: 2 rule(s)") && line.contains("does not exist or does not read as a rulebook"), "{line}");
+
+        std::fs::write(
+            serve::respond::default_rulebook_path(&db),
+            r#"[{"id": "no-plain-language-tldr", "any_of": ["commit "], "reminder": "Open with a summary."}]"#,
+        )
+        .unwrap();
+        let line = answer_guard_line(&db).expect("one entry is still missing");
+        assert!(line.contains("answer-guard: 1 rule(s) name a response-rulebook entry that is not there"), "{line}");
+        assert!(line.contains("  fx-say - its answer-guard entry 'no-such-entry' is not in the response rulebook"), "{line}");
+        assert!(!line.contains("fx-known") && !line.contains("fx-plain"), "{line}");
+        assert!(report(&db, None, None, None, None, None, false, None).iter().any(|l| l.contains("fx-say - its answer-guard entry")), "part of doctor's report");
+
+        std::fs::write(
+            serve::respond::default_rulebook_path(&db),
+            r#"[{"id": "no-plain-language-tldr", "reminder": "a"}, {"id": "no-such-entry", "reminder": "b"}]"#,
+        )
+        .unwrap();
+        assert_eq!(answer_guard_line(&db), None, "every named entry exists: silent");
+    }
+
+    /// Step 14 (B4): the open points line - THOR's own counted and named
+    /// apart from the legacy ones an agent filed, which are listed for the
+    /// owner. Silent on a store with none.
+    #[test]
+    fn open_points_line_counts_machine_and_legacy_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut s = EventStore::new(&db).unwrap();
+            legacy_declare(&mut s, &rule("plain-fixture"));
+        }
+        assert_eq!(open_points_line(&db, false), None);
+        {
+            let mut s = EventStore::open_existing(&db).unwrap();
+            // A file-check rule of a project with no registered working copy:
+            // an evaluation start writes THOR's own point for it.
+            let mut held = rule("held-fixture");
+            held.project = Some("gamma".to_string());
+            held.text = "README.md keeps `x marks it`.".to_string();
+            held.bindings = vec![model::item::Binding::Target { kind: model::item::TargetKind::Path, value: "README.md".to_string() }];
+            held.check = Some(model::item::Check::Contains { path: "README.md".to_string(), literal: "x marks it".to_string() });
+            legacy_declare(&mut s, &held);
+            serve::eval_session::start(&db, &mut s, "0de7dc52-1b97-4b66-948f-61e4438043b2", "gamma", "command").expect("the evaluation starts");
+            // And one an agent filed before this build.
+            let mut old = rule("open-old-fixture");
+            old.kind = model::item::Kind::Report;
+            old.bindings = vec![];
+            old.falsifier = None;
+            old.project = Some("gamma".to_string());
+            old.text = "held-fixture still needs a real call, later.".to_string();
+            old.tags = vec![store::OPEN_POINT_TAG.to_string()];
+            legacy_declare(&mut s, &old);
+        }
+        let line = open_points_line(&db, false).expect("two open points");
+        assert!(line.starts_with("open points: 1 written by THOR itself (machine)"), "{line}");
+        assert!(line.contains("; 1 legacy (filed by an agent before THOR wrote them itself) - they settle nothing and hold no filing"), "{line}");
+        assert!(line.contains("  machine: open-no-working-copy-gamma [gamma] no-working-copy - about gamma"), "{line}");
+        assert!(line.contains("  legacy: open-old-fixture [gamma] held-fixture still needs a real call, later."), "{line}");
     }
 
     /// Step 9: the ROT line - every live rule and orientation without a
@@ -4370,7 +4816,7 @@ mod tests {
             serve::teeth::fixture::decide(&mut s, "force-push");
             legacy_declare(&mut s, &rule("gone-rule"));
             s.append_event("s", "s", "mcp", EventKind::ItemServed, "gone-rule", None, "{\"served_at\":\"2999-01-01T00:00:00Z\"}").unwrap();
-            store::retract(&mut s, "s", "l", "mcp", "gone-rule", "the thing it named was removed").unwrap();
+            store::retract(&mut s, "s", "l", "mcp", "gone-rule", "the thing it named was removed", None).unwrap();
         }
         let line = teeth_line(&db, true);
         assert!(
@@ -4612,6 +5058,27 @@ mod tests {
         assert!(line.contains("1 stand-aside"), "{line}");
     }
 
+    /// THOR's own records share the `gate_stood_aside` kind without being a
+    /// stand-aside: the attester's verification of every write at each Stop,
+    /// the evaluation validator's record and the A4 cutoff. Counted as
+    /// stand-asides they would swell the one count that says the gate held
+    /// off (step 19, measured on a store copy: the cutoff alone turned 0 into 1).
+    #[test]
+    fn the_gate_line_never_counts_thors_own_records_as_stand_asides() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut s = EventStore::new(&db).unwrap();
+            let stood = thor_core::event_store::EventKind::GateStoodAside;
+            s.append_event("s", "l", "hook", stood, "rule-c", None, "{}").unwrap();
+            for actor in [model::store::ATTESTER_ACTOR, model::store::EVAL_VALIDATOR_ACTOR, "retest"] {
+                s.append_event("s", "l", actor, stood, "rule-d", None, "{}").unwrap();
+            }
+        }
+        let line = gate_line(&db);
+        assert!(line.contains(" 1 stand-asides, lifetime"), "only the hook's own stand-aside counts: {line}");
+    }
+
     #[test]
     fn the_gate_line_is_part_of_the_report_not_an_optional_extra() {
         let dir = tempfile::tempdir().unwrap();
@@ -4667,8 +5134,8 @@ mod tests {
         // comment - it never contributes a line unless the WAL has actually
         // outgrown both the 64 MB floor and the store itself), but
         // `dead_moment_bindings_line` always says something, "none" included,
-        // and so does `working_copy_lines`.
-        assert_eq!(lines.len(), 15);
+        // and so does `working_copy_lines`, and (step 17) the cadence line.
+        assert_eq!(lines.len(), 16);
         assert!(lines[0].starts_with("memory store:"));
         assert!(lines[1].starts_with("dead moments:"));
         assert!(lines[2].starts_with("code index:"));
@@ -4689,6 +5156,7 @@ mod tests {
         assert!(lines[12].starts_with("semantic search:"));
         assert!(lines[13].starts_with("project keys:"));
         assert!(lines[14].starts_with("working copies:"));
+        assert!(lines[15].starts_with("evaluation cadence:"));
     }
 
     /// Every registration is listed, with its date and where it moved from;
@@ -5310,5 +5778,161 @@ mod tests {
         assert!(!line.contains("dead-10"), "and it stops at the cap: {line}");
         assert!(!line.contains("dead-11"), "{line}");
         assert!(line.contains("2 more"), "silence about the rest would read as done: {line}");
+    }
+
+    // ------------------------------------------ the evaluations (step 16)
+
+    /// One VALID evaluation of project `p` by `DOCTOR_EVALUATOR`: `useful`
+    /// items judged useful, `noise` judged noise and `skipped` skipped with a
+    /// reason, all on its frozen judgement list - each verdict given through
+    /// THOR's mark tool and verified the way a Stop verifies it - then the
+    /// report filed and validated. Returns the validator's record.
+    fn evaluation_with_verdicts(store: &mut EventStore, p: &str, useful: usize, noise: usize, skipped: usize) -> model::store::EvaluationValidation {
+        let transcripts = tempfile::tempdir().unwrap();
+        let session = DOCTOR_EVALUATOR;
+        let ids: Vec<String> = (0..useful + noise + skipped).map(|i| format!("judged-{p}-{i:02}")).collect();
+        for id in &ids {
+            let mut item = rule(id);
+            item.text = format!("fixture judged rule {id}");
+            item.project = Some(p.to_string());
+            item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: format!("fixture-judged-{id}") }];
+            store::declare(store, "s", "l", "a", &item).unwrap();
+            for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
+                serve::deliver::record_delivery(store, session, session, serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &[id.clone()]);
+            }
+        }
+        let start = serve::attest::fixture::quiet_start(store, session, p);
+        assert_eq!(start.frozen.judgement.len(), ids.len(), "fixture sanity: every item is on the frozen list");
+        for (i, id) in ids.iter().enumerate().take(useful + noise) {
+            serve::attest::fixture::attested_mark(store, transcripts.path(), session, id, i >= useful, &format!("toolu_mark_{i}"));
+        }
+        let mut report = report_item(&format!("eval-{p}-2026-09-30"), p);
+        report.tags.extend(ids[useful + noise..].iter().map(|id| format!("not-judgeable:{id}:the fixture never saw where it fired")));
+        serve::eval_filing::fixture::valid_filing(store, transcripts.path(), session, &report, "toolu_filing")
+    }
+
+    /// G16.4 (B7): 7 useful, 2 noise, 1 skipped - doctor names the newest
+    /// evaluation that counts and its share, "78% useful", and no flag.
+    #[test]
+    fn evaluations_line_shows_the_share() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let record = evaluation_with_verdicts(&mut EventStore::new(&db).unwrap(), "fxp", 7, 2, 1);
+        assert_eq!((record.verdicts.useful, record.verdicts.noise, record.verdicts.skipped), (7, 2, 1), "{record:?}");
+        let line = evaluations_line(&db, Some("fxp")).expect("a valid evaluation, the line must speak");
+        assert!(
+            line.starts_with(&format!(
+                "evaluations: newest evaluation report 'eval-fxp-2026-09-30' (valid, filed by session {DOCTOR_EVALUATOR})"
+            )),
+            "{line}"
+        );
+        assert!(line.contains("  eval-fxp-2026-09-30: 7 useful, 2 noise, 1 skipped (78% useful)"), "{line}");
+        assert!(!line.contains("every verdict went one way"), "{line}");
+        assert_eq!(evaluations_line(&db, Some("other")), None, "silent for a project with no report at all");
+        assert_eq!(evaluations_line(&db, None), None, "silent outside a project");
+    }
+
+    /// R16.6 (B7): 12 items on the list, every one judged useful - doctor
+    /// flags it: a blind pass looks exactly like this.
+    #[test]
+    fn one_way_flag_at_ten_verdicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        evaluation_with_verdicts(&mut EventStore::new(&db).unwrap(), "fxp", 12, 0, 0);
+        let line = evaluations_line(&db, Some("fxp")).unwrap();
+        assert!(
+            line.contains(
+                "eval-fxp-2026-09-30: 12 useful, 0 noise, 0 skipped (100% useful) - every verdict went one way - a blind pass \
+                 looks exactly like this; nothing here can tell whether the items were read"
+            ),
+            "{line}"
+        );
+
+        // Nine the same way is below the flag's floor.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        evaluation_with_verdicts(&mut EventStore::new(&db).unwrap(), "fxp", 0, 9, 0);
+        let line = evaluations_line(&db, Some("fxp")).unwrap();
+        assert!(line.contains("0 useful, 9 noise, 0 skipped (0% useful)") && !line.contains("went one way"), "{line}");
+    }
+
+    /// B5, B6: THOR's own open points of a project a valid evaluation was
+    /// filed past are the owner's; doctor counts them against the budget of
+    /// 8, names each with who carried it, and over the budget opens with the
+    /// same banner as the owner's session start. The points and the
+    /// validator's record are written raw here - what doctor reads, not how
+    /// the machine pass makes them (`serve/tests/owner_queue_banner.rs` and
+    /// `serve::eval_filing`'s units prove that).
+    #[test]
+    fn owner_queue_line_counts_against_the_budget() {
+        let queue = |n: usize| {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("t.db");
+            let mut store = EventStore::new(&db).unwrap();
+            let mut carry = Vec::new();
+            for i in 0..n {
+                let subject = format!("notes-{i}.md");
+                let blocker = store::Blocker::WorkingTreeDiffers { path: subject.clone() };
+                let point = Item {
+                    id: store::machine_point_id("fxp", &blocker),
+                    kind: Kind::Report,
+                    text: format!("THOR's own open point about {subject}"),
+                    bindings: vec![],
+                    severity: None,
+                    project: Some("fxp".to_string()),
+                    tags: store::machine_point_tags(&blocker),
+                    expires: None,
+                    key: None,
+                    falsifier: None,
+                    check: None,
+                };
+                let body = store::canonical_body(&point).unwrap();
+                store.append_event("s", "s", "eval-machine", EventKind::FactCreated, &point.id, None, &body).unwrap();
+                carry.push(store::CarryEntry { subject, carried: 0, session: DOCTOR_EVALUATOR.to_string(), agent: None });
+            }
+            let validation = store::EvaluationValidation {
+                valid: true,
+                why: String::new(),
+                drift: false,
+                report: "eval-fxp-2026-09-29".to_string(),
+                report_seq: 1,
+                project: Some("fxp".to_string()),
+                session: DOCTOR_EVALUATOR.to_string(),
+                agent: None,
+                started_seq: Some(1),
+                filed_seq: Some(2),
+                filed_at: Some("2026-09-29T10:00:00Z".to_string()),
+                machine_sha256: None,
+                verdicts: store::VerdictShares::default(),
+                carry,
+            };
+            let body = serde_json::to_string(&validation).unwrap();
+            store.append_event("s", "s", "eval-validator", EventKind::GateStoodAside, "eval-fxp-2026-09-29", None, &body).unwrap();
+            drop(store);
+            (dir, owner_queue_line(&db))
+        };
+        let (_dir, none) = queue(0);
+        assert_eq!(none, None, "silent when nothing waits on the owner");
+
+        let (_dir, within) = queue(3);
+        let within = within.expect("three points wait on the owner");
+        assert!(
+            within.starts_with("owner queue: 3 of THOR's open points in 'fxp' wait on the owner (budget 8)"),
+            "within the budget: no banner: {within}"
+        );
+        assert!(
+            within.contains(&format!("  open-working-tree-differs-fxp-notes-0-md - carried by session {DOCTOR_EVALUATOR} on 2026-09-29")),
+            "{within}"
+        );
+
+        let (_dir, over) = queue(9);
+        let over = over.expect("nine points wait on the owner");
+        assert!(
+            over.starts_with(
+                "[THOR] 9 open points wait on YOU in fxp (budget 8) - each one says what to do, step by step\nowner queue: 9 of \
+                 THOR's open points in 'fxp' wait on the owner (budget 8)"
+            ),
+            "{over}"
+        );
     }
 }

@@ -243,6 +243,16 @@ fn main() {
                 }
             };
             let item = Item { id, kind, text, bindings, severity, project, tags, expires, key, falsifier, check };
+            // An evaluation report is filed only through a THOR tool call
+            // Claude Code made (step 15): a report written from a shell could
+            // never count, so it is refused here, before a store is opened,
+            // with the very sentence the tool server gives. The store refuses
+            // it too (`store::declare` carries no filing context).
+            if gate::is_evaluation_report(&item) {
+                let refusal = store::unattested_filing_refusal("the model command line is not a THOR tool call");
+                eprintln!("{}", store::refusal_sentence(&refusal));
+                std::process::exit(1);
+            }
 
             let mut event_store = open_store(&cli.db);
             // The same neighbourhood toll the agent's own write pays. Wiring

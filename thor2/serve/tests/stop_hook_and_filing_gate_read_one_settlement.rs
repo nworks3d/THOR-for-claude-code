@@ -1,8 +1,10 @@
 //! The Stop hook's teeth question, the evaluation-filing gate and its batch
 //! read ONE answer (`model::store::settlement`, step 9): the same rules are
 //! owed on all three, a settled rule is named by none, and a rule held by a
-//! machine blocker (a file check of a project with no registered working
-//! copy) is named by none until the blocker lifts - then by all three.
+//! machine blocker is named by none until the blocker lifts - then by all
+//! three. Both blockers (step 14): a file check of a project with no
+//! registered working copy, and a contains literal an uncommitted edit took
+//! out of the registered working tree while the default branch still has it.
 //!
 //! (The spec names this file `stop_hook_teeth_debt_reads_the_same_settlement_
 //! as_the_filing_gate.rs`; that name makes the test binary's path pass the
@@ -73,7 +75,7 @@ fn rule(id: &str, text: &str) -> Item {
     }
 }
 
-const IDS: [&str; 4] = ["owed-1", "owed-2", "noted", "blocked-1"];
+const IDS: [&str; 5] = ["owed-1", "owed-2", "noted", "blocked-1", "blocked-2"];
 
 fn named(text: &str) -> BTreeSet<String> {
     IDS.iter().filter(|id| text.contains(&format!("'{id}'"))).map(|id| id.to_string()).collect()
@@ -109,7 +111,13 @@ fn three_answers(db: &Path, session: &str, cwd: &Path) -> (BTreeSet<String>, BTr
         .map(|(id, _)| id)
         .filter(|id| IDS.contains(&id.as_str()))
         .collect();
-    let filing = match model::store::declare(&mut store, "s", "l", "a", &eval_report(&format!("eval-{session}"))) {
+    // The filing gate reads the lists an evaluation froze at its start
+    // (step 14); this start hands it the live batch, and the report goes
+    // through the shared attested fixture (step 15).
+    serve::attest::fixture::live_batch_start(&mut store, session, "p");
+    let transcripts = db.parent().unwrap().join("transcripts");
+    let report = eval_report(&format!("eval-{session}"));
+    let filing = match serve::attest::fixture::attested_filing(&mut store, &transcripts, session, &report, "toolu_filing") {
         Ok(_) => BTreeSet::new(),
         Err(e) => named(&e.to_string()),
     };
@@ -134,9 +142,10 @@ fn the_stop_hook_the_batch_and_the_filing_gate_name_the_same_rules() {
     let checkout: PathBuf = tmp.path().join("p");
     std::fs::create_dir_all(&checkout).unwrap();
     std::fs::write(checkout.join("NOTES.md"), "keep me\nplain line\n").unwrap();
+    std::fs::write(checkout.join("OTHER.md"), "stay put\nplain line\n").unwrap();
     let db = tmp.path().join("thor.db");
     let mut store = EventStore::new(&db).unwrap();
-    model::store::declare(&mut store, "s", "l", "a", &eval_report("eval-old")).unwrap();
+    serve::attest::fixture::attested_filing(&mut store, &tmp.path().join("transcripts"), "s", &eval_report("eval-old"), "toolu_old").unwrap();
     legacy(&mut store, &rule("owed-1", "probe rule owed-1 about a costly mistake"));
     legacy(&mut store, &rule("owed-2", "probe rule owed-2 about a costly mistake"));
     legacy(&mut store, &rule("noted", "probe rule noted about a costly mistake"));
@@ -144,6 +153,10 @@ fn the_stop_hook_the_batch_and_the_filing_gate_name_the_same_rules() {
     blocked.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "NOTES.md".to_string() }];
     blocked.check = Some(Check::Contains { path: "NOTES.md".to_string(), literal: "keep me".to_string() });
     legacy(&mut store, &blocked);
+    let mut differs = rule("blocked-2", "OTHER.md must keep the line `stay put`.");
+    differs.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "OTHER.md".to_string() }];
+    differs.check = Some(Check::Contains { path: "OTHER.md".to_string(), literal: "stay put".to_string() });
+    legacy(&mut store, &differs);
     // The trial settles `noted` as a note.
     let corpus = serve::legit::Corpus::load(&store);
     let retest = serve::teeth::retest(&store, Some(db.as_path()), "noted", &corpus).unwrap();
@@ -151,19 +164,28 @@ fn the_stop_hook_the_batch_and_the_filing_gate_name_the_same_rules() {
     serve::teeth::apply_as_retest(&mut store, &retest).unwrap();
     drop(store);
 
-    // p is not registered: blocked-1 is held by that blocker.
+    // p is not registered: blocked-1 and blocked-2 are held by that blocker
+    // (no working copy).
     std::fs::write(checkout.join(".thor-project"), "p\n").unwrap();
     let (stop, batch, filing) = three_answers(&db, "session-one", &checkout);
     assert_eq!(stop, set(&["owed-1", "owed-2"]), "the Stop hook");
     assert_eq!(batch, stop, "the batch reads the same answer");
     assert_eq!(filing, stop, "and so does the filing gate");
 
-    // Registered: the blocker lifts, and all three name it.
+    // Registered: that blocker lifts, and all three name blocked-1. For
+    // blocked-2 the other blocker holds now: both files are committed, and an
+    // uncommitted edit then takes its literal out of the working tree while
+    // the default branch still has it (the working tree differs).
     std::fs::remove_file(checkout.join(".thor-project")).unwrap();
     let hooks = tmp.path().join("no-hooks");
     std::fs::create_dir_all(&hooks).unwrap();
     git(&checkout, &hooks, &["init", "-q", "-b", "main"]);
     git(&checkout, &hooks, &["config", "core.hooksPath", hooks.to_str().unwrap()]);
+    git(&checkout, &hooks, &["config", "user.email", "fixture@example.invalid"]);
+    git(&checkout, &hooks, &["config", "user.name", "fixture"]);
+    git(&checkout, &hooks, &["add", "NOTES.md", "OTHER.md"]);
+    git(&checkout, &hooks, &["commit", "-q", "-m", "fixture"]);
+    std::fs::write(checkout.join("OTHER.md"), "mid-edit\nplain line\n").unwrap();
     let mut store = EventStore::open_existing(&db).unwrap();
     let record = Item {
         id: model::store::project_opened_id("p"),
@@ -190,6 +212,23 @@ fn the_stop_hook_the_batch_and_the_filing_gate_name_the_same_rules() {
     drop(store);
     let (stop, batch, filing) = three_answers(&db, "session-two", &checkout);
     assert_eq!(stop, set(&["owed-1", "owed-2", "blocked-1"]), "the Stop hook");
+    assert_eq!(batch, stop, "the batch");
+    assert_eq!(filing, stop, "the filing gate");
+    {
+        let store = EventStore::open_existing(&db).unwrap();
+        assert_eq!(
+            model::store::settlement(&store, "blocked-2", None),
+            model::store::Settlement::Settled(model::store::Settled::Blocked(model::store::Blocker::WorkingTreeDiffers {
+                path: "OTHER.md".to_string()
+            })),
+            "held by the working tree, not by the agent"
+        );
+    }
+
+    // The edit is dropped: that blocker lifts too, and all three name it.
+    std::fs::write(checkout.join("OTHER.md"), "stay put\nplain line\n").unwrap();
+    let (stop, batch, filing) = three_answers(&db, "session-three", &checkout);
+    assert_eq!(stop, set(&["owed-1", "owed-2", "blocked-1", "blocked-2"]), "the Stop hook");
     assert_eq!(batch, stop, "the batch");
     assert_eq!(filing, stop, "the filing gate");
 }

@@ -45,9 +45,11 @@
 //! mechanism. Every ask is now counted on the PROJECT's own sidecar entry
 //! (`asked_count`/`first_asked_since_report`) instead of a session's, reset
 //! the moment a new report is seen (`the_ask_counter_increments_per_turn_
-//! and_resets_once_a_report_is_seen`). `seed_eval_state`/`recently_covered`/
-//! `no_longer_covered` below drive `last_evaluation_seen` directly, at an
-//! exact instant relative to the real wall clock this binary reads;
+//! and_resets_once_a_report_is_seen`). `seed_valid_report`/`recently_covered`/
+//! `no_longer_covered` below give the project a VALID report filed at an
+//! exact instant relative to the real wall clock this binary reads (since
+//! step 16 `last_evaluation_seen` comes from the validator's record in the
+//! log, and every Stop overwrites the sidecar's copy with it);
 //! `seed_tracking_since` (still calling the real, unchanged `update_eval_
 //! debt_state` write) remains only for the no-project tests, which care
 //! about whether the sidecar is touched AT ALL, never about which
@@ -325,8 +327,8 @@ fn declare_owed_items(store: &mut EventStore, n: usize, project: Option<&str>) -
 /// accrued total needs anyway.
 ///
 /// Reads the sidecar first and merges in, rather than overwriting the whole
-/// file, so a fixture that already seeded a report (`seed_eval_state`) or
-/// another session's own accrual for the same project is never clobbered.
+/// file, so another session's own accrual for the same project is never
+/// clobbered.
 fn seed_session_work(db: &Path, project: Option<&str>, session_id: &str, minutes: i64) {
     seed_session_work_with_risk(db, project, session_id, minutes, 0, false);
 }
@@ -350,8 +352,23 @@ fn seed_session_work_with_risk(db: &Path, project: Option<&str>, session_id: &st
             last_event_unix: Some(now),
             edits_since_test,
             compacted_since_anchor,
+            // A session that worked here this long has ended a turn here
+            // before: its first Stop in the project is never held (Q10).
+            stops: 1,
         },
     );
+    // The project's own clock (step 17, B8): never below what any one of
+    // its sessions accrued, so a seeded session carries the project with it.
+    if entry.work.accrued_secs < minutes * 60 {
+        entry.work = serve::usefulness::SessionWorkState {
+            anchor_unix: Some(now - minutes * 60),
+            accrued_secs: minutes * 60,
+            last_event_unix: Some(now),
+            edits_since_test,
+            compacted_since_anchor,
+            stops: 0,
+        };
+    }
     all.insert(key, entry);
     std::fs::write(serve::usefulness::eval_debt_state_path(db), serde_json::to_string(&all).unwrap()).unwrap();
 }
@@ -370,16 +387,23 @@ fn seed_tracking_since(store: &EventStore, db: &Path, project: Option<&str>, hou
     serve::usefulness::update_eval_debt_state(store, db, project, since);
 }
 
-/// Write the evaluation-debt sidecar directly, the same JSON shape
-/// `usefulness::update_eval_debt_state` itself writes - the only way to
-/// seed `last_evaluation_seen` (or `asked_count`/`first_asked_since_
-/// report`) at an exact, controllable instant, since the real hook binary
-/// always reads the real wall clock, never a fixture instant.
-fn seed_eval_state(db: &Path, project: Option<&str>, state: serve::usefulness::ProjectEvalState) {
-    let mut all: serve::usefulness::EvalDebtState = Default::default();
-    all.insert(project.unwrap_or("").to_string(), state);
-    std::fs::write(serve::usefulness::eval_debt_state_path(db), serde_json::to_string(&all).unwrap()).unwrap();
+/// A VALID evaluation report of `project`, filed at unix time `seen` as far
+/// as its transcript tells, and validated the way a Stop validates it (step
+/// 16) - the only way to give the project a covering report at an exact
+/// instant: since step 16 `last_evaluation_seen` comes from the log, and a
+/// Stop overwrites whatever the sidecar says with it. Filed by an evaluating
+/// session of its own (`EVALUATOR`), which saw none of the fixture's
+/// firings, so its frozen judgement list is empty.
+fn seed_valid_report(db: &Path, project: &str, seen: i64, id: &str) {
+    let mut store = EventStore::open_existing(db).unwrap();
+    let transcripts = tempfile::tempdir().unwrap();
+    let report = serve::eval_filing::fixture::report(id, project, "fixture evaluation report");
+    serve::eval_filing::fixture::valid_filing_at(&mut store, transcripts.path(), EVALUATOR, &report, "toolu_fixture_report", seen);
 }
+
+/// The evaluating session of the fixtures' reports (UUID-shaped: only such a
+/// session has a transcript THOR reads).
+const EVALUATOR: &str = "7a1e0c3a-0000-4000-8000-00000000e7a1";
 
 /// An instant `usefulness::eval_report_covers` will always agree still
 /// covers, relative to the real "now" - regardless of what wall-clock hour
@@ -422,7 +446,7 @@ fn no_longer_covered() -> i64 {
 /// gate's own doc comment (`model::store::check_evaluation_report_filing`).
 fn pay_down_judgement_debt(store: &mut EventStore, ids: &[String]) {
     for id in ids {
-        serve::mark::record_useful(store, "fixture", "fixture", "fixture", "2026-09-17T00:00:00Z", id).unwrap();
+        serve::mark::record_useful(store, "fixture", "fixture", "fixture", "2026-09-17T00:00:00Z", id, None).unwrap();
     }
 }
 
@@ -444,7 +468,13 @@ fn declare_report(store: &mut EventStore, id: &str, project: &str) {
         falsifier: None,
         check: None,
     };
-    model::store::declare(store, "fixture", "fixture", "fixture", &item).unwrap();
+    // Filed the way Claude Code files one (step 15): through THOR's remember
+    // tool, for a quiet evaluation of the project, by the shared fixture -
+    // in an evaluating session of its own, which saw none of the fixture's
+    // firings (its frozen judgement list is empty) - and validated the way
+    // the next Stop validates it (step 16).
+    let transcripts = tempfile::tempdir().unwrap();
+    serve::eval_filing::fixture::valid_filing(store, transcripts.path(), EVALUATOR, &item, "toolu_fixture_report");
 }
 
 /// The exact shape `ops::install::working_contract` seeds the real setup
@@ -836,15 +866,7 @@ fn a_recently_seen_report_silences_it_for_as_long_as_it_covers() {
     let mut store = EventStore::new(&db).unwrap();
     declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
     drop(store);
-    // `seed_eval_state` overwrites the WHOLE sidecar file (it has no
-    // existing state to merge with here), so it must run BEFORE
-    // `seed_session_work`, which reads-and-merges - the other order would
-    // silently wipe the session accrual `seed_session_work` just wrote.
-    seed_eval_state(
-        &db,
-        Some("thor-fixture"),
-        serve::usefulness::ProjectEvalState { last_evaluation_seen: Some(recently_covered()), ..Default::default() },
-    );
+    seed_valid_report(&db, "thor-fixture", recently_covered(), "eval-thor-fixture-covering");
     seed_session_work(&db, Some("thor-fixture"), "s1", 90);
 
     let first = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
@@ -865,14 +887,7 @@ fn a_report_outside_the_coverage_window_does_not_silence_it() {
     let mut store = EventStore::new(&db).unwrap();
     declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
     drop(store);
-    // `seed_eval_state` overwrites the WHOLE sidecar file, so it must run
-    // BEFORE `seed_session_work` (which reads-and-merges) - see the
-    // identical note on the test above.
-    seed_eval_state(
-        &db,
-        Some("thor-fixture"),
-        serve::usefulness::ProjectEvalState { last_evaluation_seen: Some(no_longer_covered()), ..Default::default() },
-    );
+    seed_valid_report(&db, "thor-fixture", no_longer_covered(), "eval-thor-fixture-covering");
     seed_session_work(&db, Some("thor-fixture"), "s1", 90);
 
     let out = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
@@ -895,14 +910,7 @@ fn the_day_after_a_report_59_minutes_worked_is_silent_61_fires() {
     let mut store = EventStore::new(&db).unwrap();
     declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
     drop(store);
-    // `seed_eval_state` overwrites the WHOLE sidecar file, so it must run
-    // BEFORE `seed_session_work` (which reads-and-merges) - see the
-    // identical note on the earlier tests in this file.
-    seed_eval_state(
-        &db,
-        Some("thor-fixture"),
-        serve::usefulness::ProjectEvalState { last_evaluation_seen: Some(no_longer_covered()), ..Default::default() },
-    );
+    seed_valid_report(&db, "thor-fixture", no_longer_covered(), "eval-thor-fixture-covering");
     seed_session_work(&db, Some("thor-fixture"), "s1", 59);
     let silent = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
     assert!(silent.trim().is_empty(), "59 minutes, the day after a report, must still be silent: {silent}");
@@ -912,11 +920,7 @@ fn the_day_after_a_report_59_minutes_worked_is_silent_61_fires() {
     let mut store2 = EventStore::new(&db2).unwrap();
     declare_owed_items(&mut store2, OWED_CONTEXT_COUNT, Some("thor-fixture"));
     drop(store2);
-    seed_eval_state(
-        &db2,
-        Some("thor-fixture"),
-        serve::usefulness::ProjectEvalState { last_evaluation_seen: Some(no_longer_covered()), ..Default::default() },
-    );
+    seed_valid_report(&db2, "thor-fixture", no_longer_covered(), "eval-thor-fixture-covering");
     seed_session_work(&db2, Some("thor-fixture"), "s2", 61);
     let out = run_hook(&db2, &stop_payload("s2", &project_dir), &sandbox);
     let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("61 minutes must fire: {e}: {out}"));
@@ -944,11 +948,7 @@ fn a_report_seen_today_with_90_minutes_accrued_since_stays_silent() {
     let mut store = EventStore::new(&db).unwrap();
     declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
     drop(store);
-    seed_eval_state(
-        &db,
-        Some("thor-fixture"),
-        serve::usefulness::ProjectEvalState { last_evaluation_seen: Some(recently_covered()), ..Default::default() },
-    );
+    seed_valid_report(&db, "thor-fixture", recently_covered(), "eval-thor-fixture-covering");
     seed_session_work(&db, Some("thor-fixture"), "s1", 90);
 
     let out = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
@@ -969,15 +969,7 @@ fn a_report_seen_today_with_three_hours_accrued_since_fires_the_repeat_message()
     let mut store = EventStore::new(&db).unwrap();
     declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
     drop(store);
-    seed_eval_state(
-        &db,
-        Some("thor-fixture"),
-        serve::usefulness::ProjectEvalState {
-            last_evaluation_seen: Some(recently_covered()),
-            last_evaluation_report_id: Some("eval-thor-fixture-2026-09-17".to_string()),
-            ..Default::default()
-        },
-    );
+    seed_valid_report(&db, "thor-fixture", recently_covered(), "eval-thor-fixture-2026-09-17");
     seed_session_work_with_risk(
         &db,
         Some("thor-fixture"),
@@ -1021,15 +1013,7 @@ fn three_hours_accrued_with_no_risk_at_all_stays_silent_end_to_end() {
     let mut store = EventStore::new(&db).unwrap();
     declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
     drop(store);
-    seed_eval_state(
-        &db,
-        Some("thor-fixture"),
-        serve::usefulness::ProjectEvalState {
-            last_evaluation_seen: Some(recently_covered()),
-            last_evaluation_report_id: Some("eval-thor-fixture-2026-09-17".to_string()),
-            ..Default::default()
-        },
-    );
+    seed_valid_report(&db, "thor-fixture", recently_covered(), "eval-thor-fixture-2026-09-17");
     seed_session_work(&db, Some("thor-fixture"), "s1", serve::usefulness::EVAL_REPEAT_WORK_MINUTES + 1);
 
     let out = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
@@ -1053,15 +1037,7 @@ fn subagent_untested_edits_count_toward_the_risk_counter_but_a_subagent_stop_nev
     let mut store = EventStore::new(&db).unwrap();
     declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
     drop(store);
-    seed_eval_state(
-        &db,
-        Some("thor-fixture"),
-        serve::usefulness::ProjectEvalState {
-            last_evaluation_seen: Some(recently_covered()),
-            last_evaluation_report_id: Some("eval-thor-fixture-2026-09-17".to_string()),
-            ..Default::default()
-        },
-    );
+    seed_valid_report(&db, "thor-fixture", recently_covered(), "eval-thor-fixture-2026-09-17");
     seed_session_work(&db, Some("thor-fixture"), "sub1", serve::usefulness::EVAL_REPEAT_WORK_MINUTES + 1);
 
     for _ in 0..serve::usefulness::EVAL_REPEAT_MIN_UNTESTED_EDITS {
@@ -1173,7 +1149,7 @@ fn regression_verdicts_on_unrelated_global_items_never_silence_this() {
             check: None,
         };
         model::store::declare(&mut store, "fixture", "fixture", "fixture", &item).unwrap();
-        serve::mark::record_useful(&mut store, "s", "s", "t", "2026-09-08T00:00:00Z", &id).unwrap();
+        serve::mark::record_useful(&mut store, "s", "s", "t", "2026-09-08T00:00:00Z", &id, None).unwrap();
     }
     drop(store);
 
@@ -1350,4 +1326,458 @@ fn teeth_debt_still_fires_after_the_evaluation_debt_check() {
     // the rule is owed, and the command that decides it.
     assert!(reason.contains("it has never been tried"), "and say why it is owed: {reason}");
     assert!(reason.contains("retest --id 'names-a-flag'"), "and the command that decides it: {reason}");
+}
+
+// ------------------------------------------ step 16: only a valid report counts
+//
+// The Stop hook validates every report on file once (`serve::eval_filing`),
+// and the evaluation's facts in the sidecar come from that record in the
+// log only - overwritten at every Stop.
+
+/// R16.2 (EV Z10): setting `last_evaluation_seen` to "now" in
+/// `eval-debt-state.json` - no report behind it - used to silence the
+/// evaluation for 16 hours. Both Stops block now, and the Stop puts the
+/// sidecar back to what the log says.
+#[test]
+fn an_edited_debt_sidecar_does_not_silence_the_ask() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let sandbox = Sandbox::new();
+    let project_dir = sandbox.project_dir("thor-fixture");
+    drop(EventStore::new(&db).unwrap());
+    seed_session_work(&db, Some("thor-fixture"), "s1", 90);
+
+    let first = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
+    assert!(first.contains("\"decision\":\"block\""), "fixture sanity, the first Stop asks: {first}");
+
+    let mut all = serve::usefulness::read_eval_debt_state(&db);
+    let now = serve::time::now_unix();
+    let entry = all.get_mut("thor-fixture").expect("the Stop wrote this project's entry");
+    entry.last_evaluation_seen = Some(now);
+    entry.last_evaluation_report_id = Some("eval-thor-fixture-2026-09-30".to_string());
+    for session in entry.sessions.values_mut() {
+        session.anchor_unix = Some(now + 1);
+    }
+    std::fs::write(serve::usefulness::eval_debt_state_path(&db), serde_json::to_string(&all).unwrap()).unwrap();
+
+    let second = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
+    assert!(second.contains("\"decision\":\"block\""), "an edited sidecar never stands in for a valid report: {second}");
+    let state = serve::usefulness::project_eval_state(&db, Some("thor-fixture"));
+    assert_eq!((state.last_evaluation_seen, state.last_evaluation_report_id), (None, None), "put back from the log");
+}
+
+/// R16.1 / R16.3 (EV Z11, Z1 c): a report that reached the log past the
+/// tool server's filing gate - here written raw, the shape an older `mcp.exe`
+/// or `model.exe` leaves (since step 15 `model::store::declare` itself
+/// refuses an evaluation report without a filing context, so the raw write
+/// stands in for it) - does not count: the Stop still holds the turn, names
+/// the report and says why.
+#[test]
+fn a_report_written_past_the_gate_does_not_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let sandbox = Sandbox::new();
+    let project_dir = sandbox.project_dir("thor-fixture");
+    let mut store = EventStore::new(&db).unwrap();
+    let report = serve::eval_filing::fixture::report("eval-thor-fixture-2026-09-28", "thor-fixture", "TLDR: all fine.");
+    let refused = model::store::declare(&mut store, "mcp", "mcp", "mcp", &report).unwrap_err().to_string();
+    assert!(refused.contains("not coming through a THOR tool call"), "fixture sanity, the store's own gate refuses it: {refused}");
+    let body = model::store::canonical_body(&report).unwrap();
+    store.append_event("mcp", "mcp", "mcp", EventKind::FactCreated, &report.id, None, &body).unwrap();
+    drop(store);
+    seed_session_work(&db, Some("thor-fixture"), "s1", 90);
+
+    let out = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("expected a block: {e}: {out}"));
+    assert_eq!(v["decision"], "block", "{out}");
+    let reason = v["reason"].as_str().unwrap();
+    assert!(
+        reason.starts_with(
+            "[THOR] The report 'eval-thor-fixture-2026-09-28' is on file but does not count as this project's evaluation: not \
+             filed through an attested THOR tool call"
+        ),
+        "{reason}"
+    );
+    assert!(reason.contains("The evaluation is still owed.") && reason.contains("Run the THOR evaluation"), "{reason}");
+    let store = EventStore::open_existing(&db).unwrap();
+    let record = serve::eval_filing::current_validation(&store, &report.id).expect("the Stop recorded its check");
+    assert!(!record.valid && !record.drift, "{record:?}");
+}
+
+// -------------------------------------- step 17: the project's work clock
+//
+// B8, D11, D12, D13, F14, Q10. The clock is the PROJECT's (every session
+// together, parallel minutes once); the ask follows the work, not the
+// folder; it lands only on a session with ten minutes of its own work in
+// the project, never at its first Stop there, and not while another session
+// runs the evaluation - for at most an hour. A zeroed sidecar is overruled by
+// the session's own transcript and bounded by the weekly floor, which reads
+// the log only. Every session here is UUID-shaped: only such a session has
+// a transcript, and only such a session is log activity.
+
+fn uuid(n: u32) -> String {
+    format!("5e1f0c3a-0000-4000-8000-0000000017{n:02}")
+}
+
+fn pretooluse_payload(session_id: &str, cwd: &Path) -> String {
+    serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": session_id,
+        "cwd": cwd.to_string_lossy(),
+        "tool_name": "Read",
+        "tool_input": { "file_path": "fixture.txt" },
+    })
+    .to_string()
+}
+
+/// Let `secs` seconds pass, as far as the work clock can tell: every instant
+/// the sidecar holds moves that far into the past. The hook itself reads
+/// the real clock, so this is how a test makes minutes go by between events.
+fn age_sidecar(db: &Path, secs: i64) {
+    fn age(v: &mut serde_json::Value, secs: i64) {
+        match v {
+            serde_json::Value::Object(map) => {
+                for (key, value) in map.iter_mut() {
+                    let instant = matches!(
+                        key.as_str(),
+                        "anchor_unix" | "last_event_unix" | "tracking_since" | "first_asked_since_report" | "last_evaluation_seen"
+                    );
+                    match value.as_i64() {
+                        Some(t) if instant => *value = serde_json::json!(t - secs),
+                        _ => age(value, secs),
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(|item| age(item, secs)),
+            _ => {}
+        }
+    }
+    let path = serve::usefulness::eval_debt_state_path(db);
+    let mut v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    age(&mut v, secs);
+    std::fs::write(&path, v.to_string()).unwrap();
+}
+
+/// Seed `session`'s OWN work in `project` (`minutes`, and how many of its
+/// Stops were seen there) without touching the project's clock.
+fn seed_own_work(db: &Path, project: &str, session: &str, minutes: i64, stops: u32) {
+    let mut all = serve::usefulness::read_eval_debt_state(db);
+    let entry = all.entry(project.to_string()).or_default();
+    let now = serve::time::now_unix();
+    entry.sessions.insert(
+        session.to_string(),
+        serve::usefulness::SessionWorkState {
+            anchor_unix: Some(now - minutes * 60),
+            accrued_secs: minutes * 60,
+            last_event_unix: Some(now),
+            stops,
+            ..Default::default()
+        },
+    );
+    std::fs::write(serve::usefulness::eval_debt_state_path(db), serde_json::to_string(&all).unwrap()).unwrap();
+}
+
+/// Set the PROJECT's own clock to `minutes`.
+fn seed_project_clock(db: &Path, project: &str, minutes: i64) {
+    let mut all = serve::usefulness::read_eval_debt_state(db);
+    let entry = all.entry(project.to_string()).or_default();
+    let now = serve::time::now_unix();
+    entry.work = serve::usefulness::SessionWorkState {
+        anchor_unix: Some(now - minutes * 60),
+        accrued_secs: minutes * 60,
+        last_event_unix: Some(now),
+        ..Default::default()
+    };
+    std::fs::write(serve::usefulness::eval_debt_state_path(db), serde_json::to_string(&all).unwrap()).unwrap();
+}
+
+fn is_block(out: &str) -> bool {
+    out.contains("\"decision\":\"block\"")
+}
+
+fn transcripts(sandbox: &Sandbox) -> PathBuf {
+    sandbox.home.path().join(".claude").join("projects")
+}
+
+/// A rule of `project`, decided (a note), served to `session` at
+/// `days_ago` days before now: log activity of the project in that session.
+fn served_in(store: &mut EventStore, project: &str, session: &str, days_ago: i64) {
+    let id = format!("fx-active-{project}");
+    if model::store::show(store, &id).is_err() {
+        let item = Item {
+            id: id.clone(),
+            kind: Kind::Rule,
+            text: format!("fixture rule that fires in {project}"),
+            bindings: vec![Binding::Target { kind: TargetKind::Command, value: format!("fixture-active-{project}") }],
+            severity: None,
+            project: Some(project.to_string()),
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some("the fixture rule turns out to be wrong".to_string()),
+            check: None,
+        };
+        model::store::declare(store, "fixture", "fixture", "fixture", &item).unwrap();
+        serve::teeth::fixture::decide(store, &id);
+    }
+    let at = serve::time::iso8601_from_unix(serve::time::now_unix() - days_ago * 86_400);
+    serve::deliver::record_delivery(store, session, session, serve::usefulness::ASSISTANT_DELIVERY_ACTOR, &at, &[id]);
+}
+
+/// R17.1 (EV B8): S1 works 40 minutes in the project (a hook event every two
+/// minutes), then S2 works 25. Neither session reaches an hour, the project
+/// does: S1's Stops stay quiet (40 project minutes), S2's first Stop is free
+/// (Q10), and S2's next Stop holds the turn. Driven through the real hook,
+/// with the sidecar aged two minutes between events.
+#[test]
+fn two_short_sessions_add_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let sandbox = Sandbox::new();
+    let fxp = sandbox.project_dir("fxp");
+    drop(EventStore::new(&db).unwrap());
+    let (s1, s2) = (uuid(1), uuid(2));
+    for _ in 0..=20 {
+        run_hook(&db, &pretooluse_payload(&s1, &fxp), &sandbox);
+        age_sidecar(&db, 120);
+    }
+    assert!(!is_block(&run_hook(&db, &stop_payload(&s1, &fxp), &sandbox)), "S1 alone: 40 minutes");
+    assert!(!is_block(&run_hook(&db, &stop_payload(&s1, &fxp), &sandbox)), "S1 alone, again");
+    for _ in 0..=12 {
+        run_hook(&db, &pretooluse_payload(&s2, &fxp), &sandbox);
+        age_sidecar(&db, 120);
+    }
+    let state = serve::usefulness::project_eval_state(&db, Some("fxp"));
+    assert!(state.work.accrued_secs >= 64 * 60, "the project's clock holds both: {:?}", state.work);
+    assert!(state.sessions[&s2].accrued_secs < 30 * 60, "S2's own: {:?}", state.sessions[&s2]);
+    let first = run_hook(&db, &stop_payload(&s2, &fxp), &sandbox);
+    assert!(!is_block(&first), "S2's first Stop is never held: {first}");
+    let second = run_hook(&db, &stop_payload(&s2, &fxp), &sandbox);
+    assert!(is_block(&second) && second.contains("Run the THOR evaluation"), "{second}");
+    assert!(second.contains("every session together"), "the ask names the project's clock: {second}");
+}
+
+/// G17.3 (F14): a session with four minutes of its own work in an overdue
+/// project is never held, on any Stop; the next session, with twelve, is held
+/// at its second Stop.
+#[test]
+fn a_session_without_ten_minutes_of_its_own_is_never_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let sandbox = Sandbox::new();
+    let fxp = sandbox.project_dir("fxp");
+    drop(EventStore::new(&db).unwrap());
+    seed_project_clock(&db, "fxp", 90);
+    let (short, next) = (uuid(3), uuid(4));
+    seed_own_work(&db, "fxp", &short, 4, 0);
+    for stop in 1..=3 {
+        let out = run_hook(&db, &stop_payload(&short, &fxp), &sandbox);
+        assert!(!is_block(&out), "stop {stop}: four minutes of its own is never enough: {out}");
+    }
+    seed_own_work(&db, "fxp", &next, 12, 0);
+    assert!(!is_block(&run_hook(&db, &stop_payload(&next, &fxp), &sandbox)), "its first Stop is free");
+    assert!(is_block(&run_hook(&db, &stop_payload(&next, &fxp), &sandbox)), "its second Stop is held");
+}
+
+/// G17.1 second half (Q10): a brand-new session's first Stop in a project
+/// that is already due is never held; its second Stop is.
+#[test]
+fn first_stop_of_a_session_is_never_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let sandbox = Sandbox::new();
+    let fxp = sandbox.project_dir("fxp");
+    drop(EventStore::new(&db).unwrap());
+    seed_project_clock(&db, "fxp", 90);
+    let fresh = uuid(5);
+    seed_own_work(&db, "fxp", &fresh, 30, 0);
+    let first = run_hook(&db, &stop_payload(&fresh, &fxp), &sandbox);
+    assert!(!is_block(&first), "{first}");
+    let second = run_hook(&db, &stop_payload(&fresh, &fxp), &sandbox);
+    assert!(is_block(&second), "{second}");
+
+    // The Stop count is a sidecar copy: zeroed by hand, the transcript's
+    // earlier turn still says this is not the first Stop.
+    let dodger = uuid(6);
+    seed_own_work(&db, "fxp", &dodger, 30, 0);
+    let now = serve::time::now_unix();
+    serve::attest::fixture::work_in(&transcripts(&sandbox), &dodger, &fxp, now - 40 * 60, 10);
+    serve::attest::fixture::work_in(&transcripts(&sandbox), &dodger, &fxp, now - 20 * 60, 10);
+    let out = run_hook(&db, &stop_payload(&dodger, &fxp), &sandbox);
+    assert!(is_block(&out), "two turns in its transcript: a zeroed Stop count frees nothing: {out}");
+}
+
+/// R17.4 (D11): the ask follows the work, not the folder - S2 worked 25
+/// minutes in fxp (the project is due), then its folder moved into gamma,
+/// a project with no debt: its next Stop still asks for fxp, and says so. A
+/// move into a folder of no project does not silence it either.
+#[test]
+fn the_ask_follows_the_work_not_the_folder() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let sandbox = Sandbox::new();
+    let gamma = sandbox.project_dir("gamma");
+    drop(EventStore::new(&db).unwrap());
+    let s2 = uuid(7);
+    seed_project_clock(&db, "fxp", 70);
+    seed_own_work(&db, "fxp", &s2, 25, 1);
+    let out = run_hook(&db, &stop_payload(&s2, &gamma), &sandbox);
+    assert!(is_block(&out), "{out}");
+    assert!(out.contains("This session worked in project 'fxp' since its last evaluation; this folder belongs to 'gamma'"), "{out}");
+    assert!(out.contains("(project 'fxp')") && out.contains("The evaluation of 'fxp' started"), "{out}");
+    let elsewhere = run_hook(&db, &stop_payload(&s2, &sandbox.global_cwd()), &sandbox);
+    assert!(is_block(&elsewhere) && elsewhere.contains("(project 'fxp')"), "{elsewhere}");
+    assert!(elsewhere.contains("this folder belongs to no project"), "{elsewhere}");
+}
+
+/// G17.5 (D11): a session that worked only in its folder's own project is
+/// asked about that project only, exactly as before - no line about another
+/// project.
+#[test]
+fn a_session_in_its_own_project_is_asked_about_that_project_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let sandbox = Sandbox::new();
+    let fxp = sandbox.project_dir("fxp");
+    drop(EventStore::new(&db).unwrap());
+    let s = uuid(8);
+    seed_project_clock(&db, "fxp", 70);
+    seed_own_work(&db, "fxp", &s, 70, 1);
+    let out = run_hook(&db, &stop_payload(&s, &fxp), &sandbox);
+    assert!(is_block(&out) && out.contains("(project 'fxp')"), "{out}");
+    assert!(!out.contains("this folder belongs to"), "{out}");
+}
+
+/// G17.1 first half (D12): S1 holds an open evaluation start ten minutes old
+/// and gave a verdict two minutes ago: S2's Stop is not held - one line says
+/// where the evaluation runs.
+#[test]
+fn a_running_evaluation_elsewhere_is_not_asked_twice() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let sandbox = Sandbox::new();
+    let fxp = sandbox.project_dir("fxp");
+    let (s1, s2) = (uuid(9), uuid(10));
+    {
+        let mut store = EventStore::new(&db).unwrap();
+        let now = serve::time::now_unix();
+        serve::attest::fixture::quiet_start_at(&mut store, &s1, "fxp", now - 10 * 60);
+        served_in(&mut store, "fxp", "fixture", 0);
+        let at = serve::time::iso8601_from_unix(now - 2 * 60);
+        serve::mark::record_useful(&mut store, &s1, "mcp", "mcp", &at, "fx-active-fxp", None).unwrap();
+    }
+    seed_project_clock(&db, "fxp", 90);
+    seed_own_work(&db, "fxp", &s2, 30, 1);
+    let out = run_hook(&db, &stop_payload(&s2, &fxp), &sandbox);
+    assert!(!is_block(&out), "{out}");
+    assert!(out.contains("[THOR] an evaluation of fxp is running in another session (started "), "{out}");
+}
+
+/// R17.5 (D12): the exemption lasts at most an hour per start. S1's start is
+/// 61 minutes old and S1 keeps writing: S2's Stop is held with the ask. The
+/// modification time of S1's transcript plays no part (nothing reads it).
+#[test]
+fn a_running_evaluation_exempts_for_at_most_an_hour() {
+    let sandbox = Sandbox::new();
+    let fxp = sandbox.project_dir("fxp");
+    let (s1, s2) = (uuid(11), uuid(12));
+    let now = serve::time::now_unix();
+    let case = |started_minutes_ago: i64| -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            serve::attest::fixture::quiet_start_at(&mut store, &s1, "fxp", now - started_minutes_ago * 60);
+            served_in(&mut store, "fxp", "fixture", 0);
+            let at = serve::time::iso8601_from_unix(now - 60);
+            serve::mark::record_useful(&mut store, &s1, "mcp", "mcp", &at, "fx-active-fxp", None).unwrap();
+        }
+        seed_project_clock(&db, "fxp", 90);
+        seed_own_work(&db, "fxp", &s2, 30, 1);
+        run_hook(&db, &stop_payload(&s2, &fxp), &sandbox)
+    };
+    // S1's transcript, just written ("touched").
+    serve::attest::fixture::work_in(&transcripts(&sandbox), &s1, &fxp, now - 5 * 60, 5);
+    let out = case(61);
+    assert!(is_block(&out) && out.contains("Run the THOR evaluation"), "{out}");
+    let quiet = case(10);
+    assert!(!is_block(&quiet), "the contrast: ten minutes old, it exempts: {quiet}");
+}
+
+/// R17.2 (EV B8, the step-16 leftover): the sidecar's minutes zeroed for S2
+/// between Stops. S2's own transcript shows 25 minutes of work in the
+/// project, so the ask still lands: with the project's clock intact the
+/// transcript restores S2's own minutes; with the project's zeroed too, the
+/// weekly floor (log activity, no valid evaluation) makes it due.
+#[test]
+fn zeroed_sidecar_is_overruled_by_the_transcript() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let sandbox = Sandbox::new();
+    let fxp = sandbox.project_dir("fxp");
+    let s2 = uuid(13);
+    drop(EventStore::new(&db).unwrap());
+    seed_project_clock(&db, "fxp", 70);
+    seed_own_work(&db, "fxp", &s2, 0, 1);
+    let control = run_hook(&db, &stop_payload(&s2, &fxp), &sandbox);
+    assert!(!is_block(&control), "control: no transcript, zero minutes of its own: {control}");
+    let now = serve::time::now_unix();
+    serve::attest::fixture::work_in(&transcripts(&sandbox), &s2, &fxp, now - 26 * 60, 25);
+    seed_own_work(&db, "fxp", &s2, 0, 1);
+    let out = run_hook(&db, &stop_payload(&s2, &fxp), &sandbox);
+    assert!(is_block(&out), "the transcript's 25 minutes overrule the zeroed sidecar: {out}");
+
+    // The project's clock zeroed as well: S2 was served one of the
+    // project's rules today (log activity) and the project has no valid
+    // evaluation, so the weekly floor holds.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    {
+        let mut store = EventStore::new(&db).unwrap();
+        served_in(&mut store, "fxp", &s2, 0);
+    }
+    seed_project_clock(&db, "fxp", 0);
+    seed_own_work(&db, "fxp", &s2, 0, 1);
+    let out = run_hook(&db, &stop_payload(&s2, &fxp), &sandbox);
+    assert!(is_block(&out) && out.contains("(the weekly floor)"), "{out}");
+}
+
+/// R17.6 (D13): the project's minutes zeroed; S2 has 12 minutes of its own
+/// (under the hour, so the clock alone would not ask); the log shows fxp
+/// activity on three of the last seven days and the newest valid evaluation
+/// is eight days old: S2's second Stop is held. G17.4: with no activity in
+/// the last seven days, or a valid evaluation three days old, the floor
+/// makes nothing due.
+#[test]
+fn zeroed_project_clock_meets_the_weekly_floor() {
+    let sandbox = Sandbox::new();
+    let fxp = sandbox.project_dir("fxp");
+    let s2 = uuid(14);
+    let now = serve::time::now_unix();
+    let case = |eval_days: Option<i64>, activity_days: &[i64]| -> (String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        drop(EventStore::new(&db).unwrap());
+        if let Some(days) = eval_days {
+            seed_valid_report(&db, "fxp", now - days * 86_400, "eval-fxp-fixture");
+        }
+        {
+            let mut store = EventStore::open_existing(&db).unwrap();
+            for (i, days) in activity_days.iter().enumerate() {
+                served_in(&mut store, "fxp", &uuid(40 + i as u32), *days);
+            }
+        }
+        seed_project_clock(&db, "fxp", 0);
+        seed_own_work(&db, "fxp", &s2, 12, 0);
+        let first = run_hook(&db, &stop_payload(&s2, &fxp), &sandbox);
+        let second = run_hook(&db, &stop_payload(&s2, &fxp), &sandbox);
+        (first, second)
+    };
+    let (first, second) = case(Some(8), &[1, 3, 5]);
+    assert!(!is_block(&first), "the first Stop is free: {first}");
+    assert!(is_block(&second) && second.contains("(the weekly floor)"), "{second}");
+    let (_, quiet) = case(None, &[9]);
+    assert!(!is_block(&quiet), "no activity in the last seven days: {quiet}");
+    let (_, quiet) = case(Some(3), &[1, 2]);
+    assert!(!is_block(&quiet), "a valid evaluation three days old: {quiet}");
 }

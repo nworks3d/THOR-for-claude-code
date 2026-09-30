@@ -231,6 +231,17 @@ see asked or answered. Measured 2026-09-09: agents working among
 themselves are not held by any of this; it applies only to what is
 addressed to the owner.
 
+Two sentences of the paragraph above are history by now (2.4.1). The
+evaluation ask is no longer read from one session's own accrual: it follows
+the PROJECT's work clock (every session together, parallel minutes counted
+once), holds only a session with at least ten minutes of its own work there
+and never on its first `Stop`, and a report counts only once THOR has checked
+how it was filed - see `thor2/README.md`, "Who is asked, and when". And a
+write through the tool server is no longer always stamped with the literal
+session "mcp": the stamp is the server's own Claude Code session id (a hint;
+"mcp" remains only when the server has none), and a verdict clears debt only when a `Stop` has checked that it was a real tool
+call of that session.
+
 Each of the six - Lane C, `setup_debt`, the evaluation debt, and the three
 memory-upkeep debts - decides its own subagent scope independently, at its
 own call site in `hook_once`'s `Stop` arm, rather than behind one shared

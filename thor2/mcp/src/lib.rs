@@ -91,9 +91,11 @@
 //! and never an empty reply that could be mistaken for "nothing found".
 
 use model::item::{Binding, Item, Kind, Severity, TargetKind};
+use rmcp::handler::server::common::FromContextPart;
 use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{Implementation, Meta, ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -102,9 +104,56 @@ use std::sync::{Arc, Mutex};
 use thor_core::event_store::EventStore;
 use thor_core::inbox::{self, InboxOp};
 
-const SESSION_ID: &str = "mcp";
 const LINEAGE_ID: &str = "mcp";
 const ACTOR: &str = "mcp";
+
+/// The session column of a write when this server knows no Claude Code
+/// session (a drain replaying a replica's queue, an in-process test). A
+/// server Claude Code starts writes under its session hint instead (step 12).
+const NO_SESSION: &str = "mcp";
+
+/// A write call's arguments exactly as they arrived, cloned before
+/// `Parameters<T>` takes them - so the schema stays generated from `T`, and
+/// the digest is of what the client really sent (step 12: the transcript's
+/// tool_use input digests to the same value, measured). Must come before
+/// `Parameters<T>` in a handler's arguments.
+#[derive(Debug, Clone, Default)]
+pub struct RawArgs(pub serde_json::Value);
+
+impl<'a, S> FromContextPart<ToolCallContext<'a, S>> for RawArgs {
+    fn from_context_part(context: &mut ToolCallContext<'a, S>) -> Result<Self, rmcp::ErrorData> {
+        Ok(RawArgs(serde_json::Value::Object(context.arguments.clone().unwrap_or_default())))
+    }
+}
+
+/// What a write call brings for its `att` stamp (step 12): the call's
+/// `_meta`, its raw arguments, the THOR tool, and the server's session hint
+/// (`CLAUDE_CODE_SESSION_ID`, fixed when the server started).
+struct Stamp {
+    meta: serde_json::Map<String, serde_json::Value>,
+    raw: serde_json::Value,
+    tool: &'static str,
+    session: Option<String>,
+}
+
+impl Stamp {
+    /// The stamp itself: `serve::attest::att_for_call`, which reads the
+    /// session's transcripts - so it runs inside the blocking closure.
+    fn att(&self) -> model::store::Att {
+        serve::attest::att_for_call(
+            &self.meta,
+            self.session.as_deref(),
+            &self.raw,
+            self.tool,
+            serve::attest::transcripts_root().as_deref(),
+        )
+    }
+
+    /// The session column the write lands under: the hint, else `NO_SESSION`.
+    fn column(&self) -> &str {
+        self.session.as_deref().unwrap_or(NO_SESSION)
+    }
+}
 
 /// What the body becomes: replaced wholesale, added to, or patched in one
 /// place. Exactly one of the three, or none at all.
@@ -712,7 +761,45 @@ fn open_a_new_shelf_if_named_by_owner(
 /// (`serve::teeth::trial_for_write`) is the one place that writes it. The
 /// store refuses a new label with no record behind it for every other writer
 /// too (K16); this is the friendlier message for the one door an agent uses.
-fn refuse_a_forged_teeth_tag(tags: &[String]) -> Result<(), String> {
+///
+/// EXTENDED IN STEP 13 to THOR's evaluation start records: an id beginning
+/// with `evaluation-start-` and the tag `evaluation-start` are THOR's own. The
+/// store's reserved-id fence is the authority (`model::store::fence`); this is
+/// the friendlier first message.
+///
+/// EXTENDED IN STEP 14 to THOR's own open points: an id THOR keeps for them
+/// (`model::store::is_machine_point_id`) is never a writer's. Their TAGS are
+/// refused by `refuse_an_open_point_tag`, which a revise calls once it has
+/// read the item (a legacy point keeps the tag it already has).
+fn refuse_a_forged_teeth_tag(id: &str, tags: &[String]) -> Result<(), String> {
+    if model::store::is_machine_point_id(id.trim()) {
+        return Err(format!(
+            "{} Nothing was written: '{}' is an id THOR keeps for its own open points - it writes one when something \
+             only the owner can lift holds a rule, and closes it at the first evaluation start after that lifts. Give \
+             your own item another id; to move a stuck rule, run THOR's trial on it (mcp__thor__revise with only the \
+             rule's id) and make the one fix it names.",
+            model::store::MACHINE_POINT_REFUSAL,
+            id.trim()
+        ));
+    }
+    if id.trim().starts_with(model::store::EVALUATION_START_PREFIX) {
+        return Err(format!(
+            "invalid 'id': '{id}' begins with '{prefix}', which THOR keeps for its own record of an evaluation start - \
+             only THOR writes one, when an evaluation starts, and nothing else may change it. Nothing was written. \
+             Give your own item an id that does not begin with '{prefix}' (for an evaluation report: \
+             'eval-<project>-<date>').",
+            id = id.trim(),
+            prefix = model::store::EVALUATION_START_PREFIX
+        ));
+    }
+    if tags.iter().any(|t| t == model::store::EVALUATION_START_TAG) {
+        return Err(format!(
+            "invalid 'tags': '{tag}' is THOR's own tag for its record of an evaluation start - only THOR writes it. \
+             Nothing was written. Drop '{tag}' from the tags (an evaluation report carries '{report}' instead).",
+            tag = model::store::EVALUATION_START_TAG,
+            report = model::store::EVALUATION_REPORT_TAG
+        ));
+    }
     if let Some(bad) = tags.iter().find(|t| t.starts_with(model::store::TEETH_TAG_PREFIX)) {
         return Err(format!(
             "invalid 'tags': '{bad}' starts with '{prefix}', which this tool reserves for itself - whether a \
@@ -723,6 +810,27 @@ fn refuse_a_forged_teeth_tag(tags: &[String]) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Open points are written and closed by THOR itself (step 14): a caller may
+/// not put the tag `open-point`, or a tag starting `about:` or `blocker:`, on
+/// anything. Checked against the tags THE CALLER SUPPLIES that the item does
+/// not already carry - `existing` is the head a revise replaces - so a legacy
+/// open point (filed by an agent before this build) can still be corrected
+/// or retracted; it just settles nothing and holds no filing.
+///
+/// Measured before this: a Report tagged `open-point` naming a heavy rule was
+/// stored, and that rule then counted as settled for the evaluation filing.
+fn refuse_an_open_point_tag(tags: &[String], existing: Option<&Item>) -> Result<(), String> {
+    let carried = |tag: &String| existing.is_some_and(|e| e.tags.contains(tag));
+    let Some(bad) = tags.iter().find(|t| model::store::is_open_point_tag(t) && !carried(t)) else { return Ok(()) };
+    Err(format!(
+        "{}. Nothing was written: the tag '{bad}' marks THOR's own record of what holds a rule, and nobody files one. \
+         Drop the tag. If a rule cannot be decided yet, run THOR's trial on it (mcp__thor__revise with only the rule's \
+         id) and make the one fix it names; a rule held by something only the owner can lift gets its open point from \
+         THOR at the next evaluation start.",
+        model::store::OPEN_POINT_REFUSAL
+    ))
 }
 
 /// The three dispute arguments of a write (K22, K8(d)), as the trial reads
@@ -795,48 +903,116 @@ fn normalized_item(item: &Item) -> Item {
 /// reason is the tool's own, written into the item's history.
 const UNPIN_BECAUSE: &str = "unpinned with the unpin tool: the Always binding was removed on purpose, every other binding stays";
 
-/// The evaluation a filing belongs to, from the hook's handover
-/// (`serve::eval_session`): `None` for every item that is not an evaluation
-/// report, and for one the hook recorded no filing of.
-fn evaluation_scope(item: &model::item::Item, handover_db: Option<&std::path::Path>) -> Option<model::store::EvaluationScope> {
-    let is_evaluation = item.kind == Kind::Report && item.tags.iter().any(|t| t == model::store::EVALUATION_REPORT_TAG);
-    if !is_evaluation {
-        return None;
+/// THE FILING CONTEXT of a write that files an evaluation report (step 15,
+/// K21, F2), or the refusal of one that cannot count. `before` is the head a
+/// revise replaces (`None` for a remember); `att` is the call's own stamp.
+///
+/// `Ok(None)`: this write files nothing (it is no evaluation report, or a
+/// revise of one that was filed before). Otherwise, in order:
+/// - the call is a side door (`att.inflight`: no tool call id in its `_meta`,
+///   no session for this server, or the session's transcript holds that id
+///   under another tool or other arguments): refused, with the why;
+/// - this server's session has no evaluation of the report's project open in
+///   the log: refused - there is nothing to file;
+/// - an item on the evaluation's frozen lists was written in its window
+///   outside an attested THOR call of it (D10): the start record is closed as
+///   void right here (`serve::eval_session::void`), and the filing refused;
+/// - else the context: what the writer saw of the call (seen or unseen - a
+///   line not on disk yet is never a refusal) and the open start record.
+///
+/// No wait and no "try again": the filing call's own result and hook
+/// attachment cannot exist while it runs, so the writer never asks for them.
+/// The Stop hook is the authority on the call itself.
+fn filing_context(
+    store: &mut EventStore,
+    item: &Item,
+    before: Option<&Item>,
+    stamp: &Stamp,
+    att: &model::store::Att,
+) -> Result<Option<model::store::FilingContext>, String> {
+    let files = match before {
+        None => model::gate::is_evaluation_report(item),
+        Some(before) => model::gate::newly_filed_as_evaluation(&normalized_item(before), &normalized_item(item)),
+    };
+    if !files {
+        return Ok(None);
     }
-    serve::eval_session::scope_for_filing(handover_db?, &item.id, serve::time::now_unix())
+    let sentence = |refusal: model::Refusal| model::store::refusal_sentence(&refusal);
+    let inflight = att.inflight.as_deref().unwrap_or(model::store::INFLIGHT_SIDE_DOOR);
+    if inflight == model::store::INFLIGHT_SIDE_DOOR {
+        let why = att.side_door.as_deref().unwrap_or("the call carries no sign of a Claude Code tool call");
+        return Err(sentence(model::store::unattested_filing_refusal(why)));
+    }
+    let project = normalized_item(item).project;
+    let (Some(session), Some(project)) = (stamp.session.as_deref(), project.as_deref()) else {
+        return Err(sentence(model::store::unattested_filing_refusal("this server knows no Claude Code session or the report names no project")));
+    };
+    let Some(start) = model::store::open_evaluation_start(store, session, project) else {
+        return Err(sentence(model::store::no_open_evaluation_refusal(store, session, project)));
+    };
+    if let Some(outside) = model::store::frozen_writes_in_window(store, &start, None).outside.into_iter().next() {
+        serve::eval_session::void(store, &start, &outside);
+        return Err(sentence(model::store::changed_behind_refusal(&outside)));
+    }
+    Ok(model::store::FilingContext::new(inflight, start))
 }
 
-/// The line a filed evaluation report's receipt carries about judgement:
-/// what its own list held, and how much stays owed store-wide - so a report
-/// that files is never read as "the debt is paid". Empty for every other
-/// write.
-fn evaluation_receipt(
-    store: &EventStore,
-    item: &model::item::Item,
-    scope: Option<&model::store::EvaluationScope>,
-) -> String {
-    if item.kind != Kind::Report || !item.tags.iter().any(|t| t == model::store::EVALUATION_REPORT_TAG) {
-        return String::new();
+/// A SIDE-DOOR WRITE TO A FROZEN ITEM IS REFUSED ON THE SPOT (step 15, D10).
+/// An item on the frozen lists of an open evaluation may only be changed by
+/// an attested THOR call of the evaluating session; any other write would
+/// make that evaluation's filing refused. A call whose in-flight check
+/// already says side door is therefore refused here, before anything is
+/// written, so a script or a second client learns it at once - and the
+/// evaluation stands. Every other write through a side door still lands
+/// (it simply never counts as attested), and a verdict (`mark`) is never
+/// refused here: it settles nothing and is listed in the machine section.
+fn refuse_a_side_door_on_a_frozen_item(store: &EventStore, id: &str, att: &model::store::Att) -> Result<(), String> {
+    if att.inflight.as_deref() != Some(model::store::INFLIGHT_SIDE_DOOR) {
+        return Ok(());
     }
-    let project = item.project.as_deref();
-    let store_wide = model::store::judgement_debt_in_project(store, project).len();
-    match scope {
-        Some(scope) => {
-            let judgement = model::store::evaluation_judgement_owed(store, project, scope, &item.tags);
-            format!(
-                "\njudgement: this evaluation's list (fixed at log position {}) held {} item(s): {} settled, {} skipped \
-                 as not judgeable here. {store_wide} item(s) stay owed store-wide for this project - doctor names them.",
-                scope.started_seq,
-                judgement.settled.len() + judgement.skipped.len() + judgement.owed.len(),
-                judgement.settled.len(),
-                judgement.skipped.len()
-            )
-        }
-        None => format!(
-            "\njudgement: no hook record says which session filed this report, so no verdict was required here. \
-             {store_wide} item(s) stay owed store-wide for this project - doctor names them."
-        ),
-    }
+    let Some(start) = model::store::open_evaluation_freezing(store, id.trim()) else { return Ok(()) };
+    let door = att.side_door.as_deref().unwrap_or("no reason recorded");
+    Err(model::store::refusal_sentence(&model::store::frozen_side_door_refusal(id.trim(), &start, door)))
+}
+
+/// The lines a filed evaluation report's receipt carries: a summary of the
+/// machine section THOR wrote above the writer's text, and how much stays
+/// owed store-wide - so a report that files is never read as "the debt is
+/// paid". Empty for every other write (`ctx` is `None`).
+fn evaluation_receipt(store: &EventStore, item: &Item, ctx: Option<&model::store::FilingContext>, event_seq: i64) -> String {
+    let Some(ctx) = ctx else { return String::new() };
+    let filed_seq = model::store::show(store, &item.id)
+        .ok()
+        .and_then(|stored| model::gate::machine_section_range(&stored.text))
+        .map_or(event_seq - 1, |(_, filed)| filed);
+    let m = model::store::machine_section_summary(store, &ctx.start, filed_seq);
+    let store_wide = model::store::judgement_debt_in_project(store, item.project.as_deref()).len();
+    // Over the owner's budget of open points (step 16, B6): said here too.
+    let queue = item.project.as_deref().and_then(|p| {
+        model::store::owner_queue_banner(p, model::store::owner_queue(store, p).len()).map(|line| format!("\n{line}"))
+    });
+    let queue = queue.unwrap_or_default();
+    format!(
+        "\nmachine section: THOR wrote it above your text, from its log (seq {} to {}); it cannot be edited.\
+         \njudgement: this evaluation's list (fixed at log position {}) held {} item(s): {} useful, {} noise, {} skipped \
+         as not judgeable here, {} retracted or taken off the rule track, {} pinned. {store_wide} item(s) stay owed \
+         store-wide for this project - doctor names them.\
+         \nteeth: {} rule(s) on the frozen batch and A4 list, all settled.\
+         \nside doors: {} write(s) in the window outside an attested THOR call, {} still to be checked.\
+         \nTHOR checks this filing call against the session's transcript when the turn ends.{queue}",
+        m.started_seq,
+        m.filed_seq,
+        m.started_seq,
+        m.listed,
+        m.useful,
+        m.noise,
+        m.skipped,
+        m.gone,
+        m.pinned,
+        m.teeth_listed,
+        m.side_doors,
+        m.unverified
+    )
 }
 
 /// Refuse a check that holds only in the linked worktree this server was
@@ -1182,7 +1358,8 @@ ran it - a replica cannot attest it. Nothing was queued: file the report from a 
 /// literal the text does not name) and the note track included. The trial
 /// itself needs the working copy, so it still runs at the drain.
 fn replica_refusal_for_remember(store: &EventStore, args: &RememberArgs) -> Result<(), String> {
-    refuse_a_forged_teeth_tag(&args.tags)?;
+    refuse_a_forged_teeth_tag(&args.id, &args.tags)?;
+    refuse_an_open_point_tag(&args.tags, None)?;
     let item = remembered_item(args)?;
     if is_evaluation_report(&item) {
         return Err(REPLICA_EVALUATION_REFUSAL.to_string());
@@ -1195,11 +1372,10 @@ fn replica_refusal_for_remember(store: &EventStore, args: &RememberArgs) -> Resu
 /// replica's own copy of the item, when it has one (a write it has not seen
 /// yet is left to the drain), including the widened weakenings and A4.
 fn replica_refusal_for_revise(store: &EventStore, args: &ReviseArgs) -> Result<(), String> {
-    if let Some(tags) = args.tags.as_deref() {
-        refuse_a_forged_teeth_tag(tags)?;
-    }
+    refuse_a_forged_teeth_tag(&args.id, args.tags.as_deref().unwrap_or(&[]))?;
     model::store::fence(store, ACTOR.into(), &args.id).map_err(|e| format!("REFUSED: {e}"))?;
     let Ok(existing) = model::store::show(store, &args.id) else { return Ok(()) };
+    refuse_an_open_point_tag(args.tags.as_deref().unwrap_or(&[]), Some(&existing))?;
     let plan = plan_revise(&existing, args)?;
     if is_evaluation_report(&plan.updated) && (!is_evaluation_report(&existing) || existing.project != plan.updated.project) {
         return Err(REPLICA_EVALUATION_REFUSAL.to_string());
@@ -1227,7 +1403,10 @@ fn write_binding_change(
     updated: &Item,
     because: Option<&str>,
     verb: &str,
+    stamp: &Stamp,
 ) -> Result<String, String> {
+    let att = stamp.att();
+    refuse_a_side_door_on_a_frozen_item(store, &existing.id, &att)?;
     model::gate::revise(&normalized_item(existing), &normalized_item(updated))
         .map_err(|r| format!("REFUSED: {}", model::store::WriteError::Refused(r)))?;
     let (written, record, notes, trial_because) = match run_trial(
@@ -1252,7 +1431,7 @@ fn write_binding_change(
     let because = because.map(str::to_string).or(trial_because);
     match model::store::revise_tried_scoped(
         store,
-        SESSION_ID,
+        stamp.column(),
         LINEAGE_ID,
         ACTOR,
         &baseline,
@@ -1262,6 +1441,7 @@ fn write_binding_change(
         None,
         record.as_ref(),
         None,
+        Some(&att),
     ) {
         Ok(event) => {
             let mut out = format!("{verb} '{}' (event seq {})", written.id, event.seq);
@@ -1901,12 +2081,6 @@ pub struct ThorMcpServer {
     /// can refuse a check that holds only here (see
     /// `refuse_a_worktree_only_check`).
     worktree: Option<Arc<PathBuf>>,
-    /// The store's own path, when this server runs against a real file: where
-    /// the hook's evaluation handover lives (`serve::eval_session`), so a
-    /// filing can be tied to the session that files it. `None` (an in-memory
-    /// store, a replica) means no handover, and the filing gate then demands
-    /// no verdict - see `model::store::EvaluationScope`.
-    handover_db: Option<Arc<PathBuf>>,
     /// Replica divert mode: when set, `remember`, `revise` and `retract` do
     /// NOT write to this store. They append the call to the capture inbox at
     /// this path instead, for the authority to replay (see
@@ -1939,9 +2113,10 @@ pub struct ThorMcpServer {
     /// process only.
     ///
     /// THE GAP THIS CLOSES. Every `item_marked_useful`/`item_marked_noise`
-    /// event is stamped with the constant `SESSION_ID` ("mcp") - see that
-    /// constant's own doc comment - so the STORE cannot tell one Claude Code
-    /// session's verdict from the next session's. This server process can:
+    /// event used to be stamped with one shared session name ("mcp"), and a
+    /// server with no session hint still is (step 12), so the STORE cannot
+    /// always tell one Claude Code session's verdict from the next session's.
+    /// This server process can:
     /// one process lives exactly as long as one session (stdio, one client).
     /// Measured: a verdict replayed from a stale debt list repeated an
     /// identical noise verdict already given earlier in the same session, and
@@ -1981,7 +2156,6 @@ impl ThorMcpServer {
             embedder_cache: Arc::new(Mutex::new(None)),
             root: None,
             worktree: None,
-            handover_db: None,
             inbox: None,
             library: None,
             asked_piles: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -2005,7 +2179,6 @@ impl ThorMcpServer {
             embedder_cache: Arc::new(Mutex::new(None)),
             root: None,
             worktree: None,
-            handover_db: None,
             inbox: None,
             library: None,
             asked_piles: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -2059,16 +2232,14 @@ impl ThorMcpServer {
         self
     }
 
+    /// The stamp of one write call (step 12).
+    fn stamp(&self, tool: &'static str, meta: Meta, raw: RawArgs) -> Stamp {
+        Stamp { meta: meta.0, raw: raw.0, tool, session: self.session.session_id.clone() }
+    }
+
     /// Name the session this server writes for (see the `session` field).
     pub fn with_session(mut self, session: serve::teeth::SessionCtx) -> Self {
         self.session = session;
-        self
-    }
-
-    /// Read the hook's evaluation handover beside the store at `db` (see the
-    /// `handover_db` field).
-    pub fn with_evaluation_handover(mut self, db: PathBuf) -> Self {
-        self.handover_db = Some(Arc::new(db));
         self
     }
 
@@ -2145,7 +2316,7 @@ impl ThorMcpServer {
     }
 
     #[tool(description = "Code lane: declares a NEW item (Rule, Orientation, Report, Lookup or Chunk) through the write gate. Call lookup first so this corrects an existing item instead of storing a near-duplicate; for anything about the owner's own life use shelve, never this. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refuses, with the exact reason and the fix, when a Rule/Orientation has no binding, no falsifier, or exceeds 300 characters, or when a Report/Chunk names no project scope; nothing is written on a refusal. check_kind/check_path/check_literal(s) optionally attach a machine-runnable proof alongside the falsifier - see server instructions for the six check kinds. Every Rule/Orientation is TRIED as it is written: a check that bites is stored on the rule track, a rule with no working tooth is stored as a note (no check), and a tooth THOR builds from the rule's own words that bites refuses the write, naming the exact check to hang - the reply's 'teeth:' note says which. Replies with the stored id, kind and event sequence, or the refusal text.", annotations(title = "Remember a fact", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false))]
-    async fn remember(&self, Parameters(args): Parameters<RememberArgs>) -> String {
+    async fn remember(&self, meta: Meta, raw: RawArgs, Parameters(args): Parameters<RememberArgs>) -> String {
         if self.inbox.is_some() {
             let judged = {
                 let store = self.store.lock().unwrap_or_else(|p| p.into_inner());
@@ -2158,16 +2329,17 @@ impl ThorMcpServer {
         if let Some(queued) = self.capture("remember", &args) {
             return queued;
         }
+        let stamp = self.stamp("remember", meta, raw);
         let root = self.root.clone();
         let library = self.library.clone();
         let worktree = self.worktree.clone();
-        let handover_db = self.handover_db.clone();
         let corpus = self.corpus.clone();
         let session = self.session.clone();
         self.blocking(move |s| {
             // Checked first, against the CALLER'S OWN tags: see
             // `refuse_a_forged_teeth_tag`'s own doc comment.
-            refuse_a_forged_teeth_tag(&args.tags)?;
+            refuse_a_forged_teeth_tag(&args.id, &args.tags)?;
+            refuse_an_open_point_tag(&args.tags, None)?;
             let item = remembered_item(&args)?;
             refuse_a_worktree_only_check(
                 item.check.as_ref(),
@@ -2195,16 +2367,19 @@ impl ThorMcpServer {
                 serve::teeth::WriteTrial::Unchanged { item, receipt } => (item, None, receipt),
                 serve::teeth::WriteTrial::Tried { item, record, receipt, .. } => (item, Some(record), receipt),
             };
-            let scope = evaluation_scope(&item, handover_db.as_deref().map(|p| p.as_path()));
+            let att = stamp.att();
+            refuse_a_side_door_on_a_frozen_item(s, &item.id, &att)?;
+            let ctx = filing_context(s, &item, None, &stamp, &att)?;
             match model::store::declare_in_scoped(
                 s,
-                SESSION_ID,
+                stamp.column(),
                 LINEAGE_ID,
                 ACTOR,
                 &item,
                 root.as_deref().map(|p| p.as_path()),
-                scope.as_ref(),
+                ctx.as_ref(),
                 record.as_ref(),
+                Some(&att),
             ) {
                 Ok(event) => {
                     let files = registered_root(s, &item);
@@ -2214,7 +2389,7 @@ impl ThorMcpServer {
                             item.id,
                             item.kind,
                             event.seq,
-                            evaluation_receipt(s, &item, scope.as_ref())
+                            evaluation_receipt(s, &item, ctx.as_ref(), event.seq)
                         ),
                         &item,
                         None,
@@ -2230,7 +2405,7 @@ impl ThorMcpServer {
     }
 
     #[tool(description = "Code lane: corrects an EXISTING item by id through the same write gate as remember; a field left unmentioned keeps its current value, and none may silently vanish - clear one with clear_severity/clear_project/clear_expires/clear_key/clear_falsifier/clear_check; an empty string on the field is the harness-only equivalent, and a flag plus a real value for that field is refused. Weakening a checked rule (its check, severity, a binding, or scope) needs because: one sentence, kept in history. On a replica this queues instead of writing ('queued for the main machine' is not an error). Prefer this over remember for an existing item that merely changed; retract, with its own reason, is for one that is simply wrong. Refuses, with the exact reason, on remember's grounds, plus a dropped field or an unexplained weakening. A revise that changes its text, anchors, check, project or severity is tried again (a revise naming only the id tries a rule no trial has decided yet); one that changes only tags, falsifier, expires or key keeps its verdict. Replies with the revised id and event sequence, or the refusal text.", annotations(title = "Revise an item", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false))]
-    async fn revise(&self, Parameters(args): Parameters<ReviseArgs>) -> String {
+    async fn revise(&self, meta: Meta, raw: RawArgs, Parameters(args): Parameters<ReviseArgs>) -> String {
         if self.inbox.is_some() {
             let judged = {
                 let store = self.store.lock().unwrap_or_else(|p| p.into_inner());
@@ -2243,26 +2418,43 @@ impl ThorMcpServer {
         if let Some(queued) = self.capture("revise", &args) {
             return queued;
         }
+        let stamp = self.stamp("revise", meta, raw);
         // The checkout this server was started in, for the worktree check and
         // a new collection's own marker. Cloned out here because the closure
         // below cannot borrow self.
         let revise_root = self.root.clone();
         let revise_library = self.library.clone();
         let revise_worktree = self.worktree.clone();
-        let revise_handover_db = self.handover_db.clone();
         let corpus = self.corpus.clone();
         let session = self.session.clone();
         self.blocking(move |s| {
-            let existing = model::store::show(s, &args.id).map_err(|e| format!("cannot revise: {e}"))?;
-            // Checked first and only against a NEW tags list the caller
+            // Checked first: the id (THOR's own start records are never a
+            // writer's to change), and only a NEW tags list the caller
             // actually supplies (an omitted `tags` carries `existing.tags`
             // forward, which may carry THOR's own label - that is not a
             // forgery, it is the label surviving a revise that never
             // mentioned tags at all).
-            if let Some(new_tags) = args.tags.as_deref() {
-                refuse_a_forged_teeth_tag(new_tags)?;
-            }
+            refuse_a_forged_teeth_tag(&args.id, args.tags.as_deref().unwrap_or(&[]))?;
+            let existing = model::store::show(s, &args.id).map_err(|e| format!("cannot revise: {e}"))?;
+            // An open-point tag this call would ADD (step 14): refused, with
+            // the way on. One the item already carries is left alone.
+            refuse_an_open_point_tag(args.tags.as_deref().unwrap_or(&[]), Some(&existing))?;
+            // A side-door call on an item an open evaluation froze: refused
+            // before anything is tried or written (step 15, D10).
+            let att = stamp.att();
+            refuse_a_side_door_on_a_frozen_item(s, &args.id, &att)?;
             let RevisePlan { mut updated, mut gate_existing, tags_cleared, bare } = plan_revise(&existing, &args)?;
+            // A filed evaluation report keeps THOR's machine section (step
+            // 15): a `text` that carries no section header is the writer's
+            // own new TLDR and remarks, stored below the section as it
+            // stands. A text that touches the section is refused by the gate.
+            if args.text.is_some() && model::gate::is_evaluation_report(&existing) {
+                if let Some(block) = model::gate::machine_block(&existing.text) {
+                    if !model::gate::names_a_section_header(&updated.text) {
+                        updated.text = format!("{block}{}", updated.text);
+                    }
+                }
+            }
             // THOR's own `teeth:` label is never the writer's: an omitted
             // `tags` carries the head's label forward, and the trial replaces
             // it (or keeps the head's when it runs none) - so the write is
@@ -2318,19 +2510,20 @@ impl ThorMcpServer {
             gate_existing.tags.retain(|t| !t.starts_with(model::store::TEETH_TAG_PREFIX));
             let because = args.because.clone().or(trial_because);
             let weakenings = model::gate::weakenings_widened(&normalized_item(&existing), &normalized_item(&written));
-            let scope = evaluation_scope(&written, revise_handover_db.as_deref().map(|p| p.as_path()));
+            let ctx = filing_context(s, &written, Some(&existing), &stamp, &att)?;
             match model::store::revise_tried_scoped(
                 s,
-                SESSION_ID,
+                stamp.column(),
                 LINEAGE_ID,
                 ACTOR,
                 &gate_existing,
                 &written,
                 &existing,
                 because.as_deref(),
-                scope.as_ref(),
+                ctx.as_ref(),
                 record.as_ref(),
                 None,
+                Some(&att),
             ) {
                 Ok(event) => {
                     // A deliberate clear is the one revise outcome that is
@@ -2357,6 +2550,9 @@ impl ThorMcpServer {
                             success.push_str(&format!("; because: {reason}"));
                         }
                     }
+                    // A revise that FILED an evaluation report: the same
+                    // receipt a remember gives.
+                    success.push_str(&evaluation_receipt(s, &written, ctx.as_ref(), event.seq));
                     let files = registered_root(s, &written);
                     Ok(with_warnings(success, &written, Some(&existing), files.as_deref(), Some(s), notes))
                 }
@@ -2379,10 +2575,11 @@ impl ThorMcpServer {
     /// and both are tried like any revise: the binding is the rule's reach
     /// (`write_binding_change`).
     #[tool(description = "Code lane: adds the Always binding to an existing item, so it is served in full at every session start; every other binding and field stays untouched. A pinned item owes no verdict from that point on - mark refuses it and points back here to unpin. Use revise instead when anything besides the binding needs to change. Idempotent - pinning an already-pinned item changes nothing and is not an error. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refused, loudly, when the item's kind may carry no binding at all (a Report or Chunk). Replies 'pinned' with the event sequence, 'already pinned', or the refusal text.", annotations(title = "Pin an item", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
-    async fn pin(&self, Parameters(args): Parameters<PinArgs>) -> String {
+    async fn pin(&self, meta: Meta, raw: RawArgs, Parameters(args): Parameters<PinArgs>) -> String {
         if let Some(queued) = self.capture("pin", &args) {
             return queued;
         }
+        let stamp = self.stamp("pin", meta, raw);
         let corpus = self.corpus.clone();
         let session = self.session.clone();
         self.blocking(move |s| {
@@ -2392,16 +2589,17 @@ impl ThorMcpServer {
             }
             let mut updated = existing.clone();
             updated.bindings.push(Binding::Always);
-            write_binding_change(s, &corpus, &session, &existing, &updated, None, "pinned")
+            write_binding_change(s, &corpus, &session, &existing, &updated, None, "pinned", &stamp)
         })
         .await
     }
 
     #[tool(description = "Code lane: removes the Always binding from an existing item; every other binding and field stays untouched. Use revise instead when anything besides the binding needs to change. Idempotent - unpinning an item with no Always binding changes nothing and is not an error. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refused, loudly, when removing Always would leave the item with no binding left to ever fire on - give it a Moment or Target binding first, or leave it pinned. Replies 'unpinned' with the event sequence, 'already unpinned', or the refusal text.", annotations(title = "Unpin an item", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
-    async fn unpin(&self, Parameters(args): Parameters<UnpinArgs>) -> String {
+    async fn unpin(&self, meta: Meta, raw: RawArgs, Parameters(args): Parameters<UnpinArgs>) -> String {
         if let Some(queued) = self.capture("unpin", &args) {
             return queued;
         }
+        let stamp = self.stamp("unpin", meta, raw);
         let corpus = self.corpus.clone();
         let session = self.session.clone();
         self.blocking(move |s| {
@@ -2421,7 +2619,7 @@ impl ThorMcpServer {
             }
             let mut updated = existing.clone();
             updated.bindings = remaining;
-            write_binding_change(s, &corpus, &session, &existing, &updated, Some(UNPIN_BECAUSE), "unpinned")
+            write_binding_change(s, &corpus, &session, &existing, &updated, Some(UNPIN_BECAUSE), "unpinned", &stamp)
         })
         .await
     }
@@ -2717,8 +2915,8 @@ impl ThorMcpServer {
         }
     }
 
-    #[tool(description = "Code lane: judges an item you were served or looked up. Default records that it HELPED, which clears noise recorded before it (a later noise mark still counts - the newest verdict wins). Pass noise:true for the opposite; two noise marks since the last useful one retire the item from the injection surfaces, though it stays fully findable via lookup. A second call THIS SESSION for the same id with the same verdict writes nothing and says so, unless the item fired 40 more times since, in which case it is owed again and written; a different verdict is written and the earlier one is named in the reply. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refused when the item is not live (retracted or archived) - there is nothing to judge. Also refused, with nothing written, when the item is pinned (Always-bound): the owner already answered by pinning it, so a verdict changes nothing - unpin it first if it should be judged instead. Replies with the verdict recorded, or the refusal text.", annotations(title = "Record a verdict", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false))]
-    async fn mark(&self, Parameters(args): Parameters<MarkArgs>) -> String {
+    #[tool(description = "Code lane: judges an item you were served or looked up. Default records that it HELPED, which clears noise recorded before it (a later noise mark still counts - the newest verdict wins). Pass noise:true for the opposite; two noise marks since the last useful one retire the item from the injection surfaces, though it stays fully findable via lookup. A second call THIS SESSION for the same id with the same verdict writes nothing and says so, unless the item fired 40 more times since, in which case it is owed again and written; a different verdict is written and the earlier one is named in the reply. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refused when the item is not live (retracted or archived) - there is nothing to judge. Also refused, with nothing written, when the item is pinned (Always-bound): the owner already answered by pinning it, so a verdict changes nothing - unpin it first if it should be judged instead. Replies with the verdict recorded and its event sequence, or the refusal text.", annotations(title = "Record a verdict", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false))]
+    async fn mark(&self, meta: Meta, raw: RawArgs, Parameters(args): Parameters<MarkArgs>) -> String {
         // A repeat of the SAME verdict on the SAME id, from THIS process, is
         // caught before anything else runs - before even a replica's own
         // queue - see `mark_history`'s own doc comment for why a process
@@ -2770,6 +2968,7 @@ impl ThorMcpServer {
                 None => queued,
             };
         }
+        let stamp = self.stamp("mark", meta, raw);
         let mark_history = self.mark_history.clone();
         let id_for_history = args.id.clone();
         let noise = args.noise;
@@ -2871,10 +3070,11 @@ impl ThorMcpServer {
                 ));
             }
             let now = serve::time::now_iso8601();
+            let att = stamp.att();
             let written = if noise {
-                serve::mark::record_noise(s, SESSION_ID, LINEAGE_ID, ACTOR, &now, &args.id)
+                serve::mark::record_noise(s, stamp.column(), LINEAGE_ID, ACTOR, &now, &args.id, Some(&att))
             } else {
-                serve::mark::record_useful(s, SESSION_ID, LINEAGE_ID, ACTOR, &now, &args.id)
+                serve::mark::record_useful(s, stamp.column(), LINEAGE_ID, ACTOR, &now, &args.id, Some(&att))
             };
             match written {
                 Ok(event) => {
@@ -2914,7 +3114,9 @@ impl ThorMcpServer {
                             ));
                         }
                     }
-                    Ok(format!("{owed_again_note}{reply}"))
+                    // Named last, the way every write tool's reply names it:
+                    // the Stop reads it back to tie this call to its event.
+                    Ok(format!("{owed_again_note}{reply} (event seq {})", event.seq))
                 }
                 Err(e) => Err(format!("could not record the mark: {e}")),
             }
@@ -3002,36 +3204,55 @@ impl ThorMcpServer {
         .await
     }
 
-    #[tool(description = "Code lane: removes an item that is simply WRONG or no longer applies - it stops being live everywhere (session start, the moment of action, lookup), but nothing is deleted, and history still walks it. Use revise instead when the item merely changed. A reason is required; a blank one is refused. On a replica this queues instead of writing ('queued for the main machine' is not an error). Bringing the fact back later is a fresh remember, never a revise of the tombstone. Replies 'retracted <id> (<reason>)', or the refusal text.", annotations(title = "Retract an item", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false))]
-    async fn retract(&self, Parameters(args): Parameters<RetractArgs>) -> String {
+    #[tool(description = "Code lane: removes an item that is simply WRONG or no longer applies - it stops being live everywhere (session start, the moment of action, lookup), but nothing is deleted, and history still walks it. Use revise instead when the item merely changed. A reason is required; a blank one is refused. On a replica this queues instead of writing ('queued for the main machine' is not an error). Bringing the fact back later is a fresh remember, never a revise of the tombstone. Replies 'retracted <id> (<reason>) (event seq N)', or the refusal text.", annotations(title = "Retract an item", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false))]
+    async fn retract(&self, meta: Meta, raw: RawArgs, Parameters(args): Parameters<RetractArgs>) -> String {
+        // THOR's own open point (step 14) is never a writer's to close: it
+        // closes itself at the first evaluation start after its subject
+        // settles. Refused before anything is queued or written; the store's
+        // fence is the authority, this is the plain first message.
+        if model::store::is_machine_point_id(args.id.trim()) {
+            return format!(
+                "{}. Nothing was written. What clears it is in its own text (get shows it): for a project with no \
+                 registered working copy, the owner registers the folder; for a working tree that is mid-change, the \
+                 change is committed or dropped. The next evaluation start then closes the point by itself.",
+                model::store::MACHINE_POINT_REFUSAL
+            );
+        }
         if let Some(queued) = self.capture("retract", &args) {
             return queued;
         }
+        let stamp = self.stamp("retract", meta, raw);
         self.blocking(move |s| {
-            match model::store::retract(s, SESSION_ID, LINEAGE_ID, ACTOR, &args.id, &args.reason) {
-                Ok(_) => Ok(format!("retracted {} ({})", args.id, args.reason.trim())),
+            let att = stamp.att();
+            refuse_a_side_door_on_a_frozen_item(s, &args.id, &att)?;
+            match model::store::retract(s, stamp.column(), LINEAGE_ID, ACTOR, &args.id, &args.reason, Some(&att)) {
+                Ok(event) => Ok(format!("retracted {} ({}) (event seq {})", args.id, args.reason.trim(), event.seq)),
                 Err(e) => Err(format!("refused: {e}")),
             }
         })
         .await
     }
 
-    #[tool(description = "Code lane: settles an item with more than one current head - what get reports as DIVERGED, from two machines revising the same fact apart. Read history first; never guess which head is real. Name the surviving revision hash in keep and every other current head in discard - leaving one out fails rather than silently discarding it. On a replica this queues instead of writing ('queued for the main machine' is not an error). The head set is rechecked under the write lock, so a head that appears mid-decision fails the call loudly instead of being dropped. Replies 'resolved <id> onto <keep>', or the refusal text.", annotations(title = "Resolve a divergence", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false))]
-    async fn resolve(&self, Parameters(args): Parameters<ResolveArgs>) -> String {
+    #[tool(description = "Code lane: settles an item with more than one current head - what get reports as DIVERGED, from two machines revising the same fact apart. Read history first; never guess which head is real. Name the surviving revision hash in keep and every other current head in discard - leaving one out fails rather than silently discarding it. On a replica this queues instead of writing ('queued for the main machine' is not an error). The head set is rechecked under the write lock, so a head that appears mid-decision fails the call loudly instead of being dropped. Replies 'resolved <id> onto <keep> (event seq N)', or the refusal text.", annotations(title = "Resolve a divergence", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false))]
+    async fn resolve(&self, meta: Meta, raw: RawArgs, Parameters(args): Parameters<ResolveArgs>) -> String {
         if let Some(queued) = self.capture("resolve", &args) {
             return queued;
         }
+        let stamp = self.stamp("resolve", meta, raw);
         self.blocking(move |s| {
+            let att = stamp.att();
+            refuse_a_side_door_on_a_frozen_item(s, &args.id, &att)?;
             match model::store::resolve(
                 s,
-                SESSION_ID,
+                stamp.column(),
                 LINEAGE_ID,
                 ACTOR,
                 &args.id,
                 &args.keep,
                 &args.discard,
+                Some(&att),
             ) {
-                Ok(_) => Ok(format!("resolved {} onto {}", args.id, args.keep)),
+                Ok(event) => Ok(format!("resolved {} onto {} (event seq {})", args.id, args.keep, event.seq)),
                 Err(e) => Err(format!("could not resolve: {e}")),
             }
         })
@@ -3184,15 +3405,15 @@ impl ThorMcpServer {
         }
         let text = match op.tool.as_str() {
             "remember" => match serde_json::from_value::<RememberArgs>(op.args.clone()) {
-                Ok(args) => self.remember(Parameters(args)).await,
+                Ok(args) => self.remember(Meta::new(), RawArgs(op.args.clone()), Parameters(args)).await,
                 Err(e) => format!("arguments do not parse as a remember call: {e}"),
             },
             "revise" => match serde_json::from_value::<ReviseArgs>(op.args.clone()) {
-                Ok(args) => self.revise(Parameters(args)).await,
+                Ok(args) => self.revise(Meta::new(), RawArgs(op.args.clone()), Parameters(args)).await,
                 Err(e) => format!("arguments do not parse as a revise call: {e}"),
             },
             "retract" => match serde_json::from_value::<RetractArgs>(op.args.clone()) {
-                Ok(args) => self.retract(Parameters(args)).await,
+                Ok(args) => self.retract(Meta::new(), RawArgs(op.args.clone()), Parameters(args)).await,
                 Err(e) => format!("arguments do not parse as a retract call: {e}"),
             },
             // THE FOUR THAT LEAKED, wired 2026-08-17. Every one of these
@@ -3205,19 +3426,19 @@ impl ThorMcpServer {
             // of the four in practice: every session is nudged to judge what
             // it was served, so it is the write a remote agent makes most.
             "pin" => match serde_json::from_value::<PinArgs>(op.args.clone()) {
-                Ok(args) => self.pin(Parameters(args)).await,
+                Ok(args) => self.pin(Meta::new(), RawArgs(op.args.clone()), Parameters(args)).await,
                 Err(e) => format!("arguments do not parse as a pin call: {e}"),
             },
             "unpin" => match serde_json::from_value::<UnpinArgs>(op.args.clone()) {
-                Ok(args) => self.unpin(Parameters(args)).await,
+                Ok(args) => self.unpin(Meta::new(), RawArgs(op.args.clone()), Parameters(args)).await,
                 Err(e) => format!("arguments do not parse as an unpin call: {e}"),
             },
             "resolve" => match serde_json::from_value::<ResolveArgs>(op.args.clone()) {
-                Ok(args) => self.resolve(Parameters(args)).await,
+                Ok(args) => self.resolve(Meta::new(), RawArgs(op.args.clone()), Parameters(args)).await,
                 Err(e) => format!("arguments do not parse as a resolve call: {e}"),
             },
             "mark" => match serde_json::from_value::<MarkArgs>(op.args.clone()) {
-                Ok(args) => self.mark(Parameters(args)).await,
+                Ok(args) => self.mark(Meta::new(), RawArgs(op.args.clone()), Parameters(args)).await,
                 Err(e) => format!("arguments do not parse as a mark call: {e}"),
             },
             // The second lane travels the same road. One inbox, one owner:
@@ -3312,9 +3533,7 @@ pub fn run_in(db: &Path, code: Option<CodeIndexPaths>, root: Option<PathBuf>, wo
     // inbox to divert a filing into. There the two tools say plainly that no
     // library is configured, which is the truth, rather than writing a second
     // copy that could never be reconciled.
-    .with_library(library::default_path(db))
-    // The hook's evaluation handover lives beside the store.
-    .with_evaluation_handover(db.to_path_buf());
+    .with_library(library::default_path(db));
     // The session this server writes for (K20, K8(c)): Claude Code starts it
     // in the session's own project folder, so that folder's checkout and
     // project are the session's own, and its session id is in the
@@ -3633,7 +3852,7 @@ mod tests {
         let srv = server();
         let mut args = base_remember("no-falsifier-1");
         args.falsifier = None;
-        let reply = srv.remember(Parameters(args)).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.contains("REFUSED"), "expected a loud refusal, got: {reply}");
         assert!(reply.contains("falsifier"), "expected the reason to name the missing field: {reply}");
 
@@ -3652,7 +3871,7 @@ mod tests {
         let mut args = base_remember("heavy-orientation-no-check-1");
         args.kind = "orientation".to_string();
         args.tags = vec![];
-        let reply = srv.remember(Parameters(args)).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.starts_with("stored "), "{reply}");
         assert!(reply.contains("teeth: note - "), "{reply}");
         assert!(!reply.contains(model::store::NO_LITERAL_REASON_PREFIX), "no reason tag is asked for: {reply}");
@@ -3680,7 +3899,7 @@ mod tests {
         // heavy rule that loses its no-literal tag is refused for the teeth
         // question first, and the bindings message never gets a turn.
         args.severity = Some("house_style".to_string());
-        let stored = srv.remember(Parameters(args)).await;
+        let stored = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(stored.starts_with("stored"), "fixture setup must succeed: {stored}");
 
         let revise_args = ReviseArgs {
@@ -3718,7 +3937,7 @@ mod tests {
             may_change: vec![],
             accept_refusing: vec![],
         };
-        let reply = srv.revise(Parameters(revise_args)).await;
+        let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise_args)).await;
         assert!(reply.contains("REFUSED"), "expected a loud refusal, got: {reply}");
         assert!(reply.contains("binding"), "expected the reason to name the dropped field: {reply}");
 
@@ -3831,7 +4050,7 @@ mod tests {
     async fn stored(srv: &ThorMcpServer, id: &str, text: &str) {
         let mut args = base_remember(id);
         args.text = text.to_string();
-        let reply = srv.remember(Parameters(args)).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.starts_with("stored "), "{reply}");
     }
 
@@ -3845,7 +4064,7 @@ mod tests {
         let srv = server();
         stored(&srv, "app-1", "the changelog lives in CHANGELOG.md at the repo root").await;
         let reply = srv
-            .revise(Parameters(ReviseArgs {
+            .revise(Meta::new(), RawArgs::default(), Parameters(ReviseArgs {
                 id: "app-1".to_string(),
                 append: Some("and nowhere else".to_string()),
                 ..Default::default()
@@ -3859,7 +4078,7 @@ mod tests {
     async fn replace_patches_one_place_and_leaves_the_rest() {
         let srv = server();
         stored(&srv, "rep-1", "the changelog lives in CHANGELOG.md at the repo root").await;
-        srv.revise(Parameters(ReviseArgs {
+        srv.revise(Meta::new(), RawArgs::default(), Parameters(ReviseArgs {
             id: "rep-1".to_string(),
             replace_from: Some("the repo root".to_string()),
             replace_to: Some("docs/".to_string()),
@@ -3877,7 +4096,7 @@ mod tests {
         let srv = server();
         stored(&srv, "rep-2", "the changelog lives in CHANGELOG.md at the repo root").await;
         let reply = srv
-            .revise(Parameters(ReviseArgs {
+            .revise(Meta::new(), RawArgs::default(), Parameters(ReviseArgs {
                 id: "rep-2".to_string(),
                 replace_from: Some("never written".to_string()),
                 replace_to: Some("x".to_string()),
@@ -3898,7 +4117,7 @@ mod tests {
         let srv = server();
         stored(&srv, "rep-3", "the changelog lives in CHANGELOG.md at the repo root").await;
         let reply = srv
-            .revise(Parameters(ReviseArgs {
+            .revise(Meta::new(), RawArgs::default(), Parameters(ReviseArgs {
                 id: "rep-3".to_string(),
                 text: Some("a whole new body that says something else entirely".to_string()),
                 append: Some("and more".to_string()),
@@ -3913,7 +4132,7 @@ mod tests {
         let srv = server();
         stored(&srv, "rep-4", "the changelog lives in CHANGELOG.md at the repo root").await;
         let reply = srv
-            .revise(Parameters(ReviseArgs {
+            .revise(Meta::new(), RawArgs::default(), Parameters(ReviseArgs {
                 id: "rep-4".to_string(),
                 replace_from: Some("CHANGELOG.md".to_string()),
                 ..Default::default()
@@ -3930,7 +4149,7 @@ mod tests {
         let srv = server();
         stored(&srv, "rep-5", "the changelog lives in CHANGELOG.md at the repo root").await;
         let reply = srv
-            .revise(Parameters(ReviseArgs {
+            .revise(Meta::new(), RawArgs::default(), Parameters(ReviseArgs {
                 id: "rep-5".to_string(),
                 append: Some("x".repeat(400)),
                 ..Default::default()
@@ -3964,7 +4183,7 @@ mod tests {
         args.check_kind = Some("forbidden".to_string());
         args.check_literals = vec!["INSERT".to_string()];
 
-        let reply = srv.remember(Parameters(args)).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.starts_with("stored "), "the success prefix must survive: {reply}");
         assert!(reply.contains("note:"), "the warning must actually reach the caller: {reply}");
         assert!(!reply.contains("REFUSED"), "a warning must never read as a refusal: {reply}");
@@ -3980,7 +4199,7 @@ mod tests {
         let srv = server();
         let mut args = base_remember("clean-item");
         args.severity = Some("house_style".to_string());
-        let reply = srv.remember(Parameters(args)).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.starts_with("stored "), "{reply}");
         let notes: Vec<&str> = reply.lines().filter(|l| l.contains("note:")).collect();
         assert_eq!(notes.len(), 1, "one note, the trial receipt: {reply}");
@@ -3994,7 +4213,7 @@ mod tests {
     #[tokio::test]
     async fn a_heavy_checkless_write_with_nothing_to_build_from_is_stored_as_a_note() {
         let srv = server();
-        let reply = srv.remember(Parameters(base_remember("heavy-checkless"))).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(base_remember("heavy-checkless"))).await;
         assert!(reply.starts_with("stored "), "{reply}");
         assert!(
             reply.contains("teeth: note - nothing in the text or anchors to build a tooth from (no flag, quoted call, backtick span or path)"),
@@ -4020,7 +4239,7 @@ mod tests {
         args.check_kind = Some("contains".to_string());
         args.check_path = Some("README.md".to_string());
         args.check_literal = Some("TODO".to_string());
-        let reply = srv.remember(Parameters(args)).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.starts_with("stored "), "{reply}");
         assert!(
             reply.contains(
@@ -4075,7 +4294,7 @@ mod tests {
         let srv = server();
         let mut args = base_remember("forged-1");
         args.tags = vec![model::store::TEETH_PROVEN_TAG.to_string()];
-        let reply = srv.remember(Parameters(args)).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.contains("invalid 'tags'"), "{reply}");
         assert!(reply.contains(model::store::TEETH_TAG_PREFIX), "{reply}");
 
@@ -4086,12 +4305,130 @@ mod tests {
     #[tokio::test]
     async fn revise_refuses_a_caller_supplied_teeth_tag_and_changes_nothing() {
         let srv = server();
-        srv.remember(Parameters(base_remember("forged-2"))).await;
+        srv.remember(Meta::new(), RawArgs::default(), Parameters(base_remember("forged-2"))).await;
         let mut args = bare_revise("forged-2");
         args.tags = Some(vec![model::store::TEETH_INFORMING_TAG.to_string()]);
-        let reply = srv.revise(Parameters(args)).await;
+        let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.contains("invalid 'tags'"), "{reply}");
         assert!(reply.contains(model::store::TEETH_TAG_PREFIX), "{reply}");
+    }
+
+    /// Step 13: an evaluation start record is THOR's own. A remember on an
+    /// id beginning with 'evaluation-start-', or carrying its tag, is refused
+    /// with the way on, and writes nothing.
+    #[tokio::test]
+    async fn remember_with_an_evaluation_start_id_is_refused_and_writes_nothing() {
+        let srv = server();
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(base_remember("evaluation-start-x"))).await;
+        assert!(reply.contains("invalid 'id'"), "{reply}");
+        assert!(reply.contains("Give your own item an id that does not begin with 'evaluation-start-'"), "{reply}");
+
+        let mut args = base_remember("a-start-of-my-own");
+        args.tags = vec![model::store::EVALUATION_START_TAG.to_string()];
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
+        assert!(reply.contains("invalid 'tags'") && reply.contains("Drop 'evaluation-start' from the tags"), "{reply}");
+
+        let events = srv.store.lock().unwrap().get_all_events().unwrap();
+        assert!(events.is_empty(), "a refused remember must write nothing at all, found: {events:?}");
+    }
+
+    /// R14.4 (step 14): open points are written and closed by THOR itself. A
+    /// remember carrying the tag `open-point` - or an `about:` or `blocker:`
+    /// tag - is refused with the way on, and writes nothing; so is a revise
+    /// that would put one on an existing item. A legacy open point already in
+    /// the store can still be corrected and retracted.
+    #[tokio::test]
+    async fn remember_with_the_open_point_tag_is_refused() {
+        let srv = server();
+        for tag in ["open-point", "about:fx-heavy-02", "blocker:no-working-copy"] {
+            let mut args = base_remember("open-fx-heavy-02");
+            args.tags = vec![tag.to_string()];
+            let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
+            assert!(
+                reply.starts_with("REFUSED: open points are written and closed by THOR itself; settle the rule instead - the start note says how"),
+                "{tag}: {reply}"
+            );
+            assert!(reply.contains("mcp__thor__revise with only the rule's id"), "the way on is one the agent can run: {reply}");
+        }
+        let events = srv.store.lock().unwrap().get_all_events().unwrap();
+        assert!(events.is_empty(), "a refused remember must write nothing at all, found: {events:?}");
+
+        srv.remember(Meta::new(), RawArgs::default(), Parameters(base_remember("plain-item"))).await;
+        let mut args = bare_revise("plain-item");
+        args.tags = Some(vec!["open-point".to_string()]);
+        let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(args)).await;
+        assert!(reply.starts_with("REFUSED: open points are written and closed by THOR itself"), "{reply}");
+        let tags = model::store::show(&srv.store.lock().unwrap(), "plain-item").unwrap().tags;
+        assert!(!tags.contains(&"open-point".to_string()), "nothing changed: {tags:?}");
+
+        // A legacy point (what an agent filed before this build), written raw:
+        // a revise that keeps the tag it already has is not adding one.
+        {
+            let mut store = srv.store.lock().unwrap();
+            let legacy = Item {
+                id: "open-legacy-1".to_string(),
+                kind: Kind::Report,
+                text: "fx-heavy-02 still needs a real call, later.".to_string(),
+                bindings: vec![],
+                severity: None,
+                project: Some("demo".to_string()),
+                tags: vec!["open-point".to_string()],
+                expires: None,
+                key: None,
+                falsifier: None,
+                check: None,
+            };
+            let body = model::store::canonical_body(&legacy).unwrap();
+            store.append_event("s", "l", "mcp", thor_core::event_store::EventKind::FactCreated, &legacy.id, None, &body).unwrap();
+        }
+        let mut args = bare_revise("open-legacy-1");
+        args.tags = Some(vec!["open-point".to_string(), "carried:1".to_string()]);
+        let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(args)).await;
+        assert!(reply.starts_with("revised 'open-legacy-1'"), "{reply}");
+        let reply = srv
+            .retract(
+                Meta::new(),
+                RawArgs::default(),
+                Parameters(RetractArgs { id: "open-legacy-1".to_string(), reason: "resolved: the rule has its verdict now".to_string() }),
+            )
+            .await;
+        assert!(reply.starts_with("retracted open-legacy-1"), "a legacy point is still closed by a retraction: {reply}");
+    }
+
+    /// R14.6 (step 14): THOR's own open point closes itself; a retract of it
+    /// is refused and writes nothing - and so is a remember or a revise on
+    /// its id.
+    #[tokio::test]
+    async fn retract_of_a_machine_point_is_refused() {
+        let srv = server();
+        let before = srv.store.lock().unwrap().get_all_events().unwrap().len();
+        let retract = |id: &str| RetractArgs { id: id.to_string(), reason: "the project is registered now, closing it by hand".to_string() };
+        for id in ["open-no-working-copy-fxp", "open-working-tree-differs-fxp-notes-md"] {
+            let reply = srv.retract(Meta::new(), RawArgs::default(), Parameters(retract(id))).await;
+            assert!(
+                reply.starts_with("REFUSED: this open point is THOR's own; it closes itself when its subject settles"),
+                "{id}: {reply}"
+            );
+        }
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(base_remember("open-no-working-copy-fxp"))).await;
+        assert!(reply.starts_with("REFUSED: this open point is THOR's own"), "{reply}");
+        let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(bare_revise("open-no-working-copy-fxp"))).await;
+        assert!(reply.starts_with("REFUSED: this open point is THOR's own"), "{reply}");
+        assert_eq!(srv.store.lock().unwrap().get_all_events().unwrap().len(), before, "nothing written");
+    }
+
+    /// The same for a revise that would put the start tag on an existing item.
+    #[tokio::test]
+    async fn revise_onto_the_evaluation_start_tag_is_refused() {
+        let srv = server();
+        srv.remember(Meta::new(), RawArgs::default(), Parameters(base_remember("plain-item"))).await;
+        let mut args = bare_revise("plain-item");
+        args.tags = Some(vec![model::store::EVALUATION_START_TAG.to_string()]);
+        let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(args)).await;
+        assert!(reply.contains("invalid 'tags'") && reply.contains("only THOR writes it"), "{reply}");
+        // And a revise of a start record itself, whatever it names.
+        let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(bare_revise("evaluation-start-demo-7"))).await;
+        assert!(reply.contains("invalid 'id'") && reply.contains("nothing else may change it"), "{reply}");
     }
 
     /// THE PRIMARY CLAIM: a fact whose check bites through THOR's own trial
@@ -4123,7 +4460,7 @@ mod tests {
             targets: vec![TargetArg { kind: "command".to_string(), value: "git push".to_string() }],
             always: false,
         };
-        let reply = srv.remember(Parameters(args)).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.starts_with("stored "), "{reply}");
         assert!(reply.contains("teeth: wired, not proven"), "{reply}");
         assert!(!reply.contains("teeth: proven guard"), "{reply}");
@@ -4181,7 +4518,7 @@ mod tests {
             targets: vec![TargetArg { kind: "command".to_string(), value: "git push".to_string() }],
             always: false,
         };
-        let reply = srv.remember(Parameters(args)).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.contains("teeth: wired, not proven"), "a refusal from before the check vouches for nothing: {reply}");
         {
             let mut s = srv.store.lock().unwrap();
@@ -4198,7 +4535,7 @@ mod tests {
         }
         let mut args = bare_revise("real-1");
         args.text = Some("never force-push with --force, on any branch".to_string());
-        let reply = srv.revise(Parameters(args)).await;
+        let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.contains("teeth: proven guard") && reply.contains("git push --force origin main"), "{reply}");
         assert_eq!(model::store::current_verdict(&srv.store.lock().unwrap(), "real-1"), model::store::CurrentVerdict::RuleProven);
     }
@@ -4232,7 +4569,7 @@ mod tests {
             targets: vec![TargetArg { kind: "command".to_string(), value: "git push --force".to_string() }],
             always: false,
         };
-        let reply = srv.remember(Parameters(args)).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.starts_with("stored "), "{reply}");
         assert!(reply.contains("teeth: wired, not proven - a whole-command ban: refuses 'git push --force x'"), "{reply}");
         assert!(reply.contains("'echo git push --force'") && reply.contains("'git --version'") && reply.contains("'git push'"), "{reply}");
@@ -4277,7 +4614,7 @@ mod tests {
         };
         args.project = Some("p".to_string());
         args.targets = vec![TargetArg { kind: "path".to_string(), value: "some/file.rs".to_string() }];
-        let reply = srv.remember(Parameters(args)).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.starts_with("stored "), "{reply}");
         assert!(reply.contains("teeth: note - your check (forbidden '--force') was not stored: nothing could be tried"), "{reply}");
         let item: Item = serde_json::from_str(&srv.get(Parameters(GetArgs { id: "unreachable-1".to_string() })).await).unwrap();
@@ -4290,7 +4627,7 @@ mod tests {
     #[tokio::test]
     async fn revise_that_changes_only_text_reruns_the_trial_and_never_carries_the_old_label() {
         let srv = server();
-        let reply = srv.remember(Parameters(RememberArgs {
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(RememberArgs {
             new_collection_named_by_owner: None,
             legitimate_calls: vec![],
             may_change: vec![],
@@ -4317,7 +4654,7 @@ mod tests {
 
         let mut args = bare_revise("stable-1");
         args.text = Some("never force-push with --force, not even on a branch".to_string());
-        let reply = srv.revise(Parameters(args)).await;
+        let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
         assert!(reply.contains("teeth: wired, not proven"), "the text change was tried again: {reply}");
         assert!(!reply.contains("teeth unchanged"), "{reply}");
@@ -4354,14 +4691,14 @@ mod tests {
             always: false,
         };
         args.tags = vec!["gotcha".to_string()];
-        assert!(srv.remember(Parameters(args)).await.starts_with("stored "));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await.starts_with("stored "));
         let before_item: Item =
             serde_json::from_str(&srv.get(Parameters(GetArgs { id: "stable-checked-1".to_string() })).await).unwrap();
         assert_eq!(before_item.tags, vec!["gotcha".to_string(), model::store::TEETH_WIRED_TAG.to_string()], "fixture sanity");
 
         let mut args = bare_revise("stable-checked-1");
         args.tags = Some(vec![]); // an explicit clear, never a caller-supplied teeth tag
-        let reply = srv.revise(Parameters(args)).await;
+        let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
         assert!(reply.contains("tags cleared"), "{reply}");
         assert!(reply.contains("teeth unchanged: the trial at log seq"), "{reply}");
@@ -4382,14 +4719,19 @@ mod tests {
     /// under the check, filed.
     #[tokio::test]
     async fn a_bare_revise_of_an_undecided_heavy_rule_runs_the_trial_and_its_verdict_settles_filing() {
-        let srv = server_knowing(&["test-project"]);
+        // The session this server writes for: a filing needs one (step 15).
+        // Not UUID-shaped, so no transcript is ever looked for.
+        const EVALUATOR: &str = "lib-evaluator";
+        let srv = server_knowing(&["test-project"])
+            .with_session(serve::teeth::SessionCtx { session_id: Some(EVALUATOR.to_string()), ..Default::default() });
+        let transcripts = tempfile::tempdir().unwrap();
         {
             let mut s = srv.store.lock().unwrap();
             let mut previous = model::store::show(&s, "seed-test-project").unwrap();
             previous.id = "eval-previous".to_string();
             previous.text = "the previous evaluation of test-project".to_string();
             previous.tags = vec![model::store::EVALUATION_REPORT_TAG.to_string()];
-            model::store::declare(&mut s, "seed", "seed", "owner", &previous).unwrap();
+            serve::attest::fixture::attested_filing(&mut s, transcripts.path(), "seed", &previous, "toolu_previous").unwrap();
         }
         // Written straight into the log, the way every rule stored before the
         // trial existed got there: no record, no label.
@@ -4435,12 +4777,20 @@ mod tests {
                 "git push --force origin main",
             );
         }
-        let refused = srv.remember(Parameters(report("eval-new"))).await;
+        // The evaluation starts, and hands the undecided rule to the agent.
+        serve::attest::fixture::live_batch_start(&mut srv.store.lock().unwrap(), EVALUATOR, "test-project");
+        // A call Claude Code makes: its `_meta` names the tool call.
+        let called = |id: &str| {
+            let mut meta = Meta::new();
+            meta.0.insert(serve::attest::META_TOOL_USE_ID.to_string(), serde_json::json!(id));
+            meta
+        };
+        let refused = srv.remember(called("toolu_file1"), RawArgs::default(), Parameters(report("eval-new"))).await;
         assert!(refused.contains("REFUSED") && refused.contains("legacy-guard"), "{refused}");
         assert!(refused.contains("retest --id 'legacy-guard'"), "the way on is named: {refused}");
         assert!(refused.contains("mcp__thor__revise with only the rule's id"), "{refused}");
 
-        let reply = srv.revise(Parameters(bare_revise("legacy-guard"))).await;
+        let reply = srv.revise(called("toolu_revise1"), RawArgs::default(), Parameters(bare_revise("legacy-guard"))).await;
         assert!(reply.starts_with("revised"), "{reply}");
         assert!(reply.contains("teeth: proven"), "a bare revise of an undecided rule runs the trial, and the refusal proves it: {reply}");
         assert_eq!(
@@ -4448,10 +4798,19 @@ mod tests {
             model::store::CurrentVerdict::RuleProven
         );
         // A second bare revise runs nothing: the record still matches.
-        let again = srv.revise(Parameters(bare_revise("legacy-guard"))).await;
+        let again = srv.revise(called("toolu_revise2"), RawArgs::default(), Parameters(bare_revise("legacy-guard"))).await;
         assert!(again.contains("teeth unchanged: the trial at log seq"), "{again}");
-        let filed = srv.remember(Parameters(report("eval-new"))).await;
+        // Those revises are this turn's own: checked when the turn ends.
+        let waiting = srv.remember(called("toolu_file2"), RawArgs::default(), Parameters(report("eval-new"))).await;
+        assert!(waiting.contains(model::store::TURN_NOT_ENDED), "{waiting}");
+        // The turn ends: the Stop records both calls as attested.
+        assert_eq!(serve::attest::fixture::attest_every_write(&mut srv.store.lock().unwrap(), EVALUATOR), 2);
+        let filed = srv.remember(called("toolu_file3"), RawArgs::default(), Parameters(report("eval-new"))).await;
         assert!(filed.starts_with("stored "), "the trial's verdict settles it, so filing goes through: {filed}");
+        assert!(filed.contains("teeth: 1 rule(s) on the frozen batch and A4 list, all settled."), "{filed}");
+        // A side door files nothing, whatever is settled.
+        let side = srv.remember(Meta::new(), RawArgs::default(), Parameters(report("eval-newer"))).await;
+        assert!(side.contains("not coming through a THOR tool call") && side.contains("no toolUseId in the call's _meta"), "{side}");
     }
     /// Severity is part of what a trial tries (its fingerprint), so a revise
     /// that changes ONLY the severity runs the trial again - lowering it is no
@@ -4461,13 +4820,13 @@ mod tests {
         let srv = server();
         let mut args = base_remember("raised-1");
         args.severity = Some("house_style".to_string());
-        let stored = srv.remember(Parameters(args)).await;
+        let stored = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(stored.starts_with("stored ") && stored.contains("teeth: note - "), "{stored}");
         let first = model::store::history(&srv.store.lock().unwrap(), "raised-1").unwrap().len();
 
         let mut raise = bare_revise("raised-1");
         raise.severity = Some("irreversible".to_string());
-        let reply = srv.revise(Parameters(raise)).await;
+        let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(raise)).await;
         assert!(reply.starts_with("revised"), "{reply}");
         assert!(reply.contains("teeth: note - "), "a severity change runs the trial: {reply}");
         assert!(!reply.contains("teeth unchanged"), "{reply}");
@@ -4479,7 +4838,7 @@ mod tests {
     #[tokio::test]
     async fn remember_then_get_round_trips() {
         let srv = server();
-        let reply = srv.remember(Parameters(base_remember("round-trip-1"))).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(base_remember("round-trip-1"))).await;
         assert!(reply.contains("stored 'round-trip-1'"), "{reply}");
 
         let get_reply = srv.get(Parameters(GetArgs { id: "round-trip-1".to_string() })).await;
@@ -4502,7 +4861,7 @@ mod tests {
     #[tokio::test]
     async fn revise_updates_text_and_keeps_untouched_fields() {
         let srv = server();
-        srv.remember(Parameters(base_remember("revise-1"))).await;
+        srv.remember(Meta::new(), RawArgs::default(), Parameters(base_remember("revise-1"))).await;
 
         let revise_args = ReviseArgs {
             because: None,
@@ -4535,7 +4894,7 @@ mod tests {
             may_change: vec![],
             accept_refusing: vec![],
         };
-        let reply = srv.revise(Parameters(revise_args)).await;
+        let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
 
         let get_reply = srv.get(Parameters(GetArgs { id: "revise-1".to_string() })).await;
@@ -4564,7 +4923,7 @@ mod tests {
         args.project = Some("docs-fixture".to_string());
         args.always = false;
         args.targets = vec![TargetArg { kind: "path".to_string(), value: "CHANGELOG.md".to_string() }];
-        let reply = srv.remember(Parameters(args)).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.starts_with("stored"), "{reply}");
 
         let get_reply = srv.get(Parameters(GetArgs { id: "check-pathexists-1".to_string() })).await;
@@ -4584,7 +4943,7 @@ mod tests {
         args.project = Some("docs-fixture".to_string());
         args.always = false;
         args.targets = vec![TargetArg { kind: "path".to_string(), value: "LICENSE.md".to_string() }];
-        let reply = srv.remember(Parameters(args)).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.starts_with("stored"), "{reply}");
 
         let get_reply = srv.get(Parameters(GetArgs { id: "check-contains-1".to_string() })).await;
@@ -4608,7 +4967,7 @@ mod tests {
         args.project = Some("docs-fixture".to_string());
         args.always = false;
         args.targets = vec![TargetArg { kind: "path".to_string(), value: "config/app.toml".to_string() }];
-        let reply = srv.remember(Parameters(args)).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.starts_with("stored"), "{reply}");
 
         let get_reply = srv.get(Parameters(GetArgs { id: "check-absent-1".to_string() })).await;
@@ -4625,7 +4984,7 @@ mod tests {
         let mut args = base_remember("check-refuse-1");
         args.text = "a rule that names a check kind but no path at all".to_string();
         args.check_kind = Some("path_exists".to_string());
-        let reply = srv.remember(Parameters(args)).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.contains("check_path"), "expected the reason to name the missing field: {reply}");
         assert!(srv.store.lock().unwrap().get_all_events().unwrap().is_empty(), "a refused remember must write nothing");
     }
@@ -4637,7 +4996,7 @@ mod tests {
         args.text = "a rule that names contains but gives no literal to find".to_string();
         args.check_kind = Some("contains".to_string());
         args.check_path = Some("README.md".to_string());
-        let reply = srv.remember(Parameters(args)).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.contains("check_literal"), "expected the reason to name the missing field: {reply}");
         assert!(srv.store.lock().unwrap().get_all_events().unwrap().is_empty(), "a refused remember must write nothing");
     }
@@ -4649,7 +5008,7 @@ mod tests {
         args.text = "a rule that names absent but gives no literal to forbid".to_string();
         args.check_kind = Some("absent".to_string());
         args.check_path = Some("README.md".to_string());
-        let reply = srv.remember(Parameters(args)).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.contains("check_literal"), "expected the reason to name the missing field: {reply}");
         assert!(srv.store.lock().unwrap().get_all_events().unwrap().is_empty(), "a refused remember must write nothing");
     }
@@ -4662,7 +5021,7 @@ mod tests {
         args.check_kind = Some("path_exists".to_string());
         args.check_path = Some("README.md".to_string());
         args.check_literal = Some("GPLv3".to_string());
-        let reply = srv.remember(Parameters(args)).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.contains("check_literal"), "expected the reason to name the conflicting field: {reply}");
         assert!(reply.contains("path_exists"), "{reply}");
         assert!(srv.store.lock().unwrap().get_all_events().unwrap().is_empty(), "a refused remember must write nothing");
@@ -4674,7 +5033,7 @@ mod tests {
         let mut args = base_remember("check-refuse-5");
         args.text = "a rule that names a check path but no check kind at all".to_string();
         args.check_path = Some("README.md".to_string());
-        let reply = srv.remember(Parameters(args)).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.contains("check_kind"), "expected the reason to name the missing field: {reply}");
         assert!(srv.store.lock().unwrap().get_all_events().unwrap().is_empty(), "a refused remember must write nothing");
     }
@@ -4686,7 +5045,7 @@ mod tests {
         args.text = "a rule that misspells its own check kind".to_string();
         args.check_kind = Some("bogus".to_string());
         args.check_path = Some("README.md".to_string());
-        let reply = srv.remember(Parameters(args)).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.contains("bogus"), "expected the reason to name the bad value: {reply}");
         assert!(srv.store.lock().unwrap().get_all_events().unwrap().is_empty(), "a refused remember must write nothing");
     }
@@ -4696,7 +5055,7 @@ mod tests {
         let srv = server();
         let mut args = base_remember("check-keep-1");
         args = RememberArgs { id: args.id.clone(), ..roadmap_rule(&args.id) };
-        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
             because: Some("lowering severity to prove an unrelated field change still lands".to_string()),
@@ -4729,7 +5088,7 @@ mod tests {
             may_change: vec![],
             accept_refusing: vec![],
         };
-        let reply = srv.revise(Parameters(revise_args)).await;
+        let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
 
         let get_reply = srv.get(Parameters(GetArgs { id: "check-keep-1".to_string() })).await;
@@ -4747,7 +5106,7 @@ mod tests {
         let srv = server();
         let mut args = base_remember("check-keep-2");
         args = RememberArgs { id: args.id.clone(), ..roadmap_rule(&args.id) };
-        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
             because: None,
@@ -4780,7 +5139,7 @@ mod tests {
             may_change: vec![],
             accept_refusing: vec![],
         };
-        let reply = srv.revise(Parameters(revise_args)).await;
+        let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
 
         let get_reply = srv.get(Parameters(GetArgs { id: "check-keep-2".to_string() })).await;
@@ -4805,7 +5164,7 @@ mod tests {
         // ANY other populated optional field (severity/project/tags/
         // expires/key/falsifier all show the identical shape in gate.rs).
         let srv = server();
-        assert!(srv.remember(Parameters(base_remember("check-clear-noop-1"))).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(base_remember("check-clear-noop-1"))).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
             because: None,
@@ -4838,7 +5197,7 @@ mod tests {
             may_change: vec![],
             accept_refusing: vec![],
         };
-        let reply = srv.revise(Parameters(revise_args)).await;
+        let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
 
         let get_reply = srv.get(Parameters(GetArgs { id: "check-clear-noop-1".to_string() })).await;
@@ -4851,7 +5210,7 @@ mod tests {
         let srv = server();
         let mut args = base_remember("check-clear-refuse-1");
         args = RememberArgs { id: args.id.clone(), ..roadmap_rule(&args.id) };
-        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
             because: None,
@@ -4884,7 +5243,7 @@ mod tests {
             may_change: vec![],
             accept_refusing: vec![],
         };
-        let reply = srv.revise(Parameters(revise_args)).await;
+        let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise_args)).await;
         assert!(reply.contains("invalid check"), "{reply}");
 
         let get_reply = srv.get(Parameters(GetArgs { id: "check-clear-refuse-1".to_string() })).await;
@@ -4917,7 +5276,7 @@ mod tests {
         let srv = server();
         let mut args = base_remember("check-clear-populated-1");
         args = RememberArgs { id: args.id.clone(), ..roadmap_rule(&args.id) };
-        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
             because: Some("the roadmap file check is redundant now that CI verifies it".to_string()),
@@ -4950,7 +5309,7 @@ mod tests {
             may_change: vec![],
             accept_refusing: vec![],
         };
-        let reply = srv.revise(Parameters(revise_args)).await;
+        let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "expected a deliberate clear to succeed, got: {reply}");
 
         let get_reply = srv.get(Parameters(GetArgs { id: "check-clear-populated-1".to_string() })).await;
@@ -4972,10 +5331,10 @@ mod tests {
         let srv = server();
         let mut args = base_remember("weaken-no-because-1");
         args = RememberArgs { id: args.id.clone(), ..roadmap_rule(&args.id) };
-        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await.starts_with("stored"));
 
         let reply = srv
-            .revise(Parameters(ReviseArgs {
+            .revise(Meta::new(), RawArgs::default(), Parameters(ReviseArgs {
                 id: "weaken-no-because-1".to_string(),
                 check_kind: Some("".to_string()), // clearing a real check with no `because`
                 ..Default::default()
@@ -4998,10 +5357,10 @@ mod tests {
         let srv = server();
         let mut args = base_remember("weaken-with-because-1");
         args = RememberArgs { id: args.id.clone(), ..roadmap_rule(&args.id) };
-        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await.starts_with("stored"));
 
         let reply = srv
-            .revise(Parameters(ReviseArgs {
+            .revise(Meta::new(), RawArgs::default(), Parameters(ReviseArgs {
                 id: "weaken-with-because-1".to_string(),
                 check_kind: Some("".to_string()),
                 because: Some("the roadmap file check is redundant now that CI verifies it".to_string()),
@@ -5021,9 +5380,9 @@ mod tests {
         let srv = server();
         let mut args = base_remember("weaken-history-1");
         args = RememberArgs { id: args.id.clone(), ..roadmap_rule(&args.id) };
-        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await.starts_with("stored"));
 
-        srv.revise(Parameters(ReviseArgs {
+        srv.revise(Meta::new(), RawArgs::default(), Parameters(ReviseArgs {
             id: "weaken-history-1".to_string(),
             check_kind: Some("".to_string()),
             because: Some("superseded by CI".to_string()),
@@ -5065,7 +5424,7 @@ mod tests {
         args.project = Some("docs-fixture".to_string());
         args.always = false;
         args.targets = vec![TargetArg { kind: "path".to_string(), value: "docs/STYLE.md".to_string() }];
-        let reply = srv.remember(Parameters(args)).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.starts_with("stored"), "{reply}");
 
         let get_reply = srv.get(Parameters(GetArgs { id: "check-absent-all-1".to_string() })).await;
@@ -5087,7 +5446,7 @@ mod tests {
         args.text = "a rule that names absent_all but gives no literals to forbid".to_string();
         args.check_kind = Some("absent_all".to_string());
         args.check_path = Some("docs/STYLE.md".to_string());
-        let reply = srv.remember(Parameters(args)).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.contains("check_literals"), "expected the reason to name the missing field: {reply}");
         assert!(srv.store.lock().unwrap().get_all_events().unwrap().is_empty(), "a refused remember must write nothing");
     }
@@ -5104,7 +5463,7 @@ mod tests {
         args.check_path = Some("docs/STYLE.md".to_string());
         args.check_literal = Some("TODO".to_string());
         args.check_literals = vec!["FIXME".to_string()];
-        let reply = srv.remember(Parameters(args)).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.contains("check_literal"), "expected the reason to name both conflicting fields: {reply}");
         assert!(reply.contains("check_literals"), "expected the reason to name both conflicting fields: {reply}");
         assert!(srv.store.lock().unwrap().get_all_events().unwrap().is_empty(), "a refused remember must write nothing");
@@ -5120,7 +5479,7 @@ mod tests {
         args.check_kind = Some("contains".to_string());
         args.check_path = Some("LICENSE".to_string());
         args.check_literals = vec!["GPLv3".to_string()];
-        let reply = srv.remember(Parameters(args)).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.contains("check_literal"), "expected the reason to name check_literal: {reply}");
         assert!(reply.contains("contains"), "expected the reason to name the offending kind: {reply}");
         assert!(srv.store.lock().unwrap().get_all_events().unwrap().is_empty(), "a refused remember must write nothing");
@@ -5149,7 +5508,7 @@ mod tests {
         args.project = Some("docs-fixture".to_string());
         args.always = false;
         args.targets = vec![TargetArg { kind: "path".to_string(), value: "docs/STYLE.md".to_string() }];
-        let stored = srv.remember(Parameters(args)).await;
+        let stored = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(stored.starts_with("stored") && stored.contains("teeth: wired, not proven"), "{stored}");
 
         let revise_args = ReviseArgs {
@@ -5183,7 +5542,7 @@ mod tests {
             may_change: vec![],
             accept_refusing: vec![],
         };
-        let reply = srv.revise(Parameters(revise_args)).await;
+        let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
 
         let get_reply = srv.get(Parameters(GetArgs { id: "check-keep-absent-all-1".to_string() })).await;
@@ -5219,7 +5578,7 @@ mod tests {
         args.project = Some("docs-fixture".to_string());
         args.always = false;
         args.targets = vec![TargetArg { kind: "path".to_string(), value: "docs/STYLE.md".to_string() }];
-        let stored = srv.remember(Parameters(args)).await;
+        let stored = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(stored.starts_with("stored") && stored.contains("teeth: wired, not proven"), "{stored}");
 
         let revise_args = ReviseArgs {
@@ -5253,7 +5612,7 @@ mod tests {
             may_change: vec![],
             accept_refusing: vec![],
         };
-        let reply = srv.revise(Parameters(revise_args)).await;
+        let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
 
         let get_reply = srv.get(Parameters(GetArgs { id: "check-upgrade-to-set-1".to_string() })).await;
@@ -5289,7 +5648,7 @@ mod tests {
         args.text = "never write an em dash (U+2014), en dash (U+2013) or ellipsis (U+2026), anywhere".to_string();
         args.check_kind = Some("forbidden".to_string());
         args.check_literals = vec!["\u{2014}".to_string(), "\u{2013}".to_string(), "\u{2026}".to_string()];
-        let reply = srv.remember(Parameters(args)).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.starts_with("stored"), "{reply}");
 
         let get_reply = srv.get(Parameters(GetArgs { id: "check-forbidden-1".to_string() })).await;
@@ -5309,7 +5668,7 @@ mod tests {
         let mut args = base_remember("check-refuse-10");
         args.text = "a rule that names forbidden but gives no literals to forbid".to_string();
         args.check_kind = Some("forbidden".to_string());
-        let reply = srv.remember(Parameters(args)).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.contains("check_literals"), "expected the reason to name the missing field: {reply}");
         assert!(srv.store.lock().unwrap().get_all_events().unwrap().is_empty(), "a refused remember must write nothing");
     }
@@ -5326,7 +5685,7 @@ mod tests {
         args.check_kind = Some("forbidden".to_string());
         args.check_path = Some("docs/STYLE.md".to_string());
         args.check_literals = vec!["TODO".to_string()];
-        let reply = srv.remember(Parameters(args)).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.contains("check_path"), "expected the reason to name the offending field: {reply}");
         assert!(reply.contains("forbidden"), "expected the reason to name the offending kind: {reply}");
         assert!(srv.store.lock().unwrap().get_all_events().unwrap().is_empty(), "a refused remember must write nothing");
@@ -5339,7 +5698,7 @@ mod tests {
         args.text = "a rule that gives forbidden one literal instead of a set".to_string();
         args.check_kind = Some("forbidden".to_string());
         args.check_literal = Some("TODO".to_string());
-        let reply = srv.remember(Parameters(args)).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.contains("check_literals"), "expected the reason to name the field to use instead: {reply}");
         assert!(srv.store.lock().unwrap().get_all_events().unwrap().is_empty(), "a refused remember must write nothing");
     }
@@ -5359,7 +5718,7 @@ mod tests {
         args.text = "never write an em dash (U+2014), en dash (U+2013) or ellipsis (U+2026), anywhere".to_string();
         args.check_kind = Some("forbidden".to_string());
         args.check_literals = vec!["\u{2014}".to_string(), "\u{2013}".to_string(), "\u{2026}".to_string()];
-        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
             because: Some("lowering severity to prove an unrelated field change still lands".to_string()),
@@ -5392,7 +5751,7 @@ mod tests {
             may_change: vec![],
             accept_refusing: vec![],
         };
-        let reply = srv.revise(Parameters(revise_args)).await;
+        let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
 
         let get_reply = srv.get(Parameters(GetArgs { id: "check-keep-forbidden-1".to_string() })).await;
@@ -5430,7 +5789,7 @@ mod tests {
         args.project = Some("docs-fixture".to_string());
         args.always = false;
         args.targets = vec![TargetArg { kind: "path".to_string(), value: "docs/STYLE.md".to_string() }];
-        let stored = srv.remember(Parameters(args)).await;
+        let stored = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(stored.starts_with("stored") && stored.contains("teeth: wired, not proven"), "{stored}");
 
         let revise_args = ReviseArgs {
@@ -5464,7 +5823,7 @@ mod tests {
             may_change: vec![],
             accept_refusing: vec![],
         };
-        let reply = srv.revise(Parameters(revise_args)).await;
+        let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
 
         let get_reply = srv.get(Parameters(GetArgs { id: "check-downgrade-to-forbidden-1".to_string() })).await;
@@ -5487,7 +5846,7 @@ mod tests {
         args.text = "never write an em dash (U+2014), anywhere".to_string();
         args.check_kind = Some("forbidden".to_string());
         args.check_literals = vec!["\u{2014}".to_string()];
-        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
             because: Some("the em dash rule is now enforced by the shared style linter instead".to_string()),
@@ -5522,7 +5881,7 @@ mod tests {
             may_change: vec![],
             accept_refusing: vec![],
         };
-        let reply = srv.revise(Parameters(revise_args)).await;
+        let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
 
         let get_reply = srv.get(Parameters(GetArgs { id: "check-clear-populated-forbidden-1".to_string() })).await;
@@ -5551,7 +5910,7 @@ mod tests {
         // A second field, left alone by this revise, to prove clearing one
         // field never disturbs a sibling that was never named.
         args.project = Some("thor2".to_string());
-        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
             // Since 2026-09-26 clearing a heavy rule's severity is a weakening
@@ -5586,7 +5945,7 @@ mod tests {
             may_change: vec![],
             accept_refusing: vec![],
         };
-        let reply = srv.revise(Parameters(revise_args)).await;
+        let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "expected a deliberate clear to succeed, got: {reply}");
 
         let get_reply = srv.get(Parameters(GetArgs { id: "clear-severity-1".to_string() })).await;
@@ -5607,7 +5966,7 @@ mod tests {
         // pre-existing repair path, not the ClearedFields one this test
         // means to prove.
         args.project = Some("thor2".to_string());
-        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
             because: None,
@@ -5640,7 +5999,7 @@ mod tests {
             may_change: vec![],
             accept_refusing: vec![],
         };
-        let reply = srv.revise(Parameters(revise_args)).await;
+        let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "expected a deliberate clear to succeed, got: {reply}");
 
         let get_reply = srv.get(Parameters(GetArgs { id: "clear-project-1".to_string() })).await;
@@ -5661,7 +6020,7 @@ mod tests {
         let srv = server_knowing(&["thor2"]);
         let mut args = base_remember("clear-project-ws");
         args.project = Some("thor2".to_string());
-        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
             because: None,
@@ -5694,7 +6053,7 @@ mod tests {
             may_change: vec![],
             accept_refusing: vec![],
         };
-        let reply = srv.revise(Parameters(revise_args)).await;
+        let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "a whitespace-only value must clear, got: {reply}");
 
         let get_reply = srv.get(Parameters(GetArgs { id: "clear-project-ws".to_string() })).await;
@@ -5707,7 +6066,7 @@ mod tests {
         let srv = server_knowing(&["test-project"]);
         // Only a Report may carry expires (gate::declare ground 2) -
         // blank_report already sets expires: Some("2027-01-01").
-        assert!(srv.remember(Parameters(blank_report("clear-expires-1"))).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(blank_report("clear-expires-1"))).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
             because: None,
@@ -5740,7 +6099,7 @@ mod tests {
             may_change: vec![],
             accept_refusing: vec![],
         };
-        let reply = srv.revise(Parameters(revise_args)).await;
+        let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "expected a deliberate clear to succeed, got: {reply}");
 
         let get_reply = srv.get(Parameters(GetArgs { id: "clear-expires-1".to_string() })).await;
@@ -5759,7 +6118,7 @@ mod tests {
         // RememberArgs' own doc comment.
         let mut args = base_remember("clear-key-1");
         args.key = Some("some-lookup-key".to_string());
-        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
             because: None,
@@ -5792,7 +6151,7 @@ mod tests {
             may_change: vec![],
             accept_refusing: vec![],
         };
-        let reply = srv.revise(Parameters(revise_args)).await;
+        let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "expected a deliberate clear to succeed, got: {reply}");
 
         let get_reply = srv.get(Parameters(GetArgs { id: "clear-key-1".to_string() })).await;
@@ -5810,7 +6169,7 @@ mod tests {
         // one, but is never required to.
         let mut args = blank_report("clear-falsifier-1");
         args.falsifier = Some("this incident happens again within a week".to_string());
-        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
             because: None,
@@ -5843,7 +6202,7 @@ mod tests {
             may_change: vec![],
             accept_refusing: vec![],
         };
-        let reply = srv.revise(Parameters(revise_args)).await;
+        let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "expected a deliberate clear to succeed, got: {reply}");
 
         let get_reply = srv.get(Parameters(GetArgs { id: "clear-falsifier-1".to_string() })).await;
@@ -5878,7 +6237,7 @@ mod tests {
         args.kind = "orientation".to_string();
         // Same reason as the sibling test above: a light rule isolates ground 9.
         args.severity = Some("house_style".to_string());
-        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
             because: None,
@@ -5914,7 +6273,7 @@ mod tests {
             may_change: vec![],
             accept_refusing: vec![],
         };
-        let reply = srv.revise(Parameters(revise_args)).await;
+        let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise_args)).await;
         assert!(reply.contains("REFUSED"), "expected the bindings drop to still be refused, got: {reply}");
         assert!(reply.contains("binding"), "expected the reason to name the dropped field: {reply}");
 
@@ -5950,7 +6309,7 @@ mod tests {
         // the no-literal reason base_remember sets.
         args.severity = Some("house_style".to_string());
         args.tags = vec!["safety".to_string(), "ci".to_string()];
-        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
             because: None,
@@ -5989,7 +6348,7 @@ mod tests {
             may_change: vec![],
             accept_refusing: vec![],
         };
-        let reply = srv.revise(Parameters(revise_args)).await;
+        let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
 
         let get_reply = srv.get(Parameters(GetArgs { id: "keep-tags-1".to_string() })).await;
@@ -6011,7 +6370,7 @@ mod tests {
         // no-literal answer.
         args.severity = Some("house_style".to_string());
         args.tags = vec!["safety".to_string(), "ci".to_string()];
-        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
             because: None,
@@ -6044,7 +6403,7 @@ mod tests {
             may_change: vec![],
             accept_refusing: vec![],
         };
-        let reply = srv.revise(Parameters(revise_args)).await;
+        let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "expected a deliberate clear to succeed, got: {reply}");
         assert!(reply.contains("tags cleared"), "expected the reply to say tags were cleared, got: {reply}");
 
@@ -6064,7 +6423,7 @@ mod tests {
         // See the first tags test above on why this needs to be house_style.
         args.severity = Some("house_style".to_string());
         args.tags = vec!["safety".to_string()];
-        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
             because: None,
@@ -6097,7 +6456,7 @@ mod tests {
             may_change: vec![],
             accept_refusing: vec![],
         };
-        let reply = srv.revise(Parameters(revise_args)).await;
+        let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
         // A replace is not a clear, so the reply must not claim one.
         assert!(!reply.contains("tags cleared"), "a replace is not a clear: {reply}");
@@ -6140,10 +6499,10 @@ mod tests {
         let srv = server_knowing(&["thor2"]);
         let mut args = base_remember("clear-severity-flag-1");
         args.project = Some("thor2".to_string());
-        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await.starts_with("stored"));
 
         let reply = srv
-            .revise(Parameters(ReviseArgs {
+            .revise(Meta::new(), RawArgs::default(), Parameters(ReviseArgs {
                 id: "clear-severity-flag-1".to_string(),
                 clear_severity: true,
                 because: Some("the fixture is only about the clear flag".to_string()),
@@ -6166,10 +6525,10 @@ mod tests {
         let srv = server_knowing(&["thor2"]);
         let mut args = base_remember("clear-project-flag-1");
         args.project = Some("thor2".to_string());
-        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await.starts_with("stored"));
 
         let reply = srv
-            .revise(Parameters(ReviseArgs {
+            .revise(Meta::new(), RawArgs::default(), Parameters(ReviseArgs {
                 id: "clear-project-flag-1".to_string(),
                 clear_project: true,
                 ..Default::default()
@@ -6188,10 +6547,10 @@ mod tests {
         // succeeds` above; same Report fixture, for the same reason (only a
         // Report may carry expires at all).
         let srv = server_knowing(&["test-project"]);
-        assert!(srv.remember(Parameters(blank_report("clear-expires-flag-1"))).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(blank_report("clear-expires-flag-1"))).await.starts_with("stored"));
 
         let reply = srv
-            .revise(Parameters(ReviseArgs {
+            .revise(Meta::new(), RawArgs::default(), Parameters(ReviseArgs {
                 id: "clear-expires-flag-1".to_string(),
                 clear_expires: true,
                 ..Default::default()
@@ -6213,10 +6572,10 @@ mod tests {
         let srv = server();
         let mut args = base_remember("clear-key-flag-1");
         args.key = Some("some-lookup-key".to_string());
-        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await.starts_with("stored"));
 
         let reply = srv
-            .revise(Parameters(ReviseArgs {
+            .revise(Meta::new(), RawArgs::default(), Parameters(ReviseArgs {
                 id: "clear-key-flag-1".to_string(),
                 clear_key: true,
                 ..Default::default()
@@ -6237,10 +6596,10 @@ mod tests {
         let srv = server_knowing(&["test-project"]);
         let mut args = blank_report("clear-falsifier-flag-1");
         args.falsifier = Some("this incident happens again within a week".to_string());
-        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await.starts_with("stored"));
 
         let reply = srv
-            .revise(Parameters(ReviseArgs {
+            .revise(Meta::new(), RawArgs::default(), Parameters(ReviseArgs {
                 id: "clear-falsifier-flag-1".to_string(),
                 clear_falsifier: true,
                 ..Default::default()
@@ -6274,10 +6633,10 @@ mod tests {
         let srv = server();
         let mut args = base_remember("clear-check-flag-no-because-1");
         args = RememberArgs { id: args.id.clone(), ..roadmap_rule(&args.id) };
-        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await.starts_with("stored"));
 
         let reply = srv
-            .revise(Parameters(ReviseArgs {
+            .revise(Meta::new(), RawArgs::default(), Parameters(ReviseArgs {
                 id: "clear-check-flag-no-because-1".to_string(),
                 clear_check: true,
                 ..Default::default()
@@ -6304,10 +6663,10 @@ mod tests {
         let srv = server();
         let mut args = base_remember("clear-check-flag-with-because-1");
         args = RememberArgs { id: args.id.clone(), ..roadmap_rule(&args.id) };
-        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await.starts_with("stored"));
 
         let reply = srv
-            .revise(Parameters(ReviseArgs {
+            .revise(Meta::new(), RawArgs::default(), Parameters(ReviseArgs {
                 id: "clear-check-flag-with-because-1".to_string(),
                 clear_check: true,
                 because: Some("the roadmap file check is redundant now that CI verifies it".to_string()),
@@ -6334,10 +6693,10 @@ mod tests {
         // reply would start with "revised" - silently picking a winner
         // instead of refusing the contradiction outright.
         let srv = server();
-        assert!(srv.remember(Parameters(base_remember("clear-severity-conflict-1"))).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(base_remember("clear-severity-conflict-1"))).await.starts_with("stored"));
 
         let reply = srv
-            .revise(Parameters(ReviseArgs {
+            .revise(Meta::new(), RawArgs::default(), Parameters(ReviseArgs {
                 id: "clear-severity-conflict-1".to_string(),
                 clear_severity: true,
                 severity: Some("costly".to_string()),
@@ -6357,10 +6716,10 @@ mod tests {
         let srv = server_knowing(&["thor2", "other-project"]);
         let mut args = base_remember("clear-project-conflict-1");
         args.project = Some("thor2".to_string());
-        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await.starts_with("stored"));
 
         let reply = srv
-            .revise(Parameters(ReviseArgs {
+            .revise(Meta::new(), RawArgs::default(), Parameters(ReviseArgs {
                 id: "clear-project-conflict-1".to_string(),
                 clear_project: true,
                 project: Some("other-project".to_string()),
@@ -6378,10 +6737,10 @@ mod tests {
     #[tokio::test]
     async fn clear_expires_together_with_a_real_expires_is_refused_naming_the_conflict() {
         let srv = server_knowing(&["test-project"]);
-        assert!(srv.remember(Parameters(blank_report("clear-expires-conflict-1"))).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(blank_report("clear-expires-conflict-1"))).await.starts_with("stored"));
 
         let reply = srv
-            .revise(Parameters(ReviseArgs {
+            .revise(Meta::new(), RawArgs::default(), Parameters(ReviseArgs {
                 id: "clear-expires-conflict-1".to_string(),
                 clear_expires: true,
                 expires: Some("2028-01-01".to_string()),
@@ -6401,10 +6760,10 @@ mod tests {
         let srv = server();
         let mut args = base_remember("clear-key-conflict-1");
         args.key = Some("some-lookup-key".to_string());
-        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await.starts_with("stored"));
 
         let reply = srv
-            .revise(Parameters(ReviseArgs {
+            .revise(Meta::new(), RawArgs::default(), Parameters(ReviseArgs {
                 id: "clear-key-conflict-1".to_string(),
                 clear_key: true,
                 key: Some("another-key".to_string()),
@@ -6424,10 +6783,10 @@ mod tests {
         let srv = server_knowing(&["test-project"]);
         let mut args = blank_report("clear-falsifier-conflict-1");
         args.falsifier = Some("this incident happens again within a week".to_string());
-        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await.starts_with("stored"));
 
         let reply = srv
-            .revise(Parameters(ReviseArgs {
+            .revise(Meta::new(), RawArgs::default(), Parameters(ReviseArgs {
                 id: "clear-falsifier-conflict-1".to_string(),
                 clear_falsifier: true,
                 falsifier: Some("a different falsifier entirely".to_string()),
@@ -6457,10 +6816,10 @@ mod tests {
         let srv = server();
         let mut args = base_remember("clear-check-conflict-1");
         args = RememberArgs { id: args.id.clone(), ..roadmap_rule(&args.id) };
-        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await.starts_with("stored"));
 
         let reply = srv
-            .revise(Parameters(ReviseArgs {
+            .revise(Meta::new(), RawArgs::default(), Parameters(ReviseArgs {
                 id: "clear-check-conflict-1".to_string(),
                 clear_check: true,
                 check_kind: Some("forbidden".to_string()),
@@ -6497,10 +6856,10 @@ mod tests {
         let srv = server();
         let mut args = base_remember("clear-check-path-conflict-1");
         args = RememberArgs { id: args.id.clone(), ..roadmap_rule(&args.id) };
-        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await.starts_with("stored"));
 
         let reply = srv
-            .revise(Parameters(ReviseArgs {
+            .revise(Meta::new(), RawArgs::default(), Parameters(ReviseArgs {
                 id: "clear-check-path-conflict-1".to_string(),
                 clear_check: true,
                 check_path: Some("OTHER.md".to_string()),
@@ -6532,10 +6891,10 @@ mod tests {
         let mut args = roadmap_rule("plain-revise-no-flags-1");
         args.project = Some("thor2".to_string());
         args.key = Some("some-key".to_string());
-        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await.starts_with("stored"));
 
         let reply = srv
-            .revise(Parameters(ReviseArgs {
+            .revise(Meta::new(), RawArgs::default(), Parameters(ReviseArgs {
                 id: "plain-revise-no-flags-1".to_string(),
                 text: Some("the roadmap lives in ROADMAP.md, updated every quarter; never write zz-roadmap-marker".to_string()),
                 ..Default::default()
@@ -6569,9 +6928,9 @@ mod tests {
         // that name. Real callers name the project; so does this fixture.
         args.project = Some("some-project".to_string());
         args.targets = vec![TargetArg { kind: "path".to_string(), value: "src/pin_test.rs".to_string() }];
-        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await.starts_with("stored"));
 
-        let reply = srv.pin(Parameters(PinArgs { id: "pin-1".to_string() })).await;
+        let reply = srv.pin(Meta::new(), RawArgs::default(), Parameters(PinArgs { id: "pin-1".to_string() })).await;
         assert!(reply.starts_with("pinned"), "{reply}");
 
         let get_reply = srv.get(Parameters(GetArgs { id: "pin-1".to_string() })).await;
@@ -6590,9 +6949,9 @@ mod tests {
         args.always = true;
         args.project = Some("some-project".to_string()); // see the note in the pin test
         args.targets = vec![TargetArg { kind: "path".to_string(), value: "src/unpin_test.rs".to_string() }];
-        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await.starts_with("stored"));
 
-        let reply = srv.unpin(Parameters(UnpinArgs { id: "unpin-1".to_string() })).await;
+        let reply = srv.unpin(Meta::new(), RawArgs::default(), Parameters(UnpinArgs { id: "unpin-1".to_string() })).await;
         assert!(reply.starts_with("unpinned"), "{reply}");
 
         let get_reply = srv.get(Parameters(GetArgs { id: "unpin-1".to_string() })).await;
@@ -6613,9 +6972,9 @@ mod tests {
     async fn unpin_that_would_empty_the_bindings_is_refused() {
         let srv = server();
         // base_remember is Always-bound only: no moments, no targets.
-        assert!(srv.remember(Parameters(base_remember("unpin-2"))).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(base_remember("unpin-2"))).await.starts_with("stored"));
 
-        let reply = srv.unpin(Parameters(UnpinArgs { id: "unpin-2".to_string() })).await;
+        let reply = srv.unpin(Meta::new(), RawArgs::default(), Parameters(UnpinArgs { id: "unpin-2".to_string() })).await;
         assert!(reply.contains("REFUSED"), "expected a loud refusal, got: {reply}");
         assert!(reply.contains("no binding"), "expected the reason to name the empty-binding problem: {reply}");
 
@@ -6627,9 +6986,9 @@ mod tests {
     #[tokio::test]
     async fn pinning_an_already_pinned_item_is_idempotent() {
         let srv = server();
-        assert!(srv.remember(Parameters(base_remember("pin-2"))).await.starts_with("stored")); // already always: true
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(base_remember("pin-2"))).await.starts_with("stored")); // already always: true
 
-        let reply = srv.pin(Parameters(PinArgs { id: "pin-2".to_string() })).await;
+        let reply = srv.pin(Meta::new(), RawArgs::default(), Parameters(PinArgs { id: "pin-2".to_string() })).await;
         assert!(reply.contains("already pinned"), "{reply}");
 
         let get_reply = srv.get(Parameters(GetArgs { id: "pin-2".to_string() })).await;
@@ -6666,8 +7025,8 @@ mod tests {
         b.text = "shared filament tuning notes for ABS bed adhesion settings".to_string();
         b.expires = Some("2027-01-01".to_string());
 
-        assert!(srv.remember(Parameters(a)).await.starts_with("stored"));
-        assert!(srv.remember(Parameters(b)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(a)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(b)).await.starts_with("stored"));
 
         let reply = srv
             .lookup(Parameters(LookupArgs { scope: None, query: Some("filament".to_string()), key: None, kind: None }))
@@ -6684,7 +7043,7 @@ mod tests {
         lookup_item.text = "the release checklist lives in RELEASE.md".to_string();
         lookup_item.key = Some("release-checklist".to_string());
         lookup_item.expires = None;
-        assert!(srv.remember(Parameters(lookup_item)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(lookup_item)).await.starts_with("stored"));
 
         let hit = srv
             .lookup(Parameters(LookupArgs { scope: None, query: None, key: Some("release-checklist".to_string()), kind: None }))
@@ -6716,7 +7075,7 @@ mod tests {
         register.key = Some("boeken 2026-08".to_string());
         register.text = "2026-08-11 Dune\n2026-08-16 Piranesi".to_string();
         register.expires = None;
-        assert!(srv.remember(Parameters(register)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(register)).await.starts_with("stored"));
 
         let reply = srv.lookup(Parameters(LookupArgs { scope: None, query: None, key: None, kind: None })).await;
         assert!(reply.contains("boeken"), "the scope must be named: {reply}");
@@ -6734,7 +7093,7 @@ mod tests {
         register.key = Some("uitgaven 2026-08".to_string());
         register.text = "2026-08-16 tandarts 85 euro".to_string();
         register.expires = None;
-        assert!(srv.remember(Parameters(register)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(register)).await.starts_with("stored"));
 
         let reply = srv.lookup(Parameters(LookupArgs { scope: None, query: None, key: None, kind: None })).await;
         assert!(reply.contains("scope uitgaven"), "the first word of the key is the scope: {reply}");
@@ -6757,7 +7116,7 @@ mod tests {
             let mut book = blank_report(id);
             book.project = Some("boeken".to_string());
             book.text = text.to_string();
-            assert!(srv.remember(Parameters(book)).await.starts_with("stored"));
+            assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(book)).await.starts_with("stored"));
         }
 
         let reply = srv
@@ -6781,7 +7140,7 @@ mod tests {
             let mut it = blank_report(id);
             it.project = Some(scope.to_string());
             it.text = text.to_string();
-            assert!(srv.remember(Parameters(it)).await.starts_with("stored"));
+            assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(it)).await.starts_with("stored"));
         }
 
         let wide = srv
@@ -6811,12 +7170,12 @@ mod tests {
         let mut filed = blank_report("recept-1");
         filed.project = Some("eten".to_string());
         filed.text = "Zoete aardappel uit de oven met bruine boter.".to_string();
-        assert!(srv.remember(Parameters(filed)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(filed)).await.starts_with("stored"));
 
         let mut loose = blank_report("sportschema-1");
         loose.project = None;
         loose.text = "Push/pull/legs, drie keer per week.".to_string();
-        let reply = srv.remember(Parameters(loose)).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(loose)).await;
 
         assert!(reply.contains("REFUSED"), "a write with no scope must not land: {reply}");
         assert!(reply.contains("scopes that already exist"), "the choice must come with the refusal: {reply}");
@@ -6835,7 +7194,7 @@ mod tests {
         let mut invented = blank_report("voeding-1");
         invented.project = Some("voeding-fitness".to_string());
         invented.text = "140 g eiwit per dag, wei na de training.".to_string();
-        let reply = srv.remember(Parameters(invented)).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(invented)).await;
 
         assert!(reply.contains("REFUSED"), "an invented collection must not land: {reply}");
         assert!(reply.contains("voeding-fitness"), "it must say which name it refused: {reply}");
@@ -6864,7 +7223,7 @@ mod tests {
         register.kind = "lookup".to_string();
         register.key = Some("profiel".to_string());
         register.project = None;
-        let reply = srv.remember(Parameters(register)).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(register)).await;
         assert!(reply.contains("REFUSED"), "a register opens a collection too: {reply}");
         assert!(reply.contains("profiel"), "{reply}");
         assert!(
@@ -6887,7 +7246,7 @@ mod tests {
         let mut args = blank_report(model::store::OWNER_SETUP_ANSWERS_ID);
         args.project = None;
         args.text = "reply length: short. language: Dutch. lanes: work only.".to_string();
-        let reply = srv.remember(Parameters(args)).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.starts_with("stored"), "the setup answer must land on a store with no scopes at all: {reply}");
     }
 
@@ -6899,7 +7258,7 @@ mod tests {
         let srv = server();
         let mut args = blank_report("some-other-report");
         args.project = None;
-        let reply = srv.remember(Parameters(args)).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.contains("REFUSED"), "only the setup answer id is exempt: {reply}");
         assert!(reply.contains(model::gate::NO_SCOPE_PROBLEM), "ground 21 must still be the one speaking: {reply}");
         assert!(
@@ -6916,16 +7275,16 @@ mod tests {
         let srv = server_knowing(&["eten"]);
         let mut doomed = blank_report("weg-ermee");
         doomed.project = Some("eten".to_string());
-        assert!(srv.remember(Parameters(doomed)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(doomed)).await.starts_with("stored"));
         assert!(srv
-            .retract(Parameters(RetractArgs {
+            .retract(Meta::new(), RawArgs::default(), Parameters(RetractArgs {
                 id: "weg-ermee".to_string(),
                 reason: "toch niet waar gebleken".to_string(),
             }))
             .await
             .starts_with("retracted"));
 
-        let reply = srv.mark(Parameters(MarkArgs { id: "weg-ermee".to_string(), noise: true })).await;
+        let reply = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "weg-ermee".to_string(), noise: true })).await;
         assert!(reply.contains("not live"), "{reply}");
         assert!(reply.contains("Nothing was recorded"), "{reply}");
     }
@@ -7362,16 +7721,16 @@ mod tests {
         let srv = server_knowing(&["eten"]);
         let mut args = blank_report("weg-hiermee");
         args.project = Some("eten".to_string());
-        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await.starts_with("stored"));
         assert!(srv
-            .retract(Parameters(RetractArgs {
+            .retract(Meta::new(), RawArgs::default(), Parameters(RetractArgs {
                 id: "weg-hiermee".to_string(),
                 reason: "wrong from the start".to_string(),
             }))
             .await
             .starts_with("retracted"));
 
-        let reply = srv.mark(Parameters(MarkArgs { id: "weg-hiermee".to_string(), noise: true })).await;
+        let reply = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "weg-hiermee".to_string(), noise: true })).await;
         assert!(reply.contains("not live"), "{reply}");
         assert!(reply.contains("Nothing was recorded"), "{reply}");
     }
@@ -7386,7 +7745,7 @@ mod tests {
         let mut asked = blank_report("loop-1");
         asked.project = Some("hardlopen".to_string());
         asked.new_collection_named_by_owner = Some("hardlopen".to_string());
-        assert!(srv.remember(Parameters(asked)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(asked)).await.starts_with("stored"));
     }
 
     /// The name has to be the one being written, or the field is just a box
@@ -7398,7 +7757,7 @@ mod tests {
         let mut sneaky = blank_report("loop-2");
         sneaky.project = Some("sport".to_string());
         sneaky.new_collection_named_by_owner = Some("hardlopen".to_string());
-        let reply = srv.remember(Parameters(sneaky)).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(sneaky)).await;
         assert!(reply.contains("REFUSED"), "{reply}");
         assert!(reply.contains("have to be the same word"), "{reply}");
     }
@@ -7411,7 +7770,7 @@ mod tests {
         let mut fits = blank_report("recept-1");
         fits.project = Some("eten".to_string());
         fits.text = "Zoete aardappel uit de oven met bruine boter.".to_string();
-        assert!(srv.remember(Parameters(fits)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(fits)).await.starts_with("stored"));
     }
 
     /// The one new name this door allows: the checkout's own project key, which
@@ -7425,7 +7784,7 @@ mod tests {
 
         let mut first = blank_report("eerste-feit");
         first.project = Some("verse-repo".to_string());
-        assert!(srv.remember(Parameters(first)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(first)).await.starts_with("stored"));
     }
 
     /// THE STALE ADVICE THIS GUARDS AGAINST: the hint used to send the owner
@@ -7443,7 +7802,7 @@ mod tests {
 
         let mut item = blank_report("first-note");
         item.project = Some("brand-new-project".to_string());
-        let reply = srv.remember(Parameters(item)).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(item)).await;
 
         assert!(reply.contains("REFUSED"), "{reply}");
         assert!(!reply.contains("install --project"), "the retired --project advice must be gone: {reply}");
@@ -7470,7 +7829,7 @@ mod tests {
         too_long.text = "x".repeat(400);
         too_long.always = true;
         too_long.falsifier = Some("this turns out to be wrong".to_string());
-        let reply = srv.remember(Parameters(too_long)).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(too_long)).await;
 
         assert!(reply.contains("REFUSED"), "{reply}");
         assert!(!reply.contains("scopes that already exist"), "only the no-scope refusal carries the list: {reply}");
@@ -7507,7 +7866,7 @@ mod tests {
         let vectors_dir = tempfile::tempdir().unwrap();
         let vectors_path = vectors_dir.path().join("v.db");
         let srv = ThorMcpServer::new(EventStore::in_memory().unwrap()).with_vectors(vectors_path);
-        srv.remember(Parameters(base_remember("cache-regression-1"))).await;
+        srv.remember(Meta::new(), RawArgs::default(), Parameters(base_remember("cache-regression-1"))).await;
 
         let first = srv
             .lookup(Parameters(LookupArgs { scope: None, query: Some("force-push".to_string()), key: None, kind: None }))
@@ -7532,10 +7891,10 @@ mod tests {
         let srv = server_knowing(&["test-project"]);
         let mut rule = base_remember("widget-rule");
         rule.text = "never ship a widget without a size chart".to_string();
-        assert!(srv.remember(Parameters(rule)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(rule)).await.starts_with("stored"));
         let mut report = blank_report("widget-report");
         report.text = "a long report about the widget rollout last quarter".to_string();
-        assert!(srv.remember(Parameters(report)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(report)).await.starts_with("stored"));
 
         let reply = srv
             .lookup(Parameters(LookupArgs {
@@ -7562,19 +7921,19 @@ mod tests {
         let mut in_scope_report = blank_report("widget-in-boeken");
         in_scope_report.project = Some("boeken".to_string());
         in_scope_report.text = "widget assembly notes filed under boeken".to_string();
-        assert!(srv.remember(Parameters(in_scope_report)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(in_scope_report)).await.starts_with("stored"));
 
         let mut other_scope_report = blank_report("widget-in-eten");
         other_scope_report.project = Some("eten".to_string());
         other_scope_report.text = "widget shaped cookie cutter notes filed under eten".to_string();
-        assert!(srv.remember(Parameters(other_scope_report)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(other_scope_report)).await.starts_with("stored"));
 
         // Same scope as `in_scope_report` above, on purpose - see this test's
         // own doc comment for why that is the point.
         let mut rule = base_remember("widget-rule-in-boeken");
         rule.project = Some("boeken".to_string());
         rule.text = "never ship a widget without testing it first".to_string();
-        assert!(srv.remember(Parameters(rule)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(rule)).await.starts_with("stored"));
 
         let reply = srv
             .lookup(Parameters(LookupArgs {
@@ -7619,7 +7978,7 @@ mod tests {
         let srv = server_knowing(&["test-project"]);
         let mut report = blank_report("findable-1");
         report.text = "this findable item must never be reached because the kind argument is invalid".to_string();
-        assert!(srv.remember(Parameters(report)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(report)).await.starts_with("stored"));
 
         let reply = srv
             .lookup(Parameters(LookupArgs {
@@ -7648,7 +8007,7 @@ mod tests {
         let srv = server_knowing(&["test-project"]);
         let mut report = blank_report("gizmo-1");
         report.text = "a gizmo has nothing to do with the other word".to_string();
-        assert!(srv.remember(Parameters(report)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(report)).await.starts_with("stored"));
 
         let reply = srv
             .lookup(Parameters(LookupArgs {
@@ -7672,7 +8031,7 @@ mod tests {
         let srv = server_knowing(&["test-project"]);
         let mut report = blank_report("gizmo-1");
         report.text = "a gizmo has nothing to do with the other word".to_string();
-        assert!(srv.remember(Parameters(report)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(report)).await.starts_with("stored"));
 
         let reply = srv
             .lookup(Parameters(LookupArgs {
@@ -7694,7 +8053,7 @@ mod tests {
         let srv = server_knowing(&["test-project"]);
         let mut report = blank_report("gizmo-1");
         report.text = "a gizmo has nothing to do with the other word".to_string();
-        assert!(srv.remember(Parameters(report)).await.starts_with("stored"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(report)).await.starts_with("stored"));
 
         let reply = srv
             .lookup(Parameters(LookupArgs { scope: None, query: Some("gizmo".to_string()), key: None, kind: None }))
@@ -7748,9 +8107,9 @@ mod tests {
         let mut args = base_remember("mark-1");
         args.always = false;
         args.targets = vec![TargetArg { kind: "command".to_string(), value: "force-push".to_string() }];
-        srv.remember(Parameters(args)).await;
+        srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         fired_once(&srv, "mark-1");
-        let reply = srv.mark(Parameters(MarkArgs { id: "mark-1".to_string(), noise: false })).await;
+        let reply = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "mark-1".to_string(), noise: false })).await;
         assert!(reply.contains("marked useful: mark-1"), "{reply}");
 
         let store = srv.store.lock().unwrap();
@@ -7769,9 +8128,9 @@ mod tests {
         let srv = server();
         // base_remember is Always-bound by default (see the pin/unpin tests
         // above) - exactly the shape this refusal exists for.
-        srv.remember(Parameters(base_remember("pinned-mark-1"))).await;
+        srv.remember(Meta::new(), RawArgs::default(), Parameters(base_remember("pinned-mark-1"))).await;
 
-        let reply = srv.mark(Parameters(MarkArgs { id: "pinned-mark-1".to_string(), noise: false })).await;
+        let reply = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "pinned-mark-1".to_string(), noise: false })).await;
         assert!(reply.starts_with("pinned:"), "{reply}");
         assert!(reply.contains("pinned-mark-1"), "{reply}");
         assert!(reply.contains("unpin"), "must point at the way out: {reply}");
@@ -7795,10 +8154,10 @@ mod tests {
         let mut args = base_remember("trigger-mark-1");
         args.always = false;
         args.targets = vec![TargetArg { kind: "command".to_string(), value: "force-push".to_string() }];
-        srv.remember(Parameters(args)).await;
+        srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         fired_once(&srv, "trigger-mark-1");
 
-        let reply = srv.mark(Parameters(MarkArgs { id: "trigger-mark-1".to_string(), noise: false })).await;
+        let reply = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "trigger-mark-1".to_string(), noise: false })).await;
         assert!(reply.contains("marked useful: trigger-mark-1"), "{reply}");
     }
 
@@ -7809,12 +8168,12 @@ mod tests {
     #[tokio::test]
     async fn marking_a_pinned_item_twice_never_reads_as_a_repeat() {
         let srv = server();
-        srv.remember(Parameters(base_remember("pinned-mark-2"))).await;
+        srv.remember(Meta::new(), RawArgs::default(), Parameters(base_remember("pinned-mark-2"))).await;
 
-        let first = srv.mark(Parameters(MarkArgs { id: "pinned-mark-2".to_string(), noise: false })).await;
+        let first = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "pinned-mark-2".to_string(), noise: false })).await;
         assert!(first.starts_with("pinned:"), "{first}");
 
-        let second = srv.mark(Parameters(MarkArgs { id: "pinned-mark-2".to_string(), noise: true })).await;
+        let second = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "pinned-mark-2".to_string(), noise: true })).await;
         assert!(second.starts_with("pinned:"), "the repeat map must not have recorded the first call: {second}");
         assert!(!second.contains("already judged"), "{second}");
     }
@@ -7866,13 +8225,13 @@ mod tests {
         args.always = false;
         args.project = Some("some-project".to_string()); // see the note in the pin test
         args.targets = vec![TargetArg { kind: "path".to_string(), value: "src/noisy.rs".to_string() }];
-        srv.remember(Parameters(args)).await;
+        srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         fired_once(&srv, "noisy-1");
         for _ in 0..serve::decay::NOISE_MARKS_BEFORE_STALE {
             // A fresh server per verdict: a different SESSION judging the
             // same item once, never the same session asked twice.
             let session = ThorMcpServer::new(EventStore::new(&db_path).unwrap());
-            let reply = session.mark(Parameters(MarkArgs { id: "noisy-1".to_string(), noise: true })).await;
+            let reply = session.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "noisy-1".to_string(), noise: true })).await;
             assert!(reply.contains("marked noise"), "{reply}");
         }
         {
@@ -7896,7 +8255,7 @@ mod tests {
     /// bookkeeping - two noise marks with no mark of usefulness between them
     /// retire an item from every injection surface, and the first one had
     /// already fired. The store cannot see this itself: every write through
-    /// this server carries the fixed session id "mcp" (`SESSION_ID`), so only
+    /// this in-process server carries no session hint, so the session id "mcp", so only
     /// the process asking a second time can know it already asked once.
     #[tokio::test]
     async fn a_repeated_identical_verdict_this_session_writes_nothing_and_says_so() {
@@ -7907,13 +8266,13 @@ mod tests {
         let mut args = base_remember("repeat-noise");
         args.always = false;
         args.targets = vec![TargetArg { kind: "command".to_string(), value: "force-push".to_string() }];
-        srv.remember(Parameters(args)).await;
+        srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         fired_once(&srv, "repeat-noise");
 
-        let first = srv.mark(Parameters(MarkArgs { id: "repeat-noise".to_string(), noise: true })).await;
+        let first = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "repeat-noise".to_string(), noise: true })).await;
         assert!(first.contains("marked noise"), "{first}");
 
-        let second = srv.mark(Parameters(MarkArgs { id: "repeat-noise".to_string(), noise: true })).await;
+        let second = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "repeat-noise".to_string(), noise: true })).await;
         assert!(second.contains("already judged noise this session"), "{second}");
         assert!(second.contains("event seq"), "the earlier verdict's own seq must be named: {second}");
         assert!(second.contains("not counted again"), "{second}");
@@ -7938,10 +8297,10 @@ mod tests {
         let mut args = base_remember("owed-again");
         args.always = false;
         args.targets = vec![TargetArg { kind: "command".to_string(), value: "owed-again-command".to_string() }];
-        srv.remember(Parameters(args)).await;
+        srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         fired_once(&srv, "owed-again");
 
-        let first = srv.mark(Parameters(MarkArgs { id: "owed-again".to_string(), noise: true })).await;
+        let first = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "owed-again".to_string(), noise: true })).await;
         assert!(first.contains("marked noise"), "{first}");
 
         {
@@ -7951,7 +8310,7 @@ mod tests {
             }
         }
 
-        let second = srv.mark(Parameters(MarkArgs { id: "owed-again".to_string(), noise: true })).await;
+        let second = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "owed-again".to_string(), noise: true })).await;
         assert!(
             second.starts_with("judged noise again: it fired"),
             "must open with the owed-again note, before the normal reply text: {second}"
@@ -7979,10 +8338,10 @@ mod tests {
         let mut args = base_remember("not-owed-again");
         args.always = false;
         args.targets = vec![TargetArg { kind: "command".to_string(), value: "not-owed-again-command".to_string() }];
-        srv.remember(Parameters(args)).await;
+        srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         fired_once(&srv, "not-owed-again");
 
-        let first = srv.mark(Parameters(MarkArgs { id: "not-owed-again".to_string(), noise: true })).await;
+        let first = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "not-owed-again".to_string(), noise: true })).await;
         assert!(first.contains("marked noise"), "{first}");
 
         {
@@ -7992,7 +8351,7 @@ mod tests {
             }
         }
 
-        let second = srv.mark(Parameters(MarkArgs { id: "not-owed-again".to_string(), noise: true })).await;
+        let second = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "not-owed-again".to_string(), noise: true })).await;
         assert!(second.contains("already judged noise this session"), "{second}");
         assert!(second.contains("not counted again"), "{second}");
         assert!(!second.starts_with("judged noise again"), "one short of the threshold is not owed again: {second}");
@@ -8017,13 +8376,13 @@ mod tests {
         let mut args = base_remember("change-of-mind");
         args.always = false;
         args.targets = vec![TargetArg { kind: "command".to_string(), value: "force-push".to_string() }];
-        srv.remember(Parameters(args)).await;
+        srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         fired_once(&srv, "change-of-mind");
 
-        let first = srv.mark(Parameters(MarkArgs { id: "change-of-mind".to_string(), noise: false })).await;
+        let first = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "change-of-mind".to_string(), noise: false })).await;
         assert!(first.contains("marked useful"), "{first}");
 
-        let second = srv.mark(Parameters(MarkArgs { id: "change-of-mind".to_string(), noise: true })).await;
+        let second = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "change-of-mind".to_string(), noise: true })).await;
         assert!(second.contains("marked noise"), "a different verdict must still be written: {second}");
         assert!(second.contains("this session's earlier useful"), "{second}");
         assert!(second.contains("event seq"), "{second}");
@@ -8059,19 +8418,19 @@ mod tests {
         }
 
         let srv1 = server();
-        srv1.remember(Parameters(trigger_bound("fresh-process-1"))).await;
+        srv1.remember(Meta::new(), RawArgs::default(), Parameters(trigger_bound("fresh-process-1"))).await;
         fired_once(&srv1, "fresh-process-1");
-        let on_first = srv1.mark(Parameters(MarkArgs { id: "fresh-process-1".to_string(), noise: false })).await;
+        let on_first = srv1.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "fresh-process-1".to_string(), noise: false })).await;
         assert!(on_first.contains("marked useful"), "{on_first}");
         let repeat_same_instance =
-            srv1.mark(Parameters(MarkArgs { id: "fresh-process-1".to_string(), noise: false })).await;
+            srv1.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "fresh-process-1".to_string(), noise: false })).await;
         assert!(repeat_same_instance.contains("already judged"), "{repeat_same_instance}");
 
         let srv2 = server();
-        srv2.remember(Parameters(trigger_bound("fresh-process-1"))).await;
+        srv2.remember(Meta::new(), RawArgs::default(), Parameters(trigger_bound("fresh-process-1"))).await;
         fired_once(&srv2, "fresh-process-1");
         let on_fresh_instance =
-            srv2.mark(Parameters(MarkArgs { id: "fresh-process-1".to_string(), noise: false })).await;
+            srv2.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "fresh-process-1".to_string(), noise: false })).await;
         assert!(
             on_fresh_instance.contains("marked useful"),
             "a fresh process must write again, not remember another instance's verdict: {on_fresh_instance}"
@@ -8084,7 +8443,7 @@ mod tests {
     #[tokio::test]
     async fn status_counts_every_kind_including_zero() {
         let srv = server();
-        srv.remember(Parameters(base_remember("status-1"))).await;
+        srv.remember(Meta::new(), RawArgs::default(), Parameters(base_remember("status-1"))).await;
         let reply = srv.status().await;
         assert!(reply.contains("Rule: 1"), "{reply}");
         assert!(reply.contains("Report: 0"), "a kind with nothing declared must still show 0: {reply}");
@@ -8114,7 +8473,7 @@ mod tests {
         let srv = server();
         let mut args = base_remember("bad-kind-1");
         args.kind = "bogus".to_string();
-        let reply = srv.remember(Parameters(args)).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.contains("bogus"), "{reply}");
         assert!(reply.contains("rule"), "expects the valid list to be named: {reply}");
     }
@@ -8140,7 +8499,7 @@ mod tests {
         let path = dir.path().join("inbox.jsonl");
         let srv = replica(&path);
 
-        let reply = srv.remember(Parameters(base_remember("from-the-road"))).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(base_remember("from-the-road"))).await;
         assert!(reply.starts_with("queued for the main machine"), "{reply}");
 
         let stored = srv.get(Parameters(GetArgs { id: "from-the-road".to_string() })).await;
@@ -8161,7 +8520,7 @@ mod tests {
     async fn a_captured_write_replays_into_the_authority_as_a_normal_item() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("inbox.jsonl");
-        replica(&path).remember(Parameters(base_remember("captured-then-real"))).await;
+        replica(&path).remember(Meta::new(), RawArgs::default(), Parameters(base_remember("captured-then-real"))).await;
 
         let authority = server();
         let op = &inbox::read_all(&path).unwrap()[0];
@@ -8187,7 +8546,7 @@ mod tests {
         let path = dir.path().join("inbox.jsonl");
         let mut bad = base_remember("no-falsifier-here");
         bad.falsifier = None;
-        let on_the_spot = replica(&path).remember(Parameters(bad)).await;
+        let on_the_spot = replica(&path).remember(Meta::new(), RawArgs::default(), Parameters(bad)).await;
         assert!(on_the_spot.starts_with("REFUSED") && on_the_spot.contains("falsifier"), "{on_the_spot}");
         assert!(!path.exists(), "a write refused on the spot is never queued");
 
@@ -8245,7 +8604,7 @@ mod tests {
         seed_raw(&srv, &stale_neighbour("goes-stale"));
 
         // Now anything else on that same target is refused, by name.
-        let refusal = srv.remember(Parameters(anchored_args("the-next-one"))).await;
+        let refusal = srv.remember(Meta::new(), RawArgs::default(), Parameters(anchored_args("the-next-one"))).await;
         assert!(refusal.starts_with("REFUSED"), "the toll must fire through this door: {refusal}");
         assert!(refusal.contains("goes-stale"), "and name what to settle: {refusal}");
 
@@ -8280,7 +8639,7 @@ mod tests {
     async fn a_server_with_no_root_never_tolls_the_agent() {
         let srv = server();
         seed_raw(&srv, &stale_neighbour("goes-stale"));
-        let second = srv.remember(Parameters(anchored_args("the-next-one"))).await;
+        let second = srv.remember(Meta::new(), RawArgs::default(), Parameters(anchored_args("the-next-one"))).await;
         assert!(second.starts_with("stored "), "with no root there is nothing to check: {second}");
     }
     /// THE DEFECT THIS PREVENTS: a connector that comes up healthy, logs

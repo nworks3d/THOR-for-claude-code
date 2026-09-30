@@ -1184,7 +1184,8 @@ pub fn teeth_reason_tag(item: &Item) -> Option<&str> {
 /// Report (`crate::store::OPEN_POINT_TAG`); a tag `open:<id>:...` on the rule
 /// looks like one and counts for nothing. Measured: a session did exactly
 /// that on four rules and was refused again for all four, with no word on
-/// why. Refused here, with the recipe that does count.
+/// why. Refused here, saying what does count: since step 14 THOR writes and
+/// closes open points itself, so the way on is to settle the rule.
 fn teeth_answer_contradictions(existing: Option<&Item>, updated: &Item) -> Result<(), Refusal> {
     let is_new = |tag: &str| existing.is_none_or(|e| !e.tags.iter().any(|t| t == tag));
     if updated.kind != Kind::Report {
@@ -1194,12 +1195,10 @@ fn teeth_answer_contradictions(existing: Option<&Item>, updated: &Item) -> Resul
         }) {
             return Err(Refusal::new(
                 format!("the tag '{tag}' looks like an open point, but an open point is never a tag on the rule itself"),
-                format!(
-                    "leave the rule's tags alone and file the open point as its own small Report instead: remember \
-                     with kind \"report\", the same project as the evaluation report, tags [\"{}\"], and a text that \
-                     names this rule's id and the real call that would prove it (or what blocks the fix)",
-                    crate::store::OPEN_POINT_TAG
-                ),
+                "leave the rule's tags alone. Open points are written and closed by THOR itself, when its own trial \
+                 finds a rule held by something only the owner can lift - nobody files one. Settle the rule instead: \
+                 run THOR's trial on it (revise with only the rule's id) and make the one fix it names; the \
+                 evaluation's start note says how for each rule on its lists",
             ));
         }
     }
@@ -1547,10 +1546,132 @@ fn dropped_field(name: &'static str) -> Refusal {
     )
 }
 
+// ------------------------------------ the two sections of an evaluation report (step 15)
+//
+// A filed evaluation report is stored in two parts. THE MACHINE SECTION comes
+// first: THOR writes it at the filing, from its event log alone
+// (`crate::store::render_machine_section`), so what the report says was judged,
+// settled and written behind the evaluation's back is what the log says, never
+// what the session typed. Below it, after `AGENT_SECTION_BEGIN`, is the
+// session's own text - its TLDR and remarks, which settle nothing. The shapes
+// live here because the gate's own revise ground reads them: a revise of a
+// filed report keeps its machine block byte for byte.
+
+/// The machine section's first line, with `<N>` (the log position the
+/// evaluation started at) and `<F>` (the log position it was filed at) still
+/// to fill in (`machine_section_begin`).
+pub const MACHINE_SECTION_BEGIN: &str = "=== MACHINE SECTION: derived from the log, seq <N> to <F>; it cannot be edited ===";
+
+/// How the machine section's first line begins, up to `<N>`.
+pub const MACHINE_SECTION_PREFIX: &str = "=== MACHINE SECTION: derived from the log, seq ";
+
+/// The words no agent text may carry: the start of the machine section's
+/// header, however the rest of the line is spelled.
+pub const MACHINE_SECTION_MARK: &str = "=== MACHINE SECTION";
+
+/// The line the session's own text follows.
+pub const AGENT_SECTION_BEGIN: &str = "=== TLDR AND REMARKS: written by the evaluating session; they settle nothing ===";
+
+/// The machine section's first line for an evaluation started at log position
+/// `n` and filed at log position `f`.
+pub fn machine_section_begin(n: i64, f: i64) -> String {
+    MACHINE_SECTION_BEGIN.replace("<N>", &n.to_string()).replace("<F>", &f.to_string())
+}
+
+/// The machine block of a stored evaluation report: everything from its first
+/// byte up to and including the `AGENT_SECTION_BEGIN` line and its newline.
+/// `None` for a text that does not open with the machine section (a report
+/// filed before step 15 has none).
+pub fn machine_block(text: &str) -> Option<&str> {
+    if !text.starts_with(MACHINE_SECTION_PREFIX) {
+        return None;
+    }
+    let end = format!("\n\n{AGENT_SECTION_BEGIN}\n");
+    text.find(&end).map(|at| &text[..at + end.len()])
+}
+
+/// The session's own part of a stored evaluation report: what follows its
+/// machine block, or the whole text when it has none.
+pub fn agent_section(text: &str) -> &str {
+    machine_block(text).map_or(text, |block| &text[block.len()..])
+}
+
+/// The log positions a machine block's first line names: (N, F).
+pub fn machine_section_range(text: &str) -> Option<(i64, i64)> {
+    let line = machine_block(text)?.lines().next()?;
+    let (n, rest) = line.strip_prefix(MACHINE_SECTION_PREFIX)?.split_once(" to ")?;
+    let (f, _) = rest.split_once(';')?;
+    Some((n.trim().parse().ok()?, f.trim().parse().ok()?))
+}
+
+/// Whether `text` carries one of the two section headers - which only THOR
+/// writes.
+pub fn names_a_section_header(text: &str) -> bool {
+    text.contains(MACHINE_SECTION_MARK) || text.contains(AGENT_SECTION_BEGIN)
+}
+
+/// Whether `item` is an evaluation report: a Report carrying
+/// `crate::store::EVALUATION_REPORT_TAG`.
+pub fn is_evaluation_report(item: &Item) -> bool {
+    item.kind == Kind::Report && item.tags.iter().any(|t| t == crate::store::EVALUATION_REPORT_TAG)
+}
+
+/// Whether this revise FILES an evaluation report for a project it was not
+/// filed for before: the tag is newly added, OR a report that already
+/// carried it is moved to a different project.
+///
+/// THE HOLE THE SECOND HALF CLOSES (2026-09-26). The filing gate ran only
+/// when the tag was newly added, so an evaluation report already filed for
+/// ANOTHER project, revised onto this one, counted as this project's report
+/// without a single condition ever being checked here - measured on a copy
+/// of a real store: an old report of one project re-scoped to another went
+/// straight through. A move is a filing for the project it lands in.
+pub fn newly_filed_as_evaluation(existing: &Item, updated: &Item) -> bool {
+    is_evaluation_report(updated) && (!is_evaluation_report(existing) || existing.project != updated.project)
+}
+
+/// What a revise that changes a filed report's machine section is told.
+pub const MACHINE_SECTION_REFUSAL: &str = "the machine section of an evaluation report cannot be edited; revise only the TLDR \
+                                           and remarks below it";
+
+/// THE MACHINE-SECTION GROUND (step 15): a revise of an evaluation report
+/// that carries a machine block keeps that block byte for byte, and what it
+/// writes below it carries no section header. A revise that FILES the report
+/// (`newly_filed_as_evaluation`) is the store's own filing path, which writes
+/// a fresh machine section itself.
+fn check_machine_section_kept(existing: &Item, updated: &Item) -> Result<(), Refusal> {
+    if !is_evaluation_report(existing) || newly_filed_as_evaluation(existing, updated) {
+        return Ok(());
+    }
+    let fix = format!(
+        "leave everything from the first line down to and including the line '{AGENT_SECTION_BEGIN}' exactly as it is, and \
+         change only what follows that line: pass `append` to add a remark, `replace_from`/`replace_to` for words below \
+         that line, or `text` holding only your own new TLDR and remarks (THOR keeps its section above them)"
+    );
+    let kept = machine_block(&existing.text);
+    if machine_block(&updated.text) != kept {
+        return Err(Refusal::new(MACHINE_SECTION_REFUSAL, fix));
+    }
+    if kept.is_some() && names_a_section_header(agent_section(&updated.text)) {
+        return Err(Refusal::new(MACHINE_SECTION_REFUSAL, fix));
+    }
+    if kept.is_none() && names_a_section_header(&updated.text) && !names_a_section_header(&existing.text) {
+        return Err(Refusal::new(
+            "only THOR writes the machine section of an evaluation report, and this report was filed without one",
+            format!(
+                "drop the lines beginning '{MACHINE_SECTION_MARK}' and '=== TLDR AND REMARKS' from the text - a header typed \
+                 by hand settles nothing"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// The write-time gate for a revise: everything `declare` requires, PLUS no
 /// field the existing item had may silently vanish (refusal ground 9).
 pub fn revise(existing: &Item, updated: &Item) -> Result<(), Refusal> {
     teeth_answer_contradictions(Some(existing), updated)?;
+    check_machine_section_kept(existing, updated)?;
     // The same concession for ground 20: an item that was ALREADY anchored to
     // nothing but a symbol stays correctable. Refusing those would lock the
     // very backlog this ground exists to drain - you could no longer fix a
@@ -1608,6 +1729,9 @@ pub fn revise(existing: &Item, updated: &Item) -> Result<(), Refusal> {
     // made the point vanish from every list that asks about it, with no
     // reason recorded - measured on a copy of a real store, one revise did
     // it. Lowering the carried count re-opened the one carry the point has.
+    // LEGACY POINTS ONLY (step 14): ground 30 judges the open points an
+    // agent filed before THOR wrote them itself. THOR's own are written and
+    // closed by `eval-machine`, past this gate, and carry no `carried:` tag.
     if existing.tags.iter().any(|t| t == crate::store::OPEN_POINT_TAG) {
         if !updated.tags.iter().any(|t| t == crate::store::OPEN_POINT_TAG) {
             return Err(Refusal::new(
@@ -3011,6 +3135,47 @@ pub const TWO_TRACK_GROUND_CODES: &[&str] = &[
     "teeth_tag",
     "weakening_widened",
     "replica_evaluation_filing",
+    // Step 13: an id or tag THOR keeps for its evaluation start records.
+    "evaluation_start_reserved",
+    // Step 14: a tag only THOR writes on an open point (`open-point`,
+    // `about:`, `blocker:`) - the way on is to drop it and settle the rule.
+    "open_point_reserved",
+    // Step 14: a write on one of THOR's own open points. The point IS the
+    // owner's item: it says what clears it, holds nothing of the agent's, and
+    // closes itself - the way on for the agent is to leave it.
+    "machine_point_reserved",
+    // Step 14: a filing while THOR's machine pass has not finished - the way
+    // on is to end the turn once; the next Stop finishes the pass.
+    "evaluation_still_deciding",
+    // Step 15: an evaluation report that does not come through a THOR tool
+    // call Claude Code made (a script, a second client, the model CLI) - the
+    // way on is the THOR tool itself.
+    "evaluation_not_attested",
+    // Step 15: a report for a project this session has no evaluation open
+    // for - there is nothing to file; the way on is to file none.
+    "evaluation_not_open",
+    // Step 15 (D10): an item on the evaluation's frozen lists was changed
+    // outside an attested call of the evaluation - the evaluation is void and
+    // the next Stop starts a fresh one.
+    "evaluation_changed_behind",
+    // Step 15: a verdict or a write of the filing turn is not verified yet -
+    // the way on is to end the turn once and file again.
+    "evaluation_turn_not_ended",
+    // Step 15: a revise that edits a filed report's machine section, or an
+    // agent text that carries a section header - the way on is to change only
+    // the TLDR and remarks.
+    "evaluation_machine_section",
+    // Step 15 (D10): a write to an item on an open evaluation's frozen lists
+    // from a side door, refused on the spot - the way on is the THOR tool
+    // itself, inside Claude Code.
+    "frozen_item_side_door",
+    // Step 19 (G1, the final gate): the two filing refusals older than the
+    // table - an item on the frozen judgement list still owes a verdict (the
+    // way on is `mark`, or the not-judgeable tag), and a rule on the frozen
+    // batch or A4 list has no current verdict (the way on is THOR's trial:
+    // `revise` with the rule's id, or the fix the start note names).
+    "evaluation_judgement_owed",
+    "evaluation_batch_owed",
 ];
 
 /// Where a teeth candidate was found.
@@ -7028,6 +7193,32 @@ mod two_tracks_tests {
 
     // ------------------------------------------ the grounds switched on in step 8
 
+    /// K14 (step 14): an `answer-guard:<entry>` tag names where a rule about
+    /// what gets SAID is enforced; it answers no teeth question and settles
+    /// nothing - whether the entry it names exists or not. The gate stores
+    /// it like any other tag, and no reader of a teeth answer sees one in it.
+    #[test]
+    fn answer_guard_tag_settles_nothing() {
+        let tag = format!("{}no-such-entry", crate::store::ANSWER_GUARD_TAG_PREFIX);
+        assert_eq!(crate::store::teeth_answer(&tag), None, "not an answer to the teeth question");
+        assert_eq!(command_teeth_answer(&tag), None);
+
+        let mut item = base_rule();
+        item.text = "Every answer to the owner opens with a one-line summary.".to_string();
+        item.severity = Some(Severity::Costly);
+        item.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "README.md".to_string() }];
+        item.falsifier = Some("An answer without a summary line cost the owner nothing.".to_string());
+        item.tags = vec![tag];
+        declare(&item).expect("the tag is an ordinary tag to the gate");
+        assert_eq!(teeth_reason_tag(&item), None, "no reason stands in for a verdict, and this is not even a reason");
+        // Beside a check that refuses it is no contradiction either: it never
+        // claimed that nothing can catch the rule's mistake.
+        let mut checked = item.clone();
+        checked.text = "Every answer opens with a summary; README.md never says `no summary needed`.".to_string();
+        checked.check = Some(Check::Absent { path: "README.md".to_string(), literal: "no summary needed".to_string() });
+        declare(&checked).expect("an answer-guard tag beside a refusing check is not a contradiction");
+    }
+
     /// A project-scoped rule with no binding yet (ground 19 refuses a global
     /// rule anchored to a source file, which is not what these test).
     fn base_rule() -> Item {
@@ -7159,5 +7350,109 @@ mod two_tracks_tests {
         codes.sort();
         codes.dedup();
         assert_eq!(codes.len(), TWO_TRACK_GROUND_CODES.len());
+    }
+}
+
+/// The two sections of a filed evaluation report (step 15): a revise keeps
+/// the machine block byte for byte and may change only what follows it.
+#[cfg(test)]
+mod machine_section_tests {
+    use super::*;
+    use crate::item::{Item, Kind};
+
+    fn filed(own: &str) -> Item {
+        Item {
+            id: "eval-fxp-2026-09-28".to_string(),
+            kind: Kind::Report,
+            text: format!(
+                "{}\nEvery line of this machine section was computed by THOR from its event log.\nJUDGEMENT: 0 item(s) on the \
+                 frozen list.\n\n{AGENT_SECTION_BEGIN}\n{own}",
+                machine_section_begin(26, 30)
+            ),
+            bindings: vec![],
+            severity: None,
+            project: Some("fxp".to_string()),
+            tags: vec![crate::store::EVALUATION_REPORT_TAG.to_string()],
+            expires: None,
+            key: None,
+            falsifier: None,
+            check: None,
+        }
+    }
+
+    #[test]
+    fn the_block_and_the_agent_section_read_back() {
+        let item = filed("TLDR: evaluation of fxp. Nothing to add.");
+        let block = machine_block(&item.text).expect("a machine block");
+        assert!(block.starts_with("=== MACHINE SECTION: derived from the log, seq 26 to 30; it cannot be edited ===\n"));
+        assert!(block.ends_with(&format!("\n\n{AGENT_SECTION_BEGIN}\n")));
+        assert_eq!(agent_section(&item.text), "TLDR: evaluation of fxp. Nothing to add.");
+        assert_eq!(machine_section_range(&item.text), Some((26, 30)));
+        assert_eq!(machine_block("TLDR: an old report with no machine section."), None);
+        assert!(MACHINE_SECTION_BEGIN.starts_with(MACHINE_SECTION_PREFIX));
+        assert!(names_a_section_header(&item.text) && !names_a_section_header(agent_section(&item.text)));
+    }
+
+    /// R15.5: a revise that changes one word of the machine section - or
+    /// drops it, or puts a header below it - is refused, naming what may
+    /// change instead.
+    #[test]
+    fn revising_the_machine_block_is_refused() {
+        let existing = filed("TLDR: evaluation of fxp. Nothing to add.");
+        let mut typo = existing.clone();
+        typo.text = existing.text.replacen("machine section", "machine sectiom", 1);
+        assert_ne!(typo.text, existing.text, "fixture sanity");
+        let mut dropped = existing.clone();
+        dropped.text = "TLDR: evaluation of fxp. Nothing to add.".to_string();
+        let mut header_below = existing.clone();
+        header_below.text = format!("{}\n=== MACHINE SECTION: added by hand", existing.text);
+        for (what, updated) in [("a typo in the block", &typo), ("the block dropped", &dropped), ("a header below it", &header_below)] {
+            let err = revise(&existing, updated).expect_err(what);
+            assert!(
+                err.problem.starts_with(
+                    "the machine section of an evaluation report cannot be edited; revise only the TLDR and remarks below it"
+                ),
+                "{what}: {}",
+                err.problem
+            );
+            assert!(err.fix.contains("change only what follows that line"), "{what}: {}", err.fix);
+        }
+        // Dropping the tag changes nothing about it: the block stays.
+        let mut untagged = typo.clone();
+        untagged.tags = vec!["notes".to_string()];
+        assert!(revise(&existing, &untagged).is_err(), "the block is kept whatever the tags say");
+        // A report filed before step 15 cannot be given a machine header by hand.
+        let mut legacy = existing.clone();
+        legacy.text = "TLDR: an old report.".to_string();
+        let mut forged = legacy.clone();
+        forged.text = format!("TLDR: an old report.\n{MACHINE_SECTION_MARK}: all settled");
+        assert!(revise(&legacy, &forged).is_err(), "a hand-typed header on an old report");
+    }
+
+    /// G15.2: a revise that only fixes a typo below the agent header - or
+    /// appends a remark - goes through; so does any correction of an old
+    /// report that has no machine section at all.
+    #[test]
+    fn revising_only_the_tldr_is_allowed() {
+        let existing = filed("TLDR: evaluaton of fxp. Nothing to add.");
+        let mut fixed = existing.clone();
+        fixed.text = existing.text.replace("evaluaton", "evaluation");
+        assert_eq!(machine_block(&fixed.text), machine_block(&existing.text));
+        revise(&existing, &fixed).expect("a typo below the agent header");
+        let mut appended = existing.clone();
+        appended.text = format!("{}\nOne more remark.", existing.text);
+        revise(&existing, &appended).expect("an appended remark");
+        let mut legacy = existing.clone();
+        legacy.text = "TLDR: an old report.".to_string();
+        let mut legacy_fixed = legacy.clone();
+        legacy_fixed.text = "TLDR: an older report.".to_string();
+        revise(&legacy, &legacy_fixed).expect("an old report with no machine section stays correctable");
+        // Moving the report to another project FILES it there: the store's
+        // filing path writes a fresh section, so this ground stays out of it.
+        let mut moved = existing.clone();
+        moved.project = Some("other".to_string());
+        moved.text = "TLDR: evaluation of other.".to_string();
+        assert!(newly_filed_as_evaluation(&existing, &moved));
+        revise(&existing, &moved).expect("a move is a new filing, judged by the store");
     }
 }

@@ -1057,6 +1057,10 @@ struct Work<'a> {
     old_stock: Option<OldContainsStock>,
     /// The old contains check bit: the record carries `old_stock`.
     old_stock_granted: bool,
+    /// At a retest that A4 refuses: the check itself bites - it holds and the
+    /// hook's pipeline refuses its forbidden form and lets every clean form
+    /// through - so ONLY the naming is missing (K23).
+    a4_only: bool,
 }
 
 fn attempts_of(tried: &Tried, what: &str) -> Vec<TrialAttempt> {
@@ -1477,6 +1481,9 @@ impl<'a> Work<'a> {
         let a4_pre_existing = !unnamed.is_empty();
         let old_stock = a4_pre_existing && matches!(self.mode, Mode::Retest) && self.old_stock.is_some();
         if a4_pre_existing && !old_stock && (touches_check || matches!(self.mode, Mode::Retest)) {
+            if matches!(self.mode, Mode::Retest) {
+                self.a4_only = self.bites_but_for_the_naming(root_ok.as_deref());
+            }
             return self.a4_refusal();
         }
 
@@ -1841,6 +1848,25 @@ impl<'a> Work<'a> {
         }
     }
 
+    /// Whether the rule's check works as a tooth when the A4 naming is left
+    /// aside: a file check holds in the registered checkout, and the hook's
+    /// pipeline refuses the forbidden form and lets every clean form through.
+    /// What tells "only the words are missing" (K23: the A4 list) from a
+    /// check that needs more than a rewording.
+    fn bites_but_for_the_naming(&self, root: Option<&Path>) -> bool {
+        let item = self.item();
+        let Some(check) = &item.check else { return false };
+        let try_root = if is_file_check(check) {
+            match root {
+                Some(root) if truth(check, root).is_ok() => root.to_path_buf(),
+                _ => return false,
+            }
+        } else {
+            command_root(self.env.store, item.project.as_deref())
+        };
+        try_check(item, &try_root).bites()
+    }
+
     /// Old contains stock that does not bite (Q24): no exemption, so A4
     /// answers exactly as it would have - with one line saying why the old
     /// check was not counted.
@@ -1946,6 +1972,7 @@ fn new_work<'a>(
         forcing_words: Vec::new(),
         old_stock: None,
         old_stock_granted: false,
+        a4_only: false,
     }
 }
 
@@ -2030,6 +2057,10 @@ pub struct Retest {
     pub head_rev: String,
     /// The item to write and its record, for a rule or a note.
     pub write: Option<(Item, TrialRecord)>,
+    /// For a rule that needs the agent: its check bites and only the A4
+    /// naming is missing (K23) - the evaluation's machine pass lists those
+    /// apart from every other fix.
+    pub a4_only: bool,
 }
 
 /// The head of `id`: its item and its rev hash, when it has one live head.
@@ -2156,7 +2187,8 @@ pub fn retest(store: &EventStore, db: Option<&Path>, id: &str, corpus: &Corpus) 
         _ => None,
     };
     let project = model::normalize::normalize_project(item.project.as_deref());
-    Ok(Retest { id: id.to_string(), outcome, project, root: root.clone(), attempts, lines, fingerprint, head_rev, write: write_out })
+    let a4_only = work.a4_only && matches!(outcome, Maintenance::NeedsAgent(_));
+    Ok(Retest { id: id.to_string(), outcome, project, root: root.clone(), attempts, lines, fingerprint, head_rev, write: write_out, a4_only })
 }
 
 /// Why `apply` wrote nothing.
@@ -2243,6 +2275,7 @@ pub fn apply(store: &mut EventStore, retest: &Retest, actor: SystemActor) -> Res
         None,
         Some(record),
         Some(&retest.head_rev),
+        None,
     );
     match written {
         Ok(event) => Ok(event),
@@ -2258,6 +2291,79 @@ pub fn apply(store: &mut EventStore, retest: &Retest, actor: SystemActor) -> Res
 /// backfill loop), which may not build THOR's own actor token itself.
 pub fn apply_as_retest(store: &mut EventStore, retest: &Retest) -> Result<Event, ApplyError> {
     apply(store, retest, SystemActor::new("retest"))
+}
+
+/// Whether `retest`'s verdict rests on old contains stock (Q24): its record
+/// carries THOR's old-stock mark, which only the `retest` actor may write
+/// (`model::store`'s Q24 fence) - so a caller that writes verdicts under
+/// another of THOR's names writes this one through `apply_as_retest`.
+pub fn is_old_stock_verdict(retest: &Retest) -> bool {
+    retest.write.as_ref().is_some_and(|(_, record)| record.fields().a4_old_stock.is_some())
+}
+
+/// Whether a rule-track `contains` rule has to be tried again at an
+/// evaluation start (K9), and why: its record says the literal was not
+/// committed yet (`uncommitted`), or the file changed since the trial
+/// (`file_blob` is no longer the blob `git hash-object` gives the file now,
+/// or the file is gone). `None` for every other item - nothing to try again.
+///
+/// `root` is the registered checkout; `blobs` holds the current blob hash of
+/// every check path that is a readable file (`blob_hashes`). A check on a
+/// DIRECTORY is tried on one of its children, so it has no one blob to
+/// compare: it is tried again only while its record says `uncommitted`.
+pub fn contains_retry_due(
+    store: &EventStore,
+    id: &str,
+    item: &Item,
+    root: &Path,
+    blobs: &std::collections::HashMap<String, String>,
+) -> Option<&'static str> {
+    let Some(Check::Contains { path, .. }) = &item.check else { return None };
+    let record = model::store::current_record(store, id)?;
+    let fields = record.fields();
+    if !matches!(fields.verdict, RecordedVerdict::RuleProven | RecordedVerdict::RuleWired) {
+        return None;
+    }
+    if fields.uncommitted {
+        return Some("its literal was not committed when it was last tried");
+    }
+    if root.join(path).is_dir() {
+        return None;
+    }
+    match (fields.file_blob.as_deref(), blobs.get(path).map(String::as_str)) {
+        (None, _) => None,
+        (Some(then), Some(now)) if then == now => None,
+        (Some(_), Some(_)) => Some("its file changed since it was last tried"),
+        (Some(_), None) => Some("its file is gone or unreadable since it was last tried"),
+    }
+}
+
+/// Whether writing `retest`'s verdict would change nothing a reader cares
+/// about: the rule's current record already says the same verdict, the same
+/// `uncommitted` and the same file blob. A rule tried again at an evaluation
+/// start and found exactly as before is left alone, not rewritten.
+pub fn same_as_current_record(store: &EventStore, retest: &Retest) -> bool {
+    let (Some((_, new)), Some(old)) = (&retest.write, model::store::current_record(store, &retest.id)) else { return false };
+    let (new, old) = (new.fields(), old.fields());
+    new.verdict == old.verdict && new.uncommitted == old.uncommitted && new.file_blob == old.file_blob
+}
+
+/// The current blob hash of each of `paths` (relative to `root`), from ONE
+/// `git hash-object` call; a path that is not a readable file has none.
+pub fn blob_hashes(root: &Path, paths: &[String]) -> std::collections::HashMap<String, String> {
+    let existing: Vec<&String> = paths.iter().filter(|p| root.join(p.as_str()).is_file()).collect();
+    if existing.is_empty() {
+        return Default::default();
+    }
+    let mut args: Vec<String> = vec!["hash-object".to_string(), "--".to_string()];
+    args.extend(existing.iter().map(|p| git_path(p)));
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let Some(out) = git(root, &arg_refs) else { return Default::default() };
+    let hashes: Vec<&str> = out.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    if hashes.len() != existing.len() {
+        return Default::default();
+    }
+    existing.into_iter().cloned().zip(hashes.into_iter().map(str::to_string)).collect()
 }
 
 // ------------------------------------------------------------ at the write

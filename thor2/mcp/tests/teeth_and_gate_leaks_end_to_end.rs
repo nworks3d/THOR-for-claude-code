@@ -28,19 +28,25 @@ struct Mcp {
     stdin: ChildStdin,
     lines: Receiver<String>,
     next_id: u64,
+    next_call: u64,
 }
 
 impl Mcp {
     fn start(db: &Path, cwd: &Path) -> Mcp {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_mcp"))
-            .arg("--db")
-            .arg(db)
-            .current_dir(cwd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn mcp");
+        Mcp::start_as(db, cwd, None)
+    }
+
+    /// The server as Claude Code starts it for `session`: its session id in
+    /// the environment (never inherited from the environment the tests run
+    /// in), and a home of its own so no real transcript is ever read.
+    fn start_as(db: &Path, cwd: &Path, session: Option<&str>) -> Mcp {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_mcp"));
+        cmd.arg("--db").arg(db).current_dir(cwd);
+        cmd.env_remove("CLAUDE_CODE_SESSION_ID");
+        if let Some(session) = session {
+            cmd.env("CLAUDE_CODE_SESSION_ID", session).env("USERPROFILE", cwd).env("HOME", cwd);
+        }
+        let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().expect("spawn mcp");
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         let (tx, rx) = channel();
@@ -51,7 +57,7 @@ impl Mcp {
                 }
             }
         });
-        let mut mcp = Mcp { child, stdin, lines: rx, next_id: 1 };
+        let mut mcp = Mcp { child, stdin, lines: rx, next_id: 1, next_call: 0 };
         mcp.request(
             "initialize",
             serde_json::json!({"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}}),
@@ -80,7 +86,21 @@ impl Mcp {
 
     /// One tool call; the text of its reply.
     fn call(&mut self, tool: &str, args: serde_json::Value) -> String {
-        let v = self.request("tools/call", serde_json::json!({"name": tool, "arguments": args}));
+        self.call_params(serde_json::json!({"name": tool, "arguments": args}))
+    }
+
+    /// One tool call the way Claude Code makes it: its `_meta` names the
+    /// calling tool_use. With no transcript on disk the server sees it
+    /// unseen, and never refuses for that (step 12, K21) - the only way an
+    /// evaluation report is filed at all (step 15).
+    fn call_meta(&mut self, tool: &str, args: serde_json::Value) -> String {
+        self.next_call += 1;
+        let id = format!("toolu_leak_{}", self.next_call);
+        self.call_params(serde_json::json!({"name": tool, "arguments": args, "_meta": {"claudecode/toolUseId": id}}))
+    }
+
+    fn call_params(&mut self, params: serde_json::Value) -> String {
+        let v = self.request("tools/call", params);
         v["result"]["content"]
             .as_array()
             .map(|parts| parts.iter().filter_map(|p| p["text"].as_str()).collect::<Vec<_>>().join("\n"))
@@ -124,22 +144,43 @@ fn served_in(store: &mut EventStore, session: &str, id: &str, n: usize) {
     }
 }
 
-fn now_unix() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
+/// The evaluation start, written by the very function the hook calls
+/// (`serve::eval_session::start`): `session` starts evaluating `project` at
+/// the log's current tip - the start record with the judgement list frozen
+/// there, THOR's own pass over the project's old rules, then the batch
+/// record (step 14). The server finds it by the session it runs for
+/// (`Mcp::start_as`).
+fn open_start(db: &Path, session: &str, project: &str) {
+    with_store(db, |s| {
+        let started = serve::eval_session::start(db, s, session, project, "skill").expect("the evaluation starts");
+        assert!(started.fresh && started.start.frozen.decided(), "{started:?}");
+    });
 }
 
-/// The hook's evaluation handover, written the way the hook writes it
-/// (`serve::eval_session`): `session` started evaluating `project` at the
-/// log's current tip, and is filing `report_id`. The file is the contract
-/// between the hook and this server, so it is written by hand here.
-fn handover(db: &Path, session: &str, project: &str, report_id: &str) {
-    let tip = EventStore::open_existing(db).unwrap().get_next_seq().unwrap() - 1;
-    let now = now_unix();
-    let json = serde_json::json!({
-        "evaluations": [{"session_id": session, "project": project, "started_seq": tip, "started_unix": now, "started_by": "skill"}],
-        "filings": [{"report_id": report_id, "session_id": session, "project": project, "at_unix": now}],
+/// An evaluation start of `project` by `session` whose frozen batch hands
+/// the agent every rule the live batch owes (`serve::attest::fixture::
+/// live_batch_start`) - for the tests about what the FILING GATE accepts as
+/// settled, which THOR's real machine pass would decide itself first.
+fn open_start_with_the_live_batch(db: &Path, session: &str, project: &str) {
+    with_store(db, |s| {
+        serve::attest::fixture::live_batch_start(s, session, project);
     });
-    std::fs::write(db.parent().unwrap().join("evaluation-sessions.json"), json.to_string()).unwrap();
+}
+
+/// Record the newest verdict on `id` as attested for `session`, the way the
+/// Stop hook's attester records it once the call's lines are in the
+/// session's transcript (`serve::attest::record_write_verifications`).
+fn attest_newest_verdict(db: &Path, id: &str, session: &str) {
+    with_store(db, |s| {
+        let events = s.get_events_by_entity(id).unwrap();
+        let mark = events
+            .iter()
+            .rev()
+            .find(|e| matches!(e.kind, EventKind::ItemMarkedUseful | EventKind::ItemMarkedNoise))
+            .expect("a verdict to attest");
+        let body = serde_json::json!({"event_seq": mark.seq, "attested": true, "session": session, "agent_id": null, "why": "fixture"});
+        s.append_event(session, session, "attester", EventKind::GateStoodAside, id, None, &body.to_string()).unwrap();
+    });
 }
 
 /// Register `root` as `key`'s working copy the way the installer writes it
@@ -277,8 +318,9 @@ fn an_informing_label_alone_never_lets_an_evaluation_through_and_the_refusal_nam
     );
     let db = store_with(tmp.path(), &[report("eval-old", "p", &["evaluation-report"]), heavy]);
     with_store(&db, |s| served(s, "labelled-heavy", 1));
-    let mut mcp = Mcp::start(&db, tmp.path());
-    let reply = mcp.call("remember", eval_report_args("eval-new", "p"));
+    open_start_with_the_live_batch(&db, "s", "p");
+    let mut mcp = Mcp::start_as(&db, tmp.path(), Some("s"));
+    let reply = mcp.call_meta("remember", eval_report_args("eval-new", "p"));
     assert!(reply.contains("REFUSED") && reply.contains("labelled-heavy"), "{reply}");
     assert!(!reply.contains("backfill_teeth"), "a bulk relabel is never the way out: {reply}");
 }
@@ -299,14 +341,23 @@ fn a_reason_settles_nothing_and_the_trial_the_refusal_names_does() {
     );
     let db = store_with(tmp.path(), &[report("eval-old", "p", &["evaluation-report"]), heavy]);
     with_store(&db, |s| served(s, "honest-heavy", 1));
-    let mut mcp = Mcp::start(&db, tmp.path());
-    let reply = mcp.call("remember", eval_report_args("eval-new", "p"));
+    open_start_with_the_live_batch(&db, "s", "p");
+    let mut mcp = Mcp::start_as(&db, tmp.path(), Some("s"));
+    let reply = mcp.call_meta("remember", eval_report_args("eval-new", "p"));
     assert!(reply.contains("REFUSED") && reply.contains("honest-heavy"), "a reason is no answer: {reply}");
     assert!(reply.contains("mcp__thor__revise with only the rule's id"), "{reply}");
     assert!(reply.contains("retest --id 'honest-heavy'"), "{reply}");
+    // The rule is on the evaluation's frozen batch: a side door may not
+    // touch it (step 15), THOR's own tool may.
     let reply = mcp.call("revise", serde_json::json!({"id": "honest-heavy"}));
+    assert!(reply.starts_with("REFUSED: 'honest-heavy' is on the frozen lists of an open evaluation"), "{reply}");
+    let reply = mcp.call_meta("revise", serde_json::json!({"id": "honest-heavy"}));
     assert!(reply.starts_with("revised") && reply.contains("teeth: note - "), "{reply}");
-    let reply = mcp.call("remember", eval_report_args("eval-new", "p"));
+    // The Stop checks that call; then the note the trial reached settles it.
+    with_store(&db, |s| {
+        serve::attest::fixture::attest_every_write(s, "s");
+    });
+    let reply = mcp.call_meta("remember", eval_report_args("eval-new", "p"));
     assert!(reply.starts_with("stored"), "the note the trial reached settles it: {reply}");
 }
 // ------------------------------------------------------------------ C
@@ -317,9 +368,9 @@ fn the_filing_refusal_names_the_items_that_owe_a_judgement() {
     let light = rule("owed-light", Some("p"), None, vec![command("fixture-cmd")], vec![]);
     let db = store_with(tmp.path(), &[report("seed-p", "p", &[]), light]);
     with_store(&db, |s| served(s, "owed-light", 40));
-    handover(&db, "s", "p", "eval-new");
-    let mut mcp = Mcp::start(&db, tmp.path());
-    let reply = mcp.call("remember", eval_report_args("eval-new", "p"));
+    open_start(&db, "s", "p");
+    let mut mcp = Mcp::start_as(&db, tmp.path(), Some("s"));
+    let reply = mcp.call_meta("remember", eval_report_args("eval-new", "p"));
     assert!(reply.contains("REFUSED") && reply.contains("'owed-light'"), "the owed item is named: {reply}");
 }
 
@@ -328,7 +379,7 @@ fn the_filing_refusal_names_the_items_that_owe_a_judgement() {
 // MEASURED 2026-09-26: a fresh evaluation filed its report eight times and
 // was refused eight times on a list that kept growing, then stamped sixty
 // items useful, some it never saw fire. These drive the fix through the
-// real server, with the hook's handover written by hand.
+// real server, with the hook's start record written by hand.
 
 #[test]
 fn a_report_is_never_held_for_items_that_fired_only_in_another_session() {
@@ -342,9 +393,9 @@ fn a_report_is_never_held_for_items_that_fired_only_in_another_session() {
         serve::teeth::fixture::decide(s, "fired-elsewhere");
     });
     with_store(&db, |s| served_in(s, "a-parallel-session", "fired-elsewhere", 40));
-    handover(&db, "this-session", "p", "eval-new");
-    let mut mcp = Mcp::start(&db, tmp.path());
-    let reply = mcp.call("remember", eval_report_args("eval-new", "p"));
+    open_start(&db, "this-session", "p");
+    let mut mcp = Mcp::start_as(&db, tmp.path(), Some("this-session"));
+    let reply = mcp.call_meta("remember", eval_report_args("eval-new", "p"));
     assert!(reply.starts_with("stored"), "another session's firings are not this report's to settle: {reply}");
     assert!(reply.contains("1 item(s) stay owed store-wide"), "and the receipt says what stays owed: {reply}");
 }
@@ -366,17 +417,24 @@ fn the_judgement_list_is_fixed_when_the_evaluation_starts() {
         served(s, "owed-before-start", 40);
         served(s, "remember-bound-during", 39);
     });
-    handover(&db, "s", "p", "eval-new");
+    open_start(&db, "s", "p");
     // The evaluation's own writes fire it past the threshold, after the start.
     with_store(&db, |s| served(s, "remember-bound-during", 5));
-    let mut mcp = Mcp::start(&db, tmp.path());
-    let reply = mcp.call("remember", eval_report_args("eval-new", "p"));
+    let mut mcp = Mcp::start_as(&db, tmp.path(), Some("s"));
+    let reply = mcp.call_meta("remember", eval_report_args("eval-new", "p"));
     assert!(reply.contains("REFUSED") && reply.contains("'owed-before-start'"), "{reply}");
     assert!(!reply.contains("remember-bound-during"), "nothing after the start joins the list: {reply}");
 
     let marked = mcp.call("mark", serde_json::json!({"id": "owed-before-start"}));
     assert!(!marked.contains("REFUSED"), "{marked}");
-    let reply = mcp.call("remember", eval_report_args("eval-new", "p"));
+    // Step 13: a verdict settles the list only once its recorded attestation
+    // says it came through a THOR call of the evaluating session. This one
+    // carries no tool_use id at all, so until a Stop has recorded it as
+    // attested it settles nothing.
+    let reply = mcp.call_meta("remember", eval_report_args("eval-new", "p"));
+    assert!(reply.contains("REFUSED") && reply.contains("'owed-before-start'"), "an unverified verdict settles nothing: {reply}");
+    attest_newest_verdict(&db, "owed-before-start", "s");
+    let reply = mcp.call_meta("remember", eval_report_args("eval-new", "p"));
     assert!(reply.starts_with("stored"), "the fixed list is settled: {reply}");
 }
 
@@ -392,11 +450,11 @@ fn an_honest_skip_lets_the_report_file_and_the_item_stays_owed() {
         serve::teeth::fixture::decide(s, "unsure-item");
     });
     with_store(&db, |s| served(s, "unsure-item", 40));
-    handover(&db, "s", "p", "eval-new");
-    let mut mcp = Mcp::start(&db, tmp.path());
+    open_start(&db, "s", "p");
+    let mut mcp = Mcp::start_as(&db, tmp.path(), Some("s"));
     let mut args = eval_report_args("eval-new", "p");
     args["tags"] = serde_json::json!(["evaluation-report", "not-judgeable:unsure-item:it fired on a log grep I never opened"]);
-    let reply = mcp.call("remember", args);
+    let reply = mcp.call_meta("remember", args);
     assert!(reply.starts_with("stored"), "an explicit skip with a reason settles it for this filing: {reply}");
     assert!(reply.contains("1 skipped"), "{reply}");
     assert!(reply.contains("1 item(s) stay owed store-wide"), "{reply}");
@@ -449,8 +507,8 @@ fn moving_another_projects_report_here_is_held_to_this_projects_gate() {
     let light = rule("owed-here", Some("p"), None, vec![command("fixture-cmd")], vec![]);
     let db = store_with(tmp.path(), &[report("seed-p", "p", &[]), report("eval-elsewhere", "q", &["evaluation-report"]), light]);
     with_store(&db, |s| served(s, "owed-here", 40));
-    handover(&db, "s", "p", "eval-elsewhere");
-    let mut mcp = Mcp::start(&db, tmp.path());
+    open_start(&db, "s", "p");
+    let mut mcp = Mcp::start_as(&db, tmp.path(), Some("s"));
     let reply = mcp.call("revise", serde_json::json!({"id": "eval-elsewhere", "project": "p"}));
     assert!(reply.contains("REFUSED"), "moving a filed report is a filing for the project it lands in: {reply}");
 }
@@ -510,17 +568,31 @@ fn an_open_point_cannot_be_revised_out_of_existence() {
     assert!(reply.contains("REFUSED"), "an open point is closed by retracting it, never by dropping its tag: {reply}");
 }
 
+/// Step 14: an open point an agent filed before THOR wrote them itself (a
+/// legacy point) holds no filing - carried or not, however many reports
+/// later - and nobody files a new one.
 #[test]
-fn a_carried_open_point_blocks_the_filing_after_the_next_one() {
+fn a_legacy_open_point_never_holds_a_filing() {
     let tmp = tempfile::tempdir().unwrap();
     let db = store_with(tmp.path(), &[report("open-2", "p", &["open-point"])]);
-    let mut mcp = Mcp::start(&db, tmp.path());
-    let first = mcp.call("remember", eval_report_args("eval-1", "p"));
+    let mut mcp = Mcp::start_as(&db, tmp.path(), Some("s"));
+    // Three evaluations in a row, each filed through THOR's own tool.
+    open_start(&db, "s", "p");
+    let first = mcp.call_meta("remember", eval_report_args("eval-1", "p"));
     assert!(first.starts_with("stored"), "{first}");
     let carried = mcp.call("revise", serde_json::json!({"id": "open-2", "tags": ["open-point", "carried:1"]}));
-    assert!(carried.starts_with("revised"), "{carried}");
-    let second = mcp.call("remember", eval_report_args("eval-2", "p"));
-    assert!(second.starts_with("stored"), "the carry covers one filing: {second}");
-    let third = mcp.call("remember", eval_report_args("eval-3", "p"));
-    assert!(third.contains("REFUSED") && third.contains("open-2"), "the carry is used up: {third}");
+    assert!(carried.starts_with("revised"), "a tag it already carries is not a new open point: {carried}");
+    open_start(&db, "s", "p");
+    let second = mcp.call_meta("remember", eval_report_args("eval-2", "p"));
+    assert!(second.starts_with("stored"), "{second}");
+    open_start(&db, "s", "p");
+    let third = mcp.call_meta("remember", eval_report_args("eval-3", "p"));
+    assert!(third.starts_with("stored"), "a legacy point holds no filing, ever: {third}");
+
+    let fresh = mcp.call(
+        "remember",
+        serde_json::json!({"id": "open-3", "kind": "report", "project": "p", "tags": ["open-point"], "text": "The push rule still needs a real call, later."}),
+    );
+    assert!(fresh.starts_with("REFUSED: open points are written and closed by THOR itself"), "{fresh}");
+    assert!(mcp.call("get", serde_json::json!({"id": "open-3"})).contains("no item"), "nothing stored");
 }

@@ -10,8 +10,10 @@
 //! trial and the retest) and `model::gate::TWO_TRACK_GROUND_CODES` (the write
 //! grounds switched on in step 8) - and `every_code_has_exactly_one_row`
 //! fails when a code is added without a row (R8.26), or a row outlives its
-//! code. No row routes to the owner queue: that queue arrives with part B,
-//! and until then every code here has an agent-runnable way on.
+//! code. No row routes to the owner queue. The queue holds THOR's own open
+//! points (a working copy nobody registered, a checkout mid-change), which
+//! are blockers and never refusals an agent is told to live with, so every
+//! code here has an agent-runnable way on.
 //!
 //! Writes go through the real compiled `mcp` binary; a retest runs the
 //! library's own `serve::teeth::retest` on the same store file.
@@ -43,6 +45,18 @@ const ROWS: &[&str] = &[
     "teeth_tag",
     "weakening_widened",
     "replica_evaluation_filing",
+    "evaluation_start_reserved",
+    "open_point_reserved",
+    "machine_point_reserved",
+    "evaluation_still_deciding",
+    "evaluation_not_attested",
+    "evaluation_not_open",
+    "evaluation_changed_behind",
+    "evaluation_turn_not_ended",
+    "evaluation_machine_section",
+    "frozen_item_side_door",
+    "evaluation_judgement_owed",
+    "evaluation_batch_owed",
 ];
 
 /// R8.26: a code without a row, or a row without a code, fails here.
@@ -379,6 +393,21 @@ fn weakening_widened_says_give_because_and_giving_it_lands() {
 }
 
 #[test]
+fn evaluation_start_reserved_says_pick_another_id_and_that_lands() {
+    let fx = Fx::new(&["demo"]);
+    let mut mcp = fx.mcp();
+    let report = |id: &str| json!({"id": id, "kind": "report", "project": "demo", "text": "Notes on where the demo evaluation began."});
+    let reply = mcp.call("remember", report("evaluation-start-demo-7"));
+    assert!(reply.contains("Give your own item an id that does not begin with 'evaluation-start-'"), "{reply}");
+    let mut tagged = report("notes-demo-start");
+    tagged["tags"] = json!(["evaluation-start"]);
+    let reply = mcp.call("remember", tagged);
+    assert!(reply.contains("Drop 'evaluation-start' from the tags"), "{reply}");
+    let reply = mcp.call("remember", report("notes-demo-start"));
+    assert!(landed(&reply), "{reply}");
+}
+
+#[test]
 fn replica_evaluation_filing_says_file_it_on_the_main_machine_and_that_lands() {
     let fx = Fx::new(&["demo"]);
     let inbox = fx.dir().join("inbox.jsonl");
@@ -387,6 +416,267 @@ fn replica_evaluation_filing_says_file_it_on_the_main_machine_and_that_lands() {
     let reply = replica.call("remember", report.clone());
     assert!(reply.starts_with("REFUSED:") && reply.contains("file the report from a session on the main machine"), "{reply}");
     drop(replica);
-    let reply = fx.mcp().call("remember", report);
+    // On the main machine, in the session that runs the evaluation, through
+    // THOR's own tool (step 15): it files.
+    let mut s = session(&fx);
+    s.prompt("/t-eval");
+    let mut mcp = s.mcp();
+    let reply = s.call(&mut mcp, "remember", report, "toolu_main_filing");
     assert!(landed(&reply), "on the main machine it files: {reply}");
+}
+
+#[test]
+fn open_point_reserved_says_drop_the_tag_and_that_lands() {
+    let fx = Fx::new(&["demo"]);
+    let mut mcp = fx.mcp();
+    let note = |tags: serde_json::Value| json!({"id": "push-rule-still-open", "kind": "report", "project": "demo", "tags": tags, "text": "The push rule still needs a real call, later."});
+    for tag in ["open-point", "about:push-rule", "blocker:no-working-copy"] {
+        let reply = mcp.call("remember", note(json!([tag])));
+        assert!(reply.starts_with("REFUSED: open points are written and closed by THOR itself; settle the rule instead"), "{tag}: {reply}");
+        assert!(reply.contains("Drop the tag") && reply.contains("mcp__thor__revise with only the rule's id"), "{tag}: {reply}");
+    }
+    assert_eq!(events_of(&fx.db, "push-rule-still-open").len(), 0, "nothing written");
+    let reply = mcp.call("remember", note(json!([])));
+    assert!(landed(&reply), "without the tag it is an ordinary note: {reply}");
+}
+
+/// A rule of a project with no registered working copy, held by THOR's own
+/// open point after an evaluation start by `session`.
+fn evaluation_with_a_machine_point(fx: &Fx, session: &str) -> model::store::EvaluationStart {
+    let held = item("demo-keeps", "README.md keeps `x marks it`.", vec![path("README.md")], Some(Check::Contains { path: "README.md".to_string(), literal: "x marks it".to_string() }), Some("demo"));
+    seed_raw(&fx.db, &held);
+    let mut store = EventStore::open_existing(&fx.db).unwrap();
+    serve::eval_session::start(&fx.db, &mut store, session, "demo", "command").expect("the evaluation starts").start
+}
+
+#[test]
+fn machine_point_reserved_says_it_closes_itself_and_it_holds_nothing_of_the_agents() {
+    let fx = Fx::new(&["demo"]);
+    let start = evaluation_with_a_machine_point(&fx, WRITING_SESSION);
+    assert_eq!(start.frozen.machine.as_ref().map(|m| m.blocked), Some(1));
+    let point = "open-no-working-copy-demo";
+    let before = events_of(&fx.db, point).len();
+    assert_eq!(before, 1, "THOR wrote its own point");
+
+    let mut mcp = Mcp::start_with(Start { db: &fx.db, cwd: fx.dir(), session: Some(WRITING_SESSION), args: vec![], home: None });
+    let reply = mcp.call("retract", json!({"id": point, "reason": "closing it by hand, the folder is registered"}));
+    assert!(reply.starts_with("REFUSED: this open point is THOR's own; it closes itself when its subject settles"), "{reply}");
+    assert!(reply.contains("the owner registers the folder"), "it names whose step it is: {reply}");
+    let reply = mcp.call("revise", json!({"id": point, "text": "Closed by hand."}));
+    assert!(reply.starts_with("REFUSED: this open point is THOR's own"), "{reply}");
+    assert_eq!(events_of(&fx.db, point).len(), before, "nothing written");
+
+    // The way on for the agent is to leave it: the point holds no filing
+    // (filed through THOR's own tool in the evaluating session, step 15).
+    let mut s = session(&fx);
+    let mut filer = s.mcp();
+    let reply = s.call(&mut filer, "remember", report_args("eval-demo-1", "demo", "An evaluation of demo."), "toolu_mp_filing");
+    assert!(landed(&reply), "a rule held by THOR's own point holds no filing: {reply}");
+}
+
+#[test]
+fn evaluation_still_deciding_says_end_the_turn_once_and_then_it_lands() {
+    let fx = Fx::new(&["demo"]);
+    {
+        // What a hook killed between its two writes leaves: the start record
+        // with no batch.
+        let mut store = EventStore::open_existing(&fx.db).unwrap();
+        let began = serve::eval_session::begin(&fx.db, &mut store, WRITING_SESSION, "demo", "stop-ask").unwrap();
+        assert!(!began.start.frozen.decided());
+    }
+    let mut s = session(&fx);
+    let mut mcp = s.mcp();
+    let report = report_args("eval-demo-1", "demo", "An evaluation of demo.");
+    let reply = s.call(&mut mcp, "remember", report.clone(), "toolu_deciding_1");
+    assert!(reply.starts_with("REFUSED:") && reply.contains("THOR is still deciding the old rules - end this turn once and the start note will list what is yours to do"), "{reply}");
+    assert_eq!(events_of(&fx.db, "eval-demo-1").len(), 0, "nothing written");
+    // Ending the turn: the session's Stop finishes the pass (`resume`).
+    {
+        let mut store = EventStore::open_existing(&fx.db).unwrap();
+        assert_eq!(serve::eval_session::resume(&mut store, WRITING_SESSION).len(), 1);
+    }
+    let reply = s.call(&mut mcp, "remember", report, "toolu_deciding_2");
+    assert!(landed(&reply), "{reply}");
+}
+
+// ------------------------------------------------------------ the filing, step 15
+
+/// The evaluating session of `fx`'s store: `WRITING_SESSION`, working in a
+/// folder of project demo (`common::Session`, the shared attested fixture).
+fn session(fx: &Fx) -> Session {
+    Session::with_store(fx.dir(), fx.db.clone(), WRITING_SESSION)
+}
+
+/// A rule of demo decided by THOR's trial (a note) that fired 40 times in
+/// the evaluating session: on the next start's judgement list.
+fn listed(fx: &Fx, id: &str) {
+    let mut rule = item(id, &format!("Run the fixture check {id} first."), vec![cmd(&format!("fixture-{id}"))], None, Some("demo"));
+    rule.severity = None;
+    seed_raw(&fx.db, &rule);
+    let mut store = EventStore::open_existing(&fx.db).unwrap();
+    serve::teeth::fixture::decide(&mut store, id);
+    for _ in 0..40 {
+        serve::deliver::record_delivery(&mut store, WRITING_SESSION, WRITING_SESSION, "hook", "2026-09-28T00:00:00Z", &[id.to_string()]);
+    }
+}
+
+fn demo_report() -> serde_json::Value {
+    report_args("eval-demo-1", "demo", "An evaluation of demo.")
+}
+
+#[test]
+fn evaluation_not_attested_says_file_it_with_the_thor_tool_and_that_lands() {
+    let fx = Fx::new(&["demo"]);
+    let mut s = session(&fx);
+    s.prompt("/t-eval");
+    let mut mcp = s.mcp();
+    let reply = mcp.call("remember", demo_report());
+    assert!(reply.starts_with("REFUSED: this evaluation report is not coming through a THOR tool call"), "{reply}");
+    assert!(reply.contains("File it with the THOR tool itself") && reply.contains("load it with ToolSearch"), "{reply}");
+    assert_eq!(events_of(&fx.db, "eval-demo-1").len(), 0, "nothing written");
+    let reply = s.call(&mut mcp, "remember", demo_report(), "toolu_na_file");
+    assert!(landed(&reply), "the same call through the THOR tool: {reply}");
+}
+
+#[test]
+fn evaluation_not_open_says_file_nothing_until_one_starts_and_then_it_lands() {
+    let fx = Fx::new(&["demo"]);
+    let mut s = session(&fx);
+    let mut mcp = s.mcp();
+    let reply = s.call(&mut mcp, "remember", demo_report(), "toolu_no_1");
+    assert!(
+        reply.starts_with(
+            "REFUSED: this evaluation report cannot be filed: no evaluation of 'demo' is open in this session (THOR's log holds no start record for it)"
+        ),
+        "{reply}"
+    );
+    assert!(reply.contains("There is nothing to file now, so file nothing"), "{reply}");
+    assert_eq!(events_of(&fx.db, "eval-demo-1").len(), 0, "nothing written");
+    // Once an evaluation starts (the Stop ask, or the owner's /thor-eval),
+    // the report files.
+    s.prompt("/t-eval");
+    let reply = s.call(&mut mcp, "remember", demo_report(), "toolu_no_2");
+    assert!(landed(&reply), "{reply}");
+}
+
+#[test]
+fn evaluation_changed_behind_says_end_the_turn_and_the_fresh_evaluation_lands() {
+    let fx = Fx::new(&["demo"]);
+    listed(&fx, "listed-a");
+    let mut s = session(&fx);
+    s.prompt("/t-eval");
+    {
+        let mut store = EventStore::open_existing(&fx.db).unwrap();
+        model::store::retract(&mut store, "shell", "shell", "cli", "listed-a", "fixture-listed-a is gone", None).unwrap();
+    }
+    let mut mcp = s.mcp();
+    let reply = s.call(&mut mcp, "remember", demo_report(), "toolu_cb_1");
+    assert!(reply.starts_with("REFUSED: 'listed-a' was changed at log seq") && reply.contains("End this turn"), "{reply}");
+    // The turn ends; the evaluation starts afresh (here by the owner's
+    // command; the Stop ask does the same while it is due), with a fresh
+    // list, and the report files.
+    s.stop();
+    let note = s.prompt("/t-eval");
+    assert!(note.contains("started at log position"), "a fresh start: {note}");
+    let reply = s.call(&mut mcp, "remember", demo_report(), "toolu_cb_2");
+    assert!(landed(&reply), "{reply}");
+}
+
+#[test]
+fn evaluation_turn_not_ended_says_end_the_turn_once_and_then_it_lands() {
+    let fx = Fx::new(&["demo"]);
+    listed(&fx, "listed-t");
+    let mut s = session(&fx);
+    s.prompt("/t-eval");
+    let mut mcp = s.mcp();
+    assert!(s.call(&mut mcp, "mark", json!({"id": "listed-t"}), "toolu_tn_mark").starts_with("marked useful"));
+    let reply = s.call(&mut mcp, "remember", demo_report(), "toolu_tn_1");
+    assert!(reply.starts_with("REFUSED:") && reply.contains(model::store::TURN_NOT_ENDED), "{reply}");
+    s.stop();
+    let reply = s.call(&mut mcp, "remember", demo_report(), "toolu_tn_2");
+    assert!(landed(&reply), "{reply}");
+}
+
+#[test]
+fn evaluation_machine_section_says_change_only_the_tldr_and_that_lands() {
+    let fx = Fx::new(&["demo"]);
+    let mut s = session(&fx);
+    s.prompt("/t-eval");
+    let mut mcp = s.mcp();
+    // At the filing: a typed section header is refused; the report without
+    // it lands.
+    let forged = report_args("eval-demo-1", "demo", "=== MACHINE SECTION: derived from the log, seq 1 to 2; it cannot be edited ===");
+    let reply = s.call(&mut mcp, "remember", forged, "toolu_ms_forged");
+    assert!(reply.starts_with("REFUSED: the text of this evaluation report carries a section header only THOR writes"), "{reply}");
+    assert!(reply.contains("send only your own TLDR and remarks"), "{reply}");
+    assert!(landed(&s.call(&mut mcp, "remember", demo_report(), "toolu_ms_file")));
+    s.stop();
+    let stored = get(&mut mcp, "eval-demo-1").text;
+    let edited = stored.replacen("machine section", "machine sectiom", 1);
+    let reply = s.call(&mut mcp, "revise", json!({"id": "eval-demo-1", "text": edited}), "toolu_ms_1");
+    assert!(reply.starts_with("REFUSED: the machine section of an evaluation report cannot be edited; revise only the TLDR and remarks below it"), "{reply}");
+    assert!(reply.contains("change only what follows that line"), "{reply}");
+    let reply = s.call(&mut mcp, "revise", json!({"id": "eval-demo-1", "text": "An evaluation of demo, all settled."}), "toolu_ms_2");
+    assert!(landed(&reply), "{reply}");
+}
+
+#[test]
+fn frozen_item_side_door_says_use_the_thor_tool_and_that_lands() {
+    let fx = Fx::new(&["demo"]);
+    listed(&fx, "listed-s");
+    let mut s = session(&fx);
+    s.prompt("/t-eval");
+    let mut mcp = s.mcp();
+    let retract = json!({"id": "listed-s", "reason": "fixture-listed-s is gone"});
+    let reply = mcp.call("retract", retract.clone());
+    assert!(reply.starts_with("REFUSED: 'listed-s' is on the frozen lists of an open evaluation"), "{reply}");
+    assert!(reply.contains("Make this change with the THOR tool itself, inside Claude Code"), "{reply}");
+    let reply = s.call(&mut mcp, "retract", retract, "toolu_fs_1");
+    assert!(reply.starts_with("retracted listed-s"), "{reply}");
+}
+
+// ------------------------------------------------------------ the filing, step 19
+//
+// The two filing refusals older than this table, rowed at the final gate:
+// each names the one call that settles its item, and that call - then the
+// same filing - lands.
+
+#[test]
+fn evaluation_judgement_owed_names_the_mark_and_marking_lets_the_filing_land() {
+    let fx = Fx::new(&["demo"]);
+    listed(&fx, "listed-j");
+    let mut s = session(&fx);
+    s.prompt("/t-eval");
+    let mut mcp = s.mcp();
+    let reply = s.call(&mut mcp, "remember", demo_report(), "toolu_jo_1");
+    assert!(reply.starts_with("REFUSED: this evaluation report cannot be filed yet: 1 item(s) fired in this session"), "{reply}");
+    assert!(reply.contains("'listed-j'") && reply.contains("mcp__thor__mark(id: \"<id>\")"), "it names the item and the call: {reply}");
+    assert_eq!(events_of(&fx.db, "eval-demo-1").len(), 0, "nothing written");
+    assert!(s.call(&mut mcp, "mark", json!({"id": "listed-j"}), "toolu_jo_mark").starts_with("marked useful"));
+    s.stop();
+    let reply = s.call(&mut mcp, "remember", demo_report(), "toolu_jo_2");
+    assert!(landed(&reply), "{reply}");
+}
+
+#[test]
+fn evaluation_batch_owed_names_the_trial_and_the_named_fix_lets_the_filing_land() {
+    let fx = Fx::new(&["demo"]);
+    let mut forcing = item("demo-no-wipe", "Never run `acme-tool --wipe` on the ledger.", vec![cmd("acme-tool")], None, Some("demo"));
+    forcing.severity = Some(Severity::Costly);
+    seed_raw(&fx.db, &forcing);
+    let mut s = session(&fx);
+    s.prompt("/t-eval");
+    let start = s.open_start("demo").expect("started");
+    assert_eq!(start.frozen.batch(), &["demo-no-wipe".to_string()], "fixture sanity: {:?}", start.frozen.machine);
+    let mut mcp = s.mcp();
+    let reply = s.call(&mut mcp, "remember", demo_report(), "toolu_bo_1");
+    assert!(reply.starts_with("REFUSED: this evaluation report cannot be filed yet: 1 rule(s) on this evaluation's frozen lists"), "{reply}");
+    assert!(reply.contains("'demo-no-wipe'") && reply.contains("mcp__thor__revise with only the rule's id"), "it names the rule and the call: {reply}");
+    assert_eq!(events_of(&fx.db, "eval-demo-1").len(), 0, "nothing written");
+    // The fix its derived tooth names: hang the check.
+    let reply = s.call(&mut mcp, "revise", json!({"id": "demo-no-wipe", "check_kind": "forbidden", "check_literals": ["--wipe"]}), "toolu_bo_fix");
+    assert!(landed(&reply), "{reply}");
+    s.stop();
+    let reply = s.call(&mut mcp, "remember", demo_report(), "toolu_bo_2");
+    assert!(landed(&reply), "{reply}");
 }

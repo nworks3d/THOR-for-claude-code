@@ -122,8 +122,8 @@ fn fixture_with_secret_rule(dir: &Path) -> (std::path::PathBuf, String) {
 /// sqlite file.
 fn mark_noise_twice(db: &Path, id: &str) {
     let mut store = thor_core::event_store::EventStore::new(db).unwrap();
-    serve::mark::record_noise(&mut store, "s", "l", "a", "2026-09-08T00:00:00Z", id).unwrap();
-    serve::mark::record_noise(&mut store, "s", "l", "a", "2026-09-08T00:01:00Z", id).unwrap();
+    serve::mark::record_noise(&mut store, "s", "l", "a", "2026-09-08T00:00:00Z", id, None).unwrap();
+    serve::mark::record_noise(&mut store, "s", "l", "a", "2026-09-08T00:01:00Z", id, None).unwrap();
 }
 
 /// THE MAIN PROOF. Two noise marks, no useful mark since, then a real

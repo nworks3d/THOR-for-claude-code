@@ -123,7 +123,7 @@ fn an_item_marked_useful_even_once_never_decays_end_to_end() {
     let mut db = EventStore::in_memory().unwrap();
     store::declare(&mut db, "s", "l", "a", &moment_rule("stays-1")).unwrap();
     serve_it_n_times(&mut db, "stays-1", decay::STALE_AFTER_SERVINGS * 10);
-    mark::record_useful(&mut db, "s", "l", "a", "2026-08-02T00:00:00Z", "stays-1").unwrap();
+    mark::record_useful(&mut db, "s", "l", "a", "2026-08-02T00:00:00Z", "stays-1", None).unwrap();
 
     let mut input = ServeInput::default();
     input.add_moment(Action::Push);
@@ -149,7 +149,7 @@ fn marking_useful_is_recorded_and_changes_nothing_about_what_applies() {
     let before = serve::serve(&db, &input);
     assert!(before.all.iter().any(|r| r.id == "marked-1"), "applies before any mark");
 
-    mark::record_useful(&mut db, "s", "l", "a", "2026-08-02T00:00:00Z", "marked-1").unwrap();
+    mark::record_useful(&mut db, "s", "l", "a", "2026-08-02T00:00:00Z", "marked-1", None).unwrap();
     assert!(
         serve::usefulness::ever_marked_useful(&db).contains("marked-1"),
         "the mark must still be recorded in the log"

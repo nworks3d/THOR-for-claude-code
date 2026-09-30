@@ -1245,12 +1245,48 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
         // are deleted after about 30 days, so the answer has to be kept while
         // it can still be given. The main session's Stop also covers its
         // subagents' files (`serve::attest`'s reader walks them).
+        // The same for every WRITE of this session through THOR's tool
+        // server (step 12): verified against the transcript once every line
+        // of the call is on disk, and recorded once - the only thing a
+        // judgement-debt reader ever counts a verdict by.
+        // AN EVALUATION WHOSE MACHINE PASS WAS CUT OFF (step 14, F10): a start
+        // record with no batch means the hook that started the evaluation
+        // was killed between its two writes. This Stop finishes the pass and
+        // writes the batch record before anything else, and the session is
+        // shown the start note with what is now its to do (`resumed_note`
+        // below). Never for a subagent's Stop: the evaluation is the main
+        // session's.
+        let mut resumed: Vec<model::store::EvaluationStart> = Vec::new();
         if !no_record {
             if let Ok(mut store) = serve::store_dir::open_existing(db_path) {
                 serve::attest::record_refusal_verifications(&mut store, &session_id);
+                serve::attest::record_write_verifications(&mut store, &session_id);
+                if !payload_is_from_a_subagent(&payload) {
+                    // THE READER OF A FILING (step 16): every evaluation
+                    // report on file whose filing has no validator record
+                    // yet is validated once - after the verifications above,
+                    // which it reads - and the answer recorded.
+                    serve::eval_filing::validate_new_reports(&mut store, serve::attest::transcripts_root().as_deref(), &session_id);
+                    resumed = serve::eval_session::resume(&mut store, &session_id);
+                }
             }
+            // The evaluation's old handover file is gone for good (step 13):
+            // the start lives in the log now, and nothing reads the file.
+            serve::eval_session::retire_handover_sidecar(db_path);
         }
         let already_fired = payload.get("stop_hook_active").and_then(|v| v.as_bool()).unwrap_or(false);
+        // What the session is told when this Stop finished a cut-off pass.
+        // It never replaces the Response Guard below - an early return here
+        // would blind it for this Stop, the mistake this arm has made twice
+        // before. It RIDES WITH the guard's own verdict instead: appended to
+        // its block or its warning, and a block of its own only once the
+        // guard had none.
+        let resumed_note: Option<String> = (!resumed.is_empty())
+            .then(|| resumed.iter().map(serve::eval_session::resumed_note).collect::<Vec<_>>().join("\n\n"));
+        let with_resumed = |text: String| match &resumed_note {
+            Some(note) => format!("{text}\n\n{note}"),
+            None => text,
+        };
         let msg = payload.get("last_assistant_message").and_then(|v| v.as_str()).unwrap_or("");
         // The Response Guard's rulebook judges the SHAPE of a reply (length,
         // a summary first, evidence for a claim) for the OWNER's own
@@ -1331,13 +1367,18 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
         // that decides, rule by rule, whether `is_subagent` excuses this
         // particular fire.
         if already_fired {
+            // A Stop that already held this turn once may not hold it again
+            // (loop safety): a resumed note still arrives, as a warning.
             if msg.trim().is_empty() {
-                return None;
+                return resumed_note.map(|text| HookOutput::Warn { event_name, text });
             }
             let rulebook_text = std::fs::read_to_string(respond::default_rulebook_path(db_path)).ok();
             let last_prompt = last_user_prompt_from_payload(&payload);
             let verdict = respond::guard_verdict(rulebook_text.as_deref(), msg, &last_prompt, reader_is_an_agent, citation_lookup);
-            let text = verdict.block_reason.or(verdict.warn_reason)?;
+            let text = match verdict.block_reason.or(verdict.warn_reason) {
+                Some(text) => with_resumed(text),
+                None => resumed_note?,
+            };
             return Some(HookOutput::Warn { event_name, text });
         }
         // Same shape for the ordinary first pass: only an empty message
@@ -1356,11 +1397,20 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
             if let Some(reason) = verdict.block_reason {
                 return Some(HookOutput::Decision(serde_json::json!({
                     "decision": "block",
-                    "reason": reason,
+                    "reason": with_resumed(reason),
                 })));
             }
             verdict.warn_reason
         };
+        // The Response Guard had no block: a finished machine pass holds this
+        // Stop once, with the start note (and the guard's warning, if any).
+        if let Some(note) = resumed_note {
+            let reason = match warn_text {
+                Some(warning) => format!("{note}\n\n{warning}"),
+                None => note,
+            };
+            return Some(HookOutput::Decision(serde_json::json!({ "decision": "block", "reason": reason })));
+        }
 
         // Lane C, C2 (SPEC-ENFORCEMENT.md 2.2) - the Response Guard above had
         // no BLOCK to return (a WARN, if any, is only pending in `warn_text`
@@ -1414,6 +1464,14 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
         // a `cd` into a scratch folder silences every debt the session still
         // owes there.
         let stop_project = project::session_project(db_path, &session_id, stop_root.as_deref());
+        // FORMAT DRIFT (D14): this session's transcript is in a shape THOR
+        // cannot read. Then no report can be checked or counted, so the
+        // evaluation is not asked for - it could not be filed - and every
+        // turn says so instead, riding with whatever else this Stop says.
+        let drift_note: Option<&str> = (!is_subagent && stop_project.is_some() && !no_record)
+            .then(|| serve::eval_filing::session_drifted(serve::attest::transcripts_root().as_deref(), &session_id))
+            .filter(|drifted| *drifted)
+            .map(|_| serve::eval_filing::DRIFT_LINE);
         // GATED ON `is_subagent`: a fact landing on an already-full anchor is
         // still true of the STORE no matter who wrote it, but PAYING this
         // debt (fold or re-anchor with `revise`, retract, or the
@@ -1539,50 +1597,53 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
         // guard a second time, on purpose (see its own doc comment), so the
         // rule still holds even if a future caller reaches it some other
         // way.
-        if stop_project.is_some() {
+        // STEP 17 (B8, D11, D12, F14, Q10): the clock is the PROJECT's, and
+        // the ask follows the work - every project this session worked in
+        // since that project's newest valid evaluation, the folder's own
+        // first - but lands only on a session with ten minutes of its own
+        // work there, never at its first Stop there, and not while another
+        // session runs that project's evaluation (for at most an hour). See
+        // `eval_stop_ask` and `usefulness::stop_decision`. A subagent's Stop
+        // still counts as work of its session, never as a Stop that can be
+        // held. What the paragraphs above say about `stop_project.is_some()`
+        // now holds per project: the facts are refreshed, and the ask made,
+        // for every project this session worked in - from a folder of no
+        // project too - while the no-project key itself is still never
+        // written.
+        let mut elsewhere_note: Option<String> = None;
+        {
             let now = time::now_unix();
-            if !is_subagent {
-                if let Ok(store) = serve::store_dir::open_existing(db_path) {
-                    usefulness::update_eval_debt_state(&store, db_path, stop_project.as_deref(), now);
-                    // A `Stop` event carries no tool call, so it is never
-                    // itself an edit, a test/build command, or a compaction -
-                    // `HookEventKind::Other` (see that enum's own doc
-                    // comment). The classification `usefulness::
-                    // classify_hook_event` runs below, for `SessionStart`/
-                    // `UserPromptSubmit`/`PreToolUse`, is what actually feeds
-                    // the two risk counters this Stop reads back through
-                    // `work`.
-                    if let Some(work) =
-                        usefulness::record_hook_event(db_path, stop_project.as_deref(), &session_id, true, now, usefulness::HookEventKind::Other)
-                    {
-                        if let Some(reason) = evaluation_debt(&store, db_path, stop_project.as_deref(), &work) {
-                            usefulness::record_eval_debt_asked(db_path, stop_project.as_deref(), now);
-                            // The ask is where this evaluation starts: the
-                            // list its report is held to is fixed here and
-                            // named with the ask (`serve::eval_session`). A
-                            // later turn's ask finds it open and keeps it.
-                            let reason = match stop_project
-                                .as_deref()
-                                .and_then(|p| serve::eval_session::start(db_path, &store, &session_id, p, now, "stop-ask"))
-                            {
-                                Some(evaluation) => {
-                                    format!("{reason}\n\n{}", serve::eval_session::start_note(&store, &evaluation))
-                                }
-                                None => reason,
-                            };
-                            return Some(HookOutput::Decision(
-                                serde_json::json!({ "decision": "block", "reason": reason }),
-                            ));
+            if is_subagent {
+                usefulness::record_hook_event(db_path, stop_project.as_deref(), &session_id, true, now, usefulness::HookEventKind::Other);
+            } else {
+                usefulness::record_main_stop(db_path, stop_project.as_deref(), &session_id, now);
+                if let Ok(mut store) = serve::store_dir::open_existing(db_path) {
+                    // The folder's own answer, for the words only: when the
+                    // ask is about another project, it says where the
+                    // session stands.
+                    let folder_own = stop_root.as_deref().and_then(project::resolve_project);
+                    let at = EvalStopAt { project: stop_project.as_deref(), folder: folder_own.as_deref() };
+                    match eval_stop_ask(&mut store, db_path, &session_id, at, now, drift_note.is_none(), no_record) {
+                        EvalStop::Ask(reason) => {
+                            return Some(HookOutput::Decision(serde_json::json!({ "decision": "block", "reason": reason })));
                         }
+                        EvalStop::Elsewhere(line) => elsewhere_note = Some(line),
+                        EvalStop::Quiet => {}
                     }
                 }
-            } else {
-                // A subagent's own Stop can never block for this debt, but
-                // its work still counts toward its own session's accrual -
-                // see the doc comment above.
-                usefulness::record_hook_event(db_path, stop_project.as_deref(), &session_id, true, now, usefulness::HookEventKind::Other);
             }
         }
+        // What rides with whatever this Stop still says: the drift line and
+        // the running-evaluation line.
+        let riders: Vec<String> = drift_note.map(str::to_string).into_iter().chain(elsewhere_note).collect();
+        let with_drift = |reason: String| match riders.is_empty() {
+            true => reason,
+            false => format!("{}
+
+{reason}", riders.join("
+
+")),
+        };
 
         // The one debt nobody ever pays voluntarily. Independent of the
         // capture guard above it - that one can be switched off and usually
@@ -1608,7 +1669,7 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
                 .and_then(|s| judgement_debt(&s, db_path, &session_id, stop_project.as_deref()))
             {
                 return Some(HookOutput::Decision(
-                    serde_json::json!({ "decision": "block", "reason": reason }),
+                    serde_json::json!({ "decision": "block", "reason": with_drift(reason) }),
                 ));
             }
         }
@@ -1627,7 +1688,7 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
             {
                 record_teeth_asked(db_path, &session_id);
                 return Some(HookOutput::Decision(
-                    serde_json::json!({ "decision": "block", "reason": reason }),
+                    serde_json::json!({ "decision": "block", "reason": with_drift(reason) }),
                 ));
             }
         }
@@ -1652,6 +1713,11 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
                 return Some(output);
             }
         }
+        let warn_text = match (warn_text, riders.is_empty()) {
+            (Some(text), false) => Some(format!("{}\n\n{text}", riders.join("\n\n"))),
+            (None, false) => Some(riders.join("\n\n")),
+            (text, true) => text,
+        };
         return warn_text.map(|text| HookOutput::Warn { event_name, text });
     }
 
@@ -1715,15 +1781,20 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
     // session was working in. The evaluation and the hard guards below use
     // this same answer; only serving keeps the folder's own.
     let session_project = project::session_project(db_path, &session_id, session_cwd.as_deref());
-    if session_project.is_some() {
+    // This session's accrued work in its project, as of this very event: what
+    // a skill call opening the evaluation routine is judged by (whether the
+    // evaluation is due now, `skill_call_answer`).
+    let hook_work = if session_project.is_some() {
         let hook_tool_input = payload.get("tool_input");
         let hook_tool_name = payload.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
         let hook_file_path = hook_tool_input.and_then(|t| t.get("file_path")).and_then(|v| v.as_str());
         let hook_command = absent_guard::proposed_command(hook_tool_input);
         let hook_source = payload.get("source").and_then(|v| v.as_str());
         let event_kind = usefulness::classify_hook_event(&event_name, hook_tool_name, hook_file_path, hook_command, hook_source);
-        usefulness::record_hook_event(db_path, session_project.as_deref(), &session_id, false, time::now_unix(), event_kind);
-    }
+        usefulness::record_hook_event(db_path, session_project.as_deref(), &session_id, false, time::now_unix(), event_kind)
+    } else {
+        None
+    };
 
     let mut store = serve::store_dir::open_for_hook(db_path)?;
 
@@ -1799,7 +1870,12 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
             // block above AFTER it is built, never inside the match above,
             // so a session with nothing else to show still gets this on its
             // own rather than staying silent.
-            let block = match (block.is_empty(), open_points_session_start_note(&store, folder_project.as_deref())) {
+            // Never a subagent's (step 16, B6): the open points - and the
+            // owner-queue banner above them - are for the owner's own session.
+            let open_points = (!payload_is_from_a_subagent(&payload))
+                .then(|| open_points_session_start_note(&store, folder_project.as_deref()))
+                .flatten();
+            let block = match (block.is_empty(), open_points) {
                 (true, None) => return None,
                 (true, Some(note)) => note,
                 (false, None) => block,
@@ -1854,15 +1930,22 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
                 capture_flag(&store, db_path, &session_id, prompt_text);
             }
 
-            // The owner typed the evaluation command: the evaluation starts
-            // here, and the session is told the list its report is held to
+            // The owner typed the evaluation command (`/t-eval` or
+            // `/thor-eval`): the evaluation starts here, due or not, and the
+            // session is told the three lists its report is held to
             // (`serve::eval_session`). Only the command itself counts - a
-            // task that merely says to end with it has not started one.
-            let eval_note = if serve::eval_session::prompt_starts_evaluation(prompt_text, &serve::eval_session::command_names(db_path)) {
+            // task that merely says to end with it has not started one - and
+            // never in a prompt a subagent receives: no owner typed that.
+            let typed = !payload_is_from_a_subagent(&payload)
+                && serve::eval_session::prompt_starts_evaluation(prompt_text, &serve::eval_session::command_names(db_path));
+            let eval_note = if typed && !no_record {
                 session_project
                     .as_deref()
-                    .and_then(|p| serve::eval_session::start(db_path, &store, &session_id, p, time::now_unix(), "command"))
-                    .map(|evaluation| serve::eval_session::start_note(&store, &evaluation))
+                    .and_then(|p| serve::eval_session::start(db_path, &mut store, &session_id, p, "command"))
+                    .map(|started| match started.fresh {
+                        true => serve::eval_session::start_note(&started.start),
+                        false => serve::eval_session::continue_note(&started.start, true),
+                    })
             } else {
                 None
             };
@@ -1905,33 +1988,21 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
             let file_path = tool_input.and_then(|t| t.get("file_path")).and_then(|v| v.as_str());
             let tool_name = payload.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
 
-            // THE EVALUATION HANDOVER (`serve::eval_session`), before any
-            // guard can return: opening the evaluation routine as a skill
-            // starts an evaluation (and names its fixed list below), and a
-            // call that files an evaluation report records which session
-            // files it - the one fact the tool server cannot know itself.
-            // Recorded before the guards on purpose: a filing a guard then
-            // refuses never reaches the tool server, so the record is inert.
-            let now_unix = time::now_unix();
-            let eval_note = if serve::eval_session::call_starts_evaluation(tool_name, tool_input, &serve::eval_session::command_names(db_path)) {
-                session_project
-                    .as_deref()
-                    .and_then(|p| serve::eval_session::start(db_path, &store, &session_id, p, now_unix, "skill"))
-                    .map(|evaluation| serve::eval_session::start_note(&store, &evaluation))
-            } else {
-                None
-            };
-            if let Some((report_id, named_project)) = serve::eval_session::filing_in_call(mcp_tool_suffix(tool_name), tool_input) {
-                // The report's own project: named on the call, or - for a
-                // revise that leaves it out - the item's own, and only then
-                // the session's.
-                let project = named_project
-                    .or_else(|| model::store::show(&store, &report_id).ok().and_then(|item| item.project))
-                    .or_else(|| session_project.clone());
-                if let Some(project) = project {
-                    serve::eval_session::record_filing(db_path, &store, &session_id, &project, &report_id, now_unix);
+            // OPENING THE EVALUATION ROUTINE AS A SKILL (`serve::eval_session`),
+            // before any guard can return. It starts an evaluation ONLY while
+            // the evaluation is due - the Stop hook would ask for it now -
+            // and never a second one: an evaluation already open in this
+            // session is named again with its start note. Otherwise nothing
+            // starts and the call gets one plain answer: which evaluation is
+            // already open elsewhere, or that none is due.
+            let eval_note = match session_project.as_deref() {
+                Some(project)
+                    if serve::eval_session::call_starts_evaluation(tool_name, tool_input, &serve::eval_session::command_names(db_path)) =>
+                {
+                    Some(skill_call_answer(&mut store, db_path, &session_id, project, hook_work.as_ref(), &payload, no_record))
                 }
-            }
+                _ => None,
+            };
 
             // Lane C, C3 (SPEC-ENFORCEMENT.md 2.3): the wrong-sink check,
             // BEFORE anything else in this arm. Deliberately narrow - see
@@ -2003,121 +2074,146 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
                 })));
             }
 
-            let mut input = ServeInput {
-                project: folder_project.clone(),
-                root: session_cwd.clone(),
-                ..Default::default()
+            // THE WRITE MARKER (step 12): a THOR write this hook lets through
+            // gets one more line of context, naming the call and the digest of
+            // its arguments. Claude Code records it in the transcript as a
+            // hook attachment of that call, after the tool finished; the Stop
+            // then reads it back (`serve::attest::verify_write`) as proof that
+            // the write passed this hook. A block returned above never gets it.
+            let write_marker = serve::attest::write_marker(
+                tool_name,
+                payload.get("tool_use_id").and_then(|v| v.as_str()),
+                tool_input,
+            );
+            let marker_event = event_name.clone();
+            let served: Option<HookOutput> = 'served: {
+                let mut input = ServeInput {
+                    project: folder_project.clone(),
+                    root: session_cwd.clone(),
+                    ..Default::default()
+                };
+                if let Some(command) = absent_guard::proposed_command(tool_input) {
+                    input.add_command(command);
+                } else {
+                    // THE TOOL-NAME REACH THIS CLOSES. MEASURED: a Rule bound to
+                    // Target command "Agent"/"Artifact"/"SendUserFile" was only
+                    // ever matched inside the requires guard
+                    // (`guard_verdict::requires`, which already reads the bare tool
+                    // name as its own reach) - this surface built `input` from a
+                    // Bash-style "command" field alone, so such a rule was never
+                    // SERVED when the tool it names was actually called, and
+                    // nine pinned rules had to stay on Always only to be seen at
+                    // all. A tool call with no "command" field (every non-shell
+                    // tool: Agent, Read, Write, Artifact, ...) now offers its own
+                    // bare NAME the same way a shell command offers its own text,
+                    // so a Command anchor naming a tool reaches that tool's own
+                    // call - `add_command` gives it the identical moment/target/
+                    // context derivation every other command anchor already
+                    // gets, and a forbidden-literal check against a bare tool
+                    // name stays harmless: this is the informational surface
+                    // (`serve::serve`, rendered as context) - the hard guard
+                    // (`guard_verdict::command`) still reads only a real "command"
+                    // field via `absent_guard::proposed_command`, completely
+                    // unaffected by this branch.
+                    input.add_command(tool_name);
+                }
+                if let Some(file_path) = file_path {
+                    input.add_file(file_path);
+                }
+                let searched = searched_path(tool_name, tool_input);
+                if let Some(searched) = searched {
+                    // Only the PLACE, never the moments a file touch derives: a
+                    // search acts on nothing, so it informs about what is anchored
+                    // there and nothing more. `file` makes the `why` hint name it.
+                    input.add_target(TargetKind::Path, searched);
+                    input.file = Some(searched.to_string());
+                }
+                // The Remember moment (`intent::Action::Remember`): nothing
+                // derives it from a command or file path (see `intent`'s own
+                // closed vocabulary doc comment), so this is the one place a
+                // call to this memory's own remember/revise tool ever turns into
+                // that moment. See `is_remember_moment`'s own doc comment for why
+                // only the tool-name SUFFIX is compared, never the whole name.
+                if is_remember_moment(tool_name) {
+                    input.add_moment(Action::Remember);
+                }
+                // The evaluation's start note leads whatever else this call says.
+                let sink_warning = match (eval_note, sink_warning) {
+                    (Some(note), Some(warning)) => Some(format!("{note}\n\n{warning}")),
+                    (note, warning) => note.or(warning),
+                };
+                if input.is_empty() {
+                    // Nothing else would render, but a provisional sink warning
+                    // may still stand entirely on its own. Nothing was ever
+                    // selected, so `verdicts` is empty here too - never a guess
+                    // at what would have applied.
+                    break 'served sink_warning.map(|block| HookOutput::Context { event_name, block, verdicts: Vec::new() });
+                }
+                let served = serve::serve(&store, &input);
+                let rendered = render::render_text(&served.selection, &input, db_path);
+                let block = match (sink_warning, rendered) {
+                    (Some(warning), Some(rendered)) => Some(format!("{warning}\n\n{rendered}")),
+                    (Some(warning), None) => Some(warning),
+                    (None, Some(rendered)) => Some(rendered),
+                    (None, None) => None,
+                };
+                let Some(block) = block else { break 'served None };
+                let ids: Vec<String> = served.selection.shown.iter().map(|r| r.id.clone()).collect();
+                // THE ONE SURFACE WHERE `verdicts` IS EVER REAL: the moment of
+                // action, the only one of the three hook events that proposes an
+                // actual command or write. `input.command` is whatever was
+                // already resolved above (the real command when there was one,
+                // the tool-name fallback otherwise - the SAME text this call's
+                // own selection already ran on, never a second derivation), and
+                // `proposed_content` is the Write/Edit fragment when this tool
+                // call carries one. See `check_rows`/`CheckRow` for the shape and
+                // `Context`'s own doc comment for why this can never leak into
+                // `block` itself.
+                //
+                // Built from `served.all`, never `served.selection.shown` alone -
+                // see `check_rows`'s own doc comment for the defect that left a
+                // real prohibition, outranked at its own anchor by heavier items,
+                // invisible to any program reading this exact field. `shown_ids`
+                // is the same set `ids` above already
+                // names, read back out of `served.selection.shown` a second time
+                // rather than reused from `ids` directly, because `check_rows`
+                // wants `&str` borrows and `ids` is already-owned `String`s.
+                let shown_ids: std::collections::HashSet<&str> =
+                    served.selection.shown.iter().map(|r| r.id.as_str()).collect();
+                let verdicts = check_rows(&served.all, &shown_ids, input.command.as_deref().unwrap_or(""), absent_guard::proposed_content(tool_name, tool_input));
+                // The command as typed wins over the file, never the tool-name
+                // fallback `input.add_command` used above when there was no real
+                // command (`absent_guard::proposed_command` returns `None` for
+                // that case too - it is not "the command line as typed" the way
+                // `ItemServed::trigger` means it, only a stand-in target). A
+                // Bash-style call never carries both at once in a real payload
+                // (see the comment above `input.add_command`/`add_file` a few
+                // lines up), so the order only matters for a hand-built input.
+                let trigger = absent_guard::proposed_command(tool_input).or(file_path).or(searched);
+                if !no_record {
+                    deliver::record_delivery_with_trigger(
+                        &mut store,
+                        &session_id,
+                        &session_id,
+                        actor,
+                        &time::now_iso8601(),
+                        &ids,
+                        trigger,
+                    );
+                }
+                Some(HookOutput::Context { event_name, block, verdicts })
             };
-            if let Some(command) = absent_guard::proposed_command(tool_input) {
-                input.add_command(command);
-            } else {
-                // THE TOOL-NAME REACH THIS CLOSES. MEASURED: a Rule bound to
-                // Target command "Agent"/"Artifact"/"SendUserFile" was only
-                // ever matched inside the requires guard
-                // (`guard_verdict::requires`, which already reads the bare tool
-                // name as its own reach) - this surface built `input` from a
-                // Bash-style "command" field alone, so such a rule was never
-                // SERVED when the tool it names was actually called, and
-                // nine pinned rules had to stay on Always only to be seen at
-                // all. A tool call with no "command" field (every non-shell
-                // tool: Agent, Read, Write, Artifact, ...) now offers its own
-                // bare NAME the same way a shell command offers its own text,
-                // so a Command anchor naming a tool reaches that tool's own
-                // call - `add_command` gives it the identical moment/target/
-                // context derivation every other command anchor already
-                // gets, and a forbidden-literal check against a bare tool
-                // name stays harmless: this is the informational surface
-                // (`serve::serve`, rendered as context) - the hard guard
-                // (`guard_verdict::command`) still reads only a real "command"
-                // field via `absent_guard::proposed_command`, completely
-                // unaffected by this branch.
-                input.add_command(tool_name);
-            }
-            if let Some(file_path) = file_path {
-                input.add_file(file_path);
-            }
-            let searched = searched_path(tool_name, tool_input);
-            if let Some(searched) = searched {
-                // Only the PLACE, never the moments a file touch derives: a
-                // search acts on nothing, so it informs about what is anchored
-                // there and nothing more. `file` makes the `why` hint name it.
-                input.add_target(TargetKind::Path, searched);
-                input.file = Some(searched.to_string());
-            }
-            // The Remember moment (`intent::Action::Remember`): nothing
-            // derives it from a command or file path (see `intent`'s own
-            // closed vocabulary doc comment), so this is the one place a
-            // call to this memory's own remember/revise tool ever turns into
-            // that moment. See `is_remember_moment`'s own doc comment for why
-            // only the tool-name SUFFIX is compared, never the whole name.
-            if is_remember_moment(tool_name) {
-                input.add_moment(Action::Remember);
-            }
-            // The evaluation's start note leads whatever else this call says.
-            let sink_warning = match (eval_note, sink_warning) {
-                (Some(note), Some(warning)) => Some(format!("{note}\n\n{warning}")),
-                (note, warning) => note.or(warning),
-            };
-            if input.is_empty() {
-                // Nothing else would render, but a provisional sink warning
-                // may still stand entirely on its own. Nothing was ever
-                // selected, so `verdicts` is empty here too - never a guess
-                // at what would have applied.
-                return sink_warning.map(|block| HookOutput::Context { event_name, block, verdicts: Vec::new() });
-            }
-            let served = serve::serve(&store, &input);
-            let rendered = render::render_text(&served.selection, &input, db_path);
-            let block = match (sink_warning, rendered) {
-                (Some(warning), Some(rendered)) => Some(format!("{warning}\n\n{rendered}")),
-                (Some(warning), None) => Some(warning),
-                (None, Some(rendered)) => Some(rendered),
-                (None, None) => None,
-            };
-            let block = block?;
-            let ids: Vec<String> = served.selection.shown.iter().map(|r| r.id.clone()).collect();
-            // THE ONE SURFACE WHERE `verdicts` IS EVER REAL: the moment of
-            // action, the only one of the three hook events that proposes an
-            // actual command or write. `input.command` is whatever was
-            // already resolved above (the real command when there was one,
-            // the tool-name fallback otherwise - the SAME text this call's
-            // own selection already ran on, never a second derivation), and
-            // `proposed_content` is the Write/Edit fragment when this tool
-            // call carries one. See `check_rows`/`CheckRow` for the shape and
-            // `Context`'s own doc comment for why this can never leak into
-            // `block` itself.
-            //
-            // Built from `served.all`, never `served.selection.shown` alone -
-            // see `check_rows`'s own doc comment for the defect that left a
-            // real prohibition, outranked at its own anchor by heavier items,
-            // invisible to any program reading this exact field. `shown_ids`
-            // is the same set `ids` above already
-            // names, read back out of `served.selection.shown` a second time
-            // rather than reused from `ids` directly, because `check_rows`
-            // wants `&str` borrows and `ids` is already-owned `String`s.
-            let shown_ids: std::collections::HashSet<&str> =
-                served.selection.shown.iter().map(|r| r.id.as_str()).collect();
-            let verdicts = check_rows(&served.all, &shown_ids, input.command.as_deref().unwrap_or(""), absent_guard::proposed_content(tool_name, tool_input));
-            // The command as typed wins over the file, never the tool-name
-            // fallback `input.add_command` used above when there was no real
-            // command (`absent_guard::proposed_command` returns `None` for
-            // that case too - it is not "the command line as typed" the way
-            // `ItemServed::trigger` means it, only a stand-in target). A
-            // Bash-style call never carries both at once in a real payload
-            // (see the comment above `input.add_command`/`add_file` a few
-            // lines up), so the order only matters for a hand-built input.
-            let trigger = absent_guard::proposed_command(tool_input).or(file_path).or(searched);
-            if !no_record {
-                deliver::record_delivery_with_trigger(
-                    &mut store,
-                    &session_id,
-                    &session_id,
-                    actor,
-                    &time::now_iso8601(),
-                    &ids,
-                    trigger,
-                );
-            }
-            Some(HookOutput::Context { event_name, block, verdicts })
+            let Some(marker) = write_marker else { return served };
+            Some(match served {
+                Some(HookOutput::Context { event_name, block, verdicts }) => {
+                    HookOutput::Context { event_name, block: format!("{block}\n{marker}"), verdicts }
+                }
+                Some(HookOutput::ContextWithNotice { event_name, block, notice, verdicts }) => {
+                    HookOutput::ContextWithNotice { event_name, block: format!("{block}\n{marker}"), notice, verdicts }
+                }
+                Some(other) => other,
+                None => HookOutput::Context { event_name: marker_event, block: marker, verdicts: Vec::new() },
+            })
         }
     }
 }
@@ -2357,7 +2453,9 @@ fn session_watermark(db_path: &Path, session_id: &str) -> Option<i64> {
 /// which does know the real one - matched nothing and the debt never fired.
 /// Its unit tests passed because they handed the same id to both sides. Found
 /// by a real session running the test end to end and reporting that step 2
-/// simply did not block.
+/// simply did not block. (Since step 12 the tool server stamps a write with
+/// its `CLAUDE_CODE_SESSION_ID` when it has one - a hint fixed when the server
+/// started, still "mcp" without one - so the watermark stays the boundary.)
 ///
 /// So the boundary is a WATERMARK: the store's tip as it stood when this
 /// session started (`session_watermark`). Anything written above it was
@@ -2494,7 +2592,7 @@ fn teeth_debt(store: &EventStore, db_path: &Path, current_project: Option<&str>)
         if !li.item.kind.can_fire() || !project::applies_to(li.item.project.as_deref(), current_project) {
             continue;
         }
-        let model::store::Settlement::Owed { why } = model::store::settlement(store, &li.id) else { continue };
+        let model::store::Settlement::Owed { why } = model::store::settlement(store, &li.id, None) else { continue };
         let count = fired.get(&li.id).copied().unwrap_or(0);
         candidates.push((
             asked.get(&li.id).copied().unwrap_or(0),
@@ -2942,7 +3040,10 @@ fn judgement_debt(store: &EventStore, db_path: &Path, session_id: &str, current_
     // SessionStart payload carries it) - "was this id marked, useful or
     // noise, at a later position in the log than where this session
     // started" - true regardless of which literal a verdict happened to be
-    // stamped with, because it never reads that column at all.
+    // stamped with, because it never reads that column at all. (Since step
+    // 12 the tool server stamps a verdict with its session hint when it has
+    // one, still "mcp" without one; and only an ATTESTED verdict counts here,
+    // see `judged_since`.)
     //
     // `session_watermark` returning `None` (no SessionStart was ever seen
     // for this session id - an old install, a hook that failed to write, or
@@ -2990,10 +3091,17 @@ fn judgement_debt(store: &EventStore, db_path: &Path, session_id: &str, current_
     ))
 }
 
-/// Has `id` received a verdict (useful or noise, either one) at a strictly
-/// later position in the log than `after_seq`? See `judgement_debt`'s own
-/// doc comment on its watermark check for why this reads log POSITION
-/// rather than a verdict's own `session_id` column.
+/// Has `id` received an ATTESTED verdict (useful or noise, either one) at a
+/// strictly later position in the log than `after_seq`? See
+/// `judgement_debt`'s own doc comment on its watermark check for why this
+/// reads log POSITION rather than a verdict's own `session_id` column.
+///
+/// ONLY AN ATTESTED VERDICT COUNTS HERE (step 12, D9), exactly as in
+/// `usefulness::served_since_last_verdict`: a verdict whose recorded
+/// verification (the `attester` record on the same item, written at a Stop)
+/// says it was made through an attested THOR call. Measured before this: a
+/// `serve mark` typed into a shell after the session's start left the count
+/// owed, yet silenced the ask for the rest of the session through this floor.
 ///
 /// An indexed per-id read (`EventStore::get_events_by_entity`,
 /// `idx_event_entity`) rather than `crowding_debt`'s own `get_all_events`
@@ -3004,6 +3112,7 @@ fn judgement_debt(store: &EventStore, db_path: &Path, session_id: &str, current_
 /// into five figures of events.
 fn judged_since(store: &EventStore, id: &str, after_seq: i64) -> bool {
     let Ok(events) = store.get_events_by_entity(id) else { return false };
+    let verified = model::store::recorded_write_verdicts(&events);
     events.iter().any(|e| {
         e.seq > after_seq
             && matches!(
@@ -3011,7 +3120,72 @@ fn judged_since(store: &EventStore, id: &str, after_seq: i64) -> bool {
                 thor_core::event_store::EventKind::ItemMarkedUseful
                     | thor_core::event_store::EventKind::ItemMarkedNoise
             )
+            && verified.get(&e.seq).is_some_and(|v| v.attested)
     })
+}
+
+/// What a `Skill` (or `SlashCommand`) call opening the evaluation routine
+/// is told, and whether it starts an evaluation (step 13, F16). In order:
+/// - an evaluation of `project` already open in THIS session: named again,
+///   "continue it", with its start note - nothing new is written;
+/// - the evaluation is due now (`evaluation_debt` would ask for it at this
+///   session's Stop): it starts here, one start record in the log, and the
+///   answer is its start note. Never for a subagent: the Stop never asks one;
+/// - an evaluation of `project` open in ANOTHER session: where, and since
+///   when - nothing starts;
+/// - otherwise: none is due - nothing starts.
+///
+/// A hook run that records nothing (`no_record`) starts nothing either.
+fn skill_call_answer(
+    store: &mut EventStore,
+    db_path: &Path,
+    session_id: &str,
+    project: &str,
+    work: Option<&usefulness::SessionWorkState>,
+    payload: &Value,
+    no_record: bool,
+) -> String {
+    if let Some(open) = serve::eval_session::open_evaluation(store, session_id, project) {
+        // An open evaluation whose machine pass was cut off is finished here
+        // (`start` keeps the open one and only writes its batch record).
+        let open = match (open.frozen.decided(), no_record) {
+            (false, false) => {
+                serve::eval_session::start(db_path, store, session_id, project, "skill").map_or(open, |started| started.start)
+            }
+            _ => open,
+        };
+        return serve::eval_session::continue_note(&open, true);
+    }
+    // Due as the Stop would ask THIS session (step 17: the project's clock,
+    // ten minutes of the session's own work, no evaluation running
+    // elsewhere) - except that opening the routine is the session's own
+    // choice, so its first Stop not having come yet does not hold it back.
+    let due = !payload_is_from_a_subagent(payload)
+        && work.is_some()
+        && {
+            let now = time::now_unix();
+            let state = usefulness::update_eval_debt_state(store, db_path, Some(project), now);
+            let timeline = serve::attest::transcripts_root()
+                .map(|root| serve::attest::session_timeline(&root, session_id))
+                .unwrap_or_default();
+            matches!(
+                usefulness::stop_decision(store, &state, project, session_id, &timeline, false, false, now, usefulness::EVAL_CADENCE),
+                usefulness::StopDecision::Ask(_)
+            )
+        };
+    if due && !no_record {
+        if let Some(started) = serve::eval_session::start(db_path, store, session_id, project, "skill") {
+            return match started.fresh {
+                true => serve::eval_session::start_note(&started.start),
+                false => serve::eval_session::continue_note(&started.start, true),
+            };
+        }
+    }
+    let elsewhere = model::store::open_evaluation_starts_of_project(store, project, time::now_unix());
+    match elsewhere.iter().rev().find(|s| s.frozen.session != session_id) {
+        Some(open) => serve::eval_session::continue_note(open, false),
+        None => serve::eval_session::not_due_note(project),
+    }
 }
 
 /// Ask for the WHOLE end-of-session evaluation, or nothing - BLOCKS THE
@@ -3075,20 +3249,157 @@ fn judged_since(store: &EventStore, id: &str, after_seq: i64) -> bool {
 /// have no honest way out regardless of which caller reaches this function.
 /// Repeating the check here means that stays true even if some future
 /// caller forgets, or bypasses, the call site's own gate.
+///
+/// STEP 17: the Stop no longer calls this. It decides WHO is asked about
+/// WHICH project in `eval_stop_ask` (`usefulness::stop_decision`) and words
+/// the ask with `evaluation_ask`. This stays as the unit tests' door to the
+/// project half: `work` is the PROJECT's clock, and this session's own
+/// minutes are taken to be the same.
+#[cfg(test)]
 fn evaluation_debt(
     store: &EventStore,
     db_path: &Path,
     current_project: Option<&str>,
     work: &usefulness::SessionWorkState,
 ) -> Option<String> {
-    current_project?;
+    let project = current_project?;
+    let state = usefulness::project_eval_state(db_path, Some(project));
+    let by_floor = usefulness::project_due(store, &state, project, work, time::now_unix(), usefulness::EVAL_CADENCE)?;
+    let clock = usefulness::EvalClock { work: work.clone(), own_minutes: work.accrued_secs / 60, by_floor };
+    Some(evaluation_ask(store, db_path, project, &clock, Some(project)))
+}
+
+/// What the Stop decided about the evaluation (step 17, `eval_stop_ask`).
+enum EvalStop {
+    /// Hold the turn: the ask, with the start note of the evaluation it
+    /// starts.
+    Ask(String),
+    /// Another session runs the evaluation: one line that rides with the
+    /// rest of this Stop, no hold (D12).
+    Elsewhere(String),
+    Quiet,
+}
+
+/// THE STOP'S EVALUATION DECISION (step 17). Reads this session's own
+/// transcript once (`attest::session_timeline`, bounded to each file's
+/// tail), then walks every project the session worked in
+/// (`usefulness::projects_of_session`: the folder's own project first),
+/// refreshing each project's facts from the log (`update_eval_debt_state`,
+/// the one place a valid evaluation resets a clock) and asking
+/// `usefulness::stop_decision` whether THIS session is the one to ask. The
+/// first project that says so is asked about - one ask per turn - and its
+/// evaluation starts in the log; a project whose evaluation runs in another
+/// session gives the one line instead. `may_ask` is false while the
+/// session's transcript is in a shape THOR cannot read (D14): the facts are
+/// still refreshed, nothing is asked.
+/// Where a Stop stands: the project it was counted in (the folder's, else
+/// the session's last - `project::session_project`) and the folder's own
+/// project, if any.
+struct EvalStopAt<'a> {
+    project: Option<&'a str>,
+    folder: Option<&'a str>,
+}
+
+fn eval_stop_ask(
+    store: &mut EventStore,
+    db_path: &Path,
+    session_id: &str,
+    at: EvalStopAt,
+    now: i64,
+    may_ask: bool,
+    no_record: bool,
+) -> EvalStop {
+    let folder_project = at.project;
+    let timeline = serve::attest::transcripts_root()
+        .map(|root| serve::attest::session_timeline(&root, session_id))
+        .unwrap_or_default();
+    let candidates = usefulness::projects_of_session(
+        &usefulness::read_eval_debt_state(db_path),
+        session_id,
+        folder_project,
+        &serve::attest::projects_in(&timeline),
+    );
+    let mut elsewhere: Option<String> = None;
+    for project in candidates {
+        let state = usefulness::update_eval_debt_state(store, db_path, Some(&project), now);
+        if !may_ask {
+            continue;
+        }
+        let stop_here = folder_project == Some(project.as_str());
+        match usefulness::stop_decision(store, &state, &project, session_id, &timeline, stop_here, true, now, usefulness::EVAL_CADENCE) {
+            usefulness::StopDecision::Ask(clock) => {
+                let reason = evaluation_ask(store, db_path, &project, &clock, at.folder);
+                usefulness::record_eval_debt_asked(db_path, Some(&project), now);
+                // The ask is where this evaluation starts: one start record
+                // in the log freezes the three lists its report is held to,
+                // and the note naming them rides with the ask
+                // (`serve::eval_session`). A later turn's ask finds it open
+                // and keeps it.
+                let started = match no_record {
+                    true => None,
+                    false => serve::eval_session::start(db_path, store, session_id, &project, "stop-ask"),
+                };
+                return EvalStop::Ask(match started {
+                    Some(started) => format!("{reason}\n\n{}", serve::eval_session::start_note(&started.start)),
+                    None => reason,
+                });
+            }
+            usefulness::StopDecision::Elsewhere(start) => {
+                elsewhere.get_or_insert_with(|| {
+                    format!(
+                        "[THOR] an evaluation of {project} is running in another session (started {})",
+                        time::iso8601_from_unix(start.frozen.started_unix)
+                    )
+                });
+            }
+            usefulness::StopDecision::Quiet(_) => {}
+        }
+    }
+    elsewhere.map_or(EvalStop::Quiet, EvalStop::Elsewhere)
+}
+
+/// The words of the evaluation ask for `project`, from `clock` (the
+/// project's work clock and this session's own minutes). `folder_project` is
+/// where the session stands now: when the ask is about ANOTHER project (the
+/// ask follows the work, D11), it opens by saying so.
+fn evaluation_ask(
+    store: &EventStore,
+    db_path: &Path,
+    project: &str,
+    clock: &usefulness::EvalClock,
+    folder_project: Option<&str>,
+) -> String {
+    let current_project = Some(project);
+    let work = &clock.work;
     let now = time::now_unix();
     let accrued_minutes = work.accrued_secs / 60;
+    let own_minutes = clock.own_minutes;
     let state = usefulness::project_eval_state(db_path, current_project);
-    if !usefulness::eval_debt_owed(accrued_minutes, state.last_evaluation_seen, now, work.edits_since_test, work.compacted_since_anchor) {
-        return None;
-    }
     let (_, owed_in_project) = usefulness::judgement_debt_counts(store, current_project);
+    // THE ASK FOLLOWS THE WORK (D11): named when the folder is elsewhere.
+    let elsewhere = match folder_project {
+        Some(folder) if folder == project => String::new(),
+        Some(folder) => format!(
+            "[THOR] This session worked in project '{project}' since its last evaluation; this folder belongs to '{folder}'. \
+             The ask below is about '{project}' - moving to another folder does not move it.\n\n"
+        ),
+        None => format!(
+            "[THOR] This session worked in project '{project}' since its last evaluation; this folder belongs to no \
+             project. The ask below is about '{project}'.\n\n"
+        ),
+    };
+    // A REPORT ON FILE THAT DOES NOT COUNT (step 16): named first, with the
+    // validator's reason, so a session that filed one - through an older
+    // binary, a script, or a call its transcript does not hold - learns why
+    // it is still asked.
+    let not_counted = serve::eval_filing::newest_invalid_report(store, current_project)
+        .map(|(id, why)| {
+            format!(
+                "[THOR] The report '{id}' is on file but does not count as this project's evaluation: {why}. The \
+                 evaluation is still owed.\n\n"
+            )
+        })
+        .unwrap_or_default();
     // Named when the file is actually there to read - the same location
     // `ops::install::seed_eval_command` writes to, resolved the same way
     // (`usefulness::default_eval_command_path`, `ops/tests` proves the two
@@ -3107,6 +3418,21 @@ fn evaluation_debt(
             model::store::install_command_for(Some(db_path))
         ),
     };
+    // The project's own clock, when it says more than this session's (B8):
+    // every session of the project together, parallel minutes counted once.
+    let together = match accrued_minutes > own_minutes {
+        true => format!(" (the project, every session together: {accrued_minutes} minute(s) since its last evaluation)"),
+        false => String::new(),
+    };
+    // THE WEEKLY FLOOR (D13): said plainly when it alone made this due.
+    let floor = match clock.by_floor {
+        true => format!(
+            " It was active in the last {days} days and has had no valid evaluation in {days} days, so it is due whatever the \
+             work clock says (the weekly floor).",
+            days = usefulness::EVAL_FLOOR_DAYS
+        ),
+        false => String::new(),
+    };
 
     if usefulness::eval_report_covers(state.last_evaluation_seen, now) {
         // THE REPEAT ASK (fifth rewrite, 2026-09-17): names hours, not
@@ -3116,12 +3442,11 @@ fn evaluation_debt(
         // uses.
         //
         // NAMES THE RISK TOO (sixth rewrite, 2026-09-17 - see `usefulness`'s
-        // own "the repeat's own risk" doc comment): `eval_debt_owed` above
-        // already guarantees at least one of the two holds by the time this
-        // branch is reached, so `risk_reasons` is never empty here - either
-        // clause on its own is a complete, true sentence, and both together
-        // read naturally joined with "and".
-        let hours = accrued_minutes as f64 / 60.0;
+        // own "the repeat's own risk" doc comment): `eval_debt_owed` already
+        // guarantees at least one of the two holds when the clock made this
+        // due, so `risk_reasons` is empty only for an ask the weekly floor
+        // made.
+        let hours = own_minutes as f64 / 60.0;
         let report_id = state.last_evaluation_report_id.as_deref().unwrap_or("an earlier report");
         let mut risk_reasons = Vec::new();
         if work.edits_since_test >= usefulness::EVAL_REPEAT_MIN_UNTESTED_EDITS {
@@ -3130,24 +3455,18 @@ fn evaluation_debt(
         if work.compacted_since_anchor {
             risk_reasons.push("the context was summarized".to_string());
         }
-        let risk_text = risk_reasons.join(" and ");
-        let mut message = format!(
-            "[THOR] This session has worked here for {hours:.1} hour(s) since the last evaluation report ('{report_id}'), \
-             and {risk_text}. \
+        let risk_text = match risk_reasons.is_empty() {
+            true => String::new(),
+            false => format!(", and {}", risk_reasons.join(" and ")),
+        };
+        format!(
+            "{elsewhere}{not_counted}[THOR] This session has worked here for {hours:.1} hour(s) since the last evaluation report ('{report_id}'){together}\
+             {risk_text}.{floor} \
              A new evaluation is due, covering only what happened since then plus the state of the work; \
              {owed_in_project} item(s) currently owe a verdict here. \
              Run the THOR evaluation before you finish: {ask} \
              A turn cannot end until the evaluation report for this project is filed."
-        );
-        if let Some(batch) = teeth_batch_note(store, current_project) {
-            message.push_str("\n\n");
-            message.push_str(&batch);
-        }
-        if let Some(points) = open_points_full_block(store, current_project) {
-            message.push_str("\n\n");
-            message.push_str(&points);
-        }
-        Some(message)
+        )
     } else {
         // How many times this project has already been asked since its
         // last report, and since when - the count and clock this very ask
@@ -3161,52 +3480,16 @@ fn evaluation_debt(
         let first_asked = state.first_asked_since_report.unwrap_or(now);
         let asked_count = state.asked_count + 1;
         let covers_hours = usefulness::EVAL_REPORT_COVERS_HOURS;
-        let mut message = format!(
-            "[THOR] This project has had no evaluation in the last {covers_hours} hours. This session has worked here for {accrued_minutes} minute(s); \
+        format!(
+            "{elsewhere}{not_counted}[THOR] This project has had no evaluation in the last {covers_hours} hours (project '{project}').{floor} \
+             This session has worked here for {own_minutes} minute(s){together}; \
              {owed_in_project} item(s) currently owe a verdict here. It has been asked {asked_count} time(s) - the first \
              {} day(s) ago - with no report filed yet. \
              Run the THOR evaluation before you finish: {ask} \
              A turn cannot end until the evaluation report for this project is filed. After that it is quiet for {covers_hours} hours.",
             usefulness::days_ago(now, first_asked)
-        );
-        if let Some(batch) = teeth_batch_note(store, current_project) {
-            message.push_str("\n\n");
-            message.push_str(&batch);
-        }
-        if let Some(points) = open_points_full_block(store, current_project) {
-            message.push_str("\n\n");
-            message.push_str(&points);
-        }
-        Some(message)
+        )
     }
-}
-
-/// The rules this evaluation's report is held to
-/// (`model::store::evaluation_teeth_batch`), named in the message that asks
-/// for the evaluation, so a session sees the batch before it starts rather
-/// than only in the refusal at the end. `None` when the batch owes nothing.
-fn teeth_batch_note(store: &EventStore, project: Option<&str>) -> Option<String> {
-    let batch = model::store::evaluation_teeth_batch(store, project);
-    if batch.owed_now.is_empty() {
-        return None;
-    }
-    let db = store.path();
-    let named = batch
-        .owed_now
-        .iter()
-        .map(|(id, why)| format!("\n- '{id}': {why}. Run: {}", model::store::retest_command_for(db.as_deref(), id)))
-        .collect::<String>();
-    let later = match batch.owed_later.len() {
-        0 => String::new(),
-        n => format!(" {n} more stay owed for a later report; doctor names them."),
-    };
-    Some(format!(
-        "This report's batch of rules (at most {}, the ones that fired since the previous report first, then the \
-         ones written longest ago) - each has no current verdict from THOR's trial, and the report cannot be filed \
-         until each one is settled. Run the command shown for each: it prints its verdict, and the same command \
-         with --apply writes a rule or a note.{later}{named}",
-        model::store::EVALUATION_TEETH_BATCH
-    ))
 }
 
 /// How many open points `SessionStart`'s own note names in full before
@@ -3217,41 +3500,48 @@ fn teeth_batch_note(store: &EventStore, project: Option<&str>) -> Option<String>
 const OPEN_POINTS_SESSION_START_CAP: usize = 5;
 
 /// This project's own open points (`model::store::open_points`), formatted
-/// for the ONE message that HOLDS A TURN - `evaluation_debt`'s own two
-/// branches above - so it carries the full list, untruncated: a session
-/// about to be blocked on filing (or actually filing) an evaluation report
-/// needs everything it must act on, not a teaser. `None` when the project
-/// has none open right now.
-fn open_points_full_block(store: &EventStore, project: Option<&str>) -> Option<String> {
-    let points = model::store::open_points(store, project);
-    if points.is_empty() {
-        return None;
-    }
-    let mut lines = vec![format!("This project's own open point(s) from earlier evaluations ({}):", points.len())];
-    for p in &points {
-        let carried = if p.carried > 0 { format!(" [carried {}x]", p.carried) } else { String::new() };
-        lines.push(format!("- '{}'{carried}: {}", p.id, p.text));
-    }
-    Some(lines.join("\n"))
-}
-
-/// The same open points, formatted instead for `SessionStart` - capped at
-/// `OPEN_POINTS_SESSION_START_CAP`, id plus one short line each, a bare
-/// count for whatever does not fit. `None` when the project has none open.
+/// for `SessionStart` - capped at `OPEN_POINTS_SESSION_START_CAP`, id plus
+/// one short line each, a bare count for whatever does not fit. THOR's own
+/// points come first and say so; a legacy one (filed by an agent before THOR
+/// wrote them itself) is marked, because it settles nothing and holds no
+/// filing. `None` when the project has none open.
+///
+/// (The message that asks for an evaluation no longer lists them: the start
+/// note that rides with it does, from the start record's frozen lists.)
+///
+/// OVER THE OWNER'S BUDGET (step 16, B6): when more of THOR's own points of
+/// the project wait on the owner (`model::store::owner_queue`) than
+/// `model::store::OPEN_POINTS_OWNER_BUDGET`, the block opens with the
+/// banner that says so. Nothing is refused over it. The call site never
+/// shows this block to a subagent.
 fn open_points_session_start_note(store: &EventStore, project: Option<&str>) -> Option<String> {
     let points = model::store::open_points(store, project);
     if points.is_empty() {
         return None;
     }
-    let mut lines = vec![format!("[THOR] {} open point(s) from earlier evaluations in this project:", points.len())];
+    let machine = points.iter().filter(|p| p.machine).count();
+    let queue = project.map(|p| model::store::owner_queue(store, p)).unwrap_or_default();
+    let mut lines: Vec<String> = project.and_then(|p| model::store::owner_queue_banner(p, queue.len())).into_iter().collect();
+    lines.push(format!(
+        "[THOR] {} open point(s) in this project: {machine} written by THOR itself (each says what clears it, and closes \
+         itself), {} legacy (filed by an agent earlier; they settle nothing and hold no filing):",
+        points.len(),
+        points.len() - machine
+    ));
     for p in points.iter().take(OPEN_POINTS_SESSION_START_CAP) {
         let short: String = p.text.chars().take(80).collect();
         let ellipsis = if p.text.chars().count() > 80 { "..." } else { "" };
-        lines.push(format!("- '{}': {short}{ellipsis}", p.id));
+        let in_queue = queue.iter().any(|(q, _)| q.id == p.id);
+        let whose = match (p.machine, in_queue) {
+            (true, true) => "THOR's own, the owner decides",
+            (true, false) => "THOR's own",
+            (false, _) => "legacy",
+        };
+        lines.push(format!("- '{}' ({whose}): {short}{ellipsis}", p.id));
     }
     if points.len() > OPEN_POINTS_SESSION_START_CAP {
         lines.push(format!(
-            "...{} more (the evaluation report or `lookup` has the rest).",
+            "...{} more (`lookup` has the rest).",
             points.len() - OPEN_POINTS_SESSION_START_CAP
         ));
     }
@@ -3839,7 +4129,7 @@ mod setup_debt_tests {
         let mut store = EventStore::new(&db).unwrap();
         model::store::declare(&mut store, "s", "l", "a", &setup_note()).unwrap();
         model::store::declare(&mut store, "s", "l", "a", &owner_setup_answers()).unwrap();
-        model::store::retract(&mut store, "s", "l", "a", model::store::SETUP_NOTE_ID, "owner walked through setup")
+        model::store::retract(&mut store, "s", "l", "a", model::store::SETUP_NOTE_ID, "owner walked through setup", None)
             .expect("the gate must accept this retract once the answers are on record");
 
         assert!(setup_debt(&store).is_none(), "a retracted note must never hold the turn again");
@@ -4115,7 +4405,7 @@ mod judgement_debt_tests {
         model::store::declare(&mut store, "mcp", "mcp", "t", &crowded_newcomer("mine", "p")).unwrap();
         assert!(crowding_debt(&store, &db, "now", None).is_some(), "fixture sanity");
 
-        model::store::retract(&mut store, "mcp", "mcp", "t", "mine", "folded into the item that already said it")
+        model::store::retract(&mut store, "mcp", "mcp", "t", "mine", "folded into the item that already said it", None)
             .unwrap();
         assert!(crowding_debt(&store, &db, "now", None).is_none(), "folding it away settles it, with no marker to update");
     }
@@ -4761,7 +5051,7 @@ mod judgement_debt_tests {
         serve_it(&mut store, "gone", JUDGEMENT_DEBT_AFTER);
         assert!(judgement_debt(&store, Path::new("no-watermark-for-this-test"), "s", None).is_some(), "fixture sanity: it is owed while it is live");
 
-        model::store::retract(&mut store, "t", "t", "t", "gone", "merged into another item").unwrap();
+        model::store::retract(&mut store, "t", "t", "t", "gone", "merged into another item", None).unwrap();
         assert!(
             judgement_debt(&store, Path::new("no-watermark-for-this-test"), "s", None).is_none(),
             "a retracted item must drop out of the debt, or it is owed forever with no way to settle it"
@@ -4790,7 +5080,10 @@ mod judgement_debt_tests {
         serve_it(&mut store, "drifter", JUDGEMENT_DEBT_AFTER);
         assert!(judgement_debt(&store, Path::new("no-watermark-for-this-test"), "s", None).is_some(), "fixture sanity: it is owed");
 
-        serve::mark::record_useful(&mut store, "s", "s", "t", "2026-08-08T00:00:00Z", "drifter").unwrap();
+        let verdicts = tempfile::tempdir().unwrap();
+        // Through THOR's mark tool and verified at a Stop (step 12, D9): the
+        // only kind of verdict that clears judgement debt.
+        serve::attest::fixture::attested_mark(&mut store, verdicts.path(), serve::attest::fixture::SESSION, "drifter", false, "toolu_drifter");
         assert!(judgement_debt(&store, Path::new("no-watermark-for-this-test"), "s", None).is_none(), "a verdict must settle it for now");
 
         serve_as(&mut store, "s2", "drifter", JUDGEMENT_DEBT_AFTER - 1);
@@ -4824,7 +5117,10 @@ mod judgement_debt_tests {
         serve_it(&mut store, "settled-in-session", JUDGEMENT_DEBT_AFTER);
         assert!(judgement_debt(&store, &db, "s", None).is_some(), "fixture sanity: it is owed");
 
-        serve::mark::record_useful(&mut store, "s", "s", "t", "2026-08-08T00:00:00Z", "settled-in-session").unwrap();
+        let verdicts = tempfile::tempdir().unwrap();
+        // Through THOR's mark tool and verified at a Stop (step 12, D9): the
+        // only kind of verdict that clears judgement debt.
+        serve::attest::fixture::attested_mark(&mut store, verdicts.path(), serve::attest::fixture::SESSION, "settled-in-session", false, "toolu_settled_in_session");
         assert!(judgement_debt(&store, &db, "s", None).is_none(), "a verdict must settle it for now");
 
         serve_it(&mut store, "settled-in-session", JUDGEMENT_DEBT_AFTER * 2);
@@ -4832,6 +5128,22 @@ mod judgement_debt_tests {
             judgement_debt(&store, &db, "s", None).is_none(),
             "the SAME session must never be asked about it again this session, however many more times it fires"
         );
+    }
+
+    /// D9 (step 12): a verdict typed into a shell (`serve mark`, no stamp)
+    /// after the session started is written, but neither resets the count nor
+    /// silences this session's ask through the in-session floor.
+    #[test]
+    fn a_verdict_from_the_command_line_does_not_silence_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        record_session_watermark(&db, "s");
+        declare(&mut store, "shell-marked", false);
+        serve_it(&mut store, "shell-marked", JUDGEMENT_DEBT_AFTER);
+        serve::mark::record_useful(&mut store, "cli", "cli", "cli", "2026-08-08T00:00:00Z", "shell-marked", None).unwrap();
+        let asked = judgement_debt(&store, &db, "s", None).expect("an unattested verdict settles nothing");
+        assert!(asked.contains("shell-marked"), "{asked}");
     }
 
     /// The other verdict shape settles a session the same way - `judged_since`
@@ -4847,7 +5159,10 @@ mod judgement_debt_tests {
         serve_it(&mut store, "noised-in-session", JUDGEMENT_DEBT_AFTER);
         assert!(judgement_debt(&store, &db, "s", None).is_some(), "fixture sanity: it is owed");
 
-        serve::mark::record_noise(&mut store, "s", "s", "t", "2026-08-08T00:00:00Z", "noised-in-session").unwrap();
+        let verdicts = tempfile::tempdir().unwrap();
+        // Through THOR's mark tool and verified at a Stop (step 12, D9): the
+        // only kind of verdict that clears judgement debt.
+        serve::attest::fixture::attested_mark(&mut store, verdicts.path(), serve::attest::fixture::SESSION, "noised-in-session", true, "toolu_noised_in_session");
         assert!(judgement_debt(&store, &db, "s", None).is_none(), "a noise verdict must also settle it for now");
 
         serve_it(&mut store, "noised-in-session", JUDGEMENT_DEBT_AFTER * 2);
@@ -5093,7 +5408,10 @@ mod judgement_debt_tests {
         serve_it(&mut store, "still-owed-a", JUDGEMENT_DEBT_AFTER);
         serve_it(&mut store, "still-owed-b", JUDGEMENT_DEBT_AFTER);
 
-        serve::mark::record_useful(&mut store, "s", "s", "t", "2026-08-13T00:00:00Z", "answered").unwrap();
+        let verdicts = tempfile::tempdir().unwrap();
+        // Through THOR's mark tool and verified at a Stop (step 12, D9): the
+        // only kind of verdict that clears judgement debt.
+        serve::attest::fixture::attested_mark(&mut store, verdicts.path(), serve::attest::fixture::SESSION, "answered", false, "toolu_answered");
 
         let asked = judgement_debt(&store, Path::new("no-watermark-for-this-test"), "s", None).expect("two items are still owed");
         assert!(!asked.contains("answered"), "a settled item must not reappear: {asked}");
@@ -5159,7 +5477,12 @@ mod evaluation_debt_tests {
             falsifier: None,
             check: None,
         };
-        model::store::declare(store, "t", "t", "t", &item).expect("fixture must store");
+        // Filed through THOR's remember tool, the way Claude Code files one
+        // (step 15), and validated the way the next Stop validates it (step
+        // 16) - by the shared fixture.
+        let transcripts = tempfile::tempdir().unwrap();
+        let session = serve::attest::fixture::SESSION;
+        serve::eval_filing::fixture::valid_filing(store, transcripts.path(), session, &item, "toolu_fixture_report");
     }
 
     /// Served under `usefulness::ASSISTANT_DELIVERY_ACTOR` (2026-09-19), same
@@ -5306,10 +5629,12 @@ mod evaluation_debt_tests {
         assert!(asked.contains("After that it is quiet for 16 hours"), "{asked}");
     }
 
-    /// The ask names the batch of rules the report will be held to, and
-    /// counts the ones that stay owed beyond it (2026-09-26).
+    /// Step 14: the ask itself no longer carries a batch computed live - a
+    /// list that could name a rule the evaluation is not held to. The start
+    /// note that rides with it says what THOR decided itself at the start
+    /// and what is left for the session, from the start record alone.
     #[test]
-    fn the_ask_names_the_batch_of_heavy_rules_and_counts_the_rest() {
+    fn the_ask_carries_no_live_batch_and_the_start_note_says_what_the_machine_decided() {
         let (_dir, db, mut store) = new_store();
         let owed = model::store::EVALUATION_TEETH_BATCH + 2;
         for i in 0..owed {
@@ -5334,10 +5659,14 @@ mod evaluation_debt_tests {
             serve_it(&mut store, &id, 1);
         }
         let asked = evaluation_debt(&store, &db, Some("thor"), &work_minutes(90)).expect("the evaluation is owed");
-        assert!(asked.contains("This report's batch of rules"), "{asked}");
-        assert_eq!(asked.matches("\n- 'heavy-").count(), model::store::EVALUATION_TEETH_BATCH, "{asked}");
-        assert!(asked.contains("retest --id 'heavy-00'"), "each one with the command that decides it: {asked}");
-        assert!(asked.contains("2 more stay owed for a later report"), "{asked}");
+        assert!(!asked.contains("This report's batch of rules") && !asked.contains("heavy-00"), "no live batch in the ask: {asked}");
+
+        let started = serve::eval_session::start(&db, &mut store, "0de7dc52-1b97-4b66-948f-61e4438043b2", "thor", "stop-ask").unwrap();
+        let note = serve::eval_session::start_note(&started.start);
+        assert!(note.contains(&format!("THOR tried {owed} old rule(s) of this project itself")), "{note}");
+        assert!(note.contains(&format!("{owed} became a note")) && note.contains("not reached this time: 0"), "{note}");
+        assert!(note.contains("a. THE BATCH - no rule needs a fix from you"), "{note}");
+        assert_eq!(teeth_debt(&store, &db, Some("thor")), None, "and the backlog burn has nothing left to ask");
     }
 
     /// Case named in the build brief: zero items owed must still fire once
@@ -6943,16 +7272,21 @@ fn cmd_mark(db_path: &Path, id: &str, noise: bool) {
     let mut store = open_store_or_die(db_path);
     let now = time::now_iso8601();
     let written = if noise {
-        mark::record_noise(&mut store, "cli", "cli", "cli", &now, id)
+        mark::record_noise(&mut store, "cli", "cli", "cli", &now, id, None)
     } else {
-        mark::record_useful(&mut store, "cli", "cli", "cli", &now, id)
+        mark::record_useful(&mut store, "cli", "cli", "cli", &now, id, None)
     };
+    // A verdict typed here is written, and counts for decay, but it clears no
+    // judgement debt: only a verdict made through THOR's own `mark` tool in a
+    // Claude Code session - one the session's Stop can verify - does (D9).
+    let debt = "written from the command line, so it clears no judgement debt - to clear that, judge it with THOR's \
+                mark tool inside the Claude Code session it fired in";
     match written {
         Ok(_) if noise => println!(
-            "marked noise: {id} ({}+ of these, with no mark of usefulness, retires it from the injection surfaces; it stays findable via search)",
+            "marked noise: {id} ({}+ of these, with no mark of usefulness, retires it from the injection surfaces; it stays findable via search) - {debt}",
             serve::decay::NOISE_MARKS_BEFORE_STALE
         ),
-        Ok(_) => println!("marked useful: {id} (clears the noise recorded before it; a later noise mark still counts)"),
+        Ok(_) => println!("marked useful: {id} (clears the noise recorded before it; a later noise mark still counts) - {debt}"),
         Err(e) => {
             eprintln!("could not record the mark for {id}: {e}");
             std::process::exit(1);

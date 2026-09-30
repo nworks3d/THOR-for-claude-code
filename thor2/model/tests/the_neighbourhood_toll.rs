@@ -102,7 +102,7 @@ fn settling_the_neighbour_lets_the_write_through_unchanged() {
     let mut s = store_with(&[stale]);
 
     // Settling it the cheap way: retract, one call and a reason.
-    store::retract(&mut s, "t", "t", "t", "the-stale-one", "the name it named is gone").unwrap();
+    store::retract(&mut s, "t", "t", "t", "the-stale-one", "the name it named is gone", None).unwrap();
 
     let fresh = anchored("the-new-one", "noted.md", None);
     store::declare_in(&mut s, "t", "t", "t", &fresh, Some(&root))
@@ -150,7 +150,7 @@ fn revising_and_retracting_are_never_tolled() {
     store::revise(&mut s, "t", "t", "t", &existing, &updated)
         .expect("a revise must never be tolled - it IS the maintenance");
 
-    store::retract(&mut s, "t", "t", "t", "also-here", "no longer relevant")
+    store::retract(&mut s, "t", "t", "t", "also-here", "no longer relevant", None)
         .expect("a retract must never be tolled either");
 
     // And the toll is still armed for a genuine new declaration.

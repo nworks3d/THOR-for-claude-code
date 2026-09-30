@@ -201,7 +201,7 @@ fn main() -> anyhow::Result<()> {
                 println!("WOULD retract {} - {}", o.id, o.reason);
                 continue;
             }
-            match store::retract(&mut store, "attach-checks", "attach-checks", "cli", &o.id, &o.reason) {
+            match store::retract(&mut store, "attach-checks", "attach-checks", "cli", &o.id, &o.reason, None) {
                 Ok(_) => println!("OUT   {}", o.id),
                 Err(e) => println!("REFUSED {} - {e}", o.id),
             }

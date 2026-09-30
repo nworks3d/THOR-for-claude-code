@@ -147,39 +147,95 @@ there the day writes are turned on. An existing copy - the owner's own
 edited version, or one an earlier install already wrote - is left exactly
 as it is.
 
-Opening that routine starts an evaluation, and the judgement list its
-report is held to is fixed right then: only what fired in that session, 40
-times or more since its last verdict, and nothing that fires afterwards.
-The hook records the start in `evaluation-sessions.json` beside the store,
-because only the hook knows which session is which; the tool server reads it
-back when the report is filed. Keep the routine under a name of your own as
-well? List that name, one per line, in `eval-command-names.txt` beside the
-store, and opening it under that name starts an evaluation too.
+Opening that routine starts an evaluation, and so does the `Stop` hook's ask
+for one. The start is a record in the memory's own log (`evaluation-start-<project>-<seq>`,
+written by the reserved actor `eval-machine`), never a file beside the store:
+only the hook knows which session is which, so it writes the record, and the
+tool server finds it again by the session id it runs under. The record
+freezes three lists, none of which can grow afterwards: the judgement
+list (what fired in that session, 40 times or more since its last verdict),
+the batch (at most 8 old rules only an agent can fix) and the A4 list (at
+most 16 rules whose check bites and whose text only has to name its literal).
+Right after it, THOR's machine pass tries the project's old rules itself, in a
+time box of 20 seconds (`THOR_MACHINE_PASS_SECS`, 1 to 200), and writes a
+rule, a note or an open point of its own for each; what it could not decide
+goes to the batch or the A4 list, and the start note shows both with the exact
+call for each item. A pass the hook did not finish (it was killed, or the box
+ran out) is finished by the next `Stop`. Keep the routine under a name of your
+own as well? List that name, one per line, in `eval-command-names.txt` beside
+the store, and opening it under that name starts an evaluation too.
 
-Once a project has gone 16 hours without an evaluation report, and the
-session has accrued at least an hour of work in that project, the `Stop`
-hook asks for this whole routine by name instead of one more item at a time
-- see the `judgement debt` line under "Check it" below for where this
-checkout's own newest evaluation report is named. It is not once per
-session: it blocks the first `Stop` of EVERY turn, regardless of how many
-notes currently owe a verdict, naming how many times it has already asked
-and since when, until the report is filed. Filing the evaluation report -
-the last step of the routine above - is what lets a turn end and stays
-quiet for the next 16 hours. This only ever happens inside a project: a
-checkout that resolves to no project is never asked, since there would be
-no collection to file that report under and so no way to ever silence the
-ask at all.
+An evaluation report is filed through `mcp__thor__remember` only. The hook
+stamps the call in flight (its `tool_use_id` and the input's digest), the
+tool server stores them with the write, and THOR writes the report's MACHINE
+SECTION itself in front of the agent's text: what was judged, what the
+machine decided, which rules were refused, which writes came from outside an
+attested call (side doors), which open points were carried. It is a pure
+function of the log up to the filing, and a later `revise` that edits it is
+refused; only the TLDR and remarks below it can change. The model command
+line, a second client and an older binary cannot file one at all. A filing is
+also refused while the batch or the A4 list is not settled, while THOR is still
+deciding, while the verdicts given in the same turn are not checked yet, and
+when a frozen item was changed outside an attested call of the evaluation (that
+voids it; the next `Stop` starts a fresh one).
 
-Filing that report does not buy silence for the full 16 hours, either -
-but only when something risky happened since: once three more hours of
-accrued work go by since it, AND at least three code changes have gone by
-with no test or build run since, or the context was summarized, a repeat
-evaluation is due the same way, covering only what happened since the last
-report plus the state of the work right now, until a newer report is filed.
-Three quiet hours with neither counts for nothing. "Accrued" means real
+At the first main-session `Stop` after a filing, THOR validates it once and
+records the answer in the log (`eval-validator`, `valid` or not, with the
+reason and the carried open points): a filing that is a THOR call of this
+session, for an evaluation THOR started in it, with the machine section exactly
+as the log gives it and nothing on the lists changed behind it. A report that is
+not valid counts for nothing, the next ask names it and why, and every project
+therefore owes one fresh evaluation after the upgrade that introduced this (the
+older reports carry no stamp). A missing session record makes a report invalid;
+a record in a shape THOR cannot read (Claude Code changed its format) is drift:
+nothing counts, no evaluation is asked for, and every turn says so until THOR is
+updated. `eval-debt-state.json` beside the store is a copy for the hooks' speed
+only: the `Stop` overwrites its facts from the log every time.
+
+Who is asked, and when. The `Stop` hook asks for the whole routine by name,
+per project and not per folder, when:
+
+- the project's own work clock (every session of the project together, parallel
+  minutes counted once, in `eval-debt-state.json`) shows 60 minutes since the
+  newest VALID evaluation, in the cadence this build runs (`EVAL_CADENCE`,
+  rolling 16 hours: a valid report covers the next 16 hours, and after it a
+  repeat is due after three more hours of work AND a real risk - at least three
+  code changes with no test or build run since, or a context summary);
+- this session has at least 10 minutes of its own work in that project since
+  then (the larger of the clock file's number and the session record's own
+  count, so zeroing the file delays the ask at most until the record is read);
+- it is not this session's first `Stop` in that project;
+- no other session runs that project's evaluation right now (an open start of
+  less than an hour, its session active within half an hour): then the session
+  gets one line and no hold.
+
+The weekly floor holds regardless of the clock: a project with activity in
+the last 7 days (an item served or a write from a Claude Code session) and no
+valid evaluation in 7 days is due. The ask follows the work, not the folder: a
+session that worked in project A is asked about A from another folder, and a
+leading line says so. It is not once per session: it blocks the first `Stop` of
+EVERY turn, naming how many times it has already asked and since when, until a
+valid report is on file. A folder that belongs to no project is never asked on
+its own, since there would be no collection to file that report under. A second
+cadence, `WeeklyUnlessRot` (once a week, daily while the project shows rot), is
+built and off: it is a constant in the code, not a setting, and flipping it is
+the owner's decision; `doctor` prints which one runs. "Accrued" means real
 activity - `SessionStart`, a prompt, a tool call, or `Stop` - with a gap of
-half an hour or more between two of them counting as a pause, never as
-work.
+half an hour or more between two of them counting as a pause, never as work.
+Only a new valid evaluation, read from the log at a `Stop`, resets the clocks.
+
+An open point is THOR's own: the machine pass writes one per blocker
+(`open-no-working-copy-*` when a project has no registered working copy,
+`open-working-tree-differs-*` when the checkout is mid-change) and closes it
+itself, with a derived reason, at the first start after the blocker is gone.
+`remember`, `revise` and `retract` refuse an agent's attempt to file, tag or
+remove one. One still open after a valid evaluation was filed is in the owner's
+queue (the point's text says so, and names each carrier); over a budget of 8 per
+project, the `SessionStart` block opens with a banner for the owner, never for a
+subagent, and the filing receipt repeats it. A `mark` given from a shell with
+`serve mark` still writes a verdict, but it is outside an attested call: it is
+not counted as judgement debt settled, it does not shrink a judgement list, and
+the machine section lists it as a side door.
 
 `--project <key>` additionally writes a `.thor-project` marker in the current
 directory to override the project name. By default, a checkout is scoped to the
@@ -341,18 +397,29 @@ doctor also names each one that applies to this checkout - how often, what
 kind, and where it fires - so a review has a list to settle instead of only a
 count. A rule the owner has pinned to fire at every session start never
 appears on that list: pinning it already answered whether it belongs there,
-and a verdict on it would change nothing else in the memory. The same line
-also names the newest evaluation report this store holds for the project
-and the day it was first seen, or that none exists yet; says whether it
-still covers this project (within the last 16 hours - and, once it does,
-that a repeat is due after three more hours of accrued work since it AND a
-risk shows up too - time alone never triggers a repeat); and, when it does
-not, how many times the `Stop` hook has already asked and since when, plus
-a note that it blocks every turn once a session has accrued an hour of work
-here, until the report is filed. It also names the most recently active session's own
-accrued work for this project, its own untested-edit count and whether a
-context summary has happened since its own last reset, and when its next
-evaluation is due, where that is known.
+and a verdict on it would change nothing else in the memory. A verdict only
+clears that debt once a `Stop` has checked that it was made with the `mark`
+tool inside the Claude Code session the item fired in; the ones that were not
+(a `serve mark` from a shell, every verdict given before the upgrade that
+introduced the check) are kept, counted on a line of their own, and clear
+nothing.
+
+An `evaluations` line names the newest evaluation report that COUNTS for this
+checkout's project (valid, and filed by which session), the last five valid
+ones with how their verdicts split (`eval-<id>: <u> useful, <n> noise, <s>
+skipped (<p>% useful)`), a flag when ten or more verdicts all went one way (a
+blind pass looks exactly like that, and nothing can tell whether the items were
+read), every report on file that does not count with the reason, and a warning
+when Claude Code's session record could not be read. The judgement debt line
+says whether the project's evaluation is due and, when it is not, how many times
+the `Stop` hook has already asked and since when. A `cadence` line always names
+which cadence this build runs (rolling 16 hours; `weekly-unless-rot` is built
+and off), and a `work clock` line speaks up when the work-clock file disagrees
+with the session records by more than a quarter of an hour, since that file is
+one any local process can write. An `open points` line counts THOR's own open
+points apart from the legacy ones an agent filed before THOR wrote them itself,
+and an `owner queue` line counts, per project, the ones waiting for the owner
+against the budget of 8.
 
 Doctor also lists the working copy each project is registered at, since when,
 and where it was before a move - or `NOT USABLE` with the reason, when that

@@ -391,7 +391,7 @@ mod tests {
         let mut elsewhere = bound_rule("marked-elsewhere");
         elsewhere.text = "back up the database nightly".to_string();
         store::declare(&mut db, "s", "l", "a", &elsewhere).unwrap();
-        crate::mark::record_useful(&mut db, "s", "l", "a", "2026-08-02T00:00:00Z", "marked-elsewhere").unwrap();
+        crate::mark::record_useful(&mut db, "s", "l", "a", "2026-08-02T00:00:00Z", "marked-elsewhere", None).unwrap();
 
         let status = store_status(&db);
         assert_eq!(status.served_never_marked.count, 1, "hot-1 is still served repeatedly and never marked");
@@ -413,7 +413,7 @@ mod tests {
         store::declare(&mut db, "s", "l", "a", &bound_rule("noisy-1")).unwrap();
         for i in 0..crate::decay::NOISE_MARKS_BEFORE_STALE {
             crate::mark::record_noise(
-                &mut db, "s", "l", "a", &format!("2026-08-0{}T00:00:00Z", i + 1), "noisy-1",
+                &mut db, "s", "l", "a", &format!("2026-08-0{}T00:00:00Z", i + 1), "noisy-1", None,
             )
             .unwrap();
         }
@@ -447,7 +447,7 @@ mod tests {
                 &mut db, "s", "l", "serve", &format!("2026-08-0{}T00:00:00Z", i + 1), &["marked-1".to_string()],
             );
         }
-        crate::mark::record_useful(&mut db, "s", "l", "a", "2026-08-02T00:00:00Z", "marked-1").unwrap();
+        crate::mark::record_useful(&mut db, "s", "l", "a", "2026-08-02T00:00:00Z", "marked-1", None).unwrap();
         let status = store_status(&db);
         assert_eq!(status.decayed, 0, "a marked item must never count as decayed");
     }

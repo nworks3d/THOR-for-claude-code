@@ -217,6 +217,15 @@ out of date, and settles the debt in one pass instead of one note a day. A
 session that never runs it simply leaves that debt for the next one to
 inherit.
 
+You do not have to remember to run it. Once a project has had an hour of work
+since its last review, and your assistant has put in at least ten minutes of
+its own work there, THOR holds the end of the assistant's turn until a review
+is filed and checked. THOR sorts your older notes itself at the start of the
+review; your assistant only handles what needs its own judgement, and the part
+of the review report that says what was judged and what was refused is written
+by THOR from its own record, so it cannot be made up. A review that was filed
+any other way than through THOR's own tool does not count, and THOR says why.
+
 ## A memory with a spine
 
 Version 1 remembered well and never argued. It would hand your assistant a note

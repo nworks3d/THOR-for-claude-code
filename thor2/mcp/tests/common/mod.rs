@@ -37,11 +37,14 @@ pub struct Start<'a> {
     pub session: Option<&'a str>,
     /// Extra arguments (a replica's `--http`, `--capture-inbox`).
     pub args: Vec<String>,
+    /// A home folder for the server (`USERPROFILE` and `HOME`): where it
+    /// looks for Claude Code's transcripts (`<home>/.claude/projects`).
+    pub home: Option<&'a Path>,
 }
 
 impl Mcp {
     pub fn start(db: &Path, cwd: &Path) -> Mcp {
-        Mcp::start_with(Start { db, cwd, session: None, args: vec![] })
+        Mcp::start_with(Start { db, cwd, session: None, args: vec![], home: None })
     }
 
     pub fn start_with(start: Start<'_>) -> Mcp {
@@ -50,6 +53,9 @@ impl Mcp {
         cmd.env_remove("CLAUDE_CODE_SESSION_ID");
         if let Some(session) = start.session {
             cmd.env("CLAUDE_CODE_SESSION_ID", session);
+        }
+        if let Some(home) = start.home {
+            cmd.env("USERPROFILE", home).env("HOME", home);
         }
         let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().expect("spawn mcp");
         let stdin = child.stdin.take().unwrap();
@@ -92,7 +98,20 @@ impl Mcp {
     /// A tool call's text - its result, or (for a call the transport itself
     /// refused, such as an unknown argument) the error message.
     pub fn call(&mut self, tool: &str, args: serde_json::Value) -> String {
-        let v = self.request("tools/call", serde_json::json!({"name": tool, "arguments": args}));
+        self.call_params(serde_json::json!({"name": tool, "arguments": args}))
+    }
+
+    /// `call`, with the `_meta` Claude Code sends: the calling tool_use id.
+    pub fn call_meta(&mut self, tool: &str, args: serde_json::Value, tool_use_id: &str) -> String {
+        self.call_params(serde_json::json!({
+            "name": tool,
+            "arguments": args,
+            "_meta": {"claudecode/toolUseId": tool_use_id}
+        }))
+    }
+
+    fn call_params(&mut self, params: serde_json::Value) -> String {
+        let v = self.request("tools/call", params);
         if let Some(parts) = v["result"]["content"].as_array() {
             return parts.iter().filter_map(|p| p["text"].as_str()).collect::<Vec<_>>().join("\n");
         }
@@ -366,4 +385,196 @@ pub fn queued(inbox: &Path) -> Vec<thor_core::inbox::InboxOp> {
         return Vec::new();
     }
     thor_core::inbox::read_all(inbox).unwrap()
+}
+
+// ------------------------------------------------ one Claude Code session (step 15)
+//
+// THE SHARED ATTESTED FIXTURE for the tool server's own tests: a simulated
+// Claude Code session that calls THOR's tools the way Claude Code does, over
+// the real compiled binaries - the `mcp` server, and the `serve` hook beside
+// it that Claude Code runs before each call and at each Stop. Every line of
+// the session's transcript is written in the order Claude Code writes it
+// (step 1 of the build, answers 5 and 6): the tool_use line first, then the
+// call (carrying `_meta`), then the hook's attachments, then the result.
+
+/// The `serve` binary built beside `mcp`. A plain message when it is not
+/// there: no test here ever skips.
+pub fn serve_exe() -> PathBuf {
+    let exe = Path::new(env!("CARGO_BIN_EXE_mcp")).with_file_name(format!("serve{}", std::env::consts::EXE_SUFFIX));
+    assert!(
+        exe.is_file(),
+        "the serve binary is not built beside mcp ({}) - build it first with the same CARGO_TARGET_DIR: \
+         cargo build -p serve --bins",
+        exe.display()
+    );
+    exe
+}
+
+/// One Claude Code session, simulated: its store, its home folder (where the
+/// transcripts live), the project folder it works in and its main
+/// transcript file.
+pub struct Session {
+    pub db: PathBuf,
+    pub home: PathBuf,
+    pub cwd: PathBuf,
+    pub transcript: PathBuf,
+    pub id: String,
+    lines: usize,
+}
+
+impl Session {
+    /// A session of `WRITING_SESSION` in a fresh store holding the
+    /// collection "demo", working in a folder that resolves to project
+    /// "demo".
+    pub fn new(dir: &Path) -> Session {
+        Session::with_store(dir, store(dir, &["demo"]), WRITING_SESSION)
+    }
+
+    /// A session `id` of the store `db`, working in `dir/work` (project
+    /// "demo").
+    pub fn with_store(dir: &Path, db: PathBuf, id: &str) -> Session {
+        let home = dir.join("home");
+        let transcript = home.join(".claude").join("projects").join("C--work-demo").join(format!("{id}.jsonl"));
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        let cwd = dir.join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(cwd.join(".thor-project"), "demo\n").unwrap();
+        Session { db, home, cwd, transcript, id: id.to_string(), lines: 0 }
+    }
+
+    /// The tool server as Claude Code starts it for this session.
+    pub fn mcp(&self) -> Mcp {
+        Mcp::start_with(Start { db: &self.db, cwd: &self.cwd, session: Some(&self.id), args: vec![], home: Some(&self.home) })
+    }
+
+    /// One transcript line, stamped the way Claude Code stamps it: its own
+    /// uuid, the session, and the time it was written.
+    pub fn line(&mut self, mut v: serde_json::Value) {
+        self.lines += 1;
+        v["uuid"] = serde_json::json!(format!("00000000-0000-4000-8000-{:012x}", self.lines));
+        v["sessionId"] = serde_json::json!(self.id);
+        v["timestamp"] = serde_json::json!(serve::time::now_iso8601());
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&self.transcript).unwrap();
+        writeln!(f, "{v}").unwrap();
+    }
+
+    /// Run THOR's hook with `payload` on stdin, as Claude Code runs it.
+    pub fn hook(&self, payload: serde_json::Value) -> String {
+        let mut child = Command::new(serve_exe())
+            .arg("--db")
+            .arg(&self.db)
+            .arg("hook")
+            .env("USERPROFILE", &self.home)
+            .env("HOME", &self.home)
+            .env_remove("CLAUDE_CODE_SESSION_ID")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn serve");
+        child.stdin.take().unwrap().write_all(payload.to_string().as_bytes()).unwrap();
+        let out = child.wait_with_output().unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    fn tool_use(&mut self, name: &str, args: &serde_json::Value, id: &str) {
+        self.line(serde_json::json!({"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": id, "name": name, "input": args}]}}));
+    }
+
+    /// A THOR tool call exactly as Claude Code makes one.
+    pub fn call(&mut self, mcp: &mut Mcp, tool: &str, args: serde_json::Value, id: &str) -> String {
+        self.call_in_order(mcp, tool, args, id, false)
+    }
+
+    /// The same call, with its tool_use line reaching the transcript only
+    /// AFTER the tool ran (Claude Code writes it late at times): the writer
+    /// sees the call unseen, never refuses for that, and the Stop decides.
+    pub fn call_unseen(&mut self, mcp: &mut Mcp, tool: &str, args: serde_json::Value, id: &str) -> String {
+        self.call_in_order(mcp, tool, args, id, true)
+    }
+
+    fn call_in_order(&mut self, mcp: &mut Mcp, tool: &str, args: serde_json::Value, id: &str, late: bool) -> String {
+        let name = format!("mcp__thor__{tool}");
+        if !late {
+            self.tool_use(&name, &args, id);
+        }
+        let out = self.hook(serde_json::json!({
+            "hook_event_name": "PreToolUse", "session_id": self.id, "cwd": self.cwd,
+            "transcript_path": self.transcript, "tool_name": name, "tool_input": args, "tool_use_id": id
+        }));
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap_or(serde_json::Value::Null);
+        assert_ne!(parsed["decision"], "block", "fixture sanity - the hook must let {tool} through: {out}");
+        let reply = mcp.call_meta(tool, args.clone(), id);
+        if late {
+            self.tool_use(&name, &args, id);
+        }
+        self.line(serde_json::json!({"type": "attachment", "attachment": {"type": "hook_success",
+            "hookName": format!("PreToolUse:{name}"), "toolUseID": id, "hookEvent": "PreToolUse", "content": "", "stdout": out}}));
+        if let Some(ctx) = parsed["hookSpecificOutput"]["additionalContext"].as_str() {
+            self.line(serde_json::json!({"type": "attachment", "attachment": {"type": "hook_additional_context", "content": [ctx],
+                "hookName": format!("PreToolUse:{name}"), "toolUseID": id, "hookEvent": "PreToolUse"}}));
+        }
+        self.line(serde_json::json!({"type": "user", "message": {"role": "user", "content": [
+            {"tool_use_id": id, "type": "tool_result", "content": [{"type": "text", "text": reply}]}]}}));
+        reply
+    }
+
+    /// A real Bash tool call of the session, as its transcript holds it.
+    pub fn bash_call(&mut self, id: &str, command: &str, result: &str) {
+        self.tool_use("Bash", &serde_json::json!({"command": command}), id);
+        self.line(serde_json::json!({"type": "user", "message": {"role": "user", "content": [
+            {"tool_use_id": id, "type": "tool_result", "content": [{"type": "text", "text": result}]}]}}));
+    }
+
+    /// The owner types `text` as a prompt (`/t-eval` starts an evaluation):
+    /// the hook's context, which reaches the transcript as an attachment.
+    pub fn prompt(&mut self, text: &str) -> String {
+        let out = self.hook(serde_json::json!({
+            "hook_event_name": "UserPromptSubmit", "session_id": self.id, "cwd": self.cwd,
+            "transcript_path": self.transcript, "prompt": text
+        }));
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap_or(serde_json::Value::Null);
+        let ctx = parsed["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or_default().to_string();
+        self.line(serde_json::json!({"type": "user", "message": {"role": "user", "content": text}}));
+        if !ctx.is_empty() {
+            self.line(serde_json::json!({"type": "attachment", "attachment": {"type": "hook_additional_context", "content": [ctx],
+                "hookName": "UserPromptSubmit", "hookEvent": "UserPromptSubmit"}}));
+        }
+        ctx
+    }
+
+    /// The session's Stop, as Claude Code runs it at the end of a turn.
+    pub fn stop(&self) -> String {
+        self.hook(serde_json::json!({
+            "hook_event_name": "Stop", "session_id": self.id, "cwd": self.cwd,
+            "transcript_path": self.transcript, "stop_hook_active": false
+        }))
+    }
+
+    /// Every recorded verification of a write on `id`.
+    pub fn verdicts(&self, id: &str) -> std::collections::HashMap<i64, model::store::WriteVerdict> {
+        model::store::recorded_write_verdicts(&events_of(&self.db, id))
+    }
+
+    /// The evaluation this session has open of `project`, read from the log.
+    pub fn open_start(&self, project: &str) -> Option<model::store::EvaluationStart> {
+        model::store::open_evaluation_start(&EventStore::open_existing(&self.db).unwrap(), &self.id, project)
+    }
+}
+
+/// The last event of `id` of `kind`.
+pub fn last_of(db: &Path, id: &str, kind: EventKind) -> thor_core::event_store::Event {
+    events_of(db, id).into_iter().filter(|e| e.kind == kind).last().unwrap_or_else(|| panic!("no {kind:?} on {id}"))
+}
+
+/// The seq a reply names as "event seq N".
+pub fn named_seq(reply: &str) -> i64 {
+    let at = reply.find("event seq ").unwrap_or_else(|| panic!("the reply names no event seq: {reply}"));
+    reply[at + "event seq ".len()..].chars().take_while(char::is_ascii_digit).collect::<String>().parse().unwrap()
+}
+
+/// An evaluation report's remember arguments.
+pub fn report_args(id: &str, project: &str, text: &str) -> serde_json::Value {
+    serde_json::json!({"id": id, "kind": "report", "project": project, "tags": ["evaluation-report"], "text": text})
 }

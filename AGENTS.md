@@ -351,31 +351,102 @@ Saying it in your reply settles nothing - the fix has to be a real change to the
 note, or the tag that records the decision. No tag decides a rule's teeth: only
 its trial does.
 
-Once in a while it asks for something bigger instead of one more note: in
-every project a session actually works in, once that session has accrued at
-least an hour of work there and no evaluation report filed for that project
-still covers it (one covers the next 16 hours - a rolling window rather than
-a calendar day, so a report filed late at night is not undone by midnight),
-it asks you to run the full end-of-session review in one pass rather than
-judging notes one at a time - regardless of how many notes currently owe a
-verdict. THIS ONE DOES NOT GO QUIET AFTER ONE ASK: it holds the end of every
-turn, naming how many times it has already asked and since when, until a
-report is actually filed - and filing it at the end of that review is the
-only thing that lets a turn end and stays quiet for the next 16 hours.
-Filing it does not buy silence for that whole window either - but only when
-something risky happened since: once three more hours of accrued work go by since that report, AND
-three or more code changes have gone by with no test or build run since, or
-the context was summarized, it asks again the same way, covering only what
-happened since then plus the state of the work, until a newer report is
-filed. Three quiet hours with neither risk stays silent. "Accrued" is
-gap-filtered real activity - a pause of half an hour or more never counts
-toward it. It only ever happens inside a project, and never in a checkout
-that resolves to no project at all - there, no report could ever be filed
-to silence it, so it is never asked in the first place.
+Once in a while it asks for something bigger instead of one more note: the full
+end-of-session review, which the install wrote as `/thor-eval`. The message
+names the routine and says where it is; open it and do what it says.
 
-The first of those only ever names a note THIS session actually saw fire -
-never one that only ever showed up during other, unrelated work. Answer for
-one and this session will not ask about that same note again, however many
+**When it asks.** Per project, never per folder. It asks at the end of a turn
+when all of this holds:
+
+- the project has had an hour of work since its last evaluation that counts.
+  The hour is the project's own clock, every session added together, and two
+  sessions working at the same moment count once;
+- this session has put in at least 10 minutes of its own work in that project
+  since then - a session that only looked in for a moment is never held;
+- it is not this session's first turn-end in that project - the first one is
+  never held.
+
+It follows the work, not the folder: a session that worked in project A and then
+moved to another folder is still asked about A, and the message says so. If
+another session is already running that project's evaluation (started less than
+an hour ago, still busy), you get one line saying so and are not held. A project
+worked in during the last 7 days with no evaluation that counts in 7 days is
+asked about whatever the clock says - the weekly floor, so that an edited clock
+file can delay the question but never cancel it. A folder that belongs to no
+project is never asked about on its own, since there would be nowhere to file the
+report.
+
+THIS ONE DOES NOT GO QUIET AFTER ONE ASK: it holds the end of every turn,
+naming how many times it has already asked and since when, until a report that
+counts is on file. A report covers the next 16 hours (a rolling window, not a
+calendar day). Three more hours of work after it, AND a risk - three or more
+code changes with no test or build run since, or a summary of the context - and
+it asks again, covering only what happened since. Three quiet hours with
+neither risk stay silent. "Work" is real activity: a pause of half an hour or
+more never counts.
+
+**How an evaluation goes.** Do these in order, and do not skip one.
+
+1. **It starts in THOR's own record, not in a file.** Opening `/thor-eval` or
+   being asked at the end of a turn writes a start note into the memory's log,
+   and from that moment the lists below are frozen: nothing that fires or is
+   written later is added, and nothing that only fired in another session is on
+   them. THOR then decides the old rules of the project itself - for up to 20
+   seconds - and shows you a note with three parts. If the note says THOR is
+   still deciding, end the turn once and read it again.
+   - **Verdicts.** The notes that fired in this session 40 times or more
+     without a verdict. Give each one with the THOR tool (`mark`), or skip it
+     honestly by tagging the report `not-judgeable:<id>:<reason>` (a real
+     reason of at least 12 characters). A verdict given any other way - a
+     command line, a script, another session - settles nothing and is listed
+     for the owner.
+   - **The batch and the A4 list.** Rules THOR could not decide alone: at most
+     8 that need a fix only you can make, and at most 16 that only have to
+     name their check's literal in their text. Each line gives the reason and
+     the exact call to make. Make that call; THOR tries the rule again and says
+     what it is now, or what is still missing. A tag, a reason or a note about
+     it settles nothing.
+   - **Open points.** THOR writes and closes these itself, for things only the
+     owner can do, such as a project whose working copy is not registered.
+     There is nothing for you to do. Never file one, and never tag a note as
+     one: `remember` and `revise` refuse it.
+2. **Give your verdicts, then end the turn once.** THOR checks, when a turn ends,
+   that each verdict really was a THOR tool call. The report is refused while
+   the verdicts of the turn you are in are not checked yet, and the refusal
+   says so: end the turn once, then file again.
+3. **File the report with the THOR tool, and only with it.** Use `remember`:
+   kind `report`, the project, tags `["evaluation-report"]`, the id
+   `eval-<project>-<date>`, and a text that is only your summary in plain words
+   and your remarks. THOR writes the facts itself, from its log, in front of
+   your text - what was judged, what it decided, what it refused, which
+   writes bypassed the tools - and nobody, you included, can edit that part. If
+   the THOR tools are not loaded in your session yet, load them first; the
+   refusal says how. A report filed any other way - a script, a second
+   program, the command line, an older version of THOR - is refused, and if one
+   slips through it does not count.
+4. **THOR checks the filing when the turn ends.** It reads Claude Code's own
+   record of the session and the memory's log, and writes its answer to the
+   log. Only a report that passes counts: only it lets a held turn end and keeps
+   the question quiet for the next 16 hours. If the next message says your
+   report is on file but does not count, it names why - follow that, and do not
+   file the same thing again unchanged.
+
+**What stays with the owner.** If an open point is still there after an
+evaluation that counts was filed, THOR moves it to the owner's queue and says
+so in the point itself ("the owner decides"). You cannot settle those, and you should not
+try. When a project has more than 8 of them, every new session there starts with
+a line telling the owner how many wait. Doctor lists all of them, and lists
+every rule saved with `legitimate_calls`, `may_change` or `accept_refusing`, so
+use those three only when you can say why.
+
+**When THOR cannot read Claude Code's record of the session.** An update of
+Claude Code can change the format it writes that record in. THOR then cannot
+check any filing, so it asks for no evaluation, and says so on every turn until
+THOR itself is updated. Nothing you do fixes it: tell the owner.
+
+The question about one note only ever names a note THIS session actually saw
+fire - never one that only ever showed up during other, unrelated work. Answer
+for one and this session will not ask about that same note again, however many
 more times it fires before the session ends.
 
 ## If you are talking to a remote copy

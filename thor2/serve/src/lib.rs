@@ -97,6 +97,7 @@ pub mod decay;
 pub mod deliver;
 #[cfg(feature = "semantic")]
 pub mod embed;
+pub mod eval_filing;
 pub mod eval_session;
 pub mod guard_verdict;
 pub mod input;
@@ -267,7 +268,7 @@ mod tests {
         }
         let now = time::now_iso8601();
         for _ in 0..decay::NOISE_MARKS_BEFORE_STALE {
-            mark::record_noise(&mut db, "s", "l", "a", &now, "d1").unwrap();
+            mark::record_noise(&mut db, "s", "l", "a", &now, "d1", None).unwrap();
         }
 
         let mut input = input::ServeInput::default();

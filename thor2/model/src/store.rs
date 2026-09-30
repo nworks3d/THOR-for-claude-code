@@ -213,6 +213,9 @@ pub fn project_root_id(key: &str) -> String {
 ///   only `installer`. Retracting the project record would otherwise
 ///   tombstone it, and no registration could ever land again (D2).
 /// - `evaluation-start-*`: only `eval-machine`.
+/// - `open-no-working-copy-*` and `open-working-tree-differs-*` (THOR's own
+///   open points, `machine_point_id`): only `eval-machine` - it writes one
+///   when a blocker holds a rule and closes it when the blocker lifts.
 /// - `teeth-a4-cutoff` (`A4_CUTOFF_ID`): only `retest` - THOR's record of the
 ///   one point before which a contains check counts as old stock (Q24).
 pub fn reserved_id_owner(entity_id: &str) -> Option<&'static str> {
@@ -221,7 +224,7 @@ pub fn reserved_id_owner(entity_id: &str) -> Option<&'static str> {
     if project_record {
         return Some(INSTALLER_ACTOR);
     }
-    if entity_id.starts_with("evaluation-start-") {
+    if entity_id.starts_with("evaluation-start-") || is_machine_point_id(entity_id) {
         return Some("eval-machine");
     }
     if entity_id == A4_CUTOFF_ID {
@@ -293,6 +296,12 @@ fn reserved_id_refusal(store: &EventStore, entity_id: &str, owner: &str) -> Refu
                  retest and never moved"
             ),
             fix: format!("give your own item an id other than '{A4_CUTOFF_ID}'"),
+        }
+    } else if is_machine_point_id(entity_id) {
+        Refusal {
+            problem: format!("this open point is THOR's own ('{entity_id}'); it closes itself when its subject settles"),
+            fix: "leave it alone - settle the rules it names, or do what its own text says, and the next evaluation start closes it. Give your own item an id that does not begin with 'open-no-working-copy-' or 'open-working-tree-differs-'"
+                .to_string(),
         }
     } else {
         Refusal {
@@ -531,6 +540,14 @@ fn find_near_duplicate(store: &EventStore, item: &Item) -> anyhow::Result<Option
                 continue;
             }
         }
+        // TWO EVALUATION REPORTS ARE NEVER "THE SAME FACT TOLD TWICE" (step
+        // 15, G15.2): each is the record of one evaluation, and two quiet
+        // ones - nothing on any list, the same one-line TLDR - read alike on
+        // purpose. Their text collision is skipped; the key rule above
+        // still holds.
+        if gate::is_evaluation_report(&existing) && gate::is_evaluation_report(item) {
+            continue;
+        }
         let existing_normalized = normalize_for_comparison(&existing.text);
         if existing_normalized == new_normalized {
             return Ok(Some((id, Collision::Text)));
@@ -713,16 +730,18 @@ pub fn declare_in<'a>(
     item: &Item,
     root: Option<&Path>,
 ) -> Result<Event, WriteError> {
-    declare_in_scoped(store, session_id, lineage_id, actor, item, root, None, None)
+    declare_in_scoped(store, session_id, lineage_id, actor, item, root, None, None, None)
 }
 
-/// `declare_in`, for a write that may FILE an evaluation report: `scope`
-/// says which session files it and where its evaluation started (see
-/// `EvaluationScope`). Every other write passes `None` and is untouched.
+/// `declare_in`, for a write that may FILE an evaluation report: `ctx` says
+/// which evaluation it files for and that the filing comes through a THOR
+/// tool call (see `FilingContext`). Every other write passes `None` and is
+/// untouched; an evaluation report with `None` is refused.
 ///
 /// `trial` is the record of THOR's own trial of this item, spliced into the
-/// event body as `"teeth_trial"` (`body_with_trial`). Every caller passes
-/// `None` until the trial is switched on for the writes.
+/// event body as `"teeth_trial"` (`body_with_trial`); `att` is the tool
+/// server's stamp of the call that makes the write, spliced after it as
+/// `"att"` (`body_with_att`, step 12). `None` for either writes no key.
 #[allow(clippy::too_many_arguments)]
 pub fn declare_in_scoped<'a>(
     store: &mut EventStore,
@@ -731,8 +750,9 @@ pub fn declare_in_scoped<'a>(
     actor: impl Into<WriteActor<'a>>,
     item: &Item,
     root: Option<&Path>,
-    scope: Option<&EvaluationScope>,
+    ctx: Option<&FilingContext>,
     trial: Option<&TrialRecord>,
+    att: Option<&Att>,
 ) -> Result<Event, WriteError> {
     let actor = actor.into();
     fence(store, actor, &item.id)?;
@@ -779,7 +799,7 @@ pub fn declare_in_scoped<'a>(
             }));
         }
     }
-    declare_gated(store, session_id, lineage_id, actor, item, scope, trial, None)
+    declare_gated(store, session_id, lineage_id, actor, item, ctx, trial, att, None)
 }
 
 pub fn declare<'a>(
@@ -789,19 +809,21 @@ pub fn declare<'a>(
     actor: impl Into<WriteActor<'a>>,
     item: &Item,
 ) -> Result<Event, WriteError> {
-    declare_scoped(store, session_id, lineage_id, actor, item, None)
+    declare_scoped(store, session_id, lineage_id, actor, item, None, None)
 }
 
-/// `declare`, with the evaluation scope `declare_in_scoped` describes.
+/// `declare`, with the filing context and the call's stamp
+/// `declare_in_scoped` describes.
 pub fn declare_scoped<'a>(
     store: &mut EventStore,
     session_id: &str,
     lineage_id: &str,
     actor: impl Into<WriteActor<'a>>,
     item: &Item,
-    scope: Option<&EvaluationScope>,
+    ctx: Option<&FilingContext>,
+    att: Option<&Att>,
 ) -> Result<Event, WriteError> {
-    declare_gated(store, session_id, lineage_id, actor.into(), item, scope, None, None)
+    declare_gated(store, session_id, lineage_id, actor.into(), item, ctx, None, att, None)
 }
 
 /// Everything `declare_scoped` does, plus the trial record `declare_in_scoped`
@@ -815,8 +837,9 @@ fn declare_gated(
     lineage_id: &str,
     actor: WriteActor<'_>,
     item: &Item,
-    scope: Option<&EvaluationScope>,
+    ctx: Option<&FilingContext>,
     trial: Option<&TrialRecord>,
+    att: Option<&Att>,
     root: Option<(&str, &str)>,
 ) -> Result<Event, WriteError> {
     let actor = fence(store, actor, &item.id)?;
@@ -856,12 +879,6 @@ fn declare_gated(
     if let Some(refusal) = find_opposing_check(store, &item).map_err(WriteError::Store)? {
         return Err(WriteError::Refused(refusal));
     }
-    // GROUND 30, CONTINUED (2026-09-27): a fresh open point naming a rule an
-    // earlier one (any id, live or retracted) already carried must start at
-    // that count - see `check_open_point_carry_inherited`'s own doc comment.
-    if let Some(refusal) = check_open_point_carry_inherited(store, &item) {
-        return Err(WriteError::Refused(refusal));
-    }
     // CONTRACT R1's own refusal class, unpaid until 2026-08-08: an item that
     // cannot reach a block is cover that looks real and never fires. Only the
     // provable half refuses here; the rest comes back as a note on the write
@@ -876,14 +893,15 @@ fn declare_gated(
     }
     // THE EVALUATION-FILING GATE (2026-09-25) - see this file's own
     // "evaluation obligation" section, right above `OWNER_SETUP_ANSWERS_ID`.
-    // A no-op for every write that is not itself an evaluation report.
-    if let Some(refusal) = check_evaluation_report_filing(store, &item, scope) {
-        return Err(WriteError::Refused(refusal));
-    }
+    // A no-op for every write that is not itself an evaluation report. One
+    // that passes is stored with THOR's machine section above the writer's
+    // own text (step 15).
+    let item = filed_evaluation_report(store, &item, None, ctx).map_err(WriteError::Refused)?.unwrap_or(item);
     let mut body = canonical_body(&item).map_err(WriteError::Serialize)?;
     if let Some(trial) = trial {
         body = body_with_trial(&body, trial).map_err(WriteError::Serialize)?;
     }
+    body = with_att(body, att).map_err(WriteError::Serialize)?;
     if let Some((root, at)) = root {
         body = body_with_root(&body, root, at).map_err(WriteError::Serialize)?;
     }
@@ -933,7 +951,10 @@ pub fn revise<'a>(
     // held hostage to conditions that were only ever about the FILING
     // moment) - exactly the same "moment, not the item's whole life"
     // distinction `declare` itself draws.
-    if newly_filed_as_evaluation(&existing, &updated) {
+    // This entry point carries no filing context (`FilingContext`), so a
+    // revise that files through it is always refused (step 15): only the
+    // THOR tool's own revise can file.
+    if gate::newly_filed_as_evaluation(&existing, &updated) {
         if let Some(refusal) = check_evaluation_report_filing(store, &updated, None) {
             return Err(WriteError::Refused(refusal));
         }
@@ -942,21 +963,6 @@ pub fn revise<'a>(
     store
         .append_mutate_checked(session_id, lineage_id, actor, EventKind::FactRevised, &updated.id, None, &body)
         .map_err(WriteError::Store)
-}
-
-/// Whether this revise FILES an evaluation report for a project it was not
-/// filed for before: the tag is newly added, OR a report that already
-/// carried it is moved to a different project.
-///
-/// THE HOLE THE SECOND HALF CLOSES (2026-09-26). The filing gate ran only
-/// when the tag was newly added, so an evaluation report already filed for
-/// ANOTHER project, revised onto this one, counted as this project's report
-/// without a single condition ever being checked here - measured on a copy
-/// of a real store: an old report of one project re-scoped to another went
-/// straight through. A move is a filing for the project it lands in.
-fn newly_filed_as_evaluation(existing: &Item, updated: &Item) -> bool {
-    let tagged = |item: &Item| item.tags.iter().any(|t| t == EVALUATION_REPORT_TAG);
-    updated.kind == Kind::Report && tagged(updated) && (!tagged(existing) || existing.project != updated.project)
 }
 
 /// The `revise` entry point for a caller that can explain a WEAKENING
@@ -991,7 +997,7 @@ pub fn revise_because<'a>(
     revise_because_scoped(store, session_id, lineage_id, actor, existing, updated, before, because, None)
 }
 
-/// `revise_because`, with the evaluation scope `declare_in_scoped`
+/// `revise_because`, with the filing context `declare_in_scoped`
 /// describes - for a revise that files an evaluation report.
 #[allow(clippy::too_many_arguments)]
 pub fn revise_because_scoped<'a>(
@@ -1003,15 +1009,17 @@ pub fn revise_because_scoped<'a>(
     updated: &Item,
     before: &Item,
     because: Option<&str>,
-    scope: Option<&EvaluationScope>,
+    ctx: Option<&FilingContext>,
 ) -> Result<Event, WriteError> {
-    revise_tried_scoped(store, session_id, lineage_id, actor, existing, updated, before, because, scope, None, None)
+    revise_tried_scoped(store, session_id, lineage_id, actor, existing, updated, before, because, ctx, None, None, None)
 }
 
 /// `revise_because_scoped`, for a revise that carries THOR's trial record.
 ///
 /// `trial` is the record of THOR's own trial of `updated`, spliced into the
 /// event body as `"teeth_trial"`, right after `because` (`body_with_trial`).
+/// `att` is the tool server's stamp of the call (step 12), spliced after the
+/// record as `"att"`; `None` writes no key.
 /// `parent_rev` is the head the caller read the item from: the write lands
 /// only while that is still the head, so an item that changed between the
 /// read and this write is refused (the log's own compare-and-swap,
@@ -1036,9 +1044,10 @@ pub fn revise_tried_scoped<'a>(
     updated: &Item,
     before: &Item,
     because: Option<&str>,
-    scope: Option<&EvaluationScope>,
+    ctx: Option<&FilingContext>,
     trial: Option<&TrialRecord>,
     parent_rev: Option<&str>,
+    att: Option<&Att>,
 ) -> Result<Event, WriteError> {
     let actor = fence(store, actor.into(), &updated.id)?;
     let existing = normalized(existing);
@@ -1061,11 +1070,16 @@ pub fn revise_tried_scoped<'a>(
     // against `before`, the item exactly as stored: `existing` may be a
     // cleared baseline (see this function's own doc comment) whose project
     // was blanked on purpose.
-    if newly_filed_as_evaluation(&before, &updated) {
-        if let Some(refusal) = check_evaluation_report_filing(store, &updated, scope) {
-            return Err(WriteError::Refused(refusal));
-        }
-    }
+    // A revise that files is stored like a new filing: THOR's machine
+    // section for THIS evaluation, then the writer's own text - the part
+    // below the machine block the report carried before, when it had one.
+    let updated = if gate::newly_filed_as_evaluation(&before, &updated) {
+        filed_evaluation_report(store, &updated, gate::machine_block(&before.text), ctx)
+            .map_err(WriteError::Refused)?
+            .unwrap_or(updated)
+    } else {
+        updated
+    };
     let reason = because.map(str::trim).filter(|r| !r.is_empty());
     let written = without_stale_teeth_tags(&before, &updated, trial);
     let mut body = match reason {
@@ -1075,6 +1089,7 @@ pub fn revise_tried_scoped<'a>(
     if let Some(trial) = trial {
         body = body_with_trial(&body, trial).map_err(WriteError::Serialize)?;
     }
+    body = with_att(body, att).map_err(WriteError::Serialize)?;
     store
         .append_mutate_checked(session_id, lineage_id, actor, EventKind::FactRevised, &updated.id, parent_rev, &body)
         .map_err(WriteError::Store)
@@ -1704,6 +1719,12 @@ pub const A4_CUTOFF_ID: &str = "teeth-a4-cutoff";
 /// records the cutoff and writes the old-stock mark.
 const RETEST_ACTOR: &str = "retest";
 
+/// The actor the evaluation's machine pass writes a rule's or a note's
+/// verdict as (`serve::eval_session::machine_pass`, step 14). An old-stock
+/// verdict (Q24) is the one exception: only `retest` writes that mark, so
+/// the pass writes it as THOR's retest, which is what it runs.
+pub const TEETH_EVAL_ACTOR: &str = "teeth-eval";
+
 /// The A4 cutoff recorded on this store: the log seq at or before which a
 /// contains check counts as old stock. `None` until THOR's retest records it.
 ///
@@ -1858,6 +1879,26 @@ pub enum Blocker {
     WorkingTreeDiffers { path: String },
 }
 
+impl Blocker {
+    /// The blocker's code, as THOR's open point carries it in its
+    /// `blocker:` tag.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Blocker::NoWorkingCopy { .. } => "no-working-copy",
+            Blocker::WorkingTreeDiffers { .. } => "working-tree-differs",
+        }
+    }
+
+    /// What the blocker is about - the subject of THOR's open point: the
+    /// project for `NoWorkingCopy`, the file for `WorkingTreeDiffers`.
+    pub fn subject(&self) -> &str {
+        match self {
+            Blocker::NoWorkingCopy { project } => project,
+            Blocker::WorkingTreeDiffers { path } => path,
+        }
+    }
+}
+
 impl std::fmt::Display for Blocker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1899,9 +1940,95 @@ impl Settlement {
     }
 }
 
-/// Whether rule `id` is settled right now - the one reader (see this
-/// section's banner).
-pub fn settlement(store: &EventStore, id: &str) -> Settlement {
+/// Whether rule `id` is settled - the one reader (see this section's banner).
+///
+/// `start: None` judges it right now: a blocker is read at READ time
+/// (`checkout::read_time_blocker`). That is what doctor and the Stop hook's
+/// backlog burn ask, outside any evaluation.
+///
+/// `start: Some(evaluation)` judges it for that evaluation (step 14, v2): what
+/// holds a rule is what THOR's machine pass found AT THE START, written in the
+/// start record (`Frozen::machine`), never the state of a folder at filing
+/// time:
+/// - a rule the pass found BLOCKED is settled by that blocker for this
+///   evaluation - the machine's open point holds it, not the agent;
+/// - a rule the pass handed to the agent (the frozen batch or the A4 list)
+///   is settled only by a verdict written AFTER the start, by being retracted
+///   or taken off the rule track, or - for a contains check whose literal was
+///   gone - by the literal being back in the registered working copy. A
+///   blocker that appears later settles nothing here: it did not hold at the
+///   start, so the rule was this evaluation's to decide;
+/// - any other rule is read by its current verdict alone, with no blocker.
+pub fn settlement(store: &EventStore, id: &str, start: Option<&EvaluationStart>) -> Settlement {
+    match start {
+        None => settlement_now(store, id),
+        Some(start) => settlement_at(store, id, start),
+    }
+}
+
+/// `settlement` for one evaluation (see its doc comment).
+fn settlement_at(store: &EventStore, id: &str, start: &EvaluationStart) -> Settlement {
+    let read = verdict_and_record(store, id);
+    if read.retracted {
+        return Settlement::Settled(Settled::Retracted);
+    }
+    let Some(item) = read.head else {
+        let why = match read.verdict {
+            CurrentVerdict::Undecided { why } => why,
+            _ => format!("'{id}' does not read as an item"),
+        };
+        return Settlement::Owed { why };
+    };
+    if !item.kind.can_fire() {
+        return Settlement::Settled(Settled::OffTheRuleTrack);
+    }
+    let found = start.frozen.machine.as_ref().and_then(|m| m.items.iter().find(|i| i.id == id));
+    let handed_to_agent = found.is_some_and(|i| matches!(i.outcome, MachineOutcome::NeedsAgent | MachineOutcome::A4Only));
+    let by_verdict = |verdict: CurrentVerdict, record: Option<TrialRecord>| match verdict {
+        CurrentVerdict::RuleProven => Some(Settled::Rule { proven: true }),
+        CurrentVerdict::RuleWired => Some(Settled::Rule { proven: false }),
+        CurrentVerdict::Note => {
+            let fields = record.as_ref().map(TrialRecord::fields);
+            Some(Settled::Note {
+                pending: fields.and_then(|f| f.pending.as_ref().map(|p| p.why)),
+                by_dispute: fields
+                    .is_some_and(|f| !f.disputes.legitimate_calls.is_empty() || !f.disputes.may_change.is_empty()),
+            })
+        }
+        CurrentVerdict::Undecided { .. } => None,
+    };
+    let undecided_why = match &read.verdict {
+        CurrentVerdict::Undecided { why } => Some(why.clone()),
+        _ => None,
+    };
+    match by_verdict(read.verdict, read.record) {
+        Some(settled) if !handed_to_agent => Settlement::Settled(settled),
+        Some(settled) => {
+            // Handed to the agent at the start while it carried a verdict: a
+            // rule-track contains check THOR tried again and found false. A
+            // verdict written since the start settles it; so does the literal
+            // being back where the check reads it.
+            let holds_again = matches!(&item.check, Some(Check::Contains { .. }))
+                && crate::checkout::registered_checkout(store, item.project.as_deref())
+                    .is_ok_and(|root| item.check.as_ref().is_some_and(|c| crate::check::run(c, &root) == crate::check::Outcome::Holds));
+            if verdict_written_after(store, id, start.seq) || holds_again {
+                Settlement::Settled(settled)
+            } else {
+                Settlement::Owed { why: found.map(|i| i.detail.clone()).unwrap_or_default() }
+            }
+        }
+        None => match found {
+            Some(MachineItem { outcome: MachineOutcome::Blocked, blocker: Some(blocker), .. }) => {
+                Settlement::Settled(Settled::Blocked(blocker.to_blocker()))
+            }
+            Some(found) if handed_to_agent => Settlement::Owed { why: found.detail.clone() },
+            _ => Settlement::Owed { why: undecided_why.unwrap_or_default() },
+        },
+    }
+}
+
+/// `settlement` right now, with a blocker read at read time.
+fn settlement_now(store: &EventStore, id: &str) -> Settlement {
     let read = verdict_and_record(store, id);
     if read.retracted {
         return Settlement::Settled(Settled::Retracted);
@@ -2693,7 +2820,7 @@ pub const OWNER_SETUP_ANSWERS_ID: &str = "owner-setup-answers";
 //
 // WHAT THIS SECTION CLOSES (2026-09-25). Filing an evaluation report used to
 // discharge the Stop hook's evaluation debt (`serve::usefulness::
-// eval_debt_owed`/`newest_evaluation_report`) by merely EXISTING: a live
+// eval_debt_owed`, then `newest_evaluation_report`) by merely EXISTING: a live
 // `Report` scoped to the project and carrying `EVALUATION_REPORT_TAG`.
 // Nobody read it, and nothing checked the log for the work the evaluation
 // routine actually demands, so a session could discharge the
@@ -2703,15 +2830,15 @@ pub const OWNER_SETUP_ANSWERS_ID: &str = "owner-setup-answers";
 // and the report's prose stays completely unchecked; it no longer discharges
 // anything by existing.
 //
-// Three conditions, all of them per-project: the project's judgement debt is
-// zero, every Rule or Orientation in this filing's batch - at most
-// `EVALUATION_TEETH_BATCH` of the owed ones that apply to this project,
-// whatever their weight, the ones that fired since the PREVIOUS report first
-// and the ones written longest ago first (`teeth_batch_since`) - is settled
-// (`settlement`), and every open point (see below) older than the previous
-// report is either closed (retracted) or has been carried forward exactly
-// once. The rules beyond the batch stay owed and are named by `doctor`; the
-// next filing asks for them first.
+// Two conditions, both per-project: the evaluation's frozen judgement list
+// is settled, and every rule THOR's machine pass handed to the agent at the
+// start - the frozen batch (at most `EVALUATION_TEETH_BATCH`) and the frozen
+// A4 list (at most `EVALUATION_A4_LIST`) - is settled (`settlement`, read for
+// that evaluation). The rules beyond those lists, and the ones the pass did
+// not reach, are not this filing's: doctor names them, and the next
+// evaluation starts with them. OPEN POINTS HOLD NO FILING (step 14): THOR
+// writes and closes its own, and a legacy one an agent filed settles nothing
+// and holds nothing - doctor lists it for the owner.
 //
 // WHAT "PER-PROJECT" MEANS FOR THE FIRST TWO. An item applies to a project
 // when it names that project or names none at all (global) - the same
@@ -2849,6 +2976,175 @@ pub fn attested_field_refusals(events: &[Event]) -> HashSet<i64> {
     recorded_refusal_verdicts(events).into_iter().filter(|(_, (field, _))| *field).map(|(seq, _)| seq).collect()
 }
 
+// ------------------------------------------ session identity for every write (step 12)
+//
+// Which Claude Code session - and which tool call in it - made a write. The
+// tool server stamps every write it makes with `Att`, spliced into the event
+// body as the trailing key `"att"` (after `because` and `teeth_trial`, by the
+// same byte splice). It is a CLAIM, made while the call runs: the server can
+// only refuse on positive evidence of a side door, never wait for a line to
+// reach the disk (K21). Whether the claim holds is decided once, at a Stop of
+// the session, against its whole transcript (`serve::attest::verify_write`),
+// and recorded here as one `gate_stood_aside` by actor `attester` per write
+// (entity = the item, body `{event_seq, attested, session, agent_id, why}`).
+// Every reader of attestation reads that record, never a live transcript.
+
+/// `inflight` value: the call's tool_use line was already in the session's
+/// transcript while the call ran, under the same tool and arguments.
+pub const INFLIGHT_SEEN: &str = "seen";
+
+/// `inflight` value: the tool_use line was not on disk yet (or no transcript
+/// of the session was) - never a refusal; the Stop decides.
+pub const INFLIGHT_UNSEEN: &str = "unseen";
+
+/// `inflight` value: positive evidence of a side door (`Att::side_door` says
+/// which). Recorded, refuses nothing by itself.
+pub const INFLIGHT_SIDE_DOOR: &str = "side-door";
+
+/// The stamp a write through the tool server carries (see the section above).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Att {
+    /// `claudecode/toolUseId` from the call's `_meta`, when it carried one.
+    pub tool_use_id: Option<String>,
+    /// `args_digest` of the call's arguments exactly as they arrived.
+    pub args_sha256: String,
+    /// `CLAUDE_CODE_SESSION_ID` of the server, fixed when it started: a hint.
+    pub session_hint: Option<String>,
+    /// `INFLIGHT_SEEN`, `INFLIGHT_UNSEEN` or `INFLIGHT_SIDE_DOOR`. The tool
+    /// server always sets it (a replica's queued write replayed at the drain
+    /// carries no `_meta`, so it reads `INFLIGHT_SIDE_DOOR`); `None` only in a
+    /// body some other program wrote.
+    pub inflight: Option<String>,
+    /// Why the call is a side door, with `INFLIGHT_SIDE_DOOR`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side_door: Option<String>,
+}
+
+/// The digest of a tool call's arguments: `hash_event("", <canonical JSON>)`,
+/// where the canonical JSON is `serde_json`'s own serialisation of the value
+/// (keys sorted: this workspace does not enable `preserve_order`). Measured
+/// equal for the arguments the tool server receives and the input the
+/// transcript's tool_use line holds (step 1 of the build, answer 2).
+pub fn args_digest(args: &serde_json::Value) -> String {
+    thor_core::event_store::hash_event("", &serde_json::to_string(args).unwrap_or_default())
+}
+
+/// `body` with one more trailing key, `"att":{...}`, spliced on exactly the
+/// way `body_with_because` splices `because`. `att_of` is its one reader.
+fn body_with_att(body: &str, att: &Att) -> Result<String, serde_json::Error> {
+    let att = serde_json::to_string(att)?;
+    debug_assert!(body.ends_with('}'), "every event body written here is a JSON object");
+    Ok(format!("{},\"att\":{att}}}", &body[..body.len() - 1]))
+}
+
+/// `body`, stamped with `att` when there is one - the one splice every writer
+/// of a stamped event uses (`serve::mark` included).
+pub fn with_att(body: String, att: Option<&Att>) -> Result<String, serde_json::Error> {
+    match att {
+        Some(att) => body_with_att(&body, att),
+        None => Ok(body),
+    }
+}
+
+/// The stamp an event body carries, if any.
+pub fn att_of(body: &str) -> Option<Att> {
+    let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    serde_json::from_value(value.get("att")?.clone()).ok()
+}
+
+/// The event kinds a write tool of the tool server appends: the writes a
+/// session's Stop verifies.
+pub const ATTESTED_WRITE_KINDS: &[EventKind] = &[
+    EventKind::FactCreated,
+    EventKind::FactRevised,
+    EventKind::FactRetracted,
+    EventKind::FactResolved,
+    EventKind::ItemMarkedUseful,
+    EventKind::ItemMarkedNoise,
+];
+
+/// One recorded verification of a write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteVerdict {
+    pub attested: bool,
+    pub session: String,
+    pub agent_id: Option<String>,
+    pub why: String,
+}
+
+/// Record the verification of the write at log seq `event_seq` (on item
+/// `entity_id`), once. Only THOR's attester writes this (`actor` must be
+/// `ATTESTER_ACTOR`); a second verification of the same write appends nothing
+/// and returns `Ok(None)` - the first recorded verdict is the one every
+/// reader uses.
+#[allow(clippy::too_many_arguments)]
+pub fn record_write_verification(
+    store: &mut EventStore,
+    session_id: &str,
+    actor: SystemActor,
+    entity_id: &str,
+    event_seq: i64,
+    attested: bool,
+    agent_id: Option<&str>,
+    why: &str,
+) -> Result<Option<Event>, WriteError> {
+    if actor.name() != ATTESTER_ACTOR {
+        return Err(WriteError::Refused(Refusal {
+            problem: format!("a write's verification is recorded by THOR's attester only, not by '{}'", actor.name()),
+            fix: "let the Stop hook record it (serve::attest::record_write_verifications)".to_string(),
+        }));
+    }
+    let events = store.get_events_by_entity(entity_id).map_err(|e| WriteError::Store(e.into()))?;
+    if recorded_write_verdicts(&events).contains_key(&event_seq) {
+        return Ok(None);
+    }
+    let name = fence(store, actor.into(), entity_id)?;
+    let body = serde_json::json!({
+        "event_seq": event_seq,
+        "attested": attested,
+        "session": session_id,
+        "agent_id": agent_id,
+        "why": why,
+    })
+    .to_string();
+    store
+        .append_event(session_id, session_id, name, EventKind::GateStoodAside, entity_id, None, &body)
+        .map(Some)
+        .map_err(|e| WriteError::Store(e.into()))
+}
+
+/// Every recorded write verification in `events`: write seq -> verdict. The
+/// first one recorded for a write counts; only events by `ATTESTER_ACTOR`
+/// are read.
+pub fn recorded_write_verdicts(events: &[Event]) -> HashMap<i64, WriteVerdict> {
+    let mut out: HashMap<i64, WriteVerdict> = HashMap::new();
+    for e in events.iter().filter(|e| e.kind == EventKind::GateStoodAside && e.actor == ATTESTER_ACTOR) {
+        let Ok(body) = serde_json::from_str::<serde_json::Value>(&e.body) else { continue };
+        let (Some(seq), Some(attested)) =
+            (body.get("event_seq").and_then(|v| v.as_i64()), body.get("attested").and_then(|v| v.as_bool()))
+        else {
+            continue;
+        };
+        let text = |key: &str| body.get(key).and_then(|v| v.as_str()).map(str::to_string);
+        out.entry(seq).or_insert(WriteVerdict {
+            attested,
+            session: text("session").unwrap_or_default(),
+            agent_id: text("agent_id"),
+            why: text("why").unwrap_or_default(),
+        });
+    }
+    out
+}
+
+/// The seqs of every write whose recorded verification says it was made
+/// through an attested THOR call - the one set every judgement-debt reader
+/// resets on (D9). Fails open to an empty set on an unreadable log: then no
+/// verdict clears anything, which asks more, never less.
+pub fn attested_write_seqs(store: &EventStore) -> HashSet<i64> {
+    let Ok(events) = store.events_of_kinds(&[EventKind::GateStoodAside], 0) else { return HashSet::new() };
+    recorded_write_verdicts(&events).into_iter().filter(|(_, v)| v.attested).map(|(seq, _)| seq).collect()
+}
+
 /// An in-memory store holding exactly `item`, written as a raw `fact_created`
 /// with no gate at all: THOR's trial runs the hook's own pipeline against a
 /// store like this one, so it tries the item exactly as it would be written,
@@ -2867,14 +3163,183 @@ pub fn one_item_store(item: &Item) -> anyhow::Result<EventStore> {
 /// field evidence - doctor counts it apart.
 pub const TEETH_PROBE_ACTOR: &str = "teeth-probe";
 
-/// An open point: a small, project-scoped `Report` tagged with this, holding
-/// one sentence naming something an evaluation could not finish - see this
-/// section's own doc comment. Never served at a gate (it is a `Report`,
-/// archive-kind, exactly like an evaluation report itself), found by
-/// `lookup` and handed to a session directly by `serve::bin::serve`'s own
-/// SessionStart and evaluation-debt messages instead - see that file's
-/// `open_points_line`/`open_points_block`.
+/// An open point: a small, project-scoped `Report` tagged with this, naming
+/// something that holds rules undecided. Never served at a gate (it is a
+/// `Report`, archive-kind, exactly like an evaluation report itself), found by
+/// `lookup` and handed to a session directly by the hook's SessionStart note
+/// and the evaluation's start note.
+///
+/// SINCE STEP 14 THOR WRITES AND CLOSES THEM ITSELF (`write_machine_point`,
+/// `retract_machine_point`): one per subject a machine blocker holds
+/// (`Blocker`), on a reserved id (`machine_point_id`), by `eval-machine`. A
+/// reader accepts a point as THOR's own only when `eval-machine` wrote it
+/// (`OpenPoint::machine`). Every other open point is LEGACY - filed by an
+/// agent before this build: it settles nothing and holds no filing, and
+/// doctor lists it for the owner.
 pub const OPEN_POINT_TAG: &str = "open-point";
+
+/// Prefix of the tag naming what a machine open point is about: the project
+/// for `Blocker::NoWorkingCopy`, the file for `Blocker::WorkingTreeDiffers`.
+pub const OPEN_POINT_ABOUT_PREFIX: &str = "about:";
+
+/// Prefix of the tag naming the blocker a machine open point holds rules by
+/// (`Blocker::code`).
+pub const OPEN_POINT_BLOCKER_PREFIX: &str = "blocker:";
+
+/// Whether `tag` is one only THOR writes on an open point: the open-point tag
+/// itself, or an `about:`/`blocker:` tag.
+pub fn is_open_point_tag(tag: &str) -> bool {
+    tag == OPEN_POINT_TAG || tag.starts_with(OPEN_POINT_ABOUT_PREFIX) || tag.starts_with(OPEN_POINT_BLOCKER_PREFIX)
+}
+
+/// What a write tool answers a caller who tries to file or tag an open point.
+pub const OPEN_POINT_REFUSAL: &str =
+    "REFUSED: open points are written and closed by THOR itself; settle the rule instead - the start note says how";
+
+/// What a write tool answers a caller who tries to retract THOR's own point.
+pub const MACHINE_POINT_REFUSAL: &str = "REFUSED: this open point is THOR's own; it closes itself when its subject settles";
+
+const MACHINE_POINT_PREFIXES: &[&str] = &["open-no-working-copy-", "open-working-tree-differs-"];
+
+/// Whether `id` is shaped like one of THOR's own open points - an id only
+/// `eval-machine` may write (`reserved_id_owner`).
+pub fn is_machine_point_id(id: &str) -> bool {
+    MACHINE_POINT_PREFIXES.iter().any(|prefix| id.starts_with(prefix))
+}
+
+/// Lower-case ASCII letters, digits and single hyphens - a plain, greppable
+/// piece of an id. Empty input gives `fallback`.
+fn slug(text: &str, fallback: &str) -> String {
+    let mut slug = String::new();
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c.to_ascii_lowercase());
+        } else if !slug.ends_with('-') && !slug.is_empty() {
+            slug.push('-');
+        }
+    }
+    let slug = slug.trim_end_matches('-');
+    if slug.is_empty() { fallback.to_string() } else { slug.to_string() }
+}
+
+/// The id of THOR's open point for `blocker` in `project`: one per subject.
+/// `open-no-working-copy-<project>` for a project with no usable registered
+/// working copy; `open-working-tree-differs-<project>-<file>` for a file whose
+/// registered working tree lacks a literal the default branch still has.
+pub fn machine_point_id(project: &str, blocker: &Blocker) -> String {
+    match blocker {
+        Blocker::NoWorkingCopy { project } => format!("open-no-working-copy-{}", slug(project, "project")),
+        Blocker::WorkingTreeDiffers { path } => {
+            format!("open-working-tree-differs-{}-{}", slug(project, "project"), slug(path, "file"))
+        }
+    }
+}
+
+/// The tags THOR's open point for `blocker` carries: the open-point tag, what
+/// it is about, and the blocker's code.
+pub fn machine_point_tags(blocker: &Blocker) -> Vec<String> {
+    vec![
+        OPEN_POINT_TAG.to_string(),
+        format!("{OPEN_POINT_ABOUT_PREFIX}{}", blocker.subject()),
+        format!("{OPEN_POINT_BLOCKER_PREFIX}{}", blocker.code()),
+    ]
+}
+
+/// Write THOR's open point for `blocker` in `project`, with `text`: created
+/// when its id holds nothing yet, revised when its text changed, re-opened
+/// when the machine closed it earlier and the blocker is back, and left alone
+/// (`Ok(None)`) when it already says exactly this. One event at most, straight
+/// onto the log - a machine point is THOR's own record, not a claim for the
+/// write gate to judge. Only `eval-machine` writes one (`fence`).
+///
+/// RE-OPENING A CLOSED POINT writes on the same id, as a revise whose parent
+/// is the tombstone. The store refuses that for every other writer (a
+/// retraction is a decision, not a pause); for THOR's own point, open and
+/// closed are the two states one record moves between, and its history then
+/// shows every time the blocker held and lifted.
+pub fn write_machine_point(
+    store: &mut EventStore,
+    actor: SystemActor,
+    session: &str,
+    project: &str,
+    blocker: &Blocker,
+    text: &str,
+) -> Result<Option<Event>, WriteError> {
+    if actor.name() != EVAL_MACHINE_ACTOR {
+        return Err(WriteError::Refused(Refusal {
+            problem: format!("an open point is written by THOR's eval-machine only, not by '{}'", actor.name()),
+            fix: "let the evaluation start write it (serve::eval_session::machine_pass)".to_string(),
+        }));
+    }
+    let id = machine_point_id(project, blocker);
+    let name = fence(store, actor.into(), &id)?;
+    let item = Item {
+        id: id.clone(),
+        kind: Kind::Report,
+        text: text.to_string(),
+        bindings: vec![],
+        severity: None,
+        project: Some(project.to_string()),
+        tags: machine_point_tags(blocker),
+        expires: None,
+        key: None,
+        falsifier: None,
+        check: None,
+    };
+    let body = canonical_body(&normalized(&item)).map_err(WriteError::Serialize)?;
+    let events = store.get_events_by_entity(&id).map_err(|e| WriteError::Store(e.into()))?;
+    if events.is_empty() {
+        return store.append_created_unique(session, session, name, &id, &body, |_, _, _| false).map(Some).map_err(WriteError::Store);
+    }
+    let heads = thor_core::cas::compute_head_sets(&events);
+    let head = heads
+        .get(&id)
+        .filter(|set| set.heads.len() == 1)
+        .and_then(|set| set.heads.iter().next())
+        .and_then(|hash| events.iter().find(|e| &e.this_hash == hash));
+    let Some(head) = head else {
+        return Err(WriteError::Store(anyhow::anyhow!("'{id}' has more than one head")));
+    };
+    if head.kind == EventKind::FactRetracted {
+        return store
+            .append_event(session, session, name, EventKind::FactRevised, &id, Some(&head.this_hash), &body)
+            .map(Some)
+            .map_err(WriteError::Store);
+    }
+    if head.body == body {
+        return Ok(None);
+    }
+    store
+        .append_mutate_checked(session, session, name, EventKind::FactRevised, &id, Some(&head.this_hash), &body)
+        .map(Some)
+        .map_err(WriteError::Store)
+}
+
+/// Close THOR's open point `id` with a derived `reason` - its subject settled.
+/// Only `eval-machine` (`fence`); `Ok(None)` when the point is not live.
+pub fn retract_machine_point(
+    store: &mut EventStore,
+    actor: SystemActor,
+    session: &str,
+    id: &str,
+    reason: &str,
+) -> Result<Option<Event>, WriteError> {
+    if actor.name() != EVAL_MACHINE_ACTOR || !is_machine_point_id(id) {
+        return Err(WriteError::Refused(Refusal {
+            problem: format!("'{id}' is not an open point THOR's eval-machine may close as '{}'", actor.name()),
+            fix: "let the evaluation start close it (serve::eval_session::machine_pass)".to_string(),
+        }));
+    }
+    let name = fence(store, actor.into(), id)?;
+    if show(store, id).is_err() {
+        return Ok(None);
+    }
+    let body = serde_json::json!({ "retracted": id, "reason": reason }).to_string();
+    store
+        .append_mutate_checked(session, session, name, EventKind::FactRetracted, id, None, &body)
+        .map(Some)
+        .map_err(WriteError::Store)
+}
 
 /// Prefix for the tag naming the evaluation report an open point was raised
 /// in, e.g. `from-report:eval-acme-2026-01-01`. Informational only - nothing
@@ -2882,11 +3347,10 @@ pub const OPEN_POINT_TAG: &str = "open-point";
 /// point back to the evaluation that found it.
 pub const OPEN_POINT_SOURCE_PREFIX: &str = "from-report:";
 
-/// Prefix for the tag recording how many times an open point has been
+/// Prefix for the tag recording how many times a LEGACY open point has been
 /// carried forward, e.g. `carried:1`. `open_point_carried_count` below reads
-/// it; `gate::revise`'s own GROUND 30 refuses ever writing a count above 1 -
-/// see that ground's doc comment for why a second carry needs the owner
-/// rather than another automated pass.
+/// it; `gate::revise`'s own GROUND 30 refuses ever writing a count above 1.
+/// THOR's own points carry no such tag: their carry is counted from the log.
 pub const OPEN_POINT_CARRIED_PREFIX: &str = "carried:";
 
 /// The carried-forward count a set of tags records, `0` when none of them
@@ -2898,115 +3362,6 @@ pub fn open_point_carried_count(tags: &[String]) -> u32 {
         .find_map(|t| t.strip_prefix(OPEN_POINT_CARRIED_PREFIX))
         .and_then(|n| n.parse::<u32>().ok())
         .unwrap_or(0)
-}
-
-/// THE DEFECT THIS CLOSES (2026-09-27). Ground 30 (`gate::revise`) ties a
-/// carry to ONE entity's own id, comparing that same id's tags across a
-/// revise. Measured on a copy of a real store: 12 open points carry an id
-/// ending `-2`, and for every one of them the original (ending in no suffix
-/// at all) was RETRACTED first, then a brand-new id filed fresh - never a
-/// revise of the old one, so ground 30 never even ran, and the new point's
-/// own carry count started at 0 again. "Carried at most once" held only
-/// against a fixed id, which is a formality once retracting and re-filing
-/// under a new id is this easy.
-///
-/// So the carry ties to what the point is ABOUT - the rule id its own text
-/// names - never to the note's own id. `named_rule_id` finds that rule id
-/// with the IDENTICAL substring match `teeth_batch_since` already uses to
-/// decide an open point names a rule (never a second matcher, per this
-/// task's own instruction); `every_open_point_ever` reads every open point
-/// this project has held, live or since retracted, from the log itself
-/// (retracting one leaves its last real body on the log untouched - only a
-/// `fact_retracted` event is added - so what it carried right before being
-/// closed is still exactly readable). A new open point naming the same rule
-/// as an earlier one must declare AT LEAST that earlier one's own count;
-/// `gate::revise`'s own ground 30 still refuses ever carrying it past 1, so
-/// this only ever closes the gap ground 30 could not reach on its own -
-/// crossing entities - never loosens what ground 30 already refuses.
-fn named_rule_id(store: &EventStore, project: Option<&str>, text: &str) -> Option<String> {
-    let lower = text.to_lowercase();
-    let mut matches: Vec<String> = all_live_items(store)
-        .into_iter()
-        .filter(|(_, item)| item.kind.can_fire())
-        .filter(|(_, item)| project_applies_to(item.project.as_deref(), project))
-        .filter(|(id, _)| lower.contains(&id.to_lowercase()))
-        .map(|(id, _)| id)
-        .collect();
-    matches.sort();
-    matches.dedup();
-    // More than one live rule id matches: which one this point is really
-    // about is ambiguous from the text alone, and guessing wrong would
-    // either force a false starting count or miss inheriting a real one -
-    // this fails to "no rule found", the same stance every other best-effort
-    // read in this section takes, never a refusal on a guess.
-    (matches.len() == 1).then(|| matches.remove(0))
-}
-
-/// Every open point (`Report`, `OPEN_POINT_TAG`) `project` has EVER held,
-/// live or since retracted, as `(id, its own last real body)` - one entry
-/// per entity id, the latest `fact_created`/`fact_revised` body on the log
-/// winning, exactly the body it carried right before any later retraction
-/// (a `fact_retracted` event carries no body of its own to prefer instead).
-/// Fails open to an empty list on an unreadable log, the same stance
-/// `all_live_items` takes.
-fn every_open_point_ever(store: &EventStore, project: Option<&str>) -> Vec<(String, Item)> {
-    let Ok(events) = store.get_all_events() else { return Vec::new() };
-    let mut by_id: HashMap<String, (i64, Item)> = HashMap::new();
-    for e in &events {
-        if !matches!(e.kind, EventKind::FactCreated | EventKind::FactRevised) {
-            continue;
-        }
-        let Ok(item) = parse_body(&e.body) else { continue };
-        if item.kind != Kind::Report || !item.tags.iter().any(|t| t == OPEN_POINT_TAG) || item.project.as_deref() != project {
-            continue;
-        }
-        by_id
-            .entry(e.entity_id.clone())
-            .and_modify(|(seq, cur)| {
-                if e.seq > *seq {
-                    *seq = e.seq;
-                    *cur = item.clone();
-                }
-            })
-            .or_insert((e.seq, item));
-    }
-    by_id.into_iter().map(|(id, (_, item))| (id, item)).collect()
-}
-
-/// `Some(refusal)` when `item` is a brand-new open point naming a rule an
-/// EARLIER open point (live or since retracted, any id) already carried
-/// forward, and this one's own count starts BELOW that - see `named_rule_id`/
-/// `every_open_point_ever`'s own doc comments. `None` for everything else,
-/// including an open point naming no rule this store can identify at all -
-/// this never refuses on a guess, only on a real, matched carry history.
-fn check_open_point_carry_inherited(store: &EventStore, item: &Item) -> Option<Refusal> {
-    if item.kind != Kind::Report || !item.tags.iter().any(|t| t == OPEN_POINT_TAG) {
-        return None;
-    }
-    let rule_id = named_rule_id(store, item.project.as_deref(), &item.text)?;
-    let prior_max = every_open_point_ever(store, item.project.as_deref())
-        .into_iter()
-        .filter(|(id, _)| id != &item.id)
-        .filter(|(_, prior)| prior.text.to_lowercase().contains(&rule_id.to_lowercase()))
-        .map(|(_, prior)| open_point_carried_count(&prior.tags))
-        .max()
-        .unwrap_or(0);
-    let own = open_point_carried_count(&item.tags);
-    if own >= prior_max {
-        return None;
-    }
-    Some(Refusal {
-        problem: format!(
-            "this open point names '{rule_id}', which an earlier open point about the same rule (live or since \
-             retracted) already carried forward {prior_max} time(s) - filing it under a fresh id does not reset \
-             that count back to zero"
-        ),
-        fix: format!(
-            "add the tag '{OPEN_POINT_CARRIED_PREFIX}{prior_max}' to this open point so it starts where the \
-             earlier one about '{rule_id}' left off - carrying it any further than that still needs the owner \
-             directly, exactly as `gate::revise`'s own ground 30 already refuses"
-        ),
-    })
 }
 
 /// Every live item, current single head, not a retraction tombstone, body
@@ -3044,19 +3399,22 @@ fn project_applies_to(item_project: Option<&str>, checkout_project: Option<&str>
 
 /// Mirrors `serve::usefulness::served_since_last_verdict` exactly: how many
 /// times each item has fired (`ItemServed`, stamped by `ASSISTANT_DELIVERY_
-/// ACTOR`) since its own last verdict (`ItemMarkedUseful`/`ItemMarkedNoise`
-/// reset the count to zero, from any actor - a verdict is about the item,
-/// not the audience). Fails open to an empty map, the same stance
+/// ACTOR`) since its own last ATTESTED verdict (an `ItemMarkedUseful`/
+/// `ItemMarkedNoise` resets the count to zero only when its recorded
+/// verification says it was made through an attested THOR call,
+/// `attested_write_seqs` - D9; from any audience - a verdict is about the
+/// item, not the audience). Fails open to an empty map, the same stance
 /// `all_live_items` takes and for the same reason.
 fn served_since_last_verdict_local(store: &EventStore) -> HashMap<String, usize> {
-    let Ok(events) = store.event_kinds_with_actor() else { return HashMap::new() };
+    let Ok(events) = store.firings_and_verdicts() else { return HashMap::new() };
+    let attested = attested_write_seqs(store);
     let mut counts: HashMap<String, usize> = HashMap::new();
-    for (kind, id, actor) in events {
+    for (seq, kind, id, actor, _session) in events {
         match kind {
             EventKind::ItemServed if actor == ASSISTANT_DELIVERY_ACTOR => {
                 *counts.entry(id).or_default() += 1;
             }
-            EventKind::ItemMarkedUseful | EventKind::ItemMarkedNoise => {
+            EventKind::ItemMarkedUseful | EventKind::ItemMarkedNoise if attested.contains(&seq) => {
                 counts.insert(id, 0);
             }
             _ => {}
@@ -3089,38 +3447,896 @@ pub fn judgement_debt_in_project(store: &EventStore, project: Option<&str>) -> V
     owed
 }
 
-/// Which evaluation a filing belongs to: the session that runs it, and the
-/// log position at which it started.
-///
-/// WHY THE FILING GATE NEEDS THIS (2026-09-26). The judgement condition used
-/// to be computed live and store-wide at every filing attempt. Measured in a
-/// fresh evaluation that day: a session filed its report eight times and was
-/// refused eight times, each time on a different, growing list (14, 6, 13, 4,
-/// 4, 1, 5, 4). Two things fed it. The rules bound to the `remember` moment
-/// fire on every one of the evaluation's own writes, so the evaluation pushed
-/// items over the threshold by doing its work; and parallel sessions in the
-/// same repository did the same, for items this session never saw fire. It
-/// ended up marking sixty items useful against two noise, including items it
-/// had never seen - the exact false record the verdict exists to prevent.
-///
-/// So the set a report must settle is fixed when its evaluation STARTS, the
-/// same way the teeth batch is fixed by the previous report, and it holds only
-/// what fired in the evaluating session itself. The log already records the
-/// session of every firing (the hook stamps it); what it cannot record is
-/// which session is FILING, because every write through the tool server is
-/// stamped with one shared constant. The hook knows, and hands it over in a
-/// small sidecar (`serve::eval_session`); the tool server reads that back and
-/// passes it in here. `None` - no hook record of the filing at all - means no
-/// session is known, and then no verdict can honestly be demanded: a session
-/// the hook never saw has no firings on record either. The store-wide debt
-/// stays with doctor and the Stop hook's own per-turn ask either way.
+// ------------------------------------------------ the filing context (step 15)
+//
+// WHY A FILING NEEDS ONE. Until step 15 an evaluation report could be written
+// by anything that could reach the store: a second JSON-RPC client, a script,
+// the model CLI, an older binary. Measured on a store copy: a side-door client
+// filed "eval-fxp-2026-09-28" and the receipt said no verdict was required,
+// because no hook record said which session filed it. A report like that can
+// never count - the Stop hook (the reader, step 16) only accepts one whose
+// filing call is in the evaluating session's own transcript - so the writer
+// refuses it as the friendly first line.
+//
+// WHAT THE WRITER CAN KNOW (K21, F2). While the filing call runs, its own
+// tool_result and hook attachment do not exist yet, so the writer never asks
+// for them and never waits. It refuses only on POSITIVE evidence of a side
+// door (`serve::attest::check_call_in_flight`), and it needs the open
+// evaluation start record of the filing session and the report's project,
+// read from the log. Everything the gate COUNTS - a verdict on the judgement
+// list, a write to a rule on the batch or the A4 list - is judged by its
+// RECORDED attestation (step 12): those calls finished earlier, and the
+// session's Stop recorded each one. A write of the filing turn has no record
+// yet and counts as not yet attested; the refusal says to end the turn once.
+
+/// What a write that files an evaluation report brings. Built only by the
+/// tool server's remember and revise (and, from step 16, by the validator
+/// that recomputes the filing). A write with none - the model CLI, a replica's
+/// drain, a one-off binary, a call that is a side door - is refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EvaluationScope {
-    /// The Claude Code session id the hook stamped on this session's firings.
-    pub session_id: String,
-    /// The highest log seq that existed when the evaluation started. Nothing
-    /// after it can add to the set this report must settle.
+pub struct FilingContext {
+    /// What the tool server saw of the filing call while it ran:
+    /// `INFLIGHT_SEEN` or `INFLIGHT_UNSEEN`. Never a side door.
+    pub inflight: String,
+    /// The open evaluation start record of the filing session and the
+    /// report's project: its frozen lists are what the filing is held to.
+    pub start: EvaluationStart,
+    /// THOR's own open points as that start's machine pass left them: the
+    /// blockers that hold rules of the project, each with its subject and the
+    /// rules it holds (`Frozen::machine`). A rule held by one is settled for
+    /// this evaluation and holds no filing.
+    pub blockers: Vec<MachinePoint>,
+}
+
+impl FilingContext {
+    /// The context of a filing call the tool server saw as `inflight`
+    /// (`Att::inflight`) for the evaluation `start` records. `None` when the
+    /// call is a side door: that gives no context, and the filing is refused.
+    pub fn new(inflight: &str, start: EvaluationStart) -> Option<Self> {
+        if inflight != INFLIGHT_SEEN && inflight != INFLIGHT_UNSEEN {
+            return None;
+        }
+        let blockers = start.frozen.machine.as_ref().map(|m| m.points.clone()).unwrap_or_default();
+        Some(FilingContext { inflight: inflight.to_string(), start, blockers })
+    }
+}
+
+/// A refusal as the one sentence a tool prints: `REFUSED: <problem>. <fix>.`
+pub fn refusal_sentence(refusal: &Refusal) -> String {
+    format!("REFUSED: {}. {}.", refusal.problem, refusal.fix)
+}
+
+/// The refusal of an evaluation report that is not coming through a THOR tool
+/// call Claude Code made - `why` says what gave it away. The same sentence
+/// for every writer: the tool server on a side door, the model CLI, the store
+/// itself for a write with no filing context.
+pub fn unattested_filing_refusal(why: &str) -> Refusal {
+    Refusal {
+        problem: format!(
+            "this evaluation report is not coming through a THOR tool call that both Claude Code and THOR's hook saw \
+             ({why}), so it could never count - the Stop hook only accepts a report whose filing call is in this \
+             session's own transcript. Nothing was written"
+        ),
+        fix: "File it with the THOR tool itself, not a script, a second client, the model CLI or an older binary: if \
+              mcp__thor__remember is not loaded yet, load it with ToolSearch, query \
+              \"select:mcp__thor__remember,mcp__thor__revise,mcp__thor__mark\", then call it with the same arguments"
+            .to_string(),
+    }
+}
+
+/// The refusal of an evaluation report for a project the filing session has
+/// no evaluation open for. There is then nothing to file: a report is filed
+/// for an evaluation THOR started, and is held to the lists that start froze.
+pub fn no_open_evaluation_refusal(store: &EventStore, session: &str, project: &str) -> Refusal {
+    let newest = evaluation_starts_of_session(store, session).into_iter().filter(|s| s.frozen.project == project).max_by_key(|s| s.seq);
+    let detail = match newest {
+        None => "THOR's log holds no start record for it".to_string(),
+        Some(start) => match &start.frozen.void {
+            Some(void) => format!(
+                "its last one, '{}', is void: '{}' was changed at log seq {} outside an attested THOR call of it ({})",
+                start.id, void.id, void.seq, void.door
+            ),
+            None if own_report_filed(store, &start) => format!("its last one, '{}', already has its report on file", start.id),
+            None => format!("its last one, '{}', is older than {EVALUATION_OPEN_HOURS} hours and closed", start.id),
+        },
+    };
+    Refusal {
+        problem: format!(
+            "this evaluation report cannot be filed: no evaluation of '{project}' is open in this session ({detail}). A \
+             report is filed for an evaluation THOR started, and is held to the lists that start froze. Nothing was written"
+        ),
+        fix: "There is nothing to file now, so file nothing. An evaluation starts when THOR's Stop hook asks for one at \
+              the end of a turn (its ask carries the start note) or when the owner types /thor-eval; do what that start \
+              note lists, then file the report in that same session"
+            .to_string(),
+    }
+}
+
+/// A write to an item on an evaluation's frozen lists (or to its start
+/// record) made outside an attested THOR call of that evaluation (D10): which
+/// item, at which log seq, and through which door. Kept on the start record
+/// once the evaluation is closed for it (`Frozen::void`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrozenVoid {
+    pub id: String,
+    pub seq: i64,
+    pub door: String,
+}
+
+/// What a filing is told when an item of its evaluation's lists was changed
+/// behind it (D10). The evaluation is closed; a fresh one has to start.
+pub fn changed_behind_refusal(void: &FrozenVoid) -> Refusal {
+    Refusal {
+        problem: format!(
+            "'{}' was changed at log seq {} outside an attested THOR call of this evaluation ({}). An evaluation whose \
+             list was changed behind it cannot count. The next Stop starts a fresh evaluation with a fresh list",
+            void.id, void.seq, void.door
+        ),
+        fix: "Nothing was written, and this evaluation is closed. End this turn: while the evaluation is still due, \
+              THOR's Stop hook starts it again and its start note lists what is yours to do - then file the report with \
+              the THOR tool itself. Change a listed item only with the THOR tools, inside the evaluating session"
+            .to_string(),
+    }
+}
+
+/// What a side-door write to an item on an open evaluation's frozen lists is
+/// told, on the spot (D10): nothing is written, so the evaluation stands.
+pub fn frozen_side_door_refusal(id: &str, start: &EvaluationStart, door: &str) -> Refusal {
+    Refusal {
+        problem: format!(
+            "'{id}' is on the frozen lists of an open evaluation of '{}' ('{}', session {}), and this write is coming \
+             from outside an attested THOR call ({door}). An evaluation whose list was changed behind it cannot count, \
+             so nothing was written",
+            start.frozen.project, start.id, start.frozen.session
+        ),
+        fix: "Make this change with the THOR tool itself, inside Claude Code, in the session that runs the evaluation \
+              - not a script or a second client: if the tool is not loaded yet, load it with ToolSearch, query \
+              \"select:mcp__thor__remember,mcp__thor__revise,mcp__thor__retract,mcp__thor__mark\". Or make it after \
+              that evaluation's report is filed"
+            .to_string(),
+    }
+}
+
+/// What the filing gate tells a session whose own writes of this turn are
+/// not verified yet.
+pub const TURN_NOT_ENDED: &str =
+    "the verdicts you gave in this turn are checked when the turn ends - end the turn once, then file again";
+
+/// How one write stands against an evaluation by `session` - read from the
+/// write's own event and its RECORDED verification, never a live transcript.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteDoor {
+    /// By one of THOR's own actors (`RESERVED_ACTORS`): the machine pass, a
+    /// retest, the attester. Never a side door.
+    Machine,
+    /// Recorded as an attested THOR call of the evaluating session (made by
+    /// its subagent `agent_id`, when one made it).
+    Attested { agent_id: Option<String> },
+    /// Stamped as a THOR call of the evaluating session and not verified yet:
+    /// the session's next Stop records it.
+    Pending,
+    /// Outside an attested THOR call of the evaluating session: the door.
+    Outside(String),
+}
+
+/// `WriteDoor` of `event`, given the recorded verifications of its entity
+/// (`recorded_write_verdicts`).
+pub fn write_door(event: &Event, verdicts: &HashMap<i64, WriteVerdict>, session: &str) -> WriteDoor {
+    if RESERVED_ACTORS.contains(&event.actor.as_str()) {
+        return WriteDoor::Machine;
+    }
+    if let Some(verdict) = verdicts.get(&event.seq) {
+        return if verdict.attested && verdict.session == session {
+            WriteDoor::Attested { agent_id: verdict.agent_id.clone() }
+        } else if verdict.attested {
+            WriteDoor::Outside(format!("an attested THOR call of another session, {}", verdict.session))
+        } else {
+            WriteDoor::Outside(format!("not an attested THOR call: {}", verdict.why))
+        };
+    }
+    let Some(att) = att_of(&event.body) else {
+        return WriteDoor::Outside(format!(
+            "written by '{}' with no stamp of THOR's tool server - the command line, a repair tool or an older build",
+            event.actor
+        ));
+    };
+    if att.inflight.as_deref() == Some(INFLIGHT_SIDE_DOOR) {
+        return WriteDoor::Outside(format!("a side door: {}", att.side_door.as_deref().unwrap_or("no reason recorded")));
+    }
+    if att.tool_use_id.as_deref().is_none_or(str::is_empty) {
+        return WriteDoor::Outside("no toolUseId in the call's _meta".to_string());
+    }
+    if event.session_id != session {
+        return WriteDoor::Outside(format!("a THOR call of another session, {}", event.session_id));
+    }
+    WriteDoor::Pending
+}
+
+/// The kinds of event that change an item: the ones D10 counts as a write to
+/// a frozen item. A verdict (`mark`) is not one - it is judged on its own.
+fn changes_an_item(kind: EventKind) -> bool {
+    moves_the_head(kind) || kind == EventKind::FactReprojected
+}
+
+/// Every id on `start`'s frozen lists - judgement, batch, A4 list - once
+/// each, in that order.
+pub fn frozen_ids(start: &EvaluationStart) -> Vec<String> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    start
+        .frozen
+        .judgement
+        .iter()
+        .chain(start.frozen.batch())
+        .chain(start.frozen.a4_list())
+        .filter(|id| seen.insert(id.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// The writes to `start`'s frozen items, and to its start record, in its
+/// window: after the start, up to log seq `until` (`None`: the log's tip).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FrozenWrites {
+    /// Made outside an attested THOR call of the evaluation, oldest first:
+    /// each one voids it (D10).
+    pub outside: Vec<FrozenVoid>,
+    /// Made through a THOR call of the evaluating session that is not
+    /// verified yet, as (id, log seq): they count once the turn has ended.
+    pub pending: Vec<(String, i64)>,
+}
+
+/// `FrozenWrites` of `start`. Reads each frozen id's own events (indexed),
+/// never the whole log. An id whose events cannot be read is skipped: an
+/// unreadable log is not evidence of a side door.
+pub fn frozen_writes_in_window(store: &EventStore, start: &EvaluationStart, until: Option<i64>) -> FrozenWrites {
+    frozen_writes_judged(store, start, until, until)
+}
+
+/// `frozen_writes_in_window` for the writes up to log seq `until`, each judged
+/// by the verifications recorded up to `judged_until` (`None`: every one on
+/// the log now). The Stop-time validator (step 16) judges the writes of a
+/// filing's window by every verification recorded since - its own Stop
+/// completes them first - while the filing gate itself only knew the ones
+/// recorded before it.
+pub fn frozen_writes_judged(
+    store: &EventStore,
+    start: &EvaluationStart,
+    until: Option<i64>,
+    judged_until: Option<i64>,
+) -> FrozenWrites {
+    let session = start.frozen.session.as_str();
+    let mut found = FrozenWrites::default();
+    let mut ids = frozen_ids(start);
+    ids.push(start.id.clone());
+    for id in ids {
+        let Ok(events) = store.get_events_by_entity(&id) else { continue };
+        let judged: Vec<Event> = events.iter().filter(|e| judged_until.is_none_or(|u| e.seq <= u)).cloned().collect();
+        let verdicts = recorded_write_verdicts(&judged);
+        let events: Vec<Event> = events.into_iter().filter(|e| until.is_none_or(|u| e.seq <= u)).collect();
+        for event in events.iter().filter(|e| e.seq > start.frozen.started_seq && changes_an_item(e.kind)) {
+            match write_door(event, &verdicts, session) {
+                WriteDoor::Machine | WriteDoor::Attested { .. } => {}
+                WriteDoor::Pending => found.pending.push((id.clone(), event.seq)),
+                WriteDoor::Outside(door) => found.outside.push(FrozenVoid { id: id.clone(), seq: event.seq, door }),
+            }
+        }
+    }
+    found.outside.sort_by_key(|w| w.seq);
+    found.pending.sort_by_key(|(_, seq)| *seq);
+    found
+}
+
+/// The open evaluation of any session whose frozen lists hold `id` - for the
+/// tool server's on-the-spot refusal of a side-door write to a frozen item.
+/// The newest one when several do.
+pub fn open_evaluation_freezing(store: &EventStore, id: &str) -> Option<EvaluationStart> {
+    let events = store.events_of_kinds(&[EventKind::FactCreated, EventKind::FactRevised], 0).ok()?;
+    let now = now_unix_secs();
+    let mut newest_per_key: HashMap<(String, String), EvaluationStart> = HashMap::new();
+    for start in starts_in(&events) {
+        newest_per_key.insert((start.frozen.session.clone(), start.frozen.project.clone()), start);
+    }
+    newest_per_key
+        .into_values()
+        .filter(|s| s.id == id || frozen_ids(s).iter().any(|frozen| frozen == id))
+        .filter(|s| evaluation_still_open(store, s, now))
+        .max_by_key(|s| s.seq)
+}
+
+// ------------------------------------------ the evaluation start record (step 13)
+//
+// An evaluation starts IN THE LOG: one `fact_created` by THOR's own
+// `eval-machine`, entity `evaluation-start-<project slug>-<N>`, session S,
+// whose body is a canonical Report (the project, the tag `evaluation-start`,
+// the start note in words as its text) with a trailing `"frozen"` key spliced
+// on the same way `because` is. `frozen` holds the lists the report is held
+// to - the judgement list, the teeth batch, the A4 list and the open points -
+// fixed at log position N, so nothing that fires or is written afterwards can
+// grow them. The id is reserved for `eval-machine` at the fence
+// (`reserved_id_owner`), so no other writer can plant or change one.
+//
+// TWO WRITES (step 14). The start record is written FIRST, with the judgement
+// list and the open points and NO batch: THOR's machine pass over the
+// project's old rules runs after it, under a time box, and its result is
+// written as ONE `fact_revised` by `eval-machine` on the same record, adding
+// `frozen.batch`, `frozen.a4_list` and `frozen.machine`
+// (`record_evaluation_batch`). A start record with no batch is the marker of
+// a pass that has not finished - a hook killed in between - and the filing
+// gate refuses until it is there.
+//
+// It replaces the hook's handover sidecar (`evaluation-sessions.json`): any
+// local process could write that file, and an evaluation whose start and
+// list lived there could be shrunk or moved by editing it.
+
+/// The id prefix of every evaluation start record.
+pub const EVALUATION_START_PREFIX: &str = "evaluation-start-";
+
+/// The tag every evaluation start record carries.
+pub const EVALUATION_START_TAG: &str = "evaluation-start";
+
+/// The actor that writes evaluation start records (a reserved name).
+pub const EVAL_MACHINE_ACTOR: &str = "eval-machine";
+
+/// How long an evaluation that never filed its report stays open. After this
+/// a new start signal opens a fresh one: an evaluation abandoned yesterday
+/// must not fix today's list.
+pub const EVALUATION_OPEN_HOURS: i64 = 16;
+
+/// How many rules whose check bites and whose text only fails to name the
+/// literal (A4) one evaluation hands to the agent, beside its batch (K23,
+/// Q24).
+pub const EVALUATION_A4_LIST: usize = 16;
+
+/// A blocker as the start record keeps it (`Blocker`, in a serde shape).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachineBlocker {
+    /// `Blocker::code`.
+    pub code: String,
+    /// `Blocker::subject`: the project, or the file.
+    pub subject: String,
+}
+
+impl MachineBlocker {
+    pub fn of(blocker: &Blocker) -> Self {
+        MachineBlocker { code: blocker.code().to_string(), subject: blocker.subject().to_string() }
+    }
+
+    pub fn to_blocker(&self) -> Blocker {
+        if self.code == "working-tree-differs" {
+            Blocker::WorkingTreeDiffers { path: self.subject.clone() }
+        } else {
+            Blocker::NoWorkingCopy { project: self.subject.clone() }
+        }
+    }
+}
+
+/// What THOR's machine pass did with one old rule at an evaluation start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MachineOutcome {
+    /// Its check bites: written on the rule track by `teeth-eval`.
+    Rule,
+    /// No tooth holds: written as a note by `teeth-eval`.
+    Note,
+    /// A note's pending check now holds and bites: hung by `teeth-eval`.
+    PendingHung,
+    /// A note's pending check is still not a working tooth: nothing written.
+    PendingKept,
+    /// Held by a machine blocker: THOR's open point for its subject holds it.
+    Blocked,
+    /// The agent has to act: on the frozen batch, or waiting for a later one.
+    NeedsAgent,
+    /// The check bites and only the naming is missing (A4): on the A4 list,
+    /// or waiting for a later one.
+    A4Only,
+    /// Tried again and still the same rule: nothing written.
+    Unchanged,
+}
+
+/// One old rule as the machine pass left it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachineItem {
+    pub id: String,
+    pub outcome: MachineOutcome,
+    /// Why, in words: the verdict's first line, the because of a note, the
+    /// fix the agent has to make, or the blocker.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+    /// The exact call the agent runs for it, when it needs the agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call: Option<String>,
+    /// The blocker holding it, when it is blocked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocker: Option<MachineBlocker>,
+    /// The seq of the `fact_revised` `teeth-eval` wrote for it, when it
+    /// wrote one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<i64>,
+}
+
+/// One of THOR's own open points as the machine pass left it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachinePoint {
+    pub id: String,
+    pub blocker: MachineBlocker,
+    /// The rules it holds (the ones this pass found blocked by it).
+    #[serde(default)]
+    pub rules: Vec<String>,
+    /// Every VALID evaluation that filed while this subject was held by an
+    /// open point, as the validator recorded them up to this start (step 16,
+    /// B5). Not empty: the point is in the OWNER QUEUE - the owner decides.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub carried_by: Vec<Carrier>,
+}
+
+/// What THOR's machine pass decided at an evaluation start
+/// (`Frozen::machine`): the seven totals, every item's outcome, and the open
+/// points it wrote or closed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachinePass {
+    /// Rules whose check bites, written on the rule track.
+    #[serde(default)]
+    pub bites: usize,
+    /// Rules with no working tooth, written as notes.
+    #[serde(default)]
+    pub notes: usize,
+    /// Notes whose pending check now bites, hung.
+    #[serde(default)]
+    pub pending_hung: usize,
+    /// Rules held by a machine blocker.
+    #[serde(default)]
+    pub blocked: usize,
+    /// Rules that need the agent for anything but the A4 naming - the batch
+    /// holds the first `EVALUATION_TEETH_BATCH` of them.
+    #[serde(default)]
+    pub needs_agent: usize,
+    /// Rules whose check bites and whose text only fails to name the literal
+    /// - the A4 list holds the first `EVALUATION_A4_LIST` of them.
+    #[serde(default)]
+    pub a4_only: usize,
+    /// Rules the pass did not reach inside its time box. Not owed in this
+    /// evaluation; the next start begins with them.
+    #[serde(default)]
+    pub not_reached: usize,
+    /// Every item's outcome, in the order the pass tried them.
+    #[serde(default)]
+    pub items: Vec<MachineItem>,
+    /// The ids the pass did not reach, in the order it would have tried them.
+    #[serde(default)]
+    pub not_reached_ids: Vec<String>,
+    /// THOR's open points live after the pass.
+    #[serde(default)]
+    pub points: Vec<MachinePoint>,
+    /// THOR's open points the pass closed, each with its derived reason.
+    #[serde(default)]
+    pub points_closed: Vec<(String, String)>,
+    /// How long the pass had, in seconds (its time box).
+    #[serde(default)]
+    pub box_secs: u64,
+}
+
+/// The lists an evaluation start froze, spliced into the start record's body
+/// as the trailing key `"frozen"`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Frozen {
+    /// The Claude Code session that runs the evaluation.
+    pub session: String,
+    pub project: String,
+    /// N: the highest log seq that existed when the evaluation started.
     pub started_seq: i64,
+    /// What started it: "stop-ask", "command" or "skill".
+    pub started_by: String,
+    /// When it started (unix seconds). The log itself records no time, and
+    /// both the open window (`EVALUATION_OPEN_HOURS`) and the "started
+    /// <date>" a reader is shown need one.
+    pub started_unix: i64,
+    /// Creation seq of the project's newest evaluation report at the start
+    /// (0 for none): where the machine pass counted "fired since" from.
+    pub prev_report_seq: i64,
+    /// The judgement list (`evaluation_judgement_list`).
+    pub judgement: Vec<String>,
+    /// The teeth batch: at most `EVALUATION_TEETH_BATCH` rule ids that need
+    /// the agent. `None` until THOR's machine pass has finished and written
+    /// the batch record - the marker of a pass still to run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch: Option<Vec<String>>,
+    /// How many rules that need the agent did not fit in the batch.
+    #[serde(default)]
+    pub batch_later: usize,
+    /// The A4 list: at most `EVALUATION_A4_LIST` rule ids whose check bites
+    /// and whose text only has to name the literal. Written with the batch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub a4_list: Option<Vec<String>>,
+    /// The project's open points at the start, by id: THOR's own first, then
+    /// the legacy ones.
+    pub open_points: Vec<String>,
+    /// What THOR's own machine pass decided at the start. Written with the
+    /// batch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<MachinePass>,
+    /// Set when the evaluation was closed as VOID (step 15, D10): an item on
+    /// its frozen lists was changed outside an attested THOR call of it. A
+    /// void evaluation is never open again and no report can be filed for
+    /// it; the next start signal opens a fresh one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub void: Option<FrozenVoid>,
+}
+
+impl Frozen {
+    /// Whether THOR's machine pass has finished: the batch record is written.
+    pub fn decided(&self) -> bool {
+        self.batch.is_some()
+    }
+
+    /// The frozen batch; empty while the machine pass has not finished.
+    pub fn batch(&self) -> &[String] {
+        self.batch.as_deref().unwrap_or(&[])
+    }
+
+    /// The frozen A4 list; empty while the machine pass has not finished.
+    pub fn a4_list(&self) -> &[String] {
+        self.a4_list.as_deref().unwrap_or(&[])
+    }
+
+    /// Whether the evaluation was closed as void (`Frozen::void`).
+    pub fn is_void(&self) -> bool {
+        self.void.is_some()
+    }
+}
+
+/// One evaluation start record, read back from the log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvaluationStart {
+    /// `evaluation-start-<project slug>-<N>`.
+    pub id: String,
+    /// The start record's own event seq (N + 1 when nothing raced it).
+    pub seq: i64,
+    /// The frozen lists as the record holds them now: the ones written at
+    /// the start, plus the batch, the A4 list and the machine's decisions
+    /// once the batch record is written.
+    pub frozen: Frozen,
+    /// The seq of the batch record (`record_evaluation_batch`), once written.
+    pub batch_seq: Option<i64>,
+}
+
+/// The id of the start record of `project`'s evaluation starting at log
+/// position `n`: the project folded to lower-case ASCII letters, digits and
+/// single hyphens, so any project name gives a plain, greppable id.
+pub fn evaluation_start_id(project: &str, n: i64) -> String {
+    format!("{EVALUATION_START_PREFIX}{}-{n}", slug(project, "project"))
+}
+
+/// `body` with the trailing key `"frozen":{...}` spliced on, byte for byte
+/// the way `body_with_because` splices `because`. Public so a test can write
+/// a start record raw (a test holds no THOR actor token).
+pub fn body_with_frozen(body: &str, frozen: &Frozen) -> Result<String, serde_json::Error> {
+    let frozen = serde_json::to_string(frozen)?;
+    debug_assert!(body.ends_with('}'), "every event body written here is a JSON object");
+    Ok(format!("{},\"frozen\":{frozen}}}", &body[..body.len() - 1]))
+}
+
+/// The frozen lists an event body carries, if any.
+pub fn frozen_of(body: &str) -> Option<Frozen> {
+    let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    serde_json::from_value(value.get("frozen")?.clone()).ok()
+}
+
+/// The start record `event` is, when it is one: a `fact_created` by
+/// `eval-machine` on an `evaluation-start-` id whose body carries `frozen`.
+/// Anything else - an event by another actor included, which the fence
+/// never lets through - is not a start.
+fn start_of_event(event: &Event) -> Option<EvaluationStart> {
+    if event.kind != EventKind::FactCreated
+        || event.actor != EVAL_MACHINE_ACTOR
+        || !event.entity_id.starts_with(EVALUATION_START_PREFIX)
+    {
+        return None;
+    }
+    Some(EvaluationStart { id: event.entity_id.clone(), seq: event.seq, frozen: frozen_of(&event.body)?, batch_seq: None })
+}
+
+/// Every start record in `events` (created and revised events of start
+/// records, in log order), each with the lists its record holds NOW: a later
+/// `fact_revised` by `eval-machine` on the same record - the batch record, or
+/// the one that closes it as void - replaces the frozen lists the start
+/// wrote, and is the only thing that can.
+fn starts_in(events: &[Event]) -> Vec<EvaluationStart> {
+    let mut starts: Vec<EvaluationStart> = Vec::new();
+    for event in events {
+        if let Some(start) = start_of_event(event) {
+            starts.push(start);
+            continue;
+        }
+        let revised = event.kind == EventKind::FactRevised
+            && event.actor == EVAL_MACHINE_ACTOR
+            && event.entity_id.starts_with(EVALUATION_START_PREFIX);
+        if !revised {
+            continue;
+        }
+        let Some(frozen) = frozen_of(&event.body) else { continue };
+        if let Some(start) = starts.iter_mut().find(|s| s.id == event.entity_id) {
+            // The batch record is the revise that ADDS the batch; a later
+            // one (the void mark) leaves its seq alone.
+            if !start.frozen.decided() && frozen.decided() {
+                start.batch_seq = Some(event.seq);
+            }
+            start.frozen = frozen;
+        }
+    }
+    starts
+}
+
+/// What an evaluation of `project` by `session` starting now freezes FIRST,
+/// computed from the log alone: the judgement list
+/// (`evaluation_judgement_list`, attested verdicts only) and the project's
+/// open points. N is the log's tip. The batch, the A4 list and the machine's
+/// decisions are not in it: THOR's machine pass writes them after the start
+/// record is on the log (`record_evaluation_batch`). Pure: nothing is written.
+pub fn frozen_now(store: &EventStore, session: &str, project: &str, started_by: &str, started_unix: i64) -> Option<Frozen> {
+    let started_seq = store.get_next_seq().ok()? - 1;
+    Some(Frozen {
+        session: session.to_string(),
+        project: project.to_string(),
+        started_seq,
+        started_by: started_by.to_string(),
+        started_unix,
+        prev_report_seq: newest_evaluation_report_seq(store, Some(project)),
+        judgement: evaluation_judgement_list(store, Some(project), session, started_seq),
+        batch: None,
+        batch_later: 0,
+        a4_list: None,
+        open_points: open_points(store, Some(project)).into_iter().map(|p| p.id).collect(),
+        machine: None,
+        void: None,
+    })
+}
+
+/// Append the start record: one `fact_created`, straight onto the log - not
+/// through `declare` (a start is THOR's own record, not a claim for the write
+/// gate to judge). Only `eval-machine` writes one; `item` must be a Report on
+/// an `evaluation-start-` id carrying `EVALUATION_START_TAG`, and the id must
+/// not exist yet (two starts racing for the same N: one lands, the other is
+/// refused and reads the one that landed).
+pub fn record_evaluation_start(
+    store: &mut EventStore,
+    actor: SystemActor,
+    item: &Item,
+    frozen: &Frozen,
+) -> Result<EvaluationStart, WriteError> {
+    if actor.name() != EVAL_MACHINE_ACTOR {
+        return Err(WriteError::Refused(Refusal {
+            problem: format!("an evaluation start is recorded by THOR's eval-machine only, not by '{}'", actor.name()),
+            fix: "let the hook start the evaluation (serve::eval_session::start)".to_string(),
+        }));
+    }
+    let shaped = item.id.starts_with(EVALUATION_START_PREFIX)
+        && item.kind == Kind::Report
+        && item.tags.iter().any(|t| t == EVALUATION_START_TAG);
+    if !shaped {
+        return Err(WriteError::Refused(Refusal {
+            problem: format!("'{}' is not shaped like an evaluation start record", item.id),
+            fix: format!("write a Report on an id beginning with '{EVALUATION_START_PREFIX}' tagged '{EVALUATION_START_TAG}'"),
+        }));
+    }
+    let name = fence(store, actor.into(), &item.id)?;
+    let body = canonical_body(&normalized(item)).map_err(WriteError::Serialize)?;
+    let body = body_with_frozen(&body, frozen).map_err(WriteError::Serialize)?;
+    let event = store
+        .append_created_unique(&frozen.session, &frozen.session, name, &item.id, &body, |_, _, _| false)
+        .map_err(WriteError::Store)?;
+    Ok(EvaluationStart { id: item.id.clone(), seq: event.seq, frozen: frozen.clone(), batch_seq: None })
+}
+
+/// Write the batch record: ONE `fact_revised` by `eval-machine` on the start
+/// record `start`, whose body is the record with `text` (the start note, now
+/// naming what is the agent's to do) and the frozen lists with `batch`,
+/// `a4_list`, `batch_later` and `machine` added. Everything else the start
+/// froze - the session, N, the judgement list, the open points - is carried
+/// over unchanged. Refused when the record already holds a batch: an
+/// evaluation's lists are written once.
+pub fn record_evaluation_batch(
+    store: &mut EventStore,
+    actor: SystemActor,
+    start: &EvaluationStart,
+    text: &str,
+    batch: Vec<String>,
+    batch_later: usize,
+    a4_list: Vec<String>,
+    machine: MachinePass,
+) -> Result<EvaluationStart, WriteError> {
+    if actor.name() != EVAL_MACHINE_ACTOR {
+        return Err(WriteError::Refused(Refusal {
+            problem: format!("an evaluation's batch is recorded by THOR's eval-machine only, not by '{}'", actor.name()),
+            fix: "let the hook run the machine pass (serve::eval_session::start)".to_string(),
+        }));
+    }
+    let name = fence(store, actor.into(), &start.id)?;
+    let events = store.get_events_by_entity(&start.id).map_err(|e| WriteError::Store(e.into()))?;
+    let current = starts_in(&events).into_iter().next();
+    let Some(current) = current else {
+        return Err(WriteError::Store(anyhow::anyhow!("'{}' is not an evaluation start record on this log", start.id)));
+    };
+    if current.frozen.decided() {
+        return Err(WriteError::Refused(Refusal {
+            problem: format!("'{}' already holds its batch (log seq {})", start.id, current.batch_seq.unwrap_or(0)),
+            fix: "read the start record back (open_evaluation_start): an evaluation's lists are written once".to_string(),
+        }));
+    }
+    if current.frozen.is_void() {
+        return Err(WriteError::Refused(Refusal {
+            problem: format!("'{}' is void: an item on its lists was changed behind it", start.id),
+            fix: "start a fresh evaluation (serve::eval_session::start): a void one is never decided".to_string(),
+        }));
+    }
+    let mut item = show(store, &start.id).map_err(|e| WriteError::Store(anyhow::anyhow!("{e}")))?;
+    item.text = text.to_string();
+    let mut frozen = current.frozen.clone();
+    frozen.batch = Some(batch);
+    frozen.batch_later = batch_later;
+    frozen.a4_list = Some(a4_list);
+    frozen.machine = Some(machine);
+    let body = canonical_body(&normalized(&item)).map_err(WriteError::Serialize)?;
+    let body = body_with_frozen(&body, &frozen).map_err(WriteError::Serialize)?;
+    let event = store
+        .append_mutate_checked(&frozen.session, &frozen.session, name, EventKind::FactRevised, &start.id, None, &body)
+        .map_err(WriteError::Store)?;
+    Ok(EvaluationStart { id: current.id, seq: current.seq, frozen, batch_seq: Some(event.seq) })
+}
+
+/// Close the evaluation `start` records as VOID (step 15, D10): ONE more
+/// `fact_revised` by `eval-machine` on the start record, whose frozen lists
+/// carry `void` - the item that was changed behind the evaluation, the log
+/// seq of that write and its door - and whose text says so. Everything else
+/// the record froze is carried over unchanged. A record that is void already
+/// is returned as it is: an evaluation is voided once.
+pub fn record_evaluation_void(
+    store: &mut EventStore,
+    actor: SystemActor,
+    start: &EvaluationStart,
+    void: &FrozenVoid,
+) -> Result<EvaluationStart, WriteError> {
+    if actor.name() != EVAL_MACHINE_ACTOR {
+        return Err(WriteError::Refused(Refusal {
+            problem: format!("an evaluation is closed as void by THOR's eval-machine only, not by '{}'", actor.name()),
+            fix: "let the tool server close it (serve::eval_session::void)".to_string(),
+        }));
+    }
+    let name = fence(store, actor.into(), &start.id)?;
+    let events = store.get_events_by_entity(&start.id).map_err(|e| WriteError::Store(e.into()))?;
+    let Some(current) = starts_in(&events).into_iter().next() else {
+        return Err(WriteError::Store(anyhow::anyhow!("'{}' is not an evaluation start record on this log", start.id)));
+    };
+    if current.frozen.is_void() {
+        return Ok(current);
+    }
+    let mut item = show(store, &start.id).map_err(|e| WriteError::Store(anyhow::anyhow!("{e}")))?;
+    item.text = format!("{}\n\n[THOR] THIS EVALUATION IS VOID: {}.", item.text, changed_behind_refusal(void).problem);
+    let mut frozen = current.frozen.clone();
+    frozen.void = Some(void.clone());
+    let body = canonical_body(&normalized(&item)).map_err(WriteError::Serialize)?;
+    let body = body_with_frozen(&body, &frozen).map_err(WriteError::Serialize)?;
+    store
+        .append_mutate_checked(&frozen.session, &frozen.session, name, EventKind::FactRevised, &start.id, None, &body)
+        .map_err(WriteError::Store)?;
+    Ok(EvaluationStart { frozen, ..current })
+}
+
+/// The newest evaluation start of `project` written before log seq
+/// `before_seq`, in any session - where a machine pass reads which rules the
+/// previous pass did not reach.
+pub fn previous_evaluation_start(store: &EventStore, project: &str, before_seq: i64) -> Option<EvaluationStart> {
+    let events = store.events_of_kinds(&[EventKind::FactCreated, EventKind::FactRevised], 0).ok()?;
+    starts_in(&events).into_iter().filter(|s| s.frozen.project == project && s.seq < before_seq).max_by_key(|s| s.seq)
+}
+
+/// Every evaluation start record `session` wrote, oldest first.
+pub fn evaluation_starts_of_session(store: &EventStore, session: &str) -> Vec<EvaluationStart> {
+    let Ok(events) = store.events_of_kinds_in_session(&[EventKind::FactCreated, EventKind::FactRevised], session) else {
+        return Vec::new();
+    };
+    starts_in(&events).into_iter().filter(|s| s.frozen.session == session).collect()
+}
+
+/// Whether the evaluation `start` records has filed its OWN report: a live
+/// evaluation report of its project, created or newly tagged after the start
+/// by a write whose session is the evaluating session. A report another
+/// session files for the same project in parallel closes nothing here - it
+/// was never this evaluation's report.
+fn own_report_filed(store: &EventStore, start: &EvaluationStart) -> bool {
+    let Ok(events) = store.events_of_kinds_in_session(&[EventKind::FactCreated, EventKind::FactRevised], &start.frozen.session)
+    else {
+        return false;
+    };
+    let mut candidates: Vec<&str> = events
+        .iter()
+        .filter(|e| e.seq > start.seq)
+        .filter(|e| parse_body(&e.body).is_ok_and(|item| is_evaluation_report_of(&item, &start.frozen.project)))
+        .map(|e| e.entity_id.as_str())
+        .collect();
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates.into_iter().any(|id| {
+        show(store, id).is_ok_and(|item| is_evaluation_report_of(&item, &start.frozen.project))
+            && filed_by_session_after(store, id, start)
+    })
+}
+
+/// Whether report `id` was FILED for `start`'s project after the start by
+/// the evaluating session: the write that made it an evaluation report of
+/// that project (its creation, or the revise that tagged it or moved it
+/// there) came after the start, in that session. A later correction of a
+/// report filed before the start - a typo fix - is not a filing.
+fn filed_by_session_after(store: &EventStore, id: &str, start: &EvaluationStart) -> bool {
+    let Ok(events) = store.get_events_by_entity(id) else { return false };
+    let mut was_report = false;
+    let mut filed = false;
+    for e in events.iter().filter(|e| writes_the_item(e.kind)) {
+        // A body that is no item (a resolve names heads, not fields) changes
+        // nothing about what the report is.
+        let Ok(item) = parse_body(&e.body) else { continue };
+        let is_report = is_evaluation_report_of(&item, &start.frozen.project);
+        if is_report && !was_report && e.seq > start.seq && e.session_id == start.frozen.session {
+            filed = true;
+        }
+        was_report = is_report;
+    }
+    filed
+}
+
+fn is_evaluation_report_of(item: &Item, project: &str) -> bool {
+    item.kind == Kind::Report
+        && item.project.as_deref() == Some(project)
+        && item.tags.iter().any(|t| t == EVALUATION_REPORT_TAG)
+}
+
+/// Whether `start` is still the evaluation running at `now_unix`: not void,
+/// younger than `EVALUATION_OPEN_HOURS`, and its own report not filed yet.
+pub fn evaluation_still_open(store: &EventStore, start: &EvaluationStart, now_unix: i64) -> bool {
+    !start.frozen.is_void()
+        && now_unix - start.frozen.started_unix <= EVALUATION_OPEN_HOURS * 3600
+        && !own_report_filed(store, start)
+}
+
+fn now_unix_secs() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// The open evaluation `session` runs for `project`, read from the log: its
+/// newest start record for that project, when that one is still open
+/// (`evaluation_still_open`). `None` when there is none.
+pub fn open_evaluation_start(store: &EventStore, session: &str, project: &str) -> Option<EvaluationStart> {
+    open_evaluation_start_at(store, session, project, now_unix_secs())
+}
+
+/// `open_evaluation_start`, at a given time.
+pub fn open_evaluation_start_at(store: &EventStore, session: &str, project: &str, now_unix: i64) -> Option<EvaluationStart> {
+    evaluation_starts_of_session(store, session)
+        .into_iter()
+        .filter(|s| s.frozen.project == project)
+        .max_by_key(|s| s.seq)
+        .filter(|s| evaluation_still_open(store, s, now_unix))
+}
+
+/// Every evaluation of `project` still open at `now_unix`, in any session,
+/// oldest first - so a session that opens the routine while another
+/// session's evaluation runs can be told where it runs.
+pub fn open_evaluation_starts_of_project(store: &EventStore, project: &str, now_unix: i64) -> Vec<EvaluationStart> {
+    let Ok(events) = store.events_of_kinds(&[EventKind::FactCreated, EventKind::FactRevised], 0) else { return Vec::new() };
+    let mut newest_per_session: HashMap<String, EvaluationStart> = HashMap::new();
+    for start in starts_in(&events).into_iter().filter(|s| s.frozen.project == project) {
+        newest_per_session.insert(start.frozen.session.clone(), start);
+    }
+    let mut open: Vec<EvaluationStart> =
+        newest_per_session.into_values().filter(|s| evaluation_still_open(store, s, now_unix)).collect();
+    open.sort_by_key(|s| s.seq);
+    open
+}
+
+/// Whether the recorded verification of the write at `seq` says it was made
+/// through an attested THOR call of `session` (its subagents included: their
+/// writes verify under the main session, with an agent id beside it).
+fn attested_for_session(verdicts: &HashMap<i64, WriteVerdict>, seq: i64, session: &str) -> bool {
+    verdicts.get(&seq).is_some_and(|v| v.attested && v.session == session)
 }
 
 /// The tag an evaluation report carries for one item it could not judge,
@@ -3156,78 +4372,168 @@ pub struct EvaluationJudgement {
     pub settled: Vec<String>,
     /// Skipped with a `not-judgeable` reason on the report being filed.
     pub skipped: Vec<String>,
+    /// Of the owed ones: given a verdict (or taken off the rule track) by a
+    /// THOR call of the evaluating session that is not verified yet, as
+    /// (id, log seq of that write). They settle once the turn has ended.
+    pub unverified: Vec<(String, i64)>,
 }
 
-/// The set one evaluation must settle (see `EvaluationScope`), split by
-/// state. `report_tags` are the tags of the report being filed - only its
-/// `not-judgeable` entries are read. FAILS OPEN to an empty result on an
-/// unreadable log, the same stance `all_live_items` takes.
+/// The judgement list of an evaluation of `project` by `session` starting at
+/// log position `started_seq` - what its start record freezes
+/// (`Frozen::judgement`). FAILS OPEN to an empty list on an unreadable log,
+/// the same stance `all_live_items` takes.
 ///
 /// THE SET, computed from the log alone: an item belongs to it when, counting
-/// only events at or before `scope.started_seq`, it had fired
+/// only events at or before `started_seq`, it had fired
 /// `JUDGEMENT_DEBT_AFTER`+ times (assistant deliveries only, exactly as the
-/// store-wide debt counts) since its own last verdict, AND it fired in
-/// `scope.session_id` at least once at or before the start - the same "was
-/// the reader being asked ever in the room" test the Stop hook's own per-turn
-/// ask applies (`EventStore::served_ids_in_session`). It must also still be live, still apply to `project`
-/// and still not be pinned. A firing after the start never adds anything,
-/// whichever session it came from, which is what keeps the evaluation's own
-/// writes - and every rule bound to the `remember` moment they fire - from
-/// growing the list while it is being paid.
-pub fn evaluation_judgement_owed(
-    store: &EventStore,
-    project: Option<&str>,
-    scope: &EvaluationScope,
-    report_tags: &[String],
-) -> EvaluationJudgement {
-    let Ok(events) = store.firings_and_verdicts() else { return EvaluationJudgement::default() };
+/// store-wide debt counts) since its own last ATTESTED verdict, AND it fired
+/// in `session` at least once at or before the start - the same "was the
+/// reader being asked ever in the room" test the Stop hook's own per-turn ask
+/// applies (`EventStore::served_ids_in_session`). It must also still be live,
+/// still apply to `project` and still not be pinned. A firing after the start
+/// never adds anything, whichever session it came from, which is what keeps
+/// the evaluation's own writes - and every rule bound to the `remember` moment
+/// they fire - from growing the list while it is being paid.
+///
+/// ONLY ATTESTED VERDICTS RESET A COUNT HERE (D9): a verdict whose recorded
+/// verification (`attested_write_seqs`) does not say it came through an
+/// attested THOR call - a `serve mark` from a shell, a side-door client, an
+/// older binary - resets nothing, so it cannot shrink the list before the
+/// evaluation even starts.
+pub fn evaluation_judgement_list(store: &EventStore, project: Option<&str>, session: &str, started_seq: i64) -> Vec<String> {
+    let Ok(events) = store.firings_and_verdicts() else { return Vec::new() };
+    let attested = attested_write_seqs(store);
     let mut count_at_start: HashMap<&str, usize> = HashMap::new();
     let mut fired_here: HashSet<&str> = HashSet::new();
-    let mut judged_after: HashSet<&str> = HashSet::new();
-    for (seq, kind, id, actor, session) in &events {
-        let after = *seq > scope.started_seq;
+    for (seq, kind, id, actor, event_session) in &events {
+        if *seq > started_seq {
+            continue;
+        }
         match kind {
-            EventKind::ItemServed if !after && actor == ASSISTANT_DELIVERY_ACTOR => {
+            EventKind::ItemServed if actor == ASSISTANT_DELIVERY_ACTOR => {
                 *count_at_start.entry(id.as_str()).or_default() += 1;
-                if *session == scope.session_id {
+                if event_session == session {
                     fired_here.insert(id.as_str());
                 }
             }
-            EventKind::ItemMarkedUseful | EventKind::ItemMarkedNoise => {
-                if after {
-                    judged_after.insert(id.as_str());
-                } else {
-                    count_at_start.insert(id.as_str(), 0);
-                }
+            EventKind::ItemMarkedUseful | EventKind::ItemMarkedNoise if attested.contains(seq) => {
+                count_at_start.insert(id.as_str(), 0);
             }
             _ => {}
         }
     }
     let live = all_live_items(store);
     let live_by_id: HashMap<&str, &Item> = live.iter().map(|(id, it)| (id.as_str(), it)).collect();
-    let mut result = EvaluationJudgement::default();
-    let mut ids: Vec<&str> = count_at_start
+    let mut ids: Vec<String> = count_at_start
         .iter()
         .filter(|(id, count)| **count >= JUDGEMENT_DEBT_AFTER && fired_here.contains(**id))
-        .map(|(id, _)| *id)
+        .filter_map(|(id, _)| {
+            let item = live_by_id.get(id)?;
+            let pinned = item.bindings.iter().any(|b| matches!(b, Binding::Always));
+            (!pinned && project_applies_to(item.project.as_deref(), project)).then(|| id.to_string())
+        })
         .collect();
     ids.sort();
-    for id in ids {
-        let Some(item) = live_by_id.get(id) else {
-            // Retracted since: a verdict on something gone is no verdict,
-            // and nothing is left to ask about.
-            result.settled.push(id.to_string());
+    ids
+}
+
+/// The set one evaluation must settle, split by state. `report_tags` are the
+/// tags of the report being filed - only its `not-judgeable` entries are
+/// read. FAILS OPEN to an empty result on an unreadable log, the same stance
+/// `all_live_items` takes.
+///
+/// THE LIST is the one the evaluation's start record froze
+/// (`Frozen::judgement`): what fired in the evaluating session before it
+/// started. Measured on 2026-09-26, before the list was frozen: a session
+/// filed its report eight times and was refused eight times, each time on a
+/// different, growing list (14, 6, 13, 4, 4, 1, 5, 4) - the evaluation's own
+/// writes and parallel sessions kept pushing items over the threshold - and
+/// it ended up marking sixty items useful, some it had never seen fire.
+///
+/// WHAT SETTLES AN ITEM ON IT (step 13), each read from the RECORDED
+/// verification of a write (`recorded_write_verdicts`), never from who the
+/// log says wrote it:
+/// - a verdict (`mark`) after the start whose verification says it came
+///   through an attested THOR call of the evaluating session (its subagents
+///   included). A verdict from another session, or one outside an attested
+///   call (a `serve mark` from a shell, a side-door client), settles nothing;
+/// - the item gone from the rule track since the start - retracted, archived,
+///   or revised into a Report (folding a duplicate into another item is
+///   legitimate work) - when the write that took it off is attested for the
+///   evaluating session. The same change through any other door settles
+///   nothing: the item stays owed, and the report can still skip it with a
+///   reason (`not-judgeable`);
+/// - a `not-judgeable:<id>:<reason>` tag on the report skips it for this
+///   filing (the item stays owed store-wide).
+///
+/// A PINNED item is skipped: neither owed nor settled (mark refuses a pinned
+/// item, so a verdict could never be given).
+pub fn evaluation_judgement_owed(store: &EventStore, start: &EvaluationStart, report_tags: &[String]) -> EvaluationJudgement {
+    let project = Some(start.frozen.project.as_str());
+    let session = start.frozen.session.as_str();
+    let started_seq = start.frozen.started_seq;
+    let list = start.frozen.judgement.clone();
+    let live = all_live_items(store);
+    let live_by_id: HashMap<&str, &Item> = live.iter().map(|(id, it)| (id.as_str(), it)).collect();
+    let mut result = EvaluationJudgement::default();
+    for id in list {
+        let Ok(events) = store.get_events_by_entity(&id) else {
+            result.owed.push(id);
             continue;
         };
+        let verified = recorded_write_verdicts(&events);
+        let after = |e: &&Event| e.seq > started_seq;
+        // Archived, or revised into a Report, since the start: its head then
+        // is a Report while the one it had at the start was not.
+        let kind_at_start = events
+            .iter()
+            .filter(|e| e.seq <= started_seq && writes_the_item(e.kind))
+            .filter_map(|e| parse_body(&e.body).ok())
+            .last()
+            .map(|item| item.kind);
+        let gone = match live_by_id.get(id.as_str()) {
+            None => true,
+            Some(item) => item.kind == Kind::Report && kind_at_start.is_some_and(|k| k != Kind::Report),
+        };
+        if gone {
+            // Gone since the start: settled only when the write that took it
+            // off the rule track is the evaluating session's own attested call.
+            let last_write = events
+                .iter()
+                .filter(after)
+                .filter(|e| writes_the_item(e.kind) || e.kind == EventKind::FactRetracted)
+                .max_by_key(|e| e.seq);
+            if last_write.is_some_and(|e| attested_for_session(&verified, e.seq, session)) {
+                result.settled.push(id);
+            } else if not_judgeable_reason(report_tags, &id).is_some() {
+                result.skipped.push(id);
+            } else {
+                if let Some(e) = last_write.filter(|e| write_door(e, &verified, session) == WriteDoor::Pending) {
+                    result.unverified.push((id.clone(), e.seq));
+                }
+                result.owed.push(id);
+            }
+            continue;
+        }
+        let item = live_by_id[id.as_str()];
         if item.bindings.iter().any(|b| matches!(b, Binding::Always)) || !project_applies_to(item.project.as_deref(), project) {
             continue;
         }
-        if judged_after.contains(id) {
-            result.settled.push(id.to_string());
-        } else if not_judgeable_reason(report_tags, id).is_some() {
-            result.skipped.push(id.to_string());
+        let marks: Vec<&Event> = events
+            .iter()
+            .filter(after)
+            .filter(|e| matches!(e.kind, EventKind::ItemMarkedUseful | EventKind::ItemMarkedNoise))
+            .collect();
+        let judged = marks.iter().any(|e| attested_for_session(&verified, e.seq, session));
+        if judged {
+            result.settled.push(id);
+        } else if not_judgeable_reason(report_tags, &id).is_some() {
+            result.skipped.push(id);
         } else {
-            result.owed.push(id.to_string());
+            if let Some(e) = marks.iter().rev().find(|e| write_door(e, &verified, session) == WriteDoor::Pending) {
+                result.unverified.push((id.clone(), e.seq));
+            }
+            result.owed.push(id);
         }
     }
     result
@@ -3236,12 +4542,13 @@ pub fn evaluation_judgement_owed(
 /// The highest creation seq among this project's own live evaluation
 /// reports - `0` when it has none yet, so "since the previous report" reads
 /// as "since the beginning of the log" for a project's first-ever
-/// evaluation. Mirrors `serve::usefulness::newest_evaluation_report`'s own
-/// EXACT-project match (never `project_applies_to`'s "or global" rule: a
-/// report filed for one project must never silence another's debt),
-/// reimplemented for the identical reason every other function in this
-/// section is.
-fn newest_evaluation_report_seq(store: &EventStore, project: Option<&str>) -> i64 {
+/// evaluation. EXACT-project match (never `project_applies_to`'s "or global"
+/// rule: a report filed for one project must never silence another's debt).
+/// It only orders the machine pass ("fired since the previous report") and
+/// doctor's batch preview; whether a report COUNTS as the project's
+/// evaluation is the Stop-time validator's answer
+/// (`serve::eval_filing::newest_valid_evaluation`, step 16).
+pub fn newest_evaluation_report_seq(store: &EventStore, project: Option<&str>) -> i64 {
     all_live_items(store)
         .into_iter()
         .filter(|(_, item)| item.kind == Kind::Report)
@@ -3252,7 +4559,9 @@ fn newest_evaluation_report_seq(store: &EventStore, project: Option<&str>) -> i6
         .unwrap_or(0)
 }
 
-/// How many heavy rules one evaluation filing is held to.
+/// How many rules that need a fix from the agent one evaluation filing is
+/// held to (since step 14: the ones THOR's machine pass could not decide
+/// itself, beside the A4 list of `EVALUATION_A4_LIST`).
 ///
 /// WHY A BATCH (2026-09-26). The filing gate used to demand every heavy rule
 /// that fired since the previous report, all at once. Measured on a copy of a
@@ -3293,8 +4602,11 @@ pub struct TeethBatch {
     pub owed_later: Vec<(String, String)>,
 }
 
-/// The batch the NEXT evaluation report for `project` is held to - what the
-/// filing gate refuses on, and what `doctor` shows.
+/// The rules of `project` with no verdict, first eight first - doctor's
+/// PREVIEW of what the next evaluation start will try (step 14: THOR's
+/// machine pass decides what it can, and the frozen batch holds only what
+/// needs the agent), and what the filing gate falls back to for a scope with
+/// no start record.
 pub fn evaluation_teeth_batch(store: &EventStore, project: Option<&str>) -> TeethBatch {
     teeth_batch_since(store, project, newest_evaluation_report_seq(store, project))
 }
@@ -3366,7 +4678,7 @@ fn teeth_batch_since(store: &EventStore, project: Option<&str>, cutoff_seq: i64)
         .filter(|(_, item)| project_applies_to(item.project.as_deref(), project))
     {
         let key = last_write_by_cutoff.get(id.as_str()).or_else(|| first_write.get(id.as_str())).copied().unwrap_or(i64::MAX);
-        match settlement(store, &id) {
+        match settlement(store, &id, None) {
             Settlement::Owed { why } => {
                 if fired_after.contains(&id) {
                     fired_owed.push((key, id, why));
@@ -3438,171 +4750,222 @@ pub fn retest_command_for(db: Option<&Path>, id: &str) -> String {
     format!("{program} --db \"{}\" retest --id '{id}'", db_argument(db))
 }
 
-/// Every live open point for `project`, exactly scoped (never `project_
-/// applies_to`'s "or global" rule - the same reason `newest_evaluation_
-/// report_seq` is exact) whose own creation seq is at or before
-/// `cutoff_seq` (it already existed as of the previous report - a point
-/// raised THIS session, while preparing the report about to be filed, is
-/// never held against that same filing) and that has not been carried
-/// forward since that previous report. It keeps being handed to the session
-/// regardless (`serve::bin::serve`'s own open-points messages), so it is
-/// never silently forgotten.
-///
-/// A CARRY BUYS ONE CYCLE, NOT FOREVER (2026-09-26). A point carried once
-/// used to stop blocking for good the moment its tag read `carried:1` - one
-/// revise, and the point could ride along unanswered through every later
-/// evaluation. Now the carry is dated: it covers the ONE filing that follows
-/// it. Once a report has been filed after the carry, the point blocks again,
-/// and since a second carry is refused (`gate::revise`, ground 30) the only
-/// way on is to close it, or to take it to the owner.
-fn open_points_needing_action(store: &EventStore, project: Option<&str>, cutoff_seq: i64) -> Vec<String> {
-    let mut out: Vec<String> = all_live_items(store)
-        .into_iter()
-        .filter(|(_, item)| item.kind == Kind::Report)
-        .filter(|(_, item)| item.project.as_deref() == project)
-        .filter(|(_, item)| item.tags.iter().any(|t| t == OPEN_POINT_TAG))
-        .filter(|(id, _)| {
-            let Ok(events) = store.get_events_by_entity(id) else { return false };
-            let Some(created) = events.first().map(|e| e.seq) else { return false };
-            if created > cutoff_seq {
-                return false;
-            }
-            // The first revision that recorded a carry, if any.
-            let carried_at = events
-                .iter()
-                .filter(|e| e.kind == EventKind::FactRevised)
-                .find(|e| parse_body(&e.body).is_ok_and(|item| open_point_carried_count(&item.tags) >= 1))
-                .map(|e| e.seq);
-            match carried_at {
-                None => true,
-                Some(seq) => seq <= cutoff_seq,
-            }
-        })
-        .map(|(id, _)| id)
-        .collect();
-    out.sort();
-    out
-}
-
-/// One live open point, as handed to a reader rather than only to the
-/// filing gate above: its id (so a writer can `retract` or `revise` it),
-/// its one-sentence text, and how many times it has already been carried
-/// forward (`open_point_carried_count`) - `serve::bin::serve`'s own
-/// SessionStart and evaluation-debt messages format this, never the raw
-/// `Item`, so a display change on either surface never has to relearn the
-/// tag shape.
+/// One live open point, as handed to a reader: its id, its text, and whether
+/// it is THOR's own (`machine`, with its subject and blocker code) or a legacy
+/// one an agent filed before step 14 (with the carried count its tags record).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenPoint {
     pub id: String,
     pub text: String,
+    /// A legacy point's `carried:<n>` tag; always 0 for THOR's own.
     pub carried: u32,
+    /// Written by `eval-machine` on a reserved id: THOR's own point. Every
+    /// other open point is legacy - it settles nothing and holds no filing.
+    pub machine: bool,
+    /// What a machine point is about (its `about:` tag).
+    pub subject: Option<String>,
+    /// The blocker a machine point holds rules by (its `blocker:` tag).
+    pub blocker: Option<String>,
 }
 
-/// Every live open point scoped EXACTLY to `project` (never `project_
-/// applies_to`'s "or global" rule - an open point belongs to the project
-/// that raised it, the same exact-match every other function in this
-/// section uses), oldest first (ascending creation seq, so the point that
-/// has waited longest leads) - a failed per-item seq lookup sorts an item
-/// last rather than dropping it, so a read glitch narrows the order, never
-/// the membership.
+/// Whether the live head of `id` is one of THOR's own open points: a reserved
+/// id whose current head was written by `eval-machine`. An item that merely
+/// looks like one - the tags, or the id, written by anyone else before the
+/// fence existed - is not.
+pub fn is_machine_point(store: &EventStore, id: &str) -> bool {
+    if !is_machine_point_id(id) {
+        return false;
+    }
+    let Ok(events) = store.get_events_by_entity(id) else { return false };
+    let heads = thor_core::cas::compute_head_sets(&events);
+    let Some(set) = heads.get(id).filter(|set| set.heads.len() == 1) else { return false };
+    set.heads
+        .iter()
+        .next()
+        .and_then(|hash| events.iter().find(|e| &e.this_hash == hash))
+        .is_some_and(|head| head.actor == EVAL_MACHINE_ACTOR && head.kind != EventKind::FactRetracted)
+}
+
+/// Every live open point scoped EXACTLY to `project` (an open point belongs
+/// to the project it is about): THOR's own first, then the legacy ones, each
+/// group oldest first (ascending creation seq; a failed seq lookup sorts an
+/// item last rather than dropping it).
 pub fn open_points(store: &EventStore, project: Option<&str>) -> Vec<OpenPoint> {
-    let mut with_seq: Vec<(i64, OpenPoint)> = all_live_items(store)
+    let mut with_seq: Vec<(bool, i64, OpenPoint)> = all_live_items(store)
         .into_iter()
         .filter(|(_, item)| item.kind == Kind::Report)
         .filter(|(_, item)| item.project.as_deref() == project)
         .filter(|(_, item)| item.tags.iter().any(|t| t == OPEN_POINT_TAG))
         .map(|(id, item)| {
             let seq = store.get_events_by_entity(&id).ok().and_then(|e| e.first().map(|e| e.seq)).unwrap_or(i64::MAX);
-            let carried = open_point_carried_count(&item.tags);
-            (seq, OpenPoint { id, text: item.text, carried })
+            let machine = is_machine_point(store, &id);
+            let tagged = |prefix: &str| item.tags.iter().find_map(|t| t.strip_prefix(prefix)).map(str::to_string);
+            let point = OpenPoint {
+                carried: if machine { 0 } else { open_point_carried_count(&item.tags) },
+                subject: if machine { tagged(OPEN_POINT_ABOUT_PREFIX) } else { None },
+                blocker: if machine { tagged(OPEN_POINT_BLOCKER_PREFIX) } else { None },
+                machine,
+                id,
+                text: item.text,
+            };
+            (!machine, seq, point)
         })
         .collect();
-    with_seq.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.id.cmp(&b.1.id)));
-    with_seq.into_iter().map(|(_, p)| p).collect()
+    with_seq.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then_with(|| a.2.id.cmp(&b.2.id)));
+    with_seq.into_iter().map(|(_, _, p)| p).collect()
 }
 
-/// THE GATE ITSELF. `Ok(None)` for every write that is not an evaluation
-/// report (`item.kind != Kind::Report`, or a `Report` with no
-/// `EVALUATION_REPORT_TAG`) - untouched. For one that is, the three
-/// conditions this section's own top-of-file doc comment names, each
-/// computed fresh from the event log; `Ok(Some(refusal))` names every
-/// condition that is not yet met, with the concrete action that settles it,
-/// never just the first one found (the same "collect every problem, not
-/// just the first" stance `gate::declare_inner`'s own doc comment explains
-/// and measures).
+/// The rules of `start`'s frozen batch and A4 list that `settlement` still
+/// calls owed for this evaluation, each with its reason, in the order they
+/// were frozen - what the filing gate holds that report to in teeth. Nothing
+/// outside the frozen ids is read: a rule on a list that settles never pulls
+/// the next owed rule in, and a rule the machine pass did not reach is not
+/// this evaluation's.
+pub fn evaluation_frozen_batch_owed(store: &EventStore, start: &EvaluationStart) -> Vec<(String, String)> {
+    start
+        .frozen
+        .batch()
+        .iter()
+        .chain(start.frozen.a4_list())
+        .filter_map(|id| match settlement(store, id, Some(start)) {
+            Settlement::Owed { why } => Some((id.clone(), why)),
+            Settlement::Settled(_) => None,
+        })
+        .collect()
+}
+
+/// What the filing gate answers while THOR's machine pass has not finished
+/// for this evaluation (its start record holds no batch yet).
+pub const STILL_DECIDING: &str =
+    "THOR is still deciding the old rules - end this turn once and the start note will list what is yours to do";
+
+/// THE GATE ITSELF. `None` for every write that is not an evaluation report
+/// (`item.kind != Kind::Report`, or a `Report` with no
+/// `EVALUATION_REPORT_TAG`) - untouched. For one that is, every condition is
+/// computed fresh from the event log; `Some(refusal)` names every condition
+/// that is not yet met, with the concrete action that settles it, never just
+/// the first one found (the same "collect every problem, not just the first"
+/// stance `gate::declare_inner`'s own doc comment explains and measures).
 ///
-/// `item.project` is read as given rather than asserted `Some`: `gate::
-/// declare`'s own ground 21 already refuses a scopeless `Report`, but this
-/// function is cheap to make correct for a scopeless one too (every helper
-/// above already takes `Option<&str>`) rather than relying on a guarantee
-/// from a call it does not control the order against.
-///
-/// THE JUDGEMENT CONDITION IS SCOPED (2026-09-26): only the set
-/// `evaluation_judgement_owed` fixes for `scope` - what fired in the filing
-/// session before its evaluation started. `scope: None` (no hook record of
-/// which session files this) demands no verdict at all; see
-/// `EvaluationScope`'s own doc comment for why that is the honest answer.
-fn check_evaluation_report_filing(store: &EventStore, item: &Item, scope: Option<&EvaluationScope>) -> Option<Refusal> {
-    if item.kind != Kind::Report || !item.tags.iter().any(|t| t == EVALUATION_REPORT_TAG) {
+/// IN ORDER (step 15):
+/// - `ctx: None` - the write brings no filing context (`FilingContext`): the
+///   model CLI, a replica's drain, a one-off binary, a test without an
+///   attested fixture, the tool server on a side door. REFUSED, never waived:
+///   such a report could never count.
+/// - the evaluation is void, or an item on its frozen lists (or its start
+///   record) was written in its window outside an attested THOR call of the
+///   evaluating session and not by one of THOR's own actors (D10): refused -
+///   an evaluation whose list was changed behind it cannot count. The tool
+///   server then closes the start record as void (`record_evaluation_void`).
+/// - THOR's machine pass has not finished (the start record holds no batch:
+///   the hook was killed between its two writes): nothing can be filed yet,
+///   and the session's next Stop finishes the pass.
+/// - the frozen judgement list (`evaluation_judgement_owed`) and the frozen
+///   batch and A4 list (`evaluation_frozen_batch_owed`) are settled. Only the
+///   frozen ids are read. Every verdict and every write that settles one is
+///   judged by its RECORDED attestation; a write of the filing turn has none
+///   yet, counts as not yet attested, and the refusal says to end the turn
+///   once (`TURN_NOT_ENDED`).
+fn check_evaluation_report_filing(store: &EventStore, item: &Item, ctx: Option<&FilingContext>) -> Option<Refusal> {
+    if !gate::is_evaluation_report(item) {
         return None;
     }
-    let project = item.project.as_deref();
+    let Some(ctx) = ctx else {
+        return Some(unattested_filing_refusal(
+            "this write carries no filing context: no THOR tool call with an open evaluation behind it is making it",
+        ));
+    };
+    let start = &ctx.start;
+    if item.project.as_deref() != Some(start.frozen.project.as_str()) {
+        return Some(Refusal {
+            problem: format!(
+                "this evaluation report is scoped to '{}', but the evaluation this session has open ('{}') is of '{}'",
+                item.project.as_deref().unwrap_or("no project"),
+                start.id,
+                start.frozen.project
+            ),
+            fix: format!("file it with project '{}', the project the open evaluation is of", start.frozen.project),
+        });
+    }
+    if let Some(void) = &start.frozen.void {
+        return Some(changed_behind_refusal(void));
+    }
+    let written = frozen_writes_in_window(store, start, None);
+    if let Some(outside) = written.outside.first() {
+        return Some(changed_behind_refusal(outside));
+    }
+    if !start.frozen.decided() {
+        return Some(Refusal {
+            problem: format!("this evaluation report cannot be filed yet: {STILL_DECIDING}"),
+            fix: "nothing to file yet: the next Stop finishes THOR's pass over the old rules and shows the start note \
+                  with the batch - do what it lists, then file this report again"
+                .to_string(),
+        });
+    }
     let mut missing: Vec<String> = Vec::new();
 
-    let judgement = scope.map(|scope| (scope, evaluation_judgement_owed(store, project, scope, &item.tags)));
-    if let Some((scope, judgement)) = judgement.as_ref().filter(|(_, j)| !j.owed.is_empty()) {
+    let judgement = evaluation_judgement_owed(store, start, &item.tags);
+    if !judgement.owed.is_empty() {
         let named = judgement.owed.iter().map(|id| format!("'{id}'")).collect::<Vec<_>>().join(", ");
         missing.push(format!(
             "{} item(s) fired in this session before this evaluation started (log position {}) and still owe a \
              judgement - each had fired {JUDGEMENT_DEBT_AFTER}+ times since its last verdict by then: {named}. This \
              list was fixed when the evaluation started and cannot grow: nothing that fires after that, and nothing \
-             that fired only in another session, is this report's to settle. For each one, read where it fired \
-             (`get` shows the item) and decide whether it belonged there: mcp__thor__mark(id: \"<id>\") when it \
+             that fired only in another session, is this report's to settle. Only a verdict this session gives \
+             through the THOR tool itself counts - one from another session, or from a shell or a script, settles \
+             nothing - and a verdict given in this turn counts once the turn has ended (THOR checks it against the \
+             session's transcript at the Stop), so end the turn once before filing again. For each one, read where \
+             it fired (`get` shows the item) and decide whether it belonged there: mcp__thor__mark(id: \"<id>\") when it \
              did, mcp__thor__mark(id: \"<id>\", noise: true) when it did not. If you cannot honestly judge one \
              here, do not guess - add the tag '{NOT_JUDGEABLE_TAG_PREFIX}<id>:<reason>' to this report (a reason \
              of at least {NOT_JUDGEABLE_REASON_MIN_CHARS} characters); it then stays owed store-wide instead. A \
              verdict you did not read the item for is a false record, and it is worse than the debt",
             judgement.owed.len(),
-            scope.started_seq
+            start.frozen.started_seq
         ));
     }
 
-    let cutoff_seq = newest_evaluation_report_seq(store, project);
-    let batch = teeth_batch_since(store, project, cutoff_seq);
-    if !batch.owed_now.is_empty() {
-        let named = batch.owed_now.iter().map(|(id, why)| format!("'{id}' ({why})")).collect::<Vec<_>>().join(", ");
-        let later = match batch.owed_later.len() {
+    // THE BATCH AND THE A4 LIST: the ones the start record holds - a rule on
+    // them that settles never pulls the next owed rule in, so the lists the
+    // session was shown at the start are the whole of what it is held to.
+    let owed_now = evaluation_frozen_batch_owed(store, start);
+    if !owed_now.is_empty() {
+        let named = owed_now.iter().map(|(id, why)| format!("'{id}' ({why})")).collect::<Vec<_>>().join(", ");
+        let later = match start.frozen.batch_later {
             0 => String::new(),
             n => format!(
                 " {n} more rule(s) in the same state are not this report's to settle: they stay owed, doctor names \
                  them, and a later evaluation asks for them first."
             ),
         };
-        let first = &batch.owed_now[0].0;
+        let first = &owed_now[0].0;
         missing.push(format!(
-            "{} rule(s) in this report's batch (at most {EVALUATION_TEETH_BATCH}, the ones written longest ago \
-             first; every live rule and orientation counts, whatever its weight) apply to this project (its own or \
-             global) and have no current verdict from THOR's trial: {named}.{later} What settles one, and nothing \
-             else does: THOR's trial, run on the rule as it stands. See what it decides with `{}` - it prints the \
-             registered working copy it used, every attempt, and a rule, a note, or the one fix you have to make \
-             yourself - then run the same command with --apply to write the rule or the note it decided. Or \
-             mcp__thor__revise with only the rule's id, which runs the same trial and writes its verdict. A tag, a \
-             reason, an open point, a refusal on record or a probe settles nothing. Retract the rule with a reason if \
-             it is simply wrong",
-            batch.owed_now.len(),
+            "{} rule(s) on this evaluation's frozen lists (the batch of at most {EVALUATION_TEETH_BATCH} rules that \
+             need your fix and the A4 list of at most {EVALUATION_A4_LIST} whose text must name its check's literal, \
+             both fixed by THOR's pass at the start) apply to this project (its own or global) and have no current \
+             verdict from THOR's trial: {named}.{later} What settles one, and nothing else does: THOR's trial, run on \
+             the rule as it stands. See what it decides with `{}` - it prints the registered working copy it used, \
+             every attempt, and a rule, a note, or the one fix you have to make yourself - then run the same command \
+             with --apply to write the rule or the note it decided. Or mcp__thor__revise with only the rule's id, \
+             which runs the same trial and writes its verdict. A tag, a reason, an open point, a refusal on record or \
+             a probe settles nothing. Retract the rule with a reason if it is simply wrong",
+            owed_now.len(),
             retest_command_for(store.path().as_deref(), first)
         ));
     }
 
-    let stuck = open_points_needing_action(store, project, cutoff_seq);
-    if !stuck.is_empty() {
-        let named = stuck.iter().map(|id| format!("'{id}'")).collect::<Vec<_>>().join(", ");
+    // WRITES OF THE FILING TURN: stamped as this session's own THOR calls,
+    // not verified yet. They count as not yet attested, and ending the turn
+    // once is the whole of what settles them.
+    let mut unverified: Vec<String> =
+        judgement.unverified.iter().map(|(id, seq)| format!("'{id}' (its verdict at log seq {seq})")).collect();
+    unverified.extend(written.pending.iter().map(|(id, seq)| format!("'{id}' (written at log seq {seq})")));
+    if !unverified.is_empty() {
         missing.push(format!(
-            "{} open point(s) from an earlier report are still neither closed nor carried: {named} - retract \
-             each with a reason if it is resolved, or revise it to add the tag '{}1' if it is being carried \
-             forward for the first time",
-            stuck.len(),
-            OPEN_POINT_CARRIED_PREFIX
+            "{} write(s) of this turn on this evaluation's lists are not checked yet: {}. {TURN_NOT_ENDED} - THOR reads \
+             each call back from this session's transcript at the Stop, and until then it counts as not yet attested",
+            unverified.len(),
+            unverified.join(", ")
         ));
     }
 
@@ -3614,8 +4977,782 @@ fn check_evaluation_report_filing(store: &EventStore, item: &Item, scope: Option
         fix: "settle every item named above by doing the work it names, then file this report again - each \
               condition is computed fresh from the log and from the items themselves, never from what this \
               report's own text says, so nothing here can be answered by rewording the report or by relabelling \
-              in bulk"
+              in bulk. For a write that is only waiting to be checked, ending the turn once is the whole of it"
             .to_string(),
+    })
+}
+
+/// The filing gate's answer for `item` under `ctx`, exactly as a filing would
+/// get it (`check_evaluation_report_filing`), without writing anything. For
+/// the Stop-time validator (step 16), which recomputes it on the log
+/// truncated at the filing's own log position (`EventStore::truncated_copy`)
+/// with the evaluation start as it stood there.
+pub fn evaluation_filing_refusal(store: &EventStore, item: &Item, ctx: Option<&FilingContext>) -> Option<Refusal> {
+    check_evaluation_report_filing(store, item, ctx)
+}
+
+/// What an agent text that carries one of THOR's two section headers is told
+/// at the filing.
+fn typed_header_refusal() -> Refusal {
+    Refusal {
+        problem: format!(
+            "the text of this evaluation report carries a section header only THOR writes ('{}' or '{}')",
+            gate::MACHINE_SECTION_MARK,
+            gate::AGENT_SECTION_BEGIN
+        ),
+        fix: "take those lines out and send only your own TLDR and remarks: THOR writes the machine section above \
+              them itself, from its log, when the report is filed"
+            .to_string(),
+    }
+}
+
+/// THE FILING OF AN EVALUATION REPORT (step 15). `Ok(None)` for a write that
+/// is not one. For one that is: the filing gate
+/// (`check_evaluation_report_filing`), and - when it passes - the item as it
+/// is STORED: THOR's machine section for this evaluation
+/// (`render_machine_section`, derived from the log up to its tip right now),
+/// a blank line, `gate::AGENT_SECTION_BEGIN`, a newline, and the writer's own
+/// text. `carried` is the machine block the report had before, for a revise
+/// that files an existing report again: when the writer's text still opens
+/// with it, only what follows it is the writer's own. A writer's text that
+/// carries either header is refused - only THOR writes them.
+fn filed_evaluation_report(
+    store: &EventStore,
+    item: &Item,
+    carried: Option<&str>,
+    ctx: Option<&FilingContext>,
+) -> Result<Option<Item>, Refusal> {
+    if !gate::is_evaluation_report(item) {
+        return Ok(None);
+    }
+    let own_text = match carried {
+        Some(block) if item.text.starts_with(block) => &item.text[block.len()..],
+        _ => item.text.as_str(),
+    };
+    if ctx.is_some() && gate::names_a_section_header(own_text) {
+        return Err(typed_header_refusal());
+    }
+    if let Some(refusal) = check_evaluation_report_filing(store, item, ctx) {
+        return Err(refusal);
+    }
+    let Some(ctx) = ctx else { return Ok(None) };
+    let filed_seq = store.get_next_seq().map(|next| next - 1).unwrap_or(ctx.start.frozen.started_seq);
+    let machine = render_machine_section(store, &ctx.start, filed_seq);
+    let mut filed = item.clone();
+    filed.text = format!("{machine}\n\n{}\n{own_text}", gate::AGENT_SECTION_BEGIN);
+    Ok(Some(filed))
+}
+
+// ------------------------------------------------ the machine section (step 15, B1)
+//
+// WHAT IT CLOSES. An evaluation report was whatever its session typed.
+// Measured on a store copy: get showed "TLDR: evaluation of fxp. Nothing to
+// add." and nothing else, and a revise could rewrite all of it. Now the first
+// part of every filed report is written by THOR, from its event log alone:
+// what was on the frozen lists, who judged what, how each rule settled, what
+// was retracted or weakened in the window, and every write that came in
+// through a side door.
+//
+// PURE, FROM THE LOG TRUNCATED AT F. `render_machine_section(store, start,
+// filed_seq)` reads only events with seq <= `filed_seq` - the attester's
+// recorded verifications written before it included - and never a live
+// transcript, a file of the working copy or the clock. So the filing and the
+// Stop-time validation (step 16) render the same bytes, and a later event
+// changes nothing about a section already written. `filed_seq` (F) is the
+// log's tip when the filing was made; the report's own event comes after it.
+
+/// What a filing's receipt says about its machine section, in numbers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MachineSummary {
+    /// N: where the evaluation started.
+    pub started_seq: i64,
+    /// F: the log's tip the section was derived at.
+    pub filed_seq: i64,
+    /// How many items the frozen judgement list held.
+    pub listed: usize,
+    pub useful: usize,
+    pub noise: usize,
+    /// No verdict from this evaluation: skipped with a reason on the report.
+    pub skipped: usize,
+    /// Retracted, archived or moved to a Report by an attested call.
+    pub gone: usize,
+    /// Pinned since the start: owes no verdict.
+    pub pinned: usize,
+    /// How many rules the frozen batch and A4 list held together.
+    pub teeth_listed: usize,
+    /// Writes in the window outside an attested THOR call.
+    pub side_doors: usize,
+    /// Writes in the window whose check is still to come.
+    pub unverified: usize,
+}
+
+/// One line of machine-section text out of words some writer chose (an id, a
+/// reason, a door): plain ASCII on one line, at most 200 characters. A
+/// character outside printable ASCII is written as its code point, so the
+/// section never carries a glyph, a line break or a control character.
+fn plain(text: &str) -> String {
+    let mut out = String::new();
+    for c in text.chars() {
+        if c == ' ' || c.is_ascii_graphic() {
+            out.push(c);
+        } else if c.is_whitespace() || c.is_control() {
+            out.push(' ');
+        } else {
+            out.push_str(&format!("U+{:04X}", c as u32));
+        }
+    }
+    let collapsed = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() > 200 {
+        format!("{}...", collapsed.chars().take(200).collect::<String>())
+    } else {
+        collapsed
+    }
+}
+
+/// Who made an attested write: the main session, or one of its subagents.
+fn by_whom(agent_id: &Option<String>) -> String {
+    match agent_id {
+        Some(agent) => format!("agent {}", plain(agent)),
+        None => "the main session".to_string(),
+    }
+}
+
+/// The door of a write, in words for the machine section.
+fn door_words(door: &WriteDoor) -> String {
+    match door {
+        WriteDoor::Machine => "THOR itself".to_string(),
+        WriteDoor::Attested { agent_id } => format!("an attested THOR call of {}", by_whom(agent_id)),
+        WriteDoor::Pending => "a THOR call of this session, checked at the end of this turn".to_string(),
+        WriteDoor::Outside(door) => plain(door),
+    }
+}
+
+/// A severity in words.
+fn severity_name(severity: Option<Severity>) -> &'static str {
+    match severity {
+        Some(Severity::Irreversible) => "irreversible",
+        Some(Severity::Costly) => "costly",
+        Some(Severity::HouseStyle) => "house_style",
+        None => "none",
+    }
+}
+
+/// The log as it stood at log seq `until`: each entity's own events, read
+/// once (indexed) and truncated there.
+struct LogAt<'a> {
+    store: &'a EventStore,
+    until: i64,
+    entities: std::cell::RefCell<HashMap<String, std::rc::Rc<Vec<Event>>>>,
+}
+
+impl<'a> LogAt<'a> {
+    fn new(store: &'a EventStore, until: i64) -> Self {
+        LogAt { store, until, entities: std::cell::RefCell::new(HashMap::new()) }
+    }
+
+    /// Every event on `id` at or before `until`, oldest first.
+    fn entity(&self, id: &str) -> std::rc::Rc<Vec<Event>> {
+        if let Some(found) = self.entities.borrow().get(id) {
+            return found.clone();
+        }
+        let events: Vec<Event> =
+            self.store.get_events_by_entity(id).unwrap_or_default().into_iter().filter(|e| e.seq <= self.until).collect();
+        let events = std::rc::Rc::new(events);
+        self.entities.borrow_mut().insert(id.to_string(), events.clone());
+        events
+    }
+}
+
+/// The item `events` (one entity's, oldest first) held just before log seq
+/// `before`: the body of its last write that parses as one. `None` when it
+/// had none, or its last write then was a retraction.
+fn item_before(events: &[Event], before: i64) -> Option<Item> {
+    let last = events.iter().filter(|e| e.seq < before && changes_an_item(e.kind)).next_back()?;
+    if last.kind == EventKind::FactRetracted {
+        return None;
+    }
+    events.iter().filter(|e| e.seq <= last.seq && changes_an_item(e.kind)).filter_map(|e| parse_body(&e.body).ok()).next_back()
+}
+
+/// How one rule on the frozen batch or A4 list stood at F, from its own
+/// events alone.
+fn settled_how(events: &[Event], started_seq: i64, session: &str) -> String {
+    let verdicts = recorded_write_verdicts(events);
+    let window: Vec<&Event> = events.iter().filter(|e| e.seq > started_seq && changes_an_item(e.kind)).collect();
+    let door = |e: &Event| door_words(&write_door(e, &verdicts, session));
+    if let Some(gone) = window.iter().rev().find(|e| e.kind == EventKind::FactRetracted) {
+        if events.iter().filter(|e| changes_an_item(e.kind)).next_back().is_some_and(|last| last.seq == gone.seq) {
+            return format!("retracted at log seq {} by {} - reason: {}", gone.seq, door(gone), plain(&tombstone_reason(&gone.body)));
+        }
+    }
+    let now = item_before(events, i64::MAX);
+    if let Some(item) = now.as_ref().filter(|item| !item.kind.can_fire()) {
+        let seq = window.last().map(|e| e.seq).unwrap_or(0);
+        let door = window.last().map(|e| door(e)).unwrap_or_default();
+        return format!("taken off the rule track at log seq {seq} by {door} (now a {:?})", item.kind);
+    }
+    let tried = window.iter().rev().find_map(|e| match trial_of(e) {
+        Ok(Some(record)) => Some((*e, record)),
+        _ => None,
+    });
+    match (tried, now) {
+        (Some((event, record)), Some(item)) if record.fields().fingerprint == fingerprint(&item) => {
+            let verdict = match record.fields().verdict {
+                RecordedVerdict::RuleProven => "a rule (proven)",
+                RecordedVerdict::RuleWired => "a rule (wired, not proven)",
+                RecordedVerdict::Note => "a note",
+            };
+            format!("{verdict} by THOR's trial at log seq {}, written by {}", event.seq, door(event))
+        }
+        (Some((event, _)), _) => format!("tried at log seq {} and rewritten since - no verdict stands for it at the filing", event.seq),
+        _ => "no write in the window settled it - the filing gate read its check in the registered working copy".to_string(),
+    }
+}
+
+/// THE MACHINE SECTION of an evaluation report (see this section's banner),
+/// as text: `gate::machine_section_begin(N, F)` first, then the header line,
+/// JUDGEMENT, TEETH, OPEN POINTS, REFUSED and SIDE DOORS. Pure: the same
+/// `start` and `filed_seq` on the same log give the same bytes, whatever was
+/// appended after `filed_seq`.
+pub fn render_machine_section(store: &EventStore, start: &EvaluationStart, filed_seq: i64) -> String {
+    machine_section(store, start, filed_seq).0
+}
+
+/// The numbers of the machine section `render_machine_section` writes for the
+/// same arguments - what a filing's receipt summarises.
+pub fn machine_section_summary(store: &EventStore, start: &EvaluationStart, filed_seq: i64) -> MachineSummary {
+    machine_section(store, start, filed_seq).1
+}
+
+fn machine_section(store: &EventStore, start: &EvaluationStart, filed_seq: i64) -> (String, MachineSummary) {
+    let frozen = &start.frozen;
+    let n = frozen.started_seq;
+    let session = frozen.session.as_str();
+    let project = Some(frozen.project.as_str());
+    let log = LogAt::new(store, filed_seq);
+    let window: Vec<Event> =
+        store.events_since(n).unwrap_or_default().into_iter().filter(|e| e.seq <= filed_seq).collect();
+    let mut summary = MachineSummary { started_seq: n, filed_seq, listed: frozen.judgement.len(), ..MachineSummary::default() };
+    let mut out = gate::machine_section_begin(n, filed_seq);
+    out.push_str("\nEvery line of this machine section was computed by THOR from its event log; the evaluating session typed none of it.");
+
+    // ---- header: who took part, from the recorded verifications in the window
+    let mut agents: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut main_seen = false;
+    for event in window.iter().filter(|e| e.kind == EventKind::GateStoodAside && e.actor == ATTESTER_ACTOR) {
+        let Ok(body) = serde_json::from_str::<serde_json::Value>(&event.body) else { continue };
+        let attested = body.get("attested").and_then(|v| v.as_bool()).unwrap_or(false);
+        if !attested || body.get("session").and_then(|v| v.as_str()) != Some(session) {
+            continue;
+        }
+        match body.get("agent_id").and_then(|v| v.as_str()) {
+            Some(agent) => {
+                agents.insert(plain(agent));
+            }
+            None => main_seen = true,
+        }
+    }
+    let mut who: Vec<String> = Vec::new();
+    if main_seen || agents.is_empty() {
+        who.push("the main session".to_string());
+    }
+    who.extend(agents.iter().map(|a| format!("agent {a}")));
+    out.push_str(&format!(
+        "\nEVALUATION: project '{}'; session {} ({}); started by {} (THOR's record '{}', log seq {}); N = {n}, F = {filed_seq}.",
+        plain(&frozen.project),
+        plain(session),
+        who.join(", "),
+        plain(&frozen.started_by),
+        plain(&start.id),
+        start.seq
+    ));
+
+    // ---- JUDGEMENT
+    out.push_str(&format!("\n\nJUDGEMENT: {} item(s) on the frozen list.", frozen.judgement.len()));
+    for id in &frozen.judgement {
+        let events = log.entity(id);
+        let verdicts = recorded_write_verdicts(&events);
+        let in_window = |e: &&Event| e.seq > n;
+        let mark = events
+            .iter()
+            .filter(in_window)
+            .filter(|e| matches!(e.kind, EventKind::ItemMarkedUseful | EventKind::ItemMarkedNoise))
+            .filter_map(|e| match write_door(e, &verdicts, session) {
+                WriteDoor::Attested { agent_id } => Some((e, agent_id)),
+                _ => None,
+            })
+            .next_back();
+        let line = if let Some((event, agent_id)) = mark {
+            let word = if event.kind == EventKind::ItemMarkedUseful {
+                summary.useful += 1;
+                "useful"
+            } else {
+                summary.noise += 1;
+                "noise"
+            };
+            format!("{word} - verdict at log seq {} by {}", event.seq, by_whom(&agent_id))
+        } else {
+            let at_start = item_before(&events, n + 1);
+            let at_filing = item_before(&events, i64::MAX);
+            let off_track = match (&at_start, &at_filing) {
+                (_, None) => true,
+                (Some(before), Some(now)) => before.kind != Kind::Report && now.kind == Kind::Report,
+                (None, Some(_)) => false,
+            };
+            let last_write = events.iter().filter(in_window).filter(|e| changes_an_item(e.kind)).next_back();
+            match (off_track, last_write, &at_filing) {
+                (true, Some(event), _) if matches!(write_door(event, &verdicts, session), WriteDoor::Attested { .. }) => {
+                    summary.gone += 1;
+                    let how = if event.kind == EventKind::FactRetracted {
+                        format!("retracted - reason: {}", plain(&tombstone_reason(&event.body)))
+                    } else {
+                        "taken off the rule track".to_string()
+                    };
+                    format!("{how}, at log seq {} by {}", event.seq, door_words(&write_door(event, &verdicts, session)))
+                }
+                (false, _, Some(now)) if now.bindings.iter().any(|b| matches!(b, Binding::Always)) => {
+                    summary.pinned += 1;
+                    "pinned - owes no verdict".to_string()
+                }
+                _ => {
+                    summary.skipped += 1;
+                    "skipped - no verdict from this evaluation (the report's own not-judgeable tag gives the reason)".to_string()
+                }
+            }
+        };
+        out.push_str(&format!("\n- '{}': {line}", plain(id)));
+    }
+    let share = match summary.useful + summary.noise {
+        0 => "no verdict was given".to_string(),
+        given => format!("{}% useful of {given} verdict(s)", (summary.useful * 100 + given / 2) / given),
+    };
+    out.push_str(&format!(
+        "\ntotals: {} useful, {} noise, {} skipped, {} retracted or taken off the rule track, {} pinned; {share}.",
+        summary.useful, summary.noise, summary.skipped, summary.gone, summary.pinned
+    ));
+
+    // ---- TEETH
+    out.push_str("\n\nTEETH: ");
+    match &frozen.machine {
+        Some(machine) => out.push_str(&format!(
+            "THOR tried {} old rule(s) itself at the start (time box {} s): {} bite, {} note(s), {} pending check(s) hung, {} \
+             blocked, {} need the agent, {} need only their literal named (A4), not reached: {}.",
+            machine.items.len(),
+            machine.box_secs,
+            machine.bites,
+            machine.notes,
+            machine.pending_hung,
+            machine.blocked,
+            machine.needs_agent,
+            machine.a4_only,
+            machine.not_reached
+        )),
+        None => out.push_str("THOR's pass over the old rules left no record."),
+    }
+    summary.teeth_listed = frozen.batch().len() + frozen.a4_list().len();
+    for (name, ids) in [("frozen batch", frozen.batch()), ("frozen A4 list", frozen.a4_list())] {
+        out.push_str(&format!("\n{name}: {} rule(s).", ids.len()));
+        for id in ids {
+            out.push_str(&format!("\n- '{}': {}", plain(id), settled_how(&log.entity(id), n, session)));
+        }
+    }
+    // Every rule of this project (its own or global) retracted, archived,
+    // taken off the rule track or given a lower severity in the window; every
+    // note by dispute and every accept_refusing written in it.
+    let mut weakened: Vec<String> = Vec::new();
+    let mut disputes: Vec<String> = Vec::new();
+    let mut accepted: Vec<String> = Vec::new();
+    for event in window.iter().filter(|e| matches!(e.kind, EventKind::FactRevised | EventKind::FactRetracted | EventKind::FactCreated)) {
+        let events = log.entity(&event.entity_id);
+        let verdicts = recorded_write_verdicts(&events);
+        let door = door_words(&write_door(event, &verdicts, session));
+        let id = plain(&event.entity_id);
+        let after = parse_body(&event.body).ok();
+        if let (Some(item), Ok(Some(record))) = (&after, trial_of(event)) {
+            if project_applies_to(item.project.as_deref(), project) {
+                let fields = record.fields();
+                let quoted = |list: &[String]| list.iter().map(|c| format!("'{}'", plain(c))).collect::<Vec<_>>().join(", ");
+                if fields.verdict == RecordedVerdict::Note
+                    && (!fields.disputes.legitimate_calls.is_empty() || !fields.disputes.may_change.is_empty())
+                {
+                    disputes.push(format!(
+                        "\n- '{id}' at log seq {} by {door}: legitimate_calls [{}], may_change [{}]",
+                        event.seq,
+                        quoted(&fields.disputes.legitimate_calls),
+                        quoted(&fields.disputes.may_change)
+                    ));
+                }
+                if !fields.accept_refusing.is_empty() {
+                    accepted.push(format!("\n- '{id}' at log seq {} by {door}: [{}]", event.seq, quoted(&fields.accept_refusing)));
+                }
+            }
+        }
+        if event.kind == EventKind::FactCreated {
+            continue;
+        }
+        let Some(before) = item_before(&events, event.seq) else { continue };
+        if !before.kind.can_fire() || !project_applies_to(before.project.as_deref(), project) {
+            continue;
+        }
+        let because = || plain(&because_reason(&event.body).unwrap_or_else(|| "no reason recorded".to_string()));
+        if event.kind == EventKind::FactRetracted {
+            weakened.push(format!(
+                "\n- '{id}': retracted at log seq {} by {door} - reason: {}",
+                event.seq,
+                plain(&tombstone_reason(&event.body))
+            ));
+        } else if let Some(after) = after {
+            if !after.kind.can_fire() {
+                let reason = after
+                    .tags
+                    .iter()
+                    .filter(|t| !before.tags.contains(t))
+                    .find_map(|t| t.strip_prefix("archived:"))
+                    .map(plain)
+                    .unwrap_or_else(because);
+                let word = if after.tags.iter().any(|t| t.starts_with("archived:") && !before.tags.contains(t)) {
+                    "archived"
+                } else {
+                    "taken off the rule track"
+                };
+                weakened.push(format!("\n- '{id}': {word} at log seq {} by {door} - reason: {reason}", event.seq));
+            } else if crate::item::severity_rank(after.severity) > crate::item::severity_rank(before.severity) {
+                weakened.push(format!(
+                    "\n- '{id}': severity lowered from {} to {} at log seq {} by {door} - reason: {}",
+                    severity_name(before.severity),
+                    severity_name(after.severity),
+                    event.seq,
+                    because()
+                ));
+            }
+        }
+    }
+    out.push_str(&format!(
+        "\nrules retracted, archived, taken off the rule track or given a lower severity in the window: {}.",
+        weakened.len()
+    ));
+    weakened.iter().for_each(|line| out.push_str(line));
+    out.push_str(&format!("\nnotes by dispute written in the window: {}.", disputes.len()));
+    disputes.iter().for_each(|line| out.push_str(line));
+    out.push_str(&format!("\nrules kept with accept_refusing written in the window: {}.", accepted.len()));
+    accepted.iter().for_each(|line| out.push_str(line));
+
+    // ---- OPEN POINTS: THOR's own as the start's pass left them, each with
+    // how many valid evaluations carried it (recorded by the validator,
+    // step 16), then the legacy ones.
+    let points = frozen.machine.as_ref().map(|m| m.points.as_slice()).unwrap_or(&[]);
+    let legacy: Vec<&String> = frozen.open_points.iter().filter(|id| !is_machine_point_id(id)).collect();
+    out.push_str(&format!("\n\nOPEN POINTS: {} of THOR's own, {} legacy.", points.len(), legacy.len()));
+    for point in points {
+        let carriers = carriers_of(store, &frozen.project, &point.blocker.subject, filed_seq);
+        let carried = carriers.len();
+        let queue = match carried {
+            0 => String::new(),
+            _ => format!(" - in the owner queue: the owner decides - carried by {}", carriers_in_words(&carriers)),
+        };
+        out.push_str(&format!(
+            "\n- '{}' about '{}' ({}): holds {} rule(s); carried by {carried} valid evaluation(s){queue}",
+            plain(&point.id),
+            plain(&point.blocker.subject),
+            plain(&point.blocker.code),
+            point.rules.len()
+        ));
+    }
+    if !legacy.is_empty() {
+        let named = legacy.iter().map(|id| format!("'{}'", plain(id))).collect::<Vec<_>>().join(", ");
+        out.push_str(&format!("\n- legacy, filed by an agent before THOR wrote them itself (they settle nothing): {named}"));
+    }
+
+    // ---- REFUSED: what the hook refused in the window, split by whether a
+    // real tool call stands behind it.
+    let (mut verified, mut unchecked, mut never_proof, mut trial_refused) = (0usize, 0usize, 0usize, 0usize);
+    for event in window.iter().filter(|e| e.kind == EventKind::GateRefused) {
+        if event.actor == TEETH_WRITE_ACTOR {
+            trial_refused += 1;
+        } else if event.actor == ASSISTANT_DELIVERY_ACTOR {
+            match recorded_refusal_verdicts(&log.entity(&event.entity_id)).get(&event.seq) {
+                Some((true, _)) => verified += 1,
+                Some((false, _)) => never_proof += 1,
+                None => unchecked += 1,
+            }
+        } else {
+            never_proof += 1;
+        }
+    }
+    out.push_str(&format!(
+        "\n\nREFUSED: in the window the hook refused {verified} real tool call(s) (verified in a session's transcript); \
+         {never_proof} probe or hand-fed refusal(s) (never proof); {unchecked} not verified yet; {trial_refused} write(s) \
+         refused by THOR's own trial."
+    ));
+
+    // ---- SIDE DOORS: every write in the window, on an item of this project
+    // or made in the evaluating session, that did not come through an
+    // attested THOR call - and the ones whose check is still to come.
+    let mut side_doors: Vec<String> = Vec::new();
+    let mut unverified: Vec<String> = Vec::new();
+    for event in window.iter().filter(|e| ATTESTED_WRITE_KINDS.contains(&e.kind)) {
+        if RESERVED_ACTORS.contains(&event.actor.as_str()) {
+            continue;
+        }
+        let events = log.entity(&event.entity_id);
+        let ours = event.session_id == session
+            || events
+                .iter()
+                .filter(|e| changes_an_item(e.kind))
+                .filter_map(|e| parse_body(&e.body).ok())
+                .next_back()
+                .is_some_and(|item| project_applies_to(item.project.as_deref(), project));
+        if !ours {
+            continue;
+        }
+        let verdicts = recorded_write_verdicts(&events);
+        let line = |door: &str| format!("\n- '{}' {} at log seq {}: {door}", plain(&event.entity_id), event.kind.as_str(), event.seq);
+        match verdicts.get(&event.seq) {
+            Some(verdict) if verdict.attested => {}
+            Some(verdict) => side_doors.push(line(&plain(&verdict.why))),
+            None => match write_door(event, &verdicts, &event.session_id) {
+                WriteDoor::Outside(door) => side_doors.push(line(&plain(&door))),
+                _ => unverified.push(line("a THOR call not verified yet")),
+            },
+        }
+    }
+    summary.side_doors = side_doors.len();
+    summary.unverified = unverified.len();
+    out.push_str(&format!("\n\nSIDE DOORS: {} write(s) in the window outside an attested THOR call.", side_doors.len()));
+    side_doors.iter().for_each(|line| out.push_str(line));
+    out.push_str(&format!("\nchecked at the end of this turn: {} write(s).", unverified.len()));
+    unverified.iter().for_each(|line| out.push_str(line));
+    (out, summary)
+}
+
+/// The actor that records a filing's validation (step 16).
+pub const EVAL_VALIDATOR_ACTOR: &str = "eval-validator";
+
+// ------------------------------------------------ the validator's record (step 16)
+//
+// THE READER OF A FILING. The writer (step 15) refuses what it can see is a
+// side door, but it cannot see the filing call's own lines - they reach the
+// transcript only after the call. So the first main-session Stop after a new
+// report validates it once (`serve::eval_filing::validate`), from the log and
+// Claude Code's transcript only, and records the answer here: ONE
+// `gate_stood_aside` by `eval-validator` on the report's id, per filing event.
+// Every later reader - the Stop hook's evaluation debt, doctor, the carry of
+// THOR's own open points - reads that record, never a live transcript
+// (transcripts are deleted after about 30 days).
+
+/// How the verdicts of one evaluation split (B7): on its frozen judgement
+/// list by an attested call of the evaluating session (its subagents
+/// included) - useful, noise, or skipped - plus attested verdicts of that
+/// session on items OFF the list, and verdicts in the window that came in
+/// outside an attested THOR call (side doors).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerdictShares {
+    #[serde(default)]
+    pub useful: usize,
+    #[serde(default)]
+    pub noise: usize,
+    #[serde(default)]
+    pub skipped: usize,
+    #[serde(default)]
+    pub off_list: usize,
+    #[serde(default)]
+    pub unattested: usize,
+}
+
+/// One subject a valid evaluation filed while THOR's own open point about it
+/// was live (B5): `carried` is how many valid evaluations had carried it
+/// BEFORE this one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CarryEntry {
+    pub subject: String,
+    pub carried: usize,
+    pub session: String,
+    #[serde(default)]
+    pub agent: Option<String>,
+}
+
+/// The validator's answer for one filing of one evaluation report, as its
+/// record holds it. Fields that are only known for a filing that got far
+/// enough to be checked are `None` otherwise.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvaluationValidation {
+    pub valid: bool,
+    /// Why it does not count, in words; empty for a valid one.
+    #[serde(default)]
+    pub why: String,
+    /// The session's transcript is in a shape THOR cannot read (D14): never
+    /// valid, and nothing is asked that cannot be filed.
+    #[serde(default)]
+    pub drift: bool,
+    /// The report's id.
+    pub report: String,
+    /// The log seq of the event that filed it (created it, or newly tagged
+    /// or moved it as an evaluation report).
+    pub report_seq: i64,
+    #[serde(default)]
+    pub project: Option<String>,
+    /// The session column of the filing event (S).
+    pub session: String,
+    /// The subagent that made the filing call, when one did.
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub started_seq: Option<i64>,
+    #[serde(default)]
+    pub filed_seq: Option<i64>,
+    /// The transcript timestamp of the filing call's result.
+    #[serde(default)]
+    pub filed_at: Option<String>,
+    /// `machine_block_digest` of the stored machine block.
+    #[serde(default)]
+    pub machine_sha256: Option<String>,
+    #[serde(default)]
+    pub verdicts: VerdictShares,
+    #[serde(default)]
+    pub carry: Vec<CarryEntry>,
+}
+
+/// The digest a validator record keeps of a report's machine block
+/// (`gate::machine_block`): `hash_event("", block)`, the same SHA-256 based
+/// digest `args_digest` uses. A later typo fix below the block leaves it
+/// unchanged; any change to the block changes it.
+pub fn machine_block_digest(block: &str) -> String {
+    thor_core::event_store::hash_event("", block)
+}
+
+/// Append the validator's record for one filing: ONE `gate_stood_aside` by
+/// `eval-validator` on the report's id, in the filing session's column. Once
+/// per filing event: a second record for the same (report, report_seq)
+/// appends nothing and returns `Ok(None)` - the first answer is the one every
+/// reader uses. Only `eval-validator` writes it.
+pub fn record_evaluation_validation(
+    store: &mut EventStore,
+    actor: SystemActor,
+    validation: &EvaluationValidation,
+) -> Result<Option<Event>, WriteError> {
+    if actor.name() != EVAL_VALIDATOR_ACTOR {
+        return Err(WriteError::Refused(Refusal {
+            problem: format!("an evaluation report's validation is recorded by THOR's eval-validator only, not by '{}'", actor.name()),
+            fix: "let the Stop hook validate it (serve::eval_filing::validate_new_reports)".to_string(),
+        }));
+    }
+    if evaluation_validation_of(store, &validation.report, validation.report_seq).is_some() {
+        return Ok(None);
+    }
+    let name = fence(store, actor.into(), &validation.report)?;
+    let body = serde_json::to_string(validation).map_err(WriteError::Serialize)?;
+    let session = validation.session.as_str();
+    store
+        .append_event(session, session, name, EventKind::GateStoodAside, &validation.report, None, &body)
+        .map(Some)
+        .map_err(|e| WriteError::Store(e.into()))
+}
+
+/// Every validator record on the log, oldest first, as (record seq,
+/// validation): the first one per filing (report, report_seq) only. Reads
+/// the validator's own events alone. Empty on an unreadable log - then
+/// nothing counts as a valid evaluation, which asks more, never less.
+pub fn evaluation_validations(store: &EventStore) -> Vec<(i64, EvaluationValidation)> {
+    let Ok(events) = store.events_of_kinds_by_actor(&[EventKind::GateStoodAside], EVAL_VALIDATOR_ACTOR) else {
+        return Vec::new();
+    };
+    let mut seen: HashSet<(String, i64)> = HashSet::new();
+    events
+        .iter()
+        .filter_map(|e| serde_json::from_str::<EvaluationValidation>(&e.body).ok().map(|v| (e.seq, v)))
+        .filter(|(_, v)| seen.insert((v.report.clone(), v.report_seq)))
+        .collect()
+}
+
+/// The validator's record for the filing of `report` at log seq
+/// `report_seq`, when one was written.
+pub fn evaluation_validation_of(store: &EventStore, report: &str, report_seq: i64) -> Option<EvaluationValidation> {
+    let events = store.get_events_by_entity(report).ok()?;
+    events
+        .iter()
+        .filter(|e| e.kind == EventKind::GateStoodAside && e.actor == EVAL_VALIDATOR_ACTOR)
+        .filter_map(|e| serde_json::from_str::<EvaluationValidation>(&e.body).ok())
+        .find(|v| v.report_seq == report_seq)
+}
+
+/// One valid evaluation that carried an open point about a subject: who
+/// filed it, when, and which report it was.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Carrier {
+    pub session: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// The transcript timestamp of that filing call's result.
+    pub filed_at: String,
+    pub report: String,
+}
+
+/// Every VALID evaluation filing of `project` at whose filing THOR's own
+/// open point about `subject` was live (B5), from the validator's records at
+/// or before log seq `until`, oldest first. Counted per SUBJECT, never per
+/// point: a point that is closed and re-opened, or retracted and written
+/// again, keeps its carry.
+pub fn carriers_of(store: &EventStore, project: &str, subject: &str, until: i64) -> Vec<Carrier> {
+    evaluation_validations(store)
+        .into_iter()
+        .filter(|(seq, v)| *seq <= until && v.valid && v.project.as_deref() == Some(project))
+        .filter_map(|(_, v)| {
+            let entry = v.carry.iter().find(|c| c.subject == subject)?;
+            Some(Carrier {
+                session: entry.session.clone(),
+                agent: entry.agent.clone(),
+                filed_at: v.filed_at.clone().unwrap_or_default(),
+                report: v.report.clone(),
+            })
+        })
+        .collect()
+}
+
+/// How many VALID evaluation filings of `project` carried an open point about
+/// `subject`, at or before log seq `until` (`carriers_of`).
+pub fn carried_by_valid_evaluations(store: &EventStore, project: &str, subject: &str, until: i64) -> usize {
+    carriers_of(store, project, subject, until).len()
+}
+
+/// The carrying sessions in words: "session S1 on 2026-09-30, S2 (agent a1)
+/// on 2026-10-01" - each with the date its filing's result was written.
+pub fn carriers_in_words(carriers: &[Carrier]) -> String {
+    let one = |c: &Carrier| {
+        let agent = c.agent.as_deref().map(|a| format!(" (agent {})", plain(a))).unwrap_or_default();
+        let date = c.filed_at.get(..10).unwrap_or(c.filed_at.as_str());
+        format!("{}{agent} on {}", plain(&c.session), plain(date))
+    };
+    format!("session {}", carriers.iter().map(one).collect::<Vec<_>>().join(", "))
+}
+
+/// How many of THOR's own open points of one project may wait on the owner
+/// before his own session is told so at its start (B6, Q8). Nothing is ever
+/// refused over it.
+pub const OPEN_POINTS_OWNER_BUDGET: usize = 8;
+
+/// THOR's own open points of `project` that wait on the OWNER (B5): live,
+/// and their subject carried by at least one valid evaluation. Each comes
+/// with its carriers, oldest first.
+pub fn owner_queue(store: &EventStore, project: &str) -> Vec<(OpenPoint, Vec<Carrier>)> {
+    open_points(store, Some(project))
+        .into_iter()
+        .filter(|p| p.machine)
+        .filter_map(|p| {
+            let carriers = carriers_of(store, project, p.subject.as_deref()?, i64::MAX);
+            (!carriers.is_empty()).then_some((p, carriers))
+        })
+        .collect()
+}
+
+/// The line that opens the owner's own session start - and doctor, and a
+/// filing's receipt - when more of THOR's open points of `project` wait on
+/// him than `OPEN_POINTS_OWNER_BUDGET`. `None` within the budget.
+pub fn owner_queue_banner(project: &str, waiting: usize) -> Option<String> {
+    (waiting > OPEN_POINTS_OWNER_BUDGET).then(|| {
+        format!(
+            "[THOR] {waiting} open points wait on YOU in {project} (budget {OPEN_POINTS_OWNER_BUDGET}) - each one says \
+             what to do, step by step"
+        )
     })
 }
 
@@ -3841,6 +5978,10 @@ fn tombstone_reason(body: &str) -> String {
 /// seeded first-session note) is refused until `OWNER_SETUP_ANSWERS_ID`
 /// exists as a live item - see `gate::retract`'s own doc comment for why.
 /// Every other id is retracted exactly as before.
+///
+/// `att` is the tool server's stamp of the call that makes the retraction
+/// (step 12), spliced onto the tombstone body as `"att"`; `None` (the command
+/// line, a repair tool, a test) writes no key.
 pub fn retract<'a>(
     store: &mut EventStore,
     session_id: &str,
@@ -3848,6 +5989,7 @@ pub fn retract<'a>(
     actor: impl Into<WriteActor<'a>>,
     entity_id: &str,
     reason: &str,
+    att: Option<&Att>,
 ) -> Result<Event, WriteError> {
     let actor = fence(store, actor.into(), entity_id)?;
     let reason = reason.trim();
@@ -3906,6 +6048,7 @@ pub fn retract<'a>(
     let answers_recorded = entity_id == SETUP_NOTE_ID && show(store, OWNER_SETUP_ANSWERS_ID).is_ok();
     gate::retract(entity_id, answers_recorded).map_err(WriteError::Refused)?;
     let body = serde_json::json!({ "retracted": entity_id, "reason": reason }).to_string();
+    let body = with_att(body, att).map_err(WriteError::Serialize)?;
     store
         .append_mutate_checked(
             session_id,
@@ -3924,6 +6067,9 @@ pub fn retract<'a>(
 /// `core` recomputes that set under the write lock, so a head that appeared
 /// while the caller was deciding makes this fail instead of silently dropping
 /// someone else's revision.
+///
+/// `att` is the tool server's stamp of the call that makes the resolve (step
+/// 12), spliced onto the body as `"att"`; `None` writes no key.
 pub fn resolve<'a>(
     store: &mut EventStore,
     session_id: &str,
@@ -3932,10 +6078,12 @@ pub fn resolve<'a>(
     entity_id: &str,
     keep: &str,
     discard: &[String],
+    att: Option<&Att>,
 ) -> Result<Event, WriteError> {
     let actor = fence(store, actor.into(), entity_id)?;
+    let att = att.map(serde_json::to_string).transpose().map_err(WriteError::Serialize)?;
     store
-        .append_resolve(session_id, lineage_id, actor, entity_id, keep, discard)
+        .append_resolve_stamped(session_id, lineage_id, actor, entity_id, keep, discard, att.as_deref())
         .map_err(WriteError::Store)
 }
 
@@ -4060,7 +6208,7 @@ pub fn declare_project_record(
 ) -> Result<Event, WriteError> {
     fence(store, actor.into(), &item.id)?;
     refuse_unless_project_record(&item.id)?;
-    declare_gated(store, "install", "install", actor.into(), item, None, None, Some((root, at)))
+    declare_gated(store, "install", "install", actor.into(), item, None, None, None, Some((root, at)))
 }
 
 /// Register (or move) the working copy on an existing project record: one
@@ -4313,7 +6461,7 @@ mod tests {
         declare(&mut store, "s1", "l1", "test", &item).unwrap();
         show(&store, &item.id).expect("live before the retraction");
 
-        retract(&mut store, "s1", "l1", "test", &item.id, "config/app.toml moved").unwrap();
+        retract(&mut store, "s1", "l1", "test", &item.id, "config/app.toml moved", None).unwrap();
 
         match show(&store, &item.id) {
             Err(ReadError::Retracted(why)) => assert!(
@@ -4332,7 +6480,7 @@ mod tests {
         let item = sample();
         declare(&mut store, "s1", "l1", "test", &item).unwrap();
 
-        let err = retract(&mut store, "s1", "l1", "test", &item.id, "   ").unwrap_err();
+        let err = retract(&mut store, "s1", "l1", "test", &item.id, "   ", None).unwrap_err();
         assert!(matches!(err, WriteError::Refused(_)));
         assert_eq!(
             store.get_all_events().unwrap().len(),
@@ -4352,7 +6500,7 @@ mod tests {
         let mut updated = item.clone();
         updated.text = "the config lives in config/app.toml, and is read once at start".to_string();
         revise(&mut store, "s1", "l1", "test", &item, &updated).unwrap();
-        retract(&mut store, "s1", "l1", "test", &item.id, "app.toml was superseded by the new layout").unwrap();
+        retract(&mut store, "s1", "l1", "test", &item.id, "app.toml was superseded by the new layout", None).unwrap();
 
         let log = history(&store, &item.id).unwrap();
         assert_eq!(log.len(), 3, "declare, revise and retract must all still be there");
@@ -4980,7 +7128,7 @@ mod tests {
         let newcomer = path_bound("newcomer", 8, "src/shared/queue.rs", Some(Severity::Costly));
         declare(&mut store, "s", "l", "t", &newcomer).expect_err("fixture sanity: the anchor starts full");
 
-        retract(&mut store, "s", "l", "t", "sit-0", "folded into 'sit-1'").unwrap();
+        retract(&mut store, "s", "l", "t", "sit-0", "folded into 'sit-1'", None).unwrap();
         declare(&mut store, "s", "l", "t", &newcomer).expect("one retraction is enough room");
     }
 
@@ -5490,7 +7638,7 @@ mod tests {
         // p3: retracted - a tombstone, must be absent from both paths.
         let p3 = sample_with("p3", "run linting before every commit");
         declare(&mut store, "s1", "l1", "test", &p3).unwrap();
-        retract(&mut store, "s1", "l1", "test", &p3.id, "app.toml was superseded by the new layout").unwrap();
+        retract(&mut store, "s1", "l1", "test", &p3.id, "app.toml was superseded by the new layout", None).unwrap();
 
         // p4: diverged (hand-crafted, same shape as
         // `serve::live`'s own equivalence test) - must be absent too.
@@ -5562,7 +7710,7 @@ mod tests {
         let mut store = EventStore::in_memory().unwrap();
         declare(&mut store, "s", "l", "a", &setup_note()).unwrap();
 
-        let err = retract(&mut store, "s", "l", "a", SETUP_NOTE_ID, "done").unwrap_err();
+        let err = retract(&mut store, "s", "l", "a", SETUP_NOTE_ID, "done", None).unwrap_err();
         assert!(matches!(err, WriteError::Refused(_)), "{err}");
         assert!(show(&store, SETUP_NOTE_ID).is_ok(), "a refused retract must leave the note live");
     }
@@ -5575,7 +7723,7 @@ mod tests {
         declare(&mut store, "s", "l", "a", &setup_note()).unwrap();
         declare(&mut store, "s", "l", "a", &owner_setup_answers()).unwrap();
 
-        retract(&mut store, "s", "l", "a", SETUP_NOTE_ID, "owner walked through setup").unwrap();
+        retract(&mut store, "s", "l", "a", SETUP_NOTE_ID, "owner walked through setup", None).unwrap();
         assert!(matches!(show(&store, SETUP_NOTE_ID).unwrap_err(), ReadError::Retracted(_)));
     }
 
@@ -5590,7 +7738,7 @@ mod tests {
         declines.text = "he does not want any of this - no rules, no lanes, nothing kept".to_string();
         declare(&mut store, "s", "l", "a", &declines).unwrap();
 
-        retract(&mut store, "s", "l", "a", SETUP_NOTE_ID, "owner declined setup").unwrap();
+        retract(&mut store, "s", "l", "a", SETUP_NOTE_ID, "owner declined setup", None).unwrap();
     }
 
     /// THE NARROW SCOPE THIS GROUND MUST KEEP: an ordinary retract, on an
@@ -5601,7 +7749,7 @@ mod tests {
         let item = sample();
         declare(&mut store, "s", "l", "a", &item).unwrap();
 
-        retract(&mut store, "s", "l", "a", &item.id, "config/app.toml is no longer true").unwrap();
+        retract(&mut store, "s", "l", "a", &item.id, "config/app.toml is no longer true", None).unwrap();
     }
 
     /// A store that never had the seeded note at all (an old install, or one
@@ -5611,7 +7759,7 @@ mod tests {
     #[test]
     fn a_store_with_no_seeded_note_is_unaffected() {
         let mut store = EventStore::in_memory().unwrap();
-        let err = retract(&mut store, "s", "l", "a", SETUP_NOTE_ID, "cleanup").unwrap_err();
+        let err = retract(&mut store, "s", "l", "a", SETUP_NOTE_ID, "cleanup", None).unwrap_err();
         assert!(matches!(err, WriteError::Store(_)), "an id that was never declared is NotFound, not Refused: {err}");
     }
 
@@ -5707,13 +7855,22 @@ mod tests {
         }
     }
 
-    /// An evaluation by `session`, started right now (at the log's tip).
-    fn started_now(store: &EventStore, session: &str) -> EvaluationScope {
-        EvaluationScope { session_id: session.to_string(), started_seq: store.get_next_seq().unwrap() - 1 }
+    /// FILE `report` THE WAY THE TOOL SERVER DOES (step 15), in one go:
+    /// session "s" starts an evaluation of the report's project right now
+    /// (`record_start`: the start record, then the batch record with the
+    /// live batch handed to the agent), and the report is filed for it
+    /// through a THOR call the writer saw in flight (`file_in`). A fresh
+    /// start at every attempt, so what is asked is what an evaluation
+    /// starting now would be held to.
+    fn file_now(store: &mut EventStore, report: &Item) -> Result<Event, WriteError> {
+        let start = record_start(store, "s", report.project.as_deref().expect("an evaluation report names its project"));
+        file_in(store, report, &start)
     }
 
-    fn file(store: &mut EventStore, report: &Item, scope: &EvaluationScope) -> Result<Event, WriteError> {
-        declare_scoped(store, "s", "l", "a", report, Some(scope))
+    /// Record the write at `seq` on `id` as an attested THOR call of
+    /// `session`, the way the session's Stop records it.
+    fn attest(store: &mut EventStore, session: &str, id: &str, seq: i64) {
+        record_write_verification(store, session, SystemActor::new(ATTESTER_ACTOR), id, seq, true, None, "fixture: attested").unwrap();
     }
 
     #[test]
@@ -5741,12 +7898,8 @@ mod tests {
     #[test]
     fn revising_an_ordinary_report_onto_the_evaluation_report_tag_is_also_gated() {
         let mut store = EventStore::in_memory().unwrap();
-        // The teeth condition, not the judgement one: this door carries no
-        // evaluation scope, so only the conditions every filing is held to
-        // can refuse here (see `EvaluationScope`).
-        legacy_thinly_answered(&mut store, "unboxed-3", Some("z"));
-        serve_n(&mut store, "unboxed-3", "hook", 1);
-
+        // This door carries no filing context at all (`FilingContext`), so
+        // a revise that files through it is refused outright (step 15).
         let mut plain = eval_report("not-yet-an-eval-report", "z");
         plain.tags = vec!["some-other-tag".to_string()];
         declare(&mut store, "s", "l", "a", &plain).expect("an ordinary, untagged Report may be declared freely");
@@ -5755,7 +7908,8 @@ mod tests {
         now_tagged.tags.push(EVALUATION_REPORT_TAG.to_string());
         let err = revise(&mut store, "s", "l", "a", &plain, &now_tagged).unwrap_err();
         let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
-        assert!(refusal.problem.contains("no current verdict from THOR's trial"), "{}", refusal.problem);
+        assert!(refusal.problem.contains("not coming through a THOR tool call"), "{}", refusal.problem);
+        assert_eq!(show(&store, "not-yet-an-eval-report").unwrap().tags, vec!["some-other-tag".to_string()], "nothing written");
     }
 
     /// THE CONCESSION THIS MUST NOT COST: a report that has ALREADY been
@@ -5792,8 +7946,8 @@ mod tests {
         declare_noted(&mut store, &light);
         serve_n(&mut store, "owed-1", ASSISTANT_DELIVERY_ACTOR, JUDGEMENT_DEBT_AFTER);
 
-        let scope = started_now(&store, "s");
-        let err = file(&mut store, &eval_report("eval-p-1", "p"), &scope).unwrap_err();
+        let start = record_start(&mut store, "s", "p");
+        let err = file_in(&mut store, &eval_report("eval-p-1", "p"), &start).unwrap_err();
         let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
         assert!(refusal.problem.contains("owe a judgement"), "{}", refusal.problem);
         assert!(show(&store, "eval-p-1").is_err(), "a refused report must not be live");
@@ -5805,10 +7959,11 @@ mod tests {
         let light = light_command_rule("owed-2", "p");
         declare_noted(&mut store, &light);
         serve_n(&mut store, "owed-2", ASSISTANT_DELIVERY_ACTOR, JUDGEMENT_DEBT_AFTER);
-        mark_useful(&mut store, "owed-2");
+        // Attested: since step 12 only such a verdict clears anything (D9).
+        mark_verified(&mut store, "owed-2", "s", true);
 
-        let scope = started_now(&store, "s");
-        file(&mut store, &eval_report("eval-p-2", "p"), &scope).expect("debt is settled, filing must succeed");
+        let start = record_start(&mut store, "s", "p");
+        file_in(&mut store, &eval_report("eval-p-2", "p"), &start).expect("debt is settled, filing must succeed");
     }
 
     /// A heavy rule that predates the content rule for reasons: its answer
@@ -5826,11 +7981,11 @@ mod tests {
     #[test]
     fn evaluation_report_filing_is_refused_when_a_fired_heavy_rule_has_neither_a_real_tooth_nor_a_real_reason() {
         let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "s", "l", "a", &eval_report("eval-q-old", "q")).unwrap();
+        file_now(&mut store, &eval_report("eval-q-old", "q")).unwrap();
         legacy_thinly_answered(&mut store, "unboxed-heavy", Some("q"));
         serve_n(&mut store, "unboxed-heavy", "hook", 1);
 
-        let err = declare(&mut store, "s", "l", "a", &eval_report("eval-q-new", "q")).unwrap_err();
+        let err = file_now(&mut store, &eval_report("eval-q-new", "q")).unwrap_err();
         let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
         assert!(refusal.problem.contains("unboxed-heavy"), "{}", refusal.problem);
         assert!(refusal.problem.contains("no current verdict from THOR's trial"), "{}", refusal.problem);
@@ -5843,10 +7998,10 @@ mod tests {
     #[test]
     fn the_filing_refusal_names_the_real_work_and_never_the_bulk_relabel() {
         let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "s", "l", "a", &eval_report("eval-c-old", "c")).unwrap();
+        file_now(&mut store, &eval_report("eval-c-old", "c")).unwrap();
         legacy_thinly_answered(&mut store, "needs-work", Some("c"));
         serve_n(&mut store, "needs-work", "hook", 1);
-        let err = declare(&mut store, "s", "l", "a", &eval_report("eval-c-new", "c")).unwrap_err();
+        let err = file_now(&mut store, &eval_report("eval-c-new", "c")).unwrap_err();
         let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
         let text = format!("{} {}", refusal.problem, refusal.fix);
         assert!(!text.contains("backfill_teeth"), "a bulk relabel is never the way out: {text}");
@@ -5865,8 +8020,8 @@ mod tests {
         declare_noted(&mut store, &light_command_rule("owed-b", "o"));
         serve_n(&mut store, "owed-a", ASSISTANT_DELIVERY_ACTOR, JUDGEMENT_DEBT_AFTER);
         serve_n(&mut store, "owed-b", ASSISTANT_DELIVERY_ACTOR, JUDGEMENT_DEBT_AFTER);
-        let scope = started_now(&store, "s");
-        let err = file(&mut store, &eval_report("eval-o-1", "o"), &scope).unwrap_err();
+        let start = record_start(&mut store, "s", "o");
+        let err = file_in(&mut store, &eval_report("eval-o-1", "o"), &start).unwrap_err();
         let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
         assert!(refusal.problem.contains("'owed-a'") && refusal.problem.contains("'owed-b'"), "{}", refusal.problem);
         assert!(refusal.problem.contains("not-judgeable:<id>:<reason>"), "the refusal names the honest skip: {}", refusal.problem);
@@ -5878,7 +8033,7 @@ mod tests {
     // refusals, on a list that kept growing (14, 6, 13, 4, 4, 1, 5, 4) - the
     // evaluation's own writes fired the remember-bound rules, and parallel
     // sessions fired items this session never saw. It ended up stamping sixty
-    // items useful. These pin the fix (see `EvaluationScope`).
+    // items useful. These pin the fix (see `evaluation_judgement_owed`).
 
     /// Items that fired only in another session stay owed store-wide, but
     /// never hold this session's report.
@@ -5887,9 +8042,9 @@ mod tests {
         let mut store = EventStore::in_memory().unwrap();
         declare_noted(&mut store, &light_command_rule("elsewhere", "w"));
         serve_in(&mut store, "other-session", "elsewhere", JUDGEMENT_DEBT_AFTER);
-        let scope = started_now(&store, "this-session");
+        let start = record_start(&mut store, "this-session", "w");
 
-        file(&mut store, &eval_report("eval-w-1", "w"), &scope).expect("another session's firings are not this report's to settle");
+        file_in(&mut store, &eval_report("eval-w-1", "w"), &start).expect("another session's firings are not this report's to settle");
         assert_eq!(
             judgement_debt_in_project(&store, Some("w")),
             vec!["elsewhere".to_string()],
@@ -5907,17 +8062,19 @@ mod tests {
         declare_noted(&mut store, &light_command_rule("remember-bound", "f"));
         serve_in(&mut store, "eval-session", "owed-before", JUDGEMENT_DEBT_AFTER);
         serve_in(&mut store, "eval-session", "remember-bound", JUDGEMENT_DEBT_AFTER - 1);
-        let scope = started_now(&store, "eval-session");
+        let start = record_start(&mut store, "eval-session", "f");
         // The evaluation's own writes fire it again, well past the threshold.
         serve_in(&mut store, "eval-session", "remember-bound", 10);
 
-        let err = file(&mut store, &eval_report("eval-f-1", "f"), &scope).unwrap_err();
+        let err = file_in(&mut store, &eval_report("eval-f-1", "f"), &start).unwrap_err();
         let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
         assert!(refusal.problem.contains("'owed-before'"), "{}", refusal.problem);
         assert!(!refusal.problem.contains("remember-bound"), "the list cannot grow: {}", refusal.problem);
 
         mark_useful(&mut store, "owed-before");
-        file(&mut store, &eval_report("eval-f-1", "f"), &scope).expect("the fixed list is settled, so the report files");
+        assert!(file_in(&mut store, &eval_report("eval-f-1", "f"), &start).is_err(), "a verdict with no recorded attestation settles nothing");
+        mark_verified(&mut store, "owed-before", "eval-session", true);
+        file_in(&mut store, &eval_report("eval-f-1", "f"), &start).expect("the fixed list is settled, so the report files");
     }
 
     /// "When in doubt, skip" and "the list must be settled" no longer
@@ -5929,26 +8086,715 @@ mod tests {
         let mut store = EventStore::in_memory().unwrap();
         declare_noted(&mut store, &light_command_rule("unsure", "n"));
         serve_in(&mut store, "eval-session", "unsure", JUDGEMENT_DEBT_AFTER);
-        let scope = started_now(&store, "eval-session");
+        let start = record_start(&mut store, "eval-session", "n");
 
         let mut thin = eval_report("eval-n-1", "n");
         thin.tags.push(format!("{NOT_JUDGEABLE_TAG_PREFIX}unsure:no"));
-        assert!(file(&mut store, &thin, &scope).is_err(), "a skip with no real reason settles nothing");
+        assert!(file_in(&mut store, &thin, &start).is_err(), "a skip with no real reason settles nothing");
 
         let mut honest = eval_report("eval-n-1", "n");
         honest.tags.push(format!("{NOT_JUDGEABLE_TAG_PREFIX}unsure:it fired on a grep of a log I never opened"));
-        file(&mut store, &honest, &scope).expect("an honest skip settles it for this filing");
+        file_in(&mut store, &honest, &start).expect("an honest skip settles it for this filing");
         assert!(judgement_debt_in_project(&store, Some("n")).contains(&"unsure".to_string()), "and it stays owed store-wide");
     }
 
-    /// No hook record of the filing session: no verdict can honestly be
-    /// demanded (see `EvaluationScope`), so none is.
+    /// R15.1/R15.2 at the store: a write that files an evaluation report
+    /// with NO filing context - the model CLI, a replica's drain, a one-off
+    /// binary, the tool server on a side door - is REFUSED, never waived.
+    /// Measured before step 15: it was stored, and its receipt said "no
+    /// verdict was required here". Nothing is written, through any door.
     #[test]
-    fn a_filing_with_no_known_session_demands_no_verdict() {
+    fn filing_without_context_is_refused_not_waived() {
         let mut store = EventStore::in_memory().unwrap();
         declare_noted(&mut store, &light_command_rule("owed-x", "x"));
         serve_n(&mut store, "owed-x", ASSISTANT_DELIVERY_ACTOR, JUDGEMENT_DEBT_AFTER);
-        declare(&mut store, "s", "l", "a", &eval_report("eval-x-1", "x")).expect("no session known, no verdict demanded");
+        let report = eval_report("eval-x-1", "x");
+        let before = store.get_next_seq().unwrap();
+
+        let refused = |err: WriteError| {
+            let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
+            assert!(
+                refusal.problem.contains("not coming through a THOR tool call that both Claude Code and THOR's hook saw"),
+                "{}",
+                refusal.problem
+            );
+            assert!(refusal.problem.contains("Nothing was written"), "{}", refusal.problem);
+            assert!(refusal.fix.contains("File it with the THOR tool itself") && refusal.fix.contains("ToolSearch"), "{}", refusal.fix);
+        };
+        refused(declare(&mut store, "s", "l", "a", &report).unwrap_err());
+        refused(declare_in(&mut store, "s", "l", "a", &report, None).unwrap_err());
+        refused(declare_scoped(&mut store, "s", "l", "mcp", &report, None, None).unwrap_err());
+        // An open evaluation changes nothing about it: the context is what
+        // the write brings, and this one brings none.
+        let start = record_start(&mut store, "s", "x");
+        refused(declare_scoped(&mut store, "s", "l", "mcp", &report, None, None).unwrap_err());
+        // A side door gives no context at all.
+        assert_eq!(FilingContext::new(INFLIGHT_SIDE_DOOR, start.clone()), None);
+        // The revise doors: tagging an existing report files it.
+        let mut plain = report.clone();
+        plain.id = "notes-x".to_string();
+        plain.tags = vec!["notes".to_string()];
+        declare(&mut store, "s", "l", "a", &plain).unwrap();
+        let mut tagged = plain.clone();
+        tagged.tags.push(EVALUATION_REPORT_TAG.to_string());
+        refused(revise(&mut store, "s", "l", "a", &plain, &tagged).unwrap_err());
+        refused(revise_because(&mut store, "s", "l", "a", &plain, &tagged, &plain, None).unwrap_err());
+
+        assert!(show(&store, "eval-x-1").is_err(), "nothing stored");
+        let written: Vec<String> =
+            store.events_since(before - 1).unwrap().into_iter().map(|e| e.entity_id).filter(|id| id.starts_with("eval-")).collect();
+        assert!(written.is_empty(), "no event on the report at all: {written:?}");
+        // And the one sentence every door prints.
+        let sentence = refusal_sentence(&unattested_filing_refusal("no toolUseId in the call's _meta"));
+        assert!(
+            sentence.starts_with(
+                "REFUSED: this evaluation report is not coming through a THOR tool call that both Claude Code and THOR's hook \
+                 saw (no toolUseId in the call's _meta), so it could never count - the Stop hook only accepts a report whose \
+                 filing call is in this session's own transcript. Nothing was written. File it with the THOR tool itself, not \
+                 a script, a second client, the model CLI or an older binary: if mcp__thor__remember is not loaded yet, load \
+                 it with ToolSearch, query \"select:mcp__thor__remember,mcp__thor__revise,mcp__thor__mark\", then call it with \
+                 the same arguments."
+            ),
+            "{sentence}"
+        );
+    }
+
+    // ------------------------------------------ the start record (step 13)
+
+    /// A verdict on `id` by `session`, with its recorded verification: one
+    /// `attester` record saying whether it came through an attested THOR call.
+    fn mark_verified(store: &mut EventStore, id: &str, session: &str, attested: bool) -> i64 {
+        let seq = store.append_event(session, session, "mcp", EventKind::ItemMarkedUseful, id, None, "{}").unwrap().seq;
+        let why = if attested { "fixture: attested" } else { "fixture: no toolUseId in the call's _meta" };
+        record_write_verification(store, session, SystemActor::new(ATTESTER_ACTOR), id, seq, attested, None, why).unwrap();
+        seq
+    }
+
+    /// The start record of an evaluation of `project` by `session`, starting
+    /// now, written the way the hook writes it: the start record first, then
+    /// the batch record. THOR's machine pass lives in `serve`, so the batch
+    /// here is the live batch, every rule on it handed to the agent - what
+    /// the pass writes when none of them can be decided without one.
+    fn record_start(store: &mut EventStore, session: &str, project: &str) -> EvaluationStart {
+        let batch = evaluation_teeth_batch(store, Some(project));
+        let items = batch
+            .owed_now
+            .iter()
+            .chain(&batch.owed_later)
+            .map(|(id, why)| machine_item(id, MachineOutcome::NeedsAgent, why, None))
+            .collect();
+        let ids = batch.owed_now.iter().map(|(id, _)| id.clone()).collect();
+        let first = record_start_only(store, session, project);
+        decide_start(store, &first, ids, batch.owed_later.len(), vec![], items)
+    }
+
+    fn machine_item(id: &str, outcome: MachineOutcome, detail: &str, blocker: Option<&Blocker>) -> MachineItem {
+        MachineItem {
+            id: id.to_string(),
+            outcome,
+            detail: detail.to_string(),
+            call: None,
+            blocker: blocker.map(MachineBlocker::of),
+            seq: None,
+        }
+    }
+
+    /// The batch record on `start`, as THOR's machine pass writes it.
+    fn decide_start(
+        store: &mut EventStore,
+        start: &EvaluationStart,
+        batch: Vec<String>,
+        batch_later: usize,
+        a4_list: Vec<String>,
+        items: Vec<MachineItem>,
+    ) -> EvaluationStart {
+        let count = |o: MachineOutcome| items.iter().filter(|i| i.outcome == o).count();
+        let machine = MachinePass {
+            blocked: count(MachineOutcome::Blocked),
+            needs_agent: count(MachineOutcome::NeedsAgent),
+            a4_only: count(MachineOutcome::A4Only),
+            items,
+            ..MachinePass::default()
+        };
+        let actor = SystemActor::new(EVAL_MACHINE_ACTOR);
+        record_evaluation_batch(store, actor, start, "fixture start note, decided", batch, batch_later, a4_list, machine).unwrap()
+    }
+
+    /// Only the FIRST of the two records: the start, with no batch yet.
+    fn record_start_only(store: &mut EventStore, session: &str, project: &str) -> EvaluationStart {
+        let frozen = frozen_now(store, session, project, "skill", now_unix_secs()).unwrap();
+        let item = Item {
+            id: evaluation_start_id(project, frozen.started_seq),
+            kind: Kind::Report,
+            text: format!("fixture start note of {project}"),
+            bindings: vec![],
+            severity: None,
+            project: Some(project.to_string()),
+            tags: vec![EVALUATION_START_TAG.to_string()],
+            expires: None,
+            key: None,
+            falsifier: None,
+            check: None,
+        };
+        record_evaluation_start(store, SystemActor::new(EVAL_MACHINE_ACTOR), &item, &frozen).unwrap()
+    }
+
+    /// File `report` for the evaluation `start` records, the way the tool
+    /// server does: a filing context (the call seen in flight, the start
+    /// record) and the call's own stamp.
+    fn file_in(store: &mut EventStore, report: &Item, start: &EvaluationStart) -> Result<Event, WriteError> {
+        let session = start.frozen.session.clone();
+        let att = Att {
+            tool_use_id: Some(format!("toolu_fixture_{}", report.id)),
+            args_sha256: args_digest(&serde_json::json!({"id": report.id})),
+            session_hint: Some(session.clone()),
+            inflight: Some(INFLIGHT_SEEN.to_string()),
+            side_door: None,
+        };
+        let ctx = FilingContext::new(INFLIGHT_SEEN, start.clone()).expect("seen in flight gives a context");
+        declare_scoped(store, &session, "l", "mcp", report, Some(&ctx), Some(&att))
+    }
+
+    /// B5, B6: a point in the OWNER QUEUE - its subject carried by a valid
+    /// evaluation, still blocked at the next start - holds no filing: the
+    /// report of that next evaluation files. It counts against the owner's
+    /// budget, and only more than `OPEN_POINTS_OWNER_BUDGET` of them open the
+    /// owner's session with the banner.
+    #[test]
+    fn a_point_in_the_owner_queue_does_not_hold_the_filing() {
+        let mut store = EventStore::in_memory().unwrap();
+        let blocker = Blocker::NoWorkingCopy { project: "q".to_string() };
+        let mut held = heavy_command_rule("q-file", "q");
+        held.check = Some(Check::Contains { path: "README.md".to_string(), literal: "alpha line".to_string() });
+        legacy(&mut store, &held);
+        let machine = SystemActor::new(EVAL_MACHINE_ACTOR);
+        let point_id = machine_point_id("q", &blocker);
+        write_machine_point(&mut store, machine, "s1", "q", &blocker, "fixture point: no working copy of q").unwrap();
+        let carried = |carried_by: Vec<Carrier>| MachinePass {
+            blocked: 1,
+            items: vec![machine_item("q-file", MachineOutcome::Blocked, "no working copy", Some(&blocker))],
+            points: vec![MachinePoint {
+                id: point_id.clone(),
+                blocker: MachineBlocker::of(&blocker),
+                rules: vec!["q-file".to_string()],
+                carried_by,
+            }],
+            ..MachinePass::default()
+        };
+        let first = record_start_only(&mut store, "s1", "q");
+        record_evaluation_batch(&mut store, machine, &first, "fixture, decided", vec![], 0, vec![], carried(vec![])).unwrap();
+        assert!(owner_queue(&store, "q").is_empty(), "no valid evaluation has carried it yet");
+
+        // The validator's record of a valid filing while the point held.
+        let validation = EvaluationValidation {
+            valid: true,
+            why: String::new(),
+            drift: false,
+            report: "eval-q-1".to_string(),
+            report_seq: 1,
+            project: Some("q".to_string()),
+            session: "s1".to_string(),
+            agent: None,
+            started_seq: Some(first.frozen.started_seq),
+            filed_seq: Some(first.frozen.started_seq + 2),
+            filed_at: Some("2026-09-29T10:00:00Z".to_string()),
+            machine_sha256: Some("x".to_string()),
+            verdicts: VerdictShares::default(),
+            carry: vec![CarryEntry { subject: "q".to_string(), carried: 0, session: "s1".to_string(), agent: None }],
+        };
+        let validator = SystemActor::new(EVAL_VALIDATOR_ACTOR);
+        assert!(record_evaluation_validation(&mut store, validator, &validation).unwrap().is_some());
+        assert!(record_evaluation_validation(&mut store, validator, &validation).unwrap().is_none(), "recorded once");
+        let err = record_evaluation_validation(&mut store, machine, &validation).unwrap_err().to_string();
+        assert!(err.contains("eval-validator only"), "{err}");
+
+        let queue = owner_queue(&store, "q");
+        assert_eq!(queue.len(), 1);
+        assert_eq!((queue[0].0.id.as_str(), queue[0].1.len()), (point_id.as_str(), 1));
+        assert_eq!(carriers_in_words(&queue[0].1), "session s1 on 2026-09-29");
+        assert_eq!(owner_queue_banner("q", queue.len()), None, "within the budget: no banner");
+        assert_eq!(owner_queue_banner("q", OPEN_POINTS_OWNER_BUDGET), None);
+        assert_eq!(
+            owner_queue_banner("q", OPEN_POINTS_OWNER_BUDGET + 1).as_deref(),
+            Some("[THOR] 9 open points wait on YOU in q (budget 8) - each one says what to do, step by step")
+        );
+
+        // The next evaluation, the point in the owner queue: the report files.
+        let carriers = carriers_of(&store, "q", "q", i64::MAX);
+        let second = record_start_only(&mut store, "s2", "q");
+        let second = record_evaluation_batch(&mut store, machine, &second, "fixture, decided", vec![], 0, vec![], carried(carriers)).unwrap();
+        let filed = file_in(&mut store, &eval_report("eval-q-2", "q"), &second).expect("an owner-queue point holds no filing");
+        let text = show(&store, "eval-q-2").unwrap().text;
+        assert!(
+            text.contains(&format!("'{point_id}' about 'q' (no-working-copy): holds 1 rule(s); carried by 1 valid evaluation(s) - in the owner queue: the owner decides - carried by session s1 on 2026-09-29")),
+            "{text}"
+        );
+        assert!(filed.seq > second.seq);
+    }
+
+    #[test]
+    fn start_record_round_trips_its_frozen_lists() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare_noted(&mut store, &light_command_rule("rt-judge", "rt"));
+        serve_in(&mut store, "rt-session", "rt-judge", JUDGEMENT_DEBT_AFTER);
+        legacy_thinly_answered(&mut store, "rt-owed", Some("rt"));
+        declare(&mut store, "s", "l", "a", &open_point("open-rt-1", "rt")).unwrap();
+        let start = record_start(&mut store, "rt-session", "rt");
+
+        assert_eq!(start.id, format!("evaluation-start-rt-{}", start.frozen.started_seq));
+        assert_eq!(start.seq, start.frozen.started_seq + 1, "written right at the tip it froze");
+        assert_eq!(start.frozen.judgement, vec!["rt-judge".to_string()]);
+        assert_eq!(start.frozen.batch, Some(vec!["rt-owed".to_string()]));
+        assert_eq!(start.frozen.batch_later, 0);
+        assert_eq!(start.frozen.a4_list, Some(vec![]));
+        assert_eq!(start.frozen.open_points, vec!["open-rt-1".to_string()]);
+        assert_eq!(start.frozen.machine.as_ref().map(|m| m.needs_agent), Some(1));
+
+        assert_eq!(open_evaluation_start(&store, "rt-session", "rt"), Some(start.clone()), "read back from the log");
+        assert_eq!(evaluation_starts_of_session(&store, "rt-session"), vec![start.clone()]);
+        assert_eq!(open_evaluation_start(&store, "another-session", "rt"), None);
+        // Two events, both by eval-machine in the evaluating session: the
+        // start record with no batch, then the ONE revise that adds it.
+        let events = store.get_events_by_entity(&start.id).unwrap();
+        assert_eq!(events.iter().map(|e| e.kind).collect::<Vec<_>>(), vec![EventKind::FactCreated, EventKind::FactRevised]);
+        assert!(events.iter().all(|e| e.actor == EVAL_MACHINE_ACTOR && e.session_id == "rt-session"));
+        assert!(!events[0].body.contains("\"batch\":"), "the start record is written before the batch exists: {}", events[0].body);
+        assert!(frozen_of(&events[0].body).is_some_and(|f| !f.decided() && f.judgement == start.frozen.judgement));
+        assert_eq!(start.batch_seq, Some(events[1].seq));
+        let event = events.last().unwrap();
+        assert!(event.body.ends_with(&format!(",\"frozen\":{}}}", serde_json::to_string(&start.frozen).unwrap())), "{}", event.body);
+        let item = show(&store, &start.id).unwrap();
+        assert_eq!((item.kind, item.tags.clone()), (Kind::Report, vec![EVALUATION_START_TAG.to_string()]));
+
+        // Only eval-machine writes one, and never twice on one id.
+        let again = Item { text: "again".to_string(), ..item.clone() };
+        assert!(record_evaluation_start(&mut store, SystemActor::new(EVAL_MACHINE_ACTOR), &again, &start.frozen).is_err());
+        let other = Item { id: evaluation_start_id("rt", 999_999), ..item.clone() };
+        assert!(record_evaluation_start(&mut store, SystemActor::new("retest"), &other, &start.frozen).is_err());
+        let err = declare(&mut store, "s", "l", "mcp", &other).unwrap_err();
+        assert!(err.to_string().contains("does not begin with 'evaluation-start-'"), "{err}");
+        assert_eq!(evaluation_starts_of_session(&store, "rt-session").len(), 1);
+    }
+
+    /// D9: a verdict outside an attested THOR call - a `serve mark` from a
+    /// shell - before the start cannot shrink the frozen list; an attested
+    /// one can.
+    #[test]
+    fn an_unattested_verdict_does_not_shrink_the_frozen_list() {
+        let mut store = EventStore::in_memory().unwrap();
+        for id in ["ua-1", "ua-2", "ua-3"] {
+            declare_noted(&mut store, &light_command_rule(id, "ua"));
+            serve_in(&mut store, "ua-session", id, JUDGEMENT_DEBT_AFTER);
+        }
+        mark_verified(&mut store, "ua-1", "shell", false);
+        store.append_event("shell", "shell", "cli", EventKind::ItemMarkedNoise, "ua-2", None, "{}").unwrap();
+        mark_verified(&mut store, "ua-3", "ua-session", true);
+        let start = record_start(&mut store, "ua-session", "ua");
+        assert_eq!(start.frozen.judgement, vec!["ua-1".to_string(), "ua-2".to_string()], "only the attested verdict cleared its item");
+    }
+
+    #[test]
+    fn verdict_from_another_session_does_not_settle_the_judgement_list() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare_noted(&mut store, &light_command_rule("vs-item", "vs"));
+        serve_in(&mut store, "vs-session", "vs-item", JUDGEMENT_DEBT_AFTER);
+        let start = record_start(&mut store, "vs-session", "vs");
+        assert_eq!(start.frozen.judgement, vec!["vs-item".to_string()]);
+
+        mark_verified(&mut store, "vs-item", "another-session", true);
+        mark_verified(&mut store, "vs-item", "vs-session", false);
+        let err = file_in(&mut store, &eval_report("eval-vs-1", "vs"), &start).unwrap_err();
+        assert!(err.to_string().contains("'vs-item'"), "another session's verdict, and an unattested one, settle nothing: {err}");
+
+        mark_verified(&mut store, "vs-item", "vs-session", true);
+        file_in(&mut store, &eval_report("eval-vs-1", "vs"), &start).expect("this session's attested verdict settles it");
+    }
+
+    /// F15: folding a listed item into another (an attested retract) settles
+    /// it; the same retract from a shell does not; a listed item pinned
+    /// mid-evaluation is skipped. None of them holds the filing for good: the
+    /// unattested one can still be skipped with a reason.
+    #[test]
+    fn an_attested_retract_after_the_start_settles_a_listed_item() {
+        let mut store = EventStore::in_memory().unwrap();
+        for id in ["ar-folded", "ar-shell", "ar-pinned"] {
+            declare_noted(&mut store, &light_command_rule(id, "ar"));
+            serve_in(&mut store, "ar-session", id, JUDGEMENT_DEBT_AFTER);
+        }
+        let start = record_start(&mut store, "ar-session", "ar");
+        assert_eq!(start.frozen.judgement.len(), 3);
+
+        let folded = retract(&mut store, "ar-session", "l", "mcp", "ar-folded", "folded into 'ar-pinned'", None).unwrap();
+        attest(&mut store, "ar-session", "ar-folded", folded.seq);
+        let mut pinned = show(&store, "ar-pinned").unwrap();
+        let before = pinned.clone();
+        pinned.bindings.push(Binding::Always);
+        let pin = revise(&mut store, "ar-session", "l", "mcp", &before, &pinned).unwrap();
+        attest(&mut store, "ar-session", "ar-pinned", pin.seq);
+
+        let judgement = evaluation_judgement_owed(&store, &start, &[]);
+        assert_eq!(judgement.settled, vec!["ar-folded".to_string()]);
+        assert_eq!(judgement.owed, vec!["ar-shell".to_string()], "nothing was done about this one yet");
+        assert!(!judgement.owed.contains(&"ar-pinned".to_string()) && !judgement.settled.contains(&"ar-pinned".to_string()), "pinned: skipped");
+        assert!(frozen_writes_in_window(&store, &start, None).outside.is_empty(), "attested writes are no side door");
+
+        let mut skipping = eval_report("eval-ar-1", "ar");
+        skipping.tags.push(format!("{NOT_JUDGEABLE_TAG_PREFIX}ar-shell:its command is gone and I never saw it fire"));
+        file_in(&mut store, &skipping, &start).expect("the one left owed can be skipped with a reason");
+    }
+
+    /// D10: the same retract from a shell - no stamp of the tool server - is
+    /// a write to a frozen item behind the evaluation. It settles nothing,
+    /// the filing is refused naming the item, the log seq and the door, and
+    /// once the start record is closed as void the session has no evaluation
+    /// open any more. THOR's own writes in the window (a retest, the machine
+    /// pass, the attester) never do that (G15.4).
+    #[test]
+    fn a_side_door_write_to_a_frozen_item_refuses_the_filing_and_voids_the_evaluation() {
+        let mut store = EventStore::in_memory().unwrap();
+        for id in ["sd-shell", "sd-machine"] {
+            declare_noted(&mut store, &light_command_rule(id, "sd"));
+            serve_in(&mut store, "sd-session", id, JUDGEMENT_DEBT_AFTER);
+        }
+        let start = record_start(&mut store, "sd-session", "sd");
+        assert_eq!(start.frozen.judgement.len(), 2);
+
+        // THOR's own writes: a revise by the retest, and the attester's record.
+        let rule = show(&store, "sd-machine").unwrap();
+        let record = sealed(&rule, RecordedVerdict::Note);
+        let by_retest =
+            revise_tried_scoped(&mut store, "retest", "retest", SystemActor::new("retest"), &rule, &rule, &rule, None, None, Some(&record), None, None)
+                .unwrap();
+        assert_eq!(by_retest.actor, "retest");
+        mark_verified(&mut store, "sd-machine", "sd-session", true);
+        mark_verified(&mut store, "sd-shell", "sd-session", true);
+        assert_eq!(frozen_writes_in_window(&store, &start, None), FrozenWrites::default(), "machine writes and verdicts void nothing");
+        assert!(check_evaluation_report_filing(&store, &eval_report("eval-sd-1", "sd"), FilingContext::new(INFLIGHT_UNSEEN, start.clone()).as_ref()).is_none());
+
+        let shell = retract(&mut store, "shell", "l", "cli", "sd-shell", "fixture-command-sd-shell no longer exists", None).unwrap();
+        let written = frozen_writes_in_window(&store, &start, None);
+        assert_eq!(written.outside.len(), 1, "{written:?}");
+        assert_eq!((written.outside[0].id.as_str(), written.outside[0].seq), ("sd-shell", shell.seq));
+        assert!(written.outside[0].door.contains("written by 'cli' with no stamp of THOR's tool server"), "{:?}", written.outside[0]);
+        assert_eq!(frozen_writes_in_window(&store, &start, Some(shell.seq - 1)).outside.len(), 0, "truncated before it: nothing");
+
+        let err = file_in(&mut store, &eval_report("eval-sd-1", "sd"), &start).unwrap_err().to_string();
+        assert!(
+            err.starts_with(&format!("'sd-shell' was changed at log seq {} outside an attested THOR call of this evaluation (", shell.seq)),
+            "{err}"
+        );
+        assert!(err.contains("An evaluation whose list was changed behind it cannot count. The next Stop starts a fresh evaluation with a fresh list"), "{err}");
+        assert!(show(&store, "eval-sd-1").is_err(), "nothing filed");
+
+        // Closing it: one more revise by eval-machine on the start record.
+        assert_eq!(open_evaluation_start(&store, "sd-session", "sd").map(|s| s.id), Some(start.id.clone()));
+        let actor = || SystemActor::new(EVAL_MACHINE_ACTOR);
+        assert!(record_evaluation_void(&mut store, SystemActor::new("retest"), &start, &written.outside[0]).is_err(), "eval-machine only");
+        let void = record_evaluation_void(&mut store, actor(), &start, &written.outside[0]).unwrap();
+        assert_eq!(void.frozen.void.as_ref(), Some(&written.outside[0]));
+        assert_eq!(void.batch_seq, start.batch_seq, "the batch record's seq stays the batch record's");
+        assert_eq!(open_evaluation_start(&store, "sd-session", "sd"), None, "a void evaluation is not open");
+        let events = store.get_events_by_entity(&start.id).unwrap();
+        assert_eq!(events.len(), 3, "the start, the batch record, the void mark");
+        assert!(events.iter().all(|e| e.actor == EVAL_MACHINE_ACTOR));
+        assert!(show(&store, &start.id).unwrap().text.contains("THIS EVALUATION IS VOID: 'sd-shell' was changed at log seq"));
+        let again = record_evaluation_void(&mut store, actor(), &start, &written.outside[0]).unwrap();
+        assert_eq!(again, void, "voided once");
+        assert_eq!(store.get_events_by_entity(&start.id).unwrap().len(), 3);
+        // Filing under the void record is refused with the same sentence,
+        // and the refusal for "nothing open" names why.
+        let err = file_in(&mut store, &eval_report("eval-sd-1", "sd"), &void).unwrap_err().to_string();
+        assert!(err.starts_with("'sd-shell' was changed at log seq"), "{err}");
+        let none = no_open_evaluation_refusal(&store, "sd-session", "sd");
+        assert!(none.problem.contains("is void: 'sd-shell' was changed at log seq"), "{}", none.problem);
+        // A fresh start has a fresh list: the retracted item is not on it.
+        let fresh = record_start(&mut store, "sd-session", "sd");
+        assert_eq!(fresh.frozen.judgement, Vec::<String>::new(), "sd-machine was judged, sd-shell is gone");
+        file_in(&mut store, &eval_report("eval-sd-1", "sd"), &fresh).expect("the fresh evaluation files");
+    }
+
+    /// A write of the filing turn: stamped as the evaluating session's own
+    /// THOR call, not verified yet. It counts as not yet attested, and the
+    /// refusal says to end the turn once - it is never a side door.
+    #[test]
+    fn a_write_of_the_filing_turn_is_not_yet_attested_and_the_refusal_says_end_the_turn() {
+        let mut store = EventStore::in_memory().unwrap();
+        for id in ["tn-marked", "tn-folded"] {
+            declare_noted(&mut store, &light_command_rule(id, "tn"));
+            serve_in(&mut store, "tn-session", id, JUDGEMENT_DEBT_AFTER);
+        }
+        let start = record_start(&mut store, "tn-session", "tn");
+        let stamp = |tool_use_id: &str| Att {
+            tool_use_id: Some(tool_use_id.to_string()),
+            args_sha256: "fixture".to_string(),
+            session_hint: Some("tn-session".to_string()),
+            inflight: Some(INFLIGHT_UNSEEN.to_string()),
+            side_door: None,
+        };
+        let body = with_att(serde_json::json!({"id": "tn-marked"}).to_string(), Some(&stamp("toolu_mark"))).unwrap();
+        let mark = store.append_event("tn-session", "tn-session", "mcp", EventKind::ItemMarkedUseful, "tn-marked", None, &body).unwrap();
+        let fold = retract(&mut store, "tn-session", "l", "mcp", "tn-folded", "folded into 'tn-marked'", Some(&stamp("toolu_fold"))).unwrap();
+
+        let judgement = evaluation_judgement_owed(&store, &start, &[]);
+        assert_eq!(judgement.owed.len(), 2, "{judgement:?}");
+        assert_eq!(judgement.unverified, vec![("tn-folded".to_string(), fold.seq), ("tn-marked".to_string(), mark.seq)]);
+        let written = frozen_writes_in_window(&store, &start, None);
+        assert!(written.outside.is_empty(), "a call of this session waiting for its check is no side door: {written:?}");
+        assert_eq!(written.pending, vec![("tn-folded".to_string(), fold.seq)]);
+
+        let err = file_in(&mut store, &eval_report("eval-tn-1", "tn"), &start).unwrap_err().to_string();
+        assert!(err.contains(TURN_NOT_ENDED), "{err}");
+        assert!(err.contains("the verdicts you gave in this turn are checked when the turn ends - end the turn once, then file again"), "{err}");
+        assert!(err.contains(&format!("'tn-marked' (its verdict at log seq {})", mark.seq)), "{err}");
+
+        // The turn ends: the Stop records both as attested.
+        attest(&mut store, "tn-session", "tn-marked", mark.seq);
+        attest(&mut store, "tn-session", "tn-folded", fold.seq);
+        file_in(&mut store, &eval_report("eval-tn-1", "tn"), &start).expect("verified, so the report files");
+    }
+
+    /// R15.6 at the store: a verdict on an item that is NOT on the frozen
+    /// list settles nothing on it, and neither does an unattested verdict on
+    /// one that is - a side-door mark, a mark from another session. The list
+    /// stays owed for exactly those ids, and the evaluation is not voided: a
+    /// verdict is no write to the item.
+    #[test]
+    fn off_list_and_unattested_verdicts_do_not_settle_the_list() {
+        let mut store = EventStore::in_memory().unwrap();
+        for id in ["ol-a", "ol-b", "ol-c"] {
+            declare_noted(&mut store, &light_command_rule(id, "ol"));
+            serve_in(&mut store, "ol-session", id, JUDGEMENT_DEBT_AFTER);
+        }
+        declare_noted(&mut store, &light_command_rule("ol-off-list", "ol"));
+        serve_in(&mut store, "ol-session", "ol-off-list", 3);
+        let start = record_start(&mut store, "ol-session", "ol");
+        assert_eq!(start.frozen.judgement, vec!["ol-a".to_string(), "ol-b".to_string(), "ol-c".to_string()]);
+
+        // Off the list: an attested verdict of this very session.
+        mark_verified(&mut store, "ol-off-list", "ol-session", true);
+        // On the list, none attested for this session: a side-door client
+        // (recorded unattested), a shell mark with no stamp at all (never
+        // recorded), another session's attested verdict.
+        mark_verified(&mut store, "ol-a", "ol-session", false);
+        store.append_event("shell", "shell", "cli", EventKind::ItemMarkedUseful, "ol-b", None, "{}").unwrap();
+        mark_verified(&mut store, "ol-c", "another-session", true);
+
+        let judgement = evaluation_judgement_owed(&store, &start, &[]);
+        assert_eq!(judgement.owed, vec!["ol-a".to_string(), "ol-b".to_string(), "ol-c".to_string()]);
+        assert!(judgement.settled.is_empty() && judgement.unverified.is_empty(), "{judgement:?}");
+        assert_eq!(frozen_writes_in_window(&store, &start, None), FrozenWrites::default(), "a verdict voids nothing");
+        let err = file_in(&mut store, &eval_report("eval-ol-1", "ol"), &start).unwrap_err().to_string();
+        assert!(err.contains("3 item(s) fired in this session"), "{err}");
+        for id in ["'ol-a'", "'ol-b'", "'ol-c'"] {
+            assert!(err.contains(id), "{id}: {err}");
+        }
+        assert!(!err.contains("ol-off-list"), "the off-list item is not this report's: {err}");
+
+        // The machine section of the report that does file lists them as
+        // side doors, and the three items as skipped.
+        let mut skipping = eval_report("eval-ol-1", "ol");
+        for id in ["ol-a", "ol-b", "ol-c"] {
+            skipping.tags.push(format!("{NOT_JUDGEABLE_TAG_PREFIX}{id}:judged through a side door, never read here"));
+        }
+        file_in(&mut store, &skipping, &start).expect("skipped with a reason");
+        let text = show(&store, "eval-ol-1").unwrap().text;
+        assert!(text.contains("totals: 0 useful, 0 noise, 3 skipped"), "{text}");
+        let side = text.split("SIDE DOORS: ").nth(1).expect("the side-door block");
+        assert!(side.starts_with("2 write(s) in the window outside an attested THOR call."), "{side}");
+        assert!(side.contains("- 'ol-a' item_marked_useful at log seq") && side.contains("fixture: no toolUseId in the call's _meta"), "{side}");
+        assert!(side.contains("- 'ol-b' item_marked_useful at log seq") && side.contains("written by 'cli' with no stamp"), "{side}");
+        assert!(!side.contains("'ol-c'") && !side.contains("ol-off-list"), "an attested call of any session is no side door: {side}");
+    }
+
+    /// B1: the machine section is a pure function of the log truncated at F.
+    /// The same start and the same F give the same bytes - whatever was
+    /// appended after F, and on a copy of the log that ends at F.
+    #[test]
+    fn machine_section_is_a_pure_function_of_the_log() {
+        let mut store = EventStore::in_memory().unwrap();
+        for id in ["mp-useful", "mp-noise", "mp-skipped"] {
+            declare_noted(&mut store, &light_command_rule(id, "mp"));
+            serve_in(&mut store, "mp-session", id, JUDGEMENT_DEBT_AFTER);
+        }
+        legacy_thinly_answered(&mut store, "mp-batch", Some("mp"));
+        serve_n(&mut store, "mp-batch", "hook", 1);
+        let start = record_start(&mut store, "mp-session", "mp");
+        assert_eq!(start.frozen.batch(), ["mp-batch".to_string()]);
+
+        let useful = mark_verified(&mut store, "mp-useful", "mp-session", true);
+        let noise = store.append_event("mp-session", "mp-session", "mcp", EventKind::ItemMarkedNoise, "mp-noise", None, "{}").unwrap().seq;
+        record_write_verification(&mut store, "mp-session", SystemActor::new(ATTESTER_ACTOR), "mp-noise", noise, true, Some("a1"), "fixture").unwrap();
+        let settled = settle_by_naming_the_trigger(&mut store, "mp-batch");
+        attest(&mut store, "mp-session", "mp-batch", settled.seq);
+        store.append_event("x", "x", "hook", EventKind::GateRefused, "mp-batch", None, "{}").unwrap();
+
+        let filed_seq = store.get_next_seq().unwrap() - 1;
+        let section = render_machine_section(&store, &start, filed_seq);
+        assert_eq!(render_machine_section(&store, &start, filed_seq), section, "twice the same");
+        let expected_first = format!("=== MACHINE SECTION: derived from the log, seq {} to {filed_seq}; it cannot be edited ===", start.frozen.started_seq);
+        assert_eq!(section.lines().next(), Some(expected_first.as_str()));
+        assert!(section.is_ascii() && !section.contains('\r'), "plain ASCII, LF only");
+        assert!(section.contains(&format!("EVALUATION: project 'mp'; session mp-session (the main session, agent a1); started by skill (THOR's record '{}'", start.id)), "{section}");
+        assert!(section.contains(&format!("- 'mp-useful': useful - verdict at log seq {useful} by the main session")), "{section}");
+        assert!(section.contains(&format!("- 'mp-noise': noise - verdict at log seq {noise} by agent a1")), "{section}");
+        assert!(section.contains("- 'mp-skipped': skipped - no verdict from this evaluation"), "{section}");
+        assert!(section.contains("totals: 1 useful, 1 noise, 1 skipped, 0 retracted or taken off the rule track, 0 pinned; 50% useful of 2 verdict(s)."), "{section}");
+        assert!(section.contains("frozen batch: 1 rule(s)."), "{section}");
+        assert!(
+            section.contains(&format!("- 'mp-batch': a note by THOR's trial at log seq {}, written by an attested THOR call of the main session", settled.seq)),
+            "{section}"
+        );
+        assert!(section.contains("frozen A4 list: 0 rule(s)."), "{section}");
+        assert!(section.contains("OPEN POINTS: 0 of THOR's own, 0 legacy."), "{section}");
+        assert!(section.contains("1 not verified yet"), "the hook's refusal in the window has no recorded check: {section}");
+        assert!(section.contains("SIDE DOORS: 0 write(s) in the window outside an attested THOR call."), "{section}");
+        assert_eq!(
+            machine_section_summary(&store, &start, filed_seq),
+            MachineSummary {
+                started_seq: start.frozen.started_seq,
+                filed_seq,
+                listed: 3,
+                useful: 1,
+                noise: 1,
+                skipped: 1,
+                teeth_listed: 1,
+                ..MachineSummary::default()
+            }
+        );
+
+        // A copy of the log that ENDS at F gives the same bytes.
+        let shipped: Vec<thor_core::event_store::ShippedEvent> =
+            store.get_all_events().unwrap().iter().filter(|e| e.seq <= filed_seq).map(|e| e.to_shipped()).collect();
+        let mut truncated = EventStore::in_memory().unwrap();
+        truncated.ingest_batch(&shipped).unwrap();
+        assert_eq!(truncated.get_next_seq().unwrap() - 1, filed_seq);
+        assert_eq!(render_machine_section(&truncated, &start, filed_seq), section, "the truncated log renders the same bytes");
+
+        // Everything appended after F changes nothing about the section at F:
+        // a side-door verdict, a retract of a listed item, a new verdict, the
+        // attester's record of each, more refusals.
+        mark_verified(&mut store, "mp-skipped", "mp-session", true);
+        mark_verified(&mut store, "mp-useful", "shell", false);
+        retract(&mut store, "shell", "l", "cli", "mp-noise", "fixture-command-mp-noise no longer exists", None).unwrap();
+        store.append_event("x", "x", "hook", EventKind::GateRefused, "mp-batch", None, "{}").unwrap();
+        let other = record_start(&mut store, "other-session", "mp");
+        file_in(&mut store, &eval_report("eval-mp-other", "mp"), &other).unwrap();
+        assert_eq!(render_machine_section(&store, &start, filed_seq), section, "later events do not reach a section at F");
+        assert_ne!(render_machine_section(&store, &start, store.get_next_seq().unwrap() - 1), section, "a later F reads them");
+    }
+
+    /// G15.2: two quiet evaluations - nothing on any list, the same one-line
+    /// TLDR - both store. Their texts differ only in the log positions of
+    /// the machine section, which the near-duplicate check must not read as
+    /// "the same fact told twice". Any OTHER report with that text is still
+    /// a duplicate of neither.
+    #[test]
+    fn two_quiet_evaluations_are_not_near_duplicates() {
+        let mut store = EventStore::in_memory().unwrap();
+        let tldr = "TLDR: evaluation of q. Nothing to add.";
+        // A report filed before step 15 - no machine section - with the very
+        // same one-line TLDR, the way yesterday's quiet evaluation left it.
+        let mut older = eval_report("eval-q-2026-09-27", "q");
+        older.text = tldr.to_string();
+        legacy(&mut store, &older);
+        let mut first = eval_report("eval-q-2026-09-28", "q");
+        first.text = tldr.to_string();
+        let mut second = eval_report("eval-q-2026-09-29", "q");
+        second.text = tldr.to_string();
+        file_now(&mut store, &first).expect("the first quiet evaluation stores");
+        file_now(&mut store, &second).expect("and so does the second, a day later");
+        let (a, b) = (show(&store, &first.id).unwrap().text, show(&store, &second.id).unwrap().text);
+        assert!(a.starts_with("=== MACHINE SECTION") && b.starts_with("=== MACHINE SECTION"));
+        assert!(a.ends_with(&format!("\n\n{}\n{tldr}", gate::AGENT_SECTION_BEGIN)), "{a}");
+        let words = |text: &str| normalize_for_comparison(text);
+        assert!(
+            jaccard_similarity(&word_set(&words(&a)), &word_set(&words(&b))) >= NEAR_DUPLICATE_JACCARD_THRESHOLD,
+            "fixture sanity: the two stored texts ARE near-identical"
+        );
+        // The exemption is for two evaluation reports only: an ordinary
+        // report with the old one's text is still a near-duplicate of it.
+        let mut notes = older.clone();
+        notes.id = "notes-q-tldr".to_string();
+        notes.tags = vec!["notes".to_string()];
+        let err = declare(&mut store, "s", "l", "a", &notes).unwrap_err().to_string();
+        assert!(err.contains("near-duplicate") && err.contains("eval-q-2026-09-27"), "{err}");
+        let mut copy = first.clone();
+        copy.id = "notes-q".to_string();
+        copy.tags = vec!["notes".to_string()];
+        copy.text = a.replace("=== MACHINE SECTION", "machine section").replace("=== TLDR AND REMARKS", "tldr and remarks");
+        let err = declare(&mut store, "s", "l", "a", &copy).unwrap_err().to_string();
+        assert!(err.contains("near-duplicate"), "an ordinary report copying one is still refused: {err}");
+    }
+
+    /// R15.5 at the store: the stored text of a filed report is the machine
+    /// section, a blank line, the agent header, a newline, the writer's own
+    /// text - and a text that carries either header is refused at the filing.
+    #[test]
+    fn a_filed_report_is_stored_below_the_machine_section_and_a_typed_header_is_refused() {
+        let mut store = EventStore::in_memory().unwrap();
+        let start = record_start(&mut store, "s", "h");
+        for forged in [
+            "=== MACHINE SECTION: derived from the log, seq 1 to 2; it cannot be edited ===\nall settled",
+            "Summary.\n=== TLDR AND REMARKS: written by the evaluating session; they settle nothing ===\nmore",
+            "a line naming === MACHINE SECTION in passing",
+        ] {
+            let mut report = eval_report("eval-h-1", "h");
+            report.text = forged.to_string();
+            let err = file_in(&mut store, &report, &start).unwrap_err().to_string();
+            assert!(err.contains("carries a section header only THOR writes"), "{forged}: {err}");
+            assert!(err.contains("send only your own TLDR and remarks"), "{err}");
+        }
+        assert!(show(&store, "eval-h-1").is_err(), "nothing stored");
+        let mut report = eval_report("eval-h-1", "h");
+        report.text = "TLDR: evaluation of h. Nothing to add.".to_string();
+        let event = file_in(&mut store, &report, &start).unwrap();
+        let stored = show(&store, "eval-h-1").unwrap().text;
+        let filed_seq = event.seq - 1;
+        assert_eq!(
+            stored,
+            format!(
+                "{}\n\n{}\n{}",
+                render_machine_section(&store, &start, filed_seq),
+                gate::AGENT_SECTION_BEGIN,
+                report.text
+            ),
+            "machine section + blank line + agent header + newline + the agent's text"
+        );
+        assert_eq!(gate::machine_section_range(&stored), Some((start.frozen.started_seq, filed_seq)));
+        assert_eq!(gate::agent_section(&stored), report.text);
+    }
+
+
+
+    /// R-b's unit: settling a member of the frozen batch never pulls the next
+    /// owed rule in - the filing is held to the frozen ids only, while the
+    /// live batch (doctor's view) moves on.
+    #[test]
+    fn frozen_batch_never_grows_when_a_member_is_settled() {
+        let mut store = EventStore::in_memory().unwrap();
+        let ids: Vec<String> = (1..=10).map(|n| format!("fb-heavy-{n:02}")).collect();
+        for id in &ids {
+            legacy_thinly_answered(&mut store, id, Some("fb"));
+            serve_n(&mut store, id, "hook", 1);
+        }
+        let start = record_start(&mut store, "fb-session", "fb");
+        assert_eq!(start.frozen.batch(), &ids[..8]);
+        assert_eq!(start.frozen.batch_later, 2);
+
+        // Settled by the evaluating session's own attested call (a write
+        // to a frozen rule from anywhere else would void the evaluation).
+        let settled = settle_by_naming_the_trigger(&mut store, &ids[0]);
+        attest(&mut store, "fb-session", &ids[0], settled.seq);
+        assert!(!settlement(&store, &ids[0], None).is_owed());
+
+        let owed: Vec<String> = evaluation_frozen_batch_owed(&store, &start).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(owed, ids[1..8].to_vec(), "seven left, and nobody new");
+        let live: Vec<String> = evaluation_teeth_batch(&store, Some("fb")).owed_now.into_iter().map(|(id, _)| id).collect();
+        assert!(live.contains(&ids[8]), "the live batch pulls the ninth in: {live:?}");
+
+        let err = file_in(&mut store, &eval_report("eval-fb-1", "fb"), &start).unwrap_err().to_string();
+        assert!(err.contains("'fb-heavy-02'") && err.contains("'fb-heavy-08'"), "{err}");
+        assert!(!err.contains("fb-heavy-09") && !err.contains("fb-heavy-10") && !err.contains("'fb-heavy-01'"), "{err}");
     }
 
     /// Since step 8 a reason tag settles NOTHING, before or after a check was
@@ -5957,26 +8803,26 @@ mod tests {
     #[test]
     fn a_no_literal_reason_settles_nothing_and_a_note_verdict_settles() {
         let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "s", "l", "a", &eval_report("eval-t-old", "t")).unwrap();
+        file_now(&mut store, &eval_report("eval-t-old", "t")).unwrap();
         let mut rule = heavy_command_rule("never-tried", "t");
         rule.tags = vec![format!("{NO_CATCH_ON_COMMAND_REASON_PREFIX}the same text is in 'fixture-command-never-tried --help' which is legitimate")];
         let body = serde_json::to_string(&rule).unwrap();
         store.append_event("legacy", "never-tried", "migration", EventKind::FactCreated, "never-tried", None, &body).unwrap();
         serve_n(&mut store, "never-tried", "hook", 1);
 
-        let err = declare(&mut store, "s", "l", "a", &eval_report("eval-t-new", "t")).unwrap_err();
+        let err = file_now(&mut store, &eval_report("eval-t-new", "t")).unwrap_err();
         let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
         assert!(refusal.problem.contains("'never-tried'"), "a reason is no answer: {}", refusal.problem);
 
         // A check tried once and given up again: the reason still settles
         // nothing (the old "after a real try" arm is gone).
         try_a_check_then_give_it_up(&mut store, &rule);
-        let err = declare(&mut store, "s", "l", "a", &eval_report("eval-t-new", "t")).unwrap_err();
+        let err = file_now(&mut store, &eval_report("eval-t-new", "t")).unwrap_err();
         assert!(err.to_string().contains("'never-tried'"), "{err}");
 
         settle_by_naming_the_trigger(&mut store, "never-tried");
         assert_eq!(current_verdict(&store, "never-tried"), CurrentVerdict::Note);
-        declare(&mut store, "s", "l", "a", &eval_report("eval-t-new", "t")).expect("a note verdict settles the rule");
+        file_now(&mut store, &eval_report("eval-t-new", "t")).expect("a note verdict settles the rule");
     }
 
     /// THE SCOPE THIS CONDITION ACTUALLY HAS, stated where it is enforced. An
@@ -5990,11 +8836,11 @@ mod tests {
     #[test]
     fn a_fired_global_heavy_rule_blocks_filing_and_the_refusal_names_the_scope_it_really_counts() {
         let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "s", "l", "a", &eval_report("eval-g-old", "g")).unwrap();
+        file_now(&mut store, &eval_report("eval-g-old", "g")).unwrap();
         legacy_thinly_answered(&mut store, "global-heavy", None);
         serve_n(&mut store, "global-heavy", "hook", 1);
 
-        let err = declare(&mut store, "s", "l", "a", &eval_report("eval-g-new", "g")).unwrap_err();
+        let err = file_now(&mut store, &eval_report("eval-g-new", "g")).unwrap_err();
         let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
         assert!(refusal.problem.contains("global-heavy"), "a global rule applies here too: {}", refusal.problem);
         assert!(
@@ -6017,7 +8863,7 @@ mod tests {
     #[test]
     fn an_informing_label_alone_never_settles_a_fired_heavy_rule() {
         let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "s", "l", "a", &eval_report("eval-r-old", "r")).unwrap();
+        file_now(&mut store, &eval_report("eval-r-old", "r")).unwrap();
         legacy_thinly_answered(&mut store, "boxed-heavy", Some("r"));
         let existing = show(&store, "boxed-heavy").unwrap();
         let mut labelled = existing.clone();
@@ -6025,7 +8871,7 @@ mod tests {
         legacy_revise(&mut store, &labelled);
         serve_n(&mut store, "boxed-heavy", "hook", 1);
 
-        let err = declare(&mut store, "s", "l", "a", &eval_report("eval-r-new", "r")).unwrap_err();
+        let err = file_now(&mut store, &eval_report("eval-r-new", "r")).unwrap_err();
         let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
         assert!(refusal.problem.contains("boxed-heavy"), "{}", refusal.problem);
     }
@@ -6049,19 +8895,19 @@ mod tests {
     /// of the two tracks: THOR's trial put it on the note track - a revise
     /// carrying a Note record, the check cleared and the label `teeth:note`
     /// (a reason tag settles nothing any more).
-    fn settle_by_naming_the_trigger(store: &mut EventStore, id: &str) {
+    fn settle_by_naming_the_trigger(store: &mut EventStore, id: &str) -> Event {
         let existing = show(store, id).unwrap();
         let mut noted = existing.clone();
         noted.check = None;
         noted.tags = vec![TEETH_NOTE_TAG.to_string()];
         let record = TrialRecord::seal(trial_fields(&noted, RecordedVerdict::Note));
         let baseline = gate::ClearedFields { check: true, ..Default::default() }.baseline(&existing);
-        revise_tried_scoped(store, "s", "l", "a", &baseline, &noted, &existing, Some("fixture: the trial found no tooth"), None, Some(&record), None)
-            .unwrap();
+        revise_tried_scoped(store, "s", "l", "a", &baseline, &noted, &existing, Some("fixture: the trial found no tooth"), None, Some(&record), None, None)
+            .unwrap()
     }
 
     fn filing_refusal(store: &mut EventStore, report: &str, project: &str) -> Option<String> {
-        match declare(store, "s", "l", "a", &eval_report(report, project)) {
+        match file_now(store, &eval_report(report, project)) {
             Ok(_) => None,
             Err(WriteError::Refused(refusal)) => Some(refusal.problem),
             Err(other) => panic!("expected a refusal or a filing: {other}"),
@@ -6087,7 +8933,7 @@ mod tests {
     #[test]
     fn a_filing_is_held_to_one_batch_and_the_rest_stays_owed() {
         let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "s", "l", "a", &eval_report("eval-w-0", "w")).unwrap();
+        file_now(&mut store, &eval_report("eval-w-0", "w")).unwrap();
         let ids = unsettled_fired_rules(&mut store, "w", 12);
 
         let (batch, rest) = ids.split_at(EVALUATION_TEETH_BATCH.min(ids.len()));
@@ -6132,7 +8978,7 @@ mod tests {
     #[test]
     fn settling_a_batch_member_pulls_the_next_owed_rule_in() {
         let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "s", "l", "a", &eval_report("eval-s-0", "s")).unwrap();
+        file_now(&mut store, &eval_report("eval-s-0", "s")).unwrap();
         let ids = unsettled_fired_rules(&mut store, "s", 10);
         settle_by_naming_the_trigger(&mut store, &ids[0]);
 
@@ -6157,12 +9003,12 @@ mod tests {
     #[test]
     fn the_next_filing_asks_first_for_what_the_last_one_left() {
         let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "s", "l", "a", &eval_report("eval-r0", "rot")).unwrap();
+        file_now(&mut store, &eval_report("eval-r0", "rot")).unwrap();
         let ids = unsettled_fired_rules(&mut store, "rot", 11);
         for id in &ids {
             settle_by_naming_the_trigger(&mut store, id);
         }
-        declare(&mut store, "s", "l", "a", &eval_report("eval-r1", "rot")).unwrap();
+        file_now(&mut store, &eval_report("eval-r1", "rot")).unwrap();
 
         // A fresh batch, written and fired only after `eval-r1` - oldest
         // first, and a rule written later waits behind the older ones.
@@ -6194,7 +9040,7 @@ mod tests {
             declare(&mut store, "s", "l", "a", &settled).unwrap();
             settle_by_naming_the_trigger(&mut store, &settled.id);
         }
-        declare(&mut store, "s", "l", "a", &eval_report("eval-k-0", "k")).unwrap();
+        file_now(&mut store, &eval_report("eval-k-0", "k")).unwrap();
         let ids = unsettled_fired_rules(&mut store, "k", 3);
         for i in 0..EVALUATION_TEETH_BATCH {
             serve_n(&mut store, &format!("old-{i}"), "hook", 3);
@@ -6211,7 +9057,7 @@ mod tests {
     #[test]
     fn a_reason_that_names_the_trigger_no_longer_settles_and_a_note_does() {
         let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "s", "l", "a", &eval_report("eval-n-old", "n")).unwrap();
+        file_now(&mut store, &eval_report("eval-n-old", "n")).unwrap();
         let mut heavy = heavy_command_rule("named-heavy", "n");
         heavy.tags = vec![format!(
             "{}an authorised fixture-command-named-heavy run is typed exactly like a wrong one",
@@ -6219,14 +9065,14 @@ mod tests {
         )];
         declare(&mut store, "s", "l", "a", &heavy).unwrap();
         serve_n(&mut store, "named-heavy", "hook", 1);
-        assert!(declare(&mut store, "s", "l", "a", &eval_report("eval-n-new", "n")).is_err(), "a reason is no answer");
+        assert!(file_now(&mut store, &eval_report("eval-n-new", "n")).is_err(), "a reason is no answer");
         try_a_check_then_give_it_up(&mut store, &heavy);
         assert!(
-            declare(&mut store, "s", "l", "a", &eval_report("eval-n-new", "n")).is_err(),
+            file_now(&mut store, &eval_report("eval-n-new", "n")).is_err(),
             "not after a try either"
         );
         settle_by_naming_the_trigger(&mut store, "named-heavy");
-        declare(&mut store, "s", "l", "a", &eval_report("eval-n-new", "n")).expect("a note verdict settles it");
+        file_now(&mut store, &eval_report("eval-n-new", "n")).expect("a note verdict settles it");
     }
     /// Step 9, the one reader: no label, reason or open point settles a rule
     /// any more - not `teeth:proven-guard`, not `teeth:wired-not-proven`, not
@@ -6236,7 +9082,7 @@ mod tests {
     #[test]
     fn settlement_ignores_tags_and_reasons() {
         let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "s", "l", "a", &eval_report("eval-w9-old", "w9")).unwrap();
+        file_now(&mut store, &eval_report("eval-w9-old", "w9")).unwrap();
         let labels = [
             TEETH_PROVEN_TAG.to_string(),
             TEETH_WIRED_TAG.to_string(),
@@ -6255,13 +9101,13 @@ mod tests {
             rule.check = Some(Check::Forbidden { literals: vec!["--force".to_string()] });
             legacy(&mut store, &rule);
             serve_n(&mut store, &rule.id, "hook", 1);
-            assert!(settlement(&store, &rule.id).is_owed(), "{label} settles nothing: {:?}", settlement(&store, &rule.id));
+            assert!(settlement(&store, &rule.id, None).is_owed(), "{label} settles nothing: {:?}", settlement(&store, &rule.id, None));
             ids.push(rule.id);
         }
         let mut point = open_point("open-labelled", "w9");
         point.text = format!("{} still has to refuse a real --force push", ids.join(", "));
         declare(&mut store, "s", "l", "a", &point).unwrap();
-        let err = declare(&mut store, "s", "l", "a", &eval_report("eval-w9-new", "w9")).unwrap_err();
+        let err = file_now(&mut store, &eval_report("eval-w9-new", "w9")).unwrap_err();
         let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
         for id in &ids {
             assert!(refusal.problem.contains(&format!("'{id}'")), "an open point carries nothing: {}", refusal.problem);
@@ -6271,10 +9117,10 @@ mod tests {
         for id in &ids {
             let rule = show(&store, id).unwrap();
             let record = sealed(&rule, RecordedVerdict::RuleWired);
-            revise_tried_scoped(&mut store, "s", "l", "a", &rule, &rule, &rule, None, None, Some(&record), None).unwrap();
-            assert_eq!(settlement(&store, id), Settlement::Settled(Settled::Rule { proven: false }));
+            revise_tried_scoped(&mut store, "s", "l", "a", &rule, &rule, &rule, None, None, Some(&record), None, None).unwrap();
+            assert_eq!(settlement(&store, id, None), Settlement::Settled(Settled::Rule { proven: false }));
         }
-        declare(&mut store, "s", "l", "a", &eval_report("eval-w9-new", "w9")).expect("verdicts settle them");
+        file_now(&mut store, &eval_report("eval-w9-new", "w9")).expect("verdicts settle them");
     }
 
     /// A verdict counts only while the rule is the one tried: a rewrite of
@@ -6284,17 +9130,17 @@ mod tests {
         let mut store = EventStore::in_memory().unwrap();
         let rule = force_push_rule("rewritten");
         declare_tried(&mut store, &rule, &sealed(&rule, RecordedVerdict::RuleWired));
-        assert_eq!(settlement(&store, "rewritten"), Settlement::Settled(Settled::Rule { proven: false }));
+        assert_eq!(settlement(&store, "rewritten", None), Settlement::Settled(Settled::Rule { proven: false }));
         let mut changed = rule.clone();
         changed.text = "Never run `git push --force`, not even on a branch of your own.".to_string();
         legacy_revise(&mut store, &changed);
         assert_eq!(
-            settlement(&store, "rewritten"),
+            settlement(&store, "rewritten", None),
             Settlement::Owed { why: "its text changed after its last trial".to_string() }
         );
         // Back to the text it was tried with: the same record counts again.
         legacy_revise(&mut store, &rule);
-        assert_eq!(settlement(&store, "rewritten"), Settlement::Settled(Settled::Rule { proven: false }));
+        assert_eq!(settlement(&store, "rewritten", None), Settlement::Settled(Settled::Rule { proven: false }));
     }
 
     /// D8: lowering a heavy rule's severity (a raw fixture event, the shape
@@ -6304,16 +9150,16 @@ mod tests {
     #[test]
     fn lowering_severity_never_takes_a_rule_out_of_rot() {
         let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "s", "l", "a", &eval_report("eval-ls-old", "ls")).unwrap();
+        file_now(&mut store, &eval_report("eval-ls-old", "ls")).unwrap();
         let mut noted = heavy_command_rule("noted-heavy", "ls");
         noted.tags = vec![];
         declare_noted(&mut store, &noted);
-        assert!(!settlement(&store, "noted-heavy").is_owed());
+        assert!(!settlement(&store, "noted-heavy", None).is_owed());
         let mut lowered = noted.clone();
         lowered.severity = None;
         legacy_revise(&mut store, &lowered);
         assert_eq!(
-            settlement(&store, "noted-heavy"),
+            settlement(&store, "noted-heavy", None),
             Settlement::Owed { why: "its severity changed after its last trial".to_string() }
         );
 
@@ -6321,7 +9167,7 @@ mod tests {
         let mut light = show(&store, "owed-heavy").unwrap();
         light.severity = None;
         legacy_revise(&mut store, &light);
-        assert!(settlement(&store, "owed-heavy").is_owed());
+        assert!(settlement(&store, "owed-heavy", None).is_owed());
         let owed: Vec<String> = evaluation_teeth_batch(&store, Some("ls")).owed_now.into_iter().map(|(id, _)| id).collect();
         assert!(owed.contains(&"owed-heavy".to_string()) && owed.contains(&"noted-heavy".to_string()), "{owed:?}");
     }
@@ -6337,7 +9183,7 @@ mod tests {
     fn a_blocked_rule_is_settled_only_while_its_blocker_holds() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "s", "l", "a", &eval_report("eval-gamma-old", "gamma")).unwrap();
+        file_now(&mut store, &eval_report("eval-gamma-old", "gamma")).unwrap();
         let mut rule = heavy_command_rule("gamma-keeps", "gamma");
         rule.text = "NOTES.md must keep the line `keep me`.".to_string();
         rule.tags = vec![];
@@ -6346,10 +9192,10 @@ mod tests {
         legacy(&mut store, &rule);
         serve_n(&mut store, "gamma-keeps", "hook", 1);
         assert_eq!(
-            settlement(&store, "gamma-keeps"),
+            settlement(&store, "gamma-keeps", None),
             Settlement::Settled(Settled::Blocked(Blocker::NoWorkingCopy { project: "gamma".to_string() }))
         );
-        declare(&mut store, "s", "l", "a", &eval_report("eval-gamma-1", "gamma")).expect("a blocked rule holds no filing");
+        file_now(&mut store, &eval_report("eval-gamma-1", "gamma")).expect("a blocked rule holds no filing");
 
         // Registered: a real checkout named gamma, NOTES.md committed on main.
         let checkout = dir.path().join("gamma");
@@ -6370,25 +9216,25 @@ mod tests {
         let record = project_record("gamma");
         let body = body_with_root(&canonical_body(&record).unwrap(), checkout.to_str().unwrap(), "2026-09-29T00:00:00Z").unwrap();
         store.append_event("install", "install", INSTALLER_ACTOR, EventKind::FactCreated, &record.id, None, &body).unwrap();
-        assert!(settlement(&store, "gamma-keeps").is_owed(), "registered: owed again");
-        let err = declare(&mut store, "s", "l", "a", &eval_report("eval-gamma-2", "gamma")).unwrap_err();
+        assert!(settlement(&store, "gamma-keeps", None).is_owed(), "registered: owed again");
+        let err = file_now(&mut store, &eval_report("eval-gamma-2", "gamma")).unwrap_err();
         assert!(err.to_string().contains("'gamma-keeps'"), "{err}");
 
         // Mid-change in the owner's checkout: the default branch still has it.
         std::fs::write(checkout.join("NOTES.md"), "plain line\n").unwrap();
         assert_eq!(
-            settlement(&store, "gamma-keeps"),
+            settlement(&store, "gamma-keeps", None),
             Settlement::Settled(Settled::Blocked(Blocker::WorkingTreeDiffers { path: "NOTES.md".to_string() }))
         );
         std::fs::write(checkout.join("NOTES.md"), "keep me\nplain line\n").unwrap();
-        assert!(settlement(&store, "gamma-keeps").is_owed(), "the tree has it again: owed");
+        assert!(settlement(&store, "gamma-keeps", None).is_owed(), "the tree has it again: owed");
 
         // A global rule's file check: never blocked.
         let mut global = rule.clone();
         global.id = "global-keeps".to_string();
         global.project = None;
         legacy(&mut store, &global);
-        assert!(settlement(&store, "global-keeps").is_owed());
+        assert!(settlement(&store, "global-keeps", None).is_owed());
     }
 
     /// Retracted, or taken off the rule track: settled; a rule with a note
@@ -6397,8 +9243,8 @@ mod tests {
     fn a_retracted_or_archived_rule_and_every_note_shape_are_settled() {
         let mut store = EventStore::in_memory().unwrap();
         legacy_thinly_answered(&mut store, "to-retract", Some("rt"));
-        retract(&mut store, "s", "l", "a", "to-retract", "fixture-command-to-retract no longer exists").unwrap();
-        assert_eq!(settlement(&store, "to-retract"), Settlement::Settled(Settled::Retracted));
+        retract(&mut store, "s", "l", "a", "to-retract", "fixture-command-to-retract no longer exists", None).unwrap();
+        assert_eq!(settlement(&store, "to-retract", None), Settlement::Settled(Settled::Retracted));
 
         let mut report = heavy_command_rule("now-a-report", "rt");
         report.kind = Kind::Report;
@@ -6406,7 +9252,7 @@ mod tests {
         report.severity = None;
         report.tags = vec![];
         legacy(&mut store, &report);
-        assert_eq!(settlement(&store, "now-a-report"), Settlement::Settled(Settled::OffTheRuleTrack));
+        assert_eq!(settlement(&store, "now-a-report", None), Settlement::Settled(Settled::OffTheRuleTrack));
 
         let mut disputed = heavy_command_rule("disputed", "rt");
         disputed.tags = vec![];
@@ -6418,7 +9264,7 @@ mod tests {
         });
         declare_tried(&mut store, &disputed, &TrialRecord::seal(fields));
         assert_eq!(
-            settlement(&store, "disputed"),
+            settlement(&store, "disputed", None),
             Settlement::Settled(Settled::Note { pending: Some(PendingWhy::NoWorkingCopy), by_dispute: true })
         );
     }
@@ -6433,53 +9279,34 @@ mod tests {
     #[test]
     fn a_heavy_rule_that_never_fired_since_the_previous_report_now_fills_a_place() {
         let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "s", "l", "a", &eval_report("eval-t-old", "t")).unwrap();
+        file_now(&mut store, &eval_report("eval-t-old", "t")).unwrap();
         // Declared after the previous report and never served at all.
         declare(&mut store, "s", "l", "a", &heavy_command_rule("never-fired", "t")).unwrap();
 
-        let err = declare(&mut store, "s", "l", "a", &eval_report("eval-t-new", "t")).unwrap_err();
+        let err = file_now(&mut store, &eval_report("eval-t-new", "t")).unwrap_err();
         let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
         assert!(refusal.problem.contains("never-fired"), "{}", refusal.problem);
         assert!(refusal.problem.contains("did not fire since the previous report"), "{}", refusal.problem);
 
         settle_by_naming_the_trigger(&mut store, "never-fired");
-        declare(&mut store, "s", "l", "a", &eval_report("eval-t-newer", "t")).expect("settled, so it fills its place cleanly");
+        file_now(&mut store, &eval_report("eval-t-newer", "t")).expect("settled, so it fills its place cleanly");
     }
 
+    /// Step 14: an open point an agent filed (a legacy point) holds no
+    /// filing - not when it is older than the previous report, not when it
+    /// was never closed or carried.
     #[test]
-    fn evaluation_report_filing_is_refused_by_an_open_point_older_than_the_previous_report() {
+    fn a_legacy_open_point_holds_no_filing() {
         let mut store = EventStore::in_memory().unwrap();
         declare(&mut store, "s", "l", "a", &open_point("open-u-1", "u")).unwrap();
-        declare(&mut store, "s", "l", "a", &eval_report("eval-u-1", "u")).expect("a brand-new open point must never block its own contemporaneous report");
+        file_now(&mut store, &eval_report("eval-u-1", "u")).unwrap();
+        file_now(&mut store, &eval_report("eval-u-2", "u")).expect("a legacy open point holds no filing");
+        let points = open_points(&store, Some("u"));
+        assert_eq!(points.len(), 1);
+        assert!(!points[0].machine, "filed by an agent: legacy");
 
-        let err = declare(&mut store, "s", "l", "a", &eval_report("eval-u-2", "u")).unwrap_err();
-        let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
-        assert!(refusal.problem.contains("open-u-1"), "{}", refusal.problem);
-        assert!(refusal.problem.contains("neither closed nor carried"), "{}", refusal.problem);
-    }
-
-    #[test]
-    fn closing_the_open_point_with_a_retraction_lets_filing_through() {
-        let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "s", "l", "a", &open_point("open-v-1", "v")).unwrap();
-        declare(&mut store, "s", "l", "a", &eval_report("eval-v-1", "v")).unwrap();
-        retract(&mut store, "s", "l", "a", "open-v-1", "resolved during the next evaluation").unwrap();
-
-        declare(&mut store, "s", "l", "a", &eval_report("eval-v-2", "v")).expect("a closed open point must never block filing");
-    }
-
-    #[test]
-    fn carrying_the_open_point_forward_once_lets_filing_through() {
-        let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "s", "l", "a", &open_point("open-w-1", "w")).unwrap();
-        declare(&mut store, "s", "l", "a", &eval_report("eval-w-1", "w")).unwrap();
-        let existing = show(&store, "open-w-1").unwrap();
-        let mut carried = existing.clone();
-        carried.tags.push(format!("{OPEN_POINT_CARRIED_PREFIX}1"));
-        revise(&mut store, "s", "l", "a", &existing, &carried).unwrap();
-
-        declare(&mut store, "s", "l", "a", &eval_report("eval-w-2", "w"))
-            .expect("an open point carried forward exactly once must not block filing");
+        retract(&mut store, "s", "l", "a", "open-u-1", "resolved during the next evaluation", None).expect("a legacy point is still closed by a retraction");
+        assert!(open_points(&store, Some("u")).is_empty());
     }
 
     #[test]
@@ -6500,26 +9327,182 @@ mod tests {
 
         let points = open_points(&store, Some("x"));
         assert_eq!(points.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), vec!["open-x-1", "open-x-2"]);
-        assert!(points.iter().all(|p| p.carried == 0));
+        assert!(points.iter().all(|p| p.carried == 0 && !p.machine));
+
+        // THOR's own point, written later, still leads the list.
+        let blocker = Blocker::NoWorkingCopy { project: "x".to_string() };
+        let actor = SystemActor::new(EVAL_MACHINE_ACTOR);
+        write_machine_point(&mut store, actor, "sess", "x", &blocker, "fixture machine point text").unwrap().expect("written");
+        let points = open_points(&store, Some("x"));
+        assert_eq!(
+            points.iter().map(|p| (p.id.as_str(), p.machine)).collect::<Vec<_>>(),
+            vec![("open-no-working-copy-x", true), ("open-x-1", false), ("open-x-2", false)]
+        );
+        assert_eq!((points[0].subject.as_deref(), points[0].blocker.as_deref()), (Some("x"), Some("no-working-copy")));
     }
 
-    /// G (2026-09-26): a carry covers ONE filing. Once a report was filed
-    /// after the carry, the point blocks again - it used to stop blocking for
-    /// good the moment its tag read `carried:1`.
+    /// THOR's own open point: written once, left alone when nothing changed,
+    /// revised when its text did, closed with a derived reason, and re-opened
+    /// on the same id when the blocker is back - by `eval-machine` only.
     #[test]
-    fn a_carried_open_point_blocks_again_once_a_report_was_filed_after_the_carry() {
+    fn a_machine_point_is_written_closed_and_reopened_by_eval_machine_only() {
         let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "s", "l", "a", &open_point("open-g-1", "gg")).unwrap();
-        declare(&mut store, "s", "l", "a", &eval_report("eval-gg-1", "gg")).unwrap();
-        let existing = show(&store, "open-g-1").unwrap();
-        let mut carried = existing.clone();
-        carried.tags.push(format!("{OPEN_POINT_CARRIED_PREFIX}1"));
-        revise(&mut store, "s", "l", "a", &existing, &carried).unwrap();
-        declare(&mut store, "s", "l", "a", &eval_report("eval-gg-2", "gg")).expect("the one carry covers this filing");
+        let blocker = Blocker::WorkingTreeDiffers { path: "docs/NOTES.md".to_string() };
+        let machine = || SystemActor::new(EVAL_MACHINE_ACTOR);
+        let id = machine_point_id("Acme Demo", &blocker);
+        assert_eq!(id, "open-working-tree-differs-acme-demo-docs-notes-md");
 
-        let err = declare(&mut store, "s", "l", "a", &eval_report("eval-gg-3", "gg")).unwrap_err();
-        let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
-        assert!(refusal.problem.contains("open-g-1"), "the carry is used up: {}", refusal.problem);
+        let created = write_machine_point(&mut store, machine(), "sess", "Acme Demo", &blocker, "first text").unwrap().expect("created");
+        assert_eq!((created.kind, created.actor.as_str(), created.session_id.as_str()), (EventKind::FactCreated, EVAL_MACHINE_ACTOR, "sess"));
+        let item = show(&store, &id).unwrap();
+        assert_eq!(item.tags, vec!["open-point".to_string(), "about:docs/NOTES.md".to_string(), "blocker:working-tree-differs".to_string()]);
+        assert!(is_machine_point(&store, &id));
+        assert!(write_machine_point(&mut store, machine(), "sess", "Acme Demo", &blocker, "first text").unwrap().is_none(), "same text: nothing written");
+        let revised = write_machine_point(&mut store, machine(), "sess", "Acme Demo", &blocker, "second text").unwrap().expect("revised");
+        assert_eq!(revised.kind, EventKind::FactRevised);
+
+        // Nobody else writes on it: not a retract, not a revise, not a create.
+        let err = retract(&mut store, "s", "l", "mcp", &id, "closing it by hand", None).unwrap_err().to_string();
+        assert!(err.contains("this open point is THOR's own") && err.contains("closes itself when its subject settles"), "{err}");
+        let err = declare(&mut store, "s", "l", "mcp", &open_point("open-no-working-copy-acme", "acme")).unwrap_err().to_string();
+        assert!(err.contains("THOR's own"), "{err}");
+        assert!(write_machine_point(&mut store, SystemActor::new("retest"), "sess", "Acme Demo", &blocker, "x").is_err());
+
+        let closed = retract_machine_point(&mut store, machine(), "sess", &id, "docs/NOTES.md holds the literal again").unwrap();
+        assert_eq!(closed.map(|e| e.kind), Some(EventKind::FactRetracted));
+        assert!(!is_machine_point(&store, &id) && open_points(&store, Some("Acme Demo")).is_empty());
+        assert!(retract_machine_point(&mut store, machine(), "sess", &id, "again").unwrap().is_none(), "not live: nothing written");
+
+        let reopened = write_machine_point(&mut store, machine(), "sess", "Acme Demo", &blocker, "third text").unwrap().expect("re-opened");
+        assert_eq!(reopened.kind, EventKind::FactRevised);
+        assert_eq!(show(&store, &id).unwrap().text, "third text");
+        assert!(is_machine_point(&store, &id));
+        let listed = open_points(&store, Some("Acme Demo"));
+        assert_eq!(listed.iter().map(|p| (p.id.as_str(), p.machine)).collect::<Vec<_>>(), vec![(id.as_str(), true)], "live again, on the same id");
+        assert_eq!(
+            store.get_events_by_entity(&id).unwrap().iter().map(|e| e.kind).collect::<Vec<_>>(),
+            vec![EventKind::FactCreated, EventKind::FactRevised, EventKind::FactRetracted, EventKind::FactRevised],
+            "its history shows every time the blocker held and lifted"
+        );
+    }
+
+    /// K10, step 14: a rule is held only by a blocker THOR itself found. An
+    /// open point an agent filed about it settles nothing; neither does a
+    /// Report that merely looks like THOR's point. And for one evaluation the
+    /// blocker counts only when its machine pass found it AT THE START.
+    #[test]
+    fn only_a_machine_blocker_settles_a_rule() {
+        let mut store = EventStore::in_memory().unwrap();
+        // A rule with no verdict, and an agent-filed open point naming it.
+        legacy_thinly_answered(&mut store, "mb-rule", Some("mb"));
+        let mut point = open_point("open-mb-rule", "mb");
+        point.text = "mb-rule still needs a real call, later.".to_string();
+        declare(&mut store, "s", "l", "a", &point).unwrap();
+        assert!(settlement(&store, "mb-rule", None).is_owed(), "an agent-filed open point settles nothing");
+
+        // The same, shaped like THOR's own point and written raw by another
+        // actor (what an older binary could have left): not a machine point.
+        let blocker = Blocker::NoWorkingCopy { project: "mb".to_string() };
+        let forged = Item { id: machine_point_id("mb", &blocker), tags: machine_point_tags(&blocker), ..point.clone() };
+        let body = serde_json::to_string(&forged).unwrap();
+        store.append_event("s", "l", "a", EventKind::FactCreated, &forged.id, None, &body).unwrap();
+        assert!(!is_machine_point(&store, &forged.id));
+        assert!(open_points(&store, Some("mb")).iter().all(|p| !p.machine));
+        assert!(settlement(&store, "mb-rule", None).is_owed());
+
+        // A file check in a project with no registered working copy: held by
+        // the machine's own blocker, read from the registration.
+        let mut rule = heavy_command_rule("mb-file", "mb");
+        rule.text = "NOTES.md must keep the line `keep me`.".to_string();
+        rule.tags = vec![];
+        rule.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "NOTES.md".to_string() }];
+        rule.check = Some(Check::Contains { path: "NOTES.md".to_string(), literal: "keep me".to_string() });
+        legacy(&mut store, &rule);
+        assert_eq!(settlement(&store, "mb-file", None), Settlement::Settled(Settled::Blocked(blocker.clone())));
+
+        // For one evaluation: blocked only when its pass found it blocked.
+        let first = record_start_only(&mut store, "mb-session", "mb");
+        let unseen = decide_start(&mut store, &first, vec![], 0, vec![], vec![]);
+        assert!(settlement(&store, "mb-file", Some(&unseen)).is_owed(), "the pass never found it blocked");
+        let second = record_start_only(&mut store, "mb-session-2", "mb");
+        let items = vec![machine_item("mb-file", MachineOutcome::Blocked, "blocked: 'mb' has no registered working copy", Some(&blocker))];
+        let seen = decide_start(&mut store, &second, vec![], 0, vec![], items);
+        assert_eq!(settlement(&store, "mb-file", Some(&seen)), Settlement::Settled(Settled::Blocked(blocker)));
+        file_in(&mut store, &eval_report("eval-mb-1", "mb"), &seen).expect("a rule held by the machine's blocker holds no filing");
+    }
+
+    /// A blocker that held at one evaluation's start and no longer holds:
+    /// the rule is the next start's to decide - in that start's batch when it
+    /// needs the agent - and it holds that filing until it has a verdict.
+    #[test]
+    fn a_blocker_that_stopped_holding_puts_the_rule_in_the_next_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = EventStore::in_memory().unwrap();
+        let mut rule = heavy_command_rule("bs-keeps", "gamma");
+        rule.text = "NOTES.md must keep its first line.".to_string();
+        rule.tags = vec![];
+        rule.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "NOTES.md".to_string() }];
+        rule.check = Some(Check::Contains { path: "NOTES.md".to_string(), literal: "keep me".to_string() });
+        legacy(&mut store, &rule);
+        let blocker = Blocker::NoWorkingCopy { project: "gamma".to_string() };
+
+        let first = record_start_only(&mut store, "bs-session-1", "gamma");
+        let items = vec![machine_item("bs-keeps", MachineOutcome::Blocked, "blocked: no registered working copy", Some(&blocker))];
+        let first = decide_start(&mut store, &first, vec![], 0, vec![], items);
+        assert_eq!(settlement(&store, "bs-keeps", Some(&first)), Settlement::Settled(Settled::Blocked(blocker.clone())));
+        file_in(&mut store, &eval_report("eval-gamma-1", "gamma"), &first).expect("blocked at the start: not this filing's");
+
+        // The project gets registered: the blocker no longer holds.
+        let checkout = dir.path().join("gamma");
+        std::fs::create_dir_all(checkout.join(".git")).unwrap();
+        std::fs::write(checkout.join("NOTES.md"), "keep me\nplain line\n").unwrap();
+        let record = project_record("gamma");
+        let body = body_with_root(&canonical_body(&record).unwrap(), checkout.to_str().unwrap(), "2026-09-29T00:00:00Z").unwrap();
+        store.append_event("install", "install", INSTALLER_ACTOR, EventKind::FactCreated, &record.id, None, &body).unwrap();
+        assert!(settlement(&store, "bs-keeps", None).is_owed(), "registered: owed again, read now");
+        assert_eq!(
+            settlement(&store, "bs-keeps", Some(&first)),
+            Settlement::Settled(Settled::Blocked(blocker)),
+            "the first evaluation is judged by what held at ITS start"
+        );
+
+        // The next start tries it for real; here its text does not name the
+        // literal, so it needs the agent: it is on that start's A4 list.
+        let second = record_start_only(&mut store, "bs-session-2", "gamma");
+        let items = vec![machine_item("bs-keeps", MachineOutcome::A4Only, "A4: 'keep me' not named in the text", None)];
+        let second = decide_start(&mut store, &second, vec![], 0, vec!["bs-keeps".to_string()], items);
+        assert_eq!(settlement(&store, "bs-keeps", Some(&second)), Settlement::Owed { why: "A4: 'keep me' not named in the text".to_string() });
+        let err = file_in(&mut store, &eval_report("eval-gamma-2", "gamma"), &second).unwrap_err().to_string();
+        assert!(err.contains("'bs-keeps'") && err.contains("A4: 'keep me' not named in the text"), "{err}");
+
+        // A verdict written after that start - by the evaluating session's
+        // own attested call - settles it.
+        let settled = settle_by_naming_the_trigger(&mut store, "bs-keeps");
+        attest(&mut store, "bs-session-2", "bs-keeps", settled.seq);
+        assert!(!settlement(&store, "bs-keeps", Some(&second)).is_owed());
+        file_in(&mut store, &eval_report("eval-gamma-2", "gamma"), &second).expect("decided since the start");
+    }
+
+    /// F10: while THOR's machine pass has not finished - the start record
+    /// holds no batch - nothing can be filed, and the refusal says to end the
+    /// turn once.
+    #[test]
+    fn filing_is_refused_while_the_start_record_holds_no_batch() {
+        let mut store = EventStore::in_memory().unwrap();
+        let pending = record_start_only(&mut store, "sd-session", "sd");
+        assert!(!pending.frozen.decided());
+        let err = file_in(&mut store, &eval_report("eval-sd-1", "sd"), &pending).unwrap_err().to_string();
+        assert!(err.contains(STILL_DECIDING), "{err}");
+        assert!(show(&store, "eval-sd-1").is_err(), "nothing stored");
+
+        let decided = decide_start(&mut store, &pending, vec![], 0, vec![], vec![]);
+        assert_eq!(open_evaluation_start(&store, "sd-session", "sd"), Some(decided.clone()), "read back with its batch");
+        file_in(&mut store, &eval_report("eval-sd-1", "sd"), &decided).expect("the batch is written and empty: it files");
+        let actor = SystemActor::new(EVAL_MACHINE_ACTOR);
+        assert!(
+            record_evaluation_batch(&mut store, actor, &decided, "again", vec![], 0, vec![], MachinePass::default()).is_err(),
+            "an evaluation's lists are written once"
+        );
     }
 
     /// G (2026-09-26): an open point is closed by a retraction with a reason,
@@ -6542,52 +9525,6 @@ mod tests {
         assert!(revise(&mut store, "s", "l", "a", &now, &uncarried).is_err(), "lowering the carry must be refused");
     }
 
-    /// CHANGE 4 (2026-09-27): retracting a carried open point and filing a
-    /// fresh one under a new id, naming the same rule, must not reset the
-    /// carry count to zero - see `check_open_point_carry_inherited`'s own
-    /// doc comment. Measured on a copy of a real store: 12 open points carry
-    /// an id ending `-2`, and for every one the original was retracted
-    /// first, exactly this shape.
-    #[test]
-    fn retracting_a_carried_open_point_and_filing_a_new_one_about_the_same_rule_inherits_the_carry() {
-        let mut store = EventStore::in_memory().unwrap();
-        // A real live rule the open point's own text can name - settled by a
-        // Note verdict, so it cannot confuse this test with a second,
-        // unrelated refusal.
-        declare_noted(&mut store, &light_command_rule("carry-rule", "cr"));
-
-        let mut point = open_point("open-carry-rule", "cr");
-        point.text = "carry-rule still needs a real refusal through the real hook".to_string();
-        declare(&mut store, "s", "l", "a", &point).unwrap();
-        declare(&mut store, "s", "l", "a", &eval_report("eval-cr-1", "cr")).unwrap();
-        let existing = show(&store, "open-carry-rule").unwrap();
-        let mut carried = existing.clone();
-        carried.tags.push(format!("{OPEN_POINT_CARRIED_PREFIX}1"));
-        revise(&mut store, "s", "l", "a", &existing, &carried).unwrap();
-        retract(&mut store, "s", "l", "a", "open-carry-rule", "closing it to reopen fresh").unwrap();
-
-        // A brand-new id, same rule named, carrying nothing of its own.
-        let mut fresh = open_point("open-carry-rule-2", "cr");
-        fresh.text = "carry-rule still has not met a real call".to_string();
-        let err = declare(&mut store, "s", "l", "a", &fresh).unwrap_err();
-        let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
-        assert!(refusal.problem.contains("carry-rule"), "{}", refusal.problem);
-        assert!(refusal.problem.contains("carried forward 1 time"), "{}", refusal.problem);
-
-        // Starting it at the inherited count is accepted.
-        fresh.tags.push(format!("{OPEN_POINT_CARRIED_PREFIX}1"));
-        declare(&mut store, "s", "l", "a", &fresh).expect("starting at the inherited count must be accepted");
-
-        // And ground 30 still refuses carrying THIS one past 1, exactly as
-        // it always has - the fix closes the cross-entity gap, never
-        // ground 30's own limit.
-        let fresh_existing = show(&store, "open-carry-rule-2").unwrap();
-        let mut over = fresh_existing.clone();
-        over.tags.retain(|t| !t.starts_with(OPEN_POINT_CARRIED_PREFIX));
-        over.tags.push(format!("{OPEN_POINT_CARRIED_PREFIX}2"));
-        assert!(revise(&mut store, "s", "l", "a", &fresh_existing, &over).is_err(), "a second carry still needs the owner");
-    }
-
     /// D (2026-09-26): an evaluation report already filed for ANOTHER
     /// project, moved onto this one, is a filing for this one - through both
     /// revise doors.
@@ -6596,16 +9533,21 @@ mod tests {
         let mut store = EventStore::in_memory().unwrap();
         legacy_thinly_answered(&mut store, "unboxed-d", Some("dd"));
         serve_n(&mut store, "unboxed-d", "hook", 1);
-        declare(&mut store, "s", "l", "a", &eval_report("eval-elsewhere", "other")).unwrap();
+        file_now(&mut store, &eval_report("eval-elsewhere", "other")).unwrap();
 
         let filed = show(&store, "eval-elsewhere").unwrap();
         let mut moved = filed.clone();
         moved.project = Some("dd".to_string());
+        // Through a door with no filing context: refused outright (step 15).
         let err = revise(&mut store, "s", "l", "a", &filed, &moved).unwrap_err();
         let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
-        assert!(refusal.problem.contains("no current verdict from THOR's trial"), "{}", refusal.problem);
+        assert!(refusal.problem.contains("not coming through a THOR tool call"), "{}", refusal.problem);
 
-        let err = revise_because(&mut store, "s", "l", "a", &filed, &moved, &filed, None).unwrap_err();
+        // With the context of an evaluation of 'dd': held to that project's
+        // own lists, which hold the owed rule.
+        let start = record_start(&mut store, "s", "dd");
+        let ctx = FilingContext::new(INFLIGHT_SEEN, start).unwrap();
+        let err = revise_because_scoped(&mut store, "s", "l", "a", &filed, &moved, &filed, None, Some(&ctx)).unwrap_err();
         let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
         assert!(refusal.problem.contains("no current verdict from THOR's trial"), "the assistant's own revise door too: {}", refusal.problem);
         assert_eq!(show(&store, "eval-elsewhere").unwrap().project.as_deref(), Some("other"), "nothing moved");
@@ -6623,8 +9565,12 @@ mod tests {
         declare(&mut store, "s", "l", "a", &plain).unwrap();
         let mut tagged = plain.clone();
         tagged.tags.push(EVALUATION_REPORT_TAG.to_string());
-        let scope = started_now(&store, "s");
-        assert!(revise_because_scoped(&mut store, "s", "l", "a", &plain, &tagged, &plain, None, Some(&scope)).is_err());
+        // Even with the filing context of an open evaluation: the owed
+        // verdict on its list refuses this filing like any other.
+        let start = record_start(&mut store, "s", "ee");
+        let ctx = FilingContext::new(INFLIGHT_SEEN, start).unwrap();
+        let err = revise_because_scoped(&mut store, "s", "l", "a", &plain, &tagged, &plain, None, Some(&ctx)).unwrap_err();
+        assert!(err.to_string().contains("'owed-e'"), "{err}");
     }
 
     /// E (2026-09-26): a heavy rule is not retracted on a reason that fits
@@ -6634,8 +9580,8 @@ mod tests {
         let mut store = EventStore::in_memory().unwrap();
         let item = sample();
         declare(&mut store, "s", "l", "a", &item).unwrap();
-        assert!(retract(&mut store, "s", "l", "a", &item.id, "no longer relevant for this project").is_err());
-        retract(&mut store, "s", "l", "a", &item.id, "config/app.toml no longer exists").unwrap();
+        assert!(retract(&mut store, "s", "l", "a", &item.id, "no longer relevant for this project", None).is_err());
+        retract(&mut store, "s", "l", "a", &item.id, "config/app.toml no longer exists", None).unwrap();
     }
 
     // ------------------------------------------------ the batch gate, 2026-09-27
@@ -6719,15 +9665,15 @@ mod tests {
     #[test]
     fn no_refusal_settles_anything_attested_or_not() {
         let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "s", "l", "a", &eval_report("eval-bit-old", "bit")).unwrap();
+        file_now(&mut store, &eval_report("eval-bit-old", "bit")).unwrap();
         legacy(&mut store, &wired_forbidden("bit-rule", "bit", "--force"));
         served_in(&mut store, REAL_SESSION, "bit-rule");
         let seq = refused_in(&mut store, REAL_SESSION, "bit-rule", "fixture-command-bit-rule --force");
-        assert!(settlement(&store, "bit-rule").is_owed(), "unverified");
+        assert!(settlement(&store, "bit-rule", None).is_owed(), "unverified");
         attested(&mut store, REAL_SESSION, "bit-rule", seq, true);
         assert_eq!(attested_field_refusals(&store.get_all_events().unwrap()), HashSet::from([seq]));
-        assert!(settlement(&store, "bit-rule").is_owed(), "verified as field evidence, still no verdict");
-        let err = declare(&mut store, "s", "l", "a", &eval_report("eval-bit-new", "bit")).unwrap_err();
+        assert!(settlement(&store, "bit-rule", None).is_owed(), "verified as field evidence, still no verdict");
+        let err = file_now(&mut store, &eval_report("eval-bit-new", "bit")).unwrap_err();
         assert!(err.to_string().contains("'bit-rule'"), "{err}");
 
         // A refusal under a non-hook actor, and one from a session with no
@@ -6736,15 +9682,15 @@ mod tests {
         store
             .append_event("s", "l", "probe", EventKind::GateRefused, "bit-rule", None, &serde_json::json!({"target": "x --force"}).to_string())
             .unwrap();
-        assert!(settlement(&store, "bit-rule").is_owed());
+        assert!(settlement(&store, "bit-rule", None).is_owed());
 
         // Green: the trial's verdict settles it.
         let rule = show(&store, "bit-rule").unwrap();
         let mut named = rule.clone();
         named.text = "fixture heavy rule bit-rule: never with --force".to_string();
-        revise_tried_scoped(&mut store, "s", "l", "a", &rule, &named, &rule, None, None, Some(&sealed(&named, RecordedVerdict::RuleWired)), None)
+        revise_tried_scoped(&mut store, "s", "l", "a", &rule, &named, &rule, None, None, Some(&sealed(&named, RecordedVerdict::RuleWired)), None, None)
             .unwrap();
-        declare(&mut store, "s", "l", "a", &eval_report("eval-bit-new", "bit")).expect("the verdict settles it");
+        file_now(&mut store, &eval_report("eval-bit-new", "bit")).expect("the verdict settles it");
     }
 
     /// The writer of a verification: only THOR's attester, once per refusal.
@@ -6794,7 +9740,7 @@ mod tests {
     #[test]
     fn a_probe_event_is_never_field_evidence() {
         let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "s", "l", "a", &eval_report("eval-co-old", "co")).unwrap();
+        file_now(&mut store, &eval_report("eval-co-old", "co")).unwrap();
         // Global, so no missing working copy holds it (that would settle it
         // as blocked): owed, and a probe changes nothing about that.
         let mut rule = wired_contains("co-rule", "co", "NOTES.md", "keep me");
@@ -6821,8 +9767,8 @@ mod tests {
                 .unwrap();
         }
         assert!(attested_field_refusals(&store.get_all_events().unwrap()).is_empty(), "never field evidence");
-        assert!(settlement(&store, "co-rule").is_owed(), "{:?}", settlement(&store, "co-rule"));
-        let err = declare(&mut store, "s", "l", "a", &eval_report("eval-co-new", "co")).unwrap_err();
+        assert!(settlement(&store, "co-rule", None).is_owed(), "{:?}", settlement(&store, "co-rule", None));
+        let err = file_now(&mut store, &eval_report("eval-co-new", "co")).unwrap_err();
         assert!(err.to_string().contains("'co-rule'"), "the filing stays refused: {err}");
     }
 
@@ -6834,10 +9780,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
         let mut store = EventStore::new(&db).unwrap();
-        declare(&mut store, "s", "l", "a", &eval_report("eval-op-old", "op")).unwrap();
+        file_now(&mut store, &eval_report("eval-op-old", "op")).unwrap();
         legacy(&mut store, &wired_forbidden("op-rule", "op", "--force"));
         serve_n(&mut store, "op-rule", "hook", 1);
-        let err = declare(&mut store, "s", "l", "a", &eval_report("eval-op-new", "op")).unwrap_err();
+        let err = file_now(&mut store, &eval_report("eval-op-new", "op")).unwrap_err();
         let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
         let text = refusal.problem;
         assert!(text.contains(&format!("--db \"{}\" retest --id 'op-rule'", db.display())), "{text}");
@@ -6853,7 +9799,7 @@ mod tests {
     #[test]
     fn a_reason_beside_a_refusing_check_never_settles_the_filing() {
         let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "s", "l", "a", &eval_report("eval-rc-old", "rc")).unwrap();
+        file_now(&mut store, &eval_report("eval-rc-old", "rc")).unwrap();
         let mut both = wired_forbidden("rc-rule", "rc", "--force");
         both.tags.push(format!(
             "{}same text as 'fixture-command-rc-rule --force' in a legitimate call",
@@ -6861,7 +9807,7 @@ mod tests {
         ));
         legacy(&mut store, &both);
         serve_n(&mut store, "rc-rule", "hook", 1);
-        let err = declare(&mut store, "s", "l", "a", &eval_report("eval-rc-new", "rc")).unwrap_err();
+        let err = file_now(&mut store, &eval_report("eval-rc-new", "rc")).unwrap_err();
         let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
         assert!(refusal.problem.contains("rc-rule"), "{}", refusal.problem);
     }
@@ -6904,7 +9850,8 @@ mod tests {
         let err = revise(&mut store, "s", "l", "a", &rule, &tagged).unwrap_err();
         let text = err.to_string();
         assert!(text.contains("never a tag on the rule itself"), "{text}");
-        assert!(text.contains("kind \"report\""), "{text}");
+        assert!(text.contains("written and closed by THOR itself"), "{text}");
+        assert!(!text.contains("kind \"report\""), "nobody files an open point any more: {text}");
     }
 
     /// Step 9: an open point naming a rule carries nothing any more - with a
@@ -6913,7 +9860,7 @@ mod tests {
     #[test]
     fn an_open_point_never_settles_a_rule_with_or_without_a_check() {
         let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "s", "l", "a", &eval_report("eval-ci-old", "ci")).unwrap();
+        file_now(&mut store, &eval_report("eval-ci-old", "ci")).unwrap();
         let mut informing = heavy_command_rule("ci-check", "ci");
         informing.tags = vec![TEETH_INFORMING_TAG.to_string()];
         informing.check = Some(Check::Forbidden { literals: vec!["up -d --build".to_string()] });
@@ -6926,7 +9873,7 @@ mod tests {
         let mut point = open_point("open-ci", "ci");
         point.text = "ci-check and ci-bare: the path binding deploy/watch.sh is full".to_string();
         declare(&mut store, "s", "l", "a", &point).unwrap();
-        let err = declare(&mut store, "s", "l", "a", &eval_report("eval-ci-new", "ci")).unwrap_err();
+        let err = file_now(&mut store, &eval_report("eval-ci-new", "ci")).unwrap_err();
         let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
         assert!(refusal.problem.contains("'ci-check'"), "{}", refusal.problem);
         assert!(refusal.problem.contains("'ci-bare'"), "{}", refusal.problem);
@@ -6967,7 +9914,7 @@ mod tests {
         for name in RESERVED_ACTORS {
             let mut store = EventStore::in_memory().unwrap();
             let item = sample_with(&format!("fenced-{name}"), "a fixture written under a name only THOR may use");
-            let err = declare_scoped(&mut store, "S1", "S1", *name, &item, None).unwrap_err();
+            let err = declare_scoped(&mut store, "S1", "S1", *name, &item, None, None).unwrap_err();
             assert_eq!(
                 err.to_string(),
                 format!("the actor name {name} is reserved for THOR itself - write without --actor, or with your own name")
@@ -6994,15 +9941,15 @@ mod tests {
             ),
             (
                 "revise_tried_scoped",
-                revise_tried_scoped(&mut store, "s", "l", reserved, &item, &updated, &item, None, None, None, None),
+                revise_tried_scoped(&mut store, "s", "l", reserved, &item, &updated, &item, None, None, None, None, None),
             ),
             ("archive", archive(&mut store, "s", "l", reserved, &item.id, "its subject is gone", None)),
             (
                 "restore_deliberate_anchor",
                 restore_deliberate_anchor(&mut store, "s", "l", reserved, &item.id, Kind::Rule, "config/app.toml"),
             ),
-            ("retract", retract(&mut store, "s", "l", reserved, &item.id, "a fixture retraction")),
-            ("resolve", resolve(&mut store, "s", "l", reserved, &item.id, "x", &[])),
+            ("retract", retract(&mut store, "s", "l", reserved, &item.id, "a fixture retraction", None)),
+            ("resolve", resolve(&mut store, "s", "l", reserved, &item.id, "x", &[], None)),
         ];
         for (door, result) in refusals {
             let err = result.expect_err(door);
@@ -7039,9 +9986,9 @@ mod tests {
         changed.tags.push("checkout-root:C:/tmp/copy".to_string());
         let doors: Vec<(&str, Result<Event, WriteError>)> = vec![
             ("revise", revise(&mut store, "mcp", "mcp", "mcp", &record, &changed)),
-            ("retract", retract(&mut store, "mcp", "mcp", "mcp", &record.id, "a project record nobody wants")),
+            ("retract", retract(&mut store, "mcp", "mcp", "mcp", &record.id, "a project record nobody wants", None)),
             ("archive", archive(&mut store, "mcp", "mcp", "mcp", &record.id, "moved", None)),
-            ("resolve", resolve(&mut store, "mcp", "mcp", "mcp", &record.id, "x", &[])),
+            ("resolve", resolve(&mut store, "mcp", "mcp", "mcp", &record.id, "x", &[], None)),
             (
                 "revise_project_root",
                 revise_project_root(&mut store, &record.id, "C:/tmp/copy", "2026-09-28T11:00:00Z", SystemActor::new("retest")),
@@ -7275,7 +10222,7 @@ mod tests {
     ];
 
     fn raw_append_sites(root: &Path) -> std::collections::BTreeMap<String, usize> {
-        let needles = [".append_event(", ".append_resolve(", ".append_mutate_checked(", ".append_created_unique("];
+        let needles = [".append_event(", ".append_resolve(", ".append_resolve_stamped(", ".append_mutate_checked(", ".append_created_unique("];
         let excluded = ["core/src/event_store.rs", "model/src/store.rs", "serve/src/deliver.rs"];
         let mut out = std::collections::BTreeMap::new();
         for (rel, text) in member_files(root) {
@@ -7404,7 +10351,7 @@ mod tests {
     }
 
     fn declare_tried(store: &mut EventStore, item: &Item, trial: &TrialRecord) -> Event {
-        declare_in_scoped(store, "s", "l", "a", item, None, None, Some(trial)).unwrap()
+        declare_in_scoped(store, "s", "l", "a", item, None, None, Some(trial), None).unwrap()
     }
 
     /// Declare `item` (checkless) with a Note verdict from a trial record -
@@ -7530,6 +10477,7 @@ mod tests {
             Some("the short flag does the same"),
             None,
             Some(&trial),
+            None,
             None,
         )
         .unwrap();
@@ -7680,7 +10628,7 @@ mod tests {
         let mut second = first.clone();
         second.text = "Never run `git push --force` on main or release.".to_string();
         let trial = sealed(&second, RecordedVerdict::RuleWired);
-        revise_tried_scoped(&mut store, "s", "l", "a", &first, &second, &first, None, None, Some(&trial), None).unwrap();
+        revise_tried_scoped(&mut store, "s", "l", "a", &first, &second, &first, None, None, Some(&trial), None, None).unwrap();
         assert_eq!(current_verdict(&store, "last"), CurrentVerdict::RuleWired);
         // Back to the first text without a trial: the first record matches it,
         // but the LAST trial was of the second text.
@@ -7711,7 +10659,7 @@ mod tests {
         let trial = sealed(&item, RecordedVerdict::RuleWired);
         assert_eq!(trial.fields().a4, vec!["zqxj-never-typed".to_string()]);
         // The gate refuses to write it (A4, step 8)...
-        let err = declare_in_scoped(&mut store, "s", "l", "a", &item, None, None, Some(&trial)).unwrap_err();
+        let err = declare_in_scoped(&mut store, "s", "l", "a", &item, None, None, Some(&trial), None).unwrap_err();
         assert!(err.to_string().contains("not named anywhere in the rule's own text"), "{err}");
         // ...and a record like it on the log (an older write) reads undecided.
         legacy_tried(&mut store, &item, &trial);
@@ -7758,7 +10706,7 @@ mod tests {
 
         let gone = force_push_rule("gone");
         declare_tried(&mut store, &gone, &sealed(&gone, RecordedVerdict::RuleWired));
-        retract(&mut store, "s", "l", "a", "gone", "a fixture retraction of the git push rule").unwrap();
+        retract(&mut store, "s", "l", "a", "gone", "a fixture retraction of the git push rule", None).unwrap();
         assert_eq!(current_verdict(&store, "gone"), undecided("it was retracted"));
 
         let split = force_push_rule("split");
@@ -7803,6 +10751,7 @@ mod tests {
             None,
             Some(&trial),
             Some(&first.this_hash),
+            None,
         )
         .unwrap_err();
         assert!(
@@ -7833,6 +10782,7 @@ mod tests {
             None,
             Some(&trial),
             Some(&head.this_hash),
+            None,
         )
         .unwrap();
         assert_eq!(event.parent_rev.as_deref(), Some(head.this_hash.as_str()));
@@ -8181,7 +11131,7 @@ mod tests {
         let mut wired = force_push_rule("wired-by-record");
         wired.tags = vec![TEETH_PROVEN_TAG.to_string()];
         let record = sealed(&wired, RecordedVerdict::RuleWired);
-        assert!(declare_in_scoped(&mut store, "s", "l", "a", &wired, None, None, Some(&record)).is_err(), "the record does not imply proven");
+        assert!(declare_in_scoped(&mut store, "s", "l", "a", &wired, None, None, Some(&record), None).is_err(), "the record does not imply proven");
         wired.tags = vec![TEETH_WIRED_TAG.to_string()];
         declare_tried(&mut store, &wired, &sealed(&wired, RecordedVerdict::RuleWired));
 
@@ -8450,7 +11400,7 @@ mod tests {
         let mut store = EventStore::in_memory().unwrap();
         raw_write(&mut store, &rule);
         let cutoff = prospective_a4_cutoff(&store);
-        retract(&mut store, "s", "l", "a", "old", "gone").unwrap();
+        retract(&mut store, "s", "l", "a", "old", "gone", None).unwrap();
         assert_eq!(stock(&store, "old", cutoff), None);
     }
 
@@ -8497,16 +11447,16 @@ mod tests {
         // A new rule is never old stock, even one whose text names its literal.
         let mut named = old_contains_rule("new");
         named.text = "NOTES.md keeps `keep me`.".to_string();
-        let err = declare_in_scoped(&mut store, "s", "l", "mcp", &named, None, None, Some(&record)).unwrap_err();
+        let err = declare_in_scoped(&mut store, "s", "l", "mcp", &named, None, None, Some(&record), None).unwrap_err();
         assert!(err.to_string().contains("only THOR's retest writes that mark"), "{err}");
         for actor in [WriteActor::Named("mcp"), WriteActor::System(SystemActor::new("teeth-eval"))] {
-            let err = revise_tried_scoped(&mut store, "s", "l", actor, &rule, &rule, &rule, None, None, Some(&record), None).unwrap_err();
+            let err = revise_tried_scoped(&mut store, "s", "l", actor, &rule, &rule, &rule, None, None, Some(&record), None, None).unwrap_err();
             assert!(err.to_string().contains("only THOR's retest writes that mark"), "{err}");
         }
         assert_eq!(store.get_all_events().unwrap().len(), before, "nothing written");
 
         record_a4_cutoff(&mut store, retest_actor(), cutoff).unwrap();
-        revise_tried_scoped(&mut store, "retest", "old", retest_actor(), &rule, &rule, &rule, None, None, Some(&record), None)
+        revise_tried_scoped(&mut store, "retest", "old", retest_actor(), &rule, &rule, &rule, None, None, Some(&record), None, None)
             .expect("THOR's retest writes its own mark");
         assert_eq!(current_verdict(&store, "old"), CurrentVerdict::RuleWired);
         let log = history(&store, "old").unwrap();
@@ -8534,7 +11484,7 @@ mod tests {
         assert!(matches!(current_verdict(&unrecorded, "old"), CurrentVerdict::Undecided { why } if why.starts_with("A4: 'keep me'")));
 
         record_a4_cutoff(&mut store, retest_actor(), cutoff).unwrap();
-        revise_tried_scoped(&mut store, "retest", "old", retest_actor(), &rule, &rule, &rule, None, None, Some(&record), None).unwrap();
+        revise_tried_scoped(&mut store, "retest", "old", retest_actor(), &rule, &rule, &rule, None, None, Some(&record), None, None).unwrap();
         assert_eq!(current_verdict(&store, "old"), CurrentVerdict::RuleWired);
 
         let mut tagged = rule.clone();

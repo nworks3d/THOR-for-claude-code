@@ -112,3 +112,47 @@ fn a_second_no_mcp_install_leaves_the_eval_command_untouched() {
         "a second install must not rewrite a file that is already there"
     );
 }
+
+/// The routine `install` seeds, as a fresh machine gets it.
+fn seeded_routine() -> String {
+    let repo = tempfile::tempdir().unwrap();
+    let sandbox = Sandbox::new();
+    let out = run_install(repo.path(), &sandbox, &["--no-mcp"]);
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    std::fs::read_to_string(sandbox.eval_command_path()).unwrap()
+}
+
+/// THE DEFECT THIS GUARDS AGAINST: the routine told a session to file an open
+/// point for every check that had not bitten yet. THOR writes and closes its
+/// own open points now, and `remember` refuses one from a session, so a
+/// routine that still asked for one would send a session into a refusal it
+/// could not get out of. Any mention of the tag must be a prohibition.
+#[test]
+fn seeded_routine_never_asks_for_open_points() {
+    let routine = seeded_routine();
+    for line in routine.lines().filter(|l| l.contains("open-point")) {
+        assert!(line.to_lowercase().contains("never"), "a line naming the open-point tag must forbid it: {line}");
+    }
+    for old in ["carried:", "carry it into", "File it with `remember`: kind `report`", "hangs a check carried by an open point"] {
+        assert!(!routine.contains(old), "the seeded routine still carries the old instruction '{old}'");
+    }
+    assert!(!routine.contains("trial_check"), "trial_check is an unknown field now: the routine must not send a session to it");
+    assert!(
+        routine.contains("Never file an open point"),
+        "the routine must say why a session never files one: THOR writes and closes them"
+    );
+}
+
+/// The report a session files is its TLDR and remarks only: THOR writes the
+/// machine section in front of it, from the log, and refuses any edit to it.
+#[test]
+fn seeded_routine_asks_for_the_tldr_only() {
+    let routine = seeded_routine();
+    let flat = routine.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(flat.contains("a text that is ONLY your TLDR and remarks"), "the filing step must ask for the TLDR and remarks only");
+    assert!(flat.contains("THOR writes that machine section in front of your text"), "it must say THOR writes the machine section");
+    assert!(flat.contains("Never through a script, a second client, the model command line or an older program"), "it must forbid every other door");
+    assert!(flat.contains("load them first with ToolSearch"), "it must say how to load the THOR tools");
+    assert!(flat.contains("tags `[\"evaluation-report\"]`"), "it must give the one tag a filing carries");
+}
+

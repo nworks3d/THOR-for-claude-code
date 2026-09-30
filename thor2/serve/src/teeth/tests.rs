@@ -222,7 +222,7 @@ fn g7b_5_a_pending_check_is_hung_once_its_project_is_registered() {
     assert!(receipt(&t).contains("could not be tried here because 'gamma' has no registered working copy"), "{}", receipt(&t));
     let stored = stored_item(&item, &t).unwrap();
     assert_eq!(stored.tags, vec![model::store::TEETH_NOTE_TAG.to_string()]);
-    model::store::declare_in_scoped(&mut fx.store, "s", "l", "a", &stored, None, None, t.record.as_ref()).unwrap();
+    model::store::declare_in_scoped(&mut fx.store, "s", "l", "a", &stored, None, None, t.record.as_ref(), None).unwrap();
     assert_eq!(model::store::current_verdict(&fx.store, "g-rule"), model::store::CurrentVerdict::Note);
 
     // Still unregistered: the retest says blocked, and there is nothing to write.
@@ -292,7 +292,7 @@ fn r7b_14_an_unpin_with_an_old_a4_failure_lands_undecided() {
     assert_eq!(t.check, unpinned.check, "the check stays");
     let stored = stored_item(&unpinned, &t).unwrap();
     let because = Some("no longer needed at every session start");
-    model::store::revise_tried_scoped(&mut fx.store, "s", "l", "a", &pinned, &stored, &pinned, because, None, t.record.as_ref(), None)
+    model::store::revise_tried_scoped(&mut fx.store, "s", "l", "a", &pinned, &stored, &pinned, because, None, t.record.as_ref(), None, None)
         .unwrap();
     match model::store::current_verdict(&fx.store, "old") {
         model::store::CurrentVerdict::Undecided { why } => assert!(why.starts_with("A4: '--force'"), "{why}"),
@@ -1157,7 +1157,7 @@ fn q24_an_old_contains_check_that_bites_is_a_rule_showing_the_fragment_it_guards
     apply(&mut fx.store, &r, retest_actor()).unwrap();
     assert_eq!(model::store::a4_cutoff(&fx.store), Some(mark.cutoff), "the first old-stock verdict records the cutoff it was judged by");
     assert_eq!(model::store::current_verdict(&fx.store, "old"), model::store::CurrentVerdict::RuleProven);
-    assert!(!model::store::settlement(&fx.store, "old").is_owed());
+    assert!(!model::store::settlement(&fx.store, "old", None).is_owed());
     let log = model::store::history(&fx.store, "old").unwrap();
     assert_eq!(log.last().unwrap().a4_old_stock.as_ref(), Some(&mark));
     assert_eq!(model::store::show(&fx.store, "old").unwrap().tags, vec![model::store::TEETH_PROVEN_TAG.to_string()]);
@@ -1227,7 +1227,7 @@ fn q24_a_revise_of_the_text_or_the_anchors_ends_the_exemption() {
         // As the write tool does: THOR's own label is the trial's to drop.
         let mut gate_existing = before.clone();
         gate_existing.tags.retain(|t| !t.starts_with(model::store::TEETH_TAG_PREFIX));
-        model::store::revise_tried_scoped(&mut fx.store, "s", "l", "mcp", &gate_existing, &stored, &before, None, None, t.record.as_ref(), None)
+        model::store::revise_tried_scoped(&mut fx.store, "s", "l", "mcp", &gate_existing, &stored, &before, None, None, t.record.as_ref(), None, None)
             .unwrap();
         assert!(
             matches!(model::store::current_verdict(&fx.store, "old"), model::store::CurrentVerdict::Undecided { why } if why.starts_with("A4:")),

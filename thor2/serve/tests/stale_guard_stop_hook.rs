@@ -198,7 +198,7 @@ fn an_entry_whose_item_was_retracted_after_it_was_recorded_no_longer_blocks() {
 
     write_stale_sidecar(dir.path(), "r1", "failed", "Absent { path: \"NOTES.md\" }", "NOTES.md", 1, 1);
 
-    model::store::retract(&mut store, "s", "l", "a", "r1", "the anchor moved and this rule no longer applies").unwrap();
+    model::store::retract(&mut store, "s", "l", "a", "r1", "the anchor moved and this rule no longer applies", None).unwrap();
     drop(store);
 
     let out = run_hook(&db, &stop_payload("s1"));

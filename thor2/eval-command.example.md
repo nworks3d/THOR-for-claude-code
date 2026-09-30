@@ -25,21 +25,58 @@ item, once per turn. That is the same debt this routine pays; here you
 settle it deliberately, over the whole session, instead of one item at a
 time.
 
-In every project a session actually works in, once that session has put in
-at least an hour there, the Stop hook requires this evaluation before a turn
-can end - not once per session: it blocks the FIRST Stop of EVERY turn,
-regardless of how many notes currently owe a verdict, for as long as no
-evaluation report filed for this project still covers it (within the last
-16 hours). It names how many times it has already asked, and since when.
-Filing the report below is what goes quiet - but not necessarily for the
-full 16 hours: once three more hours of accrued work go by since that
-report, AND a real risk has shown up since then too - three or more code
-changes with no test or build run in between, or a context summary - the
-obligation returns while the report still covers, as a repeat covering only
-what happened since that report (see the SCOPE note under step 2). Three
-quiet hours with neither risk stays silent. It only ever asks inside a
-project: a checkout that resolves to no project is never asked, since there
-would be no way to file the report that silences it.
+## When THOR asks for this, and how it starts
+
+THOR's Stop hook asks for this evaluation at the end of a turn, in a project
+a session really works in, when all of this holds:
+- the project has had an hour of work since its last evaluation that counts.
+  The hour is the project's own clock, every session added together, and two
+  sessions working at the same moment count once;
+- this session has put in at least ten minutes of its own work in that
+  project since then;
+- it is not this session's first turn-end in that project.
+
+The ask follows the work, not the folder: a session that worked in project A
+and then moved to another folder is still asked about A, and the ask says so.
+If another session is already running this project's evaluation (it started
+less than an hour ago and is still active), you are told that in one line
+and are not held. A project with activity in the last seven days and no
+evaluation that counts in seven days is due whatever the clock says.
+
+The ask does not go quiet after one turn: it holds the end of every turn,
+naming how many times it has already asked and since when, until a report
+that COUNTS is on file. A report covers the next 16 hours. Once three more
+hours of work go by since it, AND a real risk has shown up too - three or
+more code changes with no test or build run in between, or a context summary
+- the obligation returns as a repeat covering only what happened since that
+report (see the SCOPE note under step 2). Three quiet hours with neither risk
+stays silent. It only ever asks inside a project: a checkout that resolves
+to no project is never asked, since there would be no way to file the report
+that silences it.
+
+A report counts only when THOR has checked how it was filed (see "The
+report" below). One that was filed any other way is on record but counts for
+nothing, and the next ask says why.
+
+THE EVALUATION STARTS IN THOR'S LOG, never in a file and never at filing. It
+starts when you open this routine (as a skill, or when the owner types the
+command) or when the Stop hook asks for it. At that moment THOR writes a
+start record and freezes three lists, which cannot grow: nothing that fires
+or is written afterwards is added, and nothing that fired only in another
+session is on them. Then THOR decides the old rules of the project ITSELF,
+for up to 20 seconds, and the note it shows you afterwards names three
+things:
+1. JUDGEMENT - the items you give a verdict on (step 2);
+2. TEETH - what THOR decided by itself, then two lists that are yours: the
+   batch (at most eight rules) and the A4 list (at most sixteen), each item
+   with its reason and the exact call to make (step 4);
+3. OPEN POINTS - THOR's own, written and closed by THOR. Nothing for you to
+   do.
+
+That note is the one source for your work. If you missed it, the gate names
+the same lists when it refuses the report. If the note says THOR is still
+deciding the old rules, end this turn once: the next Stop shows the finished
+note.
 
 ---
 
@@ -69,8 +106,8 @@ conversation?
   the same as checking it.
 
 Every item above gets a decision: settle it now if you can (run the missing
-test, check the machine, ask what a background job actually did), or carry
-it into this report's own open points with the reason you could not settle
+test, check the machine, ask what a background job actually did), or write
+it under "not settled" in your remarks with the reason you could not settle
 it here. Step 1 is done once every item above has one of those two outcomes
 - never left as a bare observation with nothing decided about it.
 
@@ -78,11 +115,12 @@ it here. Step 1 is done once every item above has one of those two outcomes
 
 Before any of that: look up the previous evaluation report for this project
 (`mcp__thor__lookup` for the tag `evaluation-report` and this project; take
-the newest one). Handle its open points first - what it left unjudged with a
-reason, the gaps it left open, and everything it listed as not verified or
-still to be probed. For each: settle it now, or carry it into this report's
-own open points with the reason it is still open. No previous report? Say so
-and move on.
+the newest one). Read its remarks - what it left unjudged with a reason, the
+gaps it left open, and everything it listed as not verified or still to be
+probed. For each: settle it now, or write it under "not settled" in your own
+remarks with the reason it is still open. No previous report? Say so and move
+on. THOR's own open points are not yours: they are written and closed by THOR
+(see step 4), and nothing you write carries one.
 
 SCOPE: if an evaluation report for this project was already filed within the
 last 16 hours, this evaluation covers only what happened SINCE that report -
@@ -112,35 +150,34 @@ The argument is called `id`, not `entity_id`. On an "unknown entity" error,
 retry the call, first with and then without a project prefix - the local
 mcp__thor__ server is the authority.
 
-Your list is fixed the moment this evaluation starts. It starts when you
-open this routine (as a skill, or when the owner types the command), when
-the Stop hook asks for it - or, if none of those happened, at your first
-attempt to file the report. From that moment the list holds exactly the
-items that fired in THIS session and had fired 40 times or more since their
-last verdict, and it never grows: nothing that fires after the start (your
-own remember and revise calls fire the rules bound to the `remember` moment
-on every write) and nothing that fired only in another session is added.
-The note that starts the evaluation names the list; if you missed it, the
-gate names it when it refuses the report. A pinned item is never on it: the
-owner already answered whether it belongs there by pinning it.
+Your list is the one the start note printed under JUDGEMENT, frozen when the
+evaluation started: exactly the items that fired in THIS session and had
+fired 40 times or more since their last verdict. Judge only those. A pinned
+item is never on it: the owner already answered whether it belongs there by
+pinning it.
 
-Every item on your list gets one of two answers. A verdict: useful if it
-belonged where it fired, noise if it did not. Or, when you cannot honestly
-judge it - "when in doubt, skip" above - an explicit skip, written as a tag
-on the report itself: `not-judgeable:<id>:<reason>`, with a reason of
-at least twelve characters that says why, for example
+Every item on your list gets one of two answers. A verdict, given with the
+THOR tool itself: useful if it belonged where it fired, noise if it did not.
+A verdict from a shell, a script, another session or another program settles
+nothing, and is listed for the owner under "side doors". Or, when you cannot
+honestly judge it - "when in doubt, skip" above - an explicit skip, written
+as a tag on the report itself: `not-judgeable:<id>:<reason>`, with a reason
+of at least twelve characters that says why, for example
 `not-judgeable:a-1f2e3d:it fired on a grep of a log I never opened`. A skip
 settles that item for this report only; it stays owed store-wide, and the
-next session that sees it fire is asked again. On top of your list: every
-fact you recognised as noise this session, and every useful fact the Stop
-hook itself never asked about. Do not re-mark something that already
-carries a verdict - that would count twice.
+next session that sees it fire is asked again. Do not re-mark something that
+already carries a verdict - that would count twice.
+
+GIVE YOUR VERDICTS, THEN END THE TURN ONCE, THEN FILE. THOR checks that every
+verdict of this evaluation was a real THOR call when the turn ends, and the
+report is refused while the verdicts of the turn you are in are not checked
+yet. So give all your verdicts, answer in a line, and let the turn end; the
+Stop hook checks them. Then file the report (see "The report").
 
 The health check's `judgement debt` line names the debt of the whole store
 for this checkout, including items that only fired in other sessions. Those
-are not this report's to settle and never hold it; judge one only if you
-saw it fire yourself and know where. Step 2 is done once every item on your
-list carries a verdict or a skip tag with a reason.
+are not this report's to settle and never hold it. Step 2 is done once every
+item on your list carries a verdict or a skip tag with a reason.
 
 ## 3. Repair what has rotted (this is not noise)
 
@@ -171,83 +208,56 @@ hanging on a refusal.
 Step 3 asks whether a fact is still TRUE. This step asks whether it can DO
 anything.
 
-A fact about something irreversible or costly that carries no check only
-informs: it sits there while the mistake happens and says nothing. Walk the
-facts that fired this session and are heavy (`irreversible` or `costly`),
-and decide for each. `get` shows you `severity`; a fact with no `check`
-field can stop nothing. Note the `teeth` line from the health check before
+Every rule is tried by THOR the moment it is written, and the old rules were
+tried by THOR itself at the start of this evaluation. A rule whose check
+bites is on the rule track (`teeth: wired, not proven`, `teeth: proven guard`
+once reality backs it too) and can refuse a wrong change. A rule whose tooth
+cannot hold is a note (`teeth: note`): it still arrives at its moment and
+can only inform. Nothing in this step turns a note into a rule by argument,
+and nothing here accepts "it is a judgement rule" as an answer: the burden of
+proof is on the rule, so for every rule you handle you TRY to give it a tooth
+that holds before anything else. A tag, a reason, an open point or a refusal
+on record settles nothing: only the trial decides, and the trial reads the
+rule as it is written now. Note the `teeth` line from the health check before
 you start this step and again once you finish it - the report names both.
 
-Start with this report's batch: at most eight heavy facts that fired since
-the previous report without a real tooth or a real reason, the ones written
-longest ago first. You do not pick them: the health check names them on its
-`evaluation batch` line, each on its own `batch: <id>` line, and the ask for
-this evaluation names the same ones. The report cannot be filed until each
-one is settled; until then the gate refuses it and counts what is left.
-Settled means what the gate counts, and nothing else: a check that bit
-reality (the real hook refused a call under the check the rule carries now -
-that counts by itself, even while the label still reads wired); a rule that
-hangs a check carried by an open point that names its id (see below for what
-an open point is); or, only for a rule whose check cannot refuse (none,
-`contains` or `path_exists`), a no-literal reason that quotes the legitimate
-call or names the trigger, after a real try. A reason never settles a rule
-whose check can refuse, and the gate refuses the two side by side. A label
-the tool wrote itself, such as `teeth:informing`, settles nothing. The heavy facts on the `owed later:`
-lines stay owed and lead the next report's batch - settle more of them when
-there is time, but never fewer than the batch.
+So you do NOT walk the store's heavy facts, and you do NOT pick your own. You
+handle only what the start note handed you under TEETH:
 
-The burden of proof is reversed: for every heavy fact with no check, TRY to
-give it one before anything else. Work out, in writing, which literal
-fragment marks the mistake, at which file or command it belongs (a fact
-hanging on a broad moment gets re-anchored to the exact command or file
-first), and which check kind fits - `forbidden`, `absent`, `absent_all`,
-`contains`, or `requires`. Then attach it with `revise`. Measured
-2026-08-09: this is how a line about deleting a pushed remote tag went from
-"fires on every `rm`, stops nothing" to "refuses exactly that form" - by
-re-anchoring, not by writing a new rule.
+- **The batch**: at most eight rules that need a fix only you can make, each
+  line giving the reason and the call. Make the fix the line names, then run
+  the call shown - normally `mcp__thor__revise(id: "<id>")` with no other
+  argument, which makes THOR try the rule again as it is written now and
+  answer rule, note, or what is still missing. The report cannot be filed
+  until every rule of the batch is settled, and the gate counts what is
+  left. Rules that did not fit stay owed and lead the next evaluation.
+- **The A4 list**: at most sixteen rules whose check bites and whose text only
+  has to name the check's literal. Reword the text so it names that literal,
+  using the exact call the note prints (a `revise` with the reworded text) -
+  nothing else has to change.
+- **Everything THOR settled itself** (rules, notes, pending checks hung) is
+  only reported, in the machine section of the report. You do not redo it.
 
-Only after that attempt may you answer "no literal", and only with one of
-two reasons written into the tag: the fragment also appears in legitimate
-use of that command - QUOTE that legitimate call between quotes, for
-example `no-literal:the same fragment is in 'git push origin main' which is
-allowed` - or the mistake leaves no text at all, an omission or a judgement -
-then NAME what the rule is about: its command, its file, or the moment it
-fires at. The gate refuses a reason on a heavy fact that does neither: "it
-is a judgement rule" fits every rule in the store, so it says nothing about
-this one. A reason that quotes the call or names the trigger is a settled
-answer; the Stop hook and the report gate stop asking about that fact.
+Work out, for a batch rule, which literal fragment marks the mistake, at
+which file or command it belongs (a rule hanging on a broad moment gets
+re-anchored to the exact command or file first), and which check kind fits -
+`forbidden`, `absent`, `absent_all`, `contains`, or `requires`. Name that
+literal in the rule's own text, or the tool refuses the check: a tooth has to
+say in its own words what it refuses. Then `revise`. If the tool refuses, its
+reply names the one thing to do; do it and call again - the refusal is the
+gate working, not a bug.
 
-A reason counts only after a real try, and the log is what shows the try: a
-no-literal reason settles a heavy fact only when that fact's own history
-carries a check at some point. So the order is not optional - but the try
-never hangs live. Send the reason tag and the check you worked out in ONE
-`revise`, with `trial_check: true`: the tool runs its own write-time proof on
-that check, records the check and what the proof found in the fact's
-history, and never stores it. If the tried check turns out to work, the
-revise is refused and tells you to hang it for real instead - then that is
-your answer, not the reason. Never hang a check you already expect to be
-wrong just to earn a reason: measured 2026-09-27, one such check refused
-every write that mentioned the file it named for about a minute. A reason on
-a fact that never carried or tried a check settles nothing, however well it
-is written: two such reasons slipped through on 2026-09-26, one of them
-saying in so many words that the syntax was never found.
+Three arguments exist for a refusal that is right about the tooth but wrong
+about your rule: `legitimate_calls`, `may_change` and `accept_refusing`.
+Doctor lists every rule saved with one of them for the owner, so use one only
+when you can say why, in the report, in a sentence the owner can check. They
+are not a way to get a rule off the batch.
 
-A heavy fact that already carries a no-literal tag is re-checked, not waved
-through: read the reason again against the fact. An older reason that
-neither quotes a call nor names the trigger does not count any more - the
-debts keep naming that fact until you rewrite it. If the fact names a
-command or a file, the reason is suspect and the attempt above applies
-again. Say per fact whether the reason held.
-
-A label the tool writes is never an answer. `teeth:informing` only says
-nothing could be tried; `teeth:wired-not-proven` says the check reaches the
-right place both ways, but was tried only with attempts built from its own
-literal, which an invented literal passes just as well. A check counts as a
-real tooth - `teeth:proven-guard` - only once the log shows it biting
-reality: the real hook refused a real call under it, or a real call the rule
-already fired on carries its literal while the rule's ordinary calls still
-pass. Never run the dangerous command itself to "prove" a check: if the
-check does not catch your form of it, the command runs.
+Never file an open point, and never tag a rule with `open-point`, `about:` or
+`blocker:`: THOR writes and closes its own open points (a missing working
+copy, a file the checkout is changing) and refuses yours. A legacy open point
+an older routine filed settles nothing and holds nothing; retract one, with a
+reason, only when what it names is resolved.
 
 Working in a git worktree? Every check is judged against the MAIN checkout -
 the health check and the commit gates read that one, never your worktree. A
@@ -260,36 +270,15 @@ What you NEVER do here: stretch the literal to catch more. If it catches one
 form and not another, that is the honest answer - write down the gap you
 left open. A broader rule that blocks legitimate work is the most expensive
 outcome this system knows (see step 6), and the doctrine forbids widening a
-trigger to buy a catch.
+trigger to buy a catch. Never write the mistake into a real file, and never
+run the dangerous command itself, to "prove" a check: if the check does not
+catch your form of it, the mistake is now in the code, or the command ran.
+A command check may be proven with a harmless form of its command (step 8).
 
-Never write the mistake into a real file to make a check bite: if the check
-misses, the mistake is now in the code. A command check may be proven with a
-harmless form of its command (step 8); a refusal that happened on its own
-this session counts by itself. So every check here that has not bitten -
-`teeth: wired, not proven`, or one you could not make work here - goes on an
-open point, one per fact. An open point is a separate small Report, never a
-tag on the rule (the gate refuses a tag such as `open:<id>` for exactly that
-reason). File it with `remember`: kind `report`, the same project as this
-report, tags `["open-point"]`, an id such as `open-<rule id>`, and one
-sentence that names the rule's id and the real call that would prove it, or
-what blocks the fix (a full anchor, say). That open point is what lets the
-report through while the check has not met reality yet, and the next
-evaluation has to close it - retract it with a reason once the check bit, or
-once the check itself was retracted - or carry it forward once. A check that
-has never met a real call is an assumption.
-
-Does the gate refuse the check you are adding - does it not hold, or is the
-anchor full after moving it? Correct the check until it holds. A full anchor
-is solved with a route from step 6; if that cannot happen in this session,
-the open point names the full anchor and its occupants - never a no-literal
-reason that hides the real cause. That happens in the same turn, not as a
-line in the report. Step 4 is done once every heavy fact in this report's
-batch, and every other one you took on, has a decision - a check that bit
-reality, a wired check carried by a named open
-point, or a tried-and-justified no-literal tag - every fact that already
-carried a no-literal tag has been re-checked this session, and nothing is
-left hanging on a refusal. Retracting a heavy fact takes a reason that says
-what changed about THAT fact; "no longer relevant" is refused.
+Step 4 is done once every rule of the batch and of the A4 list has its call
+made and THOR's answer to it, and nothing is left hanging on a refusal.
+Retracting a heavy rule takes a reason that says what changed about THAT
+rule; "no longer relevant" is refused.
 
 ## 5. Capture what was missing
 
@@ -309,7 +298,8 @@ Where the gate will refuse you, so you get it right immediately:
   leave it with the label `crowded-on-purpose`) and name the occupants in
   your report - dropping it is not a route;
 - a NEW place - a project, scope or purpose that does not exist yet: choose
-  an existing place that fits, or ask the owner for a name for the new one.
+  an existing place that fits, or ask the owner for a name for the new one;
+- a check whose literal the text never names.
 
 Want a fact to be able to REFUSE a wrong action instead of only informing:
 - forbidden text in files: `always` plus check_kind `forbidden`;
@@ -319,7 +309,9 @@ Want a fact to be able to REFUSE a wrong action instead of only informing:
   it refuses its own documentation;
 - text that must not appear in ONE file: check_kind `absent`.
 
-All other forms only inform, and that is usually the right choice.
+The reply to a write says which of three things THOR found: RULE, NOTE, or
+REFUSED (nothing written, and the one thing to do). All other forms only
+inform, and that is usually the right choice.
 
 Step 5 is done once every fact you tried to capture is actually stored - no
 attempt is left hanging on a refusal from the gate.
@@ -400,7 +392,9 @@ silently displaced binding shows up nowhere here. Flag such a fact as
 putting the forbidden fragment literally into a harmless form of the bound
 command and seeing whether the gate responds. Never test with a file check
 or with free prose - that proves nothing, and writing the mistake into a
-file only risks it; a check on a file waits on an open point (step 4).
+file only risks it. A check on a file is tried by THOR itself against the
+project's registered working copy; one it cannot try yet is kept as a note
+with a pending check, and doctor lists it.
 
 Step 8 is done once every untested addition from this session is on that
 list, named with what should make it refuse.
@@ -434,10 +428,10 @@ not done.
 2. what you judged as noise and why, and what belonged where it fired;
 3. what you revised, with before and after, and which artifact you checked
    it against;
-4. the doctor's `teeth` line before and after this step; each fact that
-   gained a check, with its id, the check kind, the literal, and where it
-   is anchored; each fact that got or kept a no-literal reason, with the
-   reason; and the gaps you left open;
+4. the health check's `teeth` line before and after step 4; the batch and the
+   A4 list: per rule, the call you made and THOR's answer (rule, note, or what
+   was still missing), and every rule you saved with `legitimate_calls`,
+   `may_change` or `accept_refusing`, with the reason;
 5. what you stored that had been missing;
 6. what the gate did - including every false block and every refusal of
    your own write actions;
@@ -459,26 +453,52 @@ stays silent when there is no copy, and speaks up when one has gone stale),
 this project), and `contradictions` (how many pairs of notes carry a proof
 that cannot both be true right now; this line stays silent when there are
 none). Do not copy those numbers into a Rule or Orientation - point to them
-instead; they may appear in the dated evaluation report itself (below).
+instead; they may appear in your remarks in the dated evaluation report
+itself (below).
 
-Save the whole report in THOR when you are done, so a later session can find
-it and hunt it for real THOR defects: `mcp__thor__remember` with kind
-report, id `eval-<project>-<YYYY-MM-DD>` (a second one the same day gets
-`-2`), project set to the project you evaluated, tags `evaluation-report`,
-and text the full report exactly as you gave it to the owner. This is a
-dated record, not a rule - the health-check numbers may appear in it, and it
-never fires on its own. Add a `not-judgeable:<id>:<reason>` tag for every
-item of your list you skipped (step 2). If the gate refuses the report, it
-names what is still open - each item is either settled by the work it names
-or honestly skipped; the list it holds you to cannot grow between attempts.
-The reply to a filed report says how many items of your list you settled
-and skipped, and how many stay owed store-wide. It is also what tells THOR
-the evaluation happened:
-the Stop hook reads it back, and filing it is what lets a blocked turn end
-and stays quiet for the next 16 hours - a report filed now never buys more
-than that in advance.
+## Filing the report
+
+File the report in THOR when you are done, so a later session can find it and
+hunt it for real THOR defects. THOR writes the facts of the evaluation
+itself, from its log, and puts them in front of your text:
+
+- Call `mcp__thor__remember` with kind `report`, the project you evaluated,
+  tags `["evaluation-report"]`, id `eval-<project>-<YYYY-MM-DD>` (a second
+  one the same day gets `-2`), and a text that is ONLY your TLDR and remarks:
+  the plain-language summary and then the eight points above, exactly as you
+  gave them to the owner.
+- Do not write a section of your own for what was judged, the teeth, the open
+  points, the refusals or the side doors, and do not start a line with
+  `=== `. THOR writes that machine section in front of your text, checks it
+  against the log, and refuses any edit to it later. Your text below it can
+  be revised; the machine section cannot.
+- Add a `not-judgeable:<id>:<reason>` tag for every item of your list you
+  skipped (step 2).
+- If the THOR tools are not loaded in this session, load them first with
+  ToolSearch, query `select:mcp__thor__remember,mcp__thor__revise,mcp__thor__mark`,
+  then call the tool with the same arguments.
+- File ONLY through that tool call, in the session that ran the evaluation.
+  Never through a script, a second client, the model command line or an older
+  program: such a report is refused, and if one slips through it does not
+  count - the Stop hook checks the filing call against this session's own
+  record of the conversation.
+
+If the gate refuses the report, it names what is still open and the one
+thing to do: each item is either settled by the work it names or honestly
+skipped; the lists it holds you to cannot grow between attempts. Three
+refusals are plain waiting, not work: "THOR is still deciding the old rules"
+and "the verdicts you gave in this turn are checked when the turn ends" both
+mean end this turn once and file again; "no evaluation is open in this
+session" means there is nothing to file, so file nothing.
+
+The reply to a filed report says what the machine section holds and that THOR
+checks the filing call when the turn ends. The report counts from that check
+on: the Stop hook reads the answer back from THOR's log, and only a report
+that counts lets a blocked turn end and stays quiet for the next 16 hours. If
+the next ask says your report is on file but does not count, it names why;
+follow that.
 
 Do not store or change anything else unless the owner asks for it. The
 exceptions are the work the steps themselves call for: the verdicts, the
-revisions of rotten facts, the checks you attach to heavy facts, the
+revisions of rotten facts, the calls on the batch and the A4 list, the
 captures of what was missing, and filing the report itself.
