@@ -807,7 +807,6 @@ pub const REFUSAL_TABLE: &[(&str, &str)] = &[
     ("needs_agent:majority", "accept_refusing"),
     ("needs_agent:no_reach", "bind it to"),
     ("needs_agent:false_now", "revise the check"),
-    ("needs_agent:global", "give it the project"),
     ("needs_agent:crowded", "fold this rule into a neighbour"),
 ];
 
@@ -1129,11 +1128,29 @@ impl<'a> Work<'a> {
         let item = self.item();
         let path = check_path(check).unwrap_or_default();
         if matches!(problem, RootProblem::GlobalRule) {
+            // AN OLD RULE at a retest or an evaluation's machine pass (step 20,
+            // K10): THOR's blocker, never the agent's batch. Its only exits
+            // there were to narrow a rule meant for every repository or to
+            // clear a true check - C3 measured an agent deleting two true
+            // checks to file its report.
+            if matches!(self.mode, Mode::Retest) {
+                return Some(Decision::Refuse {
+                    code: RefuseCode::Untryable,
+                    message: format!(
+                        "blocked: a rule with no project has no working copy to try its check on {path} in - it keeps \
+                         its check and is counted apart; nothing needs doing. Only when the rule is really about one \
+                         project: give it that project (mcp__thor__revise with the rule's id, project and a because)"
+                    ),
+                    retest: RetestAs::Blocked(Blocker::global_rules()),
+                });
+            }
             return Some(self.refuse(
                 RefuseCode::Untryable,
                 format!(
                     "THOR cannot try this file check: a rule with no project has no working copy to try a check on {path} in - \
-                     give it the project whose checkout holds {path}, then write this again"
+                     give it the project whose checkout holds {path}, then write this again. If the rule is meant for \
+                     every project, leave this rule as it stands instead: an old one keeps its check and is held apart \
+                     for the owner - clearing a check that is true is never the way past this"
                 ),
             ));
         }

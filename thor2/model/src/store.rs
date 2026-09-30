@@ -1879,7 +1879,27 @@ pub enum Blocker {
     WorkingTreeDiffers { path: String },
 }
 
+/// The subject of THOR's open point for rules with NO project whose check
+/// reads a file - `Blocker::NoWorkingCopy { project: GLOBAL_RULES_SUBJECT }`
+/// (K10: "a global rule with a file check included"; step 20). Such a rule
+/// has no working copy THOR could try its check in, and giving it a project
+/// would narrow a rule meant for every repository, so it is the machine's
+/// blocker, never the agent's fix. "global" never names a project
+/// (`normalize::normalize_project` folds it to none), so it cannot collide
+/// with one.
+pub const GLOBAL_RULES_SUBJECT: &str = "global";
+
 impl Blocker {
+    /// The blocker of a rule with no project whose check reads a file.
+    pub fn global_rules() -> Self {
+        Blocker::NoWorkingCopy { project: GLOBAL_RULES_SUBJECT.to_string() }
+    }
+
+    /// Whether this is `Blocker::global_rules`.
+    pub fn is_global_rules(&self) -> bool {
+        matches!(self, Blocker::NoWorkingCopy { project } if project == GLOBAL_RULES_SUBJECT)
+    }
+
     /// The blocker's code, as THOR's open point carries it in its
     /// `blocker:` tag.
     pub fn code(&self) -> &'static str {
@@ -1902,6 +1922,9 @@ impl Blocker {
 impl std::fmt::Display for Blocker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Blocker::NoWorkingCopy { .. } if self.is_global_rules() => {
+                write!(f, "a rule with no project - no working copy to try its file check in")
+            }
             Blocker::NoWorkingCopy { project } => write!(f, "{project} - no registered working copy"),
             Blocker::WorkingTreeDiffers { path } => {
                 write!(f, "{path} - the registered working tree lacks the literal the default branch still has")
@@ -3228,6 +3251,11 @@ fn slug(text: &str, fallback: &str) -> String {
 /// registered working tree lacks a literal the default branch still has.
 pub fn machine_point_id(project: &str, blocker: &Blocker) -> String {
     match blocker {
+        // One point per evaluated project for its global rules: "global" is
+        // no project, so the id names the project whose evaluation holds it.
+        Blocker::NoWorkingCopy { .. } if blocker.is_global_rules() => {
+            format!("open-no-working-copy-global-rules-in-{}", slug(project, "project"))
+        }
         Blocker::NoWorkingCopy { project } => format!("open-no-working-copy-{}", slug(project, "project")),
         Blocker::WorkingTreeDiffers { path } => {
             format!("open-working-tree-differs-{}-{}", slug(project, "project"), slug(path, "file"))
@@ -4267,20 +4295,64 @@ fn own_report_filed(store: &EventStore, start: &EvaluationStart) -> bool {
 /// there) came after the start, in that session. A later correction of a
 /// report filed before the start - a typo fix - is not a filing.
 fn filed_by_session_after(store: &EventStore, id: &str, start: &EvaluationStart) -> bool {
-    let Ok(events) = store.get_events_by_entity(id) else { return false };
+    filing_seq_after(store, id, start).is_some()
+}
+
+/// The log seq of the first write that FILED report `id` for `start`'s
+/// project after the start, in the evaluating session (see
+/// `filed_by_session_after`), if any.
+fn filing_seq_after(store: &EventStore, id: &str, start: &EvaluationStart) -> Option<i64> {
+    let events = store.get_events_by_entity(id).ok()?;
     let mut was_report = false;
-    let mut filed = false;
     for e in events.iter().filter(|e| writes_the_item(e.kind)) {
         // A body that is no item (a resolve names heads, not fields) changes
         // nothing about what the report is.
         let Ok(item) = parse_body(&e.body) else { continue };
         let is_report = is_evaluation_report_of(&item, &start.frozen.project);
         if is_report && !was_report && e.seq > start.seq && e.session_id == start.frozen.session {
-            filed = true;
+            return Some(e.seq);
         }
         was_report = is_report;
     }
-    filed
+    None
+}
+
+/// THE SESSION'S OWN EVALUATION AT A POINT IN THE LOG (step 20, NEW-2): the
+/// evaluation `session` had open at log seq `seq` - its start record comes
+/// before `seq`, it was not closed as void before `seq`, the session had not
+/// filed its report for it before `seq`, and (when `at_unix`, the time of
+/// the event at `seq`, is known) the start was not older than
+/// `EVALUATION_OPEN_HOURS` then. Read from the log alone. A refusal the
+/// evaluating session met inside this window is a call it made while judging
+/// the very rules that refused it: it never proves a tooth.
+pub fn evaluation_open_in_session_at(store: &EventStore, session: &str, seq: i64, at_unix: Option<i64>) -> Option<EvaluationStart> {
+    let events = store.events_of_kinds_in_session(&[EventKind::FactCreated, EventKind::FactRevised], session).ok()?;
+    let starts: Vec<EvaluationStart> =
+        starts_in(&events).into_iter().filter(|s| s.frozen.session == session && s.seq < seq).collect();
+    starts.into_iter().rev().find(|start| {
+        if at_unix.is_some_and(|at| at - start.frozen.started_unix > EVALUATION_OPEN_HOURS * 3600) {
+            return false;
+        }
+        let voided_before = events.iter().any(|e| {
+            e.entity_id == start.id
+                && e.kind == EventKind::FactRevised
+                && e.actor == EVAL_MACHINE_ACTOR
+                && e.seq < seq
+                && frozen_of(&e.body).is_some_and(|f| f.is_void())
+        });
+        if voided_before {
+            return false;
+        }
+        let mut reports: Vec<&str> = events
+            .iter()
+            .filter(|e| e.seq > start.seq && e.seq < seq)
+            .filter(|e| parse_body(&e.body).is_ok_and(|item| is_evaluation_report_of(&item, &start.frozen.project)))
+            .map(|e| e.entity_id.as_str())
+            .collect();
+        reports.sort_unstable();
+        reports.dedup();
+        !reports.into_iter().any(|id| filing_seq_after(store, id, start).is_some_and(|filed| filed < seq))
+    })
 }
 
 fn is_evaluation_report_of(item: &Item, project: &str) -> bool {
@@ -5466,9 +5538,15 @@ fn machine_section(store: &EventStore, start: &EvaluationStart, filed_seq: i64) 
     // ---- REFUSED: what the hook refused in the window, split by whether a
     // real tool call stands behind it.
     let (mut verified, mut unchecked, mut never_proof, mut trial_refused) = (0usize, 0usize, 0usize, 0usize);
+    // A call the evaluating session made inside its own evaluation proves no
+    // tooth, whatever its transcript holds (step 20, NEW-2).
+    let mut own_session = 0usize;
     for event in window.iter().filter(|e| e.kind == EventKind::GateRefused) {
         if event.actor == TEETH_WRITE_ACTOR {
             trial_refused += 1;
+        } else if event.actor == ASSISTANT_DELIVERY_ACTOR && event.session_id == session {
+            own_session += 1;
+            never_proof += 1;
         } else if event.actor == ASSISTANT_DELIVERY_ACTOR {
             match recorded_refusal_verdicts(&log.entity(&event.entity_id)).get(&event.seq) {
                 Some((true, _)) => verified += 1,
@@ -5484,6 +5562,12 @@ fn machine_section(store: &EventStore, start: &EvaluationStart, filed_seq: i64) 
          {never_proof} probe or hand-fed refusal(s) (never proof); {unchecked} not verified yet; {trial_refused} write(s) \
          refused by THOR's own trial."
     ));
+    if own_session > 0 {
+        out.push_str(&format!(
+            " {own_session} of the refusals never proof were calls the evaluating session made itself during this \
+             evaluation - refused during the session's own evaluation, not proof."
+        ));
+    }
 
     // ---- SIDE DOORS: every write in the window, on an item of this project
     // or made in the evaluating session, that did not come through an
@@ -8683,6 +8767,35 @@ mod tests {
         assert_ne!(render_machine_section(&store, &start, store.get_next_seq().unwrap() - 1), section, "a later F reads them");
     }
 
+    /// Step 20 (NEW-2): in the machine section, a refusal the EVALUATING
+    /// session met inside its own evaluation is never a verified real call -
+    /// even with a field verdict recorded before the fix - and the section
+    /// says how many were its own. Another session's refusal in the same
+    /// window still counts. `evaluation_open_in_session_at` reads the same
+    /// window: open after the start, not before it, closed by the filing.
+    #[test]
+    fn the_evaluating_sessions_own_refusals_are_never_proof_in_its_machine_section() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare_noted(&mut store, &light_command_rule("own-rule", "mp"));
+        let before = store.get_next_seq().unwrap();
+        let start = record_start(&mut store, "mp-session", "mp");
+        assert!(evaluation_open_in_session_at(&store, "mp-session", before, None).is_none(), "not before its start");
+        let own = store.append_event("mp-session", "mp-session", "hook", EventKind::GateRefused, "own-rule", None, "{}").unwrap().seq;
+        let other = store.append_event("other-session", "other-session", "hook", EventKind::GateRefused, "own-rule", None, "{}").unwrap().seq;
+        for (session, seq) in [("mp-session", own), ("other-session", other)] {
+            record_refusal_verification(&mut store, session, SystemActor::new(ATTESTER_ACTOR), "own-rule", seq, true, "fixture").unwrap();
+        }
+        assert_eq!(evaluation_open_in_session_at(&store, "mp-session", own, None).map(|s| s.id), Some(start.id.clone()));
+        assert!(evaluation_open_in_session_at(&store, "other-session", other, None).is_none(), "another session has no evaluation open");
+        let filed_seq = store.get_next_seq().unwrap() - 1;
+        let section = render_machine_section(&store, &start, filed_seq);
+        assert!(section.contains("the hook refused 1 real tool call(s)") && section.contains("1 probe or hand-fed refusal(s)"), "{section}");
+        assert!(section.contains("1 of the refusals never proof were calls the evaluating session made itself"), "{section}");
+        file_in(&mut store, &eval_report("eval-mp-own", "mp"), &start).unwrap();
+        let after = store.get_next_seq().unwrap();
+        assert!(evaluation_open_in_session_at(&store, "mp-session", after, None).is_none(), "closed by its filing");
+    }
+
     /// G15.2: two quiet evaluations - nothing on any list, the same one-line
     /// TLDR - both store. Their texts differ only in the log positions of
     /// the machine section, which the near-duplicate check must not read as
@@ -9177,8 +9290,8 @@ mod tests {
     /// nothing the agent runs settles it - and owed again the moment the
     /// project is registered. A contains literal missing from the registered
     /// working tree while the default branch still has it blocks the same
-    /// way, until the tree has it again. A global rule's file check is never
-    /// blocked: it needs a project, which the agent can give it.
+    /// way, until the tree has it again. A global rule's file check is
+    /// blocked too, by THOR's blocker for rules with no project (step 20).
     #[test]
     fn a_blocked_rule_is_settled_only_while_its_blocker_holds() {
         let dir = tempfile::tempdir().unwrap();
@@ -9229,12 +9342,14 @@ mod tests {
         std::fs::write(checkout.join("NOTES.md"), "keep me\nplain line\n").unwrap();
         assert!(settlement(&store, "gamma-keeps", None).is_owed(), "the tree has it again: owed");
 
-        // A global rule's file check: never blocked.
+        // A global rule's file check (step 20, K10): blocked by THOR's own
+        // blocker for rules with no project - never the agent's, and it
+        // holds no filing.
         let mut global = rule.clone();
         global.id = "global-keeps".to_string();
         global.project = None;
         legacy(&mut store, &global);
-        assert!(settlement(&store, "global-keeps", None).is_owed());
+        assert_eq!(settlement(&store, "global-keeps", None), Settlement::Settled(Settled::Blocked(Blocker::global_rules())));
     }
 
     /// Retracted, or taken off the rule track: settled; a rule with a note
@@ -9741,10 +9856,30 @@ mod tests {
     fn a_probe_event_is_never_field_evidence() {
         let mut store = EventStore::in_memory().unwrap();
         file_now(&mut store, &eval_report("eval-co-old", "co")).unwrap();
-        // Global, so no missing working copy holds it (that would settle it
-        // as blocked): owed, and a probe changes nothing about that.
-        let mut rule = wired_contains("co-rule", "co", "NOTES.md", "keep me");
-        rule.project = None;
+        // Registered, its file holding the literal, so no blocker holds it
+        // (a missing working copy, or no project at all since step 20, would
+        // settle it as blocked): owed, and a probe changes nothing about that.
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = dir.path().join("co");
+        std::fs::create_dir_all(&checkout).unwrap();
+        let hooks = dir.path().join("no-hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git").arg("-C").arg(&checkout).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "core.hooksPath", hooks.to_str().unwrap()]);
+        git(&["config", "user.email", "fixture@example.invalid"]);
+        git(&["config", "user.name", "fixture"]);
+        std::fs::write(checkout.join("NOTES.md"), "keep me
+").unwrap();
+        git(&["add", "NOTES.md"]);
+        git(&["commit", "-q", "-m", "notes"]);
+        let record = project_record("co");
+        let body = body_with_root(&canonical_body(&record).unwrap(), checkout.to_str().unwrap(), "2026-09-29T00:00:00Z").unwrap();
+        store.append_event("install", "install", INSTALLER_ACTOR, EventKind::FactCreated, &record.id, None, &body).unwrap();
+        let rule = wired_contains("co-rule", "co", "NOTES.md", "keep me");
         legacy(&mut store, &rule);
         serve_n(&mut store, "co-rule", "hook", 1);
         for kind in [EventKind::GateRefused, EventKind::GateStoodAside] {

@@ -502,6 +502,16 @@ fn point_text(
 /// `point_text` without the owner-queue opening.
 fn point_text_of(store: &EventStore, project: &str, blocker: &Blocker, rules: &[String], more: &str) -> String {
     match blocker {
+        Blocker::NoWorkingCopy { .. } if blocker.is_global_rules() => format!(
+            "THOR's own open point: {} rule(s) with no project carry a check that reads a file, and a rule with no \
+             project has no working copy THOR could try that check in: {}.{more} Nothing needs doing: each keeps its \
+             check and is counted apart - clearing a check that is true is never the way past this. Only when a rule \
+             is really about one project: give it that project (mcp__thor__revise with the rule's id, project and a \
+             because); otherwise the owner decides. This point closes itself at the first evaluation start after no \
+             rule with no project carries a file check.",
+            rules.len(),
+            named(rules)
+        ),
         Blocker::NoWorkingCopy { project: held } => {
             let why = match project::registered_checkout(store, Some(held)) {
                 Err(problem) => problem.to_string(),
@@ -548,6 +558,14 @@ fn point_text_of(store: &EventStore, project: &str, blocker: &Blocker, rules: &[
 /// else the derived reason the point is closed with.
 fn lifted(store: &EventStore, project: &str, blocker: &Blocker) -> Option<String> {
     match blocker {
+        Blocker::NoWorkingCopy { .. } if blocker.is_global_rules() => {
+            let still = crate::live::live_items(store).into_iter().any(|li| {
+                li.item.kind.can_fire()
+                    && model::normalize::normalize_project(li.item.project.as_deref()).is_none()
+                    && li.item.check.as_ref().is_some_and(model::checkout::is_file_check)
+            });
+            (!still).then(|| "no rule with no project carries a file check any more".to_string())
+        }
         Blocker::NoWorkingCopy { project: held } => {
             project::registered_checkout(store, Some(held)).is_ok().then(|| "the working copy is registered now".to_string())
         }

@@ -11,7 +11,8 @@
 //! grounds switched on in step 8) - and `every_code_has_exactly_one_row`
 //! fails when a code is added without a row (R8.26), or a row outlives its
 //! code. No row routes to the owner queue. The queue holds THOR's own open
-//! points (a working copy nobody registered, a checkout mid-change), which
+//! points (a working copy nobody registered, a checkout mid-change, a rule
+//! with no project whose check reads a file - step 20), which
 //! are blockers and never refusals an agent is told to live with, so every
 //! code here has an agent-runnable way on.
 //!
@@ -38,7 +39,6 @@ const ROWS: &[&str] = &[
     "needs_agent:majority",
     "needs_agent:no_reach",
     "needs_agent:false_now",
-    "needs_agent:global",
     "needs_agent:crowded",
     "a4_no_longer_named",
     "note_carries_check",
@@ -288,14 +288,21 @@ fn needs_agent_false_now_names_the_fix_and_restoring_the_file_settles_it() {
     assert!(landed(&reply) && fx.settled("nfn"), "the restored file, tried by a bare revise: {reply}");
 }
 
+/// A rule with no project and a file check is no refusal an agent is told
+/// to live with (step 20, K10): at a retest it is THOR's blocker - routed to
+/// the owner queue by an evaluation's machine pass - and the way on it names
+/// is not destructive: giving it a project still lands, decided.
 #[test]
-fn needs_agent_global_names_the_project_and_giving_it_lands_decided() {
+fn a_global_file_check_is_blocked_and_giving_it_the_project_still_lands() {
     let fx = Fx::new(&["beta"]);
     let beta = checkout(fx.dir(), "beta", &[("README.md", "marker-r1\n")], true);
     register(&fx.db, "beta", &beta);
     seed_raw(&fx.db, &item("ngl", "Keep `marker-r1` in README.md.", vec![path("README.md")], Some(Check::Contains { path: "README.md".to_string(), literal: "marker-r1".to_string() }), None));
-    let why = fx.needs_agent("ngl");
-    assert!(why.contains(way_on("needs_agent:global")), "{why}");
+    match fx.retest("ngl").outcome {
+        serve::teeth::Maintenance::Blocked(blocker) => assert!(blocker.is_global_rules(), "{blocker:?}"),
+        other => panic!("expected THOR's blocker, got {other:?}"),
+    }
+    assert!(!fx.settled("ngl"), "blocked is not a verdict: nothing was written");
     let reply = fx.mcp().call("revise", json!({"id": "ngl", "project": "beta", "because": "the file lives in the beta checkout only"}));
     assert!(landed(&reply) && fx.settled("ngl"), "{reply}");
 }

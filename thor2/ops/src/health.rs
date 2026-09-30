@@ -1983,7 +1983,7 @@ pub fn teeth_line(db: &Path, full: bool) -> String {
         }
     }
 
-    let refusals = refusals_apart(&active, &events);
+    let refusals = refusals_apart(&store, &active, &events);
     let taken_off = taken_off_the_rule_track(&events);
     let reworded = reworded_after_a_refusal(&store, &events);
 
@@ -2101,6 +2101,12 @@ struct RefusalsApart {
     teeth_write: usize,
     /// Under any other actor: a hand-fed payload with `--actor`.
     other_actor: usize,
+    /// A real refusal met by a session during its own evaluation (step 20,
+    /// NEW-2, `serve::attest::self_proof`): never proof.
+    own_evaluation: usize,
+    /// A real refusal met by the session that wrote the rule's check: never
+    /// proof.
+    own_check: usize,
 }
 
 impl RefusalsApart {
@@ -2129,6 +2135,19 @@ impl RefusalsApart {
                 "  {} refusal(s) from Claude Code sessions with no matching tool call in the transcript - never counted \
                  as proof",
                 self.no_matching_call
+            ));
+        }
+        if self.own_evaluation > 0 {
+            out.push(format!(
+                "  {} refusal(s) refused during the session's own evaluation - not proof (the evaluating session made \
+                 those calls itself, while judging the rules that refused them)",
+                self.own_evaluation
+            ));
+        }
+        if self.own_check > 0 {
+            out.push(format!(
+                "  {} refusal(s) refused in the session that wrote the rule's check - not proof",
+                self.own_check
             ));
         }
         if self.no_tool_call_id > 0 {
@@ -2182,7 +2201,7 @@ fn sessions_with_activity(events: &[Event]) -> std::collections::HashSet<&str> {
 
 /// Every `gate_refused` on the log, sorted into `RefusalsApart`. `active`:
 /// the sessions that served anything (`sessions_with_activity`).
-fn refusals_apart(active: &std::collections::HashSet<&str>, events: &[Event]) -> RefusalsApart {
+fn refusals_apart(store: &EventStore, active: &std::collections::HashSet<&str>, events: &[Event]) -> RefusalsApart {
     use thor_core::event_store::EventKind;
     let verdicts = model::store::recorded_refusal_verdicts(events);
     let mut out = RefusalsApart::default();
@@ -2201,10 +2220,28 @@ fn refusals_apart(active: &std::collections::HashSet<&str>, events: &[Event]) ->
                 } else if !has_id {
                     out.no_tool_call_id += 1;
                 } else {
-                    match verdicts.get(&e.seq) {
-                        Some((true, _)) if session_active => out.counted += 1,
-                        Some(_) => out.no_matching_call += 1,
-                        None => out.unverified += 1,
+                    // A self-proof is shown apart, whether its verdict was
+                    // recorded as one (step 20) or recorded field before.
+                    let self_why = |why: &str| {
+                        if why.starts_with(serve::attest::OWN_EVALUATION_WHY) {
+                            Some(true)
+                        } else if why.starts_with(serve::attest::OWN_CHECK_WHY) {
+                            Some(false)
+                        } else {
+                            None
+                        }
+                    };
+                    let apart = match verdicts.get(&e.seq) {
+                        Some((false, why)) => self_why(why),
+                        Some((true, _)) if session_active => serve::attest::self_proof(store, e).and_then(|why| self_why(&why)),
+                        _ => None,
+                    };
+                    match (apart, verdicts.get(&e.seq)) {
+                        (Some(true), _) => out.own_evaluation += 1,
+                        (Some(false), _) => out.own_check += 1,
+                        (None, Some((true, _))) if session_active => out.counted += 1,
+                        (None, Some(_)) => out.no_matching_call += 1,
+                        (None, None) => out.unverified += 1,
                     }
                 }
             }
@@ -4535,6 +4572,44 @@ mod tests {
         let line = teeth_line(&db, false);
         assert!(line.contains("1 of 2"), "{line}");
         assert!(line.contains("the other 1 can only inform"), "{line}");
+    }
+
+    /// Step 20 (NEW-2): a refusal the evaluating session provoked during its
+    /// own evaluation is recorded and shown apart - "refused during the
+    /// session's own evaluation - not proof" - and holds no field refusal.
+    #[test]
+    fn teeth_line_shows_refusals_during_the_sessions_own_evaluation_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcripts = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let session = "0de7dc52-1b97-4b66-948f-61e4438043b2";
+        {
+            let mut s = EventStore::new(&db).unwrap();
+            let mut bitten = rule("self-probed-fixture");
+            bitten.text = "never run git push with --force".to_string();
+            bitten.bindings = vec![model::item::Binding::Target {
+                kind: model::item::TargetKind::Command,
+                value: "git push".to_string(),
+            }];
+            bitten.check = Some(model::item::Check::Forbidden { literals: vec!["--force".to_string()] });
+            legacy_declare(&mut s, &bitten);
+            serve::attest::fixture::quiet_start(&mut s, session, "fxp");
+            serve::attest::fixture::field_refusal(
+                &mut s,
+                transcripts.path(),
+                session,
+                "self-probed-fixture",
+                "toolu_self",
+                "Bash",
+                serde_json::json!({"command": "git push --force nowhere-fixture"}),
+                "git push --force nowhere-fixture",
+            );
+        }
+        let line = teeth_line(&db, true);
+        assert!(line.contains("0 rule(s) of any weight hold a field refusal"), "{line}");
+        assert!(line.contains("teeth refusals: 0 of 1 refusal(s) on the log count as field evidence"), "{line}");
+        assert!(line.contains("1 refusal(s) refused during the session's own evaluation - not proof"), "{line}");
+        assert!(line.contains("the evaluating session made those calls itself"), "{line}");
     }
 
     /// Step 9 (A7, K6, EV B7): the field column counts only what passes

@@ -978,8 +978,11 @@ fn every_refusal_and_needs_agent_text_is_in_the_refusal_table() {
     check("needs_agent:no_reach", &m);
     let m = needs(&mut fx, &rule("nfn", "NOTES.md keeps `gone line`.", vec![path("NOTES.md")], contains("NOTES.md", "gone line"), Some("beta")));
     check("needs_agent:false_now", &m);
-    let m = needs(&mut fx, &rule("ngl", "Keep `x` in README.md.", vec![path("README.md")], contains("README.md", "x"), None));
-    check("needs_agent:global", &m);
+    // A rule with no project and a file check is THOR's blocker at a retest
+    // (step 20, K10), never the agent's: it has no row here.
+    let global = rule("ngl", "Keep `x` in README.md.", vec![path("README.md")], contains("README.md", "x"), None);
+    fx.legacy(&global);
+    assert!(matches!(fx.retest("ngl").outcome, Maintenance::Blocked(ref b) if b.is_global_rules()));
     let mut light = rule("ncr", "Never run `npm publish --force` here.", vec![cmd("npm publish")], forbidden(&["--force"]), None);
     light.severity = None;
     fx.legacy(&light);

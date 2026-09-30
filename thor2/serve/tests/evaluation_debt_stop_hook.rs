@@ -1781,3 +1781,84 @@ fn zeroed_project_clock_meets_the_weekly_floor() {
     let (_, quiet) = case(Some(3), &[1, 2]);
     assert!(!is_block(&quiet), "a valid evaluation three days old: {quiet}");
 }
+
+// ---------------------------------------------------------------- step 20
+//
+// NEW-1 (C3): the Response Guard's block returned before the Stop was counted
+// and before the evaluation was asked, and its retry cannot hold the turn - so
+// a session whose replies were always long or had no summary was never asked
+// and its Stops were never counted. The ask now rides with the guard's block,
+// and every first-pass Stop is counted, whoever holds it.
+
+/// A rulebook beside the store whose one rule blocks a long reply that does
+/// not open with a TLDR.
+fn seed_tldr_rulebook(db: &Path) {
+    let rulebook = r#"[
+  {"id":"fx-tldr-first",
+   "any_of":["fixture-detail"],
+   "none_of":["tldr"],
+   "min_chars":400,
+   "reminder":"open with a TLDR in plain language"}
+]"#;
+    std::fs::write(db.parent().unwrap().join("guard-response-rulebook.json"), rulebook).unwrap();
+}
+
+/// A first-pass (or, with `retry`, a retried) Stop whose reply the rulebook
+/// above blocks: long, and no TLDR.
+fn long_reply_stop(session_id: &str, cwd: &Path, retry: bool) -> String {
+    serde_json::json!({
+        "hook_event_name": "Stop",
+        "session_id": session_id,
+        "stop_hook_active": retry,
+        "last_assistant_message": format!("done. {}", "fixture-detail ".repeat(60)),
+        "cwd": cwd.to_string_lossy(),
+    })
+    .to_string()
+}
+
+/// NEW-1, the ask: a session that is due (not its first Stop, ten minutes of
+/// its own) answers long without a TLDR. The Stop holds the turn with the
+/// guard's reason AND the evaluation ask with its start note, in one block;
+/// the retry of that turn holds nothing.
+#[test]
+fn a_response_guard_block_carries_the_evaluation_ask() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let sandbox = Sandbox::new();
+    let fxp = sandbox.project_dir("fxp");
+    drop(EventStore::new(&db).unwrap());
+    seed_tldr_rulebook(&db);
+    let s = uuid(60);
+    seed_project_clock(&db, "fxp", 90);
+    seed_own_work(&db, "fxp", &s, 30, 1);
+    let out = run_hook(&db, &long_reply_stop(&s, &fxp, false), &sandbox);
+    assert!(is_block(&out), "{out}");
+    assert!(out.contains("TLDR"), "the guard is never skipped: {out}");
+    assert!(out.contains("Run the THOR evaluation") && out.contains("The evaluation of 'fxp' started"), "the ask rides with it: {out}");
+    let retry = run_hook(&db, &long_reply_stop(&s, &fxp, true), &sandbox);
+    assert!(!is_block(&retry), "the retry never holds the turn again: {retry}");
+    assert_eq!(serve::usefulness::project_eval_state(&db, Some("fxp")).asked_count, 1, "asked once, counted once");
+}
+
+/// NEW-1, the count: a fresh session's first Stop is held by the guard (and
+/// is free of the ask, Q10) - it is still counted, so the session's next
+/// Stop is its second and is asked. Before step 20 the guard's block left the
+/// count at zero and the next Stop was "the first" again.
+#[test]
+fn a_stop_held_by_the_response_guard_still_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let sandbox = Sandbox::new();
+    let fxp = sandbox.project_dir("fxp");
+    drop(EventStore::new(&db).unwrap());
+    seed_tldr_rulebook(&db);
+    let s = uuid(61);
+    seed_project_clock(&db, "fxp", 90);
+    seed_own_work(&db, "fxp", &s, 30, 0);
+    let first = run_hook(&db, &long_reply_stop(&s, &fxp, false), &sandbox);
+    assert!(is_block(&first) && first.contains("TLDR"), "{first}");
+    assert!(!first.contains("Run the THOR evaluation"), "the first Stop is free of the ask: {first}");
+    assert_eq!(serve::usefulness::project_eval_state(&db, Some("fxp")).sessions[&s].stops, 1, "the held Stop is counted");
+    let second = run_hook(&db, &long_reply_stop(&s, &fxp, false), &sandbox);
+    assert!(is_block(&second) && second.contains("TLDR") && second.contains("Run the THOR evaluation"), "{second}");
+}

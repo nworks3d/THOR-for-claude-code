@@ -336,8 +336,9 @@ pub fn is_file_check(check: &Check) -> bool {
 /// - `NoWorkingCopy` - a file check of a project whose registered working
 ///   copy cannot be used (`registered_checkout` fails: none registered, the
 ///   folder gone, not a checkout top, a linked worktree, or resolving to
-///   another project). A global rule's file check is never blocked: it needs
-///   the agent (give it a project).
+///   another project). A rule with NO project whose check reads a file is
+///   `Blocker::global_rules` (step 20, K10): it has no working copy anywhere,
+///   and giving it a project would narrow a rule meant for every repository.
 /// - `WorkingTreeDiffers` - a `contains` check whose literals the text names
 ///   (A4 holds, which the retest asks first), whose file is in the registered
 ///   checkout without the literal, while the default branch's HEAD still has
@@ -347,7 +348,11 @@ pub fn is_file_check(check: &Check) -> bool {
 /// check whose file lacks its literal. `None` for every item nothing blocks.
 pub fn read_time_blocker(store: &EventStore, item: &Item) -> Option<Blocker> {
     let check = item.check.as_ref().filter(|c| is_file_check(c))?;
-    let project = crate::normalize::normalize_project(item.project.as_deref())?;
+    // A rule with no project has no working copy at all to try a file check
+    // in (step 20, K10): blocked, counted apart, the owner's to decide.
+    let Some(project) = crate::normalize::normalize_project(item.project.as_deref()) else {
+        return Some(Blocker::global_rules());
+    };
     let root = match registered_checkout(store, Some(&project)) {
         Ok(root) => root,
         Err(_) => return Some(Blocker::NoWorkingCopy { project }),

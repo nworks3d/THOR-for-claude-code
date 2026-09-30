@@ -1381,6 +1381,37 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
             };
             return Some(HookOutput::Warn { event_name, text });
         }
+        // Where this Stop stands, resolved once, BEFORE any verdict below can
+        // return: the folder, and the project the session is counted in.
+        let stop_root: Option<PathBuf> =
+            payload.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from).or_else(|| std::env::current_dir().ok());
+        // A working directory that belongs to no project falls back to the
+        // project this session last worked in (`project::session_project`,
+        // the same answer the work clock and the hard guards use) - otherwise
+        // a `cd` into a scratch folder silences every debt the session still
+        // owes there.
+        let stop_project = project::session_project(db_path, &session_id, stop_root.as_deref());
+        // EVERY FIRST-PASS STOP IS COUNTED (step 20, NEW-1), whoever holds
+        // it: a Stop the Response Guard (or any debt below) holds is still a
+        // Stop of this session, and the first-Stop gate (Q10) reads this
+        // count. It used to be taken only when nothing earlier had returned,
+        // so a session whose replies the guard always held was never counted
+        // and never reached its second Stop. A subagent's Stop is work of its
+        // session, never a Stop that counts or can be held.
+        let stop_now = time::now_unix();
+        if is_subagent {
+            usefulness::record_hook_event(db_path, stop_project.as_deref(), &session_id, true, stop_now, usefulness::HookEventKind::Other);
+        } else {
+            usefulness::record_main_stop(db_path, stop_project.as_deref(), &session_id, stop_now);
+        }
+        // FORMAT DRIFT (D14): this session's transcript is in a shape THOR
+        // cannot read. Then no report can be checked or counted, so the
+        // evaluation is not asked for - it could not be filed - and every
+        // turn says so instead, riding with whatever else this Stop says.
+        let drift_note: Option<&str> = (!is_subagent && stop_project.is_some() && !no_record)
+            .then(|| serve::eval_filing::session_drifted(serve::attest::transcripts_root().as_deref(), &session_id))
+            .filter(|drifted| *drifted)
+            .map(|_| serve::eval_filing::DRIFT_LINE);
         // Same shape for the ordinary first pass: only an empty message
         // skips the call into `respond::guard_verdict` now. A subagent
         // payload still computes a real verdict - `warn_text` (and the BLOCK
@@ -1395,9 +1426,29 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
             let last_prompt = last_user_prompt_from_payload(&payload);
             let verdict = respond::guard_verdict(rulebook_text.as_deref(), msg, &last_prompt, reader_is_an_agent, citation_lookup);
             if let Some(reason) = verdict.block_reason {
+                // THE GUARD NEVER STARVES THE EVALUATION ASK (step 20,
+                // NEW-1). The guard's block holds this turn once and the
+                // retry cannot hold it again, so an ask that waited for a
+                // Stop the guard let through would never come to a session
+                // whose replies are always too long or lack a summary. The
+                // ask - with the start note of the evaluation it starts -
+                // rides with the guard's block instead, the way a resumed
+                // machine pass's note does (step 14): the guard is never
+                // skipped, and neither is the ask.
+                let mut parts: Vec<String> = drift_note.map(str::to_string).into_iter().collect();
+                let mut ask: Option<String> = None;
+                if !is_subagent {
+                    match stop_eval_decision(db_path, &session_id, stop_root.as_deref(), stop_project.as_deref(), drift_note.is_none(), no_record) {
+                        EvalStop::Ask(text) => ask = Some(text),
+                        EvalStop::Elsewhere(line) => parts.push(line),
+                        EvalStop::Quiet => {}
+                    }
+                }
+                parts.push(reason);
+                parts.extend(ask);
                 return Some(HookOutput::Decision(serde_json::json!({
                     "decision": "block",
-                    "reason": with_resumed(reason),
+                    "reason": with_resumed(parts.join("\n\n")),
                 })));
             }
             verdict.warn_reason
@@ -1448,30 +1499,15 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
         // Asked first because it is the only one whose answer decays: the
         // person who wrote the fact still knows what it was for, and tomorrow
         // nobody does.
-        // The project THIS session is working in, from the payload's own cwd -
-        // resolved here because the shared `session_project` below is computed
-        // after this early Stop branch returns. It routes the crowding nag to
-        // the session whose project the fact belongs to (see crowding_debt).
-        // The same cwd resolution, as the folder the session's project is
-        // resolved from. (`teeth_debt` no longer takes it: since step 9 it
-        // reads `model::store::settlement`, which judges a rule against its
-        // project's REGISTERED working copy, never the folder a Stop ran in.)
-        let stop_root: Option<PathBuf> =
-            payload.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from).or_else(|| std::env::current_dir().ok());
-        // A working directory that belongs to no project falls back to the
-        // project this session last worked in (`project::session_project`,
-        // the same answer the work clock and the hard guards use) - otherwise
-        // a `cd` into a scratch folder silences every debt the session still
-        // owes there.
-        let stop_project = project::session_project(db_path, &session_id, stop_root.as_deref());
-        // FORMAT DRIFT (D14): this session's transcript is in a shape THOR
-        // cannot read. Then no report can be checked or counted, so the
-        // evaluation is not asked for - it could not be filed - and every
-        // turn says so instead, riding with whatever else this Stop says.
-        let drift_note: Option<&str> = (!is_subagent && stop_project.is_some() && !no_record)
-            .then(|| serve::eval_filing::session_drifted(serve::attest::transcripts_root().as_deref(), &session_id))
-            .filter(|drifted| *drifted)
-            .map(|_| serve::eval_filing::DRIFT_LINE);
+        // The project THIS session is working in, from the payload's own cwd
+        // (`stop_project`, resolved at the top of this arm, before the
+        // Response Guard, because the shared `session_project` below is
+        // computed after this early Stop branch returns). It routes the
+        // crowding nag to the session whose project the fact belongs to (see
+        // crowding_debt). (`teeth_debt` no longer takes
+        // the folder: since step 9 it reads `model::store::settlement`, which
+        // judges a rule against its project's REGISTERED working copy, never
+        // the folder a Stop ran in.)
         // GATED ON `is_subagent`: a fact landing on an already-full anchor is
         // still true of the STORE no matter who wrote it, but PAYING this
         // debt (fold or re-anchor with `revise`, retract, or the
@@ -1610,27 +1646,16 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
         // for every project this session worked in - from a folder of no
         // project too - while the no-project key itself is still never
         // written.
+        // The Stop itself was counted above, before the Response Guard
+        // (step 20).
         let mut elsewhere_note: Option<String> = None;
-        {
-            let now = time::now_unix();
-            if is_subagent {
-                usefulness::record_hook_event(db_path, stop_project.as_deref(), &session_id, true, now, usefulness::HookEventKind::Other);
-            } else {
-                usefulness::record_main_stop(db_path, stop_project.as_deref(), &session_id, now);
-                if let Ok(mut store) = serve::store_dir::open_existing(db_path) {
-                    // The folder's own answer, for the words only: when the
-                    // ask is about another project, it says where the
-                    // session stands.
-                    let folder_own = stop_root.as_deref().and_then(project::resolve_project);
-                    let at = EvalStopAt { project: stop_project.as_deref(), folder: folder_own.as_deref() };
-                    match eval_stop_ask(&mut store, db_path, &session_id, at, now, drift_note.is_none(), no_record) {
-                        EvalStop::Ask(reason) => {
-                            return Some(HookOutput::Decision(serde_json::json!({ "decision": "block", "reason": reason })));
-                        }
-                        EvalStop::Elsewhere(line) => elsewhere_note = Some(line),
-                        EvalStop::Quiet => {}
-                    }
+        if !is_subagent {
+            match stop_eval_decision(db_path, &session_id, stop_root.as_deref(), stop_project.as_deref(), drift_note.is_none(), no_record) {
+                EvalStop::Ask(reason) => {
+                    return Some(HookOutput::Decision(serde_json::json!({ "decision": "block", "reason": reason })));
                 }
+                EvalStop::Elsewhere(line) => elsewhere_note = Some(line),
+                EvalStop::Quiet => {}
             }
         }
         // What rides with whatever this Stop still says: the drift line and
@@ -3298,6 +3323,27 @@ enum EvalStop {
 struct EvalStopAt<'a> {
     project: Option<&'a str>,
     folder: Option<&'a str>,
+}
+
+/// The Stop's evaluation decision for a main session (`eval_stop_ask`), with
+/// the store opened here: `stop_root` is the Stop's folder, `stop_project`
+/// the project it was counted in. Asked from two places - the Response
+/// Guard's block, which the ask rides with (step 20), and the Stop's own
+/// turn when the guard had no block - and never twice in one Stop.
+fn stop_eval_decision(
+    db_path: &Path,
+    session_id: &str,
+    stop_root: Option<&Path>,
+    stop_project: Option<&str>,
+    may_ask: bool,
+    no_record: bool,
+) -> EvalStop {
+    let Ok(mut store) = serve::store_dir::open_existing(db_path) else { return EvalStop::Quiet };
+    // The folder's own answer, for the words only: when the ask is about
+    // another project, it says where the session stands.
+    let folder_own = stop_root.and_then(project::resolve_project);
+    let at = EvalStopAt { project: stop_project, folder: folder_own.as_deref() };
+    eval_stop_ask(&mut store, db_path, session_id, at, time::now_unix(), may_ask, no_record)
 }
 
 fn eval_stop_ask(

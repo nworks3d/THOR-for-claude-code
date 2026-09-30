@@ -343,6 +343,55 @@ fn one_point_per_project_wide_blocker() {
     assert_eq!(fx.events_of("open-no-working-copy-gamma").len(), 1, "nothing new to say: nothing written");
 }
 
+/// Step 20 (C3 B2 L416-L439, K10): two OLD rules with NO project carry a
+/// file check - one absolute, one relative. Neither can be tried anywhere,
+/// and giving either a project would narrow a rule meant for every
+/// repository, so they are THOR's blocker: never on the agent's batch (whose
+/// only exit was to delete the two true checks), one point for the owner
+/// naming the non-destructive way, and the report files. Their checks stay.
+/// Once no such rule is left, the next start closes the point itself.
+#[test]
+fn a_global_file_check_is_a_machine_blocker_never_the_agents_batch() {
+    let mut fx = Fx::new();
+    let beta = fx.checkout("beta", &[("NOTES.md", "keep me\n")], true);
+    fx.register("beta", &beta);
+    fx.legacy(&rule("glob-abs", "The doctor binary lives at C:/fxp/bin/doctor.exe.", vec![cmd("doctor")], Some(Check::PathExists { path: "C:/fxp/bin/doctor.exe".to_string() }), None));
+    fx.legacy(&rule("glob-rel", "Every repo keeps `eol=lf` in .gitattributes.", vec![cmd("git add")], contains(".gitattributes", "eol=lf"), None));
+    let start = fx.start(S1, "beta");
+    let machine = start.frozen.machine.clone().unwrap();
+    assert_eq!(outcome_of(&start, "glob-abs"), MachineOutcome::Blocked);
+    assert_eq!(outcome_of(&start, "glob-rel"), MachineOutcome::Blocked);
+    assert!(start.frozen.batch().is_empty() && start.frozen.a4_list().is_empty(), "{:?} {:?}", start.frozen.batch(), start.frozen.a4_list());
+    let points = model::store::open_points(&fx.store, Some("beta"));
+    let point = points.iter().find(|p| p.id == "open-no-working-copy-global-rules-in-beta").unwrap_or_else(|| panic!("{points:?}"));
+    assert_eq!((point.subject.as_deref(), point.blocker.as_deref()), (Some(model::store::GLOBAL_RULES_SUBJECT), Some("no-working-copy")));
+    assert!(point.text.contains("'glob-abs'") && point.text.contains("'glob-rel'"), "{}", point.text);
+    assert!(point.text.contains("Nothing needs doing") && point.text.contains("clearing a check that is true is never the way"), "{}", point.text);
+    assert!(point.text.contains("give it that project (mcp__thor__revise"), "{}", point.text);
+    assert_eq!(machine.points.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), vec!["open-no-working-copy-global-rules-in-beta"]);
+    for id in ["glob-abs", "glob-rel"] {
+        assert!(matches!(model::store::settlement(&fx.store, id, Some(&start)), Settlement::Settled(Settled::Blocked(_))), "{id}");
+        assert!(matches!(model::store::settlement(&fx.store, id, None), Settlement::Settled(Settled::Blocked(_))), "{id}: not rot at read time either");
+        assert!(model::store::show(&fx.store, id).unwrap().check.is_some(), "{id}: its check stays");
+    }
+    file(&mut fx, &start, "eval-beta-1").expect("rules held by THOR's blocker hold no filing");
+
+    // Both turn out to be about beta and get beta (the named way). Nothing
+    // with no project carries a file check now: the next start closes the
+    // point.
+    for id in ["glob-abs", "glob-rel"] {
+        let before = model::store::show(&fx.store, id).unwrap();
+        let moved = Item { project: Some("beta".to_string()), ..before.clone() };
+        model::store::revise_because(&mut fx.store, "s", "l", "a", &before, &moved, &before, Some("fixture: the rule is about beta")).unwrap();
+    }
+    let next = fx.start(S2, "beta");
+    let closed = &next.frozen.machine.as_ref().unwrap().points_closed;
+    assert!(
+        closed.iter().any(|(id, why)| id == "open-no-working-copy-global-rules-in-beta" && why.contains("no rule with no project carries a file check")),
+        "{closed:?}"
+    );
+}
+
 /// G14.4, second half, and R14.5: once the folder is registered, the next
 /// start closes the point itself - reason 'the working copy is registered
 /// now' - and tries those rules for real; no carried point remains.

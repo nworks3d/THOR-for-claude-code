@@ -401,6 +401,9 @@ pub fn verify_refusal(store: &EventStore, event: &Event, root: Option<&Path>) ->
             event.entity_id
         ));
     }
+    if let Some(why) = self_proof(store, event) {
+        return no(why);
+    }
     Some(Verification {
         field: true,
         why: format!(
@@ -408,6 +411,75 @@ pub fn verify_refusal(store: &EventStore, event: &Event, root: Option<&Path>) ->
             call.name, event.entity_id
         ),
     })
+}
+
+/// How a recorded verdict names a real refusal the evaluating session met
+/// during its own evaluation (`self_proof`). Doctor counts these apart.
+pub const OWN_EVALUATION_WHY: &str = "refused during the session's own evaluation - not proof";
+
+/// How a recorded verdict names a real refusal met by the session that wrote
+/// the rule's current check (`self_proof`). Doctor counts these apart.
+pub const OWN_CHECK_WHY: &str = "refused in the session that wrote the rule's check - not proof";
+
+/// SELF-PROOF (step 20, NEW-2): a refusal that really happened but proves
+/// nothing, because the session that met it is the one judging or writing
+/// the rule. Measured in C3: during its own evaluation a session ran the
+/// forbidden commands itself at targets that do not exist (a push to a fake
+/// remote, ssh to a fake host) so the hook would refuse them, and every one
+/// was recorded as field evidence - the rules it was judging became
+/// "proven" by calls made for that purpose. Two shapes the log can show:
+/// - the session had its own evaluation open at the refusal
+///   (`model::store::evaluation_open_in_session_at`);
+/// - the session itself wrote the rule's check in force at the refusal, the
+///   refusal side of D6 (a real call planted by the writing session stops
+///   nothing; a refusal it provokes proves nothing either). A check THOR's
+///   own actors set is not a writing session's.
+///
+/// `Some(why)` for a self-proof, `None` otherwise. What stays open: a
+/// session that plants a refused call outside both - before its evaluation
+/// starts, on a rule someone else wrote - looks exactly like a real call
+/// (N15 in the step-20 report); a refusal only ever sets the "proven" label,
+/// never a settlement.
+pub fn self_proof(store: &EventStore, event: &Event) -> Option<String> {
+    let session = event.session_id.as_str();
+    let body = serde_json::from_str::<Value>(&event.body).unwrap_or(Value::Null);
+    let at = body.get("at").and_then(|t| t.as_str()).and_then(crate::time::unix_from_iso8601);
+    if let Some(start) = model::store::evaluation_open_in_session_at(store, session, event.seq, at) {
+        return Some(format!(
+            "{OWN_EVALUATION_WHY}: session {session} had its evaluation of '{}' open since log seq {} ('{}')",
+            start.frozen.project, start.seq, start.id
+        ));
+    }
+    let events = store.get_events_by_entity(&event.entity_id).ok()?;
+    let setter = check_setter_before(&events, event.seq)?;
+    let own = setter.session_id == session && !model::store::RESERVED_ACTORS.contains(&setter.actor.as_str());
+    own.then(|| format!("{OWN_CHECK_WHY}: session {session} set this rule's check at log seq {}", setter.seq))
+}
+
+/// The write that set the check in force just before log seq `seq` on
+/// `events` (one item's own log): the last create or revise before `seq`
+/// whose check differs from the one before it. `None` when no check was in
+/// force then.
+fn check_setter_before(events: &[Event], seq: i64) -> Option<&Event> {
+    let mut logged: Option<Option<Check>> = None;
+    let mut setter: Option<&Event> = None;
+    for e in events.iter().filter(|e| e.seq < seq) {
+        match e.kind {
+            EventKind::FactCreated | EventKind::FactRevised => {
+                let Ok(item) = model::store::parse_body(&e.body) else { continue };
+                if logged.as_ref() != Some(&item.check) {
+                    setter = item.check.is_some().then_some(e);
+                    logged = Some(item.check);
+                }
+            }
+            EventKind::FactRetracted => {
+                logged = None;
+                setter = None;
+            }
+            _ => {}
+        }
+    }
+    setter
 }
 
 /// Verify and record every refusal of `session` that has no recorded verdict
@@ -537,6 +609,11 @@ pub fn is_attested_refusal(store: &EventStore, event: &Event, since: i64, verdic
         return false;
     }
     if !verdicts.get(&event.seq).is_some_and(|(field, _)| *field) {
+        return false;
+    }
+    // A verdict recorded before step 20 said field for a self-proof too:
+    // read the log again, so such a refusal never counts either.
+    if self_proof(store, event).is_some() {
         return false;
     }
     // Last, being the one query of the log: the session has other activity.
@@ -1807,6 +1884,67 @@ mod tests {
         changed.check = Some(Check::Forbidden { literals: vec!["--mirror".to_string()] });
         model::store::revise_because(&mut store, "s", "l", "a", &item, &changed, &item, Some("fixture")).unwrap();
         assert!(field_refusals(&store, &item.id, &changed).is_empty());
+    }
+
+    /// NEW-2 (C3, step 20): during its own open evaluation a session runs the
+    /// forbidden call itself and the hook refuses it. The refusal is real, and
+    /// recorded - as never proof, saying why. The same session's refusal
+    /// before its evaluation started, and another session's during it, still
+    /// count.
+    #[test]
+    fn a_refusal_during_the_sessions_own_evaluation_is_never_field_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let item = force_rule();
+        let mut store = store_with(&item);
+        let input = json!({"command": "git push --force origin main"});
+        let before = field_refusal(&mut store, root.path(), S1, &item.id, "toolu_B", "Bash", input.clone(), "git push --force origin main");
+        let start = quiet_start(&mut store, S1, "fxp");
+        let during = field_refusal(&mut store, root.path(), S1, &item.id, "toolu_D", "Bash", input.clone(), "git push --force origin main");
+        let (field, why) = verdicts(&store, &item.id).get(&during).cloned().expect("recorded");
+        assert!(!field, "{why}");
+        assert!(why.starts_with(OWN_EVALUATION_WHY) && why.contains(&start.id), "{why}");
+        let other = field_refusal(&mut store, root.path(), S2, &item.id, "toolu_O", "Bash", input.clone(), "git push --force origin main");
+        let counted: Vec<i64> = field_refusals(&store, &item.id, &item).into_iter().map(|(seq, _)| seq).collect();
+        assert_eq!(counted, vec![before, other], "only the evaluating session's own call inside its evaluation is dropped");
+        // The window closes with the evaluation: once it is void, the same
+        // session's next real refusal counts again.
+        let void = model::store::FrozenVoid { id: item.id.clone(), seq: during, door: "fixture".to_string() };
+        model::store::record_evaluation_void(&mut store, SystemActor::new(model::store::EVAL_MACHINE_ACTOR), &start, &void).unwrap();
+        let after = field_refusal(&mut store, root.path(), S1, &item.id, "toolu_A", "Bash", input, "git push --force origin main");
+        assert!(verdicts(&store, &item.id)[&after].0, "{:?}", verdicts(&store, &item.id)[&after]);
+    }
+
+    /// NEW-2, a verdict recorded before step 20: it said field for a refusal
+    /// inside the session's own evaluation (C3 storeB, seq 241750-241757).
+    /// Every reader reads the log again, so it never counts either.
+    #[test]
+    fn a_field_verdict_recorded_before_the_fix_does_not_prove_a_self_probe() {
+        let item = force_rule();
+        let mut store = store_with(&item);
+        serve_once(&mut store, S1, &item.id);
+        quiet_start(&mut store, S1, "fxp");
+        let e = refuse(&mut store, S1, "hook", &item.id, "git push --force origin main", Some("toolu_OLD"));
+        model::store::record_refusal_verification(&mut store, S1, SystemActor::new(ATTESTER_ACTOR), &item.id, e.seq, true, "old build")
+            .unwrap();
+        assert!(field_refusals(&store, &item.id, &item).is_empty());
+        assert!(self_proof(&store, &e).is_some_and(|why| why.starts_with(OWN_EVALUATION_WHY)));
+    }
+
+    /// NEW-2, the writer's side (the refusal half of D6): the session that
+    /// wrote the rule's check provokes a refusal of it. Recorded, never proof;
+    /// another session's refusal of the same call counts.
+    #[test]
+    fn a_refusal_in_the_session_that_wrote_the_check_is_never_field_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let item = force_rule();
+        let mut store = EventStore::in_memory().unwrap();
+        model::store::declare(&mut store, S1, S1, "mcp", &item).unwrap();
+        let input = json!({"command": "git push --force origin main"});
+        let own = field_refusal(&mut store, root.path(), S1, &item.id, "toolu_W", "Bash", input.clone(), "git push --force origin main");
+        let (field, why) = verdicts(&store, &item.id).get(&own).cloned().expect("recorded");
+        assert!(!field && why.starts_with(OWN_CHECK_WHY), "{why}");
+        let other = field_refusal(&mut store, root.path(), S2, &item.id, "toolu_X2", "Bash", input, "git push --force origin main");
+        assert_eq!(field_refusals(&store, &item.id, &item), vec![(other, "git push --force origin main".to_string())]);
     }
 }
 
