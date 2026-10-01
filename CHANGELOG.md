@@ -2,6 +2,10 @@
 
 What changed in each release, newest first. The release workflow copies the section for the tag being released to the top of the release notes and refuses to publish without one.
 
+## 2.5.3 (2026-10-01)
+
+- **A Stop notice that does not hold the turn no longer holds it.** The void notice, the "running in session X" line, the "report still owed" line and the Response Guard's warnings were sent as model context, which Claude Code answers with another turn, so a session was stopped again at every Stop until Claude Code overrode the hook; they now reach you as a plain message only, a void notice is shown once per session, and a held turn is held again at most four times.
+
 ## 2.5.2 (2026-10-01)
 
 - **One project runs one evaluation at a time.** A second session's evaluation of the same project no longer starts while the first one's session was active in the last 30 minutes, however old its start is; that session gets one line naming the session that runs it. Once the running one has been quiet for 30 minutes, the next ask takes the evaluation over and closes the old one as superseded, never voided: its verdicts and edits stay.
