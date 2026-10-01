@@ -2,6 +2,10 @@
 
 What changed in each release, newest first. The release workflow copies the section for the tag being released to the top of the release notes and refuses to publish without one.
 
+## 2.5.1 (2026-10-01)
+
+- **The crowding hold no longer names writes THOR made itself.** The Stop hook's "stored this session onto a place that is already full" hold now counts only writes the session itself made: a revision by one of THOR's own actors (such as the `retest` pass an install runs from inside a session) or one stamped with another session's id is never that session's debt.
+
 ## 2.5.0 (2026-10-01)
 
 - **The evaluation starts from the previous report's remarks.** Before judging what fired, it looks up the newest evaluation report filed for this project and either settles what that report's remarks left open - unjudged items, gaps, anything still to be probed - now, or writes it down again with the reason it is still open. THOR's own open points are not part of this: THOR writes and closes those itself (see below).
