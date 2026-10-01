@@ -223,16 +223,26 @@ the owner's decision; `doctor` prints which one runs. "Accrued" means real
 activity - `SessionStart`, a prompt, a tool call, or `Stop` - with a gap of
 half an hour or more between two of them counting as a pause, never as work.
 Only a new valid evaluation, read from the log at a `Stop`, resets the clocks.
+When something else holds that `Stop` first - a reply that breaks a reply rule,
+the first-session setup, a decision the owner stated that was not stored, or a
+note stored onto a full place - the ask is not lost: it comes in the same block,
+after that reason, and the `Stop` is counted once.
 
 An open point is THOR's own: the machine pass writes one per blocker
 (`open-no-working-copy-*` when a project has no registered working copy,
 `open-working-tree-differs-*` when the checkout is mid-change) and closes it
 itself, with a derived reason, at the first start after the blocker is gone.
+Rules with no project whose check reads a file have no working copy anywhere;
+they share ONE point for the whole memory, `open-no-working-copy--global-rules`,
+which every project's evaluation holds them by (never on its batch) and which
+belongs to no project.
 `remember`, `revise` and `retract` refuse an agent's attempt to file, tag or
 remove one. One still open after a valid evaluation was filed is in the owner's
 queue (the point's text says so, and names each carrier); over a budget of 8 per
 project, the `SessionStart` block opens with a banner for the owner, never for a
-subagent, and the filing receipt repeats it. A `mark` given from a shell with
+subagent, and the filing receipt repeats it. The one point for the whole memory
+is carried by every project's valid evaluations together, counted once in the
+queue, and against no project's budget. A `mark` given from a shell with
 `serve mark` still writes a verdict, but it is outside an attested call: it is
 not counted as judgement debt settled, it does not shrink a judgement list, and
 the machine section lists it as a side door.
@@ -419,7 +429,7 @@ with the session records by more than a quarter of an hour, since that file is
 one any local process can write. An `open points` line counts THOR's own open
 points apart from the legacy ones an agent filed before THOR wrote them itself,
 and an `owner queue` line counts, per project, the ones waiting for the owner
-against the budget of 8.
+against the budget of 8 - and, once, the point for the whole memory.
 
 Doctor also lists the working copy each project is registered at, since when,
 and where it was before a move - or `NOT USABLE` with the reason, when that
@@ -667,6 +677,12 @@ a tooth built from its own text still bites, which it names as the fix. `--id
 it can write, 3 when a rule is blocked (its project has no registered working
 copy, or that checkout is mid-change while the default branch still has the
 line), and 4 when only a writer can make the fix, which it names.
+
+The `Stop` hook also asks a session about a few of these, once per session, with
+the command for each. It asks only a session that has done at least 10 minutes
+of its own work in the project, and never at its first `Stop` there - the same
+two terms the evaluation ask lands on, read from the same clock - so a short
+task is never held for old rules it did not touch.
 
 There is a second gate that keeps the number from rotting once you start
 using it. Adding a fact to a target that already holds one whose own proof

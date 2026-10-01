@@ -1889,6 +1889,14 @@ pub enum Blocker {
 /// with one.
 pub const GLOBAL_RULES_SUBJECT: &str = "global";
 
+/// The id of THOR's ONE open point for rules with no project held for lack
+/// of a working copy (step 21): one for the whole store, never one per
+/// evaluated project, so it counts once in the owner queue and against no
+/// project's budget. It keeps the reserved prefix (only `eval-machine` writes
+/// it), and the double hyphen keeps it apart from every project's own point:
+/// a project's part of an id (`slug`) never starts with a hyphen.
+pub const GLOBAL_RULES_POINT_ID: &str = "open-no-working-copy--global-rules";
+
 impl Blocker {
     /// The blocker of a rule with no project whose check reads a file.
     pub fn global_rules() -> Self {
@@ -3248,14 +3256,12 @@ fn slug(text: &str, fallback: &str) -> String {
 /// The id of THOR's open point for `blocker` in `project`: one per subject.
 /// `open-no-working-copy-<project>` for a project with no usable registered
 /// working copy; `open-working-tree-differs-<project>-<file>` for a file whose
-/// registered working tree lacks a literal the default branch still has.
+/// registered working tree lacks a literal the default branch still has; and
+/// `GLOBAL_RULES_POINT_ID` - whatever `project` is evaluated - for the rules
+/// with no project (step 21: one store-wide point).
 pub fn machine_point_id(project: &str, blocker: &Blocker) -> String {
     match blocker {
-        // One point per evaluated project for its global rules: "global" is
-        // no project, so the id names the project whose evaluation holds it.
-        Blocker::NoWorkingCopy { .. } if blocker.is_global_rules() => {
-            format!("open-no-working-copy-global-rules-in-{}", slug(project, "project"))
-        }
+        Blocker::NoWorkingCopy { .. } if blocker.is_global_rules() => GLOBAL_RULES_POINT_ID.to_string(),
         Blocker::NoWorkingCopy { project } => format!("open-no-working-copy-{}", slug(project, "project")),
         Blocker::WorkingTreeDiffers { path } => {
             format!("open-working-tree-differs-{}-{}", slug(project, "project"), slug(path, "file"))
@@ -3301,13 +3307,16 @@ pub fn write_machine_point(
     }
     let id = machine_point_id(project, blocker);
     let name = fence(store, actor.into(), &id)?;
+    // The store-wide point of the rules with no project belongs to no
+    // project: no project's owner budget counts it (step 21).
+    let scope = (!blocker.is_global_rules()).then(|| project.to_string());
     let item = Item {
         id: id.clone(),
         kind: Kind::Report,
         text: text.to_string(),
         bindings: vec![],
         severity: None,
-        project: Some(project.to_string()),
+        project: scope,
         tags: machine_point_tags(blocker),
         expires: None,
         key: None,
@@ -4113,7 +4122,13 @@ pub fn frozen_now(store: &EventStore, session: &str, project: &str, started_by: 
         batch: None,
         batch_later: 0,
         a4_list: None,
-        open_points: open_points(store, Some(project)).into_iter().map(|p| p.id).collect(),
+        // The project's own points, then THOR's store-wide one, which every
+        // project's evaluation holds the rules with no project by (step 21).
+        open_points: open_points(store, Some(project))
+            .into_iter()
+            .chain(open_points(store, None).into_iter().filter(|p| p.machine))
+            .map(|p| p.id)
+            .collect(),
         machine: None,
         void: None,
     })
@@ -5775,11 +5790,15 @@ pub struct Carrier {
 /// open point about `subject` was live (B5), from the validator's records at
 /// or before log seq `until`, oldest first. Counted per SUBJECT, never per
 /// point: a point that is closed and re-opened, or retracted and written
-/// again, keeps its carry.
+/// again, keeps its carry. The store-wide point of the rules with no project
+/// (`GLOBAL_RULES_SUBJECT`, step 21) is carried by every project's valid
+/// evaluations together - one carry, counted once - so `project` is not read
+/// for it.
 pub fn carriers_of(store: &EventStore, project: &str, subject: &str, until: i64) -> Vec<Carrier> {
+    let any_project = subject == GLOBAL_RULES_SUBJECT;
     evaluation_validations(store)
         .into_iter()
-        .filter(|(seq, v)| *seq <= until && v.valid && v.project.as_deref() == Some(project))
+        .filter(|(seq, v)| *seq <= until && v.valid && (any_project || v.project.as_deref() == Some(project)))
         .filter_map(|(_, v)| {
             let entry = v.carry.iter().find(|c| c.subject == subject)?;
             Some(Carrier {
@@ -5823,6 +5842,21 @@ pub fn owner_queue(store: &EventStore, project: &str) -> Vec<(OpenPoint, Vec<Car
         .filter(|p| p.machine)
         .filter_map(|p| {
             let carriers = carriers_of(store, project, p.subject.as_deref()?, i64::MAX);
+            (!carriers.is_empty()).then_some((p, carriers))
+        })
+        .collect()
+}
+
+/// THOR's own store-wide open points that wait on the owner (step 21): the
+/// one point of the rules with no project, when it is live and a valid
+/// evaluation of any project was filed while it held. Counted once, here,
+/// and against no project's `OPEN_POINTS_OWNER_BUDGET`.
+pub fn store_wide_owner_queue(store: &EventStore) -> Vec<(OpenPoint, Vec<Carrier>)> {
+    open_points(store, None)
+        .into_iter()
+        .filter(|p| p.machine && p.subject.as_deref() == Some(GLOBAL_RULES_SUBJECT))
+        .filter_map(|p| {
+            let carriers = carriers_of(store, "", GLOBAL_RULES_SUBJECT, i64::MAX);
             (!carriers.is_empty()).then_some((p, carriers))
         })
         .collect()

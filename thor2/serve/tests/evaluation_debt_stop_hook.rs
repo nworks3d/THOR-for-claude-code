@@ -1294,28 +1294,33 @@ fn setup_debt_still_fires_with_an_eval_eligible_backlog_also_present() {
     let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("expected a decision JSON: {e}: {out}"));
     assert_eq!(v["decision"], "block", "{out}");
     let reason = v["reason"].as_str().unwrap();
-    assert!(reason.contains("First session with a new owner"), "setup_debt must still win first: {reason}");
-    assert!(!reason.contains("Run the THOR evaluation"), "the evaluation debt must not also speak this turn: {reason}");
+    assert!(reason.starts_with("[THOR] This memory was just installed"), "setup_debt must still come first: {reason}");
+    // Step 21: the evaluation ask rides after it in the same block, instead
+    // of waiting for a Stop setup does not hold
+    // (`a_setup_block_carries_the_evaluation_ask`).
+    assert!(reason.contains("Run the THOR evaluation"), "the ask rides with the setup block: {reason}");
 }
 
 /// THE OTHER HALF: a debt AFTER the new insertion point (the backlog burn,
 /// `teeth_debt`) must still fire on its own store, unaffected, when the
 /// evaluation debt itself has nothing to say (no sidecar was ever seeded
 /// here, and the session served nothing applying to this project either).
-/// Left on `global_cwd` deliberately: this test was never about the
-/// evaluation debt firing or staying silent in the first place (nothing
-/// here would make it fire either way), only about the debt after it still
-/// running.
+/// Since step 21 the teeth question holds only a session with ten minutes of
+/// its own work in the project, past its first Stop there (the evaluation
+/// ask's own gates), so the session has thirty minutes and one earlier Stop
+/// in a project - too little for the evaluation (the project's clock is not
+/// due), enough for the teeth question.
 #[test]
 fn teeth_debt_still_fires_after_the_evaluation_debt_check() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("thor.db");
     let sandbox = Sandbox::new();
-    let cwd = sandbox.global_cwd();
+    let cwd = sandbox.project_dir("fxp");
 
     let mut store = EventStore::new(&db).unwrap();
     declare_teeth_eligible_item(&mut store, "names-a-flag");
     drop(store);
+    seed_own_work(&db, "fxp", "s1", 30, 1);
 
     let out = run_hook(&db, &stop_payload("s1", &cwd), &sandbox);
     let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("expected a decision JSON: {e}: {out}"));
@@ -1861,4 +1866,166 @@ fn a_stop_held_by_the_response_guard_still_counts() {
     assert_eq!(serve::usefulness::project_eval_state(&db, Some("fxp")).sessions[&s].stops, 1, "the held Stop is counted");
     let second = run_hook(&db, &long_reply_stop(&s, &fxp, false), &sandbox);
     assert!(is_block(&second) && second.contains("TLDR") && second.contains("Run the THOR evaluation"), "{second}");
+}
+
+// ---------------------------------------------------------------- step 21
+//
+// C3 B2 L86: a short task session was held at its very first Stop by the
+// teeth question (rules with no current verdict from THOR's trial), work it
+// never touched. That hold now has the evaluation ask's own gates (F14,
+// Q10): never a session's first Stop in the project, and only once the
+// session has ten minutes of its own work there. And the setup, capture and
+// crowding blocks no longer starve the evaluation ask: it rides with them,
+// the way it rides with the Response Guard's block (step 20).
+
+/// A main session's `SessionStart` in `cwd`: it records where the log stood,
+/// the mark the crowding question reads what this session wrote by.
+fn session_start_payload(session_id: &str, cwd: &Path) -> String {
+    serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "session_id": session_id,
+        "source": "startup",
+        "cwd": cwd.to_string_lossy(),
+    })
+    .to_string()
+}
+
+/// The teeth question holds neither a session's first Stop in the project
+/// nor a session with less than ten minutes of its own work there; a
+/// session past both gates is asked at its next Stop.
+#[test]
+fn the_teeth_question_never_holds_a_first_stop_or_a_short_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let sandbox = Sandbox::new();
+    let fxp = sandbox.project_dir("fxp");
+    let mut store = EventStore::new(&db).unwrap();
+    declare_teeth_eligible_item(&mut store, "names-a-flag");
+    drop(store);
+
+    let fresh = uuid(64);
+    seed_own_work(&db, "fxp", &fresh, 30, 0);
+    let first = run_hook(&db, &stop_payload(&fresh, &fxp), &sandbox);
+    assert!(!is_block(&first), "a session's first Stop here is never held for rule upkeep: {first}");
+    let second = run_hook(&db, &stop_payload(&fresh, &fxp), &sandbox);
+    assert!(is_block(&second) && second.contains("names-a-flag"), "its second Stop is: {second}");
+    assert!(second.contains("retest --id 'names-a-flag'"), "with the command that decides it: {second}");
+
+    let short = uuid(65);
+    seed_own_work(&db, "fxp", &short, 4, 2);
+    for stop in 1..=3 {
+        let out = run_hook(&db, &stop_payload(&short, &fxp), &sandbox);
+        assert!(!is_block(&out), "stop {stop}: four minutes of its own here is never held for rule upkeep: {out}");
+    }
+}
+
+/// The setup block holds the turn first, and the evaluation ask - with the
+/// start note of the evaluation it starts - rides in the same block. The
+/// Stop is counted once.
+#[test]
+fn a_setup_block_carries_the_evaluation_ask() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let sandbox = Sandbox::new();
+    let fxp = sandbox.project_dir("fxp");
+    let mut store = EventStore::new(&db).unwrap();
+    declare_setup_note(&mut store);
+    drop(store);
+    let s = uuid(66);
+    seed_project_clock(&db, "fxp", 90);
+    seed_own_work(&db, "fxp", &s, 30, 1);
+
+    let out = run_hook(&db, &stop_payload(&s, &fxp), &sandbox);
+    assert!(is_block(&out), "{out}");
+    let setup = out.find("First session with a new owner").unwrap_or_else(|| panic!("setup is never skipped: {out}"));
+    let ask = out.find("Run the THOR evaluation").unwrap_or_else(|| panic!("the ask rides with it: {out}"));
+    assert!(setup < ask && out.contains("The evaluation of 'fxp' started"), "setup first, then the ask and its start note: {out}");
+    let state = serve::usefulness::project_eval_state(&db, Some("fxp"));
+    assert_eq!((state.asked_count, state.sessions[&s].stops), (1, 2), "asked once, the Stop counted once");
+    let retry = run_hook(&db, &retry_stop_payload(&s, &fxp), &sandbox);
+    assert!(!is_block(&retry), "the retry never holds the turn again: {retry}");
+}
+
+/// The capture check (a durable decision the owner stated, not recorded)
+/// holds the turn, and the evaluation ask rides in the same block.
+#[test]
+fn a_capture_block_carries_the_evaluation_ask() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let sandbox = Sandbox::new();
+    let fxp = sandbox.project_dir("fxp");
+    drop(EventStore::new(&db).unwrap());
+    let s = uuid(67);
+    let prompt = serde_json::json!({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": s,
+        "cwd": fxp.to_string_lossy(),
+        "prompt": "from now on always run the linter first",
+    })
+    .to_string();
+    run_hook(&db, &prompt, &sandbox);
+    seed_project_clock(&db, "fxp", 90);
+    seed_own_work(&db, "fxp", &s, 30, 1);
+
+    let out = run_hook(&db, &stop_payload(&s, &fxp), &sandbox);
+    assert!(is_block(&out), "{out}");
+    let capture = out.find("NEW durable decision").unwrap_or_else(|| panic!("the capture check is never skipped: {out}"));
+    let ask = out.find("Run the THOR evaluation").unwrap_or_else(|| panic!("the ask rides with it: {out}"));
+    assert!(capture < ask && out.contains("The evaluation of 'fxp' started"), "{out}");
+    let state = serve::usefulness::project_eval_state(&db, Some("fxp"));
+    assert_eq!((state.asked_count, state.sessions[&s].stops), (1, 2), "asked once, the Stop counted once");
+}
+
+/// The crowding question (a fact this session stored onto a full place)
+/// holds the turn, and the evaluation ask rides in the same block.
+#[test]
+fn a_crowding_block_carries_the_evaluation_ask() {
+    const DISTINCT: [&str; 5] = [
+        "a webhook retry backs off before it gives up entirely",
+        "the estimator rounds a quote up to whole cents",
+        "a spool label carries the batch it came from",
+        "the scheduler skips a printer that is on hold",
+        "an invoice number never restarts inside a year",
+    ];
+    let moment_rule = |id: &str, text: &str| Item {
+        id: id.to_string(),
+        kind: Kind::Rule,
+        text: text.to_string(),
+        bindings: vec![Binding::Moment(intent::Action::Deploy)],
+        severity: None,
+        project: Some("fxp".to_string()),
+        tags: vec![],
+        expires: None,
+        key: None,
+        falsifier: Some(format!("{id} turns out not to matter")),
+        check: None,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let sandbox = Sandbox::new();
+    let fxp = sandbox.project_dir("fxp");
+    let mut store = EventStore::new(&db).unwrap();
+    for i in 0..model::item::MAX_ITEMS {
+        let id = format!("holder-{i}");
+        model::store::declare(&mut store, "earlier", "earlier", "t", &moment_rule(&id, DISTINCT[i % DISTINCT.len()])).unwrap();
+        serve::teeth::fixture::decide(&mut store, &id);
+    }
+    drop(store);
+    let s = uuid(68);
+    run_hook(&db, &session_start_payload(&s, &fxp), &sandbox);
+    let mut store = EventStore::open_existing(&db).unwrap();
+    let newcomer = moment_rule("newcomer", "a shipment label is printed once and never reprinted silently");
+    model::store::declare(&mut store, "mcp", "mcp", "t", &newcomer).unwrap();
+    serve::teeth::fixture::decide(&mut store, "newcomer");
+    drop(store);
+    seed_project_clock(&db, "fxp", 90);
+    seed_own_work(&db, "fxp", &s, 30, 1);
+
+    let out = run_hook(&db, &stop_payload(&s, &fxp), &sandbox);
+    assert!(is_block(&out), "{out}");
+    let crowding = out.find("onto a place that is already full").unwrap_or_else(|| panic!("the crowding question is never skipped: {out}"));
+    let ask = out.find("Run the THOR evaluation").unwrap_or_else(|| panic!("the ask rides with it: {out}"));
+    assert!(crowding < ask && out.contains("The evaluation of 'fxp' started"), "{out}");
+    let state = serve::usefulness::project_eval_state(&db, Some("fxp"));
+    assert_eq!((state.asked_count, state.sessions[&s].stops), (1, 2), "asked once, the Stop counted once");
 }

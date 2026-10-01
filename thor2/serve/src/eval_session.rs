@@ -493,7 +493,8 @@ fn point_text(
         return text;
     }
     format!(
-        "IN THE OWNER QUEUE - the owner decides - carried by {}: {} valid evaluation(s) were filed while this still held,          and no agent can lift it. {text}",
+        "IN THE OWNER QUEUE - the owner decides - carried by {}: {} valid evaluation(s) were filed while this still held, \
+         and no agent can lift it. {text}",
         model::store::carriers_in_words(carried_by),
         carried_by.len()
     )
@@ -503,12 +504,14 @@ fn point_text(
 fn point_text_of(store: &EventStore, project: &str, blocker: &Blocker, rules: &[String], more: &str) -> String {
     match blocker {
         Blocker::NoWorkingCopy { .. } if blocker.is_global_rules() => format!(
-            "THOR's own open point: {} rule(s) with no project carry a check that reads a file, and a rule with no \
-             project has no working copy THOR could try that check in: {}.{more} Nothing needs doing: each keeps its \
-             check and is counted apart - clearing a check that is true is never the way past this. Only when a rule \
-             is really about one project: give it that project (mcp__thor__revise with the rule's id, project and a \
-             because); otherwise the owner decides. This point closes itself at the first evaluation start after no \
-             rule with no project carries a file check.",
+            "THOR's own open point, one for the whole memory (not for one project): {} rule(s) with no project carry a \
+             check that reads a file, and a rule with no project has no working copy THOR could try that check in: \
+             {}.{more} Every project's evaluation holds these rules by this one point, and none of them is that \
+             evaluation's to settle. Nothing needs doing: each keeps its check and is counted apart - clearing a check \
+             that is true is never the way past this. Only when a rule is really about one project: give it that \
+             project (mcp__thor__revise with the rule's id, project and a because); otherwise the owner decides. This \
+             point closes itself at the first evaluation start, in any project, after no rule with no project carries \
+             a file check.",
             rules.len(),
             named(rules)
         ),
@@ -644,13 +647,28 @@ pub fn machine_pass(store: &mut EventStore, project: &str, start: &EvaluationSta
     }
     // A point of an earlier start that this pass found no rule blocked by:
     // closed when its blocker no longer holds, kept when it does (the pass
-    // may not have reached its rules).
-    for point in model::store::open_points(store, Some(project)).into_iter().filter(|p| p.machine) {
+    // may not have reached its rules). The project's own points, and THOR's
+    // store-wide one for the rules with no project (step 21).
+    let earlier: Vec<model::store::OpenPoint> = model::store::open_points(store, Some(project))
+        .into_iter()
+        .chain(model::store::open_points(store, None))
+        .filter(|p| p.machine)
+        .collect();
+    for point in earlier {
         if machine.points.iter().any(|p| p.id == point.id) {
             continue;
         }
         let (Some(code), Some(subject)) = (point.blocker.clone(), point.subject.clone()) else { continue };
         let blocker = MachineBlocker { code, subject };
+        // A per-project point for the rules with no project, the shape the
+        // build before step 21 wrote: the one store-wide point replaces it.
+        if blocker.to_blocker().is_global_rules() && point.id != model::store::GLOBAL_RULES_POINT_ID {
+            let reason = format!("replaced by THOR's one store-wide point '{}'", model::store::GLOBAL_RULES_POINT_ID);
+            if model::store::retract_machine_point(store, eval_machine(), &session, &point.id, &reason).is_ok() {
+                machine.points_closed.push((point.id, reason));
+            }
+            continue;
+        }
         match lifted(store, project, &blocker.to_blocker()) {
             Some(reason) => {
                 if model::store::retract_machine_point(store, eval_machine(), &session, &point.id, &reason).is_ok() {
@@ -811,9 +829,18 @@ fn open_points_section(out: &mut String, frozen: &Frozen) {
                 .points
                 .iter()
                 .map(|p| {
-                    let held = match p.rules.len() {
-                        0 => format!("'{}'", p.id),
-                        n => format!("'{}' (holds {n} rule(s): {})", p.id, named(&p.rules)),
+                    // The store-wide point says so: one for every project,
+                    // never this project's own (step 21).
+                    let store_wide = p.id == model::store::GLOBAL_RULES_POINT_ID;
+                    let held = match (p.rules.len(), store_wide) {
+                        (0, false) => format!("'{}'", p.id),
+                        (0, true) => format!("'{}' (one point for the whole memory: the rules with no project)", p.id),
+                        (n, false) => format!("'{}' (holds {n} rule(s): {})", p.id, named(&p.rules)),
+                        (n, true) => format!(
+                            "'{}' (one point for the whole memory: holds {n} rule(s) with no project: {})",
+                            p.id,
+                            named(&p.rules)
+                        ),
                     };
                     match p.carried_by.is_empty() {
                         true => held,

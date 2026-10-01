@@ -42,6 +42,10 @@ If another session is already running this project's evaluation (it started
 less than an hour ago and is still active), you are told that in one line
 and are not held. A project with activity in the last seven days and no
 evaluation that counts in seven days is due whatever the clock says.
+When something else holds the same turn-end first - a reply rule, the
+first-session setup, a decision the owner stated that was not stored, or a
+note stored onto a full place - the ask comes in the same message, after it.
+Settle both.
 
 The ask does not go quiet after one turn: it holds the end of every turn,
 naming how many times it has already asked and since when, until a report
@@ -255,7 +259,9 @@ are not a way to get a rule off the batch.
 
 Never file an open point, and never tag a rule with `open-point`, `about:` or
 `blocker:`: THOR writes and closes its own open points (a missing working
-copy, a file the checkout is changing) and refuses yours. A legacy open point
+copy, a file the checkout is changing, and ONE point for the whole memory
+that holds every rule with no project whose check reads a file) and refuses
+yours. A legacy open point
 an older routine filed settles nothing and holds nothing; retract one, with a
 reason, only when what it names is resolved.
 

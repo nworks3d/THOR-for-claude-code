@@ -333,6 +333,12 @@ is checked once, at that session's `Stop`, and the verdict is recorded in the
 log; a refusal never verified whose transcript is gone is never proof. A field
 refusal sets the proven label and nothing else.
 
+Self-proof is never proof: a refusal the evaluating session met inside its own
+evaluation (from its start to its filing), and a refusal in the session that
+wrote the rule's current check, are recorded with `field: false` and the reason,
+and doctor counts both shapes apart. What this cannot close is named in 7.8
+(N15).
+
 ### 6.5 One reader, and retest
 
 - `model::store::settlement` is the one answer for the evaluation filing gate,
@@ -429,11 +435,25 @@ project, AND no other session running that project's evaluation for less than
 `EVAL_ELSEWHERE_MAX_MINUTES`. The weekly floor (`EVAL_FLOOR_DAYS`) reads the log
 alone. Only a new valid evaluation resets the clocks.
 
+The ask rides with every block that holds a first-pass `Stop` before its own
+turn - the Response Guard, setup, the capture check, the crowding question - in
+the same block after that reason, so none of them starves it; the `Stop` is
+counted once, before any verdict. The teeth question (rules with no current
+verdict from THOR's trial) holds a session only on the ask's own two session
+terms, read by the same functions (`usefulness::upkeep_may_hold`): at least
+`EVAL_OWN_WORK_MINUTES` of its own work in the project, and not its first `Stop`
+there. A `Stop` in no project is never held for it.
+
 ### 7.6 Open points and the owner queue
 
 Open points are THOR's own (`open-no-working-copy-*`,
 `open-working-tree-differs-*`), reserved to `eval-machine` at the store, written
-and closed by the machine pass. A subject still open after a valid evaluation was
+and closed by the machine pass. Rules with no project whose check reads a file
+(`Blocker::global_rules`) share ONE store-wide point,
+`open-no-working-copy--global-rules` (`GLOBAL_RULES_POINT_ID`), in no project:
+every project's evaluation holds them by it (never on its batch), its carry is
+counted across every project's valid evaluations together, and it is counted
+once in the owner queue (`store_wide_owner_queue`), against no project's budget. A subject still open after a valid evaluation was
 filed is carried and is in the owner queue; over `OPEN_POINTS_OWNER_BUDGET` a
 project's session start opens with a banner. No agent can file, tag or remove
 one.
@@ -447,4 +467,11 @@ one.
 `serve/src/usefulness/clock_tests.rs`,
 `serve/tests/the_teeth_instructions_agree.rs` (the routine and AGENTS.md say what
 the code does), `ops/tests/install_eval_command.rs` (the seeded routine files a
-TLDR and remarks only and never asks for an open point).
+TLDR and remarks only and never asks for an open point),
+`serve/tests/teeth_debt_rotates_and_follows_the_session.rs`.
+
+### 7.8 What stays open (named limits)
+
+| # | What stays open | Why | Fallback |
+|---|---|---|---|
+| N15 | A session that plants a refused call OUTSIDE its own evaluation window (before its evaluation starts, or after it filed), on a rule it did not write, looks exactly like a real call and can set that rule's proven label | Nothing tells a planted call from a real one; excluding every refusal of a session that later evaluates would also drop real refusals | Doctor counts the self-proof shapes apart; the record of every field refusal names its session and log seq; a proven label settles nothing (proven versus wired only) |

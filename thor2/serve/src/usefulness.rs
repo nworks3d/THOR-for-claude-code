@@ -1291,25 +1291,71 @@ pub fn stop_decision(
     now_unix: i64,
     cadence: EvalCadence,
 ) -> StopDecision {
-    let own_state = state.sessions.get(session).cloned().unwrap_or_default();
-    let own_minutes =
-        (own_state.accrued_secs / 60).max(crate::attest::minutes_in(timeline, project, state.last_evaluation_seen));
+    let own_minutes = own_minutes_in(state, project, session, timeline);
     if own_minutes < EVAL_OWN_WORK_MINUTES {
-        return StopDecision::Quiet("this session has less than ten minutes of its own work here");
+        return StopDecision::Quiet(SHORT_SESSION);
     }
     let mut work = state.work.clone();
     work.accrued_secs = work.accrued_secs.max(own_minutes * 60);
     let Some(by_floor) = project_due(store, state, project, &work, now_unix, cadence) else {
         return StopDecision::Quiet("the project is not due");
     };
-    let earlier_stops = own_state.stops.saturating_sub(u32::from(stop_here));
-    if first_stop_is_free && earlier_stops == 0 && !crate::attest::earlier_turn_in(timeline, project) {
-        return StopDecision::Quiet("this is the session's first Stop here");
+    if first_stop_is_free && first_stop_here(state, project, session, timeline, stop_here) {
+        return StopDecision::Quiet(FIRST_STOP);
     }
     if let Some(start) = evaluation_running_elsewhere(store, project, session, now_unix) {
         return StopDecision::Elsewhere(start);
     }
     StopDecision::Ask(EvalClock { work, own_minutes, by_floor })
+}
+
+const SHORT_SESSION: &str = "this session has less than ten minutes of its own work here";
+const FIRST_STOP: &str = "this is the session's first Stop here";
+
+/// This session's own minutes of work in `project` since the project's newest
+/// valid evaluation: the larger of the sidecar's number and its transcript's
+/// (`timeline`, the tamper check). `state` is the project's sidecar entry.
+pub fn own_minutes_in(state: &ProjectEvalState, project: &str, session: &str, timeline: &[crate::attest::TimedLine]) -> i64 {
+    let own_secs = state.sessions.get(session).map_or(0, |s| s.accrued_secs);
+    (own_secs / 60).max(crate::attest::minutes_in(timeline, project, state.last_evaluation_seen))
+}
+
+/// Whether the Stop just counted is this session's first in `project` (Q10):
+/// neither the sidecar's Stop count nor the transcript shows an earlier turn
+/// there. `stop_here` says the Stop just counted was in this project.
+pub fn first_stop_here(
+    state: &ProjectEvalState,
+    project: &str,
+    session: &str,
+    timeline: &[crate::attest::TimedLine],
+    stop_here: bool,
+) -> bool {
+    let stops = state.sessions.get(session).map_or(0, |s| s.stops);
+    stops.saturating_sub(u32::from(stop_here)) == 0 && !crate::attest::earlier_turn_in(timeline, project)
+}
+
+/// THE SESSION'S OWN GATES, for a Stop hold about rule upkeep (step 21): the
+/// teeth question (rules with no current verdict from THOR's trial) holds a
+/// main session's Stop only on the same two terms the evaluation ask lands
+/// on - F14 and Q10, read by the same functions from the same clock: at least
+/// `EVAL_OWN_WORK_MINUTES` of the session's own work in `project`, and not
+/// its first Stop there. A short task session, or one that just started,
+/// never answers for a backlog it did not touch (C3 B2 L86). `Err` names the
+/// gate that keeps it quiet.
+pub fn upkeep_may_hold(
+    state: &ProjectEvalState,
+    project: &str,
+    session: &str,
+    timeline: &[crate::attest::TimedLine],
+    stop_here: bool,
+) -> Result<(), &'static str> {
+    if own_minutes_in(state, project, session, timeline) < EVAL_OWN_WORK_MINUTES {
+        return Err(SHORT_SESSION);
+    }
+    if first_stop_here(state, project, session, timeline, stop_here) {
+        return Err(FIRST_STOP);
+    }
+    Ok(())
 }
 
 /// THE ASK FOLLOWS THE WORK (D11): every project the Stop considers for

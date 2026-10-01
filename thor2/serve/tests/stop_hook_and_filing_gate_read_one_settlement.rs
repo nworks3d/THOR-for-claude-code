@@ -39,7 +39,23 @@ fn run_hook(db: &Path, payload: &str) -> String {
     String::from_utf8(out.stdout).unwrap()
 }
 
+/// The Stop of `session` in project `p`, once it has thirty minutes of its
+/// own work there and an earlier turn: since step 21 the teeth question
+/// holds a session only past the evaluation ask's own gates.
 fn stop_reason(db: &Path, session: &str, cwd: &Path) -> String {
+    let mut all = serve::usefulness::read_eval_debt_state(db);
+    let now = serve::time::now_unix();
+    all.entry("p".to_string()).or_default().sessions.insert(
+        session.to_string(),
+        serve::usefulness::SessionWorkState {
+            anchor_unix: Some(now - 30 * 60),
+            accrued_secs: 30 * 60,
+            last_event_unix: Some(now),
+            stops: 1,
+            ..Default::default()
+        },
+    );
+    std::fs::write(serve::usefulness::eval_debt_state_path(db), serde_json::to_string(&all).unwrap()).unwrap();
     let payload = serde_json::json!({
         "hook_event_name": "Stop",
         "session_id": session,

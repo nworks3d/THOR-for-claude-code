@@ -349,11 +349,18 @@ or a rule THOR's own trial has not decided yet (the message names the command
 that decides it). Each has one honest way out, and the message says which.
 Saying it in your reply settles nothing - the fix has to be a real change to the
 note, or the tag that records the decision. No tag decides a rule's teeth: only
-its trial does.
+its trial does. The question about rules the trial has not decided yet waits
+until this session has done at least 10 minutes of its own work in the project,
+and it never holds the session's first turn-end there - a short task is never
+held for old rules it did not touch.
 
 Once in a while it asks for something bigger instead of one more note: the full
 end-of-session review, which the install wrote as `/thor-eval`. The message
-names the routine and says where it is; open it and do what it says.
+names the routine and says where it is; open it and do what it says. When
+something else holds the same turn-end - the first-session setup, a decision the
+owner stated that you did not store, a note stored onto a full place, or a reply
+that breaks one of the reply rules - the request for the review comes in the same
+message, after that one. Deal with both.
 
 **When it asks.** Per project, never per folder. It asks at the end of a turn
 when all of this holds:
@@ -408,7 +415,8 @@ more never counts.
      it settles nothing.
    - **Open points.** THOR writes and closes these itself, for things only the
      owner can do, such as a project whose working copy is not registered.
-     There is nothing for you to do. Never file one, and never tag a note as
+     Rules that belong to no project and check a file share ONE open point for
+     the whole memory, not one per project. There is nothing for you to do. Never file one, and never tag a note as
      one: `remember` and `revise` refuse it.
 2. **Give your verdicts, then end the turn once.** THOR checks, when a turn ends,
    that each verdict really was a THOR tool call. The report is refused while
@@ -435,7 +443,8 @@ more never counts.
 evaluation that counts was filed, THOR moves it to the owner's queue and says
 so in the point itself ("the owner decides"). You cannot settle those, and you should not
 try. When a project has more than 8 of them, every new session there starts with
-a line telling the owner how many wait. Doctor lists all of them, and lists
+a line telling the owner how many wait. The one open point for the whole memory
+is counted once, and not toward any project's 8. Doctor lists all of them, and lists
 every rule saved with `legitimate_calls`, `may_change` or `accept_refusing`, so
 use those three only when you can say why.
 

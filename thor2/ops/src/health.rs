@@ -1364,6 +1364,16 @@ pub fn owner_queue_line(db: &Path) -> Option<String> {
             out.push(format!("  {} - carried by {}", point.id, model::store::carriers_in_words(carriers)));
         }
     }
+    // THOR's one store-wide point (the rules with no project, step 21):
+    // counted once here, against no project's budget.
+    for (point, carriers) in model::store::store_wide_owner_queue(&store) {
+        out.push(format!(
+            "owner queue, the whole memory: {} - one point for every project's rules with no project, waits on the \
+             owner (counted once, in no project's budget) - carried by {}",
+            point.id,
+            model::store::carriers_in_words(&carriers)
+        ));
+    }
     (!out.is_empty()).then(|| out.join("\n"))
 }
 
@@ -5938,6 +5948,86 @@ mod tests {
     /// validator's record are written raw here - what doctor reads, not how
     /// the machine pass makes them (`serve/tests/owner_queue_banner.rs` and
     /// `serve::eval_filing`'s units prove that).
+    /// Step 21: THOR's one store-wide point (the rules with no project) is
+    /// carried by every project's valid evaluations together and counted ONCE
+    /// in the owner queue - never against a project's budget: eight points of
+    /// fxp's own plus that one open no banner.
+    #[test]
+    fn owner_queue_line_counts_the_store_wide_point_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        let point = |id: String, project: Option<&str>, blocker: &store::Blocker| Item {
+            id,
+            kind: Kind::Report,
+            text: "THOR's own open point".to_string(),
+            bindings: vec![],
+            severity: None,
+            project: project.map(str::to_string),
+            tags: store::machine_point_tags(blocker),
+            expires: None,
+            key: None,
+            falsifier: None,
+            check: None,
+        };
+        let entry = |subject: &str, session: &str| store::CarryEntry {
+            subject: subject.to_string(),
+            carried: 0,
+            session: session.to_string(),
+            agent: None,
+        };
+        let mut fxp_carry = Vec::new();
+        for i in 0..store::OPEN_POINTS_OWNER_BUDGET {
+            let subject = format!("notes-{i}.md");
+            let blocker = store::Blocker::WorkingTreeDiffers { path: subject.clone() };
+            let body = store::canonical_body(&point(store::machine_point_id("fxp", &blocker), Some("fxp"), &blocker)).unwrap();
+            store.append_event("s", "s", "eval-machine", EventKind::FactCreated, &store::machine_point_id("fxp", &blocker), None, &body).unwrap();
+            fxp_carry.push(entry(&subject, DOCTOR_EVALUATOR));
+        }
+        let global = store::Blocker::global_rules();
+        let id = store::machine_point_id("fxp", &global);
+        assert_eq!(id, store::GLOBAL_RULES_POINT_ID, "one id whatever project is evaluated");
+        let body = store::canonical_body(&point(id.clone(), None, &global)).unwrap();
+        store.append_event("s", "s", "eval-machine", EventKind::FactCreated, &id, None, &body).unwrap();
+        fxp_carry.push(entry(store::GLOBAL_RULES_SUBJECT, DOCTOR_EVALUATOR));
+        let other = "7a1e0c3a-0000-4000-8000-0000000000b2";
+        for (report, project, session, carry, at) in [
+            ("eval-fxp-2026-09-29", "fxp", DOCTOR_EVALUATOR, fxp_carry, "2026-09-29T10:00:00Z"),
+            ("eval-beta-2026-09-30", "beta", other, vec![entry(store::GLOBAL_RULES_SUBJECT, other)], "2026-09-30T10:00:00Z"),
+        ] {
+            let validation = store::EvaluationValidation {
+                valid: true,
+                why: String::new(),
+                drift: false,
+                report: report.to_string(),
+                report_seq: 1,
+                project: Some(project.to_string()),
+                session: session.to_string(),
+                agent: None,
+                started_seq: Some(1),
+                filed_seq: Some(2),
+                filed_at: Some(at.to_string()),
+                machine_sha256: None,
+                verdicts: store::VerdictShares::default(),
+                carry,
+            };
+            let body = serde_json::to_string(&validation).unwrap();
+            store.append_event("s", "s", "eval-validator", EventKind::GateStoodAside, report, None, &body).unwrap();
+        }
+        drop(store);
+        let line = owner_queue_line(&db).expect("points wait on the owner");
+        assert!(!line.contains("[THOR] 9 open points"), "the store-wide point is in no project's budget: {line}");
+        assert!(line.starts_with("owner queue: 8 of THOR's open points in 'fxp' wait on the owner (budget 8)"), "{line}");
+        assert!(
+            line.contains(&format!(
+                "owner queue, the whole memory: {} - one point for every project's rules with no project",
+                store::GLOBAL_RULES_POINT_ID
+            )) && line.contains(&format!("carried by session {DOCTOR_EVALUATOR} on 2026-09-29, {other} on 2026-09-30")),
+            "counted once, carried by both projects' evaluations: {line}"
+        );
+        assert_eq!(line.matches(store::GLOBAL_RULES_POINT_ID).count(), 1, "{line}");
+    }
+
     #[test]
     fn owner_queue_line_counts_against_the_budget() {
         let queue = |n: usize| {

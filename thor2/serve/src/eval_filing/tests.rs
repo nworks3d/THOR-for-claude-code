@@ -455,3 +455,80 @@ fn another_sessions_stop_leaves_the_filing_to_its_own() {
     let written = validate_new_reports(&mut fx.store, Some(&root), S2);
     assert_eq!(written.iter().map(|r| r.report.as_str()).collect::<Vec<_>>(), vec!["eval-beta-old"]);
 }
+
+// ------------------------------------------------------------- step 21
+
+/// An old rule with NO project whose check reads a file, written raw: no
+/// working copy anywhere can try it, so THOR's machine pass holds it
+/// (`Blocker::global_rules`).
+fn global_file_rule(fx: &mut Fx, id: &str) {
+    let item = Item {
+        project: None,
+        ..rule(
+            id,
+            "Every repo keeps `eol=lf` in .gitattributes.",
+            vec![Binding::Target { kind: TargetKind::Command, value: "git add".to_string() }],
+            Some(Check::Contains { path: ".gitattributes".to_string(), literal: "eol=lf".to_string() }),
+            "unused",
+        )
+    };
+    let body = model::store::canonical_body(&item).unwrap();
+    fx.store.append_event("legacy", id, "migration", EventKind::FactCreated, id, None, &body).unwrap();
+}
+
+/// Decision 5 of step 21: rules with no project held for lack of a working
+/// copy get ONE store-wide point - not one per evaluated project - that no
+/// project's owner budget counts, and whose carry is counted once across
+/// every project's valid evaluations. Every project's evaluation still holds
+/// those rules as blocked, never on its batch.
+#[test]
+fn global_rules_hold_one_store_wide_point_counted_once() {
+    let mut fx = Fx::new();
+    let root = fx.root();
+    global_file_rule(&mut fx, "glob-file");
+    let point_id = "open-no-working-copy--global-rules";
+
+    let first = fx.start(S1, "fxp");
+    let machine = first.frozen.machine.clone().unwrap();
+    assert_eq!((machine.blocked, first.frozen.batch().len()), (1, 0), "blocked, never the agent's batch: {machine:?}");
+    assert_eq!(machine.points.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), vec![point_id], "{machine:?}");
+    valid_filing(&mut fx.store, &root, S1, &report("eval-fxp-1", "fxp", "TLDR one."), "toolu_f1");
+
+    let second = fx.start(S2, "beta");
+    let machine = second.frozen.machine.clone().unwrap();
+    assert_eq!((machine.blocked, second.frozen.batch().len()), (1, 0), "{machine:?}");
+    assert_eq!(machine.points.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), vec![point_id], "the same one point: {machine:?}");
+    valid_filing(&mut fx.store, &root, S2, &report("eval-beta-1", "beta", "TLDR two."), "toolu_f2");
+
+    let store_wide: Vec<_> = model::store::open_points(&fx.store, None).into_iter().filter(|p| p.machine).collect();
+    assert_eq!(store_wide.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), vec![point_id], "one point in the whole store");
+    for project in ["fxp", "beta"] {
+        assert!(model::store::open_points(&fx.store, Some(project)).is_empty(), "no point of {project}'s own");
+        assert!(model::store::owner_queue(&fx.store, project).is_empty(), "{project}'s budget of 8 does not count it");
+    }
+    let carriers = model::store::carriers_of(&fx.store, "fxp", model::store::GLOBAL_RULES_SUBJECT, i64::MAX);
+    assert_eq!(carriers.iter().map(|c| c.session.as_str()).collect::<Vec<_>>(), vec![S1, S2], "carried by both projects' evaluations");
+    assert_eq!(model::store::GLOBAL_RULES_POINT_ID, point_id, "the id stays stable");
+    let queue = model::store::store_wide_owner_queue(&fx.store);
+    assert_eq!(queue.iter().map(|(p, c)| (p.id.as_str(), c.len())).collect::<Vec<_>>(), vec![(point_id, 2)], "counted once in the owner queue");
+
+    let third = fx.start(S3, "fxp");
+    assert!(third.frozen.batch().is_empty());
+    let point = model::store::open_points(&fx.store, None).into_iter().find(|p| p.id == point_id).unwrap();
+    assert!(point.text.starts_with("IN THE OWNER QUEUE") && point.text.contains(S2), "{}", point.text);
+}
+
+/// The owner-queue opening of THOR's point reads as one sentence: no run of
+/// spaces left by a lost line break.
+#[test]
+fn the_owner_queue_point_text_has_no_lost_line_break() {
+    let mut fx = Fx::new();
+    let root = fx.root();
+    unregistered_file_rule(&mut fx, "fx-file", "fxp");
+    fx.start(S1, "fxp");
+    valid_filing(&mut fx.store, &root, S1, &report("eval-fxp-1", "fxp", "TLDR one."), "toolu_f1");
+    fx.start(S2, "fxp");
+    let point = model::store::open_points(&fx.store, Some("fxp")).pop().unwrap();
+    assert!(point.text.contains("valid evaluation(s) were filed while this still held, and no agent can lift it."), "{}", point.text);
+    assert!(!point.text.contains("  "), "{}", point.text);
+}

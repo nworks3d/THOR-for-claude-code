@@ -1435,20 +1435,13 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
                 // rides with the guard's block instead, the way a resumed
                 // machine pass's note does (step 14): the guard is never
                 // skipped, and neither is the ask.
-                let mut parts: Vec<String> = drift_note.map(str::to_string).into_iter().collect();
-                let mut ask: Option<String> = None;
-                if !is_subagent {
-                    match stop_eval_decision(db_path, &session_id, stop_root.as_deref(), stop_project.as_deref(), drift_note.is_none(), no_record) {
-                        EvalStop::Ask(text) => ask = Some(text),
-                        EvalStop::Elsewhere(line) => parts.push(line),
-                        EvalStop::Quiet => {}
-                    }
-                }
-                parts.push(reason);
-                parts.extend(ask);
+                let text = match is_subagent {
+                    true => reason,
+                    false => with_eval_ask(db_path, &session_id, stop_root.as_deref(), stop_project.as_deref(), drift_note, no_record, reason),
+                };
                 return Some(HookOutput::Decision(serde_json::json!({
                     "decision": "block",
-                    "reason": with_resumed(parts.join("\n\n")),
+                    "reason": with_resumed(text),
                 })));
             }
             verdict.warn_reason
@@ -1483,15 +1476,24 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
         // this arm once had - the shape that also swallowed the Response
         // Guard's own subagent behaviour (see the rule about a loop guard
         // blinding a whole hook, and `is_subagent`'s own doc comment above).
+        // THE EVALUATION ASK RIDES WITH THESE BLOCKS TOO (step 21), as it
+        // rides with the Response Guard's: setup, the capture check and the
+        // crowding question below each hold the turn once, and an ask that
+        // waited for a Stop none of them held could wait for good. The block
+        // is never skipped; the ask, when this session owes it, follows its
+        // reason in the same block, and the Stop was counted once above.
+        let hold = |reason: String| {
+            let text =
+                with_eval_ask(db_path, &session_id, stop_root.as_deref(), stop_project.as_deref(), drift_note, no_record, reason);
+            Some(HookOutput::Decision(serde_json::json!({ "decision": "block", "reason": text })))
+        };
         if !is_subagent {
             if let Some(reason) = serve::store_dir::open_existing(db_path).ok().and_then(|s| setup_debt(&s)) {
-                return Some(HookOutput::Decision(
-                    serde_json::json!({ "decision": "block", "reason": reason }),
-                ));
+                return hold(reason);
             }
 
-            if let Some(output) = capture_stop_check(db_path, &session_id) {
-                return Some(output);
+            if let Some(reason) = capture_stop_check(db_path, &session_id) {
+                return hold(reason);
             }
         }
 
@@ -1527,9 +1529,7 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
                 .ok()
                 .and_then(|s| crowding_debt(&s, db_path, &session_id, stop_project.as_deref()))
             {
-                return Some(HookOutput::Decision(
-                    serde_json::json!({ "decision": "block", "reason": reason }),
-                ));
+                return hold(reason);
             }
         }
 
@@ -1705,7 +1705,11 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
         // session or a verdict that is owed. Still gated on `!is_subagent`,
         // unchanged by today's fix: not one of the four debts it names, left
         // exactly as it already stood.
-        if !is_subagent {
+        // THE SESSION'S OWN GATES (step 21, C3 B2 L86): like the evaluation
+        // ask (F14, Q10), never a session's first Stop in the project, and
+        // only with ten minutes of its own work there - a short task session
+        // never answers for a backlog it did not touch.
+        if !is_subagent && teeth_upkeep_may_hold(db_path, &session_id, stop_project.as_deref()) {
             if let Some(reason) = serve::store_dir::open_existing(db_path)
                 .ok()
                 .filter(|_| teeth_not_yet_asked_this_session(db_path, &session_id))
@@ -2307,7 +2311,9 @@ fn capture_flag(store: &thor_core::event_store::EventStore, db_path: &Path, sess
 /// discard it anyway (a paid debt always wins over any verdict), so checking
 /// `paid` first saves a real judge round trip on every turn where the model
 /// already did the right thing.
-fn capture_stop_check(db_path: &Path, session_id: &str) -> Option<HookOutput> {
+/// Returns the block's reason; the caller holds the Stop with it (and the
+/// evaluation ask rides along, step 21).
+fn capture_stop_check(db_path: &Path, session_id: &str) -> Option<String> {
     // `Off` is checked before anything else here is even read - the cheapest
     // possible "never blocks anything" (OPTION4-IMPLEMENTATION.md): no marker
     // file, no store, nothing.
@@ -2358,10 +2364,7 @@ fn capture_stop_check(db_path: &Path, session_id: &str) -> Option<HookOutput> {
         // Nothing else had anything to say, so this is where the one debt
         // that never gets paid voluntarily is collected.
         capture::StopVerdict::Allow => None,
-        capture::StopVerdict::Block(reason) => Some(HookOutput::Decision(serde_json::json!({
-            "decision": "block",
-            "reason": reason,
-        }))),
+        capture::StopVerdict::Block(reason) => Some(reason),
     }
 }
 
@@ -3292,6 +3295,53 @@ fn evaluation_debt(
     let by_floor = usefulness::project_due(store, &state, project, work, time::now_unix(), usefulness::EVAL_CADENCE)?;
     let clock = usefulness::EvalClock { work: work.clone(), own_minutes: work.accrued_secs / 60, by_floor };
     Some(evaluation_ask(store, db_path, project, &clock, Some(project)))
+}
+
+/// The text of a main session's Stop held by `reason`, with the evaluation
+/// ask riding along (steps 20 and 21): the drift line and the "running
+/// elsewhere" line first, then `reason`, then the ask with the start note of
+/// the evaluation it starts - when this session owes it now. Every block that
+/// holds a first-pass Stop before the ask's own turn (the Response Guard,
+/// setup, the capture check, the crowding question) goes through here, so
+/// none of them starves the ask, and each Stop asks at most once.
+fn with_eval_ask(
+    db_path: &Path,
+    session_id: &str,
+    stop_root: Option<&Path>,
+    stop_project: Option<&str>,
+    drift_note: Option<&str>,
+    no_record: bool,
+    reason: String,
+) -> String {
+    let mut parts: Vec<String> = drift_note.map(str::to_string).into_iter().collect();
+    let mut ask: Option<String> = None;
+    match stop_eval_decision(db_path, session_id, stop_root, stop_project, drift_note.is_none(), no_record) {
+        EvalStop::Ask(text) => ask = Some(text),
+        EvalStop::Elsewhere(line) => parts.push(line),
+        EvalStop::Quiet => {}
+    }
+    parts.push(reason);
+    parts.extend(ask);
+    parts.join("\n\n")
+}
+
+/// Whether the teeth question may hold this main session's Stop (step 21):
+/// the Stop was counted in `stop_project`, and the session passes the
+/// evaluation ask's own gates there (`usefulness::upkeep_may_hold` - ten
+/// minutes of its own work, not its first Stop). A Stop in no project holds
+/// nothing for rule upkeep, as it is never asked for an evaluation. The
+/// transcript is read only when the sidecar alone does not already pass:
+/// it can only add minutes and earlier turns.
+fn teeth_upkeep_may_hold(db_path: &Path, session_id: &str, stop_project: Option<&str>) -> bool {
+    let Some(project) = stop_project else { return false };
+    let state = usefulness::project_eval_state(db_path, Some(project));
+    if usefulness::upkeep_may_hold(&state, project, session_id, &[], true).is_ok() {
+        return true;
+    }
+    let timeline = serve::attest::transcripts_root()
+        .map(|root| serve::attest::session_timeline(&root, session_id))
+        .unwrap_or_default();
+    usefulness::upkeep_may_hold(&state, project, session_id, &timeline, true).is_ok()
 }
 
 /// What the Stop decided about the evaluation (step 17, `eval_stop_ask`).

@@ -362,13 +362,17 @@ fn a_global_file_check_is_a_machine_blocker_never_the_agents_batch() {
     assert_eq!(outcome_of(&start, "glob-abs"), MachineOutcome::Blocked);
     assert_eq!(outcome_of(&start, "glob-rel"), MachineOutcome::Blocked);
     assert!(start.frozen.batch().is_empty() && start.frozen.a4_list().is_empty(), "{:?} {:?}", start.frozen.batch(), start.frozen.a4_list());
-    let points = model::store::open_points(&fx.store, Some("beta"));
-    let point = points.iter().find(|p| p.id == "open-no-working-copy-global-rules-in-beta").unwrap_or_else(|| panic!("{points:?}"));
+    // Step 21: one point for the whole store, in no project.
+    assert!(model::store::open_points(&fx.store, Some("beta")).is_empty(), "not beta's own point");
+    let points = model::store::open_points(&fx.store, None);
+    let point = points.iter().find(|p| p.id == model::store::GLOBAL_RULES_POINT_ID).unwrap_or_else(|| panic!("{points:?}"));
     assert_eq!((point.subject.as_deref(), point.blocker.as_deref()), (Some(model::store::GLOBAL_RULES_SUBJECT), Some("no-working-copy")));
     assert!(point.text.contains("'glob-abs'") && point.text.contains("'glob-rel'"), "{}", point.text);
     assert!(point.text.contains("Nothing needs doing") && point.text.contains("clearing a check that is true is never the way"), "{}", point.text);
     assert!(point.text.contains("give it that project (mcp__thor__revise"), "{}", point.text);
-    assert_eq!(machine.points.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), vec!["open-no-working-copy-global-rules-in-beta"]);
+    assert!(point.text.contains("one for the whole memory"), "{}", point.text);
+    assert_eq!(machine.points.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), vec![model::store::GLOBAL_RULES_POINT_ID]);
+    assert!(start_note(&start).contains("one point for the whole memory: holds 2 rule(s) with no project"), "{}", start_note(&start));
     for id in ["glob-abs", "glob-rel"] {
         assert!(matches!(model::store::settlement(&fx.store, id, Some(&start)), Settlement::Settled(Settled::Blocked(_))), "{id}");
         assert!(matches!(model::store::settlement(&fx.store, id, None), Settlement::Settled(Settled::Blocked(_))), "{id}: not rot at read time either");
@@ -387,9 +391,45 @@ fn a_global_file_check_is_a_machine_blocker_never_the_agents_batch() {
     let next = fx.start(S2, "beta");
     let closed = &next.frozen.machine.as_ref().unwrap().points_closed;
     assert!(
-        closed.iter().any(|(id, why)| id == "open-no-working-copy-global-rules-in-beta" && why.contains("no rule with no project carries a file check")),
+        closed.iter().any(|(id, why)| id == model::store::GLOBAL_RULES_POINT_ID && why.contains("no rule with no project carries a file check")),
         "{closed:?}"
     );
+}
+
+/// Step 21: a per-project point for the rules with no project - the shape
+/// the build before step 21 wrote, `open-no-working-copy-global-rules-in-<p>`
+/// - is closed by the next start of that project, replaced by the one
+/// store-wide point, so the rules are never held twice.
+#[test]
+fn a_per_project_point_for_global_rules_is_replaced_by_the_store_wide_one() {
+    let mut fx = Fx::new();
+    let beta = fx.checkout("beta", &[("NOTES.md", "keep me\n")], true);
+    fx.register("beta", &beta);
+    fx.legacy(&rule("glob-rel", "Every repo keeps `eol=lf` in .gitattributes.", vec![cmd("git add")], contains(".gitattributes", "eol=lf"), None));
+    let old_id = "open-no-working-copy-global-rules-in-beta";
+    let blocker = Blocker::global_rules();
+    let old = Item {
+        id: old_id.to_string(),
+        kind: Kind::Report,
+        text: "THOR's own open point: fixture text of the older build".to_string(),
+        bindings: vec![],
+        severity: None,
+        project: Some("beta".to_string()),
+        tags: model::store::machine_point_tags(&blocker),
+        expires: None,
+        key: None,
+        falsifier: None,
+        check: None,
+    };
+    let body = model::store::canonical_body(&old).unwrap();
+    fx.store.append_event(S1, S1, model::store::EVAL_MACHINE_ACTOR, EventKind::FactCreated, old_id, None, &body).unwrap();
+    assert!(model::store::is_machine_point(&fx.store, old_id), "fixture sanity: THOR's own point");
+
+    let start = fx.start(S2, "beta");
+    let machine = start.frozen.machine.clone().unwrap();
+    assert_eq!(machine.points.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), vec![model::store::GLOBAL_RULES_POINT_ID]);
+    assert!(machine.points_closed.iter().any(|(id, why)| id == old_id && why.contains("replaced by THOR's one store-wide point")), "{:?}", machine.points_closed);
+    assert!(model::store::open_points(&fx.store, Some("beta")).is_empty(), "the old point is closed");
 }
 
 /// G14.4, second half, and R14.5: once the folder is registered, the next
