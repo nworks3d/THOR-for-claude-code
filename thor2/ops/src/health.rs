@@ -1051,16 +1051,17 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool
     let mut problem_lines: Vec<String> = Vec::new();
     let mut out = vec![match checkout_project {
         Some(project) => format!(
-            "judgement debt: {total} item(s) store-wide are owed a verdict (fired {threshold}+ times since \
+            "judgement debt: {total} item(s) store-wide are owed a verdict (fired in {threshold}+ sessions since \
              the last one, or never judged at all; pinned items excluded - the owner answered that question \
-             by pinning them) - {in_project} of them apply to this checkout ('{project}', or global); `mark` \
-             each once it is next served to settle it"
+             by pinning them) - {in_project} of them apply to this checkout ('{project}', or global); they are \
+             asked about inside the project's next evaluation, never at the end of a turn"
         ),
         None => format!(
-            "judgement debt: {total} item(s) store-wide are owed a verdict (fired {threshold}+ times since \
+            "judgement debt: {total} item(s) store-wide are owed a verdict (fired in {threshold}+ sessions since \
              the last one, or never judged at all; pinned items excluded - the owner answered that question \
              by pinning them) - this checkout resolves to no project, so only the {in_project} global one(s) \
-             among them would ever be asked about here; `mark` each once it is next served to settle it"
+             among them would ever be asked about here; they are asked about inside an evaluation, never at the \
+             end of a turn"
         ),
     }];
     match checkout_project {
@@ -2802,6 +2803,15 @@ pub fn dead_moment_bindings_line(db: &Path) -> String {
     out
 }
 
+/// Doctor's volume lines (step 28): for the last 24 hours and 7 days, how many
+/// facts were shown in full and how many repeats were left out, the five most
+/// shown facts, and how many Stops held a turn per session on average - so the
+/// owner sees whether sessions get nagged. Read from the sidecar the hooks
+/// keep (`serve::volume`); nothing is written.
+pub fn volume_lines(db: &Path) -> Vec<String> {
+    serve::volume::lines(db, serve::time::now_unix())
+}
+
 pub fn report(
     db: &Path,
     index_db: Option<&Path>,
@@ -2851,6 +2861,7 @@ pub fn report(
     // rather than in place of it. `full` also lifts its named-items cap, the
     // same flag `decay_line`/`crowding_line` already take it from.
     lines.extend(judgement_debt_line(db, checkout_project, full));
+    lines.extend(volume_lines(db));
     lines.extend(evaluations_line(db, checkout_project));
     lines.push(cadence_line());
     lines.extend(work_clock_line(db, checkout_project));
@@ -3169,8 +3180,8 @@ mod tests {
             // every repository that happens to hold a file by that name.
             item.project = Some("a-project".to_string());
             store::declare(&mut store, "s", "l", "t", &item).unwrap();
-            for _ in 0..50 {
-                serve::deliver::record_delivery(&mut store, "s", "l", "t", "now", &["gone".to_string()]);
+            for i in 0..50 {
+                serve::deliver::record_delivery(&mut store, &serve::deliver::nth_session("s", i), "l", "t", "now", &["gone".to_string()]);
             }
             store::retract(&mut store, "s", "l", "t", "gone", "wrong from the start", None).unwrap();
         }
@@ -3222,8 +3233,8 @@ mod tests {
             // repository that happens to have a file by that name.
             item.project = Some("thor".to_string());
             store::declare(&mut store, "s", "l", "a", &item).unwrap();
-            for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
-                serve::deliver::record_delivery(&mut store, "s", "l", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &["owed-global".to_string()]);
+            for i in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
+                serve::deliver::record_delivery(&mut store, &serve::deliver::nth_session("s", i), "l", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &["owed-global".to_string()]);
             }
         }
         let line = judgement_debt_line(&db, Some("thor"), false).expect("something is owed, the line must speak");
@@ -3252,12 +3263,12 @@ mod tests {
             item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "npm run deploy".to_string() }];
             item.project = Some("thor".to_string());
             store::declare(&mut store, "s", "l", "a", &item).unwrap();
-            for _ in 0..(serve::usefulness::JUDGEMENT_DEBT_AFTER - 1) {
-                serve::deliver::record_delivery(&mut store, "s", "l", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &["owed-with-trigger".to_string()]);
+            for i in 0..(serve::usefulness::JUDGEMENT_DEBT_AFTER - 1) {
+                serve::deliver::record_delivery(&mut store, &serve::deliver::nth_session("s", i), "l", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &["owed-with-trigger".to_string()]);
             }
             serve::deliver::record_delivery_with_trigger(
                 &mut store,
-                "s",
+                "the-last-session",
                 "l",
                 "hook",
                 "2026-09-17T00:00:00Z",
@@ -3285,8 +3296,8 @@ mod tests {
             item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "npm run build".to_string() }];
             item.project = Some("thor".to_string());
             store::declare(&mut store, "s", "l", "a", &item).unwrap();
-            for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
-                serve::deliver::record_delivery(&mut store, "s", "l", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &["owed-without-trigger".to_string()]);
+            for i in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
+                serve::deliver::record_delivery(&mut store, &serve::deliver::nth_session("s", i), "l", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &["owed-without-trigger".to_string()]);
             }
         }
         let line = judgement_debt_line(&db, Some("thor"), false).expect("something is owed, the line must speak");
@@ -3310,8 +3321,8 @@ mod tests {
             let mut item = rule("owed-global-2");
             item.bindings = vec![Binding::Moment(intent::Action::Commit)];
             store::declare(&mut store, "s", "l", "a", &item).unwrap();
-            for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
-                serve::deliver::record_delivery(&mut store, "s", "l", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &["owed-global-2".to_string()]);
+            for i in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
+                serve::deliver::record_delivery(&mut store, &serve::deliver::nth_session("s", i), "l", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &["owed-global-2".to_string()]);
             }
         }
         let line = judgement_debt_line(&db, None, false).expect("a global item is still owed with no project resolved");
@@ -3353,8 +3364,8 @@ mod tests {
                 item.bindings =
                     vec![Binding::Target { kind: TargetKind::Command, value: format!("fixture-debt-command-{n:02}") }];
                 store::declare(&mut store, "s", "l", "a", &item).unwrap();
-                for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
-                    serve::deliver::record_delivery(&mut store, "s", "l", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &[id.clone()]);
+                for i in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
+                    serve::deliver::record_delivery(&mut store, &serve::deliver::nth_session("s", i), "l", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &[id.clone()]);
                 }
             }
         }
@@ -3395,8 +3406,8 @@ mod tests {
                 item.bindings =
                     vec![Binding::Target { kind: TargetKind::Command, value: format!("fixture-debt-command-{n:02}") }];
                 store::declare(&mut store, "s", "l", "a", &item).unwrap();
-                for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
-                    serve::deliver::record_delivery(&mut store, "s", "l", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &[id.clone()]);
+                for i in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
+                    serve::deliver::record_delivery(&mut store, &serve::deliver::nth_session("s", i), "l", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &[id.clone()]);
                 }
             }
         }
@@ -3420,8 +3431,8 @@ mod tests {
             item.bindings =
                 vec![Binding::Target { kind: TargetKind::Command, value: format!("fixture-eval-command-{project}-{i:02}") }];
             store::declare(store, "s", "l", "a", &item).unwrap();
-            for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
-                serve::deliver::record_delivery(store, "s", "l", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &[id.clone()]);
+            for i in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
+                serve::deliver::record_delivery(store, &serve::deliver::nth_session("s", i), "l", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &[id.clone()]);
             }
         }
     }
@@ -3559,8 +3570,8 @@ mod tests {
             let mut item = rule("owed-global-no-project-tail");
             item.bindings = vec![Binding::Moment(intent::Action::Commit)];
             store::declare(&mut store, "s", "l", "a", &item).unwrap();
-            for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
-                serve::deliver::record_delivery(&mut store, "s", "l", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &["owed-global-no-project-tail".to_string()]);
+            for i in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
+                serve::deliver::record_delivery(&mut store, &serve::deliver::nth_session("s", i), "l", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &["owed-global-no-project-tail".to_string()]);
             }
         }
         let yesterday = serve::time::now_unix() - 25 * 3600;
@@ -3921,8 +3932,8 @@ mod tests {
                 vec![Binding::Target { kind: TargetKind::Command, value: "fixture-excl-command".to_string() }];
             store::declare(&mut store, "s", "l", "a", &trigger).unwrap();
             for id in ["pinned-excluded", "trigger-included"] {
-                for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
-                    serve::deliver::record_delivery(&mut store, "s", "l", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &[id.to_string()]);
+                for i in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
+                    serve::deliver::record_delivery(&mut store, &serve::deliver::nth_session("s", i), "l", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &[id.to_string()]);
                 }
             }
         }
@@ -3957,8 +3968,8 @@ mod tests {
                 vec![Binding::Target { kind: TargetKind::Command, value: "fixture-agree-command".to_string() }];
             store::declare(&mut store, "s", "l", "a", &trigger).unwrap();
             for id in ["pinned-heavy", "trigger-heavy"] {
-                for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
-                    serve::deliver::record_delivery(&mut store, "s", "l", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &[id.to_string()]);
+                for i in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
+                    serve::deliver::record_delivery(&mut store, &serve::deliver::nth_session("s", i), "l", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &[id.to_string()]);
                 }
             }
         }
@@ -3994,9 +4005,9 @@ mod tests {
             owed.text = "fixture rule that is owed by a real assistant firing".to_string();
             owed.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "fixture-assistant-command".to_string() }];
             store::declare(&mut store, "s", "l", "a", &owed).unwrap();
-            for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
+            for i in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
                 serve::deliver::record_delivery(
-                    &mut store, "s", "l", serve::usefulness::ASSISTANT_DELIVERY_ACTOR,
+                    &mut store, &serve::deliver::nth_session("s", i), "l", serve::usefulness::ASSISTANT_DELIVERY_ACTOR,
                     "2026-09-19T00:00:00Z", &["owed-by-assistant".to_string()],
                 );
             }
@@ -4005,8 +4016,8 @@ mod tests {
             probed.text = "fixture rule that is only ever served by another actor".to_string();
             probed.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "fixture-probe-command".to_string() }];
             store::declare(&mut store, "s", "l", "a", &probed).unwrap();
-            for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
-                serve::deliver::record_delivery(&mut store, "s", "l", "probe", "2026-09-19T00:00:00Z", &["probed-only".to_string()]);
+            for i in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
+                serve::deliver::record_delivery(&mut store, &serve::deliver::nth_session("s", i), "l", "probe", "2026-09-19T00:00:00Z", &["probed-only".to_string()]);
             }
         }
         let line = judgement_debt_line(&db, None, false).expect("something is owed, the line must speak");
@@ -4037,8 +4048,8 @@ mod tests {
             probed.text = "fixture rule that is only ever served by another actor".to_string();
             probed.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "fixture-probe-command".to_string() }];
             store::declare(&mut store, "s", "l", "a", &probed).unwrap();
-            for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
-                serve::deliver::record_delivery(&mut store, "s", "l", "probe", "2026-09-19T00:00:00Z", &["probed-only".to_string()]);
+            for i in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
+                serve::deliver::record_delivery(&mut store, &serve::deliver::nth_session("s", i), "l", "probe", "2026-09-19T00:00:00Z", &["probed-only".to_string()]);
             }
         }
         let line = judgement_debt_line(&db, None, false)
@@ -5061,9 +5072,9 @@ mod tests {
             let mut irreversible_busy = rule("irreversible-and-often-served");
             irreversible_busy.severity = Some(model::item::Severity::Irreversible);
             legacy_declare(&mut s, &irreversible_busy);
-            for _ in 0..3 {
+            for i in 0..3 {
                 serve::deliver::record_delivery(
-                    &mut s, "s", "l", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z",
+                    &mut s, &serve::deliver::nth_session("s", i), "l", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z",
                     &["irreversible-and-often-served".to_string()],
                 );
             }
@@ -5171,8 +5182,8 @@ mod tests {
             anchored.project = Some("fixture-project".to_string());
             store::declare(&mut s, "s", "l", "a", &anchored).unwrap();
 
-            for _ in 0..3 {
-                serve::deliver::record_delivery(&mut s, "s", "s", "t", "2026-08-08T00:00:00Z", &["pinned-one".to_string()]);
+            for i in 0..3 {
+                serve::deliver::record_delivery(&mut s, &serve::deliver::nth_session("s", i), "s", "t", "2026-08-08T00:00:00Z", &["pinned-one".to_string()]);
             }
             serve::deliver::record_delivery(&mut s, "s", "s", "t", "2026-08-08T00:00:00Z", &["anchored-one".to_string()]);
         }
@@ -5294,12 +5305,13 @@ mod tests {
         let db = dir.path().join("t.db");
         EventStore::new(&db).unwrap();
         let lines = report(&db, None, None, None, None, None, false, None);
-        // 15: `wal_line` stays silent on a fresh store (see its own doc
+        // 17: `wal_line` stays silent on a fresh store (see its own doc
         // comment - it never contributes a line unless the WAL has actually
         // outgrown both the 64 MB floor and the store itself), but
         // `dead_moment_bindings_line` always says something, "none" included,
-        // and so does `working_copy_lines`, and (step 17) the cadence line.
-        assert_eq!(lines.len(), 16);
+        // and so does `working_copy_lines`, the volume line (step 28, "nothing
+        // recorded yet") and (step 17) the cadence line.
+        assert_eq!(lines.len(), 17);
         assert!(lines[0].starts_with("memory store:"));
         assert!(lines[1].starts_with("dead moments:"));
         assert!(lines[2].starts_with("code index:"));
@@ -5320,7 +5332,28 @@ mod tests {
         assert!(lines[12].starts_with("semantic search:"));
         assert!(lines[13].starts_with("project keys:"));
         assert!(lines[14].starts_with("working copies:"));
-        assert!(lines[15].starts_with("evaluation cadence:"));
+        assert!(lines[15].starts_with("volume: nothing recorded yet"));
+        assert!(lines[16].starts_with("evaluation cadence:"));
+    }
+
+    /// STEP 28: doctor shows the volume - what was shown in full, what was left
+    /// out, the most shown facts and the Stop holds per session - for the last
+    /// 24 hours and 7 days, from the record the hooks keep.
+    #[test]
+    fn doctor_shows_the_volume_of_the_last_day_and_week() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        EventStore::new(&db).unwrap();
+        serve::volume::record_showing(&db, "s1", &["fact-a", "fact-b"], 3);
+        serve::volume::record_stop(&db, "s1", true);
+        serve::volume::record_stop(&db, "s1", false);
+        let lines = volume_lines(&db);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].starts_with("volume, last 24 hours: 2 fact(s) shown in full"), "{}", lines[0]);
+        assert!(lines[0].contains("3 repeat(s) left out") && lines[0].contains("most shown: fact-a (1x), fact-b (1x)"), "{}", lines[0]);
+        assert!(lines[0].contains("1 Stop hold(s) in 1 session(s), 1.0 per session on average"), "{}", lines[0]);
+        assert!(lines[1].starts_with("volume, last 7 days: 2 fact(s) shown in full"), "{}", lines[1]);
+        assert!(report(&db, None, None, None, None, None, false, None).iter().any(|l| l.starts_with("volume, last 24 hours")));
     }
 
     /// Every registration is listed, with its date and where it moved from;
@@ -5961,8 +5994,8 @@ mod tests {
             item.project = Some(p.to_string());
             item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: format!("fixture-judged-{id}") }];
             store::declare(store, "s", "l", "a", &item).unwrap();
-            for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
-                serve::deliver::record_delivery(store, session, session, serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &[id.clone()]);
+            for i in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
+                serve::deliver::record_delivery(store, &serve::deliver::nth_session(session, i), session, serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &[id.clone()]);
             }
         }
         let start = serve::attest::fixture::quiet_start(store, session, p);

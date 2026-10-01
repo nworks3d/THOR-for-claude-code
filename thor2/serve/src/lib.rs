@@ -130,6 +130,7 @@ pub mod time;
 pub mod usefulness;
 #[cfg(feature = "semantic")]
 pub mod vectors;
+pub mod volume;
 
 use thor_core::event_store::EventStore;
 

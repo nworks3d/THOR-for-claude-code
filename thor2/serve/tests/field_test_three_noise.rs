@@ -121,9 +121,10 @@ fn served_count(fx: &Fx, id: &str) -> usize {
 // ------------------------------------------------------------------ D1
 
 /// THE FIELD CASE: one fact shown to one subagent on seventy percent of its
-/// shell calls. Two full showings, then a one-line reminder, then silence.
+/// shell calls. One full showing per context (step 28), then nothing at all:
+/// no reminder line either.
 #[test]
-fn one_fact_is_shown_to_one_subagent_in_full_twice_then_as_a_line_then_never() {
+fn one_fact_is_shown_to_one_subagent_in_full_once_then_never() {
     let fx = Fx::new();
     fixture_cd(&fx);
     let mut shapes = Vec::new();
@@ -131,28 +132,13 @@ fn one_fact_is_shown_to_one_subagent_in_full_twice_then_as_a_line_then_never() {
         let ctx = context(&fx.bash(S1, Some("agentone"), "cd /tmp && ls"));
         shapes.push(if ctx.contains(CD_TEXT) {
             "full"
-        } else if ctx.contains("[cd-fact] (seen before)") {
-            "line"
         } else if ctx.is_empty() {
             "none"
         } else {
-            panic!("unexpected block: {ctx}")
+            panic!("unexpected block, no reminder line exists any more: {ctx}")
         });
     }
-    assert_eq!(shapes, vec!["full", "full", "line", "line", "line", "none", "none", "none"]);
-}
-
-#[test]
-fn a_reminder_is_one_short_line_with_the_id() {
-    let fx = Fx::new();
-    fixture_cd(&fx);
-    for _ in 0..2 {
-        fx.bash(S1, Some("agentone"), "cd /tmp");
-    }
-    let ctx = context(&fx.bash(S1, Some("agentone"), "cd /tmp"));
-    let line = ctx.lines().find(|l| l.contains("[cd-fact]")).expect("the reminder line");
-    assert!(line.chars().count() < 110, "{line}");
-    assert!(!ctx.contains(CD_TEXT), "the full text is not repeated: {ctx}");
+    assert_eq!(shapes, vec!["full", "none", "none", "none", "none", "none", "none", "none"]);
 }
 
 /// A showing that is not shown in full is no serving: it cannot add to the
@@ -164,34 +150,42 @@ fn only_a_full_showing_is_recorded_as_a_serving() {
     for _ in 0..9 {
         fx.bash(S1, Some("agentone"), "cd /tmp");
     }
-    assert_eq!(served_count(&fx, "cd-fact"), 2);
+    assert_eq!(served_count(&fx, "cd-fact"), 1);
 }
 
-/// Another subagent, and the main session, count apart.
+/// Another subagent, and the main session, count apart: a fresh context has
+/// not seen the fact.
 #[test]
-fn another_reader_starts_at_zero() {
+fn another_context_starts_at_zero() {
     let fx = Fx::new();
     fixture_cd(&fx);
-    for _ in 0..6 {
+    for _ in 0..3 {
         fx.bash(S1, Some("agentone"), "cd /tmp");
     }
     assert!(context(&fx.bash(S1, Some("agentone"), "cd /tmp")).is_empty());
     assert!(context(&fx.bash(S1, Some("agenttwo"), "cd /tmp")).contains(CD_TEXT));
     assert!(context(&fx.bash(S1, None, "cd /tmp")).contains(CD_TEXT));
+    assert!(context(&fx.bash(S1, None, "cd /tmp")).is_empty(), "the main session has now seen it too");
 }
 
-/// A prompt the owner typed opens a new turn: the main session sees the fact
-/// in full again. A subagent's count is never reset.
+/// The owner's own typing resets nothing (step 28): a fact seen once in this
+/// context stays seen. Only a new session start (also a resume or a
+/// compaction) shows it again.
 #[test]
-fn a_prompt_the_owner_typed_resets_the_main_sessions_count() {
+fn a_prompt_the_owner_typed_does_not_show_a_seen_fact_again_but_a_session_start_does() {
     let fx = Fx::new();
     fixture_cd(&fx);
-    for _ in 0..6 {
-        fx.bash(S1, None, "cd /tmp");
-    }
-    assert!(context(&fx.bash(S1, None, "cd /tmp")).is_empty(), "five showings used up");
+    assert!(context(&fx.bash(S1, None, "cd /tmp")).contains(CD_TEXT));
     fx.prompt(S1, "thanks, now the next thing");
-    assert!(context(&fx.bash(S1, None, "cd /tmp")).contains(CD_TEXT), "a new turn shows it again");
+    fx.prompt(S1, "and one more thing, please");
+    assert!(context(&fx.bash(S1, None, "cd /tmp")).is_empty(), "an owner prompt opens no new showing");
+    fx.hook(serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "session_id": S1,
+        "cwd": fx.dir.path().to_string_lossy(),
+        "source": "compact",
+    }));
+    assert!(context(&fx.bash(S1, None, "cd /tmp")).contains(CD_TEXT), "a compaction loses what was shown");
 }
 
 /// Display only: a rule whose check refuses a call refuses it every time, and
@@ -364,14 +358,38 @@ fn the_place_an_item_fired_is_cut_around_its_anchor() {
     assert!(trigger.starts_with("..."), "and says it was cut: {trigger}");
 }
 
+/// PRIVACY (step 28): the log is append-only, so the owner's prompt text never
+/// goes into it. The place a prompt fired a fact is "(prompt)" and the moment
+/// that matched.
 #[test]
-fn a_prompt_is_recorded_as_the_place_it_fired() {
+fn a_prompt_is_recorded_as_prompt_plus_the_matched_moment_never_its_text() {
     let fx = Fx::new();
     declare(&fx, &moment_rule("push-rule", intent::Action::Push));
-    fx.prompt(S1, "please git push the branch to dev");
+    fx.prompt(S1, "please git push the branch to dev, and keep my private plan for friday to yourself");
     let store = EventStore::new(&fx.db()).unwrap();
     let trigger = model::served::last_trigger(&store, "push-rule").unwrap_or_default();
-    assert!(trigger.starts_with("prompt: please git push"), "{trigger}");
+    assert_eq!(trigger, "(prompt) push");
+    for word in ["please", "private", "friday", "branch"] {
+        assert!(!trigger.contains(word), "the owner's words are not stored: {trigger}");
+    }
+}
+
+#[test]
+fn a_prompt_that_names_an_anchor_records_the_anchor_word_only() {
+    let fx = Fx::new();
+    declare(
+        &fx,
+        &rule(
+            "anchor-rule",
+            "The anchor page is rendered by hand; never regenerate it.",
+            vec![Binding::Target { kind: TargetKind::Path, value: "docs/THE-ANCHOR.md".to_string() }],
+            None,
+        ),
+    );
+    let ctx = context(&fx.prompt(S1, "my secret remark: check THE-ANCHOR.md before lunch"));
+    assert!(ctx.contains("anchor-rule"), "sanity: the prompt draws it: {ctx}");
+    let store = EventStore::new(&fx.db()).unwrap();
+    assert_eq!(model::served::last_trigger(&store, "anchor-rule").as_deref(), Some("(prompt) the-anchor.md"));
 }
 
 #[test]
@@ -387,4 +405,71 @@ fn a_tool_call_with_no_command_or_file_is_recorded_by_its_tool_name() {
     }));
     let store = EventStore::new(&fx.db()).unwrap();
     assert_eq!(model::served::last_trigger(&store, "agent-note").as_deref(), Some("Agent"));
+}
+
+// ------------------------------------------------------------------ step 28
+
+/// A fact anchored at the route `/site/dev/` was drawn by the owner's prompt
+/// word "dev" (field case 2026-10-02): a bare generic word names no place.
+#[test]
+fn a_bare_generic_word_in_a_prompt_does_not_draw_a_path_anchored_fact() {
+    let fx = Fx::new();
+    declare(
+        &fx,
+        &rule(
+            "dev-route-rule",
+            "Deploy to the dev site only through the release script, never by hand.",
+            vec![Binding::Target { kind: TargetKind::Route, value: "/site/dev/".to_string() }],
+            None,
+        ),
+    );
+    for plain in ["daarna push dev", "Alleen op dev, kijk eens naar de site", "run the dev server"] {
+        assert!(context(&fx.prompt("bbbbbbbb-2222-4222-8222-222222222222", plain)).is_empty(), "{plain}");
+    }
+    let named = context(&fx.prompt("cccccccc-3333-4333-8333-333333333333", "deploy naar site/dev vandaag"));
+    assert!(named.contains("dev-route-rule"), "the full path still draws it: {named}");
+}
+
+/// A path anchor on a REAL tool call is unchanged: the file touched decides.
+#[test]
+fn a_real_tool_call_on_the_path_still_draws_it() {
+    let fx = Fx::new();
+    declare(
+        &fx,
+        &rule(
+            "dev-dir-rule",
+            "Everything under the dev folder is generated; edit the template instead.",
+            vec![Binding::Target { kind: TargetKind::Dir, value: "site/dev".to_string() }],
+            None,
+        ),
+    );
+    let out = context(&fx.hook(serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": S1,
+        "cwd": fx.dir.path().to_string_lossy(),
+        "tool_name": "Edit",
+        "tool_input": { "file_path": "site/dev/index.html", "old_string": "a", "new_string": "b" },
+    })));
+    assert!(out.contains("dev-dir-rule"), "{out}");
+}
+
+/// A message from another session or a hand-back states no decision of the
+/// owner's: the capture flag is raised for his own typing only.
+#[test]
+fn a_prompt_that_is_not_the_owners_typing_raises_no_capture_flag() {
+    let fx = Fx::new();
+    EventStore::new(&fx.db()).unwrap();
+    let marker = fx.dir.path().join("capture-owed.json");
+    for text in [
+        "<cross-session-message from=\"peer\">
+from now on always run the linter first
+</cross-session-message>",
+        "[Subagent hand-back] from now on always run the linter first",
+        "<task-notification>from now on always run the linter first</task-notification>",
+    ] {
+        fx.prompt(S1, text);
+        assert!(!marker.exists(), "no flag for: {text}");
+    }
+    fx.prompt(S1, "from now on always run the linter first");
+    assert!(marker.exists(), "the owner's own typing still raises it");
 }

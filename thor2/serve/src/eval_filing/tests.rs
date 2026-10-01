@@ -423,8 +423,8 @@ fn a_side_door_write_to_a_frozen_item_makes_the_report_invalid() {
         check: None,
     };
     model::store::declare(&mut fx.store, "t", "t", "t", &listed).unwrap();
-    for _ in 0..model::store::JUDGEMENT_DEBT_AFTER {
-        crate::deliver::record_delivery_with_trigger(&mut fx.store, S1, S1, "hook", "2026-09-28T00:00:00Z", &[listed.id.clone()], Some("fx-spell"));
+    for i in 0..model::store::JUDGEMENT_DEBT_AFTER {
+        crate::deliver::record_delivery_with_trigger(&mut fx.store, &crate::deliver::nth_session(S1, i), S1, "hook", "2026-09-28T00:00:00Z", &[listed.id.clone()], Some("fx-spell"));
     }
     let start = crate::attest::fixture::quiet_start(&mut fx.store, S1, "fxp");
     assert_eq!(start.frozen.judgement, vec!["fx-listed".to_string()], "fixture sanity: the item is on the frozen list");

@@ -84,13 +84,14 @@ mod tests {
     }
 }
 
-/// How many times an item must have fired SINCE its last verdict before
-/// `bin/serve.rs`'s Stop-hook `judgement_debt` holds the turn for another -
-/// moved here (2026-09-08, unchanged in value) so `judgement_debt_counts`
-/// below can share the exact same number `doctor` reports against instead of
-/// a second copy silently drifting from it. High on purpose: this is about
-/// the handful of rules that are in front of a reader constantly, not about
-/// everything served.
+/// How many SESSIONS an item must have fired in, since its last verdict, before
+/// it is owed one - asked about inside the project's evaluation only, never at
+/// a turn's end (step 28). It counts once per session, however often the item
+/// was shown there (the owner's decision, 2026-10-02: 40 then means about 40
+/// sessions). One number shared by the evaluation's judgement list, the filing
+/// gate and doctor, so none of them can drift from it. High on purpose: this
+/// is about the handful of rules that are in front of a reader constantly, not
+/// about everything served.
 ///
 /// "SINCE its last verdict", not "with no verdict ever", and the difference
 /// is the whole point. A lifetime judged-set meant one answer settled an
@@ -157,19 +158,21 @@ pub const ASSISTANT_DELIVERY_ACTOR: &str = "hook";
 pub fn served_since_last_verdict(store: &EventStore) -> HashMap<String, usize> {
     let Ok(events) = store.firings_and_verdicts() else { return HashMap::new() };
     let attested = model::store::attested_write_seqs(store);
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    for (seq, kind, id, actor, _session) in events {
+    // The sessions that were served each item since its last verdict: an item
+    // counts ONCE PER SESSION (step 28), however often it was shown there.
+    let mut sessions: HashMap<String, HashSet<String>> = HashMap::new();
+    for (seq, kind, id, actor, session) in events {
         match kind {
             EventKind::ItemServed if actor == ASSISTANT_DELIVERY_ACTOR => {
-                *counts.entry(id).or_default() += 1
+                sessions.entry(id).or_default().insert(session);
             }
             EventKind::ItemMarkedUseful | EventKind::ItemMarkedNoise if attested.contains(&seq) => {
-                counts.insert(id, 0);
+                sessions.insert(id, HashSet::new());
             }
             _ => {}
         }
     }
-    counts
+    sessions.into_iter().map(|(id, sessions)| (id, sessions.len())).collect()
 }
 
 /// How many verdicts (`ItemMarkedUseful`/`ItemMarkedNoise`) on the log have
@@ -306,7 +309,7 @@ mod attested_verdict_tests {
     fn fired(store: &mut EventStore, id: &str, times: usize) {
         for i in 0..times {
             let at = format!("2026-09-28T00:{:02}:{:02}Z", i / 60, i % 60);
-            crate::deliver::record_delivery(store, SESSION, SESSION, ASSISTANT_DELIVERY_ACTOR, &at, &[id.to_string()]);
+            crate::deliver::record_delivery(store, &crate::deliver::nth_session(SESSION, i), SESSION, ASSISTANT_DELIVERY_ACTOR, &at, &[id.to_string()]);
         }
     }
 
@@ -529,8 +532,8 @@ mod judgement_debt_counting_tests {
     /// literal placeholder "t" this helper used before would now be silently
     /// invisible to every count this whole module asserts on.
     fn serve_n(store: &mut EventStore, id: &str, times: usize) {
-        for _ in 0..times {
-            crate::deliver::record_delivery(store, "s", "s", ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &[id.to_string()]);
+        for i in 0..times {
+            crate::deliver::record_delivery(store, &crate::deliver::nth_session("s", i), "s", ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &[id.to_string()]);
         }
     }
 
@@ -1376,30 +1379,6 @@ pub fn first_stop_here(
 ) -> bool {
     let stops = state.sessions.get(session).map_or(0, |s| s.stops);
     stops.saturating_sub(u32::from(stop_here)) == 0 && !crate::attest::earlier_turn_in(timeline, project)
-}
-
-/// THE SESSION'S OWN GATES, for a Stop hold about rule upkeep (step 21): the
-/// teeth question (rules with no current verdict from THOR's trial) holds a
-/// main session's Stop only on the same two terms the evaluation ask lands
-/// on - F14 and Q10, read by the same functions from the same clock: at least
-/// `EVAL_OWN_WORK_MINUTES` of the session's own work in `project`, and not
-/// its first Stop there. A short task session, or one that just started,
-/// never answers for a backlog it did not touch (C3 B2 L86). `Err` names the
-/// gate that keeps it quiet.
-pub fn upkeep_may_hold(
-    state: &ProjectEvalState,
-    project: &str,
-    session: &str,
-    timeline: &[crate::attest::TimedLine],
-    stop_here: bool,
-) -> Result<(), &'static str> {
-    if own_minutes_in(state, project, session, timeline) < EVAL_OWN_WORK_MINUTES {
-        return Err(SHORT_SESSION);
-    }
-    if first_stop_here(state, project, session, timeline, stop_here) {
-        return Err(FIRST_STOP);
-    }
-    Ok(())
 }
 
 /// THE ASK FOLLOWS THE WORK (D11): every project the Stop considers for
@@ -2961,8 +2940,8 @@ mod eval_debt_state_tests {
     /// build a real judgement-debt backlog, and only an assistant-attributed
     /// firing counts as one any more.
     fn serve_n(store: &mut EventStore, id: &str, times: usize) {
-        for _ in 0..times {
-            crate::deliver::record_delivery(store, "s", "s", ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &[id.to_string()]);
+        for i in 0..times {
+            crate::deliver::record_delivery(store, &crate::deliver::nth_session("s", i), "s", ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &[id.to_string()]);
         }
     }
 

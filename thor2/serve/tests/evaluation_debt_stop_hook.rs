@@ -283,8 +283,8 @@ fn declare_owed_items(store: &mut EventStore, n: usize, project: Option<&str>) -
         // asks about every rule without a verdict, whatever its weight, and
         // these fixtures are about the judgement and evaluation debts.
         serve::teeth::fixture::decide(store, &id);
-        for _ in 0..AFTER {
-            serve::deliver::record_delivery(store, "fixture", "fixture", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &[id.clone()]);
+        for i in 0..AFTER {
+            serve::deliver::record_delivery(store, &serve::deliver::nth_session("fixture", i), "fixture", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &[id.clone()]);
         }
         ids.push(id);
     }
@@ -498,32 +498,6 @@ fn declare_setup_note(store: &mut EventStore) {
     // Not "installer": that name is reserved for THOR itself and the store
     // refuses it from anything but the installer's own token.
     model::store::declare(store, "install", "install", "install-fixture", &item).unwrap();
-}
-
-/// A rule naming an obvious literal (a `--flag`), declared by bypassing the
-/// write gate directly - the same escape hatch `bin/serve.rs`'s own
-/// `legacy_unanswered` test helper uses, needed because the real gate
-/// refuses a NEW rule shaped this way with no check and no `no-literal` tag.
-fn declare_teeth_eligible_item(store: &mut EventStore, id: &str) {
-    let item = Item {
-        id: id.to_string(),
-        kind: Kind::Rule,
-        text: format!("Never run the deploy script with --force-{id} on this repo"),
-        bindings: vec![Binding::Always],
-        // Heavy: since the 2026-09-25 rebuild, `teeth_debt` only ever owes a
-        // proof to the population `serve::prove::teeth_box` does (heavy, or
-        // a refusing-kind check) - see that function's own doc comment. A
-        // light item with no check is `NotApplicable` and never asked.
-        severity: Some(model::item::Severity::Irreversible),
-        project: None,
-        tags: vec![],
-        expires: None,
-        key: None,
-        falsifier: Some("this turns out to be safe after all".to_string()),
-        check: None,
-    };
-    let body = serde_json::to_string(&item).unwrap();
-    store.append_event("legacy", id, "migration", EventKind::FactCreated, id, None, &body).unwrap();
 }
 
 // ------------------------------------------------------------- fires
@@ -1414,38 +1388,6 @@ fn setup_debt_still_fires_with_an_eval_eligible_backlog_also_present() {
     assert!(reason.contains("Run the THOR evaluation"), "the ask rides with the setup block: {reason}");
 }
 
-/// THE OTHER HALF: a debt AFTER the new insertion point (the backlog burn,
-/// `teeth_debt`) must still fire on its own store, unaffected, when the
-/// evaluation debt itself has nothing to say (no sidecar was ever seeded
-/// here, and the session served nothing applying to this project either).
-/// Since step 21 the teeth question holds only a session with ten minutes of
-/// its own work in the project, past its first Stop there (the evaluation
-/// ask's own gates), so the session has thirty minutes and one earlier Stop
-/// in a project - too little for the evaluation (the project's clock is not
-/// due), enough for the teeth question.
-#[test]
-fn teeth_debt_still_fires_after_the_evaluation_debt_check() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = dir.path().join("thor.db");
-    let sandbox = Sandbox::new();
-    let cwd = sandbox.project_dir("fxp");
-
-    let mut store = EventStore::new(&db).unwrap();
-    declare_teeth_eligible_item(&mut store, "names-a-flag");
-    drop(store);
-    seed_own_work(&db, "fxp", "s1", 30, 1);
-
-    let out = run_hook(&db, &stop_payload("s1", &cwd), &sandbox);
-    let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("expected a decision JSON: {e}: {out}"));
-    assert_eq!(v["decision"], "block", "{out}");
-    let reason = v["reason"].as_str().unwrap();
-    assert!(reason.contains("names-a-flag"), "teeth_debt must still name the rule: {reason}");
-    // Step 9: `teeth_debt` reads `model::store::settlement` and names why
-    // the rule is owed, and the command that decides it.
-    assert!(reason.contains("it has never been tried"), "and say why it is owed: {reason}");
-    assert!(reason.contains("retest --id 'names-a-flag'"), "and the command that decides it: {reason}");
-}
-
 // ------------------------------------------ step 16: only a valid report counts
 //
 // The Stop hook validates every report on file once (`serve::eval_filing`),
@@ -1976,35 +1918,6 @@ fn session_start_payload(session_id: &str, cwd: &Path) -> String {
         "cwd": cwd.to_string_lossy(),
     })
     .to_string()
-}
-
-/// The teeth question holds neither a session's first Stop in the project
-/// nor a session with less than ten minutes of its own work there; a
-/// session past both gates is asked at its next Stop.
-#[test]
-fn the_teeth_question_never_holds_a_first_stop_or_a_short_session() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = dir.path().join("thor.db");
-    let sandbox = Sandbox::new();
-    let fxp = sandbox.project_dir("fxp");
-    let mut store = EventStore::new(&db).unwrap();
-    declare_teeth_eligible_item(&mut store, "names-a-flag");
-    drop(store);
-
-    let fresh = uuid(64);
-    seed_own_work(&db, "fxp", &fresh, 30, 0);
-    let first = run_hook(&db, &stop_payload(&fresh, &fxp), &sandbox);
-    assert!(!is_block(&first), "a session's first Stop here is never held for rule upkeep: {first}");
-    let second = run_hook(&db, &stop_payload(&fresh, &fxp), &sandbox);
-    assert!(is_block(&second) && second.contains("names-a-flag"), "its second Stop is: {second}");
-    assert!(second.contains("retest --id 'names-a-flag'"), "with the command that decides it: {second}");
-
-    let short = uuid(65);
-    seed_own_work(&db, "fxp", &short, 4, 2);
-    for stop in 1..=3 {
-        let out = run_hook(&db, &stop_payload(&short, &fxp), &sandbox);
-        assert!(!is_block(&out), "stop {stop}: four minutes of its own here is never held for rule upkeep: {out}");
-    }
 }
 
 /// The setup block holds the turn first, and the evaluation ask - with the

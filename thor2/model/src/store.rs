@@ -3123,11 +3123,11 @@ pub const OWNER_SETUP_ANSWERS_ID: &str = "owner-setup-answers";
 /// projection`'s own doc comment already makes.
 pub const EVALUATION_REPORT_TAG: &str = "evaluation-report";
 
-/// How many times a live item must have fired since its own last verdict
-/// before it counts as judgement debt - mirrors `serve::usefulness::
-/// JUDGEMENT_DEBT_AFTER` exactly (kept equal by hand: `model` cannot import
-/// it, for the same reason every other constant in this section is
-/// reimplemented rather than shared).
+/// How many SESSIONS a live item must have fired in since its own last verdict
+/// before it counts as judgement debt (once per session, step 28) - mirrors
+/// `serve::usefulness::JUDGEMENT_DEBT_AFTER` exactly (kept equal by hand:
+/// `model` cannot import it, for the same reason every other constant in this
+/// section is reimplemented rather than shared).
 pub const JUDGEMENT_DEBT_AFTER: usize = 40;
 
 /// The actor a real delivery is stamped with - mirrors `serve::usefulness::
@@ -3698,19 +3698,20 @@ fn project_applies_to(item_project: Option<&str>, checkout_project: Option<&str>
 fn served_since_last_verdict_local(store: &EventStore) -> HashMap<String, usize> {
     let Ok(events) = store.firings_and_verdicts() else { return HashMap::new() };
     let attested = attested_write_seqs(store);
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    for (seq, kind, id, actor, _session) in events {
+    // Counted once per session (step 28): the sessions served since the last verdict.
+    let mut sessions: HashMap<String, HashSet<String>> = HashMap::new();
+    for (seq, kind, id, actor, session) in events {
         match kind {
             EventKind::ItemServed if actor == ASSISTANT_DELIVERY_ACTOR => {
-                *counts.entry(id).or_default() += 1;
+                sessions.entry(id).or_default().insert(session);
             }
             EventKind::ItemMarkedUseful | EventKind::ItemMarkedNoise if attested.contains(&seq) => {
-                counts.insert(id, 0);
+                sessions.insert(id, HashSet::new());
             }
             _ => {}
         }
     }
-    counts
+    sessions.into_iter().map(|(id, sessions)| (id, sessions.len())).collect()
 }
 
 /// How many live, non-pinned items THIS project owes a verdict on right now,
@@ -4987,12 +4988,14 @@ pub struct EvaluationJudgement {
 /// the same stance `all_live_items` takes.
 ///
 /// THE SET, computed from the log alone: an item belongs to it when, counting
-/// only events at or before `started_seq`, it had fired
-/// `JUDGEMENT_DEBT_AFTER`+ times (assistant deliveries only, exactly as the
-/// store-wide debt counts) since its own last ATTESTED verdict, AND it fired
-/// in `session` at least once at or before the start - the same "was the
-/// reader being asked ever in the room" test the Stop hook's own per-turn ask
-/// applies (`EventStore::served_ids_in_session`). It must also still be live,
+/// only events at or before `started_seq`, it had fired in
+/// `JUDGEMENT_DEBT_AFTER`+ SESSIONS (assistant deliveries only, once per
+/// session, exactly as the store-wide debt counts) since its own last
+/// ATTESTED verdict, AND it fired in `session` at least once at or before the
+/// start - the "was the reader being asked ever in the room" test: a verdict
+/// guessed on an item the evaluating session never saw is no verdict. This is
+/// the ONLY place the owner is asked for a judgement (step 28): no Stop holds
+/// a turn for it any more. It must also still be live,
 /// still apply to `project` and still not be pinned. A firing after the start
 /// never adds anything, whichever session it came from, which is what keeps
 /// the evaluation's own writes - and every rule bound to the `remember` moment
@@ -5006,7 +5009,9 @@ pub struct EvaluationJudgement {
 pub fn evaluation_judgement_list(store: &EventStore, project: Option<&str>, session: &str, started_seq: i64) -> Vec<String> {
     let Ok(events) = store.firings_and_verdicts() else { return Vec::new() };
     let attested = attested_write_seqs(store);
-    let mut count_at_start: HashMap<&str, usize> = HashMap::new();
+    // The sessions that were served each item since its last verdict, as of
+    // the start: an item counts once per session (step 28).
+    let mut sessions_at_start: HashMap<&str, HashSet<&str>> = HashMap::new();
     let mut fired_here: HashSet<&str> = HashSet::new();
     for (seq, kind, id, actor, event_session) in &events {
         if *seq > started_seq {
@@ -5014,22 +5019,22 @@ pub fn evaluation_judgement_list(store: &EventStore, project: Option<&str>, sess
         }
         match kind {
             EventKind::ItemServed if actor == ASSISTANT_DELIVERY_ACTOR => {
-                *count_at_start.entry(id.as_str()).or_default() += 1;
+                sessions_at_start.entry(id.as_str()).or_default().insert(event_session.as_str());
                 if event_session == session {
                     fired_here.insert(id.as_str());
                 }
             }
             EventKind::ItemMarkedUseful | EventKind::ItemMarkedNoise if attested.contains(seq) => {
-                count_at_start.insert(id.as_str(), 0);
+                sessions_at_start.insert(id.as_str(), HashSet::new());
             }
             _ => {}
         }
     }
     let live = all_live_items(store);
     let live_by_id: HashMap<&str, &Item> = live.iter().map(|(id, it)| (id.as_str(), it)).collect();
-    let mut ids: Vec<String> = count_at_start
+    let mut ids: Vec<String> = sessions_at_start
         .iter()
-        .filter(|(id, count)| **count >= JUDGEMENT_DEBT_AFTER && fired_here.contains(**id))
+        .filter(|(id, sessions)| sessions.len() >= JUDGEMENT_DEBT_AFTER && fired_here.contains(**id))
         .filter_map(|(id, _)| {
             let item = live_by_id.get(id)?;
             let pinned = item.bindings.iter().any(|b| matches!(b, Binding::Always));
@@ -5550,7 +5555,7 @@ fn check_evaluation_report_filing(store: &EventStore, item: &Item, ctx: Option<&
         let named = judgement.owed.iter().map(|id| format!("'{id}'")).collect::<Vec<_>>().join(", ");
         missing.push(format!(
             "{} item(s) fired in this session before this evaluation started (log position {}) and still owe a \
-             judgement - each had fired {JUDGEMENT_DEBT_AFTER}+ times since its last verdict by then: {named}. This \
+             judgement - each had fired in {JUDGEMENT_DEBT_AFTER}+ sessions since its last verdict by then: {named}. This \
              list was fixed when the evaluation started and cannot grow: nothing that fires after that, and nothing \
              that fired only in another session, is this report's to settle. Only a verdict this session gives \
              through the THOR tool itself counts - one from another session, or from a shell or a script, settles \
@@ -8729,9 +8734,12 @@ mod tests {
         }
     }
 
+    /// Firings in `n` sessions, one each ("s", then "s-1", "s-2" ...): the
+    /// judgement debt counts a fact once per session (step 28).
     fn serve_n(store: &mut EventStore, id: &str, actor: &str, n: usize) {
-        for _ in 0..n {
-            store.append_event("s", "l", actor, EventKind::ItemServed, id, None, "{}").unwrap();
+        for i in 0..n {
+            let session = if i == 0 { "s".to_string() } else { format!("s-{i}") };
+            store.append_event(&session, "l", actor, EventKind::ItemServed, id, None, "{}").unwrap();
         }
     }
 
@@ -8739,10 +8747,12 @@ mod tests {
         store.append_event("s", "l", "a", EventKind::ItemMarkedUseful, id, None, "{}").unwrap();
     }
 
-    /// Firings under a named session, the way the hook stamps them.
+    /// Firings the way the hook stamps them, in `n` sessions: the named one
+    /// first, then "<session>-1", "<session>-2" ... (once per session, step 28).
     fn serve_in(store: &mut EventStore, session: &str, id: &str, n: usize) {
-        for _ in 0..n {
-            store.append_event(session, session, ASSISTANT_DELIVERY_ACTOR, EventKind::ItemServed, id, None, "{}").unwrap();
+        for i in 0..n {
+            let this = if i == 0 { session.to_string() } else { format!("{session}-{i}") };
+            store.append_event(&this, session, ASSISTANT_DELIVERY_ACTOR, EventKind::ItemServed, id, None, "{}").unwrap();
         }
     }
 
@@ -8943,6 +8953,25 @@ mod tests {
         );
     }
 
+    /// STEP 28: a fact counts ONCE PER SESSION toward the 40 that make a verdict
+    /// owed - in the store-wide debt and in an evaluation's frozen list alike.
+    /// Eighty showings in one session are one session; forty sessions that saw
+    /// it once each are forty.
+    #[test]
+    fn a_fact_counts_once_per_session_toward_the_debt_and_the_frozen_list() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare_noted(&mut store, &light_command_rule("one-session", "o"));
+        declare_noted(&mut store, &light_command_rule("many-sessions", "o"));
+        for _ in 0..JUDGEMENT_DEBT_AFTER * 2 {
+            store.append_event("busy", "busy", ASSISTANT_DELIVERY_ACTOR, EventKind::ItemServed, "one-session", None, "{}").unwrap();
+        }
+        serve_in(&mut store, "busy", "many-sessions", JUDGEMENT_DEBT_AFTER);
+        assert_eq!(served_since_last_verdict_local(&store).get("one-session"), Some(&1));
+        assert_eq!(served_since_last_verdict_local(&store).get("many-sessions"), Some(&JUDGEMENT_DEBT_AFTER));
+        assert_eq!(judgement_debt_in_project(&store, Some("o")), vec!["many-sessions".to_string()]);
+        assert_eq!(evaluation_judgement_list(&store, Some("o"), "busy", i64::MAX), vec!["many-sessions".to_string()]);
+    }
+
     /// The list is fixed when the evaluation starts: an item pushed over the
     /// threshold afterwards - by the evaluation's own writes firing the
     /// remember-bound rules, or by anything else - never joins it.
@@ -8955,7 +8984,7 @@ mod tests {
         serve_in(&mut store, "eval-session", "remember-bound", JUDGEMENT_DEBT_AFTER - 1);
         let start = record_start(&mut store, "eval-session", "f");
         // The evaluation's own writes fire it again, well past the threshold.
-        serve_in(&mut store, "eval-session", "remember-bound", 10);
+        serve_in(&mut store, "late-session", "remember-bound", 10);
 
         let err = file_in(&mut store, &eval_report("eval-f-1", "f"), &start).unwrap_err();
         let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };

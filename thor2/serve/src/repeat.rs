@@ -1,61 +1,49 @@
-//! HOW OFTEN ONE AGENT SEES THE SAME FACT (step 27, field test 3).
+//! HOW OFTEN ONE AGENT SEES THE SAME FACT (step 27, field test 3; one full
+//! showing per context since step 28).
 //!
 //! Field case 2026-10-01: in 60 minutes two sessions and three subagents were
 //! handed 628 fact showings (250 KB) for work that needed a dozen; one fact was
 //! put in front of one subagent 78 times, on 70% of its shell calls. A fact
 //! bound to a command such as `cd` or `node --test` fires on every such call,
-//! and an agent that has read it twice learns nothing from a third copy.
+//! and an agent that has read it once learns nothing from a second copy.
+//! The owner's decision, 2026-10-02: "1x per sessie is meer dan voldoende".
 //!
-//! So what is DISPLAYED is limited, per reader. A reader is one session's main
-//! conversation or one subagent (`key_for`). For one reader and one fact:
+//! So what is DISPLAYED is limited, per context. A context is one session's
+//! main conversation or one subagent (`key_for`): a subagent starts with a
+//! fresh context that has not seen anything, so it is counted apart. For one
+//! context and one fact:
 //!
-//! - the first `FULL_SHOWINGS` showings carry the fact in full;
-//! - the next ones, up to `LAST_SHOWING` in all, are one line: the id and the
-//!   head of the text, enough to jog a memory and to `get` the rest;
-//! - after that nothing, until the reader's count is reset (`reset`): a new
-//!   session start, or a prompt the owner typed himself, which opens a new turn
-//!   of the conversation and may need the fact again. A subagent's count is never
-//!   reset: an agent id is one run.
+//! - the first showing carries the fact in full;
+//! - every later showing shows nothing at all, no reminder line either;
+//! - the count is reset only by `reset`, called at a new session start (also a
+//!   resume or a compaction, which lose what the agent was shown). An owner's
+//!   prompt resets nothing: a fact seen once in this context stays seen.
 //!
 //! Only DISPLAY is limited. Every refusal, requirement and check runs before
 //! this and knows nothing of it: a rule that blocks a call blocks it the
 //! hundredth time too.
 //!
-//! JUDGEMENT DEBT. A serving is an `ItemServed` event, and 40 of them without a
-//! verdict make an item owe one. Only a FULL showing is recorded as a serving
-//! (the caller records `Arranged::selection`, never the reminders). A one-line
-//! reminder carries no new content and a suppressed showing nothing at all, so
-//! neither is something the agent could be asked to judge; counting them would
-//! make the debt grow with the very repeats this module removes.
+//! JUDGEMENT DEBT. A serving is an `ItemServed` event, recorded for what is
+//! shown in full (the caller records `Arranged::selection`). A suppressed
+//! showing is not a serving, so repeats cannot build debt; and the debt counts
+//! a fact once per session (`usefulness::served_since_last_verdict`).
 //!
 //! NEAR-IDENTICAL FACTS in one block (two facts that say the same about the
 //! same place) are shown once: the higher ranked one stays, the other is left
 //! out of this block and not counted as shown.
 //!
-//! State is one small file per reader beside the store (`shown-counts/`), so
-//! two readers never write the same file. Best effort like every sidecar: a
+//! State is one small file per context beside the store (`shown-counts/`), so
+//! two contexts never write the same file. Best effort like every sidecar: a
 //! file that cannot be read or written means every fact shows in full again,
 //! never that one is hidden by mistake.
 
 use crate::rank::RankedItem;
 use crate::render::{self, Selection};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 /// The folder beside the store.
 pub const DIR: &str = "shown-counts";
-
-/// How many showings of one fact one reader gets in full.
-pub const FULL_SHOWINGS: u32 = 2;
-
-/// How many showings (full and one-line together) one reader gets at all.
-pub const LAST_SHOWING: u32 = 5;
-
-/// How many one-line reminders one block carries at most.
-pub const MAX_REMINDERS: usize = 6;
-
-/// How much of a fact's text a reminder keeps, in characters.
-const REMINDER_HEAD_CHARS: usize = 60;
 
 /// Two facts count as the same when at least this share of the smaller one's
 /// words (four letters or more) is in the other.
@@ -71,27 +59,28 @@ const KEEP_SECS: u64 = 2 * 24 * 3600;
 /// How many counting files may sit there before old ones are looked for.
 const PRUNE_ABOVE: usize = 200;
 
-/// What one block is made of after the limits.
+/// What one block is made of after the limit.
 pub struct Arranged {
     /// The facts shown in full, capped like every block.
     pub selection: Selection,
-    /// The facts shown as one line.
-    pub reminders: Vec<RankedItem>,
+    /// How many facts this context had already been shown and were left out.
+    pub suppressed: usize,
 }
 
 impl Arranged {
-    /// Ids of everything displayed, in full or as a line.
+    /// Ids of everything displayed.
     pub fn displayed_ids(&self) -> Vec<&str> {
-        self.selection.shown.iter().chain(self.reminders.iter()).map(|r| r.id.as_str()).collect()
+        self.selection.shown.iter().map(|r| r.id.as_str()).collect()
     }
 }
 
+/// The ids this context has been shown in full.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
-struct Counts {
-    counts: BTreeMap<String, u32>,
+struct Seen {
+    seen: BTreeSet<String>,
 }
 
-/// The reader a hook call belongs to: the session's main conversation, or one
+/// The context a hook call belongs to: the session's main conversation, or one
 /// subagent of it.
 pub fn key_for(session_id: &str, agent_id: Option<&str>) -> String {
     match agent_id.filter(|a| !a.is_empty()) {
@@ -105,11 +94,21 @@ fn file_for(db: &Path, key: &str) -> PathBuf {
     db.parent().unwrap_or_else(|| Path::new(".")).join(DIR).join(format!("{name}.json"))
 }
 
-fn read(db: &Path, key: &str) -> Counts {
-    std::fs::read_to_string(file_for(db, key)).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+/// What the file says. A file of the earlier format (a map of counts) is read
+/// as well: every id in it has been shown at least once.
+fn read(db: &Path, key: &str) -> Seen {
+    let Some(text) = std::fs::read_to_string(file_for(db, key)).ok() else { return Seen::default() };
+    if let Ok(seen) = serde_json::from_str::<Seen>(&text) {
+        return seen;
+    }
+    #[derive(serde::Deserialize)]
+    struct Earlier {
+        counts: std::collections::BTreeMap<String, u32>,
+    }
+    serde_json::from_str::<Earlier>(&text).map(|e| Seen { seen: e.counts.into_keys().collect() }).unwrap_or_default()
 }
 
-fn write(db: &Path, key: &str, counts: &Counts) {
+fn write(db: &Path, key: &str, seen: &Seen) {
     let path = file_for(db, key);
     if crate::store_dir::is_held(&path) {
         return;
@@ -118,7 +117,7 @@ fn write(db: &Path, key: &str, counts: &Counts) {
     if std::fs::create_dir_all(dir).is_err() {
         return;
     }
-    if let Ok(text) = serde_json::to_string(counts) {
+    if let Ok(text) = serde_json::to_string(seen) {
         let _ = std::fs::write(&path, text);
     }
     prune(dir);
@@ -144,8 +143,8 @@ fn prune(dir: &Path) {
     }
 }
 
-/// Forget what this reader has been shown: a new session start, or a prompt
-/// the owner typed himself.
+/// Forget what this context has been shown: a new session start (also a resume
+/// or a compaction). Nothing else calls this.
 pub fn reset(db: &Path, key: &str) {
     let path = file_for(db, key);
     if crate::store_dir::is_held(&path) {
@@ -181,42 +180,23 @@ fn without_near_duplicates(all: &[RankedItem]) -> Vec<&RankedItem> {
     kept.into_iter().map(|(item, _)| item).collect()
 }
 
-/// One line for a fact this reader has already seen twice.
-pub fn reminder_line(ranked: &RankedItem) -> String {
-    let flat = ranked.item.text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let head: String = flat.chars().take(REMINDER_HEAD_CHARS).collect();
-    let cut = if flat.chars().count() > REMINDER_HEAD_CHARS { "..." } else { "" };
-    format!("- [{}] (seen before) {head}{cut}", ranked.id)
-}
-
-/// Decide what one block shows this reader, and count it. `all` is the ranked
+/// Decide what one block shows this context, and count it. `all` is the ranked
 /// list the block would have been made from; `record` is false for a run that
 /// must leave no trace (the counts are then read but not written).
 pub fn arrange(db: &Path, key: &str, all: &[RankedItem], record: bool) -> Arranged {
-    let mut counts = read(db, key);
-    let mut full: Vec<RankedItem> = Vec::new();
-    let mut reminders: Vec<RankedItem> = Vec::new();
+    let mut seen = read(db, key);
+    let mut fresh: Vec<RankedItem> = Vec::new();
+    let mut suppressed = 0;
     for item in without_near_duplicates(all) {
-        let seen = counts.counts.get(&item.id).copied().unwrap_or(0);
-        if seen >= LAST_SHOWING {
-            continue;
-        }
-        if seen >= FULL_SHOWINGS {
-            reminders.push(item.clone());
-        } else {
-            full.push(item.clone());
+        match seen.seen.contains(&item.id) {
+            true => suppressed += 1,
+            false => fresh.push(item.clone()),
         }
     }
-    let selection = render::cap(full);
-    reminders.truncate(MAX_REMINDERS);
-    let arranged = Arranged { selection, reminders };
-    if record {
-        for id in arranged.displayed_ids() {
-            *counts.counts.entry(id.to_string()).or_insert(0) += 1;
-        }
-        if !arranged.displayed_ids().is_empty() {
-            write(db, key, &counts);
-        }
+    let arranged = Arranged { selection: render::cap(fresh), suppressed };
+    if record && !arranged.displayed_ids().is_empty() {
+        seen.seen.extend(arranged.displayed_ids().into_iter().map(str::to_string));
+        write(db, key, &seen);
     }
     arranged
 }
@@ -252,42 +232,43 @@ mod tests {
     }
 
     #[test]
-    fn a_fact_is_shown_in_full_twice_then_as_a_line_then_not_at_all() {
+    fn a_fact_is_shown_in_full_once_then_never_again_in_that_context() {
         let (_dir, db) = state();
         let all = vec![ranked("f1", "Never trust the working directory after a cd in a shell call.")];
-        let mut shapes = Vec::new();
-        for _ in 0..7 {
+        let mut shown = Vec::new();
+        let mut suppressed = Vec::new();
+        for _ in 0..4 {
             let a = arrange(&db, "s1", &all, true);
-            shapes.push((a.selection.shown.len(), a.reminders.len()));
+            shown.push(a.selection.shown.len());
+            suppressed.push(a.suppressed);
         }
-        assert_eq!(shapes, vec![(1, 0), (1, 0), (0, 1), (0, 1), (0, 1), (0, 0), (0, 0)]);
+        assert_eq!(shown, vec![1, 0, 0, 0]);
+        assert_eq!(suppressed, vec![0, 1, 1, 1]);
     }
 
     #[test]
-    fn two_readers_count_apart_and_a_reset_starts_over() {
+    fn two_contexts_count_apart_and_a_reset_starts_over() {
         let (_dir, db) = state();
         let all = vec![ranked("f1", "Some fact that is long enough to be a fact.")];
-        for _ in 0..4 {
-            arrange(&db, "s1", &all, true);
-        }
+        arrange(&db, "s1", &all, true);
         assert_eq!(arrange(&db, "s1", &all, true).selection.shown.len(), 0);
         assert_eq!(arrange(&db, "s1-agentA", &all, true).selection.shown.len(), 1, "a subagent starts at zero");
+        assert_eq!(arrange(&db, "s1-agentA", &all, true).selection.shown.len(), 0);
+        assert_eq!(arrange(&db, "s1-agentB", &all, true).selection.shown.len(), 1, "each subagent is its own context");
         reset(&db, "s1");
-        assert_eq!(arrange(&db, "s1", &all, true).selection.shown.len(), 1, "a new turn shows it again");
+        assert_eq!(arrange(&db, "s1", &all, true).selection.shown.len(), 1, "a new session start shows it again");
     }
 
     #[test]
     fn a_hidden_fact_leaves_its_slot_to_the_next_one() {
         let (_dir, db) = state();
         let mut all: Vec<RankedItem> = (0..5).map(|i| ranked(&format!("f{i}"), &format!("distinct fact number {i} about topic{i} alpha{i} beta{i}"))).collect();
-        for _ in 0..5 {
-            arrange(&db, "s1", &all[..4], true);
-        }
+        arrange(&db, "s1", &all[..4], true);
         all.rotate_left(0);
         let a = arrange(&db, "s1", &all, true);
         let ids: Vec<&str> = a.selection.shown.iter().map(|r| r.id.as_str()).collect();
-        assert_eq!(ids, vec!["f4"], "the four that were seen five times are quiet, the new one shows");
-        assert!(a.reminders.is_empty());
+        assert_eq!(ids, vec!["f4"], "the four that were seen are quiet, the new one shows");
+        assert_eq!(a.suppressed, 4);
     }
 
     #[test]
@@ -320,20 +301,20 @@ mod tests {
     }
 
     #[test]
-    fn a_reminder_is_one_line_with_the_id_and_the_head_of_the_text() {
-        let line = reminder_line(&ranked("f1", &format!("{} {}", "a".repeat(80), "tail")));
-        assert!(line.starts_with("- [f1] (seen before) aaaa"), "{line}");
-        assert!(line.ends_with("..."), "{line}");
-        assert!(!line.contains('\n'));
-        assert!(line.chars().count() < 100, "{line}");
-    }
-
-    #[test]
     fn an_unreadable_counting_file_shows_everything_again() {
         let (dir, db) = state();
         let all = vec![ranked("f1", "A fact long enough to be a fact for this test of an unreadable file.")];
         std::fs::create_dir_all(dir.path().join(DIR)).unwrap();
         std::fs::write(file_for(&db, "s1"), "not json").unwrap();
         assert_eq!(arrange(&db, "s1", &all, true).selection.shown.len(), 1);
+    }
+
+    #[test]
+    fn a_counting_file_of_the_earlier_format_still_counts_as_seen() {
+        let (dir, db) = state();
+        let all = vec![ranked("f1", "A fact long enough to be a fact for this test of the earlier format.")];
+        std::fs::create_dir_all(dir.path().join(DIR)).unwrap();
+        std::fs::write(file_for(&db, "s1"), r#"{"counts":{"f1":2}}"#).unwrap();
+        assert_eq!(arrange(&db, "s1", &all, true).selection.shown.len(), 0);
     }
 }

@@ -442,11 +442,11 @@ alone. Only a new valid evaluation resets the clocks.
 The ask rides with every block that holds a first-pass `Stop` before its own
 turn - the Response Guard, setup, the capture check, the crowding question - in
 the same block after that reason, so none of them starves it; the `Stop` is
-counted once, before any verdict. The teeth question (rules with no current
-verdict from THOR's trial) holds a session only on the ask's own two session
-terms, read by the same functions (`usefulness::upkeep_may_hold`): at least
-`EVAL_OWN_WORK_MINUTES` of its own work in the project, and not its first `Stop`
-there. A `Stop` in no project is never held for it.
+counted once, before any verdict. Since step 28 (2.5.6) no `Stop` holds a turn
+for the teeth question (rules with no current verdict from THOR's trial) or for
+the judgement debt: both are asked inside the evaluation (its batch, its A4 list
+and its frozen judgement list), at most once per 16 hours per project. The
+judgement debt counts a fact once per session.
 
 ### 7.6 Open points and the owner queue
 

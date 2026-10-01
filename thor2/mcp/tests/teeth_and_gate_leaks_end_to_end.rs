@@ -139,8 +139,10 @@ fn served(store: &mut EventStore, id: &str, n: usize) {
 
 /// Firings under a named session, the way the hook stamps them.
 fn served_in(store: &mut EventStore, session: &str, id: &str, n: usize) {
-    for _ in 0..n {
-        store.append_event(session, "l", "hook", EventKind::ItemServed, id, None, "{}").unwrap();
+    // One firing per session (step 28): `session` first, then "<session>-1" ...
+    for i in 0..n {
+        let this = serve::deliver::nth_session(session, i);
+        store.append_event(&this, "l", "hook", EventKind::ItemServed, id, None, "{}").unwrap();
     }
 }
 

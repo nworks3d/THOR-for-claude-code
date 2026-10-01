@@ -169,8 +169,8 @@ fn fired_rule(db: &std::path::Path, id: &str, session: &str, times: usize) {
     seed_raw(db, &item);
     let mut store = EventStore::open_existing(db).unwrap();
     serve::teeth::fixture::decide(&mut store, id);
-    for _ in 0..times {
-        serve::deliver::record_delivery(&mut store, session, session, "hook", "2026-09-28T00:00:00Z", &[id.to_string()]);
+    for i in 0..times {
+        serve::deliver::record_delivery(&mut store, &serve::deliver::nth_session(session, i), session, "hook", "2026-09-28T00:00:00Z", &[id.to_string()]);
     }
 }
 
@@ -346,8 +346,8 @@ fn the_machine_s_own_writes_in_the_window_never_void_the_evaluation() {
         };
         seed_raw(&s.db, &item);
         let mut store = EventStore::open_existing(&s.db).unwrap();
-        for _ in 0..40 {
-            serve::deliver::record_delivery(&mut store, WRITING_SESSION, WRITING_SESSION, "hook", "2026-09-28T00:00:00Z", &[id.to_string()]);
+        for i in 0..40 {
+            serve::deliver::record_delivery(&mut store, &serve::deliver::nth_session(WRITING_SESSION, i), WRITING_SESSION, "hook", "2026-09-28T00:00:00Z", &[id.to_string()]);
         }
     }
     let start = start_evaluation(&mut s);
@@ -844,7 +844,7 @@ fn a_shell_serve_mark_neither_clears_debt_nor_shrinks_a_list() {
     let owed = |db: &std::path::Path| model::store::judgement_debt_in_project(&EventStore::open_existing(db).unwrap(), Some("demo"));
     assert!(owed(&s.db).contains(&"listed-a".to_string()), "fixture sanity: {:?}", owed(&s.db));
     let asked = s.stop();
-    assert!(asked.contains("\"decision\":\"block\"") && asked.contains("listed-a"), "fixture sanity: {asked}");
+    assert!(!asked.contains("listed-a"), "no Stop asks for a verdict any more (step 28): {asked}");
 
     let out = std::process::Command::new(serve_exe())
         .arg("--db")
@@ -858,8 +858,6 @@ fn a_shell_serve_mark_neither_clears_debt_nor_shrinks_a_list() {
     last_of(&s.db, "listed-a", EventKind::ItemMarkedUseful);
 
     assert!(owed(&s.db).contains(&"listed-a".to_string()), "the debt is unchanged by a verdict from a shell");
-    let asked = s.stop();
-    assert!(asked.contains("\"decision\":\"block\"") && asked.contains("listed-a"), "the Stop still asks for it: {asked}");
     let start = start_evaluation(&mut s);
     assert_eq!(start.frozen.judgement, vec!["listed-a".to_string(), "listed-b".to_string()], "the list did not shrink");
 }

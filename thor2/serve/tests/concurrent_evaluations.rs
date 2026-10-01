@@ -45,10 +45,10 @@ fn noted_rule(store: &mut EventStore, id: &str) {
 /// `id` fired `n` times in `session` just now.
 fn fire(store: &mut EventStore, session: &str, id: &str, n: usize) {
     let at = serve::time::iso8601_from_unix(serve::time::now_unix() - 60);
-    for _ in 0..n {
+    for i in 0..n {
         serve::deliver::record_delivery_with_trigger(
             store,
-            session,
+            &serve::deliver::nth_session(session, i),
             session,
             serve::usefulness::ASSISTANT_DELIVERY_ACTOR,
             &at,

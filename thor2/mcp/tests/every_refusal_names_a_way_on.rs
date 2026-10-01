@@ -566,8 +566,8 @@ fn listed(fx: &Fx, id: &str) {
     seed_raw(&fx.db, &rule);
     let mut store = EventStore::open_existing(&fx.db).unwrap();
     serve::teeth::fixture::decide(&mut store, id);
-    for _ in 0..40 {
-        serve::deliver::record_delivery(&mut store, WRITING_SESSION, WRITING_SESSION, "hook", "2026-09-28T00:00:00Z", &[id.to_string()]);
+    for i in 0..40 {
+        serve::deliver::record_delivery(&mut store, &serve::deliver::nth_session(WRITING_SESSION, i), WRITING_SESSION, "hook", "2026-09-28T00:00:00Z", &[id.to_string()]);
     }
 }
 

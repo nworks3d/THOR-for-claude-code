@@ -943,7 +943,8 @@ pub fn render_start_note(id: &str, frozen: &Frozen) -> String {
         // place per item, so the note stays bounded.
         let per_item = if frozen.judgement.len() > model::store::FIRED_FULL_LIST_MAX { 1 } else { model::store::FIRED_TRIGGERS };
         out.push_str(&format!(
-            "{} item(s) that fired in this session and had fired {}+ times since their last verdict: {}. Under each \
+            "{} item(s) that fired in this session and had fired in {}+ sessions since their last verdict (a fact counts \
+             once per session): {}. Under each \
              one is where it fired in this session (its last {per_item} distinct place(s); \
              mcp__thor__get(id: \"<id>\", fired: true) shows its recent firings). Judge each one by whether it \
              belonged THERE, with the THOR tool itself - a verdict from a shell, a script or another session settles \
@@ -1313,7 +1314,26 @@ mod tests {
 
     /// A project's served item, fired `n` times in `session` at `at` (unix),
     /// on `trigger` - assistant deliveries, the ones the judgement list counts.
+    /// `n` firings in `n` sessions (the debt counts a fact once per session,
+    /// step 28): `session` first, then "<session>-1" ...
     fn fire(store: &mut EventStore, session: &str, id: &str, n: usize, at: i64, trigger: Option<&str>) {
+        let at = crate::time::iso8601_from_unix(at);
+        for i in 0..n {
+            crate::deliver::record_delivery_with_trigger(
+                store,
+                &crate::deliver::nth_session(session, i),
+                session,
+                crate::usefulness::ASSISTANT_DELIVERY_ACTOR,
+                &at,
+                &[id.to_string()],
+                trigger,
+            );
+        }
+    }
+
+    /// `n` firings, all in `session` itself - for what a session saw fire
+    /// there - and `PADDING` other sessions that fired it too, so it is owed.
+    fn fire_here(store: &mut EventStore, session: &str, id: &str, n: usize, at: i64, trigger: Option<&str>) {
         let at = crate::time::iso8601_from_unix(at);
         for _ in 0..n {
             crate::deliver::record_delivery_with_trigger(
@@ -1326,6 +1346,11 @@ mod tests {
                 trigger,
             );
         }
+    }
+
+    /// 40 other sessions that fired `id` once each: it is owed a verdict.
+    fn pad(store: &mut EventStore, id: &str, at: i64) {
+        fire(store, "pad", id, model::store::JUDGEMENT_DEBT_AFTER, at, None);
     }
 
     /// A decided rule of project "p" (a note), so the machine pass leaves it.
@@ -1402,9 +1427,10 @@ mod tests {
         let (db, mut store) = store_with_events(dir.path(), 1);
         let now = crate::time::now_unix();
         noted_rule(&mut store, "fx-fired", model::item::Binding::Target { kind: model::item::TargetKind::Command, value: "git push".to_string() });
-        fire(&mut store, "sess", "fx-fired", 30, now - 600, Some("git push origin main"));
-        fire(&mut store, "sess", "fx-fired", 10, now - 300, Some("git push --tags"));
-        fire(&mut store, "other", "fx-fired", 5, now - 200, Some("git push elsewhere"));
+        pad(&mut store, "fx-fired", now - 900);
+        fire_here(&mut store, "sess", "fx-fired", 30, now - 600, Some("git push origin main"));
+        fire_here(&mut store, "sess", "fx-fired", 10, now - 300, Some("git push --tags"));
+        fire_here(&mut store, "other", "fx-fired", 5, now - 200, Some("git push elsewhere"));
         let started = start(&db, &mut store, "sess", "p", "stop-ask").unwrap();
         assert_eq!(started.start.frozen.judgement, vec!["fx-fired".to_string()]);
         let note = start_note(&started.start);
@@ -1426,7 +1452,8 @@ mod tests {
         let (db, mut store) = store_with_events(dir.path(), 1);
         let now = crate::time::now_unix();
         noted_rule(&mut store, "fx-old", model::item::Binding::Target { kind: model::item::TargetKind::Command, value: "git push".to_string() });
-        fire(&mut store, "sess", "fx-old", 40, now - 600, Some("git push origin main"));
+        pad(&mut store, "fx-old", now - 900);
+        fire_here(&mut store, "sess", "fx-old", 40, now - 600, Some("git push origin main"));
         let mut frozen = model::store::frozen_now(&store, "sess", "p", "stop-ask", now).unwrap();
         assert_eq!(frozen.judgement, vec!["fx-old".to_string()]);
         // What an older build wrote: no places at all.
@@ -1465,8 +1492,9 @@ mod tests {
         for i in 0..n {
             let id = format!("fx-long-{i:02}");
             noted_rule(&mut store, &id, model::item::Binding::Target { kind: model::item::TargetKind::Command, value: format!("make t{i}") });
-            fire(&mut store, "sess", &id, 39, now - 600, Some(&format!("make t{i} --old")));
-            fire(&mut store, "sess", &id, 1, now - 300, Some(&format!("make t{i} --new")));
+            pad(&mut store, &id, now - 900);
+            fire_here(&mut store, "sess", &id, 39, now - 600, Some(&format!("make t{i} --old")));
+            fire_here(&mut store, "sess", &id, 1, now - 300, Some(&format!("make t{i} --new")));
         }
         let started = start(&db, &mut store, "sess", "p", "stop-ask").unwrap();
         assert_eq!(started.start.frozen.judgement.len(), n);

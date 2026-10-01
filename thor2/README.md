@@ -153,7 +153,8 @@ written by the reserved actor `eval-machine`), never a file beside the store:
 only the hook knows which session is which, so it writes the record, and the
 tool server finds it again by the session id it runs under. The record
 freezes three lists, none of which can grow afterwards: the judgement
-list (what fired in that session, 40 times or more since its last verdict),
+list (what fired in that session and in 40 sessions or more since its last verdict,
+a fact counting once per session),
 the batch (at most 8 old rules only an agent can fix) and the A4 list (at
 most 16 rules whose check bites and whose text only has to name its literal).
 Right after it, THOR's machine pass tries the project's old rules itself, in a
@@ -212,15 +213,23 @@ per project and not per folder, when:
   been quiet for 30 minutes, the next ask takes the evaluation over and closes
   the old one as superseded (never void: its verdicts stay). A session's own
   open evaluation is asked for first, whatever the clock says.
-- ONE HOLDER PER PROJECT (2.5.4): the judgement debt and the teeth question
-  are the project's debt as well. Per project the holder is the session with
-  the open evaluation, else the one currently held for the project's debt (a
-  lease in `debt-holders.json` beside the store, released at a `Stop` that
-  holds it for nothing), else the first one asked. Another session is not
-  held for any of them while the holder showed activity on the log in the
-  last 30 minutes; it gets one line naming the holder. Holds about the
-  session's own writes (a fact on a full place, setup, a stated decision,
-  the Response Guard) stay per session.
+- ONE HOLDER PER PROJECT (2.5.4): per project the holder is the session with
+  the open evaluation, else the one holding the lease the evaluation ask took
+  (`debt-holders.json` beside the store, released at a `Stop` that holds
+  nothing, and at the retry `Stop` once the evaluation is no longer open),
+  else the first one asked. Another session is not asked while the holder
+  showed activity on the log in the last 30 minutes; it gets one line naming
+  the holder. Holds about the session's own writes (a fact on a full place,
+  setup, a stated decision, the Response Guard) stay per session.
+- NO JUDGEMENT ASK AND NO RULE-UPKEEP ASK AT A TURN'S END (2.5.6): the owner's
+  decision, 2026-10-02 - one block, in the evaluation, instead of something to
+  judge every quarter of an hour. What used to hold a `Stop` for the items that
+  fired repeatedly since they were last judged, or for the old rules THOR's
+  trial has not decided, is asked inside the project's evaluation only (its
+  frozen judgement list, its batch and its A4 list), at most once per 16 hours
+  per project. A fact counts ONCE PER SESSION toward the 40 that make a verdict
+  owed, however often it was shown there, so 40 means about 40 sessions. The
+  stale-rule guard still speaks once per session at most.
 
 Inside a turn the ask already held, the `Stop` of that turn holds again while
 the session's evaluation is open and its report not filed - only once the
@@ -271,13 +280,21 @@ requires answer is only approval markers (`go-<name>`).
 Stop notices that do not hold the turn are also queued (at most 3, once each)
 and handed to the same session as context at its next prompt.
 
-HOW OFTEN ONE AGENT SEES A FACT (2.5.5): a session, or one subagent, is shown
-a fact in full twice, then as one line (its id and the head of its text) up to
-five showings in all, then not at all; the count starts again at the next
-session start and at the next prompt the owner types himself. Two facts that
-say the same in one block are shown once. Only what is shown is limited:
-refusals run before it and are never hidden, and only a full showing is
-recorded as a serving, so a repeat adds nothing to the judgement debt. A
+HOW OFTEN ONE AGENT SEES A FACT (2.5.6): one context - a session's main
+conversation, or one subagent, which starts fresh - is shown a fact in full
+ONCE, then never again: no reminder line, and a prompt the owner types opens no
+new showing. The count starts again only at a new session start (also a resume
+or a compaction, which lose what was shown). Two facts that say the same in one
+block are shown once. Only what is shown is limited: refusals run before it and
+are never hidden, and only a full showing is recorded as a serving, so a
+repeat adds nothing to the judgement debt. A path, directory or route anchor is
+named by a prompt only through its path (`site/dev`) or a distinctive segment,
+never by a bare generic word such as `dev`, `src`, `test`, `docs` or `server`
+(no dot, at most four letters or on a short list); a real tool call on the path
+is unchanged. The log keeps no prompt text: where a prompt fired a fact it
+records "(prompt)" and the anchor or moment word that matched. `doctor` shows
+the volume for the last 24 hours and 7 days: facts shown in full, repeats left
+out, the five most shown facts and the average Stop holds per session. A
 prompt that is a message from another session, a hand-back, a task
 notification or a local-command echo draws no facts, and a negated action
 ("niet pushen", "no deploy") is no moment. The `SessionStart` block lists the
@@ -455,7 +472,7 @@ counts, and without `agent_id` the field changes nothing.
 target/release/doctor.exe --db "<store>"
 ```
 
-Its first line always names the build it was run from (`doctor 2.5.5`), so a
+Its first line always names the build it was run from (`doctor 2.5.6`), so a
 report you paste somewhere says which version made it - every program in this
 directory answers the same way to `--version` or `-V`, on its own, with no
 store needed.

@@ -1170,10 +1170,16 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
     };
     let payload: Option<Value> = serde_json::from_str(&raw).ok();
     let out = hook_inner(db_path, Some(raw), actor, no_record);
+    let event_name: String =
+        payload.as_ref().and_then(|p| p.get("hook_event_name")).and_then(|v| v.as_str()).unwrap_or("PreToolUse").to_string();
+    // Every Stop and whether it held the turn, for doctor's volume line
+    // (`serve::volume`, step 28).
+    if let (true, "Stop", Some(p)) = (!no_record, event_name.as_str(), payload.as_ref()) {
+        serve::volume::record_stop(db_path, &resolve_session_id(p), matches!(out, Some(HookOutput::Decision(_))));
+    }
     let Some(payload) = payload.filter(|p| !no_record && !payload_is_from_a_subagent(p)) else { return out };
-    let event_name = payload.get("hook_event_name").and_then(|v| v.as_str()).unwrap_or("PreToolUse");
     let session_id = resolve_session_id(&payload);
-    match (event_name, out) {
+    match (event_name.as_str(), out) {
         ("Stop", Some(HookOutput::Warn { text })) => {
             serve::next_turn::queue(db_path, &session_id, &text);
             Some(HookOutput::Warn { text })
@@ -1200,6 +1206,29 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
 
 /// Each shown fact with the values it is anchored to, for the excerpt of
 /// where it fired (`deliver::record_delivery_around_anchors`).
+/// Where a PROMPT fired an item, for the log: "(prompt)" and the anchor or
+/// moment words of the item that this prompt matched - never the prompt's own
+/// text, which is the owner's and must not land in an append-only log (step 28).
+fn prompt_place(bindings: &[model::item::Binding], input: &ServeInput) -> String {
+    let mut words: Vec<String> = Vec::new();
+    for binding in bindings {
+        let word = match binding {
+            model::item::Binding::Moment(action) if input.moments.contains(action) => action.as_str().to_string(),
+            model::item::Binding::Target { kind, value } if input.targets.contains(&(*kind, value.clone())) => {
+                model::normalize::last_segment(&model::normalize::normalize_target(value)).to_string()
+            }
+            _ => continue,
+        };
+        if !words.contains(&word) {
+            words.push(word);
+        }
+    }
+    match words.is_empty() {
+        true => "(prompt)".to_string(),
+        false => format!("(prompt) {}", words.join(", ")),
+    }
+}
+
 fn anchors_of(shown: &[RankedItem]) -> Vec<(String, Vec<String>)> {
     shown
         .iter()
@@ -1426,7 +1455,7 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             // paid, and any other session owing there was told "held
             // elsewhere" for as long.
             if !is_subagent && !no_record {
-                release_lease_when_paid(db_path, &session_id, &payload);
+                release_lease_when_paid(db_path, &session_id);
             }
             let owed = match is_subagent || no_record {
                 true => None,
@@ -1735,86 +1764,18 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
         // What rides with whatever this Stop still says: the drift line and
         // the running-evaluation line.
         let riders: Vec<String> = drift_note.map(str::to_string).into_iter().chain(elsewhere_note).collect();
-        let with_drift = |reason: String| match riders.is_empty() {
-            true => reason,
-            false => format!("{}
 
-{reason}", riders.join("
-
-")),
-        };
-
-        // The one debt nobody ever pays voluntarily. Independent of the
-        // capture guard above it - that one can be switched off and usually
-        // is, and this must not go quiet with it. `stop_project` (resolved
-        // above for `crowding_debt`) is reused here for the identical reason:
-        // this session's own project right now, not just its own session_id.
-        //
-        // GATED ON `is_subagent`: `mark`'s own verdict is stamped with a
-        // session identity a subagent shares with its own main session (see
-        // this function's own doc comment, "WHY THIS IS A WATERMARK... AND
-        // NOT A FILTER ON THE MARK EVENT'S OWN session_id COLUMN"), so a
-        // subagent that pays this debt settles it under a name that reads,
-        // from the store's side, exactly like the owner's own verdict -
-        // without the owner ever having read the item himself. A false
-        // record like that is worse than the gap silence leaves, and the
-        // question is one the owner will never see asked or answered
-        // regardless, so holding a subagent's turn for it wastes a whole
-        // agent run. Agents among themselves are not held by this debt; it
-        // applies only to what is addressed to him.
-        // ONE HOLDER PER PROJECT (step 26): the judgement debt and the teeth
-        // question below are the PROJECT's debt, so only its holder is held
-        // for them (`serve::holder`); another session gets one line naming
-        // the holder - at most one such line per Stop, the evaluation's own
-        // "running in session X" line included.
-        let mut holder_note: Option<String> = None;
-        let debt_held_elsewhere = |holder_note: &mut Option<String>| -> bool {
-            let Some(line) = debt_holder_elsewhere(db_path, &session_id, stop_project.as_deref()) else { return false };
-            if riders.is_empty() && holder_note.is_none() {
-                *holder_note = Some(line);
-            }
-            true
-        };
-        if !is_subagent {
-            if let Some(reason) = serve::store_dir::open_existing(db_path)
-                .ok()
-                .and_then(|s| judgement_debt(&s, db_path, &session_id, stop_project.as_deref()))
-            {
-                if !debt_held_elsewhere(&mut holder_note) {
-                    claim_debt(db_path, &session_id, stop_project.as_deref(), no_record);
-                    return Some(HookOutput::Decision(
-                        serde_json::json!({ "decision": "block", "reason": with_drift(reason) }),
-                    ));
-                }
-            }
-        }
-
-        // The backlog burn: one fact per turn that LOOKS armable and has
-        // never been asked. Last of the debts on purpose - it is the only one
-        // with no urgency, and it must never speak over a mess made this
-        // session or a verdict that is owed. Still gated on `!is_subagent`,
-        // unchanged by today's fix: not one of the four debts it names, left
-        // exactly as it already stood.
-        // THE SESSION'S OWN GATES (step 21, C3 B2 L86): like the evaluation
-        // ask (F14, Q10), never a session's first Stop in the project, and
-        // only with ten minutes of its own work there - a short task session
-        // never answers for a backlog it did not touch.
-        if !is_subagent
-            && teeth_upkeep_may_hold(db_path, &session_id, stop_project.as_deref())
-            && !debt_held_elsewhere(&mut holder_note)
-        {
-            if let Some(reason) = serve::store_dir::open_existing(db_path)
-                .ok()
-                .filter(|_| teeth_not_yet_asked_this_session(db_path, &session_id))
-                .and_then(|s| teeth_debt(&s, db_path, stop_project.as_deref()))
-            {
-                record_teeth_asked(db_path, &session_id);
-                claim_debt(db_path, &session_id, stop_project.as_deref(), no_record);
-                return Some(HookOutput::Decision(
-                    serde_json::json!({ "decision": "block", "reason": with_drift(reason) }),
-                ));
-            }
-        }
+        // NO JUDGEMENT ASK AND NO RULE-UPKEEP ASK HERE (step 28). The owner's
+        // decision, 2026-10-02: "1x per sessie is meer dan voldoende" and
+        // "liever 1 blok dan random continu lopen zeuren - daar dient de eval
+        // voor". What used to hold a turn here - the items that fired
+        // repeatedly since they were last judged, and the rules the trial has
+        // not decided - is asked inside the project's evaluation only: its
+        // frozen judgement list, its batch and its A4 list (`serve::
+        // eval_session`), at most once per 16 hours per project. A Stop still
+        // holds for what is about the session's OWN doing (setup, a decision
+        // to capture, a fact it stored on a full place, a Response Guard
+        // block) and for the evaluation ask itself.
 
         // The stale-rule guard (`serve::stale_guard`) - AFTER both the
         // Response Guard above and Lane C's capture guard just above, on
@@ -1841,7 +1802,6 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
         if !is_subagent && !no_record {
             serve::holder::release(db_path, &session_id);
         }
-        let riders: Vec<String> = riders.into_iter().chain(holder_note).collect();
         let warn_text = match (warn_text, riders.is_empty()) {
             (Some(text), false) => Some(format!("{}\n\n{text}", riders.join("\n\n"))),
             (None, false) => Some(riders.join("\n\n")),
@@ -2074,8 +2034,11 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             // `capture_flag`'s own doc comment; every failure here is silent.
             // NEVER for a subagent (`payload_is_from_a_subagent`'s own doc
             // comment) - a subagent's own task prompt is not the owner
-            // stating anything.
-            if !payload_is_from_a_subagent(&payload) {
+            // stating anything - and never for a prompt that is another
+            // session's message, a hand-back or a task notification
+            // (`prompt::is_owners_own_text`, step 28): no decision of HIS is
+            // stated there either.
+            if !payload_is_from_a_subagent(&payload) && serve::prompt::is_owners_own_text(prompt_text) {
                 capture_flag(&store, db_path, &session_id, prompt_text);
             }
 
@@ -2110,13 +2073,10 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             // a local-command echo is not something the owner typed: its words
             // draw no facts here (a real tool call it leads to still does,
             // through its own command and file anchors). Only the owner's own
-            // typing also opens a new turn for the repeat limit.
+            // typing also draws facts.
             let reader = serve::repeat::key_for(&session_id, payload.get("agent_id").and_then(|v| v.as_str()));
             if !serve::prompt::is_owners_own_text(prompt_text) {
                 return eval_note.map(|block| HookOutput::Context { event_name, block, verdicts: Vec::new() });
-            }
-            if !payload_is_from_a_subagent(&payload) && !no_record {
-                serve::repeat::reset(db_path, &reader);
             }
 
             let candidates = serve::live::live_items(&store);
@@ -2128,28 +2088,33 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             let decay = DecayContext::load(&store);
             let all = serve::decay::retain_live(serve::rank::select(&candidates, &input), &decay);
             let arranged = serve::repeat::arrange(db_path, &reader, &all, !no_record);
+            if !no_record {
+                serve::volume::record_showing(db_path, &session_id, &arranged.displayed_ids(), arranged.suppressed);
+            }
             let selection = arranged.selection;
-            let rendered = render::render_text_with_reminders(&selection, &arranged.reminders, &input, db_path);
+            let rendered = render::render_text(&selection, &input, db_path);
             let block = match (rendered, eval_note) {
                 (Some(rendered), Some(note)) => format!("{note}\n\n{rendered}"),
                 (Some(rendered), None) => rendered,
                 (None, Some(note)) => return Some(HookOutput::Context { event_name, block: note, verdicts: Vec::new() }),
                 (None, None) => return None,
             };
-            let ids: Vec<String> = selection.shown.iter().map(|r| r.id.clone()).collect();
-            // The place a prompt fired an item is the prompt itself: its first
-            // words, on one line (step 27, D9), where it used to be blank.
+            // The place a prompt fired an item is "(prompt)" and the anchor or
+            // moment word that matched - never the owner's own words: the log
+            // is append-only and keeps no prompt text (step 28).
             if !no_record {
-                let head: String = prompt_text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(100).collect();
-                deliver::record_delivery_with_trigger(
-                    &mut store,
-                    &session_id,
-                    &session_id,
-                    actor,
-                    &time::now_iso8601(),
-                    &ids,
-                    Some(&format!("prompt: {head}")),
-                );
+                for ranked in &selection.shown {
+                    let place = prompt_place(&ranked.item.bindings, &input);
+                    deliver::record_delivery_with_trigger(
+                        &mut store,
+                        &session_id,
+                        &session_id,
+                        actor,
+                        &time::now_iso8601(),
+                        std::slice::from_ref(&ranked.id),
+                        Some(&place),
+                    );
+                }
             }
             // No `verdicts` here either, for the identical reason session
             // start carries none: a raw prompt is neither a proposed command
@@ -2333,13 +2298,16 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                     break 'served sink_warning.map(|block| HookOutput::Context { event_name, block, verdicts: Vec::new() });
                 }
                 let served = serve::serve(&store, &input);
-                // WHAT THIS READER HAS NOT SEEN TWICE YET (step 27): a fact
-                // already shown in full twice to this session or subagent
-                // comes as one line, then not at all. Display only - every
-                // refusal above ran before this and does not know of it.
+                // WHAT THIS CONTEXT HAS NOT SEEN YET (step 27, one showing
+                // since step 28): a fact already shown in full to this
+                // session or subagent is not shown again. Display only -
+                // every refusal above ran before this and does not know of it.
                 let reader = serve::repeat::key_for(&session_id, payload.get("agent_id").and_then(|v| v.as_str()));
                 let arranged = serve::repeat::arrange(db_path, &reader, &served.all, !no_record);
-                let rendered = render::render_text_with_reminders(&arranged.selection, &arranged.reminders, &input, db_path);
+                if !no_record {
+                    serve::volume::record_showing(db_path, &session_id, &arranged.displayed_ids(), arranged.suppressed);
+                }
+                let rendered = render::render_text(&arranged.selection, &input, db_path);
                 let block = match (sink_warning, rendered) {
                     (Some(warning), Some(rendered)) => Some(format!("{warning}\n\n{rendered}")),
                     (Some(warning), None) => Some(warning),
@@ -2348,7 +2316,7 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                 };
                 let Some(block) = block else { break 'served None };
                 // Only a fact shown IN FULL is a serving (and so can owe a
-                // judgement): a one-line reminder carries nothing new - the
+                // judgement): a repeat that was left out is not one - the
                 // recording below takes `arranged.selection.shown` alone.
                 // THE ONE SURFACE WHERE `verdicts` IS EVER REAL: the moment of
                 // action, the only one of the three hook events that proposes an
@@ -2624,238 +2592,7 @@ fn session_watermark(db_path: &Path, session_id: &str) -> Option<i64> {
     marks.get(session_id).copied()
 }
 
-/// The crowded facts THIS session wrote and has not dealt with.
 ///
-/// WHY THIS IS FORCED AND THE EVALUATION IS NOT. The write response already
-/// says "this may well never be shown there" the moment somebody stores a fact
-/// onto a full pool. Saying it was not enough: measured across two real
-/// sessions, the note was reported and then left alone, and the fact stayed
-/// invisible. A maintenance step that depends on somebody remembering is the
-/// same shape as the useful-mark was before it was fixed - it works exactly as
-/// often as people feel like it.
-///
-/// So this holds the turn, like the judgement debt does, and for the same
-/// reason: it is the only thing that ever produced maintenance. It is asked
-/// BEFORE that older debt because this answer decays - the person who wrote
-/// the fact still knows what it was for, and tomorrow nobody does.
-///
-/// WHAT "THIS SESSION" MEANS HERE, AND WHY IT IS NOT THE SESSION ID. A first
-/// version filtered events on `session_id` and was UNREACHABLE in real use:
-/// every write through the tool server is stamped with the constant "mcp"
-/// (`mcp::SESSION_ID`), never the caller's own session, so the Stop hook -
-/// which does know the real one - matched nothing and the debt never fired.
-/// Its unit tests passed because they handed the same id to both sides. Found
-/// by a real session running the test end to end and reporting that step 2
-/// simply did not block. (Since step 12 the tool server stamps a write with
-/// its `CLAUDE_CODE_SESSION_ID` when it has one - a hint fixed when the server
-/// started, still "mcp" without one - so the watermark stays the boundary.)
-///
-/// So the boundary is a WATERMARK: the store's tip as it stood when this
-/// session started (`session_watermark`). Anything written above it was
-/// written during this session, whoever stamped it.
-///
-/// Beyond that watermark it holds no state. `capacity` is a pure function of
-/// the store as it stands now, so the debt clears by construction the moment
-/// the fact is folded away, re-anchored somewhere with room, or retracted.
-///
-/// It only ever asks about what THIS session made. A session that stores
-/// nothing never sees it, and it never becomes a backlog nag about older mess.
-/// THE THING THE OWNER ASKED FOR THREE DAYS RUNNING, and did not have until
-/// 2026-08-09: the system finding, by itself, which facts deserve to reach the
-/// gate.
-///
-/// The write gate asks its question of every heavy rule at the door. That
-/// covers what is written from now on, and it covered the backlog exactly once
-/// - in a sweep somebody had to decide to run. Everything else in the store
-/// stayed as it was, and nothing was ever going to look at it again. "Ask when
-/// somebody happens to touch it" is not a mechanism; it is a hope.
-///
-/// So this walks the whole store, every turn, and holds the turn on ONE rule
-/// that names something concrete in its own text and has never been asked. It
-/// does not decide the answer - that needs judgement, and the answer "there is
-/// nothing to catch here" is a real answer. It decides WHO GETS ASKED, which
-/// was the part that depended on somebody remembering.
-///
-/// Deliberately last among the debts and deliberately one at a time: this is a
-/// backlog with hundreds in it, and a burn that never stops beats a sweep that
-/// happens once.
-/// Where the backlog burn remembers whose turn it already took.
-fn teeth_asked_path(db: &Path) -> std::path::PathBuf {
-    db.parent().unwrap_or_else(|| Path::new(".")).join("teeth-asked.json")
-}
-
-/// ONCE per session, never once per turn.
-///
-/// THE DEFECT THIS PREVENTS, caught the same evening it was built: with 348
-/// unanswered rules in the store, a per-turn debt is not a slow burn, it is a
-/// wall - every single turn ends held, forever, and the only way to work is to
-/// stop believing the debts. A maintenance nudge that makes the tool unusable
-/// gets switched off, and then it protects nothing at all.
-fn teeth_not_yet_asked_this_session(db: &Path, session_id: &str) -> bool {
-    let Ok(text) = std::fs::read_to_string(teeth_asked_path(db)) else { return true };
-    !text.lines().any(|line| line.trim() == session_id)
-}
-
-/// Best effort, like every sidecar here: a sidecar that cannot be written
-/// means the burn asks again next turn, never that a turn breaks.
-fn record_teeth_asked(db: &Path, session_id: &str) {
-    let path = teeth_asked_path(db);
-    let mut text = std::fs::read_to_string(&path).unwrap_or_default();
-    text.push_str(session_id);
-    text.push('\n');
-    // Keep the tail only: this file is a set of recent sessions, not history.
-    let kept: Vec<&str> = text.lines().rev().take(200).collect();
-    let trimmed: String = kept.into_iter().rev().collect::<Vec<_>>().join("\n");
-    let _ = serve::store_dir::write(&path, format!("{trimmed}\n"));
-}
-
-/// How many unanswered rules one turn is asked about at once.
-///
-/// WHY A BATCH, since 2026-08-14. One per session is a burn that never
-/// finishes: measured that day at 336 waiting, which is one a day for the
-/// better part of a year, while the answer to each is usually one sentence.
-/// The judgement debt had exactly this shape and exactly this fix. Five, not
-/// all of them: the wall this is deliberately not is a debt that hands over
-/// 336 rules and ends every turn until they are gone.
-const TEETH_DEBT_BATCH_MAX: usize = 5;
-
-/// SCOPED TO THE CHECKOUT'S OWN PROJECT, the same rule `judgement_debt` and
-/// `crowding_debt` already apply: `current_project` is the project THIS
-/// checkout resolves to, `None` for "no project" (global-only); an item with
-/// no project of its own is global and reaches every checkout regardless
-/// (`project::applies_to`, this file's one shared rule for it).
-///
-/// THE DEFECT THIS CLOSES. Before this parameter existed, this function took
-/// only `store` and walked EVERY live candidate in the whole store with
-/// nothing anywhere in its filter chain naming a project - confirmed by
-/// reading its own signature - and was measured firing exactly that way,
-/// unscoped, during a real proof run. That is the identical unanswerable
-/// question `judgement_debt` was fixed for on 2026-09-07/08 and
-/// `crowding_debt` on 2026-08-14: asking THIS session to arm or dismiss a
-/// rule that belongs to a checkout it is not even sitting in.
-///
-/// TWO THINGS THIS DELIBERATELY DOES NOT ALSO COPY FROM `judgement_debt`'s
-/// OWN 2026-09-08 FIX, AND WHY.
-///
-/// NOT "only what this session actually saw fire" (`served_ids_in_session`).
-/// That filter is right for a debt asking "you just saw this happen, judge
-/// it" - it is wrong for this one, whose entire reason to exist is the
-/// opposite: see `teeth_asked_path`'s own doc comment above ("this walks the
-/// whole store, every turn... a backlog with hundreds in it, and a burn that
-/// never stops beats a sweep that happens once"). A rule nobody has asked
-/// about in months, that no session happens to re-trigger, is exactly what
-/// this debt was built to surface BECAUSE no session ever sees it fire on
-/// its own; scoping it to "seen this session" would silence it for
-/// precisely the backlog it exists to burn down.
-///
-/// NOT a per-item floor in place of the existing per-session one
-/// (`teeth_not_yet_asked_this_session` / `record_teeth_asked`, "ONCE per
-/// session, never once per turn"). That gate is already STRICTER than a
-/// per-item floor: once this debt has asked at all this session, it asks
-/// nothing more this session, about any item, answered or not. Loosening it
-/// to per-item would let a fresh batch of newly-eligible ids reopen the
-/// block later the same session - reintroducing the exact "every single turn
-/// ends held, forever" wall its own 2026-08-14 fix closed.
-///
-/// SETTLED BY THE ONE READER (step 9). A rule leaves this debt exactly when
-/// `model::store::settlement` calls it settled - the same answer the
-/// evaluation-filing gate and doctor read: a current verdict from THOR's
-/// trial (rule track or note), or a machine blocker while it holds (a file
-/// check of a project with no usable registered working copy - never named
-/// here, because nothing the agent runs can settle it, F9). A tag, a reason,
-/// an open point, a refusal on record or a probe settles nothing. Every
-/// live rule and orientation counts, whatever its weight (D8): lowering a
-/// severity changes the fingerprint, so it is owed again.
-///
-/// The demand names the one command that settles it: `serve retest --id
-/// <id>` (with `--db`), then the same with `--apply`.
-///
-/// ROTATES, so a fix-nothing session does not see the same five forever
-/// (2026-09-26): measured on a copy of a real store, this named the same five
-/// lowest ids at every session start in a project with nearly a hundred
-/// waiting, because it sorted by id alone. Now the ones asked about least
-/// often come first (`teeth_items_asked_counts`, a sidecar beside the store),
-/// then the heaviest, then the ones that fired most since their last verdict.
-fn teeth_debt(store: &EventStore, db_path: &Path, current_project: Option<&str>) -> Option<String> {
-    let fired = usefulness::served_since_last_verdict(store);
-    let asked = teeth_items_asked_counts(db_path);
-    // (asked count, severity rank, fired count, id, why it is owed)
-    let mut candidates: Vec<(usize, u8, usize, String, String)> = Vec::new();
-    for li in serve::live::live_items(store) {
-        if !li.item.kind.can_fire() || !project::applies_to(li.item.project.as_deref(), current_project) {
-            continue;
-        }
-        let model::store::Settlement::Owed { why } = model::store::settlement(store, &li.id, None) else { continue };
-        let count = fired.get(&li.id).copied().unwrap_or(0);
-        candidates.push((
-            asked.get(&li.id).copied().unwrap_or(0),
-            model::item::severity_rank(li.item.severity),
-            count,
-            li.id,
-            why,
-        ));
-    }
-    if candidates.is_empty() {
-        return None;
-    }
-    candidates.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(b.2.cmp(&a.2)).then(a.3.cmp(&b.3)));
-    let batch_len = candidates.len().min(TEETH_DEBT_BATCH_MAX);
-    let left = candidates.len() - batch_len;
-    let mut items_block = String::new();
-    for (_, _, _, id, why) in candidates.iter().take(TEETH_DEBT_BATCH_MAX) {
-        items_block.push_str(&format!("\n- '{id}': {why}. Run: {}", model::store::retest_command_for(Some(db_path), id)));
-    }
-    record_teeth_items_asked(db_path, candidates.iter().take(TEETH_DEBT_BATCH_MAX).map(|c| c.3.as_str()));
-    let left_note = if left > 0 {
-        format!(" {left} more are waiting behind this batch; the next session is asked about others first.")
-    } else {
-        String::new()
-    };
-    Some(format!(
-        "[THOR] {batch_len} rule(s) have no current verdict from THOR's trial - listed below, each with why and the \
-         command that decides it. For each one: run the command shown. It prints the registered working copy it \
-         used, every form it tried, and its verdict - a rule, a note, or the one fix you have to make yourself. When \
-         it says rule track or note, run the same command again with --apply to write that verdict. When it names a \
-         fix, make it (for example revise the text to name the literal, or hang the tooth it names), then run it \
-         again. mcp__thor__revise with only the rule's id runs the same trial too. Retract a rule, saying what \
-         changed about it, if it is simply wrong. A tag, a reason, an open point or a refusal on record settles \
-         nothing.{left_note}{items_block}"
-    ))
-}
-
-/// Where `teeth_debt` keeps how often it has named each rule - beside the
-/// store, one id per line, newest last. Its own file, never `teeth-asked.json`
-/// (that one is the once-per-session gate and holds session ids).
-fn teeth_items_asked_path(db: &Path) -> std::path::PathBuf {
-    db.parent().unwrap_or_else(|| Path::new(".")).join("teeth-asked-items.txt")
-}
-
-/// How often each rule has been named by `teeth_debt`, from its sidecar. An
-/// unreadable sidecar reads as "never asked", which only changes the order.
-fn teeth_items_asked_counts(db: &Path) -> std::collections::HashMap<String, usize> {
-    let mut counts = std::collections::HashMap::new();
-    if let Ok(text) = std::fs::read_to_string(teeth_items_asked_path(db)) {
-        for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
-            *counts.entry(line.to_string()).or_insert(0) += 1;
-        }
-    }
-    counts
-}
-
-/// Best effort, like every sidecar here. Keeps the newest 2000 lines: enough
-/// history to rotate through a backlog of hundreds, never an unbounded file.
-fn record_teeth_items_asked<'a>(db: &Path, ids: impl Iterator<Item = &'a str>) {
-    let path = teeth_items_asked_path(db);
-    let mut text = std::fs::read_to_string(&path).unwrap_or_default();
-    for id in ids {
-        text.push_str(id);
-        text.push('\n');
-    }
-    let lines: Vec<&str> = text.lines().collect();
-    let kept = &lines[lines.len().saturating_sub(2000)..];
-    let _ = serve::store_dir::write(&path, format!("{}\n", kept.join("\n")));
-}
-
 /// Does this item ACTUALLY reach a block at one of its own bindings, as the
 /// real ranker decides it?
 ///
@@ -2935,6 +2672,45 @@ fn written_by_a_session_write(event: &thor_core::event_store::Event, session_id:
     matches!(event.session_id.as_str(), "mcp" | "cli") || event.session_id == session_id
 }
 
+/// The crowded facts THIS session wrote and has not dealt with.
+///
+/// WHY THIS IS FORCED AND THE EVALUATION IS NOT. The write response already
+/// says "this may well never be shown there" the moment somebody stores a fact
+/// onto a full pool. Saying it was not enough: measured across two real
+/// sessions, the note was reported and then left alone, and the fact stayed
+/// invisible. A maintenance step that depends on somebody remembering is the
+/// same shape as the useful-mark was before it was fixed - it works exactly as
+/// often as people feel like it.
+///
+/// So this holds the turn, like the judgement debt does, and for the same
+/// reason: it is the only thing that ever produced maintenance. It is asked
+/// BEFORE that older debt because this answer decays - the person who wrote
+/// the fact still knows what it was for, and tomorrow nobody does.
+///
+/// WHAT "THIS SESSION" MEANS HERE, AND WHY IT IS NOT THE SESSION ID. A first
+/// version filtered events on `session_id` and was UNREACHABLE in real use:
+/// every write through the tool server is stamped with the constant "mcp"
+/// (`mcp::SESSION_ID`), never the caller's own session, so the Stop hook -
+/// which does know the real one - matched nothing and the debt never fired.
+/// Its unit tests passed because they handed the same id to both sides. Found
+/// by a real session running the test end to end and reporting that step 2
+/// simply did not block. (Since step 12 the tool server stamps a write with
+/// its `CLAUDE_CODE_SESSION_ID` when it has one - a hint fixed when the server
+/// started, still "mcp" without one - so the watermark stays the boundary.)
+///
+/// So the boundary is a WATERMARK: the store's tip as it stood when this
+/// session started (`session_watermark`). Anything written above it was
+/// written during this session, whoever stamped it.
+///
+/// Beyond that watermark it holds no state. `capacity` is a pure function of
+/// the store as it stands now, so the debt clears by construction the moment
+/// the fact is folded away, re-anchored somewhere with room, or retracted.
+///
+/// It only ever asks about what THIS session made. A session that stores
+/// nothing never sees it, and it never becomes a backlog nag about older mess.
+/// THE THING THE OWNER ASKED FOR THREE DAYS RUNNING, and did not have until
+/// 2026-08-09: the system finding, by itself, which facts deserve to reach the
+/// gate.
 fn crowding_debt(
     store: &EventStore,
     db_path: &Path,
@@ -3032,327 +2808,6 @@ fn crowding_debt(
         ));
     }
     None
-}
-
-// The threshold itself, and the fold that counts firings-since-last-verdict,
-// moved to `serve::usefulness` (2026-09-08, value and behaviour unchanged) so
-// `ops::health`'s own doctor line can be built on the exact same numbers this
-// hook acts on instead of a second copy silently drifting from them - see
-// `usefulness::JUDGEMENT_DEBT_AFTER` and `usefulness::served_since_last_verdict`
-// for the full "SINCE its last verdict" reasoning. Imported under its old bare
-// name so every reference below (this file's own tests included) is unchanged.
-use usefulness::JUDGEMENT_DEBT_AFTER;
-
-/// How many owed items one blocked Stop asks about at once. Unbounded would
-/// just move the problem this exists to fix (see `judgement_debt`'s own doc
-/// comment) into a single enormous block instead of many small ones; this
-/// keeps each block itself bounded while still settling the common case (a
-/// handful owed) in one round instead of one Stop per id.
-const JUDGEMENT_DEBT_BATCH_MAX: usize = 20;
-
-/// Ask for a verdict on ONE item that has fired over and over and has never
-/// once been judged, or nothing.
-///
-/// WHY THIS ONE IS ALLOWED TO BLOCK WHEN THE CAPTURE GUARD IS NOT. The
-/// capture guard has to decide whether a piece of prose stated a durable
-/// decision - a judgement, measured on a blind hold-out at 55% catch and
-/// 11.4% FALSE blocks, and recorded as not deployable. This decides nothing:
-/// the log knows exactly how often an item was served and whether a verdict
-/// ever came back. A false block is not merely unlikely here, it is not
-/// expressible.
-///
-/// It terminates by construction. Claude Code sets `stop_hook_active` on the
-/// Stop that follows a block, and this whole arm returns early on that, so
-/// the ask happens at most once per turn and cannot loop. A verdict buys
-/// quiet, not immunity: the count resets, and another `JUDGEMENT_DEBT_AFTER`
-/// firings earn another question. This comment used to say a judged item was
-/// never asked about again, by anyone, forever - which was true of the
-/// lifetime judged-set it once held, and stopped being true the same day the
-/// fold below started counting since the last verdict.
-///
-/// `mark` is the only thing in this system that ever retires noise - a
-/// serving count decides nothing, and silence decides nothing either (see
-/// `serve::decay`). Without a verdict the loop simply never runs, which is
-/// where this store stood for its whole life: four judgements, all on one
-/// day, out of 325 items that had fired.
-///
-/// A PINNED ITEM OWES NO VERDICT - reversed back, 2026-09-12, from the
-/// inclusion defended below the line, which held from 2026-09-08 until
-/// today. That inclusion was a defensible fix for a real defect (kept below,
-/// in full), but it created a sharper one: `serve::decay::DecayContext::
-/// is_stale` already ignores every verdict on an `Always`-bound item
-/// outright ("an Always-bound item is NEVER stale... it is what Always
-/// means"), so a verdict recorded here changes NOTHING anywhere else in the
-/// system - asking for one is pure waste, not caution. Measured the day this
-/// reversed: the named judgement-debt list carried more than thirty
-/// `Always`-bound items, two of them pinned by the owner on purpose, and a
-/// whole evaluation was spent judging every one of them for nothing.
-///
-/// THE DEFECT THE INCLUSION BELOW WAS REALLY FIXING, kept because it is still
-/// true and still matters. Before 2026-09-08 this excluded every
-/// `Always`-bound item outright, and the blanket exclusion was measured
-/// never to let go again: `doctor` (`ops::health::pinned_line`) went on to
-/// report "48 pinned facts (14% of all servings) never re-read" and "44 of
-/// 48 never reviewed" - every one of them permanently outside the one
-/// mechanism (`mark`) that ever puts a verdict on a fact at all. That
-/// measurement still stands, and `pinned_line` still reports it. What was
-/// wrong was the fix, not the diagnosis: nothing downstream of a verdict
-/// recorded here was ever going to read it, because `is_stale` exempts
-/// `Always` unconditionally, so manufacturing a question here answered
-/// nothing real. The actual fix for a stale or wrong pin is the owner
-/// reading `pinned_line`'s own report and revising or unpinning what it
-/// names - not this debt asking a question whose answer changes nothing.
-///
-/// So a pin is excluded again below, through the exact same shared test
-/// (`usefulness::is_pinned`) that `usefulness::owed_items` - the fold
-/// `judgement_debt_counts`/`judgement_debt_named` build doctor's own lines
-/// on - now filters on too: one predicate, both places, so the Stop-time ask
-/// and doctor's judgement-debt line can never again silently disagree about
-/// what "owed" means the way they did for these four days.
-///
-/// THE INCLUSION THIS REVERSES, kept in full rather than deleted, since it
-/// answers a question a future change here will otherwise ask again: why
-/// not simply restore the pre-2026-09-08 blanket exclusion unchanged? A pin
-/// still records only a PLACEMENT decision ("this fires at every session
-/// start"), never a CONTENT one ("this is still right") - nineteen of the
-/// first forty-two owed items were pinned ones, found by trying to pay one,
-/// and asking "did it belong where it fired" about something the owner
-/// already placed by hand looked unanswerable: "useful" a lie when the rule
-/// simply did not come up, "noise" overruling his own decision. That
-/// reasoning is exactly why an item pinned but never yet judged did, for
-/// those four days, get offered exactly one verdict rather than none at
-/// all - and it is why this doc comment keeps that history rather than
-/// erasing it: the two defects (a pin nobody ever revisits; a verdict here
-/// that changes nothing) are both real, and the fix for the second must not
-/// quietly resurrect the first. `pinned_line`'s own report is that fix -
-/// visibility without a manufactured, inert verdict.
-///
-/// ASKS ABOUT THE WHOLE OWED SET IN ONE BLOCK, up to
-/// `JUDGEMENT_DEBT_BATCH_MAX`, not one item per Stop. Unpinning a batch of
-/// long-pinned items (see `serve unpin`) makes all of them owed at once -
-/// each carried a large lifetime serving count from its time as `Always`,
-/// which crosses `JUDGEMENT_DEBT_AFTER` the moment the pin comes off - and a
-/// long conversation pays the FULL conversation history again on every Stop
-/// it takes to answer, one id per turn. Measured 2026-08-13: five separate
-/// one-item Stops to judge a backlog that batching would have settled in
-/// one. The termination property is unchanged: still one block per Stop
-/// (`stop_hook_active` still short-circuits the retry), still one verdict
-/// call per id, just several ids asked about in that single block instead of
-/// a queue paid out one Stop at a time.
-fn judgement_debt(store: &EventStore, db_path: &Path, session_id: &str, current_project: Option<&str>) -> Option<String> {
-    // Servings SINCE the last verdict, not servings ever: a judgement resets
-    // its item's count to zero rather than removing it from the question
-    // forever. Shared with `ops::health`'s own doctor line (2026-09-08) as
-    // `usefulness::served_since_last_verdict` - see that function's own doc
-    // comment; it is the same fold `usefulness::noise_since_last_useful`
-    // performs on the other side of the same doctrine.
-    let served = usefulness::served_since_last_verdict(store);
-    // Deterministic: the most-served unjudged item, ties broken by id, so a
-    // session that ignores the ask is asked the same thing next time rather
-    // than being walked through a random tour of the backlog.
-    let mut owed: Vec<(String, usize)> = served
-        .into_iter()
-        .filter(|(_, n)| *n >= JUDGEMENT_DEBT_AFTER)
-        .collect();
-    if owed.is_empty() {
-        return None;
-    }
-    // Only now, and only when something is actually owed, is the whole live
-    // set even fetched - the empty case stays a cheap count over event
-    // kinds, which is what every quiet turn pays.
-    let live = serve::live::live_items(store);
-    // And only what is still LIVE. The served/judged counts are folded from
-    // event kinds, which keep every serving an item ever had, including the
-    // ones it had before somebody retracted it. So a retracted item stayed
-    // owed forever and could never be settled: the question is "did it belong
-    // where it fired", and there is no honest answer for something that is
-    // gone. Found the moment it bit, on 2026-08-08: merging 57 duplicates
-    // turned all 57 into permanent unanswerable asks, and the very next Stop
-    // asked about one of them by name.
-    //
-    // The same pass also builds the id -> project lookup the two filters
-    // below share - one fetch of `live`, not two.
-    let project_of: std::collections::HashMap<&str, Option<&str>> =
-        live.iter().map(|li| (li.id.as_str(), li.item.project.as_deref())).collect();
-    owed.retain(|(id, _)| project_of.contains_key(id.as_str()));
-    if owed.is_empty() {
-        return None;
-    }
-    // PINNED ITEMS EXCLUDED - see this function's own doc comment above,
-    // "A PINNED ITEM OWES NO VERDICT", for why. The same shared test
-    // `usefulness::owed_items` (the doctor-side fold) now filters on too, so
-    // the two can never again silently disagree about what "owed" means.
-    let pinned: std::collections::HashSet<&str> =
-        live.iter().filter(|li| usefulness::is_pinned(&li.item.bindings)).map(|li| li.id.as_str()).collect();
-    owed.retain(|(id, _)| !pinned.contains(id.as_str()));
-    if owed.is_empty() {
-        return None;
-    }
-    // And only what THIS session was actually served. A lifetime count says
-    // an item fired a hundred times; it says nothing about whether the
-    // reader being asked was ever in the room. A rule scoped to another
-    // project fires only there, so asking here produces the same
-    // unanswerable question the pinned ones did - found on 2026-08-07 by
-    // being asked about an acme-shop commit rule during work in thor-2.
-    let seen: std::collections::HashSet<String> =
-        store.served_ids_in_session(session_id).unwrap_or_default().into_iter().collect();
-    owed.retain(|(id, _)| seen.contains(id));
-    if owed.is_empty() {
-        return None;
-    }
-    // THE DEFECT THIS CLOSES, measured 2026-09-07/08: `seen` above proves
-    // this literal session_id served the item at SOME point in its own
-    // life, never that it did so while working on what this turn is
-    // actually about. A session_id is not scoped to one project - the same
-    // one can carry a long history across many checkouts (this workspace's
-    // own orchestrator pattern, CLAUDE.md's "Orchestrator mode", is exactly
-    // this shape on purpose) - so a session that spent part of its life in
-    // another project's directory can still show up in that project's own
-    // `served_ids_in_session`, and `seen` alone would let one of its items
-    // back in here once this session moved on to a different checkout. That
-    // is a session honestly being unable to judge something it saw fire
-    // somewhere else entirely - a business-repo fact nagging a THOR-dev
-    // turn, the exact shape `crowding_debt` (below) was already fixed for on
-    // 2026-08-14 ("a business-repo fact nagged a THOR-dev session twice").
-    // `judgement_debt` never got that companion filter until now.
-    // `project::applies_to` draws the line the same way every real injection
-    // surface already does (`rank::select`, `session_start::select`): an
-    // item with no project is global and always in scope; one with a
-    // project is in scope only for that project's own checkout.
-    owed.retain(|(id, _)| project::applies_to(project_of[id.as_str()], current_project));
-    if owed.is_empty() {
-        return None;
-    }
-    // THE DEFECT THIS CLOSES, reported by the owner and recorded as
-    // `oordeelschuld-komt-binnen-de-sessie-terug` (2026-09-08): measured in a
-    // real session, the Stop hook asked for a verdict on the same items
-    // three separate times, each only minutes after they had just been
-    // judged - four of eight items in one such round had already been
-    // marked useful earlier in that very session. Every filter above still
-    // reads the count SINCE THE LAST VERDICT, with no floor in time or in
-    // turns, so a pinned or often-touched item crosses `JUDGEMENT_DEBT_AFTER`
-    // again within minutes in a busy session where nearly every tool call
-    // serves it - the verdict is asked, given, and immediately asked again.
-    // For a new user that reads as nagging, and the honest answer stops
-    // being read.
-    //
-    // WHY THIS IS A WATERMARK AND NOT A FILTER ON THE MARK EVENT'S OWN
-    // `session_id` COLUMN, THE WAY `seen` ABOVE READS `item_served` BACK.
-    // Every event carries a `session_id`, but a verdict recorded the way a
-    // real session actually records one - calling the `mark` tool - is
-    // stamped by the tool server with the shared constant `mcp::SESSION_ID`
-    // ("mcp"), never the caller's own Claude Code session id; `serve mark`'s
-    // own CLI path stamps a second shared constant, "cli" (`cmd_mark`
-    // below). A filter keyed on that column would compare this turn's real
-    // session id against a literal no verdict ever actually carries, match
-    // nothing, and silently do nothing at all - the identical shape
-    // `crowding_debt` (below) was already bitten by and fixed for on
-    // 2026-08-14: "every write through the tool server is stamped with the
-    // constant 'mcp'... never the caller's own session, so the Stop hook -
-    // which does know the real one - matched nothing and the debt never
-    // fired." This reuses that exact fix rather than repeating the mistake:
-    // a WATERMARK, recorded at SessionStart (`record_session_watermark`,
-    // which DOES see the real session id, since Claude Code's own
-    // SessionStart payload carries it) - "was this id marked, useful or
-    // noise, at a later position in the log than where this session
-    // started" - true regardless of which literal a verdict happened to be
-    // stamped with, because it never reads that column at all. (Since step
-    // 12 the tool server stamps a verdict with its session hint when it has
-    // one, still "mcp" without one; and only an ATTESTED verdict counts here,
-    // see `judged_since`.)
-    //
-    // `session_watermark` returning `None` (no SessionStart was ever seen
-    // for this session id - an old install, a hook that failed to write, or
-    // `resolve_session_id`'s own synthetic fallback) fails OPEN: this filter
-    // is simply skipped rather than guessed at, the same stance
-    // `crowding_debt` already takes on a missing watermark of its own.
-    // Nothing about the threshold or the "since last verdict" fold changes -
-    // a session that ends and comes back later, or a different session
-    // entirely, is asked about the very same item the moment it is next
-    // owed, because `served` above never stopped counting underneath this
-    // filter; only asking AGAIN, from the session whose own watermark the
-    // verdict already falls after, is what stops.
-    if let Some(watermark) = session_watermark(db_path, session_id) {
-        owed.retain(|(id, _)| !judged_since(store, id, watermark));
-        if owed.is_empty() {
-            return None;
-        }
-    }
-    owed.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    let total_owed = owed.len();
-    let batch_len = total_owed.min(JUDGEMENT_DEBT_BATCH_MAX);
-    let mut items_block = String::new();
-    // WHERE IT FIRED IN THIS SESSION (step 24): its last distinct places here,
-    // the same lines the evaluation's start note shows.
-    let batch_ids: Vec<String> = owed.iter().take(JUDGEMENT_DEBT_BATCH_MAX).map(|(id, _)| id.clone()).collect();
-    let fired_here = model::store::session_firings(store, session_id, &batch_ids, i64::MAX);
-    for (id, count) in owed.iter().take(JUDGEMENT_DEBT_BATCH_MAX) {
-        let text = model::store::show(store, id).ok().map(|i| i.text).unwrap_or_default();
-        if let Some(fired) = fired_here.get(id).filter(|f| !f.triggers.is_empty()) {
-            let places = fired.triggers.iter().map(|t| format!("'{t}'")).collect::<Vec<_>>().join(" | ");
-            items_block.push_str(&format!(
-                "\n- '{id}' ({count}x since last judged, if ever; {} time(s) in this session, last at {places}): {text} \
-                 [check it is still true first]",
-                fired.count
-            ));
-            continue;
-        }
-        // ", last fired at '<trigger>'" - the same clause `ops::health::
-        // judgement_debt_line`'s own named list prints, and trivial to add
-        // here once `model::served::last_trigger` existed for that line to
-        // call: an evaluation judging "did it belong where it fired" needs
-        // the place, not only the binding, and this is the live Stop-time
-        // ask, not only the cold `doctor` report.
-        let last_fired = match model::served::last_trigger(store, id) {
-            Some(trigger) => format!(", last fired at '{trigger}'"),
-            None => String::new(),
-        };
-        // CHECK TRUTH FIRST on every line (step 26): field test 2 saw ten
-        // verdicts in five seconds with no look at whether each still held.
-        items_block.push_str(&format!("\n- '{id}' ({count}x since last judged, if ever){last_fired}: {text} [check it is still true first]"));
-    }
-    let held_back = total_owed - batch_len;
-    let held_back_note = if held_back > 0 {
-        format!(" {held_back} more beyond this batch will follow on a later turn.")
-    } else {
-        String::new()
-    };
-    Some(format!(
-        "[THOR] {batch_len} item(s) have fired repeatedly since they were last judged, if ever - listed below. Judge ALL {batch_len} before ending the turn: call mark once per id, noise:true if it did not belong where it fired, or plain if it helped.{held_back_note} FIRST look at whether each is still TRUE - if the code or the file says otherwise, revise it against what you can see there; that is a repair, not noise, and marking it noise would leave a wrong fact in place. Two noise judgements since the last mark of usefulness retire an item from every injection surface while leaving it findable; a mark of usefulness clears the noise recorded before it, and a noise mark recorded after it still counts. Nothing else in this system ever retires noise - a serving count decides nothing and silence decides nothing.{items_block}"
-    ))
-}
-
-/// Has `id` received an ATTESTED verdict (useful or noise, either one) at a
-/// strictly later position in the log than `after_seq`? See
-/// `judgement_debt`'s own doc comment on its watermark check for why this
-/// reads log POSITION rather than a verdict's own `session_id` column.
-///
-/// ONLY AN ATTESTED VERDICT COUNTS HERE (step 12, D9), exactly as in
-/// `usefulness::served_since_last_verdict`: a verdict whose recorded
-/// verification (the `attester` record on the same item, written at a Stop)
-/// says it was made through an attested THOR call. Measured before this: a
-/// `serve mark` typed into a shell after the session's start left the count
-/// owed, yet silenced the ask for the rest of the session through this floor.
-///
-/// An indexed per-id read (`EventStore::get_events_by_entity`,
-/// `idx_event_entity`) rather than `crowding_debt`'s own `get_all_events`
-/// scan of the whole log: `judgement_debt` only ever reaches this for the
-/// handful of ids still standing after every earlier filter, so paying per
-/// id here is cheaper than paying for every event on the log on every Stop
-/// that owes anything, and the store this was measured against holds well
-/// into five figures of events.
-fn judged_since(store: &EventStore, id: &str, after_seq: i64) -> bool {
-    let Ok(events) = store.get_events_by_entity(id) else { return false };
-    let verified = model::store::recorded_write_verdicts(&events);
-    events.iter().any(|e| {
-        e.seq > after_seq
-            && matches!(
-                e.kind,
-                thor_core::event_store::EventKind::ItemMarkedUseful
-                    | thor_core::event_store::EventKind::ItemMarkedNoise
-            )
-            && verified.get(&e.seq).is_some_and(|v| v.attested)
-    })
 }
 
 /// What a `Skill` (or `SlashCommand`) call opening the evaluation routine
@@ -3752,61 +3207,22 @@ fn routine_changed_lines(session_id: &str) -> String {
     serve::attest::routine_reread_lines(&command, &transcript).into_iter().map(|line| format!("{line}\n\n")).collect()
 }
 
-/// ONE HOLDER PER PROJECT (step 26): the line naming the session that holds
-/// `project`'s debt, when that is another session active within the idle
-/// window - this session is then not held for the project's debt. `None`:
-/// this session may be held (no project, no store, or it is the holder).
-/// A Stop that cannot hold again (`stop_hook_active`) frees the session's debt
-/// lease when the judgement debt it was held for is gone - see the call site.
-/// Reads only: nothing is released while anything is still owed.
-fn release_lease_when_paid(db_path: &Path, session_id: &str, payload: &Value) {
-    if !serve::holder::leases(db_path).values().any(|l| l.session == session_id) {
+/// A Stop that cannot hold again (`stop_hook_active`) frees the session's lease
+/// once the evaluation it was claimed for is no longer open: filed, voided or
+/// timed out (step 27, D5; since step 28 the evaluation is the only debt that
+/// claims one). Reads only: nothing is released while an evaluation of that
+/// project is still open in this session.
+fn release_lease_when_paid(db_path: &Path, session_id: &str) {
+    let leases = serve::holder::leases(db_path);
+    let mine: Vec<&String> = leases.iter().filter(|(_, l)| l.session == session_id).map(|(project, _)| project).collect();
+    if mine.is_empty() {
         return;
     }
-    let cwd = payload.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from).or_else(|| std::env::current_dir().ok());
-    let project = project::session_project(db_path, session_id, cwd.as_deref());
     let Ok(store) = serve::store_dir::open_existing(db_path) else { return };
-    if judgement_debt(&store, db_path, session_id, project.as_deref()).is_none() {
+    let now = time::now_unix();
+    if mine.iter().all(|project| model::store::open_evaluation_start_at(&store, session_id, project, now).is_none()) {
         serve::holder::release(db_path, session_id);
     }
-}
-
-fn debt_holder_elsewhere(db_path: &Path, session_id: &str, project: Option<&str>) -> Option<String> {
-    let project = project?;
-    let store = serve::store_dir::open_existing(db_path).ok()?;
-    match serve::holder::holder_of(&store, db_path, project, session_id, time::now_unix()) {
-        serve::holder::Holder::Me => None,
-        serve::holder::Holder::Other { session, idle_minutes, why } => {
-            Some(serve::holder::holder_line(project, &session, idle_minutes, why))
-        }
-    }
-}
-
-/// This session is held for `project`'s debt now: it takes the project's
-/// lease (step 26). Nothing for no project, or a hook run that records nothing.
-fn claim_debt(db_path: &Path, session_id: &str, project: Option<&str>, no_record: bool) {
-    if let (Some(project), false) = (project, no_record) {
-        serve::holder::claim(db_path, project, session_id, time::now_unix());
-    }
-}
-
-/// Whether the teeth question may hold this main session's Stop (step 21):
-/// the Stop was counted in `stop_project`, and the session passes the
-/// evaluation ask's own gates there (`usefulness::upkeep_may_hold` - ten
-/// minutes of its own work, not its first Stop). A Stop in no project holds
-/// nothing for rule upkeep, as it is never asked for an evaluation. The
-/// transcript is read only when the sidecar alone does not already pass:
-/// it can only add minutes and earlier turns.
-fn teeth_upkeep_may_hold(db_path: &Path, session_id: &str, stop_project: Option<&str>) -> bool {
-    let Some(project) = stop_project else { return false };
-    let state = usefulness::project_eval_state(db_path, Some(project));
-    if usefulness::upkeep_may_hold(&state, project, session_id, &[], true).is_ok() {
-        return true;
-    }
-    let timeline = serve::attest::transcripts_root()
-        .map(|root| serve::attest::session_timeline(&root, session_id))
-        .unwrap_or_default();
-    usefulness::upkeep_may_hold(&state, project, session_id, &timeline, true).is_ok()
 }
 
 /// What the Stop decided about the evaluation (step 17, `eval_stop_ask`).
@@ -4711,7 +4127,7 @@ mod setup_debt_tests {
 }
 
 #[cfg(test)]
-mod judgement_debt_tests {
+mod crowding_debt_tests {
     use super::*;
     use model::item::{Binding, Item, Kind};
 
@@ -5092,333 +4508,6 @@ mod judgement_debt_tests {
         );
     }
 
-    /// A rule as it exists in a store written BEFORE the gate started asking:
-    /// it names something concrete and carries no check. The gate refuses to
-    /// create one now, which is the point of the gate - so the only honest way
-    /// to test the backlog burn is to put a legacy row in directly, exactly as
-    /// the migration did.
-    fn legacy_unanswered(store: &mut EventStore, id: &str, text: &str) {
-        let mut item = crowded_newcomer(id, "p");
-        item.text = text.to_string();
-        // Heavy: since the 2026-09-25 rebuild, the backlog burn only ever
-        // owes a proof to the same population `serve::prove::teeth_box`
-        // does (heavy, or a refusing-kind check) - see `teeth_debt`'s own
-        // doc comment. `crowded_newcomer`'s own default (`severity: None`)
-        // would make every fixture below `NotApplicable` and silently stop
-        // testing anything.
-        item.severity = Some(model::item::Severity::Irreversible);
-        let body = serde_json::to_string(&item).unwrap();
-        store
-            .append_event("legacy", id, "migration", thor_core::event_store::EventKind::FactCreated, id, None, &body)
-            .unwrap();
-    }
-
-    /// Same legacy bypass as `legacy_unanswered` above, with an explicit
-    /// project (`None` for a global rule) instead of the fixed "p" - needed
-    /// to prove the backlog burn's own project scoping without touching the
-    /// write gate, which still refuses a NEW item shaped this way regardless
-    /// of project (see `legacy_unanswered`'s own doc comment).
-    fn legacy_unanswered_in_project(store: &mut EventStore, id: &str, text: &str, project: Option<&str>) {
-        let mut item = crowded_newcomer(id, "unused");
-        item.project = project.map(str::to_string);
-        item.text = text.to_string();
-        // See `legacy_unanswered`'s own comment just above: heavy, so Change
-        // 2's applicability gate actually reaches this fixture.
-        item.severity = Some(model::item::Severity::Irreversible);
-        let body = serde_json::to_string(&item).unwrap();
-        store
-            .append_event("legacy", id, "migration", thor_core::event_store::EventKind::FactCreated, id, None, &body)
-            .unwrap();
-    }
-
-    /// THE DEFECT THIS CLOSES: until `teeth_debt` took a project at all, a
-    /// rule scoped to one checkout was named to every OTHER checkout's
-    /// session too - the identical unanswerable question `judgement_debt`
-    /// and `crowding_debt` were already fixed for on their own debts.
-    #[test]
-    fn the_burn_never_names_another_checkouts_own_project() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("t.db");
-        let mut store = EventStore::new(&db).unwrap();
-        legacy_unanswered_in_project(
-            &mut store,
-            "acme-unarmed",
-            "Draai npm audit fix --force nooit op deze repo",
-            Some("acme"),
-        );
-        assert!(
-            teeth_debt(&store, &db, Some("acme")).is_some(),
-            "fixture sanity: it applies inside its own checkout"
-        );
-        assert!(
-            teeth_debt(&store, &db, Some("thor")).is_none(),
-            "a different checkout's project must never be asked about acme's own rule"
-        );
-        assert!(
-            teeth_debt(&store, &db, None).is_none(),
-            "a checkout that resolves to no project at all gets the global layer only"
-        );
-    }
-
-    /// A global rule (no project of its own) still reaches every checkout,
-    /// exactly as `project::applies_to` already promises every other real
-    /// injection surface.
-    #[test]
-    fn the_burn_still_names_a_global_rule_from_any_checkout() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("t.db");
-        let mut store = EventStore::new(&db).unwrap();
-        legacy_unanswered_in_project(
-            &mut store,
-            "global-unarmed",
-            "Draai npm audit fix --force nooit op deze repo",
-            None,
-        );
-        assert!(teeth_debt(&store, &db, Some("acme")).is_some(), "a global rule reaches acme's checkout");
-        assert!(teeth_debt(&store, &db, Some("thor")).is_some(), "and thor's checkout too");
-        assert!(teeth_debt(&store, &db, None).is_some(), "and a checkout with no project at all");
-    }
-
-    #[test]
-    fn the_burn_takes_one_turn_per_session_not_every_turn() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("t.db");
-        assert!(teeth_not_yet_asked_this_session(&db, "s1"), "a fresh session has not been asked");
-        record_teeth_asked(&db, "s1");
-        assert!(!teeth_not_yet_asked_this_session(&db, "s1"), "the same session must not be held again");
-        assert!(teeth_not_yet_asked_this_session(&db, "s2"), "a different session gets its own turn");
-    }
-
-    /// A rule with no verdict is found by the sweep itself, with nobody
-    /// pointing at it, and named with why it is owed (`settlement`'s own
-    /// reason) and the one command that decides it (step 9).
-    #[test]
-    fn a_heavy_checkless_rule_is_found_without_anybody_pointing_at_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("t.db");
-        let mut store = EventStore::new(&db).unwrap();
-        legacy_unanswered(&mut store, "names-a-flag", "Draai npm audit fix --force nooit op deze repo");
-
-        let asked =
-            teeth_debt(&store, &db, Some("p")).expect("a heavy checkless rule must be found by the sweep itself");
-        assert!(asked.contains("names-a-flag"), "it must name which rule: {asked}");
-        assert!(asked.contains("it has never been tried"), "and say why it is owed: {asked}");
-        let shown = db.display().to_string().replace('\\', "/");
-        let shown = if shown.contains(' ') { format!("\"{shown}\"") } else { shown };
-        assert!(
-            asked.contains(&format!("--db {shown} retest --id 'names-a-flag'")),
-            "and the command that decides it, on this very store: {asked}"
-        );
-    }
-
-    /// One rule per session is a burn that never finishes: 336 were waiting on
-    /// 2026-08-14, and the answer to each is a single sentence. The batch is
-    /// what turns a year into weeks. It must also say what it held back - five
-    /// names with nothing after them read as the whole backlog.
-    #[test]
-    fn the_burn_asks_a_batch_and_says_what_it_held_back() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("t.db");
-        let mut store = EventStore::new(&db).unwrap();
-        for i in 0..TEETH_DEBT_BATCH_MAX + 2 {
-            legacy_unanswered(&mut store, &format!("unarmed-{i}"), &format!("Draai npm audit fix --force-{i} nooit"));
-        }
-
-        let asked = teeth_debt(&store, &db, Some("p")).expect("several rules are unanswered");
-        for i in 0..TEETH_DEBT_BATCH_MAX {
-            assert!(asked.contains(&format!("unarmed-{i}")), "the whole batch is named: {asked}");
-        }
-        assert!(
-            !asked.contains(&format!("unarmed-{TEETH_DEBT_BATCH_MAX}")),
-            "and it stops at the cap: {asked}"
-        );
-        assert!(asked.contains("2 more are waiting"), "silence about the rest would read as done: {asked}");
-    }
-
-    /// Step 8 of the two tracks: a reason tag settles NOTHING any more -
-    /// thin or checkable, before or after a check was tried - because THOR's
-    /// trial decides whether a rule can have a tooth. A thin reason is no
-    /// longer refused at the write either (it is just a tag). The rule leaves
-    /// the debt once the trial puts it on the note track.
-    #[test]
-    fn a_reason_settles_nothing_and_a_note_verdict_does() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("t.db");
-        let mut store = EventStore::new(&db).unwrap();
-        legacy_unanswered(&mut store, "answer-me", "Draai npm audit fix --force nooit op deze repo");
-        assert!(teeth_debt(&store, &db, Some("p")).is_some(), "fixture sanity");
-
-        let item = model::store::show(&store, "answer-me").unwrap();
-        let mut real = item.clone();
-        real.tags.push(format!(
-            "{}the same --force also appears in the legitimate lockfile repair run",
-            model::store::NO_LITERAL_REASON_PREFIX
-        ));
-        model::store::revise(&mut store, "s", "l", "a", &item, &real).expect("a reason tag is just a tag now");
-        let now = model::store::show(&store, "answer-me").unwrap();
-        let mut tried = now.clone();
-        tried.check = Some(model::item::Check::Forbidden { literals: vec!["npm audit fix --force".to_string()] });
-        for body in [serde_json::to_string(&tried).unwrap(), serde_json::to_string(&now).unwrap()] {
-            store
-                .append_mutate_checked("legacy", "answer-me", "migration", thor_core::event_store::EventKind::FactRevised, "answer-me", None, &body)
-                .unwrap();
-        }
-        let asked = teeth_debt(&store, &db, Some("p")).unwrap();
-        assert!(asked.contains("answer-me"), "a reason, even after a try, settles nothing: {asked}");
-        assert!(asked.contains("retest --id 'answer-me'"), "the way on is the trial: {asked}");
-
-        let corpus = serve::legit::Corpus::load(&store);
-        let retest = serve::teeth::retest(&store, Some(db.as_path()), "answer-me", &corpus).unwrap();
-        assert!(matches!(retest.outcome, serve::teeth::Maintenance::Note { .. }), "{:?}", retest.outcome);
-        serve::teeth::apply_as_retest(&mut store, &retest).unwrap();
-        assert!(teeth_debt(&store, &db, Some("p")).is_none(), "a note verdict settles it");
-    }
-    /// Step 9: a refusal on record and an open point naming the rule settle
-    /// NOTHING - not even a field refusal, verified from the session's own
-    /// transcript (it only sets the "proven" label of a trial). The one
-    /// thing that settles it is a verdict from THOR's trial.
-    #[test]
-    fn a_refusal_or_an_open_point_settles_nothing_and_a_verdict_does() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("t.db");
-        let mut store = EventStore::new(&db).unwrap();
-        legacy_unanswered(&mut store, "arm-me", "Draai npm audit fix --force nooit op deze repo");
-        let current = model::store::show(&store, "arm-me").unwrap();
-        let mut armed = current.clone();
-        armed.bindings = vec![model::item::Binding::Target {
-            kind: model::item::TargetKind::Command,
-            value: "npm audit fix".to_string(),
-        }];
-        armed.check = Some(model::item::Check::Forbidden { literals: vec!["--force".to_string()] });
-        model::store::revise(&mut store, "s", "l", "a", &current, &armed).unwrap();
-        let asked = teeth_debt(&store, &db, Some("p")).expect("a check with no verdict is owed");
-        assert!(asked.contains("arm-me"), "{asked}");
-
-        let transcripts = tempfile::tempdir().unwrap();
-        serve::attest::fixture::field_refusal(
-            &mut store,
-            transcripts.path(),
-            "0de7dc52-1b97-4b66-948f-61e4438043b2",
-            "arm-me",
-            "toolu_arm",
-            "Bash",
-            serde_json::json!({"command": "npm audit fix --force"}),
-            "npm audit fix --force",
-        );
-        assert!(teeth_debt(&store, &db, Some("p")).is_some_and(|a| a.contains("arm-me")), "a field refusal settles nothing");
-
-        let point = model::item::Item {
-            id: "open-arm-me".to_string(),
-            kind: model::item::Kind::Report,
-            text: "arm-me: its --force check is wired and still has to refuse a real call".to_string(),
-            bindings: vec![],
-            severity: None,
-            project: Some("p".to_string()),
-            tags: vec![model::store::OPEN_POINT_TAG.to_string()],
-            expires: None,
-            key: None,
-            falsifier: None,
-            check: None,
-        };
-        model::store::declare(&mut store, "s", "l", "a", &point).unwrap();
-        assert!(teeth_debt(&store, &db, Some("p")).is_some_and(|a| a.contains("arm-me")), "an open point settles nothing");
-
-        let corpus = serve::legit::Corpus::load(&store);
-        let retest = serve::teeth::retest(&store, Some(db.as_path()), "arm-me", &corpus).unwrap();
-        assert!(matches!(retest.outcome, serve::teeth::Maintenance::Rule { proven: true, .. }), "{:?}", retest.outcome);
-        serve::teeth::apply_as_retest(&mut store, &retest).unwrap();
-        assert!(teeth_debt(&store, &db, Some("p")).is_none(), "the trial's verdict - proven by that refusal - settles it");
-    }
-
-    /// F9: a file check of a project with no registered working copy is
-    /// held by that blocker - never named, because nothing the agent runs
-    /// settles it - and owed again the moment the project is registered.
-    #[test]
-    fn a_blocked_rule_is_named_only_once_its_blocker_lifts() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("t.db");
-        let mut store = EventStore::new(&db).unwrap();
-        let checkout = dir.path().join("gamma");
-        std::fs::create_dir_all(checkout.join(".git")).unwrap();
-        std::fs::write(checkout.join("NOTES.md"), "keep me\nplain line\n").unwrap();
-        let mut item = crowded_newcomer("gamma-keeps", "gamma");
-        item.text = "NOTES.md must keep the line `keep me`.".to_string();
-        item.severity = Some(model::item::Severity::Irreversible);
-        item.bindings = vec![model::item::Binding::Target { kind: model::item::TargetKind::Path, value: "NOTES.md".to_string() }];
-        item.check = Some(model::item::Check::Contains { path: "NOTES.md".to_string(), literal: "keep me".to_string() });
-        let body = serde_json::to_string(&item).unwrap();
-        store
-            .append_event("legacy", "gamma-keeps", "migration", thor_core::event_store::EventKind::FactCreated, "gamma-keeps", None, &body)
-            .unwrap();
-        assert!(teeth_debt(&store, &db, Some("gamma")).is_none(), "blocked: never named");
-        // The installer's registration, as its own event lands on the log (a
-        // raw append: THOR's actor token is built in the installer only).
-        let record = model::item::Item {
-            id: model::store::project_opened_id("gamma"),
-            kind: model::item::Kind::Report,
-            text: "Project gamma: a fixture record.".to_string(),
-            bindings: Vec::new(),
-            severity: None,
-            project: Some("gamma".to_string()),
-            tags: vec!["project-record".to_string()],
-            expires: None,
-            key: None,
-            falsifier: None,
-            check: None,
-        };
-        let body = model::store::canonical_body(&record).unwrap();
-        let body = format!(
-            "{},\"root\":{},\"root_at\":\"2026-09-29T00:00:00Z\"}}",
-            &body[..body.len() - 1],
-            serde_json::to_string(checkout.to_str().unwrap()).unwrap()
-        );
-        store
-            .append_event("install", "install", model::store::INSTALLER_ACTOR, thor_core::event_store::EventKind::FactCreated, &record.id, None, &body)
-            .unwrap();
-        let asked = teeth_debt(&store, &db, Some("gamma")).expect("registered: owed again");
-        assert!(asked.contains("gamma-keeps"), "{asked}");
-    }
-
-    /// THE DEFECT THIS CLOSES (H): sorted by id alone, every session was asked
-    /// about the same five rules. The ones asked least often come first now.
-    #[test]
-    fn the_burn_rotates_so_the_next_session_is_asked_about_others() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("t.db");
-        let mut store = EventStore::new(&db).unwrap();
-        for i in 0..TEETH_DEBT_BATCH_MAX * 2 {
-            legacy_unanswered(&mut store, &format!("unarmed-{i:02}"), &format!("Draai npm audit fix --force-{i} nooit"));
-        }
-        let first = teeth_debt(&store, &db, Some("p")).unwrap();
-        let second = teeth_debt(&store, &db, Some("p")).unwrap();
-        for i in 0..TEETH_DEBT_BATCH_MAX {
-            assert!(first.contains(&format!("'unarmed-{i:02}'")), "{first}");
-            assert!(!second.contains(&format!("'unarmed-{i:02}'")), "the second ask must move on: {second}");
-        }
-        for i in TEETH_DEBT_BATCH_MAX..TEETH_DEBT_BATCH_MAX * 2 {
-            assert!(second.contains(&format!("'unarmed-{i:02}'")), "{second}");
-        }
-    }
-
-    /// D8 (step 9): a light rule with no check and no verdict is owed like
-    /// any other - weight plays no part, so lowering a severity never takes
-    /// a rule out of this debt. The trial's note settles it.
-    #[test]
-    fn a_light_item_without_a_verdict_is_asked_until_the_trial_decides_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("t.db");
-        let mut store = EventStore::new(&db).unwrap();
-        let mut item = crowded_newcomer("pure-judgement", "p");
-        item.text = "Vraag eerst toestemming voor je iets onomkeerbaars doet".to_string();
-        model::store::declare(&mut store, "s", "l", "a", &item).unwrap();
-        assert!(teeth_debt(&store, &db, Some("p")).is_some_and(|a| a.contains("pure-judgement")), "light and owed");
-        let corpus = serve::legit::Corpus::load(&store);
-        let retest = serve::teeth::retest(&store, Some(db.as_path()), "pure-judgement", &corpus).unwrap();
-        assert!(matches!(retest.outcome, serve::teeth::Maintenance::Note { .. }), "{:?}", retest.outcome);
-        serve::teeth::apply_as_retest(&mut store, &retest).unwrap();
-        assert!(teeth_debt(&store, &db, Some("p")).is_none(), "a note verdict settles it");
-    }
-
     #[test]
     fn prose_that_merely_contains_a_slash_or_a_dot_is_not_a_path() {
         assert_eq!(model::gate::candidate_literal("werk dev->prod bij en/of herstart"), None);
@@ -5427,33 +4516,6 @@ mod judgement_debt_tests {
             model::gate::candidate_literal("wijzig files/deploy-watcher.sh en push"),
             Some("files/deploy-watcher.sh".to_string())
         );
-    }
-
-    /// REPLACES `a_rule_that_already_has_teeth_is_left_alone` (2026-09-25):
-    /// that test's own fixture LOOKED armed (a `Forbidden` check) but its
-    /// binding is `crowded_newcomer`'s own `Moment(Deploy)` - never a
-    /// `Command` or `Always`, the only two shapes a `Forbidden` check can
-    /// ever reach (`serve::prove::forbidden_reach`). A check that cannot be
-    /// tried without a real checkout is asked again forever until anchored;
-    /// this one can never be tried AT ALL, so leaving it alone was exactly
-    /// the defect this rebuild closes - proven here by inverting the
-    /// original assertion. `model::store::declare` still accepts this
-    /// shape (the unreachable-check refusal lives at the MCP/`serve::prove`
-    /// layer - see `mcp::teeth_test` - never inside the pure write gate),
-    /// which is exactly how a rule like this can exist live in the store at
-    /// all.
-    #[test]
-    fn a_check_that_cannot_reach_anything_is_named_again_not_left_alone() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("t.db");
-        let mut store = EventStore::new(&db).unwrap();
-        let mut item = crowded_newcomer("looks-armed-fires-nothing", "p");
-        item.text = "Draai npm audit fix --force nooit op deze repo".to_string();
-        item.check = Some(model::item::Check::Forbidden { literals: vec!["--force".to_string()] });
-        model::store::declare(&mut store, "s", "l", "a", &item).unwrap();
-        let asked = teeth_debt(&store, &db, Some("p"));
-        assert!(asked.is_some(), "a check that can never reach anything must still be named");
-        assert!(asked.unwrap().contains("looks-armed-fires-nothing"));
     }
 
     /// The THIRD way out, and until 2026-08-09 the only one the message
@@ -5609,473 +4671,13 @@ mod judgement_debt_tests {
             "a directory-only item's note is Broad, never Crowded, and must never be read as debt"
         );
     }
-
-
-    fn declare(store: &mut EventStore, id: &str, pinned: bool) {
-        let item = Item {
-            id: id.to_string(),
-            kind: Kind::Rule,
-            text: format!("something worth knowing about {id}"),
-            bindings: if pinned {
-                vec![Binding::Always]
-            } else {
-                vec![Binding::Moment(intent::Action::Commit)]
-            },
-            severity: None,
-            project: None,
-            tags: vec![],
-            expires: None,
-            key: None,
-            falsifier: Some("it stops being true".to_string()),
-            check: None,
-        };
-        model::store::declare(store, "t", "t", "t", &item).expect("fixture must store");
-    }
-
-    fn serve_it(store: &mut EventStore, id: &str, times: usize) {
-        serve_as(store, "s", id, times);
-    }
-
-    /// Served under `usefulness::ASSISTANT_DELIVERY_ACTOR` (2026-09-19):
-    /// `judgement_debt` (below, via `usefulness::served_since_last_verdict`)
-    /// now counts only that actor's own firings, so a fixture that claims to
-    /// build real judgement debt has to serve under it.
-    fn serve_as(store: &mut EventStore, session: &str, id: &str, times: usize) {
-        for _ in 0..times {
-            deliver::record_delivery(store, session, session, usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-08-07T00:00:00Z", &[id.to_string()]);
-        }
-    }
-
-    /// `declare`'s own project-scoped sibling: trigger-bound (never pinned -
-    /// existing pin coverage lives on `declare` above), anchored to `project`
-    /// exactly the way a real project-scoped rule is.
-    fn declare_in_project(store: &mut EventStore, id: &str, project: &str) {
-        let item = Item {
-            id: id.to_string(),
-            kind: Kind::Rule,
-            text: format!("something worth knowing about {id}, only in {project}"),
-            bindings: vec![Binding::Moment(intent::Action::Commit)],
-            severity: None,
-            project: Some(project.to_string()),
-            tags: vec![],
-            expires: None,
-            key: None,
-            falsifier: Some("it stops being true".to_string()),
-            check: None,
-        };
-        model::store::declare(store, "t", "t", "t", &item).expect("fixture must store");
-    }
-
-    /// THE DEFECT THIS PREVENTS, and it bit within minutes of being possible.
-    /// The served and judged counts are folded from event kinds, which keep
-    /// every serving an item ever had - including the ones from before
-    /// somebody retracted it. So a retracted item stayed owed forever, and
-    /// the ask had no honest answer: "did it belong where it fired" cannot be
-    /// answered about something that is gone. On 2026-08-08 a de-duplication
-    /// retracted 57 items and the very next Stop asked about one of them by
-    /// name, quoting an empty text because `show` refuses a tombstone.
-    #[test]
-    fn a_retracted_item_is_never_asked_about() {
-        let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "gone", false);
-        serve_it(&mut store, "gone", JUDGEMENT_DEBT_AFTER);
-        assert!(judgement_debt(&store, Path::new("no-watermark-for-this-test"), "s", None).is_some(), "fixture sanity: it is owed while it is live");
-
-        model::store::retract(&mut store, "t", "t", "t", "gone", "merged into another item", None).unwrap();
-        assert!(
-            judgement_debt(&store, Path::new("no-watermark-for-this-test"), "s", None).is_none(),
-            "a retracted item must drop out of the debt, or it is owed forever with no way to settle it"
-        );
-    }
-
-    /// THE DEFECT THIS PREVENTS: one answer settling an item for life. The
-    /// debt used to hold a lifetime judged-set, so the first verdict about an
-    /// item was also the last, however far the item drifted afterwards. That
-    /// is the same shape `decay::is_stale` carried until 2026-08-08, and it
-    /// bit hardest here, because the debt asks first about the items that
-    /// fire most - the ones whose bindings are most worth a second look.
-    ///
-    /// A verdict now buys quiet, not immunity: the count resets, and another
-    /// `JUDGEMENT_DEBT_AFTER` firings earn another question - but see the
-    /// NEXT test for the part that is new since 2026-09-08: that second
-    /// question is never put to the SAME session that just answered the
-    /// first one, no matter how many more times it fires. This test proves
-    /// the count-reset half from a session that did not itself hand down the
-    /// earlier verdict, which is exactly the case the floor is not meant to
-    /// touch.
-    #[test]
-    fn a_judged_item_is_asked_about_again_in_a_new_session_once_it_fires_that_many_times_more() {
-        let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "drifter", false);
-        serve_it(&mut store, "drifter", JUDGEMENT_DEBT_AFTER);
-        assert!(judgement_debt(&store, Path::new("no-watermark-for-this-test"), "s", None).is_some(), "fixture sanity: it is owed");
-
-        let verdicts = tempfile::tempdir().unwrap();
-        // Through THOR's mark tool and verified at a Stop (step 12, D9): the
-        // only kind of verdict that clears judgement debt.
-        serve::attest::fixture::attested_mark(&mut store, verdicts.path(), serve::attest::fixture::SESSION, "drifter", false, "toolu_drifter");
-        assert!(judgement_debt(&store, Path::new("no-watermark-for-this-test"), "s", None).is_none(), "a verdict must settle it for now");
-
-        serve_as(&mut store, "s2", "drifter", JUDGEMENT_DEBT_AFTER - 1);
-        assert!(judgement_debt(&store, Path::new("no-watermark-for-this-test"), "s2", None).is_none(), "one short of the threshold is not owed yet");
-
-        serve_as(&mut store, "s2", "drifter", 1);
-        let asked = judgement_debt(&store, Path::new("no-watermark-for-this-test"), "s2", None)
-            .expect("forty more firings must earn a second question, from a session that did not itself just judge it");
-        assert!(asked.contains("drifter"), "{asked}");
-    }
-
-    /// THE DEFECT THIS PREVENTS, reported by the owner and recorded as
-    /// `oordeelschuld-komt-binnen-de-sessie-terug` (2026-09-08): measured in
-    /// a real session, the Stop hook asked for a verdict on the same items
-    /// three separate times, each only minutes after they had just been
-    /// judged - four of eight items in one such round had already been
-    /// marked useful earlier in that very session. The count-since-last-
-    /// verdict fold (proven by the previous test) had no floor in time or in
-    /// turns, so a busy session that keeps serving the same item crosses the
-    /// threshold again within minutes of its own verdict.
-    #[test]
-    fn a_verdict_settles_an_item_for_the_rest_of_this_session_no_matter_how_many_more_times_it_fires() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("t.db");
-        let mut store = EventStore::new(&db).unwrap();
-        // The SessionStart this session actually had, before anything else -
-        // see `judgement_debt`'s own doc comment for why the floor reads
-        // this watermark rather than a verdict's own `session_id` column.
-        record_session_watermark(&db, "s");
-        declare(&mut store, "settled-in-session", false);
-        serve_it(&mut store, "settled-in-session", JUDGEMENT_DEBT_AFTER);
-        assert!(judgement_debt(&store, &db, "s", None).is_some(), "fixture sanity: it is owed");
-
-        let verdicts = tempfile::tempdir().unwrap();
-        // Through THOR's mark tool and verified at a Stop (step 12, D9): the
-        // only kind of verdict that clears judgement debt.
-        serve::attest::fixture::attested_mark(&mut store, verdicts.path(), serve::attest::fixture::SESSION, "settled-in-session", false, "toolu_settled_in_session");
-        assert!(judgement_debt(&store, &db, "s", None).is_none(), "a verdict must settle it for now");
-
-        serve_it(&mut store, "settled-in-session", JUDGEMENT_DEBT_AFTER * 2);
-        assert!(
-            judgement_debt(&store, &db, "s", None).is_none(),
-            "the SAME session must never be asked about it again this session, however many more times it fires"
-        );
-    }
-
-    /// D9 (step 12): a verdict typed into a shell (`serve mark`, no stamp)
-    /// after the session started is written, but neither resets the count nor
-    /// silences this session's ask through the in-session floor.
-    #[test]
-    fn a_verdict_from_the_command_line_does_not_silence_the_session() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("t.db");
-        let mut store = EventStore::new(&db).unwrap();
-        record_session_watermark(&db, "s");
-        declare(&mut store, "shell-marked", false);
-        serve_it(&mut store, "shell-marked", JUDGEMENT_DEBT_AFTER);
-        serve::mark::record_useful(&mut store, "cli", "cli", "cli", "2026-08-08T00:00:00Z", "shell-marked", None).unwrap();
-        let asked = judgement_debt(&store, &db, "s", None).expect("an unattested verdict settles nothing");
-        assert!(asked.contains("shell-marked"), "{asked}");
-    }
-
-    /// The other verdict shape settles a session the same way - `judged_since`
-    /// matches BOTH `ItemMarkedUseful` and `ItemMarkedNoise`, not just one of
-    /// the two.
-    #[test]
-    fn a_noise_verdict_also_settles_an_item_for_the_rest_of_this_session() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("t.db");
-        let mut store = EventStore::new(&db).unwrap();
-        record_session_watermark(&db, "s");
-        declare(&mut store, "noised-in-session", false);
-        serve_it(&mut store, "noised-in-session", JUDGEMENT_DEBT_AFTER);
-        assert!(judgement_debt(&store, &db, "s", None).is_some(), "fixture sanity: it is owed");
-
-        let verdicts = tempfile::tempdir().unwrap();
-        // Through THOR's mark tool and verified at a Stop (step 12, D9): the
-        // only kind of verdict that clears judgement debt.
-        serve::attest::fixture::attested_mark(&mut store, verdicts.path(), serve::attest::fixture::SESSION, "noised-in-session", true, "toolu_noised_in_session");
-        assert!(judgement_debt(&store, &db, "s", None).is_none(), "a noise verdict must also settle it for now");
-
-        serve_it(&mut store, "noised-in-session", JUDGEMENT_DEBT_AFTER * 2);
-        assert!(
-            judgement_debt(&store, &db, "s", None).is_none(),
-            "the SAME session must never be asked about it again this session, however many more times it fires"
-        );
-    }
-
-    /// THE DEFECT THIS PREVENTS, and the direct cause of writing this fix:
-    /// measured 2026-09-12, the named list under doctor's own judgement-debt
-    /// line carried more than thirty `Always`-bound items, two of them
-    /// pinned by the owner on purpose, and a whole evaluation was spent
-    /// judging every one of them for nothing - `decay::DecayContext::
-    /// is_stale` ignores a verdict on a pinned item outright, so nothing
-    /// downstream of that verdict was ever going to change. See this
-    /// function's own doc comment, "A PINNED ITEM OWES NO VERDICT", for the
-    /// fuller history, including the earlier defect (`pinned_line`'s "44 of
-    /// 48 never reviewed") the brief 2026-09-08 inclusion was itself fixing.
-    #[test]
-    fn a_never_judged_pinned_item_is_never_asked_about() {
-        let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "pinned-one", true);
-        serve_it(&mut store, "pinned-one", JUDGEMENT_DEBT_AFTER + 5);
-        assert!(
-            judgement_debt(&store, Path::new("no-watermark-for-this-test"), "s", None).is_none(),
-            "a pinned item's own verdict changes nothing downstream, so asking for one is pure waste"
-        );
-    }
-
-    /// THE OTHER HALF: a pin already served past the threshold stays silent
-    /// however many more times it fires, and regardless of which session is
-    /// asking - there is no session-scoped floor to prove here any more (a
-    /// pin never enters `owed` at all to be floored), only that the
-    /// exclusion holds no matter who is asking.
-    #[test]
-    fn a_heavily_served_pinned_item_stays_silent_across_sessions() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("t.db");
-        let mut store = EventStore::new(&db).unwrap();
-        record_session_watermark(&db, "s");
-        declare(&mut store, "pinned-two", true);
-        serve_it(&mut store, "pinned-two", JUDGEMENT_DEBT_AFTER * 3);
-        assert!(judgement_debt(&store, &db, "s", None).is_none(), "the session that saw it fire must not be asked");
-
-        serve_as(&mut store, "s2", "pinned-two", JUDGEMENT_DEBT_AFTER);
-        assert!(
-            judgement_debt(&store, &db, "s2", None).is_none(),
-            "a different session must not be asked either - pinned or not, a pin owes no verdict"
-        );
-    }
-
-    /// A large pinned backlog produces NO ask at all - not merely a capped
-    /// one. Before this fix, unpinning a batch of long-pinned items was the
-    /// one way a backlog could arrive all at once (see
-    /// `the_batch_is_capped_and_names_how_many_it_held_back` below, still
-    /// true for a TRIGGER-bound backlog); a store with many long-served pins
-    /// is no longer that shape at all, because none of them ever reach
-    /// `owed` in the first place.
-    #[test]
-    fn a_large_pinned_backlog_produces_no_ask_at_all() {
-        let mut store = EventStore::in_memory().unwrap();
-        let n = JUDGEMENT_DEBT_BATCH_MAX + 3;
-        for i in 0..n {
-            let id = format!("pinned-owed-{i}");
-            declare(&mut store, &id, true);
-            serve_it(&mut store, &id, JUDGEMENT_DEBT_AFTER);
-        }
-
-        assert!(
-            judgement_debt(&store, Path::new("no-watermark-for-this-test"), "s", None).is_none(),
-            "an all-pinned backlog, however large, must never hold the turn"
-        );
-    }
-
-    /// And the mechanism is still armed for what fires because a TRIGGER
-    /// matched, which is the case where the question is real.
-    #[test]
-    fn a_trigger_bound_item_is_still_asked_about() {
-        let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "on-a-moment", false);
-        serve_it(&mut store, "on-a-moment", JUDGEMENT_DEBT_AFTER + 5);
-        let reason = judgement_debt(&store, Path::new("no-watermark-for-this-test"), "s", None).expect("a trigger-bound item must still be asked about");
-        assert!(reason.contains("on-a-moment"), "{reason}");
-    }
-
-    /// THE DEFECT THIS PREVENTS: asking this reader about something only
-    /// SOMEBODY ELSE was ever served. A lifetime count says an item fired a
-    /// hundred times; a rule scoped to another project fired all hundred of
-    /// them there, and "did it belong where it fired" then has no form this
-    /// session can answer. Found by being asked about an acme-shop commit
-    /// rule during work in thor-2.
-    #[test]
-    fn an_item_this_session_never_saw_is_not_asked_about() {
-        let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "elsewhere", false);
-        serve_as(&mut store, "another-session", "elsewhere", JUDGEMENT_DEBT_AFTER + 5);
-        assert!(
-            judgement_debt(&store, Path::new("no-watermark-for-this-test"), "mine", None).is_none(),
-            "this session never saw it fire, so it has nothing truthful to say about it"
-        );
-        assert!(
-            judgement_debt(&store, Path::new("no-watermark-for-this-test"), "another-session", None).is_some(),
-            "the session that DID see it is still asked"
-        );
-    }
-
-    /// THE DEFECT THIS PREVENTS, measured against a copy of the live store on
-    /// 2026-09-07/08: `seen` (above) proves this literal session_id served
-    /// the item at SOME point in its own life, never that it did so while
-    /// this turn's own project was the one in front of it. A session_id can
-    /// legitimately carry a long history across many checkouts - this
-    /// workspace's own "Orchestrator mode" is exactly that shape on purpose -
-    /// so the SAME session that served this item while working in "acme"
-    /// earlier must not be handed it back once it has moved on to "thor",
-    /// mirroring the exact fix `crowding_debt` already got for its own
-    /// project leak on 2026-08-14 ("a business-repo fact nagged a THOR-dev
-    /// session twice").
-    #[test]
-    fn an_item_served_this_session_in_a_different_project_is_not_asked_about() {
-        let mut store = EventStore::in_memory().unwrap();
-        declare_in_project(&mut store, "acme-only", "acme");
-        serve_it(&mut store, "acme-only", JUDGEMENT_DEBT_AFTER + 5);
-        assert!(
-            judgement_debt(&store, Path::new("no-watermark-for-this-test"), "s", Some("acme")).is_some(),
-            "fixture sanity: the same session, still in the item's own project, is asked"
-        );
-        assert!(
-            judgement_debt(&store, Path::new("no-watermark-for-this-test"), "s", Some("thor")).is_none(),
-            "this session DID see it fire, but only while working on a different project - it \
-             cannot honestly judge it now that it has moved on"
-        );
-    }
-
-    /// The carve-out `project::applies_to` already gives every real injection
-    /// surface: an item with NO project is global, and stays in scope
-    /// regardless of which project this session currently resolves to.
-    #[test]
-    fn a_global_item_is_still_asked_about_regardless_of_the_current_project() {
-        let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "global-rule", false);
-        serve_it(&mut store, "global-rule", JUDGEMENT_DEBT_AFTER + 5);
-        let asked = judgement_debt(&store, Path::new("no-watermark-for-this-test"), "s", Some("thor")).expect("a global item applies everywhere");
-        assert!(asked.contains("global-rule"), "{asked}");
-    }
-
-    /// Sanity opposite of the mismatch test above: the item's own project and
-    /// the session's CURRENT project agreeing must never itself be treated as
-    /// suspicious - only a genuine mismatch withholds the ask.
-    #[test]
-    fn an_item_in_the_sessions_current_project_is_still_asked_about() {
-        let mut store = EventStore::in_memory().unwrap();
-        declare_in_project(&mut store, "thor-only", "thor");
-        serve_it(&mut store, "thor-only", JUDGEMENT_DEBT_AFTER + 5);
-        let asked = judgement_debt(&store, Path::new("no-watermark-for-this-test"), "s", Some("thor")).expect("same project as right now - still owed");
-        assert!(asked.contains("thor-only"), "{asked}");
-    }
-
-    /// Below the threshold nothing is owed: this is about the handful of
-    /// rules constantly in front of a reader, not about everything served.
-    #[test]
-    fn firing_a_few_times_owes_nothing() {
-        let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "rarely", false);
-        serve_it(&mut store, "rarely", JUDGEMENT_DEBT_AFTER - 1);
-        assert!(judgement_debt(&store, Path::new("no-watermark-for-this-test"), "s", None).is_none());
-    }
-
-    /// THE OTHER HALF of "a session that saw nothing is not held": not merely
-    /// under the threshold (`firing_a_few_times_owes_nothing`, above), but a
-    /// session_id that never appears in the log AT ALL, against a store that
-    /// genuinely owes plenty to OTHER sessions. `served_ids_in_session`
-    /// returns an empty set for an id it has never seen, so `seen.contains`
-    /// can never be true for anything - the same "owes nothing" answer, from
-    /// the opposite direction (never having served anything at all, rather
-    /// than not having served enough of any one thing).
-    #[test]
-    fn a_session_that_saw_nothing_at_all_is_not_held() {
-        let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "owed-elsewhere-a", false);
-        declare(&mut store, "owed-elsewhere-b", false);
-        serve_as(&mut store, "busy-session", "owed-elsewhere-a", JUDGEMENT_DEBT_AFTER);
-        serve_as(&mut store, "busy-session", "owed-elsewhere-b", JUDGEMENT_DEBT_AFTER + 20);
-        assert!(
-            judgement_debt(&store, Path::new("no-watermark-for-this-test"), "busy-session", None).is_some(),
-            "fixture sanity: the store really does owe something, to the session that saw it"
-        );
-        assert!(
-            judgement_debt(&store, Path::new("no-watermark-for-this-test"), "brand-new-session-saw-nothing", None).is_none(),
-            "a session absent from the log entirely owes nothing, no matter how large the backlog"
-        );
-    }
-
-    /// THE DEFECT THIS PREVENTS: unpinning a batch of long-pinned items (each
-    /// carrying a large lifetime serving count from its time as `Always`)
-    /// makes all of them owed in the same instant, and asking about them one
-    /// per Stop turns a single backlog into that many separate blocked turns
-    /// - each one repaying a long conversation's full history for a single
-    /// id. One block must be able to carry more than one id.
-    #[test]
-    fn multiple_owed_items_are_all_asked_about_in_one_block() {
-        let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "first", false);
-        declare(&mut store, "second", false);
-        serve_it(&mut store, "first", JUDGEMENT_DEBT_AFTER);
-        serve_it(&mut store, "second", JUDGEMENT_DEBT_AFTER);
-
-        let asked = judgement_debt(&store, Path::new("no-watermark-for-this-test"), "s", None).expect("two owed items must still produce one block");
-        assert!(asked.contains("first"), "{asked}");
-        assert!(asked.contains("second"), "{asked}");
-    }
-
-    /// THE DEFECT THIS PREVENTS (measured 2026-09-17): an evaluation judging
-    /// "did it belong where it fired" could see an owed item's own text but
-    /// not where it had actually been firing. This Stop-time ask names it
-    /// too now, the same way `ops::health::judgement_debt_line`'s own named
-    /// list does - trivial to add once `model::served::last_trigger` existed
-    /// for that line to call.
-    #[test]
-    fn the_ask_names_where_the_owed_item_last_fired() {
-        let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "triggered", false);
-        serve_it(&mut store, "triggered", JUDGEMENT_DEBT_AFTER - 1);
-        deliver::record_delivery_with_trigger(
-            &mut store, "s", "s", usefulness::ASSISTANT_DELIVERY_ACTOR,
-            "2026-08-07T00:00:00Z", &["triggered".to_string()], Some("npm run deploy"),
-        );
-
-        let asked = judgement_debt(&store, Path::new("no-watermark-for-this-test"), "s", None).expect("fixture sanity: it is owed");
-        // Since step 24: this session's own places, newest first.
-        assert!(asked.contains("time(s) in this session, last at 'npm run deploy'"), "{asked}");
-    }
-
-    /// A verdict on one of several owed items settles only that one - the
-    /// others must still be owed and still asked about together, not
-    /// silently cleared as a side effect of somebody else's answer.
-    #[test]
-    fn judging_one_of_several_leaves_the_rest_owed_together() {
-        let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "answered", false);
-        declare(&mut store, "still-owed-a", false);
-        declare(&mut store, "still-owed-b", false);
-        serve_it(&mut store, "answered", JUDGEMENT_DEBT_AFTER);
-        serve_it(&mut store, "still-owed-a", JUDGEMENT_DEBT_AFTER);
-        serve_it(&mut store, "still-owed-b", JUDGEMENT_DEBT_AFTER);
-
-        let verdicts = tempfile::tempdir().unwrap();
-        // Through THOR's mark tool and verified at a Stop (step 12, D9): the
-        // only kind of verdict that clears judgement debt.
-        serve::attest::fixture::attested_mark(&mut store, verdicts.path(), serve::attest::fixture::SESSION, "answered", false, "toolu_answered");
-
-        let asked = judgement_debt(&store, Path::new("no-watermark-for-this-test"), "s", None).expect("two items are still owed");
-        assert!(!asked.contains("answered"), "a settled item must not reappear: {asked}");
-        assert!(asked.contains("still-owed-a"), "{asked}");
-        assert!(asked.contains("still-owed-b"), "{asked}");
-    }
-
-    /// THE CAP MUST STAY A CAP, not become a new unbounded block under a
-    /// different name - the whole point of batching was to stop paying a
-    /// long conversation's full history once per owed id, not to risk one
-    /// enormous block instead. Past the cap, it must say how many it held
-    /// back rather than silently dropping them.
-    #[test]
-    fn the_batch_is_capped_and_names_how_many_it_held_back() {
-        let mut store = EventStore::in_memory().unwrap();
-        let n = JUDGEMENT_DEBT_BATCH_MAX + 3;
-        for i in 0..n {
-            let id = format!("owed-{i}");
-            declare(&mut store, &id, false);
-            serve_it(&mut store, &id, JUDGEMENT_DEBT_AFTER);
-        }
-
-        let asked = judgement_debt(&store, Path::new("no-watermark-for-this-test"), "s", None).expect("a large backlog is still owed");
-        let shown = (0..n).filter(|i| asked.contains(&format!("owed-{i}"))).count();
-        assert_eq!(shown, JUDGEMENT_DEBT_BATCH_MAX, "the block must show exactly the cap, not more: {asked}");
-        assert!(asked.contains(&format!("{} more", n - JUDGEMENT_DEBT_BATCH_MAX)), "{asked}");
-    }
 }
 
 #[cfg(test)]
 mod evaluation_debt_tests {
     use super::*;
     use model::item::{Binding, Item, Kind};
+    use usefulness::JUDGEMENT_DEBT_AFTER;
 
     fn declare(store: &mut EventStore, id: &str, project: Option<&str>) {
         let item = Item {
@@ -6120,9 +4722,13 @@ mod evaluation_debt_tests {
     /// reason as `judgement_debt_tests`'s own `serve_as`: `owe` below claims
     /// to build real judgement debt for the context line's own count, and
     /// only an assistant-attributed firing counts as one any more.
+    ///
+    /// One firing per session (step 28): the debt counts sessions, so `times`
+    /// sessions are served the item.
     fn serve_it(store: &mut EventStore, id: &str, times: usize) {
-        for _ in 0..times {
-            deliver::record_delivery(store, "s", "s", usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-08-07T00:00:00Z", &[id.to_string()]);
+        for i in 0..times {
+            let session = format!("s{i}");
+            deliver::record_delivery(store, &session, &session, usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-08-07T00:00:00Z", &[id.to_string()]);
         }
     }
 
@@ -6297,7 +4903,6 @@ mod evaluation_debt_tests {
         assert!(note.contains(&format!("THOR tried {owed} old rule(s) of this project itself")), "{note}");
         assert!(note.contains(&format!("{owed} became a note")) && note.contains("not reached this time: 0"), "{note}");
         assert!(note.contains("a. THE BATCH - no rule needs a fix from you"), "{note}");
-        assert_eq!(teeth_debt(&store, &db, Some("thor")), None, "and the backlog burn has nothing left to ask");
     }
 
     /// Case named in the build brief: zero items owed must still fire once

@@ -65,10 +65,15 @@ fn fixture(dir: &Path) -> (PathBuf, PathBuf) {
     (db, work)
 }
 
+/// A session of its own for every call: a fact is shown once per context
+/// (step 28), and each call here asks what THAT call draws.
+static NEXT_SESSION: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 fn run_hook(db: &Path, cwd: &Path, tool: &str, input: serde_json::Value) -> String {
+    let session = format!("s{}", NEXT_SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     let payload = serde_json::json!({
         "hook_event_name": "PreToolUse",
-        "session_id": "s1",
+        "session_id": session,
         "cwd": cwd.to_string_lossy(),
         "tool_name": tool,
         "tool_input": input,

@@ -115,8 +115,8 @@ fn fired_rule(store: &mut EventStore, id: &str, project: &str, session: &str, n:
         check: None,
     };
     model::store::declare(store, "fixture", "fixture", "fixture", &item).unwrap();
-    for _ in 0..n {
-        serve::deliver::record_delivery(store, session, session, serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-26T00:00:00Z", &[id.to_string()]);
+    for i in 0..n {
+        serve::deliver::record_delivery(store, &serve::deliver::nth_session(session, i), session, serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-26T00:00:00Z", &[id.to_string()]);
     }
 }
 

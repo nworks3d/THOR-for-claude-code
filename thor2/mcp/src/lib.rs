@@ -3088,13 +3088,16 @@ impl ThorMcpServer {
                     let prev_seq = prev.seq.unwrap_or_else(|| {
                         unreachable!("a seq:None repeat already returned before self.blocking")
                     });
+                    // Once per session, like every judgement count (step 28).
                     let fired_since = s
                         .get_events_by_entity(&args.id)
                         .map(|events| {
                             events
                                 .iter()
                                 .filter(|e| e.kind == thor_core::event_store::EventKind::ItemServed && e.seq > prev_seq)
-                                .count()
+                                .map(|e| e.session_id.as_str())
+                                .collect::<std::collections::HashSet<_>>()
+                                .len()
                         })
                         .unwrap_or(0);
                     if fired_since < serve::usefulness::JUDGEMENT_DEBT_AFTER {
@@ -3105,7 +3108,7 @@ impl ThorMcpServer {
                         ));
                     }
                     owed_again_note = format!(
-                        "judged {} again: it fired {fired_since} more times since this session's earlier verdict \
+                        "judged {} again: it fired in {fired_since} more sessions since this session's earlier verdict \
                          (event seq {prev_seq}), so it was owed a fresh one; ",
                         prev.verdict_word()
                     );
@@ -8480,9 +8483,10 @@ mod tests {
     /// six items judged earlier in a long session fired 40+ more times,
     /// doctor listed them as owed again, the second `mark` was refused, and
     /// the project's debt stayed at 10 with no way to pay it down in that
-    /// same session. `serve::usefulness::JUDGEMENT_DEBT_AFTER` (40)
-    /// `item_served` events since the earlier verdict's own event seq is
-    /// enough to write the verdict again, with a reply that says why.
+    /// same session. `serve::usefulness::JUDGEMENT_DEBT_AFTER` (40) sessions
+    /// served the item since the earlier verdict's own event seq (once per
+    /// session, step 28) is enough to write the verdict again, with a reply
+    /// that says why.
     #[tokio::test]
     async fn a_repeated_identical_verdict_is_written_again_once_it_fired_enough_more_times() {
         let srv = server();
@@ -8497,8 +8501,8 @@ mod tests {
 
         {
             let mut store = srv.store.lock().unwrap();
-            for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
-                serve::deliver::record_delivery(&mut store, "s", "l", "hook", "2026-09-17T00:00:00Z", &["owed-again".to_string()]);
+            for i in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
+                serve::deliver::record_delivery(&mut store, &format!("s{i}"), "l", "hook", "2026-09-17T00:00:00Z", &["owed-again".to_string()]);
             }
         }
 
@@ -8508,7 +8512,7 @@ mod tests {
             "must open with the owed-again note, before the normal reply text: {second}"
         );
         assert!(
-            second.contains(&format!("it fired {} more times since this session's earlier verdict", serve::usefulness::JUDGEMENT_DEBT_AFTER)),
+            second.contains(&format!("it fired in {} more sessions since this session's earlier verdict", serve::usefulness::JUDGEMENT_DEBT_AFTER)),
             "{second}"
         );
         assert!(second.contains("event seq"), "must name the earlier verdict's own seq: {second}");
@@ -8538,8 +8542,8 @@ mod tests {
 
         {
             let mut store = srv.store.lock().unwrap();
-            for _ in 0..(serve::usefulness::JUDGEMENT_DEBT_AFTER - 1) {
-                serve::deliver::record_delivery(&mut store, "s", "l", "hook", "2026-09-17T00:00:00Z", &["not-owed-again".to_string()]);
+            for i in 0..(serve::usefulness::JUDGEMENT_DEBT_AFTER - 1) {
+                serve::deliver::record_delivery(&mut store, &format!("s{i}"), "l", "hook", "2026-09-17T00:00:00Z", &["not-owed-again".to_string()]);
             }
         }
 

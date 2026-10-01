@@ -5,19 +5,19 @@
 //! and evaluation, and did the same work twice.
 //!
 //! Per project the holder is the session that runs its open evaluation, else
-//! the session currently held for its debt, else the first one asked. Another
-//! session working there is not held for any of that while the holder showed
+//! the session holding the lease the evaluation ask took, else the first one
+//! asked. Another session working there is not asked while the holder showed
 //! activity in the last `EVALUATION_IDLE_MINUTES`; it gets one non-blocking
-//! line naming the holder. A quiet holder is taken over: the lease moves.
+//! line naming the holder. Since step 28 the evaluation is the only debt that
+//! holds a turn (no Stop holds one for a judgement or the rule upkeep), so it
+//! is the only thing that takes the lease.
 
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use model::item::{Binding, Item, Kind, TargetKind};
 use thor_core::event_store::EventStore;
 
-const AFTER: usize = serve::usefulness::JUDGEMENT_DEBT_AFTER;
 const S1: &str = "11111111-1111-4111-8111-111111111111";
 const S2: &str = "22222222-2222-4222-8222-222222222222";
 
@@ -65,33 +65,6 @@ impl Fx {
     }
 }
 
-/// `n` rules of project `alpha`, each on its own command, decided as notes
-/// and served `AFTER` times in `session`, `minutes_ago` minutes ago.
-fn owed(store: &mut EventStore, prefix: &str, n: usize, session: &str, minutes_ago: i64) {
-    let at = serve::time::iso8601_from_unix(serve::time::now_unix() - minutes_ago * 60);
-    for i in 0..n {
-        let id = format!("{prefix}-{i}");
-        let item = Item {
-            id: id.clone(),
-            kind: Kind::Rule,
-            text: format!("fixture rule {prefix} number {i} of project alpha"),
-            bindings: vec![Binding::Target { kind: TargetKind::Command, value: format!("fixture-{prefix}-command-{i}") }],
-            severity: None,
-            project: Some("alpha".to_string()),
-            tags: vec![],
-            expires: None,
-            key: None,
-            falsifier: Some(format!("fixture rule {prefix} number {i} turns out to be wrong")),
-            check: None,
-        };
-        model::store::declare(store, "fixture", "fixture", "fixture", &item).unwrap();
-        serve::teeth::fixture::decide(store, &id);
-        for _ in 0..AFTER {
-            serve::deliver::record_delivery(store, session, session, serve::usefulness::ASSISTANT_DELIVERY_ACTOR, &at, &[id.clone()]);
-        }
-    }
-}
-
 fn is_hold(v: &serde_json::Value) -> bool {
     v.get("decision").and_then(|d| d.as_str()) == Some("block")
 }
@@ -102,65 +75,6 @@ fn reason(v: &serde_json::Value) -> String {
 
 fn notice(v: &serde_json::Value) -> String {
     v.get("systemMessage").and_then(|r| r.as_str()).unwrap_or_default().to_string()
-}
-
-#[test]
-fn two_sessions_with_judgement_debt_in_one_project_only_the_holder_is_held() {
-    let fx = Fx::new();
-    let mut store = EventStore::new(&fx.db()).unwrap();
-    owed(&mut store, "one", 2, S1, 1);
-    owed(&mut store, "two", 2, S2, 1);
-    drop(store);
-
-    let first = fx.stop(S1);
-    assert!(is_hold(&first), "the first session asked holds the project's debt: {first}");
-    assert!(reason(&first).contains("fired repeatedly"), "{first}");
-
-    let second = fx.stop(S2);
-    assert!(!is_hold(&second), "a second session in the same project is never held while the holder is active: {second}");
-    let line = notice(&second);
-    assert!(line.contains(S1), "the one line names the holder: {second}");
-    assert!(line.contains("alpha"), "and the project: {second}");
-}
-
-#[test]
-fn a_quiet_holder_is_taken_over_by_the_next_session_asked() {
-    let fx = Fx::new();
-    let mut store = EventStore::new(&fx.db()).unwrap();
-    owed(&mut store, "one", 2, S1, 45);
-    owed(&mut store, "two", 2, S2, 1);
-    drop(store);
-
-    // S1 held the debt, then went quiet: its last activity is 45 minutes old.
-    let first = fx.stop(S1);
-    assert!(is_hold(&first), "{first}");
-    let second = fx.stop(S2);
-    assert!(is_hold(&second), "a holder quiet for longer than the idle window is taken over: {second}");
-}
-
-#[test]
-fn a_holder_that_owes_nothing_any_more_lets_the_next_session_hold() {
-    let fx = Fx::new();
-    let mut store = EventStore::new(&fx.db()).unwrap();
-    owed(&mut store, "one", 1, S1, 1);
-    owed(&mut store, "two", 1, S2, 1);
-    drop(store);
-
-    assert!(is_hold(&fx.stop(S1)));
-    // S1 judges its item with an attested-looking verdict path is not needed
-    // here: a Stop of S1 that holds nothing releases the lease. Its debt is
-    // paid by pinning the item (a pinned item owes no verdict).
-    let mut store = EventStore::new(&fx.db()).unwrap();
-    let mut item = model::store::show(&store, "one-0").unwrap();
-    let before = item.clone();
-    item.bindings = vec![Binding::Always];
-    model::store::revise(&mut store, "fixture", "fixture", "fixture", &before, &item).unwrap();
-    drop(store);
-    let released = fx.stop(S1);
-    assert!(!is_hold(&released), "S1 owes nothing now: {released}");
-
-    let second = fx.stop(S2);
-    assert!(is_hold(&second), "the lease was released, so the next session asked holds: {second}");
 }
 
 /// Seed `session`'s own work in `project` and the project's clock, so the
@@ -181,78 +95,66 @@ fn due_for(db: &std::path::Path, project: &str, session: &str, minutes: i64) {
     std::fs::write(serve::usefulness::eval_debt_state_path(db), serde_json::to_string(&all).unwrap()).unwrap();
 }
 
+fn retry_stop(fx: &Fx, session: &str) {
+    let payload = serde_json::json!({
+        "hook_event_name": "Stop",
+        "session_id": session,
+        "stop_hook_active": true,
+        "last_assistant_message": "",
+        "cwd": fx.checkout().to_string_lossy(),
+    });
+    fx.hook(&payload.to_string());
+}
+
 #[test]
-fn the_evaluation_ask_waits_for_the_session_held_for_the_projects_debt() {
+fn two_sessions_due_for_the_evaluation_in_one_project_only_the_first_asked_is_held() {
     let fx = Fx::new();
-    let mut store = EventStore::new(&fx.db()).unwrap();
-    owed(&mut store, "one", 1, S1, 1);
-    drop(store);
-
-    // S1 is held for the project's judgement debt: it holds the project.
-    let first = fx.stop(S1);
-    assert!(is_hold(&first) && reason(&first).contains("fired repeatedly"), "{first}");
-
-    // S2 has worked long enough here that the evaluation is due for it.
+    EventStore::new(&fx.db()).unwrap();
+    due_for(&fx.db(), "alpha", S1, 120);
     due_for(&fx.db(), "alpha", S2, 120);
+
+    let first = fx.stop(S1);
+    assert!(is_hold(&first), "the first session asked holds the project's evaluation: {first}");
+    assert!(reason(&first).contains("evaluation"), "{first}");
+    assert!(serve::holder::leases(&fx.db()).values().any(|l| l.session == S1), "and takes the lease");
+
     let second = fx.stop(S2);
-    assert!(!is_hold(&second), "the evaluation ask waits while another session holds the project's debt: {second}");
-    assert!(notice(&second).contains(S1), "{second}");
-    let store = EventStore::new(&fx.db()).unwrap();
-    assert!(model::store::open_evaluation_start(&store, S2, "alpha").is_none(), "no evaluation was started beside it");
+    assert!(!is_hold(&second), "a second session in the same project is never asked while the holder is active: {second}");
+    let line = notice(&second);
+    assert!(line.contains(S1), "the one line names the holder: {second}");
+    assert!(line.contains("alpha"), "and the project: {second}");
 }
 
-/// STEP 27 (D5), field case 2026-10-01: the retry Stop that follows a paid debt
-/// (`stop_hook_active`) returns before the release at the end of the first-pass
-/// arm, so the paid session kept the project's lease for as long as it stayed
-/// quiet. The retry now frees it when nothing is owed any more.
+/// STEP 27 (D5), field case 2026-10-01: the retry Stop (`stop_hook_active`)
+/// returns before the release at the end of the first-pass arm, so a session
+/// kept the project's lease for as long as it stayed quiet. Since step 28 the
+/// lease is the evaluation's: the retry frees it once the evaluation is no
+/// longer open.
 #[test]
-fn the_retry_stop_after_a_paid_debt_releases_the_lease() {
+fn the_retry_stop_after_the_evaluation_is_closed_releases_the_lease() {
     let fx = Fx::new();
-    let mut store = EventStore::new(&fx.db()).unwrap();
-    owed(&mut store, "one", 1, S1, 1);
-    owed(&mut store, "two", 1, S2, 1);
+    EventStore::new(&fx.db()).unwrap();
+    due_for(&fx.db(), "alpha", S1, 120);
+    assert!(is_hold(&fx.stop(S1)), "S1 is asked and takes the lease");
+    assert!(serve::holder::leases(&fx.db()).values().any(|l| l.session == S1));
+
+    // The evaluation is closed (another session's start supersedes it).
+    let mut store = EventStore::open_existing(&fx.db()).unwrap();
+    serve::attest::fixture::supersede_others(&mut store, S2, "alpha");
     drop(store);
 
-    assert!(is_hold(&fx.stop(S1)), "S1 is held and takes the lease");
-    let mut store = EventStore::new(&fx.db()).unwrap();
-    let mut item = model::store::show(&store, "one-0").unwrap();
-    let before = item.clone();
-    item.bindings = vec![Binding::Always];
-    model::store::revise(&mut store, "fixture", "fixture", "fixture", &before, &item).unwrap();
-    drop(store);
-
-    // The retry Stop of the same turn.
-    let payload = serde_json::json!({
-        "hook_event_name": "Stop",
-        "session_id": S1,
-        "stop_hook_active": true,
-        "last_assistant_message": "",
-        "cwd": fx.checkout().to_string_lossy(),
-    });
-    fx.hook(&payload.to_string());
+    retry_stop(&fx, S1);
     let leases = serve::holder::leases(&fx.db());
-    assert!(!leases.values().any(|l| l.session == S1), "the paid session no longer holds the lease: {leases:?}");
-
-    let second = fx.stop(S2);
-    assert!(is_hold(&second), "so the next session asked holds at once: {second}");
+    assert!(!leases.values().any(|l| l.session == S1), "the session no longer holds the lease: {leases:?}");
 }
 
-/// The same retry Stop while the debt is still owed keeps the lease.
+/// The same retry Stop while the evaluation is still open keeps the lease.
 #[test]
-fn the_retry_stop_keeps_the_lease_while_the_debt_is_still_owed() {
+fn the_retry_stop_keeps_the_lease_while_the_evaluation_is_still_open() {
     let fx = Fx::new();
-    let mut store = EventStore::new(&fx.db()).unwrap();
-    owed(&mut store, "one", 1, S1, 1);
-    drop(store);
-
+    EventStore::new(&fx.db()).unwrap();
+    due_for(&fx.db(), "alpha", S1, 120);
     assert!(is_hold(&fx.stop(S1)));
-    let payload = serde_json::json!({
-        "hook_event_name": "Stop",
-        "session_id": S1,
-        "stop_hook_active": true,
-        "last_assistant_message": "",
-        "cwd": fx.checkout().to_string_lossy(),
-    });
-    fx.hook(&payload.to_string());
+    retry_stop(&fx, S1);
     assert!(serve::holder::leases(&fx.db()).values().any(|l| l.session == S1));
 }

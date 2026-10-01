@@ -102,26 +102,28 @@ fn the_three_arguments_are_real_fields_on_both_doors_and_trial_check_is_gone() {
     assert!(!section.contains("trial_check"), "AGENTS.md must not send an agent to trial_check");
 }
 
-/// A reason tag answers nothing: AGENTS.md, the seeded note and the Stop
-/// hook all say so, and the hook sends an agent to the trial instead of
-/// asking for a quoted call.
+/// A reason tag answers nothing: AGENTS.md, the seeded note and the
+/// evaluation's start note (where the rule upkeep is asked since step 28, no
+/// Stop holds a turn for it any more) all say so, and the start note sends an
+/// agent to the trial instead of asking for a quoted call.
 #[test]
 fn a_reason_tag_answers_nothing_in_every_text_an_agent_reads() {
     let section = agents_teeth_section();
     let seeds = read("ops/src/install.rs");
+    let note = read("serve/src/eval_session.rs");
     let hook = read("serve/src/bin/serve.rs");
     assert!(section.contains("A `no-literal:` tag answers nothing"), "AGENTS.md must say a reason answers nothing");
     assert!(seeds.contains("A no-literal tag answers nothing."), "the seeded note must say a reason answers nothing");
     assert!(
-        hook.contains("A tag, a reason, an open point or a refusal on record settles"),
-        "the Stop hook must say a reason settles nothing"
+        note.contains("A tag, a reason or an open point settles nothing"),
+        "the evaluation's start note must say a reason settles nothing"
     );
-    assert!(hook.contains("retest_command_for"), "the Stop hook must send an agent to the trial, by its command");
     assert!(
-        hook.contains("mcp__thor__revise with only the rule's id runs the same trial"),
-        "and name the write tool's door to the same trial"
+        note.contains("mcp__thor__revise(id: \\\"{id}\\\")"),
+        "and name the write tool's door to the trial"
     );
-    assert!(!hook.contains("QUOTES the legitimate call"), "the Stop hook must not ask for a reason that answers nothing");
+    assert!(!hook.contains("fn teeth_debt"), "no Stop asks about the rules the trial has not decided any more");
+    assert!(!hook.contains("QUOTES the legitimate call"), "nothing may ask for a reason that answers nothing");
     assert!(seeds.contains("Every rule is tried when written."), "the seeded note must say every rule is tried");
 }
 
@@ -199,7 +201,7 @@ fn agents_md_gives_the_numbers_the_evaluation_really_uses() {
         format!("at most {} that need a fix", model::store::EVALUATION_TEETH_BATCH),
         format!("at most {} that only have to name", model::store::EVALUATION_A4_LIST),
         format!("at least {} minutes of its own work", serve::usefulness::EVAL_OWN_WORK_MINUTES),
-        format!("{} times or more without a verdict", model::store::JUDGEMENT_DEBT_AFTER),
+        format!("{} sessions or more without a verdict", model::store::JUDGEMENT_DEBT_AFTER),
         format!("at least {} characters", model::store::NOT_JUDGEABLE_REASON_MIN_CHARS),
         format!("covers the next {} hours", serve::usefulness::EVAL_REPORT_COVERS_HOURS),
         format!("last {} days", serve::usefulness::EVAL_FLOOR_DAYS),

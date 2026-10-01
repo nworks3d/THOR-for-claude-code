@@ -82,6 +82,63 @@ fn contains_phrase(haystack_normalized: &str, needle: &str) -> bool {
     }
 }
 
+/// Folder names too common to name a place by themselves, longer than the
+/// shortest-name rule of `is_generic_segment` would catch.
+const GENERIC_SEGMENTS: &[&str] = &[
+    "server", "client", "tests", "config", "public", "static", "assets", "build", "source", "scripts", "utils", "common",
+    "shared", "tools", "staging", "production", "backend", "frontend", "services", "models", "components", "templates",
+    "scratch", "output", "vendor", "target", "files", "pages", "routes", "health", "index",
+];
+
+/// Whether the last segment of a path, directory or route anchor is a bare
+/// generic word (`dev`, `src`, `test`, `lib`, `docs`, `server`, `app`, `main`
+/// ...) that a sentence uses for a hundred other things (step 28). Field case
+/// 2026-10-02: a fact anchored at `/site/dev/` was drawn by the owner's
+/// prompt word "dev". The rule: a segment is generic when it has no dot (a
+/// file name with an extension, `main.rs` or `index.html`, names that file),
+/// and it is a route parameter (`:id`), or at most four characters, or on the
+/// `GENERIC_SEGMENTS` list. A generic segment names its place only through its
+/// path (`names_full_path`), never through the bare word.
+fn is_generic_segment(segment: &str) -> bool {
+    if segment.contains('.') {
+        return false;
+    }
+    segment.starts_with(':') || segment.chars().count() <= 4 || GENERIC_SEGMENTS.contains(&segment)
+}
+
+/// Is the anchor's path written in the prompt as a path: its last two segments
+/// (`site/dev` for `/site/dev/` or for `//nas/web/site/dev/`), on their own and
+/// not inside a longer name? Two segments with a slash between them are a path
+/// whatever the words are; one bare word never is. A one-segment anchor has no
+/// such path to name.
+fn names_full_path(haystack_normalized: &str, anchor_normalized: &str) -> bool {
+    let segments: Vec<&str> = anchor_normalized.split('/').filter(|part| !part.is_empty()).collect();
+    let [.., parent, last] = segments.as_slice() else { return false };
+    let path = format!("{parent}/{last}");
+    let part_of_a_name = |c: char| c.is_alphanumeric() || matches!(c, '_' | '-' | '.');
+    haystack_normalized.match_indices(&path).any(|(at, found)| {
+        let before = haystack_normalized[..at].chars().next_back();
+        let after = haystack_normalized[at + found.len()..].chars().next();
+        !before.is_some_and(part_of_a_name) && !after.is_some_and(part_of_a_name)
+    })
+}
+
+/// Does the prompt name this target? A command, host or symbol anchor by its
+/// last segment as a word (`contains_phrase`); a path, directory or route
+/// anchor the same way unless that segment is a bare generic word, which only
+/// its path (`site/dev`) names.
+fn names_target(prompt_normalized: &str, kind: model::item::TargetKind, value: &str) -> bool {
+    use model::item::TargetKind;
+    let anchor = normalize_target(value);
+    let segment = last_segment(&anchor);
+    match kind {
+        TargetKind::Path | TargetKind::Dir | TargetKind::Route if is_generic_segment(segment) => {
+            names_full_path(prompt_normalized, &anchor)
+        }
+        _ => contains_phrase(prompt_normalized, segment),
+    }
+}
+
 /// The wrappers a harness puts around text that is NOT the owner's own typing:
 /// a message from another session, a subagent's hand-back, a background task's
 /// notification, a local-command echo, a system reminder. Field case
@@ -194,8 +251,7 @@ pub fn resolve(prompt: &str, candidates: &[LiveItem]) -> ServeInput {
     for c in candidates {
         for binding in &c.item.bindings {
             if let Binding::Target { kind, value } = binding {
-                let seg = last_segment(&normalize_target(value)).to_string();
-                if contains_phrase(&normalized_prompt, &seg) {
+                if names_target(&normalized_prompt, *kind, value) {
                     let entry = (*kind, value.clone());
                     if !input.targets.contains(&entry) {
                         input.targets.push(entry);
@@ -367,5 +423,70 @@ mod tests {
         }
         assert!(is_owners_own_text("Loop de testsuite na en verbeter ze"));
         assert!(is_owners_own_text("/thor-eval"));
+    }
+
+    /// THE DEFECT THIS CLOSES (field case 2026-10-02): facts anchored at
+    /// `/site/dev/` were drawn by the owner's prompt word "dev".
+    #[test]
+    fn a_bare_generic_word_never_names_a_path_or_route_anchor() {
+        let items = vec![
+            target_item("route", TargetKind::Route, "/site/dev/"),
+            target_item("share", TargetKind::Path, r"\\nas\web\site\dev\"),
+            target_item("src", TargetKind::Dir, "server/src"),
+            target_item("docs", TargetKind::Path, "docs"),
+        ];
+        for prompt in ["daarna push dev", "Alleen op dev, niets deployen", "kijk in src en de docs van de server", "test op dev"] {
+            let input = resolve(prompt, &items);
+            assert!(input.targets.is_empty(), "{prompt}: {:?}", input.targets);
+        }
+    }
+
+    #[test]
+    fn the_path_still_names_the_place() {
+        let items = vec![
+            target_item("route", TargetKind::Route, "/site/dev/"),
+            target_item("share", TargetKind::Path, r"\\nas\web\site\dev\"),
+        ];
+        assert_eq!(resolve("deploy naar site/dev vandaag", &items).targets.len(), 2, "both end in the path site/dev");
+        assert_eq!(resolve("deploy naar web/site/dev vandaag", &items).targets.len(), 2, "a longer part of the path names it too");
+        assert_eq!(resolve("kopieer naar /site/dev/ en kijk", &items).targets.len(), 2);
+        let share = resolve("zet het op nas/web/site/dev", &items);
+        assert!(share.targets.iter().any(|(_, v)| v.contains("nas")), "{:?}", share.targets);
+    }
+
+    #[test]
+    fn a_full_path_inside_a_longer_name_is_not_the_path() {
+        let items = vec![target_item("route", TargetKind::Route, "/site/dev/")];
+        for prompt in ["kijk in site/devices", "mysite/dev is anders", "site/dev.old"] {
+            assert!(resolve(prompt, &items).targets.is_empty(), "{prompt}");
+        }
+    }
+
+    #[test]
+    fn a_distinctive_segment_or_a_file_name_still_names_its_place() {
+        let items = vec![
+            target_item("core", TargetKind::Dir, "/srv/estimator-core/"),
+            target_item("file", TargetKind::Path, "site/index.html"),
+            target_item("name", TargetKind::Path, "ops/Dockerfile"),
+        ];
+        assert_eq!(resolve("kijk eens naar estimator-core", &items).targets.len(), 1);
+        assert_eq!(resolve("pas index.html aan", &items).targets.len(), 1);
+        assert_eq!(resolve("herschrijf de Dockerfile", &items).targets.len(), 1);
+    }
+
+    #[test]
+    fn the_generic_rule_is_for_places_only_a_command_anchor_keeps_its_word() {
+        let items = vec![target_item("cmd", TargetKind::Command, "dev"), target_item("host", TargetKind::Host, "dev")];
+        assert_eq!(resolve("start dev nu", &items).targets.len(), 2);
+    }
+
+    #[test]
+    fn the_generic_segment_rule_in_words() {
+        for generic in ["dev", "src", "test", "lib", "docs", "server", "app", "main", "site", "tests", ":id", "config"] {
+            assert!(is_generic_segment(generic), "{generic}");
+        }
+        for distinctive in ["estimator-core", "main.rs", "index.html", "dockerfile", "acme-estimator", "swap-binary.ps1"] {
+            assert!(!is_generic_segment(distinctive), "{distinctive}");
+        }
     }
 }

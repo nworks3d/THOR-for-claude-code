@@ -37,6 +37,17 @@ pub fn record_delivery(
     record_delivery_with_trigger(store, session_id, lineage_id, actor, served_at, ids, None);
 }
 
+/// The session id of the `i`-th of several firings of one fact in a fixture:
+/// the first is `base` itself, every other one a session of its own. The
+/// judgement debt counts a fact once per session (step 28), so a fixture that
+/// wants "fired N times" has to fire it in N sessions.
+pub fn nth_session(base: &str, i: usize) -> String {
+    match i {
+        0 => base.to_string(),
+        _ => format!("{base}-{i}"),
+    }
+}
+
 /// The longest `trigger` a served event records verbatim - a command line
 /// can run to any length, and the point of this field is naming the general
 /// shape of where an item fired (see `ItemServed::trigger`'s own doc

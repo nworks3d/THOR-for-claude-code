@@ -20,10 +20,10 @@ A useful mark is not a dead signal. The latest verdict is what counts:
 - two noise marks since the last useful mark take a fact out of the
   injection channels - it stays findable through lookup regardless.
 
-The Stop hook already asks for a verdict on the single most-served unjudged
-item, once per turn. That is the same debt this routine pays; here you
-settle it deliberately, over the whole session, instead of one item at a
-time.
+No Stop hook asks for a verdict on a single item any more (since THOR
+2.5.6): the items that fired in many sessions without a verdict wait for this
+routine, and a fact counts once per session however often it was shown there.
+Here you settle them deliberately, over the whole session, in one block.
 
 ## When THOR asks for this, and how it starts
 
@@ -43,31 +43,26 @@ running this project's evaluation and was active in the last 30 minutes, you
 are told that in one line, naming that session, and are not held. Once it has
 been quiet longer, the next ask takes the evaluation over. A project with activity in the last seven days and no
 evaluation that counts in seven days is due whatever the clock says.
-Since THOR 2.5.4 the same holds for the judgement debt ("N item(s) have fired
-repeatedly") and the question about old rules: per project one session at a
-time is held - the one running its evaluation, else the one already held for
-the project's debt, else the first one asked. Another session in the same
-project gets one line naming the holder and is not held; once the holder has
-been quiet for 30 minutes, the next one asked takes it over. A verdict counts
-per item for everyone. What is about your OWN writes (a fact stored onto a
-full place, an unattested write, setup, a decision the owner stated) stays
-per session.
+Since THOR 2.5.6 the judgement debt and the question about old rules are not
+asked at a turn-end at all: this evaluation is the one place, per project at
+most once every 16 hours, so a session is never handed something to judge
+every quarter of an hour. A verdict counts per item for everyone. What is
+about your OWN writes (a fact stored onto a full place, setup, a decision the
+owner stated) stays per session.
 If THOR says this routine changed since you last read it, read it again
 before you go on: never work from an old version.
 When something else holds the same turn-end first - a reply rule, the
-first-session setup, a decision the owner stated that was not stored, a note
-stored onto a full place, or the question about old rules below - the ask
-comes in the same message, after it. Settle both.
+first-session setup, a decision the owner stated that was not stored, or a
+note stored onto a full place - the ask comes in the same message, after it.
+Settle both.
 
-THOR can also hold a turn-end to ask about old rules whose trial it has not
-decided yet. That question waits for the same two terms as the ask: ten
-minutes of the session's own work in the project, and never the first
-turn-end there, so a short session is not held for it. It prints ONE command
-to run, `serve ... retest --id '<id>'`, written with forward slashes and no
-`&`: that is exactly the form this routine's `allowed-tools` pre-approves, so
-run it as printed (add `--apply` to write the verdict). Do not retype it in
-another shell form - a PowerShell form is not pre-approved and a headless
-session is refused.
+The old rules whose trial THOR has not decided yet are asked here, in the
+start note (the batch and the A4 list), not at a turn-end. Each line prints
+ONE command to run, `serve ... retest --id '<id>'`, written with forward
+slashes and no `&`: that is exactly the form this routine's `allowed-tools`
+pre-approves, so run it as printed (add `--apply` to write the verdict). Do
+not retype it in another shell form - a PowerShell form is not pre-approved
+and a headless session is refused.
 
 The ask does not go quiet after one turn: it holds the end of every turn,
 naming how many times it has already asked and since when, until a report
@@ -178,7 +173,8 @@ mcp__thor__ server is the authority.
 
 Your list is the one the start note printed under JUDGEMENT, frozen when the
 evaluation started: exactly the items that fired in THIS session and had
-fired 40 times or more since their last verdict. Judge only those. A pinned
+fired in 40 sessions or more since their last verdict (a fact counts once per
+session). Judge only those. A pinned
 item is never on it: the owner already answered whether it belongs there by
 pinning it.
 

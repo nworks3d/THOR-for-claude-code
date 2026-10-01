@@ -394,8 +394,8 @@ fn a_subagents_stop_is_silent_for_the_judgement_debt() {
     {
         let mut store = thor_core::event_store::EventStore::new(&db).unwrap();
         declare_watched_rule(&mut store, "watched-rule");
-        for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
-            serve::deliver::record_delivery(&mut store, "s1", "s1", "hook", "2026-09-09T00:00:00Z", &["watched-rule".to_string()]);
+        for i in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
+            serve::deliver::record_delivery(&mut store, &serve::deliver::nth_session("s1", i), "s1", "hook", "2026-09-09T00:00:00Z", &["watched-rule".to_string()]);
         }
     }
 
@@ -403,28 +403,25 @@ fn a_subagents_stop_is_silent_for_the_judgement_debt() {
     assert!(out.trim().is_empty(), "a subagent's Stop must never be held by the judgement debt: {out}");
 }
 
-/// Scoped, not a kill switch: the IDENTICAL store and served history, minus
-/// `agent_id`, still blocks the owner's own main session on the judgement
-/// debt exactly as it did before this task (see `judgement_debt` itself,
-/// unchanged).
+/// Since step 28 nothing holds ANY Stop for the judgement debt - it is asked
+/// inside the evaluation only (`serve/tests/no_upkeep_hold_at_stop.rs`): the
+/// IDENTICAL store and served history, minus `agent_id`, no longer blocks the
+/// owner's own main session either.
 #[test]
-fn the_owners_own_main_session_still_gets_the_judgement_debt() {
+fn the_owners_own_main_session_is_not_held_for_the_judgement_debt_any_more() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("thor.db");
     {
         let mut store = thor_core::event_store::EventStore::new(&db).unwrap();
         declare_watched_rule(&mut store, "watched-rule");
-        for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
-            serve::deliver::record_delivery(&mut store, "s1", "s1", "hook", "2026-09-09T00:00:00Z", &["watched-rule".to_string()]);
+        for i in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
+            serve::deliver::record_delivery(&mut store, &serve::deliver::nth_session("s1", i), "s1", "hook", "2026-09-09T00:00:00Z", &["watched-rule".to_string()]);
         }
     }
 
     let out = run_hook(&db, &main_session_stop_payload("s1", ""));
-    let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("expected a decision JSON: {e}: {out}"));
-    assert_eq!(v["decision"], "block", "{out}");
-    let reason = v["reason"].as_str().unwrap();
-    assert!(reason.contains("watched-rule"), "must name the owed item: {reason}");
-    assert!(reason.contains("fired repeatedly"), "must be the judgement debt's own message: {reason}");
+    assert!(!out.contains("fired repeatedly"), "the debt is the evaluation's, never a Stop's: {out}");
+    assert!(!out.contains("\"decision\":\"block\""), "{out}");
 }
 
 /// Write `absent-guard-stale.json` directly beside the store, with exactly

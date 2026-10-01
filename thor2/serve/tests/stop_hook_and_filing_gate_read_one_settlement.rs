@@ -1,8 +1,9 @@
-//! The Stop hook's teeth question, the evaluation-filing gate and its batch
-//! read ONE answer (`model::store::settlement`, step 9): the same rules are
-//! owed on all three, a settled rule is named by none, and a rule held by a
-//! machine blocker is named by none until the blocker lifts - then by all
-//! three. Both blockers (step 14): a file check of a project with no
+//! The evaluation's batch and the evaluation-filing gate read ONE answer
+//! (`model::store::settlement`, step 9): the same rules are owed on both, a
+//! settled rule is named by neither, and a rule held by a machine blocker is
+//! named by neither until the blocker lifts - then by both. Since step 28 no
+//! Stop hook asks about these rules at all (the owner's decision: that is the
+//! evaluation's question), and this file proves the Stop names none of them. Both blockers (step 14): a file check of a project with no
 //! registered working copy, and a contains literal an uncommitted edit took
 //! out of the registered working tree while the default branch still has it.
 //!
@@ -40,8 +41,8 @@ fn run_hook(db: &Path, payload: &str) -> String {
 }
 
 /// The Stop of `session` in project `p`, once it has thirty minutes of its
-/// own work there and an earlier turn: since step 21 the teeth question
-/// holds a session only past the evaluation ask's own gates.
+/// own work there and an earlier turn - the point where the teeth question
+/// used to hold it. What the hook said, whatever it was.
 fn stop_reason(db: &Path, session: &str, cwd: &Path) -> String {
     let mut all = serve::usefulness::read_eval_debt_state(db);
     let now = serve::time::now_unix();
@@ -64,10 +65,7 @@ fn stop_reason(db: &Path, session: &str, cwd: &Path) -> String {
         "last_assistant_message": "",
     })
     .to_string();
-    let out = run_hook(db, &payload);
-    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap_or_else(|e| panic!("expected a block: {e}: {out}"));
-    assert_eq!(v["decision"], "block", "{out}");
-    v["reason"].as_str().unwrap().to_string()
+    run_hook(db, &payload)
 }
 
 fn legacy(store: &mut EventStore, item: &Item) {
@@ -184,9 +182,9 @@ fn the_stop_hook_the_batch_and_the_filing_gate_name_the_same_rules() {
     // (no working copy).
     std::fs::write(checkout.join(".thor-project"), "p\n").unwrap();
     let (stop, batch, filing) = three_answers(&db, "session-one", &checkout);
-    assert_eq!(stop, set(&["owed-1", "owed-2"]), "the Stop hook");
-    assert_eq!(batch, stop, "the batch reads the same answer");
-    assert_eq!(filing, stop, "and so does the filing gate");
+    assert_eq!(stop, set(&[]), "no Stop names a rule of the upkeep any more");
+    assert_eq!(batch, set(&["owed-1", "owed-2"]), "the batch");
+    assert_eq!(filing, batch, "and the filing gate reads the same answer");
 
     // Registered: that blocker lifts, and all three name blocked-1. For
     // blocked-2 the other blocker holds now: both files are committed, and an
@@ -233,9 +231,9 @@ fn the_stop_hook_the_batch_and_the_filing_gate_name_the_same_rules() {
     drop(store);
     serve::holder::release(&db, "session-one");
     let (stop, batch, filing) = three_answers(&db, "session-two", &checkout);
-    assert_eq!(stop, set(&["owed-1", "owed-2", "blocked-1"]), "the Stop hook");
-    assert_eq!(batch, stop, "the batch");
-    assert_eq!(filing, stop, "the filing gate");
+    assert_eq!(stop, set(&[]), "the Stop hook");
+    assert_eq!(batch, set(&["owed-1", "owed-2", "blocked-1"]), "the batch");
+    assert_eq!(filing, batch, "the filing gate");
     {
         let store = EventStore::open_existing(&db).unwrap();
         assert_eq!(
@@ -255,7 +253,7 @@ fn the_stop_hook_the_batch_and_the_filing_gate_name_the_same_rules() {
     drop(store);
     serve::holder::release(&db, "session-two");
     let (stop, batch, filing) = three_answers(&db, "session-three", &checkout);
-    assert_eq!(stop, set(&["owed-1", "owed-2", "blocked-1", "blocked-2"]), "the Stop hook");
-    assert_eq!(batch, stop, "the batch");
-    assert_eq!(filing, stop, "the filing gate");
+    assert_eq!(stop, set(&[]), "the Stop hook");
+    assert_eq!(batch, set(&["owed-1", "owed-2", "blocked-1", "blocked-2"]), "the batch");
+    assert_eq!(filing, batch, "the filing gate");
 }

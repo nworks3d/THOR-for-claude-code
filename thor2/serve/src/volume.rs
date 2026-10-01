@@ -1,0 +1,277 @@
+//! THE VOLUME RECORD (step 28): how much THOR talks, kept so the owner can see
+//! whether sessions get nagged.
+//!
+//! The owner's decision, 2026-10-02: "doctor moet deze dan maar bijhouden". A
+//! session must not be handed something to judge every quarter of an hour, and
+//! the facts shown to it are limited to one full showing per context
+//! (`repeat`); doctor shows whether that holds.
+//!
+//! One small append-only file beside the store, `volume-log.jsonl`, one JSON
+//! line per hook call that showed or hid something, and one per Stop:
+//!
+//! - `{"t":<unix>,"k":"show","s":"<session>","i":["<id>",...],"r":<n>}` - the
+//!   facts shown in full (`i`) and how many repeats were left out (`r`);
+//! - `{"t":<unix>,"k":"stop","s":"<session>","h":0|1}` - a Stop, and whether it
+//!   held the turn.
+//!
+//! Best effort like every sidecar: a line that cannot be written is lost, never
+//! an error for the hook. Nothing here ever reads the store, and doctor only
+//! reads this file. The file is cut to the last `KEEP_DAYS` days when it grows
+//! past `PRUNE_ABOVE_BYTES`.
+
+use std::collections::BTreeMap;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+/// The file beside the store.
+pub const FILE: &str = "volume-log.jsonl";
+
+/// How long a line is kept.
+const KEEP_DAYS: i64 = 8;
+
+/// The file is cut to `KEEP_DAYS` once it is bigger than this.
+const PRUNE_ABOVE_BYTES: u64 = 3 * 1024 * 1024;
+
+/// The windows doctor reports, in seconds, with their labels.
+pub const WINDOWS: [(&str, i64); 2] = [("24 hours", 24 * 3600), ("7 days", 7 * 24 * 3600)];
+
+/// How many of the most shown facts doctor names.
+pub const TOP: usize = 5;
+
+fn path(db: &Path) -> PathBuf {
+    db.parent().unwrap_or_else(|| Path::new(".")).join(FILE)
+}
+
+fn append(db: &Path, line: String, now: i64) {
+    let file = path(db);
+    if crate::store_dir::is_held(&file) {
+        return;
+    }
+    let opened = std::fs::OpenOptions::new().create(true).append(true).open(&file);
+    let Ok(mut opened) = opened else { return };
+    if writeln!(opened, "{line}").is_err() {
+        return;
+    }
+    if opened.metadata().map(|m| m.len() > PRUNE_ABOVE_BYTES).unwrap_or(false) {
+        drop(opened);
+        prune(&file, now);
+    }
+}
+
+fn prune(file: &Path, now: i64) {
+    let Ok(text) = std::fs::read_to_string(file) else { return };
+    let from = now - KEEP_DAYS * 24 * 3600;
+    let kept: Vec<&str> = text.lines().filter(|l| parse(l).is_some_and(|e| e.t >= from)).collect();
+    let _ = std::fs::write(file, format!("{}\n", kept.join("\n")));
+}
+
+/// One hook call showed `shown` facts in full and left `suppressed` repeats
+/// out. Nothing is written when both are nothing.
+pub fn record_showing(db: &Path, session_id: &str, shown: &[&str], suppressed: usize) {
+    if shown.is_empty() && suppressed == 0 {
+        return;
+    }
+    let now = crate::time::now_unix();
+    let line = serde_json::json!({ "t": now, "k": "show", "s": session_id, "i": shown, "r": suppressed });
+    append(db, line.to_string(), now);
+}
+
+/// A Stop of `session_id`, and whether it held the turn.
+pub fn record_stop(db: &Path, session_id: &str, held: bool) {
+    let now = crate::time::now_unix();
+    let line = serde_json::json!({ "t": now, "k": "stop", "s": session_id, "h": u8::from(held) });
+    append(db, line.to_string(), now);
+}
+
+struct Entry {
+    t: i64,
+    kind: Kind,
+    session: String,
+}
+
+enum Kind {
+    Show { ids: Vec<String>, suppressed: usize },
+    Stop { held: bool },
+}
+
+fn parse(line: &str) -> Option<Entry> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    let kind = match v.get("k")?.as_str()? {
+        "show" => Kind::Show {
+            ids: v.get("i")?.as_array()?.iter().filter_map(|x| x.as_str().map(str::to_string)).collect(),
+            suppressed: v.get("r")?.as_u64()? as usize,
+        },
+        "stop" => Kind::Stop { held: v.get("h")?.as_u64()? != 0 },
+        _ => return None,
+    };
+    Some(Entry { t: v.get("t")?.as_i64()?, kind, session: v.get("s")?.as_str()?.to_string() })
+}
+
+/// What one window of the record adds up to.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Summary {
+    /// Facts shown in full.
+    pub full: usize,
+    /// Repeats left out because the context had seen the fact.
+    pub suppressed: usize,
+    /// The most shown facts, most first, ties by id.
+    pub top: Vec<(String, usize)>,
+    /// Stops that held the turn.
+    pub holds: usize,
+    /// Sessions that had at least one Stop.
+    pub sessions: usize,
+}
+
+/// The record read from the file, oldest first. A missing or unreadable file
+/// reads as none.
+fn read(db: &Path) -> Vec<Entry> {
+    std::fs::read_to_string(path(db)).map(|t| t.lines().filter_map(parse).collect()).unwrap_or_default()
+}
+
+fn summarize(entries: &[Entry], from: i64) -> Summary {
+    let mut summary = Summary::default();
+    let mut shown: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut stop_sessions: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for entry in entries.iter().filter(|e| e.t >= from) {
+        match &entry.kind {
+            Kind::Show { ids, suppressed } => {
+                summary.full += ids.len();
+                summary.suppressed += suppressed;
+                for id in ids {
+                    *shown.entry(id.as_str()).or_default() += 1;
+                }
+            }
+            Kind::Stop { held } => {
+                stop_sessions.insert(entry.session.as_str());
+                summary.holds += usize::from(*held);
+            }
+        }
+    }
+    summary.sessions = stop_sessions.len();
+    let mut top: Vec<(String, usize)> = shown.into_iter().map(|(id, n)| (id.to_string(), n)).collect();
+    top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    top.truncate(TOP);
+    summary.top = top;
+    summary
+}
+
+/// The one doctor line of a window.
+fn line_of(label: &str, s: &Summary) -> String {
+    let top = match s.top.is_empty() {
+        true => "none".to_string(),
+        false => s.top.iter().map(|(id, n)| format!("{id} ({n}x)")).collect::<Vec<_>>().join(", "),
+    };
+    let holds = match s.sessions {
+        0 => "no Stop recorded".to_string(),
+        n => format!("{} Stop hold(s) in {n} session(s), {:.1} per session on average", s.holds, s.holds as f64 / n as f64),
+    };
+    format!(
+        "volume, last {label}: {} fact(s) shown in full at prompts and tool calls (session starts not counted), {} repeat(s) left out; most shown: {top}; {holds}",
+        s.full, s.suppressed
+    )
+}
+
+/// The doctor lines: one per window, or one line saying nothing is recorded
+/// yet. Reads the record only.
+pub fn lines(db: &Path, now: i64) -> Vec<String> {
+    let entries = read(db);
+    if entries.is_empty() {
+        return vec![
+            "volume: nothing recorded yet (THOR 2.5.6 starts recording it: how many facts were shown or left out and how \
+             many Stops held a turn, over the last 24 hours and 7 days)"
+                .to_string(),
+        ];
+    }
+    WINDOWS.iter().map(|(label, secs)| line_of(label, &summarize(&entries, now - secs))).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(db: &Path, t: i64, line: serde_json::Value) {
+        let mut line = line;
+        line["t"] = serde_json::json!(t);
+        append(db, line.to_string(), t);
+    }
+
+    fn show(s: &str, ids: &[&str], r: usize) -> serde_json::Value {
+        serde_json::json!({ "k": "show", "s": s, "i": ids, "r": r })
+    }
+
+    fn stop(s: &str, held: u8) -> serde_json::Value {
+        serde_json::json!({ "k": "stop", "s": s, "h": held })
+    }
+
+    #[test]
+    fn the_windows_add_up_showings_repeats_the_top_facts_and_stop_holds_per_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        let now = 1_000_000_000;
+        let day = 24 * 3600;
+        at(&db, now - 3600, show("s1", &["a", "b"], 3));
+        at(&db, now - 1800, show("s1", &["a"], 0));
+        at(&db, now - 600, show("s2", &["c"], 1));
+        at(&db, now - 500, stop("s1", 1));
+        at(&db, now - 400, stop("s1", 0));
+        at(&db, now - 300, stop("s2", 0));
+        at(&db, now - 3 * day, show("s0", &["old", "old2"], 9));
+        at(&db, now - 3 * day, stop("s0", 1));
+        let all = lines(&db, now);
+        assert_eq!(all.len(), 2);
+        assert!(
+            all[0].contains("last 24 hours: 4 fact(s) shown in full at prompts and tool calls (session starts not counted), 4 repeat(s) left out; most shown: a (2x), b (1x), c (1x);")
+                && all[0].contains("1 Stop hold(s) in 2 session(s), 0.5 per session on average"),
+            "{}",
+            all[0]
+        );
+        assert!(
+            all[1].contains("last 7 days: 6 fact(s) shown in full at prompts and tool calls (session starts not counted), 13 repeat(s) left out")
+                && all[1].contains("2 Stop hold(s) in 3 session(s), 0.7 per session on average"),
+            "{}",
+            all[1]
+        );
+    }
+
+    #[test]
+    fn only_the_five_most_shown_facts_are_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        let now = 1_000_000_000;
+        for (i, id) in ["a", "b", "c", "d", "e", "f", "g"].iter().enumerate() {
+            for _ in 0..(10 - i) {
+                at(&db, now - 60, show("s", &[id], 0));
+            }
+        }
+        let first = &lines(&db, now)[0];
+        assert!(first.contains("most shown: a (10x), b (9x), c (8x), d (7x), e (6x);"), "{first}");
+    }
+
+    #[test]
+    fn nothing_recorded_says_so_and_a_recording_run_leaves_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        assert_eq!(lines(&db, 100).len(), 1);
+        assert!(lines(&db, 100)[0].starts_with("volume: nothing recorded yet"));
+        record_showing(&db, "s", &[], 0);
+        assert!(!dir.path().join(FILE).exists(), "a block that showed and hid nothing writes nothing");
+        {
+            let _held = crate::store_dir::hold(&db);
+            record_showing(&db, "s", &["a"], 0);
+            record_stop(&db, "s", true);
+        }
+        assert!(!dir.path().join(FILE).exists(), "a held directory takes no write");
+    }
+
+    #[test]
+    fn an_old_line_goes_when_the_file_is_cut_and_a_new_one_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        let now = 1_000_000_000;
+        at(&db, now - 20 * 24 * 3600, show("s", &["old"], 0));
+        at(&db, now - 60, show("s", &["new"], 0));
+        prune(&path(&db), now);
+        let text = std::fs::read_to_string(path(&db)).unwrap();
+        assert!(!text.contains("old") && text.contains("new"), "{text}");
+    }
+}

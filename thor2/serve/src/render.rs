@@ -105,19 +105,7 @@ pub fn cap(ranked: Vec<RankedItem>) -> Selection {
 /// surface that pushes at a reader stays minimal, a surface a reader asks
 /// carries everything.
 pub fn render_text(selection: &Selection, input: &ServeInput, db_path: &Path) -> Option<String> {
-    render_text_with_reminders(selection, &[], input, db_path)
-}
-
-/// `render_text`, plus one line for each fact this reader has already seen in
-/// full (`repeat`): they follow the full facts, and a block with nothing but
-/// reminders is still a block.
-pub fn render_text_with_reminders(
-    selection: &Selection,
-    reminders: &[RankedItem],
-    input: &ServeInput,
-    db_path: &Path,
-) -> Option<String> {
-    if selection.shown.is_empty() && reminders.is_empty() {
+    if selection.shown.is_empty() {
         return None;
     }
     let head = if input.moments.is_empty() {
@@ -135,9 +123,6 @@ pub fn render_text_with_reminders(
     // value was already banked at write time.
     for ranked in &selection.shown {
         lines.push(format!("- [{}] {}", ranked.id, ranked.item.text));
-    }
-    for ranked in reminders {
-        lines.push(crate::repeat::reminder_line(ranked));
     }
     if selection.withheld > 0 {
         lines.push(format!(
