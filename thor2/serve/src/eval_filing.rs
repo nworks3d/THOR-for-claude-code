@@ -31,8 +31,10 @@
 //!
 //! A MISSING TRANSCRIPT IS INVALID, never a way out: deleting a file does not
 //! waive anything. A transcript that exists, is larger than 64 KB and holds
-//! not one tool call THOR can parse is FORMAT DRIFT (D14): a Claude Code
-//! update changed its shape. Then no report counts, nothing is asked that
+//! not one tool call THOR can parse, although a filing call must be in it, or
+//! tool calls it fails to read (a `tool_use` structure no known line matches),
+//! is FORMAT DRIFT (D14): a Claude Code update changed its shape. A large
+//! transcript with no tool call at all is just a chat-only turn. Then no report counts, nothing is asked that
 //! cannot be filed, and every turn says so (`DRIFT_LINE`). Rewriting a
 //! transcript to look drifted is a forged artifact (N9).
 
@@ -46,8 +48,8 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use thor_core::event_store::{Event, EventKind, EventStore};
 
-/// A transcript this large that holds no tool call of the known shape is
-/// format drift, not a session that simply made no call.
+/// A transcript this large that holds no tool call of the known shape although
+/// a call must be there (or holds calls in another shape) is format drift.
 pub const DRIFT_MIN_BYTES: u64 = 64 * 1024;
 
 /// What every turn says while the transcript is in a shape THOR cannot read
@@ -111,18 +113,47 @@ pub fn filing_event(store: &EventStore, report_id: &str) -> Option<(Event, Item)
     filing
 }
 
-/// Whether the transcript `files` hold no tool call THOR can read although
-/// they are large enough that they must (D14).
-pub fn transcript_drifted(files: &[PathBuf]) -> bool {
-    let bytes: u64 = files.iter().filter_map(|f| std::fs::metadata(f).ok()).map(|m| m.len()).sum();
-    bytes > DRIFT_MIN_BYTES && !files.iter().any(|f| holds_a_known_tool_use(f))
+/// Whether the transcript `files` hold tool calls THOR cannot read although one
+/// must be there (D14): the transcript is large, no line is a tool call of the
+/// known shape, and EITHER some line carries a tool call in another shape OR
+/// the log proves the session made a THOR call (`made_a_thor_call`: a write
+/// stamped by the tool server, whose call must be in the transcript). Size
+/// plus "no tool call this turn" is NEVER drift: a chat-only turn of a real
+/// session is large only because of the context injected into it, and holds
+/// no tool call to read at all.
+pub fn transcript_drifted(files: &[PathBuf], made_a_thor_call: impl FnOnce() -> bool) -> bool {
+    large_enough_to_hold_calls(files)
+        && !files.iter().any(|f| holds_a_known_tool_use(f))
+        && (files.iter().any(|f| holds_an_unreadable_tool_use(f)) || made_a_thor_call())
 }
 
-/// Whether session `session`'s own transcript under `root` is in a shape THOR
-/// cannot read - the Stop hook's per-turn question. A session with no
-/// transcript at all is not drift.
-pub fn session_drifted(root: Option<&Path>, session: &str) -> bool {
-    root.is_some_and(|root| transcript_drifted(&attest::session_transcripts(root, session)))
+/// Whether the transcript `files` hold no tool call THOR can read although the
+/// log proves one was made (the filing call of an attested report): such a
+/// transcript is large enough that it must hold it (D14).
+fn filing_call_unreadable(files: &[PathBuf]) -> bool {
+    large_enough_to_hold_calls(files) && !files.iter().any(|f| holds_a_known_tool_use(f))
+}
+
+fn large_enough_to_hold_calls(files: &[PathBuf]) -> bool {
+    let bytes: u64 = files.iter().filter_map(|f| std::fs::metadata(f).ok()).map(|m| m.len()).sum();
+    bytes > DRIFT_MIN_BYTES
+}
+
+/// Whether session `session`'s own transcript under `root` holds tool calls in
+/// a shape THOR cannot read - the Stop hook's per-turn question. A session with
+/// no transcript at all is not drift.
+pub fn session_drifted(db_path: &Path, root: Option<&Path>, session: &str) -> bool {
+    let Some(root) = root else { return false };
+    transcript_drifted(&attest::session_transcripts(root, session), || session_made_a_thor_call(db_path, session))
+}
+
+/// Whether the log holds a write of this session stamped by THOR's tool server
+/// with a call id: a call the session's transcript must hold.
+fn session_made_a_thor_call(db_path: &Path, session: &str) -> bool {
+    let Ok(store) = crate::store_dir::open_existing(db_path) else { return false };
+    store
+        .events_of_kinds_in_session(model::store::ATTESTED_WRITE_KINDS, session)
+        .is_ok_and(|writes| writes.iter().any(|w| attest::claim_of(w).is_ok()))
 }
 
 /// Whether `file` holds one line of the known shape: a `message.content`
@@ -139,6 +170,32 @@ fn holds_a_known_tool_use(file: &Path) -> bool {
             })
         })
     })
+}
+
+/// Whether `file` holds a line that IS a tool call by its structure - a JSON
+/// key named `tool_use`, or a `type` of `tool_use` - or one that mentions a tool
+/// call and does not parse as JSON at all. The word inside free text (injected
+/// context, a pasted note) is neither: only structure counts.
+fn holds_an_unreadable_tool_use(file: &Path) -> bool {
+    let Ok(handle) = std::fs::File::open(file) else { return false };
+    BufReader::new(handle).lines().map_while(Result::ok).filter(|line| line.contains("tool_use")).any(|line| {
+        match serde_json::from_str::<Value>(&line) {
+            Ok(v) => has_tool_use_structure(&v),
+            Err(_) => true,
+        }
+    })
+}
+
+fn has_tool_use_structure(v: &Value) -> bool {
+    match v {
+        Value::Object(map) => {
+            map.get("type").and_then(|t| t.as_str()) == Some("tool_use")
+                || map.contains_key("tool_use")
+                || map.values().any(has_tool_use_structure)
+        }
+        Value::Array(items) => items.iter().any(has_tool_use_structure),
+        _ => false,
+    }
 }
 
 /// The texts THOR's hook put in front of the session that can carry a start
@@ -260,7 +317,7 @@ fn judge(store: &EventStore, event: &Event, filed: &Item, root: Option<&Path>, r
              filing call cannot be checked"
         ));
     }
-    if transcript_drifted(&files) {
+    if filing_call_unreadable(&files) {
         return Validation::Drift(format!(
             "session {session}'s transcript is larger than 64 KB and holds no tool call in a shape THOR can read"
         ));

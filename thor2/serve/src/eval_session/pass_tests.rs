@@ -396,6 +396,60 @@ fn a_global_file_check_is_a_machine_blocker_never_the_agents_batch() {
     );
 }
 
+/// Step 22 (C3b B4 L433-L470): an OLD orientation carries a `path_exists`
+/// check on a file it is not anchored to, and the only way to name the file
+/// (anchor the rule to it) is refused by the crowding cap - four facts already
+/// sit there, and every exit from that is folding, moving or archiving one of
+/// the OWNER's facts. The agent's batch then had one exit left, "drop the
+/// check" (a true one - the file is there), and took it. So the item is THOR's
+/// blocker, never the batch: one point naming the full anchor and every
+/// occupant, in the owner's queue once carried, the check kept. When an
+/// occupant goes, the point closes and the rule is the agent's again.
+#[test]
+fn a_path_check_whose_only_anchor_is_full_is_a_machine_blocker_never_the_agents_batch() {
+    let mut fx = Fx::new();
+    let alpha = fx.checkout("alpha", &[("files/PLAN.md", "the plan
+")], true);
+    fx.register("alpha", &alpha);
+    let occupants = ["plan-note-a", "plan-note-b", "plan-note-c", "plan-note-d"];
+    for id in occupants {
+        let note = rule(id, &format!("A decision about the plan ({id})."), vec![path("files/PLAN.md")], None, Some("alpha"));
+        fx.legacy(&Item { kind: Kind::Orientation, severity: None, ..note });
+    }
+    let project_binding = Binding::Target { kind: TargetKind::Project, value: "alpha".to_string() };
+    let orientation = rule("plan-here", "The plan lives in files/PLAN.md of this repo.", vec![project_binding], Some(Check::PathExists { path: "files/PLAN.md".to_string() }), Some("alpha"));
+    fx.legacy(&Item { kind: Kind::Orientation, severity: None, ..orientation });
+
+    let start = fx.start(S1, "alpha");
+    assert_eq!(outcome_of(&start, "plan-here"), MachineOutcome::Blocked, "{:?}", item_of(&start, "plan-here"));
+    assert!(start.frozen.batch().is_empty() && start.frozen.a4_list().is_empty(), "{:?} {:?}", start.frozen.batch(), start.frozen.a4_list());
+    let points = model::store::open_points(&fx.store, Some("alpha"));
+    let point = points.iter().find(|p| p.machine && p.id.starts_with("open-anchor-full-")).unwrap_or_else(|| panic!("{points:?}"));
+    assert_eq!((point.subject.as_deref(), point.blocker.as_deref()), (Some("files/PLAN.md"), Some("anchor-full")));
+    assert!(point.text.contains("'plan-here'") && point.text.contains("files/PLAN.md"), "{}", point.text);
+    for id in occupants {
+        assert!(point.text.contains(&format!("'{id}'")), "the point names the occupant {id}: {}", point.text);
+    }
+    assert!(point.text.contains("clearing a check that is true is never the way past this"), "{}", point.text);
+    assert!(point.text.contains("The owner decides which fact gives way"), "{}", point.text);
+    assert!(!point.text.contains("drop the check"), "never a text that makes clearing the cheapest exit: {}", point.text);
+    assert!(start_note(&start).contains("'plan-here'") || start_note(&start).contains("held by a blocker only the owner can lift"), "{}", start_note(&start));
+    for at in [Some(&start), None] {
+        assert!(matches!(model::store::settlement(&fx.store, "plan-here", at), Settlement::Settled(Settled::Blocked(_))), "{at:?}");
+    }
+    assert!(model::store::show(&fx.store, "plan-here").unwrap().check.is_some(), "its check stays");
+    file(&mut fx, &start, "eval-alpha-1").expect("a rule held by THOR's blocker holds no filing");
+
+    // The owner archives one occupant: the place has room, the point closes
+    // at the next start, and the rule is the agent's again - anchoring works.
+    model::store::retract(&mut fx.store, "s", "l", "a", "plan-note-d", "fixture: the owner folded it away", None).unwrap();
+    let next = fx.start(S2, "alpha");
+    let machine = next.frozen.machine.clone().unwrap();
+    assert!(machine.points_closed.iter().any(|(id, why)| id.starts_with("open-anchor-full-") && why.contains("has room")), "{:?}", machine.points_closed);
+    assert_eq!(outcome_of(&next, "plan-here"), MachineOutcome::NeedsAgent);
+    assert_eq!(next.frozen.batch(), &["plan-here".to_string()]);
+}
+
 /// Step 21: a per-project point for the rules with no project - the shape
 /// the build before step 21 wrote, `open-no-working-copy-global-rules-in-<p>`
 /// - is closed by the next start of that project, replaced by the one

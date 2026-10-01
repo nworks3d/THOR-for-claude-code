@@ -288,7 +288,7 @@ fn an_unreadable_transcript_shape_is_drift_and_nothing_counts() {
     let lines: Vec<String> = std::iter::repeat(unknown).take(110).collect();
     std::fs::write(&file, lines.join("\n") + "\n").unwrap();
     assert!(std::fs::metadata(&file).unwrap().len() > DRIFT_MIN_BYTES);
-    assert!(session_drifted(Some(&root), S1));
+    assert!(session_drifted(&fx.db, Some(&root), S1));
     assert!(matches!(validate(&fx.store, "eval-fxp-a", Some(&root)), Validation::Drift(_)));
 
     let written = fx.stop();
@@ -303,8 +303,53 @@ fn an_unreadable_transcript_shape_is_drift_and_nothing_counts() {
     attested_filing_unverified(&mut fx.store, &root, S1, &report("eval-fxp-a", "fxp", "TLDR."), "toolu_f1").unwrap();
     let file = root.join(crate::attest::fixture::PROJECT_FOLDER).join(format!("{S1}.jsonl"));
     std::fs::write(&file, "{\"kind\":\"turn\"}\n").unwrap();
-    assert!(!session_drifted(Some(&root), S1));
+    assert!(!session_drifted(&fx.db, Some(&root), S1));
     assert!(matches!(validate(&fx.store, "eval-fxp-a", Some(&root)), Validation::Invalid(_)));
+}
+
+/// C3b probe B0: a chat-only first turn (no tool call at all) whose transcript
+/// is over 64 KB only because of the injected context is readable, not drift -
+/// even when that context mentions the word tool_use in plain text.
+#[test]
+fn a_large_transcript_with_no_tool_call_is_no_drift() {
+    let fx = Fx::new();
+    let root = fx.root();
+    std::fs::create_dir_all(root.join(crate::attest::fixture::PROJECT_FOLDER)).unwrap();
+    let file = root.join(crate::attest::fixture::PROJECT_FOLDER).join(format!("{S1}.jsonl"));
+    let context = r#"{"type":"attachment","attachment":{"type":"hook_additional_context","content":["PAD a tool_use block is what Claude Code writes for a call"]}}"#
+        .replace("PAD", &"z".repeat(900));
+    let chat = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Hello."}]}}"#.to_string();
+    let mut lines: Vec<String> = std::iter::repeat(context).take(110).collect();
+    lines.push(chat);
+    std::fs::write(&file, lines.join("
+") + "
+").unwrap();
+    assert!(std::fs::metadata(&file).unwrap().len() > DRIFT_MIN_BYTES);
+    assert!(!session_drifted(&fx.db, Some(&root), S1), "no tool call to read is not a shape THOR cannot read");
+}
+
+/// A transcript that does hold tool calls but only in a shape THOR does not
+/// know (a tool_use block without its id) is drift; one known call among
+/// them is not.
+#[test]
+fn tool_calls_that_cannot_be_read_are_drift_and_one_readable_call_is_not() {
+    let fx = Fx::new();
+    let root = fx.root();
+    std::fs::create_dir_all(root.join(crate::attest::fixture::PROJECT_FOLDER)).unwrap();
+    let file = root.join(crate::attest::fixture::PROJECT_FOLDER).join(format!("{S1}.jsonl"));
+    let broken = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","call":"c1","pad":"PAD"}]}}"#
+        .replace("PAD", &"z".repeat(900));
+    let mut lines: Vec<String> = std::iter::repeat(broken).take(110).collect();
+    std::fs::write(&file, lines.join("
+") + "
+").unwrap();
+    assert!(session_drifted(&fx.db, Some(&root), S1));
+    let known = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{}}]}}"#;
+    lines.push(known.to_string());
+    std::fs::write(&file, lines.join("
+") + "
+").unwrap();
+    assert!(!session_drifted(&fx.db, Some(&root), S1));
 }
 
 // ------------------------------------------------------------- D10

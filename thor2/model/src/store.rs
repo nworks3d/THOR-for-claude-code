@@ -1877,6 +1877,13 @@ pub enum Blocker {
     /// A `contains` literal is missing from the registered working tree while
     /// the default branch's HEAD still has it.
     WorkingTreeDiffers { path: String },
+    /// A `path_exists` check names a file the rule is not anchored to, the
+    /// only way to name it (anchor the rule there) is refused because that
+    /// place already holds the most facts a place ever shows, and every way
+    /// out of that moves, folds or archives one of the owner's facts: the
+    /// owner's to decide, never the agent's (step 22, C3b B4 - the agent's
+    /// other exit was to clear the TRUE check).
+    AnchorFull { path: String },
 }
 
 /// The subject of THOR's open point for rules with NO project whose check
@@ -1914,6 +1921,7 @@ impl Blocker {
         match self {
             Blocker::NoWorkingCopy { .. } => "no-working-copy",
             Blocker::WorkingTreeDiffers { .. } => "working-tree-differs",
+            Blocker::AnchorFull { .. } => "anchor-full",
         }
     }
 
@@ -1922,7 +1930,7 @@ impl Blocker {
     pub fn subject(&self) -> &str {
         match self {
             Blocker::NoWorkingCopy { project } => project,
-            Blocker::WorkingTreeDiffers { path } => path,
+            Blocker::WorkingTreeDiffers { path } | Blocker::AnchorFull { path } => path,
         }
     }
 }
@@ -1936,6 +1944,9 @@ impl std::fmt::Display for Blocker {
             Blocker::NoWorkingCopy { project } => write!(f, "{project} - no registered working copy"),
             Blocker::WorkingTreeDiffers { path } => {
                 write!(f, "{path} - the registered working tree lacks the literal the default branch still has")
+            }
+            Blocker::AnchorFull { path } => {
+                write!(f, "{path} - the anchor this rule's check needs is already full of the owner's facts")
             }
         }
     }
@@ -2569,6 +2580,22 @@ fn severity_word(severity: Option<crate::item::Severity>) -> &'static str {
         Some(crate::item::Severity::HouseStyle) => "house_style",
         None => "no severity",
     }
+}
+
+/// The live facts sitting on `binding` for `item`, when that place is already
+/// full - `item::MAX_ITEMS` or more of them, the count `capacity` refuses a new
+/// claimant by (`full_reliable_anchor`) - as (id, text); `None` while it has
+/// room. A Path, Dir or Command target only: the places a write is refused for.
+pub fn full_place_occupants(store: &EventStore, item: &Item, binding: &Binding) -> Option<Vec<(String, String)>> {
+    if !matches!(
+        binding,
+        Binding::Target { kind: crate::item::TargetKind::Path | crate::item::TargetKind::Dir | crate::item::TargetKind::Command, .. }
+    ) {
+        return None;
+    }
+    let candidates = if store.heads_projection_current() { live_items_from_projection(store) } else { live_items_from_fold(store) }.ok()?;
+    let rivals = pool_rivals(&candidates, item, binding);
+    (rivals.len() >= crate::item::MAX_ITEMS).then(|| rivals.into_iter().map(|(id, other)| (id.clone(), other.text.clone())).collect())
 }
 
 /// The longest reason `archive` will carry. It becomes a tag, and a tag is
@@ -3230,7 +3257,7 @@ pub const OPEN_POINT_REFUSAL: &str =
 /// What a write tool answers a caller who tries to retract THOR's own point.
 pub const MACHINE_POINT_REFUSAL: &str = "REFUSED: this open point is THOR's own; it closes itself when its subject settles";
 
-const MACHINE_POINT_PREFIXES: &[&str] = &["open-no-working-copy-", "open-working-tree-differs-"];
+const MACHINE_POINT_PREFIXES: &[&str] = &["open-no-working-copy-", "open-working-tree-differs-", "open-anchor-full-"];
 
 /// Whether `id` is shaped like one of THOR's own open points - an id only
 /// `eval-machine` may write (`reserved_id_owner`).
@@ -3266,6 +3293,7 @@ pub fn machine_point_id(project: &str, blocker: &Blocker) -> String {
         Blocker::WorkingTreeDiffers { path } => {
             format!("open-working-tree-differs-{}-{}", slug(project, "project"), slug(path, "file"))
         }
+        Blocker::AnchorFull { path } => format!("open-anchor-full-{}-{}", slug(project, "project"), slug(path, "file")),
     }
 }
 
@@ -3841,6 +3869,8 @@ impl MachineBlocker {
     pub fn to_blocker(&self) -> Blocker {
         if self.code == "working-tree-differs" {
             Blocker::WorkingTreeDiffers { path: self.subject.clone() }
+        } else if self.code == "anchor-full" {
+            Blocker::AnchorFull { path: self.subject.clone() }
         } else {
             Blocker::NoWorkingCopy { project: self.subject.clone() }
         }
@@ -4823,18 +4853,44 @@ fn verdict_written_after(store: &EventStore, id: &str, cutoff_seq: i64) -> bool 
 /// decides.
 ///
 /// Names `serve` by its full path when it sits next to the running program
-/// (every installed THOR binary does), so a reader can run the line as it
-/// stands - on Windows with PowerShell's `&` call operator, which a quoted
-/// path needs; else the bare program name.
+/// (every installed THOR binary does); else the bare program name. See
+/// `retest_command_with` for the form, which is the one the evaluation
+/// routine's `allowed-tools` entry allows.
 pub fn retest_command_for(db: Option<&Path>, id: &str) -> String {
     let name = format!("serve{}", std::env::consts::EXE_SUFFIX);
     let beside = std::env::current_exe().ok().and_then(|exe| exe.parent().map(|dir| dir.join(&name))).filter(|p| p.is_file());
-    let program = match beside {
-        Some(path) if cfg!(windows) => format!("& \"{}\"", path.display()),
-        Some(path) => format!("\"{}\"", path.display()),
-        None => name,
+    retest_command_with(&beside.unwrap_or_else(|| PathBuf::from(name)), db, id)
+}
+
+/// The retest command for `serve` at `program`: `<serve> --db <store> retest
+/// --id '<id>'`, in the SHELL-NEUTRAL form the evaluation routine's own
+/// `allowed-tools` entry allows (`retest_allow_entry`) - forward slashes, no
+/// PowerShell `&`, a path quoted only when it holds a space. Claude Code
+/// matches a `Bash(...)` entry against the command text from its start, so a
+/// command in PowerShell form (`& "C:\...\serve.exe" ...`) was refused again
+/// and again in a headless session (C3b, E1) and could not be run at all.
+pub fn retest_command_with(program: &Path, db: Option<&Path>, id: &str) -> String {
+    format!("{} retest --id '{id}'", retest_prefix(program, db))
+}
+
+/// The `allowed-tools` entry that pre-approves `retest_command_with` (and the
+/// same command with `--apply`, or any other id): `Bash(<serve> --db <store>
+/// retest:*)`. One function shapes the entry and the printed command, so they
+/// cannot drift apart; a test pins that the printed command starts with it.
+pub fn retest_allow_entry(program: &Path, db: Option<&Path>) -> String {
+    format!("Bash({} retest:*)", retest_prefix(program, db))
+}
+
+fn retest_prefix(program: &Path, db: Option<&Path>) -> String {
+    let word = |text: String| {
+        let text = text.replace('\\', "/");
+        if text.chars().any(char::is_whitespace) {
+            format!("\"{text}\"")
+        } else {
+            text
+        }
     };
-    format!("{program} --db \"{}\" retest --id '{id}'", db_argument(db))
+    format!("{} --db {}", word(program.display().to_string()), word(db_argument(db)))
 }
 
 /// One live open point, as handed to a reader: its id, its text, and whether
@@ -5148,6 +5204,26 @@ fn filed_evaluation_report(
 // changes nothing about a section already written. `filed_seq` (F) is the
 // log's tip when the filing was made; the report's own event comes after it.
 
+/// The file a check reads, if it reads one.
+pub fn check_file_of(check: &Check) -> Option<&str> {
+    match check {
+        Check::Contains { path, .. } | Check::Absent { path, .. } | Check::AbsentAll { path, .. } | Check::PathExists { path } => Some(path),
+        _ => None,
+    }
+}
+
+/// A check in a few plain words: its kind and the file it reads, if any.
+pub fn check_in_words(check: &Check) -> String {
+    let kind = serde_json::to_value(check)
+        .ok()
+        .and_then(|v| v.as_object().and_then(|o| o.keys().next().cloned()))
+        .unwrap_or_else(|| "check".to_string());
+    match check_file_of(check) {
+        Some(path) => format!("{kind} {path}"),
+        None => kind,
+    }
+}
+
 /// What a filing's receipt says about its machine section, in numbers.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MachineSummary {
@@ -5171,6 +5247,8 @@ pub struct MachineSummary {
     pub side_doors: usize,
     /// Writes in the window whose check is still to come.
     pub unverified: usize,
+    /// Rules whose check an agent cleared, moved or changed in the window.
+    pub checks_weakened: usize,
 }
 
 /// One line of machine-section text out of words some writer chose (an id, a
@@ -5447,6 +5525,12 @@ fn machine_section(store: &EventStore, start: &EvaluationStart, filed_seq: i64) 
     // taken off the rule track or given a lower severity in the window; every
     // note by dispute and every accept_refusing written in it.
     let mut weakened: Vec<String> = Vec::new();
+    // Every rule whose CHECK an agent cleared or changed in the window (a
+    // weakening the gate lets through with a because, step 22 - C3b B4
+    // cleared a true check and the section said 0). THOR's own verdicts clear
+    // a check too (a note, by its trial) and are the pass's, so only a write
+    // by someone else is listed.
+    let mut checks: Vec<String> = Vec::new();
     let mut disputes: Vec<String> = Vec::new();
     let mut accepted: Vec<String> = Vec::new();
     for event in window.iter().filter(|e| matches!(e.kind, EventKind::FactRevised | EventKind::FactRetracted | EventKind::FactCreated)) {
@@ -5482,6 +5566,21 @@ fn machine_section(store: &EventStore, start: &EvaluationStart, filed_seq: i64) 
             continue;
         }
         let because = || plain(&because_reason(&event.body).unwrap_or_else(|| "no reason recorded".to_string()));
+        if event.kind == EventKind::FactRevised && !RESERVED_ACTORS.contains(&event.actor.as_str()) {
+            if let Some(after) = after.as_ref().filter(|a| a.kind.can_fire()) {
+                let changed = gate::weakenings(&before, after).iter().any(|w| matches!(w.label, "check cleared" | "check changed"));
+                if let (true, Some(old)) = (changed, &before.check) {
+                    let what = match &after.check {
+                        None => format!("check cleared ({})", plain(&check_in_words(old))),
+                        Some(new) if check_file_of(old) != check_file_of(new) => {
+                            format!("check moved from {} to {}", plain(&check_in_words(old)), plain(&check_in_words(new)))
+                        }
+                        Some(new) => format!("check changed from {} to {}", plain(&check_in_words(old)), plain(&check_in_words(new))),
+                    };
+                    checks.push(format!("\n- '{id}': {what} at log seq {} by {door} - reason: {}", event.seq, because()));
+                }
+            }
+        }
         if event.kind == EventKind::FactRetracted {
             weakened.push(format!(
                 "\n- '{id}': retracted at log seq {} by {door} - reason: {}",
@@ -5519,6 +5618,12 @@ fn machine_section(store: &EventStore, start: &EvaluationStart, filed_seq: i64) 
         weakened.len()
     ));
     weakened.iter().for_each(|line| out.push_str(line));
+    out.push_str(&format!(
+        "\nrules whose check was cleared, moved or changed by a write that is not THOR's own in the window: {}.",
+        checks.len()
+    ));
+    checks.iter().for_each(|line| out.push_str(line));
+    summary.checks_weakened = checks.len();
     out.push_str(&format!("\nnotes by dispute written in the window: {}.", disputes.len()));
     disputes.iter().for_each(|line| out.push_str(line));
     out.push_str(&format!("\nrules kept with accept_refusing written in the window: {}.", accepted.len()));
@@ -8801,6 +8906,65 @@ mod tests {
         assert_ne!(render_machine_section(&store, &start, store.get_next_seq().unwrap() - 1), section, "a later F reads them");
     }
 
+    /// Step 22 (C3b B4): an agent cleared a TRUE check with a because and the
+    /// machine section said "0 weakenings", so the owner could only see it in
+    /// the item's history. A check cleared, moved to another file or changed in
+    /// the window by a write that is not THOR's own is listed and counted; THOR's
+    /// own verdict clearing a check (a note by its trial) is the pass's, not a
+    /// weakening to report.
+    #[test]
+    fn a_check_cleared_or_moved_in_the_window_is_in_the_machine_section() {
+        let mut store = EventStore::in_memory().unwrap();
+        let rule_with = |id: &str, anchor: &str, check: Check| {
+            let mut item = checked_sample();
+            item.id = id.to_string();
+            item.project = Some("mp".to_string());
+            item.text = format!("{anchor} keeps the line `keep me` for {id}.");
+            item.bindings = vec![Binding::Target { kind: crate::item::TargetKind::Path, value: anchor.to_string() }];
+            item.check = Some(check);
+            item
+        };
+        let plan = rule_with("plan-here", "files/PLAN.md", Check::PathExists { path: "files/PLAN.md".to_string() });
+        let moved = rule_with("moved-here", "docs/A.md", Check::Contains { path: "docs/A.md".to_string(), literal: "keep me".to_string() });
+        let noted = rule_with("noted-here", "docs/B.md", Check::PathExists { path: "docs/B.md".to_string() });
+        for item in [&plan, &moved, &noted] {
+            declare(&mut store, "mp-session", "l", "test", item).unwrap();
+        }
+        let start = record_start(&mut store, "mp-session", "mp");
+
+        // An agent clears one check and moves another's file, each with a because.
+        let mut cleared = plan.clone();
+        cleared.check = None;
+        let baseline = gate::ClearedFields { check: true, ..Default::default() }.baseline(&plan);
+        let cleared_at = revise_because(&mut store, "mp-session", "l", "mcp", &baseline, &cleared, &plan, Some("the file is in a full anchor")).unwrap().seq;
+        let mut elsewhere = moved.clone();
+        elsewhere.check = Some(Check::Contains { path: "docs/B.md".to_string(), literal: "keep me".to_string() });
+        let moved_at = revise_because(&mut store, "mp-session", "l", "mcp", &moved, &elsewhere, &moved, Some("the file moved")).unwrap().seq;
+        // THOR's own verdict clears a check as well (a note): not listed.
+        let mut as_note = noted.clone();
+        as_note.check = None;
+        let body = canonical_body(&as_note).unwrap();
+        store.append_event("mp-session", "l", "teeth-eval", EventKind::FactRevised, &noted.id, None, &body).unwrap();
+
+        let filed_seq = store.get_next_seq().unwrap() - 1;
+        let section = render_machine_section(&store, &start, filed_seq);
+        assert!(
+            section.contains("rules whose check was cleared, moved or changed by a write that is not THOR's own in the window: 2."),
+            "{section}"
+        );
+        assert!(
+            section.contains(&format!("- 'plan-here': check cleared (path_exists files/PLAN.md) at log seq {cleared_at} by")),
+            "{section}"
+        );
+        assert!(section.contains("reason: the file is in a full anchor"), "{section}");
+        assert!(
+            section.contains(&format!("- 'moved-here': check moved from contains docs/A.md to contains docs/B.md at log seq {moved_at} by")),
+            "{section}"
+        );
+        assert!(!section.contains("'noted-here'"), "THOR's own verdict is not an agent's weakening: {section}");
+        assert_eq!(machine_section_summary(&store, &start, filed_seq).checks_weakened, 2);
+    }
+
     /// Step 20 (NEW-2): in the machine section, a refusal the EVALUATING
     /// session met inside its own evaluation is never a verified real call -
     /// even with a field verdict recorded before the fix - and the section
@@ -9944,6 +10108,33 @@ mod tests {
     /// The filing refusal names the one command that decides each rule, on
     /// the very store the refusing process has open (F7), and nothing that
     /// no longer settles anything.
+    /// C3b E1: the printed retest command is the shell-neutral form the
+    /// evaluation routine's `allowed-tools` entry allows - forward slashes, no
+    /// `&` - and it always starts with that entry's own text, with or without
+    /// a space in a path.
+    #[test]
+    fn the_retest_command_is_the_form_its_allow_entry_allows() {
+        for (program, db) in [
+            ("C:\\thor2\\bin\\serve.exe", "C:\\thor2\\thor.db"),
+            ("C:\\Program Files\\thor2\\bin\\serve.exe", "C:\\Users\\a b\\thor.db"),
+            ("/opt/thor2/bin/serve", "/var/thor 2/thor.db"),
+        ] {
+            let (program, db) = (Path::new(program), Path::new(db));
+            let command = retest_command_with(program, Some(db), "rule-a");
+            let entry = retest_allow_entry(program, Some(db));
+            let prefix = entry.strip_prefix("Bash(").and_then(|e| e.strip_suffix(":*)")).expect("a Bash(...:*) entry");
+            assert!(command.starts_with(prefix), "{command} vs {entry}");
+            assert!(prefix.ends_with(" retest"), "{entry}");
+            assert!(!command.starts_with('&') && !command.contains('\\'), "no call operator, no backslash: {command}");
+            assert!(command.ends_with(" retest --id 'rule-a'"), "{command}");
+            assert!(command.contains(" --db "), "every printed command carries --db: {command}");
+        }
+        assert_eq!(
+            retest_command_with(Path::new("C:\\thor2\\bin\\serve.exe"), None, "r"),
+            "C:/thor2/bin/serve.exe --db \"<path to thor.db>\" retest --id 'r'"
+        );
+    }
+
     #[test]
     fn the_filing_refusal_names_the_retest_command_on_this_store() {
         let dir = tempfile::tempdir().unwrap();
@@ -9955,7 +10146,10 @@ mod tests {
         let err = file_now(&mut store, &eval_report("eval-op-new", "op")).unwrap_err();
         let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
         let text = refusal.problem;
-        assert!(text.contains(&format!("--db \"{}\" retest --id 'op-rule'", db.display())), "{text}");
+        let shown = db.display().to_string().replace('\\', "/");
+        let shown = if shown.contains(' ') { format!("\"{shown}\"") } else { shown };
+        assert!(text.contains(&format!("--db {shown} retest --id 'op-rule'")), "{text}");
+        assert!(!text.contains("& \""), "the shell-neutral form, no PowerShell call operator: {text}");
         assert!(text.contains("--apply"), "{text}");
         assert!(!text.contains("probe-teeth"), "a retired command is never named: {text}");
         assert!(!text.contains("tags [\"open-point\"]"), "an open point settles nothing any more: {text}");

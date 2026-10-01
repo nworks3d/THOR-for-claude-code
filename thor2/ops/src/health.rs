@@ -2068,11 +2068,14 @@ pub fn teeth_line(db: &Path, full: bool) -> String {
     out.extend(name_rot("wired, literal never seen", &unseen, full));
     out.extend(name_rot("old contains, text does not name it", &old_stock, full));
     let cap = name_cap(full);
-    for line in taken_off.iter().take(cap) {
-        out.push(format!("  taken off the rule track: {line}"));
+    for (label, line) in taken_off.iter().take(cap) {
+        out.push(format!("  {label}: {line}"));
     }
     if taken_off.len() > cap {
-        out.push(format!("  taken off the rule track: and {} more, not named here (use --full)", taken_off.len() - cap));
+        out.push(format!(
+            "  taken off the rule track or check weakened: and {} more, not named here (use --full)",
+            taken_off.len() - cap
+        ));
     }
     for line in &reworded {
         out.push(format!("  reworded: {line}"));
@@ -2266,16 +2269,20 @@ const TAKEN_OFF_DAYS: i64 = 30;
 
 /// Every Rule or Orientation taken off the rule track in the last
 /// `TAKEN_OFF_DAYS` days - retracted, archived, or revised to a kind that
-/// never fires (D16) - newest first, each with its reason and the door (the
-/// actor that wrote it). An event carries no time of its own, so each one is
-/// dated by the newest served or refused event before it that records one;
+/// never fires (D16) - and every rule whose check was cleared, moved to another
+/// file or changed by a write that is not THOR's own (step 22: a clear_check
+/// with a because is a weakening the owner must be able to see) - newest
+/// first, each with its reason and the door (the actor that wrote it), under
+/// the label it is listed by. An event carries no time of its own, so each one
+/// is dated by the newest served or refused event before it that records one;
 /// one with none before it is listed rather than dropped.
-fn taken_off_the_rule_track(events: &[Event]) -> Vec<String> {
+fn taken_off_the_rule_track(events: &[Event]) -> Vec<(&'static str, String)> {
     use thor_core::event_store::EventKind;
     let now = serve::time::now_unix();
     let mut last_at: Option<i64> = None;
     let mut last_kind: std::collections::HashMap<&str, model::item::Kind> = Default::default();
-    let mut out: Vec<(i64, String)> = Vec::new();
+    let mut last_check: std::collections::HashMap<&str, Option<model::item::Check>> = Default::default();
+    let mut out: Vec<(i64, &'static str, String)> = Vec::new();
     for e in events {
         match e.kind {
             EventKind::ItemServed | EventKind::GateRefused | EventKind::GateStoodAside => {
@@ -2288,6 +2295,7 @@ fn taken_off_the_rule_track(events: &[Event]) -> Vec<String> {
             EventKind::FactCreated | EventKind::FactRevised | EventKind::FactResolved => {
                 let Ok(item) = model::store::parse_body(&e.body) else { continue };
                 let before = last_kind.insert(e.entity_id.as_str(), item.kind);
+                let before_check = last_check.insert(e.entity_id.as_str(), item.check.clone()).flatten();
                 let was_rule = before.is_some_and(|k| k.can_fire());
                 if e.kind == EventKind::FactRevised && was_rule && !item.kind.can_fire() {
                     let reason = item
@@ -2301,7 +2309,36 @@ fn taken_off_the_rule_track(events: &[Event]) -> Vec<String> {
                                 .and_then(|v| v.get("because").and_then(|b| b.as_str()).map(|b| format!("because: {b}")))
                         })
                         .unwrap_or_else(|| "no reason recorded".to_string());
-                    out.push((e.seq, format!("{} - kind changed to a report at log seq {} ({reason}; door: {})", e.entity_id, e.seq, e.actor)));
+                    out.push((
+                        e.seq,
+                        "taken off the rule track",
+                        format!("{} - kind changed to a report at log seq {} ({reason}; door: {})", e.entity_id, e.seq, e.actor),
+                    ));
+                } else if e.kind == EventKind::FactRevised && was_rule && item.kind.can_fire() && !model::store::RESERVED_ACTORS.contains(&e.actor.as_str()) {
+                    if let Some(old) = before_check.filter(|old| item.check.as_ref() != Some(old)) {
+                        let what = match &item.check {
+                            None => format!("check cleared ({})", model::store::check_in_words(&old)),
+                            Some(new) if model::store::check_file_of(&old) != model::store::check_file_of(new) => format!(
+                                "check moved from {} to {}",
+                                model::store::check_in_words(&old),
+                                model::store::check_in_words(new)
+                            ),
+                            Some(new) => format!(
+                                "check changed from {} to {}",
+                                model::store::check_in_words(&old),
+                                model::store::check_in_words(new)
+                            ),
+                        };
+                        let because = serde_json::from_str::<serde_json::Value>(&e.body)
+                            .ok()
+                            .and_then(|v| v.get("because").and_then(|b| b.as_str()).map(str::to_string))
+                            .unwrap_or_else(|| "no reason recorded".to_string());
+                        out.push((
+                            e.seq,
+                            "check weakened",
+                            format!("{} - {what} at log seq {} (because: {because}; door: {})", e.entity_id, e.seq, e.actor),
+                        ));
+                    }
                 }
             }
             EventKind::FactRetracted => {
@@ -2311,13 +2348,17 @@ fn taken_off_the_rule_track(events: &[Event]) -> Vec<String> {
                         .ok()
                         .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(str::to_string))
                         .unwrap_or_else(|| "no reason recorded".to_string());
-                    out.push((e.seq, format!("{} - retracted at log seq {} (reason: {reason}; door: {})", e.entity_id, e.seq, e.actor)));
+                    out.push((
+                        e.seq,
+                        "taken off the rule track",
+                        format!("{} - retracted at log seq {} (reason: {reason}; door: {})", e.entity_id, e.seq, e.actor),
+                    ));
                 }
             }
             _ => continue,
         }
         if matches!(e.kind, EventKind::FactRevised | EventKind::FactRetracted) {
-            if let (Some((seq, _)), Some(at)) = (out.last(), last_at) {
+            if let (Some((seq, _, _)), Some(at)) = (out.last(), last_at) {
                 if *seq == e.seq && now - at > TAKEN_OFF_DAYS * 86_400 {
                     out.pop();
                 }
@@ -2325,7 +2366,7 @@ fn taken_off_the_rule_track(events: &[Event]) -> Vec<String> {
         }
     }
     out.reverse();
-    out.into_iter().map(|(_, line)| line).collect()
+    out.into_iter().map(|(_, label, line)| (label, line)).collect()
 }
 
 /// R7: a write THOR's trial refused because a tooth it built from the text
@@ -4874,6 +4915,41 @@ mod tests {
         assert!(line.contains(&format!("the A4 cutoff is log seq {cutoff}, recorded once and never moved")), "{line}");
         assert!(
             line.contains("  old contains, text does not name it: old-keeps [beta] it guards 'keep me' in NOTES.md (its check was set at log seq"),
+            "{line}"
+        );
+    }
+
+    /// Step 22 (C3b B4): a check an agent cleared or moved with a because is a
+    /// weakening the owner sees in doctor, beside the rules taken off the rule
+    /// track - not only in the item's history. THOR's own writes are not.
+    #[test]
+    fn teeth_line_names_a_check_cleared_or_moved_by_a_write_that_is_not_thors() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut s = EventStore::new(&db).unwrap();
+            let mut plan = rule("plan-here");
+            plan.check = Some(model::item::Check::PathExists { path: "files/PLAN.md".to_string() });
+            let mut moved = rule("moved-here");
+            moved.text = "The fixture keeps `keep me` in its notes.".to_string();
+            moved.check = Some(model::item::Check::Contains { path: "docs/A.md".to_string(), literal: "keep me".to_string() });
+            legacy_declare(&mut s, &plan);
+            legacy_declare(&mut s, &moved);
+            let mut cleared = plan.clone();
+            cleared.check = None;
+            let baseline = model::gate::ClearedFields { check: true, ..Default::default() }.baseline(&plan);
+            store::revise_because(&mut s, "s", "l", "mcp", &baseline, &cleared, &plan, Some("the file is in a full anchor")).unwrap();
+            let mut elsewhere = moved.clone();
+            elsewhere.check = Some(model::item::Check::Contains { path: "docs/B.md".to_string(), literal: "keep me".to_string() });
+            store::revise_because(&mut s, "s", "l", "mcp", &moved, &elsewhere, &moved, Some("the file moved")).unwrap();
+        }
+        let line = teeth_line(&db, true);
+        assert!(
+            line.contains("  check weakened: plan-here - check cleared (path_exists files/PLAN.md) at log seq 3 (because: the file is in a full anchor; door: mcp)"),
+            "{line}"
+        );
+        assert!(
+            line.contains("  check weakened: moved-here - check moved from contains docs/A.md to contains docs/B.md at log seq 4 (because: the file moved; door: mcp)"),
             "{line}"
         );
     }

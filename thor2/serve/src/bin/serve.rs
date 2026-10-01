@@ -1409,7 +1409,7 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
         // evaluation is not asked for - it could not be filed - and every
         // turn says so instead, riding with whatever else this Stop says.
         let drift_note: Option<&str> = (!is_subagent && stop_project.is_some() && !no_record)
-            .then(|| serve::eval_filing::session_drifted(serve::attest::transcripts_root().as_deref(), &session_id))
+            .then(|| serve::eval_filing::session_drifted(db_path, serve::attest::transcripts_root().as_deref(), &session_id))
             .filter(|drifted| *drifted)
             .map(|_| serve::eval_filing::DRIFT_LINE);
         // Same shape for the ordinary first pass: only an empty message
@@ -4671,8 +4671,10 @@ mod judgement_debt_tests {
             teeth_debt(&store, &db, Some("p")).expect("a heavy checkless rule must be found by the sweep itself");
         assert!(asked.contains("names-a-flag"), "it must name which rule: {asked}");
         assert!(asked.contains("it has never been tried"), "and say why it is owed: {asked}");
+        let shown = db.display().to_string().replace('\\', "/");
+        let shown = if shown.contains(' ') { format!("\"{shown}\"") } else { shown };
         assert!(
-            asked.contains(&format!("--db \"{}\" retest --id 'names-a-flag'", db.display())),
+            asked.contains(&format!("--db {shown} retest --id 'names-a-flag'")),
             "and the command that decides it, on this very store: {asked}"
         );
     }

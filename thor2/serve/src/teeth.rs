@@ -1499,6 +1499,22 @@ impl<'a> Work<'a> {
         let old_stock = a4_pre_existing && matches!(self.mode, Mode::Retest) && self.old_stock.is_some();
         if a4_pre_existing && !old_stock && (touches_check || matches!(self.mode, Mode::Retest)) {
             if matches!(self.mode, Mode::Retest) {
+                // A path_exists check on a file the rule is not anchored to,
+                // whose one fix - anchoring the rule there - the crowding cap
+                // refuses (step 22, C3b B4): THOR's blocker, never the
+                // agent's batch. Its other exit was to clear a TRUE check.
+                if let (Some(Check::PathExists { path }), Some(root)) = (&w, &root_ok) {
+                    if let Some(blocker) = model::checkout::crowded_path_anchor(self.env.store, self.item(), root, path) {
+                        return Decision::Refuse {
+                            code: RefuseCode::A4,
+                            message: format!(
+                                "blocked: {path} is already full of other facts, so the rule cannot be anchored to it - \
+                                it keeps its true check and is counted apart; the owner decides which fact gives way"
+                            ),
+                            retest: RetestAs::Blocked(blocker),
+                        };
+                    }
+                }
                 self.a4_only = self.bites_but_for_the_naming(root_ok.as_deref());
             }
             return self.a4_refusal();

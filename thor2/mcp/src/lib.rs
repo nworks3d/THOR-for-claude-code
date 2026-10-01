@@ -992,13 +992,20 @@ fn evaluation_receipt(store: &EventStore, item: &Item, ctx: Option<&model::store
         model::store::owner_queue_banner(p, model::store::owner_queue(store, p).len()).map(|line| format!("\n{line}"))
     });
     let queue = queue.unwrap_or_default();
+    let weakened = match m.checks_weakened {
+        0 => String::new(),
+        n => format!(
+            "\ncheck weakened: {n} rule(s) had a check cleared, moved or changed in the window - the machine section lists \
+             each one with its reason, for the owner."
+        ),
+    };
     format!(
         "\nmachine section: THOR wrote it above your text, from its log (seq {} to {}); it cannot be edited.\
          \njudgement: this evaluation's list (fixed at log position {}) held {} item(s): {} useful, {} noise, {} skipped \
          as not judgeable here, {} retracted or taken off the rule track, {} pinned. {store_wide} item(s) stay owed \
          store-wide for this project - doctor names them.\
          \nteeth: {} rule(s) on the frozen batch and A4 list, all settled.\
-         \nside doors: {} write(s) in the window outside an attested THOR call, {} still to be checked.\
+         \nside doors: {} write(s) in the window outside an attested THOR call, {} still to be checked.{weakened}\
          \nTHOR checks this filing call against the session's transcript when the turn ends.{queue}",
         m.started_seq,
         m.filed_seq,

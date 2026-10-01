@@ -254,15 +254,24 @@ pub fn doctor_allow_invocation(bin_dir: &Path, windows: bool) -> String {
     }
 }
 
-/// Fill in the template's two placeholders - `{{THOR_DOCTOR}}` (the doctor
-/// invocation the report tells a reader to run) and `{{THOR_DOCTOR_ALLOW}}`
-/// (the matching `allowed-tools` entry that pre-approves it) - with this
-/// install run's own resolution for the current platform (see
+/// The `serve` program the Stop hook's retest command names, next to the
+/// other binaries.
+fn serve_program(bin_dir: &Path) -> PathBuf {
+    bin_dir.join(format!("serve{}", std::env::consts::EXE_SUFFIX))
+}
+
+/// Fill in the template's placeholders - `{{THOR_DOCTOR}}` (the doctor
+/// invocation the report tells a reader to run), `{{THOR_DOCTOR_ALLOW}}` (the
+/// matching `allowed-tools` entry that pre-approves it) and
+/// `{{THOR_RETEST_ALLOW}}` (the entry that pre-approves THOR's own retest
+/// command, in the exact form `model::store::retest_command_with` prints) -
+/// with this install run's own resolution for the current platform (see
 /// `doctor_invocation`/`doctor_allow_invocation`).
 fn render_eval_command(bin_dir: &Path, db: &Path) -> String {
     EVAL_COMMAND_TEMPLATE
         .replace("{{THOR_DOCTOR}}", &doctor_invocation(bin_dir, db, cfg!(windows)))
         .replace("{{THOR_DOCTOR_ALLOW}}", &doctor_allow_invocation(bin_dir, cfg!(windows)))
+        .replace("{{THOR_RETEST_ALLOW}}", &model::store::retest_allow_entry(&serve_program(bin_dir), Some(db)))
 }
 
 /// Claude Code's per-user commands folder: `~/.claude/commands`. Same base
@@ -2000,11 +2009,12 @@ mod tests {
         let rendered = render_eval_command(Path::new("C:\\thor2\\bin"), Path::new("C:\\thor2\\thor.db"));
         // `l.contains("doctor")` alone would also match the frontmatter's own
         // `allowed-tools` line since `{{THOR_DOCTOR_ALLOW}}` was added there
-        // too (section 2 of this task) - `--db` narrows this to the actual
-        // invocation line the report tells a reader to run.
+        // too (section 2 of this task), and the retest entry carries `--db` -
+        // so the frontmatter line is left out, which narrows this to the
+        // actual invocation line the report tells a reader to run.
         let line = rendered
             .lines()
-            .find(|l| l.contains("doctor") && l.contains("--db"))
+            .find(|l| l.contains("doctor") && l.contains("--db") && !l.starts_with("allowed-tools:"))
             .expect("the rendered eval command must carry a line naming doctor");
         let trimmed = line.trim();
         assert!(trimmed.starts_with("& \""), "the windows doctor line must start with the call operator: {trimmed}");
@@ -2073,6 +2083,34 @@ mod tests {
         );
         assert!(entries.iter().any(|e| e.contains("doctor")), "the doctor entry must be present: {allowed_tools_line}");
         assert!(!allowed_tools_line.contains("{{"), "no placeholder may survive substitution: {allowed_tools_line}");
+    }
+
+    /// C3b E1: the retest command the Stop hook prints for a rot or teeth
+    /// hold must be one the seeded routine's own `allowed-tools` allows, or a
+    /// headless session is refused again and again and cannot run it. Proven
+    /// on the rendered routine: the printed command (with `--apply` too)
+    /// starts with the text of one of its `Bash(...)` entries.
+    #[test]
+    fn the_printed_retest_command_matches_an_allowed_tools_entry_of_the_seeded_routine() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("thor-eval.md");
+        let bin_dir = Path::new("C:\\fake\\thor2\\bin");
+        let db = Path::new("C:\\fake\\thor2\\thor.db");
+        seed_eval_command(&path, bin_dir, db).unwrap();
+        let written = fs::read_to_string(&path).unwrap();
+        let line = written.lines().find(|l| l.starts_with("allowed-tools:")).expect("an allowed-tools line");
+        let entries: Vec<&str> = line.trim_start_matches("allowed-tools:").split(", ").map(str::trim).collect();
+        let allows = |command: &str| {
+            entries.iter().any(|e| {
+                e.strip_prefix("Bash(").and_then(|e| e.strip_suffix(":*)")).is_some_and(|prefix| command.starts_with(prefix))
+            })
+        };
+
+        let printed = model::store::retest_command_with(&serve_program(bin_dir), Some(db), "unanswered-rule");
+        assert!(allows(&printed), "the printed command {printed} matches no entry of: {line}");
+        assert!(allows(&format!("{printed} --apply")), "the same command with --apply: {printed}");
+        assert!(!printed.starts_with('&') && !printed.contains('\\'), "no PowerShell form: {printed}");
+        assert!(!allows("C:/fake/thor2/bin/serve.exe --db C:/other/thor.db retest --id 'x'"), "another store is not allowed");
     }
 
     /// The defect this guards against: an installer that "refreshes" the

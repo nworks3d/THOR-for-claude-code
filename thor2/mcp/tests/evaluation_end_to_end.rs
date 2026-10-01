@@ -903,6 +903,25 @@ fn a_missing_transcript_is_invalid_and_an_unreadable_one_is_drift() {
     assert!(!out.contains("\"decision\":\"block\""), "nothing is demanded that cannot be filed: {out}");
 }
 
+/// C3b probe B0: a session's first turn with no tool call at all, whose
+/// transcript is over 64 KB only because of the context injected into it, is
+/// readable - the Stop never tells the owner the shape is unreadable.
+#[test]
+fn a_large_chat_only_transcript_is_never_reported_as_drift() {
+    let tmp = tempfile::tempdir().unwrap();
+    let s = Session::new(tmp.path());
+    let context = r#"{"type":"attachment","attachment":{"type":"hook_additional_context","content":["PAD"]}}"#
+        .replace("PAD", &"z".repeat(900));
+    let chat = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Hello."}]}}"#;
+    std::fs::write(&s.transcript, vec![context.as_str(); 200].join("
+") + "
+" + chat + "
+").unwrap();
+    assert!(std::fs::metadata(&s.transcript).unwrap().len() > serve::eval_filing::DRIFT_MIN_BYTES);
+    let out = s.stop();
+    assert!(!out.contains("in a shape THOR cannot read"), "no tool call is not unreadable: {out}");
+}
+
 /// F10 (R14.8): the machine pass writes its start record FIRST - every write
 /// of the pass and the batch record come after it - and a hook killed after
 /// that first write leaves a start with no batch: a filing then is refused

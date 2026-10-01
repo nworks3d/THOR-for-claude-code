@@ -343,7 +343,7 @@ and doctor counts both shapes apart. What this cannot close is named in 7.8
 
 - `model::store::settlement` is the one answer for the evaluation filing gate,
   the `Stop` hook and `doctor`: Settled on a current RULE or NOTE verdict,
-  while a blocker holds (`NoWorkingCopy`, `WorkingTreeDiffers`), or when
+  while a blocker holds (`NoWorkingCopy`, `WorkingTreeDiffers`, `AnchorFull`), or when
   retracted or archived; otherwise Owed. Rot is every live Rule/Orientation
   that is Owed, whatever its severity. A tag, a reason, an open point or a
   refusal on record settles nothing. Read for one evaluation (`Some(start)`), a
@@ -423,7 +423,11 @@ start note shown to it, the machine section byte for byte as the log renders it,
 no D10 write in the window, the filing gate holding on the log as it stood.
 Only a valid report counts: for the ask, the clocks, the carry, and `doctor`. A
 missing record of the session is invalid; a record in a shape THOR cannot read
-is drift: nothing counts, no evaluation is asked for, every turn says so.
+is drift: nothing counts, no evaluation is asked for, every turn says so. Drift
+is only THOR failing to read tool calls it expects (a large record with a
+`tool_use` structure no known line matches, or with no readable call although an
+attested THOR write of the session proves one was made), never size plus "no
+tool call this turn": a chat-only turn is large through injected context alone.
 
 ### 7.5 Who is asked
 
@@ -447,8 +451,14 @@ there. A `Stop` in no project is never held for it.
 ### 7.6 Open points and the owner queue
 
 Open points are THOR's own (`open-no-working-copy-*`,
-`open-working-tree-differs-*`), reserved to `eval-machine` at the store, written
-and closed by the machine pass. Rules with no project whose check reads a file
+`open-working-tree-differs-*`, `open-anchor-full-*`), reserved to `eval-machine`
+at the store, written and closed by the machine pass. `Blocker::AnchorFull` holds
+a `path_exists` check on a file the rule is not anchored to when anchoring it
+there is refused by the crowding cap (the place already holds the most facts it
+ever shows): its point names the full place and every occupant for the owner, the
+rule keeps its true check and is never on the agent's batch, and the point closes
+when the place has room. A check an agent clears, moves or changes in an
+evaluation's window is counted and listed in the machine section and in `doctor`. Rules with no project whose check reads a file
 (`Blocker::global_rules`) share ONE store-wide point,
 `open-no-working-copy--global-rules` (`GLOBAL_RULES_POINT_ID`), in no project:
 every project's evaluation holds them by it (never on its batch), its carry is

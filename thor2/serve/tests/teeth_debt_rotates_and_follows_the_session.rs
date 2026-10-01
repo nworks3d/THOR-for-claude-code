@@ -128,7 +128,10 @@ fn the_next_session_is_asked_about_other_rules_first() {
     let (a, b) = (named(&first), named(&second));
     // Step 9: each one is named with the command that decides it, on this
     // very store.
-    assert!(first.contains(&format!("--db \"{}\" retest --id 'unanswered-", db.display())), "{first}");
+    let shown = db.display().to_string().replace('\\', "/");
+    let shown = if shown.contains(' ') { format!("\"{shown}\"") } else { shown };
+    assert!(first.contains(&format!("--db {shown} retest --id 'unanswered-")), "{first}");
+    assert!(!first.contains("& \""), "the shell-neutral form the routine allows, no call operator: {first}");
     assert_eq!(a.len(), 5, "{first}");
     assert_eq!(b.len(), 5, "{second}");
     assert!(a.iter().all(|i| !b.contains(i)), "the second session must be asked about others: {a:?} then {b:?}");

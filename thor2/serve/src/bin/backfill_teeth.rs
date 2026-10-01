@@ -110,6 +110,10 @@ fn main() -> ExitCode {
                 blocked += 1;
                 println!("{id}: blocked - {path} differs from the default branch in the registered checkout; nothing written");
             }
+            Maintenance::Blocked(Blocker::AnchorFull { path }) => {
+                blocked += 1;
+                println!("{id}: blocked - {path} is already full, so the rule cannot be anchored to it; nothing written");
+            }
             Maintenance::NeedsAgent(fix) => {
                 needs_agent += 1;
                 println!("{id}: needs the agent - {fix}");

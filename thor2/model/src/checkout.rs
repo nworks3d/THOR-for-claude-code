@@ -35,7 +35,7 @@
 use std::path::{Path, PathBuf};
 use thor_core::event_store::EventStore;
 
-use crate::item::{Check, Item};
+use crate::item::{Binding, Check, Item};
 use crate::store::Blocker;
 
 /// A file named this, sitting directly in a directory, wins over any git-root
@@ -330,6 +330,21 @@ pub fn is_file_check(check: &Check) -> bool {
     matches!(check, Check::Contains { .. } | Check::Absent { .. } | Check::AbsentAll { .. } | Check::PathExists { .. })
 }
 
+/// `Blocker::AnchorFull` for a `path_exists` check on `path` that the rule is
+/// not anchored to (A4 refuses it), when the file is really in the registered
+/// checkout `root` and the one fix - anchoring the rule to it - is refused
+/// because that place already holds the most facts a place ever shows
+/// (`store::full_place_occupants`). `None` for any other state: a file that is
+/// gone is a rotten check with a different fix, and a place with room is the
+/// agent's anchor to make (step 22, C3b B4).
+pub fn crowded_path_anchor(store: &EventStore, item: &Item, root: &Path, path: &str) -> Option<Blocker> {
+    if crate::gate::unnamed_literals(item).is_empty() || !root.join(path).exists() {
+        return None;
+    }
+    let anchor = Binding::Target { kind: crate::item::TargetKind::Path, value: path.to_string() };
+    crate::store::full_place_occupants(store, item, &anchor).map(|_| Blocker::AnchorFull { path: path.to_string() })
+}
+
 /// What holds `item` from being decided right now, judged at READ time the
 /// same way `serve::teeth::retest` judges it, so a reader never demands a
 /// retest whose answer is "blocked" (F9):
@@ -357,6 +372,9 @@ pub fn read_time_blocker(store: &EventStore, item: &Item) -> Option<Blocker> {
         Ok(root) => root,
         Err(_) => return Some(Blocker::NoWorkingCopy { project }),
     };
+    if let Check::PathExists { path } = check {
+        return crowded_path_anchor(store, item, &root, path);
+    }
     let Check::Contains { path, literal } = check else { return None };
     if !crate::gate::unnamed_literals(item).is_empty() || !root.join(path).is_file() {
         return None;

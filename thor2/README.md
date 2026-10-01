@@ -187,9 +187,9 @@ as the log gives it and nothing on the lists changed behind it. A report that is
 not valid counts for nothing, the next ask names it and why, and every project
 therefore owes one fresh evaluation after the upgrade that introduced this (the
 older reports carry no stamp). A missing session record makes a report invalid;
-a record in a shape THOR cannot read (Claude Code changed its format) is drift:
-nothing counts, no evaluation is asked for, and every turn says so until THOR is
-updated. `eval-debt-state.json` beside the store is a copy for the hooks' speed
+a record whose tool calls THOR cannot read (Claude Code changed its format) is
+drift: nothing counts, no evaluation is asked for, and every turn says so until
+THOR is updated. A long turn with no tool call at all is not drift. `eval-debt-state.json` beside the store is a copy for the hooks' speed
 only: the `Stop` overwrites its facts from the log every time.
 
 Who is asked, and when. The `Stop` hook asks for the whole routine by name,
@@ -230,7 +230,9 @@ after that reason, and the `Stop` is counted once.
 
 An open point is THOR's own: the machine pass writes one per blocker
 (`open-no-working-copy-*` when a project has no registered working copy,
-`open-working-tree-differs-*` when the checkout is mid-change) and closes it
+`open-working-tree-differs-*` when the checkout is mid-change,
+`open-anchor-full-*` when a rule's file check cannot be anchored because that
+file's place is full of the owner's other facts) and closes it
 itself, with a derived reason, at the first start after the blocker is gone.
 Rules with no project whose check reads a file have no working copy anywhere;
 they share ONE point for the whole memory, `open-no-working-copy--global-rules`,

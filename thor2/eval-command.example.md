@@ -1,6 +1,6 @@
 ---
 description: THOR session evaluation - judge what fired, repair what has rotted, give teeth to what nothing could stop, capture what was missing, report what the gate did and where it chafed, and close with a plain-language summary
-allowed-tools: mcp__thor__mark, mcp__thor__get, mcp__thor__lookup, mcp__thor__remember, mcp__thor__revise, mcp__thor__retract, mcp__thor__status, mcp__thor__history, Bash(git status:*), Bash(git diff:*), Bash(git log:*), Bash(cargo test:*), Bash(cargo build:*), Bash(npm test:*), Bash(npm run verify:*), Bash(node --test:*), Bash(pio run:*), Bash(pio test:*), {{THOR_DOCTOR_ALLOW}}
+allowed-tools: mcp__thor__mark, mcp__thor__get, mcp__thor__lookup, mcp__thor__remember, mcp__thor__revise, mcp__thor__retract, mcp__thor__status, mcp__thor__history, Bash(git status:*), Bash(git diff:*), Bash(git log:*), Bash(cargo test:*), Bash(cargo build:*), Bash(npm test:*), Bash(npm run verify:*), Bash(node --test:*), Bash(pio run:*), Bash(pio test:*), {{THOR_DOCTOR_ALLOW}}, {{THOR_RETEST_ALLOW}}
 ---
 
 THOR session evaluation. Work through steps 1 to 8, then the report. You need
@@ -43,9 +43,19 @@ less than an hour ago and is still active), you are told that in one line
 and are not held. A project with activity in the last seven days and no
 evaluation that counts in seven days is due whatever the clock says.
 When something else holds the same turn-end first - a reply rule, the
-first-session setup, a decision the owner stated that was not stored, or a
-note stored onto a full place - the ask comes in the same message, after it.
-Settle both.
+first-session setup, a decision the owner stated that was not stored, a note
+stored onto a full place, or the question about old rules below - the ask
+comes in the same message, after it. Settle both.
+
+THOR can also hold a turn-end to ask about old rules whose trial it has not
+decided yet. That question waits for the same two terms as the ask: ten
+minutes of the session's own work in the project, and never the first
+turn-end there, so a short session is not held for it. It prints ONE command
+to run, `serve ... retest --id '<id>'`, written with forward slashes and no
+`&`: that is exactly the form this routine's `allowed-tools` pre-approves, so
+run it as printed (add `--apply` to write the verdict). Do not retype it in
+another shell form - a PowerShell form is not pre-approved and a headless
+session is refused.
 
 The ask does not go quiet after one turn: it holds the end of every turn,
 naming how many times it has already asked and since when, until a report
@@ -259,9 +269,13 @@ are not a way to get a rule off the batch.
 
 Never file an open point, and never tag a rule with `open-point`, `about:` or
 `blocker:`: THOR writes and closes its own open points (a missing working
-copy, a file the checkout is changing, and ONE point for the whole memory
-that holds every rule with no project whose check reads a file) and refuses
-yours. A legacy open point
+copy, a file the checkout is changing, a file whose anchor is already full of
+the owner's other facts, and ONE point for the whole memory that holds every
+rule with no project whose check reads a file) and refuses yours. A rule held
+by one of those is not on your lists and is never yours to clear: clearing a
+check that is true is never the way past a blocker, and a check you clear,
+move to another file or change during this evaluation is listed in the
+report's machine section for the owner. A legacy open point
 an older routine filed settles nothing and holds nothing; retract one, with a
 reason, only when what it names is resolved.
 
@@ -279,7 +293,12 @@ outcome this system knows (see step 6), and the doctrine forbids widening a
 trigger to buy a catch. Never write the mistake into a real file, and never
 run the dangerous command itself, to "prove" a check: if the check does not
 catch your form of it, the mistake is now in the code, or the command ran.
-A command check may be proven with a harmless form of its command (step 8).
+A refusal your own session meets while this evaluation is open proves
+nothing: THOR records it as "refused during the session's own evaluation -
+not proof", it never turns a rule from wired into proven, and it is listed
+apart in the report. So do not plant a forbidden call, however harmless its
+form, to show that a tooth works. THOR tries every tooth itself with forms it
+builds; only a real refusal at real work counts.
 
 Step 4 is done once every rule of the batch and of the A4 list has its call
 made and THOR's answer to it, and nothing is left hanging on a refusal.
@@ -394,11 +413,11 @@ every point needs to become a fact, but every point needs a decision.
 Name explicitly what you are assuming but have not checked. If you added a
 fact bound to a target, this evaluation only ever sees what FIRED - a
 silently displaced binding shows up nowhere here. Flag such a fact as
-"still to be probed": the probe itself happens outside this evaluation, by
-putting the forbidden fragment literally into a harmless form of the bound
-command and seeing whether the gate responds. Never test with a file check
-or with free prose - that proves nothing, and writing the mistake into a
-file only risks it. A check on a file is tried by THOR itself against the
+"still to be probed": the probe is not made in this evaluation - a call you
+plant here is recorded as proof of nothing (step 4) - but by the real work of
+a later session, or by the owner. Never test with a file check or with free
+prose - that proves nothing, and writing the mistake into a file only risks
+it. A check on a file is tried by THOR itself against the
 project's registered working copy; one it cannot try yet is kept as a note
 with a pending check, and doctor lists it.
 

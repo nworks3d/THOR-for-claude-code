@@ -477,6 +477,13 @@ fn named(ids: &[String]) -> String {
     out
 }
 
+/// The first words of a fact's text, on one line, for a point that names it.
+fn first_words(text: &str) -> String {
+    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let head: String = one_line.chars().take(70).collect();
+    if one_line.chars().count() > 70 { format!("{head}...") } else { head }
+}
+
 /// The text of THOR's open point for `blocker`: the rules it holds and the
 /// step that clears it, with the exact command (F7).
 fn point_text(
@@ -553,6 +560,27 @@ fn point_text_of(store: &EventStore, project: &str, blocker: &Blocker, rules: &[
                 named(rules)
             )
         }
+        Blocker::AnchorFull { path } => {
+            let anchor = model::item::Binding::Target { kind: model::item::TargetKind::Path, value: path.clone() };
+            let occupants = rules
+                .iter()
+                .find_map(|id| model::store::show(store, id).ok())
+                .and_then(|item| model::store::full_place_occupants(store, &item, &anchor))
+                .unwrap_or_default();
+            let shown = occupants.iter().map(|(id, text)| format!("'{id}' ({})", first_words(text))).collect::<Vec<_>>().join("; ");
+            format!(
+                "THOR's own open point: {path} already holds {} live fact(s), the most a place ever shows - {shown} - so the \
+                 {} rule(s) whose path_exists check names {path} without being anchored to it cannot be anchored there: \
+                 {}.{more} Nothing needs doing from a session: each keeps its true check and is counted apart - clearing a \
+                 check that is true is never the way past this. The owner decides which fact gives way: fold one into \
+                 another (revise one to carry the point too, retract the rest), re-anchor one to the narrower file it is \
+                 really about, or archive the one that is dated. This point closes itself at the first evaluation start \
+                 after {path} has room again; the rules are then tried again.",
+                occupants.len(),
+                rules.len(),
+                named(rules)
+            )
+        }
     }
 }
 
@@ -586,6 +614,18 @@ fn lifted(store: &EventStore, project: &str, blocker: &Blocker) -> Option<String
                     && model::checkout::in_blob(&root, &branch, p, literal)
             });
             (!still).then(|| format!("the registered working tree and the default branch agree about {path} again"))
+        }
+        Blocker::AnchorFull { path } => {
+            let Ok(root) = project::registered_checkout(store, Some(project)) else {
+                return Some("the working copy is no longer registered - the rules are held by that instead".to_string());
+            };
+            let still = crate::live::live_items(store).into_iter().any(|li| {
+                li.item.kind.can_fire()
+                    && model::normalize::normalize_project(li.item.project.as_deref()).as_deref() == Some(project)
+                    && matches!(&li.item.check, Some(Check::PathExists { path: p }) if p == path)
+                    && model::checkout::crowded_path_anchor(store, &li.item, &root, path).is_some()
+            });
+            (!still).then(|| format!("{path} has room again, or no rule is held by it any more"))
         }
     }
 }

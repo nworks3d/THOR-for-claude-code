@@ -307,6 +307,47 @@ fn a_global_file_check_is_blocked_and_giving_it_the_project_still_lands() {
     assert!(landed(&reply) && fx.settled("ngl"), "{reply}");
 }
 
+/// A path_exists check on a file the rule is not anchored to, whose one fix
+/// (anchor the rule there) the crowding cap refuses because four facts sit on
+/// that path, is no refusal an agent is left with (step 22, C3b B4): at a
+/// retest it is THOR's blocker - routed to the owner queue by an evaluation's
+/// machine pass - and its text never offers clearing the check. Once a
+/// place has room it is the agent's again, and the way on it names (anchor the
+/// rule there) lands decided.
+#[test]
+fn a_path_check_on_a_full_anchor_is_blocked_and_room_makes_it_the_agents_again() {
+    let fx = Fx::new(&["beta"]);
+    let beta = checkout(fx.dir(), "beta", &[("files/PLAN.md", "the plan\n")], true);
+    register(&fx.db, "beta", &beta);
+    for n in 0..4 {
+        let mut occupant = item(&format!("occ{n}"), &format!("Decision number {n} about the plan."), vec![path("files/PLAN.md")], None, Some("beta"));
+        occupant.severity = None;
+        seed_raw(&fx.db, &occupant);
+    }
+    let project = Binding::Target { kind: TargetKind::Project, value: "beta".to_string() };
+    let mut plan = item("npa", "The plan lives in files/PLAN.md of this repo.", vec![project], Some(Check::PathExists { path: "files/PLAN.md".to_string() }), Some("beta"));
+    plan.kind = Kind::Orientation;
+    seed_raw(&fx.db, &plan);
+    match fx.retest("npa").outcome {
+        serve::teeth::Maintenance::Blocked(blocker) => {
+            assert_eq!(blocker, model::store::Blocker::AnchorFull { path: "files/PLAN.md".to_string() });
+            assert!(!blocker.to_string().contains("drop the check"), "{blocker}");
+        }
+        other => panic!("expected THOR's blocker, got {other:?}"),
+    }
+    assert!(!fx.settled("npa"), "blocked is not a verdict: nothing was written");
+
+    let reply = fx.mcp().call("retract", json!({"id": "occ3", "reason": "the owner folded it into another decision"}));
+    assert!(reply.contains("retracted"), "{reply}");
+    let why = fx.needs_agent("npa");
+    assert!(why.contains("anchor the rule to 'files/PLAN.md'"), "the place has room: the agent's anchor to make: {why}");
+    let reply = fx.mcp().call(
+        "revise",
+        json!({"id": "npa", "targets": [{"kind": "project", "value": "beta"}, {"kind": "path", "value": "files/PLAN.md"}]}),
+    );
+    assert!(landed(&reply) && fx.settled("npa"), "{reply}");
+}
+
 #[test]
 fn needs_agent_crowded_names_a_narrower_anchor_and_moving_it_lands_decided() {
     let fx = Fx::new(&["demo"]);
