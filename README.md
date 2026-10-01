@@ -388,7 +388,7 @@ after a restart. Until then, it can already read the memory but not add to it.
 thor2/target/release/doctor.exe --db "C:\Users\you\AppData\Local\thor2\thor.db"
 ```
 
-Sixteen plain-language lines, one per part: which build you are running,
+One plain-language line per part: which build you are running,
 whether your memory is healthy, whether searching by meaning is switched on,
 how many of your notes can prove themselves, how many point at files that are
 no longer there, and how many are bound to something that can never happen. It
@@ -447,7 +447,7 @@ A generic client config, the shape most tool-calling assistants expect:
       "args": [
         "run", "-i", "--rm",
         "-v", "thor-data:/data",
-        "ghcr.io/nworks3d/thor-mcp:2.4.1"
+        "ghcr.io/nworks3d/thor-mcp:2.5.0"
       ]
     }
   }
@@ -457,7 +457,7 @@ A generic client config, the shape most tool-calling assistants expect:
 ### Run it as a container
 
 ```bash
-docker run -i --rm -v thor-data:/data ghcr.io/nworks3d/thor-mcp:2.4.1
+docker run -i --rm -v thor-data:/data ghcr.io/nworks3d/thor-mcp:2.5.0
 ```
 
 On an empty volume, the container creates a memory and seeds it with THOR's
