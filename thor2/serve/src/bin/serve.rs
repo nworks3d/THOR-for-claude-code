@@ -2750,6 +2750,26 @@ fn reaches_a_block(store: &EventStore, id: &str, item: &model::item::Item) -> bo
     false
 }
 
+/// Whether a write above the watermark can be this session's own.
+///
+/// The watermark alone cannot tell, so two things are read off the event
+/// itself. (1) A write by one of THOR's own actors (`RESERVED_ACTORS`: the
+/// retest pass, repair, migration, the machine's notes) is never the
+/// session's work, even when it ran from inside the session: measured
+/// 2026-10-01, the install ran `serve retest --all --apply` from a session and
+/// its 1586 revisions (session id "retest") were then named one per turn as
+/// "stored this session". (2) A write stamped with a DIFFERENT real session id
+/// is another session's. The two shared constants a write carries when it has
+/// no session of its own ("mcp" from the tool server without a session hint,
+/// "cli" from the command line) still read as ours, exactly as before: the
+/// watermark and the project filter below stay the boundary for those.
+fn written_by_a_session_write(event: &thor_core::event_store::Event, session_id: &str) -> bool {
+    if model::store::RESERVED_ACTORS.contains(&event.actor.as_str()) {
+        return false;
+    }
+    matches!(event.session_id.as_str(), "mcp" | "cli") || event.session_id == session_id
+}
+
 fn crowding_debt(
     store: &EventStore,
     db_path: &Path,
@@ -2770,6 +2790,9 @@ fn crowding_debt(
         }
         match e.kind {
             EventKind::FactCreated | EventKind::FactRevised => {
+                if !written_by_a_session_write(e, session_id) {
+                    continue;
+                }
                 if !written.contains(&e.entity_id) {
                     written.push(e.entity_id.clone());
                 }
@@ -4468,6 +4491,71 @@ mod judgement_debt_tests {
         assert!(asked.contains("mine"), "{asked}");
         assert!(asked.contains("FOLD"), "it must say what to do, not just that something is wrong: {asked}");
         assert!(asked.contains("never do is raise its severity"), "{asked}");
+    }
+
+    /// Measured 2026-10-01: the install ran `serve retest --all --apply` from
+    /// inside a Claude session. Its revisions (actor and session id "retest")
+    /// landed above that session's watermark, so every Stop named one of them
+    /// as "stored this session". A write by THOR's own machine is never the
+    /// session's debt, whoever ran the command.
+    #[test]
+    fn a_retest_write_onto_a_full_place_is_never_this_sessions_debt() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        crowd_a_moment(&mut store, "p");
+        record_session_watermark(&db, "now");
+        for actor in model::store::RESERVED_ACTORS {
+            let id = format!("retested-by-{actor}");
+            let body = serde_json::to_string(&crowded_newcomer(&id, "p")).unwrap();
+            store
+                .append_event(
+                    "retest",
+                    "retest",
+                    actor,
+                    thor_core::event_store::EventKind::FactRevised,
+                    &id,
+                    None,
+                    &body,
+                )
+                .unwrap();
+        }
+        assert!(
+            crowding_debt(&store, &db, "now", None).is_none(),
+            "a write by one of THOR's own actors is not this session's"
+        );
+        // Fixture sanity: the same item written by the session itself holds.
+        let mut mine = crowded_newcomer("mine", "p");
+        mine.text = "a quote never ships before the spool is counted twice".to_string();
+        model::store::declare(&mut store, "now", "now", "t", &mine).unwrap();
+        let asked = crowding_debt(&store, &db, "now", None).expect("a real session write must still hold");
+        assert!(asked.contains("mine"), "{asked}");
+        assert!(!asked.contains("retested"), "{asked}");
+    }
+
+    /// A write stamped with another real session's id is that session's, even
+    /// though it landed above this session's watermark.
+    #[test]
+    fn another_sessions_stamped_write_is_not_this_sessions_debt() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        crowd_a_moment(&mut store, "p");
+        record_session_watermark(&db, "now");
+        model::store::declare(&mut store, "other-session", "other-session", "mcp", &crowded_newcomer("theirs", "p")).unwrap();
+        assert!(crowding_debt(&store, &db, "now", None).is_none(), "another session's write is not ours");
+    }
+
+    /// A write stamped with this session's own id still holds the turn.
+    #[test]
+    fn a_write_stamped_with_this_sessions_own_id_holds_the_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        crowd_a_moment(&mut store, "p");
+        record_session_watermark(&db, "now");
+        model::store::declare(&mut store, "now", "now", "mcp", &crowded_newcomer("mine", "p")).unwrap();
+        assert!(crowding_debt(&store, &db, "now", None).is_some());
     }
 
     /// It asks about what YOU made, never about somebody else's backlog. A
