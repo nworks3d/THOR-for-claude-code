@@ -2,6 +2,20 @@
 
 What changed in each release, newest first. The release workflow copies the section for the tag being released to the top of the release notes and refuses to publish without one.
 
+## 2.5.5 (2026-10-02)
+
+- **One fact is no longer shown over and over to one agent.** A session or subagent now gets a fact in full twice, then as a one-line reminder with its id (up to five showings in all), then not at all until its next prompt from the owner or its next session start; two facts that say the same in one block are shown once. Only what is displayed is limited - every refusal still runs - and only a full showing counts as a serving, so a repeat never adds to the judgement debt.
+- **A negated action is no moment, and other parties' messages are not the owner's prompts.** "niet pushen", "no deploy" and "don't push" no longer draw the push or deploy facts, and a message from another session, a subagent's hand-back, a task notification or a local-command echo draws no facts at all.
+- **A reply that denies a push is no claim of one.** A Response Guard rule marked `affirmative_only` (the version rule) does not fire on "niets gepusht of gedeployd".
+- **A call that trips several requires rules is refused once, naming all of them.** A call used to be refused one rule at a time, so an Agent brief took three rounds.
+- **A revise is refused once, with every problem.** The length limit, a weakening without a reason and a check whose literal the text no longer names come back in one answer; a path only shortened by its directory prefix is no longer a removal, and nothing is lost when a fragment leaves a note that never had a tooth.
+- **A paid debt frees its lease at once.** The retry Stop that follows a paid judgement debt now releases the project's lease when nothing is owed any more, instead of keeping it until the session's next first Stop.
+- **Old full-place open points are judged again.** A point an older build left, still saying the owner decides which fact gives way, is closed when the place has room and reworded when it is still held, at the first session start in its project.
+- **Open points are no longer put in front of the agent.** The session start carries one line with their count instead of their texts.
+- **The session start lists the heaviest rules first,** so the 2 KB Claude Code shows of a long block holds the rules that can refuse or cannot be undone.
+- **Where an item fired is kept around its anchor.** The place is the part of the command around the item's own file or command, a prompt shows its first words, and an Agent or MCP call shows its tool name, instead of the first 120 characters or a blank.
+- **THOR's own writes are no side doors.** A write by the installer or the machine pass is no longer recorded as "written by another program".
+
 ## 2.5.4 (2026-10-02)
 
 - **One session at a time owes a project its upkeep.** The judgement debt, the question about old rules and the evaluation ask now hold only the project's holder - the session running its evaluation, else the one already held for its debt, else the first one asked; another session in the same project gets one line naming the holder, and takes over once the holder has been quiet for 30 minutes.
