@@ -2,6 +2,16 @@
 
 What changed in each release, newest first. The release workflow copies the section for the tag being released to the top of the release notes and refuses to publish without one.
 
+## 2.5.6 (2026-10-02)
+
+- **A fact is shown in full once per context, then never again.** A session's main conversation, and each subagent on its own (a fresh context has seen nothing), gets a fact in full one time; there are no reminder lines any more, and a prompt the owner types opens no new showing. Only a new session start (also a resume or a compaction) shows it again. Every refusal still runs.
+- **No Stop holds a turn for a judgement or for old rules.** The "N item(s) have fired repeatedly" hold and the rule-upkeep question are gone from the turn's end; both are asked inside the project's evaluation (its frozen judgement list, its batch and its A4 list), at most once per 16 hours per project. Holds about the session's own writes, setup, a stated decision, the reply rules and the evaluation ask itself are unchanged.
+- **A fact counts once per session toward the verdict it owes.** The 40 now means 40 sessions, in the evaluation's judgement list, the filing gate, the repeat-verdict check and doctor; the start note says so.
+- **doctor shows the volume.** For the last 24 hours and 7 days: facts shown in full, repeats left out, the five most shown facts and how many Stop holds a session gets on average.
+- **A bare generic word no longer names a path.** A prompt word such as "dev", "src", "test", "docs" or "server" no longer draws a fact anchored at a path, directory or route; the path (`site/dev`) or a distinctive segment still does, and a real tool call on the path is unchanged.
+- **The owner's prompt text is not kept in the log.** Where a prompt fired a fact is now recorded as "(prompt)" and the anchor or moment word that matched, instead of the prompt's first words.
+- **Another party's message raises no capture flag.** A message from another session, a hand-back or a task notification no longer flags a decision to capture.
+
 ## 2.5.5 (2026-10-02)
 
 - **One fact is no longer shown over and over to one agent.** A session or subagent now gets a fact in full twice, then as a one-line reminder with its id (up to five showings in all), then not at all until its next prompt from the owner or its next session start; two facts that say the same in one block are shown once. Only what is displayed is limited - every refusal still runs - and only a full showing counts as a serving, so a repeat never adds to the judgement debt.
