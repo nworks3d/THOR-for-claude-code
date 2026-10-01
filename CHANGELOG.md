@@ -2,6 +2,19 @@
 
 What changed in each release, newest first. The release workflow copies the section for the tag being released to the top of the release notes and refuses to publish without one.
 
+## 2.5.4 (2026-10-02)
+
+- **One session at a time owes a project its upkeep.** The judgement debt, the question about old rules and the evaluation ask now hold only the project's holder - the session running its evaluation, else the one already held for its debt, else the first one asked; another session in the same project gets one line naming the holder, and takes over once the holder has been quiet for 30 minutes.
+- **A full place is the agent's to clear.** A rule whose check needs a full place now goes to the agent's batch with every note on that place (its severity and whether its check can refuse) and the three honest exits - fold, move to a narrower anchor, retract a stale one with a reason; only when every note there is a heavier rule whose check can refuse does it stay THOR's own open point, and that point no longer says the owner decides.
+- **The owner's go cannot be typed by an agent.** A requires check tagged `owner-approval` is answered only by the owner's own message in this session, this turn or the one before - never the call itself, a subagent's hand-back or quoted text - and an unreadable transcript refuses; its marker need not be named in the rule's text, and every rule answered only by a `go-<name>` marker is marked so once, at session start.
+- **Stop notices reach the agent at its next prompt.** A notice that may not hold the turn still goes to the owner only at Stop, and is now also queued (at most three, each once) and handed to the same session as context when its next turn starts.
+- **Where an item fired is shown for evaluations started by an older build.** A start record without frozen places gets them from the log when it is read, so "where it fired was not recorded" no longer appears when the firings are on the log.
+- **A flag the rule recommends is never forbidden.** A rule that says to use a flag ("use git grep --no-index there") no longer gets a forbidden tooth on that flag, so it never demands a made-up legitimate call.
+- **Losing a check is said out loud.** Retracting a rule whose check holds warns in the reply and names the check, the machine section lists it under the checks, and a full-place refusal shows each note's severity and whether it carries a check.
+- **The machine section names an earlier round.** An earlier evaluation of the same project closed as void or superseded gets a line with its session's verdicts and edits, so a restarted evaluation hides no work.
+- **The evaluation ask says when the routine changed.** When the routine file changed after the session last read it, the ask says so and asks to read it again, and every judgement line now says to check that the item is still true first.
+- **A reason tag beside a working check is refused on a reword too.** A text revise of a rule that carries a check (a contains check included) and a "nothing can catch this" reason is refused like any other write of that pair.
+
 ## 2.5.3 (2026-10-01)
 
 - **A Stop notice that does not hold the turn no longer holds it.** The void notice, the "running in session X" line, the "report still owed" line and the Response Guard's warnings were sent as model context, which Claude Code answers with another turn, so a session was stopped again at every Stop until Claude Code overrode the hook; they now reach you as a plain message only, a void notice is shown once per session, and a held turn is held again at most four times.
