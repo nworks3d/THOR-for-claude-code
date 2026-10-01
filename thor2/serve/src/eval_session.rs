@@ -112,9 +112,33 @@ pub fn retire_handover_sidecar(db: &Path) {
     }
 }
 
-/// The open evaluation `session_id` runs for `project`, read from the log.
+/// The open evaluation `session_id` runs for `project`, read from the log -
+/// with where each judgement item fired filled in at read time when the start
+/// record carries none (`with_fired`).
 pub fn open_evaluation(store: &EventStore, session_id: &str, project: &str) -> Option<EvaluationStart> {
-    model::store::open_evaluation_start(store, session_id, project)
+    model::store::open_evaluation_start(store, session_id, project).map(|start| with_fired(store, start))
+}
+
+/// READ-TIME FALLBACK FOR WHERE IT FIRED (step 26, field test 2 defect 1): a
+/// start record written by a build before step 24 carries no frozen places
+/// (`Frozen::fired`), and its note said "where it fired was not recorded" for
+/// every item although the log held each firing. Such a start gets the places
+/// computed now, from the log, exactly as a start freezes them: the evaluating
+/// session's firings at or before N, one place per item for a long list. A
+/// start that froze its places, or holds no judgement list, is returned as it
+/// is. Nothing is written.
+pub fn with_fired(store: &EventStore, start: EvaluationStart) -> EvaluationStart {
+    if !start.frozen.fired.is_empty() || start.frozen.judgement.is_empty() {
+        return start;
+    }
+    let mut start = start;
+    let mut fired =
+        model::store::session_firings(store, &start.frozen.session, &start.frozen.judgement, start.frozen.started_seq);
+    if start.frozen.judgement.len() > model::store::FIRED_FULL_LIST_MAX {
+        fired.values_mut().for_each(|f| f.triggers.truncate(1));
+    }
+    start.frozen.fired = fired;
+    start
 }
 
 /// Whether `start` is still the evaluation running: not older than
@@ -198,7 +222,7 @@ pub enum StartRefused {
 pub fn try_start(db: &Path, store: &mut EventStore, session_id: &str, project: &str, started_by: &str) -> Result<Started, StartRefused> {
     let began = try_begin(db, store, session_id, project, started_by)?;
     let decided = decide(store, began.start, pass_box());
-    Ok(Started { start: decided, fresh: began.fresh })
+    Ok(Started { start: with_fired(store, decided), fresh: began.fresh })
 }
 
 /// The FIRST of a start's two writes: the start record, with the judgement
@@ -331,7 +355,9 @@ pub fn resume(store: &mut EventStore, session_id: &str) -> Vec<EvaluationStart> 
         .filter(|s| !s.frozen.decided() && model::store::evaluation_still_open(store, s, now))
         .collect();
     pending.sort_by_key(|s| s.seq);
-    pending.into_iter().map(|start| decide(store, start, pass_box())).filter(|s| s.frozen.decided()).collect()
+    let decided: Vec<EvaluationStart> =
+        pending.into_iter().map(|start| decide(store, start, pass_box())).filter(|s| s.frozen.decided()).collect();
+    decided.into_iter().map(|s| with_fired(store, s)).collect()
 }
 
 /// What the session is told when its Stop finished a machine pass that an
@@ -645,14 +671,17 @@ fn point_text_of(store: &EventStore, project: &str, blocker: &Blocker, rules: &[
                 .and_then(|item| model::store::full_place_occupants(store, &item, &anchor))
                 .unwrap_or_default();
             let shown = occupants.iter().map(|(id, text)| format!("'{id}' ({})", first_words(text))).collect::<Vec<_>>().join("; ");
+            // STEP 26: this point exists only while no fact on the place
+            // honestly gives way - every one a heavier rule whose check can
+            // refuse. A place with an honest exit is the agent's (its batch
+            // line names the occupants and the exits), never the owner's.
             format!(
-                "THOR's own open point: {path} already holds {} live fact(s), the most a place ever shows - {shown} - so the \
-                 {} rule(s) whose check reads {path} without being anchored to it cannot be anchored there: \
-                 {}.{more} Nothing needs doing from a session: each keeps its true check and is counted apart - clearing a \
-                 check that is true is never the way past this. The owner decides which fact gives way: fold one into \
-                 another (revise one to carry the point too, retract the rest), re-anchor one to the narrower file it is \
-                 really about, or archive the one that is dated. This point closes itself at the first evaluation start \
-                 after {path} has room again; the rules are then tried again.",
+                "THOR's own open point: {path} already holds {} live fact(s), the most a place ever shows - {shown} - and \
+                 every one is a heavier rule whose check can refuse, so no fact there honestly gives way and the {} rule(s) \
+                 whose check reads {path} without being anchored to it cannot be anchored there: {}.{more} Nothing needs \
+                 doing from a session: each keeps its true check and is counted apart - clearing a check that is true is \
+                 never the way past this. This point closes itself at the first evaluation start after {path} has room again \
+                 or a fact on it no longer outweighs these rules; they are then tried again, and making room is the agent's.",
                 occupants.len(),
                 rules.len(),
                 named(rules)
@@ -872,8 +901,12 @@ pub fn render_start_note(id: &str, frozen: &Frozen) -> String {
             quoted(&frozen.judgement)
         ));
         for id in &frozen.judgement {
+            // CHECK TRUTH FIRST, on every line (step 26): field test 2 saw
+            // ten verdicts given in five seconds with no look at whether the
+            // items were still true; the advice stood once, above the list.
             out.push_str(&format!(
-                "\n   - '{id}': mcp__thor__mark(id: \"{id}\") when it belonged where it fired, or \
+                "\n   - '{id}': first check it is still TRUE (revise it when the code says otherwise - a repair, not \
+                 noise), then mcp__thor__mark(id: \"{id}\") when it belonged where it fired, or \
                  mcp__thor__mark(id: \"{id}\", noise: true) when it did not"
             ));
             out.push_str(&fired_line(frozen.fired.get(id), per_item));
@@ -1328,6 +1361,44 @@ mod tests {
             "the places this session saw it fire, newest first: {note}"
         );
         assert!(!note.contains("git push elsewhere"), "another session's firing is not this one's: {note}");
+    }
+
+    /// FIELD TEST 2, defect 1 (2026-10-01): an evaluation started by an older
+    /// build carries no frozen places, and its note said "where it fired was
+    /// not recorded" for every item although the log held each firing. The
+    /// places are now computed at read time from the log, the same way the
+    /// start freezes them.
+    #[test]
+    fn a_start_from_an_older_build_shows_where_each_item_fired_at_read_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, mut store) = store_with_events(dir.path(), 1);
+        let now = crate::time::now_unix();
+        noted_rule(&mut store, "fx-old", model::item::Binding::Target { kind: model::item::TargetKind::Command, value: "git push".to_string() });
+        fire(&mut store, "sess", "fx-old", 40, now - 600, Some("git push origin main"));
+        let mut frozen = model::store::frozen_now(&store, "sess", "p", "stop-ask", now).unwrap();
+        assert_eq!(frozen.judgement, vec!["fx-old".to_string()]);
+        // What an older build wrote: no places at all.
+        frozen.fired.clear();
+        let id = model::store::evaluation_start_id("p", frozen.started_seq);
+        let item = Item {
+            id: id.clone(),
+            kind: Kind::Report,
+            text: render_start_note(&id, &frozen),
+            bindings: vec![],
+            severity: None,
+            project: Some("p".to_string()),
+            tags: vec![model::store::EVALUATION_START_TAG.to_string()],
+            expires: None,
+            key: None,
+            falsifier: None,
+            check: None,
+        };
+        model::store::record_evaluation_start(&mut store, eval_machine(), &item, &frozen).unwrap();
+        let again = start(&db, &mut store, "sess", "p", "stop-ask").unwrap();
+        assert!(!again.fresh, "the open evaluation is kept");
+        let note = start_note(&again.start);
+        assert!(note.contains("fired here 40 time(s); last at: 'git push origin main'"), "{note}");
+        assert!(!note.contains("was not recorded"), "{note}");
     }
 
     /// The places stay bounded: a judgement list longer than

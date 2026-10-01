@@ -101,7 +101,7 @@ impl Alone {
     /// session's project is the rule's own, and `root` is both the checkout
     /// and the working folder.
     fn refuses(&self, call: &Call, root: &Path) -> bool {
-        let judged = guard_verdict::pre_tool(&self.store, &call.tool, Some(&call.input), self.project.as_deref(), Some(root), Some(root));
+        let judged = guard_verdict::pre_tool(&self.store, &call.tool, Some(&call.input), self.project.as_deref(), Some(root), Some(root), None);
         judged.verdict.and_then(|v| v.rule_id).as_deref() == Some(self.id.as_str())
     }
 }
@@ -587,12 +587,110 @@ fn teeth_of_span(words: &[&str], anchor_len: usize, anchor: &str, proposed: Opti
     out
 }
 
+/// Words that RECOMMEND what follows them ("use X", "gebruik X"), and words
+/// that turn a recommendation into a prohibition ("never use X"). Lowercase,
+/// English and Dutch: the owner's rules are written in both.
+const RECOMMENDING: &[&str] = &[
+    "use", "using", "prefer", "run", "always", "pass", "add", "instead", "gebruik", "gebruiken", "liever", "altijd",
+    "draai", "voeg", "kies",
+];
+const NEGATING: &[&str] = &[
+    "never", "not", "no", "don't", "dont", "avoid", "nooit", "niet", "geen", "vermijd", "zonder", "without", "forbidden",
+    "verboden",
+];
+
+/// THE INVERSE TOOTH (step 26, field test 2 defect 2): whether the words just
+/// before position `at` of `text`'s tokens - at most three, never across the
+/// end of a sentence - RECOMMEND what starts there: a recommending word and no
+/// negating one. Field case 2026-10-01 (git-grep-springt-naar-bovenliggende-git):
+/// "Gebruik daar git grep --no-index" derived forbidden '--no-index', the very
+/// flag the rule recommends; the write was refused until the agent named a
+/// legitimate call carrying it, no such call existed, and the agent invented
+/// one. A literal the text recommends is never forbidden.
+fn recommended_at(raw: &[&str], at: usize) -> bool {
+    let mut words: Vec<String> = Vec::new();
+    for raw_word in raw[..at].iter().rev().take(3) {
+        if raw_word.ends_with(['.', '!', '?', ';', ':']) {
+            break;
+        }
+        words.push(raw_word.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'').to_lowercase());
+    }
+    words.iter().any(|w| RECOMMENDING.contains(&w.as_str())) && !words.iter().any(|w| NEGATING.contains(&w.as_str()))
+}
+
+/// The position in `raw` (the text's whitespace tokens) where the words of
+/// `span` start, compared without surrounding quotes, backticks and
+/// punctuation, case ignored.
+fn span_position(raw: &[&str], span: &[&str]) -> Option<usize> {
+    let bare = |t: &str| t.trim_matches(|c: char| matches!(c, '`' | '\'' | '"' | '(' | ')' | ',' | ';' | ':' | '.' | '!' | '?')).to_lowercase();
+    let wanted: Vec<String> = span.iter().map(|w| bare(w)).collect();
+    (0..raw.len()).find(|&i| i + wanted.len() <= raw.len() && raw[i..i + wanted.len()].iter().zip(&wanted).all(|(r, w)| bare(r) == *w))
+}
+
 /// A5: every tooth the rule's own text composes (see this module's doc
 /// comment), plus (e) - a span or flag of the text present in the file of a
 /// Path/Dir anchor or a text path that resolves in `root`. Only where the
 /// TEXT composes a call with a fragment: a flag alone in prose, far from any
-/// anchor, derives nothing.
+/// anchor, derives nothing. A command the text RECOMMENDS (`recommended_at`)
+/// yields no forbidden tooth on what it recommends - only the requires one.
 fn derive(item: &Item, root: Option<&Path>) -> Vec<Derived> {
+    let out = derive_all(item, root);
+    let raw: Vec<&str> = item.text.split_whitespace().collect();
+    let recommended: Vec<String> = recommended_fragments(item, &raw);
+    out.into_iter()
+        .filter(|d| match &d.check {
+            Check::Forbidden { literals } => !literals.iter().any(|l| recommended.iter().any(|r| r == l)),
+            _ => true,
+        })
+        .collect()
+}
+
+/// Every flag or fragment the text names right after a command it
+/// RECOMMENDS: the literal a forbidden tooth would refuse, in the forms
+/// `teeth_of_span` and the prose rule (c) build them.
+fn recommended_fragments(item: &Item, raw: &[&str]) -> Vec<String> {
+    let mut anchors: Vec<Vec<String>> = item
+        .bindings
+        .iter()
+        .filter_map(|b| match b {
+            Binding::Target { kind: TargetKind::Command, value } => Some(value.split_whitespace().map(str::to_string).collect()),
+            _ => None,
+        })
+        .collect();
+    // A span with its own command (1 to 3 words before its first flag).
+    for c in gate::teeth_candidates(item) {
+        if !matches!(c.source, gate::CandidateSource::Backtick | gate::CandidateSource::Quoted) {
+            continue;
+        }
+        let words: Vec<&str> = c.value.split_whitespace().collect();
+        if let Some(k) = words.iter().position(|w| leading_flag(w).is_some()).filter(|k| (1..=3).contains(k)) {
+            anchors.push(words[..k].iter().map(|w| w.to_string()).collect());
+        }
+    }
+    let mut out: Vec<String> = Vec::new();
+    for anchor in &anchors {
+        let aw: Vec<&str> = anchor.iter().map(String::as_str).collect();
+        let mut from = 0;
+        while let Some(found) = span_position(&raw[from..], &aw).map(|i| i + from) {
+            from = found + 1;
+            if !recommended_at(raw, found) {
+                continue;
+            }
+            let bare = |t: &str| t.trim_matches(|c: char| matches!(c, '`' | '\'' | '"' | '(' | ')' | ',' | ';' | ':' | '.' | '!' | '?')).to_string();
+            let after: Vec<String> = raw[found + aw.len()..].iter().take(3).map(|t| bare(t)).collect();
+            if let Some(first) = after.first() {
+                out.push(first.clone());
+                if let Some(next) = after.get(1).filter(|n| !n.starts_with('-') && !n.is_empty()) {
+                    out.push(format!("{first} {next}"));
+                }
+            }
+            out.extend(after.iter().filter_map(|t| leading_flag(t)).map(str::to_string));
+        }
+    }
+    out
+}
+
+fn derive_all(item: &Item, root: Option<&Path>) -> Vec<Derived> {
     let candidates = gate::teeth_candidates(item);
     let spans: Vec<&str> = candidates
         .iter()
@@ -808,6 +906,7 @@ pub const REFUSAL_TABLE: &[(&str, &str)] = &[
     ("needs_agent:no_reach", "bind it to"),
     ("needs_agent:false_now", "revise the check"),
     ("needs_agent:crowded", "fold this rule into a neighbour"),
+    ("needs_agent:full_place", "Then bind this rule there"),
 ];
 
 /// Where a write stands after its trial.
@@ -1507,33 +1606,21 @@ impl<'a> Work<'a> {
                 // whose one fix - anchoring the rule there - the crowding cap
                 // refuses (step 22, C3b B4): THOR's blocker, never the
                 // agent's batch. Its other exit was to clear a TRUE check.
+                // Making room is the agent's (step 26): the batch line names
+                // every fact there and the honest exits; only when no fact
+                // there honestly gives way is it THOR's own point.
                 if let (Some(Check::PathExists { path }), Some(root)) = (&w, &root_ok) {
-                    if let Some(blocker) = model::checkout::crowded_path_anchor(self.env.store, self.item(), root, path) {
-                        return Decision::Refuse {
-                            code: RefuseCode::A4,
-                            message: format!(
-                                "blocked: {path} is already full of other facts, so the rule cannot be anchored to it - \
-                                it keeps its true check and is counted apart; the owner decides which fact gives way"
-                            ),
-                            retest: RetestAs::Blocked(blocker),
-                        };
+                    if let Some(place) = model::checkout::full_path_place(self.env.store, self.item(), root, path) {
+                        return self.full_place_refusal(RefuseCode::A4, place);
                     }
                 }
                 // A contains or absent check the rule is not anchored to, whose
                 // anchor is full (step 24): naming its literal would never be
-                // enough, and the one other fix is the owner's.
+                // enough - room is made first (step 26).
                 if let (Some(check), Some(root)) = (&w, &root_ok) {
                     if !matches!(check, Check::PathExists { .. }) && self.binding_alone_would_reach(check, root) {
-                        if let Some(blocker) = self.full_file_anchor(check, root) {
-                            let path = check_path(check).unwrap_or_default();
-                            return Decision::Refuse {
-                                code: RefuseCode::A4,
-                                message: format!(
-                                    "blocked: {path} is already full of other facts, so the rule cannot be anchored to it \
-                                     - it keeps its true check and is counted apart; the owner decides which fact gives way"
-                                ),
-                                retest: RetestAs::Blocked(blocker),
-                            };
+                        if let Some(place) = self.full_file_place(check, root) {
+                            return self.full_place_refusal(RefuseCode::A4, place);
                         }
                     }
                 }
@@ -1774,21 +1861,15 @@ impl<'a> Work<'a> {
             }
             // At a retest, a file check that only lacks its anchor needs the
             // agent: THOR can name the one binding that makes it bite - or,
-            // when that place is full, the owner decides (step 24).
+            // when that place is full, the room the agent makes first, or
+            // THOR's own point when nothing there honestly gives way (step 26).
             if matches!(self.mode, Mode::Retest) && !tried.reaches() {
                 if let Some(path) = check_path(check).filter(|_| is_file_check(check)) {
                     let mut bound = item.clone();
                     bound.bindings.push(Binding::Target { kind: TargetKind::Path, value: path.to_string() });
                     if try_check(&bound, &try_root).bites() {
-                        if let Some(blocker) = self.full_file_anchor(check, &try_root) {
-                            return Decision::Refuse {
-                                code: RefuseCode::Untryable,
-                                message: format!(
-                                    "blocked: {path} is already full of other facts, so the rule cannot be anchored to it - \
-                                     it keeps its true check and is counted apart; the owner decides which fact gives way"
-                                ),
-                                retest: RetestAs::Blocked(blocker),
-                            };
+                        if let Some(place) = self.full_file_place(check, &try_root) {
+                            return self.full_place_refusal(RefuseCode::Untryable, place);
                         }
                         return Decision::Refuse {
                             code: RefuseCode::Forcing,
@@ -1961,16 +2042,38 @@ impl<'a> Work<'a> {
         try_check(item, &try_root).bites()
     }
 
-    /// The place a file check reads, as an anchor this rule cannot take
-    /// because it is full (`model::checkout::crowded_file_anchor`) - `None`
-    /// for a path_exists check (its own rule, `crowded_path_anchor`), or when
-    /// the rule is anchored there already or the place has room.
-    fn full_file_anchor(&self, check: &Check, root: &Path) -> Option<Blocker> {
+    /// The place a file check reads, as an anchor this rule cannot take yet
+    /// because it is full (`model::checkout::full_file_place`) - `None` for a
+    /// path_exists check (its own rule, `full_path_place`), or when the rule is
+    /// anchored there already or the place has room.
+    fn full_file_place(&self, check: &Check, root: &Path) -> Option<model::store::FullPlace> {
         match check {
             Check::Contains { path, .. } | Check::Absent { path, .. } | Check::AbsentAll { path, .. } => {
-                model::checkout::crowded_file_anchor(self.env.store, self.item(), root, path)
+                model::checkout::full_file_place(self.env.store, self.item(), root, path)
             }
             _ => None,
+        }
+    }
+
+    /// A FULL PLACE IS THE AGENT'S (step 26, the owner's decision): the rule
+    /// needs `place` as its anchor and the place is full. When a fact there
+    /// honestly gives way (it is lighter, or carries no check that can
+    /// refuse), the agent makes room: the refusal names every occupant with its
+    /// severity and check, and the three exits - never "the owner decides".
+    /// Only when no fact there gives way honestly is it THOR's own point
+    /// (`Blocker::AnchorFull`), the rule's true check kept.
+    fn full_place_refusal(&self, code: RefuseCode, place: model::store::FullPlace) -> Decision {
+        let path = place.path.clone();
+        if place.honest_exit {
+            return Decision::Refuse { code, message: place.agent_line(&self.item().id), retest: RetestAs::NeedsAgent };
+        }
+        Decision::Refuse {
+            code,
+            message: format!(
+                "blocked: {path} is already full, and every fact on it is a heavier rule whose check can refuse - no fact \
+                 there honestly gives way, so this rule keeps its true check and is counted apart (THOR's own point)"
+            ),
+            retest: RetestAs::Blocked(Blocker::AnchorFull { path }),
         }
     }
 
@@ -1993,7 +2096,7 @@ impl<'a> Work<'a> {
     /// STEP 24's keep: at a write that leaves the rule's check exactly as it
     /// was, a check that holds but does not reach from the rule's bindings is
     /// kept, with the verdict undecided and the rebind named as its own step
-    /// (or the owner's decision, when that place is full). `None` for every
+    /// (or the room to make first, when that place is full). `None` for every
     /// other case: the trial goes on as before.
     fn kept_unreached(&mut self, check: &Check, tried: &Tried, root: &Path) -> Option<Decision> {
         let file_check = is_file_check(check) && !matches!(check, Check::PathExists { .. });
@@ -2012,17 +2115,22 @@ impl<'a> Work<'a> {
             return None;
         }
         let kept = format!("its check ({}) is kept: it holds", describe(check, &item.bindings));
-        let why = match self.full_file_anchor(check, root) {
+        let why = match self.full_file_place(check, root) {
             None => format!(
                 "{kept}, but this rule's bindings never reach a write to {path}, and a text revise never clears a check. \
                  The rebind is a step of its own: mcp__thor__revise(id: \"{}\", bindings: <its bindings plus \
                  {{\"target\": {{\"kind\": \"path\", \"value\": \"{path}\"}}}}>) - THOR then tries it as a rule",
                 item.id
             ),
+            // Making room is the agent's (step 26).
+            Some(place) if place.honest_exit => format!(
+                "{kept}, but this rule's bindings never reach a write to {path}, and a text revise never clears a check. {}",
+                place.agent_line(&item.id)
+            ),
             Some(_) => format!(
-                "{kept}, but this rule's bindings never reach a write to {path}, and {path} is already full of other facts, \
-                 so it cannot be anchored there. Nothing more to do from a session: THOR's own open point holds it at the \
-                 next evaluation start, and the owner decides which fact gives way"
+                "{kept}, but this rule's bindings never reach a write to {path}, and {path} is already full: every fact on it \
+                 is a heavier rule whose check can refuse, so no fact there honestly gives way. Nothing more to do from a \
+                 session: THOR's own open point holds it at the next evaluation start, its check kept"
             ),
         };
         self.unreached = Some(why.clone());

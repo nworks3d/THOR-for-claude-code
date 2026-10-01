@@ -909,6 +909,30 @@ pub fn find_requires_violation_in(
     scope: Option<&[Option<String>]>,
     content: &str,
 ) -> Option<String> {
+    find_requires_violation_owned(items, segments, scope, content, None)
+}
+
+/// Where a live hook reads the owner's own words from: his last messages of
+/// this session (`attest::owner_messages`), or why they cannot be read.
+pub type OwnerWords<'a> = &'a dyn Fn() -> Result<Vec<String>, String>;
+
+/// [`find_requires_violation_in`], with THE OWNER'S GO (step 26): a rule
+/// marked `model::store::OWNER_APPROVAL_TAG` is answered only by the owner's
+/// own words, read from `owner` - never by `content`, the call's own input. An
+/// agent typing the marker in its call answers nothing; the owner saying it in
+/// his own message, this turn or the one before, does. Words that cannot be
+/// read refuse the call (fail closed), saying why. `owner` is read at most
+/// once, and only when such a rule is reached. `None` (THOR's own trial, which
+/// builds the call it tries): the call's content stands in for the owner's
+/// words, so the trial still tries the check's shape.
+pub fn find_requires_violation_owned(
+    items: &[LiveItem],
+    segments: &[crate::shell::Segment],
+    scope: Option<&[Option<String>]>,
+    content: &str,
+    owner: Option<OwnerWords>,
+) -> Option<String> {
+    let said: std::cell::OnceCell<Result<Vec<String>, String>> = std::cell::OnceCell::new();
     for candidate in items {
         if !candidate.item.kind.can_fire() {
             continue;
@@ -931,6 +955,32 @@ pub fn find_requires_violation_in(
             Some(*anchor)
         });
         let Some(anchor) = hit else { continue };
+        if let (true, Some(owner)) = (model::store::is_owner_approval(&candidate.item), owner) {
+            let trips = if inner { format!("{anchor:?} carrying {when:?}") } else { format!("{anchor:?}") };
+            match said.get_or_init(owner) {
+                Ok(messages) if messages.iter().any(|m| required.iter().any(|r| crate::attest::says_marker(m, r))) => continue,
+                Ok(_) => {
+                    let answers: Vec<String> = required.iter().map(|r| format!("{r:?}")).collect();
+                    return Some(format!(
+                        "[THOR] rule {} applies here: this call trips {trips} and needs the owner's explicit go - his own \
+                         message, in this turn or the one before, must say {}. Writing it in the call does not count, and \
+                         neither does a subagent's hand-back or quoted text. Nothing was done. Ask the owner; once he has \
+                         said it, run the call again. {}",
+                        candidate.id,
+                        answers.join(" or "),
+                        candidate.item.text
+                    ));
+                }
+                Err(why) => {
+                    return Some(format!(
+                        "[THOR] rule {} applies here: this call trips {trips} and needs the owner's explicit go, but THOR \
+                         cannot read this session's transcript ({why}), so it cannot see one and refuses rather than guess. \
+                         Nothing was done. Ask the owner to run it himself. {}",
+                        candidate.id, candidate.item.text
+                    ));
+                }
+            }
+        }
         if required.iter().any(|r| content.contains(r.as_str())) {
             continue;
         }

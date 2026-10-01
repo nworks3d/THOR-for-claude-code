@@ -43,6 +43,17 @@ running this project's evaluation and was active in the last 30 minutes, you
 are told that in one line, naming that session, and are not held. Once it has
 been quiet longer, the next ask takes the evaluation over. A project with activity in the last seven days and no
 evaluation that counts in seven days is due whatever the clock says.
+Since THOR 2.5.4 the same holds for the judgement debt ("N item(s) have fired
+repeatedly") and the question about old rules: per project one session at a
+time is held - the one running its evaluation, else the one already held for
+the project's debt, else the first one asked. Another session in the same
+project gets one line naming the holder and is not held; once the holder has
+been quiet for 30 minutes, the next one asked takes it over. A verdict counts
+per item for everyone. What is about your OWN writes (a fact stored onto a
+full place, an unattested write, setup, a decision the owner stated) stays
+per session.
+If THOR says this routine changed since you last read it, read it again
+before you go on: never work from an old version.
 When something else holds the same turn-end first - a reply rule, the
 first-session setup, a decision the owner stated that was not stored, a note
 stored onto a full place, or the question about old rules below - the ask
@@ -272,7 +283,13 @@ which file or command it belongs (a rule hanging on a broad moment gets
 re-anchored to the exact command or file first), and which check kind fits -
 `forbidden`, `absent`, `absent_all`, `contains`, or `requires`. Name that
 literal in the rule's own text, or the tool refuses the check: a tooth has to
-say in its own words what it refuses. Then `revise`. If the tool refuses, its
+say in its own words what it refuses. One exception: an approval marker of the
+owner (a `requires` check tagged `owner-approval`, such as `go-owner`) is NOT
+named in the text and never typed by you in a call - it counts only when the
+owner writes it in his own message, this turn or the one before; a subagent's
+hand-back or quoted text does not count. The text says the rule needs the
+owner's explicit go instead. When THOR refuses a call for it, ask the owner
+and wait for his message. Then `revise`. If the tool refuses, its
 reply names the one thing to do; do it and call again - the refusal is the
 gate working, not a bug.
 
@@ -290,12 +307,24 @@ When a revise reply says bind, anchor or rebind (for example "bind it to
 <file>"), make that rebind as a revise of its own, or write "could not" with
 the refusal. Since THOR 2.5.2 a rewording never clears a true check: a reply
 saying the check "is kept" leaves the rule owed until the rebind is made - or,
-when that place is full, THOR's own open point takes it to the owner.
+when that place is full, you make room first and rebind after.
+
+A full place is yours to solve, never a question for the owner: THOR names
+every fact on it with its severity and whether it carries a check that can
+refuse, and the three honest exits - FOLD two that say almost the same (revise
+one to carry the other's point, retract the other with a reason naming the
+survivor), MOVE one to the narrower file or command it is really about, or
+RETRACT one that is stale, with a reason. A fact with no check gives way before
+a rule whose check can refuse, and a lighter fact before a heavier one. Never
+clear a true check to get past it. When you retract a rule whose check held,
+THOR warns and the machine section names that check: say in the report where
+its point and its check live now, or that they went on purpose. Only when no
+exit is honest, write "could not" with the refusal and the occupants.
 
 Never file an open point, and never tag a rule with `open-point`, `about:` or
 `blocker:`: THOR writes and closes its own open points (a missing working
-copy, a file the checkout is changing, a file whose anchor is already full of
-the owner's other facts, and ONE point for the whole memory that holds every
+copy, a file the checkout is changing, a file whose anchor is full of heavier
+rules that can each refuse, and ONE point for the whole memory that holds every
 rule with no project whose check reads a file) and refuses yours. A rule held
 by one of those is not on your lists and is never yours to clear: clearing a
 check that is true is never the way past a blocker, and a check you clear,

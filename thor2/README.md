@@ -212,6 +212,15 @@ per project and not per folder, when:
   been quiet for 30 minutes, the next ask takes the evaluation over and closes
   the old one as superseded (never void: its verdicts stay). A session's own
   open evaluation is asked for first, whatever the clock says.
+- ONE HOLDER PER PROJECT (2.5.4): the judgement debt and the teeth question
+  are the project's debt as well. Per project the holder is the session with
+  the open evaluation, else the one currently held for the project's debt (a
+  lease in `debt-holders.json` beside the store, released at a `Stop` that
+  holds it for nothing), else the first one asked. Another session is not
+  held for any of them while the holder showed activity on the log in the
+  last 30 minutes; it gets one line naming the holder. Holds about the
+  session's own writes (a fact on a full place, setup, a stated decision,
+  the Response Guard) stay per session.
 
 Inside a turn the ask already held, the `Stop` of that turn holds again while
 the session's evaluation is open and its report not filed - only once the
@@ -241,6 +250,26 @@ When something else holds that `Stop` first - a reply that breaks a reply rule,
 the first-session setup, a decision the owner stated that was not stored, or a
 note stored onto a full place - the ask is not lost: it comes in the same block,
 after that reason, and the `Stop` is counted once.
+
+A FULL PLACE IS THE AGENT'S (2.5.4): a rule whose check needs a place it is
+not anchored to, when that place is full, goes to the agent's batch with a line
+naming every occupant (severity, and whether its check can refuse) and the
+three honest exits - fold, move to a narrower anchor, retract a stale one with
+a reason - then the rebind. Only when every occupant is a heavier rule whose
+check can refuse is it THOR's own open point (`anchor-full`). Retracting a rule
+whose check holds warns in the reply and is listed under the machine section's
+checks.
+
+THE OWNER'S GO (2.5.4): a `requires` check tagged `owner-approval` is answered
+only by the owner's own words - a real user turn of the session's main
+transcript, this turn or the one before, with quoted and fenced text left out;
+never the call itself, a tool result or a subagent's hand-back. An unreadable
+transcript refuses (fail closed). Its marker is exempt from A4, so the text
+need not publish it. At `SessionStart` THOR marks, once, every rule whose
+requires answer is only approval markers (`go-<name>`).
+
+Stop notices that do not hold the turn are also queued (at most 3, once each)
+and handed to the same session as context at its next prompt.
 
 An open point is THOR's own: the machine pass writes one per blocker
 (`open-no-working-copy-*` when a project has no registered working copy,
@@ -406,7 +435,7 @@ counts, and without `agent_id` the field changes nothing.
 target/release/doctor.exe --db "<store>"
 ```
 
-Its first line always names the build it was run from (`doctor 2.5.3`), so a
+Its first line always names the build it was run from (`doctor 2.5.4`), so a
 report you paste somewhere says which version made it - every program in this
 directory answers the same way to `--version` or `-V`, on its own, with no
 store needed.

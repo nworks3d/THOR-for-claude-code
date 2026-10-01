@@ -656,6 +656,34 @@ fn g7b_4_may_change_turns_a_derived_contains_into_a_note_by_dispute() {
     assert_eq!(t.record.as_ref().unwrap().fields().disputes.may_change, vec!["version".to_string()]);
 }
 
+/// FIELD TEST 2, defect 2 (2026-10-01): the rule RECOMMENDS a flag ("use git
+/// grep --no-index there"), THOR built a forbidden tooth on that very flag,
+/// and the only exit it offered was a legitimate call carrying the flag -
+/// which did not exist, so the agent invented one. A literal the text
+/// recommends is never forbidden; the other tooth (requires) is still tried,
+/// and real calls without the flag stop it, so the rule is a note.
+#[test]
+fn a_flag_the_text_recommends_is_never_forbidden() {
+    let mut fx = Fx::new();
+    fx.served(S2, "git grep -n \"TODO\" -- src");
+    fx.served(S2, "git grep -n \"FIXME\" HEAD -- lib");
+    for text in [
+        "git grep in a folder without its own .git searches the parent repository silently. Use git grep --no-index there instead.",
+        "git grep in een map zonder eigen .git zoekt stil in de bovenliggende repo. Gebruik daar git grep --no-index.",
+        "In a folder without its own .git, always run `git grep --no-index` there.",
+    ] {
+        let item = rule("gg", text, vec![cmd("git grep")], None, None);
+        let t = fx.run(&item, None, &session_in("alpha", None, S1), &Disputes::default());
+        assert!(matches!(t.outcome, Outcome::Note { .. }), "{text}\n{:?}\n{}", t.outcome, receipt(&t));
+        assert!(!receipt(&t).contains("forbidden '--no-index'"), "a recommended flag is never forbidden: {}", receipt(&t));
+    }
+    // The prohibition the same words can carry still derives its tooth.
+    let never = rule("gn", "Never run `git grep --no-index` inside a real repository.", vec![cmd("git grep")], None, None);
+    let (code, message) = refusal(&fx.run(&never, None, &session_in("alpha", None, S1), &Disputes::default()));
+    assert_eq!(code, RefuseCode::Forcing);
+    assert!(message.contains("forbidden '--no-index' on 'git grep'"), "{message}");
+}
+
 /// R7b.8 (D6): the writing session ran 'git push --force --dry-run' itself:
 /// the derived tooth still forces, and the receipt says that call does not
 /// count.
@@ -994,6 +1022,15 @@ fn every_refusal_and_needs_agent_text_is_in_the_refusal_table() {
         Err(ApplyError::NeedsAgent(why)) => check("needs_agent:crowded", &why),
         other => panic!("{other:?}"),
     }
+    // A full place a rule's check needs as its anchor is the agent's to clear
+    // (step 26): the line names every occupant, the exits and the binding.
+    for n in 0..4 {
+        let mut sitting = rule(&format!("np{n}"), &format!("NOTES.md fact {n}."), vec![path("NOTES.md")], None, Some("beta"));
+        sitting.severity = None;
+        fx.legacy(&sitting);
+    }
+    let m = needs(&mut fx, &rule("nfp", "NOTES.md keeps `keep this line` for deploys.", vec![cmd("make deploy")], contains("NOTES.md", "keep this line"), Some("beta")));
+    check("needs_agent:full_place", &m);
 
     for (code, _) in REFUSAL_TABLE {
         assert!(seen.iter().any(|s| s == code), "the table row {code} was never produced here");
@@ -1354,11 +1391,13 @@ fn a_text_revise_keeps_a_true_check_its_bindings_never_reach() {
 }
 
 /// The same rewording when NOTES.md already holds the most facts a place
-/// shows: the check is kept, the reply says the owner decides, and THOR's
-/// own retest holds the rule by the anchor-full blocker (its open point) -
-/// never back on the agent's batch.
+/// shows: the check is kept, and - the owner's decision, step 26 - making room
+/// is the AGENT's: the reply names every fact there with its severity and
+/// whether it carries a check, and the three honest exits; THOR's own retest
+/// hands it back to the agent's batch with the same line, never "the owner
+/// decides".
 #[test]
-fn a_kept_check_on_a_full_place_is_the_owners_to_decide() {
+fn a_kept_check_on_a_full_place_names_the_occupants_and_the_exits() {
     let mut fx = Fx::new();
     let (before, reworded) = unreached_contains(&mut fx);
     for n in 0..model::item::MAX_ITEMS {
@@ -1370,10 +1409,14 @@ fn a_kept_check_on_a_full_place_is_the_owners_to_decide() {
     assert!(matches!(t.outcome, Outcome::Undecided { .. }), "{:?}\n{}", t.outcome, receipt(&t));
     assert_eq!(t.check, before.check);
     let said = receipt(&t);
-    assert!(said.contains("already full of other facts") && said.contains("the owner decides"), "{said}");
+    assert!(said.contains("'sits-0' (no severity, no check)") && said.contains("FOLD") && said.contains("RETRACT"), "{said}");
+    assert!(!said.contains("owner decides"), "{said}");
     let stored = stored_item(&reworded, &t).unwrap();
     model::store::revise_tried_scoped(&mut fx.store, "s", "l", "mcp", &before, &stored, &before, None, None, t.record.as_ref(), None, None)
         .unwrap();
     let r = fx.retest("c-kept");
-    assert!(matches!(&r.outcome, Maintenance::Blocked(Blocker::AnchorFull { path }) if path == "NOTES.md"), "{:?}\n{:?}", r.outcome, r.lines);
+    match &r.outcome {
+        Maintenance::NeedsAgent(why) => assert!(why.contains("'sits-3' (no severity, no check)") && why.contains("MOVE"), "{why}"),
+        other => panic!("{other:?}\n{:?}", r.lines),
+    }
 }

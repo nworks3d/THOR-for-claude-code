@@ -40,6 +40,7 @@ const ROWS: &[&str] = &[
     "needs_agent:no_reach",
     "needs_agent:false_now",
     "needs_agent:crowded",
+    "needs_agent:full_place",
     "a4_no_longer_named",
     "note_carries_check",
     "teeth_tag",
@@ -309,13 +310,14 @@ fn a_global_file_check_is_blocked_and_giving_it_the_project_still_lands() {
 
 /// A path_exists check on a file the rule is not anchored to, whose one fix
 /// (anchor the rule there) the crowding cap refuses because four facts sit on
-/// that path, is no refusal an agent is left with (step 22, C3b B4): at a
-/// retest it is THOR's blocker - routed to the owner queue by an evaluation's
-/// machine pass - and its text never offers clearing the check. Once a
-/// place has room it is the agent's again, and the way on it names (anchor the
-/// rule there) lands decided.
+/// that path. Step 22 made it THOR's blocker so the agent would not clear a
+/// true check; step 26 (the owner's decision: a full place is the agent's)
+/// hands it to the agent with every occupant - its severity and whether it
+/// carries a check - and the three honest exits, never "the owner decides" and
+/// never "drop the check". Once a place has room, the way on it names (anchor
+/// the rule there) lands decided.
 #[test]
-fn a_path_check_on_a_full_anchor_is_blocked_and_room_makes_it_the_agents_again() {
+fn a_path_check_on_a_full_anchor_names_the_occupants_and_room_makes_it_land() {
     let fx = Fx::new(&["beta"]);
     let beta = checkout(fx.dir(), "beta", &[("files/PLAN.md", "the plan\n")], true);
     register(&fx.db, "beta", &beta);
@@ -329,13 +331,14 @@ fn a_path_check_on_a_full_anchor_is_blocked_and_room_makes_it_the_agents_again()
     plan.kind = Kind::Orientation;
     seed_raw(&fx.db, &plan);
     match fx.retest("npa").outcome {
-        serve::teeth::Maintenance::Blocked(blocker) => {
-            assert_eq!(blocker, model::store::Blocker::AnchorFull { path: "files/PLAN.md".to_string() });
-            assert!(!blocker.to_string().contains("drop the check"), "{blocker}");
+        serve::teeth::Maintenance::NeedsAgent(why) => {
+            assert!(why.contains("'occ0' (no severity, no check)") && why.contains("FOLD") && why.contains("RETRACT"), "{why}");
+            assert!(why.contains(way_on("needs_agent:full_place")), "{why}");
+            assert!(!why.contains("drop the check") && !why.contains("owner decides"), "{why}");
         }
-        other => panic!("expected THOR's blocker, got {other:?}"),
+        other => panic!("expected the agent's way on, got {other:?}"),
     }
-    assert!(!fx.settled("npa"), "blocked is not a verdict: nothing was written");
+    assert!(!fx.settled("npa"), "needing the agent is not a verdict: nothing was written");
 
     let reply = fx.mcp().call("retract", json!({"id": "occ3", "reason": "the owner folded it into another decision"}));
     assert!(reply.contains("retracted"), "{reply}");

@@ -154,6 +154,7 @@ pub fn pre_tool(
     project: Option<&str>,
     root: Option<&Path>,
     cwd: Option<&Path>,
+    owner: Option<absent_guard::OwnerWords>,
 ) -> Judgement {
     let file_path = tool_input.and_then(|t| t.get("file_path")).and_then(|v| v.as_str());
     let mut judged = file_write(store, tool_name, file_path, tool_input, project, root, cwd);
@@ -168,7 +169,7 @@ pub fn pre_tool(
         judged.verdict = by_command.verdict;
         return judged;
     }
-    judged.verdict = requires_in(&live, tool_name, tool_input, call.as_ref(), project);
+    judged.verdict = requires_in(&live, tool_name, tool_input, call.as_ref(), project, owner);
     judged
 }
 
@@ -431,15 +432,19 @@ pub fn requires(
 ) -> Option<Verdict> {
     let live = Live::of(store);
     let call = Call::of(&live, tool, tool_input, project, cwd);
-    requires_in(&live, tool, tool_input, call.as_ref(), project)
+    requires_in(&live, tool, tool_input, call.as_ref(), project, None)
 }
 
+/// `owner`: where the live hook reads the owner's own words for a rule marked
+/// owner-approval (step 26, `absent_guard::find_requires_violation_owned`);
+/// `None` in THOR's own trial, which builds the calls it tries.
 fn requires_in(
     live: &Live,
     tool: &str,
     tool_input: Option<&Value>,
     call: Option<&Call>,
     project: Option<&str>,
+    owner: Option<absent_guard::OwnerWords>,
 ) -> Option<Verdict> {
     let content = tool_input_values(tool_input?);
     if content.is_empty() {
@@ -448,11 +453,11 @@ fn requires_in(
     let candidates = live.items();
     let command = absent_guard::proposed_command(tool_input);
     let reason = match call {
-        Some(call) => absent_guard::find_requires_violation_in(&candidates, &call.segments, Some(&call.projects), &content),
+        Some(call) => absent_guard::find_requires_violation_owned(&candidates, &call.segments, Some(&call.projects), &content, owner),
         None => {
             let segments = [shell::tool_segment(tool, &content)];
             let projects = [project.map(str::to_string)];
-            absent_guard::find_requires_violation_in(&candidates, &segments, Some(&projects), &content)
+            absent_guard::find_requires_violation_owned(&candidates, &segments, Some(&projects), &content, owner)
         }
     }?;
     Some(Verdict {

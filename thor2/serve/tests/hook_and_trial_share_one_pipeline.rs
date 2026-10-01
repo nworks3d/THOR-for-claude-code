@@ -133,6 +133,7 @@ fn pre_tool_decides_exactly_what_the_hook_printed() {
                 project.as_deref(),
                 root.as_deref(),
                 Some(&cwd),
+                None,
             );
 
             match (golden_reason, judgement.verdict) {

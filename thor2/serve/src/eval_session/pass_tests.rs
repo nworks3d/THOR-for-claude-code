@@ -412,25 +412,26 @@ fn a_global_file_check_is_a_machine_blocker_never_the_agents_batch() {
     );
 }
 
-/// Step 22 (C3b B4 L433-L470): an OLD orientation carries a `path_exists`
-/// check on a file it is not anchored to, and the only way to name the file
-/// (anchor the rule to it) is refused by the crowding cap - four facts already
-/// sit there, and every exit from that is folding, moving or archiving one of
-/// the OWNER's facts. The agent's batch then had one exit left, "drop the
-/// check" (a true one - the file is there), and took it. So the item is THOR's
-/// blocker, never the batch: one point naming the full anchor and every
-/// occupant, in the owner's queue once carried, the check kept. When an
-/// occupant goes, the point closes and the rule is the agent's again.
+/// Step 22 (C3b B4 L433-L470), narrowed by step 26: an OLD orientation
+/// carries a `path_exists` check on a file it is not anchored to, and the only
+/// way to name the file (anchor the rule to it) is refused by the crowding
+/// cap. When every fact on that place is a rule whose check can refuse AND is
+/// heavier than this one, no fact there honestly gives way: THOR's own point
+/// holds the rule, its check kept, never the agent's batch - and the point no
+/// longer hands the decision to the owner. When an occupant goes, the point
+/// closes and the rule is the agent's again.
 #[test]
-fn a_path_check_whose_only_anchor_is_full_is_a_machine_blocker_never_the_agents_batch() {
+fn a_path_check_on_a_full_place_of_heavier_guards_stays_thors_point() {
     let mut fx = Fx::new();
     let alpha = fx.checkout("alpha", &[("files/PLAN.md", "the plan
 ")], true);
     fx.register("alpha", &alpha);
-    let occupants = ["plan-note-a", "plan-note-b", "plan-note-c", "plan-note-d"];
+    let occupants = ["plan-guard-a", "plan-guard-b", "plan-guard-c", "plan-guard-d"];
     for id in occupants {
-        let note = rule(id, &format!("A decision about the plan ({id})."), vec![path("files/PLAN.md")], None, Some("alpha"));
-        fx.legacy(&Item { kind: Kind::Orientation, severity: None, ..note });
+        let mut guard = rule(id, &format!("files/PLAN.md keeps `the plan` ({id})."), vec![path("files/PLAN.md")], contains("files/PLAN.md", "the plan"), Some("alpha"));
+        guard.severity = Some(model::item::Severity::Costly);
+        fx.legacy(&guard);
+        crate::teeth::fixture::decide(&mut fx.store, id);
     }
     let project_binding = Binding::Target { kind: TargetKind::Project, value: "alpha".to_string() };
     let orientation = rule("plan-here", "The plan lives in files/PLAN.md of this repo.", vec![project_binding], Some(Check::PathExists { path: "files/PLAN.md".to_string() }), Some("alpha"));
@@ -447,23 +448,63 @@ fn a_path_check_whose_only_anchor_is_full_is_a_machine_blocker_never_the_agents_
         assert!(point.text.contains(&format!("'{id}'")), "the point names the occupant {id}: {}", point.text);
     }
     assert!(point.text.contains("clearing a check that is true is never the way past this"), "{}", point.text);
-    assert!(point.text.contains("The owner decides which fact gives way"), "{}", point.text);
+    assert!(point.text.contains("no fact there honestly gives way"), "{}", point.text);
+    assert!(!point.text.contains("owner decides"), "a full place is never the owner's to decide: {}", point.text);
     assert!(!point.text.contains("drop the check"), "never a text that makes clearing the cheapest exit: {}", point.text);
-    assert!(start_note(&start).contains("'plan-here'") || start_note(&start).contains("held by a blocker only the owner can lift"), "{}", start_note(&start));
     for at in [Some(&start), None] {
         assert!(matches!(model::store::settlement(&fx.store, "plan-here", at), Settlement::Settled(Settled::Blocked(_))), "{at:?}");
     }
     assert!(model::store::show(&fx.store, "plan-here").unwrap().check.is_some(), "its check stays");
     file(&mut fx, &start, "eval-alpha-1").expect("a rule held by THOR's blocker holds no filing");
 
-    // The owner archives one occupant: the place has room, the point closes
-    // at the next start, and the rule is the agent's again - anchoring works.
-    model::store::retract(&mut fx.store, "s", "l", "a", "plan-note-d", "fixture: the owner folded it away", None).unwrap();
+    // One occupant goes: the place has room, the point closes at the next
+    // start, and the rule is the agent's again - anchoring works.
+    model::store::retract(&mut fx.store, "s", "l", "a", "plan-guard-d", "fixture: folded into 'plan-guard-a' about files/PLAN.md", None).unwrap();
     let next = fx.start(S2, "alpha");
     let machine = next.frozen.machine.clone().unwrap();
     assert!(machine.points_closed.iter().any(|(id, why)| id.starts_with("open-anchor-full-") && why.contains("has room")), "{:?}", machine.points_closed);
     assert_eq!(outcome_of(&next, "plan-here"), MachineOutcome::NeedsAgent);
     assert_eq!(next.frozen.batch(), &["plan-here".to_string()]);
+}
+
+/// THE OWNER'S DECISION (step 26): a full place is the AGENT's to solve, by
+/// THOR's rules - never "the owner decides". Field case 2026-10-01: the point
+/// said the owner decides which fact gives way, the agent asked the owner, and
+/// the owner answered "decide yourself by THOR's rules". When a fact on the
+/// place is lighter, or carries no check that can refuse, the rule goes to the
+/// agent's batch, and its line names every occupant with its severity and
+/// whether it carries a check, and the three honest exits.
+#[test]
+fn a_full_place_with_a_light_occupant_is_the_agents_batch_naming_occupants_and_exits() {
+    let mut fx = Fx::new();
+    let alpha = fx.checkout("alpha", &[("files/PLAN.md", "the plan
+")], true);
+    fx.register("alpha", &alpha);
+    let occupants = ["plan-note-a", "plan-note-b", "plan-note-c", "plan-note-d"];
+    for id in occupants {
+        let note = rule(id, &format!("A decision about the plan ({id})."), vec![path("files/PLAN.md")], None, Some("alpha"));
+        fx.legacy(&Item { kind: Kind::Orientation, severity: None, ..note });
+    }
+    let project_binding = Binding::Target { kind: TargetKind::Project, value: "alpha".to_string() };
+    let orientation = rule("plan-here", "The plan lives in files/PLAN.md of this repo.", vec![project_binding], Some(Check::PathExists { path: "files/PLAN.md".to_string() }), Some("alpha"));
+    fx.legacy(&Item { kind: Kind::Orientation, severity: None, ..orientation });
+
+    let start = fx.start(S1, "alpha");
+    assert_eq!(outcome_of(&start, "plan-here"), MachineOutcome::NeedsAgent, "{:?}", item_of(&start, "plan-here"));
+    assert_eq!(start.frozen.batch(), &["plan-here".to_string()]);
+    let detail = item_of(&start, "plan-here").detail.clone();
+    for id in occupants {
+        assert!(detail.contains(&format!("'{id}' (no severity, no check")), "each occupant with its weight and check: {detail}");
+    }
+    for exit in ["FOLD", "MOVE", "RETRACT"] {
+        assert!(detail.contains(exit), "the three honest exits: {detail}");
+    }
+    assert!(detail.contains("\"value\": \"files/PLAN.md\""), "then the binding that names the file: {detail}");
+    assert!(!detail.contains("owner decides"), "{detail}");
+    let points = model::store::open_points(&fx.store, Some("alpha"));
+    assert!(!points.iter().any(|p| p.id.starts_with("open-anchor-full-")), "no point for the owner: {points:?}");
+    assert!(start_note(&start).contains("'plan-note-a' (no severity, no check"), "{}", start_note(&start));
+    assert!(model::store::settlement(&fx.store, "plan-here", None).is_owed(), "owed by the agent, not held by THOR");
 }
 
 /// Step 21: a per-project point for the rules with no project - the shape

@@ -1047,6 +1047,238 @@ fn is_typed_prompt(line: &str) -> bool {
     !text.is_empty() && !text.starts_with("Stop hook feedback") && !text.starts_with("[Request interrupted")
 }
 
+// ------------------------------------------- a routine changed since read
+
+/// THE ROUTINE CHANGED SINCE IT WAS READ (step 26, field test 2 defect 5): a
+/// session read the evaluation routine once, the routine was rewritten an
+/// hour later, and every Stop after that said "read ... and do what it says"
+/// without saying the file had changed - the session went on by the old text.
+///
+/// `command_file` is the routine the Stop names; every absolute path to an
+/// existing `.md` file its text names is a routine too (a machine whose
+/// `thor-eval.md` says "read <home>/.claude/commands/t-eval.md"). For each one
+/// read before in `transcript` (a Read of the file, the skill or slash command
+/// of its name) whose file changed after that last read, one line says so.
+/// Never read at all: nothing to say - the ask says to read it anyway.
+pub fn routine_reread_lines(command_file: &Path, transcript: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(command_file) else { return Vec::new() };
+    let mut files = vec![command_file.to_path_buf()];
+    for token in text.split_whitespace() {
+        let token = token.trim_matches(|c: char| matches!(c, '`' | '\'' | '"' | '(' | ')' | ',' | ';' | ':' | '.' | '<' | '>'));
+        let path = PathBuf::from(token);
+        if token.to_ascii_lowercase().ends_with(".md") && path.is_absolute() && path.is_file() && !files.contains(&path) {
+            files.push(path);
+        }
+    }
+    let reads = routine_reads(transcript);
+    let mut out = Vec::new();
+    for file in files {
+        let Some(changed) = std::fs::metadata(&file)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+        else {
+            continue;
+        };
+        let folded = fold_path(&file.to_string_lossy());
+        let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
+        let last = reads.iter().filter(|(key, _)| *key == folded || *key == format!("name:{stem}")).map(|(_, at)| *at).max();
+        let Some(read_at) = last else { continue };
+        if changed > read_at + 2 {
+            let name = file.file_name().and_then(|n| n.to_str()).unwrap_or("the routine");
+            out.push(format!(
+                "[THOR] {name} changed since you last read it (read {}, changed {}) - read it again before you go on: the \
+                 steps you remember may not be the ones in that file now.",
+                crate::time::iso8601_from_unix(read_at),
+                crate::time::iso8601_from_unix(changed)
+            ));
+        }
+    }
+    out
+}
+
+/// A path as compared here: forward slashes, lowercase.
+fn fold_path(path: &str) -> String {
+    path.replace('\\', "/").to_ascii_lowercase()
+}
+
+/// Every read of a routine in `transcript`, with when: a Read tool call
+/// (its folded file path), a Skill call or a typed slash command
+/// (`name:<its name>`).
+fn routine_reads(transcript: &Path) -> Vec<(String, i64)> {
+    let mut out = Vec::new();
+    for line in tail_lines(transcript) {
+        let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+        let Some(at) = v.get("timestamp").and_then(|t| t.as_str()).and_then(crate::eval_filing::unix_of_timestamp) else {
+            continue;
+        };
+        let content = v.get("message").and_then(|m| m.get("content"));
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("assistant") => {
+                for block in content.and_then(|c| c.as_array()).into_iter().flatten() {
+                    if block.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
+                        continue;
+                    }
+                    let input = block.get("input");
+                    match block.get("name").and_then(|n| n.as_str()) {
+                        Some("Read") => {
+                            if let Some(path) = input.and_then(|i| i.get("file_path")).and_then(|p| p.as_str()) {
+                                out.push((fold_path(path), at));
+                            }
+                        }
+                        Some("Skill") => {
+                            if let Some(skill) = input.and_then(|i| i.get("skill")).and_then(|s| s.as_str()) {
+                                let name = skill.rsplit(':').next().unwrap_or(skill).trim_start_matches('/').to_ascii_lowercase();
+                                out.push((format!("name:{name}"), at));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Some("user") => {
+                let text = match content {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(Value::Array(blocks)) => {
+                        blocks.iter().filter_map(|b| b.get("text").and_then(|t| t.as_str())).collect::<Vec<_>>().join("\n")
+                    }
+                    _ => continue,
+                };
+                if let Some(rest) = text.split("<command-name>").nth(1) {
+                    let name = rest.split("</command-name>").next().unwrap_or("").trim().trim_start_matches('/');
+                    if !name.is_empty() {
+                        out.push((format!("name:{}", name.to_ascii_lowercase()), at));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+// ------------------------------------------------- the owner's own words
+
+/// THE OWNER'S OWN WORDS (step 26): the text of the last `last` messages the
+/// owner himself typed in the session whose main transcript is `transcript`,
+/// oldest first - what a rule marked `model::store::OWNER_APPROVAL_TAG` is
+/// answered by. A message counts only when it is a real user turn: a `user`
+/// line of the main transcript that is no sidechain, no meta line (a Stop
+/// hook's feedback, a subagent's hand-back) and no compact summary, whose
+/// `origin` - when the line carries one - is `human`, and whose content is
+/// text, not a tool result. Inside it, quoted lines (`>`) and fenced blocks
+/// are not his own words and are left out. `Err` names why the transcript
+/// cannot be read: the caller then refuses (fail closed).
+pub fn owner_messages(transcript: &Path, last: usize) -> Result<Vec<String>, String> {
+    if !transcript.is_file() {
+        return Err(format!("no transcript at {}", transcript.display()));
+    }
+    let lines = tail_lines(transcript);
+    if lines.is_empty() {
+        return Err(format!("the transcript at {} could not be read", transcript.display()));
+    }
+    let mut out: Vec<String> = lines.iter().filter_map(|line| owner_text(line)).collect();
+    let skip = out.len().saturating_sub(last);
+    Ok(out.split_off(skip))
+}
+
+/// The owner's own words on one transcript line, or `None` when the line is
+/// not a message he typed (see `owner_messages`).
+fn owner_text(line: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(line).ok()?;
+    if v.get("type").and_then(|t| t.as_str()) != Some("user") {
+        return None;
+    }
+    let flag = |name: &str| v.get(name).and_then(|f| f.as_bool()).unwrap_or(false);
+    if flag("isSidechain") || flag("isMeta") || flag("isCompactSummary") {
+        return None;
+    }
+    if let Some(origin) = v.get("origin") {
+        if origin.get("kind").and_then(|k| k.as_str()) != Some("human") {
+            return None;
+        }
+    }
+    let text = match v.get("message").and_then(|m| m.get("content")) {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(blocks)) => {
+            if blocks.iter().any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result")) {
+                return None;
+            }
+            blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        _ => return None,
+    };
+    let start = text.trim_start();
+    let injected = [
+        "Stop hook feedback",
+        "[Request interrupted",
+        "<task-notification>",
+        "Another Claude session sent a message",
+        "[Subagent hand-back]",
+        "<local-command-stdout>",
+        "Caveat: The messages below",
+    ];
+    if start.is_empty() || injected.iter().any(|p| start.starts_with(p)) {
+        return None;
+    }
+    let mut own = Vec::new();
+    let mut fenced = false;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced || trimmed.starts_with('>') {
+            continue;
+        }
+        own.push(line);
+    }
+    Some(own.join("\n"))
+}
+
+/// Whether `text` says `marker` as a word of its own: case ignored, with no
+/// letter, digit, `_` or `-` right before or after it ("go-owner" is not said
+/// by "go-owners" or "nogo-owner").
+pub fn says_marker(text: &str, marker: &str) -> bool {
+    let marker = marker.trim().to_ascii_lowercase();
+    if marker.is_empty() {
+        return false;
+    }
+    let hay = text.to_ascii_lowercase();
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+    let mut from = 0;
+    while let Some(at) = hay[from..].find(&marker).map(|i| i + from) {
+        let before = hay[..at].chars().next_back();
+        let after = hay[at + marker.len()..].chars().next();
+        if !before.is_some_and(word) && !after.is_some_and(word) {
+            return true;
+        }
+        from = at + 1;
+        while !hay.is_char_boundary(from) {
+            from += 1;
+        }
+    }
+    false
+}
+
+/// The main transcript of `session`: `named` (a hook payload's
+/// `transcript_path`) when it is that session's own main file, else the one
+/// `session_transcripts` finds under `root`.
+pub fn main_transcript_of(named: Option<&Path>, root: Option<&Path>, session: &str) -> Option<PathBuf> {
+    let own = |p: &Path| p.file_stem().and_then(|s| s.to_str()) == Some(session) && p.is_file();
+    if let Some(path) = named.filter(|p| own(p)) {
+        return Some(path.to_path_buf());
+    }
+    session_transcripts(root?, session).into_iter().find(|p| own(p))
+}
+
 /// The last `TRANSCRIPT_TAIL_BYTES` of `file`, as whole lines.
 fn tail_lines(file: &Path) -> Vec<String> {
     use std::io::{Read, Seek, SeekFrom};
@@ -2383,5 +2615,83 @@ mod clock_tests {
         }
         fixture::work_in(&root, S, &alpha, t0 + 21 * 60, 4);
         assert_eq!(session_minutes_from_transcript(&root, S, "alpha", None), 4, "the first 20 minutes sit before the tail");
+    }
+}
+
+#[cfg(test)]
+mod step_26_tests {
+    use super::*;
+
+    fn line(v: serde_json::Value) -> String {
+        format!("{v}\n")
+    }
+
+    /// Field test 2, defect 5: the routine was rewritten after the session
+    /// read it, and the Stop never said so.
+    #[test]
+    fn a_routine_rewritten_after_it_was_read_is_named_and_one_read_since_is_quiet() {
+        let dir = tempfile::tempdir().unwrap();
+        let routine = dir.path().join("t-eval.md");
+        std::fs::write(&routine, "the owner's own routine\n").unwrap();
+        let command = dir.path().join("thor-eval.md");
+        std::fs::write(&command, format!("This machine runs {} - read it whole.\n", routine.display())).unwrap();
+        let transcript = dir.path().join("s.jsonl");
+        let read = |path: &Path, at: &str| {
+            line(serde_json::json!({
+                "type": "assistant",
+                "timestamp": at,
+                "message": {"content": [{"type": "tool_use", "name": "Read", "input": {"file_path": path.to_string_lossy()}}]},
+            }))
+        };
+        // Read long ago: both files changed since.
+        std::fs::write(&transcript, read(&routine, "2026-01-01T10:00:00.000Z")).unwrap();
+        let lines = routine_reread_lines(&command, &transcript);
+        assert_eq!(lines.len(), 1, "only the file that was read is named: {lines:?}");
+        assert!(lines[0].contains("t-eval.md changed since you last read it"), "{lines:?}");
+        // Read again after the change: quiet.
+        let later = crate::time::iso8601_from_unix(crate::time::now_unix() + 3600);
+        std::fs::write(&transcript, format!("{}{}", read(&routine, "2026-01-01T10:00:00.000Z"), read(&routine, &format!("{}.000Z", later.trim_end_matches('Z'))))).unwrap();
+        assert!(routine_reread_lines(&command, &transcript).is_empty());
+        // The skill of the same name counts as a read.
+        let skill = line(serde_json::json!({
+            "type": "assistant",
+            "timestamp": "2026-01-01T10:00:00.000Z",
+            "message": {"content": [{"type": "tool_use", "name": "Skill", "input": {"skill": "t-eval"}}]},
+        }));
+        std::fs::write(&transcript, skill).unwrap();
+        assert_eq!(routine_reread_lines(&command, &transcript).len(), 1);
+        // Never read: nothing to say.
+        std::fs::write(&transcript, "").unwrap();
+        assert!(routine_reread_lines(&command, &transcript).is_empty());
+    }
+
+    #[test]
+    fn the_owners_words_are_his_typed_turns_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("s.jsonl");
+        let user = |text: &str, extra: serde_json::Value| {
+            let mut v = serde_json::json!({"type": "user", "message": {"role": "user", "content": text}});
+            if let (Some(map), Some(more)) = (v.as_object_mut(), extra.as_object()) {
+                map.extend(more.clone());
+            }
+            line(v)
+        };
+        let text = [
+            user("first go-owner", serde_json::json!({"origin": {"kind": "human"}})),
+            user("hand-back go-owner", serde_json::json!({"isMeta": true, "origin": {"kind": "peer"}})),
+            user("peer go-owner", serde_json::json!({"origin": {"kind": "peer"}})),
+            user("second\n> quoted go-owner\n```\ngo-owner\n```\nend", serde_json::json!({"origin": {"kind": "human"}})),
+            line(serde_json::json!({"type": "user", "message": {"content": [{"type": "tool_result", "content": "go-owner"}]}})),
+            user("third", serde_json::json!({})),
+        ]
+        .concat();
+        std::fs::write(&transcript, text).unwrap();
+        let words = owner_messages(&transcript, 2).unwrap();
+        assert_eq!(words.len(), 2, "{words:?}");
+        assert!(!words.iter().any(|w| says_marker(w, "go-owner")), "quoted, fenced, meta and peer text are not his: {words:?}");
+        let all = owner_messages(&transcript, 10).unwrap();
+        assert!(says_marker(&all[0], "go-owner"), "{all:?}");
+        assert!(owner_messages(&dir.path().join("missing.jsonl"), 2).is_err());
+        assert!(says_marker("ok, Go-Owner.", "go-owner") && !says_marker("go-owners", "go-owner") && !says_marker("nogo-owner", "go-owner"));
     }
 }

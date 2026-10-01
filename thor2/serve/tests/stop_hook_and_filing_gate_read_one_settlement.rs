@@ -225,7 +225,13 @@ fn the_stop_hook_the_batch_and_the_filing_gate_name_the_same_rules() {
     store
         .append_event("install", "install", model::store::INSTALLER_ACTOR, EventKind::FactCreated, &record.id, None, &body)
         .unwrap();
+    // ONE HOLDER PER PROJECT (step 26): session-one, still active, holds p's
+    // debt through its open evaluation and its lease. Its round is over here:
+    // the evaluation is closed as superseded and the lease released, so
+    // session-two is the one asked.
+    serve::attest::fixture::supersede_others(&mut store, "session-two", "p");
     drop(store);
+    serve::holder::release(&db, "session-one");
     let (stop, batch, filing) = three_answers(&db, "session-two", &checkout);
     assert_eq!(stop, set(&["owed-1", "owed-2", "blocked-1"]), "the Stop hook");
     assert_eq!(batch, stop, "the batch");
@@ -243,6 +249,11 @@ fn the_stop_hook_the_batch_and_the_filing_gate_name_the_same_rules() {
 
     // The edit is dropped: that blocker lifts too, and all three name it.
     std::fs::write(checkout.join("OTHER.md"), "stay put\nplain line\n").unwrap();
+    // Session-two's round is over the same way (step 26).
+    let mut store = EventStore::open_existing(&db).unwrap();
+    serve::attest::fixture::supersede_others(&mut store, "session-three", "p");
+    drop(store);
+    serve::holder::release(&db, "session-two");
     let (stop, batch, filing) = three_answers(&db, "session-three", &checkout);
     assert_eq!(stop, set(&["owed-1", "owed-2", "blocked-1", "blocked-2"]), "the Stop hook");
     assert_eq!(batch, stop, "the batch");

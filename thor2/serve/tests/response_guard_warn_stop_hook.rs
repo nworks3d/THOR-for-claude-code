@@ -399,3 +399,63 @@ fn a_context_surface_still_renders_with_no_system_message() {
         .unwrap_or_else(|| panic!("expected hookSpecificOutput.additionalContext: {out}"));
     assert!(context.contains("never force-push to main"), "{context}");
 }
+
+fn prompt_payload(session_id: &str, cwd: &Path, prompt: &str) -> String {
+    serde_json::json!({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": session_id,
+        "cwd": cwd.to_string_lossy(),
+        "prompt": prompt,
+    })
+    .to_string()
+}
+
+fn context_of(out: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(out.trim())
+        .ok()
+        .and_then(|v| v["hookSpecificOutput"]["additionalContext"].as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// STEP 26: a Stop warning is the owner's line at Stop (it may not wake the
+/// model), but the agent still has to learn it. It is queued once and handed
+/// to the same session as context when its next turn starts - at most three,
+/// never twice, never to another session.
+#[test]
+fn a_stop_warning_reaches_the_agent_at_its_next_prompt_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fresh_store(dir.path());
+    std::fs::write(dir.path().join("guard-response-rulebook.json"), WARN_ONLY_RULEBOOK).unwrap();
+    let cwd = dir.path().join("no-project");
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let out = run_hook(&db, &stop_payload("s1", WARN_MESSAGE, false));
+    assert!(out.contains("systemMessage"), "{out}");
+    // The same warning at a second Stop is queued once.
+    run_hook(&db, &stop_payload("s1", WARN_MESSAGE, false));
+
+    let other = run_hook(&db, &prompt_payload("s2", &cwd, "something unrelated to anything"));
+    assert!(!context_of(&other).contains("preference"), "never another session's: {other}");
+
+    let next = run_hook(&db, &prompt_payload("s1", &cwd, "something unrelated to anything"));
+    let context = context_of(&next);
+    assert!(context.contains("phrase this as a preference"), "the agent learns the warning at its next turn: {next}");
+    assert_eq!(context.matches("phrase this as a preference").count(), 1, "queued once: {context}");
+
+    let again = run_hook(&db, &prompt_payload("s1", &cwd, "something unrelated to anything"));
+    assert!(!context_of(&again).contains("preference"), "delivered once: {again}");
+}
+
+/// A subagent's Stop warning is never queued for the session: its reply is
+/// read by the session that spawned it, not handed back at the owner's turn.
+#[test]
+fn a_subagents_stop_warning_is_not_queued() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fresh_store(dir.path());
+    std::fs::write(dir.path().join("guard-response-rulebook.json"), BLOCK_TIER_RULEBOOK).unwrap();
+    let cwd = dir.path().join("no-project");
+    std::fs::create_dir_all(&cwd).unwrap();
+    run_hook(&db, &subagent_stop_payload("s1", "ok"));
+    let next = run_hook(&db, &prompt_payload("s1", &cwd, "something unrelated to anything"));
+    assert!(!context_of(&next).contains("At the end of your last turn"), "{next}");
+}

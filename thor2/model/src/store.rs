@@ -1894,12 +1894,13 @@ pub enum Blocker {
     /// A `contains` literal is missing from the registered working tree while
     /// the default branch's HEAD still has it.
     WorkingTreeDiffers { path: String },
-    /// A `path_exists` check names a file the rule is not anchored to, the
-    /// only way to name it (anchor the rule there) is refused because that
-    /// place already holds the most facts a place ever shows, and every way
-    /// out of that moves, folds or archives one of the owner's facts: the
-    /// owner's to decide, never the agent's (step 22, C3b B4 - the agent's
-    /// other exit was to clear the TRUE check).
+    /// A file check needs a place the rule is not anchored to, the only way
+    /// to name it (anchor the rule there) is refused because that place
+    /// already holds the most facts a place ever shows, AND no fact there
+    /// honestly gives way: every one is a heavier rule whose check can refuse
+    /// (step 22, C3b B4; narrowed by step 26). A full place with an honest
+    /// exit is the AGENT's to clear - fold, move or retract by THOR's rules -
+    /// never the owner's (`FullPlace`).
     AnchorFull { path: String },
 }
 
@@ -1963,7 +1964,7 @@ impl std::fmt::Display for Blocker {
                 write!(f, "{path} - the registered working tree lacks the literal the default branch still has")
             }
             Blocker::AnchorFull { path } => {
-                write!(f, "{path} - the anchor this rule's check needs is already full of the owner's facts")
+                write!(f, "{path} - the anchor this rule's check needs is full of heavier rules whose checks can refuse")
             }
         }
     }
@@ -2587,7 +2588,9 @@ fn full_reliable_anchor(candidates: &[(String, Item)], item: &Item, bindings: &[
         }
         let named = rivals
             .iter()
-            .map(|(id, other)| format!("'{id}' ({}): {}", severity_word(other.severity), other.text))
+            // Each occupant's severity AND whether it carries a check (step
+            // 26, field test 2): a description gives way before a guard.
+            .map(|(id, other)| format!("'{id}' ({}, {}): {}", severity_word(other.severity), check_word(other.check.as_ref()), other.text))
             .collect::<Vec<_>>()
             .join("; ");
         return Some(Refusal {
@@ -2608,6 +2611,15 @@ fn full_reliable_anchor(candidates: &[(String, Item)], item: &Item, bindings: &[
         });
     }
     None
+}
+
+/// Whether an occupant of a place carries a check, in words: "check:
+/// <the check>" or "no check".
+fn check_word(check: Option<&Check>) -> String {
+    match check {
+        Some(check) => format!("check: {}", check_named(check)),
+        None => "no check".to_string(),
+    }
 }
 
 /// A severity, in the same words `Severity::from_str` accepts back - so a
@@ -2635,6 +2647,161 @@ pub fn full_place_occupants(store: &EventStore, item: &Item, binding: &Binding) 
     let candidates = if store.heads_projection_current() { live_items_from_projection(store) } else { live_items_from_fold(store) }.ok()?;
     let rivals = pool_rivals(&candidates, item, binding);
     (rivals.len() >= crate::item::MAX_ITEMS).then(|| rivals.into_iter().map(|(id, other)| (id.clone(), other.text.clone())).collect())
+}
+
+/// The live facts sitting on a full `binding` for `item`, as whole items -
+/// `full_place_occupants` with everything a reader needs to choose which one
+/// gives way (step 26).
+pub fn full_place_items(store: &EventStore, item: &Item, binding: &Binding) -> Option<Vec<(String, Item)>> {
+    if !matches!(
+        binding,
+        Binding::Target { kind: crate::item::TargetKind::Path | crate::item::TargetKind::Dir | crate::item::TargetKind::Command, .. }
+    ) {
+        return None;
+    }
+    let candidates = if store.heads_projection_current() { live_items_from_projection(store) } else { live_items_from_fold(store) }.ok()?;
+    let rivals = pool_rivals(&candidates, item, binding);
+    (rivals.len() >= crate::item::MAX_ITEMS).then(|| rivals.into_iter().map(|(id, other)| (id.clone(), other.clone())).collect())
+}
+
+/// One fact on a full place, as the agent needs it to choose which gives way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Occupant {
+    pub id: String,
+    pub text: String,
+    pub severity: Option<crate::item::Severity>,
+    pub check: Option<Check>,
+    /// On the rule track: its check can refuse a wrong change.
+    pub refusing: bool,
+}
+
+impl Occupant {
+    /// "'id' (costly, a check that can refuse: contains 'x' in f): first words".
+    pub fn line(&self) -> String {
+        let check = match (&self.check, self.refusing) {
+            (None, _) => "no check".to_string(),
+            (Some(check), true) => format!("a check that can refuse: {}", check_named(check)),
+            (Some(check), false) => format!("a check not on the rule track: {}", check_named(check)),
+        };
+        let one_line = self.text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let one_line = one_line.trim_end_matches('.');
+        let head: String = one_line.chars().take(70).collect();
+        let head = if one_line.chars().count() > 70 { format!("{head}...") } else { head };
+        format!("'{}' ({}, {check}): {}", self.id, severity_word(self.severity), plain(&head))
+    }
+}
+
+/// A full place a rule's check needs as its anchor (step 26): every fact on
+/// it, and whether THOR sees an honest exit - a fact there that is not
+/// heavier than the rule, or carries no check that can refuse. With no such
+/// fact, nothing honestly gives way and the place stays THOR's own point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FullPlace {
+    pub path: String,
+    pub occupants: Vec<Occupant>,
+    pub honest_exit: bool,
+}
+
+impl FullPlace {
+    /// The place `binding` names for `item`, when it is full - `None` while it
+    /// has room.
+    pub fn of(store: &EventStore, item: &Item, path: &str) -> Option<FullPlace> {
+        let anchor = Binding::Target { kind: crate::item::TargetKind::Path, value: path.to_string() };
+        let rank = crate::item::severity_rank(item.severity);
+        let occupants: Vec<Occupant> = full_place_items(store, item, &anchor)?
+            .into_iter()
+            .map(|(id, other)| {
+                // The trial's own verdict, never `settlement`: settlement reads
+                // the full-place blocker, which reads this - a loop.
+                let refusing = matches!(current_verdict(store, &id), CurrentVerdict::RuleProven | CurrentVerdict::RuleWired);
+                Occupant { text: other.text.clone(), severity: other.severity, check: other.check.clone(), refusing, id }
+            })
+            .collect();
+        let honest_exit = occupants.iter().any(|o| !o.refusing || crate::item::severity_rank(o.severity) >= rank);
+        Some(FullPlace { path: path.to_string(), occupants, honest_exit })
+    }
+
+    /// The agent's line for rule `rule_id`: every occupant, the three honest
+    /// exits, and the binding to add once there is room.
+    pub fn agent_line(&self, rule_id: &str) -> String {
+        let path = &self.path;
+        format!(
+            "{path} is already full ({} live facts, the most a place ever shows), so this rule cannot be anchored there \
+             yet. Making room is yours, by THOR's rules - never the owner's. On it now: {}. The honest exits: (1) FOLD - two \
+             that say almost the same: revise one to carry the other's point, then retract the other with a reason naming \
+             the survivor; (2) MOVE - one that is really about a narrower file or command: revise its bindings to that \
+             place; (3) RETRACT - one that is stale: retract it with a reason saying what changed. A fact with no check gives \
+             way before a rule whose check can refuse; never clear this rule's own true check to get past this. Then bind \
+             this rule there: mcp__thor__revise(id: \"{rule_id}\", bindings: <its bindings plus {{\"target\": {{\"kind\": \
+             \"path\", \"value\": \"{path}\"}}}}>)",
+            self.occupants.len(),
+            self.occupants.iter().map(Occupant::line).collect::<Vec<_>>().join("; ")
+        )
+    }
+}
+
+/// THE OWNER'S GO (step 26). A rule carrying this tag on a `requires` check
+/// is satisfied only by the OWNER's own words: its required literal must stand
+/// in his own message in this session - a real user turn of the transcript,
+/// this turn or the one before - never in the call itself, a tool result, a
+/// subagent's hand-back or quoted text (`serve::guard_verdict`). Field case
+/// 2026-10-01: two guards whose point is to stop an agent were satisfied by a
+/// marker any agent could type, and the A4 naming rule had put the marker in
+/// their served text. Such a marker is exempt from A4
+/// (`gate::unnamed_literals`): the text says it needs the owner's explicit go.
+pub const OWNER_APPROVAL_TAG: &str = "owner-approval";
+
+/// The shape of an approval marker a `requires` check was satisfied by before
+/// the owner's go existed: `go-` and a name, one plain token
+/// (`migrate_owner_approval`).
+pub const APPROVAL_MARKER_PREFIX: &str = "go-";
+
+/// Whether `item` is a rule whose `requires` answer only the owner gives.
+pub fn is_owner_approval(item: &Item) -> bool {
+    matches!(item.check, Some(Check::Requires { .. })) && item.tags.iter().any(|t| t == OWNER_APPROVAL_TAG)
+}
+
+/// Whether `literal` has the shape of an approval marker: `go-` and at least
+/// one more letter or digit, lowercase letters, digits and hyphens only.
+pub fn is_approval_marker(literal: &str) -> bool {
+    literal
+        .strip_prefix(APPROVAL_MARKER_PREFIX)
+        .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'))
+}
+
+/// THE ONE-TIME MIGRATION TO THE OWNER'S GO (step 26): every live rule or
+/// orientation whose `requires` check is answered only by approval markers
+/// (`is_approval_marker`: "go-<name>") gets `OWNER_APPROVAL_TAG`, its trigger,
+/// check and text untouched - from then on its marker counts only in the
+/// owner's own message. Written by THOR (`installer`), one revise per rule.
+/// Idempotent, and never twice: a rule that ever carried the tag (the owner
+/// may have taken it off since, with a because) is left alone. Returns the ids
+/// it marked; a rule its write is refused for is skipped.
+pub fn migrate_owner_approval(store: &mut EventStore, session: &str) -> Vec<String> {
+    let candidates = if store.heads_projection_current() { live_items_from_projection(store) } else { live_items_from_fold(store) };
+    let Ok(candidates) = candidates else { return Vec::new() };
+    let mut marked = Vec::new();
+    for (id, item) in candidates {
+        let Some(Check::Requires { required, .. }) = &item.check else { continue };
+        if !item.kind.can_fire() || required.is_empty() || !required.iter().all(|r| is_approval_marker(r)) {
+            continue;
+        }
+        if item.tags.iter().any(|t| t == OWNER_APPROVAL_TAG) {
+            continue;
+        }
+        let ever = store.get_events_by_entity(&id).unwrap_or_default().iter().any(|e| {
+            parse_body(&e.body).is_ok_and(|earlier| earlier.tags.iter().any(|t| t == OWNER_APPROVAL_TAG))
+        });
+        if ever {
+            continue;
+        }
+        let mut updated = item.clone();
+        updated.tags.push(OWNER_APPROVAL_TAG.to_string());
+        if revise(store, session, session, SystemActor::new(INSTALLER_ACTOR), &item, &updated).is_ok() {
+            marked.push(id);
+        }
+    }
+    marked
 }
 
 /// The longest reason `archive` will carry. It becomes a tag, and a tag is
@@ -5566,6 +5733,22 @@ pub fn check_in_words(check: &Check) -> String {
     }
 }
 
+/// A check in full plain words: its kind, its literals and the file it
+/// reads - "forbidden '--force'", "contains 'only-owner' in files/INGRESS.md".
+/// A literal outside plain ASCII is named by its code point.
+pub fn check_named(check: &Check) -> String {
+    let lit = |l: &str| format!("'{}'", gate::shown_literal(l));
+    let all = |ls: &[String]| ls.iter().map(|l| lit(l)).collect::<Vec<_>>().join(", ");
+    match check {
+        Check::PathExists { path } => format!("path_exists {path}"),
+        Check::Contains { path, literal } => format!("contains {} in {path}", lit(literal)),
+        Check::Absent { path, literal } => format!("absent {} in {path}", lit(literal)),
+        Check::AbsentAll { path, literals } => format!("absent_all {} in {path}", all(literals)),
+        Check::Forbidden { literals } => format!("forbidden {}", all(literals)),
+        Check::Requires { when, required } => format!("requires {} on '{when}'", all(required)),
+    }
+}
+
 /// What a filing's receipt says about its machine section, in numbers.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MachineSummary {
@@ -5730,6 +5913,62 @@ fn settled_how(events: &[Event], started_seq: i64, session: &str) -> String {
 /// JUDGEMENT, TEETH, OPEN POINTS, REFUSED and SIDE DOORS. Pure: the same
 /// `start` and `filed_seq` on the same log give the same bytes, whatever was
 /// appended after `filed_seq`.
+/// The machine section's line for each earlier round of `start`'s project
+/// (step 26): a start before it, of the same project, that started within
+/// `EVALUATION_OPEN_HOURS` before it and was closed as void or superseded on
+/// the log at F - with its session's attested verdicts and edits between its
+/// own N and this start's N. Pure, from the log up to F.
+fn earlier_rounds(store: &EventStore, log: &LogAt, start: &EvaluationStart, filed_seq: i64) -> Vec<String> {
+    let frozen = &start.frozen;
+    let Ok(events) = store.events_of_kinds(&[EventKind::FactCreated, EventKind::FactRevised], 0) else { return Vec::new() };
+    let events: Vec<Event> = events.into_iter().filter(|e| e.seq <= filed_seq).collect();
+    let from_unix = frozen.started_unix - EVALUATION_OPEN_HOURS * 3600;
+    let mut lines = Vec::new();
+    for round in starts_in(&events) {
+        let closed = round.frozen.is_void() || round.frozen.is_superseded();
+        if round.frozen.project != frozen.project || round.seq >= start.seq || round.frozen.started_unix < from_unix || !closed {
+            continue;
+        }
+        let session = round.frozen.session.as_str();
+        let how = match (&round.frozen.void, &round.frozen.superseded) {
+            (Some(void), _) => format!("closed as void: '{}' was changed at log seq {}", plain(&void.id), void.seq),
+            (None, Some(sup)) => format!("superseded by session {}", plain(&sup.by_session)),
+            (None, None) => continue,
+        };
+        let (mut useful, mut noise, mut edits) = (0usize, 0usize, 0usize);
+        let range = store.events_since(round.frozen.started_seq).unwrap_or_default();
+        for event in range.iter().filter(|e| e.seq <= frozen.started_seq) {
+            let verdict = matches!(event.kind, EventKind::ItemMarkedUseful | EventKind::ItemMarkedNoise);
+            if !verdict && !changes_an_item(event.kind) {
+                continue;
+            }
+            if event.entity_id.starts_with(EVALUATION_START_PREFIX) {
+                continue;
+            }
+            let entity = log.entity(&event.entity_id);
+            let verdicts = recorded_write_verdicts(&entity);
+            if !matches!(write_door(event, &verdicts, session), WriteDoor::Attested { .. }) {
+                continue;
+            }
+            match event.kind {
+                EventKind::ItemMarkedUseful => useful += 1,
+                EventKind::ItemMarkedNoise => noise += 1,
+                _ => edits += 1,
+            }
+        }
+        lines.push(format!(
+            "\n- '{}' by session {} ({how}): {} verdict(s) ({useful} useful, {noise} noise) and {edits} edit(s) by that \
+             session between log seq {} and {}.",
+            plain(&round.id),
+            plain(session),
+            useful + noise,
+            round.frozen.started_seq,
+            frozen.started_seq
+        ));
+    }
+    lines
+}
+
 pub fn render_machine_section(store: &EventStore, start: &EvaluationStart, filed_seq: i64) -> String {
     machine_section(store, start, filed_seq).0
 }
@@ -5782,6 +6021,21 @@ fn machine_section(store: &EventStore, start: &EvaluationStart, filed_seq: i64) 
         plain(&start.id),
         start.seq
     ));
+
+    // ---- EARLIER ROUNDS (step 26, field test 2): an earlier evaluation of
+    // this project, closed as void or superseded before this one started and
+    // within its open window, so restarted evaluations never hide the work
+    // done in the round before. Only when there is one: a section without
+    // earlier rounds is byte for byte what it always was.
+    let earlier = earlier_rounds(store, &log, start, filed_seq);
+    if !earlier.is_empty() {
+        out.push_str(&format!(
+            "\nEARLIER ROUNDS of this project closed before this one: {}. Their verdicts and edits stay on record; this \
+             evaluation does not judge them again.",
+            earlier.len()
+        ));
+        earlier.iter().for_each(|line| out.push_str(line));
+    }
 
     // ---- JUDGEMENT
     out.push_str(&format!("\n\nJUDGEMENT: {} item(s) on the frozen list.", frozen.judgement.len()));
@@ -5942,6 +6196,19 @@ fn machine_section(store: &EventStore, start: &EvaluationStart, filed_seq: i64) 
                     };
                     checks.push(format!("\n- '{id}': {what} at log seq {} by {door} - reason: {}", event.seq, because()));
                 }
+            }
+        }
+        // A RETRACT TAKES ITS CHECK WITH IT (step 26, field test 2): a fold
+        // that retracted a rule whose check still held listed it only as
+        // "retracted", so the lost guard was invisible. Listed here too.
+        if event.kind == EventKind::FactRetracted && !RESERVED_ACTORS.contains(&event.actor.as_str()) {
+            if let Some(old) = &before.check {
+                checks.push(format!(
+                    "\n- '{id}': check lost with the retract ({}) at log seq {} by {door} - reason: {}",
+                    plain(&check_in_words(old)),
+                    event.seq,
+                    plain(&tombstone_reason(&event.body))
+                ));
             }
         }
         if event.kind == EventKind::FactRetracted {
@@ -7638,6 +7905,9 @@ mod tests {
         assert!(msg.contains("sit-0"), "names a sitting fact so the agent can choose: {msg}");
         assert!(msg.contains("fold"), "says how to make room: {msg}");
         assert!(msg.contains("no crowding, no loose ends"), "names the rule by its own words: {msg}");
+        // Field test 2 (2026-10-01): each occupant's severity AND whether it
+        // carries a check, so the writer can tell a description from a guard.
+        assert!(msg.contains("'sit-0' (costly, no check)"), "severity and check status per occupant: {msg}");
     }
 
     /// The other half of the same defect: a HEAVIER newcomer is not a free
@@ -9314,6 +9584,9 @@ mod tests {
             item.text = format!("{anchor} keeps the line `keep me` for {id}.");
             item.bindings = vec![Binding::Target { kind: crate::item::TargetKind::Path, value: anchor.to_string() }];
             item.check = Some(check);
+            // A check that guards its point carries no "nothing can catch
+            // this" reason beside it (step 26).
+            item.tags.clear();
             item
         };
         let plan = rule_with("plan-here", "files/PLAN.md", Check::PathExists { path: "files/PLAN.md".to_string() });
@@ -9355,6 +9628,119 @@ mod tests {
         );
         assert!(!section.contains("'noted-here'"), "THOR's own verdict is not an agent's weakening: {section}");
         assert_eq!(machine_section_summary(&store, &start, filed_seq).checks_weakened, 2);
+    }
+
+    /// THE OWNER'S GO (step 26), at the write gate: the marker of a rule marked
+    /// owner-approval need not be named in its text (it is answered by the
+    /// owner, never the call, and naming it published it to every agent); the
+    /// tag belongs on a requires check only; taking it off is a weakening that
+    /// needs a because; and the migration marks a go-marker rule once.
+    #[test]
+    fn the_owners_go_at_the_write_gate_and_its_migration() {
+        let mut store = EventStore::in_memory().unwrap();
+        let mut rule = heavy_command_rule("og-rule", "og");
+        rule.tags = vec![OWNER_APPROVAL_TAG.to_string()];
+        rule.text = "Never touch the fixture command without the owner's explicit go.".to_string();
+        rule.check = Some(Check::Requires { when: "fixture-command-og-rule".to_string(), required: vec!["go-owner".to_string()] });
+        assert!(gate::unnamed_literals(&rule).is_empty(), "the owner's marker is exempt from A4");
+        declare(&mut store, "s", "l", "a", &rule).expect("an owner rule whose text does not name its marker");
+
+        let mut plain = heavy_command_rule("og-plain", "og");
+        plain.tags = vec![OWNER_APPROVAL_TAG.to_string()];
+        let err = declare(&mut store, "s", "l", "a", &plain).unwrap_err();
+        assert!(err.to_string().contains("carries no requires check"), "{err}");
+
+        let mut dropped = rule.clone();
+        dropped.tags.clear();
+        dropped.text = "Never touch the fixture command without the owner's explicit go-owner.".to_string();
+        assert!(
+            gate::weakenings(&rule, &dropped).iter().any(|w| w.label == "owner approval dropped"),
+            "taking the owner's go off is a weakening"
+        );
+
+        // The migration: a go-marker rule without the tag is marked, once.
+        let mut old = heavy_command_rule("og-old", "og");
+        old.tags.clear();
+        old.text = "Never touch the fixture command without go-owner in the call.".to_string();
+        old.check = Some(Check::Requires { when: "fixture-command-og-old".to_string(), required: vec!["go-owner".to_string()] });
+        legacy(&mut store, &old);
+        let other = Check::Requires { when: "fixture-command-og-other".to_string(), required: vec!["--dry-run".to_string()] };
+        let mut not_a_marker = heavy_command_rule("og-other", "og");
+        not_a_marker.tags.clear();
+        not_a_marker.text = "The fixture command always runs with --dry-run first.".to_string();
+        not_a_marker.check = Some(other);
+        legacy(&mut store, &not_a_marker);
+        assert_eq!(migrate_owner_approval(&mut store, "s"), vec!["og-old".to_string()]);
+        assert!(is_owner_approval(&show(&store, "og-old").unwrap()));
+        assert!(!is_owner_approval(&show(&store, "og-other").unwrap()), "a literal that is no approval marker stays as it is");
+        assert!(migrate_owner_approval(&mut store, "s").is_empty(), "idempotent");
+        assert!(is_approval_marker("go-alpha") && is_approval_marker("go-owner2") && !is_approval_marker("go-") && !is_approval_marker("Go-Alpha"));
+    }
+
+    /// Field test 2 (2026-10-01): session B's first round was closed as void
+    /// and a fresh one started; the report's machine section covered only the
+    /// fresh round, so the 61 verdicts and the edits of the first round had no
+    /// line and the agent summarised them from memory (67, 66, 62). An earlier
+    /// round of the same project that was closed as void or superseded gets a
+    /// line: its session, how it closed, and that session's verdicts and edits
+    /// between its start and this one.
+    #[test]
+    fn an_earlier_round_closed_before_this_one_has_a_line_in_the_machine_section() {
+        let mut store = EventStore::in_memory().unwrap();
+        let mut rule = checked_sample();
+        rule.id = "er-rule".to_string();
+        rule.project = Some("mp".to_string());
+        declare(&mut store, "s-old", "l", "test", &rule).unwrap();
+        let old = record_start(&mut store, "s-old", "mp");
+        mark_verified(&mut store, "er-rule", "s-old", true);
+        mark_verified(&mut store, "er-rule", "s-old", true);
+        mark_verified(&mut store, "er-rule", "someone-else", true);
+        let at_seq = store.get_next_seq().unwrap() - 1;
+        let superseded = FrozenSuperseded { by_session: "s-new".to_string(), at_seq, idle_minutes: Some(45) };
+        record_evaluation_superseded(&mut store, SystemActor::new(EVAL_MACHINE_ACTOR), &old, &superseded).unwrap();
+        let start = record_start(&mut store, "s-new", "mp");
+        let filed_seq = store.get_next_seq().unwrap() - 1;
+        let section = render_machine_section(&store, &start, filed_seq);
+        assert!(section.contains("EARLIER ROUNDS of this project closed before this one: 1."), "{section}");
+        assert!(
+            section.contains(&format!("- '{}' by session s-old (superseded by session s-new): 2 verdict(s) (2 useful, 0 noise) and 0 edit(s)", old.id)),
+            "{section}"
+        );
+
+        // No earlier round: no line at all, so a section is byte for byte what
+        // it was before this existed.
+        let mut fresh = EventStore::in_memory().unwrap();
+        declare(&mut fresh, "s-new", "l", "test", &rule).unwrap();
+        let only = record_start(&mut fresh, "s-new", "mp");
+        let filed = fresh.get_next_seq().unwrap() - 1;
+        assert!(!render_machine_section(&fresh, &only, filed).contains("EARLIER ROUNDS"));
+    }
+
+    /// Field test 2 (2026-10-01): a fold retracted a rule whose check still
+    /// held (`contains durable dark` in files/INGRESS.md) and the machine
+    /// section listed it only as "retracted", so the lost guard was invisible.
+    /// A retract of a rule that carried a check is listed under the checks
+    /// too, naming the check that is gone with it.
+    #[test]
+    fn a_retract_that_takes_a_check_with_it_is_listed_under_the_checks() {
+        let mut store = EventStore::in_memory().unwrap();
+        let mut item = checked_sample();
+        item.id = "gone-here".to_string();
+        item.project = Some("mp".to_string());
+        item.text = "docs/C.md keeps the line `keep me`.".to_string();
+        item.bindings = vec![Binding::Target { kind: crate::item::TargetKind::Path, value: "docs/C.md".to_string() }];
+        item.check = Some(Check::Contains { path: "docs/C.md".to_string(), literal: "keep me".to_string() });
+        item.tags.clear();
+        declare(&mut store, "mp-session", "l", "test", &item).unwrap();
+        let start = record_start(&mut store, "mp-session", "mp");
+        let at = retract(&mut store, "mp-session", "l", "mcp", "gone-here", "folded into the rule on docs/C.md that keeps 'keep me'", None).unwrap().seq;
+        let filed_seq = store.get_next_seq().unwrap() - 1;
+        let section = render_machine_section(&store, &start, filed_seq);
+        assert!(
+            section.contains(&format!("- 'gone-here': check lost with the retract (contains docs/C.md) at log seq {at} by")),
+            "{section}"
+        );
+        assert_eq!(machine_section_summary(&store, &start, filed_seq).checks_weakened, 1);
     }
 
     /// Step 20 (NEW-2): in the machine section, a refusal the EVALUATING
@@ -10588,9 +10974,42 @@ mod tests {
         let mut old = heavy_command_rule("wg-old", "wg");
         old.check = Some(Check::Forbidden { literals: vec!["--force".to_string()] });
         legacy(&mut store, &old);
-        let mut corrected = old.clone();
-        corrected.text = "fixture heavy rule wg-old, corrected".to_string();
-        revise(&mut store, "s", "l", "a", &old, &corrected).expect("a rule that already carried both stays correctable");
+        // A rule that already carried both stays correctable: dropping the
+        // reason tag lands, and so does a write that leaves its text alone.
+        let mut pinned = old.clone();
+        pinned.bindings.push(Binding::Always);
+        revise(&mut store, "s", "l", "a", &old, &pinned).expect("a write that leaves the text alone lands");
+        let mut corrected = pinned.clone();
+        corrected.tags = vec!["fixture-topic".to_string()];
+        revise(&mut store, "s", "l", "a", &pinned, &corrected).expect("dropping the reason corrects it");
+    }
+
+    /// Field test 2 (2026-10-01): a-2eeb was refused for carrying a working
+    /// check beside a reason saying nothing can catch its mistake, while
+    /// b-2a644 kept exactly that pair through a reword - the gate ran only when
+    /// a revise touched the check or the tags, and never counted a contains
+    /// check as one that refuses. Now a text-only revise of an item that
+    /// carries both is held to it too, and a contains check counts.
+    #[test]
+    fn a_text_revise_of_a_rule_carrying_a_check_and_a_reason_is_refused() {
+        let mut store = EventStore::in_memory().unwrap();
+        let mut old = heavy_command_rule("wg-reword", "wg");
+        old.check = Some(Check::Forbidden { literals: vec!["--force".to_string()] });
+        legacy(&mut store, &old);
+        let mut reworded = old.clone();
+        reworded.text = "fixture heavy rule wg-reword, reworded".to_string();
+        let err = revise(&mut store, "s", "l", "a", &old, &reworded).unwrap_err();
+        assert!(err.to_string().contains("one of the two is wrong"), "{err}");
+
+        let mut guarded = heavy_command_rule("wg-contains", "wg");
+        guarded.bindings = vec![Binding::Target { kind: crate::item::TargetKind::Path, value: "files/INGRESS.md".to_string() }];
+        guarded.text = "files/INGRESS.md keeps `only-owner` for the dashboard route.".to_string();
+        guarded.check = Some(Check::Contains { path: "files/INGRESS.md".to_string(), literal: "only-owner".to_string() });
+        legacy(&mut store, &guarded);
+        let mut reworded = guarded.clone();
+        reworded.text = "files/INGRESS.md keeps `only-owner` for the dashboard route, reworded.".to_string();
+        let err = revise(&mut store, "s", "l", "a", &guarded, &reworded).unwrap_err();
+        assert!(err.to_string().contains("one of the two is wrong"), "a contains check counts too: {err}");
     }
 
     /// Fix 1: an open point tagged onto the rule itself counts for nothing,

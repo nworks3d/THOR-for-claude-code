@@ -346,14 +346,28 @@ pub fn binds_the_file(item: &Item, path: &str) -> bool {
 /// that the rule is not anchored to, when the file is really in the
 /// registered checkout `root` and the one fix - anchoring the rule to it - is
 /// refused because that place already holds the most facts a place ever
-/// shows. The same owner's decision `crowded_path_anchor` makes for a
-/// `path_exists` check: the rule keeps its true check and is counted apart.
+/// shows, AND no fact there honestly gives way (step 26: every one is a rule
+/// whose check can refuse and is heavier). The same rule `crowded_path_anchor`
+/// applies to a `path_exists` check: the rule keeps its true check and is
+/// counted apart. With an honest exit the place is the agent's to clear
+/// (`full_file_place`).
 pub fn crowded_file_anchor(store: &EventStore, item: &Item, root: &Path, path: &str) -> Option<Blocker> {
+    full_file_place(store, item, root, path)
+        .filter(|place| !place.honest_exit)
+        .map(|_| Blocker::AnchorFull { path: path.to_string() })
+}
+
+/// The full place a contains or absent check on `path` needs as its anchor
+/// (the rule is not anchored to it, the file is really in the registered
+/// checkout `root`), with its occupants and whether an honest exit exists -
+/// `None` while the place has room (step 26). With an exit, making room is
+/// the AGENT's (`FullPlace::agent_line`); without one, it is THOR's own point
+/// (`crowded_file_anchor`).
+pub fn full_file_place(store: &EventStore, item: &Item, root: &Path, path: &str) -> Option<crate::store::FullPlace> {
     if binds_the_file(item, path) || !root.join(path).exists() {
         return None;
     }
-    let anchor = Binding::Target { kind: crate::item::TargetKind::Path, value: path.to_string() };
-    crate::store::full_place_occupants(store, item, &anchor).map(|_| Blocker::AnchorFull { path: path.to_string() })
+    crate::store::FullPlace::of(store, item, path)
 }
 
 /// Whether a check reads a file, and so needs a working copy to be tried.
@@ -365,15 +379,25 @@ pub fn is_file_check(check: &Check) -> bool {
 /// not anchored to (A4 refuses it), when the file is really in the registered
 /// checkout `root` and the one fix - anchoring the rule to it - is refused
 /// because that place already holds the most facts a place ever shows
-/// (`store::full_place_occupants`). `None` for any other state: a file that is
-/// gone is a rotten check with a different fix, and a place with room is the
-/// agent's anchor to make (step 22, C3b B4).
+/// (`store::full_place_occupants`) and no fact there honestly gives way (step
+/// 26: every occupant is a rule whose check can refuse and is heavier). `None`
+/// for any other state: a file that is gone is a rotten check with a different
+/// fix, and a place with room - or a full one with an honest exit - is the
+/// agent's to make (step 22, C3b B4; step 26).
 pub fn crowded_path_anchor(store: &EventStore, item: &Item, root: &Path, path: &str) -> Option<Blocker> {
+    full_path_place(store, item, root, path)
+        .filter(|place| !place.honest_exit)
+        .map(|_| Blocker::AnchorFull { path: path.to_string() })
+}
+
+/// `full_file_place` for a `path_exists` check on `path` whose literal the
+/// text does not name (A4 refuses it): the full place, its occupants and
+/// whether an honest exit exists - `None` while it has room (step 26).
+pub fn full_path_place(store: &EventStore, item: &Item, root: &Path, path: &str) -> Option<crate::store::FullPlace> {
     if crate::gate::unnamed_literals(item).is_empty() || !root.join(path).exists() {
         return None;
     }
-    let anchor = Binding::Target { kind: crate::item::TargetKind::Path, value: path.to_string() };
-    crate::store::full_place_occupants(store, item, &anchor).map(|_| Blocker::AnchorFull { path: path.to_string() })
+    crate::store::FullPlace::of(store, item, path)
 }
 
 /// What holds `item` from being decided right now, judged at READ time the

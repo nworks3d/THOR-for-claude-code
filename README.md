@@ -272,6 +272,24 @@ at the right moment and hope. Version 2 is the same memory with a spine.
   it can ever show - lighter rivals count too, so a heavier note can no longer
   bump a lighter one out of sight unnoticed. Version 1 accepted it and said
   nothing, which is how a memory fills up with advice nobody will ever see.
+  Making room is the assistant's own job: the refusal names every note on the
+  place, how heavy it is and whether it can refuse anything, and the three
+  honest ways out - merge two that say the same, move one to the narrower file
+  or command it is really about, or remove one that is out of date with a
+  reason. It never becomes a question for you, and a true check is never
+  thrown away to get past it.
+- **One assistant at a time owes a project its upkeep.** When two
+  conversations work in the same project, only one of them is stopped to judge
+  notes, fix rules or write the project's evaluation; the other gets one line
+  saying which conversation is doing it. If that one goes quiet for half an
+  hour, the next one asked takes over.
+- **Your go cannot be typed by the assistant.** A rule can say a command needs
+  your explicit go (for example sending an e-mail, or touching a live
+  server). Then only your own message counts - what you typed yourself, in
+  this turn or the one before. The assistant writing the word into its own
+  command, a helper's report, or text you pasted as a quote does not count.
+  If THOR cannot read the conversation to check, it refuses rather than
+  guess.
 
 ## A second memory, for everything that is not code
 
@@ -447,7 +465,7 @@ A generic client config, the shape most tool-calling assistants expect:
       "args": [
         "run", "-i", "--rm",
         "-v", "thor-data:/data",
-        "ghcr.io/nworks3d/thor-mcp:2.5.3"
+        "ghcr.io/nworks3d/thor-mcp:2.5.4"
       ]
     }
   }
@@ -457,7 +475,7 @@ A generic client config, the shape most tool-calling assistants expect:
 ### Run it as a container
 
 ```bash
-docker run -i --rm -v thor-data:/data ghcr.io/nworks3d/thor-mcp:2.5.3
+docker run -i --rm -v thor-data:/data ghcr.io/nworks3d/thor-mcp:2.5.4
 ```
 
 On an empty volume, the container creates a memory and seeds it with THOR's

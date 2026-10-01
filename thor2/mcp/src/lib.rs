@@ -1015,6 +1015,30 @@ fn filing_context(
 /// evaluation stands. Every other write through a side door still lands
 /// (it simply never counts as attested), and a verdict (`mark`) is never
 /// refused here: it settles nothing and is listed in the machine section.
+/// THE GUARD A RETRACT TAKES WITH IT (step 26, field test 2): a fold retracted
+/// a rule whose check still held (`contains durable dark`) and no reply said
+/// so. When `item` carries a check that holds now - a command check always
+/// does; a file check when it holds in the project's registered working copy
+/// - the warning names it. A file check THOR cannot try here is named too, as
+/// "could not be tried". `None` for an item with no check.
+fn lost_check_warning(store: &EventStore, item: &model::item::Item) -> Option<String> {
+    let check = item.check.as_ref()?;
+    let named = model::store::check_named(check);
+    let holds = match model::store::check_file_of(check) {
+        None => Some(true),
+        Some(_) => serve::project::registered_checkout(store, item.project.as_deref())
+            .ok()
+            .map(|root| model::check::run(check, &root) == model::check::Outcome::Holds),
+    };
+    let after = "that guard is gone with it. If its point lives on in another rule, give that rule the same check \
+                 (revise it with check_kind and its literal), or say in your report that this check was dropped and why";
+    match holds {
+        Some(true) => Some(format!("WARNING: its check held ({named}) - {after}")),
+        Some(false) => None,
+        None => Some(format!("WARNING: its check ({named}) could not be tried here; if it held, {after}")),
+    }
+}
+
 fn refuse_a_side_door_on_a_frozen_item(store: &EventStore, id: &str, att: &model::store::Att) -> Result<(), String> {
     if att.inflight.as_deref() != Some(model::store::INFLIGHT_SIDE_DOOR) {
         return Ok(());
@@ -3293,8 +3317,15 @@ impl ThorMcpServer {
         self.blocking(move |s| {
             let att = stamp.att();
             refuse_a_side_door_on_a_frozen_item(s, &args.id, &att)?;
+            let lost = model::store::show(s, &args.id).ok().and_then(|item| lost_check_warning(s, &item));
             match model::store::retract(s, stamp.column(), LINEAGE_ID, ACTOR, &args.id, &args.reason, Some(&att)) {
-                Ok(event) => Ok(format!("retracted {} ({}) (event seq {})", args.id, args.reason.trim(), event.seq)),
+                Ok(event) => Ok(format!(
+                    "retracted {} ({}) (event seq {}){}",
+                    args.id,
+                    args.reason.trim(),
+                    event.seq,
+                    lost.map(|w| format!(" - {w}")).unwrap_or_default()
+                )),
                 Err(e) => Err(format!("refused: {e}")),
             }
         })
@@ -4302,6 +4333,9 @@ mod tests {
     async fn a_file_check_with_no_registered_working_copy_is_stored_as_a_note_with_it_pending() {
         let srv = server_knowing(&["gamma"]);
         let mut args = base_remember("heavy-contains");
+        // A contains check answers the teeth question itself: no "nothing can
+        // catch this" reason beside it (step 26).
+        args.tags = vec![];
         args.project = Some("gamma".to_string());
         args.text = "README.md must keep its TODO list".to_string();
         args.check_kind = Some("contains".to_string());
@@ -4483,6 +4517,48 @@ mod tests {
         let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(bare_revise("open-no-working-copy-fxp"))).await;
         assert!(reply.starts_with("REFUSED: this open point is THOR's own"), "{reply}");
         assert_eq!(srv.store.lock().unwrap().get_all_events().unwrap().len(), before, "nothing written");
+    }
+
+    /// FIELD TEST 2 (2026-10-01): a fold retracted a rule whose check still
+    /// held and nothing said so - the guard was simply gone. The reply now
+    /// warns and names the check that goes with it.
+    #[tokio::test]
+    async fn retracting_a_rule_whose_check_holds_warns_and_names_the_check() {
+        let srv = server();
+        let args = RememberArgs {
+            new_collection_named_by_owner: None,
+            legitimate_calls: vec![],
+            may_change: vec![],
+            accept_refusing: vec![],
+            id: "guarded-1".to_string(),
+            kind: "rule".to_string(),
+            text: "never force-push with --force".to_string(),
+            severity: Some("irreversible".to_string()),
+            project: None,
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some("a force-push lands with no incident".to_string()),
+            check_kind: Some("forbidden".to_string()),
+            check_path: None,
+            check_literal: None,
+            check_literals: vec!["--force".to_string()],
+            moments: vec![],
+            targets: vec![TargetArg { kind: "command".to_string(), value: "git push".to_string() }],
+            always: false,
+        };
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
+        assert!(reply.starts_with("stored "), "{reply}");
+        let reply = srv
+            .retract(
+                Meta::new(),
+                RawArgs::default(),
+                Parameters(RetractArgs { id: "guarded-1".to_string(), reason: "folded into 'push-rules': it carries the --force point now".to_string() }),
+            )
+            .await;
+        assert!(reply.starts_with("retracted guarded-1"), "{reply}");
+        assert!(reply.contains("WARNING: its check held"), "{reply}");
+        assert!(reply.contains("forbidden '--force'"), "the reply names the lost check: {reply}");
     }
 
     /// The same for a revise that would put the start tag on an existing item.
@@ -5044,6 +5120,9 @@ mod tests {
         let srv = server_knowing(&["docs-fixture"]);
         let _checkout = registered_checkout(&srv, "docs-fixture", &[("LICENSE.md", "GPLv3 or later\n")]);
         let mut args = base_remember("check-contains-1");
+        // A contains check answers the teeth question itself: no "nothing can
+        // catch this" reason beside it (step 26).
+        args.tags = vec![];
         args.text = "the license file must always mention GPLv3 somewhere in it".to_string();
         args.check_kind = Some("contains".to_string());
         args.check_path = Some("LICENSE.md".to_string());

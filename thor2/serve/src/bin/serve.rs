@@ -1152,7 +1152,53 @@ mod resolve_session_id_tests {
 /// only the write itself is skipped. It also holds the store's directory
 /// read-only for the whole call (`serve::store_dir`), so no state file beside
 /// the store is written either and the store is opened read-only.
+/// One hook call: `hook_inner` decides what the surfaces say, and this hands a
+/// Stop notice that does not hold the turn on to the session's next turn
+/// (step 26, `serve::next_turn`). Since 2.5.3 such a notice goes out at Stop as
+/// `systemMessage` only - for the owner, never waking the model - so the agent
+/// would otherwise never learn it: it is queued once, and the session's next
+/// `UserPromptSubmit` opens with it as context. Never for a subagent, never on
+/// a hook run that records nothing.
 fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_record: bool) -> Option<HookOutput> {
+    let raw = match payload_text {
+        Some(text) => text,
+        None => {
+            let mut raw = String::new();
+            std::io::stdin().read_to_string(&mut raw).ok()?;
+            raw
+        }
+    };
+    let payload: Option<Value> = serde_json::from_str(&raw).ok();
+    let out = hook_inner(db_path, Some(raw), actor, no_record);
+    let Some(payload) = payload.filter(|p| !no_record && !payload_is_from_a_subagent(p)) else { return out };
+    let event_name = payload.get("hook_event_name").and_then(|v| v.as_str()).unwrap_or("PreToolUse");
+    let session_id = resolve_session_id(&payload);
+    match (event_name, out) {
+        ("Stop", Some(HookOutput::Warn { text })) => {
+            serve::next_turn::queue(db_path, &session_id, &text);
+            Some(HookOutput::Warn { text })
+        }
+        ("UserPromptSubmit", out @ (None | Some(HookOutput::Context { .. }) | Some(HookOutput::ContextWithNotice { .. }))) => {
+            let waiting = serve::next_turn::take(db_path, &session_id);
+            if waiting.is_empty() {
+                return out;
+            }
+            let notes = serve::next_turn::render(&waiting);
+            let with = |block: String| if block.is_empty() { notes.clone() } else { format!("{notes}\n\n{block}") };
+            Some(match out {
+                None => HookOutput::Context { event_name: event_name.to_string(), block: notes, verdicts: Vec::new() },
+                Some(HookOutput::Context { event_name, block, verdicts }) => HookOutput::Context { event_name, block: with(block), verdicts },
+                Some(HookOutput::ContextWithNotice { event_name, block, notice, verdicts }) => {
+                    HookOutput::ContextWithNotice { event_name, block: with(block), notice, verdicts }
+                }
+                Some(other) => other,
+            })
+        }
+        (_, out) => out,
+    }
+}
+
+fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_record: bool) -> Option<HookOutput> {
     let _hold = no_record.then(|| serve::store_dir::hold(db_path));
     // `payload_text` is `Some` only when the caller already read stdin (see
     // `cmd_hook`'s `--diagnose` path, which has to read it to say anything
@@ -1687,14 +1733,30 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
         // regardless, so holding a subagent's turn for it wastes a whole
         // agent run. Agents among themselves are not held by this debt; it
         // applies only to what is addressed to him.
+        // ONE HOLDER PER PROJECT (step 26): the judgement debt and the teeth
+        // question below are the PROJECT's debt, so only its holder is held
+        // for them (`serve::holder`); another session gets one line naming
+        // the holder - at most one such line per Stop, the evaluation's own
+        // "running in session X" line included.
+        let mut holder_note: Option<String> = None;
+        let debt_held_elsewhere = |holder_note: &mut Option<String>| -> bool {
+            let Some(line) = debt_holder_elsewhere(db_path, &session_id, stop_project.as_deref()) else { return false };
+            if riders.is_empty() && holder_note.is_none() {
+                *holder_note = Some(line);
+            }
+            true
+        };
         if !is_subagent {
             if let Some(reason) = serve::store_dir::open_existing(db_path)
                 .ok()
                 .and_then(|s| judgement_debt(&s, db_path, &session_id, stop_project.as_deref()))
             {
-                return Some(HookOutput::Decision(
-                    serde_json::json!({ "decision": "block", "reason": with_drift(reason) }),
-                ));
+                if !debt_held_elsewhere(&mut holder_note) {
+                    claim_debt(db_path, &session_id, stop_project.as_deref(), no_record);
+                    return Some(HookOutput::Decision(
+                        serde_json::json!({ "decision": "block", "reason": with_drift(reason) }),
+                    ));
+                }
             }
         }
 
@@ -1708,13 +1770,17 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
         // ask (F14, Q10), never a session's first Stop in the project, and
         // only with ten minutes of its own work there - a short task session
         // never answers for a backlog it did not touch.
-        if !is_subagent && teeth_upkeep_may_hold(db_path, &session_id, stop_project.as_deref()) {
+        if !is_subagent
+            && teeth_upkeep_may_hold(db_path, &session_id, stop_project.as_deref())
+            && !debt_held_elsewhere(&mut holder_note)
+        {
             if let Some(reason) = serve::store_dir::open_existing(db_path)
                 .ok()
                 .filter(|_| teeth_not_yet_asked_this_session(db_path, &session_id))
                 .and_then(|s| teeth_debt(&s, db_path, stop_project.as_deref()))
             {
                 record_teeth_asked(db_path, &session_id);
+                claim_debt(db_path, &session_id, stop_project.as_deref(), no_record);
                 return Some(HookOutput::Decision(
                     serde_json::json!({ "decision": "block", "reason": with_drift(reason) }),
                 ));
@@ -1741,6 +1807,12 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
                 return Some(output);
             }
         }
+        // Held for no debt in this Stop: every lease this session holds goes
+        // back, so the next session asked holds (step 26).
+        if !is_subagent && !no_record {
+            serve::holder::release(db_path, &session_id);
+        }
+        let riders: Vec<String> = riders.into_iter().chain(holder_note).collect();
         let warn_text = match (warn_text, riders.is_empty()) {
             (Some(text), false) => Some(format!("{}\n\n{text}", riders.join("\n\n"))),
             (None, false) => Some(riders.join("\n\n")),
@@ -1854,6 +1926,13 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
             // server is stamped with a constant, never the caller's own
             // session - see `crowding_debt`.
             record_session_watermark(db_path, &session_id);
+            // THE OWNER'S GO, once (step 26): a rule whose requires check is
+            // answered by an approval marker ("go-<name>") is marked so that
+            // only the owner's own message answers it from now on. A write by
+            // THOR itself, idempotent, never again once a rule carried the tag.
+            if !no_record && !payload_is_from_a_subagent(&payload) {
+                model::store::migrate_owner_approval(&mut store, &session_id);
+            }
 
             let candidates = serve::live::always_candidates(&store);
             let decay = DecayContext::load(&store);
@@ -2090,6 +2169,10 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
                 folder_project.as_deref(),
                 session_project.as_deref(),
             );
+            // THE OWNER'S GO (step 26): a rule marked owner-approval is
+            // answered only by the owner's own words in this session's main
+            // transcript - read only when such a rule is reached.
+            let owner_words = || owner_words_of(&payload, &session_id);
             if let Some(reason) = pre_tool_guard_block(
                 &store,
                 db_path,
@@ -2101,6 +2184,7 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
                 session_cwd.as_deref(),
                 actor,
                 payload.get("tool_use_id").and_then(|v| v.as_str()),
+                Some(&owner_words),
             ) {
                 return Some(HookOutput::Decision(serde_json::json!({
                     "decision": "block",
@@ -3131,7 +3215,8 @@ fn judgement_debt(store: &EventStore, db_path: &Path, session_id: &str, current_
         if let Some(fired) = fired_here.get(id).filter(|f| !f.triggers.is_empty()) {
             let places = fired.triggers.iter().map(|t| format!("'{t}'")).collect::<Vec<_>>().join(" | ");
             items_block.push_str(&format!(
-                "\n- '{id}' ({count}x since last judged, if ever; {} time(s) in this session, last at {places}): {text}",
+                "\n- '{id}' ({count}x since last judged, if ever; {} time(s) in this session, last at {places}): {text} \
+                 [check it is still true first]",
                 fired.count
             ));
             continue;
@@ -3146,7 +3231,9 @@ fn judgement_debt(store: &EventStore, db_path: &Path, session_id: &str, current_
             Some(trigger) => format!(", last fired at '{trigger}'"),
             None => String::new(),
         };
-        items_block.push_str(&format!("\n- '{id}' ({count}x since last judged, if ever){last_fired}: {text}"));
+        // CHECK TRUTH FIRST on every line (step 26): field test 2 saw ten
+        // verdicts in five seconds with no look at whether each still held.
+        items_block.push_str(&format!("\n- '{id}' ({count}x since last judged, if ever){last_fired}: {text} [check it is still true first]"));
     }
     let held_back = total_owed - batch_len;
     let held_back_note = if held_back > 0 {
@@ -3516,7 +3603,7 @@ fn evaluation_after_a_hold(db_path: &Path, session_id: &str, payload: &Value) ->
             ), None));
         }
         if !start.frozen.decided() {
-            return Some(held(serve::eval_session::resumed_note(start), None));
+            return Some(held(serve::eval_session::resumed_note(&serve::eval_session::with_fired(&store, (*start).clone())), None));
         }
         let judgement = model::store::evaluation_judgement_owed(&store, start, &[]);
         let teeth = model::store::evaluation_frozen_batch_owed(&store, start);
@@ -3525,8 +3612,9 @@ fn evaluation_after_a_hold(db_path: &Path, session_id: &str, payload: &Value) ->
             0 => String::new(),
             n => format!(", {n} write(s) by another session not checked yet"),
         };
+        let reread = routine_changed_lines(session_id);
         return Some(held(format!(
-            "[THOR] The evaluation of '{project}' ('{}') is still open and its report is not filed, so this turn is held \
+            "{reread}[THOR] The evaluation of '{project}' ('{}') is still open and its report is not filed, so this turn is held \
              again. Every verdict and write of this turn was checked at this Stop: file the report NOW, in this turn, \
              with the THOR tool itself - mcp__thor__remember with kind report, project '{project}', tags \
              [\"evaluation-report\"], id eval-{project}-<date> and your own plain summary as its text. If anything is still \
@@ -3573,6 +3661,41 @@ fn evaluation_after_a_hold(db_path: &Path, session_id: &str, payload: &Value) ->
              now - no report is owed by this session for it.",
             start.id
         ), Some(&start.id))),
+    }
+}
+
+/// THE ROUTINE CHANGED SINCE IT WAS READ (step 26, field test 2): one line
+/// per routine file the session read before and that changed since
+/// (`serve::attest::routine_reread_lines`), each followed by a blank line -
+/// empty when there is none, no routine is installed, or no transcript of the
+/// session is found.
+fn routine_changed_lines(session_id: &str) -> String {
+    let Some(command) = usefulness::default_eval_command_path().filter(|p| p.is_file()) else { return String::new() };
+    let root = serve::attest::transcripts_root();
+    let Some(transcript) = serve::attest::main_transcript_of(None, root.as_deref(), session_id) else { return String::new() };
+    serve::attest::routine_reread_lines(&command, &transcript).into_iter().map(|line| format!("{line}\n\n")).collect()
+}
+
+/// ONE HOLDER PER PROJECT (step 26): the line naming the session that holds
+/// `project`'s debt, when that is another session active within the idle
+/// window - this session is then not held for the project's debt. `None`:
+/// this session may be held (no project, no store, or it is the holder).
+fn debt_holder_elsewhere(db_path: &Path, session_id: &str, project: Option<&str>) -> Option<String> {
+    let project = project?;
+    let store = serve::store_dir::open_existing(db_path).ok()?;
+    match serve::holder::holder_of(&store, db_path, project, session_id, time::now_unix()) {
+        serve::holder::Holder::Me => None,
+        serve::holder::Holder::Other { session, idle_minutes, why } => {
+            Some(serve::holder::holder_line(project, &session, idle_minutes, why))
+        }
+    }
+}
+
+/// This session is held for `project`'s debt now: it takes the project's
+/// lease (step 26). Nothing for no project, or a hook run that records nothing.
+fn claim_debt(db_path: &Path, session_id: &str, project: Option<&str>, no_record: bool) {
+    if let (Some(project), false) = (project, no_record) {
+        serve::holder::claim(db_path, project, session_id, time::now_unix());
     }
 }
 
@@ -3675,6 +3798,15 @@ fn eval_stop_ask(
         let stop_here = folder_project == Some(project.as_str());
         match usefulness::stop_decision(store, &state, &project, session_id, &timeline, stop_here, true, now, usefulness::EVAL_CADENCE) {
             usefulness::StopDecision::Ask(clock) => {
+                // ONE HOLDER PER PROJECT (step 26): a session that is not the
+                // project's holder is not asked while the holder is active -
+                // one line names it instead.
+                if let serve::holder::Holder::Other { session, idle_minutes, why } =
+                    serve::holder::holder_of(store, db_path, &project, session_id, now)
+                {
+                    elsewhere.get_or_insert_with(|| serve::holder::holder_line(&project, &session, idle_minutes, why));
+                    continue;
+                }
                 let reason = evaluation_ask(store, db_path, &project, &clock, at.folder);
                 usefulness::record_eval_debt_asked(db_path, Some(&project), now);
                 // The ask is where this evaluation starts: one start record
@@ -3695,6 +3827,10 @@ fn eval_stop_ask(
                         Err(serve::eval_session::StartRefused::Store) => None,
                     },
                 };
+                if !no_record {
+                    serve::holder::claim(db_path, &project, session_id, now);
+                }
+                let reason = format!("{}{reason}", routine_changed_lines(session_id));
                 return EvalStop::Ask(match started {
                     Some(started) => format!("{reason}\n\n{}", serve::eval_session::start_note(&started.start)),
                     None => reason,
@@ -4064,8 +4200,9 @@ fn pre_tool_guard_block(
     cwd: Option<&Path>,
     actor: &str,
     tool_use_id: Option<&str>,
+    owner: Option<serve::absent_guard::OwnerWords>,
 ) -> Option<String> {
-    let judgement = guard_verdict::pre_tool(store, tool_name, tool_input, project, root, cwd);
+    let judgement = guard_verdict::pre_tool(store, tool_name, tool_input, project, root, cwd, owner);
     if let Some(file) = &judgement.pools.file {
         record_absent_guard_staleness(store, db_path, &file.location, &file.ranked, &file.file_path, root);
     }
@@ -4086,6 +4223,19 @@ fn pre_tool_guard_block(
         record_gate(db_path, session_id, actor, true, id, &verdict.target, tool_use_id);
     }
     Some(reason)
+}
+
+/// THE OWNER'S OWN WORDS for a rule marked owner-approval (step 26): his last
+/// two messages of this session - this turn's and the one before - from the
+/// session's MAIN transcript (a subagent's payload names its own file, whose
+/// "user" lines are the orchestrator's brief, never the owner). `Err` says
+/// why they cannot be read; the guard then refuses.
+fn owner_words_of(payload: &Value, session_id: &str) -> Result<Vec<String>, String> {
+    let named = payload.get("transcript_path").and_then(|v| v.as_str()).map(PathBuf::from);
+    let root = serve::attest::transcripts_root();
+    let path = serve::attest::main_transcript_of(named.as_deref(), root.as_deref(), session_id)
+        .ok_or_else(|| format!("no main transcript of session {session_id} was found"))?;
+    serve::attest::owner_messages(&path, 2)
 }
 
 /// A refusal's wording once its marker has been read: a repeat of an attempt

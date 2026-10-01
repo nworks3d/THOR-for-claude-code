@@ -1202,9 +1202,34 @@ fn teeth_answer_contradictions(existing: Option<&Item>, updated: &Item) -> Resul
             ));
         }
     }
-    if updated.kind.can_fire() && is_refusing_check(updated.check.as_ref()) {
+    // A contains check counts as one that catches its mistake here too (step
+    // 26, field test 2): b-2a644 kept a proven contains check beside a reason
+    // saying nothing can catch its mistake, while a-2eeb was refused for the
+    // same pair with a requires check.
+    let guards = |check: Option<&Check>| is_refusing_check(check) || matches!(check, Some(Check::Contains { .. }));
+    // THE OWNER'S GO is a property of a requires check (step 26): the tag
+    // on anything else would say something no guard does.
+    if updated.tags.iter().any(|t| t == crate::store::OWNER_APPROVAL_TAG)
+        && !(updated.kind.can_fire() && matches!(updated.check, Some(Check::Requires { .. })))
+    {
+        return Err(Refusal::new(
+            format!(
+                "the tag '{}' marks a requires check whose answer only the owner gives, and this item carries no requires check",
+                crate::store::OWNER_APPROVAL_TAG
+            ),
+            "give the rule a requires check (check_kind requires, the trigger as check_path or its command binding, the marker the owner says as check_literal), or drop the tag",
+        ));
+    }
+    if updated.kind.can_fire() && guards(updated.check.as_ref()) {
         if let Some(reason) = teeth_reason_tag(updated) {
-            let carried = existing.is_some_and(|e| is_refusing_check(e.check.as_ref()) && teeth_reason_tag(e).is_some());
+            // A pair the item already carried is left alone only by a write
+            // that leaves its TEXT as it was (a pin, a binding, THOR's own
+            // verdict): a reword is held to the pair like any other write
+            // (step 26 - the gate used to run only when a revise touched the
+            // check or the tags).
+            let carried = existing.is_some_and(|e| {
+                guards(e.check.as_ref()) && teeth_reason_tag(e).is_some() && e.text == updated.text
+            });
             if !carried {
                 return Err(Refusal::new(
                     format!(
@@ -1928,6 +1953,15 @@ pub fn weakenings(before: &Item, updated: &Item) -> Vec<Weakening> {
         found.push(Weakening {
             label: "binding removed",
             problem: "this removes a binding from a rule that can refuse a write, narrowing where it can ever fire"
+                .to_string(),
+        });
+    }
+    // Taking the owner's go off a requires check (step 26) lets an agent
+    // answer it by typing the marker in its own call again.
+    if crate::store::is_owner_approval(before) && !crate::store::is_owner_approval(updated) {
+        found.push(Weakening {
+            label: "owner approval dropped",
+            problem: "this takes the owner's go off a requires check, so a marker an agent types in its own call would answer it again"
                 .to_string(),
         });
     }
@@ -2989,7 +3023,14 @@ pub fn unnamed_literals(item: &Item) -> Vec<String> {
             if !requires_trigger_names_a_binding(when, &item.bindings) && !literal_is_named(text, stem) {
                 out.push(when.clone());
             }
-            out.extend(required.iter().filter(|r| !named(r)).cloned());
+            // THE OWNER'S GO (step 26): the answer of a rule marked
+            // owner-approval stands in the owner's own message, never in the
+            // call - so its marker is exempt from being named in the text,
+            // which says it needs the owner's explicit go instead. Naming it
+            // only published the marker to every agent the rule was served to.
+            if !crate::store::is_owner_approval(item) {
+                out.extend(required.iter().filter(|r| !named(r)).cloned());
+            }
             out
         }
         Check::PathExists { path } => {
