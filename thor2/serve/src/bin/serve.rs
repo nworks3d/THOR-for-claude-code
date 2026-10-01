@@ -858,59 +858,23 @@ enum HookOutput {
     /// `respond.rs`'s own "WARN TIER" section for the state this left off
     /// at, and `hook_once`'s `Stop` arm below for where this is now built).
     ///
-    /// `cmd_hook` renders this as TWO independent fields carrying the same
-    /// `text`, one per audience, instead of the one shape `Context` uses: a
-    /// top-level `systemMessage` for the OWNER, and
-    /// `hookSpecificOutput.additionalContext` (keyed to this same
-    /// `event_name`, always `"Stop"` in practice - `hook_once`'s `Stop` arm
-    /// is the only place this variant is ever built) for the MODEL. Neither
-    /// field's presence implies the other, and setting them never sets a
-    /// `"decision"` key - a WARN must never be readable as a block.
+    /// `cmd_hook` renders this as a top-level `systemMessage` ONLY: a line
+    /// for the OWNER, never `hookSpecificOutput.additionalContext`, and never
+    /// a `"decision"` key - a WARN must not be readable as a block.
     ///
-    /// Why two fields for one string: a Response Guard warning is about the
-    /// reply the assistant just finished, and at `Stop` that turn is already
-    /// over - the assistant cannot act on anything unless it is blocked, and
-    /// a WARN by definition never blocks, so the model-facing half can only
-    /// ever land on a LATER turn. The owner is the only audience who can
-    /// still do something about it now, which is the reason this variant
-    /// exists at all.
-    ///
-    /// CONFIRMED BY THE DOCS, not merely defensive any more: `Stop` accepts
-    /// `additionalContext` for non-blocking feedback in the first place -
-    /// "Stop and SubagentStop also accept
-    /// `hookSpecificOutput.additionalContext` for non-error feedback that
-    /// continues the conversation" - but that feedback is addressed to
-    /// Claude, not the owner: "For non-blocking feedback that Claude should
-    /// see and act on, use `hookSpecificOutput.additionalContext` instead",
-    /// landing "at the end of the turn. The conversation continues so Claude
-    /// can act on the feedback" - i.e. next turn, never this one. The field
-    /// that actually reaches the owner is the different, top-level one this
-    /// variant now also sets: "If you want to show a message to the user
-    /// without blocking Claude, return `systemMessage` instead", which the
-    /// universal field table every hook event shares (not `Stop`-specific)
-    /// lists as "Warning message shown to the user". And the JSON never
-    /// carrying a `"decision"` key is still proven the older way too, by
-    /// this variant's own tests in `serve/tests/` against the real compiled
-    /// binary - so no consumer that keys its blocking behaviour off
-    /// `decision`/`reason` can ever read a WARN as a block.
-    ///
-    /// LEFT OPEN BY THE DOCS: whether `additionalContext` at `Stop` is
-    /// actually surfaced to the model when it arrives WITHOUT a `decision`
-    /// key - the only way this variant ever sends it, since a WARN by
-    /// definition carries no `decision`. The docs say `Stop` takes the field
-    /// for non-error feedback, but every worked example in that section
-    /// pairs `additionalContext` with a block; none shows it standing alone.
-    /// Left unresolved rather than guessed at again: this variant does not
-    /// depend on the answer to do its job, because the `systemMessage` half
-    /// - the reason it exists - is confirmed on its own and reaches the
-    /// owner regardless. If `additionalContext` alone turns out to be
-    /// silently ignored at `Stop`, that is the same "the model does not see
-    /// it" outcome this whole shape was always chosen to fail into, not a
-    /// new failure mode. If either assumption is ever found wrong, only this
-    /// one variant's rendering in `cmd_hook` needs to change - nothing about
-    /// `hook_once`'s own ordering logic depends on the JSON shape chosen
-    /// here.
-    Warn { event_name: String, text: String },
+    /// WHY NO `additionalContext` (field, 2026-10-01, session 615bdf12): at
+    /// `Stop` Claude Code documents that field as "non-error feedback that
+    /// continues the conversation ... so Claude can act on the feedback". A
+    /// Stop line that said "this Stop does not hold the turn again" went out
+    /// with it, exit 0, and every Stop was answered by another model turn
+    /// and another Stop, nine times, until Claude Code overrode the hook
+    /// ("blocked the turn from ending 9 consecutive times"). An earlier
+    /// version of this comment read "continues" as "next turn"; the
+    /// transcript shows it is this one. So a notice that does not hold the
+    /// turn - the Response Guard's warning, the void notice, "running in
+    /// session X", "report still owed" - goes out as `systemMessage` alone.
+    /// What must reach the model goes out as a block, with its loop guard.
+    Warn { text: String },
 }
 
 /// Whether this payload arrives from inside a Task-tool subagent rather than
@@ -1400,7 +1364,7 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
                 }
                 Some(Rehold::Say(line)) => {
                     let parts: Vec<String> = resumed_note.clone().into_iter().chain(guard_text.clone()).chain(std::iter::once(line)).collect();
-                    return Some(HookOutput::Warn { event_name, text: parts.join("\n\n") });
+                    return Some(HookOutput::Warn { text: parts.join("\n\n") });
                 }
                 None => {}
             }
@@ -1408,7 +1372,7 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
                 Some(text) => with_resumed(text),
                 None => resumed_note?,
             };
-            return Some(HookOutput::Warn { event_name, text });
+            return Some(HookOutput::Warn { text });
         }
         // A first-pass Stop of a main session: where the log stands, so a
         // later Stop in this same turn can tell whether the session did
@@ -1782,7 +1746,7 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
             (None, false) => Some(riders.join("\n\n")),
             (text, true) => text,
         };
-        return warn_text.map(|text| HookOutput::Warn { event_name, text });
+        return warn_text.map(|text| HookOutput::Warn { text });
     }
 
     // The session's own working directory, and the two project answers
@@ -3423,8 +3387,10 @@ enum Rehold {
 /// How many times one turn may be held again for the evaluation it owes
 /// (`evaluation_after_a_hold`) - each time only after the session did
 /// something since the last hold, so even this is never reached by a session
-/// that does nothing.
-const REHOLD_MAX: u32 = 5;
+/// that does nothing. Claude Code gives up on a Stop hook after 9 blocks in a
+/// row ("overriding and ending turn"); the first Stop's own hold plus these is
+/// at most 5, well under that.
+const REHOLD_MAX: u32 = 4;
 
 /// Where a session's turn stands for `evaluation_after_a_hold`: the log's
 /// tip at its last Stop, and how many times this turn was held again since
@@ -3433,7 +3399,14 @@ const REHOLD_MAX: u32 = 5;
 struct TurnMark {
     at_seq: i64,
     holds: u32,
+    /// Ids of the evaluation starts whose void notice this session was
+    /// already shown: a notice is shown ONCE per start, never on every Stop.
+    #[serde(default)]
+    announced: Vec<String>,
 }
+
+/// How many announced starts a session's mark remembers.
+const ANNOUNCED_KEEP: usize = 8;
 
 fn turn_marks_path(db: &Path) -> std::path::PathBuf {
     db.parent().unwrap_or_else(|| Path::new(".")).join("eval-turn-marks.json")
@@ -3451,11 +3424,13 @@ fn write_turn_mark(db: &Path, session_id: &str, mark: TurnMark) {
     }
 }
 
-/// A first-pass Stop: the log's tip now, and no hold yet in this turn.
+/// A first-pass Stop: the log's tip now, and no hold yet in this turn (what
+/// was already announced to the session stays announced).
 fn record_turn_mark(db: &Path, session_id: &str) {
     let Ok(store) = serve::store_dir::open_existing(db) else { return };
     let at_seq = store.get_next_seq().map(|n| n - 1).unwrap_or(0);
-    write_turn_mark(db, session_id, TurnMark { at_seq, holds: 0 });
+    let announced = read_turn_marks(db).remove(session_id).map(|m| m.announced).unwrap_or_default();
+    write_turn_mark(db, session_id, TurnMark { at_seq, holds: 0, announced });
 }
 
 /// Whether `session_id` did anything on the log after `at_seq`: a served
@@ -3508,12 +3483,21 @@ fn evaluation_after_a_hold(db_path: &Path, session_id: &str, payload: &Value) ->
     let progressed = mark.as_ref().is_some_and(|m| session_did_something_since(&store, session_id, m.at_seq));
     let holds = mark.as_ref().map_or(0, |m| m.holds);
     let may_hold = progressed && holds < REHOLD_MAX;
-    let held = |reason: String| {
-        write_turn_mark(db_path, session_id, TurnMark { at_seq: tip, holds: holds + 1 });
+    let announced = mark.as_ref().map(|m| m.announced.clone()).unwrap_or_default();
+    // `announce`: the start whose void notice this answer carries, so no later
+    // Stop of the session shows it again.
+    let remember = |announce: Option<&str>, holds: u32| {
+        let mut announced = announced.clone();
+        announced.extend(announce.map(str::to_string));
+        let skip = announced.len().saturating_sub(ANNOUNCED_KEEP);
+        write_turn_mark(db_path, session_id, TurnMark { at_seq: tip, holds, announced: announced.split_off(skip) });
+    };
+    let held = |reason: String, announce: Option<&str>| {
+        remember(announce, holds + 1);
         Rehold::Hold(reason)
     };
-    let quiet = |line: String| {
-        write_turn_mark(db_path, session_id, TurnMark { at_seq: tip, holds });
+    let quiet = |line: String, announce: Option<&str>| {
+        remember(announce, holds);
         Rehold::Say(line)
     };
     if let Some(start) = open.first() {
@@ -3529,10 +3513,10 @@ fn evaluation_after_a_hold(db_path: &Path, session_id: &str, payload: &Value) ->
                     (Some(_), true) => "this turn was held for it often enough",
                     (Some(_), false) => "nothing was done since the last hold",
                 }
-            )));
+            ), None));
         }
         if !start.frozen.decided() {
-            return Some(held(serve::eval_session::resumed_note(start)));
+            return Some(held(serve::eval_session::resumed_note(start), None));
         }
         let judgement = model::store::evaluation_judgement_owed(&store, start, &[]);
         let teeth = model::store::evaluation_frozen_batch_owed(&store, start);
@@ -3552,18 +3536,22 @@ fn evaluation_after_a_hold(db_path: &Path, session_id: &str, payload: &Value) ->
             start.id,
             judgement.owed.len(),
             teeth.len()
-        )));
+        ), None));
     }
     // The newest evaluation is void: the fresh one its refusal promised.
     let start = void.first()?;
+    let shown = announced.contains(&start.id);
     let project = start.frozen.project.clone();
     let why = start.frozen.void.as_ref().map(|v| format!("'{}' was changed at log seq {} ({})", v.id, v.seq, v.door)).unwrap_or_default();
     if !may_hold {
+        if shown {
+            return None;
+        }
         return Some(quiet(format!(
             "[THOR] The evaluation of '{project}' ('{}') was closed as void ({why}). This Stop does not hold the turn again, \
              so the next turn's first Stop starts a fresh one when it is still due.",
             start.id
-        )));
+        ), Some(&start.id)));
     }
     let stop_root: Option<PathBuf> =
         payload.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from).or_else(|| std::env::current_dir().ok());
@@ -3574,16 +3562,17 @@ fn evaluation_after_a_hold(db_path: &Path, session_id: &str, payload: &Value) ->
             "[THOR] The evaluation of '{project}' ('{}') was closed as void ({why}), so its report could not count. The \
              fresh evaluation it promised starts now - its start note is below.\n\n{text}",
             start.id
-        ))),
+        ), Some(&start.id))),
+        _ if shown => None,
         EvalStop::Elsewhere(line) => Some(quiet(format!(
             "[THOR] The evaluation of '{project}' ('{}') was closed as void ({why}).\n\n{line}",
             start.id
-        ))),
+        ), Some(&start.id))),
         EvalStop::Quiet => Some(quiet(format!(
             "[THOR] The evaluation of '{project}' ('{}') was closed as void ({why}), and no fresh evaluation is due here \
              now - no report is owed by this session for it.",
             start.id
-        ))),
+        ), Some(&start.id))),
     }
 }
 
@@ -6716,24 +6705,11 @@ fn hook_output_json(output: HookOutput) -> Value {
         // sibling either: a BLOCK already IS the refusal, so there is
         // nothing left for an advisory classifier to add.
         HookOutput::Decision(v) => v,
-        // A WARN-tier verdict at Stop - kept as its own arm rather than
-        // folded into `Context`'s (not merely to save a few lines) because
-        // the two mean different things and no longer render the same way
-        // either: `Context` is an injection surface handing the model ONE
-        // field, `hookSpecificOutput.additionalContext`. `Warn` is the
-        // Response Guard's own softer verdict, and has a second audience
-        // `Context` never needs to reach - the owner, not just the model -
-        // so it also sets a top-level `systemMessage` carrying the same
-        // text. No `verdicts` here either: `Warn` fires at Stop, about a
-        // reply already given, never about a proposed command or write the
-        // classifier could have anything to say about.
-        HookOutput::Warn { event_name, text } => serde_json::json!({
-            "systemMessage": text,
-            "hookSpecificOutput": {
-                "hookEventName": event_name,
-                "additionalContext": text,
-            }
-        }),
+        // A WARN-tier verdict or a notice at Stop: a top-level `systemMessage`
+        // for the owner and nothing else. NOT `additionalContext`: at Stop
+        // that field continues the conversation, so it would hold the turn
+        // (see `HookOutput::Warn`'s own doc comment for the field case).
+        HookOutput::Warn { text } => serde_json::json!({ "systemMessage": text }),
     }
 }
 

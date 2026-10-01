@@ -153,25 +153,20 @@ fn a_warn_tier_rule_produces_visible_text_and_does_not_block() {
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("expected JSON output, got {out:?}: {e}"));
 
     assert!(v.get("decision").is_none(), "a warn must never carry a \"decision\" key: {out}");
-    assert_eq!(v["hookSpecificOutput"]["hookEventName"], "Stop", "{out}");
-    let text = v["hookSpecificOutput"]["additionalContext"]
-        .as_str()
-        .unwrap_or_else(|| panic!("expected a string additionalContext: {out}"));
+    assert!(v.get("hookSpecificOutput").is_none(), "a warn must never carry model context: {out}");
+    let text = v["systemMessage"].as_str().unwrap_or_else(|| panic!("expected a string systemMessage: {out}"));
     assert!(text.contains("preference"), "{text}");
 }
 
-/// THE DEFECT THIS PREVENTS: `additionalContext` alone reaches the model,
-/// which cannot act on it until a later turn (the turn is already over by
-/// the time a `Stop` warn fires), while the owner - the only audience who
-/// can still do something about it now - never sees anything at all. Per
-/// Claude Code's own hooks documentation (`HookOutput::Warn`'s own doc
-/// comment in `serve.rs` spells out exactly what that documentation settles
-/// and what it still leaves open), the field that reaches the owner is a
-/// different, top-level `systemMessage`. Both fields must carry the
-/// identical text, neither replaces the other, and neither ever adds a
-/// `"decision"` key.
+/// THE DEFECT THIS PREVENTS (field, 2026-10-01): a Stop warn that carried
+/// `hookSpecificOutput.additionalContext` made Claude Code CONTINUE the
+/// conversation ("The conversation continues so Claude can act on the
+/// feedback"), so a notice that said "this Stop does not hold the turn" held
+/// it anyway, once per Stop, until Claude Code overrode the hook after 9. A
+/// warn is for the owner: a top-level `systemMessage` only, never model
+/// context, never a `"decision"` key.
 #[test]
-fn a_warn_emits_a_top_level_system_message_and_still_carries_additional_context() {
+fn a_warn_emits_a_top_level_system_message_and_never_carries_additional_context() {
     let dir = tempfile::tempdir().unwrap();
     let db = fresh_store(dir.path());
     std::fs::write(dir.path().join("guard-response-rulebook.json"), WARN_ONLY_RULEBOOK).unwrap();
@@ -181,17 +176,11 @@ fn a_warn_emits_a_top_level_system_message_and_still_carries_additional_context(
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("expected JSON output, got {out:?}: {e}"));
 
     assert!(v.get("decision").is_none(), "a warn must never carry a \"decision\" key: {out}");
+    assert!(v.get("hookSpecificOutput").is_none(), "a warn must never carry additionalContext (it continues the turn): {out}");
     let system_message = v["systemMessage"]
         .as_str()
         .unwrap_or_else(|| panic!("expected a top-level systemMessage: {out}"));
-    let additional_context = v["hookSpecificOutput"]["additionalContext"]
-        .as_str()
-        .unwrap_or_else(|| panic!("expected a string additionalContext: {out}"));
     assert!(system_message.contains("preference"), "{system_message}");
-    assert_eq!(
-        system_message, additional_context,
-        "systemMessage and additionalContext must carry the identical text: {out}"
-    );
 }
 
 /// THE DEFECT THIS PREVENTS: a warn-tier match at Stop silently eats a real,
@@ -326,9 +315,7 @@ fn the_owners_own_main_session_still_gets_the_pending_warn() {
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("expected JSON output, got {out:?}: {e}"));
     assert!(v.get("decision").is_none(), "a warn must never carry a \"decision\" key: {out}");
-    let text = v["hookSpecificOutput"]["additionalContext"]
-        .as_str()
-        .unwrap_or_else(|| panic!("expected a string additionalContext: {out}"));
+    let text = v["systemMessage"].as_str().unwrap_or_else(|| panic!("expected a string systemMessage: {out}"));
     assert!(text.contains("preference"), "{text}");
 }
 
@@ -355,9 +342,7 @@ fn an_unmarked_warn_tier_rule_still_reaches_a_subagents_stop() {
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("expected JSON output, got {out:?}: {e}"));
     assert!(v.get("decision").is_none(), "a warn must never carry a \"decision\" key: {out}");
-    let text = v["hookSpecificOutput"]["additionalContext"]
-        .as_str()
-        .unwrap_or_else(|| panic!("expected a string additionalContext: {out}"));
+    let text = v["systemMessage"].as_str().unwrap_or_else(|| panic!("expected a string systemMessage: {out}"));
     assert!(text.contains("no owner_reading_only key"), "{text}");
 }
 

@@ -2117,3 +2117,147 @@ fn a_crowding_block_carries_the_evaluation_ask() {
     let state = serve::usefulness::project_eval_state(&db, Some("fxp"));
     assert_eq!((state.asked_count, state.sessions[&s].stops), (1, 2), "asked once, the Stop counted once");
 }
+
+// ---------------------------------------------------------------------------
+// STEP 25: a notice that does not hold the turn must never wake the model.
+// Field case 2026-10-01 (session 615bdf12): the void notice said "this Stop
+// does not hold the turn again" and was delivered with exit 0, yet Claude
+// Code ended every Stop by answering it again, 9 times, until it overrode.
+// Cause: the notice went out with `hookSpecificOutput.additionalContext`,
+// which at Stop "continues the conversation" - a hold in everything but name.
+// ---------------------------------------------------------------------------
+
+/// A Stop answer that carries text for the model: it makes Claude Code start
+/// another model turn, so it is a hold whatever its exit code says.
+fn wakes_the_model(out: &str) -> bool {
+    out.contains("additionalContext") || out.contains("\"decision\"")
+}
+
+/// The notice reached the owner as a plain system message.
+fn system_message(out: &str) -> String {
+    let v: serde_json::Value = serde_json::from_str(out).unwrap_or_else(|e| panic!("not JSON: {out:?}: {e}"));
+    v["systemMessage"].as_str().unwrap_or_else(|| panic!("no systemMessage: {out}")).to_string()
+}
+
+/// `s` has an evaluation of `fxp` that was started by the first Stop and then
+/// closed as void by a side door, with the session doing nothing since.
+fn voided_start_without_new_work(db: &Path, sandbox: &Sandbox, fxp: &Path, s: &str) -> String {
+    drop(EventStore::new(db).unwrap());
+    seed_session_work(db, Some("fxp"), s, 90);
+    let first = run_hook(db, &stop_payload(s, fxp), sandbox);
+    assert!(is_block(&first), "{first}");
+    let mut store = EventStore::new(db).unwrap();
+    let open = model::store::open_evaluation_start(&store, s, "fxp").expect("the ask started one");
+    served_in(&mut store, "fxp", "fixture", 0);
+    let outside = model::store::FrozenVoid { id: "fx-active-fxp".to_string(), seq: 1, door: "an attested THOR call of another session".to_string() };
+    serve::eval_session::void(&mut store, &open, &outside).expect("void");
+    open.id
+}
+
+/// THE FIELD CASE: a voided start, the session did nothing new, the same
+/// Stop arrives again and again. The notice is shown once, as a system
+/// message, never as something the model has to answer; the Stops after it
+/// say nothing. And the next turn's first Stop still starts the fresh
+/// evaluation the notice promised.
+#[test]
+fn a_void_notice_is_shown_once_and_never_wakes_the_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let sandbox = Sandbox::new();
+    let fxp = sandbox.project_dir("fxp");
+    let s = uuid(70);
+    let voided = voided_start_without_new_work(&db, &sandbox, &fxp, &s);
+
+    let first = run_hook(&db, &retry_stop_payload(&s, &fxp), &sandbox);
+    assert!(!wakes_the_model(&first), "a notice that does not hold the turn must not wake the model: {first}");
+    assert!(system_message(&first).contains(&format!("('{voided}') was closed as void")), "{first}");
+    for round in 0..4 {
+        let again = run_hook(&db, &retry_stop_payload(&s, &fxp), &sandbox);
+        assert!(!wakes_the_model(&again), "round {round}: {again}");
+        assert!(!again.contains("closed as void"), "round {round}: the notice is shown once, not on every Stop: {again}");
+    }
+
+    // The next turn's first Stop (no stop_hook_active) starts the fresh one.
+    let next_turn = run_hook(&db, &stop_payload(&s, &fxp), &sandbox);
+    assert!(is_block(&next_turn) && next_turn.contains("[THOR] The evaluation of 'fxp' started"), "{next_turn}");
+    let store = EventStore::new(&db).unwrap();
+    let fresh = model::store::open_evaluation_start(&store, &s, "fxp").expect("a fresh evaluation is open");
+    assert_ne!(fresh.id, voided);
+}
+
+/// The same, while another session's evaluation of the project is active:
+/// one line saying who runs it, as a system message, once - never a hold.
+#[test]
+fn a_running_elsewhere_notice_after_a_void_is_one_line_and_never_wakes_the_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let sandbox = Sandbox::new();
+    let fxp = sandbox.project_dir("fxp");
+    let (s, other) = (uuid(71), uuid(72));
+    let voided = voided_start_without_new_work(&db, &sandbox, &fxp, &s);
+    {
+        // The other session's evaluation is open and it was active a moment
+        // ago; this session then does something, so its Stop looks again.
+        let mut store = EventStore::new(&db).unwrap();
+        serve::attest::fixture::quiet_start_at(&mut store, &other, "fxp", serve::time::now_unix() - 40 * 60);
+        let at = serve::time::iso8601_from_unix(serve::time::now_unix());
+        serve::mark::record_useful(&mut store, &other, "mcp", "mcp", &at, "fx-active-fxp", None).unwrap();
+        served_in(&mut store, "fxp", &s, 0);
+    }
+    let first = run_hook(&db, &retry_stop_payload(&s, &fxp), &sandbox);
+    assert!(!wakes_the_model(&first), "{first}");
+    let line = system_message(&first);
+    assert!(line.contains(&format!("('{voided}') was closed as void")) && line.contains(&format!("running in session {other}")), "{line}");
+    for round in 0..3 {
+        let again = run_hook(&db, &retry_stop_payload(&s, &fxp), &sandbox);
+        assert!(!wakes_the_model(&again) && !again.contains("closed as void"), "round {round}: {again}");
+    }
+}
+
+/// An evaluation still open and unfiled, nothing done since the last hold:
+/// the line says so, and says it as a system message only.
+#[test]
+fn the_report_still_owed_line_never_wakes_the_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let sandbox = Sandbox::new();
+    let fxp = sandbox.project_dir("fxp");
+    let s = uuid(73);
+    drop(EventStore::new(&db).unwrap());
+    seed_session_work(&db, Some("fxp"), &s, 90);
+    let first = run_hook(&db, &stop_payload(&s, &fxp), &sandbox);
+    assert!(is_block(&first), "{first}");
+    let retry = run_hook(&db, &retry_stop_payload(&s, &fxp), &sandbox);
+    assert!(!wakes_the_model(&retry), "{retry}");
+    assert!(system_message(&retry).contains("is still open and its report is not filed"), "{retry}");
+}
+
+/// Claude Code overrides a Stop hook after 9 blocks in a row. A session that
+/// does something between every Stop is held again at most `REHOLD_MAX`
+/// times: the first hold and the re-holds together stay well under 9.
+#[test]
+fn a_held_turn_is_held_again_at_most_four_times() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let sandbox = Sandbox::new();
+    let fxp = sandbox.project_dir("fxp");
+    let s = uuid(74);
+    drop(EventStore::new(&db).unwrap());
+    seed_session_work(&db, Some("fxp"), &s, 90);
+    let first = run_hook(&db, &stop_payload(&s, &fxp), &sandbox);
+    assert!(is_block(&first), "{first}");
+    let mut blocks = 1;
+    for _ in 0..9 {
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            served_in(&mut store, "fxp", &s, 0);
+        }
+        let out = run_hook(&db, &retry_stop_payload(&s, &fxp), &sandbox);
+        if is_block(&out) {
+            blocks += 1;
+        } else {
+            assert!(!wakes_the_model(&out), "{out}");
+        }
+    }
+    assert_eq!(blocks, 5, "the first hold plus four re-holds, never more");
+}

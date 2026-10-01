@@ -215,10 +215,11 @@ per project and not per folder, when:
 
 Inside a turn the ask already held, the `Stop` of that turn holds again while
 the session's evaluation is open and its report not filed - only once the
-session did something since the last hold, and at most five times - asking to
+session did something since the last hold, and at most four times - asking to
 file in that same turn; after a void it starts the fresh evaluation the void
 promised. With nothing done since the hold it lets go with one line saying the
-report is still owed. An item another session changed through an attested
+report is still owed; that line, and a void notice (shown once per session),
+are messages for you only and never ask the assistant to answer. An item another session changed through an attested
 THOR call counts as settled by that session (credited in the machine section)
 and never voids the evaluation.
 
@@ -405,7 +406,7 @@ counts, and without `agent_id` the field changes nothing.
 target/release/doctor.exe --db "<store>"
 ```
 
-Its first line always names the build it was run from (`doctor 2.5.2`), so a
+Its first line always names the build it was run from (`doctor 2.5.3`), so a
 report you paste somewhere says which version made it - every program in this
 directory answers the same way to `--version` or `-V`, on its own, with no
 store needed.
