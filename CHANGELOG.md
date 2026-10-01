@@ -2,6 +2,17 @@
 
 What changed in each release, newest first. The release workflow copies the section for the tag being released to the top of the release notes and refuses to publish without one.
 
+## 2.5.2 (2026-10-01)
+
+- **One project runs one evaluation at a time.** A second session's evaluation of the same project no longer starts while the first one's session was active in the last 30 minutes, however old its start is; that session gets one line naming the session that runs it. Once the running one has been quiet for 30 minutes, the next ask takes the evaluation over and closes the old one as superseded, never voided: its verdicts and edits stay.
+- **Another session's attested edit never voids an evaluation.** An item on an evaluation's lists that another session changed through an attested THOR call counts as settled by that session, is credited to it in the machine section, and drops off the evaluation's own obligations; such a write not checked yet is checked at the evaluating session's next Stop, and only an unattested or side-door write still voids it.
+- **A turn held for the evaluation is held again until the report is filed.** The Stop of a turn the ask already held used to let the session go silently, so "file next turn" never came; it now holds again, once the session did something since the hold, asking to file in that same turn, starts the fresh evaluation a void promised, and lets go only after nothing more is done, with one line saying the report is still owed.
+- **The start note shows where each judged item fired.** Every item on the judgement list carries how often it fired in this session and its last few places (the command or file), the Stop's single-item ask shows the same, and `get` with `fired: true` lists an item's recent firings in the calling session.
+- **A rewording never clears a true check.** A text-only revise of a rule whose check holds but whose bindings never reach its file keeps the check, stays undecided, and names the rebind as a step of its own - or, when that file's place is full, leaves the rule to THOR's own open point for the owner. Each A4 line says how many of the 300 characters are left.
+- **One rule for "can never reach a block".** A rule that keeps every binding it stands on is judged by its own servings first, so THOR's machine pass, the revise reply and the write gate no longer disagree about the same place.
+- **Plain words for reports filed before checked filings.** Such a report still does not count, and now says it was filed before THOR 2.5 checked filings instead of blaming another program; doctor says the same.
+- **Every program reports the same version again.** All binaries are released together as 2.5.2.
+
 ## 2.5.1 (2026-10-01)
 
 - **The crowding hold no longer names writes THOR made itself.** The Stop hook's "stored this session onto a place that is already full" hold now counts only writes the session itself made: a revision by one of THOR's own actors (such as the `retest` pass an install runs from inside a session) or one stamped with another session's id is never that session's debt.
