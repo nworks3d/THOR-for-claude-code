@@ -94,9 +94,25 @@ impl Fx {
         self.store.append_event("legacy", &item.id, "migration", EventKind::FactCreated, &item.id, None, &body).unwrap()
     }
 
+    /// Close every other session's open evaluation of `project` as
+    /// superseded, the way a start finds one whose session went quiet (step
+    /// 24: one project runs one evaluation at a time). These cases are about
+    /// what one start leaves the next, not about two running at once.
+    fn quiet_others(&mut self, session: &str, project: &str) {
+        let now = crate::time::now_unix();
+        for other in model::store::open_evaluation_starts_of_project(&self.store, project, now) {
+            if other.frozen.session == session {
+                continue;
+            }
+            let superseded = model::store::FrozenSuperseded { by_session: session.to_string(), at_seq: 0, idle_minutes: None };
+            model::store::record_evaluation_superseded(&mut self.store, eval_machine(), &other, &superseded).unwrap();
+        }
+    }
+
     /// One evaluation start of `project` by `session`, both writes, with a
     /// box nothing here runs out of.
     fn start(&mut self, session: &str, project: &str) -> EvaluationStart {
+        self.quiet_others(session, project);
         let began = begin(&self.db, &mut self.store, session, project, "command").unwrap();
         assert!(began.fresh, "a fresh start for {session}");
         decide(&mut self.store, began.start, WIDE)
@@ -610,6 +626,7 @@ fn the_pass_stops_at_its_time_box_and_resumes() {
 
     // The marker of a hook killed between its two writes.
     fx.legacy(&rule("late", "Keep the changelog under 80 lines.", vec![Binding::Moment(intent::Action::Commit)], None, Some("beta")));
+    fx.quiet_others(S3, "beta");
     let cut = begin(&fx.db, &mut fx.store, S3, "beta", "stop-ask").unwrap().start;
     assert!(!cut.frozen.decided());
     assert!(file(&mut fx, &cut, "eval-beta-cut").unwrap_err().to_string().contains(model::store::STILL_DECIDING));
@@ -742,6 +759,11 @@ fn a4_only_items_get_their_own_list_of_16() {
         assert!(note.contains(&call), "{id}: {note}");
     }
     assert!(note.contains("4 more rule(s) like these wait for the next evaluation"), "{note}");
+    // The room the rewording has (step 24, field defect 5): the A4 line says
+    // how many characters are left, so a reword fits the first time.
+    let used = "Never wipe data volume 0 with the acme tool.".chars().count();
+    let budget = format!("text budget: {} of 300 characters left (the text is {used} now)", 300 - used);
+    assert!(note.contains(&budget), "{budget}: {note}");
     assert!(!note.contains("mcp__thor__revise(id: \"a4-16\""), "the seventeenth is not this evaluation's: {note}");
     let err = file(&mut fx, &start, "eval-beta-1").unwrap_err().to_string();
     assert!(err.contains("'a4-00'") && err.contains("'a4-15'") && !err.contains("'a4-16'"), "{err}");

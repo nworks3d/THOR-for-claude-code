@@ -205,9 +205,22 @@ per project and not per folder, when:
   then (the larger of the clock file's number and the session record's own
   count, so zeroing the file delays the ask at most until the record is read);
 - it is not this session's first `Stop` in that project;
-- no other session runs that project's evaluation right now (an open start of
-  less than an hour, its session active within half an hour): then the session
-  gets one line and no hold.
+- no other session runs that project's evaluation right now (an open, unfiled
+  start whose session showed activity on the log in the last 30 minutes,
+  however old the start is): then the session gets one line naming that
+  session, no hold, and no second evaluation starts. Once that session has
+  been quiet for 30 minutes, the next ask takes the evaluation over and closes
+  the old one as superseded (never void: its verdicts stay). A session's own
+  open evaluation is asked for first, whatever the clock says.
+
+Inside a turn the ask already held, the `Stop` of that turn holds again while
+the session's evaluation is open and its report not filed - only once the
+session did something since the last hold, and at most five times - asking to
+file in that same turn; after a void it starts the fresh evaluation the void
+promised. With nothing done since the hold it lets go with one line saying the
+report is still owed. An item another session changed through an attested
+THOR call counts as settled by that session (credited in the machine section)
+and never voids the evaluation.
 
 The weekly floor holds regardless of the clock: a project with activity in
 the last 7 days (an item served or a write from a Claude Code session) and no

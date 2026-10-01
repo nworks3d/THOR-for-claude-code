@@ -99,6 +99,10 @@ fn owner_queue_of(n: usize) -> Fx {
         store.append_event("legacy", &rule.id, "migration", EventKind::FactCreated, &rule.id, None, &body).unwrap();
     }
     let decide = |store: &mut EventStore, session: &str| {
+        // One project runs one evaluation at a time (step 24): the earlier
+        // session's evaluation is closed as superseded first, the way a start
+        // finds one whose session went quiet.
+        serve::attest::fixture::supersede_others(store, session, "fxp");
         let began = serve::eval_session::begin(&db, store, session, "fxp", "command").unwrap();
         serve::eval_session::decide(store, began.start, Duration::from_secs(120))
     };

@@ -1207,7 +1207,10 @@ fn report_problem_lines(store: &EventStore, project: &str) -> Vec<String> {
         .into_iter()
         .filter_map(|(id, _, validation)| match validation {
             Some(v) if v.valid => None,
-            Some(v) => Some(format!("  evaluation report '{id}' does not count as this project's evaluation: {}", v.why)),
+            Some(v) => Some(format!(
+                "  evaluation report '{id}' does not count as this project's evaluation: {}",
+                serve::eval_filing::why_in_words(store, &v)
+            )),
             None => Some(format!(
                 "  evaluation report '{id}' is not checked yet - the next Stop of a main session checks its filing"
             )),

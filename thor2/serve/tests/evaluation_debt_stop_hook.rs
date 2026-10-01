@@ -672,8 +672,121 @@ fn does_not_block_twice_in_the_same_turn() {
     let v: serde_json::Value = serde_json::from_str(&first).expect("the first Stop of the turn must fire");
     assert_eq!(v["decision"], "block", "fixture sanity: {first}");
 
+    // Nothing was done since the hold: the retry never holds again (loop
+    // safety). Since step 24 it is not silent either while the evaluation it
+    // started is still owed - one line says so.
     let retry = run_hook(&db, &retry_stop_payload("s1", &project_dir), &sandbox);
-    assert!(retry.trim().is_empty(), "a retry within the same turn must never block again: {retry}");
+    assert!(!is_block(&retry), "a retry with nothing done since the hold must never block again: {retry}");
+    assert!(retry.contains("does not hold the turn again (nothing was done since the last hold)"), "{retry}");
+}
+
+/// FIELD DEFECT 2 (2026-10-01): both sessions did their evaluation work INSIDE
+/// the turn the ask held, then ended it meaning to "file next turn" - and the
+/// Stop of a held turn (`stop_hook_active`) let both go silently, so no next
+/// turn ever came. Now the evaluation the session owes holds that Stop again
+/// once the session did something since the hold, says to file in this very
+/// turn, and lets go only after nothing more is done.
+#[test]
+fn a_turn_held_for_the_evaluation_is_held_again_until_its_report_is_filed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let sandbox = Sandbox::new();
+    let fxp = sandbox.project_dir("fxp");
+    let s = uuid(40);
+    drop(EventStore::new(&db).unwrap());
+    seed_session_work(&db, Some("fxp"), &s, 90);
+    let first = run_hook(&db, &stop_payload(&s, &fxp), &sandbox);
+    assert!(is_block(&first) && first.contains("[THOR] The evaluation of 'fxp' started"), "{first}");
+
+    // The session works inside the held turn (a THOR-visible call), then
+    // ends the turn without filing.
+    {
+        let mut store = EventStore::new(&db).unwrap();
+        served_in(&mut store, "fxp", &s, 0);
+    }
+    let again = run_hook(&db, &retry_stop_payload(&s, &fxp), &sandbox);
+    assert!(is_block(&again), "the evaluation it owes holds the held turn again: {again}");
+    assert!(again.contains("is still open and its report is not filed") && again.contains("file the report NOW"), "{again}");
+
+    // Nothing more done: never a loop.
+    let then = run_hook(&db, &retry_stop_payload(&s, &fxp), &sandbox);
+    assert!(!is_block(&then), "{then}");
+    assert!(then.contains("is still open and its report is not filed"), "never silent while it is owed: {then}");
+}
+
+/// FIELD DEFECT 2, the void half: a filing refused as void promised "the next
+/// Stop starts a fresh evaluation", and the Stop of the held turn let the
+/// session go silently. Now that Stop starts the fresh evaluation it promised
+/// and holds the turn with its start note.
+#[test]
+fn a_voided_evaluation_starts_the_fresh_one_inside_the_held_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let sandbox = Sandbox::new();
+    let fxp = sandbox.project_dir("fxp");
+    let s = uuid(41);
+    drop(EventStore::new(&db).unwrap());
+    seed_session_work(&db, Some("fxp"), &s, 90);
+    let first = run_hook(&db, &stop_payload(&s, &fxp), &sandbox);
+    assert!(is_block(&first), "{first}");
+    let voided = {
+        let mut store = EventStore::new(&db).unwrap();
+        let open = model::store::open_evaluation_start(&store, &s, "fxp").expect("the ask started one");
+        served_in(&mut store, "fxp", &s, 0);
+        let outside = model::store::FrozenVoid { id: "fx-active-fxp".to_string(), seq: 1, door: "a side door in the fixture".to_string() };
+        serve::eval_session::void(&mut store, &open, &outside).expect("void");
+        open.id
+    };
+    let again = run_hook(&db, &retry_stop_payload(&s, &fxp), &sandbox);
+    assert!(is_block(&again), "the fresh evaluation the void promised: {again}");
+    assert!(again.contains(&format!("('{voided}') was closed as void")), "{again}");
+    let store = EventStore::new(&db).unwrap();
+    let fresh = model::store::open_evaluation_start(&store, &s, "fxp").expect("a fresh evaluation is open");
+    assert_ne!(fresh.id, voided);
+    assert!(again.contains(&fresh.id), "its start note rides with the hold: {again}");
+}
+
+/// FIELD DEFECT 1 through the real hook: S1 started the project's evaluation
+/// 90 minutes ago and worked a minute ago. S2's Stop is due, yet it starts no
+/// second evaluation - one line names S1 - however old S1's start is (the old
+/// one-hour exemption let the second start happen). Once S1 has been quiet
+/// for 30 minutes, S2's Stop takes the evaluation over and S1's is closed as
+/// superseded, never voided.
+#[test]
+fn one_project_runs_one_evaluation_and_a_quiet_one_is_taken_over() {
+    let sandbox = Sandbox::new();
+    let fxp = sandbox.project_dir("fxp");
+    let (s1, s2) = (uuid(42), uuid(43));
+    let now = serve::time::now_unix();
+    let case = |quiet_minutes: i64| -> (String, std::path::PathBuf, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            serve::attest::fixture::quiet_start_at(&mut store, &s1, "fxp", now - 90 * 60);
+            served_in(&mut store, "fxp", "fixture", 0);
+            let at = serve::time::iso8601_from_unix(now - quiet_minutes * 60);
+            serve::mark::record_useful(&mut store, &s1, "mcp", "mcp", &at, "fx-active-fxp", None).unwrap();
+        }
+        seed_project_clock(&db, "fxp", 120);
+        seed_own_work(&db, "fxp", &s2, 30, 1);
+        let out = run_hook(&db, &stop_payload(&s2, &fxp), &sandbox);
+        (out, db, dir)
+    };
+    let (active, db, _keep) = case(1);
+    assert!(!is_block(&active), "{active}");
+    assert!(active.contains(&format!("is running in session {s1}")) && active.contains("since its last activity"), "{active}");
+    let store = EventStore::new(&db).unwrap();
+    assert!(model::store::open_evaluation_start(&store, &s2, "fxp").is_none(), "no second evaluation was started");
+    drop(store);
+
+    let (quiet, db, _keep) = case(45);
+    assert!(is_block(&quiet) && quiet.contains("Run the THOR evaluation"), "{quiet}");
+    let store = EventStore::new(&db).unwrap();
+    assert!(model::store::open_evaluation_start(&store, &s2, "fxp").is_some(), "S2 runs it now");
+    let s1_start = model::store::evaluation_starts_of_session(&store, &s1).pop().unwrap();
+    assert!(model::store::open_evaluation_start(&store, &s1, "fxp").is_none(), "S1's is no longer open");
+    assert_eq!(s1_start.frozen.void, None, "superseded, never voided");
 }
 
 /// Case named in the build brief: "the ask counter increments per blocked
@@ -1602,7 +1715,13 @@ fn first_stop_of_a_session_is_never_held() {
     assert!(is_block(&second), "{second}");
 
     // The Stop count is a sidecar copy: zeroed by hand, the transcript's
-    // earlier turn still says this is not the first Stop.
+    // earlier turn still says this is not the first Stop. On a store of its
+    // own: one project runs one evaluation at a time (step 24), and the
+    // first session's is still running in the one above.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    drop(EventStore::new(&db).unwrap());
+    seed_project_clock(&db, "fxp", 90);
     let dodger = uuid(6);
     seed_own_work(&db, "fxp", &dodger, 30, 0);
     let now = serve::time::now_unix();
@@ -1675,38 +1794,7 @@ fn a_running_evaluation_elsewhere_is_not_asked_twice() {
     seed_own_work(&db, "fxp", &s2, 30, 1);
     let out = run_hook(&db, &stop_payload(&s2, &fxp), &sandbox);
     assert!(!is_block(&out), "{out}");
-    assert!(out.contains("[THOR] an evaluation of fxp is running in another session (started "), "{out}");
-}
-
-/// R17.5 (D12): the exemption lasts at most an hour per start. S1's start is
-/// 61 minutes old and S1 keeps writing: S2's Stop is held with the ask. The
-/// modification time of S1's transcript plays no part (nothing reads it).
-#[test]
-fn a_running_evaluation_exempts_for_at_most_an_hour() {
-    let sandbox = Sandbox::new();
-    let fxp = sandbox.project_dir("fxp");
-    let (s1, s2) = (uuid(11), uuid(12));
-    let now = serve::time::now_unix();
-    let case = |started_minutes_ago: i64| -> String {
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("thor.db");
-        {
-            let mut store = EventStore::new(&db).unwrap();
-            serve::attest::fixture::quiet_start_at(&mut store, &s1, "fxp", now - started_minutes_ago * 60);
-            served_in(&mut store, "fxp", "fixture", 0);
-            let at = serve::time::iso8601_from_unix(now - 60);
-            serve::mark::record_useful(&mut store, &s1, "mcp", "mcp", &at, "fx-active-fxp", None).unwrap();
-        }
-        seed_project_clock(&db, "fxp", 90);
-        seed_own_work(&db, "fxp", &s2, 30, 1);
-        run_hook(&db, &stop_payload(&s2, &fxp), &sandbox)
-    };
-    // S1's transcript, just written ("touched").
-    serve::attest::fixture::work_in(&transcripts(&sandbox), &s1, &fxp, now - 5 * 60, 5);
-    let out = case(61);
-    assert!(is_block(&out) && out.contains("Run the THOR evaluation"), "{out}");
-    let quiet = case(10);
-    assert!(!is_block(&quiet), "the contrast: ten minutes old, it exempts: {quiet}");
+    assert!(out.contains(&format!("[THOR] the evaluation of fxp is running in session {s1}")), "{out}");
 }
 
 /// R17.2 (EV B8, the step-16 leftover): the sidecar's minutes zeroed for S2

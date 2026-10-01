@@ -178,20 +178,89 @@ fn teeth_eval() -> SystemActor {
 /// only when the log cannot be read or written (a hook run that holds the
 /// store read-only included).
 pub fn start(db: &Path, store: &mut EventStore, session_id: &str, project: &str, started_by: &str) -> Option<Started> {
-    let began = begin(db, store, session_id, project, started_by)?;
+    try_start(db, store, session_id, project, started_by).ok()
+}
+
+/// Why a start signal started nothing (step 24).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartRefused {
+    /// ONE EVALUATION PER PROJECT: another session runs this project's
+    /// evaluation and showed activity on the log within
+    /// `model::store::EVALUATION_IDLE_MINUTES` - its start, and how many
+    /// minutes it has been quiet.
+    RunningElsewhere { start: EvaluationStart, idle_minutes: i64 },
+    /// The log could not be read or written (a hook run that holds the store
+    /// read-only included).
+    Store,
+}
+
+/// `start`, saying why it started nothing (`StartRefused`).
+pub fn try_start(db: &Path, store: &mut EventStore, session_id: &str, project: &str, started_by: &str) -> Result<Started, StartRefused> {
+    let began = try_begin(db, store, session_id, project, started_by)?;
     let decided = decide(store, began.start, pass_box());
-    Some(Started { start: decided, fresh: began.fresh })
+    Ok(Started { start: decided, fresh: began.fresh })
 }
 
 /// The FIRST of a start's two writes: the start record, with the judgement
 /// list and the open points and no batch - or the evaluation already open,
 /// untouched. `start` is `begin` followed by `decide`.
 pub fn begin(db: &Path, store: &mut EventStore, session_id: &str, project: &str, started_by: &str) -> Option<Started> {
+    try_begin(db, store, session_id, project, started_by).ok()
+}
+
+/// What the session is told when its start signal met another session's
+/// evaluation of the same project (`StartRefused::RunningElsewhere`).
+pub fn running_elsewhere_note(start: &EvaluationStart, idle_minutes: i64) -> String {
+    format!(
+        "[THOR] the evaluation of {} is running in session {}, {idle_minutes} minute(s) since its last activity (started \
+         {}, THOR's record '{}') - one project runs one evaluation at a time, so nothing was started here and this \
+         session owes no report for it. If that session stays quiet for {} minutes, the next ask here takes the \
+         evaluation over.",
+        start.frozen.project,
+        start.frozen.session,
+        crate::time::iso8601_from_unix(start.frozen.started_unix),
+        start.id,
+        model::store::EVALUATION_IDLE_MINUTES
+    )
+}
+
+/// `begin`, saying why it started nothing. ONE EVALUATION PER PROJECT (step
+/// 24): another session's open evaluation of `project` refuses the start
+/// while that session showed activity within
+/// `model::store::EVALUATION_IDLE_MINUTES`, and is closed as SUPERSEDED once
+/// it has been quiet longer - never voided: its verdicts and edits stay.
+pub fn try_begin(db: &Path, store: &mut EventStore, session_id: &str, project: &str, started_by: &str) -> Result<Started, StartRefused> {
     retire_handover_sidecar(db);
     if let Some(open) = open_evaluation(store, session_id, project) {
-        return Some(Started { start: open, fresh: false });
+        return Ok(Started { start: open, fresh: false });
     }
-    let frozen = model::store::frozen_now(store, session_id, project, started_by, crate::time::now_unix())?;
+    let now = crate::time::now_unix();
+    let others: Vec<EvaluationStart> = model::store::open_evaluation_starts_of_project(store, project, now)
+        .into_iter()
+        .filter(|s| s.frozen.session != session_id)
+        .collect();
+    for other in &others {
+        let idle = crate::usefulness::session_idle_minutes(store, &other.frozen.session, now, model::store::EVALUATION_IDLE_MINUTES);
+        if let Some(idle_minutes) = idle {
+            return Err(StartRefused::RunningElsewhere { start: other.clone(), idle_minutes });
+        }
+    }
+    for other in &others {
+        let idle_minutes = crate::usefulness::session_idle_minutes(
+            store,
+            &other.frozen.session,
+            now,
+            model::store::EVALUATION_OPEN_HOURS * 60,
+        );
+        let at_seq = store.get_next_seq().map(|n| n - 1).unwrap_or(0);
+        let superseded = model::store::FrozenSuperseded { by_session: session_id.to_string(), at_seq, idle_minutes };
+        // A record that cannot be written leaves the other one open: no fresh
+        // start beside it.
+        if model::store::record_evaluation_superseded(store, eval_machine(), other, &superseded).is_err() {
+            return Err(StartRefused::Store);
+        }
+    }
+    let frozen = model::store::frozen_now(store, session_id, project, started_by, now).ok_or(StartRefused::Store)?;
     let id = model::store::evaluation_start_id(project, frozen.started_seq);
     let item = Item {
         id: id.clone(),
@@ -207,10 +276,10 @@ pub fn begin(db: &Path, store: &mut EventStore, session_id: &str, project: &str,
         check: None,
     };
     match model::store::record_evaluation_start(store, eval_machine(), &item, &frozen) {
-        Ok(start) => Some(Started { start, fresh: true }),
+        Ok(start) => Ok(Started { start, fresh: true }),
         // Raced by another start for the same position: read the one that
         // landed.
-        Err(_) => open_evaluation(store, session_id, project).map(|start| Started { start, fresh: false }),
+        Err(_) => open_evaluation(store, session_id, project).map(|start| Started { start, fresh: false }).ok_or(StartRefused::Store),
     }
 }
 
@@ -422,7 +491,15 @@ fn try_one(store: &mut EventStore, db: Option<&Path>, candidate: &Candidate, cor
             ..machine_item(id, MachineOutcome::Blocked, format!("blocked: {blocker}"))
         },
         Maintenance::NeedsAgent(why) if tried.a4_only => {
-            MachineItem { call: Some(a4_call(store, id)), ..machine_item(id, MachineOutcome::A4Only, why.clone()) }
+            // The room the rewording has (step 24): field case 2026-10-01, five
+            // appends refused for running past the limit, never retried.
+            let used = model::store::show(store, id).map(|item| item.text.chars().count()).unwrap_or(0);
+            let max = model::gate::MAX_TEXT_CHARS;
+            let detail = format!(
+                "{why} - text budget: {} of {max} characters left (the text is {used} now), so reword rather than append",
+                max.saturating_sub(used)
+            );
+            MachineItem { call: Some(a4_call(store, id)), ..machine_item(id, MachineOutcome::A4Only, detail) }
         }
         Maintenance::NeedsAgent(why) => needs_agent(why.clone()),
         Maintenance::Rule { .. } | Maintenance::Note { .. } => {
@@ -570,7 +647,7 @@ fn point_text_of(store: &EventStore, project: &str, blocker: &Blocker, rules: &[
             let shown = occupants.iter().map(|(id, text)| format!("'{id}' ({})", first_words(text))).collect::<Vec<_>>().join("; ");
             format!(
                 "THOR's own open point: {path} already holds {} live fact(s), the most a place ever shows - {shown} - so the \
-                 {} rule(s) whose path_exists check names {path} without being anchored to it cannot be anchored there: \
+                 {} rule(s) whose check reads {path} without being anchored to it cannot be anchored there: \
                  {}.{more} Nothing needs doing from a session: each keeps its true check and is counted apart - clearing a \
                  check that is true is never the way past this. The owner decides which fact gives way: fold one into \
                  another (revise one to carry the point too, retract the rest), re-anchor one to the narrower file it is \
@@ -622,8 +699,19 @@ fn lifted(store: &EventStore, project: &str, blocker: &Blocker) -> Option<String
             let still = crate::live::live_items(store).into_iter().any(|li| {
                 li.item.kind.can_fire()
                     && model::normalize::normalize_project(li.item.project.as_deref()).as_deref() == Some(project)
-                    && matches!(&li.item.check, Some(Check::PathExists { path: p }) if p == path)
-                    && model::checkout::crowded_path_anchor(store, &li.item, &root, path).is_some()
+                    && match &li.item.check {
+                        Some(Check::PathExists { path: p }) if p == path => {
+                            model::checkout::crowded_path_anchor(store, &li.item, &root, path).is_some()
+                        }
+                        // A contains or absent check the rule is not anchored
+                        // to, on that same full place (step 24).
+                        Some(Check::Contains { path: p, .. } | Check::Absent { path: p, .. } | Check::AbsentAll { path: p, .. })
+                            if p == path =>
+                        {
+                            model::checkout::crowded_file_anchor(store, &li.item, &root, path).is_some()
+                        }
+                        _ => false,
+                    }
             });
             (!still).then(|| format!("{path} has room again, or no rule is held by it any more"))
         }
@@ -732,6 +820,19 @@ pub fn machine_pass(store: &mut EventStore, project: &str, start: &EvaluationSta
     Passed { batch_later: needing.len() - batch.len(), batch, a4_list, machine }
 }
 
+/// The line under one judgement item: how often it fired in this session and
+/// where, newest place first - at most `per_item` places.
+pub fn fired_line(fired: Option<&model::store::Firings>, per_item: usize) -> String {
+    match fired {
+        Some(f) if !f.triggers.is_empty() => {
+            let places = f.triggers.iter().take(per_item).map(|t| format!("'{t}'")).collect::<Vec<_>>().join(" | ");
+            format!("\n       fired here {} time(s); last at: {places}", f.count)
+        }
+        Some(f) => format!("\n       fired here {} time(s)", f.count),
+        None => "\n       where it fired was not recorded".to_string(),
+    }
+}
+
 fn quoted(ids: &[String]) -> String {
     ids.iter().map(|id| format!("'{id}'")).collect::<Vec<_>>().join(", ")
 }
@@ -756,10 +857,16 @@ pub fn render_start_note(id: &str, frozen: &Frozen) -> String {
     if frozen.judgement.is_empty() {
         out.push_str("nothing that fired in this session owes a verdict, so the report is held to no judgement at all.");
     } else {
+        // WHERE IT FIRED, under each item (step 24): the last distinct places
+        // this session served it, frozen with the list. A long list shows one
+        // place per item, so the note stays bounded.
+        let per_item = if frozen.judgement.len() > model::store::FIRED_FULL_LIST_MAX { 1 } else { model::store::FIRED_TRIGGERS };
         out.push_str(&format!(
-            "{} item(s) that fired in this session and had fired {}+ times since their last verdict: {}. For each \
-             one, read where it fired (`get` shows the item), then judge it with the THOR tool itself - a verdict \
-             from a shell, a script or another session settles nothing:",
+            "{} item(s) that fired in this session and had fired {}+ times since their last verdict: {}. Under each \
+             one is where it fired in this session (its last {per_item} distinct place(s); \
+             mcp__thor__get(id: \"<id>\", fired: true) shows its recent firings). Judge each one by whether it \
+             belonged THERE, with the THOR tool itself - a verdict from a shell, a script or another session settles \
+             nothing:",
             frozen.judgement.len(),
             model::store::JUDGEMENT_DEBT_AFTER,
             quoted(&frozen.judgement)
@@ -769,6 +876,7 @@ pub fn render_start_note(id: &str, frozen: &Frozen) -> String {
                 "\n   - '{id}': mcp__thor__mark(id: \"{id}\") when it belonged where it fired, or \
                  mcp__thor__mark(id: \"{id}\", noise: true) when it did not"
             ));
+            out.push_str(&fired_line(frozen.fired.get(id), per_item));
         }
         out.push_str(&format!(
             "\n   If you cannot judge one honestly, do not guess: add the tag '{}<id>:<reason>' to the report instead.",
@@ -1112,9 +1220,137 @@ mod tests {
         assert!(!again.fresh);
         assert_eq!(again.start, first.start, "the start never moves while the evaluation is open");
         assert_eq!(start_records(&store).len(), 2, "no second record: still the start and its batch record");
-        let other = start(&db, &mut store, "other-sess", "p", "skill").unwrap();
-        assert!(other.fresh, "another session starts its own");
-        assert_eq!(other.start.frozen.started_seq, 6);
+        // ONE PROJECT, ONE EVALUATION (step 24): "sess" is active (its start
+        // is a minute old), so another session starts none beside it.
+        assert_eq!(start(&db, &mut store, "other-sess", "p", "skill"), None, "another session starts none beside it");
+        assert_eq!(start_records(&store).len(), 2, "nothing written for the refused start");
+    }
+
+    /// A project's served item, fired `n` times in `session` at `at` (unix),
+    /// on `trigger` - assistant deliveries, the ones the judgement list counts.
+    fn fire(store: &mut EventStore, session: &str, id: &str, n: usize, at: i64, trigger: Option<&str>) {
+        let at = crate::time::iso8601_from_unix(at);
+        for _ in 0..n {
+            crate::deliver::record_delivery_with_trigger(
+                store,
+                session,
+                session,
+                crate::usefulness::ASSISTANT_DELIVERY_ACTOR,
+                &at,
+                &[id.to_string()],
+                trigger,
+            );
+        }
+    }
+
+    /// A decided rule of project "p" (a note), so the machine pass leaves it.
+    fn noted_rule(store: &mut EventStore, id: &str, binding: model::item::Binding) {
+        let item = Item {
+            id: id.to_string(),
+            kind: Kind::Rule,
+            text: format!("fixture rule {id} of project p"),
+            bindings: vec![binding],
+            severity: None,
+            project: Some("p".to_string()),
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some("the fixture rule turns out to be wrong".to_string()),
+            check: None,
+        };
+        model::store::declare(store, "fixture", "fixture", "fixture", &item).unwrap();
+        crate::teeth::fixture::decide(store, id);
+    }
+
+    /// FIELD DEFECT 1 (2026-10-01): two sessions evaluated one project at once,
+    /// with overlapping frozen lists. Now a second session's start is refused
+    /// while the first one's session is active - whatever the first start's
+    /// age - and the refusal names that session and how long it has been
+    /// quiet.
+    #[test]
+    fn a_second_session_starts_no_evaluation_beside_an_active_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, mut store) = store_with_events(dir.path(), 2);
+        let now = crate::time::now_unix();
+        noted_rule(&mut store, "fx-rule", model::item::Binding::Target { kind: model::item::TargetKind::Command, value: "make".to_string() });
+        // A's evaluation started 90 minutes ago, and A worked a minute ago.
+        let a = crate::attest::fixture::quiet_start_at(&mut store, "sess-a", "p", now - 90 * 60);
+        fire(&mut store, "sess-a", "fx-rule", 1, now - 60, Some("make all"));
+        assert_eq!(start(&db, &mut store, "sess-b", "p", "stop-ask"), None, "B starts nothing beside A's evaluation");
+        match try_start(&db, &mut store, "sess-b", "p", "stop-ask") {
+            Err(StartRefused::RunningElsewhere { start, idle_minutes }) => {
+                assert_eq!(start.id, a.id);
+                assert!(idle_minutes <= 2, "{idle_minutes}");
+                let note = running_elsewhere_note(&start, idle_minutes);
+                assert!(note.contains("is running in session sess-a") && note.contains("since its last activity"), "{note}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(still_open(&store, &a), "A's evaluation stands");
+    }
+
+    /// FIELD DEFECT 1, the other half: once the running evaluation's session
+    /// has been quiet for 30 minutes, a new start takes over - the old one is
+    /// closed as SUPERSEDED, never voided for the work it did.
+    #[test]
+    fn a_quiet_sessions_evaluation_is_superseded_never_voided() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, mut store) = store_with_events(dir.path(), 2);
+        let now = crate::time::now_unix();
+        noted_rule(&mut store, "fx-rule", model::item::Binding::Target { kind: model::item::TargetKind::Command, value: "make".to_string() });
+        let a = crate::attest::fixture::quiet_start_at(&mut store, "sess-a", "p", now - 3 * 3600);
+        fire(&mut store, "sess-a", "fx-rule", 1, now - 45 * 60, Some("make all"));
+        let b = start(&db, &mut store, "sess-b", "p", "stop-ask").expect("B takes the evaluation over");
+        assert!(b.fresh);
+        let a_now = model::store::evaluation_starts_of_session(&store, "sess-a").into_iter().find(|s| s.id == a.id).unwrap();
+        assert!(!still_open(&store, &a_now), "A's evaluation is no longer the one running");
+        assert_eq!(a_now.frozen.void, None, "superseded, never voided for the work it did");
+        assert!(model::store::show(&store, &a.id).unwrap().text.contains("THIS EVALUATION WAS SUPERSEDED"));
+    }
+
+    /// FIELD DEFECT 4 (2026-10-01): the start note said "`get` shows where it
+    /// fired" and nothing showed it. Each judgement item now carries this
+    /// session's last distinct places, the part around its own anchor first.
+    #[test]
+    fn the_start_note_shows_where_each_item_fired_in_this_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, mut store) = store_with_events(dir.path(), 1);
+        let now = crate::time::now_unix();
+        noted_rule(&mut store, "fx-fired", model::item::Binding::Target { kind: model::item::TargetKind::Command, value: "git push".to_string() });
+        fire(&mut store, "sess", "fx-fired", 30, now - 600, Some("git push origin main"));
+        fire(&mut store, "sess", "fx-fired", 10, now - 300, Some("git push --tags"));
+        fire(&mut store, "other", "fx-fired", 5, now - 200, Some("git push elsewhere"));
+        let started = start(&db, &mut store, "sess", "p", "stop-ask").unwrap();
+        assert_eq!(started.start.frozen.judgement, vec!["fx-fired".to_string()]);
+        let note = start_note(&started.start);
+        assert!(
+            note.contains("fired here 40 time(s); last at: 'git push --tags' | 'git push origin main'"),
+            "the places this session saw it fire, newest first: {note}"
+        );
+        assert!(!note.contains("git push elsewhere"), "another session's firing is not this one's: {note}");
+    }
+
+    /// The places stay bounded: a judgement list longer than
+    /// `model::store::FIRED_FULL_LIST_MAX` keeps, and shows, one place per
+    /// item.
+    #[test]
+    fn a_long_judgement_list_keeps_one_place_per_item() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, mut store) = store_with_events(dir.path(), 1);
+        let now = crate::time::now_unix();
+        let n = model::store::FIRED_FULL_LIST_MAX + 1;
+        for i in 0..n {
+            let id = format!("fx-long-{i:02}");
+            noted_rule(&mut store, &id, model::item::Binding::Target { kind: model::item::TargetKind::Command, value: format!("make t{i}") });
+            fire(&mut store, "sess", &id, 39, now - 600, Some(&format!("make t{i} --old")));
+            fire(&mut store, "sess", &id, 1, now - 300, Some(&format!("make t{i} --new")));
+        }
+        let started = start(&db, &mut store, "sess", "p", "stop-ask").unwrap();
+        assert_eq!(started.start.frozen.judgement.len(), n);
+        assert!(started.start.frozen.fired.values().all(|f| f.triggers.len() == 1), "one place per item when the list is long");
+        let note = start_note(&started.start);
+        assert!(note.contains("fired here 40 time(s); last at: 'make t0 --new'\n"), "{note}");
+        assert!(!note.contains("--old"), "{note}");
     }
 
     /// File a report for `session`'s open evaluation of "p" the way Claude

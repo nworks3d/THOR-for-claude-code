@@ -1262,6 +1262,10 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
                 serve::attest::record_refusal_verifications(&mut store, &session_id);
                 serve::attest::record_write_verifications(&mut store, &session_id);
                 if !payload_is_from_a_subagent(&payload) {
+                    // ANOTHER SESSION'S WRITES on this session's open
+                    // evaluation lists (step 24): checked here, so a filing
+                    // never waits on a session that went quiet.
+                    serve::attest::record_foreign_write_verifications(&mut store, &session_id);
                     // THE READER OF A FILING (step 16): every evaluation
                     // report on file whose filing has no validator record
                     // yet is validated once - after the verifications above,
@@ -1369,17 +1373,48 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
         if already_fired {
             // A Stop that already held this turn once may not hold it again
             // (loop safety): a resumed note still arrives, as a warning.
-            if msg.trim().is_empty() {
-                return resumed_note.map(|text| HookOutput::Warn { event_name, text });
+            // ONE EXCEPTION (step 24): the evaluation this session owes. Field
+            // case 2026-10-01: both sessions did their evaluation work inside
+            // the turn the ask held, ended it to "file next turn", and this
+            // branch let both go silently - no next turn ever came. So while
+            // this session's evaluation is open and unfiled (or was just
+            // voided and is still due), this Stop holds again - but only after
+            // the session did something since the last hold, and at most
+            // `REHOLD_MAX` times in one turn, so it can never loop.
+            let guard_text = (!msg.trim().is_empty()).then(|| {
+                let rulebook_text = std::fs::read_to_string(respond::default_rulebook_path(db_path)).ok();
+                let last_prompt = last_user_prompt_from_payload(&payload);
+                let verdict =
+                    respond::guard_verdict(rulebook_text.as_deref(), msg, &last_prompt, reader_is_an_agent, citation_lookup);
+                verdict.block_reason.or(verdict.warn_reason)
+            });
+            let guard_text = guard_text.flatten();
+            let owed = match is_subagent || no_record {
+                true => None,
+                false => evaluation_after_a_hold(db_path, &session_id, &payload),
+            };
+            match owed {
+                Some(Rehold::Hold(reason)) => {
+                    let parts: Vec<String> = resumed_note.clone().into_iter().chain(guard_text.clone()).chain(std::iter::once(reason)).collect();
+                    return Some(HookOutput::Decision(serde_json::json!({ "decision": "block", "reason": parts.join("\n\n") })));
+                }
+                Some(Rehold::Say(line)) => {
+                    let parts: Vec<String> = resumed_note.clone().into_iter().chain(guard_text.clone()).chain(std::iter::once(line)).collect();
+                    return Some(HookOutput::Warn { event_name, text: parts.join("\n\n") });
+                }
+                None => {}
             }
-            let rulebook_text = std::fs::read_to_string(respond::default_rulebook_path(db_path)).ok();
-            let last_prompt = last_user_prompt_from_payload(&payload);
-            let verdict = respond::guard_verdict(rulebook_text.as_deref(), msg, &last_prompt, reader_is_an_agent, citation_lookup);
-            let text = match verdict.block_reason.or(verdict.warn_reason) {
+            let text = match guard_text {
                 Some(text) => with_resumed(text),
                 None => resumed_note?,
             };
             return Some(HookOutput::Warn { event_name, text });
+        }
+        // A first-pass Stop of a main session: where the log stands, so a
+        // later Stop in this same turn can tell whether the session did
+        // anything since (`evaluation_after_a_hold`).
+        if !is_subagent && !no_record {
+            record_turn_mark(db_path, &session_id);
         }
         // Where this Stop stands, resolved once, BEFORE any verdict below can
         // return: the folder, and the project the session is counted in.
@@ -1968,13 +2003,19 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
             let typed = !payload_is_from_a_subagent(&payload)
                 && serve::eval_session::prompt_starts_evaluation(prompt_text, &serve::eval_session::command_names(db_path));
             let eval_note = if typed && !no_record {
-                session_project
-                    .as_deref()
-                    .and_then(|p| serve::eval_session::start(db_path, &mut store, &session_id, p, "command"))
-                    .map(|started| match started.fresh {
-                        true => serve::eval_session::start_note(&started.start),
-                        false => serve::eval_session::continue_note(&started.start, true),
-                    })
+                session_project.as_deref().and_then(|p| {
+                    match serve::eval_session::try_start(db_path, &mut store, &session_id, p, "command") {
+                        Ok(started) => Some(match started.fresh {
+                            true => serve::eval_session::start_note(&started.start),
+                            false => serve::eval_session::continue_note(&started.start, true),
+                        }),
+                        // One project runs one evaluation at a time (step 24).
+                        Err(serve::eval_session::StartRefused::RunningElsewhere { start, idle_minutes }) => {
+                            Some(serve::eval_session::running_elsewhere_note(&start, idle_minutes))
+                        }
+                        Err(serve::eval_session::StartRefused::Store) => None,
+                    }
+                })
             } else {
                 None
             };
@@ -3117,8 +3158,20 @@ fn judgement_debt(store: &EventStore, db_path: &Path, session_id: &str, current_
     let total_owed = owed.len();
     let batch_len = total_owed.min(JUDGEMENT_DEBT_BATCH_MAX);
     let mut items_block = String::new();
+    // WHERE IT FIRED IN THIS SESSION (step 24): its last distinct places here,
+    // the same lines the evaluation's start note shows.
+    let batch_ids: Vec<String> = owed.iter().take(JUDGEMENT_DEBT_BATCH_MAX).map(|(id, _)| id.clone()).collect();
+    let fired_here = model::store::session_firings(store, session_id, &batch_ids, i64::MAX);
     for (id, count) in owed.iter().take(JUDGEMENT_DEBT_BATCH_MAX) {
         let text = model::store::show(store, id).ok().map(|i| i.text).unwrap_or_default();
+        if let Some(fired) = fired_here.get(id).filter(|f| !f.triggers.is_empty()) {
+            let places = fired.triggers.iter().map(|t| format!("'{t}'")).collect::<Vec<_>>().join(" | ");
+            items_block.push_str(&format!(
+                "\n- '{id}' ({count}x since last judged, if ever; {} time(s) in this session, last at {places}): {text}",
+                fired.count
+            ));
+            continue;
+        }
         // ", last fired at '<trigger>'" - the same clause `ops::health::
         // judgement_debt_line`'s own named list prints, and trivial to add
         // here once `model::served::last_trigger` existed for that line to
@@ -3225,14 +3278,24 @@ fn skill_call_answer(
             )
         };
     if due && !no_record {
-        if let Some(started) = serve::eval_session::start(db_path, store, session_id, project, "skill") {
-            return match started.fresh {
-                true => serve::eval_session::start_note(&started.start),
-                false => serve::eval_session::continue_note(&started.start, true),
-            };
+        match serve::eval_session::try_start(db_path, store, session_id, project, "skill") {
+            Ok(started) => {
+                return match started.fresh {
+                    true => serve::eval_session::start_note(&started.start),
+                    false => serve::eval_session::continue_note(&started.start, true),
+                };
+            }
+            Err(serve::eval_session::StartRefused::RunningElsewhere { start, idle_minutes }) => {
+                return serve::eval_session::running_elsewhere_note(&start, idle_minutes);
+            }
+            Err(serve::eval_session::StartRefused::Store) => {}
         }
     }
-    let elsewhere = model::store::open_evaluation_starts_of_project(store, project, time::now_unix());
+    let now = time::now_unix();
+    if let Some((open, idle)) = usefulness::evaluation_running_elsewhere(store, project, session_id, now) {
+        return serve::eval_session::running_elsewhere_note(&open, idle);
+    }
+    let elsewhere = model::store::open_evaluation_starts_of_project(store, project, now);
     match elsewhere.iter().rev().find(|s| s.frozen.session != session_id) {
         Some(open) => serve::eval_session::continue_note(open, false),
         None => serve::eval_session::not_due_note(project),
@@ -3348,6 +3411,182 @@ fn with_eval_ask(
     parts.join("\n\n")
 }
 
+/// What a Stop inside an already-held turn says about the evaluation this
+/// session owes (step 24, `evaluation_after_a_hold`).
+enum Rehold {
+    /// Hold the turn again, with this reason.
+    Hold(String),
+    /// Do not hold, but say this - never a silent release while it is owed.
+    Say(String),
+}
+
+/// How many times one turn may be held again for the evaluation it owes
+/// (`evaluation_after_a_hold`) - each time only after the session did
+/// something since the last hold, so even this is never reached by a session
+/// that does nothing.
+const REHOLD_MAX: u32 = 5;
+
+/// Where a session's turn stands for `evaluation_after_a_hold`: the log's
+/// tip at its last Stop, and how many times this turn was held again since
+/// its first Stop. One entry per session, in a sidecar beside the store.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct TurnMark {
+    at_seq: i64,
+    holds: u32,
+}
+
+fn turn_marks_path(db: &Path) -> std::path::PathBuf {
+    db.parent().unwrap_or_else(|| Path::new(".")).join("eval-turn-marks.json")
+}
+
+fn read_turn_marks(db: &Path) -> std::collections::BTreeMap<String, TurnMark> {
+    std::fs::read_to_string(turn_marks_path(db)).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+}
+
+fn write_turn_mark(db: &Path, session_id: &str, mark: TurnMark) {
+    let mut all = read_turn_marks(db);
+    all.insert(session_id.to_string(), mark);
+    if let Ok(text) = serde_json::to_string(&all) {
+        let _ = serve::store_dir::write(&turn_marks_path(db), text);
+    }
+}
+
+/// A first-pass Stop: the log's tip now, and no hold yet in this turn.
+fn record_turn_mark(db: &Path, session_id: &str) {
+    let Ok(store) = serve::store_dir::open_existing(db) else { return };
+    let at_seq = store.get_next_seq().map(|n| n - 1).unwrap_or(0);
+    write_turn_mark(db, session_id, TurnMark { at_seq, holds: 0 });
+}
+
+/// Whether `session_id` did anything on the log after `at_seq`: a served
+/// item, a verdict or a write of its own (THOR's own records never count).
+fn session_did_something_since(store: &EventStore, session_id: &str, at_seq: i64) -> bool {
+    store.events_since(at_seq).unwrap_or_default().iter().any(|e| {
+        let served_here = e.kind == thor_core::event_store::EventKind::ItemServed && e.session_id == session_id;
+        let written = (e.session_id == session_id || e.session_id == "mcp") && !model::store::RESERVED_ACTORS.contains(&e.actor.as_str());
+        served_here || written
+    })
+}
+
+/// THE EVALUATION OWED INSIDE AN ALREADY-HELD TURN (step 24, field defect 2).
+/// `None`: this session owes no evaluation report now. Otherwise:
+/// - its evaluation is open and its report not filed: hold again, saying to
+///   file it now (the writes of this turn were just checked at this Stop),
+///   with what is still owed;
+/// - its newest evaluation of a project was closed as VOID and none is open:
+///   the fresh evaluation the void promised starts now when the project is
+///   still due here - or one line says which session runs it, or that none is
+///   due;
+/// - and never a hold when nothing was done since the last one, or after
+///   `REHOLD_MAX` holds in this turn: then one line says it is still owed.
+fn evaluation_after_a_hold(db_path: &Path, session_id: &str, payload: &Value) -> Option<Rehold> {
+    let store = serve::store_dir::open_existing(db_path).ok()?;
+    let now = time::now_unix();
+    let mut newest: std::collections::BTreeMap<String, model::store::EvaluationStart> = std::collections::BTreeMap::new();
+    for start in model::store::evaluation_starts_of_session(&store, session_id) {
+        newest.insert(start.frozen.project.clone(), start);
+    }
+    let open: Vec<&model::store::EvaluationStart> =
+        newest.values().filter(|s| model::store::evaluation_still_open(&store, s, now)).collect();
+    let void: Vec<&model::store::EvaluationStart> = newest
+        .values()
+        .filter(|s| s.frozen.is_void() && now - s.frozen.started_unix <= model::store::EVALUATION_OPEN_HOURS * 3600)
+        .collect();
+    if open.is_empty() && void.is_empty() {
+        return None;
+    }
+    // A transcript THOR cannot read can never carry a filing that counts.
+    if serve::eval_filing::session_drifted(db_path, serve::attest::transcripts_root().as_deref(), session_id) {
+        return None;
+    }
+    // No mark: this turn's first Stop was never seen (a session that started
+    // before this build). Nothing proves the session did anything since the
+    // hold, so this Stop says so and does not hold; the next turn's first
+    // Stop records a mark.
+    let mark = read_turn_marks(db_path).remove(session_id);
+    let tip = store.get_next_seq().map(|n| n - 1).unwrap_or(0);
+    let progressed = mark.as_ref().is_some_and(|m| session_did_something_since(&store, session_id, m.at_seq));
+    let holds = mark.as_ref().map_or(0, |m| m.holds);
+    let may_hold = progressed && holds < REHOLD_MAX;
+    let held = |reason: String| {
+        write_turn_mark(db_path, session_id, TurnMark { at_seq: tip, holds: holds + 1 });
+        Rehold::Hold(reason)
+    };
+    let quiet = |line: String| {
+        write_turn_mark(db_path, session_id, TurnMark { at_seq: tip, holds });
+        Rehold::Say(line)
+    };
+    if let Some(start) = open.first() {
+        let project = &start.frozen.project;
+        if !may_hold {
+            return Some(quiet(format!(
+                "[THOR] The evaluation of '{project}' ('{}') is still open and its report is not filed. This Stop does not \
+                 hold the turn again ({}), so the next turn's first Stop asks for it again - file the report then, with \
+                 the THOR tool itself.",
+                start.id,
+                match (&mark, progressed) {
+                    (None, _) => "this turn's first Stop was not seen by this build",
+                    (Some(_), true) => "this turn was held for it often enough",
+                    (Some(_), false) => "nothing was done since the last hold",
+                }
+            )));
+        }
+        if !start.frozen.decided() {
+            return Some(held(serve::eval_session::resumed_note(start)));
+        }
+        let judgement = model::store::evaluation_judgement_owed(&store, start, &[]);
+        let teeth = model::store::evaluation_frozen_batch_owed(&store, start);
+        let foreign = model::store::frozen_writes_in_window(&store, start, None).foreign_pending.len();
+        let foreign = match foreign {
+            0 => String::new(),
+            n => format!(", {n} write(s) by another session not checked yet"),
+        };
+        return Some(held(format!(
+            "[THOR] The evaluation of '{project}' ('{}') is still open and its report is not filed, so this turn is held \
+             again. Every verdict and write of this turn was checked at this Stop: file the report NOW, in this turn, \
+             with the THOR tool itself - mcp__thor__remember with kind report, project '{project}', tags \
+             [\"evaluation-report\"], id eval-{project}-<date> and your own plain summary as its text. If anything is still \
+             owed, the filing names it, one by one; do that and file again. Owed right now: {} judgement item(s) without \
+             a verdict or a not-judgeable tag, {} rule(s) of the batch and the A4 list{foreign}. Do not tell the owner \
+             'next turn': file in this one.",
+            start.id,
+            judgement.owed.len(),
+            teeth.len()
+        )));
+    }
+    // The newest evaluation is void: the fresh one its refusal promised.
+    let start = void.first()?;
+    let project = start.frozen.project.clone();
+    let why = start.frozen.void.as_ref().map(|v| format!("'{}' was changed at log seq {} ({})", v.id, v.seq, v.door)).unwrap_or_default();
+    if !may_hold {
+        return Some(quiet(format!(
+            "[THOR] The evaluation of '{project}' ('{}') was closed as void ({why}). This Stop does not hold the turn again, \
+             so the next turn's first Stop starts a fresh one when it is still due.",
+            start.id
+        )));
+    }
+    let stop_root: Option<PathBuf> =
+        payload.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from).or_else(|| std::env::current_dir().ok());
+    let stop_project = serve::project::session_project(db_path, session_id, stop_root.as_deref());
+    drop(store);
+    match stop_eval_decision(db_path, session_id, stop_root.as_deref(), stop_project.as_deref(), true, false) {
+        EvalStop::Ask(text) => Some(held(format!(
+            "[THOR] The evaluation of '{project}' ('{}') was closed as void ({why}), so its report could not count. The \
+             fresh evaluation it promised starts now - its start note is below.\n\n{text}",
+            start.id
+        ))),
+        EvalStop::Elsewhere(line) => Some(quiet(format!(
+            "[THOR] The evaluation of '{project}' ('{}') was closed as void ({why}).\n\n{line}",
+            start.id
+        ))),
+        EvalStop::Quiet => Some(quiet(format!(
+            "[THOR] The evaluation of '{project}' ('{}') was closed as void ({why}), and no fresh evaluation is due here \
+             now - no report is owed by this session for it.",
+            start.id
+        ))),
+    }
+}
+
 /// Whether the teeth question may hold this main session's Stop (step 21):
 /// the Stop was counted in `stop_project`, and the session passes the
 /// evaluation ask's own gates there (`usefulness::upkeep_may_hold` - ten
@@ -3456,20 +3695,24 @@ fn eval_stop_ask(
                 // and keeps it.
                 let started = match no_record {
                     true => None,
-                    false => serve::eval_session::start(db_path, store, session_id, &project, "stop-ask"),
+                    false => match serve::eval_session::try_start(db_path, store, session_id, &project, "stop-ask") {
+                        Ok(started) => Some(started),
+                        // Another session started it between the decision and
+                        // this start (step 24): one line, no hold.
+                        Err(serve::eval_session::StartRefused::RunningElsewhere { start, idle_minutes }) => {
+                            elsewhere.get_or_insert_with(|| serve::eval_session::running_elsewhere_note(&start, idle_minutes));
+                            continue;
+                        }
+                        Err(serve::eval_session::StartRefused::Store) => None,
+                    },
                 };
                 return EvalStop::Ask(match started {
                     Some(started) => format!("{reason}\n\n{}", serve::eval_session::start_note(&started.start)),
                     None => reason,
                 });
             }
-            usefulness::StopDecision::Elsewhere(start) => {
-                elsewhere.get_or_insert_with(|| {
-                    format!(
-                        "[THOR] an evaluation of {project} is running in another session (started {})",
-                        time::iso8601_from_unix(start.frozen.started_unix)
-                    )
-                });
+            usefulness::StopDecision::Elsewhere(start, idle_minutes) => {
+                elsewhere.get_or_insert_with(|| serve::eval_session::running_elsewhere_note(&start, idle_minutes));
             }
             usefulness::StopDecision::Quiet(_) => {}
         }
@@ -5578,7 +5821,8 @@ mod judgement_debt_tests {
         );
 
         let asked = judgement_debt(&store, Path::new("no-watermark-for-this-test"), "s", None).expect("fixture sanity: it is owed");
-        assert!(asked.contains("last fired at 'npm run deploy'"), "{asked}");
+        // Since step 24: this session's own places, newest first.
+        assert!(asked.contains("time(s) in this session, last at 'npm run deploy'"), "{asked}");
     }
 
     /// A verdict on one of several owed items settles only that one - the

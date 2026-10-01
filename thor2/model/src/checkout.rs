@@ -325,6 +325,37 @@ pub fn default_branch(root: &Path) -> String {
 
 // ------------------------------------------------- the blocker, at read time
 
+/// Whether `item` is anchored to the file `path`: a Path binding on exactly
+/// it, or a Dir binding on a directory that holds it (slashes compared
+/// alike). A file check on a rule anchored nowhere near its file never
+/// reaches a write to it.
+pub fn binds_the_file(item: &Item, path: &str) -> bool {
+    let fold = |p: &str| p.replace('\\', "/").trim_end_matches('/').to_string();
+    let file = fold(path);
+    item.bindings.iter().any(|b| match b {
+        Binding::Target { kind: crate::item::TargetKind::Path, value } => fold(value) == file,
+        Binding::Target { kind: crate::item::TargetKind::Dir, value } => {
+            let dir = fold(value);
+            dir.is_empty() || dir == "." || file.starts_with(&format!("{dir}/"))
+        }
+        _ => false,
+    })
+}
+
+/// `Blocker::AnchorFull` for a contains or absent check on `path` (step 24)
+/// that the rule is not anchored to, when the file is really in the
+/// registered checkout `root` and the one fix - anchoring the rule to it - is
+/// refused because that place already holds the most facts a place ever
+/// shows. The same owner's decision `crowded_path_anchor` makes for a
+/// `path_exists` check: the rule keeps its true check and is counted apart.
+pub fn crowded_file_anchor(store: &EventStore, item: &Item, root: &Path, path: &str) -> Option<Blocker> {
+    if binds_the_file(item, path) || !root.join(path).exists() {
+        return None;
+    }
+    let anchor = Binding::Target { kind: crate::item::TargetKind::Path, value: path.to_string() };
+    crate::store::full_place_occupants(store, item, &anchor).map(|_| Blocker::AnchorFull { path: path.to_string() })
+}
+
 /// Whether a check reads a file, and so needs a working copy to be tried.
 pub fn is_file_check(check: &Check) -> bool {
     matches!(check, Check::Contains { .. } | Check::Absent { .. } | Check::AbsentAll { .. } | Check::PathExists { .. })
@@ -374,6 +405,13 @@ pub fn read_time_blocker(store: &EventStore, item: &Item) -> Option<Blocker> {
     };
     if let Check::PathExists { path } = check {
         return crowded_path_anchor(store, item, &root, path);
+    }
+    // A contains or absent check the rule is not anchored to, on a place that
+    // is already full (step 24): the owner's decision, as for path_exists.
+    if let Check::Contains { path, .. } | Check::Absent { path, .. } | Check::AbsentAll { path, .. } = check {
+        if let Some(blocker) = crowded_file_anchor(store, item, &root, path) {
+            return Some(blocker);
+        }
     }
     let Check::Contains { path, literal } = check else { return None };
     if !crate::gate::unnamed_literals(item).is_empty() || !root.join(path).is_file() {

@@ -858,6 +858,65 @@ pub fn record_write_verifications(store: &mut EventStore, session: &str) -> usiz
 /// `record_write_verifications` against the transcripts under `root`. Reads
 /// the session's transcripts ONCE for all of its unverified writes.
 pub fn record_write_verifications_in(store: &mut EventStore, session: &str, root: Option<&Path>) -> usize {
+    record_writes_of(store, session, session, root)
+}
+
+/// THE WRITES OF ANOTHER SESSION ON AN OPEN EVALUATION'S LISTS (step 24),
+/// checked at the Stop of the evaluating `session`: for every evaluation it
+/// has open, every write by another session to an item on its lists that no
+/// verification covers yet is checked against THAT session's transcript, and
+/// the verdict recorded under this session's name (`record_write_verification_by`).
+/// An attested one is credited to that session and voids nothing; one that
+/// fails, or whose session has no transcript on this machine, is a side door.
+/// So a filing never waits on a session that went quiet. Returns how many it
+/// recorded.
+pub fn record_foreign_write_verifications(store: &mut EventStore, session: &str) -> usize {
+    record_foreign_write_verifications_in(store, session, transcripts_root().as_deref())
+}
+
+/// `record_foreign_write_verifications` against the transcripts under `root`.
+pub fn record_foreign_write_verifications_in(store: &mut EventStore, session: &str, root: Option<&Path>) -> usize {
+    let Some(root) = root else { return 0 };
+    let now = crate::time::now_unix();
+    let mut writers: std::collections::BTreeMap<String, Vec<(String, i64)>> = std::collections::BTreeMap::new();
+    for start in model::store::evaluation_starts_of_session(store, session) {
+        if !model::store::evaluation_still_open(store, &start, now) {
+            continue;
+        }
+        for (id, seq, writer) in model::store::frozen_writes_in_window(store, &start, None).foreign_pending {
+            writers.entry(writer).or_default().push((id, seq));
+        }
+    }
+    let mut recorded = 0;
+    for (writer, writes) in writers {
+        if session_transcripts(root, &writer).is_empty() {
+            for (id, seq) in writes {
+                let why = format!("no transcript of session {writer} is on this machine, so its call cannot be checked");
+                let written = model::store::record_write_verification_by(
+                    store,
+                    session,
+                    &writer,
+                    SystemActor::new(ATTESTER_ACTOR),
+                    &id,
+                    seq,
+                    false,
+                    None,
+                    &why,
+                );
+                if matches!(written, Ok(Some(_))) {
+                    recorded += 1;
+                }
+            }
+            continue;
+        }
+        recorded += record_writes_of(store, &writer, session, Some(root));
+    }
+    recorded
+}
+
+/// Verify every unverified write of `session` against its transcripts under
+/// `root`, recording each verdict under `recorder`'s name.
+fn record_writes_of(store: &mut EventStore, session: &str, recorder: &str, root: Option<&Path>) -> usize {
     if session.is_empty() {
         return 0;
     }
@@ -903,8 +962,9 @@ pub fn record_write_verifications_in(store: &mut EventStore, session: &str, root
             }
             WriteAttestation::Unattested(why) => (false, None, why),
         };
-        let written = model::store::record_write_verification(
+        let written = model::store::record_write_verification_by(
             store,
+            recorder,
             session,
             SystemActor::new(ATTESTER_ACTOR),
             &event.entity_id,
@@ -1466,6 +1526,22 @@ pub mod fixture {
         let batch = live.owed_now.iter().map(|(id, _)| id.clone()).collect();
         model::store::record_evaluation_batch(store, actor(), &start, "fixture start note, decided", batch, live.owed_later.len(), vec![], machine)
             .expect("fixture batch record")
+    }
+
+    /// Close every other session's open evaluation of `project` as
+    /// superseded by `session`, the way a start finds one whose session went
+    /// quiet (step 24: one project runs one evaluation at a time) - for a
+    /// fixture about what one start leaves the next, not about two at once.
+    pub fn supersede_others(store: &mut EventStore, session: &str, project: &str) {
+        let now = crate::time::now_unix();
+        for other in model::store::open_evaluation_starts_of_project(store, project, now) {
+            if other.frozen.session == session {
+                continue;
+            }
+            let superseded = model::store::FrozenSuperseded { by_session: session.to_string(), at_seq: 0, idle_minutes: None };
+            let actor = SystemActor::new(model::store::EVAL_MACHINE_ACTOR);
+            model::store::record_evaluation_superseded(store, actor, &other, &superseded).expect("fixture: superseded");
+        }
     }
 
     /// Record every write of `session` that has no recorded verification yet

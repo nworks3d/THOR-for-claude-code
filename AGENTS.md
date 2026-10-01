@@ -374,9 +374,12 @@ when all of this holds:
   never held.
 
 It follows the work, not the folder: a session that worked in project A and then
-moved to another folder is still asked about A, and the message says so. If
-another session is already running that project's evaluation (started less than
-an hour ago, still busy), you get one line saying so and are not held. A project
+moved to another folder is still asked about A, and the message says so. One
+project runs one evaluation at a time: if another session is already running
+that project's evaluation and was active in the last 30 minutes, you get one
+line naming that session and are not held, and no second evaluation starts.
+Once that session has been quiet longer, the next ask takes the evaluation over;
+the old one is closed as superseded, and its verdicts stay. A project
 worked in during the last 7 days with no evaluation that counts in 7 days is
 asked about whatever the clock says - the weekly floor, so that an edited clock
 file can delay the question but never cancel it. A folder that belongs to no

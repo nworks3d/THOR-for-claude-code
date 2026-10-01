@@ -10,7 +10,7 @@
 use crate::gate::{self, Refusal};
 use crate::item::{Binding, Check, Item, Kind, Severity};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use thor_core::cas::compute_head_sets;
 use thor_core::event_store::{Event, EventKind, EventStore};
@@ -936,9 +936,11 @@ pub fn revise<'a>(
     teeth_tag_ground(Some(&existing), &updated, None).map_err(WriteError::Refused)?;
     // The same capacity refusal `declare` makes. Without this the gate was
     // one door wide: declare refused an item that could never be shown, and
-    // revise walked the identical binding in through the back.
+    // revise walked the identical binding in through the back. Judged as
+    // `capacity_for_revise` judges it (step 24): an item that keeps every
+    // binding it stands on is answered by its own servings first.
     if let Capacity::DeadOnArrival(refusal) | Capacity::Full(refusal) =
-        capacity(store, &updated).map_err(WriteError::Store)?
+        capacity_for_revise(store, &existing, &updated, &crate::served::now_iso8601()).map_err(WriteError::Store)?
     {
         return Err(WriteError::Refused(refusal));
     }
@@ -1058,8 +1060,11 @@ pub fn revise_tried_scoped<'a>(
     gate::a4_ground(Some(&before), &updated, None).map_err(WriteError::Refused)?;
     old_stock_ground(Some(actor), trial).map_err(WriteError::Refused)?;
     teeth_tag_ground(Some(&before), &updated, trial).map_err(WriteError::Refused)?;
+    // Judged as `capacity_for_revise` judges it (step 24): an item that keeps
+    // every binding it stands on is answered by its own servings first, the
+    // same rule the reply's note and THOR's own retest use.
     if let Capacity::DeadOnArrival(refusal) | Capacity::Full(refusal) =
-        capacity(store, &updated).map_err(WriteError::Store)?
+        capacity_for_revise(store, &before, &updated, &crate::served::now_iso8601()).map_err(WriteError::Store)?
     {
         return Err(WriteError::Refused(refusal));
     }
@@ -1391,6 +1396,15 @@ pub struct TrialFields {
     /// as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub a4_old_stock: Option<OldContainsStock>,
+    /// Set when a revise kept the rule's check although its bindings never
+    /// reach a write to the file it reads (step 24): a text revise never
+    /// clears a check as a side effect. Says what is still missing (the
+    /// binding, or the owner's decision when that place is full), and keeps
+    /// the verdict undecided until a later trial finds the check reaching.
+    /// Left out of the JSON when absent, so every other record reads and
+    /// writes exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unreached: Option<String>,
 }
 
 /// THE Q24 EXEMPTION, in one value: an OLD contains check - one that stood on
@@ -1652,6 +1666,9 @@ fn verdict_and_record(store: &EventStore, id: &str) -> VerdictRead {
     if fields.fingerprint != fingerprint(&item) {
         let why = changed_since_trial(carrier, &item);
         return undecided(why, item);
+    }
+    if let Some(why) = &fields.unreached {
+        return undecided(why.clone(), item);
     }
     if !fields.a4.is_empty() && !old_stock_stands(store, &events, carrier, &item, fields) {
         let list = fields.a4.iter().map(|l| format!("'{}'", gate::shown_literal(l))).collect::<Vec<_>>().join(", ");
@@ -2437,6 +2454,28 @@ pub fn capacity_for_revise(
     if existing.bindings != updated.bindings {
         return Ok(cap);
     }
+    // THE SAME RULE FOR "CAN NEVER REACH A BLOCK" (step 24). The estimate
+    // said an item standing on dashboard.html was held by 6 heavier rivals
+    // and "can never reach a block", while the log showed it served 1028
+    // times in 30 days, 432 of them at that very file. For an item that
+    // already stands on every binding it keeps, the log's servings answer
+    // both estimates the same way: shown, so not crowded out.
+    if let Capacity::DeadOnArrival(_) = &cap {
+        let served = crate::served::served_count(store, &updated.id, now, crate::served::SERVED_WINDOW_DAYS);
+        if served == 0 {
+            return Ok(cap);
+        }
+        let place = updated
+            .bindings
+            .iter()
+            .find(|b| !matches!(b, Binding::Always))
+            .map(describe)
+            .unwrap_or_else(|| "its bindings".to_string());
+        return Ok(Capacity::Crowded(format!(
+            "shown {served} time(s) in the last {} days at {place} - not crowded out",
+            crate::served::SERVED_WINDOW_DAYS
+        )));
+    }
     // The one note this function knows how to measure is the per-binding
     // one `crowded_binding_note` builds (`Capacity::Crowded`). The
     // all-directory note `capacity` returns unconditionally, before ever
@@ -3146,6 +3185,25 @@ pub fn record_write_verification(
     agent_id: Option<&str>,
     why: &str,
 ) -> Result<Option<Event>, WriteError> {
+    record_write_verification_by(store, session_id, session_id, actor, entity_id, event_seq, attested, agent_id, why)
+}
+
+/// `record_write_verification`, recorded at the Stop of ANOTHER session
+/// (`recorder`, step 24): the verdict names the write's own session in its
+/// body, while the event itself is stamped with the recording session - so a
+/// session that checks another's writes never makes that one look active.
+#[allow(clippy::too_many_arguments)]
+pub fn record_write_verification_by(
+    store: &mut EventStore,
+    recorder: &str,
+    session_id: &str,
+    actor: SystemActor,
+    entity_id: &str,
+    event_seq: i64,
+    attested: bool,
+    agent_id: Option<&str>,
+    why: &str,
+) -> Result<Option<Event>, WriteError> {
     if actor.name() != ATTESTER_ACTOR {
         return Err(WriteError::Refused(Refusal {
             problem: format!("a write's verification is recorded by THOR's attester only, not by '{}'", actor.name()),
@@ -3166,7 +3224,7 @@ pub fn record_write_verification(
     })
     .to_string();
     store
-        .append_event(session_id, session_id, name, EventKind::GateStoodAside, entity_id, None, &body)
+        .append_event(recorder, recorder, name, EventKind::GateStoodAside, entity_id, None, &body)
         .map(Some)
         .map_err(|e| WriteError::Store(e.into()))
 }
@@ -3601,6 +3659,11 @@ pub fn no_open_evaluation_refusal(store: &EventStore, session: &str, project: &s
                 "its last one, '{}', is void: '{}' was changed at log seq {} outside an attested THOR call of it ({})",
                 start.id, void.id, void.seq, void.door
             ),
+            None if start.frozen.is_superseded() => format!(
+                "its last one, '{}', was superseded: {}",
+                start.id,
+                start.frozen.superseded.as_ref().map(superseded_words).unwrap_or_default()
+            ),
             None if own_report_filed(store, &start) => format!("its last one, '{}', already has its report on file", start.id),
             None => format!("its last one, '{}', is older than {EVALUATION_OPEN_HOURS} hours and closed", start.id),
         },
@@ -3680,6 +3743,16 @@ pub enum WriteDoor {
     /// Stamped as a THOR call of the evaluating session and not verified yet:
     /// the session's next Stop records it.
     Pending,
+    /// Recorded as an attested THOR call of ANOTHER session (step 24). Never a
+    /// side door: it voids nothing, and an item it changed on an evaluation's
+    /// lists counts as settled by that session (credited to it in the machine
+    /// section). Field case 2026-10-01: two sessions evaluated one project at
+    /// once, and the first one's attested edits voided the other's evaluation.
+    OtherSession { session: String, agent_id: Option<String> },
+    /// Stamped as a THOR call of another session and not verified yet: the
+    /// evaluating session's next Stop checks it against that session's
+    /// transcript (`serve::attest::record_foreign_write_verifications`).
+    OtherSessionPending { session: String },
     /// Outside an attested THOR call of the evaluating session: the door.
     Outside(String),
 }
@@ -3694,7 +3767,7 @@ pub fn write_door(event: &Event, verdicts: &HashMap<i64, WriteVerdict>, session:
         return if verdict.attested && verdict.session == session {
             WriteDoor::Attested { agent_id: verdict.agent_id.clone() }
         } else if verdict.attested {
-            WriteDoor::Outside(format!("an attested THOR call of another session, {}", verdict.session))
+            WriteDoor::OtherSession { session: verdict.session.clone(), agent_id: verdict.agent_id.clone() }
         } else {
             WriteDoor::Outside(format!("not an attested THOR call: {}", verdict.why))
         };
@@ -3712,7 +3785,12 @@ pub fn write_door(event: &Event, verdicts: &HashMap<i64, WriteVerdict>, session:
         return WriteDoor::Outside("no toolUseId in the call's _meta".to_string());
     }
     if event.session_id != session {
-        return WriteDoor::Outside(format!("a THOR call of another session, {}", event.session_id));
+        // A stamp with no session of its own ("mcp" from a tool server with no
+        // session hint, "cli") can never be checked against a transcript.
+        if matches!(event.session_id.as_str(), "" | "mcp" | "cli") {
+            return WriteDoor::Outside(format!("a THOR call of another session, {}", event.session_id));
+        }
+        return WriteDoor::OtherSessionPending { session: event.session_id.clone() };
     }
     WriteDoor::Pending
 }
@@ -3748,6 +3826,14 @@ pub struct FrozenWrites {
     /// Made through a THOR call of the evaluating session that is not
     /// verified yet, as (id, log seq): they count once the turn has ended.
     pub pending: Vec<(String, i64)>,
+    /// Made through an attested THOR call of ANOTHER session, as (id, log
+    /// seq, that session), oldest first (step 24): never a void - the item
+    /// counts as settled by that session.
+    pub foreign: Vec<(String, i64, String)>,
+    /// Stamped as a THOR call of another session and not verified yet, as
+    /// (id, log seq, that session): the evaluating session's next Stop checks
+    /// each one. Neither a void nor a credit until then.
+    pub foreign_pending: Vec<(String, i64, String)>,
 }
 
 /// `FrozenWrites` of `start`. Reads each frozen id's own events (indexed),
@@ -3782,13 +3868,40 @@ pub fn frozen_writes_judged(
             match write_door(event, &verdicts, session) {
                 WriteDoor::Machine | WriteDoor::Attested { .. } => {}
                 WriteDoor::Pending => found.pending.push((id.clone(), event.seq)),
+                WriteDoor::OtherSession { session: other, .. } => found.foreign.push((id.clone(), event.seq, other)),
+                WriteDoor::OtherSessionPending { session: other } => {
+                    found.foreign_pending.push((id.clone(), event.seq, other))
+                }
                 WriteDoor::Outside(door) => found.outside.push(FrozenVoid { id: id.clone(), seq: event.seq, door }),
             }
         }
     }
     found.outside.sort_by_key(|w| w.seq);
     found.pending.sort_by_key(|(_, seq)| *seq);
+    found.foreign.sort_by_key(|(_, seq, _)| *seq);
+    found.foreign_pending.sort_by_key(|(_, seq, _)| *seq);
     found
+}
+
+/// The other session whose attested THOR call last changed `id` in `start`'s
+/// window, with that write's log seq - the session an item on the lists is
+/// credited to (step 24). `None` when no other session's attested write
+/// changed it, or when this session changed it again after that.
+pub fn credited_to_other_session(store: &EventStore, start: &EvaluationStart, id: &str) -> Option<(String, i64)> {
+    let events = store.get_events_by_entity(id).ok()?;
+    credited_in(&events, start.frozen.started_seq, &start.frozen.session)
+}
+
+/// `credited_to_other_session` over one entity's events (oldest first).
+fn credited_in(events: &[Event], started_seq: i64, session: &str) -> Option<(String, i64)> {
+    let verdicts = recorded_write_verdicts(events);
+    let last = events.iter().filter(|e| e.seq > started_seq && changes_an_item(e.kind)).filter(|e| {
+        !RESERVED_ACTORS.contains(&e.actor.as_str())
+    });
+    match last.last().map(|e| (e.seq, write_door(e, &verdicts, session))) {
+        Some((seq, WriteDoor::OtherSession { session: other, .. })) => Some((other, seq)),
+        _ => None,
+    }
 }
 
 /// The open evaluation of any session whose frozen lists hold `id` - for the
@@ -4027,7 +4140,134 @@ pub struct Frozen {
     /// it; the next start signal opens a fresh one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub void: Option<FrozenVoid>,
+    /// Set when the evaluation was closed as SUPERSEDED (step 24): another
+    /// session started the project's evaluation while this one's session had
+    /// been idle for `EVALUATION_IDLE_MINUTES` or more. Never a void: the work
+    /// it did stays on record, it is only no longer the one running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded: Option<FrozenSuperseded>,
+    /// Where each item on the judgement list fired in the evaluating session
+    /// before the start (step 24): how often, and its last few distinct
+    /// triggers - so a verdict rests on the place, not a guess. Field case
+    /// 2026-10-01: the start note said "`get` shows where it fired", `get`
+    /// showed no trigger at all, and one session judged 205 items in four
+    /// minutes without looking.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub fired: BTreeMap<String, Firings>,
 }
+
+/// How one item fired in one session (`Frozen::fired`, `session_firings`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Firings {
+    /// How many times it was served in the session.
+    pub count: usize,
+    /// Its last up to `FIRED_TRIGGERS` distinct triggers, newest first, each
+    /// at most `FIRED_TRIGGER_CHARS` characters, the part around the item's
+    /// own anchor when it names one.
+    #[serde(default)]
+    pub triggers: Vec<String>,
+}
+
+/// How many distinct triggers per item `session_firings` keeps.
+pub const FIRED_TRIGGERS: usize = 3;
+
+/// Above this many judgement items an evaluation keeps - and its start note
+/// shows - one place per item instead of `FIRED_TRIGGERS`, so the record and
+/// the note stay bounded; a list that long is mapped from the transcript
+/// anyway (the routine says how), and `get` with `fired` shows more.
+pub const FIRED_FULL_LIST_MAX: usize = 50;
+
+/// The longest trigger `session_firings` keeps, in characters.
+pub const FIRED_TRIGGER_CHARS: usize = 120;
+
+/// What a firing with no command or file of its own is shown as (a prompt,
+/// or a tool call the hook recorded no trigger for).
+pub const FIRED_WITHOUT_TRIGGER: &str = "(a prompt or a tool call with no command or file)";
+
+/// `trigger` cut to `FIRED_TRIGGER_CHARS` characters: the part around the
+/// first of `anchors` it names (slashes compared alike, case ignored), else
+/// its start.
+pub fn trigger_excerpt(trigger: &str, anchors: &[String]) -> String {
+    let chars: Vec<char> = trigger.chars().collect();
+    if chars.len() <= FIRED_TRIGGER_CHARS {
+        return trigger.to_string();
+    }
+    let folded: String = trigger.chars().map(|c| if c == '\\' { '/' } else { c.to_ascii_lowercase() }).collect();
+    let hit = anchors
+        .iter()
+        .map(|a| a.replace('\\', "/").to_ascii_lowercase())
+        .filter(|a| !a.is_empty())
+        .find_map(|a| folded.find(&a).map(|byte| (folded[..byte].chars().count(), a.chars().count())));
+    let start = match hit {
+        Some((at, len)) if at + len > FIRED_TRIGGER_CHARS => (at + len / 2).saturating_sub(FIRED_TRIGGER_CHARS / 2),
+        _ => 0,
+    };
+    let start = start.min(chars.len() - FIRED_TRIGGER_CHARS);
+    let cut: String = chars[start..start + FIRED_TRIGGER_CHARS].iter().collect();
+    match (start > 0, start + FIRED_TRIGGER_CHARS < chars.len()) {
+        (true, true) => format!("...{cut}..."),
+        (true, false) => format!("...{cut}"),
+        (false, true) => format!("{cut}..."),
+        (false, false) => cut,
+    }
+}
+
+/// How each of `ids` fired in `session` at or before log seq `until_seq`
+/// (`Frozen::fired`): one read of the session's served events. An id that
+/// never fired there is left out. Fails open to an empty map.
+pub fn session_firings(store: &EventStore, session: &str, ids: &[String], until_seq: i64) -> BTreeMap<String, Firings> {
+    let wanted: HashSet<&str> = ids.iter().map(String::as_str).collect();
+    let Ok(events) = store.events_of_kinds_in_session(&[EventKind::ItemServed], session) else { return BTreeMap::new() };
+    let mut out: BTreeMap<String, Firings> = BTreeMap::new();
+    let mut anchors: HashMap<String, Vec<String>> = HashMap::new();
+    for event in events.iter().rev().filter(|e| e.seq <= until_seq && wanted.contains(e.entity_id.as_str())) {
+        let anchor = anchors.entry(event.entity_id.clone()).or_insert_with(|| {
+            show(store, &event.entity_id)
+                .map(|item| {
+                    item.bindings
+                        .iter()
+                        .filter_map(|b| match b {
+                            Binding::Target { value, .. } => Some(value.clone()),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+        let trigger = serde_json::from_str::<crate::served::ItemServed>(&event.body).ok().and_then(|b| b.trigger);
+        let shown = match trigger.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+            Some(t) => trigger_excerpt(t, anchor),
+            None => FIRED_WITHOUT_TRIGGER.to_string(),
+        };
+        let entry = out.entry(event.entity_id.clone()).or_default();
+        entry.count += 1;
+        if entry.triggers.len() < FIRED_TRIGGERS && !entry.triggers.contains(&shown) {
+            entry.triggers.push(shown);
+        }
+    }
+    out
+}
+
+/// How an evaluation was closed as superseded (`Frozen::superseded`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrozenSuperseded {
+    /// The session whose start closed it.
+    pub by_session: String,
+    /// The log's tip when it was closed.
+    pub at_seq: i64,
+    /// How many minutes its session had shown no activity on the log when it
+    /// was closed - at least this many; `None` when none was found at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_minutes: Option<i64>,
+}
+
+/// One project has at most one evaluation running (step 24): another
+/// session's open evaluation of it holds a new start off while that session
+/// showed activity on the log within this many minutes, and is superseded
+/// once it has been idle longer. Measured 2026-10-01: two sessions evaluated
+/// one project at once, with overlapping frozen lists, and destroyed each
+/// other's evaluation.
+pub const EVALUATION_IDLE_MINUTES: i64 = 30;
 
 impl Frozen {
     /// Whether THOR's machine pass has finished: the batch record is written.
@@ -4048,6 +4288,11 @@ impl Frozen {
     /// Whether the evaluation was closed as void (`Frozen::void`).
     pub fn is_void(&self) -> bool {
         self.void.is_some()
+    }
+
+    /// Whether the evaluation was closed as superseded (`Frozen::superseded`).
+    pub fn is_superseded(&self) -> bool {
+        self.superseded.is_some()
     }
 }
 
@@ -4161,6 +4406,16 @@ pub fn frozen_now(store: &EventStore, session: &str, project: &str, started_by: 
             .collect(),
         machine: None,
         void: None,
+        superseded: None,
+        fired: BTreeMap::new(),
+    })
+    .map(|mut frozen| {
+        let mut fired = session_firings(store, session, &frozen.judgement, started_seq);
+        if frozen.judgement.len() > FIRED_FULL_LIST_MAX {
+            fired.values_mut().for_each(|f| f.triggers.truncate(1));
+        }
+        frozen.fired = fired;
+        frozen
     })
 }
 
@@ -4235,10 +4490,10 @@ pub fn record_evaluation_batch(
             fix: "read the start record back (open_evaluation_start): an evaluation's lists are written once".to_string(),
         }));
     }
-    if current.frozen.is_void() {
+    if current.frozen.is_void() || current.frozen.is_superseded() {
         return Err(WriteError::Refused(Refusal {
-            problem: format!("'{}' is void: an item on its lists was changed behind it", start.id),
-            fix: "start a fresh evaluation (serve::eval_session::start): a void one is never decided".to_string(),
+            problem: format!("'{}' is closed (void or superseded): it is no longer the evaluation running", start.id),
+            fix: "start a fresh evaluation (serve::eval_session::start): a closed one is never decided".to_string(),
         }));
     }
     let mut item = show(store, &start.id).map_err(|e| WriteError::Store(anyhow::anyhow!("{e}")))?;
@@ -4292,6 +4547,59 @@ pub fn record_evaluation_void(
         .append_mutate_checked(&frozen.session, &frozen.session, name, EventKind::FactRevised, &start.id, None, &body)
         .map_err(WriteError::Store)?;
     Ok(EvaluationStart { frozen, ..current })
+}
+
+/// Close the evaluation `start` records as SUPERSEDED (step 24): ONE more
+/// `fact_revised` by `eval-machine` on the start record, whose frozen lists
+/// carry `superseded` and whose text says so. Called when another session
+/// starts the project's evaluation while this one's session has been idle for
+/// `EVALUATION_IDLE_MINUTES` or more. Never a void: its verdicts and edits
+/// stay on record. A record already closed (void or superseded) is returned
+/// as it is.
+pub fn record_evaluation_superseded(
+    store: &mut EventStore,
+    actor: SystemActor,
+    start: &EvaluationStart,
+    superseded: &FrozenSuperseded,
+) -> Result<EvaluationStart, WriteError> {
+    if actor.name() != EVAL_MACHINE_ACTOR {
+        return Err(WriteError::Refused(Refusal {
+            problem: format!("an evaluation is closed as superseded by THOR's eval-machine only, not by '{}'", actor.name()),
+            fix: "let the hook close it (serve::eval_session::start)".to_string(),
+        }));
+    }
+    let name = fence(store, actor.into(), &start.id)?;
+    let events = store.get_events_by_entity(&start.id).map_err(|e| WriteError::Store(e.into()))?;
+    let Some(current) = starts_in(&events).into_iter().next() else {
+        return Err(WriteError::Store(anyhow::anyhow!("'{}' is not an evaluation start record on this log", start.id)));
+    };
+    if current.frozen.is_void() || current.frozen.is_superseded() {
+        return Ok(current);
+    }
+    let mut item = show(store, &start.id).map_err(|e| WriteError::Store(anyhow::anyhow!("{e}")))?;
+    item.text = format!("{}\n\n[THOR] THIS EVALUATION WAS SUPERSEDED: {}.", item.text, superseded_words(superseded));
+    let mut frozen = current.frozen.clone();
+    frozen.superseded = Some(superseded.clone());
+    let body = canonical_body(&normalized(&item)).map_err(WriteError::Serialize)?;
+    let body = body_with_frozen(&body, &frozen).map_err(WriteError::Serialize)?;
+    store
+        .append_mutate_checked(&frozen.session, &frozen.session, name, EventKind::FactRevised, &start.id, None, &body)
+        .map_err(WriteError::Store)?;
+    Ok(EvaluationStart { frozen, ..current })
+}
+
+/// Why an evaluation was superseded, in one plain clause.
+pub fn superseded_words(superseded: &FrozenSuperseded) -> String {
+    let idle = match superseded.idle_minutes {
+        Some(minutes) => format!("{minutes} minute(s)"),
+        None => format!("more than {EVALUATION_IDLE_MINUTES} minutes"),
+    };
+    format!(
+        "session {} started this project's evaluation at log seq {} after this evaluation's session had shown no \
+         activity for {idle} - one project runs one evaluation at a time. Its verdicts and edits stay on record; only \
+         its report can no longer be filed",
+        superseded.by_session, superseded.at_seq
+    )
 }
 
 /// The newest evaluation start of `project` written before log seq
@@ -4383,7 +4691,7 @@ pub fn evaluation_open_in_session_at(store: &EventStore, session: &str, seq: i64
                 && e.kind == EventKind::FactRevised
                 && e.actor == EVAL_MACHINE_ACTOR
                 && e.seq < seq
-                && frozen_of(&e.body).is_some_and(|f| f.is_void())
+                && frozen_of(&e.body).is_some_and(|f| f.is_void() || f.is_superseded())
         });
         if voided_before {
             return false;
@@ -4410,6 +4718,7 @@ fn is_evaluation_report_of(item: &Item, project: &str) -> bool {
 /// younger than `EVALUATION_OPEN_HOURS`, and its own report not filed yet.
 pub fn evaluation_still_open(store: &EventStore, start: &EvaluationStart, now_unix: i64) -> bool {
     !start.frozen.is_void()
+        && !start.frozen.is_superseded()
         && now_unix - start.frozen.started_unix <= EVALUATION_OPEN_HOURS * 3600
         && !own_report_filed(store, start)
 }
@@ -4493,6 +4802,10 @@ pub struct EvaluationJudgement {
     /// THOR call of the evaluating session that is not verified yet, as
     /// (id, log seq of that write). They settle once the turn has ended.
     pub unverified: Vec<(String, i64)>,
+    /// Of the settled ones: changed in the window by an attested THOR call of
+    /// ANOTHER session (step 24), as (id, that session) - settled by that
+    /// session, credited to it, and no longer this evaluation's to settle.
+    pub credited: Vec<(String, String)>,
 }
 
 /// The judgement list of an evaluation of `project` by `session` starting at
@@ -4622,6 +4935,9 @@ pub fn evaluation_judgement_owed(store: &EventStore, start: &EvaluationStart, re
                 .max_by_key(|e| e.seq);
             if last_write.is_some_and(|e| attested_for_session(&verified, e.seq, session)) {
                 result.settled.push(id);
+            } else if let Some((other, _)) = credited_in(&events, started_seq, session) {
+                result.credited.push((id.clone(), other));
+                result.settled.push(id);
             } else if not_judgeable_reason(report_tags, &id).is_some() {
                 result.skipped.push(id);
             } else {
@@ -4643,6 +4959,12 @@ pub fn evaluation_judgement_owed(store: &EventStore, start: &EvaluationStart, re
             .collect();
         let judged = marks.iter().any(|e| attested_for_session(&verified, e.seq, session));
         if judged {
+            result.settled.push(id);
+        } else if let Some((other, _)) = credited_in(&events, started_seq, session) {
+            // Changed by another session's attested THOR call (step 24): the
+            // item this session saw fire is not the item that stands now, so
+            // it is that session's, never a void of this evaluation.
+            result.credited.push((id.clone(), other));
             result.settled.push(id);
         } else if not_judgeable_reason(report_tags, &id).is_some() {
             result.skipped.push(id);
@@ -4970,6 +5292,9 @@ pub fn evaluation_frozen_batch_owed(store: &EventStore, start: &EvaluationStart)
         .batch()
         .iter()
         .chain(start.frozen.a4_list())
+        // Changed by another session's attested THOR call (step 24): settled
+        // by that session and credited to it, never this evaluation's.
+        .filter(|id| credited_to_other_session(store, start, id).is_none())
         .filter_map(|id| match settlement(store, id, Some(start)) {
             Settlement::Owed { why } => Some((id.clone(), why)),
             Settlement::Settled(_) => None,
@@ -5111,6 +5436,23 @@ fn check_evaluation_report_filing(store: &EventStore, item: &Item, ctx: Option<&
             unverified.join(", ")
         ));
     }
+    // WRITES OF ANOTHER SESSION (step 24): an attested one is credited to
+    // that session and voids nothing; one not checked yet is checked against
+    // that session's transcript at THIS session's next Stop.
+    if !written.foreign_pending.is_empty() {
+        let named = written
+            .foreign_pending
+            .iter()
+            .map(|(id, seq, other)| format!("'{id}' (written at log seq {seq} by session {other})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        missing.push(format!(
+            "{} write(s) by another session on this evaluation's lists are not checked yet: {named}. THOR checks each \
+             one against that session's transcript at this session's next Stop: end the turn once, then file again - \
+             an attested one counts as settled by that session, never as a void of this evaluation",
+            written.foreign_pending.len()
+        ));
+    }
 
     if missing.is_empty() {
         return None;
@@ -5249,6 +5591,9 @@ pub struct MachineSummary {
     pub unverified: usize,
     /// Rules whose check an agent cleared, moved or changed in the window.
     pub checks_weakened: usize,
+    /// Judgement items another session's attested THOR call changed in the
+    /// window: settled by that session, credited to it (step 24).
+    pub credited: usize,
 }
 
 /// One line of machine-section text out of words some writer chose (an id, a
@@ -5288,6 +5633,12 @@ fn door_words(door: &WriteDoor) -> String {
         WriteDoor::Machine => "THOR itself".to_string(),
         WriteDoor::Attested { agent_id } => format!("an attested THOR call of {}", by_whom(agent_id)),
         WriteDoor::Pending => "a THOR call of this session, checked at the end of this turn".to_string(),
+        WriteDoor::OtherSession { session, .. } => {
+            format!("an attested THOR call of another session, {} (credited to that session)", plain(session))
+        }
+        WriteDoor::OtherSessionPending { session } => {
+            format!("a THOR call of another session, {}, not checked yet", plain(session))
+        }
         WriteDoor::Outside(door) => plain(door),
     }
 }
@@ -5447,7 +5798,15 @@ fn machine_section(store: &EventStore, start: &EvaluationStart, filed_seq: i64) 
                 _ => None,
             })
             .next_back();
-        let line = if let Some((event, agent_id)) = mark {
+        let credited = if mark.is_none() { credited_in(&events, n, session) } else { None };
+        let line = if let Some((other, seq)) = credited {
+            summary.credited += 1;
+            format!(
+                "settled by session {} - an attested THOR call of that session changed it at log seq {seq} (credited to \
+                 that session; not this evaluation's to judge)",
+                plain(&other)
+            )
+        } else if let Some((event, agent_id)) = mark {
             let word = if event.kind == EventKind::ItemMarkedUseful {
                 summary.useful += 1;
                 "useful"
@@ -5491,8 +5850,12 @@ fn machine_section(store: &EventStore, start: &EvaluationStart, filed_seq: i64) 
         0 => "no verdict was given".to_string(),
         given => format!("{}% useful of {given} verdict(s)", (summary.useful * 100 + given / 2) / given),
     };
+    let credited = match summary.credited {
+        0 => String::new(),
+        n => format!(", {n} settled by another session's attested call"),
+    };
     out.push_str(&format!(
-        "\ntotals: {} useful, {} noise, {} skipped, {} retracted or taken off the rule track, {} pinned; {share}.",
+        "\ntotals: {} useful, {} noise, {} skipped, {} retracted or taken off the rule track, {} pinned{credited}; {share}.",
         summary.useful, summary.noise, summary.skipped, summary.gone, summary.pinned
     ));
 
@@ -7465,6 +7828,35 @@ mod tests {
                 assert!(!note.contains("may well never be shown"), "the measured line replaces the guess: {note}");
             }
             other => panic!("expected a measured Crowded note, got {other:?}"),
+        }
+    }
+
+    /// FIELD DEFECT 6 (2026-10-01): THOR's machine pass said a rule standing on
+    /// dashboard.html "can never reach a block" (6 heavier rivals) while the
+    /// revise reply said "shown 1028 time(s) ... not crowded out" - the log
+    /// showed 432 servings at that very file. One rule now: an item that keeps
+    /// every binding it stands on is answered by its servings, for the
+    /// dead-on-arrival estimate exactly as for the crowded one.
+    #[test]
+    fn capacity_for_revise_answers_a_dead_on_arrival_estimate_by_servings() {
+        let mut store = EventStore::in_memory().unwrap();
+        let path = "server/public/dashboard.html";
+        let mine = path_bound("light", 0, path, Some(Severity::HouseStyle));
+        seed_live(&mut store, &mine);
+        for i in 0..crate::item::MAX_ITEMS + 2 {
+            seed_live(&mut store, &path_bound(&format!("heavy-{i}"), i + 1, path, Some(Severity::Irreversible)));
+        }
+        let mut updated = mine.clone();
+        updated.text = format!("{} Reworded.", mine.text);
+        assert!(matches!(capacity(&store, &updated).unwrap(), Capacity::DeadOnArrival(_)), "fixture: the estimate says hopeless");
+        assert!(
+            matches!(capacity_for_revise(&store, &mine, &updated, NOW).unwrap(), Capacity::DeadOnArrival(_)),
+            "never served: the estimate stands"
+        );
+        seed_served(&mut store, &mine.id, RECENTLY);
+        match capacity_for_revise(&store, &mine, &updated, NOW).unwrap() {
+            Capacity::Crowded(note) => assert!(note.contains("shown 1 time(s)") && note.contains("not crowded out"), "{note}"),
+            other => panic!("served at its own binding, so never 'can never reach a block': {other:?}"),
         }
     }
 
@@ -10706,6 +11098,7 @@ mod tests {
             parent_rev: None,
             file_blob: None,
             a4_old_stock: None,
+            unreached: None,
         }
     }
 

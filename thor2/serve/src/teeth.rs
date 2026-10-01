@@ -1060,6 +1060,10 @@ struct Work<'a> {
     /// hook's pipeline refuses its forbidden form and lets every clean form
     /// through - so ONLY the naming is missing (K23).
     a4_only: bool,
+    /// At a write: the check was KEPT although the rule's bindings never
+    /// reach a write to its file (step 24) - what is still missing, recorded
+    /// so the verdict stays undecided (`TrialFields::unreached`).
+    unreached: Option<String>,
 }
 
 fn attempts_of(tried: &Tried, what: &str) -> Vec<TrialAttempt> {
@@ -1515,7 +1519,42 @@ impl<'a> Work<'a> {
                         };
                     }
                 }
+                // A contains or absent check the rule is not anchored to, whose
+                // anchor is full (step 24): naming its literal would never be
+                // enough, and the one other fix is the owner's.
+                if let (Some(check), Some(root)) = (&w, &root_ok) {
+                    if !matches!(check, Check::PathExists { .. }) && self.binding_alone_would_reach(check, root) {
+                        if let Some(blocker) = self.full_file_anchor(check, root) {
+                            let path = check_path(check).unwrap_or_default();
+                            return Decision::Refuse {
+                                code: RefuseCode::A4,
+                                message: format!(
+                                    "blocked: {path} is already full of other facts, so the rule cannot be anchored to it \
+                                     - it keeps its true check and is counted apart; the owner decides which fact gives way"
+                                ),
+                                retest: RetestAs::Blocked(blocker),
+                            };
+                        }
+                    }
+                }
                 self.a4_only = self.bites_but_for_the_naming(root_ok.as_deref());
+                if !self.a4_only {
+                    if let (Some(check), Some(root)) = (&w, &root_ok) {
+                        if self.binding_alone_would_reach(check, root) {
+                            let path = check_path(check).unwrap_or_default();
+                            if let Decision::Refuse { code, message, retest } = self.a4_refusal() {
+                                return Decision::Refuse {
+                                    code,
+                                    message: format!(
+                                        "{message} - and its bindings never reach a write to {path}: bind it to path:{path} \
+                                         too, or naming the literal alone keeps the check undecided"
+                                    ),
+                                    retest,
+                                };
+                            }
+                        }
+                    }
+                }
             }
             return self.a4_refusal();
         }
@@ -1723,13 +1762,34 @@ impl<'a> Work<'a> {
             } else {
                 format!("it refuses {}, which a check must let through", self.clean_failed.iter().map(|c| format!("'{c}'")).collect::<Vec<_>>().join(" and "))
             };
+            // A TEXT REVISE NEVER CLEARS A CHECK AS A SIDE EFFECT (step 24). The
+            // check is the one the rule already carried, it holds, and only its
+            // anchor keeps it from reaching a write: it is kept, the verdict
+            // stays undecided, and the rebind is named as a step of its own -
+            // or, when that place is full, left to the owner. Field case
+            // 2026-10-01: rewording two rules as the evaluation asked cleared
+            // their true contains checks, and the rebind was then refused.
+            if let Some(kept) = self.kept_unreached(check, &tried, &try_root) {
+                return kept;
+            }
             // At a retest, a file check that only lacks its anchor needs the
-            // agent: THOR can name the one binding that makes it bite.
+            // agent: THOR can name the one binding that makes it bite - or,
+            // when that place is full, the owner decides (step 24).
             if matches!(self.mode, Mode::Retest) && !tried.reaches() {
                 if let Some(path) = check_path(check).filter(|_| is_file_check(check)) {
                     let mut bound = item.clone();
                     bound.bindings.push(Binding::Target { kind: TargetKind::Path, value: path.to_string() });
                     if try_check(&bound, &try_root).bites() {
+                        if let Some(blocker) = self.full_file_anchor(check, &try_root) {
+                            return Decision::Refuse {
+                                code: RefuseCode::Untryable,
+                                message: format!(
+                                    "blocked: {path} is already full of other facts, so the rule cannot be anchored to it - \
+                                     it keeps its true check and is counted apart; the owner decides which fact gives way"
+                                ),
+                                retest: RetestAs::Blocked(blocker),
+                            };
+                        }
                         return Decision::Refuse {
                             code: RefuseCode::Forcing,
                             message: format!(
@@ -1852,6 +1912,7 @@ impl<'a> Work<'a> {
             parent_rev: self.write.parent_rev.clone(),
             file_blob: self.file_blob.clone(),
             a4_old_stock: if self.old_stock_granted { self.old_stock.clone() } else { None },
+            unreached: self.unreached.clone(),
         })
     }
 
@@ -1898,6 +1959,75 @@ impl<'a> Work<'a> {
             command_root(self.env.store, item.project.as_deref())
         };
         try_check(item, &try_root).bites()
+    }
+
+    /// The place a file check reads, as an anchor this rule cannot take
+    /// because it is full (`model::checkout::crowded_file_anchor`) - `None`
+    /// for a path_exists check (its own rule, `crowded_path_anchor`), or when
+    /// the rule is anchored there already or the place has room.
+    fn full_file_anchor(&self, check: &Check, root: &Path) -> Option<Blocker> {
+        match check {
+            Check::Contains { path, .. } | Check::Absent { path, .. } | Check::AbsentAll { path, .. } => {
+                model::checkout::crowded_file_anchor(self.env.store, self.item(), root, path)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether a contains or absent check that does not reach a write today
+    /// would bite once the rule is anchored to its file - the one binding
+    /// that is missing.
+    fn binding_alone_would_reach(&self, check: &Check, root: &Path) -> bool {
+        let Some(path) = check_path(check).filter(|_| is_file_check(check) && !matches!(check, Check::PathExists { .. })) else {
+            return false;
+        };
+        let item = self.item();
+        if model::checkout::binds_the_file(item, path) || truth(check, root).is_err() {
+            return false;
+        }
+        let mut bound = item.clone();
+        bound.bindings.push(Binding::Target { kind: TargetKind::Path, value: path.to_string() });
+        try_check(&bound, root).bites()
+    }
+
+    /// STEP 24's keep: at a write that leaves the rule's check exactly as it
+    /// was, a check that holds but does not reach from the rule's bindings is
+    /// kept, with the verdict undecided and the rebind named as its own step
+    /// (or the owner's decision, when that place is full). `None` for every
+    /// other case: the trial goes on as before.
+    fn kept_unreached(&mut self, check: &Check, tried: &Tried, root: &Path) -> Option<Decision> {
+        let file_check = is_file_check(check) && !matches!(check, Check::PathExists { .. });
+        if !matches!(self.mode, Mode::Write) || tried.reaches() || !file_check {
+            return None;
+        }
+        let before = self.write.before?;
+        if before.check.as_ref() != Some(check) {
+            return None;
+        }
+        let path = check_path(check)?.to_string();
+        let item = self.item();
+        let mut bound = item.clone();
+        bound.bindings.push(Binding::Target { kind: TargetKind::Path, value: path.clone() });
+        if !try_check(&bound, root).bites() {
+            return None;
+        }
+        let kept = format!("its check ({}) is kept: it holds", describe(check, &item.bindings));
+        let why = match self.full_file_anchor(check, root) {
+            None => format!(
+                "{kept}, but this rule's bindings never reach a write to {path}, and a text revise never clears a check. \
+                 The rebind is a step of its own: mcp__thor__revise(id: \"{}\", bindings: <its bindings plus \
+                 {{\"target\": {{\"kind\": \"path\", \"value\": \"{path}\"}}}}>) - THOR then tries it as a rule",
+                item.id
+            ),
+            Some(_) => format!(
+                "{kept}, but this rule's bindings never reach a write to {path}, and {path} is already full of other facts, \
+                 so it cannot be anchored there. Nothing more to do from a session: THOR's own open point holds it at the \
+                 next evaluation start, and the owner decides which fact gives way"
+            ),
+        };
+        self.unreached = Some(why.clone());
+        self.receipt.insert(0, format!("teeth: undecided - {why}"));
+        Some(Decision::Undecided { why })
     }
 
     /// Old contains stock that does not bite (Q24): no exemption, so A4
@@ -2006,6 +2136,7 @@ fn new_work<'a>(
         old_stock: None,
         old_stock_granted: false,
         a4_only: false,
+        unreached: None,
     }
 }
 
@@ -2258,7 +2389,11 @@ pub fn apply(store: &mut EventStore, retest: &Retest, actor: SystemActor) -> Res
             retest.id
         )));
     }
-    if let Ok(model::store::Capacity::DeadOnArrival(r) | model::store::Capacity::Full(r)) = model::store::capacity(store, stored) {
+    // Judged as a revise is (step 24, `capacity_for_revise`): a rule that keeps
+    // every binding it stands on is answered by its own servings first, so the
+    // machine pass and the revise reply can never disagree about one place.
+    let measured = model::store::capacity_for_revise(store, &now, stored, &crate::time::now_iso8601());
+    if let Ok(model::store::Capacity::DeadOnArrival(r) | model::store::Capacity::Full(r)) = measured {
         let at = stored
             .bindings
             .iter()

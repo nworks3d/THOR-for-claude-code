@@ -130,6 +130,54 @@ fn invalid_why(validation: Validation) -> String {
 
 // ------------------------------------------------------------- (1) attestation
 
+/// FIELD DEFECT 3 (2026-10-01): a report filed through the THOR tool itself,
+/// before the build that checks filings was installed, was described as
+/// "written by another program (the command line, a repair tool or an older
+/// build)". The rule stands - it does not count - but the words say what
+/// happened: filed before THOR 2.5 checked filings. A report written past the
+/// tools AFTER checked filings began keeps the other wording.
+#[test]
+fn a_report_filed_before_checks_began_says_so_plainly() {
+    let mut fx = Fx::new();
+    crate::attest::fixture::quiet_start(&mut fx.store, S1, "fxp");
+    let early = report("eval-fxp-2026-09-30", "fxp", "TLDR: filed through the tool, before filings were checked.");
+    fx.raw(S1, EventKind::FactCreated, &early, None);
+    // Checked filings begin: the first write THOR's attester verifies.
+    let checked = rule("checked-rule", "Run the demo linter before `demo-release`.", vec![Binding::Target { kind: TargetKind::Command, value: "demo-release".to_string() }], None, "fxp");
+    fx.raw(S2, EventKind::FactCreated, &checked, None);
+    crate::attest::fixture::attest_every_write(&mut fx.store, S2);
+    let why = invalid_why(validate(&fx.store, &early.id, Some(&fx.root())));
+    assert!(why.contains("filed before THOR 2.5 checked filings; does not count after the upgrade"), "{why}");
+    assert!(!why.contains("written by another program"), "{why}");
+
+    let late = report("eval-fxp-2026-10-01", "fxp", "TLDR: written past the tools after checks began.");
+    fx.raw(S1, EventKind::FactCreated, &late, None);
+    let why = invalid_why(validate(&fx.store, &late.id, Some(&fx.root())));
+    assert!(why.contains("written by another program") && !why.contains("filed before THOR 2.5"), "{why}");
+
+    // A record written by the build before this one keeps its words on the
+    // log; every reader shows today's.
+    let mut old_record = EvaluationValidation {
+        valid: false,
+        why: format!("{NOT_ATTESTED} (it carries no stamp of THOR's tool server - it was written by another program (the command line, a repair tool or an older build))"),
+        drift: false,
+        report: early.id.clone(),
+        report_seq: 1,
+        project: Some("fxp".to_string()),
+        session: S1.to_string(),
+        agent: None,
+        started_seq: None,
+        filed_seq: None,
+        filed_at: None,
+        machine_sha256: None,
+        verdicts: VerdictShares::default(),
+        carry: Vec::new(),
+    };
+    assert!(why_in_words(&fx.store, &old_record).contains("filed before THOR 2.5 checked filings"));
+    old_record.report_seq = i64::MAX;
+    assert!(why_in_words(&fx.store, &old_record).contains("written by another program"), "after checks began: unchanged");
+}
+
 /// R16.1 / R16.3 at the unit level: a report that reached the log without a
 /// THOR tool call of its session - an older binary, the model CLI, a repair
 /// tool - never counts, and the record says why.

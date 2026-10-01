@@ -210,8 +210,8 @@ fn agents_md_gives_the_numbers_the_evaluation_really_uses() {
         assert!(page.contains(&phrase), "AGENTS.md must say '{phrase}'");
     }
     assert!(
-        serve::usefulness::EVAL_ELSEWHERE_MAX_MINUTES == 60 && page.contains("started less than an hour ago"),
-        "AGENTS.md must give the hour a running evaluation elsewhere exempts a session for"
+        model::store::EVALUATION_IDLE_MINUTES == 30 && page.contains("was active in the last 30 minutes"),
+        "AGENTS.md must give how long a running evaluation elsewhere holds a second one off"
     );
 }
 

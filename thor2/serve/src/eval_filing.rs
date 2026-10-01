@@ -61,6 +61,44 @@ pub const DRIFT_LINE: &str = "[THOR] this Claude Code version writes its transcr
 /// not count.
 pub const NOT_ATTESTED: &str = "not filed through an attested THOR tool call";
 
+/// Why a report filed before THOR checked filings does not count (step 24),
+/// in the words a reader needs: the rule stands - such a report never counts
+/// - but it was not written by another program. Field case 2026-10-01: a
+/// report filed through the THOR tool itself at 06:36, before the checking
+/// build was installed, was described as "written by another program (the
+/// command line, a repair tool or an older build)".
+pub const FILED_BEFORE_CHECKS: &str = "filed before THOR 2.5 checked filings; does not count after the upgrade";
+
+/// The log seq of the first write THOR's attester ever verified as an
+/// attested THOR call - where checked filings began on this store. `None`
+/// while there is none.
+pub fn first_checked_write_seq(store: &EventStore) -> Option<i64> {
+    let events = store.events_of_kinds(&[EventKind::GateStoodAside], 0).ok()?;
+    model::store::recorded_write_verdicts(&events).into_iter().filter(|(_, v)| v.attested).map(|(seq, _)| seq).min()
+}
+
+/// Whether `event`, a filing with no stamp of THOR's tool server, came before
+/// checked filings began (`first_checked_write_seq`).
+fn filed_before_checks(store: &EventStore, event: &Event) -> bool {
+    model::store::att_of(&event.body).is_none() && first_checked_write_seq(store).is_none_or(|first| event.seq < first)
+}
+
+/// The reason a validator record gives, in today's words: a record written
+/// before step 24 for a report filed before checked filings began says
+/// `FILED_BEFORE_CHECKS` instead of "written by another program".
+pub fn why_in_words(store: &EventStore, v: &EvaluationValidation) -> String {
+    let unstamped = v.why.starts_with(NOT_ATTESTED) && v.why.contains("carries no stamp of THOR's tool server");
+    if unstamped && !v.why.contains(FILED_BEFORE_CHECKS) && first_checked_write_seq(store).is_none_or(|first| v.report_seq < first) {
+        return before_checks_words();
+    }
+    v.why.clone()
+}
+
+/// The full reason for a report filed before checked filings began.
+fn before_checks_words() -> String {
+    format!("{NOT_ATTESTED} (it carries no stamp of THOR's tool server: {FILED_BEFORE_CHECKS})")
+}
+
 /// A report that counts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Valid {
@@ -304,6 +342,7 @@ fn judge(store: &EventStore, event: &Event, filed: &Item, root: Option<&Path>, r
     // (1) a THOR call at all: a stamp, a tool call id, a Claude Code session.
     let claim = match attest::claim_of(event) {
         Ok(claim) => claim,
+        Err(_) if filed_before_checks(store, event) => return invalid(before_checks_words()),
         Err(why) => return invalid(format!("{NOT_ATTESTED} ({why})")),
     };
     if !matches!(event.kind, EventKind::FactCreated | EventKind::FactRevised) {
@@ -481,7 +520,9 @@ fn shares(log: &EventStore, start: &EvaluationStart, filed_seq: i64, project: &s
                     shares.unattested += 1;
                 }
             }
-            WriteDoor::Machine | WriteDoor::Pending => {}
+            // Another session's verdict (step 24): that session's own share,
+            // never this evaluation's and never a side door.
+            WriteDoor::Machine | WriteDoor::Pending | WriteDoor::OtherSession { .. } | WriteDoor::OtherSessionPending { .. } => {}
         }
     }
     shares
@@ -619,7 +660,7 @@ pub fn newest_invalid_report(store: &EventStore, project: Option<&str>) -> Optio
     reports_of_project(store, project)
         .into_iter()
         .filter(|(_, seq, _)| *seq > valid_seq)
-        .find_map(|(id, _, v)| v.filter(|v| !v.valid).map(|v| (id, v.why)))
+        .find_map(|(id, _, v)| v.filter(|v| !v.valid).map(|v| (id, why_in_words(store, &v))))
 }
 
 /// WHETHER `project` SHOWS ROT, for the weekly cadence (step 17), from the log

@@ -1307,3 +1307,73 @@ fn q24_apply_refuses_when_the_cutoff_was_recorded_in_between() {
 fn plain(words: &[&str]) -> Item {
     rule(&words.join("-"), "Run the linter before a release.", vec![cmd("make release")], None, Some("alpha"))
 }
+
+// ------------------------------------- step 24: a text revise keeps a true check
+
+/// The setup of field defect 5 (2026-10-01): a true contains check on a rule
+/// bound to a command, which never reaches a write to NOTES.md, with a text
+/// that does not name the literal - and the rewording the evaluation asked
+/// for, naming it.
+fn unreached_contains(fx: &mut Fx) -> (Item, Item) {
+    let beta = fx.checkout("beta", &[("NOTES.md", "keep this line\n")], true);
+    fx.register("beta", &beta);
+    let before = rule("c-kept", "NOTES.md must keep its first line.", vec![cmd("make release")], contains("NOTES.md", "keep this line"), Some("beta"));
+    fx.legacy(&before);
+    let mut reworded = before.clone();
+    reworded.text = "NOTES.md must keep `keep this line` as its first line.".to_string();
+    (before, reworded)
+}
+
+/// Field defect 5: rewording a rule to name its check's literal cleared its
+/// TRUE check, because its bindings never reach a write to the file. A
+/// text-only revise keeps the check now: undecided, with the rebind named as
+/// a step of its own - and the store reads it back as owed, not as a note.
+#[test]
+fn a_text_revise_keeps_a_true_check_its_bindings_never_reach() {
+    let mut fx = Fx::new();
+    let (before, reworded) = unreached_contains(&mut fx);
+    let t = fx.run(&reworded, Some(&before), &SessionCtx::default(), &Disputes::default());
+    assert!(matches!(t.outcome, Outcome::Undecided { .. }), "{:?}\n{}", t.outcome, receipt(&t));
+    assert_eq!(t.check, before.check, "a text revise never clears the check: {}", receipt(&t));
+    let said = receipt(&t);
+    assert!(said.contains("is kept") && said.contains("never reach a write to NOTES.md"), "{said}");
+    assert!(said.contains("The rebind is a step of its own") && said.contains("\"value\": \"NOTES.md\""), "{said}");
+    let stored = stored_item(&reworded, &t).unwrap();
+    assert_eq!(stored.check, before.check);
+    model::store::revise_tried_scoped(&mut fx.store, "s", "l", "mcp", &before, &stored, &before, None, None, t.record.as_ref(), None, None)
+        .unwrap();
+    match model::store::current_verdict(&fx.store, "c-kept") {
+        model::store::CurrentVerdict::Undecided { why } => assert!(why.contains("is kept"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    // The rebind it names, as its own step: now the check bites.
+    let mut bound = stored.clone();
+    bound.bindings.push(path("NOTES.md"));
+    let t = fx.run(&bound, Some(&stored), &SessionCtx::default(), &Disputes::default());
+    assert!(matches!(t.outcome, Outcome::Rule { .. }), "{:?}\n{}", t.outcome, receipt(&t));
+}
+
+/// The same rewording when NOTES.md already holds the most facts a place
+/// shows: the check is kept, the reply says the owner decides, and THOR's
+/// own retest holds the rule by the anchor-full blocker (its open point) -
+/// never back on the agent's batch.
+#[test]
+fn a_kept_check_on_a_full_place_is_the_owners_to_decide() {
+    let mut fx = Fx::new();
+    let (before, reworded) = unreached_contains(&mut fx);
+    for n in 0..model::item::MAX_ITEMS {
+        let mut sitting = rule(&format!("sits-{n}"), &format!("NOTES.md fact number {n}."), vec![path("NOTES.md")], None, Some("beta"));
+        sitting.severity = None;
+        fx.legacy(&sitting);
+    }
+    let t = fx.run(&reworded, Some(&before), &SessionCtx::default(), &Disputes::default());
+    assert!(matches!(t.outcome, Outcome::Undecided { .. }), "{:?}\n{}", t.outcome, receipt(&t));
+    assert_eq!(t.check, before.check);
+    let said = receipt(&t);
+    assert!(said.contains("already full of other facts") && said.contains("the owner decides"), "{said}");
+    let stored = stored_item(&reworded, &t).unwrap();
+    model::store::revise_tried_scoped(&mut fx.store, "s", "l", "mcp", &before, &stored, &before, None, None, t.record.as_ref(), None, None)
+        .unwrap();
+    let r = fx.retest("c-kept");
+    assert!(matches!(&r.outcome, Maintenance::Blocked(Blocker::AnchorFull { path }) if path == "NOTES.md"), "{:?}\n{:?}", r.outcome, r.lines);
+}

@@ -38,9 +38,10 @@ a session really works in, when all of this holds:
 
 The ask follows the work, not the folder: a session that worked in project A
 and then moved to another folder is still asked about A, and the ask says so.
-If another session is already running this project's evaluation (it started
-less than an hour ago and is still active), you are told that in one line
-and are not held. A project with activity in the last seven days and no
+One project runs one evaluation at a time: if another session is already
+running this project's evaluation and was active in the last 30 minutes, you
+are told that in one line, naming that session, and are not held. Once it has
+been quiet longer, the next ask takes the evaluation over. A project with activity in the last seven days and no
 evaluation that counts in seven days is due whatever the clock says.
 When something else holds the same turn-end first - a reply rule, the
 first-session setup, a decision the owner stated that was not stored, a note
@@ -170,6 +171,16 @@ fired 40 times or more since their last verdict. Judge only those. A pinned
 item is never on it: the owner already answered whether it belongs there by
 pinning it.
 
+Judge each item by WHERE it fired, never by its text alone. Under every item
+the start note shows where it fired in this session - how often, and its last
+places (the command or file); `mcp__thor__get(id: "<id>", fired: true)` shows
+an item's recent firings. With a list of more than about 50 items, build a
+firing map FIRST: one pass over this session's transcript (a subagent may read
+it) that says, per id, on which call it fired - then judge. Never get-then-mark
+blocks of items without looking where they fired: measured 2026-10-01, one
+session gave 205 verdicts in four minutes that way, and three were provably
+wrong.
+
 Every item on your list gets one of two answers. A verdict, given with the
 THOR tool itself: useful if it belonged where it fired, noise if it did not.
 A verdict from a shell, a script, another session or another program settles
@@ -186,7 +197,10 @@ GIVE YOUR VERDICTS, THEN END THE TURN ONCE, THEN FILE. THOR checks that every
 verdict of this evaluation was a real THOR call when the turn ends, and the
 report is refused while the verdicts of the turn you are in are not checked
 yet. So give all your verdicts, answer in a line, and let the turn end; the
-Stop hook checks them. Then file the report (see "The report").
+Stop hook checks them and holds the turn again, asking you to file NOW - file
+the report in that same turn (see "The report"). If no THOR message held you,
+file right away, in this turn. Never tell the owner "next turn" or "I will
+file it later" unless the Stop actually held you.
 
 The health check's `judgement debt` line names the debt of the whole store
 for this checkout, including items that only fired in other sessions. Those
@@ -248,7 +262,8 @@ handle only what the start note handed you under TEETH:
 - **The A4 list**: at most sixteen rules whose check bites and whose text only
   has to name the check's literal. Reword the text so it names that literal,
   using the exact call the note prints (a `revise` with the reworded text) -
-  nothing else has to change.
+  nothing else has to change. Each line says how many characters the text has
+  left (300 minus its length now): reword within that budget, never append.
 - **Everything THOR settled itself** (rules, notes, pending checks hung) is
   only reported, in the machine section of the report. You do not redo it.
 
@@ -265,7 +280,17 @@ Three arguments exist for a refusal that is right about the tooth but wrong
 about your rule: `legitimate_calls`, `may_change` and `accept_refusing`.
 Doctor lists every rule saved with one of them for the owner, so use one only
 when you can say why, in the report, in a sentence the owner can check. They
-are not a way to get a rule off the batch.
+are not a way to get a rule off the batch. A `legitimate_calls` entry must be a
+call that really occurs - in the log (THOR's reply says how many real calls a
+tooth reaches) or in the project. Never a made-up path or a template with
+`<...>` in it: measured 2026-10-01, a session named a test file that did not
+exist.
+
+When a revise reply says bind, anchor or rebind (for example "bind it to
+<file>"), make that rebind as a revise of its own, or write "could not" with
+the refusal. Since THOR 2.5.2 a rewording never clears a true check: a reply
+saying the check "is kept" leaves the rule owed until the rebind is made - or,
+when that place is full, THOR's own open point takes it to the owner.
 
 Never file an open point, and never tag a rule with `open-point`, `about:` or
 `blocker:`: THOR writes and closes its own open points (a missing working
@@ -432,6 +457,11 @@ Open with a plain-language summary: what happened, does it work, what does
 it mean for the owner. No jargon, no hashes, no test names. The detail
 follows below, in the order of the steps above.
 
+Every claim in the report is re-run in THIS turn, or marked "not verified" (a
+health check, what origin holds, a version, what is still running). Counts -
+verdicts, useful, noise, rules - come from THOR's replies and the machine
+section, never from memory.
+
 Report what you DID, not what you noticed - evidence, not assertion. The
 owner cannot see into your session: "I repaired a rotten fact" is, to him,
 indistinguishable from doing nothing. So for every fact you changed: its id,
@@ -513,8 +543,13 @@ thing to do: each item is either settled by the work it names or honestly
 skipped; the lists it holds you to cannot grow between attempts. Three
 refusals are plain waiting, not work: "THOR is still deciding the old rules"
 and "the verdicts you gave in this turn are checked when the turn ends" both
-mean end this turn once and file again; "no evaluation is open in this
-session" means there is nothing to file, so file nothing.
+mean end this turn once and file again - THOR then holds the turn and you file
+in it; "no evaluation is open in this session" means there is nothing to file,
+so file nothing. A refusal that calls the evaluation VOID (an item on its
+lists was changed outside an attested THOR call) means: end the turn, and the
+next Stop starts the fresh evaluation or names the session that runs it. An
+attested change by ANOTHER session never voids an evaluation: that item counts
+as settled by that session.
 
 The reply to a filed report says what the machine section holds and that THOR
 checks the filing call when the turn ends. The report counts from that check

@@ -882,6 +882,55 @@ fn registered_root(store: &EventStore, item: &Item) -> Option<PathBuf> {
     serve::project::registered_checkout(store, item.project.as_deref()).ok()
 }
 
+/// How many firings `get` with `fired: true` shows.
+const FIRINGS_SHOWN: usize = 10;
+
+/// WHERE AN ITEM FIRED (step 24): its newest firings in `session` (every
+/// session's, each with its session, when this server knows none), at most
+/// `FIRINGS_SHOWN`, each with when and the command or file it fired on - cut
+/// to the part around the item's own anchor. Field case 2026-10-01: the
+/// evaluation said "`get` shows where it fired", and `get` showed no place
+/// at all.
+fn recent_firings(store: &EventStore, id: &str, session: Option<&str>) -> String {
+    let events = store.get_events_by_entity(id).unwrap_or_default();
+    let anchors: Vec<String> = model::store::show(store, id)
+        .map(|item| {
+            item.bindings
+                .iter()
+                .filter_map(|b| match b {
+                    Binding::Target { value, .. } => Some(value.clone()),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let served: Vec<&thor_core::event_store::Event> = events
+        .iter()
+        .rev()
+        .filter(|e| e.kind == thor_core::event_store::EventKind::ItemServed)
+        .filter(|e| session.is_none_or(|s| e.session_id == s))
+        .collect();
+    let whose = match session {
+        Some(s) => format!("in this session ({s})"),
+        None => "in any session (this server knows no session of its own)".to_string(),
+    };
+    if served.is_empty() {
+        return format!("WHERE IT FIRED {whose}: never.");
+    }
+    let mut out = format!("WHERE IT FIRED {whose}: {} time(s); the newest {}:", served.len(), served.len().min(FIRINGS_SHOWN));
+    for event in served.iter().take(FIRINGS_SHOWN) {
+        let body = serde_json::from_str::<model::served::ItemServed>(&event.body).ok();
+        let at = body.as_ref().map(|b| b.served_at.clone()).unwrap_or_default();
+        let place = match body.and_then(|b| b.trigger).filter(|t| !t.trim().is_empty()) {
+            Some(t) => format!("'{}'", model::store::trigger_excerpt(&t, &anchors)),
+            None => model::store::FIRED_WITHOUT_TRIGGER.to_string(),
+        };
+        let who = if session.is_none() { format!(" (session {})", event.session_id) } else { String::new() };
+        out.push_str(&format!("\n- {at}{who}: {place}"));
+    }
+    out
+}
+
 /// A write that REFUSED on the gate's own grounds, as the reply - the same
 /// words the store gives (`REFUSED: <problem>. Fix: <fix>`), with the scope
 /// list when the refusal is the missing-scope one.
@@ -1811,6 +1860,11 @@ pub struct UnpinArgs {
 pub struct GetArgs {
     /// The id to show.
     pub id: String,
+    /// true also shows where the item fired recently in THIS session (newest
+    /// first, at most 10 firings): when, and the command or file it fired on.
+    /// What an evaluation judges a verdict by.
+    #[serde(default)]
+    pub fired: Option<bool>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -2631,10 +2685,17 @@ impl ThorMcpServer {
         .await
     }
 
-    #[tool(description = "Code lane: shows one item whole, by id. Use lookup instead when the id is not already known. Read-only. Reports a plain, honest error - never a blank reply that could look like success - when the id is unknown, when the item is DIVERGED (more than one current head; read history, then use resolve), or when its stored body will not parse. Replies with the item as formatted JSON, or the error text.", annotations(title = "Get an item", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
+    #[tool(description = "Code lane: shows one item whole, by id. Use lookup instead when the id is not already known. Read-only. Reports a plain, honest error - never a blank reply that could look like success - when the id is unknown, when the item is DIVERGED (more than one current head; read history, then use resolve), or when its stored body will not parse. With fired: true it also lists where the item fired recently in this session (when, and the command or file) - what a verdict is judged by. Replies with the item as formatted JSON (then the firings, when asked), or the error text.", annotations(title = "Get an item", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn get(&self, Parameters(args): Parameters<GetArgs>) -> String {
+        let session = self.session.session_id.clone();
         self.blocking(move |s| match model::store::show(s, &args.id) {
-            Ok(item) => serde_json::to_string_pretty(&item).map_err(|e| format!("could not render item: {e}")),
+            Ok(item) => {
+                let shown = serde_json::to_string_pretty(&item).map_err(|e| format!("could not render item: {e}"))?;
+                match args.fired {
+                    Some(true) => Ok(format!("{shown}\n\n{}", recent_firings(s, &item.id, session.as_deref()))),
+                    _ => Ok(shown),
+                }
+            }
             Err(e) => Err(e.to_string()),
         })
         .await
@@ -4062,7 +4123,7 @@ mod tests {
     }
 
     async fn body(srv: &ThorMcpServer, id: &str) -> String {
-        let raw = srv.get(Parameters(GetArgs { id: id.to_string() })).await;
+        let raw = srv.get(Parameters(GetArgs { id: id.to_string(), fired: None })).await;
         serde_json::from_str::<Item>(&raw).expect(&format!("get must return JSON: {raw}")).text
     }
 
@@ -4226,7 +4287,7 @@ mod tests {
             reply.contains("teeth: note - nothing in the text or anchors to build a tooth from (no flag, quoted call, backtick span or path)"),
             "{reply}"
         );
-        let get_reply = srv.get(Parameters(GetArgs { id: "heavy-checkless".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "heavy-checkless".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert!(item.tags.iter().any(|t| t == model::store::TEETH_NOTE_TAG), "{:?}", item.tags);
         assert!(item.check.is_none());
@@ -4255,7 +4316,7 @@ mod tests {
             ),
             "{reply}"
         );
-        let get_reply = srv.get(Parameters(GetArgs { id: "heavy-contains".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "heavy-contains".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert!(item.check.is_none(), "a pending check is never on the item");
         assert!(item.tags.iter().any(|t| t == model::store::TEETH_NOTE_TAG), "{:?}", item.tags);
@@ -4473,7 +4534,7 @@ mod tests {
         assert!(!reply.contains("teeth: proven guard"), "{reply}");
         assert!(reply.contains("git push --force (refused)") && reply.contains("git push (let through)"), "{reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "proven-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "proven-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert!(item.tags.iter().any(|t| t == model::store::TEETH_WIRED_TAG), "{:?}", item.tags);
         assert!(!item.tags.iter().any(|t| t == model::store::TEETH_PROVEN_TAG), "{:?}", item.tags);
@@ -4584,7 +4645,7 @@ mod tests {
             reply.contains("Advice: bind to 'git push' with the literal '--force' - THOR tried exactly that and it bites"),
             "{reply}"
         );
-        let get_reply = srv.get(Parameters(GetArgs { id: "collapsed-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "collapsed-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert!(item.tags.iter().any(|t| t == model::store::TEETH_WIRED_TAG), "{:?}", item.tags);
         assert!(!item.tags.iter().any(|t| t == model::store::TEETH_ANCHOR_COLLAPSED_TAG), "{:?}", item.tags);
@@ -4624,7 +4685,7 @@ mod tests {
         let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.starts_with("stored "), "{reply}");
         assert!(reply.contains("teeth: note - your check (forbidden '--force') was not stored: nothing could be tried"), "{reply}");
-        let item: Item = serde_json::from_str(&srv.get(Parameters(GetArgs { id: "unreachable-1".to_string() })).await).unwrap();
+        let item: Item = serde_json::from_str(&srv.get(Parameters(GetArgs { id: "unreachable-1".to_string(), fired: None })).await).unwrap();
         assert!(item.check.is_none());
         assert!(item.tags.iter().any(|t| t == model::store::TEETH_NOTE_TAG));
     }
@@ -4700,7 +4761,7 @@ mod tests {
         args.tags = vec!["gotcha".to_string()];
         assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await.starts_with("stored "));
         let before_item: Item =
-            serde_json::from_str(&srv.get(Parameters(GetArgs { id: "stable-checked-1".to_string() })).await).unwrap();
+            serde_json::from_str(&srv.get(Parameters(GetArgs { id: "stable-checked-1".to_string(), fired: None })).await).unwrap();
         assert_eq!(before_item.tags, vec!["gotcha".to_string(), model::store::TEETH_WIRED_TAG.to_string()], "fixture sanity");
 
         let mut args = bare_revise("stable-checked-1");
@@ -4711,7 +4772,7 @@ mod tests {
         assert!(reply.contains("teeth unchanged: the trial at log seq"), "{reply}");
 
         let after_item: Item =
-            serde_json::from_str(&srv.get(Parameters(GetArgs { id: "stable-checked-1".to_string() })).await).unwrap();
+            serde_json::from_str(&srv.get(Parameters(GetArgs { id: "stable-checked-1".to_string(), fired: None })).await).unwrap();
         assert_eq!(after_item.tags, vec![model::store::TEETH_WIRED_TAG.to_string()], "only the writer's tags are cleared");
         assert_eq!(
             model::store::current_verdict(&srv.store.lock().unwrap(), "stable-checked-1"),
@@ -4848,17 +4909,57 @@ mod tests {
         let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(base_remember("round-trip-1"))).await;
         assert!(reply.contains("stored 'round-trip-1'"), "{reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "round-trip-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "round-trip-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).expect(&format!("get must return valid JSON: {get_reply}"));
         assert_eq!(item.id, "round-trip-1");
         assert_eq!(item.kind, ItemKind::Rule);
         assert_eq!(item.severity, Some(ItemSeverity::Irreversible));
     }
 
+    /// FIELD DEFECT 4 (2026-10-01): the evaluation said "`get` shows where it
+    /// fired", and `get` showed no place at all. With `fired: true` it shows
+    /// the item's newest firings in THIS session - when, and the command or
+    /// file it fired on - and never another session's; without it, the item
+    /// alone, exactly as before.
+    #[tokio::test]
+    async fn get_with_fired_shows_where_the_item_fired_in_this_session() {
+        let srv = server().with_session(serve::teeth::SessionCtx { session_id: Some(FIXTURE_SESSION.to_string()), ..Default::default() });
+        {
+            let mut s = srv.store.lock().unwrap();
+            let item = Item {
+                id: "fired-1".to_string(),
+                kind: ItemKind::Rule,
+                text: "Run the demo linter before `demo-release`.".to_string(),
+                bindings: vec![Binding::Target { kind: TargetKind::Command, value: "demo-release".to_string() }],
+                severity: None,
+                project: None,
+                tags: vec![],
+                expires: None,
+                key: None,
+                falsifier: Some("the demo linter turns out to be optional".to_string()),
+                check: None,
+            };
+            model::store::declare(&mut s, "s", "l", "t", &item).unwrap();
+            let ids = ["fired-1".to_string()];
+            serve::deliver::record_delivery_with_trigger(&mut s, FIXTURE_SESSION, FIXTURE_SESSION, "hook", "2026-10-01T15:00:00Z", &ids, Some("demo-release --dry-run"));
+            serve::deliver::record_delivery_with_trigger(&mut s, "other-session", "other-session", "hook", "2026-10-01T15:01:00Z", &ids, Some("demo-release elsewhere"));
+            serve::deliver::record_delivery_with_trigger(&mut s, FIXTURE_SESSION, FIXTURE_SESSION, "hook", "2026-10-01T15:02:00Z", &ids, None);
+        }
+        let plain = srv.get(Parameters(GetArgs { id: "fired-1".to_string(), fired: None })).await;
+        assert!(serde_json::from_str::<Item>(&plain).is_ok() && !plain.contains("WHERE IT FIRED"), "{plain}");
+        let reply = srv.get(Parameters(GetArgs { id: "fired-1".to_string(), fired: Some(true) })).await;
+        assert!(reply.contains(&format!("WHERE IT FIRED in this session ({FIXTURE_SESSION}): 2 time(s)")), "{reply}");
+        let newest = reply.find("2026-10-01T15:02:00Z").expect("the newest firing");
+        let older = reply.find("2026-10-01T15:00:00Z: 'demo-release --dry-run'").expect("the older one, with its command");
+        assert!(newest < older, "newest first: {reply}");
+        assert!(reply.contains(model::store::FIRED_WITHOUT_TRIGGER), "{reply}");
+        assert!(!reply.contains("elsewhere"), "another session's firing is not this one's: {reply}");
+    }
+
     #[tokio::test]
     async fn get_on_an_unknown_id_is_a_plain_error_not_a_blank_success() {
         let srv = server();
-        let reply = srv.get(Parameters(GetArgs { id: "does-not-exist".to_string() })).await;
+        let reply = srv.get(Parameters(GetArgs { id: "does-not-exist".to_string(), fired: None })).await;
         assert!(!reply.trim().is_empty(), "a missing id must produce an honest message, not a blank reply");
         assert!(reply.contains("does-not-exist"), "{reply}");
     }
@@ -4904,7 +5005,7 @@ mod tests {
         let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "revise-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "revise-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(item.text, "never force-push to main, ever");
         assert_eq!(item.severity, Some(ItemSeverity::Irreversible), "untouched field must be kept");
@@ -4933,7 +5034,7 @@ mod tests {
         let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.starts_with("stored"), "{reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "check-pathexists-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "check-pathexists-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(item.check, Some(Check::PathExists { path: "CHANGELOG.md".to_string() }));
     }
@@ -4953,7 +5054,7 @@ mod tests {
         let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.starts_with("stored"), "{reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "check-contains-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "check-contains-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(item.check, Some(Check::Contains { path: "LICENSE.md".to_string(), literal: "GPLv3".to_string() }));
     }
@@ -4977,7 +5078,7 @@ mod tests {
         let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.starts_with("stored"), "{reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "check-absent-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "check-absent-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(
             item.check,
@@ -5098,7 +5199,7 @@ mod tests {
         let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "check-keep-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "check-keep-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(item.severity, Some(ItemSeverity::Costly), "the field that WAS mentioned must change");
         assert_eq!(
@@ -5149,7 +5250,7 @@ mod tests {
         let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "check-keep-2".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "check-keep-2".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(item.text, "the roadmap lives in ROADMAP.md, updated every quarter; never write zz-roadmap-marker");
         assert_eq!(
@@ -5207,7 +5308,7 @@ mod tests {
         let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "check-clear-noop-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "check-clear-noop-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(item.check, None);
     }
@@ -5253,7 +5354,7 @@ mod tests {
         let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise_args)).await;
         assert!(reply.contains("invalid check"), "{reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "check-clear-refuse-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "check-clear-refuse-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(
             item.check,
@@ -5319,7 +5420,7 @@ mod tests {
         let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "expected a deliberate clear to succeed, got: {reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "check-clear-populated-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "check-clear-populated-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(item.check, None, "a deliberate clear must actually clear the field");
     }
@@ -5354,7 +5455,7 @@ mod tests {
         );
         assert!(reply.to_lowercase().contains("because"), "the refusal must say to give `because`: {reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "weaken-no-because-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "weaken-no-because-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert!(item.check.is_some(), "a refused weakening must change nothing");
     }
@@ -5434,7 +5535,7 @@ mod tests {
         let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.starts_with("stored"), "{reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "check-absent-all-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "check-absent-all-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(
             item.check,
@@ -5552,7 +5653,7 @@ mod tests {
         let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "check-keep-absent-all-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "check-keep-absent-all-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(item.severity, Some(ItemSeverity::Costly), "the field that WAS mentioned must change");
         assert_eq!(
@@ -5622,7 +5723,7 @@ mod tests {
         let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "check-upgrade-to-set-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "check-upgrade-to-set-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(
             item.check,
@@ -5658,7 +5759,7 @@ mod tests {
         let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.starts_with("stored"), "{reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "check-forbidden-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "check-forbidden-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(
             item.check,
@@ -5761,7 +5862,7 @@ mod tests {
         let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "check-keep-forbidden-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "check-keep-forbidden-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(item.severity, Some(ItemSeverity::Costly), "the field that WAS mentioned must change");
         assert_eq!(
@@ -5833,7 +5934,7 @@ mod tests {
         let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "check-downgrade-to-forbidden-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "check-downgrade-to-forbidden-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(item.check, Some(Check::Forbidden { literals: vec!["\u{2014}".to_string()] }));
     }
@@ -5891,7 +5992,7 @@ mod tests {
         let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "check-clear-populated-forbidden-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "check-clear-populated-forbidden-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(item.check, None, "a deliberate clear must actually clear the field");
     }
@@ -5955,7 +6056,7 @@ mod tests {
         let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "expected a deliberate clear to succeed, got: {reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "clear-severity-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "clear-severity-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(item.severity, None, "a deliberate clear must actually clear the field");
         assert_eq!(item.project, Some("thor2".to_string()), "a field nobody asked to clear must survive untouched");
@@ -6009,7 +6110,7 @@ mod tests {
         let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "expected a deliberate clear to succeed, got: {reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "clear-project-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "clear-project-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(item.project, None, "a deliberate clear must actually clear the field");
     }
@@ -6063,7 +6164,7 @@ mod tests {
         let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "a whitespace-only value must clear, got: {reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "clear-project-ws".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "clear-project-ws".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(item.project, None, "the field must actually be cleared, not set to whitespace");
     }
@@ -6109,7 +6210,7 @@ mod tests {
         let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "expected a deliberate clear to succeed, got: {reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "clear-expires-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "clear-expires-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(item.expires, None, "a deliberate clear must actually clear the field");
     }
@@ -6161,7 +6262,7 @@ mod tests {
         let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "expected a deliberate clear to succeed, got: {reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "clear-key-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "clear-key-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(item.key, None, "a deliberate clear must actually clear the field");
     }
@@ -6212,7 +6313,7 @@ mod tests {
         let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "expected a deliberate clear to succeed, got: {reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "clear-falsifier-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "clear-falsifier-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(item.falsifier, None, "a deliberate clear must actually clear the field");
     }
@@ -6285,7 +6386,7 @@ mod tests {
         assert!(reply.contains("binding"), "expected the reason to name the dropped field: {reply}");
 
         let get_reply =
-            srv.get(Parameters(GetArgs { id: "clear-severity-keep-bindings-refusal-1".to_string() })).await;
+            srv.get(Parameters(GetArgs { id: "clear-severity-keep-bindings-refusal-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(item.severity, Some(ItemSeverity::HouseStyle), "a refused revise must change nothing");
         assert!(!item.bindings.is_empty(), "a refused revise must change nothing, bindings included");
@@ -6358,7 +6459,7 @@ mod tests {
         let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "keep-tags-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "keep-tags-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(
             teeth_free(&item.tags),
@@ -6414,7 +6515,7 @@ mod tests {
         assert!(reply.starts_with("revised"), "expected a deliberate clear to succeed, got: {reply}");
         assert!(reply.contains("tags cleared"), "expected the reply to say tags were cleared, got: {reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "clear-tags-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "clear-tags-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(
             item.tags,
@@ -6468,7 +6569,7 @@ mod tests {
         // A replace is not a clear, so the reply must not claim one.
         assert!(!reply.contains("tags cleared"), "a replace is not a clear: {reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "replace-tags-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "replace-tags-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(
             teeth_free(&item.tags),
@@ -6518,7 +6619,7 @@ mod tests {
             .await;
         assert!(reply.starts_with("revised"), "expected the flag to clear it, got: {reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "clear-severity-flag-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "clear-severity-flag-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(item.severity, None, "clear_severity must actually clear the field");
         assert_eq!(item.project, Some("thor2".to_string()), "a field nobody asked to clear must survive untouched");
@@ -6543,7 +6644,7 @@ mod tests {
             .await;
         assert!(reply.starts_with("revised"), "expected the flag to clear it, got: {reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "clear-project-flag-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "clear-project-flag-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(item.project, None, "clear_project must actually clear the field");
     }
@@ -6565,7 +6666,7 @@ mod tests {
             .await;
         assert!(reply.starts_with("revised"), "expected the flag to clear it, got: {reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "clear-expires-flag-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "clear-expires-flag-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(item.expires, None, "clear_expires must actually clear the field");
     }
@@ -6590,7 +6691,7 @@ mod tests {
             .await;
         assert!(reply.starts_with("revised"), "expected the flag to clear it, got: {reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "clear-key-flag-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "clear-key-flag-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(item.key, None, "clear_key must actually clear the field");
     }
@@ -6614,7 +6715,7 @@ mod tests {
             .await;
         assert!(reply.starts_with("revised"), "expected the flag to clear it, got: {reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "clear-falsifier-flag-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "clear-falsifier-flag-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(item.falsifier, None, "clear_falsifier must actually clear the field");
     }
@@ -6656,7 +6757,7 @@ mod tests {
         );
         assert!(reply.to_lowercase().contains("because"), "the refusal must say to give `because`: {reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "clear-check-flag-no-because-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "clear-check-flag-no-because-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert!(item.check.is_some(), "a refused weakening must change nothing");
     }
@@ -6687,7 +6788,7 @@ mod tests {
             "the reply must echo the reason back: {reply}"
         );
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "clear-check-flag-with-because-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "clear-check-flag-with-because-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(item.check, None, "clear_check must actually clear the field");
     }
@@ -6713,7 +6814,7 @@ mod tests {
         assert!(reply.contains("invalid 'severity'"), "{reply}");
         assert!(reply.contains("clear_severity"), "the refusal must name the flag: {reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "clear-severity-conflict-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "clear-severity-conflict-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(item.severity, Some(ItemSeverity::Irreversible), "a refused revise must change nothing");
     }
@@ -6736,7 +6837,7 @@ mod tests {
         assert!(reply.contains("invalid 'project'"), "{reply}");
         assert!(reply.contains("clear_project"), "the refusal must name the flag: {reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "clear-project-conflict-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "clear-project-conflict-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(item.project, Some("thor2".to_string()), "a refused revise must change nothing");
     }
@@ -6757,7 +6858,7 @@ mod tests {
         assert!(reply.contains("invalid 'expires'"), "{reply}");
         assert!(reply.contains("clear_expires"), "the refusal must name the flag: {reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "clear-expires-conflict-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "clear-expires-conflict-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(item.expires, Some("2027-01-01".to_string()), "a refused revise must change nothing");
     }
@@ -6780,7 +6881,7 @@ mod tests {
         assert!(reply.contains("invalid 'key'"), "{reply}");
         assert!(reply.contains("clear_key"), "the refusal must name the flag: {reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "clear-key-conflict-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "clear-key-conflict-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(item.key, Some("some-lookup-key".to_string()), "a refused revise must change nothing");
     }
@@ -6803,7 +6904,7 @@ mod tests {
         assert!(reply.contains("invalid 'falsifier'"), "{reply}");
         assert!(reply.contains("clear_falsifier"), "the refusal must name the flag: {reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "clear-falsifier-conflict-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "clear-falsifier-conflict-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(
             item.falsifier,
@@ -6836,7 +6937,7 @@ mod tests {
         assert!(reply.contains("invalid 'check_kind'"), "{reply}");
         assert!(reply.contains("clear_check"), "the refusal must name the flag: {reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "clear-check-conflict-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "clear-check-conflict-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(
             item.check,
@@ -6875,7 +6976,7 @@ mod tests {
             .await;
         assert!(reply.contains("clearing a check takes none of them"), "{reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "clear-check-path-conflict-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "clear-check-path-conflict-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(
             item.check,
@@ -6910,7 +7011,7 @@ mod tests {
         assert!(reply.starts_with("revised"), "{reply}");
         assert!(!reply.contains("weakened"), "an ordinary edit must not be read as a weakening: {reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "plain-revise-no-flags-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "plain-revise-no-flags-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(item.text, "the roadmap lives in ROADMAP.md, updated every quarter; never write zz-roadmap-marker");
         assert_eq!(item.severity, Some(ItemSeverity::Irreversible), "untouched field must be kept");
@@ -6940,7 +7041,7 @@ mod tests {
         let reply = srv.pin(Meta::new(), RawArgs::default(), Parameters(PinArgs { id: "pin-1".to_string() })).await;
         assert!(reply.starts_with("pinned"), "{reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "pin-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "pin-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert!(item.bindings.contains(&Binding::Always), "a pinned item must carry the Always binding: {item:?}");
         assert!(
@@ -6961,7 +7062,7 @@ mod tests {
         let reply = srv.unpin(Meta::new(), RawArgs::default(), Parameters(UnpinArgs { id: "unpin-1".to_string() })).await;
         assert!(reply.starts_with("unpinned"), "{reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "unpin-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "unpin-1".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert!(!item.bindings.contains(&Binding::Always), "unpin must remove the Always binding: {item:?}");
         assert!(
@@ -6985,7 +7086,7 @@ mod tests {
         assert!(reply.contains("REFUSED"), "expected a loud refusal, got: {reply}");
         assert!(reply.contains("no binding"), "expected the reason to name the empty-binding problem: {reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "unpin-2".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "unpin-2".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(item.bindings, vec![Binding::Always], "a refused unpin must change nothing");
     }
@@ -6998,7 +7099,7 @@ mod tests {
         let reply = srv.pin(Meta::new(), RawArgs::default(), Parameters(PinArgs { id: "pin-2".to_string() })).await;
         assert!(reply.contains("already pinned"), "{reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "pin-2".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "pin-2".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(item.bindings, vec![Binding::Always], "pinning twice must never duplicate the binding");
 
@@ -8509,7 +8610,7 @@ mod tests {
         let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(base_remember("from-the-road"))).await;
         assert!(reply.starts_with("queued for the main machine"), "{reply}");
 
-        let stored = srv.get(Parameters(GetArgs { id: "from-the-road".to_string() })).await;
+        let stored = srv.get(Parameters(GetArgs { id: "from-the-road".to_string(), fired: None })).await;
         assert!(
             !stored.contains("\"id\""),
             "the replica must NOT hold the item - it was queued, not written: {stored}"
@@ -8536,7 +8637,7 @@ mod tests {
             CapturedOutcome::NotApplied(text) => panic!("a valid capture must apply: {text}"),
         }
 
-        let get_reply = authority.get(Parameters(GetArgs { id: "captured-then-real".to_string() })).await;
+        let get_reply = authority.get(Parameters(GetArgs { id: "captured-then-real".to_string(), fired: None })).await;
         let item: Item = serde_json::from_str(&get_reply).expect(&get_reply);
         assert_eq!(item.id, "captured-then-real");
         assert_eq!(item.kind, ItemKind::Rule);
@@ -8615,7 +8716,7 @@ mod tests {
         assert!(refusal.starts_with("REFUSED"), "the toll must fire through this door: {refusal}");
         assert!(refusal.contains("goes-stale"), "and name what to settle: {refusal}");
 
-        let missing = srv.get(Parameters(GetArgs { id: "the-next-one".to_string() })).await;
+        let missing = srv.get(Parameters(GetArgs { id: "the-next-one".to_string(), fired: None })).await;
         assert!(!missing.contains("\"id\""), "nothing may be written when the toll refuses: {missing}");
     }
 

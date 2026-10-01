@@ -1110,9 +1110,6 @@ pub const EVAL_OWN_WORK_MINUTES: i64 = 10;
 /// the sidecar says.
 pub const EVAL_FLOOR_DAYS: i64 = 7;
 
-/// How long another session's open evaluation start exempts this session
-/// from the ask, at most (D12), in minutes.
-pub const EVAL_ELSEWHERE_MAX_MINUTES: i64 = 60;
 
 /// The time an event carries in its own body, when it carries one: a served
 /// item's `served_at`, a verdict's `marked_at`, an evaluation start's
@@ -1196,24 +1193,61 @@ pub fn weekly_floor_due(store: &EventStore, project: &str, now_unix: i64) -> boo
     project_activity(store, project, since, true).0
 }
 
-/// THE RUNNING EVALUATION ELSEWHERE (D12), from the log only: another
-/// session holds an open, not-void evaluation start for `project` that is
-/// less than `EVAL_ELSEWHERE_MAX_MINUTES` old, and that session has a log
-/// event - a served item, a verdict, a write or an attester record - within
-/// `EVAL_PAUSE_MINUTES`. No file's modification time is read. The newest such
-/// start, when there is one.
+/// THE RUNNING EVALUATION ELSEWHERE (D12, step 24), from the log only:
+/// another session holds an open evaluation of `project` - not void, not
+/// superseded, its report not filed - and that session showed activity on
+/// the log within `model::store::EVALUATION_IDLE_MINUTES`. Activity is any
+/// event of that session (`session_idle_minutes`), never the start's age:
+/// measured 2026-10-01, a 60-minute cap on the start's age let a second
+/// session start the same project's evaluation beside one that was still
+/// being worked, and the two voided each other. No file's modification time
+/// is read. The newest such start, with how many minutes its session has
+/// been quiet.
 pub fn evaluation_running_elsewhere(
     store: &EventStore,
     project: &str,
     session: &str,
     now_unix: i64,
-) -> Option<model::store::EvaluationStart> {
+) -> Option<(model::store::EvaluationStart, i64)> {
     model::store::open_evaluation_starts_of_project(store, project, now_unix)
         .into_iter()
         .filter(|s| s.frozen.session != session)
-        .filter(|s| now_unix - s.frozen.started_unix < EVAL_ELSEWHERE_MAX_MINUTES * 60)
-        .filter(|s| session_active_since(store, &s.frozen.session, now_unix - EVAL_PAUSE_MINUTES * 60))
-        .max_by_key(|s| s.seq)
+        .filter_map(|s| {
+            let idle = session_idle_minutes(store, &s.frozen.session, now_unix, model::store::EVALUATION_IDLE_MINUTES)?;
+            Some((s, idle))
+        })
+        .max_by_key(|(s, _)| s.seq)
+}
+
+/// How many whole minutes ago `session` last showed activity on the log -
+/// any event of that session, dated as `event_time` says (an undated event is
+/// dated by the newest dated event before it, a lower bound) - when that was
+/// within `within_minutes` of `now_unix`; `None` when the session showed none
+/// in that window. Reads the log newest first and stops at the window's edge.
+pub fn session_idle_minutes(store: &EventStore, session: &str, now_unix: i64, within_minutes: i64) -> Option<i64> {
+    let since = now_unix - within_minutes * 60;
+    let mut found = false;
+    let mut at: Option<i64> = None;
+    let _ = store.visit_newest_first(|event| {
+        let its = event.session_id == session;
+        match event_time(event) {
+            Some(when) => {
+                if when < since {
+                    return false;
+                }
+                if its || found {
+                    at = Some(when);
+                    return false;
+                }
+                true
+            }
+            None => {
+                found |= its;
+                true
+            }
+        }
+    });
+    at.map(|when| minutes_ago(now_unix, when))
 }
 
 /// The work clock of one project as a Stop (or a skill call opening the
@@ -1265,7 +1299,8 @@ pub enum StopDecision {
     /// Hold the turn with the evaluation ask.
     Ask(EvalClock),
     /// Due, but another session runs its evaluation (D12): one line, no hold.
-    Elsewhere(model::store::EvaluationStart),
+    /// With how many minutes that session has been quiet on the log.
+    Elsewhere(model::store::EvaluationStart, i64),
     /// Not this session's ask, and why.
     Quiet(&'static str),
 }
@@ -1292,19 +1327,28 @@ pub fn stop_decision(
     cadence: EvalCadence,
 ) -> StopDecision {
     let own_minutes = own_minutes_in(state, project, session, timeline);
+    let mut work = state.work.clone();
+    work.accrued_secs = work.accrued_secs.max(own_minutes * 60);
+    // THIS SESSION'S OWN OPEN EVALUATION FIRST (step 24): it was started for
+    // this session, so it is owed here until its report is filed - whatever
+    // the clock, the gates, or another session's start say. Measured
+    // 2026-10-01: a session with an open evaluation was told "running in
+    // another session" about a second evaluation that should never have
+    // started, and was never asked for its own again.
+    if model::store::open_evaluation_start_at(store, session, project, now_unix).is_some() {
+        return StopDecision::Ask(EvalClock { work, own_minutes, by_floor: false });
+    }
     if own_minutes < EVAL_OWN_WORK_MINUTES {
         return StopDecision::Quiet(SHORT_SESSION);
     }
-    let mut work = state.work.clone();
-    work.accrued_secs = work.accrued_secs.max(own_minutes * 60);
     let Some(by_floor) = project_due(store, state, project, &work, now_unix, cadence) else {
         return StopDecision::Quiet("the project is not due");
     };
     if first_stop_is_free && first_stop_here(state, project, session, timeline, stop_here) {
         return StopDecision::Quiet(FIRST_STOP);
     }
-    if let Some(start) = evaluation_running_elsewhere(store, project, session, now_unix) {
-        return StopDecision::Elsewhere(start);
+    if let Some((start, idle)) = evaluation_running_elsewhere(store, project, session, now_unix) {
+        return StopDecision::Elsewhere(start, idle);
     }
     StopDecision::Ask(EvalClock { work, own_minutes, by_floor })
 }
@@ -1377,34 +1421,6 @@ pub fn projects_of_session(all: &EvalDebtState, session: &str, folder_project: O
         }
     }
     out
-}
-
-/// Whether `session` has a log event (a served item, a verdict, a write, an
-/// attester record - never THOR's own machine records) at or after
-/// `since_unix`, dated as `event_time` says.
-fn session_active_since(store: &EventStore, session: &str, since_unix: i64) -> bool {
-    let mut found = false;
-    let mut active = false;
-    let _ = store.visit_newest_first(|event| {
-        let its = event.session_id == session
-            && (event.kind == EventKind::ItemServed
-                || event.actor == model::store::ATTESTER_ACTOR
-                || (is_write_kind(event.kind) && !model::store::RESERVED_ACTORS.contains(&event.actor.as_str())));
-        match event_time(event) {
-            Some(at) => {
-                if its || found {
-                    active = at >= since_unix;
-                    return false;
-                }
-                at >= since_unix
-            }
-            None => {
-                found |= its;
-                true
-            }
-        }
-    });
-    active
 }
 
 /// Whole days between `then_unix` and `now_unix`, floored, never negative -
