@@ -67,7 +67,15 @@ pub fn render(items: &[RankedItem]) -> Option<String> {
     }
     let mut lines: Vec<String> =
         vec![crate::render::FRAMING_LINE.to_string(), "Standing rules for this session:".to_string()];
-    for ranked in items {
+    // THE HEAVIEST FIRST (step 27, D12). Nothing is cut: every item is still
+    // here. But Claude Code keeps a long hook output in a file and shows the
+    // agent only its first 2 KB, and in id order those were whichever six
+    // facts had the alphabetically first ids (measured 2026-10-01: 53 items,
+    // 16 KB, 6 visible). A stable sort puts what can refuse or cannot be
+    // undone where the preview reaches; ids still order what is equally heavy.
+    let mut ordered: Vec<&RankedItem> = items.iter().collect();
+    ordered.sort_by_key(|r| r.item.severity.map_or(3u8, |s| s as u8));
+    for ranked in ordered {
         lines.push(format!("- [{}] {}", ranked.id, ranked.item.text));
     }
     Some(lines.join("\n"))
@@ -365,5 +373,21 @@ mod tests {
     #[test]
     fn a_subagent_payload_never_returns_the_reminder_even_with_source_compact() {
         assert!(compact_reminder(Some("compact"), true).is_none());
+    }
+
+    #[test]
+    fn the_heaviest_standing_rules_come_first_and_none_is_left_out() {
+        use model::item::Severity;
+        let mut light = item("a-light", Kind::Orientation, vec![Binding::Always], None);
+        let mut costly = item("b-costly", Kind::Rule, vec![Binding::Always], None);
+        let mut hard = item("c-hard", Kind::Rule, vec![Binding::Always], None);
+        let plain = item("d-plain", Kind::Orientation, vec![Binding::Always], None);
+        costly.item.severity = Some(Severity::Costly);
+        hard.item.severity = Some(Severity::Irreversible);
+        light.item.severity = Some(Severity::HouseStyle);
+        let items = select(&[light, costly, hard, plain], None);
+        let block = render(&items).unwrap();
+        let at = |id: &str| block.find(&format!("[{id}]")).unwrap_or_else(|| panic!("{id} missing: {block}"));
+        assert!(at("c-hard") < at("b-costly") && at("b-costly") < at("a-light") && at("a-light") < at("d-plain"), "{block}");
     }
 }

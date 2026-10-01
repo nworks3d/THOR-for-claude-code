@@ -116,6 +116,7 @@ pub mod prove;
 pub mod rank;
 pub mod reentry;
 pub mod render;
+pub mod repeat;
 pub mod respond;
 pub mod semantic_paths;
 pub mod serving;

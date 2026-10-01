@@ -200,3 +200,59 @@ fn the_evaluation_ask_waits_for_the_session_held_for_the_projects_debt() {
     let store = EventStore::new(&fx.db()).unwrap();
     assert!(model::store::open_evaluation_start(&store, S2, "alpha").is_none(), "no evaluation was started beside it");
 }
+
+/// STEP 27 (D5), field case 2026-10-01: the retry Stop that follows a paid debt
+/// (`stop_hook_active`) returns before the release at the end of the first-pass
+/// arm, so the paid session kept the project's lease for as long as it stayed
+/// quiet. The retry now frees it when nothing is owed any more.
+#[test]
+fn the_retry_stop_after_a_paid_debt_releases_the_lease() {
+    let fx = Fx::new();
+    let mut store = EventStore::new(&fx.db()).unwrap();
+    owed(&mut store, "one", 1, S1, 1);
+    owed(&mut store, "two", 1, S2, 1);
+    drop(store);
+
+    assert!(is_hold(&fx.stop(S1)), "S1 is held and takes the lease");
+    let mut store = EventStore::new(&fx.db()).unwrap();
+    let mut item = model::store::show(&store, "one-0").unwrap();
+    let before = item.clone();
+    item.bindings = vec![Binding::Always];
+    model::store::revise(&mut store, "fixture", "fixture", "fixture", &before, &item).unwrap();
+    drop(store);
+
+    // The retry Stop of the same turn.
+    let payload = serde_json::json!({
+        "hook_event_name": "Stop",
+        "session_id": S1,
+        "stop_hook_active": true,
+        "last_assistant_message": "",
+        "cwd": fx.checkout().to_string_lossy(),
+    });
+    fx.hook(&payload.to_string());
+    let leases = serve::holder::leases(&fx.db());
+    assert!(!leases.values().any(|l| l.session == S1), "the paid session no longer holds the lease: {leases:?}");
+
+    let second = fx.stop(S2);
+    assert!(is_hold(&second), "so the next session asked holds at once: {second}");
+}
+
+/// The same retry Stop while the debt is still owed keeps the lease.
+#[test]
+fn the_retry_stop_keeps_the_lease_while_the_debt_is_still_owed() {
+    let fx = Fx::new();
+    let mut store = EventStore::new(&fx.db()).unwrap();
+    owed(&mut store, "one", 1, S1, 1);
+    drop(store);
+
+    assert!(is_hold(&fx.stop(S1)));
+    let payload = serde_json::json!({
+        "hook_event_name": "Stop",
+        "session_id": S1,
+        "stop_hook_active": true,
+        "last_assistant_message": "",
+        "cwd": fx.checkout().to_string_lossy(),
+    });
+    fx.hook(&payload.to_string());
+    assert!(serve::holder::leases(&fx.db()).values().any(|l| l.session == S1));
+}

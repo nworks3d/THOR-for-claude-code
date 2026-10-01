@@ -465,7 +465,7 @@ A generic client config, the shape most tool-calling assistants expect:
       "args": [
         "run", "-i", "--rm",
         "-v", "thor-data:/data",
-        "ghcr.io/nworks3d/thor-mcp:2.5.4"
+        "ghcr.io/nworks3d/thor-mcp:2.5.5"
       ]
     }
   }
@@ -475,7 +475,7 @@ A generic client config, the shape most tool-calling assistants expect:
 ### Run it as a container
 
 ```bash
-docker run -i --rm -v thor-data:/data ghcr.io/nworks3d/thor-mcp:2.5.4
+docker run -i --rm -v thor-data:/data ghcr.io/nworks3d/thor-mcp:2.5.5
 ```
 
 On an empty volume, the container creates a memory and seeds it with THOR's

@@ -929,6 +929,12 @@ fn record_writes_of(store: &mut EventStore, session: &str, recorder: &str, root:
     let pending: Vec<(Event, Result<Claim, String>)> = writes
         .into_iter()
         .filter(|e| !done.contains_key(&e.seq))
+        // THOR's OWN WRITES (its installer's migration, its machine pass) are
+        // made by no tool call, so there is nothing to attest and nothing to
+        // call a side door: the actor is the stamp (step 27, D10). Field case
+        // 2026-10-01: a migration's three revises were recorded as "written
+        // by another program" and read as writes that bypassed the tools.
+        .filter(|e| !model::store::RESERVED_ACTORS.contains(&e.actor.as_str()))
         .map(|e| {
             let claim = claim_of(&e);
             (e, claim)
@@ -2693,5 +2699,38 @@ mod step_26_tests {
         assert!(says_marker(&all[0], "go-owner"), "{all:?}");
         assert!(owner_messages(&dir.path().join("missing.jsonl"), 2).is_err());
         assert!(says_marker("ok, Go-Owner.", "go-owner") && !says_marker("go-owners", "go-owner") && !says_marker("nogo-owner", "go-owner"));
+    }
+
+    /// STEP 27 (D10): a write THOR makes itself - here the installer's owner-
+    /// approval migration at session start - is made by no tool call. It is
+    /// never recorded as "written by another program", so it never reads as a
+    /// side door.
+    #[test]
+    fn a_write_by_thors_own_installer_is_never_recorded_as_unattested() {
+        let root = tempfile::tempdir().unwrap();
+        let rule = Item {
+            id: "send-needs-the-go".to_string(),
+            kind: model::item::Kind::Rule,
+            text: "Sending needs the owner's go-owner marker.".to_string(),
+            bindings: vec![Binding::Target { kind: TargetKind::Command, value: "send".to_string() }],
+            severity: None,
+            project: None,
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some("Sending without a go turns out harmless.".to_string()),
+            check: Some(Check::Requires { when: "send".to_string(), required: vec!["go-owner".to_string()] }),
+        };
+        const SESSION: &str = "0de7dc52-1b97-4b66-948f-61e4438043b2";
+        let mut store = EventStore::in_memory().unwrap();
+        model::store::declare(&mut store, "s", "l", "a", &rule).unwrap();
+        let marked = model::store::migrate_owner_approval(&mut store, SESSION);
+        assert_eq!(marked, vec!["send-needs-the-go".to_string()], "the migration ran as the installer");
+        assert_eq!(record_write_verifications_in(&mut store, SESSION, Some(root.path())), 0);
+        assert!(write_verdicts_of(&store, "send-needs-the-go").is_empty(), "no verdict of any kind was recorded");
+    }
+
+    fn write_verdicts_of(store: &EventStore, id: &str) -> HashMap<i64, model::store::WriteVerdict> {
+        model::store::recorded_write_verdicts(&store.get_events_by_entity(id).unwrap())
     }
 }

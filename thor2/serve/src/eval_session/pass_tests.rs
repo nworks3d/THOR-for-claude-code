@@ -916,3 +916,65 @@ fn an_old_contains_check_is_decided_by_the_machine() {
     assert!(!model::store::settlement(&fx.store, "old", None).is_owed());
     assert!(model::store::a4_cutoff(&fx.store).is_some(), "and the cutoff is recorded once");
 }
+
+/// STEP 27 (D4): the full-place point an older build wrote still says the owner
+/// decides which fact gives way. The first session start in its project judges
+/// it again under the current rule: reworded while a full place of heavier
+/// guards still holds a rule, closed once it no longer does - and never touched
+/// a second time.
+fn old_anchor_full_point(fx: &mut Fx) -> (String, Blocker) {
+    let alpha = fx.checkout("alpha", &[("files/PLAN.md", "the plan\n")], true);
+    fx.register("alpha", &alpha);
+    for id in ["plan-guard-a", "plan-guard-b", "plan-guard-c", "plan-guard-d"] {
+        let mut guard = rule(id, &format!("files/PLAN.md keeps `the plan` ({id})."), vec![path("files/PLAN.md")], contains("files/PLAN.md", "the plan"), Some("alpha"));
+        guard.severity = Some(model::item::Severity::Costly);
+        fx.legacy(&guard);
+        crate::teeth::fixture::decide(&mut fx.store, id);
+    }
+    let project_binding = Binding::Target { kind: TargetKind::Project, value: "alpha".to_string() };
+    let orientation = rule("plan-here", "The plan lives in files/PLAN.md of this repo.", vec![project_binding], Some(Check::PathExists { path: "files/PLAN.md".to_string() }), Some("alpha"));
+    fx.legacy(&Item { kind: Kind::Orientation, severity: None, ..orientation });
+    fx.start(S1, "alpha");
+    let blocker = Blocker::AnchorFull { path: "files/PLAN.md".to_string() };
+    let id = model::store::machine_point_id("alpha", &blocker);
+    let old = "THOR's own open point: files/PLAN.md already holds 4 live fact(s). Nothing needs doing from a session. The owner decides which fact gives way.";
+    model::store::write_machine_point(&mut fx.store, eval_machine(), S1, "alpha", &blocker, old).unwrap();
+    (id, blocker)
+}
+
+#[test]
+fn an_old_full_place_point_still_held_is_reworded_at_the_next_session_start() {
+    let mut fx = Fx::new();
+    let (id, _) = old_anchor_full_point(&mut fx);
+    let text_of = |fx: &Fx| model::store::open_points(&fx.store, Some("alpha")).into_iter().find(|p| p.id == id).map(|p| p.text);
+    assert!(text_of(&fx).unwrap().contains("owner decides which fact gives way"));
+
+    let done = refresh_old_anchor_full_points(&mut fx.store, S2, "alpha");
+    assert_eq!(done, vec![id.clone()]);
+    let text = text_of(&fx).expect("still open: every occupant is a heavier guard");
+    assert!(!text.contains("owner decides"), "{text}");
+    assert!(text.contains("no fact there honestly gives way") && text.contains("'plan-here'"), "{text}");
+
+    assert!(refresh_old_anchor_full_points(&mut fx.store, S2, "alpha").is_empty(), "nothing left to judge the second time");
+}
+
+#[test]
+fn an_old_full_place_point_whose_place_has_room_is_closed_at_the_next_session_start() {
+    let mut fx = Fx::new();
+    let (id, _) = old_anchor_full_point(&mut fx);
+    model::store::retract(&mut fx.store, "s", "l", "a", "plan-guard-d", "fixture: folded into 'plan-guard-a' about files/PLAN.md", None).unwrap();
+
+    let done = refresh_old_anchor_full_points(&mut fx.store, S2, "alpha");
+    assert_eq!(done, vec![id.clone()]);
+    assert!(!model::store::open_points(&fx.store, Some("alpha")).iter().any(|p| p.id == id), "closed: the place has room again");
+}
+
+#[test]
+fn a_point_written_by_this_build_is_left_alone() {
+    let mut fx = Fx::new();
+    let (id, blocker) = old_anchor_full_point(&mut fx);
+    let fresh = "THOR's own open point: files/PLAN.md holds heavier guards; no fact there honestly gives way.";
+    model::store::write_machine_point(&mut fx.store, eval_machine(), S1, "alpha", &blocker, fresh).unwrap();
+    assert!(refresh_old_anchor_full_points(&mut fx.store, S2, "alpha").is_empty());
+    assert!(model::store::open_points(&fx.store, Some("alpha")).iter().any(|p| p.id == id && p.text == fresh));
+}

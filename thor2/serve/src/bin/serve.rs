@@ -1198,6 +1198,26 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
     }
 }
 
+/// Each shown fact with the values it is anchored to, for the excerpt of
+/// where it fired (`deliver::record_delivery_around_anchors`).
+fn anchors_of(shown: &[RankedItem]) -> Vec<(String, Vec<String>)> {
+    shown
+        .iter()
+        .map(|r| {
+            let anchors = r
+                .item
+                .bindings
+                .iter()
+                .filter_map(|b| match b {
+                    model::item::Binding::Target { value, .. } => Some(value.clone()),
+                    _ => None,
+                })
+                .collect();
+            (r.id.clone(), anchors)
+        })
+        .collect()
+}
+
 fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_record: bool) -> Option<HookOutput> {
     let _hold = no_record.then(|| serve::store_dir::hold(db_path));
     // `payload_text` is `Some` only when the caller already read stdin (see
@@ -1399,6 +1419,15 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                 verdict.block_reason.or(verdict.warn_reason)
             });
             let guard_text = guard_text.flatten();
+            // THE LEASE GOES BACK WHEN THE DEBT IS PAID (step 27). The retry
+            // Stop that follows a paid debt returns here and never reaches the
+            // release at the end of the first-pass arm: field case 2026-10-01,
+            // a session kept the project's lease 34 minutes after it had
+            // paid, and any other session owing there was told "held
+            // elsewhere" for as long.
+            if !is_subagent && !no_record {
+                release_lease_when_paid(db_path, &session_id, &payload);
+            }
             let owed = match is_subagent || no_record {
                 true => None,
                 false => evaluation_after_a_hold(db_path, &session_id, &payload),
@@ -1926,6 +1955,11 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             // server is stamped with a constant, never the caller's own
             // session - see `crowding_debt`.
             record_session_watermark(db_path, &session_id);
+            // A new start (also a resume or a compaction, which lose what the
+            // agent was shown): what it has been shown so far no longer counts.
+            if !no_record {
+                serve::repeat::reset(db_path, &serve::repeat::key_for(&session_id, None));
+            }
             // THE OWNER'S GO, once (step 26): a rule whose requires check is
             // answered by an approval marker ("go-<name>") is marked so that
             // only the owner's own message answers it from now on. A write by
@@ -1979,6 +2013,14 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             // own rather than staying silent.
             // Never a subagent's (step 16, B6): the open points - and the
             // owner-queue banner above them - are for the owner's own session.
+            // THE FULL-PLACE POINTS AN OLDER BUILD LEFT (step 27, D4): judged
+            // again under the current rule before they are counted - see
+            // `eval_session::refresh_old_anchor_full_points`.
+            if !no_record && !payload_is_from_a_subagent(&payload) {
+                if let Some(project) = folder_project.as_deref() {
+                    serve::eval_session::refresh_old_anchor_full_points(&mut store, &session_id, project);
+                }
+            }
             let open_points = (!payload_is_from_a_subagent(&payload))
                 .then(|| open_points_session_start_note(&store, folder_project.as_deref()))
                 .flatten();
@@ -2063,6 +2105,20 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                 None
             };
 
+            // WHOSE WORDS THESE ARE (step 27). A prompt that is a message from
+            // another session, a subagent's hand-back, a task notification or
+            // a local-command echo is not something the owner typed: its words
+            // draw no facts here (a real tool call it leads to still does,
+            // through its own command and file anchors). Only the owner's own
+            // typing also opens a new turn for the repeat limit.
+            let reader = serve::repeat::key_for(&session_id, payload.get("agent_id").and_then(|v| v.as_str()));
+            if !serve::prompt::is_owners_own_text(prompt_text) {
+                return eval_note.map(|block| HookOutput::Context { event_name, block, verdicts: Vec::new() });
+            }
+            if !payload_is_from_a_subagent(&payload) && !no_record {
+                serve::repeat::reset(db_path, &reader);
+            }
+
             let candidates = serve::live::live_items(&store);
             let mut input = prompt::resolve(prompt_text, &candidates);
             input.project = folder_project.clone();
@@ -2071,8 +2127,9 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             }
             let decay = DecayContext::load(&store);
             let all = serve::decay::retain_live(serve::rank::select(&candidates, &input), &decay);
-            let selection = render::cap(all);
-            let rendered = render::render_text(&selection, &input, db_path);
+            let arranged = serve::repeat::arrange(db_path, &reader, &all, !no_record);
+            let selection = arranged.selection;
+            let rendered = render::render_text_with_reminders(&selection, &arranged.reminders, &input, db_path);
             let block = match (rendered, eval_note) {
                 (Some(rendered), Some(note)) => format!("{note}\n\n{rendered}"),
                 (Some(rendered), None) => rendered,
@@ -2080,11 +2137,19 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                 (None, None) => return None,
             };
             let ids: Vec<String> = selection.shown.iter().map(|r| r.id.clone()).collect();
-            // No trigger: a prompt is neither a command nor a file, the two
-            // shapes `ItemServed::trigger` names - plain `record_delivery`
-            // already writes `None`, exactly what this surface needs.
+            // The place a prompt fired an item is the prompt itself: its first
+            // words, on one line (step 27, D9), where it used to be blank.
             if !no_record {
-                deliver::record_delivery(&mut store, &session_id, &session_id, actor, &time::now_iso8601(), &ids);
+                let head: String = prompt_text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(100).collect();
+                deliver::record_delivery_with_trigger(
+                    &mut store,
+                    &session_id,
+                    &session_id,
+                    actor,
+                    &time::now_iso8601(),
+                    &ids,
+                    Some(&format!("prompt: {head}")),
+                );
             }
             // No `verdicts` here either, for the identical reason session
             // start carries none: a raw prompt is neither a proposed command
@@ -2268,7 +2333,13 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                     break 'served sink_warning.map(|block| HookOutput::Context { event_name, block, verdicts: Vec::new() });
                 }
                 let served = serve::serve(&store, &input);
-                let rendered = render::render_text(&served.selection, &input, db_path);
+                // WHAT THIS READER HAS NOT SEEN TWICE YET (step 27): a fact
+                // already shown in full twice to this session or subagent
+                // comes as one line, then not at all. Display only - every
+                // refusal above ran before this and does not know of it.
+                let reader = serve::repeat::key_for(&session_id, payload.get("agent_id").and_then(|v| v.as_str()));
+                let arranged = serve::repeat::arrange(db_path, &reader, &served.all, !no_record);
+                let rendered = render::render_text_with_reminders(&arranged.selection, &arranged.reminders, &input, db_path);
                 let block = match (sink_warning, rendered) {
                     (Some(warning), Some(rendered)) => Some(format!("{warning}\n\n{rendered}")),
                     (Some(warning), None) => Some(warning),
@@ -2276,7 +2347,9 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                     (None, None) => None,
                 };
                 let Some(block) = block else { break 'served None };
-                let ids: Vec<String> = served.selection.shown.iter().map(|r| r.id.clone()).collect();
+                // Only a fact shown IN FULL is a serving (and so can owe a
+                // judgement): a one-line reminder carries nothing new - the
+                // recording below takes `arranged.selection.shown` alone.
                 // THE ONE SURFACE WHERE `verdicts` IS EVER REAL: the moment of
                 // action, the only one of the three hook events that proposes an
                 // actual command or write. `input.command` is whatever was
@@ -2296,8 +2369,7 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                 // names, read back out of `served.selection.shown` a second time
                 // rather than reused from `ids` directly, because `check_rows`
                 // wants `&str` borrows and `ids` is already-owned `String`s.
-                let shown_ids: std::collections::HashSet<&str> =
-                    served.selection.shown.iter().map(|r| r.id.as_str()).collect();
+                let shown_ids: std::collections::HashSet<&str> = arranged.displayed_ids().into_iter().collect();
                 let verdicts = check_rows(&served.all, &shown_ids, input.command.as_deref().unwrap_or(""), absent_guard::proposed_content(tool_name, tool_input));
                 // The command as typed wins over the file, never the tool-name
                 // fallback `input.add_command` used above when there was no real
@@ -2308,14 +2380,18 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                 // (see the comment above `input.add_command`/`add_file` a few
                 // lines up), so the order only matters for a hand-built input.
                 let trigger = absent_guard::proposed_command(tool_input).or(file_path).or(searched);
+                // A call with neither command nor file (an Agent or MCP call)
+                // fired the item by its tool name: say so, instead of leaving
+                // the place blank (step 27, D9).
+                let trigger = trigger.or(Some(tool_name).filter(|t| !t.is_empty()));
                 if !no_record {
-                    deliver::record_delivery_with_trigger(
+                    deliver::record_delivery_around_anchors(
                         &mut store,
                         &session_id,
                         &session_id,
                         actor,
                         &time::now_iso8601(),
-                        &ids,
+                        &anchors_of(&arranged.selection.shown),
                         trigger,
                     );
                 }
@@ -3680,6 +3756,21 @@ fn routine_changed_lines(session_id: &str) -> String {
 /// `project`'s debt, when that is another session active within the idle
 /// window - this session is then not held for the project's debt. `None`:
 /// this session may be held (no project, no store, or it is the holder).
+/// A Stop that cannot hold again (`stop_hook_active`) frees the session's debt
+/// lease when the judgement debt it was held for is gone - see the call site.
+/// Reads only: nothing is released while anything is still owed.
+fn release_lease_when_paid(db_path: &Path, session_id: &str, payload: &Value) {
+    if !serve::holder::leases(db_path).values().any(|l| l.session == session_id) {
+        return;
+    }
+    let cwd = payload.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from).or_else(|| std::env::current_dir().ok());
+    let project = project::session_project(db_path, session_id, cwd.as_deref());
+    let Ok(store) = serve::store_dir::open_existing(db_path) else { return };
+    if judgement_debt(&store, db_path, session_id, project.as_deref()).is_none() {
+        serve::holder::release(db_path, session_id);
+    }
+}
+
 fn debt_holder_elsewhere(db_path: &Path, session_id: &str, project: Option<&str>) -> Option<String> {
     let project = project?;
     let store = serve::store_dir::open_existing(db_path).ok()?;
@@ -3979,59 +4070,30 @@ fn evaluation_ask(
     }
 }
 
-/// How many open points `SessionStart`'s own note names in full before
-/// falling back to a bare count of the rest - the session-start block is
-/// already the largest thing this tool injects (`session_start::render`'s
-/// own doc comment), so this stays small on purpose, the same reasoning
-/// `TEETH_DEBT_BATCH_MAX` already gives the backlog burn's own batch.
-const OPEN_POINTS_SESSION_START_CAP: usize = 5;
-
-/// This project's own open points (`model::store::open_points`), formatted
-/// for `SessionStart` - capped at `OPEN_POINTS_SESSION_START_CAP`, id plus
-/// one short line each, a bare count for whatever does not fit. THOR's own
-/// points come first and say so; a legacy one (filed by an agent before THOR
-/// wrote them itself) is marked, because it settles nothing and holds no
-/// filing. `None` when the project has none open.
-///
-/// (The message that asks for an evaluation no longer lists them: the start
-/// note that rides with it does, from the start record's frozen lists.)
+/// This project's own open points (`model::store::open_points`), as ONE line
+/// at `SessionStart`: how many there are, and that they are the owner's
+/// (step 27). Field test 3 (2026-10-01): the list of them - THOR's own, legacy
+/// ones that "settle nothing", and a stale text that still said "the owner
+/// decides" - was put in front of every agent at every start, and an agent can
+/// do nothing about any of them. Their texts are no longer injected; `doctor`
+/// and `lookup` have them. `None` when the project has none open.
 ///
 /// OVER THE OWNER'S BUDGET (step 16, B6): when more of THOR's own points of
 /// the project wait on the owner (`model::store::owner_queue`) than
-/// `model::store::OPEN_POINTS_OWNER_BUDGET`, the block opens with the
+/// `model::store::OPEN_POINTS_OWNER_BUDGET`, the line is preceded by the
 /// banner that says so. Nothing is refused over it. The call site never
-/// shows this block to a subagent.
+/// shows this to a subagent.
 fn open_points_session_start_note(store: &EventStore, project: Option<&str>) -> Option<String> {
     let points = model::store::open_points(store, project);
     if points.is_empty() {
         return None;
     }
-    let machine = points.iter().filter(|p| p.machine).count();
     let queue = project.map(|p| model::store::owner_queue(store, p)).unwrap_or_default();
     let mut lines: Vec<String> = project.and_then(|p| model::store::owner_queue_banner(p, queue.len())).into_iter().collect();
     lines.push(format!(
-        "[THOR] {} open point(s) in this project: {machine} written by THOR itself (each says what clears it, and closes \
-         itself), {} legacy (filed by an agent earlier; they settle nothing and hold no filing):",
-        points.len(),
-        points.len() - machine
+        "[THOR] {} open point(s) in this project are the owner's to read, not a task for this session (doctor lists them).",
+        points.len()
     ));
-    for p in points.iter().take(OPEN_POINTS_SESSION_START_CAP) {
-        let short: String = p.text.chars().take(80).collect();
-        let ellipsis = if p.text.chars().count() > 80 { "..." } else { "" };
-        let in_queue = queue.iter().any(|(q, _)| q.id == p.id);
-        let whose = match (p.machine, in_queue) {
-            (true, true) => "THOR's own, the owner decides",
-            (true, false) => "THOR's own",
-            (false, _) => "legacy",
-        };
-        lines.push(format!("- '{}' ({whose}): {short}{ellipsis}", p.id));
-    }
-    if points.len() > OPEN_POINTS_SESSION_START_CAP {
-        lines.push(format!(
-            "...{} more (`lookup` has the rest).",
-            points.len() - OPEN_POINTS_SESSION_START_CAP
-        ));
-    }
     Some(lines.join("\n"))
 }
 

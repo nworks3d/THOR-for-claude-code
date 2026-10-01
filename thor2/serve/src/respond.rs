@@ -195,7 +195,7 @@ fn rule_matches(rule: &Rule, haystack_lower: &str) -> bool {
 
 /// The trigger side: `min_chars`, then every `all_of` term and (when there
 /// are any) one `any_of` term present, where `present` answers for one
-/// lowercased term - a plain substring test, or `in_own_voice` for a rule
+/// lowercased term - a plain substring test, or `occurs_as_claimed` for a rule
 /// that counts only the assistant's own claims (see "reported speech").
 fn trigger_holds(rule: &Rule, haystack_lower: &str, present: &dyn Fn(&str) -> bool) -> bool {
     if rule.min_chars > 0 && haystack_lower.chars().count() < rule.min_chars {
@@ -373,6 +373,13 @@ pub struct OptInRule {
     /// file's own "reported speech" section. Missing, `false` or malformed all
     /// mean the rule reads every occurrence, as before this field existed.
     pub own_claims_only: bool,
+    /// `true` marks this rule as being about something the assistant CLAIMS
+    /// is so ("pushed", "deployed", "now running"): a trigger term does not
+    /// count where a negation just before it turns it into the opposite claim
+    /// ("niets gepusht of gedeployd"). See this file's own "negated claims"
+    /// section. Missing, `false` or malformed all mean the rule reads every
+    /// occurrence, as before this field existed.
+    pub affirmative_only: bool,
 }
 
 /// Parse the rulebook into `OptInRule`s: every field `parse_rules` reads,
@@ -405,6 +412,7 @@ pub fn parse_opt_in_rules(text: &str) -> Vec<OptInRule> {
             // Same direction as `owner_reading_only`: anything but a literal
             // `true` keeps the rule reading every occurrence of its terms.
             let own_claims_only = r.get("own_claims_only").and_then(|v| v.as_bool()).unwrap_or(false);
+            let affirmative_only = r.get("affirmative_only").and_then(|v| v.as_bool()).unwrap_or(false);
             Some(OptInRule {
                 base,
                 before,
@@ -413,6 +421,7 @@ pub fn parse_opt_in_rules(text: &str) -> Vec<OptInRule> {
                 list_request_any_of,
                 owner_reading_only,
                 own_claims_only,
+                affirmative_only,
             })
         })
         .collect()
@@ -1013,23 +1022,64 @@ fn occurrence_is_another_partys(hay: &str, at: usize, len: usize) -> bool {
     reported_by_another_party(&lead, &hay[at..at + len])
 }
 
-/// Whether `term_lower` occurs in `hay` at least once in the assistant's own
-/// voice. An empty term is present everywhere, as `str::contains` has it.
-fn in_own_voice(hay: &str, term_lower: &str) -> bool {
-    if term_lower.is_empty() {
-        return true;
-    }
-    hay.match_indices(term_lower).any(|(at, t)| !occurrence_is_another_partys(hay, at, t.len()))
-}
-
 /// The trigger side of a rule (`trigger_holds`) with `own_claims_only`
 /// honoured.
 fn trigger_fires(rule: &OptInRule, haystack_lower: &str) -> bool {
-    if rule.own_claims_only {
-        trigger_holds(&rule.base, haystack_lower, &|term| in_own_voice(haystack_lower, term))
+    if rule.own_claims_only || rule.affirmative_only {
+        trigger_holds(&rule.base, haystack_lower, &|term| {
+            occurs_as_claimed(haystack_lower, term, rule.own_claims_only, rule.affirmative_only)
+        })
     } else {
         trigger_holds(&rule.base, haystack_lower, &|term| haystack_lower.contains(term))
     }
+}
+
+// -------------------------------------------------------- negated claims
+//
+// THE FALSE BLOCK THIS CLOSES (field test 2026-10-01). The rule that demands
+// "name the VERSION whenever you say something is pushed, deployed or now
+// running" held a reply that said "niets gecommit, gepusht of gedeployd" - a
+// plain substring match cannot tell the claim from its opposite.
+//
+// A rule opts in with `affirmative_only: true`. One occurrence of a trigger
+// term then does not count when a negation word ("niet", "niets", "geen",
+// "nooit", "not", "never", "without", ...) stands within the six words before
+// it in the same sentence, with no contrast word ("maar", "but", "wel", ...)
+// between them. A comma does not end the reach: "niets gecommit, gepusht of
+// gedeployd" negates all three. "no" alone is not a negation word here: it
+// opens too many harmless sentences ("No problem, pushed to dev").
+//
+// Biased like the reported-speech reading: a negation further back than six
+// words, or cut off by a full stop, leaves the claim a claim.
+
+/// How many words before a trigger term a negation can reach.
+const NEGATION_REACH: usize = 6;
+
+/// Whether the words just before byte `at` of `hay` negate what follows.
+fn negated_before(hay: &str, at: usize) -> bool {
+    let lead = &hay[sentence_start(hay, 0, at)..at];
+    let before = words(lead);
+    for (_, _, word) in before.iter().rev().take(NEGATION_REACH) {
+        let word = word.to_lowercase();
+        if crate::prompt::CONTRASTS.contains(&word.as_str()) {
+            return false;
+        }
+        if word != "no" && crate::prompt::NEGATORS.contains(&word.as_str()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether `term_lower` occurs in `hay` at least once as the assistant's
+/// claim: in its own voice when `own_voice`, not negated when `affirmative`.
+fn occurs_as_claimed(hay: &str, term_lower: &str, own_voice: bool, affirmative: bool) -> bool {
+    if term_lower.is_empty() {
+        return true;
+    }
+    hay.match_indices(term_lower).any(|(at, t)| {
+        (!own_voice || !occurrence_is_another_partys(hay, at, t.len())) && (!affirmative || !negated_before(hay, at))
+    })
 }
 
 // --------------------------------------------------------- list exemption
@@ -1977,5 +2027,56 @@ mod tests {
 
         let v = guard_verdict(Some(MALFORMED_RULEBOOK), "deze regel heeft een kapotte waarde erin", "", true, None);
         assert!(v.block_reason.is_some(), "a malformed value must be treated as not-marked, so it still catches a subagent");
+    }
+
+    // ------------------------------------------------- negated claims (step 27)
+
+    const VERSION_RULE: &str = r#"[{"id":"no-version-number-on-ship","tier":"block","affirmative_only":true,
+        "any_of":["gepusht","gedeployed","pushed","deployed"],"none_of":["versie","version"],
+        "reminder":"name the version"}]"#;
+
+    const VERSION_RULE_OLD: &str = r#"[{"id":"no-version-number-on-ship","tier":"block",
+        "any_of":["gepusht","gedeployed","pushed","deployed"],"none_of":["versie","version"],
+        "reminder":"name the version"}]"#;
+
+    fn blocks(rulebook: &str, msg: &str) -> bool {
+        guard_verdict(Some(rulebook), msg, "", false, None).block_reason.is_some()
+    }
+
+    /// THE FIELD CASE: "niets gecommit, gepusht of gedeployd" is the opposite of
+    /// a claim that something was pushed.
+    #[test]
+    fn a_negated_ship_claim_does_not_trip_the_version_rule() {
+        for msg in [
+            "Klaar. Niets gecommit, gepusht of gedeployd.",
+            "Nothing was pushed or deployed.",
+            "Het is niet gepusht naar dev.",
+            "Zonder iets te deployed te hebben.",
+        ] {
+            assert!(!blocks(VERSION_RULE, msg), "{msg}");
+        }
+    }
+
+    #[test]
+    fn an_affirmative_ship_claim_still_trips_it() {
+        for msg in [
+            "Alles is gepusht naar dev.",
+            "Het is gepusht, niet gedeployed.",
+            "No problem, pushed to dev.",
+            "We hebben niet gewacht. Alles is gedeployed.",
+        ] {
+            assert!(blocks(VERSION_RULE, msg), "{msg}");
+        }
+    }
+
+    #[test]
+    fn a_rule_without_the_field_reads_every_occurrence_as_before() {
+        assert!(blocks(VERSION_RULE_OLD, "Klaar. Niets gecommit, gepusht of gedeployd."));
+    }
+
+    #[test]
+    fn a_negation_further_back_than_its_reach_leaves_the_claim_a_claim() {
+        let msg = "Niet alles ging goed, maar daarna is het uiteindelijk toch allemaal netjes gepusht.";
+        assert!(blocks(VERSION_RULE, msg), "{msg}");
     }
 }

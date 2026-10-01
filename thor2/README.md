@@ -271,6 +271,18 @@ requires answer is only approval markers (`go-<name>`).
 Stop notices that do not hold the turn are also queued (at most 3, once each)
 and handed to the same session as context at its next prompt.
 
+HOW OFTEN ONE AGENT SEES A FACT (2.5.5): a session, or one subagent, is shown
+a fact in full twice, then as one line (its id and the head of its text) up to
+five showings in all, then not at all; the count starts again at the next
+session start and at the next prompt the owner types himself. Two facts that
+say the same in one block are shown once. Only what is shown is limited:
+refusals run before it and are never hidden, and only a full showing is
+recorded as a serving, so a repeat adds nothing to the judgement debt. A
+prompt that is a message from another session, a hand-back, a task
+notification or a local-command echo draws no facts, and a negated action
+("niet pushen", "no deploy") is no moment. The `SessionStart` block lists the
+heaviest rules first and carries the open points as one line with their count.
+
 An open point is THOR's own: the machine pass writes one per blocker
 (`open-no-working-copy-*` when a project has no registered working copy,
 `open-working-tree-differs-*` when the checkout is mid-change,
@@ -401,6 +413,14 @@ rule is one entry with:
   what the agent says itself; a first-person word ("I", "ik", "we") in the
   sentence that frames the report keeps it the agent's own. Left out, the
   rule reads every word of the reply, whoever said it.
+- `affirmative_only` - `true` marks a rule about something the agent CLAIMS
+  is so, such as "whenever you say it is pushed, name the version". Such a
+  rule does not fire on a claim that a negation just before it turns into the
+  opposite ("niets gepusht of gedeployd", "nothing was pushed"): a negation
+  word ("niet", "niets", "geen", "nooit", "not", "never", "without", ...)
+  within the six words before the trigger, in the same sentence and with no
+  "maar"/"but" between them, makes that occurrence no claim. Left out, the
+  rule reads every occurrence.
 - `tier` - `block` holds the reply back until it is fixed; `warn` only
   leaves a note behind. Every rule seeded here is `block`.
 - `owner_reading_only` - `true` marks a rule about how a reply reads to the
@@ -435,7 +455,7 @@ counts, and without `agent_id` the field changes nothing.
 target/release/doctor.exe --db "<store>"
 ```
 
-Its first line always names the build it was run from (`doctor 2.5.4`), so a
+Its first line always names the build it was run from (`doctor 2.5.5`), so a
 report you paste somewhere says which version made it - every program in this
 directory answers the same way to `--version` or `-V`, on its own, with no
 store needed.

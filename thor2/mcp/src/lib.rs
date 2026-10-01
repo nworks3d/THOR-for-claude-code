@@ -1467,9 +1467,8 @@ fn replica_refusal_for_revise(store: &EventStore, args: &ReviseArgs) -> Result<(
         out
     };
     let (before, updated) = (normalized_item(&existing), unlabelled(&plan.updated));
-    model::gate::revise(&unlabelled(&plan.gate_existing), &updated).map_err(|r| gate_refusal(r, store))?;
-    model::gate::revise_weakening(&before, &updated, args.because.as_deref()).map_err(|r| gate_refusal(r, store))?;
-    model::gate::a4_ground(Some(&before), &updated, None).map_err(|r| gate_refusal(r, store))
+    model::gate::revise_refusals(&unlabelled(&plan.gate_existing), &before, &updated, args.because.as_deref(), true)
+        .map_err(|r| gate_refusal(r, store))
 }
 
 /// Write a pin or unpin: the binding change goes through the same gate and
@@ -2571,10 +2570,16 @@ impl ThorMcpServer {
             // the TRUE `existing` for the weakenings (never `gate_existing`):
             // a check or severity `ClearedFields` blanked for a legitimate
             // clear must still read as the change it is.
-            model::gate::revise(&normalized_item(&gate_existing), &normalized_item(&updated))
-                .map_err(|r| gate_refusal(r, s))?;
-            model::gate::revise_weakening(&normalized_item(&existing), &normalized_item(&updated), args.because.as_deref())
-                .map_err(|r| gate_refusal(r, s))?;
+            // ALL of them in one answer (step 27): the length, the weakening
+            // and, once something else refuses, A4 too.
+            model::gate::revise_refusals(
+                &normalized_item(&gate_existing),
+                &normalized_item(&existing),
+                &normalized_item(&updated),
+                args.because.as_deref(),
+                false,
+            )
+            .map_err(|r| gate_refusal(r, s))?;
             let disputes = disputes_of(&args.legitimate_calls, &args.may_change, &args.accept_refusing);
             let trial = run_trial(s, &corpus, &session, &updated, Some(&existing), args.because.as_deref(), &disputes, bare);
             let (written, record, notes, unchanged, trial_because) = match trial {

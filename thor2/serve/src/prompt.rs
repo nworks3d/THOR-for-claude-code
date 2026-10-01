@@ -82,6 +82,87 @@ fn contains_phrase(haystack_normalized: &str, needle: &str) -> bool {
     }
 }
 
+/// The wrappers a harness puts around text that is NOT the owner's own typing:
+/// a message from another session, a subagent's hand-back, a background task's
+/// notification, a local-command echo, a system reminder. Field case
+/// 2026-10-01: such texts were read as the owner's prompts and drew prod-data
+/// and deploy facts for words some other party wrote.
+const NOT_THE_OWNERS: &[&str] = &[
+    "<cross-session-message",
+    "<agent-message",
+    "<task-notification",
+    "[subagent hand-back]",
+    "<local-command-",
+    "<system-reminder",
+];
+
+/// Whether `prompt` can be the owner's own typing. A prompt that opens with one
+/// of the harness wrappers above is somebody else's words.
+pub fn is_owners_own_text(prompt: &str) -> bool {
+    let head = prompt.trim_start().to_lowercase();
+    !NOT_THE_OWNERS.iter().any(|w| head.starts_with(w))
+}
+
+/// Words that turn what follows into something NOT to do.
+pub const NEGATORS: &[&str] = &[
+    "niet", "niets", "geen", "nooit", "nergens", "zonder", "no", "not", "never", "without", "nothing", "don't", "dont",
+    "doesn't", "doesnt", "won't", "wont", "shouldn't", "mustn't", "cannot", "can't", "cant",
+];
+
+/// Words that end a negation's reach inside one sentence ("niet pushen, maar
+/// wel committen").
+pub const CONTRASTS: &[&str] = &["maar", "but", "behalve", "except", "wel", "instead", "however"];
+
+/// `prompt` with every negated stretch blanked: from a negation word to the end
+/// of its sentence (a full stop followed by a space, `!`, `?`, `;`, `:` or a
+/// line break), or to a contrast word, whichever comes first. A comma does not
+/// end it: "niets deployen, pushen of mergen" negates all three. Everything
+/// outside such a stretch is returned as it was, so an affirmative instruction
+/// in the same prompt still resolves its moments.
+pub fn without_negated(prompt: &str) -> String {
+    let chars: Vec<char> = prompt.chars().collect();
+    let mut out = String::with_capacity(prompt.len());
+    let mut negating = false;
+    let mut word = String::new();
+    let flush = |word: &mut String, out: &mut String, negating: &mut bool| {
+        if word.is_empty() {
+            return;
+        }
+        let lower = word.to_lowercase().replace('\u{2019}', "'");
+        if CONTRASTS.contains(&lower.as_str()) {
+            *negating = false;
+        }
+        if NEGATORS.contains(&lower.as_str()) {
+            *negating = true;
+        }
+        if !*negating {
+            out.push_str(word);
+        }
+        word.clear();
+    };
+    for (i, &c) in chars.iter().enumerate() {
+        let next_is_space = chars.get(i + 1).is_none_or(|n| n.is_whitespace());
+        let word_char = c.is_alphanumeric() || matches!(c, '\'' | '\u{2019}' | '-' | '_' | '/' | '\\')
+            || (c == '.' && !word.is_empty() && !next_is_space);
+        if word_char {
+            word.push(c);
+            continue;
+        }
+        flush(&mut word, &mut out, &mut negating);
+        let ends_sentence = matches!(c, '!' | '?' | ';' | ':' | '\n') || (c == '.' && next_is_space);
+        if ends_sentence {
+            negating = false;
+            out.push(c);
+        } else if negating {
+            out.push(' ');
+        } else {
+            out.push(c);
+        }
+    }
+    flush(&mut word, &mut out, &mut negating);
+    out
+}
+
 /// Build the `ServeInput` a raw prompt resolves to. Moments: the union of
 /// what `intent::from_command` and `intent::from_path` detect in the raw
 /// text (a prompt that literally instructs a destructive command must
@@ -95,12 +176,15 @@ pub fn resolve(prompt: &str, candidates: &[LiveItem]) -> ServeInput {
         return input;
     }
 
-    for signal in intent::from_command(prompt) {
+    // A negated action is no moment: "niet pushen", "no deploy", "don't push
+    // --force" say the opposite of what the detectors look for.
+    let asserted = without_negated(prompt);
+    for signal in intent::from_command(&asserted) {
         if !input.moments.contains(&signal.action) {
             input.moments.push(signal.action);
         }
     }
-    for signal in intent::from_path(prompt) {
+    for signal in intent::from_path(&asserted) {
         if !input.moments.contains(&signal.action) {
             input.moments.push(signal.action);
         }
@@ -238,5 +322,50 @@ mod tests {
             vec![target_item("t4", TargetKind::Path, "src/main.rs"), target_item("t5", TargetKind::Path, "src/main.rs")];
         let input = resolve("look at src/main.rs please", &candidates);
         assert_eq!(input.targets.len(), 1);
+    }
+
+    #[test]
+    fn a_negated_stretch_is_blanked_to_the_end_of_its_sentence() {
+        assert!(!without_negated("niets deployen of pushen").contains("pushen"));
+        assert!(!without_negated("Alleen op dev, niets deployen of pushen.").contains("deployen"));
+        assert!(without_negated("Alleen op dev, niets deployen of pushen.").contains("Alleen op dev"));
+        assert!(!without_negated("don't git push --force").contains("push"));
+        assert!(!without_negated("no deploy today").contains("deploy"));
+    }
+
+    #[test]
+    fn a_contrast_word_or_a_full_stop_ends_the_negation() {
+        let text = without_negated("niet git push, maar wel git commit");
+        assert!(text.contains("git commit") && !text.contains("push"), "{text}");
+        let text = without_negated("Do not touch it. Now git push it.");
+        assert!(text.contains("git push"), "{text}");
+    }
+
+    #[test]
+    fn a_prompt_without_a_negation_is_unchanged() {
+        let text = "please run git push --force-with-lease origin main.";
+        assert_eq!(without_negated(text), text);
+    }
+
+    #[test]
+    fn a_word_that_merely_contains_a_negator_is_not_one() {
+        assert!(without_negated("node --test and nothing_else_here git push").contains("git push"));
+        assert!(without_negated("run the notebook, then git push").contains("git push"));
+    }
+
+    #[test]
+    fn harness_wrappers_are_not_the_owners_typing() {
+        for wrapped in [
+            "<cross-session-message from=\"x\">hi</cross-session-message>",
+            "  <agent-message from=\"a\">[Subagent hand-back] done",
+            "<task-notification><summary>x</summary>",
+            "[Subagent hand-back] the report",
+            "<local-command-caveat>Caveat",
+            "<system-reminder>x</system-reminder>",
+        ] {
+            assert!(!is_owners_own_text(wrapped), "{wrapped}");
+        }
+        assert!(is_owners_own_text("Loop de testsuite na en verbeter ze"));
+        assert!(is_owners_own_text("/thor-eval"));
     }
 }

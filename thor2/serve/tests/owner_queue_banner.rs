@@ -172,13 +172,15 @@ fn owner_queue_over_budget_banner_at_session_start() {
         ),
         "the banner opens the open-points block: {block}"
     );
-    assert!(block.contains("(THOR's own, the owner decides)"), "{block}");
+    assert!(block.contains("are the owner's to read, not a task for this session"), "{block}");
+    assert!(!block.contains("(THOR's own, the owner decides)"), "the points themselves are no longer listed: {block}");
 
     let within = owner_queue_of(3);
     let context = session_start(&within, None);
     assert!(!context.contains("wait on YOU"), "within the budget: no banner: {context}");
     assert!(context.contains("[THOR] 3 open point(s) in this project"), "{context}");
-    assert_eq!(context.matches("(THOR's own, the owner decides)").count(), 3, "{context}");
+    assert_eq!(context.matches("(THOR's own, the owner decides)").count(), 0, "no point text is injected any more: {context}");
+    assert!(context.contains("3 open point(s) in this project are the owner's"), "{context}");
 }
 
 /// G16.3: a subagent's session start shows neither the banner nor the open

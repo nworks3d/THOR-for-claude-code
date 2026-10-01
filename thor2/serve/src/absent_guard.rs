@@ -933,6 +933,7 @@ pub fn find_requires_violation_owned(
     owner: Option<OwnerWords>,
 ) -> Option<String> {
     let said: std::cell::OnceCell<Result<Vec<String>, String>> = std::cell::OnceCell::new();
+    let mut reasons: Vec<String> = Vec::new();
     for candidate in items {
         if !candidate.item.kind.can_fire() {
             continue;
@@ -961,7 +962,7 @@ pub fn find_requires_violation_owned(
                 Ok(messages) if messages.iter().any(|m| required.iter().any(|r| crate::attest::says_marker(m, r))) => continue,
                 Ok(_) => {
                     let answers: Vec<String> = required.iter().map(|r| format!("{r:?}")).collect();
-                    return Some(format!(
+                    reasons.push(format!(
                         "[THOR] rule {} applies here: this call trips {trips} and needs the owner's explicit go - his own \
                          message, in this turn or the one before, must say {}. Writing it in the call does not count, and \
                          neither does a subagent's hand-back or quoted text. Nothing was done. Ask the owner; once he has \
@@ -970,14 +971,16 @@ pub fn find_requires_violation_owned(
                         answers.join(" or "),
                         candidate.item.text
                     ));
+                    continue;
                 }
                 Err(why) => {
-                    return Some(format!(
+                    reasons.push(format!(
                         "[THOR] rule {} applies here: this call trips {trips} and needs the owner's explicit go, but THOR \
                          cannot read this session's transcript ({why}), so it cannot see one and refuses rather than guess. \
                          Nothing was done. Ask the owner to run it himself. {}",
                         candidate.id, candidate.item.text
                     ));
+                    continue;
                 }
             }
         }
@@ -986,7 +989,7 @@ pub fn find_requires_violation_owned(
         }
         let answers: Vec<String> = required.iter().map(|r| format!("{r:?}")).collect();
         let trips = if inner { format!("{anchor:?} carrying {when:?}") } else { format!("{anchor:?}") };
-        return Some(format!(
+        reasons.push(format!(
             "[THOR] rule {} applies here: this call trips {trips} and says none of {}. {} \
              Nothing was done. Add one and run the call again.",
             candidate.id,
@@ -994,7 +997,23 @@ pub fn find_requires_violation_owned(
             candidate.item.text
         ));
     }
-    None
+    all_reasons(reasons)
+}
+
+/// Every rule one call trips, in ONE refusal (step 27). Field case 2026-10-01: an
+/// Agent call was refused three times in 35 seconds, one failing rule per
+/// refusal, each fix revealing the next. A single reason is returned as it
+/// always was; several come with a line saying there are several, so one
+/// rewrite answers them all.
+fn all_reasons(reasons: Vec<String>) -> Option<String> {
+    match reasons.len() {
+        0 => None,
+        1 => reasons.into_iter().next(),
+        n => Some(format!(
+            "[THOR] this call trips {n} rules at once - answer ALL of them in one go, then run it again.\n\n{}",
+            reasons.join("\n\n")
+        )),
+    }
 }
 
 /// Whether segment `i` of a call is `item`'s business: `scope` names the

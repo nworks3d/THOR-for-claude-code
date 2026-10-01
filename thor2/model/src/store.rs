@@ -4359,6 +4359,12 @@ pub fn trigger_excerpt(trigger: &str, anchors: &[String]) -> String {
     if chars.len() <= FIRED_TRIGGER_CHARS {
         return trigger.to_string();
     }
+    // An excerpt this function wrote itself at the time of the firing (its
+    // "..." marks included) is already the right size: cut again it would
+    // lose its own end.
+    if chars.len() <= FIRED_TRIGGER_CHARS + 6 && (trigger.starts_with("...") || trigger.ends_with("...")) {
+        return trigger.to_string();
+    }
     let folded: String = trigger.chars().map(|c| if c == '\\' { '/' } else { c.to_ascii_lowercase() }).collect();
     let hit = anchors
         .iter()

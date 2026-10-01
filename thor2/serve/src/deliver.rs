@@ -75,11 +75,42 @@ pub fn record_delivery_with_trigger(
         }
     });
     for id in ids {
-        let body = match serde_json::to_string(&ItemServed { served_at: served_at.to_string(), trigger: trigger.clone() }) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-        let _ = store.append_event(session_id, lineage_id, actor, EventKind::ItemServed, id, None, &body);
+        append_served(store, session_id, lineage_id, actor, served_at, id, trigger.clone());
+    }
+}
+
+fn append_served(
+    store: &mut EventStore,
+    session_id: &str,
+    lineage_id: &str,
+    actor: &str,
+    served_at: &str,
+    id: &str,
+    trigger: Option<String>,
+) {
+    let Ok(body) = serde_json::to_string(&ItemServed { served_at: served_at.to_string(), trigger }) else { return };
+    let _ = store.append_event(session_id, lineage_id, actor, EventKind::ItemServed, id, None, &body);
+}
+
+/// `record_delivery_with_trigger`, keeping for each item the part of `trigger`
+/// AROUND the item's own anchors (`anchors_of` gives them per id) instead of
+/// the first `TRIGGER_LIMIT` characters (step 27, D9). Field case 2026-10-01:
+/// a long command named an item's file far from its start, the head was all
+/// that was kept, and the evaluation was shown "...ESTIMATOR.md CL" as the
+/// place the item fired. The excerpt carries its own "..." marks, as
+/// `model::store::trigger_excerpt` writes them.
+pub fn record_delivery_around_anchors(
+    store: &mut EventStore,
+    session_id: &str,
+    lineage_id: &str,
+    actor: &str,
+    served_at: &str,
+    anchors_of: &[(String, Vec<String>)],
+    trigger: Option<&str>,
+) {
+    for (id, anchors) in anchors_of {
+        let excerpt = trigger.map(|t| model::store::trigger_excerpt(t, anchors));
+        append_served(store, session_id, lineage_id, actor, served_at, id, excerpt);
     }
 }
 

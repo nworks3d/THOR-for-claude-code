@@ -2039,6 +2039,46 @@ pub fn revise_weakening(before: &Item, updated: &Item, because: Option<&str>) ->
     Ok(found)
 }
 
+/// Every write-time refusal of one revise, in ONE answer (step 27). Field case
+/// 2026-10-01: a revise was refused for its length, then for a weakening, then
+/// (had it got that far) for A4 - one problem per round trip, each hiding the
+/// next. This runs the grounds `revise` checks (the length and the rest), the
+/// weakening ground and A4 together and joins whatever they found.
+///
+/// `gate_before` is the baseline `revise` judges field loss against,
+/// `weak_before` the true head the weakenings and A4 compare with. A4 is
+/// added to the answer only when `a4_always` or when another ground already
+/// refuses: a caller whose trial decides A4 itself (a check that turns out to
+/// have no tooth never reaches it) must not gain a refusal of its own here.
+pub fn revise_refusals(
+    gate_before: &Item,
+    weak_before: &Item,
+    updated: &Item,
+    because: Option<&str>,
+    a4_always: bool,
+) -> Result<(), Refusal> {
+    let mut found: Vec<Refusal> = Vec::new();
+    found.extend(revise(gate_before, updated).err());
+    found.extend(revise_weakening(weak_before, updated, because).err());
+    if a4_always || !found.is_empty() {
+        found.extend(a4_ground(Some(weak_before), updated, None).err());
+    }
+    match found.len() {
+        0 => Ok(()),
+        1 => Err(found.remove(0)),
+        n => Err(Refusal::new(
+            format!(
+                "this revise has {n} problems: {}",
+                found.iter().enumerate().map(|(i, r)| format!("({}) {}", i + 1, r.problem)).collect::<Vec<_>>().join("; ")
+            ),
+            format!(
+                "fix all {n} in one revise: {}",
+                found.iter().enumerate().map(|(i, r)| format!("({}) {}", i + 1, r.fix)).collect::<Vec<_>>().join("; ")
+            ),
+        )),
+    }
+}
+
 /// The literal(s) `check` requires PRESENT in its named file - `None` for a
 /// check whose predicate is not "requires a literal present" (`PathExists`,
 /// `Absent`, `AbsentAll`, `Forbidden`), or for `Requires`, whose own literals
@@ -3384,6 +3424,21 @@ pub fn teeth_candidates(item: &Item) -> Vec<Candidate> {
     out
 }
 
+/// Whether two path fragments name the same file with different amounts of
+/// directory in front: one is the other with a leading part dropped (or added),
+/// compared with `/` and case folded. `server/test/a.js` and `test/a.js` are
+/// the same file seen from two folders; `a.js` alone and `x/a.js` are not
+/// compared (a bare name has no directory to drop).
+fn same_path_by_suffix(a: &str, b: &str) -> bool {
+    if !path_token(a) || !path_token(b) {
+        return false;
+    }
+    let norm = |p: &str| p.replace('\\', "/").to_lowercase();
+    let (a, b) = (norm(a), norm(b));
+    let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    short == long || (short.contains('/') && long.ends_with(&format!("/{short}")))
+}
+
 /// Whether `updated` lost at least one Command, Path or Dir anchor `before`
 /// carried (removed, or replaced by another value). Multiset-safe, like
 /// `binding_removed`.
@@ -3437,8 +3492,15 @@ pub fn weakenings_widened(before: &Item, updated: &Item) -> Vec<Weakening> {
         teeth_candidates(item).into_iter().filter(|c| c.source.is_text()).map(|c| c.value).collect()
     };
     let kept = text_values(updated);
-    let gone: Vec<String> = text_values(before).into_iter().filter(|v| !kept.contains(v)).collect();
-    if !gone.is_empty() {
+    let gone: Vec<String> =
+        text_values(before).into_iter().filter(|v| !kept.iter().any(|k| k == v || same_path_by_suffix(v, k))).collect();
+    // A rule that never had a tooth (the trial's own `teeth:note` label, which
+    // only THOR writes, and no check) loses nothing when a fragment leaves its
+    // text: there was nothing built from it to take away. Field case
+    // 2026-10-01: a path only shortened, on a note, was refused for a missing
+    // `because`.
+    let had_no_tooth = before.check.is_none() && before.tags.iter().any(|t| t == crate::store::TEETH_NOTE_TAG);
+    if !gone.is_empty() && !had_no_tooth {
         add(Weakening {
             label: "text candidate removed",
             problem: format!(
@@ -7391,6 +7453,82 @@ mod two_tracks_tests {
         codes.sort();
         codes.dedup();
         assert_eq!(codes.len(), TWO_TRACK_GROUND_CODES.len());
+    }
+
+    // ------------------------------------------------ step 27: D7 (revise gate)
+
+    const SHORT_PATH_TEXT: &str = "The dashboard render is guarded by server/test/dashboard-render.test.js only.";
+
+    /// FIELD CASE 2026-10-01: a path only shortened (its directory prefix
+    /// dropped), on a note that never had a tooth, was refused for a missing
+    /// `because`.
+    #[test]
+    fn a_path_only_shortened_is_not_a_removal() {
+        let mut before = rule(SHORT_PATH_TEXT, vec![command("node --test")], forbidden(&["--wipe"]));
+        before.text = SHORT_PATH_TEXT.to_string();
+        before.check = None;
+        let mut after = before.clone();
+        after.text = "The dashboard render is guarded by test/dashboard-render.test.js only.".to_string();
+        assert!(weakenings_widened(&before, &after).is_empty(), "{:?}", weakenings_widened(&before, &after));
+        // The same in the other direction and with the other slash.
+        after.text = r"The dashboard render is guarded by server\test\dashboard-render.test.js only.".to_string();
+        assert!(weakenings_widened(&before, &after).is_empty(), "{:?}", weakenings_widened(&before, &after));
+    }
+
+    #[test]
+    fn a_path_that_really_leaves_is_still_a_removal_on_a_rule_with_a_tooth() {
+        let mut before = rule(SHORT_PATH_TEXT, vec![command("node --test")], None);
+        before.tags = vec![crate::store::TEETH_WIRED_TAG.to_string()];
+        let mut after = before.clone();
+        after.text = "The dashboard render is guarded by other-file.test.js only.".to_string();
+        assert_eq!(labels(&weakenings_widened(&before, &after)), vec!["text candidate removed"]);
+    }
+
+    #[test]
+    fn nothing_is_lost_when_a_fragment_leaves_a_rule_that_never_had_a_tooth() {
+        let mut before = rule("Never run `git push --force` on main.", vec![command("git push")], None);
+        before.tags = vec![crate::store::TEETH_NOTE_TAG.to_string()];
+        let mut after = before.clone();
+        after.text = "Never rewrite shared history.".to_string();
+        assert!(weakenings_widened(&before, &after).is_empty());
+        // A different file name is a different file.
+        assert!(!same_path_by_suffix("a/b/x.js", "a/b/y.js"));
+        assert!(!same_path_by_suffix("x.js", "a/x.js"), "a bare name has no directory to drop");
+        assert!(same_path_by_suffix("a/b/x.js", "b/x.js"));
+        assert!(same_path_by_suffix("C:/a/b/x.js", "b/x.js"));
+    }
+
+    /// The length, the weakening and A4 in ONE answer.
+    #[test]
+    fn a_revise_with_several_problems_is_refused_once_with_all_of_them() {
+        let mut before = rule(
+            "Never run `git push --force` on main - it rewrites shared history.",
+            vec![command("git push")],
+            forbidden(&["--force"]),
+        );
+        before.severity = Some(Severity::Irreversible);
+        let mut after = before.clone();
+        // Over the length limit, drops the severity (a weakening, no because)
+        // and no longer names the check's literal.
+        after.text = format!("Never rewrite shared history. {}", "x".repeat(MAX_TEXT_CHARS));
+        after.severity = None;
+        let refusal = revise_refusals(&before, &before, &after, None, false).unwrap_err();
+        assert!(refusal.problem.starts_with("this revise has 3 problems"), "{}", refusal.problem);
+        assert!(refusal.problem.contains("300") || refusal.problem.contains("characters"), "{}", refusal.problem);
+        assert!(refusal.problem.contains("no `because`"), "{}", refusal.problem);
+        assert!(refusal.problem.contains("--force"), "{}", refusal.problem);
+        assert!(refusal.fix.starts_with("fix all 3 in one revise"), "{}", refusal.fix);
+    }
+
+    #[test]
+    fn one_problem_is_refused_exactly_as_before() {
+        let before = rule("Never run `git push --force` on main.", vec![command("git push")], None);
+        let mut after = before.clone();
+        after.text = format!("{} {}", before.text, "x".repeat(MAX_TEXT_CHARS));
+        let one = revise_refusals(&before, &before, &after, None, false).unwrap_err();
+        let plain = revise(&before, &after).unwrap_err();
+        assert_eq!(one.problem, plain.problem);
+        assert!(revise_refusals(&before, &before, &before, None, true).is_ok());
     }
 }
 

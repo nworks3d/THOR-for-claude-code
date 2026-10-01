@@ -725,26 +725,78 @@ fn lifted(store: &EventStore, project: &str, blocker: &Blocker) -> Option<String
             let Ok(root) = project::registered_checkout(store, Some(project)) else {
                 return Some("the working copy is no longer registered - the rules are held by that instead".to_string());
             };
-            let still = crate::live::live_items(store).into_iter().any(|li| {
-                li.item.kind.can_fire()
-                    && model::normalize::normalize_project(li.item.project.as_deref()).as_deref() == Some(project)
-                    && match &li.item.check {
-                        Some(Check::PathExists { path: p }) if p == path => {
-                            model::checkout::crowded_path_anchor(store, &li.item, &root, path).is_some()
-                        }
-                        // A contains or absent check the rule is not anchored
-                        // to, on that same full place (step 24).
-                        Some(Check::Contains { path: p, .. } | Check::Absent { path: p, .. } | Check::AbsentAll { path: p, .. })
-                            if p == path =>
-                        {
-                            model::checkout::crowded_file_anchor(store, &li.item, &root, path).is_some()
-                        }
-                        _ => false,
-                    }
-            });
-            (!still).then(|| format!("{path} has room again, or no rule is held by it any more"))
+            anchor_full_rules(store, project, path, &root)
+                .is_empty()
+                .then(|| format!("{path} has room again, or no rule is held by it any more"))
         }
     }
+}
+
+/// The live rules of `project` whose check reads the full place `path` without
+/// being anchored to it, and that no fact there honestly gives way for (the
+/// step 26 rule): the rules THOR's open point for that place holds.
+fn anchor_full_rules(store: &EventStore, project: &str, path: &str, root: &std::path::Path) -> Vec<String> {
+    crate::live::live_items(store)
+        .into_iter()
+        .filter(|li| {
+            li.item.kind.can_fire()
+                && model::normalize::normalize_project(li.item.project.as_deref()).as_deref() == Some(project)
+                && match &li.item.check {
+                    Some(Check::PathExists { path: p }) if p == path => {
+                        model::checkout::crowded_path_anchor(store, &li.item, root, path).is_some()
+                    }
+                    // A contains or absent check the rule is not anchored
+                    // to, on that same full place (step 24).
+                    Some(Check::Contains { path: p, .. } | Check::Absent { path: p, .. } | Check::AbsentAll { path: p, .. })
+                        if p == path =>
+                    {
+                        model::checkout::crowded_file_anchor(store, &li.item, root, path).is_some()
+                    }
+                    _ => false,
+                }
+        })
+        .map(|li| li.id)
+        .collect()
+}
+
+/// The words a full-place point had before step 26 (2.5.4), when the owner
+/// "decided which fact gives way". A point still carrying them was written by
+/// an older build and is judged again under the current rule.
+const OLD_ANCHOR_FULL_TEXT: &str = "owner decides which fact gives way";
+
+/// THE POINTS AN OLDER BUILD LEFT (step 27, D4). A full-place open point written
+/// before 2.5.4 still says the owner decides which fact gives way, and went on
+/// saying so until some evaluation started in its project. Judged again here,
+/// at the first start of a session in that project: closed when no rule is held
+/// by the place any more (a place with an honest exit is the agent's, and its
+/// rules are tried again at the next evaluation), reworded to the current text
+/// otherwise. Only points that still carry the old words are touched, so this
+/// does nothing the second time. Written as THOR's eval-machine, like every
+/// machine point; returns the ids it closed or reworded.
+pub fn refresh_old_anchor_full_points(store: &mut EventStore, session: &str, project: &str) -> Vec<String> {
+    let stale: Vec<model::store::OpenPoint> = model::store::open_points(store, Some(project))
+        .into_iter()
+        .filter(|p| p.machine && p.blocker.as_deref() == Some("anchor-full") && p.text.contains(OLD_ANCHOR_FULL_TEXT))
+        .collect();
+    let mut done = Vec::new();
+    for point in stale {
+        let Some(path) = point.subject.clone() else { continue };
+        let blocker = Blocker::AnchorFull { path: path.clone() };
+        let written = match lifted(store, project, &blocker) {
+            Some(reason) => model::store::retract_machine_point(store, eval_machine(), session, &point.id, &reason).is_ok(),
+            None => {
+                let Ok(root) = project::registered_checkout(store, Some(project)) else { continue };
+                let rules = anchor_full_rules(store, project, &path, &root);
+                let carried_by = model::store::carriers_of(store, project, &path, i64::MAX);
+                let text = point_text(store, project, &blocker, &rules, true, &carried_by);
+                model::store::write_machine_point(store, eval_machine(), session, project, &blocker, &text).is_ok()
+            }
+        };
+        if written {
+            done.push(point.id);
+        }
+    }
+    done
 }
 
 /// THOR's machine pass for one evaluation start (see this module's doc
