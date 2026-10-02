@@ -115,6 +115,13 @@ fn main() -> ExitCode {
         println!("{line}");
     }
 
+    // A running tool server older than its program on disk (field test 5, D4).
+    if let Some(bin_dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(std::path::Path::to_path_buf)) {
+        if let Some(line) = ops::health::stale_tool_server_line(&bin_dir) {
+            println!("{line}");
+        }
+    }
+
     // --gate turns the report above into an exit code, reusing its verdict
     // rather than deciding anything new here - see `ops::health::gate_verdict`
     // for which findings count and why. Without --gate, cli.gate is false and

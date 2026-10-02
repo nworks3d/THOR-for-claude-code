@@ -858,7 +858,25 @@ pub fn record_write_verifications(store: &mut EventStore, session: &str) -> usiz
 /// `record_write_verifications` against the transcripts under `root`. Reads
 /// the session's transcripts ONCE for all of its unverified writes.
 pub fn record_write_verifications_in(store: &mut EventStore, session: &str, root: Option<&Path>) -> usize {
-    record_writes_of(store, session, session, root)
+    record_writes_of(store, session, session, root, false)
+}
+
+/// FIELD TEST 5 (D5). Called when an evaluation report is being filed: attest,
+/// right now, the writes of `session` whose three transcript lines are already
+/// on disk (the call, THOR's hook marker, the result naming the write), so a
+/// report that settles rules by writes to them does not have to end the turn
+/// once just for the Stop to read the same lines. Only POSITIVE answers are
+/// recorded: a call still running, or one that does not check out, is left for
+/// the Stop to decide, so this can never mark a write as a side door early. A
+/// verdict (a mark) is left to the Stop as before - the one turn between
+/// reading an item and judging it. Returns how many it recorded.
+pub fn attest_finished_writes(store: &mut EventStore, session: &str) -> usize {
+    attest_finished_writes_in(store, session, transcripts_root().as_deref())
+}
+
+/// `attest_finished_writes` against the transcripts under `root`.
+pub fn attest_finished_writes_in(store: &mut EventStore, session: &str, root: Option<&Path>) -> usize {
+    record_writes_of(store, session, session, root, true)
 }
 
 /// THE WRITES OF ANOTHER SESSION ON AN OPEN EVALUATION'S LISTS (step 24),
@@ -909,14 +927,16 @@ pub fn record_foreign_write_verifications_in(store: &mut EventStore, session: &s
             }
             continue;
         }
-        recorded += record_writes_of(store, &writer, session, Some(root));
+        recorded += record_writes_of(store, &writer, session, Some(root), false);
     }
     recorded
 }
 
 /// Verify every unverified write of `session` against its transcripts under
-/// `root`, recording each verdict under `recorder`'s name.
-fn record_writes_of(store: &mut EventStore, session: &str, recorder: &str, root: Option<&Path>) -> usize {
+/// `root`, recording each verdict under `recorder`'s name. With
+/// `positive_only` (`attest_finished_writes`): only the attested answers are
+/// recorded, and verdicts (marks) are not looked at.
+fn record_writes_of(store: &mut EventStore, session: &str, recorder: &str, root: Option<&Path>, positive_only: bool) -> usize {
     if session.is_empty() {
         return 0;
     }
@@ -929,6 +949,7 @@ fn record_writes_of(store: &mut EventStore, session: &str, recorder: &str, root:
     let pending: Vec<(Event, Result<Claim, String>)> = writes
         .into_iter()
         .filter(|e| !done.contains_key(&e.seq))
+        .filter(|e| !(positive_only && matches!(e.kind, EventKind::ItemMarkedUseful | EventKind::ItemMarkedNoise)))
         // THOR's OWN WRITES (its installer's migration, its machine pass) are
         // made by no tool call, so there is nothing to attest and nothing to
         // call a side door: the actor is the stamp (step 27, D10). Field case
@@ -956,6 +977,9 @@ fn record_writes_of(store: &mut EventStore, session: &str, recorder: &str, root:
             Ok(claim) => judge_write(event, claim, found.get(&claim.tool_use_id).cloned().unwrap_or(Found::Nothing)),
         };
         if let Some(verdict) = verdict {
+            if positive_only && !matches!(verdict, WriteAttestation::Attested { .. }) {
+                continue;
+            }
             verdicts.push((event.clone(), verdict));
         }
     }
@@ -2507,6 +2531,39 @@ mod write_tests {
         record_write_verifications_in(&mut store, S, Some(root.path()));
         let verdict = write_verdicts(&store).remove(&event.seq).expect("recorded");
         assert!(!verdict.attested && verdict.why == "toolu_B is a Bash call, not mcp__thor__remember", "{verdict:?}");
+    }
+
+    /// Field test 5 (D5): at filing, a finished write is attested on the spot;
+    /// a verdict, and a call that does not check out, wait for the Stop (and
+    /// the second is never recorded as false early).
+    #[test]
+    fn finished_writes_are_attested_at_filing_and_the_rest_waits_for_the_stop() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = EventStore::in_memory().unwrap();
+        let mut t = main_transcript(root.path(), S);
+        let genuine = real_call(&mut store, root.path(), &mut t, "toolu_G");
+        // A replay of the same call id with another text: it does not check out.
+        let mut changed = args();
+        changed["text"] = json!("Run git diff before a push to see what leaves the machine, always.");
+        let att = att_for_call(&meta("toolu_G"), Some(S), &changed, "remember", Some(root.path()));
+        let mut replay = item();
+        replay.id = "fx-rule-replayed".to_string();
+        replay.text = "Run git diff before a push to see what leaves the machine.".to_string();
+        let replayed = model::store::declare_in_scoped(&mut store, S, "mcp", "mcp", &replay, None, None, None, Some(&att)).unwrap();
+        t.result("toolu_G", &format!("stored 'fx-rule-replayed' (Rule, event seq {})", replayed.seq)).write();
+        let mark = attested_mark_unverified(&mut store, root.path(), S, "fx-rule", false, "toolu_H");
+
+        assert_eq!(attest_finished_writes_in(&mut store, S, Some(root.path())), 1, "only the genuine write");
+        assert!(write_verdicts(&store).get(&genuine.seq).is_some_and(|v| v.attested), "{:?}", write_verdicts(&store));
+        assert!(!write_verdicts(&store).contains_key(&mark), "a verdict is left to the Stop");
+        let replay_records = model::store::recorded_write_verdicts(&store.get_events_by_entity("fx-rule-replayed").unwrap());
+        assert!(replay_records.is_empty(), "a call that does not check out is not recorded false early");
+
+        // The Stop then decides the other two, as before.
+        assert_eq!(record_write_verifications_in(&mut store, S, Some(root.path())), 2);
+        assert!(write_verdicts(&store).get(&mark).is_some_and(|v| v.attested));
+        let replay_records = model::store::recorded_write_verdicts(&store.get_events_by_entity("fx-rule-replayed").unwrap());
+        assert!(replay_records.get(&replayed.seq).is_some_and(|v| !v.attested));
     }
 
     /// Recorded once, by the attester, and read back from the record alone.

@@ -155,20 +155,105 @@ pub fn replica_line(db: &Path, replica: Option<(&str, &str)>) -> String {
 /// only has to be small next to that.
 pub const SHIP_STALE_CEILING_HOURS: u64 = 3;
 
-/// The off-site backup's failure, in plain words: `None` while it is healthy
-/// (the sidecar only exists between a failed attempt and the next success).
-/// The backup runs inside a SessionStart hook, where a failure is invisible,
-/// so this is where the owner learns the copy on GitHub has gone stale.
+/// FIELD TEST 5 (D4): the tool server (`mcp.exe`) a Claude Code session talks
+/// to is loaded once, when Claude starts. After the program is replaced a
+/// running session keeps the old one, and the two disagree about what the
+/// memory says (one reported 140 owed where the new count was 13). This names
+/// every running `mcp.exe` that started before the file on disk was replaced.
+/// `None` when none is stale, none runs, or the platform cannot say.
+pub fn stale_tool_server_line(bin_dir: &Path) -> Option<String> {
+    let exe = bin_dir.join(if cfg!(windows) { "mcp.exe" } else { "mcp" });
+    let modified = std::fs::metadata(&exe).ok()?.modified().ok()?;
+    let modified_unix = modified.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64;
+    let started = running_tool_servers(&exe);
+    stale_servers_line(modified_unix, &started)
+}
+
+/// The words of the finding, from when the file was replaced and the
+/// `(process id, start time)` of every running tool server.
+fn stale_servers_line(replaced_unix: i64, started: &[(u32, i64)]) -> Option<String> {
+    let stale: Vec<&(u32, i64)> = started.iter().filter(|(_, start)| *start < replaced_unix).collect();
+    if stale.is_empty() {
+        return None;
+    }
+    let ids: Vec<String> = stale
+        .iter()
+        .map(|(pid, start)| format!("{pid} (started {})", serve::time::iso8601_from_unix(*start)))
+        .collect();
+    Some(format!(
+        "tool server: {} running mcp.exe process(es) started before mcp.exe was replaced ({}): {} - they still run the OLD          program and may count and judge differently. Restart Claude to load the new tool server.",
+        stale.len(),
+        serve::time::iso8601_from_unix(replaced_unix),
+        ids.join(", ")
+    ))
+}
+
+/// Every running process of `exe`, as (process id, start time in Unix
+/// seconds). Windows only: asks PowerShell, windowless; anywhere else, or when
+/// that fails, an empty list (the finding is then simply not made).
+#[cfg(windows)]
+fn running_tool_servers(exe: &Path) -> Vec<(u32, i64)> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let script = "Get-Process -Name mcp -ErrorAction SilentlyContinue | ForEach-Object {                   $_.Id.ToString() + '|' + ([DateTimeOffset]$_.StartTime).ToUnixTimeSeconds() + '|' + $_.Path }";
+    let Ok(out) = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+    else {
+        return Vec::new();
+    };
+    let wanted = exe.to_string_lossy().replace('/', "\\").to_lowercase();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.trim().splitn(3, '|');
+            let pid = parts.next()?.parse::<u32>().ok()?;
+            let start = parts.next()?.parse::<i64>().ok()?;
+            let path = parts.next()?.replace('/', "\\").to_lowercase();
+            (path == wanted).then_some((pid, start))
+        })
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn running_tool_servers(_exe: &Path) -> Vec<(u32, i64)> {
+    Vec::new()
+}
+
+/// The off-site backup, in plain words: where the last copy went and when,
+/// or - when the last attempt failed - that it is failing, since when and
+/// why. `None` only before any backup has run here. The backup runs inside a
+/// SessionStart hook, where a failure is invisible, so this is where the owner
+/// learns the copy has gone stale, and which place it is supposed to reach.
 pub fn backup_line(db: &Path) -> Option<String> {
     backup_line_at(db, crate::backup_state::now_unix())
 }
 
+/// `nas (//host/share/folder)`, or just the folder name when no remote was
+/// ever recorded.
+fn backup_target_text(state: &crate::backup_state::BackupState) -> String {
+    let repo = if state.repo.is_empty() { "the backup repository" } else { state.repo.as_str() };
+    match (state.remote.is_empty(), state.address.is_empty()) {
+        (true, _) => repo.to_string(),
+        (false, true) => format!("{repo} (remote {})", state.remote),
+        (false, false) => format!("{repo} (remote {}: {})", state.remote, state.address),
+    }
+}
+
 fn backup_line_at(db: &Path, now: u64) -> Option<String> {
     let state = crate::backup_state::read(db)?;
-    let repo = if state.repo.is_empty() { "the backup repository" } else { state.repo.as_str() };
+    let target = backup_target_text(&state);
+    if !state.is_failing() {
+        if state.last_ok_unix == 0 {
+            return None;
+        }
+        let hours = now.saturating_sub(state.last_ok_unix) / 3600;
+        return Some(format!("backup: last copy went to {target}, {hours}h ago"));
+    }
     let hours = now.saturating_sub(state.failing_since_unix) / 3600;
     Some(format!(
-        "backup to {repo} failing since {} ({hours}h ago): {} - the off-site copy is not being updated; run backup.exe by hand and read what it prints",
+        "backup to {target} failing since {} ({hours}h ago): {} - the off-site copy is not being updated; run backup.exe by hand and read what it prints",
         serve::time::iso8601_from_unix(state.failing_since_unix as i64),
         state.last_error
     ))
@@ -1188,7 +1273,18 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool
         // firing - measured 2026-09-17 (acme-shop eval 1 and 2): five
         // owed items were skipped outright for exactly that gap.
         let last_fired = match &item.last_trigger {
-            Some(trigger) => format!(", last fired at '{trigger}'"),
+            Some(trigger) => {
+                // The log keeps a longer place than a doctor line shows.
+                let anchors: Vec<String> = item
+                    .bindings
+                    .iter()
+                    .filter_map(|b| match b {
+                        model::item::Binding::Target { value, .. } => Some(value.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                format!(", last fired at '{}'", model::store::trigger_excerpt(trigger, &anchors))
+            }
             None => String::new(),
         };
         out.push(format!(
@@ -2861,7 +2957,7 @@ pub fn report(
     // `ship_line`'s own doc comment for why "never shipped" is not itself a
     // finding worth a permanent line.
     lines.extend(ship_line(db));
-    // Silent unless the off-site backup is failing right now.
+    // Where the last off-site copy went, or that it is failing right now.
     lines.extend(backup_line(db));
     lines.extend(drain_refusals_line(db));
     lines.extend([
@@ -4336,11 +4432,41 @@ mod tests {
     }
 
     #[test]
+    fn a_tool_server_started_before_the_program_was_replaced_is_named() {
+        let line = stale_servers_line(1_790_000_000, &[(111, 1_789_990_000), (222, 1_790_000_500)]).expect("one is stale");
+        assert!(line.starts_with("tool server: 1 running mcp.exe process(es) started before mcp.exe was replaced"), "{line}");
+        assert!(line.contains("111 (started 2026-") && !line.contains("222"), "{line}");
+        assert!(line.contains("Restart Claude to load the new tool server"), "{line}");
+        assert_eq!(stale_servers_line(1_790_000_000, &[(222, 1_790_000_500)]), None, "a newer process is fine");
+        assert_eq!(stale_servers_line(1_790_000_000, &[]), None, "none running is fine");
+    }
+
+    #[test]
     fn backup_line_is_silent_while_the_backup_is_healthy() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
         EventStore::new(&db).unwrap();
         assert_eq!(backup_line(&db), None);
+    }
+
+    #[test]
+    fn backup_line_names_the_nas_target_and_age_after_a_good_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        EventStore::new(&db).unwrap();
+        let at = 1_790_000_000;
+        crate::backup_state::record_success_for(
+            &db,
+            std::path::Path::new("C:/x/acme-backup"),
+            "nas",
+            "//nas/share/acme-backup",
+            at,
+            true,
+        );
+        let line = backup_line_at(&db, at + 3 * 3600).expect("a good backup must be visible");
+        assert!(line.starts_with("backup: last copy went to acme-backup (remote nas: //nas/share/acme-backup), 3h ago"), "{line}");
+        let lines = report(&db, None, None, None, None, None, false, None);
+        assert!(lines.iter().any(|l| l.contains("remote nas: //nas/share/acme-backup")), "{lines:#?}");
     }
 
     #[test]
@@ -4358,6 +4484,25 @@ mod tests {
         .unwrap();
         let line = backup_line_at(&db, since + 31 * 3600).expect("a failing backup must produce a line");
         assert!(line.starts_with("backup to acme-backup failing since 2026-"), "{line}");
+        // With a remote on record the target is named in the line.
+        crate::backup_state::record_failure_for(
+            &db,
+            std::path::Path::new("C:/x/acme-backup"),
+            "nas",
+            "//nas/share/acme-backup",
+            "share is gone",
+            since + 3600,
+        )
+        .unwrap();
+        let named = backup_line_at(&db, since + 4 * 3600).unwrap();
+        assert!(named.starts_with("backup to acme-backup (remote nas: //nas/share/acme-backup) failing since"), "{named}");
+        crate::backup_state::record_failure_at(
+            &db,
+            std::path::Path::new("C:/x/acme-backup"),
+            "git push failed: file thor2/events.jsonl is 106.42 MB; this exceeds the file size limit",
+            since,
+        )
+        .unwrap();
         assert!(line.contains("(31h ago)"), "{line}");
         assert!(line.contains("106.42 MB"), "the reason must be in the line: {line}");
         let lines = report(&db, None, None, None, None, None, false, None);

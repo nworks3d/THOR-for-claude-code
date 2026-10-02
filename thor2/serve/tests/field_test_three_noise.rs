@@ -335,7 +335,7 @@ fn one_refusal_names_every_requires_rule_the_call_trips() {
 // ------------------------------------------------------------------ D9
 
 /// A long command that names an item's file far from its start: the place kept
-/// is the part around the file, not the first 120 characters.
+/// is the part around the file, not the first 400 characters.
 #[test]
 fn the_place_an_item_fired_is_cut_around_its_anchor() {
     let fx = Fx::new();
@@ -348,13 +348,13 @@ fn the_place_an_item_fired_is_cut_around_its_anchor() {
             None,
         ),
     );
-    let padding = "x".repeat(300);
+    let padding = "x".repeat(800);
     let command = format!("python scan.py --root {padding} --file docs/THE-ANCHOR.md --verbose");
     fx.bash(S1, None, &command);
     let store = EventStore::new(&fx.db()).unwrap();
     let trigger = model::served::last_trigger(&store, "readme-note").expect("the item fired");
     assert!(trigger.contains("docs/THE-ANCHOR.md"), "the stored place names the anchor: {trigger}");
-    assert!(trigger.chars().count() <= 126, "and stays short: {trigger}");
+    assert!(trigger.chars().count() <= serve::deliver::TRIGGER_LIMIT + 6, "and stays short: {trigger}");
     assert!(trigger.starts_with("..."), "and says it was cut: {trigger}");
 }
 

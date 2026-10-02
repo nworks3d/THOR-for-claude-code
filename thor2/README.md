@@ -589,7 +589,13 @@ day. The log is exported in numbered files (`events-0001.jsonl`, ...) of at
 most 50 MB each, so no file passes the size GitHub accepts, and
 `backup --restore-from` takes the folder that holds them. A backup that fails
 is not tried again at every session start, only after an hour, and `doctor`
-says since when it has been failing and why.
+says since when it has been failing and why. Where the copy goes is chosen
+without a setting: a remote called `nas` in the backup folder wins, else the
+remote the branch already follows, else `origin`; `backup --remote <name>` names
+one on purpose, and a name the folder does not have is refused with the fix. A
+private copy can move from a website to a bare repository on a NAS this way,
+and neither the hook nor a scheduled task has to change. `doctor` prints one line with the place and the age of the last copy even
+while all is well.
 
 So a write arriving at the copy is not applied there. It is queued, and the
 authority applies it later. Three commands, in the order you set them up:

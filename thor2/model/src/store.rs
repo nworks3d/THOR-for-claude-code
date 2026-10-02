@@ -1294,7 +1294,9 @@ pub struct TrialCorpus {
     pub reached: usize,
     /// Of those, the ones that carry the literal as a whole token.
     pub whole_hits: usize,
-    /// Reached calls cut at 120 characters, which prove nothing absent.
+    /// Reached calls the log recorded cut (an older build kept 120 characters,
+    /// a longer call is cut at `serve::deliver::TRIGGER_LIMIT`), which prove
+    /// nothing absent: they were not tried.
     pub cut: usize,
     pub stopped_forcing: Vec<StoppedForcing>,
 }
@@ -4384,14 +4386,21 @@ pub const FIRED_WITHOUT_TRIGGER: &str = "(a prompt or a tool call with no comman
 /// first of `anchors` it names (slashes compared alike, case ignored), else
 /// its start.
 pub fn trigger_excerpt(trigger: &str, anchors: &[String]) -> String {
+    trigger_excerpt_to(trigger, anchors, FIRED_TRIGGER_CHARS)
+}
+
+/// `trigger_excerpt` with the size given: the log records a longer excerpt
+/// than an evaluation shows (`serve::deliver::TRIGGER_LIMIT`), so the trial of
+/// a rule can read most real calls whole.
+pub fn trigger_excerpt_to(trigger: &str, anchors: &[String], limit: usize) -> String {
     let chars: Vec<char> = trigger.chars().collect();
-    if chars.len() <= FIRED_TRIGGER_CHARS {
+    if chars.len() <= limit {
         return trigger.to_string();
     }
     // An excerpt this function wrote itself at the time of the firing (its
     // "..." marks included) is already the right size: cut again it would
     // lose its own end.
-    if chars.len() <= FIRED_TRIGGER_CHARS + 6 && (trigger.starts_with("...") || trigger.ends_with("...")) {
+    if chars.len() <= limit + 6 && (trigger.starts_with("...") || trigger.ends_with("...")) {
         return trigger.to_string();
     }
     let folded: String = trigger.chars().map(|c| if c == '\\' { '/' } else { c.to_ascii_lowercase() }).collect();
@@ -4401,12 +4410,12 @@ pub fn trigger_excerpt(trigger: &str, anchors: &[String]) -> String {
         .filter(|a| !a.is_empty())
         .find_map(|a| folded.find(&a).map(|byte| (folded[..byte].chars().count(), a.chars().count())));
     let start = match hit {
-        Some((at, len)) if at + len > FIRED_TRIGGER_CHARS => (at + len / 2).saturating_sub(FIRED_TRIGGER_CHARS / 2),
+        Some((at, len)) if at + len > limit => (at + len / 2).saturating_sub(limit / 2),
         _ => 0,
     };
-    let start = start.min(chars.len() - FIRED_TRIGGER_CHARS);
-    let cut: String = chars[start..start + FIRED_TRIGGER_CHARS].iter().collect();
-    match (start > 0, start + FIRED_TRIGGER_CHARS < chars.len()) {
+    let start = start.min(chars.len() - limit);
+    let cut: String = chars[start..start + limit].iter().collect();
+    match (start > 0, start + limit < chars.len()) {
         (true, true) => format!("...{cut}..."),
         (true, false) => format!("...{cut}"),
         (false, true) => format!("{cut}..."),
@@ -5637,7 +5646,10 @@ fn check_evaluation_report_filing(store: &EventStore, item: &Item, ctx: Option<&
     if !unverified.is_empty() {
         missing.push(format!(
             "{} write(s) of this turn on this evaluation's lists are not checked yet: {}. {TURN_NOT_ENDED} - THOR reads \
-             each call back from this session's transcript at the Stop, and until then it counts as not yet attested",
+             each call back from this session's transcript at the Stop, and until then it counts as not yet attested. \
+             (When you filed, THOR already tried to read each rule write back from the transcript and attested those \
+             it could; what is named here is a verdict, which waits for the Stop by design, or a call whose lines \
+             were not all on disk yet)",
             unverified.len(),
             unverified.join(", ")
         ));
@@ -6330,9 +6342,16 @@ fn machine_section(store: &EventStore, start: &EvaluationStart, filed_seq: i64) 
     // A call the evaluating session made inside its own evaluation proves no
     // tooth, whatever its transcript holds (step 20, NEW-2).
     let mut own_session = 0usize;
+    // Writes the trial refused in OTHER sessions during the window: not this
+    // evaluation's, counted apart (field test 5, D7: four counted, three its own).
+    let mut trial_refused_elsewhere = 0usize;
     for event in window.iter().filter(|e| e.kind == EventKind::GateRefused) {
         if event.actor == TEETH_WRITE_ACTOR {
-            trial_refused += 1;
+            if event.session_id == session {
+                trial_refused += 1;
+            } else {
+                trial_refused_elsewhere += 1;
+            }
         } else if event.actor == ASSISTANT_DELIVERY_ACTOR && event.session_id == session {
             own_session += 1;
             never_proof += 1;
@@ -6351,6 +6370,11 @@ fn machine_section(store: &EventStore, start: &EvaluationStart, filed_seq: i64) 
          {never_proof} probe or hand-fed refusal(s) (never proof); {unchecked} not verified yet; {trial_refused} write(s) \
          refused by THOR's own trial."
     ));
+    if trial_refused_elsewhere > 0 {
+        out.push_str(&format!(
+            " {trial_refused_elsewhere} more write(s) refused by the trial in other sessions during the window are not counted here."
+        ));
+    }
     if own_session > 0 {
         out.push_str(&format!(
             " {own_session} of the refusals never proof were calls the evaluating session made itself during this \
@@ -9833,6 +9857,22 @@ mod tests {
         file_in(&mut store, &eval_report("eval-mp-own", "mp"), &start).unwrap();
         let after = store.get_next_seq().unwrap();
         assert!(evaluation_open_in_session_at(&store, "mp-session", after, None).is_none(), "closed by its filing");
+    }
+
+    /// Field test 5 (D7): "write(s) refused by THOR's own trial" counts the
+    /// evaluating session's own refusals only; another session's are named
+    /// apart, never added.
+    #[test]
+    fn the_machine_section_counts_only_the_evaluating_sessions_trial_refusals() {
+        let mut store = EventStore::in_memory().unwrap();
+        let start = record_start(&mut store, "mp-session", "mp");
+        for (session, id) in [("mp-session", "own-one"), ("mp-session", "own-two"), ("other-session", "theirs")] {
+            record_refused_write(&mut store, session, SystemActor::new(TEETH_WRITE_ACTOR), id, "forcing", &[], "the text").unwrap();
+        }
+        let filed_seq = store.get_next_seq().unwrap() - 1;
+        let section = render_machine_section(&store, &start, filed_seq);
+        assert!(section.contains("2 write(s) refused by THOR's own trial."), "{section}");
+        assert!(section.contains("1 more write(s) refused by the trial in other sessions during the window are not counted here"), "{section}");
     }
 
     /// G15.2: two quiet evaluations - nothing on any list, the same one-line

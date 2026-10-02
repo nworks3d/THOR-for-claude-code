@@ -549,8 +549,10 @@ fn the_filing_is_held_to_the_batch_frozen_at_its_start() {
     assert!(reply.starts_with("retracted fx-heavy-01"), "{reply}");
     let refused = s.call(&mut mcp, "remember", report_args(REPORT, "demo", TLDR), "toolu_file1");
     assert!(refused.starts_with("REFUSED"), "{refused}");
-    assert!(refused.contains(model::store::TURN_NOT_ENDED), "the retract of this turn waits for its Stop: {refused}");
-    assert_eq!(names(&refused), ids[..8].to_vec(), "only frozen ids: {refused}");
+    // Field test 5 (D5): the retract is a rule write already fully in the transcript, so
+    // it is attested at the filing and the turn need not end for it.
+    assert!(!refused.contains(model::store::TURN_NOT_ENDED), "the retract was attested at the filing: {refused}");
+    assert_eq!(names(&refused), ids[1..8].to_vec(), "only frozen ids, the retracted one settled: {refused}");
 
     s.stop();
     let refused = s.call(&mut mcp, "remember", report_args(REPORT, "demo", TLDR), "toolu_file2");

@@ -27,8 +27,9 @@
 //! - counted for the majority question (K8(d)), when it is whole.
 //!
 //! CUT CALLS (F20). A trigger is stored cut at `deliver::TRIGGER_LIMIT`
-//! characters. A call of exactly that length is marked cut and its last
-//! (possibly cut) token dropped. A cut call is never evidence that a literal
+//! characters (120 before step 30, `LEGACY_TRIGGER_LIMIT`), or as an excerpt
+//! with "..." marks where it is cut. A call of exactly either limit, or with
+//! marks, is marked cut and its partial end token(s) dropped. A cut call is never evidence that a literal
 //! is ABSENT: it never counts as a call a check lets through, never toward
 //! "refuses zero real calls", never in the majority count. It is listed as a
 //! hit only when its visible part carries the literal.
@@ -37,7 +38,7 @@ use std::collections::HashMap;
 use thor_core::event_store::{EventKind, EventStore};
 
 use crate::attest::is_uuid_shaped;
-use crate::deliver::TRIGGER_LIMIT;
+use crate::deliver::{LEGACY_TRIGGER_LIMIT, TRIGGER_LIMIT};
 use crate::shell::{self, Segment};
 
 /// How many distinct calls the corpus keeps, newest first.
@@ -100,7 +101,8 @@ pub struct RealCall {
     /// The call as an anchor and a literal are read in: the recorded text, or
     /// its visible part (last token dropped) when it was cut.
     pub text: String,
-    /// Recorded cut at `TRIGGER_LIMIT` characters.
+    /// Recorded cut (at `TRIGGER_LIMIT` characters, or at the 120 an older
+    /// build kept, or as an excerpt with "..." marks).
     pub cut: bool,
     /// `text`, cut into its simple commands once, at load.
     pub segments: Vec<Segment>,
@@ -176,15 +178,36 @@ fn as_trigger(text: &str) -> String {
     text.chars().take(TRIGGER_LIMIT).collect()
 }
 
-/// The visible part of a recorded trigger, and whether it was cut: a trigger
-/// of exactly `TRIGGER_LIMIT` characters loses its last token.
+/// The visible part of a recorded trigger, and whether it was cut. A cut
+/// trigger is one of exactly `TRIGGER_LIMIT` characters, one of exactly the
+/// 120 an older build kept, or an excerpt with "..." marks; the partial token
+/// at each cut end is dropped (a mark at the start drops the first token, a
+/// mark or a hard cut at the end drops the last).
 fn visible(text: &str) -> (String, bool) {
-    if text.chars().count() < TRIGGER_LIMIT {
+    let count = text.chars().count();
+    let marked_start = text.starts_with("...");
+    let marked_end = text.ends_with("...");
+    let hard_cut = count == LEGACY_TRIGGER_LIMIT || count >= TRIGGER_LIMIT;
+    if !marked_start && !marked_end && !hard_cut {
         return (text.to_string(), false);
     }
-    let trimmed = text.trim_end();
-    let cut_at = trimmed.rfind(char::is_whitespace).unwrap_or(0);
-    (trimmed[..cut_at].trim_end().to_string(), true)
+    let mut body = text;
+    if marked_start {
+        let rest = body.trim_start_matches("...");
+        body = match rest.find(char::is_whitespace) {
+            Some(at) => &rest[at..],
+            None => "",
+        };
+    }
+    if marked_end {
+        body = body.trim_end_matches("...");
+    }
+    if marked_end || hard_cut {
+        let trimmed = body.trim_end();
+        let cut_at = trimmed.rfind(char::is_whitespace).unwrap_or(0);
+        body = &trimmed[..cut_at];
+    }
+    (body.trim().to_string(), true)
 }
 
 impl Corpus {
@@ -220,7 +243,10 @@ impl Corpus {
                 }
                 EventKind::GateRefused if e.actor == model::store::ASSISTANT_DELIVERY_ACTOR => {
                     let Some(target) = body.get("target").and_then(|t| t.as_str()) else { continue };
+                    // Both cuts: an event an older build wrote holds the call cut at 120.
                     self.refused_by_session.entry((e.session_id.clone(), as_trigger(target))).or_insert(e.seq);
+                    let legacy: String = target.chars().take(LEGACY_TRIGGER_LIMIT).collect();
+                    self.refused_by_session.entry((e.session_id.clone(), legacy)).or_insert(e.seq);
                 }
                 _ => {}
             }
@@ -338,6 +364,13 @@ mod tests {
         store.get_events_by_entity("r").unwrap().last().unwrap().seq
     }
 
+    /// A served event the way a build before step 30 wrote it: the trigger
+    /// cut hard at 120 characters.
+    fn served_by_an_older_build(store: &mut EventStore, session: &str, trigger: &str) {
+        let body = serde_json::json!({"served_at": "2026-09-28T00:00:00Z", "trigger": trigger}).to_string();
+        store.append_event(session, session, "hook", EventKind::ItemServed, "r", None, &body).unwrap();
+    }
+
     fn refused(store: &mut EventStore, session: &str, target: &str) {
         crate::deliver::record_gate_outcome(store, session, session, "hook", "2026-09-28T00:00:01Z", true, "r", target);
     }
@@ -419,7 +452,7 @@ mod tests {
     /// never counts as a call a check lets through, never stops forcing.
     #[test]
     fn a_cut_trigger_loses_its_last_token_and_never_proves_absence() {
-        let long = format!("git push origin feature/{}", "very-long-name-".repeat(10));
+        let long = format!("git push origin feature/{}", "very-long-name-".repeat(40));
         let mut store = EventStore::in_memory().unwrap();
         served(&mut store, S1, &long);
         served(&mut store, S1, "git push origin main");
@@ -431,6 +464,46 @@ mod tests {
         assert_eq!(cut.counts_against_forcing(Some(S2), None), None, "a cut call never stops forcing");
         let whole = corpus.calls().iter().find(|c| !c.cut).unwrap();
         assert!(!whole.cut && whole.text == "git push origin main");
+    }
+
+    /// Field test 5 (D2): the log used to keep 120 characters of a call, so
+    /// most real `ssh ... docker exec ... sh -c "..."` calls were cut and the
+    /// trial could not see the literal. A call of a few hundred characters is
+    /// now recorded and read whole.
+    #[test]
+    fn a_call_of_a_few_hundred_characters_is_kept_whole() {
+        let call = format!("ssh nas 'sudo docker exec app sh -c \"{}\"'", "echo hello && ".repeat(15));
+        assert!(call.chars().count() > 200 && call.chars().count() < TRIGGER_LIMIT);
+        let mut store = EventStore::in_memory().unwrap();
+        served(&mut store, S1, &call);
+        let corpus = Corpus::load(&store);
+        let found = &corpus.calls()[0];
+        assert!(!found.cut, "a call under the limit is whole");
+        assert_eq!(found.text, call);
+        assert!(found.hit("ssh", "sh -c"));
+    }
+
+    /// An older build cut at exactly 120 characters; those events stay in the
+    /// log, and a call of that length is still read as cut.
+    #[test]
+    fn a_trigger_an_older_build_cut_at_120_characters_is_still_cut() {
+        let old: String = format!("ssh nas 'docker exec app {}", "x".repeat(200)).chars().take(120).collect();
+        let mut store = EventStore::in_memory().unwrap();
+        served_by_an_older_build(&mut store, S1, &old);
+        let corpus = Corpus::load(&store);
+        assert!(corpus.calls()[0].cut, "a 120-character trigger is a cut one");
+    }
+
+    /// An excerpt the hook wrote around an anchor carries "..." where it is
+    /// cut; both partial ends are dropped and the call is marked cut.
+    #[test]
+    fn an_excerpt_with_marks_is_cut_at_both_ends() {
+        let mut store = EventStore::in_memory().unwrap();
+        served(&mut store, S1, "...ker exec app sh -c ls && echo hi th...");
+        let corpus = Corpus::load(&store);
+        let call = &corpus.calls()[0];
+        assert!(call.cut);
+        assert_eq!(call.text, "exec app sh -c ls && echo hi");
     }
 
     /// R7a.6 and G7a.3 (D6): a call made by the writing session, or after the

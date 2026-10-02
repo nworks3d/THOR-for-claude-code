@@ -996,6 +996,10 @@ fn filing_context(
     let (Some(session), Some(project)) = (stamp.session.as_deref(), project.as_deref()) else {
         return Err(sentence(model::store::unattested_filing_refusal("this server knows no Claude Code session or the report names no project")));
     };
+    // The rule writes of this turn that are already fully in the transcript are
+    // attested now, so settling rules does not cost a turn end (field test 5, D5).
+    // Anything not decidable yet is left to the Stop, as before.
+    serve::attest::attest_finished_writes(store, session);
     let Some(start) = model::store::open_evaluation_start(store, session, project) else {
         return Err(sentence(model::store::no_open_evaluation_refusal(store, session, project)));
     };
@@ -1059,7 +1063,9 @@ fn evaluation_receipt(store: &EventStore, item: &Item, ctx: Option<&model::store
         .and_then(|stored| model::gate::machine_section_range(&stored.text))
         .map_or(event_seq - 1, |(_, filed)| filed);
     let m = model::store::machine_section_summary(store, &ctx.start, filed_seq);
-    let store_wide = model::store::judgement_debt_in_project(store, item.project.as_deref()).len();
+    // The ONE count the ask at the end of a turn and doctor use too (field test
+    // 5, D4: three counts, 13 / 140 / 13, because one of them ran an older fold).
+    let (_, store_wide) = serve::usefulness::judgement_debt_counts(store, item.project.as_deref());
     // Over the owner's budget of open points (step 16, B6): said here too.
     let queue = item.project.as_deref().and_then(|p| {
         model::store::owner_queue_banner(p, model::store::owner_queue(store, p).len()).map(|line| format!("\n{line}"))
@@ -1076,7 +1082,7 @@ fn evaluation_receipt(store: &EventStore, item: &Item, ctx: Option<&model::store
         "\nmachine section: THOR wrote it above your text, from its log (seq {} to {}); it cannot be edited.\
          \njudgement: this evaluation's list (fixed at log position {}) held {} item(s): {} useful, {} noise, {} skipped \
          as not judgeable here, {} retracted or taken off the rule track, {} pinned. {store_wide} item(s) stay owed \
-         store-wide for this project - doctor names them.\
+         store-wide for this project (all sessions, a different count from this evaluation's list) - doctor names them.\
          \nteeth: {} rule(s) on the frozen batch and A4 list, all settled.\
          \nside doors: {} write(s) in the window outside an attested THOR call, {} still to be checked.{weakened}\
          \nTHOR checks this filing call against the session's transcript when the turn ends.{queue}",
@@ -1154,6 +1160,9 @@ struct RevisePlan {
     updated: Item,
     gate_existing: Item,
     tags_cleared: bool,
+    /// Reason tags (`no-literal:...`) this revise dropped by itself because it
+    /// hangs a check that refuses (field test 5, D3), for the reply to name.
+    dropped_reasons: Vec<String>,
     /// The call names no field at all, only the id: `revise` then runs THOR's
     /// trial on the rule as it stands when no trial record counts for it yet.
     bare: bool,
@@ -1352,6 +1361,21 @@ fn plan_revise(existing: &Item, args: &ReviseArgs) -> Result<RevisePlan, String>
         check: check_cleared,
     };
     let mut gate_existing = cleared.baseline(&existing);
+    // FIELD TEST 5 (D3): THOR's own "Hang it" line names a call with no tags
+    // in it, and the gate refused that call whenever the rule carried a
+    // `no-literal:` reason beside the check it was hanging (four of five first
+    // tries). A call that hangs a check that refuses and leaves the tags alone
+    // drops the reason itself - the check says the opposite - and says so.
+    let mut updated = updated;
+    let mut dropped_reasons: Vec<String> = Vec::new();
+    let hangs_a_guard = updated.check != existing.check
+        && updated.kind.can_fire()
+        && (model::gate::is_refusing_check(updated.check.as_ref()) || matches!(updated.check, Some(model::item::Check::Contains { .. })));
+    if args.tags.is_none() && hangs_a_guard {
+        dropped_reasons = existing.tags.iter().filter(|t| model::gate::is_teeth_reason_tag(t)).cloned().collect();
+        updated.tags.retain(|t| !dropped_reasons.contains(t));
+        gate_existing.tags.retain(|t| !dropped_reasons.contains(t));
+    }
     // `ClearedFields::baseline` above only knows the six fields it
     // was built for. `tags` never joined that type (see
     // `tags_cleared`'s own comment), so its baseline is blanked
@@ -1385,7 +1409,7 @@ fn plan_revise(existing: &Item, args: &ReviseArgs) -> Result<RevisePlan, String>
         && args.always.is_none()
         && !(args.clear_severity || args.clear_project || args.clear_expires || args.clear_key)
         && !(args.clear_falsifier || args.clear_check);
-    Ok(RevisePlan { updated, gate_existing, tags_cleared, bare })
+    Ok(RevisePlan { updated, gate_existing, tags_cleared, dropped_reasons, bare })
 }
 
 /// A remember call's item, exactly as `remember` writes it (before its
@@ -2527,7 +2551,7 @@ impl ThorMcpServer {
             // before anything is tried or written (step 15, D10).
             let att = stamp.att();
             refuse_a_side_door_on_a_frozen_item(s, &args.id, &att)?;
-            let RevisePlan { mut updated, mut gate_existing, tags_cleared, bare } = plan_revise(&existing, &args)?;
+            let RevisePlan { mut updated, mut gate_existing, tags_cleared, dropped_reasons, bare } = plan_revise(&existing, &args)?;
             // A filed evaluation report keeps THOR's machine section (step
             // 15): a `text` that carries no section header is the writer's
             // own new TLDR and remarks, stored below the section as it
@@ -2624,6 +2648,11 @@ impl ThorMcpServer {
                     } else {
                         format!("revised '{}' (event seq {})", written.id, event.seq)
                     };
+                    for reason in &dropped_reasons {
+                        success.push_str(&format!(
+                            " - dropped the tag '{reason}': the check you hung says the opposite, and the two cannot stand together"
+                        ));
+                    }
                     // No trial ran: the one line that says so, and why the
                     // verdict it had still stands (or that it has none).
                     let mut notes = notes;

@@ -494,7 +494,7 @@ fn r7b_1_a_contains_check_bound_always_is_a_note() {
     assert_eq!(t.outcome, Outcome::Note { pending: None, by_dispute: false }, "{}", receipt(&t));
     assert!(t.check.is_none());
     assert!(
-        receipt(&t).contains("a contains check only reaches a write when the rule is anchored to that file or its directory - bind it to NOTES.md"),
+        receipt(&t).contains("a contains check guards writes to NOTES.md only for a rule that carries a file or folder anchor"),
         "{}",
         receipt(&t)
     );
@@ -682,6 +682,82 @@ fn a_flag_the_text_recommends_is_never_forbidden() {
     let (code, message) = refusal(&fx.run(&never, None, &session_in("alpha", None, S1), &Disputes::default()));
     assert_eq!(code, RefuseCode::Forcing);
     assert!(message.contains("forbidden '--no-index' on 'git grep'"), "{message}");
+}
+
+/// Field test 5 (D9): "npm run verify draait set-version.js --check" describes
+/// what the command runs; it is no prohibition of the flag.
+#[test]
+fn d9_a_verb_that_describes_running_a_flag_derives_no_forbidden_tooth() {
+    for text in [
+        "npm run verify draait set-version.js --check en stopt bij een afwijking.",
+        "npm run verify runs set-version.js --check and stops at a difference.",
+        "De bouwstap gebruikt git grep --no-index hier.",
+    ] {
+        let anchor = if text.contains("verify") { "npm run verify" } else { "git grep" };
+        let item = rule("v", text, vec![cmd(anchor)], None, None);
+        let forbidden: Vec<String> = derive(&item, None)
+            .iter()
+            .filter_map(|d| match &d.check {
+                Check::Forbidden { literals } => Some(literals.join(" ")),
+                _ => None,
+            })
+            .collect();
+        assert!(forbidden.is_empty(), "{text}: {forbidden:?}");
+    }
+    // A prohibition in the same words still derives its tooth.
+    let never = rule("v", "Never let npm run verify run set-version.js --check by hand.", vec![cmd("npm run verify")], None, None);
+    assert!(derive(&never, None).iter().any(|d| matches!(&d.check, Check::Forbidden { .. })));
+}
+
+/// Field test 5 (D9): a fragment that is a piece of the anchor path ("README"
+/// in README.md, "RELEASE" in RELEASE-CHECKLIST.md) is in that file by the way
+/// it is named, so it is no tooth; a real fragment of the same text still is.
+#[test]
+fn d9_a_fragment_of_the_anchor_path_derives_no_contains_tooth() {
+    let mut fx = Fx::new();
+    let beta = fx.checkout("beta", &[("README.md", "README
+the password is in Keyvault
+")], true);
+    fx.register("beta", &beta);
+    let item = rule(
+        "pw",
+        "The `README` keeps pointing to `Keyvault` for the password.",
+        vec![path("README.md")],
+        None,
+        Some("beta"),
+    );
+    let derived = derive(&item, Some(&beta));
+    let literals: Vec<&str> = derived
+        .iter()
+        .filter_map(|d| match &d.check {
+            Check::Contains { literal, .. } => Some(literal.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(literals, vec!["Keyvault"], "{derived:?}");
+}
+
+/// Field test 5 (D9): a bare short flag is dropped when another literal was
+/// built; alone it stays.
+#[test]
+fn d9_a_bare_short_flag_is_dropped_when_a_longer_literal_exists() {
+    let both = rule(
+        "sf",
+        "Never run `git push -f` or `git push --force-with-lease` on main.",
+        vec![cmd("git push")],
+        None,
+        None,
+    );
+    let literals: Vec<String> = derive(&both, None)
+        .iter()
+        .filter_map(|d| match &d.check {
+            Check::Forbidden { literals } => Some(literals.join(" ")),
+            _ => None,
+        })
+        .collect();
+    assert!(!literals.contains(&"-f".to_string()) && literals.contains(&"--force-with-lease".to_string()), "{literals:?}");
+    let alone = rule("sf2", "Never run `git push -f` on main.", vec![cmd("git push")], None, None);
+    assert!(derive(&alone, None).iter().any(|d| matches!(&d.check, Check::Forbidden { literals } if literals == &vec!["-f".to_string()])));
 }
 
 /// R7b.8 (D6): the writing session ran 'git push --force --dry-run' itself:
@@ -909,10 +985,53 @@ fn the_replay_counts_reached_calls_and_changes_only_the_text() {
     fx.served(S2, "echo git push --force");
     fx.served(S2, "ls -la");
     let loud = fx.write(&item);
-    assert!(receipt(&loud).contains("reaches 1 real call(s) in the log (0 more cut at 120 characters); would refuse 1"), "{}", receipt(&loud));
-    assert!(receipt(&quiet).contains("reaches 0 real call(s)"), "{}", receipt(&quiet));
+    assert!(receipt(&loud).contains("reaches 1 whole real call(s) in the log; would refuse 1"), "{}", receipt(&loud));
+    assert!(!receipt(&loud).contains("unknown"), "no call was cut: {}", receipt(&loud));
+    assert!(receipt(&quiet).contains("reaches 0 whole real call(s)"), "{}", receipt(&quiet));
     assert_eq!(quiet.outcome, loud.outcome);
     assert_eq!(stored_item(&item, &quiet), stored_item(&item, &loud));
+}
+
+/// Field test 5 (D2): a call of a few hundred characters used to be cut at 120
+/// and so never tried; it is now recorded whole and counted.
+#[test]
+fn a_long_call_is_tried_whole() {
+    let mut fx = Fx::new();
+    let item = rule("fp", "Never run `git push --force` on main.", vec![cmd("git push")], forbidden(&["--force"]), None);
+    fx.served(S2, &format!("git push origin {} --force", "x".repeat(200)));
+    let loud = fx.write(&item);
+    assert!(receipt(&loud).contains("reaches 1 whole real call(s) in the log; would refuse 1"), "{}", receipt(&loud));
+}
+
+/// Field test 5 (D2): "reaches 2 real calls (16 more cut) ... would refuse 0"
+/// read as a safe tooth while the cut calls could well be refused. Calls the
+/// log recorded cut are named as NOT TRIED, never folded into a zero.
+#[test]
+fn calls_the_log_cut_are_reported_as_not_tried_never_as_safe() {
+    let mut fx = Fx::new();
+    let item = rule("fp", "Never run `git push --force` on main.", vec![cmd("git push")], forbidden(&["--force"]), None);
+    fx.served(S2, "git push origin main");
+    // Two calls an older build recorded cut at exactly 120 characters.
+    for (i, session) in [S1, S2].iter().enumerate() {
+        let old: String = format!("git push origin feature-{i} {}", "z".repeat(200)).chars().take(120).collect();
+        let body = serde_json::json!({"served_at": "2026-09-28T00:00:00Z", "trigger": old}).to_string();
+        fx.store.append_event(session, session, "hook", EventKind::ItemServed, "any", None, &body).unwrap();
+    }
+    let trial = fx.write(&item);
+    let text = receipt(&trial);
+    assert!(text.contains("reaches 1 whole real call(s) in the log; would refuse 0"), "{text}");
+    assert!(text.contains("unknown: 2 of 3 reached call(s) not tried"), "{text}");
+}
+
+#[test]
+fn a_cut_call_that_carries_the_literal_counts_toward_the_majority() {
+    let mut r = Replay::default();
+    r.reached = 1;
+    r.cut = 5;
+    r.refused_cut = (0..5).map(|i| format!("git push --force {i}")).collect();
+    assert!(r.majority(), "5 of the 6 calls that could be judged carry the literal");
+    r.refused_cut.truncate(2);
+    assert!(!r.majority(), "2 of 3 judged calls is under the 5-call floor");
 }
 
 /// DR M8: an inner trigger that occurs in reached calls but that the matcher

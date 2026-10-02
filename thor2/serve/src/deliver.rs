@@ -56,7 +56,16 @@ pub fn nth_session(base: &str, i: usize) -> String {
 /// small; truncated by CHARACTER count, not by byte-slicing, so a multi-byte
 /// UTF-8 command (a path with a non-ASCII directory name, say) is never cut
 /// mid-codepoint.
-pub const TRIGGER_LIMIT: usize = 120;
+///
+/// 400 since step 30 (field test 5, defect D2): at 120 most real `ssh ...
+/// docker exec ... sh -c "..."` calls were cut, the trial of a rule could not
+/// see the literal in them, and "would refuse 0" was read as safe. Events an
+/// older build wrote stay cut at `LEGACY_TRIGGER_LIMIT`.
+pub const TRIGGER_LIMIT: usize = 400;
+
+/// What a build before step 30 kept of a trigger. Only read, to recognise a
+/// cut call in an old event.
+pub const LEGACY_TRIGGER_LIMIT: usize = 120;
 
 /// Record one `ItemServed` event per shown item id, each carrying `trigger`
 /// - see `ItemServed::trigger`'s own doc comment for what the three shapes
@@ -120,7 +129,7 @@ pub fn record_delivery_around_anchors(
     trigger: Option<&str>,
 ) {
     for (id, anchors) in anchors_of {
-        let excerpt = trigger.map(|t| model::store::trigger_excerpt(t, anchors));
+        let excerpt = trigger.map(|t| model::store::trigger_excerpt_to(t, anchors, TRIGGER_LIMIT));
         append_served(store, session_id, lineage_id, actor, served_at, id, excerpt);
     }
 }
@@ -245,6 +254,37 @@ mod tests {
         let trigger = model::served::last_trigger(&store, "x1").expect("a trigger was given");
         assert_eq!(trigger.chars().count(), TRIGGER_LIMIT, "must be cut down to the limit, not left full length");
         assert_eq!(trigger, "x".repeat(TRIGGER_LIMIT));
+    }
+
+    /// Field test 5 (D2): the place a command fired is kept to a few hundred
+    /// characters, not 120, so a rule's trial can read the call it is judged on.
+    #[test]
+    fn a_command_of_a_few_hundred_characters_is_recorded_whole() {
+        let mut store = EventStore::in_memory().unwrap();
+        let call = format!("ssh nas 'docker exec app sh -c \"{}\"'", "echo hello && ".repeat(15));
+        assert!(call.chars().count() > 200);
+        record_delivery_around_anchors(
+            &mut store,
+            "s",
+            "l",
+            "hook",
+            "2026-10-02T00:00:00Z",
+            &[("x1".to_string(), vec!["ssh".to_string()])],
+            Some(&call),
+        );
+        assert_eq!(model::served::last_trigger(&store, "x1").as_deref(), Some(call.as_str()));
+        let huge = format!("ssh nas {}", "y".repeat(3000));
+        record_delivery_around_anchors(
+            &mut store,
+            "s",
+            "l",
+            "hook",
+            "2026-10-02T00:00:01Z",
+            &[("x2".to_string(), vec!["ssh".to_string()])],
+            Some(&huge),
+        );
+        let kept = model::served::last_trigger(&store, "x2").unwrap();
+        assert!(kept.chars().count() <= TRIGGER_LIMIT + 6, "a huge call is still cut: {}", kept.chars().count());
     }
 
     #[test]

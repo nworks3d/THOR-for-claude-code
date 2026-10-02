@@ -180,6 +180,13 @@ fn escapes_root(root: &Path, resolved: &Path) -> bool {
 /// this check cannot run. Never panics: every step is a `Result`/`Option`
 /// combinator, never an `unwrap`.
 fn read_bounded_utf8(path: &Path) -> Option<String> {
+    String::from_utf8(read_bounded_bytes(path)?).ok()
+}
+
+/// The bytes of `path`, under the same limits as `read_bounded_utf8` (a
+/// regular file, at most `MAX_CHECK_FILE_BYTES`) but with no opinion on the
+/// encoding.
+fn read_bounded_bytes(path: &Path) -> Option<Vec<u8>> {
     let metadata = std::fs::metadata(path).ok()?;
     if !metadata.is_file() {
         return None;
@@ -187,8 +194,7 @@ fn read_bounded_utf8(path: &Path) -> Option<String> {
     if metadata.len() > MAX_CHECK_FILE_BYTES {
         return None;
     }
-    let bytes = std::fs::read(path).ok()?;
-    String::from_utf8(bytes).ok()
+    std::fs::read(path).ok()
 }
 
 /// The content(s) `Contains`/`Absent`/`AbsentAll` must search: the single
@@ -204,6 +210,16 @@ fn read_bounded_utf8(path: &Path) -> Option<String> {
 /// would otherwise let `Absent`/`AbsentAll` report a false `Holds`, which is
 /// worse than not running the check at all (see `Outcome`'s own doc
 /// comment).
+///
+/// ONE EXCEPTION, `lossy_text` (field test 5, defect D1): `Absent` and
+/// `AbsentAll` over a DIRECTORY read a file that is not UTF-8 text (a zip, an
+/// image, a `.3mf` in a fixtures folder) lossily instead of giving up on the
+/// whole directory. An ASCII literal survives a lossy read - it is present in
+/// the lossy text exactly when its bytes are in the file - so no `Holds` is
+/// ever false, and one binary file no longer takes away a guard that could
+/// run. Oversized and unreadable files still make the answer `CannotRun`.
+/// `Contains` stays strict: a literal that is not found proves nothing about
+/// a file this runner could not read as text.
 ///
 /// THE GAP THIS CLOSES. A single check can only ever name one path, but a
 /// real fact routinely spans two files at once - the case this was built
@@ -233,7 +249,7 @@ fn read_bounded_utf8(path: &Path) -> Option<String> {
 /// `Holds` (no file contains anything) and `Contains` correctly `Fails` (no
 /// file contains the literal either) - see `run`'s own match arms for where
 /// that falls out of this returning `Some(vec![])`.
-fn read_bounded_targets(resolved: &Path) -> Option<Vec<String>> {
+fn read_bounded_targets(resolved: &Path, lossy_text: bool) -> Option<Vec<String>> {
     if resolved.is_dir() {
         let mut contents = Vec::new();
         for entry in std::fs::read_dir(resolved).ok()? {
@@ -251,7 +267,11 @@ fn read_bounded_targets(resolved: &Path) -> Option<Vec<String>> {
             if !entry.file_type().ok()?.is_file() {
                 continue;
             }
-            contents.push(read_bounded_utf8(&entry.path())?);
+            if lossy_text {
+                contents.push(String::from_utf8_lossy(&read_bounded_bytes(&entry.path())?).into_owned());
+            } else {
+                contents.push(read_bounded_utf8(&entry.path())?);
+            }
         }
         Some(contents)
     } else {
@@ -329,7 +349,7 @@ pub fn run(check: &Check, root: &Path) -> Outcome {
                 Outcome::Fails
             }
         }
-        Check::Contains { literal, .. } => match read_bounded_targets(&resolved) {
+        Check::Contains { literal, .. } => match read_bounded_targets(&resolved, false) {
             Some(contents) => {
                 // Holds as soon as ANY one target contains the literal - the
                 // directory form's honest mirror of `Absent` below, which
@@ -344,7 +364,7 @@ pub fn run(check: &Check, root: &Path) -> Outcome {
             }
             None => Outcome::CannotRun,
         },
-        Check::Absent { literal, .. } => match read_bounded_targets(&resolved) {
+        Check::Absent { literal, .. } => match read_bounded_targets(&resolved, true) {
             Some(contents) => {
                 if contents.iter().any(|content| content.contains(literal.as_str())) {
                     Outcome::Fails
@@ -354,7 +374,7 @@ pub fn run(check: &Check, root: &Path) -> Outcome {
             }
             None => Outcome::CannotRun,
         },
-        Check::AbsentAll { literals, .. } => match read_bounded_targets(&resolved) {
+        Check::AbsentAll { literals, .. } => match read_bounded_targets(&resolved, true) {
             // Set form of Absent immediately above: Holds only when NONE of
             // the literals is present in ANY target, Fails as soon as any
             // single one is - same CannotRun conditions either way, since
@@ -728,6 +748,59 @@ mod tests {
             Outcome::CannotRun,
             "an unreadable sibling file must never be silently skipped"
         );
+    }
+
+    #[test]
+    fn an_absent_check_over_a_directory_reads_past_a_file_that_is_not_text() {
+        // FIELD TEST 5 (D1): one zip (a .3mf) in a fixtures directory made the
+        // whole directory CannotRun, so the check could not be tried and a
+        // true guard had to be cleared. An ASCII literal survives a lossy
+        // read, so the binary file is read lossily instead of sinking the answer.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("clean.js"), b"const a = 1;").unwrap();
+        fs::write(dir.path().join("plate.3mf"), [0x50u8, 0x4B, 0x03, 0x04, 0xFF, 0xFE, 0x00, 0xFF]).unwrap();
+        let absent = Check::Absent { path: ".".to_string(), literal: "from '../../lib/".to_string() };
+        assert_eq!(run(&absent, dir.path()), Outcome::Holds);
+        let absent_all = Check::AbsentAll { path: ".".to_string(), literals: vec!["from '../../lib/".to_string()] };
+        assert_eq!(run(&absent_all, dir.path()), Outcome::Holds);
+    }
+
+    #[test]
+    fn an_absent_check_still_fails_when_a_literal_sits_in_a_text_file_beside_a_binary_one() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("bad.js"), b"import x from '../../lib/x'").unwrap();
+        fs::write(dir.path().join("plate.3mf"), [0xFFu8, 0x00, 0xFF]).unwrap();
+        let absent = Check::Absent { path: ".".to_string(), literal: "from '../../lib/".to_string() };
+        assert_eq!(run(&absent, dir.path()), Outcome::Fails);
+    }
+
+    #[test]
+    fn an_absent_literal_inside_a_binary_file_of_a_directory_is_still_found() {
+        // An ASCII literal inside a file that is mostly not text is still seen.
+        let dir = tempfile::tempdir().unwrap();
+        let mut bytes = vec![0xFFu8, 0xFE, 0x00];
+        bytes.extend_from_slice(b"from '../../lib/x");
+        bytes.extend_from_slice(&[0xFF, 0x00]);
+        fs::write(dir.path().join("blob.bin"), bytes).unwrap();
+        let absent = Check::Absent { path: ".".to_string(), literal: "from '../../lib/".to_string() };
+        assert_eq!(run(&absent, dir.path()), Outcome::Fails);
+    }
+
+    #[test]
+    fn a_contains_check_over_a_directory_with_a_binary_file_stays_strict() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.js"), b"const a = 1;").unwrap();
+        fs::write(dir.path().join("plate.3mf"), [0xFFu8, 0x00, 0xFF]).unwrap();
+        let contains = Check::Contains { path: ".".to_string(), literal: "const".to_string() };
+        assert_eq!(run(&contains, dir.path()), Outcome::CannotRun);
+    }
+
+    #[test]
+    fn an_absent_check_on_one_binary_file_stays_strict() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("plate.3mf"), [0xFFu8, 0x00, 0xFF]).unwrap();
+        let absent = Check::Absent { path: "plate.3mf".to_string(), literal: "x".to_string() };
+        assert_eq!(run(&absent, dir.path()), Outcome::CannotRun);
     }
 
     #[test]

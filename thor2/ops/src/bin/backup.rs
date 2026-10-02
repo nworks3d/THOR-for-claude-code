@@ -31,10 +31,15 @@ struct Cli {
     /// to rebuild into.
     #[arg(long)]
     db: PathBuf,
-    /// Path to an existing git clone with an `origin` remote and a `main` branch.
+    /// Path to an existing git clone (it needs a remote to push to).
     /// Required for a backup; ignored when restoring.
     #[arg(long)]
     repo: Option<PathBuf>,
+    /// The name of the remote to push to. Without it, a remote called `nas` is
+    /// used when the clone has one (the private backup lives on the NAS), else
+    /// the remote the branch already follows, else `origin`.
+    #[arg(long)]
+    remote: Option<String>,
     /// Rebuild a store from an exported log instead of backing one up: point it
     /// at the `thor2` folder of this repo (it reads every events-NNNN.jsonl in
     /// order). An old single `events.jsonl` still works.
@@ -141,10 +146,24 @@ fn main() -> ExitCode {
         }
     }
 
-    match backup::backup_to_repo(&store, &repo, &cli.subdir, cli.force) {
+    // Where this run pushes, named once so the result and the doctor can say it.
+    let (remote_name, address) = match backup::resolve_target(&repo, cli.remote.as_deref()) {
+        Ok(target) => {
+            let address = backup::remote_url(&repo, &target.remote).unwrap_or_default();
+            (target.remote, address)
+        }
+        Err(e) => {
+            let _ = ops::backup_state::record_failure_at(&cli.db, &repo, &e.to_string(), now);
+            eprintln!("backup failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match backup::backup_to_remote(&store, &repo, &cli.subdir, cli.force, Some(&remote_name)) {
         Ok(line) => {
-            ops::backup_state::record_success(&cli.db);
-            println!("{line}");
+            // "backup is Nh old ... skipping" sent nothing: the time of the last copy stays.
+            let pushed = !line.starts_with("backup is ");
+            ops::backup_state::record_success_for(&cli.db, &repo, &remote_name, &address, ops::backup_state::now_unix(), pushed);
+            println!("{line} (to {remote_name})");
             // The person who only ever reads this one line (this binary runs
             // far more often than `doctor` does) still learns the copy on
             // the NAS has gone stale - see `ops::health::ship_line`'s own
@@ -156,7 +175,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            let _ = ops::backup_state::record_failure_at(&cli.db, &repo, &e.to_string(), now);
+            let _ = ops::backup_state::record_failure_for(&cli.db, &repo, &remote_name, &address, &e.to_string(), now);
             eprintln!("backup failed: {e}");
             ExitCode::FAILURE
         }

@@ -144,6 +144,21 @@ Then open a new conversation and touch that host. If the note comes back, setup
 is done. If it does not, do not tell them it worked - the usual cause is step 3,
 the restart.
 
+**7. Optional: ask where the memory should be backed up.** Once a day THOR
+writes a copy of the memory into a git repository they own (the install tells
+them where it is, and the command is `backup.exe --db "<their store>" --repo
+"<that folder>"`). Ask them where the copy should go: another folder on their NAS
+or any machine they own is the safe choice, a private repository on a website
+the other. To send it to a NAS, create an empty bare repository there
+(`git init --bare <folder on the NAS>`), add it to the backup folder as a remote
+called `nas` (`git -C "<that folder>" remote add nas <the NAS folder>`), and push
+the branch once by name (`git -C "<that folder>" push nas main`). From then on
+the backup uses `nas` by itself, with no other setting. If git says the folder
+has "dubious ownership", add it as a safe directory with the line git prints.
+`doctor` then names the place the last copy went. The memory can be rebuilt from
+it with `backup.exe --db "<a new store path>" --restore-from "<the thor2 folder
+of the backup>"`.
+
 ## The tools you have
 
 After the restart you get sixteen. These are the ones setup needs; the rest

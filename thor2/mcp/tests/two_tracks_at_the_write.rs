@@ -91,7 +91,7 @@ fn r8_2_and_g8_2_a_checkless_rule_whose_text_composes_a_tooth_is_refused_and_han
     println!("G8.2: {reply}");
     assert!(reply.starts_with("stored 'a1-light'"), "{reply}");
     assert!(reply.contains("teeth: wired, not proven - tried git push --force (refused), git push (let through)"), "{reply}");
-    assert!(reply.contains("reaches 3 real call(s) in the log"), "{reply}");
+    assert!(reply.contains("reaches 3 whole real call(s) in the log"), "{reply}");
     assert!(reply.contains("would refuse 0"), "{reply}");
     assert!(get(&mut mcp, "a1-light").tags.contains(&"teeth:wired-not-proven".to_string()));
 
@@ -392,7 +392,7 @@ fn r8_10_and_g8_6_a_check_refusing_a_listing_form_is_never_stored() {
         reply.starts_with("REFUSED: Your check (requires '-a' after 'git tag' on 'git tag') was not stored: it refuses 'git tag' and 'git tag -l' and 'git tag --list', which a check must let through."),
         "{reply}"
     );
-    assert!(reply.contains("forbidden '-a' on 'git tag'") && reply.contains("legitimate_calls"), "{reply}");
+    assert!(reply.contains("forbidden '-a v1' on 'git tag'") && reply.contains("legitimate_calls"), "{reply}");
     assert!(reply.contains("would refuse 1, e.g. 'git tag -l \"backup-checkpoint*\"'"), "the replay line: {reply}");
 
     args["legitimate_calls"] = json!(["git tag -a v1 -m release"]);
@@ -427,7 +427,7 @@ fn r8_12_the_receipt_names_the_real_calls_a_check_would_refuse() {
     let reply = mcp.call("remember", tag);
     println!("R8.12 tag: {reply}");
     assert!(reply.starts_with("REFUSED:"), "{reply}");
-    assert!(reply.contains("reaches 2 real call(s) in the log") && reply.contains("would refuse 2, e.g."), "{reply}");
+    assert!(reply.contains("reaches 2 whole real call(s) in the log") && reply.contains("would refuse 2, e.g."), "{reply}");
     assert!(reply.contains("'git tag -l'") && reply.contains("'git tag v1.2 -m x'"), "{reply}");
 
     let mut pip = rule("pip-no-deps", "Install a printer plugin with `pip install --no-deps`.", Some("demo"));
@@ -466,7 +466,7 @@ fn r8_11_an_over_match_never_drops_a_check() {
     let reply = mcp.call("remember", args);
     println!("R8.11: {reply}");
     assert!(reply.contains("teeth: wired, not proven"), "{reply}");
-    assert!(reply.contains("reaches 1 real call(s) in the log") && reply.contains("would refuse 0"), "{reply}");
+    assert!(reply.contains("reaches 1 whole real call(s) in the log") && reply.contains("would refuse 0"), "{reply}");
     assert!(get(&mut mcp, "no-force").check.is_some());
 }
 
@@ -638,7 +638,7 @@ fn g8_7_the_real_call_replay_changes_words_never_state() {
         args["check_kind"] = json!("forbidden");
         args["check_literals"] = json!(["--force"]);
         let reply = mcp.call("remember", args);
-        assert!(reply.contains("reaches 2 real call(s) in the log") && reply.contains("would refuse 0"), "{reply}");
+        assert!(reply.contains("reaches 2 whole real call(s) in the log") && reply.contains("would refuse 0"), "{reply}");
         get(&mut mcp, "replay")
     };
     let without = {
@@ -680,4 +680,49 @@ fn g8_14_a_ban_meant_to_refuse_every_push_is_kept_by_accept_refusing() {
     println!("G8.14: {reply}");
     assert!(reply.contains("teeth: wired, not proven - a whole-command ban"), "{reply}");
     assert!(reply.contains("refusing these real calls is accepted: git push origin main"), "{reply}");
+}
+
+/// Field test 5 (D3): THOR's "Hang it" line was refused whenever the rule also
+/// carried a no-literal reason tag - four of five first tries. Hanging a
+/// check that refuses on a rule whose tags the call does not touch now drops
+/// the reason tag itself, and the reply says so. A call that names the tags
+/// and keeps the reason is still held to the contradiction.
+#[test]
+fn d3_hanging_a_check_drops_the_no_literal_reason_tag_by_itself() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = store(tmp.path(), &["demo"]);
+    seed_raw(
+        &db,
+        &Item {
+            id: "force-old".to_string(),
+            kind: Kind::Rule,
+            text: "Never force-push: `git push --force` rewrites shared history.".to_string(),
+            bindings: vec![Binding::Target { kind: TargetKind::Command, value: "git push".to_string() }],
+            severity: Some(Severity::Costly),
+            project: Some("demo".to_string()),
+            tags: vec!["no-literal:force pushing leaves no fixed text in the command".to_string()],
+            expires: None,
+            key: None,
+            falsifier: Some("A force push turns out to be harmless here.".to_string()),
+            check: None,
+        },
+    );
+    let mut mcp = Mcp::start(&db, tmp.path());
+
+    // Naming the tags and keeping the reason is still the contradiction.
+    let reply = mcp.call(
+        "revise",
+        json!({"id": "force-old", "check_kind": "forbidden", "check_literals": ["--force"],
+               "tags": ["no-literal:force pushing leaves no fixed text in the command"]}),
+    );
+    assert!(reply.starts_with("REFUSED:") && reply.contains("AND the tag"), "{reply}");
+
+    // The call THOR's own "Hang it" line names: no tags in it.
+    let reply = mcp.call("revise", json!({"id": "force-old", "check_kind": "forbidden", "check_literals": ["--force"]}));
+    println!("D3: {reply}");
+    assert!(reply.starts_with("revised 'force-old'"), "{reply}");
+    assert!(reply.contains("dropped the tag 'no-literal:force pushing leaves no fixed text in the command'"), "{reply}");
+    let item = get(&mut mcp, "force-old");
+    assert!(!item.tags.iter().any(|t| t.starts_with("no-literal:")), "{:?}", item.tags);
+    assert!(item.check.is_some());
 }

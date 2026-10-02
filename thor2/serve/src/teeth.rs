@@ -455,7 +455,8 @@ fn try_check(item: &Item, root: &Path, known: &[String]) -> Tried {
 struct Replay {
     /// Whole calls the anchor reaches.
     reached: usize,
-    /// Cut calls the anchor reaches.
+    /// Cut calls the anchor reaches: the log recorded only part of them, so
+    /// they were not tried.
     cut: usize,
     /// Whole calls the check would refuse.
     refused: Vec<RealCall>,
@@ -472,25 +473,40 @@ struct Replay {
 impl Replay {
     fn line(&self) -> String {
         let examples: Vec<String> = self.refused.iter().take(3).map(|c| format!("'{}'", c.text)).collect();
-        let mut line = format!(
-            "reaches {} real call(s) in the log ({} more cut at {} characters); would refuse {}",
-            self.reached,
-            self.cut,
-            crate::deliver::TRIGGER_LIMIT,
-            self.refused.len()
-        );
+        let mut line = format!("reaches {} whole real call(s) in the log; would refuse {}", self.reached, self.refused.len());
         if !examples.is_empty() {
             line.push_str(&format!(", e.g. {}", examples.join(", ")));
         }
-        if !self.refused_cut.is_empty() {
-            line.push_str(&format!("; {} cut call(s) carry it too", self.refused_cut.len()));
+        // Field test 5 (D2): a call the log recorded cut was NOT tried, so a
+        // count of zero says nothing about it and is never read as safe.
+        if self.cut > 0 {
+            line.push_str(&format!(
+                "; unknown: {} of {} reached call(s) not tried (the log kept only part of them, so 'would refuse {}' says nothing about them)",
+                self.cut,
+                self.reached + self.cut,
+                self.refused.len()
+            ));
+            if !self.refused_cut.is_empty() {
+                line.push_str(&format!("; {} of those carry the literal in the part that was kept", self.refused_cut.len()));
+            }
         }
         line
     }
 
-    /// K8(d): refuses more than half of at least 5 whole calls it reaches.
+    /// K8(d): refuses more than half of at least 5 calls it can judge. A cut
+    /// call counts only when the part that was kept already carries the
+    /// literal (the hook would refuse it); a cut call that does not is
+    /// unknown and counts neither way.
     fn majority(&self) -> bool {
-        self.reached >= 5 && self.refused.len() * 2 > self.reached
+        let judged = self.reached + self.refused_cut.len();
+        let refused = self.refused.len() + self.refused_cut.len();
+        judged >= 5 && refused * 2 > judged
+    }
+
+    /// Every call the check refuses, whole or cut: what a writer may name in
+    /// `accept_refusing`.
+    fn refused_texts(&self) -> Vec<String> {
+        self.refused.iter().map(|c| c.text.clone()).chain(self.refused_cut.iter().cloned()).collect()
     }
 }
 
@@ -612,6 +628,9 @@ fn teeth_of_span(words: &[&str], anchor_len: usize, anchor: &str, proposed: Opti
 const RECOMMENDING: &[&str] = &[
     "use", "using", "prefer", "run", "always", "pass", "add", "instead", "gebruik", "gebruiken", "liever", "altijd",
     "draai", "voeg", "kies",
+    // The present tense DESCRIBES running a flag ("verify draait set-version.js
+    // --check"), which is no prohibition of it (field test 5, D9).
+    "runs", "uses", "adds", "passes", "draait", "gebruikt", "voegt", "kiest", "voert", "voer", "geef", "geeft",
 ];
 const NEGATING: &[&str] = &[
     "never", "not", "no", "don't", "dont", "avoid", "nooit", "niet", "geen", "vermijd", "zonder", "without", "forbidden",
@@ -633,6 +652,35 @@ fn recommended_at(raw: &[&str], at: usize) -> bool {
             break;
         }
         words.push(raw_word.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'').to_lowercase());
+    }
+    words.iter().any(|w| RECOMMENDING.contains(&w.as_str())) && !words.iter().any(|w| NEGATING.contains(&w.as_str()))
+}
+
+/// Whether the words just AFTER a command, up to the first flag and at most
+/// three, say the command runs or uses what follows ("npm run verify draait
+/// set-version.js --check"): a description of the flag, not a prohibition.
+fn describes_running_after(raw: &[&str], anchor_at: usize, from: usize) -> bool {
+    // A negating word just before the command ("never let X run ...") makes it
+    // a prohibition again.
+    let mut before: Vec<String> = Vec::new();
+    for raw_word in raw[..anchor_at].iter().rev().take(3) {
+        if raw_word.ends_with(['.', '!', '?', ';', ':']) {
+            break;
+        }
+        before.push(raw_word.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'').to_lowercase());
+    }
+    if before.iter().any(|w| NEGATING.contains(&w.as_str())) {
+        return false;
+    }
+    let mut words: Vec<String> = Vec::new();
+    for raw_word in raw.iter().skip(from).take(3) {
+        if raw_word.starts_with('-') {
+            break;
+        }
+        words.push(raw_word.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'').to_lowercase());
+        if raw_word.ends_with(['.', '!', '?', ';', ':']) {
+            break;
+        }
     }
     words.iter().any(|w| RECOMMENDING.contains(&w.as_str())) && !words.iter().any(|w| NEGATING.contains(&w.as_str()))
 }
@@ -692,7 +740,7 @@ fn recommended_fragments(item: &Item, raw: &[&str]) -> Vec<String> {
         let mut from = 0;
         while let Some(found) = span_position(&raw[from..], &aw).map(|i| i + from) {
             from = found + 1;
-            if !recommended_at(raw, found) {
+            if !recommended_at(raw, found) && !describes_running_after(raw, found, found + aw.len()) {
                 continue;
             }
             let bare = |t: &str| t.trim_matches(|c: char| matches!(c, '`' | '\'' | '"' | '(' | ')' | ',' | ';' | ':' | '.' | '!' | '?')).to_string();
@@ -790,6 +838,12 @@ fn derive_all(item: &Item, root: Option<&Path>) -> Vec<Derived> {
                 continue;
             }
             for fragment in &fragments {
+                // A fragment that is a piece of the file's own path ("README"
+                // in README.md) is in the file by the way it is named: no
+                // tooth (field test 5, D9). So is a bare short flag.
+                if place.to_lowercase().contains(&fragment.to_lowercase()) || is_bare_short_flag(fragment) {
+                    continue;
+                }
                 if target_file(root, &place, |c| c.contains(fragment)).is_ok() {
                     out.push(Derived {
                         check: Check::Contains { path: place.clone(), literal: fragment.to_string() },
@@ -806,7 +860,32 @@ fn derive_all(item: &Item, root: Option<&Path>) -> Vec<Derived> {
             unique.push(d);
         }
     }
+    // A bare short flag ("-n", "-f") is the weakest literal there is: it is
+    // dropped when another tooth with a longer literal was built (D9).
+    let has_longer = unique.iter().any(|d| derived_literals(&d.check).iter().any(|l| !is_bare_short_flag(l)));
+    if has_longer {
+        unique.retain(|d| {
+            let literals = derived_literals(&d.check);
+            literals.is_empty() || !literals.iter().all(|l| is_bare_short_flag(l))
+        });
+    }
     unique
+}
+
+/// `-n`, `-f`: one dash and one letter.
+fn is_bare_short_flag(literal: &str) -> bool {
+    let mut chars = literal.chars();
+    chars.next() == Some('-') && chars.next().is_some_and(|c| c.is_ascii_alphabetic()) && chars.next().is_none()
+}
+
+/// The literals a derived check carries.
+fn derived_literals(check: &Check) -> Vec<&str> {
+    match check {
+        Check::Forbidden { literals } => literals.iter().map(String::as_str).collect(),
+        Check::Requires { required, .. } => required.iter().map(String::as_str).collect(),
+        Check::Contains { literal, .. } => vec![literal.as_str()],
+        _ => Vec::new(),
+    }
 }
 
 /// Every distinct earlier check on `id`'s own log that is not `current`,
@@ -1119,6 +1198,9 @@ impl DerivedTrial {
                 }
             }
             s.push_str(" through");
+            if let Some(r) = self.replay.as_ref().filter(|r| r.cut > 0) {
+                s.push_str(&format!(" ({} more real call(s) were cut in the log and not tried)", r.cut));
+            }
         }
         if let Origin::History { seq, .. } = &self.d.origin {
             s = format!("the check it carried at log seq {seq} ({}) still bites", describe(&self.d.check, &bindings));
@@ -1755,7 +1837,7 @@ impl<'a> Work<'a> {
             }
             if tried.bites() {
                 if let Some(r) = replayed.as_ref().filter(|r| r.majority()) {
-                    let listed: Vec<String> = r.refused.iter().map(|c| c.text.clone()).collect();
+                    let listed: Vec<String> = r.refused_texts();
                     let accepted: Vec<String> =
                         self.disputes.accept_refusing.iter().filter(|a| listed.contains(a)).cloned().collect();
                     let bad: Vec<&String> = self.disputes.accept_refusing.iter().filter(|a| !listed.contains(a)).collect();
@@ -1774,8 +1856,8 @@ impl<'a> Work<'a> {
                             "your check would refuse {} of the {} real calls it reaches in the log: {}. Two ways on: narrow \
                              the check (a longer literal, a narrower anchor), or - when refusing them is the intent - name one \
                              of these calls in accept_refusing",
-                            r.refused.len(),
-                            r.reached,
+                            listed.len(),
+                            r.reached + r.refused_cut.len(),
                             listed.iter().map(|c| format!("'{c}'")).collect::<Vec<_>>().join(", ")
                         );
                         // F4 (R8.4): when a tooth THOR builds from the rule's own
@@ -2200,8 +2282,12 @@ fn and_join(items: &[String]) -> String {
 /// that name the fix.
 fn no_reach_why(check: &Check) -> String {
     match check {
+        // What the hook really does (field test 5, D6; proven by
+        // serve/tests/contains_check_reach.rs): the check guards writes to its
+        // OWN path, and it is looked at only for a rule that carries some file
+        // or folder anchor - any one, it need not be {path}.
         Check::Contains { path, .. } => format!(
-            "a contains check only reaches a write when the rule is anchored to that file or its directory - bind it to {path}"
+            "a contains check guards writes to {path} only for a rule that carries a file or folder anchor (a path or dir binding - any one; a rule bound Always or to a command is never looked at for a write) - bind it to {path}"
         ),
         Check::Absent { path, .. } | Check::AbsentAll { path, .. } => {
             format!("this rule's bindings never reach a write to {path} - bind it to {path}")

@@ -248,6 +248,13 @@ at the right moment and hope. Version 2 is the same memory with a spine.
   is held only for something the session did itself: a note it just filed where
   it will never be seen, a setup left undone, a decision you stated that was not
   stored. It will not be waved off with a promise to do it later.
+- **A copy of the memory is kept somewhere else, and you choose where.** Once a
+  day, and when a conversation starts, THOR writes the whole memory into a
+  private git repository on your machine and sends it on. If that repository has
+  a remote called `nas` (a folder on a NAS or another computer you own), the copy
+  goes there by itself and nowhere else; without one it goes to the remote the
+  repository already follows. `doctor` says where the last copy went and how
+  long ago, or that it has been failing and why. Getting it back is one command.
 - **It costs almost nothing to carry.** A note is capped at 300 characters and a
   block at four notes and 1200 characters, so what lands in the conversation is
   a few hundred tokens, not a whole rules file re-read on every turn. A memory

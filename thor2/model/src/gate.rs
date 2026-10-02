@@ -1161,10 +1161,14 @@ pub fn is_refusing_check(check: Option<&Check>) -> bool {
 /// The written reason on an item that nothing can catch its mistake
 /// (`no-literal:<why>` or `no-catch-on-command:<why>`), if it carries one.
 pub fn teeth_reason_tag(item: &Item) -> Option<&str> {
-    item.tags.iter().map(String::as_str).find(|tag| {
-        matches!(crate::store::teeth_answer(tag), Some(crate::store::TeethAnswer::Reasoned(r)) if !r.is_empty())
-            || matches!(command_teeth_answer(tag), Some(crate::store::TeethAnswer::Reasoned(r)) if !r.is_empty())
-    })
+    item.tags.iter().map(String::as_str).find(|tag| is_teeth_reason_tag(tag))
+}
+
+/// Whether `tag` is a written reason that nothing can catch the mistake
+/// (`no-literal:<why>` or `no-catch-on-command:<why>`).
+pub fn is_teeth_reason_tag(tag: &str) -> bool {
+    matches!(crate::store::teeth_answer(tag), Some(crate::store::TeethAnswer::Reasoned(r)) if !r.is_empty())
+        || matches!(command_teeth_answer(tag), Some(crate::store::TeethAnswer::Reasoned(r)) if !r.is_empty())
 }
 
 /// Two shapes a write may not INTRODUCE (2026-09-27), both measured in a

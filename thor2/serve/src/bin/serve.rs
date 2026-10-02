@@ -3444,7 +3444,7 @@ fn evaluation_ask(
             "{elsewhere}{not_counted}[THOR] This session has worked here for {hours:.1} hour(s) since the last evaluation report ('{report_id}'){together}\
              {risk_text}.{floor} \
              A new evaluation is due, covering only what happened since then plus the state of the work; \
-             {owed_in_project} item(s) currently owe a verdict here. \
+             {owed_in_project} item(s) are owed a verdict store-wide for this project (the evaluation's own list, fixed when it starts, may hold fewer or none). \
              Run the THOR evaluation before you finish: {ask} \
              A turn cannot end until the evaluation report for this project is filed."
         )
@@ -3464,7 +3464,7 @@ fn evaluation_ask(
         format!(
             "{elsewhere}{not_counted}[THOR] This project has had no evaluation in the last {covers_hours} hours (project '{project}').{floor} \
              This session has worked here for {own_minutes} minute(s){together}; \
-             {owed_in_project} item(s) currently owe a verdict here. It has been asked {asked_count} time(s) - the first \
+             {owed_in_project} item(s) are owed a verdict store-wide for this project (the evaluation's own list, fixed when it starts, may hold fewer or none). It has been asked {asked_count} time(s) - the first \
              {} day(s) ago - with no report filed yet. \
              Run the THOR evaluation before you finish: {ask} \
              A turn cannot end until the evaluation report for this project is filed. After that it is quiet for {covers_hours} hours.",
@@ -4847,7 +4847,7 @@ mod evaluation_debt_tests {
         assert!(asked.contains("This project has had no evaluation in the last 16 hours"), "{asked}");
         assert!(asked.contains("This session has worked here for"), "{asked}");
         assert!(asked.contains("minute(s)"), "{asked}");
-        assert!(asked.contains("12 item(s) currently owe a verdict here"), "{asked}");
+        assert!(asked.contains("12 item(s) are owed a verdict store-wide for this project"), "{asked}");
         assert!(asked.contains("It has been asked 1 time(s)"), "{asked}");
         assert!(asked.contains("A turn cannot end until the evaluation report for this project is filed"), "{asked}");
         assert!(asked.contains("After that it is quiet for 16 hours"), "{asked}");
@@ -4901,7 +4901,7 @@ mod evaluation_debt_tests {
         let (_dir, db, store) = new_store();
         let asked =
             evaluation_debt(&store, &db, Some("thor"), &work_minutes(90)).expect("a zero-item backlog must still owe an evaluation");
-        assert!(asked.contains("0 item(s) currently owe a verdict here"), "{asked}");
+        assert!(asked.contains("0 item(s) are owed a verdict store-wide for this project"), "{asked}");
     }
 
     /// THE NO-PROJECT GUARD (`no evaluation is asked outside a project,
@@ -5113,7 +5113,7 @@ mod evaluation_debt_tests {
             asked.contains("A new evaluation is due, covering only what happened since then plus the state of the work"),
             "{asked}"
         );
-        assert!(asked.contains("5 item(s) currently owe a verdict here"), "{asked}");
+        assert!(asked.contains("5 item(s) are owed a verdict store-wide for this project"), "{asked}");
         assert!(asked.contains("A turn cannot end until the evaluation report for this project is filed"), "{asked}");
         assert!(
             !asked.contains("It has been asked"),

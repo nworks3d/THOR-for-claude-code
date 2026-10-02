@@ -8,6 +8,10 @@
 //! work. This file lets the backup back off for an hour after a failed attempt
 //! instead of retrying at every start, and lets the health check say plainly
 //! that the off-site copy is stale and since when.
+//!
+//! Since the backup moved to the NAS it also remembers where the last
+//! successful copy went (the remote's name and address) and when, so the
+//! health check can name the target while all is well, not only when it fails.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -36,14 +40,32 @@ pub struct BackupState {
     /// Why the most recent attempt failed, on one line.
     #[serde(default)]
     pub last_error: String,
+    /// The remote the last attempt pushed to (for example `nas`); empty when
+    /// the attempt failed before one was chosen.
+    #[serde(default)]
+    pub remote: String,
+    /// Where that remote points (a folder on the NAS, or a web address).
+    #[serde(default)]
+    pub address: String,
+    /// When the last successful push finished (Unix seconds); 0 when none yet.
+    #[serde(default)]
+    pub last_ok_unix: u64,
+}
+
+impl BackupState {
+    /// A run of failures is in progress.
+    pub fn is_failing(&self) -> bool {
+        self.failing_since_unix > 0
+    }
 }
 
 pub fn path_for(db: &Path) -> PathBuf {
     db.parent().unwrap_or_else(|| Path::new(".")).join("backup-state.json")
 }
 
-/// The recorded failure, or `None` while the backup is healthy (no sidecar) or
-/// the sidecar cannot be read - the same fail-open stance as `ship_state`.
+/// What the sidecar holds, or `None` when there is none yet or it cannot be
+/// read - the same fail-open stance as `ship_state`. A healthy backup has a
+/// sidecar too (its last success); `BackupState::is_failing` tells them apart.
 pub fn read(db: &Path) -> Option<BackupState> {
     let text = std::fs::read_to_string(path_for(db)).ok()?;
     serde_json::from_str(&text).ok()
@@ -53,29 +75,73 @@ pub fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-/// Record a failed attempt. Keeps the time of the FIRST failure of the run.
-pub fn record_failure_at(db: &Path, repo: &Path, reason: &str, now: u64) -> std::io::Result<()> {
-    let since = read(db).map(|s| s.failing_since_unix).filter(|t| *t > 0).unwrap_or(now);
-    let state = BackupState {
-        repo: repo.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
-        failing_since_unix: since,
-        last_attempt_unix: now,
-        last_error: one_line(reason),
-    };
-    let json = serde_json::to_string(&state).unwrap_or_else(|_| "{}".to_string());
+fn repo_name(repo: &Path) -> String {
+    repo.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
+}
+
+fn write_state(db: &Path, state: &BackupState) -> std::io::Result<()> {
+    let json = serde_json::to_string(state).unwrap_or_else(|_| "{}".to_string());
     std::fs::write(path_for(db), json)
 }
 
-/// A success ends the run of failures: the sidecar goes away, so a healthy
-/// backup leaves nothing behind and the health check says nothing.
-pub fn record_success(db: &Path) {
-    let _ = std::fs::remove_file(path_for(db));
+/// Record a failed attempt before a remote was chosen. See `record_failure_for`.
+pub fn record_failure_at(db: &Path, repo: &Path, reason: &str, now: u64) -> std::io::Result<()> {
+    record_failure_for(db, repo, "", "", reason, now)
+}
+
+/// Record a failed attempt to `remote` (at `address`). Keeps the time of the
+/// FIRST failure of the run, and the time of the last success.
+pub fn record_failure_for(
+    db: &Path,
+    repo: &Path,
+    remote: &str,
+    address: &str,
+    reason: &str,
+    now: u64,
+) -> std::io::Result<()> {
+    let before = read(db);
+    let since = before.as_ref().map(|s| s.failing_since_unix).filter(|t| *t > 0).unwrap_or(now);
+    let last_ok_unix = before.map(|s| s.last_ok_unix).unwrap_or(0);
+    write_state(
+        db,
+        &BackupState {
+            repo: repo_name(repo),
+            failing_since_unix: since,
+            last_attempt_unix: now,
+            last_error: one_line(reason),
+            remote: remote.to_string(),
+            address: address.to_string(),
+            last_ok_unix,
+        },
+    )
+}
+
+/// A success ends the run of failures. What stays is the proof of where the
+/// last copy went and when, so the health check can say so while all is well.
+///
+/// `pushed` is false for a run that did nothing because the last copy is still
+/// fresh: the attempt went well, but the time of the last copy must not move.
+pub fn record_success_for(db: &Path, repo: &Path, remote: &str, address: &str, now: u64, pushed: bool) {
+    let last_ok_unix = if pushed { now } else { read(db).map(|s| s.last_ok_unix).unwrap_or(0) };
+    let _ = write_state(
+        db,
+        &BackupState {
+            repo: repo_name(repo),
+            failing_since_unix: 0,
+            last_attempt_unix: now,
+            last_error: String::new(),
+            remote: remote.to_string(),
+            address: address.to_string(),
+            last_ok_unix,
+        },
+    );
 }
 
 /// Seconds still to wait before the next attempt, when the last attempt failed
-/// less than `BACKOFF_SECS` ago; `None` when an attempt may run.
+/// less than `BACKOFF_SECS` ago; `None` when an attempt may run (a success
+/// never makes the next attempt wait).
 pub fn backoff_left_at(db: &Path, now: u64) -> Option<u64> {
-    let state = read(db)?;
+    let state = read(db).filter(BackupState::is_failing)?;
     let waited = now.saturating_sub(state.last_attempt_unix);
     (waited < BACKOFF_SECS).then(|| BACKOFF_SECS - waited)
 }
@@ -124,13 +190,39 @@ mod tests {
     }
 
     #[test]
-    fn a_success_clears_everything() {
+    fn a_success_ends_the_failure_and_remembers_where_the_copy_went() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("thor.db");
         record_failure_at(&db, Path::new("acme-backup"), "x", 1_000_000).unwrap();
-        record_success(&db);
-        assert_eq!(read(&db), None);
-        assert_eq!(backoff_left_at(&db, 1_000_001), None);
+        record_success_for(&db, Path::new("acme-backup"), "nas", "//nas/share/acme-backup", 1_000_500, true);
+        let s = read(&db).unwrap();
+        assert!(!s.is_failing());
+        assert_eq!(s.remote, "nas");
+        assert_eq!(s.address, "//nas/share/acme-backup");
+        assert_eq!(s.last_ok_unix, 1_000_500);
+        assert_eq!(backoff_left_at(&db, 1_000_501), None, "a success never makes the next attempt wait");
+    }
+
+    #[test]
+    fn a_run_that_pushed_nothing_does_not_move_the_time_of_the_last_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        record_success_for(&db, Path::new("acme-backup"), "nas", "//nas/x", 1_000, true);
+        record_success_for(&db, Path::new("acme-backup"), "nas", "//nas/x", 5_000, false);
+        assert_eq!(read(&db).unwrap().last_ok_unix, 1_000);
+    }
+
+    #[test]
+    fn a_failure_keeps_the_time_of_the_last_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        record_success_for(&db, Path::new("acme-backup"), "nas", "//nas/x", 1_000, true);
+        record_failure_for(&db, Path::new("acme-backup"), "nas", "//nas/x", "share is gone", 2_000).unwrap();
+        let s = read(&db).unwrap();
+        assert!(s.is_failing());
+        assert_eq!(s.failing_since_unix, 2_000);
+        assert_eq!(s.last_ok_unix, 1_000);
+        assert_eq!(s.remote, "nas");
     }
 
     #[test]

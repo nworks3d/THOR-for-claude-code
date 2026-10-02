@@ -89,38 +89,38 @@ fn last_commit_age_hours_at(repo: &Path, subdir: &str, rev: &str) -> Option<u64>
     Some(now.saturating_sub(ts) / 3600)
 }
 
-/// Whether the branch checked out in `repo` has a configured upstream at
-/// all (`@{u}`, git's own name for it) - a repo with no remote configured,
-/// or a branch never set to track one, has no upstream to compare against,
-/// and every check below falls back to today's LOCAL-only behaviour rather
-/// than guessing at one. Deliberately NOT hard-coded to `origin/main`: the
-/// branch actually checked out here may track a different remote, a
-/// different branch name, or both - see `upstream_remote_and_branch`.
-fn has_upstream(repo: &Path) -> bool {
-    Command::new("git")
-        .arg("-C").arg(repo)
-        .args(["rev-parse", "--verify", "-q", "@{u}"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+/// Where a backup goes: one remote, one branch, and the local copy of what
+/// that remote has (`tracking`, for example `refs/remotes/nas/main`), when git has one.
+///
+/// WHY THE REMOTE IS CHOSEN HERE AND NOT BY GIT'S "UPSTREAM". The private
+/// backup moved from GitHub to the NAS on 2026-10-02. A clone that still has
+/// both remotes would keep pushing to whichever one its branch tracks, which
+/// is the old one. So a remote named `nas` wins by itself, with no change to
+/// the hook or the scheduled task that start the backup; `--remote` names
+/// another one on purpose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Target {
+    pub remote: String,
+    pub branch: String,
+    pub tracking: Option<String>,
 }
 
-/// How many commits local `HEAD` carries that the upstream (`@{u}`) does
-/// not - the exact count of backup commits a previous run made but could
-/// not push. `None` when it cannot be determined (git failed to run at
-/// all) - callers already gate this behind `has_upstream`, so an
-/// unparseable count here is treated the same as "nothing to catch up"
-/// rather than guessed at.
-fn commits_ahead_of_upstream(repo: &Path) -> Option<u64> {
-    let out = Command::new("git")
-        .arg("-C").arg(repo)
-        .args(["rev-list", "--count", "@{u}..HEAD"])
-        .output()
-        .ok()?;
+fn git_text(repo: &Path, args: &[&str]) -> Option<String> {
+    let out = Command::new("git").arg("-C").arg(repo).args(args).output().ok()?;
     if !out.status.success() {
         return None;
     }
-    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// The names of the remotes the clone has.
+fn remote_names(repo: &Path) -> Vec<String> {
+    git_text(repo, &["remote"]).map(|t| t.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect()).unwrap_or_default()
+}
+
+/// Where `remote` points (its fetch address), for messages and for the doctor.
+pub fn remote_url(repo: &Path, remote: &str) -> Option<String> {
+    git_text(repo, &["remote", "get-url", remote]).filter(|u| !u.is_empty())
 }
 
 /// The checked-out branch's configured upstream, split into (remote,
@@ -128,22 +128,60 @@ fn commits_ahead_of_upstream(repo: &Path) -> Option<u64> {
 /// but just as well `("upstream", "release/2.0")` for one tracking
 /// `upstream/release/2.0` (a branch name may itself contain `/`, so only
 /// the FIRST `/` splits remote from branch - a remote name never does).
-/// `None` with no upstream configured, the same case `has_upstream` reports
-/// `false` for; callers fall back to today's `origin`/`main` pair then, so
-/// a repo with no upstream at all keeps behaving exactly as before this
-/// existed.
+/// `None` with no upstream configured.
 fn upstream_remote_and_branch(repo: &Path) -> Option<(String, String)> {
-    let out = Command::new("git")
-        .arg("-C").arg(repo)
-        .args(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let full = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let full = git_text(repo, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])?;
     let (remote, branch) = full.split_once('/')?;
     Some((remote.to_string(), branch.to_string()))
+}
+
+/// Choose the remote and branch a backup uses.
+///
+/// Remote: the one asked for (`requested`, which must exist), else a remote
+/// named `nas`, else the remote the checked-out branch tracks, else `origin`.
+/// Branch: the tracked branch when the tracked remote is the one chosen, else
+/// the checked-out branch, else `main`.
+pub fn resolve_target(repo: &Path, requested: Option<&str>) -> anyhow::Result<Target> {
+    let remotes = remote_names(repo);
+    let upstream = upstream_remote_and_branch(repo);
+    let remote = match requested {
+        Some(name) => {
+            anyhow::ensure!(
+                remotes.iter().any(|r| r == name),
+                "{} has no remote named '{name}' - add it first (git remote add {name} <address>) or leave --remote off",
+                repo.display()
+            );
+            name.to_string()
+        }
+        None if remotes.iter().any(|r| r == "nas") => "nas".to_string(),
+        None => upstream.as_ref().map(|(r, _)| r.clone()).unwrap_or_else(|| "origin".to_string()),
+    };
+    let branch = match &upstream {
+        Some((r, b)) if *r == remote => b.clone(),
+        _ => git_text(repo, &["symbolic-ref", "--short", "HEAD"]).unwrap_or_else(|| "main".to_string()),
+    };
+    let tracking_ref = format!("refs/remotes/{remote}/{branch}");
+    let has_tracking = Command::new("git")
+        .arg("-C").arg(repo)
+        .args(["rev-parse", "--verify", "-q", &tracking_ref])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    Ok(Target { remote, branch, tracking: has_tracking.then_some(tracking_ref) })
+}
+
+/// How many commits local `HEAD` carries that `tracking` does not - the exact
+/// count of backup commits a previous run made but could not push. `None`
+/// when it cannot be determined (git failed to run at all), which callers
+/// treat the same as "nothing to catch up" rather than guessing.
+fn commits_ahead_of(repo: &Path, tracking: &str) -> Option<u64> {
+    git_text(repo, &["rev-list", "--count", &format!("{tracking}..HEAD")])?.parse().ok()
+}
+
+/// `commits_ahead_of` against git's own upstream (`@{u}`); the tests use it.
+#[cfg(test)]
+fn commits_ahead_of_upstream(repo: &Path) -> Option<u64> {
+    commits_ahead_of(repo, "@{u}")
 }
 
 /// Automated backup: export the log to <repo>/<subdir>/events-0001.jsonl ..., then commit
@@ -167,6 +205,18 @@ pub fn backup_to_repo(
     backup_to_repo_sized(store, repo, subdir, force, Sizes::DEFAULT)
 }
 
+/// `backup_to_repo` pushing to the remote `requested` names (see
+/// `resolve_target` for what happens when it is None).
+pub fn backup_to_remote(
+    store: &EventStore,
+    repo: &Path,
+    subdir: &str,
+    force: bool,
+    requested: Option<&str>,
+) -> anyhow::Result<String> {
+    backup_inner(store, repo, subdir, force, Sizes::DEFAULT, requested)
+}
+
 /// `backup_to_repo` with the segment and push sizes given - tests pass
 /// kilobytes, the real run passes `Sizes::DEFAULT`.
 pub fn backup_to_repo_sized(
@@ -175,6 +225,17 @@ pub fn backup_to_repo_sized(
     subdir: &str,
     force: bool,
     sizes: Sizes,
+) -> anyhow::Result<String> {
+    backup_inner(store, repo, subdir, force, sizes, None)
+}
+
+fn backup_inner(
+    store: &EventStore,
+    repo: &Path,
+    subdir: &str,
+    force: bool,
+    sizes: Sizes,
+    requested: Option<&str>,
 ) -> anyhow::Result<String> {
     anyhow::ensure!(
         !subdir.is_empty()
@@ -191,19 +252,17 @@ pub fn backup_to_repo_sized(
     // below: the data is only actually backed up once it leaves this
     // machine, and the debounce exists to limit how often we commit, never
     // to sit on a commit that already happened.
-    let upstream = has_upstream(repo);
-    // Resolved once, from the branch actually checked out here - falls back
-    // to today's `origin`/`main` pair only when no upstream is configured
-    // at all, so that case keeps behaving exactly as it did before this
-    // existed (see `upstream_remote_and_branch`'s own doc comment).
-    let (remote, branch) = upstream_remote_and_branch(repo).unwrap_or_else(|| ("origin".to_string(), "main".to_string()));
+    // Resolved once (see `resolve_target`): a remote named `nas` wins by
+    // itself, else the branch's own upstream, else `origin`/`main`.
+    let target = resolve_target(repo, requested)?;
+    let Target { remote, branch, tracking } = target;
     let mut pushed_note: Option<String> = None;
-    if upstream {
-        if let Some(ahead) = commits_ahead_of_upstream(repo) {
+    if let Some(tracking) = tracking.as_deref() {
+        if let Some(ahead) = commits_ahead_of(repo, tracking) {
             if ahead > 0 {
                 // A local commit holding a file GitHub will never take (the
                 // old single events.jsonl) would fail every push for ever.
-                let dropped = drop_unpushable_backup_commits(repo, subdir, sizes.push_limit_bytes)?;
+                let dropped = drop_unpushable_backup_commits(repo, subdir, sizes.push_limit_bytes, tracking)?;
                 if dropped > 0 {
                     pushed_note = Some(format!(
                         "dropped {dropped} local backup commit(s) holding a file too big to push (the export is regenerated below)"
@@ -226,10 +285,9 @@ pub fn backup_to_repo_sized(
         // think a backup just landed (see this file's own doc comment). With
         // no upstream configured at all, there is nothing to measure from
         // but the local branch, so that stays today's behaviour unchanged.
-        let age = if upstream {
-            last_commit_age_hours_at(repo, subdir, "@{u}")
-        } else {
-            last_commit_age_hours(repo, subdir)
+        let age = match tracking.as_deref() {
+            Some(tracking) => last_commit_age_hours_at(repo, subdir, tracking),
+            None => last_commit_age_hours(repo, subdir),
         };
         if let Some(age) = age {
             if age < DEBOUNCE_HOURS {
@@ -389,7 +447,7 @@ pub fn restore_path(store: &mut EventStore, path: &Path) -> anyhow::Result<usize
 /// `subdir`; anything else is somebody's work and is reported, never
 /// rewritten. Nothing on the remote changes (no force push). Returns how many
 /// commits were dropped; the export is regenerated by the caller.
-fn drop_unpushable_backup_commits(repo: &Path, subdir: &str, limit: u64) -> anyhow::Result<usize> {
+fn drop_unpushable_backup_commits(repo: &Path, subdir: &str, limit: u64, tracking: &str) -> anyhow::Result<usize> {
     let git_out = |args: &[&str]| -> anyhow::Result<String> {
         let out = Command::new("git").arg("-C").arg(repo).args(args).output()?;
         if !out.status.success() {
@@ -398,7 +456,7 @@ fn drop_unpushable_backup_commits(repo: &Path, subdir: &str, limit: u64) -> anyh
         Ok(String::from_utf8_lossy(&out.stdout).to_string())
     };
     // Any object in the unpushed range over the limit?
-    let objects = git_out(&["rev-list", "--objects", "@{u}..HEAD"])?;
+    let objects = git_out(&["rev-list", "--objects", &format!("{tracking}..HEAD")])?;
     let mut batch_in = String::new();
     for line in objects.lines() {
         if let Some(id) = line.split_whitespace().next() {
@@ -427,8 +485,8 @@ fn drop_unpushable_backup_commits(repo: &Path, subdir: &str, limit: u64) -> anyh
         return Ok(0);
     }
     // Only our own export commits may be dropped.
-    let subjects = git_out(&["log", "--format=%s", "@{u}..HEAD"])?;
-    let names = git_out(&["diff", "--name-only", "@{u}", "HEAD"])?;
+    let subjects = git_out(&["log", "--format=%s", &format!("{tracking}..HEAD")])?;
+    let names = git_out(&["diff", "--name-only", tracking, "HEAD"])?;
     let prefix = format!("{subdir} backup (");
     let own_subjects = subjects.lines().all(|s| s.starts_with(&prefix));
     let own_paths = names.lines().all(|n| n.starts_with(&format!("{subdir}/")));
@@ -439,7 +497,7 @@ fn drop_unpushable_backup_commits(repo: &Path, subdir: &str, limit: u64) -> anyh
         limit
     );
     let count = subjects.lines().count();
-    git_out(&["reset", "--soft", "@{u}"])?;
+    git_out(&["reset", "--soft", tracking])?;
     git_out(&["reset", "--quiet"])?;
     Ok(count)
 }
@@ -988,5 +1046,89 @@ mod tests {
             "must catch up against the real upstream (upstream/release): {second}"
         );
         assert_eq!(commits_ahead_of_upstream(&work), Some(0), "the real upstream must now have the commit");
+    }
+
+    // ------------------------------------------------ the NAS remote (step 30)
+
+    /// The fixture plus a second bare remote called `nas` that already has
+    /// `main` (the state after the first push to the NAS by hand).
+    fn fixture_with_nas() -> (GitFixture, std::path::PathBuf) {
+        let fx = make_git_fixture();
+        let nas = fx._dir.path().join("nas.git");
+        git_ok(fx._dir.path(), &["init", "--bare", nas.to_str().unwrap()]);
+        git_ok(&fx.work, &["remote", "add", "nas", nas.to_str().unwrap()]);
+        git_ok(&fx.work, &["push", "nas", "main"]);
+        (fx, nas)
+    }
+
+    fn count_commits(git_dir: &Path, rev: &str) -> usize {
+        let out = Command::new("git").arg("-C").arg(git_dir).args(["rev-list", "--count", rev]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+    }
+
+    #[test]
+    fn a_remote_named_nas_gets_the_backup_by_itself_and_origin_is_left_alone() {
+        let (fx, nas) = fixture_with_nas();
+        let mut store = EventStore::in_memory().unwrap();
+        seed(&mut store);
+        let out = backup_to_remote(&store, &fx.work, "thor2", true, None).unwrap();
+        assert!(out.contains("pushed thor2 backup"), "{out}");
+        assert_eq!(count_commits(&nas, "main"), 2, "the NAS has the initial commit and the backup");
+        assert_eq!(count_commits(&fx.remote, "main"), 1, "origin must not receive the backup");
+    }
+
+    #[test]
+    fn the_plain_entry_point_also_follows_the_nas_remote() {
+        // The hook and the scheduled task never pass a remote: they must end
+        // up at the NAS anyway.
+        let (fx, nas) = fixture_with_nas();
+        let mut store = EventStore::in_memory().unwrap();
+        seed(&mut store);
+        backup_to_repo(&store, &fx.work, "thor2", true).unwrap();
+        assert_eq!(count_commits(&nas, "main"), 2);
+        assert_eq!(count_commits(&fx.remote, "main"), 1);
+    }
+
+    #[test]
+    fn a_remote_asked_for_by_name_beats_the_nas_default() {
+        let (fx, nas) = fixture_with_nas();
+        let mut store = EventStore::in_memory().unwrap();
+        seed(&mut store);
+        backup_to_remote(&store, &fx.work, "thor2", true, Some("origin")).unwrap();
+        assert_eq!(count_commits(&fx.remote, "main"), 2);
+        assert_eq!(count_commits(&nas, "main"), 1);
+    }
+
+    #[test]
+    fn a_remote_that_does_not_exist_is_refused_with_the_fix() {
+        let fx = make_git_fixture();
+        let mut store = EventStore::in_memory().unwrap();
+        seed(&mut store);
+        let err = backup_to_remote(&store, &fx.work, "thor2", true, Some("vault")).unwrap_err().to_string();
+        assert!(err.contains("no remote named 'vault'") && err.contains("git remote add vault"), "{err}");
+    }
+
+    #[test]
+    fn a_commit_that_never_reached_the_nas_is_pushed_on_the_next_run() {
+        let (fx, nas) = fixture_with_nas();
+        let mut store = EventStore::in_memory().unwrap();
+        seed(&mut store);
+        git_ok(&fx.work, &["remote", "set-url", "--push", "nas", "/no/such/path"]);
+        assert!(backup_to_remote(&store, &fx.work, "thor2", true, None).is_err());
+        assert_eq!(count_commits(&nas, "main"), 1);
+        git_ok(&fx.work, &["remote", "set-url", "--push", "nas", nas.to_str().unwrap()]);
+        let second = backup_to_remote(&store, &fx.work, "thor2", false, None).unwrap();
+        assert!(second.contains("pushed 1 backup commit(s) that had not reached the remote"), "{second}");
+        assert_eq!(count_commits(&nas, "main"), 2);
+    }
+
+    #[test]
+    fn the_target_names_the_nas_remote_and_its_address() {
+        let (fx, nas) = fixture_with_nas();
+        let target = resolve_target(&fx.work, None).unwrap();
+        assert_eq!(target.remote, "nas");
+        assert_eq!(target.branch, "main");
+        assert_eq!(target.tracking.as_deref(), Some("refs/remotes/nas/main"));
+        assert_eq!(remote_url(&fx.work, "nas").as_deref(), Some(nas.to_str().unwrap()));
     }
 }
