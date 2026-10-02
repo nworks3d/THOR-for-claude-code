@@ -2138,6 +2138,47 @@ mod tests {
         }
     }
 
+    /// The owner's `claim-no-access-without-checking` rule as narrowed on
+    /// 2026-10-02: the bare "geen toegang" is gone, only first-person forms
+    /// remain. (The repo ships no copy of this rule in its example rulebook,
+    /// so this is an inline copy of the live rule.)
+    const NARROWED_NO_ACCESS_RULEBOOK: &str = r#"[
+      {"id":"claim-no-access-without-checking","own_claims_only":true,
+       "any_of":["kan ik van hieruit niet","geen tailnet","geen nas-toegang","heb ik geen toegang",
+                 "ik heb er geen toegang","ik heb geen toegang",
+                 "i can't reach","i don't have access","no access to the nas"],
+       "none_of":["read-only","alleen-lezen","vals alarm","false positive","use versus mention","als voorbeeld","any_of"],
+       "reminder":"Verify before claiming you cannot."}
+    ]"#;
+
+    fn narrowed_no_access_held(msg: &str) -> bool {
+        guard_verdict(Some(NARROWED_NO_ACCESS_RULEBOOK), msg, "", false, None).block_reason.is_some()
+    }
+
+    /// FALSE FIRE SEEN LIVE 2026-10-02: a sentence about a third party's
+    /// permission scope ("De assistent ... geen toegang tot ...") is not the
+    /// assistant claiming it cannot reach something.
+    #[test]
+    fn a_third_partys_permission_scope_does_not_fire_the_no_access_rule() {
+        let msg = "Is het een kleine, duidelijke oplossing, dan bouwt hij die met een test. \
+                   Die test moet eerst aantoonbaar falen en daarna slagen. \
+                   De assistent blijft enkel lezen: geen toegang tot geld, bestellingen of klantgegevens. \
+                   Hij zet niets op dev en commit niets.";
+        assert!(!narrowed_no_access_held(msg));
+    }
+
+    /// The first-person claims still fire after the narrowing.
+    #[test]
+    fn first_person_no_access_claims_still_fire_after_narrowing() {
+        for msg in [
+            "Ik heb geen toegang tot de NAS.",
+            "Daar heb ik geen toegang toe.",
+            "Ik heb er geen toegang toe.",
+        ] {
+            assert!(narrowed_no_access_held(msg), "must still fire: {msg}");
+        }
+    }
+
     /// An ordinary Dutch/English word that happens to use only hex-alphabet
     /// letters (a-f) must never be misread as a sha - it carries no digit at
     /// all, which `contains_commit_sha` requires.
