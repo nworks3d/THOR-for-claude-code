@@ -508,6 +508,9 @@ fn replay(item: &Item, corpus: &Corpus, root: &Path, known: &[String]) -> Option
     let alone = Alone::of(item, known)?;
     let mut out = Replay::default();
     for call in corpus.reaching(anchor) {
+        if item.project.as_deref().is_some_and(|project| corpus.made_elsewhere(call, project)) {
+            continue;
+        }
         if call.cut {
             out.cut += 1;
             if literals.iter().any(|l| call.hit(anchor, l)) {

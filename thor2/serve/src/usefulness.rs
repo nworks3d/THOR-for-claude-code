@@ -1903,7 +1903,7 @@ pub fn last_project_of_session(db: &Path, session_id: &str) -> Option<String> {
 
 /// `last_project_of_session` on a sidecar already read: the project whose
 /// entry for `session_id` has the newest `last_event_unix`.
-fn newest_project_of_session<'a>(all: &'a EvalDebtState, session_id: &str) -> Option<&'a str> {
+pub(crate) fn newest_project_of_session<'a>(all: &'a EvalDebtState, session_id: &str) -> Option<&'a str> {
     all.iter()
         .filter(|(key, _)| !key.is_empty())
         .filter_map(|(key, state)| state.sessions.get(session_id).map(|s| (key.as_str(), s.last_event_unix.unwrap_or(i64::MIN))))

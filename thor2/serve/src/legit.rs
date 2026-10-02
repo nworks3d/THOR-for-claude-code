@@ -165,6 +165,10 @@ pub struct Corpus {
     refused_by_session: HashMap<(String, String), i64>,
     /// Each distinct text is segmented once.
     segmented: HashMap<String, Vec<Segment>>,
+    /// session -> the project it last worked in, where the store's sidecar
+    /// knows it (`usefulness::last_project_of_session`). A session it does not
+    /// know is simply absent: its calls count for every project.
+    session_projects: HashMap<String, String>,
 }
 
 /// `text` as a served trigger records it: at most `TRIGGER_LIMIT` characters.
@@ -221,7 +225,45 @@ impl Corpus {
                 _ => {}
             }
         }
+        self.learn_session_projects(store);
         self.rebuild();
+    }
+
+    /// Where each session of the log worked, from the sidecar beside the store.
+    /// The log keeps no folder for a call, so this is the one answer to "whose
+    /// project was it made in" - the project the session LAST worked in
+    /// (step 29). Best effort: no sidecar, no answer.
+    fn learn_session_projects(&mut self, store: &EventStore) {
+        let Some(db) = store.path() else { return };
+        let state = crate::usefulness::read_eval_debt_state(&db);
+        if state.is_empty() {
+            return;
+        }
+        let sessions: Vec<String> = self.seen.values().flat_map(|m| m.keys().cloned()).collect();
+        for session in sessions {
+            if self.session_projects.contains_key(&session) {
+                continue;
+            }
+            if let Some(project) = crate::usefulness::newest_project_of_session(&state, &session) {
+                self.session_projects.insert(session, project.to_string());
+            }
+        }
+    }
+
+    /// Whether every session that made `call` is known to have last worked in a
+    /// project other than `project`: a rule of `project` is then not what the
+    /// hook would have applied to it, and the trial must not count it as one
+    /// that rule refuses (field 2026-10-02: 57 pushes made in two other
+    /// repositories counted against a project's push ban). A session this
+    /// corpus knows nothing about keeps its calls counted.
+    pub fn made_elsewhere(&self, call: &RealCall, project: &str) -> bool {
+        let own = model::normalize::normalize_project(Some(project));
+        !call.sessions.is_empty()
+            && call.sessions.iter().all(|(session, _)| {
+                self.session_projects
+                    .get(session)
+                    .is_some_and(|p| model::normalize::normalize_project(Some(p.as_str())) != own)
+            })
     }
 
     fn rebuild(&mut self) {
@@ -457,5 +499,35 @@ mod tests {
         let code = source.split("#[cfg(test)]").next().unwrap();
         assert!(code.contains("shell::segments(") && code.contains("shell::literal_in("));
         assert!(!code.contains("split_whitespace().any("), "no matcher of its own");
+    }
+
+    /// Step 29: the log keeps no folder for a call, so a session's project comes
+    /// from the sidecar beside the store. A call made only by sessions that last
+    /// worked in ANOTHER project is not one this project's rule would have met.
+    #[test]
+    fn a_call_made_in_another_projects_session_is_not_this_projects_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        let mut store = EventStore::new(&db).unwrap();
+        served(&mut store, S1, "git push origin main");
+        served(&mut store, S2, "git push origin dev");
+        let sidecar = serde_json::json!({
+            "alpha": { "sessions": { S1: { "last_event_unix": 10 } } },
+            "beta": { "sessions": { S2: { "last_event_unix": 10 } } },
+        });
+        std::fs::write(crate::usefulness::eval_debt_state_path(&db), sidecar.to_string()).unwrap();
+        let corpus = Corpus::load(&store);
+        let by_text = |text: &str| corpus.calls().iter().find(|c| c.text == text).unwrap();
+        assert!(!corpus.made_elsewhere(by_text("git push origin main"), "alpha"));
+        assert!(corpus.made_elsewhere(by_text("git push origin dev"), "alpha"));
+        assert!(!corpus.made_elsewhere(by_text("git push origin dev"), "beta"));
+    }
+
+    #[test]
+    fn a_session_the_sidecar_does_not_know_keeps_its_calls_counted() {
+        let mut store = EventStore::in_memory().unwrap();
+        served(&mut store, S1, "git push origin main");
+        let corpus = Corpus::load(&store);
+        assert!(!corpus.made_elsewhere(&corpus.calls()[0], "alpha"));
     }
 }

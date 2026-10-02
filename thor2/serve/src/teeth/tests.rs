@@ -1473,3 +1473,26 @@ fn the_trials_replay_does_not_count_calls_made_in_other_known_projects() {
     assert_eq!(r.refused.len(), 1, "only the push made where alpha lives would be refused: {:?}", r.refused.iter().map(|c| &c.text).collect::<Vec<_>>());
     assert_eq!(r.refused[0].text, "git push origin main");
 }
+
+#[test]
+fn the_trials_replay_skips_a_call_made_by_a_session_of_another_project() {
+    let mut fx = Fx::new();
+    let alpha = fx.checkout("alpha", &[("README.md", "alpha\n")], true);
+    fx.register("alpha", &alpha);
+    let ban = rule("no-push-from-alpha", "alpha gets no git push until the owner says so.", vec![command("git push")], forbidden(&["git push"]), Some("alpha"));
+    let dir = tempfile::tempdir().unwrap();
+    let log_db = dir.path().join("log.db");
+    let mut log = EventStore::new(&log_db).unwrap();
+    crate::deliver::record_delivery_with_trigger(&mut log, S1, S1, "hook", "2026-09-28T00:00:00Z", &["r".to_string()], Some("git push origin beta-branch"));
+    crate::deliver::record_delivery_with_trigger(&mut log, S2, S2, "hook", "2026-09-28T00:00:01Z", &["r".to_string()], Some("git push origin alpha-branch"));
+    let sidecar = serde_json::json!({
+        "alpha": { "sessions": { S2: { "last_event_unix": 10 } } },
+        "beta": { "sessions": { S1: { "last_event_unix": 10 } } },
+    });
+    std::fs::write(crate::usefulness::eval_debt_state_path(&log_db), sidecar.to_string()).unwrap();
+    let corpus = Corpus::load(&log);
+    let r = replay(&ban, &corpus, &alpha, &[]).expect("a command check is replayed");
+    assert_eq!(r.reached, 1, "the push made in beta's session is not alpha's call");
+    assert_eq!(r.refused.len(), 1);
+    assert_eq!(r.refused[0].text, "git push origin alpha-branch");
+}
