@@ -181,7 +181,7 @@ fn stale_servers_line(replaced_unix: i64, started: &[(u32, i64)]) -> Option<Stri
         .map(|(pid, start)| format!("{pid} (started {})", serve::time::iso8601_from_unix(*start)))
         .collect();
     Some(format!(
-        "tool server: {} running mcp.exe process(es) started before mcp.exe was replaced ({}): {} - they still run the OLD          program and may count and judge differently. Restart Claude to load the new tool server.",
+        "tool server: {} running mcp.exe process(es) started before mcp.exe was replaced ({}): {} - they still run the OLD program and may count and judge differently. Restart Claude to load the new tool server.",
         stale.len(),
         serve::time::iso8601_from_unix(replaced_unix),
         ids.join(", ")
@@ -195,7 +195,7 @@ fn stale_servers_line(replaced_unix: i64, started: &[(u32, i64)]) -> Option<Stri
 fn running_tool_servers(exe: &Path) -> Vec<(u32, i64)> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let script = "Get-Process -Name mcp -ErrorAction SilentlyContinue | ForEach-Object {                   $_.Id.ToString() + '|' + ([DateTimeOffset]$_.StartTime).ToUnixTimeSeconds() + '|' + $_.Path }";
+    let script = "Get-Process -Name mcp -ErrorAction SilentlyContinue | ForEach-Object { $_.Id.ToString() + '|' + ([DateTimeOffset]$_.StartTime).ToUnixTimeSeconds() + '|' + $_.Path }";
     let Ok(out) = std::process::Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .creation_flags(CREATE_NO_WINDOW)
