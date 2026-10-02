@@ -628,6 +628,10 @@ fn teeth_of_span(words: &[&str], anchor_len: usize, anchor: &str, proposed: Opti
 const RECOMMENDING: &[&str] = &[
     "use", "using", "prefer", "run", "always", "pass", "add", "instead", "gebruik", "gebruiken", "liever", "altijd",
     "draai", "voeg", "kies",
+    // A route prescribed through a quoted call ("pipe it via `x | ssh host 'sh -s'`"): the
+    // recommending word sits before the whole backtick span, not before the command in it
+    // (`recommended_inside_span`).
+    "via", "through",
     // The present tense DESCRIBES running a flag ("verify draait set-version.js
     // --check"), which is no prohibition of it (field test 5, D9).
     "runs", "uses", "adds", "passes", "draait", "gebruikt", "voegt", "kiest", "voert", "voer", "geef", "geeft",
@@ -654,6 +658,47 @@ fn recommended_at(raw: &[&str], at: usize) -> bool {
         words.push(raw_word.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'').to_lowercase());
     }
     words.iter().any(|w| RECOMMENDING.contains(&w.as_str())) && !words.iter().any(|w| NEGATING.contains(&w.as_str()))
+}
+
+/// The position of the token that opens the backtick span `at` sits inside, if
+/// any: the first token whose backticks leave a span open, counting every token
+/// before `at`. A span that closes before `at` opens nothing.
+fn backtick_span_start(raw: &[&str], at: usize) -> Option<usize> {
+    let mut open: Option<usize> = None;
+    for (i, token) in raw[..at].iter().enumerate() {
+        if token.matches('`').count() % 2 == 1 {
+            open = match open {
+                Some(_) => None,
+                None => Some(i),
+            };
+        }
+    }
+    open
+}
+
+/// Whether position `at` of `raw` sits inside a backtick span that the words
+/// before the span RECOMMEND ("pipe it via `... | ssh host 'sh -s'`"). The
+/// 3-token window of `recommended_at` never reaches past a long span to the
+/// word that prescribes it, so a command quoted deep inside a prescribed
+/// route was read as a prohibition (field 2026-10-02, a-38c5614df8feac5d:
+/// `sh -s` forbidden by the very rule that prescribes piping to it).
+fn recommended_inside_span(raw: &[&str], at: usize) -> bool {
+    let Some(start) = backtick_span_start(raw, at) else { return false };
+    recommended_at(raw, start) && !sentence_negates(raw, at)
+}
+
+/// Whether a negating word stands anywhere in the sentence token `at` is in
+/// ("never pipe scripts via `...`"): the recommending word may sit far from the
+/// negation, so the 3-token window of `recommended_at` is not enough here.
+fn sentence_negates(raw: &[&str], at: usize) -> bool {
+    let ends = |t: &str| t.ends_with(['.', '!', '?', ';', ':']);
+    let word = |t: &str| t.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'').to_lowercase();
+    let before = raw[..at].iter().rev().take_while(|t| !ends(t));
+    let after = raw[at..].iter().scan(false, |stop, t| {
+        let done = std::mem::replace(stop, ends(t));
+        (!done).then_some(t)
+    });
+    before.chain(after).any(|t| NEGATING.contains(&word(t).as_str()))
 }
 
 /// Whether the words just AFTER a command, up to the first flag and at most
@@ -740,7 +785,10 @@ fn recommended_fragments(item: &Item, raw: &[&str]) -> Vec<String> {
         let mut from = 0;
         while let Some(found) = span_position(&raw[from..], &aw).map(|i| i + from) {
             from = found + 1;
-            if !recommended_at(raw, found) && !describes_running_after(raw, found, found + aw.len()) {
+            if !recommended_at(raw, found)
+                && !recommended_inside_span(raw, found)
+                && !describes_running_after(raw, found, found + aw.len())
+            {
                 continue;
             }
             let bare = |t: &str| t.trim_matches(|c: char| matches!(c, '`' | '\'' | '"' | '(' | ')' | ',' | ';' | ':' | '.' | '!' | '?')).to_string();

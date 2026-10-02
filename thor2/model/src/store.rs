@@ -6300,7 +6300,7 @@ fn machine_section(store: &EventStore, start: &EvaluationStart, filed_seq: i64) 
     ));
     weakened.iter().for_each(|line| out.push_str(line));
     out.push_str(&format!(
-        "\nrules whose check was cleared, moved or changed by a write that is not THOR's own in the window: {}.",
+        "\nrules whose check was cleared, moved or changed by an agent's write rather than THOR's own trial in the window: {}.",
         checks.len()
     ));
     checks.iter().for_each(|line| out.push_str(line));
@@ -9701,7 +9701,7 @@ mod tests {
         let filed_seq = store.get_next_seq().unwrap() - 1;
         let section = render_machine_section(&store, &start, filed_seq);
         assert!(
-            section.contains("rules whose check was cleared, moved or changed by a write that is not THOR's own in the window: 2."),
+            section.contains("rules whose check was cleared, moved or changed by an agent's write rather than THOR's own trial in the window: 2."),
             "{section}"
         );
         assert!(

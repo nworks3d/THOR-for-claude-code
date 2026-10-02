@@ -751,6 +751,41 @@ fn d9_a_verb_that_describes_running_a_flag_derives_no_forbidden_tooth() {
     assert!(derive(&never, None).iter().any(|d| matches!(&d.check, Check::Forbidden { .. })));
 }
 
+/// FIELD TEST 10 (2026-10-02, a-38c5614df8feac5d): the rule PRESCRIBES a route
+/// ("pipe it via `... | ssh host 'sh -s'`") and THOR built a forbidden tooth on
+/// `-s` for `sh` from it, because the recommending word sits before the whole
+/// backtick span, outside the 3-token window in front of `sh`. The agent hung
+/// it as told, and the tooth then refused the very route the rule prescribes.
+/// A command quoted inside a span that a recommending word introduces is never
+/// forbidden; the same span after a negating word still is.
+#[test]
+fn a_command_inside_a_prescribed_route_is_never_forbidden() {
+    for text in [
+        "Standard route for NAS scripts: strip the BOM and the CR, then pipe it via `... | ssh nas 'sh -s'`.",
+        "Standaard-route voor NAS-scripts: pipe het met de twee verplichte -replaces (BOM strippen, CR strippen) via `... | ssh admin@host 'sh -s'`.",
+        "Run the script through `cat run.sh | ssh nas 'sh -s'` from the scratchpad.",
+    ] {
+        let item = rule("route", text, vec![cmd("sh")], None, None);
+        let forbidden: Vec<String> = derive(&item, None)
+            .iter()
+            .filter_map(|d| match &d.check {
+                Check::Forbidden { literals } => Some(literals.join(" ")),
+                _ => None,
+            })
+            .collect();
+        assert!(forbidden.is_empty(), "{text}: {forbidden:?}");
+    }
+    // A prohibition of the same route still derives its tooth, and a span that
+    // closed before the command opens nothing.
+    for text in [
+        "Never pipe scripts via `cat run.sh | ssh nas 'sh -s'`.",
+        "Use `cat` for notes, but never run `sh -s` on the NAS.",
+    ] {
+        let item = rule("route", text, vec![cmd("sh")], None, None);
+        assert!(derive(&item, None).iter().any(|d| matches!(&d.check, Check::Forbidden { .. })), "{text}");
+    }
+}
+
 /// Field test 5 (D9): a fragment that is a piece of the anchor path ("README"
 /// in README.md, "RELEASE" in RELEASE-CHECKLIST.md) is in that file by the way
 /// it is named, so it is no tooth; a real fragment of the same text still is.
