@@ -675,7 +675,10 @@ fn check_evidence(message: &str, lookup: &EvidenceLookup) -> CheckedEvidence {
     for m in commit_sha_regex().find_iter(&escapes_lower) {
         let s = m.as_str();
         let shaped = s.bytes().any(|b| b.is_ascii_digit()) && s.bytes().any(|b| b.is_ascii_alphabetic());
-        if shaped && !candidates.iter().any(|c| c == s) && candidates.len() < MAX_SHA_LOOKUPS {
+        // A real sha can be all digits (its first eight characters are, one
+        // commit in forty-three); written next to "commit" or "sha" it is
+        // asked of the repository, which is the judge. Bare, it is a number.
+        if (shaped || named_as_a_commit(&escapes_lower, m.start())) && !candidates.iter().any(|c| c == s) && candidates.len() < MAX_SHA_LOOKUPS {
             candidates.push(s.to_string());
         }
     }
@@ -688,6 +691,16 @@ fn check_evidence(message: &str, lookup: &EvidenceLookup) -> CheckedEvidence {
         !real.is_empty()
     });
     CheckedEvidence { verified_citations, real_sha, real_line_reference, unverified, escapes_lower }
+}
+
+/// Whether the text just before `start` is the word commit, sha, hash, rev or
+/// revision (white space, a colon, a hash sign, quotes, backticks and an open
+/// bracket allowed in between), as a whole word.
+fn named_as_a_commit(haystack_lower: &str, start: usize) -> bool {
+    let before = haystack_lower[..start].trim_end_matches(|c: char| c.is_whitespace() || ":#`'\"(".contains(c));
+    ["commit", "sha", "hash", "revision", "rev"].iter().any(|word| {
+        before.strip_suffix(word).is_some_and(|rest| !rest.chars().next_back().is_some_and(char::is_alphanumeric))
+    })
 }
 
 /// Whether some "line N"/"regel N" in `message` names a line that a file named
@@ -1250,8 +1263,11 @@ pub fn evaluate_opt_in(
 
 /// What a fired rule says: its `reminder_if_asked` when the owner's own prompt
 /// asked for what the reminder tells the writer to leave out, else its
-/// reminder - with any internal id in a bracket taken out (`without_internal_ids`).
-fn reminder_for(rule: &OptInRule, prompt_lower: &str) -> String {
+/// reminder - with any internal id in a bracket taken out (`without_internal_ids`)
+/// and `{owner_request}` replaced by the owner's own words (`owner_request_quote`).
+/// `prompt` is the owner's last prompt as he typed it, `prompt_lower` the same
+/// lowercased (empty when it could not be read).
+fn reminder_for(rule: &OptInRule, prompt: &str, prompt_lower: &str) -> String {
     let asked = !prompt_lower.is_empty()
         && !rule.asked_for_any_of.is_empty()
         && rule.asked_for_any_of.iter().any(|t| prompt_lower.contains(&t.to_lowercase()));
@@ -1259,7 +1275,78 @@ fn reminder_for(rule: &OptInRule, prompt_lower: &str) -> String {
         (Some(alternative), true) => alternative,
         _ => &rule.base.reminder,
     };
-    without_internal_ids(text)
+    let text = without_internal_ids(text);
+    if !text.contains(OWNER_REQUEST_PLACEHOLDER) {
+        return text;
+    }
+    let quote = owner_request_quote(prompt, &rule.asked_for_any_of);
+    text.replace(OWNER_REQUEST_PLACEHOLDER, &quote).replace("  ", " ")
+}
+
+/// A reminder that cannot know what the owner asked for says so with this
+/// placeholder; the hold then carries his own words instead of a guess (step 32:
+/// "the owner asked for the test result" made an agent drop the "what you
+/// changed" the same prompt also asked for).
+const OWNER_REQUEST_PLACEHOLDER: &str = "{owner_request}";
+
+/// The longest quote of the owner's prompt a hold carries.
+const OWNER_REQUEST_QUOTE_MAX_CHARS: usize = 240;
+
+/// His own words, as a short clause for a hold: the sentence(s) of `prompt`
+/// that name one of `asked_terms` (the report he asked for), else the first
+/// words of the prompt; cut at `OWNER_REQUEST_QUOTE_MAX_CHARS`. Empty when the
+/// prompt could not be read, so the clause is simply left out.
+fn owner_request_quote(prompt: &str, asked_terms: &[String]) -> String {
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        return String::new();
+    }
+    let terms: Vec<String> = asked_terms.iter().map(|t| t.to_lowercase()).collect();
+    let naming: Vec<&str> = prompt_sentences(prompt)
+        .into_iter()
+        .filter(|sentence| {
+            let lower = sentence.to_lowercase();
+            terms.iter().any(|t| lower.contains(t))
+        })
+        .collect();
+    let picked = if naming.is_empty() { prompt.to_string() } else { naming.join(" ") };
+    let one_line = picked.split_whitespace().collect::<Vec<_>>().join(" ");
+    let cut = if one_line.chars().count() > OWNER_REQUEST_QUOTE_MAX_CHARS {
+        let head: String = one_line.chars().take(OWNER_REQUEST_QUOTE_MAX_CHARS).collect();
+        format!("{}...", head.trim_end())
+    } else {
+        one_line
+    };
+    format!("His own words were: \"{cut}\".")
+}
+
+/// `prompt` cut into sentences: after a `.`, `!` or `?` that is followed by
+/// white space, and at every line break. A dot inside a name (`lib/pdf.js`)
+/// is not an end.
+fn prompt_sentences(prompt: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut chars = prompt.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        let ends_here = match c {
+            '\n' => true,
+            '.' | '!' | '?' => chars.peek().map_or(true, |(_, next)| next.is_whitespace()),
+            _ => false,
+        };
+        if ends_here {
+            let end = i + c.len_utf8();
+            let sentence = prompt[start..end].trim();
+            if !sentence.is_empty() {
+                out.push(sentence);
+            }
+            start = end;
+        }
+    }
+    let rest = prompt[start..].trim();
+    if !rest.is_empty() {
+        out.push(rest);
+    }
+    out
 }
 
 /// `text` without a store id in brackets: a block message is read by a writer
@@ -1302,10 +1389,12 @@ fn is_internal_id(inner: &str) -> bool {
 fn evaluate_opt_in_checked(
     rules: &[OptInRule],
     haystack_lower: &str,
-    prompt_lower: &str,
+    prompt: &str,
     is_subagent: bool,
     evidence: Option<(&str, &EvidenceLookup)>,
 ) -> Vec<(Tier, String)> {
+    let prompt_lower = prompt.to_lowercase();
+    let prompt_lower = prompt_lower.as_str();
     let checked: std::cell::OnceCell<Option<CheckedEvidence>> = std::cell::OnceCell::new();
     rules
         .iter()
@@ -1329,7 +1418,7 @@ fn evaluate_opt_in_checked(
             if escaped {
                 return None;
             }
-            let said = reminder_for(r, prompt_lower);
+            let said = reminder_for(r, prompt, prompt_lower);
             let reminder = match checked.filter(|c| !c.unverified.is_empty()) {
                 Some(c) => format!(
                     "{} (Evidence counts only when it checks out: a path:line, or a line number next to a file \
@@ -1390,9 +1479,8 @@ pub fn guard_verdict(
     if rules.is_empty() {
         return GuardVerdict { block_reason: None, warn_reason: None };
     }
-    let prompt_lower = last_user_prompt.to_lowercase();
     let fired =
-        evaluate_opt_in_checked(&rules, &haystack(message), &prompt_lower, is_subagent, evidence.map(|e| (message, e)));
+        evaluate_opt_in_checked(&rules, &haystack(message), last_user_prompt, is_subagent, evidence.map(|e| (message, e)));
     let format_tier = |tier: Tier| -> Option<String> {
         let reasons: Vec<&str> = fired.iter().filter(|(t, _)| *t == tier).map(|(_, r)| r.as_str()).collect();
         if reasons.is_empty() {
@@ -1742,6 +1830,43 @@ mod tests {
 
     // ---------------------------------- commits, line numbers (2026-09-26)
 
+    /// A repository whose one commit's short form is all digits (about one
+    /// commit in forty-three is like that).
+    fn only_12345678(candidates: &[String]) -> Option<HashSet<String>> {
+        Some(candidates.iter().filter(|c| c.as_str() == "12345678").cloned().collect())
+    }
+
+    fn held_by_digit_repository(msg: &str) -> Option<String> {
+        let lookup = EvidenceLookup { line_exists: &only_real_rs, real_commits: &only_12345678 };
+        guard_verdict(Some(EVIDENCE_RULEBOOK), msg, "", false, Some(&lookup)).block_reason
+    }
+
+    /// THE FLAKE (step 31 report): a real sha whose first eight characters are
+    /// all digits was not looked up at all, so "commit 12345678" never counted.
+    #[test]
+    fn a_real_commit_written_as_eight_digits_counts_when_it_is_named_as_a_commit() {
+        for msg in [
+            "Verified: commit 12345678 has the fix.",
+            "Verified: commit: 12345678 has the fix.",
+            "Verified: commit `12345678` has the fix.",
+            "Verified in sha 12345678.",
+            "Verified in Commit 12345678.",
+        ] {
+            assert!(held_by_digit_repository(msg).is_none(), "a real commit must count: {msg}");
+        }
+        let fake = held_by_digit_repository("Verified: commit 87654321 has the fix.").expect("a made-up sha is held");
+        assert!(fake.contains("87654321"), "the reason must name it: {fake}");
+    }
+
+    /// A number that is not named as a commit stays a number: it is not looked
+    /// up, does not count as evidence and is not listed as a missing commit.
+    #[test]
+    fn a_bare_run_of_digits_is_still_not_a_commit() {
+        let reason = held_by_digit_repository("Verified: ran 12345678 checks on 20260929.").expect("no evidence: held");
+        assert!(!reason.contains("no such commit"), "{reason}");
+        assert!(held_by_digit_repository("Verified: the 12345678 commit has the fix").is_some());
+    }
+
     fn held(msg: &str) -> bool {
         guard_verdict(Some(EVIDENCE_RULEBOOK), msg, "", false, Some(&lookup())).block_reason.is_some()
     }
@@ -1936,6 +2061,65 @@ mod tests {
         let reason = v.block_reason.expect("still too long: the length rule stays");
         assert!(reason.contains("he asked for the test result"), "{reason}");
         assert!(!reason.contains("no test counts"), "{reason}");
+    }
+
+    // ------------------------------- step 32: the length hold does not guess the request
+
+    const QUOTING_RULEBOOK: &str = r#"[
+      {"id":"answer-is-too-long","tier":"block","owner_reading_only":true,
+       "any_of":[],"none_of":["```"],"min_chars":1000,
+       "asked_for_any_of":["testuitslag","test result"],
+       "reminder":"Over 1000 characters. Keep every item his own prompt asked for. {owner_request} No ids unless asked.",
+       "reminder_if_asked":"Over 1000 characters. Keep every item his own prompt asked for, test result included. {owner_request} Plain words."}
+    ]"#;
+
+    const TWO_ITEM_PROMPT: &str = "Maak het lettertype in de widget een keer laadbaar. Draai daarna alle tests. \
+                                   Geef op het einde kort wat je veranderde en de echte testuitslag. Verder niets.";
+
+    /// THE DEFECT (field test 7): the hold said "give the test result and the
+    /// count", so the agent dropped "what you changed", which the prompt also
+    /// asked for. The hold now quotes the owner's own sentence instead.
+    #[test]
+    fn the_hold_quotes_the_sentence_that_names_everything_the_owner_asked_for() {
+        let long = "x".repeat(1200);
+        let v = guard_verdict(Some(QUOTING_RULEBOOK), &long, TWO_ITEM_PROMPT, false, None);
+        let reason = v.block_reason.expect("long answer blocks");
+        assert!(
+            reason.contains("Geef op het einde kort wat je veranderde en de echte testuitslag."),
+            "the owner's own sentence, in his own case, must be quoted: {reason}"
+        );
+        assert!(!reason.contains("{owner_request}"), "{reason}");
+        assert!(!reason.contains("Maak het lettertype"), "only the asking sentence is quoted: {reason}");
+    }
+
+    #[test]
+    fn a_prompt_without_a_known_term_is_quoted_from_its_first_words() {
+        let long = "x".repeat(1200);
+        let prompt = "Leg uit hoe de cache werkt en wat je zou aanpassen. ".repeat(10);
+        let v = guard_verdict(Some(QUOTING_RULEBOOK), &long, &prompt, false, None);
+        let reason = v.block_reason.expect("long answer blocks");
+        assert!(reason.contains("Leg uit hoe de cache werkt"), "{reason}");
+        assert!(!reason.contains("{owner_request}"), "{reason}");
+        assert!(reason.len() < 700, "the quote is cut short: {} bytes", reason.len());
+    }
+
+    #[test]
+    fn an_unreadable_prompt_leaves_no_placeholder_and_no_quote() {
+        let long = "x".repeat(1200);
+        let v = guard_verdict(Some(QUOTING_RULEBOOK), &long, "", false, None);
+        let reason = v.block_reason.expect("long answer blocks");
+        assert!(!reason.contains("{owner_request}"), "{reason}");
+        assert!(!reason.contains("  "), "no doubled space left behind: {reason}");
+        assert!(reason.contains("Keep every item his own prompt asked for"), "{reason}");
+    }
+
+    #[test]
+    fn a_dot_inside_a_file_name_does_not_cut_the_quoted_sentence() {
+        let long = "x".repeat(1200);
+        let prompt = "Pas lib/pdf.js aan. Vertel kort in de testuitslag wat er in lib/pdf.js veranderde.";
+        let v = guard_verdict(Some(QUOTING_RULEBOOK), &long, prompt, false, None);
+        let reason = v.block_reason.expect("long answer blocks");
+        assert!(reason.contains("Vertel kort in de testuitslag wat er in lib/pdf.js veranderde."), "{reason}");
     }
 
     // --------------------------------------------------- FALSE BLOCK A: lists

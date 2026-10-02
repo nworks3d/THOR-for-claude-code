@@ -85,26 +85,31 @@ pub struct Rendered {
 }
 
 /// The standing-rules block, kept within `budget` bytes. Nothing is cut in the
-/// middle: every rule is in the block whole or not in it at all. The heaviest
-/// rules (the ones that can refuse or cannot be undone) come first, then this
-/// project's own before the global ones, then id order; when not everything
-/// fits, the rest is replaced by ONE line saying how many were left out, and
-/// the caller records as shown only `Rendered::shown`. `None` when there is
-/// nothing to render.
+/// middle: every rule is in the block whole or not in it at all. This project's
+/// own facts come first, then the heavy global rules, then house style, then the
+/// global facts with no weight (see [`render_within_ranked`]); when not
+/// everything fits, the rest is replaced by ONE line saying how many were left
+/// out, and the caller records as shown only `Rendered::shown`. `None` when
+/// there is nothing to render.
 pub fn render_within(items: &[RankedItem], budget: usize) -> Option<Rendered> {
     render_within_ranked(items, budget, &std::collections::BTreeSet::new())
 }
 
-/// [`render_within`], ranking with what this project has been using (step 31).
-/// A project's first prompt is not known at session start, so relevance cannot
-/// come from it; it comes from what the facts did here lately. Order:
+/// [`render_within`], ranked for relevance (steps 31 and 32). A project's first
+/// prompt is not known at session start, so relevance comes from whose fact it
+/// is and from what the facts did here lately. Order, one place after the other:
 ///
-/// 1. the facts that fired in this project's own sessions lately (`recent`:
-///    shown at a prompt or before a tool call, never counting a session start),
-///    heaviest first, this project's own before the global ones;
-/// 2. then every other heavy rule (one that can refuse or cannot be undone),
-///    this project's own first;
-/// 3. then the rest, by weight and id.
+/// 1. this project's own facts;
+/// 2. the global heavy rules (irreversible, then costly);
+/// 3. the global house-style rules;
+/// 4. the global facts with no weight at all (no severity): reply habits, other
+///    areas, experiments - last, so they only fill what is left.
+///
+/// Inside a place, a fact that fired in this project's own sessions lately
+/// (`recent`: shown at a prompt or before a tool call, never counting a session
+/// start) comes first, then the heavier, then id order. Field test 7: about 60
+/// percent of a code task's block was noise while the project's own facts shared
+/// slots with global style rules.
 ///
 /// The cap and the "N did not fit" line are exactly [`render_within`]'s.
 pub fn render_within_ranked(
@@ -116,26 +121,20 @@ pub fn render_within_ranked(
         return None;
     }
     let head: Vec<String> = vec![crate::render::FRAMING_LINE.to_string(), "Standing rules for this session:".to_string()];
-    // THE HEAVIEST FIRST (step 27, D12). Claude Code keeps a long hook output
-    // in a file and shows the agent only its first 2 KB, and in id order those
-    // were whichever six facts had the alphabetically first ids (measured
-    // 2026-10-01: 53 items, 16 KB, 6 visible). A stable sort puts what can
-    // refuse or cannot be undone first; a rule of this project goes before a
-    // global one of the same weight (step 29); ids order what is left. Step 31
-    // puts what fired in this project lately before all of that (field test 6:
-    // 28 of 33 start facts had nothing to do with the task).
-    let heavy = |r: &RankedItem| matches!(r.item.severity, Some(model::item::Severity::Irreversible | model::item::Severity::Costly));
+    // Claude Code keeps a long hook output in a file and shows the agent only
+    // its first 2 KB (measured 2026-10-01: 53 items, 16 KB, 6 visible), so the
+    // order decides what is seen. The sort is stable: ids order what is left.
+    let place = |r: &RankedItem| -> u8 {
+        use model::item::Severity::{Costly, HouseStyle, Irreversible};
+        match (r.item.project.is_some(), r.item.severity) {
+            (true, _) => 0,
+            (false, Some(Irreversible | Costly)) => 1,
+            (false, Some(HouseStyle)) => 2,
+            (false, None) => 3,
+        }
+    };
     let mut ordered: Vec<&RankedItem> = items.iter().collect();
-    ordered.sort_by_key(|r| {
-        let group: u8 = if recent.contains(&r.id) {
-            0
-        } else if heavy(r) {
-            1
-        } else {
-            2
-        };
-        (group, r.item.severity.map_or(3u8, |s| s as u8), r.item.project.is_none())
-    });
+    ordered.sort_by_key(|r| (place(r), !recent.contains(&r.id), r.item.severity.map_or(3u8, |s| s as u8)));
     let lines: Vec<String> = ordered.iter().map(|r| format!("- [{}] {}", r.id, r.item.text)).collect();
     let head_len: usize = head.iter().map(|l| l.len() + 1).sum();
     let all_len: usize = head_len + lines.iter().map(|l| l.len() + 1).sum::<usize>();
@@ -192,6 +191,45 @@ pub fn for_session_kind(items: Vec<RankedItem>, headless: bool) -> Vec<RankedIte
         return items;
     }
     items.into_iter().filter(|r| !r.item.tags.iter().any(|t| t == INTERACTIVE_ONLY_TAG)).collect()
+}
+
+/// What a headless session start left out, by ids.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct LeftOut {
+    pub interactive_only: Vec<String>,
+    pub answer_only: Vec<String>,
+}
+
+/// Whether the only thing besides `Always` that a fact is bound to is the
+/// moment of answering or of claiming something done. Those moments fire
+/// nowhere on their own, so such a fact reaches a session only through its
+/// `Always`, and what it says is about the reply, which the Stop guard watches.
+fn bound_only_to_the_reply(item: &model::item::Item) -> bool {
+    use intent::Action::{Answer, ClaimDone};
+    let others: Vec<&Binding> = item.bindings.iter().filter(|b| !matches!(b, Binding::Always)).collect();
+    !others.is_empty() && others.iter().all(|b| matches!(b, Binding::Moment(Answer | ClaimDone)))
+}
+
+/// The start block's own filter (step 32): [`for_session_kind`], plus - for a
+/// headless session - the facts bound only to the reply, and the ids of what
+/// was left out, so the volume record can say what a headless start did not
+/// carry. An interactive session is served everything.
+pub fn split_for_session_start(items: Vec<RankedItem>, headless: bool) -> (Vec<RankedItem>, LeftOut) {
+    let mut left_out = LeftOut::default();
+    if !headless {
+        return (items, left_out);
+    }
+    let mut kept = Vec::with_capacity(items.len());
+    for r in items {
+        if r.item.tags.iter().any(|t| t == INTERACTIVE_ONLY_TAG) {
+            left_out.interactive_only.push(r.id);
+        } else if bound_only_to_the_reply(&r.item) {
+            left_out.answer_only.push(r.id);
+        } else {
+            kept.push(r);
+        }
+    }
+    (kept, left_out)
 }
 
 /// Appended after the standing-rules block exactly once: right after Claude
@@ -560,5 +598,82 @@ mod tests {
         let items = select(&[global, own], Some("thor2"));
         let r = render_within(&items, HOOK_OUTPUT_LIMIT_BYTES).unwrap();
         assert_eq!(r.shown, vec!["z-own".to_string(), "a-global".to_string()]);
+    }
+
+    // ------------------------------------------------ the ranking (step 32)
+
+    fn standing(id: &str, project: Option<&str>, severity: Option<model::item::Severity>) -> LiveItem {
+        let mut c = item(id, Kind::Rule, vec![Binding::Always], project);
+        c.item.severity = severity;
+        c
+    }
+
+    fn order_of(items: &[LiveItem], project: Option<&str>, recent: &[&str]) -> Vec<String> {
+        use std::collections::BTreeSet;
+        let recent: BTreeSet<String> = recent.iter().map(|s| s.to_string()).collect();
+        render_within_ranked(&select(items, project), HOOK_OUTPUT_LIMIT_BYTES, &recent).unwrap().shown
+    }
+
+    /// THE FIELD CASE (field test 7): about 60 percent of a code task's start
+    /// block was global style rules and other areas. This project's own facts
+    /// come first, then heavy rules, then house style, then facts with no project
+    /// and no weight at all.
+    #[test]
+    fn this_projects_facts_come_first_then_heavy_then_house_style_then_the_unweighted_global_ones() {
+        use model::item::Severity::{Costly, HouseStyle, Irreversible};
+        let items = [
+            standing("a-global-none", None, None),
+            standing("b-global-house", None, Some(HouseStyle)),
+            standing("c-global-costly", None, Some(Costly)),
+            standing("d-own-none", Some("alpha"), None),
+            standing("e-global-irreversible", None, Some(Irreversible)),
+            standing("f-own-costly", Some("alpha"), Some(Costly)),
+        ];
+        assert_eq!(
+            order_of(&items, Some("alpha"), &[]),
+            ["f-own-costly", "d-own-none", "e-global-irreversible", "c-global-costly", "b-global-house", "a-global-none"]
+        );
+    }
+
+    /// What this project's sessions used lately goes first inside its own place
+    /// in that order, and never jumps a place.
+    #[test]
+    fn a_recent_showing_lifts_a_fact_only_inside_its_own_place() {
+        use model::item::Severity::HouseStyle;
+        let items = [
+            standing("a-own", Some("alpha"), None),
+            standing("b-own-used", Some("alpha"), None),
+            standing("c-global-house", None, Some(HouseStyle)),
+            standing("d-global-none-used", None, None),
+        ];
+        assert_eq!(
+            order_of(&items, Some("alpha"), &["b-own-used", "d-global-none-used"]),
+            ["b-own-used", "a-own", "c-global-house", "d-global-none-used"]
+        );
+    }
+
+    /// A headless run has the Stop guard and no chat: a fact whose only binding
+    /// besides Always is the moment of answering or of claiming done is left out
+    /// of its start block, and the volume record says how many and which.
+    #[test]
+    fn a_headless_start_leaves_out_interactive_only_and_answer_only_facts_and_names_them() {
+        use intent::Action;
+        let plain = item("plain", Kind::Rule, vec![Binding::Always], None);
+        let mut chat = item("chat", Kind::Rule, vec![Binding::Always], None);
+        chat.item.tags = vec![INTERACTIVE_ONLY_TAG.to_string()];
+        let answer = item("answer", Kind::Rule, vec![Binding::Moment(Action::Answer), Binding::Always], None);
+        let done = item("done", Kind::Rule, vec![Binding::Always, Binding::Moment(Action::ClaimDone)], None);
+        let mixed = item("mixed", Kind::Rule, vec![Binding::Always, Binding::Moment(Action::Answer), Binding::Moment(Action::Push)], None);
+        let all = select(&[plain, chat, answer, done, mixed], None);
+
+        let (kept, left_out) = split_for_session_start(all.clone(), true);
+        let kept_ids: Vec<&str> = kept.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(kept_ids, ["plain", "mixed"]);
+        assert_eq!(left_out.interactive_only, ["chat"]);
+        assert_eq!(left_out.answer_only, ["answer", "done"]);
+
+        let (kept, left_out) = split_for_session_start(all, false);
+        assert_eq!(kept.len(), 5, "an interactive session is served everything");
+        assert!(left_out.interactive_only.is_empty() && left_out.answer_only.is_empty());
     }
 }

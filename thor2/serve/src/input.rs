@@ -375,6 +375,12 @@ pub struct ServeInput {
     /// comparison rather than guessing. See that function's own doc comment
     /// for the defect this exists to close.
     pub root: Option<PathBuf>,
+    /// Whether `command` is a real shell command (`add_command`), not the bare
+    /// name of a tool offered the same way (`add_tool_name`): only a shell call
+    /// can be read-only in the sense of `read_only::is_read_only_call` (a Grep
+    /// TOOL call is a search the owner measured to fire the rules anchored at
+    /// the place it searches, and still does).
+    pub shell_call: bool,
 }
 
 impl ServeInput {
@@ -397,11 +403,30 @@ impl ServeInput {
     /// and - see `paths_in_command`/`hosts_in_command` - every file and host
     /// the command NAMES as a doel of its own.
     pub fn add_command(&mut self, command: &str) {
+        self.add_command_text(command, true);
+    }
+
+    /// The bare name of a tool (`Agent`, `Grep`, `Artifact`), offered the way a
+    /// command is so that an anchor naming the tool reaches its call. Not a
+    /// shell command: it is never read as a read-only call.
+    pub fn add_tool_name(&mut self, name: &str) {
+        self.add_command_text(name, false);
+    }
+
+    fn add_command_text(&mut self, command: &str, shell: bool) {
         if command.is_empty() {
             return;
         }
         self.command = Some(command.to_string());
-        self.moments.extend(intent::from_command(command).into_iter().map(|s| s.action));
+        self.shell_call = shell;
+        let moments = intent::from_command(command).into_iter().map(|s| s.action);
+        if shell && crate::read_only::is_read_only_call(&crate::shell::segments(command, crate::shell::Dialect::Sh)) {
+            // The command text only MENTIONS the action (`grep "git push" docs`):
+            // nothing is pushed, published or installed by a call that only looks.
+            self.moments.extend(moments.filter(|a| !crate::read_only::CHANGES_THINGS.contains(a)));
+        } else {
+            self.moments.extend(moments);
+        }
         self.targets.push((TargetKind::Command, command.to_string()));
         for path in paths_in_command(command) {
             self.targets.push((TargetKind::Path, path));
@@ -474,6 +499,25 @@ mod tests {
             Some("app/.env"),
             "the verbatim path must be kept as written"
         );
+    }
+
+    /// THE READ-ONLY RULE, moment half: a call that only looks never pushes,
+    /// installs or deploys, whatever its text mentions - but reading live data
+    /// is still touching it.
+    #[test]
+    fn a_read_only_call_derives_no_moment_that_changes_things() {
+        let mut input = ServeInput::default();
+        input.add_command("grep -rn \"git push --force\" docs | head");
+        assert!(!input.moments.contains(&Action::Push), "{:?}", input.moments);
+        let mut input = ServeInput::default();
+        input.add_command("git push --force origin main");
+        assert!(input.moments.contains(&Action::Push));
+        let mut input = ServeInput::default();
+        input.add_command("echo x && git push origin main");
+        assert!(input.moments.contains(&Action::Push), "a call that pushes is not read-only");
+        let mut input = ServeInput::default();
+        input.add_command("cat prod-orders.log");
+        assert!(input.moments.contains(&Action::ProdData), "reading live data is still touching it: {:?}", input.moments);
     }
 
     #[test]

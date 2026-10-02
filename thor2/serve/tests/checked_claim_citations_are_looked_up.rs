@@ -149,6 +149,33 @@ fn a_commit_counts_only_when_it_exists_in_the_working_directorys_repository() {
     }
 }
 
+/// The fixture repository with empty commits added until HEAD's first eight
+/// characters are all digits (about one commit in forty-three), so the case
+/// that made the test above fail one run in fifty is tried on every run.
+fn all_digit_head(work: &Path) -> String {
+    for n in 0..2000 {
+        let sha = git(work, &["rev-parse", "HEAD"]);
+        if sha[..8].bytes().all(|b| b.is_ascii_digit()) {
+            return sha;
+        }
+        git(work, &["commit", "-q", "--allow-empty", "-m", &format!("filler {n}")]);
+    }
+    panic!("no all-digit commit in 2000 tries");
+}
+
+#[test]
+fn a_commit_whose_short_form_is_all_digits_still_counts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (db, work, _sha) = fixture_in_git(tmp.path());
+    let sha = all_digit_head(&work);
+    let message = format!("Verified: commit {} has the fix.", &sha[..8]);
+    let out = run_hook(&db, &stop(Some(&work), &message));
+    assert!(!blocked(&out), "a real commit must count even when its short form is all digits: {message}: {out}");
+    let made_up = "Verified: commit 12345678 has the fix.";
+    let out = run_hook(&db, &stop(Some(&work), made_up));
+    assert!(blocked(&out) || sha.starts_with("12345678"), "a made-up all-digit sha must be held: {out}");
+}
+
 #[test]
 fn a_line_number_counts_only_when_a_named_file_has_that_line() {
     let tmp = tempfile::tempdir().unwrap();

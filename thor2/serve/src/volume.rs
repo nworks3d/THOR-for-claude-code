@@ -83,10 +83,32 @@ pub fn record_showing(db: &Path, session_id: &str, shown: &[&str], suppressed: u
 
 /// A session start of `session_id` put `shown` standing rules in a block of
 /// `bytes` bytes and left `hidden` out because they did not fit.
-pub fn record_start(db: &Path, session_id: &str, shown: &[&str], hidden: usize, bytes: usize) {
+///
+/// A headless start also records what it kept out (step 32): `lo` the number and
+/// `li` the ids of the facts left out as interactive-only, `ao` and `ai` the
+/// same for the facts bound only to the reply. Absent for an interactive start.
+pub fn record_start(
+    db: &Path,
+    session_id: &str,
+    shown: &[&str],
+    hidden: usize,
+    bytes: usize,
+    left_out: &crate::session_start::LeftOut,
+) {
     let now = crate::time::now_unix();
-    let line = serde_json::json!({ "t": now, "k": "start", "s": session_id, "i": shown, "n": hidden, "b": bytes });
+    let mut line = serde_json::json!({ "t": now, "k": "start", "s": session_id, "i": shown, "n": hidden, "b": bytes });
+    add_left_out(&mut line, left_out);
     append(db, line.to_string(), now);
+}
+
+fn add_left_out(line: &mut serde_json::Value, left_out: &crate::session_start::LeftOut) {
+    if left_out.interactive_only.is_empty() && left_out.answer_only.is_empty() {
+        return;
+    }
+    line["lo"] = serde_json::json!(left_out.interactive_only.len());
+    line["li"] = serde_json::json!(left_out.interactive_only);
+    line["ao"] = serde_json::json!(left_out.answer_only.len());
+    line["ai"] = serde_json::json!(left_out.answer_only);
 }
 
 /// How a session start saw the session was started (step 31): the entrypoint
@@ -94,9 +116,20 @@ pub fn record_start(db: &Path, session_id: &str, shown: &[&str], hidden: usize, 
 /// of the session's transcript, `none`: neither) and whether that made the
 /// session headless. Only for the owner to check that the detection saw
 /// something; `doctor` does not read it (an unknown line kind is skipped).
-pub fn record_entrypoint(db: &Path, session_id: &str, entrypoint: &str, source: &str, headless: bool) {
+/// The same `lo`/`li`/`ao`/`ai` fields as the start line say what a headless
+/// start left out (step 32).
+pub fn record_entrypoint(
+    db: &Path,
+    session_id: &str,
+    entrypoint: &str,
+    source: &str,
+    headless: bool,
+    left_out: &crate::session_start::LeftOut,
+) {
     let now = crate::time::now_unix();
-    let line = serde_json::json!({ "t": now, "k": "entry", "s": session_id, "e": entrypoint, "from": source, "headless": headless });
+    let mut line =
+        serde_json::json!({ "t": now, "k": "entry", "s": session_id, "e": entrypoint, "from": source, "headless": headless });
+    add_left_out(&mut line, left_out);
     append(db, line.to_string(), now);
 }
 

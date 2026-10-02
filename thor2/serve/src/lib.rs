@@ -115,6 +115,7 @@ pub mod project;
 pub mod prompt;
 pub mod prove;
 pub mod rank;
+pub mod read_only;
 pub mod reentry;
 pub mod render;
 pub mod repeat;

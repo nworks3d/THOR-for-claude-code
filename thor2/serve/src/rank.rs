@@ -117,6 +117,33 @@ fn binding_matches(binding: &Binding, input: &ServeInput, item_project: Option<&
     }
 }
 
+/// THE READ-ONLY RULE (step 32). A call that only looks (`cat`, `grep`, `ls`,
+/// `git diff` ... - `read_only::is_read_only_call`) cannot break what a fact
+/// about CHANGING a file is about, so a fact reached on such a call only
+/// through a file or directory anchor is served when its text names the reader
+/// that is running (`grep`, `git diff`: a fact about reading with that tool,
+/// like a grep trap in a log file) and is otherwise left out. A fact reached
+/// through any other binding (a command anchor, a moment, a host) is served
+/// as before, and so is every fact on a call that writes or that cannot be
+/// read in full.
+fn skipped_on_a_read_only_call(candidate: &LiveItem, input: &ServeInput, commands: &[Vec<Segment>]) -> bool {
+    if !input.shell_call || commands.is_empty() || !commands.iter().all(|segments| crate::read_only::is_read_only_call(segments)) {
+        return false;
+    }
+    let reached_otherwise = candidate.item.bindings.iter().any(|b| {
+        !matches!(b, Binding::Target { kind: TargetKind::Path | TargetKind::Dir, .. })
+            && binding_matches(b, input, candidate.item.project.as_deref(), commands)
+    });
+    if reached_otherwise {
+        return false;
+    }
+    let names_the_reader = commands
+        .iter()
+        .flat_map(|segments| crate::read_only::readers_of(segments))
+        .any(|reader| crate::read_only::text_names(&candidate.item.text, &reader));
+    !names_the_reader
+}
+
 /// Every Command target of `input`, cut into its segments in the sh dialect
 /// - the reading `absent_guard::command_anchor_names` gives a command's text,
 /// done once per call here rather than once per candidate.
@@ -162,6 +189,7 @@ pub fn select(candidates: &[LiveItem], input: &ServeInput) -> Vec<RankedItem> {
         // `project::applies_to` for the measurement that found it.
         .filter(|c| crate::project::applies_to(c.item.project.as_deref(), input.project.as_deref()))
         .filter(|c| c.item.bindings.iter().any(|b| binding_matches(b, input, c.item.project.as_deref(), &commands)))
+        .filter(|c| !skipped_on_a_read_only_call(c, input, &commands))
         .map(|c| RankedItem { id: c.id.clone(), item: c.item.clone() })
         .collect();
 
@@ -271,6 +299,7 @@ mod tests {
             command: None,
             file: None,
             root: None,
+            shell_call: false,
         }
     }
 
@@ -291,6 +320,7 @@ mod tests {
             command: None,
             file: None,
             root: None,
+            shell_call: false,
         }
     }
 
@@ -482,6 +512,7 @@ mod tests {
             command: None,
             file: None,
             root: None,
+            shell_call: false,
         };
         assert!(select(&[c.clone_for_test()], &miss).is_empty());
         let hit = ServeInput {
@@ -492,6 +523,7 @@ mod tests {
             command: None,
             file: None,
             root: None,
+            shell_call: false,
         };
         assert_eq!(select(&[c], &hit).len(), 1);
     }
@@ -514,6 +546,7 @@ mod tests {
             command: None,
             file: None,
             root: None,
+            shell_call: false,
         };
         assert_eq!(select(&[c], &input).len(), 1);
     }
@@ -535,6 +568,7 @@ mod tests {
             command: None,
             file: None,
             root: None,
+            shell_call: false,
         };
         assert_eq!(select(&[c], &input).len(), 1);
     }
@@ -558,6 +592,7 @@ mod tests {
             command: None,
             file: None,
             root: None,
+            shell_call: false,
         };
         assert_eq!(select(&[c.clone_for_test()], &with_args).len(), 1, "the arguments are the normal case");
 
@@ -572,6 +607,7 @@ mod tests {
                 command: None,
                 file: None,
                 root: None,
+                shell_call: false,
             };
             assert!(select(&[c.clone_for_test()], &input).is_empty(), "must not fire on: {miss}");
         }
@@ -593,6 +629,7 @@ mod tests {
             command: None,
             file: None,
             root: None,
+            shell_call: false,
         };
         for hit in [
             "cd repo && gh repo edit acme/x --visibility public",
@@ -618,6 +655,7 @@ mod tests {
             command: None,
             file: None,
             root: None,
+            shell_call: false,
         };
         assert!(select(&[c], &input).is_empty(), "a Command binding must not answer a Path target");
     }
@@ -671,6 +709,7 @@ mod tests {
             command: None,
             file: None,
             root: None,
+            shell_call: false,
         };
         let hits = select(&[generic, specific], &input);
         assert_eq!(hits[0].id, "s", "the item naming the real command/path must rank first");
@@ -757,5 +796,82 @@ mod tests {
         // must go through model::normalize, never re-implement comparison.
         assert!(target_matches(TargetKind::Path, r"A\B.rs", TargetKind::Path, "a/b.rs"));
         assert!(!target_matches(TargetKind::Path, "a/b.rs", TargetKind::Symbol, "a/b.rs"));
+    }
+
+    // ------------------------------------- step 32: read-only calls and file anchors
+
+    fn fact_at(id: &str, kind: Kind, path: &str, text: &str) -> LiveItem {
+        let mut c = base(id, kind);
+        c.item.text = text.to_string();
+        c.item.bindings = vec![Binding::Target { kind: TargetKind::Path, value: path.to_string() }];
+        c
+    }
+
+    fn running(command: &str) -> ServeInput {
+        let mut input = ServeInput::default();
+        input.add_command(command);
+        input
+    }
+
+    fn ids(hits: Vec<RankedItem>) -> Vec<String> {
+        hits.into_iter().map(|h| h.id).collect()
+    }
+
+    /// THE DEFECT (field test 7): a read-only `cat server/package.json | grep
+    /// test` served facts about changing that file.
+    #[test]
+    fn a_read_only_call_does_not_serve_advice_about_changing_the_file_it_reads() {
+        let facts = [
+            fact_at("bump", Kind::Rule, "server/package.json", "Bump the version with the set-version script."),
+            fact_at("what", Kind::Orientation, "server/package.json", "The suite version lives in this file."),
+        ];
+        assert!(select(&facts, &running("cat server/package.json | grep -n test")).is_empty());
+        assert!(select(&facts, &running("git diff --stat server/package.json")).is_empty());
+        // The same file, changed: both come back.
+        assert_eq!(ids(select(&facts, &running("sed -i s/1/2/ server/package.json"))).len(), 2);
+        assert_eq!(ids(select(&facts, &running("cat server/package.json > copy.json"))).len(), 2);
+        assert_eq!(ids(select(&facts, &running("npm install left-pad && cat server/package.json"))).len(), 2);
+    }
+
+    /// A fact that is about reading - it names the very tool - still arrives
+    /// (the 2026-08-07 grep trap in a log file).
+    #[test]
+    fn a_read_only_call_still_serves_a_fact_that_names_the_reader() {
+        let facts = [fact_at("trap", Kind::Rule, "logs/app.log", "A grep on this log misses lines with a NUL byte; use rg -a.")];
+        assert_eq!(ids(select(&facts, &running("grep -n error logs/app.log"))), vec!["trap"]);
+        // Another reader is not named, so it stays quiet.
+        assert!(select(&facts, &running("tail -n 5 logs/app.log")).is_empty());
+    }
+
+    /// Only a place-only match is held back: a fact reached through its command
+    /// anchor, a moment or a host is served as before.
+    #[test]
+    fn a_read_only_call_serves_what_another_binding_reached() {
+        let mut by_command = fact_at("cmd", Kind::Rule, "server/package.json", "Bump the version.");
+        by_command.item.bindings.push(Binding::Target { kind: TargetKind::Command, value: "cat".to_string() });
+        assert_eq!(ids(select(&[by_command], &running("cat server/package.json"))), vec!["cmd"]);
+    }
+
+    /// The other half of the report: an anchor on package-lock.json must never
+    /// be reached by package.json (and the reverse), read-only or not.
+    #[test]
+    fn a_lock_file_anchor_is_not_reached_by_the_manifest_next_to_it() {
+        let lock = || fact_at("lock", Kind::Rule, "server/package-lock.json", "Regenerate with npm install.");
+        let manifest = fact_at("manifest", Kind::Rule, "server/package.json", "Bump the version.");
+        assert!(select(&[lock()], &running("sed -i s/1/2/ server/package.json")).is_empty());
+        assert!(select(&[manifest], &running("sed -i s/1/2/ server/package-lock.json")).is_empty());
+        assert_eq!(ids(select(&[lock()], &running("sed -i s/1/2/ server/package-lock.json"))), vec!["lock"]);
+    }
+
+    /// The Grep and Glob TOOLS are offered as a tool name, not as a shell
+    /// command: a search of the place a fact is anchored at still draws it
+    /// (measured 2026-09-26), whatever the fact says.
+    #[test]
+    fn a_grep_tool_call_is_not_a_read_only_shell_call() {
+        let facts = [fact_at("anchored", Kind::Orientation, "src/lib.rs", "This file is generated.")];
+        let mut input = ServeInput::default();
+        input.add_tool_name("Grep");
+        input.add_target(TargetKind::Path, "src/lib.rs");
+        assert_eq!(ids(select(&facts, &input)), vec!["anchored"]);
     }
 }

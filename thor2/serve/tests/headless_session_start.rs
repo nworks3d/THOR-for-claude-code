@@ -184,7 +184,7 @@ fn now_unix() -> i64 {
 }
 
 #[test]
-fn the_facts_this_project_was_shown_lately_come_first_then_the_heavy_ones() {
+fn this_projects_facts_come_first_then_heavy_ones_then_what_was_shown_lately_among_house_style() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("store.db");
     let repo = dir.path().join("sample-quote-repo");
@@ -195,7 +195,8 @@ fn the_facts_this_project_was_shown_lately_come_first_then_the_heavy_ones() {
             // ids sort so that, without the ranking, "zz-recent" would be last
             store::declare(&mut s, "s", "l", "a", &bulky(&format!("aa-light-{i:02}"), Some(Severity::HouseStyle), None)).unwrap();
         }
-        store::declare(&mut s, "s", "l", "a", &bulky("zz-recent", None, None)).unwrap();
+        store::declare(&mut s, "s", "l", "a", &bulky("zz-recent", Some(Severity::HouseStyle), None)).unwrap();
+        store::declare(&mut s, "s", "l", "a", &bulky("zz-unweighted", None, None)).unwrap();
         store::declare(&mut s, "s", "l", "a", &bulky("zz-heavy", Some(Severity::Irreversible), None)).unwrap();
         store::declare(&mut s, "s", "l", "a", &bulky("zz-costly-here", Some(Severity::Costly), Some("sample-quote-repo"))).unwrap();
     }
@@ -208,7 +209,9 @@ fn the_facts_this_project_was_shown_lately_come_first_then_the_heavy_ones() {
     std::fs::write(
         dir.path().join("volume-log.jsonl"),
         format!(
-            "{}\n{}\n",
+            "{}
+{}
+",
             serde_json::json!({ "t": now - 3_000, "k": "show", "s": "sess-a", "i": ["zz-recent"], "r": 0 }),
             serde_json::json!({ "t": now - 3_000, "k": "show", "s": "sess-elsewhere", "i": ["aa-light-29"], "r": 0 }),
         ),
@@ -219,7 +222,94 @@ fn the_facts_this_project_was_shown_lately_come_first_then_the_heavy_ones() {
     let shown = ids_in(&block);
     assert!(block.len() <= 9_500, "the cap holds: {} bytes", block.len());
     assert!(block.contains("more standing rule(s) did not fit"), "the left-out line stays: {block}");
-    assert_eq!(shown[0], "zz-recent", "what this project's sessions were shown comes first: {shown:?}");
-    assert_eq!(&shown[1..3], ["zz-heavy", "zz-costly-here"], "then the heavy ones, the heaviest first: {shown:?}");
+    assert_eq!(shown[0], "zz-costly-here", "this project's own fact comes first: {shown:?}");
+    assert_eq!(shown[1], "zz-heavy", "then the global heavy ones: {shown:?}");
+    assert_eq!(shown[2], "zz-recent", "then house style, what this project's sessions were shown first: {shown:?}");
     assert!(!shown.contains(&"aa-light-29".to_string()), "a fact shown in ANOTHER project's session gets no lift: {shown:?}");
+    assert!(!shown.contains(&"zz-unweighted".to_string()), "a global fact with no weight comes last and is cut: {shown:?}");
+}
+
+// ------------------------------------------ what a headless start leaves out (step 32)
+
+fn answer_only(id: &str) -> Item {
+    let mut item = always(id, &format!("{id} about how to report"), None, &[]);
+    item.bindings = vec![Binding::Moment(intent::Action::Answer), Binding::Always];
+    item
+}
+
+#[test]
+fn a_headless_start_drops_reply_only_facts_and_the_volume_record_names_what_it_left_out() {
+    let fx = fixture();
+    {
+        let mut s = EventStore::new(&fx.db).unwrap();
+        // The gate refuses a NEW answer binding; such facts exist in the store from before, so
+        // the fixture writes the event the way an older build did.
+        let item = answer_only("reply-rule");
+        let body = store::canonical_body(&item).unwrap();
+        s.append_event("s", "l", "a", thor_core::event_store::EventKind::FactCreated, &item.id, None, &body).unwrap();
+    }
+    let headless = start(&fx.db, &cwd(&fx), Some("sdk-cli"), "s-out", None);
+    assert!(!headless.contains("reply-rule"), "{headless}");
+    let interactive = start(&fx.db, &cwd(&fx), Some("claude-desktop"), "s-in", None);
+    assert!(interactive.contains("reply-rule"), "{interactive}");
+
+    let log = std::fs::read_to_string(fx.dir.path().join("volume-log.jsonl")).unwrap();
+    let line_of = |kind: &str, session: &str| -> serde_json::Value {
+        let line = log
+            .lines()
+            .find(|l| l.contains(&format!("\"k\":\"{kind}\"")) && l.contains(&format!("\"s\":\"{session}\"")))
+            .unwrap_or_else(|| panic!("no {kind} line for {session}: {log}"));
+        serde_json::from_str(line).unwrap()
+    };
+    for kind in ["entry", "start"] {
+        let v = line_of(kind, "s-out");
+        assert_eq!((v["lo"].as_u64(), v["ao"].as_u64()), (Some(1), Some(1)), "{kind}: {v}");
+        assert_eq!((v["li"][0].as_str(), v["ai"][0].as_str()), (Some("chat-rule"), Some("reply-rule")), "{kind}: {v}");
+        let v = line_of(kind, "s-in");
+        assert!(v.get("lo").is_none() && v.get("ao").is_none(), "an interactive start left nothing out: {v}");
+    }
+}
+
+fn register_raw(store: &mut EventStore, key: &str, root: &str) {
+    let item = Item {
+        id: store::project_opened_id(key),
+        kind: Kind::Report,
+        text: format!("Project {key}: a fixture record of a registered working copy."),
+        bindings: Vec::new(),
+        severity: None,
+        project: Some(key.to_string()),
+        tags: vec!["project-record".to_string()],
+        expires: None,
+        key: None,
+        falsifier: None,
+        check: None,
+    };
+    let body = store::canonical_body(&item).unwrap();
+    let at = serve::time::iso8601_from_unix(now_unix() - 2 * 86_400);
+    let body = format!(
+        "{},\"root\":{},\"root_at\":{}}}",
+        &body[..body.len() - 1],
+        serde_json::to_string(root).unwrap(),
+        serde_json::to_string(&at).unwrap()
+    );
+    store.append_event("install", "install", "installer", thor_core::event_store::EventKind::FactCreated, &item.id, None, &body).unwrap();
+}
+
+/// The registration line is for the owner. A headless run gets none, and it
+/// does not use up the day's showing for the owner's own next session.
+#[test]
+fn a_headless_start_carries_no_registration_line_and_leaves_it_for_the_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("store.db");
+    let repo = dir.path().join("sample-info-repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    {
+        let mut s = EventStore::new(&db).unwrap();
+        store::declare(&mut s, "s", "l", "a", &always("plain-rule", "PLAINTEXT keep going.", Some(Severity::Costly), &[])).unwrap();
+        register_raw(&mut s, "sample-info-repo", &repo.display().to_string().replace('\\', "/"));
+    }
+    let headless = start(&db, &repo, Some("sdk-cli"), "s-h", None);
+    assert!(headless.contains("PLAINTEXT") && !headless.contains("the working copy of"), "{headless}");
+    let owner = start(&db, &repo, Some("claude-desktop"), "s-o", None);
+    assert!(owner.contains("the working copy of sample-info-repo is registered at"), "{owner}");
 }

@@ -284,10 +284,33 @@ as `claude -p`. THOR reads how the session was started from
 every entrypoint that starts with `sdk` is headless, `claude-desktop` and `cli`
 are not, and a session of unknown kind is served as before. Facts bound to a
 file or a command still fire at the tool call in every session. Tag a fact with
-`revise` and its `tags`. The session start block is ranked: first what this
-project's own sessions were shown in the last 14 days, then the other heavy
-rules, then the rest. The working copy line and the open-points count line show
-once a day per project.
+`revise` and its `tags`. The session start block is ranked: this project's own
+facts first, then the global heavy rules (irreversible, costly), then house
+style, then the global facts with no weight at all; inside each step, what this
+project's own sessions were shown in the last 14 days goes first. A headless
+start also leaves out the facts whose only binding besides "always" is the
+moment of answering or of claiming something done (the Stop guard watches the
+reply), says how many and which in `volume-log.jsonl` (`lo`/`li` for
+interactive-only, `ao`/`ai` for reply-only, on the `entry` and `start` lines),
+and carries neither the working copy line nor the open-points lines. Those two
+lines show once a day per project in the owner's own sessions.
+
+A CALL THAT ONLY LOOKS (2.5): when every part of a Bash call only reads
+(`cat`, `grep`, `rg`, `head`, `tail`, `ls`, `find` without `-delete` or
+`-exec`, `sed` without `-i`, `git log`, `git status`, `git diff`, `git show`, no
+redirect), nothing is pushed, published or installed, so such a call derives no
+push, publish, deploy, install, commit, delete, send, spend or configure moment
+even when its text mentions one, and a fact that was reached ONLY through a file
+it names is served only when its text names the tool that is running (a fact
+about reading with `grep`, like a trap in a log file). Facts reached through a
+command anchor, a host or another moment are served as before, and so is every
+call that writes or that cannot be read in full.
+
+THE LENGTH HOLD QUOTES THE OWNER (2.5): a response-rulebook reminder may carry
+`{owner_request}`; the hold replaces it with the sentence of the owner's last
+prompt that names one of the rule's `asked_for_any_of` terms, else the first
+words of the prompt, between quotes and cut at 240 characters, so the agent
+keeps every item the prompt asked for instead of a guess of it.
 
 Stop notices that do not hold the turn are also queued (at most 3, once each)
 and handed to the same session as context at its next prompt.

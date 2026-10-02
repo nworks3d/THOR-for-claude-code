@@ -1927,13 +1927,13 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             // A headless session (`claude -p`) is not served what is written for
             // the owner's interactive chat (`session_start::INTERACTIVE_ONLY_TAG`).
             let kind = session_kind(&payload);
-            if !no_record {
-                serve::volume::record_entrypoint(db_path, &session_id, &kind.entrypoint, kind.from, kind.headless);
-            }
-            let items = session_start::for_session_kind(
+            let (items, left_out) = session_start::split_for_session_start(
                 serve::decay::retain_live(session_start::select(&candidates, folder_project.as_deref()), &decay),
                 kind.headless,
             );
+            if !no_record {
+                serve::volume::record_entrypoint(db_path, &session_id, &kind.entrypoint, kind.from, kind.headless, &left_out);
+            }
             // THE BLOCK STAYS UNDER WHAT CLAUDE CODE SHOWS WHOLE (step 29). A
             // hook output over 10,000 characters is kept in a file and the
             // agent sees only its first 2 KB; THOR used to count every rule of
@@ -1954,8 +1954,12 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             // (N11), so whoever made it is named where the owner looks - see
             // `project::registration_notice`.
             // Shown at most once a day per project (`serve::notices`).
+            // Neither this line nor the open points below reach a headless
+            // session (step 32): they are for the owner, an agent can act on
+            // neither, and a headless run must not use up the day's showing.
             let registration = project::registration_notice(&store, folder_project.as_deref(), time::now_unix()).filter(|_| {
-                serve::notices::due(db_path, folder_project.as_deref().unwrap_or(""), "registration", time::now_unix(), !no_record)
+                !kind.headless
+                    && serve::notices::due(db_path, folder_project.as_deref().unwrap_or(""), "registration", time::now_unix(), !no_record)
             });
             // Handed over (2026-09-25), capped: this project's own open
             // points - see `open_points_session_start_note`'s own doc comment.
@@ -1969,7 +1973,7 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                     serve::eval_session::refresh_old_anchor_full_points(&mut store, project);
                 }
             }
-            let open_points = (!payload_is_from_a_subagent(&payload))
+            let open_points = (!payload_is_from_a_subagent(&payload) && !kind.headless)
                 .then(|| {
                     open_points_session_start_note(&store, folder_project.as_deref(), &|project| {
                         serve::notices::due(db_path, project, "open-points", time::now_unix(), !no_record)
@@ -2019,7 +2023,7 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                     );
                 }
                 let shown: Vec<&str> = shown_ids.iter().map(String::as_str).collect();
-                serve::volume::record_start(db_path, &session_id, &shown, hidden, block.len());
+                serve::volume::record_start(db_path, &session_id, &shown, hidden, block.len(), &left_out);
             }
             // No `verdicts` here - see `HookOutput::Context`'s own doc
             // comment: the classifier answers "is this a prohibition for the
@@ -2279,7 +2283,7 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                     // (`guard_verdict::command`) still reads only a real "command"
                     // field via `absent_guard::proposed_command`, completely
                     // unaffected by this branch.
-                    input.add_command(tool_name);
+                    input.add_tool_name(tool_name);
                 }
                 if let Some(file_path) = file_path {
                     input.add_file(file_path);
