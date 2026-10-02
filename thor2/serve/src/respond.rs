@@ -117,6 +117,9 @@ pub fn haystack(message: &str) -> String {
         .join("\n")
 }
 
+/// How Claude Code opens the user line it writes for a Stop hook's text.
+const STOP_HOOK_FEEDBACK_PREFIX: &str = "Stop hook feedback:";
+
 /// The text of the OWNER'S OWN last prompt, read out of a Claude Code
 /// transcript (the JSONL `transcript_path` a Stop payload always names -
 /// `serve/src/bin/serve.rs` reads that file and hands its raw text here;
@@ -159,9 +162,14 @@ pub fn last_user_prompt(transcript_jsonl: &str) -> Option<String> {
         if entry.get("type").and_then(|t| t.as_str()) != Some("user") {
             continue;
         }
+        // Claude Code's own notes to the model (`isMeta`), such as the text of
+        // a Stop hold fed back after the hold, are not the owner typing.
+        if entry.get("isMeta").and_then(|m| m.as_bool()) == Some(true) {
+            continue;
+        }
         let Some(content) = entry.get("message").and_then(|m| m.get("content")) else { continue };
         if let Some(s) = content.as_str() {
-            if !s.trim().is_empty() {
+            if !s.trim().is_empty() && !s.starts_with(STOP_HOOK_FEEDBACK_PREFIX) {
                 return Some(s.to_string());
             }
             continue;
@@ -2120,6 +2128,28 @@ mod tests {
         let v = guard_verdict(Some(QUOTING_RULEBOOK), &long, prompt, false, None);
         let reason = v.block_reason.expect("long answer blocks");
         assert!(reason.contains("Vertel kort in de testuitslag wat er in lib/pdf.js veranderde."), "{reason}");
+    }
+
+    /// THE SECOND ROUND (found while replaying field test 7): after a hold, Claude
+    /// Code writes the hold's own text into the transcript as a user line
+    /// (`isMeta`, "Stop hook feedback: ..."). It is not something the owner
+    /// typed, and must never be read as his prompt - or the next hold would
+    /// quote THOR's own words as his request.
+    #[test]
+    fn a_stop_hook_feedback_line_is_not_the_owners_prompt() {
+        let transcript = [
+            r#"{"type":"user","message":{"role":"user","content":"Tel de tests en vertel wat je veranderde."}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"een lang antwoord"}]}}"#,
+            r#"{"type":"user","isMeta":true,"message":{"role":"user","content":"Stop hook feedback:\n[THOR] This answer is over 1000 characters."}}"#,
+        ]
+        .join("\n");
+        assert_eq!(last_user_prompt(&transcript).as_deref(), Some("Tel de tests en vertel wat je veranderde."));
+        let unflagged = transcript.replace("\"isMeta\":true,", "");
+        assert_eq!(
+            last_user_prompt(&unflagged).as_deref(),
+            Some("Tel de tests en vertel wat je veranderde."),
+            "the text alone names it, even without the flag"
+        );
     }
 
     // --------------------------------------------------- FALSE BLOCK A: lists
