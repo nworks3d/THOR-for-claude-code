@@ -8,7 +8,7 @@
 //! changelog, all anchored at that file and all about CHANGING it.
 //!
 //! Deliberately conservative: a call is read-only only when EVERY simple
-//! command of it is on the lists below and none writes (no redirect, no `-i`,
+//! command of it is on the lists below and none writes (no file redirect, no `-i`,
 //! no `-delete`, no `-exec`), and the call was read in full (no flat
 //! fallback segment, nothing over `ssh`). Anything not recognised counts as a
 //! write, which keeps the old behaviour: serve.
@@ -76,9 +76,16 @@ fn sed_edits_in_place(seg: &Segment) -> bool {
     })
 }
 
+/// A redirect target that is no file: the bit bucket (`/dev/null`, `NUL`,
+/// PowerShell's `$null`) or a standard stream. File-descriptor duplication
+/// (`2>&1`) never reaches the segment's redirects at all.
+fn is_bit_bucket(target: &str) -> bool {
+    matches!(target.to_lowercase().as_str(), "/dev/null" | "nul" | "$null" | "/dev/stdout" | "/dev/stderr")
+}
+
 /// Whether one simple command only reads.
 fn segment_is_read_only(seg: &Segment) -> bool {
-    if seg.flat || seg.remote || !seg.redirects.is_empty() {
+    if seg.flat || seg.remote || seg.redirects.iter().any(|r| !is_bit_bucket(&r.target)) {
         return false;
     }
     let program = program_name(seg);
@@ -180,6 +187,26 @@ mod tests {
             "",
         ] {
             assert!(!read_only(command), "{command} must not count as read-only");
+        }
+    }
+
+    #[test]
+    fn a_redirect_to_the_bit_bucket_or_a_descriptor_still_only_reads() {
+        // The exact call of field test 8 (2026-10-02): `2>/dev/null` is no write.
+        let field = r#"cd /c/work/acme-app; ls docker-compose*; grep -n "container_name\|^  [a-z0-9-]*:$\|profiles" docker-compose.dev.yml; grep -rn "tailscale-dev\|mainsail-dev" --include=* -I . 2>/dev/null | grep -v "^./node_modules\|CHANGELOG" | head -30; sed -n 520,560p files/deploy.sh"#;
+        for command in [
+            field,
+            "grep -rn x . 2>/dev/null",
+            "grep -rn x . >/dev/null 2>&1",
+            "grep -rn x . 2>&1 | head",
+            "grep -rn x . &>/dev/null",
+            "cat a 2>NUL",
+            "cat a >/dev/null",
+        ] {
+            assert!(read_only(command), "{command} only reads");
+        }
+        for command in ["cat a > /dev/null.txt", "cat a 2>err.log", "cat a >b 2>/dev/null", "cat a 2>&1 > out.txt"] {
+            assert!(!read_only(command), "{command} writes a file");
         }
     }
 

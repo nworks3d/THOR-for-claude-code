@@ -1,2 +1,2 @@
 exit 0
-{"decision":"block","reason":"[THOR] rule c-twice requires this to stay in NOTES.md (\"NOTES.md keeps the word keep\"); it is missing from what is about to be written: \"keep\""}
+{"decision":"block","reason":"[THOR] rule c-twice requires this to stay in NOTES.md (\"NOTES.md keeps the word keep\"); it is missing from what is about to be written: \"keep\". If the owner asked for this line to go, tell the owner and revise rule c-twice (clear or change its check, with a because) or retract it first, then make the edit - never keep the text in a comment to get past this. If he did not ask for it, keep the text."}

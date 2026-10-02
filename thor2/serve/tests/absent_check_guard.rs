@@ -605,3 +605,17 @@ fn named(item: &model::item::Item) -> model::item::Item {
     }
     out
 }
+
+#[test]
+fn a_contains_refusal_says_how_to_go_on_when_the_removal_is_wanted() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, real) = checkout_with_required_line(dir.path());
+    let notes = real.join("NOTES.md");
+    let out = run_hook(&db, &edit_payload("s1", &real, &notes, "keep this line\n", ""));
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("expected a decision JSON: {e}: {out}"));
+    let reason = v["reason"].as_str().unwrap();
+    assert!(reason.contains("If the owner asked for this line to go"), "{reason}");
+    assert!(reason.contains("revise rule c-path"), "{reason}");
+    assert!(reason.contains("retract it"), "{reason}");
+    assert!(reason.contains("never keep the text in a comment"), "{reason}");
+}

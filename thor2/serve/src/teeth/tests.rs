@@ -401,6 +401,48 @@ fn g7b_1_a_committed_contains_check_is_a_proven_rule() {
     assert!(!f.uncommitted && f.file_blob.is_some() && f.root.is_some() && f.head_commit.is_some());
 }
 
+/// Step 33: a contains check whose rule is not about that file's content is
+/// wired, never proven: the removal of the literal is refused, but that only
+/// shows the tooth bites, not that the literal guards the hazard the rule
+/// names (here a click in a web UI, which no file shows).
+#[test]
+fn s33_a_contains_check_on_a_file_the_rule_never_names_is_not_proven() {
+    let mut fx = Fx::new();
+    let beta = fx.checkout("beta", &[("deploy.sh", "restart alpha-sidecar
+plain line
+")], true);
+    fx.register("beta", &beta);
+    let mut item = rule(
+        "ui",
+        "Never update alpha-sidecar through the web UI; only the restart trigger may touch it.",
+        vec![path("deploy.sh")],
+        contains("deploy.sh", "alpha-sidecar"),
+        Some("beta"),
+    );
+    item.falsifier = Some("alpha-sidecar gets updated through the web UI instead of the restart trigger.".to_string());
+    let t = fx.write(&item);
+    assert_eq!(t.outcome, Outcome::Rule { proven: false }, "{}", receipt(&t));
+    let r = receipt(&t);
+    assert!(r.starts_with("teeth: wired, not proven"), "{r}");
+    assert!(r.contains("never names deploy.sh"), "{r}");
+    let f = t.record.as_ref().unwrap().fields();
+    assert!(f.evidence.is_empty(), "{:?}", f.evidence);
+}
+
+/// Step 33: the same check is proven when the rule's text names the file.
+#[test]
+fn s33_a_contains_check_on_a_file_the_falsifier_names_is_proven() {
+    let mut fx = Fx::new();
+    let beta = fx.checkout("beta", &[("deploy.sh", "restart alpha-sidecar
+plain line
+")], true);
+    fx.register("beta", &beta);
+    let mut item = rule("ui2", "The restart branch must keep alpha-sidecar.", vec![path("deploy.sh")], contains("deploy.sh", "alpha-sidecar"), Some("beta"));
+    item.falsifier = Some("deploy.sh restarts without alpha-sidecar.".to_string());
+    let t = fx.write(&item);
+    assert_eq!(t.outcome, Outcome::Rule { proven: true }, "{}", receipt(&t));
+}
+
 /// R7b.3 (Z2 b): the literal twice in the file - the forbidden attempt
 /// removes both and is refused (a first-occurrence-only edit leaves one and
 /// would judge a working tooth toothless).

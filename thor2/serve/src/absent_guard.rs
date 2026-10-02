@@ -802,8 +802,11 @@ pub fn find_missing_required(
         }
         if !content.contains(literal) {
             return Some(format!(
-                "[THOR] rule {} requires this to stay in {} (\"{}\"); it is missing from what is about to be written: \"{}\"",
-                candidate.id, check_path, candidate.item.text, literal
+                "[THOR] rule {} requires this to stay in {} (\"{}\"); it is missing from what is about to be written: \"{}\". \
+                 If the owner asked for this line to go, tell the owner and revise rule {} (clear or change its check, \
+                 with a because) or retract it first, then make the edit - never keep the text in a comment to get past \
+                 this. If he did not ask for it, keep the text.",
+                candidate.id, check_path, candidate.item.text, literal, candidate.id
             ));
         }
     }

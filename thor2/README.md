@@ -298,7 +298,7 @@ lines show once a day per project in the owner's own sessions.
 A CALL THAT ONLY LOOKS (2.5): when every part of a Bash call only reads
 (`cat`, `grep`, `rg`, `head`, `tail`, `ls`, `find` without `-delete` or
 `-exec`, `sed` without `-i`, `git log`, `git status`, `git diff`, `git show`, no
-redirect), nothing is pushed, published or installed, so such a call derives no
+file redirect; `2>/dev/null`, `>/dev/null`, `NUL` and `2>&1` are not one), nothing is pushed, published or installed, so such a call derives no
 push, publish, deploy, install, commit, delete, send, spend or configure moment
 even when its text mentions one, and a fact that was reached ONLY through a file
 it names is served only when its text names the tool that is running (a fact
@@ -307,10 +307,35 @@ command anchor, a host or another moment are served as before, and so is every
 call that writes or that cannot be read in full.
 
 THE LENGTH HOLD QUOTES THE OWNER (2.5): a response-rulebook reminder may carry
-`{owner_request}`; the hold replaces it with the sentence of the owner's last
-prompt that names one of the rule's `asked_for_any_of` terms, else the first
-words of the prompt, between quotes and cut at 240 characters, so the agent
-keeps every item the prompt asked for instead of a guess of it.
+`{owner_request}`; the hold replaces it with the sentence(s) of the owner's last
+prompt that name one of the rule's `asked_for_any_of` terms or ask for a report
+back (geef, vertel, rapporteer, tell, give, report, "wat je veranderde", "hoe je
+het controleerde", ...), else the LAST sentence, between quotes and cut at a
+word boundary near 240 characters, so the agent keeps every item the prompt
+asked for instead of a guess of it. A rule may also carry a `short_reminder`:
+when two rules of one tier fire on the same reply, each says its short form once,
+and one closing line keeps any note that a guard refused an edit or forced a change.
+
+A CLAIM OF CHECKING BACKED BY A REAL CHECK (2.5): the rule that wants a path:line
+or a commit for a "checked" claim counts the claim as evidenced when the same
+turn ran a check through Bash or PowerShell (`sh -n`, `bash -n`, `node --check`,
+`node --test`, `npm test`, `cargo test|check|build|clippy`, `pytest`,
+`py_compile`, `go test`, `shellcheck`, `git diff` ...) or when the answer names
+one. It is a broad test on purpose: it does not match the claim to the command.
+The shipped reminder is English, like every other hold.
+
+A CONTAINS CHECK IS PROVEN ONLY FOR A RULE ABOUT THAT FILE (2.5): the trial's
+evidence that a literal sits in the committed file counts only when the rule's
+text or falsifier names the file. A rule about a click in a web UI whose check
+freezes a name in a script is wired, never proven. A refusal of a removal also
+says what to do when the owner asked for it: tell him, revise the rule (clear or
+change its check, with a because) or retract it, then edit - never keep the text
+in a comment to get past the guard.
+
+A HEADLESS START CARRIES AT MOST EIGHT GLOBAL FACTS (2.5): besides the project's
+own facts, the irreversible and costly global facts first, then house style, then
+the unweighted ones; `go`/`gi` on the volume `entry` and `start` lines count and
+name what was cut.
 
 Stop notices that do not hold the turn are also queued (at most 3, once each)
 and handed to the same session as context at its next prompt.

@@ -1293,6 +1293,15 @@ fn same_project(a: Option<&str>, b: Option<&str>) -> bool {
 
 use model::checkout::{default_branch, git, git_path, head_commit, in_blob};
 
+/// True when the rule's text or falsifier names `rel` (the whole relative path
+/// or its file name, either slash form, case-insensitive).
+fn text_names_file(item: &Item, rel: &str) -> bool {
+    let rel = rel.replace('\\', "/").to_lowercase();
+    let base = rel.rsplit('/').next().unwrap_or(&rel).to_string();
+    let hay = format!("{} {}", item.text, item.falsifier.as_deref().unwrap_or("")).replace('\\', "/").to_lowercase();
+    hay.contains(&rel) || (!base.is_empty() && hay.contains(&base))
+}
+
 /// Whether a file check holds in `root`: `Ok(())`, `Err(Ok(what))` when it is
 /// false (with what is missing or present), `Err(Err(why))` when the file
 /// cannot be read.
@@ -1886,9 +1895,22 @@ impl<'a> Work<'a> {
                     self.receipt.push(format!("the real hook refused '{target}' (log seq {seq}) in a Claude Code session"));
                 }
                 if let (Check::Contains { literal, .. }, Some(file)) = (check, &tried.file) {
-                    match head_commit(&try_root).filter(|_| in_blob(&try_root, "HEAD", &file.rel, literal)) {
-                        Some(commit) => self.evidence.push(TrialEvidence::InHead { commit }),
-                        None => self.uncommitted = true,
+                    // Step 33: the literal in HEAD, plus the refused removal, shows the tooth
+                    // bites - not that the literal guards what the rule is about. Only a rule
+                    // that names the file (in its text or falsifier) is about that file's
+                    // content; any other (a click in a web UI, a command on a host) stays
+                    // wired, never proven by this evidence.
+                    if text_names_file(item, &file.rel) {
+                        match head_commit(&try_root).filter(|_| in_blob(&try_root, "HEAD", &file.rel, literal)) {
+                            Some(commit) => self.evidence.push(TrialEvidence::InHead { commit }),
+                            None => self.uncommitted = true,
+                        }
+                    } else {
+                        self.receipt.push(format!(
+                            "the rule's text and falsifier never names {}, so the literal there is a proxy: the tooth bites, \
+                             but that does not prove it guards what the rule is about",
+                            file.rel
+                        ));
                     }
                 }
                 let absent = match check {

@@ -159,37 +159,63 @@ pub fn last_user_prompt(transcript_jsonl: &str) -> Option<String> {
             continue;
         }
         let Ok(entry) = serde_json::from_str::<Value>(line) else { continue };
-        if entry.get("type").and_then(|t| t.as_str()) != Some("user") {
-            continue;
-        }
-        // Claude Code's own notes to the model (`isMeta`), such as the text of
-        // a Stop hold fed back after the hold, are not the owner typing.
-        if entry.get("isMeta").and_then(|m| m.as_bool()) == Some(true) {
-            continue;
-        }
-        let Some(content) = entry.get("message").and_then(|m| m.get("content")) else { continue };
-        if let Some(s) = content.as_str() {
-            if !s.trim().is_empty() && !s.starts_with(STOP_HOOK_FEEDBACK_PREFIX) {
-                return Some(s.to_string());
-            }
-            continue;
-        }
-        if let Some(blocks) = content.as_array() {
-            let text = blocks
-                .iter()
-                .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
-                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                .collect::<Vec<_>>()
-                .join("\n");
-            if !text.trim().is_empty() {
-                return Some(text);
-            }
-            // A content array with no plain text block at all (a pure
-            // tool_result turn) is not something the owner typed - keep
-            // scanning further back rather than stopping here.
+        if let Some(prompt) = owner_prompt_of(&entry) {
+            return Some(prompt);
         }
     }
     None
+}
+
+/// The text the owner typed in one transcript entry, `None` for every entry
+/// that is not him typing (an assistant line, a tool result, Claude Code's own
+/// note, a Stop hold's text) - see `last_user_prompt` for the shapes.
+fn owner_prompt_of(entry: &Value) -> Option<String> {
+    if entry.get("type").and_then(|t| t.as_str()) != Some("user") {
+        return None;
+    }
+    // Claude Code's own notes to the model (`isMeta`), such as the text of
+    // a Stop hold fed back after the hold, are not the owner typing.
+    if entry.get("isMeta").and_then(|m| m.as_bool()) == Some(true) {
+        return None;
+    }
+    let content = entry.get("message").and_then(|m| m.get("content"))?;
+    if let Some(s) = content.as_str() {
+        return (!s.trim().is_empty() && !s.starts_with(STOP_HOOK_FEEDBACK_PREFIX)).then(|| s.to_string());
+    }
+    let blocks = content.as_array()?;
+    let text = blocks
+        .iter()
+        .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+        .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+        .collect::<Vec<_>>()
+        .join("
+");
+    // A content array with no plain text block at all (a pure tool_result
+    // turn) is not something the owner typed.
+    (!text.trim().is_empty()).then_some(text)
+}
+
+/// The shell commands the assistant ran in the CURRENT turn: every Bash or
+/// PowerShell tool call after the owner's last prompt in the transcript. Empty
+/// when the transcript is unreadable (fail-open: no evidence is claimed).
+pub fn turn_commands(transcript_jsonl: &str) -> Vec<String> {
+    let entries: Vec<Value> = transcript_jsonl.lines().filter_map(|l| serde_json::from_str::<Value>(l.trim()).ok()).collect();
+    let start = entries.iter().rposition(|e| owner_prompt_of(e).is_some()).map_or(0, |i| i + 1);
+    let mut commands = Vec::new();
+    for entry in &entries[start..] {
+        if entry.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+            continue;
+        }
+        let Some(blocks) = entry.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_array()) else { continue };
+        for block in blocks {
+            let is_shell = block.get("type").and_then(|t| t.as_str()) == Some("tool_use")
+                && matches!(block.get("name").and_then(|n| n.as_str()), Some("Bash" | "PowerShell"));
+            if let (true, Some(command)) = (is_shell, block.get("input").and_then(|i| i.get("command")).and_then(|c| c.as_str())) {
+                commands.push(command.to_string());
+            }
+        }
+    }
+    commands
 }
 
 /// Whether `rule`'s AND/OR/NOT/min_chars conditions hold against this
@@ -397,6 +423,10 @@ pub struct OptInRule {
     /// What is said instead of the reminder when `asked_for_any_of` matches the
     /// owner's prompt.
     pub reminder_if_asked: Option<String>,
+    /// What this rule says when another rule of the same tier fires on the same
+    /// reply (step 33): each requirement once, short, instead of two full
+    /// reminders that repeat each other. Absent: the reminder as ever.
+    pub short_reminder: Option<String>,
 }
 
 /// Parse the rulebook into `OptInRule`s: every field `parse_rules` reads,
@@ -432,6 +462,7 @@ pub fn parse_opt_in_rules(text: &str) -> Vec<OptInRule> {
             let affirmative_only = r.get("affirmative_only").and_then(|v| v.as_bool()).unwrap_or(false);
             let asked_for_any_of = str_list(r, "asked_for_any_of");
             let reminder_if_asked = r.get("reminder_if_asked").and_then(|v| v.as_str()).map(str::to_string);
+            let short_reminder = r.get("short_reminder").and_then(|v| v.as_str()).map(str::to_string);
             Some(OptInRule {
                 base,
                 before,
@@ -443,6 +474,7 @@ pub fn parse_opt_in_rules(text: &str) -> Vec<OptInRule> {
                 affirmative_only,
                 asked_for_any_of,
                 reminder_if_asked,
+                short_reminder,
             })
         })
         .collect()
@@ -1266,7 +1298,7 @@ pub fn evaluate_opt_in(
     prompt_lower: &str,
     is_subagent: bool,
 ) -> Vec<(Tier, String)> {
-    evaluate_opt_in_checked(rules, haystack_lower, prompt_lower, is_subagent, None)
+    evaluate_opt_in_checked(rules, haystack_lower, prompt_lower, is_subagent, None, &[])
 }
 
 /// What a fired rule says: its `reminder_if_asked` when the owner's own prompt
@@ -1283,13 +1315,23 @@ fn reminder_for(rule: &OptInRule, prompt: &str, prompt_lower: &str) -> String {
         (Some(alternative), true) => alternative,
         _ => &rule.base.reminder,
     };
-    let text = without_internal_ids(text);
+    with_owner_request(&without_internal_ids(text), rule, prompt)
+}
+
+/// `text` with `{owner_request}` replaced by the owner's own words.
+fn with_owner_request(text: &str, rule: &OptInRule, prompt: &str) -> String {
     if !text.contains(OWNER_REQUEST_PLACEHOLDER) {
-        return text;
+        return text.to_string();
     }
     let quote = owner_request_quote(prompt, &rule.asked_for_any_of);
     text.replace(OWNER_REQUEST_PLACEHOLDER, &quote).replace("  ", " ")
 }
+
+/// Said once after the short reminders when two rules of one tier fire (step 33).
+/// A guard's note about a refused edit or a change it forced is not padding, and
+/// the length rule must not make a writer drop it.
+const COMBINED_HOLD_TAIL: &str =
+    "Keep any one-line note that a guard refused an edit or forced a change to your work: that is not cut.";
 
 /// A reminder that cannot know what the owner asked for says so with this
 /// placeholder; the hold then carries his own words instead of a guess (step 32:
@@ -1300,28 +1342,55 @@ const OWNER_REQUEST_PLACEHOLDER: &str = "{owner_request}";
 /// The longest quote of the owner's prompt a hold carries.
 const OWNER_REQUEST_QUOTE_MAX_CHARS: usize = 240;
 
+/// Words that ask for a report back (English and Dutch), matched as whole words
+/// of a sentence of the owner's prompt, beside the rulebook's own
+/// `asked_for_any_of` terms.
+const REPORT_VERBS: &[&str] = &[
+    "geef", "vertel", "rapporteer", "meld", "toon", "report", "tell", "give", "summarise", "summarize", "explain",
+    "describe",
+];
+
+/// Phrases that ask for a report back, matched anywhere in a sentence.
+const REPORT_PHRASES: &[&str] = &["laat zien", "show me", "wat je veranderde", "hoe je het controleerde", "what you changed", "how you checked", "how you verified"];
+
+fn asks_for_a_report(lower_sentence: &str) -> bool {
+    REPORT_PHRASES.iter().any(|p| lower_sentence.contains(p))
+        || lower_sentence
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|word| REPORT_VERBS.contains(&word))
+}
+
 /// His own words, as a short clause for a hold: the sentence(s) of `prompt`
-/// that name one of `asked_terms` (the report he asked for), else the first
-/// words of the prompt; cut at `OWNER_REQUEST_QUOTE_MAX_CHARS`. Empty when the
-/// prompt could not be read, so the clause is simply left out.
+/// that name one of `asked_terms` or ask for a report back (`asks_for_a_report`),
+/// else the LAST sentence (a report is asked for at the end); cut at a word
+/// boundary after `OWNER_REQUEST_QUOTE_MAX_CHARS`. Empty when the prompt could
+/// not be read, so the clause is simply left out.
 fn owner_request_quote(prompt: &str, asked_terms: &[String]) -> String {
     let prompt = prompt.trim();
     if prompt.is_empty() {
         return String::new();
     }
     let terms: Vec<String> = asked_terms.iter().map(|t| t.to_lowercase()).collect();
-    let naming: Vec<&str> = prompt_sentences(prompt)
-        .into_iter()
+    let sentences = prompt_sentences(prompt);
+    let naming: Vec<&str> = sentences
+        .iter()
+        .copied()
         .filter(|sentence| {
             let lower = sentence.to_lowercase();
-            terms.iter().any(|t| lower.contains(t))
+            terms.iter().any(|t| lower.contains(t)) || asks_for_a_report(&lower)
         })
         .collect();
-    let picked = if naming.is_empty() { prompt.to_string() } else { naming.join(" ") };
+    let picked = if naming.is_empty() { sentences.last().copied().unwrap_or(prompt).to_string() } else { naming.join(" ") };
     let one_line = picked.split_whitespace().collect::<Vec<_>>().join(" ");
     let cut = if one_line.chars().count() > OWNER_REQUEST_QUOTE_MAX_CHARS {
         let head: String = one_line.chars().take(OWNER_REQUEST_QUOTE_MAX_CHARS).collect();
-        format!("{}...", head.trim_end())
+        // Back to the last whole word, unless the cut already fell on a space.
+        let whole = if one_line.chars().nth(OWNER_REQUEST_QUOTE_MAX_CHARS).is_some_and(char::is_whitespace) {
+            head.as_str()
+        } else {
+            head.rsplit_once(char::is_whitespace).map_or(head.as_str(), |(words, _)| words)
+        };
+        format!("{}...", whole.trim_end())
     } else {
         one_line
     };
@@ -1400,11 +1469,12 @@ fn evaluate_opt_in_checked(
     prompt: &str,
     is_subagent: bool,
     evidence: Option<(&str, &EvidenceLookup)>,
+    turn_commands: &[String],
 ) -> Vec<(Tier, String)> {
     let prompt_lower = prompt.to_lowercase();
     let prompt_lower = prompt_lower.as_str();
     let checked: std::cell::OnceCell<Option<CheckedEvidence>> = std::cell::OnceCell::new();
-    rules
+    let fired: Vec<(&OptInRule, String, usize)> = rules
         .iter()
         .filter_map(|r| {
             let fires_before_escapes = trigger_fires(r, haystack_lower)
@@ -1412,6 +1482,11 @@ fn evaluate_opt_in_checked(
                 && !list_exempted(r, prompt_lower, haystack_lower)
                 && !(r.owner_reading_only && is_subagent);
             if !fires_before_escapes {
+                return None;
+            }
+            // A check the turn really ran, or one the answer names, is evidence of
+            // a claim of checking (step 33): whoever reads the claim can test it.
+            if takes_evidence(r) && (turn_commands.iter().any(|c| names_a_check(&c.to_lowercase())) || names_a_check(haystack_lower)) {
                 return None;
             }
             let checked = if takes_evidence(r) {
@@ -1427,6 +1502,7 @@ fn evaluate_opt_in_checked(
                 return None;
             }
             let said = reminder_for(r, prompt, prompt_lower);
+            let said_len = said.len();
             let reminder = match checked.filter(|c| !c.unverified.is_empty()) {
                 Some(c) => format!(
                     "{} (Evidence counts only when it checks out: a path:line, or a line number next to a file \
@@ -1437,9 +1513,46 @@ fn evaluate_opt_in_checked(
                 ),
                 None => said,
             };
-            Some((r.tier, reminder))
+            Some((r, reminder, said_len))
         })
-        .collect()
+        .collect();
+    // Two rules of one tier on one reply: each says its requirement once, in its
+    // short form, and the tail is said once (step 33). A rule without a short
+    // form keeps its full reminder.
+    let mut out: Vec<(Tier, String)> = Vec::new();
+    for (i, (rule, reminder, said_len)) in fired.iter().enumerate() {
+        let together = fired.iter().filter(|(o, _, _)| o.tier == rule.tier).count() > 1;
+        let text = match (&rule.short_reminder, together) {
+            (Some(short), true) => {
+                let short = with_owner_request(&without_internal_ids(short), rule, prompt);
+                // The evidence note rides after the reminder in the full form; keep it.
+                format!("{short}{}", &reminder[*said_len..])
+            }
+            _ => reminder.clone(),
+        };
+        out.push((rule.tier, text));
+        let last_of_tier = !fired[i + 1..].iter().any(|(o, _, _)| o.tier == rule.tier);
+        if together && last_of_tier {
+            out.push((rule.tier, COMBINED_HOLD_TAIL.to_string()));
+        }
+    }
+    out
+}
+
+/// Commands (or the words of an answer) that check something: a syntax check,
+/// a test run, a build check, a diff. Matched as lowercase substrings that start
+/// a word, so `bash -n` and `sh -n` both count and `ash -n` inside a longer word
+/// does not.
+const CHECK_COMMANDS: &[&str] = &[
+    "sh -n", "bash -n", "dash -n", "zsh -n", "node --check", "node --test", "npm test", "npm run test", "pnpm test", "yarn test", "cargo test", "cargo check",
+    "cargo build", "cargo clippy", "pytest", "py_compile", "unittest", "go test", "go vet", "dotnet test", "shellcheck", "tsc ",
+    "git diff", "make test", "ctest", "mvn test", "gradle test",
+];
+
+fn names_a_check(lower: &str) -> bool {
+    CHECK_COMMANDS.iter().any(|needle| {
+        lower.match_indices(needle).any(|(at, _)| !lower[..at].chars().next_back().is_some_and(|c| c.is_alphanumeric() || c == '_'))
+    })
 }
 
 /// SPEC-ENFORCEMENT.md section 1.1's three verdicts, restricted to the two
@@ -1483,12 +1596,28 @@ pub fn guard_verdict(
     is_subagent: bool,
     evidence: Option<&EvidenceLookup>,
 ) -> GuardVerdict {
+    guard_verdict_in_turn(rulebook_text, message, last_user_prompt, is_subagent, evidence, &[])
+}
+
+/// `guard_verdict` that also knows the shell commands the assistant ran in the
+/// turn (`turn_commands`): a claim of having checked something counts as
+/// evidenced when the turn ran a check (`names_a_check`) or the answer names
+/// one. The claim is still judged only by its shape and the lookups; this
+/// adds the one signal the answer text cannot carry, a real tool call.
+pub fn guard_verdict_in_turn(
+    rulebook_text: Option<&str>,
+    message: &str,
+    last_user_prompt: &str,
+    is_subagent: bool,
+    evidence: Option<&EvidenceLookup>,
+    turn_commands: &[String],
+) -> GuardVerdict {
     let rules = rulebook_text.map(parse_opt_in_rules).unwrap_or_default();
     if rules.is_empty() {
         return GuardVerdict { block_reason: None, warn_reason: None };
     }
     let fired =
-        evaluate_opt_in_checked(&rules, &haystack(message), last_user_prompt, is_subagent, evidence.map(|e| (message, e)));
+        evaluate_opt_in_checked(&rules, &haystack(message), last_user_prompt, is_subagent, evidence.map(|e| (message, e)), turn_commands);
     let format_tier = |tier: Tier| -> Option<String> {
         let reasons: Vec<&str> = fired.iter().filter(|(t, _)| *t == tier).map(|(_, r)| r.as_str()).collect();
         if reasons.is_empty() {
@@ -2111,6 +2240,35 @@ mod tests {
         assert!(reason.len() < 700, "the quote is cut short: {} bytes", reason.len());
     }
 
+    /// Field test 8: the prompt's report request is its LAST sentence and shares no
+    /// word with the rulebook's terms; the hold quoted the first 240 characters
+    /// instead, cut in the middle of a word.
+    #[test]
+    fn the_hold_quotes_the_sentence_with_a_report_verb_not_the_start_of_the_prompt() {
+        let long = "x".repeat(1200);
+        let prompt = "files/deploy.sh controleert bij een dev-herstart nog containers zoals alpha-a en alpha-b.                       Zoek in deze repo uit welke dev-containers echt bestaan (docker-compose-bestanden en documentatie),                       en pas de lijst in het script aan zodat een dev-herstart niet faalt op containers die er niet meer zijn.                       Doe het werk zelf. Controleer de syntax van het script. Alleen lokaal: niets committen.                       Geef op het einde kort wat je veranderde en hoe je het controleerde.";
+        let v = guard_verdict(Some(QUOTING_RULEBOOK), &long, prompt, false, None);
+        let reason = v.block_reason.expect("long answer blocks");
+        assert!(reason.contains("Geef op het einde kort wat je veranderde en hoe je het controleerde."), "{reason}");
+        assert!(!reason.contains("files/deploy.sh controleert"), "{reason}");
+    }
+
+    #[test]
+    fn a_prompt_with_no_report_sentence_is_quoted_from_its_last_sentence() {
+        let long = "x".repeat(1200);
+        let prompt = "Leg uit hoe de cache werkt. Kijk vooral naar de eviction. Houd het bij de feiten.";
+        let v = guard_verdict(Some(QUOTING_RULEBOOK), &long, prompt, false, None);
+        let reason = v.block_reason.expect("long answer blocks");
+        assert!(reason.contains("His own words were: \"Houd het bij de feiten.\""), "{reason}");
+    }
+
+    #[test]
+    fn a_long_quote_is_cut_at_a_word_boundary() {
+        let quote = owner_request_quote(&format!("Vertel {}.", "woordje ".repeat(60)), &[]);
+        assert!(quote.ends_with("woordje...\"."), "{quote}");
+        assert!(quote.chars().count() < 280, "{quote}");
+    }
+
     #[test]
     fn an_unreadable_prompt_leaves_no_placeholder_and_no_quote() {
         let long = "x".repeat(1200);
@@ -2150,6 +2308,102 @@ mod tests {
             Some("Tel de tests en vertel wat je veranderde."),
             "the text alone names it, even without the flag"
         );
+    }
+
+    // ------------------------------- step 33: a claim backed by a tool call of the turn
+
+    const CLAIM_RULEBOOK: &str = r#"[
+      {"id":"checked-claim-needs-evidence","tier":"block",
+       "any_of":["gecontroleerd:","checked:"],
+       "none_of":[".sh:","commit ","niet gecheckt","not checked"],
+       "none_of_patterns":["commit_sha","path_line"],
+       "reminder":"You are claiming something was checked without evidence."}
+    ]"#;
+
+    fn transcript_with_commands(commands: &[&str]) -> String {
+        let mut lines = vec![r#"{"type":"user","message":{"role":"user","content":"Pas het script aan en controleer het."}}"#.to_string()];
+        for c in commands {
+            lines.push(format!(
+                r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"tool_use","name":"Bash","input":{{"command":"{c}"}}}}]}}}}"#
+            ));
+        }
+        lines.join("
+")
+    }
+
+    /// THE DEFECT (field test 8): "Gecontroleerd: de syntaxcontrole is geslaagd" after a
+    /// real `sh -n` in the same turn was held for "no evidence".
+    #[test]
+    fn a_claim_backed_by_a_check_run_in_the_same_turn_passes() {
+        let claim = "Gecontroleerd: de syntaxcontrole is geslaagd.";
+        let bare = guard_verdict_in_turn(Some(CLAIM_RULEBOOK), claim, "", false, None, &[]);
+        assert!(bare.block_reason.is_some(), "no tool call, no named command: the claim still needs evidence");
+        let commands = turn_commands(&transcript_with_commands(&["sh -n files/deploy.sh && echo SYNTAX_OK"]));
+        assert_eq!(commands, vec!["sh -n files/deploy.sh && echo SYNTAX_OK".to_string()]);
+        let backed = guard_verdict_in_turn(Some(CLAIM_RULEBOOK), claim, "", false, None, &commands);
+        assert!(backed.block_reason.is_none(), "{:?}", backed.block_reason);
+        for command in ["node --test", "cargo test --release", "npm test", "git diff --stat", "bash -n x.sh", "python -m py_compile a.py"] {
+            let v = guard_verdict_in_turn(Some(CLAIM_RULEBOOK), claim, "", false, None, &[command.to_string()]);
+            assert!(v.block_reason.is_none(), "{command}");
+        }
+    }
+
+    #[test]
+    fn a_tool_call_that_checks_nothing_does_not_back_a_claim() {
+        let v = guard_verdict_in_turn(Some(CLAIM_RULEBOOK), "Gecontroleerd: alles werkt.", "", false, None, &["ls -la".to_string(), "cat a".to_string()]);
+        assert!(v.block_reason.is_some());
+    }
+
+    #[test]
+    fn an_answer_that_names_the_command_it_ran_counts() {
+        let v = guard_verdict_in_turn(Some(CLAIM_RULEBOOK), "Gecontroleerd: `sh -n` gaf geen fout.", "", false, None, &[]);
+        assert!(v.block_reason.is_none(), "{:?}", v.block_reason);
+    }
+
+    #[test]
+    fn only_the_current_turns_commands_are_read() {
+        let transcript = [
+            r#"{"type":"user","message":{"role":"user","content":"eerste vraag"}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"command":"cargo test"}}]}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"ok"}]}}"#,
+            r#"{"type":"user","message":{"role":"user","content":"tweede vraag"}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Read","input":{"file_path":"a"}},{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}"#,
+        ]
+        .join("
+");
+        assert_eq!(turn_commands(&transcript), vec!["ls".to_string()]);
+    }
+
+    // ------------------------------------- step 33: one short hold when two rules fire
+
+    const TWO_FIRE_RULEBOOK: &str = r#"[
+      {"id":"no-tldr","tier":"block","any_of":["gepusht"],"none_of":["tldr"],"min_chars":600,
+       "reminder":"LONG-TLDR: open with a TLDR in plain human language, what happened, does it work, what it means, no jargon, detail below it, and keep the whole answer under 1000 characters because the length rule counts all of it.",
+       "short_reminder":"SHORT-TLDR: open with a plain-language TLDR."},
+      {"id":"too-long","tier":"block","any_of":[],"none_of":["```"],"min_chars":1000,
+       "reminder":"LONG-LENGTH: this answer is over 1000 characters, shorten it to the outcome and keep every item his own prompt asked for. {owner_request} Say what happened, then stop.",
+       "short_reminder":"SHORT-LENGTH: stay under 1000 characters, keep every item asked for. {owner_request}"}
+    ]"#;
+
+    #[test]
+    fn two_firing_rules_say_each_requirement_once_in_their_short_form() {
+        let msg = format!("gepusht {}", "x".repeat(1200));
+        let v = guard_verdict(Some(TWO_FIRE_RULEBOOK), &msg, "Geef kort wat je veranderde.", false, None);
+        let reason = v.block_reason.expect("both fire");
+        assert!(reason.contains("SHORT-TLDR") && reason.contains("SHORT-LENGTH"), "{reason}");
+        assert!(!reason.contains("LONG-"), "{reason}");
+        assert!(reason.contains("Geef kort wat je veranderde."), "the quote still rides: {reason}");
+        assert!(reason.contains("refused an edit"), "the note about a refused edit is kept on purpose: {reason}");
+        assert_eq!(reason.matches("refused an edit").count(), 1, "{reason}");
+    }
+
+    #[test]
+    fn one_firing_rule_keeps_its_full_reminder() {
+        let msg = format!("{}", "x".repeat(1200));
+        let v = guard_verdict(Some(TWO_FIRE_RULEBOOK), &msg, "", false, None);
+        let reason = v.block_reason.expect("length fires alone");
+        assert!(reason.contains("LONG-LENGTH") && !reason.contains("SHORT-"), "{reason}");
+        assert!(!reason.contains("refused an edit"), "{reason}");
     }
 
     // --------------------------------------------------- FALSE BLOCK A: lists

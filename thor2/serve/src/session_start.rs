@@ -198,7 +198,17 @@ pub fn for_session_kind(items: Vec<RankedItem>, headless: bool) -> Vec<RankedIte
 pub struct LeftOut {
     pub interactive_only: Vec<String>,
     pub answer_only: Vec<String>,
+    /// Global facts a headless start cut to `HEADLESS_GLOBAL_CAP` (step 33).
+    pub global_capped: Vec<String>,
 }
+
+/// The most global facts (no project) a headless session's start block carries.
+/// This project's own facts are never counted against it. Field test 8: a small
+/// project has few facts of its own, and the global "always" facts about
+/// previews, browser panes and other areas filled the rest of a block for a
+/// task they had nothing to do with. Chosen, not measured: eight is room for
+/// the irreversible and costly rules of the whole house.
+pub const HEADLESS_GLOBAL_CAP: usize = 8;
 
 /// Whether the only thing besides `Always` that a fact is bound to is the
 /// moment of answering or of claiming something done. Those moments fire
@@ -211,8 +221,8 @@ fn bound_only_to_the_reply(item: &model::item::Item) -> bool {
 }
 
 /// The start block's own filter (step 32): [`for_session_kind`], plus - for a
-/// headless session - the facts bound only to the reply, and the ids of what
-/// was left out, so the volume record can say what a headless start did not
+/// headless session - the facts bound only to the reply and (step 33) the global
+/// facts past `HEADLESS_GLOBAL_CAP`, and the ids of what was left out, so the volume record can say what a headless start did not
 /// carry. An interactive session is served everything.
 pub fn split_for_session_start(items: Vec<RankedItem>, headless: bool) -> (Vec<RankedItem>, LeftOut) {
     let mut left_out = LeftOut::default();
@@ -228,6 +238,22 @@ pub fn split_for_session_start(items: Vec<RankedItem>, headless: bool) -> (Vec<R
         } else {
             kept.push(r);
         }
+    }
+    // Of the global facts the heaviest stay (irreversible, costly, house style,
+    // then the unweighted), in the order they came; this project's own all stay.
+    let mut global: Vec<usize> = (0..kept.len()).filter(|&i| kept[i].item.project.is_none()).collect();
+    if global.len() > HEADLESS_GLOBAL_CAP {
+        global.sort_by_key(|&i| (kept[i].item.severity.map_or(3u8, |s| s as u8), i));
+        let dropped: std::collections::BTreeSet<usize> = global[HEADLESS_GLOBAL_CAP..].iter().copied().collect();
+        let mut index = 0;
+        kept.retain(|r| {
+            let keep = !dropped.contains(&index);
+            index += 1;
+            if !keep {
+                left_out.global_capped.push(r.id.clone());
+            }
+            keep
+        });
     }
     (kept, left_out)
 }
@@ -675,5 +701,37 @@ mod tests {
         let (kept, left_out) = split_for_session_start(all, false);
         assert_eq!(kept.len(), 5, "an interactive session is served everything");
         assert!(left_out.interactive_only.is_empty() && left_out.answer_only.is_empty());
+    }
+
+    /// Field test 8 (2026-10-02): a headless start for a small project was about
+    /// 70 percent global "always" facts that had nothing to do with the task.
+    /// A headless start now carries at most `HEADLESS_GLOBAL_CAP` global facts,
+    /// the irreversible and costly ones first, and every one of this project's.
+    #[test]
+    fn a_headless_start_caps_the_global_facts_and_keeps_every_project_fact() {
+        use model::item::Severity::{Costly, HouseStyle, Irreversible};
+        let mut items = vec![standing("own-1", Some("alpha"), None), standing("own-2", Some("alpha"), Some(HouseStyle))];
+        for n in 0..6 {
+            items.push(standing(&format!("g-style-{n}"), None, Some(HouseStyle)));
+        }
+        for n in 0..6 {
+            items.push(standing(&format!("g-none-{n}"), None, None));
+        }
+        items.push(standing("g-costly", None, Some(Costly)));
+        items.push(standing("g-irreversible", None, Some(Irreversible)));
+        let all = select(&items, Some("alpha"));
+        assert_eq!(all.len(), 16);
+
+        let (kept, left_out) = split_for_session_start(all.clone(), true);
+        let ids: Vec<&str> = kept.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(kept.len(), 2 + HEADLESS_GLOBAL_CAP);
+        assert!(ids.contains(&"own-1") && ids.contains(&"own-2"), "{ids:?}");
+        assert!(ids.contains(&"g-irreversible") && ids.contains(&"g-costly"), "heavy ones survive the cap: {ids:?}");
+        assert_eq!(left_out.global_capped.len(), 16 - 2 - HEADLESS_GLOBAL_CAP);
+        assert!(left_out.global_capped.iter().all(|id| id.starts_with("g-none-") || id.starts_with("g-style-")));
+
+        let (kept, left_out) = split_for_session_start(all, false);
+        assert_eq!(kept.len(), 16, "an interactive session is not capped");
+        assert!(left_out.global_capped.is_empty());
     }
 }

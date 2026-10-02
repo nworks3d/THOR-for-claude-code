@@ -1030,6 +1030,16 @@ fn last_user_prompt_from_payload(payload: &Value) -> String {
     respond::last_user_prompt(&text).unwrap_or_default()
 }
 
+/// The shell commands the assistant ran in this turn, read out of the
+/// transcript the payload names (`respond::turn_commands`); empty on anything
+/// unreadable, so no evidence is then claimed.
+fn turn_commands_from_payload(payload: &Value) -> Vec<String> {
+    let Some(path) = payload.get("transcript_path").and_then(|v| v.as_str()) else {
+        return Vec::new();
+    };
+    std::fs::read_to_string(path).map(|text| respond::turn_commands(&text)).unwrap_or_default()
+}
+
 /// This invocation's own session identity: the payload's own `session_id`
 /// when it is a real, non-empty string, or - only when that is missing -
 /// a value made up fresh for this one process, never shared with any other
@@ -1437,8 +1447,15 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             let guard_text = (!msg.trim().is_empty()).then(|| {
                 let rulebook_text = std::fs::read_to_string(respond::default_rulebook_path(db_path)).ok();
                 let last_prompt = last_user_prompt_from_payload(&payload);
-                let verdict =
-                    respond::guard_verdict(rulebook_text.as_deref(), msg, &last_prompt, reader_is_an_agent, citation_lookup);
+                let commands = turn_commands_from_payload(&payload);
+                let verdict = respond::guard_verdict_in_turn(
+                    rulebook_text.as_deref(),
+                    msg,
+                    &last_prompt,
+                    reader_is_an_agent,
+                    citation_lookup,
+                    &commands,
+                );
                 verdict.block_reason.or(verdict.warn_reason)
             });
             let guard_text = guard_text.flatten();
@@ -1521,7 +1538,15 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
         } else {
             let rulebook_text = std::fs::read_to_string(respond::default_rulebook_path(db_path)).ok();
             let last_prompt = last_user_prompt_from_payload(&payload);
-            let verdict = respond::guard_verdict(rulebook_text.as_deref(), msg, &last_prompt, reader_is_an_agent, citation_lookup);
+            let commands = turn_commands_from_payload(&payload);
+            let verdict = respond::guard_verdict_in_turn(
+                rulebook_text.as_deref(),
+                msg,
+                &last_prompt,
+                reader_is_an_agent,
+                citation_lookup,
+                &commands,
+            );
             if let Some(reason) = verdict.block_reason {
                 // THE GUARD NEVER STARVES THE EVALUATION ASK (step 20,
                 // NEW-1). The guard's block holds this turn once and the

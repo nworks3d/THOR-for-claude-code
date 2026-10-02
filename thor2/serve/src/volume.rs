@@ -86,7 +86,8 @@ pub fn record_showing(db: &Path, session_id: &str, shown: &[&str], suppressed: u
 ///
 /// A headless start also records what it kept out (step 32): `lo` the number and
 /// `li` the ids of the facts left out as interactive-only, `ao` and `ai` the
-/// same for the facts bound only to the reply. Absent for an interactive start.
+/// same for the facts bound only to the reply, `go` and `gi` for the global facts
+/// cut to the headless cap (step 33). Absent for an interactive start.
 pub fn record_start(
     db: &Path,
     session_id: &str,
@@ -102,13 +103,16 @@ pub fn record_start(
 }
 
 fn add_left_out(line: &mut serde_json::Value, left_out: &crate::session_start::LeftOut) {
-    if left_out.interactive_only.is_empty() && left_out.answer_only.is_empty() {
+    if left_out.interactive_only.is_empty() && left_out.answer_only.is_empty() && left_out.global_capped.is_empty() {
         return;
     }
     line["lo"] = serde_json::json!(left_out.interactive_only.len());
     line["li"] = serde_json::json!(left_out.interactive_only);
     line["ao"] = serde_json::json!(left_out.answer_only.len());
     line["ai"] = serde_json::json!(left_out.answer_only);
+    // Step 33: the global facts a headless start cut to its cap.
+    line["go"] = serde_json::json!(left_out.global_capped.len());
+    line["gi"] = serde_json::json!(left_out.global_capped);
 }
 
 /// How a session start saw the session was started (step 31): the entrypoint

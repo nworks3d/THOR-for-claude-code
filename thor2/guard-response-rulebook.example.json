@@ -5,6 +5,7 @@
     "any_of": ["md5", "sha256", "commit ", "gepusht", "fsck", "exit=0", "test result", "ci is groen"],
     "none_of": ["tldr", "kort:", "samengevat", "in het kort", "any_of"],
     "min_chars": 600,
+    "short_reminder": "Open with a TLDR in plain human language: what happened, does it work, what it means for the reader, with no hashes, shas, test names or ports. The technical detail goes below it.",
     "reminder": "This reads like results/analysis but has no TLDR. Open with a plain-language summary - what happened, does it work, what it means - before the technical detail, not as the first hurdle."
   },
   {
@@ -27,10 +28,11 @@
     "any_of": [],
     "none_of": ["\n> ", "```"],
     "list_request_any_of": ["lijst", "overzicht", "rapport", "list", "overview", "report", "all the", "eval", "evaluatie"],
-    "asked_for_any_of": ["test result", "testuitslag", "testresultaat", "how many tests", "hoeveel tests"],
-    "reminder_if_asked": "This answer is over 1000 characters. Shorten it to the outcome, but keep every item the user's own prompt asked for, including the test result and its count, plainly and exactly. {owner_request} No other ids, filenames or code names unless the prompt asked for them (if it asked what you changed, the changed files or places may stay). Then stop.",
+    "asked_for_any_of": ["test result", "testuitslag", "testresultaat", "how many tests", "hoeveel tests", "wat je veranderde", "hoe je het controleerde", "what you changed", "how you checked", "geef op het einde", "vertel wat", "report back"],
+    "reminder_if_asked": "This answer is over 1000 characters. Shorten it to the outcome, but keep every item the user's own prompt asked for, including whatever was asked to hear back (what changed, how it was checked, a test result and its count), plainly and exactly. {owner_request} No other ids, filenames or code names unless the prompt asked for them (if it asked what you changed, the changed files or places may stay). Then stop.",
     "min_chars": 1000,
-    "reminder": "This answer is over 1000 characters. Shorten it to the outcome and keep every item the user's own prompt asked for - drop what was not asked, never what was. {owner_request} Plain language: no ids, filenames, test counts or code names unless the prompt asked for them (if it asked what you changed, the changed files or places may stay). Say what happened and what it means, then stop. Quoted material the user asked to see does not count - a reply built around a blockquote is exempt. A list or overview the user explicitly asked for is exempt too, when the reply actually is one, not merely because the prompt asked for one."
+    "short_reminder": "Keep the WHOLE answer, TLDR included, under 1000 characters, and keep every item the user's own prompt asked for. {owner_request} No ids, filenames, test counts or code names unless the prompt asked for them.",
+    "reminder": "This answer is over 1000 characters. Shorten it to the outcome and keep every item the user's own prompt asked for - drop what was not asked, never what was. {owner_request} Plain language: no ids, filenames, test counts or code names unless the prompt asked for them (if it asked what you changed, the changed files or places may stay). Say what happened and what it means, then stop. Quoted material the user asked to see does not count - a reply built around a blockquote is exempt. A list or overview the user explicitly asked for is exempt too, when the reply actually is one, not merely because the prompt asked for one. A one-line note that a guard refused an edit or forced a change to your work stays."
   },
   {
     "id": "checked-claim-needs-evidence",
