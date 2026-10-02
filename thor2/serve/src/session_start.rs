@@ -92,6 +92,26 @@ pub struct Rendered {
 /// the caller records as shown only `Rendered::shown`. `None` when there is
 /// nothing to render.
 pub fn render_within(items: &[RankedItem], budget: usize) -> Option<Rendered> {
+    render_within_ranked(items, budget, &std::collections::BTreeSet::new())
+}
+
+/// [`render_within`], ranking with what this project has been using (step 31).
+/// A project's first prompt is not known at session start, so relevance cannot
+/// come from it; it comes from what the facts did here lately. Order:
+///
+/// 1. the facts that fired in this project's own sessions lately (`recent`:
+///    shown at a prompt or before a tool call, never counting a session start),
+///    heaviest first, this project's own before the global ones;
+/// 2. then every other heavy rule (one that can refuse or cannot be undone),
+///    this project's own first;
+/// 3. then the rest, by weight and id.
+///
+/// The cap and the "N did not fit" line are exactly [`render_within`]'s.
+pub fn render_within_ranked(
+    items: &[RankedItem],
+    budget: usize,
+    recent: &std::collections::BTreeSet<String>,
+) -> Option<Rendered> {
     if items.is_empty() {
         return None;
     }
@@ -101,9 +121,21 @@ pub fn render_within(items: &[RankedItem], budget: usize) -> Option<Rendered> {
     // were whichever six facts had the alphabetically first ids (measured
     // 2026-10-01: 53 items, 16 KB, 6 visible). A stable sort puts what can
     // refuse or cannot be undone first; a rule of this project goes before a
-    // global one of the same weight (step 29); ids order what is left.
+    // global one of the same weight (step 29); ids order what is left. Step 31
+    // puts what fired in this project lately before all of that (field test 6:
+    // 28 of 33 start facts had nothing to do with the task).
+    let heavy = |r: &RankedItem| matches!(r.item.severity, Some(model::item::Severity::Irreversible | model::item::Severity::Costly));
     let mut ordered: Vec<&RankedItem> = items.iter().collect();
-    ordered.sort_by_key(|r| (r.item.severity.map_or(3u8, |s| s as u8), r.item.project.is_none()));
+    ordered.sort_by_key(|r| {
+        let group: u8 = if recent.contains(&r.id) {
+            0
+        } else if heavy(r) {
+            1
+        } else {
+            2
+        };
+        (group, r.item.severity.map_or(3u8, |s| s as u8), r.item.project.is_none())
+    });
     let lines: Vec<String> = ordered.iter().map(|r| format!("- [{}] {}", r.id, r.item.text)).collect();
     let head_len: usize = head.iter().map(|l| l.len() + 1).sum();
     let all_len: usize = head_len + lines.iter().map(|l| l.len() + 1).sum::<usize>();
@@ -127,6 +159,39 @@ pub fn render_within(items: &[RankedItem], budget: usize) -> Option<Rendered> {
         ));
     }
     Some(Rendered { text: out.join("\n"), shown, hidden })
+}
+
+/// A fact tagged this way is written for the owner's interactive chat (he
+/// orchestrates through background agents, wants an answer before any agent,
+/// pastes prompts) and is kept out of the session start and the prompt
+/// injection of a headless session, such as `claude -p` (step 31). Field test
+/// 6 (2026-10-02): a headless run was served such facts, delegated everything
+/// to a background agent that could get no shell permission, and delivered
+/// nothing. Facts that fire at a tool call or a file are not affected.
+pub const INTERACTIVE_ONLY_TAG: &str = "interactive-only";
+
+/// Whether a Claude Code entrypoint is a headless one. Claude Code names how
+/// it was started in `CLAUDE_CODE_ENTRYPOINT` (and in every transcript line):
+/// the owner's chats read `claude-desktop` or `cli`, `claude -p` reads
+/// `sdk-cli`, the SDKs `sdk-ts` and `sdk-py`. Every `sdk...` one is headless.
+pub fn entrypoint_is_headless(entrypoint: &str) -> bool {
+    entrypoint.trim().to_ascii_lowercase().starts_with("sdk")
+}
+
+/// The entrypoint a transcript names, read from the head of its text.
+pub fn entrypoint_in_transcript_head(head: &str) -> Option<String> {
+    let at = head.find("\"entrypoint\":\"")? + "\"entrypoint\":\"".len();
+    let value: String = head[at..].chars().take_while(|c| *c != '"').collect();
+    (!value.is_empty()).then_some(value)
+}
+
+/// `items` without the interactive-only facts when the session is headless;
+/// untouched otherwise.
+pub fn for_session_kind(items: Vec<RankedItem>, headless: bool) -> Vec<RankedItem> {
+    if !headless {
+        return items;
+    }
+    items.into_iter().filter(|r| !r.item.tags.iter().any(|t| t == INTERACTIVE_ONLY_TAG)).collect()
 }
 
 /// Appended after the standing-rules block exactly once: right after Claude

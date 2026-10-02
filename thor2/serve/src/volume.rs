@@ -89,6 +89,17 @@ pub fn record_start(db: &Path, session_id: &str, shown: &[&str], hidden: usize, 
     append(db, line.to_string(), now);
 }
 
+/// How a session start saw the session was started (step 31): the entrypoint
+/// Claude Code named (`env`: the hook's environment, `transcript`: the head
+/// of the session's transcript, `none`: neither) and whether that made the
+/// session headless. Only for the owner to check that the detection saw
+/// something; `doctor` does not read it (an unknown line kind is skipped).
+pub fn record_entrypoint(db: &Path, session_id: &str, entrypoint: &str, source: &str, headless: bool) {
+    let now = crate::time::now_unix();
+    let line = serde_json::json!({ "t": now, "k": "entry", "s": session_id, "e": entrypoint, "from": source, "headless": headless });
+    append(db, line.to_string(), now);
+}
+
 /// A Stop of `session_id`, and whether it held the turn.
 pub fn record_stop(db: &Path, session_id: &str, held: bool) {
     let now = crate::time::now_unix();
@@ -124,6 +135,27 @@ fn parse(line: &str) -> Option<Entry> {
         _ => return None,
     };
     Some(Entry { t: v.get("t")?.as_i64()?, kind, session: v.get("s")?.as_str()?.to_string() })
+}
+
+/// The facts shown in full at a prompt or before a tool call (never a session
+/// start) in any of `sessions` since `from` (unix seconds). What a project's
+/// own sessions have been using lately; a session start's block ranks by it
+/// (`session_start::render_within_ranked`). Empty when the file is missing.
+pub fn shown_in_sessions_since(
+    db: &Path,
+    sessions: &std::collections::BTreeSet<String>,
+    from: i64,
+) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    if sessions.is_empty() {
+        return out;
+    }
+    for entry in read(db).into_iter().filter(|e| e.t >= from && sessions.contains(&e.session)) {
+        if let Kind::Show { ids, .. } = entry.kind {
+            out.extend(ids);
+        }
+    }
+    out
 }
 
 /// What one window of the record adds up to.

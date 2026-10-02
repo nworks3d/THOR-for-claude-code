@@ -1901,6 +1901,23 @@ pub fn last_project_of_session(db: &Path, session_id: &str) -> Option<String> {
     newest_project_of_session(&read_eval_debt_state(db), session_id).map(str::to_string)
 }
 
+/// The sessions that have worked in `project` since `since_unix` (unix
+/// seconds), from the evaluation sidecar's per-session clocks. Empty when the
+/// sidecar has no such project.
+pub fn sessions_of_project_since(db: &Path, project: &str, since_unix: i64) -> std::collections::BTreeSet<String> {
+    read_eval_debt_state(db)
+        .get(project)
+        .map(|state| {
+            state
+                .sessions
+                .iter()
+                .filter(|(_, s)| s.last_event_unix.is_some_and(|t| t >= since_unix))
+                .map(|(id, _)| id.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// `last_project_of_session` on a sidecar already read: the project whose
 /// entry for `session_id` has the newest `last_event_unix`.
 pub(crate) fn newest_project_of_session<'a>(all: &'a EvalDebtState, session_id: &str) -> Option<&'a str> {

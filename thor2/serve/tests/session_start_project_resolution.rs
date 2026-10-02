@@ -216,21 +216,26 @@ fn the_session_start_names_a_fresh_registration_for_seven_days_then_stops() {
     let workdir = tempfile::tempdir().unwrap();
     let repo = make_repo_dir(workdir.path(), "gamma-repo");
     let root = repo.display().to_string().replace('\\', "/");
+    // One folder per store: the once-a-day log of shown info lines lives beside
+    // the store, and each of these starts is meant to be a first one.
     let db_dir = tempfile::tempdir().unwrap();
+    for name in ["fresh", "old", "moved"] {
+        std::fs::create_dir_all(db_dir.path().join(name)).unwrap();
+    }
 
-    let fresh = db_dir.path().join("fresh.db");
+    let fresh = db_dir.path().join("fresh").join("fresh.db");
     let three_days_ago = days_ago(3);
     register_raw(&mut EventStore::new(&fresh).unwrap(), "gamma-repo", &root, &three_days_ago);
     let out = session_start_in(&repo, &fresh);
     let line = format!("[THOR] the working copy of gamma-repo is registered at {root} since {}", &three_days_ago[..10]);
     assert!(out.contains(&line), "a registration three days old is named: {out}");
 
-    let old = db_dir.path().join("old.db");
+    let old = db_dir.path().join("old").join("old.db");
     register_raw(&mut EventStore::new(&old).unwrap(), "gamma-repo", &root, &days_ago(8));
     let out = session_start_in(&repo, &old);
     assert!(!out.contains("the working copy of"), "after seven days the line stops: {out}");
 
-    let moved = db_dir.path().join("moved.db");
+    let moved = db_dir.path().join("moved").join("moved.db");
     {
         let mut store = EventStore::new(&moved).unwrap();
         register_raw(&mut store, "gamma-repo", "C:/fixture/gamma-old", &days_ago(40));
@@ -239,4 +244,28 @@ fn the_session_start_names_a_fresh_registration_for_seven_days_then_stops() {
     let out = session_start_in(&repo, &moved);
     assert!(out.contains(&format!("registered at {root} since")), "{out}");
     assert!(out.contains("(moved from C:/fixture/gamma-old, which no longer exists)"), "a move names both paths: {out}");
+}
+
+/// Step 31: the registration line is shown at most once a day per project, not
+/// at every start (field test 6: about 250 characters of the budget, for
+/// nothing an agent can act on).
+#[test]
+fn the_registration_line_is_shown_once_a_day() {
+    let workdir = tempfile::tempdir().unwrap();
+    let repo = make_repo_dir(workdir.path(), "delta-repo");
+    let root = repo.display().to_string().replace('\\', "/");
+    let db_dir = tempfile::tempdir().unwrap();
+    let db = db_dir.path().join("store.db");
+    register_raw(&mut EventStore::new(&db).unwrap(), "delta-repo", &root, &days_ago(2));
+    let first = session_start_in(&repo, &db);
+    assert!(first.contains("the working copy of delta-repo is registered at"), "{first}");
+    let second = session_start_in(&repo, &db);
+    assert!(!second.contains("the working copy of"), "a second start within a day stays quiet: {second}");
+    // A day later it is due again: age the stamp the way a day passing would.
+    let log = db_dir.path().join("info-notice-log.json");
+    let stamped: std::collections::BTreeMap<String, i64> = serde_json::from_str(&std::fs::read_to_string(&log).unwrap()).unwrap();
+    let old: std::collections::BTreeMap<String, i64> = stamped.into_iter().map(|(k, v)| (k, v - 90_000)).collect();
+    std::fs::write(&log, serde_json::to_string(&old).unwrap()).unwrap();
+    let third = session_start_in(&repo, &db);
+    assert!(third.contains("the working copy of delta-repo is registered at"), "a day later it is shown again: {third}");
 }

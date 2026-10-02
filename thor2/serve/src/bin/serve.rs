@@ -1924,9 +1924,15 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
 
             let candidates = serve::live::always_candidates(&store);
             let decay = DecayContext::load(&store);
-            let items = serve::decay::retain_live(
-                session_start::select(&candidates, folder_project.as_deref()),
-                &decay,
+            // A headless session (`claude -p`) is not served what is written for
+            // the owner's interactive chat (`session_start::INTERACTIVE_ONLY_TAG`).
+            let kind = session_kind(&payload);
+            if !no_record {
+                serve::volume::record_entrypoint(db_path, &session_id, &kind.entrypoint, kind.from, kind.headless);
+            }
+            let items = session_start::for_session_kind(
+                serve::decay::retain_live(session_start::select(&candidates, folder_project.as_deref()), &decay),
+                kind.headless,
             );
             // THE BLOCK STAYS UNDER WHAT CLAUDE CODE SHOWS WHOLE (step 29). A
             // hook output over 10,000 characters is kept in a file and the
@@ -1947,7 +1953,10 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             // registered or moved: the first registration is first-come
             // (N11), so whoever made it is named where the owner looks - see
             // `project::registration_notice`.
-            let registration = project::registration_notice(&store, folder_project.as_deref(), time::now_unix());
+            // Shown at most once a day per project (`serve::notices`).
+            let registration = project::registration_notice(&store, folder_project.as_deref(), time::now_unix()).filter(|_| {
+                serve::notices::due(db_path, folder_project.as_deref().unwrap_or(""), "registration", time::now_unix(), !no_record)
+            });
             // Handed over (2026-09-25), capped: this project's own open
             // points - see `open_points_session_start_note`'s own doc comment.
             // Never a subagent's (step 16, B6): the open points - and the
@@ -1961,11 +1970,28 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                 }
             }
             let open_points = (!payload_is_from_a_subagent(&payload))
-                .then(|| open_points_session_start_note(&store, folder_project.as_deref()))
+                .then(|| {
+                    open_points_session_start_note(&store, folder_project.as_deref(), &|project| {
+                        serve::notices::due(db_path, project, "open-points", time::now_unix(), !no_record)
+                    })
+                })
                 .flatten();
             let extras: Vec<String> = [reminder, registration, open_points].into_iter().flatten().collect();
             let extras_len: usize = extras.iter().map(|e| e.len() + 2).sum();
-            let rules = session_start::render_within(&items, session_start::HOOK_OUTPUT_LIMIT_BYTES.saturating_sub(extras_len));
+            // What this project's own sessions used lately ranks first (step 31).
+            let recent = match folder_project.as_deref() {
+                Some(project) => {
+                    let from = time::now_unix() - RECENT_FACTS_DAYS * 86_400;
+                    let sessions = usefulness::sessions_of_project_since(db_path, project, from);
+                    serve::volume::shown_in_sessions_since(db_path, &sessions, from)
+                }
+                None => Default::default(),
+            };
+            let rules = session_start::render_within_ranked(
+                &items,
+                session_start::HOOK_OUTPUT_LIMIT_BYTES.saturating_sub(extras_len),
+                &recent,
+            );
             let (rules_text, shown_ids, hidden) = match rules {
                 Some(r) => (Some(r.text), r.shown, r.hidden),
                 None => (None, Vec::new(), 0),
@@ -2074,7 +2100,10 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                 return eval_note.map(|block| HookOutput::Context { event_name, block, verdicts: Vec::new() });
             }
             let decay = DecayContext::load(&store);
-            let all = serve::decay::retain_live(serve::rank::select(&candidates, &input), &decay);
+            let all = session_start::for_session_kind(
+                serve::decay::retain_live(serve::rank::select(&candidates, &input), &decay),
+                session_kind(&payload).headless,
+            );
             let arranged = serve::repeat::arrange(db_path, &reader, &all, !no_record);
             if !no_record {
                 serve::volume::record_showing(db_path, &session_id, &arranged.displayed_ids(), arranged.suppressed);
@@ -3486,18 +3515,59 @@ fn evaluation_ask(
 /// `model::store::OPEN_POINTS_OWNER_BUDGET`, the line is preceded by the
 /// banner that says so. Nothing is refused over it. The call site never
 /// shows this to a subagent.
-fn open_points_session_start_note(store: &EventStore, project: Option<&str>) -> Option<String> {
+fn open_points_session_start_note(store: &EventStore, project: Option<&str>, line_is_due: &dyn Fn(&str) -> bool) -> Option<String> {
     let points = model::store::open_points(store, project);
     if points.is_empty() {
         return None;
     }
     let queue = project.map(|p| model::store::owner_queue(store, p)).unwrap_or_default();
     let mut lines: Vec<String> = project.and_then(|p| model::store::owner_queue_banner(p, queue.len())).into_iter().collect();
-    lines.push(format!(
-        "[THOR] {} open point(s) in this project are the owner's to read, not a task for this session (doctor lists them).",
-        points.len()
-    ));
-    Some(lines.join("\n"))
+    // The count line is shown once a day per project (`serve::notices`); the
+    // banner above it, when the owner's budget is over, is shown every time.
+    if line_is_due(project.unwrap_or("")) {
+        lines.push(format!(
+            "[THOR] {} open point(s) in this project are the owner's to read, not a task for this session (doctor lists them).",
+            points.len()
+        ));
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+/// How many days back "fired in this project lately" looks, for the ranking of
+/// the session start block.
+const RECENT_FACTS_DAYS: i64 = 14;
+
+/// How this session was started, and whether that makes it headless
+/// (`session_start::entrypoint_is_headless`). Claude Code names it in
+/// `CLAUDE_CODE_ENTRYPOINT`; failing that, in the head of the session's
+/// transcript (`"entrypoint":"..."` on every line). Neither found: not
+/// headless, so a session of an unknown kind is served exactly as before.
+struct SessionKind {
+    entrypoint: String,
+    from: &'static str,
+    headless: bool,
+}
+
+fn session_kind(payload: &Value) -> SessionKind {
+    if let Ok(entrypoint) = std::env::var("CLAUDE_CODE_ENTRYPOINT") {
+        if !entrypoint.trim().is_empty() {
+            let headless = session_start::entrypoint_is_headless(&entrypoint);
+            return SessionKind { entrypoint, from: "env", headless };
+        }
+    }
+    let head = payload.get("transcript_path").and_then(|v| v.as_str()).and_then(|path| {
+        use std::io::Read as _;
+        let mut bytes = Vec::new();
+        std::fs::File::open(path).ok()?.take(65_536).read_to_end(&mut bytes).ok()?;
+        Some(String::from_utf8_lossy(&bytes).into_owned())
+    });
+    match head.as_deref().and_then(session_start::entrypoint_in_transcript_head) {
+        Some(entrypoint) => {
+            let headless = session_start::entrypoint_is_headless(&entrypoint);
+            SessionKind { entrypoint, from: "transcript", headless }
+        }
+        None => SessionKind { entrypoint: String::new(), from: "none", headless: false },
+    }
 }
 
 /// Which capture-guard mode is live right now, for THIS store
@@ -3675,6 +3745,9 @@ fn pre_tool_guard_block(
         record_command_guard_staleness(store, db_path, &pool.items, &pool.segments, &pool.command, root);
     }
     let verdict = judgement.verdict?;
+    // One record per rule the refusal names: a combined "answer ALL" message
+    // names several, and opens with no rule id of its own (step 31).
+    let rule_ids: Vec<String> = absent_guard::rule_ids_of(&verdict.reason).into_iter().map(str::to_string).collect();
     let reason = match &verdict.repeat {
         Some(guard_verdict::RepeatKey::File(attempt)) => {
             with_repeat_wording(&absent_guard::default_marker_path(db_path), session_id, attempt, verdict.reason)
@@ -3684,7 +3757,7 @@ fn pre_tool_guard_block(
         }
         None => verdict.reason,
     };
-    if let Some(id) = &verdict.rule_id {
+    for id in &rule_ids {
         record_gate(db_path, session_id, actor, true, id, &verdict.target, tool_use_id);
     }
     Some(reason)

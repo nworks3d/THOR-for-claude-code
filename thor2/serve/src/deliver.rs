@@ -17,6 +17,66 @@
 use model::served::ItemServed;
 use thor_core::event_store::{EventKind, EventStore};
 
+/// What a likely secret is replaced by.
+pub const REDACTED: &str = "[redacted]";
+
+/// `text` with likely secrets replaced by `[redacted]` (step 31). The log keeps
+/// the command a fact fired on, and so do its backups: a token typed in a
+/// command line must not go with it. Four shapes, in this order:
+///
+/// 1. an `Authorization` header's value;
+/// 2. the value after `=` or `:` in a name that holds `token`, `secret`,
+///    `password`, `passwd`, `pwd` or `key` (`API_TOKEN=...`, `?key=...`), and
+///    the value after a `--password`, `--token`, `--secret` or `--api-key` flag;
+/// 3. well-known token shapes (`sk_live_`, `ghp_`, `github_pat_`, `xoxb-`,
+///    `AKIA...`, `tskey-`, a JWT);
+/// 4. any other long run of 32 or more letters and digits that is all hex, or
+///    mixes upper case, lower case and digits (a hash or base64 blob). A long
+///    hyphenated name or a path is neither.
+///
+/// It looks for likely secrets and never claims to find all of them. What a
+/// rule's trial needs from a command (the program, its flags, the paths)
+/// stays as it was.
+pub fn redact_secrets(text: &str) -> String {
+    use regex::Regex;
+    use std::sync::OnceLock;
+    static RULES: OnceLock<Vec<(Regex, String)>> = OnceLock::new();
+    static LONG_RUN: OnceLock<Regex> = OnceLock::new();
+    let rules = RULES.get_or_init(|| {
+        let keep_then = |pattern: &str| (Regex::new(pattern).expect("a fixed pattern"), format!("${{1}}{REDACTED}"));
+        let whole = |pattern: &str| (Regex::new(pattern).expect("a fixed pattern"), REDACTED.to_string());
+        vec![
+            keep_then(r#"(?i)(authorization\s*[:=]\s*)(?:(?:bearer|basic|token)\s+)?[^\s'"]+"#),
+            keep_then(
+                r#"(?i)([A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|pwd|key)[A-Za-z0-9_.-]*\s*[=:]\s*)("[^"]*"|'[^']*'|[^\s'"&;|]+)"#,
+            ),
+            keep_then(r#"(?i)(--?(?:password|passwd|pwd|token|secret|api-?key|apikey)\s+)("[^"]*"|'[^']*'|[^\s'"-][^\s'"]*)"#),
+            whole(
+                r"\b(?:(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{8,}|(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|tskey-[A-Za-z0-9-]{10,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,})",
+            ),
+        ]
+    });
+    let mut out = text.to_string();
+    for (pattern, replacement) in rules {
+        out = pattern.replace_all(&out, replacement.as_str()).into_owned();
+    }
+    let long_run = LONG_RUN.get_or_init(|| Regex::new(r"[A-Za-z0-9+_-]{32,}={0,2}").expect("a fixed pattern"));
+    long_run
+        .replace_all(&out, |found: &regex::Captures| {
+            let run = &found[0];
+            let hex = run.chars().all(|c| c.is_ascii_hexdigit());
+            let mixed = run.chars().any(|c| c.is_ascii_digit())
+                && run.chars().any(|c| c.is_ascii_uppercase())
+                && run.chars().any(|c| c.is_ascii_lowercase());
+            if hex || mixed {
+                REDACTED.to_string()
+            } else {
+                run.to_string()
+            }
+        })
+        .into_owned()
+}
+
 /// Record one `ItemServed` event per shown item id, with no `trigger` - the
 /// plain entry point for every caller that either has none to give (`hook`'s
 /// own `UserPromptSubmit` arm - a prompt is not a command, a file, or the
@@ -87,11 +147,11 @@ pub fn record_delivery_with_trigger(
     ids: &[String],
     trigger: Option<&str>,
 ) {
-    let trigger: Option<String> = trigger.map(|t| {
+    let trigger: Option<String> = trigger.map(redact_secrets).map(|t| {
         if t.chars().count() > TRIGGER_LIMIT {
             t.chars().take(TRIGGER_LIMIT).collect()
         } else {
-            t.to_string()
+            t
         }
     });
     for id in ids {
@@ -128,8 +188,10 @@ pub fn record_delivery_around_anchors(
     anchors_of: &[(String, Vec<String>)],
     trigger: Option<&str>,
 ) {
+    // Redacted whole BEFORE it is cut, so a secret cannot survive in the part kept.
+    let trigger = trigger.map(redact_secrets);
     for (id, anchors) in anchors_of {
-        let excerpt = trigger.map(|t| model::store::trigger_excerpt_to(t, anchors, TRIGGER_LIMIT));
+        let excerpt = trigger.as_deref().map(|t| model::store::trigger_excerpt_to(t, anchors, TRIGGER_LIMIT));
         append_served(store, session_id, lineage_id, actor, served_at, id, excerpt);
     }
 }
@@ -182,7 +244,7 @@ pub fn record_gate_outcome_for_call(
     target: &str,
     tool_use_id: Option<&str>,
 ) {
-    let mut body = serde_json::json!({ "at": at, "target": target });
+    let mut body = serde_json::json!({ "at": at, "target": redact_secrets(target) });
     if let Some(id) = tool_use_id.filter(|id| !id.trim().is_empty()) {
         body["tool_use_id"] = serde_json::Value::String(id.to_string());
     }
@@ -324,5 +386,68 @@ mod tests {
         record_delivery(&mut store, "s", "l", "serve", "2026-08-02T12:00:00Z", &["ghost".to_string()]);
         let stats = serving_stats(&store);
         assert_eq!(stats.get("ghost").map(|s| s.times_served), Some(1));
+    }
+
+    /// Step 31: a command that carries a secret never lands in the log with it.
+    /// The tokens below are made up for this test.
+    #[test]
+    fn a_secret_in_a_command_is_redacted_before_it_is_stored() {
+        let fake_token = "ghp_0123456789abcdefghijABCDEFGHIJ012345";
+        let calls = [
+            format!("curl -H 'Authorization: Bearer {fake_token}' https://example.test/api"),
+            format!("deploy.sh --env prod API_TOKEN={fake_token}"),
+            "ssh nas 'PASSWORD=hunter2hunter2 ./run.sh'".to_string(),
+            "tool --password hunter2hunter2 --verbose".to_string(),
+            "export DB_SECRET: \"s3cr3t-value-here\"".to_string(),
+            "curl https://example.test/x?key=abcdef123456".to_string(),
+            "echo 5d41402abc4b2a76b9719d911017c5925d41402abc4b2a76b9719d911017c592".to_string(),
+            "echo QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU2Nzg5YWJjZGVm".to_string(),
+        ];
+        for call in &calls {
+            let mut store = EventStore::in_memory().unwrap();
+            record_delivery_with_trigger(&mut store, "s", "l", "hook", "2026-10-02T00:00:00Z", &["x1".to_string()], Some(call));
+            let kept = model::served::last_trigger(&store, "x1").unwrap();
+            for secret in [
+                fake_token,
+                "hunter2hunter2",
+                "s3cr3t-value-here",
+                "abcdef123456",
+                "5d41402abc4b2a76b9719d911017c592",
+                "QUJDREVGR0hJSktMTU5PUFFSU1RVVldY",
+            ] {
+                assert!(!kept.contains(secret), "{secret} survived in {kept}");
+            }
+            assert!(kept.contains("[redacted]"), "{kept}");
+            let mut again = EventStore::in_memory().unwrap();
+            let anchors = vec![("x1".to_string(), vec!["ssh".to_string()])];
+            record_delivery_around_anchors(&mut again, "s", "l", "hook", "2026-10-02T00:00:00Z", &anchors, Some(call));
+            assert!(!model::served::last_trigger(&again, "x1").unwrap().contains(fake_token));
+        }
+    }
+
+    /// The refusal's own record carries the refused command, so it is redacted too.
+    #[test]
+    fn a_refused_command_is_stored_without_its_secret() {
+        let mut store = EventStore::in_memory().unwrap();
+        record_gate_outcome(&mut store, "s", "l", "hook", "2026-10-02T00:00:00Z", true, "r1", "tool --password hunter2hunter2 --force");
+        let events = store.get_events_by_entity("r1").unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(!events[0].body.contains("hunter2hunter2"), "{}", events[0].body);
+        assert!(events[0].body.contains("--force"), "{}", events[0].body);
+    }
+
+    /// What the trial of a rule reads stays readable: ordinary commands, paths
+    /// and long hyphenated names are not touched.
+    #[test]
+    fn an_ordinary_command_is_left_alone() {
+        for call in [
+            "git push --force origin main",
+            "node --test --test-timeout=120000 C:/work/acme/serve/src/deliver.rs",
+            "cat mechanische-agentbrief-verbiedt-subagenten-in-een-lange-naam.md",
+            "ssh nas 'docker exec app sh -c \"echo hello\"'",
+            "npm run keyboard-test --key-count 3",
+        ] {
+            assert_eq!(redact_secrets(call), call, "{call}");
+        }
     }
 }

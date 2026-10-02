@@ -194,3 +194,21 @@ fn subagent_never_gets_the_owner_banner() {
     let owner = session_start(&over, None);
     assert!(owner.contains("wait on YOU"), "fixture sanity, the owner's own start shows it: {owner}");
 }
+
+/// Step 31: the open-points count line is shown at most once a day per project;
+/// the banner for an owner queue over its budget is not - it says something
+/// that needs the owner, so it stays at every start.
+#[test]
+fn the_count_line_is_shown_once_a_day_and_the_banner_every_start() {
+    let over = owner_queue_of(9);
+    let first = session_start(&over, None);
+    assert!(first.contains("[THOR] 9 open point(s) in this project"), "{first}");
+    let second = session_start(&over, None);
+    assert!(second.contains("[THOR] 9 open points wait on YOU"), "the banner stays: {second}");
+    assert!(!second.contains("open point(s) in this project"), "the count line stays quiet for a day: {second}");
+
+    let within = owner_queue_of(3);
+    assert!(session_start(&within, None).contains("[THOR] 3 open point(s) in this project"));
+    let again = session_start(&within, None);
+    assert!(!again.contains("open point(s) in this project"), "{again}");
+}

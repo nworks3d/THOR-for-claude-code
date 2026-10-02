@@ -532,6 +532,21 @@ pub fn rule_id_of(message: &str) -> Option<&str> {
     message.strip_prefix("[THOR] rule ")?.split_whitespace().next()
 }
 
+/// Every rule id a refusal message names, in order. A single refusal names one;
+/// a combined "answer ALL of them" message (`all_reasons`) names each rule it
+/// answers, one per paragraph. Empty for anything that is not one of ours.
+pub fn rule_ids_of(message: &str) -> Vec<&str> {
+    let mut ids: Vec<&str> = Vec::new();
+    for paragraph in message.split("\n\n") {
+        if let Some(id) = rule_id_of(paragraph) {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    ids
+}
+
 fn block_message(rule_id: &str, rule_text: &str, content: &str, literal: &str) -> String {
     let quote = quote_with_context(content, literal);
     format!(

@@ -277,6 +277,18 @@ transcript refuses (fail closed). Its marker is exempt from A4, so the text
 need not publish it. At `SessionStart` THOR marks, once, every rule whose
 requires answer is only approval markers (`go-<name>`).
 
+FACTS FOR THE OWNER'S CHAT ONLY (2.5): a fact tagged `interactive-only` is left
+out of the session start block and the prompt facts of a headless session, such
+as `claude -p`. THOR reads how the session was started from
+`CLAUDE_CODE_ENTRYPOINT` (else from the head of the session's transcript);
+every entrypoint that starts with `sdk` is headless, `claude-desktop` and `cli`
+are not, and a session of unknown kind is served as before. Facts bound to a
+file or a command still fire at the tool call in every session. Tag a fact with
+`revise` and its `tags`. The session start block is ranked: first what this
+project's own sessions were shown in the last 14 days, then the other heavy
+rules, then the rest. The working copy line and the open-points count line show
+once a day per project.
+
 Stop notices that do not hold the turn are also queued (at most 3, once each)
 and handed to the same session as context at its next prompt.
 

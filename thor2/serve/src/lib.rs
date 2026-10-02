@@ -109,6 +109,7 @@ pub mod lookup;
 pub mod mark;
 pub mod migrate;
 pub mod next_turn;
+pub mod notices;
 pub mod pins;
 pub mod project;
 pub mod prompt;

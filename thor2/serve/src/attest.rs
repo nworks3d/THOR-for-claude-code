@@ -326,7 +326,8 @@ fn slashed(path: &str) -> String {
 /// for a call with neither.
 fn same_call(name: &str, input: &Value, target: &str) -> bool {
     if let Some(command) = input.get("command").and_then(|c| c.as_str()) {
-        return command == target;
+        // The log keeps a command with its likely secrets redacted.
+        return command == target || crate::deliver::redact_secrets(command) == target;
     }
     if let Some(file) = input.get("file_path").and_then(|f| f.as_str()) {
         let (file, target) = (slashed(file), slashed(target));
@@ -391,8 +392,7 @@ pub fn verify_refusal(store: &EventStore, event: &Event, root: Option<&Path>) ->
         *is_error
             && content
                 .strip_prefix(&prefix)
-                .and_then(crate::absent_guard::rule_id_of)
-                .is_some_and(|id| id == event.entity_id)
+                .is_some_and(|rest| crate::absent_guard::rule_ids_of(rest).contains(&event.entity_id.as_str()))
     });
     if !blocked {
         return no(format!(
@@ -2059,6 +2059,27 @@ mod tests {
 
         std::fs::remove_dir_all(root.path().join(PROJECT_FOLDER)).unwrap();
         assert_eq!(field_refusals(&store, &item.id, &item).len(), 1, "the recorded verdict still reads field");
+    }
+
+    /// Step 31: a refusal that answered several rules in one combined message
+    /// is verified for each rule it names, not only for a first one.
+    #[test]
+    fn a_combined_refusal_message_verifies_for_every_rule_it_names() {
+        let root = tempfile::tempdir().unwrap();
+        let item = force_rule();
+        let mut store = store_with(&item);
+        serve_once(&mut store, S1, &item.id);
+        let input = json!({"command": "git push --force origin main"});
+        let combined = format!(
+            "[THOR] this call trips 2 rules at once - answer ALL of them in one go, then run it again.\n\n{}\n\n{}",
+            block_reason("another-rule", "x"),
+            block_reason(&item.id, "git push --force origin main")
+        );
+        main_transcript(root.path(), S1).block("toolu_COMB", "Bash", &input, &combined).write();
+        let e = refuse(&mut store, S1, "hook", &item.id, "git push --force origin main", Some("toolu_COMB"));
+        record_refusal_verifications_in(&mut store, S1, Some(root.path()));
+        let (field, why) = verdicts(&store, &item.id).get(&e.seq).cloned().expect("recorded");
+        assert!(field, "{why}");
     }
 
     /// The real block shape in a SUBAGENT's own file is found too - from the
