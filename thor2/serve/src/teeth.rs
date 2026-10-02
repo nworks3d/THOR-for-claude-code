@@ -908,6 +908,9 @@ fn derive_all(item: &Item, root: Option<&Path>) -> Vec<Derived> {
             unique.push(d);
         }
     }
+    // A literal holding a placeholder ("<pad>") never appears in a real call: no
+    // tooth is built on it.
+    unique.retain(|d| !derived_literals(&d.check).iter().any(|l| is_placeholder_literal(l)));
     // A bare short flag ("-n", "-f") is the weakest literal there is: it is
     // dropped when another tooth with a longer literal was built (D9).
     let has_longer = unique.iter().any(|d| derived_literals(&d.check).iter().any(|l| !is_bare_short_flag(l)));
@@ -918,6 +921,25 @@ fn derive_all(item: &Item, root: Option<&Path>) -> Vec<Derived> {
         });
     }
     unique
+}
+
+/// Whether `literal` holds an angle-bracket placeholder: `<` straight followed
+/// by a letter, then letters, digits, spaces, dashes or underscores, then `>`
+/// ("<pad>", "-i <keyfile>", "<the rest>"). It names whatever the reader fills
+/// in, so no real call ever carries it, and a tooth built on it can never
+/// refuse anything. A `<` that opens none stays a literal: "<<EOF", "< file",
+/// "2>&1".
+fn is_placeholder_literal(literal: &str) -> bool {
+    let chars: Vec<char> = literal.chars().collect();
+    (0..chars.len()).any(|open| {
+        if chars[open] != '<' || !chars.get(open + 1).is_some_and(|c| c.is_ascii_alphabetic()) {
+            return false;
+        }
+        chars[open + 2..]
+            .iter()
+            .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '_')))
+            .is_some_and(|c| *c == '>')
+    })
 }
 
 /// `-n`, `-f`: one dash and one letter.

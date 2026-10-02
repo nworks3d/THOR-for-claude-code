@@ -1692,3 +1692,44 @@ fn the_trials_replay_skips_a_call_made_by_a_session_of_another_project() {
     assert_eq!(r.refused.len(), 1);
     assert_eq!(r.refused[0].text, "git push origin alpha-branch");
 }
+
+/// FIELD TEST 11 (2026-10-02): a placeholder written in angle brackets
+/// ("git -C <pad> reset --hard", "ssh -i <keyfile> user@host") names whatever
+/// the reader fills in; no real call ever carries it. THOR built forbidden
+/// '<pad>', '<pad> reset' and '-i <keyfile>' from such texts: teeth that can
+/// never refuse anything but were reported as wired, and the evaluating agent
+/// was told to hang them. No derived tooth carries a placeholder literal.
+#[test]
+fn a_placeholder_in_angle_brackets_derives_no_tooth() {
+    for (text, anchor) in [
+        ("`git reset` vuurt NIET op `git -C <pad> reset --hard`", "git -C"),
+        ("Bash tool refuses 'ssh -i <keyfile> user@host ...'", "ssh"),
+        ("Never run `ssh -p <port number> <HOST> uptime`.", "ssh"),
+    ] {
+        let item = rule("placeholder", text, vec![cmd(anchor)], None, None);
+        let literals: Vec<String> = derive(&item, None)
+            .iter()
+            .flat_map(|d| derived_literals(&d.check).into_iter().map(str::to_string).collect::<Vec<_>>())
+            .collect();
+        assert!(literals.iter().all(|l| !is_placeholder_literal(l)), "{text}: {literals:?}");
+        assert!(!literals.iter().any(|l| l.contains('<') && l.contains('>')), "{text}: {literals:?}");
+    }
+}
+
+/// A `<` that opens no placeholder keeps working: a here-document, a
+/// redirect from a file, a descriptor redirect.
+#[test]
+fn a_real_angle_bracket_in_a_literal_is_no_placeholder() {
+    for literal in ["-s <<EOF", "< file", "<<'EOF'", "2>&1", "-x < in.txt > out.txt", "a<b", "<1>", "< x >"] {
+        assert!(!is_placeholder_literal(literal), "{literal}");
+    }
+    for literal in ["<pad>", "-i <keyfile>", "<pad> reset", "<the rest>", "<HOST>", "<path>", "<my-file_2>"] {
+        assert!(is_placeholder_literal(literal), "{literal}");
+    }
+    let item = rule("heredoc", "Never run `sh -s <<EOF` on the box.", vec![cmd("sh")], None, None);
+    let literals: Vec<String> = derive(&item, None)
+        .iter()
+        .flat_map(|d| derived_literals(&d.check).into_iter().map(str::to_string).collect::<Vec<_>>())
+        .collect();
+    assert!(literals.iter().any(|l| l.contains("<<EOF")), "{literals:?}");
+}
