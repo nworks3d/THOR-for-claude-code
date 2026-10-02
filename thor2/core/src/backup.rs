@@ -19,12 +19,50 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Do not push more than once per this many hours (debounce for the SessionStart hook).
 const DEBOUNCE_HOURS: u64 = 20;
 
+/// One export segment never grows past this many bytes. GitHub refuses any
+/// file over 100 MiB (104,857,600 bytes) and warns above 50 MB, so a segment
+/// is cut well under both: the single `events.jsonl` crossed the limit on
+/// 2026-10-01 and every backup since then failed at the push.
+pub const SEGMENT_MAX_BYTES: usize = 50_000_000;
+
+/// A local, never-pushed commit holding an object bigger than this can never
+/// be pushed to GitHub, so it is replaced rather than retried forever.
+pub const PUSH_LIMIT_BYTES: u64 = 90_000_000;
+
+/// The two sizes `backup_to_repo_sized` works with - a seam so tests can use
+/// kilobytes instead of megabytes.
+#[derive(Debug, Clone, Copy)]
+pub struct Sizes {
+    pub segment_bytes: usize,
+    pub push_limit_bytes: u64,
+}
+
+impl Sizes {
+    pub const DEFAULT: Sizes = Sizes { segment_bytes: SEGMENT_MAX_BYTES, push_limit_bytes: PUSH_LIMIT_BYTES };
+}
+
 fn git(repo: &Path, args: &[&str]) -> anyhow::Result<()> {
     let out = Command::new("git").arg("-C").arg(repo).args(args).output()?;
     if !out.status.success() {
-        anyhow::bail!("git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr).trim());
+        anyhow::bail!("git {:?} failed: {}", args, failure_reason(&String::from_utf8_lossy(&out.stderr)));
     }
     Ok(())
+}
+
+/// The part of git's stderr that says why: the `error:`/`fatal:` lines (a
+/// remote's refusal is buried under progress and hint lines), or everything
+/// when no line says so.
+fn failure_reason(stderr: &str) -> String {
+    let said: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.contains("error:") || l.contains("fatal:") || l.contains("rejected"))
+        .collect();
+    if said.is_empty() {
+        stderr.trim().to_string()
+    } else {
+        said.join(" | ")
+    }
 }
 
 /// Age in hours of the last commit reachable from local `HEAD` that touched
@@ -108,7 +146,7 @@ fn upstream_remote_and_branch(repo: &Path) -> Option<(String, String)> {
     Some((remote.to_string(), branch.to_string()))
 }
 
-/// Automated backup: export the log to <repo>/<subdir>/events.jsonl, then commit
+/// Automated backup: export the log to <repo>/<subdir>/events-0001.jsonl ..., then commit
 /// and push (git handles the credentials). Debounced to once per DEBOUNCE_HOURS
 /// unless `force`. Only ever touches `subdir` - it pulls --rebase first so it
 /// never collides with anything else living in the same repo. Returns a
@@ -125,6 +163,18 @@ pub fn backup_to_repo(
     repo: &Path,
     subdir: &str,
     force: bool,
+) -> anyhow::Result<String> {
+    backup_to_repo_sized(store, repo, subdir, force, Sizes::DEFAULT)
+}
+
+/// `backup_to_repo` with the segment and push sizes given - tests pass
+/// kilobytes, the real run passes `Sizes::DEFAULT`.
+pub fn backup_to_repo_sized(
+    store: &EventStore,
+    repo: &Path,
+    subdir: &str,
+    force: bool,
+    sizes: Sizes,
 ) -> anyhow::Result<String> {
     anyhow::ensure!(
         !subdir.is_empty()
@@ -151,8 +201,17 @@ pub fn backup_to_repo(
     if upstream {
         if let Some(ahead) = commits_ahead_of_upstream(repo) {
             if ahead > 0 {
-                git(repo, &["push", &remote, &branch])?;
-                pushed_note = Some(format!("pushed {ahead} backup commit(s) that had not reached the remote"));
+                // A local commit holding a file GitHub will never take (the
+                // old single events.jsonl) would fail every push for ever.
+                let dropped = drop_unpushable_backup_commits(repo, subdir, sizes.push_limit_bytes)?;
+                if dropped > 0 {
+                    pushed_note = Some(format!(
+                        "dropped {dropped} local backup commit(s) holding a file too big to push (the export is regenerated below)"
+                    ));
+                } else {
+                    git(repo, &["push", &remote, &branch])?;
+                    pushed_note = Some(format!("pushed {ahead} backup commit(s) that had not reached the remote"));
+                }
             }
         }
     }
@@ -180,10 +239,7 @@ pub fn backup_to_repo(
     }
     let out_dir = repo.join(subdir);
     std::fs::create_dir_all(&out_dir)?;
-    let n = {
-        let mut f = std::fs::File::create(out_dir.join("events.jsonl"))?;
-        export_jsonl(store, &mut f)?
-    };
+    let n = export_segments(store, &out_dir, sizes.segment_bytes)?;
     // sync with the shared repo (other backups push here too), then stage ours only
     let pathspec = format!("{subdir}/");
     git(repo, &["pull", "--rebase", "--autostash", &remote, &branch])?;
@@ -199,11 +255,11 @@ pub fn backup_to_repo(
     Ok(prefix(format!("pushed {subdir} backup ({n} events)")))
 }
 
-/// Write the whole event log as one JSON object per line, ordered by seq.
-/// Returns the number of events written.
-pub fn export_jsonl(store: &EventStore, out: &mut impl Write) -> anyhow::Result<usize> {
+/// The whole event log as one JSON line per event (no trailing newline), by seq.
+fn export_lines(store: &EventStore) -> anyhow::Result<Vec<String>> {
     let mut events = store.get_all_events()?;
     events.sort_by_key(|e| e.seq);
+    let mut lines = Vec::with_capacity(events.len());
     for e in &events {
         let rec = serde_json::json!({
             "seq": e.seq,
@@ -216,9 +272,176 @@ pub fn export_jsonl(store: &EventStore, out: &mut impl Write) -> anyhow::Result<
             "body": e.body,
             "this_hash": e.this_hash,
         });
-        writeln!(out, "{}", serde_json::to_string(&rec)?)?;
+        lines.push(serde_json::to_string(&rec)?);
     }
-    Ok(events.len())
+    Ok(lines)
+}
+
+/// Write the whole event log as one JSON object per line, ordered by seq.
+/// Returns the number of events written.
+pub fn export_jsonl(store: &EventStore, out: &mut impl Write) -> anyhow::Result<usize> {
+    let lines = export_lines(store)?;
+    for line in &lines {
+        writeln!(out, "{line}")?;
+    }
+    Ok(lines.len())
+}
+
+fn segment_name(index: usize) -> String {
+    format!("events-{index:04}.jsonl")
+}
+
+fn is_segment_name(name: &str) -> bool {
+    name.strip_prefix("events-")
+        .and_then(|rest| rest.strip_suffix(".jsonl"))
+        .is_some_and(|digits| !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Every segment file in `dir`, in order (`events-0001.jsonl`, ...).
+pub fn segment_files(dir: &Path) -> anyhow::Result<Vec<std::path::PathBuf>> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if is_segment_name(&entry.file_name().to_string_lossy()) {
+            files.push(entry.path());
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+/// Export the log into `dir` as numbered segments, each at most
+/// `segment_bytes` long, cut at event boundaries. The log only ever grows, so
+/// every closed segment keeps the same bytes from run to run and only the
+/// last one changes - git stores that as a tiny delta, and no file ever
+/// reaches the size GitHub refuses. Removes the old single `events.jsonl` and
+/// any stale segment, so the old file leaves the export tree in the same
+/// commit that adds the segments. Returns the number of events written.
+pub fn export_segments(store: &EventStore, dir: &Path, segment_bytes: usize) -> anyhow::Result<usize> {
+    let lines = export_lines(store)?;
+    let mut segments: Vec<String> = vec![String::new()];
+    for line in &lines {
+        let current = segments.last_mut().expect("at least one segment");
+        if !current.is_empty() && current.len() + line.len() + 1 > segment_bytes {
+            segments.push(String::new());
+        }
+        let current = segments.last_mut().expect("at least one segment");
+        current.push_str(line);
+        current.push('\n');
+    }
+    if lines.is_empty() {
+        segments.clear();
+    }
+    let old = dir.join("events.jsonl");
+    if old.exists() {
+        std::fs::remove_file(&old)?;
+    }
+    let keep: Vec<String> = (1..=segments.len()).map(segment_name).collect();
+    for existing in segment_files(dir)? {
+        let name = existing.file_name().unwrap_or_default().to_string_lossy().to_string();
+        if !keep.contains(&name) {
+            std::fs::remove_file(&existing)?;
+        }
+    }
+    for (name, text) in keep.iter().zip(&segments) {
+        let path = dir.join(name);
+        // Leave an identical closed segment alone: no rewrite, no new mtime.
+        if std::fs::read(&path).map(|b| b == text.as_bytes()).unwrap_or(false) {
+            continue;
+        }
+        std::fs::write(&path, text)?;
+    }
+    Ok(lines.len())
+}
+
+/// Replay an export into `store` from a path: a folder holding the segments,
+/// one segment or legacy single file, or the old `events.jsonl` path (which
+/// no longer exists once the export is segmented - the segments beside it are
+/// read instead). Returns the number of events restored.
+pub fn restore_path(store: &mut EventStore, path: &Path) -> anyhow::Result<usize> {
+    let files: Vec<std::path::PathBuf> = if path.is_file() {
+        vec![path.to_path_buf()]
+    } else {
+        let dir = if path.is_dir() { path } else { path.parent().unwrap_or_else(|| Path::new(".")) };
+        let segments = if dir.is_dir() { segment_files(dir)? } else { Vec::new() };
+        if !segments.is_empty() {
+            segments
+        } else if path.is_dir() && dir.join("events.jsonl").is_file() {
+            vec![dir.join("events.jsonl")]
+        } else {
+            anyhow::bail!(
+                "no exported log found at {}: point --restore-from at the folder that holds events-0001.jsonl, events-0002.jsonl, ...",
+                path.display()
+            );
+        }
+    };
+    let mut reader: Box<dyn std::io::Read> = Box::new(std::io::empty());
+    for file in &files {
+        let f = std::fs::File::open(file).map_err(|e| anyhow::anyhow!("cannot read {}: {e}", file.display()))?;
+        reader = Box::new(std::io::Read::chain(reader, f));
+    }
+    restore_jsonl(store, std::io::BufReader::new(reader))
+}
+
+/// Replace local, never-pushed backup commits that hold an object bigger than
+/// `limit` (the remote will refuse it for ever). Only when EVERY unpushed
+/// commit is one of this tool's own backup commits touching nothing but
+/// `subdir`; anything else is somebody's work and is reported, never
+/// rewritten. Nothing on the remote changes (no force push). Returns how many
+/// commits were dropped; the export is regenerated by the caller.
+fn drop_unpushable_backup_commits(repo: &Path, subdir: &str, limit: u64) -> anyhow::Result<usize> {
+    let git_out = |args: &[&str]| -> anyhow::Result<String> {
+        let out = Command::new("git").arg("-C").arg(repo).args(args).output()?;
+        if !out.status.success() {
+            anyhow::bail!("git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr).trim());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    };
+    // Any object in the unpushed range over the limit?
+    let objects = git_out(&["rev-list", "--objects", "@{u}..HEAD"])?;
+    let mut batch_in = String::new();
+    for line in objects.lines() {
+        if let Some(id) = line.split_whitespace().next() {
+            batch_in.push_str(id);
+            batch_in.push('\n');
+        }
+    }
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["cat-file", "--batch-check=%(objectsize)"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let feed = std::thread::spawn(move || {
+        let _ = stdin.write_all(batch_in.as_bytes());
+    });
+    let out = child.wait_with_output()?;
+    let _ = feed.join();
+    let too_big = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .any(|l| l.trim().parse::<u64>().map(|n| n > limit).unwrap_or(false));
+    if !too_big {
+        return Ok(0);
+    }
+    // Only our own export commits may be dropped.
+    let subjects = git_out(&["log", "--format=%s", "@{u}..HEAD"])?;
+    let names = git_out(&["diff", "--name-only", "@{u}", "HEAD"])?;
+    let prefix = format!("{subdir} backup (");
+    let own_subjects = subjects.lines().all(|s| s.starts_with(&prefix));
+    let own_paths = names.lines().all(|n| n.starts_with(&format!("{subdir}/")));
+    anyhow::ensure!(
+        own_subjects && own_paths,
+        "an unpushed commit in {} holds a file over {} bytes that the remote will refuse, and it is not one of the backup's own commits, so it was left alone - push or fix it by hand",
+        repo.display(),
+        limit
+    );
+    let count = subjects.lines().count();
+    git_out(&["reset", "--soft", "@{u}"])?;
+    git_out(&["reset", "--quiet"])?;
+    Ok(count)
 }
 
 /// Replay an exported log into `store` (which MUST be empty) in seq order,
@@ -368,6 +591,211 @@ mod tests {
                 "subdir {bad:?} must be refused before any git command runs"
             );
         }
+    }
+
+    // ---------------------------------------------- segments (step 29)
+
+    /// A store whose export is a few hundred KB, big enough to need several
+    /// segments at the tiny segment size the tests use.
+    fn big_store(events: usize) -> EventStore {
+        let mut store = EventStore::in_memory().unwrap();
+        let body = "x".repeat(900);
+        for i in 0..events {
+            store
+                .append_event("s", "l", "act", EventKind::FactCreated, &format!("e{i}"), None, &body)
+                .unwrap();
+        }
+        store
+    }
+
+    #[test]
+    fn the_export_is_split_into_segments_that_stay_under_the_limit() {
+        let store = big_store(300);
+        let dir = tempfile::tempdir().unwrap();
+        let n = export_segments(&store, dir.path(), 100_000).unwrap();
+        assert_eq!(n, 300);
+        let names = segment_files(dir.path()).unwrap();
+        assert!(names.len() >= 3, "300 events of ~1.2 KB at 100 KB each need several segments: {names:?}");
+        for f in &names {
+            let size = std::fs::metadata(f).unwrap().len();
+            assert!(size <= 100_000, "{} is {size} bytes, over the segment limit", f.display());
+        }
+        let first = names[0].file_name().unwrap().to_string_lossy().to_string();
+        assert_eq!(first, "events-0001.jsonl");
+    }
+
+    #[test]
+    fn closed_segments_do_not_change_when_the_log_grows() {
+        let mut store = big_store(300);
+        let dir = tempfile::tempdir().unwrap();
+        export_segments(&store, dir.path(), 100_000).unwrap();
+        let before = segment_files(dir.path()).unwrap();
+        let first_bytes = std::fs::read(&before[0]).unwrap();
+        store
+            .append_event("s", "l", "act", EventKind::FactCreated, "later", None, "one more")
+            .unwrap();
+        export_segments(&store, dir.path(), 100_000).unwrap();
+        assert_eq!(std::fs::read(&segment_files(dir.path()).unwrap()[0]).unwrap(), first_bytes);
+    }
+
+    #[test]
+    fn restoring_from_the_folder_reads_every_segment_in_order() {
+        let src = big_store(300);
+        let dir = tempfile::tempdir().unwrap();
+        export_segments(&src, dir.path(), 100_000).unwrap();
+        let mut dst = EventStore::in_memory().unwrap();
+        let n = restore_path(&mut dst, dir.path()).unwrap();
+        assert_eq!(n, 300);
+        let a = src.get_all_events().unwrap();
+        let b = dst.get_all_events().unwrap();
+        assert_eq!(a.last().unwrap().this_hash, b.last().unwrap().this_hash);
+    }
+
+    #[test]
+    fn restoring_from_the_old_single_file_path_finds_the_segments_next_to_it() {
+        let src = big_store(300);
+        let dir = tempfile::tempdir().unwrap();
+        export_segments(&src, dir.path(), 100_000).unwrap();
+        let mut dst = EventStore::in_memory().unwrap();
+        let n = restore_path(&mut dst, &dir.path().join("events.jsonl")).unwrap();
+        assert_eq!(n, 300, "the old file name must lead to the segments that replaced it");
+    }
+
+    #[test]
+    fn restoring_from_a_legacy_single_file_still_works() {
+        let src = big_store(5);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        export_jsonl(&src, &mut f).unwrap();
+        drop(f);
+        let mut dst = EventStore::in_memory().unwrap();
+        assert_eq!(restore_path(&mut dst, &path).unwrap(), 5);
+    }
+
+    #[test]
+    fn a_missing_segment_fails_the_restore_loudly() {
+        let src = big_store(300);
+        let dir = tempfile::tempdir().unwrap();
+        export_segments(&src, dir.path(), 100_000).unwrap();
+        std::fs::remove_file(dir.path().join("events-0002.jsonl")).unwrap();
+        let mut dst = EventStore::in_memory().unwrap();
+        assert!(restore_path(&mut dst, dir.path()).is_err(), "a gap in the segments must not restore quietly");
+    }
+
+    /// A bare remote that refuses any object over `limit` bytes, the way
+    /// GitHub refuses a file over 100 MB - the exact failure of 2026-10-01.
+    fn refuse_big_objects(remote: &Path, limit: u64) {
+        let hook = remote.join("hooks").join("pre-receive");
+        let script = [
+            "#!/bin/sh".to_string(),
+            "while read old new ref; do".to_string(),
+            "  if [ \"$old\" = 0000000000000000000000000000000000000000 ]; then range=\"$new\"; else range=\"$old..$new\"; fi".to_string(),
+            format!("  git rev-list --objects $range | git cat-file --batch-check='%(objectsize) %(rest)' | awk '$1 > {limit} {{bad=1}} END {{exit bad}}' || {{ echo 'file is too large for this remote' >&2; exit 1; }}"),
+            "done".to_string(),
+            String::new(),
+        ]
+        .join("\n");
+        std::fs::write(&hook, script).unwrap();
+        // The machine's shared git hooks (core.hooksPath) would otherwise
+        // replace this remote's own hooks folder.
+        git_ok(remote, &["config", "core.hooksPath", hook.parent().unwrap().to_str().unwrap()]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_log_bigger_than_the_remote_allows_still_backs_up_in_segments() {
+        let fx = make_git_fixture();
+        refuse_big_objects(&fx.remote, 150_000);
+        let store = big_store(300);
+        let sizes = Sizes { segment_bytes: 100_000, push_limit_bytes: 150_000 };
+        let out = backup_to_repo_sized(&store, &fx.work, "thor2", true, sizes).unwrap();
+        assert!(out.starts_with("pushed thor2 backup ("), "{out}");
+        assert_eq!(commits_ahead_of_upstream(&fx.work), Some(0));
+        assert!(!fx.work.join("thor2").join("events.jsonl").exists());
+        assert!(fx.work.join("thor2").join("events-0001.jsonl").exists());
+    }
+
+    /// Control for the test above: the fixture remote really does refuse one
+    /// big file, so the segment test proves something.
+    #[test]
+    fn the_fixture_remote_refuses_a_single_big_file() {
+        let fx = make_git_fixture();
+        refuse_big_objects(&fx.remote, 150_000);
+        std::fs::write(fx.work.join("big.bin"), vec![b'x'; 200_000]).unwrap();
+        git_ok(&fx.work, &["add", "big.bin"]);
+        git_ok(&fx.work, &["commit", "-m", "big"]);
+        let out = Command::new("git").arg("-C").arg(&fx.work).args(["push", "origin", "main"]).output().unwrap();
+        assert!(!out.status.success(), "the control remote must refuse the big file");
+    }
+
+    #[test]
+    fn the_old_single_file_leaves_the_export_tree_in_the_same_commit() {
+        let fx = make_git_fixture();
+        let store = big_store(20);
+        std::fs::create_dir_all(fx.work.join("thor2")).unwrap();
+        std::fs::write(fx.work.join("thor2").join("events.jsonl"), "{}\n").unwrap();
+        git_ok(&fx.work, &["add", "thor2/"]);
+        git_ok(&fx.work, &["commit", "-m", "old single-file backup"]);
+        git_ok(&fx.work, &["push", "origin", "main"]);
+        let sizes = Sizes { segment_bytes: 100_000, push_limit_bytes: 150_000 };
+        backup_to_repo_sized(&store, &fx.work, "thor2", true, sizes).unwrap();
+        let tree = Command::new("git")
+            .arg("-C")
+            .arg(&fx.work)
+            .args(["ls-tree", "-r", "--name-only", "origin/main"])
+            .output()
+            .unwrap();
+        let tree = String::from_utf8_lossy(&tree.stdout).to_string();
+        assert!(!tree.contains("thor2/events.jsonl"), "old file still in the remote tree: {tree}");
+        assert!(tree.contains("thor2/events-0001.jsonl"), "{tree}");
+    }
+
+    /// The stuck state the live repo is in: a local backup commit that holds
+    /// a file the remote will never take. The next run drops that one local
+    /// commit (it is only an export, regenerated below) and pushes the
+    /// segments - no force push, nothing on the remote is rewritten.
+    #[test]
+    fn a_local_commit_the_remote_refuses_is_replaced_not_pushed_forever() {
+        let fx = make_git_fixture();
+        refuse_big_objects(&fx.remote, 150_000);
+        let store = big_store(300);
+        std::fs::create_dir_all(fx.work.join("thor2")).unwrap();
+        let mut f = std::fs::File::create(fx.work.join("thor2").join("events.jsonl")).unwrap();
+        export_jsonl(&store, &mut f).unwrap();
+        drop(f);
+        git_ok(&fx.work, &["add", "thor2/"]);
+        git_ok(&fx.work, &["commit", "-m", "thor2 backup (300 events)"]);
+        assert_eq!(commits_ahead_of_upstream(&fx.work), Some(1));
+
+        let sizes = Sizes { segment_bytes: 100_000, push_limit_bytes: 150_000 };
+        let out = backup_to_repo_sized(&store, &fx.work, "thor2", true, sizes).unwrap();
+        assert!(out.contains("dropped 1 local backup commit"), "must say what it did: {out}");
+        assert_eq!(commits_ahead_of_upstream(&fx.work), Some(0));
+        let log = Command::new("git")
+            .arg("-C")
+            .arg(&fx.work)
+            .args(["log", "--format=%s", "origin/main"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&log.stdout).lines().count(), 2, "initial + one new backup commit");
+    }
+
+    #[test]
+    fn an_unpushed_commit_that_is_not_a_backup_is_never_dropped() {
+        let fx = make_git_fixture();
+        let store = big_store(300);
+        std::fs::write(fx.work.join("big.bin"), vec![b'x'; 200_000]).unwrap();
+        git_ok(&fx.work, &["add", "big.bin"]);
+        git_ok(&fx.work, &["commit", "-m", "someone's own work"]);
+        let sizes = Sizes { segment_bytes: 100_000, push_limit_bytes: 150_000 };
+        let err = backup_to_repo_sized(&store, &fx.work, "thor2", true, sizes);
+        assert!(err.is_err(), "a commit that is not ours must be reported, never rewritten");
+        assert_eq!(commits_ahead_of_upstream(&fx.work), Some(1), "the commit must still be there");
     }
 
     // ---------------------------------------------- real-git fixture tests

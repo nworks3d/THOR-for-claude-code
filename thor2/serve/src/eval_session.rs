@@ -759,13 +759,16 @@ fn anchor_full_rules(store: &EventStore, project: &str, path: &str, root: &std::
         .collect()
 }
 
-/// The words a full-place point had before step 26 (2.5.4), when the owner
+/// The words a full-place point had before step 26 (2.5), when the owner
 /// "decided which fact gives way". A point still carrying them was written by
 /// an older build and is judged again under the current rule.
+/// The session id THOR's own writes at a session start carry: no session's.
+pub const MACHINE_SESSION: &str = "machine";
+
 const OLD_ANCHOR_FULL_TEXT: &str = "owner decides which fact gives way";
 
 /// THE POINTS AN OLDER BUILD LEFT (step 27, D4). A full-place open point written
-/// before 2.5.4 still says the owner decides which fact gives way, and went on
+/// before 2.5 still says the owner decides which fact gives way, and went on
 /// saying so until some evaluation started in its project. Judged again here,
 /// at the first start of a session in that project: closed when no rule is held
 /// by the place any more (a place with an honest exit is the agent's, and its
@@ -773,7 +776,13 @@ const OLD_ANCHOR_FULL_TEXT: &str = "owner decides which fact gives way";
 /// otherwise. Only points that still carry the old words are touched, so this
 /// does nothing the second time. Written as THOR's eval-machine, like every
 /// machine point; returns the ids it closed or reworded.
-pub fn refresh_old_anchor_full_points(store: &mut EventStore, session: &str, project: &str) -> Vec<String> {
+///
+/// NO SESSION ID (step 29): THOR's own housekeeping at a session start is not
+/// the session's work. Written under the agent's session id (field 2026-10-02:
+/// a retraction by eval-machine under a headless agent's session), it read as
+/// something that session did. It is written under `MACHINE_SESSION`.
+pub fn refresh_old_anchor_full_points(store: &mut EventStore, project: &str) -> Vec<String> {
+    let session = MACHINE_SESSION;
     let stale: Vec<model::store::OpenPoint> = model::store::open_points(store, Some(project))
         .into_iter()
         .filter(|p| p.machine && p.blocker.as_deref() == Some("anchor-full") && p.text.contains(OLD_ANCHOR_FULL_TEXT))

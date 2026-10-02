@@ -155,6 +155,25 @@ pub fn replica_line(db: &Path, replica: Option<(&str, &str)>) -> String {
 /// only has to be small next to that.
 pub const SHIP_STALE_CEILING_HOURS: u64 = 3;
 
+/// The off-site backup's failure, in plain words: `None` while it is healthy
+/// (the sidecar only exists between a failed attempt and the next success).
+/// The backup runs inside a SessionStart hook, where a failure is invisible,
+/// so this is where the owner learns the copy on GitHub has gone stale.
+pub fn backup_line(db: &Path) -> Option<String> {
+    backup_line_at(db, crate::backup_state::now_unix())
+}
+
+fn backup_line_at(db: &Path, now: u64) -> Option<String> {
+    let state = crate::backup_state::read(db)?;
+    let repo = if state.repo.is_empty() { "the backup repository" } else { state.repo.as_str() };
+    let hours = now.saturating_sub(state.failing_since_unix) / 3600;
+    Some(format!(
+        "backup to {repo} failing since {} ({hours}h ago): {} - the off-site copy is not being updated; run backup.exe by hand and read what it prints",
+        serve::time::iso8601_from_unix(state.failing_since_unix as i64),
+        state.last_error
+    ))
+}
+
 /// Component: how long ago `sync ship` last completed without error, read
 /// from the sidecar `ops::ship_state` writes beside `db` on every attempt.
 ///
@@ -2842,6 +2861,8 @@ pub fn report(
     // `ship_line`'s own doc comment for why "never shipped" is not itself a
     // finding worth a permanent line.
     lines.extend(ship_line(db));
+    // Silent unless the off-site backup is failing right now.
+    lines.extend(backup_line(db));
     lines.extend(drain_refusals_line(db));
     lines.extend([
         falsifier_line(db),
@@ -4312,6 +4333,35 @@ mod tests {
         assert!(line.contains("FAILED"), "{line}");
         assert!(line.contains("connection refused"), "{line}");
         assert!(line.contains("no successful ship yet"), "{line}");
+    }
+
+    #[test]
+    fn backup_line_is_silent_while_the_backup_is_healthy() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        EventStore::new(&db).unwrap();
+        assert_eq!(backup_line(&db), None);
+    }
+
+    #[test]
+    fn backup_line_says_plainly_that_the_backup_is_failing_and_since_when() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        EventStore::new(&db).unwrap();
+        let since = 1_790_000_000;
+        crate::backup_state::record_failure_at(
+            &db,
+            std::path::Path::new("C:/x/acme-backup"),
+            "git push failed: file thor2/events.jsonl is 106.42 MB; this exceeds the file size limit",
+            since,
+        )
+        .unwrap();
+        let line = backup_line_at(&db, since + 31 * 3600).expect("a failing backup must produce a line");
+        assert!(line.starts_with("backup to acme-backup failing since 2026-"), "{line}");
+        assert!(line.contains("(31h ago)"), "{line}");
+        assert!(line.contains("106.42 MB"), "the reason must be in the line: {line}");
+        let lines = report(&db, None, None, None, None, None, false, None);
+        assert!(lines.iter().any(|l| l.starts_with("backup to acme-backup failing")), "{lines:#?}");
     }
 
     #[test]

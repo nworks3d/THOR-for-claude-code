@@ -92,8 +92,10 @@ struct Alone {
 }
 
 impl Alone {
-    fn of(item: &Item) -> Option<Alone> {
-        let store = model::store::one_item_store(item).ok()?;
+    /// `known`: the other projects the real store holds (`known_projects`), so a
+    /// `cd` into one of them is judged as the live hook judges it.
+    fn of(item: &Item, known: &[String]) -> Option<Alone> {
+        let store = model::store::one_item_store_among(item, known).ok()?;
         Some(Alone { store, id: item.id.clone(), project: item.project.clone() })
     }
 
@@ -121,9 +123,23 @@ fn command_root(store: &EventStore, project: Option<&str>) -> PathBuf {
 /// and the real-call replay ask of a command check. `root` is where it is
 /// tried (`command_root`).
 pub fn refuses_call(id: &str, item: &Item, command: &str, root: &Path) -> bool {
+    refuses_call_among(id, item, command, root, &[])
+}
+
+/// `refuses_call`, in a world that also knows the projects `known` names.
+pub fn refuses_call_among(id: &str, item: &Item, command: &str, root: &Path, known: &[String]) -> bool {
     let mut item = item.clone();
     item.id = id.to_string();
-    Alone::of(&item).is_some_and(|alone| alone.refuses(&bash(command), root))
+    Alone::of(&item, known).is_some_and(|alone| alone.refuses(&bash(command), root))
+}
+
+/// Every project the store holds a live item of: what the hook calls "a known
+/// project" when it reads where a command runs (`guard_verdict::segment_projects`).
+pub fn known_projects(store: &EventStore) -> Vec<String> {
+    let mut projects: Vec<String> = crate::live::live_items(store).into_iter().filter_map(|li| li.item.project).collect();
+    projects.sort();
+    projects.dedup();
+    projects
 }
 
 /// Whether `item`'s check refuses the call `tool`/`input`, tried in `root`
@@ -131,12 +147,12 @@ pub fn refuses_call(id: &str, item: &Item, command: &str, root: &Path) -> bool {
 /// (`prove`), so it never calls a guard arm directly.
 pub(crate) fn pipeline_refuses(item: &Item, tool: &str, input: &Value, root: &Path) -> bool {
     let call = Call { shown: String::new(), tool: tool.to_string(), input: input.clone() };
-    Alone::of(item).is_some_and(|alone| alone.refuses(&call, root))
+    Alone::of(item, &[]).is_some_and(|alone| alone.refuses(&call, root))
 }
 
 /// `refuses_call`, in the folder `command_root` picks for `store`.
 pub fn refuses_call_in(store: &EventStore, id: &str, item: &Item, command: &str) -> bool {
-    refuses_call(id, item, command, &command_root(store, item.project.as_deref()))
+    refuses_call_among(id, item, command, &command_root(store, item.project.as_deref()), &known_projects(store))
 }
 
 /// The item's first Command anchor.
@@ -412,12 +428,12 @@ fn absent_forms(root: &Path, path: &str, literals: &[String]) -> Result<Forms, S
 }
 
 /// Try `item`'s check through the pipeline, every form.
-fn try_check(item: &Item, root: &Path) -> Tried {
+fn try_check(item: &Item, root: &Path, known: &[String]) -> Tried {
     let built = match forms(item, root) {
         Ok(f) => f,
         Err(why) => return Tried { forbidden: vec![], clean: vec![], collapsed: false, file: None, none: Some(why) },
     };
-    let Some(alone) = Alone::of(item) else {
+    let Some(alone) = Alone::of(item, known) else {
         return Tried { forbidden: vec![], clean: vec![], collapsed: false, file: None, none: Some("the rule could not be built into a trial store".to_string()) };
     };
     let forbidden = built.forbidden.into_iter().map(|c| {
@@ -481,7 +497,7 @@ impl Replay {
 /// Replay a command check over the real calls its anchor reaches, through the
 /// hook's own pipeline. A forbidden check can only refuse a call carrying one
 /// of its literals, so a call without any is let through without running.
-fn replay(item: &Item, corpus: &Corpus, root: &Path) -> Option<Replay> {
+fn replay(item: &Item, corpus: &Corpus, root: &Path, known: &[String]) -> Option<Replay> {
     let anchor = command_anchor(&item.bindings)?;
     let check = item.check.as_ref()?;
     let literals: Vec<String> = match check {
@@ -489,7 +505,7 @@ fn replay(item: &Item, corpus: &Corpus, root: &Path) -> Option<Replay> {
         Check::Requires { .. } => Vec::new(),
         _ => return None,
     };
-    let alone = Alone::of(item)?;
+    let alone = Alone::of(item, known)?;
     let mut out = Replay::default();
     for call in corpus.reaching(anchor) {
         if call.cut {
@@ -1132,6 +1148,8 @@ enum RetestAs {
 
 struct Work<'a> {
     env: &'a Env<'a>,
+    /// The other projects the real store holds (`known_projects`).
+    known: Vec<String>,
     write: &'a Write<'a>,
     root: &'a Result<PathBuf, RootProblem>,
     session: &'a SessionCtx,
@@ -1348,13 +1366,13 @@ impl<'a> Work<'a> {
             let file = is_file_check(&d.check);
             let try_root = if file { root.map(Path::to_path_buf) } else { Some(cmd_root.clone()) };
             let Some(try_root) = try_root else { continue };
-            let tried = try_check(&with, &try_root);
+            let tried = try_check(&with, &try_root, &self.known);
             let what = format!("derived {}", describe(&d.check, &with.bindings));
             self.attempts.extend(attempts_of(&tried, &what));
             let mut dt = DerivedTrial { d, tried, stopped: vec![], not_counting: vec![], blocked: None, replay: None };
             let never_forces = matches!(dt.d.origin, Origin::EarlierText { .. });
             if dt.tried.bites() && !file && !never_forces {
-                if let Some(r) = replay(&with, self.corpus, &try_root) {
+                if let Some(r) = replay(&with, self.corpus, &try_root, &self.known) {
                     for call in &r.refused {
                         match call.counts_against_forcing(writer.as_deref(), first_refusal) {
                             Some((session, seq)) => {
@@ -1452,7 +1470,7 @@ impl<'a> Work<'a> {
                     why_not = format!("'{call}' is not a call on '{anchor}'");
                     continue;
                 }
-                if !refuses_call(&with.id, &with, call, &base_root) {
+                if !refuses_call_among(&with.id, &with, call, &base_root, &self.known) {
                     why_not = format!("'{call}' is not refused by {} - nothing to dispute there", describe(&dt.d.check, &bindings));
                     continue;
                 }
@@ -1712,13 +1730,13 @@ impl<'a> Work<'a> {
         let mut dropped: Option<String> = None;
         if let Some(check) = &w {
             let try_root = if is_file_check(check) { root_ok.clone().unwrap_or_else(|| cmd_root.clone()) } else { cmd_root.clone() };
-            let tried = try_check(item, &try_root);
+            let tried = try_check(item, &try_root, &self.known);
             self.attempts.extend(attempts_of(&tried, &format!("your {}", describe(check, &item.bindings))));
             self.clean_failed = tried.clean_failed();
             if let Some(file) = &tried.file {
                 self.file_blob = git(&try_root, &["hash-object", "--", &git_path(&file.rel)]).map(|s| s.trim().to_string());
             }
-            let replayed = replay(item, self.corpus, &try_root);
+            let replayed = replay(item, self.corpus, &try_root, &self.known);
             if let Some(r) = &replayed {
                 self.corpus_summary.reached = r.reached;
                 self.corpus_summary.whole_hits = r.whole_hits;
@@ -1867,7 +1885,7 @@ impl<'a> Work<'a> {
                 if let Some(path) = check_path(check).filter(|_| is_file_check(check)) {
                     let mut bound = item.clone();
                     bound.bindings.push(Binding::Target { kind: TargetKind::Path, value: path.to_string() });
-                    if try_check(&bound, &try_root).bites() {
+                    if try_check(&bound, &try_root, &self.known).bites() {
                         if let Some(place) = self.full_file_place(check, &try_root) {
                             return self.full_place_refusal(RefuseCode::Untryable, place);
                         }
@@ -1965,7 +1983,7 @@ impl<'a> Work<'a> {
         let mut cleaner = self.item().clone();
         cleaner.bindings = vec![command(&stripped)];
         cleaner.check = Some(Check::Forbidden { literals: vec![literal.clone()] });
-        try_check(&cleaner, root).bites().then(|| {
+        try_check(&cleaner, root, &self.known).bites().then(|| {
             format!("bind to '{stripped}' with the literal '{}' - THOR tried exactly that and it bites", gate::shown_literal(literal))
         })
     }
@@ -2039,7 +2057,7 @@ impl<'a> Work<'a> {
         } else {
             command_root(self.env.store, item.project.as_deref())
         };
-        try_check(item, &try_root).bites()
+        try_check(item, &try_root, &self.known).bites()
     }
 
     /// The place a file check reads, as an anchor this rule cannot take yet
@@ -2090,7 +2108,7 @@ impl<'a> Work<'a> {
         }
         let mut bound = item.clone();
         bound.bindings.push(Binding::Target { kind: TargetKind::Path, value: path.to_string() });
-        try_check(&bound, root).bites()
+        try_check(&bound, root, &self.known).bites()
     }
 
     /// STEP 24's keep: at a write that leaves the rule's check exactly as it
@@ -2111,7 +2129,7 @@ impl<'a> Work<'a> {
         let item = self.item();
         let mut bound = item.clone();
         bound.bindings.push(Binding::Target { kind: TargetKind::Path, value: path.clone() });
-        if !try_check(&bound, root).bites() {
+        if !try_check(&bound, root, &self.known).bites() {
             return None;
         }
         let kept = format!("its check ({}) is kept: it holds", describe(check, &item.bindings));
@@ -2223,6 +2241,7 @@ fn new_work<'a>(
     mode: Mode,
 ) -> Work<'a> {
     Work {
+        known: known_projects(env.store),
         env,
         write,
         root,

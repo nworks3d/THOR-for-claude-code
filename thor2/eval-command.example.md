@@ -21,7 +21,7 @@ A useful mark is not a dead signal. The latest verdict is what counts:
   injection channels - it stays findable through lookup regardless.
 
 No Stop hook asks for a verdict on a single item any more (since THOR
-2.5.6): the items that fired in many sessions without a verdict wait for this
+2.5): the items that fired in many sessions without a verdict wait for this
 routine, and a fact counts once per session however often it was shown there.
 Here you settle them deliberately, over the whole session, in one block.
 
@@ -43,7 +43,7 @@ running this project's evaluation and was active in the last 30 minutes, you
 are told that in one line, naming that session, and are not held. Once it has
 been quiet longer, the next ask takes the evaluation over. A project with activity in the last seven days and no
 evaluation that counts in seven days is due whatever the clock says.
-Since THOR 2.5.6 the judgement debt and the question about old rules are not
+Since THOR 2.5 the judgement debt and the question about old rules are not
 asked at a turn-end at all: this evaluation is the one place, per project at
 most once every 16 hours, so a session is never handed something to judge
 every quarter of an hour. A verdict counts per item for everyone. What is
@@ -301,7 +301,7 @@ exist.
 
 When a revise reply says bind, anchor or rebind (for example "bind it to
 <file>"), make that rebind as a revise of its own, or write "could not" with
-the refusal. Since THOR 2.5.2 a rewording never clears a true check: a reply
+the refusal. Since THOR 2.5 a rewording never clears a true check: a reply
 saying the check "is kept" leaves the rule owed until the rebind is made - or,
 when that place is full, you make room first and rebind after.
 

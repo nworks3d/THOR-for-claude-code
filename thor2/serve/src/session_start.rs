@@ -62,23 +62,71 @@ pub fn select(candidates: &[LiveItem], project: Option<&str>) -> Vec<RankedItem>
 /// (one item, on request, whole) and is counted in `status`/`doctor`, and
 /// never rides along on session start, the moment of action, or the prompt.
 pub fn render(items: &[RankedItem]) -> Option<String> {
+    render_within(items, usize::MAX).map(|r| r.text)
+}
+
+/// The most bytes a hook output may carry. Claude Code keeps a hook output
+/// longer than 10,000 characters in a file and shows the agent only its first
+/// 2 KB (measured on this machine's own transcripts: the largest output that
+/// arrived whole was 9,972 characters, the smallest that was cut was 9.8 KB,
+/// i.e. 10,035 bytes). 9,500 stays under it with room for a multi-byte letter.
+pub const HOOK_OUTPUT_LIMIT_BYTES: usize = 9_500;
+
+/// Room kept for the one-line note about the rules that did not fit.
+const NOT_FIT_NOTE_RESERVE: usize = 220;
+
+/// What `render_within` put in the block.
+pub struct Rendered {
+    pub text: String,
+    /// The ids that are really in `text`, in order. Only these were shown.
+    pub shown: Vec<String>,
+    /// How many standing rules did not fit and are not in `text`.
+    pub hidden: usize,
+}
+
+/// The standing-rules block, kept within `budget` bytes. Nothing is cut in the
+/// middle: every rule is in the block whole or not in it at all. The heaviest
+/// rules (the ones that can refuse or cannot be undone) come first, then this
+/// project's own before the global ones, then id order; when not everything
+/// fits, the rest is replaced by ONE line saying how many were left out, and
+/// the caller records as shown only `Rendered::shown`. `None` when there is
+/// nothing to render.
+pub fn render_within(items: &[RankedItem], budget: usize) -> Option<Rendered> {
     if items.is_empty() {
         return None;
     }
-    let mut lines: Vec<String> =
-        vec![crate::render::FRAMING_LINE.to_string(), "Standing rules for this session:".to_string()];
-    // THE HEAVIEST FIRST (step 27, D12). Nothing is cut: every item is still
-    // here. But Claude Code keeps a long hook output in a file and shows the
-    // agent only its first 2 KB, and in id order those were whichever six
-    // facts had the alphabetically first ids (measured 2026-10-01: 53 items,
-    // 16 KB, 6 visible). A stable sort puts what can refuse or cannot be
-    // undone where the preview reaches; ids still order what is equally heavy.
+    let head: Vec<String> = vec![crate::render::FRAMING_LINE.to_string(), "Standing rules for this session:".to_string()];
+    // THE HEAVIEST FIRST (step 27, D12). Claude Code keeps a long hook output
+    // in a file and shows the agent only its first 2 KB, and in id order those
+    // were whichever six facts had the alphabetically first ids (measured
+    // 2026-10-01: 53 items, 16 KB, 6 visible). A stable sort puts what can
+    // refuse or cannot be undone first; a rule of this project goes before a
+    // global one of the same weight (step 29); ids order what is left.
     let mut ordered: Vec<&RankedItem> = items.iter().collect();
-    ordered.sort_by_key(|r| r.item.severity.map_or(3u8, |s| s as u8));
-    for ranked in ordered {
-        lines.push(format!("- [{}] {}", ranked.id, ranked.item.text));
+    ordered.sort_by_key(|r| (r.item.severity.map_or(3u8, |s| s as u8), r.item.project.is_none()));
+    let lines: Vec<String> = ordered.iter().map(|r| format!("- [{}] {}", r.id, r.item.text)).collect();
+    let head_len: usize = head.iter().map(|l| l.len() + 1).sum();
+    let all_len: usize = head_len + lines.iter().map(|l| l.len() + 1).sum::<usize>();
+    let room = if all_len <= budget { usize::MAX } else { budget.saturating_sub(NOT_FIT_NOTE_RESERVE) };
+
+    let mut out = head;
+    let mut shown = Vec::new();
+    let mut used = head_len;
+    for (ranked, line) in ordered.iter().zip(lines) {
+        if used.saturating_add(line.len() + 1) > room {
+            continue;
+        }
+        used += line.len() + 1;
+        shown.push(ranked.id.clone());
+        out.push(line);
     }
-    Some(lines.join("\n"))
+    let hidden = ordered.len() - shown.len();
+    if hidden > 0 {
+        out.push(format!(
+            "[THOR] {hidden} more standing rule(s) did not fit in this block and are not shown. Look them up with the lookup tool when something you are about to do may be covered."
+        ));
+    }
+    Some(Rendered { text: out.join("\n"), shown, hidden })
 }
 
 /// Appended after the standing-rules block exactly once: right after Claude
@@ -389,5 +437,63 @@ mod tests {
         let block = render(&items).unwrap();
         let at = |id: &str| block.find(&format!("[{id}]")).unwrap_or_else(|| panic!("{id} missing: {block}"));
         assert!(at("c-hard") < at("b-costly") && at("b-costly") < at("a-light") && at("a-light") < at("d-plain"), "{block}");
+    }
+
+    // ------------------------------------------------ the size limit (step 29)
+
+    fn many(n: usize, len: usize) -> Vec<LiveItem> {
+        (0..n)
+            .map(|i| {
+                let mut c = item(&format!("id-{i:03}"), Kind::Rule, vec![Binding::Always], None);
+                c.item.text = format!("{i:03} {}", "w".repeat(len));
+                c
+            })
+            .collect()
+    }
+
+    /// THE FIELD CASE (2026-10-01): 53 rules, 15.6 KB. Claude Code showed the
+    /// agent 2 KB of it while THOR counted all 53 as shown.
+    #[test]
+    fn a_block_over_the_limit_keeps_whole_rules_only_and_says_how_many_were_left_out() {
+        let items = select(&many(53, 280), None);
+        let r = render_within(&items, HOOK_OUTPUT_LIMIT_BYTES).unwrap();
+        assert!(r.text.len() <= HOOK_OUTPUT_LIMIT_BYTES, "{} bytes", r.text.len());
+        assert_eq!(r.shown.len() + r.hidden, 53);
+        assert!(r.hidden > 0 && !r.shown.is_empty());
+        assert!(r.text.contains(&format!("{} more standing rule(s) did not fit", r.hidden)), "{}", r.text);
+        for id in &r.shown {
+            assert!(r.text.contains(&format!("[{id}]")), "a shown id must be in the text: {id}");
+        }
+        let in_text = r.text.lines().filter(|l| l.starts_with("- [")).count();
+        assert_eq!(in_text, r.shown.len(), "what is reported shown is exactly what is in the block");
+    }
+
+    #[test]
+    fn a_block_that_fits_is_unchanged_and_has_no_note() {
+        let items = select(&many(5, 100), None);
+        let r = render_within(&items, HOOK_OUTPUT_LIMIT_BYTES).unwrap();
+        assert_eq!(r.hidden, 0);
+        assert_eq!(r.shown.len(), 5);
+        assert_eq!(r.text, render(&items).unwrap());
+        assert!(!r.text.contains("did not fit"));
+    }
+
+    #[test]
+    fn the_heaviest_rules_are_the_ones_that_survive_the_limit() {
+        use model::item::Severity;
+        let mut all = many(40, 280);
+        all[39].item.severity = Some(Severity::Irreversible);
+        let items = select(&all, None);
+        let r = render_within(&items, 3_000).unwrap();
+        assert_eq!(r.shown.first().map(String::as_str), Some("id-039"), "the irreversible rule must come first and fit");
+    }
+
+    #[test]
+    fn this_projects_own_rules_come_before_global_ones_of_the_same_weight() {
+        let global = item("a-global", Kind::Rule, vec![Binding::Always], None);
+        let own = item("z-own", Kind::Rule, vec![Binding::Always], Some("thor2"));
+        let items = select(&[global, own], Some("thor2"));
+        let r = render_within(&items, HOOK_OUTPUT_LIMIT_BYTES).unwrap();
+        assert_eq!(r.shown, vec!["z-own".to_string(), "a-global".to_string()]);
     }
 }

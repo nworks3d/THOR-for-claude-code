@@ -231,6 +231,11 @@ see asked or answered. Measured 2026-09-09: agents working among
 themselves are not held by any of this; it applies only to what is
 addressed to the owner.
 
+Since 2.5 the judgement debt and the rule-upkeep question are not asked at a
+`Stop` at all: they are asked inside the project's evaluation, once per 16
+hours (see `thor2/README.md`, "Who is asked, and when"), so what the paragraph
+above says about them is history.
+
 Two sentences of the paragraph above are history by now (2.4.1). The
 evaluation ask is no longer read from one session's own accrual: it follows
 the PROJECT's work clock (every session together, parallel minutes counted
@@ -242,8 +247,8 @@ session "mcp": the stamp is the server's own Claude Code session id (a hint;
 "mcp" remains only when the server has none), and a verdict clears debt only when a `Stop` has checked that it was a real tool
 call of that session.
 
-Each of the six - Lane C, `setup_debt`, the evaluation debt, and the three
-memory-upkeep debts - decides its own subagent scope independently, at its
+Each of these - Lane C, `setup_debt`, the evaluation debt, and the crowding
+and stale-rule checks - decides its own subagent scope independently, at its
 own call site in `hook_once`'s `Stop` arm, rather than behind one shared
 early return: this project has measured twice what a single early return
 across several gates does to the ones after it, most recently when an
@@ -270,9 +275,10 @@ having checked something with no evidence, a claim that something could
 not be reached without trying), and a subagent that lies about either is
 the same lazy-agent behaviour this whole project exists to catch,
 regardless of who reads the lie. That default - applies to everyone unless
-a rule opts out - is the opposite of the six debts above, which stay
+a rule opts out - is the opposite of the Stop's own asks above (capture,
+setup, the evaluation ask, crowding and the stale-rule check), which stay
 silent for a subagent by default; that is deliberate, not an
-inconsistency: for the six debts, going quiet for a subagent is the
+inconsistency: for those asks, going quiet for a subagent is the
 settled behaviour, but for a rulebook rule, going quiet by default is
 exactly the failure this field exists to prevent (see `respond.rs`'s own
 "THE DEFAULT MATTERS" reasoning). Measured 2026-09-09 on 25 real agent

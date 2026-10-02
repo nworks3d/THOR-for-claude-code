@@ -1420,3 +1420,56 @@ fn a_kept_check_on_a_full_place_names_the_occupants_and_the_exits() {
         other => panic!("{other:?}\n{:?}", r.lines),
     }
 }
+
+// ------------------------------------------------ step 29: scope of the trial
+
+/// Field 2026-10-02: a rule of one project forbidding `git push` counted 57
+/// pushes made in two OTHER repositories as refused, while the live hook let
+/// them through (a command run in the folder of another known project is that
+/// project's business). The trial's store held one rule and so knew no other
+/// project; it now knows the projects the real store holds.
+#[test]
+fn a_call_run_in_another_known_projects_folder_is_not_refused_by_this_projects_rule() {
+    let mut fx = Fx::new();
+    let alpha = fx.checkout("alpha", &[("README.md", "alpha\n")], true);
+    let beta = fx.checkout("beta", &[("README.md", "beta\n")], true);
+    fx.register("alpha", &alpha);
+    fx.register("beta", &beta);
+    let ban = rule("no-push-from-alpha", "alpha gets no git push until the owner says so.", vec![command("git push")], forbidden(&["git push"]), Some("alpha"));
+
+    let others = known_projects(&fx.store);
+    assert!(others.contains(&"beta".to_string()), "{others:?}");
+
+    let in_beta = format!("cd \"{}\" && git push origin main", beta.display());
+    assert!(
+        refuses_call_among("no-push-from-alpha", &ban, "git push origin main", &alpha, &others),
+        "a push in alpha's own folder is refused"
+    );
+    assert!(
+        !refuses_call_among("no-push-from-alpha", &ban, &in_beta, &alpha, &others),
+        "a push made in beta's folder is beta's business"
+    );
+    assert!(
+        refuses_call("no-push-from-alpha", &ban, &in_beta, &alpha),
+        "a world that knows no other project keeps judging it under alpha - the defect"
+    );
+}
+
+#[test]
+fn the_trials_replay_does_not_count_calls_made_in_other_known_projects() {
+    let mut fx = Fx::new();
+    let alpha = fx.checkout("alpha", &[("README.md", "alpha\n")], true);
+    let beta = fx.checkout("beta", &[("README.md", "beta\n")], true);
+    fx.register("alpha", &alpha);
+    fx.register("beta", &beta);
+    let ban = rule("no-push-from-alpha", "alpha gets no git push until the owner says so.", vec![command("git push")], forbidden(&["git push"]), Some("alpha"));
+    let mut log = EventStore::in_memory().unwrap();
+    crate::deliver::record_delivery_with_trigger(&mut log, S1, S1, "hook", "2026-09-28T00:00:00Z", &["r".to_string()], Some(&format!("cd \"{}\" && git push origin main", beta.display())));
+    crate::deliver::record_delivery_with_trigger(&mut log, S1, S1, "hook", "2026-09-28T00:00:01Z", &["r".to_string()], Some("git push origin main"));
+    let corpus = Corpus::load(&log);
+    let known = known_projects(&fx.store);
+    let r = replay(&ban, &corpus, &alpha, &known).expect("a command check is replayed");
+    assert_eq!(r.reached, 2);
+    assert_eq!(r.refused.len(), 1, "only the push made where alpha lives would be refused: {:?}", r.refused.iter().map(|c| &c.text).collect::<Vec<_>>());
+    assert_eq!(r.refused[0].text, "git push origin main");
+}

@@ -12,7 +12,12 @@
 //! - `{"t":<unix>,"k":"show","s":"<session>","i":["<id>",...],"r":<n>}` - the
 //!   facts shown in full (`i`) and how many repeats were left out (`r`);
 //! - `{"t":<unix>,"k":"stop","s":"<session>","h":0|1}` - a Stop, and whether it
-//!   held the turn.
+//!   held the turn;
+//! - `{"t":<unix>,"k":"start","s":"<session>","i":["<id>",...],"n":<n>,"b":<bytes>}` -
+//!   a session start (step 29): the standing rules actually put in the
+//!   block (`i`), how many did not fit and were left out (`n`), and the bytes
+//!   the block carried (`b`). Claude Code keeps only about the first 2 KB of a
+//!   hook output over 10,000 characters, so a session start's size matters.
 //!
 //! Best effort like every sidecar: a line that cannot be written is lost, never
 //! an error for the hook. Nothing here ever reads the store, and doctor only
@@ -76,6 +81,14 @@ pub fn record_showing(db: &Path, session_id: &str, shown: &[&str], suppressed: u
     append(db, line.to_string(), now);
 }
 
+/// A session start of `session_id` put `shown` standing rules in a block of
+/// `bytes` bytes and left `hidden` out because they did not fit.
+pub fn record_start(db: &Path, session_id: &str, shown: &[&str], hidden: usize, bytes: usize) {
+    let now = crate::time::now_unix();
+    let line = serde_json::json!({ "t": now, "k": "start", "s": session_id, "i": shown, "n": hidden, "b": bytes });
+    append(db, line.to_string(), now);
+}
+
 /// A Stop of `session_id`, and whether it held the turn.
 pub fn record_stop(db: &Path, session_id: &str, held: bool) {
     let now = crate::time::now_unix();
@@ -92,6 +105,7 @@ struct Entry {
 enum Kind {
     Show { ids: Vec<String>, suppressed: usize },
     Stop { held: bool },
+    Start { shown: usize, hidden: usize, bytes: usize },
 }
 
 fn parse(line: &str) -> Option<Entry> {
@@ -102,6 +116,11 @@ fn parse(line: &str) -> Option<Entry> {
             suppressed: v.get("r")?.as_u64()? as usize,
         },
         "stop" => Kind::Stop { held: v.get("h")?.as_u64()? != 0 },
+        "start" => Kind::Start {
+            shown: v.get("i")?.as_array()?.len(),
+            hidden: v.get("n")?.as_u64()? as usize,
+            bytes: v.get("b")?.as_u64()? as usize,
+        },
         _ => return None,
     };
     Some(Entry { t: v.get("t")?.as_i64()?, kind, session: v.get("s")?.as_str()?.to_string() })
@@ -120,6 +139,12 @@ pub struct Summary {
     pub holds: usize,
     /// Sessions that had at least one Stop.
     pub sessions: usize,
+    /// Session starts, the standing rules they showed, the rules that did not
+    /// fit, and the bytes they carried.
+    pub starts: usize,
+    pub start_shown: usize,
+    pub start_hidden: usize,
+    pub start_bytes: usize,
 }
 
 /// The record read from the file, oldest first. A missing or unreadable file
@@ -145,6 +170,12 @@ fn summarize(entries: &[Entry], from: i64) -> Summary {
                 stop_sessions.insert(entry.session.as_str());
                 summary.holds += usize::from(*held);
             }
+            Kind::Start { shown, hidden, bytes } => {
+                summary.starts += 1;
+                summary.start_shown += shown;
+                summary.start_hidden += hidden;
+                summary.start_bytes += bytes;
+            }
         }
     }
     summary.sessions = stop_sessions.len();
@@ -165,8 +196,17 @@ fn line_of(label: &str, s: &Summary) -> String {
         0 => "no Stop recorded".to_string(),
         n => format!("{} Stop hold(s) in {n} session(s), {:.1} per session on average", s.holds, s.holds as f64 / n as f64),
     };
+    let starts = match s.starts {
+        0 => "no session start recorded".to_string(),
+        n => format!(
+            "{n} session start(s) put {} standing rule(s) in {:.1} KB ({} did not fit and were left out)",
+            s.start_shown,
+            s.start_bytes as f64 / 1024.0,
+            s.start_hidden
+        ),
+    };
     format!(
-        "volume, last {label}: {} fact(s) shown in full at prompts and tool calls (session starts not counted), {} repeat(s) left out; most shown: {top}; {holds}",
+        "volume, last {label}: {} fact(s) shown in full at prompts and tool calls, {} repeat(s) left out; most shown: {top}; {starts}; {holds}",
         s.full, s.suppressed
     )
 }
@@ -177,8 +217,8 @@ pub fn lines(db: &Path, now: i64) -> Vec<String> {
     let entries = read(db);
     if entries.is_empty() {
         return vec![
-            "volume: nothing recorded yet (THOR 2.5.6 starts recording it: how many facts were shown or left out and how \
-             many Stops held a turn, over the last 24 hours and 7 days)"
+            "volume: nothing recorded yet (THOR records how many facts were shown or left out, what each session start \
+             carried and how many Stops held a turn, over the last 24 hours and 7 days)"
                 .to_string(),
         ];
     }
@@ -220,17 +260,42 @@ mod tests {
         let all = lines(&db, now);
         assert_eq!(all.len(), 2);
         assert!(
-            all[0].contains("last 24 hours: 4 fact(s) shown in full at prompts and tool calls (session starts not counted), 4 repeat(s) left out; most shown: a (2x), b (1x), c (1x);")
+            all[0].contains("last 24 hours: 4 fact(s) shown in full at prompts and tool calls, 4 repeat(s) left out; most shown: a (2x), b (1x), c (1x);")
                 && all[0].contains("1 Stop hold(s) in 2 session(s), 0.5 per session on average"),
             "{}",
             all[0]
         );
         assert!(
-            all[1].contains("last 7 days: 6 fact(s) shown in full at prompts and tool calls (session starts not counted), 13 repeat(s) left out")
+            all[1].contains("last 7 days: 6 fact(s) shown in full at prompts and tool calls, 13 repeat(s) left out")
                 && all[1].contains("2 Stop hold(s) in 3 session(s), 0.7 per session on average"),
             "{}",
             all[1]
         );
+    }
+
+    #[test]
+    fn session_starts_are_counted_with_their_bytes_and_the_rules_that_did_not_fit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        let now = 1_000_000_000;
+        at(&db, now - 3600, serde_json::json!({ "k": "start", "s": "s1", "i": ["a", "b", "c"], "n": 40, "b": 9_000 }));
+        at(&db, now - 1800, serde_json::json!({ "k": "start", "s": "s2", "i": ["a", "b"], "n": 41, "b": 6_000 }));
+        let first = &lines(&db, now)[0];
+        assert!(
+            first.contains("2 session start(s) put 5 standing rule(s) in 14.6 KB (81 did not fit and were left out)"),
+            "{first}"
+        );
+        // A session start is not a showing: the top list and the full count stay at prompts and tool calls.
+        assert!(first.contains("0 fact(s) shown in full"), "{first}");
+        assert!(first.contains("most shown: none"), "{first}");
+    }
+
+    #[test]
+    fn a_window_without_a_session_start_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        at(&db, 1_000_000_000 - 60, show("s", &["a"], 0));
+        assert!(lines(&db, 1_000_000_000)[0].contains("no session start recorded"));
     }
 
     #[test]

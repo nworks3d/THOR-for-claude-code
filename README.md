@@ -242,10 +242,12 @@ at the right moment and hope. Version 2 is the same memory with a spine.
   many ever have, how much of your memory nothing re-reads. Version 1 had no
   number for the one thing it was built to do, which is how a safety net stays
   broken for a year.
-- **Maintenance is no longer optional.** At the end of a turn it asks for one
-  thing: judge a note that keeps firing, fix one you just filed where it will
-  never be seen, answer whether an expensive note can refuse anything. One at a
-  time, and it will not be waved off with a promise to do it later.
+- **Maintenance is no longer optional, and it does not nag.** Judging the notes
+  that keep firing and cleaning up old rules is asked once, inside the project's
+  evaluation (at most once per 16 hours), never at the end of every turn. A turn
+  is held only for something the session did itself: a note it just filed where
+  it will never be seen, a setup left undone, a decision you stated that was not
+  stored. It will not be waved off with a promise to do it later.
 - **It costs almost nothing to carry.** A note is capped at 300 characters and a
   block at four notes and 1200 characters, so what lands in the conversation is
   a few hundred tokens, not a whole rules file re-read on every turn. A memory
@@ -465,7 +467,7 @@ A generic client config, the shape most tool-calling assistants expect:
       "args": [
         "run", "-i", "--rm",
         "-v", "thor-data:/data",
-        "ghcr.io/nworks3d/thor-mcp:2.5.6"
+        "ghcr.io/nworks3d/thor-mcp:2.5.0"
       ]
     }
   }
@@ -475,7 +477,7 @@ A generic client config, the shape most tool-calling assistants expect:
 ### Run it as a container
 
 ```bash
-docker run -i --rm -v thor-data:/data ghcr.io/nworks3d/thor-mcp:2.5.6
+docker run -i --rm -v thor-data:/data ghcr.io/nworks3d/thor-mcp:2.5.0
 ```
 
 On an empty volume, the container creates a memory and seeds it with THOR's

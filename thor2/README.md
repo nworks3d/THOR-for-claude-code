@@ -213,15 +213,15 @@ per project and not per folder, when:
   been quiet for 30 minutes, the next ask takes the evaluation over and closes
   the old one as superseded (never void: its verdicts stay). A session's own
   open evaluation is asked for first, whatever the clock says.
-- ONE HOLDER PER PROJECT (2.5.4): per project the holder is the session with
-  the open evaluation, else the one holding the lease the evaluation ask took
-  (`debt-holders.json` beside the store, released at a `Stop` that holds
+- ONE HOLDER PER PROJECT (2.5): per project the holder of the evaluation ask is
+  the session with the open evaluation, else the one holding the lease the ask
+  took (`debt-holders.json` beside the store, released at a `Stop` that holds
   nothing, and at the retry `Stop` once the evaluation is no longer open),
   else the first one asked. Another session is not asked while the holder
   showed activity on the log in the last 30 minutes; it gets one line naming
   the holder. Holds about the session's own writes (a fact on a full place,
   setup, a stated decision, the Response Guard) stay per session.
-- NO JUDGEMENT ASK AND NO RULE-UPKEEP ASK AT A TURN'S END (2.5.6): the owner's
+- NO JUDGEMENT ASK AND NO RULE-UPKEEP ASK AT A TURN'S END (2.5): the owner's
   decision, 2026-10-02 - one block, in the evaluation, instead of something to
   judge every quarter of an hour. What used to hold a `Stop` for the items that
   fired repeatedly since they were last judged, or for the old rules THOR's
@@ -260,7 +260,7 @@ the first-session setup, a decision the owner stated that was not stored, or a
 note stored onto a full place - the ask is not lost: it comes in the same block,
 after that reason, and the `Stop` is counted once.
 
-A FULL PLACE IS THE AGENT'S (2.5.4): a rule whose check needs a place it is
+A FULL PLACE IS THE AGENT'S (2.5): a rule whose check needs a place it is
 not anchored to, when that place is full, goes to the agent's batch with a line
 naming every occupant (severity, and whether its check can refuse) and the
 three honest exits - fold, move to a narrower anchor, retract a stale one with
@@ -269,7 +269,7 @@ check can refuse is it THOR's own open point (`anchor-full`). Retracting a rule
 whose check holds warns in the reply and is listed under the machine section's
 checks.
 
-THE OWNER'S GO (2.5.4): a `requires` check tagged `owner-approval` is answered
+THE OWNER'S GO (2.5): a `requires` check tagged `owner-approval` is answered
 only by the owner's own words - a real user turn of the session's main
 transcript, this turn or the one before, with quoted and fenced text left out;
 never the call itself, a tool result or a subagent's hand-back. An unreadable
@@ -280,7 +280,7 @@ requires answer is only approval markers (`go-<name>`).
 Stop notices that do not hold the turn are also queued (at most 3, once each)
 and handed to the same session as context at its next prompt.
 
-HOW OFTEN ONE AGENT SEES A FACT (2.5.6): one context - a session's main
+HOW OFTEN ONE AGENT SEES A FACT (2.5): one context - a session's main
 conversation, or one subagent, which starts fresh - is shown a fact in full
 ONCE, then never again: no reminder line, and a prompt the owner types opens no
 new showing. The count starts again only at a new session start (also a resume
@@ -472,7 +472,7 @@ counts, and without `agent_id` the field changes nothing.
 target/release/doctor.exe --db "<store>"
 ```
 
-Its first line always names the build it was run from (`doctor 2.5.6`), so a
+Its first line always names the build it was run from (`doctor 2.5.0`), so a
 report you paste somewhere says which version made it - every program in this
 directory answers the same way to `--version` or `-V`, on its own, with no
 store needed.
@@ -585,7 +585,11 @@ is named with its own reason. The off-site copy the `backup` command keeps in
 git behaves the same way about its own commits - one that could not reach the
 remote is pushed again on the very next run, before that run's own
 once-a-day schedule is even checked, instead of sitting unpushed for up to a
-day.
+day. The log is exported in numbered files (`events-0001.jsonl`, ...) of at
+most 50 MB each, so no file passes the size GitHub accepts, and
+`backup --restore-from` takes the folder that holds them. A backup that fails
+is not tried again at every session start, only after an hour, and `doctor`
+says since when it has been failing and why.
 
 So a write arriving at the copy is not applied there. It is queued, and the
 authority applies it later. Three commands, in the order you set them up:
@@ -760,11 +764,13 @@ it can write, 3 when a rule is blocked (its project has no registered working
 copy, or that checkout is mid-change while the default branch still has the
 line), and 4 when only a writer can make the fix, which it names.
 
-The `Stop` hook also asks a session about a few of these, once per session, with
-the command for each. It asks only a session that has done at least 10 minutes
-of its own work in the project, and never at its first `Stop` there - the same
-two terms the evaluation ask lands on, read from the same clock - so a short
-task is never held for old rules it did not touch.
+The `Stop` hook does not ask about these at all any more (2.5). The rules THOR
+could not decide alone are asked inside the project's evaluation - its batch of
+at most eight that need a fix only an agent can make, and its list of at most
+sixteen that only have to name their check's literal - which is asked at most
+once per 16 hours per project, of a session that has done at least 10 minutes
+of its own work in the project and never at its first `Stop` there. A short task
+is never held for old rules it did not touch.
 
 There is a second gate that keeps the number from rotting once you start
 using it. Adding a fact to a target that already holds one whose own proof

@@ -380,6 +380,15 @@ pub struct OptInRule {
     /// section. Missing, `false` or malformed all mean the rule reads every
     /// occurrence, as before this field existed.
     pub affirmative_only: bool,
+    /// Terms whose presence in the OWNER'S OWN LAST PROMPT means he asked for
+    /// what the rule's reminder tells the writer to leave out (step 29: the
+    /// length rule says "no test counts", and the prompt may be "give me the
+    /// real test result"). Then `reminder_if_asked` is said instead of the
+    /// reminder. Empty, or no prompt that could be read: the reminder as ever.
+    pub asked_for_any_of: Vec<String>,
+    /// What is said instead of the reminder when `asked_for_any_of` matches the
+    /// owner's prompt.
+    pub reminder_if_asked: Option<String>,
 }
 
 /// Parse the rulebook into `OptInRule`s: every field `parse_rules` reads,
@@ -413,6 +422,8 @@ pub fn parse_opt_in_rules(text: &str) -> Vec<OptInRule> {
             // `true` keeps the rule reading every occurrence of its terms.
             let own_claims_only = r.get("own_claims_only").and_then(|v| v.as_bool()).unwrap_or(false);
             let affirmative_only = r.get("affirmative_only").and_then(|v| v.as_bool()).unwrap_or(false);
+            let asked_for_any_of = str_list(r, "asked_for_any_of");
+            let reminder_if_asked = r.get("reminder_if_asked").and_then(|v| v.as_str()).map(str::to_string);
             Some(OptInRule {
                 base,
                 before,
@@ -422,6 +433,8 @@ pub fn parse_opt_in_rules(text: &str) -> Vec<OptInRule> {
                 owner_reading_only,
                 own_claims_only,
                 affirmative_only,
+                asked_for_any_of,
+                reminder_if_asked,
             })
         })
         .collect()
@@ -1235,6 +1248,50 @@ pub fn evaluate_opt_in(
     evaluate_opt_in_checked(rules, haystack_lower, prompt_lower, is_subagent, None)
 }
 
+/// What a fired rule says: its `reminder_if_asked` when the owner's own prompt
+/// asked for what the reminder tells the writer to leave out, else its
+/// reminder - with any internal id in a bracket taken out (`without_internal_ids`).
+fn reminder_for(rule: &OptInRule, prompt_lower: &str) -> String {
+    let asked = !prompt_lower.is_empty()
+        && !rule.asked_for_any_of.is_empty()
+        && rule.asked_for_any_of.iter().any(|t| prompt_lower.contains(&t.to_lowercase()));
+    let text = match (&rule.reminder_if_asked, asked) {
+        (Some(alternative), true) => alternative,
+        _ => &rule.base.reminder,
+    };
+    without_internal_ids(text)
+}
+
+/// `text` without a store id in brackets: a block message is read by a writer
+/// who has no use for "(mcp-0a1b2c3d)" or "(alpha:mem-0a1b2c3d)" - the
+/// reminder says what to do, never which stored note says so (step 29). Only a
+/// bracket holding nothing but such an id is removed, with the space before it.
+pub fn without_internal_ids(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('(') {
+        let Some(close) = rest[open..].find(')') else { break };
+        let inner = &rest[open + 1..open + close];
+        if is_internal_id(inner) {
+            out.push_str(rest[..open].trim_end_matches(' '));
+            rest = &rest[open + close + 1..];
+        } else {
+            out.push_str(&rest[..open + close + 1]);
+            rest = &rest[open + close + 1..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `mcp-0a1b2c3d`, `mem-0a1b2c3d`, `alpha:mem-0a1b2c3d`: an optional
+/// project and colon, then `mcp-` or `mem-` and eight hex digits.
+fn is_internal_id(inner: &str) -> bool {
+    let id = inner.rsplit(':').next().unwrap_or(inner);
+    let hex = id.strip_prefix("mcp-").or_else(|| id.strip_prefix("mem-"));
+    hex.is_some_and(|h| h.len() == 8 && h.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
 /// `evaluate_opt_in`, plus the reply's evidence checked when the caller could
 /// look (see "checked evidence" above): a rule that takes a citation or a sha
 /// as evidence then reads its escapes against what checked out, and its
@@ -1272,15 +1329,16 @@ fn evaluate_opt_in_checked(
             if escaped {
                 return None;
             }
+            let said = reminder_for(r, prompt_lower);
             let reminder = match checked.filter(|c| !c.unverified.is_empty()) {
                 Some(c) => format!(
                     "{} (Evidence counts only when it checks out: a path:line, or a line number next to a file \
                      name, must name a line that file really has under the session's working directory, and a \
                      commit must exist in its git repository; these did not: {}.)",
-                    r.base.reminder,
+                    said,
                     c.unverified.iter().take(3).map(String::as_str).collect::<Vec<_>>().join(", ")
                 ),
-                None => r.base.reminder.clone(),
+                None => said,
             };
             Some((r.tier, reminder))
         })
@@ -1837,6 +1895,47 @@ mod tests {
     #[test]
     fn a_real_short_sha_is_detected_case_insensitively() {
         assert!(contains_commit_sha("commits a2770f8e en BE1E8B3B"));
+    }
+
+    // ------------------------------------------- step 29: the reminder's words
+
+    #[test]
+    fn an_internal_id_in_a_bracket_is_not_part_of_the_message() {
+        assert_eq!(
+            without_internal_ids("The owner standing rule (mcp-0a1b2c3d): open with a TLDR."),
+            "The owner standing rule: open with a TLDR."
+        );
+        assert_eq!(without_internal_ids("rule (alpha:mem-0a1b2c3d): drop it"), "rule: drop it");
+        // Anything else in a bracket stays.
+        assert_eq!(without_internal_ids("no ids (hashes, ports) here"), "no ids (hashes, ports) here");
+        assert_eq!(without_internal_ids("see (mcp-12) and (a-1234)"), "see (mcp-12) and (a-1234)");
+        assert_eq!(without_internal_ids("an open ( bracket"), "an open ( bracket");
+    }
+
+    const ASKED_RULEBOOK: &str = r#"[
+      {"id":"answer-is-too-long","tier":"block","owner_reading_only":true,
+       "any_of":[],"none_of":["```"],"min_chars":1000,
+       "asked_for_any_of":["testuitslag","test result"],
+       "reminder":"Over 1000 characters (mcp-0a1b2c3d): no test counts, no ids.",
+       "reminder_if_asked":"Over 1000 characters: he asked for the test result, so give that number, plainly, and stop."}
+    ]"#;
+
+    #[test]
+    fn the_reminder_without_a_matching_prompt_names_no_id() {
+        let long = "x".repeat(1200);
+        let v = guard_verdict(Some(ASKED_RULEBOOK), &long, "Kun je het even uitleggen?", false, None);
+        let reason = v.block_reason.expect("long answer blocks");
+        assert!(reason.contains("no test counts"), "{reason}");
+        assert!(!reason.contains("mcp-0a1b2c3d"), "{reason}");
+    }
+
+    #[test]
+    fn a_prompt_that_asks_for_the_test_result_gets_the_reminder_that_allows_it() {
+        let long = "x".repeat(1200);
+        let v = guard_verdict(Some(ASKED_RULEBOOK), &long, "Geef me de echte testuitslag erbij", false, None);
+        let reason = v.block_reason.expect("still too long: the length rule stays");
+        assert!(reason.contains("he asked for the test result"), "{reason}");
+        assert!(!reason.contains("no test counts"), "{reason}");
     }
 
     // --------------------------------------------------- FALSE BLOCK A: lists

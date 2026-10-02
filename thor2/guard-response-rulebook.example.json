@@ -27,6 +27,8 @@
     "any_of": [],
     "none_of": ["\n> ", "```"],
     "list_request_any_of": ["lijst", "overzicht", "rapport", "list", "overview", "report", "all the", "eval", "evaluatie"],
+    "asked_for_any_of": ["test result", "testuitslag", "testresultaat", "how many tests", "hoeveel tests"],
+    "reminder_if_asked": "This answer is over 1000 characters. The user asked for the test result, so give that result and the count they asked for, plainly, then stop - no other ids, filenames or code names unless asked.",
     "min_chars": 1000,
     "reminder": "This answer is over 1000 characters. Keep it short and in plain language, not just the summary - no ids, no filenames, no test counts, no code names unless asked. Say what happened and what it means, then stop. Quoted material the user asked to see does not count - a reply built around a blockquote is exempt. A list or overview the user explicitly asked for is exempt too, when the reply actually is one, not merely because the prompt asked for one."
   },

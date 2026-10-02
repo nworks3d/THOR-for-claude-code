@@ -1,6 +1,6 @@
 //! STOP WARNINGS REACH THE AGENT NEXT TURN (step 26).
 //!
-//! Since 2.5.3 a Stop notice that does not hold the turn - the Response
+//! Since 2.5 a Stop notice that does not hold the turn - the Response
 //! Guard's warn tier, "running in session X", "report still owed" - goes out
 //! as `systemMessage` only: a line for the owner. It had to: at `Stop`, Claude
 //! Code reads `additionalContext` as feedback that continues the conversation,

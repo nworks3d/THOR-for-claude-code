@@ -1,8 +1,12 @@
 //! Off-site backup of the event log into a git clone.
 //!
 //! The backup IS the log, exported as canonical append-only JSONL (see
-//! `thor_core::backup`). This binary is only the CLI around it: it opens the
-//! store, names the subdirectory to write into, and prints what happened.
+//! `thor_core::backup`), cut into numbered segments (`events-0001.jsonl`, ...)
+//! so no single file reaches the size GitHub refuses. This binary is only the
+//! CLI around it: it opens the store, names the subdirectory to write into,
+//! and prints what happened. A failed attempt is remembered
+//! (`ops::backup_state`) so the next session starts do not retry for an hour
+//! and `doctor` can say the off-site copy is stale.
 //!
 //! Why the subdirectory has a default that is NOT "thor": a 2.0 store is a
 //! different hash chain over the same memory, and 1.0's backup already owns
@@ -32,7 +36,8 @@ struct Cli {
     #[arg(long)]
     repo: Option<PathBuf>,
     /// Rebuild a store from an exported log instead of backing one up: point it
-    /// at an `events.jsonl` from this repo.
+    /// at the `thor2` folder of this repo (it reads every events-NNNN.jsonl in
+    /// order). An old single `events.jsonl` still works.
     ///
     /// WHY THIS FLAG EXISTS. `thor_core::backup::restore_jsonl` was written,
     /// tested and reachable from nowhere: 2.0 could write a backup every session
@@ -61,13 +66,6 @@ fn main() -> ExitCode {
     // Restore mode, checked first: it is the one path that must work when the
     // live store is gone, so it never opens an existing store.
     if let Some(from) = &cli.restore_from {
-        let file = match std::fs::File::open(from) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("cannot read the exported log at {}: {e}", from.display());
-                return ExitCode::FAILURE;
-            }
-        };
         let mut store = match EventStore::new(&cli.db) {
             Ok(s) => s,
             Err(e) => {
@@ -75,7 +73,7 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        return match backup::restore_jsonl(&mut store, std::io::BufReader::new(file)) {
+        return match backup::restore_path(&mut store, from) {
             Ok(n) => {
                 println!("restored {n} events into {}", cli.db.display());
                 ExitCode::SUCCESS
@@ -113,6 +111,19 @@ fn main() -> ExitCode {
     // one machine. Written before the export below, so both land in the same
     // commit; a debounced run that commits nothing simply leaves a fresh file
     // for the next one.
+    let now = ops::backup_state::now_unix();
+    // After a failed attempt, wait before trying again instead of paying the
+    // same failure at every session start. Exit 0: the hook behaved; `doctor`
+    // is where the failure is named.
+    if !cli.force {
+        if let Some(left) = ops::backup_state::backoff_left_at(&cli.db, now) {
+            println!(
+                "backup: the last attempt failed, next try in {} min (run with --force to try now; doctor names the reason)",
+                left.div_ceil(60)
+            );
+            return ExitCode::SUCCESS;
+        }
+    }
     let library_path = library::default_path(&cli.db);
     if library_path.exists() {
         let out_dir = repo.join(&cli.subdir);
@@ -132,6 +143,7 @@ fn main() -> ExitCode {
 
     match backup::backup_to_repo(&store, &repo, &cli.subdir, cli.force) {
         Ok(line) => {
+            ops::backup_state::record_success(&cli.db);
             println!("{line}");
             // The person who only ever reads this one line (this binary runs
             // far more often than `doctor` does) still learns the copy on
@@ -144,6 +156,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
+            let _ = ops::backup_state::record_failure_at(&cli.db, &repo, &e.to_string(), now);
             eprintln!("backup failed: {e}");
             ExitCode::FAILURE
         }

@@ -1,10 +1,12 @@
 //! The operational layer: replicating the log to a NAS/remote copy over HTTP
 //! (`transport`), recording when that replication last succeeded
-//! (`ship_state`), draining a replica's captured writes back into the
+//! (`ship_state`), remembering when the off-site backup failed
+//! (`backup_state`), draining a replica's captured writes back into the
 //! authority (`drain`), installing THOR's hooks into an agent's settings file
 //! (`install`) and git's own hooks directory (`githooks`), and a
 //! plain-language health check over both plus the fact store (`health`).
 
+pub mod backup_state;
 pub mod drain;
 pub mod githooks;
 pub mod health;

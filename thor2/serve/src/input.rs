@@ -357,13 +357,9 @@ pub struct ServeInput {
     /// project could not be resolved, and then only global items are served -
     /// see `project::applies_to` for why that is the safe direction.
     pub project: Option<String>,
-    /// The verbatim string last handed to `add_command`, kept ONLY so
-    /// `render::render_text` can echo back a `why --command "..."` that
-    /// re-asks this exact question - `targets`/`context` already hold
-    /// this same text, derived and mixed with other signals, which is right
-    /// for ranking but wrong for a hint that must be copy-pasteable as one
-    /// flag's value. See `render::why_invocation`'s own doc comment for the
-    /// defect this closes.
+    /// The verbatim string last handed to `add_command` - `targets`/`context`
+    /// hold this same text derived and mixed with other signals, which is right
+    /// for ranking but not for a caller that needs the command as written.
     pub command: Option<String>,
     /// The verbatim string last handed to `add_file`, for the same reason
     /// `command` above exists.
@@ -463,7 +459,7 @@ mod tests {
         assert_eq!(
             input.command.as_deref(),
             Some("git push --force origin main"),
-            "the verbatim command must be kept for render::why_invocation's own hint"
+            "the verbatim command must be kept as written"
         );
     }
 
@@ -476,7 +472,7 @@ mod tests {
         assert_eq!(
             input.file.as_deref(),
             Some("app/.env"),
-            "the verbatim path must be kept for render::why_invocation's own hint"
+            "the verbatim path must be kept as written"
         );
     }
 

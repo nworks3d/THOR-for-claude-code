@@ -313,17 +313,11 @@ struct TargetArgs {
     /// shortest form of `--file` below, and the one a new user reaches for
     /// first.
     ///
-    /// THE DEFECT THIS CLOSES. Every hint this binary prints for a withheld
-    /// item (`serve::render::render_text`'s "run `serve why ...`" line) used
-    /// to read "run `serve why`" with nothing after it - not a flag this
-    /// parser accepted, and not even the file or command that made the
-    /// block fire. A session's own report on trying to guess past it: "the
-    /// help command for what fires here had a different flag than the hint
-    /// said: --file, not a path." The hint is now built from this same
-    /// struct (see `render::why_invocation`) and always names `--file`
-    /// explicitly, but this positional stays too, so the shortest thing a
-    /// new user actually types - the bare path, no flag remembered - also
-    /// works. Refused together with `--file` (never silently picking one)
+    /// THE DEFECT THIS CLOSES. A hint this binary used to print for a withheld
+    /// item read "run `serve why`" with nothing after it - not a flag this
+    /// parser accepted. The block now names the hidden ids instead (step
+    /// 29), but this positional stays, so the shortest thing a new user
+    /// actually types - the bare path, no flag remembered - works. Refused together with `--file` (never silently picking one)
     /// rather than left to guess which wins.
     #[arg(value_name = "PATH", conflicts_with = "file")]
     path: Option<String>,
@@ -1154,7 +1148,7 @@ mod resolve_session_id_tests {
 /// the store is written either and the store is opened read-only.
 /// One hook call: `hook_inner` decides what the surfaces say, and this hands a
 /// Stop notice that does not hold the turn on to the session's next turn
-/// (step 26, `serve::next_turn`). Since 2.5.3 such a notice goes out at Stop as
+/// (step 26, `serve::next_turn`). Since 2.5 such a notice goes out at Stop as
 /// `systemMessage` only - for the owner, never waking the model - so the agent
 /// would otherwise never learn it: it is queued once, and the session's next
 /// `UserPromptSubmit` opens with it as context. Never for a subagent, never on
@@ -1934,43 +1928,28 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                 session_start::select(&candidates, folder_project.as_deref()),
                 &decay,
             );
-            let rules_block = session_start::render(&items);
-
-            // Its own gate, at its own call site, deliberately never chained
-            // onto `rules_block`'s own early return above: a session with no
-            // live Always item must still get this reminder when it just
+            // THE BLOCK STAYS UNDER WHAT CLAUDE CODE SHOWS WHOLE (step 29). A
+            // hook output over 10,000 characters is kept in a file and the
+            // agent sees only its first 2 KB; THOR used to count every rule of
+            // such a block as shown. So the extras below (compaction reminder,
+            // registration notice, open points) are made first, the standing
+            // rules get what room is left, and only the rules that really are
+            // in the block are recorded as shown.
+            //
+            // The compaction reminder has its own gate, at its own call site,
+            // deliberately never chained onto the rules' early return: a
+            // session with no live Always item must still get it when it just
             // went through a compaction (see `session_start::compact_
-            // reminder`'s own doc comment) - letting the rules block's `?`
-            // swallow it would silence the reminder on exactly the sessions
-            // that have nothing else to show. `payload_is_from_a_subagent`
-            // is passed in rather than checked inside `compact_reminder`
-            // itself for the same reason every other gate in this match
-            // keeps that check local: see that function's own doc comment.
+            // reminder`'s own doc comment).
             let source = payload.get("source").and_then(|v| v.as_str());
             let reminder = session_start::compact_reminder(source, payload_is_from_a_subagent(&payload));
-
-            let block = match (rules_block, reminder) {
-                (Some(rules), Some(reminder)) => format!("{rules}\n\n{reminder}"),
-                (Some(rules), None) => rules,
-                (None, Some(reminder)) => reminder,
-                (None, None) => String::new(),
-            };
             // One line, for seven days after this project's working copy was
             // registered or moved: the first registration is first-come
             // (N11), so whoever made it is named where the owner looks - see
             // `project::registration_notice`.
-            let block = match (block.is_empty(), project::registration_notice(&store, folder_project.as_deref(), time::now_unix())) {
-                (_, None) => block,
-                (true, Some(line)) => line,
-                (false, Some(line)) => format!("{block}\n\n{line}"),
-            };
+            let registration = project::registration_notice(&store, folder_project.as_deref(), time::now_unix());
             // Handed over (2026-09-25), capped: this project's own open
-            // points, so a fresh session is never held by the evaluation
-            // debt later and given no list at all - see `open_points_
-            // session_start_note`'s own doc comment. Combined with the
-            // block above AFTER it is built, never inside the match above,
-            // so a session with nothing else to show still gets this on its
-            // own rather than staying silent.
+            // points - see `open_points_session_start_note`'s own doc comment.
             // Never a subagent's (step 16, B6): the open points - and the
             // owner-queue banner above them - are for the owner's own session.
             // THE FULL-PLACE POINTS AN OLDER BUILD LEFT (step 27, D4): judged
@@ -1978,34 +1957,43 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             // `eval_session::refresh_old_anchor_full_points`.
             if !no_record && !payload_is_from_a_subagent(&payload) {
                 if let Some(project) = folder_project.as_deref() {
-                    serve::eval_session::refresh_old_anchor_full_points(&mut store, &session_id, project);
+                    serve::eval_session::refresh_old_anchor_full_points(&mut store, project);
                 }
             }
             let open_points = (!payload_is_from_a_subagent(&payload))
                 .then(|| open_points_session_start_note(&store, folder_project.as_deref()))
                 .flatten();
-            let block = match (block.is_empty(), open_points) {
-                (true, None) => return None,
-                (true, Some(note)) => note,
-                (false, None) => block,
-                (false, Some(note)) => format!("{block}\n\n{note}"),
+            let extras: Vec<String> = [reminder, registration, open_points].into_iter().flatten().collect();
+            let extras_len: usize = extras.iter().map(|e| e.len() + 2).sum();
+            let rules = session_start::render_within(&items, session_start::HOOK_OUTPUT_LIMIT_BYTES.saturating_sub(extras_len));
+            let (rules_text, shown_ids, hidden) = match rules {
+                Some(r) => (Some(r.text), r.shown, r.hidden),
+                None => (None, Vec::new(), 0),
             };
+            let block = rules_text.into_iter().chain(extras).collect::<Vec<String>>().join("\n\n");
+            if block.is_empty() {
+                return None;
+            }
 
-            let ids: Vec<String> = items.iter().map(|r| r.id.clone()).collect();
             // "session start" - the one trigger this surface can ever have:
             // every item here is the pinned `Always` block, never a reaction
             // to a particular file or command. See `ItemServed::trigger`'s
-            // own doc comment for the other two shapes.
+            // own doc comment for the other two shapes. Only what is in the
+            // block counts as served.
             if !no_record {
-                deliver::record_delivery_with_trigger(
-                    &mut store,
-                    &session_id,
-                    &session_id,
-                    actor,
-                    &time::now_iso8601(),
-                    &ids,
-                    Some("session start"),
-                );
+                if !shown_ids.is_empty() {
+                    deliver::record_delivery_with_trigger(
+                        &mut store,
+                        &session_id,
+                        &session_id,
+                        actor,
+                        &time::now_iso8601(),
+                        &shown_ids,
+                        Some("session start"),
+                    );
+                }
+                let shown: Vec<&str> = shown_ids.iter().map(String::as_str).collect();
+                serve::volume::record_start(db_path, &session_id, &shown, hidden, block.len());
             }
             // No `verdicts` here - see `HookOutput::Context`'s own doc
             // comment: the classifier answers "is this a prohibition for the
@@ -2092,7 +2080,7 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                 serve::volume::record_showing(db_path, &session_id, &arranged.displayed_ids(), arranged.suppressed);
             }
             let selection = arranged.selection;
-            let rendered = render::render_text(&selection, &input, db_path);
+            let rendered = render::render_text(&selection, &input);
             let block = match (rendered, eval_note) {
                 (Some(rendered), Some(note)) => format!("{note}\n\n{rendered}"),
                 (Some(rendered), None) => rendered,
@@ -2119,9 +2107,8 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             // No `verdicts` here either, for the identical reason session
             // start carries none: a raw prompt is neither a proposed command
             // nor proposed content (`prompt::resolve` never calls
-            // `add_command`/`add_file` - see `render::why_invocation`'s own
-            // doc comment), so there is nothing for the classifier to catch
-            // anything IN.
+            // `add_command`/`add_file`), so there is nothing for the
+            // classifier to catch anything IN.
             Some(HookOutput::Context { event_name, block, verdicts: Vec::new() })
         }
         _ => {
@@ -2307,7 +2294,7 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                 if !no_record {
                     serve::volume::record_showing(db_path, &session_id, &arranged.displayed_ids(), arranged.suppressed);
                 }
-                let rendered = render::render_text(&arranged.selection, &input, db_path);
+                let rendered = render::render_text(&arranged.selection, &input);
                 let block = match (sink_warning, rendered) {
                     (Some(warning), Some(rendered)) => Some(format!("{warning}\n\n{rendered}")),
                     (Some(warning), None) => Some(warning),
@@ -5505,7 +5492,7 @@ fn hook_output_json(output: HookOutput) -> Value {
         HookOutput::Context { event_name, block, verdicts } => serde_json::json!({
             "hookSpecificOutput": {
                 "hookEventName": event_name,
-                "additionalContext": block,
+                "additionalContext": render::within_hook_limit(&block),
             },
             "verdicts": verdicts,
         }),
@@ -5513,7 +5500,7 @@ fn hook_output_json(output: HookOutput) -> Value {
             "systemMessage": notice,
             "hookSpecificOutput": {
                 "hookEventName": event_name,
-                "additionalContext": block,
+                "additionalContext": render::within_hook_limit(&block),
             },
             "verdicts": verdicts,
         }),
@@ -5818,7 +5805,7 @@ fn cmd_check(db_path: &Path, input: &ServeInput, json: bool) {
     } else {
         println!("detected: {}", input.moments.iter().map(Action::as_str).collect::<Vec<_>>().join(", "));
     }
-    match render::render_text(&served.selection, input, db_path) {
+    match render::render_text(&served.selection, input) {
         Some(block) => println!("\n{}", mark_prohibitions(&block, &served.all, &served.selection.shown, command, None)),
         None => println!("\n(no item governs this)"),
     }
@@ -5899,9 +5886,9 @@ mod prose_marking_tests {
             ranked_command_item("p1", Some(Check::Forbidden { literals: vec!["--force".to_string()] })),
             ranked_command_item("a1", None),
         ];
-        let selection = render::Selection { shown: shown.clone(), withheld: 0 };
+        let selection = render::Selection { shown: shown.clone(), withheld: 0, withheld_ids: Vec::new() };
         let input = ServeInput { command: Some("git push --force origin main".to_string()), ..Default::default() };
-        let before = render::render_text(&selection, &input, Path::new("does-not-need-to-exist.db"))
+        let before = render::render_text(&selection, &input)
             .expect("fixture must render a block");
 
         let after = mark_prohibitions(&before, &shown, &shown, "git push --force origin main", None);
@@ -5923,9 +5910,9 @@ mod prose_marking_tests {
     #[test]
     fn a_block_with_no_prohibition_is_returned_unchanged() {
         let shown = vec![ranked_command_item("a1", None)];
-        let selection = render::Selection { shown: shown.clone(), withheld: 0 };
+        let selection = render::Selection { shown: shown.clone(), withheld: 0, withheld_ids: Vec::new() };
         let input = ServeInput { command: Some("git status".to_string()), ..Default::default() };
-        let before = render::render_text(&selection, &input, Path::new("does-not-need-to-exist.db")).unwrap();
+        let before = render::render_text(&selection, &input).unwrap();
 
         let after = mark_prohibitions(&before, &shown, &shown, "git status", None);
         assert_eq!(before, after, "nothing to mark means nothing added");
@@ -5951,12 +5938,12 @@ mod prose_marking_tests {
         );
         let mut all = heavier.clone();
         all.push(outranked.clone());
-        let selection = render::Selection { shown: heavier.clone(), withheld: 1 };
+        let selection = render::Selection { shown: heavier.clone(), withheld: 1, withheld_ids: vec!["held-back".to_string()] };
         // A command the fixtures' own anchor ("git push") reaches - see
         // `rows_stay_paired_with_the_right_item_across_several_at_once`.
         let command = "git push --no-verify origin main";
         let input = ServeInput { command: Some(command.to_string()), ..Default::default() };
-        let before = render::render_text(&selection, &input, Path::new("does-not-need-to-exist.db"))
+        let before = render::render_text(&selection, &input)
             .expect("fixture must render a block");
         assert!(
             !before.contains("skip-hooks-rule"),
@@ -6068,7 +6055,7 @@ fn cmd_prompt(db_path: &Path, text: &str) {
     let decay = DecayContext::load(&store);
     let all = serve::decay::retain_live(serve::rank::select(&candidates, &input), &decay);
     let selection = render::cap(all);
-    match render::render_text(&selection, &input, db_path) {
+    match render::render_text(&selection, &input) {
         Some(block) => println!("{block}"),
         None => println!("(no item governs this)"),
     }

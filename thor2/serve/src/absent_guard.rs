@@ -884,11 +884,17 @@ pub fn find_requires_violation(items: &[LiveItem], tool: &str, command: Option<&
 /// tripped it on its own pattern (`a_grep_for_the_trigger_text_is_never_
 /// refused` below reproduces this verbatim).
 ///
-/// The requirement side stays lenient on purpose: satisfied as soon as any
-/// of `required` appears ANYWHERE in the call's flattened input values, as a
-/// plain substring, never narrowed to the segment the trigger matched - a
-/// missed case here costs far less than a false refusal, the rule this whole
-/// project holds to throughout.
+/// THE REQUIREMENT IS LOOKED FOR IN THE TRIGGERED COMMAND ONLY (step 29). It
+/// used to be satisfied by any of `required` anywhere in the call's flattened
+/// input, and field 2026-10-02 showed the cost: `git log -- x.test.js && cd
+/// server && node --test | tail` passed the rule that wants `node --test` to
+/// carry a reporter, a timeout or a `.test.js` file, because the `.test.js`
+/// belonged to the `git log`. Now every segment the trigger reaches must carry
+/// one of `required` in its own unit (the command's text, its heredoc and its
+/// last `cd` - `shell::Segment::unit`); a different command on the same line
+/// answers nothing. A call with no command (an Agent or MCP call) is one
+/// segment whose unit is the whole input, as before. A rule that needs the
+/// OWNER's go is the exception: it reads the owner's own words, below.
 ///
 /// THE INNER TRIGGER (2026-09-26), the one case where `when` is read again.
 /// A trigger that names none of the item's bindings (`model::gate::
@@ -942,20 +948,25 @@ pub fn find_requires_violation_owned(
         let Some((when, required)) = requires_pair(check) else { continue };
         let anchors = command_bindings(&candidate.item);
         let inner = !model::gate::requires_trigger_names_a_binding(when, &candidate.item.bindings);
-        let hit = segments.iter().enumerate().find_map(|(i, segment)| {
-            if !in_scope(&candidate.item, scope, i) {
-                return None;
-            }
-            let anchor = anchors.iter().find(|a| crate::shell::anchor_reaches(a, segment))?;
-            if inner && !crate::shell::trigger_in_segment(segment, when) {
-                return None;
-            }
-            if crate::shell::is_pure_help_call(anchor, segment) {
-                return None;
-            }
-            Some(*anchor)
-        });
-        let Some(anchor) = hit else { continue };
+        let triggered: Vec<(&str, &crate::shell::Segment)> = segments
+            .iter()
+            .enumerate()
+            .filter_map(|(i, segment)| {
+                if !in_scope(&candidate.item, scope, i) {
+                    return None;
+                }
+                let anchor = anchors.iter().find(|a| crate::shell::anchor_reaches(a, segment))?;
+                if inner && !crate::shell::trigger_in_segment(segment, when) {
+                    return None;
+                }
+                if crate::shell::is_pure_help_call(anchor, segment) {
+                    return None;
+                }
+                Some((*anchor, segment))
+            })
+            .collect();
+        let Some(&(first_anchor, _)) = triggered.first() else { continue };
+        let mut anchor = first_anchor;
         if let (true, Some(owner)) = (model::store::is_owner_approval(&candidate.item), owner) {
             let trips = if inner { format!("{anchor:?} carrying {when:?}") } else { format!("{anchor:?}") };
             match said.get_or_init(owner) {
@@ -984,9 +995,14 @@ pub fn find_requires_violation_owned(
                 }
             }
         }
-        if required.iter().any(|r| content.contains(r.as_str())) {
-            continue;
-        }
+        let comments = shell_comments(content);
+        let unanswered = triggered.iter().find(|(_, segment)| {
+            !required.iter().any(|r| {
+                segment.unit.contains(r.as_str()) || segment.unit_words.contains(r.as_str()) || comments.contains(r.as_str())
+            })
+        });
+        let Some(&(unanswered_anchor, _)) = unanswered else { continue };
+        anchor = unanswered_anchor;
         let answers: Vec<String> = required.iter().map(|r| format!("{r:?}")).collect();
         let trips = if inner { format!("{anchor:?} carrying {when:?}") } else { format!("{anchor:?}") };
         reasons.push(format!(
@@ -998,6 +1014,32 @@ pub fn find_requires_violation_owned(
         ));
     }
     all_reasons(reasons)
+}
+
+/// The text of every shell comment in `content` (a `#` that starts a word,
+/// outside quotes, to the end of its line). The segments drop a comment, but a
+/// marker written there ("# go-owner") is part of the call's own line and keeps
+/// answering a requirement, as it always did.
+fn shell_comments(content: &str) -> String {
+    let mut out = String::new();
+    for line in content.lines() {
+        let mut quote: Option<char> = None;
+        let mut previous = ' ';
+        for (at, c) in line.char_indices() {
+            match (quote, c) {
+                (Some(q), c) if c == q => quote = None,
+                (None, '\'' | '"') => quote = Some(c),
+                (None, '#') if previous.is_whitespace() => {
+                    out.push_str(&line[at..]);
+                    out.push('\n');
+                    break;
+                }
+                _ => {}
+            }
+            previous = c;
+        }
+    }
+    out
 }
 
 /// Every rule one call trips, in ONE refusal (step 27). Field case 2026-10-01: an
@@ -2360,6 +2402,19 @@ pub fn record_stale_text(
         }
     }
     serde_json::to_string(&records).ok()
+}
+
+#[cfg(test)]
+mod comment_tests {
+    use super::shell_comments;
+
+    #[test]
+    fn a_comment_after_a_command_is_found_and_a_hash_in_a_quote_or_word_is_not() {
+        assert_eq!(shell_comments("ssh nas ls # go-owner 2026"), "# go-owner 2026\n");
+        assert_eq!(shell_comments("echo \"a # b\" && ls"), "");
+        assert_eq!(shell_comments("echo a#b"), "");
+        assert_eq!(shell_comments("git log -- x.test.js && node --test"), "");
+    }
 }
 
 #[cfg(test)]

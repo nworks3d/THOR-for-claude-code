@@ -3434,9 +3434,37 @@ pub fn attested_write_seqs(store: &EventStore) -> HashSet<i64> {
 /// never as the gate would have shaped it. It is a store of its own, in
 /// memory: nothing here can reach any store on disk.
 pub fn one_item_store(item: &Item) -> anyhow::Result<EventStore> {
+    one_item_store_among(item, &[])
+}
+
+/// `one_item_store`, in a world that also KNOWS the projects named in
+/// `others` (step 29). The hook sends a command run in the folder of another
+/// KNOWN project (`cd ../other && git push`) to that project's rules, so a
+/// rule of this project does not apply there; a store that holds one rule
+/// knows no other project, and a trial in it refused calls the live hook lets
+/// through (field 2026-10-02: 57 pushes made in two other repositories counted
+/// as refused by a rule of this project). Each other project is made known by
+/// one inert Report - it can never fire, it only makes the project known.
+pub fn one_item_store_among(item: &Item, others: &[String]) -> anyhow::Result<EventStore> {
     let mut store = EventStore::in_memory()?;
     let body = canonical_body(item)?;
     store.append_event("trial", "trial", "trial", EventKind::FactCreated, &item.id, None, &body)?;
+    for (n, project) in others.iter().enumerate() {
+        let known = Item {
+            id: format!("trial-known-project-{n}"),
+            kind: Kind::Report,
+            text: "a project this memory knows".to_string(),
+            bindings: vec![],
+            severity: None,
+            project: Some(project.clone()),
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: None,
+            check: None,
+        };
+        store.append_event("trial", "trial", "trial", EventKind::FactCreated, &known.id, None, &canonical_body(&known)?)?;
+    }
     Ok(store)
 }
 

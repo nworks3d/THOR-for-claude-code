@@ -1,8 +1,7 @@
 //! `why`'s argument parsing (`TargetArgs` in `bin/serve.rs`), proven end to
 //! end against the real compiled `serve` binary: the bare positional path is
-//! `--file`'s own shorthand, and the withheld-item hint
-//! (`render::render_text`, built by `render::why_invocation`) names a flag
-//! this parser genuinely accepts - not merely plausible-looking text.
+//! `--file`'s own shorthand, and the withheld-item line
+//! (`render::render_text`) names ids that `why` really lists.
 //!
 //! THE DEFECT THIS PREVENTS. The withheld-item hint used to read
 //! "run `serve why`" with nothing after it - not a flag `why`'s own parser
@@ -134,27 +133,23 @@ fn giving_both_the_positional_and_the_file_flag_is_refused() {
     assert!(!out.stderr.is_empty(), "the refusal must be explained: {out:?}");
 }
 
-/// THE FULL LOOP, past what a unit test can prove: not just that the hint's
-/// own text NAMES `--file` (`render`'s own test module proves that in
-/// isolation), but that running exactly what it says reproduces the SAME
-/// items `check` already knew were being withheld - the flag is a genuinely
-/// working invocation, not merely plausible-looking text.
+/// THE FULL LOOP (step 29): the block that withheld items names their ids, in
+/// the real binary, and `why` lists exactly those items - the ids are real, not
+/// plausible-looking text. (The block used to name a command to run, built from
+/// the whole tool call; it now names ids.)
 ///
 /// Triggered through a `.env`-shaped path (`intent::from_path`'s own
-/// Credentials rule, "(^|/)\.env(\.|$)") rather than a Path-target anchor:
-/// the fixture rules are Moment-bound (see `declare_moment_rule`'s own doc
-/// comment for why), so what actually seats them is the Credentials moment
-/// `--file app/.env` derives - `render::why_invocation` still names `--file`
-/// in the hint regardless, because it reads what was ASKED
-/// (`ServeInput::file`), never how each item happened to match.
+/// Credentials rule, "(^|/)\.env(\.|$)") rather than a Path-target anchor: the
+/// fixture rules are Moment-bound (see `declare_moment_rule`'s own doc comment
+/// for why).
 #[test]
-fn the_flag_named_in_the_withheld_hint_actually_reproduces_the_withheld_items() {
+fn the_ids_named_in_the_withheld_line_are_the_items_why_lists() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("store.db");
     {
         let mut store = EventStore::new(&db).unwrap();
         // One more than MAX_ITEMS (4), so the moment-of-action preview
-        // (`check`) withholds at least one and prints the hint this proves.
+        // (`check`) withholds at least one.
         for (i, text) in DISTINCT_TEXTS.iter().enumerate() {
             declare_moment_rule(&mut store, &format!("rule-{i}"), text, Action::Credentials);
         }
@@ -170,29 +165,17 @@ fn the_flag_named_in_the_withheld_hint_actually_reproduces_the_withheld_items() 
         .expect("spawn serve check");
     assert!(check_out.status.success());
     let check_text = String::from_utf8(check_out.stdout).unwrap();
-    assert!(
-        check_text.contains("why --file \"app/.env\"` to see them"),
-        "expected the exact working invocation in the hint: {check_text}"
-    );
-    // THE DEFECT THIS PREVENTS, reported 2026-09-12: the hint named the
-    // right flag but still opened with the bare word `serve`, which is
-    // never on PATH for this deployment - following it verbatim answered
-    // "command not found" on every machine, this one included. The real
-    // compiled binary must now name ITS OWN absolute path (exactly the path
-    // this test used to spawn it, `CARGO_BIN_EXE_serve`, since
-    // `std::env::current_exe` inside that spawned process resolves to the
-    // same path it was launched from) and the exact `--db` it was opened
-    // with - not a unit-level plausible string, the real running program's
-    // own answer.
-    let expected_self_invocation = if cfg!(windows) {
-        format!("& \"{}\" --db \"{}\" why --file \"app/.env\"", env!("CARGO_BIN_EXE_serve"), db.display())
-    } else {
-        format!("\"{}\" --db \"{}\" why --file \"app/.env\"", env!("CARGO_BIN_EXE_serve"), db.display())
-    };
-    assert!(
-        check_text.contains(&expected_self_invocation),
-        "expected the real binary's own absolute path and its real --db in the hint: {check_text}"
-    );
+    let line = check_text
+        .lines()
+        .find(|l| l.contains("more item(s) apply here"))
+        .unwrap_or_else(|| panic!("expected the withheld line: {check_text}"));
+    assert!(!line.contains("serve.exe") && !line.contains(" why "), "the line must not be a command: {line}");
+    let hidden: Vec<String> = (0..5)
+        .map(|i| format!("rule-{i}"))
+        .filter(|id| !check_text.lines().any(|l| l.starts_with("- [") && l.contains(&format!("[{id}]"))))
+        .collect();
+    assert_eq!(hidden.len(), 1, "one of five is withheld: {check_text}");
+    assert!(line.contains(&hidden[0]), "the line must name the hidden id {}: {line}", hidden[0]);
 
     let why_out = run_why(&db, &["--file", "app/.env"]);
     assert!(why_out.status.success());

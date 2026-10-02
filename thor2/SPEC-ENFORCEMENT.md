@@ -442,7 +442,7 @@ alone. Only a new valid evaluation resets the clocks.
 The ask rides with every block that holds a first-pass `Stop` before its own
 turn - the Response Guard, setup, the capture check, the crowding question - in
 the same block after that reason, so none of them starves it; the `Stop` is
-counted once, before any verdict. Since step 28 (2.5.6) no `Stop` holds a turn
+counted once, before any verdict. Since step 28 (2.5) no `Stop` holds a turn
 for the teeth question (rules with no current verdict from THOR's trial) or for
 the judgement debt: both are asked inside the evaluation (its batch, its A4 list
 and its frozen judgement list), at most once per 16 hours per project. The

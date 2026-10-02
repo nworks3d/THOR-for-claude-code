@@ -949,13 +949,29 @@ fn an_old_full_place_point_still_held_is_reworded_at_the_next_session_start() {
     let text_of = |fx: &Fx| model::store::open_points(&fx.store, Some("alpha")).into_iter().find(|p| p.id == id).map(|p| p.text);
     assert!(text_of(&fx).unwrap().contains("owner decides which fact gives way"));
 
-    let done = refresh_old_anchor_full_points(&mut fx.store, S2, "alpha");
+    let done = refresh_old_anchor_full_points(&mut fx.store, "alpha");
     assert_eq!(done, vec![id.clone()]);
     let text = text_of(&fx).expect("still open: every occupant is a heavier guard");
     assert!(!text.contains("owner decides"), "{text}");
     assert!(text.contains("no fact there honestly gives way") && text.contains("'plan-here'"), "{text}");
 
-    assert!(refresh_old_anchor_full_points(&mut fx.store, S2, "alpha").is_empty(), "nothing left to judge the second time");
+    assert!(refresh_old_anchor_full_points(&mut fx.store, "alpha").is_empty(), "nothing left to judge the second time");
+}
+
+#[test]
+fn the_housekeeping_at_a_session_start_carries_no_sessions_id() {
+    let mut fx = Fx::new();
+    let (id, _) = old_anchor_full_point(&mut fx);
+    let before = fx.store.get_all_events().unwrap().len();
+    let done = refresh_old_anchor_full_points(&mut fx.store, "alpha");
+    assert_eq!(done, vec![id]);
+    let events = fx.store.get_all_events().unwrap();
+    assert!(events.len() > before, "the refresh must have written");
+    for event in &events[before..] {
+        assert_eq!(event.session_id, MACHINE_SESSION, "seq {} carries a session's id", event.seq);
+        assert_ne!(event.session_id, S2);
+        assert_eq!(event.actor, "eval-machine");
+    }
 }
 
 #[test]
@@ -964,7 +980,7 @@ fn an_old_full_place_point_whose_place_has_room_is_closed_at_the_next_session_st
     let (id, _) = old_anchor_full_point(&mut fx);
     model::store::retract(&mut fx.store, "s", "l", "a", "plan-guard-d", "fixture: folded into 'plan-guard-a' about files/PLAN.md", None).unwrap();
 
-    let done = refresh_old_anchor_full_points(&mut fx.store, S2, "alpha");
+    let done = refresh_old_anchor_full_points(&mut fx.store, "alpha");
     assert_eq!(done, vec![id.clone()]);
     assert!(!model::store::open_points(&fx.store, Some("alpha")).iter().any(|p| p.id == id), "closed: the place has room again");
 }
@@ -975,6 +991,6 @@ fn a_point_written_by_this_build_is_left_alone() {
     let (id, blocker) = old_anchor_full_point(&mut fx);
     let fresh = "THOR's own open point: files/PLAN.md holds heavier guards; no fact there honestly gives way.";
     model::store::write_machine_point(&mut fx.store, eval_machine(), S1, "alpha", &blocker, fresh).unwrap();
-    assert!(refresh_old_anchor_full_points(&mut fx.store, S2, "alpha").is_empty());
+    assert!(refresh_old_anchor_full_points(&mut fx.store, "alpha").is_empty());
     assert!(model::store::open_points(&fx.store, Some("alpha")).iter().any(|p| p.id == id && p.text == fresh));
 }

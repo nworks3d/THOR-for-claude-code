@@ -73,8 +73,12 @@ fn a_trigger_glued_to_the_port_inside_a_url_is_caught_by_the_live_guard() {
     let db = fixture(dir.path(), "curl");
     let out = run_bash(&db, dir.path(), "curl -s http://10.0.0.5:3002/health");
     assert!(blocked(&out), "the real call carries /health inside its URL: {out}");
+    let out = run_bash(&db, dir.path(), "curl -s http://10.0.0.5:3002/health -H 'X-Proof: docker inspect app'");
+    assert!(!blocked(&out), "the call that carries the start time itself passes: {out}");
+    // Step 29: the answer must sit in the command that trips the rule, not in
+    // another command of the same line.
     let out = run_bash(&db, dir.path(), "curl -s http://10.0.0.5:3002/health && docker inspect app");
-    assert!(!blocked(&out), "the call that also reads the start time passes: {out}");
+    assert!(blocked(&out), "a different command on the same line is no answer: {out}");
 }
 
 #[test]

@@ -208,15 +208,12 @@ const EVAL_COMMAND_TEMPLATE: &str = include_str!("../../eval-command.example.md"
 /// so it is always invoked by its full path next to the other binaries.
 ///
 /// Windows gets PowerShell's own call-operator form, because a quoted path
-/// alone is a call EXPRESSION there, not a command - the identical defect
-/// `serve::render::render_self_invocation` exists to fix for `why`, and the
-/// identical fix. Every other platform gets a plain quoted path, which a
+/// alone is a call EXPRESSION there, not a command. Every other platform gets a plain quoted path, which a
 /// POSIX shell already runs as a command with no operator needed, and no
 /// `.exe` suffix, which is a Windows-only convention.
 ///
 /// `windows` is a parameter rather than this function reading `cfg!(windows)`
-/// itself, for the same reason `render_self_invocation` takes it as one:
-/// `cfg!` bakes into whichever platform compiled the test binary, so a suite
+/// itself: `cfg!` bakes into whichever platform compiled the test binary, so a suite
 /// built on one platform could otherwise never prove the other form was even
 /// reachable. `render_eval_command` passes the real `cfg!(windows)` at its
 /// own call site, so production behaviour is unchanged; only the test's
