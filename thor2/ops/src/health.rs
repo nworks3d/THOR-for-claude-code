@@ -1945,8 +1945,10 @@ pub fn wal_line(db: &Path) -> Option<String> {
 ///   beside the plan's starting line, and the share owing only the A4 naming
 ///   fix with its drain estimate; each named as `undecided`, with the reason;
 /// - the VERDICTS: proven, wired, notes (by dispute, with a pending check),
-///   rules kept by `accept_refusing`, wired rules whose literal no real call
-///   ever carried, and the blocked ones per project and blocker;
+///   rules kept by `accept_refusing`, wired forbidden rules whose literal no
+///   real call ever carried and that no real session was ever refused by (a
+///   requires check has no literal to carry, so it is never counted), and the
+///   blocked ones per project and blocker;
 /// - FIELD EVIDENCE: rules holding a field refusal, beside the ones passing
 ///   only its structural part, and every refusal that does not count, sorted
 ///   by why (not a Claude Code session, no matching tool call, no tool call
@@ -2034,6 +2036,10 @@ pub fn teeth_line(db: &Path, full: bool) -> String {
                 ));
             }
         }
+        // A real session's hook refused a call under this check (the
+        // structural part of field evidence): the rule bites, whatever the
+        // call corpus holds.
+        let mut really_refused = false;
         if li.item.check.is_some() && refused_ids.contains(li.id.as_str()) {
             if !serve::attest::field_refusals(&store, &li.id, &li.item).is_empty() {
                 field_rules += 1;
@@ -2050,6 +2056,7 @@ pub fn teeth_line(db: &Path, full: bool) -> String {
                 });
                 if structural {
                     structural_rules += 1;
+                    really_refused = true;
                 }
             }
         }
@@ -2083,9 +2090,13 @@ pub fn teeth_line(db: &Path, full: bool) -> String {
                 if let Some(mark) = fields.and_then(|f| f.a4_old_stock.as_ref()) {
                     old_stock.push(Rot { id: li.id.clone(), project: project.clone(), what: mark.describe() });
                 }
-                let command_check =
-                    matches!(li.item.check, Some(model::item::Check::Forbidden { .. } | model::item::Check::Requires { .. }));
-                if !proven && command_check && fields.is_some_and(|f| f.corpus.whole_hits == 0) {
+                // Only a forbidden check has a literal to carry: a requires
+                // check's trial never counts one (`whole_hits` is 0 by
+                // construction), and a rule a real session was refused by is
+                // not one nothing ever carried - the call corpus drops the
+                // calls that were refused.
+                let forbidden_check = matches!(li.item.check, Some(model::item::Check::Forbidden { .. }));
+                if !proven && forbidden_check && !really_refused && fields.is_some_and(|f| f.corpus.whole_hits == 0) {
                     unseen.push(Rot { id: li.id.clone(), project: project.clone(), what: check_desc.clone() });
                 }
             }
@@ -2140,8 +2151,8 @@ pub fn teeth_line(db: &Path, full: bool) -> String {
     let blocked_n: usize = blocked.values().map(Vec::len).sum();
     out.push(format!(
         "teeth verdicts: {proven_n} proven and {wired_n} wired on the rule track; {notes_n} note(s), {} of them by \
-         dispute and {pending_n} with a pending check; {} rule(s) kept by accept_refusing; {} wired rule(s) whose \
-         literal no real call on record ever carried; {blocked_n} blocked, held until their blocker lifts",
+         dispute and {pending_n} with a pending check; {} rule(s) kept by accept_refusing; {} wired forbidden rule(s) \
+         whose literal no real call on record ever carried and that never refused one; {blocked_n} blocked, held until their blocker lifts",
         by_dispute.len(),
         accepted.len(),
         unseen.len()
@@ -5061,6 +5072,52 @@ mod tests {
         assert!(line.contains("teeth verdicts: 0 proven and 0 wired on the rule track; 1 note(s)"), "{line}");
         assert!(line.contains("  undecided: rewritten [global] its text changed after its last trial"), "{line}");
         assert!(!line.contains("honest_no"), "{line}");
+    }
+
+    /// The "wired, literal never seen" count (measured 2026-10-03: 70 listed,
+    /// 29 of them requires rules whose trial can never count a literal, and 35
+    /// that a real session had been refused by - the call corpus drops refused
+    /// calls). It now names only a forbidden rule whose literal no call carried
+    /// and that no real session was refused by.
+    #[test]
+    fn teeth_line_never_seen_counts_only_forbidden_rules_that_never_refused_a_real_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let session = "0de7dc52-1b97-4b66-948f-61e4438043b2";
+        {
+            let mut s = EventStore::new(&db).unwrap();
+            let on = |item: &mut Item, command: &str| {
+                item.bindings = vec![model::item::Binding::Target {
+                    kind: model::item::TargetKind::Command,
+                    value: command.to_string(),
+                }];
+            };
+            let mut quiet = rule("ban-quiet");
+            quiet.text = "never run deploy-zz with --zz-quiet".to_string();
+            on(&mut quiet, "deploy-zz");
+            quiet.check = Some(model::item::Check::Forbidden { literals: vec!["--zz-quiet".to_string()] });
+            let mut bitten = rule("ban-bitten");
+            bitten.text = "never run ship-zz with --zz-bitten".to_string();
+            on(&mut bitten, "ship-zz");
+            bitten.check = Some(model::item::Check::Forbidden { literals: vec!["--zz-bitten".to_string()] });
+            let mut asks = rule("requires-quiet");
+            asks.text = "pack-zz must carry --zz-asked".to_string();
+            on(&mut asks, "pack-zz");
+            asks.check = Some(model::item::Check::Requires { when: "pack-zz".to_string(), required: vec!["--zz-asked".to_string()] });
+            for item in [&quiet, &bitten, &asks] {
+                legacy_declare(&mut s, item);
+                serve::teeth::fixture::decide(&mut s, &item.id);
+            }
+            // A real session's hook refused a call under `ban-bitten`.
+            serve::deliver::record_delivery(&mut s, session, "l", "hook", "2026-10-02T00:00:00Z", &["ban-bitten".to_string()]);
+            serve::deliver::record_gate_outcome_for_call(&mut s, session, "l", "hook", "2026-10-02T00:00:01Z", true, "ban-bitten", "ship-zz --zz-bitten", Some("toolu_x"));
+        }
+        let line = teeth_line(&db, true);
+        assert!(line.contains("3 wired on the rule track"), "{line}");
+        assert!(line.contains("; 1 wired forbidden rule(s) whose literal no real call on record ever carried and that never refused one;"), "{line}");
+        assert!(line.contains("wired, literal never seen") && line.contains("ban-quiet"), "{line}");
+        let named = line.lines().find(|l| l.contains("wired, literal never seen")).unwrap_or_default();
+        assert!(!named.contains("ban-bitten") && !named.contains("requires-quiet"), "{line}");
     }
 
     /// Step 9: rules settled only by a machine blocker are listed per project

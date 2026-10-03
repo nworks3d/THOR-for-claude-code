@@ -1021,3 +1021,93 @@ fn a_deep_directory_stack_never_crashes_the_reader() {
     let cmd = format!("{}docker exec acme-prod node -e 1", "pushd /x; ".repeat(300_000));
     assert!(fb(&["docker exec"], PROD, &cmd).1);
 }
+
+// ------------------------------------------------ PowerShell paren groups
+
+/// Whether a requires rule on `Start-Process` refuses `cmd`, a PowerShell
+/// call, for want of one of `req`.
+fn ps_requires_refuses(req: &[&str], cmd: &str) -> bool {
+    let items = rule(&["Start-Process"], Check::Requires { when: "Start-Process".to_string(), required: s(req) });
+    absent_guard::find_requires_violation(&items, "PowerShell", Some(cmd), cmd).is_some()
+}
+
+fn ps_words(cmd: &str) -> Vec<String> {
+    segments(cmd, Dialect::PowerShell).into_iter().map(|g| g.words.join(" ")).collect()
+}
+
+/// The measured false refusal (2026-10-03, 33 and 35 of 289 real
+/// `Start-Process` calls): the `)` that closed `@( ... )` ended the command,
+/// so the flags after the array stood in another segment and two rules that
+/// require them refused a call that carries exactly what they ask for.
+#[test]
+fn a_flag_after_a_powershell_array_is_still_a_flag_of_its_command() {
+    let hidden = &["-WindowStyle", "-NoNewWindow"];
+    let wait = &["-Wait"];
+    for cmd in [
+        "Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile','-File','x.ps1') -WindowStyle Hidden -Wait",
+        "Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile', '-File', 'x.ps1') -WindowStyle Hidden -Wait",
+        "Start-Process -FilePath powershell.exe -ArgumentList @( '-File', 'x.ps1' ) -WindowStyle Hidden -Wait",
+        "Start-Process -WindowStyle Hidden -Wait -FilePath powershell.exe -ArgumentList @('-File','x.ps1')",
+        "Start-Process -FilePath p.exe -ArgumentList \"-File x.ps1\" -WindowStyle Hidden -Wait",
+        "Start-Process -FilePath p.exe -ArgumentList \"a $(Get-Date -Format yyyy)\" -WindowStyle Hidden -Wait",
+        "Start-Process -FilePath p.exe -ArgumentList $(Get-Item a | Where-Object { $_ } ) -WindowStyle Hidden -Wait",
+        "Start-Process -FilePath p.exe -ArgumentList @(Get-ChildItem | ForEach-Object { $_.Name }) -WindowStyle Hidden -Wait",
+        "Start-Process -FilePath p.exe -ArgumentList $args.Join(',') -WindowStyle Hidden -Wait",
+        "Start-Process -FilePath p.exe -ArgumentList @('a', @('b', ('c' + 'd'))) -WindowStyle Hidden -Wait",
+        "Start-Process -FilePath p.exe -ArgumentList @('a)b', \"c(d\", 'e') -WindowStyle Hidden -Wait",
+        "Start-Process -FilePath p.exe -ArgumentList $($x.Trim()) -WindowStyle Hidden -Wait",
+        "$p = Start-Process -FilePath p.exe -ArgumentList @('a') -NoNewWindow -Wait -PassThru",
+    ] {
+        let has_hidden = cmd.contains("-WindowStyle") || cmd.contains("-NoNewWindow");
+        assert_eq!(ps_requires_refuses(hidden, cmd), !has_hidden, "-WindowStyle rule: {cmd}");
+        assert!(!ps_requires_refuses(wait, cmd), "-Wait rule: {cmd}");
+    }
+}
+
+/// The other side of it: a flag that is not on the command is still missing,
+/// whether the array is there or not, and a flag after a real `;` or a real
+/// `( ... )` group belongs to another command.
+#[test]
+fn a_missing_flag_is_still_refused_with_an_array_in_the_call() {
+    for cmd in [
+        "Start-Process -FilePath p.exe -ArgumentList @('-File','x.ps1')",
+        "Start-Process -FilePath p.exe -ArgumentList @('-File','x.ps1'); Get-Item x -Wait",
+        "Start-Process -FilePath p.exe -ArgumentList $a.Join(',')",
+        "Start-Process -FilePath p.exe; (Get-Item x; Get-Item y) -Wait",
+    ] {
+        assert!(ps_requires_refuses(&["-Wait"], cmd), "must be refused: {cmd}");
+    }
+}
+
+/// A group in a word is part of the word, a group that starts a statement is
+/// still a group of its own, and what a group runs is still read.
+#[test]
+fn a_powershell_paren_group_is_a_word_only_when_a_word_is_open() {
+    assert_eq!(ps_words("(Get-Foo; Get-Bar) -Wait"), ["Get-Foo", "Get-Bar", "-Wait"]);
+    assert_eq!(ps_words("Start-Process p @('a','b') -Wait"), ["Start-Process p @('a','b') -Wait", "a,b"]);
+    let nested = ps_words("Start-Process p -ArgumentList @('a', ('b')) -Wait");
+    assert_eq!(nested[0], "Start-Process p -ArgumentList @('a', ('b')) -Wait", "{nested:?}");
+    // What the group runs is its own segment, so a rule on it still reaches it.
+    for cmd in [
+        "Write-Host @(docker exec acme-prod node -e 1) -Wait",
+        "Write-Host x.Add(docker exec acme-prod node -e 1) -Wait",
+        "Start-Process p -ArgumentList @('a', $(docker exec acme-prod node -e 1)) -Wait",
+    ] {
+        assert!(fb_ps(&["docker exec"], PROD, cmd).1, "must be refused: {cmd}");
+    }
+    // Bash is untouched: there a `)` always ends the command.
+    let sh: Vec<String> = segments("echo a (b) -Wait", Dialect::Sh).into_iter().map(|g| g.words.join(" ")).collect();
+    assert_eq!(sh, ["echo a", "b", "-Wait"], "{sh:?}");
+}
+
+/// A deep nest of word-attached groups is read to the depth cap and then
+/// counted, like `$(`: never a crash, and the command beside it still read.
+#[test]
+fn a_deep_nest_of_powershell_word_groups_never_crashes() {
+    let bad = "docker exec acme-prod node -e 1";
+    let n = 20_000;
+    let nest = format!("x {}{}", "f(".repeat(n), ")".repeat(n));
+    for cmd in [format!("{bad}; {nest}"), format!("{nest}; {bad}")] {
+        assert!(fb_ps(&["docker exec"], PROD, &cmd).1, "must be refused: {} bytes", cmd.len());
+    }
+}

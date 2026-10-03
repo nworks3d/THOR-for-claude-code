@@ -1781,6 +1781,20 @@ impl<'a> Scanner<'a> {
         self.expansion(at, close + 1, vec![(at + 1, close)]);
     }
 
+    /// PowerShell only: a `(` that follows a character of the current word
+    /// (`@(...)`, `$x.Add(1)`, `f(x)`), at `i`. Like `$(`, the group is part
+    /// of the word and its commands are kept to be read, so the `)` that
+    /// closes it never ends the command: `Start-Process p -ArgumentList
+    /// @('-File','x.ps1') -WindowStyle Hidden -Wait` is one command, with the
+    /// two flags after the array still its own. A `(` with no word open
+    /// (`(cmd1; cmd2)`, `if (...)`) still opens a group of its own.
+    fn paren_in_word(&mut self) {
+        let at = self.i;
+        let close = self.closing_paren(at + 1);
+        let keep = if self.stop_on_close { Vec::new() } else { vec![(at + 1, close)] };
+        self.expansion(at, close + 1, keep);
+    }
+
     /// sh `$'...'` at `i`: a quoted word in which a backslash escapes any
     /// character, a quote included. Read as two plain quotes, `$'a\'b'` would
     /// open a string that is not there and hide the commands after it.
@@ -2151,6 +2165,7 @@ impl<'a> Scanner<'a> {
                     self.i += 1;
                 }
                 '(' if sh && !self.word_open && self.ch(i + 1) == Some('(') && self.arithmetic_command() => {}
+                '(' if ps && self.word_open => self.paren_in_word(),
                 '(' if !self.word_open => {
                     self.paren_depth += 1;
                     self.cut(i, i + 1, Sep::Open);
