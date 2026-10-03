@@ -324,8 +324,9 @@ pub fn served_tool_tails() -> Vec<String> {
     ThorMcpServer::tool_router().list_all().iter().map(|t| t.name.to_string()).collect()
 }
 
-/// A note for every NEW command anchor of a write that no real call can reach
-/// (`serve::dead_anchor`): the rule is stored, and it will probably never fire.
+/// A note for every NEW command anchor of a write that has never fired and that
+/// no call can reach (`serve::dead_anchor`): the rule is stored, and as a command
+/// the anchor only matches calls that start with it.
 /// Never a refusal - a rule that waits for a tool or program that does not
 /// exist yet is legitimate. A revise is asked only about the anchors it adds.
 fn unreachable_anchor_notes(
@@ -351,8 +352,8 @@ fn unreachable_anchor_notes(
         .filter_map(|anchor| {
             judge.judge(anchor).map(|reason| {
                 format!(
-                    "the command anchor '{anchor}' can probably never fire ({}): {}. To fix it: {}. Nothing was refused - a \
-                     rule that waits for a program or tool that does not exist yet is legitimate.",
+                    "the command anchor '{anchor}' has never fired, and no call can reach it ({}): {}. What to do: {}. \
+                     Nothing was refused - a rule that waits for a program, a tool or a phrase the owner will type is legitimate.",
                     reason.class(),
                     reason.why(anchor),
                     reason.fix(anchor)
@@ -4433,7 +4434,7 @@ mod tests {
     }
 
     fn anchor_note(reply: &str) -> Option<&str> {
-        reply.lines().find(|l| l.contains("can probably never fire"))
+        reply.lines().find(|l| l.contains("has never fired"))
     }
 
     #[tokio::test]
@@ -4454,7 +4455,7 @@ mod tests {
         assert!(reply.starts_with("stored "), "{reply}");
         let note = anchor_note(&reply).unwrap_or_else(|| panic!("no note about the anchor: {reply}"));
         assert!(note.contains("never reached, not a program here"), "{note}");
-        assert!(note.contains("program word first"), "the fix is named: {note}");
+        assert!(note.contains("if it is a command") && note.contains("owner's prompt contains it"), "the fix and what the anchor does match are named: {note}");
     }
 
     #[tokio::test]
@@ -4487,6 +4488,26 @@ mod tests {
         let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(remembered_on_command("fired-1", "geankerd feit"))).await;
         assert!(reply.starts_with("stored "), "{reply}");
         assert!(anchor_note(&reply).is_none(), "a real call reached it: {reply}");
+    }
+
+    #[tokio::test]
+    async fn an_anchor_the_owners_prompt_fired_before_gets_no_note() {
+        let srv = server();
+        {
+            let mut store = srv.store.lock().unwrap();
+            serve::deliver::record_delivery_with_trigger(
+                &mut store,
+                "0de7dc52-1b97-4b66-948f-61e4438043b2",
+                "0de7dc52-1b97-4b66-948f-61e4438043b2",
+                "hook",
+                "2026-09-28T00:00:00Z",
+                &["somewhere".to_string()],
+                Some("(prompt) geankerd feit"),
+            );
+        }
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(remembered_on_command("prompted-1", "Geankerd Feit"))).await;
+        assert!(reply.starts_with("stored "), "{reply}");
+        assert!(anchor_note(&reply).is_none(), "the owner's prompt fired it: {reply}");
     }
 
     #[tokio::test]

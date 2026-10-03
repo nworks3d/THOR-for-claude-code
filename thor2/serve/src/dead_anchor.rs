@@ -1,24 +1,33 @@
-//! Command anchors that nothing real can reach.
+//! Command anchors that never fired, and why a call cannot reach them.
 //!
 //! WHY THIS EXISTS. A Rule or Orientation bound to a Target of kind `command`
-//! is served only when a real call's simple command starts with the anchor
-//! (`shell::anchor_reaches`), or - for a call that is not a shell command - when
-//! the call's WHOLE tool name equals it (`mcp__thor__remember`, `Agent`). An
-//! anchor that is a stored sentence ("Raspberry Pi 5"), a tool's short name
-//! ("remember"), a fragment without its program ("push --all") or a program that
-//! is gone ("thor.exe import") can never be reached, so its rule never fires
-//! and nothing says so. A field review of one store found about 205 such items.
-//! `doctor` counts them (`dead command anchors`) and the write gate says so in a
-//! note when a new anchor is of this kind (never a refusal: a rule waiting for a
-//! tool that does not exist yet is legitimate).
+//! fires on two surfaces. At a real call it fires only when a call's simple
+//! command STARTS with the anchor (`shell::anchor_reaches`), or - for a call
+//! that is not a shell command - when the call's WHOLE tool name equals it
+//! (`mcp__thor__remember`, `Agent`). At the owner's own prompt it fires when
+//! the prompt contains the anchor's last word or phrase (`prompt::names_target`),
+//! so an anchor written as a keyword ("Raspberry Pi 5", "remember") is not dead
+//! by itself: it fires when the owner types it. What no call can ever reach is
+//! an anchor that is a stored sentence, a tool's short name, a fragment without
+//! its program ("push --all") or a program that is gone ("thor.exe import") -
+//! and when the owner never types it either, the rule never fires and nothing
+//! says so. A field review of one store found about 205 such items, and a
+//! second look found that 33 of 37 global prose anchors DID fire when their
+//! phrase was typed: so this module only ever says "never fired", never "dead".
+//! `doctor` counts them (`command anchors never fired`) and the write gate says
+//! so in a note when a new anchor is of this kind (never a refusal: a rule
+//! waiting for a tool that does not exist yet, or for a phrase the owner will
+//! type, is legitimate).
 //!
 //! HOW AN ANCHOR IS JUDGED, in this order, stopping at the first that holds.
 //! Nothing here guesses; every verdict names the fact it stands on.
-//! 1. REACHED BEFORE. Some real call in the log (`legit::Corpus`, the calls a
-//!    rule was served on, refused ones included) was reached by the anchor, by
-//!    the live matcher itself (`shell::reaches_any`): reachable, whatever the
-//!    rest says. The named limit is the corpus's own: only a call that fired some
-//!    rule is in the log at all.
+//! 1. FIRED BEFORE, on either surface. Some real call in the log
+//!    (`legit::Corpus`, the calls a rule was served on, refused ones included)
+//!    was reached by the anchor, by the live matcher itself
+//!    (`shell::reaches_any`); or some item was ever served by the owner's own
+//!    prompt on the anchor's phrase (the `(prompt) word` place a prompt firing
+//!    records). Either one: not judged. The named limit is the log's own: only
+//!    a call or prompt that fired some rule is in it at all.
 //! 2. NOT DECIDABLE, so not judged: an anchor that is more than one simple
 //!    command, or whose first word is a path (`./x.sh`, `C:\x\y.exe`), a `~` or
 //!    a `$` - what they name depends on a folder or a variable no reader here
@@ -26,20 +35,22 @@
 //! 3. STARTS WITH A FLAG (`-f x`): a call starts with its program, never a flag.
 //! 4. BARE TOOL NAME: one word, equal to the short name of a tool THOR itself
 //!    serves (`remember`, `shelve`), and not a program here. A tool call offers
-//!    its whole name, so the short one never equals it.
-//! 5. A PROGRAM HERE, so reachable and not judged: the first word is an
-//!    executable on PATH or in the folders given (the store's `bin`), a
+//!    its whole name, so the short one matches no tool call; it still fires
+//!    when the owner's prompt contains the word.
+//! 5. A PROGRAM HERE, so a call can reach it and not judged: the first word is
+//!    an executable on PATH or in the folders given (the store's `bin`), a
 //!    PowerShell cmdlet by shape (an approved verb, a hyphen, a noun), a shell
 //!    builtin or alias, the name of a tool the hook sees (`mcp__...`, or one
 //!    capitalised word such as `Agent`), or the program of some real call in the
 //!    log - which is how a command that lives only on another machine (`docker`
 //!    over ssh) is recognised without claiming it exists here.
-//! 6. FRAGMENT OF A LONGER COMMAND: the anchor's words stand, as a run, inside a
-//!    real call after another word (`push --all` inside `git push --all`). The
-//!    program is named - derived from a recorded call, never from a list.
-//! 7. Otherwise NEVER REACHED AND NOT A PROGRAM HERE: no real call reached it and
-//!    its first word is not a program here. This does NOT claim the command does
-//!    not exist anywhere: it may live on another machine.
+//! 6. FRAGMENT OF A LONGER COMMAND: the anchor's words stand, right after a
+//!    program (or after its flags), in a real call (`push --all` in `git push
+//!    --all`). The program is named - derived from a recorded call, never from
+//!    a list.
+//! 7. Otherwise NEVER REACHED AND NOT A PROGRAM HERE: no real call started with
+//!    it and its first word is not a program here. This does NOT claim the
+//!    command does not exist anywhere: it may live on another machine.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -47,7 +58,7 @@ use std::path::{Path, PathBuf};
 use crate::legit::Corpus;
 use crate::shell::{self, Dialect, Segment};
 
-/// Why an anchor cannot be reached.
+/// Why a call cannot reach an anchor that has never fired.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reason {
     /// One word, the short name of a tool THOR serves.
@@ -56,7 +67,7 @@ pub enum Reason {
     FlagFirst,
     /// The anchor's words stand after `program` in a real call.
     Fragment { program: String, call: String },
-    /// No real call reached it and its first word is not a program here.
+    /// No real call started with it and its first word is not a program here.
     NeverReached { first: String },
 }
 
@@ -74,34 +85,39 @@ impl Reason {
     /// The class and the one-line fix, for a list.
     pub fn short(&self) -> String {
         match self {
-            Reason::BareToolName { tail } => format!("{}: bind mcp__thor__{tail}", self.class()),
-            Reason::FlagFirst => format!("{}: put the program word first", self.class()),
-            Reason::Fragment { program, .. } => format!("{}: start it with '{program}'", self.class()),
-            Reason::NeverReached { first } => format!("{}: '{first}' was never run by a real call", self.class()),
+            Reason::BareToolName { tail } => format!("{}: as a command bind mcp__thor__{tail}", self.class()),
+            Reason::FlagFirst => format!("{}: as a command put the program word first", self.class()),
+            Reason::Fragment { program, .. } => format!("{}: as a command start it with '{program}'", self.class()),
+            Reason::NeverReached { first } => format!("{}: no real call started with '{first}'", self.class()),
         }
     }
 
-    /// What is wrong, in plain words.
+    /// Why no call can reach it, in plain words. Always says what the anchor
+    /// does match, so a keyword is never called dead.
     pub fn why(&self, anchor: &str) -> String {
+        let how = format!(
+            "as a command, '{anchor}' only matches a call that starts with it, and otherwise it fires only when the \
+             owner's prompt contains it - and neither has happened yet"
+        );
         match self {
             Reason::BareToolName { tail } => format!(
-                "'{tail}' is the short name of a tool THOR serves; a tool call offers its WHOLE name (mcp__thor__{tail}), \
-                 so '{anchor}' never equals it"
+                "'{tail}' is the short name of a tool THOR serves, and a tool call offers its WHOLE name \
+                 (mcp__thor__{tail}), so it matches no tool call; {how}"
             ),
-            Reason::FlagFirst => format!("'{anchor}' starts with a flag, and a call starts with its program"),
-            Reason::Fragment { program, call } => format!(
-                "'{anchor}' is how a real call continues after '{program}' ('{call}'), and an anchor reaches a call only \
-                 from the call's first word"
-            ),
+            Reason::FlagFirst => format!("'{anchor}' starts with a flag, and a call starts with its program; {how}"),
+            Reason::Fragment { program, call } => {
+                format!("real calls carry these words after '{program}' ('{call}'), never at their start; {how}")
+            }
             Reason::NeverReached { first } => format!(
-                "no real call in the log was ever reached by '{anchor}', and '{first}' is not found on PATH or in \
-                 THOR's own bin folder, and is not a cmdlet or a tool name the hook sees - it may still exist elsewhere \
-                 (another machine, a folder not on PATH), and then it simply never fired"
+                "no real call in the log ever started with '{anchor}', and '{first}' is not found on PATH or in THOR's \
+                 own bin folder, and is not a cmdlet or a tool name the hook sees (it may exist elsewhere: another \
+                 machine, a folder not on PATH); {how}"
             ),
         }
     }
 
-    /// What to do about it.
+    /// What to do about it. Each fix is conditional on what the anchor was
+    /// meant to be: a command, a keyword the owner types, or a file or action.
     pub fn fix(&self, anchor: &str) -> String {
         match self {
             Reason::BareToolName { tail } => {
@@ -110,15 +126,21 @@ impl Reason {
                 } else {
                     ""
                 };
-                format!("bind the whole tool name as your tool list shows it (mcp__thor__{tail} when the server is called thor){moment}")
+                format!(
+                    "if you meant the tool, bind the whole tool name as your tool list shows it (mcp__thor__{tail} when the \
+                     server is called thor){moment}; if you meant the word the owner types, leave it"
+                )
             }
-            Reason::FlagFirst => "write the program word first, as a real call types it".to_string(),
-            Reason::Fragment { program, .. } => {
-                format!("start it with the program word ('{program} {anchor}'), or anchor the program alone and name the rest in the rule's text")
-            }
-            Reason::NeverReached { .. } => "write the anchor as the program word first, as a real call types it; bind a path or a \
-                 moment instead when the rule is about a file or an action; leave it as it is only when the rule waits for a \
-                 program or tool that does not exist yet"
+            Reason::FlagFirst => "if it is a command, write the program word first, as a real call types it; if it is a \
+                 keyword the owner types, leave it"
+                .to_string(),
+            Reason::Fragment { program, .. } => format!(
+                "if it is a command, start it with the program word ('{program} {anchor}'), or anchor the program alone and \
+                 name the rest in the rule's text; if it is a keyword the owner types, leave it"
+            ),
+            Reason::NeverReached { .. } => "if it is a command, start it with the program word as a real call types it; if it \
+                 is a keyword or phrase the owner types, it is fine as it stands; if the rule is about a file or an action, \
+                 bind a path or a moment instead; if it waits for a program or tool that does not exist yet, leave it"
                 .to_string(),
         }
     }
@@ -240,6 +262,12 @@ pub fn own_dirs(db: Option<&Path>) -> Vec<PathBuf> {
     dirs
 }
 
+/// The corpus's calls without the pseudo-calls a prompt firing leaves in it
+/// (`(prompt) word`): those are not typed commands.
+fn real_calls(corpus: &Corpus) -> impl Iterator<Item = &crate::legit::RealCall> {
+    corpus.calls().iter().filter(|c| !c.text.starts_with("(prompt)"))
+}
+
 /// Judges anchors against the real calls of one log and one machine.
 pub struct Judge<'a> {
     corpus: &'a Corpus,
@@ -269,7 +297,7 @@ impl<'a> Judge<'a> {
         let refused: Vec<Vec<Segment>> =
             corpus.refused().iter().map(|r| shell::segments(&r.text, Dialect::Sh)).collect();
         let mut run = HashSet::new();
-        let all = corpus.calls().iter().map(|c| c.segments.as_slice()).chain(refused.iter().map(Vec::as_slice));
+        let all = real_calls(corpus).map(|c| c.segments.as_slice()).chain(refused.iter().map(Vec::as_slice));
         for segments in all {
             for seg in segments.iter().filter(|s| !s.flat) {
                 if !seg.program.is_empty() {
@@ -290,9 +318,13 @@ impl<'a> Judge<'a> {
         }
     }
 
-    /// Whether some real call was reached by `anchor`.
-    fn reached_before(&self, anchor: &str) -> bool {
-        self.corpus.reaching(anchor).next().is_some() || self.refused.iter().any(|segs| shell::reaches_any(anchor, segs))
+    /// Whether `anchor` ever fired: some real call was reached by it, or some
+    /// item was served by the owner's own prompt on its phrase.
+    fn fired_before(&self, anchor: &str) -> bool {
+        let phrase = model::normalize::last_segment(&model::normalize::normalize_target(anchor)).to_string();
+        real_calls(self.corpus).any(|c| c.reached_by(anchor))
+            || self.refused.iter().any(|segs| shell::reaches_any(anchor, segs))
+            || self.corpus.prompted(&phrase)
     }
 
     /// Whether `word` names an executable file in one of the folders.
@@ -322,7 +354,7 @@ impl<'a> Judge<'a> {
     /// it is never read as a fragment.
     fn fragment_of(&self, words: &[String]) -> Option<(String, String)> {
         let n = words.len();
-        for call in self.corpus.calls() {
+        for call in real_calls(self.corpus) {
             for seg in call.segments.iter().filter(|s| !s.flat) {
                 let program = program_key(seg.head.first().map(String::as_str).unwrap_or(""));
                 if program.is_empty() || INTERPRETERS.contains(&program.as_str()) || seg.head.len() <= n {
@@ -358,7 +390,7 @@ impl<'a> Judge<'a> {
         if anchor.is_empty() || is_compound(anchor) {
             return None;
         }
-        if self.reached_before(anchor) {
+        if self.fired_before(anchor) {
             return None;
         }
         let words: Vec<String> = anchor.split_whitespace().map(|w| w.to_lowercase()).collect();
@@ -466,6 +498,24 @@ mod tests {
         }
         let judge = Judge::with_dirs(&corpus, &tails(), vec![dir.path().to_path_buf()]);
         assert_eq!(judge.judge("lookup"), None);
+    }
+
+    #[test]
+    fn an_anchor_the_owners_prompt_fired_is_not_judged_and_the_wording_never_calls_a_keyword_dead() {
+        assert!(verdict(&[], "Raspberry Pi 5").is_some());
+        assert_eq!(verdict(&["(prompt) raspberry pi 5"], "Raspberry Pi 5"), None);
+        assert_eq!(verdict(&["(prompt) remember, git"], "remember"), None);
+        // A prompt that fired on another phrase clears nothing.
+        assert!(verdict(&["(prompt) raspberry"], "Raspberry Pi 5").is_some());
+        // And a prompt firing is not a program that a real call ran.
+        let found = verdict(&["(prompt) geankerd"], "geankerd feit").expect("still never fired");
+        assert!(matches!(found, Reason::NeverReached { .. }), "{found:?}");
+        let why = found.why("geankerd feit");
+        assert!(why.contains("only matches a call that starts with it") && why.contains("owner's prompt contains it"), "{why}");
+        let fix = found.fix("geankerd feit");
+        assert!(fix.contains("if it is a command") && fix.contains("fine as it stands"), "{fix}");
+        let bare = verdict(&[], "remember").unwrap().why("remember");
+        assert!(bare.contains("owner's prompt contains it"), "{bare}");
     }
 
     #[test]

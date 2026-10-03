@@ -171,6 +171,11 @@ pub struct Corpus {
     /// knows it (`usefulness::last_project_of_session`). A session it does not
     /// know is simply absent: its calls count for every project.
     session_projects: HashMap<String, String>,
+    /// The anchor words the owner's own prompts fired items on (the place a
+    /// prompt firing records: `(prompt) word, word`), lowercase. Not calls:
+    /// read by `dead_anchor`, which asks whether a phrase ever fired from the
+    /// prompt surface.
+    prompted: std::collections::HashSet<String>,
 }
 
 /// `text` as a served trigger records it: at most `TRIGGER_LIMIT` characters.
@@ -236,6 +241,9 @@ impl Corpus {
                     let Some(trigger) = body.get("trigger").and_then(|t| t.as_str()) else { continue };
                     if trigger.trim().is_empty() || trigger == "session start" {
                         continue;
+                    }
+                    if let Some(words) = trigger.strip_prefix("(prompt)") {
+                        self.prompted.extend(words.split(',').map(|w| w.trim().to_lowercase()).filter(|w| !w.is_empty()));
                     }
                     let slot = self.seen.entry(trigger.to_string()).or_default().entry(e.session_id.clone()).or_insert((e.seq, e.seq));
                     slot.0 = slot.0.min(e.seq);
@@ -336,6 +344,12 @@ impl Corpus {
     /// The calls a session had refused itself - apart, never legitimate.
     pub fn refused(&self) -> &[RefusedCall] {
         &self.refused
+    }
+
+    /// Whether an item was ever served by the owner's own prompt on `phrase`
+    /// (the anchor as a prompt names it: last path segment, lowercase).
+    pub fn prompted(&self, phrase: &str) -> bool {
+        self.prompted.contains(&phrase.to_lowercase())
     }
 
     /// The last log seq this corpus has read.
