@@ -882,6 +882,49 @@ fn a_command_inside_a_prescribed_route_is_never_forbidden() {
     }
 }
 
+/// FIELD 2026-10-03 (a retracted rule): "Gebruik op de NAS `sudo docker compose
+/// -p x up -d` - kaal `docker compose up -d` ... botst" prescribes the first
+/// span and warns off the second. The recommending word opens the sentence,
+/// four tokens before the first span, outside the 3-token window, so THOR
+/// derived "forbidden '-p'" on `sudo docker compose` - the opposite of the
+/// rule. A recommending word that opens the clause of a span counts for the
+/// first span of that clause; the span after the dash keeps its own reading.
+#[test]
+fn a_recommending_word_opening_the_clause_covers_its_first_span() {
+    let forbidden_of = |text: &str, anchors: &[&str]| -> Vec<String> {
+        let item = rule("clause", text, anchors.iter().map(|a| cmd(a)).collect(), None, None);
+        derive(&item, None)
+            .iter()
+            .filter_map(|d| match &d.check {
+                Check::Forbidden { literals } => Some(literals.join(" ")),
+                _ => None,
+            })
+            .collect()
+    };
+    for text in [
+        "Gebruik op de NAS `sudo docker compose -p demo-app up -d` - kaal `docker compose up -d` vanuit de projectmap botst met Container Manager",
+        "Use on the NAS `sudo docker compose -p demo-app up -d`; a bare `docker compose up -d` clashes with the container manager.",
+    ] {
+        for anchors in [&["docker compose up"][..], &["sudo docker compose"][..], &["docker compose up", "sudo docker compose"][..]] {
+            let forbidden = forbidden_of(text, anchors);
+            assert!(!forbidden.iter().any(|f| f.starts_with("-p")), "{text} {anchors:?}: {forbidden:?}");
+        }
+    }
+    // The recommending word does not reach across a dash, a semicolon, a clause
+    // word or a negating word: these still forbid what the span holds.
+    for text in [
+        "Prefer the plain form - `sudo docker compose -p demo-app up -d` breaks the project.",
+        "Prefer the plain form; `sudo docker compose -p demo-app up -d` breaks the project.",
+        "Use the plain form on the NAS, but `sudo docker compose -p demo-app up -d` breaks the project.",
+        "Never use on the NAS `sudo docker compose -p demo-app up -d` - it breaks the project.",
+        "Gebruik op de NAS niet `sudo docker compose -p demo-app up -d` - dat breekt het project.",
+        "Use the plain form on the NAS with `docker compose up -d` or `sudo docker compose -p demo-app up -d`.",
+    ] {
+        let forbidden = forbidden_of(text, &["sudo docker compose"]);
+        assert!(forbidden.iter().any(|f| f.starts_with("-p")), "{text}: {forbidden:?}");
+    }
+}
+
 /// Field test 5 (D9): a fragment that is a piece of the anchor path ("README"
 /// in README.md, "RELEASE" in RELEASE-CHECKLIST.md) is in that file by the way
 /// it is named, so it is no tooth; a real fragment of the same text still is.

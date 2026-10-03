@@ -687,6 +687,62 @@ fn recommended_inside_span(raw: &[&str], at: usize) -> bool {
     recommended_at(raw, start) && !sentence_negates(raw, at)
 }
 
+/// Words that open a contrasting clause of a sentence ("use `x`, but `y` ...").
+const CLAUSE_WORDS: &[&str] = &["but", "maar", "while", "whereas", "terwijl", "however"];
+
+/// A standalone dash, ASCII or typographic (U+2013, U+2014): it starts a new,
+/// often contrasting, clause ("use `x` - a bare `y` clashes").
+fn is_dash_token(token: &str) -> bool {
+    matches!(token, "-" | "--" | "\u{2013}" | "\u{2014}")
+}
+
+/// Whether a clause ends or starts at `token`: a sentence stop, a dash, or a
+/// clause word.
+fn is_clause_boundary(token: &str) -> bool {
+    let word = token.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'').to_lowercase();
+    token.ends_with(['.', '!', '?', ';', ':']) || is_dash_token(token) || CLAUSE_WORDS.contains(&word.as_str())
+}
+
+/// Whether the backtick span that position `at` sits in (or opens) is the FIRST
+/// span of a clause whose first word RECOMMENDS ("Gebruik op de NAS `sudo
+/// docker compose -p x up -d` - kaal `docker compose up -d` botst"): the
+/// recommending word opens the clause and may stand more than the three tokens
+/// of `recommended_at` before the span, so the prescribed call was read as a
+/// prohibition (field 2026-10-03). The clause runs from the token after the
+/// last boundary before the span to the next boundary after it; a dash, colon,
+/// semicolon, sentence stop or clause word ends it, so a contrasting clause
+/// ("kaal `...` botst") keeps its own reading, a second span of the clause is
+/// never covered, and a negating word anywhere in the clause cancels it.
+fn recommended_by_clause_opener(raw: &[&str], at: usize) -> bool {
+    let opens = |t: &str| t.matches('`').count() % 2 == 1;
+    let Some(start) = backtick_span_start(raw, at).or_else(|| raw.get(at).filter(|t| opens(t)).map(|_| at)) else {
+        return false;
+    };
+    let mut first = start;
+    while first > 0 && !is_clause_boundary(raw[first - 1]) && !raw[first - 1].contains('`') {
+        first -= 1;
+    }
+    let word = |t: &str| t.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'').to_lowercase();
+    if first == start || !RECOMMENDING.contains(&word(raw[first]).as_str()) {
+        return false;
+    }
+    let mut open = false;
+    let mut end = start;
+    for (i, token) in raw.iter().enumerate().skip(start) {
+        if i > start && !open && (is_dash_token(token) || CLAUSE_WORDS.contains(&word(token).as_str())) {
+            break;
+        }
+        end = i + 1;
+        if opens(token) {
+            open = !open;
+        }
+        if !open && token.ends_with(['.', '!', '?', ';', ':']) {
+            break;
+        }
+    }
+    !raw[first..end].iter().any(|t| NEGATING.contains(&word(t).as_str()))
+}
+
 /// Whether a negating word stands anywhere in the sentence token `at` is in
 /// ("never pipe scripts via `...`"): the recommending word may sit far from the
 /// negation, so the 3-token window of `recommended_at` is not enough here.
@@ -787,6 +843,7 @@ fn recommended_fragments(item: &Item, raw: &[&str]) -> Vec<String> {
             from = found + 1;
             if !recommended_at(raw, found)
                 && !recommended_inside_span(raw, found)
+                && !recommended_by_clause_opener(raw, found)
                 && !describes_running_after(raw, found, found + aw.len())
             {
                 continue;
