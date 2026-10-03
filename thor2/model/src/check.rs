@@ -79,6 +79,38 @@ pub fn named_path(check: &Check) -> Option<&str> {
     }
 }
 
+/// Whether `line` is a comment, judged narrowly and on purpose.
+///
+/// The census that first counted hollow checks read a leading `#` as a
+/// comment marker everywhere, which made a Markdown heading and a C
+/// `#define` look like commentary: it reported 28 comment-only checks where
+/// hand-checking found 6. This is the corrected rule, and it is deliberately
+/// conservative - it would rather miss a real comment than call working code
+/// one, because what it feeds is a judgement about weakening a proof.
+pub fn looks_like_comment(line: &str, extension: &str) -> bool {
+    let s = line.trim_start();
+    match extension {
+        // A heading is content, not commentary.
+        "md" | "markdown" => false,
+        _ if s.starts_with("#define") || s.starts_with("#include") => false,
+        "sh" | "py" | "yml" | "yaml" | "toml" | "ps1" if s.starts_with('#') => true,
+        _ => s.starts_with("//") || s.starts_with("<!--") || s.starts_with("/*") || s.starts_with('*'),
+    }
+}
+
+/// Whether `literal` occurs in `body` (the content of the file at `path`)
+/// ONLY on lines that `looks_like_comment`. False when it never occurs at all:
+/// a literal that is absent is a failing check, not a comment-only one.
+///
+/// A contains check on such a literal holds while the behaviour it is meant
+/// to guard drifts or leaves, and refuses a harmless comment cleanup: the one
+/// outcome this system counts as most expensive.
+pub fn literal_only_in_comments(body: &str, path: &str, literal: &str) -> bool {
+    let extension = Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("");
+    let mut hits = body.lines().filter(|l| l.contains(literal)).peekable();
+    hits.peek().is_some() && hits.all(|l| looks_like_comment(l, extension))
+}
+
 /// Resolve `relative` against `root`, refusing anything that could reach
 /// outside it. Purely lexical - no filesystem access, so this works whether
 /// or not the target exists, which matters because a missing target is a
@@ -1116,5 +1148,22 @@ mod tests {
 
         let check = Check::Forbidden { literals: vec!["TODO".to_string()] };
         assert_eq!(run(&check, &missing_root), Outcome::Holds);
+    }
+
+    // ------------------------------------------------ literal_only_in_comments
+
+    #[test]
+    fn a_literal_on_comment_lines_only_is_comment_only() {
+        assert!(literal_only_in_comments("// note about widgets\nlet a = 1;\n", "a.rs", "widgets"));
+        assert!(literal_only_in_comments("# widgets\nrun: x\n", "ci.yml", "widgets"));
+        assert!(literal_only_in_comments("/*\n * widgets here\n */\ncode();\n", "a.js", "widgets"));
+    }
+
+    #[test]
+    fn a_literal_that_is_also_in_code_or_absent_or_in_markdown_is_not_comment_only() {
+        assert!(!literal_only_in_comments("// widgets\nlet widgets = 1;\n", "a.rs", "widgets"));
+        assert!(!literal_only_in_comments("let a = 1;\n", "a.rs", "widgets"), "absent is a failing check, not a hollow one");
+        assert!(!literal_only_in_comments("# widgets\nbody\n", "README.md", "widgets"), "a heading is content");
+        assert!(!literal_only_in_comments("#define WIDGETS 1\n", "pins.h", "WIDGETS"));
     }
 }

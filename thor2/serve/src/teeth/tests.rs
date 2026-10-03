@@ -698,6 +698,102 @@ fn g7b_4_may_change_turns_a_derived_contains_into_a_note_by_dispute() {
     assert_eq!(t.record.as_ref().unwrap().fields().disputes.may_change, vec!["version".to_string()]);
 }
 
+/// Field case 2026-10-03: a contains check on a phrase that sits ONLY in a
+/// comment was hung and guarded nothing. A writer's own such check is now a
+/// note at write time, with the reason and the way to keep a check in the reply.
+/// Green twins: the same literal also in code, and a Markdown heading (never a
+/// comment), are still proven rules.
+#[test]
+fn a_contains_check_on_a_literal_only_in_comments_is_a_note_at_write_time() {
+    let mut fx = Fx::new();
+    let files = [
+        ("tools/build.mjs", "// spec phrase here explains the layout\nconst layout = 1;\n"),
+        ("tools/both.mjs", "// spec phrase here explains the layout\nconst note = 'spec phrase here';\n"),
+        ("docs/guide.md", "# spec phrase here\nbody\n"),
+    ];
+    let beta = fx.checkout("beta", &files, true);
+    fx.register("beta", &beta);
+
+    let red = rule(
+        "red",
+        "tools/build.mjs documents the 'spec phrase here' wording.",
+        vec![path("tools/build.mjs")],
+        contains("tools/build.mjs", "spec phrase here"),
+        Some("beta"),
+    );
+    let t = fx.write(&red);
+    assert!(matches!(t.outcome, Outcome::Note { by_dispute: false, .. }), "{:?}\n{}", t.outcome, receipt(&t));
+    let r = receipt(&t);
+    assert!(r.starts_with("teeth: note - your check (contains 'spec phrase here' in tools/build.mjs) was not stored: "), "{r}");
+    assert!(r.contains("sits only in comments of tools/build.mjs"), "{r}");
+    assert!(r.contains("a Markdown file is never read as comments"), "how to keep a check: {r}");
+    assert_eq!(t.check, None, "stored without the check");
+
+    for (id, file) in [("green-code", "tools/both.mjs"), ("green-md", "docs/guide.md")] {
+        let text = format!("{file} documents the 'spec phrase here' wording.");
+        let item = rule(id, &text, vec![path(file)], contains(file, "spec phrase here"), Some("beta"));
+        let t = fx.write(&item);
+        assert!(matches!(t.outcome, Outcome::Rule { .. }), "{id}: {:?}\n{}", t.outcome, receipt(&t));
+    }
+}
+
+/// The same literal as a tooth THOR derives from the text: it used to be
+/// forced on the writer ("hang it"), who hung it. Now no such tooth is built
+/// and the rule is a note saying why; a literal that is also in code still
+/// forces (the existing `package.json` case), and a retest is untouched.
+#[test]
+fn a_derived_contains_tooth_on_a_comment_only_literal_is_not_built_at_write_time() {
+    let mut fx = Fx::new();
+    let beta = fx.checkout(
+        "beta",
+        &[("tools/build.mjs", "// spec phrase here explains the layout\nconst layout = 1;\n"), ("tools/code.mjs", "const t = 'spec phrase here';\n")],
+        true,
+    );
+    fx.register("beta", &beta);
+
+    let red = rule("red", "Keep the 'spec phrase here' wording in tools/build.mjs.", vec![path("tools/build.mjs")], None, Some("beta"));
+    let t = fx.write(&red);
+    assert!(matches!(t.outcome, Outcome::Note { by_dispute: false, .. }), "{:?}\n{}", t.outcome, receipt(&t));
+    let r = receipt(&t);
+    assert!(r.contains("contains 'spec phrase here' in tools/build.mjs was not built as a tooth: "), "{r}");
+    assert!(r.contains("sits only in comments of tools/build.mjs"), "{r}");
+
+    let green = rule("green", "Keep the 'spec phrase here' wording in tools/code.mjs.", vec![path("tools/code.mjs")], None, Some("beta"));
+    let (code, message) = refusal(&fx.write(&green));
+    assert_eq!(code, RefuseCode::Forcing);
+    assert!(message.contains("contains 'spec phrase here' in tools/code.mjs"), "{message}");
+
+    // A retest is runtime: it still asks for the tooth, so no rule is silently changed.
+    fx.legacy(&red);
+    match fx.retest("red").outcome {
+        Maintenance::NeedsAgent(_) => {}
+        other => panic!("a retest still forces the tooth: {other:?}"),
+    }
+}
+
+/// Write time only, and only for a check that is new or changed: a revise that
+/// rewords the text of a rule whose stored contains check is already hung
+/// keeps that check (no silent demotion).
+#[test]
+fn a_revise_keeping_an_already_hung_comment_only_check_keeps_it() {
+    let mut fx = Fx::new();
+    let beta = fx.checkout("beta", &[("tools/build.mjs", "// spec phrase here explains the layout\nconst layout = 1;\n")], true);
+    fx.register("beta", &beta);
+    let before = rule(
+        "old",
+        "tools/build.mjs documents the 'spec phrase here' wording.",
+        vec![path("tools/build.mjs")],
+        contains("tools/build.mjs", "spec phrase here"),
+        Some("beta"),
+    );
+    fx.legacy(&before);
+    let mut after = before.clone();
+    after.text = "tools/build.mjs documents the 'spec phrase here' wording, as agreed.".to_string();
+    let t = fx.run(&after, Some(&before), &SessionCtx::default(), &Disputes::default());
+    assert!(matches!(t.outcome, Outcome::Rule { .. }), "{:?}\n{}", t.outcome, receipt(&t));
+    assert!(t.check.is_some());
+}
+
 /// FIELD TEST 2, defect 2 (2026-10-01): the rule RECOMMENDS a flag ("use git
 /// grep --no-index there"), THOR built a forbidden tooth on that very flag,
 /// and the only exit it offered was a legitimate call carrying the flag -

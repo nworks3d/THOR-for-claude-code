@@ -315,25 +315,6 @@ fn with_warnings(
     format!("{success}\n{}", notes.join("\n"))
 }
 
-/// Whether `line` is a comment, judged narrowly and on purpose.
-///
-/// The census that first counted hollow checks read a leading `#` as a
-/// comment marker everywhere, which made a Markdown heading and a C
-/// `#define` look like commentary: it reported 28 comment-only checks where
-/// hand-checking found 6. This is the corrected rule, and it is deliberately
-/// conservative - it would rather miss a real comment than call working code
-/// one, because the warning it feeds is about weakening a proof.
-fn looks_like_comment(line: &str, extension: &str) -> bool {
-    let s = line.trim_start();
-    match extension {
-        // A heading is content, not commentary.
-        "md" | "markdown" => false,
-        _ if s.starts_with("#define") || s.starts_with("#include") => false,
-        "sh" | "py" | "yml" | "yaml" | "toml" | "ps1" if s.starts_with('#') => true,
-        _ => s.starts_with("//") || s.starts_with("<!--") || s.starts_with("/*") || s.starts_with('*'),
-    }
-}
-
 /// The half of the hollow-check problem the write gate cannot see, because it
 /// never reads a file: a literal that occurs everywhere, and one that only
 /// ever sits in a comment.
@@ -364,7 +345,7 @@ fn file_aware_warnings(item: &model::item::Item, root: &std::path::Path) -> Vec<
             hits.len()
         ));
     }
-    if !hits.is_empty() && hits.iter().all(|l| looks_like_comment(l, extension)) {
+    if !hits.is_empty() && hits.iter().all(|l| model::check::looks_like_comment(l, extension)) {
         out.push(format!(
             "{literal:?} appears only inside comments in {path}. That passes while the behaviour \
              it guards may live in another file entirely - check the anchor points at the code, \

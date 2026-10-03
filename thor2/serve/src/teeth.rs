@@ -1372,6 +1372,33 @@ fn text_names_file(item: &Item, rel: &str) -> bool {
     hay.contains(&rel) || (!base.is_empty() && hay.contains(&base))
 }
 
+/// Why a `contains` check is hollow when its literal sits ONLY in comments of
+/// its file (`model::check::literal_only_in_comments`), as one sentence a
+/// reply can carry; `None` for any other check, or a literal that is also in
+/// code, or a file that cannot be read.
+///
+/// Used at a WRITE only (a writer's own check, and a tooth built from the
+/// text), never at a retest: a rule already on the rule track is never
+/// demoted by this. Such a tooth guards nothing the rule is about - the
+/// behaviour can move or go while the remark stays - and it refuses a harmless
+/// comment cleanup. A rule that really is about comment text keeps a check by
+/// pointing it at a documentation file (a Markdown file is never read as
+/// comments) or at a literal that also occurs in code.
+fn comment_only_contains(check: &Check, root: &Path) -> Option<String> {
+    let Check::Contains { path, literal } = check else { return None };
+    let file = target_file(root, path, |c| c.contains(literal.as_str())).ok()?;
+    if !model::check::literal_only_in_comments(&file.content, &file.rel, literal) {
+        return None;
+    }
+    Some(format!(
+        "'{}' sits only in comments of {}, so it guards no behaviour the rule is about and would refuse a harmless \
+         comment cleanup. If the comment text itself is what the rule is about, point the check at a documentation \
+         file (a Markdown file is never read as comments) or at a literal that also occurs in code",
+        gate::shown_literal(literal),
+        file.rel
+    ))
+}
+
 /// Whether a file check holds in `root`: `Ok(())`, `Err(Ok(what))` when it is
 /// false (with what is missing or present), `Err(Err(why))` when the file
 /// cannot be read.
@@ -1469,6 +1496,24 @@ impl<'a> Work<'a> {
     fn forcing(&mut self, base: &Item, root: Option<&Path>, command_only: bool) -> Result<Vec<DerivedTrial>, Decision> {
         let text_root = if command_only { None } else { root };
         let mut teeth = derive(base, text_root);
+        // At a write, a contains tooth built from the text whose literal sits
+        // only in comments is not built: hanging it would be forced on the
+        // writer and then guard nothing (see `comment_only_contains`).
+        if let (Mode::Write, Some(root)) = (&self.mode, text_root) {
+            let mut kept = Vec::new();
+            for d in teeth {
+                match comment_only_contains(&d.check, root).filter(|_| matches!(d.origin, Origin::Text(_))) {
+                    Some(why) => {
+                        let line = format!("{} was not built as a tooth: {why}", describe(&d.check, &base.bindings));
+                        if !self.receipt.contains(&line) {
+                            self.receipt.push(line);
+                        }
+                    }
+                    None => kept.push(d),
+                }
+            }
+            teeth = kept;
+        }
         for h in self.history {
             if command_only && is_file_check(&h.check) {
                 continue;
@@ -1896,6 +1941,14 @@ impl<'a> Work<'a> {
             let try_root = if is_file_check(check) { root_ok.clone().unwrap_or_else(|| cmd_root.clone()) } else { cmd_root.clone() };
             let tried = try_check(item, &try_root, &self.known);
             self.attempts.extend(attempts_of(&tried, &format!("your {}", describe(check, &item.bindings))));
+            // A NEW or CHANGED contains check on a literal that sits only in
+            // comments is not hung (write time only: a check the rule already
+            // carried is never demoted by a revise of its text).
+            let hollow = if matches!(self.mode, Mode::Write) && touches_check && tried.bites() {
+                comment_only_contains(check, &try_root)
+            } else {
+                None
+            };
             self.clean_failed = tried.clean_failed();
             if let Some(file) = &tried.file {
                 self.file_blob = git(&try_root, &["hash-object", "--", &git_path(&file.rel)]).map(|s| s.trim().to_string());
@@ -1914,7 +1967,7 @@ impl<'a> Work<'a> {
                     ));
                 }
             }
-            if tried.bites() {
+            if tried.bites() && hollow.is_none() {
                 if let Some(r) = replayed.as_ref().filter(|r| r.majority()) {
                     let listed: Vec<String> = r.refused_texts();
                     let accepted: Vec<String> =
@@ -2078,7 +2131,11 @@ impl<'a> Work<'a> {
                     }
                 }
             }
-            dropped = Some(format!("your check ({}) was not stored: {failed_form}", describe(check, &item.bindings)));
+            dropped = Some(format!(
+                "your check ({}) was not stored: {}",
+                describe(check, &item.bindings),
+                hollow.unwrap_or(failed_form)
+            ));
         }
 
         // (6)-(8) derived teeth.
