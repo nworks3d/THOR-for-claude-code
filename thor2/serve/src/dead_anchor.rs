@@ -262,12 +262,6 @@ pub fn own_dirs(db: Option<&Path>) -> Vec<PathBuf> {
     dirs
 }
 
-/// The corpus's calls without the pseudo-calls a prompt firing leaves in it
-/// (`(prompt) word`): those are not typed commands.
-fn real_calls(corpus: &Corpus) -> impl Iterator<Item = &crate::legit::RealCall> {
-    corpus.calls().iter().filter(|c| !c.text.starts_with("(prompt)"))
-}
-
 /// Judges anchors against the real calls of one log and one machine.
 pub struct Judge<'a> {
     corpus: &'a Corpus,
@@ -297,7 +291,7 @@ impl<'a> Judge<'a> {
         let refused: Vec<Vec<Segment>> =
             corpus.refused().iter().map(|r| shell::segments(&r.text, Dialect::Sh)).collect();
         let mut run = HashSet::new();
-        let all = real_calls(corpus).map(|c| c.segments.as_slice()).chain(refused.iter().map(Vec::as_slice));
+        let all = corpus.calls().iter().map(|c| c.segments.as_slice()).chain(refused.iter().map(Vec::as_slice));
         for segments in all {
             for seg in segments.iter().filter(|s| !s.flat) {
                 if !seg.program.is_empty() {
@@ -322,7 +316,7 @@ impl<'a> Judge<'a> {
     /// item was served by the owner's own prompt on its phrase.
     fn fired_before(&self, anchor: &str) -> bool {
         let phrase = model::normalize::last_segment(&model::normalize::normalize_target(anchor)).to_string();
-        real_calls(self.corpus).any(|c| c.reached_by(anchor))
+        self.corpus.calls().iter().any(|c| c.reached_by(anchor))
             || self.refused.iter().any(|segs| shell::reaches_any(anchor, segs))
             || self.corpus.prompted(&phrase)
     }
@@ -354,7 +348,7 @@ impl<'a> Judge<'a> {
     /// it is never read as a fragment.
     fn fragment_of(&self, words: &[String]) -> Option<(String, String)> {
         let n = words.len();
-        for call in real_calls(self.corpus) {
+        for call in self.corpus.calls().iter() {
             for seg in call.segments.iter().filter(|s| !s.flat) {
                 let program = program_key(seg.head.first().map(String::as_str).unwrap_or(""));
                 if program.is_empty() || INTERPRETERS.contains(&program.as_str()) || seg.head.len() <= n {

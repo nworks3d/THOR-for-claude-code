@@ -6,6 +6,8 @@
 //! id has the shape of a Claude Code session id. A call the same session had
 //! refused is not a legitimate call - it is kept apart, in the refused set.
 //! The named limit: only commands that fired some rule are in the log at all.
+//! A firing from the owner's own prompt (`(prompt) word`) is not a command and
+//! is never a call here; only `Corpus::prompted` remembers its anchor words.
 //!
 //! READ THE WAY THE LIVE GUARD READS. Each call is cut into its simple
 //! commands ONCE, when the corpus loads, by the one segmenter the hook uses
@@ -242,8 +244,11 @@ impl Corpus {
                     if trigger.trim().is_empty() || trigger == "session start" {
                         continue;
                     }
+                    // A prompt firing is the owner's sentence, not a call: kept
+                    // for `prompted`, never replayed as a call.
                     if let Some(words) = trigger.strip_prefix("(prompt)") {
                         self.prompted.extend(words.split(',').map(|w| w.trim().to_lowercase()).filter(|w| !w.is_empty()));
+                        continue;
                     }
                     let slot = self.seen.entry(trigger.to_string()).or_default().entry(e.session_id.clone()).or_insert((e.seq, e.seq));
                     slot.0 = slot.0.min(e.seq);
@@ -402,6 +407,21 @@ mod tests {
         served(&mut store, "s", "git push origin fixture");
         let corpus = Corpus::load(&store);
         assert_eq!(texts(&corpus), vec!["git push origin main"]);
+    }
+
+    /// The owner's own sentence a prompt firing records (`(prompt) word`) is
+    /// not a call: no anchor reaches it and a trial never replays it, while
+    /// `prompted` still knows the words. A real Bash call stays a call.
+    #[test]
+    fn a_prompt_firing_is_never_a_real_call() {
+        let mut store = EventStore::in_memory().unwrap();
+        served(&mut store, S1, "(prompt) backup, quoter");
+        served(&mut store, S1, "backup --list");
+        let corpus = Corpus::load(&store);
+        assert_eq!(texts(&corpus), vec!["backup --list"]);
+        assert_eq!(corpus.reaching("backup").count(), 1);
+        assert_eq!(corpus.reaching("(prompt)").count(), 0);
+        assert!(corpus.prompted("backup") && corpus.prompted("quoter"));
     }
 
     /// R7a.3: a call the same session had refused is not in the clean set;
