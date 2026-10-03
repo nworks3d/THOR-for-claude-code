@@ -271,6 +271,7 @@ fn with_warnings(
     root: Option<&std::path::Path>,
     store: Option<&thor_core::event_store::EventStore>,
     teeth_notes: Vec<String>,
+    corpus: &Mutex<Option<serve::legit::Corpus>>,
 ) -> String {
     // THOR's trial receipt first among the notes: what trying this fact's
     // teeth showed (`serve::teeth::trial_for_write`) - its verdict line, the
@@ -303,6 +304,7 @@ fn with_warnings(
         if let Ok(model::store::Capacity::Crowded(note) | model::store::Capacity::Broad(note)) = cap {
             notes.push(note);
         }
+        notes.extend(unreachable_anchor_notes(store, corpus, item, existing));
     }
     if let Some(root) = root {
         notes.extend(file_aware_warnings(item, root));
@@ -313,6 +315,51 @@ fn with_warnings(
     }
     let notes: Vec<String> = notes.iter().map(|n| format!("  note: {n}")).collect();
     format!("{success}\n{}", notes.join("\n"))
+}
+
+/// The short names of the tools this server serves (`remember`, `shelve`...):
+/// what `serve::dead_anchor` reads a bare tool name against. Read from the
+/// router itself, so a tool added later is covered without a second list.
+pub fn served_tool_tails() -> Vec<String> {
+    ThorMcpServer::tool_router().list_all().iter().map(|t| t.name.to_string()).collect()
+}
+
+/// A note for every NEW command anchor of a write that no real call can reach
+/// (`serve::dead_anchor`): the rule is stored, and it will probably never fire.
+/// Never a refusal - a rule that waits for a tool or program that does not
+/// exist yet is legitimate. A revise is asked only about the anchors it adds.
+fn unreachable_anchor_notes(
+    store: &thor_core::event_store::EventStore,
+    corpus: &Mutex<Option<serve::legit::Corpus>>,
+    item: &model::item::Item,
+    existing: Option<&model::item::Item>,
+) -> Vec<String> {
+    if !item.kind.can_fire() {
+        return Vec::new();
+    }
+    let before: Vec<&str> = existing.map(serve::dead_anchor::command_anchors).unwrap_or_default();
+    let fresh: Vec<&str> = serve::dead_anchor::command_anchors(item).into_iter().filter(|a| !before.contains(a)).collect();
+    if fresh.is_empty() {
+        return Vec::new();
+    }
+    let mut cached = corpus.lock().unwrap_or_else(|p| p.into_inner());
+    let corpus = cached.get_or_insert_with(|| serve::legit::Corpus::load(store));
+    corpus.refresh(store);
+    let judge = serve::dead_anchor::Judge::new(corpus, &served_tool_tails(), &serve::dead_anchor::own_dirs(store.path().as_deref()));
+    fresh
+        .into_iter()
+        .filter_map(|anchor| {
+            judge.judge(anchor).map(|reason| {
+                format!(
+                    "the command anchor '{anchor}' can probably never fire ({}): {}. To fix it: {}. Nothing was refused - a \
+                     rule that waits for a program or tool that does not exist yet is legitimate.",
+                    reason.class(),
+                    reason.why(anchor),
+                    reason.fix(anchor)
+                )
+            })
+        })
+        .collect()
 }
 
 /// The half of the hollow-check problem the write gate cannot see, because it
@@ -2485,6 +2532,7 @@ impl ThorMcpServer {
                         files.as_deref(),
                         Some(s),
                         notes,
+                        &corpus,
                     ))
                 }
                 Err(e) => Err(with_scope_menu(format!("REFUSED: {e}"), s)),
@@ -2654,7 +2702,7 @@ impl ThorMcpServer {
                     // receipt a remember gives.
                     success.push_str(&evaluation_receipt(s, &written, ctx.as_ref(), event.seq));
                     let files = registered_root(s, &written);
-                    Ok(with_warnings(success, &written, Some(&existing), files.as_deref(), Some(s), notes))
+                    Ok(with_warnings(success, &written, Some(&existing), files.as_deref(), Some(s), notes, &corpus))
                 }
                 Err(e) => Err(with_scope_menu(format!("REFUSED: {e}"), s)),
             }
@@ -4373,6 +4421,97 @@ mod tests {
         assert!(item.check.is_none(), "a pending check is never on the item");
         assert!(item.tags.iter().any(|t| t == model::store::TEETH_NOTE_TAG), "{:?}", item.tags);
     }
+    // ----------------------------------------- unreachable command anchors (step 40)
+
+    fn remembered_on_command(id: &str, anchor: &str) -> RememberArgs {
+        let mut args = base_remember(id);
+        args.text = "keep the reply short when this runs".to_string();
+        args.severity = Some("house_style".to_string());
+        args.tags = vec![];
+        args.targets = vec![TargetArg { kind: "command".to_string(), value: anchor.to_string() }];
+        args
+    }
+
+    fn anchor_note(reply: &str) -> Option<&str> {
+        reply.lines().find(|l| l.contains("can probably never fire"))
+    }
+
+    #[tokio::test]
+    async fn a_bare_tool_name_anchor_is_stored_with_a_note_naming_the_whole_name() {
+        let srv = server();
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(remembered_on_command("bare-1", "remember"))).await;
+        assert!(reply.starts_with("stored "), "a note is never a refusal: {reply}");
+        let note = anchor_note(&reply).unwrap_or_else(|| panic!("no note about the anchor: {reply}"));
+        assert!(note.contains("bare tool name") && note.contains("mcp__thor__remember"), "{note}");
+        assert!(note.contains("Nothing was refused"), "{note}");
+        assert_eq!(srv.store.lock().unwrap().get_all_events().unwrap().len(), 1, "the write landed");
+    }
+
+    #[tokio::test]
+    async fn a_never_reached_non_program_anchor_is_stored_with_a_note() {
+        let srv = server();
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(remembered_on_command("prose-1", "geankerd feit"))).await;
+        assert!(reply.starts_with("stored "), "{reply}");
+        let note = anchor_note(&reply).unwrap_or_else(|| panic!("no note about the anchor: {reply}"));
+        assert!(note.contains("never reached, not a program here"), "{note}");
+        assert!(note.contains("program word first"), "the fix is named: {note}");
+    }
+
+    #[tokio::test]
+    async fn anchors_that_can_be_reached_get_no_note() {
+        let srv = server();
+        for (i, anchor) in ["mcp__thor__remember", "Agent", "Get-Command"].iter().enumerate() {
+            let mut args = remembered_on_command(&format!("fine-{i}"), anchor);
+            args.text = format!("a different matter entirely, number {i}, about {anchor} calls");
+            let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
+            assert!(reply.starts_with("stored "), "{reply}");
+            assert!(anchor_note(&reply).is_none(), "{anchor} can be reached: {reply}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_anchor_that_fired_before_gets_no_note() {
+        let srv = server();
+        {
+            let mut store = srv.store.lock().unwrap();
+            serve::deliver::record_delivery_with_trigger(
+                &mut store,
+                "0de7dc52-1b97-4b66-948f-61e4438043b2",
+                "0de7dc52-1b97-4b66-948f-61e4438043b2",
+                "hook",
+                "2026-09-28T00:00:00Z",
+                &["somewhere".to_string()],
+                Some("geankerd feit now"),
+            );
+        }
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(remembered_on_command("fired-1", "geankerd feit"))).await;
+        assert!(reply.starts_with("stored "), "{reply}");
+        assert!(anchor_note(&reply).is_none(), "a real call reached it: {reply}");
+    }
+
+    #[tokio::test]
+    async fn a_revise_is_told_only_about_the_anchors_it_adds() {
+        let srv = server();
+        let first = srv.remember(Meta::new(), RawArgs::default(), Parameters(remembered_on_command("rev-1", "geankerd feit"))).await;
+        assert!(anchor_note(&first).is_some(), "{first}");
+        // A revise that leaves the anchors alone: no second note about the same anchor.
+        let mut same = bare_revise("rev-1");
+        same.text = Some("keep the reply very short when this runs".to_string());
+        let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(same)).await;
+        assert!(reply.starts_with("revised "), "{reply}");
+        assert!(anchor_note(&reply).is_none(), "the anchor was already there: {reply}");
+        // A revise that adds a new dead one is told about that one.
+        let mut added = bare_revise("rev-1");
+        added.targets = Some(vec![
+            TargetArg { kind: "command".to_string(), value: "geankerd feit".to_string() },
+            TargetArg { kind: "command".to_string(), value: "shelve".to_string() },
+        ]);
+        let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(added)).await;
+        assert!(reply.starts_with("revised "), "{reply}");
+        let note = anchor_note(&reply).unwrap_or_else(|| panic!("{reply}"));
+        assert!(note.contains("'shelve'") && !note.contains("'geankerd feit'"), "{note}");
+    }
+
     // --------------------------------------------------------- CHANGE 2 tests
 
     fn bare_revise(id: &str) -> ReviseArgs {

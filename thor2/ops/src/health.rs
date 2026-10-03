@@ -2929,6 +2929,74 @@ pub fn dead_moment_bindings_line(db: &Path) -> String {
     out
 }
 
+/// Doctor's `dead command anchors` line (step 40): the live rules and
+/// orientations whose command anchors can ALL never be reached by a real call
+/// (`serve::dead_anchor`: a short tool name, a fragment without its program, a
+/// stored sentence, a program that is gone), so what they bind never fires
+/// through them. Each is named with its anchor and the reason class; the ones
+/// with no other binding left fire nowhere at all and are named first.
+///
+/// WHAT IT STANDS ON, said in the line itself: this shell's `PATH`, THOR's own
+/// `bin` folder and the real calls in the log. A command that lives only on
+/// another machine is never called a non-program when some real call ran it,
+/// and when none did it is only called never reached.
+pub fn dead_command_anchors_line(db: &Path, full: bool) -> String {
+    let Ok(store) = EventStore::open_existing(db) else {
+        return "dead command anchors: store unreadable, not checked".to_string();
+    };
+    let corpus = serve::legit::Corpus::load(&store);
+    let judge = serve::dead_anchor::Judge::new(&corpus, &mcp::served_tool_tails(), &serve::dead_anchor::own_dirs(Some(db)));
+    let mut verdicts: std::collections::HashMap<String, Option<serve::dead_anchor::Reason>> = Default::default();
+    let mut with_anchors = 0usize;
+    // (fires nowhere, id, project, what, class)
+    let mut dead: Vec<(bool, Rot, &'static str)> = Vec::new();
+    for li in serve::live::live_items(&store).iter().filter(|li| li.item.kind.can_fire()) {
+        let anchors = serve::dead_anchor::command_anchors(&li.item);
+        if anchors.is_empty() {
+            continue;
+        }
+        with_anchors += 1;
+        let found: Vec<(&str, Option<serve::dead_anchor::Reason>)> = anchors
+            .iter()
+            .map(|a| (*a, verdicts.entry((*a).to_string()).or_insert_with(|| judge.judge(a)).clone()))
+            .collect();
+        if found.iter().any(|(_, reason)| reason.is_none()) {
+            continue;
+        }
+        let nowhere = li.item.bindings.iter().all(|b| {
+            matches!(b, model::item::Binding::Target { kind: model::item::TargetKind::Command, .. })
+        });
+        let class = found[0].1.as_ref().map(|r| r.class()).unwrap_or("");
+        let what = found
+            .iter()
+            .filter_map(|(a, r)| r.as_ref().map(|r| format!("'{a}' - {}", r.short())))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let what = if nowhere { what } else { format!("{what} (the item has another binding)") };
+        let project = li.item.project.clone().unwrap_or_else(|| "global".to_string());
+        dead.push((nowhere, Rot { id: li.id.clone(), project, what }, class));
+    }
+    if dead.is_empty() {
+        return format!(
+            "dead command anchors: none - of {with_anchors} live item(s) with command anchors, every one has an anchor a real call can reach or one that could not be judged"
+        );
+    }
+    dead.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.id.cmp(&b.1.id)));
+    let nowhere = dead.iter().filter(|d| d.0).count();
+    let mut by_class: std::collections::BTreeMap<&str, usize> = Default::default();
+    for d in &dead {
+        *by_class.entry(d.2).or_default() += 1;
+    }
+    let classes = by_class.iter().map(|(c, n)| format!("{n} {c}")).collect::<Vec<_>>().join(", ");
+    let rot: Vec<Rot> = dead.into_iter().map(|d| d.1).collect();
+    let mut lines = vec![format!(
+        "dead command anchors: {} of {with_anchors} live item(s) with command anchors carry ONLY anchors no real call can reach ({nowhere} of them have no other binding, so they fire NOWHERE; by class: {classes}) - judged against this shell's PATH, THOR's own bin folder and the real calls in the log; repair each with revise (the program word first, the whole tool name, or a path or moment instead) or retract it, each one named below",
+        rot.len()
+    )];
+    lines.extend(name_rot("dead command anchor", &rot, full));
+    lines.join("\n")
+}
+
 /// Doctor's volume lines (step 28): for the last 24 hours and 7 days, how many
 /// facts were shown in full and how many repeats were left out, the five most
 /// shown facts, and how many Stops held a turn per session on average - so the
@@ -2962,6 +3030,7 @@ pub fn report(
     // default rather than a "wal: fine" line on every ordinary run.
     lines.extend(wal_line_from_size(wal_size, db));
     lines.push(dead_moment_bindings_line(db));
+    lines.push(dead_command_anchors_line(db, full));
     lines.push(code_index_line(index_db, repo));
     lines.push(replica_line(db, replica));
     // Silent unless this machine has ever completed a ship - see
@@ -5563,29 +5632,30 @@ mod tests {
         // `dead_moment_bindings_line` always says something, "none" included,
         // and so does `working_copy_lines`, the volume line (step 28, "nothing
         // recorded yet") and (step 17) the cadence line.
-        assert_eq!(lines.len(), 17);
+        assert_eq!(lines.len(), 18);
         assert!(lines[0].starts_with("memory store:"));
         assert!(lines[1].starts_with("dead moments:"));
-        assert!(lines[2].starts_with("code index:"));
-        assert!(lines[3].starts_with("replica:"));
-        assert!(lines[4].starts_with("falsifiers:"));
-        assert!(lines[5].starts_with("provable rules:"));
+        assert!(lines[2].starts_with("dead command anchors:"));
+        assert!(lines[3].starts_with("code index:"));
+        assert!(lines[4].starts_with("replica:"));
+        assert!(lines[5].starts_with("falsifiers:"));
+        assert!(lines[6].starts_with("provable rules:"));
         // Straight after the coverage number, on purpose: one says how many
         // rules COULD refuse, the next says how often one DID. Read apart
         // they mislead in opposite directions.
-        assert!(lines[6].starts_with("gate:"));
+        assert!(lines[7].starts_with("gate:"));
         // Next to the gate on purpose: one says how often it fired, the next
         // two say where it has no teeth and what nothing ever re-reads.
-        assert!(lines[7].starts_with("teeth:"));
-        assert!(lines[8].starts_with("pinned:"));
-        assert!(lines[9].starts_with("decay:"));
-        assert!(lines[10].starts_with("crowding:"));
-        assert!(lines[11].starts_with("unjudged:"));
-        assert!(lines[12].starts_with("semantic search:"));
-        assert!(lines[13].starts_with("project keys:"));
-        assert!(lines[14].starts_with("working copies:"));
-        assert!(lines[15].starts_with("volume: nothing recorded yet"));
-        assert!(lines[16].starts_with("evaluation cadence:"));
+        assert!(lines[8].starts_with("teeth:"));
+        assert!(lines[9].starts_with("pinned:"));
+        assert!(lines[10].starts_with("decay:"));
+        assert!(lines[11].starts_with("crowding:"));
+        assert!(lines[12].starts_with("unjudged:"));
+        assert!(lines[13].starts_with("semantic search:"));
+        assert!(lines[14].starts_with("project keys:"));
+        assert!(lines[15].starts_with("working copies:"));
+        assert!(lines[16].starts_with("volume: nothing recorded yet"));
+        assert!(lines[17].starts_with("evaluation cadence:"));
     }
 
     /// STEP 28: doctor shows the volume - what was shown in full, what was left
@@ -6227,6 +6297,96 @@ mod tests {
         assert!(!line.contains("dead-10"), "and it stops at the cap: {line}");
         assert!(!line.contains("dead-11"), "{line}");
         assert!(line.contains("2 more"), "silence about the rest would read as done: {line}");
+    }
+
+    // ------------------------------------------------ dead_command_anchors_line (step 40)
+
+    /// A rule bound only to the given command anchors (and `Always` too when
+    /// `also_always`), written straight to the log.
+    fn bound_to_commands(store: &mut EventStore, id: &str, anchors: &[&str], also_always: bool) {
+        let mut item = rule(id);
+        item.bindings = anchors
+            .iter()
+            .map(|a| Binding::Target { kind: TargetKind::Command, value: (*a).to_string() })
+            .collect();
+        if also_always {
+            item.bindings.push(Binding::Always);
+        }
+        legacy_declare(store, &item);
+    }
+
+    #[test]
+    fn dead_command_anchors_line_names_each_class_and_leaves_the_reachable_ones_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        // A real program in the folder doctor treats as THOR's own bin.
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let program = if cfg!(windows) { "fixtureprog.exe" } else { "fixtureprog" };
+        let file = bin.join(program);
+        std::fs::write(&file, b"x").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // The dead ones.
+        bound_to_commands(&mut store, "dead-bare-tool", &["remember"], false);
+        bound_to_commands(&mut store, "dead-prose", &["geankerd feit"], false);
+        bound_to_commands(&mut store, "dead-flag", &["--force"], false);
+        bound_to_commands(&mut store, "dead-but-pinned", &["shelve"], true);
+        // The reachable ones.
+        bound_to_commands(&mut store, "ok-whole-tool-name", &["mcp__thor__remember"], false);
+        bound_to_commands(&mut store, "ok-tool", &["Agent"], false);
+        bound_to_commands(&mut store, "ok-cmdlet", &["Get-Command"], false);
+        bound_to_commands(&mut store, "ok-program", &["fixtureprog run"], false);
+        bound_to_commands(&mut store, "ok-one-live-anchor", &["remember", "fixtureprog"], false);
+        // One that fired before: a real call reached it.
+        bound_to_commands(&mut store, "ok-fired", &["sentence that ran"], false);
+        serve::deliver::record_delivery_with_trigger(
+            &mut store,
+            "0de7dc52-1b97-4b66-948f-61e4438043b2",
+            "0de7dc52-1b97-4b66-948f-61e4438043b2",
+            "hook",
+            "2026-09-28T00:00:00Z",
+            &["ok-fired".to_string()],
+            Some("sentence that ran today"),
+        );
+
+        let line = dead_command_anchors_line(&db, true);
+        assert!(line.starts_with("dead command anchors: 4 of 10 live item(s)"), "{line}");
+        assert!(line.contains("3 of them have no other binding"), "the pinned one still fires: {line}");
+        for id in ["dead-bare-tool", "dead-prose", "dead-flag", "dead-but-pinned"] {
+            assert!(line.contains(&format!("dead command anchor: {id}")), "{id} is named: {line}");
+        }
+        for id in ["ok-whole-tool-name", "ok-tool", "ok-cmdlet", "ok-program", "ok-one-live-anchor", "ok-fired"] {
+            assert!(!line.contains(&format!("anchor: {id}")), "{id} can be reached: {line}");
+        }
+        assert!(line.contains("bare tool name") && line.contains("mcp__thor__remember"), "{line}");
+        assert!(line.contains("never reached, not a program here"), "{line}");
+        assert!(line.contains("starts with a flag"), "{line}");
+        assert!(line.contains("(the item has another binding)"), "{line}");
+    }
+
+    #[test]
+    fn dead_command_anchors_line_is_none_when_every_anchor_can_fire_and_caps_its_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        bound_to_commands(&mut store, "fine", &["Agent"], false);
+        let line = dead_command_anchors_line(&db, false);
+        assert!(line.starts_with("dead command anchors: none"), "{line}");
+
+        for i in 0..22 {
+            bound_to_commands(&mut store, &format!("dead-{i:02}"), &[&format!("nonsense word {i}")], false);
+        }
+        let capped = dead_command_anchors_line(&db, false);
+        assert!(capped.contains("22 of 23 live item(s)"), "{capped}");
+        assert_eq!(capped.matches("dead command anchor: dead-").count(), 20, "{capped}");
+        assert!(capped.contains("and 2 more, not named here (use --full)"), "{capped}");
+        let all = dead_command_anchors_line(&db, true);
+        assert_eq!(all.matches("dead command anchor: dead-").count(), 22, "{all}");
     }
 
     // ------------------------------------------ the evaluations (step 16)

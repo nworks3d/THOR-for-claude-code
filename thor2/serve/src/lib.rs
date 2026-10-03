@@ -93,6 +93,7 @@ pub mod absent_guard;
 pub mod attest;
 pub mod audit;
 pub mod capture;
+pub mod dead_anchor;
 pub mod decay;
 pub mod deliver;
 #[cfg(feature = "semantic")]
