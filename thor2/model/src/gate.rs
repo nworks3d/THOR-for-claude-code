@@ -567,8 +567,8 @@ pub fn inner_trigger_is_specific(when: &str) -> bool {
 
 /// Words that introduce a line-number reference: English "line" and the
 /// Dutch "regel". Matched case-insensitively and only when the next token
-/// starts with a digit, so "line up" or a "regel" meaning "a rule" never
-/// match.
+/// is a plain integer (see `plain_integer`), so "line up", a "regel" meaning
+/// "a rule", and "regel 2026-10-04" (a date) never match.
 const LINE_NUMBER_WORDS: &[&str] = &["line", "regel"];
 
 /// A conservative set of source/text file extensions, used to recognise a
@@ -702,6 +702,22 @@ fn find_source_file_reference(text: &str) -> Option<String> {
         .find_map(|token| source_file_in_token(token).map(str::to_string))
 }
 
+/// The digits of `raw` when the token is a plain integer, allowing only
+/// sentence punctuation around it ("93", "(93)", "93,", "93:"). `None` for a
+/// date ("2026-08-23"), a version ("1.0.124"), a time ("09:30"), a range or
+/// anything with a letter or a '%' in it ("50%"). Reads the RAW token because
+/// `strip_edge_punctuation` would drop the '%' off "50%" and leave "50".
+fn plain_integer(raw: &str) -> Option<&str> {
+    let digits = raw
+        .trim_start_matches(['(', '[', '{', '"', '\''])
+        .trim_end_matches([')', ']', '}', '"', '\'', ',', ';', ':', '.', '!', '?']);
+    if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+        Some(digits)
+    } else {
+        None
+    }
+}
+
 /// The line-number reference in `text`, if any - "line 93", the Dutch
 /// "regel 93", "L93", or a "file.ext:93" suffix - returned as the exact
 /// fragment matched, so the refusal can quote it instead of saying "some
@@ -710,13 +726,12 @@ fn find_source_file_reference(text: &str) -> Option<String> {
 /// 11 tests below for exactly which forms are covered and which are
 /// deliberately left alone.
 fn find_line_number_reference(text: &str) -> Option<String> {
-    let tokens: Vec<&str> = text.split_whitespace().map(strip_edge_punctuation).collect();
+    let raw_tokens: Vec<&str> = text.split_whitespace().collect();
+    let tokens: Vec<&str> = raw_tokens.iter().copied().map(strip_edge_punctuation).collect();
     for (i, token) in tokens.iter().enumerate() {
         if LINE_NUMBER_WORDS.contains(&token.to_lowercase().as_str()) {
-            if let Some(next) = tokens.get(i + 1) {
-                if next.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
-                    return Some(format!("{token} {next}"));
-                }
+            if let Some(number) = raw_tokens.get(i + 1).and_then(|raw| plain_integer(raw)) {
+                return Some(format!("{token} {number}"));
             }
         }
         if is_capital_l_line_token(token) || looks_like_file_line_suffix(token) {
@@ -4253,6 +4268,37 @@ mod tests {
         let mut item = base(Kind::Orientation);
         item.text = "quote.example.com:8080 serves the quote portal".to_string();
         assert!(declare(&item).is_ok());
+    }
+
+    #[test]
+    fn a_word_that_means_rule_before_a_date_or_version_is_not_a_line_number() {
+        // "regel" is also the Dutch word for "rule", so "Harde regel
+        // 2026-08-23" names a date, not a line. Only a plain integer after the
+        // word is a line number: nothing with '-', '.', '%' or ':' inside.
+        for text in [
+            "Harde regel 2026-08-23 van de eigenaar.",
+            "regel 2026-10-04 aangescherpt",
+            "line 1.0.124 shipped",
+            "regel 50% sneller",
+            "regel 09:30 dagelijks",
+            "line 3.5 is the target",
+        ] {
+            assert_eq!(find_line_number_reference(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_plain_integer_after_a_line_word_is_still_a_line_number() {
+        for (text, expected) in [
+            ("zie regel 93", "regel 93"),
+            ("see line 93", "line 93"),
+            ("de check op regel 93: staat hier", "regel 93"),
+            ("(line 93), then more", "line 93"),
+            ("see gate.rs L93 now", "L93"),
+            ("panic at file.rs:93", "file.rs:93"),
+        ] {
+            assert_eq!(find_line_number_reference(text).as_deref(), Some(expected), "{text}");
+        }
     }
 
     #[test]
