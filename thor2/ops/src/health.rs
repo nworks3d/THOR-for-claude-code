@@ -2735,7 +2735,28 @@ pub fn crowding_line(db: &Path, checkouts: Option<&Path>, full: bool) -> String 
     };
 
     let roots = checkout_roots(root);
+    // Loaded ONCE for every probe below - see `serve::serve_with_decay`'s own
+    // doc comment for the day this loop's own command anchors doubled this
+    // line's runtime by re-folding an unchanging log per probe.
+    let decay = serve::decay::DecayContext::load(&store);
+    let mut text = project_crowding_text(&store, &roots, &decay, full);
+    let global = global_crowding_lines(&store, &roots, &decay, full);
+    if !global.is_empty() {
+        text.push('\n');
+        text.push_str(&global.join("\n"));
+    }
+    text
+}
 
+/// The crowding report for items that belong to a project: each is probed at
+/// its own anchors, in its own project. A GLOBAL item is not probed here -
+/// see `global_crowding_lines`.
+fn project_crowding_text(
+    store: &EventStore,
+    roots: &std::collections::BTreeMap<String, std::path::PathBuf>,
+    decay: &serve::decay::DecayContext,
+    full: bool,
+) -> String {
     // Every distinct anchor that resolves, and the pool it stands for.
     let mut anchors: std::collections::BTreeSet<(String, String)> = Default::default();
     // Every distinct COMMAND binding value of a live item whose project
@@ -2748,7 +2769,7 @@ pub fn crowding_line(db: &Path, checkouts: Option<&Path>, full: bool) -> String 
     // nothing for that project - the crowd was real and this line could not
     // see it.
     let mut command_anchors: std::collections::BTreeSet<(String, String)> = Default::default();
-    for li in serve::live::live_items(&store).iter().filter(|li| li.item.kind.can_fire()) {
+    for li in serve::live::live_items(store).iter().filter(|li| li.item.kind.can_fire()) {
         let Some(project) = li.item.project.clone() else { continue };
         let Some(base) = roots.get(&project) else { continue };
         for binding in &li.item.bindings {
@@ -2768,10 +2789,6 @@ pub fn crowding_line(db: &Path, checkouts: Option<&Path>, full: bool) -> String 
             }
         }
     }
-    // Loaded ONCE for every probe below - see `serve::serve_with_decay`'s own
-    // doc comment for the day this loop's own command anchors doubled this
-    // line's runtime by re-folding an unchanging log per probe.
-    let decay = serve::decay::DecayContext::load(&store);
     if anchors.is_empty() && command_anchors.is_empty() {
         return "crowding: no resolvable anchor to probe, nothing to say".to_string();
     }
@@ -2792,7 +2809,7 @@ pub fn crowding_line(db: &Path, checkouts: Option<&Path>, full: bool) -> String 
         // The project is what `rank::select` filters on. Leaving it out serves
         // only global items and makes every pool look empty.
         input.project = Some(project.clone());
-        let served = serve::serve_with_decay(&store, &input, &decay);
+        let served = serve::serve_with_decay(store, &input, decay);
         let shown: std::collections::HashSet<&str> =
             served.selection.shown.iter().map(|r| r.id.as_str()).collect();
         for r in &served.all {
@@ -2816,7 +2833,7 @@ pub fn crowding_line(db: &Path, checkouts: Option<&Path>, full: bool) -> String 
         let mut input = serve::input::ServeInput::default();
         input.add_command(command);
         input.project = Some(project.clone());
-        let served = serve::serve_with_decay(&store, &input, &decay);
+        let served = serve::serve_with_decay(store, &input, decay);
         let shown: std::collections::HashSet<&str> =
             served.selection.shown.iter().map(|r| r.id.as_str()).collect();
         let where_lost = format!("{command} (command)");
@@ -2857,7 +2874,7 @@ pub fn crowding_line(db: &Path, checkouts: Option<&Path>, full: bool) -> String 
     // grind needs - while the count of them is still said out loud, so the
     // list getting shorter can never be mistaken for the crowd getting
     // smaller.
-    let judged_crowded: std::collections::HashSet<String> = serve::live::live_items(&store)
+    let judged_crowded: std::collections::HashSet<String> = serve::live::live_items(store)
         .iter()
         .filter(|li| li.item.tags.iter().any(|t| t == model::store::CROWDED_ON_PURPOSE_TAG))
         .map(|li| li.id.clone())
@@ -2882,6 +2899,106 @@ pub fn crowding_line(db: &Path, checkouts: Option<&Path>, full: bool) -> String 
         ));
     }
     out.join("\n")
+}
+
+/// The crowding report for GLOBAL items (no project): each is probed at its
+/// own anchors in EVERY registered working copy, the way the runtime would
+/// rank it there, and named with the project(s) where it applies but is not
+/// shown.
+///
+/// WHY A SECOND PASS. `project_crowding_text` probes an item only in the
+/// project that owns it, so a global item was never probed at its own anchor
+/// at all, and counted only when a project's probe happened to reach it
+/// (measured 2026-10-07, field test 12: six global command-anchored items
+/// hidden in at least one registered project, one of them in all six, while
+/// the line said "1 of 1112"). A global item hidden in one project is not
+/// healthy because it wins in another: the project of the incident is the
+/// one that matters. Reported on its own line group, so the project-scoped
+/// numbers above keep meaning exactly what they meant. Empty when no global
+/// item is outranked anywhere.
+fn global_crowding_lines(
+    store: &EventStore,
+    roots: &std::collections::BTreeMap<String, std::path::PathBuf>,
+    decay: &serve::decay::DecayContext,
+    full: bool,
+) -> Vec<String> {
+    let live = serve::live::live_items(store);
+    // (is_command, anchor) -> the global items bound to it.
+    let mut anchors: std::collections::BTreeMap<(bool, String), std::collections::BTreeSet<String>> = Default::default();
+    for li in live.iter().filter(|li| li.item.kind.can_fire() && li.item.project.is_none()) {
+        for binding in &li.item.bindings {
+            match binding {
+                model::item::Binding::Target { kind: model::item::TargetKind::Path, value } => {
+                    if value.contains(':') || value.starts_with('/') || value.starts_with("\\\\") {
+                        continue;
+                    }
+                    anchors.entry((false, value.clone())).or_default().insert(li.id.clone());
+                }
+                model::item::Binding::Target { kind: model::item::TargetKind::Command, value } => {
+                    anchors.entry((true, value.clone())).or_default().insert(li.id.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+    // item id -> anchor label -> the projects where it applies and is not shown.
+    let mut hidden: std::collections::BTreeMap<String, std::collections::BTreeMap<String, Vec<String>>> =
+        Default::default();
+    for ((is_command, anchor), ids) in &anchors {
+        for (project, base) in roots {
+            let mut input = serve::input::ServeInput::default();
+            if *is_command {
+                input.add_command(anchor);
+            } else {
+                // A path anchor only means something where the file exists.
+                if !base.join(anchor.replace('\\', "/")).exists() {
+                    continue;
+                }
+                input.add_file(anchor);
+            }
+            input.project = Some(project.clone());
+            let served = serve::serve_with_decay(store, &input, decay);
+            let shown: std::collections::HashSet<&str> =
+                served.selection.shown.iter().map(|r| r.id.as_str()).collect();
+            let applying: std::collections::HashSet<&str> = served.all.iter().map(|r| r.id.as_str()).collect();
+            for id in ids {
+                if applying.contains(id.as_str()) && !shown.contains(id.as_str()) {
+                    let label = if *is_command { format!("{anchor} (command)") } else { anchor.clone() };
+                    hidden.entry(id.clone()).or_default().entry(label).or_default().push(project.clone());
+                }
+            }
+        }
+    }
+    // Same rule as the project list: an item already judged crowded on
+    // purpose is counted, not listed.
+    let judged_crowded: std::collections::HashSet<&str> = live
+        .iter()
+        .filter(|li| li.item.tags.iter().any(|t| t == model::store::CROWDED_ON_PURPOSE_TAG))
+        .map(|li| li.id.as_str())
+        .collect();
+    let listed: Vec<(&String, &std::collections::BTreeMap<String, Vec<String>>)> =
+        hidden.iter().filter(|(id, _)| !judged_crowded.contains(id.as_str())).collect();
+    if hidden.is_empty() {
+        return Vec::new();
+    }
+    let mut out = vec![format!(
+        "crowding (global): {} global item(s) are eligible at their own trigger and outranked in at least one project, \
+         even where they win elsewhere - they are not shown there until a place is freed",
+        hidden.len()
+    )];
+    let settled = hidden.len() - listed.len();
+    if settled > 0 {
+        out.push(format!("  outranked: {settled} of them already judged as crowded on purpose, not listed"));
+    }
+    for (id, places) in listed.iter().take(name_cap(full)) {
+        let at: Vec<String> =
+            places.iter().map(|(anchor, projects)| format!("{anchor} in {}", projects.join(", "))).collect();
+        out.push(format!("  outranked: {id} (global) at {}", at.join("; ")));
+    }
+    if listed.len() > name_cap(full) {
+        out.push(format!("  outranked: and {} more, not named here", listed.len() - name_cap(full)));
+    }
+    out
 }
 
 /// How many live items are bound ONLY to a moment nothing in `serve` ever
@@ -5829,6 +5946,62 @@ mod tests {
                 "the command anchor must be named, tagged, and scoped to its project: {line}"
             );
         }
+    }
+
+    /// Two registered checkouts, each with one project item at the command
+    /// "npm run deploy", so both are probed; the first is then crowded with
+    /// `MAX_ITEMS` irreversible project items, the second is not. Returns the
+    /// store path and the checkouts root.
+    fn two_projects_at_one_command(dir: &Path, crowd_alpha: bool) -> (std::path::PathBuf, std::path::PathBuf) {
+        let db = dir.join("t.db");
+        let checkouts = dir.join("dev");
+        let deploy = || vec![Binding::Target { kind: TargetKind::Command, value: "npm run deploy".to_string() }];
+        let mut store = EventStore::new(&db).unwrap();
+        for project in ["Alpha-Crowded", "Beta-Quiet"] {
+            std::fs::create_dir_all(checkouts.join(project).join(".git")).unwrap();
+            let count = if project == "Alpha-Crowded" && crowd_alpha { serve::render::MAX_ITEMS } else { 1 };
+            for i in 0..count {
+                let mut item = rule(&format!("{}-owner-{i}", project.to_lowercase()));
+                item.text = format!("fixture project rule {i} for {project}");
+                item.project = Some(project.to_string());
+                item.severity = Some(model::item::Severity::Irreversible);
+                item.bindings = deploy();
+                legacy_declare(&mut store, &item);
+            }
+        }
+        let mut global = rule("global-deploy-note");
+        global.text = "fixture global rule about deploying".to_string();
+        global.bindings = deploy();
+        legacy_declare(&mut store, &global);
+        (db, checkouts)
+    }
+
+    /// THE DEFECT THIS PREVENTS (field test 12, R1): a GLOBAL item was never
+    /// probed at its own anchor, and counted only when a project's probe
+    /// reached it - so a global rule outranked in the one project of an
+    /// incident, but shown in another, was invisible to this line.
+    #[test]
+    fn crowding_line_names_a_global_item_outranked_in_one_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, checkouts) = two_projects_at_one_command(dir.path(), true);
+        let line = crowding_line(&db, Some(&checkouts), false);
+        assert!(line.contains("crowding (global): 1 global item(s)"), "{line}");
+        assert!(
+            line.contains("outranked: global-deploy-note (global) at npm run deploy (command) in Alpha-Crowded"),
+            "{line}"
+        );
+        assert!(!line.contains("Beta-Quiet"), "it wins in the quiet project, which must not be named: {line}");
+    }
+
+    /// The other half: a global item that is shown in every project it
+    /// applies in is healthy and must not be counted.
+    #[test]
+    fn crowding_line_does_not_count_a_global_item_shown_everywhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, checkouts) = two_projects_at_one_command(dir.path(), false);
+        let line = crowding_line(&db, Some(&checkouts), false);
+        assert!(!line.contains("global"), "{line}");
+        assert!(line.starts_with("crowding: none"), "{line}");
     }
 
     // ------------------------------------------------------- semantic_line
