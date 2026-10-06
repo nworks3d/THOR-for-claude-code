@@ -144,15 +144,16 @@ fn skipped_on_a_read_only_call(candidate: &LiveItem, input: &ServeInput, command
     !names_the_reader
 }
 
-/// Every Command target of `input`, cut into its segments in the sh dialect
-/// - the reading `absent_guard::command_anchor_names` gives a command's text,
+/// Every Command target of `input`, cut into its segments in the dialect of its
+/// tool (`input.dialect`; sh unless it is a PowerShell call) - the
+/// reading `absent_guard::command_anchor_names` gives a command's text,
 /// done once per call here rather than once per candidate.
 fn command_segments(input: &ServeInput) -> Vec<Vec<Segment>> {
     input
         .targets
         .iter()
         .filter(|(kind, _)| *kind == TargetKind::Command)
-        .map(|(_, command)| crate::shell::segments(command, crate::shell::Dialect::Sh))
+        .map(|(_, command)| crate::shell::segments(command, input.dialect))
         .collect()
 }
 
@@ -300,6 +301,7 @@ mod tests {
             file: None,
             root: None,
             shell_call: false,
+            dialect: Default::default(),
         }
     }
 
@@ -321,6 +323,7 @@ mod tests {
             file: None,
             root: None,
             shell_call: false,
+            dialect: Default::default(),
         }
     }
 
@@ -513,6 +516,7 @@ mod tests {
             file: None,
             root: None,
             shell_call: false,
+            dialect: Default::default(),
         };
         assert!(select(&[c.clone_for_test()], &miss).is_empty());
         let hit = ServeInput {
@@ -524,6 +528,7 @@ mod tests {
             file: None,
             root: None,
             shell_call: false,
+            dialect: Default::default(),
         };
         assert_eq!(select(&[c], &hit).len(), 1);
     }
@@ -547,6 +552,7 @@ mod tests {
             file: None,
             root: None,
             shell_call: false,
+            dialect: Default::default(),
         };
         assert_eq!(select(&[c], &input).len(), 1);
     }
@@ -569,6 +575,7 @@ mod tests {
             file: None,
             root: None,
             shell_call: false,
+            dialect: Default::default(),
         };
         assert_eq!(select(&[c], &input).len(), 1);
     }
@@ -593,6 +600,7 @@ mod tests {
             file: None,
             root: None,
             shell_call: false,
+            dialect: Default::default(),
         };
         assert_eq!(select(&[c.clone_for_test()], &with_args).len(), 1, "the arguments are the normal case");
 
@@ -608,6 +616,7 @@ mod tests {
                 file: None,
                 root: None,
                 shell_call: false,
+                dialect: Default::default(),
             };
             assert!(select(&[c.clone_for_test()], &input).is_empty(), "must not fire on: {miss}");
         }
@@ -630,6 +639,7 @@ mod tests {
             file: None,
             root: None,
             shell_call: false,
+            dialect: Default::default(),
         };
         for hit in [
             "cd repo && gh repo edit acme/x --visibility public",
@@ -656,6 +666,7 @@ mod tests {
             file: None,
             root: None,
             shell_call: false,
+            dialect: Default::default(),
         };
         assert!(select(&[c], &input).is_empty(), "a Command binding must not answer a Path target");
     }
@@ -710,6 +721,7 @@ mod tests {
             file: None,
             root: None,
             shell_call: false,
+            dialect: Default::default(),
         };
         let hits = select(&[generic, specific], &input);
         assert_eq!(hits[0].id, "s", "the item naming the real command/path must rank first");
@@ -815,6 +827,30 @@ mod tests {
 
     fn ids(hits: Vec<RankedItem>) -> Vec<String> {
         hits.into_iter().map(|h| h.id).collect()
+    }
+
+    /// FIELD TEST 12, R4: the serving path read every call in the sh dialect,
+    /// where a backslash is an escape, so `node tools\push.mjs` became the word
+    /// `toolspush.mjs` and a rule anchored at `node tools/push.mjs` never fired
+    /// for the PowerShell spelling. A PowerShell call is read as PowerShell now.
+    #[test]
+    fn a_powershell_call_with_a_backslash_path_reaches_a_forward_slash_command_anchor() {
+        let mut rule = base("push-rule", Kind::Rule);
+        rule.item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "node tools/push.mjs".to_string() }];
+        let facts = [rule];
+        let running_in = |command: &str, dialect: crate::shell::Dialect| {
+            let mut input = ServeInput { dialect, ..ServeInput::default() };
+            input.add_command(command);
+            ids(select(&facts, &input))
+        };
+        use crate::shell::Dialect::{PowerShell, Sh};
+        for command in ["node tools\\push.mjs 10.0.0.9", "node .\\tools\\push.mjs 10.0.0.9", "node tools/push.mjs 10.0.0.9"] {
+            assert_eq!(running_in(command, PowerShell), vec!["push-rule".to_string()], "{command}");
+        }
+        assert_eq!(running_in("node tools/push.mjs 10.0.0.9", Sh), vec!["push-rule".to_string()]);
+        for command in ["node tools/pushx.mjs 10.0.0.9", "node other/push.mjs 10.0.0.9", "node tools\\pushx.mjs 10.0.0.9"] {
+            assert!(running_in(command, PowerShell).is_empty(), "{command}");
+        }
     }
 
     /// THE DEFECT (field test 7): a read-only `cat server/package.json | grep

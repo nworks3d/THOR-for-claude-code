@@ -143,8 +143,9 @@ use std::sync::Arc;
 
 /// The shell a command line is written for. A PowerShell tool call is read as
 /// PowerShell; everything else (Bash, and every reader with no tool name) as sh.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Dialect {
+    #[default]
     Sh,
     PowerShell,
 }
@@ -2206,8 +2207,33 @@ fn eq_lower(word: &str, lower: &str) -> bool {
     word.chars().flat_map(char::to_lowercase).eq(lower.chars())
 }
 
+/// Whether the call's `word` is the anchor's `anchor` word (already lowercased).
+///
+/// A word that is a PATH (it holds a slash or a backslash) is compared with
+/// both separators read as one: `tools\push.mjs` and `tools/push.mjs` name the
+/// same file, and a Windows caller types the first where the anchor, written
+/// once, holds the second. A leading `./` or `.\` on the call's word is the
+/// same file too, so it is dropped when the anchor has none. Exact words, never
+/// a glob and never a substring: `tools/pushx.mjs` and `other/push.mjs` are
+/// other files.
+fn word_eq(word: &str, anchor: &str) -> bool {
+    if eq_lower(word, anchor) {
+        return true;
+    }
+    let is_sep = |c: char| c == '/' || c == '\\';
+    if !word.contains(is_sep) && !anchor.contains(is_sep) {
+        return false;
+    }
+    let slashed = |text: &str| -> String {
+        text.chars().flat_map(char::to_lowercase).map(|c| if c == '\\' { '/' } else { c }).collect()
+    };
+    let (word, anchor) = (slashed(word), slashed(anchor));
+    let word = if anchor.starts_with("./") { word.as_str() } else { word.strip_prefix("./").unwrap_or(&word) };
+    word == anchor
+}
+
 fn prefix(words: &[String], anchor: &[String]) -> bool {
-    words.len() >= anchor.len() && words.iter().zip(anchor).all(|(w, a)| eq_lower(w, a))
+    words.len() >= anchor.len() && words.iter().zip(anchor).all(|(w, a)| word_eq(w, a))
 }
 
 /// An anchor, read once.
@@ -2332,7 +2358,7 @@ fn flat_rest<'s>(a: &Anchor, seg: &'s Segment) -> Option<&'s [String]> {
                 Some(exe) => first.rsplit(['/', '\\']).next().is_some_and(|base| eq_lower(base, exe)),
                 None => seg.head.get(p).is_some_and(|base| *base == a.words[0]) || eq_lower(first, &a.words[0]),
             };
-            first_ok && seg.words[p + 1..p + len].iter().zip(&a.words[1..]).all(|(w, x)| eq_lower(w, x))
+            first_ok && seg.words[p + 1..p + len].iter().zip(&a.words[1..]).all(|(w, x)| word_eq(w, x))
         })
         .map(|p| &seg.words[p + len..])
 }

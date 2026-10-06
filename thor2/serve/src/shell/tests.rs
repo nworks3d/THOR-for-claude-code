@@ -1111,3 +1111,54 @@ fn a_deep_nest_of_powershell_word_groups_never_crashes() {
         assert!(fb_ps(&["docker exec"], PROD, &cmd).1, "must be refused: {} bytes", cmd.len());
     }
 }
+
+// ------------------------------------------------ a path word in a command anchor
+
+/// FIELD TEST 12, R4: an anchor is written once with forward slashes
+/// (`node tools/push.mjs`), and a Windows caller types the same file with
+/// backslashes, or with a leading `.\`. The call was read word for word, so
+/// neither fired nor was refused. Measured with `serve why`.
+#[test]
+fn a_backslash_or_dot_slash_spelling_of_the_anchors_path_word_reaches_it() {
+    let anchor = "node tools/push.mjs";
+    let reaches = |cmd: &str, dialect: Dialect| reaches_any(anchor, &segments(cmd, dialect));
+    for cmd in [
+        r"node tools\push.mjs 10.0.0.9",
+        r"node .\tools\push.mjs 10.0.0.9",
+        "node ./tools/push.mjs 10.0.0.9",
+        "node tools/push.mjs 10.0.0.9",
+    ] {
+        assert!(reaches(cmd, Dialect::PowerShell), "PowerShell must reach: {cmd}");
+    }
+    // Bash: a backslash is an escape, so only the slash spellings are the file.
+    assert!(reaches("node tools/push.mjs x", Dialect::Sh));
+    assert!(reaches("node ./tools/push.mjs x", Dialect::Sh));
+    for cmd in [
+        "node tools/pushx.mjs x",
+        "node other/push.mjs x",
+        r"node tools\pushx.mjs x",
+        r"node xtools\push.mjs x",
+        r"node ..\tools\push.mjs x",
+    ] {
+        assert!(!reaches(cmd, Dialect::PowerShell), "must not reach: {cmd}");
+        assert!(!reaches(cmd, Dialect::Sh), "must not reach: {cmd}");
+    }
+    // An anchor that itself starts the word with `./` keeps that form.
+    assert!(!reaches_any("node ./tools/push.mjs", &segments(r"node tools\push.mjs", Dialect::PowerShell)));
+    assert!(reaches_any("node ./tools/push.mjs", &segments(r"node .\tools\push.mjs", Dialect::PowerShell)));
+}
+
+/// The same reach, as the hard guard uses it: a forbidden check on the anchor
+/// refuses the backslash spelling of the call (a PowerShell tool call), and
+/// still lets the other files through.
+#[test]
+fn a_forbidden_check_on_the_anchor_refuses_the_backslash_spelling() {
+    let anchors = ["node tools/push.mjs"];
+    for cmd in [r"node tools\push.mjs 10.0.0.9 --live", r"node .\tools\push.mjs 10.0.0.9 --live", r"cd x; node tools\push.mjs --live"] {
+        assert!(fb_ps(&anchors, &["--live"], cmd).1, "must be refused: {cmd}");
+    }
+    assert!(fb(&anchors, &["--live"], "node tools/push.mjs 10.0.0.9 --live").1);
+    for cmd in [r"node tools\pushx.mjs 10.0.0.9 --live", r"node other\push.mjs 10.0.0.9 --live", r"node tools\push.mjs 10.0.0.9"] {
+        assert!(!fb_ps(&anchors, &["--live"], cmd).1, "must pass: {cmd}");
+    }
+}

@@ -2297,6 +2297,7 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                 let mut input = ServeInput {
                     project: folder_project.clone(),
                     root: session_cwd.clone(),
+                    dialect: serve::shell::dialect_for(tool_name),
                     ..Default::default()
                 };
                 if let Some(command) = absent_guard::proposed_command(tool_input) {

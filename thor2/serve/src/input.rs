@@ -381,6 +381,11 @@ pub struct ServeInput {
     /// TOOL call is a search the owner measured to fire the rules anchored at
     /// the place it searches, and still does).
     pub shell_call: bool,
+    /// The shell `command` is written for: PowerShell for a PowerShell tool
+    /// call, sh otherwise. A backslash is an escape in sh and a path separator
+    /// in PowerShell, so `rank::select` must read the call in the dialect it
+    /// was typed in (`dialect_for`).
+    pub dialect: crate::shell::Dialect,
 }
 
 impl ServeInput {
