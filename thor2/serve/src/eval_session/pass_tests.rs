@@ -597,6 +597,9 @@ fn an_uncommitted_contains_is_retried_at_the_start() {
     let second = fx.start(S2, "beta");
     assert_eq!(second.frozen.machine.as_ref().unwrap().items.iter().map(|i| (i.id.as_str(), i.outcome)).collect::<Vec<_>>(), vec![("co", MachineOutcome::Unchanged)]);
     assert_eq!(fx.machine_writes("co").len(), 1);
+    // The start note's TEETH sentence names every outcome, so its parts add
+    // up to the number tried (field test 11: 'tried 36' summed to 35).
+    assert!(start_note(&second).contains("tried 1 old rule(s)") && start_note(&second).contains("1 tried again and left as they were"), "{}", start_note(&second));
 
     git(&beta, &["commit", "-q", "-am", "keep me"]);
     let third = fx.start(S3, "beta");

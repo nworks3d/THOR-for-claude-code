@@ -4381,6 +4381,16 @@ pub struct MachinePass {
     pub box_secs: u64,
 }
 
+impl MachinePass {
+    /// Rules tried again and left as they were: `Unchanged` (still the same
+    /// rule) and `PendingKept` (the pending check still cannot be tried).
+    /// Neither has a counter field of its own, and a sentence that lists the
+    /// others without these sums to less than the number tried.
+    pub fn left_as_they_were(&self) -> usize {
+        self.items.iter().filter(|i| matches!(i.outcome, MachineOutcome::Unchanged | MachineOutcome::PendingKept)).count()
+    }
+}
+
 /// The lists an evaluation start froze, spliced into the start record's body
 /// as the trailing key `"frozen"`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -6257,7 +6267,7 @@ fn machine_section(store: &EventStore, start: &EvaluationStart, filed_seq: i64) 
     match &frozen.machine {
         Some(machine) => out.push_str(&format!(
             "THOR tried {} old rule(s) itself at the start (time box {} s): {} bite, {} note(s), {} pending check(s) hung, {} \
-             blocked, {} need the agent, {} need only their literal named (A4), not reached: {}.",
+             blocked, {} need the agent, {} need only their literal named (A4), {} tried again and left as they were, not reached: {}.",
             machine.items.len(),
             machine.box_secs,
             machine.bites,
@@ -6266,6 +6276,7 @@ fn machine_section(store: &EventStore, start: &EvaluationStart, filed_seq: i64) 
             machine.blocked,
             machine.needs_agent,
             machine.a4_only,
+            machine.left_as_they_were(),
             machine.not_reached
         )),
         None => out.push_str("THOR's pass over the old rules left no record."),
@@ -9752,6 +9763,58 @@ mod tests {
         assert!(side.contains("- 'ol-a' item_marked_useful at log seq") && side.contains("fixture: no toolUseId in the call's _meta"), "{side}");
         assert!(side.contains("- 'ol-b' item_marked_useful at log seq") && side.contains("written by 'cli' with no stamp"), "{side}");
         assert!(!side.contains("'ol-c'") && !side.contains("ol-off-list"), "an attested call of any session is no side door: {side}");
+    }
+
+    /// Field test 11: the TEETH sentence left out the rules tried again and
+    /// left as they were, so "tried 36" listed parts that summed to 35. Every
+    /// outcome the pass can record has a part in the sentence.
+    #[test]
+    fn the_teeth_sentence_parts_add_up_to_the_number_tried() {
+        let mut store = EventStore::in_memory().unwrap();
+        let outcomes = [
+            MachineOutcome::Rule,
+            MachineOutcome::Rule,
+            MachineOutcome::Note,
+            MachineOutcome::PendingHung,
+            MachineOutcome::PendingKept,
+            MachineOutcome::PendingKept,
+            MachineOutcome::Blocked,
+            MachineOutcome::NeedsAgent,
+            MachineOutcome::A4Only,
+            MachineOutcome::Unchanged,
+            MachineOutcome::Unchanged,
+            MachineOutcome::Unchanged,
+        ];
+        let items: Vec<MachineItem> =
+            outcomes.iter().enumerate().map(|(n, o)| machine_item(&format!("tp-{n}"), *o, "fixture", None)).collect();
+        let count = |o: MachineOutcome| items.iter().filter(|i| i.outcome == o).count();
+        let pass = MachinePass {
+            bites: count(MachineOutcome::Rule),
+            notes: count(MachineOutcome::Note),
+            pending_hung: count(MachineOutcome::PendingHung),
+            blocked: count(MachineOutcome::Blocked),
+            needs_agent: count(MachineOutcome::NeedsAgent),
+            a4_only: count(MachineOutcome::A4Only),
+            items: items.clone(),
+            ..MachinePass::default()
+        };
+        assert_eq!(
+            pass.bites + pass.notes + pass.pending_hung + pass.blocked + pass.needs_agent + pass.a4_only + pass.left_as_they_were(),
+            items.len(),
+            "every outcome has exactly one part"
+        );
+        let first = record_start_only(&mut store, "tp-session", "tp");
+        let start = record_evaluation_batch(&mut store, SystemActor::new(EVAL_MACHINE_ACTOR), &first, "fixture, decided", vec![], 0, vec![], pass)
+            .unwrap();
+        let filed_seq = store.get_next_seq().unwrap() - 1;
+        let section = render_machine_section(&store, &start, filed_seq);
+        let line = section.lines().find(|l| l.starts_with("TEETH: THOR tried")).expect("the TEETH sentence");
+        let tried: usize = line.split_whitespace().nth(3).and_then(|n| n.parse().ok()).expect("the tried count");
+        let parts = line.split("): ").nth(1).and_then(|p| p.split(", not reached").next()).expect("the parts");
+        let sum: usize =
+            parts.split(", ").map(|part| part.split_whitespace().next().and_then(|n| n.parse::<usize>().ok()).expect("a count")).sum();
+        assert_eq!((tried, sum), (12, 12), "{line}");
+        assert!(line.contains("5 tried again and left as they were"), "{line}");
     }
 
     /// B1: the machine section is a pure function of the log truncated at F.

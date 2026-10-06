@@ -1002,13 +1002,14 @@ fn teeth_section(out: &mut String, frozen: &Frozen, machine: &MachinePass) {
     out.push_str(&format!(
         "THOR tried {reached} old rule(s) of this project itself at the start (time box {} s): {} bite and are on the rule \
          track now, {} became a note, {} pending check(s) hung, {} held by a blocker only the owner can lift (see 3), \
-         {} need you; not reached this time: {} (not owed in this evaluation - the next one starts with them).",
+         {} need you, {} tried again and left as they were; not reached this time: {} (not owed in this evaluation - the next one starts with them).",
         machine.box_secs,
         machine.bites,
         machine.notes,
         machine.pending_hung,
         machine.blocked,
         machine.needs_agent + machine.a4_only,
+        machine.left_as_they_were(),
         machine.not_reached
     ));
     let hung: Vec<String> =
