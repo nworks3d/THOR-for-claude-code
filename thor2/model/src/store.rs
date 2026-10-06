@@ -2202,12 +2202,23 @@ fn pool_rivals<'a>(
     item: &Item,
     binding: &Binding,
 ) -> Vec<&'a (String, Item)> {
+    // A Command anchor is read once, as the call the runtime would see it
+    // when this very command is typed (see `command_covers`).
+    let new_command = match binding {
+        Binding::Target { kind: crate::item::TargetKind::Command, value } => {
+            Some(crate::shell::segments(value, crate::shell::Dialect::PowerShell))
+        }
+        _ => None,
+    };
     let Some(kind_match): Option<&dyn Fn(&Binding) -> bool> = (match binding {
         Binding::Always => None,
         Binding::Moment(_) => Some(&|b: &Binding| matches!((b, binding), (Binding::Moment(x), Binding::Moment(y)) if x == y)),
         Binding::Target { .. } => Some(&|b: &Binding| match (b, binding) {
             (Binding::Target { kind: bk, value: bv }, Binding::Target { kind, value }) => {
                 crate::normalize::target_matches(*bk, bv, *kind, value)
+                    || new_command.as_ref().is_some_and(|segments| {
+                        *bk == crate::item::TargetKind::Command && crate::shell::reaches_any(bv, segments)
+                    })
             }
             _ => false,
         }),
@@ -2217,19 +2228,92 @@ fn pool_rivals<'a>(
 
     candidates
         .iter()
-        .filter(|(id, other)| {
-            if *id == item.id || !other.kind.can_fire() {
-                return false;
-            }
-            match (item.project.as_deref(), other.project.as_deref()) {
-                (None, None) => true,
-                (None, Some(_)) => false,
-                (Some(_), None) => true,
-                (Some(mine), Some(theirs)) => mine == theirs,
-            }
-        })
+        .filter(|(id, other)| shares_a_pool_with(item, id, other))
         .filter(|(_, other)| other.bindings.iter().any(|b| kind_match(b)))
         .collect()
+}
+
+/// Whether `other` (stored as `id`) can sit in a pool `item` is in: a live
+/// firing kind of its own project or of the global tier (scope: see
+/// `pool_rivals`).
+fn shares_a_pool_with(item: &Item, id: &str, other: &Item) -> bool {
+    if id == item.id || !other.kind.can_fire() {
+        return false;
+    }
+    match (item.project.as_deref(), other.project.as_deref()) {
+        (None, None) => true,
+        (None, Some(_)) => false,
+        (Some(_), None) => true,
+        (Some(mine), Some(theirs)) => mine == theirs,
+    }
+}
+
+/// Whether the Command anchor `broad` fires on every call the Command anchor
+/// `narrow` fires on - the runtime's own word-prefix reading
+/// (`shell::reaches_any`: the anchor's words are a prefix of the call's), asked
+/// of `narrow` read as a call. `normalize::target_matches` cannot answer this:
+/// it compares paths (equality or a path-segment suffix), so `node
+/// tools/push.mjs` never counted as a rival of `node tools/push.mjs 10.0.0.5`
+/// while at runtime it reaches every call the longer anchor was written for.
+/// Both anchors are read in the PowerShell dialect, the one an anchor itself is
+/// parsed in (a backslash is literal).
+fn command_covers(broad: &str, narrow: &str) -> bool {
+    crate::shell::reaches_any(broad, &crate::shell::segments(narrow, crate::shell::Dialect::PowerShell))
+}
+
+/// The live items that fire together on the BUSIEST call a narrower rival
+/// anchor stands for, when the NEW Command `binding` is a word prefix of that
+/// anchor: the new item fires on that call too, so those items and the new one
+/// all compete for its block. Empty for any other kind of binding, or when no
+/// live anchor is narrower than the new one.
+///
+/// Counted by the write gate's capacity refusal only (`full_reliable_anchor`),
+/// never by `pool_rivals`. Not every narrower anchor counts: `ssh`, written
+/// when a dozen different `ssh <host>` anchors exist, is not crowded by them,
+/// because no single call reaches all twelve. A call is the unit that
+/// competes, so this takes the one call (a narrower anchor read as a call)
+/// where the most live items fire at once - the displacement the refusal can
+/// actually promise.
+fn busiest_narrower_call<'a>(
+    candidates: &'a [(String, Item)],
+    item: &Item,
+    binding: &Binding,
+) -> Vec<&'a (String, Item)> {
+    let Binding::Target { kind: crate::item::TargetKind::Command, value } = binding else {
+        return Vec::new();
+    };
+    let in_scope: Vec<&(String, Item)> =
+        candidates.iter().filter(|(id, other)| shares_a_pool_with(item, id, other)).collect();
+    let commands = |other: &Item| -> Vec<String> {
+        other
+            .bindings
+            .iter()
+            .filter_map(|b| match b {
+                Binding::Target { kind: crate::item::TargetKind::Command, value } => Some(value.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let mut narrower: Vec<String> = in_scope
+        .iter()
+        .flat_map(|(_, other)| commands(other))
+        .filter(|ov| ov != value && command_covers(value, ov))
+        .collect();
+    narrower.sort();
+    narrower.dedup();
+
+    let mut busiest: Vec<&(String, Item)> = Vec::new();
+    for call in &narrower {
+        let firing: Vec<&(String, Item)> = in_scope
+            .iter()
+            .copied()
+            .filter(|(_, other)| commands(other).iter().any(|ov| command_covers(ov, call)))
+            .collect();
+        if firing.len() > busiest.len() {
+            busiest = firing;
+        }
+    }
+    busiest
 }
 
 /// Would this item ever reach a block, and if not, is that provable?
@@ -2584,7 +2668,11 @@ fn full_reliable_anchor(candidates: &[(String, Item)], item: &Item, bindings: &[
         if previously_bound.contains(binding) {
             continue;
         }
-        let rivals = pool_rivals(candidates, item, binding);
+        let mut rivals = pool_rivals(candidates, item, binding);
+        let busiest = busiest_narrower_call(candidates, item, binding);
+        if busiest.len() > rivals.len() {
+            rivals = busiest;
+        }
         if rivals.len() < crate::item::MAX_ITEMS {
             continue;
         }
@@ -8089,6 +8177,94 @@ mod tests {
         widened.bindings.push(Binding::Target { kind: TargetKind::Path, value: "src/shared/gateway.rs".to_string() });
         revise(&mut store, "s", "l", "t", &existing, &widened)
             .expect_err("adding a binding to a full anchor is a new arrival there, judged as one");
+    }
+
+    fn command_bound(id: &str, nth: usize, command: &str) -> Item {
+        let mut item = sample_with(id, DISTINCT[nth % DISTINCT.len()]);
+        item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: command.to_string() }];
+        item
+    }
+
+    /// THE DEFECT THIS PREVENTS (field test 11): a full command anchor
+    /// (`node tools/push.mjs`, four facts) was dodged by binding the new rule
+    /// to the narrower `node tools/push.mjs 10.0.0.5`. The gate counted
+    /// rivals as path strings, so the broad anchor was no rival; at runtime
+    /// (`shell::reaches_any`) the broad anchor reaches every call the narrow
+    /// one is meant for, so the new rule was crowded out the moment it landed.
+    #[test]
+    fn a_narrower_command_anchor_under_a_full_broader_one_is_refused() {
+        let mut store = EventStore::in_memory().unwrap();
+        for i in 0..crate::item::MAX_ITEMS {
+            let sitting = command_bound(&format!("sit-{i}"), i, "node tools/push.mjs");
+            declare(&mut store, "s", "l", "t", &sitting).expect("fixture must store");
+        }
+        let narrow = command_bound("narrow", 8, "node tools/push.mjs 10.0.0.5");
+        let err = declare(&mut store, "s", "l", "t", &narrow).expect_err("the broad anchor reaches every call the narrow one does");
+        let msg = format!("{err}");
+        assert!(msg.contains("sit-0"), "the refusal must name the occupants: {msg}");
+        assert!(msg.contains("fold, move or archive"), "and the three exits: {msg}");
+    }
+
+    /// The other direction of the same runtime relation: a new BROAD anchor
+    /// fires on the calls four existing narrower rules fire on.
+    #[test]
+    fn a_broader_command_anchor_over_four_narrower_ones_is_refused() {
+        let mut store = EventStore::in_memory().unwrap();
+        for i in 0..crate::item::MAX_ITEMS {
+            let sitting = command_bound(&format!("sit-{i}"), i, "node tools/push.mjs 10.0.0.5");
+            declare(&mut store, "s", "l", "t", &sitting).expect("fixture must store");
+        }
+        let broad = command_bound("broad", 8, "node tools/push.mjs");
+        declare(&mut store, "s", "l", "t", &broad).expect_err("the narrow anchors fire on calls the broad one fires on");
+    }
+
+    /// Narrower anchors only crowd a broad one when a single call reaches them
+    /// all: four DIFFERENT `node tools/push.mjs <host>` anchors never fire on
+    /// the same call, so a broad `node tools/push.mjs` rule is not displaced.
+    #[test]
+    fn a_broad_command_anchor_over_unrelated_narrower_ones_is_not_refused() {
+        let mut store = EventStore::in_memory().unwrap();
+        for i in 0..crate::item::MAX_ITEMS {
+            let sitting = command_bound(&format!("sit-{i}"), i, &format!("node tools/push.mjs host-{i}"));
+            declare(&mut store, "s", "l", "t", &sitting).expect("fixture must store");
+        }
+        let broad = command_bound("broad", 8, "node tools/push.mjs");
+        declare(&mut store, "s", "l", "t", &broad).expect("no single call reaches all four narrower anchors");
+    }
+
+    /// A command that shares only its first word, and is not a word prefix of
+    /// the other, never fires on the same calls: not a rival.
+    #[test]
+    fn a_command_anchor_that_is_not_a_word_prefix_is_not_a_rival() {
+        let mut store = EventStore::in_memory().unwrap();
+        for i in 0..crate::item::MAX_ITEMS {
+            let sitting = command_bound(&format!("sit-{i}"), i, "node tools/push.mjs");
+            declare(&mut store, "s", "l", "t", &sitting).expect("fixture must store");
+        }
+        for (n, other) in ["node other.mjs", "node tools/push.mjs.bak", "node tools/push", "nodejs tools/push.mjs"].iter().enumerate() {
+            let unrelated = command_bound(&format!("unrelated-{n}"), 4 + n, other);
+            declare(&mut store, "s", "l", "t", &unrelated)
+                .unwrap_or_else(|e| panic!("'{other}' is no word prefix of 'node tools/push.mjs': {e}"));
+        }
+    }
+
+    /// An existing crowded item is never demoted or re-checked: revising it in
+    /// place (same command binding) is judged only for bindings new to the
+    /// write.
+    #[test]
+    fn an_existing_crowded_command_item_is_untouched() {
+        let mut store = EventStore::in_memory().unwrap();
+        for i in 0..crate::item::MAX_ITEMS {
+            let sitting = command_bound(&format!("sit-{i}"), i, "node tools/push.mjs");
+            declare(&mut store, "s", "l", "t", &sitting).expect("fixture must store");
+        }
+        // Crowded already: stored through a back door, as a pre-fix write.
+        let crowded = command_bound("crowded", 8, "node tools/push.mjs 10.0.0.5");
+        seed_live(&mut store, &crowded);
+        let existing = show(&store, "crowded").unwrap();
+        let mut reworded = existing.clone();
+        reworded.text = format!("{} - reworded", existing.text);
+        revise(&mut store, "s", "l", "t", &existing, &reworded).expect("a binding the item already stood on is never refused");
     }
 
     // ------------------------------------------------ capacity_for_revise

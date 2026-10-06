@@ -17,6 +17,7 @@ pub mod item;
 pub mod marked;
 pub mod normalize;
 pub mod served;
+pub mod shell;
 pub mod store;
 
 pub use gate::{Refusal, Warning};
