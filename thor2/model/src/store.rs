@@ -6465,8 +6465,8 @@ fn machine_section(store: &EventStore, start: &EvaluationStart, filed_seq: i64) 
         }
     }
     out.push_str(&format!(
-        "\n\nREFUSED: in the window the hook refused {verified} real tool call(s) (verified in a session's transcript); \
-         {never_proof} probe or hand-fed refusal(s) (never proof); {unchecked} not verified yet; {trial_refused} write(s) \
+        "\n\nREFUSED: during the evaluation itself (log seq {n} to {filed_seq}; work before it is not counted here) the \
+         hook refused {verified} real tool call(s) (verified in a session's transcript); {never_proof} probe or hand-fed refusal(s) (never proof); {unchecked} not verified yet; {trial_refused} write(s) \
          refused by THOR's own trial."
     ));
     if trial_refused_elsewhere > 0 {
@@ -6514,7 +6514,10 @@ fn machine_section(store: &EventStore, start: &EvaluationStart, filed_seq: i64) 
     }
     summary.side_doors = side_doors.len();
     summary.unverified = unverified.len();
-    out.push_str(&format!("\n\nSIDE DOORS: {} write(s) in the window outside an attested THOR call.", side_doors.len()));
+    out.push_str(&format!(
+        "\n\nSIDE DOORS: {} write(s) outside an attested THOR call during the evaluation itself (log seq {n} to {filed_seq}).",
+        side_doors.len()
+    ));
     side_doors.iter().for_each(|line| out.push_str(line));
     out.push_str(&format!("\nchecked at the end of this turn: {} write(s).", unverified.len()));
     unverified.iter().for_each(|line| out.push_str(line));
@@ -9759,7 +9762,7 @@ mod tests {
         let text = show(&store, "eval-ol-1").unwrap().text;
         assert!(text.contains("totals: 0 useful, 0 noise, 3 skipped"), "{text}");
         let side = text.split("SIDE DOORS: ").nth(1).expect("the side-door block");
-        assert!(side.starts_with("2 write(s) in the window outside an attested THOR call."), "{side}");
+        assert!(side.starts_with("2 write(s) outside an attested THOR call during the evaluation itself (log seq "), "{side}");
         assert!(side.contains("- 'ol-a' item_marked_useful at log seq") && side.contains("fixture: no toolUseId in the call's _meta"), "{side}");
         assert!(side.contains("- 'ol-b' item_marked_useful at log seq") && side.contains("written by 'cli' with no stamp"), "{side}");
         assert!(!side.contains("'ol-c'") && !side.contains("ol-off-list"), "an attested call of any session is no side door: {side}");
@@ -9858,7 +9861,7 @@ mod tests {
         assert!(section.contains("frozen A4 list: 0 rule(s)."), "{section}");
         assert!(section.contains("OPEN POINTS: 0 of THOR's own, 0 legacy."), "{section}");
         assert!(section.contains("1 not verified yet"), "the hook's refusal in the window has no recorded check: {section}");
-        assert!(section.contains("SIDE DOORS: 0 write(s) in the window outside an attested THOR call."), "{section}");
+        assert!(section.contains("SIDE DOORS: 0 write(s) outside an attested THOR call during the evaluation itself (log seq "), "{section}");
         assert_eq!(
             machine_section_summary(&store, &start, filed_seq),
             MachineSummary {
@@ -10067,6 +10070,35 @@ mod tests {
             "{section}"
         );
         assert_eq!(machine_section_summary(&store, &start, filed_seq).checks_weakened, 1);
+    }
+
+    /// Field test 11: REFUSED and SIDE DOORS read "0" for every report because
+    /// they cover only the evaluation itself (SPEC-ENFORCEMENT 7.8 N15 names
+    /// that window: from its start to its filing - a refusal outside it could
+    /// be planted). The window is deliberately NOT widened; the two lines now
+    /// say which window they count, so a reader does not take "0" for the
+    /// work period.
+    #[test]
+    fn refused_and_side_doors_name_the_window_they_count() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare_noted(&mut store, &light_command_rule("win-rule", "mp"));
+        let early = store.append_event("work-session", "work-session", "hook", EventKind::GateRefused, "win-rule", None, "{}").unwrap().seq;
+        record_refusal_verification(&mut store, "work-session", SystemActor::new(ATTESTER_ACTOR), "win-rule", early, true, "fixture").unwrap();
+        let start = record_start(&mut store, "mp-session", "mp");
+        assert!(early < start.frozen.started_seq, "fixture: the refusal came before the evaluation");
+        let late = store.append_event("work-session", "work-session", "hook", EventKind::GateRefused, "win-rule", None, "{}").unwrap().seq;
+        record_refusal_verification(&mut store, "work-session", SystemActor::new(ATTESTER_ACTOR), "win-rule", late, true, "fixture").unwrap();
+        let filed_seq = store.get_next_seq().unwrap() - 1;
+        let section = render_machine_section(&store, &start, filed_seq);
+        let window = format!("log seq {} to {filed_seq}", start.frozen.started_seq);
+        assert!(
+            section.contains(&format!("REFUSED: during the evaluation itself ({window}")) && section.contains("the hook refused 1 real tool call(s)"),
+            "only the refusal inside the evaluation counts, and the line says so: {section}"
+        );
+        assert!(
+            section.contains(&format!("SIDE DOORS: 0 write(s) outside an attested THOR call during the evaluation itself ({window})")),
+            "{section}"
+        );
     }
 
     /// Step 20 (NEW-2): in the machine section, a refusal the EVALUATING
