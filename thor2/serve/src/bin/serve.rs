@@ -538,7 +538,14 @@ fn decay_notice(store: &EventStore, db: &Path, cwd: Option<&Path>) -> Option<Str
             continue;
         }
         for binding in &li.item.bindings {
-            if let model::item::Binding::Target { kind: model::item::TargetKind::Path, value } = binding {
+            // Path AND Dir, as doctor's decay line counts them: a fact anchored
+            // to a directory that is gone fires nowhere, like one anchored to a
+            // deleted file.
+            if let model::item::Binding::Target {
+                kind: model::item::TargetKind::Path | model::item::TargetKind::Dir,
+                value,
+            } = binding
+            {
                 if value.contains(':') || value.starts_with('/') || value.starts_with("\\\\") {
                     continue;
                 }
@@ -4181,6 +4188,43 @@ mod decay_notice_tests {
 
         let notice = decay_notice(&store, &db, Some(&root)).expect("an untagged dead anchor is decay");
         assert!(notice.contains("Some-Project: 1 anchor(s) point at a file that is not there"), "{notice}");
+    }
+
+    /// THE DEFECT THIS CLOSES: doctor's decay line counts a dead DIRECTORY
+    /// anchor as well as a dead file anchor (since 2026-08-14); this
+    /// session-start line counted only files, so a project whose directory
+    /// had gone was told nothing while doctor said it was rotten. An anchor
+    /// at a directory that still exists is not decay, and the deliberate-
+    /// anchor tag skips a Dir anchor the same way it skips a Path one.
+    #[test]
+    fn a_dead_directory_anchor_counts_like_a_dead_file() {
+        let (dir, root) = checkout("Some-Project");
+        std::fs::create_dir_all(root.join("fleet").join("kept")).unwrap();
+        let db = dir.path().join("thor.db");
+        let mut store = EventStore::new(&db).unwrap();
+        let dir_rule = |id: &str, value: &str, tags: Vec<String>| Item {
+            id: id.to_string(),
+            kind: Kind::Rule,
+            text: format!("guards the {value} tree"),
+            bindings: vec![Binding::Target { kind: TargetKind::Dir, value: value.to_string() }],
+            severity: None,
+            project: Some("Some-Project".to_string()),
+            tags,
+            expires: None,
+            key: None,
+            falsifier: Some("the directory stops mattering".to_string()),
+            check: None,
+        };
+        model::store::declare(&mut store, "t", "t", "t", &dir_rule("kept-dir", "fleet/kept", vec![])).unwrap();
+        assert!(decay_notice(&store, &db, Some(&root)).is_none(), "a directory that exists is not decay");
+
+        let tagged = vec![model::store::DELIBERATE_ANCHOR_TAG.to_string()];
+        model::store::declare(&mut store, "t", "t", "t", &dir_rule("ignored-dir", "fleet/ignored", tagged)).unwrap();
+        assert!(decay_notice(&store, &db, Some(&root)).is_none(), "a deliberate Dir anchor is skipped like a Path one");
+
+        model::store::declare(&mut store, "t", "t", "t", &dir_rule("gone-dir", "fleet/gone", vec![])).unwrap();
+        let notice = decay_notice(&store, &db, Some(&root)).expect("a dead Dir anchor is decay");
+        assert!(notice.contains("Some-Project: 1 anchor(s)"), "{notice}");
     }
 
     /// Scope: another project's dead anchor, under the same checkouts folder,
