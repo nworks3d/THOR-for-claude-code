@@ -4435,6 +4435,12 @@ pub struct MachinePass {
     /// - the A4 list holds the first `EVALUATION_A4_LIST` of them.
     #[serde(default)]
     pub a4_only: usize,
+    /// How many of the rules the pass tried (`items`) belong to no project.
+    /// They apply to every project, so each evaluation tries them, and the
+    /// start note counts them apart from the project's own rules. 0 for a
+    /// record written before this field existed.
+    #[serde(default)]
+    pub projectless: usize,
     /// Rules the pass did not reach inside its time box. Not owed in this
     /// evaluation; the next start begins with them.
     #[serde(default)]

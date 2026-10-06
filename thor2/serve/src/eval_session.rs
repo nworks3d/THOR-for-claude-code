@@ -395,6 +395,8 @@ struct Candidate {
     /// A rule-track contains check tried again (K9): its verdict stands
     /// unless this pass finds otherwise.
     retry: bool,
+    /// The rule belongs to no project (it applies to every one).
+    projectless: bool,
 }
 
 /// The seq of the last write of `id` (create, revise, resolve, move).
@@ -456,7 +458,7 @@ fn candidates(store: &EventStore, project: &str, start: &EvaluationStart) -> Vec
             Settlement::Settled(_) => continue,
         };
         let key = last_write(store, &li.id);
-        found.push((group, key, Candidate { id: li.id, pending, retry }));
+        found.push((group, key, Candidate { projectless: li.item.project.is_none(), id: li.id, pending, retry }));
     }
     let left_over: Vec<String> = model::store::previous_evaluation_start(store, project, start.seq)
         .and_then(|previous| previous.frozen.machine)
@@ -828,6 +830,9 @@ pub fn machine_pass(store: &mut EventStore, project: &str, start: &EvaluationSta
             break;
         }
         machine.items.push(try_one(store, db.as_deref(), candidate, &corpus));
+        if candidate.projectless {
+            machine.projectless += 1;
+        }
     }
     machine.not_reached = machine.not_reached_ids.len();
     let count = |machine: &MachinePass, outcome: MachineOutcome| machine.items.iter().filter(|i| i.outcome == outcome).count();
@@ -999,8 +1004,19 @@ fn teeth_section(out: &mut String, frozen: &Frozen, machine: &MachinePass) {
         out.push_str("no rule of this project is owed a verdict from THOR's trial.");
         return;
     }
+    // The rules tried include the ones that belong to no project: say so, so the
+    // "of this project" count is not inflated by them.
+    let tried = if machine.projectless == 0 {
+        format!("{reached} old rule(s) of this project")
+    } else {
+        format!(
+            "{} old rule(s) of this project and {} with no project ({reached} in all)",
+            reached - machine.projectless.min(reached),
+            machine.projectless
+        )
+    };
     out.push_str(&format!(
-        "THOR tried {reached} old rule(s) of this project itself at the start (time box {} s): {} bite and are on the rule \
+        "THOR tried {tried} itself at the start (time box {} s): {} bite and are on the rule \
          track now, {} became a note, {} pending check(s) hung, {} held by a blocker only the owner can lift (see 3), \
          {} need you, {} tried again and left as they were; not reached this time: {} (not owed in this evaluation - the next one starts with them).",
         machine.box_secs,
@@ -1426,6 +1442,59 @@ mod tests {
         assert!(!still_open(&store, &a_now), "A's evaluation is no longer the one running");
         assert_eq!(a_now.frozen.void, None, "superseded, never voided for the work it did");
         assert!(model::store::show(&store, &a.id).unwrap().text.contains("THIS EVALUATION WAS SUPERSEDED"));
+    }
+
+    /// An owed rule written straight into the log (the write gate would ask a
+    /// heavy rule for a tooth, which is what it lacks), in `project`.
+    fn owed_rule(store: &mut EventStore, id: &str, project: Option<&str>) {
+        let item = Item {
+            id: id.to_string(),
+            kind: Kind::Rule,
+            text: format!("a heavy fixture rule {id}"),
+            bindings: vec![model::item::Binding::Moment(intent::Action::Commit)],
+            severity: Some(model::item::Severity::Irreversible),
+            project: project.map(str::to_string),
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some("it stops being true".to_string()),
+            check: None,
+        };
+        let body = serde_json::to_string(&item).unwrap();
+        store.append_event("legacy", id, "migration", EventKind::FactCreated, id, None, &body).unwrap();
+    }
+
+    /// FIELD TEST 12, R3: the TEETH sentence said "old rule(s) of this project"
+    /// and counted the rules with no project too. It now says how many of the
+    /// rules tried have no project, and the parts add up to the whole.
+    #[test]
+    fn the_teeth_sentence_counts_the_rules_with_no_project_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, mut store) = store_with_events(dir.path(), 1);
+        owed_rule(&mut store, "own-rule-a", Some("p"));
+        owed_rule(&mut store, "own-rule-b", Some("p"));
+        owed_rule(&mut store, "global-rule", None);
+        let started = start(&db, &mut store, "sess", "p", "stop-ask").unwrap();
+        let machine = started.start.frozen.machine.clone().expect("decided");
+        assert_eq!((machine.items.len(), machine.projectless), (3, 1), "{machine:?}");
+        let note = start_note(&started.start);
+        assert!(
+            note.contains("THOR tried 2 old rule(s) of this project and 1 with no project (3 in all) itself"),
+            "{note}"
+        );
+    }
+
+    /// With no projectless rule among them the sentence is as it always was,
+    /// and a record written before the count existed reads as 0.
+    #[test]
+    fn the_teeth_sentence_is_unchanged_when_every_rule_tried_has_a_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, mut store) = store_with_events(dir.path(), 1);
+        owed_rule(&mut store, "own-rule-a", Some("p"));
+        let started = start(&db, &mut store, "sess", "p", "stop-ask").unwrap();
+        assert!(start_note(&started.start).contains("THOR tried 1 old rule(s) of this project itself"));
+        let old: model::store::MachinePass = serde_json::from_str("{\"bites\":1}").unwrap();
+        assert_eq!(old.projectless, 0);
     }
 
     /// FIELD DEFECT 4 (2026-10-01): the start note said "`get` shows where it
