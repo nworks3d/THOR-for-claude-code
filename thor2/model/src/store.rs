@@ -2754,6 +2754,81 @@ pub fn full_place_items(store: &EventStore, item: &Item, binding: &Binding) -> O
     (rivals.len() >= crate::item::MAX_ITEMS).then(|| rivals.into_iter().map(|(id, other)| (id.clone(), other.clone())).collect())
 }
 
+/// An informing note for a GLOBAL Rule/Orientation written onto a place that is
+/// already full in one or more registered projects; `None` otherwise.
+///
+/// WHY A NOTE AND NOT A REFUSAL. `shares_a_pool_with` compares a global write
+/// only with other globals, on purpose: refusing on a guess about the projects
+/// a global item will land in would refuse honest writes. That trade-off stays.
+/// But it left the writer blind to a measured case (field test 12): a rule was
+/// revised to global at an ssh command anchor, the gate accepted it, and in the
+/// one project of the incident the anchor already held four heavier facts, so
+/// the rule was outranked there and nothing said so. This asks the question per
+/// registered project (a project with a registered working copy) with the item
+/// standing in that project's pool, counted exactly as the gate counts a place
+/// (`pool_rivals` and `busiest_narrower_call`, full at `item::MAX_ITEMS`).
+///
+/// Only a binding the previous version did not already carry as a global item
+/// is asked about, as `full_reliable_anchor` does; a Moment or an Always binding
+/// is never a countable place.
+pub fn global_write_crowded_in_projects(store: &EventStore, item: &Item, previous: Option<&Item>) -> Option<String> {
+    if item.project.is_some() || !item.kind.can_fire() {
+        return None;
+    }
+    let previously_global: &[Binding] = match previous {
+        Some(prev) if prev.project.is_none() => prev.bindings.as_slice(),
+        _ => &[],
+    };
+    let bindings: Vec<&Binding> = item
+        .bindings
+        .iter()
+        .filter(|b| {
+            matches!(
+                b,
+                Binding::Target { kind: crate::item::TargetKind::Path | crate::item::TargetKind::Dir | crate::item::TargetKind::Command, .. }
+            ) && !previously_global.contains(b)
+        })
+        .collect();
+    if bindings.is_empty() {
+        return None;
+    }
+    let candidates =
+        if store.heads_projection_current() { live_items_from_projection(store) } else { live_items_from_fold(store) }.ok()?;
+    let projects: std::collections::BTreeSet<&str> = candidates
+        .iter()
+        .filter_map(|(_, other)| other.project.as_deref())
+        .filter(|project| registered_root_raw(store, project).is_some())
+        .collect();
+    let mut lines: Vec<String> = Vec::new();
+    for project in projects {
+        let mut as_project = item.clone();
+        as_project.project = Some(project.to_string());
+        for binding in &bindings {
+            let mut rivals = pool_rivals(&candidates, &as_project, binding);
+            let busiest = busiest_narrower_call(&candidates, &as_project, binding);
+            if busiest.len() > rivals.len() {
+                rivals = busiest;
+            }
+            if rivals.len() >= crate::item::MAX_ITEMS {
+                lines.push(format!("{} in project '{project}' ({} occupant(s))", describe(binding), rivals.len()));
+            }
+        }
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "this is a GLOBAL item, and the write gate compares a global write only with other globals. \
+         Counted per registered project, it lands on a place that is already full: {}. A block shows {} \
+         at most, so there it may be outranked and not shown. Nothing was refused. To make room, fold \
+         it into an occupant that already carries the same ground, move one occupant to the narrower \
+         file or command it is really about, or retract one that is stale, with a reason. \
+         `serve why --command <anchor>` or `--file <anchor>` from inside that project shows the real block.",
+        lines.join("; "),
+        crate::item::MAX_ITEMS
+    ))
+}
+
 /// One fact on a full place, as the agent needs it to choose which gives way.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Occupant {
@@ -11425,6 +11500,78 @@ mod tests {
         let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
         assert!(refusal.problem.contains("'ci-check'"), "{}", refusal.problem);
         assert!(refusal.problem.contains("'ci-bare'"), "{}", refusal.problem);
+    }
+
+    // ------------------------------------ a global write on a place full per project
+
+    /// A live item at one Command anchor, in `project` (None = global).
+    fn scoped_command_item(id: &str, nth: usize, command: &str, project: Option<&str>) -> Item {
+        let mut item = sample_with(id, DISTINCT[nth % DISTINCT.len()]);
+        item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: command.to_string() }];
+        item.project = project.map(str::to_string);
+        item
+    }
+
+    /// `project` registered with a working copy, holding `occupants` live items
+    /// at `command`.
+    fn project_with_occupants(store: &mut EventStore, project: &str, command: &str, occupants: usize) {
+        declare_project_record(store, &project_record(project), "C:/tmp/fixture", "2026-10-07T10:00:00Z", installer()).unwrap();
+        for i in 0..occupants {
+            seed_live(store, &scoped_command_item(&format!("{project}-occ-{i}"), i, command, Some(project)));
+        }
+    }
+
+    /// THE DEFECT THIS ANSWERS (field test 12, R2): the gate compares a global
+    /// write only with globals, so a rule written global onto a command that is
+    /// already full in one project was accepted without a word and then
+    /// outranked in that project. The note names the project and the count.
+    #[test]
+    fn a_global_write_on_a_place_full_in_one_project_gets_a_note_naming_it() {
+        let mut store = EventStore::in_memory().unwrap();
+        project_with_occupants(&mut store, "alpha", "ssh fixture-host", crate::item::MAX_ITEMS);
+        project_with_occupants(&mut store, "beta", "ssh fixture-host", 1);
+        let global = scoped_command_item("new-global", 8, "ssh fixture-host", None);
+        let note = global_write_crowded_in_projects(&store, &global, None).expect("full in alpha");
+        assert!(note.contains("project 'alpha' (4 occupant(s))"), "{note}");
+        assert!(!note.contains("beta"), "beta has room and must not be named: {note}");
+        assert!(note.contains("fold") && note.contains("move") && note.contains("retract"), "the three exits: {note}");
+    }
+
+    /// The other half: no registered project is full there, no note.
+    #[test]
+    fn a_global_write_on_a_place_with_room_everywhere_gets_no_note() {
+        let mut store = EventStore::in_memory().unwrap();
+        project_with_occupants(&mut store, "alpha", "ssh fixture-host", crate::item::MAX_ITEMS - 1);
+        project_with_occupants(&mut store, "beta", "ssh fixture-host", 1);
+        let global = scoped_command_item("new-global", 8, "ssh fixture-host", None);
+        assert_eq!(global_write_crowded_in_projects(&store, &global, None), None);
+    }
+
+    /// A project nobody registered a working copy for is not a place a
+    /// session ever works in, so a crowd there is not named.
+    #[test]
+    fn a_project_without_a_registered_working_copy_is_not_named() {
+        let mut store = EventStore::in_memory().unwrap();
+        for i in 0..crate::item::MAX_ITEMS {
+            seed_live(&mut store, &scoped_command_item(&format!("gamma-occ-{i}"), i, "ssh fixture-host", Some("gamma")));
+        }
+        let global = scoped_command_item("new-global", 8, "ssh fixture-host", None);
+        assert_eq!(global_write_crowded_in_projects(&store, &global, None), None);
+    }
+
+    /// A revise that keeps a global item's binding is not asked again (the
+    /// gate skips an already-held binding the same way), and a project item
+    /// is never asked: its own pool is already counted by the gate.
+    #[test]
+    fn a_kept_global_binding_and_a_project_item_get_no_note() {
+        let mut store = EventStore::in_memory().unwrap();
+        project_with_occupants(&mut store, "alpha", "ssh fixture-host", crate::item::MAX_ITEMS);
+        let global = scoped_command_item("kept-global", 8, "ssh fixture-host", None);
+        assert_eq!(global_write_crowded_in_projects(&store, &global, Some(&global)), None);
+        let scoped = scoped_command_item("scoped", 8, "ssh fixture-host", Some("alpha"));
+        assert_eq!(global_write_crowded_in_projects(&store, &scoped, None), None);
+        // Moving a project item to global IS asked.
+        assert!(global_write_crowded_in_projects(&store, &global, Some(&scoped)).is_some());
     }
 
     // ---------------------------------------------- the actor fence (D1, D2)

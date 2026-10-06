@@ -304,6 +304,9 @@ fn with_warnings(
         if let Ok(model::store::Capacity::Crowded(note) | model::store::Capacity::Broad(note)) = cap {
             notes.push(note);
         }
+        // A global write is gated against other globals only; say so when the
+        // place it lands on is already full in a registered project.
+        notes.extend(model::store::global_write_crowded_in_projects(store, item, existing));
         notes.extend(unreachable_anchor_notes(store, corpus, item, existing));
     }
     if let Some(root) = root {
@@ -4435,6 +4438,49 @@ mod tests {
 
     fn anchor_note(reply: &str) -> Option<&str> {
         reply.lines().find(|l| l.contains("has never fired"))
+    }
+
+    /// R2 (field test 12): a global rule written at a command that is already
+    /// full in a registered project is stored, never refused, and the reply
+    /// names the project, the count and the three exits.
+    #[tokio::test]
+    async fn a_global_remember_on_a_place_full_in_a_project_says_so_and_still_stores() {
+        let srv = server();
+        let _alpha = registered_checkout(&srv, "alpha", &[]);
+        for i in 0..model::item::MAX_ITEMS {
+            let occupant = Item {
+                id: format!("alpha-occ-{i}"),
+                kind: Kind::Rule,
+                text: format!("a distinct occupant number {i} about the fixture host"),
+                bindings: vec![model::item::Binding::Target { kind: model::item::TargetKind::Command, value: "ssh fixture-host".to_string() }],
+                severity: None,
+                project: Some("alpha".to_string()),
+                tags: vec![],
+                expires: None,
+                key: None,
+                falsifier: Some("the fixture host is gone".to_string()),
+                check: None,
+            };
+            let body = model::store::canonical_body(&occupant).unwrap();
+            srv.store
+                .lock()
+                .unwrap()
+                .append_event("s", "l", "t", thor_core::event_store::EventKind::FactCreated, &occupant.id, None, &body)
+                .unwrap();
+        }
+        let reply = srv
+            .remember(Meta::new(), RawArgs::default(), Parameters(remembered_on_command("new-global", "ssh fixture-host")))
+            .await;
+        assert!(reply.starts_with("stored "), "a note is never a refusal: {reply}");
+        let note = reply.lines().find(|l| l.contains("GLOBAL item")).unwrap_or_else(|| panic!("no note: {reply}"));
+        assert!(note.contains("project 'alpha' (4 occupant(s))"), "{note}");
+        assert!(note.contains("fold") && note.contains("move") && note.contains("retract"), "{note}");
+
+        // Room for it somewhere else: no note.
+        let mut other = remembered_on_command("other-global", "ssh other-host");
+        other.text = "the other host is a different machine, keep its reports apart".to_string();
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(other)).await;
+        assert!(reply.starts_with("stored ") && !reply.contains("GLOBAL item"), "{reply}");
     }
 
     #[tokio::test]
