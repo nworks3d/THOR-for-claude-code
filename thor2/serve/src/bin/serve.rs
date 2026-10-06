@@ -530,6 +530,13 @@ fn decay_notice(store: &EventStore, db: &Path, cwd: Option<&Path>) -> Option<Str
         if li.item.project.as_deref() != Some(project.as_str()) {
             continue;
         }
+        // An anchor on something DELIBERATELY absent (a gitignored secrets
+        // file) is not decay: it is there so the rule fires the moment that
+        // file appears. Doctor's decay line skips these the same way; without
+        // this the two lines disagreed on every such item.
+        if li.item.tags.iter().any(|t| t == model::store::DELIBERATE_ANCHOR_TAG) {
+            continue;
+        }
         for binding in &li.item.bindings {
             if let model::item::Binding::Target { kind: model::item::TargetKind::Path, value } = binding {
                 if value.contains(':') || value.starts_with('/') || value.starts_with("\\\\") {
@@ -4119,6 +4126,77 @@ mod decay_notice_tests {
             !serve::absent_guard::default_stale_path(&db).exists(),
             "a healthy store must not grow a staleness sidecar out of nowhere"
         );
+    }
+
+    /// A rule anchored at a path, with no check, so only the dead-anchor count
+    /// can ever see it.
+    fn anchored_rule(store: &mut EventStore, id: &str, project: &str, path: &str, tags: Vec<String>) {
+        let item = Item {
+            id: id.to_string(),
+            kind: Kind::Rule,
+            text: format!("guards {path}"),
+            bindings: vec![Binding::Target { kind: TargetKind::Path, value: path.to_string() }],
+            severity: None,
+            project: Some(project.to_string()),
+            tags,
+            expires: None,
+            key: None,
+            falsifier: Some("the guarded file stops mattering".to_string()),
+            check: None,
+        };
+        model::store::declare(store, "t", "t", "t", &item).expect("fixture must store");
+    }
+
+    /// THE DEFECT THIS CLOSES, measured on 2026-10-06. Two rules anchored at
+    /// the gitignored `firmware/src/secrets.h` carry the `deliberate-anchor`
+    /// tag: the file is SUPPOSED to be absent, the anchor is there so the rule
+    /// fires the moment someone touches it. Doctor's decay line skips them,
+    /// but this session-start line did not, so every session in that project
+    /// was told "2 anchor(s) point at a file that is not there" while doctor
+    /// said "decay: none".
+    #[test]
+    fn a_deliberately_dead_anchor_is_not_decay() {
+        let (dir, root) = checkout("Some-Project");
+        let db = dir.path().join("thor.db");
+        let mut store = EventStore::new(&db).unwrap();
+        anchored_rule(
+            &mut store,
+            "ignored-secrets",
+            "Some-Project",
+            "firmware/src/secrets.h",
+            vec![model::store::DELIBERATE_ANCHOR_TAG.to_string()],
+        );
+
+        assert!(decay_notice(&store, &db, Some(&root)).is_none(), "a deliberate anchor must never read as rot");
+    }
+
+    /// The other half: the SAME dead anchor without the tag is real decay and
+    /// must still be counted, exactly once.
+    #[test]
+    fn an_untagged_dead_anchor_still_counts_once() {
+        let (dir, root) = checkout("Some-Project");
+        let db = dir.path().join("thor.db");
+        let mut store = EventStore::new(&db).unwrap();
+        anchored_rule(&mut store, "moved-file", "Some-Project", "firmware/src/secrets.h", vec![]);
+
+        let notice = decay_notice(&store, &db, Some(&root)).expect("an untagged dead anchor is decay");
+        assert!(notice.contains("Some-Project: 1 anchor(s) point at a file that is not there"), "{notice}");
+    }
+
+    /// Scope: another project's dead anchor, under the same checkouts folder,
+    /// never counts toward this session's project - and this project's own
+    /// dead anchor still does.
+    #[test]
+    fn another_projects_dead_anchor_is_not_counted() {
+        let (dir, root) = checkout("Project-A");
+        let db = dir.path().join("thor.db");
+        let mut store = EventStore::new(&db).unwrap();
+        anchored_rule(&mut store, "b-gone", "Project-B", "fleet/web/app.js", vec![]);
+        assert!(decay_notice(&store, &db, Some(&root)).is_none(), "project B's rot is not project A's");
+
+        anchored_rule(&mut store, "a-gone", "Project-A", "fleet/web/app.js", vec![]);
+        let notice = decay_notice(&store, &db, Some(&root)).expect("A's own dead anchor must count");
+        assert!(notice.contains("Project-A: 1 anchor(s)"), "{notice}");
     }
 }
 
