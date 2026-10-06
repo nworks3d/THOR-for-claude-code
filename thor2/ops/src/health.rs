@@ -1158,14 +1158,18 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool
             "judgement debt: {total} item(s) store-wide are owed a verdict (fired in {threshold}+ sessions since \
              the last one, or never judged at all; pinned items excluded - the owner answered that question \
              by pinning them) - {in_project} of them apply to this checkout ('{project}', or global); they are \
-             asked about inside the project's next evaluation, never at the end of a turn"
+             never asked at the end of a turn, and an evaluation asks about one only when the evaluating session saw \
+             it fire - so an item that never fires there stays owed until it is settled with mark or retract; the \
+             longest owed are named below, each with its sessions since its last verdict"
         ),
         None => format!(
             "judgement debt: {total} item(s) store-wide are owed a verdict (fired in {threshold}+ sessions since \
              the last one, or never judged at all; pinned items excluded - the owner answered that question \
              by pinning them) - this checkout resolves to no project, so only the {in_project} global one(s) \
-             among them would ever be asked about here; they are asked about inside an evaluation, never at the \
-             end of a turn"
+             among them could ever be asked about here; they are never asked at the end of a turn, and an \
+             evaluation asks about one only when the evaluating session saw it fire - so an item that never fires \
+             there stays owed until it is settled with mark or retract; the longest owed are named below, each \
+             with its sessions since its last verdict"
         ),
     }];
     match checkout_project {
@@ -3443,6 +3447,35 @@ mod tests {
             line.contains(&format!("  judgement debt: owed-global ({}x, Rule) at src/lib.rs", serve::usefulness::JUDGEMENT_DEBT_AFTER)),
             "must name the item, its count, its kind and where it fires: {line}"
         );
+    }
+
+    /// Field test 11: the line promised that every owed item "is asked about
+    /// inside the project's next evaluation". By design an evaluation asks
+    /// only about items the EVALUATING session saw fire, so an owed item that
+    /// never fires there is never asked. The sentence now says exactly that,
+    /// and points at the two calls that settle such an item by hand.
+    #[test]
+    fn judgement_debt_line_promises_only_what_the_evaluation_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            let mut item = rule("owed-promise");
+            item.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "src/lib.rs".to_string() }];
+            item.project = Some("thor".to_string());
+            store::declare(&mut store, "s", "l", "a", &item).unwrap();
+            for i in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
+                serve::deliver::record_delivery(&mut store, &serve::deliver::nth_session("s", i), "l", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &["owed-promise".to_string()]);
+            }
+        }
+        for project in [Some("thor"), None] {
+            let line = judgement_debt_line(&db, project, false).expect("something is owed, the line must speak");
+            let first = line.lines().next().unwrap();
+            assert!(!first.contains("asked about inside the project's next evaluation"), "the old promise is gone: {first}");
+            assert!(first.contains("only when the evaluating session saw it fire"), "{first}");
+            assert!(first.contains("mark or retract"), "and says how to settle the rest: {first}");
+            assert!(first.contains("sessions since its last verdict"), "and what the number after each name means: {first}");
+        }
     }
 
     /// THE DEFECT THIS PREVENTS (measured 2026-09-17): acme-shop eval 1
