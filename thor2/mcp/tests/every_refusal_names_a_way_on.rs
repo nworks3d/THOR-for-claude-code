@@ -370,8 +370,8 @@ fn needs_agent_crowded_names_a_narrower_anchor_and_moving_it_lands_decided() {
     assert!(why.contains(way_on("needs_agent:crowded")), "{why}");
     let reply = fx.mcp().call(
         "revise",
-        json!({"id": "ncr", "targets": [{"kind": "command", "value": "npm publish --tag beta"}],
-               "text": "Never run `npm publish --tag beta --force` here.", "because": "moved to the one publish form it is about"}),
+        json!({"id": "ncr", "targets": [{"kind": "command", "value": "npm run publish-beta"}],
+               "text": "Never run `npm run publish-beta --force` here.", "because": "moved to the one publish form it is about"}),
     );
     assert!(landed(&reply) && fx.settled("ncr"), "{reply}");
 }

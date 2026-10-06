@@ -2825,7 +2825,7 @@ pub fn apply(store: &mut EventStore, retest: &Retest, actor: SystemActor) -> Res
             })
             .unwrap_or_else(|| "its binding".to_string());
         return Err(ApplyError::NeedsAgent(format!(
-            "crowded at {at}: fold this rule into a neighbour or move it to a narrower anchor ({})",
+            "crowded at {at}: fold this rule into a neighbour or move it to an anchor with room (a command that still starts with {at} is as full as {at}) ({})",
             r.problem
         )));
     }
