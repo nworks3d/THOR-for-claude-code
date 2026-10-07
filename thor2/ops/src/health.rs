@@ -614,7 +614,15 @@ fn nearest_repo_root(start_dir: &Path) -> Option<std::path::PathBuf> {
 /// a worktree of it: a worktree is a place someone works, its files lag or
 /// lead main, and a check read there says nothing about the memory's own
 /// truth (see `nearest_repo_root` for the day that mattered).
-fn checkout_roots(root: &Path) -> std::collections::BTreeMap<String, std::path::PathBuf> {
+///
+/// THE REGISTERED WORKING COPY WINS when it lies under `root` at any depth
+/// and is still valid (`serve::project::registered_checkout`: the runtime's own
+/// reading). Found by the scan above it, a repository nested one level deeper
+/// (`<root>/<group>/<repo>`) was never seen, so every anchor of its project
+/// read as dead while `serve why` resolved the same file correctly (measured
+/// 2026-10-07, field test 12). A registered folder outside `root` is left to
+/// the scan: `--checkouts` still bounds what doctor measures.
+fn checkout_roots(store: &EventStore, root: &Path) -> std::collections::BTreeMap<String, std::path::PathBuf> {
     let mut roots: std::collections::BTreeMap<String, std::path::PathBuf> = Default::default();
     if let Ok(entries) = std::fs::read_dir(root) {
         for entry in entries.flatten() {
@@ -626,7 +634,27 @@ fn checkout_roots(root: &Path) -> std::collections::BTreeMap<String, std::path::
             }
         }
     }
+    let projects: std::collections::BTreeSet<String> =
+        serve::live::live_items(store).into_iter().filter_map(|li| li.item.project).collect();
+    for project in projects {
+        if let Ok(registered) = serve::project::registered_checkout(store, Some(&project)) {
+            if is_under(root, &registered) {
+                roots.insert(project, registered);
+            }
+        }
+    }
     roots
+}
+
+/// Whether `path` lies inside `root`, compared as text with one separator,
+/// without case and without a Windows verbatim prefix.
+fn is_under(root: &Path, path: &Path) -> bool {
+    let plain = |p: &Path| {
+        let text = p.to_string_lossy().replace('\\', "/").to_lowercase();
+        text.trim_start_matches("//?/").trim_end_matches('/').to_string()
+    };
+    let (root, path) = (plain(root), plain(path));
+    path.strip_prefix(&root).is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// Doctor's own inferred `--checkouts` root when the flag itself is absent:
@@ -806,7 +834,7 @@ fn decay_check(db: &Path, checkouts: Option<&Path>, project_filter: Option<&str>
         return DecayCheck::NoCheckouts;
     };
 
-    let roots = checkout_roots(root);
+    let roots = checkout_roots(&store, root);
 
     let items = serve::live::live_items(&store);
     let (mut dead, mut failing, mut judged) = (Vec::new(), Vec::new(), 0usize);
@@ -1823,7 +1851,7 @@ pub fn contradiction_line(db: &Path, checkouts: Option<&Path>) -> Option<String>
     let store = EventStore::open_existing(db).ok()?;
     let root = checkouts?;
 
-    let roots = checkout_roots(root);
+    let roots = checkout_roots(&store, root);
 
     let mut by_file: std::collections::BTreeMap<(String, String), Vec<model::item::Check>> = Default::default();
     for li in serve::live::live_items(&store) {
@@ -2734,7 +2762,7 @@ pub fn crowding_line(db: &Path, checkouts: Option<&Path>, full: bool) -> String 
         return "crowding: pass --checkouts <dir> to see how many facts never win a place".to_string();
     };
 
-    let roots = checkout_roots(root);
+    let roots = checkout_roots(&store, root);
     // Loaded ONCE for every probe below - see `serve::serve_with_decay`'s own
     // doc comment for the day this loop's own command anchors doubled this
     // line's runtime by re-folding an unchanging log per probe.
@@ -3330,6 +3358,58 @@ mod tests {
         store
             .append_event("legacy", &item.id, "migration", thor_core::event_store::EventKind::FactCreated, &item.id, None, &body)
             .unwrap();
+    }
+
+    /// FIELD TEST 12, R5: a project whose working copy is a repository nested
+    /// one level under the `--checkouts` root (`<root>/<group>/<repo>`) was
+    /// never found by the scan of immediate subdirectories, so every anchor of
+    /// it read as dead while `serve why` resolved the same file. The registered
+    /// working copy, when it lies under the root, is the one doctor reads.
+    #[test]
+    fn a_project_registered_in_a_nested_repository_is_not_reported_as_decayed() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkouts = dir.path().join("dev");
+        let nested = checkouts.join("group").join("nested-proj");
+        std::fs::create_dir_all(nested.join(".git")).unwrap();
+        std::fs::create_dir_all(nested.join("src").join("libs")).unwrap();
+        std::fs::write(nested.join(".thor-project"), "nested-proj\n").unwrap();
+        std::fs::write(nested.join("src").join("libs").join("Kernel.cpp"), "int main() {}\n").unwrap();
+
+        let db = dir.path().join("t.db");
+        let mut s = EventStore::new(&db).unwrap();
+        let mut item = rule("nested-rule");
+        item.project = Some("nested-proj".to_string());
+        item.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "src/libs/Kernel.cpp".to_string() }];
+        legacy_declare(&mut s, &item);
+        let mut record = rule(&store::project_opened_id("nested-proj"));
+        record.kind = Kind::Report;
+        record.bindings = vec![];
+        record.falsifier = None;
+        record.project = Some("nested-proj".to_string());
+        record.tags = vec!["project-record".to_string()];
+        let body = store::canonical_body(&record).unwrap();
+        let top = serve::project::checkout_top(&nested);
+        let body = format!(
+            "{},\"root\":{},\"root_at\":\"2026-10-07T10:00:00Z\"}}",
+            &body[..body.len() - 1],
+            serde_json::to_string(&top.to_string_lossy()).unwrap()
+        );
+        s.append_event("install", "install", store::INSTALLER_ACTOR, EventKind::FactCreated, &record.id, None, &body).unwrap();
+        drop(s);
+
+        let line = decay_line(&db, Some(&checkouts), false);
+        assert!(line.starts_with("decay: none"), "an existing file in a nested registered repo is not decay: {line}");
+
+        // The nested repository really is the one judged: take the file away.
+        std::fs::remove_file(nested.join("src").join("libs").join("Kernel.cpp")).unwrap();
+        let line = decay_line(&db, Some(&checkouts), false);
+        assert!(line.contains("1 anchor(s) point at nothing") && line.contains("nested-rule"), "{line}");
+
+        // A registration outside the root is not measured by this root.
+        let elsewhere = tempfile::tempdir().unwrap();
+        assert!(!is_under(elsewhere.path(), &checkouts));
+        assert!(is_under(&checkouts, &nested));
+        assert!(!is_under(&checkouts, &checkouts), "the root itself is not under itself");
     }
 
     /// The batch the next report is held to, and what stays owed beyond it,
