@@ -223,6 +223,53 @@ fn machine_block_differing_from_the_log_is_invalid() {
     assert!(matches!(validate(&fx.store, &sent.id, Some(&fx.root())), Validation::Valid(_)));
 }
 
+/// 2026-10-06: a report filed by a tool server older than the hook's checker
+/// did not count, and the reason blamed the agent ("edited, or written past
+/// the filing gate"). A block whose header names another renderer revision -
+/// or none, as before the header carried one - is version skew: the reason
+/// says so, tells what to do, and the validator's record is what the next
+/// machine section counts.
+#[test]
+fn a_block_from_another_renderer_revision_is_named_version_skew_not_an_edit() {
+    for header in [
+        "; renderer 1".to_string(),                           // an older revision
+        String::new(),                                        // written before the header carried one
+        format!("; renderer {}", model::gate::MACHINE_RENDERER_REV + 1), // a newer tool server than the checker
+    ] {
+        let mut fx = Fx::new();
+        let start = crate::attest::fixture::quiet_start(&mut fx.store, S1, "fxp");
+        main_transcript(&fx.root(), S1).prompt_context(&crate::eval_session::start_note(&start)).write();
+        let (block, _) = machine_block_now(&fx, &start);
+        let current = format!("; renderer {}", model::gate::MACHINE_RENDERER_REV);
+        let skewed = block.replacen(&current, &header, 1).replacen("JUDGEMENT: 0 item(s)", "JUDGEMENT: no items", 1);
+        assert_ne!(skewed, block, "fixture sanity");
+        let sent = report("eval-fxp-2026-09-28", "fxp", "TLDR: nothing to add.");
+        fx.filed_past(&sent, &format!("{skewed}{}", sent.text));
+        let why = invalid_why(validate(&fx.store, &sent.id, Some(&fx.root())));
+        assert!(why.starts_with(model::store::SKEW_WHY), "{header:?}: {why}");
+        assert!(why.contains("restart Claude") && why.contains("nothing was edited"), "{why}");
+        assert!(!why.contains("edited, or written past"), "{why}");
+    }
+}
+
+/// The same revision with other bytes IS an edit (or a write past the gate),
+/// and the reason points at the first line that differs.
+#[test]
+fn a_block_of_the_same_revision_with_other_bytes_names_the_first_differing_line() {
+    let mut fx = Fx::new();
+    let start = crate::attest::fixture::quiet_start(&mut fx.store, S1, "fxp");
+    main_transcript(&fx.root(), S1).prompt_context(&crate::eval_session::start_note(&start)).write();
+    let (block, _) = machine_block_now(&fx, &start);
+    let forged = block.replacen("JUDGEMENT: 0 item(s)", "JUDGEMENT: 0 item(s), all judged with care", 1);
+    let line = block.lines().zip(forged.lines()).position(|(a, b)| a != b).expect("a differing line") + 1;
+    let sent = report("eval-fxp-2026-09-28", "fxp", "TLDR: nothing to add.");
+    fx.filed_past(&sent, &format!("{forged}{}", sent.text));
+    let why = invalid_why(validate(&fx.store, &sent.id, Some(&fx.root())));
+    assert!(why.contains("edited, or written past the filing gate"), "{why}");
+    assert!(why.contains(&format!("first differs at line {line} ")), "{why}");
+    assert!(!why.starts_with(model::store::SKEW_WHY), "{why}");
+}
+
 impl Fx {
     fn filed_past(&mut self, sent: &Item, stored_text: &str) -> Event {
         filed_past_the_gate(self, S1, sent, stored_text, "toolu_past")

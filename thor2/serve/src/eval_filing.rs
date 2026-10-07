@@ -465,9 +465,23 @@ fn judge(store: &EventStore, event: &Event, filed: &Item, root: Option<&Path>, r
         model::gate::AGENT_SECTION_BEGIN
     );
     if block != expected {
+        // A section of another renderer revision differs in bytes for a reason
+        // that is nobody's edit: the tool server that wrote it was built from
+        // another THOR than this checker. Never turned into a pass.
+        let theirs = model::gate::machine_renderer_of(&filed.text);
+        let ours = model::gate::MACHINE_RENDERER_REV;
+        if theirs != Some(ours) {
+            let theirs = theirs.map_or("none (before the header carried one)".to_string(), |rev| rev.to_string());
+            return invalid(format!(
+                "{}: its machine section was rendered by format {theirs}, this checker reads format {ours} - restart \
+                 Claude so the tool server is the current one, and file again; nothing was edited",
+                model::store::SKEW_WHY
+            ));
+        }
+        let line = block.lines().zip(expected.lines()).position(|(a, b)| a != b).unwrap_or_else(|| block.lines().count().min(expected.lines().count())) + 1;
         return invalid(format!(
             "its machine section is not the one THOR derives from the log for seq {n} to {f} - it was edited, or written \
-             past the filing gate"
+             past the filing gate; it first differs at line {line} of its machine section"
         ));
     }
     // (3) the filing gate, run again on the log as it stood at F.

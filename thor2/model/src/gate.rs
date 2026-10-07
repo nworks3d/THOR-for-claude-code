@@ -1601,10 +1601,18 @@ fn dropped_field(name: &'static str) -> Refusal {
 // live here because the gate's own revise ground reads them: a revise of a
 // filed report keeps its machine block byte for byte.
 
+/// The revision of the code that renders the machine section. A rendering that
+/// changes in any byte bumps it, and the header carries it so the filing
+/// validator compares like with like: a section written by a tool server of
+/// another revision is version skew, not an edit. A header with no revision
+/// was written before this existed.
+pub const MACHINE_RENDERER_REV: u32 = 2;
+
 /// The machine section's first line, with `<N>` (the log position the
-/// evaluation started at) and `<F>` (the log position it was filed at) still
-/// to fill in (`machine_section_begin`).
-pub const MACHINE_SECTION_BEGIN: &str = "=== MACHINE SECTION: derived from the log, seq <N> to <F>; it cannot be edited ===";
+/// evaluation started at), `<F>` (the log position it was filed at) and `<R>`
+/// (`MACHINE_RENDERER_REV`) still to fill in (`machine_section_begin`).
+pub const MACHINE_SECTION_BEGIN: &str =
+    "=== MACHINE SECTION: derived from the log, seq <N> to <F>; renderer <R>; it cannot be edited ===";
 
 /// How the machine section's first line begins, up to `<N>`.
 pub const MACHINE_SECTION_PREFIX: &str = "=== MACHINE SECTION: derived from the log, seq ";
@@ -1619,7 +1627,18 @@ pub const AGENT_SECTION_BEGIN: &str = "=== TLDR AND REMARKS: written by the eval
 /// The machine section's first line for an evaluation started at log position
 /// `n` and filed at log position `f`.
 pub fn machine_section_begin(n: i64, f: i64) -> String {
-    MACHINE_SECTION_BEGIN.replace("<N>", &n.to_string()).replace("<F>", &f.to_string())
+    MACHINE_SECTION_BEGIN
+        .replace("<N>", &n.to_string())
+        .replace("<F>", &f.to_string())
+        .replace("<R>", &MACHINE_RENDERER_REV.to_string())
+}
+
+/// The renderer revision a machine block's first line names, or `None` for a
+/// block written before the header carried one.
+pub fn machine_renderer_of(text: &str) -> Option<u32> {
+    let line = machine_block(text)?.lines().next()?;
+    let (_, rest) = line.strip_prefix(MACHINE_SECTION_PREFIX)?.split_once(';')?;
+    rest.trim().strip_prefix("renderer ")?.split(';').next()?.trim().parse().ok()
 }
 
 /// The machine block of a stored evaluation report: everything from its first
@@ -7613,13 +7632,31 @@ mod machine_section_tests {
     fn the_block_and_the_agent_section_read_back() {
         let item = filed("TLDR: evaluation of fxp. Nothing to add.");
         let block = machine_block(&item.text).expect("a machine block");
-        assert!(block.starts_with("=== MACHINE SECTION: derived from the log, seq 26 to 30; it cannot be edited ===\n"));
+        assert!(block.starts_with(&format!(
+            "=== MACHINE SECTION: derived from the log, seq 26 to 30; renderer {MACHINE_RENDERER_REV}; it cannot be edited ===\n"
+        )));
         assert!(block.ends_with(&format!("\n\n{AGENT_SECTION_BEGIN}\n")));
         assert_eq!(agent_section(&item.text), "TLDR: evaluation of fxp. Nothing to add.");
         assert_eq!(machine_section_range(&item.text), Some((26, 30)));
+        assert_eq!(machine_renderer_of(&item.text), Some(MACHINE_RENDERER_REV));
         assert_eq!(machine_block("TLDR: an old report with no machine section."), None);
         assert!(MACHINE_SECTION_BEGIN.starts_with(MACHINE_SECTION_PREFIX));
         assert!(names_a_section_header(&item.text) && !names_a_section_header(agent_section(&item.text)));
+    }
+
+    /// A header written before the renderer revision existed names none, and a
+    /// reader must still find its log positions: the validator tells such a
+    /// block apart from a current one by the missing revision alone.
+    #[test]
+    fn a_header_without_a_renderer_revision_still_reads_and_names_none() {
+        let old = "=== MACHINE SECTION: derived from the log, seq 26 to 30; it cannot be edited ===\nbody\n\n".to_string()
+            + AGENT_SECTION_BEGIN
+            + "\nmine";
+        assert_eq!(machine_section_range(&old), Some((26, 30)));
+        assert_eq!(machine_renderer_of(&old), None);
+        let other = old.replace("30; it", "30; renderer 7; it");
+        assert_eq!(machine_renderer_of(&other), Some(7));
+        assert_eq!(machine_section_range(&other), Some((26, 30)));
     }
 
     /// R15.5: a revise that changes one word of the machine section - or
