@@ -363,12 +363,12 @@ pub fn resume(store: &mut EventStore, session_id: &str) -> Vec<EvaluationStart> 
 /// What the session is told when its Stop finished a machine pass that an
 /// earlier hook run was cut off in: the start note, now with its lists.
 pub fn resumed_note(start: &EvaluationStart) -> String {
-    format!(
+    let line = format!(
         "[THOR] THOR finished deciding the old rules of '{}' - the hook that started this evaluation was cut off before \
-         it could. What is yours to do is listed now.\n\n{}",
-        start.frozen.project,
-        start_note(start)
-    )
+         it could. What is yours to do is listed now.\n\n",
+        start.frozen.project
+    );
+    format!("{line}{}", start_note_after(start, line.len()))
 }
 
 // ----------------------------------------------------------- the machine pass
@@ -488,10 +488,18 @@ fn candidates(store: &EventStore, project: &str, start: &EvaluationStart, compar
 }
 
 /// The exact call the agent runs for a rule that needs it for anything but
-/// the A4 naming: THOR's trial of the rule as it stands, which writes its
-/// verdict once the fix its line names is made, or names the fix again.
+/// the A4 naming: a revise carrying the change its line names, which THOR's
+/// trial then tries as it is written. A bare `revise(id)` changes nothing a
+/// trial reads, so it is never the call. The `because` is in the shape because
+/// the gate asks for one whenever the fix narrows the text (takes a quoted
+/// form out of it), moves or clears the check, lowers the severity or drops an
+/// anchor.
 fn agent_call(id: &str) -> String {
-    format!("mcp__thor__revise(id: \"{id}\")")
+    format!(
+        "mcp__thor__revise(id: \"{id}\", <the change its line names>, because: \"<needed when the change takes a quoted \
+         form out of the text or weakens the rule: why, {}+ characters>\")",
+        model::store::DISPUTE_REASON_MIN_CHARS
+    )
 }
 
 /// The call for exit (b) of a DEMOTION: the revise THOR's trial accepts, which
@@ -536,6 +544,33 @@ fn a4_call(store: &EventStore, id: &str) -> String {
     format!("mcp__thor__revise(id: \"{id}\", text: \"<its text, reworded so it names {naming}>\")")
 }
 
+/// THE STILL-OWED ANSWER to a write that changed nothing. A bare
+/// `revise(id)` on a rule that an open evaluation owes on its batch or its A4
+/// list changes nothing a trial reads, so the trial runs none and the reply
+/// used to read "teeth unchanged" as if the rule were settled. This says
+/// plainly that it is NOT, and prints the line the start note shows for it
+/// with its exits (a demotion's two exits, a batch item's fix and call).
+/// `None` when no open evaluation of the item's project owes it.
+pub fn still_owed(store: &EventStore, item: &Item) -> Option<String> {
+    let project = model::normalize::normalize_project(item.project.as_deref())?;
+    let now = crate::time::now_unix();
+    for start in model::store::open_evaluation_starts_of_project(store, &project, now) {
+        if !model::store::evaluation_frozen_batch_owed(store, &start).iter().any(|(id, _)| id == &item.id) {
+            continue;
+        }
+        let line = start.frozen.machine.as_ref().and_then(|m| m.items.iter().find(|i| i.id == item.id));
+        let why = line.map(|i| i.detail.trim_end_matches('.').to_string()).unwrap_or_default();
+        let call = line.and_then(|i| i.call.clone()).unwrap_or_else(|| agent_call(&item.id));
+        return Some(format!(
+            "NOTHING WAS SETTLED, '{id}' IS STILL OWED: this call changed nothing a trial reads, so it is still on the batch of the evaluation started at log position {n} (THOR's record '{record}'). What its line says: {why}. The call that settles it: {call}",
+            id = item.id,
+            n = start.frozen.started_seq,
+            record = start.id
+        ));
+    }
+    None
+}
+
 fn machine_item(id: &str, outcome: MachineOutcome, detail: String) -> MachineItem {
     MachineItem { id: id.to_string(), outcome, detail, call: None, blocker: None, seq: None }
 }
@@ -565,11 +600,11 @@ fn try_one(store: &mut EventStore, db: Option<&Path>, candidate: &Candidate, cor
         let accept = format!("{} --apply", model::store::retest_command_for(db, id));
         let detail = format!(
             "DEMOTION, nothing written: it bit when {then} tried it, and this build (matcher {}) would make it a note - {because}. \
-             TWO EXITS, you decide after opening the rule (mcp__thor__get) and the file or command it is about. (a) ACCEPT the \
-             demotion, only when no wording or anchor can make the check bite: run {accept} - it writes the note and nothing else \
-             (a retest of one rule needs no --allow-demote), and your report says you accepted it and why. (b) KEEP THE TOOTH by \
-             narrowing the rule to the forms its check really catches: send the Call below with your own reworded text and a reason \
-             of at least {} characters",
+             TWO EXITS, decide after opening the rule (mcp__thor__get) and the file or command it is about. (a) ACCEPT, only \
+             when no wording or anchor can make the check bite: run {accept} (it writes the note and nothing else; your report \
+             says you accepted it and why). (b) KEEP THE TOOTH: send the Call below with the text reworded to name only the \
+             forms the check really catches and a reason of at least {} characters. Done when the command ran or THOR \
+             accepted the Call",
             teeth::matcher_rev(),
             model::store::DISPUTE_REASON_MIN_CHARS
         );
@@ -668,9 +703,14 @@ fn named(ids: &[String]) -> String {
 
 /// The first words of a fact's text, on one line, for a point that names it.
 fn first_words(text: &str) -> String {
+    cut_words(text, 70)
+}
+
+/// `text` on one line, cut to `max` characters with three dots when longer.
+fn cut_words(text: &str, max: usize) -> String {
     let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let head: String = one_line.chars().take(70).collect();
-    if one_line.chars().count() > 70 { format!("{head}...") } else { head }
+    let head: String = one_line.chars().take(max).collect();
+    if one_line.chars().count() > max { format!("{head}...") } else { head }
 }
 
 /// The text of THOR's open point for `blocker`: the rules it holds and the
@@ -1041,16 +1081,95 @@ fn quoted(ids: &[String]) -> String {
     ids.iter().map(|id| format!("'{id}'")).collect::<Vec<_>>().join(", ")
 }
 
-/// The start note: N, and the lists with the exact call that settles each
-/// item. It is the start record's own text, and what the session is shown -
-/// as the Stop block reason, or as context for the typed command and the
-/// skill call. Rendered from the frozen lists alone, so the note and the
-/// record can never name different items.
+/// How much of the start note the session is shown at most, in bytes: Claude
+/// Code keeps a hook output over `HOOK_OUTPUT_LIMIT_BYTES` in a file and shows
+/// the agent only its first 2 KB, and a cut at that limit lost whole sections
+/// without a word (field 2026-10-07: the signals never arrived). The margin
+/// is for the cut's own line; what rides in front of the note (the Stop ask,
+/// the continue line) is taken off the budget (`start_note_after`).
+pub const START_NOTE_BUDGET: usize = 9_300;
+
+/// What the note lists in full. Every list shows its first `n` items; the rest
+/// are counted and pointed at (`more_line`). `usize::MAX` is the whole list.
+#[derive(Clone)]
+struct Caps {
+    judgement: usize,
+    batch: usize,
+    a4: usize,
+    disputes: usize,
+    blocks: usize,
+    /// List THOR's own open points one by one, or only count them.
+    points: bool,
+}
+
+impl Caps {
+    fn all() -> Self {
+        Caps { judgement: usize::MAX, batch: usize::MAX, a4: usize::MAX, disputes: usize::MAX, blocks: usize::MAX, points: true }
+    }
+
+    /// Give up the least actionable thing still shown: the open points first
+    /// (they need nothing), then the probable false blocks, the A4 list, the
+    /// disputes, the batch and the judgement - each from its far end. `false`
+    /// when nothing is left to give up.
+    fn shrink(&mut self, frozen: &Frozen) -> bool {
+        fn one(cap: &mut usize, len: usize) -> bool {
+            let shown = (*cap).min(len);
+            if shown == 0 {
+                return false;
+            }
+            *cap = shown - 1;
+            true
+        }
+        if self.points {
+            self.points = false;
+            return true;
+        }
+        let blocks = frozen.machine.as_ref().and_then(|m| m.signals.as_ref()).map_or(0, |s| s.false_blocks.len());
+        one(&mut self.blocks, blocks)
+            || one(&mut self.a4, frozen.a4_list().len())
+            || one(&mut self.disputes, frozen.dispute_list().len())
+            || one(&mut self.batch, frozen.batch().len())
+            || one(&mut self.judgement, frozen.judgement.len())
+    }
+}
+
+/// The line that stands where a list was cut: how many items it holds back and
+/// where the whole note is. Never a silent cut.
+fn more_line(held_back: usize, record: &str) -> String {
+    format!(
+        "\n      {held_back} more item(s) of this list are NOT shown here, to keep this note under the size Claude Code shows \
+         whole - read them in the whole note: mcp__thor__get(id: \"{record}\")."
+    )
+}
+
+/// The start note whole: N, and the lists with the exact call that settles
+/// each item. It is the start record's own text, kept on the log in full
+/// (`mcp__thor__get` on the record shows it). Rendered from the frozen lists
+/// alone, so the note and the record can never name different items.
 pub fn render_start_note(id: &str, frozen: &Frozen) -> String {
+    render_note(id, frozen, &Caps::all())
+}
+
+/// The start note as the session is shown it: the whole note when it fits
+/// `START_NOTE_BUDGET`, else with the least actionable items left out, from the
+/// far end of each list, each cut saying how many it held back and where the
+/// whole note is. What the session must act on comes first and a cut never
+/// takes an item without saying so.
+pub fn render_start_note_within(id: &str, frozen: &Frozen, budget: usize) -> String {
+    let mut caps = Caps::all();
+    loop {
+        let note = render_note(id, frozen, &caps);
+        if note.len() <= budget || !caps.shrink(frozen) {
+            return note;
+        }
+    }
+}
+
+fn render_note(id: &str, frozen: &Frozen, caps: &Caps) -> String {
     let mut out = format!(
         "[THOR] The evaluation of '{}' started at log position {} ({}, {}; THOR's record '{id}'). The lists its report \
-         is held to are fixed now and cannot grow: nothing that fires or is written from here on is added to them, and \
-         nothing that fired only in another session is on them.",
+         is held to are fixed now: nothing that fires or is written from here on is added to them, and nothing that \
+         fired only in another session is on them.",
         frozen.project,
         frozen.started_seq,
         frozen.started_by,
@@ -1076,16 +1195,19 @@ pub fn render_start_note(id: &str, frozen: &Frozen) -> String {
             model::store::JUDGEMENT_DEBT_AFTER,
             quoted(&frozen.judgement)
         ));
-        for id in &frozen.judgement {
+        for item in frozen.judgement.iter().take(caps.judgement) {
             // CHECK TRUTH FIRST, on every line (step 26): field test 2 saw
             // ten verdicts given in five seconds with no look at whether the
             // items were still true; the advice stood once, above the list.
             out.push_str(&format!(
-                "\n   - '{id}': first check it is still TRUE (revise it when the code says otherwise - a repair, not \
-                 noise), then mcp__thor__mark(id: \"{id}\") when it belonged where it fired, or \
-                 mcp__thor__mark(id: \"{id}\", noise: true) when it did not"
+                "\n   - '{item}': first check it is still TRUE (revise it when the code says otherwise - a repair, not \
+                 noise), then mcp__thor__mark(id: \"{item}\") when it belonged where it fired, or \
+                 mcp__thor__mark(id: \"{item}\", noise: true) when it did not"
             ));
-            out.push_str(&fired_line(frozen.fired.get(id), per_item));
+            out.push_str(&fired_line(frozen.fired.get(item), per_item));
+        }
+        if frozen.judgement.len() > caps.judgement {
+            out.push_str(&more_line(frozen.judgement.len() - caps.judgement, id));
         }
         out.push_str(&format!(
             "\n   If you cannot judge one honestly, do not guess: add the tag '{}<id>:<reason>' to the report instead.",
@@ -1094,27 +1216,30 @@ pub fn render_start_note(id: &str, frozen: &Frozen) -> String {
     }
 
     out.push_str("\n\n2. TEETH - ");
-    match frozen.machine.as_ref().filter(|_| frozen.decided()) {
+    let machine = frozen.machine.as_ref().filter(|_| frozen.decided());
+    match machine {
         None => out.push_str(&format!("{}.", model::store::STILL_DECIDING)),
         Some(machine) => {
-            teeth_section(&mut out, frozen, machine);
-            disputes_section(&mut out, machine);
+            teeth_section(&mut out, id, frozen, machine, caps);
+            disputes_section(&mut out, id, machine, caps);
         }
     }
 
-    out.push_str("\n\n3. OPEN POINTS - ");
-    open_points_section(&mut out, frozen);
-    let signals = frozen.machine.as_ref().filter(|_| frozen.decided()).and_then(|machine| machine.signals.as_ref());
-    if let Some(signals) = signals {
-        signals_section(&mut out, signals);
+    // WHAT NEEDS NO ACTION COMES LAST: the signals ask for a line in the
+    // report and the open points for nothing, so a cut at the end of the note
+    // never takes an item the session must act on.
+    if let Some(signals) = machine.and_then(|machine| machine.signals.as_ref()) {
+        signals_section(&mut out, id, signals, caps);
     }
+    out.push_str("\n\n4. OPEN POINTS - ");
+    open_points_section(&mut out, frozen, caps);
     out
 }
 
 /// Section 2 of the start note once the machine pass has finished: what THOR
 /// decided itself, then the two lists that are the agent's, each item with
 /// its reason and its exact call.
-fn teeth_section(out: &mut String, frozen: &Frozen, machine: &MachinePass) {
+fn teeth_section(out: &mut String, record: &str, frozen: &Frozen, machine: &MachinePass, caps: &Caps) {
     let reached = machine.items.len();
     if reached == 0 && machine.not_reached == 0 {
         out.push_str("no rule of this project is owed a verdict from THOR's trial.");
@@ -1133,8 +1258,8 @@ fn teeth_section(out: &mut String, frozen: &Frozen, machine: &MachinePass) {
     };
     out.push_str(&format!(
         "THOR tried {tried} itself at the start (time box {} s): {} bite and are on the rule \
-         track now, {} became a note, {} pending check(s) hung, {} held by a blocker only the owner can lift (see 3), \
-         {} need you, {} tried again and left as they were; not reached this time: {} (not owed in this evaluation - the next one starts with them).",
+         track now, {} became a note, {} pending check(s) hung, {} held by a blocker only the owner can lift (see 4), \
+         {} need you, {} tried again and left as they were; not reached this time: {}{}",
         machine.box_secs,
         machine.bites,
         machine.notes,
@@ -1142,7 +1267,14 @@ fn teeth_section(out: &mut String, frozen: &Frozen, machine: &MachinePass) {
         machine.blocked,
         machine.needs_agent + machine.a4_only,
         machine.left_as_they_were(),
-        machine.not_reached
+        machine.not_reached,
+        match machine.not_reached {
+            0 => ".".to_string(),
+            n => format!(
+                " - the time box ended before THOR reached {n} old rule(s); they are not owed in this evaluation and they \
+                 lead the next start."
+            ),
+        }
     ));
     let hung: Vec<String> =
         machine.items.iter().filter(|i| i.outcome == MachineOutcome::PendingHung).map(|i| i.id.clone()).collect();
@@ -1160,14 +1292,18 @@ fn teeth_section(out: &mut String, frozen: &Frozen, machine: &MachinePass) {
         out.push_str("\n   a. THE BATCH - no rule needs a fix from you.");
     } else {
         out.push_str(&format!(
-            "\n   a. THE BATCH - {} rule(s) that need a fix only you can make (at most {}): {}. For each one, make the \
-             fix its line names with the call shown - THOR tries the rule again as it is written and says rule, note, \
-             or what is still missing. A tag, a reason or an open point settles nothing:",
+            "\n   a. THE BATCH - {} rule(s) that need a fix only you can make (at most {}): {}. Make the fix each \
+             line names with the call shown; THOR tries the rule again as it is written and answers rule, note, or what \
+             is still missing. An item is done when it answers rule or note. \
+             A tag, a reason or an open point settles nothing:",
             batch.len(),
             model::store::EVALUATION_TEETH_BATCH,
             quoted(batch)
         ));
-        batch.iter().for_each(|id| out.push_str(&line(id)));
+        batch.iter().take(caps.batch).for_each(|id| out.push_str(&line(id)));
+        if batch.len() > caps.batch {
+            out.push_str(&more_line(batch.len() - caps.batch, record));
+        }
         if frozen.batch_later > 0 {
             out.push_str(&format!(
                 "\n      {} more rule(s) need the same and are not this evaluation's: a later one starts with them.",
@@ -1181,12 +1317,16 @@ fn teeth_section(out: &mut String, frozen: &Frozen, machine: &MachinePass) {
     } else {
         out.push_str(&format!(
             "\n   b. THE A4 LIST - {} rule(s) whose check bites and whose text only has to name the check's literal (at \
-             most {}): {}. For each one, reword its text so it names the literal - nothing else has to change:",
+             most {}): {}. For each one, reword its text so it names the literal - nothing else has to change; the item \
+             is done when THOR answers rule:",
             a4_list.len(),
             model::store::EVALUATION_A4_LIST,
             quoted(a4_list)
         ));
-        a4_list.iter().for_each(|id| out.push_str(&line(id)));
+        a4_list.iter().take(caps.a4).for_each(|id| out.push_str(&line(id)));
+        if a4_list.len() > caps.a4 {
+            out.push_str(&more_line(a4_list.len() - caps.a4, record));
+        }
         let later = machine.a4_only.saturating_sub(a4_list.len());
         if later > 0 {
             out.push_str(&format!("\n      {later} more rule(s) like these wait for the next evaluation."));
@@ -1208,7 +1348,11 @@ fn hang_call(id: &str, first_argument: &str, files: &[String]) -> String {
         ("may_change", _) => "check_kind: \"contains\", check_path: \"<the file the span is in>\", check_literal: \"<the rule's subject>\"".to_string(),
         _ => "check_kind: \"forbidden\", check_literals: [\"<the rule's subject>\"]".to_string(),
     };
-    format!("mcp__thor__revise(id: \"{id}\", text: \"<its text, reworded so it names the rule's subject>\", {check})")
+    format!(
+        "mcp__thor__revise(id: \"{id}\", text: \"<its text, reworded to name the rule's subject>\", {check}, \
+         because: \"<only if the rewording drops a quoted form: why, {}+ characters>\")",
+        model::store::DISPUTE_REASON_MIN_CHARS
+    )
 }
 
 /// The exact call that confirms a dispute: the same rule, with the reason
@@ -1218,15 +1362,15 @@ fn confirm_call(id: &str, first_argument: &str, span: &str) -> String {
     let why = match first_argument {
         "may_change" => format!("why {span} may change while the rule stays true"),
         "accept_refusing" => format!("why refusing {span} is the intent"),
-        _ => format!("why {span} is a legitimate call while the rule stays true"),
+        _ => format!("why {span} is legitimate while the rule stays true"),
     };
-    format!("mcp__thor__revise(id: \"{id}\", because: \"<{why} - at least {} characters>\")", model::store::DISPUTE_REASON_MIN_CHARS)
+    format!("mcp__thor__revise(id: \"{id}\", because: \"<{why}, {}+ characters>\")", model::store::DISPUTE_REASON_MIN_CHARS)
 }
 
 /// Item c of section 2 of the start note: the disputes the agent verifies
 /// (`MachinePass::disputes`). Every line says what the item means, the exact
 /// calls and when it is done - a signal without those makes an agent guess.
-fn disputes_section(out: &mut String, machine: &MachinePass) {
+fn disputes_section(out: &mut String, record: &str, machine: &MachinePass, caps: &Caps) {
     let list = &machine.disputes;
     if list.is_empty() {
         out.push_str("\n   c. DISPUTES TO VERIFY - no rule stored by dispute since the previous evaluation waits to be verified.");
@@ -1234,50 +1378,45 @@ fn disputes_section(out: &mut String, machine: &MachinePass) {
     }
     let ids: Vec<String> = list.iter().map(|d| d.id.clone()).collect();
     out.push_str(&format!(
-        "\n   c. DISPUTES TO VERIFY - {} rule(s) were stored by dispute (legitimate_calls, may_change or accept_refusing) \
-         since the previous evaluation, and nobody has verified the dispute yet (at most {}): {}. WHAT THIS MEANS: the \
-         writer told THOR that the tooth it built from the rule's own words is wrong here, so the rule became a note \
-         that can never refuse anything (with accept_refusing the rule keeps its check and says refusing those calls \
-         is the intent). An audit on 2026-10-07 found 7 of 11 such disputes wrong: the disputed literal was the rule's \
-         real subject, or a better check existed. WHAT TO DO, for each one: open the rule (mcp__thor__get) and the \
-         file or command it is about, and decide whether the disputed literal IS what the rule is about. If it is, or \
-         a better check exists, hang that check (call 1 on its line). If it is only an incidental span, confirm the \
-         dispute with a reason of your own (call 2; a reason shorter than {min} characters is refused). \
-         WHEN AN ITEM IS DONE: the call you made was accepted - THOR then shows rule or note for call 1, or \
-         'revised' for call 2. \
-         Retracting the rule with a reason also settles an item, but only for a rule that is simply wrong. Nothing else \
-         settles an item (not a tag, not a note, not a line in the report), and the report is held until each one is \
-         done. The machine section of your report keeps one line per item of this list saying how it was verified. \
-         EXAMPLE: a rule saying \
-         'the sensor delay is in microseconds, not nanoseconds', disputed on the loose word 'delay' in sensor.cfg: the \
-         subject is 'microseconds', so call 1 with check_kind \"contains\", check_path \"sensor.cfg\", check_literal \
-         \"microseconds\" and the text reworded to name it.",
+        "\n   c. DISPUTES TO VERIFY - {} rule(s) stored by dispute (legitimate_calls, may_change or accept_refusing) since \
+         the previous evaluation and not verified yet (at most {}): {}. WHAT THIS MEANS: the writer said the tooth THOR \
+         built from the rule's own words is wrong here, so the rule is a note that can never refuse anything; an audit \
+         on 2026-10-07 found 7 of 11 such disputes wrong. WHAT TO DO, per rule: open it (mcp__thor__get) and the file or \
+         command it is about. If the disputed literal IS what the rule is about, or a better check exists: call 1 (hang \
+         that check). If it is only an incidental span: call 2 (confirm it with your own reason; one shorter than {min} \
+         characters is refused). WHEN AN ITEM IS DONE: THOR accepted the call (it shows rule or note for call 1, \
+         'revised' for call 2). Retracting the rule with a reason also settles an item, only for a rule that is simply \
+         wrong; a tag, a note or a line in the report settles nothing, and the report is held until every item is done. EXAMPLE: 'the sensor \
+         delay is in microseconds' disputed on the word 'delay': its subject is 'microseconds', so call 1 with \
+         check_kind \"contains\", check_path \"sensor.cfg\", check_literal \"microseconds\".",
         list.len(),
         model::store::EVALUATION_DISPUTE_LIST,
         quoted(&ids),
         min = model::store::DISPUTE_REASON_MIN_CHARS
     ));
-    for dispute in list {
+    for dispute in list.iter().take(caps.disputes) {
         let first = dispute.arguments.first().map(|(name, _)| name.as_str()).unwrap_or("legitimate_calls");
         let span = dispute
             .arguments
             .first()
             .and_then(|(_, values)| values.first())
-            .map(|v| format!("'{}'", first_words(v)))
+            .map(|v| format!("'{}'", cut_words(v, 36)))
             .unwrap_or_else(|| "the span".to_string());
-        let because = match dispute.because.as_deref().map(first_words).filter(|b| !b.is_empty()) {
+        let because = match dispute.because.as_deref().map(|b| cut_words(b, 50)).filter(|b| !b.is_empty()) {
             Some(reason) => format!("the writer's reason: '{reason}'"),
             None => "no reason recorded".to_string(),
         };
         out.push_str(&format!(
-            "\n      - '{id}': {args} (written at log seq {seq}); {because}.\n         Call 1, hang the real check: {hang}\n         \
-             Call 2, confirm the dispute: {confirm}\n         Done when: call 1 or call 2 is accepted.",
+            "\n      - '{id}': {args}; {because}.\n         Call 1, hang the real check: {hang}\n         \
+             Call 2, confirm the dispute: {confirm}",
             id = dispute.id,
             args = model::store::dispute_in_words(&dispute.arguments),
-            seq = dispute.seq,
             hang = hang_call(&dispute.id, first, &dispute.files),
             confirm = confirm_call(&dispute.id, first, &span),
         ));
+    }
+    if list.len() > caps.disputes {
+        out.push_str(&more_line(list.len() - caps.disputes, record));
     }
     if !machine.disputes_later_ids.is_empty() {
         out.push_str(&format!(
@@ -1287,16 +1426,15 @@ fn disputes_section(out: &mut String, machine: &MachinePass) {
     }
 }
 
-/// Section 4 of the start note: THOR's health and the refusal outcomes known
+/// Section 3 of the start note: THOR's health and the refusal outcomes known
 /// at the start (`MachinePass::signals`), so the agent can act on them before
 /// it files. Each says what it means, the exact calls, when it is done and an
 /// example, or says there is nothing to do.
-fn signals_section(out: &mut String, signals: &model::store::SignalsSoFar) {
+fn signals_section(out: &mut String, record: &str, signals: &model::store::SignalsSoFar, caps: &Caps) {
     out.push_str(
-        "\n\n4. SIGNALS BEFORE YOU FILE - THOR read these two signals from its log for the time since the previous report \
-         (the whole log when there is none) up to this start. Refusals no session has verified at its Stop yet are not \
-         counted. The machine section of your report records the same two signals again for this evaluation's own window when \
-         you file: act on what is listed here now, and read that section in the reply to your filing for anything new.",
+        "\n\n3. SIGNALS BEFORE YOU FILE - two signals THOR read from its log, from the previous report up to this start \
+         (refusals no session verified at its Stop yet are not counted). The machine section in the reply to your filing \
+         records them again for this evaluation's own window: act on these now, read that section for anything new.",
     );
     out.push_str(&format!("\n   a. {}", signals.health));
     if signals.hook_failures == 0 && signals.skew_events == 0 {
@@ -1304,17 +1442,13 @@ fn signals_section(out: &mut String, signals: &model::store::SignalsSoFar) {
     } else {
         out.push_str(
             "\n      WHAT THIS MEANS: a hook launch failure is a Claude Code hook (THOR's guard or Stop hook) that could not \
-             start, so nothing from THOR reached that call - the line above names the hook event, its exit code and the \
-             session; a version-skew event is a filing THOR refused because the tool server that wrote the report was built \
-             from another THOR than the checker. Neither is anybody's edit, and no note needs a fix.\
-             \n      WHAT TO DO: put both numbers, the hook events and the sessions in your report, and tell the owner in your \
-             summary: for a skew, to restart Claude so the tool server is the current one - a report refused as skew is on \
-             file but does not count, so file the report again after the restart, and it will still list that skew because \
-             it is in its window; for a launch failure, that the named hook needs his attention. You cannot restart or repair \
-             anything yourself.\
-             \n      DONE WHEN: both numbers, the hook events and the sessions are in the report, and the owner was told.\
-             \n      EXAMPLE: \"THOR health: 1 hook launch failure (PreToolUse, exit 126, session 0de7dc52) - the owner should \
-             look at that hook; 0 version-skew events.\"",
+             start, so nothing from THOR reached that call; a version-skew event is a filing THOR refused because the tool \
+             server that wrote it was built from another THOR than the checker (that report is on file but does not \
+             count). WHAT TO DO: put both numbers, the hook events and the sessions in your report and tell the owner in \
+             your summary - after a skew, to restart Claude (the next end-of-turn ask then files a new report); after a \
+             launch failure, that the named hook needs his attention. You cannot restart or repair anything. DONE WHEN: \
+             the report holds them and the owner was told. EXAMPLE: \"THOR health: 1 hook launch failure (PreToolUse, exit \
+             126, session 0de7dc52) - the owner should look at that hook; 0 version-skew events.\"",
         );
     }
     out.push_str(&format!("\n   b. {}", signals.refusals));
@@ -1322,11 +1456,14 @@ fn signals_section(out: &mut String, signals: &model::store::SignalsSoFar) {
         out.push_str("\n      Nothing to do here.");
         return;
     }
-    for block in &signals.false_blocks {
+    for block in signals.false_blocks.iter().take(caps.blocks) {
         out.push_str(&format!(
             "\n      - {}\n         Read: mcp__thor__history(id: \"{}\")\n         If the refusal was right, restore: {}",
             block.line, block.rule, block.restore
         ));
+    }
+    if signals.false_blocks.len() > caps.blocks {
+        out.push_str(&more_line(signals.false_blocks.len() - caps.blocks, record));
     }
     if signals.false_blocks_more > 0 {
         out.push_str(&format!(
@@ -1336,30 +1473,24 @@ fn signals_section(out: &mut String, signals: &model::store::SignalsSoFar) {
         ));
     }
     out.push_str(&format!(
-        "\n      WHAT THIS MEANS: THOR counts a refusal as a PROBABLE false block when someone other than THOR then retracted \
-         the refusing rule or weakened it (cleared or changed its check, lowered its severity, dropped a binding). A proxy, \
-         not a verdict: a rule can change for other reasons, and a noise mark is shown in history but never counted.\
-         \n      WHAT TO DO, for each rule listed: first run the Read call - the history line of the refusal shows the call that \
-         was refused, the lines after it show the change, and each step shows the rule as it stood. Then decide whether the \
-         refused call was legitimate, from that call and the file or command the rule is about. If it WAS (the refusal was \
-         wrong), the weakening was right: write in the report the rule id, the refused call and why it was legitimate - that \
-         is a false block. If it was NOT (the refusal was right), put the rule back with the restore call shown under it, \
-         with your own reason of at least {} characters in because; THOR must answer rule or note, never a refusal. A \
-         retracted rule is brought back by the remember call shown, under a NEW id with a tag naming the old one: the old id \
-         stays retracted, and a second remember on it would leave it with two heads. If you cannot tell, say so in the \
-         report for that rule and why, and restore nothing.\
-         \n      DONE WHEN: every rule listed has one of those outcomes in your report, and a restore you made was answered \
-         rule or note.\
-         \n      EXAMPLE: the line lists 'no-force-push', refused 'git push --force-with-lease origin main', then check cleared: \
+        "\n      WHAT THIS MEANS: a refusal counts as a PROBABLE false block when someone other than THOR then retracted the \
+         refusing rule or weakened it (cleared or changed its check, lowered its severity, dropped a binding) - a proxy, \
+         not a verdict. WHAT TO DO, per rule: run its Read call (the history shows the refused call and the change after \
+         it), then decide from that call and the file or command the rule is about whether the refused call was \
+         legitimate. If it WAS, the weakening was right: write in the report the rule id, the refused call and why. If it \
+         was NOT, put the rule back with the restore call under it and your own reason of {}+ characters in because (a \
+         retracted rule comes back under a NEW id tagged with the old one). If you cannot tell, say so and restore \
+         nothing. DONE WHEN: every rule listed has one of those outcomes in your report, and a restore was answered rule \
+         or note. EXAMPLE: 'no-force-push' refused 'git push --force-with-lease origin main', then its check was cleared: \
          that call is safe, so the report says \"no-force-push refused git push --force-with-lease origin main, which is \
          safe; clearing its check was right\".",
         model::store::DISPUTE_REASON_MIN_CHARS
     ));
 }
 
-/// Section 3 of the start note: THOR's own open points (nothing for the
+/// Section 4 of the start note: THOR's own open points (nothing for the
 /// agent to do), then the legacy ones an agent filed before step 14.
-fn open_points_section(out: &mut String, frozen: &Frozen) {
+fn open_points_section(out: &mut String, frozen: &Frozen, caps: &Caps) {
     // THOR's own: as the machine pass left them once it has run; before
     // that, the ones that were open at the start.
     let (own, closed): (Vec<String>, Vec<(String, String)>) = match &frozen.machine {
@@ -1383,10 +1514,7 @@ fn open_points_section(out: &mut String, frozen: &Frozen) {
                     };
                     match p.carried_by.is_empty() {
                         true => held,
-                        false => format!(
-                            "{held} - owner decides - carried by {}",
-                            model::store::carriers_in_words(&p.carried_by)
-                        ),
+                        false => format!("{held} - owner decides - {}", model::store::carriers_compact(&p.carried_by)),
                     }
                 })
                 .collect(),
@@ -1403,13 +1531,18 @@ fn open_points_section(out: &mut String, frozen: &Frozen) {
         out.push_str("none.");
         return;
     }
-    out.push_str("written and closed by THOR itself; none of them holds this report.");
-    if !own.is_empty() {
+    out.push_str("written and closed by THOR itself; none of them holds this report, and nothing here is for you to do.");
+    if !own.is_empty() && caps.points {
         out.push_str(&format!(
-            "\n   - THOR's own, open ({}): {}. Nothing for you to do: each one says in its own text what clears it \
-             (`get` shows it), and it closes itself when its subject settles.",
+            "\n   - THOR's own, open ({}): {}. Each one says in its own text what clears it (`get` shows it), and it \
+             closes itself when its subject settles.",
             own.len(),
             own.join(", ")
+        ));
+    } else if !own.is_empty() {
+        out.push_str(&format!(
+            "\n   - THOR's own, open: {} of them, not listed here to keep this note short (`doctor` lists them).",
+            own.len()
         ));
     }
     for (id, reason) in &closed {
@@ -1425,10 +1558,17 @@ fn open_points_section(out: &mut String, frozen: &Frozen) {
     }
 }
 
-/// The start note of `start`, as shown again when the evaluation is already
-/// open: rendered from its frozen lists, exactly as when it started.
+/// The start note of `start`, as the session is shown it: rendered from its
+/// frozen lists, exactly as when it started, within `START_NOTE_BUDGET`.
 pub fn start_note(start: &EvaluationStart) -> String {
-    render_start_note(&start.id, &start.frozen)
+    start_note_after(start, 0)
+}
+
+/// `start_note` for a text that goes out with `in_front` bytes of other words
+/// before it (the Stop ask, the continue line): the same size limit holds for
+/// the two together.
+pub fn start_note_after(start: &EvaluationStart, in_front: usize) -> String {
+    render_start_note_within(&start.id, &start.frozen, START_NOTE_BUDGET.saturating_sub(in_front))
 }
 
 /// What the session is told when it opens the routine while an evaluation
@@ -1437,13 +1577,13 @@ pub fn start_note(start: &EvaluationStart) -> String {
 pub fn continue_note(start: &EvaluationStart, this_session: bool) -> String {
     let when = crate::time::iso8601_from_unix(start.frozen.started_unix);
     if this_session {
-        format!(
+        let line = format!(
             "[THOR] an evaluation of {} is already open since log seq {} (started {when} in this session) - continue \
-             it: the start note is repeated below.\n\n{}",
-            start.frozen.project,
-            start.frozen.started_seq,
-            start_note(start)
-        )
+             it: the start note is repeated below.\n\n",
+            start.frozen.project, start.frozen.started_seq
+        );
+        let note = start_note_after(start, line.len());
+        format!("{line}{note}")
     } else {
         format!(
             "[THOR] an evaluation of {} is already open since log seq {} (started {when} in another session) - \
@@ -1956,7 +2096,7 @@ mod tests {
         assert_eq!(note, stored.text, "the record's text is the note");
         assert!(note.contains("1. JUDGEMENT - nothing that fired in this session owes a verdict"), "{note}");
         assert!(note.contains("2. TEETH - no rule"), "{note}");
-        assert!(note.contains("3. OPEN POINTS - none."), "{note}");
+        assert!(note.contains("4. OPEN POINTS - none."), "{note}");
     }
 
     /// The retired handover sidecar is deleted, and a planted one changes

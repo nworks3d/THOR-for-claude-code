@@ -5963,6 +5963,19 @@ mod tests {
             "{line}"
         );
         assert!(line.contains("  note by dispute: dsp-old [global] legitimate_calls ['git bundle list-heads backup.bundle'], may_change [] - because: no reason recorded"), "{line}");
+
+        // The agent's "confirm the dispute" call is a bare revise with a reason
+        // (no trial record of its own): doctor shows the reason it gave.
+        {
+            let mut s = EventStore::open_existing(&db).unwrap();
+            let old = store::show(&s, "dsp-old").unwrap();
+            store::revise_tried_scoped(&mut s, "s", "l", "a", &old, &old, &old, Some("checked the file: list-heads is incidental here"), None, None, None, None).unwrap();
+        }
+        let line = teeth_line(&db, true);
+        assert!(
+            line.contains("  note by dispute: dsp-old [global] legitimate_calls ['git bundle list-heads backup.bundle'], may_change [] - because: checked the file: list-heads is incidental here"),
+            "a reason given by a bare revise is shown: {line}"
+        );
     }
 
     /// The "wired, literal never seen" count (measured 2026-10-03: 70 listed,

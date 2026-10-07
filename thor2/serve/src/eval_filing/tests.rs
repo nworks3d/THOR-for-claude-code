@@ -562,7 +562,13 @@ fn owner_queue_names_every_carrying_session() {
     let two = valid_filing(&mut fx.store, &root, S2, &report("eval-fxp-2", "fxp", "TLDR two."), "toolu_f2");
     let third = fx.start(S3, "fxp");
     let date = |v: &EvaluationValidation| v.filed_at.clone().unwrap()[..10].to_string();
-    let named = format!("owner decides - carried by session {S1} on {}, {S2} on {}", date(&one), date(&two));
+    let named = format!(
+        "owner decides - carried by 2 valid evaluation(s), the last 2: session {} on {}, {} on {}",
+        &S1[..8],
+        date(&one),
+        &S2[..8],
+        date(&two)
+    );
     let note = crate::eval_session::start_note(&third);
     assert!(note.contains(&named), "the start note: {note}");
     let point = model::store::open_points(&fx.store, Some("fxp")).pop().unwrap();

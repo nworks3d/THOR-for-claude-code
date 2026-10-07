@@ -199,7 +199,7 @@ fn assert_note_names_the_frozen_lists(note: &str, start: &EvaluationStart) {
     for id in start.frozen.a4_list() {
         assert!(note.contains(&format!("mcp__thor__revise(id: \"{id}\", text: ")), "the exact call for '{id}': {note}");
     }
-    assert!(note.contains("1. JUDGEMENT") && note.contains("2. TEETH") && note.contains("3. OPEN POINTS"), "{note}");
+    assert!(note.contains("1. JUDGEMENT") && note.contains("2. TEETH") && note.contains("4. OPEN POINTS"), "{note}");
 }
 
 /// The Stop hook's ask starts the evaluation: one start record, by

@@ -1276,31 +1276,32 @@ pub fn dispute_arguments(fields: &TrialFields) -> Vec<(String, Vec<String>)> {
     .collect()
 }
 
-/// The reason the dispute recorded at log seq `seq` was written with: the
-/// `because` of the newest write by someone other than THOR's own actors, at
-/// or before `seq`, whose record named this same dispute. THOR's own retest
-/// carries a dispute forward under its own name, so its events are looked
-/// through. `None` when the writer gave none (every dispute stored before the
-/// reason was required), or when `seq` carries no dispute.
+/// The reason the dispute standing at log seq `seq` is kept with: the newest
+/// `because` given for it, at or before `seq`, by anyone but THOR's own actors,
+/// on ANY write of the item since the dispute began - the write that carried it,
+/// or a later revise that only restates the reason (the agent's "confirm the
+/// dispute" call changes no field a trial reads, so it has no trial record of
+/// its own). THOR's own retest carries a dispute forward under its own name, so
+/// its events are looked through. `None` when no writer ever gave one (every
+/// dispute stored before the reason was required), or when `seq` carries no
+/// dispute.
 pub fn dispute_reason(events: &[Event], seq: i64) -> Option<String> {
-    let mut wanted: Option<Vec<(String, Vec<String>)>> = None;
-    for event in events.iter().rev().filter(|e| e.seq <= seq) {
-        let Ok(Some(record)) = trial_of(event) else { continue };
-        let arguments = dispute_arguments(record.fields());
-        match &wanted {
-            None if arguments.is_empty() => return None,
-            None => wanted = Some(arguments),
-            Some(first) if *first != arguments => return None,
-            Some(_) => {}
-        }
-        if RESERVED_ACTORS.contains(&event.actor.as_str()) {
-            continue;
-        }
-        if let Some(reason) = because_reason(&event.body).map(|r| r.trim().to_string()).filter(|r| !r.is_empty()) {
-            return Some(reason);
-        }
+    let (last, record) = events
+        .iter()
+        .rev()
+        .filter(|e| e.seq <= seq)
+        .find_map(|e| trial_of(e).ok().flatten().map(|record| (e.seq, record)))?;
+    if dispute_arguments(record.fields()).is_empty() {
+        return None;
     }
-    None
+    let origin = dispute_origin(events, last);
+    events
+        .iter()
+        .rev()
+        .filter(|e| e.seq >= origin && e.seq <= seq)
+        .filter(|e| matches!(e.kind, EventKind::FactCreated | EventKind::FactRevised))
+        .filter(|e| !RESERVED_ACTORS.contains(&e.actor.as_str()))
+        .find_map(|e| because_reason(&e.body).map(|r| r.trim().to_string()).filter(|r| !r.is_empty()))
 }
 
 /// The log seq where the run of records naming the dispute that `seq` carries
@@ -1334,8 +1335,7 @@ pub fn current_dispute_in_words(store: &EventStore, id: &str) -> Option<String> 
 /// `dispute_reason`. `None` for an item that carries no dispute, too.
 pub fn current_dispute_reason(store: &EventStore, id: &str) -> Option<String> {
     let events = store.get_events_by_entity(id).ok()?;
-    let last = events.iter().rev().find(|e| matches!(trial_of(e), Ok(Some(_))))?.seq;
-    dispute_reason(&events, last)
+    dispute_reason(&events, i64::MAX)
 }
 
 /// A later write by the agent that answers a dispute: a revise with a reason
@@ -6464,7 +6464,7 @@ fn settled_how(events: &[Event], started_seq: i64, session: &str) -> String {
             format!("{verdict} by THOR's trial at log seq {}, written by {}", event.seq, door(event))
         }
         (Some((event, _)), _) => format!("tried at log seq {} and rewritten since - no verdict stands for it at the filing", event.seq),
-        _ => "no write in the window settled it - the filing gate read its check in the registered working copy".to_string(),
+        _ => "settled without a write - its check already holds in the registered working copy; nothing to do".to_string(),
     }
 }
 
@@ -6947,7 +6947,12 @@ fn false_block_lines(blocks: &[FalseBlock]) -> String {
         "\nprobable false blocks, each with the call that was refused and what followed (at most {FALSE_BLOCKS_LISTED} are listed):"
     );
     for block in blocks.iter().take(FALSE_BLOCKS_LISTED) {
-        out.push_str(&format!("\n- {}", block.line));
+        // The same two lines the start note gives, so the filing reply never
+        // names a refusal it does not say how to settle.
+        out.push_str(&format!(
+            "\n- {}\n  Read: mcp__thor__history(id: \"{}\")\n  If the refusal was right, restore: {}",
+            block.line, block.rule, block.restore
+        ));
     }
     if blocks.len() > FALSE_BLOCKS_LISTED {
         out.push_str(&format!("\n- and {} more, not listed here", blocks.len() - FALSE_BLOCKS_LISTED));
@@ -7080,7 +7085,8 @@ fn machine_section(store: &EventStore, start: &EvaluationStart, filed_seq: i64) 
     }
     who.extend(agents.iter().map(|a| format!("agent {a}")));
     out.push_str(&format!(
-        "\nEVALUATION: project '{}'; session {} ({}); started by {} (THOR's record '{}', log seq {}); N = {n}, F = {filed_seq}.",
+        "\nEVALUATION: project '{}'; session {} ({}); started by {} (THOR's record '{}', itself written at log seq {}); N = {n} is the log position the start \
+         note names, F = {filed_seq} is the filing.",
         plain(&frozen.project),
         plain(session),
         who.join(", "),
@@ -7340,14 +7346,21 @@ fn machine_section(store: &EventStore, start: &EvaluationStart, filed_seq: i64) 
     // Writes the trial refused in OTHER sessions during the window: not this
     // evaluation's, counted apart (field test 5, D7: four counted, three its own).
     let mut trial_refused_elsewhere = 0usize;
+    // The rule each counted refusal was about, so none is anonymous.
+    let mut hook_rules: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut trial_rules: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     for event in window.iter().filter(|e| e.kind == EventKind::GateRefused) {
         if event.actor == TEETH_WRITE_ACTOR {
             if event.session_id == session {
                 trial_refused += 1;
+                *trial_rules.entry(plain(&event.entity_id)).or_default() += 1;
             } else {
                 trial_refused_elsewhere += 1;
             }
-        } else if event.actor == ASSISTANT_DELIVERY_ACTOR && event.session_id == session {
+            continue;
+        }
+        *hook_rules.entry(plain(&event.entity_id)).or_default() += 1;
+        if event.actor == ASSISTANT_DELIVERY_ACTOR && event.session_id == session {
             own_session += 1;
             never_proof += 1;
         } else if event.actor == ASSISTANT_DELIVERY_ACTOR {
@@ -7365,6 +7378,12 @@ fn machine_section(store: &EventStore, start: &EvaluationStart, filed_seq: i64) 
          hook refused {verified} real tool call(s) (verified in a session's transcript); {never_proof} probe or hand-fed refusal(s) (never proof); {unchecked} not verified yet; {trial_refused} write(s) \
          refused by THOR's own trial."
     ));
+    if !hook_rules.is_empty() {
+        out.push_str(&format!(" Rules the hook refused: {}.", refused_rules_named(&hook_rules)));
+    }
+    if !trial_rules.is_empty() {
+        out.push_str(&format!(" Rules whose write the trial refused: {}.", refused_rules_named(&trial_rules)));
+    }
     if trial_refused_elsewhere > 0 {
         out.push_str(&format!(
             " {trial_refused_elsewhere} more write(s) refused by the trial in other sessions during the window are not counted here."
@@ -7420,6 +7439,20 @@ fn machine_section(store: &EventStore, start: &EvaluationStart, filed_seq: i64) 
     out.push_str(&format!("\nchecked at the end of this turn: {} write(s).", unverified.len()));
     unverified.iter().for_each(|line| out.push_str(line));
     (out, summary)
+}
+
+/// The rules a REFUSED line names: each with how many refusals it had when
+/// more than one, at most `FALSE_BLOCKS_LISTED` of them, then how many more.
+fn refused_rules_named(rules: &std::collections::BTreeMap<String, usize>) -> String {
+    let mut named: Vec<String> = rules
+        .iter()
+        .take(FALSE_BLOCKS_LISTED)
+        .map(|(rule, n)| if *n > 1 { format!("'{rule}' ({n}x)") } else { format!("'{rule}'") })
+        .collect();
+    if rules.len() > FALSE_BLOCKS_LISTED {
+        named.push(format!("and {} more", rules.len() - FALSE_BLOCKS_LISTED));
+    }
+    named.join(", ")
 }
 
 /// REFUSAL OUTCOMES, for the machine section: of the real refusals the hook
@@ -7634,6 +7667,23 @@ pub fn carriers_in_words(carriers: &[Carrier]) -> String {
         format!("{}{agent} on {}", plain(&c.session), plain(date))
     };
     format!("session {}", carriers.iter().map(one).collect::<Vec<_>>().join(", "))
+}
+
+/// How many carrying evaluations the start note names (`carriers_compact`).
+pub const CARRIERS_NAMED: usize = 3;
+
+/// `carriers_in_words` for the start note, where a long owner queue must not
+/// push the lists the session acts on out of the size Claude Code shows:
+/// how many valid evaluations carried the subject, then the last
+/// `CARRIERS_NAMED` of them by the first eight characters of their session and
+/// their date. The whole list stays in the point's own text (`get`).
+pub fn carriers_compact(carriers: &[Carrier]) -> String {
+    let one = |c: &Carrier| {
+        let date = c.filed_at.get(..10).unwrap_or(c.filed_at.as_str());
+        format!("{} on {}", short_session(&c.session), plain(date))
+    };
+    let last: Vec<String> = carriers.iter().rev().take(CARRIERS_NAMED).rev().map(one).collect();
+    format!("carried by {} valid evaluation(s), the last {}: session {}", carriers.len(), last.len(), last.join(", "))
 }
 
 /// How many of THOR's own open points of one project may wait on the owner
@@ -10958,6 +11008,42 @@ mod tests {
         assert_eq!(current_dispute_reason(&store, "no-such-item"), None);
     }
 
+    /// The agent's "confirm the dispute" call is a bare revise with a reason: no
+    /// trial record of its own. The reason it gives is the newest one for the
+    /// dispute, and doctor reads it from here - a dispute the writer left no
+    /// reason for shows the confirming one, and a later confirmation beats an
+    /// earlier reason. A reason given before the dispute began is not its reason.
+    #[test]
+    fn a_dispute_reason_follows_a_later_bare_revise_with_a_reason() {
+        let mut store = EventStore::in_memory().unwrap();
+        // The reason of an earlier life of the same item, before any dispute.
+        declare(&mut store, "s", "l", "a", &plain_note("dsp-bare")).unwrap();
+        let before = show(&store, "dsp-bare").unwrap();
+        revise_tried_scoped(&mut store, "s", "l", "a", &before, &before, &before, Some("an older reason from before the dispute"), None, None, None, None).unwrap();
+        declare_disputed(&mut store, "dsp-bare2", None, may_change("version"));
+        assert_eq!(current_dispute_reason(&store, "dsp-bare2"), None, "none was given yet");
+        let existing = show(&store, "dsp-bare2").unwrap();
+        revise_tried_scoped(&mut store, "s", "l", "a", &existing, &existing, &existing, Some("checked the file: only the version number moves"), None, None, None, None).unwrap();
+        assert_eq!(current_dispute_reason(&store, "dsp-bare2").as_deref(), Some("checked the file: only the version number moves"));
+        revise_tried_scoped(&mut store, "s", "l", "a", &existing, &existing, &existing, Some("restated later: the heading never changes, the number does"), None, None, None, None).unwrap();
+        assert_eq!(
+            current_dispute_reason(&store, "dsp-bare2").as_deref(),
+            Some("restated later: the heading never changes, the number does"),
+            "the newest reason wins"
+        );
+        // THOR's own retest after the confirmation keeps it visible.
+        let mut fields = trial_fields(&existing, RecordedVerdict::Note);
+        fields.disputes.may_change = vec!["version".to_string()];
+        let record = TrialRecord::seal(fields);
+        revise_tried_scoped(&mut store, "retest", "l", SystemActor::new("retest"), &existing, &existing, &existing, Some("no tooth bites"), None, Some(&record), None, None).unwrap();
+        assert_eq!(
+            current_dispute_reason(&store, "dsp-bare2").as_deref(),
+            Some("restated later: the heading never changes, the number does")
+        );
+        // An item that carries no dispute has no dispute reason, whatever it was revised for.
+        assert_eq!(current_dispute_reason(&store, "dsp-bare"), None);
+    }
+
     /// A refusal in an item's history carries the call it refused, as the
     /// log kept it (redacted when it was written), cut to a short excerpt -
     /// so a reader can tell a wrong refusal from a right one.
@@ -11179,6 +11265,28 @@ mod tests {
         for quiet in ["- 'ro-same'", "- 'ro-own'", "- 'ro-unverified'"] {
             assert!(!section.contains(quiet), "{quiet} is no probable false block: {section}");
         }
+        // The same calls the start note prints: a read, and the restore - a
+        // revise with the old check plus a reason for a weakened rule, a
+        // remember under a new id tagged with the old one for a retracted one.
+        assert!(section.contains("\n  Read: mcp__thor__history(id: \"ro-weak\")"), "{section}");
+        assert!(
+            section.contains("\n  If the refusal was right, restore: mcp__thor__revise(id: \"ro-weak\", check_kind: \"contains\", check_path: \"files/ro-weak.md\", check_literal: \"keep me\", because: \"<why the weakening was a mistake - at least 20 characters>\")"),
+            "{section}"
+        );
+        assert!(section.contains("\n  Read: mcp__thor__history(id: \"ro-gone\")"), "{section}");
+        assert!(
+            section.contains("restore: mcp__thor__remember(id: \"ro-gone-restored\", kind: \"orientation\"") && section.contains("tags: [\"restored-from:ro-gone\"]"),
+            "{section}"
+        );
+        // No refusal is anonymous: the REFUSED line names the rule of each one it counts.
+        let refused = section.lines().find(|l| l.starts_with("REFUSED:")).expect("the line");
+        assert!(refused.contains(" Rules the hook refused: 'ro-gone', 'ro-own', 'ro-same', 'ro-unverified', 'ro-weak'."), "{refused}");
+        // N and the start record's own seq are told apart.
+        let evaluation = section.lines().find(|l| l.starts_with("EVALUATION:")).expect("the line");
+        assert!(
+            evaluation.contains(&format!("itself written at log seq {}); N = {} is the log position the start note names", start.seq, start.frozen.started_seq)),
+            "{evaluation}"
+        );
         assert!(section.is_ascii() && !section.contains('\r'), "plain ASCII, LF only");
         assert_eq!(render_machine_section(&store, &start, filed_seq), section, "pure");
     }

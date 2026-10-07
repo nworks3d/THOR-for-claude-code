@@ -1243,6 +1243,37 @@ pub struct Disputes {
     pub accept_refusing: Vec<String>,
 }
 
+impl Disputes {
+    /// Whether the writer named no dispute at all.
+    pub fn is_empty(&self) -> bool {
+        self.legitimate_calls.is_empty() && self.may_change.is_empty() && self.accept_refusing.is_empty()
+    }
+}
+
+/// The disputes `head` stands on today: what its newest trial record says it
+/// was stored with, when that record is for `head` as it reads now. A revise
+/// that changes a field a trial reads and gives a reason of its own, but names
+/// no dispute, CONFIRMS the dispute the rule stands on: the trial runs again
+/// with these, so a rule whose tooth still cannot work stays a note by
+/// dispute with the new reason in its history (a dispute the trial does not
+/// need is simply not recorded again). Without this the retry dropped the
+/// dispute and the reason with it.
+pub fn standing_disputes(store: &EventStore, head: &Item) -> Disputes {
+    let Ok(events) = store.get_events_by_entity(&head.id) else { return Disputes::default() };
+    let Some(record) = events.iter().rev().find_map(|e| model::store::trial_of(e).ok().flatten()) else {
+        return Disputes::default();
+    };
+    let f = record.fields();
+    if f.fingerprint != model::store::fingerprint(head) {
+        return Disputes::default();
+    }
+    Disputes {
+        legitimate_calls: f.disputes.legitimate_calls.clone(),
+        may_change: f.disputes.may_change.clone(),
+        accept_refusing: f.accept_refusing.clone(),
+    }
+}
+
 /// The write being tried.
 #[derive(Debug, Clone)]
 pub struct Write<'a> {
@@ -2885,7 +2916,7 @@ fn recorded_disputes(store: &EventStore, id: &str, fp: &str) -> (Disputes, Optio
                 return (Disputes::default(), None, false);
             }
             let named = !model::store::dispute_arguments(f).is_empty();
-            if named && model::store::dispute_reason(&events, e.seq).is_none() {
+            if named && model::store::dispute_reason(&events, i64::MAX).is_none() {
                 return (Disputes::default(), f.pending.clone(), true);
             }
             return (
@@ -3270,6 +3301,12 @@ pub fn trial_for_write(
                      severity"
                 ),
                 (_, None) => "teeth unchanged".to_string(),
+            };
+            // A rule an open evaluation still owes is NOT settled by a write
+            // that changes nothing: say so before the reassuring line.
+            let line = match crate::eval_session::still_owed(store, item) {
+                Some(owed) => format!("{owed} - {line}"),
+                None => line,
             };
             return WriteTrial::Unchanged { item: kept, receipt: vec![line] };
         }

@@ -262,3 +262,29 @@ fn history_shows_the_call_a_refusal_refused_and_the_rule_as_it_stood() {
     assert!(!history.contains("no readable item body"), "{history}");
     assert!(history.contains("\n    as it stood: check forbidden '--force'; bound to command 'git push'; severity "), "{history}");
 }
+
+/// A text change that gives a reason of its own, and names no dispute, is the
+/// agent confirming the dispute the rule stands on while it rewords: the trial
+/// runs again with the dispute, so the rule stays a note by dispute and the
+/// new reason is the one doctor shows. Before, the retry dropped the dispute
+/// and the reason with it.
+#[test]
+fn a_reworded_rule_with_a_reason_keeps_its_confirmed_dispute_and_the_reason() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = store(tmp.path(), &["demo"]);
+    let mut mcp = Mcp::start(&db, tmp.path());
+    let mut args = push_rule();
+    args["because"] = json!(REASON);
+    assert!(mcp.call("remember", args).starts_with("stored 'bundle'"));
+
+    let restated = "reworded the rule and checked it: the example call stays incidental, the rule stays true";
+    let reply = mcp.call(
+        "revise",
+        json!({ "id": "bundle", "text": "Prove a bundle with `git clone --mirror` plus fsck, never with `git bundle list-heads` alone.", "because": restated }),
+    );
+    println!("{reply}");
+    assert!(reply.starts_with("revised 'bundle'"), "{reply}");
+    let store = thor_core::event_store::EventStore::open_existing(&db).unwrap();
+    assert!(model::store::current_dispute_in_words(&store, "bundle").is_some(), "the dispute is still carried: {reply}");
+    assert_eq!(model::store::current_dispute_reason(&store, "bundle").as_deref(), Some(restated), "{reply}");
+}

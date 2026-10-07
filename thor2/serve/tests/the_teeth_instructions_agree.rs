@@ -119,7 +119,7 @@ fn a_reason_tag_answers_nothing_in_every_text_an_agent_reads() {
         "the evaluation's start note must say a reason settles nothing"
     );
     assert!(
-        note.contains("mcp__thor__revise(id: \\\"{id}\\\")"),
+        note.contains("mcp__thor__revise(id: \\\"{id}\\\", <the change its line names>"),
         "and name the write tool's door to the trial"
     );
     assert!(!hook.contains("fn teeth_debt"), "no Stop asks about the rules the trial has not decided any more");
@@ -186,8 +186,11 @@ fn the_routine_names_the_real_arguments_and_the_start_notes_call() {
         assert!(routine.contains(&format!("`{field}`")), "the routine must name {field}");
         assert!(struct_body(&mcp, "ReviseArgs").contains(&format!("pub {field}: Vec<String>")), "revise must take {field}");
     }
-    assert!(routine.contains("mcp__thor__revise(id: \"<id>\")"), "the routine must give the call a batch rule gets");
-    assert!(read("serve/src/eval_session.rs").contains("mcp__thor__revise(id: \\\"{id}\\\")"), "the start note must print that call");
+    assert!(routine.contains("mcp__thor__revise(id: \"<id>\", ...)"), "the routine must give the call a batch rule gets");
+    assert!(
+        read("serve/src/eval_session.rs").contains("mcp__thor__revise(id: \\\"{id}\\\", <the change its line names>"),
+        "the start note must print that call"
+    );
 }
 
 /// AGENTS.md describes the evaluation with numbers; each one is the code's own
@@ -247,7 +250,7 @@ fn the_three_arguments_need_a_because_in_every_text_an_agent_reads() {
     assert!(routine.contains("each one needs `because`") && routine.contains("at least twenty characters"), "the routine must say so");
     assert!(routine.contains("**The disputes to verify**"), "the routine must describe the dispute list");
     let note = read("serve/src/eval_session.rs");
-    for phrase in ["c. DISPUTES TO VERIFY", "WHAT THIS MEANS:", "WHEN AN ITEM IS DONE:", "EXAMPLE:", "Done when:"] {
+    for phrase in ["c. DISPUTES TO VERIFY", "WHAT THIS MEANS:", "WHEN AN ITEM IS DONE:", "EXAMPLE:", "WHAT TO DO"] {
         assert!(note.contains(phrase), "the start note must carry '{phrase}'");
     }
 }
@@ -275,16 +278,17 @@ fn the_routine_explains_every_new_evaluation_signal_in_the_words_thor_prints() {
         ("DISPUTES TO VERIFY", "the machine section's frozen dispute lines"),
         ("notes by dispute written in the window", "the window lists are told apart from item c"),
         ("`restored-from:<id>`", "a retracted rule is restored under a new id"),
-        ("SIGNALS BEFORE YOU FILE", "section 4 of the start note"),
+        ("SIGNALS BEFORE YOU FILE", "section 3 of the start note"),
         ("in full", "the filing reply prints the machine section in full"),
         ("a text revise changes neither", "a revised report still counts"),
     ] {
         assert!(routine.contains(phrase), "the routine must explain {why} (missing '{phrase}')");
     }
     for (phrase, where_) in [
-        ("4. SIGNALS BEFORE YOU FILE", &note),
+        ("3. SIGNALS BEFORE YOU FILE", &note),
         ("TWO EXITS", &note),
-        ("a reason shorter than {min} characters is refused", &note),
+        ("one shorter than {min}", &note),
+        ("characters is refused", &note),
         ("Retracting the rule with a reason also settles an item", &note),
         ("DISPUTES TO VERIFY (frozen at the start)", &model),
         ("verified by call 1", &model),

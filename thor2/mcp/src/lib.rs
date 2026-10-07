@@ -2755,7 +2755,13 @@ impl ThorMcpServer {
                 false,
             )
             .map_err(|r| gate_refusal(r, s))?;
-            let disputes = disputes_of(&args.legitimate_calls, &args.may_change, &args.accept_refusing);
+            let mut disputes = disputes_of(&args.legitimate_calls, &args.may_change, &args.accept_refusing);
+            // A reason of its own on a revise that names no dispute confirms
+            // the one the rule stands on: it is tried again with it.
+            let gives_reason = args.because.as_deref().is_some_and(|b| b.trim().chars().count() >= model::store::DISPUTE_REASON_MIN_CHARS);
+            if gives_reason && disputes.is_empty() {
+                disputes = serve::teeth::standing_disputes(s, &existing);
+            }
             let trial = run_trial(s, &corpus, &session, &updated, Some(&existing), args.because.as_deref(), &disputes, bare);
             let (written, record, notes, unchanged, trial_because) = match trial {
                 serve::teeth::WriteTrial::Refused { message, receipt, .. } => return Err(trial_refusal(&message, &receipt)),

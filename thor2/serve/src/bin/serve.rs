@@ -3418,7 +3418,10 @@ fn eval_stop_ask(
                 }
                 let reason = format!("{}{reason}", routine_changed_lines(session_id));
                 return EvalStop::Ask(match started {
-                    Some(started) => format!("{reason}\n\n{}", serve::eval_session::start_note(&started.start)),
+                    Some(started) => {
+                        let note = serve::eval_session::start_note_after(&started.start, reason.len() + 2);
+                        format!("{reason}\n\n{note}")
+                    }
                     None => reason,
                 });
             }

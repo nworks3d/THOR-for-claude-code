@@ -657,6 +657,12 @@ fn the_pass_stops_at_its_time_box_and_resumes() {
     assert_eq!((machine.not_reached, machine.items.len()), (12, 0), "{machine:?}");
     assert_eq!(machine.not_reached_ids, ids, "oldest write first");
     assert!(start_note(&first).contains("not reached this time: 12"), "{}", start_note(&first));
+    // The count says what it means: why, that it is not owed here, and who goes first next time.
+    assert!(
+        start_note(&first).contains("the time box ended before THOR reached 12 old rule(s); they are not owed in this evaluation and they lead the next start"),
+        "{}",
+        start_note(&first)
+    );
     assert!(model::store::evaluation_frozen_batch_owed(&fx.store, &first).is_empty(), "what was not reached is not owed here");
     file(&mut fx, &first, "eval-beta-1").expect("none of the unreached rules holds the filing");
 
@@ -798,7 +804,11 @@ fn a4_only_items_get_their_own_list_of_16() {
     assert_eq!((machine.a4_only, machine.needs_agent, machine.bites, machine.notes), (20, 0, 0, 0), "{machine:?}");
     assert_eq!(start.frozen.a4_list(), &ids[..16]);
     assert_eq!(start.frozen.batch(), &[] as &[String], "none in the batch of 8");
-    let note = start_note(&start);
+    // The record keeps the whole note; what the session is shown is the same
+    // note cut to the size Claude Code shows, with the cut named.
+    let shown = start_note(&start);
+    assert!(shown.len() <= START_NOTE_BUDGET, "{} bytes", shown.len());
+    let note = render_start_note(&start.id, &start.frozen);
     for (n, id) in ids.iter().enumerate().take(16) {
         let call = format!("mcp__thor__revise(id: \"{id}\", text: \"<its text, reworded so it names '--wipe-{n:02}'>\")");
         assert_eq!(item_of(&start, id).call.as_deref(), Some(call.as_str()));
@@ -912,22 +922,22 @@ fn a_dispute_written_since_the_previous_report_is_on_the_start_note_with_its_cal
     assert_eq!(start.frozen.dispute_list()[1].because, None);
 
     let note = start_note(&start);
-    assert!(note.contains("c. DISPUTES TO VERIFY - 2 rule(s) were stored by dispute"), "{note}");
+    assert!(note.contains("c. DISPUTES TO VERIFY - 2 rule(s) stored by dispute"), "{note}");
     assert!(note.contains("WHAT THIS MEANS:") && note.contains("WHEN AN ITEM IS DONE:") && note.contains("EXAMPLE:"), "{note}");
-    assert!(note.contains(&format!("the writer's reason: '{}", &why[..60])), "{note}");
+    assert!(note.contains(&format!("the writer's reason: '{}", &why[..45])), "{note}");
     assert!(note.contains("no reason recorded"), "{note}");
     for id in [&reasoned, &silent] {
         assert!(
             note.contains(&format!(
-                "Call 1, hang the real check: mcp__thor__revise(id: \"{id}\", text: \"<its text, reworded so it names the rule's subject>\", \
-                 check_kind: \"forbidden\", check_literals: [\"<the rule's subject>\"])"
+                "Call 1, hang the real check: mcp__thor__revise(id: \"{id}\", text: \"<its text, reworded to name the rule's subject>\", \
+                 check_kind: \"forbidden\", check_literals: [\"<the rule's subject>\"], because: \"<only if the rewording drops a quoted form"
             )),
             "{id}: {note}"
         );
-        assert!(note.contains(&format!("Call 2, confirm the dispute: mcp__thor__revise(id: \"{id}\", because: \"<why 'git bundle list-heads backup.bundle' is a legitimate call while the rule stays true")), "{id}: {note}");
+        assert!(note.contains(&format!("Call 2, confirm the dispute: mcp__thor__revise(id: \"{id}\", because: \"<why 'git bundle list-heads backup.bundle' is legitimate while the rule stays true, 20+ characters>\")")), "{id}: {note}");
     }
-    assert_eq!(note.matches("Done when: call 1 or call 2 is accepted.").count(), 2, "{note}");
-    assert!(note.contains("a reason shorter than 20 characters is refused"), "call 2 says THOR enforces the length: {note}");
+    assert!(note.contains("WHEN AN ITEM IS DONE: THOR accepted the call"), "{note}");
+    assert!(note.contains("one shorter than 20 characters is refused"), "call 2 says THOR enforces the length: {note}");
     assert!(note.contains("Retracting the rule with a reason also settles an item"), "a retract is named as the other exit: {note}");
     // Frozen: the record carries them, so the note and the record agree.
     assert_eq!(model::store::frozen_ids(&start).iter().filter(|id| id.starts_with("bundle-")).count(), 2);
@@ -965,7 +975,7 @@ fn the_start_note_shows_health_and_refusal_outcomes_known_so_far_with_their_call
     let start = fx.start(S1, "demo");
     assert!(start.frozen.machine.as_ref().unwrap().signals.is_some(), "frozen with the start");
     let note = start_note(&start);
-    let section = &note[note.find("\n\n4. SIGNALS BEFORE YOU FILE").expect(&note)..];
+    let section = &note[note.find("\n\n3. SIGNALS BEFORE YOU FILE").expect(&note)..];
     assert!(
         section.contains("\n   a. THOR health since the previous report: 1 hook launch failure(s) (PreToolUse, exit 126, session 373e8610), 0 version-skew event(s)."),
         "{section}"
@@ -1022,7 +1032,7 @@ fn disputes_follow_the_batch_cap_and_the_rest_come_first_next_time() {
         note.contains("check_kind: \"contains\", check_path: \"pkg0.json\", check_literal: \"<the rule's subject>\""),
         "a span dispute hangs a contains check on the file the rule is bound to: {note}"
     );
-    assert!(note.contains("because: \"<why 'version' may change while the rule stays true - at least 20 characters>\""), "{note}");
+    assert!(note.contains("because: \"<why 'version' may change while the rule stays true, 20+ characters>\""), "{note}");
 
     // A later evaluation after a report was filed since: the two that did not
     // fit are written BEFORE that report and still come first.
@@ -1097,7 +1107,9 @@ fn a_capacity_refusal_on_apply_needs_the_agent() {
     assert!(crowded.detail.starts_with("crowded at git push: fold this rule into a neighbour"), "{}", crowded.detail);
     assert!(fx.machine_writes("light").is_empty(), "nothing written");
     assert!(start.frozen.batch().contains(&"light".to_string()));
-    assert_eq!(crowded.call.as_deref(), Some("mcp__thor__revise(id: \"light\")"));
+    let call = crowded.call.as_deref().unwrap();
+    assert!(call.starts_with("mcp__thor__revise(id: \"light\", <the change its line names>, because: \"<needed when the change takes a quoted"), "{call}");
+    assert!(call.contains("20+ characters"), "{call}");
 }
 
 /// Q24 at the machine pass: an old contains check whose text does not name
@@ -1381,8 +1393,14 @@ fn either_exit_of_a_demotion_settles_the_batch_item_and_a_bare_revise_does_not()
         let mut corpus = crate::legit::Corpus::load(&fx.store);
         let head = model::store::show(&fx.store, "ban").unwrap();
         let bare = teeth::trial_for_write(&mut fx.store, Some(&fx.db), &teeth::SessionCtx::default(), &mut corpus, &head, Some(&head), None, &teeth::Disputes::default(), true);
-        assert!(matches!(bare, teeth::WriteTrial::Unchanged { .. }), "a bare revise writes no verdict");
+        let teeth::WriteTrial::Unchanged { receipt, .. } = bare else { panic!("a bare revise writes no verdict") };
         assert_eq!(model::store::evaluation_frozen_batch_owed(&fx.store, &start).len(), 1, "still owed");
+        // And the reply says so: not "teeth unchanged" alone, as if it were done.
+        let said = receipt.join(" | ");
+        assert!(said.starts_with("NOTHING WAS SETTLED, 'ban' IS STILL OWED"), "{said}");
+        assert!(said.contains("TWO EXITS") && said.contains("retest --id 'ban' --apply"), "the exits are printed: {said}");
+        assert!(said.contains("The call that settles it: mcp__thor__revise(id: \"ban\", text:"), "{said}");
+        assert!(said.contains("teeth unchanged"), "{said}");
     }
 
     // Exit (a): accept the demotion.
@@ -1443,4 +1461,161 @@ fn a_verdict_with_no_matcher_recorded_is_older_than_any() {
     assert!(crate::teeth::read_matcher_tried(&fx.db).contains("fp"));
     let next = fx.start(S2, "beta");
     assert!(next.frozen.machine.as_ref().unwrap().items.is_empty(), "{:?}", next.frozen.machine);
+}
+
+// ---------------------------------------------------------------- the size of the start note
+
+/// A start record as a busy store makes one: demotions on the batch, an A4
+/// list, disputes, health trouble, probable false blocks and an owner queue of
+/// carrying sessions. Built raw (a test holds no THOR actor token).
+fn busy_frozen(batch: usize, a4: usize, disputes: usize, blocks: usize, carriers: usize, judgement: usize) -> Frozen {
+    let long_because = "your check (forbidden 'alpha-dev reset', 'beta-prod reset', 'alpha-dev && git reset', 'beta-prod && git reset' \
+                        on 'git') was not stored: it refuses 'git alpha-dev reset' and 'git beta-prod reset' but lets \
+                        'git alpha-dev && git reset' and 'git beta-prod && git reset' through, and a check must refuse every form it names";
+    let mut machine = MachinePass { box_secs: 20, needs_agent: batch, a4_only: a4, ..MachinePass::default() };
+    let mut batch_ids = Vec::new();
+    for n in 0..batch {
+        let id = format!("batch-rule-{n}");
+        machine.items.push(model::store::MachineItem {
+            id: id.clone(),
+            outcome: MachineOutcome::NeedsAgent,
+            detail: format!("DEMOTION, nothing written: it bit when matcher 7c1e9d02ab35 tried it - {long_because}"),
+            call: Some(format!("mcp__thor__revise(id: \"{id}\", text: \"<its text, reworded>\", check_kind: \"forbidden\", check_literals: [\"alpha-dev reset\"], because: \"<why - at least 20 characters>\")")),
+            blocker: None,
+            seq: None,
+        });
+        batch_ids.push(id);
+    }
+    let mut a4_ids = Vec::new();
+    for n in 0..a4 {
+        let id = format!("a4-rule-{n}");
+        machine.items.push(model::store::MachineItem {
+            id: id.clone(),
+            outcome: MachineOutcome::A4Only,
+            detail: "its check bites, but its text does not name the literal 'system prune'".to_string(),
+            call: Some(format!("mcp__thor__revise(id: \"{id}\", text: \"<its text, reworded so it names 'system prune'>\")")),
+            blocker: None,
+            seq: None,
+        });
+        a4_ids.push(id);
+    }
+    machine.disputes = (0..disputes)
+        .map(|n| model::store::DisputeItem {
+            id: format!("dispute-rule-{n}"),
+            seq: 100 + n as i64,
+            arguments: vec![("legitimate_calls".to_string(), vec!["git grep --no-index -n \"TODO\" some/scratch-folder".to_string()])],
+            because: Some("requiring the flag refuses all 7 real git grep calls inside real repositories".to_string()),
+            files: Vec::new(),
+        })
+        .collect();
+    let carried_by: Vec<model::store::Carrier> = (0..carriers)
+        .map(|n| model::store::Carrier {
+            session: format!("{n:08x}-1111-4222-8333-444455556666"),
+            agent: None,
+            filed_at: format!("2026-10-{:02}T10:00:00Z", 1 + n % 7),
+            report: format!("eval-demo-{n}"),
+        })
+        .collect();
+    machine.points = vec![model::store::MachinePoint {
+        id: model::store::GLOBAL_RULES_POINT_ID.to_string(),
+        blocker: model::store::MachineBlocker { code: "no-working-copy".to_string(), subject: String::new() },
+        rules: vec!["rule-without-project-a".to_string(), "rule-without-project-b".to_string()],
+        carried_by,
+    }];
+    machine.signals = Some(model::store::SignalsSoFar {
+        health: "THOR health since the previous report: 1 hook launch failure(s) (PreToolUse, exit 126, session 5e1f0c3a), 0 version-skew event(s).".to_string(),
+        hook_failures: 1,
+        skew_events: 0,
+        refusals: format!("REFUSAL OUTCOMES since the previous report: {blocks} verified refusal(s), {blocks} followed by a weakening or retract of the refusing rule (probable false blocks), rate 100.0 percent, one-sided 95 percent upper bound 100.0 percent. A proxy read from the log: a rule can change for other reasons, and it feeds no ranking and no gate."),
+        false_blocks: (0..blocks)
+            .map(|n| model::store::FalseBlock {
+                rule: format!("refused-rule-{n}"),
+                line: format!("'refused-rule-{n}': refused 'docker system prune --filter until=24h' at log seq {}, then weakened (check cleared) at log seq {}", 10 + n, 20 + n),
+                restore: format!("mcp__thor__revise(id: \"refused-rule-{n}\", check_kind: \"forbidden\", check_literals: [\"system prune\"], because: \"<why the weakening was a mistake - at least 20 characters>\")"),
+            })
+            .collect(),
+        false_blocks_more: 0,
+    });
+    Frozen {
+        session: S1.to_string(),
+        project: "demo".to_string(),
+        started_seq: 500,
+        started_by: "command".to_string(),
+        started_unix: 1_790_000_000,
+        prev_report_seq: 0,
+        judgement: (0..judgement).map(|n| format!("judged-rule-{n}")).collect(),
+        batch: Some(batch_ids),
+        batch_later: 0,
+        a4_list: Some(a4_ids),
+        open_points: vec![model::store::GLOBAL_RULES_POINT_ID.to_string()],
+        machine: Some(machine),
+        void: None,
+        superseded: None,
+        fired: std::collections::BTreeMap::new(),
+    }
+}
+
+const BUSY_ID: &str = "evaluation-start-demo-500";
+
+/// THE SIGNALS NEVER ARRIVED (field 2026-10-07): on a store like the live one
+/// the start note was cut at about 9 KB right after the heading of the signals
+/// section, because the open point listed 25 carrying sessions and the disputes
+/// block carried 1.4 KB of fixed text. A state as busy as the live one must
+/// show every section a session acts on, whole, inside the size Claude Code
+/// shows, with the open points - which need nothing - last.
+#[test]
+fn a_busy_start_note_shows_every_section_the_session_acts_on_within_the_hook_limit() {
+    let frozen = busy_frozen(1, 0, 4, 1, 25, 0);
+    assert!(render_start_note(BUSY_ID, &frozen).len() <= START_NOTE_BUDGET, "this state is the live one: whole, uncut");
+    let note = render_start_note_within(BUSY_ID, &frozen, START_NOTE_BUDGET);
+    assert!(note.len() <= START_NOTE_BUDGET, "{} bytes: {note}", note.len());
+    assert!(note.len() < crate::session_start::HOOK_OUTPUT_LIMIT_BYTES, "{} bytes", note.len());
+    assert!(!note.contains("NOT shown here"), "this state fits whole, nothing is cut: {note}");
+    for must in [
+        "a. THE BATCH",
+        "'batch-rule-0'",
+        "b. THE A4 LIST",
+        "c. DISPUTES TO VERIFY",
+        "'dispute-rule-3'",
+        "3. SIGNALS BEFORE YOU FILE",
+        "a. THOR health since the previous report",
+        "b. REFUSAL OUTCOMES since the previous report",
+        "'refused-rule-0'",
+        "4. OPEN POINTS",
+    ] {
+        assert!(note.contains(must), "missing {must}: {note}");
+    }
+    // The order: what the session acts on first, what needs no action last.
+    let at = |needle: &str| note.find(needle).unwrap_or_else(|| panic!("missing {needle}"));
+    assert!(at("a. THE BATCH") < at("c. DISPUTES TO VERIFY") && at("c. DISPUTES TO VERIFY") < at("3. SIGNALS BEFORE YOU FILE"));
+    assert!(at("3. SIGNALS BEFORE YOU FILE") < at("4. OPEN POINTS"));
+    // The owner queue is a count and the last three sessions, not 25 sessions.
+    assert!(note.contains("carried by 25 valid evaluation(s), the last 3: session"), "{note}");
+    assert!(note.matches(" on 2026-10-").count() <= 4, "three carriers and the audit date, not 25 sessions: {note}");
+}
+
+/// A note that cannot fit cuts from the least actionable end, and says what it
+/// held back and where the whole note is: never a silent cut, and the sections
+/// a session acts on (the batch, the disputes, the signals' health) survive.
+#[test]
+fn an_overfull_start_note_cuts_from_the_least_actionable_end_and_says_so() {
+    let frozen = busy_frozen(8, 16, 8, 8, 25, 0);
+    let whole = render_start_note(BUSY_ID, &frozen);
+    assert!(whole.len() > START_NOTE_BUDGET, "fixture is overfull: {} bytes", whole.len());
+    let note = render_start_note_within(BUSY_ID, &frozen, START_NOTE_BUDGET);
+    assert!(note.len() <= START_NOTE_BUDGET, "{} bytes", note.len());
+    for must in ["a. THE BATCH", "c. DISPUTES TO VERIFY", "3. SIGNALS BEFORE YOU FILE", "a. THOR health since", "b. REFUSAL OUTCOMES", "4. OPEN POINTS", "'batch-rule-0'"] {
+        assert!(note.contains(must), "missing {must}: {note}");
+    }
+    // Every cut names its list's held-back count and the record to read.
+    let cuts = note.matches("more item(s) of this list are NOT shown here").count();
+    assert!(cuts >= 1, "the note was cut and says so: {note}");
+    assert!(note.contains(&format!("mcp__thor__get(id: \"{BUSY_ID}\")")), "{note}");
+    // The least actionable go first: the A4 list is cut before the batch is.
+    let shown = |prefix: &str| note.matches(&format!("\n      - '{prefix}")).count();
+    assert!(shown("a4-rule-") < 16, "the A4 list gave way: {note}");
+    // The whole note, with every item, is what the record keeps.
+    for n in 0..16 {
+        assert!(whole.contains(&format!("\n      - 'a4-rule-{n}'")), "{n}");
+    }
 }
