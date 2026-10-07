@@ -409,7 +409,7 @@ fn main() {
     // about from this one locked call site. See `thor_core::is_version_flag`
     // for why this reads that shared predicate instead of a local literal.
     if std::env::args().any(|a| thor_core::is_version_flag(&a)) {
-        println!("serve {}", env!("CARGO_PKG_VERSION"));
+        println!("{}", serve::version_line("serve"));
         return;
     }
     let cli = Cli::parse();

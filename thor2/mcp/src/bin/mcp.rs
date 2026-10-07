@@ -70,6 +70,12 @@ fn resolve_code_index(root: &Path) -> Option<mcp::CodeIndexPaths> {
 }
 
 fn main() {
+    // Answered before clap, like `serve`, so the line carries the build id: a
+    // tool server older than the hook's checker prints another one.
+    if std::env::args().any(|a| thor_core::is_version_flag(&a)) {
+        println!("{}", serve::version_line("mcp"));
+        return;
+    }
     let cli = Cli::parse();
     let code = match (cli.code_index_db, cli.repo) {
         (Some(index_db), Some(repo)) => Some(mcp::CodeIndexPaths { index_db, repo }),
