@@ -623,6 +623,22 @@ fn nearest_repo_root(start_dir: &Path) -> Option<std::path::PathBuf> {
 /// 2026-10-07, field test 12). A registered folder outside `root` is left to
 /// the scan: `--checkouts` still bounds what doctor measures.
 fn checkout_roots(store: &EventStore, root: &Path) -> std::collections::BTreeMap<String, std::path::PathBuf> {
+    let mut roots = scanned_roots(root);
+    let projects: std::collections::BTreeSet<String> =
+        serve::live::live_items(store).into_iter().filter_map(|li| li.item.project).collect();
+    for project in projects {
+        if let Ok(registered) = serve::project::registered_checkout(store, Some(&project)) {
+            if is_under(root, &registered) {
+                roots.insert(project, registered);
+            }
+        }
+    }
+    roots
+}
+
+/// The immediate subdirectories of `root` that resolve to a project key, each
+/// mapped to its checkout: the scan half of `checkout_roots`.
+fn scanned_roots(root: &Path) -> std::collections::BTreeMap<String, std::path::PathBuf> {
     let mut roots: std::collections::BTreeMap<String, std::path::PathBuf> = Default::default();
     if let Ok(entries) = std::fs::read_dir(root) {
         for entry in entries.flatten() {
@@ -631,15 +647,6 @@ fn checkout_roots(store: &EventStore, root: &Path) -> std::collections::BTreeMap
                 if let Some(key) = serve::project::resolve_project(&path) {
                     roots.insert(key, serve::project::checkout_for(&path));
                 }
-            }
-        }
-    }
-    let projects: std::collections::BTreeSet<String> =
-        serve::live::live_items(store).into_iter().filter_map(|li| li.item.project).collect();
-    for project in projects {
-        if let Ok(registered) = serve::project::registered_checkout(store, Some(&project)) {
-            if is_under(root, &registered) {
-                roots.insert(project, registered);
             }
         }
     }
@@ -835,6 +842,14 @@ fn decay_check(db: &Path, checkouts: Option<&Path>, project_filter: Option<&str>
     };
 
     let roots = checkout_roots(&store, root);
+    // A project can have two folders that both resolve to it (an outer folder
+    // with the marker, and a repository nested inside it that is the
+    // registered working copy), and a session stands in either. An anchor or
+    // a proof that holds in the folder the scan found is not decay, even when
+    // the registered working copy is the other one (measured 2026-10-07: two
+    // anchors written relative to the outer folder fire from it, and read as
+    // dead against the nested repository alone).
+    let scanned = scanned_roots(root);
 
     let items = serve::live::live_items(&store);
     let (mut dead, mut failing, mut judged) = (Vec::new(), Vec::new(), 0usize);
@@ -873,7 +888,9 @@ fn decay_check(db: &Path, checkouts: Option<&Path>, project_filter: Option<&str>
                 if value.contains(':') || value.starts_with('/') || value.starts_with("\\\\") {
                     continue;
                 }
-                if !base.join(value.replace('\\', "/")).exists() {
+                let relative = value.replace('\\', "/");
+                let alive_in_the_scanned_folder = scanned.get(project).is_some_and(|alt| alt.join(&relative).exists());
+                if !base.join(&relative).exists() && !alive_in_the_scanned_folder {
                     dead.push(Rot {
                         id: li.id.clone(),
                         project: project.to_string(),
@@ -883,7 +900,10 @@ fn decay_check(db: &Path, checkouts: Option<&Path>, project_filter: Option<&str>
             }
         }
         if let Some(check) = li.item.check.as_ref() {
-            if model::check::run(check, base) == model::check::Outcome::Fails {
+            let fails_in_the_scanned_folder = scanned
+                .get(project)
+                .is_none_or(|alt| alt == base || model::check::run(check, alt) == model::check::Outcome::Fails);
+            if model::check::run(check, base) == model::check::Outcome::Fails && fails_in_the_scanned_folder {
                 failing.push(Rot {
                     id: li.id.clone(),
                     project: project.to_string(),
@@ -3410,6 +3430,63 @@ mod tests {
         assert!(!is_under(elsewhere.path(), &checkouts));
         assert!(is_under(&checkouts, &nested));
         assert!(!is_under(&checkouts, &checkouts), "the root itself is not under itself");
+    }
+
+    /// One project, two folders that resolve to it: an outer folder with the
+    /// marker (which the scan finds) and the repository nested in it (the
+    /// registered working copy). Anchors written relative to either one fire
+    /// from the folder a session stands in, so neither is decay. Measured on
+    /// the owner's store (2026-10-07): preferring the registered copy alone
+    /// turned two live anchors into false dead ones.
+    #[test]
+    fn an_anchor_alive_in_either_folder_of_one_project_is_not_decay() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkouts = dir.path().join("dev");
+        let outer = checkouts.join("group");
+        let nested = outer.join("fw");
+        std::fs::create_dir_all(nested.join(".git")).unwrap();
+        std::fs::create_dir_all(nested.join("src")).unwrap();
+        std::fs::write(outer.join(".thor-project"), "two-folders\n").unwrap();
+        std::fs::write(nested.join(".thor-project"), "two-folders\n").unwrap();
+        std::fs::write(nested.join("src").join("kernel.cpp"), "int main() {}\n").unwrap();
+
+        let db = dir.path().join("t.db");
+        let mut s = EventStore::new(&db).unwrap();
+        // One anchor relative to the nested repository, one relative to the outer folder.
+        for (id, anchor) in [("rel-nested", "src/kernel.cpp"), ("rel-outer", "fw/src/kernel.cpp")] {
+            let mut item = rule(id);
+            item.project = Some("two-folders".to_string());
+            item.bindings = vec![Binding::Target { kind: TargetKind::Path, value: anchor.to_string() }];
+            legacy_declare(&mut s, &item);
+        }
+        let mut record = rule(&store::project_opened_id("two-folders"));
+        record.kind = Kind::Report;
+        record.bindings = vec![];
+        record.falsifier = None;
+        record.project = Some("two-folders".to_string());
+        record.tags = vec!["project-record".to_string()];
+        let body = store::canonical_body(&record).unwrap();
+        let top = serve::project::checkout_top(&nested);
+        let body = format!(
+            "{},\"root\":{},\"root_at\":\"2026-10-07T10:00:00Z\"}}",
+            &body[..body.len() - 1],
+            serde_json::to_string(&top.to_string_lossy()).unwrap()
+        );
+        s.append_event("install", "install", store::INSTALLER_ACTOR, EventKind::FactCreated, &record.id, None, &body).unwrap();
+        drop(s);
+
+        let line = decay_line(&db, Some(&checkouts), false);
+        assert!(line.starts_with("decay: none"), "{line}");
+
+        // An anchor alive in neither folder is still decay.
+        let mut s = EventStore::open_existing(&db).unwrap();
+        let mut gone = rule("gone");
+        gone.project = Some("two-folders".to_string());
+        gone.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "src/missing.cpp".to_string() }];
+        legacy_declare(&mut s, &gone);
+        drop(s);
+        let line = decay_line(&db, Some(&checkouts), false);
+        assert!(line.contains("1 anchor(s) point at nothing") && line.contains("gone"), "{line}");
     }
 
     /// The batch the next report is held to, and what stays owed beyond it,
