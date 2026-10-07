@@ -2568,13 +2568,8 @@ mod tests {
     fn last_user_prompt_skips_a_task_notification_and_a_system_reminder_entry() {
         let jsonl = r#"{"type":"user","message":{"role":"user","content":"controleer de build en zeg wat er stuk is"}}
 {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"ik start een taak"}]}}
-{"type":"user","message":{"role":"user","content":"<task-notification>
-<task-id>t1</task-id>
-<summary>Build finished</summary>
-</task-notification>"}}
-{"type":"user","message":{"role":"user","content":[{"type":"text","text":"<system-reminder>
-fixture reminder
-</system-reminder>"}]}}"#;
+{"type":"user","message":{"role":"user","content":"<task-notification><task-id>t1</task-id><summary>Build finished</summary></task-notification>"}}
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"<system-reminder>fixture reminder</system-reminder>"}]}}"#;
         assert_eq!(last_user_prompt(jsonl).as_deref(), Some("controleer de build en zeg wat er stuk is"));
 
         let mixed = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"<system-reminder>fixture</system-reminder>"},{"type":"text","text":"en nu de tweede vraag"}]}}"#;
