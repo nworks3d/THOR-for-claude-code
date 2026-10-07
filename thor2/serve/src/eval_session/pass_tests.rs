@@ -997,3 +997,120 @@ fn a_point_written_by_this_build_is_left_alone() {
     assert!(refresh_old_anchor_full_points(&mut fx.store, "alpha").is_empty());
     assert!(model::store::open_points(&fx.store, Some("alpha")).iter().any(|p| p.id == id && p.text == fresh));
 }
+
+// ------------------------------------------- a verdict an older matcher made
+
+/// A rule written straight into the log with a verdict an older build
+/// decided: its trial record claims `verdict` and names `matcher_rev` (none
+/// for a build that recorded none). The record is spliced in by hand, as an
+/// older store holds it.
+fn decided_long_ago(fx: &mut Fx, item: &Item, verdict: model::store::RecordedVerdict, matcher_rev: Option<&str>) {
+    let fields = model::store::TrialFields {
+        v: model::store::TRIAL_RECORD_VERSION,
+        fingerprint: model::store::fingerprint(item),
+        root: None,
+        project: model::normalize::normalize_project(item.project.as_deref()),
+        head_commit: None,
+        candidates: Vec::new(),
+        attempts: Vec::new(),
+        corpus: model::store::TrialCorpus { reached: 0, whole_hits: 0, cut: 0, stopped_forcing: Vec::new() },
+        clean_failed: Vec::new(),
+        disputes: model::store::TrialDisputes { legitimate_calls: Vec::new(), may_change: Vec::new() },
+        accept_refusing: Vec::new(),
+        history: Vec::new(),
+        pending: None,
+        a4: Vec::new(),
+        verdict,
+        evidence: Vec::new(),
+        uncommitted: false,
+        parent_rev: None,
+        file_blob: None,
+        a4_old_stock: None,
+        unreached: None,
+        matcher_rev: matcher_rev.map(str::to_string),
+    };
+    let body = model::store::canonical_body(item).unwrap();
+    let body = format!("{},\"teeth_trial\":{}}}", &body[..body.len() - 1], serde_json::to_string(&fields).unwrap());
+    fx.store.append_event("legacy", &item.id, "migration", EventKind::FactCreated, &item.id, None, &body).unwrap();
+}
+
+/// The field case b-559c4de06b30d8d3: a ban whose built forms are only partly
+/// refused. The current matcher puts it on the note track.
+fn partly_refused_ban(id: &str) -> Item {
+    rule(
+        id,
+        "Never hard-reset the deploy checkouts alpha-dev and beta-prod. Refused: `alpha-dev reset`, `beta-prod reset`, `alpha-dev && git reset`, `beta-prod && git reset`.",
+        vec![cmd("git")],
+        forbidden(&["alpha-dev reset", "beta-prod reset", "alpha-dev && git reset", "beta-prod && git reset"]),
+        Some("beta"),
+    )
+}
+
+fn under_matcher(rev: &str, body: impl FnOnce()) {
+    crate::teeth::MATCHER_REV_OVERRIDE.with(|r| *r.borrow_mut() = Some(rev.to_string()));
+    body();
+    crate::teeth::MATCHER_REV_OVERRIDE.with(|r| *r.borrow_mut() = None);
+}
+
+/// A rule an older matcher decided is tried again at the start: the same
+/// verdict is written once more, now naming this build's matcher, and the
+/// next start leaves it alone.
+#[test]
+fn a_verdict_an_older_matcher_made_is_tried_again_once() {
+    let mut fx = Fx::new();
+    fx.legacy(&rule("fp", "Never run `git push --force` on main.", vec![cmd("git push")], forbidden(&["--force"]), Some("beta")));
+    fx.legacy(&rule("subj", "Keep commit subjects under 60 characters.", vec![Binding::Moment(intent::Action::Commit)], None, Some("beta")));
+    let mut first = None;
+    under_matcher("old-matcher", || first = Some(fx.start(S1, "beta")));
+    assert_eq!(outcome_of(&first.unwrap(), "fp"), MachineOutcome::Rule);
+    assert_eq!(crate::teeth::decided_by(&fx.store, "fp"), Some(Some("old-matcher".to_string())));
+    assert_eq!(crate::teeth::decided_by(&fx.store, "subj"), Some(Some("old-matcher".to_string())));
+
+    let second = fx.start(S2, "beta");
+    for id in ["fp", "subj"] {
+        assert_eq!(outcome_of(&second, id), MachineOutcome::Unchanged, "{id}: the same kind of verdict");
+        assert_eq!(fx.machine_writes(id).len(), 2, "{id}: one write at each start");
+        assert_eq!(item_of(&second, id).seq, Some(fx.machine_writes(id)[1].seq));
+        assert_eq!(crate::teeth::decided_by(&fx.store, id), Some(Some(crate::teeth::matcher_rev())), "{id}: now decided by this build");
+    }
+    assert_eq!(model::store::current_verdict(&fx.store, "fp"), CurrentVerdict::RuleWired);
+    assert_eq!(model::store::current_verdict(&fx.store, "subj"), CurrentVerdict::Note);
+
+    let third = fx.start(S3, "beta");
+    assert!(third.frozen.machine.as_ref().unwrap().items.is_empty(), "nothing is owed any more: {:?}", third.frozen.machine);
+    assert_eq!(fx.machine_writes("fp").len(), 2);
+}
+
+/// A rule that bit when an older build tried it and that this build would
+/// make a note keeps its tooth: the machine writes nothing, and the rule goes
+/// to the agent's batch with its reason.
+#[test]
+fn a_demotion_by_a_newer_matcher_goes_to_the_batch_never_to_the_log() {
+    let mut fx = Fx::new();
+    let beta = fx.checkout("beta", &[("NOTES.md", "x\n")], true);
+    fx.register("beta", &beta);
+    decided_long_ago(&mut fx, &partly_refused_ban("ban"), model::store::RecordedVerdict::RuleWired, Some("old-matcher"));
+    assert_eq!(model::store::current_verdict(&fx.store, "ban"), CurrentVerdict::RuleWired);
+
+    let start = fx.start(S1, "beta");
+    assert_eq!(outcome_of(&start, "ban"), MachineOutcome::NeedsAgent, "{:?}", start.frozen.machine);
+    let item = item_of(&start, "ban");
+    assert!(item.detail.starts_with("DEMOTION, nothing written: it bit when matcher old-matcher tried it"), "{}", item.detail);
+    assert!(item.detail.contains("retest --id ban --apply"), "{}", item.detail);
+    assert!(start.frozen.batch().contains(&"ban".to_string()), "{:?}", start.frozen.batch());
+    assert!(fx.machine_writes("ban").is_empty(), "a demotion is never applied by the machine");
+    assert_eq!(model::store::current_verdict(&fx.store, "ban"), CurrentVerdict::RuleWired, "it keeps its tooth");
+}
+
+/// A rule whose record names no matcher at all (an older build) is old too,
+/// and an unchanged class of verdict is only refreshed.
+#[test]
+fn a_verdict_with_no_matcher_recorded_is_older_than_any() {
+    let mut fx = Fx::new();
+    let item = rule("fp", "Never run `git push --force` on main.", vec![cmd("git push")], forbidden(&["--force"]), Some("beta"));
+    decided_long_ago(&mut fx, &item, model::store::RecordedVerdict::RuleWired, None);
+    assert!(crate::teeth::decided_by_older_matcher(&fx.store, "fp"));
+    let start = fx.start(S1, "beta");
+    assert_eq!(outcome_of(&start, "fp"), MachineOutcome::Unchanged);
+    assert!(!crate::teeth::decided_by_older_matcher(&fx.store, "fp"));
+}

@@ -245,6 +245,19 @@ enum Command {
         /// is written.
         #[arg(long)]
         apply: bool,
+        /// Try every live rule that ALREADY HAS a verdict again with this
+        /// build, skipping none, and print the ones whose verdict would
+        /// change: a note that now bites (promote), a rule that bit and would
+        /// now be a note (DEMOTION, listed loudly), a rule this build cannot
+        /// decide. Writes nothing. With `--apply` it writes only the changed
+        /// verdicts it can (promotions), and never a demotion unless
+        /// `--allow-demote` is given too. Exit codes: 0 nothing left to
+        /// change, 5 verdicts that would change were not written, 1 an error.
+        #[arg(long)]
+        compare: bool,
+        /// With `--compare --apply`: also write the demotions.
+        #[arg(long = "allow-demote", requires_all = ["compare", "apply"])]
+        allow_demote: bool,
     },
     /// Record that a served item actually helped. Recorded in the log and
     /// reported by `status`; it does NOT decide whether anything fires - see
@@ -440,7 +453,9 @@ fn main() {
         Command::Outline { index_db, path } => cmd_outline(&index_db, &path),
         Command::Status { index_db, repo } => cmd_status(&cli.db, index_db.as_deref(), repo.as_deref()),
         Command::Mark { id, noise } => cmd_mark(&cli.db, &id, noise),
-        Command::Retest { id, project, all, apply } => cmd_retest(&cli.db, id.as_deref(), project.as_deref(), all, apply),
+        Command::Retest { id, project, all, apply, compare, allow_demote } => {
+            cmd_retest(&cli.db, id.as_deref(), project.as_deref(), all, apply, compare, allow_demote)
+        }
         #[cfg(feature = "semantic")]
         Command::VectorsBuild { model_dir, vectors_db } => cmd_vectors_build(&cli.db, model_dir.as_deref(), vectors_db.as_deref()),
         #[cfg(feature = "semantic")]
@@ -6732,7 +6747,7 @@ fn cmd_mark(db_path: &Path, id: &str, noise: bool) {
 /// `Command::Retest` - see that variant's own doc comment. Opens an existing
 /// store only (never creates one), tries each rule, prints what it found, and
 /// exits with the code the variant's doc comment names.
-fn cmd_retest(db_path: &Path, id: Option<&str>, project: Option<&str>, all: bool, apply: bool) {
+fn cmd_retest(db_path: &Path, id: Option<&str>, project: Option<&str>, all: bool, apply: bool, compare: bool, allow_demote: bool) {
     let mut store = match EventStore::open_existing(db_path) {
         Ok(store) => store,
         Err(e) => {
@@ -6741,16 +6756,17 @@ fn cmd_retest(db_path: &Path, id: Option<&str>, project: Option<&str>, all: bool
         }
     };
     let corpus = serve::legit::Corpus::load(&store);
+    if compare {
+        let ids = match id {
+            Some(id) => vec![id.to_string()],
+            None => live_rule_ids(&store, project, all),
+        };
+        std::process::exit(compare_rules(&mut store, db_path, &ids, &corpus, apply, allow_demote));
+    }
     if let Some(id) = id {
         std::process::exit(retest_one(&mut store, db_path, id, &corpus, apply));
     }
-    let wanted = project.and_then(|p| model::normalize::normalize_project(Some(p)));
-    let ids: Vec<String> = serve::live::live_items(&store)
-        .into_iter()
-        .filter(|li| li.item.kind.can_fire())
-        .filter(|li| all || model::normalize::normalize_project(li.item.project.as_deref()) == wanted)
-        .map(|li| li.id)
-        .collect();
+    let ids = live_rule_ids(&store, project, all);
     let (mut decided, mut tried) = (0usize, 0usize);
     let mut worst = 0;
     for id in &ids {
@@ -6765,6 +6781,133 @@ fn cmd_retest(db_path: &Path, id: Option<&str>, project: Option<&str>, all: bool
     }
     println!("tried {tried} rule(s) without a current verdict; {decided} already have one and were left as they are");
     std::process::exit(worst);
+}
+
+/// Every live rule and orientation: of `project` (exactly this key), or of
+/// every project with `all`.
+fn live_rule_ids(store: &EventStore, project: Option<&str>, all: bool) -> Vec<String> {
+    let wanted = project.and_then(|p| model::normalize::normalize_project(Some(p)));
+    serve::live::live_items(store)
+        .into_iter()
+        .filter(|li| li.item.kind.can_fire())
+        .filter(|li| all || model::normalize::normalize_project(li.item.project.as_deref()) == wanted)
+        .map(|li| li.id)
+        .collect()
+}
+
+/// What a verdict a rule holds is called, in the words `retest` prints.
+fn held_words(verdict: &model::store::CurrentVerdict) -> &'static str {
+    match verdict {
+        model::store::CurrentVerdict::RuleProven => "rule track, proven",
+        model::store::CurrentVerdict::RuleWired => "rule track, wired",
+        model::store::CurrentVerdict::Note => "note",
+        model::store::CurrentVerdict::Undecided { .. } => "no verdict",
+    }
+}
+
+/// What this build decided now, in one phrase, and why in one line.
+fn decided_words(outcome: &serve::teeth::Maintenance, first_line: &str) -> (String, String) {
+    match outcome {
+        serve::teeth::Maintenance::Rule { proven: true, .. } => ("rule track, proven".to_string(), first_line.to_string()),
+        serve::teeth::Maintenance::Rule { proven: false, .. } => ("rule track, wired".to_string(), first_line.to_string()),
+        serve::teeth::Maintenance::Note { because } => ("note".to_string(), because.clone()),
+        serve::teeth::Maintenance::Blocked(blocker) => ("blocked".to_string(), blocker.to_string()),
+        serve::teeth::Maintenance::NeedsAgent(fix) => ("needs the agent".to_string(), fix.clone()),
+    }
+}
+
+/// `retest --compare`: every rule in `ids` that already holds a verdict is
+/// tried again with this build and compared with it, skipping none. Prints
+/// only the rules whose class of verdict changed (bite, note, undecided), the
+/// demotions loudly, and one summary. With `apply` it writes the changed
+/// verdicts it can - promotions - and a demotion only with `allow_demote`.
+/// Returns the exit code: 1 when a rule could not be tried, 5 when verdicts
+/// that would change were not written, else 0.
+fn compare_rules(store: &mut EventStore, db_path: &Path, ids: &[String], corpus: &serve::legit::Corpus, apply: bool, allow_demote: bool) -> i32 {
+    use serve::teeth::Change;
+    let rev = serve::teeth::matcher_rev();
+    let (mut skipped, mut unchanged, mut errors, mut older, mut written) = (0usize, 0usize, 0usize, 0usize, 0usize);
+    let (mut promoted, mut demoted, mut undecided): (Vec<String>, Vec<String>, Vec<String>) = (Vec::new(), Vec::new(), Vec::new());
+    let mut left = 0usize;
+    let mut demotions_left: Vec<String> = Vec::new();
+    for id in ids {
+        let compared = match serve::teeth::compare(store, Some(db_path), id, corpus) {
+            Ok(Some(compared)) => compared,
+            Ok(None) => {
+                skipped += 1;
+                continue;
+            }
+            Err(why) => {
+                println!("{id}: cannot be tried - {why}");
+                errors += 1;
+                continue;
+            }
+        };
+        if compared.old_rev.as_deref() != Some(rev.as_str()) {
+            older += 1;
+        }
+        if compared.change == Change::Unchanged {
+            unchanged += 1;
+            continue;
+        }
+        let first_line = compared.retest.lines.first().cloned().unwrap_or_default();
+        let (now, why) = decided_words(&compared.retest.outcome, &first_line);
+        let held = held_words(&compared.old);
+        let decided_by = compared.old_rev.as_deref().map_or("a build that recorded no matcher".to_string(), |r| format!("matcher {r}"));
+        match compared.change {
+            Change::Promote => println!("PROMOTE {id}: {held} -> {now}"),
+            Change::Demote => println!("DEMOTION {id}: {held} -> {now} - it bites in the store now and this build would take its tooth away"),
+            _ => println!("UNDECIDED {id}: {held} -> {now} - this build cannot decide it"),
+        }
+        println!("  decided by {decided_by}; this build is matcher {rev}");
+        println!("  why: {why}");
+        let writable = matches!(compared.change, Change::Promote | Change::Demote) && compared.retest.write.is_some();
+        let may_write = apply && writable && (compared.change != Change::Demote || allow_demote);
+        if may_write {
+            match serve::teeth::apply_as_retest(store, &compared.retest) {
+                Ok(event) => {
+                    println!("  written: fact_revised at log seq {} by '{}'", event.seq, event.actor);
+                    written += 1;
+                }
+                Err(e) => {
+                    println!("  not written: {e}");
+                    left += 1;
+                }
+            }
+        } else if compared.change == Change::Demote {
+            println!("  NOT WRITTEN: a demotion needs --compare --apply --allow-demote, or the evaluation's batch decides it");
+            demotions_left.push(id.clone());
+            left += 1;
+        } else {
+            println!("  nothing written{}", if writable { " - run again with --compare --apply to write it" } else { "" });
+            left += 1;
+        }
+        match compared.change {
+            Change::Promote => promoted.push(id.clone()),
+            Change::Demote => demoted.push(id.clone()),
+            _ => undecided.push(id.clone()),
+        }
+        println!();
+    }
+    println!(
+        "compared {} rule(s) that hold a verdict with this build (matcher {rev}): {} promote, {} DEMOTE, {} this build cannot decide, \
+         {unchanged} unchanged; {older} of them were decided by an older matcher; {skipped} hold no verdict and were skipped, \
+         {errors} could not be tried, {written} written. Information only: nothing is written without --apply.",
+        ids.len() - skipped - errors,
+        promoted.len(),
+        demoted.len(),
+        undecided.len()
+    );
+    if !demotions_left.is_empty() {
+        println!("DEMOTIONS NOT WRITTEN ({}): {}", demotions_left.len(), demotions_left.join(", "));
+    }
+    if errors > 0 {
+        1
+    } else if left > 0 {
+        5
+    } else {
+        0
+    }
 }
 
 /// The worse of two `retest` exit codes: an error, then needs the agent, then

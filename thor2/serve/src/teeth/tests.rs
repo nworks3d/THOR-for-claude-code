@@ -1872,3 +1872,149 @@ fn a_real_angle_bracket_in_a_literal_is_no_placeholder() {
         .collect();
     assert!(literals.iter().any(|l| l.contains("<<EOF")), "{literals:?}");
 }
+
+// ------------------------------------------- the reason reads whole, 2026-10-07
+
+/// Field case b-559c4de06b30d8d3 (store history, seq 261247): a ban on `git`
+/// with four literals, some of whose built forms are refused and some let
+/// through, and no clean form refused. The reason used to render "it refuses
+/// , which a check must let through" - an empty call - and cost the rule its
+/// tooth with no way to read why.
+#[test]
+fn a_mixed_ban_never_says_it_refuses_nothing() {
+    let fx = Fx::new();
+    let item = rule(
+        "reset-ban",
+        "Never hard-reset the deploy checkouts alpha-dev and beta-prod. Refused: `alpha-dev reset`, `beta-prod reset`, `alpha-dev && git reset`, `beta-prod && git reset`.",
+        vec![cmd("git")],
+        forbidden(&["alpha-dev reset", "beta-prod reset", "alpha-dev && git reset", "beta-prod && git reset"]),
+        None,
+    );
+    let t = fx.write(&item);
+    let said = format!("{}\n{:?}", receipt(&t), t.outcome);
+    for broken in ["it refuses ,", "refuses , ", "''", ", ,", "refuses  "] {
+        assert!(!said.contains(broken), "found {broken:?} in:\n{said}");
+    }
+}
+
+/// The wording for each shape of non-biting check: the reason names the
+/// forms it talks about, whichever of the two lists is empty.
+#[test]
+fn why_a_check_does_not_bite_names_the_forms_in_every_shape() {
+    let tried = |forbidden: Vec<(Call, bool)>, clean: Vec<(Call, bool)>| Tried { forbidden, clean, collapsed: false, file: None, none: None };
+
+    // Refused some of what it names, let the rest through, refused no clean form.
+    let mixed = tried(vec![(bash("git a"), true), (bash("git b"), false)], vec![(bash("git c"), false)]);
+    let why = mixed.why_not_biting();
+    assert!(why.contains("'git b'"), "{why}");
+    assert!(why.contains("every form it names"), "{why}");
+    assert!(!why.contains("it refuses ,") && !why.contains("''"), "{why}");
+
+    // Refused a clean form: the old wording.
+    let clean = tried(vec![(bash("git a"), true)], vec![(bash("git c"), true), (bash("git d"), true)]);
+    assert_eq!(clean.why_not_biting(), "it refuses 'git c' and 'git d', which a check must let through");
+
+    // Both at once: each is named.
+    let both = tried(vec![(bash("git a"), true), (bash("git b"), false)], vec![(bash("git c"), true)]);
+    let why = both.why_not_biting();
+    assert!(why.contains("'git c'") && why.contains("'git b'"), "{why}");
+}
+
+// ------------------------------------------------------ the matcher revision
+
+/// Run `body` with this thread's matcher revision standing in for `rev`.
+fn under_matcher(rev: &str, body: impl FnOnce()) {
+    MATCHER_REV_OVERRIDE.with(|r| *r.borrow_mut() = Some(rev.to_string()));
+    body();
+    MATCHER_REV_OVERRIDE.with(|r| *r.borrow_mut() = None);
+}
+
+/// A comment, a blank line or a reindent is no change of behaviour and must
+/// not make every verdict look old; a changed line of code is one.
+#[test]
+fn the_matcher_revision_follows_code_not_comments() {
+    let base = "fn refuses(x: &str) -> bool {\n    x.contains(\"--force\")\n}\n";
+    let commented = "// Whether x is refused.\nfn refuses(x: &str) -> bool {\r\n\n        x.contains(\"--force\")   \n}\n// end\n";
+    let changed = "fn refuses(x: &str) -> bool {\n    x.contains(\"--force-with-lease\")\n}\n";
+    assert_eq!(matcher_rev_of(&[base]), matcher_rev_of(&[commented]));
+    assert_ne!(matcher_rev_of(&[base]), matcher_rev_of(&[changed]));
+    assert_ne!(matcher_rev_of(&[base, "x"]), matcher_rev_of(&["x", base]), "the order of the sources counts");
+    assert_eq!(matcher_rev_of(&[base]).len(), 12);
+    assert_eq!(matcher_rev(), matcher_rev(), "one build, one revision");
+}
+
+/// Every verdict a trial writes names the matcher that decided it.
+#[test]
+fn a_verdict_records_the_matcher_that_decided_it() {
+    let fx = Fx::new();
+    let item = rule("fp", "Never run `git push --force` on main.", vec![cmd("git push")], forbidden(&["--force"]), None);
+    let t = fx.write(&item);
+    assert_eq!(t.record.as_ref().unwrap().fields().matcher_rev, Some(matcher_rev()));
+    under_matcher("old-matcher", || {
+        let t = fx.write(&item);
+        assert_eq!(t.record.as_ref().unwrap().fields().matcher_rev.as_deref(), Some("old-matcher"));
+    });
+}
+
+/// A verdict an older matcher wrote is found, and stops being found once
+/// this build has written its own.
+#[test]
+fn a_verdict_from_an_older_matcher_is_due_to_be_tried_again() {
+    let mut fx = Fx::new();
+    let item = rule("fp", "Never run `git push --force` on main.", vec![cmd("git push")], forbidden(&["--force"]), None);
+    fx.legacy(&item);
+    assert!(!decided_by_older_matcher(&fx.store, "fp"), "no verdict at all is not an old one");
+    assert_eq!(decided_by(&fx.store, "fp"), None);
+    under_matcher("old-matcher", || {
+        let r = fx.retest("fp");
+        apply(&mut fx.store, &r, retest_actor()).unwrap();
+    });
+    assert_eq!(decided_by(&fx.store, "fp"), Some(Some("old-matcher".to_string())));
+    assert!(decided_by_older_matcher(&fx.store, "fp"));
+    let r = fx.retest("fp");
+    apply(&mut fx.store, &r, retest_actor()).unwrap();
+    assert_eq!(decided_by(&fx.store, "fp"), Some(Some(matcher_rev())));
+    assert!(!decided_by_older_matcher(&fx.store, "fp"));
+}
+
+/// How a verdict now compares with the one a rule holds.
+#[test]
+fn a_verdict_is_compared_by_its_class() {
+    use model::store::CurrentVerdict as Old;
+    let rule_now = Maintenance::Rule { check: Check::Forbidden { literals: vec!["--force".to_string()] }, proven: false };
+    let note_now = Maintenance::Note { because: "no tooth holds".to_string() };
+    let agent_now = Maintenance::NeedsAgent("fix it".to_string());
+    let blocked_now = Maintenance::Blocked(Blocker::WorkingTreeDiffers { path: "NOTES.md".to_string() });
+    let undecided = Old::Undecided { why: "never tried".to_string() };
+
+    assert_eq!(change_of(&Old::RuleWired, &rule_now), Some(Change::Unchanged));
+    assert_eq!(change_of(&Old::RuleProven, &rule_now), Some(Change::Unchanged));
+    assert_eq!(change_of(&Old::Note, &note_now), Some(Change::Unchanged));
+    assert_eq!(change_of(&Old::Note, &rule_now), Some(Change::Promote));
+    assert_eq!(change_of(&Old::RuleWired, &note_now), Some(Change::Demote));
+    assert_eq!(change_of(&Old::RuleProven, &note_now), Some(Change::Demote));
+    assert_eq!(change_of(&Old::RuleWired, &agent_now), Some(Change::Unresolved));
+    assert_eq!(change_of(&Old::Note, &blocked_now), Some(Change::Unresolved));
+    assert_eq!(change_of(&undecided, &rule_now), None, "no verdict, nothing to compare");
+}
+
+/// `compare` skips nothing that holds a verdict, writes nothing, and reports
+/// a rule this build decides the same as unchanged; a rule with no verdict is
+/// left to a plain retest.
+#[test]
+fn compare_tries_a_decided_rule_again_and_writes_nothing() {
+    let mut fx = Fx::new();
+    let item = rule("fp", "Never run `git push --force` on main.", vec![cmd("git push")], forbidden(&["--force"]), None);
+    fx.legacy(&item);
+    let corpus = Corpus::load(&fx.store);
+    assert!(compare(&fx.store, Some(&fx.db), "fp", &corpus).unwrap().is_none(), "no verdict yet");
+    under_matcher("old-matcher", || {
+        let r = fx.retest("fp");
+        apply(&mut fx.store, &r, retest_actor()).unwrap();
+    });
+    let before = fx.store.get_all_events().unwrap().len();
+    let compared = compare(&fx.store, Some(&fx.db), "fp", &corpus).unwrap().expect("it holds a verdict");
+    assert_eq!(compared.change, Change::Unchanged);
+    assert_eq!(compared.old_rev.as_deref(), Some("old-matcher"));
+    assert_eq!(fx.store.get_all_events().unwrap().len(), before, "compare writes nothing");
+}

@@ -56,7 +56,7 @@
 
 use crate::legit::Corpus;
 use crate::project;
-use crate::teeth::{self, ApplyError, Maintenance};
+use crate::teeth::{self, ApplyError, Change, Maintenance};
 use model::item::{Check, Item, Kind};
 use model::store::{
     Blocker, EvaluationStart, Frozen, MachineBlocker, MachineItem, MachineOutcome, MachinePass, MachinePoint, Settled,
@@ -395,6 +395,10 @@ struct Candidate {
     /// A rule-track contains check tried again (K9): its verdict stands
     /// unless this pass finds otherwise.
     retry: bool,
+    /// The rule's verdict was decided by an older matcher revision (or one
+    /// that recorded none): this build tries it again, and writes only what
+    /// is not a demotion.
+    matcher: bool,
     /// The rule belongs to no project (it applies to every one).
     projectless: bool,
 }
@@ -443,22 +447,26 @@ fn candidates(store: &EventStore, project: &str, start: &EvaluationStart) -> Vec
     // (group, last write, candidate)
     let mut found: Vec<(u8, i64, Candidate)> = Vec::new();
     for li in live {
-        let (group, pending, retry) = match model::store::settlement(store, &li.id, None) {
-            Settlement::Owed { .. } => (if fired.contains(&li.id) { 0 } else { 2 }, false, false),
-            Settlement::Settled(Settled::Blocked(_)) => (2, false, false),
-            Settlement::Settled(Settled::Note { pending: Some(_), .. }) => (1, true, false),
+        let (group, pending, retry, matcher) = match model::store::settlement(store, &li.id, None) {
+            Settlement::Owed { .. } => (if fired.contains(&li.id) { 0 } else { 2 }, false, false, false),
+            Settlement::Settled(Settled::Blocked(_)) => (2, false, false, false),
+            Settlement::Settled(Settled::Note { pending: Some(_), .. }) => (1, true, false, false),
             Settlement::Settled(Settled::Rule { .. }) => {
                 let due = own(&li.item)
                     && root.as_ref().is_some_and(|root| teeth::contains_retry_due(store, &li.id, &li.item, root, &blobs).is_some());
-                if !due {
+                let stale = teeth::decided_by_older_matcher(store, &li.id);
+                if !due && !stale {
                     continue;
                 }
-                (2, false, true)
+                (if due { 2 } else { 3 }, false, due, stale)
             }
+            // A note with nothing pending, decided by an older matcher: a
+            // newer one may find that a tooth bites after all.
+            Settlement::Settled(Settled::Note { .. }) if teeth::decided_by_older_matcher(store, &li.id) => (3, false, false, true),
             Settlement::Settled(_) => continue,
         };
         let key = last_write(store, &li.id);
-        found.push((group, key, Candidate { projectless: li.item.project.is_none(), id: li.id, pending, retry }));
+        found.push((group, key, Candidate { projectless: li.item.project.is_none(), id: li.id, pending, retry, matcher }));
     }
     let left_over: Vec<String> = model::store::previous_evaluation_start(store, project, start.seq)
         .and_then(|previous| previous.frozen.machine)
@@ -502,11 +510,28 @@ fn machine_item(id: &str, outcome: MachineOutcome, detail: String) -> MachineIte
 fn try_one(store: &mut EventStore, db: Option<&Path>, candidate: &Candidate, corpus: &Corpus) -> MachineItem {
     let id = candidate.id.as_str();
     let needs_agent = |why: String| MachineItem { call: Some(agent_call(id)), ..machine_item(id, MachineOutcome::NeedsAgent, why) };
+    // What the rule holds now, read before anything is written: a rule an
+    // older matcher decided is compared with it.
+    let held = candidate.matcher.then(|| (model::store::current_verdict(store, id), teeth::decided_by(store, id).flatten()));
     let tried = match teeth::retest(store, db, id, corpus) {
         Ok(tried) => tried,
         Err(why) => return needs_agent(why),
     };
     let first_line = tried.lines.first().cloned().unwrap_or_default();
+    let change = held.as_ref().and_then(|(old, _)| teeth::change_of(old, &tried.outcome));
+    // A DEMOTION IS NEVER APPLIED BY THE MACHINE. A rule that bit when an
+    // older matcher tried it and that this build would make a note keeps its
+    // tooth until the agent decides: fixes the check so it bites again, or
+    // writes the note by revising it.
+    if let (Some(Change::Demote), Maintenance::Note { because }) = (change, &tried.outcome) {
+        let then = held.and_then(|(_, rev)| rev).map_or("a build that recorded no matcher".to_string(), |rev| format!("matcher {rev}"));
+        return needs_agent(format!(
+            "DEMOTION, nothing written: it bit when {then} tried it, and this build (matcher {}) would make it a note - {because}. \
+             Either revise the rule so its check bites again (the anchor, the literals or the text it names), or, when the owner \
+             agrees it should be a note, run serve --db \"<their store>\" retest --id {id} --apply, which writes the note",
+            teeth::matcher_rev()
+        ));
+    }
     match &tried.outcome {
         // A note whose pending check cannot be tried yet is still a note
         // (K20): it is settled, nothing holds it, and it gets no open point -
@@ -540,7 +565,10 @@ fn try_one(store: &mut EventStore, db: Option<&Path>, candidate: &Candidate, cor
                 // A note whose pending check is still not a working tooth.
                 return machine_item(id, MachineOutcome::PendingKept, detail);
             }
-            if candidate.retry && teeth::same_as_current_record(store, &tried) {
+            // (A rule an older matcher decided is written even when nothing
+            // else changed: its record then names this build's matcher, and
+            // the next start does not try it again.)
+            if candidate.retry && !candidate.matcher && teeth::same_as_current_record(store, &tried) {
                 return machine_item(id, MachineOutcome::Unchanged, detail);
             }
             // Every verdict is written as `teeth-eval`, but one: an old
@@ -561,6 +589,9 @@ fn try_one(store: &mut EventStore, db: Option<&Path>, candidate: &Candidate, cor
                         (false, true) => MachineOutcome::PendingHung,
                         (false, false) => MachineOutcome::Rule,
                     };
+                    // Tried again by this matcher and the same kind of verdict:
+                    // only its record was refreshed.
+                    let outcome = if change == Some(Change::Unchanged) { MachineOutcome::Unchanged } else { outcome };
                     MachineItem { seq: Some(event.seq), ..machine_item(id, outcome, detail) }
                 }
                 // Changed while it was being tried: nothing was written, and

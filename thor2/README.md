@@ -830,6 +830,26 @@ it can write, 3 when a rule is blocked (its project has no registered working
 copy, or that checkout is mid-change while the default branch still has the
 line), and 4 when only a writer can make the fix, which it names.
 
+A verdict is only as good as the matcher that made it, so every verdict records
+the matcher revision of the build that wrote it (a hash of the sources that
+decide whether a call is refused; comments and blank lines do not count). After
+an upgrade, see what the new build would decide differently:
+
+```bash
+serve --db "<store>" retest --all --compare
+```
+
+It tries every rule that ALREADY has a verdict again, skips none, writes nothing,
+and prints only the rules whose verdict would change: a note that now bites
+(`PROMOTE`), a rule that bit and would now be a note (`DEMOTION`, listed loudly),
+and a rule this build cannot decide (`UNDECIDED`). It exits 5 when something
+would change. `--compare --apply` writes the promotions; a demotion is written
+only with `--compare --apply --allow-demote`, and otherwise waits for the
+evaluation. The evaluation start does the same for rules an older matcher
+decided, inside its time box: promotions and unchanged verdicts are written (an
+unchanged one only to record the new matcher revision), and a demotion goes to
+the agent's batch with its reason, never to the log.
+
 The `Stop` hook does not ask about these at all any more (2.5). The rules THOR
 could not decide alone are asked inside the project's evaluation - its batch of
 at most eight that need a fix only an agent can make, and its list of at most
