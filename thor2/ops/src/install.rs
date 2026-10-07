@@ -350,6 +350,36 @@ pub struct HookSpec {
     pub command: String,
 }
 
+/// Start `serve --version` once, the way a hook would start it, and say in
+/// plain words why not when it cannot be started. A program that is on disk but
+/// blocked (Windows Smart App Control, an antivirus) makes every hook fail open:
+/// Claude Code records an error and carries on, and THOR never speaks. `None`
+/// when it ran and exited cleanly. Writes nothing.
+pub fn launch_problem(serve_exe: &Path) -> Option<String> {
+    let mut command = std::process::Command::new(serve_exe);
+    command.arg("--version");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    match command.output() {
+        Err(e) => Some(format!(
+            "{} could not be started ({e}). Windows or your antivirus is probably blocking it (Smart App Control and \
+             Code Integrity do this to programs they do not know), or the file is damaged. THOR does not change that \
+             setting: allow the program in Windows Security, or build it again, then run this again.",
+            serve_exe.display()
+        )),
+        Ok(out) if !out.status.success() => Some(format!(
+            "{} started but exited with {} when asked for its version, so a hook that calls it would fail too. Build it \
+             again, then run this again.",
+            serve_exe.display(),
+            out.status
+        )),
+        Ok(_) => None,
+    }
+}
+
 /// The three hooks the CONTRACT asks for: session start, before a tool call,
 /// and per prompt - all three calling the same `serve hook --db <db>` command,
 /// exactly like `serve/src/bin/serve.rs`'s own `hook` subcommand expects
