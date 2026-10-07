@@ -11,6 +11,11 @@ explicitly instead. An empty step is a finding; a skipped step is a gap.
 Invent nothing. If a step turned up nothing, say so. A made-up finding costs
 more than a missed one.
 
+Do the work yourself. The session that runs this evaluation makes every THOR
+call, every check and every test itself, and does not hand the evaluation to a
+subagent: verdicts and filings count only from the evaluating session's own
+calls, so work a subagent does is not counted.
+
 ## What a mark means
 
 A useful mark is not a dead signal. The latest verdict is what counts:
@@ -174,7 +179,10 @@ conversation?
   earlier in the session - a build can go stale the moment one more file
   changes after it. Run it again, right now, and quote the actual result
   line (a pass/fail count, or the compiler's own summary), never a
-  paraphrase of one.
+  paraphrase of one. Run it in a plain form that `allowed-tools` pre-approves:
+  the command itself from the project root (for example `cargo test
+  --manifest-path <dir>/Cargo.toml`), never prefixed with `cd x &&`, which is
+  not pre-approved.
 - **Agents or background jobs.** Anything still running, or that stopped
   partway through its own work, gets named: what it was doing, and whether
   it finished, failed, or is still going right now.
@@ -235,7 +243,9 @@ evaluation started: exactly the items that fired in THIS session and had
 fired in 40 sessions or more since their last verdict (a fact counts once per
 session). Judge only those. A pinned
 item is never on it: the owner already answered whether it belongs there by
-pinning it.
+pinning it. Never `mark` an item that is not on your frozen list, even if it
+fired in the wrong place: a wrong-place firing off the list goes to step 7 as
+friction (anchor), not to a verdict.
 
 Judge each item by WHERE it fired, never by its text alone. Under every item
 the start note shows where it fired in this session - how often, and its last
@@ -727,6 +737,13 @@ changed: the id with before and after, the anchor from and to, the new id from
 step 5, or the file) or cannot here (what you tried and the one thing that is
 missing). A point that cannot be done here goes under "not settled" in your
 remarks, and step 2 of the next evaluation picks it up.
+
+When the fix for a friction point lives in THOR's own code or tool texts, not
+in the memory, the outcome is "cannot here": name the one missing thing as "a
+THOR code change", describe the change in one sentence, and write it in the
+report so the next review picks it up. And a rule that fired in the wrong place
+but is not on your frozen judgement list is friction (anchor) here, never a
+`mark` (step 2).
 
 This step has a third outcome: **one-off**, when it will not come back and you
 say which circumstance caused it and why that circumstance is gone. If the
