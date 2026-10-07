@@ -70,4 +70,8 @@ fn the_stop_hook_writes_a_launch_failure_of_its_session_to_the_log_once() {
     assert_eq!(faults.len(), 1, "recorded once, not once per Stop: {faults:?}");
     assert_eq!((faults[0].hook_event.as_str(), faults[0].exit_code), ("SessionStart", 126));
     assert_eq!(faults[0].tool_use_id, "toolu-blocked-1");
+    // The record sits on an id no item has; the log must still verify.
+    let all = store.get_all_events().unwrap();
+    assert!(thor_core::auditor::verify_chain_integrity(&all).is_ok());
+    assert!(thor_core::auditor::DifferentialAuditor::verify_consistency(&all).is_ok());
 }
