@@ -2703,6 +2703,42 @@ pub fn decided_by_older_matcher(store: &EventStore, id: &str) -> bool {
     decided_by(store, id).is_some_and(|rev| rev.as_deref() != Some(matcher_rev().as_str()))
 }
 
+/// The state file beside the store that remembers which rules this build
+/// already compared with their older verdict and found unchanged.
+pub const MATCHER_TRIED_FILE: &str = "matcher-tried.json";
+
+fn matcher_tried_path(db: &Path) -> PathBuf {
+    db.parent().unwrap_or_else(|| Path::new(".")).join(MATCHER_TRIED_FILE)
+}
+
+/// The rules this build's matcher revision already tried again and found the
+/// same class of verdict for, so no write was needed. A cache and nothing
+/// more: a missing, unreadable or older-revision file reads as empty, and the
+/// cost is only that those rules are tried (and written nowhere) once more.
+/// The log never carries a record of it - rewriting every unchanged rule to
+/// stamp the revision cost one `fact_revised` per rule after every edit to
+/// the matcher sources.
+pub fn read_matcher_tried(db: &Path) -> std::collections::HashSet<String> {
+    let Ok(text) = std::fs::read_to_string(matcher_tried_path(db)) else { return Default::default() };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else { return Default::default() };
+    if value.get("rev").and_then(|r| r.as_str()) != Some(matcher_rev().as_str()) {
+        return Default::default();
+    }
+    value
+        .get("ids")
+        .and_then(|ids| ids.as_array())
+        .map(|ids| ids.iter().filter_map(|id| id.as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
+}
+
+/// Remember `ids` as tried at this build's matcher revision (`read_matcher_tried`).
+pub fn write_matcher_tried(db: &Path, ids: &std::collections::HashSet<String>) {
+    let mut sorted: Vec<&String> = ids.iter().collect();
+    sorted.sort();
+    let body = serde_json::json!({ "rev": matcher_rev(), "ids": sorted });
+    let _ = crate::store_dir::write(&matcher_tried_path(db), body.to_string());
+}
+
 /// How a rule's verdict from this build compares with the one it holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Change {

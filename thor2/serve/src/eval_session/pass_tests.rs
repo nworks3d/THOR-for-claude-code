@@ -15,6 +15,8 @@ use thor_core::event_store::Event;
 const S1: &str = "0de7dc52-1b97-4b66-948f-61e4438043b2";
 const S2: &str = "373e8610-8130-490d-ac29-56aa98709fd1";
 const S3: &str = "5e1f0c3a-0000-4000-8000-000000000003";
+const S4: &str = "5e1f0c3a-0000-4000-8000-000000000004";
+const S5: &str = "5e1f0c3a-0000-4000-8000-000000000005";
 
 /// A box no fixture ever runs out of.
 const WIDE: Duration = Duration::from_secs(120);
@@ -1185,11 +1187,12 @@ fn under_matcher(rev: &str, body: impl FnOnce()) {
     crate::teeth::MATCHER_REV_OVERRIDE.with(|r| *r.borrow_mut() = None);
 }
 
-/// A rule an older matcher decided is tried again at the start: the same
-/// verdict is written once more, now naming this build's matcher, and the
-/// next start leaves it alone.
+/// A rule an older matcher decided is tried again at the start: the same kind
+/// of verdict writes NOTHING to the log (no `fact_revised` to stamp the
+/// matcher), this build's revision is remembered beside the store, and the
+/// next start leaves it alone. A newer matcher revision tries it again.
 #[test]
-fn a_verdict_an_older_matcher_made_is_tried_again_once() {
+fn a_verdict_an_older_matcher_made_is_tried_again_once_and_writes_nothing() {
     let mut fx = Fx::new();
     fx.legacy(&rule("fp", "Never run `git push --force` on main.", vec![cmd("git push")], forbidden(&["--force"]), Some("beta")));
     fx.legacy(&rule("subj", "Keep commit subjects under 60 characters.", vec![Binding::Moment(intent::Action::Commit)], None, Some("beta")));
@@ -1199,19 +1202,53 @@ fn a_verdict_an_older_matcher_made_is_tried_again_once() {
     assert_eq!(crate::teeth::decided_by(&fx.store, "fp"), Some(Some("old-matcher".to_string())));
     assert_eq!(crate::teeth::decided_by(&fx.store, "subj"), Some(Some("old-matcher".to_string())));
 
+    let events_before = fx.machine_writes("fp").len() + fx.machine_writes("subj").len();
     let second = fx.start(S2, "beta");
     for id in ["fp", "subj"] {
         assert_eq!(outcome_of(&second, id), MachineOutcome::Unchanged, "{id}: the same kind of verdict");
-        assert_eq!(fx.machine_writes(id).len(), 2, "{id}: one write at each start");
-        assert_eq!(item_of(&second, id).seq, Some(fx.machine_writes(id)[1].seq));
-        assert_eq!(crate::teeth::decided_by(&fx.store, id), Some(Some(crate::teeth::matcher_rev())), "{id}: now decided by this build");
+        assert_eq!(fx.machine_writes(id).len(), 1, "{id}: no stamp written for the new matcher");
+        assert_eq!(item_of(&second, id).seq, None, "{id}: nothing was written");
     }
+    assert_eq!(fx.machine_writes("fp").len() + fx.machine_writes("subj").len(), events_before, "no write at all");
     assert_eq!(model::store::current_verdict(&fx.store, "fp"), CurrentVerdict::RuleWired);
     assert_eq!(model::store::current_verdict(&fx.store, "subj"), CurrentVerdict::Note);
+    let tried = crate::teeth::read_matcher_tried(&fx.db);
+    assert!(tried.contains("fp") && tried.contains("subj"), "remembered beside the store: {tried:?}");
 
+    // The next start has nothing owed, and the log did not grow for the rules.
     let third = fx.start(S3, "beta");
     assert!(third.frozen.machine.as_ref().unwrap().items.is_empty(), "nothing is owed any more: {:?}", third.frozen.machine);
-    assert_eq!(fx.machine_writes("fp").len(), 2);
+    assert_eq!(fx.machine_writes("fp").len(), 1);
+
+    // A lost file only costs one more trial, never a write.
+    std::fs::remove_file(fx.dir.path().join(crate::teeth::MATCHER_TRIED_FILE)).unwrap();
+    let fourth = fx.start(S4, "beta");
+    assert_eq!(outcome_of(&fourth, "fp"), MachineOutcome::Unchanged);
+    assert_eq!(fx.machine_writes("fp").len(), 1);
+
+    // Another edit to the matcher sources: tried once more, still no write.
+    under_matcher("newer-matcher", || {
+        let fifth = fx.start(S5, "beta");
+        assert_eq!(outcome_of(&fifth, "fp"), MachineOutcome::Unchanged);
+        assert_eq!(fx.machine_writes("fp").len(), 1, "no write after a second matcher edit either");
+        let tried = crate::teeth::read_matcher_tried(&fx.db);
+        assert!(tried.contains("fp"), "{tried:?}");
+    });
+}
+
+/// The machine pass's stamp-free refresh is no door at all: the rules it
+/// compared are not rewritten, so no THOR-actor write lands on an evaluation's
+/// frozen lists and nothing is left for the weakening readers to skip.
+#[test]
+fn an_unchanged_rule_compared_with_a_newer_matcher_leaves_the_history_alone() {
+    let mut fx = Fx::new();
+    fx.legacy(&rule("fp", "Never run `git push --force` on main.", vec![cmd("git push")], forbidden(&["--force"]), Some("beta")));
+    under_matcher("old-matcher", || {
+        fx.start(S1, "beta");
+    });
+    let history_before = fx.store.get_events_by_entity("fp").unwrap().len();
+    fx.start(S2, "beta");
+    assert_eq!(fx.store.get_events_by_entity("fp").unwrap().len(), history_before, "history did not grow");
 }
 
 /// A rule that bit when an older build tried it and that this build would
@@ -1245,5 +1282,8 @@ fn a_verdict_with_no_matcher_recorded_is_older_than_any() {
     assert!(crate::teeth::decided_by_older_matcher(&fx.store, "fp"));
     let start = fx.start(S1, "beta");
     assert_eq!(outcome_of(&start, "fp"), MachineOutcome::Unchanged);
-    assert!(!crate::teeth::decided_by_older_matcher(&fx.store, "fp"));
+    assert!(fx.machine_writes("fp").is_empty(), "compared, not rewritten");
+    assert!(crate::teeth::read_matcher_tried(&fx.db).contains("fp"));
+    let next = fx.start(S2, "beta");
+    assert!(next.frozen.machine.as_ref().unwrap().items.is_empty(), "{:?}", next.frozen.machine);
 }

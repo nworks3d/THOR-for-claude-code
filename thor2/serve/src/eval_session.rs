@@ -419,7 +419,7 @@ fn last_write(store: &EventStore, id: &str) -> i64 {
 /// that keep a pending check, then the rest - rules with no verdict that did
 /// not fire, rules a blocker holds, and rule-track contains checks that have
 /// to be tried again - each group oldest write first.
-fn candidates(store: &EventStore, project: &str, start: &EvaluationStart) -> Vec<Candidate> {
+fn candidates(store: &EventStore, project: &str, start: &EvaluationStart, compared: &HashSet<String>) -> Vec<Candidate> {
     let live: Vec<crate::live::LiveItem> = crate::live::live_items(store)
         .into_iter()
         .filter(|li| li.item.kind.can_fire() && project::applies_to(li.item.project.as_deref(), Some(project)))
@@ -454,7 +454,7 @@ fn candidates(store: &EventStore, project: &str, start: &EvaluationStart) -> Vec
             Settlement::Settled(Settled::Rule { .. }) => {
                 let due = own(&li.item)
                     && root.as_ref().is_some_and(|root| teeth::contains_retry_due(store, &li.id, &li.item, root, &blobs).is_some());
-                let stale = teeth::decided_by_older_matcher(store, &li.id);
+                let stale = teeth::decided_by_older_matcher(store, &li.id) && !compared.contains(&li.id);
                 if !due && !stale {
                     continue;
                 }
@@ -462,7 +462,9 @@ fn candidates(store: &EventStore, project: &str, start: &EvaluationStart) -> Vec
             }
             // A note with nothing pending, decided by an older matcher: a
             // newer one may find that a tooth bites after all.
-            Settlement::Settled(Settled::Note { .. }) if teeth::decided_by_older_matcher(store, &li.id) => (3, false, false, true),
+            Settlement::Settled(Settled::Note { .. }) if teeth::decided_by_older_matcher(store, &li.id) && !compared.contains(&li.id) => {
+                (3, false, false, true)
+            }
             Settlement::Settled(_) => continue,
         };
         let key = last_write(store, &li.id);
@@ -507,7 +509,7 @@ fn machine_item(id: &str, outcome: MachineOutcome, detail: String) -> MachineIte
 
 /// Try one old rule and do with it what the machine can: write a rule or a
 /// note as `teeth-eval`, or say who has to act.
-fn try_one(store: &mut EventStore, db: Option<&Path>, candidate: &Candidate, corpus: &Corpus) -> MachineItem {
+fn try_one(store: &mut EventStore, db: Option<&Path>, candidate: &Candidate, corpus: &Corpus, compared: &mut HashSet<String>) -> MachineItem {
     let id = candidate.id.as_str();
     let needs_agent = |why: String| MachineItem { call: Some(agent_call(id)), ..machine_item(id, MachineOutcome::NeedsAgent, why) };
     // What the rule holds now, read before anything is written: a rule an
@@ -565,10 +567,17 @@ fn try_one(store: &mut EventStore, db: Option<&Path>, candidate: &Candidate, cor
                 // A note whose pending check is still not a working tooth.
                 return machine_item(id, MachineOutcome::PendingKept, detail);
             }
-            // (A rule an older matcher decided is written even when nothing
-            // else changed: its record then names this build's matcher, and
-            // the next start does not try it again.)
-            if candidate.retry && !candidate.matcher && teeth::same_as_current_record(store, &tried) {
+            // A rule tried again and found as before is left alone, not
+            // rewritten. When it was tried because an older matcher decided
+            // it, THIS build's revision is remembered beside the store
+            // (`teeth::read_matcher_tried`) instead of in the log: a stamp
+            // written to every unchanged rule would cost one `fact_revised`
+            // per rule after every edit to the matcher sources.
+            let stamp_only = candidate.matcher && change == Some(Change::Unchanged);
+            if (candidate.retry || stamp_only) && teeth::same_as_current_record(store, &tried) {
+                if stamp_only {
+                    compared.insert(id.to_string());
+                }
                 return machine_item(id, MachineOutcome::Unchanged, detail);
             }
             // Every verdict is written as `teeth-eval`, but one: an old
@@ -853,19 +862,24 @@ pub fn machine_pass(store: &mut EventStore, project: &str, start: &EvaluationSta
     let db = store.path();
     let session = start.frozen.session.clone();
     let corpus = Corpus::load(store);
-    let order = candidates(store, project, start);
+    let mut compared = db.as_deref().map(teeth::read_matcher_tried).unwrap_or_default();
+    let compared_before = compared.len();
+    let order = candidates(store, project, start, &compared);
     let mut machine = MachinePass { box_secs, ..MachinePass::default() };
     for (place, candidate) in order.iter().enumerate() {
         if Instant::now() >= deadline {
             machine.not_reached_ids = order[place..].iter().map(|c| c.id.clone()).collect();
             break;
         }
-        machine.items.push(try_one(store, db.as_deref(), candidate, &corpus));
+        machine.items.push(try_one(store, db.as_deref(), candidate, &corpus, &mut compared));
         if candidate.projectless {
             machine.projectless += 1;
         }
     }
     machine.not_reached = machine.not_reached_ids.len();
+    if let (Some(db), true) = (db.as_deref(), compared.len() != compared_before) {
+        teeth::write_matcher_tried(db, &compared);
+    }
     let count = |machine: &MachinePass, outcome: MachineOutcome| machine.items.iter().filter(|i| i.outcome == outcome).count();
     machine.bites = count(&machine, MachineOutcome::Rule);
     machine.notes = count(&machine, MachineOutcome::Note);

@@ -289,6 +289,25 @@ handle only what the start note handed you under TEETH:
   done. Example: a rule saying "the sensor delay is in microseconds, not
   nanoseconds", disputed on the loose word "delay": the subject is
   "microseconds", so call 1 hangs a `contains` check on it.
+- **A DEMOTION in the batch**: a batch line that starts with "DEMOTION, nothing
+  written". WHAT IT MEANS: THOR's matcher (the code that reads a command and
+  decides whether a rule refuses it) changed between builds. This rule bit when
+  the older matcher tried it, and the newer one would turn it into a note that
+  can never refuse anything. THOR writes nothing on its own for this: the rule
+  keeps its tooth until you decide. WHAT TO DO: open the rule (`mcp__thor__get`)
+  and the file or command it is about, and read the reason on the line. If the
+  tooth can be made to bite again (the anchor, the literal or the words the text
+  names were wrong), make that fix with `mcp__thor__revise(id: "<id>", text:
+  "<the reworded text>")` and THOR tries the rule again. Only when you checked
+  and the rule truly cannot bite under the new reading, run the retest command
+  the line shows (`serve ... retest --id '<id>' --apply`), which writes the
+  note, and say in the report that you accepted the demotion and why. WHEN IT IS
+  DONE: the rule is no longer on the batch - THOR answers rule for the revise,
+  or note for the retest. EXAMPLE: a ban on resetting two named deploy checkouts
+  lists four refused forms, and the new matcher lets two of them through; the
+  line says so. Rewording the text to name only the forms the check really
+  catches keeps the rule on the rule track (revise); keeping the text as it is
+  and running the retest turns it into a note.
 - **Everything THOR settled itself** (rules, notes, pending checks hung) is
   only reported, in the machine section of the report. You do not redo it.
 
@@ -425,6 +444,43 @@ This is the signal that counts here, not a mark.
   belongs in the report - with the rule id, what you tried, and why it was
   legitimate. A false block teaches people to work around the gate, and
   that cannot be undone.
+- **REFUSAL OUTCOMES (probable false blocks).** The machine section of the
+  report has a line that starts "REFUSAL OUTCOMES in the window". WHAT IT MEANS:
+  THOR looked at every verified refusal in the window, found what happened to
+  the refusing rule afterwards, and counts a refusal as a PROBABLE false block
+  when someone other than THOR then retracted that rule or weakened it (cleared
+  or changed its check, lowered its severity, dropped a binding). It is a
+  proxy, not a verdict: a rule can change for other reasons. WHAT TO DO, for
+  each rule that line counts: open its history (`mcp__thor__history(id:
+  "<id>")`) and read the refusal and the change that followed. If the refusal
+  was WRONG (a legitimate call was blocked), the weakening was right: say so in
+  the report, with the rule id, the call that was refused and why it was
+  legitimate (this is the false block above). If the refusal was RIGHT and the
+  weakening was wrong, restore the check: `mcp__thor__revise(id: "<id>", ...)`
+  with the check as it was and a `because` of at least twenty characters that
+  says why the weakening was a mistake. WHEN IT IS DONE: every counted rule has
+  one of the two outcomes written in the report, and a restore was accepted by
+  THOR (rule or note, never a refusal). A line that says "no verified refusal
+  in the window" needs nothing. EXAMPLE: the line counts rule `no-force-push`;
+  its history shows a refusal of `git push --force-with-lease`, then a revise
+  that cleared the check. The refused call was legitimate, so the weakening
+  stands: write "no-force-push refused git push --force-with-lease, which is
+  safe; clearing its check was right".
+- **THOR health.** The machine section also has a line "THOR health in the
+  window: N hook launch failure(s), M version-skew event(s)". WHAT IT MEANS: a
+  hook launch failure is a Claude Code hook (THOR's guard or Stop hook) that
+  could not start, so nothing from THOR reached that call; a version-skew event
+  is a filing that THOR refused because the tool server that wrote the report
+  was built from another THOR than the checker ("written by a tool server of
+  another build than the checker"), which is nobody's edit. There is nothing to
+  fix in any note. WHAT TO DO: put both numbers in the report. When M is above
+  zero, or a filing was refused that way, tell the owner in the summary to
+  restart Claude so the tool server is the current one, then file again. When N
+  is above zero, name the hook and say it needs the owner's attention. WHEN IT
+  IS DONE: both numbers are in the report, and the owner was told to restart
+  when there was skew. EXAMPLE: "THOR health: 0 hook launch failures, 1
+  version-skew event - the owner was told to restart Claude, and I filed again
+  after the restart".
 - Did the gate refuse one of your OWN write actions (`remember`/`revise`)?
   That is not an annoyance but a signal about the shape of the store. Name
   the reason.
@@ -453,6 +509,8 @@ This is the signal that counts here, not a mark.
   the compensating trick this design forbids.
 
 Step 6 is done once every refusal is named, every false block is in the
+report, every rule the REFUSAL OUTCOMES line counts has its outcome written
+(and a wrongly weakened check restored), the THOR health numbers are in the
 report, and every displacement notice is either resolved or deliberately
 tagged - reporting alone is never enough here.
 
@@ -536,8 +594,9 @@ not done.
    was still missing), and every rule you saved with `legitimate_calls`,
    `may_change` or `accept_refusing`, with the reason;
 5. what you stored that had been missing;
-6. what the gate did - including every false block and every refusal of
-   your own write actions;
+6. what the gate did - including every false block, every rule the REFUSAL
+   OUTCOMES line counts with its outcome, the THOR health numbers, and every
+   refusal of your own write actions;
 7. the friction, and which of it will happen again next session;
 8. what you did not verify.
 

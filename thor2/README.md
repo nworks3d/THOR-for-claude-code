@@ -846,9 +846,11 @@ and a rule this build cannot decide (`UNDECIDED`). It exits 5 when something
 would change. `--compare --apply` writes the promotions; a demotion is written
 only with `--compare --apply --allow-demote`, and otherwise waits for the
 evaluation. The evaluation start does the same for rules an older matcher
-decided, inside its time box: promotions and unchanged verdicts are written (an
-unchanged one only to record the new matcher revision), and a demotion goes to
-the agent's batch with its reason, never to the log.
+decided, inside its time box: promotions are written, an unchanged verdict is
+NOT rewritten (the revision it was compared at is remembered in
+`matcher-tried.json` beside the store, a cache whose loss only costs one more
+trial), and a demotion goes to the agent's batch with its reason, never to the
+log.
 
 The `Stop` hook does not ask about these at all any more (2.5). The rules THOR
 could not decide alone are asked inside the project's evaluation - its batch of
