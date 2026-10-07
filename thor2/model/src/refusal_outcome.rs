@@ -55,6 +55,8 @@ pub struct RefusalFate {
     /// The log seq of the event the fate names; `None` for the two that are
     /// not a write by the rule's owner side (unchanged).
     pub fate_seq: Option<i64>,
+    /// The rule as it stood when it refused: what a restore puts back.
+    pub then: Item,
 }
 
 impl RefusalFate {
@@ -101,7 +103,7 @@ pub fn fates(
             continue;
         }
         let mut noise: Option<i64> = None;
-        let mut fate = RefusalFate { rule: rule.to_string(), refusal_seq: refusal.seq, fate: Fate::Unchanged, fate_seq: None };
+        let mut fate = RefusalFate { rule: rule.to_string(), refusal_seq: refusal.seq, fate: Fate::Unchanged, fate_seq: None, then: item.clone() };
         for (j, later) in events.iter().enumerate().skip(i + 1).filter(|(_, l)| follows(refusal, l)) {
             let by_thor = RESERVED_ACTORS.contains(&later.actor.as_str());
             match later.kind {

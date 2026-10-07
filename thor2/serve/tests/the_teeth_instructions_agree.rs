@@ -251,3 +251,46 @@ fn the_three_arguments_need_a_because_in_every_text_an_agent_reads() {
         assert!(note.contains(phrase), "the start note must carry '{phrase}'");
     }
 }
+
+/// The signals of the 2026-10-07 field audit (a DEMOTION line, the disputes to
+/// verify, the refusal outcomes, THOR's health) are each described in the
+/// routine in the words the start note and the machine section really print:
+/// the two exits of a demotion with the retest command and the narrowing
+/// revise (never a bare revise), the retract that also settles a dispute, the
+/// restore of a retracted rule under a new id, the full machine section in the
+/// filing reply, and a report revised after its filing. A signal the routine
+/// leaves unexplained makes an agent guess.
+#[test]
+fn the_routine_explains_every_new_evaluation_signal_in_the_words_thor_prints() {
+    let routine = routine();
+    let note = read("serve/src/eval_session.rs");
+    let model = read("model/src/store.rs");
+    for (phrase, why) in [
+        ("A DEMOTION in the batch", "the demotion bullet"),
+        ("`retest --id '<id>' --apply`", "exit (a), the retest command in the pre-approved form"),
+        ("`check_kind: \"forbidden\"`", "exit (b), the narrowing revise"),
+        ("A bare `mcp__thor__revise(id: \"<id>\")` is NOT an exit", "a bare revise is no exit"),
+        ("the owner is not asked", "the agent decides a demotion"),
+        ("or when you retract the rule with a reason", "a retract settles a dispute"),
+        ("DISPUTES TO VERIFY", "the machine section's frozen dispute lines"),
+        ("notes by dispute written in the window", "the window lists are told apart from item c"),
+        ("`restored-from:<id>`", "a retracted rule is restored under a new id"),
+        ("SIGNALS BEFORE YOU FILE", "section 4 of the start note"),
+        ("in full", "the filing reply prints the machine section in full"),
+        ("a text revise changes neither", "a revised report still counts"),
+    ] {
+        assert!(routine.contains(phrase), "the routine must explain {why} (missing '{phrase}')");
+    }
+    for (phrase, where_) in [
+        ("4. SIGNALS BEFORE YOU FILE", &note),
+        ("TWO EXITS", &note),
+        ("a reason shorter than {min} characters is refused", &note),
+        ("Retracting the rule with a reason also settles an item", &note),
+        ("DISPUTES TO VERIFY (frozen at the start)", &model),
+        ("verified by call 1", &model),
+        ("verified by call 2", &model),
+        ("probable false blocks, each with the call that was refused and what followed", &model),
+    ] {
+        assert!(where_.contains(phrase), "the code must print '{phrase}', which the routine describes");
+    }
+}

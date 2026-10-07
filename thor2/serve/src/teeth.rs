@@ -170,6 +170,29 @@ fn command_anchor(bindings: &[Binding]) -> Option<&str> {
     })
 }
 
+/// For a forbidden check on a command: which of its literals the trial's
+/// built form refused and which it let through, by the forms `attempts`
+/// holds (`<anchor> <literal>`, which the trial writes after its own "your
+/// forbidden ... on ...: " label). A literal with no such form tried (a
+/// collapsed check, another kind of check) is in neither list.
+pub fn literals_by_outcome(item: &Item, attempts: &[model::store::TrialAttempt]) -> (Vec<String>, Vec<String>) {
+    let (Some(Check::Forbidden { literals }), Some(anchor)) = (&item.check, command_anchor(&item.bindings)) else {
+        return (Vec::new(), Vec::new());
+    };
+    let anchor = anchor.split_whitespace().collect::<Vec<_>>().join(" ");
+    let (mut refused, mut let_through) = (Vec::new(), Vec::new());
+    for literal in literals {
+        let form = format!("{anchor} {literal}");
+        let tried_form = format!(": {form}");
+        match attempts.iter().find(|a| a.form == form || a.form.ends_with(&tried_form)).map(|a| a.outcome) {
+            Some(model::store::AttemptOutcome::Refused) => refused.push(literal.clone()),
+            Some(model::store::AttemptOutcome::LetThrough) => let_through.push(literal.clone()),
+            None => {}
+        }
+    }
+    (refused, let_through)
+}
+
 /// Whether a Command anchor names a tool rather than a shell command: one
 /// word, a capital first letter (`Agent`, `WebFetch`) or an MCP tool name.
 /// Such a call carries no command; the hook reads its tool name.

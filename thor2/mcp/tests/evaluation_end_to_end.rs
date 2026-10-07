@@ -430,6 +430,13 @@ fn stored_report_starts_with_the_machine_section() {
     );
     assert!(stored.contains(&format!("EVALUATION: project 'demo'; session {WRITING_SESSION}")), "{stored}");
     assert!(stored.ends_with(&format!("\n\n{}\nTLDR: evaluaton of demo. Nothing to add.", model::gate::AGENT_SECTION_BEGIN)), "{stored}");
+    // The reply to the filing prints the machine section IN FULL, so the agent
+    // reads the health line, the refusal outcomes and the dispute lines it was
+    // held to before the turn ends, and can fix its own text below them.
+    let block = model::gate::machine_block(&stored).expect("the stored report carries its machine section");
+    assert!(reply.contains(block), "the reply holds the whole section: {reply}");
+    assert!(reply.contains("THOR's machine section of this report, in full"), "{reply}");
+    assert!(reply.contains("revise only your own text below it"), "the reply says what may still be changed: {reply}");
     s.stop();
 
     // The section edited: refused, and nothing changes.
@@ -642,6 +649,51 @@ fn attested_filing_then_stop_is_silent() {
     worked(&s, 90);
     assert!(s.stop().trim().is_empty(), "and the next turn too, while it covers");
     assert_eq!(validator(&s.db).len(), 1, "a later Stop reads the record and writes nothing");
+}
+
+/// The routine tells the agent to read the reply to its filing - which prints
+/// the machine section in full - and to revise only its OWN text below it if
+/// that is needed. Such a revise, made before the Stop has validated the
+/// filing or after, leaves the report counting: the validator reads the event
+/// that FILED it, and the machine block is kept byte for byte, so the digest
+/// the evaluation is judged by does not move.
+#[test]
+fn a_report_revised_after_its_filing_still_counts_at_the_stop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Session::new(tmp.path());
+    start_evaluation(&mut s);
+    worked(&s, 90);
+    let mut mcp = s.mcp();
+    let reply = s.call_unseen(&mut mcp, "remember", report_args(REPORT, "demo", TLDR), "toolu_file1");
+    assert!(reply.starts_with(&format!("stored '{REPORT}' (Report, event seq ")), "{reply}");
+    let filed = last_of(&s.db, REPORT, EventKind::FactCreated);
+
+    // Revised in the same turn, before the Stop validated the filing.
+    let revised = s.call(&mut mcp, "revise", json!({"id": REPORT, "text": "TLDR: evaluation of demo. Corrected after reading the reply."}), "toolu_rev1");
+    assert!(revised.starts_with(&format!("revised '{REPORT}'")), "{revised}");
+    let after = s.stop();
+    assert!(after.trim().is_empty(), "the revised report still silences the Stop: {after}");
+    let records = |db: &std::path::Path| -> Vec<model::store::EvaluationValidation> {
+        events_of(db, REPORT)
+            .into_iter()
+            .filter(|e| e.kind == EventKind::GateStoodAside && e.actor == model::store::EVAL_VALIDATOR_ACTOR)
+            .map(|e| serde_json::from_str(&e.body).unwrap())
+            .collect()
+    };
+    let validated = records(&s.db);
+    assert_eq!(validated.len(), 1, "validated once, for the filing event");
+    assert!(validated[0].valid && validated[0].report_seq == filed.seq, "{:?}", validated[0]);
+
+    // Revised again after it was validated: still the same one record, still counting.
+    let revised = s.call(&mut mcp, "revise", json!({"id": REPORT, "text": "TLDR: evaluation of demo. A second correction."}), "toolu_rev2");
+    assert!(revised.starts_with(&format!("revised '{REPORT}'")), "{revised}");
+    worked(&s, 90);
+    assert!(s.stop().trim().is_empty(), "and the next turn is silent too");
+    assert_eq!(records(&s.db).len(), 1, "no second validation for a text revise");
+    let store = EventStore::open_existing(&s.db).unwrap();
+    let counted = serve::eval_filing::newest_valid_evaluation(&store, Some("demo")).expect("the report still counts");
+    assert_eq!(counted.report, REPORT);
+    assert_eq!(counted.report_seq, filed.seq);
 }
 
 // ---------------------------------------------------------------- step 19

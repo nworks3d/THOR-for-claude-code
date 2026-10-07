@@ -139,3 +139,126 @@ fn a_write_with_no_dispute_needs_no_because() {
     let reply = mcp.call("remember", args);
     assert!(reply.starts_with("stored 'plain'"), "{reply}");
 }
+
+/// THE CONFIRM CALL (call 2) holds the same floor as writing a dispute: a
+/// revise that carries only a reason, on a rule that stands on a dispute, is
+/// refused when the reason is shorter than twenty characters - the 2026-10-07
+/// audit found a one-word reason would otherwise settle the item.
+#[test]
+fn the_confirm_call_needs_twenty_characters_too() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = store(tmp.path(), &["demo"]);
+    let mut mcp = Mcp::start(&db, tmp.path());
+    let mut args = push_rule();
+    args["because"] = json!(REASON);
+    let reply = mcp.call("remember", args);
+    assert!(reply.starts_with("stored 'bundle'") && reply.contains("teeth: note by dispute"), "{reply}");
+
+    for filler in ["ok", "it is fine", "checked, it stands"] {
+        let reply = mcp.call("revise", json!({ "id": "bundle", "because": filler }));
+        println!("{reply}");
+        assert!(reply.starts_with("REFUSED:") && reply.contains("20 characters") && reply.contains("dispute"), "'{filler}': {reply}");
+    }
+    let history = mcp.call("history", json!({ "id": "bundle" }));
+    assert!(!history.contains("(because: ok)") && !history.contains("(because: it is fine)"), "nothing was written: {history}");
+    let reply = mcp.call("revise", json!({ "id": "bundle", "because": "checked the rule against its file: the example call is incidental" }));
+    assert!(reply.starts_with("revised 'bundle'"), "{reply}");
+}
+
+/// A reason on a rule that carries no dispute is the ordinary `because` of any
+/// weakening: the floor is the dispute's, not every revise's.
+#[test]
+fn a_short_because_on_a_rule_without_a_dispute_is_not_refused_by_that_floor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = store(tmp.path(), &["demo"]);
+    let mut mcp = Mcp::start(&db, tmp.path());
+    let mut args = rule("plain", "Keep the build green.", Some("demo"));
+    args["moments"] = json!(["push"]);
+    assert!(mcp.call("remember", args).starts_with("stored 'plain'"));
+    let reply = mcp.call("revise", json!({ "id": "plain", "because": "tidy" }));
+    assert!(!reply.contains("a dispute needs"), "{reply}");
+}
+
+/// A rule retracted by mistake comes back with a `remember` under a NEW id,
+/// in the shape THOR's restore call prints: the old id stays retracted (a
+/// second remember on it would leave the id with two heads, which `get`
+/// refuses to read until a resolve), the new rule is live with its check, and
+/// the history of the old id keeps the retract.
+#[test]
+fn a_retracted_rule_comes_back_with_a_remember_under_a_new_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = store(tmp.path(), &["demo"]);
+    let mut mcp = Mcp::start(&db, tmp.path());
+    let mut args = rule("no-prune", "Never run `docker system prune` on the build host.", Some("demo"));
+    args["targets"] = json!([{ "kind": "command", "value": "docker" }]);
+    args["check_kind"] = json!("forbidden");
+    args["check_literals"] = json!(["system prune"]);
+    let reply = mcp.call("remember", args.clone());
+    assert!(reply.starts_with("stored 'no-prune'"), "{reply}");
+    let reply = mcp.call("retract", json!({ "id": "no-prune", "reason": "the docker system prune ban is replaced by a cleanup job" }));
+    assert!(reply.starts_with("retracted no-prune"), "{reply}");
+    assert!(get_missing(&mut mcp, "no-prune"));
+
+    // The call THOR prints: id "<old>-restored", a tag naming the old id, the
+    // rule's own text, bindings and check.
+    let mut restored = args.clone();
+    restored["id"] = json!("no-prune-restored");
+    restored["tags"] = json!(["restored-from:no-prune"]);
+    restored["moments"] = json!([]);
+    restored["always"] = json!(false);
+    let reply = mcp.call("remember", restored);
+    println!("{reply}");
+    assert!(reply.starts_with("stored 'no-prune-restored'"), "{reply}");
+    let back = get(&mut mcp, "no-prune-restored");
+    assert!(back.check.is_some() && back.tags.contains(&"restored-from:no-prune".to_string()), "{back:?}");
+    assert!(get_missing(&mut mcp, "no-prune"), "the old id stays retracted");
+    let history = mcp.call("history", json!({ "id": "no-prune" }));
+    assert!(history.contains("fact_retracted"), "the history keeps the retract: {history}");
+}
+
+/// The pitfall the routine names: a second remember on a RETRACTED id writes a
+/// second head, and `get` then refuses to read the id until a resolve - so a
+/// restore always takes a new id.
+#[test]
+fn remembering_a_retracted_id_again_leaves_it_with_two_heads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = store(tmp.path(), &["demo"]);
+    let mut mcp = Mcp::start(&db, tmp.path());
+    let mut args = rule("no-prune", "Never run `docker system prune` on the build host.", Some("demo"));
+    args["targets"] = json!([{ "kind": "command", "value": "docker" }]);
+    args["check_kind"] = json!("forbidden");
+    args["check_literals"] = json!(["system prune"]);
+    assert!(mcp.call("remember", args.clone()).starts_with("stored 'no-prune'"));
+    assert!(mcp.call("retract", json!({ "id": "no-prune", "reason": "the docker system prune ban is replaced by a cleanup job" })).starts_with("retracted no-prune"));
+    let again = mcp.call("remember", args);
+    println!("{again}");
+    assert!(mcp.call("get", json!({ "id": "no-prune" })).contains("diverged"), "same id twice: two heads");
+}
+
+/// A refusal in an item's history shows the call the hook refused - what the
+/// agent needs to judge whether the refusal was right - and a rule's step
+/// shows the rule as it stood (its check and bindings).
+#[test]
+fn history_shows_the_call_a_refusal_refused_and_the_rule_as_it_stood() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = store(tmp.path(), &["demo"]);
+    let mut mcp = Mcp::start(&db, tmp.path());
+    let mut args = rule("no-force", "Never run `git push --force` on the main branch.", Some("demo"));
+    args["targets"] = json!([{ "kind": "command", "value": "git push" }]);
+    args["check_kind"] = json!("forbidden");
+    args["check_literals"] = json!(["--force"]);
+    assert!(mcp.call("remember", args).starts_with("stored 'no-force'"));
+    {
+        let mut store = thor_core::event_store::EventStore::open_existing(&db).unwrap();
+        let body = r#"{"at":"2026-10-07T09:20:00Z","target":"git push --force-with-lease origin main","tool_use_id":"toolu_02"}"#;
+        store.append_event("other-session", "other-session", "hook", thor_core::event_store::EventKind::GateRefused, "no-force", None, body).unwrap();
+        store.append_event("other-session", "other-session", "hook", thor_core::event_store::EventKind::GateRefused, "no-force", None, "not json").unwrap();
+    }
+    let history = mcp.call("history", json!({ "id": "no-force" }));
+    println!("{history}");
+    assert!(history.contains(" gate_refused by hook ["), "{history}");
+    assert!(history.contains("]: refused call: 'git push --force-with-lease origin main'"), "{history}");
+    assert!(history.contains("]: refused call: (the log kept no text for it)"), "{history}");
+    assert!(!history.contains("no readable item body"), "{history}");
+    assert!(history.contains("\n    as it stood: check forbidden '--force'; bound to command 'git push'; severity "), "{history}");
+}

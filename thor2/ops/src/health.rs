@@ -3009,14 +3009,19 @@ fn refusal_outcomes_at(db: &Path, full: bool, now: i64) -> Vec<String> {
                 _ => true,
             }
         };
-        all.extend(fates(id, &own, &is_real, &follows).into_iter().map(|f| (at.get(&f.refusal_seq).copied(), f)));
+        all.extend(fates(id, &own, &is_real, &follows).into_iter().map(|f| {
+            // The call that was refused, as the log kept it (redacted when
+            // it was written) - what tells a wrong refusal from a right one.
+            let call = own.iter().find(|e| e.seq == f.refusal_seq).and_then(model::store::refused_call_excerpt);
+            (at.get(&f.refusal_seq).copied(), f, call)
+        }));
     }
     if all.is_empty() {
         return Vec::new();
     }
-    let probable: Vec<_> = all.iter().filter(|(_, f)| f.probable_false_block()).map(|(_, f)| f).collect();
-    let noisy = all.iter().filter(|(_, f)| f.fate == Fate::MarkedNoise).count();
-    let young = all.iter().filter(|(t, _)| t.is_some_and(|t| now - t < window)).count();
+    let probable: Vec<_> = all.iter().filter(|(_, f, _)| f.probable_false_block()).map(|(_, f, call)| (f, call)).collect();
+    let noisy = all.iter().filter(|(_, f, _)| f.fate == Fate::MarkedNoise).count();
+    let young = all.iter().filter(|(t, _, _)| t.is_some_and(|t| now - t < window)).count();
     let mut line = format!(
         "refusal outcomes: {} real refusal(s) in the last {REFUSAL_OUTCOMES_DAYS} days, {} followed by weakening or retract of the \
          refusing rule within {OUTCOME_WINDOW_DAYS} days (probable false blocks), {}. A proxy read from the log: a rule can change for \
@@ -3031,23 +3036,28 @@ fn refusal_outcomes_at(db: &Path, full: bool, now: i64) -> Vec<String> {
     if young > 0 {
         line.push_str(&format!(" {young} refusal(s) are younger than the window and may still be followed."));
     }
-    if !full && !probable.is_empty() {
-        line.push_str(" --full lists them.");
+    // Each probable false block is named (the rule, the call it refused, what
+    // followed); a long list stops at `FALSE_BLOCKS_LISTED` unless --full.
+    let shown = if full { probable.len() } else { probable.len().min(model::store::FALSE_BLOCKS_LISTED) };
+    if probable.len() > shown {
+        line.push_str(" --full lists them all.");
     }
     let mut out = vec![line];
-    if full {
-        for f in probable {
-            let how = match &f.fate {
-                Fate::Weakened(labels) => format!("weakened ({labels})"),
-                _ => "retracted".to_string(),
-            };
-            out.push(format!(
-                "  probable false block: '{}' refused at log seq {}, then {how} at log seq {}",
-                f.rule,
-                f.refusal_seq,
-                f.fate_seq.unwrap_or_default()
-            ));
-        }
+    for (f, call) in probable.iter().take(shown) {
+        let how = match &f.fate {
+            Fate::Weakened(labels) => format!("weakened ({labels})"),
+            _ => "retracted".to_string(),
+        };
+        let call = call.as_ref().map_or("a call whose text the log did not keep".to_string(), |c| format!("'{c}'"));
+        out.push(format!(
+            "  probable false block: '{}' refused {call} at log seq {}, then {how} at log seq {}",
+            f.rule,
+            f.refusal_seq,
+            f.fate_seq.unwrap_or_default()
+        ));
+    }
+    if probable.len() > shown {
+        out.push(format!("  probable false block: and {} more, not listed here", probable.len() - shown));
     }
     out
 }
@@ -5740,15 +5750,15 @@ mod tests {
         }
         let now = serve::time::unix_from_iso8601("2026-10-25T00:00:00Z").unwrap();
         let lines = refusal_outcomes_at(&db, false, now);
-        assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].starts_with("refusal outcomes: 4 real refusal(s) in the last 30 days, 2 followed by weakening or retract of the refusing rule within 7 days (probable false blocks), "), "{lines:?}");
         assert!(lines[0].contains(&model::refusal_outcome::rate_words(2, 4)), "{lines:?}");
-        assert!(lines[0].contains("--full lists them"), "{lines:?}");
+        assert!(!lines[0].contains("--full"), "two are fewer than the cap, so every one is listed: {lines:?}");
+        assert_eq!(lines.len() - 1, 2, "the probable false blocks are named even without --full: {lines:?}");
 
         let full = refusal_outcomes_at(&db, true, now);
         assert_eq!(full.len(), 3, "{full:?}");
-        assert!(full.iter().any(|l| l.starts_with("  probable false block: 'rule-weak' refused at log seq ") && l.contains("then weakened (check cleared) at log seq ")), "{full:?}");
-        assert!(full.iter().any(|l| l.starts_with("  probable false block: 'rule-gone' refused at log seq ") && l.contains("then retracted at log seq ")), "{full:?}");
+        assert!(full.iter().any(|l| l.starts_with("  probable false block: 'rule-weak' refused 'git push --force origin main' at log seq ") && l.contains(", then weakened (check cleared) at log seq ")), "{full:?}");
+        assert!(full.iter().any(|l| l.starts_with("  probable false block: 'rule-gone' refused 'git push --force origin main' at log seq ") && l.contains(", then retracted at log seq ")), "{full:?}");
         assert!(!full[0].contains("--full lists them"), "{full:?}");
 
         // Silent: every refusal is older than the 30 days.
@@ -5761,6 +5771,52 @@ mod tests {
             legacy_declare(&mut s, &force_rule("rule-quiet"));
         }
         assert!(refusal_outcomes_at(&quiet, true, now).is_empty());
+    }
+
+    /// A long list of probable false blocks stops at the cap and says how many
+    /// more there are, unless --full; a secret in a refused call is shown
+    /// redacted.
+    #[test]
+    fn refusal_outcomes_cap_the_named_blocks_and_redact_the_refused_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcripts = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let ids: Vec<String> = (0..10).map(|n| format!("rule-{n:02}")).collect();
+        {
+            let mut s = EventStore::new(&db).unwrap();
+            for (n, id) in ids.iter().enumerate() {
+                let mut r = rule(id);
+                r.text = format!("never run git push with --force ({id})");
+                r.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "git push".to_string() }];
+                r.check = Some(Check::Forbidden { literals: vec!["--force".to_string()] });
+                legacy_declare(&mut s, &r);
+                let command = if n == 0 {
+                    "git push --force --token ghp_abcdefghijklmnopqrstuvwxyz0123456789ABCD origin main".to_string()
+                } else {
+                    "git push --force origin main".to_string()
+                };
+                serve::attest::fixture::field_refusal(
+                    &mut s,
+                    transcripts.path(),
+                    serve::attest::fixture::SESSION,
+                    id,
+                    &format!("toolu_{n}"),
+                    "Bash",
+                    serde_json::json!({"command": command}),
+                    &command,
+                );
+                store::retract(&mut s, "s", "l", "mcp", id, "the --force check blocked a legitimate push", None).unwrap();
+            }
+        }
+        let now = serve::time::unix_from_iso8601("2026-10-01T00:00:00Z").unwrap();
+        let lines = refusal_outcomes_at(&db, false, now);
+        assert_eq!(lines.len(), 1 + model::store::FALSE_BLOCKS_LISTED + 1, "{lines:?}");
+        assert!(lines[0].contains("--full lists them all."), "{lines:?}");
+        assert_eq!(lines.last().unwrap(), "  probable false block: and 2 more, not listed here");
+        let first = lines.iter().find(|l| l.contains("'rule-00'")).expect("rule-00 is named");
+        assert!(first.contains("[redacted]") && !first.contains("ghp_abcdef"), "{first}");
+        let full = refusal_outcomes_at(&db, true, now);
+        assert_eq!(full.len(), 1 + 10, "--full names every one: {full:?}");
     }
 
     /// Step 14 (Z8, K14): doctor names every `answer-guard:` tag whose entry

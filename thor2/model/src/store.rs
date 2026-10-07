@@ -1322,6 +1322,14 @@ fn dispute_origin(events: &[Event], seq: i64) -> i64 {
     origin
 }
 
+/// The dispute `id` stands on today, in words (`dispute_in_words`): `Some` for
+/// a note by dispute or a rule kept with accept_refusing, `None` for a rule
+/// that carries none.
+pub fn current_dispute_in_words(store: &EventStore, id: &str) -> Option<String> {
+    let arguments = dispute_arguments(current_record(store, id)?.fields());
+    (!arguments.is_empty()).then(|| dispute_in_words(&arguments))
+}
+
 /// The reason the dispute `id` stands on today was written with: see
 /// `dispute_reason`. `None` for an item that carries no dispute, too.
 pub fn current_dispute_reason(store: &EventStore, id: &str) -> Option<String> {
@@ -1331,15 +1339,17 @@ pub fn current_dispute_reason(store: &EventStore, id: &str) -> Option<String> {
 }
 
 /// A later write by the agent that answers a dispute: a revise with a reason
-/// (`because`) after log seq `after` by anyone but THOR's own actors. It
-/// confirms the dispute (the reason restates why) - or it came with the check
-/// that replaced the dispute, which no longer carries one.
+/// (`because`, at least `DISPUTE_REASON_MIN_CHARS` characters - the same
+/// floor a dispute needs when it is written) after log seq `after` by anyone
+/// but THOR's own actors. It confirms the dispute (the reason restates why) -
+/// or it came with the check that replaced the dispute, which no longer
+/// carries one.
 fn dispute_answered_since(events: &[Event], after: i64) -> Option<&Event> {
     events.iter().find(|e| {
         e.seq > after
             && e.kind == EventKind::FactRevised
             && !RESERVED_ACTORS.contains(&e.actor.as_str())
-            && because_reason(&e.body).is_some_and(|r| !r.trim().is_empty())
+            && because_reason(&e.body).is_some_and(|r| r.trim().chars().count() >= DISPUTE_REASON_MIN_CHARS)
     })
 }
 
@@ -1354,6 +1364,10 @@ pub struct DisputeItem {
     /// The writer's reason; `None` for a dispute stored before one was required.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub because: Option<String>,
+    /// The files and folders the rule is bound to (its path and dir targets):
+    /// where a `may_change` span lives, so call 1 can name the file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
 }
 
 /// Every dispute of `project`'s rules (its own and global) that nobody has
@@ -1382,7 +1396,15 @@ pub fn unverified_disputes(store: &EventStore, project: &str, since: i64, carrie
             continue;
         }
         let because = dispute_reason(&events, last);
-        found.push((left_over, origin, DisputeItem { id, seq: origin, arguments, because }));
+        let files = item
+            .bindings
+            .iter()
+            .filter_map(|b| match b {
+                Binding::Target { kind: crate::item::TargetKind::Path | crate::item::TargetKind::Dir, value } => Some(value.clone()),
+                _ => None,
+            })
+            .collect();
+        found.push((left_over, origin, DisputeItem { id, seq: origin, arguments, because, files }));
     }
     found.sort_by(|a, b| {
         match (a.0, b.0) {
@@ -4705,6 +4727,11 @@ pub struct MachinePass {
     /// The ids of the disputes that did not fit; the next start lists them first.
     #[serde(default)]
     pub disputes_later_ids: Vec<String>,
+    /// THOR's health and the refusal outcomes known at the start, shown in the
+    /// start note so the agent can act before it files (`signals_so_far`).
+    /// `None` for a record written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signals: Option<SignalsSoFar>,
 }
 
 impl MachinePass {
@@ -6059,8 +6086,10 @@ fn check_evaluation_report_filing(store: &EventStore, item: &Item, ctx: Option<&
              the rule as it stands. See what it decides with `{}` - it prints the registered working copy it used, \
              every attempt, and a rule, a note, or the one fix you have to make yourself - then run the same command \
              with --apply to write the rule or the note it decided. Or mcp__thor__revise with only the rule's id, \
-             which runs the same trial and writes its verdict. A tag, a reason, an open point, a refusal on record or \
-             a probe settles nothing. Retract the rule with a reason if it is simply wrong",
+             which runs the same trial and writes its verdict (a DEMOTION line of the start note is the exception: a bare \
+             revise changes nothing a trial reads, so use that line's two exits - its retest command with --apply to \
+             accept the demotion, or the narrowing revise it shows to keep the tooth). A tag, a reason, an open point, \
+             a refusal on record or a probe settles nothing. Retract the rule with a reason if it is simply wrong",
             owed_now.len(),
             retest_command_for(store.path().as_deref(), first)
         ));
@@ -6080,8 +6109,9 @@ fn check_evaluation_report_filing(store: &EventStore, item: &Item, ctx: Option<&
              check_kind: \"forbidden\", check_literals: [\"<the literal>\"]) - or check_kind \"contains\" with \
              check_path and check_literal for a file - and name the literal in the rule's text. If it is only an \
              incidental span, confirm it with mcp__thor__revise(id: \"<id>\", because: \"<why this span may change \
-             while the rule stays true, at least {DISPUTE_REASON_MIN_CHARS} characters>\"). Either call settles it; a \
-             tag, a note elsewhere or a report that says it was checked settles nothing",
+             while the rule stays true, at least {DISPUTE_REASON_MIN_CHARS} characters>\") (a shorter reason is refused). Either \
+             call settles it, and so does retracting the rule with a reason when it is simply wrong; a tag, a note elsewhere or a \
+             report that says it was checked settles nothing",
             disputes_owed.len()
         ));
     }
@@ -6233,6 +6263,31 @@ pub fn check_in_words(check: &Check) -> String {
     }
 }
 
+/// A rule as `history` shows it at one step, in one line: its check, what it
+/// is bound to and its severity - what a reader needs to tell what a change
+/// took away. `None` for an item that can never fire.
+pub fn rule_as_it_stood(item: &Item) -> Option<String> {
+    if !item.kind.can_fire() {
+        return None;
+    }
+    let check = item.check.as_ref().map_or("none".to_string(), check_named);
+    let bound = item
+        .bindings
+        .iter()
+        .map(|b| match b {
+            Binding::Moment(action) => format!("moment {}", action.as_str()),
+            Binding::Target { kind, value } => {
+                let kind = serde_json::to_value(kind).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
+                format!("{kind} '{}'", plain(value))
+            }
+            Binding::Always => "always".to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let bound = if bound.is_empty() { "nothing".to_string() } else { bound };
+    Some(format!("check {}; bound to {bound}; severity {}", plain(&check), severity_name(item.severity)))
+}
+
 /// A check in full plain words: its kind, its literals and the file it
 /// reads - "forbidden '--force'", "contains 'only-owner' in files/INGRESS.md".
 /// A literal outside plain ASCII is named by its code point.
@@ -6322,7 +6377,12 @@ fn door_words(door: &WriteDoor) -> String {
         WriteDoor::OtherSessionPending { session } => {
             format!("a THOR call of another session, {}, not checked yet", plain(session))
         }
-        WriteDoor::Outside(door) => plain(door),
+        // The reason often reads "written by 'x' with no stamp ..." and every line
+        // that names a door already says "by": no second "by".
+        WriteDoor::Outside(door) => {
+            let door = plain(door);
+            door.strip_prefix("written by ").map(str::to_string).unwrap_or(door)
+        }
     }
 }
 
@@ -6591,14 +6651,389 @@ pub fn hook_faults_in(events: &[Event]) -> Vec<HookFault> {
 /// hook failures recorded and the filings refused as version skew, both from
 /// the log's own records so the evaluating session cannot edit them.
 fn health_line(window: &[Event]) -> String {
-    let hook_failures = hook_faults_in(window).len();
-    let skew_events = window
+    format!("\n{}", health_facts(window, "in the window").sentence)
+}
+
+/// A session id as a line shows it: its first eight characters.
+fn short_session(session: &str) -> String {
+    plain(session).chars().take(8).collect()
+}
+
+/// At most five names, then how many more.
+fn names_capped(names: Vec<String>) -> String {
+    const SHOWN: usize = 5;
+    let more = names.len().saturating_sub(SHOWN);
+    let mut out = names.into_iter().take(SHOWN).collect::<Vec<_>>().join("; ");
+    if more > 0 {
+        out.push_str(&format!("; and {more} more"));
+    }
+    out
+}
+
+/// THOR's own health in `window`, read from the log's records: the hook
+/// launch failures the attester recorded (each named by the hook event, its
+/// exit code and the session whose hook failed) and the filings the validator
+/// refused as version skew (each named by the report and the session).
+struct HealthFacts {
+    hook_failures: usize,
+    skew_events: usize,
+    sentence: String,
+}
+
+fn health_facts(window: &[Event], place: &str) -> HealthFacts {
+    let faults: Vec<String> = window
+        .iter()
+        .filter(|e| e.kind == EventKind::GateStoodAside && e.actor == ATTESTER_ACTOR)
+        .filter_map(|e| {
+            let body = serde_json::from_str::<serde_json::Value>(&e.body).ok()?;
+            let fault = serde_json::from_value::<HookFault>(body.get("hook_fault")?.clone()).ok()?;
+            Some(format!("{}, exit {}, session {}", plain(&fault.hook_event), fault.exit_code, short_session(&e.session_id)))
+        })
+        .collect();
+    let skews: Vec<String> = window
         .iter()
         .filter(|e| e.kind == EventKind::GateStoodAside && e.actor == EVAL_VALIDATOR_ACTOR)
         .filter_map(|e| serde_json::from_str::<EvaluationValidation>(&e.body).ok())
         .filter(|v| !v.valid && v.why.starts_with(SKEW_WHY))
-        .count();
-    format!("\nTHOR health in the window: {hook_failures} hook launch failure(s), {skew_events} version-skew event(s).")
+        .map(|v| format!("report '{}', session {}", plain(&v.report), short_session(&v.session)))
+        .collect();
+    let named = |names: &[String]| if names.is_empty() { String::new() } else { format!(" ({})", names_capped(names.to_vec())) };
+    let sentence = format!(
+        "THOR health {place}: {} hook launch failure(s){}, {} version-skew event(s){}.",
+        faults.len(),
+        named(&faults),
+        skews.len(),
+        named(&skews)
+    );
+    HealthFacts { hook_failures: faults.len(), skew_events: skews.len(), sentence }
+}
+
+/// The longest refused call a line shows, in characters.
+const REFUSED_CALL_SHOWN: usize = 120;
+
+/// How many probable false blocks the machine section, the start note and
+/// doctor name before they say how many more there are.
+pub const FALSE_BLOCKS_LISTED: usize = 8;
+
+/// The call a `gate_refused` event refused: the `target` of its body (the log
+/// redacted it when it was written, `serve::deliver::redact_secrets`), a
+/// secret shape masked once more, flattened to one plain line and cut to
+/// `REFUSED_CALL_SHOWN` characters. `None` when the body names no call.
+pub fn refused_call_excerpt(event: &Event) -> Option<String> {
+    let body = serde_json::from_str::<serde_json::Value>(&event.body).ok()?;
+    let target = body.get("target")?.as_str()?;
+    let mut masked = String::new();
+    let mut from = 0;
+    for found in crate::secrets::find(target) {
+        masked.push_str(&target[from..found.start]);
+        masked.push_str("[redacted]");
+        from = found.end;
+    }
+    masked.push_str(&target[from..]);
+    let flat = plain(&masked);
+    if flat.is_empty() {
+        return None;
+    }
+    Some(if flat.chars().count() > REFUSED_CALL_SHOWN {
+        format!("{}...", flat.chars().take(REFUSED_CALL_SHOWN).collect::<String>())
+    } else {
+        flat
+    })
+}
+
+/// A string as a call writes it: JSON, with every character outside plain
+/// ASCII named by its escape, so a rule about a dash survives a plain-text
+/// reply.
+pub fn ascii_json(text: &str) -> String {
+    let mut out = String::new();
+    for c in serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string()).chars() {
+        if c.is_ascii() {
+            out.push(c);
+        } else {
+            let mut units = [0u16; 2];
+            for unit in c.encode_utf16(&mut units) {
+                out.push_str(&format!("\\u{unit:04x}"));
+            }
+        }
+    }
+    out
+}
+
+/// A check as the `check_*` arguments of a remember or revise call.
+fn check_arguments(check: &Check) -> String {
+    let list = |literals: &[String]| literals.iter().map(|l| ascii_json(l)).collect::<Vec<_>>().join(", ");
+    match check {
+        Check::PathExists { path } => format!("check_kind: \"path_exists\", check_path: {}", ascii_json(path)),
+        Check::Contains { path, literal } => {
+            format!("check_kind: \"contains\", check_path: {}, check_literal: {}", ascii_json(path), ascii_json(literal))
+        }
+        Check::Absent { path, literal } => {
+            format!("check_kind: \"absent\", check_path: {}, check_literal: {}", ascii_json(path), ascii_json(literal))
+        }
+        Check::AbsentAll { path, literals } => {
+            format!("check_kind: \"absent_all\", check_path: {}, check_literals: [{}]", ascii_json(path), list(literals))
+        }
+        Check::Forbidden { literals } => format!("check_kind: \"forbidden\", check_literals: [{}]", list(literals)),
+        Check::Requires { when, required } => {
+            let mut all = vec![when.clone()];
+            all.extend(required.iter().cloned());
+            format!("check_kind: \"requires\", check_literals: [{}]", list(&all))
+        }
+    }
+}
+
+/// Bindings as the `moments`, `targets` and `always` arguments of a call.
+fn binding_arguments(bindings: &[Binding]) -> String {
+    let moments: Vec<String> = bindings
+        .iter()
+        .filter_map(|b| match b {
+            Binding::Moment(action) => Some(ascii_json(action.as_str())),
+            _ => None,
+        })
+        .collect();
+    let targets: Vec<String> = bindings
+        .iter()
+        .filter_map(|b| match b {
+            Binding::Target { kind, value } => {
+                let kind = serde_json::to_value(kind).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
+                Some(format!("{{kind: {}, value: {}}}", ascii_json(&kind), ascii_json(value)))
+            }
+            _ => None,
+        })
+        .collect();
+    let always = bindings.iter().any(|b| matches!(b, Binding::Always));
+    format!("moments: [{}], targets: [{}], always: {always}", moments.join(", "), targets.join(", "))
+}
+
+/// The call that puts a rule back the way it stood when it refused: a revise
+/// naming only what differs from the rule as it reads now, or - for a rule
+/// that is retracted - a remember of the whole rule under a NEW id (the old id
+/// stays retracted: a second remember on it would leave the id with two heads,
+/// which `get` refuses to read until a resolve). A
+/// weakening that was a mistake takes this and a reason.
+fn restore_call(id: &str, then: &Item, now: Option<&Item>) -> String {
+    let because = "because: \"<why the weakening was a mistake - at least 20 characters>\"";
+    let Some(now) = now else {
+        let mut args = vec![
+            format!("id: {}", ascii_json(&format!("{id}-restored"))),
+            format!("kind: {}", ascii_json(&serde_json::to_value(then.kind).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_else(|| "rule".to_string()))),
+            format!("text: {}", ascii_json(&then.text)),
+        ];
+        if then.severity.is_some() {
+            args.push(format!("severity: {}", ascii_json(severity_name(then.severity))));
+        }
+        if let Some(project) = &then.project {
+            args.push(format!("project: {}", ascii_json(project)));
+        }
+        if let Some(falsifier) = &then.falsifier {
+            args.push(format!("falsifier: {}", ascii_json(falsifier)));
+        }
+        args.push(format!("tags: [{}]", ascii_json(&format!("restored-from:{id}"))));
+        args.push(binding_arguments(&then.bindings));
+        if let Some(check) = &then.check {
+            args.push(check_arguments(check));
+        }
+        return format!("mcp__thor__remember({})", args.join(", "));
+    };
+    let mut args = vec![format!("id: {}", ascii_json(id))];
+    if then.text != now.text {
+        args.push(format!("text: {}", ascii_json(&then.text)));
+    }
+    if then.check != now.check {
+        if let Some(check) = &then.check {
+            args.push(check_arguments(check));
+        }
+    }
+    if then.bindings != now.bindings {
+        args.push(binding_arguments(&then.bindings));
+    }
+    if then.severity != now.severity {
+        match then.severity {
+            Some(_) => args.push(format!("severity: {}", ascii_json(severity_name(then.severity)))),
+            None => args.push("clear_severity: true".to_string()),
+        }
+    }
+    if args.len() == 1 {
+        return "nothing to restore: the rule already reads as it did when it refused".to_string();
+    }
+    args.push(because.to_string());
+    format!("mcp__thor__revise({})", args.join(", "))
+}
+
+/// One probable false block: a refusal of a real call followed by a weakening
+/// or retract of the refusing rule by someone other than THOR.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FalseBlock {
+    pub rule: String,
+    /// "'rule': refused 'call' at log seq N, then weakened (check cleared) at log seq M".
+    pub line: String,
+    /// The call that restores the rule, when the refusal was right
+    /// (`restore_call`).
+    pub restore: String,
+}
+
+struct RefusalOutcomes {
+    verified: usize,
+    probable: usize,
+    blocks: Vec<FalseBlock>,
+}
+
+/// The real refusals the hook made in `window` (the same ones the REFUSED
+/// line calls verified, the evaluating session's own calls left out) and what
+/// became of each refusing rule before the log position `log` reads to.
+fn refusal_outcomes(log: &LogAt, window: &[Event], session: &str) -> RefusalOutcomes {
+    let in_window: HashSet<i64> = window
+        .iter()
+        .filter(|e| e.kind == EventKind::GateRefused && e.actor == ASSISTANT_DELIVERY_ACTOR && e.session_id != session)
+        .map(|e| e.seq)
+        .collect();
+    let rules: std::collections::BTreeSet<&str> =
+        window.iter().filter(|e| in_window.contains(&e.seq)).map(|e| e.entity_id.as_str()).collect();
+    let mut out = RefusalOutcomes { verified: 0, probable: 0, blocks: Vec::new() };
+    for rule in rules {
+        let events = log.entity(rule);
+        let verdicts = recorded_refusal_verdicts(&events);
+        let is_real = |e: &Event, _: &Item, _: i64| in_window.contains(&e.seq) && verdicts.get(&e.seq).is_some_and(|(field, _)| *field);
+        for fate in crate::refusal_outcome::fates(rule, &events, &is_real, &|_, _| true) {
+            out.verified += 1;
+            if !fate.probable_false_block() {
+                continue;
+            }
+            out.probable += 1;
+            let call = events
+                .iter()
+                .find(|e| e.seq == fate.refusal_seq)
+                .and_then(refused_call_excerpt)
+                .map_or("a call whose text the log did not keep".to_string(), |c| format!("'{c}'"));
+            let then = match &fate.fate {
+                crate::refusal_outcome::Fate::Weakened(labels) => {
+                    format!("weakened ({}) at log seq {}", plain(labels), fate.fate_seq.unwrap_or_default())
+                }
+                _ => format!("retracted at log seq {}", fate.fate_seq.unwrap_or_default()),
+            };
+            let now = item_before(&events, log.until.saturating_add(1));
+            out.blocks.push(FalseBlock {
+                rule: plain(rule),
+                line: format!("'{}': refused {call} at log seq {}, then {then}", plain(rule), fate.refusal_seq),
+                restore: restore_call(&plain(rule), &fate.then, now.as_ref()),
+            });
+        }
+    }
+    out
+}
+
+/// The summary sentence of REFUSAL OUTCOMES for `place` ("in the window").
+fn refusal_outcomes_sentence(o: &RefusalOutcomes, place: &str) -> String {
+    if o.verified == 0 {
+        return format!("REFUSAL OUTCOMES {place}: no verified refusal {place} to follow.");
+    }
+    format!(
+        "REFUSAL OUTCOMES {place}: {} verified refusal(s), {} followed by a weakening or retract of the \
+         refusing rule (probable false blocks), {}. A proxy read from the log: a rule can change for other reasons, and it \
+         feeds no ranking and no gate.",
+        o.verified,
+        o.probable,
+        crate::refusal_outcome::rate_words(o.probable, o.verified)
+    )
+}
+
+/// The lines under REFUSAL OUTCOMES: each probable false block, at most
+/// `FALSE_BLOCKS_LISTED`, then how many more there are.
+fn false_block_lines(blocks: &[FalseBlock]) -> String {
+    if blocks.is_empty() {
+        return String::new();
+    }
+    let mut out = format!(
+        "\nprobable false blocks, each with the call that was refused and what followed (at most {FALSE_BLOCKS_LISTED} are listed):"
+    );
+    for block in blocks.iter().take(FALSE_BLOCKS_LISTED) {
+        out.push_str(&format!("\n- {}", block.line));
+    }
+    if blocks.len() > FALSE_BLOCKS_LISTED {
+        out.push_str(&format!("\n- and {} more, not listed here", blocks.len() - FALSE_BLOCKS_LISTED));
+    }
+    out
+}
+
+/// What the start note shows before the agent files, from the log up to the
+/// start: THOR's own health and the refusal outcomes since the previous
+/// report. Frozen with the start, so the note shows the same on every read;
+/// the machine section of the filed report records the final window.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignalsSoFar {
+    /// "THOR health since the previous report: ...".
+    pub health: String,
+    pub hook_failures: usize,
+    pub skew_events: usize,
+    /// "REFUSAL OUTCOMES since the previous report: ...".
+    pub refusals: String,
+    /// The probable false blocks, at most `FALSE_BLOCKS_LISTED`.
+    pub false_blocks: Vec<FalseBlock>,
+    /// How many more there were.
+    pub false_blocks_more: usize,
+}
+
+/// `SignalsSoFar` for the events after log seq `prev_report_seq` (the project's
+/// previous report, 0 for none) up to `started_seq`, judged from `session`'s
+/// side: its own refused calls are left out, as in the machine section.
+pub fn signals_so_far(store: &EventStore, session: &str, prev_report_seq: i64, started_seq: i64) -> SignalsSoFar {
+    let window: Vec<Event> =
+        store.events_since(prev_report_seq).unwrap_or_default().into_iter().filter(|e| e.seq <= started_seq).collect();
+    let health = health_facts(&window, "since the previous report");
+    let log = LogAt::new(store, started_seq);
+    let outcomes = refusal_outcomes(&log, &window, session);
+    SignalsSoFar {
+        health: health.sentence,
+        hook_failures: health.hook_failures,
+        skew_events: health.skew_events,
+        refusals: refusal_outcomes_sentence(&outcomes, "since the previous report"),
+        false_blocks_more: outcomes.blocks.len().saturating_sub(FALSE_BLOCKS_LISTED),
+        false_blocks: outcomes.blocks.into_iter().take(FALSE_BLOCKS_LISTED).collect(),
+    }
+}
+
+/// DISPUTES TO VERIFY of the machine section: the disputes the start froze
+/// and how each stood at F - verified by call 1 (a check hung), by call 2 (a
+/// reason of at least twenty characters), settled by a retract, or not
+/// verified. From each rule's own events; the evaluating session types none
+/// of it.
+fn frozen_disputes_section(log: &LogAt, start: &EvaluationStart, session: &str) -> String {
+    let list = start.frozen.dispute_list();
+    let mut out = format!("\n\nDISPUTES TO VERIFY (frozen at the start): {} rule(s).", list.len());
+    for dispute in list {
+        let events = log.entity(&dispute.id);
+        let verdicts = recorded_write_verdicts(&events);
+        let door = |e: &Event| door_words(&write_door(e, &verdicts, session));
+        let settled = events
+            .iter()
+            .filter(|e| e.seq > start.frozen.started_seq && changes_an_item(e.kind) && !RESERVED_ACTORS.contains(&e.actor.as_str()))
+            .find_map(|e| {
+                if e.kind == EventKind::FactRetracted {
+                    return Some(format!(
+                        "settled by a retract at log seq {} by {} - reason: {}",
+                        e.seq,
+                        door(e),
+                        plain(&tombstone_reason(&e.body))
+                    ));
+                }
+                let (before, after) = (item_before(&events, e.seq)?, parse_body(&e.body).ok()?);
+                if after.check.is_some() && after.check != before.check {
+                    let hung = after.check.as_ref().map(check_named).unwrap_or_default();
+                    return Some(format!("verified by call 1 (a check was hung: {}) at log seq {} by {}", plain(&hung), e.seq, door(e)));
+                }
+                let because = because_reason(&e.body).filter(|r| r.trim().chars().count() >= DISPUTE_REASON_MIN_CHARS)?;
+                Some(format!("verified by call 2 (the dispute confirmed) at log seq {} by {} - reason: {}", e.seq, door(e), plain(&because)))
+            });
+        let last_record = events.iter().rev().find_map(|e| trial_of(e).ok().flatten());
+        let line = settled.unwrap_or_else(|| match last_record {
+            Some(record) if dispute_arguments(record.fields()).is_empty() => {
+                "no dispute stands on it any more (a later trial of THOR's own replaced it)".to_string()
+            }
+            _ => "NOT verified - the report is held until a call settles it".to_string(),
+        });
+        out.push_str(&format!("\n- '{}': {line}", plain(&dispute.id)));
+    }
+    out
 }
 
 pub fn render_machine_section(store: &EventStore, start: &EvaluationStart, filed_seq: i64) -> String {
@@ -6805,7 +7240,7 @@ fn machine_section(store: &EventStore, start: &EvaluationStart, filed_seq: i64) 
                         Some(new) if check_file_of(old) != check_file_of(new) => {
                             format!("check moved from {} to {}", plain(&check_in_words(old)), plain(&check_in_words(new)))
                         }
-                        Some(new) => format!("check changed from {} to {}", plain(&check_in_words(old)), plain(&check_in_words(new))),
+                        Some(new) => format!("check changed from {} to {}", plain(&check_named(old)), plain(&check_named(new))),
                     };
                     checks.push(format!("\n- '{id}': {what} at log seq {} by {door} - reason: {}", event.seq, because()));
                 }
@@ -6868,6 +7303,7 @@ fn machine_section(store: &EventStore, start: &EvaluationStart, filed_seq: i64) 
     checks.iter().for_each(|line| out.push_str(line));
     summary.checks_weakened = checks.len();
     out.push_str(&disputes_in_window(&window, &log, project, session));
+    out.push_str(&frozen_disputes_section(&log, start, session));
 
     // ---- OPEN POINTS: THOR's own as the start's pass left them, each with
     // how many valid evaluations carried it (recorded by the validator,
@@ -6992,32 +7428,8 @@ fn machine_section(store: &EventStore, start: &EvaluationStart, filed_seq: i64) 
 /// F, by a weakening or retract of the refusing rule - a probable false
 /// block (`crate::refusal_outcome`). Derived from the log, never typed.
 fn refusal_outcomes_line(log: &LogAt, window: &[Event], session: &str) -> String {
-    let in_window: HashSet<i64> = window
-        .iter()
-        .filter(|e| e.kind == EventKind::GateRefused && e.actor == ASSISTANT_DELIVERY_ACTOR && e.session_id != session)
-        .map(|e| e.seq)
-        .collect();
-    let rules: std::collections::BTreeSet<&str> =
-        window.iter().filter(|e| in_window.contains(&e.seq)).map(|e| e.entity_id.as_str()).collect();
-    let (mut verified, mut probable) = (0usize, 0usize);
-    for rule in rules {
-        let events = log.entity(rule);
-        let verdicts = recorded_refusal_verdicts(&events);
-        let is_real = |e: &Event, _: &Item, _: i64| in_window.contains(&e.seq) && verdicts.get(&e.seq).is_some_and(|(field, _)| *field);
-        for fate in crate::refusal_outcome::fates(rule, &events, &is_real, &|_, _| true) {
-            verified += 1;
-            probable += usize::from(fate.probable_false_block());
-        }
-    }
-    if verified == 0 {
-        return "\nREFUSAL OUTCOMES in the window: no verified refusal in the window to follow.".to_string();
-    }
-    format!(
-        "\nREFUSAL OUTCOMES in the window: {verified} verified refusal(s), {probable} followed by a weakening or retract of the \
-         refusing rule (probable false blocks), {}. A proxy read from the log: a rule can change for other reasons, and it \
-         feeds no ranking and no gate.",
-        crate::refusal_outcome::rate_words(probable, verified)
-    )
+    let outcomes = refusal_outcomes(log, window, session);
+    format!("\n{}{}", refusal_outcomes_sentence(&outcomes, "in the window"), false_block_lines(&outcomes.blocks))
 }
 
 /// The actor that records a filing's validation (step 16).
@@ -7623,6 +8035,9 @@ pub struct Revision {
     /// one: the fragment an old contains check guards although the rule's
     /// text does not name it - shown on the step's own line.
     pub a4_old_stock: Option<OldContainsStock>,
+    /// For a `gate_refused` step: the call the hook refused, as the log kept
+    /// it (redacted when it was written) and cut short - `refused_call_excerpt`.
+    pub refused_call: Option<String>,
 }
 
 /// The whole revision log for one id, oldest first, including retractions.
@@ -7640,6 +8055,7 @@ pub fn history(store: &EventStore, entity_id: &str) -> Result<Vec<Revision>, Rea
             item: parse_body(&e.body).ok(),
             because: because_reason(&e.body),
             a4_old_stock: trial_of(&e).ok().flatten().and_then(|r| r.fields().a4_old_stock.clone()),
+            refused_call: if e.kind == EventKind::GateRefused { refused_call_excerpt(&e) } else { None },
         })
         .collect())
 }
@@ -10542,6 +10958,85 @@ mod tests {
         assert_eq!(current_dispute_reason(&store, "no-such-item"), None);
     }
 
+    /// A refusal in an item's history carries the call it refused, as the
+    /// log kept it (redacted when it was written), cut to a short excerpt -
+    /// so a reader can tell a wrong refusal from a right one.
+    #[test]
+    fn history_carries_the_call_a_refusal_refused() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "hr-session", "l", "test", &plain_note("hr-rule")).unwrap();
+        let body = r#"{"at":"2026-10-01T00:00:00Z","target":"git push --force-with-lease origin main","tool_use_id":"toolu_1"}"#;
+        store.append_event("other", "other", "hook", EventKind::GateRefused, "hr-rule", None, body).unwrap();
+        store.append_event("other", "other", "hook", EventKind::GateRefused, "hr-rule", None, "not json").unwrap();
+        let steps = history(&store, "hr-rule").unwrap();
+        assert_eq!(steps[0].refused_call, None, "a write refused nothing");
+        assert_eq!(steps[1].refused_call.as_deref(), Some("git push --force-with-lease origin main"));
+        assert_eq!(steps[2].refused_call, None, "a body that is not readable names no call");
+    }
+
+    /// A reason that is not one settles nothing: the confirm call (call 2)
+    /// needs the same twenty characters a dispute needs when it is written.
+    #[test]
+    fn a_filler_reason_does_not_answer_a_frozen_dispute() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare_disputed(&mut store, "dsp-filler", Some("the version line moves with every release"), may_change("version"));
+        let first = record_start_only(&mut store, "gf-session", "demo");
+        let pass = MachinePass { disputes: unverified_disputes(&store, "demo", 0, &[]), ..MachinePass::default() };
+        let start = record_evaluation_batch(&mut store, SystemActor::new(EVAL_MACHINE_ACTOR), &first, "fixture", vec![], 0, vec![], pass).unwrap();
+        let existing = show(&store, "dsp-filler").unwrap();
+        for filler in ["ok", "it is fine", "checked, it stands"] {
+            revise_tried_scoped(&mut store, "gf-session", "l", "a", &existing, &existing, &existing, Some(filler), None, None, None, None).unwrap();
+            assert_eq!(evaluation_frozen_disputes_owed(&store, &start).len(), 1, "'{filler}' answers nothing");
+        }
+        revise_tried_scoped(&mut store, "gf-session", "l", "a", &existing, &existing, &existing, Some("only the version number moves, never the rule"), None, None, None, None).unwrap();
+        assert!(evaluation_frozen_disputes_owed(&store, &start).is_empty(), "twenty characters of reason answer it");
+    }
+
+    /// The disputes the agent verified stay visible in the machine section,
+    /// one line each: by call 1 (a check hung), by call 2 (a reason), by a
+    /// retract, or still unverified - read from the log, never typed.
+    #[test]
+    fn the_machine_section_lists_how_each_frozen_dispute_was_verified() {
+        let mut store = EventStore::in_memory().unwrap();
+        for id in ["fd-call-one", "fd-call-two", "fd-retracted", "fd-open"] {
+            declare_disputed(&mut store, id, Some("the span is only an example"), may_change("version"));
+        }
+        let first = record_start_only(&mut store, "fd-session", "demo");
+        let pass = MachinePass { disputes: unverified_disputes(&store, "demo", 0, &[]), ..MachinePass::default() };
+        let start = record_evaluation_batch(&mut store, SystemActor::new(EVAL_MACHINE_ACTOR), &first, "fixture", vec![], 0, vec![], pass).unwrap();
+        assert_eq!(start.frozen.dispute_list().len(), 4);
+
+        let one = show(&store, "fd-call-one").unwrap();
+        let mut hung = one.clone();
+        hung.text = "Never run `git bundle create` on the staging repository.".to_string();
+        hung.check = Some(Check::Forbidden { literals: vec!["git bundle create".to_string()] });
+        revise_tried_scoped(&mut store, "fd-session", "l", "a", &one, &hung, &one, None, None, None, None, None).unwrap();
+        let two = show(&store, "fd-call-two").unwrap();
+        revise_tried_scoped(&mut store, "fd-session", "l", "a", &two, &two, &two, Some("only the version number moves, never the rule"), None, None, None, None).unwrap();
+        retract(&mut store, "fd-session", "l", "a", "fd-retracted", "the rule it guarded was removed", None).unwrap();
+
+        let filed_seq = store.get_next_seq().unwrap() - 1;
+        let section = render_machine_section(&store, &start, filed_seq);
+        assert!(section.contains("\n\nDISPUTES TO VERIFY (frozen at the start): 4 rule(s)."), "{section}");
+        assert!(section.contains("\n- 'fd-call-one': verified by call 1 (a check was hung: forbidden 'git bundle create') at log seq"), "{section}");
+        assert!(section.contains("\n- 'fd-call-two': verified by call 2 (the dispute confirmed) at log seq"), "{section}");
+        assert!(section.contains(" - reason: only the version number moves, never the rule"), "{section}");
+        assert!(section.contains("\n- 'fd-retracted': settled by a retract at log seq"), "{section}");
+        assert!(section.contains(" - reason: the rule it guarded was removed"), "{section}");
+        assert!(section.contains("\n- 'fd-open': NOT verified"), "{section}");
+        assert!(section.is_ascii() && !section.contains('\r'), "plain ASCII, LF only");
+    }
+
+    /// A start with no frozen dispute says so in one line.
+    #[test]
+    fn a_machine_section_with_no_frozen_dispute_says_none() {
+        let mut store = EventStore::in_memory().unwrap();
+        let start = record_start(&mut store, "fn-session", "demo");
+        let filed_seq = store.get_next_seq().unwrap() - 1;
+        let section = render_machine_section(&store, &start, filed_seq);
+        assert!(section.contains("\n\nDISPUTES TO VERIFY (frozen at the start): 0 rule(s)."), "{section}");
+    }
+
     /// Which disputes an evaluation hands to the agent: the ones written since
     /// the previous report, plus the left-over ones first, minus the answered.
     #[test]
@@ -10666,8 +11161,155 @@ mod tests {
         assert!(line.contains("2 followed by a weakening or retract of the refusing rule (probable false blocks)"), "{line}");
         assert!(line.contains(&crate::refusal_outcome::rate_words(2, 3)), "{line}");
         assert!(line.contains("A proxy"), "{line}");
+        // Each probable false block is named: the rule, the refused call, and
+        // what followed. The one left alone, the unverified and the evaluating
+        // session's own are not listed.
+        assert!(
+            section.contains("\nprobable false blocks, each with the call that was refused and what followed (at most 8 are listed):"),
+            "{section}"
+        );
+        assert!(
+            section.contains("\n- 'ro-weak': refused 'files/x.md' at log seq") && section.contains(", then weakened (check cleared) at log seq"),
+            "{section}"
+        );
+        assert!(
+            section.contains("\n- 'ro-gone': refused 'files/x.md' at log seq") && section.contains(", then retracted at log seq"),
+            "{section}"
+        );
+        for quiet in ["- 'ro-same'", "- 'ro-own'", "- 'ro-unverified'"] {
+            assert!(!section.contains(quiet), "{quiet} is no probable false block: {section}");
+        }
         assert!(section.is_ascii() && !section.contains('\r'), "plain ASCII, LF only");
         assert_eq!(render_machine_section(&store, &start, filed_seq), section, "pure");
+    }
+
+    /// What the start note shows before the agent files: THOR's health and the
+    /// refusal outcomes between the previous report and the start, each
+    /// probable false block with the exact call that would put the rule back.
+    #[test]
+    fn signals_so_far_name_the_health_and_the_false_blocks_before_the_start() {
+        let mut store = EventStore::in_memory().unwrap();
+        let attester = SystemActor::new(ATTESTER_ACTOR);
+        // Before the previous report: not in the window.
+        assert!(record_hook_fault(&mut store, "mp-session", attester, &hook_fault("old")).unwrap().is_some());
+        let prev_report_seq = store.get_next_seq().unwrap() - 1;
+        for (id, literal) in [("sg-weak", "keep me"), ("sg-gone", "keep it")] {
+            let mut item = checked_sample();
+            item.id = id.to_string();
+            item.project = Some("mp".to_string());
+            item.text = format!("The file files/{id}.md keeps the line `{literal}` and nothing else.");
+            item.bindings = vec![Binding::Target { kind: crate::item::TargetKind::Path, value: format!("files/{id}.md") }];
+            item.check = Some(Check::Contains { path: format!("files/{id}.md"), literal: literal.to_string() });
+            item.tags.clear();
+            declare(&mut store, "mp-session", "l", "test", &item).unwrap();
+        }
+        assert!(record_hook_fault(&mut store, "other-session", attester, &hook_fault("new")).unwrap().is_some());
+        for id in ["sg-weak", "sg-gone"] {
+            let body = r#"{"at":"2026-10-01T00:00:00Z","target":"files/x.md","tool_use_id":"toolu_1"}"#;
+            let seq = store.append_event("other-session", "other-session", "hook", EventKind::GateRefused, id, None, body).unwrap().seq;
+            record_refusal_verification(&mut store, "other-session", attester, id, seq, true, "fixture").unwrap();
+        }
+        let weak = show(&store, "sg-weak").unwrap();
+        let mut cleared = weak.clone();
+        cleared.check = None;
+        let baseline = gate::ClearedFields { check: true, ..Default::default() }.baseline(&weak);
+        revise_because(&mut store, "mp-session", "l", "mcp", &baseline, &cleared, &weak, Some("the file is gone")).unwrap();
+        retract(&mut store, "shell", "l", "cli", "sg-gone", "files/sg-gone.md is gone", None).unwrap();
+        let started_seq = store.get_next_seq().unwrap() - 1;
+        // After the start: never in the window.
+        assert!(record_hook_fault(&mut store, "other-session", attester, &hook_fault("later")).unwrap().is_some());
+
+        let signals = signals_so_far(&store, "mp-session", prev_report_seq, started_seq);
+        assert_eq!(
+            signals.health,
+            "THOR health since the previous report: 1 hook launch failure(s) (SessionStart, exit 126, session other-se), 0 version-skew event(s)."
+        );
+        assert_eq!((signals.hook_failures, signals.skew_events), (1, 0));
+        assert!(signals.refusals.starts_with("REFUSAL OUTCOMES since the previous report: 2 verified refusal(s), 2 followed by"), "{}", signals.refusals);
+        let rules: Vec<&str> = signals.false_blocks.iter().map(|b| b.rule.as_str()).collect();
+        assert_eq!(rules, ["sg-gone", "sg-weak"]);
+        assert_eq!(signals.false_blocks_more, 0);
+        let weak = signals.false_blocks.iter().find(|b| b.rule == "sg-weak").unwrap();
+        assert!(weak.line.starts_with("'sg-weak': refused 'files/x.md' at log seq"), "{}", weak.line);
+        assert_eq!(
+            weak.restore,
+            "mcp__thor__revise(id: \"sg-weak\", check_kind: \"contains\", check_path: \"files/sg-weak.md\", check_literal: \"keep me\", \
+             because: \"<why the weakening was a mistake - at least 20 characters>\")"
+        );
+        let gone = signals.false_blocks.iter().find(|b| b.rule == "sg-gone").unwrap();
+        assert!(gone.line.contains(", then retracted at log seq"), "{}", gone.line);
+        assert!(
+            gone.restore.starts_with("mcp__thor__remember(id: \"sg-gone-restored\", kind: \"orientation\", text: \"The file files/sg-gone.md keeps the line `keep it`"),
+            "{}",
+            gone.restore
+        );
+        assert!(gone.restore.contains("tags: [\"restored-from:sg-gone\"]"), "{}", gone.restore);
+        assert!(gone.restore.contains("targets: [{kind: \"path\", value: \"files/sg-gone.md\"}]"), "{}", gone.restore);
+        assert!(gone.restore.contains("check_kind: \"contains\", check_path: \"files/sg-gone.md\", check_literal: \"keep it\""), "{}", gone.restore);
+        assert!(signals.health.is_ascii() && gone.restore.is_ascii() && weak.restore.is_ascii());
+    }
+
+    /// A rule about a typographic character survives a plain-ASCII reply: the
+    /// character is named by its escape in the restore call.
+    #[test]
+    fn a_restore_call_names_a_non_ascii_character_by_its_escape() {
+        let mut then = checked_sample();
+        then.text = "Never write a dash like \u{2014} in prose.".to_string();
+        then.check = Some(Check::Forbidden { literals: vec!["\u{2014}".to_string()] });
+        let call = restore_call("typo", &then, None);
+        assert!(call.is_ascii(), "{call}");
+        assert!(call.contains("check_kind: \"forbidden\", check_literals: [\"\\u2014\"]"), "{call}");
+        let mut now = then.clone();
+        now.check = None;
+        assert_eq!(
+            restore_call("typo", &then, Some(&now)),
+            "mcp__thor__revise(id: \"typo\", check_kind: \"forbidden\", check_literals: [\"\\u2014\"], because: \"<why the weakening was a mistake - at least 20 characters>\")"
+        );
+        assert_eq!(restore_call("typo", &then, Some(&then)), "nothing to restore: the rule already reads as it did when it refused");
+    }
+
+    /// The list of probable false blocks is capped, with the rest counted, so
+    /// a noisy window cannot swell the section; a refused call carrying a
+    /// secret shows it redacted, and a long call is cut.
+    #[test]
+    fn the_probable_false_blocks_are_capped_and_the_refused_call_is_redacted_and_cut() {
+        let mut store = EventStore::in_memory().unwrap();
+        let mut ids = Vec::new();
+        for n in 0..10 {
+            let mut item = checked_sample();
+            item.id = format!("cap-{n:02}");
+            item.project = Some("mp".to_string());
+            item.text = format!("The file files/cap-{n:02}.md keeps the line `keep me` number {n} and nothing else.");
+            item.bindings = vec![Binding::Target { kind: crate::item::TargetKind::Path, value: format!("files/cap-{n:02}.md") }];
+            item.check = Some(Check::Contains { path: format!("files/cap-{n:02}.md"), literal: "keep me".to_string() });
+            item.tags.clear();
+            declare(&mut store, "mp-session", "l", "test", &item).unwrap();
+            ids.push(item.id);
+        }
+        let start = record_start(&mut store, "mp-session", "mp");
+        let long = "x".repeat(300);
+        for (n, id) in ids.iter().enumerate() {
+            let target = match n {
+                0 => "curl -H 'Authorization: Bearer ghp_abcdefghijklmnopqrstuvwxyz0123456789ABCD' https://example.test".to_string(),
+                1 => long.clone(),
+                _ => "files/x.md".to_string(),
+            };
+            let body = serde_json::json!({"at": "2026-10-01T00:00:00Z", "target": target, "tool_use_id": "toolu_1"}).to_string();
+            let seq = store.append_event("other-session", "other-session", "hook", EventKind::GateRefused, id, None, &body).unwrap().seq;
+            record_refusal_verification(&mut store, "other-session", SystemActor::new(ATTESTER_ACTOR), id, seq, true, "fixture").unwrap();
+            retract(&mut store, "shell", "l", "cli", id, &format!("files/{id}.md is gone"), None).unwrap();
+        }
+        let filed_seq = store.get_next_seq().unwrap() - 1;
+        let section = render_machine_section(&store, &start, filed_seq);
+        assert!(section.contains("10 verified refusal(s), 10 followed by a weakening or retract"), "{section}");
+        let from = section.find("\nprobable false blocks, each with").expect(&section);
+        let block = &section[from..from + section[from..].find("\n\n").expect(&section)];
+        assert_eq!(block.matches("\n- 'cap-").count(), 8, "eight are listed: {block}");
+        assert!(block.ends_with("\n- and 2 more, not listed here"), "{block}");
+        let first = block.lines().find(|l| l.starts_with("- 'cap-00'")).expect(block);
+        assert!(first.contains("[redacted]") && !first.contains("ghp_abcdef"), "a secret is redacted: {first}");
+        let second = block.lines().find(|l| l.starts_with("- 'cap-01'")).expect(block);
+        assert!(second.contains(&format!("{}...'", "x".repeat(100))) && !second.contains(&"x".repeat(200)), "a long call is cut: {second}");
     }
 
     /// THE OWNER'S GO (step 26), at the write gate: the marker of a rule marked
@@ -10904,7 +11546,13 @@ mod tests {
 
         let filed_seq = store.get_next_seq().unwrap() - 1;
         let section = render_machine_section(&store, &start, filed_seq);
-        assert!(section.contains("\nTHOR health in the window: 2 hook launch failure(s), 1 version-skew event(s).\n"), "{section}");
+        assert!(
+            section.contains(
+                "\nTHOR health in the window: 2 hook launch failure(s) (SessionStart, exit 126, session mp-sessi; SessionStart, \
+                 exit 126, session other-se), 1 version-skew event(s) (report 'eval-mp-a', session mp-sessi).\n"
+            ),
+            "the health line names each failure's hook event and session: {section}"
+        );
         assert_eq!(render_machine_section(&store.truncated_copy(filed_seq).unwrap(), &start, filed_seq), section, "pure at F");
 
         let mut quiet = EventStore::in_memory().unwrap();

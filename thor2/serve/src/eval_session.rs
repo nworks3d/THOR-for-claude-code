@@ -494,6 +494,39 @@ fn agent_call(id: &str) -> String {
     format!("mcp__thor__revise(id: \"{id}\")")
 }
 
+/// The call for exit (b) of a DEMOTION: the revise THOR's trial accepts, which
+/// rewords the text to name only the forms the check catches, narrows the
+/// check to those literals, and says why. Naming the literals and a reason is
+/// what makes it a change a trial reads (taking a quoted form out of the text
+/// is a weakening that needs a `because`). `refused` is what the trial
+/// refused; with none, or a check that is not a forbidden command check, the
+/// agent's own words stand where THOR cannot know them.
+fn demotion_call(id: &str, head: Option<&model::item::Item>, refused: &[String]) -> String {
+    let because = format!(
+        "because: \"<why the rule now names only the forms its check catches - at least {} characters>\"",
+        model::store::DISPUTE_REASON_MIN_CHARS
+    );
+    let forbidden = matches!(head.and_then(|item| item.check.as_ref()), Some(model::item::Check::Forbidden { .. }));
+    if !forbidden {
+        return format!(
+            "mcp__thor__revise(id: \"{id}\", text: \"<its text, reworded so its check bites again - the anchor, the literals or the \
+             words the text names>\", {because})"
+        );
+    }
+    let (named, literals) = if refused.is_empty() {
+        ("the forms the check really catches".to_string(), "\"<the forms the check really catches>\"".to_string())
+    } else {
+        (
+            refused.iter().map(|l| format!("'{}'", model::gate::shown_literal(l))).collect::<Vec<_>>().join(" and "),
+            refused.iter().map(|l| model::store::ascii_json(l)).collect::<Vec<_>>().join(", "),
+        )
+    };
+    format!(
+        "mcp__thor__revise(id: \"{id}\", text: \"<its text, reworded so it names only these forms: {named}>\", check_kind: \"forbidden\", \
+         check_literals: [{literals}], {because})"
+    )
+}
+
 /// The exact call for a rule whose check bites and whose text only has to
 /// name the check's literal (A4).
 fn a4_call(store: &EventStore, id: &str) -> String {
@@ -523,16 +556,27 @@ fn try_one(store: &mut EventStore, db: Option<&Path>, candidate: &Candidate, cor
     let change = held.as_ref().and_then(|(old, _)| teeth::change_of(old, &tried.outcome));
     // A DEMOTION IS NEVER APPLIED BY THE MACHINE. A rule that bit when an
     // older matcher tried it and that this build would make a note keeps its
-    // tooth until the agent decides: fixes the check so it bites again, or
-    // writes the note by revising it.
+    // tooth until the agent decides, by one of two exits that both settle it:
+    // (a) accept the demotion with the retest command, (b) narrow the rule so
+    // its check bites again. The agent decides - a bare `revise(id)` is
+    // neither (it changes nothing a trial reads), so it is never the call.
     if let (Some(Change::Demote), Maintenance::Note { because }) = (change, &tried.outcome) {
         let then = held.and_then(|(_, rev)| rev).map_or("a build that recorded no matcher".to_string(), |rev| format!("matcher {rev}"));
-        return needs_agent(format!(
+        let accept = format!("{} --apply", model::store::retest_command_for(db, id));
+        let detail = format!(
             "DEMOTION, nothing written: it bit when {then} tried it, and this build (matcher {}) would make it a note - {because}. \
-             Either revise the rule so its check bites again (the anchor, the literals or the text it names), or, when the owner \
-             agrees it should be a note, run serve --db \"<their store>\" retest --id {id} --apply, which writes the note",
-            teeth::matcher_rev()
-        ));
+             TWO EXITS, you decide after opening the rule (mcp__thor__get) and the file or command it is about. (a) ACCEPT the \
+             demotion, only when no wording or anchor can make the check bite: run {accept} - it writes the note and nothing else \
+             (a retest of one rule needs no --allow-demote), and your report says you accepted it and why. (b) KEEP THE TOOTH by \
+             narrowing the rule to the forms its check really catches: send the Call below with your own reworded text and a reason \
+             of at least {} characters",
+            teeth::matcher_rev(),
+            model::store::DISPUTE_REASON_MIN_CHARS
+        );
+        let head = model::store::show(store, id).ok();
+    let (refused, _) = head.as_ref().map(|item| teeth::literals_by_outcome(item, &tried.attempts)).unwrap_or_default();
+        let narrowing = demotion_call(id, head.as_ref(), &refused);
+        return MachineItem { call: Some(narrowing), ..machine_item(id, MachineOutcome::NeedsAgent, detail) };
     }
     match &tried.outcome {
         // A note whose pending check cannot be tried yet is still a note
@@ -961,6 +1005,15 @@ pub fn machine_pass(store: &mut EventStore, project: &str, start: &EvaluationSta
     machine.disputes_later_ids = disputes.iter().skip(model::store::EVALUATION_DISPUTE_LIST).map(|d| d.id.clone()).collect();
     machine.disputes = disputes.into_iter().take(model::store::EVALUATION_DISPUTE_LIST).collect();
 
+    // THOR'S HEALTH AND THE REFUSAL OUTCOMES known at the start, frozen here so
+    // the start note shows them and the agent can act before it files.
+    machine.signals = Some(model::store::signals_so_far(
+        store,
+        &start.frozen.session,
+        start.frozen.prev_report_seq,
+        start.frozen.started_seq,
+    ));
+
     let of = |outcome: MachineOutcome| -> Vec<String> {
         machine.items.iter().filter(|i| i.outcome == outcome).map(|i| i.id.clone()).collect()
     };
@@ -1051,6 +1104,10 @@ pub fn render_start_note(id: &str, frozen: &Frozen) -> String {
 
     out.push_str("\n\n3. OPEN POINTS - ");
     open_points_section(&mut out, frozen);
+    let signals = frozen.machine.as_ref().filter(|_| frozen.decided()).and_then(|machine| machine.signals.as_ref());
+    if let Some(signals) = signals {
+        signals_section(&mut out, signals);
+    }
     out
 }
 
@@ -1096,7 +1153,7 @@ fn teeth_section(out: &mut String, frozen: &Frozen, machine: &MachinePass) {
         let item = machine.items.iter().find(|i| &i.id == id);
         let why = item.map(|i| i.detail.as_str()).unwrap_or("");
         let call = item.and_then(|i| i.call.clone()).unwrap_or_else(|| agent_call(id));
-        format!("\n      - '{id}': {why}. Call: {call}")
+        format!("\n      - '{id}': {}. Call: {call}", why.trim_end_matches('.'))
     };
     let batch = frozen.batch();
     if batch.is_empty() {
@@ -1142,22 +1199,28 @@ fn teeth_section(out: &mut String, frozen: &Frozen, machine: &MachinePass) {
 /// becomes a forbidden check, a file span (may_change) a contains check. The
 /// text is reworded in the same call because a check's literal has to be named
 /// in the rule's own text.
-fn hang_call(id: &str, first_argument: &str) -> String {
-    let check = match first_argument {
-        "may_change" => "check_kind: \"contains\", check_path: \"<the file>\", check_literal: \"<the rule's subject>\"",
-        _ => "check_kind: \"forbidden\", check_literals: [\"<the rule's subject>\"]",
+fn hang_call(id: &str, first_argument: &str, files: &[String]) -> String {
+    let check = match (first_argument, files) {
+        ("may_change", [file]) => format!(
+            "check_kind: \"contains\", check_path: {}, check_literal: \"<the rule's subject>\"",
+            model::store::ascii_json(file)
+        ),
+        ("may_change", _) => "check_kind: \"contains\", check_path: \"<the file the span is in>\", check_literal: \"<the rule's subject>\"".to_string(),
+        _ => "check_kind: \"forbidden\", check_literals: [\"<the rule's subject>\"]".to_string(),
     };
-    format!("mcp__thor__revise(id: \"{id}\", text: \"<its text, reworded so it names <the rule's subject>>\", {check})")
+    format!("mcp__thor__revise(id: \"{id}\", text: \"<its text, reworded so it names the rule's subject>\", {check})")
 }
 
 /// The exact call that confirms a dispute: the same rule, with the reason
-/// restated. The span it names is the one the dispute names.
-fn confirm_call(id: &str, span: &str) -> String {
-    format!(
-        "mcp__thor__revise(id: \"{id}\", because: \"<why {span} may change, or why the call is legitimate, while the rule \
-         stays true - at least {} characters>\")",
-        model::store::DISPUTE_REASON_MIN_CHARS
-    )
+/// restated. The span it names is the one the dispute names, and the reason
+/// is asked for in the words of that kind of dispute.
+fn confirm_call(id: &str, first_argument: &str, span: &str) -> String {
+    let why = match first_argument {
+        "may_change" => format!("why {span} may change while the rule stays true"),
+        "accept_refusing" => format!("why refusing {span} is the intent"),
+        _ => format!("why {span} is a legitimate call while the rule stays true"),
+    };
+    format!("mcp__thor__revise(id: \"{id}\", because: \"<{why} - at least {} characters>\")", model::store::DISPUTE_REASON_MIN_CHARS)
 }
 
 /// Item c of section 2 of the start note: the disputes the agent verifies
@@ -1179,15 +1242,20 @@ fn disputes_section(out: &mut String, machine: &MachinePass) {
          real subject, or a better check existed. WHAT TO DO, for each one: open the rule (mcp__thor__get) and the \
          file or command it is about, and decide whether the disputed literal IS what the rule is about. If it is, or \
          a better check exists, hang that check (call 1 on its line). If it is only an incidental span, confirm the \
-         dispute with a reason of your own (call 2). WHEN AN ITEM IS DONE: the call you made was accepted - THOR then \
-         shows rule or note for call 1, or 'revised' for call 2. Nothing else settles an item (not a tag, not a note, \
-         not a line in the report), and the report is held until each one is done. EXAMPLE: a rule saying \
+         dispute with a reason of your own (call 2; a reason shorter than {min} characters is refused). \
+         WHEN AN ITEM IS DONE: the call you made was accepted - THOR then shows rule or note for call 1, or \
+         'revised' for call 2. \
+         Retracting the rule with a reason also settles an item, but only for a rule that is simply wrong. Nothing else \
+         settles an item (not a tag, not a note, not a line in the report), and the report is held until each one is \
+         done. The machine section of your report keeps one line per item of this list saying how it was verified. \
+         EXAMPLE: a rule saying \
          'the sensor delay is in microseconds, not nanoseconds', disputed on the loose word 'delay' in sensor.cfg: the \
          subject is 'microseconds', so call 1 with check_kind \"contains\", check_path \"sensor.cfg\", check_literal \
          \"microseconds\" and the text reworded to name it.",
         list.len(),
         model::store::EVALUATION_DISPUTE_LIST,
-        quoted(&ids)
+        quoted(&ids),
+        min = model::store::DISPUTE_REASON_MIN_CHARS
     ));
     for dispute in list {
         let first = dispute.arguments.first().map(|(name, _)| name.as_str()).unwrap_or("legitimate_calls");
@@ -1207,8 +1275,8 @@ fn disputes_section(out: &mut String, machine: &MachinePass) {
             id = dispute.id,
             args = model::store::dispute_in_words(&dispute.arguments),
             seq = dispute.seq,
-            hang = hang_call(&dispute.id, first),
-            confirm = confirm_call(&dispute.id, &span),
+            hang = hang_call(&dispute.id, first, &dispute.files),
+            confirm = confirm_call(&dispute.id, first, &span),
         ));
     }
     if !machine.disputes_later_ids.is_empty() {
@@ -1217,6 +1285,76 @@ fn disputes_section(out: &mut String, machine: &MachinePass) {
             machine.disputes_later_ids.len()
         ));
     }
+}
+
+/// Section 4 of the start note: THOR's health and the refusal outcomes known
+/// at the start (`MachinePass::signals`), so the agent can act on them before
+/// it files. Each says what it means, the exact calls, when it is done and an
+/// example, or says there is nothing to do.
+fn signals_section(out: &mut String, signals: &model::store::SignalsSoFar) {
+    out.push_str(
+        "\n\n4. SIGNALS BEFORE YOU FILE - THOR read these two signals from its log for the time since the previous report \
+         (the whole log when there is none) up to this start. Refusals no session has verified at its Stop yet are not \
+         counted. The machine section of your report records the same two signals again for this evaluation's own window when \
+         you file: act on what is listed here now, and read that section in the reply to your filing for anything new.",
+    );
+    out.push_str(&format!("\n   a. {}", signals.health));
+    if signals.hook_failures == 0 && signals.skew_events == 0 {
+        out.push_str("\n      Nothing to do here.");
+    } else {
+        out.push_str(
+            "\n      WHAT THIS MEANS: a hook launch failure is a Claude Code hook (THOR's guard or Stop hook) that could not \
+             start, so nothing from THOR reached that call - the line above names the hook event, its exit code and the \
+             session; a version-skew event is a filing THOR refused because the tool server that wrote the report was built \
+             from another THOR than the checker. Neither is anybody's edit, and no note needs a fix.\
+             \n      WHAT TO DO: put both numbers, the hook events and the sessions in your report, and tell the owner in your \
+             summary: for a skew, to restart Claude so the tool server is the current one - a report refused as skew is on \
+             file but does not count, so file the report again after the restart, and it will still list that skew because \
+             it is in its window; for a launch failure, that the named hook needs his attention. You cannot restart or repair \
+             anything yourself.\
+             \n      DONE WHEN: both numbers, the hook events and the sessions are in the report, and the owner was told.\
+             \n      EXAMPLE: \"THOR health: 1 hook launch failure (PreToolUse, exit 126, session 0de7dc52) - the owner should \
+             look at that hook; 0 version-skew events.\"",
+        );
+    }
+    out.push_str(&format!("\n   b. {}", signals.refusals));
+    if signals.false_blocks.is_empty() {
+        out.push_str("\n      Nothing to do here.");
+        return;
+    }
+    for block in &signals.false_blocks {
+        out.push_str(&format!(
+            "\n      - {}\n         Read: mcp__thor__history(id: \"{}\")\n         If the refusal was right, restore: {}",
+            block.line, block.rule, block.restore
+        ));
+    }
+    if signals.false_blocks_more > 0 {
+        out.push_str(&format!(
+            "\n      {} more are not listed here; the machine section of your report names up to {} again.",
+            signals.false_blocks_more,
+            model::store::FALSE_BLOCKS_LISTED
+        ));
+    }
+    out.push_str(&format!(
+        "\n      WHAT THIS MEANS: THOR counts a refusal as a PROBABLE false block when someone other than THOR then retracted \
+         the refusing rule or weakened it (cleared or changed its check, lowered its severity, dropped a binding). A proxy, \
+         not a verdict: a rule can change for other reasons, and a noise mark is shown in history but never counted.\
+         \n      WHAT TO DO, for each rule listed: first run the Read call - the history line of the refusal shows the call that \
+         was refused, the lines after it show the change, and each step shows the rule as it stood. Then decide whether the \
+         refused call was legitimate, from that call and the file or command the rule is about. If it WAS (the refusal was \
+         wrong), the weakening was right: write in the report the rule id, the refused call and why it was legitimate - that \
+         is a false block. If it was NOT (the refusal was right), put the rule back with the restore call shown under it, \
+         with your own reason of at least {} characters in because; THOR must answer rule or note, never a refusal. A \
+         retracted rule is brought back by the remember call shown, under a NEW id with a tag naming the old one: the old id \
+         stays retracted, and a second remember on it would leave it with two heads. If you cannot tell, say so in the \
+         report for that rule and why, and restore nothing.\
+         \n      DONE WHEN: every rule listed has one of those outcomes in your report, and a restore you made was answered \
+         rule or note.\
+         \n      EXAMPLE: the line lists 'no-force-push', refused 'git push --force-with-lease origin main', then check cleared: \
+         that call is safe, so the report says \"no-force-push refused git push --force-with-lease origin main, which is \
+         safe; clearing its check was right\".",
+        model::store::DISPUTE_REASON_MIN_CHARS
+    ));
 }
 
 /// Section 3 of the start note: THOR's own open points (nothing for the

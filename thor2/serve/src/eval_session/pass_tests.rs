@@ -919,20 +919,83 @@ fn a_dispute_written_since_the_previous_report_is_on_the_start_note_with_its_cal
     for id in [&reasoned, &silent] {
         assert!(
             note.contains(&format!(
-                "Call 1, hang the real check: mcp__thor__revise(id: \"{id}\", text: \"<its text, reworded so it names <the rule's subject>>\", \
+                "Call 1, hang the real check: mcp__thor__revise(id: \"{id}\", text: \"<its text, reworded so it names the rule's subject>\", \
                  check_kind: \"forbidden\", check_literals: [\"<the rule's subject>\"])"
             )),
             "{id}: {note}"
         );
-        assert!(note.contains(&format!("Call 2, confirm the dispute: mcp__thor__revise(id: \"{id}\", because: \"<why 'git bundle list-heads backup.bundle' may change")), "{id}: {note}");
+        assert!(note.contains(&format!("Call 2, confirm the dispute: mcp__thor__revise(id: \"{id}\", because: \"<why 'git bundle list-heads backup.bundle' is a legitimate call while the rule stays true")), "{id}: {note}");
     }
     assert_eq!(note.matches("Done when: call 1 or call 2 is accepted.").count(), 2, "{note}");
+    assert!(note.contains("a reason shorter than 20 characters is refused"), "call 2 says THOR enforces the length: {note}");
+    assert!(note.contains("Retracting the rule with a reason also settles an item"), "a retract is named as the other exit: {note}");
     // Frozen: the record carries them, so the note and the record agree.
     assert_eq!(model::store::frozen_ids(&start).iter().filter(|id| id.starts_with("bundle-")).count(), 2);
     // Nothing to verify: the section still says so, in one line.
     let mut quiet = Fx::new();
     let none = quiet.start(S1, "demo");
     assert!(start_note(&none).contains("c. DISPUTES TO VERIFY - no rule stored by dispute since the previous evaluation waits to be verified."));
+}
+
+/// THE SIGNALS BEFORE FILING: the start note carries THOR's health and the
+/// refusal outcomes known at the start, each with its meaning, the exact calls,
+/// when it is done and an example - so the agent can act before it files, not
+/// only read about them after.
+#[test]
+fn the_start_note_shows_health_and_refusal_outcomes_known_so_far_with_their_calls() {
+    let mut fx = Fx::new();
+    let demo = fx.checkout("demo", &[("NOTES.md", "x\n")], true);
+    fx.register("demo", &demo);
+    // Raw fixture events, the way the attester's records read on the log: a test
+    // holds no token of THOR's own.
+    let fault = serde_json::json!({"hook_fault": {
+        "tool_use_id": "toolu_01FaultExample", "hook_event": "PreToolUse", "exit_code": 126, "at": "2026-10-07T09:12:00.000Z" }});
+    fx.store.append_event(S2, S2, model::store::ATTESTER_ACTOR, EventKind::GateStoodAside, &model::store::hook_fault_entity(S2), None, &fault.to_string()).unwrap();
+    fx.legacy(&rule("rule-zeta", "Never run `git push --force` on the main branch of this project.", vec![cmd("git push")], forbidden(&["--force"]), Some("demo")));
+    let body = r#"{"at":"2026-10-07T09:20:00Z","target":"git push --force-with-lease origin main","tool_use_id":"toolu_02"}"#;
+    let seq = fx.store.append_event(S2, S2, "hook", EventKind::GateRefused, "rule-zeta", None, body).unwrap().seq;
+    let verified = serde_json::json!({"refusal_seq": seq, "field": true, "why": "fixture"});
+    fx.store.append_event(S2, S2, model::store::ATTESTER_ACTOR, EventKind::GateStoodAside, "rule-zeta", None, &verified.to_string()).unwrap();
+    let zeta = model::store::show(&fx.store, "rule-zeta").unwrap();
+    let mut cleared = zeta.clone();
+    cleared.check = None;
+    let baseline = model::gate::ClearedFields { check: true, ..Default::default() }.baseline(&zeta);
+    model::store::revise_because(&mut fx.store, S2, "l", "mcp", &baseline, &cleared, &zeta, Some("it refused a lease push, which is safe")).unwrap();
+
+    let start = fx.start(S1, "demo");
+    assert!(start.frozen.machine.as_ref().unwrap().signals.is_some(), "frozen with the start");
+    let note = start_note(&start);
+    let section = &note[note.find("\n\n4. SIGNALS BEFORE YOU FILE").expect(&note)..];
+    assert!(
+        section.contains("\n   a. THOR health since the previous report: 1 hook launch failure(s) (PreToolUse, exit 126, session 373e8610), 0 version-skew event(s)."),
+        "{section}"
+    );
+    assert!(
+        section.contains("\n   b. REFUSAL OUTCOMES since the previous report: 1 verified refusal(s), 1 followed by a weakening or retract"),
+        "{section}"
+    );
+    assert!(section.contains("\n      - 'rule-zeta': refused 'git push --force-with-lease origin main' at log seq"), "{section}");
+    assert!(section.contains(", then weakened (check cleared) at log seq"), "{section}");
+    assert!(section.contains("\n         Read: mcp__thor__history(id: \"rule-zeta\")"), "{section}");
+    assert!(
+        section.contains(
+            "\n         If the refusal was right, restore: mcp__thor__revise(id: \"rule-zeta\", check_kind: \"forbidden\", \
+             check_literals: [\"--force\"], because: \"<why the weakening was a mistake - at least 20 characters>\")"
+        ),
+        "{section}"
+    );
+    for part in ["WHAT THIS MEANS:", "WHAT TO DO", "DONE WHEN:", "EXAMPLE:"] {
+        assert_eq!(section.matches(part).count(), 2, "both signals say {part}: {section}");
+    }
+    assert!(section.is_ascii(), "plain ASCII");
+
+    // Nothing to report: each signal says so and what to do about it.
+    let mut quiet = Fx::new();
+    let none = quiet.start(S1, "demo");
+    let note = start_note(&none);
+    assert!(note.contains("\n   a. THOR health since the previous report: 0 hook launch failure(s), 0 version-skew event(s)."), "{note}");
+    assert!(note.contains("\n   b. REFUSAL OUTCOMES since the previous report: no verified refusal since the previous report to follow."), "{note}");
+    assert_eq!(note.matches("Nothing to do here.").count(), 2, "{note}");
 }
 
 /// At most the batch's own cap of eight per evaluation; the rest are named
@@ -955,7 +1018,11 @@ fn disputes_follow_the_batch_cap_and_the_rest_come_first_next_time() {
     let note = start_note(&start);
     assert!(note.contains("2 more dispute(s) wait for the next evaluation, which lists them first."), "{note}");
     assert!(!note.contains("Call 1, hang the real check: mcp__thor__revise(id: \"span-08\""), "{note}");
-    assert!(note.contains("check_kind: \"contains\", check_path: \"<the file>\""), "a span dispute hangs a contains check: {note}");
+    assert!(
+        note.contains("check_kind: \"contains\", check_path: \"pkg0.json\", check_literal: \"<the rule's subject>\""),
+        "a span dispute hangs a contains check on the file the rule is bound to: {note}"
+    );
+    assert!(note.contains("because: \"<why 'version' may change while the rule stays true - at least 20 characters>\""), "{note}");
 
     // A later evaluation after a report was filed since: the two that did not
     // fit are written BEFORE that report and still come first.
@@ -1266,10 +1333,100 @@ fn a_demotion_by_a_newer_matcher_goes_to_the_batch_never_to_the_log() {
     assert_eq!(outcome_of(&start, "ban"), MachineOutcome::NeedsAgent, "{:?}", start.frozen.machine);
     let item = item_of(&start, "ban");
     assert!(item.detail.starts_with("DEMOTION, nothing written: it bit when matcher old-matcher tried it"), "{}", item.detail);
-    assert!(item.detail.contains("retest --id ban --apply"), "{}", item.detail);
+    // Exit (a): the real command, the real store, forward slashes, no
+    // placeholder; and the agent decides, not the owner.
+    let accept = format!("{} --apply", model::store::retest_command_for(Some(&fx.db), "ban"));
+    assert!(item.detail.contains(&accept), "{}\nwanted: {accept}", item.detail);
+    assert!(accept.contains("--db ") && accept.contains("retest --id 'ban' --apply") && !accept.contains('\\'), "{accept}");
+    assert!(!item.detail.contains("<their store>") && !item.detail.contains("owner agrees"), "{}", item.detail);
+    // Exit (b): the revise THOR accepts, with the literals the check catches.
+    let call = item.call.clone().expect("a demotion line carries a call");
+    assert_ne!(call, "mcp__thor__revise(id: \"ban\")", "a bare revise changes nothing and is never the call");
+    assert!(call.starts_with("mcp__thor__revise(id: \"ban\", text: \"<its text, reworded so it names only these forms:"), "{call}");
+    assert!(call.contains("check_kind: \"forbidden\", check_literals: [\"alpha-dev reset\", \"beta-prod reset\"], because: \"<"), "{call}");
     assert!(start.frozen.batch().contains(&"ban".to_string()), "{:?}", start.frozen.batch());
     assert!(fx.machine_writes("ban").is_empty(), "a demotion is never applied by the machine");
     assert_eq!(model::store::current_verdict(&fx.store, "ban"), CurrentVerdict::RuleWired, "it keeps its tooth");
+}
+
+/// A demoted rule's start, in a store of its own: 'ban' bit under
+/// 'old-matcher' and the current matcher would make it a note.
+fn demoted_start() -> (Fx, EvaluationStart) {
+    let mut fx = Fx::new();
+    let beta = fx.checkout("beta", &[("NOTES.md", "x\n")], true);
+    fx.register("beta", &beta);
+    decided_long_ago(&mut fx, &partly_refused_ban("ban"), model::store::RecordedVerdict::RuleWired, Some("old-matcher"));
+    let start = fx.start(S1, "beta");
+    (fx, start)
+}
+
+/// The literals a printed call names in `check_literals: [...]`.
+fn literals_of(call: &str) -> Vec<String> {
+    let from = call.find("check_literals: [").expect(call) + "check_literals: [".len();
+    let to = from + call[from..].find(']').expect(call);
+    serde_json::from_str(&format!("[{}]", &call[from..to])).expect(call)
+}
+
+/// Both exits a DEMOTION line prints settle the item for the filing gate.
+/// (a) accept: the printed command, tried as `serve retest --id --apply` does,
+/// writes the note. (b) keep the tooth: the printed revise, with the literals
+/// it names and a reason, is accepted by THOR's trial and leaves the rule on
+/// the rule track. A bare revise is neither: it changes nothing.
+#[test]
+fn either_exit_of_a_demotion_settles_the_batch_item_and_a_bare_revise_does_not() {
+    // A bare revise is no exit.
+    let (mut fx, start) = demoted_start();
+    assert_eq!(model::store::evaluation_frozen_batch_owed(&fx.store, &start).len(), 1);
+    {
+        let mut corpus = crate::legit::Corpus::load(&fx.store);
+        let head = model::store::show(&fx.store, "ban").unwrap();
+        let bare = teeth::trial_for_write(&mut fx.store, Some(&fx.db), &teeth::SessionCtx::default(), &mut corpus, &head, Some(&head), None, &teeth::Disputes::default(), true);
+        assert!(matches!(bare, teeth::WriteTrial::Unchanged { .. }), "a bare revise writes no verdict");
+        assert_eq!(model::store::evaluation_frozen_batch_owed(&fx.store, &start).len(), 1, "still owed");
+    }
+
+    // Exit (a): accept the demotion.
+    let corpus = crate::legit::Corpus::load(&fx.store);
+    let tried = teeth::retest(&fx.store, Some(&fx.db), "ban", &corpus).unwrap();
+    assert!(matches!(tried.outcome, teeth::Maintenance::Note { .. }), "{:?}", tried.outcome);
+    teeth::apply_as_retest(&mut fx.store, &tried).unwrap();
+    assert!(model::store::evaluation_frozen_batch_owed(&fx.store, &start).is_empty(), "accepted: settled");
+    assert_eq!(model::store::current_verdict(&fx.store, "ban"), CurrentVerdict::Note);
+
+    // Exit (b): keep the tooth by narrowing, with the literals the call names.
+    let (mut fx, start) = demoted_start();
+    let call = item_of(&start, "ban").call.clone().unwrap();
+    let literals = literals_of(&call);
+    assert_eq!(literals, ["alpha-dev reset", "beta-prod reset"], "{call}");
+    let head = model::store::show(&fx.store, "ban").unwrap();
+    let mut narrowed = head.clone();
+    narrowed.text = "Never hard-reset the deploy checkouts alpha-dev and beta-prod. Refused: `alpha-dev reset`, `beta-prod reset`.".to_string();
+    narrowed.check = Some(Check::Forbidden { literals });
+    let because = "the two forms joined with && are not refused by the matcher, so the text names only what the check catches";
+    let mut corpus = crate::legit::Corpus::load(&fx.store);
+    let tried = teeth::trial_for_write(&mut fx.store, Some(&fx.db), &teeth::SessionCtx::default(), &mut corpus, &narrowed, Some(&head), Some(because), &teeth::Disputes::default(), true);
+    let teeth::WriteTrial::Tried { item, record, outcome, .. } = tried else { panic!("the narrowed rule is tried") };
+    assert!(matches!(outcome, teeth::Outcome::Rule { .. }), "{outcome:?}");
+    model::store::revise_tried_scoped(&mut fx.store, S1, "l", "mcp", &head, &item, &head, Some(because), None, Some(&record), None, None).unwrap();
+    assert!(model::store::evaluation_frozen_batch_owed(&fx.store, &start).is_empty(), "narrowed: settled");
+    assert_eq!(model::store::current_verdict(&fx.store, "ban"), CurrentVerdict::RuleWired);
+}
+
+/// A rule's check kind other than a forbidden command check has no literals
+/// to name: the call still carries the shape, with the agent's own words
+/// where only the agent knows them.
+#[test]
+fn a_demotion_whose_check_names_no_caught_form_still_prints_a_revise() {
+    let mut fx = Fx::new();
+    let beta = fx.checkout("beta", &[("NOTES.md", "x\n")], true);
+    fx.register("beta", &beta);
+    let mut item = partly_refused_ban("ban");
+    item.check = forbidden(&["alpha-dev && git reset", "beta-prod && git reset"]);
+    decided_long_ago(&mut fx, &item, model::store::RecordedVerdict::RuleWired, Some("old-matcher"));
+    let start = fx.start(S1, "beta");
+    let call = item_of(&start, "ban").call.clone().unwrap();
+    assert!(call.starts_with("mcp__thor__revise(id: \"ban\", text: \"<"), "{call}");
+    assert!(call.contains("check_kind: \"forbidden\", check_literals: [\"<"), "no literal is caught, so none is named: {call}");
 }
 
 /// A rule whose record names no matcher at all (an older build) is old too,

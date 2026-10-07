@@ -926,6 +926,43 @@ fn refuse_a_dispute_without_reason(
     ))
 }
 
+/// CALL 2 OF AN EVALUATION'S DISPUTES holds the same floor as writing one: a
+/// revise that carries a `because` and no check and no dispute argument, on a
+/// rule that stands on a dispute, is the confirmation of that dispute - and a
+/// reason shorter than `DISPUTE_REASON_MIN_CHARS` characters is refused, as
+/// the same reason is when the dispute is written. (THOR's settlement counts
+/// only a reason of that length too, so a filler would settle nothing either
+/// way; refusing it here says so at once.) A revise of a rule with no dispute,
+/// or one that hangs a check, keeps its own `because` rules.
+fn refuse_a_short_confirmation(store: &EventStore, args: &ReviseArgs) -> Result<(), String> {
+    let Some(because) = args.because.as_deref() else { return Ok(()) };
+    let names_check = args.check_kind.is_some()
+        || args.check_path.is_some()
+        || args.check_literal.is_some()
+        || !args.check_literals.is_empty()
+        || args.clear_check;
+    let names_dispute = !args.legitimate_calls.is_empty() || !args.may_change.is_empty() || !args.accept_refusing.is_empty();
+    let said = because.trim().chars().count();
+    let min = model::store::DISPUTE_REASON_MIN_CHARS;
+    if names_check || names_dispute || said >= min {
+        return Ok(());
+    }
+    let Some(dispute) = model::store::current_dispute_in_words(store, args.id.trim()) else { return Ok(()) };
+    let have = match said {
+        0 => "none was given".to_string(),
+        n => format!("the one given is {n} characters"),
+    };
+    Err(format!(
+        "REFUSED: '{}' stands on a dispute ({dispute}), and confirming it needs a 'because': one sentence of at least {min} \
+         characters saying WHY the named span may change, or why the call is legitimate, while the rule stays true ({have}). \
+         Nothing was written. Open the rule and the file or command it is about first: if the disputed literal IS the rule's \
+         subject, hang the real check instead (name it in the text and pass check_kind and check_literals); if the rule is \
+         simply wrong, retract it with a reason. For an incidental span, send the same call again with your own reason, for \
+         example: because: \"the version number moves with every release, so that line may change while the rule stays true\"",
+        args.id.trim()
+    ))
+}
+
 /// THOR's trial of one write (`serve::teeth::trial_for_write`), with this
 /// server's cached corpus of real calls: loaded once per process and
 /// refreshed from the last seq it read on every later write (the trial does
@@ -1141,10 +1178,23 @@ fn refuse_a_side_door_on_a_frozen_item(store: &EventStore, id: &str, att: &model
 /// paid". Empty for every other write (`ctx` is `None`).
 fn evaluation_receipt(store: &EventStore, item: &Item, ctx: Option<&model::store::FilingContext>, event_seq: i64) -> String {
     let Some(ctx) = ctx else { return String::new() };
-    let filed_seq = model::store::show(store, &item.id)
-        .ok()
+    let stored = model::store::show(store, &item.id).ok();
+    let filed_seq = stored
+        .as_ref()
         .and_then(|stored| model::gate::machine_section_range(&stored.text))
         .map_or(event_seq - 1, |(_, filed)| filed);
+    // The section itself, in full: the health line, the refusal outcomes and the
+    // dispute lines are in it, and the receipt's counts leave them out.
+    let section = stored
+        .as_ref()
+        .and_then(|stored| model::gate::machine_block(&stored.text))
+        .map(|block| {
+            format!(
+                "\nTHOR's machine section of this report, in full (read it now: you cannot edit it; revise only your own text \
+                 below it, if that is needed):\n{block}"
+            )
+        })
+        .unwrap_or_default();
     let m = model::store::machine_section_summary(store, &ctx.start, filed_seq);
     // The ONE count the ask at the end of a turn and doctor use too (field test
     // 5, D4: three counts, 13 / 140 / 13, because one of them ran an older fold).
@@ -1168,7 +1218,7 @@ fn evaluation_receipt(store: &EventStore, item: &Item, ctx: Option<&model::store
          store-wide for this project (all sessions, a different count from this evaluation's list) - doctor names them.\
          \nteeth: {} rule(s) on the frozen batch and A4 list, all settled.\
          \nside doors: {} write(s) in the window outside an attested THOR call, {} still to be checked.{weakened}\
-         \nTHOR checks this filing call against the session's transcript when the turn ends.{queue}",
+         \nTHOR checks this filing call against the session's transcript when the turn ends.{queue}{section}",
         m.started_seq,
         m.filed_seq,
         m.started_seq,
@@ -1562,6 +1612,7 @@ fn replica_refusal_for_remember(store: &EventStore, args: &RememberArgs) -> Resu
 fn replica_refusal_for_revise(store: &EventStore, args: &ReviseArgs) -> Result<(), String> {
     refuse_a_forged_teeth_tag(&args.id, args.tags.as_deref().unwrap_or(&[]))?;
     refuse_a_dispute_without_reason(args.because.as_deref(), &args.legitimate_calls, &args.may_change, &args.accept_refusing)?;
+    refuse_a_short_confirmation(store, args)?;
     model::store::fence(store, ACTOR.into(), &args.id).map_err(|e| format!("REFUSED: {e}"))?;
     let Ok(existing) = model::store::show(store, &args.id) else { return Ok(()) };
     refuse_an_open_point_tag(args.tags.as_deref().unwrap_or(&[]), Some(&existing))?;
@@ -2643,6 +2694,7 @@ impl ThorMcpServer {
             refuse_a_forged_teeth_tag(&args.id, args.tags.as_deref().unwrap_or(&[]))?;
             refuse_a_dispute_without_reason(args.because.as_deref(), &args.legitimate_calls, &args.may_change, &args.accept_refusing)?;
             let existing = model::store::show(s, &args.id).map_err(|e| format!("cannot revise: {e}"))?;
+            refuse_a_short_confirmation(s, &args)?;
             // An open-point tag this call would ADD (step 14): refused, with
             // the way on. One the item already carries is left alone.
             refuse_an_open_point_tag(args.tags.as_deref().unwrap_or(&[]), Some(&existing))?;
@@ -3391,11 +3443,14 @@ impl ThorMcpServer {
             Ok(log) => {
                 let mut out = String::new();
                 for rev in &log {
-                    let text = rev
-                        .item
-                        .as_ref()
-                        .map(|i| i.text.clone())
-                        .unwrap_or_else(|| "(no readable item body at this step)".to_string());
+                    // A refusal has no item body: it names the call the hook
+                    // refused instead, which is what a reader needs to judge
+                    // whether the refusal was right.
+                    let text = rev.item.as_ref().map(|i| i.text.clone()).unwrap_or_else(|| match (rev.kind.as_str(), &rev.refused_call) {
+                        ("gate_refused", Some(call)) => format!("refused call: '{call}'"),
+                        ("gate_refused", None) => "refused call: (the log kept no text for it)".to_string(),
+                        _ => "(no readable item body at this step)".to_string(),
+                    });
                     out.push_str(&format!(
                         "seq {} {} by {} [{}]: {}",
                         rev.seq,
@@ -3422,6 +3477,12 @@ impl ThorMcpServer {
                             " (THOR: old contains check counted as a tooth although the text does not name it - {})",
                             mark.describe()
                         ));
+                    }
+                    // The rule as it stood at this step, so a weakening or a
+                    // retract can be read - and undone - without guessing
+                    // what it took away.
+                    if let Some(stood) = rev.item.as_ref().and_then(model::store::rule_as_it_stood) {
+                        out.push_str(&format!("\n    as it stood: {stood}"));
                     }
                     out.push('\n');
                 }
