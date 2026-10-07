@@ -6973,7 +6973,7 @@ pub fn archive<'a>(
     updated.check = None;
     updated.tags.push(format!("archived:{reason}"));
 
-    gate::declare(&updated).map_err(WriteError::Refused)?;
+    gate::declare_carried(&updated).map_err(WriteError::Refused)?;
     let body = canonical_body(&updated).map_err(WriteError::Serialize)?;
     store
         .append_mutate_checked(session_id, lineage_id, actor, EventKind::FactRevised, &updated.id, None, &body)
@@ -7021,7 +7021,7 @@ pub fn restore_deliberate_anchor<'a>(
         updated.tags.push(DELIBERATE_ANCHOR_TAG.to_string());
     }
 
-    gate::declare(&updated).map_err(WriteError::Refused)?;
+    gate::declare_carried(&updated).map_err(WriteError::Refused)?;
     let body = canonical_body(&updated).map_err(WriteError::Serialize)?;
     store
         .append_mutate_checked(session_id, lineage_id, actor, EventKind::FactRevised, &updated.id, None, &body)

@@ -462,7 +462,13 @@ could change.\n\nBINDINGS: a Rule/Orientation needs at least one - a Moment (onl
 command or file actually produces fires: publish, commit, deploy and the rest, plus remember \
 itself; a NEW answer/claim_done binding is refused, since neither fires yet), a Target (an \
 exact path, command or tool - never a glob or bare role name), or Always (what pin/unpin toggle \
-on an existing item).\n\nNOT HERE ON PURPOSE: session start, the moment of action, and the \
+on an existing item). A costly or irreversible item bound ONLY to a project name is refused \
+too: that binding reaches a prompt where the owner types the name, never a tool call - bind it \
+to the file, command or moment it is about, or pin it.\n\nSECRETS: a real secret token in a \
+note's text or falsifier (sk_/pk_ live or test keys, ghp_ and other GitHub tokens, xox Slack, \
+AKIA, tskey-, sk-ant-, AIza, a JWT, a PEM private key header) is refused for every kind, with no \
+override: the log keeps every write and its backup copies it. Store WHERE the secret lives (a \
+file or variable name), never its value, and rotate it if it was real.\n\nNOT HERE ON PURPOSE: session start, the moment of action, and the \
 prompt surface are hooks that fire on their own. No tool calls them - one that could would \
 recreate the one ranked pool THOR was built to remove.";
 
@@ -2455,7 +2461,7 @@ impl ThorMcpServer {
         }
     }
 
-    #[tool(description = "Code lane: declares a NEW item (Rule, Orientation, Report, Lookup or Chunk) through the write gate. Call lookup first so this corrects an existing item instead of storing a near-duplicate; for anything about the owner's own life use shelve, never this. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refuses, with the exact reason and the fix, when a Rule/Orientation has no binding, no falsifier, or exceeds 300 characters, or when a Report/Chunk names no project scope; nothing is written on a refusal. check_kind/check_path/check_literal(s) optionally attach a machine-runnable proof alongside the falsifier - see server instructions for the six check kinds. Every Rule/Orientation is TRIED as it is written: a check that bites is stored on the rule track, a rule with no working tooth is stored as a note (no check), and a tooth THOR builds from the rule's own words that bites refuses the write, naming the exact check to hang - the reply's 'teeth:' note says which. Replies with the stored id, kind and event sequence, or the refusal text.", annotations(title = "Remember a fact", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false))]
+    #[tool(description = "Code lane: declares a NEW item (Rule, Orientation, Report, Lookup or Chunk) through the write gate. Call lookup first so this corrects an existing item instead of storing a near-duplicate; for anything about the owner's own life use shelve, never this. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refuses, with the exact reason and the fix, when a Rule/Orientation has no binding (or, if costly or irreversible, only a project name, which reaches no tool call), no falsifier, or exceeds 300 characters, when a Report/Chunk names no project scope, or when the text or falsifier carries a real secret token (never echoed back; store where it lives, never the value; no override); nothing is written on a refusal. check_kind/check_path/check_literal(s) optionally attach a machine-runnable proof alongside the falsifier - see server instructions for the six check kinds. Every Rule/Orientation is TRIED as it is written: a check that bites is stored on the rule track, a rule with no working tooth is stored as a note (no check), and a tooth THOR builds from the rule's own words that bites refuses the write, naming the exact check to hang - the reply's 'teeth:' note says which. Replies with the stored id, kind and event sequence, or the refusal text.", annotations(title = "Remember a fact", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false))]
     async fn remember(&self, meta: Meta, raw: RawArgs, Parameters(args): Parameters<RememberArgs>) -> String {
         if self.inbox.is_some() {
             let judged = {
@@ -2545,7 +2551,7 @@ impl ThorMcpServer {
         .await
     }
 
-    #[tool(description = "Code lane: corrects an EXISTING item by id through the same write gate as remember; a field left unmentioned keeps its current value, and none may silently vanish - clear one with clear_severity/clear_project/clear_expires/clear_key/clear_falsifier/clear_check; an empty string on the field is the harness-only equivalent, and a flag plus a real value for that field is refused. Weakening a checked rule (its check, severity, a binding, or scope) needs because: one sentence, kept in history. On a replica this queues instead of writing ('queued for the main machine' is not an error). Prefer this over remember for an existing item that merely changed; retract, with its own reason, is for one that is simply wrong. Refuses, with the exact reason, on remember's grounds, plus a dropped field or an unexplained weakening. A revise that changes its text, anchors, check, project or severity is tried again (a revise naming only the id tries a rule no trial has decided yet); one that changes only tags, falsifier, expires or key keeps its verdict. Replies with the revised id and event sequence, or the refusal text.", annotations(title = "Revise an item", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false))]
+    #[tool(description = "Code lane: corrects an EXISTING item by id through the same write gate as remember; a field left unmentioned keeps its current value, and none may silently vanish - clear one with clear_severity/clear_project/clear_expires/clear_key/clear_falsifier/clear_check; an empty string on the field is the harness-only equivalent, and a flag plus a real value for that field is refused. Weakening a checked rule (its check, severity, a binding, or scope) needs because: one sentence, kept in history. On a replica this queues instead of writing ('queued for the main machine' is not an error). Prefer this over remember for an existing item that merely changed; retract, with its own reason, is for one that is simply wrong. Refuses, with the exact reason, on remember's grounds (a secret token newly written into the text or falsifier included), plus a dropped field or an unexplained weakening. A revise that changes its text, anchors, check, project or severity is tried again (a revise naming only the id tries a rule no trial has decided yet); one that changes only tags, falsifier, expires or key keeps its verdict. Replies with the revised id and event sequence, or the refusal text.", annotations(title = "Revise an item", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false))]
     async fn revise(&self, meta: Meta, raw: RawArgs, Parameters(args): Parameters<ReviseArgs>) -> String {
         if self.inbox.is_some() {
             let judged = {
@@ -4012,6 +4018,68 @@ mod tests {
     }
 
     // ----------------------------------------------------- refusal is loud
+
+    /// The tool says an Orientation with no binding is refused, so it is: the
+    /// same call that a Rule gets refused for.
+    #[tokio::test]
+    async fn an_orientation_with_no_binding_is_refused_through_the_tool() {
+        let srv = server();
+        let mut args = base_remember("unbound-orientation");
+        args.kind = "orientation".to_string();
+        args.severity = None;
+        args.always = false;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
+        assert!(reply.contains("REFUSED") && reply.contains("Orientation with no binding"), "{reply}");
+        assert!(srv.store.lock().unwrap().get_all_events().unwrap().is_empty(), "nothing is written on a refusal");
+    }
+
+    /// A costly rule bound only to a project name reaches no tool call.
+    #[tokio::test]
+    async fn a_costly_rule_bound_only_to_a_project_is_refused_through_the_tool() {
+        let srv = server_knowing(&["acme"]);
+        let before = srv.store.lock().unwrap().get_all_events().unwrap().len();
+        let mut args = base_remember("project-only-costly");
+        args.severity = Some("costly".to_string());
+        args.always = false;
+        args.targets = vec![TargetArg { kind: "project".to_string(), value: "acme".to_string() }];
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
+        assert!(reply.contains("REFUSED") && reply.contains("only binding is the project name"), "{reply}");
+        assert_eq!(srv.store.lock().unwrap().get_all_events().unwrap().len(), before, "nothing is written on a refusal");
+    }
+
+    /// A token in a note is refused for remember and for revise, the reply
+    /// never says it back, and nothing is written.
+    #[tokio::test]
+    async fn a_token_in_a_note_is_refused_through_remember_and_revise_and_never_echoed() {
+        let srv = server_knowing(&["acme"]);
+        let before = srv.store.lock().unwrap().get_all_events().unwrap().len();
+        let token = format!("{}{}", ["gh", "p_"].concat(), "Qz".repeat(18));
+
+        let mut args = base_remember("leaky-remember");
+        args.kind = "report".to_string();
+        args.project = Some("acme".to_string());
+        args.severity = None;
+        args.always = false;
+        args.tags = vec![];
+        args.falsifier = None;
+        args.text = format!("deploys log in with {token}");
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
+        assert!(reply.contains("REFUSED") && reply.contains("GitHub token"), "{reply}");
+        assert!(!reply.contains(&token), "{reply}");
+        assert_eq!(srv.store.lock().unwrap().get_all_events().unwrap().len(), before, "nothing is written on a refusal");
+
+        stored(&srv, "clean-note", "the deploy token lives in the GH_TOKEN variable").await;
+        let reply = srv
+            .revise(Meta::new(), RawArgs::default(), Parameters(ReviseArgs {
+                id: "clean-note".to_string(),
+                append: Some(format!("it is {token}")),
+                ..Default::default()
+            }))
+            .await;
+        assert!(reply.contains("REFUSED") && reply.contains("GitHub token"), "{reply}");
+        assert!(!reply.contains(&token), "{reply}");
+        assert_eq!(body(&srv, "clean-note").await, "the deploy token lives in the GH_TOKEN variable");
+    }
 
     #[tokio::test]
     async fn a_refused_remember_is_loud_and_writes_nothing() {

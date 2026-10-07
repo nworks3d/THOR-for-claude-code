@@ -29,7 +29,9 @@ pub const REDACTED: &str = "[redacted]";
 ///    `password`, `passwd`, `pwd` or `key` (`API_TOKEN=...`, `?key=...`), and
 ///    the value after a `--password`, `--token`, `--secret` or `--api-key` flag;
 /// 3. well-known token shapes (`sk_live_`, `ghp_`, `github_pat_`, `xoxb-`,
-///    `AKIA...`, `tskey-`, a JWT);
+///    `AKIA...`, `tskey-`, `sk-ant-`, `AIza`, a JWT, a PEM private key
+///    header): the ONE list the write gate refuses in a note too, kept in
+///    `model::secrets` so the two can never drift apart;
 /// 4. any other long run of 32 or more letters and digits that is all hex, or
 ///    mixes upper case, lower case and digits (a hash or base64 blob). A long
 ///    hyphenated name or a path is neither.
@@ -44,22 +46,27 @@ pub fn redact_secrets(text: &str) -> String {
     static LONG_RUN: OnceLock<Regex> = OnceLock::new();
     let rules = RULES.get_or_init(|| {
         let keep_then = |pattern: &str| (Regex::new(pattern).expect("a fixed pattern"), format!("${{1}}{REDACTED}"));
-        let whole = |pattern: &str| (Regex::new(pattern).expect("a fixed pattern"), REDACTED.to_string());
         vec![
             keep_then(r#"(?i)(authorization\s*[:=]\s*)(?:(?:bearer|basic|token)\s+)?[^\s'"]+"#),
             keep_then(
                 r#"(?i)([A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|pwd|key)[A-Za-z0-9_.-]*\s*[=:]\s*)("[^"]*"|'[^']*'|[^\s'"&;|]+)"#,
             ),
             keep_then(r#"(?i)(--?(?:password|passwd|pwd|token|secret|api-?key|apikey)\s+)("[^"]*"|'[^']*'|[^\s'"-][^\s'"]*)"#),
-            whole(
-                r"\b(?:(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{8,}|(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|tskey-[A-Za-z0-9-]{10,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,})",
-            ),
         ]
     });
     let mut out = text.to_string();
     for (pattern, replacement) in rules {
         out = pattern.replace_all(&out, replacement.as_str()).into_owned();
     }
+    let mut kept = String::with_capacity(out.len());
+    let mut from = 0;
+    for found in model::secrets::find(&out) {
+        kept.push_str(&out[from..found.start]);
+        kept.push_str(REDACTED);
+        from = found.end;
+    }
+    kept.push_str(&out[from..]);
+    let out = kept;
     let long_run = LONG_RUN.get_or_init(|| Regex::new(r"[A-Za-z0-9+_-]{32,}={0,2}").expect("a fixed pattern"));
     long_run
         .replace_all(&out, |found: &regex::Captures| {
@@ -434,6 +441,17 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert!(!events[0].body.contains("hunter2hunter2"), "{}", events[0].body);
         assert!(events[0].body.contains("--force"), "{}", events[0].body);
+    }
+
+    /// The known-token list is the write gate's own (`model::secrets`), so a
+    /// shape it refuses in a note is scrubbed from a served command too.
+    #[test]
+    fn the_shapes_the_write_gate_refuses_are_scrubbed_from_a_command_too() {
+        let anthropic = format!("{}{}", ["sk-", "ant-"].concat(), "x".repeat(30));
+        let kept = redact_secrets(&format!("curl --data {anthropic} https://example.test"));
+        assert!(!kept.contains(&anthropic), "{kept}");
+        let pem = redact_secrets("echo '-----BEGIN PRIVATE KEY-----' > key.pem");
+        assert!(!pem.contains("BEGIN"), "{pem}");
     }
 
     /// What the trial of a rule reads stays readable: ordinary commands, paths

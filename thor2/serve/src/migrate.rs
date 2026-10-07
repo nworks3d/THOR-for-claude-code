@@ -60,7 +60,7 @@ impl MigrationReport {
 /// must never end up in a count label, a log line, or this migration's report.
 fn classify_refusal(refusal: &Refusal) -> &'static str {
     let p = refusal.problem.as_str();
-    if p.contains("Rule with no binding") {
+    if p.contains("Rule with no binding") || p.contains("Orientation with no binding") {
         "rule_with_no_binding"
     } else if p.contains("carries an expires date") {
         "expires_on_a_kind_that_never_expires"
@@ -90,6 +90,10 @@ fn classify_refusal(refusal: &Refusal) -> &'static str {
         "check_trigger_not_named_in_text"
     } else if p.contains("an item on the note track carries no check") {
         "note_carries_a_check"
+    } else if p.contains("its only binding is the project name") {
+        "weighted_item_bound_only_to_a_project"
+    } else if p.contains("carries a real secret") {
+        "text_carries_a_secret"
     } else {
         // Every ground `model::gate::declare` can return is matched above
         // (see its own doc comment: "a refusal reason with no test does not

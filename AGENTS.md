@@ -193,7 +193,12 @@ unpinned, rewritten, or thrown out like any other.
 **A note has to be able to fire, or it will never come back.** Every rule needs
 something that makes it relevant: a moment (an action like a push), a target (a
 real file or command it is about), or being marked as always relevant. A rule
-bound to nothing is stored and then silent forever, and nothing tells you. A
+or orientation bound to nothing is refused, and so is a costly or irreversible
+one bound only to a project name (that reaches only a prompt where the owner
+types the name, never a tool call): bind it to the file, command or moment it
+is about, or pin it. Never put a real secret token (an API key, a GitHub token,
+a private key) into a note: it is refused, and a stored one can never be
+removed from the log or its backup. Write where it lives instead. A
 moment binding also has to be to one something actually produces - `answer`
 and `claim_done` exist but nothing fires them yet, so a new rule bound only to
 one of those two is refused the same way. A target that names a command works

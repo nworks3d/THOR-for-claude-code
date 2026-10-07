@@ -16,6 +16,7 @@ pub mod gate;
 pub mod item;
 pub mod marked;
 pub mod normalize;
+pub mod secrets;
 pub mod served;
 pub mod shell;
 pub mod store;

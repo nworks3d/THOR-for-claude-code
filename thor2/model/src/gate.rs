@@ -981,6 +981,69 @@ pub fn is_dead_moment(action: Action) -> bool {
     DEAD_MOMENTS.contains(&action)
 }
 
+/// A costly or irreversible Rule/Orientation whose every binding is a
+/// project name. A project binding reaches only a prompt in which the owner
+/// types that name (`serve::prompt`); `serve::input` never offers one at a
+/// tool call and session start serves `Always` alone. So such an item never
+/// guards the call it is about.
+///
+/// `pub` for the same reason `is_dead_moment` is: doctor's own line counting
+/// what is already stored reads this one definition, never its own copy.
+pub fn is_weighted_project_only(item: &Item) -> bool {
+    item.kind.can_fire()
+        && matches!(item.severity, Some(Severity::Irreversible | Severity::Costly))
+        && !item.bindings.is_empty()
+        && item.bindings.iter().all(|b| matches!(b, Binding::Target { kind: TargetKind::Project, .. }))
+}
+
+/// A Rule/Orientation with no binding at all: it can never fire. The gate
+/// refuses a new one; doctor counts the ones stored before that.
+pub fn is_unbound(item: &Item) -> bool {
+    item.kind.can_fire() && item.bindings.is_empty()
+}
+
+/// Ground 27: a real secret token in the text or the falsifier of a note.
+///
+/// The log is append-only, a retract keeps history and the backup is that log
+/// pushed to a remote, so a token that gets in can only be rotated, never
+/// removed. See `crate::secrets` for the few high-precision shapes this
+/// refuses and for what it deliberately leaves alone. There is NO argument
+/// that bypasses it: a prefixed token of twenty characters or more has no
+/// legitimate place in a note.
+///
+/// `existing` is the item before a revise (`None` for a new one). A field the
+/// write leaves unchanged is not scanned again: history already holds it, and
+/// refusing it would make a note that carries a token impossible to maintain
+/// (a re-stamp, a tag edit). A changed field is scanned whole.
+///
+/// The refusal names the field and the shape and shows the first six and last
+/// two characters of the token, never the value.
+fn secret_ground(existing: Option<&Item>, item: &Item) -> Result<(), Refusal> {
+    let fields = [
+        ("text", Some(item.text.as_str()), existing.map(|e| e.text.as_str())),
+        ("falsifier", item.falsifier.as_deref(), existing.and_then(|e| e.falsifier.as_deref())),
+    ];
+    let mut hits: Vec<String> = Vec::new();
+    for (field, now, before) in fields {
+        let Some(now) = now else { continue };
+        if before == Some(now) {
+            continue;
+        }
+        for found in crate::secrets::find(now) {
+            let hint = found.hint(now).map(|h| format!(" ({h})")).unwrap_or_default();
+            hits.push(format!("the {field} holds a {}{hint}", found.shape));
+        }
+    }
+    let Some(first) = hits.first() else { return Ok(()) };
+    let more = if hits.len() > 1 { format!(" (and {} more)", hits.len() - 1) } else { String::new() };
+    Err(Refusal::new(
+        format!("this item looks like it carries a real secret: {first}{more}"),
+        "store WHERE the secret lives (the file or the variable name, for example 'the STRIPE_KEY variable in .env'), \
+         never its value; and if this value was real, rotate it now, because the log keeps every write and the daily \
+         backup copies it, so a stored secret can never be removed. This is refused with no override",
+    ))
+}
+
 /// `symbol_only_allowed` and `carried_bindings` are the two things about an
 /// item this cannot see for itself: whether the symbol-only anchor it has was
 /// already there, and WHICH bindings were already there (GROUND 25 below
@@ -989,10 +1052,42 @@ pub fn is_dead_moment(action: Action) -> bool {
 /// (`false`/`None`).
 fn shape_problems(item: &Item, symbol_only_allowed: bool, carried_bindings: Option<&[Binding]>) -> Vec<Refusal> {
     let mut problems = Vec::new();
-    if item.kind == Kind::Rule && item.bindings.is_empty() {
+    // Ground 1, for both kinds that ever reach a gate. An item that was
+    // ALREADY stored unbound (`carried_bindings` is `Some` and empty: only a
+    // revise of a Rule or Orientation says so) stays correctable - the five
+    // live orientations that predate this ground are never demoted.
+    let carried_unbound = carried_bindings.is_some_and(<[Binding]>::is_empty);
+    if item.kind.can_fire() && item.bindings.is_empty() && !carried_unbound {
+        let kind = match item.kind {
+            Kind::Orientation => "an Orientation",
+            _ => "a Rule",
+        };
         problems.push(Refusal::new(
-            "a Rule with no binding can never fire",
+            format!("{kind} with no binding can never fire"),
             "give it at least one binding: Moment(<action>), a Target, or Always",
+        ));
+    }
+    // Ground 26: a project binding reaches only a prompt in which the owner
+    // types the project's name. It never reaches a tool call, so a weighted
+    // item bound to nothing else looks protective and never guards the call it
+    // is about (measured 2026-10-07: 13 live items, 6 never served). Only a
+    // binding NEW in this write is judged, so what is already stored is never
+    // demoted.
+    if is_weighted_project_only(item)
+        && item.bindings.iter().any(|b| !carried_bindings.is_some_and(|carried| carried.contains(b)))
+    {
+        let weight = match item.severity {
+            Some(Severity::Irreversible) => "irreversible",
+            _ => "costly",
+        };
+        problems.push(Refusal::new(
+            format!(
+                "this item is {weight} but its only binding is the project name, which reaches you only when the owner \
+                 types that name in a prompt - never at a tool call, a command or a file"
+            ),
+            "bind it to the file or command it is about, or to the moment it applies at; pin it (Always) only if it \
+             must show at every session start, which costs tokens in every session; or set severity house_style if a \
+             prompt that names the project is enough, or write it as a Report",
         ));
     }
     // Ground 20: an anchor that is ONLY a symbol is an anchor that never fires.
@@ -1158,6 +1253,16 @@ fn combined(problems: Vec<Refusal>) -> Refusal {
 pub const NO_SCOPE_PROBLEM: &str = "this is archive material with no scope, so it joins the unscoped pile: it belongs to no collection, and opening one will never show it";
 
 pub fn declare(item: &Item) -> Result<(), Refusal> {
+    secret_ground(None, item)?;
+    declare_carried(item)
+}
+
+/// `declare` for an item that is ALREADY in the store, whose words are not
+/// being written again: archiving a dead rule, restoring one. Every ground
+/// except the secret scan - history keeps what it holds, and refusing to
+/// archive a note over a token it carried before the scan existed would only
+/// leave a dead rule live.
+pub fn declare_carried(item: &Item) -> Result<(), Refusal> {
     teeth_answer_contradictions(None, item)?;
     declare_inner(item, false, false, None)?;
     a4_ground(None, item, None)
@@ -1714,6 +1819,7 @@ fn check_machine_section_kept(existing: &Item, updated: &Item) -> Result<(), Ref
 /// The write-time gate for a revise: everything `declare` requires, PLUS no
 /// field the existing item had may silently vanish (refusal ground 9).
 pub fn revise(existing: &Item, updated: &Item) -> Result<(), Refusal> {
+    secret_ground(Some(existing), updated)?;
     teeth_answer_contradictions(Some(existing), updated)?;
     check_machine_section_kept(existing, updated)?;
     // The same concession for ground 20: an item that was ALREADY anchored to
@@ -1736,7 +1842,11 @@ pub fn revise(existing: &Item, updated: &Item) -> Result<(), Refusal> {
     // (never a filtered-down "just the dead ones"): ground 25 only ever
     // checks membership of one exact binding at a time, so handing it
     // everything already there costs nothing and needs no separate filter.
-    declare_inner(updated, carried_symbol_only, carried_unscoped, Some(&existing.bindings))?;
+    // Only a Rule or Orientation can have carried bindings (archive material
+    // may carry none), so only then does "carried nothing" mean an item that
+    // was ALREADY stored unbound (ground 1) and stays correctable.
+    let carried = existing.kind.can_fire().then_some(existing.bindings.as_slice());
+    declare_inner(updated, carried_symbol_only, carried_unscoped, carried)?;
     if !existing.bindings.is_empty() && updated.bindings.is_empty() {
         return Err(dropped_field("bindings"));
     }
@@ -3616,7 +3726,9 @@ mod tests {
             id: "id-1".to_string(),
             kind,
             text: "do the thing".to_string(),
-            bindings: vec![],
+            // An Orientation must carry a binding like a Rule (ground 1), so the
+            // default one is pinned; the tests of a Rule set their own.
+            bindings: if kind == Kind::Orientation { vec![Binding::Always] } else { vec![] },
             severity: None,
             // A project by default, for the same reason the falsifier below is
             // valid by default: ground 19 refuses a GLOBAL item that names a
@@ -3681,6 +3793,198 @@ mod tests {
     fn a_rule_with_no_binding_is_refused() {
         let item = base(Kind::Rule);
         assert!(declare(&item).is_err());
+    }
+
+    /// THE HOLE THIS CLOSES (2026-10-07): the gate refused only a Rule with no
+    /// binding, while the tool text and the unpin refusal both promise that a
+    /// Rule OR an Orientation is refused. Five live orientations were stored
+    /// unbound and had never once been served.
+    #[test]
+    fn an_orientation_with_no_binding_is_refused() {
+        let mut item = base(Kind::Orientation);
+        item.bindings = vec![];
+        let refusal = declare(&item).expect_err("an unbound orientation can never fire");
+        assert_eq!(refusal.problem, "an Orientation with no binding can never fire");
+        assert!(refusal.fix.contains("Always"), "the refusal names the pin as one exit: {}", refusal.fix);
+    }
+
+    /// The concession that keeps the backlog correctable: an orientation that
+    /// was stored unbound before this ground existed may still be revised for
+    /// anything else (a typo, a falsifier, a re-stamp by retest). Only a NEW
+    /// unbound one is refused, so nothing already there is ever demoted.
+    #[test]
+    fn an_orientation_that_was_already_unbound_stays_correctable() {
+        let mut existing = base(Kind::Orientation);
+        existing.bindings = vec![];
+        let mut updated = existing.clone();
+        updated.text = "do the thing, but now say why".to_string();
+        revise(&existing, &updated).expect("an old unbound orientation must stay correctable");
+
+        // A Report becoming an unbound Orientation is a NEW unbound item.
+        let report = base(Kind::Report);
+        let mut promoted = report.clone();
+        promoted.kind = Kind::Orientation;
+        revise(&report, &promoted).expect_err("a Report may not become an unbound Orientation");
+    }
+
+    // ----------------------------------------- a real secret in a note
+
+    /// A token assembled in code, so no scanner sees a whole one in the source.
+    fn fake_token() -> String {
+        format!("{}{}", ["gh", "p_"].concat(), "Qz".repeat(18))
+    }
+
+    fn bound(kind: Kind) -> Item {
+        let mut item = base(kind);
+        if kind.can_fire() {
+            item.bindings = vec![Binding::Always];
+        }
+        item
+    }
+
+    /// The log is append-only and the backup is that log pushed to a remote,
+    /// so a token written into a note can never be taken out again. It is
+    /// refused at the door, for every kind, and the refusal never says it back.
+    #[test]
+    fn a_note_carrying_a_known_token_is_refused_and_does_not_echo_it() {
+        let token = fake_token();
+        for kind in [Kind::Rule, Kind::Orientation, Kind::Report, Kind::Lookup, Kind::Chunk] {
+            let mut in_text = bound(kind);
+            in_text.key = Some("k".to_string());
+            in_text.text = format!("the deploy script logs in with {token} from the vault");
+            let mut in_falsifier = bound(kind);
+            in_falsifier.key = Some("k".to_string());
+            in_falsifier.falsifier = Some(format!("the login with {token} stops working"));
+            for (item, field) in [(in_text, "text"), (in_falsifier, "falsifier")] {
+                let refusal = declare(&item).expect_err("a token in a note is refused");
+                let whole = format!("{refusal}");
+                assert!(whole.contains(field), "names the field: {whole}");
+                assert!(whole.contains("GitHub token"), "names the shape: {whole}");
+                assert!(whole.contains("ghp_Qz"), "shows the first six characters: {whole}");
+                assert!(!whole.contains(&token), "never echoes the value: {whole}");
+                assert!(!whole.contains(&token[..token.len() - 4]), "never echoes most of it: {whole}");
+                assert!(whole.contains("WHERE the secret lives") && whole.contains("rotate"), "{whole}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_revise_that_writes_a_token_is_refused() {
+        let existing = bound(Kind::Rule);
+        let mut updated = existing.clone();
+        updated.text = format!("log in with {}", fake_token());
+        let refusal = revise(&existing, &updated).expect_err("a revise may not write a token");
+        assert!(refusal.problem.contains("GitHub token"), "{}", refusal.problem);
+    }
+
+    /// History cannot be cleaned, but a note that already carries one must not
+    /// become impossible to maintain: only a field THIS write changes is
+    /// scanned, so a re-stamp or a tag edit still goes through, and writing the
+    /// token again is still refused.
+    #[test]
+    fn a_note_that_already_carries_a_token_stays_correctable_in_other_fields() {
+        let mut existing = bound(Kind::Rule);
+        existing.text = format!("log in with {}", fake_token());
+        let mut retagged = existing.clone();
+        retagged.tags = vec!["housekeeping".to_string()];
+        revise(&existing, &retagged).expect("an unchanged field is not scanned again");
+
+        let mut reworded = existing.clone();
+        reworded.text = format!("always log in with {}", fake_token());
+        revise(&existing, &reworded).expect_err("a changed text that still holds the token is refused");
+
+        let mut cleaned = existing.clone();
+        cleaned.text = "log in with the token in the GH_TOKEN variable".to_string();
+        revise(&existing, &cleaned).expect("taking the token out is exactly the fix");
+    }
+
+    #[test]
+    fn a_note_that_talks_about_secrets_is_not_refused() {
+        for text in [
+            "never pass --password on the command line",
+            "primary key: id",
+            "the fix landed in 4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+            "a GitHub token starts with ghp_ and is checked by the push hook",
+            "Stripe keys start with sk_live_ or sk_test_; keep them in the STRIPE_KEY variable",
+            "never paste a PEM private key; it begins with a BEGIN line",
+        ] {
+            let mut rule = bound(Kind::Rule);
+            rule.text = text.to_string();
+            rule.falsifier = Some(text.to_string());
+            declare(&rule).unwrap_or_else(|r| panic!("'{text}' was refused: {r}"));
+        }
+    }
+
+    // ----------------------------------------- a weighted rule bound to a project only
+
+    fn project_binding() -> Binding {
+        Binding::Target { kind: TargetKind::Project, value: "test-project".to_string() }
+    }
+
+    /// THE SECOND WAY TO STORE A RULE THAT NEVER FIRES. A project binding
+    /// reaches a prompt where the owner types the project's name and nothing
+    /// else: no tool call, no command, no file. A costly or irreversible rule
+    /// bound only to it looks protective and never reaches the call it guards.
+    #[test]
+    fn a_costly_rule_bound_only_to_a_project_is_refused() {
+        for severity in [Severity::Costly, Severity::Irreversible] {
+            for kind in [Kind::Rule, Kind::Orientation] {
+                let mut item = base(kind);
+                item.severity = Some(severity);
+                item.bindings = vec![project_binding()];
+                let refusal = declare(&item).expect_err("a weighted project-only item never reaches a tool call");
+                assert!(refusal.problem.contains("project"), "{}", refusal.problem);
+                assert!(
+                    refusal.fix.contains("file") && refusal.fix.contains("command") && refusal.fix.contains("moment"),
+                    "the refusal names where to bind it instead: {}",
+                    refusal.fix
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_project_binding_is_fine_when_it_can_be_the_only_one() {
+        // Light: house_style or no severity fires only on the typed word, and says so.
+        for severity in [None, Some(Severity::HouseStyle)] {
+            let mut item = base(Kind::Rule);
+            item.severity = severity;
+            item.bindings = vec![project_binding()];
+            declare(&item).expect("a light project-only note is allowed");
+        }
+        // Weighted, but with a real way to fire beside the project.
+        for beside in [
+            Binding::Always,
+            Binding::Moment(Action::Push),
+            Binding::Target { kind: TargetKind::Path, value: "src/courier.rs".to_string() },
+            Binding::Target { kind: TargetKind::Command, value: "cargo".to_string() },
+        ] {
+            let mut item = base(Kind::Rule);
+            item.severity = Some(Severity::Costly);
+            item.bindings = vec![project_binding(), beside];
+            declare(&item).expect("a weighted item with a real way to fire is allowed");
+        }
+    }
+
+    /// Existing items are never demoted: a weighted project-only rule that is
+    /// already stored stays correctable, and only a binding NEW in this write
+    /// is judged.
+    #[test]
+    fn a_weighted_project_only_rule_already_stored_stays_correctable() {
+        let mut existing = base(Kind::Rule);
+        existing.severity = Some(Severity::Costly);
+        existing.bindings = vec![project_binding()];
+        let mut updated = existing.clone();
+        updated.text = "do the thing, but now say why".to_string();
+        revise(&existing, &updated).expect("an old project-only rule must stay correctable");
+
+        // ... but a rule that fires at a file may not be traded for a project-only one.
+        let mut fires = base(Kind::Rule);
+        fires.severity = Some(Severity::Costly);
+        fires.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "src/courier.rs".to_string() }];
+        let mut narrowed = fires.clone();
+        narrowed.bindings = vec![project_binding()];
+        revise(&fires, &narrowed).expect_err("a real anchor may not be traded for a project-only one");
     }
 
     // --------------------------------------------------------- ground 2

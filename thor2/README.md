@@ -853,6 +853,29 @@ sentence naming what would prove it wrong), and it has to fit in 300 characters.
 The gate refuses anything else and tells you exactly what to fix. That refusal
 is the gate working, not a bug.
 
+A rule or an orientation with no binding at all is refused: it could never
+fire. So is a costly or irreversible one whose only binding is a project name:
+that binding reaches a prompt in which you type the name, and never a tool call,
+a command or a file. Bind it to the file or command it is about, to the moment
+it applies at, or pin it (`always`, which costs tokens at every session start).
+A light note (`house_style` or no severity) may be bound to a project name alone;
+it then fires only when you type the name. Items stored before these two
+refusals stay correctable, and `doctor` counts them (the `no binding` and
+`project-only` lines) instead of saying `dead moments: none`.
+
+A note may not carry a real secret. The text and the falsifier of every kind of
+note are scanned for a short list of unmistakable token shapes (Stripe-style
+`sk_`/`pk_`/`rk_` live and test keys, GitHub `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`
+and `github_pat_`, Slack `xox`, AWS `AKIA`, `tskey-`, `sk-ant-`, `AIza`, a JWT,
+a PEM private key header), each with a minimum length so a sentence that merely
+mentions `ghp_` is fine. The words password or key, `name=value` and long hex
+(a commit sha) are not scanned. The refusal names the shape, shows the first six
+and last two characters and never the value, and there is no way around it: the
+log is append-only and its daily backup copies every write, so a stored secret
+can never be removed, only rotated. Write where the secret lives (a file or
+variable name) instead. If a live note already carries one, `doctor` prints a
+`secrets in notes` line (silent when there is none).
+
 A moment binding only works for a moment something actually produces: `push`,
 `commit`, `deploy` and the rest that `intent` derives from a real command or
 file, plus `remember` itself. `answer` and `claim_done` exist in the schema but

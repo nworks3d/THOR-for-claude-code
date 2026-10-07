@@ -3070,9 +3070,8 @@ pub fn dead_moment_bindings_line(db: &Path) -> String {
         return "dead moments: store unreadable, not checked".to_string();
     };
     let live = serve::live::live_items(&store);
-    let dead: Vec<&str> = live
-        .iter()
-        .filter(|li| li.item.kind.can_fire())
+    let fireable = || live.iter().filter(|li| li.item.kind.can_fire());
+    let dead: Vec<&str> = fireable()
         .filter(|li| !li.item.bindings.is_empty())
         .filter(|li| {
             li.item.bindings.iter().all(|b| {
@@ -3081,21 +3080,91 @@ pub fn dead_moment_bindings_line(db: &Path) -> String {
         })
         .map(|li| li.id.as_str())
         .collect();
-    if dead.is_empty() {
+    // The two other ways a live item can never fire at a tool call. The write
+    // gate refuses both for a NEW write (grounds 1 and 26) and counts nothing
+    // already stored, so they are counted here, never hidden behind "none".
+    let unbound: Vec<&str> = fireable().filter(|li| model::gate::is_unbound(&li.item)).map(|li| li.id.as_str()).collect();
+    let project_only: Vec<&str> =
+        fireable().filter(|li| model::gate::is_weighted_project_only(&li.item)).map(|li| li.id.as_str()).collect();
+    if dead.is_empty() && unbound.is_empty() && project_only.is_empty() {
         return "dead moments: none - every live item's bindings can actually fire".to_string();
     }
+    let sections: [(&str, &str, &str, &Vec<&str>); 3] = [
+        (
+            "dead moments",
+            "dead moment",
+            "bound ONLY to a moment nothing in serve ever fires (answer/claim_done) - re-bind each one with revise, \
+             to Always, a command or a file",
+            &dead,
+        ),
+        (
+            "no binding",
+            "no binding",
+            "with NO binding at all, so they can never fire - bind each one with revise, to Always, a command, a file \
+             or a moment, or retract it",
+            &unbound,
+        ),
+        (
+            "project-only",
+            "project-only",
+            "costly or irreversible and bound ONLY to a project name, which reaches a prompt where the owner types \
+             that name and never a tool call - bind each one with revise to the file or command it is about, or set \
+             severity house_style if the typed name is enough",
+            &project_only,
+        ),
+    ];
+    let mut out = Vec::new();
+    for (heading, each, what, ids) in sections {
+        if ids.is_empty() {
+            continue;
+        }
+        let mut section = format!("{heading}: {} live item(s) {what}", ids.len());
+        for id in ids.iter().take(NAMED_AT_MOST) {
+            section.push_str(&format!("\n  {each}: {id}"));
+        }
+        if ids.len() > NAMED_AT_MOST {
+            section.push_str(&format!("\n  {each}: and {} more, not named here", ids.len() - NAMED_AT_MOST));
+        }
+        out.push(section);
+    }
+    out.join("\n")
+}
+
+/// Doctor's `secrets in notes` line: how many live notes already carry a real
+/// secret token in their text or falsifier, found with the SAME function the
+/// write gate refuses with (`model::secrets`). Silent at zero.
+///
+/// It says plainly what cannot be done: the log is append-only, a retract
+/// keeps history, and the backup is that log pushed to a remote, so a token
+/// that is already in cannot be cleaned out, only rotated. It names the note
+/// ids and the shape, never a value.
+pub fn secrets_in_notes_line(db: &Path) -> Option<String> {
+    const NAMED_AT_MOST: usize = 10;
+    let store = EventStore::open_existing(db).ok()?;
+    let mut hits: Vec<(String, &'static str)> = Vec::new();
+    for li in serve::live::live_items(&store) {
+        let falsifier = li.item.falsifier.as_deref().unwrap_or("");
+        for found in model::secrets::find(&li.item.text).into_iter().chain(model::secrets::find(falsifier)) {
+            hits.push((li.id.clone(), found.shape));
+        }
+    }
+    if hits.is_empty() {
+        return None;
+    }
+    let notes: std::collections::BTreeSet<&str> = hits.iter().map(|(id, _)| id.as_str()).collect();
     let mut out = format!(
-        "dead moments: {} live item(s) bound ONLY to a moment nothing in serve ever fires (answer/claim_done) - \
-         re-bind each one with revise, to Always, a command or a file",
-        dead.len()
+        "secrets in notes: {} live note(s) carry what looks like a real secret token - the log is append-only and its \
+         backup copies it, so history cannot be cleaned: ROTATE each one, then revise the note to say where the secret \
+         lives (a file or variable name) instead of its value",
+        notes.len()
     );
-    for id in dead.iter().take(NAMED_AT_MOST) {
-        out.push_str(&format!("\n  dead moment: {id}"));
+    for (id, shape) in hits.iter().take(NAMED_AT_MOST) {
+        out.push_str(&format!("\n  secret: {id} ({shape})"));
     }
-    if dead.len() > NAMED_AT_MOST {
-        out.push_str(&format!("\n  dead moment: and {} more, not named here", dead.len() - NAMED_AT_MOST));
+    if hits.len() > NAMED_AT_MOST {
+        out.push_str(&format!("\n  secret: and {} more, not named here", hits.len() - NAMED_AT_MOST));
     }
-    out
+    Some(out)
 }
 
 /// Doctor's `command anchors never fired` line (step 40): the live rules and
@@ -3200,6 +3269,8 @@ pub fn report(
     // default rather than a "wal: fine" line on every ordinary run.
     lines.extend(wal_line_from_size(wal_size, db));
     lines.push(dead_moment_bindings_line(db));
+    // Silent at zero: a store with no secret in a note has nothing to say.
+    lines.extend(secrets_in_notes_line(db));
     lines.push(command_anchors_never_fired_line(db, full));
     lines.push(code_index_line(index_db, repo));
     lines.push(replica_line(db, replica));
@@ -6661,6 +6732,57 @@ mod tests {
         assert!(!line.contains("dead-10"), "and it stops at the cap: {line}");
         assert!(!line.contains("dead-11"), "{line}");
         assert!(line.contains("2 more"), "silence about the rest would read as done: {line}");
+    }
+
+    /// The two other ways a stored item never fires, counted instead of hidden
+    /// behind "none": no binding at all (an Orientation stored before ground 1
+    /// covered it), and a costly rule bound only to a project name.
+    #[test]
+    fn dead_moment_bindings_line_counts_unbound_and_project_only_items_instead_of_saying_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        let mut unbound = rule("orientation-with-no-binding");
+        unbound.kind = Kind::Orientation;
+        unbound.bindings = vec![];
+        legacy_declare(&mut store, &unbound);
+        let mut weighted = rule("costly-but-project-only");
+        weighted.severity = Some(model::item::Severity::Costly);
+        weighted.bindings = vec![Binding::Target { kind: TargetKind::Project, value: "acme".to_string() }];
+        legacy_declare(&mut store, &weighted);
+        let mut light = rule("light-and-project-only");
+        light.bindings = weighted.bindings.clone();
+        legacy_declare(&mut store, &light);
+
+        let line = dead_moment_bindings_line(&db);
+        assert!(!line.contains("none"), "{line}");
+        assert!(line.contains("no binding: 1 live item"), "{line}");
+        assert!(line.contains("orientation-with-no-binding"), "{line}");
+        assert!(line.contains("project-only: 1 live item"), "{line}");
+        assert!(line.contains("costly-but-project-only"), "{line}");
+        assert!(!line.contains("light-and-project-only"), "a light note is allowed to fire on the typed word: {line}");
+    }
+
+    /// A real token already in a note is counted, named by id and shape and
+    /// never by value, with the plain statement that history cannot be cleaned.
+    /// Silent when there is none.
+    #[test]
+    fn secrets_in_notes_line_names_the_note_and_the_shape_and_is_silent_at_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        legacy_declare(&mut store, &rule("clean-note"));
+        assert_eq!(secrets_in_notes_line(&db), None);
+
+        let token = format!("{}{}", ["gh", "p_"].concat(), "Qz".repeat(18));
+        let mut leaky = rule("leaky-note");
+        leaky.text = format!("log in with {token}");
+        legacy_declare(&mut store, &leaky);
+        let line = secrets_in_notes_line(&db).expect("one note carries a token");
+        assert!(line.contains("1 live note"), "{line}");
+        assert!(line.contains("leaky-note") && line.contains("GitHub token"), "{line}");
+        assert!(line.contains("cannot be cleaned") && line.contains("ROTATE"), "{line}");
+        assert!(!line.contains(&token), "{line}");
     }
 
     // ------------------------------------------------ command_anchors_never_fired_line (step 40)
