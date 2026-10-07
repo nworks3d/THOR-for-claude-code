@@ -73,6 +73,17 @@ fn a_dispute_with_a_because_lands_and_the_reason_is_in_history() {
     assert!(reply.starts_with("stored 'bundle'") && reply.contains("teeth: note by dispute"), "{reply}");
     let history = mcp.call("history", json!({ "id": "bundle" }));
     assert!(history.contains(&format!("(because: {REASON})")), "{history}");
+
+    // The evaluation's second call, "confirm the dispute": a revise naming
+    // only the id and a reason is accepted, keeps the verdict, and is in the
+    // history beside the first reason.
+    let restated = "checked the rule against its file: the example call is incidental, the rule stays true";
+    let reply = mcp.call("revise", json!({ "id": "bundle", "because": restated }));
+    println!("{reply}");
+    assert!(reply.starts_with("revised 'bundle'"), "{reply}");
+    let history = mcp.call("history", json!({ "id": "bundle" }));
+    assert!(history.contains(&format!("(because: {restated})")) && history.contains(&format!("(because: {REASON})")), "{history}");
+    assert!(get(&mut mcp, "bundle").check.is_none(), "still a note by dispute");
 }
 
 /// may_change: the same demand, the same message.
