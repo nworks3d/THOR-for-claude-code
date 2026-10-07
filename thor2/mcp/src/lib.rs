@@ -875,6 +875,51 @@ fn disputes_of(legitimate_calls: &[String], may_change: &[String], accept_refusi
     }
 }
 
+/// A dispute needs its reason (2026-10-07: 7 of 11 disputes one maintenance pass
+/// saved were wrong, and nothing had asked the writer to say why). Refuses a
+/// write that names any of the three dispute arguments with a `because` of
+/// fewer than `DISPUTE_REASON_MIN_CHARS` characters, offering the better path
+/// first. Nothing is tried or written on a refusal.
+fn refuse_a_dispute_without_reason(
+    because: Option<&str>,
+    legitimate_calls: &[String],
+    may_change: &[String],
+    accept_refusing: &[String],
+) -> Result<(), String> {
+    let named: Vec<&str> = [
+        ("legitimate_calls", !legitimate_calls.is_empty()),
+        ("may_change", !may_change.is_empty()),
+        ("accept_refusing", !accept_refusing.is_empty()),
+    ]
+    .iter()
+    .filter(|(_, used)| *used)
+    .map(|(name, _)| *name)
+    .collect();
+    if named.is_empty() {
+        return Ok(());
+    }
+    let said = because.map(str::trim).unwrap_or("");
+    let min = model::store::DISPUTE_REASON_MIN_CHARS;
+    if said.chars().count() >= min {
+        return Ok(());
+    }
+    let have = match said.chars().count() {
+        0 => "none was given".to_string(),
+        n => format!("the one given is {n} characters"),
+    };
+    Err(format!(
+        "REFUSED: {} is a dispute, and a dispute needs 'because': one sentence of at least {min} characters saying WHY the \
+         named span may change, or why the call is legitimate, while the rule stays true ({have}). Nothing was written. \
+         THE BETTER PATH FIRST: first try to hang a check on the literal that IS the rule's subject (name it in the \
+         rule's text, then pass check_kind and check_literals); dispute only an incidental span. A dispute turns a rule \
+         that bites into a note that can never refuse anything, and a wrong one stays hidden until someone audits it. \
+         If the span really is incidental, send the same call again with because, for example: because: \"the version \
+         number moves with every release, so that line may change while the rule stays true\". The reason is kept in \
+         this item's history (see 'history') and shown to the owner at the next evaluation.",
+        named.join(", ")
+    ))
+}
+
 /// THOR's trial of one write (`serve::teeth::trial_for_write`), with this
 /// server's cached corpus of real calls: loaded once per process and
 /// refreshed from the last seq it read on every later write (the trial does
@@ -1496,6 +1541,7 @@ ran it - a replica cannot attest it. Nothing was queued: file the report from a 
 fn replica_refusal_for_remember(store: &EventStore, args: &RememberArgs) -> Result<(), String> {
     refuse_a_forged_teeth_tag(&args.id, &args.tags)?;
     refuse_an_open_point_tag(&args.tags, None)?;
+    refuse_a_dispute_without_reason(args.because.as_deref(), &args.legitimate_calls, &args.may_change, &args.accept_refusing)?;
     let item = remembered_item(args)?;
     if is_evaluation_report(&item) {
         return Err(REPLICA_EVALUATION_REFUSAL.to_string());
@@ -1509,6 +1555,7 @@ fn replica_refusal_for_remember(store: &EventStore, args: &RememberArgs) -> Resu
 /// yet is left to the drain), including the widened weakenings and A4.
 fn replica_refusal_for_revise(store: &EventStore, args: &ReviseArgs) -> Result<(), String> {
     refuse_a_forged_teeth_tag(&args.id, args.tags.as_deref().unwrap_or(&[]))?;
+    refuse_a_dispute_without_reason(args.because.as_deref(), &args.legitimate_calls, &args.may_change, &args.accept_refusing)?;
     model::store::fence(store, ACTOR.into(), &args.id).map_err(|e| format!("REFUSED: {e}"))?;
     let Ok(existing) = model::store::show(store, &args.id) else { return Ok(()) };
     refuse_an_open_point_tag(args.tags.as_deref().unwrap_or(&[]), Some(&existing))?;
@@ -1703,24 +1750,31 @@ pub struct RememberArgs {
     /// (or key) on this same call, or the write is refused anyway.
     #[serde(default)]
     pub new_collection_named_by_owner: Option<String>,
+    /// REQUIRED with legitimate_calls, may_change or accept_refusing, and never needed otherwise:
+    /// one sentence of at least 20 characters saying WHY the named span may change, or why the
+    /// call is legitimate, while the rule stays true. It is kept in this item's history and shown
+    /// to the owner at the next evaluation. First try to hang a check on the literal that IS the
+    /// rule's subject; dispute only an incidental span.
+    #[serde(default)]
+    pub because: Option<String>,
     /// ONLY after a refusal said THOR built a tooth from this rule's own text and it bites: a real,
     /// whole call you name as LEGITIMATE although that tooth refuses it - e.g. ["git push
     /// --force-with-lease origin main"] for a rule whose text names `--force`. It must reach the
     /// tooth's command, be refused by it, differ from the forbidden form THOR built itself, and
     /// carry something beyond the command and the literal. Then the rule is stored as a note by
-    /// dispute, which doctor lists for the owner. Leave it out otherwise.
+    /// dispute, which doctor lists for the owner. Needs `because`. Leave it out otherwise.
     #[serde(default)]
     pub legitimate_calls: Vec<String>,
     /// ONLY after a refusal said THOR derived a contains check from this rule's text and a file: the
     /// span you name as one that MAY CHANGE in that file - e.g. ["version"] for a rule that names
     /// the version line of package.json. It must be exactly the derived check's literal. Then the
-    /// rule is stored as a note by dispute, which doctor lists for the owner. Leave it out otherwise.
+    /// rule is stored as a note by dispute, which doctor lists for the owner. Needs `because`. Leave it out otherwise.
     #[serde(default)]
     pub may_change: Vec<String>,
     /// ONLY after a refusal said your check would refuse most of the real calls it reaches: one of
     /// the calls it listed, named because refusing it IS the intent - e.g. ["git push origin main"]
     /// for a "never push this repository until the owner says so" ban. The rule stays on the rule
-    /// track, and doctor lists every rule kept this way. Otherwise narrow the check instead.
+    /// track, and doctor lists every rule kept this way. Needs `because`. Otherwise narrow the check instead.
     #[serde(default)]
     pub accept_refusing: Vec<String>,
 }
@@ -1898,7 +1952,10 @@ pub struct ReviseArgs {
     /// item's own history (see `history`), the same way retract's reason is,
     /// so the owner can read later why a rule lost its teeth. Blank or
     /// missing on one of those is refused outright. Accepted and stored on
-    /// any other revise too, but never required for one.
+    /// any other revise too, but never required for one - except that a revise
+    /// naming legitimate_calls, may_change or accept_refusing always needs it:
+    /// at least 20 characters saying why the span may change or the call is
+    /// legitimate while the rule stays true.
     #[serde(default)]
     pub because: Option<String>,
     /// ONLY after a refusal said THOR built a tooth from this rule's own text and it bites: a real,
@@ -1906,19 +1963,19 @@ pub struct ReviseArgs {
     /// --force-with-lease origin main"] for a rule whose text names `--force`. It must reach the
     /// tooth's command, be refused by it, differ from the forbidden form THOR built itself, and
     /// carry something beyond the command and the literal. Then the rule is stored as a note by
-    /// dispute, which doctor lists for the owner. Leave it out otherwise.
+    /// dispute, which doctor lists for the owner. Needs `because`. Leave it out otherwise.
     #[serde(default)]
     pub legitimate_calls: Vec<String>,
     /// ONLY after a refusal said THOR derived a contains check from this rule's text and a file: the
     /// span you name as one that MAY CHANGE in that file - e.g. ["version"] for a rule that names
     /// the version line of package.json. It must be exactly the derived check's literal. Then the
-    /// rule is stored as a note by dispute, which doctor lists for the owner. Leave it out otherwise.
+    /// rule is stored as a note by dispute, which doctor lists for the owner. Needs `because`. Leave it out otherwise.
     #[serde(default)]
     pub may_change: Vec<String>,
     /// ONLY after a refusal said your check would refuse most of the real calls it reaches: one of
     /// the calls it listed, named because refusing it IS the intent - e.g. ["git push origin main"]
     /// for a "never push this repository until the owner says so" ban. The rule stays on the rule
-    /// track, and doctor lists every rule kept this way. Otherwise narrow the check instead.
+    /// track, and doctor lists every rule kept this way. Needs `because`. Otherwise narrow the check instead.
     #[serde(default)]
     pub accept_refusing: Vec<String>,
 }
@@ -2480,6 +2537,7 @@ impl ThorMcpServer {
             // `refuse_a_forged_teeth_tag`'s own doc comment.
             refuse_a_forged_teeth_tag(&args.id, &args.tags)?;
             refuse_an_open_point_tag(&args.tags, None)?;
+            refuse_a_dispute_without_reason(args.because.as_deref(), &args.legitimate_calls, &args.may_change, &args.accept_refusing)?;
             let item = remembered_item(&args)?;
             refuse_a_worktree_only_check(
                 item.check.as_ref(),
@@ -2510,7 +2568,7 @@ impl ThorMcpServer {
             let att = stamp.att();
             refuse_a_side_door_on_a_frozen_item(s, &item.id, &att)?;
             let ctx = filing_context(s, &item, None, &stamp, &att)?;
-            match model::store::declare_in_scoped(
+            match model::store::declare_in_scoped_because(
                 s,
                 stamp.column(),
                 LINEAGE_ID,
@@ -2520,6 +2578,7 @@ impl ThorMcpServer {
                 ctx.as_ref(),
                 record.as_ref(),
                 Some(&att),
+                args.because.as_deref(),
             ) {
                 Ok(event) => {
                     let files = registered_root(s, &item);
@@ -2576,6 +2635,7 @@ impl ThorMcpServer {
             // forgery, it is the label surviving a revise that never
             // mentioned tags at all).
             refuse_a_forged_teeth_tag(&args.id, args.tags.as_deref().unwrap_or(&[]))?;
+            refuse_a_dispute_without_reason(args.because.as_deref(), &args.legitimate_calls, &args.may_change, &args.accept_refusing)?;
             let existing = model::store::show(s, &args.id).map_err(|e| format!("cannot revise: {e}"))?;
             // An open-point tag this call would ADD (step 14): refused, with
             // the way on. One the item already carries is left alone.
@@ -3974,6 +4034,7 @@ mod tests {
 
     fn base_remember(id: &str) -> RememberArgs {
         RememberArgs {
+            because: None,
             new_collection_named_by_owner: None,
             legitimate_calls: vec![],
             may_change: vec![],
@@ -4750,6 +4811,7 @@ mod tests {
     async fn retracting_a_rule_whose_check_holds_warns_and_names_the_check() {
         let srv = server();
         let args = RememberArgs {
+            because: None,
             new_collection_named_by_owner: None,
             legitimate_calls: vec![],
             may_change: vec![],
@@ -4807,6 +4869,7 @@ mod tests {
     async fn remember_with_a_reachable_forbidden_check_is_stored_wired_never_proven() {
         let srv = server();
         let args = RememberArgs {
+            because: None,
             new_collection_named_by_owner: None,
             legitimate_calls: vec![],
             may_change: vec![],
@@ -4865,6 +4928,7 @@ mod tests {
             );
         }
         let args = RememberArgs {
+            because: None,
             new_collection_named_by_owner: None,
             legitimate_calls: vec![],
             may_change: vec![],
@@ -4916,6 +4980,7 @@ mod tests {
     async fn remember_with_a_collapsed_anchor_is_stored_as_a_whole_command_ban() {
         let srv = server();
         let args = RememberArgs {
+            because: None,
             new_collection_named_by_owner: None,
             legitimate_calls: vec![],
             may_change: vec![],
@@ -4959,6 +5024,7 @@ mod tests {
     async fn remember_with_an_unreachable_forbidden_check_drops_it_and_stores_a_note() {
         let srv = server_knowing(&["p"]);
         let mut args = RememberArgs {
+            because: None,
             new_collection_named_by_owner: None,
             legitimate_calls: vec![],
             may_change: vec![],
@@ -4996,6 +5062,7 @@ mod tests {
     async fn revise_that_changes_only_text_reruns_the_trial_and_never_carries_the_old_label() {
         let srv = server();
         let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(RememberArgs {
+            because: None,
             new_collection_named_by_owner: None,
             legitimate_calls: vec![],
             may_change: vec![],
@@ -5037,6 +5104,7 @@ mod tests {
     async fn revise_clearing_tags_on_a_checked_item_still_keeps_the_existing_teeth_tag() {
         let srv = server();
         let mut args = RememberArgs {
+            because: None,
             new_collection_named_by_owner: None,
             legitimate_calls: vec![],
             may_change: vec![],
@@ -8478,6 +8546,7 @@ mod tests {
 
     fn blank_report(id: &str) -> RememberArgs {
         RememberArgs {
+            because: None,
             new_collection_named_by_owner: None,
             legitimate_calls: vec![],
             may_change: vec![],

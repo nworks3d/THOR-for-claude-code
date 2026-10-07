@@ -754,6 +754,26 @@ pub fn declare_in_scoped<'a>(
     trial: Option<&TrialRecord>,
     att: Option<&Att>,
 ) -> Result<Event, WriteError> {
+    declare_in_scoped_because(store, session_id, lineage_id, actor, item, root, ctx, trial, att, None)
+}
+
+/// `declare_in_scoped`, for a writer that gives a reason: `because` is spliced
+/// into the event body (`body_with_because`) the way a revise's is, so `history`
+/// shows it. A dispute (`legitimate_calls`, `may_change`, `accept_refusing`)
+/// on a new rule carries one, and the evaluation reads it back from here.
+#[allow(clippy::too_many_arguments)]
+pub fn declare_in_scoped_because<'a>(
+    store: &mut EventStore,
+    session_id: &str,
+    lineage_id: &str,
+    actor: impl Into<WriteActor<'a>>,
+    item: &Item,
+    root: Option<&Path>,
+    ctx: Option<&FilingContext>,
+    trial: Option<&TrialRecord>,
+    att: Option<&Att>,
+    because: Option<&str>,
+) -> Result<Event, WriteError> {
     let actor = actor.into();
     fence(store, actor, &item.id)?;
     if let Some(root) = root {
@@ -799,7 +819,7 @@ pub fn declare_in_scoped<'a>(
             }));
         }
     }
-    declare_gated(store, session_id, lineage_id, actor, item, ctx, trial, att, None)
+    declare_gated(store, session_id, lineage_id, actor, item, ctx, trial, att, None, because)
 }
 
 pub fn declare<'a>(
@@ -823,7 +843,7 @@ pub fn declare_scoped<'a>(
     ctx: Option<&FilingContext>,
     att: Option<&Att>,
 ) -> Result<Event, WriteError> {
-    declare_gated(store, session_id, lineage_id, actor.into(), item, ctx, None, att, None)
+    declare_gated(store, session_id, lineage_id, actor.into(), item, ctx, None, att, None, None)
 }
 
 /// Everything `declare_scoped` does, plus the trial record `declare_in_scoped`
@@ -841,6 +861,7 @@ fn declare_gated(
     trial: Option<&TrialRecord>,
     att: Option<&Att>,
     root: Option<(&str, &str)>,
+    because: Option<&str>,
 ) -> Result<Event, WriteError> {
     let actor = fence(store, actor, &item.id)?;
     let item = normalized(item);
@@ -897,7 +918,11 @@ fn declare_gated(
     // that passes is stored with THOR's machine section above the writer's
     // own text (step 15).
     let item = filed_evaluation_report(store, &item, None, ctx).map_err(WriteError::Refused)?.unwrap_or(item);
-    let mut body = canonical_body(&item).map_err(WriteError::Serialize)?;
+    let reason = because.map(str::trim).filter(|r| !r.is_empty());
+    let mut body = match reason {
+        Some(reason) => body_with_because(&item, reason).map_err(WriteError::Serialize)?,
+        None => canonical_body(&item).map_err(WriteError::Serialize)?,
+    };
     if let Some(trial) = trial {
         body = body_with_trial(&body, trial).map_err(WriteError::Serialize)?;
     }
@@ -1217,6 +1242,203 @@ fn body_with_root(body: &str, root: &str, at: &str) -> Result<String, serde_json
 /// cannot parse simply carries none.
 fn because_reason(body: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(body).ok()?.get("because")?.as_str().map(str::to_string)
+}
+
+// ------------------------------------------------ a dispute and its reason
+//
+// A dispute (`legitimate_calls`, `may_change`, `accept_refusing`) turns a rule
+// that bites into a note that cannot refuse anything, or keeps a check that
+// refuses real calls. Measured 2026-10-07: of 11 disputes one maintenance pass
+// saved, 7 were wrong (the disputed literal was the rule's real subject, or a
+// better check existed), and nothing had asked the writer why. So a dispute is
+// written with a `because` (the write tools refuse one without it), the reason
+// lives in the item's history like a revise's, and everything below reads it
+// back from the LOG: the evaluation's machine section lists every dispute with
+// its reason, the evaluation's batch hands each unverified one to the agent,
+// and doctor shows the reason beside it. A dispute from before this (no
+// reason) reads as "no reason recorded" everywhere, and THOR's retest never
+// carries one forward silently.
+
+/// The fewest characters a dispute's `because` may have.
+pub const DISPUTE_REASON_MIN_CHARS: usize = 20;
+
+/// What a dispute of `fields` names, as (argument, calls or spans) - only the
+/// arguments the writer used, in the order the door documents them.
+pub fn dispute_arguments(fields: &TrialFields) -> Vec<(String, Vec<String>)> {
+    [
+        ("legitimate_calls", &fields.disputes.legitimate_calls),
+        ("may_change", &fields.disputes.may_change),
+        ("accept_refusing", &fields.accept_refusing),
+    ]
+    .into_iter()
+    .filter(|(_, values)| !values.is_empty())
+    .map(|(name, values)| (name.to_string(), values.clone()))
+    .collect()
+}
+
+/// The reason the dispute recorded at log seq `seq` was written with: the
+/// `because` of the newest write by someone other than THOR's own actors, at
+/// or before `seq`, whose record named this same dispute. THOR's own retest
+/// carries a dispute forward under its own name, so its events are looked
+/// through. `None` when the writer gave none (every dispute stored before the
+/// reason was required), or when `seq` carries no dispute.
+pub fn dispute_reason(events: &[Event], seq: i64) -> Option<String> {
+    let mut wanted: Option<Vec<(String, Vec<String>)>> = None;
+    for event in events.iter().rev().filter(|e| e.seq <= seq) {
+        let Ok(Some(record)) = trial_of(event) else { continue };
+        let arguments = dispute_arguments(record.fields());
+        match &wanted {
+            None if arguments.is_empty() => return None,
+            None => wanted = Some(arguments),
+            Some(first) if *first != arguments => return None,
+            Some(_) => {}
+        }
+        if RESERVED_ACTORS.contains(&event.actor.as_str()) {
+            continue;
+        }
+        if let Some(reason) = because_reason(&event.body).map(|r| r.trim().to_string()).filter(|r| !r.is_empty()) {
+            return Some(reason);
+        }
+    }
+    None
+}
+
+/// The log seq where the run of records naming the dispute that `seq` carries
+/// began: a retest that carries a dispute forward writes a newer record of the
+/// same dispute, and that is not a new dispute.
+fn dispute_origin(events: &[Event], seq: i64) -> i64 {
+    let mut wanted: Option<Vec<(String, Vec<String>)>> = None;
+    let mut origin = seq;
+    for event in events.iter().rev().filter(|e| e.seq <= seq) {
+        let Ok(Some(record)) = trial_of(event) else { continue };
+        let arguments = dispute_arguments(record.fields());
+        match &wanted {
+            None => wanted = Some(arguments),
+            Some(first) if *first != arguments => break,
+            Some(_) => {}
+        }
+        origin = event.seq;
+    }
+    origin
+}
+
+/// The reason the dispute `id` stands on today was written with: see
+/// `dispute_reason`. `None` for an item that carries no dispute, too.
+pub fn current_dispute_reason(store: &EventStore, id: &str) -> Option<String> {
+    let events = store.get_events_by_entity(id).ok()?;
+    let last = events.iter().rev().find(|e| matches!(trial_of(e), Ok(Some(_))))?.seq;
+    dispute_reason(&events, last)
+}
+
+/// A later write by the agent that answers a dispute: a revise with a reason
+/// (`because`) after log seq `after` by anyone but THOR's own actors. It
+/// confirms the dispute (the reason restates why) - or it came with the check
+/// that replaced the dispute, which no longer carries one.
+fn dispute_answered_since(events: &[Event], after: i64) -> Option<&Event> {
+    events.iter().find(|e| {
+        e.seq > after
+            && e.kind == EventKind::FactRevised
+            && !RESERVED_ACTORS.contains(&e.actor.as_str())
+            && because_reason(&e.body).is_some_and(|r| !r.trim().is_empty())
+    })
+}
+
+/// One dispute an evaluation hands to the agent to verify (`MachinePass::disputes`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisputeItem {
+    pub id: String,
+    /// The log seq of the write that first carried this dispute.
+    pub seq: i64,
+    /// What it names: (argument, calls or spans), only the arguments used.
+    pub arguments: Vec<(String, Vec<String>)>,
+    /// The writer's reason; `None` for a dispute stored before one was required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub because: Option<String>,
+}
+
+/// Every dispute of `project`'s rules (its own and global) that nobody has
+/// answered yet and that was written after log seq `since` (the project's
+/// previous evaluation report) or was left over from the previous evaluation's
+/// list (`carried`): oldest first, the left-over ones before the rest. A
+/// dispute is "answered" once the agent revised the rule with a reason after
+/// it was written (`dispute_answered_since`); one that has been replaced by a
+/// check is no dispute any more and is not listed.
+pub fn unverified_disputes(store: &EventStore, project: &str, since: i64, carried: &[String]) -> Vec<DisputeItem> {
+    let mut found: Vec<(Option<usize>, i64, DisputeItem)> = Vec::new();
+    for (id, item) in all_live_items(store) {
+        if !item.kind.can_fire() || !project_applies_to(item.project.as_deref(), Some(project)) {
+            continue;
+        }
+        let Some(record) = current_record(store, &id) else { continue };
+        let arguments = dispute_arguments(record.fields());
+        if arguments.is_empty() {
+            continue;
+        }
+        let Ok(events) = store.get_events_by_entity(&id) else { continue };
+        let Some(last) = events.iter().rev().find(|e| matches!(trial_of(e), Ok(Some(_)))).map(|e| e.seq) else { continue };
+        let origin = dispute_origin(&events, last);
+        let left_over = carried.iter().position(|c| *c == id);
+        if dispute_answered_since(&events, origin).is_some() || (origin <= since && left_over.is_none()) {
+            continue;
+        }
+        let because = dispute_reason(&events, last);
+        found.push((left_over, origin, DisputeItem { id, seq: origin, arguments, because }));
+    }
+    found.sort_by(|a, b| {
+        match (a.0, b.0) {
+            (Some(x), Some(y)) => x.cmp(&y),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.1.cmp(&b.1),
+        }
+        .then_with(|| a.2.id.cmp(&b.2.id))
+    });
+    found.into_iter().map(|(_, _, item)| item).collect()
+}
+
+/// The dispute on `id`, frozen on `start`'s dispute list, in words, when it
+/// is still to be answered: `None` once the rule is gone, off the rule track,
+/// carries no dispute any more (a check replaced it), or the agent revised it
+/// with a reason after the start. What the filing gate holds a report to.
+fn dispute_owed(store: &EventStore, id: &str, start: &EvaluationStart) -> Option<String> {
+    let item = show(store, id).ok()?;
+    if !item.kind.can_fire() {
+        return None;
+    }
+    let record = current_record(store, id)?;
+    let arguments = dispute_arguments(record.fields());
+    if arguments.is_empty() {
+        return None;
+    }
+    let events = store.get_events_by_entity(id).ok()?;
+    if dispute_answered_since(&events, start.frozen.started_seq).is_some() {
+        return None;
+    }
+    Some(format!("a dispute ({}) nobody has verified", dispute_in_words(&arguments)))
+}
+
+/// A dispute's arguments in words: "may_change ['version'], legitimate_calls ['a call']".
+pub fn dispute_in_words(arguments: &[(String, Vec<String>)]) -> String {
+    arguments
+        .iter()
+        .map(|(name, values)| {
+            let list = values.iter().map(|v| format!("'{}'", plain(v))).collect::<Vec<_>>().join(", ");
+            format!("{name} [{list}]")
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The disputes on `start`'s frozen dispute list that are still to be
+/// answered, each with its reason in words, in the order they were frozen.
+pub fn evaluation_frozen_disputes_owed(store: &EventStore, start: &EvaluationStart) -> Vec<(String, String)> {
+    start
+        .frozen
+        .dispute_list()
+        .iter()
+        .filter(|d| credited_to_other_session(store, start, &d.id).is_none())
+        .filter_map(|d| dispute_owed(store, &d.id, start).map(|why| (d.id.clone(), why)))
+        .collect()
 }
 
 // ------------------------------------------------ the verdict in the log (A1, A6)
@@ -4162,8 +4384,8 @@ fn changes_an_item(kind: EventKind) -> bool {
     moves_the_head(kind) || kind == EventKind::FactReprojected
 }
 
-/// Every id on `start`'s frozen lists - judgement, batch, A4 list - once
-/// each, in that order.
+/// Every id on `start`'s frozen lists - judgement, batch, A4 list, disputes to
+/// verify - once each, in that order.
 pub fn frozen_ids(start: &EvaluationStart) -> Vec<String> {
     let mut seen: HashSet<&str> = HashSet::new();
     start
@@ -4172,6 +4394,7 @@ pub fn frozen_ids(start: &EvaluationStart) -> Vec<String> {
         .iter()
         .chain(start.frozen.batch())
         .chain(start.frozen.a4_list())
+        .chain(start.frozen.dispute_list().iter().map(|d| &d.id))
         .filter(|id| seen.insert(id.as_str()))
         .cloned()
         .collect()
@@ -4326,6 +4549,11 @@ pub const EVALUATION_OPEN_HOURS: i64 = 16;
 /// Q24).
 pub const EVALUATION_A4_LIST: usize = 16;
 
+/// How many disputes one evaluation hands to the agent to verify: the batch's
+/// own cap (`EVALUATION_TEETH_BATCH`) - one real look at one rule's file per
+/// item, which is what a dispute asks for. The rest wait for the next one.
+pub const EVALUATION_DISPUTE_LIST: usize = EVALUATION_TEETH_BATCH;
+
 /// A blocker as the start record keeps it (`Blocker`, in a serde shape).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MachineBlocker {
@@ -4460,6 +4688,14 @@ pub struct MachinePass {
     /// How long the pass had, in seconds (its time box).
     #[serde(default)]
     pub box_secs: u64,
+    /// The disputes the agent is to verify in this evaluation: every
+    /// unanswered dispute written since the project's previous report (or left
+    /// over from the previous list), at most `EVALUATION_DISPUTE_LIST`.
+    #[serde(default)]
+    pub disputes: Vec<DisputeItem>,
+    /// The ids of the disputes that did not fit; the next start lists them first.
+    #[serde(default)]
+    pub disputes_later_ids: Vec<String>,
 }
 
 impl MachinePass {
@@ -4673,6 +4909,11 @@ impl Frozen {
     /// The frozen A4 list; empty while the machine pass has not finished.
     pub fn a4_list(&self) -> &[String] {
         self.a4_list.as_deref().unwrap_or(&[])
+    }
+
+    /// The frozen disputes to verify; empty while the machine pass has not finished.
+    pub fn dispute_list(&self) -> &[DisputeItem] {
+        self.machine.as_ref().map(|m| m.disputes.as_slice()).unwrap_or(&[])
     }
 
     /// Whether the evaluation was closed as void (`Frozen::void`).
@@ -5816,6 +6057,26 @@ fn check_evaluation_report_filing(store: &EventStore, item: &Item, ctx: Option<&
         ));
     }
 
+    // THE DISPUTES TO VERIFY: the ones the start record froze. Settled by the
+    // agent's own revise of the rule - the real check, or its reason restated.
+    let disputes_owed = evaluation_frozen_disputes_owed(store, start);
+    if !disputes_owed.is_empty() {
+        let named = disputes_owed.iter().map(|(id, why)| format!("'{id}' ({why})")).collect::<Vec<_>>().join(", ");
+        missing.push(format!(
+            "{} dispute(s) on this evaluation's frozen dispute list (at most {EVALUATION_DISPUTE_LIST}, fixed by THOR's \
+             pass at the start) have not been verified: {named}. A dispute named a span that may change or a call that \
+             is legitimate, and that is why the rule is a note or refuses real calls; an audit found 7 of 11 such \
+             disputes wrong. For each one open the rule and the file or command it is about and decide whether the \
+             disputed literal IS what the rule is about. If it is, hang the real check with mcp__thor__revise(id: \"<id>\", \
+             check_kind: \"forbidden\", check_literals: [\"<the literal>\"]) - or check_kind \"contains\" with \
+             check_path and check_literal for a file - and name the literal in the rule's text. If it is only an \
+             incidental span, confirm it with mcp__thor__revise(id: \"<id>\", because: \"<why this span may change \
+             while the rule stays true, at least {DISPUTE_REASON_MIN_CHARS} characters>\"). Either call settles it; a \
+             tag, a note elsewhere or a report that says it was checked settles nothing",
+            disputes_owed.len()
+        ));
+    }
+
     // WRITES OF THE FILING TURN: stamped as this session's own THOR calls,
     // not verified yet. They count as not yet attested, and ending the turn
     // once is the whole of what settles them.
@@ -6199,6 +6460,64 @@ fn earlier_rounds(store: &EventStore, log: &LogAt, start: &EvaluationStart, file
     lines
 }
 
+/// THE DISPUTES OF THE WINDOW, from the log, one line per item: every note by
+/// dispute and every rule kept with accept_refusing written between the start
+/// and the filing, with the argument, the calls or spans it names and the
+/// writer's own reason ("no reason recorded" when there is none - a dispute
+/// from before a reason was required, or a call that gave none). When the
+/// agent revised the rule with a reason afterwards, the line says so: that is
+/// the dispute verified. The evaluating session types none of it.
+fn disputes_in_window(window: &[Event], log: &LogAt, project: Option<&str>, session: &str) -> String {
+    let mut disputes: Vec<String> = Vec::new();
+    let mut accepted: Vec<String> = Vec::new();
+    for event in window.iter().filter(|e| matches!(e.kind, EventKind::FactRevised | EventKind::FactCreated)) {
+        let (Some(item), Ok(Some(record))) = (parse_body(&event.body).ok(), trial_of(event)) else { continue };
+        if !project_applies_to(item.project.as_deref(), project) {
+            continue;
+        }
+        let fields = record.fields();
+        let by_dispute =
+            fields.verdict == RecordedVerdict::Note && (!fields.disputes.legitimate_calls.is_empty() || !fields.disputes.may_change.is_empty());
+        let kept = !fields.accept_refusing.is_empty();
+        if !by_dispute && !kept {
+            continue;
+        }
+        let events = log.entity(&event.entity_id);
+        let verdicts = recorded_write_verdicts(&events);
+        let door = door_words(&write_door(event, &verdicts, session));
+        let reason = dispute_reason(&events, event.seq).map(|r| plain(&r)).unwrap_or_else(|| "no reason recorded".to_string());
+        let verified = dispute_answered_since(&events, event.seq)
+            .map(|e| {
+                format!(
+                    " - since then verified at log seq {} by {}: {}",
+                    e.seq,
+                    door_words(&write_door(e, &verdicts, session)),
+                    plain(&because_reason(&e.body).unwrap_or_default())
+                )
+            })
+            .unwrap_or_default();
+        let id = plain(&event.entity_id);
+        let named = |names: &[&str]| {
+            let used: Vec<(String, Vec<String>)> =
+                dispute_arguments(fields).into_iter().filter(|(name, _)| names.contains(&name.as_str())).collect();
+            dispute_in_words(&used)
+        };
+        if by_dispute {
+            let what = named(&["legitimate_calls", "may_change"]);
+            disputes.push(format!("\n- '{id}' at log seq {} by {door}: {what} - because: {reason}{verified}", event.seq));
+        }
+        if kept {
+            let what = named(&["accept_refusing"]);
+            accepted.push(format!("\n- '{id}' at log seq {} by {door}: {what} - because: {reason}{verified}", event.seq));
+        }
+    }
+    let mut out = format!("\nnotes by dispute written in the window: {}.", disputes.len());
+    disputes.iter().for_each(|line| out.push_str(line));
+    out.push_str(&format!("\nrules kept with accept_refusing written in the window: {}.", accepted.len()));
+    accepted.iter().for_each(|line| out.push_str(line));
+    out
+}
+
 pub fn render_machine_section(store: &EventStore, start: &EvaluationStart, filed_seq: i64) -> String {
     machine_section(store, start, filed_seq).0
 }
@@ -6379,33 +6698,12 @@ fn machine_section(store: &EventStore, start: &EvaluationStart, filed_seq: i64) 
     // a check too (a note, by its trial) and are the pass's, so only a write
     // by someone else is listed.
     let mut checks: Vec<String> = Vec::new();
-    let mut disputes: Vec<String> = Vec::new();
-    let mut accepted: Vec<String> = Vec::new();
     for event in window.iter().filter(|e| matches!(e.kind, EventKind::FactRevised | EventKind::FactRetracted | EventKind::FactCreated)) {
         let events = log.entity(&event.entity_id);
         let verdicts = recorded_write_verdicts(&events);
         let door = door_words(&write_door(event, &verdicts, session));
         let id = plain(&event.entity_id);
         let after = parse_body(&event.body).ok();
-        if let (Some(item), Ok(Some(record))) = (&after, trial_of(event)) {
-            if project_applies_to(item.project.as_deref(), project) {
-                let fields = record.fields();
-                let quoted = |list: &[String]| list.iter().map(|c| format!("'{}'", plain(c))).collect::<Vec<_>>().join(", ");
-                if fields.verdict == RecordedVerdict::Note
-                    && (!fields.disputes.legitimate_calls.is_empty() || !fields.disputes.may_change.is_empty())
-                {
-                    disputes.push(format!(
-                        "\n- '{id}' at log seq {} by {door}: legitimate_calls [{}], may_change [{}]",
-                        event.seq,
-                        quoted(&fields.disputes.legitimate_calls),
-                        quoted(&fields.disputes.may_change)
-                    ));
-                }
-                if !fields.accept_refusing.is_empty() {
-                    accepted.push(format!("\n- '{id}' at log seq {} by {door}: [{}]", event.seq, quoted(&fields.accept_refusing)));
-                }
-            }
-        }
         if event.kind == EventKind::FactCreated {
             continue;
         }
@@ -6485,10 +6783,7 @@ fn machine_section(store: &EventStore, start: &EvaluationStart, filed_seq: i64) 
     ));
     checks.iter().for_each(|line| out.push_str(line));
     summary.checks_weakened = checks.len();
-    out.push_str(&format!("\nnotes by dispute written in the window: {}.", disputes.len()));
-    disputes.iter().for_each(|line| out.push_str(line));
-    out.push_str(&format!("\nrules kept with accept_refusing written in the window: {}.", accepted.len()));
-    accepted.iter().for_each(|line| out.push_str(line));
+    out.push_str(&disputes_in_window(&window, &log, project, session));
 
     // ---- OPEN POINTS: THOR's own as the start's pass left them, each with
     // how many valid evaluations carried it (recorded by the validator,
@@ -7307,7 +7602,7 @@ pub fn declare_project_record(
 ) -> Result<Event, WriteError> {
     fence(store, actor.into(), &item.id)?;
     refuse_unless_project_record(&item.id)?;
-    declare_gated(store, "install", "install", actor.into(), item, None, None, None, Some((root, at)))
+    declare_gated(store, "install", "install", actor.into(), item, None, None, None, Some((root, at)), None)
 }
 
 /// Register (or move) the working copy on an existing project record: one
@@ -10038,6 +10333,157 @@ mod tests {
         );
         assert!(!section.contains("'noted-here'"), "THOR's own verdict is not an agent's weakening: {section}");
         assert_eq!(machine_section_summary(&store, &start, filed_seq).checks_weakened, 2);
+    }
+
+    /// A rule stored by dispute, the way the write tools store one: a Note
+    /// whose record carries what `edit` puts in it, and the writer's `because`
+    /// spliced into the event body.
+    fn declare_disputed(store: &mut EventStore, id: &str, because: Option<&str>, edit: impl FnOnce(&mut TrialFields)) -> Event {
+        let mut item = plain_note(id);
+        // Distinct words per id, or the gate reads two of them as one fact.
+        let stem: String = id.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+        item.text = format!("{stem}aa {stem}bb {stem}cc {stem}dd {stem}ee {stem}ff {stem}gg {stem}hh.");
+        let mut fields = trial_fields(&item, RecordedVerdict::Note);
+        edit(&mut fields);
+        let record = TrialRecord::seal(fields);
+        declare_in_scoped_because(store, "s", "l", "a", &item, None, None, Some(&record), None, because).unwrap()
+    }
+
+    fn may_change(span: &str) -> impl FnOnce(&mut TrialFields) {
+        let span = span.to_string();
+        move |f| f.disputes.may_change = vec![span]
+    }
+
+    /// The disputes of the window, one line each, derived from the log: the
+    /// argument, the calls or spans it names and the writer's own reason -
+    /// "no reason recorded" when there is none.
+    #[test]
+    fn the_machine_section_lists_every_dispute_with_its_argument_its_literal_and_its_reason() {
+        let mut store = EventStore::in_memory().unwrap();
+        let start = record_start(&mut store, "md-session", "demo");
+        declare_disputed(&mut store, "dsp-span", Some("the version line moves with every release, so it may change"), may_change("version"));
+        declare_disputed(&mut store, "dsp-call", None, |f| {
+            f.disputes.legitimate_calls = vec!["git bundle list-heads backup.bundle".to_string()]
+        });
+        declare_disputed(&mut store, "dsp-kept", Some("refusing every push is the whole intent of this ban"), |f| {
+            f.accept_refusing = vec!["git push origin main".to_string()]
+        });
+        let filed_seq = store.get_next_seq().unwrap() - 1;
+        let section = render_machine_section(&store, &start, filed_seq);
+        assert!(section.contains("\nnotes by dispute written in the window: 2.\n- 'dsp-span' at log seq"), "{section}");
+        assert!(
+            section.contains(": may_change ['version'] - because: the version line moves with every release, so it may change"),
+            "{section}"
+        );
+        assert!(
+            section.contains(": legitimate_calls ['git bundle list-heads backup.bundle'] - because: no reason recorded"),
+            "a dispute with no reason says so: {section}"
+        );
+        assert!(section.contains("\nrules kept with accept_refusing written in the window: 1.\n- 'dsp-kept' at log seq"), "{section}");
+        assert!(
+            section.contains(": accept_refusing ['git push origin main'] - because: refusing every push is the whole intent of this ban"),
+            "{section}"
+        );
+        assert!(section.is_ascii() && !section.contains('\r'), "plain ASCII, LF only");
+    }
+
+    /// The agent's later revise with a reason is the dispute verified, and the
+    /// section says so on the same line.
+    #[test]
+    fn the_machine_section_says_when_a_dispute_was_verified_afterwards() {
+        let mut store = EventStore::in_memory().unwrap();
+        let start = record_start(&mut store, "mv-session", "demo");
+        declare_disputed(&mut store, "dsp-later", Some("the first reason, written with the dispute"), may_change("version"));
+        let existing = show(&store, "dsp-later").unwrap();
+        let seq = revise_tried_scoped(&mut store, "mv-session", "l", "a", &existing, &existing, &existing, Some("restated: only the version number moves"), None, None, None, None)
+            .unwrap()
+            .seq;
+        let filed_seq = store.get_next_seq().unwrap() - 1;
+        let section = render_machine_section(&store, &start, filed_seq);
+        assert!(section.contains(&format!("- since then verified at log seq {seq} by ")), "{section}");
+        assert!(section.contains(": restated: only the version number moves"), "{section}");
+    }
+
+    /// THOR's own retest carries a dispute forward under its own name; the
+    /// reason is still the writer's, looked up through it.
+    #[test]
+    fn a_dispute_reason_is_read_through_thors_own_retest_writes() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare_disputed(&mut store, "dsp-carried", Some("the version line moves with every release"), may_change("version"));
+        let existing = show(&store, "dsp-carried").unwrap();
+        let mut fields = trial_fields(&existing, RecordedVerdict::Note);
+        fields.disputes.may_change = vec!["version".to_string()];
+        let record = TrialRecord::seal(fields);
+        revise_tried_scoped(&mut store, "retest", "l", SystemActor::new("retest"), &existing, &existing, &existing, Some("no tooth bites"), None, Some(&record), None, None)
+            .unwrap();
+        assert_eq!(current_dispute_reason(&store, "dsp-carried").as_deref(), Some("the version line moves with every release"));
+        declare_disputed(&mut store, "dsp-silent", None, may_change("version"));
+        assert_eq!(current_dispute_reason(&store, "dsp-silent"), None, "no reason was ever recorded");
+        assert_eq!(current_dispute_reason(&store, "no-such-item"), None);
+    }
+
+    /// Which disputes an evaluation hands to the agent: the ones written since
+    /// the previous report, plus the left-over ones first, minus the answered.
+    #[test]
+    fn unverified_disputes_follow_the_window_the_carry_and_the_answers() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare_disputed(&mut store, "old-one", None, may_change("version"));
+        let since = store.get_next_seq().unwrap() - 1;
+        declare_disputed(&mut store, "new-one", Some("only the version number moves, never the rule"), may_change("version"));
+        declare_disputed(&mut store, "new-two", None, may_change("version"));
+        declare_disputed(&mut store, "new-answered", None, may_change("version"));
+        let existing = show(&store, "new-answered").unwrap();
+        revise_tried_scoped(&mut store, "s", "l", "a", &existing, &existing, &existing, Some("restated: the span is incidental"), None, None, None, None)
+            .unwrap();
+        let ids = |carried: &[String]| -> Vec<String> {
+            unverified_disputes(&store, "demo", since, carried).into_iter().map(|d| d.id).collect()
+        };
+        assert_eq!(ids(&[]), ["new-one", "new-two"], "after the window, answered ones left out");
+        assert_eq!(ids(&["old-one".to_string()]), ["old-one", "new-one", "new-two"], "a left-over one comes first");
+        let list = unverified_disputes(&store, "demo", since, &[]);
+        assert_eq!(list[0].because.as_deref(), Some("only the version number moves, never the rule"));
+        assert_eq!(list[1].because, None);
+        assert_eq!(list[0].arguments, [("may_change".to_string(), vec!["version".to_string()])]);
+        assert!(unverified_disputes(&store, "other-project", since, &[]).is_empty(), "another project's rules are not listed");
+    }
+
+    /// A start freezes the disputes; the filing is held until the agent has
+    /// answered each one with its own revise and a reason, and nothing else
+    /// answers it.
+    #[test]
+    fn a_frozen_dispute_holds_the_filing_until_the_agent_answers_it() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare_disputed(&mut store, "dsp-held", Some("the version line moves with every release"), may_change("version"));
+        let first = record_start_only(&mut store, "gd-session", "demo");
+        let pass = MachinePass { disputes: unverified_disputes(&store, "demo", 0, &[]), ..MachinePass::default() };
+        let start = record_evaluation_batch(&mut store, SystemActor::new(EVAL_MACHINE_ACTOR), &first, "fixture, decided", vec![], 0, vec![], pass)
+            .unwrap();
+        assert_eq!(start.frozen.dispute_list().len(), 1);
+        assert!(frozen_ids(&start).contains(&"dsp-held".to_string()), "a frozen dispute is a frozen item");
+
+        let err = file_in(&mut store, &eval_report("eval-demo-1", "demo"), &start).unwrap_err();
+        let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
+        assert!(refusal.problem.contains("1 dispute(s) on this evaluation's frozen dispute list"), "{}", refusal.problem);
+        assert!(refusal.problem.contains("'dsp-held'") && refusal.problem.contains("may_change ['version']"), "{}", refusal.problem);
+        assert!(refusal.problem.contains("mcp__thor__revise(id: \"<id>\", because:"), "{}", refusal.problem);
+
+        // A revise that gives no reason answers nothing.
+        let existing = show(&store, "dsp-held").unwrap();
+        let mut reworded = existing.clone();
+        reworded.tags = vec!["a-tag".to_string()];
+        let silent = revise_tried_scoped(&mut store, "gd-session", "l", "a", &existing, &reworded, &existing, None, None, None, None, None).unwrap().seq;
+        attest(&mut store, "gd-session", "dsp-held", silent);
+        assert_eq!(evaluation_frozen_disputes_owed(&store, &start).len(), 1);
+
+        // One with a reason does.
+        let existing = show(&store, "dsp-held").unwrap();
+        let answered =
+            revise_tried_scoped(&mut store, "gd-session", "l", "a", &existing, &existing, &existing, Some("only the version number moves, never the rule"), None, None, None, None)
+                .unwrap()
+                .seq;
+        attest(&mut store, "gd-session", "dsp-held", answered);
+        assert!(evaluation_frozen_disputes_owed(&store, &start).is_empty());
+        file_in(&mut store, &eval_report("eval-demo-1", "demo"), &start).expect("answered, so the report files");
     }
 
     /// THE OWNER'S GO (step 26), at the write gate: the marker of a rule marked

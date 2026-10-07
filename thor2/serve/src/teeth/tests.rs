@@ -698,6 +698,39 @@ fn g7b_4_may_change_turns_a_derived_contains_into_a_note_by_dispute() {
     assert_eq!(t.record.as_ref().unwrap().fields().disputes.may_change, vec!["version".to_string()]);
 }
 
+/// A retest carries a recorded dispute forward only when the writer's reason
+/// is on record. A dispute stored with none (every one from before a reason was
+/// required) is not carried: THOR tries the rule without it and says so, so a
+/// retest never writes a dispute nobody explained.
+#[test]
+fn a_retest_carries_a_dispute_only_when_its_reason_is_on_record() {
+    let mut fx = Fx::new();
+    let dispute = Disputes { legitimate_calls: vec!["git bundle list-heads backup.bundle".to_string()], ..Default::default() };
+    let store = |fx: &mut Fx, item: &Item, because: Option<&str>| {
+        let t = fx.run(item, None, &SessionCtx::default(), &dispute);
+        let stored = stored_item(item, &t).unwrap();
+        model::store::declare_in_scoped_because(&mut fx.store, "s", "l", "a", &stored, None, None, t.record.as_ref(), None, because).unwrap();
+    };
+    let reasoned = rule("lh-reasoned", "Never run `git bundle list-heads` on a backup.", vec![cmd("git bundle")], None, None);
+    store(&mut fx, &reasoned, Some("list-heads is only the example, the rule is about cloning the bundle"));
+    let silent = rule("lh-silent", "Avoid zzz qqq www `git bundle list-heads` for eee rrr ttt.", vec![cmd("git bundle")], None, None);
+    store(&mut fx, &silent, None);
+
+    let carried = fx.retest("lh-reasoned");
+    assert!(matches!(carried.outcome, Maintenance::Note { .. }), "{:?}\n{:?}", carried.outcome, carried.lines);
+    let (_, record) = carried.write.as_ref().expect("a note to write");
+    assert_eq!(record.fields().disputes.legitimate_calls, dispute.legitimate_calls, "the explained dispute is kept");
+
+    let dropped = fx.retest("lh-silent");
+    assert!(matches!(dropped.outcome, Maintenance::NeedsAgent(_)), "a dispute with no reason is not carried: {:?}", dropped.outcome);
+    assert!(dropped.write.is_none(), "nothing is written for it");
+    assert!(
+        dropped.lines.iter().any(|l| l.contains("stored by dispute with no reason on record") && l.contains("did NOT carry the dispute")),
+        "{:?}",
+        dropped.lines
+    );
+}
+
 /// Field case 2026-10-03: a contains check on a phrase that sits ONLY in a
 /// comment was hung and guarded nothing. A writer's own such check is now a
 /// note at write time, with the reason and the way to keep a check in the reply.

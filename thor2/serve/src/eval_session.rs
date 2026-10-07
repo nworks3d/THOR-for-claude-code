@@ -905,6 +905,17 @@ pub fn machine_pass(store: &mut EventStore, project: &str, start: &EvaluationSta
         }
     }
 
+    // THE DISPUTES TO VERIFY: every unanswered dispute written since the
+    // project's previous report, or left over from the previous list, capped
+    // like the batch. The rest are named so the next start lists them first.
+    let carried = model::store::previous_evaluation_start(store, project, start.seq)
+        .and_then(|previous| previous.frozen.machine)
+        .map(|previous| previous.disputes_later_ids)
+        .unwrap_or_default();
+    let disputes = model::store::unverified_disputes(store, project, start.frozen.prev_report_seq, &carried);
+    machine.disputes_later_ids = disputes.iter().skip(model::store::EVALUATION_DISPUTE_LIST).map(|d| d.id.clone()).collect();
+    machine.disputes = disputes.into_iter().take(model::store::EVALUATION_DISPUTE_LIST).collect();
+
     let of = |outcome: MachineOutcome| -> Vec<String> {
         machine.items.iter().filter(|i| i.outcome == outcome).map(|i| i.id.clone()).collect()
     };
@@ -987,7 +998,10 @@ pub fn render_start_note(id: &str, frozen: &Frozen) -> String {
     out.push_str("\n\n2. TEETH - ");
     match frozen.machine.as_ref().filter(|_| frozen.decided()) {
         None => out.push_str(&format!("{}.", model::store::STILL_DECIDING)),
-        Some(machine) => teeth_section(&mut out, frozen, machine),
+        Some(machine) => {
+            teeth_section(&mut out, frozen, machine);
+            disputes_section(&mut out, machine);
+        }
     }
 
     out.push_str("\n\n3. OPEN POINTS - ");
@@ -1075,6 +1089,88 @@ fn teeth_section(out: &mut String, frozen: &Frozen, machine: &MachinePass) {
         if later > 0 {
             out.push_str(&format!("\n      {later} more rule(s) like these wait for the next evaluation."));
         }
+    }
+}
+
+/// The exact call that hangs the real check on a disputed rule, in the shape
+/// of its first dispute: a command tooth (legitimate_calls, accept_refusing)
+/// becomes a forbidden check, a file span (may_change) a contains check. The
+/// text is reworded in the same call because a check's literal has to be named
+/// in the rule's own text.
+fn hang_call(id: &str, first_argument: &str) -> String {
+    let check = match first_argument {
+        "may_change" => "check_kind: \"contains\", check_path: \"<the file>\", check_literal: \"<the rule's subject>\"",
+        _ => "check_kind: \"forbidden\", check_literals: [\"<the rule's subject>\"]",
+    };
+    format!("mcp__thor__revise(id: \"{id}\", text: \"<its text, reworded so it names <the rule's subject>>\", {check})")
+}
+
+/// The exact call that confirms a dispute: the same rule, with the reason
+/// restated. The span it names is the one the dispute names.
+fn confirm_call(id: &str, span: &str) -> String {
+    format!(
+        "mcp__thor__revise(id: \"{id}\", because: \"<why {span} may change, or why the call is legitimate, while the rule \
+         stays true - at least {} characters>\")",
+        model::store::DISPUTE_REASON_MIN_CHARS
+    )
+}
+
+/// Item c of section 2 of the start note: the disputes the agent verifies
+/// (`MachinePass::disputes`). Every line says what the item means, the exact
+/// calls and when it is done - a signal without those makes an agent guess.
+fn disputes_section(out: &mut String, machine: &MachinePass) {
+    let list = &machine.disputes;
+    if list.is_empty() {
+        out.push_str("\n   c. DISPUTES TO VERIFY - no rule stored by dispute since the previous evaluation waits to be verified.");
+        return;
+    }
+    let ids: Vec<String> = list.iter().map(|d| d.id.clone()).collect();
+    out.push_str(&format!(
+        "\n   c. DISPUTES TO VERIFY - {} rule(s) were stored by dispute (legitimate_calls, may_change or accept_refusing) \
+         since the previous evaluation, and nobody has verified the dispute yet (at most {}): {}. WHAT THIS MEANS: the \
+         writer told THOR that the tooth it built from the rule's own words is wrong here, so the rule became a note \
+         that can never refuse anything (with accept_refusing the rule keeps its check and says refusing those calls \
+         is the intent). An audit on 2026-10-07 found 7 of 11 such disputes wrong: the disputed literal was the rule's \
+         real subject, or a better check existed. WHAT TO DO, for each one: open the rule (mcp__thor__get) and the \
+         file or command it is about, and decide whether the disputed literal IS what the rule is about. If it is, or \
+         a better check exists, hang that check (call 1 on its line). If it is only an incidental span, confirm the \
+         dispute with a reason of your own (call 2). WHEN AN ITEM IS DONE: the call you made was accepted - THOR then \
+         shows rule or note for call 1, or 'revised' for call 2. Nothing else settles an item (not a tag, not a note, \
+         not a line in the report), and the report is held until each one is done. EXAMPLE: a rule saying \
+         'the sensor delay is in microseconds, not nanoseconds', disputed on the loose word 'delay' in sensor.cfg: the \
+         subject is 'microseconds', so call 1 with check_kind \"contains\", check_path \"sensor.cfg\", check_literal \
+         \"microseconds\" and the text reworded to name it.",
+        list.len(),
+        model::store::EVALUATION_DISPUTE_LIST,
+        quoted(&ids)
+    ));
+    for dispute in list {
+        let first = dispute.arguments.first().map(|(name, _)| name.as_str()).unwrap_or("legitimate_calls");
+        let span = dispute
+            .arguments
+            .first()
+            .and_then(|(_, values)| values.first())
+            .map(|v| format!("'{}'", first_words(v)))
+            .unwrap_or_else(|| "the span".to_string());
+        let because = match dispute.because.as_deref().map(first_words).filter(|b| !b.is_empty()) {
+            Some(reason) => format!("the writer's reason: '{reason}'"),
+            None => "no reason recorded".to_string(),
+        };
+        out.push_str(&format!(
+            "\n      - '{id}': {args} (written at log seq {seq}); {because}.\n         Call 1, hang the real check: {hang}\n         \
+             Call 2, confirm the dispute: {confirm}\n         Done when: call 1 or call 2 is accepted.",
+            id = dispute.id,
+            args = model::store::dispute_in_words(&dispute.arguments),
+            seq = dispute.seq,
+            hang = hang_call(&dispute.id, first),
+            confirm = confirm_call(&dispute.id, &span),
+        ));
+    }
+    if !machine.disputes_later_ids.is_empty() {
+        out.push_str(&format!(
+            "\n      {} more dispute(s) wait for the next evaluation, which lists them first.",
+            machine.disputes_later_ids.len()
+        ));
     }
 }
 

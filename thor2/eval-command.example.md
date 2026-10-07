@@ -271,6 +271,24 @@ handle only what the start note handed you under TEETH:
   using the exact call the note prints (a `revise` with the reworded text) -
   nothing else has to change. Each line says how many characters the text has
   left (300 minus its length now): reword within that budget, never append.
+- **The disputes to verify** (item c of the note): at most eight rules that
+  were stored by dispute (`legitimate_calls`, `may_change` or
+  `accept_refusing`) since the previous report and that nobody has checked
+  yet. A dispute turns a rule that bites into a note that can never refuse
+  anything; an audit on 2026-10-07 found 7 of 11 such disputes wrong, because
+  the disputed literal was the rule's real subject or a better check existed.
+  Each line shows what was disputed, the writer's reason (or "no reason
+  recorded") and two exact calls. Open the rule and the file or command it is
+  about and decide whether the disputed literal IS what the rule is about.
+  If it is, or a better check exists, make call 1: a `revise` that rewords the
+  text so it names the real subject and hangs the check. If it is only an
+  incidental span, make call 2: `mcp__thor__revise(id: "<id>", because: "<why
+  the span may change while the rule stays true, at least twenty
+  characters>")`. An item is done when one of the two calls was accepted;
+  nothing else settles it, and the report cannot be filed until every item is
+  done. Example: a rule saying "the sensor delay is in microseconds, not
+  nanoseconds", disputed on the loose word "delay": the subject is
+  "microseconds", so call 1 hangs a `contains` check on it.
 - **Everything THOR settled itself** (rules, notes, pending checks hung) is
   only reported, in the machine section of the report. You do not redo it.
 
@@ -292,8 +310,12 @@ gate working, not a bug.
 Three arguments exist for a refusal that is right about the tooth but wrong
 about your rule: `legitimate_calls`, `may_change` and `accept_refusing`.
 Doctor lists every rule saved with one of them for the owner, so use one only
-when you can say why, in the report, in a sentence the owner can check. They
-are not a way to get a rule off the batch. A `legitimate_calls` entry must be a
+when you can say why - and each one needs `because`: a sentence of at least
+twenty characters that THOR keeps in the rule's history and prints beside the
+dispute in the report's machine section and in doctor. Without it the write is
+refused. Try the better path first: hang a check on the literal that IS the
+rule's subject, and dispute only a span that is incidental. They are not a way
+to get a rule off the batch. A `legitimate_calls` entry must be a
 call that really occurs - in the log (THOR's reply says how many real calls a
 tooth reaches) or in the project. Never a made-up path or a template with
 `<...>` in it: measured 2026-10-01, a session named a test file that did not
@@ -351,7 +373,8 @@ form, to show that a tooth works. THOR tries every tooth itself with forms it
 builds; only a real refusal at real work counts.
 
 Step 4 is done once every rule of the batch and of the A4 list has its call
-made and THOR's answer to it, and nothing is left hanging on a refusal.
+made and THOR's answer to it, every dispute to verify has its call 1 or call 2
+accepted, and nothing is left hanging on a refusal.
 Retracting a heavy rule takes a reason that says what changed about THAT
 rule; "no longer relevant" is refused.
 

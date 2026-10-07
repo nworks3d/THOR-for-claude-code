@@ -16,6 +16,9 @@ use model::item::{Binding, Check, Item, Kind, Severity, TargetKind};
 use model::store::CurrentVerdict;
 use serde_json::json;
 
+/// Every dispute carries its reason (a dispute without one is refused).
+const WHY: &str = "refusing these calls is the intent here, and the rule stays true as written";
+
 fn heavy(v: serde_json::Value) -> serde_json::Value {
     let mut v = v;
     v["severity"] = json!("irreversible");
@@ -180,6 +183,7 @@ fn r8_4_a_check_refusing_most_real_calls_needs_the_writer_and_accept_refusing_ke
     assert!(reply.contains("Hang it: check_kind forbidden, check_literals ['--force']"), "{reply}");
 
     args["accept_refusing"] = json!(["git push origin made-up"]);
+    args["because"] = json!(WHY);
     let reply = mcp.call("remember", args.clone());
     assert!(reply.starts_with("REFUSED:") && reply.contains("which is not one of the listed calls"), "{reply}");
 
@@ -322,6 +326,7 @@ fn r8_7_to_r8_9_a_tooth_built_from_the_text_forces_and_a_reason_no_longer_stands
     assert!(reply.starts_with("REFUSED:") && reply.contains("and bind it to the command 'git push'"), "{reply}");
 
     args["legitimate_calls"] = json!(["git push --force"]);
+    args["because"] = json!(WHY);
     let reply = mcp.call("remember", args);
     println!("R8.9: {reply}");
     assert!(reply.contains("'git push --force' is the forbidden form THOR built itself, not a legitimate call"), "{reply}");
@@ -349,6 +354,7 @@ fn g8_5_a_valid_dispute_is_a_note_by_dispute_and_prose_derives_nothing() {
     assert!(reply.contains("Both polarities bite on the same fragment"), "{reply}");
 
     args["legitimate_calls"] = json!(["git bundle list-heads backup.bundle"]);
+    args["because"] = json!(WHY);
     let reply = mcp.call("remember", args.clone());
     println!("G8.5 one dispute: {reply}");
     assert!(reply.starts_with("REFUSED:") && !reply.contains("'list-heads' on 'git bundle' refuses"), "the disputed tooth is gone: {reply}");
@@ -396,6 +402,7 @@ fn r8_10_and_g8_6_a_check_refusing_a_listing_form_is_never_stored() {
     assert!(reply.contains("would refuse 1, e.g. 'git tag -l \"backup-checkpoint*\"'"), "the replay line: {reply}");
 
     args["legitimate_calls"] = json!(["git tag -a v1 -m release"]);
+    args["because"] = json!(WHY);
     let reply = mcp.call("remember", args);
     println!("R8.10 disputed: {reply}");
     assert!(reply.starts_with("stored 'tag-annotated'") && reply.contains("teeth: note by dispute"), "{reply}");
@@ -676,6 +683,7 @@ fn g8_14_a_ban_meant_to_refuse_every_push_is_kept_by_accept_refusing() {
     println!("G8.14 red: {reply}");
     assert!(reply.starts_with("REFUSED:") && reply.contains("accept_refusing"), "{reply}");
     args["accept_refusing"] = json!(["git push origin main"]);
+    args["because"] = json!(WHY);
     let reply = mcp.call("remember", args);
     println!("G8.14: {reply}");
     assert!(reply.contains("teeth: wired, not proven - a whole-command ban"), "{reply}");
