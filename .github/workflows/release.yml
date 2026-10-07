@@ -75,14 +75,17 @@ jobs:
           - os: windows-latest
             features: "--features semantic"
             ext: ".exe"
+            semantic: "yes"
             asset: thor2-windows-x86_64.zip
           - os: ubuntu-latest
             features: "--features semantic"
             ext: ""
+            semantic: "yes"
             asset: thor2-linux-x86_64.tar.gz
           - os: ubuntu-latest
             features: ""
             ext: ""
+            semantic: "no"
             asset: thor2-linux-x86_64-plain.tar.gz
     steps:
       - uses: actions/checkout@v4
@@ -117,6 +120,27 @@ jobs:
           done
           cp LICENSE dist/
           tar czf ${{ matrix.asset }} -C dist .
+
+      # No step used to run a packaged file. This one unpacks the archive that
+      # is about to be published into a fresh folder and runs it the way a new
+      # user does (thor2/ops/tests/release_smoke.rs): install into a throwaway
+      # home, check the hooks and the tool server, run doctor, install again,
+      # store a note through the tool server, read it back at session start.
+      # It also fails when a build that should carry meaning search does not,
+      # which is otherwise silent. Any failure stops this job, and `publish`
+      # needs every build job, so nothing ships without it.
+      - name: Smoke test (the packaged archive, like a new user)
+        shell: bash
+        run: |
+          mkdir -p smoke-unpacked
+          case "${{ matrix.asset }}" in
+            *.zip) 7z x -y -osmoke-unpacked "${{ matrix.asset }}" ;;
+            *) tar xzf "${{ matrix.asset }}" -C smoke-unpacked ;;
+          esac
+          cd thor2
+          THOR_SMOKE_BIN_DIR="$GITHUB_WORKSPACE/smoke-unpacked" \
+          THOR_SMOKE_SEMANTIC="${{ matrix.semantic }}" \
+            cargo test --release ${{ matrix.features }} -p ops --test release_smoke -- --ignored --nocapture
 
       # Anyone should be able to verify the download matches what CI produced.
       - name: Checksum
@@ -216,6 +240,9 @@ jobs:
 
             Every asset is built and tested by CI on a clean runner: the whole test suite,
             plus a separate run with meaning search compiled in, plus the plain server
-            shape. Beyond that, the maintainer starts the Windows build by hand before
-            publishing; the Linux ones are CI-built only. If one does not start for you,
-            say so - that is the report worth having.
+            shape. Each packaged archive is then unpacked on its own runner and run like a
+            new user would run it (install into a throwaway home, doctor, a second install,
+            a note stored and read back at session start), and it is not published unless
+            that passes. Beyond that, the maintainer starts the Windows build by hand before
+            publishing; the Linux ones are only ever built and run by CI. If one does not
+            start for you, say so - that is the report worth having.

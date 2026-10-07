@@ -98,3 +98,20 @@ Never paste store contents, secrets, or private paths into an issue.
 
 Releases are cut from a tag by CI, never from a maintainer's machine. They are
 not on a schedule: THOR ships when there is something worth shipping.
+
+Before a release is published, CI unpacks each packaged asset on its own runner
+and runs it the way a new user would (`thor2/ops/tests/release_smoke.rs`): install
+into a throwaway home, check the hooks and the tool server entry, run doctor,
+install a second time, store a note through the tool server and read it back at
+session start. It never touches your real settings, store or git configuration.
+To try it on your own build:
+
+```bash
+cd thor2
+cargo build --release --workspace --features semantic
+cargo test --release --features semantic -p ops --test release_smoke -- --ignored --nocapture
+```
+
+It prints one `PASS` or `FAIL` line per step and fails if any step fails. To try
+a packaged archive instead, unpack it into a folder and set `THOR_SMOKE_BIN_DIR`
+to that folder (and `THOR_SMOKE_SEMANTIC=no` for the plain server asset).
