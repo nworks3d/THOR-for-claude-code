@@ -41,9 +41,11 @@ and then moved to another folder is still asked about A, and the ask says so.
 One project runs one evaluation at a time: if another session is already
 running this project's evaluation and was active in the last 30 minutes, you
 are told that in one line, naming that session, and are not held. Once it has
-been quiet longer, the next ask takes the evaluation over. A project with activity in the last seven days and no
-evaluation that counts in seven days is due whatever the clock says.
-Since THOR 2.5 the judgement debt and the question about old rules are not
+been quiet longer, the next ask takes the evaluation over: the old one is
+closed as superseded and its verdicts stay. A project with activity in the
+last seven days and no evaluation that counts in seven days is due whatever
+the clock says.
+Since THOR 2.5 the judgement debt ("N item(s) have fired repeatedly") and the question about old rules are not
 asked at a turn-end at all: this evaluation is the one place, per project at
 most once every 16 hours, so a session is never handed something to judge
 every quarter of an hour. A verdict counts per item for everyone. What is
@@ -115,6 +117,48 @@ first.
 
 ---
 
+## Done, or cannot - the bar for steps 4, 7 and 8
+
+WHAT IT MEANS. Three steps below ask you to finish something: teeth (4),
+friction (7) and verification (8). Every point in them ends in one of two
+outcomes, never in anything between:
+
+1. **Done**, with the proof in the form the step names: an id with its before
+   and after, an anchor from and to, a check with its kind, literal and place,
+   or the command and its result.
+2. **Cannot here.** The rare exception, and it costs something: you write down
+   what you tried and how that ended (the call and the refusal, or the command
+   and its error), and the ONE thing that is missing - a decision of the owner
+   (then the question goes in the report, worded so it can be answered in one
+   sentence), or a machine, tool or access this session does not have (say
+   which). If you cannot fill in both, it can be done after all, and you still
+   owe outcome 1. "No time", "later", "still to do" and "too big for now" do
+   not exist as outcomes.
+
+WHAT TO DO. For each point, make the call or run the command the step names,
+then write the outcome in the report under that step's number: outcome 1 with
+its proof, or outcome 2 with the attempt and the one missing thing.
+
+WHEN IT IS DONE. A point is closed once it carries outcome 1 or outcome 2.
+"I did not do this" is a gap, and a gap closes nothing. "I could not, because"
+carries an attempt and a reason and closes the point as well as outcome 1
+does: honestly finding that something cannot be done here blocks nothing.
+What you leave lying does not come back to you but to the owner, which is
+exactly what this evaluation is meant to prevent. Measured 2026-09-23: two
+evaluations on one day reported the same friction, predicted it would return
+and left it; three new checks went on a list for later and nobody looked at it
+again. When the owner raised it, the repair took two minutes and the proof a
+single command.
+
+EXAMPLE. Outcome 1: "rule `no-force-push`: revise accepted, THOR answered
+'teeth: wired, not proven', check forbidden on the literal `--force`". Outcome
+2: "rule `deploy-needs-vpn`: I tried a `contains` check on `deploy.sh` and THOR
+refused it because this checkout is not registered as the project's working
+copy; what is missing is the owner's decision on which folder is the working
+copy".
+
+---
+
 ## 1. State of the work
 
 Before anything else: what does this project's own working copy actually
@@ -152,8 +196,8 @@ Before any of that: look up the previous evaluation report for this project
 (`mcp__thor__lookup(scope: "<project>", kind: "report", query:
 "evaluation-report")`; take the newest one, then open it with
 `mcp__thor__get(id: "<its id>")`). Read its remarks - what it left unjudged with a reason, the
-gaps it left open, and everything it listed as not verified or still to be
-probed. For each: settle it now, or write it under "not settled" in your own
+gaps it left open, every point it reported in step 4, 7 or 8 as "cannot here",
+and everything it listed as not verified. For each: settle it now, or write it under "not settled" in your own
 remarks with the reason it is still open. No previous report? Say so and move
 on. THOR's own open points are not yours: they are written and closed by THOR
 (see step 4), and nothing you write carries one.
@@ -206,7 +250,7 @@ wrong.
 Every item on your list gets one of two answers. A verdict, given with the
 THOR tool itself: useful if it belonged where it fired, noise if it did not.
 A verdict from a shell, a script, another session or another program settles
-nothing, and is listed for the owner under "side doors". Or, when you cannot
+nothing (`serve mark` in a terminal included), and is listed for the owner under "side doors". Or, when you cannot
 honestly judge it - "when in doubt, skip" above - an explicit skip, written
 as a tag on the report itself: `not-judgeable:<id>:<reason>`, with a reason
 of at least twelve characters that says why, for example
@@ -228,7 +272,8 @@ THOR message held you, file right away too. Never tell the owner "next turn" or
 
 The health check's `judgement debt` line names the debt of the whole store
 for this checkout, including items that only fired in other sessions. Those
-are not this report's to settle and never hold it. Step 2 is done once every
+are not this report's to settle and never hold it; judge one of them only if
+you saw it fire yourself and know where. Step 2 is done once every
 item on your list carries a verdict or a skip tag with a reason.
 
 ## 3. Repair what has rotted (this is not noise)
@@ -238,12 +283,13 @@ artifact - the code, the file, the current state? That is not noise, and
 not "missing" either. Verify it against the artifact and revise it NOW.
 
 Check explicitly every fact that carries a VALUE (a number, a line number, a
-percentage, a date) rather than a pointer. These rot silently. The fix is
+percentage, a date) rather than a pointer. These rot silently: measured 2026-08-08, 1 in 10 served facts was untrue, and
+three of the nine untrue ones were exactly this shape. The fix is
 not a new value but a pointer: "read this from the health check" instead of
 a number that will drift the moment the store changes.
 
 Also check every fact that describes a problem as still open when it has
-since been fixed.
+since been fixed (two of those nine were that).
 
 THOR wins for decisions; the artifact wins for the current state of the
 build.
@@ -300,12 +346,14 @@ handle only what the start note handed you under TEETH:
 - **The disputes to verify** (item c of the note): at most eight rules that
   were stored by dispute (`legitimate_calls`, `may_change` or
   `accept_refusing`) since the previous report and that nobody has checked
-  yet. A dispute turns a rule that bites into a note that can never refuse
-  anything; an audit on 2026-10-07 found 7 of 11 such disputes wrong, because
+  yet. WHAT IT MEANS: the writer told THOR that the tooth THOR built from the
+  rule's own words is wrong (with `accept_refusing` the rule keeps its check,
+  and the writer says that refusing those calls is the intent). A dispute turns
+  a rule that bites into a note that can never refuse anything; an audit on 2026-10-07 found 7 of 11 such disputes wrong, because
   the disputed literal was the rule's real subject or a better check existed.
-  Each line shows what was disputed, the writer's reason (or "no reason
-  recorded") and two exact calls. Open the rule and the file or command it is
-  about and decide whether the disputed literal IS what the rule is about.
+  WHAT TO DO, per item: each line shows what was disputed, the writer's reason
+  (or "no reason recorded") and two exact calls. Open the rule and the file or
+  command it is about and decide whether the disputed literal IS what the rule is about.
   If it is, or a better check exists, make call 1: a `revise` that rewords the
   text so it names the real subject and hangs the check (for a disputed span
   of a file the line names the rule's file in `check_path`). If it is only an
@@ -438,9 +486,13 @@ Never file an open point, and never tag a rule with `open-point`, `about:` or
 `blocker:`: THOR writes and closes its own open points (a missing working
 copy, a file the checkout is changing, a file whose anchor is full of heavier
 rules that can each refuse, and ONE point for the whole memory that holds every
-rule with no project whose check reads a file) and refuses yours. A rule held
+rule with no project whose check reads a file) and refuses yours. A point says
+itself what happens and closes itself once the anchor has room. A rule held
 by one of those is not on your lists and is never yours to clear: clearing a
-check that is true is never the way past a blocker, and a check you clear,
+check that is true is never the way past a blocker. A full anchor that does
+have an honest exit (a lighter fact, or a fact with no check that can refuse)
+is no point but your work: the batch line names the occupants and the three
+exits, and you carry one out. A check you clear,
 move to another file or change during this evaluation is listed in the
 report's machine section for the owner. A legacy open point
 an older routine filed settles nothing and holds nothing; retract one, with a
@@ -450,7 +502,7 @@ Working in a git worktree? Every check is judged against the MAIN checkout -
 the health check and the commit gates read that one, never your worktree. A
 check whose literal or file exists only in your worktree is refused at the
 write: it would read as a false memory on main and block unrelated commits
-there. Attach it once your change is merged; until then the fact stays
+there (measured 2026-09-26: eleven minutes of blocked commits). Attach it once your change is merged; until then the fact stays
 without that check.
 
 What you NEVER do here: stretch the literal to catch more. If it catches one
@@ -465,14 +517,20 @@ nothing: THOR records it as "refused during the session's own evaluation -
 not proof", it never turns a rule from wired into proven, and it is listed
 apart in the report. So do not plant a forbidden call, however harmless its
 form, to show that a tooth works. THOR tries every tooth itself with forms it
-builds; only a real refusal at real work counts.
+builds, and its answer to your revise (which calls it refused and which it let
+through) IS the proof that counts here; only a real refusal at real work
+counts beyond that.
 
 Step 4 is done once every rule of the batch and of the A4 list has its call
 made and THOR's answer to it (for a DEMOTION: one of its two exits taken),
 every dispute to verify has its call 1 or call 2 accepted (or its rule
 retracted with a reason), and nothing is left hanging on a refusal.
 Retracting a heavy rule takes a reason that says what changed about THAT
-rule; "no longer relevant" is refused.
+rule; "no longer relevant" is refused. This is outcome 1 of the bar above: per
+rule the call, with THOR's answer to it. For a rule that truly cannot be done
+here - the fix needs a decision of the owner, or a machine this session does
+not have - outcome 2 applies, with the attempt and the one thing missing; the
+rule stays owed and goes under "not settled".
 
 ## 5. Capture what was missing
 
@@ -611,9 +669,12 @@ This is the signal that counts here, not a mark.
 
   Three ways out, in this order:
   1. **Fold it in.** Does an existing fact already say almost the same
-     thing? Fold yours into it with `revise` and retract yours.
+     thing? Fold yours into it with `revise` and retract yours. Two half
+     copies take two places for one piece of knowledge.
   2. **Anchor it narrower.** Is it hanging off a broad moment or a busy file
      when it is really about a more specific file or command? Re-anchor it.
+     Measured 2026-08-08: re-anchoring 35 facts took the number of unreachable
+     facts from 52 to 20.
   3. **Leave it, and record why.** Sometimes it genuinely belongs there and
      the place is legitimately full of heavier things. Then that is the
      answer - name which facts occupy the place in your report, and put the
@@ -650,28 +711,59 @@ time or confidence, even what you fixed yourself:
   the most important kind of friction, because it is where the store loses
   information.
 
-For each point of friction: is this a one-off, or will it happen again next
-session? If it will recur, THOR should hold a fact about it - capture that
-under step 5 instead of only reporting it.
+For each point of friction, first look for a rule that should have prevented
+it: `mcp__thor__lookup(query: "<the subject of the friction>")`, then name the
+id you found, or write "none". If one existed, the question is why it did not
+reach the session - one of three: wrong anchor (it fired at another moment or
+file than where the mistake fell: re-anchor it, step 4), displaced (it fired
+nowhere: step 6, the three exits), or no teeth (it stood there and stopped
+nothing: try to give it a tooth that holds, step 4). If none existed, step 5
+captures it. Skipping this look-up is what let two evaluations on 2026-09-23
+miss it: the repair turned out to be two rules at the wrong moment and a third
+without teeth, and nothing in the routine asked for the look.
 
-Step 7 is done once you have decided that for every point of friction - not
-every point needs to become a fact, but every point needs a decision.
+Then every point of friction gets one outcome of the bar above - done (what
+changed: the id with before and after, the anchor from and to, the new id from
+step 5, or the file) or cannot here (what you tried and the one thing that is
+missing). A point that cannot be done here goes under "not settled" in your
+remarks, and step 2 of the next evaluation picks it up.
+
+This step has a third outcome: **one-off**, when it will not come back and you
+say which circumstance caused it and why that circumstance is gone. If the
+same point was in the previous report, one-off is no longer available. Writing
+"it will come back" and moving on is no outcome but proof that you still owe
+one.
+
+Step 7 is done once every point of friction carries one of those three
+outcomes, with the id of the rule found or "none" beside it. For example:
+"a revise was refused because the anchor was full; rule found: none; done -
+folded into `anchor-full-fold-first` (step 5)".
 
 ## 8. What you did NOT verify
 
-Name explicitly what you are assuming but have not checked. If you added a
-fact bound to a target, this evaluation only ever sees what FIRED - a
-silently displaced binding shows up nowhere here. Flag such a fact as
-"still to be probed": the probe is not made in this evaluation - a call you
-plant here is recorded as proof of nothing (step 4) - but by the real work of
-a later session, or by the owner. Never test with a file check or with free
-prose - that proves nothing, and writing the mistake into a file only risks
+Name explicitly what you are assuming but have not checked, then settle each
+point with the bar above: checked, with the result, or cannot here, with the
+reason. A list for later does not exist any more - nobody read it, and the work
+landed on the owner.
+
+If you added a fact bound to a target, this evaluation only ever sees what
+FIRED - a silently displaced binding shows up nowhere here. THOR's own trial
+is the proof you have: its answer to your revise says "tried ... (refused)"
+or "(let through)". What the trial cannot show is whether the binding ever
+comes up in real work, and that is the ONE thing missing then: put the tooth
+under "not verified" with the command and what should make it refuse. A
+refusal at real work counts as a bite by itself, once THOR has checked it at
+the end of a turn. A call you plant here is recorded as proof of nothing (step
+4). Never test with a file check or with free prose - that proves nothing, and writing the mistake into a file only risks
 it. A check on a file is tried by THOR itself against the
 project's registered working copy; one it cannot try yet is kept as a note
 with a pending check, and doctor lists it.
 
-Step 8 is done once every untested addition from this session is on that
-list, named with what should make it refuse.
+Step 8 is done once every point carries one of the two outcomes: the command
+or doctor line with its result, or the reason it could not be done here - for
+an untested tooth, the command and what should make it refuse. For example:
+"rule `no-force-push`, bound to the command `git push`: not verified in real
+work; it should refuse `git push --force origin main`".
 
 ---
 
@@ -735,6 +827,10 @@ resolve it before you report: "I could not save this" does not belong in
 this report - if it is still there when you write the report, the work is
 not done.
 
+Open questions in the report are only for what is truly the owner's (money,
+publishing, deleting his data, security settings) - never for memory
+maintenance that THOR's rules let you decide yourself.
+
 1. the state of the work: uncommitted changes and who made them, the actual
    test/build result you ran, background jobs and their state, and any
    promise you found made without proof;
@@ -751,14 +847,23 @@ not done.
 6. what the gate did - including every false block, every rule the REFUSAL
    OUTCOMES line names with its outcome, the THOR health numbers with the hook
    events and sessions it names, and every refusal of your own write actions;
-7. the friction, and which of it will happen again next session;
-8. what you did not verify.
+7. the friction, per point with its outcome - done (what changed), cannot here
+   (what you tried, what is missing, and the question to the owner if there is
+   one) or one-off (why) - and the id of the rule that should have prevented
+   it, or "none";
+8. what you checked, with the result, and what could not be done here, with
+   the reason.
 
 Get the numbers about the state of the store from the health check, never
 from memory and never from a fact. That is a SEPARATE program, not a
 subcommand, and it is not on the PATH - run it with its full path:
 
     {{THOR_DOCTOR}}
+
+In a Bash tool (Git Bash on Windows) use this form instead, the one this
+file's `allowed-tools` pre-approves, so no permission prompt interrupts it:
+
+    {{THOR_DOCTOR_BASH}}
 
 The lines you need: `provable rules` (how many can refuse anything at all),
 `gate` (how often it did), `teeth` (how many heavy rules have teeth),

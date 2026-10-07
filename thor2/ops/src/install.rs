@@ -251,6 +251,26 @@ pub fn doctor_allow_invocation(bin_dir: &Path, windows: bool) -> String {
     }
 }
 
+/// The same doctor call for a Bash tool (`{{THOR_DOCTOR_BASH}}` in
+/// `eval-command.example.md`): the form `doctor_allow_invocation`'s
+/// `Bash(...)` entry pre-approves, so it runs with no permission prompt.
+/// The form of `doctor_invocation` is not pre-approved there (PowerShell's
+/// call operator on Windows, a quoted path elsewhere), so this one has
+/// forward slashes, no call operator and no quotes - the entry is a glob over
+/// the command text and a leading quote would never match it. A path with
+/// whitespace in it is quoted anyway: unquoted it would not run at all.
+/// `windows` is a parameter for the same reason as in `doctor_invocation`.
+pub fn doctor_bash_invocation(bin_dir: &Path, db: &Path, windows: bool) -> String {
+    let suffix = if windows { ".exe" } else { "" };
+    let program = format!("{}/doctor{suffix}", bin_dir.display().to_string().replace('\\', "/"));
+    let store = db.display().to_string().replace('\\', "/");
+    if program.contains(char::is_whitespace) || store.contains(char::is_whitespace) {
+        format!("\"{program}\" --db \"{store}\"")
+    } else {
+        format!("{program} --db {store}")
+    }
+}
+
 /// The `serve` program the Stop hook's retest command names, next to the
 /// other binaries.
 fn serve_program(bin_dir: &Path) -> PathBuf {
@@ -258,7 +278,8 @@ fn serve_program(bin_dir: &Path) -> PathBuf {
 }
 
 /// Fill in the template's placeholders - `{{THOR_DOCTOR}}` (the doctor
-/// invocation the report tells a reader to run), `{{THOR_DOCTOR_ALLOW}}` (the
+/// invocation the report tells a reader to run), `{{THOR_DOCTOR_BASH}}` (the
+/// same call as a Bash tool runs it), `{{THOR_DOCTOR_ALLOW}}` (the
 /// matching `allowed-tools` entry that pre-approves it) and
 /// `{{THOR_RETEST_ALLOW}}` (the entry that pre-approves THOR's own retest
 /// command, in the exact form `model::store::retest_command_with` prints) -
@@ -267,6 +288,7 @@ fn serve_program(bin_dir: &Path) -> PathBuf {
 fn render_eval_command(bin_dir: &Path, db: &Path) -> String {
     EVAL_COMMAND_TEMPLATE
         .replace("{{THOR_DOCTOR}}", &doctor_invocation(bin_dir, db, cfg!(windows)))
+        .replace("{{THOR_DOCTOR_BASH}}", &doctor_bash_invocation(bin_dir, db, cfg!(windows)))
         .replace("{{THOR_DOCTOR_ALLOW}}", &doctor_allow_invocation(bin_dir, cfg!(windows)))
         .replace("{{THOR_RETEST_ALLOW}}", &model::store::retest_allow_entry(&serve_program(bin_dir), Some(db)))
 }
@@ -2013,6 +2035,35 @@ mod tests {
     /// though `bin_dir` itself carries backslashes, plus the `.exe` suffix -
     /// see that function's own doc comment for why a `Bash(...)` allow-list
     /// entry can never carry a literal backslash.
+    /// The Bash form must be one the `Bash(...)` allow entry pre-approves:
+    /// the command starts with the entry's prefix (the entry minus its
+    /// `Bash(` and `:*)`), on both platform forms.
+    #[test]
+    fn doctor_bash_invocation_is_covered_by_the_allow_entry_on_both_platforms() {
+        for (bin, db, windows) in [
+            ("C:\\thor2\\bin", "C:\\thor2\\thor.db", true),
+            ("/home/user/thor2/bin", "/home/user/thor2/thor.db", false),
+        ] {
+            let command = doctor_bash_invocation(Path::new(bin), Path::new(db), windows);
+            let entry = doctor_allow_invocation(Path::new(bin), windows);
+            let prefix = entry.strip_prefix("Bash(").and_then(|e| e.strip_suffix(":*)")).expect("a Bash entry");
+            assert!(command.starts_with(prefix), "{command} is not covered by {entry}");
+            assert!(!command.starts_with('&') && !command.contains('\\'), "no PowerShell form: {command}");
+        }
+        assert_eq!(
+            doctor_bash_invocation(Path::new("C:\\thor2\\bin"), Path::new("C:\\thor2\\thor.db"), true),
+            "C:/thor2/bin/doctor.exe --db C:/thor2/thor.db"
+        );
+    }
+
+    #[test]
+    fn doctor_bash_invocation_quotes_a_path_with_whitespace() {
+        assert_eq!(
+            doctor_bash_invocation(Path::new("C:\\John Smith\\bin"), Path::new("C:\\John Smith\\thor.db"), true),
+            "\"C:/John Smith/bin/doctor.exe\" --db \"C:/John Smith/thor.db\""
+        );
+    }
+
     #[test]
     fn doctor_allow_invocation_windows_form_uses_forward_slashes_and_exe_suffix() {
         assert_eq!(doctor_allow_invocation(Path::new("C:\\thor2\\bin"), true), "Bash(C:/thor2/bin/doctor.exe:*)");
