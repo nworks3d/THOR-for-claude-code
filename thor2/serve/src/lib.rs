@@ -102,6 +102,7 @@ pub mod eval_filing;
 pub mod eval_session;
 pub mod guard_verdict;
 pub mod holder;
+pub mod hook_faults;
 pub mod input;
 pub mod judge;
 pub mod legit;
