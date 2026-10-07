@@ -221,6 +221,159 @@ fn running_tool_servers(_exe: &Path) -> Vec<(u32, i64)> {
     Vec::new()
 }
 
+/// The installed programs, run once each with `--version`: `None` for one that
+/// is missing or could not be started (the installer says so when it refuses;
+/// here that is not a skew finding).
+fn version_output(program: &Path) -> Option<String> {
+    let mut command = std::process::Command::new(program);
+    command.arg("--version");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let out = command.output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// THE SKEW A SINGLE VERSION NUMBER HIDES. Every program prints the release
+/// version, so a tool server older than the hook's checker looked identical to
+/// the current one, and a filing it wrote was refused with a reason that blamed
+/// the agent (2026-10-06). The build id (`serve::BUILD_ID`) tells two builds
+/// apart: this runs the programs installed beside doctor and names the case
+/// where they were not built from one source. `None` when they agree, or when
+/// there is nothing to compare.
+pub fn version_skew_line(bin_dir: &Path) -> Option<String> {
+    let suffix = std::env::consts::EXE_SUFFIX;
+    let mut programs: Vec<(String, Option<String>)> = ["serve", "mcp"]
+        .iter()
+        .map(|name| (format!("{name}{suffix}"), version_output(&bin_dir.join(format!("{name}{suffix}")))))
+        .collect();
+    programs.push((format!("doctor{suffix}"), Some(serve::version_line("doctor"))));
+    version_skew_words(&programs)
+}
+
+/// The words of the finding, from each program's `--version` output.
+pub fn version_skew_words<S: AsRef<str>>(programs: &[(S, Option<String>)]) -> Option<String> {
+    let mut with_id: Vec<(&str, &str)> = Vec::new();
+    let mut without_id: Vec<&str> = Vec::new();
+    for (name, output) in programs {
+        let Some(output) = output else { continue };
+        match serve::build_id_in(output) {
+            Some(id) => with_id.push((name.as_ref(), id)),
+            None => without_id.push(name.as_ref()),
+        }
+    }
+    let first = with_id.first()?.1;
+    let differ = with_id.iter().any(|(_, id)| *id != first);
+    if !differ && without_id.is_empty() {
+        return None;
+    }
+    let mut parts: Vec<String> = with_id.iter().map(|(name, id)| format!("{name} is build {id}")).collect();
+    parts.extend(without_id.iter().map(|name| format!("{name} prints no build id (it is older than the others)")));
+    Some(format!(
+        "installed programs: {} - they were not built from the same source, so they may count, judge and check filings differently (a report filed by the older one is refused). Copy every program from one build into the folder (run install.exe again), then restart Claude.",
+        parts.join(", ")
+    ))
+}
+
+/// How far back the hook failure line looks.
+const HOOK_FAILURE_DAYS: i64 = 7;
+
+/// Whether a Windows Code Integrity message names one of THOR's programs.
+fn names_a_thor_program(message: &str) -> bool {
+    let message = message.to_ascii_lowercase().replace('/', "\\");
+    ["\\thor2\\", "\\serve.exe", "\\mcp.exe", "\\doctor.exe"].iter().any(|name| message.contains(name))
+}
+
+/// The `unix|message` lines the Code Integrity reader prints, as the times of
+/// those inside the span that name a THOR program.
+fn parse_code_integrity_events(text: &str, since_unix: i64) -> Vec<i64> {
+    text.lines()
+        .filter_map(|line| {
+            let (at, message) = line.split_once('|')?;
+            let at: i64 = at.trim().parse().ok()?;
+            (at >= since_unix && names_a_thor_program(message)).then_some(at)
+        })
+        .collect()
+}
+
+/// The times of Windows Code Integrity block events (event 3077) naming a
+/// THOR program since `since_unix`. The log is readable without admin rights;
+/// when it is not, or on any other system, nothing is reported.
+#[cfg(windows)]
+fn code_integrity_blocks(since_unix: i64) -> Vec<i64> {
+    use std::os::windows::process::CommandExt;
+    let script = "try { Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-CodeIntegrity/Operational'; Id=3077} -MaxEvents 500 -ErrorAction Stop | ForEach-Object { ([DateTimeOffset]$_.TimeCreated).ToUnixTimeSeconds().ToString() + '|' + ($_.Message -replace '\\s+', ' ') } } catch {}";
+    let Ok(out) = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .creation_flags(0x0800_0000)
+        .output()
+    else {
+        return Vec::new();
+    };
+    parse_code_integrity_events(&String::from_utf8_lossy(&out.stdout), since_unix)
+}
+
+#[cfg(not(windows))]
+fn code_integrity_blocks(_since_unix: i64) -> Vec<i64> {
+    Vec::new()
+}
+
+/// THE FAILURE NOBODY COULD REPORT. A hook Claude Code cannot start (Windows
+/// Smart App Control or an antivirus blocking `serve.exe`, a permission, the
+/// wrong shell) leaves a record in the session's transcript and nothing in
+/// THOR, so the memory was silent with no error anywhere. This reads those
+/// records (`serve::hook_faults`) and the Windows Code Integrity log, and says
+/// so in one line. `None` at zero.
+pub fn hook_failures_line(now_unix: i64) -> Option<String> {
+    let blocks = code_integrity_blocks(now_unix - HOOK_FAILURE_DAYS * 86_400);
+    hook_failures_line_in(serve::attest::transcripts_root().as_deref(), &blocks, now_unix)
+}
+
+/// `hook_failures_line` for transcripts under `root` and the block times
+/// already read.
+pub fn hook_failures_line_in(root: Option<&Path>, blocks: &[i64], now_unix: i64) -> Option<String> {
+    let since = now_unix - HOOK_FAILURE_DAYS * 86_400;
+    let faults: Vec<serve::hook_faults::Scanned> = root
+        .map(|root| serve::hook_faults::faults_since(root, since))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|f| serve::eval_filing::unix_of_timestamp(&f.fault.at).is_some_and(|at| at >= since))
+        .collect();
+    hook_failures_words(&faults, blocks)
+}
+
+/// The words of the finding, from the failures found and the Code Integrity
+/// block times.
+pub fn hook_failures_words(faults: &[serve::hook_faults::Scanned], blocks: &[i64]) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(last) = faults.iter().max_by(|a, b| a.fault.at.cmp(&b.fault.at)) {
+        parts.push(format!(
+            "hook launch failures: {} in the last {HOOK_FAILURE_DAYS} days, the last at {} ({}, exit {}: {}) - the output of that hook never reached the session, so THOR was silent for it",
+            faults.len(),
+            last.fault.at,
+            last.fault.hook_event,
+            last.fault.exit_code,
+            last.cause
+        ));
+    }
+    if let Some(last) = blocks.iter().max() {
+        parts.push(format!(
+            "Windows Code Integrity blocked a THOR program {} time(s) in the last {HOOK_FAILURE_DAYS} days, the last at {}",
+            blocks.len(),
+            serve::time::iso8601_from_unix(*last)
+        ));
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{}. THOR cannot change Windows security settings: allow the program there (or in your antivirus), then restart Claude.",
+        parts.join("; ")
+    ))
+}
+
 /// The off-site backup, in plain words: where the last copy went and when,
 /// or - when the last attempt failed - that it is failing, since when and
 /// why. `None` only before any backup has run here. The backup runs inside a
@@ -6997,5 +7150,128 @@ mod tests {
             ),
             "{over}"
         );
+    }
+}
+
+/// The two health lines about THOR failing to run at all: the installed programs
+/// built from different sources, and hooks Claude Code could not start.
+#[cfg(test)]
+mod launch_and_skew_tests {
+    use super::*;
+    use serve::hook_faults::Scanned;
+
+    fn version(program: &str, id: &str) -> Option<String> {
+        Some(format!("{program} 2.5.0 (build {id})\n"))
+    }
+
+    #[test]
+    fn programs_of_one_build_are_not_a_finding() {
+        let same = [("serve.exe", version("serve", "aaaaaaaaaaaa")), ("mcp.exe", version("mcp", "aaaaaaaaaaaa"))];
+        assert_eq!(version_skew_words(&same), None);
+    }
+
+    #[test]
+    fn programs_of_two_builds_are_named_with_both_ids_and_the_way_on() {
+        let skewed = [
+            ("serve.exe", version("serve", "aaaaaaaaaaaa")),
+            ("mcp.exe", version("mcp", "bbbbbbbbbbbb")),
+            ("doctor.exe", version("doctor", "aaaaaaaaaaaa")),
+        ];
+        let line = version_skew_words(&skewed).expect("two builds");
+        assert!(line.contains("serve.exe is build aaaaaaaaaaaa") && line.contains("mcp.exe is build bbbbbbbbbbbb"), "{line}");
+        assert!(line.contains("not built from the same source") && line.contains("restart Claude"), "{line}");
+    }
+
+    #[test]
+    fn a_program_that_prints_no_build_id_is_older_than_the_others() {
+        let mixed = [("serve.exe", version("serve", "aaaaaaaaaaaa")), ("mcp.exe", Some("mcp 2.5.0\n".to_string()))];
+        let line = version_skew_words(&mixed).expect("one program is older");
+        assert!(line.contains("mcp.exe prints no build id") && line.contains("older"), "{line}");
+        let both_old = [("serve.exe", Some("serve 2.5.0\n".to_string())), ("mcp.exe", Some("mcp 2.5.0\n".to_string()))];
+        assert_eq!(version_skew_words(&both_old), None, "nothing to compare");
+    }
+
+    #[test]
+    fn a_program_that_could_not_be_run_or_is_missing_is_left_to_the_install_check() {
+        let missing = [("serve.exe", version("serve", "aaaaaaaaaaaa")), ("mcp.exe", None)];
+        assert_eq!(version_skew_words(&missing), None);
+    }
+
+    fn fault(at: &str, event: &str, exit: i64, cause: &'static str) -> Scanned {
+        Scanned {
+            session: "3f2ac470-767e-4df0-9ef3-2b89ed671524".to_string(),
+            fault: model::store::HookFault {
+                tool_use_id: format!("toolu-{at}"),
+                hook_event: event.to_string(),
+                exit_code: exit,
+                at: at.to_string(),
+            },
+            cause,
+        }
+    }
+
+    #[test]
+    fn no_failures_and_no_blocks_is_silent() {
+        assert_eq!(hook_failures_words(&[], &[]), None);
+    }
+
+    #[test]
+    fn hook_failures_give_one_line_with_the_count_the_last_time_and_the_cause() {
+        let faults = [
+            fault("2026-10-05T08:00:00.000Z", "PreToolUse", 66, "the hook could not run"),
+            fault("2026-10-06T22:29:00.231Z", "SessionStart", 126, "the program was blocked or could not be opened (x)"),
+        ];
+        let line = hook_failures_words(&faults, &[]).expect("two failures");
+        assert!(!line.contains('\n'), "one plain line: {line}");
+        assert!(line.starts_with("hook launch failures: 2 in the last 7 days, the last at 2026-10-06T22:29:00.231Z"), "{line}");
+        assert!(line.contains("SessionStart, exit 126: the program was blocked"), "{line}");
+        assert!(line.contains("never reached the session") && line.contains("restart Claude"), "{line}");
+    }
+
+    #[test]
+    fn windows_code_integrity_blocks_are_named_with_their_count_and_last_time() {
+        let blocks = [1_791_000_000, 1_791_100_000];
+        let line = hook_failures_words(&[], &blocks).expect("two blocks");
+        assert!(line.contains("Windows Code Integrity blocked a THOR program 2 time(s)"), "{line}");
+        assert!(line.contains(&serve::time::iso8601_from_unix(1_791_100_000)), "{line}");
+        let both = hook_failures_words(&[fault("2026-10-06T22:29:00.231Z", "Stop", 126, "blocked")], &blocks).unwrap();
+        assert!(both.contains("1 in the last 7 days") && both.contains("Code Integrity blocked a THOR program 2 time(s)"), "{both}");
+    }
+
+    #[test]
+    fn a_code_integrity_message_counts_only_when_it_names_a_thor_program() {
+        let ours = "Code Integrity determined that a process (\\Device\\HarddiskVolume3\\Users\\someone\\thor2\\bin\\serve.exe) attempted to load x.dll";
+        let other = "Code Integrity determined that a process (\\Device\\HarddiskVolume3\\Users\\someone\\.rustup\\bin\\rustc.exe) attempted to load y.dll";
+        assert!(names_a_thor_program(ours));
+        assert!(names_a_thor_program("a process (\\Device\\HarddiskVolume3\\tools\\mcp.exe) was blocked"));
+        assert!(!names_a_thor_program(other));
+        let text = format!("1791100000|{ours}\n1791000000|{other}\nnot a line\n1700000000|{ours}\n");
+        assert_eq!(parse_code_integrity_events(&text, 1_790_000_000), vec![1_791_100_000], "only a THOR program, only inside the span");
+    }
+
+    #[test]
+    fn the_line_reads_the_transcripts_of_the_last_week_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("C--Users-someone-dev-demo");
+        std::fs::create_dir_all(&project).unwrap();
+        let record = serde_json::json!({
+            "attachment": {
+                "type": "hook_non_blocking_error",
+                "toolUseID": "toolu-1",
+                "hookEvent": "SessionStart",
+                "stderr": "serve.exe: Permission denied",
+                "exitCode": 126,
+                "command": "\"C:\\thor2\\bin\\serve.exe\" --db \"C:\\thor2\\thor.db\" hook"
+            },
+            "timestamp": serve::time::iso8601_from_unix(serve::time::now_unix() - 3600),
+            "sessionId": "3f2ac470-767e-4df0-9ef3-2b89ed671524",
+        });
+        std::fs::write(project.join("3f2ac470-767e-4df0-9ef3-2b89ed671524.jsonl"), record.to_string() + "\n").unwrap();
+        let now = serve::time::now_unix();
+        let line = hook_failures_line_in(Some(dir.path()), &[], now).expect("the failure is found");
+        assert!(line.contains("1 in the last 7 days"), "{line}");
+        let far_future = now + 30 * 86_400;
+        assert_eq!(hook_failures_line_in(Some(dir.path()), &[], far_future), None, "a month later the file is older than the span");
+        assert_eq!(hook_failures_line_in(None, &[], now), None, "no transcripts folder, nothing to read");
     }
 }
