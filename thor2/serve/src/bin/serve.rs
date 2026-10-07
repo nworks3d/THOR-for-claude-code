@@ -422,7 +422,7 @@ fn main() {
     // about from this one locked call site. See `thor_core::is_version_flag`
     // for why this reads that shared predicate instead of a local literal.
     if std::env::args().any(|a| thor_core::is_version_flag(&a)) {
-        println!("serve {}", env!("CARGO_PKG_VERSION"));
+        println!("{}", serve::version_line("serve"));
         return;
     }
     let cli = Cli::parse();
@@ -1358,6 +1358,10 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                     // evaluation lists (step 24): checked here, so a filing
                     // never waits on a session that went quiet.
                     serve::attest::record_foreign_write_verifications(&mut store, &session_id);
+                    // A hook Claude Code could not start leaves a record in
+                    // the transcript and nothing in THOR: written to the log
+                    // here, so the evaluation's machine section can say so.
+                    serve::attest::record_hook_faults(&mut store, &session_id);
                     // THE READER OF A FILING (step 16): every evaluation
                     // report on file whose filing has no validator record
                     // yet is validated once - after the verifications above,

@@ -94,6 +94,18 @@ fn main() -> ExitCode {
     let checkouts = checkouts_root.as_path();
 
     println!("{}", ops::health::checkouts_root_line(&checkouts_root));
+    // THOR failing to run at all comes before the per-component lines, because
+    // nothing below can be trusted while it holds: a running tool server older
+    // than its program on disk (field test 5, D4), installed programs built
+    // from different sources, and hooks Claude Code could not start. Each is
+    // silent when there is nothing to say.
+    if let Some(bin_dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(std::path::Path::to_path_buf)) {
+        let lines = [ops::health::stale_tool_server_line(&bin_dir), ops::health::version_skew_line(&bin_dir)];
+        lines.into_iter().flatten().for_each(|line| println!("{line}"));
+    }
+    if let Some(line) = ops::health::hook_failures_line(serve::time::now_unix()) {
+        println!("{line}");
+    }
     // This checkout's own project, the same resolver every real injection
     // surface uses (`serve::project::resolve_project`) - an explicit --repo
     // wins (it already names the checkout `code_index_line` above checks
@@ -113,13 +125,6 @@ fn main() -> ExitCode {
         checkout_project.as_deref(),
     ) {
         println!("{line}");
-    }
-
-    // A running tool server older than its program on disk (field test 5, D4).
-    if let Some(bin_dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(std::path::Path::to_path_buf)) {
-        if let Some(line) = ops::health::stale_tool_server_line(&bin_dir) {
-            println!("{line}");
-        }
     }
 
     // --gate turns the report above into an exit code, reusing its verdict

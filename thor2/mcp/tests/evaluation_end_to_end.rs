@@ -421,9 +421,10 @@ fn stored_report_starts_with_the_machine_section() {
     let stored = get(&mut mcp, REPORT).text;
     assert!(
         stored.starts_with(&format!(
-            "=== MACHINE SECTION: derived from the log, seq {} to {}; it cannot be edited ===\n",
+            "=== MACHINE SECTION: derived from the log, seq {} to {}; renderer {}; it cannot be edited ===\n",
             start.frozen.started_seq,
-            seq - 1
+            seq - 1,
+            model::gate::MACHINE_RENDERER_REV
         )),
         "{stored}"
     );

@@ -6527,6 +6527,80 @@ fn disputes_in_window(window: &[Event], log: &LogAt, project: Option<&str>, sess
     out
 }
 
+/// How the validator's reason begins when a filing is refused because the tool
+/// server that wrote its machine section was of another renderer revision than
+/// the checker (`gate::MACHINE_RENDERER_REV`) - version skew, never an edit.
+pub const SKEW_WHY: &str = "written by a tool server of another build than the checker";
+
+/// A hook of Claude Code that could not start: the one fact of
+/// a `hook_non_blocking_error` record THOR keeps. Recorded by the attester at
+/// the Stop of the session whose transcript holds it (`record_hook_fault`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookFault {
+    pub tool_use_id: String,
+    pub hook_event: String,
+    pub exit_code: i64,
+    /// The transcript timestamp of the record.
+    pub at: String,
+}
+
+/// The entity a session's hook failures are recorded on.
+pub fn hook_fault_entity(session_id: &str) -> String {
+    format!("hook-fault:{session_id}")
+}
+
+/// Record that a hook of `session_id` could not start, once per `tool_use_id`:
+/// ONE `gate_stood_aside` by the attester on `hook_fault_entity`, body
+/// `{hook_fault: {...}}`. A second record of the same failure appends nothing.
+pub fn record_hook_fault(
+    store: &mut EventStore,
+    session_id: &str,
+    actor: SystemActor,
+    fault: &HookFault,
+) -> Result<Option<Event>, WriteError> {
+    if actor.name() != ATTESTER_ACTOR {
+        return Err(WriteError::Refused(Refusal {
+            problem: format!("a hook failure is recorded by THOR's attester only, not by '{}'", actor.name()),
+            fix: "let the Stop hook record it (serve::attest::record_hook_faults)".to_string(),
+        }));
+    }
+    let entity = hook_fault_entity(session_id);
+    let events = store.get_events_by_entity(&entity).map_err(|e| WriteError::Store(e.into()))?;
+    if hook_faults_in(&events).iter().any(|f| f.tool_use_id == fault.tool_use_id) {
+        return Ok(None);
+    }
+    let name = fence(store, actor.into(), &entity)?;
+    let body = serde_json::json!({ "hook_fault": fault }).to_string();
+    store
+        .append_event(session_id, session_id, name, EventKind::GateStoodAside, &entity, None, &body)
+        .map(Some)
+        .map_err(|e| WriteError::Store(e.into()))
+}
+
+/// Every hook failure the attester recorded in `events`.
+pub fn hook_faults_in(events: &[Event]) -> Vec<HookFault> {
+    events
+        .iter()
+        .filter(|e| e.kind == EventKind::GateStoodAside && e.actor == ATTESTER_ACTOR)
+        .filter_map(|e| serde_json::from_str::<serde_json::Value>(&e.body).ok())
+        .filter_map(|body| serde_json::from_value::<HookFault>(body.get("hook_fault")?.clone()).ok())
+        .collect()
+}
+
+/// The machine section's one line about THOR's own health in the window: the
+/// hook failures recorded and the filings refused as version skew, both from
+/// the log's own records so the evaluating session cannot edit them.
+fn health_line(window: &[Event]) -> String {
+    let hook_failures = hook_faults_in(window).len();
+    let skew_events = window
+        .iter()
+        .filter(|e| e.kind == EventKind::GateStoodAside && e.actor == EVAL_VALIDATOR_ACTOR)
+        .filter_map(|e| serde_json::from_str::<EvaluationValidation>(&e.body).ok())
+        .filter(|v| !v.valid && v.why.starts_with(SKEW_WHY))
+        .count();
+    format!("\nTHOR health in the window: {hook_failures} hook launch failure(s), {skew_events} version-skew event(s).")
+}
+
 pub fn render_machine_section(store: &EventStore, start: &EvaluationStart, filed_seq: i64) -> String {
     machine_section(store, start, filed_seq).0
 }
@@ -6579,6 +6653,7 @@ fn machine_section(store: &EventStore, start: &EvaluationStart, filed_seq: i64) 
         plain(&start.id),
         start.seq
     ));
+    out.push_str(&health_line(&window));
 
     // ---- EARLIER ROUNDS (step 26, field test 2): an earlier evaluation of
     // this project, closed as void or superseded before this one started and
@@ -10266,7 +10341,7 @@ mod tests {
         let filed_seq = store.get_next_seq().unwrap() - 1;
         let section = render_machine_section(&store, &start, filed_seq);
         assert_eq!(render_machine_section(&store, &start, filed_seq), section, "twice the same");
-        let expected_first = format!("=== MACHINE SECTION: derived from the log, seq {} to {filed_seq}; it cannot be edited ===", start.frozen.started_seq);
+        let expected_first = format!("=== MACHINE SECTION: derived from the log, seq {} to {filed_seq}; renderer {}; it cannot be edited ===", start.frozen.started_seq, gate::MACHINE_RENDERER_REV);
         assert_eq!(section.lines().next(), Some(expected_first.as_str()));
         assert!(section.is_ascii() && !section.contains('\r'), "plain ASCII, LF only");
         assert!(section.contains(&format!("EVALUATION: project 'mp'; session mp-session (the main session, agent a1); started by skill (THOR's record '{}'", start.id)), "{section}");
@@ -10780,6 +10855,63 @@ mod tests {
         let section = render_machine_section(&store, &start, filed_seq);
         assert!(section.contains("2 write(s) refused by THOR's own trial."), "{section}");
         assert!(section.contains("1 more write(s) refused by the trial in other sessions during the window are not counted here"), "{section}");
+    }
+
+    fn skew_validation(report: &str, report_seq: i64, valid: bool, why: &str) -> EvaluationValidation {
+        EvaluationValidation {
+            valid,
+            why: why.to_string(),
+            drift: false,
+            report: report.to_string(),
+            report_seq,
+            project: Some("mp".to_string()),
+            session: "mp-session".to_string(),
+            agent: None,
+            started_seq: None,
+            filed_seq: None,
+            filed_at: None,
+            machine_sha256: None,
+            verdicts: VerdictShares::default(),
+            carry: Vec::new(),
+        }
+    }
+
+    fn hook_fault(id: &str) -> HookFault {
+        HookFault { tool_use_id: id.to_string(), hook_event: "SessionStart".to_string(), exit_code: 126, at: "2026-10-06T22:29:00.231Z".to_string() }
+    }
+
+    /// The machine section says how healthy THOR itself was in the window: the
+    /// hook launch failures the attester recorded and the filings the
+    /// validator refused as version skew. Both come from the log up to F, so
+    /// the agent cannot edit them, and what happened before the start is not
+    /// counted.
+    #[test]
+    fn the_machine_section_counts_hook_launch_failures_and_version_skew_of_the_window() {
+        let mut store = EventStore::in_memory().unwrap();
+        let attester = SystemActor::new(ATTESTER_ACTOR);
+        let validator = SystemActor::new(EVAL_VALIDATOR_ACTOR);
+        assert!(record_hook_fault(&mut store, "mp-session", attester, &hook_fault("before")).unwrap().is_some());
+        let start = record_start(&mut store, "mp-session", "mp");
+        assert!(record_hook_fault(&mut store, "mp-session", attester, &hook_fault("one")).unwrap().is_some());
+        assert!(record_hook_fault(&mut store, "other-session", attester, &hook_fault("two")).unwrap().is_some());
+        assert!(record_hook_fault(&mut store, "mp-session", attester, &hook_fault("one")).unwrap().is_none(), "recorded once");
+        let err = record_hook_fault(&mut store, "mp-session", validator, &hook_fault("three")).unwrap_err().to_string();
+        assert!(err.contains("attester only"), "{err}");
+        let skew = skew_validation("eval-mp-a", 1, false, &format!("{SKEW_WHY}: format 1, the checker reads 2"));
+        assert!(record_evaluation_validation(&mut store, validator, &skew).unwrap().is_some());
+        let edited = skew_validation("eval-mp-b", 2, false, "its machine section is not the one THOR derives from the log");
+        assert!(record_evaluation_validation(&mut store, validator, &edited).unwrap().is_some());
+
+        let filed_seq = store.get_next_seq().unwrap() - 1;
+        let section = render_machine_section(&store, &start, filed_seq);
+        assert!(section.contains("\nTHOR health in the window: 2 hook launch failure(s), 1 version-skew event(s).\n"), "{section}");
+        assert_eq!(render_machine_section(&store.truncated_copy(filed_seq).unwrap(), &start, filed_seq), section, "pure at F");
+
+        let mut quiet = EventStore::in_memory().unwrap();
+        let quiet_start = record_start(&mut quiet, "q-session", "mp");
+        let quiet_filed = quiet.get_next_seq().unwrap() - 1;
+        let quiet_section = render_machine_section(&quiet, &quiet_start, quiet_filed);
+        assert!(quiet_section.contains("\nTHOR health in the window: 0 hook launch failure(s), 0 version-skew event(s).\n"), "{quiet_section}");
     }
 
     /// G15.2: two quiet evaluations - nothing on any list, the same one-line

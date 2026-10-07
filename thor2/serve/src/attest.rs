@@ -109,7 +109,7 @@ pub fn session_transcripts(root: &Path, session: &str) -> Vec<PathBuf> {
 }
 
 /// Every `.jsonl` file under `dir`, sorted, at most 16 folders deep.
-fn walk_jsonl(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
+pub(crate) fn walk_jsonl(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
     if depth > 16 {
         return;
     }
@@ -943,6 +943,30 @@ pub fn record_foreign_write_verifications_in(store: &mut EventStore, session: &s
             continue;
         }
         recorded += record_writes_of(store, &writer, session, Some(root), false);
+    }
+    recorded
+}
+
+/// Every THOR hook of `session` that Claude Code could not start, as its
+/// transcripts under `transcripts_root()` record it (`hook_faults`), written to
+/// the log once each. Runs at the main session's Stop and never holds a turn:
+/// it is how a failure THOR itself could not report reaches the log, and so the
+/// evaluation's machine section. Returns how many it recorded.
+pub fn record_hook_faults(store: &mut EventStore, session: &str) -> usize {
+    record_hook_faults_in(store, session, transcripts_root().as_deref())
+}
+
+/// `record_hook_faults` against the transcripts under `root`.
+pub fn record_hook_faults_in(store: &mut EventStore, session: &str, root: Option<&Path>) -> usize {
+    let Some(root) = root else { return 0 };
+    let mut recorded = 0;
+    for file in session_transcripts(root, session) {
+        for found in crate::hook_faults::faults_in_file(&file) {
+            let written = model::store::record_hook_fault(store, session, SystemActor::new(ATTESTER_ACTOR), &found.fault);
+            if matches!(written, Ok(Some(_))) {
+                recorded += 1;
+            }
+        }
     }
     recorded
 }

@@ -102,6 +102,7 @@ pub mod eval_filing;
 pub mod eval_session;
 pub mod guard_verdict;
 pub mod holder;
+pub mod hook_faults;
 pub mod input;
 pub mod judge;
 pub mod legit;
@@ -136,6 +137,23 @@ pub mod vectors;
 pub mod volume;
 
 use thor_core::event_store::EventStore;
+
+/// A hash of the sources this build came from (`build.rs`): two programs built
+/// from one tree carry one id, a program built before a change another.
+pub const BUILD_ID: &str = env!("THOR_BUILD_ID");
+
+/// What `--version` prints: `serve 2.5.0 (build 0123456789ab)`.
+pub fn version_line(program: &str) -> String {
+    format!("{program} {} (build {BUILD_ID})", env!("CARGO_PKG_VERSION"))
+}
+
+/// The build id inside the output of some program's `--version`, or `None` for
+/// a program that prints none (one built before the id existed).
+pub fn build_id_in(version_output: &str) -> Option<&str> {
+    let (_, rest) = version_output.split_once("(build ")?;
+    let id = rest.split(')').next()?.trim();
+    (!id.is_empty()).then_some(id)
+}
 
 /// The whole read side of the one serving path, run once: select what
 /// applies, then cap it. Returns the full ranked list too, since `why` needs

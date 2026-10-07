@@ -316,6 +316,13 @@ fn main() -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
+    // A file that is there but cannot be started is the same failure one step
+    // later: every hook would fail open. Asked once, with `--version`, which
+    // writes nothing.
+    if let Some(problem) = ops::install::launch_problem(&serve_exe) {
+        eprintln!("refusing to write hooks that call a program that does not start: {problem}");
+        return ExitCode::FAILURE;
+    }
 
     println!("memory:       {}", db.display());
     println!("hooks call:   {}", serve_exe.display());
