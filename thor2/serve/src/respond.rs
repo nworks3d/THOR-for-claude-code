@@ -168,7 +168,10 @@ pub fn last_user_prompt(transcript_jsonl: &str) -> Option<String> {
 
 /// The text the owner typed in one transcript entry, `None` for every entry
 /// that is not him typing (an assistant line, a tool result, Claude Code's own
-/// note, a Stop hold's text) - see `last_user_prompt` for the shapes.
+/// note, a Stop hold's text, a background task's notification or a system
+/// reminder: `prompt::is_owners_own_text`) - see `last_user_prompt` for the
+/// shapes. Field test 12, R6: the length hold quoted `</task-notification>` as
+/// the owner's words because the last user-role entry was only a notification.
 fn owner_prompt_of(entry: &Value) -> Option<String> {
     if entry.get("type").and_then(|t| t.as_str()) != Some("user") {
         return None;
@@ -180,13 +183,17 @@ fn owner_prompt_of(entry: &Value) -> Option<String> {
     }
     let content = entry.get("message").and_then(|m| m.get("content"))?;
     if let Some(s) = content.as_str() {
-        return (!s.trim().is_empty() && !s.starts_with(STOP_HOOK_FEEDBACK_PREFIX)).then(|| s.to_string());
+        return (!s.trim().is_empty() && !s.starts_with(STOP_HOOK_FEEDBACK_PREFIX) && crate::prompt::is_owners_own_text(s))
+            .then(|| s.to_string());
     }
     let blocks = content.as_array()?;
     let text = blocks
         .iter()
         .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
         .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+        // A block the harness wrote (a task notification, a system reminder)
+        // is not the owner typing, even beside a block he did type.
+        .filter(|t| crate::prompt::is_owners_own_text(t))
         .collect::<Vec<_>>()
         .join("
 ");
@@ -2551,6 +2558,31 @@ mod tests {
     fn last_user_prompt_reads_the_text_block_of_an_array_shaped_turn() {
         let jsonl = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"wat staat er op deze foto?"},{"type":"image","source":{}}]}}"#;
         assert_eq!(last_user_prompt(jsonl).as_deref(), Some("wat staat er op deze foto?"));
+    }
+
+    /// FIELD TEST 12, R6: a background task's notification is written as a
+    /// user-role entry after the owner's real prompt, and the length hold
+    /// quoted its closing tag as "his words". A harness wrapper is skipped,
+    /// as a whole entry and as one block beside a block he typed.
+    #[test]
+    fn last_user_prompt_skips_a_task_notification_and_a_system_reminder_entry() {
+        let jsonl = r#"{"type":"user","message":{"role":"user","content":"controleer de build en zeg wat er stuk is"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"ik start een taak"}]}}
+{"type":"user","message":{"role":"user","content":"<task-notification>
+<task-id>t1</task-id>
+<summary>Build finished</summary>
+</task-notification>"}}
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"<system-reminder>
+fixture reminder
+</system-reminder>"}]}}"#;
+        assert_eq!(last_user_prompt(jsonl).as_deref(), Some("controleer de build en zeg wat er stuk is"));
+
+        let mixed = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"<system-reminder>fixture</system-reminder>"},{"type":"text","text":"en nu de tweede vraag"}]}}"#;
+        assert_eq!(last_user_prompt(mixed).as_deref(), Some("en nu de tweede vraag"));
+
+        // Only a wrapper in the whole transcript: no owner prompt at all.
+        let only = r#"{"type":"user","message":{"role":"user","content":"<task-notification>x</task-notification>"}}"#;
+        assert_eq!(last_user_prompt(only), None);
     }
 
     #[test]
