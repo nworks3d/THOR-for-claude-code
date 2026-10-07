@@ -1407,6 +1407,15 @@ pub struct TrialFields {
     /// writes exactly as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unreached: Option<String>,
+    /// The matcher revision of the build that decided this verdict
+    /// (`serve::teeth::matcher_rev`): a hash of the sources that decide
+    /// whether a call is refused. A record written before this field existed
+    /// has none, and reads as decided by an older matcher. Never part of the
+    /// fingerprint, so a rule is not made undecided by a newer build - it is
+    /// only tried again (`serve retest --compare`, the evaluation start).
+    /// Left out of the JSON when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matcher_rev: Option<String>,
 }
 
 /// THE Q24 EXEMPTION, in one value: an OLD contains check - one that stood on
@@ -12045,6 +12054,7 @@ mod tests {
             file_blob: None,
             a4_old_stock: None,
             unreached: None,
+            matcher_rev: None,
         }
     }
 

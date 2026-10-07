@@ -235,6 +235,35 @@ impl Tried {
         self.clean.iter().filter(|(_, r)| *r).map(|(c, _)| c.shown.clone()).collect()
     }
 
+    /// Why a check that reaches does not bite, naming the forms it talks
+    /// about: the clean forms it refuses, and the forms it names that it lets
+    /// through. Either list can be empty, never both once `bites()` is false.
+    fn why_not_biting(&self) -> String {
+        let named = |calls: Vec<&str>| calls.iter().map(|c| format!("'{c}'")).collect::<Vec<_>>().join(" and ");
+        fn shown(forms: &[(Call, bool)], refused: bool) -> Vec<&str> {
+            forms.iter().filter(|(_, r)| *r == refused).map(|(c, _)| c.shown.as_str()).collect()
+        }
+        let (refused, let_through) = (shown(&self.forbidden, true), shown(&self.forbidden, false));
+        let clean_refused = shown(&self.clean, true);
+        match (clean_refused.is_empty(), let_through.is_empty()) {
+            (false, true) => format!("it refuses {}, which a check must let through", named(clean_refused)),
+            (false, false) => format!(
+                "it refuses {}, which a check must let through, and lets {} through, which a check must refuse",
+                named(clean_refused),
+                named(let_through)
+            ),
+            (true, false) if refused.is_empty() => {
+                format!("it lets {} through, and a check must refuse every form it names", named(let_through))
+            }
+            (true, false) => format!(
+                "it refuses {} but lets {} through, and a check must refuse every form it names",
+                named(refused),
+                named(let_through)
+            ),
+            (true, true) => "no form of it could be tried".to_string(),
+        }
+    }
+
     /// "'git push --force' (refused), 'git push' (let through)".
     fn listed(&self) -> String {
         self.forbidden
@@ -2128,10 +2157,7 @@ impl<'a> Work<'a> {
             // (6) the writer's check does not bite.
             if old_stock {
                 let why = if tried.reaches() {
-                    format!(
-                        "it refuses {}, which a check must let through",
-                        self.clean_failed.iter().map(|c| format!("'{c}'")).collect::<Vec<_>>().join(" and ")
-                    )
+                    tried.why_not_biting()
                 } else {
                     format!("an Edit removing it is let through ({})", no_reach_why(check))
                 };
@@ -2152,7 +2178,7 @@ impl<'a> Work<'a> {
                     _ => "nothing reached it".to_string(),
                 }
             } else {
-                format!("it refuses {}, which a check must let through", self.clean_failed.iter().map(|c| format!("'{c}'")).collect::<Vec<_>>().join(" and "))
+                tried.why_not_biting()
             };
             // A TEXT REVISE NEVER CLEARS A CHECK AS A SIDE EFFECT (step 24). The
             // check is the one the rule already carried, it holds, and only its
@@ -2303,6 +2329,7 @@ impl<'a> Work<'a> {
             file_blob: self.file_blob.clone(),
             a4_old_stock: if self.old_stock_granted { self.old_stock.clone() } else { None },
             unreached: self.unreached.clone(),
+            matcher_rev: Some(matcher_rev()),
         })
     }
 
@@ -2608,6 +2635,109 @@ pub fn stored_item(item: &Item, trial: &Trial) -> Option<Item> {
         out.tags.push(tag.to_string());
     }
     Some(out)
+}
+
+// ------------------------------------------------------ matcher revision
+
+/// The sources that decide whether a call is refused: how a command is read
+/// (`model::shell`), which rules reach a call (`rank`), and how the guard
+/// answers (`guard_verdict`). A trial verdict is only as good as the matcher
+/// that made it, so the verdict records a hash of these.
+const MATCHER_SOURCES: [&str; 3] =
+    [include_str!("../../model/src/shell.rs"), include_str!("rank.rs"), include_str!("guard_verdict.rs")];
+
+/// `source` without its blank lines, full-line comments and the indentation
+/// and line endings around the rest: a comment or a reformat is no change of
+/// behaviour, and must not make every verdict look old.
+fn without_comments(source: &str) -> String {
+    source.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with("//")).collect::<Vec<_>>().join("\n")
+}
+
+/// The revision (12 hex characters) of a set of matcher sources.
+pub fn matcher_rev_of(sources: &[&str]) -> String {
+    let text = sources.iter().map(|s| without_comments(s)).collect::<Vec<_>>().join("\n--\n");
+    thor_core::event_store::hash_event("matcher-rev", &text)[..12].to_string()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own matcher revision, to stand in for an older build.
+    pub(crate) static MATCHER_REV_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The matcher revision of THIS build: what every verdict it writes records.
+pub fn matcher_rev() -> String {
+    #[cfg(test)]
+    if let Some(rev) = MATCHER_REV_OVERRIDE.with(|r| r.borrow().clone()) {
+        return rev;
+    }
+    static REV: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    REV.get_or_init(|| matcher_rev_of(&MATCHER_SOURCES)).clone()
+}
+
+/// The matcher revision that decided `id`'s current verdict: `Some(None)`
+/// when that verdict was written by a build that recorded none, `None` when
+/// the rule has no current verdict at all.
+pub fn decided_by(store: &EventStore, id: &str) -> Option<Option<String>> {
+    model::store::current_record(store, id).map(|r| r.fields().matcher_rev.clone())
+}
+
+/// Whether `id` holds a verdict that an older matcher decided (or one that
+/// recorded no matcher at all): it is due to be tried again by this build.
+pub fn decided_by_older_matcher(store: &EventStore, id: &str) -> bool {
+    decided_by(store, id).is_some_and(|rev| rev.as_deref() != Some(matcher_rev().as_str()))
+}
+
+/// How a rule's verdict from this build compares with the one it holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Change {
+    /// The same class of verdict: a bite stays a bite, a note a note.
+    Unchanged,
+    /// A note that this build finds bites.
+    Promote,
+    /// A rule that bit and that this build would make a note.
+    Demote,
+    /// This build cannot decide it at all (needs the agent, or blocked).
+    Unresolved,
+}
+
+/// `old` against what a retest decided now. `None` when the rule holds no
+/// verdict to compare with.
+pub fn change_of(old: &model::store::CurrentVerdict, now: &Maintenance) -> Option<Change> {
+    use model::store::CurrentVerdict as Old;
+    let bites_before = match old {
+        Old::RuleProven | Old::RuleWired => true,
+        Old::Note => false,
+        Old::Undecided { .. } => return None,
+    };
+    Some(match now {
+        Maintenance::Rule { .. } if bites_before => Change::Unchanged,
+        Maintenance::Rule { .. } => Change::Promote,
+        Maintenance::Note { .. } if bites_before => Change::Demote,
+        Maintenance::Note { .. } => Change::Unchanged,
+        Maintenance::Blocked(_) | Maintenance::NeedsAgent(_) => Change::Unresolved,
+    })
+}
+
+/// One decided rule tried again by this build, with the verdict it holds.
+#[derive(Debug, Clone)]
+pub struct Comparison {
+    pub retest: Retest,
+    pub old: model::store::CurrentVerdict,
+    /// The matcher revision that decided the old verdict, `None` for a
+    /// record that carries none.
+    pub old_rev: Option<String>,
+    pub change: Change,
+}
+
+/// Try `id` again with this build and compare with the verdict it holds,
+/// writing nothing. `Ok(None)` for a rule with no current verdict (a plain
+/// retest decides those).
+pub fn compare(store: &EventStore, db: Option<&Path>, id: &str, corpus: &Corpus) -> Result<Option<Comparison>, String> {
+    let old = model::store::current_verdict(store, id);
+    let old_rev = decided_by(store, id).flatten();
+    let retest = retest(store, db, id, corpus)?;
+    Ok(change_of(&old, &retest.outcome).map(|change| Comparison { retest, old, old_rev, change }))
 }
 
 // ---------------------------------------------------------------- retest
