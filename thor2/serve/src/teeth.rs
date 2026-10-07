@@ -152,7 +152,14 @@ pub(crate) fn pipeline_refuses(item: &Item, tool: &str, input: &Value, root: &Pa
 
 /// `refuses_call`, in the folder `command_root` picks for `store`.
 pub fn refuses_call_in(store: &EventStore, id: &str, item: &Item, command: &str) -> bool {
-    refuses_call_among(id, item, command, &command_root(store, item.project.as_deref()), &known_projects(store))
+    refuses_call_known(store, id, item, command, &known_projects(store))
+}
+
+/// `refuses_call_in`, for a reader that tries many calls and read
+/// `known_projects` once: that read folds the whole live set, so asking it
+/// again per call is what made a doctor over a big store take a minute more.
+pub fn refuses_call_known(store: &EventStore, id: &str, item: &Item, command: &str, known: &[String]) -> bool {
+    refuses_call_among(id, item, command, &command_root(store, item.project.as_deref()), known)
 }
 
 /// The item's first Command anchor.

@@ -2794,6 +2794,111 @@ pub fn gate_line(db: &Path) -> String {
     out.join("\n")
 }
 
+/// How far back the refusal outcomes line looks for real refusals.
+const REFUSAL_OUTCOMES_DAYS: i64 = 30;
+
+/// FALSE BLOCKS AS A NUMBER, from the log alone (`model::refusal_outcome`):
+/// every real refusal (field evidence, as `teeth_line` counts it, judged
+/// against the check in force when it happened, so a rule weakened since
+/// still counts) in the last `REFUSAL_OUTCOMES_DAYS` days, and how many were
+/// followed within `OUTCOME_WINDOW_DAYS` by a weakening or retract of the
+/// refusing rule. A proxy, never a verdict: it feeds no ranking and no gate,
+/// and a noise mark is listed but never counted (the refused agent can write
+/// one). An event carries no time of its own, so a write is dated by the
+/// newest served, refused or verified event before it. Silent with no
+/// refusals; `full` lists each probable false block.
+pub fn refusal_outcomes_line(db: &Path, full: bool) -> Vec<String> {
+    refusal_outcomes_at(db, full, serve::time::now_unix())
+}
+
+fn refusal_outcomes_at(db: &Path, full: bool, now: i64) -> Vec<String> {
+    use model::refusal_outcome::{fates, rate_words, Fate, OUTCOME_WINDOW_DAYS};
+    use thor_core::event_store::EventKind;
+    let Ok(store) = EventStore::open_existing(db) else { return Vec::new() };
+    let Ok(events) = store.get_all_events() else { return Vec::new() };
+    let refused: std::collections::BTreeSet<&str> = events
+        .iter()
+        .filter(|e| e.kind == EventKind::GateRefused && e.actor == model::store::ASSISTANT_DELIVERY_ACTOR)
+        .map(|e| e.entity_id.as_str())
+        .collect();
+    if refused.is_empty() {
+        return Vec::new();
+    }
+    let mut at: std::collections::HashMap<i64, i64> = Default::default();
+    let mut last: Option<i64> = None;
+    for e in &events {
+        if matches!(e.kind, EventKind::ItemServed | EventKind::GateRefused | EventKind::GateStoodAside) {
+            let body = serde_json::from_str::<serde_json::Value>(&e.body).unwrap_or(serde_json::Value::Null);
+            let when = body.get("served_at").or_else(|| body.get("at")).and_then(|v| v.as_str());
+            last = when.and_then(serve::time::unix_from_iso8601).or(last);
+        }
+        if let (Some(t), true) = (last, refused.contains(e.entity_id.as_str())) {
+            at.insert(e.seq, t);
+        }
+    }
+    let horizon = now - REFUSAL_OUTCOMES_DAYS * 86_400;
+    let window = OUTCOME_WINDOW_DAYS * 86_400;
+    let mut all = Vec::new();
+    // Folding the live set to name the known projects is the slow part of
+    // asking a command rule's refusals; do it once, and only if one is asked.
+    let projects = std::cell::OnceCell::new();
+    let known = || projects.get_or_init(|| serve::teeth::known_projects(&store)).clone();
+    for id in refused {
+        let Ok(own) = store.get_events_by_entity(id) else { continue };
+        let verdicts = model::store::recorded_refusal_verdicts(&own);
+        let is_real = |e: &thor_core::event_store::Event, item: &model::item::Item, since: i64| {
+            at.get(&e.seq).is_none_or(|t| *t >= horizon)
+                && serve::attest::is_field_refusal_known(&store, e, id, item, since, &verdicts, &known)
+        };
+        let follows = |refusal: &thor_core::event_store::Event, later: &thor_core::event_store::Event| {
+            match (at.get(&refusal.seq), at.get(&later.seq)) {
+                (Some(then), Some(after)) => after - then <= window,
+                _ => true,
+            }
+        };
+        all.extend(fates(id, &own, &is_real, &follows).into_iter().map(|f| (at.get(&f.refusal_seq).copied(), f)));
+    }
+    if all.is_empty() {
+        return Vec::new();
+    }
+    let probable: Vec<_> = all.iter().filter(|(_, f)| f.probable_false_block()).map(|(_, f)| f).collect();
+    let noisy = all.iter().filter(|(_, f)| f.fate == Fate::MarkedNoise).count();
+    let young = all.iter().filter(|(t, _)| t.is_some_and(|t| now - t < window)).count();
+    let mut line = format!(
+        "refusal outcomes: {} real refusal(s) in the last {REFUSAL_OUTCOMES_DAYS} days, {} followed by weakening or retract of the \
+         refusing rule within {OUTCOME_WINDOW_DAYS} days (probable false blocks), {}. A proxy read from the log: a rule can change for \
+         other reasons, and one rule's refusals are counted one by one.",
+        all.len(),
+        probable.len(),
+        rate_words(probable.len(), all.len())
+    );
+    if noisy > 0 {
+        line.push_str(&format!(" {noisy} more were marked noise afterwards and are not counted."));
+    }
+    if young > 0 {
+        line.push_str(&format!(" {young} refusal(s) are younger than the window and may still be followed."));
+    }
+    if !full && !probable.is_empty() {
+        line.push_str(" --full lists them.");
+    }
+    let mut out = vec![line];
+    if full {
+        for f in probable {
+            let how = match &f.fate {
+                Fate::Weakened(labels) => format!("weakened ({labels})"),
+                _ => "retracted".to_string(),
+            };
+            out.push(format!(
+                "  probable false block: '{}' refused at log seq {}, then {how} at log seq {}",
+                f.rule,
+                f.refusal_seq,
+                f.fate_seq.unwrap_or_default()
+            ));
+        }
+    }
+    out
+}
+
 pub fn crowding_line(db: &Path, checkouts: Option<&Path>, full: bool) -> String {
     let Ok(store) = EventStore::open_existing(db) else {
         return "crowding: store unreadable, not checked".to_string();
@@ -3314,6 +3419,8 @@ pub fn report(
         orphan_projects_line(db, checkouts),
     ]);
     lines.extend(working_copy_lines(db));
+    // Silent unless a real refusal is on the log.
+    lines.extend(refusal_outcomes_line(db, full));
     // Silent unless something is actually owed - see `judgement_debt_line`'s
     // own doc comment for why this exists alongside `unjudged_line` above
     // rather than in place of it. `full` also lifts its named-items cap, the
@@ -5424,6 +5531,83 @@ mod tests {
         assert!(line.contains("0 rule(s) of any weight hold a field refusal"), "{line}");
         assert!(line.contains("1 rule(s) pass the structural part alone"), "{line}");
         assert!(line.contains("1 refusal(s) not verified yet"), "{line}");
+    }
+
+    /// FALSE BLOCKS AS A NUMBER: each real refusal (field evidence, verified in
+    /// a transcript) is linked to what happened to its rule within 7 days. A
+    /// rule weakened or retracted after refusing is a probable false block; one
+    /// left alone, one weakened only after the window, a refusal nobody
+    /// verified and a refusal older than the 30 days are not counted.
+    #[test]
+    fn refusal_outcomes_link_each_real_refusal_to_what_happened_to_its_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcripts = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let force_rule = |id: &str| {
+            let mut r = rule(id);
+            r.text = format!("never run git push with --force ({id})");
+            r.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "git push".to_string() }];
+            r.check = Some(Check::Forbidden { literals: vec!["--force".to_string()] });
+            r
+        };
+        let call = serde_json::json!({"command": "git push --force origin main"});
+        let weaken = |s: &mut EventStore, id: &str| {
+            let item = force_rule(id);
+            let mut cleared = item.clone();
+            cleared.check = None;
+            let baseline = model::gate::ClearedFields { check: true, ..Default::default() }.baseline(&item);
+            store::revise_because(s, "s", "l", "mcp", &baseline, &cleared, &item, Some("the --force check blocked a legitimate push")).unwrap();
+        };
+        {
+            let mut s = EventStore::new(&db).unwrap();
+            for id in ["rule-weak", "rule-gone", "rule-same", "rule-late"] {
+                legacy_declare(&mut s, &force_rule(id));
+            }
+            for (id, tool) in [("rule-weak", "toolu_1"), ("rule-gone", "toolu_2"), ("rule-same", "toolu_3"), ("rule-late", "toolu_4")] {
+                serve::attest::fixture::field_refusal(
+                    &mut s,
+                    transcripts.path(),
+                    serve::attest::fixture::SESSION,
+                    id,
+                    tool,
+                    "Bash",
+                    call.clone(),
+                    "git push --force origin main",
+                );
+            }
+            // A refusal no transcript backs: never counted.
+            serve::deliver::record_gate_outcome_for_call(
+                &mut s, serve::attest::fixture::SESSION, "l", "hook", "2026-09-28T00:00:02Z", true, "rule-same", "git push --force origin main", Some("toolu_5"),
+            );
+            weaken(&mut s, "rule-weak");
+            store::retract(&mut s, "s", "l", "mcp", "rule-gone", "the --force check blocked a legitimate push", None).unwrap();
+            // Three weeks of other work go by before this one is weakened.
+            serve::deliver::record_delivery(&mut s, "other", "other", "hook", "2026-10-20T00:00:00Z", &["rule-same".to_string()]);
+            weaken(&mut s, "rule-late");
+        }
+        let now = serve::time::unix_from_iso8601("2026-10-25T00:00:00Z").unwrap();
+        let lines = refusal_outcomes_at(&db, false, now);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("refusal outcomes: 4 real refusal(s) in the last 30 days, 2 followed by weakening or retract of the refusing rule within 7 days (probable false blocks), "), "{lines:?}");
+        assert!(lines[0].contains(&model::refusal_outcome::rate_words(2, 4)), "{lines:?}");
+        assert!(lines[0].contains("--full lists them"), "{lines:?}");
+
+        let full = refusal_outcomes_at(&db, true, now);
+        assert_eq!(full.len(), 3, "{full:?}");
+        assert!(full.iter().any(|l| l.starts_with("  probable false block: 'rule-weak' refused at log seq ") && l.contains("then weakened (check cleared) at log seq ")), "{full:?}");
+        assert!(full.iter().any(|l| l.starts_with("  probable false block: 'rule-gone' refused at log seq ") && l.contains("then retracted at log seq ")), "{full:?}");
+        assert!(!full[0].contains("--full lists them"), "{full:?}");
+
+        // Silent: every refusal is older than the 30 days.
+        let later = serve::time::unix_from_iso8601("2026-12-25T00:00:00Z").unwrap();
+        assert!(refusal_outcomes_at(&db, true, later).is_empty());
+        // Silent: a store that never refused anything.
+        let quiet = dir.path().join("quiet.db");
+        {
+            let mut s = EventStore::new(&quiet).unwrap();
+            legacy_declare(&mut s, &force_rule("rule-quiet"));
+        }
+        assert!(refusal_outcomes_at(&quiet, true, now).is_empty());
     }
 
     /// Step 14 (Z8, K14): doctor names every `answer-guard:` tag whose entry

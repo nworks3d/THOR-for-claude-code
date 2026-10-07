@@ -580,13 +580,28 @@ pub fn is_field_refusal(
     since: i64,
     verdicts: &HashMap<i64, (bool, String)>,
 ) -> bool {
+    is_field_refusal_known(store, event, id, item, since, verdicts, &|| crate::teeth::known_projects(store))
+}
+
+/// `is_field_refusal`, for a reader that asks it of many refusals: `known`
+/// (the projects the store holds a live item of) is asked only for a check
+/// that reads a command, so such a reader can answer from one reading.
+pub fn is_field_refusal_known(
+    store: &EventStore,
+    event: &Event,
+    id: &str,
+    item: &Item,
+    since: i64,
+    verdicts: &HashMap<i64, (bool, String)>,
+    known: &dyn Fn() -> Vec<String>,
+) -> bool {
     if event.entity_id != id || item.check.is_none() || !is_attested_refusal(store, event, since, verdicts) {
         return false;
     }
     if reads_a_command(item) {
         let body = serde_json::from_str::<Value>(&event.body).unwrap_or(Value::Null);
         let target = body.get("target").and_then(|t| t.as_str()).unwrap_or_default();
-        return crate::teeth::refuses_call_in(store, id, item, target);
+        return crate::teeth::refuses_call_known(store, id, item, target, &known());
     }
     true
 }
