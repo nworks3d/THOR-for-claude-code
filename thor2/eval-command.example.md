@@ -86,7 +86,7 @@ command) or when the Stop hook asks for it. At that moment THOR writes a
 start record and freezes three lists, which cannot grow: nothing that fires
 or is written afterwards is added, and nothing that fired only in another
 session is on them. Then THOR decides the old rules of the project ITSELF,
-for up to 20 seconds (the rules it did not reach in that time are counted in
+for up to the time box that the start note names (20 seconds by default) (the rules it did not reach in that time are counted in
 the note as "not reached this time: N" - they are not owed in this evaluation
 and they lead the next start), and the note it shows you afterwards names four
 things, ordered by what you must act on, with what needs no action last:
@@ -546,7 +546,11 @@ This is the signal that counts here, not a mark.
   start note prints under it ("If the refusal was right, restore: ..."): for a
   weakened rule a `mcp__thor__revise(id: "<id>", ...)` that sets back what the
   weakening took away, with a `because` of at least twenty characters of your
-  own saying why the weakening was a mistake; for a RETRACTED rule a
+  own saying why the weakening was a mistake. The restore puts back what the
+  weakening removed. If that old check was itself too broad (it also refuses the
+  legitimate call that was refused), narrow it in the same revise to a literal
+  that refuses the harmful form but not the legitimate one. Never widen it. For
+  a RETRACTED rule a
   `mcp__thor__remember(...)` of the whole rule under a NEW id (`<id>-restored`,
   with a tag `restored-from:<id>`) - never under the old id, because a second
   `remember` on a retracted id leaves it with two heads (`get` then refuses to
@@ -554,6 +558,9 @@ This is the signal that counts here, not a mark.
   If you cannot tell, say so for that rule and why, and restore nothing. WHEN
   IT IS DONE: every named rule has one of those outcomes written in the report,
   and a restore you made was accepted by THOR (rule or note, never a refusal). A
+  rule that refused a call and was NOT weakened or retracted afterwards is a
+  refusal that stood. Name it in the report (the rule id and the refused call, read
+  via history) as a right refusal. Nothing else is owed. A
   line that says "no verified refusal" needs nothing. For a window longer than
   eight blocks, work through the ones the start note and the section name, and
   say in the report how many more there were. EXAMPLE: the line names rule
