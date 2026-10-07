@@ -57,12 +57,13 @@ note stored onto a full place - the ask comes in the same message, after it.
 Settle both.
 
 The old rules whose trial THOR has not decided yet are asked here, in the
-start note (the batch and the A4 list), not at a turn-end. Each line prints
-ONE command to run, `serve ... retest --id '<id>'`, written with forward
-slashes and no `&`: that is exactly the form this routine's `allowed-tools`
-pre-approves, so run it as printed (add `--apply` to write the verdict). Do
-not retype it in another shell form - a PowerShell form is not pre-approved
-and a headless session is refused.
+start note (the batch and the A4 list), not at a turn-end. Where a line prints
+a command, it is `serve ... retest --id '<id>'` - a DEMOTION line prints it in
+full, with `--apply`, and so does the gate when it refuses a report - written
+with the real program and store path, forward slashes and no `&`: that is
+exactly the form this routine's `allowed-tools` pre-approves, so run it as
+printed. Do not retype it in another shell form - a PowerShell form is not
+pre-approved and a headless session is refused.
 
 The ask does not go quiet after one turn: it holds the end of every turn,
 naming how many times it has already asked and since when, until a report
@@ -85,14 +86,19 @@ command) or when the Stop hook asks for it. At that moment THOR writes a
 start record and freezes three lists, which cannot grow: nothing that fires
 or is written afterwards is added, and nothing that fired only in another
 session is on them. Then THOR decides the old rules of the project ITSELF,
-for up to 20 seconds, and the note it shows you afterwards names three
+for up to 20 seconds, and the note it shows you afterwards names four
 things:
 1. JUDGEMENT - the items you give a verdict on (step 2);
-2. TEETH - what THOR decided by itself, then two lists that are yours: the
-   batch (at most eight rules) and the A4 list (at most sixteen), each item
-   with its reason and the exact call to make (step 4);
+2. TEETH - what THOR decided by itself, then the lists that are yours: the
+   batch (at most eight rules), the A4 list (at most sixteen) and the
+   disputes to verify (item c), each item with its reason and the exact call
+   to make (step 4);
 3. OPEN POINTS - THOR's own, written and closed by THOR. Nothing for you to
-   do.
+   do;
+4. SIGNALS BEFORE YOU FILE - THOR's health and the refusal outcomes THOR
+   already knows at the start, each with its meaning, its calls and when it is
+   done (step 6). Act on them before you file; the machine section of your
+   report records the same two signals again for the evaluation's own window.
 
 That note is the one source for your work. If you missed it, the gate names
 the same lists when it refuses the report. If the note says THOR is still
@@ -261,11 +267,13 @@ handle only what the start note handed you under TEETH:
 
 - **The batch**: at most eight rules that need a fix only you can make, each
   line giving the reason and the call. Make the fix the line names, then run
-  the call shown - normally `mcp__thor__revise(id: "<id>")` with no other
-  argument, which makes THOR try the rule again as it is written now and
-  answer rule, note, or what is still missing. The report cannot be filed
-  until every rule of the batch is settled, and the gate counts what is
-  left. Rules that did not fit stay owed and lead the next evaluation.
+  the call shown - for an ordinary line normally `mcp__thor__revise(id: "<id>")`
+  with no other argument, which makes THOR try the rule again as it is written
+  now and answer rule, note, or what is still missing. A DEMOTION line is the
+  exception: it prints its own two exits, described next, and a bare revise is
+  not one of them. The report cannot be filed until every rule of the batch is
+  settled, and the gate counts what is left. Rules that did not fit stay owed
+  and lead the next evaluation.
 - **The A4 list**: at most sixteen rules whose check bites and whose text only
   has to name the check's literal. Reword the text so it names that literal,
   using the exact call the note prints (a `revise` with the reworded text) -
@@ -281,33 +289,62 @@ handle only what the start note handed you under TEETH:
   recorded") and two exact calls. Open the rule and the file or command it is
   about and decide whether the disputed literal IS what the rule is about.
   If it is, or a better check exists, make call 1: a `revise` that rewords the
-  text so it names the real subject and hangs the check. If it is only an
+  text so it names the real subject and hangs the check (for a disputed span
+  of a file the line names the rule's file in `check_path`). If it is only an
   incidental span, make call 2: `mcp__thor__revise(id: "<id>", because: "<why
   the span may change while the rule stays true, at least twenty
-  characters>")`. An item is done when one of the two calls was accepted;
-  nothing else settles it, and the report cannot be filed until every item is
-  done. Example: a rule saying "the sensor delay is in microseconds, not
-  nanoseconds", disputed on the loose word "delay": the subject is
-  "microseconds", so call 1 hangs a `contains` check on it.
+  characters>")` - THOR refuses a reason shorter than that, and a filler such
+  as "ok" settles nothing. An item is done when one of the two calls was
+  accepted, or when you retract the rule with a reason because it is simply
+  wrong; nothing else settles it (not a tag, not a note, not a line in the
+  report), and the report cannot be filed until every item is done. Example: a
+  rule saying "the sensor delay is in microseconds, not nanoseconds", disputed
+  on the loose word "delay": the subject is "microseconds", so call 1 hangs a
+  `contains` check on it. The machine section of your report lists each item of
+  this list under DISPUTES TO VERIFY, one line each: "verified by call 1" (a
+  check was hung), "verified by call 2" (with your reason), "settled by a
+  retract", or "NOT verified". That list is YOURS and frozen at the start. It is
+  not the same as the machine section's lines "notes by dispute written in the
+  window" and "rules kept with accept_refusing written in the window": those
+  list disputes written DURING this evaluation, by anyone, as information for
+  the owner and for the next evaluation's item c. You do not verify those, and a
+  rule of item c does not need to appear there.
 - **A DEMOTION in the batch**: a batch line that starts with "DEMOTION, nothing
   written". WHAT IT MEANS: THOR's matcher (the code that reads a command and
   decides whether a rule refuses it) changed between builds. This rule bit when
   the older matcher tried it, and the newer one would turn it into a note that
   can never refuse anything. THOR writes nothing on its own for this: the rule
-  keeps its tooth until you decide. WHAT TO DO: open the rule (`mcp__thor__get`)
-  and the file or command it is about, and read the reason on the line. If the
-  tooth can be made to bite again (the anchor, the literal or the words the text
-  names were wrong), make that fix with `mcp__thor__revise(id: "<id>", text:
-  "<the reworded text>")` and THOR tries the rule again. Only when you checked
-  and the rule truly cannot bite under the new reading, run the retest command
-  the line shows (`serve ... retest --id '<id>' --apply`), which writes the
-  note, and say in the report that you accepted the demotion and why. WHEN IT IS
-  DONE: the rule is no longer on the batch - THOR answers rule for the revise,
-  or note for the retest. EXAMPLE: a ban on resetting two named deploy checkouts
-  lists four refused forms, and the new matcher lets two of them through; the
-  line says so. Rewording the text to name only the forms the check really
-  catches keeps the rule on the rule track (revise); keeping the text as it is
-  and running the retest turns it into a note.
+  keeps its tooth until YOU decide - the owner is not asked. WHAT TO DO: open
+  the rule (`mcp__thor__get`) and the file or command it is about, read the
+  reason on the line (it names the forms the check refuses and the forms it
+  lets through), and take one of the two exits the line prints. A bare
+  `mcp__thor__revise(id: "<id>")` is NOT an exit: it changes nothing a trial
+  reads, so it writes nothing and the rule stays owed.
+  (a) ACCEPT the demotion, only when you checked that no wording or anchor can
+  make the check bite under the new reading: run the retest command the line
+  prints, as printed - the real `serve` path, `--db` with the real store,
+  forward slashes, `retest --id '<id>' --apply`. It writes the note and
+  nothing else; it needs no `--allow-demote` (that flag belongs to `--compare`
+  runs). Your report says that you accepted the demotion and why.
+  (b) KEEP THE TOOTH by narrowing the rule to the forms its check really
+  catches: send the Call the line prints. It is a `revise` with the three
+  things THOR's trial needs - `text` reworded to name only the caught forms (a
+  quoted form taken out of the text is a weakening), `check_kind: "forbidden"`
+  with `check_literals` narrowed to those forms (the line lists them), and a
+  `because` of at least twenty characters of your own saying why. A `revise`
+  with only the text is refused, and its refusal steers toward `clear_check`,
+  which is a weakening and never the way here. Write down in the report the
+  forms the narrowed rule no longer covers: that gap stays open.
+  WHEN IT IS DONE: the rule is no longer on the batch - THOR answers rule for
+  (b), or note for (a); the filing gate accepts either. EXAMPLE: a ban on
+  resetting two named deploy checkouts lists four refused forms, and the new
+  matcher lets the two joined with `&&` through. (b) is `mcp__thor__revise(id:
+  "ban", text: "Never hard-reset the deploy checkouts alpha-dev and beta-prod.
+  Refused: alpha-dev reset, beta-prod reset.", check_kind: "forbidden",
+  check_literals: ["alpha-dev reset", "beta-prod reset"], because: "the two
+  forms joined with && are not refused by the matcher, so the text now names
+  only what the check catches")` and THOR answers "teeth: wired, not proven";
+  (a) leaves the text as it is and turns the rule into a note.
 - **Everything THOR settled itself** (rules, notes, pending checks hung) is
   only reported, in the machine section of the report. You do not redo it.
 
@@ -392,8 +429,9 @@ form, to show that a tooth works. THOR tries every tooth itself with forms it
 builds; only a real refusal at real work counts.
 
 Step 4 is done once every rule of the batch and of the A4 list has its call
-made and THOR's answer to it, every dispute to verify has its call 1 or call 2
-accepted, and nothing is left hanging on a refusal.
+made and THOR's answer to it (for a DEMOTION: one of its two exits taken),
+every dispute to verify has its call 1 or call 2 accepted (or its rule
+retracted with a reason), and nothing is left hanging on a refusal.
 Retracting a heavy rule takes a reason that says what changed about THAT
 rule; "no longer relevant" is refused.
 
@@ -444,43 +482,68 @@ This is the signal that counts here, not a mark.
   belongs in the report - with the rule id, what you tried, and why it was
   legitimate. A false block teaches people to work around the gate, and
   that cannot be undone.
-- **REFUSAL OUTCOMES (probable false blocks).** The machine section of the
-  report has a line that starts "REFUSAL OUTCOMES in the window". WHAT IT MEANS:
-  THOR looked at every verified refusal in the window, found what happened to
-  the refusing rule afterwards, and counts a refusal as a PROBABLE false block
-  when someone other than THOR then retracted that rule or weakened it (cleared
-  or changed its check, lowered its severity, dropped a binding). It is a
-  proxy, not a verdict: a rule can change for other reasons. WHAT TO DO, for
-  each rule that line counts: open its history (`mcp__thor__history(id:
-  "<id>")`) and read the refusal and the change that followed. If the refusal
-  was WRONG (a legitimate call was blocked), the weakening was right: say so in
-  the report, with the rule id, the call that was refused and why it was
-  legitimate (this is the false block above). If the refusal was RIGHT and the
-  weakening was wrong, restore the check: `mcp__thor__revise(id: "<id>", ...)`
-  with the check as it was and a `because` of at least twenty characters that
-  says why the weakening was a mistake. WHEN IT IS DONE: every counted rule has
-  one of the two outcomes written in the report, and a restore was accepted by
-  THOR (rule or note, never a refusal). A line that says "no verified refusal
-  in the window" needs nothing. EXAMPLE: the line counts rule `no-force-push`;
-  its history shows a refusal of `git push --force-with-lease`, then a revise
-  that cleared the check. The refused call was legitimate, so the weakening
-  stands: write "no-force-push refused git push --force-with-lease, which is
-  safe; clearing its check was right".
-- **THOR health.** The machine section also has a line "THOR health in the
-  window: N hook launch failure(s), M version-skew event(s)". WHAT IT MEANS: a
-  hook launch failure is a Claude Code hook (THOR's guard or Stop hook) that
-  could not start, so nothing from THOR reached that call; a version-skew event
-  is a filing that THOR refused because the tool server that wrote the report
-  was built from another THOR than the checker ("written by a tool server of
-  another build than the checker"), which is nobody's edit. There is nothing to
-  fix in any note. WHAT TO DO: put both numbers in the report. When M is above
-  zero, or a filing was refused that way, tell the owner in the summary to
-  restart Claude so the tool server is the current one, then file again. When N
-  is above zero, name the hook and say it needs the owner's attention. WHEN IT
-  IS DONE: both numbers are in the report, and the owner was told to restart
-  when there was skew. EXAMPLE: "THOR health: 0 hook launch failures, 1
-  version-skew event - the owner was told to restart Claude, and I filed again
-  after the restart".
+- **REFUSAL OUTCOMES (probable false blocks).** Two places show it: section 4b
+  of the start note (what THOR knew at the start, since the previous report) and
+  the machine section of your report, which you read in the reply to your
+  filing (the refusals of the evaluation's own window), in a line that starts
+  "REFUSAL OUTCOMES in the window". WHAT IT MEANS: THOR looked at every verified
+  refusal, found what happened to the refusing rule afterwards, and counts a
+  refusal as a PROBABLE false block when someone other than THOR then retracted
+  that rule or weakened it (cleared or changed its check, lowered its severity,
+  dropped a binding). It is a proxy, not a verdict: a rule can change for other
+  reasons, a refusal no session has verified yet is not counted, a noise mark is
+  shown in `history` but never counted, and a rule refused twice counts twice.
+  Under the line, each probable false block is named: the rule id, the call
+  that was refused (cut short and redacted the way the log keeps it) and what
+  followed - at most eight, then "and N more". WHAT TO DO, for each rule so
+  named: open its history (`mcp__thor__history(id: "<id>")`) - the refusal step
+  shows the refused call, the later steps show the change, and every step shows
+  the rule as it stood (check, bindings, severity) - and decide, from that call
+  and the file or command the rule is about, whether the refused call was
+  legitimate. If it WAS (the refusal was wrong), the weakening was right: say so
+  in the report, with the rule id, the call that was refused and why it was
+  legitimate (this is the false block above). If it was NOT (the refusal was
+  right and the weakening was a mistake), restore the rule with the call the
+  start note prints under it ("If the refusal was right, restore: ..."): for a
+  weakened rule a `mcp__thor__revise(id: "<id>", ...)` that sets back what the
+  weakening took away, with a `because` of at least twenty characters of your
+  own saying why the weakening was a mistake; for a RETRACTED rule a
+  `mcp__thor__remember(...)` of the whole rule under a NEW id (`<id>-restored`,
+  with a tag `restored-from:<id>`) - never under the old id, because a second
+  `remember` on a retracted id leaves it with two heads (`get` then refuses to
+  read it until a `resolve`), and a retraction is never undone by a `revise`.
+  If you cannot tell, say so for that rule and why, and restore nothing. WHEN
+  IT IS DONE: every named rule has one of those outcomes written in the report,
+  and a restore you made was accepted by THOR (rule or note, never a refusal). A
+  line that says "no verified refusal" needs nothing. For a window longer than
+  eight blocks, work through the ones the start note and the section name, and
+  say in the report how many more there were. EXAMPLE: the line names rule
+  `no-force-push`, refused `git push --force-with-lease origin main`, then
+  check cleared. The refused call is safe, so the weakening stands: write
+  "no-force-push refused git push --force-with-lease origin main, which is
+  safe; clearing its check was right". `mcp__thor__history` shows the refusal
+  as `gate_refused by hook [...]: refused call: '...'`.
+- **THOR health.** Section 4a of the start note and the machine section of the
+  report each have a line "THOR health ...: N hook launch failure(s) (...), M
+  version-skew event(s) (...)". WHAT IT MEANS: a hook launch failure is a Claude
+  Code hook (THOR's guard or Stop hook) that could not start, so nothing from
+  THOR reached that call - the brackets name the hook event, its exit code and
+  the session whose hook failed (the count covers every session in the window,
+  not only yours); a version-skew event is a filing that THOR refused because
+  the tool server that wrote the report was built from another THOR than the
+  checker ("written by a tool server of another build than the checker"), which
+  is nobody's edit - the brackets name the report and the session. There is
+  nothing to fix in any note. WHAT TO DO: when both are zero there is nothing to
+  do. Otherwise put both numbers and the names in the report, and tell the owner
+  in the summary: for a skew, to restart Claude so the tool server is the
+  current one - a report refused as skew is on file but does not count, so after
+  the restart file the report again, and it will still list that skew, because
+  it happened in its window - and for a launch failure, that the named hook
+  needs his attention. You cannot restart or repair either yourself. WHEN IT IS
+  DONE: both numbers and the names are in the report, and the owner was told.
+  EXAMPLE: "THOR health: 1 hook launch failure (PreToolUse, exit 126, session
+  0de7dc52) - the owner should look at that hook; 1 version-skew event - the
+  owner was told to restart Claude, and I filed again after the restart".
 - Did the gate refuse one of your OWN write actions (`remember`/`revise`)?
   That is not an annoyance but a signal about the shape of the store. Name
   the reason.
@@ -509,10 +572,11 @@ This is the signal that counts here, not a mark.
   the compensating trick this design forbids.
 
 Step 6 is done once every refusal is named, every false block is in the
-report, every rule the REFUSAL OUTCOMES line counts has its outcome written
-(and a wrongly weakened check restored), the THOR health numbers are in the
-report, and every displacement notice is either resolved or deliberately
-tagged - reporting alone is never enough here.
+report, every rule the REFUSAL OUTCOMES lines name (in the start note and in the
+machine section of the filing reply) has its outcome written (and a wrongly
+weakened check restored), the THOR health numbers and the hook events they name
+are in the report, and every displacement notice is either resolved or
+deliberately tagged - reporting alone is never enough here.
 
 ## 7. Friction - where it chafed
 
@@ -568,6 +632,22 @@ health check, what origin holds, a version, what is still running). Counts -
 verdicts, useful, noise, rules - come from THOR's replies and the machine
 section, never from memory.
 
+WHAT YOU SEE WHEN. The start note's section 4 and the lists of step 4 are what
+THOR knows BEFORE you file: act on those lines first. The machine section
+exists only once the report is filed, and THOR prints it in full in the reply to
+your filing - its health line, its REFUSAL OUTCOMES lines, its DISPUTES TO
+VERIFY lines. Read that reply. Anything it names that the start note did not
+(a refusal or a hook failure of the evaluation's own window) you handle after
+filing, and you correct your own text with `mcp__thor__revise(id: "<report
+id>", text: "<TLDR and remarks, no section header>")`: THOR keeps the machine
+section byte for byte and stores your new text below it. Verified: such a
+revise, made before or after the Stop validated the filing, leaves the report
+counting (the end-of-turn check reads the event that FILED the report and the
+digest of its machine block, and a text revise changes neither), so do not file
+a second time for a text fix. Never write numbers into your first filing that
+you have not seen: take them from the start note, your own replies and, after
+filing, the section.
+
 Report what you DID, not what you noticed - evidence, not assertion. The
 owner cannot see into your session: "I repaired a rotten fact" is, to him,
 indistinguishable from doing nothing. So for every fact you changed: its id,
@@ -591,12 +671,14 @@ not done.
    it against;
 4. the health check's `teeth` line before and after step 4; the batch and the
    A4 list: per rule, the call you made and THOR's answer (rule, note, or what
-   was still missing), and every rule you saved with `legitimate_calls`,
-   `may_change` or `accept_refusing`, with the reason;
+   was still missing), and for a DEMOTION which exit you took and why;
+   every dispute you verified, with the call (1 or 2, or the retract) and your
+   reason; and every rule you saved with `legitimate_calls`, `may_change` or
+   `accept_refusing`, with the reason;
 5. what you stored that had been missing;
 6. what the gate did - including every false block, every rule the REFUSAL
-   OUTCOMES line counts with its outcome, the THOR health numbers, and every
-   refusal of your own write actions;
+   OUTCOMES line names with its outcome, the THOR health numbers with the hook
+   events and sessions it names, and every refusal of your own write actions;
 7. the friction, and which of it will happen again next session;
 8. what you did not verify.
 
@@ -658,12 +740,15 @@ next Stop starts the fresh evaluation or names the session that runs it. An
 attested change by ANOTHER session never voids an evaluation: that item counts
 as settled by that session.
 
-The reply to a filed report says what the machine section holds and that THOR
-checks the filing call when the turn ends. The report counts from that check
-on: the Stop hook reads the answer back from THOR's log, and only a report
-that counts lets a blocked turn end and stays quiet for the next 16 hours. If
-the next ask says your report is on file but does not count, it names why;
-follow that.
+The reply to a filed report summarises what the machine section holds, prints
+the whole section ("THOR's machine section of this report, in full"), and says
+that THOR checks the filing call when the turn ends. Read the section in the
+reply: its health, refusal-outcome and dispute lines are the final window of
+this evaluation (see "What you see when" above). The report counts from the
+end-of-turn check on: the Stop hook reads the answer back from THOR's log, and
+only a report that counts lets a blocked turn end and stays quiet for the next
+16 hours. If the next ask says your report is on file but does not count, it
+names why; follow that.
 
 Do not store or change anything else unless the owner asks for it. The
 exceptions are the work the steps themselves call for: the verdicts, the
