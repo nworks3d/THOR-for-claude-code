@@ -253,7 +253,11 @@ it yet.
   refuses no real call from the log that another session made before the id's
   first refused write. The refusal names both polarities when both bite and
   both exits: hang the tooth, or dispute it (`legitimate_calls`,
-  `may_change`), which lands a note by dispute.
+  `may_change`), which lands a note by dispute. Each of the three arguments
+  needs `because` (one sentence, at least 20 characters): the write is refused
+  without it, the reason lands in the item's history, the evaluation lists
+  every dispute with it and hands the unverified ones to the agent, and doctor
+  prints it beside the dispute ("no reason recorded" for an older one).
 - A check that would refuse more than half of at least five real calls it
   reaches in the log is refused as too broad; `accept_refusing`, naming one of
   the listed calls, keeps it on the rule track.

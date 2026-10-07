@@ -792,6 +792,16 @@ fn name_cap(full: bool) -> usize {
     if full { usize::MAX } else { NAMES_AT_MOST }
 }
 
+/// The reason `id`'s dispute was written with, in words for a doctor line:
+/// the writer's own `because`, or "no reason recorded" for every dispute from
+/// before one was required.
+fn dispute_reason_in_words(store: &EventStore, id: &str) -> String {
+    match model::store::current_dispute_reason(store, id) {
+        Some(reason) => reason.split_whitespace().collect::<Vec<_>>().join(" "),
+        None => "no reason recorded".to_string(),
+    }
+}
+
 /// The rotted items as text, one per line, indented under their own line.
 fn name_rot(label: &str, rot: &[Rot], full: bool) -> Vec<String> {
     let cap = name_cap(full);
@@ -2137,7 +2147,12 @@ pub fn teeth_line(db: &Path, full: bool) -> String {
                 let fields = record.as_ref().map(model::store::TrialRecord::fields);
                 if let Some(f) = fields.filter(|f| !f.accept_refusing.is_empty()) {
                     let calls = f.accept_refusing.iter().map(|c| format!("'{c}'")).collect::<Vec<_>>().join(", ");
-                    accepted.push(Rot { id: li.id.clone(), project: project.clone(), what: format!("accepts refusing {calls}") });
+                    let because = dispute_reason_in_words(&store, &li.id);
+                    accepted.push(Rot {
+                        id: li.id.clone(),
+                        project: project.clone(),
+                        what: format!("accepts refusing {calls} - because: {because}"),
+                    });
                 }
                 if let Some(mark) = fields.and_then(|f| f.a4_old_stock.as_ref()) {
                     old_stock.push(Rot { id: li.id.clone(), project: project.clone(), what: mark.describe() });
@@ -2166,7 +2181,12 @@ pub fn teeth_line(db: &Path, full: bool) -> String {
                     let what = record.as_ref().map_or_else(String::new, |r| {
                         let d = &r.fields().disputes;
                         let list = |ls: &[String]| ls.iter().map(|c| format!("'{c}'")).collect::<Vec<_>>().join(", ");
-                        format!("legitimate_calls [{}], may_change [{}]", list(&d.legitimate_calls), list(&d.may_change))
+                        let because = dispute_reason_in_words(&store, &li.id);
+                        format!(
+                            "legitimate_calls [{}], may_change [{}] - because: {because}",
+                            list(&d.legitimate_calls),
+                            list(&d.may_change)
+                        )
                     });
                     by_dispute.push(Rot { id: li.id.clone(), project: project.clone(), what });
                 }
@@ -5520,6 +5540,36 @@ mod tests {
         assert!(line.contains("teeth verdicts: 0 proven and 0 wired on the rule track; 1 note(s)"), "{line}");
         assert!(line.contains("  undecided: rewritten [global] its text changed after its last trial"), "{line}");
         assert!(!line.contains("honest_no"), "{line}");
+    }
+
+    /// Every dispute doctor lists carries the writer's reason beside it; one
+    /// stored before a reason was required says "no reason recorded".
+    #[test]
+    fn teeth_line_shows_the_reason_beside_each_dispute_and_marks_the_old_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut s = EventStore::new(&db).unwrap();
+            let dispute = serve::teeth::Disputes { legitimate_calls: vec!["git bundle list-heads backup.bundle".to_string()], ..Default::default() };
+            for (id, text, because) in [
+                ("dsp-new", "Never run `git bundle list-heads` on a backup, prove it by cloning.", Some("list-heads is only the example, the rule is about cloning")),
+                ("dsp-old", "Avoid zzz qqq www `git bundle list-heads` for eee rrr ttt.", None),
+            ] {
+                let mut item = rule(id);
+                item.text = text.to_string();
+                item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "git bundle".to_string() }];
+                let mut corpus = serve::legit::Corpus::load(&s);
+                let tried = serve::teeth::trial_for_write(&mut s, Some(&db), &serve::teeth::SessionCtx::default(), &mut corpus, &item, None, None, &dispute, false);
+                let serve::teeth::WriteTrial::Tried { item: stored, record, .. } = tried else { panic!("expected a note by dispute") };
+                store::declare_in_scoped_because(&mut s, "s", "l", "a", &stored, None, None, Some(&record), None, because).unwrap();
+            }
+        }
+        let line = teeth_line(&db, true);
+        assert!(
+            line.contains("  note by dispute: dsp-new [global] legitimate_calls ['git bundle list-heads backup.bundle'], may_change [] - because: list-heads is only the example, the rule is about cloning"),
+            "{line}"
+        );
+        assert!(line.contains("  note by dispute: dsp-old [global] legitimate_calls ['git bundle list-heads backup.bundle'], may_change [] - because: no reason recorded"), "{line}");
     }
 
     /// The "wired, literal never seen" count (measured 2026-10-03: 70 listed,

@@ -834,6 +834,139 @@ fn a4_only_items_get_their_own_list_of_16() {
     assert_eq!(next.frozen.a4_list(), &ids[1..17]);
 }
 
+/// A rule stored by dispute, the way the write tools store one: THOR's own
+/// trial with the three legitimate calls named, the writer's `because`
+/// (when it gave one) in the event body. Distinct words per rule, or the
+/// gate reads two of them as one fact.
+fn disputed(fx: &mut Fx, n: usize, because: Option<&str>) -> String {
+    let id = format!("bundle-{n:02}");
+    let mut item = rule(
+        &id,
+        &format!("Prove w{n}a w{n}b w{n}c w{n}d with `git clone --mirror` plus fsck, never with `git bundle list-heads`."),
+        vec![cmd("git bundle")],
+        None,
+        Some("demo"),
+    );
+    item.severity = None;
+    let corpus = Corpus::load(&fx.store);
+    let disputes = teeth::Disputes {
+        legitimate_calls: vec![
+            "git bundle list-heads backup.bundle".to_string(),
+            "git clone --mirror origin.git backup.git".to_string(),
+            "git clone origin.git work".to_string(),
+        ],
+        ..Default::default()
+    };
+    let tried = {
+        let env = teeth::Env { store: &fx.store, db: Some(&fx.db) };
+        let root = project::registered_checkout(&fx.store, item.project.as_deref());
+        let write = teeth::Write { item: &item, before: None, because: None, parent_rev: None };
+        teeth::trial(&env, &write, &root, &teeth::SessionCtx::default(), &corpus, &disputes, &[])
+    };
+    let stored = teeth::stored_item(&item, &tried).expect("a dispute makes it a note");
+    model::store::declare_in_scoped_because(&mut fx.store, "s", "l", "a", &stored, None, None, tried.record.as_ref(), None, because).unwrap();
+    id
+}
+
+/// A rule stored by a may_change dispute on `pkg<n>.json` in demo's working
+/// copy: its own place (a path anchor), so ten of them fit.
+fn disputed_span(fx: &mut Fx, n: usize, because: Option<&str>) -> String {
+    let id = format!("span-{n:02}");
+    let mut item = rule(
+        &id,
+        &format!("Bump the 'version' in pkg{n}.json with every release of w{n}a w{n}b w{n}c."),
+        vec![path(&format!("pkg{n}.json"))],
+        None,
+        Some("demo"),
+    );
+    item.severity = None;
+    let corpus = Corpus::load(&fx.store);
+    let disputes = teeth::Disputes { may_change: vec!["version".to_string()], ..Default::default() };
+    let tried = {
+        let env = teeth::Env { store: &fx.store, db: Some(&fx.db) };
+        let root = project::registered_checkout(&fx.store, item.project.as_deref());
+        let write = teeth::Write { item: &item, before: None, because: None, parent_rev: None };
+        teeth::trial(&env, &write, &root, &teeth::SessionCtx::default(), &corpus, &disputes, &[])
+    };
+    let stored = teeth::stored_item(&item, &tried).expect("a dispute makes it a note");
+    model::store::declare_in_scoped_because(&mut fx.store, "s", "l", "a", &stored, None, None, tried.record.as_ref(), None, because).unwrap();
+    id
+}
+
+/// What the agent is handed for a dispute: the item with its argument, its
+/// spans and the writer's reason (or "no reason recorded"), the exact call
+/// that hangs the real check, the exact call that confirms the dispute, when
+/// it is done, and one example.
+#[test]
+fn a_dispute_written_since_the_previous_report_is_on_the_start_note_with_its_calls() {
+    let mut fx = Fx::new();
+    let why = "list-heads is only the example here; the rule is about proving a bundle by cloning it";
+    let reasoned = disputed(&mut fx, 1, Some(why));
+    let silent = disputed(&mut fx, 2, None);
+    let start = fx.start(S1, "demo");
+    let ids: Vec<String> = start.frozen.dispute_list().iter().map(|d| d.id.clone()).collect();
+    assert_eq!(ids, [reasoned.clone(), silent.clone()]);
+    assert_eq!(start.frozen.dispute_list()[0].because.as_deref(), Some(why));
+    assert_eq!(start.frozen.dispute_list()[1].because, None);
+
+    let note = start_note(&start);
+    assert!(note.contains("c. DISPUTES TO VERIFY - 2 rule(s) were stored by dispute"), "{note}");
+    assert!(note.contains("WHAT THIS MEANS:") && note.contains("WHEN AN ITEM IS DONE:") && note.contains("EXAMPLE:"), "{note}");
+    assert!(note.contains(&format!("the writer's reason: '{}", &why[..60])), "{note}");
+    assert!(note.contains("no reason recorded"), "{note}");
+    for id in [&reasoned, &silent] {
+        assert!(
+            note.contains(&format!(
+                "Call 1, hang the real check: mcp__thor__revise(id: \"{id}\", text: \"<its text, reworded so it names <the rule's subject>>\", \
+                 check_kind: \"forbidden\", check_literals: [\"<the rule's subject>\"])"
+            )),
+            "{id}: {note}"
+        );
+        assert!(note.contains(&format!("Call 2, confirm the dispute: mcp__thor__revise(id: \"{id}\", because: \"<why 'git bundle list-heads backup.bundle' may change")), "{id}: {note}");
+    }
+    assert_eq!(note.matches("Done when: call 1 or call 2 is accepted.").count(), 2, "{note}");
+    // Frozen: the record carries them, so the note and the record agree.
+    assert_eq!(model::store::frozen_ids(&start).iter().filter(|id| id.starts_with("bundle-")).count(), 2);
+    // Nothing to verify: the section still says so, in one line.
+    let mut quiet = Fx::new();
+    let none = quiet.start(S1, "demo");
+    assert!(start_note(&none).contains("c. DISPUTES TO VERIFY - no rule stored by dispute since the previous evaluation waits to be verified."));
+}
+
+/// At most the batch's own cap of eight per evaluation; the rest are named
+/// in the record and listed first by the next start, which an answered one
+/// never re-enters.
+#[test]
+fn disputes_follow_the_batch_cap_and_the_rest_come_first_next_time() {
+    let mut fx = Fx::new();
+    let files: Vec<(String, String)> = (0..10).map(|n| (format!("pkg{n}.json"), "{\"version\":\"1.0.0\"}\n".to_string())).collect();
+    let refs: Vec<(&str, &str)> = files.iter().map(|(p, c)| (p.as_str(), c.as_str())).collect();
+    let demo = fx.checkout("demo", &refs, true);
+    fx.register("demo", &demo);
+    let ids: Vec<String> =
+        (0..10).map(|n| disputed_span(&mut fx, n, Some("a reason of at least twenty characters, written for the test"))).collect();
+    let start = fx.start(S1, "demo");
+    let machine = start.frozen.machine.clone().unwrap();
+    let listed: Vec<String> = machine.disputes.iter().map(|d| d.id.clone()).collect();
+    assert_eq!(listed, &ids[..8]);
+    assert_eq!(machine.disputes_later_ids, &ids[8..]);
+    let note = start_note(&start);
+    assert!(note.contains("2 more dispute(s) wait for the next evaluation, which lists them first."), "{note}");
+    assert!(!note.contains("Call 1, hang the real check: mcp__thor__revise(id: \"span-08\""), "{note}");
+    assert!(note.contains("check_kind: \"contains\", check_path: \"<the file>\""), "a span dispute hangs a contains check: {note}");
+
+    // A later evaluation after a report was filed since: the two that did not
+    // fit are written BEFORE that report and still come first.
+    let report_id = report("eval-demo-1", "demo");
+    let body = model::store::canonical_body(&report_id).unwrap();
+    fx.store.append_event("s", "eval", "agent", EventKind::FactCreated, &report_id.id, None, &body).unwrap();
+    let carried = model::store::unverified_disputes(&fx.store, "demo", model::store::newest_evaluation_report_seq(&fx.store, Some("demo")), &machine.disputes_later_ids);
+    let again: Vec<String> = carried.iter().map(|d| d.id.clone()).collect();
+    assert_eq!(again, &ids[8..], "only the left-over ones, nothing else is newer than the report");
+    let none = model::store::unverified_disputes(&fx.store, "demo", model::store::newest_evaluation_report_seq(&fx.store, Some("demo")), &[]);
+    assert!(none.is_empty(), "left alone they fall out of the window: {none:?}");
+}
+
 /// G14.5 (K20): a note that kept its check pending because its project had
 /// no working copy - once the project is registered and the file holds the
 /// literal, the start hangs the check itself, and lists it as hung.

@@ -1823,11 +1823,18 @@ impl<'a> Work<'a> {
                 hang.push_str(&format!(", and bind it to the command '{value}'"));
             }
             let exit = match &dt.d.check {
-                Check::Contains { literal, .. } => format!("Or, if that span may change: may_change: ['{}']", gate::shown_literal(literal)),
+                Check::Contains { literal, .. } => format!(
+                    "Or, if that span may change: may_change: ['{}'] with because: '<one sentence, at least 20 characters, why it may change while the rule stays true>' - \
+                     dispute only an incidental span; if the literal IS the rule's subject, hang the check instead",
+                    gate::shown_literal(literal)
+                ),
                 _ => {
                     let anchor = command_anchor(&bindings).unwrap_or_default();
                     let literal = tooth_literal(&dt.d.check).unwrap_or_default();
-                    format!("Or, if a real call legitimately carries it: legitimate_calls: ['{anchor} {literal} <the rest of the real call>']")
+                    format!(
+                        "Or, if a real call legitimately carries it: legitimate_calls: ['{anchor} {literal} <the rest of the real call>'] with because: '<one sentence, at least 20 characters, why that call is legitimate while the rule stays true>' - \
+                         dispute only an incidental call; if the literal IS the rule's subject, hang the check instead"
+                    )
                 }
             };
             parts.push(format!("{words}. {}. {exit}.", capitalise(&hang)));
@@ -2072,8 +2079,9 @@ impl<'a> Work<'a> {
                     if accepted.is_empty() {
                         let mut message = format!(
                             "your check would refuse {} of the {} real calls it reaches in the log: {}. Two ways on: narrow \
-                             the check (a longer literal, a narrower anchor), or - when refusing them is the intent - name one \
-                             of these calls in accept_refusing",
+                             the check (a longer literal, a narrower anchor - try this first), or - only when refusing them is \
+                             the intent - name one of these calls in accept_refusing, together with because (one sentence of at \
+                             least 20 characters saying why refusing them is right)",
                             listed.len(),
                             r.reached + r.refused_cut.len(),
                             listed.iter().map(|c| format!("'{c}'")).collect::<Vec<_>>().join(", ")
@@ -2797,14 +2805,22 @@ fn head(store: &EventStore, id: &str) -> Result<(Item, String), String> {
 }
 
 /// The disputes and accepted refusals the head's last matching trial
-/// recorded - a retest keeps what the writer decided.
-fn recorded_disputes(store: &EventStore, id: &str, fp: &str) -> (Disputes, Option<PendingCheck>) {
-    let Ok(events) = store.get_events_by_entity(id) else { return (Disputes::default(), None) };
+/// recorded - a retest keeps what the writer decided, but only a decision that
+/// came with its reason (`model::store::dispute_reason`). A dispute stored
+/// with none is not carried: a retest must never write a dispute nobody
+/// explained, so it tries the rule without it. The second field says when
+/// that happened, for the retest's own receipt.
+fn recorded_disputes(store: &EventStore, id: &str, fp: &str) -> (Disputes, Option<PendingCheck>, bool) {
+    let Ok(events) = store.get_events_by_entity(id) else { return (Disputes::default(), None, false) };
     for e in events.iter().rev() {
         if let Ok(Some(record)) = model::store::trial_of(e) {
             let f = record.fields();
             if f.fingerprint != fp {
-                return (Disputes::default(), None);
+                return (Disputes::default(), None, false);
+            }
+            let named = !model::store::dispute_arguments(f).is_empty();
+            if named && model::store::dispute_reason(&events, e.seq).is_none() {
+                return (Disputes::default(), f.pending.clone(), true);
             }
             return (
                 Disputes {
@@ -2813,10 +2829,11 @@ fn recorded_disputes(store: &EventStore, id: &str, fp: &str) -> (Disputes, Optio
                     accept_refusing: f.accept_refusing.clone(),
                 },
                 f.pending.clone(),
+                false,
             );
         }
     }
-    (Disputes::default(), None)
+    (Disputes::default(), None, false)
 }
 
 /// Whether `head` - a rule on the rule track, never a note's pending check -
@@ -2838,7 +2855,7 @@ fn old_stock_candidate(store: &EventStore, id: &str, head: &Item) -> Option<OldC
 pub fn retest(store: &EventStore, db: Option<&Path>, id: &str, corpus: &Corpus) -> Result<Retest, String> {
     let (head_item, head_rev) = head(store, id)?;
     let fingerprint = model::store::fingerprint(&head_item);
-    let (disputes, pending) = recorded_disputes(store, id, &fingerprint);
+    let (disputes, pending, unexplained) = recorded_disputes(store, id, &fingerprint);
     // A note that keeps a pending check is retried with that check (K20).
     let mut item = head_item.clone();
     if item.check.is_none() {
@@ -2861,7 +2878,7 @@ pub fn retest(store: &EventStore, db: Option<&Path>, id: &str, corpus: &Corpus) 
              this verdict, and it never moves after that"
         ));
     }
-    let lines = work.receipt.clone();
+    let mut lines = work.receipt.clone();
     let attempts = work.attempts.clone();
     let outcome = match &decision {
         Decision::Rule { proven } => Maintenance::Rule { check: item.check.clone().expect("a rule has a check"), proven: *proven },
@@ -2902,6 +2919,15 @@ pub fn retest(store: &EventStore, db: Option<&Path>, id: &str, corpus: &Corpus) 
         }
         _ => None,
     };
+    if unexplained {
+        lines.push(
+            "this rule was stored by dispute with no reason on record, so the retest did NOT carry the dispute: it tried \
+             the rule without it. Better, hang a check on the literal that IS the rule's subject; to keep the dispute, \
+             send the same call again with because (at least 20 characters: why the span may change, or the call is \
+             legitimate, while the rule stays true)"
+                .to_string(),
+        );
+    }
     let project = model::normalize::normalize_project(item.project.as_deref());
     let a4_only = work.a4_only && matches!(outcome, Maintenance::NeedsAgent(_));
     Ok(Retest { id: id.to_string(), outcome, project, root: root.clone(), attempts, lines, fingerprint, head_rev, write: write_out, a4_only })

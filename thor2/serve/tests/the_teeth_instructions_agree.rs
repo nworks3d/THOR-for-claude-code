@@ -227,3 +227,27 @@ fn neither_sends_an_agent_to_a_bulk_relabel() {
         "the filing refusal must send a writer to real work, never to a pass that labels in bulk"
     );
 }
+
+/// A dispute needs its reason (2026-10-07: 7 of 11 disputes one pass saved
+/// were wrong). Both doors take `because`, and AGENTS.md, the routine and the
+/// start note all say that the three arguments need it, with the same length
+/// the door enforces.
+#[test]
+fn the_three_arguments_need_a_because_in_every_text_an_agent_reads() {
+    let mcp = read("mcp/src/lib.rs");
+    for args in ["RememberArgs", "ReviseArgs"] {
+        assert!(struct_body(&mcp, args).contains("pub because: Option<String>"), "{args} must take because");
+    }
+    assert_eq!(model::store::DISPUTE_REASON_MIN_CHARS, 20, "the texts below say twenty");
+    let section = agents_teeth_section();
+    assert!(section.contains("Every one of the three also needs `because`"), "AGENTS.md must say so");
+    assert!(section.contains("at least 20 characters"), "AGENTS.md must name the length the door enforces");
+    assert!(section.contains("Try the better path first"), "AGENTS.md must offer the better path first");
+    let routine = routine();
+    assert!(routine.contains("each one needs `because`") && routine.contains("at least twenty characters"), "the routine must say so");
+    assert!(routine.contains("**The disputes to verify**"), "the routine must describe the dispute list");
+    let note = read("serve/src/eval_session.rs");
+    for phrase in ["c. DISPUTES TO VERIFY", "WHAT THIS MEANS:", "WHEN AN ITEM IS DONE:", "EXAMPLE:", "Done when:"] {
+        assert!(note.contains(phrase), "the start note must carry '{phrase}'");
+    }
+}

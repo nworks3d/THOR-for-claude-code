@@ -278,6 +278,21 @@ with one of three arguments - and only then:
   listed, when refusing them IS the intent (a "never push this repository until
   the owner says so" ban). The rule stays on the rule track; doctor lists it.
 
+**Every one of the three also needs `because`**: one sentence, at least 20
+characters, saying WHY the named span may change, or why the call is
+legitimate, while the rule stays true. Without it the write is refused and
+nothing is stored. The reason is kept in the item's history (`history` shows
+it), and the evaluation machine section and doctor print it beside the
+dispute; a dispute with none reads "no reason recorded". **Try the better path
+first:** hang a check on the literal that IS the rule's subject (name it in
+the text), and dispute only a span that is incidental. A wrong dispute turns a
+rule that bites into a note that can never refuse anything, and it stays
+hidden until someone audits it - 7 of the 11 disputes one maintenance pass
+saved on 2026-10-07 were wrong. `serve retest` never carries a dispute that has
+no reason on record: it tries the rule without it and says so. Example:
+`may_change: ["version"]` with `because: "the version number moves with every
+release, so that line may change while the rule stays true"`.
+
 A `no-literal:` tag answers nothing any more: the trial decides whether a rule
 can have a tooth. Never widen the text to catch more: a rule that blocks
 legitimate work is the most expensive thing this system can do.
@@ -448,6 +463,19 @@ more never counts.
      the exact call to make. Make that call; THOR tries the rule again and says
      what it is now, or what is still missing. A tag, a reason or a note about
      it settles nothing.
+   - **The disputes to verify.** Every rule stored by dispute
+     (`legitimate_calls`, `may_change`, `accept_refusing`) since the project's
+     previous report that nobody has checked yet, at most 8 (the rest come
+     first next time). Each line shows what was disputed, the writer's reason
+     (or "no reason recorded") and two exact calls. Open the rule and its
+     file or command and decide whether the disputed literal IS the rule's
+     subject. If it is, hang the real check with the first call
+     (`revise` with `check_kind` and the literal, the text reworded to name
+     it). If it is only an incidental span, confirm the dispute with the
+     second call (`revise(id, because: "...")`, at least 20 characters). An
+     item is done when one of the two calls was accepted, and the report is
+     held until every item is done; a tag or a line in the report settles
+     nothing.
    - **Open points.** THOR writes and closes these itself, for things only the
      owner can do, such as a project whose working copy is not registered.
      Rules that belong to no project and check a file share ONE open point for

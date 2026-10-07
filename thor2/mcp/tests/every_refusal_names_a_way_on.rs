@@ -24,6 +24,9 @@ mod common;
 use common::*;
 use model::item::{Binding, Check, Item, Kind, Severity, TargetKind};
 use serde_json::json;
+
+/// Every dispute carries its reason (a dispute without one is refused).
+const WHY: &str = "refusing these calls is the intent here, and the rule stays true as written";
 use std::path::{Path, PathBuf};
 use thor_core::event_store::EventStore;
 
@@ -224,6 +227,7 @@ fn majority_names_accept_refusing_and_naming_a_listed_call_lets_the_write_land()
     let reply = mcp.call("remember", args.clone());
     assert!(reply.starts_with("REFUSED:") && reply.contains(way_on("majority")), "{reply}");
     args["accept_refusing"] = json!(["git grep -n p0 src"]);
+    args["because"] = json!(WHY);
     let reply = mcp.call("remember", args);
     assert!(landed(&reply), "{reply}");
 }
@@ -257,7 +261,7 @@ fn needs_agent_majority_names_accept_refusing_and_it_lands_decided() {
     seed_raw(&fx.db, &item("nmj", "Never run `git grep` there.", vec![cmd("git grep")], Some(Check::Forbidden { literals: vec!["git grep".to_string()] }), Some("demo")));
     let why = fx.needs_agent("nmj");
     assert!(why.contains(way_on("needs_agent:majority")), "{why}");
-    let reply = fx.mcp().call("revise", json!({"id": "nmj", "accept_refusing": ["git grep -n q0 src"]}));
+    let reply = fx.mcp().call("revise", json!({"id": "nmj", "accept_refusing": ["git grep -n q0 src"], "because": WHY}));
     assert!(landed(&reply) && fx.settled("nmj"), "a revise naming only the id and the accepted call runs the trial: {reply}");
 }
 
