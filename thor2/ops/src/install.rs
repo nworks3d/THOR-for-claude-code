@@ -514,6 +514,11 @@ pub struct InstallReport {
 /// Matching on the command line is deliberate: it is the one field that
 /// identifies "this is THOR's hook" without also depending on how a matcher
 /// happened to be phrased.
+///
+/// "The same command" means the same program and the same arguments in ANY
+/// spelling of the paths: see `same_spelling`. Until 2026-10-08 this was a
+/// byte comparison, so running the installer with `C:/x/thor.db` over hooks
+/// written as `C:\x\thor.db` appended a duplicate of every hook.
 fn group_has_command(group: &Value, command: &str) -> bool {
     group
         .get("hooks")
@@ -521,10 +526,64 @@ fn group_has_command(group: &Value, command: &str) -> bool {
         .map(|hooks| {
             hooks.iter().any(|h| {
                 h.get("type").and_then(Value::as_str) == Some("command")
-                    && h.get("command").and_then(Value::as_str) == Some(command)
+                    && h.get("command").and_then(Value::as_str).is_some_and(|c| same_spelling(c, command))
             })
         })
         .unwrap_or(false)
+}
+
+/// One word of a command line (or one argument) with its path spelling
+/// flattened: `\` becomes `/`, a Windows `\\?\` prefix goes, and on Windows
+/// the case goes too (its file system ignores case; other systems do not).
+fn flatten_word(word: &str) -> String {
+    let flat = word.replace('\\', "/");
+    let flat = flat.strip_prefix("//?/").unwrap_or(&flat);
+    if cfg!(windows) {
+        flat.to_lowercase()
+    } else {
+        flat.to_string()
+    }
+}
+
+/// Split a command line into words, honouring double quotes only, so a quoted
+/// and an unquoted spelling of the same path reduce to the same word. A
+/// backslash is NOT an escape here: on Windows it is the path separator.
+fn command_words(command: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut in_word = false;
+    let mut quoted = false;
+    for ch in command.chars() {
+        match ch {
+            '"' => {
+                quoted = !quoted;
+                in_word = true;
+            }
+            c if c.is_whitespace() && !quoted => {
+                if in_word {
+                    words.push(flatten_word(&current));
+                    current.clear();
+                    in_word = false;
+                }
+            }
+            c => {
+                current.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        words.push(flatten_word(&current));
+    }
+    words
+}
+
+/// True iff two command lines call the same program with the same arguments,
+/// ignoring only path spelling: separators, case on Windows, and quoting. A
+/// different program, a different store path or a different flag is still a
+/// different command; nothing here compares more loosely than that.
+fn same_spelling(a: &str, b: &str) -> bool {
+    a == b || command_words(a) == command_words(b)
 }
 
 fn new_group(spec: &HookSpec) -> Value {
@@ -1032,7 +1091,7 @@ pub fn install_tool_server(
 
     let previous = root["mcpServers"].get(name).cloned();
     let outcome = match &previous {
-        Some(old) if *old == entry => ServerOutcome::AlreadyPresent,
+        Some(old) if same_server_entry(old, &entry) => ServerOutcome::AlreadyPresent,
         Some(_) => ServerOutcome::Replaced,
         None => ServerOutcome::Added,
     };
@@ -1070,6 +1129,35 @@ pub fn install_tool_server(
         .filter(|_| outcome == ServerOutcome::Replaced);
 
     Ok(ServerReport { outcome, replaced, backup_path })
+}
+
+/// True iff `old` is the entry `new` would write, up to path spelling: the
+/// same keys, `type` and any other key exact, and `command` and every `args`
+/// word equal after `flatten_word` (separators, case on Windows, quoting). An
+/// extra key, a different program or a different store path is a real
+/// difference and still gets the entry replaced.
+fn same_server_entry(old: &Value, new: &Value) -> bool {
+    if old == new {
+        return true;
+    }
+    let (Some(o), Some(n)) = (old.as_object(), new.as_object()) else { return false };
+    if o.len() != n.len() || o.keys().any(|k| !n.contains_key(k)) {
+        return false;
+    }
+    let words = |v: &Value| v.as_str().map(command_words);
+    o.iter().all(|(key, theirs)| {
+        let ours = &n[key];
+        match key.as_str() {
+            "command" => words(theirs).is_some() && words(theirs) == words(ours),
+            "args" => match (theirs.as_array(), ours.as_array()) {
+                (Some(t), Some(u)) => {
+                    t.len() == u.len() && t.iter().zip(u).all(|(x, y)| words(x).is_some() && words(x) == words(y))
+                }
+                _ => false,
+            },
+            _ => theirs == ours,
+        }
+    })
 }
 
 /// What happened to the project marker on this run.
@@ -1503,6 +1591,89 @@ mod tests {
                 "event {event} must still carry exactly one group after a second install"
             );
         }
+    }
+
+    /// 2026-10-08: running the installer with `C:/x/thor.db` over hooks written
+    /// with backslashes added a duplicate of every hook. The same program and
+    /// store in another spelling (separators, quoting, case on Windows) is the
+    /// same hook.
+    #[test]
+    fn the_same_hooks_in_another_path_spelling_are_already_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        install_hooks(&path, &standard_hooks("C:\\thor2\\bin\\serve.exe", "C:\\thor2\\thor.db")).unwrap();
+        let before = fs::read(&path).unwrap();
+
+        let slashes = install_hooks(&path, &standard_hooks("C:/thor2/bin/serve.exe", "C:/thor2/thor.db")).unwrap();
+        assert!(
+            slashes.results.iter().all(|(_, o)| *o == HookOutcome::AlreadyPresent),
+            "forward slashes over backslashes must add nothing: {:?}",
+            slashes.results
+        );
+        assert!(slashes.replaced.is_empty());
+        let written: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        for event in ["SessionStart", "PreToolUse", "UserPromptSubmit", "Stop"] {
+            assert_eq!(written["hooks"][event].as_array().unwrap().len(), 1, "{event} must not gain a duplicate");
+        }
+        assert_eq!(fs::read(&path).unwrap(), before, "the existing hooks must stay as they were");
+
+        // An unquoted spelling of the same command is the same command too.
+        let unquoted = vec![HookSpec {
+            event: "Stop",
+            matcher: None,
+            command: "C:/thor2/bin/serve.exe --db C:/thor2/thor.db hook".to_string(),
+        }];
+        let third = install_hooks(&path, &unquoted).unwrap();
+        assert_eq!(third.results[0].1, HookOutcome::AlreadyPresent);
+
+        if cfg!(windows) {
+            let shouting = install_hooks(&path, &standard_hooks("c:\\THOR2\\bin\\SERVE.EXE", "C:\\Thor2\\THOR.db")).unwrap();
+            assert!(shouting.results.iter().all(|(_, o)| *o == HookOutcome::AlreadyPresent), "case is ignored on Windows");
+        }
+    }
+
+    /// The other side of the same rule: the comparison flattens spelling and
+    /// nothing else. Another store, another program, another flag is a
+    /// different hook and still gets its own entry.
+    #[test]
+    fn a_genuinely_different_store_or_program_is_still_a_different_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        // A real serve.exe on disk, so the installer's "binary is gone" repair
+        // (stale_thor_command) stays out of this question.
+        let exe = dir.path().join("serve.exe");
+        fs::write(&exe, b"x").unwrap();
+        let exe = exe.display().to_string();
+        let exe_slashes = exe.replace('\\', "/");
+        install_hooks(&path, &standard_hooks(&exe, "C:\\thor2\\thor.db")).unwrap();
+
+        let other_store = install_hooks(&path, &standard_hooks(&exe_slashes, "C:/other/thor.db")).unwrap();
+        assert!(other_store.results.iter().all(|(_, o)| *o == HookOutcome::Added), "{:?}", other_store.results);
+
+        let other_exe = install_hooks(&path, &standard_hooks("C:/thor2/bin/other.exe", "C:/thor2/thor.db")).unwrap();
+        assert!(other_exe.results.iter().all(|(_, o)| *o == HookOutcome::Added), "{:?}", other_exe.results);
+
+        assert!(!same_spelling("\"a.exe\" --db \"b.db\" hook", "\"a.exe\" --db \"b.db\" hook --extra"));
+        assert!(!same_spelling("\"C:\\a b\\x.exe\" hook", "\"C:\\a\" \"b\\x.exe\" hook"));
+    }
+
+    /// The tool server entry in the user's `.claude.json` gets the same
+    /// treatment: another spelling of the same program and store is left alone
+    /// (no rewrite, no backup), a different store is still replaced.
+    #[test]
+    fn the_tool_server_in_another_path_spelling_is_already_registered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".claude.json");
+        install_tool_server(&path, "thor", "C:\\thor2\\bin\\mcp.exe", &server_args("C:\\thor2\\thor.db")).unwrap();
+        let before = fs::read(&path).unwrap();
+
+        let same = install_tool_server(&path, "thor", "C:/thor2/bin/mcp.exe", &server_args("C:/thor2/thor.db")).unwrap();
+        assert_eq!(same.outcome, ServerOutcome::AlreadyPresent);
+        assert!(same.backup_path.is_none());
+        assert_eq!(fs::read(&path).unwrap(), before, "the file must not be rewritten");
+
+        let other = install_tool_server(&path, "thor", "C:/thor2/bin/mcp.exe", &server_args("C:/other/thor.db")).unwrap();
+        assert_eq!(other.outcome, ServerOutcome::Replaced, "a different store is a real change");
     }
 
     /// The other defect this guards against: an installer that "cleans up"
