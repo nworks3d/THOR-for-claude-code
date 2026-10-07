@@ -639,12 +639,20 @@ pub fn is_attested_refusal(store: &EventStore, event: &Event, since: i64, verdic
 /// (seq, the refused target). Reads the item's own log and the recorded
 /// verdicts once.
 pub fn field_refusals(store: &EventStore, id: &str, item: &Item) -> Vec<(i64, String)> {
+    field_refusals_known(store, id, item, &|| crate::teeth::known_projects(store))
+}
+
+/// `field_refusals`, for a reader that asks it of many rules: `known` (the
+/// projects the store holds a live item of) is asked only for a check that
+/// reads a command, and folds the whole live set each time it is asked, so
+/// such a reader can answer it from one reading (see `is_field_refusal_known`).
+pub fn field_refusals_known(store: &EventStore, id: &str, item: &Item, known: &dyn Fn() -> Vec<String>) -> Vec<(i64, String)> {
     let Ok(events) = store.get_events_by_entity(id) else { return Vec::new() };
     let verdicts = model::store::recorded_refusal_verdicts(&events);
     let since = check_since(&events, item.check.as_ref());
     events
         .iter()
-        .filter(|e| is_field_refusal(store, e, id, item, since, &verdicts))
+        .filter(|e| is_field_refusal_known(store, e, id, item, since, &verdicts, known))
         .map(|e| {
             let body = serde_json::from_str::<Value>(&e.body).unwrap_or(Value::Null);
             (e.seq, body.get("target").and_then(|t| t.as_str()).unwrap_or_default().to_string())

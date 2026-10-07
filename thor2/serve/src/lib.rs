@@ -198,7 +198,15 @@ pub fn serve_with_decay(
     decay: &decay::DecayContext,
 ) -> Served {
     let candidates = live::candidates_for(store, input);
-    let all = decay::retain_live(rank::select(&candidates, input), decay);
+    serve_from_candidates(&candidates, input, decay)
+}
+
+/// `serve_with_decay` for a caller that already holds the candidate pool
+/// `live::candidates_for(store, input)` returns (see
+/// `live::candidate_pool_key`): everything after reading the pool, and the
+/// only copy of it - `serve_with_decay` calls this too.
+pub fn serve_from_candidates(candidates: &[live::LiveItem], input: &input::ServeInput, decay: &decay::DecayContext) -> Served {
+    let all = decay::retain_live(rank::select(candidates, input), decay);
     let selection = render::cap(all.clone());
     Served { all, selection }
 }
@@ -306,5 +314,45 @@ mod tests {
         assert_eq!(fresh.all.len(), shared.all.len());
         assert!(!ids(&shared).contains(&"d1".to_string()), "decay must still retire the noisy item: {:?}", ids(&shared));
         assert_eq!(shared.all.len(), 2, "the other two still apply");
+    }
+
+    /// `serve_from_candidates` is the ranking half of `serve_with_decay`, for a
+    /// caller that reads the candidate pool once for many inputs
+    /// (`ops::health::crowding_line`). Same pool key, same answer.
+    #[test]
+    fn serving_from_a_pool_read_once_answers_exactly_as_serve_with_decay_does() {
+        let mut db = EventStore::in_memory().unwrap();
+        for i in 0..6 {
+            let item = Item {
+                id: format!("p{i}"),
+                kind: Kind::Rule,
+                text: format!("rule number {i}"),
+                bindings: vec![Binding::Moment(Action::Configure)],
+                severity: Some(Severity::Irreversible),
+                project: None,
+                tags: vec![format!("{}a test fixture where 'the same call' is also the legitimate one", store::NO_LITERAL_REASON_PREFIX)],
+                expires: None,
+                key: None,
+                falsifier: Some(format!("rule number {i} turns out to be wrong")),
+                check: None,
+            };
+            store::declare(&mut db, "s", "l", "a", &item).unwrap();
+        }
+        let decay = decay::DecayContext::load(&db);
+        let mut first = input::ServeInput::default();
+        first.add_moment(Action::Configure);
+        let mut second = input::ServeInput::default();
+        second.add_moment(Action::Configure);
+        second.project = Some("another-project".to_string());
+        assert_eq!(live::candidate_pool_key(&first), live::candidate_pool_key(&second), "the project is not part of the pool");
+
+        let pool = live::candidates_for(&db, &first);
+        for input in [&first, &second] {
+            let direct = serve_with_decay(&db, input, &decay);
+            let pooled = serve_from_candidates(&pool, input, &decay);
+            let ids = |s: &Served| (s.all.iter().map(|r| r.id.clone()).collect::<Vec<_>>(), s.selection.shown.iter().map(|r| r.id.clone()).collect::<Vec<_>>());
+            assert_eq!(ids(&direct), ids(&pooled));
+            assert_eq!(direct.selection.withheld, pooled.selection.withheld);
+        }
     }
 }

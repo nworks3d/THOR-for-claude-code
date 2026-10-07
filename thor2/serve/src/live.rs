@@ -164,6 +164,16 @@ fn candidates_from_projection(
 /// or every live item when it is not - correctness never depends on which
 /// path ran, only speed does.
 pub fn candidates_for(store: &EventStore, input: &ServeInput) -> Vec<LiveItem> {
+    let (moments, target_kinds) = candidate_pool_key(input);
+    candidates_from_projection(store, &moments, &target_kinds).unwrap_or_else(|| live_items(store))
+}
+
+/// What `candidates_for` narrows the pool by: the moments and target kinds of
+/// `input`. Two inputs with the same key get the same pool from the same
+/// store (the pool never looks at the input's project or at a target's
+/// value), so a caller that probes thousands of inputs can read each pool
+/// once - `ops::health::crowding_line` does.
+pub fn candidate_pool_key(input: &ServeInput) -> (Vec<String>, Vec<String>) {
     let moments: Vec<String> = input.moments.iter().map(|a| a.as_str().to_string()).collect();
     let mut target_kinds: Vec<String> = input.targets.iter().map(|(k, _)| target_kind_wire(*k)).collect();
     // A FILE TOUCH MUST ALSO FETCH THE DIRECTORY RULES ABOVE IT. Since
@@ -178,7 +188,7 @@ pub fn candidates_for(store: &EventStore, input: &ServeInput) -> Vec<LiveItem> {
     }
     target_kinds.sort();
     target_kinds.dedup();
-    candidates_from_projection(store, &moments, &target_kinds).unwrap_or_else(|| live_items(store))
+    (moments, target_kinds)
 }
 
 /// Surface 1's candidate pool: every live item bound `Always`, narrowed

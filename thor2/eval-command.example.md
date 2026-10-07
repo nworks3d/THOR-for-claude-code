@@ -327,7 +327,9 @@ proof is on the rule, so for every rule you handle you TRY to give it a tooth
 that holds before anything else. A tag, a reason, an open point or a refusal
 on record settles nothing: only the trial decides, and the trial reads the
 rule as it is written now. Note the `teeth` line from the health check before
-you start this step and again once you finish it - the report names both.
+you start this step and again once you finish it - the report names both. Use
+the fast form (`--eval`, see "The report") for both: it takes seconds, so wait
+for it each time.
 
 So you do NOT walk the store's heavy facts, and you do NOT pick your own. You
 handle only what the start note handed you under TEETH:
@@ -873,12 +875,32 @@ maintenance that THOR's rules let you decide yourself.
 
 Get the numbers about the state of the store from the health check, never
 from memory and never from a fact. That is a SEPARATE program, not a
-subcommand, and it is not on the PATH - run it with its full path:
+subcommand, and it is not on the PATH - run it with its full path. Use its
+FAST form, `--eval`: it prints only the lines this routine asks for, each
+exactly as the full check prints it, and it ends in seconds (about 7 seconds
+on a store of 270,000 events, measured 2026-10-07). RUN IT IN THE FOREGROUND
+and wait for it to end: do not start it in the background, and do not note,
+quote or file a line before the command has returned. A line you did not
+read is "not verified", and for a line this form prints that is never an
+acceptable answer.
 
-    {{THOR_DOCTOR}}
+    {{THOR_DOCTOR_EVAL}}
 
 In a Bash tool (Git Bash on Windows) use this form instead, the one this
 file's `allowed-tools` pre-approves, so no permission prompt interrupts it:
+
+    {{THOR_DOCTOR_EVAL_BASH}}
+
+The last line it prints says what it left out. For one of those lines (the
+store and chain line, the command anchors, the hook launch failures, the
+refusal outcomes, the open points) run the full check, the same command
+without `--eval`. It takes longer (about 20 seconds on that same store), so
+run it only for such a line, wait for it to end, and never file the report
+while it is still running:
+
+    {{THOR_DOCTOR}}
+
+and in a Bash tool:
 
     {{THOR_DOCTOR_BASH}}
 
@@ -893,6 +915,14 @@ that cannot both be true right now; this line stays silent when there are
 none). Do not copy those numbers into a Rule or Orientation - point to them
 instead; they may appear in your remarks in the dated evaluation report
 itself (below).
+
+Example of reading the output: for step 4 you note the one line that starts
+`teeth: N of M rule(s) marked irreversible or costly carry a check shaped to
+refuse` - write down N and M before the step and again after it. The other
+`teeth ...` lines under it are the detail of the same check. A line that is
+missing from the output is not an error: `ship` and `contradictions` are
+silent when there is nothing to say, and the report says so instead of
+inventing a number.
 
 ## Filing the report
 

@@ -271,6 +271,22 @@ pub fn doctor_bash_invocation(bin_dir: &Path, db: &Path, windows: bool) -> Strin
     }
 }
 
+/// The fast form of `doctor_invocation` (`{{THOR_DOCTOR_EVAL}}` in
+/// `eval-command.example.md`): `doctor --eval` prints only the lines the
+/// evaluation routine asks for, in seconds instead of the full check's much
+/// longer run, so the routine can have its reader wait for it.
+pub fn doctor_eval_invocation(bin_dir: &Path, db: &Path, windows: bool) -> String {
+    format!("{} --eval", doctor_invocation(bin_dir, db, windows))
+}
+
+/// The fast form of `doctor_bash_invocation` (`{{THOR_DOCTOR_EVAL_BASH}}`).
+/// `doctor_allow_invocation`'s `Bash(<program>:*)` entry is a prefix match on
+/// the command text, so it pre-approves this form with no entry of its own
+/// (a test holds that).
+pub fn doctor_eval_bash_invocation(bin_dir: &Path, db: &Path, windows: bool) -> String {
+    format!("{} --eval", doctor_bash_invocation(bin_dir, db, windows))
+}
+
 /// The `serve` program the Stop hook's retest command names, next to the
 /// other binaries.
 fn serve_program(bin_dir: &Path) -> PathBuf {
@@ -279,7 +295,9 @@ fn serve_program(bin_dir: &Path) -> PathBuf {
 
 /// Fill in the template's placeholders - `{{THOR_DOCTOR}}` (the doctor
 /// invocation the report tells a reader to run), `{{THOR_DOCTOR_BASH}}` (the
-/// same call as a Bash tool runs it), `{{THOR_DOCTOR_ALLOW}}` (the
+/// same call as a Bash tool runs it), `{{THOR_DOCTOR_EVAL}}` and
+/// `{{THOR_DOCTOR_EVAL_BASH}}` (the same two with `--eval`, the fast form the
+/// routine tells a reader to wait for), `{{THOR_DOCTOR_ALLOW}}` (the
 /// matching `allowed-tools` entry that pre-approves it) and
 /// `{{THOR_RETEST_ALLOW}}` (the entry that pre-approves THOR's own retest
 /// command, in the exact form `model::store::retest_command_with` prints) -
@@ -289,6 +307,8 @@ fn render_eval_command(bin_dir: &Path, db: &Path) -> String {
     EVAL_COMMAND_TEMPLATE
         .replace("{{THOR_DOCTOR}}", &doctor_invocation(bin_dir, db, cfg!(windows)))
         .replace("{{THOR_DOCTOR_BASH}}", &doctor_bash_invocation(bin_dir, db, cfg!(windows)))
+        .replace("{{THOR_DOCTOR_EVAL}}", &doctor_eval_invocation(bin_dir, db, cfg!(windows)))
+        .replace("{{THOR_DOCTOR_EVAL_BASH}}", &doctor_eval_bash_invocation(bin_dir, db, cfg!(windows)))
         .replace("{{THOR_DOCTOR_ALLOW}}", &doctor_allow_invocation(bin_dir, cfg!(windows)))
         .replace("{{THOR_RETEST_ALLOW}}", &model::store::retest_allow_entry(&serve_program(bin_dir), Some(db)))
 }
@@ -2056,6 +2076,49 @@ mod tests {
         );
     }
 
+    /// The fast form is the same call with `--eval` after it, and the Bash
+    /// form is still covered by the one `Bash(<doctor>:*)` entry the routine
+    /// pre-approves - no permission prompt may stand between the reader and
+    /// the numbers it has to wait for.
+    #[test]
+    fn the_fast_doctor_forms_end_in_eval_and_the_bash_one_is_pre_approved() {
+        for (bin, db, windows) in [
+            ("C:\\thor2\\bin", "C:\\thor2\\thor.db", true),
+            ("/home/user/thor2/bin", "/home/user/thor2/thor.db", false),
+        ] {
+            let (bin, db) = (Path::new(bin), Path::new(db));
+            assert_eq!(doctor_eval_invocation(bin, db, windows), format!("{} --eval", doctor_invocation(bin, db, windows)));
+            let command = doctor_eval_bash_invocation(bin, db, windows);
+            assert_eq!(command, format!("{} --eval", doctor_bash_invocation(bin, db, windows)));
+            let entry = doctor_allow_invocation(bin, windows);
+            let prefix = entry.strip_prefix("Bash(").and_then(|e| e.strip_suffix(":*)")).expect("a Bash entry");
+            assert!(command.starts_with(prefix), "{command} is not covered by {entry}");
+        }
+        assert_eq!(
+            doctor_eval_bash_invocation(Path::new("C:\\thor2\\bin"), Path::new("C:\\thor2\\thor.db"), true),
+            "C:/thor2/bin/doctor.exe --db C:/thor2/thor.db --eval"
+        );
+    }
+
+    /// The rendered routine tells a reader to wait for the fast form, names
+    /// both of its commands, and still names the full check beside it.
+    #[test]
+    fn the_rendered_routine_carries_the_fast_doctor_form_and_the_full_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("thor-eval.md");
+        let (bin_dir, db) = (Path::new("/fake/thor2/bin"), Path::new("/fake/thor2/thor.db"));
+        seed_eval_command(&path, bin_dir, db).unwrap();
+        let written = fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = written.lines().map(str::trim).collect();
+        let eval = doctor_eval_invocation(bin_dir, db, cfg!(windows));
+        let eval_bash = doctor_eval_bash_invocation(bin_dir, db, cfg!(windows));
+        assert!(lines.contains(&eval.as_str()), "the fast PowerShell form must stand on a line of its own: {eval}");
+        assert!(lines.contains(&eval_bash.as_str()), "the fast Bash form must stand on a line of its own: {eval_bash}");
+        assert!(lines.contains(&doctor_invocation(bin_dir, db, cfg!(windows)).as_str()), "the full check stays in the routine");
+        assert!(lines.contains(&doctor_bash_invocation(bin_dir, db, cfg!(windows)).as_str()), "the full Bash form stays in the routine");
+        assert!(written.contains("RUN IT IN THE FOREGROUND"), "the routine must tell the reader to wait for the fast form");
+    }
+
     #[test]
     fn doctor_bash_invocation_quotes_a_path_with_whitespace() {
         assert_eq!(
@@ -2092,7 +2155,7 @@ mod tests {
         // actual invocation line the report tells a reader to run.
         let line = rendered
             .lines()
-            .find(|l| l.contains("doctor") && l.contains("--db") && !l.starts_with("allowed-tools:"))
+            .find(|l| l.contains("doctor") && l.contains("--db") && !l.starts_with("allowed-tools:") && !l.ends_with("--eval"))
             .expect("the rendered eval command must carry a line naming doctor");
         let trimmed = line.trim();
         assert!(trimmed.starts_with("& \""), "the windows doctor line must start with the call operator: {trimmed}");

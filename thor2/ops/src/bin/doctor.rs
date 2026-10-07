@@ -62,6 +62,16 @@ struct Cli {
     /// remove.
     #[arg(long)]
     full: bool,
+    /// The fast form for an evaluation: only the lines the evaluation routine
+    /// (`/thor-eval`) asks for - provable rules, gate, teeth, pinned, decay,
+    /// crowding, ship, judgement debt and contradictions - each exactly as the
+    /// full report prints it (`ops::health::eval_report`). Runs the checks the
+    /// full report runs for those lines and none of the others, so it ends
+    /// in seconds where the full report takes minutes on a large store. Wait
+    /// for it: a report that quotes a line must have read it. Not for use with
+    /// --gate.
+    #[arg(long, conflicts_with = "gate")]
+    eval: bool,
 }
 
 fn main() -> ExitCode {
@@ -94,6 +104,16 @@ fn main() -> ExitCode {
     let checkouts = checkouts_root.as_path();
 
     println!("{}", ops::health::checkouts_root_line(&checkouts_root));
+    if cli.eval {
+        // This checkout's own project, resolved exactly as the full report does
+        // below, so the judgement debt line counts the same checkout.
+        let checkout_project = serve::project::resolve_project(cli.repo.as_deref().unwrap_or(&cwd));
+        for line in ops::health::eval_report(&cli.db, checkouts, cli.full, checkout_project.as_deref()) {
+            println!("{line}");
+        }
+        println!("{}", ops::health::EVAL_FOOTER);
+        return ExitCode::SUCCESS;
+    }
     // THOR failing to run at all comes before the per-component lines, because
     // nothing below can be trusted while it holds: a running tool server older
     // than its program on disk (field test 5, D4), installed programs built

@@ -532,6 +532,25 @@ fn insert_event(
 
 pub struct EventStore {
     conn: Connection,
+    /// Opt-in memo of the two by-session reads (`served_ids_in_session`,
+    /// `events_of_kinds_in_session`). `None` (the default) means every call
+    /// asks SQLite, exactly as before. See `cache_session_reads`.
+    session_reads: std::cell::RefCell<Option<SessionReads>>,
+}
+
+/// What `EventStore::cache_session_reads` keeps: each by-session read answered
+/// from ONE pass over the log instead of one pass per call. `tip` is the
+/// highest seq the maps were built at; the log is append-only, so any write
+/// (this connection's or another process's) moves the tip and throws the
+/// maps away - a stale answer is never served.
+#[derive(Default)]
+struct SessionReads {
+    tip: i64,
+    /// session -> the entity ids it was served, sorted, once each.
+    served: Option<std::collections::HashMap<String, Vec<String>>>,
+    /// the kinds asked for (sorted names joined) -> session -> its events of
+    /// those kinds, oldest first.
+    by_kinds: std::collections::HashMap<String, std::collections::HashMap<String, Vec<Event>>>,
 }
 
 /// A `file:` URI for `path` with `immutable=1` (see `EventStore::open_read_only`).
@@ -600,7 +619,7 @@ impl EventStore {
         // thread or timer. Errors are deliberately not propagated - a
         // checkpoint is a nicety, never a precondition for opening the store.
         let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)");
-        Ok(EventStore { conn })
+        Ok(EventStore { conn, session_reads: Default::default() })
     }
 
     /// Open an EXISTING store to look at it: no create, no schema work, no FTS
@@ -636,7 +655,7 @@ impl EventStore {
         // so it holds within this constructor's own "never changes what is
         // in it" guarantee.
         conn.execute_batch("PRAGMA journal_size_limit = 67108864")?;
-        Ok(EventStore { conn })
+        Ok(EventStore { conn, session_reads: Default::default() })
     }
 
     /// Open an EXISTING store so that nothing in its directory changes: no
@@ -670,7 +689,7 @@ impl EventStore {
             Connection::open_with_flags(immutable_uri(path), flags)?
         };
         conn.busy_timeout(Duration::from_secs(5))?;
-        Ok(EventStore { conn })
+        Ok(EventStore { conn, session_reads: Default::default() })
     }
 
     pub fn in_memory() -> SqlResult<Self> {
@@ -681,7 +700,7 @@ impl EventStore {
         Self::init_schema(&conn)?;
         Self::sync_fts(&conn)?;
         Self::ensure_item_binding_projection(&conn)?;
-        Ok(EventStore { conn })
+        Ok(EventStore { conn, session_reads: Default::default() })
     }
 
     /// The file this store lives in, as SQLite reports it; `None` for an
@@ -1834,11 +1853,94 @@ impl EventStore {
     /// asking this session "did it belong where it fired" has no answerable
     /// form. Indexed the same way `event_kinds` is - two columns, no bodies.
     pub fn served_ids_in_session(&self, session_id: &str) -> SqlResult<Vec<String>> {
+        if let Some(answer) = self.cached_served_ids(session_id)? {
+            return Ok(answer);
+        }
         let mut stmt = self
             .conn
             .prepare_cached("SELECT DISTINCT entity_id FROM event WHERE kind = 'item_served' AND session_id = ?")?;
         let rows = stmt.query_map([session_id], |row| row.get::<_, String>(0))?;
         rows.collect()
+    }
+
+    /// Turn on the memo of the two by-session reads for THIS connection.
+    ///
+    /// WHY. Neither read has an index to use (`session_id` is not indexed, and
+    /// the log is hundreds of MB), so each call is a full pass over it. A
+    /// reader that asks one of them per refusal or per rule - `doctor`'s teeth
+    /// and refusal-outcome lines did, 54 s of a 63 s line on a 270k-event
+    /// store - pays that pass hundreds of times. With the memo on, the first
+    /// call of each kind of question does the pass once and groups the rows by
+    /// session; every later call is a map lookup that returns the identical
+    /// rows (same order: the log's, oldest first).
+    ///
+    /// OFF BY DEFAULT, and meant for a short-lived read-only caller. A
+    /// long-lived connection would hold the whole answer in memory, and the
+    /// Stop hook reads one session's rows on purpose without loading every
+    /// session's. Never stale: see `SessionReads`.
+    pub fn cache_session_reads(&self) {
+        *self.session_reads.borrow_mut() = Some(SessionReads::default());
+    }
+
+    /// The log's highest seq (0 when empty) - the staleness mark of the memo.
+    fn log_tip(&self) -> SqlResult<i64> {
+        self.conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM event", [], |row| row.get(0))
+    }
+
+    /// `None` when the memo is off.
+    fn cached_served_ids(&self, session_id: &str) -> SqlResult<Option<Vec<String>>> {
+        if self.session_reads.borrow().is_none() {
+            return Ok(None);
+        }
+        let tip = self.log_tip()?;
+        let mut guard = self.session_reads.borrow_mut();
+        let reads = guard.as_mut().expect("checked above");
+        if reads.tip != tip {
+            *reads = SessionReads { tip, ..Default::default() };
+        }
+        if reads.served.is_none() {
+            let mut stmt =
+                self.conn.prepare("SELECT DISTINCT session_id, entity_id FROM event WHERE kind = 'item_served'")?;
+            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+            let mut by_session: std::collections::HashMap<String, Vec<String>> = Default::default();
+            for row in rows {
+                let (session, entity) = row?;
+                by_session.entry(session).or_default().push(entity);
+            }
+            by_session.values_mut().for_each(|ids| ids.sort());
+            reads.served = Some(by_session);
+        }
+        Ok(Some(reads.served.as_ref().and_then(|m| m.get(session_id)).cloned().unwrap_or_default()))
+    }
+
+    /// `None` when the memo is off.
+    fn cached_events_in_session(&self, kinds: &[EventKind], session_id: &str) -> SqlResult<Option<Vec<Event>>> {
+        if self.session_reads.borrow().is_none() {
+            return Ok(None);
+        }
+        let tip = self.log_tip()?;
+        let mut names: Vec<&str> = kinds.iter().map(|k| k.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        let key = names.join(",");
+        let mut guard = self.session_reads.borrow_mut();
+        let reads = guard.as_mut().expect("checked above");
+        if reads.tip != tip {
+            *reads = SessionReads { tip, ..Default::default() };
+        }
+        if !reads.by_kinds.contains_key(&key) {
+            let marks = vec!["?"; names.len()].join(", ");
+            let sql = format!("SELECT {} FROM event WHERE kind IN ({marks}) ORDER BY seq", EVENT_COLUMNS);
+            let mut stmt = self.conn.prepare(&sql)?;
+            let events = stmt.query_map(rusqlite::params_from_iter(names.iter()), row_to_event)?;
+            let mut by_session: std::collections::HashMap<String, Vec<Event>> = Default::default();
+            for event in events {
+                let event = event?;
+                by_session.entry(event.session_id.clone()).or_default().push(event);
+            }
+            reads.by_kinds.insert(key.clone(), by_session);
+        }
+        Ok(Some(reads.by_kinds.get(&key).and_then(|m| m.get(session_id)).cloned().unwrap_or_default()))
     }
 
     pub fn get_events_by_entity(&self, entity_id: &str) -> SqlResult<Vec<Event>> {
@@ -1923,6 +2025,9 @@ impl EventStore {
     pub fn events_of_kinds_in_session(&self, kinds: &[EventKind], session_id: &str) -> SqlResult<Vec<Event>> {
         if kinds.is_empty() {
             return Ok(Vec::new());
+        }
+        if let Some(answer) = self.cached_events_in_session(kinds, session_id)? {
+            return Ok(answer);
         }
         let marks = vec!["?"; kinds.len()].join(", ");
         let sql = format!("SELECT {} FROM event WHERE session_id = ? AND kind IN ({marks}) ORDER BY seq", EVENT_COLUMNS);
@@ -3552,6 +3657,55 @@ mod item_binding_tests {
     /// and entity_id for the same store - the two must never quietly drift
     /// apart, since `serve::usefulness` folds both over the same log for
     /// related questions (see that crate's own `ASSISTANT_DELIVERY_ACTOR`).
+    /// The memo of the by-session reads (`cache_session_reads`) must answer
+    /// exactly as the plain queries do - same rows, same order - and must
+    /// never serve an answer older than the log: a write moves the tip, and the
+    /// next read sees it. Off by default, so the plain path is the one proven
+    /// unchanged here too.
+    #[test]
+    fn the_session_read_memo_answers_as_the_plain_queries_and_follows_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let mut writer = EventStore::new(&path).unwrap();
+        for (session, kind, entity) in [
+            ("s1", EventKind::FactCreated, "a"),
+            ("s2", EventKind::FactCreated, "b"),
+            ("s1", EventKind::ItemServed, "a"),
+            ("s1", EventKind::FactRevised, "a"),
+            ("s1", EventKind::ItemServed, "a"),
+            ("s1", EventKind::ItemServed, "c"),
+        ] {
+            writer.append_event(session, "l", "hook", kind, entity, None, "{}").unwrap();
+        }
+        let kinds = [EventKind::FactCreated, EventKind::FactRevised];
+        let plain = EventStore::open_existing(&path).unwrap();
+        let memo = EventStore::open_existing(&path).unwrap();
+        memo.cache_session_reads();
+
+        let seqs = |events: Vec<Event>| events.iter().map(|e| e.seq).collect::<Vec<_>>();
+        for session in ["s1", "s2", "nobody"] {
+            assert_eq!(
+                seqs(memo.events_of_kinds_in_session(&kinds, session).unwrap()),
+                seqs(plain.events_of_kinds_in_session(&kinds, session).unwrap()),
+                "events of {session}"
+            );
+            let mut want = plain.served_ids_in_session(session).unwrap();
+            want.sort();
+            assert_eq!(memo.served_ids_in_session(session).unwrap(), want, "served in {session}");
+        }
+        assert_eq!(memo.served_ids_in_session("s1").unwrap(), vec!["a".to_string(), "c".to_string()], "once each");
+        // The order the kinds are named in does not matter, and an empty list stays empty.
+        let reversed = [EventKind::FactRevised, EventKind::FactCreated];
+        assert_eq!(seqs(memo.events_of_kinds_in_session(&reversed, "s1").unwrap()), vec![1, 4]);
+        assert!(memo.events_of_kinds_in_session(&[], "s1").unwrap().is_empty());
+
+        // A write by another connection is seen by the very next read.
+        writer.append_event("s2", "l", "hook", EventKind::ItemServed, "z", None, "{}").unwrap();
+        writer.append_event("s2", "l", "hook", EventKind::FactRevised, "b", None, "{}").unwrap();
+        assert_eq!(memo.served_ids_in_session("s2").unwrap(), vec!["z".to_string()]);
+        assert_eq!(seqs(memo.events_of_kinds_in_session(&kinds, "s2").unwrap()), vec![2, 8]);
+    }
+
     #[test]
     fn event_kinds_with_actor_agrees_with_event_kinds_and_carries_the_actor_in_log_order() {
         let mut store = EventStore::in_memory().unwrap();

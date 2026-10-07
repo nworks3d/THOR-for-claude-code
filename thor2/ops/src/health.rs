@@ -2177,6 +2177,8 @@ pub fn teeth_line(db: &Path, full: bool) -> String {
     let Ok(store) = EventStore::open_existing(db) else {
         return "teeth: store unreadable, not checked".to_string();
     };
+    // Every refusal below asks the log about its session; one pass, not one per refusal.
+    store.cache_session_reads();
     let Ok(events) = store.get_all_events() else {
         return "teeth: log unreadable, not checked".to_string();
     };
@@ -2222,6 +2224,10 @@ pub fn teeth_line(db: &Path, full: bool) -> String {
     // answered once from the events already in hand, not per session.
     let active = sessions_with_activity(&events);
     let session_active = |session: &str| active.contains(session);
+    // The live set folded once, for the rules whose check reads a command - not
+    // once per refusal.
+    let projects = std::cell::OnceCell::new();
+    let known = || projects.get_or_init(|| serve::teeth::known_projects(&store)).clone();
 
     for li in live.iter().filter(|li| li.item.kind.can_fire()) {
         let is_heavy = matches!(
@@ -2256,7 +2262,7 @@ pub fn teeth_line(db: &Path, full: bool) -> String {
         // call corpus holds.
         let mut really_refused = false;
         if li.item.check.is_some() && refused_ids.contains(li.id.as_str()) {
-            if !serve::attest::field_refusals(&store, &li.id, &li.item).is_empty() {
+            if !serve::attest::field_refusals_known(&store, &li.id, &li.item, &known).is_empty() {
                 field_rules += 1;
             }
             if let Ok(own) = store.get_events_by_entity(&li.id) {
@@ -2968,6 +2974,8 @@ fn refusal_outcomes_at(db: &Path, full: bool, now: i64) -> Vec<String> {
     use model::refusal_outcome::{fates, rate_words, Fate, OUTCOME_WINDOW_DAYS};
     use thor_core::event_store::EventKind;
     let Ok(store) = EventStore::open_existing(db) else { return Vec::new() };
+    // Every refusal below asks the log about its session; one pass, not one per refusal.
+    store.cache_session_reads();
     let Ok(events) = store.get_all_events() else { return Vec::new() };
     let refused: std::collections::BTreeSet<&str> = events
         .iter()
@@ -3075,13 +3083,76 @@ pub fn crowding_line(db: &Path, checkouts: Option<&Path>, full: bool) -> String 
     // doc comment for the day this loop's own command anchors doubled this
     // line's runtime by re-folding an unchanging log per probe.
     let decay = serve::decay::DecayContext::load(&store);
-    let mut text = project_crowding_text(&store, &roots, &decay, full);
-    let global = global_crowding_lines(&store, &roots, &decay, full);
+    let mut prober = Prober::new(&store, &decay);
+    let mut text = project_crowding_text(&store, &roots, &mut prober, full);
+    let global = global_crowding_lines(&store, &roots, &mut prober, full);
     if !global.is_empty() {
         text.push('\n');
         text.push_str(&global.join("\n"));
     }
     text
+}
+
+/// What one crowding probe found: the id of every item that applies at the
+/// probed trigger, in rank order, and the ids the block would actually show.
+struct Probe {
+    all: Vec<String>,
+    shown: std::collections::HashSet<String>,
+}
+
+/// Probes anchors the way the runtime would serve them (`serve_with_decay`),
+/// for the crowding report.
+///
+/// A store with hundreds of anchors needs thousands of probes (17 s of the
+/// health check on a 270k-event store), and almost none of that was ranking:
+/// a probe read and parsed its candidate pool (9 ms) and built its input by
+/// parsing the command or path (about 2 ms), and neither depends on the
+/// project being probed. The pool depends only on the input's moments and
+/// target kinds (`live::candidate_pool_key`) and the input only on the anchor,
+/// so each is built once and reused. The ranking is `serve_from_candidates`,
+/// the same code `serve_with_decay` runs.
+struct Prober<'a> {
+    store: &'a EventStore,
+    decay: &'a serve::decay::DecayContext,
+    /// (is a command, the anchor) -> the input for it, no project yet.
+    inputs: std::collections::HashMap<(bool, String), serve::input::ServeInput>,
+    pools: std::collections::HashMap<(Vec<String>, Vec<String>), Vec<serve::live::LiveItem>>,
+}
+
+impl<'a> Prober<'a> {
+    fn new(store: &'a EventStore, decay: &'a serve::decay::DecayContext) -> Self {
+        Prober { store, decay, inputs: Default::default(), pools: Default::default() }
+    }
+
+    /// What a command (`is_command`) or a file anchor serves in `project`.
+    fn probe(&mut self, is_command: bool, anchor: &str, project: &str) -> Probe {
+        let mut input = self
+            .inputs
+            .entry((is_command, anchor.to_string()))
+            .or_insert_with(|| {
+                let mut input = serve::input::ServeInput::default();
+                if is_command {
+                    input.add_command(anchor);
+                } else {
+                    input.add_file(anchor);
+                }
+                input
+            })
+            .clone();
+        // The project is what `rank::select` filters on. Leaving it out serves
+        // only global items and makes every pool look empty.
+        input.project = Some(project.to_string());
+        let store = self.store;
+        let pool = self
+            .pools
+            .entry(serve::live::candidate_pool_key(&input))
+            .or_insert_with(|| serve::live::candidates_for(store, &input));
+        let served = serve::serve_from_candidates(pool, &input, self.decay);
+        Probe {
+            all: served.all.iter().map(|r| r.id.clone()).collect(),
+            shown: served.selection.shown.iter().map(|r| r.id.clone()).collect(),
+        }
+    }
 }
 
 /// The crowding report for items that belong to a project: each is probed at
@@ -3090,7 +3161,7 @@ pub fn crowding_line(db: &Path, checkouts: Option<&Path>, full: bool) -> String 
 fn project_crowding_text(
     store: &EventStore,
     roots: &std::collections::BTreeMap<String, std::path::PathBuf>,
-    decay: &serve::decay::DecayContext,
+    prober: &mut Prober,
     full: bool,
 ) -> String {
     // Every distinct anchor that resolves, and the pool it stands for.
@@ -3140,24 +3211,17 @@ fn project_crowding_text(
     // place that ever knew which 185.
     let mut lost_at: std::collections::BTreeMap<String, String> = Default::default();
     for (project, path) in &anchors {
-        let mut input = serve::input::ServeInput::default();
-        input.add_file(path);
-        // The project is what `rank::select` filters on. Leaving it out serves
-        // only global items and makes every pool look empty.
-        input.project = Some(project.clone());
-        let served = serve::serve_with_decay(store, &input, decay);
-        let shown: std::collections::HashSet<&str> =
-            served.selection.shown.iter().map(|r| r.id.as_str()).collect();
-        for r in &served.all {
-            eligible.insert(r.id.clone());
-            if shown.contains(r.id.as_str()) {
-                reachable.insert(r.id.clone());
+        let probe = prober.probe(false, path, project);
+        for id in &probe.all {
+            eligible.insert(id.clone());
+            if probe.shown.contains(id) {
+                reachable.insert(id.clone());
             } else {
-                lost_at.entry(r.id.clone()).or_insert_with(|| format!("{path} in {project}"));
+                lost_at.entry(id.clone()).or_insert_with(|| format!("{path} in {project}"));
             }
         }
-        if worst.as_ref().map(|(n, _, _)| served.all.len() > *n).unwrap_or(true) {
-            worst = Some((served.all.len(), project.clone(), path.clone()));
+        if worst.as_ref().map(|(n, _, _)| probe.all.len() > *n).unwrap_or(true) {
+            worst = Some((probe.all.len(), project.clone(), path.clone()));
         }
     }
     // The identical probe, for a command anchor instead of a file - see
@@ -3166,23 +3230,18 @@ fn project_crowding_text(
     // a reader can tell the two apart in `lost_at` and in the worst-pool
     // line below without opening the store.
     for (project, command) in &command_anchors {
-        let mut input = serve::input::ServeInput::default();
-        input.add_command(command);
-        input.project = Some(project.clone());
-        let served = serve::serve_with_decay(store, &input, decay);
-        let shown: std::collections::HashSet<&str> =
-            served.selection.shown.iter().map(|r| r.id.as_str()).collect();
+        let probe = prober.probe(true, command, project);
         let where_lost = format!("{command} (command)");
-        for r in &served.all {
-            eligible.insert(r.id.clone());
-            if shown.contains(r.id.as_str()) {
-                reachable.insert(r.id.clone());
+        for id in &probe.all {
+            eligible.insert(id.clone());
+            if probe.shown.contains(id) {
+                reachable.insert(id.clone());
             } else {
-                lost_at.entry(r.id.clone()).or_insert_with(|| format!("{where_lost} in {project}"));
+                lost_at.entry(id.clone()).or_insert_with(|| format!("{where_lost} in {project}"));
             }
         }
-        if worst.as_ref().map(|(n, _, _)| served.all.len() > *n).unwrap_or(true) {
-            worst = Some((served.all.len(), project.clone(), where_lost));
+        if worst.as_ref().map(|(n, _, _)| probe.all.len() > *n).unwrap_or(true) {
+            worst = Some((probe.all.len(), project.clone(), where_lost));
         }
     }
 
@@ -3255,7 +3314,7 @@ fn project_crowding_text(
 fn global_crowding_lines(
     store: &EventStore,
     roots: &std::collections::BTreeMap<String, std::path::PathBuf>,
-    decay: &serve::decay::DecayContext,
+    prober: &mut Prober,
     full: bool,
 ) -> Vec<String> {
     let live = serve::live::live_items(store);
@@ -3282,23 +3341,13 @@ fn global_crowding_lines(
         Default::default();
     for ((is_command, anchor), ids) in &anchors {
         for (project, base) in roots {
-            let mut input = serve::input::ServeInput::default();
-            if *is_command {
-                input.add_command(anchor);
-            } else {
-                // A path anchor only means something where the file exists.
-                if !base.join(anchor.replace('\\', "/")).exists() {
-                    continue;
-                }
-                input.add_file(anchor);
+            // A path anchor only means something where the file exists.
+            if !*is_command && !base.join(anchor.replace('\\', "/")).exists() {
+                continue;
             }
-            input.project = Some(project.clone());
-            let served = serve::serve_with_decay(store, &input, decay);
-            let shown: std::collections::HashSet<&str> =
-                served.selection.shown.iter().map(|r| r.id.as_str()).collect();
-            let applying: std::collections::HashSet<&str> = served.all.iter().map(|r| r.id.as_str()).collect();
+            let probe = prober.probe(*is_command, anchor, project);
             for id in ids {
-                if applying.contains(id.as_str()) && !shown.contains(id.as_str()) {
+                if probe.all.contains(id) && !probe.shown.contains(id) {
                     let label = if *is_command { format!("{anchor} (command)") } else { anchor.clone() };
                     hidden.entry(id.clone()).or_default().entry(label).or_default().push(project.clone());
                 }
@@ -3603,6 +3652,43 @@ pub fn report(
     // now - see `contradiction_line`'s own doc comment for how this differs
     // from GROUND 29 (`model::gate::opposing_literals`), which refuses a
     // structural opposition at write time and never runs here.
+    lines.extend(contradiction_line(db, checkouts));
+    lines
+}
+
+/// The last line of `doctor --eval`: what it printed and what it left out, so a
+/// reader who needs another line knows it is one command away and not missing.
+pub const EVAL_FOOTER: &str = "doctor --eval: only the lines the evaluation routine asks for (ship, provable rules, gate, teeth, pinned, decay, crowding, judgement debt, contradictions); a line the store has nothing to say about is silent, as in the full report. For anything else - the store and chain line, command anchors, hook launch failures, refusal outcomes, open points, the evaluation clock - run doctor without --eval; that takes longer, so wait for it to end and do not quote it before it has finished";
+
+/// The lines of `report` that the evaluation routine (`eval-command.example.md`)
+/// asks a reader to quote - `provable rules`, `gate`, `teeth`, `pinned`, `decay`,
+/// `crowding`, `ship`, `judgement debt` and `contradictions` - and nothing else,
+/// for `doctor --eval`.
+///
+/// THE SAME FUNCTIONS, NEVER A SECOND COMPUTATION. Each line below is the call
+/// `report` makes, with the same arguments, in the same order, so a line here
+/// cannot say something its twin in the full report does not (a test holds
+/// them equal on one store). What is left out is what the routine never reads:
+/// the store/chain line, the command anchors, the code index and replica, the
+/// backup, the falsifier count, the refusal outcomes, the working copies, the
+/// evaluation clock and the open points. The full report still has them.
+pub fn eval_report(
+    db: &Path,
+    checkouts: Option<&Path>,
+    full: bool,
+    checkout_project: Option<&str>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.extend(ship_line(db));
+    lines.extend([
+        proof_line(db, full),
+        gate_line(db),
+        teeth_line(db, full),
+        pinned_line(db),
+        decay_line(db, checkouts, full),
+        crowding_line(db, checkouts, full),
+    ]);
+    lines.extend(judgement_debt_line(db, checkout_project, full));
     lines.extend(contradiction_line(db, checkouts));
     lines
 }
