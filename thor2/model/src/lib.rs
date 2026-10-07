@@ -16,6 +16,7 @@ pub mod gate;
 pub mod item;
 pub mod marked;
 pub mod normalize;
+pub mod refusal_outcome;
 pub mod served;
 pub mod shell;
 pub mod store;

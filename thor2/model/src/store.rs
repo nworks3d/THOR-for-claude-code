@@ -6562,6 +6562,8 @@ fn machine_section(store: &EventStore, start: &EvaluationStart, filed_seq: i64) 
         ));
     }
 
+    out.push_str(&refusal_outcomes_line(&log, &window, session));
+
     // ---- SIDE DOORS: every write in the window, on an item of this project
     // or made in the evaluating session, that did not come through an
     // attested THOR call - and the ones whose check is still to come.
@@ -6603,6 +6605,40 @@ fn machine_section(store: &EventStore, start: &EvaluationStart, filed_seq: i64) 
     out.push_str(&format!("\nchecked at the end of this turn: {} write(s).", unverified.len()));
     unverified.iter().for_each(|line| out.push_str(line));
     (out, summary)
+}
+
+/// REFUSAL OUTCOMES, for the machine section: of the real refusals the hook
+/// made in the window (the same ones the REFUSED line calls verified, the
+/// evaluating session's own calls left out), how many were followed, before
+/// F, by a weakening or retract of the refusing rule - a probable false
+/// block (`crate::refusal_outcome`). Derived from the log, never typed.
+fn refusal_outcomes_line(log: &LogAt, window: &[Event], session: &str) -> String {
+    let in_window: HashSet<i64> = window
+        .iter()
+        .filter(|e| e.kind == EventKind::GateRefused && e.actor == ASSISTANT_DELIVERY_ACTOR && e.session_id != session)
+        .map(|e| e.seq)
+        .collect();
+    let rules: std::collections::BTreeSet<&str> =
+        window.iter().filter(|e| in_window.contains(&e.seq)).map(|e| e.entity_id.as_str()).collect();
+    let (mut verified, mut probable) = (0usize, 0usize);
+    for rule in rules {
+        let events = log.entity(rule);
+        let verdicts = recorded_refusal_verdicts(&events);
+        let is_real = |e: &Event, _: &Item, _: i64| in_window.contains(&e.seq) && verdicts.get(&e.seq).is_some_and(|(field, _)| *field);
+        for fate in crate::refusal_outcome::fates(rule, &events, &is_real, &|_, _| true) {
+            verified += 1;
+            probable += usize::from(fate.probable_false_block());
+        }
+    }
+    if verified == 0 {
+        return "\nREFUSAL OUTCOMES in the window: no verified refusal in the window to follow.".to_string();
+    }
+    format!(
+        "\nREFUSAL OUTCOMES in the window: {verified} verified refusal(s), {probable} followed by a weakening or retract of the \
+         refusing rule (probable false blocks), {}. A proxy read from the log: a rule can change for other reasons, and it \
+         feeds no ranking and no gate.",
+        crate::refusal_outcome::rate_words(probable, verified)
+    )
 }
 
 /// The actor that records a filing's validation (step 16).
@@ -10038,6 +10074,70 @@ mod tests {
         );
         assert!(!section.contains("'noted-here'"), "THOR's own verdict is not an agent's weakening: {section}");
         assert_eq!(machine_section_summary(&store, &start, filed_seq).checks_weakened, 2);
+    }
+
+    /// FALSE BLOCKS AS A NUMBER: the machine section links each verified
+    /// refusal of the window to what happened to its rule afterwards. A rule
+    /// whose check an agent cleared or that was retracted after refusing is a
+    /// probable false block; one left alone is not; a refusal that is not
+    /// verified, or was made by the evaluating session itself, is not counted.
+    #[test]
+    fn the_machine_section_links_each_verified_refusal_to_what_happened_to_its_rule() {
+        let mut store = EventStore::in_memory().unwrap();
+        let ids = [
+            ("ro-weak", "ledger"),
+            ("ro-gone", "manifest"),
+            ("ro-same", "roster"),
+            ("ro-own", "timetable"),
+            ("ro-unverified", "glossary"),
+        ];
+        for (id, subject) in ids {
+            let mut item = checked_sample();
+            item.id = id.to_string();
+            item.project = Some("mp".to_string());
+            item.text = format!("The {subject} file files/{id}.md keeps the line `keep me`.");
+            item.bindings = vec![Binding::Target { kind: crate::item::TargetKind::Path, value: format!("files/{id}.md") }];
+            item.check = Some(Check::Contains { path: format!("files/{id}.md"), literal: "keep me".to_string() });
+            item.tags.clear();
+            declare(&mut store, "mp-session", "l", "test", &item).unwrap();
+        }
+        let start = record_start(&mut store, "mp-session", "mp");
+        let quiet_seq = store.get_next_seq().unwrap() - 1;
+        let refuse = |store: &mut EventStore, session: &str, id: &str, verified: Option<bool>| {
+            let body = r#"{"at":"2026-10-01T00:00:00Z","target":"files/x.md","tool_use_id":"toolu_1"}"#;
+            let seq = store.append_event(session, session, "hook", EventKind::GateRefused, id, None, body).unwrap().seq;
+            if let Some(field) = verified {
+                record_refusal_verification(store, session, SystemActor::new(ATTESTER_ACTOR), id, seq, field, "fixture").unwrap();
+            }
+        };
+        for id in ["ro-weak", "ro-gone", "ro-same"] {
+            refuse(&mut store, "other-session", id, Some(true));
+        }
+        refuse(&mut store, "mp-session", "ro-own", Some(true));
+        refuse(&mut store, "other-session", "ro-unverified", None);
+
+        let item_of = |store: &EventStore, id: &str| {
+            let events = store.get_events_by_entity(id).unwrap();
+            item_before(&events, i64::MAX).unwrap()
+        };
+        let weak = item_of(&store, "ro-weak");
+        let mut cleared = weak.clone();
+        cleared.check = None;
+        let baseline = gate::ClearedFields { check: true, ..Default::default() }.baseline(&weak);
+        revise_because(&mut store, "mp-session", "l", "mcp", &baseline, &cleared, &weak, Some("the file is gone")).unwrap();
+        retract(&mut store, "shell", "l", "cli", "ro-gone", "files/ro-gone.md is gone", None).unwrap();
+
+        let none = render_machine_section(&store, &start, quiet_seq);
+        assert!(none.contains("\nREFUSAL OUTCOMES in the window: no verified refusal "), "{none}");
+        let filed_seq = store.get_next_seq().unwrap() - 1;
+        let section = render_machine_section(&store, &start, filed_seq);
+        let line = section.lines().find(|l| l.starts_with("REFUSAL OUTCOMES in the window:")).expect("the line");
+        assert!(line.starts_with("REFUSAL OUTCOMES in the window: 3 verified refusal(s)"), "{line}");
+        assert!(line.contains("2 followed by a weakening or retract of the refusing rule (probable false blocks)"), "{line}");
+        assert!(line.contains(&crate::refusal_outcome::rate_words(2, 3)), "{line}");
+        assert!(line.contains("A proxy"), "{line}");
+        assert!(section.is_ascii() && !section.contains('\r'), "plain ASCII, LF only");
+        assert_eq!(render_machine_section(&store, &start, filed_seq), section, "pure");
     }
 
     /// THE OWNER'S GO (step 26), at the write gate: the marker of a rule marked
