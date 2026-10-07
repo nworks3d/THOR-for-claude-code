@@ -1426,6 +1426,32 @@ fn disputes_section(out: &mut String, record: &str, machine: &MachinePass, caps:
     }
 }
 
+/// The start note's words about hook failures that were the machine going to
+/// sleep or shut down (`model::store::HOST_WIDE_WORDS`): what it means, the one
+/// thing to do (nothing), when it is done and an example. `alongside` is true
+/// when real THOR failures are on the same line, so the paragraph only adds the
+/// difference.
+fn host_wide_words(count: usize, alongside: bool) -> String {
+    let meaning = if alongside {
+        format!(
+            " The {count} marked \"{}\" are not launch failures: a hook of another program failed at the same moment with \
+             the same exit code. WHAT TO DO FOR THOSE: nothing; leave them out of the numbers you tell the owner about. \
+             DONE WHEN: they are not in your launch-failure count.",
+            model::store::HOST_WIDE_WORDS
+        )
+    } else {
+        format!(
+            "\n      WHAT THIS MEANS: {count} hook(s) {}. A hook of another program failed at the same moment with the same \
+             exit code, so Windows was suspending or shutting down and no hook could start; it is not a THOR fault. WHAT TO \
+             DO: nothing - do not tell the owner it is a THOR problem and do not count it as a hook launch failure; you may \
+             name the number in your report. DONE WHEN: there is nothing left to do. EXAMPLE: \"THOR health: 0 hook launch \
+             failures; 3 hooks failed while the machine was going to sleep or shutting down - not THOR, nothing to do.\"",
+            model::store::HOST_WIDE_WORDS
+        )
+    };
+    meaning
+}
+
 /// Section 3 of the start note: THOR's health and the refusal outcomes known
 /// at the start (`MachinePass::signals`), so the agent can act on them before
 /// it files. Each says what it means, the exact calls, when it is done and an
@@ -1437,8 +1463,10 @@ fn signals_section(out: &mut String, record: &str, signals: &model::store::Signa
          records them again for this evaluation's own window: act on these now, read that section for anything new.",
     );
     out.push_str(&format!("\n   a. {}", signals.health));
-    if signals.hook_failures == 0 && signals.skew_events == 0 {
+    if signals.hook_failures == 0 && signals.skew_events == 0 && signals.host_wide_failures == 0 {
         out.push_str("\n      Nothing to do here.");
+    } else if signals.hook_failures == 0 && signals.skew_events == 0 {
+        out.push_str(&host_wide_words(signals.host_wide_failures, false));
     } else {
         out.push_str(
             "\n      WHAT THIS MEANS: a hook launch failure is a Claude Code hook (THOR's guard or Stop hook) that could not \
@@ -1450,6 +1478,9 @@ fn signals_section(out: &mut String, record: &str, signals: &model::store::Signa
              the report holds them and the owner was told. EXAMPLE: \"THOR health: 1 hook launch failure (PreToolUse, exit \
              126, session 0de7dc52) - the owner should look at that hook; 0 version-skew events.\"",
         );
+        if signals.host_wide_failures > 0 {
+            out.push_str(&host_wide_words(signals.host_wide_failures, true));
+        }
     }
     out.push_str(&format!("\n   b. {}", signals.refusals));
     if signals.false_blocks.is_empty() {

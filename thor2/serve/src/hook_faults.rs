@@ -60,13 +60,24 @@ pub fn cause_in_words(exit_code: i64, stderr: &str) -> &'static str {
     }
 }
 
+/// How close in time, in milliseconds, a hook of another program must have
+/// failed with the same exit code for a THOR failure to count as host-wide.
+/// Measured 2026-10-06: the PC was suspending, a THOR hook and a node hook
+/// failed in the same second with exit 66 and no output.
+pub const HOST_WIDE_WINDOW_MS: i64 = 2_000;
+
 /// Every THOR hook launch failure recorded in the transcript file `path`.
+/// A failure is marked `host_wide` when a hook of another program failed in
+/// the same file within `HOST_WIDE_WINDOW_MS` with the same exit code: the
+/// machine was going to sleep or shut down, which is not a THOR fault.
 /// Fails quiet: an unreadable file, an unreadable line or a record of another
 /// shape is skipped, never an error.
 pub fn faults_in_file(path: &Path) -> Vec<Scanned> {
     let Ok(file) = std::fs::File::open(path) else { return Vec::new() };
     let mut reader = BufReader::new(file);
     let mut found = Vec::new();
+    // (exit code, time in milliseconds) of every hook of another program.
+    let mut others: Vec<(i64, i64)> = Vec::new();
     let mut raw = Vec::new();
     loop {
         raw.clear();
@@ -78,19 +89,68 @@ pub fn faults_in_file(path: &Path) -> Vec<Scanned> {
         if !line.contains(MARK) {
             continue;
         }
-        if let Some(scanned) = scanned_of(&line) {
-            found.push(scanned);
+        match failure_of(&line) {
+            Some(Failure::Thor(scanned)) => found.push(scanned),
+            Some(Failure::Other { exit_code, at }) => others.push((exit_code, at)),
+            None => {}
         }
+    }
+    for scanned in &mut found {
+        let Some(at) = millis_of_timestamp(&scanned.fault.at) else { continue };
+        scanned.fault.host_wide =
+            others.iter().any(|(exit, other)| *exit == scanned.fault.exit_code && (other - at).abs() <= HOST_WIDE_WINDOW_MS);
     }
     found
 }
 
-fn scanned_of(line: &str) -> Option<Scanned> {
+/// A transcript timestamp (`2026-10-06T04:18:12.231Z`) in milliseconds.
+fn millis_of_timestamp(at: &str) -> Option<i64> {
+    let seconds = crate::eval_filing::unix_of_timestamp(at)?;
+    let fraction = at.split_once('.').map(|(_, rest)| rest.trim_end_matches('Z')).unwrap_or("");
+    let digits: String = fraction.chars().take_while(char::is_ascii_digit).take(3).collect();
+    let millis = format!("{digits:0<3}").parse::<i64>().unwrap_or(0);
+    Some(seconds * 1000 + millis)
+}
+
+/// One `hook_non_blocking_error` record: THOR's own hook, or another program's.
+enum Failure {
+    Thor(Scanned),
+    Other { exit_code: i64, at: i64 },
+}
+
+/// Whether `command` runs one of THOR's own programs (its hook, the backup,
+/// the tool server...). A failure of one of those at the same moment is not
+/// evidence of the machine going to sleep: it is THOR's own.
+fn runs_a_thor_program(command: &str) -> bool {
+    let command = command.trim();
+    let program = match command.strip_prefix('"') {
+        Some(rest) => rest.split('"').next().unwrap_or(""),
+        None => command.split_whitespace().next().unwrap_or(""),
+    };
+    let name = program.rsplit(['/', '\\']).next().unwrap_or("").to_ascii_lowercase();
+    let name = name.strip_suffix(".exe").unwrap_or(&name);
+    ["serve", "backup", "mcp", "doctor", "install", "sync", "library"].contains(&name)
+}
+
+fn failure_of(line: &str) -> Option<Failure> {
     let record: Value = serde_json::from_str(line.trim()).ok()?;
     let attachment = record.get("attachment")?;
-    if attachment.get("type")?.as_str()? != MARK || !is_thor_hook_command(attachment.get("command")?.as_str()?) {
+    if attachment.get("type")?.as_str()? != MARK {
         return None;
     }
+    let command = attachment.get("command")?.as_str()?;
+    if is_thor_hook_command(command) {
+        return scanned_of(&record, attachment).map(Failure::Thor);
+    }
+    if runs_a_thor_program(command) {
+        return None;
+    }
+    let exit_code = attachment.get("exitCode")?.as_i64()?;
+    let at = millis_of_timestamp(record.get("timestamp")?.as_str()?)?;
+    Some(Failure::Other { exit_code, at })
+}
+
+fn scanned_of(record: &Value, attachment: &Value) -> Option<Scanned> {
     let exit_code = attachment.get("exitCode")?.as_i64()?;
     let stderr = attachment.get("stderr").and_then(Value::as_str).unwrap_or_default();
     Some(Scanned {
@@ -100,6 +160,7 @@ fn scanned_of(line: &str) -> Option<Scanned> {
             hook_event: attachment.get("hookEvent")?.as_str()?.to_string(),
             exit_code,
             at: record.get("timestamp")?.as_str()?.to_string(),
+            host_wide: false,
         },
         cause: cause_in_words(exit_code, stderr),
     })
@@ -136,6 +197,10 @@ mod tests {
     /// The shape Claude Code wrote on 2026-10-06 when a security product
     /// blocked serve.exe (names and paths made up).
     fn failure_line(command: &str, exit: i64, stderr: &str, id: &str) -> String {
+        failure_line_at(command, exit, stderr, id, "2026-10-06T22:29:00.231Z")
+    }
+
+    fn failure_line_at(command: &str, exit: i64, stderr: &str, id: &str, at: &str) -> String {
         serde_json::json!({
             "attachment": {
                 "type": "hook_non_blocking_error",
@@ -149,7 +214,7 @@ mod tests {
                 "durationMs": 1316
             },
             "type": "attachment",
-            "timestamp": "2026-10-06T22:29:00.231Z",
+            "timestamp": at,
             "sessionId": SESSION,
         })
         .to_string()
@@ -222,5 +287,61 @@ mod tests {
         let future = crate::time::now_unix() + 3600;
         assert!(faults_since(dir.path(), future).is_empty(), "a file older than the span is not opened");
         assert!(faults_since(&dir.path().join("nowhere"), 0).is_empty());
+    }
+
+    const NODE_HOOK: &str = "node C:/Users/someone/.claude/hooks/precommit-gate.js";
+
+    fn host_wide_of(lines: &[String]) -> Vec<(String, bool)> {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(format!("{SESSION}.jsonl"));
+        std::fs::write(&file, lines.join("\n") + "\n").unwrap();
+        faults_in_file(&file).into_iter().map(|s| (s.fault.tool_use_id, s.fault.host_wide)).collect()
+    }
+
+    /// 2026-10-06 04:18Z: the PC was suspending, three THOR hooks and a node
+    /// hook failed in the same second with exit 66 and no output. That is the
+    /// machine, not THOR.
+    #[test]
+    fn a_thor_failure_beside_another_programs_failure_in_the_same_second_is_host_wide() {
+        let lines = [
+            failure_line_at(OURS, 66, "", "toolu-1", "2026-10-06T04:18:12.100Z"),
+            failure_line_at(NODE_HOOK, 66, "", "toolu-node", "2026-10-06T04:18:12.900Z"),
+            failure_line_at(OURS, 66, "", "toolu-2", "2026-10-06T04:18:13.400Z"),
+        ];
+        assert_eq!(host_wide_of(&lines), [("toolu-1".to_string(), true), ("toolu-2".to_string(), true)]);
+    }
+
+    #[test]
+    fn a_lone_thor_failure_is_still_thors() {
+        let lines = [failure_line_at(OURS, 66, "", "toolu-1", "2026-10-06T04:18:12.100Z")];
+        assert_eq!(host_wide_of(&lines), [("toolu-1".to_string(), false)]);
+    }
+
+    /// Only the same exit code, within the window, from a program that is not
+    /// THOR's own counts.
+    #[test]
+    fn another_failure_that_is_too_far_away_or_of_another_code_or_thors_own_does_not_count() {
+        let far = [
+            failure_line_at(OURS, 66, "", "toolu-1", "2026-10-06T04:18:12.000Z"),
+            failure_line_at(NODE_HOOK, 66, "", "toolu-node", "2026-10-06T04:18:15.000Z"),
+        ];
+        assert_eq!(host_wide_of(&far), [("toolu-1".to_string(), false)], "3 s apart is not the same moment");
+        let other_code = [
+            failure_line_at(OURS, 66, "", "toolu-1", "2026-10-06T04:18:12.000Z"),
+            failure_line_at(NODE_HOOK, 1, "", "toolu-node", "2026-10-06T04:18:12.000Z"),
+        ];
+        assert_eq!(host_wide_of(&other_code), [("toolu-1".to_string(), false)], "another exit code is another cause");
+        let backup = [
+            failure_line_at(OURS, 66, "", "toolu-1", "2026-10-06T04:18:12.000Z"),
+            failure_line_at("\"C:\\x\\thor2\\bin\\backup.exe\" --db \"d\"", 66, "", "toolu-b", "2026-10-06T04:18:12.000Z"),
+        ];
+        assert_eq!(host_wide_of(&backup), [("toolu-1".to_string(), false)], "THOR's own program is not evidence of the machine");
+    }
+
+    #[test]
+    fn a_timestamp_is_read_to_the_millisecond() {
+        assert_eq!(millis_of_timestamp("2026-10-06T04:18:12.100Z").unwrap() % 1000, 100);
+        assert_eq!(millis_of_timestamp("2026-10-06T04:18:12.5Z").unwrap() % 1000, 500);
+        assert_eq!(millis_of_timestamp("2026-10-06T04:18:12Z").unwrap() % 1000, 0);
     }
 }

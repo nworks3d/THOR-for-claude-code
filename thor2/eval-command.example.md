@@ -667,7 +667,22 @@ This is the signal that counts here, not a mark.
   numbers and the names are in the report, and the owner was told. EXAMPLE:
   "THOR health: 1 hook launch failure (PreToolUse, exit 126, session 0de7dc52) -
   the owner should look at that hook; 1 version-skew event - the owner was told
-  to restart Claude".
+  to restart Claude". A THIRD PART may follow the two counts: "; also N hook(s)
+  failed while the machine was going to sleep or shutting down - not THOR (...)".
+  WHAT IT MEANS: in the same session transcript a hook of ANOTHER program
+  (not THOR's own) failed within about two seconds of THOR's hook with the same
+  exit code, which is what a PC suspending or shutting down looks like (nothing
+  can start any more). THOR did not fail, so those are NOT in the launch-failure
+  count. WHAT TO DO: nothing - do not tell the owner it is a THOR problem, and do
+  not add it to the launch-failure number. You may name the count in the report
+  as "not THOR". `doctor` says the same in its hook line ("N hook(s) failed while
+  the machine was going to sleep or shutting down - not THOR"). WHEN IT IS DONE:
+  there is nothing left to do. EXAMPLE: "THOR health: 0 hook launch failures; 3
+  hooks failed while the machine was going to sleep or shutting down - not THOR,
+  nothing to do". A failure recorded before this wording existed stays in the
+  launch-failure count (the log is never rewritten): if its time sits next to a
+  sleep or shutdown and its exit code is 66 with no output, say so in the report
+  as probably the machine.
 - Did the gate refuse one of your OWN write actions (`remember`/`revise`)?
   That is not an annoyance but a signal about the shape of the store. Name
   the reason.

@@ -6602,7 +6602,17 @@ pub struct HookFault {
     pub exit_code: i64,
     /// The transcript timestamp of the record.
     pub at: String,
+    /// True when a hook of ANOTHER program failed in the same transcript within
+    /// a couple of seconds of this one with the same exit code: the machine was
+    /// going to sleep or shut down and nothing could launch, so this one is not
+    /// THOR's. Records written before this field existed read as false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub host_wide: bool,
 }
+
+/// How a host-wide hook failure is worded in the evaluation's health line, the
+/// start note and `doctor`.
+pub const HOST_WIDE_WORDS: &str = "failed while the machine was going to sleep or shutting down - not THOR";
 
 /// The entity a session's hook failures are recorded on.
 pub fn hook_fault_entity(session_id: &str) -> String {
@@ -6676,20 +6686,24 @@ fn names_capped(names: Vec<String>) -> String {
 /// refused as version skew (each named by the report and the session).
 struct HealthFacts {
     hook_failures: usize,
+    host_wide_failures: usize,
     skew_events: usize,
     sentence: String,
 }
 
 fn health_facts(window: &[Event], place: &str) -> HealthFacts {
-    let faults: Vec<String> = window
+    let (host_wide, faults): (Vec<(bool, String)>, Vec<(bool, String)>) = window
         .iter()
         .filter(|e| e.kind == EventKind::GateStoodAside && e.actor == ATTESTER_ACTOR)
         .filter_map(|e| {
             let body = serde_json::from_str::<serde_json::Value>(&e.body).ok()?;
             let fault = serde_json::from_value::<HookFault>(body.get("hook_fault")?.clone()).ok()?;
-            Some(format!("{}, exit {}, session {}", plain(&fault.hook_event), fault.exit_code, short_session(&e.session_id)))
+            let name = format!("{}, exit {}, session {}", plain(&fault.hook_event), fault.exit_code, short_session(&e.session_id));
+            Some((fault.host_wide, name))
         })
-        .collect();
+        .partition(|(host_wide, _)| *host_wide);
+    let faults: Vec<String> = faults.into_iter().map(|(_, name)| name).collect();
+    let host_wide: Vec<String> = host_wide.into_iter().map(|(_, name)| name).collect();
     let skews: Vec<String> = window
         .iter()
         .filter(|e| e.kind == EventKind::GateStoodAside && e.actor == EVAL_VALIDATOR_ACTOR)
@@ -6698,14 +6712,22 @@ fn health_facts(window: &[Event], place: &str) -> HealthFacts {
         .map(|v| format!("report '{}', session {}", plain(&v.report), short_session(&v.session)))
         .collect();
     let named = |names: &[String]| if names.is_empty() { String::new() } else { format!(" ({})", names_capped(names.to_vec())) };
+    // A failure the machine caused (sleep, shutdown) is said apart, after the
+    // THOR numbers, and only when there is one: a window without any reads as
+    // it always did.
+    let apart = if host_wide.is_empty() {
+        String::new()
+    } else {
+        format!("; also {} hook(s) {HOST_WIDE_WORDS}{}", host_wide.len(), named(&host_wide))
+    };
     let sentence = format!(
-        "THOR health {place}: {} hook launch failure(s){}, {} version-skew event(s){}.",
+        "THOR health {place}: {} hook launch failure(s){}, {} version-skew event(s){}{apart}.",
         faults.len(),
         named(&faults),
         skews.len(),
         named(&skews)
     );
-    HealthFacts { hook_failures: faults.len(), skew_events: skews.len(), sentence }
+    HealthFacts { hook_failures: faults.len(), host_wide_failures: host_wide.len(), skew_events: skews.len(), sentence }
 }
 
 /// The longest refused call a line shows, in characters.
@@ -6969,6 +6991,10 @@ pub struct SignalsSoFar {
     /// "THOR health since the previous report: ...".
     pub health: String,
     pub hook_failures: usize,
+    /// Hook failures that were the machine going to sleep or shutting down;
+    /// not counted in `hook_failures`.
+    #[serde(default)]
+    pub host_wide_failures: usize,
     pub skew_events: usize,
     /// "REFUSAL OUTCOMES since the previous report: ...".
     pub refusals: String,
@@ -6990,6 +7016,7 @@ pub fn signals_so_far(store: &EventStore, session: &str, prev_report_seq: i64, s
     SignalsSoFar {
         health: health.sentence,
         hook_failures: health.hook_failures,
+        host_wide_failures: health.host_wide_failures,
         skew_events: health.skew_events,
         refusals: refusal_outcomes_sentence(&outcomes, "since the previous report"),
         false_blocks_more: outcomes.blocks.len().saturating_sub(FALSE_BLOCKS_LISTED),
@@ -11627,7 +11654,7 @@ mod tests {
     }
 
     fn hook_fault(id: &str) -> HookFault {
-        HookFault { tool_use_id: id.to_string(), hook_event: "SessionStart".to_string(), exit_code: 126, at: "2026-10-06T22:29:00.231Z".to_string() }
+        HookFault { tool_use_id: id.to_string(), hook_event: "SessionStart".to_string(), exit_code: 126, at: "2026-10-06T22:29:00.231Z".to_string(), host_wide: false }
     }
 
     /// The machine section says how healthy THOR itself was in the window: the
@@ -11668,6 +11695,48 @@ mod tests {
         let quiet_filed = quiet.get_next_seq().unwrap() - 1;
         let quiet_section = render_machine_section(&quiet, &quiet_start, quiet_filed);
         assert!(quiet_section.contains("\nTHOR health in the window: 0 hook launch failure(s), 0 version-skew event(s).\n"), "{quiet_section}");
+    }
+
+    /// A hook failure the transcript showed to be host-wide (another program's
+    /// hook failed at the same moment: the machine was going to sleep) is not
+    /// a THOR failure. It is said apart, in the window and in the signals of
+    /// the start note, and it is not in either THOR count.
+    #[test]
+    fn a_host_wide_hook_failure_is_said_apart_and_not_counted_as_thors() {
+        let mut store = EventStore::in_memory().unwrap();
+        let attester = SystemActor::new(ATTESTER_ACTOR);
+        let start = record_start(&mut store, "mp-session", "mp");
+        let mut sleeping = hook_fault("sleep");
+        sleeping.host_wide = true;
+        sleeping.hook_event = "PreToolUse".to_string();
+        sleeping.exit_code = 66;
+        assert!(record_hook_fault(&mut store, "mp-session", attester, &sleeping).unwrap().is_some());
+
+        let filed_seq = store.get_next_seq().unwrap() - 1;
+        let section = render_machine_section(&store, &start, filed_seq);
+        assert!(
+            section.contains(&format!(
+                "\nTHOR health in the window: 0 hook launch failure(s), 0 version-skew event(s); also 1 hook(s) {HOST_WIDE_WORDS} \
+                 (PreToolUse, exit 66, session mp-sessi).\n"
+            )),
+            "{section}"
+        );
+        let signals = signals_so_far(&store, "mp-session", 0, filed_seq);
+        assert_eq!((signals.hook_failures, signals.host_wide_failures, signals.skew_events), (0, 1, 0));
+
+        // Mixed: the THOR failure is still counted, on its own.
+        assert!(record_hook_fault(&mut store, "mp-session", attester, &hook_fault("real")).unwrap().is_some());
+        let signals = signals_so_far(&store, "mp-session", 0, store.get_next_seq().unwrap() - 1);
+        assert_eq!((signals.hook_failures, signals.host_wide_failures), (1, 1));
+        assert!(signals.health.contains("1 hook launch failure(s) (SessionStart, exit 126, session mp-sessi), 0 version-skew"), "{}", signals.health);
+
+        // A record written before the field existed reads as a THOR failure.
+        let old: HookFault = serde_json::from_str(
+            r#"{"tool_use_id":"x","hook_event":"Stop","exit_code":1,"at":"2026-10-06T22:29:00.231Z"}"#,
+        )
+        .unwrap();
+        assert!(!old.host_wide);
+        assert!(!serde_json::to_string(&old).unwrap().contains("host_wide"), "a THOR failure is written as it always was");
     }
 
     /// G15.2: two quiet evaluations - nothing on any list, the same one-line

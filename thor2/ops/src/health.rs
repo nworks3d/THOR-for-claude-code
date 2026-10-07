@@ -347,6 +347,10 @@ pub fn hook_failures_line_in(root: Option<&Path>, blocks: &[i64], now_unix: i64)
 /// The words of the finding, from the failures found and the Code Integrity
 /// block times.
 pub fn hook_failures_words(faults: &[serve::hook_faults::Scanned], blocks: &[i64]) -> Option<String> {
+    // A failure the machine caused (a hook of another program failed at the
+    // same moment: sleep or shutdown) is said apart and is never THOR's.
+    let (host_wide, faults): (Vec<&serve::hook_faults::Scanned>, Vec<&serve::hook_faults::Scanned>) =
+        faults.iter().partition(|f| f.fault.host_wide);
     let mut parts: Vec<String> = Vec::new();
     if let Some(last) = faults.iter().max_by(|a, b| a.fault.at.cmp(&b.fault.at)) {
         parts.push(format!(
@@ -365,13 +369,31 @@ pub fn hook_failures_words(faults: &[serve::hook_faults::Scanned], blocks: &[i64
             serve::time::iso8601_from_unix(*last)
         ));
     }
-    if parts.is_empty() {
-        return None;
+    let mut out = String::new();
+    if !parts.is_empty() {
+        out = format!(
+            "{}. THOR cannot change Windows security settings: allow the program there (or in your antivirus), then restart Claude.",
+            parts.join("; ")
+        );
     }
-    Some(format!(
-        "{}. THOR cannot change Windows security settings: allow the program there (or in your antivirus), then restart Claude.",
-        parts.join("; ")
-    ))
+    if let Some(last) = host_wide.iter().max_by(|a, b| a.fault.at.cmp(&b.fault.at)) {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&format!(
+            "{} hook(s) {} (in the last {HOOK_FAILURE_DAYS} days, the last at {}, {}, exit {}): a hook of another program failed at the same moment, so the machine was suspending or shutting down. Nothing to do.",
+            host_wide.len(),
+            model::store::HOST_WIDE_WORDS,
+            last.fault.at,
+            last.fault.hook_event,
+            last.fault.exit_code
+        ));
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 /// The off-site backup, in plain words: where the last copy went and when,
@@ -7716,6 +7738,7 @@ mod launch_and_skew_tests {
                 hook_event: event.to_string(),
                 exit_code: exit,
                 at: at.to_string(),
+                host_wide: false,
             },
             cause,
         }
@@ -7739,6 +7762,19 @@ mod launch_and_skew_tests {
         assert!(line.contains("never reached the session") && line.contains("restart Claude"), "{line}");
     }
 
+    #[test]
+    fn host_wide_failures_are_said_apart_and_are_not_thors() {
+        let mut sleeping = fault("2026-10-06T04:18:12.100Z", "PreToolUse", 66, "the hook could not run");
+        sleeping.fault.host_wide = true;
+        let only = hook_failures_words(std::slice::from_ref(&sleeping), &[]).expect("said apart");
+        assert!(only.starts_with("1 hook(s) failed while the machine was going to sleep or shutting down - not THOR"), "{only}");
+        assert!(!only.contains("hook launch failures") && !only.contains("restart Claude"), "no THOR alarm: {only}");
+        assert!(only.contains("Nothing to do"), "{only}");
+
+        let mixed = hook_failures_words(&[sleeping, fault("2026-10-06T22:29:00.231Z", "Stop", 126, "blocked")], &[]).unwrap();
+        assert!(mixed.starts_with("hook launch failures: 1 in the last 7 days"), "only the real one is counted: {mixed}");
+        assert!(mixed.contains("1 hook(s) failed while the machine was going to sleep"), "{mixed}");
+    }
     #[test]
     fn windows_code_integrity_blocks_are_named_with_their_count_and_last_time() {
         let blocks = [1_791_000_000, 1_791_100_000];

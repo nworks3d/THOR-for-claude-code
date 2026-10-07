@@ -1525,6 +1525,7 @@ fn busy_frozen(batch: usize, a4: usize, disputes: usize, blocks: usize, carriers
     machine.signals = Some(model::store::SignalsSoFar {
         health: "THOR health since the previous report: 1 hook launch failure(s) (PreToolUse, exit 126, session 5e1f0c3a), 0 version-skew event(s).".to_string(),
         hook_failures: 1,
+        host_wide_failures: 0,
         skew_events: 0,
         refusals: format!("REFUSAL OUTCOMES since the previous report: {blocks} verified refusal(s), {blocks} followed by a weakening or retract of the refusing rule (probable false blocks), rate 100.0 percent, one-sided 95 percent upper bound 100.0 percent. A proxy read from the log: a rule can change for other reasons, and it feeds no ranking and no gate."),
         false_blocks: (0..blocks)
@@ -1618,4 +1619,38 @@ fn an_overfull_start_note_cuts_from_the_least_actionable_end_and_says_so() {
     for n in 0..16 {
         assert!(whole.contains(&format!("\n      - 'a4-rule-{n}'")), "{n}");
     }
+}
+
+/// A hook failure that was the machine going to sleep or shutting down is
+/// explained in the start note with its meaning, the one thing to do (nothing),
+/// when it is done and an example; it is not a THOR failure, so the real
+/// launch-failure explanation does not appear for it alone.
+#[test]
+fn the_start_note_explains_hook_failures_that_were_the_machine_and_not_thor() {
+    let signals = |hook_failures: usize, host_wide_failures: usize| model::store::SignalsSoFar {
+        health: "THOR health since the previous report: x.".to_string(),
+        hook_failures,
+        host_wide_failures,
+        refusals: "REFUSAL OUTCOMES: none.".to_string(),
+        ..Default::default()
+    };
+    let render = |s: &model::store::SignalsSoFar| {
+        let mut out = String::new();
+        signals_section(&mut out, "eval-demo", s, &Caps::all());
+        out
+    };
+
+    let only = render(&signals(0, 3));
+    for part in ["WHAT THIS MEANS: 3 hook(s) failed while the machine was going to sleep or shutting down - not THOR", "WHAT TO DO: nothing", "DONE WHEN:", "EXAMPLE:"] {
+        assert!(only.contains(part), "missing {part}: {only}");
+    }
+    assert!(!only.contains("a hook launch failure is a Claude Code hook"), "no THOR alarm for it: {only}");
+    assert!(only.is_ascii(), "plain ASCII");
+
+    let mixed = render(&signals(1, 2));
+    assert!(mixed.contains("a hook launch failure is a Claude Code hook"), "{mixed}");
+    assert!(mixed.contains("The 2 marked \"failed while the machine was going to sleep or shutting down - not THOR\" are not launch failures"), "{mixed}");
+
+    let neither = render(&signals(0, 0));
+    assert!(neither.contains("Nothing to do here."), "{neither}");
 }
