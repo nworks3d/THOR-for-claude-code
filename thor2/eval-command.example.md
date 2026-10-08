@@ -372,7 +372,10 @@ handle only what the start note handed you under TEETH:
   incidental span, make call 2: `mcp__thor__revise(id: "<id>", because: "<why
   the span may change while the rule stays true, at least twenty
   characters>")` - THOR refuses a reason shorter than that, and a filler such
-  as "ok" settles nothing. An item is done when one of the two calls was
+  as "ok" settles nothing. Say in the reason which file or call you read and
+  what you found there (for example: "read sensor.cfg line 12: the word delay
+  only labels a comment; the unit is on line 14"), because a reason written
+  without opening them is what the audit found wrong. An item is done when one of the two calls was
   accepted, or when you retract the rule with a reason because it is simply
   wrong; nothing else settles it (not a tag, not a note, not a line in the
   report), and the report cannot be filed until every item is done. Example: a
@@ -595,7 +598,19 @@ This is the signal that counts here, not a mark.
   of the start note (what THOR knew at the start, since the previous report) and
   the machine section of your report, which you read in the reply to your
   filing (the refusals of the evaluation's own window), in a line that starts
-  "REFUSAL OUTCOMES in the window". WHAT IT MEANS: THOR looked at every verified
+  "REFUSAL OUTCOMES in the window". WHOSE REFUSALS: section 3b counts the
+  verified refusals of EVERY session since the previous report, yours included
+  (a refusal you met earlier in this session is there). The machine-section
+  line covers only the evaluation itself, a few minutes, and counts OTHER
+  sessions' refusals only: a call you made inside your own evaluation proves
+  nothing and is not counted, and the line says so at its end. So if the gate
+  refused one of your own calls during the evaluation, list it yourself:
+  `mcp__thor__history(id: "<rule id>")` shows the refusal, and point 6 of the
+  report names the rule id and the refused call. DONE WHEN: each of your own
+  refusals is named there, or the report says there were none. EXAMPLE: "my
+  own `Start-Process` was refused by `no-visible-window` during the evaluation;
+  the call was a harmless URI launch, so I report it as a probable false
+  block". WHAT IT MEANS: THOR looked at every verified
   refusal, found what happened to the refusing rule afterwards, and counts a
   refusal as a PROBABLE false block when someone other than THOR then retracted
   that rule or weakened it (cleared or changed its check, lowered its severity,
@@ -643,9 +658,9 @@ This is the signal that counts here, not a mark.
   report each have a line "THOR health ...: N hook launch failure(s) (...), M
   version-skew event(s) (...)". WHAT IT MEANS: a hook launch failure is a Claude
   Code hook (THOR's guard or Stop hook) that could not start, so nothing from
-  THOR reached that call - the brackets name the hook event, its exit code and
-  the session whose hook failed (the count covers every session in the window,
-  not only yours); a version-skew event is a filing that THOR refused because
+  THOR reached that call - the brackets name the hook event, its exit code, the
+  session whose hook failed and the time of the failure in UTC (the count
+  covers every session in the window, not only yours); a version-skew event is a filing that THOR refused because
   the tool server that wrote the report was built from another THOR than the
   checker ("written by a tool server of another build than the checker"), which
   is nobody's edit - the brackets name the report and the session. There is
@@ -653,21 +668,33 @@ This is the signal that counts here, not a mark.
   do. Otherwise put both numbers and the names in the report, and tell the owner
   in the summary: for a skew, to restart Claude so the tool server is the
   current one, and for a launch failure, that the named hook needs his
-  attention. You cannot restart or repair either yourself. WHAT HAPPENS AFTER A
-  SKEW, as THOR really does it: a report refused as skew is on file but does not
-  count, and filing it ended THAT evaluation (its own report is on the log), so
-  filing again in this same session cannot help - the tool server is still the
-  old build and renders the same old section. After the owner restarts Claude,
-  the next end-of-turn ask starts a FRESH evaluation (a new start note, new
-  lists and a new log position - it does not reopen the old one), and in that
-  turn you file its report under the id `eval-<project>-<YYYY-MM-DD>-2` (`-3` if
-  `-2` is taken). That new start note's THOR health line lists the skew (it
+  attention. You cannot restart or repair either yourself. WHAT HAPPENS WITH A
+  SKEW, as THOR really does it: the tool server you file through and the checker
+  the Stop hook runs are two programs. When the installed checker is of another
+  build than your tool server, the tool server refuses the filing ITSELF, before
+  it writes anything: "REFUSED: this tool server renders the evaluation machine
+  section in format N, but the installed checker (serve.exe) reads format M".
+  WHAT TO DO: tell the owner to restart Claude (the tool server loads only when
+  Claude starts), end your turn, and file nothing more in this session. DONE
+  WHEN: the owner restarted Claude and the next end-of-turn ask came. EXAMPLE
+  (for the summary): "the tool server is an older build than the checker; I did
+  not file; restart Claude and the evaluation is asked again". If a skewed
+  report did get on file (from a tool server that predates that refusal), it is
+  on file but does not count, and filing it ended THAT evaluation; THOR then
+  says one line at each Stop ("Restart Claude; the evaluation is asked again
+  after the restart") and does NOT start a fresh evaluation or hold the turn in
+  that session, so do not file a second report: it would be dead the same way.
+  After the owner restarts Claude (the same session id resumes), the next
+  end-of-turn ask starts a FRESH evaluation (a new start note, new lists and a
+  new log position - it does not reopen the old one), and in that turn you file
+  its report under the id `eval-<project>-<YYYY-MM-DD>-2` (`-3` if `-2` is
+  taken). That new start note's THOR health line lists the skew (it
   counts everything since the previous report); the new report's machine section
   does not, because its window starts at the new start. WHEN IT IS DONE: both
   numbers and the names are in the report, and the owner was told. EXAMPLE:
-  "THOR health: 1 hook launch failure (PreToolUse, exit 126, session 0de7dc52) -
-  the owner should look at that hook; 1 version-skew event - the owner was told
-  to restart Claude". A THIRD PART may follow the two counts: "; also N hook(s)
+  "THOR health: 1 hook launch failure (PreToolUse, exit 126, session 0de7dc52, at
+  2026-10-06T04:18:30Z) - the owner should look at that hook; 1 version-skew
+  event - the owner was told to restart Claude". A THIRD PART may follow the two counts: "; also N hook(s)
   failed while the machine was going to sleep or shutting down - not THOR (...)".
   WHAT IT MEANS: in the same session transcript a hook of ANOTHER program
   (not THOR's own) failed within about two seconds of THOR's hook with the same
@@ -679,10 +706,15 @@ This is the signal that counts here, not a mark.
   the machine was going to sleep or shutting down - not THOR"). WHEN IT IS DONE:
   there is nothing left to do. EXAMPLE: "THOR health: 0 hook launch failures; 3
   hooks failed while the machine was going to sleep or shutting down - not THOR,
-  nothing to do". A failure recorded before this wording existed stays in the
-  launch-failure count (the log is never rewritten): if its time sits next to a
-  sleep or shutdown and its exit code is 66 with no output, say so in the report
-  as probably the machine.
+  nothing to do". A failure recorded before THOR classified them is looked up in
+  the session transcript again when the start note is made, so it is already
+  marked "not THOR" whenever the transcript still holds the sleep. If one still
+  counts as a launch failure and its time (each failure names it) sits next to a
+  sleep, a shutdown or a reboot of the machine, and its exit code is 66 with no
+  output, it is probably the machine: say so in the report and do not tell the
+  owner a hook is broken. WHEN IT IS DONE: the report says "probably the
+  machine" for it, with the time. EXAMPLE: "PreToolUse exit 66 at
+  2026-10-06T04:18:30Z, the PC went to sleep at 04:18: probably the machine".
 - Did the gate refuse one of your OWN write actions (`remember`/`revise`)?
   That is not an annoyance but a signal about the shape of the store. Name
   the reason.
@@ -905,6 +937,19 @@ In a Bash tool (Git Bash on Windows) use this form instead, the one this
 file's `allowed-tools` pre-approves, so no permission prompt interrupts it:
 
     {{THOR_DOCTOR_EVAL_BASH}}
+
+BEFORE YOU FILE, read the first lines it prints. If one starts `tool server:` or
+`installed programs:`, the tool server you file through is older than the
+installed programs, or the programs were not built from one source. WHAT IT
+MEANS: a report filed now would be refused as version skew (see THOR health
+above) and be a dead report. WHAT TO DO: do not file; tell the owner in your
+summary to restart Claude (and to run the installer again for `installed
+programs:`), and end the turn. The next end-of-turn ask files the report.
+DONE WHEN: the summary says so and no report was filed. EXAMPLE: the output
+holds "tool server: 1 running mcp.exe process(es) started before mcp.exe was
+replaced" -> summary: "the tool server is stale; restart Claude, then the
+evaluation is asked again; I filed nothing". When neither line is printed,
+nothing is wrong and you file as usual.
 
 The last line it prints says what it left out. For one of those lines (the
 store and chain line, the command anchors, the hook launch failures, the
