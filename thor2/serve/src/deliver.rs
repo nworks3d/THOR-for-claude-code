@@ -450,8 +450,12 @@ mod tests {
         let anthropic = format!("{}{}", ["sk-", "ant-"].concat(), "x".repeat(30));
         let kept = redact_secrets(&format!("curl --data {anthropic} https://example.test"));
         assert!(!kept.contains(&anthropic), "{kept}");
-        let pem = redact_secrets("echo '-----BEGIN PRIVATE KEY-----' > key.pem");
-        assert!(!pem.contains("BEGIN"), "{pem}");
+        let body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj";
+        let pem = redact_secrets(&format!("printf '-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY-----' > key.pem"));
+        assert!(!pem.contains("BEGIN") && !pem.contains(body), "{pem}");
+        // The header alone is public: a command that only names it stays readable.
+        let header_only = "grep -c '-----BEGIN PRIVATE KEY-----' key.pem";
+        assert_eq!(redact_secrets(header_only), header_only);
     }
 
     /// What the trial of a rule reads stays readable: ordinary commands, paths

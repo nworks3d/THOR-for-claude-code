@@ -11,7 +11,9 @@
 //! WHY SO FEW SHAPES. A false refusal is the most expensive thing the gate can
 //! do, so only shapes that are all but never ordinary prose are listed, and
 //! each carries a length floor: a bare `ghp_` or `sk_live_` in a rule ABOUT
-//! secrets passes. Deliberately NOT here: the words password, token or key,
+//! secrets passes. A PEM private key counts only with key material under its
+//! header: the header is public text a rule must be able to name.
+//! Deliberately NOT here: the words password, token or key,
 //! `name=value`, a long run of hex (a commit sha) and base64 in general. Those
 //! would refuse "never pass --password on the command line" and "primary key:
 //! id", which is the failure this module exists to avoid.
@@ -179,7 +181,10 @@ fn jwt_at(bytes: &[u8], at: usize) -> Option<Found> {
     Some(Found { shape: "JWT", start: at, end })
 }
 
-/// `-----BEGIN [words] PRIVATE KEY-----`: the header alone is the shape.
+/// `-----BEGIN [words] PRIVATE KEY-----` followed by key material. The header
+/// alone is public text: a rule that forbids committing a private key has to be
+/// able to name it, so a sentence holding only the header passes. The secret is
+/// the base64 body under it.
 fn pem_at(bytes: &[u8], at: usize) -> Option<Found> {
     const OPEN: &[u8] = b"-----BEGIN ";
     const CLOSE: &[u8] = b"-----";
@@ -193,7 +198,55 @@ fn pem_at(bytes: &[u8], at: usize) -> Option<Found> {
     let label = &window[..close];
     let words_only = label.iter().all(|b| b.is_ascii_uppercase() || *b == b' ');
     let private = label.windows(b"PRIVATE KEY".len()).any(|w| w == b"PRIVATE KEY");
-    (words_only && private).then_some(Found { shape: PEM, start: at, end: label_at + close + CLOSE.len() })
+    if !(words_only && private) {
+        return None;
+    }
+    let header_end = label_at + close + CLOSE.len();
+    pem_body_end(bytes, header_end).map(|end| Found { shape: PEM, start: at, end })
+}
+
+/// Where the key material under a PEM header ends, or None when what follows
+/// the header is prose. Material is a line of at least `BODY_FLOOR` base64
+/// characters (a real PEM line is 64 or 70), after optional `Name: value` lines
+/// of an encrypted key, then any further base64 lines and the END line.
+fn pem_body_end(bytes: &[u8], from: usize) -> Option<usize> {
+    const BODY_FLOOR: usize = 32;
+    const HEADER_LINES: usize = 3;
+    let base64 = |b: &u8| b.is_ascii_alphanumeric() || *b == b'+' || *b == b'/' || *b == b'=';
+    let line_end = |at: usize| bytes[at..].iter().position(|b| *b == b'\n').map_or(bytes.len(), |n| at + n);
+    let skip_space = |mut at: usize| {
+        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        at
+    };
+    let mut at = skip_space(from);
+    for _ in 0..HEADER_LINES {
+        if !bytes[at..line_end(at)].contains(&b':') {
+            break;
+        }
+        at = skip_space(line_end(at));
+    }
+    let body_run = |from: usize| bytes[from..].iter().take_while(|b| base64(b)).count();
+    if body_run(at) < BODY_FLOOR {
+        return None;
+    }
+    let mut end = at + body_run(at);
+    loop {
+        let next = skip_space(end);
+        if next == end || body_run(next) == 0 {
+            break;
+        }
+        end = next + body_run(next);
+    }
+    let next = skip_space(end);
+    if bytes[next..].starts_with(b"-----END ") {
+        let tail = &bytes[next + 5..bytes.len().min(next + 5 + 60)];
+        if let Some(close) = tail.windows(5).position(|w| w == b"-----") {
+            end = next + 5 + close + 5;
+        }
+    }
+    Some(end)
 }
 
 #[cfg(test)]
@@ -205,6 +258,12 @@ mod tests {
     // ever sees a whole token in the source.
     fn fake(prefix: (&str, &str), filler: &str, count: usize) -> String {
         format!("{}{}{}", prefix.0, prefix.1, filler.repeat(count))
+    }
+
+    /// A header with a base64 body and an END line, the shape of a real key file.
+    fn pem(label: &str) -> String {
+        let body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj";
+        format!("-----BEGIN {label}-----\n{body}\n{body}\n-----END {label}-----")
     }
 
     fn shapes_of(text: &str) -> Vec<&'static str> {
@@ -226,8 +285,8 @@ mod tests {
             (fake(("sk-", "ant-"), "g", 30), "Anthropic API key"),
             (fake(("AI", "za"), "H", 36), "Google API key"),
             (jwt, "JWT"),
-            ("-----BEGIN RSA PRIVATE KEY-----".to_string(), "PEM private key header"),
-            ("-----BEGIN PRIVATE KEY-----".to_string(), "PEM private key header"),
+            (pem("RSA PRIVATE KEY"), "PEM private key header"),
+            (pem("PRIVATE KEY"), "PEM private key header"),
         ];
         for (token, shape) in cases {
             let text = format!("see {token} for the thing");
@@ -256,6 +315,32 @@ mod tests {
         ] {
             assert!(find(text).is_empty(), "{text}");
         }
+    }
+
+    /// THE DEFECT: the header alone was refused, so a rule that forbids
+    /// committing a private key could not name the header it forbids.
+    #[test]
+    fn a_pem_header_named_in_a_sentence_is_not_found() {
+        for text in [
+            "Never commit a file containing -----BEGIN OPENSSH PRIVATE KEY-----; scripts/check-private-data.sh must keep refusing it.",
+            "-----BEGIN PRIVATE KEY-----",
+            "-----BEGIN RSA PRIVATE KEY-----\nand then the base64 body, which is never written here",
+            "the header -----BEGIN PRIVATE KEY----- starts the file, the END line closes it -----END PRIVATE KEY-----",
+        ] {
+            assert!(find(text).is_empty(), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_pem_header_with_key_material_under_it_is_found_whole() {
+        let key = pem("OPENSSH PRIVATE KEY");
+        let text = format!("pasted: {key} oops");
+        let hit = find(&text)[0];
+        assert_eq!(&text[hit.start..hit.end], key);
+        let encrypted = "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,0123\n\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj\n-----END RSA PRIVATE KEY-----";
+        assert_eq!(shapes_of(encrypted), vec!["PEM private key header"]);
+        let one_line = "-----BEGIN PRIVATE KEY----- MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj";
+        assert_eq!(shapes_of(one_line), vec!["PEM private key header"]);
     }
 
     #[test]
@@ -288,8 +373,8 @@ mod tests {
         let hint = find(&text)[0].hint(&text).expect("a token has a hint");
         assert_eq!(hint, "ghp_zz...zz");
         assert!(!hint.contains(&token));
-        let pem = "-----BEGIN PRIVATE KEY-----";
-        assert_eq!(find(pem)[0].hint(pem), None);
+        let key = pem("PRIVATE KEY");
+        assert_eq!(find(&key)[0].hint(&key), None);
     }
 
     #[test]

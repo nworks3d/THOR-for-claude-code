@@ -466,7 +466,7 @@ on an existing item). A costly or irreversible item bound ONLY to a project name
 too: that binding reaches a prompt where the owner types the name, never a tool call - bind it \
 to the file, command or moment it is about, or pin it.\n\nSECRETS: a real secret token in a \
 note's text or falsifier (sk_/pk_ live or test keys, ghp_ and other GitHub tokens, xox Slack, \
-AKIA, tskey-, sk-ant-, AIza, a JWT, a PEM private key header) is refused for every kind, with no \
+AKIA, tskey-, sk-ant-, AIza, a JWT, a PEM private key header with its key body) is refused for every kind, with no \
 override: the log keeps every write and its backup copies it. Store WHERE the secret lives (a \
 file or variable name), never its value, and rotate it if it was real.\n\nNOT HERE ON PURPOSE: session start, the moment of action, and the \
 prompt surface are hooks that fire on their own. No tool calls them - one that could would \

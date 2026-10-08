@@ -3926,6 +3926,7 @@ mod tests {
             "a GitHub token starts with ghp_ and is checked by the push hook",
             "Stripe keys start with sk_live_ or sk_test_; keep them in the STRIPE_KEY variable",
             "never paste a PEM private key; it begins with a BEGIN line",
+            "Never commit a file containing -----BEGIN OPENSSH PRIVATE KEY-----; the hook must keep refusing it",
         ] {
             let mut rule = bound(Kind::Rule);
             rule.text = text.to_string();
