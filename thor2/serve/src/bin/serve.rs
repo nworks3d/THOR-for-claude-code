@@ -3384,6 +3384,16 @@ fn eval_stop_ask(
         let stop_here = folder_project == Some(project.as_str());
         match usefulness::stop_decision(store, &state, &project, session_id, &timeline, stop_here, true, now, usefulness::EVAL_CADENCE) {
             usefulness::StopDecision::Ask(clock) => {
+                // A REPORT THIS SESSION FILED WAS REFUSED AS VERSION SKEW and
+                // the session has not been restarted since (field test 13,
+                // D2): its tool server is still the old build, so a fresh
+                // evaluation would end in a second dead report and the hold
+                // would leave no other way out. One plain line, no hold.
+                let root = serve::attest::transcripts_root();
+                if let Some(line) = serve::eval_filing::skew_awaiting_restart(store, &project, session_id, root.as_deref()) {
+                    elsewhere.get_or_insert(line);
+                    continue;
+                }
                 // ONE HOLDER PER PROJECT (step 26): a session that is not the
                 // project's holder is not asked while the holder is active -
                 // one line names it instead.

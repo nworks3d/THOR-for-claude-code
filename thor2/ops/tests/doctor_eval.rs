@@ -102,6 +102,8 @@ fn lines(out: &std::process::Output) -> Vec<String> {
 const EVAL_BLOCKS: &[&str] = &[
     "doctor 2",
     "checkouts root:",
+    "tool server:",
+    "installed programs:",
     "ship:",
     "provable rules:",
     "gate:",
@@ -159,4 +161,32 @@ fn eval_cannot_be_combined_with_gate() {
     let (db, checkouts) = fixture(dir.path());
     let out = run(&db, &checkouts, &["--eval", "--gate"]);
     assert!(!out.status.success(), "--eval with --gate must be refused");
+}
+
+/// FIELD TEST 13, D1: the fast form hid the one line that predicts a report
+/// that would be on file and dead (a tool server or an installed program from
+/// another build). It prints the installation lines too, in the full report's
+/// order, and they are silent when nothing is wrong.
+#[test]
+fn eval_prints_the_installation_lines_the_full_report_prints() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, checkouts) = fixture(dir.path());
+    // A folder like the installed one: doctor with a "serve" and an "mcp" beside it
+    // that print no build id (an older program), which doctor names as skew.
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let suffix = std::env::consts::EXE_SUFFIX;
+    let doctor = bin.join(format!("doctor{suffix}"));
+    std::fs::copy(env!("CARGO_BIN_EXE_doctor"), &doctor).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_doctor"), bin.join(format!("serve{suffix}"))).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_doctor"), bin.join(format!("mcp{suffix}"))).unwrap();
+    let run_here = |extra: &[&str]| {
+        Command::new(&doctor).arg("--db").arg(&db).arg("--checkouts").arg(&checkouts).args(extra).output().unwrap()
+    };
+    let eval = lines(&run_here(&["--eval"]));
+    let full = lines(&run_here(&[]));
+    let skew = eval.iter().find(|l| l.starts_with("installed programs:")).unwrap_or_else(|| panic!("--eval hides the skew line:\n{}", eval.join("\n")));
+    assert!(skew.contains("prints no build id"), "{skew}");
+    assert!(full.contains(skew), "the very line the full report prints");
+    assert!(eval.iter().position(|l| l == skew) > eval.iter().position(|l| l.starts_with("checkouts root:")), "after the checkouts root");
 }

@@ -2706,10 +2706,12 @@ fn taken_off_the_rule_track(events: &[Event]) -> Vec<(&'static str, String)> {
                                 model::store::check_in_words(&old),
                                 model::store::check_in_words(new)
                             ),
+                            // The literals are named: kind and file alone read as
+                            // no change when only the literal moved (field test 13, D6).
                             Some(new) => format!(
                                 "check changed from {} to {}",
-                                model::store::check_in_words(&old),
-                                model::store::check_in_words(new)
+                                model::store::check_named(&old),
+                                model::store::check_named(new)
                             ),
                         };
                         let because = serde_json::from_str::<serde_json::Value>(&e.body)
@@ -3680,7 +3682,7 @@ pub fn report(
 
 /// The last line of `doctor --eval`: what it printed and what it left out, so a
 /// reader who needs another line knows it is one command away and not missing.
-pub const EVAL_FOOTER: &str = "doctor --eval: only the lines the evaluation routine asks for (ship, provable rules, gate, teeth, pinned, decay, crowding, judgement debt, contradictions); a line the store has nothing to say about is silent, as in the full report. For anything else - the store and chain line, command anchors, hook launch failures, refusal outcomes, open points, the evaluation clock - run doctor without --eval; that takes longer, so wait for it to end and do not quote it before it has finished";
+pub const EVAL_FOOTER: &str = "doctor --eval: only the lines the evaluation routine asks for (tool server and installed programs, when one is wrong; ship, provable rules, gate, teeth, pinned, decay, crowding, judgement debt, contradictions); a line the store has nothing to say about is silent, as in the full report. For anything else - the store and chain line, command anchors, hook launch failures, refusal outcomes, open points, the evaluation clock - run doctor without --eval; that takes longer, so wait for it to end and do not quote it before it has finished";
 
 /// The lines of `report` that the evaluation routine (`eval-command.example.md`)
 /// asks a reader to quote - `provable rules`, `gate`, `teeth`, `pinned`, `decay`,
@@ -6220,8 +6222,20 @@ mod tests {
             let mut elsewhere = moved.clone();
             elsewhere.check = Some(model::item::Check::Contains { path: "docs/B.md".to_string(), literal: "keep me".to_string() });
             store::revise_because(&mut s, "s", "l", "mcp", &moved, &elsewhere, &moved, Some("the file moved")).unwrap();
+            // The same file, another literal: the line names both literals.
+            let mut reworded = rule("reworded-here");
+            reworded.text = "The fixture keeps `keep me` or `keep it` in its notes.".to_string();
+            reworded.check = Some(model::item::Check::Contains { path: "docs/C.md".to_string(), literal: "keep me".to_string() });
+            legacy_declare(&mut s, &reworded);
+            let mut other = reworded.clone();
+            other.check = Some(model::item::Check::Contains { path: "docs/C.md".to_string(), literal: "keep it".to_string() });
+            store::revise_because(&mut s, "s", "l", "mcp", &reworded, &other, &reworded, Some("the other phrase is the one that matters")).unwrap();
         }
         let line = teeth_line(&db, true);
+        assert!(
+            line.contains("reworded-here - check changed from contains 'keep me' in docs/C.md to contains 'keep it' in docs/C.md at log seq"),
+            "{line}"
+        );
         assert!(
             line.contains("  check weakened: plan-here - check cleared (path_exists files/PLAN.md) at log seq 3 (because: the file is in a full anchor; door: mcp)"),
             "{line}"

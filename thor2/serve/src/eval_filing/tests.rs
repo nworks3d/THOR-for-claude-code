@@ -579,7 +579,7 @@ fn owner_queue_names_every_carrying_session() {
 
     let filed = valid_filing(&mut fx.store, &root, S3, &report("eval-fxp-3", "fxp", "TLDR three."), "toolu_f3");
     let text = model::store::show(&fx.store, "eval-fxp-3").unwrap().text;
-    assert!(text.contains(&format!("in the owner queue: the owner decides - carried by session {S1} on")), "{text}");
+    assert!(text.contains(&format!("in the owner queue: the owner decides - the last 2: session {} on", &S1[..8])), "{text}");
     assert_eq!(filed.carry[0].carried, 2);
 }
 
@@ -677,4 +677,75 @@ fn the_owner_queue_point_text_has_no_lost_line_break() {
     let point = model::store::open_points(&fx.store, Some("fxp")).pop().unwrap();
     assert!(point.text.contains("valid evaluation(s) were filed while this still held, and no agent can lift it."), "{}", point.text);
     assert!(!point.text.contains("  "), "{}", point.text);
+}
+
+// ------------------------------------------------------- version skew, before and after
+
+/// FIELD TEST 13, D1: a tool server that would write a dead report is refused
+/// BEFORE it writes, with the plain fix, by comparing the renderer revision it
+/// renders with against the one the installed checker prints.
+#[test]
+fn a_filing_the_installed_checker_could_not_count_is_refused_before_it_is_written() {
+    let own = model::gate::MACHINE_RENDERER_REV;
+    let same = serve_version(own);
+    assert_eq!(checker_skew_refusal(own, Some(&same)), None, "the same format: nothing to say");
+    let newer = checker_skew_refusal(own, Some(&serve_version(own + 1))).expect("a newer checker");
+    assert!(newer.starts_with("REFUSED: this tool server renders the evaluation machine section in format"), "{newer}");
+    assert!(newer.contains(&format!("format {own}")) && newer.contains(&format!("reads format {}", own + 1)), "{newer}");
+    assert!(newer.contains("Nothing was written") && newer.contains("restart Claude"), "{newer}");
+    assert!(newer.contains("end your turn") && newer.contains("DONE WHEN"), "{newer}");
+    assert!(checker_skew_refusal(own + 1, Some(&serve_version(own))).is_some(), "a tool server newer than the checker is skew too");
+    // Never a new way to block: a checker that cannot be run, or prints no revision, refuses nothing.
+    assert_eq!(checker_skew_refusal(own, None), None);
+    assert_eq!(checker_skew_refusal(own, Some("serve 2.5.0 (build 0123456789ab)\n")), None);
+    assert_eq!(checker_skew_refusal(own, Some("")), None);
+    let nowhere = tempfile::tempdir().unwrap();
+    assert_eq!(installed_checker_version(nowhere.path()), None, "no serve program beside it");
+}
+
+fn serve_version(revision: u32) -> String {
+    format!("serve 2.5.0 (build 0123456789ab, renderer {revision})\n")
+}
+
+/// A session whose filing was refused as version skew is told, in one line and
+/// without a hold, to restart; once its transcript shows it started again it is
+/// asked normally (D2).
+#[test]
+fn after_a_skew_the_session_is_told_to_restart_until_it_has_started_again() {
+    let mut fx = Fx::new();
+    let root = fx.root();
+    let start = crate::attest::fixture::quiet_start(&mut fx.store, S1, "fxp");
+    main_transcript(&root, S1).prompt_context(&crate::eval_session::start_note(&start)).write();
+    let (block, _) = machine_block_now(&fx, &start);
+    let current = format!("; renderer {}", model::gate::MACHINE_RENDERER_REV);
+    let skewed = block.replacen(&current, "; renderer 1", 1).replacen("JUDGEMENT: 0 item(s)", "JUDGEMENT: no items", 1);
+    let sent = report("eval-fxp-2026-09-28", "fxp", "TLDR: nothing to add.");
+    fx.filed_past(&sent, &format!("{skewed}{}", sent.text));
+    let written = fx.stop();
+    assert_eq!(written.len(), 1);
+    assert!(written[0].why.starts_with(model::store::SKEW_WHY), "{}", written[0].why);
+
+    assert_eq!(skew_awaiting_restart(&fx.store, "fxp", S1, None), None, "no transcripts folder: fail open");
+    assert_eq!(skew_awaiting_restart(&fx.store, "fxp", S2, Some(&root)), None, "another session's skew is not this one's");
+    assert_eq!(skew_awaiting_restart(&fx.store, "other", S1, Some(&root)), None, "another project");
+    let line = skew_awaiting_restart(&fx.store, "fxp", S1, Some(&root)).expect("not restarted yet");
+    assert!(line.contains("Restart Claude; the evaluation is asked again after the restart"), "{line}");
+    assert!(line.contains("eval-fxp-2026-09-28") && line.contains("does not hold the turn"), "{line}");
+
+    let filed = unix_of_timestamp(written[0].filed_at.as_deref().expect("the skewed filing has its time")).unwrap();
+    let session_start = |name: &str, at: i64| {
+        serde_json::json!({
+            "type": "attachment",
+            "attachment": {"type": "hook_success", "hookName": name, "hookEvent": "SessionStart", "exitCode": 0},
+            "timestamp": crate::time::iso8601_from_unix(at),
+            "sessionId": S1,
+        })
+        .to_string()
+    };
+    // A start BEFORE the filing, and a compaction after it, restart no tool server.
+    main_transcript(&root, S1).raw(&session_start("SessionStart:resume", filed - 3600)).raw(&session_start("SessionStart:compact", filed + 60)).write();
+    assert!(skew_awaiting_restart(&fx.store, "fxp", S1, Some(&root)).is_some(), "neither of those is a restart");
+    // A resume after it is.
+    main_transcript(&root, S1).raw(&session_start("SessionStart:resume", filed + 600)).write();
+    assert_eq!(skew_awaiting_restart(&fx.store, "fxp", S1, Some(&root)), None, "restarted: asked normally again");
 }

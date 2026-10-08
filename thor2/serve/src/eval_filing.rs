@@ -677,6 +677,124 @@ pub fn newest_invalid_report(store: &EventStore, project: Option<&str>) -> Optio
         .find_map(|(id, _, v)| v.filter(|v| !v.valid).map(|v| (id, why_in_words(store, &v))))
 }
 
+// ------------------------------------------------------- version skew, before and after
+
+/// THE REFUSAL OF A FILING THAT CANNOT COUNT (field test 13, D1). A tool server
+/// renders the machine section with its own build of the renderer; the
+/// checker (`serve.exe`, run by the Stop hook) compares it byte for byte with
+/// its own. When the two renderer revisions differ the report is on file but
+/// dead, and the only cure is a restart of Claude - which no one knew until
+/// the Stop refused it, a turn too late (four dead reports in two days).
+/// This is the check the tool server runs BEFORE it writes.
+///
+/// WHY THE RENDERER REVISION AND NOT THE BUILD ID. The build id differs for
+/// any change in core, model or serve, including ones that never touch the
+/// machine section, and a tool server (mcp.exe) that is simply not part of a
+/// partial install would then refuse every filing for good. The revision is
+/// the one number the checker compares, so it is the one refused on. It is
+/// read from the installed checker's own `--version` line (`serve::renderer_in`).
+///
+/// `checker_version`: the installed checker's `--version` output, `None` when
+/// it could not be run or prints no revision (an older program) - then
+/// nothing is refused: this is a courtesy ahead of the Stop, never a new way
+/// to block a filing.
+pub fn checker_skew_refusal(own_revision: u32, checker_version: Option<&str>) -> Option<String> {
+    let theirs = crate::renderer_in(checker_version?)?;
+    if theirs == own_revision {
+        return None;
+    }
+    Some(format!(
+        "REFUSED: this tool server renders the evaluation machine section in format {own_revision}, but the installed checker \
+         (serve.exe) reads format {theirs}, so a report filed now would be on file and would not count. Nothing was written. \
+         WHAT TO DO: tell the owner to restart Claude (the tool server loads only when Claude starts), and end your turn; the \
+         next end-of-turn ask starts the evaluation again and you file the report then. DONE WHEN: the owner restarted Claude \
+         and the ask came again. Do not retry the filing in this session: it would be refused the same way."
+    ))
+}
+
+/// `serve --version` of the checker installed beside `bin_dir`'s tool server,
+/// run without a window and given a few seconds. `None` when it is not there,
+/// cannot start or takes too long (the caller then refuses nothing).
+pub fn installed_checker_version(bin_dir: &Path) -> Option<String> {
+    use std::process::{Command, Stdio};
+    let exe = bin_dir.join(format!("serve{}", std::env::consts::EXE_SUFFIX));
+    if !exe.is_file() {
+        return None;
+    }
+    let mut command = Command::new(&exe);
+    command.arg("--version").stdout(Stdio::piped()).stderr(Stdio::null()).stdin(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let mut child = command.spawn().ok()?;
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait().ok()? {
+            Some(status) if status.success() => break,
+            Some(_) => return None,
+            None if started.elapsed() > std::time::Duration::from_secs(5) => {
+                let _ = child.kill();
+                return None;
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
+    let mut out = String::new();
+    std::io::Read::read_to_string(&mut child.stdout.take()?, &mut out).ok()?;
+    Some(out)
+}
+
+/// A report of `project` that THIS session filed was refused as version skew,
+/// and the session has not been restarted since (field test 13, D2). The Stop
+/// then must not start a fresh evaluation and hold the turn for it: the
+/// session's tool server is still the old build, so the second report would be
+/// dead the same way and the hold would leave no other way out. Returns the
+/// one plain line to say instead; `None` when there is no such report, when
+/// the session started again after it (a restart resumes the same session id,
+/// and its transcript holds a `SessionStart:startup` or `SessionStart:resume`
+/// record after the filing - then it is asked normally), or when its
+/// transcript cannot be read (fail open: the ask is never lost to a missing
+/// file).
+pub fn skew_awaiting_restart(store: &EventStore, project: &str, session: &str, root: Option<&Path>) -> Option<String> {
+    let valid_seq = newest_valid_evaluation(store, Some(project)).map_or(0, |v| v.report_seq);
+    let (id, skew) = reports_of_project(store, project)
+        .into_iter()
+        .filter(|(_, seq, _)| *seq > valid_seq)
+        .find_map(|(id, _, v)| v.filter(|v| !v.valid).map(|v| (id, v)))?;
+    if !skew.why.starts_with(model::store::SKEW_WHY) || skew.session != session {
+        return None;
+    }
+    let filed = skew.filed_at.as_deref().and_then(unix_of_timestamp)?;
+    let files = attest::session_transcripts(root?, session);
+    if files.is_empty() || restarted_after(&files, filed) {
+        return None;
+    }
+    Some(format!(
+        "[THOR] The report '{id}' is on file but does not count: this session's tool server is an older build than the \
+         checker. Restart Claude; the evaluation is asked again after the restart, and you file the report then. This \
+         Stop does not hold the turn."
+    ))
+}
+
+/// Whether any of `files` records the session starting (or resuming) after
+/// `after_unix`. A compaction restarts no tool server and does not count.
+fn restarted_after(files: &[PathBuf], after_unix: i64) -> bool {
+    files.iter().any(|file| {
+        let Ok(handle) = std::fs::File::open(file) else { return false };
+        BufReader::new(handle).lines().map_while(Result::ok).any(|line| {
+            if !line.contains("\"hookName\":\"SessionStart:") {
+                return false;
+            }
+            let Ok(record) = serde_json::from_str::<Value>(&line) else { return false };
+            let name = record.pointer("/attachment/hookName").and_then(Value::as_str).unwrap_or_default();
+            let at = record.get("timestamp").and_then(Value::as_str).and_then(unix_of_timestamp);
+            matches!(name, "SessionStart:startup" | "SessionStart:resume") && at.is_some_and(|at| at > after_unix)
+        })
+    })
+}
+
 /// WHETHER `project` SHOWS ROT, for the weekly cadence (step 17), from the log
 /// only: why it does, or `None` for a clean project. Rot is any of: no valid
 /// evaluation at all; the newest valid evaluation's start had anything to do

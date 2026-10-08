@@ -2174,3 +2174,69 @@ fn a_held_turn_is_held_again_at_most_four_times() {
     }
     assert_eq!(blocks, 5, "the first hold plus four re-holds, never more");
 }
+
+/// FIELD TEST 13, D2: after a filing of THIS session was refused as version
+/// skew, the Stop must not start a fresh evaluation and hold the turn for it
+/// (the second report would be dead the same way, and the hold left no other
+/// way out). It says one plain line instead, until the session's transcript
+/// shows it started again - then it is asked normally.
+#[test]
+fn after_a_skew_refusal_the_stop_says_restart_and_does_not_hold_until_the_session_restarted() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let sandbox = Sandbox::new();
+    let project_dir = sandbox.project_dir("thor-fixture");
+    let session = uuid(7);
+    let mut store = EventStore::new(&db).unwrap();
+    let report = serve::eval_filing::fixture::report("eval-thor-fixture-2026-10-08", "thor-fixture", "TLDR: all fine.");
+    let body = model::store::canonical_body(&report).unwrap();
+    let filing = store.append_event(&session, &session, "mcp", EventKind::FactCreated, &report.id, None, &body).unwrap();
+    let filed_at = serve::time::iso8601_from_unix(serve::time::now_unix() - 600);
+    let skew = model::store::EvaluationValidation {
+        valid: false,
+        why: format!("{}: its machine section was rendered by format 5, this checker reads format 7 - restart Claude", model::store::SKEW_WHY),
+        drift: false,
+        report: report.id.clone(),
+        report_seq: filing.seq,
+        project: Some("thor-fixture".to_string()),
+        session: session.clone(),
+        agent: None,
+        started_seq: None,
+        filed_seq: None,
+        filed_at: Some(filed_at.clone()),
+        machine_sha256: None,
+        verdicts: model::store::VerdictShares::default(),
+        carry: Vec::new(),
+    };
+    let record = serde_json::to_string(&skew).unwrap();
+    store.append_event(&session, &session, model::store::EVAL_VALIDATOR_ACTOR, EventKind::GateStoodAside, &report.id, None, &record).unwrap();
+    drop(store);
+    seed_session_work(&db, Some("thor-fixture"), &session, 90);
+    let transcript = transcripts(&sandbox).join("C--fixture").join(format!("{session}.jsonl"));
+    std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    let line = |name: &str, at: String| {
+        serde_json::json!({
+            "type": "attachment",
+            "attachment": {"type": "hook_success", "hookName": name, "hookEvent": "SessionStart", "exitCode": 0},
+            "timestamp": at,
+            "sessionId": session,
+        })
+        .to_string()
+    };
+    std::fs::write(&transcript, line("SessionStart:startup", serve::time::iso8601_from_unix(serve::time::now_unix() - 7200)) + "\n").unwrap();
+
+    let out = run_hook(&db, &stop_payload(&session, &project_dir), &sandbox);
+    assert!(!is_block(&out), "no hold while the tool server is the old build: {out}");
+    assert!(out.contains("Restart Claude; the evaluation is asked again after the restart"), "{out}");
+    let store = EventStore::open_existing(&db).unwrap();
+    assert!(model::store::evaluation_starts_of_session(&store, &session).is_empty(), "no fresh evaluation was started");
+    drop(store);
+
+    // The session starts again (Claude restarted, same session id): asked normally.
+    let mut file = std::fs::OpenOptions::new().append(true).open(&transcript).unwrap();
+    writeln!(file, "{}", line("SessionStart:resume", serve::time::iso8601_from_unix(serve::time::now_unix() - 60))).unwrap();
+    drop(file);
+    let out = run_hook(&db, &stop_payload(&session, &project_dir), &sandbox);
+    assert!(is_block(&out), "after the restart the ask holds the turn as usual: {out}");
+    assert!(out.contains("the report 'eval-thor-fixture-2026-10-08'") || out.contains("eval-thor-fixture-2026-10-08"), "{out}");
+}

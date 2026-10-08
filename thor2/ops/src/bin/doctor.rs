@@ -104,6 +104,16 @@ fn main() -> ExitCode {
     let checkouts = checkouts_root.as_path();
 
     println!("{}", ops::health::checkouts_root_line(&checkouts_root));
+    // THOR failing to run at all comes before the per-component lines, because
+    // nothing below can be trusted while it holds: a running tool server older
+    // than its program on disk (field test 5, D4) and installed programs built
+    // from different sources. Each is silent when there is nothing to say, so
+    // the fast `--eval` form prints them too (field test 13, D1): they are the
+    // two lines that predict a report that would be on file and dead.
+    if let Some(bin_dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(std::path::Path::to_path_buf)) {
+        let lines = [ops::health::stale_tool_server_line(&bin_dir), ops::health::version_skew_line(&bin_dir)];
+        lines.into_iter().flatten().for_each(|line| println!("{line}"));
+    }
     if cli.eval {
         // This checkout's own project, resolved exactly as the full report does
         // below, so the judgement debt line counts the same checkout.
@@ -114,15 +124,7 @@ fn main() -> ExitCode {
         println!("{}", ops::health::EVAL_FOOTER);
         return ExitCode::SUCCESS;
     }
-    // THOR failing to run at all comes before the per-component lines, because
-    // nothing below can be trusted while it holds: a running tool server older
-    // than its program on disk (field test 5, D4), installed programs built
-    // from different sources, and hooks Claude Code could not start. Each is
-    // silent when there is nothing to say.
-    if let Some(bin_dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(std::path::Path::to_path_buf)) {
-        let lines = [ops::health::stale_tool_server_line(&bin_dir), ops::health::version_skew_line(&bin_dir)];
-        lines.into_iter().flatten().for_each(|line| println!("{line}"));
-    }
+    // Hooks Claude Code could not start come right after, in the full report.
     if let Some(line) = ops::health::hook_failures_line(serve::time::now_unix()) {
         println!("{line}");
     }

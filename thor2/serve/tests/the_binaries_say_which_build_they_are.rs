@@ -25,4 +25,16 @@ fn the_build_id_is_read_back_from_a_version_line() {
     assert_eq!(serve::build_id_in("mcp 2.5.0\n"), None, "an older program prints no build id");
     assert_eq!(serve::build_id_in("serve 2.5.0 (build )"), None);
     assert_eq!(serve::build_id_in(""), None);
+    assert_eq!(serve::build_id_in("serve 2.5.0 (build 0123456789ab, renderer 7)\n"), Some("0123456789ab"), "the id ends at the comma");
+}
+
+/// The renderer revision rides on the same line, so a tool server can ask the
+/// installed checker which format it reads without opening any file.
+#[test]
+fn the_renderer_revision_is_read_back_from_a_version_line() {
+    assert_eq!(serve::renderer_in("serve 2.5.0 (build 0123456789ab, renderer 7)\n"), Some(7));
+    assert_eq!(serve::renderer_in("serve 2.5.0 (build 0123456789ab)\n"), None, "an older program prints none");
+    assert_eq!(serve::renderer_in("serve 2.5.0 (build 0123456789ab, renderer x)"), None);
+    assert_eq!(serve::renderer_in(""), None);
+    assert_eq!(serve::renderer_in(&serve::version_line("serve")), Some(model::gate::MACHINE_RENDERER_REV));
 }

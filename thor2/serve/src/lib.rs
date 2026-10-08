@@ -142,17 +142,28 @@ use thor_core::event_store::EventStore;
 /// from one tree carry one id, a program built before a change another.
 pub const BUILD_ID: &str = env!("THOR_BUILD_ID");
 
-/// What `--version` prints: `serve 2.5.0 (build 0123456789ab)`.
+/// What `--version` prints: `serve 2.5.0 (build 0123456789ab, renderer 7)`. The
+/// renderer revision (`model::gate::MACHINE_RENDERER_REV`) is the one number a
+/// filed evaluation report is checked against, so a tool server asked to file
+/// one can read it from the installed checker (`eval_filing::checker_skew_refusal`).
 pub fn version_line(program: &str) -> String {
-    format!("{program} {} (build {BUILD_ID})", env!("CARGO_PKG_VERSION"))
+    format!("{program} {} (build {BUILD_ID}, renderer {})", env!("CARGO_PKG_VERSION"), model::gate::MACHINE_RENDERER_REV)
 }
 
 /// The build id inside the output of some program's `--version`, or `None` for
 /// a program that prints none (one built before the id existed).
 pub fn build_id_in(version_output: &str) -> Option<&str> {
     let (_, rest) = version_output.split_once("(build ")?;
-    let id = rest.split(')').next()?.trim();
+    let id = rest.split([')', ',']).next()?.trim();
     (!id.is_empty()).then_some(id)
+}
+
+/// The machine-section renderer revision inside the output of some program's
+/// `--version`, or `None` for a program that prints none (one built before
+/// this was printed).
+pub fn renderer_in(version_output: &str) -> Option<u32> {
+    let (_, rest) = version_output.split_once(", renderer ")?;
+    rest.split(')').next()?.trim().parse().ok()
 }
 
 /// The whole read side of the one serving path, run once: select what

@@ -1582,6 +1582,32 @@ fn is_evaluation_report(item: &Item) -> bool {
     item.kind == Kind::Report && item.tags.iter().any(|t| t == model::store::EVALUATION_REPORT_TAG)
 }
 
+/// A FILING THE INSTALLED CHECKER COULD NOT COUNT, REFUSED BEFORE IT IS WRITTEN
+/// (field test 13, D1). A tool server renders the report's machine section in
+/// its own renderer revision, and the checker the Stop hook runs
+/// (`serve.exe`) compares it byte for byte with its own. When the two differ -
+/// this tool server was loaded before the programs were replaced and Claude
+/// has not restarted since - the report is on file and dead. `checker_version`
+/// reads the installed checker's `--version` line; nothing is refused when it
+/// cannot (`serve::eval_filing::checker_skew_refusal`). Only a NEW filing (a
+/// remember): a revise of a filed report keeps its machine block as it was.
+fn refuse_a_filing_the_checker_would_not_count(item: &Item, checker_version: impl FnOnce() -> Option<String>) -> Result<(), String> {
+    if !is_evaluation_report(item) {
+        return Ok(());
+    }
+    match serve::eval_filing::checker_skew_refusal(model::gate::MACHINE_RENDERER_REV, checker_version().as_deref()) {
+        Some(refusal) => Err(refusal),
+        None => Ok(()),
+    }
+}
+
+/// The installed checker's `--version` output, from the folder this tool
+/// server itself was started from (the installer puts every program there).
+fn installed_checker_version() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    serve::eval_filing::installed_checker_version(exe.parent()?)
+}
+
 /// The on-the-spot refusal of an evaluation report at a replica (F13).
 const REPLICA_EVALUATION_REFUSAL: &str = "REFUSED: an evaluation is filed on the main machine, in the session that \
 ran it - a replica cannot attest it. Nothing was queued: file the report from a session on the main machine.";
@@ -2596,6 +2622,7 @@ impl ThorMcpServer {
             refuse_an_open_point_tag(&args.tags, None)?;
             refuse_a_dispute_without_reason(args.because.as_deref(), &args.legitimate_calls, &args.may_change, &args.accept_refusing)?;
             let item = remembered_item(&args)?;
+            refuse_a_filing_the_checker_would_not_count(&item, installed_checker_version)?;
             refuse_a_worktree_only_check(
                 item.check.as_ref(),
                 root.as_deref().map(|p| p.as_path()),
@@ -4852,6 +4879,26 @@ mod tests {
 
         let events = srv.store.lock().unwrap().get_all_events().unwrap();
         assert!(events.is_empty(), "a refused remember must write nothing at all, found: {events:?}");
+    }
+
+    /// FIELD TEST 13, D1: a tool server older than the installed checker
+    /// refuses to FILE an evaluation report (it would be on file and dead),
+    /// before it writes, with the plain fix. Nothing else is touched.
+    #[test]
+    fn a_report_is_refused_when_the_installed_checker_reads_another_renderer_format() {
+        let mut report = remembered_item(&base_remember("eval-demo-2026-10-08")).unwrap();
+        report.kind = Kind::Report;
+        report.tags = vec![model::store::EVALUATION_REPORT_TAG.to_string()];
+        let newer = format!("serve 2.5.0 (build 0123456789ab, renderer {})\n", model::gate::MACHINE_RENDERER_REV + 1);
+        let refused = refuse_a_filing_the_checker_would_not_count(&report, || Some(newer.clone())).unwrap_err();
+        assert!(refused.starts_with("REFUSED: this tool server renders the evaluation machine section in format"), "{refused}");
+        assert!(refused.contains("restart Claude") && refused.contains("Nothing was written"), "{refused}");
+        let same = format!("serve 2.5.0 (build 0123456789ab, renderer {})\n", model::gate::MACHINE_RENDERER_REV);
+        assert!(refuse_a_filing_the_checker_would_not_count(&report, || Some(same.clone())).is_ok());
+        assert!(refuse_a_filing_the_checker_would_not_count(&report, || None).is_ok(), "no checker to ask: nothing refused");
+        // A report that is not an evaluation filing never even asks.
+        report.tags.clear();
+        assert!(refuse_a_filing_the_checker_would_not_count(&report, || panic!("asked for a plain report")).is_ok());
     }
 
     /// R14.4 (step 14): open points are written and closed by THOR itself. A
