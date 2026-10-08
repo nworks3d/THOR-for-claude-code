@@ -1524,9 +1524,10 @@ fn text_names_file(item: &Item, rel: &str) -> bool {
 /// reply can carry; `None` for any other check, or a literal that is also in
 /// code, or a file that cannot be read.
 ///
-/// Used at a WRITE only (a writer's own check, and a tooth built from the
-/// text), never at a retest: a rule already on the rule track is never
-/// demoted by this. Such a tooth guards nothing the rule is about - the
+/// Used at a WRITE (a writer's own check, and a tooth built from the text) and
+/// at a retest of a rule with no check (so a listed tooth is one the write gate
+/// accepts), never against a check a rule already carries: a rule already on
+/// the rule track is never demoted by this. Such a tooth guards nothing the rule is about - the
 /// behaviour can move or go while the remark stays - and it refuses a harmless
 /// comment cleanup. A rule that really is about comment text keeps a check by
 /// pointing it at a documentation file (a Markdown file is never read as
@@ -1643,10 +1644,17 @@ impl<'a> Work<'a> {
     fn forcing(&mut self, base: &Item, root: Option<&Path>, command_only: bool) -> Result<Vec<DerivedTrial>, Decision> {
         let text_root = if command_only { None } else { root };
         let mut teeth = derive(base, text_root);
-        // At a write, a contains tooth built from the text whose literal sits
-        // only in comments is not built: hanging it would be forced on the
-        // writer and then guard nothing (see `comment_only_contains`).
-        if let (Mode::Write, Some(root)) = (&self.mode, text_root) {
+        // A contains tooth built from the text whose literal sits only in
+        // comments is not built: hanging it would be forced on the writer and
+        // then guard nothing (see `comment_only_contains`). A retest of a rule
+        // that carries no check follows the write gate, or it would list a
+        // tooth the write gate then refuses (field test 13, D3); a rule already
+        // on the rule track is never demoted by it.
+        let filter_comments = match self.mode {
+            Mode::Write => true,
+            Mode::Retest => base.check.is_none(),
+        };
+        if let (true, Some(root)) = (filter_comments, text_root) {
             let mut kept = Vec::new();
             for d in teeth {
                 match comment_only_contains(&d.check, root).filter(|_| matches!(d.origin, Origin::Text(_))) {

@@ -773,7 +773,7 @@ fn a_contains_check_on_a_literal_only_in_comments_is_a_note_at_write_time() {
 /// The same literal as a tooth THOR derives from the text: it used to be
 /// forced on the writer ("hang it"), who hung it. Now no such tooth is built
 /// and the rule is a note saying why; a literal that is also in code still
-/// forces (the existing `package.json` case), and a retest is untouched.
+/// forces (the existing `package.json` case), and a retest agrees with the write gate.
 #[test]
 fn a_derived_contains_tooth_on_a_comment_only_literal_is_not_built_at_write_time() {
     let mut fx = Fx::new();
@@ -796,12 +796,19 @@ fn a_derived_contains_tooth_on_a_comment_only_literal_is_not_built_at_write_time
     assert_eq!(code, RefuseCode::Forcing);
     assert!(message.contains("contains 'spec phrase here' in tools/code.mjs"), "{message}");
 
-    // A retest is runtime: it still asks for the tooth, so no rule is silently changed.
+    // A retest of a rule with no check follows the write gate (field test 13,
+    // D3): it does not list a tooth the write gate would refuse, and says why.
     fx.legacy(&red);
-    match fx.retest("red").outcome {
-        Maintenance::NeedsAgent(_) => {}
-        other => panic!("a retest still forces the tooth: {other:?}"),
-    }
+    let retested = fx.retest("red");
+    assert!(!matches!(retested.outcome, Maintenance::NeedsAgent(_)), "no tooth the write gate refuses is offered: {:?}", retested.outcome);
+    assert!(
+        retested.lines.iter().any(|l| l.contains("was not built as a tooth") && l.contains("sits only in comments of tools/build.mjs")),
+        "{:?}",
+        retested.lines
+    );
+    // A literal that is also in code is still offered.
+    fx.legacy(&green);
+    assert!(matches!(fx.retest("green").outcome, Maintenance::NeedsAgent(_)));
 }
 
 /// Write time only, and only for a check that is new or changed: a revise that
