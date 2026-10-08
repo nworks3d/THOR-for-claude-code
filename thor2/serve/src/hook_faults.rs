@@ -291,6 +291,37 @@ mod tests {
 
     const NODE_HOOK: &str = "node C:/Users/someone/.claude/hooks/precommit-gate.js";
 
+    /// FIELD TEST 13, D8: three sleep failures recorded before THOR classified
+    /// them were listed as THOR's by three projects. A reader asks the
+    /// transcript again, with the rule used at record time.
+    #[test]
+    fn a_failure_recorded_before_the_classification_is_found_host_wide_by_a_later_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("C--Users-someone-dev-demo");
+        std::fs::create_dir_all(&project).unwrap();
+        let lines = [
+            failure_line_at(OURS, 66, "", "toolu-sleep", "2026-10-06T04:18:12.100Z"),
+            failure_line_at(NODE_HOOK, 66, "", "toolu-node", "2026-10-06T04:18:12.900Z"),
+            failure_line_at(OURS, 126, "", "toolu-thor", "2026-10-06T09:00:00.000Z"),
+        ];
+        std::fs::write(project.join(format!("{SESSION}.jsonl")), lines.join("\n") + "\n").unwrap();
+        let mut store = thor_core::event_store::EventStore::in_memory().unwrap();
+        // The legacy record: no host_wide mark, as the build before the classification wrote it.
+        let entity = model::store::hook_fault_entity(SESSION);
+        for (id, exit, at) in [("toolu-sleep", 66, "2026-10-06T04:18:12.100Z"), ("toolu-thor", 126, "2026-10-06T09:00:00.000Z")] {
+            let body = serde_json::json!({"hook_fault": {"tool_use_id": id, "hook_event": "PreToolUse", "exit_code": exit, "at": at}});
+            let kind = thor_core::event_store::EventKind::GateStoodAside;
+            store.append_event(SESSION, SESSION, model::store::ATTESTER_ACTOR, kind, &entity, None, &body.to_string()).unwrap();
+        }
+        let until = store.get_next_seq().unwrap() - 1;
+        let found = crate::attest::host_wide_recorded_faults(&store, 0, until, Some(dir.path()));
+        assert_eq!(found.into_iter().collect::<Vec<_>>(), ["toolu-sleep".to_string()], "the lone failure stays THOR's");
+        assert!(crate::attest::host_wide_recorded_faults(&store, 0, until, None).is_empty(), "no transcripts folder: as recorded");
+        assert!(crate::attest::host_wide_recorded_faults(&store, until, until, Some(dir.path())).is_empty(), "outside the window");
+        let gone = tempfile::tempdir().unwrap();
+        assert!(crate::attest::host_wide_recorded_faults(&store, 0, until, Some(gone.path())).is_empty(), "transcript gone: as recorded");
+    }
+
     fn host_wide_of(lines: &[String]) -> Vec<(String, bool)> {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join(format!("{SESSION}.jsonl"));

@@ -6661,12 +6661,21 @@ pub fn hook_faults_in(events: &[Event]) -> Vec<HookFault> {
 /// hook failures recorded and the filings refused as version skew, both from
 /// the log's own records so the evaluating session cannot edit them.
 fn health_line(window: &[Event]) -> String {
-    format!("\n{}", health_facts(window, "in the window").sentence)
+    format!("\n{}", health_facts(window, "in the window", &HashSet::new()).sentence)
 }
 
 /// A session id as a line shows it: its first eight characters.
 fn short_session(session: &str) -> String {
     plain(session).chars().take(8).collect()
+}
+
+/// A fault's transcript timestamp as a line shows it: to the second, in UTC.
+fn fault_time(at: &str) -> String {
+    let flat = plain(at);
+    match flat.get(..19) {
+        Some(seconds) => format!("{seconds}Z"),
+        None => flat,
+    }
 }
 
 /// At most five names, then how many more.
@@ -6682,8 +6691,11 @@ fn names_capped(names: Vec<String>) -> String {
 
 /// THOR's own health in `window`, read from the log's records: the hook
 /// launch failures the attester recorded (each named by the hook event, its
-/// exit code and the session whose hook failed) and the filings the validator
-/// refused as version skew (each named by the report and the session).
+/// exit code, the session whose hook failed and the time of the failure) and
+/// the filings the validator refused as version skew (each named by the report
+/// and the session). `host_wide_ids`: the tool call ids of recorded failures
+/// that the transcript, re-read now, shows to have been the machine going to
+/// sleep (a record written before THOR classified them says nothing).
 struct HealthFacts {
     hook_failures: usize,
     host_wide_failures: usize,
@@ -6691,15 +6703,21 @@ struct HealthFacts {
     sentence: String,
 }
 
-fn health_facts(window: &[Event], place: &str) -> HealthFacts {
+fn health_facts(window: &[Event], place: &str, host_wide_ids: &HashSet<String>) -> HealthFacts {
     let (host_wide, faults): (Vec<(bool, String)>, Vec<(bool, String)>) = window
         .iter()
         .filter(|e| e.kind == EventKind::GateStoodAside && e.actor == ATTESTER_ACTOR)
         .filter_map(|e| {
             let body = serde_json::from_str::<serde_json::Value>(&e.body).ok()?;
             let fault = serde_json::from_value::<HookFault>(body.get("hook_fault")?.clone()).ok()?;
-            let name = format!("{}, exit {}, session {}", plain(&fault.hook_event), fault.exit_code, short_session(&e.session_id));
-            Some((fault.host_wide, name))
+            let name = format!(
+                "{}, exit {}, session {}, at {}",
+                plain(&fault.hook_event),
+                fault.exit_code,
+                short_session(&e.session_id),
+                fault_time(&fault.at)
+            );
+            Some((fault.host_wide || host_wide_ids.contains(&fault.tool_use_id), name))
         })
         .partition(|(host_wide, _)| *host_wide);
     let faults: Vec<String> = faults.into_iter().map(|(_, name)| name).collect();
@@ -6901,12 +6919,12 @@ struct RefusalOutcomes {
 }
 
 /// The real refusals the hook made in `window` (the same ones the REFUSED
-/// line calls verified, the evaluating session's own calls left out) and what
-/// became of each refusing rule before the log position `log` reads to.
-fn refusal_outcomes(log: &LogAt, window: &[Event], session: &str) -> RefusalOutcomes {
+/// line calls verified; `except_session`'s own calls left out when given) and
+/// what became of each refusing rule before the log position `log` reads to.
+fn refusal_outcomes(log: &LogAt, window: &[Event], except_session: Option<&str>) -> RefusalOutcomes {
     let in_window: HashSet<i64> = window
         .iter()
-        .filter(|e| e.kind == EventKind::GateRefused && e.actor == ASSISTANT_DELIVERY_ACTOR && e.session_id != session)
+        .filter(|e| e.kind == EventKind::GateRefused && e.actor == ASSISTANT_DELIVERY_ACTOR && Some(e.session_id.as_str()) != except_session)
         .map(|e| e.seq)
         .collect();
     let rules: std::collections::BTreeSet<&str> =
@@ -6945,19 +6963,29 @@ fn refusal_outcomes(log: &LogAt, window: &[Event], session: &str) -> RefusalOutc
 }
 
 /// The summary sentence of REFUSAL OUTCOMES for `place` ("in the window").
-fn refusal_outcomes_sentence(o: &RefusalOutcomes, place: &str) -> String {
+fn refusal_outcomes_sentence(o: &RefusalOutcomes, place: &str, whose: &str) -> String {
     if o.verified == 0 {
-        return format!("REFUSAL OUTCOMES {place}: no verified refusal {place} to follow.");
+        return format!("REFUSAL OUTCOMES {place}: no verified refusal {place} to follow. {whose}");
     }
     format!(
         "REFUSAL OUTCOMES {place}: {} verified refusal(s), {} followed by a weakening or retract of the \
          refusing rule (probable false blocks), {}. A proxy read from the log: a rule can change for other reasons, and it \
-         feeds no ranking and no gate.",
+         feeds no ranking and no gate. {whose}",
         o.verified,
         o.probable,
         crate::refusal_outcome::rate_words(o.probable, o.verified)
     )
 }
+
+/// Whose refusals a REFUSAL OUTCOMES line counts: the start note's line covers
+/// the whole span since the previous report, the evaluating session's own
+/// verified refusals included.
+const REFUSALS_OF_EVERY_SESSION: &str = "Refusals of every session count, yours included.";
+
+/// The machine section's line covers the evaluation itself, where a call the
+/// evaluating session made proves nothing (see REFUSED).
+const REFUSALS_OF_OTHER_SESSIONS: &str =
+    "Other sessions' refusals only: the evaluating session's own calls inside its evaluation are not counted here.";
 
 /// The lines under REFUSAL OUTCOMES: each probable false block, at most
 /// `FALSE_BLOCKS_LISTED`, then how many more there are.
@@ -7005,20 +7033,31 @@ pub struct SignalsSoFar {
 }
 
 /// `SignalsSoFar` for the events after log seq `prev_report_seq` (the project's
-/// previous report, 0 for none) up to `started_seq`, judged from `session`'s
-/// side: its own refused calls are left out, as in the machine section.
-pub fn signals_so_far(store: &EventStore, session: &str, prev_report_seq: i64, started_seq: i64) -> SignalsSoFar {
+/// previous report, 0 for none) up to `started_seq`. Every session's refused
+/// calls count, the evaluating session's own included (all of it is on the log
+/// before the start); the machine section leaves that session's out for the
+/// evaluation itself. `host_wide_ids`: see `health_facts`.
+pub fn signals_so_far(
+    store: &EventStore,
+    prev_report_seq: i64,
+    started_seq: i64,
+    host_wide_ids: &HashSet<String>,
+) -> SignalsSoFar {
     let window: Vec<Event> =
         store.events_since(prev_report_seq).unwrap_or_default().into_iter().filter(|e| e.seq <= started_seq).collect();
-    let health = health_facts(&window, "since the previous report");
+    let health = health_facts(&window, "since the previous report", host_wide_ids);
     let log = LogAt::new(store, started_seq);
-    let outcomes = refusal_outcomes(&log, &window, session);
+    // Before the start, the evaluating session's own verified refusals count:
+    // they are on the log already and cannot be provoked for the report. Only
+    // inside the evaluation itself are they proof of nothing (the machine
+    // section).
+    let outcomes = refusal_outcomes(&log, &window, None);
     SignalsSoFar {
         health: health.sentence,
         hook_failures: health.hook_failures,
         host_wide_failures: health.host_wide_failures,
         skew_events: health.skew_events,
-        refusals: refusal_outcomes_sentence(&outcomes, "since the previous report"),
+        refusals: refusal_outcomes_sentence(&outcomes, "since the previous report", REFUSALS_OF_EVERY_SESSION),
         false_blocks_more: outcomes.blocks.len().saturating_sub(FALSE_BLOCKS_LISTED),
         false_blocks: outcomes.blocks.into_iter().take(FALSE_BLOCKS_LISTED).collect(),
     }
@@ -7349,14 +7388,17 @@ fn machine_section(store: &EventStore, start: &EvaluationStart, filed_seq: i64) 
         let carried = carriers.len();
         let queue = match carried {
             0 => String::new(),
-            _ => format!(" - in the owner queue: the owner decides - carried by {}", carriers_in_words(&carriers)),
+            _ => format!(" - in the owner queue: the owner decides - {}", carriers_last(&carriers)),
+        };
+        let holds = match point.rules.len() {
+            0 => "no rule this start's pass tried (it kept the point because its blocker still holds; doctor lists the rules)".to_string(),
+            n => format!("{n} rule(s)"),
         };
         out.push_str(&format!(
-            "\n- '{}' about '{}' ({}): holds {} rule(s); carried by {carried} valid evaluation(s){queue}",
+            "\n- '{}' about '{}' ({}): holds {holds}; carried by {carried} valid evaluation(s){queue}",
             plain(&point.id),
             plain(&point.blocker.subject),
-            plain(&point.blocker.code),
-            point.rules.len()
+            plain(&point.blocker.code)
         ));
     }
     if !legacy.is_empty() {
@@ -7488,8 +7530,12 @@ fn refused_rules_named(rules: &std::collections::BTreeMap<String, usize>) -> Str
 /// F, by a weakening or retract of the refusing rule - a probable false
 /// block (`crate::refusal_outcome`). Derived from the log, never typed.
 fn refusal_outcomes_line(log: &LogAt, window: &[Event], session: &str) -> String {
-    let outcomes = refusal_outcomes(log, window, session);
-    format!("\n{}{}", refusal_outcomes_sentence(&outcomes, "in the window"), false_block_lines(&outcomes.blocks))
+    let outcomes = refusal_outcomes(log, window, Some(session));
+    format!(
+        "\n{}{}",
+        refusal_outcomes_sentence(&outcomes, "in the window", REFUSALS_OF_OTHER_SESSIONS),
+        false_block_lines(&outcomes.blocks)
+    )
 }
 
 /// The actor that records a filing's validation (step 16).
@@ -7705,12 +7751,18 @@ pub const CARRIERS_NAMED: usize = 3;
 /// `CARRIERS_NAMED` of them by the first eight characters of their session and
 /// their date. The whole list stays in the point's own text (`get`).
 pub fn carriers_compact(carriers: &[Carrier]) -> String {
+    format!("carried by {} valid evaluation(s), {}", carriers.len(), carriers_last(carriers))
+}
+
+/// "the last 3: session S1 on 2026-10-01, S2 on 2026-10-02" - the machine
+/// section's owner-queue line gives the count itself and names only these.
+fn carriers_last(carriers: &[Carrier]) -> String {
     let one = |c: &Carrier| {
         let date = c.filed_at.get(..10).unwrap_or(c.filed_at.as_str());
         format!("{} on {}", short_session(&c.session), plain(date))
     };
     let last: Vec<String> = carriers.iter().rev().take(CARRIERS_NAMED).rev().map(one).collect();
-    format!("carried by {} valid evaluation(s), the last {}: session {}", carriers.len(), last.len(), last.join(", "))
+    format!("the last {}: session {}", last.len(), last.join(", "))
 }
 
 /// How many of THOR's own open points of one project may wait on the owner
@@ -10477,7 +10529,7 @@ mod tests {
         let filed = file_in(&mut store, &eval_report("eval-q-2", "q"), &second).expect("an owner-queue point holds no filing");
         let text = show(&store, "eval-q-2").unwrap().text;
         assert!(
-            text.contains(&format!("'{point_id}' about 'q' (no-working-copy): holds 1 rule(s); carried by 1 valid evaluation(s) - in the owner queue: the owner decides - carried by session s1 on 2026-09-29")),
+            text.contains(&format!("'{point_id}' about 'q' (no-working-copy): holds 1 rule(s); carried by 1 valid evaluation(s) - in the owner queue: the owner decides - the last 1: session s1 on 2026-09-29")),
             "{text}"
         );
         assert!(filed.seq > second.seq);
@@ -11354,10 +11406,10 @@ mod tests {
         // After the start: never in the window.
         assert!(record_hook_fault(&mut store, "other-session", attester, &hook_fault("later")).unwrap().is_some());
 
-        let signals = signals_so_far(&store, "mp-session", prev_report_seq, started_seq);
+        let signals = signals_so_far(&store, prev_report_seq, started_seq, &HashSet::new());
         assert_eq!(
             signals.health,
-            "THOR health since the previous report: 1 hook launch failure(s) (SessionStart, exit 126, session other-se), 0 version-skew event(s)."
+            "THOR health since the previous report: 1 hook launch failure(s) (SessionStart, exit 126, session other-se, at 2026-10-06T22:29:00Z), 0 version-skew event(s)."
         );
         assert_eq!((signals.hook_failures, signals.skew_events), (1, 0));
         assert!(signals.refusals.starts_with("REFUSAL OUTCOMES since the previous report: 2 verified refusal(s), 2 followed by"), "{}", signals.refusals);
@@ -11683,8 +11735,9 @@ mod tests {
         let section = render_machine_section(&store, &start, filed_seq);
         assert!(
             section.contains(
-                "\nTHOR health in the window: 2 hook launch failure(s) (SessionStart, exit 126, session mp-sessi; SessionStart, \
-                 exit 126, session other-se), 1 version-skew event(s) (report 'eval-mp-a', session mp-sessi).\n"
+                "\nTHOR health in the window: 2 hook launch failure(s) (SessionStart, exit 126, session mp-sessi, at 2026-10-06T22:29:00Z; \
+                 SessionStart, exit 126, session other-se, at 2026-10-06T22:29:00Z), 1 version-skew event(s) (report 'eval-mp-a', \
+                 session mp-sessi).\n"
             ),
             "the health line names each failure's hook event and session: {section}"
         );
@@ -11717,18 +11770,22 @@ mod tests {
         assert!(
             section.contains(&format!(
                 "\nTHOR health in the window: 0 hook launch failure(s), 0 version-skew event(s); also 1 hook(s) {HOST_WIDE_WORDS} \
-                 (PreToolUse, exit 66, session mp-sessi).\n"
+                 (PreToolUse, exit 66, session mp-sessi, at 2026-10-06T22:29:00Z).\n"
             )),
             "{section}"
         );
-        let signals = signals_so_far(&store, "mp-session", 0, filed_seq);
+        let signals = signals_so_far(&store, 0, filed_seq, &HashSet::new());
         assert_eq!((signals.hook_failures, signals.host_wide_failures, signals.skew_events), (0, 1, 0));
 
         // Mixed: the THOR failure is still counted, on its own.
         assert!(record_hook_fault(&mut store, "mp-session", attester, &hook_fault("real")).unwrap().is_some());
-        let signals = signals_so_far(&store, "mp-session", 0, store.get_next_seq().unwrap() - 1);
+        let signals = signals_so_far(&store, 0, store.get_next_seq().unwrap() - 1, &HashSet::new());
         assert_eq!((signals.hook_failures, signals.host_wide_failures), (1, 1));
-        assert!(signals.health.contains("1 hook launch failure(s) (SessionStart, exit 126, session mp-sessi), 0 version-skew"), "{}", signals.health);
+        assert!(
+            signals.health.contains("1 hook launch failure(s) (SessionStart, exit 126, session mp-sessi, at 2026-10-06T22:29:00Z), 0 version-skew"),
+            "{}",
+            signals.health
+        );
 
         // A record written before the field existed reads as a THOR failure.
         let old: HookFault = serde_json::from_str(
@@ -11737,6 +11794,104 @@ mod tests {
         .unwrap();
         assert!(!old.host_wide);
         assert!(!serde_json::to_string(&old).unwrap().contains("host_wide"), "a THOR failure is written as it always was");
+    }
+
+    /// FIELD TEST 13, D8: a failure recorded before THOR classified them
+    /// carries no host-wide mark; a reader that re-read the transcript hands
+    /// the tool call ids it found, and the start note says them apart.
+    #[test]
+    fn a_failure_the_transcript_shows_to_be_host_wide_is_said_apart_at_read_time() {
+        let mut store = EventStore::in_memory().unwrap();
+        let attester = SystemActor::new(ATTESTER_ACTOR);
+        for id in ["legacy-sleep", "legacy-real"] {
+            assert!(record_hook_fault(&mut store, "mp-session", attester, &hook_fault(id)).unwrap().is_some());
+        }
+        let tip = store.get_next_seq().unwrap() - 1;
+        let ids: HashSet<String> = ["legacy-sleep".to_string()].into_iter().collect();
+        let signals = signals_so_far(&store, 0, tip, &ids);
+        assert_eq!((signals.hook_failures, signals.host_wide_failures), (1, 1));
+        assert!(signals.health.contains(HOST_WIDE_WORDS), "{}", signals.health);
+        let without = signals_so_far(&store, 0, tip, &HashSet::new());
+        assert_eq!((without.hook_failures, without.host_wide_failures), (2, 0), "no transcript: as recorded");
+    }
+
+    /// FIELD TEST 13, D7: before the start, the evaluating session's own
+    /// verified refusals count (they are on the log and cannot be provoked for
+    /// the report); inside the evaluation they do not, and each line says whose
+    /// refusals it counts.
+    #[test]
+    fn the_start_notes_refusal_outcomes_include_the_evaluating_sessions_own_refusals() {
+        let mut store = EventStore::in_memory().unwrap();
+        let mut item = checked_sample();
+        item.id = "own-rule".to_string();
+        item.project = Some("mp".to_string());
+        item.text = "The file files/own.md keeps the line `keep me` and nothing else.".to_string();
+        item.bindings = vec![Binding::Target { kind: crate::item::TargetKind::Path, value: "files/own.md".to_string() }];
+        item.check = Some(Check::Contains { path: "files/own.md".to_string(), literal: "keep me".to_string() });
+        item.tags.clear();
+        declare(&mut store, "mp-session", "l", "test", &item).unwrap();
+        let body = r#"{"at":"2026-10-01T00:00:00Z","target":"files/x.md","tool_use_id":"toolu_1"}"#;
+        let seq = store.append_event("mp-session", "mp-session", "hook", EventKind::GateRefused, "own-rule", None, body).unwrap().seq;
+        record_refusal_verification(&mut store, "mp-session", SystemActor::new(ATTESTER_ACTOR), "own-rule", seq, true, "fixture").unwrap();
+        let started_seq = store.get_next_seq().unwrap() - 1;
+
+        let signals = signals_so_far(&store, 0, started_seq, &HashSet::new());
+        assert!(signals.refusals.starts_with("REFUSAL OUTCOMES since the previous report: 1 verified refusal(s), 0 followed by"), "{}", signals.refusals);
+        assert!(signals.refusals.ends_with("Refusals of every session count, yours included."), "{}", signals.refusals);
+
+        let start = record_start(&mut store, "mp-session", "mp");
+        let own_inside = store.append_event("mp-session", "mp-session", "hook", EventKind::GateRefused, "own-rule", None, body).unwrap().seq;
+        record_refusal_verification(&mut store, "mp-session", SystemActor::new(ATTESTER_ACTOR), "own-rule", own_inside, true, "fixture").unwrap();
+        let filed_seq = store.get_next_seq().unwrap() - 1;
+        let section = render_machine_section(&store, &start, filed_seq);
+        let line = section.lines().find(|l| l.starts_with("REFUSAL OUTCOMES in the window:")).expect("the line");
+        assert!(line.starts_with("REFUSAL OUTCOMES in the window: no verified refusal in the window to follow."), "{line}");
+        assert!(line.ends_with("Other sessions' refusals only: the evaluating session's own calls inside its evaluation are not counted here."), "{line}");
+    }
+
+    /// FIELD TEST 13, D5 and D9: a point kept because its blocker still holds,
+    /// whose rules the pass did not reach, does not read "holds 0 rule(s)"; and
+    /// a long owner queue is a count plus the last three sessions.
+    #[test]
+    fn a_kept_point_and_a_long_owner_queue_read_true_and_short_in_the_machine_section() {
+        let mut store = EventStore::in_memory().unwrap();
+        let machine = SystemActor::new(EVAL_MACHINE_ACTOR);
+        let blocker = Blocker::NoWorkingCopy { project: "q".to_string() };
+        let point_id = machine_point_id("q", &blocker);
+        write_machine_point(&mut store, machine, "s1", "q", &blocker, "fixture point: no working copy of q").unwrap();
+        let validator = SystemActor::new(EVAL_VALIDATOR_ACTOR);
+        for n in 1..=5 {
+            let validation = EvaluationValidation {
+                valid: true,
+                why: String::new(),
+                drift: false,
+                report: format!("eval-q-{n}"),
+                report_seq: n,
+                project: Some("q".to_string()),
+                session: format!("carrier{n}-aaaa"),
+                agent: None,
+                started_seq: None,
+                filed_seq: None,
+                filed_at: Some(format!("2026-09-0{n}T10:00:00Z")),
+                machine_sha256: None,
+                verdicts: VerdictShares::default(),
+                carry: vec![CarryEntry { subject: "q".to_string(), carried: 0, session: format!("carrier{n}-aaaa"), agent: None }],
+            };
+            assert!(record_evaluation_validation(&mut store, validator, &validation).unwrap().is_some());
+        }
+        let pass = MachinePass {
+            points: vec![MachinePoint { id: point_id.clone(), blocker: MachineBlocker::of(&blocker), rules: Vec::new(), carried_by: Vec::new() }],
+            ..MachinePass::default()
+        };
+        let first = record_start_only(&mut store, "s1", "q");
+        let started = record_evaluation_batch(&mut store, machine, &first, "fixture, decided", vec![], 0, vec![], pass).unwrap();
+        let filed_seq = store.get_next_seq().unwrap() - 1;
+        let section = render_machine_section(&store, &started, filed_seq);
+        let line = section.lines().find(|l| l.contains(&format!("'{point_id}' about 'q'"))).expect("the point line");
+        assert!(!line.contains("holds 0 rule(s)"), "{line}");
+        assert!(line.contains("holds no rule this start's pass tried"), "{line}");
+        assert!(!line.contains("carrier1") && !line.contains("carrier2"), "only the last three are named: {line}");
+        assert!(line.contains("the last 3: session carrier3 on 2026-09-03, carrier4 on 2026-09-04, carrier5 on 2026-09-05"), "{line}");
     }
 
     /// G15.2: two quiet evaluations - nothing on any list, the same one-line

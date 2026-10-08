@@ -979,6 +979,35 @@ pub fn record_hook_faults_in(store: &mut EventStore, session: &str, root: Option
     recorded
 }
 
+/// The tool call ids of the hook failures recorded between log seq
+/// `since_seq` (exclusive) and `until_seq` that the transcript, read again now,
+/// shows to have been the machine going to sleep or shutting down
+/// (`hook_faults::faults_in_file`, the rule used when a failure is recorded).
+/// A failure recorded before THOR classified them carries no such mark, so a
+/// reader that names failures asks here instead of listing it as THOR's. A
+/// transcript that is gone says nothing: the failure stays as recorded.
+pub fn host_wide_recorded_faults(store: &EventStore, since_seq: i64, until_seq: i64, root: Option<&Path>) -> HashSet<String> {
+    let Some(root) = root else { return HashSet::new() };
+    let mut unclassified: HashMap<String, HashSet<String>> = HashMap::new();
+    let recorded = store.events_of_kinds(&[EventKind::GateStoodAside], since_seq).unwrap_or_default();
+    for event in recorded.iter().filter(|e| e.seq <= until_seq && e.actor == ATTESTER_ACTOR) {
+        for fault in model::store::hook_faults_in(std::slice::from_ref(event)).into_iter().filter(|f| !f.host_wide) {
+            unclassified.entry(event.session_id.clone()).or_default().insert(fault.tool_use_id);
+        }
+    }
+    let mut host_wide = HashSet::new();
+    for (session, ids) in &unclassified {
+        for file in session_transcripts(root, session) {
+            for found in crate::hook_faults::faults_in_file(&file) {
+                if found.fault.host_wide && ids.contains(&found.fault.tool_use_id) {
+                    host_wide.insert(found.fault.tool_use_id);
+                }
+            }
+        }
+    }
+    host_wide
+}
+
 /// Verify every unverified write of `session` against its transcripts under
 /// `root`, recording each verdict under `recorder`'s name. With
 /// `positive_only` (`attest_finished_writes`): only the attested answers are

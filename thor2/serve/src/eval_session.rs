@@ -1047,11 +1047,19 @@ pub fn machine_pass(store: &mut EventStore, project: &str, start: &EvaluationSta
 
     // THOR'S HEALTH AND THE REFUSAL OUTCOMES known at the start, frozen here so
     // the start note shows them and the agent can act before it files.
-    machine.signals = Some(model::store::signals_so_far(
+    // A failure recorded before THOR classified them is asked of its
+    // transcript again, so a sleep is not listed as THOR's.
+    let host_wide = crate::attest::host_wide_recorded_faults(
         store,
-        &start.frozen.session,
         start.frozen.prev_report_seq,
         start.frozen.started_seq,
+        crate::attest::transcripts_root().as_deref(),
+    );
+    machine.signals = Some(model::store::signals_so_far(
+        store,
+        start.frozen.prev_report_seq,
+        start.frozen.started_seq,
+        &host_wide,
     ));
 
     let of = |outcome: MachineOutcome| -> Vec<String> {
@@ -1383,8 +1391,7 @@ fn disputes_section(out: &mut String, record: &str, machine: &MachinePass, caps:
          built from the rule's own words is wrong here, so the rule is a note that can never refuse anything; an audit \
          on 2026-10-07 found 7 of 11 such disputes wrong. WHAT TO DO, per rule: open it (mcp__thor__get) and the file or \
          command it is about. If the disputed literal IS what the rule is about, or a better check exists: call 1 (hang \
-         that check). If it is only an incidental span: call 2 (confirm it with your own reason; one shorter than {min} \
-         characters is refused). WHEN AN ITEM IS DONE: THOR accepted the call (it shows rule or note for call 1, \
+         that check). If it is only an incidental span: call 2 (confirm it with a reason naming what you read; one shorter than {min} characters is refused). WHEN AN ITEM IS DONE: THOR accepted the call (it shows rule or note for call 1, \
          'revised' for call 2). Retracting the rule with a reason also settles an item, only for a rule that is simply \
          wrong; a tag, a note or a line in the report settles nothing, and the report is held until every item is done. EXAMPLE: 'the sensor \
          delay is in microseconds' disputed on the word 'delay': its subject is 'microseconds', so call 1 with \
@@ -1459,8 +1466,8 @@ fn host_wide_words(count: usize, alongside: bool) -> String {
 fn signals_section(out: &mut String, record: &str, signals: &model::store::SignalsSoFar, caps: &Caps) {
     out.push_str(
         "\n\n3. SIGNALS BEFORE YOU FILE - two signals THOR read from its log, from the previous report up to this start \
-         (refusals no session verified at its Stop yet are not counted). The machine section in the reply to your filing \
-         records them again for this evaluation's own window: act on these now, read that section for anything new.",
+         (refusals not yet verified at a Stop are not counted). The machine section in the reply to your filing \
+         records them again for this evaluation's own window.",
     );
     out.push_str(&format!("\n   a. {}", signals.health));
     if signals.hook_failures == 0 && signals.skew_events == 0 && signals.host_wide_failures == 0 {
@@ -1474,9 +1481,11 @@ fn signals_section(out: &mut String, record: &str, signals: &model::store::Signa
              server that wrote it was built from another THOR than the checker (that report is on file but does not \
              count). WHAT TO DO: put both numbers, the hook events and the sessions in your report and tell the owner in \
              your summary - after a skew, to restart Claude (the next end-of-turn ask then files a new report); after a \
-             launch failure, that the named hook needs his attention. You cannot restart or repair anything. DONE WHEN: \
-             the report holds them and the owner was told. EXAMPLE: \"THOR health: 1 hook launch failure (PreToolUse, exit \
-             126, session 0de7dc52) - the owner should look at that hook; 0 version-skew events.\"",
+             launch failure, that the named hook needs his attention (exit 66 with no output next to a sleep is the \
+             machine: say so, not a broken hook). You cannot restart or repair anything. \
+             DONE WHEN: the report holds them and the owner was told. EXAMPLE: \"THOR health: 1 hook launch failure \
+             (PreToolUse, exit 126, session 0de7dc52, at 2026-10-06T04:18:30Z) - the owner should look at that hook; 0 \
+             version-skew events.\"",
         );
         if signals.host_wide_failures > 0 {
             out.push_str(&host_wide_words(signals.host_wide_failures, true));
@@ -1506,9 +1515,8 @@ fn signals_section(out: &mut String, record: &str, signals: &model::store::Signa
     out.push_str(&format!(
         "\n      WHAT THIS MEANS: a refusal counts as a PROBABLE false block when someone other than THOR then retracted the \
          refusing rule or weakened it (cleared or changed its check, lowered its severity, dropped a binding) - a proxy, \
-         not a verdict. WHAT TO DO, per rule: run its Read call (the history shows the refused call and the change after \
-         it), then decide from that call and the file or command the rule is about whether the refused call was \
-         legitimate. If it WAS, the weakening was right: write in the report the rule id, the refused call and why. If it \
+         not a verdict. WHAT TO DO, per rule: run its Read call, then decide from the refused call and the \
+         file or command the rule is about whether it was legitimate. If it WAS, the weakening was right: write in the report the rule id, the refused call and why. If it \
          was NOT, put the rule back with the restore call under it and your own reason of {}+ characters in because (a \
          retracted rule comes back under a NEW id tagged with the old one). If you cannot tell, say so and restore \
          nothing. DONE WHEN: every rule listed has one of those outcomes in your report, and a restore was answered rule \

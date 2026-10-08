@@ -977,7 +977,7 @@ fn the_start_note_shows_health_and_refusal_outcomes_known_so_far_with_their_call
     let note = start_note(&start);
     let section = &note[note.find("\n\n3. SIGNALS BEFORE YOU FILE").expect(&note)..];
     assert!(
-        section.contains("\n   a. THOR health since the previous report: 1 hook launch failure(s) (PreToolUse, exit 126, session 373e8610), 0 version-skew event(s)."),
+        section.contains("\n   a. THOR health since the previous report: 1 hook launch failure(s) (PreToolUse, exit 126, session 373e8610, at 2026-10-07T09:12:00Z), 0 version-skew event(s)."),
         "{section}"
     );
     assert!(
@@ -1567,7 +1567,8 @@ const BUSY_ID: &str = "evaluation-start-demo-500";
 #[test]
 fn a_busy_start_note_shows_every_section_the_session_acts_on_within_the_hook_limit() {
     let frozen = busy_frozen(1, 0, 4, 1, 25, 0);
-    assert!(render_start_note(BUSY_ID, &frozen).len() <= START_NOTE_BUDGET, "this state is the live one: whole, uncut");
+    let whole = render_start_note(BUSY_ID, &frozen);
+    assert!(whole.len() <= START_NOTE_BUDGET, "this state is the live one: whole, uncut ({} bytes)", whole.len());
     let note = render_start_note_within(BUSY_ID, &frozen, START_NOTE_BUDGET);
     assert!(note.len() <= START_NOTE_BUDGET, "{} bytes: {note}", note.len());
     assert!(note.len() < crate::session_start::HOOK_OUTPUT_LIMIT_BYTES, "{} bytes", note.len());

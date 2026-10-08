@@ -1922,7 +1922,10 @@ impl<'a> Work<'a> {
             );
         }
         if base.check.is_none() && gate::teeth_reason_tag(base).is_some() {
-            message.push_str(" A no-literal reason no longer stands in for a tooth that works.");
+            message.push_str(
+                " A no-literal reason no longer stands in for a tooth that works. Send the tags without that no-literal tag \
+                 in the same revise as the check, or THOR refuses it (a check that refuses and a no-literal tag contradict).",
+            );
         }
         message
     }
