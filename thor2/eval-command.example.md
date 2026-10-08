@@ -251,11 +251,12 @@ Judge each item by WHERE it fired, never by its text alone. Under every item
 the start note shows where it fired in this session - how often, and its last
 places (the command or file); `mcp__thor__get(id: "<id>", fired: true)` shows
 an item's recent firings. With a list of more than about 50 items, build a
-firing map FIRST: one pass over this session's transcript (a subagent may read
-it) that says, per id, on which call it fired - then judge. Never get-then-mark
-blocks of items without looking where they fired: measured 2026-10-01, one
-session gave 205 verdicts in four minutes that way, and three were provably
-wrong.
+firing map FIRST: one pass over this session's transcript (a subagent may only
+READ it, to build the map) that says, per id, on which call it fired - then
+judge. Every verdict, THOR call and filing stays the session's own. Never
+get-then-mark blocks of items without looking where they fired: measured
+2026-10-01, one session gave 205 verdicts in four minutes that way, and three
+were provably wrong.
 
 Every item on your list gets one of two answers. A verdict, given with the
 THOR tool itself: useful if it belonged where it fired, noise if it did not.
@@ -345,10 +346,16 @@ handle only what the start note handed you under TEETH:
   written now and answers rule, note, or what is still missing. A bare
   `mcp__thor__revise(id: "<id>")` changes nothing a trial reads, so it settles
   nothing: THOR answers it "NOTHING WAS SETTLED, '<id>' IS STILL OWED" and
-  prints the line's exits again. A DEMOTION line prints its own two exits,
-  described next. The report cannot be filed until every rule of the batch is
-  settled, and the gate counts what is left. Rules that did not fit stay owed
-  and lead the next evaluation. To look at the file or command a rule is about,
+  prints the line's exits again. A `no-literal:` tag answers nothing: when a
+  batch line names a rule that carries one, send `tags` without that tag in the
+  same `revise` as the check ("Send the tags without that no-literal tag in the
+  same revise as the check", as THOR words it), or THOR refuses the call because
+  a check that refuses and a no-literal tag contradict. A `revise` that hangs a
+  check and sends no `tags` at all has the tag dropped by `revise` itself, and
+  the reply says so. A DEMOTION line prints its own two exits, described next.
+  The report cannot be filed until every rule of the batch is settled, and the
+  gate counts what is left. Rules that did not fit stay owed and lead the next
+  evaluation. To look at the file or command a rule is about,
   use `Read`, `Grep` and `Glob` (they are allowed here); never a shell.
 - **The A4 list**: at most sixteen rules whose check bites and whose text only
   has to name the check's literal. Reword the text so it names that literal,
@@ -369,7 +376,9 @@ handle only what the start note handed you under TEETH:
   If it is, or a better check exists, make call 1: a `revise` that rewords the
   text so it names the real subject and hangs the check (for a disputed span
   of a file the line names the rule's file in `check_path`). If it is only an
-  incidental span, make call 2: `mcp__thor__revise(id: "<id>", because: "<why
+  incidental span (the plain test: the span may change while the rule's own
+  claim stays true, like a version number written next to the rule's real
+  subject), make call 2: `mcp__thor__revise(id: "<id>", because: "<why
   the span may change while the rule stays true, at least twenty
   characters>")` - THOR refuses a reason shorter than that, and a filler such
   as "ok" settles nothing. Say in the reason which file or call you read and
@@ -708,13 +717,17 @@ This is the signal that counts here, not a mark.
   hooks failed while the machine was going to sleep or shutting down - not THOR,
   nothing to do". A failure recorded before THOR classified them is looked up in
   the session transcript again when the start note is made, so it is already
-  marked "not THOR" whenever the transcript still holds the sleep. If one still
-  counts as a launch failure and its time (each failure names it) sits next to a
-  sleep, a shutdown or a reboot of the machine, and its exit code is 66 with no
-  output, it is probably the machine: say so in the report and do not tell the
-  owner a hook is broken. WHEN IT IS DONE: the report says "probably the
-  machine" for it, with the time. EXAMPLE: "PreToolUse exit 66 at
-  2026-10-06T04:18:30Z, the PC went to sleep at 04:18: probably the machine".
+  marked "not THOR" whenever the transcript still holds the sleep. THOR does
+  this sorting itself, never you: a failure counts as "not THOR" when a hook of
+  another program failed in the same transcript within two seconds of it with
+  the same exit code. So a failure still listed as a THOR launch failure was
+  not matched: report it as listed. Add "possibly the machine" only when its time
+  (each failure names it) is within a minute of another hook failure with the
+  same exit code in the same session (exit 66 with no output is the usual
+  look of a suspend); otherwise tell the owner the hook needs attention.
+  WHEN IT IS DONE: the report says "possibly the machine" for it, with the
+  time. EXAMPLE: "PreToolUse exit 66 at 2026-10-06T04:18:30Z, another hook
+  failed with exit 66 at 04:18:50: possibly the machine".
 - Did the gate refuse one of your OWN write actions (`remember`/`revise`)?
   That is not an annoyance but a signal about the shape of the store. Name
   the reason.
@@ -945,9 +958,13 @@ MEANS: a report filed now would be refused as version skew (see THOR health
 above) and be a dead report. WHAT TO DO: do not file; tell the owner in your
 summary to restart Claude (and to run the installer again for `installed
 programs:`), and end the turn. The next end-of-turn ask files the report.
-DONE WHEN: the summary says so and no report was filed. EXAMPLE: the output
-holds "tool server: 1 running mcp.exe process(es) started before mcp.exe was
-replaced" -> summary: "the tool server is stale; restart Claude, then the
+STEPS 1 TO 8 STAY: you still do them all, and the verdicts, batch calls and
+other THOR calls you make are written and count; only the filing is withheld.
+With no report filed, the summary for the owner goes in your chat reply. The
+installer is not a command you can name here: say "the owner re-runs the THOR
+installer". DONE WHEN: the summary says so and no report was filed. EXAMPLE:
+the output holds "tool server: 1 running mcp.exe process(es) started before
+mcp.exe was replaced" -> summary: "the tool server is stale; restart Claude, then the
 evaluation is asked again; I filed nothing". When neither line is printed,
 nothing is wrong and you file as usual.
 
