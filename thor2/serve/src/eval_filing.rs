@@ -759,13 +759,14 @@ pub fn installed_checker_version(bin_dir: &Path) -> Option<String> {
 /// file).
 pub fn skew_awaiting_restart(store: &EventStore, project: &str, session: &str, root: Option<&Path>) -> Option<String> {
     let valid_seq = newest_valid_evaluation(store, Some(project)).map_or(0, |v| v.report_seq);
+    // THIS session's newest skew-refused report: another session's newer dead
+    // report of the project must not hide it (field test 14, H1).
     let (id, skew) = reports_of_project(store, project)
         .into_iter()
         .filter(|(_, seq, _)| *seq > valid_seq)
-        .find_map(|(id, _, v)| v.filter(|v| !v.valid).map(|v| (id, v)))?;
-    if !skew.why.starts_with(model::store::SKEW_WHY) || skew.session != session {
-        return None;
-    }
+        .find_map(|(id, _, v)| {
+            v.filter(|v| !v.valid && v.session == session && v.why.starts_with(model::store::SKEW_WHY)).map(|v| (id, v))
+        })?;
     let filed = skew.filed_at.as_deref().and_then(unix_of_timestamp)?;
     let files = attest::session_transcripts(root?, session);
     if files.is_empty() || restarted_after(&files, filed) {
@@ -776,6 +777,54 @@ pub fn skew_awaiting_restart(store: &EventStore, project: &str, session: &str, r
          checker. Restart Claude; the evaluation is asked again after the restart, and you file the report then. This \
          Stop does not hold the turn."
     ))
+}
+
+/// THIS SESSION'S TOOL SERVER IS OLDER THAN THE INSTALLED ONE (field test 14,
+/// H1): the session's last `SessionStart:startup` or `SessionStart:resume` in
+/// its transcript is older than the modification time of the installed tool
+/// server (`mcp_exe`). A tool server loads only when Claude starts, so a
+/// report filed now would be built by the old program and would be dead; the
+/// Stop must not ask for it nor hold the turn for it. Returns the one plain
+/// line to say instead. `None` (fail open: the ask is never lost) when the
+/// installed program or its time cannot be read, when the transcript is
+/// missing or records no start, or when the session started after the install.
+pub fn tool_server_stale(session: &str, root: Option<&Path>, mcp_exe: Option<&Path>) -> Option<String> {
+    let installed = std::fs::metadata(mcp_exe?).ok()?.modified().ok()?;
+    let installed = installed.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64;
+    let files = attest::session_transcripts(root?, session);
+    let started = last_session_start(&files)?;
+    if started >= installed {
+        return None;
+    }
+    Some(format!(
+        "[THOR] This session's tool server is older than the installed one (the session started at {}, the tool server \
+         was replaced at {}). A report filed now would be on file and would not count. Restart Claude; the evaluation is \
+         asked again after the restart, and you file the report then. This Stop does not hold the turn.",
+        crate::time::iso8601_from_unix(started),
+        crate::time::iso8601_from_unix(installed)
+    ))
+}
+
+/// The newest `SessionStart:startup` or `SessionStart:resume` time (unix
+/// seconds) recorded in `files`; a compaction restarts no tool server.
+fn last_session_start(files: &[PathBuf]) -> Option<i64> {
+    files
+        .iter()
+        .filter_map(|file| std::fs::File::open(file).ok())
+        .flat_map(|handle| {
+            BufReader::new(handle).lines().map_while(Result::ok).filter_map(|line| {
+                if !line.contains("\"hookName\":\"SessionStart:") {
+                    return None;
+                }
+                let record = serde_json::from_str::<Value>(&line).ok()?;
+                let name = record.pointer("/attachment/hookName").and_then(Value::as_str)?;
+                if !matches!(name, "SessionStart:startup" | "SessionStart:resume") {
+                    return None;
+                }
+                record.get("timestamp").and_then(Value::as_str).and_then(unix_of_timestamp)
+            })
+        })
+        .max()
 }
 
 /// Whether any of `files` records the session starting (or resuming) after

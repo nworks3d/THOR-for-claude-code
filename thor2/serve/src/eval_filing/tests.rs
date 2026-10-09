@@ -749,3 +749,91 @@ fn after_a_skew_the_session_is_told_to_restart_until_it_has_started_again() {
     main_transcript(&root, S1).raw(&session_start("SessionStart:resume", filed + 600)).write();
     assert_eq!(skew_awaiting_restart(&fx.store, "fxp", S1, Some(&root)), None, "restarted: asked normally again");
 }
+
+/// Another session's NEWER dead report of the project must not hide this
+/// session's own skew-refused one (field test 14, H1): the session is still
+/// told to restart, not asked and held again.
+#[test]
+fn another_sessions_newer_dead_report_does_not_hide_this_sessions_skew() {
+    let mut fx = Fx::new();
+    let root = fx.root();
+    let start = crate::attest::fixture::quiet_start(&mut fx.store, S1, "fxp");
+    main_transcript(&root, S1).prompt_context(&crate::eval_session::start_note(&start)).write();
+    let (block, _) = machine_block_now(&fx, &start);
+    let current = format!("; renderer {}", model::gate::MACHINE_RENDERER_REV);
+    let skewed = block.replacen(&current, "; renderer 1", 1).replacen("JUDGEMENT: 0 item(s)", "JUDGEMENT: no items", 1);
+    let sent = report("eval-fxp-2026-09-28", "fxp", "TLDR: nothing to add.");
+    fx.filed_past(&sent, &format!("{skewed}{}", sent.text));
+    let mine = fx.stop();
+    assert!(mine[0].why.starts_with(model::store::SKEW_WHY), "{}", mine[0].why);
+
+    // The other session files a newer report that does not count either.
+    let theirs = report("eval-fxp-2026-09-29", "fxp", "TLDR: also nothing.");
+    filed_past_the_gate(&mut fx, S2, &theirs, &theirs.text, "toolu_s2");
+    crate::attest::record_write_verifications_in(&mut fx.store, S2, Some(&root));
+    let written = validate_new_reports(&mut fx.store, Some(&root), S2);
+    assert_eq!(written.len(), 1, "{written:?}");
+    assert!(!written[0].valid && !written[0].why.starts_with(model::store::SKEW_WHY), "{}", written[0].why);
+    let newest = newest_invalid_report(&fx.store, Some("fxp")).expect("an invalid report");
+    assert_eq!(newest.0, "eval-fxp-2026-09-29", "the other session's report is the project's newest dead one");
+
+    let line = skew_awaiting_restart(&fx.store, "fxp", S1, Some(&root)).expect("S1 is still told to restart");
+    assert!(line.contains("eval-fxp-2026-09-28"), "names its own report: {line}");
+    assert_eq!(skew_awaiting_restart(&fx.store, "fxp", S2, Some(&root)), None, "S2 has no skew of its own");
+}
+
+/// A `SessionStart:<how>` record of a session transcript at unix time `at`.
+fn session_start_line(how: &str, at: i64, session: &str) -> String {
+    serde_json::json!({
+        "type": "attachment",
+        "attachment": {"type": "hook_success", "hookName": format!("SessionStart:{how}"), "hookEvent": "SessionStart", "exitCode": 0},
+        "timestamp": crate::time::iso8601_from_unix(at),
+        "sessionId": session,
+    })
+    .to_string()
+}
+
+/// An installed tool server file whose modification time is `at`.
+fn mcp_installed_at(dir: &Path, at: i64) -> PathBuf {
+    let path = dir.join("mcp.exe");
+    std::fs::write(&path, b"mcp").unwrap();
+    let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    file.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(at as u64)).unwrap();
+    path
+}
+
+/// A session that started before the tool server was replaced is told to
+/// restart, with no hold; one that started after it is asked normally; and
+/// every unreadable case fails open (field test 14, H1).
+#[test]
+fn a_session_older_than_the_installed_tool_server_is_told_to_restart_and_a_fresh_one_is_not() {
+    let fx = Fx::new();
+    let root = fx.root();
+    let now = crate::time::now_unix();
+    let installed = now - 3600;
+    let mcp = mcp_installed_at(fx.dir.path(), installed);
+
+    // Started two hours ago: older than the install an hour ago.
+    main_transcript(&root, S1).raw(&session_start_line("startup", now - 7200, S1)).write();
+    let line = tool_server_stale(S1, Some(&root), Some(&mcp)).expect("older than the installed tool server");
+    assert!(line.contains("Restart Claude; the evaluation is asked again after the restart"), "{line}");
+    assert!(line.contains("does not hold the turn"), "{line}");
+
+    // Its LAST start counts, and a compaction is no start.
+    main_transcript(&root, S1).raw(&session_start_line("compact", now - 60, S1)).write();
+    assert!(tool_server_stale(S1, Some(&root), Some(&mcp)).is_some(), "a compaction restarts no tool server");
+    main_transcript(&root, S1).raw(&session_start_line("resume", now - 1800, S1)).write();
+    assert_eq!(tool_server_stale(S1, Some(&root), Some(&mcp)), None, "resumed after the install: asked normally");
+
+    // A fresh session (started after the install) is asked normally.
+    main_transcript(&root, S2).raw(&session_start_line("startup", now - 600, S2)).write();
+    assert_eq!(tool_server_stale(S2, Some(&root), Some(&mcp)), None);
+
+    // Fail open: no transcript, no start record, no tool server, no folder.
+    assert_eq!(tool_server_stale(S3, Some(&root), Some(&mcp)), None, "no transcript");
+    main_transcript(&root, S3).prompt_context("nothing about a start").write();
+    assert_eq!(tool_server_stale(S3, Some(&root), Some(&mcp)), None, "no start record");
+    assert_eq!(tool_server_stale(S1, Some(&root), Some(&fx.dir.path().join("missing.exe"))), None, "no tool server");
+    assert_eq!(tool_server_stale(S1, None, Some(&mcp)), None, "no transcripts folder");
+    assert_eq!(tool_server_stale(S1, Some(&root), None), None, "no tool server path");
+}

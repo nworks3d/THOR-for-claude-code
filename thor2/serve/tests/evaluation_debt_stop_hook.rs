@@ -157,8 +157,28 @@ impl Sandbox {
     }
 }
 
+/// The hook binary, run from a folder of its own with no tool server (`mcp`)
+/// beside it. Run in place it would find the `mcp` the workspace build leaves
+/// next to it and, as the stale-tool-server check compares a session's start
+/// with that file's age, a session start written seconds ago could look older
+/// than a build finished a minute ago (field test 14, H1).
+fn isolated_serve() -> &'static Path {
+    static COPY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    COPY.get_or_init(|| {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("isolated-serve");
+        std::fs::create_dir_all(&dir).unwrap();
+        let copy = dir.join(format!("serve{}", std::env::consts::EXE_SUFFIX));
+        let original = env!("CARGO_BIN_EXE_serve");
+        let _ = std::fs::remove_file(&copy);
+        if std::fs::hard_link(original, &copy).is_err() {
+            std::fs::copy(original, &copy).unwrap();
+        }
+        copy
+    })
+}
+
 fn run_hook(db: &Path, payload: &str, sandbox: &Sandbox) -> String {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_serve"));
+    let mut cmd = Command::new(isolated_serve());
     cmd.arg("--db").arg(db).arg("hook").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     sandbox.apply(&mut cmd);
     let mut child = cmd.spawn().expect("spawn serve");
@@ -2239,4 +2259,89 @@ fn after_a_skew_refusal_the_stop_says_restart_and_does_not_hold_until_the_sessio
     let out = run_hook(&db, &stop_payload(&session, &project_dir), &sandbox);
     assert!(is_block(&out), "after the restart the ask holds the turn as usual: {out}");
     assert!(out.contains("the report 'eval-thor-fixture-2026-10-08'") || out.contains("eval-thor-fixture-2026-10-08"), "{out}");
+}
+
+/// FIELD TEST 14, H1: a session whose last start is older than the installed
+/// tool server (`mcp` beside the checker) is told to restart, in one line,
+/// before any dead report exists - and is not asked nor held. A session that
+/// started after the install is asked as usual. The checker is a copy of the
+/// real binary in a folder of its own, beside a fake `mcp` of a chosen age.
+#[test]
+fn a_session_older_than_the_installed_tool_server_is_told_to_restart_and_a_fresh_one_is_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let sandbox = Sandbox::new();
+    let project_dir = sandbox.project_dir("thor-fixture");
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let serve_copy = bin.join(format!("serve{}", std::env::consts::EXE_SUFFIX));
+    std::fs::copy(env!("CARGO_BIN_EXE_serve"), &serve_copy).unwrap();
+    let mcp = bin.join(format!("mcp{}", std::env::consts::EXE_SUFFIX));
+    std::fs::write(&mcp, b"fake tool server").unwrap();
+    let now = serve::time::now_unix();
+    let installed = now - 3600;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&mcp)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(installed as u64))
+        .unwrap();
+    let run = |payload: &str| {
+        let mut cmd = Command::new(&serve_copy);
+        cmd.arg("--db").arg(&db).arg("hook").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        sandbox.apply(&mut cmd);
+        let mut child = cmd.spawn().expect("spawn the serve copy");
+        let _ = child.stdin.take().unwrap().write_all(payload.as_bytes());
+        let out = child.wait_with_output().expect("wait serve");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    drop(EventStore::new(&db).unwrap());
+    let start_line = |session: &str, at: i64| {
+        serde_json::json!({
+            "type": "attachment",
+            "attachment": {"type": "hook_success", "hookName": "SessionStart:startup", "hookEvent": "SessionStart", "exitCode": 0},
+            "timestamp": serve::time::iso8601_from_unix(at),
+            "sessionId": session,
+        })
+        .to_string()
+    };
+    let write_transcript = |session: &str, at: i64| {
+        let path = transcripts(&sandbox).join("C--fixture").join(format!("{session}.jsonl"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, start_line(session, at) + "\n").unwrap();
+    };
+
+    // Started two hours ago, the tool server was replaced an hour ago.
+    let old = uuid(81);
+    write_transcript(&old, now - 7200);
+    seed_session_work(&db, Some("thor-fixture"), &old, 90);
+    let out = run(&stop_payload(&old, &project_dir));
+    assert!(!is_block(&out), "no ask and no hold for a stale tool server: {out}");
+    assert!(out.contains("Restart Claude; the evaluation is asked again after the restart"), "{out}");
+    let store = EventStore::open_existing(&db).unwrap();
+    assert!(model::store::evaluation_starts_of_session(&store, &old).is_empty(), "no evaluation was started");
+    drop(store);
+
+    // Started after the install: asked and held as usual.
+    let fresh = uuid(82);
+    write_transcript(&fresh, now - 600);
+    seed_session_work(&db, Some("thor-fixture"), &fresh, 90);
+    let out = run(&stop_payload(&fresh, &project_dir));
+    assert!(is_block(&out), "a session started after the install is held normally: {out}");
+
+    // The tool server is replaced while that evaluation is open: the retry of
+    // the held turn is no longer held, it is told to restart.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&mcp)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(now as u64))
+        .unwrap();
+    {
+        let mut store = EventStore::new(&db).unwrap();
+        served_in(&mut store, "thor-fixture", &fresh, 0);
+    }
+    let out = run(&retry_stop_payload(&fresh, &project_dir));
+    assert!(!is_block(&out), "an open evaluation is not held for once the tool server is older: {out}");
+    assert!(out.contains("Restart Claude; the evaluation is asked again after the restart"), "{out}");
 }

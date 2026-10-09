@@ -525,6 +525,14 @@ fn sibling(name: &str) -> Option<PathBuf> {
     Some(dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX)))
 }
 
+/// The one line to say instead of an evaluation ask or hold when this
+/// session's tool server is older than the installed one (field test 14, H1).
+/// The installed tool server is the `mcp` program beside this checker.
+fn stale_tool_server_line(session_id: &str) -> Option<String> {
+    let mcp = sibling("mcp");
+    serve::eval_filing::tool_server_stale(session_id, serve::attest::transcripts_root().as_deref(), mcp.as_deref())
+}
+
 fn decay_notice(store: &EventStore, db: &Path, cwd: Option<&Path>) -> Option<String> {
     let root = project::git_root(cwd?)?;
     let project = project::resolve_project(&root)?;
@@ -3199,6 +3207,11 @@ fn evaluation_after_a_hold(db_path: &Path, session_id: &str, payload: &Value) ->
     };
     if let Some(start) = open.first() {
         let project = &start.frozen.project;
+        // A session whose tool server is older than the installed one cannot
+        // file a report that counts: no hold for it (field test 14, H1).
+        if let Some(line) = stale_tool_server_line(session_id) {
+            return Some(quiet(line, None));
+        }
         if !may_hold {
             return Some(quiet(format!(
                 "[THOR] The evaluation of '{project}' ('{}') is still open and its report is not filed. This Stop does not \
@@ -3389,6 +3402,13 @@ fn eval_stop_ask(
                 // D2): its tool server is still the old build, so a fresh
                 // evaluation would end in a second dead report and the hold
                 // would leave no other way out. One plain line, no hold.
+                // The same for a session that started before the installed tool
+                // server was replaced (field test 14, H1): no dead report is
+                // needed first, and no ask is made.
+                if let Some(line) = stale_tool_server_line(session_id) {
+                    elsewhere.get_or_insert(line);
+                    continue;
+                }
                 let root = serve::attest::transcripts_root();
                 if let Some(line) = serve::eval_filing::skew_awaiting_restart(store, &project, session_id, root.as_deref()) {
                     elsewhere.get_or_insert(line);
