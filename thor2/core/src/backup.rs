@@ -118,6 +118,12 @@ fn remote_names(repo: &Path) -> Vec<String> {
     git_text(repo, &["remote"]).map(|t| t.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect()).unwrap_or_default()
 }
 
+/// Whether the repository has any remote at all. None is a deliberate local
+/// copy (`install --set-backup local`).
+pub fn has_remotes(repo: &Path) -> bool {
+    !remote_names(repo).is_empty()
+}
+
 /// Where `remote` points (its fetch address), for messages and for the doctor.
 pub fn remote_url(repo: &Path, remote: &str) -> Option<String> {
     git_text(repo, &["remote", "get-url", remote]).filter(|u| !u.is_empty())
@@ -300,7 +306,12 @@ fn backup_inner(
     let n = export_segments(store, &out_dir, sizes.segment_bytes)?;
     // sync with the shared repo (other backups push here too), then stage ours only
     let pathspec = format!("{subdir}/");
-    git(repo, &["pull", "--rebase", "--autostash", &remote, &branch])?;
+    // A repository with no remote at all is a deliberate local copy: there is
+    // nothing to sync with and nothing to push to.
+    let local_only = remote_names(repo).is_empty();
+    if !local_only {
+        git(repo, &["pull", "--rebase", "--autostash", &remote, &branch])?;
+    }
     git(repo, &["add", &pathspec])?;
     // nothing changed? do not make an empty commit
     let clean = Command::new("git").arg("-C").arg(repo)
@@ -309,6 +320,9 @@ fn backup_inner(
         return Ok(prefix(format!("no change since last backup ({n} events) - nothing to commit")));
     }
     git(repo, &["commit", "-m", &format!("{subdir} backup ({n} events)")])?;
+    if local_only {
+        return Ok(prefix(format!("committed {subdir} local backup ({n} events); no remote, so nothing left this machine")));
+    }
     git(repo, &["push", &remote, &branch])?;
     Ok(prefix(format!("pushed {subdir} backup ({n} events)")))
 }
@@ -993,6 +1007,30 @@ mod tests {
             "with no origin at all, the debounce must still work from local history alone: {out}"
         );
         assert!(!out.contains("had not reached the remote"));
+    }
+
+    /// A backup repository with NO remote at all is a deliberate local copy
+    /// (`install --set-backup local`): it commits and says so, and neither
+    /// pulls nor pushes. A repository that has any remote still pulls and
+    /// pushes as before, so a typo'd remote name never turns into a silent
+    /// local-only backup.
+    #[test]
+    fn a_repository_with_no_remote_is_a_local_copy_that_commits_and_never_pushes() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        git_ok(dir.path(), &["init", "-b", "main", work.to_str().unwrap()]);
+        git_ok(&work, &["config", "user.email", "test@example.invalid"]);
+        git_ok(&work, &["config", "user.name", "Test"]);
+
+        let mut store = EventStore::in_memory().unwrap();
+        seed(&mut store);
+        let out = backup_to_repo(&store, &work, "thor2", true).unwrap();
+        assert!(out.contains("local backup") && out.contains("no remote"), "{out}");
+        let log = git_text(&work, &["log", "--oneline"]).unwrap();
+        assert_eq!(log.lines().count(), 1, "one commit holds the export: {log}");
+
+        let again = backup_to_repo(&store, &work, "thor2", true).unwrap();
+        assert!(again.contains("nothing to commit"), "{again}");
     }
 
     /// THE DEFECT STEP 2c CLOSES: every upstream check here used to be

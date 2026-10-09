@@ -140,6 +140,182 @@ struct Cli {
         conflicts_with_all = ["project", "settings", "mcp_json", "no_mcp", "serve_exe", "mcp_exe", "code_index_root", "register_root", "set_mode", "set_plan"]
     )]
     set_weekly_check: Option<String>,
+
+    /// Set ONLY the backup of the memory, and nothing else: `local` (a git
+    /// folder beside the memory, nothing leaves this machine), a place you name
+    /// (a folder on a NAS or another computer, or a private repository address),
+    /// or `off` (removes just the hook that runs the backup; copies already made
+    /// stay). A fresh install wires NO backup: nothing is backed up until you
+    /// choose here. It runs the backup once to prove it works. Needs --db.
+    #[arg(
+        long = "set-backup",
+        value_name = "local|PLACE|off",
+        conflicts_with_all = ["project", "mcp_json", "no_mcp", "serve_exe", "mcp_exe", "code_index_root", "register_root", "set_mode", "set_plan", "set_weekly_check", "set_recording", "topic"]
+    )]
+    set_backup: Option<String>,
+
+    /// Set ONLY whether THOR keeps the record of real tool calls and replies
+    /// (`on` or `off`), and nothing else. The record stays on this machine,
+    /// redacted, and lets THOR find rules that would wrongly block you. `off`
+    /// stops all new recording and the sweep then says it has no data. Needs --db.
+    #[arg(
+        long = "set-recording",
+        value_name = "on|off",
+        conflicts_with_all = ["project", "settings", "mcp_json", "no_mcp", "serve_exe", "mcp_exe", "code_index_root", "register_root", "set_mode", "set_plan", "set_weekly_check", "set_backup", "topic"]
+    )]
+    set_recording: Option<String>,
+}
+
+/// `install --set-recording on|off`: write the switch and nothing else.
+fn set_recording_only(db: Option<PathBuf>, word: &str) -> ExitCode {
+    let on = match word {
+        "on" => true,
+        "off" => false,
+        other => {
+            eprintln!("recording is 'on' or 'off', not '{other}'. Example: install --set-recording off --db <your memory>");
+            return ExitCode::from(2);
+        }
+    };
+    let Some(db) = db else {
+        eprintln!("name the memory to set this for: install --set-recording {word} --db <your memory>");
+        return ExitCode::from(2);
+    };
+    if !db.is_file() {
+        eprintln!(
+            "REFUSED: there is no memory at {} - check the path given with --db (the one your assistant's hooks name). Nothing was changed.",
+            db.display()
+        );
+        return ExitCode::FAILURE;
+    }
+    match serve::plan::set_recording(&db, on) {
+        Ok(()) if on => {
+            println!("recording switched on for {}: real tool calls and replies are kept again, on this machine only, redacted, for 30 days", db.display());
+            ExitCode::SUCCESS
+        }
+        Ok(()) => {
+            println!(
+                "recording switched off for {}: nothing new is recorded, and the weekly sweep that looks for rules which would wrongly block you says it has no data. What was already recorded is deleted by itself after 30 days.",
+                db.display()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("could not write the switch: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `install --set-backup local|<place>|off`: wire (or remove) the one hook that
+/// runs the backup, prepare the git folder, and prove it with a first copy.
+fn set_backup_only(db: Option<PathBuf>, settings: Option<PathBuf>, word: &str) -> ExitCode {
+    use ops::backup_setup::{backup_hooks_for, default_repo, hook_spec, parse_choice, prepare_repo, prove, remove_backup_hook, Choice};
+    let Some(choice) = parse_choice(word) else {
+        eprintln!("say where the backup goes: install --set-backup local (on this machine), a folder or address, or off. Example: install --set-backup local --db <your memory>");
+        return ExitCode::from(2);
+    };
+    let Some(db) = db else {
+        eprintln!("name the memory to back up: install --set-backup {word} --db <your memory>");
+        return ExitCode::from(2);
+    };
+    if !db.is_file() {
+        eprintln!(
+            "REFUSED: there is no memory at {} - check the path given with --db (the one your assistant's hooks name). Nothing was changed.",
+            db.display()
+        );
+        return ExitCode::FAILURE;
+    }
+    let Some(settings) = settings.or_else(default_settings_path) else {
+        eprintln!("could not find your home directory to place settings.json - name it with --settings");
+        return ExitCode::FAILURE;
+    };
+    if choice == Choice::Off {
+        return match remove_backup_hook(&settings, &db) {
+            Ok(0) => {
+                println!("= no backup was wired for {}; nothing to remove", db.display());
+                ExitCode::SUCCESS
+            }
+            Ok(n) => {
+                println!("+ backup switched off: removed {n} backup hook from {} (a copy of the file was saved next to it). Copies already made stay where they are.", settings.display());
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("could not switch the backup off: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    let Some(backup_exe) = sibling("backup").filter(|p| p.exists()) else {
+        eprintln!("NOTHING WAS CHANGED: the backup program (backup) is missing next to the installer. THOR is several small programs that must stay together in one folder: unpack the whole download there and run this again.");
+        return ExitCode::FAILURE;
+    };
+    let repo = default_repo(&db);
+    let spec = hook_spec(&backup_exe.display().to_string(), &db.display().to_string(), &repo.display().to_string());
+    // Another backup already wired for this memory (somebody's own, pointing
+    // elsewhere) is not ours to replace or to double up beside.
+    match backup_hooks_for(&settings, &db) {
+        Ok(existing) if existing.iter().any(|c| !ops::install::same_spelling(c, &spec.command)) => {
+            eprintln!(
+                "NOTHING WAS CHANGED: a backup is already wired for this memory ({}). To choose again, remove it first with: install --set-backup off --db \"{}\"",
+                existing[0],
+                db.display()
+            );
+            return ExitCode::FAILURE;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("NOTHING WAS CHANGED: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    if !ops::githooks::git_available() {
+        eprintln!("NOTHING WAS CHANGED: git is not installed on this computer, and the backup is a git folder. Install git first, then run this again.");
+        return ExitCode::FAILURE;
+    }
+    let place = match &choice {
+        Choice::Place(place) => Some(place.as_str()),
+        _ => None,
+    };
+    let prepared = match prepare_repo(&repo, place) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("NOTHING WAS WIRED: could not prepare the backup folder: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if prepared.created {
+        println!("+ made the backup folder {} (a git folder)", repo.display());
+    } else {
+        println!("= the backup folder {} was already there", repo.display());
+    }
+    match &prepared.place {
+        Some(address) => println!("+ copies also go to {address} (as the remote 'nas')"),
+        None if prepared.dropped_remote => println!("+ the earlier place was taken away: copies now stay on this machine"),
+        None => println!("= copies stay on this machine"),
+    }
+    if let Some(parent) = settings.parent().filter(|p| !p.as_os_str().is_empty()) {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match install_hooks(&settings, &[spec]) {
+        Ok(report) if report.results.iter().all(|(_, o)| *o == HookOutcome::AlreadyPresent) => {
+            println!("= the backup was already connected to Claude Code")
+        }
+        Ok(_) => println!("+ connected the backup to Claude Code: it runs when a session starts (at most one copy a day)"),
+        Err(e) => {
+            eprintln!("the backup folder is ready but connecting it to Claude Code failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    match prove(&backup_exe, &db, &repo) {
+        Ok(line) => {
+            println!("+ first copy made now, to prove it works: {line}");
+            ExitCode::SUCCESS
+        }
+        Err(reason) => {
+            eprintln!("the first copy FAILED, so the backup is wired but not working yet: {reason}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// `install --set-weekly-check on|off`: write the switch and nothing else.
@@ -415,6 +591,12 @@ fn main() -> ExitCode {
     }
     if let Some(word) = cli.set_weekly_check.as_deref() {
         return set_weekly_check_only(cli.db, word);
+    }
+    if let Some(word) = cli.set_recording.as_deref() {
+        return set_recording_only(cli.db, word);
+    }
+    if let Some(word) = cli.set_backup.as_deref() {
+        return set_backup_only(cli.db, cli.settings.clone(), word);
     }
 
     let data_dir = default_data_dir();

@@ -191,6 +191,22 @@ pub fn set_weekly_check(db: &Path, on: bool) -> std::io::Result<()> {
     std::fs::write(mode_file(db), Value::Object(object).to_string())
 }
 
+/// Whether THOR keeps the real-call corpus (`serve::corpus`): yes unless the
+/// user switched it off (`install --set-recording off`, first-session question
+/// about what is recorded). Off, nothing new is written to either sidecar and
+/// the sweep has no data.
+pub fn recording_on(db: &Path) -> bool {
+    read_object(db).get("recording").and_then(Value::as_str) != Some("off")
+}
+
+/// Switch the real-call recording on or off, keeping every other key of the
+/// sidecar.
+pub fn set_recording(db: &Path, on: bool) -> std::io::Result<()> {
+    let mut object = read_object(db);
+    object.insert("recording".to_string(), Value::String(if on { "on" } else { "off" }.to_string()));
+    std::fs::write(mode_file(db), Value::Object(object).to_string())
+}
+
 /// Install: settle the plan from `claude_json`. A plan the user already
 /// confirmed or told is kept as it is; anything else is (re)detected. Returns
 /// what is on record afterwards and what the file said.
@@ -294,6 +310,21 @@ mod tests {
         assert!(!weekly_check_on(&db), "writing the bug mode keeps the switch");
         set_weekly_check(&db, true).unwrap();
         assert!(weekly_check_on(&db));
+    }
+
+    #[test]
+    fn recording_is_on_until_the_user_switches_it_off_and_keeps_the_other_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = store(dir.path());
+        assert!(recording_on(&db), "on by default, with no sidecar at all");
+        write(&db, Plan::Max, PlanSource::Confirmed).unwrap();
+        set_recording(&db, false).unwrap();
+        assert!(!recording_on(&db));
+        assert_eq!(read(&db), Some((Plan::Max, PlanSource::Confirmed)), "the plan survives");
+        set_weekly_check(&db, false).unwrap();
+        assert!(!recording_on(&db), "another switch keeps it");
+        set_recording(&db, true).unwrap();
+        assert!(recording_on(&db));
     }
 
     #[test]

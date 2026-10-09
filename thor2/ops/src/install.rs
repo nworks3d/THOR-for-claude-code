@@ -569,7 +569,7 @@ fn group_has_command(group: &Value, command: &str) -> bool {
 /// One word of a command line (or one argument) with its path spelling
 /// flattened: `\` becomes `/`, a Windows `\\?\` prefix goes, and on Windows
 /// the case goes too (its file system ignores case; other systems do not).
-fn flatten_word(word: &str) -> String {
+pub(crate) fn flatten_word(word: &str) -> String {
     let flat = word.replace('\\', "/");
     let flat = flat.strip_prefix("//?/").unwrap_or(&flat);
     if cfg!(windows) {
@@ -582,7 +582,7 @@ fn flatten_word(word: &str) -> String {
 /// Split a command line into words, honouring double quotes only, so a quoted
 /// and an unquoted spelling of the same path reduce to the same word. A
 /// backslash is NOT an escape here: on Windows it is the path separator.
-fn command_words(command: &str) -> Vec<String> {
+pub(crate) fn command_words(command: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut current = String::new();
     let mut in_word = false;
@@ -616,7 +616,7 @@ fn command_words(command: &str) -> Vec<String> {
 /// ignoring only path spelling: separators, case on Windows, and quoting. A
 /// different program, a different store path or a different flag is still a
 /// different command; nothing here compares more loosely than that.
-fn same_spelling(a: &str, b: &str) -> bool {
+pub fn same_spelling(a: &str, b: &str) -> bool {
     a == b || command_words(a) == command_words(b)
 }
 

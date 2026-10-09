@@ -310,12 +310,23 @@ call. If a restart never happened, the tool is simply missing - that is step 3 a
 
 ## Backup
 
-Once a day THOR writes a copy of the memory into a git repository it keeps beside the
-store (the install says where, and the command is `backup.exe --db "<their store>"
---repo "<that folder>"`). Do not ask them about it: the default, a local copy, is
-already on. Only when they ask for the copy to live somewhere else, tell them the
-options: another folder on their NAS or any machine they own is the safe choice, a
-private repository on a website the other. To send it to a NAS, create an empty bare
+A fresh install makes NO backup: nothing is backed up until the person chooses
+(item 10 of the first-session list). One command does all of it, and makes the
+first copy at once to prove it works:
+
+- `install --set-backup local --db "<their store>"` - a git folder beside the memory
+  (`backup-repo`), no remote, nothing leaves the machine. It protects against a
+  damaged memory file, not against the disk dying.
+- `install --set-backup "<folder or address>" --db "<their store>"` - the same folder
+  plus a remote called `nas` pointing at the place they named (a folder on a NAS or
+  another machine they own is the safe choice, a private repository the other). A
+  folder that does not exist yet, or is empty, becomes the empty bare repository.
+- `install --set-backup off --db "<their store>"` - removes only the connection that
+  makes the copies; copies already made stay.
+
+Once chosen, THOR copies when a session starts, at most once a day (the program is
+`backup.exe --db "<their store>" --repo "<that folder>"`). By hand, the same thing for
+a NAS: create an empty bare
 repository there (`git init --bare <folder on the NAS>`), add it to the backup folder
 as a remote called `nas` (`git -C "<that folder>" remote add nas <the NAS folder>`),
 and push the branch once by name (`git -C "<that folder>" push nas main`). From then
@@ -488,20 +499,33 @@ only the answer guard. The full list is in the memory as the lookup item
 are the same text, rendered from one catalogue in the code.
 
 **Everything the install arranges or switches on is on that numbered list, so
-nothing happens silently.** Each item says what it is, why it exists (the real
-reason or the measurement behind it), what was chosen for them, and how to say
-no. **Do not turn it into an interview and never make anyone wait.** The person
+nothing happens silently.** The list has two layers, because four parts under
+every item was too much to read. **The person is shown only the short layer:** a
+two-line intro, ONE line per item (what it is, and what was chosen for them),
+and how to answer. **The full layer is yours,** in the appendix under the
+assistant rules: per item what it is, why it exists (the real reason or the
+measurement behind it), what was chosen, and how to say no. You state an item's
+why ONCE, and only when the person asks about that number ("why 7") or says no to
+it. **Do not turn it into an interview and never make anyone wait.** The person
 asked for THOR to be installed and nothing more, so every item has a default,
 and the defaults apply without waiting for an answer: apply them, record them,
-retract the setup note, and THEN show the list in their own language with
-"everything here is already on - tell me by number what you want different".
-They answer per number ("1 yes, 3 no, the rest as you like"); anything not
+retract the setup note, and THEN show the short list in their own language with
+"everything here is already as written - tell me by number what you want
+different". They answer per number ("1 yes, 3 no, 10 local"); anything not
 mentioned keeps the default, and "defaults" or "doe maar" accepts all of it.
 Someone who does not answer at all is answered by the defaults.
 
+**Two items are not simply "on".** Backups (10): a fresh install wires NO backup,
+so with the default nothing is backed up; say that once, and that `backup local`
+or a named folder or address starts one (`install --set-backup`, which also makes
+a first copy to prove it works). Changelog (12): the default is yes when the
+project has none, so you create `CHANGELOG.md` in the project you are in, unless
+they say no.
+
 **When an answer works against them,** say ONCE, in one or two plain sentences,
-why the item exists (its "Why it exists" line), then do what they decided. They
-have the final word. Never block, never ask twice, never repeat the warning.
+why the item exists (its "Why it exists" line in the appendix), then do what they
+decided. They have the final word. Never block, never ask twice, never repeat the
+warning.
 
 This is held, not only asked. The session does not end while the note is
 live, and retracting it is refused until the owner's answers are on record as
@@ -519,9 +543,37 @@ about your work, so you never have to repeat it, and it brings the right thing
 back at the right moment." Then show the list.
 
 <!-- questionnaire:begin -->
-THOR is set up. Here is everything the install arranged or switched on, so nothing happens silently. For each one: what it is, why it exists, what was chosen for you, and how to say no.
+THOR is set up. Here is everything the install arranged or switched on, so nothing happens silently, one line each with what I chose for you.
+Nothing here waits for you: ask me about any number and I explain it, say no to any number and I switch it off.
 
-Answer by number, for example "1 yes, 3 no, the rest as you like". Whatever you do not mention keeps the choice made for you, and "defaults" accepts all of it. You can change any of it later just by asking.
+1. Your plan: I read your plan from Claude Code's settings (the settings' answer goes here; when they say nothing, ask: Max, or Pro and smaller?), so THOR's self-check does not eat your usage limit. Default: what the settings say.
+2. Connections: THOR is wired into Claude Code at session start, before each tool call, when you send a message and when a reply ends, so the memory speaks up by itself. Default: on.
+3. Git hooks: every repository refreshes THOR's code index after each commit, so searching the code stays right. Default: on.
+4. Weekly check: about once a week THOR has your assistant tidy the memory (you can also type /thor-eval any time). Default: on.
+5. Work rules: 12 general work habits stored as notes, such as tests before 'done' and never commit a secret; none of them can block anything. Default: all on.
+6. Helper agents: your main assistant judges while cheaper models do the work in helpers, which costs less and keeps the chat free. Default: on.
+7. Bug reports: your assistant may offer to report a fault in THOR on GitHub, showing you the exact text first; nothing is sent without your yes. Default: on.
+8. Replies: in your language, short, with a summary first, and five reply rules; a reply that breaks one is rewritten once. Default: on.
+9. Topic folders: a plain folder with no code, such as recipes or travel plans, can get a memory of its own when you name it. Default: none set up yet.
+10. Backups: NOTHING is backed up until you choose: a copy on this machine, a place you name (a NAS, another computer, a private repository), or none. Default: none yet.
+11. Record of real calls: for 30 days, on this machine only, THOR keeps your commands and replies with passwords and keys blanked, to find rules that would wrongly block you. Default: on.
+12. Changelog: Shall I keep a changelog and version number for this project? I create CHANGELOG.md and note each change in it. Default: yes, when the project has none.
+
+Answer by number (for example "1 yes, 3 no, 10 local"), ask "why 7" about any number, or say "defaults" to accept all of it; you can change any of it later just by asking.
+
+FOR THE ASSISTANT (do not read this part out)
+- Show him the short list only: the intro, one line per item and the way to answer. Never paste the detail per item (the last part of this text) at him.
+- The detail per item is yours: state an item's Why once, only when he asks about a number ("why 7") or refuses it, in one or two plain sentences, then do what he decided. If he asks and has not refused, add how to say no.
+- Apply the defaults NOW, in this same turn, without waiting for an answer, so nothing waits: store the Report 'owner-setup-answers' with them and retract the setup note. Then show the short list in the user's own language, once, and say that everything on it is already as written and that he can tell you by number what he wants different (for example "1 yes, 3 no, 10 local"; "defaults" or "doe maar" accepts all of it).
+- Anything he does not mention keeps the default. Never ask the same question twice and never hold up his work for an answer.
+- Item 10 (backups) is the one whose default is NOT on: a fresh install wired no backup, so with the default nothing is backed up. Say that once, in one sentence, after the list, with the way to start ("backup local", or the folder or address he wants); do nothing for it until he answers.
+- Item 12 (changelog): the default is yes when this project has none. Unless he says no, create CHANGELOG.md in the project this session runs in (a '# Changelog' heading with an 'Unreleased' section, nothing invented; a project that already has one is left alone) and keep a version number only if the project already has one or he asks for one. If he says no, create nothing and do not ask again.
+- Question 1: if the settings named a plan, ask him to confirm it with its reason; if they did not, ask which plan outright with the same reason. Record his word with install --set-plan max|small --db <store>.
+- When he answers, apply each number where it belongs, then REVISE 'owner-setup-answers' (never store a second copy): 1 install --set-plan; 2 remove THOR's lines from Claude Code's settings file; 3 git config --global --unset core.hooksPath; 4 install --set-weekly-check off|on; 5 and 6 retract the named notes (a retracted note stops arriving); 7 install --set-mode off (or release); 8 the reply file beside the store (guard-response-rulebook.json) and a stored preference for the language; 9 install --topic, run from inside the folder; 10 install --set-backup local|<folder or address>|off --db <store> (it makes the git folder, adds a named place as the remote 'nas', connects one session-start backup and makes a first copy to prove it works: tell him that result in plain words, and if it failed say so and why); 11 install --set-recording on|off --db <store>; 12 CHANGELOG.md as above.
+- A bad answer is one that works against him (for example switching off the connections and then expecting the memory to speak). Say ONCE, in one or two plain sentences, why the item exists (its 'Why' in the detail), then do what he decided. He has the final word, you never block and never nag.
+- "He does not want any of this" is itself a valid answer: record it as the answers and apply nothing.
+
+DETAIL PER ITEM (for the assistant: state an item's Why once, only when he asks about a number or refuses it; never read all of this out)
 
 1. Your plan
    What it is: I looked at Claude Code's own settings to find out which plan you have: Max, or Pro and smaller. Ask: 'The settings say <Max | Pro or smaller>. Is that right?' - or, when they do not say, 'Which is it: Max, or Pro and smaller?'
@@ -578,18 +630,22 @@ Answer by number, for example "1 yes, 3 no, the rest as you like". Whatever you 
    To say no: Nothing to undo: do not name a folder. A folder you set up has one hidden file, .thor-project, that you can delete.
 
 10. Backups of the memory
-   What it is: About once a day, and when a session starts, THOR writes a copy of the whole memory into a git repository of its own on this machine. It goes somewhere else only if you name a place: a folder on a NAS or another computer you own, or a private repository.
+   What it is: A backup copy of the whole memory in a git folder. A fresh install makes NO backup, so until you answer nothing is copied anywhere. You choose one of three: a copy on this machine (a git folder beside the memory; nothing leaves the machine, and it protects against a damaged or wrongly edited memory, not against the disk dying), a place you name (a folder on a NAS or another computer you own, or a private repository; that survives the disk dying), or none. Once you choose, THOR copies when a session starts, at most once a day, and makes the first copy at once to prove it works. To start, say "backup local", or name the place.
    Why it exists: The memory is a single file, and if the disk dies everything it learned dies with it.
-   What I chose: A daily copy on this machine; nothing leaves the machine.
-   To say no: Nothing leaves your machine unless you name a place. The local copy is one folder you can delete.
+   What I chose: None: nothing is backed up until you answer.
+   To say no: Choose none, or simply do not answer: nothing is copied anywhere. If you change your mind later I run install --set-backup off, which removes only the connection that makes the copies; the copies already made stay where they are.
 
-FOR THE ASSISTANT (do not read this part out)
-- Apply the defaults NOW, in this same turn, without waiting for an answer, so nothing waits: store the Report 'owner-setup-answers' with them and retract the setup note. Then show the list above in the user's own language, once, and say that everything on it is already on and that he can tell you by number what he wants different (for example "1 yes, 3 no, the rest as you like"; "defaults" or "doe maar" accepts all of it).
-- Anything he does not mention keeps the default. Never ask the same question twice and never hold up his work for an answer.
-- Question 1: if the settings named a plan, ask him to confirm it with its reason; if they did not, ask which plan outright with the same reason. Record his word with install --set-plan max|small --db <store>.
-- When he answers, apply each number where it belongs, then REVISE 'owner-setup-answers' (never store a second copy): 1 install --set-plan; 2 remove THOR's lines from Claude Code's settings file; 3 git config --global --unset core.hooksPath; 4 install --set-weekly-check off|on; 5 and 6 retract the named notes (a retracted note stops arriving); 7 install --set-mode off (or release); 8 the reply file beside the store (guard-response-rulebook.json) and a stored preference for the language; 9 install --topic, run from inside the folder; 10 the backup folder and its remote.
-- A bad answer is one that works against him (for example switching off the connections and then expecting the memory to speak). Say ONCE, in one or two plain sentences, why the item exists (its 'Why' above), then do what he decided. He has the final word, you never block and never nag.
-- "He does not want any of this" is itself a valid answer: record it as the answers and apply nothing.
+11. A record of real calls
+   What it is: THOR keeps, in two files next to the memory, the commands your assistant ran and the replies it gave in the last 30 days. The files stay on this machine and are never sent anywhere. Passwords and keys THOR recognises are blanked out before anything is written, and every line older than 30 days is deleted by itself. THOR then replays its rules against that record to find a rule that would wrongly block you.
+   Why it exists: Replaying 146,000 real calls found 12 rules that blocked calls which were fine, and no review of the reports had shown them (measured at the maker, 2026-10-09).
+   What I chose: On.
+   To say no: I switch it off (install --set-recording off): nothing new is recorded and the check for wrongly blocking rules then says it has no data; what was already recorded disappears by itself after 30 days.
+
+12. A changelog and version number
+   What it is: A changelog is a file, CHANGELOG.md, with one line for every change you can see, and a version number says which state of the project is running. If this project has none I create the file now and add a line with each change from then on; a project that already keeps one is left as it is.
+   Why it exists: Every later session, and you, know exactly what changed and which version runs, without digging through history.
+   What I chose: Yes, when this project has none.
+   To say no: Then I create no file and do not ask again; the starter work rule about changelogs (item 5) stays, and it only applies to a project that keeps one.
 <!-- questionnaire:end -->
 
 Three more facts to give in your own words, without a question:
@@ -622,7 +678,7 @@ Make them in this order, in the first reply, whatever the person answers:
 remember(
   id:   "owner-setup-answers",
   kind: "report",
-  text: "Setup finished with the defaults, nothing asked first. Plan: <as detected or told>. Everything on the numbered list is on. Replies: short and plain, in the owner's own language. Lane: work only. Projects: named after their folder. Any of these changes when the owner says so."
+  text: "Setup finished with the defaults, nothing asked first. Plan: <as detected or told>. Everything on the numbered list is as written (backups: none until the owner chooses; changelog: yes when the project has none). Replies: short and plain, in the owner's own language. Lane: work only. Projects: named after their folder. Any of these changes when the owner says so."
 )
 retract(id: "walk-through-the-answer-guard-once", reason: "Setup finished: the owner's answers are on record as owner-setup-answers.")
 ```

@@ -6,6 +6,7 @@
 //! (`install`) and git's own hooks directory (`githooks`), and a
 //! plain-language health check over both plus the fact store (`health`).
 
+pub mod backup_setup;
 pub mod backup_state;
 pub mod drain;
 pub mod githooks;
