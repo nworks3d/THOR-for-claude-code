@@ -1021,7 +1021,20 @@ pub fn working_contract() -> Vec<model::item::Item> {
 /// the four notes at one moment are equals, and all of them fit one block
 /// (see `a_moments_starter_notes_fit_one_block`).
 ///
-/// TEETH. None carries a check, on evidence. Seven candidate checks were
+/// TEETH. Two notes carry a check, and only on a Windows install (the owner's
+/// goal: an agent never flashes a console window, for any user):
+/// `windowless-processes-on-windows` (`requires` on `Start-Process`, answered by
+/// `-WindowStyle`, `-NoNewWindow`, `ms-settings:`, `windowsdefender:`,
+/// `control.exe`, `.cpl`, `http://`, `https://` or `file:///`) and
+/// `scheduled-task-not-interactive` (`forbidden` `/it` on `schtasks /create`).
+/// Replayed through the real guard over the same 145,976 recorded calls
+/// (2026-10-09): the first refused 4 calls once `file:///` was an answer - three
+/// were probes of the rule itself (two with a program that does not exist, one
+/// with a stand-in function), none a browser or control panel the user wanted -
+/// and the second refused none. The match is on words, so `/it` also refuses a
+/// forward-slash path segment `/it/`, and a `$p = Start-Process ...` assignment
+/// is not seen by the guard at all (a miss, never a false block). Every other
+/// note carries no check, on evidence. Seven candidate checks were
 /// replayed through the real guard over 145,976 recorded tool calls
 /// (2026-10-09): a ban on --no-verify refused 11 legitimate commits in
 /// scratch trees; "names a model" refused 9 agent calls, "says subagent"
@@ -1037,8 +1050,20 @@ pub fn working_contract() -> Vec<model::item::Item> {
 /// They are ordinary notes. Retract one, or rewrite it, and nothing else
 /// notices.
 pub fn workflow_starter_pack() -> Vec<model::item::Item> {
+    workflow_starter_pack_for(cfg!(windows))
+}
+
+/// The starter pack for a platform: `windows` decides whether the two console-flash
+/// notes carry their refusing check.
+pub fn workflow_starter_pack_for(windows: bool) -> Vec<model::item::Item> {
     use intent::Action;
-    use model::item::{Binding, TargetKind};
+    use model::item::{Binding, Check, TargetKind};
+
+    // The check rides only on a Windows install; elsewhere the note stays a note.
+    let with_check = |mut item: model::item::Item, check: Check| {
+        item.check = windows.then_some(check);
+        item
+    };
 
     let moment = |a: Action| Binding::Moment(a);
     let command = |c: &str| Binding::Target { kind: TargetKind::Command, value: c.to_string() };
@@ -1178,13 +1203,42 @@ pub fn workflow_starter_pack() -> Vec<model::item::Item> {
              machine.",
             vec![command("bash -c"), command("node -e"), command("python -c")],
         ),
-        note(
-            "windowless-processes-on-windows",
-            "On Windows start background processes hidden: Start-Process with -WindowStyle Hidden or \
-             -NoNewWindow, a Python subprocess with CREATE_NO_WINDOW. A flashing console steals the \
-             user's focus. A process started without -Wait dies with the app that started it.",
-            "A visible console window started by an agent is found to leave the user's focus alone.",
-            vec![command("Start-Process")],
+        with_check(
+            note(
+                "windowless-processes-on-windows",
+                "On Windows Start-Process must run hidden: add -WindowStyle Hidden or -NoNewWindow. Only \
+                 something the user asked to see passes: ms-settings:, windowsdefender:, control.exe, a \
+                 .cpl file, http://, https:// or file:///. Python: CREATE_NO_WINDOW. A console flash steals focus.",
+                "A visible console window started by an agent is found to leave the user's focus alone.",
+                vec![command("Start-Process")],
+            ),
+            Check::Requires {
+                when: "Start-Process".to_string(),
+                required: [
+                    "-WindowStyle",
+                    "-NoNewWindow",
+                    "ms-settings:",
+                    "windowsdefender:",
+                    "control.exe",
+                    ".cpl",
+                    "http://",
+                    "https://",
+                    "file:///",
+                ]
+                .map(String::from)
+                .to_vec(),
+            },
+        ),
+        with_check(
+            note(
+                "scheduled-task-not-interactive",
+                "Never create a scheduled task with schtasks /create and /it or /IT: an interactive task opens a \
+                 console window at every run and steals focus. Leave it out, or let the task start a \
+                 hidden launcher (wscript.exe, or powershell -WindowStyle Hidden).",
+                "An interactive scheduled task (/it) is found to run without any console window.",
+                vec![command("schtasks /create")],
+            ),
+            Check::Forbidden { literals: vec!["/it".to_string(), "/IT".to_string()] },
         ),
     ]
 }
@@ -2496,7 +2550,7 @@ mod tests {
             }
             let lowered = format!("{} {}", item.text, item.falsifier.as_deref().unwrap_or("")).to_lowercase();
             for personal in [
-                "c:\\users", "/home/", "10.0.", "@", "http", "nas ", "printer", "klipper", "filament", "dutch",
+                "c:\\users", "/home/", "10.0.", "@", "www.", "nas ", "printer", "klipper", "filament", "dutch",
             ] {
                 assert!(!lowered.contains(personal), "{} mentions '{personal}', which is not generic", item.id);
             }
@@ -2556,11 +2610,87 @@ mod tests {
     /// recorded corpus first and listing it here by id.
     #[test]
     fn only_audited_starter_notes_carry_a_check() {
-        let audited: &[&str] = &[];
+        let audited: &[&str] = &["windowless-processes-on-windows", "scheduled-task-not-interactive"];
         for item in workflow_starter_pack() {
             if item.check.is_some() {
                 assert!(audited.contains(&item.id.as_str()), "{} carries a check nobody replayed", item.id);
             }
+        }
+    }
+
+    /// "Geen pop cmd": on Windows an agent must never flash a console window,
+    /// for any user. A new memory gets two starter rules that REFUSE, and
+    /// only on a Windows install: a `Start-Process` with no hidden form and
+    /// no target the user asked to see, and an interactive `schtasks /create`.
+    /// Every call the user wanted visible, and every harmless one, passes.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_install_refuses_a_console_flash_and_lets_the_wanted_calls_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        ensure_and_seed_store(&db).unwrap();
+        let store = EventStore::open_read_only(&db).unwrap();
+        let cwd = dir.path();
+        let owner_said_nothing: &dyn Fn() -> Result<Vec<String>, String> = &|| Ok(Vec::new());
+        let verdict = |tool: &str, command: &str| {
+            let input = serde_json::json!({ "command": command });
+            serve::guard_verdict::pre_tool(&store, tool, Some(&input), None, Some(cwd), Some(cwd), Some(owner_said_nothing))
+                .verdict
+                .map(|v| v.rule_id.unwrap_or_default())
+        };
+        for refused in [
+            "Start-Process cmd.exe -ArgumentList '/c x'",
+            "Start-Process -FilePath python -ArgumentList 'job.py'",
+            "Start-Process notepad.exe",
+        ] {
+            assert_eq!(verdict("PowerShell", refused).as_deref(), Some("windowless-processes-on-windows"), "{refused}");
+        }
+        assert_eq!(
+            verdict("Bash", "powershell -Command \"Start-Process cmd.exe -ArgumentList '/c x'\"").as_deref(),
+            Some("windowless-processes-on-windows"),
+            "the same call through the Bash tool"
+        );
+        for passes in [
+            "Start-Process cmd.exe -ArgumentList '/c x' -WindowStyle Hidden",
+            "Start-Process cmd.exe -ArgumentList '/c x' -NoNewWindow -Wait",
+            "Start-Process ms-settings:windowsdefender",
+            "Start-Process windowsdefender:",
+            "Start-Process control.exe mmsys.cpl",
+            "Start-Process https://example.com/docs",
+            "Start-Process http://localhost:3000",
+            "Start-Process msedge \"file:///C:/work/demo.html\"",
+            "Start-Process cmd.exe -ArgumentList '/c x' -WhatIf",
+            "Get-Process | Where-Object Name -eq cmd",
+        ] {
+            assert_eq!(verdict("PowerShell", passes), None, "{passes}");
+        }
+        let task = "schtasks /create /tn x /tr \"wscript.exe C:\\x.vbs\" /sc once /st 23:59";
+        assert_eq!(
+            verdict("PowerShell", &format!("{task} /it /ru me /f")).as_deref(),
+            Some("scheduled-task-not-interactive"),
+            "an interactive task flashes a window"
+        );
+        for refused in [format!("{task} /IT"), format!("{task} /it"), "schtasks.exe /create /tn x /tr y /sc daily /it".to_string()] {
+            assert_eq!(verdict("PowerShell", &refused).as_deref(), Some("scheduled-task-not-interactive"), "{refused}");
+        }
+        for passes in [task, "schtasks /query /tn x /v /fo LIST", "schtasks /run /tn x", "schtasks /create /tn x /tr \"C:\\it\\run.vbs\" /sc daily"] {
+            assert_eq!(verdict("PowerShell", passes), None, "{passes}");
+        }
+    }
+
+    /// Off Windows the same two notes stay, as plain notes: nothing there
+    /// can flash a console window, and a rule that can refuse must never
+    /// ride into an install it does not describe.
+    #[test]
+    fn off_windows_the_console_flash_notes_carry_no_check() {
+        for id in ["windowless-processes-on-windows", "scheduled-task-not-interactive"] {
+            let on = workflow_starter_pack_for(true);
+            let off = workflow_starter_pack_for(false);
+            let on = on.iter().find(|n| n.id == id).unwrap_or_else(|| panic!("{id} left the pack"));
+            let off = off.iter().find(|n| n.id == id).unwrap_or_else(|| panic!("{id} left the off-Windows pack"));
+            assert!(on.check.is_some(), "{id} lost its check on Windows");
+            assert!(off.check.is_none(), "{id} refuses on a platform with no console window to flash");
+            assert_eq!(on.text, off.text, "{id}: the note says the same on every platform");
         }
     }
 

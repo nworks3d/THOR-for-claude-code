@@ -124,7 +124,7 @@ the owner's language, work lane only, every starting note kept), and so does the
 turn-end reminder that holds the session, so a fresh agent that never read
 AGENTS.md finishes the setup in one sentence without asking anything.
 
-Fourteen more notes make up the workflow starter pack, tagged
+Fifteen more notes make up the workflow starter pack, tagged
 `workflow-starter` (`ops::install::workflow_starter_pack`): general
 coding-workflow habits that were marked useful again and again in the store of
 the person who built this, rewritten to hold on any project - a changelog line
@@ -134,11 +134,13 @@ a scan before anything goes public, complete agent briefs, and a few more.
 None is pinned: each is bound to the moment or command it is about (commit,
 push, publish, delete, deploy, install, an agent being spawned, a `cd`, a
 shell one-liner, `Start-Process`) and arrives right before it, once per
-conversation. None carries a check. The candidates were replayed through the
-real guard over 145,976 recorded tool calls and every one refused a legitimate
-call (or only looked safe because the call it targets never occurred), so each
-stays a note: a new user must never get a false block from a rule they did not
-write. They all go in through
+conversation. Only two carry a check, and only on a Windows install: no
+`Start-Process` without a hidden form unless it opens something the user asked
+to see, and no `schtasks /create` with `/it`, so an agent never flashes a
+console window. The other candidates were replayed through the real guard over
+145,976 recorded tool calls and every one refused a legitimate call (or only
+looked safe because the call it targets never occurred), so each stays a note:
+a new user must never get a false block from a rule they did not write. They all go in through
 `model::store::declare`, the same gate every other write uses, and a refusal
 is reported rather than worked around - a memory whose own gate rejects the
 notes it ships with is worth seeing. An EXISTING store is never seeded, so
