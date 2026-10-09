@@ -456,8 +456,9 @@ pub fn launch_problem(serve_exe: &Path) -> Option<String> {
     }
 }
 
-/// The three hooks the CONTRACT asks for: session start, before a tool call,
-/// and per prompt - all three calling the same `serve hook --db <db>` command,
+/// The four hooks the CONTRACT asks for: session start, before a tool call,
+/// per prompt, and at the end of a turn (Stop) - all four calling the same
+/// `serve hook --db <db>` command,
 /// exactly like `serve/src/bin/serve.rs`'s own `hook` subcommand expects
 /// (it tells the events apart by the JSON payload's `hook_event_name`, not by
 /// which command line ran it).
@@ -759,12 +760,15 @@ pub struct SeededItem {
 /// someone who reads it, and a page can be skipped; what the memory hands over
 /// at the start of every conversation cannot.
 ///
-/// WHY THESE FOUR AND NOT MORE. Two of the four things a new writer gets wrong
-/// are already caught by the gate, which refuses a rule with no binding and a
-/// rule with no falsifier and says exactly what to fix. Seeding those would be
-/// telling someone what they are about to be told anyway. These four are the
-/// ones nothing can catch: a wrong anchor, a second copy, routing around a
-/// refusal, and expecting words alone to forbid something. Each fails quietly.
+/// WHY THESE AND NOT MORE. The set started as four notes; it is 22 now (the
+/// test `working_contract().len() == 22` below pins the count). The original
+/// reasoning still holds for what was added: two of the four things a new writer
+/// gets wrong are already caught by the gate, which refuses a rule with no
+/// binding and a rule with no falsifier and says exactly what to fix. Seeding
+/// those would be telling someone what they are about to be told anyway. The
+/// four first notes are the ones nothing can catch: a wrong anchor, a second
+/// copy, routing around a refusal, and expecting words alone to forbid
+/// something. Each fails quietly.
 ///
 /// They are ordinary notes. Unpin one and it stops arriving; rewrite it in your
 /// own words; throw it out. Nothing here treats them as special afterwards.

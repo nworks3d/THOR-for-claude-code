@@ -688,8 +688,9 @@ last successful ship has gone stale, so a broken schedule shows up there even
 if nobody is watching the task itself. That line also tells a sleeping
 machine apart from a real problem: events waiting behind an old success are
 named as waiting, never as a failure, while an attempt that actually failed
-is named with its own reason. The off-site copy the `backup` command keeps in
-git behaves the same way about its own commits - one that could not reach the
+is named with its own reason. The install does not set a backup up: it is a
+choice the user makes at the first session. Once chosen, the off-site copy the
+`backup` command keeps in git behaves the same way about its own commits - one that could not reach the
 remote is pushed again on the very next run, before that run's own
 once-a-day schedule is even checked, instead of sitting unpushed for up to a
 day. The log is exported in numbered files (`events-0001.jsonl`, ...) of at
@@ -1081,8 +1082,9 @@ of names, end the trigger with one `*` - `/thor*` catches `/thor-probe`,
 `*` is allowed only as the last character of a trigger inside the command, and
 the part before it must be specific on its own. A call whose only words after
 the command are `--help`, `-h`, `-?`, `/?`, `help`, `--version` or `-V` asks the
-program about itself and runs nothing, so a `requires` check never refuses it;
-a `forbidden` check still does.
+program about itself and runs nothing, so a `requires` check never refuses it.
+A `forbidden` check does not refuse it either: a call that does nothing is
+exempt from `forbidden`, `requires` and owner-approval rules alike.
 
 One more thing `revise` refuses without asking first: weakening a rule or an
 orientation, checked or not - clearing or changing its check, lowering its
