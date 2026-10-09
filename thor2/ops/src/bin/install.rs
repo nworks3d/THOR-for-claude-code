@@ -23,7 +23,7 @@ use ops::install::{
     check_registration, check_registration_at, default_data_dir, default_eval_command_path, default_settings_path,
     default_user_mcp_path, ensure_store, install_hooks, install_tool_server, record_project_opened,
     record_topic_opened, register_command_for, register_root, seed_eval_command, seed_response_rulebook,
-    seed_working_contract, standard_hooks, topic_folder_name, write_project_marker, EvalCommandOutcome, HookOutcome,
+    seed_working_contract_at, standard_hooks, topic_folder_name, write_project_marker, EvalCommandOutcome, HookOutcome,
     MarkerOutcome, RegisterOutcome, RegisterRefusal, RulebookOutcome, ServerOutcome, StoreOutcome,
 };
 use std::path::PathBuf;
@@ -812,7 +812,14 @@ fn main() -> ExitCode {
             // shapes that never come back - which fails silently on both
             // sides. Seeding an EXISTING memory would be pushing four notes
             // into someone's real work uninvited, so that never happens.
-            match seed_working_contract(&db) {
+            let absolute = |p: &Path| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+            let paths = ops::questionnaire::Paths {
+                installer: std::env::current_exe().ok(),
+                db: Some(absolute(&db)),
+                settings: Some(absolute(&settings)),
+                tool_server_file: mcp_target.as_deref().map(absolute),
+            };
+            match seed_working_contract_at(&db, serve::plan::default_claude_json().as_deref(), &paths) {
                 Ok(seeded) => {
                     // The numbered first-session list is a lookup item, not a note.
                     let stored = seeded.iter().filter(|s| s.stored && s.id != ops::questionnaire::LOOKUP_ID).count();

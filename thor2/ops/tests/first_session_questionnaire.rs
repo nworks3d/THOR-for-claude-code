@@ -120,7 +120,7 @@ fn the_why_and_the_way_to_say_no_sit_in_the_appendix_for_the_assistant() {
         for part in [q.why, q.default] {
             assert!(block.contains(part), "item {} detail lacks '{part}'", q.n);
         }
-        assert!(block.contains(q.say_no.as_str()), "item {} detail lacks how to say no", q.n);
+        assert!(block.contains(&questionnaire::fill(&q.say_no, &questionnaire::Paths::default())), "item {} detail lacks how to say no", q.n);
     }
     let rules = questionnaire::ASSISTANT_RULES.to_lowercase();
     assert!(rules.contains("short list") && rules.contains("only when he asks about a number") && rules.contains("why once"), "{rules}");
@@ -155,7 +155,9 @@ fn the_recording_item_says_what_is_kept_where_why_and_how_to_switch_it_off() {
 #[test]
 fn the_changelog_item_is_the_owners_decision_with_a_default_of_yes() {
     let q = questions().into_iter().find(|q| q.id == "changelog").unwrap();
-    assert!(q.line.contains("Shall I keep a changelog and version number for this project?"), "{}", q.line);
+    // The user's line is a statement of what happens, never a question.
+    assert!(!q.line.contains('?'), "item 12 is a statement, not a question: {}", q.line);
+    assert!(q.line.contains("I create CHANGELOG.md") && q.line.contains("say no and I do not"), "{}", q.line);
     assert_eq!(q.why, "Every later session, and you, know exactly what changed and which version runs, without digging through history.");
     assert!(q.default.starts_with("Yes") && q.default.contains("has none"), "{}", q.default);
     assert!(questionnaire::ASSISTANT_RULES.contains("CHANGELOG.md"), "on yes the assistant creates the file");
@@ -279,4 +281,75 @@ fn the_assistant_rules_never_block_and_never_ask_twice() {
     for must in ["without waiting", "now", "once", "final word", "never block", "never ask the same question twice", "revise 'owner-setup-answers'"] {
         assert!(lowered.contains(must), "the assistant rules lack '{must}'");
     }
+}
+
+fn real_paths() -> questionnaire::Paths {
+    questionnaire::Paths {
+        installer: Some(PathBuf::from("C:/Users/x/thor2/install.exe")),
+        db: Some(PathBuf::from("C:/Users/x/AppData/Local/thor2/thor.db")),
+        settings: Some(PathBuf::from("C:/Users/x/.claude/settings.json")),
+        tool_server_file: Some(PathBuf::from("C:/Users/x/.claude.json")),
+    }
+}
+
+/// A blind test (an assistant with ONLY the served text, no AGENTS.md) had to
+/// guess the two calls, where the installer lives and which settings file to
+/// edit. The lookup now carries them, with the real paths of this install.
+#[test]
+fn the_lookup_alone_carries_the_two_calls_and_the_real_paths() {
+    let text = questionnaire::lookup_text_with(Some(Detection { plan: Plan::Small, tier_found: true }), &real_paths());
+    // The two calls, exactly.
+    assert!(text.contains("remember(\n  id:   \"owner-setup-answers\",\n  kind: \"report\",\n  text: \"Setup finished with the defaults, nothing asked first. Plan: Pro or smaller"), "{text}");
+    assert!(text.contains("retract(id: \"walk-through-the-answer-guard-once\", reason: \"Setup finished: the owner's answers are on record as owner-setup-answers.\")"), "{text}");
+    assert!(text.contains("NO project"), "the report takes no project");
+    // The real paths, quoted, in their own section and where the commands use them.
+    let paths = &text[text.find("PATHS ON THIS MACHINE").expect("a paths section")..];
+    for want in [
+        "\"C:/Users/x/thor2/install.exe\"",
+        "\"C:/Users/x/AppData/Local/thor2/thor.db\"",
+        "\"C:/Users/x/.claude/settings.json\"",
+        "\"C:/Users/x/.claude.json\"",
+    ] {
+        assert!(paths.contains(want), "the paths section lacks {want}");
+    }
+    assert!(text.contains("install --set-helpers on --db \"C:/Users/x/AppData/Local/thor2/thor.db\""), "<store> is filled in: {text}");
+    assert!(!text.contains("<store>"), "no placeholder is left when the store is known");
+    // The tool server stays when connections go off.
+    let hooks_item = &text[text.find("\n2. The connections to Claude Code").unwrap()..];
+    let hooks_item = &hooks_item[..hooks_item.find("\n\n").unwrap()];
+    assert!(hooks_item.contains("only THOR's four hook entries") && hooks_item.contains("from \"C:/Users/x/.claude/settings.json\""), "{hooks_item}");
+    assert!(hooks_item.contains("tool server in \"C:/Users/x/.claude.json\" stays"), "{hooks_item}");
+    assert!(hooks_item.contains("after you restart Claude Code"), "{hooks_item}");
+    assert!(text.contains("SAY FIRST") && text.contains("THREE MORE FACTS") && text.contains("Lanes.") && text.contains("Project names.") && text.contains("theirs to correct"), "{text}");
+}
+
+#[test]
+fn without_known_paths_the_text_describes_each_one_instead_of_leaving_a_hole() {
+    let text = questionnaire::lookup_text(None);
+    let paths = &text[text.find("PATHS ON THIS MACHINE").unwrap()..];
+    assert!(paths.contains("install program in the thor2 folder") && paths.contains("~/.claude/settings.json") && paths.contains("~/.claude.json"), "{paths}");
+    assert!(text.contains("Plan: <as detected or told>"), "the page for any user keeps the plan open");
+}
+
+#[test]
+fn an_unknown_anchor_is_stored_pinned_and_offered_once() {
+    let rules = questionnaire::ASSISTANT_RULES;
+    assert!(rules.contains("whose anchor you do not know") && rules.contains("never invent a hostname"), "{rules}");
+    assert!(rules.contains("kind orientation with always true") && rules.contains("offer once"), "{rules}");
+    assert!(rules.contains("revise that note with the target"), "{rules}");
+}
+
+#[test]
+fn the_seeded_store_carries_the_installs_real_paths_and_the_setup_note_names_the_one_place_to_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    ops::install::ensure_store(&db).unwrap();
+    let paths = real_paths();
+    let seeded = ops::install::seed_working_contract_at(&db, None, &paths).unwrap();
+    assert!(seeded.iter().all(|s| s.stored), "refused: {:?}", seeded.iter().filter(|s| !s.stored).collect::<Vec<_>>());
+    let store = thor_core::event_store::EventStore::open_read_only(&db).unwrap();
+    let item = model::store::show(&store, questionnaire::LOOKUP_ID).unwrap();
+    assert!(item.text.contains("\"C:/Users/x/thor2/install.exe\"") && item.text.contains("\"C:/Users/x/.claude/settings.json\""), "{}", item.text);
+    let note = model::store::show(&store, model::store::SETUP_NOTE_ID).unwrap();
+    assert!(note.text.contains("`lookup first-session-questions`") && note.text.contains("one place to read"), "{}", note.text);
 }

@@ -1006,10 +1006,9 @@ pub fn working_contract() -> Vec<model::item::Item> {
         // way for good.
         rule(
             model::store::SETUP_NOTE_ID,
-            "Setup is not finished. First reply: get the numbered list with lookup key \
-             'first-session-questions', store Report 'owner-setup-answers' with the defaults and \
-             retract this note, then show him the list in his language: answers by number, the rest \
-             keeps the default. Nothing waits.",
+            "Setup is not finished. In your first reply, `lookup first-session-questions` is the \
+             one place to read: the exact calls, paths and what to say. Apply the defaults at once \
+             (store 'owner-setup-answers', retract this note, show him the list). Nothing waits.",
             "This note is still being served at session start after the owner has already \
              answered these questions and the answers are applied.",
         ),
@@ -1385,12 +1384,25 @@ pub fn seed_working_contract(db: &Path) -> anyhow::Result<Vec<SeededItem>> {
 /// `seed_working_contract` with Claude Code's state file named, so a test can
 /// say what the first-session list shows for the plan.
 pub fn seed_working_contract_with(db: &Path, claude_json: Option<&Path>) -> anyhow::Result<Vec<SeededItem>> {
+    let paths = crate::questionnaire::Paths { db: Some(db.to_path_buf()), ..Default::default() };
+    seed_working_contract_at(db, claude_json, &paths)
+}
+
+/// `seed_working_contract_with` and the real paths of this install (the
+/// installer program, the store, Claude Code's settings file and the file of
+/// the tool server), which the first-session lookup carries so an assistant
+/// that never saw AGENTS.md has every path it needs.
+pub fn seed_working_contract_at(
+    db: &Path,
+    claude_json: Option<&Path>,
+    paths: &crate::questionnaire::Paths,
+) -> anyhow::Result<Vec<SeededItem>> {
     let mut store = EventStore::new(db)?;
     let mut out = Vec::new();
     // The numbered first-session list the setup note points at: a lookup item,
     // rendered from the same catalogue as the page in AGENTS.md.
     let detected = claude_json.map(serve::plan::detect_in);
-    let questions = crate::questionnaire::lookup_item(detected);
+    let questions = crate::questionnaire::lookup_item_with(detected, paths);
     for item in working_contract().into_iter().chain(workflow_starter_pack()).chain(std::iter::once(questions)) {
         let id = item.id.clone();
         match model::store::declare(&mut store, "install", "install", installer(), &item) {

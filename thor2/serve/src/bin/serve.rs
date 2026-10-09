@@ -2836,7 +2836,7 @@ fn setup_debt(store: &EventStore) -> Option<String> {
          default, and you apply the defaults without waiting for an answer. When he does answer, \
          apply each number, say ONCE and plainly why an item exists if his answer works against \
          him, then respect his word, and revise the answers Report (never store a second copy). \
-         AGENTS.md's \"First session with a new owner\" section has the same list. \"He does not \
+         That lookup item is the whole First session with a new owner: it also holds the exact calls and the real paths, so you need nothing else. \"He does not \
          want any of this\" is itself a valid answer - write that down and this still clears. Two \
          things settle it: the answers on record, and the note retracted.",
         answers = model::store::OWNER_SETUP_ANSWERS_ID,

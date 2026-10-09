@@ -39,6 +39,7 @@
 
 use crate::install::workflow_starter_pack;
 use serve::plan::{Detection, Plan};
+use std::path::PathBuf;
 
 /// The id and the key of the lookup item that carries the rendered list.
 pub const LOOKUP_ID: &str = "first-session-questions";
@@ -122,7 +123,7 @@ pub fn questions() -> Vec<Question> {
             what: "THOR is wired into Claude Code at four moments: when a session starts, before each tool call, when you send a message, and when a reply ends. That is how the memory speaks up by itself and how replies get checked. A backup copy of Claude Code's settings file was made first.".to_string(),
             why: "A memory that must be asked for stays silent, and a missing connection fails without any message: the memory simply never says a word.",
             default: "On.",
-            say_no: "Then THOR is only a notebook your assistant searches when you ask. I remove the THOR lines from Claude Code's settings file (the backup copy stays next to it), which also ends the weekly check, the reply rules and the bug offers, since they all run through those connections.".to_string(),
+            say_no: "Then THOR is only a notebook your assistant searches when you ask. I remove only THOR's four hook entries (SessionStart, PreToolUse, UserPromptSubmit and Stop, the ones whose command runs the serve program with hook at the end) from {SETTINGS}, and touch no other hook there; the backup copy stays next to it. The thor tool server in {CLAUDE_JSON} stays, so notes can still be searched and saved. It takes effect after you restart Claude Code. This also ends the weekly check, the reply rules and the bug offers, since they all run through those connections.".to_string(),
         },
         Question {
             n: 3,
@@ -225,7 +226,7 @@ pub fn questions() -> Vec<Question> {
             n: 12,
             id: "changelog",
             title: "A changelog and version number",
-            line: "Changelog: Shall I keep a changelog and version number for this project? I create CHANGELOG.md and note each change in it. Default: yes, when the project has none.".to_string(),
+            line: "Changelog: when this project has no changelog I create CHANGELOG.md and note each change in it; say no and I do not. Default: yes, when the project has none.".to_string(),
             what: "A changelog is a file, CHANGELOG.md, with one line for every change you can see, and a version number says which state of the project is running. If this project has none I create the file now and add a line with each change from then on; a project that already keeps one is left as it is.".to_string(),
             why: "Every later session, and you, know exactly what changed and which version runs, without digging through history.",
             default: "Yes, when this project has none.",
@@ -239,6 +240,7 @@ pub fn questions() -> Vec<Question> {
 /// What the assistant does with the answers. Not read out to the user.
 pub const ASSISTANT_RULES: &str = "\
 FOR THE ASSISTANT (do not read this part out)
+- This text is the whole job; you need nothing else. In your first reply, in this order: say the SAY FIRST sentences, make THE TWO CALLS, then show the short list. Every call, command and path you need is written out below (see PATHS ON THIS MACHINE), so never ask him for a path or a command.
 - Show him the short list only: the intro, one line per item and the way to answer. Never paste the detail per item (the last part of this text) at him.
 - The detail per item is yours: state an item's Why once, only when he asks about a number (\"why 7\") or refuses it, in one or two plain sentences, then do what he decided. If he asks and has not refused, add how to say no.
 - Apply the defaults NOW, in this same turn, without waiting for an answer, so nothing waits: store the Report 'owner-setup-answers' with them and retract the setup note. Then show the short list in the user's own language, once, and say that every default on it is already on, except helper agents and backup, which stay off until he chooses, and that he can tell you by number what he wants different (for example \"1 yes, 3 no, 10 local\"; \"defaults\" or \"doe maar\" accepts all of it).
@@ -247,9 +249,33 @@ FOR THE ASSISTANT (do not read this part out)
 - Item 10 (backups) is the second one whose default is NOT on: a fresh install wired no backup, so with the default nothing is backed up. Say that once, in one sentence, after the list, with the way to start (\"backup local\", or the folder or address he wants); do nothing for it until he answers.
 - Item 12 (changelog): the default is yes when this project has none. Unless he says no, create CHANGELOG.md in the project this session runs in (a '# Changelog' heading with an 'Unreleased' section, nothing invented; a project that already has one is left alone) and keep a version number only if the project already has one or he asks for one. If he says no, create nothing and do not ask again.
 - Question 1: if the settings named a plan, ask him to confirm it with its reason; if they did not, ask which plan outright with the same reason. Record his word with install --set-plan max|small --db <store>.
-- When he answers, apply each number where it belongs, then REVISE 'owner-setup-answers' (never store a second copy): 1 install --set-plan; 2 remove THOR's lines from Claude Code's settings file; 3 git config --global --unset core.hooksPath; 4 install --set-weekly-check off|on; 5 retract the named notes (a retracted note stops arriving); 6 install --set-helpers on|off --db <store> (on stores the two helper notes, off retracts them; running it again changes nothing); 7 install --set-mode off (or release); 8 the reply file beside the store (guard-response-rulebook.json) and a stored preference for the language; 9 install --topic, run from inside the folder; 10 install --set-backup local|<folder or address>|off --db <store> (it makes the git folder, adds a named place as the remote 'nas', connects one session-start backup and makes a first copy to prove it works: tell him that result in plain words, and if it failed say so and why); 11 install --set-recording on|off --db <store>; 12 CHANGELOG.md as above.
+- When he answers, apply each number where it belongs, then REVISE 'owner-setup-answers' (never store a second copy): 1 install --set-plan; 2 remove only THOR's four hook entries from the settings file (item 2 below says which and what stays), then tell him it takes effect after he restarts Claude Code; 3 git config --global --unset core.hooksPath; 4 install --set-weekly-check off|on; 5 retract the named notes (a retracted note stops arriving); 6 install --set-helpers on|off --db <store> (on stores the two helper notes, off retracts them; running it again changes nothing); 7 install --set-mode off (or release); 8 the reply file beside the store (guard-response-rulebook.json) and a stored preference for the language; 9 install --topic, run from inside the folder; 10 install --set-backup local|<folder or address>|off --db <store> (it makes the git folder, adds a named place as the remote 'nas', connects one session-start backup and makes a first copy to prove it works: tell him that result in plain words, and if it failed say so and why); 11 install --set-recording on|off --db <store>; 12 CHANGELOG.md as above.
 - A bad answer is one that works against him (for example switching off the connections and then expecting the memory to speak). Say ONCE, in one or two plain sentences, why the item exists (its 'Why' in the detail), then do what he decided. He has the final word, you never block and never nag.
+- A fact he tells you whose anchor you do not know (for example \"staging needs the VPN\" and he has not named the host): never invent a hostname, and never leave the fact unstored or ask him first. Store it with the best real anchor you do have (a file or a command it is about); when there is none, store it as kind orientation with always true (pinned, so it still comes back), with its falsifier. Then offer once, in one sentence, to attach it to the hostname if he gives it, and when he does, revise that note with the target (kind host, value the hostname).
 - \"He does not want any of this\" is itself a valid answer: record it as the answers and apply nothing.";
+
+/// What to say before anything else, in two sentences.
+const SAY_FIRST: &str = "\
+SAY FIRST (before anything else, in his language, no jargon):
+\"This remembers what you tell me about your work, so you never have to repeat it. It brings the right thing back at the right moment.\"";
+
+/// Three facts to give in your own words, without a question.
+const THREE_FACTS: &str = "\
+THREE MORE FACTS (give them in your own words, without a question):
+- Lanes. The code-and-work memory is the default. The personal lane for their own life - recipes, books, a training log - exists anyway and needs no setup; anything personal goes to the library with `shelve`, never into the code memory with `remember`.
+- Project names. Every checkout is scoped by its folder name automatically - facts stay inside that project and do not compete across projects. If a folder name does not match how they call the project, they can run `install --project <name> --db <store>` from inside the checkout to override it. Only when they tell you a name, use it - never invent one.
+- The memory is theirs to correct. A changed fact is corrected with `revise`, never stored a second time - though weakening any rule (clearing or changing its check, lowering its severity, dropping or replacing a binding, narrowing a checked rule's reach, taking a quoted call or a flag out of its text, or turning it into a report) needs a reason too, the same as removing one. Clearing one of those fields outright uses its own `clear_*` flag on `revise` (`clear_check`, `clear_severity`, and so on), not an empty value. A fact that is simply wrong is removed with `retract` and a reason. A true fact that fired in the wrong place is marked as noise with `mark`, instead of being deleted.";
+
+/// The two calls of the first reply. `{PLAN}` is filled by `two_calls`.
+const TWO_CALLS: &str = "\
+THE TWO CALLS (make them in this order, in your first reply, whatever he answers; use the THOR tools remember and retract):
+remember(
+  id:   \"owner-setup-answers\",
+  kind: \"report\",
+  text: \"Setup finished with the defaults, nothing asked first. Plan: {PLAN}. The defaults on the numbered list apply, except helper agents and backup, which stay off until the owner chooses (changelog: yes when the project has none). Replies: short and plain, in the owner's own language. Lane: work only. Projects: named after their folder. Any of these changes when the owner says so.\"
+)
+retract(id: \"walk-through-the-answer-guard-once\", reason: \"Setup finished: the owner's answers are on record as owner-setup-answers.\")
+Give the report NO project: a store this fresh has not named a scope yet, so do not invent one and do not ask him to name one. The retract is refused until the remember call has landed, so make them in this order. When he later answers by number, apply each answer where it belongs (the rules above), then revise 'owner-setup-answers' with what he chose; a second copy is worse than none. \"He is not interested\" is also a valid answer to record.";
 
 /// The line above the detail per item.
 const DETAIL_HEADER: &str = "DETAIL PER ITEM (for the assistant: state an item's Why once, only when he asks about a number or refuses it; never read all of this out)";
@@ -298,8 +324,58 @@ pub fn render_list(detected: Option<Detection>) -> String {
     out
 }
 
+/// The real paths of this machine, known when the installer seeds the
+/// memory. The user's own project does not hold the THOR repository or its
+/// AGENTS.md, so the served text alone has to carry them. A path that is not
+/// known renders as a plain description instead (`fill`), which is also what
+/// the page in AGENTS.md shows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Paths {
+    /// The installer program itself.
+    pub installer: Option<PathBuf>,
+    /// The memory (the store), for every `--db`.
+    pub db: Option<PathBuf>,
+    /// Claude Code's settings file, which holds THOR's four hook entries.
+    pub settings: Option<PathBuf>,
+    /// The file that holds the `thor` tool server (`~/.claude.json` by default).
+    pub tool_server_file: Option<PathBuf>,
+}
+
+fn shown(path: &Option<PathBuf>, unknown: &str) -> String {
+    path.as_ref().map_or_else(|| unknown.to_string(), |p| format!("\"{}\"", p.display()))
+}
+
+impl Paths {
+    fn installer_text(&self) -> String {
+        shown(&self.installer, "the install program in the thor2 folder (install.exe on Windows)")
+    }
+    fn db_text(&self) -> String {
+        shown(&self.db, "<store>")
+    }
+    fn settings_text(&self) -> String {
+        shown(&self.settings, "Claude Code's settings file (~/.claude/settings.json)")
+    }
+    fn tool_server_text(&self) -> String {
+        shown(&self.tool_server_file, "Claude Code's tool-server file (~/.claude.json)")
+    }
+}
+
+/// Put the paths into a text: the tokens `{INSTALL}`, `{DB}`, `{SETTINGS}`,
+/// `{CLAUDE_JSON}`, and the older `<store>` placeholder.
+pub fn fill(text: &str, paths: &Paths) -> String {
+    text.replace("{INSTALL}", &paths.installer_text())
+        .replace("{DB}", &paths.db_text())
+        .replace("{SETTINGS}", &paths.settings_text())
+        .replace("{CLAUDE_JSON}", &paths.tool_server_text())
+        .replace("<store>", &paths.db_text())
+}
+
 /// The detail per item, for the assistant: what, why, default and how to say no.
 pub fn render_detail(detected: Option<Detection>) -> String {
+    render_detail_with(detected, &Paths::default())
+}
+
+pub fn render_detail_with(detected: Option<Detection>, paths: &Paths) -> String {
     let mut out = String::new();
     out.push_str(DETAIL_HEADER);
     out.push('\n');
@@ -308,19 +384,63 @@ pub fn render_detail(detected: Option<Detection>) -> String {
             "\n{}. {}\n   What it is: {}\n   Why it exists: {}\n   What I chose: {}\n   To say no: {}\n",
             q.n,
             q.title,
-            q.what.replace("{PLAN_LINE}", &plan_line(detected)),
+            fill(&q.what.replace("{PLAN_LINE}", &plan_line(detected)), paths),
             q.why,
             q.default,
-            q.say_no
+            fill(&q.say_no, paths)
         ));
     }
     out
 }
 
+/// The plan as the answers report names it.
+fn plan_for_answers(detected: Option<Detection>) -> &'static str {
+    match detected {
+        Some(Detection { plan: Plan::Max, tier_found: true }) => "Max (read from Claude Code's settings; he can correct it)",
+        Some(Detection { plan: Plan::Small, tier_found: true }) => "Pro or smaller (read from Claude Code's settings; he can correct it)",
+        Some(_) => "Pro or smaller by default (the settings did not say; he is asked in item 1)",
+        None => "<as detected or told>",
+    }
+}
+
+/// The two calls of the first reply, with the plan filled in.
+pub fn two_calls(detected: Option<Detection>) -> String {
+    TWO_CALLS.replace("{PLAN}", plan_for_answers(detected))
+}
+
+/// Every path the assistant needs, so it never has to guess one or ask.
+pub fn paths_section(paths: &Paths) -> String {
+    fill(
+        "PATHS ON THIS MACHINE (use them exactly; never ask him for a path)
+- The installer program: {INSTALL}. Wherever this text says `install ...`, run this program with those arguments (a quoted path runs as a command in Bash; in PowerShell put & in front).
+- The memory (the store), for every --db: {DB}
+- Claude Code's settings file, which holds THOR's four hook entries: {SETTINGS}
+- The file that holds the `thor` tool server: {CLAUDE_JSON}",
+        paths,
+    )
+}
+
+/// What the assistant does, everything it needs written out: the rules, what
+/// to say first, the two calls, the paths and the three facts.
+pub fn assistant_section(detected: Option<Detection>, paths: &Paths) -> String {
+    format!(
+        "{}\n\n{}\n\n{}\n\n{}\n\n{}",
+        fill(ASSISTANT_RULES, paths),
+        SAY_FIRST,
+        two_calls(detected),
+        paths_section(paths),
+        fill(THREE_FACTS, paths)
+    )
+}
+
 /// The text of the lookup item: the short list, what the assistant does, then
 /// the detail per item.
 pub fn lookup_text(detected: Option<Detection>) -> String {
-    format!("{}\n{}\n\n{}", render_list(detected), ASSISTANT_RULES, render_detail(detected))
+    lookup_text_with(detected, &Paths::default())
+}
+
+pub fn lookup_text_with(detected: Option<Detection>, paths: &Paths) -> String {
+    format!("{}\n{}\n\n{}", render_list(detected), assistant_section(detected, paths), render_detail_with(detected, paths))
 }
 
 /// The block that sits between the markers in `AGENTS.md`: the same render,
@@ -331,10 +451,14 @@ pub fn agents_md_block() -> String {
 
 /// The lookup item the installer seeds into a new memory.
 pub fn lookup_item(detected: Option<Detection>) -> model::item::Item {
+    lookup_item_with(detected, &Paths::default())
+}
+
+pub fn lookup_item_with(detected: Option<Detection>, paths: &Paths) -> model::item::Item {
     model::item::Item {
         id: LOOKUP_ID.to_string(),
         kind: model::item::Kind::Lookup,
-        text: lookup_text(detected),
+        text: lookup_text_with(detected, paths),
         bindings: vec![],
         severity: None,
         project: None,

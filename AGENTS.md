@@ -543,9 +543,12 @@ valid answer to record - write that down plainly and the note clears exactly
 the same way a full set of preferences would. When answers come later, REVISE
 that report; a second copy is worse than none.
 
-Say first, in two sentences and no jargon: "This remembers what you tell me
-about your work, so you never have to repeat it, and it brings the right thing
-back at the right moment." Then show the list.
+Everything the assistant needs for this conversation is in the block below,
+which is also what the memory itself serves under `lookup first-session-questions`:
+what to say first, the two calls (store `owner-setup-answers`, retract the setup
+note), the real paths of the install, what each answer does, and three more
+facts. The person's own project does not hold this page, so the served text
+carries all of it; it is rendered from one catalogue in the code, here and there.
 
 <!-- questionnaire:begin -->
 THOR is set up. Here is everything the install arranged or switched on, so nothing happens silently, one line each with what I chose for you.
@@ -562,11 +565,12 @@ Nothing here waits for you: ask me about any number and I explain it, say no to 
 9. Topic folders: a plain folder with no code, such as recipes or travel plans, can get a memory of its own when you name it. Default: none set up yet.
 10. Backups: NOTHING is backed up until you choose: a copy on this machine, a place you name (a NAS, another computer, a private repository), or none. Default: none yet.
 11. Record of real calls: for 30 days, on this machine only, THOR keeps your commands and replies with passwords and keys blanked, to find rules that would wrongly block you. Default: on.
-12. Changelog: Shall I keep a changelog and version number for this project? I create CHANGELOG.md and note each change in it. Default: yes, when the project has none.
+12. Changelog: when this project has no changelog I create CHANGELOG.md and note each change in it; say no and I do not. Default: yes, when the project has none.
 
 Answer by number (for example "1 yes, 3 no, 10 local"), ask "why 7" about any number, or say "defaults" to accept all of it; you can change any of it later just by asking.
 
 FOR THE ASSISTANT (do not read this part out)
+- This text is the whole job; you need nothing else. In your first reply, in this order: say the SAY FIRST sentences, make THE TWO CALLS, then show the short list. Every call, command and path you need is written out below (see PATHS ON THIS MACHINE), so never ask him for a path or a command.
 - Show him the short list only: the intro, one line per item and the way to answer. Never paste the detail per item (the last part of this text) at him.
 - The detail per item is yours: state an item's Why once, only when he asks about a number ("why 7") or refuses it, in one or two plain sentences, then do what he decided. If he asks and has not refused, add how to say no.
 - Apply the defaults NOW, in this same turn, without waiting for an answer, so nothing waits: store the Report 'owner-setup-answers' with them and retract the setup note. Then show the short list in the user's own language, once, and say that every default on it is already on, except helper agents and backup, which stay off until he chooses, and that he can tell you by number what he wants different (for example "1 yes, 3 no, 10 local"; "defaults" or "doe maar" accepts all of it).
@@ -575,9 +579,33 @@ FOR THE ASSISTANT (do not read this part out)
 - Item 10 (backups) is the second one whose default is NOT on: a fresh install wired no backup, so with the default nothing is backed up. Say that once, in one sentence, after the list, with the way to start ("backup local", or the folder or address he wants); do nothing for it until he answers.
 - Item 12 (changelog): the default is yes when this project has none. Unless he says no, create CHANGELOG.md in the project this session runs in (a '# Changelog' heading with an 'Unreleased' section, nothing invented; a project that already has one is left alone) and keep a version number only if the project already has one or he asks for one. If he says no, create nothing and do not ask again.
 - Question 1: if the settings named a plan, ask him to confirm it with its reason; if they did not, ask which plan outright with the same reason. Record his word with install --set-plan max|small --db <store>.
-- When he answers, apply each number where it belongs, then REVISE 'owner-setup-answers' (never store a second copy): 1 install --set-plan; 2 remove THOR's lines from Claude Code's settings file; 3 git config --global --unset core.hooksPath; 4 install --set-weekly-check off|on; 5 retract the named notes (a retracted note stops arriving); 6 install --set-helpers on|off --db <store> (on stores the two helper notes, off retracts them; running it again changes nothing); 7 install --set-mode off (or release); 8 the reply file beside the store (guard-response-rulebook.json) and a stored preference for the language; 9 install --topic, run from inside the folder; 10 install --set-backup local|<folder or address>|off --db <store> (it makes the git folder, adds a named place as the remote 'nas', connects one session-start backup and makes a first copy to prove it works: tell him that result in plain words, and if it failed say so and why); 11 install --set-recording on|off --db <store>; 12 CHANGELOG.md as above.
+- When he answers, apply each number where it belongs, then REVISE 'owner-setup-answers' (never store a second copy): 1 install --set-plan; 2 remove only THOR's four hook entries from the settings file (item 2 below says which and what stays), then tell him it takes effect after he restarts Claude Code; 3 git config --global --unset core.hooksPath; 4 install --set-weekly-check off|on; 5 retract the named notes (a retracted note stops arriving); 6 install --set-helpers on|off --db <store> (on stores the two helper notes, off retracts them; running it again changes nothing); 7 install --set-mode off (or release); 8 the reply file beside the store (guard-response-rulebook.json) and a stored preference for the language; 9 install --topic, run from inside the folder; 10 install --set-backup local|<folder or address>|off --db <store> (it makes the git folder, adds a named place as the remote 'nas', connects one session-start backup and makes a first copy to prove it works: tell him that result in plain words, and if it failed say so and why); 11 install --set-recording on|off --db <store>; 12 CHANGELOG.md as above.
 - A bad answer is one that works against him (for example switching off the connections and then expecting the memory to speak). Say ONCE, in one or two plain sentences, why the item exists (its 'Why' in the detail), then do what he decided. He has the final word, you never block and never nag.
+- A fact he tells you whose anchor you do not know (for example "staging needs the VPN" and he has not named the host): never invent a hostname, and never leave the fact unstored or ask him first. Store it with the best real anchor you do have (a file or a command it is about); when there is none, store it as kind orientation with always true (pinned, so it still comes back), with its falsifier. Then offer once, in one sentence, to attach it to the hostname if he gives it, and when he does, revise that note with the target (kind host, value the hostname).
 - "He does not want any of this" is itself a valid answer: record it as the answers and apply nothing.
+
+SAY FIRST (before anything else, in his language, no jargon):
+"This remembers what you tell me about your work, so you never have to repeat it. It brings the right thing back at the right moment."
+
+THE TWO CALLS (make them in this order, in your first reply, whatever he answers; use the THOR tools remember and retract):
+remember(
+  id:   "owner-setup-answers",
+  kind: "report",
+  text: "Setup finished with the defaults, nothing asked first. Plan: <as detected or told>. The defaults on the numbered list apply, except helper agents and backup, which stay off until the owner chooses (changelog: yes when the project has none). Replies: short and plain, in the owner's own language. Lane: work only. Projects: named after their folder. Any of these changes when the owner says so."
+)
+retract(id: "walk-through-the-answer-guard-once", reason: "Setup finished: the owner's answers are on record as owner-setup-answers.")
+Give the report NO project: a store this fresh has not named a scope yet, so do not invent one and do not ask him to name one. The retract is refused until the remember call has landed, so make them in this order. When he later answers by number, apply each answer where it belongs (the rules above), then revise 'owner-setup-answers' with what he chose; a second copy is worse than none. "He is not interested" is also a valid answer to record.
+
+PATHS ON THIS MACHINE (use them exactly; never ask him for a path)
+- The installer program: the install program in the thor2 folder (install.exe on Windows). Wherever this text says `install ...`, run this program with those arguments (a quoted path runs as a command in Bash; in PowerShell put & in front).
+- The memory (the store), for every --db: <store>
+- Claude Code's settings file, which holds THOR's four hook entries: Claude Code's settings file (~/.claude/settings.json)
+- The file that holds the `thor` tool server: Claude Code's tool-server file (~/.claude.json)
+
+THREE MORE FACTS (give them in your own words, without a question):
+- Lanes. The code-and-work memory is the default. The personal lane for their own life - recipes, books, a training log - exists anyway and needs no setup; anything personal goes to the library with `shelve`, never into the code memory with `remember`.
+- Project names. Every checkout is scoped by its folder name automatically - facts stay inside that project and do not compete across projects. If a folder name does not match how they call the project, they can run `install --project <name> --db <store>` from inside the checkout to override it. Only when they tell you a name, use it - never invent one.
+- The memory is theirs to correct. A changed fact is corrected with `revise`, never stored a second time - though weakening any rule (clearing or changing its check, lowering its severity, dropping or replacing a binding, narrowing a checked rule's reach, taking a quoted call or a flag out of its text, or turning it into a report) needs a reason too, the same as removing one. Clearing one of those fields outright uses its own `clear_*` flag on `revise` (`clear_check`, `clear_severity`, and so on), not an empty value. A fact that is simply wrong is removed with `retract` and a reason. A true fact that fired in the wrong place is marked as noise with `mark`, instead of being deleted.
 
 DETAIL PER ITEM (for the assistant: state an item's Why once, only when he asks about a number or refuses it; never read all of this out)
 
@@ -591,7 +619,7 @@ DETAIL PER ITEM (for the assistant: state an item's Why once, only when he asks 
    What it is: THOR is wired into Claude Code at four moments: when a session starts, before each tool call, when you send a message, and when a reply ends. That is how the memory speaks up by itself and how replies get checked. A backup copy of Claude Code's settings file was made first.
    Why it exists: A memory that must be asked for stays silent, and a missing connection fails without any message: the memory simply never says a word.
    What I chose: On.
-   To say no: Then THOR is only a notebook your assistant searches when you ask. I remove the THOR lines from Claude Code's settings file (the backup copy stays next to it), which also ends the weekly check, the reply rules and the bug offers, since they all run through those connections.
+   To say no: Then THOR is only a notebook your assistant searches when you ask. I remove only THOR's four hook entries (SessionStart, PreToolUse, UserPromptSubmit and Stop, the ones whose command runs the serve program with hook at the end) from Claude Code's settings file (~/.claude/settings.json), and touch no other hook there; the backup copy stays next to it. The thor tool server in Claude Code's tool-server file (~/.claude.json) stays, so notes can still be searched and saved. It takes effect after you restart Claude Code. This also ends the weekly check, the reply rules and the bug offers, since they all run through those connections.
 
 3. The git hooks in every repository
    What it is: THOR set one git setting for the whole machine so that every repository refreshes THOR's code index after each commit. Each repository's own git hooks still run; if another tool already owned that setting, THOR left it alone.
@@ -653,45 +681,6 @@ DETAIL PER ITEM (for the assistant: state an item's Why once, only when he asks 
    What I chose: Yes, when this project has none.
    To say no: Then I create no file and do not ask again; the starter work rule about changelogs (item 5) stays, and it only applies to a project that keeps one.
 <!-- questionnaire:end -->
-
-Three more facts to give in your own words, without a question:
-
-- **Lanes.** The code-and-work memory is the default. The personal lane for
-  their own life - recipes, books, a training log - exists anyway and needs no
-  setup; anything personal goes to the library with `shelve`, never into the code
-  memory with `remember`.
-- **Project names.** Every checkout is scoped by its folder name automatically -
-  facts stay inside that project and do not compete across projects. If a folder
-  name does not match how they call the project, they can run
-  `install --project <name> --db "<their store>"` from inside the checkout to
-  override it. Only when they tell you a name, use it - never invent one.
-- **That the memory is theirs to correct.** A changed fact is corrected with
-  `revise`, never stored a second time - though weakening any rule (clearing or
-  changing its check, lowering its severity, dropping or replacing a binding,
-  narrowing a checked rule's reach, taking a quoted call or a flag out of its
-  text, or turning it into a report) needs a reason too, the same as removing
-  one. Clearing one of those fields outright uses its own `clear_*` flag on
-  `revise` (`clear_check`, `clear_severity`, and so on), not an empty value.
-  A fact that is simply wrong is removed with `retract` and a reason. A true
-  fact that fired in the wrong place is marked as noise with `mark`, instead
-  of being deleted.
-
-## The two calls
-
-Make them in this order, in the first reply, whatever the person answers:
-
-```
-remember(
-  id:   "owner-setup-answers",
-  kind: "report",
-  text: "Setup finished with the defaults, nothing asked first. Plan: <as detected or told>. The defaults on the numbered list apply, except helper agents and backup, which stay off until the owner chooses (changelog: yes when the project has none). Replies: short and plain, in the owner's own language. Lane: work only. Projects: named after their folder. Any of these changes when the owner says so."
-)
-retract(id: "walk-through-the-answer-guard-once", reason: "Setup finished: the owner's answers are on record as owner-setup-answers.")
-```
-
-When the person answers by number, apply each answer where it belongs (the
-assistant rules under the list say where), then `revise` `owner-setup-answers`
-with what they chose.
 
 ## The starter set of work rules
 
