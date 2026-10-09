@@ -11,6 +11,10 @@ serve = { path = "../serve" }
 # Named directly by the health check, which reports how many rules carry a
 # runnable proof and therefore has to know a Rule from a Report.
 model = { path = "../model" }
+# `model::item::Binding::Moment` carries an `intent::Action`; the starter
+# workflow notes (`install::workflow_starter_pack`) name the moments they fire
+# at (commit, push, ...) and so need the type.
+intent = { path = "../intent" }
 codeindex = { path = "../codeindex" }
 # The drain replays a captured tool call through the very same handler the
 # local agent reaches, so the write gate runs once, here, at the authority.
@@ -59,8 +63,3 @@ path = "src/bin/backup.rs"
 [dev-dependencies]
 tempfile = "3"
 model = { path = "../model" }
-# Only the health-check test fixtures build a `Binding::Moment(Action::...)`
-# directly (the production `dead_moment_bindings_line` never names `intent`
-# itself - it reads `model::item::Binding::Moment`'s own field type and asks
-# `model::gate::is_dead_moment` about it), so this stays a dev-dependency.
-intent = { path = "../intent" }

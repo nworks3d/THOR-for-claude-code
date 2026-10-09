@@ -1,159 +1,96 @@
 # AGENTS.md - read this if you are the AI assistant
 
-The person you work with wants THOR running, and you are the one setting it up.
-This page is the setup, and the short version of how to write a note that comes
-back to you later.
+The person you work with sent you this link and asked you to install THOR. You
+are the one setting it up, and they should have to do exactly one thing: restart
+you once. Everything else is yours, in the order below, without asking them
+anything in between.
 
-**One rule above all: assume they have never done any of this before.** Do every
-step you have the tools for yourself. Say what you are doing in ordinary words.
-When a step genuinely needs them (a restart), give them exactly one thing to do,
-and check it worked before moving on. Never hand back a menu of options.
+**One rule above all: assume they have never done any of this before.** Say what
+you are doing in ordinary words. Never hand back a menu of options, and never
+send them off to type a command or a path: you have the tools, so run it.
 
----
+## The whole install, in five steps
 
-# Setting them up
+1. **Get the machine ready and install it, from inside their project folder.**
+   Open a terminal in the folder of the project they work on. It does not matter
+   if it is not a git repository, and a folder of notes for a subject works too
+   (see "A folder for a subject, not for code" below).
+   - First check what the machine has, and install only what is missing, exactly
+     as written in "What the machine needs first" right below this list. Say in
+     one sentence what you are about to install and why. The system may show ONE
+     permission prompt for it; that click is the person's, and they type nothing.
+   - Then run the one command for their system:
+     - Windows, in PowerShell:
+       `irm https://raw.githubusercontent.com/nworks3d/THOR-memory-bible-for-AI/main/install.ps1 | iex`
+     - Linux:
+       `curl -fsSL https://raw.githubusercontent.com/nworks3d/THOR-memory-bible-for-AI/main/install.sh | sh`
+     - macOS or any other system: there is no download for it yet, so build it
+       from source (see "Installing from a build you made yourself" below).
 
-**Which route first.** Do they have a Rust toolchain and a copy of this
-repository? Almost never, and they do not need either. If THOR is not installed
-yet, take the no-tools route:
+   That one command downloads the latest release, checks it against its
+   published checksum, unpacks it into the home folder, creates the memory with
+   its starting notes (a general set of work rules included), wires the hooks
+   and the tool server into Claude Code, and reads this project's code and
+   registers it. No Rust toolchain, no question, no path to type. If your own
+   harness asks the person to approve running it, or editing Claude Code's
+   settings, that is the harness asking: it is the one click they cannot skip.
+2. **Check it before the restart.** Run `doctor` and then `serve session-start`,
+   exactly as written in "Checking it" below: the first says the memory is
+   healthy, the second shows what the next conversation will be handed. If
+   either is not fine, fix it yourself and run the check again. Only report
+   success when both pass.
+3. **Ask for the restart, in one sentence.** Say it as one plain instruction:
+   "Close Claude Code completely - not just this conversation - and open it again,
+   in the same folder. Then say hello and I will check it worked." Claude Code
+   reads the new memory at startup only; closing one conversation is not enough,
+   and neither is a compaction. This is the one thing you cannot do for them.
+4. **After the restart, finish the setup yourself.** The new session opens with
+   a note telling you setup is not finished. Call `status` first (if the tools
+   are not there, the restart did not happen yet: ask once more). Then follow
+   "First session with a new owner" below: tell them the defaults in one
+   sentence, record them as `owner-setup-answers`, retract the setup note. Do
+   not ask them questions and do not wait for an answer; they can change any
+   default later by telling you.
+5. **Tell them what they now have, in three sentences.** That THOR remembers what
+   they tell it and brings it back right before it matters. That a starter set of
+   work rules is on (changelog with every change, tests before "done", no secrets
+   in a commit, and the rest listed below), and that any can be removed by saying
+   so. That to change anything they only have to tell you.
 
-1. Tell them in one sentence what the one-line installer does: it downloads the
-   latest release from this project's GitHub page, checks it against the checksum
-   published beside it, unpacks it into a `thor2` folder in their home folder,
-   and sets everything up. (The exact lines are in the README, "Getting
-   started", step 2: `install.ps1` on Windows, `install.sh` on Linux.)
-2. Run it for them.
-3. It ends by telling them the one thing left, a restart. Carry on at step 3
-   below. Steps 1 and 2 below are the route for someone building from source:
-   the one-line installer already did both.
+## What the machine needs first
 
-Where things end up: the programs are in the `thor2` folder in their home
-folder (so `install.exe` there is step 2, done), and the memory is
-`%LOCALAPPDATA%\thor2\thor.db` on Windows or `~/.local/share/thor2/thor.db` on
-Linux, unless the installer printed another path on its `memory:` line. Use
-that path wherever `<their store>` appears below.
+You do this inside step 1, for them, with the package manager the system already
+has. Check each program; install it ONLY when the check fails. Never ask the
+person to type or paste anything, and never ask which way they prefer.
 
-**1. Build it.** They need a Rust toolchain, and nothing else.
+| Needed | Why | Check | Windows (winget) | macOS (brew) | Linux |
+| --- | --- | --- | --- | --- | --- |
+| git | Reads a project's code and keeps that reading fresh after each commit. On Windows, Git for Windows also provides Git Bash, the shell Claude Code runs its hooks through. | `git --version` | `winget install --id Git.Git -e --source winget --silent --accept-package-agreements --accept-source-agreements` | `brew install git` | apt: `sudo apt-get install -y git`; dnf: `sudo dnf install -y git` |
+| Python 3 | Helper scripts that assistants write and run for a person's work commonly use it. | `python --version` (`python3 --version` on macOS and Linux) must print `Python 3.` The Microsoft Store stub that opens the Store instead is NOT Python. | `winget install --id Python.Python.3.12 -e --source winget --silent --accept-package-agreements --accept-source-agreements` | `brew install python` | apt: `sudo apt-get install -y python3`; dnf: `sudo dnf install -y python3` |
+| The C++ runtime (Windows only) | THOR's programs need it; nearly every machine has it. `install.ps1` checks it and stops with this very command if it is missing. | the programs refuse to start | `winget install --id Microsoft.VCRedist.2015+.x64 -e --source winget --silent --accept-package-agreements --accept-source-agreements` | not needed | not needed |
 
-```sh
-cd thor2 && cargo build --release --features semantic
-```
+- A program that was just installed is not on the PATH of the terminal you are
+  in. Open a new terminal (or ask for a fresh PATH) before you check it again.
+- At most one prompt: winget on Windows may ask Windows for permission once;
+  `sudo` on Linux may ask for the person's password once. That is the system
+  asking, not you. If a prompt cannot be answered where you run, say so in one
+  sentence and stop: do not work around it.
+- On macOS, if `git --version` makes macOS open its own dialog to install the
+  command line tools, that dialog is the system's one prompt. If `brew` itself is
+  missing, say so plainly; do not install it silently.
+- Rust is NOT needed for the normal install. Only a build from source needs it,
+  and the release archive is always the first choice (see "Installing from a
+  build you made yourself").
+- The winget ids above were each checked with `winget show --id <id> -e` on
+  2026-10-09. The brew, apt and dnf package names are the standard ones and were
+  not run here.
 
-Then check the size of `thor2/target/release/serve.exe`. Over 20 MB is right.
-A few MB means `--features semantic` was left off, and searching by meaning is
-now silently missing: it returns nothing at all, with no error anywhere. Build
-it again rather than carrying on.
+## A folder for a subject, not for code
 
-**2. Install it.** One command does the whole setup, and in the common case it
-takes no arguments at all:
-
-```sh
-thor2/target/release/install.exe
-```
-
-It finds Claude Code's own two config files by itself - the per-user
-`settings.json` for the hooks, and `~/.claude.json` for the tool server you
-write through - creates their memory if there is not one yet, seeds the notes
-in the next section, and wires it all together. It backs up both files first,
-never removes anything it did not put there, and a second run changes nothing.
-
-It also points git at a shared set of hooks that run in every repository on
-this machine, not only this one - each one still finishes by running that
-repository's own hook, so nothing already there stops working.
-
-It also writes an end-of-session routine, `/thor-eval`, to your own commands
-folder. Run it at the end of a session: it walks through everything the
-memory has been served without a verdict and settles that debt in one pass,
-rather than leaving it for the next session to inherit.
-
-Nothing to type in the normal case. For an unusual setup: `--settings` and
-`--mcp-json` point it at other files, `--db` and `--serve-exe` override the
-rest, and `--no-mcp` installs a memory the agent can read but not write, on
-purpose.
-
-If it stops because a program it needs is not next to it, build it first
-(step 1). It refuses rather than install a hook that points at a missing
-binary - a missing program produces no error later, only silence, and their
-memory would simply never speak.
-
-**3. Have them restart the assistant once.** Both of those files are read at
-startup only. Until they restart, nothing you just installed is running. This
-is the one step you cannot do for them. Say it as one plain instruction: "Close
-Claude Code completely - not just this conversation - and open it again, in the
-same folder. Then say hello and I will check it worked." Closing one
-conversation is not enough, and neither is a compaction.
-
-**4. Check it.**
-
-```sh
-thor2/target/release/doctor.exe --db "<their store>"
-```
-
-The first lines are a short plain summary: OK or PROBLEM, and every problem
-carries its one next step. Read those out to them in your own words; the long
-report under it is for you, not for them. A missing language model is not a
-problem: THOR works without it, just with simpler matching.
-
-**5. Read the project's code and register its working copy.** A fresh project
-is scoped by the name of its folder already, with no setup. This command adds
-two things. Run it from inside the project's folder, with the full path to the
-installer you built in step 1, and with `--db` naming their memory - the path
-step 2 printed on its `memory:` line:
-
-```sh
-"<path to thor2>/target/release/install.exe" --db "<their store>"
-```
-
-It reads this project's code once, so searching the code, finding where a symbol
-is used and outlining a file answer here at all, and from then on every commit
-keeps that reading fresh by itself. That same successful read also opens the
-project in the memory itself, so the note in step 6 lands under this project's
-name without ever being asked to name a new collection.
-
-It also registers this checkout as the project's working copy: the one folder
-THOR tries a rule's file check in when the rule is written (see "How to write a
-note" below). It says so on a line that starts with `+ registered`, naming the
-folder.
-
-Add `--project "<project-name>"` only when the folder is not called what they
-call the project; most of the time, leave it off.
-
-**A project an earlier release already read has no working copy yet.** Nothing
-registers it by itself. Run this once from inside that checkout - it records
-the folder and touches nothing else, no settings and no code reading:
-
-```sh
-"<path to thor2>/target/release/install.exe" --register-root --db "<their store>"
-```
-
-It answers `registered '<project>' -> <folder>`. Doctor names every project
-that owns rules but has no working copy registered, with this same command.
-
-One project has one working copy, and the command says so when you are in the
-wrong place. Nothing is changed when it refuses:
-
-- `REFUSED: '<project>' is registered at <folder>, which is still a checkout of
-  it` - you are in a second copy of the project. Go to that folder and run the
-  command there, or leave it: that folder is already the one THOR uses.
-- `... which still exists. Moving a registration is the owner's call` - the
-  project moved, but its old folder is still there. Ask the owner. Once he has
-  removed or renamed the old folder, run the command again from the new one.
-
-It refuses to change a name already there - renaming a scope would strand every
-note filed under the old one. A repository on a network share needs a
-`safe.directory` line before git will open it as you.
-
-A folder with no git in it is not an error and needs no repository: it is a
-topic folder, and 5b right below is its whole route.
-
-You may not invent a name. The owner names a scope; if nothing that exists fits,
-ask him and use the word he gives you.
-
-**5b. A topic folder: no code, no git.** This is the route for someone who
-wants THOR for a SUBJECT - a renovation, a thesis, a trip, a hobby - and is not
-a programmer. A folder of notes, quotes and
-PDFs is a project like any other, keyed by the folder's own name. Do the steps
-yourself; they should not have to type anything.
+This is the route for someone who wants THOR for a SUBJECT - a renovation, a
+thesis, a trip, a hobby - and is not a programmer. A folder of notes, quotes and
+PDFs is a project like any other, keyed by the folder's own name. It needs no
+git. Do the steps yourself; they should not have to type anything.
 
 1. **One folder per subject, with Claude Code opened in it.** If they have not
    made it yet, ask only what the subject is called, make the folder (for
@@ -195,7 +132,7 @@ yourself; they should not have to type anything.
    )
    ```
 
-   Then, after the restart in step 3, open a fresh conversation in the same
+   Then, after the restart in step 3 above, open a fresh conversation in the same
    folder and check that it comes back at the start. If not, the cause is nearly
    always the restart.
 6. **Check it with `doctor`** run from inside the folder: its first lines are a
@@ -204,12 +141,157 @@ yourself; they should not have to type anything.
 If `install.exe --topic` refuses, its message is plain and names the one fix.
 Nothing is changed when it refuses.
 
-**6. Prove it works before you say it works.** Store one real note, then start a
-fresh conversation and check that it comes back. Only then tell them setup is
-done.
+---
 
-Use something they actually said, not a test string - a note worth keeping is a
-better proof than "hello world", and they get to keep it:
+# The developer route and the details behind the steps
+
+Where things end up: the programs are in the `thor2` folder in the home folder
+(`install.exe` there is step 1, done), and the memory is
+`%LOCALAPPDATA%\thor2\thor.db` on Windows or `~/.local/share/thor2/thor.db` on
+Linux, unless the installer printed another path on its `memory:` line. Use that
+path wherever `<their store>` appears below.
+
+## Installing from a build you made yourself
+
+Only for a system with no download (macOS today) or when they asked for a build
+from source. You need a Rust toolchain and nothing else: if `cargo` is missing,
+install it first (Windows: `winget install --id Rustlang.Rustup -e --source winget`;
+macOS: `brew install rustup`; Linux: rustup.rs).
+
+```sh
+cd thor2 && cargo build --release --features semantic
+```
+
+Then check the size of `thor2/target/release/serve.exe` (`serve` on Linux and
+macOS). Over 20 MB is right. A few MB means `--features semantic` was left off,
+and searching by meaning is now silently missing: it returns nothing at all, with
+no error anywhere. Build it again rather than carrying on. Then run
+`thor2/target/release/install.exe` (`install` elsewhere) from the project's
+folder: it is the same setup step the download ends with.
+
+## What the install command does
+
+The scripts download `thor2-windows-x86_64.zip` or `thor2-linux-x86_64.tar.gz`
+from the latest release, verify the `.sha256` beside it, unpack it into
+`%USERPROFILE%\thor2` (Windows) or `~/.thor2` (Linux; `THOR_HOME` changes it) and
+run the archive's `install` program with no arguments. On Windows the script first
+checks for Microsoft's Visual C++ runtime, which almost every machine has; if it is
+missing the script stops and prints the one `winget` command that installs it
+(Windows may ask permission once). Nothing needs administrator rights otherwise.
+
+`install` in the common case takes no arguments at all. It finds Claude Code's own
+two config files by itself - the per-user `settings.json` for the hooks, and
+`~/.claude.json` for the tool server you write through - creates their memory if
+there is not one yet, seeds the notes in "First session with a new owner" below,
+and wires it all together. It backs up both files first, never removes anything it
+did not put there, and a second run changes nothing.
+
+It also points git at a shared set of hooks that run in every repository on this
+machine, not only this one - each one still finishes by running that repository's
+own hook, so nothing already there stops working.
+
+It also writes an end-of-session routine, `/thor-eval`, to your own commands
+folder. Run it at the end of a session: it walks through everything the memory has
+been served without a verdict and settles that debt in one pass, rather than
+leaving it for the next session to inherit.
+
+Run from inside a git project, it also reads that project's code once, so
+searching the code, finding where a symbol is used and outlining a file answer
+there at all, and from then on every commit keeps that reading fresh by itself.
+That same successful read opens the project in the memory, so a note lands under
+this project's name without ever being asked to name a new collection. It also
+registers that checkout as the project's working copy: the one folder THOR tries
+a rule's file check in when the rule is written (see "How to write a note" below).
+The line starting with `+ registered` names the folder.
+
+For an unusual setup: `--settings` and `--mcp-json` point it at other files, `--db`
+and `--serve-exe` override the rest, and `--no-mcp` installs a memory the agent can
+read but not write, on purpose. If it stops because a program it needs is not next
+to it, the download was incomplete or the build is: do that step again. It refuses
+rather than install a hook that points at a missing binary - a missing program
+produces no error later, only silence, and their memory would simply never speak.
+
+## Checking it
+
+Both of these work before the restart. First the health check, with the store path
+from the `memory:` line the install printed (`<bin>` is the folder the install
+unpacked into: `%USERPROFILE%\thor2` on Windows, `~/.thor2` on Linux):
+
+```sh
+"<bin>/doctor" --db "<their store>"
+```
+
+The first lines are a short plain summary: OK or PROBLEM, and every problem
+carries its one next step. Read those out to them in your own words; the long
+report under it is for you, not for them. What you look for in the long report:
+`memory store: N events, chain intact`, `falsifiers: all N rule(s)/orientation(s)
+have one` and `dead moments: none`. A missing language model is not a problem:
+THOR works without it, just with simpler matching. A fresh memory also prints
+lines headed `undecided`, `toothless` and `batch`: that is the upkeep THOR will
+do itself in its first evaluation, not a fault, so do not act on them and do not
+read them out to the person.
+
+Then ask the memory what it would hand over at the start of a conversation. This is
+the very thing Claude Code's hook asks on the next start, without recording
+anything:
+
+```sh
+"<bin>/serve" --db "<their store>" session-start
+```
+
+It prints a `Standing rules for this session:` block holding the starting notes
+(among them `say-what-actually-happened` and `walk-through-the-answer-guard-once`).
+A block with nothing in it, or an error, means the memory would stay silent after
+the restart: run the install again and read what it printed.
+
+## Another project, later
+
+Every project is scoped by the name of its folder already, with no setup. To read
+another project's code and register its working copy, run the installer again from
+inside that folder, naming the memory (`--db`, the path the install printed on its
+`memory:` line):
+
+```sh
+"<the folder the install unpacked into>/install" --db "<their store>"
+```
+
+Add `--project "<project-name>"` only when the folder is not called what they call
+the project, and only when they told you the name: you may not invent one.
+
+**A project an earlier release already read has no working copy yet.** Nothing
+registers it by itself. Run this once from inside that checkout - it records the
+folder and touches nothing else, no settings and no code reading:
+
+```sh
+"<the folder the install unpacked into>/install" --register-root --db "<their store>"
+```
+
+It answers `registered '<project>' -> <folder>`. Doctor names every project that
+owns rules but has no working copy registered, with this same command.
+
+One project has one working copy, and the command says so when you are in the wrong
+place. Nothing is changed when it refuses:
+
+- `REFUSED: '<project>' is registered at <folder>, which is still a checkout of it` -
+  you are in a second copy of the project. Go to that folder and run the command
+  there, or leave it: that folder is already the one THOR uses.
+- `... which still exists. Moving a registration is the owner's call` - the project
+  moved, but its old folder is still there. Ask the owner. Once he has removed or
+  renamed the old folder, run the command again from the new one.
+
+It refuses to change a name already there - renaming a scope would strand every
+note filed under the old one. A repository on a network share needs a
+`safe.directory` line before git will open it as you.
+
+A folder with no git in it is not an error and needs no repository: it is a
+topic folder, and "A folder for a subject, not for code" near the top is its whole route.
+
+## After the restart: one real round trip
+
+Once the tool server is live (step 4 above calls `status` for exactly this), prove
+the write path with something they actually said, not a test string - a note worth
+keeping is a better proof than "hello world", and they get to keep it. Do this only
+when they have said something worth keeping; never invent one.
 
 ```
 remember(
@@ -221,25 +303,25 @@ remember(
 )
 ```
 
-Then open a new conversation and touch that host. If the note comes back, setup
-is done. If it does not, do not tell them it worked - the usual cause is step 3,
-the restart.
+Then touch that host in the same conversation: the note comes back right before the
+call. If a restart never happened, the tool is simply missing - that is step 3 again.
 
-**7. Optional: ask where the memory should be backed up.** (Skip this for
-someone with no git and no NAS; offer it only when they have either.) Once a day THOR
-writes a copy of the memory into a git repository they own (the install tells
-them where it is, and the command is `backup.exe --db "<their store>" --repo
-"<that folder>"`). Ask them where the copy should go: another folder on their NAS
-or any machine they own is the safe choice, a private repository on a website
-the other. To send it to a NAS, create an empty bare repository there
-(`git init --bare <folder on the NAS>`), add it to the backup folder as a remote
-called `nas` (`git -C "<that folder>" remote add nas <the NAS folder>`), and push
-the branch once by name (`git -C "<that folder>" push nas main`). From then on
-the backup uses `nas` by itself, with no other setting. If git says the folder
-has "dubious ownership", add it as a safe directory with the line git prints.
-`doctor` then names the place the last copy went. The memory can be rebuilt from
-it with `backup.exe --db "<a new store path>" --restore-from "<the thor2 folder
-of the backup>"`.
+## Backup
+
+Once a day THOR writes a copy of the memory into a git repository it keeps beside the
+store (the install says where, and the command is `backup.exe --db "<their store>"
+--repo "<that folder>"`). Do not ask them about it: the default, a local copy, is
+already on. Only when they ask for the copy to live somewhere else, tell them the
+options: another folder on their NAS or any machine they own is the safe choice, a
+private repository on a website the other. To send it to a NAS, create an empty bare
+repository there (`git init --bare <folder on the NAS>`), add it to the backup folder
+as a remote called `nas` (`git -C "<that folder>" remote add nas <the NAS folder>`),
+and push the branch once by name (`git -C "<that folder>" push nas main`). From then
+on the backup uses `nas` by itself, with no other setting. If git says the folder has
+"dubious ownership", add it as a safe directory with the line git prints. `doctor`
+then names the place the last copy went. The memory can be rebuilt from it with
+`backup.exe --db "<a new store path>" --restore-from "<the thor2 folder of the
+backup>"`.
 
 ## The tools you have
 
@@ -260,7 +342,7 @@ announce themselves.
 
 # How to write a note that actually comes back
 
-Step 2 puts these into their memory as pinned notes, so from the next
+The install puts these into their memory as pinned notes, so from the next
 conversation onward they arrive on their own at every session start and you do
 not have to remember any of it. This section is the fuller version, and it is
 here because you are reading it *before* that restart, when the memory cannot
@@ -341,7 +423,7 @@ with `--help` in it, a `git push --dry-run` (or `-n`), or a PowerShell call with
 one joined by `&&` or `;`.
 
 **A file check needs the project's working copy.** THOR tries it in the
-checkout registered for the rule's project (step 5 registers it). Written from
+checkout registered for the rule's project (the install, run from inside the project, registers it). Written from
 inside that project before it is registered, the rule is refused with the one
 command to run there. Written from anywhere else, it is stored as a note that
 keeps the check pending, and so is a check that holds in your own checkout (a
@@ -399,12 +481,18 @@ Once install has run and they have restarted, a seeded note -
 `walk-through-the-answer-guard-once` - arrives at the start of every session
 until it is retracted. It exists to make sure this conversation happens once,
 before any other work, and that it covers the whole first session, not only
-the answer guard. Raise each point below in plain language, apply the answer
-as you go, then retract the note.
+the answer guard.
+
+**Do not turn it into an interview.** The person asked for THOR to be installed
+and nothing more, so every point below has a default, and the defaults apply
+without waiting for an answer. Say them in ONE sentence, apply them, record
+them, and change only what they tell you to change. Someone who answers "just do
+it", or who does not answer at all, is answered by the defaults. Only a person
+who wants to go through the points one by one gets the questions.
 
 This is held, not only asked. The session does not end while the note is
 live, and retracting it is refused until the owner's answers are on record as
-`owner-setup-answers` - store what he chose first, then retract; the retract
+`owner-setup-answers` - store what applies first, then retract; the retract
 itself fails otherwise, with the same reminder. Store it as a plain Report
 with no project: a store this fresh has not named a scope yet, and this one
 item needs none - do not invent a collection for it, and do not ask him to
@@ -412,45 +500,110 @@ name one just to get this write to land. "He is not interested" is itself a
 valid answer to record - write that down plainly and the note clears exactly
 the same way a full set of preferences would.
 
-**Keep it short and friendly: three questions, asked one at a time, in their
-words, and "skip" is always an answer.** Someone who has never done this does
-not want a form. Everything else has a sensible default: do NOT raise it unless
-they ask.
+- **What this is.** In two sentences and no jargon: "This remembers what you
+  tell me about your work, so you never have to repeat it, and it brings the
+  right thing back at the right moment." Say this first, so the rest makes sense.
+- **How replies should read.** Default: short and plain, no length limit and no
+  summary line, in the language they write to you in - their own rules can be
+  written in that language even while the code stays English. Only when they
+  want it otherwise, ask how long a reply can get before it is too long and
+  whether they want a short summary line before the detail.
+- **Which lanes they want.** Default: the code-and-work memory only. The
+  personal lane for their own life - recipes, books, a training log - exists
+  anyway and needs no setup; anything personal goes to the library with
+  `shelve`, never into the code memory with `remember`.
+- **Which starting rules to keep.** Default: all of them. The install seeded the
+  starting notes listed below and five example rules into
+  `guard-response-rulebook.json`, next to the store. Each rule in that file is one
+  entry with a plain-language reminder line - edit the reminder to change what it
+  says, or delete the entry to turn the rule off.
+- **How they name their projects.** Default: the folder name. Every checkout is
+  scoped by its folder name automatically - facts stay inside that project and do
+  not compete across projects. If a folder name does not match how they call the
+  project, they can run `install --project <name> --db "<their store>"` from
+  inside the checkout to override it. Only when they tell you a name, use it -
+  never invent one.
+- **That the memory is theirs to correct.** A changed fact is corrected with
+  `revise`, never stored a second time - though weakening any rule (clearing or
+  changing its check, lowering its severity, dropping or replacing a binding,
+  narrowing a checked rule's reach, taking a quoted call or a flag out of its
+  text, or turning it into a report) needs a reason too, the same as removing
+  one. Clearing one of those fields outright uses its own `clear_*` flag on
+  `revise` (`clear_check`, `clear_severity`, and so on), not an empty value.
+  A fact that is simply wrong is removed with `retract` and a reason. A true
+  fact that fired in the wrong place is marked as noise with `mark`, instead
+  of being deleted.
 
-- **What this is** - say it first, in two sentences and no jargon: "This
-  remembers what you tell me about your work, so you never have to repeat it,
-  and it brings the right thing back at the right moment." Nothing more.
-- **Question 1: what language should I answer in?** Their own rules can be
-  written in that language even while code stays English.
-- **Question 2: short answers or detailed ones?** And, only if they care, a
-  one-line summary before the detail. Apply it to the reply-shape reminders in
-  `guard-response-rulebook.json`, next to the store (each entry has a
-  plain-language reminder line; edit it to change what it says).
-- **Question 3: do you also want me to keep things about your own life -
-  recipes, books, a training log - in a separate place?** Yes or no. Either way,
-  anything personal goes to the library with `shelve`, never into the work memory
-  with `remember`.
-- **Do not raise, unless they ask:** which starting rules to keep (they stay on,
-  and any can be edited or deleted later), and how projects are named (a folder
-  is named after itself; `install --project <name> --db "<their store>"` from
-  inside it overrides that - only then ask what name they want, never invent
-  one).
-- **Say once, in one sentence, that the memory is theirs to correct:** "If
-  something I remember is wrong, just tell me and I will fix it." (For you: a
-  changed fact is corrected with `revise`, never stored a second time - though
-  weakening any rule (clearing or changing its check, lowering its severity,
-  dropping or replacing a binding, narrowing a checked rule's reach, taking a
-  quoted call or a flag out of its text, or turning it into a report) needs a
-  reason too, the same as removing one. Clearing one of those fields outright
-  uses its own `clear_*` flag on `revise` (`clear_check`, `clear_severity`, and
-  so on), not an empty value. A fact that is simply wrong is removed with
-  `retract` and a reason. A true fact that fired in the wrong place is marked as
-  noise with `mark`, instead of being deleted.)
+## The one sentence, and the two calls
+
+Say, in their language and your own words: THOR is on, it keeps short plain
+replies, answers in their language, uses only the work memory, keeps every starting
+note (any can be removed by saying so), and names each project after its folder.
+Then make the two calls:
+
+```
+remember(
+  id:   "owner-setup-answers",
+  kind: "report",
+  text: "Setup finished with the defaults, nothing asked. Replies: short and plain, in the owner's own language. Lane: work only. Starting notes and example rules: all kept. Projects: named after their folder. Any of these changes when the owner says so."
+)
+retract(id: "walk-through-the-answer-guard-once", reason: "Setup finished: the owner's answers are on record as owner-setup-answers.")
+```
+
+If they gave their own answers, put those in the text instead of the defaults.
+
+## The starter set of work rules
+
+A memory that was just created also gets a starter set of general coding-workflow
+rules, learnt the hard way by the person who built THOR and rewritten so that they
+hold on any project. They are ordinary notes tagged `workflow-starter`: none of them
+refuses anything (a refusing check could block a legitimate call from a project the
+author never saw, so every one only informs), each arrives right before the step it
+is about, once per conversation, and any can be removed, rewritten or unpinned like
+any other note. Tell the person, in one sentence, that they exist and that you can
+remove any of them on request; to remove one, `retract` it with a reason.
+
+Before a commit or a push:
+
+- `changelog-with-every-user-visible-change` - if the project keeps a CHANGELOG, a
+  line for every user-visible change in the same commit, and a version bump when it
+  versions releases; no changelog is created unasked.
+- `run-the-tests-before-saying-done` - run the project's own tests or build and
+  quote the real result line; never skip a hook with `--no-verify`.
+- `never-commit-a-secret` - real values in a gitignored file, a tracked template
+  beside it, a look at what is staged, rotate anything that was committed.
+- `commit-hygiene` - a short plain message, `git commit -F` for several lines, stage
+  only what you mean, keep each file's line endings.
+- `commit-push-deploy-only-when-asked` - only on the user's word in this session; no
+  force-push of a shared branch.
+- `check-where-you-push-and-what-is-on-main` - folder, branch and remote, then fetch;
+  release state comes from git, never from memory.
+- `scan-before-it-goes-public` - zero hits for secrets, usernames, local paths and
+  private hostnames on every push to a public repository.
+
+Around a risky step or a tool:
+
+- `rehearse-destructive-steps-on-a-copy` - a delete, migration or deploy is tried on
+  a throwaway copy first; never test a write path against live data.
+- `pin-a-dependency-with-its-reason` - a version pin carries a comment saying why.
+- `an-agent-brief-stands-alone` - goal, absolute working folder, files it may touch,
+  no further agents, an explicit model, what to report back.
+- `parallel-agents-do-not-share-a-folder` - own folder or worktree and own build
+  directory per agent; one agent commits.
+- `absolute-paths-not-the-shell-working-directory` - absolute paths in every command
+  and every brief.
+- `script-file-not-shell-quoting` - text with quotes or backslashes goes in a script
+  file, not a one-liner.
+- `windowless-processes-on-windows` - background processes start hidden.
+
+Besides these, the install also seeded twenty-two pinned notes about writing a note
+that comes back and about honesty, agent-spawning and memory hygiene; those are
+described in the sections below.
 
 Apply each answer where it belongs - a reply-shape rule in the rulebook file,
 a standing preference as a stored fact - then store a short summary of what he
-chose (or that he declined) as `owner-setup-answers`, and only then retract
-`walk-through-the-answer-guard-once` so it never asks again.
+chose (or that he declined, or that the defaults applied) as `owner-setup-answers`,
+and only then retract `walk-through-the-answer-guard-once` so it never asks again.
 
 ---
 

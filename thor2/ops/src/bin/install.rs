@@ -458,7 +458,7 @@ fn main() -> ExitCode {
             match seed_working_contract(&db) {
                 Ok(seeded) => {
                     let stored = seeded.iter().filter(|s| s.stored).count();
-                    println!("+ put {stored} starting notes in it. They teach your assistant how to write notes that come back when needed.");
+                    println!("+ put {stored} starting notes in it. They teach your assistant how to write notes that come back when needed, and give it a few good working habits.");
                     for s in seeded.iter().filter(|s| !s.stored) {
                         let why = s.refusal.as_deref().unwrap_or("no reason given");
                         println!("  ! {} was refused: {}", s.id, why);
