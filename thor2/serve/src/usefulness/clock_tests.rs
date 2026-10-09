@@ -69,8 +69,8 @@ fn project_clock_counts_parallel_sessions_once() {
     }
     let state = sidecar(&db, "fxp");
     assert_eq!(state.work.accrued_secs / MIN, 40 + 2 + 24, "{:?}", state.work);
-    assert!(eval_debt_owed(EvalCadence::Rolling16h, state.work.accrued_secs / MIN, None, NOW + 70 * MIN, 0, false, false));
-    assert!(!eval_debt_owed(EvalCadence::Rolling16h, state.sessions[S1].accrued_secs / MIN, None, NOW + 70 * MIN, 0, false, false));
+    assert!(eval_debt_owed(EvalCadence::Weekly, state.work.accrued_secs / MIN, None, NOW + 70 * MIN, false));
+    assert!(!eval_debt_owed(EvalCadence::Weekly, state.sessions[S1].accrued_secs / MIN, None, NOW + 70 * MIN, false));
 }
 
 /// Only a new VALID evaluation, read from the log at a Stop, resets the
@@ -143,29 +143,29 @@ fn an_old_sidecar_starts_the_project_clock_from_its_largest_session() {
 
 // ------------------------------------------------------------ the cadence
 
-/// The shipped cadence is today's rule, and doctor's sentence says so.
+/// The rhythm follows the plan, and doctor's sentence says so. A small plan
+/// whose valid evaluation is two days old is quiet; a week-old one is due.
 #[test]
-fn shipped_cadence_is_rolling16h() {
-    assert_eq!(EVAL_CADENCE, EvalCadence::Rolling16h);
-    assert_eq!(cadence_clause(EVAL_CADENCE), "evaluation cadence: rolling 16 hours (weekly-unless-rot is built but off)");
-    // R17.3, the shipped half: a project whose valid evaluation is two days
-    // old and that owes nothing IS due after an hour of work.
-    assert!(eval_debt_owed(EVAL_CADENCE, 61, Some(NOW - 2 * DAY), NOW, 0, false, false));
+fn the_shipped_cadence_follows_the_plan() {
+    assert_eq!(cadence_for(crate::plan::Plan::Small), EvalCadence::Weekly);
+    assert_eq!(cadence_for(crate::plan::Plan::Max), EvalCadence::WeeklyUnlessRot);
+    assert!(!eval_debt_owed(EvalCadence::Weekly, 61, Some(NOW - 2 * DAY), NOW, false));
+    assert!(eval_debt_owed(EvalCadence::Weekly, 61, Some(NOW - 8 * DAY), NOW, false));
 }
 
 /// WeeklyUnlessRot on a clean project: a two-day-old valid evaluation keeps
 /// it quiet however long it is worked; an eight-day-old one does not; and
-/// there is no repeat ask at all.
+/// there is no repeat ask at all. A small plan is just as quiet.
 #[test]
 fn weekly_mode_is_quiet_for_a_clean_project() {
     let weekly = EvalCadence::WeeklyUnlessRot;
-    assert!(!eval_debt_owed(weekly, 600, Some(NOW - 2 * DAY), NOW, 9, true, false), "no repeat in weekly mode");
-    assert!(eval_debt_owed(weekly, 61, Some(NOW - 8 * DAY), NOW, 0, false, false));
-    assert!(!eval_debt_owed(weekly, 59, Some(NOW - 8 * DAY), NOW, 0, false, false), "still an hour of work first");
-    assert!(eval_debt_owed(weekly, 61, None, NOW, 0, false, false), "never evaluated: due after an hour");
+    assert!(!eval_debt_owed(weekly, 600, Some(NOW - 2 * DAY), NOW, false), "no repeat in weekly mode");
+    assert!(eval_debt_owed(weekly, 61, Some(NOW - 8 * DAY), NOW, false));
+    assert!(!eval_debt_owed(weekly, 59, Some(NOW - 8 * DAY), NOW, false), "still an hour of work first");
+    assert!(eval_debt_owed(weekly, 61, None, NOW, false), "never evaluated: due after an hour");
 
-    // R17.3 end to end on a store: a valid evaluation two days old, nothing
-    // owed - weekly is quiet, the shipped cadence asks.
+    // End to end on a store: a valid evaluation two days old, nothing owed -
+    // both plans are quiet.
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("thor.db");
     let root = tempfile::tempdir().unwrap();
@@ -175,17 +175,18 @@ fn weekly_mode_is_quiet_for_a_clean_project() {
     let state = update_eval_debt_state(&store, &db, Some("fxp"), now);
     assert_eq!(crate::eval_filing::project_rot(&store, "fxp"), None, "fixture sanity: a clean project");
     let work = SessionWorkState { accrued_secs: 90 * MIN, ..Default::default() };
-    assert_eq!(project_due(&store, &state, "fxp", &work, now, weekly), None, "weekly: quiet");
-    assert_eq!(project_due(&store, &state, "fxp", &work, now, EvalCadence::Rolling16h), Some(false), "rolling: due");
+    assert_eq!(project_due(&store, &state, "fxp", &work, now, weekly), None, "max, clean: quiet");
+    assert_eq!(project_due(&store, &state, "fxp", &work, now, EvalCadence::Weekly), None, "small plan: quiet");
 }
 
 /// WeeklyUnlessRot goes daily on rot: the same two-day-old evaluation, with
-/// one rule of the project left without a verdict, is due after an hour.
+/// one rule of the project left without a verdict, is due after an hour on
+/// Max - and a small plan stays strictly weekly, whatever is found.
 #[test]
-fn weekly_mode_goes_daily_on_rot() {
+fn weekly_mode_goes_daily_on_rot_on_max_only() {
     let weekly = EvalCadence::WeeklyUnlessRot;
-    assert!(eval_debt_owed(weekly, 61, Some(NOW - 2 * DAY), NOW, 0, false, true));
-    assert!(!eval_debt_owed(weekly, 61, Some(NOW - 10 * 3600), NOW, 0, false, true), "inside 16 hours even rot waits");
+    assert!(eval_debt_owed(weekly, 61, Some(NOW - 2 * DAY), NOW, true));
+    assert!(!eval_debt_owed(weekly, 61, Some(NOW - 10 * 3600), NOW, true), "inside a day even rot waits");
 
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("thor.db");
@@ -200,7 +201,8 @@ fn weekly_mode_goes_daily_on_rot() {
     let why = crate::eval_filing::project_rot(&store, "fxp").expect("a rule without a verdict is rot");
     assert!(why.contains("fx-rot"), "{why}");
     let work = SessionWorkState { accrued_secs: 90 * MIN, ..Default::default() };
-    assert_eq!(project_due(&store, &state, "fxp", &work, now, weekly), Some(false), "weekly with rot: due");
+    assert_eq!(project_due(&store, &state, "fxp", &work, now, weekly), Some(false), "max with rot: due");
+    assert_eq!(project_due(&store, &state, "fxp", &work, now, EvalCadence::Weekly), None, "small plan with rot: still weekly");
 }
 
 // -------------------------------------------------------- the weekly floor
@@ -269,4 +271,30 @@ fn a_write_is_dated_by_the_served_item_before_it() {
     model::store::declare(&mut store, S1, "mcp", "mcp", &second).unwrap();
     let (any, sessions) = project_activity(&store, "fxp", now - EVAL_FLOOR_DAYS * DAY, false);
     assert!(any && sessions.contains(S1), "written after an event of yesterday: {sessions:?}");
+}
+
+/// Part G, the rot signals THOR keeps beside the store: an open THOR bug
+/// candidate is rot on any project (and ends once the candidate is reported),
+/// and a sweep that never ran flags nothing.
+#[test]
+fn an_open_thor_bug_candidate_is_rot_until_it_is_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let root = tempfile::tempdir().unwrap();
+    let mut store = EventStore::new(&db).unwrap();
+    valid_evaluation(&mut store, root.path(), "fxp", 2);
+    assert_eq!(crate::eval_filing::project_rot(&store, "fxp"), None, "fixture sanity: a clean project");
+    assert!(crate::sweep::flagged_rule_ids(&db, &store).is_empty(), "no sweep ever ran");
+
+    crate::thor_bugs::add(&db, crate::thor_bugs::hook_launch_finding("Stop", 1));
+    let why = crate::eval_filing::project_rot(&store, "fxp").expect("an open bug candidate is rot");
+    assert!(why.contains("THOR bug candidate"), "{why}");
+
+    // Once the candidate is reported, nothing is open: back to weekly.
+    let mut book = crate::thor_bugs::load(&db);
+    for candidate in &mut book.candidates {
+        candidate.status = crate::thor_bugs::Status::Reported;
+    }
+    std::fs::write(db.parent().unwrap().join(crate::thor_bugs::FILE), serde_json::to_string(&book).unwrap()).unwrap();
+    assert_eq!(crate::eval_filing::project_rot(&store, "fxp"), None, "reported: the rot is gone");
 }

@@ -3136,7 +3136,7 @@ fn skill_call_answer(
                 .map(|root| serve::attest::session_timeline(&root, session_id))
                 .unwrap_or_default();
             matches!(
-                usefulness::stop_decision(store, &state, project, session_id, &timeline, false, false, now, usefulness::EVAL_CADENCE),
+                usefulness::stop_decision(store, &state, project, session_id, &timeline, false, false, now, usefulness::cadence_for(serve::plan::current(db_path))),
                 usefulness::StopDecision::Ask(_)
             )
         };
@@ -3241,7 +3241,7 @@ fn evaluation_debt(
 ) -> Option<String> {
     let project = current_project?;
     let state = usefulness::project_eval_state(db_path, Some(project));
-    let by_floor = usefulness::project_due(store, &state, project, work, time::now_unix(), usefulness::EVAL_CADENCE)?;
+    let by_floor = usefulness::project_due(store, &state, project, work, time::now_unix(), usefulness::cadence_for(serve::plan::current(db_path)))?;
     let clock = usefulness::EvalClock { work: work.clone(), own_minutes: work.accrued_secs / 60, by_floor };
     Some(evaluation_ask(store, db_path, project, &clock, Some(project), "test-session"))
 }
@@ -3608,7 +3608,7 @@ fn eval_stop_ask(
             continue;
         }
         let stop_here = folder_project == Some(project.as_str());
-        match usefulness::stop_decision(store, &state, &project, session_id, &timeline, stop_here, true, now, usefulness::EVAL_CADENCE) {
+        match usefulness::stop_decision(store, &state, &project, session_id, &timeline, stop_here, true, now, usefulness::cadence_for(serve::plan::current(db_path))) {
             usefulness::StopDecision::Ask(clock) => {
                 // A REPORT THIS SESSION FILED WAS REFUSED AS VERSION SKEW and
                 // the session has not been restarted since (field test 13,
@@ -3799,62 +3799,34 @@ fn evaluation_ask(
         false => String::new(),
     };
 
-    if usefulness::eval_report_covers(state.last_evaluation_seen, now) {
-        // THE REPEAT ASK (fifth rewrite, 2026-09-17): names hours, not
-        // minutes (the owner's own wording: "after every THREE HOURS OF
-        // WORK"), and the report id this accrual reset against, rather than
-        // the ask-count/first-asked clause the first-of-day message below
-        // uses.
-        //
-        // NAMES THE RISK TOO (sixth rewrite, 2026-09-17 - see `usefulness`'s
-        // own "the repeat's own risk" doc comment): `eval_debt_owed` already
-        // guarantees at least one of the two holds when the clock made this
-        // due, so `risk_reasons` is empty only for an ask the weekly floor
-        // made.
-        let hours = own_minutes as f64 / 60.0;
-        let report_id = state.last_evaluation_report_id.as_deref().unwrap_or("an earlier report");
-        let mut risk_reasons = Vec::new();
-        if work.edits_since_test >= usefulness::EVAL_REPEAT_MIN_UNTESTED_EDITS {
-            risk_reasons.push(format!("{} code change(s) since the last test or build run", work.edits_since_test));
-        }
-        if work.compacted_since_anchor {
-            risk_reasons.push("the context was summarized".to_string());
-        }
-        let risk_text = match risk_reasons.is_empty() {
-            true => String::new(),
-            false => format!(", and {}", risk_reasons.join(" and ")),
-        };
-        format!(
-            "{elsewhere}{not_counted}[THOR] This session has worked here for {hours:.1} hour(s) since the last evaluation report ('{report_id}'){together}\
-             {risk_text}.{floor} \
-             A new evaluation is due, covering only what happened since then plus the state of the work. \
-             {owed_words} \
-             Run the THOR evaluation before you finish: {ask} \
-             A turn cannot end until the evaluation report for this project is filed."
-        )
-    } else {
-        // How many times this project has already been asked since its
-        // last report, and since when - the count and clock this very ask
-        // is about to add one more to (`usefulness::record_eval_debt_asked`,
-        // called at the call site once this function returns). Read here,
-        // one ask ahead of that write, so the message can say the true
-        // count for THIS ask rather than the one before it;
-        // `first_asked_since_report.unwrap_or(now)` covers the case where
-        // this is the very first ask since the last report, which is
-        // exactly the instant the call site is about to stamp.
-        let first_asked = state.first_asked_since_report.unwrap_or(now);
-        let asked_count = state.asked_count + 1;
-        let covers_hours = usefulness::EVAL_REPORT_COVERS_HOURS;
-        format!(
-            "{elsewhere}{not_counted}[THOR] This project has had no evaluation in the last {covers_hours} hours (project '{project}').{floor} \
-             This session has worked here for {own_minutes} minute(s){together}; \
-             {owed_words} It has been asked {asked_count} time(s) - the first \
-             {} day(s) ago - with no report filed yet. \
-             Run the THOR evaluation before you finish: {ask} \
-             A turn cannot end until the evaluation report for this project is filed. After that it is quiet for {covers_hours} hours.",
-            usefulness::days_ago(now, first_asked)
-        )
-    }
+    // THE RHYTHM (part G): one evaluation per week per project, daily on Max
+    // while rot is found. The ask says which applies, in one plain line.
+    let cadence = usefulness::cadence_for(serve::plan::current(db_path));
+    let rot = cadence == usefulness::EvalCadence::WeeklyUnlessRot && serve::eval_filing::project_rot(store, project).is_some();
+    let mode = usefulness::mode_line(cadence, rot);
+    let quiet_days = usefulness::covers_hours(cadence, rot) / 24;
+    // How many times this project has already been asked since its last
+    // report, and since when - the count and clock this very ask is about to
+    // add one more to (`usefulness::record_eval_debt_asked`, called at the
+    // call site once this function returns).
+    let first_asked = state.first_asked_since_report.unwrap_or(now);
+    let asked_count = state.asked_count + 1;
+    let since = match state.last_evaluation_report_id.as_deref() {
+        Some(report_id) if state.last_evaluation_seen.is_some() => format!(
+            "The last evaluation report ('{report_id}') is {} day(s) old.",
+            usefulness::days_ago(now, state.last_evaluation_seen.unwrap_or(now))
+        ),
+        _ => format!("This project has had no evaluation in the last {quiet_days} day(s) (project '{project}')."),
+    };
+    format!(
+        "{elsewhere}{not_counted}[THOR] {since} {mode}{floor} \
+         This session has worked here for {own_minutes} minute(s){together}; \
+         {owed_words} It has been asked {asked_count} time(s) - the first \
+         {} day(s) ago - with no report filed yet. \
+         Run the THOR evaluation before you finish: {ask} \
+         A turn cannot end until the evaluation report for this project is filed. After that it is quiet for {quiet_days} day(s).",
+        usefulness::days_ago(now, first_asked)
+    )
 }
 
 /// This project's own open points (`model::store::open_points`), as ONE line
@@ -5388,7 +5360,7 @@ mod evaluation_debt_tests {
     /// `usefulness::EVAL_REPORT_COVERS_HOURS`, so a fixture can prove the
     /// "does not cover any more" branch regardless of wall-clock time.
     fn no_longer_covered() -> i64 {
-        time::now_unix() - (usefulness::EVAL_REPORT_COVERS_HOURS + 1) * 3600
+        time::now_unix() - (usefulness::EVAL_WEEKLY_DAYS * 24 + 1) * 3600
     }
 
     /// A `SessionWorkState` fixture carrying `minutes` worth of accrued work
@@ -5453,13 +5425,13 @@ mod evaluation_debt_tests {
         let asked =
             evaluation_debt(&store, &db, Some("thor"), &work_minutes(90)).expect("no report ever seen, enough time worked");
         assert!(asked.starts_with("[THOR]"), "{asked}");
-        assert!(asked.contains("This project has had no evaluation in the last 16 hours"), "{asked}");
+        assert!(asked.contains("This project has had no evaluation in the last 7 day(s)"), "{asked}");
         assert!(asked.contains("This session has worked here for"), "{asked}");
         assert!(asked.contains("minute(s)"), "{asked}");
         assert!(asked.contains("12 more item(s) of this project owe a verdict because other sessions fired them"), "{asked}");
         assert!(asked.contains("It has been asked 1 time(s)"), "{asked}");
         assert!(asked.contains("A turn cannot end until the evaluation report for this project is filed"), "{asked}");
-        assert!(asked.contains("After that it is quiet for 16 hours"), "{asked}");
+        assert!(asked.contains("After that it is quiet for 7 day(s)"), "{asked}");
     }
 
     /// Step 14: the ask itself no longer carries a batch computed live - a
@@ -5679,18 +5651,14 @@ mod evaluation_debt_tests {
         assert!(asked.contains("It has been asked 3 time(s)"), "{asked}");
     }
 
-    // ------------------------------------------------- evaluation_debt: repeat
+    // ------------------------------------------------- evaluation_debt: rhythm
     //
-    // Added 2026-09-17 (fifth rewrite): once a report already exists for
-    // today, `evaluation_debt` asks a DIFFERENT question (accrued work since
-    // that report reaching `EVAL_REPEAT_WORK_MINUTES`) and says something
-    // different too (hours since the report's own id, never an ask count).
+    // Part G (2026-10-09): ONE evaluation per week per project; on Max, daily
+    // while rot is found. There is no repeat ask any more, whatever the work
+    // or the risk after a report.
 
     #[test]
     fn a_report_seen_today_with_90_minutes_accrued_since_stays_silent() {
-        // Case named in the build brief: well past the FIRST threshold, but
-        // nowhere near the REPEAT one - a report already seen today must
-        // not read the first threshold at all any more.
         let (_dir, db, store) = new_store();
         seed_eval_state(&db, Some("thor"), usefulness::ProjectEvalState {
             last_evaluation_seen: Some(recently_covered()),
@@ -5700,91 +5668,64 @@ mod evaluation_debt_tests {
         assert_eq!(evaluation_debt(&store, &db, Some("thor"), &work_minutes(90)), None);
     }
 
+    /// The 3-hour re-ask is gone: hours of work, untested edits and a context
+    /// summary after a report, with a real backlog, still ask nothing on a
+    /// small plan or on Max.
     #[test]
-    fn a_report_seen_today_with_three_hours_accrued_since_fires_the_repeat_message() {
-        let (_dir, db, mut store) = new_store();
-        owe_project(&mut store, 5, Some("thor"));
-        seed_eval_state(&db, Some("thor"), usefulness::ProjectEvalState {
-            last_evaluation_seen: Some(recently_covered()),
-            last_evaluation_report_id: Some("eval-thor-2026-09-17".to_string()),
-            ..Default::default()
-        });
-        let work = work_minutes_with_risk(usefulness::EVAL_REPEAT_WORK_MINUTES, usefulness::EVAL_REPEAT_MIN_UNTESTED_EDITS, false);
-        let asked = evaluation_debt(&store, &db, Some("thor"), &work).expect("three hours plus a risk must fire a repeat ask");
-        assert!(asked.starts_with("[THOR]"), "{asked}");
-        assert!(asked.contains("This session has worked here for 3.0 hour(s) since the last evaluation report"), "{asked}");
-        assert!(asked.contains("eval-thor-2026-09-17"), "must name the report this accrual is measured since: {asked}");
-        assert!(
-            asked.contains(&format!("{} code change(s) since the last test or build run", usefulness::EVAL_REPEAT_MIN_UNTESTED_EDITS)),
-            "must name the risk that triggered it: {asked}"
-        );
-        assert!(
-            asked.contains("A new evaluation is due, covering only what happened since then plus the state of the work"),
-            "{asked}"
-        );
-        assert!(asked.contains("5 more item(s) of this project owe a verdict because other sessions fired them"), "{asked}");
-        assert!(asked.contains("A turn cannot end until the evaluation report for this project is filed"), "{asked}");
-        assert!(
-            !asked.contains("It has been asked"),
-            "the repeat message names hours and the report id, never an ask count: {asked}"
-        );
+    fn work_and_risk_after_a_report_never_fire_a_repeat() {
+        for plan in [serve::plan::Plan::Small, serve::plan::Plan::Max] {
+            let (_dir, db, mut store) = new_store();
+            owe_project(&mut store, 5, Some("thor"));
+            serve::plan::write(&db, plan, serve::plan::PlanSource::Confirmed).unwrap();
+            seed_eval_state(&db, Some("thor"), usefulness::ProjectEvalState {
+                last_evaluation_seen: Some(recently_covered()),
+                last_evaluation_report_id: Some("eval-thor-2026-09-17".to_string()),
+                ..Default::default()
+            });
+            let work = work_minutes_with_risk(600, usefulness::EVAL_REPEAT_MIN_UNTESTED_EDITS + 5, true);
+            assert_eq!(evaluation_debt(&store, &db, Some("thor"), &work), None, "{plan:?}: no repeat ask");
+        }
     }
 
-    /// THE CENTRAL CASE THE SIXTH REWRITE EXISTS FOR (2026-09-17, owner's
-    /// decision): the identical fixture as the test just above, MINUS any
-    /// risk - three hours accrued, a report already seen today, a real
-    /// backlog - must now stay silent. Time alone is no longer enough.
+    /// A small plan asks again only once the week is up, and the ask says
+    /// which rhythm applies and how long it is then quiet.
     #[test]
-    fn three_hours_accrued_with_no_risk_at_all_stays_silent() {
+    fn a_small_plan_asks_after_a_week_and_says_it_is_weekly() {
         let (_dir, db, mut store) = new_store();
         owe_project(&mut store, 5, Some("thor"));
         seed_eval_state(&db, Some("thor"), usefulness::ProjectEvalState {
-            last_evaluation_seen: Some(recently_covered()),
+            last_evaluation_seen: Some(no_longer_covered()),
             last_evaluation_report_id: Some("eval-thor-2026-09-17".to_string()),
             ..Default::default()
         });
-        let work = work_minutes_with_risk(usefulness::EVAL_REPEAT_WORK_MINUTES, 0, false);
-        assert_eq!(
-            evaluation_debt(&store, &db, Some("thor"), &work),
-            None,
-            "three hours of accrued time with no code change and no summary must never fire a repeat"
-        );
+        let asked = evaluation_debt(&store, &db, Some("thor"), &work_minutes(90)).expect("a week-old report on a small plan is due");
+        assert!(asked.contains("The last evaluation report ('eval-thor-2026-09-17') is 7 day(s) old"), "{asked}");
+        assert!(asked.contains("your plan is a smaller one, so this check runs once a week at most"), "{asked}");
+        assert!(asked.contains("After that it is quiet for 7 day(s)"), "{asked}");
     }
 
-    /// The other risk on its own: a context summary, with zero untested
-    /// edits, must still fire - and the message must name the summary, not
-    /// the edit count, as the reason.
+    /// The switch on Max: with rot (a backlog of owed verdicts) a two-day-old
+    /// report is due and the ask says daily; the SAME state on a small plan
+    /// stays quiet. (Max with no rot is weekly: see the clock tests.)
     #[test]
-    fn a_context_summary_with_zero_edits_fires_the_repeat_message_naming_the_summary() {
-        let (_dir, db, mut store) = new_store();
-        owe_project(&mut store, 5, Some("thor"));
-        seed_eval_state(&db, Some("thor"), usefulness::ProjectEvalState {
-            last_evaluation_seen: Some(recently_covered()),
+    fn rot_makes_max_daily_and_never_changes_a_small_plan() {
+        let two_days_ago = time::now_unix() - 2 * 86400;
+        let state = || usefulness::ProjectEvalState {
+            last_evaluation_seen: Some(two_days_ago),
             last_evaluation_report_id: Some("eval-thor-2026-09-17".to_string()),
             ..Default::default()
-        });
-        let work = work_minutes_with_risk(usefulness::EVAL_REPEAT_WORK_MINUTES, 0, true);
-        let asked = evaluation_debt(&store, &db, Some("thor"), &work).expect("a context summary alone must fire a repeat ask");
-        assert!(asked.contains("the context was summarized"), "{asked}");
-        assert!(
-            !asked.contains("code change(s) since the last test or build run"),
-            "with zero edits, the edit-count reason must not appear: {asked}"
-        );
-    }
+        };
+        let (_dir, db, mut store) = new_store();
+        owe_project(&mut store, 5, Some("thor"));
+        seed_eval_state(&db, Some("thor"), state());
+        serve::plan::write(&db, serve::plan::Plan::Max, serve::plan::PlanSource::Detected).unwrap();
+        let work = work_minutes(90);
+        let asked = evaluation_debt(&store, &db, Some("thor"), &work).expect("Max with rot is due after a day");
+        assert!(asked.contains("your plan is Max and something is wrong in this project, so the check runs daily"), "{asked}");
+        assert!(asked.contains("After that it is quiet for 1 day(s)"), "{asked}");
 
-    /// Two untested edits - one short of the floor - with no summary either,
-    /// must stay silent. Case named in the build brief.
-    #[test]
-    fn two_untested_edits_with_no_summary_stays_silent() {
-        let (_dir, db, mut store) = new_store();
-        owe_project(&mut store, 5, Some("thor"));
-        seed_eval_state(&db, Some("thor"), usefulness::ProjectEvalState {
-            last_evaluation_seen: Some(recently_covered()),
-            last_evaluation_report_id: Some("eval-thor-2026-09-17".to_string()),
-            ..Default::default()
-        });
-        let work = work_minutes_with_risk(usefulness::EVAL_REPEAT_WORK_MINUTES, usefulness::EVAL_REPEAT_MIN_UNTESTED_EDITS - 1, false);
-        assert_eq!(evaluation_debt(&store, &db, Some("thor"), &work), None, "two untested edits is under the risk floor");
+        serve::plan::write(&db, serve::plan::Plan::Small, serve::plan::PlanSource::Confirmed).unwrap();
+        assert_eq!(evaluation_debt(&store, &db, Some("thor"), &work), None, "a small plan stays weekly whatever is found");
     }
 }
 

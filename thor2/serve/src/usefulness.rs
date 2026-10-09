@@ -868,6 +868,16 @@ pub fn noise_since_last_useful(store: &EventStore) -> HashMap<String, usize> {
 // the accrual, so a long day keeps asking every three hours instead of
 // going quiet until the next UTC midnight.
 //
+// PART G (2026-10-09) SUPERSEDES THE ROLLING 16 HOURS AND THE 3-HOUR RE-ASK
+// BELOW. The owner's end state was always ONE evaluation per WEEK per project
+// as a rot check ("Doel was 1x per week"), and the preconditions are met (the
+// write gate tries every rule, teeth rot is zero, fresh-agent blind tests
+// pass). The rhythm now follows the plan (`serve::plan`): a small plan is
+// strictly weekly; Max is weekly and daily while rot is found. The history
+// below is kept because the reasons for the work clock (gap-filtered accrual,
+// no UTC day, no tracking_since) still hold: only the window length and the
+// repeat changed.
+//
 // A SEVENTH REWRITE (2026-09-17) drops the UTC CALENDAR DAY itself, the one
 // piece every rewrite above kept: "today" becomes a rolling
 // `EVAL_REPORT_COVERS_HOURS` (16) hours from `last_evaluation_seen`
@@ -914,16 +924,6 @@ pub fn noise_since_last_useful(store: &EventStore) -> HashMap<String, usize> {
 /// `EVAL_REPEAT_WORK_MINUTES` is the other).
 pub const EVAL_FIRST_WORK_MINUTES: i64 = 60;
 
-/// How many minutes of accrued work, since a report was LAST seen for this
-/// project, before a REPEAT evaluation is due the same day - the owner's
-/// decision, 2026-09-17: even a project that filed its evaluation this
-/// morning can drift for the rest of a long day, so a report already seen
-/// today no longer buys silence until midnight, only until this much more
-/// work has gone by since it was filed. Three hours: long enough that a
-/// normal session's first-of-day report is never immediately followed by a
-/// second ask, short enough that a full working day still sees more than
-/// one.
-pub const EVAL_REPEAT_WORK_MINUTES: i64 = 180;
 
 /// A gap this long or longer between two consecutive hook events of the same
 /// (project, session) pair is a pause, not work, and contributes nothing to
@@ -941,107 +941,49 @@ pub const EVAL_PAUSE_MINUTES: i64 = 30;
 /// is never subject to this throttle at all.
 const EVAL_WORK_WRITE_THROTTLE_SECS: i64 = 60;
 
-/// How many hours a filed evaluation report covers before this project is
-/// owed a fresh one - see `eval_report_covers` below and this section's own
-/// "SEVENTH REWRITE" paragraph for the measured case that replaced a UTC
-/// calendar day with this rolling window. Not a config knob (CONTRACT R9):
-/// chosen once, long enough to carry a normal night session through to the
-/// next afternoon, short enough that a quiet project is still asked about
-/// well within two working days.
-pub const EVAL_REPORT_COVERS_HOURS: i64 = 16;
+/// After the weekly check found rot on a Max plan, how many hours until the
+/// next one: "daily while rot is found". A day, not a clock-day: it is the
+/// project's own work that asks, one hour in.
+pub const EVAL_ROT_RECHECK_HOURS: i64 = 24;
 
-/// THE TIME HALF OF THE PURE PREDICATE, factored out of `eval_debt_owed`
-/// below so `doctor` (`ops::health::judgement_debt_line`), which runs cold
-/// outside any session and so can never evaluate the minutes-worked half,
-/// can still report accurately on the half it CAN evaluate - without
-/// duplicating this rule a second time and risking it drift from the one
-/// `eval_debt_owed` actually acts on. Replaces `eval_done_today`/`crate::
-/// time::same_utc_day` (2026-09-17, seventh rewrite, this section's own doc
-/// comment): a UTC calendar day measured against `last_evaluation_seen`
-/// alone gave way to a rolling `EVAL_REPORT_COVERS_HOURS`-hour window
-/// measured against the identical field.
-///
-/// Holds (the last evaluation STILL COVERS this project) when
-/// `last_evaluation_seen` is `Some`, AND `now_unix` is within
-/// `EVAL_REPORT_COVERS_HOURS` hours AFTER it - never before: a `seen` in the
-/// future (clock skew, a hand-edited sidecar) must not silence anything
-/// early, so `now_unix - seen` has to land in `0..EVAL_REPORT_COVERS_HOURS`
-/// hours, not merely under it. `None` - no evaluation report has ever been
-/// seen for this project - reads as "does not cover", never as "covers
-/// forever": there is no instant for a report that was never seen, so there
-/// is nothing for the window to measure from.
-pub fn eval_report_covers(last_evaluation_seen: Option<i64>, now_unix: i64) -> bool {
-    let Some(seen) = last_evaluation_seen else { return false };
-    (0..EVAL_REPORT_COVERS_HOURS * 3600).contains(&(now_unix - seen))
+/// How many hours a filed evaluation covers under `cadence`: a week, or a day
+/// while a Max project shows rot. A small plan has no daily mode, so `rot` is
+/// ignored there.
+pub fn covers_hours(cadence: EvalCadence, rot: bool) -> i64 {
+    match (cadence, rot) {
+        (EvalCadence::WeeklyUnlessRot, true) => EVAL_ROT_RECHECK_HOURS,
+        _ => EVAL_WEEKLY_DAYS * 24,
+    }
 }
 
-/// THE WHOLE PURE PREDICATE. Rewritten 2026-09-16 to drop `tracking_since`
-/// and the 24-hour rolling window entirely in favour of a UTC calendar day
-/// (see this section's own doc comment, fourth rewrite, for why); rewritten
-/// again 2026-09-17 (fifth rewrite) to ask a DIFFERENT threshold once
-/// today's report already exists, rather than staying silent for the rest
-/// of the day regardless of how much more work follows it; rewritten again
-/// 2026-09-17 (seventh rewrite) to replace "today's report" with "a report
-/// that still covers" (`eval_report_covers` above), dropping the calendar
-/// day entirely. Every input is already resolved elsewhere (`accrued_
-/// minutes` from `SessionWorkState::accrued_secs` via `record_hook_event`,
-/// `last_evaluation_seen` from this project's own `ProjectEvalState`,
-/// `now_unix` from `crate::time::now_unix`), so this stays nothing but the
-/// conditions themselves, unit-testable with plain integers and no store, no
-/// clock, no filesystem.
+/// Holds (the last evaluation STILL COVERS this project) when
+/// `last_evaluation_seen` is `Some`, AND `now_unix` is within `hours` hours
+/// AFTER it - never before: a `seen` in the future (clock skew, a hand-edited
+/// sidecar) must not silence anything early, so `now_unix - seen` has to land
+/// in `0..hours` hours, not merely under it. `None` - no evaluation report has
+/// ever been seen for this project - reads as "does not cover", never as
+/// "covers forever". `doctor` (`ops::health`), which runs cold outside any
+/// session, uses this too, so the two never disagree about the window.
+pub fn eval_report_covers(last_evaluation_seen: Option<i64>, now_unix: i64, hours: i64) -> bool {
+    let Some(seen) = last_evaluation_seen else { return false };
+    (0..hours * 3600).contains(&(now_unix - seen))
+}
+
+/// THE WHOLE PURE PREDICATE (part G, 2026-10-09). The 16-hour rolling window
+/// and the 3-hour repeat are gone: the rhythm is ONE evaluation per week per
+/// project, tied to the plan (`cadence_for`).
 ///
-/// Holds when `accrued_minutes` has reached the threshold FOR WHICHEVER
-/// CASE APPLIES: `EVAL_REPEAT_WORK_MINUTES` when `eval_report_covers` above
-/// already holds (a report still covers, so this would be a repeat ask), or
-/// `EVAL_FIRST_WORK_MINUTES` when it does not (nothing covers, so this
-/// would be the first ask). `accrued_minutes` itself is already measured
-/// from whichever reset last applied - no anchor yet or a newly seen
-/// report, both handled by `session_work_reset_needed` before this
-/// predicate ever runs - so neither branch here needs to look at a reset
-/// instant a second time.
-///
-/// THE REPEAT BRANCH ALSO NEEDS A RISK, since the sixth rewrite (2026-09-17,
-/// owner's decision - see this file's own "the repeat's own risk" doc
-/// comment): `edits_since_test` reaching `EVAL_REPEAT_MIN_UNTESTED_EDITS`, or
-/// `compacted_since_anchor` - either is enough, neither is required of the
-/// other. THE FIRST-OF-DAY BRANCH IS UNCHANGED: no risk condition at all,
-/// only the accrued-time floor, exactly as it was before this rewrite.
-///
-/// STEP 17 (B8, cadence): `accrued_minutes` is the PROJECT's work clock
-/// (`ProjectEvalState::work`, every session of the project together, parallel
-/// sessions counted once), and `cadence` picks the rule. `Rolling16h` is the
-/// rule above, unchanged. `WeeklyUnlessRot` asks when the project accrued at
-/// least `EVAL_FIRST_WORK_MINUTES` since its newest valid evaluation AND that
-/// evaluation is older than `EVAL_WEEKLY_DAYS` days - or older than
-/// `EVAL_REPORT_COVERS_HOURS` while `rot` holds (`eval_filing::project_rot`,
-/// read from the log). It never asks a repeat: the risk counters play no
-/// part. The weekly floor (`weekly_floor_due`) is not part of this predicate;
-/// it applies beside it in both cadences.
-#[allow(clippy::too_many_arguments)]
-pub fn eval_debt_owed(
-    cadence: EvalCadence,
-    accrued_minutes: i64,
-    last_evaluation_seen: Option<i64>,
-    now_unix: i64,
-    edits_since_test: u32,
-    compacted_since_anchor: bool,
-    rot: bool,
-) -> bool {
-    match cadence {
-        EvalCadence::Rolling16h => {
-            if eval_report_covers(last_evaluation_seen, now_unix) {
-                accrued_minutes >= EVAL_REPEAT_WORK_MINUTES
-                    && (edits_since_test >= EVAL_REPEAT_MIN_UNTESTED_EDITS || compacted_since_anchor)
-            } else {
-                accrued_minutes >= EVAL_FIRST_WORK_MINUTES
-            }
-        }
-        EvalCadence::WeeklyUnlessRot => {
-            let older_than = |hours: i64| last_evaluation_seen.is_none_or(|seen| now_unix - seen >= hours * 3600);
-            accrued_minutes >= EVAL_FIRST_WORK_MINUTES
-                && (older_than(EVAL_WEEKLY_DAYS * 24) || (rot && older_than(EVAL_REPORT_COVERS_HOURS)))
-        }
-    }
+/// Holds when the project accrued at least `EVAL_FIRST_WORK_MINUTES` of work
+/// (every session together, parallel minutes counted once) AND its newest valid
+/// evaluation is at least `covers_hours(cadence, rot)` old (or there is none).
+/// `rot` (`eval_filing::project_rot`, read from the log) only matters on
+/// `WeeklyUnlessRot`: there it shortens the wait to a day, and it ends by
+/// itself the moment a counting evaluation finds none. On `Weekly` it is
+/// ignored: a small plan is strictly weekly. No repeat ask, no risk counters:
+/// the weekly floor (`weekly_floor_due`) applies beside this in both cadences.
+pub fn eval_debt_owed(cadence: EvalCadence, accrued_minutes: i64, last_evaluation_seen: Option<i64>, now_unix: i64, rot: bool) -> bool {
+    accrued_minutes >= EVAL_FIRST_WORK_MINUTES
+        && !eval_report_covers(last_evaluation_seen, now_unix, covers_hours(cadence, rot))
 }
 
 // ------------------------------------------------ step 17: cadence and clock
@@ -1074,33 +1016,53 @@ pub fn eval_debt_owed(
 // floor (`weekly_floor_due`) reads the log only.
 
 /// Which rule decides when a project owes its evaluation - see
-/// `eval_debt_owed`. A code constant on purpose (`EVAL_CADENCE`): a JSON
-/// switch would be one edit away for any agent (the Z10 class).
+/// `eval_debt_owed`. Resolved from the plan (`cadence_for`), never a JSON
+/// switch an agent could flip (the Z10 class).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvalCadence {
-    /// A valid evaluation covers `EVAL_REPORT_COVERS_HOURS`; after it, a
-    /// repeat after `EVAL_REPEAT_WORK_MINUTES` plus a risk. Today's rule.
-    Rolling16h,
-    /// Once a week, or daily while the project shows rot. Built, off: the
-    /// flip is the owner's (section 8 of the build spec).
+    /// A small plan (Pro and anything below Max, or a plan nobody could read):
+    /// strictly once every `EVAL_WEEKLY_DAYS` days, whatever is found. The
+    /// evaluation draws on the same limits as the user's own work.
+    Weekly,
+    /// Max: once a week, and once a day while the project shows rot.
     WeeklyUnlessRot,
 }
 
-/// The cadence this build runs.
-pub const EVAL_CADENCE: EvalCadence = EvalCadence::Rolling16h;
+/// The rhythm for a plan (`serve::plan`).
+pub fn cadence_for(plan: crate::plan::Plan) -> EvalCadence {
+    match plan {
+        crate::plan::Plan::Max => EvalCadence::WeeklyUnlessRot,
+        crate::plan::Plan::Small => EvalCadence::Weekly,
+    }
+}
 
 /// The one sentence doctor prints about the cadence.
 pub fn cadence_clause(cadence: EvalCadence) -> &'static str {
     match cadence {
-        EvalCadence::Rolling16h => "evaluation cadence: rolling 16 hours (weekly-unless-rot is built but off)",
-        EvalCadence::WeeklyUnlessRot => {
-            "evaluation cadence: weekly unless rot - daily while the project shows rot (rolling 16 hours is built but off)"
+        EvalCadence::Weekly => "evaluation cadence: once a week per project, never daily (smaller plan)",
+        EvalCadence::WeeklyUnlessRot => "evaluation cadence: once a week per project, daily while rot is found (Max plan)",
+    }
+}
+
+/// The one plain line an evaluation ask carries about which rhythm applies and
+/// why. `rot` is whether the project shows rot right now.
+pub fn mode_line(cadence: EvalCadence, rot: bool) -> String {
+    match (cadence, rot) {
+        (EvalCadence::Weekly, _) => format!(
+            "Rhythm: your plan is a smaller one, so this check runs once a week at most ({EVAL_WEEKLY_DAYS} days), never daily, to leave your limit for your own work."
+        ),
+        (EvalCadence::WeeklyUnlessRot, false) => format!(
+            "Rhythm: your plan is Max, and the project looks clean, so this check runs once a week ({EVAL_WEEKLY_DAYS} days)."
+        ),
+        (EvalCadence::WeeklyUnlessRot, true) => {
+            "Rhythm: your plan is Max and something is wrong in this project, so the check runs daily until a counting evaluation finds nothing; then it goes back to once a week."
+                .to_string()
         }
     }
 }
 
-/// How old a valid evaluation may be in `EvalCadence::WeeklyUnlessRot`
-/// before a project with nothing wrong owes the next one, in days.
+/// How old a valid evaluation may be before a project with nothing wrong owes
+/// the next one, in days.
 pub const EVAL_WEEKLY_DAYS: i64 = 7;
 
 /// Minutes of its OWN work a session must have in a project, since that
@@ -1286,8 +1248,6 @@ pub fn project_due(
         work.accrued_secs / 60,
         state.last_evaluation_seen,
         now_unix,
-        work.edits_since_test,
-        work.compacted_since_anchor,
         rot,
     );
     if by_clock {
@@ -2259,231 +2219,123 @@ mod eval_debt_predicate_tests {
 
     // ---------------------------------------------------- eval_report_covers
     //
-    // Replaces `eval_done_today`/`same_utc_day` (2026-09-17, seventh rewrite
-    // - see this file's own "evaluation debt" section). THE MEASURED CASE:
-    // acme-shop eval 2 was filed about 01:30 local time (23:30 UTC), the
-    // Stop hook demanded a new evaluation at 02:09 local (00:09 UTC), and
-    // `doctor` said "today's evaluation is not done" while naming that very
-    // report as the newest - local midnight for the owner is 02:00 UTC, so
-    // the UTC calendar day split his working night in two, 39 minutes apart.
+    // How long a filed report covers depends on the rhythm (`covers_hours`):
+    // a week, or a day while a Max project shows rot.
 
     #[test]
     fn no_report_ever_seen_never_covers() {
-        assert!(!eval_report_covers(None, NOW));
+        assert!(!eval_report_covers(None, NOW, 24));
     }
 
     #[test]
-    fn a_report_seen_recently_covers() {
-        assert!(eval_report_covers(Some(NOW - HOUR), NOW), "an hour ago, well inside the window");
-        assert!(eval_report_covers(Some(NOW), NOW), "this very instant");
-    }
-
-    /// Case named in the build brief: 15 hours old still covers.
-    #[test]
-    fn a_report_seen_15_hours_ago_still_covers() {
-        assert!(eval_report_covers(Some(NOW - 15 * HOUR), NOW));
-    }
-
-    /// Case named in the build brief: 17 hours old does not cover - past
-    /// `EVAL_REPORT_COVERS_HOURS` (16), regardless of where any calendar
-    /// day boundary would have fallen.
-    #[test]
-    fn a_report_seen_17_hours_ago_does_not_cover() {
-        assert!(!eval_report_covers(Some(NOW - 17 * HOUR), NOW));
-    }
-
-    /// The exact boundary: precisely `EVAL_REPORT_COVERS_HOURS` old is
-    /// already too old - the window is "under 16 hours", not "16 or fewer".
-    #[test]
-    fn exactly_the_limit_does_not_cover() {
-        assert!(!eval_report_covers(Some(NOW - EVAL_REPORT_COVERS_HOURS * HOUR), NOW));
-    }
-
-    /// One second under the boundary still covers.
-    #[test]
-    fn one_second_under_the_limit_covers() {
-        assert!(eval_report_covers(Some(NOW - EVAL_REPORT_COVERS_HOURS * HOUR + 1), NOW));
-    }
-
-    /// A report seen a full day back - the case that used to be exactly
-    /// "yesterday" under the retired UTC-day rule - still reads as simply
-    /// "too old" under the window, the same conclusion for an unrelated
-    /// reason.
-    #[test]
-    fn a_report_seen_a_full_day_ago_does_not_cover() {
-        assert!(!eval_report_covers(Some(NOW - DAY), NOW));
+    fn a_report_inside_the_window_covers_and_one_at_the_edge_does_not() {
+        assert!(eval_report_covers(Some(NOW - HOUR), NOW, 24), "an hour ago");
+        assert!(eval_report_covers(Some(NOW), NOW, 24), "this very instant");
+        assert!(eval_report_covers(Some(NOW - 24 * HOUR + 1), NOW, 24), "one second under the edge");
+        assert!(!eval_report_covers(Some(NOW - 24 * HOUR), NOW, 24), "exactly the window is already too old");
     }
 
     #[test]
     fn a_report_seen_at_a_future_instant_does_not_cover() {
-        // Clock skew or a hand-edited sidecar: a future timestamp must not
-        // spuriously read as "covers" either - `now - seen` goes negative,
-        // which is outside `0..EVAL_REPORT_COVERS_HOURS` hours same as any
-        // other out-of-window value.
-        assert!(!eval_report_covers(Some(NOW + HOUR), NOW));
-        assert!(!eval_report_covers(Some(NOW + DAY), NOW));
+        // Clock skew or a hand-edited sidecar must not silence anything early.
+        assert!(!eval_report_covers(Some(NOW + HOUR), NOW, 24));
+        assert!(!eval_report_covers(Some(NOW + DAY), NOW, 7 * 24));
+    }
+
+    #[test]
+    fn the_window_is_a_week_unless_a_max_project_shows_rot() {
+        assert_eq!(covers_hours(EvalCadence::Weekly, true), EVAL_WEEKLY_DAYS * 24, "a small plan has no daily mode");
+        assert_eq!(covers_hours(EvalCadence::WeeklyUnlessRot, false), EVAL_WEEKLY_DAYS * 24);
+        assert_eq!(covers_hours(EvalCadence::WeeklyUnlessRot, true), EVAL_ROT_RECHECK_HOURS);
     }
 
     // --------------------------------------------------------- eval_debt_owed
     //
-    // `edits_since_test`/`compacted_since_anchor` are irrelevant to every
-    // test in this block: none of them ever reach the REPEAT branch with
-    // enough accrued time for a risk to matter (`eval_report_covers` is
-    // either `false`/out of the window, or the accrued minutes stay under
-    // `EVAL_REPEAT_WORK_MINUTES`), so every call below passes `0, false` -
-    // see "eval_debt_owed: the repeat risk" further down for the tests that
-    // actually exercise the risk gate.
+    // THE RHYTHM (part G): ONE evaluation per week per project. A small plan
+    // is strictly weekly (`EvalCadence::Weekly`); Max is weekly too but goes
+    // daily while rot is found (`EvalCadence::WeeklyUnlessRot`) and falls back
+    // to weekly the moment a counting evaluation finds none.
 
-    /// Case named in the build brief: 59 minutes accrued this session ->
-    /// silent, 61 -> fires - no report has ever been seen in either case,
-    /// proving the first-work floor alone decides the difference.
+    const WEEK: i64 = 7 * DAY;
+
     #[test]
-    fn fifty_nine_minutes_worked_is_silent_sixty_one_fires() {
-        assert!(!eval_debt_owed(EvalCadence::Rolling16h, 59, None, NOW, 0, false, false), "59 minutes must not yet be enough");
-        assert!(eval_debt_owed(EvalCadence::Rolling16h, 61, None, NOW, 0, false, false), "61 minutes must be enough");
+    fn fifty_nine_minutes_worked_is_silent_sixty_one_fires_on_both_plans() {
+        for cadence in [EvalCadence::Weekly, EvalCadence::WeeklyUnlessRot] {
+            assert!(!eval_debt_owed(cadence, 59, None, NOW, false), "59 minutes must not yet be enough ({cadence:?})");
+            assert!(eval_debt_owed(cadence, 61, None, NOW, false), "61 minutes must be enough ({cadence:?})");
+            assert!(eval_debt_owed(cadence, EVAL_FIRST_WORK_MINUTES, None, NOW, false), "'at least', not 'more than' ({cadence:?})");
+        }
     }
 
     #[test]
-    fn exactly_the_minimum_minutes_worked_is_enough() {
-        // The gate is "at least" `EVAL_FIRST_WORK_MINUTES`, not strictly more.
-        assert!(eval_debt_owed(EvalCadence::Rolling16h, EVAL_FIRST_WORK_MINUTES, None, NOW, 0, false, false));
+    fn a_small_plan_asks_strictly_once_a_week() {
+        let work = 600;
+        assert!(!eval_debt_owed(EvalCadence::Weekly, work, Some(NOW - HOUR), NOW, false), "an hour after a report");
+        assert!(!eval_debt_owed(EvalCadence::Weekly, work, Some(NOW - 3 * HOUR), NOW, false), "no three-hour re-ask");
+        assert!(!eval_debt_owed(EvalCadence::Weekly, work, Some(NOW - 2 * DAY), NOW, false), "two days after");
+        assert!(!eval_debt_owed(EvalCadence::Weekly, work, Some(NOW - WEEK + 1), NOW, false), "one second short of a week");
+        assert!(eval_debt_owed(EvalCadence::Weekly, work, Some(NOW - WEEK), NOW, false), "exactly a week is due");
+        assert!(eval_debt_owed(EvalCadence::Weekly, work, None, NOW, false), "never evaluated is due");
     }
 
     #[test]
-    fn one_minute_under_the_minimum_is_silent_regardless_of_the_report_history() {
-        assert!(!eval_debt_owed(EvalCadence::Rolling16h, EVAL_FIRST_WORK_MINUTES - 1, Some(NOW - DAY), NOW, 0, false, false));
-    }
-
-    /// Case named in the build brief: a report first seen today silences
-    /// the FIRST obligation - but not a repeat once enough more work has
-    /// gone by since (see the `repeat_` tests below), so this only holds
-    /// for accrued minutes still under `EVAL_REPEAT_WORK_MINUTES`.
-    #[test]
-    fn a_report_first_seen_today_silences_it() {
-        assert!(!eval_debt_owed(EvalCadence::Rolling16h, EVAL_FIRST_WORK_MINUTES, Some(NOW - HOUR), NOW, 0, false, false));
-    }
-
-    /// Case named in the build brief: a report first seen yesterday does
-    /// not silence today's obligation.
-    #[test]
-    fn a_report_first_seen_yesterday_does_not_silence_today() {
-        assert!(eval_debt_owed(EvalCadence::Rolling16h, EVAL_FIRST_WORK_MINUTES, Some(NOW - DAY), NOW, 0, false, false));
+    fn a_small_plan_never_switches_to_daily_whatever_rot_is_found() {
+        for age in [HOUR, 17 * HOUR, DAY, 25 * HOUR, 3 * DAY, WEEK - 1] {
+            assert!(!eval_debt_owed(EvalCadence::Weekly, 600, Some(NOW - age), NOW, true), "rot at {age}s must not shorten a small plan's week");
+        }
     }
 
     #[test]
-    fn never_evaluated_at_all_fires_once_enough_time_is_worked() {
-        assert!(eval_debt_owed(EvalCadence::Rolling16h, EVAL_FIRST_WORK_MINUTES, None, NOW, 0, false, false));
-    }
-
-    /// Case named in the build brief: the first evaluation of the day still
-    /// fires without any risk - the FIRST-of-day branch carries no risk
-    /// condition at all, unchanged by the sixth rewrite. Identical to
-    /// `never_evaluated_at_all_fires_once_enough_time_is_worked` above,
-    /// named explicitly for this build brief's own case.
-    #[test]
-    fn the_first_evaluation_of_the_day_still_fires_without_any_risk() {
-        assert!(eval_debt_owed(EvalCadence::Rolling16h, EVAL_FIRST_WORK_MINUTES, None, NOW, 0, false, false));
-    }
-
-    // ------------------------------------------- eval_debt_owed: the repeat
-
-    /// Case named in the build brief ("with a report today 179 minutes
-    /// silent and 181 fires"): once a report already exists for today, the
-    /// FIRST-work threshold no longer applies at all - only the much larger
-    /// repeat threshold does, measured from whatever reset the report
-    /// itself caused. A qualifying risk is held constant across both calls,
-    /// so this stays a pure test of the TIME boundary - see "the repeat
-    /// risk" block below for the risk boundary itself.
-    #[test]
-    fn with_a_report_today_179_minutes_is_silent_181_fires() {
-        let seen_today = Some(NOW - HOUR);
-        assert!(
-            !eval_debt_owed(EvalCadence::Rolling16h, 179, seen_today, NOW, EVAL_REPEAT_MIN_UNTESTED_EDITS, false, false),
-            "179 minutes must not yet be enough for a repeat, even with a risk already present"
-        );
-        assert!(
-            eval_debt_owed(EvalCadence::Rolling16h, 181, seen_today, NOW, EVAL_REPEAT_MIN_UNTESTED_EDITS, false, false),
-            "181 minutes must be enough for a repeat, with a risk present"
-        );
+    fn max_is_weekly_while_the_project_is_clean() {
+        assert!(!eval_debt_owed(EvalCadence::WeeklyUnlessRot, 600, Some(NOW - 2 * DAY), NOW, false));
+        assert!(!eval_debt_owed(EvalCadence::WeeklyUnlessRot, 600, Some(NOW - WEEK + 1), NOW, false));
+        assert!(eval_debt_owed(EvalCadence::WeeklyUnlessRot, 600, Some(NOW - WEEK), NOW, false));
     }
 
     #[test]
-    fn with_a_report_today_exactly_the_repeat_minimum_is_enough() {
-        assert!(eval_debt_owed(EvalCadence::Rolling16h, EVAL_REPEAT_WORK_MINUTES, Some(NOW - HOUR), NOW, 0, true, false));
+    fn max_goes_daily_while_rot_is_found_and_not_before_a_day_has_passed() {
+        assert!(!eval_debt_owed(EvalCadence::WeeklyUnlessRot, 600, Some(NOW - 23 * HOUR), NOW, true), "23 hours is not yet a day");
+        assert!(eval_debt_owed(EvalCadence::WeeklyUnlessRot, 600, Some(NOW - EVAL_ROT_RECHECK_HOURS * HOUR), NOW, true), "a day with rot is due");
+        assert!(eval_debt_owed(EvalCadence::WeeklyUnlessRot, 600, Some(NOW - 3 * DAY), NOW, true));
+        assert!(eval_debt_owed(EvalCadence::WeeklyUnlessRot, EVAL_FIRST_WORK_MINUTES, None, NOW, true));
+        assert!(!eval_debt_owed(EvalCadence::WeeklyUnlessRot, 59, Some(NOW - 3 * DAY), NOW, true), "rot never skips the work floor");
     }
 
     #[test]
-    fn with_a_report_today_well_past_the_first_threshold_but_under_the_repeat_one_stays_silent() {
-        // Case named in the build brief: a report seen today, 90 minutes
-        // accrued since - well past `EVAL_FIRST_WORK_MINUTES`, but nowhere
-        // near `EVAL_REPEAT_WORK_MINUTES` - must stay silent. The whole
-        // point of the fifth rewrite: a report already seen today no longer
-        // reads the FIRST threshold at all. A risk is present in the fixture
-        // (both forms at once) to prove it is really the TIME gate stopping
-        // this, never the risk gate.
-        assert!(!eval_debt_owed(EvalCadence::Rolling16h, 90, Some(NOW - HOUR), NOW, 10, true, false));
+    fn max_returns_to_weekly_once_the_rot_is_gone() {
+        // The same project, the same report two days back: rot says due, clean says wait.
+        let two_days_ago = Some(NOW - 2 * DAY);
+        assert!(eval_debt_owed(EvalCadence::WeeklyUnlessRot, 600, two_days_ago, NOW, true));
+        assert!(!eval_debt_owed(EvalCadence::WeeklyUnlessRot, 600, two_days_ago, NOW, false));
     }
 
     #[test]
-    fn with_no_report_today_the_repeat_threshold_never_applies() {
-        // Without `eval_report_covers` holding, `EVAL_REPEAT_WORK_MINUTES`
-        // (180) worth of accrued work is still just "well past the first threshold",
-        // and must fire exactly as any other first-of-day case would - no
-        // risk needed, since this never reaches the repeat branch at all.
-        assert!(eval_debt_owed(EvalCadence::Rolling16h, EVAL_REPEAT_WORK_MINUTES, None, NOW, 0, false, false));
-    }
-
-    // ------------------------------------- eval_debt_owed: the repeat's risk
-    //
-    // THE SIXTH REWRITE ITSELF (2026-09-17, owner's decision - see this
-    // file's own "the repeat's own risk" doc comment): accrued time reaching
-    // `EVAL_REPEAT_WORK_MINUTES` is no longer enough on its own for a repeat
-    // - a real risk has to hold too. Every case here holds `seen_today` and
-    // the accrued minutes fixed at exactly the values that would have fired
-    // unconditionally before this rewrite, varying only the two risk
-    // parameters, so each test isolates the risk gate alone.
-
-    #[test]
-    fn case_181_minutes_with_two_untested_edits_and_no_summary_stays_silent() {
-        // Case named in the build brief.
-        assert!(!eval_debt_owed(EvalCadence::Rolling16h, 181, Some(NOW - HOUR), NOW, 2, false, false), "two untested edits is under the risk floor");
+    fn the_cadence_follows_the_plan() {
+        assert_eq!(cadence_for(crate::plan::Plan::Max), EvalCadence::WeeklyUnlessRot);
+        assert_eq!(cadence_for(crate::plan::Plan::Small), EvalCadence::Weekly);
     }
 
     #[test]
-    fn case_181_minutes_with_three_untested_edits_fires() {
-        // Case named in the build brief.
-        assert!(eval_debt_owed(EvalCadence::Rolling16h, 181, Some(NOW - HOUR), NOW, 3, false, false), "three untested edits reaches the risk floor");
+    fn the_cadence_clause_names_the_mode_and_the_plan() {
+        let small = cadence_clause(EvalCadence::Weekly);
+        assert!(small.contains("once a week") && small.contains("never daily"), "{small}");
+        let max = cadence_clause(EvalCadence::WeeklyUnlessRot);
+        assert!(max.contains("once a week") && max.contains("daily while"), "{max}");
     }
 
     #[test]
-    fn case_181_minutes_with_a_summary_and_zero_edits_fires() {
-        // Case named in the build brief.
-        assert!(eval_debt_owed(EvalCadence::Rolling16h, 181, Some(NOW - HOUR), NOW, 0, true, false), "a context summary is a risk on its own, with no edits at all");
+    fn the_ask_says_which_mode_applies_in_one_line() {
+        let small = mode_line(EvalCadence::Weekly, false);
+        assert!(small.contains("smaller one") && small.contains("once a week"), "{small}");
+        let clean = mode_line(EvalCadence::WeeklyUnlessRot, false);
+        assert!(clean.contains("Max") && clean.contains("once a week"), "{clean}");
+        let rot = mode_line(EvalCadence::WeeklyUnlessRot, true);
+        assert!(rot.contains("Max") && rot.contains("daily") && rot.contains("something is wrong"), "{rot}");
+        for line in [small, clean, rot] {
+            assert!(!line.contains('\n'), "one line: {line}");
+        }
     }
 
-    #[test]
-    fn case_181_minutes_with_neither_edits_nor_a_summary_stays_silent() {
-        // THE CENTRAL CASE THIS REWRITE EXISTS FOR: accrued time alone, with
-        // no risk of either kind, must never fire a repeat any more.
-        assert!(!eval_debt_owed(EvalCadence::Rolling16h, 181, Some(NOW - HOUR), NOW, 0, false, false), "time alone must never fire a repeat");
-    }
-
-    #[test]
-    fn exactly_the_minimum_untested_edits_is_enough() {
-        // The risk gate is "at least" `EVAL_REPEAT_MIN_UNTESTED_EDITS`, not
-        // strictly more.
-        assert!(eval_debt_owed(EvalCadence::Rolling16h, EVAL_REPEAT_WORK_MINUTES, Some(NOW - HOUR), NOW, EVAL_REPEAT_MIN_UNTESTED_EDITS, false, false));
-    }
-
-    #[test]
-    fn one_untested_edit_under_the_minimum_with_no_summary_is_silent() {
-        assert!(!eval_debt_owed(EvalCadence::Rolling16h, EVAL_REPEAT_WORK_MINUTES, Some(NOW - HOUR), NOW, EVAL_REPEAT_MIN_UNTESTED_EDITS - 1, false, false));
-    }
-
-    #[test]
-    fn both_risks_at_once_still_fires() {
-        assert!(eval_debt_owed(EvalCadence::Rolling16h, EVAL_REPEAT_WORK_MINUTES, Some(NOW - HOUR), NOW, EVAL_REPEAT_MIN_UNTESTED_EDITS, true, false));
-    }
 
     #[test]
     fn days_ago_floors_and_never_goes_negative() {

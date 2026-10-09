@@ -648,7 +648,7 @@ in your reply settles nothing - the fix has to be a real change to the note, or
 the tag that records the decision. No tag decides a rule's teeth: only its trial
 does. What it never does at a turn's end: ask for a verdict on a note that keeps
 firing, or about old rules the trial has not decided. Those are asked inside the
-evaluation, once per project at most every 16 hours, so a session is never
+evaluation, which runs once a week per project, so a session is never
 handed something to judge every quarter of an hour.
 
 Once in a while it asks for something bigger instead of one more note: the full
@@ -688,12 +688,22 @@ report.
 
 THIS ONE DOES NOT GO QUIET AFTER ONE ASK: it holds the end of every turn,
 naming how many times it has already asked and since when, until a report that
-counts is on file. A report covers the next 16 hours (a rolling window, not a
-calendar day). Three more hours of work after it, AND a risk - three or more
-code changes with no test or build run since, or a summary of the context - and
-it asks again, covering only what happened since. Three quiet hours with
-neither risk stay silent. "Work" is real activity: a pause of half an hour or
-more never counts.
+counts is on file.
+
+THE RHYTHM IS ONE EVALUATION PER WEEK PER PROJECT, tied to the plan the owner
+pays for, and the ask says which mode applies in one plain line. A report covers
+the next 7 days. On a smaller plan (Pro and anything below Max, or a plan THOR
+could not read) that is strict: the next ask comes after a week, whatever is
+found, so the evaluation leaves the owner's limit for his own work. On Max the
+week is the same, but it goes daily (a report then covers the next 24 hours)
+while the project shows rot: a defect found, a false-block sweep hit, a batch
+or dispute item left owed, a report that did not count, or a THOR bug candidate
+waiting. It goes back to weekly the first time a counting evaluation finds none
+of that. THOR reads the plan from Claude Code's own settings at install and
+confirms it with the owner as question 1 of the first-session questions
+(`install --set-plan max|small` records his answer). There is no re-ask after a
+few hours of work, whatever was changed. "Work" is real activity: a pause of
+half an hour or more never counts.
 
 **How an evaluation goes.** Do these in order, and do not skip one.
 
@@ -763,7 +773,7 @@ more never counts.
 4. **THOR checks the filing when the turn ends.** It reads Claude Code's own
    record of the session and the memory's log, and writes its answer to the
    log. Only a report that passes counts: only it lets a held turn end and keeps
-   the question quiet for the next 16 hours. If the next message says your
+   the question quiet until the next week (the next day while a Max project shows rot). If the next message says your
    report is on file but does not count, it names why - follow that, and do not
    file the same thing again unchanged.
 

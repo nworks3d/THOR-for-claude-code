@@ -39,3 +39,15 @@ fn a_routine_that_lacks_a_label_makes_a_bug_candidate_once() {
     assert_eq!(routine_bugs.len(), 1, "the same gap is one bug");
     assert_eq!(routine_bugs[0].seen, 2);
 }
+
+#[test]
+fn the_test_signal_line_is_printed_for_a_project_and_named_in_the_routine() {
+    let (dir, db) = store_with_an_open_candidate();
+    let none = eval_report(&db, Some(dir.path()), false, None);
+    assert!(!none.iter().any(|l| l.starts_with("test signal:")), "no project, no test signal: {none:?}");
+    let lines = eval_report(&db, Some(dir.path()), false, Some("fxp"));
+    let signal = lines.iter().find(|l| l.starts_with("test signal:")).unwrap_or_else(|| panic!("a project gets the line: {lines:?}"));
+    assert!(signal.contains("run the tests in step 1"), "with nothing on record the answer is the old one: {signal}");
+    let gaps = routine_gaps(SHIPPED_ROUTINE, &lines);
+    assert!(gaps.is_empty(), "the routine must name the test signal: {gaps:?}");
+}

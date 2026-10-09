@@ -51,8 +51,8 @@ closed as superseded and its verdicts stay. A project with activity in the
 last seven days and no evaluation that counts in seven days is due whatever
 the clock says.
 Since THOR 2.5 the judgement debt ("N item(s) have fired repeatedly") and the question about old rules are not
-asked at a turn-end at all: this evaluation is the one place, per project at
-most once every 16 hours, so a session is never handed something to judge
+asked at a turn-end at all: this evaluation is the one place, once a week per project
+(see "The rhythm" below), so a session is never handed something to judge
 every quarter of an hour. A verdict counts per item for everyone. What is
 about your OWN writes (a fact stored onto a full place, setup, a decision the
 owner stated) stays per session.
@@ -74,14 +74,20 @@ pre-approved and a headless session is refused.
 
 The ask does not go quiet after one turn: it holds the end of every turn,
 naming how many times it has already asked and since when, until a report
-that COUNTS is on file. A report covers the next 16 hours. Once three more
-hours of work go by since it, AND a real risk has shown up too - three or
-more code changes with no test or build run in between, or a context summary
-- the obligation returns as a repeat covering only what happened since that
-report (see the SCOPE note under step 2). Three quiet hours with neither risk
-stays silent. It only ever asks inside a project: a checkout that resolves
+that COUNTS is on file. It only ever asks inside a project: a checkout that resolves
 to no project is never asked, since there would be no way to file the report
 that silences it.
+
+THE RHYTHM: one evaluation per week per project, tied to the plan the owner
+pays for, because this routine draws on the same usage limits as his own work.
+A report that counts covers the next 7 days. On a smaller plan (Pro and
+anything below Max, or a plan THOR could not read) that is strict: the next ask
+comes after a week, whatever is found. On Max it is the same week, but a day
+(24 hours) while the project shows rot: a defect found, a false-block sweep
+hit, a batch or dispute item left owed, a report that did not count, or a THOR
+bug candidate waiting; it goes back to weekly the first time a counting
+evaluation finds none of that. The ask says in one line which mode applies and
+why. Do not try to run this routine more often than the ask: nothing is gained.
 
 A report counts only when THOR has checked how it was filed (see "The
 report" below). One that was filed any other way is on record but counts for
@@ -175,9 +181,25 @@ conversation?
   every changed file, and, where you can tell, which agent or session made
   it - a background agent, a delegated task, or the session running this
   evaluation itself. No changes at all is a finding too: say so explicitly.
-- **The project's own tests or build, run now.** Do not quote a result from
-  earlier in the session - a build can go stale the moment one more file
-  changes after it. Run it again, right now, and quote the actual result
+- **The project's own tests or build.** Running a full suite again for
+  nothing is the single biggest waste of the owner's usage limit, so read the
+  `test signal:` line of the health check first - the `--eval` command given
+  under "The report" below; run it now, once, and reuse its output there.
+  THOR records every test and build command of every session, with its
+  result, at each Stop, and the line says whether any code changed since the
+  last one in this project. Two exact forms:
+    - `... may skip: quote that run ...`: nothing changed since a run that
+      passed, within the last 7 days. Do NOT run the tests again. Quote that
+      run as your evidence - its command, its result and how long ago, all in
+      the line - and write "tests not re-run: no code change since" next to it.
+      One exception: if YOU changed code in this very turn, the record (written
+      at each Stop) does not hold it yet, so run the tests.
+    - `... run the tests in step 1`: a code change since the last run, a failed,
+      unknown or old run, or no run on record. Run it, as below.
+  There is no `test signal:` line when the folder belongs to no project: run
+  the tests. Do not quote a result from earlier in the session - a build can
+  go stale the moment one more file changes after it. When you do run it, run
+  it right now, and quote the actual result
   line (a pass/fail count, or the compiler's own summary), never a
   paraphrase of one. Run it in a plain form that `allowed-tools` pre-approves:
   the command itself from the project root (for example `cargo test
@@ -211,8 +233,9 @@ on. THOR's own open points are not yours: they are written and closed by THOR
 (see step 4), and nothing you write carries one.
 
 SCOPE: if an evaluation report for this project was already filed within the
-last 16 hours, this evaluation covers only what happened SINCE that report -
-not the whole session, and not the whole 16 hours. Judge only what fired
+last 7 days (on Max, while rot is found, the last day), this evaluation
+covers only what happened SINCE that report - not the whole session, and not
+the whole week. Judge only what fired
 since then; everything the previous report already covers is not this
 evaluation's business again.
 
@@ -1105,7 +1128,7 @@ reply: its health, refusal-outcome and dispute lines are the final window of
 this evaluation (see "What you see when" above). The report counts from the
 end-of-turn check on: the Stop hook reads the answer back from THOR's log, and
 only a report that counts lets a blocked turn end and stays quiet for the next
-16 hours. If the next ask says your report is on file but does not count, it
+week (the next day on Max while rot is found). If the next ask says your report is on file but does not count, it
 names why, names every other report on file that does not count, and names the
 last one that does; follow that. A one-line "restart Claude" notice for a
 report or a stale tool server is said once per report and session, then

@@ -993,6 +993,13 @@ fn sweep_replies(db: &Path, state: &mut ReplyState, deadline: Instant, now: i64,
 
 // -------------------------------------------------------------------- report
 
+/// The ids of the rules the LAST sweep flagged (would refuse real calls that
+/// ran fine), from the state on disk - nothing is run. Empty when no sweep ever
+/// ran. Read by the evaluation rhythm: a flagged rule is rot.
+pub fn flagged_rule_ids(db: &Path, store: &EventStore) -> Vec<String> {
+    build_report(store, &load_state(db)).flagged_rules().into_iter().map(|line| line.id.clone()).collect()
+}
+
 fn build_report(store: &EventStore, state: &State) -> Report {
     let rules: HashMap<String, Item> = crate::live::live_items(store).into_iter().map(|li| (li.id, li.item)).collect();
     let mut per_rule: BTreeMap<String, Vec<&Hit>> = BTreeMap::new();

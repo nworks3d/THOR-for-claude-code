@@ -1453,7 +1453,7 @@ fn other_actors_sentence(counts: &std::collections::HashMap<String, usize>) -> S
 /// cold read gets to an honest answer, and explicitly named as coming from
 /// the sidecar rather than a live measurement. Also names, once a covering
 /// report already exists, that a REPEAT evaluation follows after
-/// `EVAL_REPEAT_WORK_MINUTES` more of accrued work since it, rather than
+/// (no longer: part G dropped the repeat) more of accrued work since it, rather than
 /// staying silent for the rest of the window. READ-ONLY: this reads the
 /// evaluation debt's own sidecar (`serve::usefulness::project_eval_state`)
 /// but, unlike the Stop hook's own `update_eval_debt_state`/`record_eval_
@@ -1559,13 +1559,16 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool
             }
             // From the log too - the same time the Stop hook overwrites the
             // sidecar's copy with, so doctor never reads a hand-edited one.
-            let covered = serve::usefulness::eval_report_covers(filed, now);
+            let cadence = serve::usefulness::cadence_for(serve::plan::current(db));
+            let rot = cadence == serve::usefulness::EvalCadence::WeeklyUnlessRot
+                && checkout_project.is_some_and(|p| serve::eval_filing::project_rot(&store, p).is_some());
+            let window_hours = serve::usefulness::covers_hours(cadence, rot);
+            let covered = serve::usefulness::eval_report_covers(filed, now, window_hours);
             if covered {
-                out[0].push_str(
-                    "; the last evaluation still covers this project, and a repeat is due once three more hours of accrued work go by since it \
-                     AND a risk shows up too (three or more untested edits since the last test or build run, or a context \
-                     summary) - time alone never triggers a repeat",
-                );
+                out[0].push_str(&format!(
+                    "; the last evaluation still covers this project for {} day(s) - nothing more is asked before then",
+                    window_hours / 24
+                ));
             } else {
                 let ask_clause = match state.first_asked_since_report {
                     Some(first) => {
@@ -1574,9 +1577,9 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool
                     None => "not asked yet".to_string(),
                 };
                 out[0].push_str(&format!(
-                    "; no evaluation in the last {} hours - {ask_clause}; the Stop hook blocks every turn once a session \
+                    "; no evaluation in the last {} day(s) - {ask_clause}; the Stop hook blocks every turn once a session \
                      has accrued an hour of work here, until the report is filed",
-                    serve::usefulness::EVAL_REPORT_COVERS_HOURS
+                    window_hours / 24
                 ));
             }
             // THE MOST RECENTLY ACTIVE SESSION'S OWN ACCRUAL, since the fifth
@@ -1593,8 +1596,7 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool
             // nothing to name, not an error.
             if let Some((session_id, work)) = serve::usefulness::most_recently_active_session(&state) {
                 let accrued_minutes = work.accrued_secs / 60;
-                let threshold =
-                    if covered { serve::usefulness::EVAL_REPEAT_WORK_MINUTES } else { serve::usefulness::EVAL_FIRST_WORK_MINUTES };
+                let threshold = serve::usefulness::EVAL_FIRST_WORK_MINUTES;
                 // Since step 17 the PROJECT's clock decides (every session
                 // together); it is never below any one session's own.
                 let project_minutes = (state.work.accrued_secs / 60).max(accrued_minutes);
@@ -1609,13 +1611,14 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool
                 // gate a repeat on - the untested-edit count since the last
                 // test or build run, and whether a context summary has
                 // happened since this session's own last reset.
+                let week_clause = if covered { " once the week is up" } else { "" };
                 let summary_clause =
                     if work.compacted_since_anchor { "a context summary has happened" } else { "no context summary yet" };
                 out[0].push_str(&format!(
                     "; its most recently active session ('{session_id}') has accrued {accrued_minutes} minute(s) of work \
                      here since its last reset, the project {project_minutes} minute(s) with every session together - \
-                     {due_clause}, with {} untested edit(s) since the last test or build run and \
-                     {summary_clause} - a repeat only ever fires once accrued work AND one of those two holds",
+                     {due_clause}{week_clause}, with {} untested edit(s) since the last test or build run and \
+                     {summary_clause}",
                     work.edits_since_test
                 ));
             }
@@ -1753,8 +1756,12 @@ pub fn evaluations_line(db: &Path, project: Option<&str>) -> Option<String> {
 /// THE CADENCE (step 17): which rule decides when a project owes its
 /// evaluation - a code constant, named on every doctor run so a flip can
 /// never go unseen.
-pub fn cadence_line() -> String {
-    serve::usefulness::cadence_clause(serve::usefulness::EVAL_CADENCE).to_string()
+pub fn cadence_line(db: &Path) -> String {
+    let (cadence, how) = match serve::plan::read(db) {
+        Some((plan, source)) => (serve::usefulness::cadence_for(plan), format!("plan {} ({})", plan.word(), source.word())),
+        None => (serve::usefulness::cadence_for(serve::plan::Plan::Small), "no plan on record, so the cheap weekly rhythm".to_string()),
+    };
+    format!("{} - {how}", serve::usefulness::cadence_clause(cadence))
 }
 
 /// How many minutes the work-clock sidecar and the transcripts may disagree
@@ -3811,9 +3818,10 @@ pub fn report(
     // rather than in place of it. `full` also lifts its named-items cap, the
     // same flag `decay_line`/`crowding_line` already take it from.
     lines.extend(judgement_debt_line(db, checkout_project, full));
+    lines.extend(test_signal_line(db, checkout_project));
     lines.extend(volume_lines(db));
     lines.extend(evaluations_line(db, checkout_project));
-    lines.push(cadence_line());
+    lines.push(cadence_line(db));
     lines.extend(work_clock_line(db, checkout_project));
     lines.extend(evaluation_batch_line(db, checkout_project, full));
     // Silent unless the store holds an open point / a rule names a
@@ -3832,9 +3840,18 @@ pub fn report(
     lines
 }
 
+/// THE TEST SIGNAL (part G): whether step 1 of the evaluation has to run the
+/// project's tests again, from the real-call corpus (`serve::test_signal`).
+/// `None` outside a project: there is no project whose tests it could name.
+pub fn test_signal_line(db: &Path, checkout_project: Option<&str>) -> Option<String> {
+    let project = checkout_project?;
+    let now = serve::time::now_unix();
+    Some(serve::test_signal::line(&serve::test_signal::read(db, project, now), now))
+}
+
 /// The last line of `doctor --eval`: what it printed and what it left out, so a
 /// reader who needs another line knows it is one command away and not missing.
-pub const EVAL_FOOTER: &str = "doctor --eval: only the lines the evaluation routine asks for (tool server and installed programs, when one is wrong; ship, provable rules, gate, teeth, pinned, decay, crowding, false-block sweep, judgement debt, contradictions; THOR bug candidates, while one is waiting); a line the store has nothing to say about is silent, as in the full report. For anything else - the store and chain line, command anchors, hook launch failures, refusal outcomes, open points, the evaluation clock - run doctor without --eval; that takes longer, so wait for it to end and do not quote it before it has finished";
+pub const EVAL_FOOTER: &str = "doctor --eval: only the lines the evaluation routine asks for (tool server and installed programs, when one is wrong; ship, provable rules, gate, teeth, pinned, decay, crowding, false-block sweep, judgement debt, test signal, contradictions; THOR bug candidates, while one is waiting); a line the store has nothing to say about is silent, as in the full report. For anything else - the store and chain line, command anchors, hook launch failures, refusal outcomes, open points, the evaluation clock - run doctor without --eval; that takes longer, so wait for it to end and do not quote it before it has finished";
 
 /// The lines of `report` that the evaluation routine (`eval-command.example.md`)
 /// asks a reader to quote - `provable rules`, `gate`, `teeth`, `pinned`, `decay`,
@@ -3866,6 +3883,7 @@ pub fn eval_report(
     ]);
     lines.extend(false_block_sweep_lines(db));
     lines.extend(judgement_debt_line(db, checkout_project, full));
+    lines.extend(test_signal_line(db, checkout_project));
     lines.extend(contradiction_line(db, checkouts));
     lines.extend(serve::thor_bugs::open_line(db));
     lines
@@ -4664,7 +4682,7 @@ mod tests {
         }
         let line = judgement_debt_line(&db, Some("thor"), false).expect("a real backlog, the line must speak");
         assert!(line.contains("no evaluation report of this project counts (none on file passed THOR's check)"), "{line}");
-        assert!(line.contains("no evaluation in the last 16 hours"), "{line}");
+        assert!(line.contains("no evaluation in the last 7 day(s)"), "{line}");
         assert!(line.contains("not asked yet"), "{line}");
         assert!(
             line.contains("the Stop hook blocks every turn once a session has accrued an hour of work here"),
@@ -4691,7 +4709,7 @@ mod tests {
         );
         let line = judgement_debt_line(&db, Some("thor"), false).expect("a real backlog, the line must speak");
         assert!(line.contains("no evaluation report of this project counts (none on file passed THOR's check)"), "{line}");
-        assert!(line.contains("no evaluation in the last 16 hours"), "{line}");
+        assert!(line.contains("no evaluation in the last 7 day(s)"), "{line}");
         assert!(line.contains("asked 4 time(s), the first 2 day(s) ago"), "{line}");
         assert!(
             line.contains("the Stop hook blocks every turn once a session has accrued an hour of work here"),
@@ -4791,7 +4809,7 @@ mod tests {
             declare_owed_for_eval_debt(&mut store, 1, "thor");
         }
         let line = judgement_debt_line(&db, Some("thor"), false).expect("one item is still owed, the line must speak");
-        assert!(line.contains("no evaluation in the last 16 hours"), "{line}");
+        assert!(line.contains("no evaluation in the last 7 day(s)"), "{line}");
         assert!(
             line.contains("the Stop hook blocks every turn once a session has accrued an hour of work here"),
             "{line}"
@@ -4807,18 +4825,25 @@ mod tests {
     // the next evaluation is due - the closest a cold read gets to the
     // per-session detail only a real Stop can know for certain.
 
-    /// Step 17: doctor names the cadence on every run - the shipped one is
-    /// rolling 16 hours, and the weekly one is named as off.
+    /// Step 17 and part G: doctor names the cadence on every run, with the plan
+    /// it follows - a small plan when nothing is on record, Max when the sidecar
+    /// says so.
     #[test]
-    fn cadence_clause_names_the_mode() {
-        assert_eq!(cadence_line(), "evaluation cadence: rolling 16 hours (weekly-unless-rot is built but off)");
-        let weekly = serve::usefulness::cadence_clause(serve::usefulness::EvalCadence::WeeklyUnlessRot);
-        assert!(weekly.starts_with("evaluation cadence: weekly unless rot") && weekly.contains("rolling 16 hours is built but off"), "{weekly}");
+    fn cadence_clause_names_the_mode_and_the_plan() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
         drop(EventStore::new(&db).unwrap());
+        assert_eq!(
+            cadence_line(&db),
+            "evaluation cadence: once a week per project, never daily (smaller plan) - no plan on record, so the cheap weekly rhythm"
+        );
+        serve::plan::write(&db, serve::plan::Plan::Max, serve::plan::PlanSource::Confirmed).unwrap();
+        assert_eq!(
+            cadence_line(&db),
+            "evaluation cadence: once a week per project, daily while rot is found (Max plan) - plan max (confirmed)"
+        );
         let lines = report(&db, None, None, None, None, None, false, Some("thor"));
-        assert!(lines.iter().any(|l| l == "evaluation cadence: rolling 16 hours (weekly-unless-rot is built but off)"), "{lines:?}");
+        assert!(lines.iter().any(|l| l == &cadence_line(&db)), "{lines:?}");
     }
 
     /// Step 17 (N3): a work-clock sidecar that disagrees with the project's
@@ -4917,10 +4942,7 @@ mod tests {
         let line = judgement_debt_line(&db, Some("thor"), false).expect("a real backlog, the line must speak");
         assert!(line.contains("2 untested edit(s) since the last test or build run"), "{line}");
         assert!(line.contains("a context summary has happened"), "{line}");
-        assert!(
-            line.contains("a repeat only ever fires once accrued work AND one of those two holds"),
-            "must say plainly that a repeat needs a risk: {line}"
-        );
+        assert!(!line.contains("repeat"), "there is no repeat any more: {line}");
     }
 
     /// The contrast: zero edits and no summary reads as "no context summary
@@ -4974,11 +4996,11 @@ mod tests {
         assert!(line.contains("already due"), "{line}");
     }
 
-    /// A report that still covers shifts BOTH the top-level wording (a
-    /// repeat evaluation, not a first one) and the per-session threshold to
-    /// `EVAL_REPEAT_WORK_MINUTES` rather than `EVAL_FIRST_WORK_MINUTES`.
+    /// A report that still covers says so, for how many days, and that
+    /// nothing more is asked before then (part G: one evaluation per week;
+    /// there is no repeat threshold any more).
     #[test]
-    fn judgement_debt_line_uses_the_repeat_threshold_once_a_covering_report_already_exists() {
+    fn judgement_debt_line_says_a_covering_report_holds_for_the_week() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
         let today = recently_covered();
@@ -5001,15 +5023,11 @@ mod tests {
         );
         let line = judgement_debt_line(&db, Some("thor"), false).expect("a real backlog, the line must speak");
         assert!(
-            line.contains("the last evaluation still covers this project, and a repeat is due once three more hours of accrued work go by since it"),
+            line.contains("the last evaluation still covers this project for 7 day(s) - nothing more is asked before then"),
             "{line}"
         );
-        assert!(line.contains("time alone never triggers a repeat"), "the risk gate must be named plainly: {line}");
-        let remaining = serve::usefulness::EVAL_REPEAT_WORK_MINUTES - 100;
-        assert!(
-            line.contains(&format!("due after {remaining} more minute(s) of accrued work")),
-            "must measure against the REPEAT threshold, not the first-of-day one: {line}"
-        );
+        assert!(!line.contains("repeat"), "there is no repeat any more: {line}");
+        assert!(line.contains("already due once the week is up"), "the per-session work is measured against the one-hour floor: {line}");
     }
 
     /// A report on file that no Stop has checked yet is NAMED, honestly - it

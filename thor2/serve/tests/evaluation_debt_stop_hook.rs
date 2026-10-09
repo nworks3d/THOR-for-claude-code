@@ -452,7 +452,7 @@ fn recently_covered() -> i64 {
 /// `usefulness::EVAL_REPORT_COVERS_HOURS`, so a fixture can prove the "does
 /// not cover any more" branch regardless of wall-clock time.
 fn no_longer_covered() -> i64 {
-    serve::time::now_unix() - (serve::usefulness::EVAL_REPORT_COVERS_HOURS + 1) * 3600
+    serve::time::now_unix() - (serve::usefulness::EVAL_WEEKLY_DAYS * 24 + 1) * 3600
 }
 
 /// Settles the judgement debt `declare_owed_items` creates, by giving every
@@ -545,7 +545,7 @@ fn fires_for_a_main_session_and_names_the_real_eval_path_when_it_exists() {
     assert_eq!(v["decision"], "block", "{out}");
     let reason = v["reason"].as_str().unwrap();
     assert!(reason.contains("[THOR]"), "{reason}");
-    assert!(reason.contains("This project has had no evaluation in the last 16 hours"), "{reason}");
+    assert!(reason.contains("This project has had no evaluation in the last 7 day(s)"), "{reason}");
     assert!(reason.contains("This session has worked here for"), "{reason}");
     assert!(reason.contains(&format!("{OWED_CONTEXT_COUNT} more item(s) of this project owe a verdict because other sessions fired them")), "{reason}");
     assert!(reason.contains("It has been asked 1 time(s)"), "{reason}");
@@ -553,7 +553,7 @@ fn fires_for_a_main_session_and_names_the_real_eval_path_when_it_exists() {
     assert!(reason.contains(&expected_path.display().to_string()), "must name the real eval file path: {reason}");
     assert!(reason.contains("/thor-eval"), "must tell the owner how to run it: {reason}");
     assert!(reason.contains("A turn cannot end until the evaluation report for this project is filed"), "{reason}");
-    assert!(reason.contains("After that it is quiet for 16 hours"), "{reason}");
+    assert!(reason.contains("After that it is quiet for 7 day(s)"), "{reason}");
 }
 
 #[test]
@@ -1003,12 +1003,31 @@ fn a_report_outside_the_coverage_window_does_not_silence_it() {
     assert_eq!(v["decision"], "block", "{out}");
 }
 
-/// Case named in the build brief: "the next day it asks again only after 60
-/// minutes of work" - the day after a report (seeded as yesterday here), 59
-/// minutes worked is still silent, 61 fires. Two stores, since each needs
-/// its own fresh sidecar and its own session.
+/// Part G: two days after a report, however long the work goes on (59 minutes
+/// or 10 hours), a small plan is not asked again: the rhythm is one
+/// evaluation per week.
 #[test]
-fn the_day_after_a_report_59_minutes_worked_is_silent_61_fires() {
+fn two_days_after_a_report_nothing_is_asked_however_long_the_work() {
+    for minutes in [59, 61, 600] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        let sandbox = Sandbox::new();
+        let project_dir = sandbox.project_dir("thor-fixture");
+
+        let mut store = EventStore::new(&db).unwrap();
+        declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
+        drop(store);
+        seed_valid_report(&db, "thor-fixture", serve::time::now_unix() - 2 * 86400, "eval-thor-fixture-covering");
+        seed_session_work(&db, Some("thor-fixture"), "s1", minutes);
+        let out = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
+        assert!(out.trim().is_empty(), "{minutes} minutes, two days after a report, must be silent on a small plan: {out}");
+    }
+}
+
+/// A week and an hour after a report the project is owed its evaluation
+/// again, and the ask says the rhythm in one line.
+#[test]
+fn a_week_after_a_report_the_ask_comes_and_names_the_rhythm() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("thor.db");
     let sandbox = Sandbox::new();
@@ -1018,20 +1037,35 @@ fn the_day_after_a_report_59_minutes_worked_is_silent_61_fires() {
     declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
     drop(store);
     seed_valid_report(&db, "thor-fixture", no_longer_covered(), "eval-thor-fixture-covering");
-    seed_session_work(&db, Some("thor-fixture"), "s1", 59);
-    let silent = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
-    assert!(silent.trim().is_empty(), "59 minutes, the day after a report, must still be silent: {silent}");
-
-    let dir2 = tempfile::tempdir().unwrap();
-    let db2 = dir2.path().join("thor.db");
-    let mut store2 = EventStore::new(&db2).unwrap();
-    declare_owed_items(&mut store2, OWED_CONTEXT_COUNT, Some("thor-fixture"));
-    drop(store2);
-    seed_valid_report(&db2, "thor-fixture", no_longer_covered(), "eval-thor-fixture-covering");
-    seed_session_work(&db2, Some("thor-fixture"), "s2", 61);
-    let out = run_hook(&db2, &stop_payload("s2", &project_dir), &sandbox);
-    let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("61 minutes must fire: {e}: {out}"));
+    seed_session_work(&db, Some("thor-fixture"), "s1", 61);
+    let out = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("a week-old report must be asked about again: {e}: {out}"));
     assert_eq!(v["decision"], "block", "{out}");
+    let reason = v["reason"].as_str().unwrap();
+    assert!(reason.contains("The last evaluation report ('eval-thor-fixture-covering') is 7 day(s) old"), "{reason}");
+    assert!(reason.contains("your plan is a smaller one, so this check runs once a week at most"), "{reason}");
+}
+
+/// The plan decides: the same store with a Max plan on record and rot (owed
+/// verdicts) is asked after two days, and the ask says it is daily.
+#[test]
+fn on_max_rot_brings_the_ask_back_after_a_day() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let sandbox = Sandbox::new();
+    let project_dir = sandbox.project_dir("thor-fixture");
+
+    let mut store = EventStore::new(&db).unwrap();
+    declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
+    drop(store);
+    serve::plan::write(&db, serve::plan::Plan::Max, serve::plan::PlanSource::Confirmed).unwrap();
+    seed_valid_report(&db, "thor-fixture", serve::time::now_unix() - 2 * 86400, "eval-thor-fixture-covering");
+    seed_session_work(&db, Some("thor-fixture"), "s1", 61);
+    let out = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("Max with rot must be asked after a day: {e}: {out}"));
+    assert_eq!(v["decision"], "block", "{out}");
+    let reason = v["reason"].as_str().unwrap();
+    assert!(reason.contains("your plan is Max and something is wrong in this project, so the check runs daily"), "{reason}");
 }
 
 // ------------------------------------------------------------ repeat: fires
@@ -1062,12 +1096,11 @@ fn a_report_seen_today_with_90_minutes_accrued_since_stays_silent() {
     assert!(out.trim().is_empty(), "well past the first threshold but nowhere near the repeat one must stay silent: {out}");
 }
 
-/// Case named in the build brief: a session with 181 minutes of accrued
-/// work after a report seen today is blocked with the repeat message - the
-/// end-to-end proof of the owner's own decision ("after every THREE HOURS OF
-/// WORK... a NEW evaluation is due").
+/// The 3-hour re-ask is gone (part G): 181 minutes of work after a report seen
+/// today, with the untested edits that used to be the risk, still asks nothing
+/// - end to end, through the real hook binary.
 #[test]
-fn a_report_seen_today_with_three_hours_accrued_since_fires_the_repeat_message() {
+fn a_report_seen_today_with_three_hours_and_a_risk_no_longer_fires_a_repeat() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("thor.db");
     let sandbox = Sandbox::new();
@@ -1081,30 +1114,13 @@ fn a_report_seen_today_with_three_hours_accrued_since_fires_the_repeat_message()
         &db,
         Some("thor-fixture"),
         "s1",
-        serve::usefulness::EVAL_REPEAT_WORK_MINUTES + 1,
+        181,
         serve::usefulness::EVAL_REPEAT_MIN_UNTESTED_EDITS,
-        false,
+        true,
     );
 
     let out = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
-    let v: serde_json::Value =
-        serde_json::from_str(&out).unwrap_or_else(|e| panic!("three hours plus a risk since the last report must fire a repeat ask: {e}: {out}"));
-    assert_eq!(v["decision"], "block", "{out}");
-    let reason = v["reason"].as_str().unwrap();
-    assert!(reason.starts_with("[THOR]"), "{reason}");
-    assert!(reason.contains("This session has worked here for 3.0 hour(s) since the last evaluation report"), "{reason}");
-    assert!(reason.contains("eval-thor-fixture-2026-09-17"), "must name the report this accrual is measured since: {reason}");
-    assert!(
-        reason.contains(&format!("{} code change(s) since the last test or build run", serve::usefulness::EVAL_REPEAT_MIN_UNTESTED_EDITS)),
-        "must name the risk that triggered it: {reason}"
-    );
-    assert!(
-        reason.contains("A new evaluation is due, covering only what happened since then plus the state of the work"),
-        "{reason}"
-    );
-    assert!(reason.contains(&format!("{OWED_CONTEXT_COUNT} more item(s) of this project owe a verdict because other sessions fired them")), "{reason}");
-    assert!(reason.contains("A turn cannot end until the evaluation report for this project is filed"), "{reason}");
-    assert!(!reason.contains("It has been asked"), "the repeat message names hours and a report id, never an ask count: {reason}");
+    assert!(out.trim().is_empty(), "no repeat ask after a few hours, whatever the risk: {out}");
 }
 
 /// THE CENTRAL CASE THE SIXTH REWRITE EXISTS FOR (owner's decision,
@@ -1121,7 +1137,7 @@ fn three_hours_accrued_with_no_risk_at_all_stays_silent_end_to_end() {
     declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
     drop(store);
     seed_valid_report(&db, "thor-fixture", recently_covered(), "eval-thor-fixture-2026-09-17");
-    seed_session_work(&db, Some("thor-fixture"), "s1", serve::usefulness::EVAL_REPEAT_WORK_MINUTES + 1);
+    seed_session_work(&db, Some("thor-fixture"), "s1", 181);
 
     let out = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
     assert!(out.trim().is_empty(), "three hours accrued with no code change and no summary must stay silent: {out}");
@@ -1145,7 +1161,7 @@ fn subagent_untested_edits_count_toward_the_risk_counter_but_a_subagent_stop_nev
     declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
     drop(store);
     seed_valid_report(&db, "thor-fixture", recently_covered(), "eval-thor-fixture-2026-09-17");
-    seed_session_work(&db, Some("thor-fixture"), "sub1", serve::usefulness::EVAL_REPEAT_WORK_MINUTES + 1);
+    seed_session_work(&db, Some("thor-fixture"), "sub1", 181);
 
     for _ in 0..serve::usefulness::EVAL_REPEAT_MIN_UNTESTED_EDITS {
         let payload = serde_json::json!({

@@ -135,6 +135,7 @@ pub mod status;
 pub mod store_dir;
 pub mod sweep;
 pub mod teeth;
+pub mod test_signal;
 pub mod thor_bugs;
 pub mod time;
 pub mod usefulness;

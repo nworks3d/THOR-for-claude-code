@@ -834,7 +834,8 @@ fn restarted_after(files: &[PathBuf], after_unix: i64) -> bool {
 /// (a judgement list, a teeth batch, an A4 list or THOR's own open points);
 /// since that evaluation, a report that does not count, a write to an item
 /// of the project outside an attested THOR call, a live rule of the project
-/// that `settlement` calls owed, or judgement debt in the project.
+/// that `settlement` calls owed, judgement debt in the project, an open THOR bug
+/// candidate, or a rule of the project the false-block sweep flags.
 pub fn project_rot(store: &EventStore, project: &str) -> Option<String> {
     let Some(valid) = newest_valid_evaluation(store, Some(project)) else {
         return Some("no evaluation of it counts".to_string());
@@ -872,7 +873,19 @@ pub fn project_rot(store: &EventStore, project: &str) -> Option<String> {
         return Some(format!("the rule '{}' has no verdict (rot)", li.id));
     }
     let (_, owed) = crate::usefulness::judgement_debt_counts(store, Some(project));
-    (owed > 0).then(|| format!("{owed} item(s) owe a verdict"))
+    if owed > 0 {
+        return Some(format!("{owed} item(s) owe a verdict"));
+    }
+    // THE SIGNALS THOR KEEPS BESIDE THE STORE (part G): a THOR bug candidate
+    // waiting, or a rule of this project the last false-block sweep found
+    // refusing real calls that ran fine. Both read from their sidecars, never
+    // by running anything.
+    let db = store.path()?;
+    if let Some(line) = crate::thor_bugs::open_line(&db) {
+        return Some(format!("a THOR bug candidate is open ({line})"));
+    }
+    let ids = crate::usefulness::items_of_project(store, project);
+    crate::sweep::flagged_rule_ids(&db, store).into_iter().find(|id| ids.contains(id)).map(|id| format!("the false-block sweep flags the rule '{id}'"))
 }
 
 /// Whether the newest validator record on the log says the transcript was in

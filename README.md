@@ -226,6 +226,18 @@ of the review report that says what was judged and what was refused is written
 by THOR from its own record, so it cannot be made up. A review that was filed
 any other way than through THOR's own tool does not count, and THOR says why.
 
+**How often the review comes depends on your plan.** The review draws on the
+same usage limits as your own work, so THOR keeps it to one a week per project.
+On a smaller plan (Pro and anything below Max) that is strict: once a week, and
+never daily, whatever it finds. On Max it is once a week too, but it comes back
+daily while something is found wrong (a defect, a rule that would refuse real
+work, a check left undone, a review that did not count, a bug in THOR itself),
+and goes back to weekly the first time a review finds nothing. THOR reads your
+plan from Claude Code's own settings file when it installs and asks you to
+confirm it in the first-session questions; `install --set-plan max` or
+`install --set-plan small` records your answer. The review's request says in
+one line which of the two applies.
+
 ## A memory with a spine
 
 Version 1 remembered well and never argued. It would hand your assistant a note
@@ -244,7 +256,7 @@ at the right moment and hope. Version 2 is the same memory with a spine.
   broken for a year.
 - **Maintenance is no longer optional, and it does not nag.** Judging the notes
   that keep firing and cleaning up old rules is asked once, inside the project's
-  evaluation (at most once per 16 hours), never at the end of every turn. A turn
+  evaluation (once a week per project), never at the end of every turn. A turn
   is held only for something the session did itself: a note it just filed where
   it will never be seen, a setup left undone, a decision you stated that was not
   stored. It will not be waved off with a promise to do it later.
