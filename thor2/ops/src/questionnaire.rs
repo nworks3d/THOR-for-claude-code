@@ -142,7 +142,7 @@ pub fn questions() -> Vec<Question> {
                 rules.len()
             ),
             what: format!(
-                "A set of {} general work habits, stored as notes that arrive right before the step they are about, once per session: {}. {teaching} more notes teach your assistant how to write notes that come back and how to work with THOR. None of them can block anything.",
+                "A set of {} general work habits, stored as notes that arrive right before the step they are about, once per session: {}. {teaching} more notes teach your assistant how to write notes that come back and how to work with THOR. None of them blocks a normal step; on Windows two of them, about hidden console windows, refuse the one call that would flash a window.",
                 rules.len(),
                 work_rule_line()
             ),

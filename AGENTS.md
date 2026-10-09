@@ -600,10 +600,10 @@ DETAIL PER ITEM (for the assistant: state an item's Why once, only when he asks 
    To say no: I switch the weekly ask off (install --set-weekly-check off); you can still type /thor-eval yourself, and nothing else changes.
 
 5. The starter work rules
-   What it is: A set of 12 general work habits, stored as notes that arrive right before the step they are about, once per session: changelog with every user visible change; run the tests before saying done; never commit a secret; commit push deploy only when asked; commit hygiene; check where you push and what is on main; scan before it goes public; rehearse destructive steps on a copy; pin a dependency with its reason; absolute paths not the shell working directory; script file not shell quoting; windowless processes on windows. 21 more notes teach your assistant how to write notes that come back and how to work with THOR. None of them can block anything.
+   What it is: A set of 13 general work habits, stored as notes that arrive right before the step they are about, once per session: changelog with every user visible change; run the tests before saying done; never commit a secret; commit push deploy only when asked; commit hygiene; check where you push and what is on main; scan before it goes public; rehearse destructive steps on a copy; pin a dependency with its reason; absolute paths not the shell working directory; script file not shell quoting; windowless processes on windows; scheduled task not interactive. 21 more notes teach your assistant how to write notes that come back and how to work with THOR. None of them blocks a normal step; on Windows two of them, about hidden console windows, refuse the one call that would flash a window.
    Why it exists: They are the habits that were marked useful again and again in a memory built over months of real work, so a new memory starts with that experience instead of learning it the hard way.
    What I chose: All on.
-   To say no: Name the ones you do not want, or say none: I remove just those notes (changelog-with-every-user-visible-change, run-the-tests-before-saying-done, never-commit-a-secret, commit-push-deploy-only-when-asked, commit-hygiene, check-where-you-push-and-what-is-on-main, scan-before-it-goes-public, rehearse-destructive-steps-on-a-copy, pin-a-dependency-with-its-reason, absolute-paths-not-the-shell-working-directory, script-file-not-shell-quoting, windowless-processes-on-windows), and a removed note simply stops arriving.
+   To say no: Name the ones you do not want, or say none: I remove just those notes (changelog-with-every-user-visible-change, run-the-tests-before-saying-done, never-commit-a-secret, commit-push-deploy-only-when-asked, commit-hygiene, check-where-you-push-and-what-is-on-main, scan-before-it-goes-public, rehearse-destructive-steps-on-a-copy, pin-a-dependency-with-its-reason, absolute-paths-not-the-shell-working-directory, script-file-not-shell-quoting, windowless-processes-on-windows, scheduled-task-not-interactive), and a removed note simply stops arriving.
 
 6. Helper-agent mode
    What it is: Your main assistant (the strongest model) answers, judges and checks, while cheaper models do the real work in helper agents, one helper per task. A trivial one-step job is done directly, tests are run narrowly while working and in full once at the end, and a helper that goes quiet is judged dead after about three checks. This is also true on smaller plans, and if your plan has no strongest model the best available one steers.
@@ -733,7 +733,12 @@ Around a risky step or a tool:
   and every brief.
 - `script-file-not-shell-quoting` - text with quotes or backslashes goes in a script
   file, not a one-liner.
-- `windowless-processes-on-windows` - background processes start hidden.
+- `windowless-processes-on-windows` - background processes start hidden. On a Windows install this
+  one REFUSES a `Start-Process` with no `-WindowStyle` or `-NoNewWindow` unless it opens something
+  you asked to see (`ms-settings:`, `windowsdefender:`, `control.exe`, a `.cpl` file, `http://`,
+  `https://`, `file:///`); on other systems it is only a note.
+- `scheduled-task-not-interactive` - `schtasks /create` with `/it` opens a console window at every
+  run. On a Windows install this one REFUSES it; on other systems it is only a note.
 
 Besides these, the install also seeded twenty-two pinned notes about writing a note
 that comes back and about honesty, agent-spawning and memory hygiene; those are
