@@ -97,7 +97,8 @@ pub fn backup_hooks_for(settings: &Path, db: &Path) -> anyhow::Result<Vec<String
 }
 
 /// Remove the backup hook(s) for `db` from `settings` and nothing else: a group
-/// that held anything else keeps it. The file is saved as `<name>.bak` first.
+/// that held anything else keeps it. The file is saved as `<name>.bak` first,
+/// unless a backup of it already exists (the first one is the user's own).
 /// Returns how many hooks went.
 pub fn remove_backup_hook(settings: &Path, db: &Path) -> anyhow::Result<usize> {
     if backup_hooks_for(settings, db)?.is_empty() {
@@ -117,11 +118,7 @@ pub fn remove_backup_hook(settings: &Path, db: &Path) -> anyhow::Result<usize> {
         }
         groups.retain(|g| g["hooks"].as_array().is_none_or(|h| !h.is_empty()));
     }
-    let backup = settings.with_extension(match settings.extension().and_then(|e| e.to_str()) {
-        Some(ext) => format!("{ext}.bak"),
-        None => "bak".to_string(),
-    });
-    std::fs::write(&backup, &raw)?;
+    crate::install::backup_once(settings, &raw)?;
     std::fs::write(settings, serde_json::to_string_pretty(&root)? + "\n")?;
     Ok(removed)
 }

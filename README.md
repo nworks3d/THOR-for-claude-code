@@ -735,8 +735,10 @@ do all of this for you if you ask; these are the steps in plain words.
    inside one of your own folders.
 10. **Open Claude Code again.** A new conversation should start without any THOR
     block, and `/thor-eval` should be gone. The `settings.json.bak` and
-    `.claude.json.bak` copies the install made can be deleted; do not restore
-    them, they predate anything else you changed since.
+    `.claude.json.bak` copies hold your two files as they were just before THOR
+    first changed them (a later run never replaces them). They can be deleted;
+    do not restore them over the current files, they predate anything else you
+    changed since.
 
 ## Documentation
 

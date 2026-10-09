@@ -57,7 +57,7 @@ Words used once, in plain language:
   command from the THOR folder.
 - Why: without them the memory never speaks and nothing announces it. This was caught on 2026-08-03,
   when the hooks had --db in the wrong place and every hook would have exited with an error silently.
-- You notice: "connected THOR to Claude Code". settings.json is first copied to settings.json.bak, nothing
+- You notice: "connected THOR to Claude Code". settings.json is first copied to settings.json.bak (only once: an existing .bak is never replaced, so it keeps your file as it was before THOR), nothing
   that is not THOR's is ever removed, a second run changes nothing, and a hook that points at a program
   that no longer exists is repointed (reported) instead of duplicated.
 - Refuse or change: --settings writes to another file. Removing the four entries from settings.json

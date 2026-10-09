@@ -97,7 +97,7 @@ It creates the store if there is not one yet, wires in the four hooks, and
 registers the tool server the agent writes through. The two files it writes are
 found on their own - the per-user `settings.json` for the hooks and
 `~/.claude.json` for the tool server. Both are backed up to `<path>.bak` before
-anything touches them, nothing this tool did not put there is ever removed, and
+anything touches them (the first backup is kept: a later run never replaces it), nothing this tool did not put there is ever removed, and
 a second run reports everything as already present and writes nothing.
 
 A store it just created also gets twenty-two pinned notes. Ten are on how to

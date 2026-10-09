@@ -637,6 +637,22 @@ fn new_group(spec: &HookSpec) -> Value {
     group
 }
 
+/// Save `raw` (the file as it is NOW) to `<path>.bak`, but only when no backup
+/// exists yet. The first backup is the file as the user had it before THOR, and
+/// the "Remove THOR completely" steps rely on it: a later write (a second
+/// install, `--set-backup`, a replaced tool-server entry) must never replace
+/// it with a file THOR has already touched. Returns the path of the backup.
+pub fn backup_once(path: &Path, raw: &str) -> std::io::Result<std::path::PathBuf> {
+    let backup = path.with_extension(match path.extension().and_then(|e| e.to_str()) {
+        Some(ext) => format!("{ext}.bak"),
+        None => "bak".to_string(),
+    });
+    if !backup.exists() {
+        fs::write(&backup, raw)?;
+    }
+    Ok(backup)
+}
+
 /// Install `specs` into the settings JSON at `path`.
 ///
 /// - Missing file: starts from `{}` (a fresh install has nothing to preserve).
@@ -644,7 +660,8 @@ fn new_group(spec: &HookSpec) -> Value {
 ///   `hooks` key (or one `hooks.<event>` key) is not the shape this tool
 ///   expects: refused with a reason. Nothing is written.
 /// - Otherwise: the file is backed up to `<path>.bak` first (copied verbatim,
-///   before any parse result is acted on), then for each spec, its event's
+///   before any parse result is acted on; an existing `.bak` is kept, see
+///   `backup_once`), then for each spec, its event's
 ///   array gets exactly one new group appended IF no existing group in that
 ///   array already carries the same command - every other group (anyone
 ///   else's hook, or THOR's own from an earlier install) is left byte-for-
@@ -687,12 +704,7 @@ pub fn install_hooks(path: &Path, specs: &[HookSpec]) -> anyhow::Result<InstallR
     }
 
     let backup_path = if existed {
-        let backup = path.with_extension(match path.extension().and_then(|e| e.to_str()) {
-            Some(ext) => format!("{ext}.bak"),
-            None => "bak".to_string(),
-        });
-        fs::write(&backup, &raw)?;
-        Some(backup)
+        Some(backup_once(path, &raw)?)
     } else {
         None
     };
@@ -1509,12 +1521,7 @@ pub fn install_tool_server(
     }
 
     let backup_path = if existed {
-        let backup = path.with_extension(match path.extension().and_then(|e| e.to_str()) {
-            Some(ext) => format!("{ext}.bak"),
-            None => "bak".to_string(),
-        });
-        fs::write(&backup, &raw)?;
-        Some(backup)
+        Some(backup_once(path, &raw)?)
     } else {
         None
     };
@@ -2205,6 +2212,35 @@ mod tests {
         let report = install_hooks(&path, &specs()).unwrap();
         let backup = report.backup_path.expect("an existing file must be backed up");
         assert_eq!(fs::read_to_string(&backup).unwrap(), original, "the backup must hold the pre-install content");
+    }
+
+    /// A second install must not replace the user's pristine backup with the
+    /// already-wired file: the "Remove THOR completely" steps rely on it.
+    #[test]
+    fn a_second_install_keeps_the_first_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(&path, "{}").unwrap();
+
+        let first = install_hooks(&path, &specs()).unwrap();
+        let backup = first.backup_path.expect("an existing file must be backed up");
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "{}");
+
+        let second = install_hooks(&path, &specs()).unwrap();
+        assert_eq!(second.backup_path.as_ref(), Some(&backup), "the report still names the one backup");
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "{}", "the backup must still hold the pre-THOR file");
+    }
+
+    /// The same rule for the tool-server file, when a later write does change it.
+    #[test]
+    fn a_replaced_tool_server_entry_keeps_the_first_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".claude.json");
+        fs::write(&path, "{}").unwrap();
+        install_tool_server(&path, "thor", "mcp.exe", &server_args("a.db")).unwrap();
+        let second = install_tool_server(&path, "thor", "mcp.exe", &server_args("b.db")).unwrap();
+        let backup = second.backup_path.expect("a changed file has a backup");
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "{}");
     }
 
     /// The defect this guards against, and it is this project's worst class:

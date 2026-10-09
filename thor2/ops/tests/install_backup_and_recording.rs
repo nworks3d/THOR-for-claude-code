@@ -222,3 +222,19 @@ fn the_backup_hook_is_the_same_hook_in_any_path_spelling() {
     let report = ops::install::install_hooks(&settings, &[b]).unwrap();
     assert_eq!(report.results[0].1, ops::install::HookOutcome::AlreadyPresent);
 }
+
+/// The `.bak` is the user's way back to the file as it was before THOR. Every
+/// later write (a second install, `--set-backup`, `--set-backup off`) must
+/// leave the first one alone, or the "Remove THOR completely" steps lose it.
+#[test]
+fn the_settings_backup_keeps_the_pristine_file_through_every_later_write() {
+    let fx = Fx::new();
+    std::fs::create_dir_all(fx.settings().parent().unwrap()).unwrap();
+    std::fs::write(fx.settings(), "{}").unwrap();
+    let bak = fx.settings().with_extension("json.bak");
+
+    assert!(fx.install(&["--set-backup", "local"]).status.success());
+    assert_eq!(std::fs::read_to_string(&bak).unwrap(), "{}", "first write must back up the pristine file");
+    assert!(fx.install(&["--set-backup", "off"]).status.success());
+    assert_eq!(std::fs::read_to_string(&bak).unwrap(), "{}", "switching the backup off must not replace the backup");
+}
