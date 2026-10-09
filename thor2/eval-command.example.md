@@ -951,22 +951,37 @@ file's `allowed-tools` pre-approves, so no permission prompt interrupts it:
 
     {{THOR_DOCTOR_EVAL_BASH}}
 
-BEFORE YOU FILE, read the first lines it prints. If one starts `tool server:` or
-`installed programs:`, the tool server you file through is older than the
-installed programs, or the programs were not built from one source. WHAT IT
-MEANS: a report filed now would be refused as version skew (see THOR health
-above) and be a dead report. WHAT TO DO: do not file; tell the owner in your
-summary to restart Claude (and to run the installer again for `installed
-programs:`), and end the turn. The next end-of-turn ask files the report.
-STEPS 1 TO 8 STAY: you still do them all, and the verdicts, batch calls and
-other THOR calls you make are written and count; only the filing is withheld.
-With no report filed, the summary for the owner goes in your chat reply. The
-installer is not a command you can name here: say "the owner re-runs the THOR
-installer". DONE WHEN: the summary says so and no report was filed. EXAMPLE:
-the output holds "tool server: 1 running mcp.exe process(es) started before
-mcp.exe was replaced" -> summary: "the tool server is stale; restart Claude, then the
-evaluation is asked again; I filed nothing". When neither line is printed,
-nothing is wrong and you file as usual.
+BEFORE YOU FILE, read the first lines it prints. Two lines can start differently,
+and they mean different things.
+
+`tool server:` (for example "tool server: 1 running mcp.exe process(es) started
+before mcp.exe was replaced") - WHAT IT MEANS: the tool server you file through
+is older than the installed mcp.exe, so a report filed now would be refused as
+version skew and be a dead report. WHAT TO DO: do not file; tell the owner in
+your summary to restart Claude, and end the turn. The next end-of-turn ask files
+the report. STEPS 1 TO 8 STAY: you still do them all, and the verdicts, batch
+calls and other THOR calls you make are written and count; only the filing is
+withheld. With no report filed, the summary for the owner goes in your chat
+reply. DONE WHEN: the summary says so and no report was filed. EXAMPLE: summary:
+"the tool server is stale; restart Claude, then the evaluation is asked again;
+I filed nothing".
+
+`installed programs:` (for example "installed programs: serve.exe is build X,
+mcp.exe is build Y, doctor.exe is build Y - they were not built from the same
+source ...") - WHAT IT MEANS: the programs on disk come from different builds,
+which happens on purpose when a fix is installed into one program without a
+restart. It is not a reason to withhold the report: a filing only fails to count
+when the tool server and the checker render the machine section differently, and
+the tool server itself refuses that before it writes anything (see THOR health
+above). WHAT TO DO: file the report as usual, and put the line in it under THOR
+health. If the filing is refused with "this tool server renders the evaluation
+machine section in format", do not file again: tell the owner to restart Claude
+and end the turn. DONE WHEN: the report is on file with the line under THOR
+health, or the refusal was passed to the owner. EXAMPLE: THOR health in the
+report: "installed programs: serve.exe is a newer build than mcp.exe (a fix
+installed without a restart); the filing was accepted".
+
+When neither line is printed, nothing is wrong and you file as usual.
 
 The last line it prints says what it left out. For one of those lines (the
 store and chain line, the command anchors, the hook launch failures, the
