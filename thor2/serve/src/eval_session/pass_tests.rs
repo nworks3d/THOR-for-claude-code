@@ -937,8 +937,8 @@ fn a_dispute_written_since_the_previous_report_is_on_the_start_note_with_its_cal
         assert!(note.contains(&format!("Call 2 (confirm the dispute): mcp__thor__revise(id: \"{id}\", because: \"<why 'git bundle list-heads backup.bundle' is legitimate, 20+ chars>\")")), "{id}: {note}");
     }
     assert!(note.contains("WHEN AN ITEM IS DONE: THOR accepted the call"), "{note}");
-    assert!(note.contains("under 20 characters is refused"), "call 2 says THOR enforces the length: {note}");
-    assert!(note.contains("or you retracted a rule that is simply wrong"), "a retract is named as the other exit: {note}");
+    assert!(note.contains("one shorter than 20 characters is refused"), "call 2 says THOR enforces the length: {note}");
+    assert!(note.contains("Retracting the rule with a reason also settles an item"), "a retract is named as the other exit: {note}");
     // Frozen: the record carries them, so the note and the record agree.
     assert_eq!(model::store::frozen_ids(&start).iter().filter(|id| id.starts_with("bundle-")).count(), 2);
     // Nothing to verify: the section still says so, in one line.
@@ -1560,7 +1560,7 @@ const BUSY_ID: &str = "evaluation-start-demo-500";
 
 /// Bytes the live-state note keeps free below `START_NOTE_BUDGET`, for a
 /// signal and a nudge that are added to it later.
-const START_NOTE_ROOM: usize = 650;
+const START_NOTE_ROOM: usize = 550;
 
 /// THE SIGNALS NEVER ARRIVED (field 2026-10-07): on a store like the live one
 /// the start note was cut at about 9 KB right after the heading of the signals

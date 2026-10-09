@@ -1309,7 +1309,7 @@ fn teeth_section(out: &mut String, record: &str, frozen: &Frozen, machine: &Mach
         out.push_str(&format!(
             "\n   a. THE BATCH - {} rule(s) that need a fix only you can make (at most {}): {}. Make the fix each \
              line names with the call shown; THOR tries the rule again and answers rule, note, or what is still \
-             missing. An item is done when it answers rule or note; a tag, a reason or an open point settles nothing:",
+             missing. An item is done when it answers rule or note. A tag, a reason or an open point settles nothing:",
             batch.len(),
             model::store::EVALUATION_TEETH_BATCH,
             quoted(batch)
@@ -1397,10 +1397,11 @@ fn disputes_section(out: &mut String, record: &str, machine: &MachinePass, caps:
          built from the rule's words wrong, so the rule is a note that can never refuse anything (an audit on \
          2026-10-07 found 7 of 11 such disputes wrong). WHAT TO DO, per rule: open it (mcp__thor__get) and the file or \
          command it is about. If the disputed literal IS the rule's subject, or a better check exists: call 1 (hang \
-         it). If it is only an incidental span: call 2 (confirm, with a reason naming what you read; under {min} \
-         characters is refused). WHEN AN ITEM IS DONE: THOR accepted the call (rule or note for call 1, 'revised' for \
-         call 2), or you retracted a rule that is simply wrong; a tag, a note or a line in the report settles nothing, \
-         and the report is held until every item is done. EXAMPLE: 'the sensor delay is in microseconds' disputed on \
+         it). If it is only an incidental span: call 2 (confirm, with a reason naming what you read; \
+         one shorter than {min} characters is refused). WHEN AN ITEM IS DONE: THOR accepted the call (rule or note for call 1, \
+         'revised' for call 2). Retracting the rule with a reason also settles an item, only for a rule that is simply \
+         wrong; a tag, a note or a line in the report settles nothing, and the report is held until every item is \
+         done. EXAMPLE: 'the sensor delay is in microseconds' disputed on \
          'delay': its subject is 'microseconds', so call 1 with check_kind \"contains\", check_path \"sensor.cfg\", \
          check_literal \"microseconds\".",
         list.len(),

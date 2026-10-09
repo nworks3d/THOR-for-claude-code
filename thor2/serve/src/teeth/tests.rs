@@ -597,7 +597,7 @@ fn listing_forms_drop_a_check_and_whole_hits_never_do() {
 /// a check proven that the hook refuses for the wrong statement.
 #[test]
 fn a_requires_trial_tries_multi_statement_powershell_calls() {
-    let mut fx = Fx::new();
+    let fx = Fx::new();
     let item = rule(
         "install-db",
         "install.exe needs --db, or it picks an empty store.",
