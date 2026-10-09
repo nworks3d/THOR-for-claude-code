@@ -431,16 +431,23 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
 - What: per project, at a turn end, THOR asks for the full /thor-eval review when: the project has had 60
   minutes of work since the last valid review (all sessions added, parallel minutes counted once); this
   session has done 10 minutes of its own work there; it is not this session's first turn end there; no
-  other session is running that project's review (active in the last 30 minutes). A valid report covers 16
-  hours. After it, a repeat needs 3 more hours of work AND a risk (3+ code changes with no test or build,
-  or a context summary). Any project worked in during the last 7 days with no valid review in 7 days is
-  due regardless.
+  other session is running that project's review (active in the last 30 minutes). The rhythm is one
+  evaluation per week per project, tied to your plan (first-session item 1): on a smaller plan (Pro and
+  anything below Max, or a plan THOR could not read) a valid report covers the next 7 days, whatever is
+  found. On Max it is the same week, but it goes daily (a report covers the next 24 hours) while the
+  project shows rot (a defect, a false-block sweep hit, an owed batch or dispute item, a report that
+  did not count, a THOR bug candidate), and back to weekly once a counting evaluation finds none. There
+  is no re-ask after a few hours of work. Any project worked in during the last 7 days with no valid
+  review in 7 days is due regardless.
 - Why: owner's decision of 2026-10-02: one block, inside the evaluation, instead of something to judge
-  every quarter of an hour. A fact counts once per session toward the 40 that make a verdict owed.
+  every quarter of an hour; and the schedule follows the plan you pay for, so the review leaves your
+  usage limit for your own work. A fact counts once per session toward the 40 that make a verdict owed.
 - You notice: the turn will not end until a valid report is on file; the message counts how many times
-  it has already asked. A short task is never held over old rules it did not touch.
-- Refuse or change: no setting turns it off (the cadence is a code constant on purpose). The only way
-  out is a valid report. Folder with no project: never asked.
+  it has already asked and says which mode applies. A short task is never held over old rules it did not
+  touch.
+- Refuse or change: install --set-plan max|small records your plan; install --set-weekly-check off stops
+  the ask (you can still type /thor-eval yourself). The only way out of a held turn is a valid report.
+  Folder with no project: never asked.
 
 ### C6. What happens inside an evaluation
 - What: THOR writes a start record in its log and freezes three lists: verdicts (notes that fired this
@@ -577,7 +584,7 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
 - What: real-calls.jsonl and real-replies.jsonl (redacted like the log, size-capped: 144 MB and 32 MB).
 - Why: so THOR can later test every rule against what really happened.
 - You notice: nothing; the files are beside the memory file. Nothing leaves the machine.
-- Refuse or change: not documented as switchable; you can delete them.
+- Refuse or change: yes, install --set-recording off|on --db <memory> (see F12); you can also delete the files.
 
 ### E6. The standing sweep for false blocks
 - What: THOR replays every rule that can refuse, and every reply-rulebook entry, against that record and

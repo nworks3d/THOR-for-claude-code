@@ -1,4 +1,4 @@
-![The AI Memory Bible](assets/banner.png)
+![THOR for Claude Code](assets/banner.png)
 
 # THOR - a memory for your AI coding assistant
 

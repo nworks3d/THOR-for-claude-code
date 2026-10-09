@@ -56,8 +56,8 @@ LABEL io.modelcontextprotocol.server.name="io.github.nworks3d/thor"
 # package page link back to the repository it was built from.
 LABEL org.opencontainers.image.title="THOR" \
       org.opencontainers.image.description="Local memory for coding agents. A rule with a runnable proof can refuse a wrong command, and a second, separate memory holds everyday things - recipes, books read, a training log - where nothing can interrupt you." \
-      org.opencontainers.image.source="https://github.com/nworks3d/thor-for-claude-code" \
-      org.opencontainers.image.url="https://github.com/nworks3d/thor-for-claude-code" \
+      org.opencontainers.image.source="https://github.com/nworks3d/THOR-for-claude-code" \
+      org.opencontainers.image.url="https://github.com/nworks3d/THOR-for-claude-code" \
       org.opencontainers.image.licenses="GPL-3.0-or-later"
 
 RUN apt-get update \

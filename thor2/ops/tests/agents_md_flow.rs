@@ -79,7 +79,7 @@ fn the_opening_steps_need_the_person_for_the_restart_alone() {
 fn agents_md_names_the_scripts_by_their_real_address() {
     let agents = read("AGENTS.md");
     for script in ["install.ps1", "install.sh"] {
-        let url = format!("https://raw.githubusercontent.com/nworks3d/thor-for-claude-code/main/{script}");
+        let url = format!("https://raw.githubusercontent.com/nworks3d/THOR-for-claude-code/main/{script}");
         assert!(agents.contains(&url), "AGENTS.md never gives the address of {script}: {url}");
     }
 }

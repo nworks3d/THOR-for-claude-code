@@ -1,7 +1,7 @@
 #!/bin/sh
 # Install THOR on Linux, in one command:
 #
-#   curl -fsSL https://raw.githubusercontent.com/nworks3d/thor-for-claude-code/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/nworks3d/THOR-for-claude-code/main/install.sh | sh
 #
 # It downloads the latest release, checks the download against the checksum
 # published beside it, unpacks it into ~/.thor2, and then runs THOR's own
@@ -16,7 +16,7 @@
 
 set -eu
 
-REPO="nworks3d/thor-for-claude-code"
+REPO="nworks3d/THOR-for-claude-code"
 DEST="${THOR_HOME:-$HOME/.thor2}"
 
 say() { printf '%s\n' "$*"; }

@@ -1,6 +1,6 @@
 # Install THOR on Windows, in one command. Open PowerShell and paste:
 #
-#   irm https://raw.githubusercontent.com/nworks3d/thor-for-claude-code/main/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/nworks3d/THOR-for-claude-code/main/install.ps1 | iex
 #
 # It downloads the latest release, checks the download against the checksum
 # published beside it, unpacks it into your home folder, and then runs THOR's
@@ -19,7 +19,7 @@ $ErrorActionPreference = 'Stop'
 # bar rather than downloading, which on a file this size is minutes wasted.
 $ProgressPreference = 'SilentlyContinue'
 
-$repo = 'nworks3d/thor-for-claude-code'
+$repo = 'nworks3d/THOR-for-claude-code'
 $dest = $env:THOR_HOME
 if (-not $dest) { $dest = Join-Path $HOME 'thor2' }
 

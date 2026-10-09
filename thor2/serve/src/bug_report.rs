@@ -23,7 +23,7 @@ use regex::Regex;
 use std::sync::OnceLock;
 
 /// The public repository bug write-ups go to.
-pub const UPSTREAM_REPO: &str = "nworks3d/thor-for-claude-code";
+pub const UPSTREAM_REPO: &str = "nworks3d/THOR-for-claude-code";
 
 /// Where a person without the `gh` program opens a new issue.
 pub fn new_issue_url() -> String {
@@ -432,7 +432,7 @@ mod tests {
             assert!(text.contains("tags: [\"thor-bug:hook-launch-1a2b3c4d\"]"), "{text}");
             assert!(text.contains("DONE WHEN"), "{text}");
         }
-        assert!(release.contains("gh issue create --repo nworks3d/thor-for-claude-code"));
+        assert!(release.contains("gh issue create --repo nworks3d/THOR-for-claude-code"));
         // The one question reassures: exact text, what was removed, no send without a yes, no is fine.
         for part in [
             "THOR vond een fout in zichzelf",
