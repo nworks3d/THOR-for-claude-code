@@ -116,6 +116,56 @@ struct Cli {
         conflicts_with_all = ["project", "settings", "mcp_json", "no_mcp", "serve_exe", "mcp_exe", "code_index_root", "register_root"]
     )]
     set_mode: Option<String>,
+
+    /// Set ONLY the plan THOR works by, `max` or `small` (Pro and anything
+    /// smaller), and nothing else. THOR reads your plan from Claude Code's own
+    /// settings file at install; this records YOUR answer when it is wrong or
+    /// when the file does not say. On `max` the weekly check runs daily while
+    /// something is found wrong; on `small` it runs strictly once a week, so
+    /// your limit stays for your own work. Needs --db.
+    #[arg(
+        long = "set-plan",
+        value_name = "PLAN",
+        conflicts_with_all = ["project", "settings", "mcp_json", "no_mcp", "serve_exe", "mcp_exe", "code_index_root", "register_root", "set_mode"]
+    )]
+    set_plan: Option<String>,
+}
+
+/// `install --set-plan max|small`: write the plan and nothing else.
+fn set_plan_only(db: Option<PathBuf>, word: &str) -> ExitCode {
+    let Some(plan) = serve::plan::Plan::from_word(word) else {
+        eprintln!("the plan is 'max' or 'small' (Pro and anything smaller), not '{word}'. Example: install --set-plan small --db <your memory>");
+        return ExitCode::from(2);
+    };
+    let Some(db) = db else {
+        eprintln!("name the memory to set the plan for: install --set-plan {word} --db <your memory>");
+        return ExitCode::from(2);
+    };
+    if !db.is_file() {
+        eprintln!(
+            "REFUSED: there is no memory at {} - check the path given with --db (the one your assistant's hooks name). \
+             Nothing was changed.",
+            db.display()
+        );
+        return ExitCode::FAILURE;
+    }
+    // Told by the user: `confirmed` when Claude Code's file had a tier to
+    // confirm, `asked` when it had none.
+    let found = serve::plan::default_claude_json().map(|p| serve::plan::detect_in(&p));
+    let source = match found {
+        Some(d) if d.tier_found => serve::plan::PlanSource::Confirmed,
+        _ => serve::plan::PlanSource::Asked,
+    };
+    match serve::plan::write(&db, plan, source) {
+        Ok(()) => {
+            println!("plan set to '{}' ({}) for {}", plan.word(), source.word(), db.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("could not write the plan: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// `install --set-mode release|test`: write the mode and nothing else.
@@ -311,6 +361,9 @@ fn main() -> ExitCode {
     if let Some(word) = cli.set_mode.as_deref() {
         return set_mode_only(cli.db, word);
     }
+    if let Some(word) = cli.set_plan.as_deref() {
+        return set_plan_only(cli.db, word);
+    }
 
     let data_dir = default_data_dir();
     let serve_exe = match cli.serve_exe.or_else(|| sibling("serve")) {
@@ -501,6 +554,23 @@ fn main() -> ExitCode {
             }
         }
         Err(e) => println!("  ! could not write the bug nudge mode: {e}"),
+    }
+
+    // 1a-2. The plan: read from Claude Code's own file, never guessed silently.
+    // The first-session questions confirm it with the user (numbered item 1).
+    let claude_json = serve::plan::default_claude_json();
+    match serve::plan::settle(&db, claude_json.as_deref()) {
+        Ok((plan, source, found)) => match (source, found.tier_found) {
+            (serve::plan::PlanSource::Detected, true) => println!(
+                "+ plan: Claude Code says your plan is {} (the first-session questions ask you to confirm it; on a smaller plan THOR's weekly check never runs more than once a week)",
+                if plan == serve::plan::Plan::Max { "Max" } else { "Pro or smaller" }
+            ),
+            (serve::plan::PlanSource::Detected, false) => println!(
+                "+ plan: Claude Code's settings do not say which plan you have, so THOR assumes a smaller one (the cheap weekly check); the first-session questions ask you"
+            ),
+            _ => println!("= plan already '{}' ({}); left alone", plan.word(), source.word()),
+        },
+        Err(e) => println!("  ! could not write the plan: {e}"),
     }
 
     // 1b. The response-guard rulebook beside it: what gives the `Stop` hook

@@ -116,6 +116,7 @@ pub mod migrate;
 pub mod next_turn;
 pub mod notices;
 pub mod pins;
+pub mod plan;
 pub mod project;
 pub mod prompt;
 pub mod prove;

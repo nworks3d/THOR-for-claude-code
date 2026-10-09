@@ -564,8 +564,14 @@ pub fn mode_word(mode: Mode) -> &'static str {
 
 /// Write the mode. Called by the installer, never by a hook.
 pub fn write_mode(db: &Path, mode: Mode) -> std::io::Result<()> {
-    let text = serde_json::json!({ "mode": mode_word(mode) }).to_string();
-    std::fs::write(sidecar(db, MODE_FILE), text)
+    // The file also carries the plan (`serve::plan`): keep every other key.
+    let mut object = std::fs::read_to_string(sidecar(db, MODE_FILE))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    object.insert("mode".to_string(), serde_json::Value::String(mode_word(mode).to_string()));
+    std::fs::write(sidecar(db, MODE_FILE), serde_json::Value::Object(object).to_string())
 }
 
 // --------------------------------------------------------------------- panics

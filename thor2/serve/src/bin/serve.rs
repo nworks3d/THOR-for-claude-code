@@ -2133,6 +2133,12 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
 
     match event_name.as_str() {
         "SessionStart" => {
+            // The plan follows Claude Code's own file when it was only ever
+            // detected (an upgrade or a downgrade); a plan the user confirmed
+            // or told is left alone. Best effort, never a reason to lose a start.
+            if let Some(file) = serve::plan::default_claude_json() {
+                serve::plan::refresh_detected(db_path, &file);
+            }
             // Surface 1. Claude Code's own SessionStart payload carries the
             // session's working directory under "cwd"; resolve "the current
             // project" from it through the one place that does this
