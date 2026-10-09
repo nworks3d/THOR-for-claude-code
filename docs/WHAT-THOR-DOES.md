@@ -142,11 +142,12 @@ Words used once, in plain language:
   created when you said yes to first-session item 12. Commit/push/deploy/install/delete moments are covered.
 - Refuse or change: tell the assistant to remove any; it retracts them with a reason.
 
-### A11. It writes a reply rulebook with five rules
-- What: guard-response-rulebook.json beside the memory, only if none exists. The five: open result-like
+### A11. It writes a reply rulebook with six rules
+- What: guard-response-rulebook.json beside the memory, only if none exists. The six: open result-like
   replies (md5, commit, test result...) with a plain summary (from 600 characters), do not ask the user to check what you can check
   yourself, no reflexive disclaimers, answers over 1000 characters are held back and shortened, and a
-  claim of "checked" needs a real look this turn. All five block when they fire (no tier means block).
+  claim of "checked" needs a real look this turn, and a claim that EVERYTHING was checked ("alles nagekeken",
+  "everything checks out") is held unless it says what it covered. All six block when they fire (no tier means block).
 - Why: so the end-of-reply check has something to check from the first session instead of silently
   checking nothing. The content is a neutral example, not the user's choice.
 - You notice: see C4. Some trigger words are Dutch ("gepusht", "kun je checken").
@@ -660,7 +661,7 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
 - Refuse or change: ask the assistant to unpin, revise or retract (retract needs a reason).
 
 ### F2. The reply rulebook
-- What: guard-response-rulebook.json (five rules, A11).
+- What: guard-response-rulebook.json (six rules, A11).
 - Why: the content is a neutral example.
 - You notice: replies stop being held, or are held differently.
 - Refuse or change: edit the reminder, delete an entry, delete the file. Optional fields (min_chars, none_of,

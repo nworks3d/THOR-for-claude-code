@@ -154,7 +154,7 @@ id cannot be created a second time (it would have two heads), so `on` after an
 `off` stores the note again and then resolves the id onto the new version.
 
 It also seeds a starting rulebook for the answer guard described below, the
-first time it finds none sitting next to the store: the same five example
+first time it finds none sitting next to the store: the same six example
 rules, so the `Stop` hook has something to check from the first session
 instead of silently checking nothing. An existing rulebook - the owner's
 own, or one an earlier install already wrote - is left exactly as it is,
@@ -481,7 +481,7 @@ the first time it finds none (see above).
 
 That example is neutral, not a choice anyone made, so a seeded note walks the
 owner through his whole first session once, before other work: what the
-guard checks, how long a reply may be, which of its five rules he wants, what
+guard checks, how long a reply may be, which of its six rules he wants, what
 language he wants his own rules written in, and the rest of that first
 session's setup besides (the full list is in `AGENTS.md`). His answers get
 applied where they belong and stored as a record next to the note, and only
@@ -553,6 +553,16 @@ rule is one entry with:
   must not USE ("nog te controleren"): where the phrase sits inside quotation
   marks or inline code it is mentioned, not used, even in the agent's own
   first-person sentence. Left out, a quote is read as before.
+- `hedge_words_before` - single words that, earlier in the same sentence as a
+  trigger term, make it a promise or a condition and not a claim ("zodra",
+  "of", "once"). Left out, nothing is read as a hedge.
+- `scope_words_after` - single words that, later in the same clause as a
+  trigger term, name what the claim covers or leaves out ("op", "behalve",
+  "except"). A claim that names its scope is not an absolute one. Left out,
+  nothing is read as a scope.
+- `list_label_scopes` - `true` reads a trigger on a list line that opens with
+  a label and a colon ("- Deploy config: alles klopt") as scoped by the label.
+  Left out, a label scopes nothing.
 - `only_if_prompt_any_of` - words of which the owner's own last prompt must
   carry at least one for the rule to apply at all. "Do not ask him to commit
   what he asked you to commit" is only a defect when he asked for a commit;

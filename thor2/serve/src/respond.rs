@@ -606,6 +606,21 @@ pub struct OptInRule {
     /// is only a defect when he asked for a commit. Empty, or a prompt that
     /// could not be read: the rule applies as ever.
     pub only_if_prompt_any_of: Vec<String>,
+    /// Single words that, standing earlier in the SAME sentence as a trigger
+    /// term, turn that occurrence into a mention of a future or conditional
+    /// state ("controleer ik of alles klopt", "once everything is verified"),
+    /// not a claim. Whole words, case-insensitive. Empty: no such reading.
+    pub hedge_words_before: Vec<String>,
+    /// Single words that, standing later in the same clause as a trigger term
+    /// (up to the next full stop, colon, semicolon or line break), say what
+    /// the claim covers or leaves out ("alles klopt op de totalen", "all
+    /// verified except the build"): a claim that names its scope is not an
+    /// absolute one. Empty: no such reading.
+    pub scope_words_after: Vec<String>,
+    /// `true` reads a trigger term on a list line that opens with a label and
+    /// a colon ("- **Deploy config:** alles klopt") as scoped by that label.
+    /// Missing, `false` or malformed all mean the label scopes nothing.
+    pub list_label_scopes: bool,
 }
 
 /// Parse the rulebook into `OptInRule`s: every field `parse_rules` reads,
@@ -647,6 +662,9 @@ pub fn parse_opt_in_rules(text: &str) -> Vec<OptInRule> {
             let short_reminder = r.get("short_reminder").and_then(|v| v.as_str()).map(str::to_string);
             let backed_by_turn_tools = r.get("backed_by_turn_tools").and_then(|v| v.as_bool()).unwrap_or(false);
             let only_if_prompt_any_of = str_list(r, "only_if_prompt_any_of");
+            let hedge_words_before = str_list(r, "hedge_words_before");
+            let scope_words_after = str_list(r, "scope_words_after");
+            let list_label_scopes = r.get("list_label_scopes").and_then(|v| v.as_bool()).unwrap_or(false);
             Some(OptInRule {
                 base,
                 before,
@@ -664,6 +682,9 @@ pub fn parse_opt_in_rules(text: &str) -> Vec<OptInRule> {
                 short_reminder,
                 backed_by_turn_tools,
                 only_if_prompt_any_of,
+                hedge_words_before,
+                scope_words_after,
+                list_label_scopes,
             })
         })
         .collect()
@@ -1280,10 +1301,9 @@ fn occurrence_is_another_partys(hay: &str, at: usize, len: usize) -> bool {
 /// The trigger side of a rule (`trigger_holds`) with `own_claims_only`
 /// honoured.
 fn trigger_fires(rule: &OptInRule, haystack_lower: &str) -> bool {
-    if rule.own_claims_only || rule.affirmative_only || rule.quotes_exempt {
-        trigger_holds(&rule.base, haystack_lower, &|term| {
-            occurs_as_claimed(haystack_lower, term, rule.own_claims_only, rule.affirmative_only, rule.quotes_exempt)
-        })
+    let scopes = !rule.hedge_words_before.is_empty() || !rule.scope_words_after.is_empty() || rule.list_label_scopes;
+    if rule.own_claims_only || rule.affirmative_only || rule.quotes_exempt || scopes {
+        trigger_holds(&rule.base, haystack_lower, &|term| occurs_as_claimed(haystack_lower, term, rule))
     } else {
         trigger_holds(&rule.base, haystack_lower, &|term| haystack_lower.contains(term))
     }
@@ -1327,16 +1347,45 @@ fn negated_before(hay: &str, at: usize) -> bool {
 }
 
 /// Whether `term_lower` occurs in `hay` at least once as the assistant's
-/// claim: in its own voice when `own_voice`, not negated when `affirmative`.
-fn occurs_as_claimed(hay: &str, term_lower: &str, own_voice: bool, affirmative: bool, quotes_exempt: bool) -> bool {
+/// claim: in its own voice when the rule asks for that, not negated when the
+/// rule is affirmative-only, outside quotes when quotes are exempt, and not
+/// hedged or scoped by the words around it (`occurrence_is_scoped`).
+fn occurs_as_claimed(hay: &str, term_lower: &str, rule: &OptInRule) -> bool {
     if term_lower.is_empty() {
         return true;
     }
     hay.match_indices(term_lower).any(|(at, t)| {
-        (!own_voice || !occurrence_is_another_partys(hay, at, t.len()))
-            && (!affirmative || !negated_before(hay, at))
-            && (!quotes_exempt || !inside_quotes(hay, at))
+        (!rule.own_claims_only || !occurrence_is_another_partys(hay, at, t.len()))
+            && (!rule.affirmative_only || !negated_before(hay, at))
+            && (!rule.quotes_exempt || !inside_quotes(hay, at))
+            && !occurrence_is_scoped(rule, hay, at, t.len())
     })
+}
+
+/// Whether the words around the occurrence at byte `at` (length `len`) make it
+/// something other than an absolute claim: a hedge word earlier in its
+/// sentence ("zodra", "of", "once"), a scope word later in its clause ("op",
+/// "behalve", "except"), or - on a list line - a label and colon before it.
+fn occurrence_is_scoped(rule: &OptInRule, hay: &str, at: usize, len: usize) -> bool {
+    let line_start = hay[..at].rfind('\n').map_or(0, |i| i + 1);
+    let has_word = |text: &str, list: &[String]| {
+        words(text).iter().any(|(_, _, w)| list.iter().any(|l| l.to_lowercase() == *w))
+    };
+    if !rule.hedge_words_before.is_empty() {
+        let lead = &hay[sentence_start(hay, line_start, at)..at];
+        if has_word(lead, &rule.hedge_words_before) {
+            return true;
+        }
+    }
+    if !rule.scope_words_after.is_empty() {
+        let tail = &hay[at + len..];
+        let end = [". ", "! ", "? ", ": ", "; ", "\n"].iter().filter_map(|stop| tail.find(stop)).min().unwrap_or(tail.len());
+        if has_word(&tail[..end], &rule.scope_words_after) {
+            return true;
+        }
+    }
+    let line = &hay[line_start..at];
+    rule.list_label_scopes && is_list_line(line) && line.contains(':')
 }
 
 /// Whether byte `at` of `hay` sits inside quotation marks or inline code: an

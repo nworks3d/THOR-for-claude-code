@@ -46,5 +46,18 @@
     "none_of": [".py:", ".mjs:", ".cfg:", ".md:", ".js:", ".json:", ".rs:", ".ts:", ".sh:", ".ps1:", "commit ", "regel ", "line ", "niet gecheckt", "not checked", "niet geverifieerd", "not verified", "niet nagekeken", "not looked up", "niet gecontroleerd", "niet gevalideerd", "nog niet gecheckt", "niet bevestigd", "not confirmed", "unverified", "volgens het verslag", "verslag van de agent", "niet zelf", "eerder deze sessie", "eerder in deze sessie", "agent's report", "not myself", "earlier this session"],
     "none_of_patterns": ["commit_sha", "path_line"],
     "reminder": "You say something was checked or verified, but this turn shows no look at it: nothing was read, run or opened. Do one of three things. (1) Check it now - read the file, run the command or the tests, open the page - and then say what you saw, in plain words. (2) Say plainly who checked it: 'according to the agent's report' or 'earlier this session'. (3) Say plainly that it was not checked. A path:line or a commit also counts as evidence, but a short answer does not need either."
+  },
+  {
+    "id": "absolute-verification-claim",
+    "tier": "block",
+    "own_claims_only": true,
+    "affirmative_only": true,
+    "quotes_exempt": true,
+    "list_label_scopes": true,
+    "hedge_words_before": ["of", "als", "zodra", "pas", "totdat", "tot", "wanneer", "indien", "if", "once", "until", "whether", "when", "unless"],
+    "scope_words_after": ["op", "behalve", "uitgezonderd", "buiten", "qua", "maar", "except", "but", "apart", "besides", "on"],
+    "any_of": ["alles nagekeken", "alles is nagekeken", "alles gecontroleerd", "alles is gecontroleerd", "alles gecheckt", "alles is gecheckt", "alles geverifieerd", "alles is geverifieerd", "alles klopt", "alles is correct", "volledig nagekeken", "volledig gecontroleerd", "volledig gecheckt", "volledig geverifieerd", "everything checked", "everything is checked", "everything verified", "everything is verified", "everything checks out", "everything is correct", "all verified", "all checked", "all of it checks out", "all of it is verified", "fully verified", "fully checked"],
+    "none_of": ["niet nagekeken", "niet gecheckt", "niet gecontroleerd", "niet geverifieerd", "niet gevalideerd", "niet bevestigd", "niet zelf", "niet bekeken", "niet alles", "volgens de helper", "volgens de agent", "volgens het verslag", "verslag van de helper", "verslag van de agent", "helper meldt", "agent meldt", "not checked", "not verified", "not looked at", "not confirmed", "not myself", "unverified", "according to the helper", "according to the agent", "helper's report", "agent's report", "helper reported", "agent reported", "not everything", "not all of", "wat ik net zag", "wat ik zag", "bron van wat ik", "what i saw", "what i looked at"],
+    "reminder": "You say everything was checked or is correct, without saying what you looked at yourself. Rewrite it in plain words: say what you checked yourself, and label the rest 'according to the helper's report' or 'not checked'. Never 'everything' or 'all of it' unless you really looked at all of it this turn."
   }
 ]

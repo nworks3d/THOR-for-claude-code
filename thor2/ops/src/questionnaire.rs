@@ -89,11 +89,20 @@ pub fn work_rule_line() -> String {
     work_rule_ids().iter().map(|id| plain_name(id)).collect::<Vec<_>>().join("; ")
 }
 
+/// A small count as a word, so the reply-rules item follows the shipped
+/// rulebook instead of a number typed twice. Above twelve the digits stand.
+fn count_word(n: usize) -> String {
+    const WORDS: [&str; 13] =
+        ["no", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve"];
+    WORDS.get(n).map_or_else(|| n.to_string(), |w| (*w).to_string())
+}
+
 /// The whole list, in the order the user sees it.
 pub fn questions() -> Vec<Question> {
     let rules = work_rule_ids();
     let teaching = crate::install::working_contract().len() - 1;
     let ids = rules.join(", ");
+    let reply_rules = count_word(crate::install::response_rulebook_rule_count());
     let list = vec![
         Question {
             n: 1,
@@ -176,10 +185,10 @@ pub fn questions() -> Vec<Question> {
             n: 8,
             id: "replies",
             title: "Reply language and length",
-            line: "Replies: in your language, short, with a summary first, and five reply rules; a reply that breaks one is rewritten once. Default: on.".to_string(),
-            what: "Your assistant answers in your language, short, with a plain-language summary first. A small file next to the memory holds five reply rules (a summary first, no reflexive disclaimers, check before asking you to look something up, keep an answer under about 1000 characters, show evidence when saying something was checked); a reply that breaks one is sent back once to be rewritten. A summary or overview you ask for may run longer.".to_string(),
+            line: format!("Replies: in your language, short, with a summary first, and {reply_rules} reply rules; a reply that breaks one is rewritten once. Default: on."),
+            what: format!("Your assistant answers in your language, short, with a plain-language summary first. A small file next to the memory holds {reply_rules} reply rules (a summary first, no reflexive disclaimers, check before asking you to look something up, keep an answer under about 1000 characters, show evidence when saying something was checked, and never say everything was checked without saying what was covered); a reply that breaks one is sent back once to be rewritten. A summary or overview you ask for may run longer."),
             why: "Long, technical replies are hard to act on; the rules keep a reply to the point, and they were checked against about 6,600 real replies at the maker, and the false triggers found there were removed.",
-            default: "Your language, short replies, all five reply rules on.",
+            default: "Your language, short replies, all the reply rules on.",
             say_no: "Tell me the language and the length you want. I change the file, or remove a single rule to turn just that one off.".to_string(),
         },
         Question {

@@ -558,7 +558,7 @@ Nothing here waits for you: ask me about any number and I explain it, say no to 
 5. Work rules: 13 general work habits stored as notes, such as tests before 'done' and never commit a secret; they only inform, except that on Windows two refuse a console window flash. Default: all on.
 6. Helper agents: your main assistant judges while cheaper models do the work in helpers, which can cost less and keeps the chat free. Default: off.
 7. Bug reports: your assistant may offer to report a fault in THOR on GitHub, showing you the exact text first; nothing is sent without your yes. Default: on.
-8. Replies: in your language, short, with a summary first, and five reply rules; a reply that breaks one is rewritten once. Default: on.
+8. Replies: in your language, short, with a summary first, and six reply rules; a reply that breaks one is rewritten once. Default: on.
 9. Topic folders: a plain folder with no code, such as recipes or travel plans, can get a memory of its own when you name it. Default: none set up yet.
 10. Backups: NOTHING is backed up until you choose: a copy on this machine, a place you name (a NAS, another computer, a private repository), or none. Default: none yet.
 11. Record of real calls: for 30 days, on this machine only, THOR keeps your commands and replies with passwords and keys blanked, to find rules that would wrongly block you. Default: on.
@@ -624,9 +624,9 @@ DETAIL PER ITEM (for the assistant: state an item's Why once, only when he asks 
    To say no: I switch it off (install --set-mode off): nothing is offered and nothing is sent, ever.
 
 8. Reply language and length
-   What it is: Your assistant answers in your language, short, with a plain-language summary first. A small file next to the memory holds five reply rules (a summary first, no reflexive disclaimers, check before asking you to look something up, keep an answer under about 1000 characters, show evidence when saying something was checked); a reply that breaks one is sent back once to be rewritten. A summary or overview you ask for may run longer.
+   What it is: Your assistant answers in your language, short, with a plain-language summary first. A small file next to the memory holds six reply rules (a summary first, no reflexive disclaimers, check before asking you to look something up, keep an answer under about 1000 characters, show evidence when saying something was checked, and never say everything was checked without saying what was covered); a reply that breaks one is sent back once to be rewritten. A summary or overview you ask for may run longer.
    Why it exists: Long, technical replies are hard to act on; the rules keep a reply to the point, and they were checked against about 6,600 real replies at the maker, and the false triggers found there were removed.
-   What I chose: Your language, short replies, all five reply rules on.
+   What I chose: Your language, short replies, all the reply rules on.
    To say no: Tell me the language and the length you want. I change the file, or remove a single rule to turn just that one off.
 
 9. Folders for a topic

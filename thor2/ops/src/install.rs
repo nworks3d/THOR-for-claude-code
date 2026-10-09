@@ -134,12 +134,18 @@ pub struct RulebookReport {
 }
 
 /// The rulebook this installer seeds when none exists yet: byte-identical to
-/// the five rules shipped at the repository root as
+/// the rules shipped at the repository root as
 /// `guard-response-rulebook.example.json` (a plain-language TLDR rule, a
-/// no-disclaimers rule, an ask-before-checking rule, a length rule, and an
-/// evidence rule) - baked in at compile time so a copied-out binary carries
+/// no-disclaimers rule, an ask-before-checking rule, a length rule, an
+/// evidence rule, and an absolute-verification-claim rule) - baked in at compile time so a copied-out binary carries
 /// it too, with no example file it has to find sitting next to it.
 const RESPONSE_RULEBOOK_TEMPLATE: &str = include_str!("../../guard-response-rulebook.example.json");
+
+/// How many reply rules the seeded rulebook carries, read from the file
+/// itself so no text has to repeat the number.
+pub fn response_rulebook_rule_count() -> usize {
+    serde_json::from_str::<Value>(RESPONSE_RULEBOOK_TEMPLATE).ok().and_then(|v| v.as_array().map(Vec::len)).unwrap_or(0)
+}
 
 /// Give a store a working Response Guard from its first session, without
 /// ever touching a rulebook that is already there.
@@ -3186,7 +3192,7 @@ mod tests {
 
         let text = fs::read_to_string(&report.path).unwrap();
         let rules = respond::parse_opt_in_rules(&text);
-        assert_eq!(rules.len(), 5, "the five shipped rules must all parse");
+        assert_eq!(rules.len(), 6, "the six shipped rules must all parse");
 
         let ids: Vec<&str> = rules.iter().map(|r| r.base.id.as_str()).collect();
         assert_eq!(
@@ -3197,6 +3203,7 @@ mod tests {
                 "no-reflexive-disclaimers",
                 "answer-is-too-long",
                 "checked-claim-needs-evidence",
+                "absolute-verification-claim",
             ]
         );
 
@@ -3216,6 +3223,10 @@ mod tests {
         assert!(evidence.none_of_patterns.contains(&"commit_sha".to_string()));
         assert!(evidence.none_of_patterns.contains(&"path_line".to_string()));
         assert!(!evidence.base.reminder.is_empty());
+
+        let absolute = rules.iter().find(|r| r.base.id == "absolute-verification-claim").unwrap();
+        assert!(absolute.base.any_of.contains(&"alles nagekeken".to_string()));
+        assert!(!absolute.backed_by_turn_tools, "it must fire even when the turn looked at something");
     }
 
     /// A real checkout at `dir` with one commit, named `key` by its own

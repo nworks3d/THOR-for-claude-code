@@ -240,9 +240,11 @@ fn the_bug_report_item_reassures_in_plain_words() {
 fn the_reply_item_counts_the_rules_the_shipped_rulebook_really_has() {
     let rulebook = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../guard-response-rulebook.example.json")).unwrap();
     let entries = serde_json::from_str::<serde_json::Value>(&rulebook).unwrap().as_array().unwrap().len();
+    let words = ["no", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve"];
     let q = questions().into_iter().find(|q| q.id == "replies").unwrap();
-    assert_eq!(entries, 5, "the item says five reply rules; change the item and this together");
-    assert!(q.what.contains("five reply rules"), "{}", q.what);
+    assert_eq!(ops::install::response_rulebook_rule_count(), entries);
+    assert!(q.what.contains(&format!("holds {} reply rules", words[entries])), "{}", q.what);
+    assert!(q.line.contains(&format!("{} reply rules", words[entries])), "{}", q.line);
 }
 
 #[test]
