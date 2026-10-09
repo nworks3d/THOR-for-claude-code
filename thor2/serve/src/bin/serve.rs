@@ -3129,6 +3129,25 @@ fn write_turn_mark(db: &Path, session_id: &str, mark: TurnMark) {
     }
 }
 
+/// Says `line` to the session ONCE: `Some(line)` the first time, `None` on every
+/// later Stop until the line itself changes (a new report id, a new install
+/// time). Field test 14, C5: the same "report is on file but does not count"
+/// line went out on 14 Stops in two hours. Remembered in the session's turn
+/// mark, beside the void notices.
+fn said_once(db_path: &Path, session_id: &str, line: String) -> Option<String> {
+    let key = format!("said:{}", model::store::machine_block_digest(&line).chars().take(16).collect::<String>());
+    let mut marks = read_turn_marks(db_path);
+    let mut mark = marks.remove(session_id).unwrap_or_default();
+    if mark.announced.contains(&key) {
+        return None;
+    }
+    mark.announced.push(key);
+    let skip = mark.announced.len().saturating_sub(ANNOUNCED_KEEP);
+    mark.announced.drain(..skip);
+    write_turn_mark(db_path, session_id, mark);
+    Some(line)
+}
+
 /// A first-pass Stop: the log's tip now, and no hold yet in this turn (what
 /// was already announced to the session stays announced).
 fn record_turn_mark(db: &Path, session_id: &str) {
@@ -3405,13 +3424,15 @@ fn eval_stop_ask(
                 // The same for a session that started before the installed tool
                 // server was replaced (field test 14, H1): no dead report is
                 // needed first, and no ask is made.
+                // Said once per report (or install) and session, then quiet
+                // until the line changes (field test 14, C5).
                 if let Some(line) = stale_tool_server_line(session_id) {
-                    elsewhere.get_or_insert(line);
+                    elsewhere = elsewhere.or_else(|| said_once(db_path, session_id, line));
                     continue;
                 }
                 let root = serve::attest::transcripts_root();
                 if let Some(line) = serve::eval_filing::skew_awaiting_restart(store, &project, session_id, root.as_deref()) {
-                    elsewhere.get_or_insert(line);
+                    elsewhere = elsewhere.or_else(|| said_once(db_path, session_id, line));
                     continue;
                 }
                 // ONE HOLDER PER PROJECT (step 26): a session that is not the
@@ -3464,6 +3485,32 @@ fn eval_stop_ask(
     elsewhere.map_or(EvalStop::Quiet, EvalStop::Elsewhere)
 }
 
+/// The reports of `project` on file that do not count, for the top of the
+/// ask (field test 14, C2): the newest first with its reason, then each older
+/// dead one, then which report is the last that COUNTS, so a dead report is
+/// never taken for a counted one. Empty when every report on file counts.
+fn not_counted_words(store: &EventStore, project: &str) -> String {
+    const LISTED: usize = 4;
+    let (counting, dead) = serve::eval_filing::reports_not_counted(store, project);
+    let Some((newest, why)) = dead.first() else { return String::new() };
+    let mut out = format!("[THOR] The report '{newest}' is on file but does not count as this project's evaluation: {why}.");
+    if dead.len() > 1 {
+        let older: Vec<String> =
+            dead.iter().skip(1).take(LISTED - 1).map(|(id, why)| format!("'{id}' (on file, did not count: {why})")).collect();
+        out.push_str(&format!(" Older ones that do not count either: {}", older.join("; ")));
+        match dead.len().saturating_sub(LISTED) {
+            0 => out.push('.'),
+            more => out.push_str(&format!("; and {more} more.")),
+        }
+    }
+    match counting {
+        Some(id) => out.push_str(&format!(" The last report that counts: '{id}'.")),
+        None => out.push_str(" No report of this project counts yet."),
+    }
+    out.push_str(" The evaluation is still owed.\n\n");
+    out
+}
+
 /// The words of the evaluation ask for `project`, from `clock` (the
 /// project's work clock and this session's own minutes). `folder_project` is
 /// where the session stands now: when the ask is about ANOTHER project (the
@@ -3498,14 +3545,7 @@ fn evaluation_ask(
     // validator's reason, so a session that filed one - through an older
     // binary, a script, or a call its transcript does not hold - learns why
     // it is still asked.
-    let not_counted = serve::eval_filing::newest_invalid_report(store, current_project)
-        .map(|(id, why)| {
-            format!(
-                "[THOR] The report '{id}' is on file but does not count as this project's evaluation: {why}. The \
-                 evaluation is still owed.\n\n"
-            )
-        })
-        .unwrap_or_default();
+    let not_counted = not_counted_words(store, project);
     // Named when the file is actually there to read - the same location
     // `ops::install::seed_eval_command` writes to, resolved the same way
     // (`usefulness::default_eval_command_path`, `ops/tests` proves the two
@@ -4980,6 +5020,43 @@ mod evaluation_debt_tests {
         let transcripts = tempfile::tempdir().unwrap();
         let session = serve::attest::fixture::SESSION;
         serve::eval_filing::fixture::valid_filing(store, transcripts.path(), session, &item, "toolu_fixture_report");
+    }
+
+    /// Field test 14, C2: the ask names every report on file that does not
+    /// count, each with its reason, and the last one that does - an agent took
+    /// a dead report for a counted one when only the newest dead one was named.
+    #[test]
+    fn the_ask_names_every_dead_report_and_the_last_one_that_counts() {
+        let (dir, _db, mut store) = new_store();
+        assert_eq!(not_counted_words(&store, "thor"), "", "nothing on file, nothing to say");
+        declare_report(&mut store, "eval-thor-2026-10-01", "thor");
+        assert_eq!(not_counted_words(&store, "thor"), "", "every report on file counts");
+        for id in ["eval-thor-2026-10-02", "eval-thor-2026-10-03"] {
+            let dead = serve::eval_filing::fixture::report(id, "thor", "TLDR: written past the tools.");
+            let body = model::store::canonical_body(&dead).unwrap();
+            store.append_event("mcp", "mcp", "mcp", thor_core::event_store::EventKind::FactCreated, id, None, &body).unwrap();
+        }
+        let root = dir.path().join("transcripts");
+        serve::eval_filing::validate_new_reports(&mut store, Some(&root), serve::attest::fixture::SESSION);
+        let text = not_counted_words(&store, "thor");
+        assert!(text.starts_with("[THOR] The report 'eval-thor-2026-10-03' is on file but does not count as this project's evaluation: "), "{text}");
+        assert!(text.contains("'eval-thor-2026-10-02' (on file, did not count: "), "the older dead one is named too: {text}");
+        assert!(text.contains("The last report that counts: 'eval-thor-2026-10-01'."), "{text}");
+        assert!(text.ends_with("The evaluation is still owed.\n\n"), "{text}");
+    }
+
+    /// Field test 14, C5: a line is said to a session once, then not again
+    /// until the line itself changes.
+    #[test]
+    fn a_line_is_said_once_per_session_until_it_changes() {
+        let (_dir, db, _store) = new_store();
+        let line = "[THOR] The report 'a' is on file but does not count.".to_string();
+        assert_eq!(said_once(&db, "s1", line.clone()), Some(line.clone()), "the first Stop says it");
+        assert_eq!(said_once(&db, "s1", line.clone()), None, "the second stays quiet");
+        assert_eq!(said_once(&db, "s1", line.clone()), None);
+        assert_eq!(said_once(&db, "s2", line.clone()), Some(line.clone()), "another session is told");
+        let changed = "[THOR] The report 'b' is on file but does not count.".to_string();
+        assert_eq!(said_once(&db, "s1", changed.clone()), Some(changed), "a new report is said again");
     }
 
     /// Served under `usefulness::ASSISTANT_DELIVERY_ACTOR` (2026-09-19), same
