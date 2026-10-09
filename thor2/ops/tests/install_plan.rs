@@ -122,3 +122,14 @@ fn switched_off_bug_reporting_stays_off_through_a_second_install() {
     install(home.path(), &["--set-mode", "release", "--db", &db.display().to_string()]);
     assert_eq!(serve::thor_bugs::read_mode(&db), Some(serve::bug_report::Mode::Release), "only his word turns it back on");
 }
+
+#[test]
+fn a_second_install_says_the_plan_is_already_there_and_changes_nothing() {
+    let home = tempfile::tempdir().unwrap();
+    let first = install(home.path(), &["--no-mcp"]);
+    assert!(String::from_utf8_lossy(&first.stdout).contains("+ plan:"), "{}", String::from_utf8_lossy(&first.stdout));
+    let second = install(home.path(), &["--no-mcp"]);
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    assert!(stdout.contains("= plan already"), "{stdout}");
+    assert!(!stdout.contains("+ plan:"), "a repeat run must add nothing: {stdout}");
+}

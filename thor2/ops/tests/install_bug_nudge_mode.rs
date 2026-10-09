@@ -65,7 +65,7 @@ fn set_mode_refuses_a_bad_word_a_missing_db_and_a_missing_memory() {
     let db = fake_store(dir.path());
     let bad = set_mode(&["--set-mode", "production", "--db", &db.display().to_string()]);
     assert_eq!(bad.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&bad.stderr).contains("'release' or 'test'"));
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("'release', 'test' or 'off'"));
     let no_db = set_mode(&["--set-mode", "test"]);
     assert_eq!(no_db.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&no_db.stderr).contains("--db"));

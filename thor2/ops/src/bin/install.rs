@@ -616,7 +616,12 @@ fn main() -> ExitCode {
     // 1a-2. The plan: read from Claude Code's own file, never guessed silently.
     // The first-session questions confirm it with the user (numbered item 1).
     let claude_json = serve::plan::default_claude_json();
+    let plan_before = serve::plan::read(&db);
     match serve::plan::settle(&db, claude_json.as_deref()) {
+        // A second run that finds the same plan on record changes nothing and says so.
+        Ok((plan, source, _)) if plan_before == Some((plan, source)) => {
+            println!("= plan already '{}' ({}); left alone", plan.word(), source.word())
+        }
         Ok((plan, source, found)) => match (source, found.tier_found) {
             (serve::plan::PlanSource::Detected, true) => println!(
                 "+ plan: Claude Code says your plan is {} (the first-session questions ask you to confirm it; on a smaller plan THOR's weekly check never runs more than once a week)",

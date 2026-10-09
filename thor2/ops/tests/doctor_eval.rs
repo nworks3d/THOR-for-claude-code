@@ -114,6 +114,7 @@ const EVAL_BLOCKS: &[&str] = &[
     "false-block sweep:",
     "answer-guard sweep:",
     "judgement debt:",
+    "test signal:",
     "contradictions:",
     "doctor --eval:",
 ];
