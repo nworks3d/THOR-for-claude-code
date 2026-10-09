@@ -269,12 +269,32 @@ pub fn version_skew_words<S: AsRef<str>>(programs: &[(S, Option<String>)]) -> Op
     if !differ && without_id.is_empty() {
         return None;
     }
-    let mut parts: Vec<String> = with_id.iter().map(|(name, id)| format!("{name} is build {id}")).collect();
+    // WHAT DECIDES WHETHER A FILING COUNTS is the machine-section renderer each
+    // program prints, not the build id (field test 15, C2): programs of two
+    // builds that render alike (a deliberate serve-only install) leave every
+    // filing counting, and the line used to tell the owner to restart anyway.
+    let renderer_of = |name: &str| programs.iter().find(|(n, _)| n.as_ref() == name).and_then(|(_, out)| out.as_deref()).and_then(serve::renderer_in);
+    let mut renderers: Vec<Option<u32>> = Vec::new();
+    let mut parts: Vec<String> = with_id
+        .iter()
+        .map(|(name, id)| {
+            let renderer = renderer_of(name);
+            renderers.push(renderer);
+            match renderer {
+                Some(n) => format!("{name} is build {id} (renderer {n})"),
+                None => format!("{name} is build {id} (prints no renderer)"),
+            }
+        })
+        .collect();
     parts.extend(without_id.iter().map(|name| format!("{name} prints no build id (it is older than the others)")));
-    Some(format!(
-        "installed programs: {} - they were not built from the same source, so they may count, judge and check filings differently (a report filed by the older one is refused). Copy every program from one build into the folder (run install.exe again), then restart Claude.",
-        parts.join(", ")
-    ))
+    renderers.extend(without_id.iter().map(|_| None));
+    let alike = renderers.iter().all(|r| r.is_some() && *r == renderers[0]);
+    let verdict = if alike {
+        "Renderers match: evaluation filings count, so this does not hold your report. Run install.exe again when it suits you."
+    } else {
+        "Renderers differ: a report filed by the program with the older renderer is on file and dead. Copy every program from one build into the folder (run install.exe again), then restart Claude."
+    };
+    Some(format!("installed programs: {} - they were not built from the same source. {verdict}", parts.join(", ")))
 }
 
 /// How far back the hook failure line looks.
@@ -7727,6 +7747,27 @@ mod launch_and_skew_tests {
         let line = version_skew_words(&skewed).expect("two builds");
         assert!(line.contains("serve.exe is build aaaaaaaaaaaa") && line.contains("mcp.exe is build bbbbbbbbbbbb"), "{line}");
         assert!(line.contains("not built from the same source") && line.contains("restart Claude"), "{line}");
+    }
+
+    /// Field test 15, C2 (collect 18): the line names the machine-section
+    /// renderer of each program and says plainly whether filings count. Two
+    /// builds that render alike are a serve-only install, not a dead report.
+    #[test]
+    fn the_line_names_each_renderer_and_says_whether_filings_count() {
+        let line_of = |serve_renderer: u32, mcp_renderer: u32| {
+            let versioned = |program: &str, id: &str, renderer: u32| Some(format!("{program} 2.5.0 (build {id}, renderer {renderer})\n"));
+            version_skew_words(&[
+                ("serve.exe", versioned("serve", "aaaaaaaaaaaa", serve_renderer)),
+                ("mcp.exe", versioned("mcp", "bbbbbbbbbbbb", mcp_renderer)),
+            ])
+            .expect("two builds")
+        };
+        let alike = line_of(7, 7);
+        assert!(alike.contains("serve.exe is build aaaaaaaaaaaa (renderer 7)") && alike.contains("mcp.exe is build bbbbbbbbbbbb (renderer 7)"), "{alike}");
+        assert!(alike.contains("Renderers match: evaluation filings count") && !alike.contains("restart Claude"), "{alike}");
+        let apart = line_of(7, 6);
+        assert!(apart.contains("(renderer 6)") && apart.contains("Renderers differ") && apart.contains("restart Claude"), "{apart}");
+        assert!(!apart.contains("Renderers match"), "{apart}");
     }
 
     #[test]

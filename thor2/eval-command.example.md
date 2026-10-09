@@ -966,20 +966,24 @@ reply. DONE WHEN: the summary says so and no report was filed. EXAMPLE: summary:
 "the tool server is stale; restart Claude, then the evaluation is asked again;
 I filed nothing".
 
-`installed programs:` (for example "installed programs: serve.exe is build X,
-mcp.exe is build Y, doctor.exe is build Y - they were not built from the same
-source ...") - WHAT IT MEANS: the programs on disk come from different builds,
-which happens on purpose when a fix is installed into one program without a
-restart. It is not a reason to withhold the report: a filing only fails to count
-when the tool server and the checker render the machine section differently, and
-the tool server itself refuses that before it writes anything (see THOR health
-above). WHAT TO DO: file the report as usual, and put the line in it under THOR
-health. If the filing is refused with "this tool server renders the evaluation
-machine section in format", do not file again: tell the owner to restart Claude
-and end the turn. DONE WHEN: the report is on file with the line under THOR
-health, or the refusal was passed to the owner. EXAMPLE: THOR health in the
-report: "installed programs: serve.exe is a newer build than mcp.exe (a fix
-installed without a restart); the filing was accepted".
+`installed programs:` (for example "installed programs: serve.exe is build X
+(renderer 7), mcp.exe is build Y (renderer 7) - they were not built from the
+same source. Renderers match: evaluation filings count ...") - WHAT IT MEANS:
+the programs on disk come from different builds, which happens on purpose when
+a fix is installed into one program without a restart. The line names the
+machine-section renderer of each program and ends in one of two verdicts.
+"Renderers match" means a filing counts: it is not a reason to withhold the
+report, and the tool server itself refuses a mismatch before it writes anything
+(see THOR health above). "Renderers differ" means a report filed by the program
+with the older renderer is dead: treat it like the `tool server:` line (do not
+file, tell the owner to restart Claude, end the turn). WHAT TO DO when they
+match: file the report as usual, and put the line in it under THOR health. If
+the filing is refused with "this tool server renders the evaluation machine
+section in format", do not file again: tell the owner to restart Claude and end
+the turn. DONE WHEN: the report is on file with the line under THOR health, or
+the refusal or the "Renderers differ" verdict was passed to the owner. EXAMPLE:
+THOR health in the report: "installed programs: renderers match (7 and 7), a
+fix installed without a restart; the filing was accepted".
 
 When neither line is printed, nothing is wrong and you file as usual.
 
