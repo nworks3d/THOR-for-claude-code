@@ -1214,7 +1214,7 @@ fn plain_line_for_block(event: &str, reason: &str) -> &'static str {
     let lower = reason.to_lowercase();
     match event {
         "Stop" if lower.contains("walked through setup") => {
-            "THOR (the memory your assistant uses) wants a quick chat first: your assistant will ask you a few setup questions, such as which language to answer in. Just answer in your own words, or say \"skip\"."
+            "THOR (the memory your assistant uses) is finishing its setup. Your assistant settles the setup questions with sensible defaults, such as answering in your own language, so nothing is needed from you. Just say so if you want something different."
         }
         "Stop" if lower.contains("evaluation") => {
             "THOR asks your assistant to do a short tidy-up of its memory before it finishes. It can take a few minutes. Nothing is needed from you."

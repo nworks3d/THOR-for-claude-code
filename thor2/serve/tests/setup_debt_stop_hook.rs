@@ -122,7 +122,7 @@ fn the_held_turn_carries_one_plain_sentence_for_the_person() {
     assert_eq!(v["decision"], "block", "{out}");
     let line = v["systemMessage"].as_str().unwrap_or_else(|| panic!("no plain line for the person: {out}"));
     assert!(line.contains("setup questions"), "it says what this is about: {line}");
-    assert!(line.contains("answer in your own words"), "it says the one thing asked of the person: {line}");
+    assert!(line.contains("nothing is needed from you"), "it says nothing is asked of the person: {line}");
     for jargon in ["note", "rule", "gate", "falsifier", "scope", "hook", "AGENTS.md", "retract"] {
         assert!(!line.contains(jargon), "the plain line must not use the word {jargon:?}: {line}");
     }
