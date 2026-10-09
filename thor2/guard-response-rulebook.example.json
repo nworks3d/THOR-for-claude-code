@@ -37,9 +37,12 @@
   {
     "id": "checked-claim-needs-evidence",
     "tier": "block",
+    "own_claims_only": true,
+    "affirmative_only": true,
+    "backed_by_turn_tools": true,
     "any_of": ["heb ik gecheckt", "heb het gecheckt", "gecheckt:", "geverifieerd:", "gecontroleerd:", "is gecheckt", "is geverifieerd", "is gecontroleerd", "zijn gecheckt", "checked:", "verified:"],
-    "none_of": [".py:", ".mjs:", ".cfg:", ".md:", ".js:", ".json:", ".rs:", ".ts:", ".sh:", ".ps1:", "commit ", "regel ", "line ", "niet gecheckt", "not checked", "niet geverifieerd", "not verified", "niet nagekeken", "not looked up", "niet gecontroleerd", "niet gevalideerd", "nog niet gecheckt", "niet bevestigd", "not confirmed", "unverified"],
+    "none_of": [".py:", ".mjs:", ".cfg:", ".md:", ".js:", ".json:", ".rs:", ".ts:", ".sh:", ".ps1:", "commit ", "regel ", "line ", "niet gecheckt", "not checked", "niet geverifieerd", "not verified", "niet nagekeken", "not looked up", "niet gecontroleerd", "niet gevalideerd", "nog niet gecheckt", "niet bevestigd", "not confirmed", "unverified", "volgens het verslag", "verslag van de agent", "niet zelf", "eerder deze sessie", "eerder in deze sessie", "agent's report", "not myself", "earlier this session"],
     "none_of_patterns": ["commit_sha", "path_line"],
-    "reminder": "You are claiming something was checked or verified without evidence. Name the file with a line number (path:line) or the commit, or say plainly that it was not checked."
+    "reminder": "You say something was checked or verified, but this turn shows no look at it: nothing was read, run or opened. Do one of three things. (1) Check it now - read the file, run the command or the tests, open the page - and then say what you saw, in plain words. (2) Say plainly who checked it: 'according to the agent's report' or 'earlier this session'. (3) Say plainly that it was not checked. A path:line or a commit also counts as evidence, but a short answer does not need either."
   }
 ]

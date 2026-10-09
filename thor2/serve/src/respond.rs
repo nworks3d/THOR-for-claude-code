@@ -202,9 +202,23 @@ fn owner_prompt_of(entry: &Value) -> Option<String> {
     (!text.trim().is_empty()).then_some(text)
 }
 
-/// The shell commands the assistant ran in the CURRENT turn: every Bash or
-/// PowerShell tool call after the owner's last prompt in the transcript. Empty
-/// when the transcript is unreadable (fail-open: no evidence is claimed).
+/// Tool calls that LOOK at something (a file, a page, the web, a screen), by
+/// name. Together with the shell, these are what a rule marked
+/// `backed_by_turn_tools` reads as "the turn looked for itself". Not in it, on
+/// purpose: launching an agent (its report is someone else's look), writing or
+/// editing, and THOR's own memory tools (a note is not the thing it is about).
+fn is_observation_tool(name: &str) -> bool {
+    matches!(name, "Read" | "Grep" | "Glob" | "WebFetch" | "WebSearch" | "NotebookRead")
+        || name.starts_with("mcp__Claude_Browser__")
+        || name.starts_with("mcp__claude-in-chrome__")
+        || name.starts_with("mcp__computer-use__")
+}
+
+/// What the assistant did in the CURRENT turn that looked at something, after
+/// the owner's last prompt in the transcript: the command of every Bash or
+/// PowerShell tool call, and a `[tool] Name` marker for every other tool call
+/// that looks (`is_observation_tool`). Empty when the transcript is unreadable
+/// (fail-open: no evidence is claimed).
 pub fn turn_commands(transcript_jsonl: &str) -> Vec<String> {
     let entries: Vec<Value> = transcript_jsonl.lines().filter_map(|l| serde_json::from_str::<Value>(l.trim()).ok()).collect();
     let start = entries.iter().rposition(|e| owner_prompt_of(e).is_some()).map_or(0, |i| i + 1);
@@ -215,10 +229,15 @@ pub fn turn_commands(transcript_jsonl: &str) -> Vec<String> {
         }
         let Some(blocks) = entry.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_array()) else { continue };
         for block in blocks {
-            let is_shell = block.get("type").and_then(|t| t.as_str()) == Some("tool_use")
-                && matches!(block.get("name").and_then(|n| n.as_str()), Some("Bash" | "PowerShell"));
+            if block.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
+                continue;
+            }
+            let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            let is_shell = matches!(name, "Bash" | "PowerShell");
             if let (true, Some(command)) = (is_shell, block.get("input").and_then(|i| i.get("command")).and_then(|c| c.as_str())) {
                 commands.push(command.to_string());
+            } else if is_observation_tool(name) {
+                commands.push(format!("[tool] {name}"));
             }
         }
     }
@@ -434,6 +453,20 @@ pub struct OptInRule {
     /// reply (step 33): each requirement once, short, instead of two full
     /// reminders that repeat each other. Absent: the reminder as ever.
     pub short_reminder: Option<String>,
+    /// `true` marks a rule about a claim of having looked at something ("checked",
+    /// "cannot reach"): it does not fire when the turn itself looked at
+    /// something (`turn_commands` is not empty: a shell command, a read, a
+    /// search, a page). Launching an agent or writing does not count, so a claim
+    /// relayed from an agent's report, or made in a turn that looked at nothing,
+    /// is still held. Known limit, stated here rather than rediscovered: the
+    /// guard cannot tell whether the call it saw is the one the claim is about.
+    /// Missing, `false` or malformed all mean the rule reads every claim.
+    pub backed_by_turn_tools: bool,
+    /// Words of which the OWNER'S OWN LAST PROMPT must carry at least one for
+    /// the rule to apply at all: "do not bounce his commit request back at him"
+    /// is only a defect when he asked for a commit. Empty, or a prompt that
+    /// could not be read: the rule applies as ever.
+    pub only_if_prompt_any_of: Vec<String>,
 }
 
 /// Parse the rulebook into `OptInRule`s: every field `parse_rules` reads,
@@ -470,6 +503,8 @@ pub fn parse_opt_in_rules(text: &str) -> Vec<OptInRule> {
             let asked_for_any_of = str_list(r, "asked_for_any_of");
             let reminder_if_asked = r.get("reminder_if_asked").and_then(|v| v.as_str()).map(str::to_string);
             let short_reminder = r.get("short_reminder").and_then(|v| v.as_str()).map(str::to_string);
+            let backed_by_turn_tools = r.get("backed_by_turn_tools").and_then(|v| v.as_bool()).unwrap_or(false);
+            let only_if_prompt_any_of = str_list(r, "only_if_prompt_any_of");
             Some(OptInRule {
                 base,
                 before,
@@ -482,6 +517,8 @@ pub fn parse_opt_in_rules(text: &str) -> Vec<OptInRule> {
                 asked_for_any_of,
                 reminder_if_asked,
                 short_reminder,
+                backed_by_turn_tools,
+                only_if_prompt_any_of,
             })
         })
         .collect()
@@ -1463,6 +1500,15 @@ fn is_internal_id(inner: &str) -> bool {
     hex.is_some_and(|h| h.len() == 8 && h.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
+/// Whether the owner's own last prompt lets `rule` apply at all
+/// (`only_if_prompt_any_of`): no gate, or a prompt that could not be read, or a
+/// prompt that carries one of its words.
+fn prompt_gate_open(rule: &OptInRule, prompt_lower: &str) -> bool {
+    rule.only_if_prompt_any_of.is_empty()
+        || prompt_lower.is_empty()
+        || rule.only_if_prompt_any_of.iter().any(|t| prompt_lower.contains(&t.to_lowercase()))
+}
+
 /// `evaluate_opt_in`, plus the reply's evidence checked when the caller could
 /// look (see "checked evidence" above): a rule that takes a citation or a sha
 /// as evidence then reads its escapes against what checked out, and its
@@ -1487,7 +1533,9 @@ fn evaluate_opt_in_checked(
             let fires_before_escapes = trigger_fires(r, haystack_lower)
                 && !positionally_escaped(r, haystack_lower)
                 && !list_exempted(r, prompt_lower, haystack_lower)
-                && !(r.owner_reading_only && is_subagent);
+                && !(r.owner_reading_only && is_subagent)
+                && prompt_gate_open(r, prompt_lower)
+                && !(r.backed_by_turn_tools && !turn_commands.is_empty());
             if !fires_before_escapes {
                 return None;
             }
@@ -2419,7 +2467,109 @@ mod tests {
         ]
         .join("
 ");
-        assert_eq!(turn_commands(&transcript), vec!["ls".to_string()]);
+        // The earlier turn's `cargo test` is not read; this turn's Read shows as a marker.
+        assert_eq!(turn_commands(&transcript), vec!["[tool] Read".to_string(), "ls".to_string()]);
+    }
+
+    // -------------- step 59: the turn's own tool calls back a claim, for a rule that opts in
+    //
+    // THE FALSE BLOCK (owner, 2026-10-09): "Zelf nagekeken ... ik heb de scripts van de
+    // admin-pagina zelf gecontroleerd: alle drie in orde. Ingelogd heb ik het niet gezien"
+    // was held for "no evidence" although the turn had run curl, git and a node check. The
+    // reminder asked for a path:line, which the owner's short-answer rule forbids. A rule
+    // with `backed_by_turn_tools` stands aside when the turn looked at something itself.
+
+    const BACKED_RULEBOOK: &str = r#"[
+      {"id":"checked","tier":"block","backed_by_turn_tools":true,
+       "any_of":["gecontroleerd:","nagekeken"],"none_of":["niet gecontroleerd"],
+       "reminder":"You are claiming something was checked without evidence."}
+    ]"#;
+
+    fn transcript_with_tool_calls(calls: &[(&str, &str)]) -> String {
+        let mut lines = vec![r#"{"type":"user","message":{"role":"user","content":"Kijk na of de admin werkt."}}"#.to_string()];
+        for (name, input) in calls {
+            lines.push(format!(
+                r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"tool_use","name":"{name}","input":{input}}}]}}}}"#
+            ));
+        }
+        lines.join("\n")
+    }
+
+    #[test]
+    fn the_turn_lists_the_tools_that_look_and_not_the_ones_that_only_launch_or_write() {
+        let transcript = transcript_with_tool_calls(&[
+            ("Read", r#"{"file_path":"a.html"}"#),
+            ("Grep", r#"{"pattern":"x"}"#),
+            ("Agent", r#"{"prompt":"do the work"}"#),
+            ("Edit", r#"{"file_path":"a.html"}"#),
+            ("mcp__thor__remember", r#"{"id":"x"}"#),
+            ("mcp__thor__lookup", r#"{"query":"x"}"#),
+            ("mcp__Claude_Browser__get_page_text", r#"{}"#),
+            ("WebFetch", r#"{"url":"https://example.com"}"#),
+        ]);
+        assert_eq!(
+            turn_commands(&transcript),
+            vec!["[tool] Read", "[tool] Grep", "[tool] mcp__Claude_Browser__get_page_text", "[tool] WebFetch"]
+        );
+    }
+
+    #[test]
+    fn a_rule_that_opts_in_is_backed_by_a_read_or_a_command_of_the_same_turn() {
+        let claim = "Zelf nagekeken. Ik heb de pagina zelf gecontroleerd: alle drie in orde.";
+        let bare = guard_verdict_in_turn(Some(BACKED_RULEBOOK), claim, "", false, None, &[]);
+        assert!(bare.block_reason.is_some(), "no tool call in the turn: the claim stays held");
+        for calls in [
+            vec![("Read", r#"{"file_path":"a.html"}"#)],
+            vec![("Grep", r#"{"pattern":"x"}"#)],
+            vec![("Bash", r#"{"command":"curl -s http://dev/health"}"#)],
+            vec![("PowerShell", r#"{"command":"Get-Service ssh-agent"}"#)],
+        ] {
+            let commands = turn_commands(&transcript_with_tool_calls(&calls));
+            let v = guard_verdict_in_turn(Some(BACKED_RULEBOOK), claim, "", false, None, &commands);
+            assert!(v.block_reason.is_none(), "{calls:?}: {:?}", v.block_reason);
+        }
+    }
+
+    #[test]
+    fn launching_an_agent_or_writing_a_note_does_not_back_a_claim() {
+        let claim = "Gecontroleerd: alle drie in orde.";
+        let transcript = transcript_with_tool_calls(&[
+            ("Agent", r#"{"prompt":"check it"}"#),
+            ("mcp__thor__remember", r#"{"id":"x"}"#),
+            ("Edit", r#"{"file_path":"a"}"#),
+        ]);
+        let commands = turn_commands(&transcript);
+        assert!(commands.is_empty(), "{commands:?}");
+        let v = guard_verdict_in_turn(Some(BACKED_RULEBOOK), claim, "", false, None, &commands);
+        assert!(v.block_reason.is_some(), "a claim relayed from an agent, with nothing looked at, stays held");
+    }
+
+    #[test]
+    fn a_rule_that_does_not_opt_in_is_not_backed_by_a_read() {
+        let v = guard_verdict_in_turn(Some(CLAIM_RULEBOOK), "Gecontroleerd: alles werkt.", "", false, None, &["[tool] Read".to_string()]);
+        assert!(v.block_reason.is_some());
+    }
+
+    #[test]
+    fn an_honest_exit_still_passes_without_any_tool() {
+        let v = guard_verdict_in_turn(Some(BACKED_RULEBOOK), "Niet gecontroleerd: ik zag het niet.", "", false, None, &[]);
+        assert!(v.block_reason.is_none());
+    }
+
+    const PROMPT_GATED_RULEBOOK: &str = r#"[
+      {"id":"ask-commit","tier":"warn","only_if_prompt_any_of":["commit","push"],
+       "any_of":["zal ik committen"],"none_of":[],"reminder":"Do not bounce his request back."}
+    ]"#;
+
+    #[test]
+    fn a_rule_gated_on_the_prompt_fires_only_when_the_owner_asked_for_that() {
+        let reply = "Alles groen. Zal ik committen?";
+        let asked = guard_verdict(Some(PROMPT_GATED_RULEBOOK), reply, "Commit maar en push naar dev", false, None);
+        assert!(asked.warn_reason.is_some(), "he asked for it: asking back is bouncing it");
+        let not_asked = guard_verdict(Some(PROMPT_GATED_RULEBOOK), reply, "Ja", false, None);
+        assert!(not_asked.warn_reason.is_none(), "he never asked for a commit: asking first is the standing rule");
+        let unreadable = guard_verdict(Some(PROMPT_GATED_RULEBOOK), reply, "", false, None);
+        assert!(unreadable.warn_reason.is_some(), "no prompt to read: the rule keeps applying");
     }
 
     // ------------------------------------- step 33: one short hold when two rules fire

@@ -498,6 +498,22 @@ rule is one entry with:
   within the six words before the trigger, in the same sentence and with no
   "maar"/"but" between them, makes that occurrence no claim. Left out, the
   rule reads every occurrence.
+- `backed_by_turn_tools` - `true` marks a rule about a claim of having looked
+  at something ("checked", "verified", "I cannot reach it"). Such a rule does
+  not fire when the turn itself looked at something: a Bash or PowerShell
+  command, a Read, Grep or Glob, a web fetch or search, or a browser or screen
+  tool, run after the owner's last prompt. Launching an agent, writing or
+  editing, and THOR's own memory tools do not count, so a claim relayed from an
+  agent's report, or made in a turn that looked at nothing, is still held. A
+  reply never has to name a file or a line for this: the owner's short-answer
+  rule forbids it. Known limit: the guard sees that the turn looked at
+  something, not whether it looked at the thing the claim is about. Left out,
+  the rule reads every claim.
+- `only_if_prompt_any_of` - words of which the owner's own last prompt must
+  carry at least one for the rule to apply at all. "Do not ask him to commit
+  what he asked you to commit" is only a defect when he asked for a commit;
+  asking first is the right thing when he did not. Left out, or a prompt that
+  cannot be read: the rule applies as ever.
 - `tier` - `block` holds the reply back until it is fixed; `warn` only
   leaves a note behind. Every rule seeded here is `block`.
 - `owner_reading_only` - `true` marks a rule about how a reply reads to the
