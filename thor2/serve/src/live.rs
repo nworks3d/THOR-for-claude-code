@@ -13,6 +13,7 @@ use thor_core::cas::compute_head_sets;
 use thor_core::event_store::{Event, EventKind, EventStore};
 
 /// One live item plus the id of the event log entity that carries it.
+#[derive(Clone)]
 pub struct LiveItem {
     pub id: String,
     pub item: Item,

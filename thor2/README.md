@@ -882,6 +882,48 @@ once per 16 hours per project, of a session that has done at least 10 minutes
 of its own work in the project and never at its first `Stop` there. A short task
 is never held for old rules it did not touch.
 
+### The false-block sweep: every rule against what really happened
+
+A rule can be right about the forms its writer thought of and wrong about the
+calls that really get made. THOR keeps the calls itself and tries every rule
+against them, so nobody has to hunt for a rule that refuses what it should not.
+
+- **The record.** At every end of a turn the hook appends the turn's tool calls
+  to `real-calls.jsonl` and the reply the answer guard judged to
+  `real-replies.jsonl`, both beside the store: the tool, its input (redacted the
+  way the log redacts a command, long texts cut), the folder and project, whether
+  THOR's hook refused it and under which rules, and whether it ran and succeeded.
+  Thirty days are kept, and each file stays under a size cap (144 MB and 32 MB,
+  the oldest lines go first). Only what is new since the last turn is read, within
+  one second (about 15 milliseconds when little is new). On a machine that starts
+  with nothing, `serve sweep --backfill` reads the last 30 days of transcripts,
+  calls and replies, in about 15 seconds; a call read back that way has no known
+  build, so it is never evidence (below).
+- **The sweep.** `serve --db "<store>" sweep` tries every rule that can refuse a
+  call, and every entry of the answer rulebook, against that record through the
+  functions the hook itself uses, and prints per rule: it would refuse K of N real
+  calls, R of them ran fine, with examples. "Ran fine" is evidence, not a verdict:
+  either the hook let the call through after the rule last changed, in a session
+  whose hook was alive, and it ran; or the hook refused it under this rule and
+  the same call later ran unchanged. Only calls the hook judged with the
+  running build count, so an install never flags rules for what an older
+  engine decided. A rule that waits for the owner's go (`owner-approval`) is
+  never flagged. It is incremental: a run replays only the
+  rows written since the last one, plus what a changed rule can reach, and stops
+  at its time box (`--budget-secs`, 600 by default) to carry on next time. A full
+  replay of 156,000 real calls takes two to four minutes; a run with nothing new
+  takes under half a second, and 3,000 new calls about three seconds. A new build
+  starts a full replay, while the earlier findings stay in view until the new pass
+  replaces them.
+- **Where it shows.** `doctor` and `doctor --eval` print one line, silent at zero:
+  `false-block sweep: R rule(s) would refuse real calls that ran fine: <ids> (run
+  serve sweep for detail)`. The evaluation start note lists the same rules as
+  item d of section 2, each with its example and the call that settles it, and its
+  refusal-outcomes line points there because that proxy cannot see a false block
+  that was walked around without weakening the rule. `remember` and `revise` of a
+  rule that can refuse say `real calls: this rule would refuse K of N real calls
+  in the last 30 days`, with up to three examples; they inform and never refuse.
+
 There is a second gate that keeps the number from rotting once you start
 using it. Adding a fact to a target that already holds one whose own proof
 has gone false is refused, and the refusal names what to settle. It is

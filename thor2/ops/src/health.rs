@@ -3121,6 +3121,23 @@ fn refusal_outcomes_at(db: &Path, full: bool, now: i64) -> Vec<String> {
     out
 }
 
+/// How long a doctor run spends on the false-block sweep: the replay of what
+/// is new in the record of real calls, and of what a changed rule reaches. A
+/// run that is not finished says so nowhere (it is silent at zero) and carries
+/// on at the next one; `serve sweep` has no such short limit.
+const DOCTOR_SWEEP_SECS: u64 = 8;
+
+/// The false-block sweep (`serve::sweep`): the rules that would refuse real
+/// calls of the last 30 days that ran fine, and the answer-rulebook entries
+/// that would fire on real replies that went through. Silent at zero, so a
+/// store with nothing to report has no line. The sweep is incremental: this
+/// is a short, bounded pass of it.
+pub fn false_block_sweep_lines(db: &Path) -> Vec<String> {
+    let Ok(store) = EventStore::open_existing(db) else { return Vec::new() };
+    let report = serve::sweep::run(db, &store, &serve::sweep::Opts::new(std::time::Duration::from_secs(DOCTOR_SWEEP_SECS)));
+    serve::sweep::doctor_lines(&report)
+}
+
 pub fn crowding_line(db: &Path, checkouts: Option<&Path>, full: bool) -> String {
     let Ok(store) = EventStore::open_existing(db) else {
         return "crowding: store unreadable, not checked".to_string();
@@ -3684,6 +3701,8 @@ pub fn report(
     lines.extend(working_copy_lines(db));
     // Silent unless a real refusal is on the log.
     lines.extend(refusal_outcomes_line(db, full));
+    // Silent unless a rule would refuse real calls that ran fine.
+    lines.extend(false_block_sweep_lines(db));
     // Silent unless something is actually owed - see `judgement_debt_line`'s
     // own doc comment for why this exists alongside `unjudged_line` above
     // rather than in place of it. `full` also lifts its named-items cap, the
@@ -3709,7 +3728,7 @@ pub fn report(
 
 /// The last line of `doctor --eval`: what it printed and what it left out, so a
 /// reader who needs another line knows it is one command away and not missing.
-pub const EVAL_FOOTER: &str = "doctor --eval: only the lines the evaluation routine asks for (tool server and installed programs, when one is wrong; ship, provable rules, gate, teeth, pinned, decay, crowding, judgement debt, contradictions); a line the store has nothing to say about is silent, as in the full report. For anything else - the store and chain line, command anchors, hook launch failures, refusal outcomes, open points, the evaluation clock - run doctor without --eval; that takes longer, so wait for it to end and do not quote it before it has finished";
+pub const EVAL_FOOTER: &str = "doctor --eval: only the lines the evaluation routine asks for (tool server and installed programs, when one is wrong; ship, provable rules, gate, teeth, pinned, decay, crowding, false-block sweep, judgement debt, contradictions); a line the store has nothing to say about is silent, as in the full report. For anything else - the store and chain line, command anchors, hook launch failures, refusal outcomes, open points, the evaluation clock - run doctor without --eval; that takes longer, so wait for it to end and do not quote it before it has finished";
 
 /// The lines of `report` that the evaluation routine (`eval-command.example.md`)
 /// asks a reader to quote - `provable rules`, `gate`, `teeth`, `pinned`, `decay`,
@@ -3739,6 +3758,7 @@ pub fn eval_report(
         decay_line(db, checkouts, full),
         crowding_line(db, checkouts, full),
     ]);
+    lines.extend(false_block_sweep_lines(db));
     lines.extend(judgement_debt_line(db, checkout_project, full));
     lines.extend(contradiction_line(db, checkouts));
     lines

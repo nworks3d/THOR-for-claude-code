@@ -172,7 +172,7 @@ pub fn last_user_prompt(transcript_jsonl: &str) -> Option<String> {
 /// reminder: `prompt::is_owners_own_text`) - see `last_user_prompt` for the
 /// shapes. Field test 12, R6: the length hold quoted `</task-notification>` as
 /// the owner's words because the last user-role entry was only a notification.
-fn owner_prompt_of(entry: &Value) -> Option<String> {
+pub fn owner_prompt_of(entry: &Value) -> Option<String> {
     if entry.get("type").and_then(|t| t.as_str()) != Some("user") {
         return None;
     }
@@ -803,7 +803,7 @@ fn pattern_escaped(rule: &OptInRule, haystack_lower: &str) -> bool {
 // not checked.
 //
 // This file does no I/O of its own: the lookups are the caller's (see
-// `serve/src/bin/serve.rs`'s own `cited_line_exists` and `real_commits`).
+// `serve::evidence`, `cited_line_exists` and `real_commits`: the Stop hook and the sweep use the same two).
 
 /// How the caller looks evidence up, handed in because this file does no I/O.
 pub struct EvidenceLookup<'a> {

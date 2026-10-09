@@ -156,20 +156,34 @@ pub fn pre_tool(
     cwd: Option<&Path>,
     owner: Option<absent_guard::OwnerWords>,
 ) -> Judgement {
+    pre_tool_in(&Live::of(store), tool_name, tool_input, project, root, cwd, owner)
+}
+
+/// `pre_tool` for a caller that judges many calls against one store (a replay
+/// of real calls, `sweep`): the store's live items are read once into `live`
+/// and shared, instead of once per call. The decision is the same function.
+pub fn pre_tool_in(
+    live: &Live,
+    tool_name: &str,
+    tool_input: Option<&Value>,
+    project: Option<&str>,
+    root: Option<&Path>,
+    cwd: Option<&Path>,
+    owner: Option<absent_guard::OwnerWords>,
+) -> Judgement {
     let file_path = tool_input.and_then(|t| t.get("file_path")).and_then(|v| v.as_str());
-    let mut judged = file_write(store, tool_name, file_path, tool_input, project, root, cwd);
+    let mut judged = file_write_in(live, tool_name, file_path, tool_input, project, root, cwd);
     if judged.verdict.is_some() {
         return judged;
     }
-    let live = Live::of(store);
-    let call = Call::of(&live, tool_name, tool_input, project, cwd);
-    let by_command = command_in(store, tool_input, call.as_ref(), root, cwd);
+    let call = Call::of(live, tool_name, tool_input, project, cwd);
+    let by_command = command_in(live, tool_input, call.as_ref(), root, cwd);
     judged.pools.command = by_command.pools.command;
     if by_command.verdict.is_some() {
         judged.verdict = by_command.verdict;
         return judged;
     }
-    judged.verdict = requires_in(&live, tool_name, tool_input, call.as_ref(), project, owner);
+    judged.verdict = requires_in(live, tool_name, tool_input, call.as_ref(), project, owner);
     judged
 }
 
@@ -232,6 +246,18 @@ pub fn file_write(
     root: Option<&Path>,
     cwd: Option<&Path>,
 ) -> Judgement {
+    file_write_in(&Live::of(store), tool_name, file_path, tool_input, project, root, cwd)
+}
+
+fn file_write_in(
+    live: &Live,
+    tool_name: &str,
+    file_path: Option<&str>,
+    tool_input: Option<&Value>,
+    project: Option<&str>,
+    root: Option<&Path>,
+    cwd: Option<&Path>,
+) -> Judgement {
     let Some(file_path) = file_path else { return Judgement::default() };
     let Some(content) = absent_guard::proposed_content(tool_name, tool_input) else { return Judgement::default() };
     let judged = judged_path(file_path, root, cwd);
@@ -240,15 +266,15 @@ pub fn file_write(
     let mut location_input = ServeInput::default();
     location_input.add_target(TargetKind::Path, file_path);
     location_input.add_target(TargetKind::Dir, file_path);
-    let location = live::candidates_for(store, &location_input);
+    let location = live.candidates(&location_input);
 
     let mut input =
         ServeInput { project: project.map(str::to_string), root: root.map(Path::to_path_buf), ..Default::default() };
     input.add_file(file_path);
-    let candidates = live::candidates_for(store, &input);
+    let candidates = live.candidates(&input);
     let ranked = rank::select(&candidates, &input);
 
-    let always = in_session_project(live::always_candidates(store), project);
+    let always = live.always_in(project);
     let reason = absent_guard::find_location_violation(&location, file_path, root)
         .or_else(|| absent_guard::find_violation(&ranked, file_path, content, root))
         .or_else(|| absent_guard::find_dir_content_violation(&location, file_path, content, root))
@@ -270,10 +296,15 @@ pub fn file_write(
             reason,
         }
     });
-    Judgement {
-        verdict,
-        pools: Pools { file: Some(FilePools { file_path: file_path.to_string(), location, ranked }), command: None },
-    }
+    // A replay feeds no staleness sidecar, so it copies no pool.
+    let pools = match live.keeps_pools() {
+        true => Pools {
+            file: Some(FilePools { file_path: file_path.to_string(), location: owned(location), ranked }),
+            command: None,
+        },
+        false => Pools::default(),
+    };
+    Judgement { verdict, pools }
 }
 
 /// The command guard (see `absent_guard`'s module doc comment, "THE COMMAND
@@ -327,12 +358,13 @@ pub fn command(
     cwd: Option<&Path>,
     project: Option<&str>,
 ) -> Judgement {
-    let call = Call::of(&Live::of(store), tool_name, tool_input, project, cwd);
-    command_in(store, tool_input, call.as_ref(), root, cwd)
+    let live = Live::of(store);
+    let call = Call::of(&live, tool_name, tool_input, project, cwd);
+    command_in(&live, tool_input, call.as_ref(), root, cwd)
 }
 
 fn command_in(
-    store: &EventStore,
+    live: &Live,
     tool_input: Option<&Value>,
     call: Option<&Call>,
     root: Option<&Path>,
@@ -351,7 +383,7 @@ fn command_in(
         let mut location_input = ServeInput::default();
         location_input.add_target(TargetKind::Path, &path);
         location_input.add_target(TargetKind::Dir, &path);
-        let location = live::candidates_for(store, &location_input);
+        let location = live.candidates(&location_input);
 
         let shell_reason = absent_guard::find_location_violation(&location, &path, root).or_else(|| {
             matches!(write.effect, ShellWriteEffect::Removed | ShellWriteEffect::Emptied)
@@ -387,7 +419,7 @@ fn command_in(
     for host in input::hosts_in_command(command) {
         targets.add_target(TargetKind::Host, &host);
     }
-    let items = live::candidates_for(store, &targets);
+    let items = live.candidates(&targets);
 
     let verdict = absent_guard::find_command_violation_in(&items, &call.segments, Some(&call.projects), root).map(
         |(reason, anchor)| Verdict {
@@ -397,7 +429,10 @@ fn command_in(
             reason,
         },
     );
-    let pool = CommandPool { command: command.to_string(), items, segments: call.segments.clone() };
+    if !live.keeps_pools() {
+        return Judgement { verdict, pools: Pools::default() };
+    }
+    let pool = CommandPool { command: command.to_string(), items: owned(items), segments: call.segments.clone() };
     Judgement { verdict, pools: Pools { file: None, command: Some(pool) } }
 }
 
@@ -616,6 +651,13 @@ fn scratch_made_by(segment: &Segment, dir: Option<&Path>, cwd: Option<&Path>) ->
     (!made.exists()).then_some(made)
 }
 
+/// The items of a pool as an owned list: moved out when nothing else holds the
+/// pool (the hook's own call, which reads each pool afresh), copied when a
+/// replay shares it.
+fn owned(pool: std::rc::Rc<Vec<LiveItem>>) -> Vec<LiveItem> {
+    std::rc::Rc::try_unwrap(pool).unwrap_or_else(|shared| (*shared).clone())
+}
+
 /// The store's live items for one decision, and the projects they are filed
 /// under - each read from the store the first time it is asked, and never
 /// again: the project scope of a call and its `requires` arm share one read
@@ -626,6 +668,12 @@ pub struct Live<'a> {
     projects: std::cell::OnceCell<HashSet<String>>,
     /// Each known project's registered remotes, normalised, to the project.
     remote_owners: std::cell::OnceCell<HashMap<String, String>>,
+    /// A replay of many calls against one store that does not change: each
+    /// candidate pool (`live::candidates_for`) is read and parsed once, not
+    /// once per call, and no staleness pool is copied out.
+    replay: bool,
+    pools: std::cell::RefCell<HashMap<(Vec<String>, Vec<String>), std::rc::Rc<Vec<LiveItem>>>>,
+    always: std::cell::RefCell<HashMap<Option<String>, std::rc::Rc<Vec<LiveItem>>>>,
 }
 
 impl<'a> Live<'a> {
@@ -635,7 +683,50 @@ impl<'a> Live<'a> {
             items: std::cell::OnceCell::new(),
             projects: std::cell::OnceCell::new(),
             remote_owners: std::cell::OnceCell::new(),
+            replay: false,
+            pools: Default::default(),
+            always: Default::default(),
         }
+    }
+
+    /// `of`, for a replay of many calls against a store that does not change
+    /// while it runs (`sweep`). The decisions are the same; only the reading of
+    /// the store is shared between calls.
+    pub fn for_replay(store: &'a EventStore) -> Self {
+        Live { replay: true, ..Live::of(store) }
+    }
+
+    fn keeps_pools(&self) -> bool {
+        !self.replay
+    }
+
+    /// `live::candidates_for` for `input` - read once per pool in a replay.
+    fn candidates(&self, input: &ServeInput) -> std::rc::Rc<Vec<LiveItem>> {
+        if !self.replay {
+            return std::rc::Rc::new(live::candidates_for(self.store, input));
+        }
+        let key = live::candidate_pool_key(input);
+        if let Some(known) = self.pools.borrow().get(&key) {
+            return known.clone();
+        }
+        let pool = std::rc::Rc::new(live::candidates_for(self.store, input));
+        self.pools.borrow_mut().insert(key, pool.clone());
+        pool
+    }
+
+    /// The Always pool as `session_project` sees it (`in_session_project`).
+    fn always_in(&self, session_project: Option<&str>) -> std::rc::Rc<Vec<LiveItem>> {
+        let key = session_project.map(str::to_string);
+        if self.replay {
+            if let Some(known) = self.always.borrow().get(&key) {
+                return known.clone();
+            }
+        }
+        let pool = std::rc::Rc::new(in_session_project(live::always_candidates(self.store), session_project));
+        if self.replay {
+            self.always.borrow_mut().insert(key, pool.clone());
+        }
+        pool
     }
 
     /// The known project whose registered working copy shares a remote with
