@@ -84,6 +84,11 @@ fn bash(command: &str) -> Call {
     Call { shown: command.to_string(), tool: "Bash".to_string(), input: json!({ "command": command }) }
 }
 
+/// A PowerShell call, shown with its tool so a reader tells it from a Bash one.
+fn powershell(command: &str) -> Call {
+    Call { shown: format!("PowerShell: {command}"), tool: "PowerShell".to_string(), input: json!({ "command": command }) }
+}
+
 /// A rule alone in a store of its own, tried through the hook's pipeline.
 struct Alone {
     store: EventStore,
@@ -436,7 +441,17 @@ fn forms(item: &Item, root: &Path) -> Result<Forms, String> {
                 clean.push(bash(anchor));
             }
             clean.extend(legit::clean_forms(anchor).iter().map(|f| bash(f)));
-            Ok(Forms { forbidden: vec![bash(&attempt)], clean, collapsed: false, file: None })
+            // MULTI-STATEMENT POWERSHELL (field test 14, C6): the hook reads a
+            // PowerShell call statement by statement, so the trial does too. The
+            // statement carrying the anchor is refused without its answer and
+            // let through with it, whatever stands before it; a statement that
+            // only ASSIGNS a path ending in the anchor runs nothing.
+            let mut forbidden = vec![bash(&attempt)];
+            forbidden.extend(["Get-Date", "$x=1"].map(|before| powershell(&format!("{before}; {attempt}"))));
+            clean.extend(["Get-Date", "$x=1"].map(|before| powershell(&format!("{before}; {attempt} {answer}"))));
+            let assigned = if anchor.contains(char::is_whitespace) { anchor.to_string() } else { format!("C:\\tools\\{anchor}") };
+            clean.push(powershell(&format!("$x='{assigned}'; Get-Item $x")));
+            Ok(Forms { forbidden, clean, collapsed: false, file: None })
         }
         Some(Check::Absent { path, literal }) => absent_forms(root, path, std::slice::from_ref(literal)),
         Some(Check::AbsentAll { path, literals }) => absent_forms(root, path, literals),
@@ -1539,7 +1554,7 @@ fn comment_only_contains(check: &Check, root: &Path) -> Option<String> {
         return None;
     }
     Some(format!(
-        "'{}' sits only in comments of {}, so it guards no behaviour the rule is about and would refuse a harmless \
+        "'{}' sits only in comments of {} (usage and help text counts as a comment), so it guards no behaviour the rule is about and would refuse a harmless \
          comment cleanup. If the comment text itself is what the rule is about, point the check at a documentation \
          file (a Markdown file is never read as comments) or at a literal that also occurs in code",
         gate::shown_literal(literal),
