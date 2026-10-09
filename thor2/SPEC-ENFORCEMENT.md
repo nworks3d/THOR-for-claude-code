@@ -138,6 +138,13 @@ is the one Stop path that may open the store, read-only):
 Store cannot be opened, marker file unreadable, JSON malformed -> return None
 (ALLOW). Same fail-open as everything else on this surface.
 
+**What the code does by default (mode `self`, `serve/src/capture.rs`).** Step 4
+describes the `judge` mode. The default mode is `self`: there is no judge, and
+the hold is a question, not an accusation. It says the owner MAY have just
+stated a new durable decision, that it only counts if it is genuinely new, and
+that if it is not, one line saying so is enough. It is still one hold per flag,
+ever. `guard-capture-mode.json` switches between `judge`, `self` and `off`.
+
 ### 2.3 C3 - block the wrong sink (PreToolUse)
 
 Narrow on purpose, so it cannot become a false-block generator. It fires ONLY
@@ -154,6 +161,13 @@ is a mirror, never the source." Outside that intersection: ALLOW, silently.
 Rationale for the narrowness: without an owed capture, an edit to CLAUDE.md is
 ordinary work and blocking it would be exactly the kind of nag this project
 exists to remove.
+
+**What the code does by default.** The hard BLOCK above happens only when the
+judge model ruled the statement a durable decision (`judge` mode). In the
+default `self` mode, and whenever only the cheap rulebook match flagged the
+prompt, a write to one of these files only WARNS (`sink_verdict`,
+`serve/src/capture.rs`): the rulebook's measured false-block rate is too high
+to let it block.
 
 ### 2.4 C4 - house style captures the pointer, not the values
 
@@ -205,10 +219,13 @@ The lesson from the underpowered behaviour test (n=14) is binding here.
 
 ## 5. Deployment - NOT part of the build
 
-Nothing here is deployed to `C:\Users\dev\thor2\bin` or wired into
-`settings.json` without the owner saying so in-session. A surface that can block
-turn completion changes his daily work; the build and the numbers come first,
-the switch is his call.
+This section is the history of how the build was staged: nothing was deployed
+or wired into `settings.json` without the owner saying so in-session, because a
+surface that can block turn completion changes his daily work. Today the
+install wires the four hooks into `settings.json` by default (session start,
+before each tool call, when a prompt is sent, and when a reply ends), and the
+capture guard runs in its default `self` mode unless `guard-capture-mode.json`
+says otherwise. Switching a part off is the owner's call, per part.
 
 ---
 
@@ -316,8 +333,9 @@ it yet.
   `absent_all`) and a `requires` check's answers keep substring matching.
 - An anchor written with `.exe` reaches only a call that names that `.exe`. A
   `requires` trigger ending in one `*` is a prefix. A call whose only words
-  after the anchor are help or version words is never refused by `requires`
-  (a `forbidden` check is not exempted).
+  after the anchor are help or version words is never refused by `requires`,
+  and a `forbidden` check does not refuse it either (an inert call is exempt
+  from `forbidden`, `requires` and owner-approval alike).
 - Each reached segment is judged under the project of the folder it runs in
   (the `cd` chain, and for git its `-C`, `--git-dir` or `GIT_DIR=`; never
   `--work-tree`, which names no repository); a folder of no project, one

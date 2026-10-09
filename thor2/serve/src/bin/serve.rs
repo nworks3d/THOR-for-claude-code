@@ -1985,7 +1985,8 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
         // since that project's newest valid evaluation, the folder's own
         // first - but lands only on a session with ten minutes of its own
         // work there, never at its first Stop there, and not while another
-        // session runs that project's evaluation (for at most an hour). See
+        // session runs that project's evaluation (while that session was
+        // active within the last 30 minutes, `EVALUATION_IDLE_MINUTES`). See
         // `eval_stop_ask` and `usefulness::stop_decision`. A subagent's Stop
         // still counts as work of its session, never as a Stop that can be
         // held. What the paragraphs above say about `stop_project.is_some()`
