@@ -950,12 +950,219 @@ pub fn working_contract() -> Vec<model::item::Item> {
         // way for good.
         rule(
             model::store::SETUP_NOTE_ID,
-            "The owner has not yet been walked through setup: how replies should read, which \
-             lane he wants, and what language his rules use. A first session raises AGENTS.md's \
-             questions, records his answers as 'owner-setup-answers', then retracts this note - \
-             retracting without that record is refused.",
+            "Setup is not finished. In your first reply tell the owner in one sentence that THOR is \
+             on with defaults (short replies, his own language, work lane only, all starting notes \
+             kept, removable any time), then store a Report 'owner-setup-answers' with those \
+             defaults or his changes and retract this note.",
             "This note is still being served at session start after the owner has already \
              answered these questions and the answers are applied.",
+        ),
+    ]
+}
+
+/// The workflow starter pack: the coding-workflow habits that, in a store
+/// built up over months of real use, were marked useful again and again (or
+/// served thousands of times) and that hold for ANY developer on ANY project.
+/// It exists so that someone who installs THOR with one sentence to their
+/// agent starts with the working experience of the person who built it,
+/// without having to learn it the same hard way.
+///
+/// WHAT IS IN HERE AND WHAT IS NOT. Everything below was rewritten generic:
+/// no names, hosts, machines, clients, languages or paths of the owner it was
+/// learnt from. A habit that only holds for one person's setup (a preferred
+/// reply length, a commit identity, a NAS, a "no AI attribution" policy) is
+/// NOT here, and neither is a habit THOR already ships by another route (the
+/// post-compaction reminder, the honesty notes in `working_contract`).
+///
+/// BINDINGS. None of these is pinned: a pinned note is read at every session
+/// start, and the session-start block is where THOR's token cost lives. Each
+/// is bound to the moment or the command it is about instead (commit, push,
+/// publish, delete, deploy, install, an agent being spawned), so it arrives
+/// right before the step it is about, once per context.
+///
+/// TEETH. None carries a check, on evidence. Seven candidate checks were
+/// replayed through the real guard over 145,976 recorded tool calls
+/// (2026-10-09): a ban on --no-verify refused 11 legitimate commits in
+/// scratch trees; "names a model" refused 9 agent calls and "says subagent"
+/// refused 1,052; "start a process hidden" refused 9 (opening a browser, a
+/// control panel); a ban on staging .env refused 3 exclusion pathspecs and
+/// is a deliberate practice in some private repositories; a force-push ban
+/// refused nothing, but it would also refuse the one legitimate history
+/// rewrite a solo project makes. A new user must never get a false block
+/// from a note they did not write, so every one of these stays a note.
+///
+/// They are ordinary notes. Retract one, or rewrite it, and nothing else
+/// notices.
+pub fn workflow_starter_pack() -> Vec<model::item::Item> {
+    use intent::Action;
+    use model::item::{Binding, Severity, TargetKind};
+
+    let moment = |a: Action| Binding::Moment(a);
+    let command = |c: &str| Binding::Target { kind: TargetKind::Command, value: c.to_string() };
+    let note = |id: &str, severity: Option<Severity>, text: &str, falsifier: &str, bindings: Vec<Binding>| {
+        model::item::Item {
+            id: id.to_string(),
+            kind: model::item::Kind::Rule,
+            text: text.to_string(),
+            bindings,
+            severity,
+            project: None,
+            tags: vec!["workflow-starter".to_string()],
+            expires: None,
+            key: None,
+            falsifier: Some(falsifier.to_string()),
+            check: None,
+        }
+    };
+
+    vec![
+        // COMMIT (four), then PUSH (four): a place holds at most four notes
+        // (`model::item::MAX_ITEMS`) and the gate refuses a fifth that could
+        // never reach a block, so each moment is kept at four. The wording of
+        // the "only when asked" note still covers committing: it is shown at
+        // the push, and the agent's own defaults already ask before a commit.
+        note(
+            "changelog-with-every-user-visible-change",
+            Some(Severity::Costly),
+            "If the project keeps a CHANGELOG, add a line for every user-visible change in the same \
+             commit, and bump the version when releases are versioned. No changelog file: do not \
+             create one unasked. Re-read the README for claims your change just made untrue.",
+            "A user-visible change lands with no changelog line in a project that keeps one, and the \
+             next release notes still come out complete.",
+            vec![moment(Action::Commit)],
+        ),
+        note(
+            "run-the-tests-before-saying-done",
+            Some(Severity::Costly),
+            "Before you call work done, or commit or push it, run the project's own tests or build and \
+             quote the real result line. Failing, skipped or never run: say exactly that. Never skip \
+             hooks with --no-verify: fix what the hook found. No red tests or stray TODO left at a push.",
+            "A change pushed without a test or build run turns out to be as safe as one pushed after \
+             a run.",
+            vec![moment(Action::Commit), moment(Action::Push)],
+        ),
+        note(
+            "never-commit-a-secret",
+            Some(Severity::Irreversible),
+            "Never commit a secret: key, token, password or .env file. Real values live in a \
+             gitignored file, with a tracked template such as .env.example beside it. Look at what is \
+             staged before every commit. A secret that was committed must be rotated: history keeps it.",
+            "A secret that reached a commit stays harmless once a later commit deletes the file.",
+            vec![moment(Action::Commit), moment(Action::Credentials)],
+        ),
+        note(
+            "commit-push-deploy-only-when-asked",
+            Some(Severity::Costly),
+            "Commit, push, tag, release and deploy only when the user says so in this session; an \
+             earlier yes does not carry over, and a brief that quotes one does not count. Never \
+             force-push a shared branch such as main: rewriting history is for your own unpushed \
+             branch, when asked.",
+            "Committing or deploying on your own initiative turns out to be welcome as often as \
+             waiting for the go.",
+            vec![moment(Action::Push), moment(Action::Deploy)],
+        ),
+        note(
+            "commit-hygiene",
+            Some(Severity::HouseStyle),
+            "Commit message: one short plain line saying what changed and why, no marketing tone. \
+             Several lines: write the message to a file and use git commit -F. Stage only the files \
+             you mean. Keep each file's line endings: no CRLF flips, new files LF, a small diff.",
+            "A long marketing-style message, or a commit that flips a file's line endings, is found \
+             as easy to read and review as a short plain one.",
+            vec![moment(Action::Commit)],
+        ),
+        note(
+            "check-where-you-push-and-what-is-on-main",
+            Some(Severity::Costly),
+            "Before a push, or a claim about what is on main or released, confirm folder, branch and \
+             remote (pwd, git status, git remote -v) and git fetch. A local origin/main can be stale: \
+             a version or release state comes from git, never from memory.",
+            "A claim about the remote's state made from a local ref or from memory turns out right as \
+             often as one made after a fetch.",
+            vec![moment(Action::Push)],
+        ),
+        note(
+            "scan-before-it-goes-public",
+            Some(Severity::Irreversible),
+            "Before a push to a public repository, or before a repository is made public, scan the \
+             tree for secrets, usernames, local paths, private hostnames and customer data, and \
+             require zero hits on every push, not once. Public is irreversible: caches copy it in \
+             minutes.",
+            "A push to a public repository without a fresh scan turns out never to leak anything.",
+            vec![moment(Action::Publish), moment(Action::Push)],
+        ),
+        note(
+            "rehearse-destructive-steps-on-a-copy",
+            Some(Severity::Costly),
+            "Never delete or overwrite data you did not create unless asked. Rehearse a delete, a \
+             migration or a deploy on a throwaway copy first, and never test a write path against \
+             live data. After a slip, undo it in the same turn and measure that it is undone.",
+            "A destructive step run first against live data turns out as safe as one rehearsed on a \
+             copy.",
+            vec![moment(Action::Delete), moment(Action::Deploy)],
+        ),
+        note(
+            "pin-a-dependency-with-its-reason",
+            None,
+            "Pin a dependency version only with a comment saying why, next to the pin, or someone \
+             will 'improve' it back to latest. Add a dependency only when the standard library or \
+             one already installed cannot do the job.",
+            "A pin with no reason next to it is found to survive later cleanups as often as one that \
+             has a reason.",
+            vec![moment(Action::Install)],
+        ),
+        // Bound to the command they are about. A command place holds four
+        // notes at most, so these stay two or one apiece and leave room for
+        // the owner's own.
+        note(
+            "an-agent-brief-stands-alone",
+            None,
+            "A spawned agent starts blank. Its brief must stand alone: the goal, an ABSOLUTE working \
+             folder, the files it may touch, no spawning of further agents, an explicit model, and \
+             what to report back including what it could not check.",
+            "An agent given a brief with no working folder or limits is found to behave the same as \
+             one given a complete brief.",
+            vec![command("Agent")],
+        ),
+        note(
+            "parallel-agents-do-not-share-a-folder",
+            None,
+            "Parallel agents in one repo each get their own folder or worktree and their own build \
+             directory, or they overwrite each other and queue on the build lock. A worktree starts \
+             from the last commit, not from uncommitted work. A commit takes everything in its \
+             folder: let one agent commit.",
+            "Two agents sharing one folder and one build directory finish as fast and as cleanly as \
+             two isolated ones.",
+            vec![command("Agent")],
+        ),
+        note(
+            "absolute-paths-not-the-shell-working-directory",
+            None,
+            "Do not trust the shell's working directory after a cd: it can stick into the next call \
+             or reset to the repo root. Use absolute paths in every command and every agent brief, \
+             and write back to the same absolute path you read from.",
+            "A relative path used after a cd is found to land in the same folder every time, in the \
+             shell and in agents.",
+            vec![command("cd")],
+        ),
+        note(
+            "script-file-not-shell-quoting",
+            None,
+            "Text with quotes, backticks, $ or backslashes goes into a script file written with the \
+             Write tool, then run that file. A bash -c, node -e or python -c one-liner, or a \
+             heredoc, can silently mangle it and the error points at the wrong line.",
+            "Nested quotes and backslashes pass intact through a shell one-liner or heredoc on this \
+             machine.",
+            vec![command("bash -c"), command("node -e"), command("python -c")],
+        ),
+        note(
+            "windowless-processes-on-windows",
+            None,
+            "On Windows start background processes hidden: Start-Process with -WindowStyle Hidden or \
+             -NoNewWindow, a Python subprocess with CREATE_NO_WINDOW. A flashing console steals the \
+             user's focus. A process started without -Wait dies with the app that started it.",
+            "A visible console window started by an agent is found to leave the user's focus alone.",
+            vec![command("Start-Process")],
         ),
     ]
 }
@@ -973,7 +1180,7 @@ pub fn working_contract() -> Vec<model::item::Item> {
 pub fn seed_working_contract(db: &Path) -> anyhow::Result<Vec<SeededItem>> {
     let mut store = EventStore::new(db)?;
     let mut out = Vec::new();
-    for item in working_contract() {
+    for item in working_contract().into_iter().chain(workflow_starter_pack()) {
         let id = item.id.clone();
         match model::store::declare(&mut store, "install", "install", installer(), &item) {
             Ok(_) => out.push(SeededItem { id, stored: true, refusal: None }),
@@ -2035,7 +2242,7 @@ mod tests {
         ensure_store(&db).unwrap();
 
         let seeded = seed_working_contract(&db).unwrap();
-        assert_eq!(seeded.len(), working_contract().len());
+        assert_eq!(seeded.len(), working_contract().len() + workflow_starter_pack().len());
         for s in &seeded {
             assert!(s.stored, "the gate refused its own starting note {}: {:?}", s.id, s.refusal);
         }
@@ -2084,10 +2291,11 @@ mod tests {
     /// store at ... this command never creates one" and nothing that speaks
     /// the tool protocol. This is the whole bootstrap in one call, proving it
     /// leaves a store with the full working contract (22 notes, matching
-    /// `working_contract().len()`) and the response-guard rulebook, not the
-    /// bare file `ensure_store` alone would leave.
+    /// `working_contract().len()`), the workflow starter pack
+    /// (`workflow_starter_pack().len()` more) and the response-guard
+    /// rulebook, not the bare file `ensure_store` alone would leave.
     #[test]
-    fn ensure_and_seed_store_creates_22_notes_and_the_rulebook_when_absent() {
+    fn ensure_and_seed_store_creates_the_notes_and_the_rulebook_when_absent() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("thor.db");
 
@@ -2095,8 +2303,9 @@ mod tests {
 
         assert_eq!(report.store, StoreOutcome::Created);
         assert_eq!(working_contract().len(), 22, "this test's own claim of 22 starting notes is now stale");
+        let want = 22 + workflow_starter_pack().len();
         let stored = report.seeded.iter().filter(|s| s.stored).count();
-        assert_eq!(stored, 22, "expected all 22 starting notes to be stored, got {stored}");
+        assert_eq!(stored, want, "expected all {want} starting notes to be stored, got {stored}");
         assert_eq!(report.rulebook.outcome, RulebookOutcome::Written);
         assert!(report.rulebook.path.exists(), "the rulebook path reported back must be the one actually written");
     }
@@ -2146,6 +2355,18 @@ mod tests {
         );
     }
 
+    /// The first-session note is the one thing a fresh agent reads before it
+    /// has seen AGENTS.md, so it has to carry the way out by itself: say the
+    /// defaults, and that nothing waits for an answer.
+    #[test]
+    fn the_first_session_note_carries_the_defaults_in_its_own_words() {
+        let note = working_contract().into_iter().find(|i| i.id == model::store::SETUP_NOTE_ID).unwrap();
+        let lowered = note.text.to_lowercase();
+        assert!(lowered.contains("default"), "{}", note.text);
+        assert!(lowered.contains("owner-setup-answers"), "{}", note.text);
+        assert!(note.text.chars().count() <= 300, "{} characters", note.text.chars().count());
+    }
+
     /// Step 8: every seed is written with only its own tag - no `no-literal:`
     /// reason (it answers nothing now) - and the one install command a seed
     /// spells out names the store it registers into (`--db`, F7).
@@ -2157,6 +2378,123 @@ mod tests {
         }
         let install = working_contract().into_iter().find(|i| i.id == "a-new-project-is-one-command").unwrap();
         assert!(install.text.contains("`install --db <your store> --project <name>`"), "{}", install.text);
+    }
+
+    /// THE DEFECT THIS GUARDS AGAINST: a starter pack that is stored and then
+    /// never speaks (bound to a moment nothing produces), or that carries the
+    /// owner's own life into someone else's memory. A friend who installs
+    /// THOR on one sentence gets exactly this set; it has to fire where it
+    /// says and say nothing that is only true for the person who wrote it.
+    #[test]
+    fn the_workflow_starter_pack_is_generic_bound_and_within_the_limit() {
+        let pack = workflow_starter_pack();
+        assert!(pack.len() >= 12, "the starter pack shrank to {} notes", pack.len());
+        let mut ids = std::collections::HashSet::new();
+        let mut pinned = 0;
+        for item in &pack {
+            assert!(ids.insert(item.id.clone()), "{} is in the pack twice", item.id);
+            assert_eq!(item.kind, model::item::Kind::Rule, "{}", item.id);
+            assert!(item.project.is_none(), "{} is scoped to a project, a new user has none", item.id);
+            assert_eq!(item.tags, vec!["workflow-starter".to_string()], "{}", item.id);
+            assert!(item.falsifier.is_some(), "{} names nothing that would prove it wrong", item.id);
+            assert!(
+                item.text.chars().count() <= 300,
+                "{} is {} characters, over the limit the gate enforces",
+                item.id,
+                item.text.chars().count()
+            );
+            assert!(item.text.is_ascii(), "{} holds a non-ASCII character", item.id);
+            assert!(!item.bindings.is_empty(), "{} fires nowhere", item.id);
+            for b in &item.bindings {
+                if let model::item::Binding::Moment(a) = b {
+                    assert!(!model::gate::is_dead_moment(*a), "{} binds to {a:?}, which nothing produces", item.id);
+                }
+            }
+            if item.bindings.contains(&model::item::Binding::Always) {
+                pinned += 1;
+            }
+            let lowered = format!("{} {}", item.text, item.falsifier.as_deref().unwrap_or("")).to_lowercase();
+            for personal in [
+                "c:\\users", "/home/", "10.0.", "@", "http", "nas ", "printer", "klipper", "filament", "dutch",
+            ] {
+                assert!(!lowered.contains(personal), "{} mentions '{personal}', which is not generic", item.id);
+            }
+        }
+        assert!(pinned <= 3, "{pinned} starter notes are pinned: every one of them is read at every session start");
+    }
+
+    /// A changelog and version rule depends on the project's own convention:
+    /// it has to say "if the project keeps one", and it may never refuse
+    /// anything, because a project without a changelog would be blocked on a
+    /// file it never had.
+    #[test]
+    fn the_changelog_note_is_adaptive_and_has_no_tooth() {
+        let note = workflow_starter_pack()
+            .into_iter()
+            .find(|i| i.id == "changelog-with-every-user-visible-change")
+            .expect("the changelog note is part of the starter pack");
+        assert!(note.text.to_lowercase().contains("if the project keeps a changelog"), "{}", note.text);
+        assert!(note.check.is_none(), "a project convention is never a refusal");
+        assert!(note.bindings.contains(&model::item::Binding::Moment(intent::Action::Commit)));
+    }
+
+    /// Only a check proven against real calls may ride in the pack, and the
+    /// replay (see `workflow_starter_pack`'s TEETH paragraph) found none that
+    /// never refuses a legitimate call. Adding one means replaying it over the
+    /// recorded corpus first and listing it here by id.
+    #[test]
+    fn only_audited_starter_notes_carry_a_check() {
+        let audited: &[&str] = &[];
+        for item in workflow_starter_pack() {
+            if item.check.is_some() {
+                assert!(audited.contains(&item.id.as_str()), "{} carries a check nobody replayed", item.id);
+            }
+        }
+    }
+
+    /// A block shows at most four notes (`model::item::MAX_ITEMS`) and a
+    /// command place holds at most four, so the pack must not crowd one
+    /// moment or command past what a block can carry in one showing, and must
+    /// leave the owner's own notes room on every command it binds.
+    #[test]
+    fn the_starter_pack_does_not_crowd_a_place() {
+        use std::collections::HashMap;
+        let mut per_place: HashMap<String, usize> = HashMap::new();
+        for item in workflow_starter_pack() {
+            for b in &item.bindings {
+                *per_place.entry(format!("{b:?}")).or_default() += 1;
+            }
+        }
+        for (place, n) in &per_place {
+            let cap = if place.starts_with("Target") { 2 } else { model::item::MAX_ITEMS };
+            assert!(*n <= cap, "{place} holds {n} starter notes, over {cap}");
+        }
+    }
+
+    /// Every starter note is accepted by the gate into a store that already
+    /// holds the working contract, and is then served at the place it names:
+    /// a rule bound to a moment nothing fires there would be stored and mute.
+    #[test]
+    fn a_starter_note_is_served_at_its_own_moment() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        ensure_and_seed_store(&db).unwrap();
+        let store = EventStore::open_read_only(&db).unwrap();
+        let live = serve::live::live_items(&store);
+        for item in workflow_starter_pack() {
+            let mut input = serve::input::ServeInput::default();
+            for b in &item.bindings {
+                match b {
+                    model::item::Binding::Moment(a) => input.add_moment(*a),
+                    model::item::Binding::Target { kind: model::item::TargetKind::Command, value } => {
+                        input.add_command(value)
+                    }
+                    _ => {}
+                }
+            }
+            let ranked = serve::rank::select(&live, &input);
+            assert!(ranked.iter().any(|r| r.id == item.id), "{} is not served at the place it names", item.id);
+        }
     }
 
     /// THE GAP THIS CLOSES: a fresh store got the `Stop` hook wired in from

@@ -43,7 +43,10 @@ case "$arch" in
 esac
 
 ASSET="thor2-linux-x86_64.tar.gz"
-BASE="https://github.com/$REPO/releases/latest/download"
+# THOR_RELEASE_BASE points the download at another folder holding the same two
+# files (a mirror, a local server, a test); left unset it is the latest release.
+BASE="${THOR_RELEASE_BASE:-https://github.com/$REPO/releases/latest/download}"
+BASE="${BASE%/}"
 
 # ---- tools ------------------------------------------------------------------
 if command -v curl >/dev/null 2>&1; then

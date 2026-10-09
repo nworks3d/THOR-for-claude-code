@@ -24,10 +24,27 @@ $dest = $env:THOR_HOME
 if (-not $dest) { $dest = Join-Path $HOME 'thor2' }
 
 $asset = 'thor2-windows-x86_64.zip'
-$base = "https://github.com/$repo/releases/latest/download"
+# THOR_RELEASE_BASE points the download at another folder holding the same two
+# files (a mirror, a local server, a test); left unset it is the latest release.
+$base = $env:THOR_RELEASE_BASE
+if (-not $base) { $base = "https://github.com/$repo/releases/latest/download" }
+$base = $base.TrimEnd('/')
 
 if ([Environment]::Is64BitOperatingSystem -ne $true) {
     throw "Only 64-bit Windows is published. Build from source for anything else."
+}
+
+# The programs need Microsoft's Visual C++ runtime. Without it Windows opens a
+# modal error box when a program starts, which nobody can click away from a
+# script, so look first and say exactly what to do. Most machines already have
+# it. If this one does not: winget installs it, and Windows may ask permission
+# once - that click is the only part nobody else can do.
+$system = [Environment]::GetFolderPath('System')
+$missing = @('vcruntime140.dll', 'msvcp140.dll') | Where-Object { -not (Test-Path (Join-Path $system $_)) }
+if ($missing) {
+    throw ("The Microsoft Visual C++ runtime is missing ($($missing -join ', ')). Install it with this one command, " +
+        "then run this script again: winget install --id Microsoft.VCRedist.2015+.x64 -e --silent " +
+        "(Windows may ask for permission once - click Yes).")
 }
 
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("thor-install-" + [System.Guid]::NewGuid().ToString('N'))
@@ -77,6 +94,11 @@ try {
 
     Write-Host "Setting up..."
     & (Join-Path $dest 'install.exe')
+    # A native program that fails does not stop a script by itself, and the
+    # "Done" below would then be a lie.
+    if ($LASTEXITCODE -ne 0) {
+        throw "THOR's setup stopped (exit code $LASTEXITCODE). Read the lines above this one, fix what they name, and run this script again."
+    }
 
     Write-Host ""
     Write-Host "Done. Restart Claude Code so it picks up the memory server."

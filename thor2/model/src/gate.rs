@@ -2955,9 +2955,11 @@ pub fn retract(entity_id: &str, answers_recorded: bool) -> Result<(), Refusal> {
         format!(
             "raise those questions with him in plain language (how replies should read, which \
              lanes he wants, which starting rules to keep, whether he wants a project marker), \
-             apply what he chooses where it belongs, then store what he chose as '{}' - a Report \
-             with no scope is enough, this id needs none, and \"he does not want any of this\" is \
-             itself a valid answer to record. Only then does retracting '{}' go through",
+             apply what he chooses where it belongs - the defaults when he does not engage: short \
+             replies, his own language, work lane only, every starting note kept, no waiting - \
+             then store what applies as '{}' - a Report with no scope is enough, this id needs \
+             none, and \"he does not want any of this\" is itself a valid answer to record. Only \
+             then does retracting '{}' go through",
             crate::store::OWNER_SETUP_ANSWERS_ID,
             crate::store::SETUP_NOTE_ID
         ),

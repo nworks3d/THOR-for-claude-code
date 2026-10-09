@@ -2630,12 +2630,16 @@ fn setup_debt(store: &EventStore) -> Option<String> {
     model::store::show(store, model::store::SETUP_NOTE_ID).ok()?;
     Some(format!(
         "[THOR] This memory was just installed and its owner has not been walked through setup \
-         yet. Before anything else: raise the questions in AGENTS.md's \"First session with a \
-         new owner\" section with him, in plain language, and apply his answers where they \
-         belong. Then store what he chose as '{}' (a Report with no scope is enough - this id \
-         needs none, so do not ask him to name a collection for it) and retract '{}'. \"He does \
-         not want any of this\" is itself a valid answer - write that down and this still \
-         clears. Two things settle it: his answers on record, and the note retracted.",
+         yet. Before anything else, tell him in ONE sentence that THOR is on with these defaults: \
+         short plain replies, in his own language, the work lane only (nothing personal goes \
+         into it), all the starting notes kept (any can be removed on his word), and each \
+         project named after its folder. Do not ask him to choose: apply the defaults without \
+         waiting for an answer and change only what he tells you to change. AGENTS.md's \"First \
+         session with a new owner\" section has the full questions for a person who wants to go \
+         through them. Then store what applies as '{}' (a Report with no scope is enough - this \
+         id needs none, so do not ask him to name a collection for it) and retract '{}'. \"He \
+         does not want any of this\" is itself a valid answer - write that down and this still \
+         clears. Two things settle it: the answers on record, and the note retracted.",
         model::store::OWNER_SETUP_ANSWERS_ID,
         model::store::SETUP_NOTE_ID
     ))
@@ -4359,6 +4363,26 @@ mod setup_debt_tests {
         assert!(reason.contains(model::store::OWNER_SETUP_ANSWERS_ID), "{reason}");
         assert!(reason.contains(model::store::SETUP_NOTE_ID), "{reason}");
         assert!(reason.to_lowercase().contains("does not want"), "{reason}");
+    }
+
+    /// THE DEFECT THIS CLOSES (zero-touch install, 2026-10-09): the session
+    /// that holds this debt is the first one AFTER the restart, and it is
+    /// usually a fresh agent that never read AGENTS.md. A message that only
+    /// points at a page it cannot open leaves that agent asking the person
+    /// questions they never signed up for, or stuck. The reminder itself must
+    /// carry the defaults and say they apply without waiting.
+    #[test]
+    fn the_debt_carries_the_defaults_so_a_session_without_the_page_can_finish() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        model::store::declare(&mut store, "s", "l", "a", &setup_note()).unwrap();
+
+        let reason = setup_debt(&store).expect("the note is live, so this must hold the turn");
+        let lowered = reason.to_lowercase();
+        for part in ["defaults", "one sentence", "replies", "language", "starting notes", "without waiting"] {
+            assert!(lowered.contains(part), "the setup reminder never mentions '{part}': {reason}");
+        }
     }
 
     /// Once the answers are on record and the note is retracted through the
