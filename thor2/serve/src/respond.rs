@@ -674,7 +674,7 @@ fn pattern_escaped(rule: &OptInRule, haystack_lower: &str) -> bool {
 // not checked.
 //
 // This file does no I/O of its own: the lookups are the caller's (see
-// `serve/src/bin/serve.rs`'s own `cited_line_exists` and `real_commits`).
+// `serve::evidence`, `cited_line_exists` and `real_commits`: the Stop hook and the sweep use the same two).
 
 /// How the caller looks evidence up, handed in because this file does no I/O.
 pub struct EvidenceLookup<'a> {

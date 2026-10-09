@@ -88,7 +88,7 @@ const MAX_ROW_BYTES: usize = 48 * 1024;
 /// The first read of a transcript file reaches back this far at most.
 pub const FIRST_READ_BYTES: u64 = 8 * 1024 * 1024;
 /// What one Stop spends reading transcripts for the corpus.
-pub const STOP_BUDGET_MS: u64 = 1_500;
+pub const STOP_BUDGET_MS: u64 = 1_000;
 
 /// A reply is cut here (and marked `cut`; a cut reply is never replayed).
 pub const REPLY_CLIP: usize = 24_000;
@@ -732,12 +732,14 @@ pub fn read_slice(
         if buf.last() != Some(&b'\n') {
             break; // a line still being written
         }
-        consumed += n as u64;
         lines += 1;
+        // The time ran out: this line was read but not used, so it is not
+        // consumed - the next read starts at it.
         if lines % 256 == 0 && deadline.is_some_and(|d| Instant::now() >= d) {
             slice.complete = false;
             break;
         }
+        consumed += n as u64;
         if n > MAX_LINE_BYTES {
             continue;
         }
@@ -1085,6 +1087,8 @@ pub fn record_files(
     let project_of = |dir: &Path| crate::project::resolve_project(dir);
     let mut lines: Vec<String> = Vec::new();
     let mut written: HashSet<String> = HashSet::new();
+    // A call older than the window is never written (a back-fill reads files that hold older ones).
+    let keep_from = now - KEEP_DAYS * 86_400;
     let mut changed = false;
     for file in files {
         if Instant::now() >= deadline {
@@ -1109,7 +1113,7 @@ pub fn record_files(
         // A call two transcripts both hold (a resumed session copies the lines
         // before it) is written once.
         let before = lines.len();
-        for row in slice.calls.iter().filter(|c| written.insert(c.id.clone())).chain(slice.patches.iter()) {
+        for row in slice.calls.iter().filter(|c| c.t >= keep_from && written.insert(c.id.clone())).chain(slice.patches.iter()) {
             if let Ok(line) = serde_json::to_string(row) {
                 lines.push(line);
             }

@@ -450,3 +450,21 @@ fn the_stop_stamps_each_call_with_the_build_that_recorded_it_and_a_back_fill_doe
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].b, "", "a call read back from a transcript has no known engine");
 }
+
+#[test]
+fn a_read_that_runs_out_of_time_loses_no_call_and_the_next_read_starts_where_it_stopped() {
+    let fx = Fx::new();
+    let lines: Vec<String> = (0..600).map(|i| use_line(&format!("toolu_{i:04}"), "Bash", json!({"command": format!("echo {i}")}), 1_000 - i)).collect();
+    fx.write(&lines);
+    let project_of: &dyn Fn(&Path) -> Option<String> = &demo_project;
+    let ctx = ctx(project_of);
+    let first = corpus::read_slice(&fx.transcript(), 0, u64::MAX, Some(std::time::Instant::now()), &ctx, None).unwrap();
+    assert!(!first.complete, "the time was already up");
+    assert!(first.calls.len() < 600, "{} calls", first.calls.len());
+    let second = corpus::read_slice(&fx.transcript(), first.end, u64::MAX, None, &ctx, first.project.clone()).unwrap();
+    assert!(second.complete);
+    let mut ids: Vec<String> = first.calls.iter().chain(second.calls.iter()).map(|c| c.id.clone()).collect();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), 600, "every call exactly once: {} + {}", first.calls.len(), second.calls.len());
+}
