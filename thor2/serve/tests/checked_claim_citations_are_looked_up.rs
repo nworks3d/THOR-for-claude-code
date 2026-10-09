@@ -73,6 +73,21 @@ fn a_citation_of_a_real_line_under_the_working_directory_counts() {
     assert!(!blocked(&out), "an absolute path under the working directory must count: {out}");
 }
 
+/// A Windows short (8.3) name such as `C:\Users\RUNNER~1\AppData\Local\Temp` is
+/// how a CI runner's temp directory is spelled: the `~` is part of the path, so
+/// an absolute citation through it must be read whole (it was cut at the `~`).
+#[test]
+fn a_citation_through_a_tilde_directory_is_read_whole() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (db, _work) = fixture(tmp.path());
+    let work = tmp.path().join("RUNNER~1");
+    std::fs::create_dir_all(work.join("src")).unwrap();
+    std::fs::write(work.join("src").join("lib.rs"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
+    let absolute = format!("Verified: {}:5 has the fix.", work.join("src").join("lib.rs").display());
+    let out = run_hook(&db, &stop(Some(&work), &absolute));
+    assert!(!blocked(&out), "an absolute path with a ~ in it must count: {out}");
+}
+
 #[test]
 fn a_citation_nobody_could_have_opened_is_held_and_named() {
     let tmp = tempfile::tempdir().unwrap();

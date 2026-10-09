@@ -762,7 +762,7 @@ fn contains_commit_sha(haystack_lower: &str) -> bool {
 }
 
 /// A `path:line` citation anywhere in the text: one or more path-shaped
-/// characters (letters, digits, `_ . / \ -`), a short alphanumeric
+/// characters (letters, digits, `_ . / \ ~ -`), a short alphanumeric
 /// extension, then `:` and a run of digits - `server/public/dashboard.html:42`,
 /// `gate.rs:610`. Deliberately a SHAPE check rather than the fixed,
 /// hand-enumerated extension list `checked-claim-needs-evidence`'s own
@@ -772,7 +772,7 @@ fn contains_commit_sha(haystack_lower: &str) -> bool {
 /// the existing fixed list stays exactly as it was.
 fn path_line_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"[a-z0-9_./\\-]+\.[a-z0-9]{1,8}:\d+").unwrap())
+    RE.get_or_init(|| Regex::new(r"[a-z0-9_./\\~-]+\.[a-z0-9]{1,8}:\d+").unwrap())
 }
 
 /// One `none_of_patterns` name resolved against the haystack. An
@@ -865,7 +865,7 @@ const MAX_LINE_LOOKUPS: usize = 24;
 /// whole.
 fn citation_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)(?:\b[a-z]:)?[a-z0-9_./\\-]+\.[a-z0-9]{1,8}:\d+").unwrap())
+    RE.get_or_init(|| Regex::new(r"(?i)(?:\b[a-z]:)?[a-z0-9_./\\~-]+\.[a-z0-9]{1,8}:\d+").unwrap())
 }
 
 /// "line 3", "lines 3-9", "regel 4", "regels 4 tot 9": the number a line
@@ -879,7 +879,7 @@ fn line_reference_regex() -> &'static Regex {
 /// shape without its `:line`.
 fn file_name_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)(?:\b[a-z]:)?[a-z0-9_./\\-]*[a-z0-9_]\.[a-z0-9]{1,8}\b").unwrap())
+    RE.get_or_init(|| Regex::new(r"(?i)(?:\b[a-z]:)?[a-z0-9_./\\~-]*[a-z0-9_]\.[a-z0-9]{1,8}\b").unwrap())
 }
 
 /// What a reply's evidence turned out to prove.

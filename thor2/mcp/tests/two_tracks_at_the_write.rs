@@ -131,10 +131,12 @@ fn r8_3_an_unregistered_projects_file_check_is_refused_inside_it_and_a_note_else
     let mut inside = Mcp::start(&db, &gamma);
     let reply = inside.call("remember", args.clone());
     println!("R8.3 inside: {reply}");
-    assert!(
-        reply.starts_with("REFUSED: THOR cannot try this file check: 'gamma' has no registered working copy. Run this from inside the checkout: install.exe --register-root --db \""),
-        "{reply}"
+    // The product names the installer of the OS it runs on: install.exe on Windows, install elsewhere.
+    let installer = if cfg!(windows) { "install.exe" } else { "install" };
+    let expected = format!(
+        "REFUSED: THOR cannot try this file check: 'gamma' has no registered working copy. Run this from inside the checkout: {installer} --register-root --db \""
     );
+    assert!(reply.starts_with(&expected), "{reply}");
     assert!(reply.contains("then write this again"), "{reply}");
     drop(inside);
 
