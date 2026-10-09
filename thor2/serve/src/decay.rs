@@ -53,6 +53,14 @@
 //! a mark of usefulness still clears every noise mark recorded before it. A
 //! serving count decides nothing.
 //!
+//! TWO LIMITS ADDED LATER (found on a live rule, 2026-10-09). A noise mark
+//! judged the version served when it was given, so a revision that changes the
+//! rule's text, check or bindings clears the marks before it
+//! (`usefulness::noise_since_last_change`). And a rule whose check can refuse
+//! (`sweep::can_refuse`) is never retired from showing: the write guard
+//! refuses with it regardless, and a refusal must not come from a rule the
+//! user is never shown.
+//!
 //! WHAT THAT LAST SENTENCE USED TO SAY, AND THE DEFECT IT CARRIED. Until
 //! 2026-08-08 one mark of usefulness made an item immortal: `is_stale`
 //! returned false forever after it, and no operation anywhere undoes a
@@ -105,10 +113,17 @@ impl DecayContext {
         // Deliberately does NOT fold the serving history any more: a serving
         // count decides nothing here, so loading it on every hook call would
         // be work done to reach a number nobody reads.
-        DecayContext {
-            ever_marked_useful: crate::usefulness::ever_marked_useful(store),
-            noise: crate::usefulness::noise_since_last_useful(store),
+        let mut noise = crate::usefulness::noise_since_last_useful(store);
+        // A verdict judged the version it was given on. Only an id that
+        // already sits at the threshold can change the answer, so only those
+        // pay for a look at their own revisions.
+        for (id, count) in noise.iter_mut() {
+            if *count < NOISE_MARKS_BEFORE_STALE {
+                continue;
+            }
+            *count = crate::usefulness::noise_since_last_change(store, id);
         }
+        DecayContext { ever_marked_useful: crate::usefulness::ever_marked_useful(store), noise }
     }
 
     /// Was this item ever marked useful? Exposed so `status` can report the
@@ -156,6 +171,12 @@ impl DecayContext {
     /// something that still has to earn its place.
     pub fn is_stale(&self, item: &Item) -> bool {
         if item.bindings.iter().any(|b| matches!(b, Binding::Always)) {
+            return false;
+        }
+        // A rule whose check can refuse is never hidden. The write guard
+        // refuses with it whether or not decay shows it, so hiding it would
+        // mean a refusal from a rule the user is never shown.
+        if crate::sweep::can_refuse(item) {
             return false;
         }
         // Deliberately NOT "was it ever marked useful". That form made one
@@ -318,6 +339,121 @@ mod tests {
             judged("i1", &verdicts).is_stale(&bound("i1")),
             "a verdict from before must not outrank one made later with better information"
         );
+    }
+
+    /// A rule stored for real, so its revisions are on the log in order.
+    fn stored_rule(store: &mut EventStore, id: &str, text: &str, check: Option<model::item::Check>) -> Item {
+        let mut item = item_of(id, vec![Binding::Moment(intent::Action::Commit)]);
+        item.text = text.to_string();
+        item.falsifier = Some("it stops being true".to_string());
+        item.check = check;
+        model::store::declare(store, "t", "t", "t", &item).expect("fixture must store");
+        item
+    }
+
+    /// A revision written raw, as an older binary could have written it: the
+    /// write gate's own view of the change is not what is under test here.
+    fn revise_raw(store: &mut EventStore, item: &Item) {
+        let body = serde_json::to_string(item).unwrap();
+        store.append_mutate_checked("s", "l", "a", thor_core::event_store::EventKind::FactRevised, &item.id, None, &body).unwrap();
+    }
+
+    fn noise_n(store: &mut EventStore, id: &str, n: usize) {
+        for i in 0..n {
+            let at = format!("2026-09-{:02}T00:00:00Z", i + 1);
+            crate::mark::record_noise(store, "s", "l", "a", &at, id, None).unwrap();
+        }
+    }
+
+    /// The control: nothing changes the rule, so two noise marks still retire
+    /// a plain note. Fix 1 must not weaken decay for an unrevised note.
+    #[test]
+    fn an_unrevised_plain_note_with_two_noise_marks_still_decays() {
+        let mut store = EventStore::in_memory().unwrap();
+        let item = stored_rule(&mut store, "plain", "a plain note", None);
+        noise_n(&mut store, "plain", NOISE_MARKS_BEFORE_STALE);
+        assert!(DecayContext::load(&store).is_stale(&item));
+    }
+
+    /// THE LIVE CASE (mechanische-agentbrief-verbiedt-subagenten): two noise
+    /// marks judged an OLD text; the rule was then rewritten. The verdict
+    /// judged the old version, so it must not retire the new one.
+    #[test]
+    fn noise_marks_from_before_a_text_revision_do_not_count() {
+        let mut store = EventStore::in_memory().unwrap();
+        let mut item = stored_rule(&mut store, "rewritten", "the old text", None);
+        noise_n(&mut store, "rewritten", NOISE_MARKS_BEFORE_STALE);
+        assert!(DecayContext::load(&store).is_stale(&item), "fixture sanity: retired before the revision");
+        item.text = "a better text".to_string();
+        revise_raw(&mut store, &item);
+        assert!(!DecayContext::load(&store).is_stale(&item), "a verdict on the old text retired the new one");
+        // Noise on the NEW version counts again, from zero.
+        noise_n(&mut store, "rewritten", NOISE_MARKS_BEFORE_STALE);
+        assert!(DecayContext::load(&store).is_stale(&item));
+    }
+
+    #[test]
+    fn noise_marks_from_before_a_check_or_binding_change_do_not_count() {
+        let mut store = EventStore::in_memory().unwrap();
+        let mut item = stored_rule(&mut store, "gains-teeth", "same text", None);
+        noise_n(&mut store, "gains-teeth", NOISE_MARKS_BEFORE_STALE);
+        item.bindings = vec![Binding::Moment(intent::Action::Push)];
+        revise_raw(&mut store, &item);
+        assert!(!DecayContext::load(&store).is_stale(&item), "a binding change must clear older verdicts");
+
+        let mut store = EventStore::in_memory().unwrap();
+        let mut item = stored_rule(&mut store, "gains-check", "same text", None);
+        noise_n(&mut store, "gains-check", NOISE_MARKS_BEFORE_STALE);
+        item.check = Some(model::item::Check::Forbidden { literals: vec!["--force".to_string()] });
+        revise_raw(&mut store, &item);
+        // Compare through a plain note's own view: the count itself, not the
+        // refusing-rule exemption (which the next test covers).
+        let mut as_note = item.clone();
+        as_note.check = None;
+        assert!(!DecayContext::load(&store).is_stale(&as_note), "a check change must clear older verdicts");
+    }
+
+    /// A revision that changes neither text, check nor bindings (a tag, a
+    /// severity, the falsifier) judged the same rule: the verdicts stand.
+    #[test]
+    fn a_revision_that_changes_only_tags_keeps_the_verdicts() {
+        let mut store = EventStore::in_memory().unwrap();
+        let mut item = stored_rule(&mut store, "retagged", "same text", None);
+        noise_n(&mut store, "retagged", NOISE_MARKS_BEFORE_STALE);
+        item.tags = vec!["housekeeping".to_string()];
+        revise_raw(&mut store, &item);
+        assert!(DecayContext::load(&store).is_stale(&item));
+    }
+
+    /// FIX 2: a rule whose check can refuse is never retired from showing,
+    /// however many noise marks it has. The guard refuses with it whether or
+    /// not decay hides it, so hiding it means a refusal from a rule the user
+    /// is never shown.
+    #[test]
+    fn a_rule_whose_check_can_refuse_never_decays() {
+        for check in [
+            model::item::Check::Forbidden { literals: vec!["--force".to_string()] },
+            model::item::Check::Requires { when: "Agent".to_string(), required: vec!["model".to_string()] },
+            model::item::Check::Absent { path: "a.txt".to_string(), literal: "x".to_string() },
+            model::item::Check::AbsentAll { path: "a.txt".to_string(), literals: vec!["x".to_string()] },
+            model::item::Check::Contains { path: "a.txt".to_string(), literal: "x".to_string() },
+        ] {
+            let mut item = bound("armed");
+            item.check = Some(check.clone());
+            assert!(
+                !called_noise("armed", NOISE_MARKS_BEFORE_STALE * 10).is_stale(&item),
+                "a refusing rule must stay shown: {check:?}"
+            );
+        }
+    }
+
+    /// A check that cannot refuse (a path_exists currency proof) is not an
+    /// exemption: that rule can only inform, and decay still applies.
+    #[test]
+    fn a_rule_whose_check_cannot_refuse_still_decays() {
+        let mut item = bound("informs");
+        item.check = Some(model::item::Check::PathExists { path: "a.txt".to_string() });
+        assert!(called_noise("informs", NOISE_MARKS_BEFORE_STALE).is_stale(&item));
     }
 
     #[test]

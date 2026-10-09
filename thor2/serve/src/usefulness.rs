@@ -750,6 +750,43 @@ pub fn noise_since_last_useful(store: &EventStore) -> HashMap<String, usize> {
     counts
 }
 
+/// `id`'s noise marks since its last mark of usefulness OR its last revision
+/// that changed what the rule says: its text, its check or its bindings.
+///
+/// WHY. A verdict judges the version that was served when it was given.
+/// `mechanische-agentbrief-verbiedt-subagenten` was called noise twice as a
+/// plain note, then gained a refusing check and about eight rewrites, and
+/// decay kept hiding it for the two old verdicts. A revision that changes none
+/// of those three (a tag, a severity, the falsifier) judged the same rule, so
+/// it clears nothing.
+///
+/// One entity's own events only, so the caller pays for it only for the few
+/// ids that already sit at the threshold. A body that does not parse is
+/// skipped and clears nothing.
+pub fn noise_since_last_change(store: &EventStore, id: &str) -> usize {
+    let Ok(events) = store.get_events_by_entity(id) else { return 0 };
+    let mut noise = 0usize;
+    let mut before: Option<model::item::Item> = None;
+    for event in events {
+        match event.kind {
+            EventKind::ItemMarkedUseful => noise = 0,
+            EventKind::ItemMarkedNoise => noise += 1,
+            EventKind::FactCreated | EventKind::FactRevised => {
+                let Ok(item) = model::store::parse_body(&event.body) else { continue };
+                let changed = before
+                    .as_ref()
+                    .is_some_and(|b| b.text != item.text || b.check != item.check || b.bindings != item.bindings);
+                if changed {
+                    noise = 0;
+                }
+                before = Some(item);
+            }
+            _ => {}
+        }
+    }
+    noise
+}
+
 // ------------------------------------------------------------------------
 // The evaluation debt (2026-09-12, trigger rewritten twice on 2026-09-16):
 // `bin/serve.rs`'s Stop hook, once per session, asks the owner to run the

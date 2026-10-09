@@ -588,8 +588,12 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
 - Refuse or change: it only informs; narrowing the rule is the fix.
 
 ### E7. Judging notes
-- What: the mark tool says whether a note belonged where it fired. Two "noise" marks in a row retire it
-  from every channel (it stays findable). A note you pinned is never asked about.
+- What: the mark tool says whether a note belonged where it fired. Two "noise" marks since the last useful
+  mark stop it from being shown at session start and before a tool call (it stays findable). Two limits:
+  a verdict judged the version it was given on, so a revision that changes the note's text, check or
+  bindings clears the earlier marks; and a rule whose check can refuse is never hidden this way, because
+  the guard refuses with it anyway and a refusal must not come from a rule you are never shown. A note
+  you pinned is never asked about.
 - Why: stale and misplaced notes should leave, not rot.
 - You notice: only inside the evaluation.
 - Refuse or change: you can mark or retract any time.

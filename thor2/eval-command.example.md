@@ -22,7 +22,9 @@ A useful mark is not a dead signal. The latest verdict is what counts:
 - a useful mark clears whatever noise came before it and resets the count to
   zero;
 - a noise mark after that counts again, on its own;
-- two noise marks since the last useful mark take a fact out of the
+- two noise marks since the last useful mark (and since its last change of
+  text, check or bindings; a rule whose check can refuse is never taken out)
+  take a fact out of the
   injection channels - it stays findable through lookup regardless.
 
 No Stop hook asks for a verdict on a single item any more (since THOR

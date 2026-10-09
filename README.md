@@ -283,8 +283,9 @@ at the right moment and hope. Version 2 is the same memory with a spine.
 - **Stale notes are hunted, not left to rot.** A note whose proof comes out
   false is reported instead of quietly going on being wrong. A note that keeps
   firing without anyone ever saying whether it belonged gets asked about, and
-  two verdicts of "this did not belong" retire it from every channel while
-  leaving it findable. In version 1 a note that went wrong simply stayed.
+  two verdicts of "this did not belong" stop it being shown while leaving it
+  findable (a rewrite of the note clears older verdicts, and a rule that can
+  refuse is never hidden this way). In version 1 a note that went wrong simply stayed.
 - **Crowding is visible and refused.** Only a few notes fit in a block, so notes
   compete. Version 2 counts that competition, tells you when you have just
   stored something onto a spot too crowded to ever show it, names what is

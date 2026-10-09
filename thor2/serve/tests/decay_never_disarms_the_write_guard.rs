@@ -22,8 +22,9 @@
 //! below). Decay only ever touches the INFORMATIONAL surfaces - session
 //! start, the per-prompt/per-action render, and their `why`/`check` previews
 //! - and the second test here confirms that half still works exactly as
-//! documented: the very same retired rule really does stop appearing in
-//! `serve why`. See `serve/src/decay.rs`'s own `retain_live` doc comment and
+//! documented: a plain note (no check that can refuse) really does stop
+//! appearing in `serve why`. A rule that CAN refuse no longer does (third
+//! test): it is never hidden, so no refusal comes from an unseen rule. See `serve/src/decay.rs`'s own `retain_live` doc comment and
 //! `serve/src/absent_guard.rs`'s own module doc comment for the two halves
 //! of this same invariant stated where the code lives, and `serve/tests/
 //! decay_is_decided_in_exactly_one_place.rs`'s own
@@ -89,6 +90,12 @@ fn run_why(db: &Path, cwd: &Path, file: &str) -> String {
 /// `absent_guard::anchor_is_current`). Returns the store path and the item's
 /// own id.
 fn fixture_with_secret_rule(dir: &Path) -> (std::path::PathBuf, String) {
+    fixture_rule(dir, true)
+}
+
+/// The same rule, with or without its check. Without one it is a plain note:
+/// it can only inform, so decay still applies to it.
+fn fixture_rule(dir: &Path, with_check: bool) -> (std::path::PathBuf, String) {
     let db = dir.join("thor.db");
     let mut store = thor_core::event_store::EventStore::new(&db).unwrap();
     std::fs::write(dir.join("notes.md"), "# notes\n").unwrap();
@@ -107,7 +114,8 @@ fn fixture_with_secret_rule(dir: &Path) -> (std::path::PathBuf, String) {
         expires: None,
         key: None,
         falsifier: Some("SECRET lands in notes.md and nobody notices".to_string()),
-        check: Some(model::item::Check::Absent { path: "notes.md".to_string(), literal: "SECRET".to_string() }),
+        check: with_check
+            .then(|| model::item::Check::Absent { path: "notes.md".to_string(), literal: "SECRET".to_string() }),
     };
     model::store::declare(&mut store, "s", "l", "a", &item).unwrap();
     (db, id)
@@ -151,15 +159,14 @@ fn two_noise_marks_since_the_last_useful_one_do_not_disarm_the_write_guard() {
 }
 
 /// THE OTHER HALF, so the first test is never mistaken for "decay simply
-/// never fires any more": the SAME two noise marks really do retire this
-/// item from the informational surface - `serve why`, run through the same
-/// compiled binary, exactly the way a person standing in `dir` would run it.
-/// Decay is real; it just never reaches the guard the first test just proved
-/// still blocks.
+/// never fires any more": the SAME two noise marks really do retire a plain
+/// note (one with no check that can refuse) from the informational surface -
+/// `serve why`, run through the same compiled binary, exactly the way a
+/// person standing in `dir` would run it.
 #[test]
-fn the_same_retired_rule_no_longer_appears_in_serve_why() {
+fn a_plain_note_twice_called_noise_no_longer_appears_in_serve_why() {
     let dir = tempfile::tempdir().unwrap();
-    let (db, id) = fixture_with_secret_rule(dir.path());
+    let (db, id) = fixture_rule(dir.path(), false);
 
     let before = run_why(&db, dir.path(), "notes.md");
     assert!(before.contains(&id), "fixture sanity: before any noise mark, why must list the rule: {before}");
@@ -169,6 +176,19 @@ fn the_same_retired_rule_no_longer_appears_in_serve_why() {
     let after = run_why(&db, dir.path(), "notes.md");
     assert!(
         !after.contains(&id),
-        "two noise marks since the last useful one must retire the rule from `serve why`: {after}"
+        "two noise marks since the last useful one must retire the note from `serve why`: {after}"
     );
+}
+
+/// Since 2026-10-09 a rule whose check can refuse is never retired from
+/// showing: the guard refuses with it whatever decay does, so a refusal must
+/// not come from a rule the user is never shown.
+#[test]
+fn a_rule_that_can_refuse_stays_in_serve_why_after_two_noise_marks() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, id) = fixture_with_secret_rule(dir.path());
+    mark_noise_twice(&db, &id);
+
+    let after = run_why(&db, dir.path(), "notes.md");
+    assert!(after.contains(&id), "a rule that can refuse must stay shown: {after}");
 }
