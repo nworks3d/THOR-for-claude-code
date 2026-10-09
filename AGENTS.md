@@ -586,10 +586,13 @@ Around a risky step or a tool:
 - `rehearse-destructive-steps-on-a-copy` - a delete, migration or deploy is tried on
   a throwaway copy first; never test a write path against live data.
 - `pin-a-dependency-with-its-reason` - a version pin carries a comment saying why.
+- `orchestrator-mode-saves-quota` - on by default: the strongest model answers
+  questions, judges and checks, cheaper models do the real work in helper agents,
+  a trivial one-step task is done directly, and with no strongest model on the plan
+  the best available one steers.
 - `an-agent-brief-stands-alone` - goal, absolute working folder, files it may touch,
-  no further agents, an explicit model, what to report back.
-- `parallel-agents-do-not-share-a-folder` - own folder or worktree and own build
-  directory per agent; one agent commits.
+  no further agents, what is already known, one narrow task with a stop point, a short
+  report; parallel agents get their own folder or worktree, and one agent commits.
 - `absolute-paths-not-the-shell-working-directory` - absolute paths in every command
   and every brief.
 - `script-file-not-shell-quoting` - text with quotes or backslashes goes in a script
@@ -795,49 +798,59 @@ fire - never one that only ever showed up during other, unrelated work. Answer
 for one and this session will not ask about that same note again, however many
 more times it fires before the session ends.
 
-## When THOR finds a bug in itself
+## When THOR finds a bug in itself (the co-tester section)
 
-Now and then the first message of a session opens with "THOR may have found a
-bug in ITSELF". It is a nudge: it holds nothing, it is not part of what the
-owner asked, and it comes once per session with at most one candidate.
+THOR is still young, so the people who use it are also its testers. Now and
+then the first message of a session opens with "THOR may have found a bug in
+ITSELF". It is a nudge: it holds nothing, it is not part of what the person asked,
+and it comes once per session with at most one candidate.
 
-**What it means.** THOR watches its own signals - a report refused as version
-skew, a hook Claude Code could not start, a start note that had to leave an item
-out - and keeps the ones that point at THOR and not at the owner's rules. The
-nudge hands you one, with a write-up already drafted for the public THOR
-repository and already stripped of paths, project names, hosts, addresses, user
-names and secrets.
+**What gets reported, in plain words.** Only mistakes in THOR itself: a program
+that would not start, a report THOR refused for its own reasons, a starting note
+THOR's own gate turned away. Never the person's work, their notes or their rules.
+The text that would be sent is written in English so the makers can read it, and
+it has had everything private taken out: file paths, project and folder names,
+computer and user names, addresses, keys and passwords. THOR checks that again
+and warns you if it is not sure.
 
 **What to do, in order.**
 1. Read the write-up once more and remove anything private that is left.
-2. Ask the owner in plain words: "THOR found a bug in itself. May I open an
-   issue about it in the public THOR repository? The text is above."
-   Nothing is sent without a yes typed in the chat, each time.
-3. After the yes, run `gh issue create --repo <the repository the nudge names>
-   --title "<title>" --body-file <file with the body>`. Without `gh`, give the
-   owner the text and the address the nudge names.
+2. When what the person asked is at a stopping point, ask them ONE question, in
+   their own language, with the exact full text that would be sent shown above
+   it. The question must say what THOR found, that the text shown is exactly what
+   would be sent, what was taken out (paths, project and folder names, computer
+   and user names, addresses, keys and passwords), that nothing is sent without
+   their yes, and that saying no is fine. In Dutch, for example: "THOR vond een
+   fout in zichzelf. Hieronder staat precies wat ik naar de makers zou sturen;
+   namen, paden, adressen en wachtwoorden zijn eruit gehaald, er gaat niets
+   anders mee. Mag ik het versturen? Nee zeggen kan gewoon." Ask for nothing but
+   yes or no. Never ask them to type, copy or edit anything.
+3. After a yes: when `gh auth status` succeeds, run `gh issue create --repo
+   nworks3d/THOR-memory-bible-for-AI --title "<title>" --body-file <file with the
+   body>`. Otherwise open `https://github.com/nworks3d/THOR-memory-bible-for-AI/issues/new?title=<title>&body=<body>`
+   in their browser (title and body URL-encoded, the whole address within about
+   7,000 characters; cut a longer body and end it with "(shortened)"), so they only
+   have to click Submit. After a no, send nothing.
 4. Record what happened, so THOR stops raising it:
    `remember(id: "thor-bug-<fingerprint>", kind: "report", text: "OUTCOME for
-   <fingerprint> (<what it was>): opened <address>", tags:
+   <fingerprint> (<what it was>): opened <address> | owner declined", tags:
    ["thor-bug:<fingerprint>"])`. The nudge gives you this call with the
    fingerprint filled in. It needs no project.
 
 **When it is done.** The `remember` call was accepted. A candidate nobody
-recorded comes back once, a day later, and then no more.
+recorded comes back once, a day later, and then no more. A candidate left by an
+earlier build of THOR is closed by the next install and never offered: only new
+evidence from the build that is running can raise one.
 
-**Example.** The nudge says a hook failed to start with exit code 126. You ask
-the owner, they say yes, `gh issue create` prints an address, and you record
-`OUTCOME for hook-launch-1a2b3c4d (hook could not start): opened <address>`.
-
-**On a development setup the same text says "this is a test environment".**
-`install` decides this itself: a mode `release` only when the programs came out
-of a release archive, `test` for a build from a checkout. In test mode you push
-nothing: you say "normally I would push this to the THOR repo", show the finished
-write-up to the owner, and record the outcome as "shown to the owner, not pushed
-(test environment)". To change the mode: `install --set-mode release` or
-`install --set-mode test`, always with `--db "<their store>"`. Without a mode
-on record THOR offers nothing, so a store made before this existed stays quiet
-until `install` has run once more.
+**The default is release, on every build.** A plain install, a source build
+included, writes mode `release`: you ask, and you file after the yes. Only the
+owner's own development machine runs `install --set-mode test --db "<their
+store>"`; there the same text carries one more paragraph saying this is a test
+environment. In test mode you push nothing: you say "normally I would push this
+to the THOR repo", show the finished write-up to the owner, and record the outcome
+as "shown to the owner, not pushed (test environment)". A store with no mode on
+record offers nothing, so a store made before this existed stays quiet until
+`install` has run once more.
 
 ## If you are talking to a remote copy
 

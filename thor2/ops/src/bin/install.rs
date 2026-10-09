@@ -107,9 +107,9 @@ struct Cli {
     /// the agent, to be written up for the public THOR repository. In
     /// `release` the agent asks you for a go and then opens the issue; in
     /// `test` (a development setup) it only shows the write-up to you and
-    /// pushes nothing. A normal install picks the mode itself: `release`
-    /// when the programs came out of a release archive, `test` otherwise,
-    /// and it never changes a mode already set. Needs --db.
+    /// pushes nothing. A normal install picks `release` on every build,
+    /// source builds included, and never changes a mode already set; only
+    /// this flag makes `test`. Needs --db.
     #[arg(
         long = "set-mode",
         value_name = "MODE",
@@ -480,26 +480,27 @@ fn main() -> ExitCode {
 
     // 1a. The mode of the bug nudge: THOR finds some of its own bugs and offers
     // one per session to the agent to be written up for the public THOR
-    // repository (`serve::thor_bugs`). `release` only when the programs came
-    // out of a release archive; a build from a checkout is `test`, which
-    // publishes nothing. A mode already set is kept.
-    {
-        let bin_dir = serve_exe.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
-        match ops::install::settle_mode(&db, &bin_dir, None) {
-            Ok((mode, how)) => {
-                let word = serve::thor_bugs::mode_word(mode);
-                match how {
-                    ops::install::ModeHow::Kept => println!("= bug nudge mode already '{word}' (left untouched)"),
-                    ops::install::ModeHow::ReleaseArchive => println!(
-                        "+ bug nudge mode 'release': these programs came from a release archive, so THOR may offer to write up a bug it finds in itself - nothing is sent without your yes"
-                    ),
-                    _ => println!(
-                        "+ bug nudge mode '{word}': these programs were not made from a release archive, so a bug THOR finds in itself is only shown to you, never sent (change it with install --set-mode release|test --db <memory>)"
-                    ),
-                }
+    // repository (`serve::thor_bugs`). The default is `release` on every
+    // build; only `install --set-mode test` makes the owner's test mode,
+    // which publishes nothing. A mode already set is kept.
+    // Whatever an earlier build left as a candidate is closed by this install:
+    // only new evidence from this build may raise one (`retire_old_evidence`).
+    let retired = serve::thor_bugs::retire_old_evidence_at(&db);
+    if retired > 0 {
+        println!("= {retired} older bug candidate(s) closed: they came from an earlier build");
+    }
+    match ops::install::settle_mode(&db, None) {
+        Ok((mode, how)) => {
+            let word = serve::thor_bugs::mode_word(mode);
+            match how {
+                ops::install::ModeHow::Kept => println!("= bug nudge mode already '{word}' (left untouched)"),
+                ops::install::ModeHow::Default => println!(
+                    "+ bug nudge mode 'release': if THOR finds a bug in itself, your assistant may offer to report it to the makers - it shows you the exact text first, and nothing is sent without your yes"
+                ),
+                ops::install::ModeHow::Told => println!("+ bug nudge mode '{word}'"),
             }
-            Err(e) => println!("  ! could not write the bug nudge mode: {e}"),
         }
+        Err(e) => println!("  ! could not write the bug nudge mode: {e}"),
     }
 
     // 1b. The response-guard rulebook beside it: what gives the `Stop` hook

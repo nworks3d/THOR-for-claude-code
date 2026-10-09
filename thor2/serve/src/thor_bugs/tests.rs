@@ -401,7 +401,7 @@ fn the_test_nudge_says_it_is_a_test_environment_and_the_release_nudge_does_not()
         let text = nudge_for_session(&fx.db, "s1", T0).unwrap();
         assert_eq!(text.contains("THIS IS A TEST ENVIRONMENT"), test_env, "{text}");
         assert_eq!(text.contains("normally I would push this to the THOR repo"), test_env);
-        assert!(text.contains("May I open an issue"), "the go is asked for in both: {text}");
+        assert!(text.contains("THOR vond een fout in zichzelf") && text.contains("saying no is fine"), "the one question is in both: {text}");
         assert!(text.contains("TITLE: ") && text.contains("**Expected:**"), "{text}");
     }
 }
@@ -439,4 +439,46 @@ fn the_doctor_line_says_the_mode_and_the_counts() {
     add(&db, hook_launch_finding("Stop", 126));
     let line = doctor_line(&db).unwrap();
     assert!(line.contains("mode test") && line.contains("1 new, 0 presented, 0 reported, 0 resolved"), "{line}");
+}
+
+// ---------------------------------------------------- an install closes old evidence
+
+#[test]
+fn an_install_closes_every_older_candidate_and_only_new_evidence_raises_one_again() {
+    let mut fx = Fx::new();
+    // The evidence an earlier build left in the log, and the candidates it made.
+    two_bugs(&mut fx);
+    write_mode(&fx.db, Mode::Release).unwrap();
+    let old_build = "2.5.0 (build old)";
+    let mut book = Book::default();
+    scan(&fx.db, &fx.store, &mut book, T0, old_build);
+    assert_eq!(book.candidates.len(), 2, "the old build found both");
+    book.candidates[1].status = Status::Presented;
+    save(&fx.db, &book);
+
+    // The install of the new build: it closes both and moves the watermark past the old log.
+    let mut book = load(&fx.db);
+    let head = fx.store.get_next_seq().unwrap() - 1;
+    assert_eq!(retire_old_evidence(&mut book, head, "2.5.0 (build new)"), 2);
+    assert!(book.candidates.iter().all(|c| c.status == Status::Resolved && c.resolved_by_upgrade));
+    assert_eq!(book.scanned_seq, head);
+    save(&fx.db, &book);
+    assert!(nudge_for_session(&fx.db, "s1", T0 + 10_000).is_none(), "old evidence is not nudged");
+
+    // The same fault, logged again AFTER the install: the new build raised it, so it is offered.
+    fx.hook_fault("toolu-2", "SessionStart", 126, false);
+    let text = nudge_for_session(&fx.db, "s2", T0 + 20_000).expect("new evidence from the new build");
+    assert!(text.contains("hook-launch"), "{text}");
+}
+
+#[test]
+fn an_install_leaves_a_reported_candidate_and_one_its_own_build_found() {
+    let mut book = Book::default();
+    upsert(&mut book, hook_launch_finding("Stop", 126), T0, "2.5.0 (build old)");
+    upsert(&mut book, hook_launch_finding("SessionStart", 66), T0, "2.5.0 (build new)");
+    upsert(&mut book, hook_panic_finding("hook", "serve/src/live.rs:3"), T0, "2.5.0 (build old)");
+    book.candidates[2].status = Status::Reported;
+    assert_eq!(retire_old_evidence(&mut book, 50, "2.5.0 (build new)"), 1);
+    let statuses: Vec<Status> = book.candidates.iter().map(|c| c.status).collect();
+    assert_eq!(statuses, vec![Status::Resolved, Status::New, Status::Reported]);
 }

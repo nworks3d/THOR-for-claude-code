@@ -37,7 +37,7 @@
 //! offered once more after a day, then left alone.
 //!
 //! MODE. `thor-mode.json` beside the store says `release` or `test`
-//! (`install --mode`). With no file, nothing is offered at all: THOR never
+//! (`install --set-mode`; a plain install writes `release`). With no file, nothing is offered at all: THOR never
 //! guesses that it may talk about publishing.
 //!
 //! Best effort like every sidecar here: a file that cannot be read or written
@@ -425,6 +425,10 @@ pub struct Candidate {
     pub presented_unix: Option<i64>,
     #[serde(default)]
     pub presentations: u32,
+    /// Closed because an upgrade came after the evidence (`retire_old_evidence`);
+    /// only a NEW sighting by the new build reopens it.
+    #[serde(default)]
+    pub resolved_by_upgrade: bool,
 }
 
 /// The whole sidecar.
@@ -472,10 +476,11 @@ pub fn upsert(book: &mut Book, finding: Finding, now: i64, version: &str) -> boo
     if let Some(known) = book.candidates.iter_mut().find(|c| c.fingerprint == fingerprint) {
         known.last_seen = now;
         known.seen = known.seen.saturating_add(1);
-        if known.status == Status::Resolved && known.version != version {
+        if known.status == Status::Resolved && (known.version != version || known.resolved_by_upgrade) {
             known.status = Status::New;
             known.presented_unix = None;
             known.presentations = 0;
+            known.resolved_by_upgrade = false;
         }
         known.version = version.to_string();
         known.finding = finding;
@@ -491,8 +496,41 @@ pub fn upsert(book: &mut Book, finding: Finding, now: i64, version: &str) -> boo
         status: Status::New,
         presented_unix: None,
         presentations: 0,
+        resolved_by_upgrade: false,
     });
     true
+}
+
+/// THE FIRST THING AN INSTALL DOES TO THE CANDIDATES. Evidence logged up to
+/// `head` was left by the builds that ran before this one, so a candidate
+/// that is still new or presented and was last seen by another build is
+/// closed as resolved by the upgrade, and the scan watermark moves to `head`:
+/// the log before this install is never read as evidence of the new build. A
+/// candidate that already has a recorded outcome, and one the current build
+/// itself found, stay as they are. Only a sighting AFTER this (`upsert` by
+/// the new build) can raise one again. Returns how many were closed.
+pub fn retire_old_evidence(book: &mut Book, head: i64, version: &str) -> usize {
+    let mut closed = 0;
+    for c in &mut book.candidates {
+        if matches!(c.status, Status::New | Status::Presented) && c.version != version {
+            c.status = Status::Resolved;
+            c.resolved_by_upgrade = true;
+            closed += 1;
+        }
+    }
+    book.scanned_seq = book.scanned_seq.max(head);
+    closed
+}
+
+/// `retire_old_evidence` on the sidecar beside `db`, as the installer calls it.
+/// Best effort: no store to open, nothing retired.
+pub fn retire_old_evidence_at(db: &Path) -> usize {
+    let Ok(store) = crate::store_dir::open_existing(db) else { return 0 };
+    let head = store.get_next_seq().map(|n| n - 1).unwrap_or(0);
+    let mut book = load(db);
+    let closed = retire_old_evidence(&mut book, head, &version_text());
+    save(db, &book);
+    closed
 }
 
 /// Record one finding at once, from a caller that knows the store (the

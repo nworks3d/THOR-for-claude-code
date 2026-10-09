@@ -1,42 +1,31 @@
-//! Proof of the mode the bug nudge runs in (`serve::thor_bugs`): `release`
-//! only for an install made from a release archive, `test` for everything
-//! else, never flipped by a second install, and settable on its own with
-//! `install --set-mode`.
+//! Proof of the mode the bug nudge runs in (`serve::thor_bugs`): `release` by
+//! default on EVERY build (a source build included), `test` only through an
+//! explicit `install --set-mode test`, never flipped by a second install.
 //!
 //! The CLI runs with HOME, USERPROFILE and LOCALAPPDATA pointed at a
 //! throwaway folder, like the other install tests.
 
-use ops::install::{settle_mode, ModeHow, RELEASE_MARKER};
+use ops::install::{settle_mode, ModeHow};
 use serve::bug_report::Mode;
 use serve::thor_bugs::read_mode;
 use std::path::Path;
 use std::process::{Command, Output};
 
 #[test]
-fn an_archive_with_the_release_marker_installs_release_and_anything_else_installs_test() {
+fn the_default_is_release_on_every_build_and_a_release_marker_changes_nothing() {
     let store = tempfile::tempdir().unwrap();
     let db = store.path().join("thor.db");
-    let bin = tempfile::tempdir().unwrap();
-    assert_eq!(settle_mode(&db, bin.path(), None).unwrap(), (Mode::Test, ModeHow::BuiltFromSource));
-    assert_eq!(read_mode(&db), Some(Mode::Test));
-
-    let store2 = tempfile::tempdir().unwrap();
-    let db2 = store2.path().join("thor.db");
-    std::fs::write(bin.path().join(RELEASE_MARKER), "release archive\n").unwrap();
-    assert_eq!(settle_mode(&db2, bin.path(), None).unwrap(), (Mode::Release, ModeHow::ReleaseArchive));
-    assert_eq!(read_mode(&db2), Some(Mode::Release));
+    assert_eq!(settle_mode(&db, None).unwrap(), (Mode::Release, ModeHow::Default));
+    assert_eq!(read_mode(&db), Some(Mode::Release));
 }
 
 #[test]
 fn a_second_install_keeps_the_mode_and_only_the_owner_changes_it() {
     let store = tempfile::tempdir().unwrap();
     let db = store.path().join("thor.db");
-    let bin = tempfile::tempdir().unwrap();
-    settle_mode(&db, bin.path(), Some(Mode::Test)).unwrap();
-    // A release marker appears later (an upgrade from an archive): the owner's test mode stays.
-    std::fs::write(bin.path().join(RELEASE_MARKER), "release archive\n").unwrap();
-    assert_eq!(settle_mode(&db, bin.path(), None).unwrap(), (Mode::Test, ModeHow::Kept));
-    assert_eq!(settle_mode(&db, bin.path(), Some(Mode::Release)).unwrap(), (Mode::Release, ModeHow::Told));
+    settle_mode(&db, Some(Mode::Test)).unwrap();
+    assert_eq!(settle_mode(&db, None).unwrap(), (Mode::Test, ModeHow::Kept));
+    assert_eq!(settle_mode(&db, Some(Mode::Release)).unwrap(), (Mode::Release, ModeHow::Told));
     assert_eq!(read_mode(&db), Some(Mode::Release));
 }
 
@@ -88,7 +77,7 @@ fn set_mode_refuses_a_bad_word_a_missing_db_and_a_missing_memory() {
 }
 
 #[test]
-fn a_full_install_from_a_build_in_a_checkout_writes_test_mode() {
+fn a_full_install_from_a_build_in_a_checkout_writes_release_mode() {
     let home = tempfile::tempdir().unwrap();
     let repo = tempfile::tempdir().unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_install"))
@@ -103,7 +92,7 @@ fn a_full_install_from_a_build_in_a_checkout_writes_test_mode() {
         .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("bug nudge mode 'test'") && stdout.contains("never sent"), "{stdout}");
+    assert!(stdout.contains("bug nudge mode 'release'") && stdout.contains("nothing is sent without your yes"), "{stdout}");
     let db = home.path().join("localappdata").join("thor2").join("thor.db");
-    assert_eq!(read_mode(&db), Some(Mode::Test));
+    assert_eq!(read_mode(&db), Some(Mode::Release));
 }

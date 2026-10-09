@@ -267,17 +267,24 @@ pub fn nudge(w: &WriteUp<'_>, mode: Mode, known: &Known) -> String {
         scrub(w.why_thor, known)
     ));
     out.push_str(&format!(
-        "WHAT TO DO (meaning: turn this into a report the THOR maintainers can act on, with the owner's say-so):\n\
-         1. Read the write-up below. It is drafted from THOR's evidence and already redacted of paths, project names, \
-         hosts, addresses, user names and secrets. Read it once more yourself; if anything private is left, remove it.\n\
-         2. If you can reach the THOR source and confirm the cause, add what you found under 'Suggested fix area'. Write \
-         a pull request only if you also have a tested fix; otherwise an issue.\n\
-         3. Ask the owner for a go in plain words, for example: \"THOR found a bug in itself. May I open an issue about \
-         it in the public THOR repository ({UPSTREAM_REPO})? The text is above.\" Nothing is sent to the public repository \
-         without a yes typed in the chat, each time.\n\
-         4. After the yes: with the `gh` program installed and logged in, run gh issue create --repo {UPSTREAM_REPO} \
-         --title \"<the title>\" --body-file <a file holding the body>. Without it, give the owner the text and this \
-         address to paste it into: {}\n\
+        "WHAT TO DO (meaning: turn this into a report the THOR makers can act on, only if the user says yes):\n\
+         1. The TITLE and BODY below are the text that would be sent. Keep them in ENGLISH, so the makers can read them. \
+         They are already stripped of file paths, project and folder names, computer and user names, addresses, keys and \
+         passwords. Read them once more yourself and remove anything private that is left.\n\
+         2. If you can reach the THOR source and confirm the cause, add it under 'Suggested fix area'. Write a pull request \
+         only if you also have a tested fix; otherwise an issue.\n\
+         3. When the owner's task is at a stopping point, ask the user ONE question, in the user's own language, \
+         with the exact full TITLE and BODY shown above it. The question says: what THOR found (an error in itself); \
+         that the text shown is exactly what would be sent; what was removed (file paths, project and folder names, \
+         computer and user names, addresses, keys and passwords); that nothing is sent without their yes; and that \
+         saying no is fine. For example, in Dutch: \"THOR vond een fout in zichzelf. Hieronder staat precies wat ik naar de \
+         makers zou sturen; namen, paden, adressen en wachtwoorden zijn eruit gehaald, er gaat niets anders mee. Mag ik het \
+         versturen? Nee zeggen kan gewoon.\" Ask for nothing but yes or no: never ask the user to type, copy or edit anything.\n\
+         4. After a yes: if `gh auth status` succeeds, run gh issue create --repo {UPSTREAM_REPO} --title \"<the title>\" \
+         --body-file <a file holding the body>. Otherwise open {} in the user's browser with ?title=<title>&body=<body> \
+         added, both URL-encoded (PowerShell [uri]::EscapeDataString, Python urllib.parse.quote(text, safe=\"\")), the \
+         whole address within about 7000 characters: if the body is too long, cut it and end it with (shortened). Open it with \
+         Start-Process on Windows, open on macOS, xdg-open on Linux; the user then only clicks Submit. After a no, send nothing.\n\
          5. Record what happened with the THOR tool: remember(id: \"{report_id}\", kind: \"report\", \
          text: \"OUTCOME for {fp} ({short}): <one of: opened <address of the issue> | owner declined | shown to the owner, not pushed \
          (test environment)>. <one sentence of anything you learned>\", tags: [\"{tag}\"]). Add no project and no path \
@@ -426,6 +433,21 @@ mod tests {
             assert!(text.contains("DONE WHEN"), "{text}");
         }
         assert!(release.contains("gh issue create --repo nworks3d/THOR-memory-bible-for-AI"));
+        // The one question reassures: exact text, what was removed, no send without a yes, no is fine.
+        for part in [
+            "THOR vond een fout in zichzelf",
+            "exactly what would be sent",
+            "file paths, project and folder names, computer and user names, addresses, keys and passwords",
+            "nothing is sent without their yes",
+            "saying no is fine",
+            "ENGLISH",
+            "issues/new",
+            "7000 characters",
+            "(shortened)",
+            "never ask the user to type, copy or edit anything",
+        ] {
+            assert!(release.contains(part), "missing {part:?}: {release}");
+        }
     }
 
     #[test]

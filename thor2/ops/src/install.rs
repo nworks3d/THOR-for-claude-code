@@ -346,12 +346,6 @@ pub fn eval_command_path_from(userprofile: Option<&str>, home: Option<&str>) -> 
     userprofile.or(home).map(|h| PathBuf::from(h).join(".claude").join("commands").join("thor-eval.md"))
 }
 
-/// The file a RELEASE ARCHIVE carries next to the programs (the release
-/// workflow writes it), and nothing else does: its presence is how an install
-/// knows it was made from the official release and not from a build in a
-/// checkout. Its content is not read.
-pub const RELEASE_MARKER: &str = "THOR-RELEASE";
-
 /// How `settle_mode` came to its answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModeHow {
@@ -359,25 +353,22 @@ pub enum ModeHow {
     Told,
     /// A mode was written by an earlier run; this run leaves it alone.
     Kept,
-    /// The programs came out of a release archive.
-    ReleaseArchive,
-    /// No release marker beside the programs: a build from a checkout.
-    BuiltFromSource,
+    /// Nobody said anything: the default, `release`, on every build.
+    Default,
 }
 
 /// Settle which mode the bug nudge runs in (`serve::thor_bugs`), and write it
 /// beside the store at `db`. `told`: the owner's own choice, always written.
 /// Otherwise a mode already on disk is kept (a second run never flips what
-/// the owner set), else `bin_dir` decides: a release marker means `release`,
-/// anything else `test` - so a source build can never publish anything, and
-/// only an install made from the official archive may ever be asked to.
-pub fn settle_mode(db: &Path, bin_dir: &Path, told: Option<serve::bug_report::Mode>) -> anyhow::Result<(serve::bug_report::Mode, ModeHow)> {
+/// the owner set), else the default is `release` on EVERY build, a source
+/// build included: only an explicit `install --set-mode test` makes the test
+/// mode, so a friend who builds from source is a co-tester like anyone else.
+pub fn settle_mode(db: &Path, told: Option<serve::bug_report::Mode>) -> anyhow::Result<(serve::bug_report::Mode, ModeHow)> {
     use serve::bug_report::Mode;
     let (mode, how) = match (told, serve::thor_bugs::read_mode(db)) {
         (Some(mode), _) => (mode, ModeHow::Told),
         (None, Some(mode)) => return Ok((mode, ModeHow::Kept)),
-        (None, None) if bin_dir.join(RELEASE_MARKER).is_file() => (Mode::Release, ModeHow::ReleaseArchive),
-        (None, None) => (Mode::Test, ModeHow::BuiltFromSource),
+        (None, None) => (Mode::Release, ModeHow::Default),
     };
     serve::thor_bugs::write_mode(db, mode)?;
     Ok((mode, how))
@@ -1152,22 +1143,15 @@ pub fn workflow_starter_pack() -> Vec<model::item::Item> {
         // notes at most, so these stay two or one apiece and leave room for
         // the owner's own.
         note(
-            "an-agent-brief-stands-alone",
-            "A spawned agent starts blank. Its brief must stand alone: the goal, an ABSOLUTE working \
-             folder, the files it may touch, no spawning of further agents, an explicit model, and \
-             what to report back including what it could not check.",
-            "An agent given a brief with no working folder or limits is found to behave the same as \
-             one given a complete brief.",
+            "orchestrator-mode-saves-quota",
+            "Orchestrator mode: the strongest model answers, judges and checks; cheaper models do the real work in helper agents, saving quota. Cheapest capable model; targeted checks, not broad searches or full test runs. Trivial one-step task: do it yourself. No strongest model: the best available steers.",
+            "Doing all the work in the strongest model uses no more quota than letting cheaper helper agents do it.",
             vec![command("Agent")],
         ),
         note(
-            "parallel-agents-do-not-share-a-folder",
-            "Parallel agents in one repo each get their own folder or worktree and their own build \
-             directory, or they overwrite each other and queue on the build lock. A worktree starts \
-             from the last commit, not from uncommitted work. A commit takes everything in its \
-             folder: let one agent commit.",
-            "Two agents sharing one folder and one build directory finish as fast and as cleanly as \
-             two isolated ones.",
+            "an-agent-brief-stands-alone",
+            "A spawned agent starts blank, so its brief stands alone: goal, ABSOLUTE working folder, files it may touch, no further agents, known facts (file:line), one narrow task with a stop point, a SHORT report. Parallel agents get their own folder or worktree and build directory; one agent commits.",
+            "An agent given a brief with no working folder or limits is found to behave the same as one given a complete brief.",
             vec![command("Agent")],
         ),
         note(

@@ -1715,7 +1715,7 @@ fn dropped_field(name: &'static str) -> Refusal {
 /// validator compares like with like: a section written by a tool server of
 /// another revision is version skew, not an edit. A header with no revision
 /// was written before this existed.
-pub const MACHINE_RENDERER_REV: u32 = 7;
+pub const MACHINE_RENDERER_REV: u32 = 8;
 
 /// The machine section's first line, with `<N>` (the log position the
 /// evaluation started at), `<F>` (the log position it was filed at) and `<R>`
