@@ -172,7 +172,7 @@ pub fn last_user_prompt(transcript_jsonl: &str) -> Option<String> {
 /// reminder: `prompt::is_owners_own_text`) - see `last_user_prompt` for the
 /// shapes. Field test 12, R6: the length hold quoted `</task-notification>` as
 /// the owner's words because the last user-role entry was only a notification.
-fn owner_prompt_of(entry: &Value) -> Option<String> {
+pub fn owner_prompt_of(entry: &Value) -> Option<String> {
     if entry.get("type").and_then(|t| t.as_str()) != Some("user") {
         return None;
     }

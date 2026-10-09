@@ -1536,6 +1536,7 @@ fn busy_frozen(batch: usize, a4: usize, disputes: usize, blocks: usize, carriers
             })
             .collect(),
         false_blocks_more: 0,
+        ..Default::default()
     });
     Frozen {
         session: S1.to_string(),
@@ -1654,4 +1655,128 @@ fn the_start_note_explains_hook_failures_that_were_the_machine_and_not_thor() {
 
     let neither = render(&signals(0, 0));
     assert!(neither.contains("Nothing to do here."), "{neither}");
+}
+
+// ------------------------------------------------- the false-block sweep in the note
+
+/// `busy_frozen` with what the false-block sweep found: `rules` rules, each
+/// with an example, and `more` it did not list.
+fn busy_frozen_with_sweep(rules: usize, more: usize) -> Frozen {
+    let mut frozen = busy_frozen(1, 0, 4, 1, 25, 0);
+    let signals = frozen.machine.as_mut().unwrap().signals.as_mut().unwrap();
+    signals.sweep = (0..rules)
+        .map(|n| model::store::SweepHit {
+            rule: format!("sweep-rule-{n}"),
+            kind: if n % 2 == 0 { "rule" } else { "answer" }.to_string(),
+            refuses: 40 + n,
+            of: 156_188,
+            ran_fine: 3 + n,
+            example: "'docker system prune --all' (2026-10-03), ran fine".to_string(),
+        })
+        .collect();
+    signals.sweep_more = more;
+    if let Some(clause) = crate::sweep::proxy_clause(&signals.sweep, more) {
+        signals.refusals.push(' ');
+        signals.refusals.push_str(&clause);
+    }
+    frozen
+}
+
+/// A sweep with nothing to say adds nothing: the busy note is what it was
+/// before the sweep existed.
+#[test]
+fn a_sweep_that_found_nothing_leaves_the_start_note_as_it_was() {
+    let frozen = busy_frozen(1, 0, 4, 1, 25, 0);
+    let note = render_start_note(BUSY_ID, &frozen);
+    assert!(!note.contains("FALSE-BLOCK SWEEP"), "{note}");
+    assert!(!note.contains("walked around"), "{note}");
+    assert!(note.len() <= START_NOTE_BUDGET);
+}
+
+/// The sweep's rules are item d of section 2: what they mean, the exact call,
+/// when an item is done, an example - and the proxy line says where they are.
+#[test]
+fn the_start_note_lists_the_rules_the_sweep_found_with_the_call_the_done_criterion_and_an_example() {
+    let frozen = busy_frozen_with_sweep(2, 0);
+    let note = render_start_note(BUSY_ID, &frozen);
+    for must in [
+        "d. FALSE-BLOCK SWEEP - 2 item(s) would refuse or fire on real calls or replies of the last 30 days that ran fine (all of the record covered): 'sweep-rule-0', 'sweep-rule-1'.",
+        "WHAT THIS MEANS:",
+        "WHAT TO DO, per rule:",
+        "mcp__thor__revise(id: \"<id>\", text: \"<reworded>\", check_kind: \"forbidden\", check_literals: [\"<narrower literal>\"], because: \"<why, 20+ characters>\")",
+        "DONE WHEN:",
+        "EXAMPLE:",
+        "- 'sweep-rule-0': would refuse 40 of 156188 real, 3 ran fine; e.g. 'docker system prune --all' (2026-10-03), ran fine",
+        "- 'sweep-rule-1': would fire on 41 of 156188 real, 4 ran fine;",
+        "The proxy cannot see a false block that was walked around without weakening the rule: the false-block sweep (item d of section 2) names 2 rule(s) or answer-rulebook entr(y/ies)",
+    ] {
+        assert!(note.contains(must), "missing {must}: {note}");
+    }
+    let at = |needle: &str| note.find(needle).unwrap_or_else(|| panic!("missing {needle}"));
+    assert!(at("c. DISPUTES TO VERIFY") < at("d. FALSE-BLOCK SWEEP") && at("d. FALSE-BLOCK SWEEP") < at("3. SIGNALS BEFORE YOU FILE"));
+    assert!(note.is_ascii(), "plain ASCII");
+}
+
+/// A note that cannot hold the sweep as well gives up what needs no action
+/// first, then the A4 list; the sweep's rules are cut only after those, from
+/// the far end, and the cut says how many it held back and where the whole
+/// note is. Nothing actionable goes silently.
+#[test]
+fn the_sweeps_rules_survive_a_cut_that_takes_the_less_actionable_first_and_a_cut_says_so() {
+    // Busy as the live store is, plus six rules from the sweep.
+    let frozen = busy_frozen_with_sweep(6, 2);
+    let whole = render_start_note(BUSY_ID, &frozen);
+    let note = render_start_note_within(BUSY_ID, &frozen, START_NOTE_BUDGET);
+    assert!(note.len() <= START_NOTE_BUDGET, "{} bytes (the whole note is {}): {note}", note.len(), whole.len());
+    assert!(note.contains("d. FALSE-BLOCK SWEEP"), "{note}");
+    assert!(note.contains("- 'sweep-rule-0':"), "the first rule of the sweep is shown: {note}");
+    assert!(note.contains("a. THE BATCH") && note.contains("c. DISPUTES TO VERIFY") && note.contains("'batch-rule-0'"), "{note}");
+    // The ones the sweep did not list are counted, and where they are read.
+    assert!(note.contains("2 more are named by `serve sweep`, not here."), "{note}");
+    // Whatever was cut says so and says where the whole note is.
+    let listed = (0..6).filter(|n| note.contains(&format!("- 'sweep-rule-{n}':"))).count();
+    if listed < 6 {
+        assert!(note.contains("NOT shown here") && note.contains(&format!("mcp__thor__get(id: \"{BUSY_ID}\")")), "{note}");
+    }
+}
+
+/// Of the two, the sweep's rules outrank the probable false blocks the proxy
+/// read from the log and the A4 list: those give way first.
+#[test]
+fn the_sweeps_rules_outrank_the_proxys_probable_false_blocks_and_the_a4_list() {
+    let mut frozen = busy_frozen(1, 16, 1, 8, 25, 0);
+    let signals = frozen.machine.as_mut().unwrap().signals.as_mut().unwrap();
+    signals.sweep = (0..4)
+        .map(|n| model::store::SweepHit {
+            rule: format!("sweep-rule-{n}"),
+            kind: "rule".to_string(),
+            refuses: 12,
+            of: 156_188,
+            ran_fine: 2,
+            example: "'docker system prune' (2026-10-03), ran fine".to_string(),
+        })
+        .collect();
+    let note = render_start_note_within(BUSY_ID, &frozen, START_NOTE_BUDGET);
+    assert!(note.len() <= START_NOTE_BUDGET, "{} bytes", note.len());
+    for n in 0..4 {
+        assert!(note.contains(&format!("- 'sweep-rule-{n}':")), "sweep-rule-{n} was cut before the A4 list and the probable false blocks: {note}");
+    }
+}
+
+/// The frozen sweep survives the record: a start written before the sweep
+/// existed reads back with none, and one with hits reads back whole.
+#[test]
+fn the_sweeps_findings_are_part_of_the_frozen_signals_and_an_older_record_reads_back_without_them() {
+    let frozen = busy_frozen_with_sweep(2, 1);
+    let text = serde_json::to_string(&frozen).unwrap();
+    let back: Frozen = serde_json::from_str(&text).unwrap();
+    let signals = back.machine.as_ref().unwrap().signals.as_ref().unwrap();
+    assert_eq!((signals.sweep.len(), signals.sweep_more), (2, 1));
+    let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let signals = value["machine"]["signals"].as_object_mut().unwrap();
+    for gone in ["sweep", "sweep_more", "sweep_partial"] {
+        signals.remove(gone);
+    }
+    let older: Frozen = serde_json::from_value(value).unwrap();
+    assert!(older.machine.unwrap().signals.unwrap().sweep.is_empty());
 }

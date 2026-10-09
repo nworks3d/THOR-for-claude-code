@@ -259,6 +259,34 @@ enum Command {
         #[arg(long = "allow-demote", requires_all = ["compare", "apply"])]
         allow_demote: bool,
     },
+    /// THE FALSE-BLOCK SWEEP (`serve::sweep`): every rule that can refuse a
+    /// call, and every entry of the answer rulebook, tried against the real
+    /// calls and replies THOR kept in the last 30 days (`serve::corpus`),
+    /// through the very functions the hook uses. Prints, per rule, how many
+    /// real calls it would refuse, how many of those ran fine, and examples.
+    /// Incremental: it replays what is new since the last run and what a
+    /// changed rule reaches, and carries on where an earlier run ran out of
+    /// time. Writes only its own state file beside the store. Exit code 0.
+    Sweep {
+        /// Start over: forget what was swept and try everything again.
+        #[arg(long)]
+        full: bool,
+        /// First read the transcripts of the last 30 days into the record of
+        /// real calls - for a machine that has none yet. Run it again to
+        /// finish if the time ran out.
+        #[arg(long)]
+        backfill: bool,
+        /// The most seconds to spend (default 600); a run that does not
+        /// finish carries on at the next one.
+        #[arg(long = "budget-secs", default_value_t = 600)]
+        budget_secs: u64,
+        /// Machine-readable output: one JSON object and nothing else.
+        #[arg(long)]
+        json: bool,
+        /// Show only this rule (or answer-rulebook entry).
+        #[arg(long)]
+        rule: Option<String>,
+    },
     /// Record that a served item actually helped. Recorded in the log and
     /// reported by `status`; it does NOT decide whether anything fires - see
     /// `serve::decay`'s own doc comment for why silence stopped removing
@@ -453,6 +481,7 @@ fn main() {
         Command::Outline { index_db, path } => cmd_outline(&index_db, &path),
         Command::Status { index_db, repo } => cmd_status(&cli.db, index_db.as_deref(), repo.as_deref()),
         Command::Mark { id, noise } => cmd_mark(&cli.db, &id, noise),
+        Command::Sweep { full, backfill, budget_secs, json, rule } => cmd_sweep(&cli.db, full, backfill, budget_secs, json, rule.as_deref()),
         Command::Retest { id, project, all, apply, compare, allow_demote } => {
             cmd_retest(&cli.db, id.as_deref(), project.as_deref(), all, apply, compare, allow_demote)
         }
@@ -978,71 +1007,40 @@ fn payload_says_the_owner_reads_the_answer(payload: &Value) -> bool {
     payload.get("owner_reads_answer").and_then(|v| v.as_bool()).unwrap_or(false)
 }
 
-/// Whether a `path:line` citation from an answer names a real line: `cited`
-/// resolves (relative to `root`, or as written when absolute) to a file that
-/// lies under `root` - the session's own working directory, already
-/// canonicalized by the caller - and that file has at least `line` lines.
-/// Line 0, a directory, a path that climbs out of `root` (`../`), and anything
-/// that cannot be read all answer `false`: a citation has to be checkable to
-/// count as evidence (see `respond`'s own "checked citations" section).
-fn cited_line_exists(root: &Path, cited: &str, line: u64) -> bool {
-    if line == 0 {
-        return false;
+/// Keep the reply the Response Guard just judged in the real-call corpus
+/// (`serve::corpus`), with what the guard said, so the standing sweep can try
+/// the answer rulebook against it later. Nothing is read again: the reply, the
+/// prompt and the turn's commands are what the verdict was made from.
+#[allow(clippy::too_many_arguments)]
+fn record_reply_in_corpus(
+    db_path: &Path,
+    payload: &Value,
+    session_id: &str,
+    msg: &str,
+    last_prompt: &str,
+    commands: &[String],
+    verdict: &respond::GuardVerdict,
+    no_record: bool,
+) {
+    if no_record {
+        return;
     }
-    let Ok(file) = root.join(cited).canonicalize() else { return false };
-    if !file.starts_with(root) || !file.is_file() {
-        return false;
-    }
-    let Ok(bytes) = std::fs::read(&file) else { return false };
-    let newlines = bytes.iter().filter(|&&b| b == b'\n').count() as u64;
-    let lines = if bytes.last().is_some_and(|&b| b != b'\n') { newlines + 1 } else { newlines };
-    line <= lines
-}
-
-/// Which of `candidates` (sha-shaped tokens from an answer) name a real commit
-/// in the git repository `cwd` stands in - `None` when no repository answers
-/// (git missing, `cwd` in no repository, any error), so the Response Guard
-/// judges a sha by its shape instead (see `respond`'s own "checked evidence"
-/// section). One `git cat-file --batch-check` for the whole list, reading only
-/// the local object store: nothing is fetched, nothing is written. An
-/// ambiguous short sha names real objects, so it counts as real.
-fn real_commits(cwd: &Path, candidates: &[String]) -> Option<std::collections::HashSet<String>> {
-    use std::io::Write as _;
-    let mut command = std::process::Command::new("git");
-    command
-        .arg("-C")
-        .arg(cwd)
-        .args(["cat-file", "--batch-check"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt as _;
-        // CREATE_NO_WINDOW: a hook never opens a console window.
-        command.creation_flags(0x0800_0000);
-    }
-    let mut child = command.spawn().ok()?;
-    let input: String = candidates.iter().map(|c| format!("{c}^{{commit}}\n")).collect();
-    // A write error (git already gone) shows up in the exit status below.
-    let _ = child.stdin.take()?.write_all(input.as_bytes());
-    let out = child.wait_with_output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let answers: Vec<&str> = text.lines().collect();
-    if answers.len() != candidates.len() {
-        return None;
-    }
-    Some(
-        candidates
-            .iter()
-            .zip(answers)
-            .filter(|(_, answer)| !answer.ends_with(" missing"))
-            .map(|(c, _)| c.clone())
-            .collect(),
-    )
+    let cwd = payload.get("cwd").and_then(|v| v.as_str()).unwrap_or_default();
+    let said = verdict.block_reason.as_deref().or(verdict.warn_reason.as_deref()).unwrap_or_default();
+    let row = serve::corpus::reply_row(
+        time::now_unix(),
+        session_id,
+        payload_is_from_a_subagent(payload),
+        payload_says_the_owner_reads_the_answer(payload),
+        cwd,
+        msg,
+        last_prompt,
+        commands,
+        verdict.block_reason.is_some(),
+        verdict.warn_reason.is_some(),
+        said,
+    );
+    serve::corpus::record_reply(db_path, &row);
 }
 
 /// The owner's own last typed prompt, for `respond::guard_verdict`'s
@@ -1381,6 +1379,26 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             // The evaluation's old handover file is gone for good (step 13):
             // the start lives in the log now, and nothing reads the file.
             serve::eval_session::retire_handover_sidecar(db_path);
+            // THE REAL-CALL CORPUS (`serve::corpus`): the tool calls this
+            // session made since the last Stop, appended to a bounded sidecar
+            // beside the store, so the standing sweep can try every rule
+            // against what really happened. Read from the transcripts this
+            // Stop already reads, only what is new, within a time box. A
+            // subagent's Stop adds nothing: the main session's covers its
+            // files.
+            if !payload_is_from_a_subagent(&payload) {
+                let named = payload.get("transcript_path").and_then(|v| v.as_str()).map(Path::new);
+                let at = payload.get("cwd").and_then(|v| v.as_str()).map(Path::new);
+                let fallback = project::session_project(db_path, &session_id, at);
+                serve::corpus::record_session(
+                    db_path,
+                    &session_id,
+                    named,
+                    serve::attest::transcripts_root().as_deref(),
+                    fallback.as_deref(),
+                    time::now_unix(),
+                );
+            }
         }
         let already_fired = payload.get("stop_hook_active").and_then(|v| v.as_bool()).unwrap_or(false);
         // What the session is told when this Stop finished a cut-off pass.
@@ -1444,11 +1462,11 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
         let payload_cwd = payload.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from);
         let evidence_root: Option<PathBuf> = payload_cwd.as_deref().and_then(|cwd| cwd.canonicalize().ok());
         let look_up_citation =
-            |cited: &str, line: u64| evidence_root.as_deref().is_some_and(|root| cited_line_exists(root, cited, line));
+            |cited: &str, line: u64| evidence_root.as_deref().is_some_and(|root| serve::evidence::cited_line_exists(root, cited, line));
         // git is handed the working directory as the payload names it, never
         // the canonical form: on Windows that is a `\\?\` path, which is not
         // one every git build reads.
-        let look_up_commits = |candidates: &[String]| payload_cwd.as_deref().and_then(|cwd| real_commits(cwd, candidates));
+        let look_up_commits = |candidates: &[String]| payload_cwd.as_deref().and_then(|cwd| serve::evidence::real_commits(cwd, candidates));
         let evidence_lookup =
             respond::EvidenceLookup { line_exists: &look_up_citation, real_commits: &look_up_commits };
         let citation_lookup: Option<&respond::EvidenceLookup> =
@@ -1497,6 +1515,7 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                     citation_lookup,
                     &commands,
                 );
+                record_reply_in_corpus(db_path, &payload, &session_id, msg, &last_prompt, &commands, &verdict, no_record);
                 verdict.block_reason.or(verdict.warn_reason)
             });
             let guard_text = guard_text.flatten();
@@ -1588,6 +1607,7 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                 citation_lookup,
                 &commands,
             );
+            record_reply_in_corpus(db_path, &payload, &session_id, msg, &last_prompt, &commands, &verdict, no_record);
             if let Some(reason) = verdict.block_reason {
                 // THE GUARD NEVER STARVES THE EVALUATION ASK (step 20,
                 // NEW-1). The guard's block holds this turn once and the
@@ -6755,6 +6775,50 @@ fn cmd_vectors_refresh(db_path: &Path, model_dir: Option<&Path>, vectors_db: Opt
 /// Record that `id` actually helped. A human-facing, deliberate write (R5's
 /// "write and declare" side): a real failure is reported plainly, never
 /// swallowed the way `hook`'s delivery telemetry is.
+fn cmd_sweep(db_path: &Path, full: bool, backfill: bool, budget_secs: u64, json: bool, only: Option<&str>) {
+    let store = match EventStore::open_read_only(db_path) {
+        Ok(store) => store,
+        Err(e) => {
+            eprintln!("could not open the store at {}: {e}", db_path.display());
+            std::process::exit(1);
+        }
+    };
+    let started = std::time::Instant::now();
+    let budget = std::time::Duration::from_secs(budget_secs);
+    let mut lines: Vec<String> = Vec::new();
+    if backfill {
+        match serve::attest::transcripts_root() {
+            Some(root) => {
+                let done = serve::corpus::backfill(db_path, &root, budget.mul_f64(0.5), time::now_unix());
+                lines.push(format!(
+                    "backfill: read {} of {} transcript file(s) of the last {} days in {} ms, {} call(s) and {} reply(ies) recorded{}",
+                    done.files_read,
+                    done.files_total,
+                    serve::corpus::KEEP_DAYS,
+                    started.elapsed().as_millis(),
+                    done.calls,
+                    done.replies,
+                    if done.complete { "" } else { " - the time ran out; run it again to finish" }
+                ));
+            }
+            None => lines.push("backfill: no folder of Claude Code transcripts was found (USERPROFILE and HOME are not set)".to_string()),
+        }
+    }
+    let mut opts = serve::sweep::Opts::new(budget.saturating_sub(started.elapsed()));
+    opts.full = full;
+    let mut report = serve::sweep::run(db_path, &store, &opts);
+    if let Some(only) = only {
+        report.calls.retain(|l| l.id == only);
+        report.answers.retain(|l| l.id == only);
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&serve::sweep::report_json(&report)).unwrap_or_default());
+        return;
+    }
+    lines.extend(serve::sweep::detail_lines(&report));
+    println!("{}", lines.join("\n"));
+}
+
 fn cmd_mark(db_path: &Path, id: &str, noise: bool) {
     let mut store = open_store_or_die(db_path);
     let now = time::now_iso8601();

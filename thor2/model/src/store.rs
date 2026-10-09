@@ -6912,6 +6912,25 @@ pub struct FalseBlock {
     pub restore: String,
 }
 
+/// One rule (or answer-rulebook entry) the false-block sweep (`serve::sweep`)
+/// named: it would refuse (fire on) real calls (replies) of the last 30 days
+/// that ran fine. Frozen with the evaluation start, so the note and the record
+/// name the same ones.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SweepHit {
+    pub rule: String,
+    /// "rule" (a call) or "answer" (a reply and the answer rulebook).
+    pub kind: String,
+    /// How many distinct real calls (replies) it would refuse (fire on).
+    pub refuses: usize,
+    /// How many real calls (replies) were tried.
+    pub of: u64,
+    /// How many of those ran fine.
+    pub ran_fine: usize,
+    /// One example, already worded for a reader.
+    pub example: String,
+}
+
 struct RefusalOutcomes {
     verified: usize,
     probable: usize,
@@ -7030,6 +7049,18 @@ pub struct SignalsSoFar {
     pub false_blocks: Vec<FalseBlock>,
     /// How many more there were.
     pub false_blocks_more: usize,
+    /// What the false-block sweep found when the evaluation started: rules
+    /// that would refuse real calls which ran fine (`serve::sweep`). Silent
+    /// when empty.
+    #[serde(default)]
+    pub sweep: Vec<SweepHit>,
+    /// How many more than `sweep` lists.
+    #[serde(default)]
+    pub sweep_more: usize,
+    /// The sweep had not covered the whole record of real calls yet when the
+    /// evaluation started.
+    #[serde(default)]
+    pub sweep_partial: bool,
 }
 
 /// `SignalsSoFar` for the events after log seq `prev_report_seq` (the project's
@@ -7060,6 +7091,7 @@ pub fn signals_so_far(
         refusals: refusal_outcomes_sentence(&outcomes, "since the previous report", REFUSALS_OF_EVERY_SESSION),
         false_blocks_more: outcomes.blocks.len().saturating_sub(FALSE_BLOCKS_LISTED),
         false_blocks: outcomes.blocks.into_iter().take(FALSE_BLOCKS_LISTED).collect(),
+        ..SignalsSoFar::default()
     }
 }
 
@@ -7466,6 +7498,7 @@ fn machine_section(store: &EventStore, start: &EvaluationStart, filed_seq: i64) 
     }
 
     out.push_str(&refusal_outcomes_line(&log, &window, session));
+    out.push_str(&false_block_sweep_line(frozen));
 
     // ---- SIDE DOORS: every write in the window, on an item of this project
     // or made in the evaluating session, that did not come through an
@@ -7522,6 +7555,24 @@ fn refused_rules_named(rules: &std::collections::BTreeMap<String, usize>) -> Str
         named.push(format!("and {} more", rules.len() - FALSE_BLOCKS_LISTED));
     }
     named.join(", ")
+}
+
+/// FALSE-BLOCK SWEEP, for the machine section: what the sweep found when the
+/// evaluation started (`serve::sweep`, frozen in the start record), so the
+/// filed report records it beside the proxy that cannot see it. Nothing when
+/// the sweep found nothing.
+fn false_block_sweep_line(frozen: &Frozen) -> String {
+    let Some(signals) = frozen.machine.as_ref().and_then(|m| m.signals.as_ref()).filter(|s| !s.sweep.is_empty()) else {
+        return String::new();
+    };
+    let ids: Vec<String> = signals.sweep.iter().map(|h| format!("'{}'", plain(&h.rule))).collect();
+    format!(
+        "\nFALSE-BLOCK SWEEP at the start: {} item(s) would refuse or fire on real calls or replies of the last 30 days \
+         that ran fine: {}{} (the start note lists each with its example).",
+        signals.sweep.len() + signals.sweep_more,
+        ids.join(", "),
+        if signals.sweep_more > 0 { format!(" and {} more", signals.sweep_more) } else { String::new() }
+    )
 }
 
 /// REFUSAL OUTCOMES, for the machine section: of the real refusals the hook
@@ -10862,6 +10913,43 @@ mod tests {
     }
 
     /// B1: the machine section is a pure function of the log truncated at F.
+    /// The filed report records what the false-block sweep found at the start,
+    /// beside the proxy that cannot see it - and nothing when it found nothing.
+    #[test]
+    fn the_machine_section_records_the_sweeps_findings_from_the_start_record() {
+        let mut signals = SignalsSoFar::default();
+        let mut frozen = Frozen {
+            session: "s".to_string(),
+            project: "demo".to_string(),
+            started_seq: 5,
+            started_by: "command".to_string(),
+            started_unix: 1_790_000_000,
+            prev_report_seq: 0,
+            judgement: vec![],
+            batch: Some(vec![]),
+            batch_later: 0,
+            a4_list: Some(vec![]),
+            open_points: vec![],
+            machine: Some(MachinePass { signals: Some(signals.clone()), ..MachinePass::default() }),
+            void: None,
+            superseded: None,
+            fired: Default::default(),
+        };
+        assert_eq!(false_block_sweep_line(&frozen), "", "nothing found, nothing said");
+        signals.sweep = vec![
+            SweepHit { rule: "acme-wipe-ban".into(), kind: "rule".into(), refuses: 4, of: 900, ran_fine: 2, example: "x".into() },
+            SweepHit { rule: "ask-user-to-check".into(), kind: "answer".into(), refuses: 3, of: 80, ran_fine: 1, example: "y".into() },
+        ];
+        signals.sweep_more = 1;
+        frozen.machine = Some(MachinePass { signals: Some(signals), ..MachinePass::default() });
+        let line = false_block_sweep_line(&frozen);
+        assert_eq!(
+            line,
+            "\nFALSE-BLOCK SWEEP at the start: 3 item(s) would refuse or fire on real calls or replies of the last 30 days \
+             that ran fine: 'acme-wipe-ban', 'ask-user-to-check' and 1 more (the start note lists each with its example)."
+        );
+    }
+
     /// The same start and the same F give the same bytes - whatever was
     /// appended after F, and on a copy of the log that ends at F.
     #[test]

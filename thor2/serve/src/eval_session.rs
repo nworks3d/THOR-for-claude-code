@@ -1062,6 +1062,23 @@ pub fn machine_pass(store: &mut EventStore, project: &str, start: &EvaluationSta
         &host_wide,
     ));
 
+    // THE FALSE-BLOCK SWEEP (`crate::sweep`): the rules that would refuse real
+    // calls of the last 30 days that ran fine, from a short incremental pass
+    // over the record of real calls (what it does not reach, the next start,
+    // doctor or `serve sweep` carries on). Frozen with the signals. The
+    // proxy above cannot see a false block that was walked around without
+    // weakening the rule, so its line says where this one is.
+    if let Some(signals) = machine.signals.as_mut() {
+        let (hits, more, covered) = crate::sweep::for_evaluation(store, Duration::from_secs(SWEEP_BOX_SECS));
+        signals.sweep = hits;
+        signals.sweep_more = more;
+        signals.sweep_partial = !covered.complete;
+        if let Some(clause) = crate::sweep::proxy_clause(&signals.sweep, signals.sweep_more) {
+            signals.refusals.push(' ');
+            signals.refusals.push_str(&clause);
+        }
+    }
+
     let of = |outcome: MachineOutcome| -> Vec<String> {
         machine.items.iter().filter(|i| i.outcome == outcome).map(|i| i.id.clone()).collect()
     };
@@ -1097,6 +1114,10 @@ fn quoted(ids: &[String]) -> String {
 /// the continue line) is taken off the budget (`start_note_after`).
 pub const START_NOTE_BUDGET: usize = 9_300;
 
+/// The most seconds an evaluation start spends on the false-block sweep, on
+/// top of the machine pass's own time box.
+pub const SWEEP_BOX_SECS: u64 = 12;
+
 /// What the note lists in full. Every list shows its first `n` items; the rest
 /// are counted and pointed at (`more_line`). `usize::MAX` is the whole list.
 #[derive(Clone)]
@@ -1106,37 +1127,58 @@ struct Caps {
     a4: usize,
     disputes: usize,
     blocks: usize,
+    sweep: usize,
     /// List THOR's own open points one by one, or only count them.
     points: bool,
 }
 
 impl Caps {
     fn all() -> Self {
-        Caps { judgement: usize::MAX, batch: usize::MAX, a4: usize::MAX, disputes: usize::MAX, blocks: usize::MAX, points: true }
+        Caps {
+            judgement: usize::MAX,
+            batch: usize::MAX,
+            a4: usize::MAX,
+            disputes: usize::MAX,
+            blocks: usize::MAX,
+            sweep: usize::MAX,
+            points: true,
+        }
     }
 
     /// Give up the least actionable thing still shown: the open points first
     /// (they need nothing), then the probable false blocks, the A4 list, the
-    /// disputes, the batch and the judgement - each from its far end. `false`
+    /// sweep's rules, the disputes, the batch and the judgement - each from its
+    /// far end. `false`
     /// when nothing is left to give up.
     fn shrink(&mut self, frozen: &Frozen) -> bool {
-        fn one(cap: &mut usize, len: usize) -> bool {
+        // Take one off a list that shows more than `floor` items.
+        fn one_above(cap: &mut usize, len: usize, floor: usize) -> bool {
             let shown = (*cap).min(len);
-            if shown == 0 {
+            if shown <= floor {
                 return false;
             }
             *cap = shown - 1;
             true
         }
+        let one = |cap: &mut usize, len: usize| one_above(cap, len, 0);
         if self.points {
             self.points = false;
             return true;
         }
         let blocks = frozen.machine.as_ref().and_then(|m| m.signals.as_ref()).map_or(0, |s| s.false_blocks.len());
+        let sweep = frozen.machine.as_ref().and_then(|m| m.signals.as_ref()).map_or(0, |s| s.sweep.len());
+        let disputes = frozen.dispute_list().len();
+        // The sweep's rules and the disputes are both things the report is
+        // held to: neither is cut to nothing while the other still shows two.
         one(&mut self.blocks, blocks)
             || one(&mut self.a4, frozen.a4_list().len())
-            || one(&mut self.disputes, frozen.dispute_list().len())
+            || one_above(&mut self.sweep, sweep, 3)
+            || one_above(&mut self.disputes, disputes, 2)
+            || one_above(&mut self.sweep, sweep, 1)
+            || one_above(&mut self.disputes, disputes, 1)
             || one(&mut self.batch, frozen.batch().len())
+            || one(&mut self.sweep, sweep)
+            || one(&mut self.disputes, disputes)
             || one(&mut self.judgement, frozen.judgement.len())
     }
 }
@@ -1230,6 +1272,9 @@ fn render_note(id: &str, frozen: &Frozen, caps: &Caps) -> String {
         Some(machine) => {
             teeth_section(&mut out, id, frozen, machine, caps);
             disputes_section(&mut out, id, machine, caps);
+            if let Some(signals) = machine.signals.as_ref().filter(|s| !s.sweep.is_empty()) {
+                sweep_section(&mut out, id, signals, caps);
+            }
         }
     }
 
@@ -1430,6 +1475,43 @@ fn disputes_section(out: &mut String, record: &str, machine: &MachinePass, caps:
             "\n      {} more dispute(s) wait for the next evaluation, which lists them first.",
             machine.disputes_later_ids.len()
         ));
+    }
+}
+
+/// Item d of section 2 of the start note: the rules the false-block sweep
+/// found refusing real calls that ran fine (`crate::sweep`). Only present when
+/// there are some. Says what it means, the exact calls, when an item is done
+/// and an example - a signal without those makes an agent guess.
+fn sweep_section(out: &mut String, record: &str, signals: &model::store::SignalsSoFar, caps: &Caps) {
+    let list = &signals.sweep;
+    let ids: Vec<String> = list.iter().map(|h| h.rule.clone()).collect();
+    out.push_str(&format!(
+        "\n   d. FALSE-BLOCK SWEEP - {} item(s) would refuse or fire on real calls or replies of the last 30 days that ran \
+         fine ({}): {}. WHAT THIS MEANS: THOR tried each rule on the calls it recorded; one that refuses what ran \
+         fine is probably too wide, and the proxy in 3 cannot see it when the call was walked around. WHAT TO DO, per \
+         item: read its example and the rule (mcp__thor__get). Fine call: narrow it with mcp__thor__revise(id: \"<id>\", \
+         text: \"<reworded>\", check_kind: \"forbidden\", check_literals: [\"<narrower literal>\"], because: \"<why, \
+         {}+ characters>\") or anchor it where it belongs (an answer entry: edit the response rulebook next to the \
+         store). Right call: say so in the report, with the id. DONE WHEN: each item has one outcome in your report and \
+         a narrowed rule answered rule or note. EXAMPLE: 'no-force-push' refused 'git push --force-with-lease' (ran \
+         fine): narrow its literal to --force.",
+        list.len() + signals.sweep_more,
+        if signals.sweep_partial { "not all of the record is covered yet" } else { "all of the record covered" },
+        quoted(&ids),
+        model::store::DISPUTE_REASON_MIN_CHARS
+    ));
+    for hit in list.iter().take(caps.sweep) {
+        let what = if hit.kind == "answer" { "fire on" } else { "refuse" };
+        out.push_str(&format!(
+            "\n      - '{}': would {what} {} of {} real, {} ran fine; e.g. {}",
+            hit.rule, hit.refuses, hit.of, hit.ran_fine, hit.example
+        ));
+    }
+    if list.len() > caps.sweep {
+        out.push_str(&more_line(list.len() - caps.sweep, record));
+    }
+    if signals.sweep_more > 0 {
+        out.push_str(&format!("\n      {} more are named by `serve sweep`, not here.", signals.sweep_more));
     }
 }
 
