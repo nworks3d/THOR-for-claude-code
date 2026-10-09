@@ -3,13 +3,13 @@
 ## Reporting a vulnerability
 
 Use GitHub's private vulnerability reporting on this repository:
-**[Report a vulnerability](https://github.com/nworks3d/THOR-memory-bible-for-AI/security/advisories/new)**.
+**[Report a vulnerability](https://github.com/nworks3d/thor-for-claude-code/security/advisories/new)**.
 It opens a private draft advisory that only you and the maintainer can see,
 so nothing about the problem is public before a fix exists.
 
 Private vulnerability reporting is not turned on for this repository yet. If
 the link above refuses to open a draft, use the fallback instead: open a
-regular [GitHub issue](https://github.com/nworks3d/THOR-memory-bible-for-AI/issues/new)
+regular [GitHub issue](https://github.com/nworks3d/thor-for-claude-code/issues/new)
 and add the `security` label (create it if it does not exist yet, or say
 "security" plainly in the title). Do not paste secrets, real file paths from
 your own machine, or anything else you would not want public into that issue

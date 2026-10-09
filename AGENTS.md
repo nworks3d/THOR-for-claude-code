@@ -21,9 +21,9 @@ send them off to type a command or a path: you have the tools, so run it.
      permission prompt for it; that click is the person's, and they type nothing.
    - Then run the one command for their system:
      - Windows, in PowerShell:
-       `irm https://raw.githubusercontent.com/nworks3d/THOR-memory-bible-for-AI/main/install.ps1 | iex`
+       `irm https://raw.githubusercontent.com/nworks3d/thor-for-claude-code/main/install.ps1 | iex`
      - Linux:
-       `curl -fsSL https://raw.githubusercontent.com/nworks3d/THOR-memory-bible-for-AI/main/install.sh | sh`
+       `curl -fsSL https://raw.githubusercontent.com/nworks3d/thor-for-claude-code/main/install.sh | sh`
      - macOS or any other system: there is no download for it yet, so build it
        from source (see "Installing from a build you made yourself" below).
 
@@ -998,8 +998,8 @@ and warns you if it is not sure.
    anders mee. Mag ik het versturen? Nee zeggen kan gewoon." Ask for nothing but
    yes or no. Never ask them to type, copy or edit anything.
 3. After a yes: when `gh auth status` succeeds, run `gh issue create --repo
-   nworks3d/THOR-memory-bible-for-AI --title "<title>" --body-file <file with the
-   body>`. Otherwise open `https://github.com/nworks3d/THOR-memory-bible-for-AI/issues/new?title=<title>&body=<body>`
+   nworks3d/thor-for-claude-code --title "<title>" --body-file <file with the
+   body>`. Otherwise open `https://github.com/nworks3d/thor-for-claude-code/issues/new?title=<title>&body=<body>`
    in their browser (title and body URL-encoded, the whole address within about
    7,000 characters; cut a longer body and end it with "(shortened)"), so they only
    have to click Submit. After a no, send nothing.

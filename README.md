@@ -377,13 +377,13 @@ system's package manager, and asks you for at most one permission click.
    Windows, in PowerShell:
 
    ```powershell
-   irm https://raw.githubusercontent.com/nworks3d/THOR-memory-bible-for-AI/main/install.ps1 | iex
+   irm https://raw.githubusercontent.com/nworks3d/thor-for-claude-code/main/install.ps1 | iex
    ```
 
    Linux:
 
    ```sh
-   curl -fsSL https://raw.githubusercontent.com/nworks3d/THOR-memory-bible-for-AI/main/install.sh | sh
+   curl -fsSL https://raw.githubusercontent.com/nworks3d/thor-for-claude-code/main/install.sh | sh
    ```
 
    (On Windows, if a THOR program refuses to start, install Microsoft's "Visual

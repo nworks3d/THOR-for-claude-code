@@ -5,10 +5,10 @@
   "description": "Local memory for coding agents. A rule with a runnable proof can refuse a wrong command.",
   "version": "2.5.0",
   "repository": {
-    "url": "https://github.com/nworks3d/THOR-memory-bible-for-AI",
+    "url": "https://github.com/nworks3d/thor-for-claude-code",
     "source": "github"
   },
-  "websiteUrl": "https://github.com/nworks3d/THOR-memory-bible-for-AI",
+  "websiteUrl": "https://github.com/nworks3d/thor-for-claude-code",
   "packages": [
     {
       "registryType": "oci",
