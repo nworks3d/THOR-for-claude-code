@@ -1128,6 +1128,23 @@ fn fresh_session_id() -> String {
 }
 
 #[cfg(test)]
+mod panic_place_tests {
+    use super::panic_place;
+
+    #[test]
+    fn a_panic_place_keeps_the_crate_and_source_file_and_never_a_home_folder() {
+        assert_eq!(panic_place("serve\\src\\bin\\serve.rs", 12), "serve/src/bin/serve.rs:12");
+        assert_eq!(panic_place("serve/src/live.rs", 3), "serve/src/live.rs:3");
+        assert_eq!(
+            panic_place("C:\\Users\\someone\\.cargo\\registry\\src\\index.crates.io-abc\\regex-1.10.0\\src\\lib.rs", 7),
+            "regex-1.10.0/src/lib.rs:7"
+        );
+        assert_eq!(panic_place("/rustc/abc123/library/core/src/option.rs", 9), "core/src/option.rs:9");
+        assert_eq!(panic_place("main.rs", 1), "main.rs:1");
+    }
+}
+
+#[cfg(test)]
 mod resolve_session_id_tests {
     use super::*;
 
@@ -1193,6 +1210,30 @@ mod resolve_session_id_tests {
 /// only the write itself is skipped. It also holds the store's directory
 /// read-only for the whole call (`serve::store_dir`), so no state file beside
 /// the store is written either and the store is opened read-only.
+/// Where the last panic of this process happened, `crate/src/file.rs:line`.
+static PANIC_AT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// A panic location as a bug write-up may carry it: from the crate folder on,
+/// never an absolute path (a dependency panics inside the cargo registry, in a
+/// folder named after the user's home).
+fn panic_place(file: &str, line: u32) -> String {
+    let flat = file.replace('\\', "/");
+    let tail = match flat.rfind("/src/") {
+        Some(at) => {
+            let before = &flat[..at];
+            let krate = before.rsplit('/').next().unwrap_or("");
+            format!("{krate}{}", &flat[at..])
+        }
+        None => flat.rsplit('/').next().unwrap_or("").to_string(),
+    };
+    format!("{}:{line}", tail.trim_start_matches('/'))
+}
+
+/// How much of a prompt's context may already be there for the bug nudge to
+/// still ride along (the nudge is about 4 KB; the context stays far below the
+/// size Claude Code keeps whole).
+const BUG_NUDGE_ROOM_BYTES: usize = 3_500;
+
 /// One hook call: `hook_inner` decides what the surfaces say, and this hands a
 /// Stop notice that does not hold the turn on to the session's next turn
 /// (step 26, `serve::next_turn`). Since 2.5 such a notice goes out at Stop as
@@ -1227,10 +1268,28 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
         }
         ("UserPromptSubmit", out @ (None | Some(HookOutput::Context { .. }) | Some(HookOutput::ContextWithNotice { .. }))) => {
             let waiting = serve::next_turn::take(db_path, &session_id);
-            if waiting.is_empty() {
+            // THE BUG NUDGE (`serve::thor_bugs`): at most one THOR bug
+            // candidate per session, on the first prompt the owner typed, and
+            // never when this prompt already carries a long block (an
+            // evaluation start note): it is deferred, not spent.
+            let in_front: usize = match &out {
+                Some(HookOutput::Context { block, .. }) | Some(HookOutput::ContextWithNotice { block, .. }) => block.len(),
+                _ => 0,
+            };
+            let owner_typed = payload.get("prompt").and_then(|v| v.as_str()).is_some_and(serve::prompt::is_owners_own_text);
+            let bug_nudge = (owner_typed && in_front < BUG_NUDGE_ROOM_BYTES)
+                .then(|| serve::thor_bugs::nudge_for_session(db_path, &session_id, serve::time::now_unix()))
+                .flatten();
+            if waiting.is_empty() && bug_nudge.is_none() {
                 return out;
             }
-            let notes = serve::next_turn::render(&waiting);
+            let mut notes = if waiting.is_empty() { String::new() } else { serve::next_turn::render(&waiting) };
+            if let Some(nudge) = bug_nudge {
+                if !notes.is_empty() {
+                    notes.push_str("\n\n");
+                }
+                notes.push_str(&nudge);
+            }
             let with = |block: String| if block.is_empty() { notes.clone() } else { format!("{notes}\n\n{block}") };
             Some(match out {
                 None => HookOutput::Context { event_name: event_name.to_string(), block: notes, verdicts: Vec::new() },
@@ -5967,9 +6026,20 @@ fn cmd_hook(db_path: &Path, diagnose: bool, actor: Option<String>, no_record: bo
  } else {
  None
  };
- std::panic::set_hook(Box::new(|_| {}));
+ // Silent, but it keeps WHERE THOR's own source panicked, so a panic that
+ // nothing else reports becomes a bug candidate (`serve::thor_bugs`).
+ std::panic::set_hook(Box::new(|info| {
+ if let (Some(location), Ok(mut at)) = (info.location(), PANIC_AT.lock()) {
+ *at = panic_place(location.file(), location.line());
+ }
+ }));
  let db_path = db_path.to_path_buf();
+ let for_panic = db_path.clone();
  let result = std::panic::catch_unwind(move || hook_once(&db_path, payload_text, &actor, no_record));
+ if result.is_err() {
+ let place = PANIC_AT.lock().map(|at| at.clone()).unwrap_or_default();
+ serve::thor_bugs::record_panic(&for_panic, "hook", &place);
+ }
  // Taken before the match below consumes `result`.
  let diagnosis: Option<(&str, i32)> = if diagnose {
  Some(match &result {

@@ -1164,13 +1164,42 @@ pub fn render_start_note(id: &str, frozen: &Frozen) -> String {
 /// whole note is. What the session must act on comes first and a cut never
 /// takes an item without saying so.
 pub fn render_start_note_within(id: &str, frozen: &Frozen, budget: usize) -> String {
+    let (note, _) = fit_note(id, frozen, budget);
+    note
+}
+
+/// The note that fits `budget`, and the caps it took to fit.
+fn fit_note(id: &str, frozen: &Frozen, budget: usize) -> (String, Caps) {
     let mut caps = Caps::all();
     loop {
         let note = render_note(id, frozen, &caps);
         if note.len() <= budget || !caps.shrink(frozen) {
-            return note;
+            return (note, caps);
         }
     }
+}
+
+/// The lists of items that NEED ACTION which the start note, fitted to
+/// `budget`, leaves out in part: "judgement", "batch", "A4 list" or
+/// "disputes". The open points and the probable false blocks need nothing and
+/// are not counted. Used by `thor_bugs`: a note that cannot show what it asks
+/// for is a defect of THOR's, not of the user's work.
+pub fn lists_cut(id: &str, frozen: &Frozen, budget: usize) -> Vec<&'static str> {
+    let (_, caps) = fit_note(id, frozen, budget);
+    let mut cut = Vec::new();
+    if frozen.judgement.len() > caps.judgement {
+        cut.push("judgement");
+    }
+    if frozen.batch().len() > caps.batch {
+        cut.push("batch");
+    }
+    if frozen.a4_list().len() > caps.a4 {
+        cut.push("A4 list");
+    }
+    if frozen.dispute_list().len() > caps.disputes {
+        cut.push("disputes");
+    }
+    cut
 }
 
 fn render_note(id: &str, frozen: &Frozen, caps: &Caps) -> String {

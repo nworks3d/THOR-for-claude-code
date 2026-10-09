@@ -3498,6 +3498,26 @@ pub const SETUP_NOTE_ID: &str = "walk-through-the-answer-guard-once";
 /// scope this could possibly be filed under.
 pub const OWNER_SETUP_ANSWERS_ID: &str = "owner-setup-answers";
 
+/// The id prefix and the tag prefix of the Report that records what became of
+/// a THOR bug candidate (`serve::thor_bugs`): id `thor-bug-<fingerprint>`, tag
+/// `thor-bug:<fingerprint>`.
+pub const THOR_BUG_ID_PREFIX: &str = "thor-bug-";
+pub const THOR_BUG_TAG_PREFIX: &str = "thor-bug:";
+
+/// Whether `item` is the outcome Report of a THOR bug candidate: a Report whose
+/// id is `thor-bug-<fingerprint>` and which carries the tag
+/// `thor-bug:<fingerprint>` for that same fingerprint. Such a Report is about
+/// THOR itself and belongs to no project, so ground 21 (archive material needs
+/// a scope) does not ask for one - the same concession `OWNER_SETUP_ANSWERS_ID`
+/// has, and as narrow: the id and the tag must name one fingerprint.
+pub fn is_thor_bug_outcome(item: &Item) -> bool {
+    item.kind == Kind::Report
+        && item
+            .id
+            .strip_prefix(THOR_BUG_ID_PREFIX)
+            .is_some_and(|fp| !fp.is_empty() && item.tags.iter().any(|t| t.strip_prefix(THOR_BUG_TAG_PREFIX) == Some(fp)))
+}
+
 // ------------------------------------------------------- evaluation obligation
 //
 // WHAT THIS SECTION CLOSES (2026-09-25). Filing an evaluation report used to
@@ -5275,6 +5295,16 @@ pub fn superseded_words(superseded: &FrozenSuperseded) -> String {
 pub fn previous_evaluation_start(store: &EventStore, project: &str, before_seq: i64) -> Option<EvaluationStart> {
     let events = store.events_of_kinds(&[EventKind::FactCreated, EventKind::FactRevised], 0).ok()?;
     starts_in(&events).into_iter().filter(|s| s.frozen.project == project && s.seq < before_seq).max_by_key(|s| s.seq)
+}
+
+/// Every evaluation start record written after log seq `since`, in any
+/// session, oldest first, each with the lists its record holds now (the batch
+/// record and a void mark included, wherever they sit on the log).
+pub fn evaluation_starts_after(store: &EventStore, since: i64) -> Vec<EvaluationStart> {
+    let Ok(events) = store.events_of_kinds_by_actor(&[EventKind::FactCreated, EventKind::FactRevised], EVAL_MACHINE_ACTOR) else {
+        return Vec::new();
+    };
+    starts_in(&events).into_iter().filter(|s| s.seq > since).collect()
 }
 
 /// Every evaluation start record `session` wrote, oldest first.
