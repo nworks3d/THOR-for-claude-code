@@ -103,6 +103,18 @@ fn agents_md_lists_every_starter_note_and_says_any_can_go() {
 }
 
 #[test]
+fn the_component_readme_counts_the_starter_pack_right() {
+    let words = ["Ten", "Eleven", "Twelve", "Thirteen", "Fourteen", "Fifteen", "Sixteen", "Seventeen", "Eighteen"];
+    let n = ops::install::workflow_starter_pack().len();
+    let word = words.get(n.wrapping_sub(10)).unwrap_or_else(|| panic!("add the word for {n} to this test"));
+    let readme = read("thor2/README.md");
+    assert!(
+        readme.contains(&format!("{word} more notes make up the workflow starter pack")),
+        "thor2/README.md does not say '{word} more notes make up the workflow starter pack' ({n} notes in the pack)"
+    );
+}
+
+#[test]
 fn the_first_session_has_defaults_that_never_block() {
     let agents = read("AGENTS.md");
     let section = agents.split("# First session with a new owner").nth(1).unwrap().to_lowercase();

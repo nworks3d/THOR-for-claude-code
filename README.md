@@ -337,6 +337,14 @@ It works the way a shelf works.
 
 ## Getting started
 
+**The shortest way - let your assistant do it.** Send your assistant the link to
+this repository and ask it to "install THOR". It reads [AGENTS.md](AGENTS.md),
+which is written for it, runs the one command below for you, checks that it
+worked, and asks you for exactly one thing: restart it once. Nothing to
+download, no paths to type, no Rust to install, no questions to answer - the
+first conversation after the restart finishes the setup on its own, with
+defaults you can change just by saying so.
+
 **The short way - one command.** It downloads the latest release, checks the
 download against the checksum published next to it, unpacks it into your home
 folder, and runs the whole setup.
@@ -399,6 +407,17 @@ sounds: an assistant with nothing in front of it writes notes in a shape that
 never fires again, and neither of you would notice for weeks. They are ordinary
 notes - unpin one, rewrite it in your own words, or throw it out. An existing
 memory is never seeded, so upgrading never pushes anything into your own notes.
+
+It also gets a starter set of general work rules for coding with an assistant,
+the habits the author learnt the hard way: a changelog line with every
+user-visible change (when the project keeps one), run the tests and quote the
+real result before saying "done", never commit a secret, no force-push of a
+shared branch, check where you push, scan before anything goes public, write a
+complete brief for every agent you spawn, and a few more. Each one arrives right
+before the step it is about - the commit, the push, the agent being spawned - and
+none of them ever refuses anything: they only inform, so a rule written for
+someone else's project cannot block yours. Ask your assistant to remove any you
+do not want.
 
 You only reach for a flag if your setup is unusual: `--settings` and `--mcp-json`
 send it at other files, `--db` and `--serve-exe` override where it looks, and

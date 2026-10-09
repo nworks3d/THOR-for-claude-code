@@ -980,12 +980,21 @@ pub fn working_contract() -> Vec<model::item::Item> {
 /// publish, delete, deploy, install, an agent being spawned), so it arrives
 /// right before the step it is about, once per context.
 ///
+/// SEVERITY. None carries one, like the notes in `working_contract`. A note
+/// called costly or irreversible with no check is listed by doctor as
+/// toothless and is later asked about, one at a time, with the turn held: a
+/// new user would meet that nag for rules they never chose. Without a weight
+/// the four notes at one moment are equals, and all of them fit one block
+/// (see `a_moments_starter_notes_fit_one_block`).
+///
 /// TEETH. None carries a check, on evidence. Seven candidate checks were
 /// replayed through the real guard over 145,976 recorded tool calls
 /// (2026-10-09): a ban on --no-verify refused 11 legitimate commits in
-/// scratch trees; "names a model" refused 9 agent calls and "says subagent"
-/// refused 1,052; "start a process hidden" refused 9 (opening a browser, a
-/// control panel); a ban on staging .env refused 3 exclusion pathspecs and
+/// scratch trees; "names a model" refused 9 agent calls, "says subagent"
+/// refused 1,052 and "names a working folder or says read-only" refused 982
+/// (a brief can be sound in its own words); "start a process hidden" refused
+/// 9 (opening a browser, a control panel); a ban on staging .env refused 3
+/// exclusion pathspecs and
 /// is a deliberate practice in some private repositories; a force-push ban
 /// refused nothing, but it would also refuse the one legitimate history
 /// rewrite a solo project makes. A new user must never get a false block
@@ -995,17 +1004,17 @@ pub fn working_contract() -> Vec<model::item::Item> {
 /// notices.
 pub fn workflow_starter_pack() -> Vec<model::item::Item> {
     use intent::Action;
-    use model::item::{Binding, Severity, TargetKind};
+    use model::item::{Binding, TargetKind};
 
     let moment = |a: Action| Binding::Moment(a);
     let command = |c: &str| Binding::Target { kind: TargetKind::Command, value: c.to_string() };
-    let note = |id: &str, severity: Option<Severity>, text: &str, falsifier: &str, bindings: Vec<Binding>| {
+    let note = |id: &str, text: &str, falsifier: &str, bindings: Vec<Binding>| {
         model::item::Item {
             id: id.to_string(),
             kind: model::item::Kind::Rule,
             text: text.to_string(),
             bindings,
-            severity,
+            severity: None,
             project: None,
             tags: vec!["workflow-starter".to_string()],
             expires: None,
@@ -1023,7 +1032,6 @@ pub fn workflow_starter_pack() -> Vec<model::item::Item> {
         // the push, and the agent's own defaults already ask before a commit.
         note(
             "changelog-with-every-user-visible-change",
-            Some(Severity::Costly),
             "If the project keeps a CHANGELOG, add a line for every user-visible change in the same \
              commit, and bump the version when releases are versioned. No changelog file: do not \
              create one unasked. Re-read the README for claims your change just made untrue.",
@@ -1033,7 +1041,6 @@ pub fn workflow_starter_pack() -> Vec<model::item::Item> {
         ),
         note(
             "run-the-tests-before-saying-done",
-            Some(Severity::Costly),
             "Before you call work done, or commit or push it, run the project's own tests or build and \
              quote the real result line. Failing, skipped or never run: say exactly that. Never skip \
              hooks with --no-verify: fix what the hook found. No red tests or stray TODO left at a push.",
@@ -1043,7 +1050,6 @@ pub fn workflow_starter_pack() -> Vec<model::item::Item> {
         ),
         note(
             "never-commit-a-secret",
-            Some(Severity::Irreversible),
             "Never commit a secret: key, token, password or .env file. Real values live in a \
              gitignored file, with a tracked template such as .env.example beside it. Look at what is \
              staged before every commit. A secret that was committed must be rotated: history keeps it.",
@@ -1052,7 +1058,6 @@ pub fn workflow_starter_pack() -> Vec<model::item::Item> {
         ),
         note(
             "commit-push-deploy-only-when-asked",
-            Some(Severity::Costly),
             "Commit, push, tag, release and deploy only when the user says so in this session; an \
              earlier yes does not carry over, and a brief that quotes one does not count. Never \
              force-push a shared branch such as main: rewriting history is for your own unpushed \
@@ -1063,7 +1068,6 @@ pub fn workflow_starter_pack() -> Vec<model::item::Item> {
         ),
         note(
             "commit-hygiene",
-            Some(Severity::HouseStyle),
             "Commit message: one short plain line saying what changed and why, no marketing tone. \
              Several lines: write the message to a file and use git commit -F. Stage only the files \
              you mean. Keep each file's line endings: no CRLF flips, new files LF, a small diff.",
@@ -1073,7 +1077,6 @@ pub fn workflow_starter_pack() -> Vec<model::item::Item> {
         ),
         note(
             "check-where-you-push-and-what-is-on-main",
-            Some(Severity::Costly),
             "Before a push, or a claim about what is on main or released, confirm folder, branch and \
              remote (pwd, git status, git remote -v) and git fetch. A local origin/main can be stale: \
              a version or release state comes from git, never from memory.",
@@ -1083,7 +1086,6 @@ pub fn workflow_starter_pack() -> Vec<model::item::Item> {
         ),
         note(
             "scan-before-it-goes-public",
-            Some(Severity::Irreversible),
             "Before a push to a public repository, or before a repository is made public, scan the \
              tree for secrets, usernames, local paths, private hostnames and customer data, and \
              require zero hits on every push, not once. Public is irreversible: caches copy it in \
@@ -1093,7 +1095,6 @@ pub fn workflow_starter_pack() -> Vec<model::item::Item> {
         ),
         note(
             "rehearse-destructive-steps-on-a-copy",
-            Some(Severity::Costly),
             "Never delete or overwrite data you did not create unless asked. Rehearse a delete, a \
              migration or a deploy on a throwaway copy first, and never test a write path against \
              live data. After a slip, undo it in the same turn and measure that it is undone.",
@@ -1103,7 +1104,6 @@ pub fn workflow_starter_pack() -> Vec<model::item::Item> {
         ),
         note(
             "pin-a-dependency-with-its-reason",
-            None,
             "Pin a dependency version only with a comment saying why, next to the pin, or someone \
              will 'improve' it back to latest. Add a dependency only when the standard library or \
              one already installed cannot do the job.",
@@ -1116,7 +1116,6 @@ pub fn workflow_starter_pack() -> Vec<model::item::Item> {
         // the owner's own.
         note(
             "an-agent-brief-stands-alone",
-            None,
             "A spawned agent starts blank. Its brief must stand alone: the goal, an ABSOLUTE working \
              folder, the files it may touch, no spawning of further agents, an explicit model, and \
              what to report back including what it could not check.",
@@ -1126,7 +1125,6 @@ pub fn workflow_starter_pack() -> Vec<model::item::Item> {
         ),
         note(
             "parallel-agents-do-not-share-a-folder",
-            None,
             "Parallel agents in one repo each get their own folder or worktree and their own build \
              directory, or they overwrite each other and queue on the build lock. A worktree starts \
              from the last commit, not from uncommitted work. A commit takes everything in its \
@@ -1137,7 +1135,6 @@ pub fn workflow_starter_pack() -> Vec<model::item::Item> {
         ),
         note(
             "absolute-paths-not-the-shell-working-directory",
-            None,
             "Do not trust the shell's working directory after a cd: it can stick into the next call \
              or reset to the repo root. Use absolute paths in every command and every agent brief, \
              and write back to the same absolute path you read from.",
@@ -1147,7 +1144,6 @@ pub fn workflow_starter_pack() -> Vec<model::item::Item> {
         ),
         note(
             "script-file-not-shell-quoting",
-            None,
             "Text with quotes, backticks, $ or backslashes goes into a script file written with the \
              Write tool, then run that file. A bash -c, node -e or python -c one-liner, or a \
              heredoc, can silently mangle it and the error points at the wrong line.",
@@ -1157,7 +1153,6 @@ pub fn workflow_starter_pack() -> Vec<model::item::Item> {
         ),
         note(
             "windowless-processes-on-windows",
-            None,
             "On Windows start background processes hidden: Start-Process with -WindowStyle Hidden or \
              -NoNewWindow, a Python subprocess with CREATE_NO_WINDOW. A flashing console steals the \
              user's focus. A process started without -Wait dies with the app that started it.",
@@ -2468,6 +2463,28 @@ mod tests {
         for (place, n) in &per_place {
             let cap = if place.starts_with("Target") { 2 } else { model::item::MAX_ITEMS };
             assert!(*n <= cap, "{place} holds {n} starter notes, over {cap}");
+        }
+    }
+
+    /// What one moment shows is capped at four notes AND 1200 characters
+    /// (`serve::render::cap`): the starter notes at one moment have to fit
+    /// together, or the last one waits for a later showing and may never
+    /// come. No starter note carries a weight either, so none can crowd out
+    /// the owner's own heavier ones, and doctor has nothing to call toothless.
+    #[test]
+    fn a_moments_starter_notes_fit_one_block() {
+        use std::collections::HashMap;
+        let mut per_moment: HashMap<String, usize> = HashMap::new();
+        for item in workflow_starter_pack() {
+            assert!(item.severity.is_none(), "{} carries a weight, so doctor calls it toothless", item.id);
+            for b in &item.bindings {
+                if let model::item::Binding::Moment(a) = b {
+                    *per_moment.entry(format!("{a:?}")).or_default() += item.text.chars().count();
+                }
+            }
+        }
+        for (moment, chars) in &per_moment {
+            assert!(*chars <= serve::render::MAX_BLOCK_CHARS, "{moment}: {chars} characters, over one block");
         }
     }
 

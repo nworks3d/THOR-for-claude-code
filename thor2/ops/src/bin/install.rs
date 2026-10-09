@@ -350,11 +350,12 @@ fn main() -> ExitCode {
             match seed_working_contract(&db) {
                 Ok(seeded) => {
                     let stored = seeded.iter().filter(|s| s.stored).count();
-                    println!("+ put {stored} starting notes in it, on how to write one that comes back");
+                    println!("+ put {stored} starting notes in it: how to write one that comes back, and a starter set of work rules");
                     for s in seeded.iter().filter(|s| !s.stored) {
                         println!("  ! {} was refused: {}", s.id, s.refusal.as_deref().unwrap_or("no reason given"));
                     }
                     println!("  they are ordinary notes: unpin one, rewrite it, or throw it out");
+                    println!("  the work rules are tagged workflow-starter; remove any you do not want by asking your assistant");
                 }
                 Err(e) => println!("  ! could not write the starting notes: {e}"),
             }

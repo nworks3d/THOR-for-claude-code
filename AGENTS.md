@@ -28,9 +28,11 @@ send them off to type a command or a path: you have the tools, so run it.
    registers it. No Rust toolchain, no question, no path to type. If your own
    harness asks the person to approve running it, or editing Claude Code's
    settings, that is the harness asking: it is the one click they cannot skip.
-2. **Check it before the restart.** Run `doctor` and let one hook fire by hand,
-   exactly as written in "Checking it" below. If a line is not fine, fix it
-   yourself and run the check again. Only report success when both pass.
+2. **Check it before the restart.** Run `doctor` and then `serve session-start`,
+   exactly as written in "Checking it" below: the first says the memory is
+   healthy, the second shows what the next conversation will be handed. If
+   either is not fine, fix it yourself and run the check again. Only report
+   success when both pass.
 3. **Ask for the restart, in one sentence.** Say that Claude Code reads the new
    memory at startup only, so they need to close it and open it again (or type
    `/exit` and start it again). This is the one thing you cannot do for them.
@@ -114,32 +116,32 @@ produces no error later, only silence, and their memory would simply never speak
 ## Checking it
 
 Both of these work before the restart. First the health check, with the store path
-from the `memory:` line the install printed:
+from the `memory:` line the install printed (`<bin>` is the folder the install
+unpacked into: `%USERPROFILE%\thor2` on Windows, `~/.thor2` on Linux):
 
 ```sh
-"<the folder the install unpacked into>/doctor" --db "<their store>"
+"<bin>/doctor" --db "<their store>"
 ```
 
-One plain line per part. A missing language model is not a problem: THOR works
-without it, just with simpler matching. Then let one hook fire by hand, the way
-Claude Code will on the next start, without recording anything in the memory:
+One plain line per part. What you look for: `memory store: N events, chain intact`,
+`falsifiers: all N rule(s)/orientation(s) have one` and `dead moments: none`. A
+missing language model is not a problem: THOR works without it, just with simpler
+matching. A fresh memory also prints lines headed `undecided`, `toothless` and
+`batch`: that is the upkeep THOR will do itself in its first evaluation, not a
+fault, so do not act on them and do not read them out to the person.
 
-PowerShell:
-
-```powershell
-'{"hook_event_name":"SessionStart","session_id":"setup-check","cwd":"."}' | & "$HOME\thor2\serve.exe" --db "<their store>" hook --no-record
-```
-
-sh:
+Then ask the memory what it would hand over at the start of a conversation. This is
+the very thing Claude Code's hook asks on the next start, without recording
+anything:
 
 ```sh
-echo '{"hook_event_name":"SessionStart","session_id":"setup-check","cwd":"."}' | ~/.thor2/serve --db "<their store>" hook --no-record
+"<bin>/serve" --db "<their store>" session-start
 ```
 
-It answers with a block of JSON whose `additionalContext` holds the notes that
-arrive at the start of every conversation (the starting notes, among them
-`say-what-actually-happened`). An answer with nothing in it, or no answer at all,
-means the hooks would stay silent: re-run the install and read what it printed.
+It prints a `Standing rules for this session:` block holding the starting notes
+(among them `say-what-actually-happened` and `walk-through-the-answer-guard-once`).
+A block with nothing in it, or an error, means the memory would stay silent after
+the restart: run the install again and read what it printed.
 
 ## Another project, later
 

@@ -581,6 +581,65 @@ impl Smoke {
         Ok(format!("{} tools offered, remember answered: {}", names.len(), text.lines().next().unwrap_or("")))
     }
 
+    /// AGENTS.md "Checking it": `serve session-start`, the command a fresh
+    /// agent runs before the restart, must list the notes the next
+    /// conversation is handed - among them the setup note that carries the
+    /// defaults, which is what lets a session that never read AGENTS.md
+    /// finish the first session without asking anything.
+    fn step_session_start_preview(&self) -> StepResult {
+        let mut cmd = self.command("serve");
+        cmd.arg("--db").arg(self.db()).arg("session-start");
+        let out = run(cmd, None, Duration::from_secs(60))?;
+        if !out.ok() {
+            return Err(out.describe());
+        }
+        for needed in ["walk-through-the-answer-guard-once", "say-what-actually-happened", "owner-setup-answers"] {
+            if !out.stdout.contains(needed) {
+                return Err(format!("`serve session-start` never lists {needed}:\n{}", out.stdout));
+            }
+        }
+        Ok(format!("{} characters, with the setup note and its defaults", out.stdout.len()))
+    }
+
+    /// The workflow starter pack reaches the hook: a `git commit` tool call
+    /// is answered with the commit notes, before the commit runs.
+    fn step_starter_pack_reaches_the_commit_hook(&self) -> StepResult {
+        let settings = self.read_json(&self.settings())?;
+        let command = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .ok_or("no PreToolUse command in settings.json")?;
+        let parts = split_command(command);
+        let mut cmd = Command::new(&parts[0]);
+        cmd.args(&parts[1..]);
+        let home = self.home();
+        cmd.current_dir(self.elsewhere()).env("HOME", &home).env("USERPROFILE", &home);
+        cmd.env("LOCALAPPDATA", home.join("localappdata")).env("XDG_DATA_HOME", home.join("xdg-data"));
+        let payload = json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "release-smoke-commit",
+            "cwd": self.elsewhere().display().to_string().replace('\\', "/"),
+            "tool_name": "Bash",
+            "tool_input": {"command": "git commit -m \"add greeting\""}
+        })
+        .to_string();
+        let out = run(cmd, Some(&payload), Duration::from_secs(60))?;
+        if !out.ok() {
+            return Err(out.describe());
+        }
+        let parsed: Value =
+            serde_json::from_str(out.stdout.trim()).map_err(|e| format!("hook output is not JSON ({e}): {}", out.stdout))?;
+        let context = parsed["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or("");
+        for needed in ["never-commit-a-secret", "run-the-tests-before-saying-done"] {
+            if !context.contains(needed) {
+                return Err(format!("a git commit was not answered with {needed}. It was answered with:\n{context}"));
+            }
+        }
+        if parsed["hookSpecificOutput"]["permissionDecision"].as_str() == Some("deny") {
+            return Err("the starter pack refused a plain git commit".to_string());
+        }
+        Ok("a git commit is answered with the starter commit notes and is not refused".to_string())
+    }
+
     /// Run the SessionStart hook exactly as the settings.json line names it,
     /// against the new store, and expect the stored note back.
     fn step_session_start_serves_it(&self, token: &str) -> StepResult {
@@ -651,6 +710,8 @@ fn a_new_user_can_install_and_use_the_shipped_programs() {
     step("install inside a project (step 5)", smoke.step_project_install());
     step("remember through mcp over stdio (step 6)", smoke.step_remember_through_mcp(token));
     step("SessionStart hook serves the note back", smoke.step_session_start_serves_it(token));
+    step("serve session-start lists the setup note (Checking it)", smoke.step_session_start_preview());
+    step("starter pack reaches a git commit", smoke.step_starter_pack_reaches_the_commit_hook());
 
     assert!(failed.is_empty(), "release smoke FAILED {} step(s): {}", failed.len(), failed.join("; "));
     println!("release smoke: all steps passed");
