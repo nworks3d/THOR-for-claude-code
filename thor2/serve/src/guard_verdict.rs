@@ -124,7 +124,7 @@ impl Call {
         cwd: Option<&Path>,
     ) -> Option<Call> {
         let command = absent_guard::proposed_command(tool_input)?;
-        let segments = shell::segments(command, shell::dialect_for(tool_name));
+        let segments = shell::call_segments(tool_name, command);
         let projects = segment_projects(live, &segments, cwd, project);
         Some(Call { segments, projects })
     }
@@ -488,8 +488,17 @@ fn requires_in(
 /// its rules still apply. Without "known", `git init` in any scratch folder
 /// made a project of its basename, and one `cd` into it silenced every rule
 /// of the session's project. The stated price: a command whose effect
-/// depends on its folder, run in a folder of no known project (a `git push`
-/// of a scratch repository), is judged under the session's project.
+/// depends on its folder, run in a folder of no known project, is judged
+/// under the session's project. Two things soften that price, for `git`
+/// alone - it acts on the repository that holds its folder, and a repository
+/// of no project this store knows is not the session's project (a `git push` in it is
+/// judged by the global rules only): a folder that resolves to such a project, and a
+/// repository the same call makes itself (`scratch_made_by`: `git init <dir>`,
+/// `git clone <local source> [dir]` of a folder that is not there yet).
+///
+/// A folder written with a variable (`git -C $b push`, `cd $b`) is read with
+/// the variables the segments before it certainly set (`shell::env_before`);
+/// a name nothing set leaves the folder one no reader resolves.
 ///
 /// The store's projects are read only when some segment's folder resolves to
 /// a project other than the session's (`Live::knows_project`), and each
@@ -501,24 +510,104 @@ pub fn segment_projects(
     session_project: Option<&str>,
 ) -> Vec<Option<String>> {
     let mut folders: HashMap<PathBuf, Option<String>> = HashMap::new();
-    segments
-        .iter()
-        .map(|segment| {
-            let session = session_project.map(str::to_string);
-            if segment.remote {
-                return session;
+    let mut scratch: Vec<PathBuf> = Vec::new();
+    let mut projects = Vec::with_capacity(segments.len());
+    for (i, segment) in segments.iter().enumerate() {
+        let session = session_project.map(str::to_string);
+        if segment.remote {
+            projects.push(session);
+            continue;
+        }
+        let resolve = |typed: Option<&str>| {
+            let text = typed.map(|dir| {
+                if dir.contains('$') {
+                    shell::expand_vars(dir, &shell::env_before(segments, i))
+                } else {
+                    dir.to_string()
+                }
+            });
+            effective_dir(text.as_deref(), cwd)
+        };
+        let dir = resolve(segment.dir.as_deref());
+        // Where the segment runs if every `cd` before it took effect: how a folder the call
+        // makes is named, the way the call itself names it (`cd hk` after `mkdir hk &&`).
+        let intended = resolve(segment.any_cd_dir.as_deref());
+        let git = segment.head.first().is_some_and(|w| w.eq_ignore_ascii_case("git"));
+        let project = match &dir {
+            // A repository this very call made is nobody's project (`scratch_made_by`).
+            _ if git && intended.as_ref().is_some_and(|dir| scratch.iter().any(|root| dir.starts_with(root))) => None,
+            Some(dir) => {
+                let folder = folders
+                    .entry(dir.clone())
+                    .or_insert_with_key(|dir| if dir.is_dir() { project::resolve_project(&canonical(dir)) } else { None })
+                    .clone();
+                match folder {
+                    Some(other) if session_project != Some(other.as_str()) && live.knows_project(&other) => Some(other),
+                    // git acts on the repository that holds its folder: one of no project this
+                    // store knows is not the session's project.
+                    Some(other) if git && session_project != Some(other.as_str()) => None,
+                    _ => session,
+                }
             }
-            let Some(dir) = effective_dir(segment.dir.as_deref(), cwd) else { return session };
-            let folder = folders
-                .entry(dir)
-                .or_insert_with_key(|dir| if dir.is_dir() { project::resolve_project(&canonical(dir)) } else { None })
-                .clone();
-            match folder {
-                Some(other) if session_project != Some(other.as_str()) && live.knows_project(&other) => Some(other),
-                _ => session,
+            None => session,
+        };
+        projects.push(project);
+        if let Some(root) = scratch_made_by(segment, intended.as_deref(), cwd) {
+            scratch.push(root);
+        }
+    }
+    projects
+}
+
+/// The repository a `git init <dir>` or a `git clone <local source> [dir]`
+/// makes, as a path read from `base` (the folder the segment runs in, else the
+/// session's `cwd`). It is a repository this call MAKES only when nothing is
+/// there yet: a `git init` of a folder that exists is a re-init of what it
+/// was. A clone of a remote source (`https://`, `git@host:`, `host:path`) is
+/// not scratch: its pushes go to that remote. A `git init` naming no folder
+/// makes the folder the segment is in, which is not a path this can place.
+fn scratch_made_by(segment: &Segment, dir: Option<&Path>, cwd: Option<&Path>) -> Option<PathBuf> {
+    let head = &segment.head;
+    if !head.first().is_some_and(|w| w.eq_ignore_ascii_case("git")) {
+        return None;
+    }
+    let takes_value = |w: &str| {
+        matches!(
+            w,
+            "-b" | "--branch" | "--initial-branch" | "--template" | "--separate-git-dir" | "--object-format" | "-o" | "--origin"
+                | "--depth" | "--reference" | "-c" | "--config" | "-j" | "--jobs" | "--filter"
+        )
+    };
+    let mut operands: Vec<&str> = Vec::new();
+    let mut skip = false;
+    for w in head.iter().skip(2).take_while(|w| *w != "--") {
+        if std::mem::take(&mut skip) {
+            continue;
+        }
+        if takes_value(w) {
+            skip = true;
+        } else if !w.starts_with('-') {
+            operands.push(w);
+        }
+    }
+    let named = match head.get(1).map(String::as_str)? {
+        "init" => operands.last()?.to_string(),
+        "clone" => {
+            let source = *operands.first()?;
+            let remote = source.contains("://") || source.contains('@') || source.get(2..).is_some_and(|rest| rest.contains(':'));
+            if remote {
+                return None;
             }
-        })
-        .collect()
+            match operands.get(1) {
+                Some(dir) => dir.to_string(),
+                None => source.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next()?.trim_end_matches(".git").to_string(),
+            }
+        }
+        _ => return None,
+    };
+    let native = drive_form(&named);
+    let made = without_dots(&dir.or(cwd)?.join(native));
+    (!made.exists()).then_some(made)
 }
 
 /// The store's live items for one decision, and the projects they are filed

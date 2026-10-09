@@ -350,11 +350,12 @@ fn a_cd_into_another_checkout_is_judged_by_that_checkouts_rules() {
     assert!(blocked(&out) && reason(&out).contains("alpha-never-pushes"), "--git-dir names the folder: {out}");
 }
 
-/// A folder of no project, a real scratch repository (`git init` gives it a
-/// `.git`, so its folder name resolves as a project nobody ever named), a
-/// folder whose marker names a project this store does not know, a folder
-/// that is not there, and every folder no reader can resolve all keep the
-/// session's project: none of them silences alpha's push ban.
+/// A folder of no project, a folder that is not there, and every folder no
+/// reader can resolve all keep the session's project: none of them silences
+/// alpha's push ban. (A real scratch repository, and a folder whose marker
+/// names a project this store does not know, are repositories of no project
+/// the memory knows: `git` acts on the repository that holds its folder, so a
+/// push there is not alpha's - `a_push_in_a_repository_of_no_known_project_is_not_the_sessions`.)
 #[test]
 fn a_cd_into_no_project_or_a_network_path_keeps_the_sessions_rules() {
     let tmp = tempfile::tempdir().unwrap();
@@ -363,14 +364,9 @@ fn a_cd_into_no_project_or_a_network_path_keeps_the_sessions_rules() {
     repo(tmp.path(), "beta");
     let scratch = tmp.path().join("scratch");
     std::fs::create_dir_all(&scratch).unwrap();
-    let scratch_repo = tmp.path().join("scratch-repo");
-    std::fs::create_dir_all(scratch_repo.join(".git")).unwrap();
-    let stranger = repo(tmp.path(), "gamma");
     let text = |p: &Path| p.to_string_lossy().replace('\\', "/");
     for command in [
         format!("cd {} && git push origin main", text(&scratch)),
-        format!("cd {} && git push origin main", text(&scratch_repo)),
-        format!("cd {} && git push origin main", text(&stranger)),
         "cd ../beta/not-there; git push origin main".to_string(),
         "cd //nas-share/docker/x && git push origin main".to_string(),
         "cd $HOME/x && git push origin main".to_string(),
@@ -380,6 +376,30 @@ fn a_cd_into_no_project_or_a_network_path_keeps_the_sessions_rules() {
         let out = run_hook(&db, &bash("s-5c", &alpha, &command));
         assert!(blocked(&out) && reason(&out).contains("alpha-never-pushes"), "{command} must keep alpha's rules: {out}");
     }
+}
+
+/// A real scratch repository (`git init` gives it a `.git`, so its folder name
+/// resolves as a project nobody ever named) and a folder whose marker names a
+/// project this store does not know are repositories of no project the memory
+/// knows: a `git push` run there pushes that repository, not alpha.
+#[test]
+fn a_push_in_a_repository_of_no_known_project_is_not_the_sessions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = two_projects_with_push_rules(tmp.path());
+    let alpha = repo(tmp.path(), "alpha");
+    repo(tmp.path(), "beta");
+    let scratch_repo = tmp.path().join("scratch-repo");
+    std::fs::create_dir_all(scratch_repo.join(".git")).unwrap();
+    let stranger = repo(tmp.path(), "gamma");
+    let text = |p: &Path| p.to_string_lossy().replace('\\', "/");
+    for folder in [&scratch_repo, &stranger] {
+        let out = run_hook(&db, &bash("s-5c", &alpha, &format!("cd {} && git push origin main", text(folder))));
+        assert!(!blocked(&out), "a push in {} is not alpha's: {out}", text(folder));
+        let out = run_hook(&db, &bash("s-5c", &alpha, &format!("git -C {} push origin main", text(folder))));
+        assert!(!blocked(&out), "git -C {} names that repository: {out}", text(folder));
+    }
+    let out = run_hook(&db, &bash("s-5c", &alpha, "git push origin main"));
+    assert!(blocked(&out) && reason(&out).contains("alpha-never-pushes"), "alpha itself is still refused: {out}");
 }
 
 /// The measured false block (2026-09-26) still holds per segment: another

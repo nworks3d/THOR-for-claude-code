@@ -160,6 +160,24 @@ pub fn dialect_for(tool_name: &str) -> Dialect {
     }
 }
 
+/// The tools that end every call by themselves at a deadline the tool
+/// enforces: Monitor takes a `timeout_ms` (default five minutes, capped at
+/// thirty) and kills the script at it. A loop in such a call cannot run
+/// forever, which is what a rule asking for a bound on a loop is about
+/// (`bounds_a_loop`).
+const DEADLINE_TOOLS: &[&str] = &["Monitor"];
+
+/// Every simple command a tool call's `command` runs (`segments`, in the
+/// dialect of its tool), each marked `bounded` when the tool enforces a
+/// deadline (`DEADLINE_TOOLS`). The one cut every reader of a call uses.
+pub fn call_segments(tool_name: &str, command: &str) -> Vec<Segment> {
+    let mut segments = segments(command, dialect_for(tool_name));
+    if DEADLINE_TOOLS.contains(&tool_name) {
+        segments.iter_mut().for_each(|s| s.bounded = true);
+    }
+    segments
+}
+
 /// One `>`/`>>` redirection of a segment (5d): the file it writes, whether it
 /// appends, and whether a real command in the segment produces what is written
 /// (a bare `> f` or `: > f` produces nothing and so empties the file).
@@ -219,6 +237,19 @@ pub struct Segment {
     /// could not be read in full: an anchor reaches it wherever its words
     /// stand. Never read for a file write.
     pub flat: bool,
+    /// The one pseudo-segment of a tool call that carries no command
+    /// (`tool_segment`): its only word is the tool's own name. An anchor
+    /// reaches it only when it is spelled exactly as that name
+    /// (`rest_after_parsed`), and a shell program never is one.
+    pub tool: bool,
+    /// The call this segment belongs to ends by itself at a deadline the tool
+    /// enforces (`DEADLINE_TOOLS`), so a loop in it cannot run forever.
+    pub bounded: bool,
+    /// The segment certainly runs, in this very shell, so what it sets
+    /// (`NAME=value`, `export`, `$env:NAME=`) holds for every later segment:
+    /// the first command of its and-or list, outside any group, not part of a
+    /// pipeline and not sent to the background. See `env_before`.
+    pub certain: bool,
 }
 
 impl Segment {
@@ -287,6 +318,9 @@ fn flat_segment(command: &str) -> Segment {
         remote: false,
         redirects: Vec::new(),
         flat: true,
+        tool: false,
+        bounded: false,
+        certain: false,
     }
 }
 
@@ -308,6 +342,9 @@ pub fn tool_segment(tool: &str, content: &str) -> Segment {
         remote: false,
         redirects: Vec::new(),
         flat: false,
+        tool: true,
+        bounded: false,
+        certain: false,
     }
 }
 
@@ -1028,6 +1065,9 @@ fn collect(command: &str, d: Dialect, depth: usize, start: Place, remote: bool, 
                 remote,
                 redirects,
                 flat: false,
+                tool: false,
+                bounded: false,
+                certain: first_in_list && groups.open.is_empty() && first == last && raw.ended_by != Sep::Background,
             });
             // A `cd` moves the folder of what follows - when the shell does
             // not refuse it, and when it can take effect here at all: in sh a
@@ -2333,6 +2373,11 @@ fn rest_after<'s>(anchor: &str, seg: &'s Segment) -> Option<&'s [String]> {
 }
 
 fn rest_after_parsed<'s>(a: &Anchor, anchor: &str, seg: &'s Segment) -> Option<&'s [String]> {
+    // A tool call's pseudo-segment is reached by the tool's own name, spelled
+    // exactly: the anchor `grep` names the shell program, never the Grep tool.
+    if seg.tool {
+        return (seg.words.first().map(String::as_str) == Some(anchor.trim())).then(|| &seg.words[1..]);
+    }
     if a.compound {
         return raw_anchor_names(anchor, &seg.raw).then_some(&seg.words[seg.words.len()..]);
     }
@@ -2395,10 +2440,162 @@ const HELP_WORDS: &[&str] = &["--help", "-h", "-?", "/?", "help", "--version", "
 /// Whether `seg`, reached by `anchor`, is a pure help or version call: every
 /// word after the anchor is one of `--help`, `-h`, `-?`, `/?`, `help`,
 /// `--version`, `-V`, and there is at least one. Such a call asks the program
-/// about itself and runs nothing, so a requires check never refuses it (a
-/// forbidden check is not exempted).
+/// about itself and runs nothing, so no forbidden, requires or owner-approval
+/// check refuses it (see also `is_inert_call`, which adds the calls that carry
+/// `--help` or are a dry run).
 pub fn is_pure_help_call(anchor: &str, seg: &Segment) -> bool {
     rest_after(anchor, seg).is_some_and(|rest| !rest.is_empty() && rest.iter().all(|w| HELP_WORDS.contains(&w.as_str())))
+}
+
+/// Claude Code's own tools that a rule can be anchored to by name. Their
+/// calls carry no command (`tool_segment`), so a shell word spelled the same
+/// is not the tool.
+const TOOL_NAMES: &[&str] = &[
+    "Agent", "Artifact", "ArtifactComments", "ArtifactData", "AskUserQuestion", "Edit", "EnterPlanMode", "ExitPlanMode",
+    "Glob", "Grep", "Monitor", "NotebookEdit", "Read", "SendMessage", "Skill", "Task", "TaskStop", "TodoWrite",
+    "ToolSearch", "WebFetch", "WebSearch", "Workflow", "Write",
+];
+
+/// Whether `anchor` is spelled as one of the tools (`TOOL_NAMES`, or an
+/// `mcp__` tool), case exact.
+fn names_a_tool(anchor: &str) -> bool {
+    let first = anchor.split_whitespace().next().unwrap_or("");
+    first.starts_with("mcp__") || TOOL_NAMES.contains(&first)
+}
+
+/// [`anchor_reaches`] as the guards read it: a tool's pseudo-segment is
+/// reached only by an anchor spelled as the tool (always so in
+/// `anchor_reaches`), and a shell command is never reached by an anchor
+/// spelled as a tool - a shell word `agent` is not the Agent tool.
+pub fn reaches_call(anchor: &str, seg: &Segment) -> bool {
+    (seg.tool || !names_a_tool(anchor)) && anchor_reaches(anchor, seg)
+}
+
+/// Whether a requires rule anchored at `anchor` is answered by the deadline
+/// of the tool that carries `seg`: a loop keyword asks for a bound, and a
+/// segment of a call the tool itself ends at a deadline (`bounded`) has one.
+pub fn bounds_a_loop(anchor: &str, seg: &Segment) -> bool {
+    seg.bounded && matches!(anchor.trim().to_lowercase().as_str(), "until" | "while")
+}
+
+/// Whether `seg` is an invocation that does nothing: it asks the program
+/// for its help (`--help` among its words, before a bare `--`), is a pure
+/// help or version call (`is_pure_help_call`), is a `git push` that is a
+/// dry run (`--dry-run`, or `-n`, which means the same for push and only for
+/// push - `git commit -n` skips hooks), or carries PowerShell's `-WhatIf`
+/// (not `-WhatIf:$false`, which forces the action). A forbidden, requires
+/// or owner-approval rule never refuses such a segment: nothing it forbids
+/// or demands an answer for happens. A flat segment (a call too large to be
+/// read in full) is never inert.
+pub fn is_inert_call(anchor: &str, seg: &Segment) -> bool {
+    if is_pure_help_call(anchor, seg) {
+        return true;
+    }
+    if seg.flat {
+        return false;
+    }
+    let before_end = |words: &[String]| -> Vec<String> { words.iter().take_while(|w| *w != "--").cloned().collect() };
+    let words = before_end(&seg.words);
+    if words.iter().any(|w| w == "--help" || w.eq_ignore_ascii_case("-whatif") || w.eq_ignore_ascii_case("-whatif:$true")) {
+        return true;
+    }
+    let head = before_end(&seg.head);
+    head.first().is_some_and(|w| w.eq_ignore_ascii_case("git"))
+        && head.get(1).map(String::as_str) == Some("push")
+        && head[2..].iter().any(|w| w == "--dry-run" || w == "-n")
+}
+
+/// The environment variables the segments before segment `before` set for
+/// every later one: `NAME=value` alone, `export NAME=value`, PowerShell's
+/// `$name = value` and `$env:NAME = value`. Only a segment that certainly
+/// ran in the top-level shell counts (`Segment::certain`, depth 0, not over
+/// `ssh`); the last assignment of a name wins, and an operator assignment
+/// (`$x += ...`) leaves the name unknown. `NAME=value command` sets the name
+/// for that command only and is not here.
+pub fn env_before(segments: &[Segment], before: usize) -> HashMap<String, String> {
+    let mut env = HashMap::new();
+    for seg in segments.iter().take(before) {
+        if !seg.certain || seg.depth != 0 || seg.remote || seg.flat || seg.tool {
+            continue;
+        }
+        let words = &seg.words;
+        let Some(first) = words.first() else { continue };
+        if let Some(rest) = first.strip_prefix('$') {
+            // PowerShell: `$name=value`, `$env:NAME=value`, `$name = value`.
+            let spaced = words.get(1).map(String::as_str) == Some("=");
+            let (name, value) = match rest.find('=') {
+                Some(eq) if is_ps_assignment(first) => (&rest[..eq], words_join(&rest[eq + 1..], &words[1..])),
+                None if spaced => (rest, words[2..].join(" ")),
+                _ => continue,
+            };
+            let plain = name.trim_end_matches(['+', '-', '*', '/', '%']);
+            let key = strip_env_prefix(plain).to_string();
+            if plain.len() == name.len() {
+                env.insert(key, value);
+            } else {
+                env.remove(&key);
+            }
+            continue;
+        }
+        let program = base_lower(first);
+        let exports = program == "export" || program == "readonly";
+        if !exports && !words.iter().all(|w| is_assignment(w)) {
+            continue;
+        }
+        for w in words.iter().filter(|w| is_assignment(w)) {
+            if let Some((name, value)) = w.split_once('=') {
+                env.insert(name.to_string(), value.to_string());
+            }
+        }
+    }
+    env
+}
+
+/// `rest` (the text after the `=` of a first word) followed by `more` words.
+fn words_join(rest: &str, more: &[String]) -> String {
+    std::iter::once(rest).chain(more.iter().map(String::as_str)).filter(|p| !p.is_empty()).collect::<Vec<_>>().join(" ")
+}
+
+/// `name` without a leading PowerShell `env:` (any case).
+fn strip_env_prefix(name: &str) -> &str {
+    match name.get(..4) {
+        Some(head) if head.eq_ignore_ascii_case("env:") => &name[4..],
+        _ => name,
+    }
+}
+
+/// `text` with every `$name`, `${name}` and `$env:name` that `vars` holds
+/// replaced by its value. A name `vars` does not hold stays as typed, so a
+/// text that still holds a `$` afterwards is one no reader resolves.
+pub fn expand_vars(text: &str, vars: &HashMap<String, String>) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find('$') {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 1..];
+        let (name, used) = if let Some(braced) = after.strip_prefix('{') {
+            match braced.find('}') {
+                Some(end) => (&braced[..end], end + 2),
+                None => ("", 0),
+            }
+        } else {
+            let skip = if after.get(..4).is_some_and(|h| h.eq_ignore_ascii_case("env:")) { 4 } else { 0 };
+            let len = after[skip..].find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(after.len() - skip);
+            (&after[skip..skip + len], skip + len)
+        };
+        match vars.get(name).filter(|_| !name.is_empty()) {
+            Some(value) => {
+                out.push_str(value);
+                rest = &after[used..];
+            }
+            None => {
+                out.push('$');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 fn is_word_char(c: char) -> bool {

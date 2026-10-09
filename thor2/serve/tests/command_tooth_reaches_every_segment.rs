@@ -344,7 +344,10 @@ fn a_pure_help_call_is_never_refused_by_a_requires_rule() {
     let a = fx.alpha.clone();
     red(&fx, &a, "Bash", "\"C:/x/bin/install.exe\" --register-root", "door-install-db", "--db");
     red(&fx, &a, "Bash", "cd C:/x && ./install.exe --project demo", "door-install-db", "--db");
-    red(&fx, &a, "Bash", "install.exe --help --all", "door-install-db", "--db");
+    // A call with --help on its own segment runs nothing; the flag on another segment answers nothing.
+    green(&fx, &a, "Bash", "install.exe --help --all");
+    red(&fx, &a, "Bash", "install.exe --help && install.exe --all", "door-install-db", "--db");
+    red(&fx, &a, "Bash", "install.exe --all -- --help", "door-install-db", "--db");
     green(&fx, &a, "Bash", "\"C:/x/bin/install.exe\" --help");
     green(&fx, &a, "Bash", "install.exe -h");
     green(&fx, &a, "Bash", "install -m 644 a b");
@@ -400,14 +403,16 @@ fn a_segment_run_in_another_checkout_is_judged_by_that_checkouts_rules() {
 
 /// The stated price of keeping a `cd` from being an exit, pinned: a command
 /// whose effect depends on its folder, run in a folder of no known project,
-/// is judged under the session's project - an alpha-scoped push ban also
-/// refuses pushing a scratch repository from a session in alpha. A scratch
-/// repository is a real one here (`git init` makes a `.git`, and its folder
-/// name then resolves as a project of its own), and so is a folder whose
-/// marker names a project this store has never heard of: neither is a
-/// project the memory knows, so neither silences alpha's rules. Before
-/// "known", both were judged as their own project and alpha's push ban and
-/// its irreversible container rule only advised.
+/// is judged under the session's project. A scratch repository is a real one
+/// here (`git init` makes a `.git`, and its folder name then resolves as a
+/// project of its own), and so is a folder whose marker names a project this
+/// store has never heard of: neither is a project the memory knows, so
+/// neither silences alpha's rules - alpha's irreversible container rule still
+/// refuses there. Since 2026-10-09 the price is lower for `git` alone, which
+/// acts on the repository that holds its folder: a push in such a repository
+/// is not a push of alpha (a scratch repository, or another repository the
+/// memory knows nothing of). A folder in no repository at all keeps the
+/// session's project for git too.
 #[test]
 fn the_stated_price_a_folder_of_no_known_project_is_judged_under_the_session() {
     let fx = fixture(&[
@@ -423,7 +428,11 @@ fn the_stated_price_a_folder_of_no_known_project_is_judged_under_the_session() {
     let a = fx.alpha.clone();
     for folder in [&plain, &scratch, &stranger] {
         let folder = folder.to_string_lossy().replace('\\', "/");
-        red(&fx, &a, "Bash", &format!("cd {folder} && git push"), "alpha-no-push", "git push");
+        if folder.ends_with("plain-folder") {
+            red(&fx, &a, "Bash", &format!("cd {folder} && git push"), "alpha-no-push", "git push");
+        } else {
+            green(&fx, &a, "Bash", &format!("cd {folder} && git push"));
+        }
         red(
             &fx,
             &a,
@@ -433,7 +442,7 @@ fn the_stated_price_a_folder_of_no_known_project_is_judged_under_the_session() {
             "acme-prod node -e",
         );
     }
-    // Once the memory knows gamma, a push run there is gamma's business.
+    // A push run in gamma's repository is not alpha's, known or not - and gamma's own rules apply once known.
     let mut store = thor_core::event_store::EventStore::open_existing(&fx.db).unwrap();
     model::store::declare(&mut store, "door", "door", "door-fixture", &named(&rule("gamma-note", &["make"], Some("gamma"), forbidden(&["--gamma"]))))
         .unwrap();

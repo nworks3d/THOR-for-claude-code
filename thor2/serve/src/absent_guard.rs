@@ -859,7 +859,7 @@ fn requires_pair(check: &Check) -> Option<(&str, &[String])> {
 /// caller passes each segment's project instead.
 pub fn find_requires_violation(items: &[LiveItem], tool: &str, command: Option<&str>, content: &str) -> Option<String> {
     let segments = match command {
-        Some(command) => crate::shell::segments(command, crate::shell::dialect_for(tool)),
+        Some(command) => crate::shell::call_segments(tool, command),
         None => vec![crate::shell::tool_segment(tool, content)],
     };
     find_requires_violation_in(items, &segments, None, content)
@@ -925,8 +925,17 @@ pub fn find_requires_violation(items: &[LiveItem], tool: &str, command: Option<&
 /// my-dev" never matches "-p my-dev-old". A trigger ending in one `*` is a
 /// prefix ("/thor*" finds "/thor-probe-eval").
 ///
-/// A PURE HELP OR VERSION CALL is never refused here (`shell::is_pure_help_call`):
-/// `install.exe --help` asks the program about itself and runs nothing.
+/// AN INERT CALL is never refused here (`shell::is_inert_call`): `install.exe
+/// --help` asks the program about itself and runs nothing, and `git push
+/// --dry-run` or a PowerShell `-WhatIf` does what it says. The flag has to be
+/// on the segment the rule reaches. A call that the tool itself ends at a
+/// deadline answers a rule that asks for a bound on a loop (`shell::bounds_a_loop`),
+/// and an exported variable of an earlier segment answers a requirement written
+/// `NAME=` (`shell::env_before`), as the inline `NAME=value command` always did.
+///
+/// A TOOL'S PSEUDO-SEGMENT AND A SHELL WORD ARE TOLD APART (`shell::reaches_call`):
+/// an anchor `grep` is the program, never the Grep tool, and the anchor `Agent`
+/// is the tool, never a shell word `agent`.
 pub fn find_requires_violation_in(
     items: &[LiveItem],
     segments: &[crate::shell::Segment],
@@ -966,24 +975,24 @@ pub fn find_requires_violation_owned(
         let Some((when, required)) = requires_pair(check) else { continue };
         let anchors = command_bindings(&candidate.item);
         let inner = !model::gate::requires_trigger_names_a_binding(when, &candidate.item.bindings);
-        let triggered: Vec<(&str, &crate::shell::Segment)> = segments
+        let triggered: Vec<(&str, &crate::shell::Segment, usize)> = segments
             .iter()
             .enumerate()
             .filter_map(|(i, segment)| {
                 if !in_scope(&candidate.item, scope, i) {
                     return None;
                 }
-                let anchor = anchors.iter().find(|a| crate::shell::anchor_reaches(a, segment))?;
+                let anchor = anchors.iter().find(|a| crate::shell::reaches_call(a, segment))?;
                 if inner && !crate::shell::trigger_in_segment(segment, when) {
                     return None;
                 }
-                if crate::shell::is_pure_help_call(anchor, segment) {
+                if crate::shell::is_inert_call(anchor, segment) {
                     return None;
                 }
-                Some((*anchor, segment))
+                Some((*anchor, segment, i))
             })
             .collect();
-        let Some(&(first_anchor, _)) = triggered.first() else { continue };
+        let Some(&(first_anchor, _, _)) = triggered.first() else { continue };
         let mut anchor = first_anchor;
         if let (true, Some(owner)) = (model::store::is_owner_approval(&candidate.item), owner) {
             let trips = if inner { format!("{anchor:?} carrying {when:?}") } else { format!("{anchor:?}") };
@@ -1014,12 +1023,21 @@ pub fn find_requires_violation_owned(
             }
         }
         let comments = shell_comments(content);
-        let unanswered = triggered.iter().find(|(_, segment)| {
+        let unanswered = triggered.iter().find(|(anchor, segment, at)| {
+            if crate::shell::bounds_a_loop(anchor, segment) {
+                return false;
+            }
+            let env = std::cell::OnceCell::new();
             !required.iter().any(|r| {
-                segment.unit.contains(r.as_str()) || segment.unit_words.contains(r.as_str()) || comments.contains(r.as_str())
+                segment.unit.contains(r.as_str())
+                    || segment.unit_words.contains(r.as_str())
+                    || comments.contains(r.as_str())
+                    || r.strip_suffix('=').is_some_and(|name| {
+                        env.get_or_init(|| crate::shell::env_before(segments, *at)).contains_key(name)
+                    })
             })
         });
-        let Some(&(unanswered_anchor, _)) = unanswered else { continue };
+        let Some(&(unanswered_anchor, _, _)) = unanswered else { continue };
         anchor = unanswered_anchor;
         let answers: Vec<String> = required.iter().map(|r| format!("{r:?}")).collect();
         let trips = if inner { format!("{anchor:?} carrying {when:?}") } else { format!("{anchor:?}") };
@@ -1872,7 +1890,11 @@ fn first_command_violation<'a>(
             if !in_scope(&candidate.item, scope, i) {
                 continue;
             }
-            let Some(anchor) = anchors.iter().find(|a| crate::shell::anchor_reaches(a, segment)) else { continue };
+            let Some(anchor) = anchors.iter().find(|a| crate::shell::reaches_call(a, segment)) else { continue };
+            // A call that does nothing (help, a dry run) forbids nothing.
+            if crate::shell::is_inert_call(anchor, segment) {
+                continue;
+            }
             // A path, when the check names one, still has to be there. A
             // `Forbidden` check names none and needs none: see `command_literals`.
             if let Some(check_path) = check_path {

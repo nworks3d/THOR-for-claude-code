@@ -492,11 +492,14 @@ fn a_pure_help_or_version_call_is_never_refused_by_requires() {
     for c in ["\"C:/x/bin/install.exe\" --help", "install.exe -h", "install.exe --version", "install.exe -V", "install.exe /?"] {
         assert!(!rq(a, w, r, c).1, "a pure help call must pass: {c}");
     }
-    assert!(rq(a, w, r, "install.exe --help --all").1, "not a pure help call");
+    assert!(!rq(a, w, r, "install.exe --help --all").1, "--help on the segment: it prints help");
+    assert!(rq(a, w, r, "install.exe --help && install.exe --all").1, "the flag is on another segment");
+    assert!(rq(a, w, r, "install.exe --all -- --help").1, "after -- it is an operand");
     assert!(rq(a, w, r, "install.exe").1, "the bare call is not a help call");
     assert!(rq(a, w, r, "\"C:/x/bin/install.exe\" --register-root").1);
-    // A forbidden check is not exempted.
-    assert!(fb(&["install.exe"], &["install.exe"], "install.exe --help").1);
+    // A forbidden check does not refuse a help call either (2026-10-09), only the call that runs.
+    assert!(!fb(&["install.exe"], &["install.exe"], "install.exe --help").1);
+    assert!(fb(&["install.exe"], &["install.exe"], "install.exe --help && install.exe").1);
 }
 
 #[test]

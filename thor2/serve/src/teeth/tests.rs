@@ -1022,12 +1022,12 @@ fn d9_a_bare_short_flag_is_dropped_when_a_longer_literal_exists() {
 #[test]
 fn r7b_8_a_call_by_the_writing_session_never_stops_forcing() {
     let mut fx = Fx::new();
-    fx.served(S1, "git push --force --dry-run");
+    fx.served(S1, "git push --force origin main");
     let item = rule("fp", "Never run `git push --force` on main.", vec![cmd("git push")], None, None);
     let t = fx.run(&item, None, &session_in("alpha", None, S1), &Disputes::default());
     let (code, _) = refusal(&t);
     assert_eq!(code, RefuseCode::Forcing);
-    assert!(receipt(&t).contains("'git push --force --dry-run' (session 0de7dc52"), "{}", receipt(&t));
+    assert!(receipt(&t).contains("'git push --force origin main' (session 0de7dc52"), "{}", receipt(&t));
     assert!(receipt(&t).contains("was made by the writing session and does not count"), "{}", receipt(&t));
 }
 
@@ -1825,8 +1825,14 @@ fn a_call_run_in_another_known_projects_folder_is_not_refused_by_this_projects_r
         "a push made in beta's folder is beta's business"
     );
     assert!(
-        refuses_call("no-push-from-alpha", &ban, &in_beta, &alpha),
-        "a world that knows no other project keeps judging it under alpha - the defect"
+        !refuses_call("no-push-from-alpha", &ban, &in_beta, &alpha),
+        "git acts on the repository that holds its folder: beta's repository is not alpha's even when unknown"
+    );
+    let npm = rule("no-npm-from-alpha", "alpha gets no npm publish until the owner says so.", vec![command("npm publish")], forbidden(&["npm publish"]), Some("alpha"));
+    let npm_in_beta = format!("cd \"{}\" && npm publish", beta.display());
+    assert!(
+        refuses_call("no-npm-from-alpha", &npm, &npm_in_beta, &alpha),
+        "a world that knows no other project keeps judging a program that is not git under alpha"
     );
 }
 
