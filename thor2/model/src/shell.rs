@@ -855,6 +855,9 @@ struct Group {
     saved: Place,
     /// The and-or list around the group, which picks up again after it.
     outer_undo: Option<Undo>,
+    /// Whether a command that is not a bare `:` has run in it, a group
+    /// inside it included.
+    produced: bool,
 }
 
 /// The groups open at a point of the text, innermost last, with how many of
@@ -866,12 +869,22 @@ struct Group {
 struct Groups {
     open: Vec<Group>,
     count: HashMap<GroupKind, usize>,
+    /// Whether the subshell or brace group closed last had run a command: what
+    /// a redirect written right after its `)` or `}` is the output of.
+    closed_produced: bool,
 }
 
 impl Groups {
     fn push(&mut self, kind: GroupKind, place: &Place, undo: &mut Option<Undo>) {
         *self.count.entry(kind).or_default() += 1;
-        self.open.push(Group { kind, saved: place.clone(), outer_undo: undo.take() });
+        self.open.push(Group { kind, saved: place.clone(), outer_undo: undo.take(), produced: false });
+    }
+
+    /// A command that is not a bare `:` ran in the innermost open group.
+    fn mark_produced(&mut self) {
+        if let Some(group) = self.open.last_mut() {
+            group.produced = true;
+        }
     }
 
     /// Close the innermost open group of `kind` (and every group opened
@@ -889,7 +902,15 @@ impl Groups {
                 *n -= 1;
             }
         }
-        let group = self.open.split_off(at).swap_remove(0);
+        let mut closed = self.open.split_off(at);
+        let produced = closed.iter().any(|g| g.produced);
+        if let Some(outer) = self.open.last_mut() {
+            outer.produced |= produced;
+        }
+        if matches!(kind, GroupKind::Brace | GroupKind::Subshell) {
+            self.closed_produced = produced;
+        }
+        let group = closed.swap_remove(0);
         let saved = group.saved;
         place.dir = saved.dir;
         place.stack = saved.stack;
@@ -967,6 +988,9 @@ fn collect(command: &str, d: Dialect, depth: usize, start: Place, remote: bool, 
     // condition (after `&&` or `||`): where the folder was before it. When
     // the list ends the folder goes back there.
     let mut undo: Option<Undo> = None;
+    // What the subshell or brace group the previous raw closed produced: the
+    // output a redirect right after its `)` or `}` writes (`{ cat n; } > f`).
+    let mut group_produced: Option<bool> = None;
     for k in 0..n {
         let raw = &raws[k];
         let prev = k.checked_sub(1).map(|p| raws[p].ended_by);
@@ -1045,7 +1069,11 @@ fn collect(command: &str, d: Dialect, depth: usize, start: Place, remote: bool, 
                 None => place.any_dir.clone(),
             };
             let cd_before = place.cd_text.clone();
-            let producer = raw.words.iter().any(|w| w != ":");
+            let own_producer = raw.words.iter().any(|w| w != ":");
+            if own_producer {
+                groups.mark_produced();
+            }
+            let producer = own_producer || group_produced == Some(true);
             let redirects = raw
                 .redirects
                 .iter()
@@ -1104,6 +1132,12 @@ fn collect(command: &str, d: Dialect, depth: usize, start: Place, remote: bool, 
             Sep::Close if sh => groups.close(GroupKind::Subshell, &mut place, &mut undo),
             Sep::CloseBrace => groups.close(GroupKind::Brace, &mut place, &mut undo),
             _ => false,
+        };
+        // PowerShell does not track `( ... )`: what it closes is an expression.
+        group_produced = if closed {
+            Some(groups.closed_produced)
+        } else {
+            (!sh && raw.ended_by == Sep::Close).then_some(true)
         };
         while groups.close(GroupKind::Compound(k), &mut place, &mut undo) {}
         let list_ends = matches!(raw.ended_by, Sep::Semi | Sep::Newline | Sep::Background | Sep::End)

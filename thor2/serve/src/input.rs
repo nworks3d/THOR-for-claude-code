@@ -683,6 +683,29 @@ mod tests {
         assert_eq!(shell_write_targets(": > f"), vec![emptied("f")], "the shell no-op idiom names no producer either");
     }
 
+    /// RH1 (field test 15): the redirect of `{ ...; } > f` and `( ... ) > f`
+    /// belongs to the group, not to a command of its own, and the group's
+    /// commands are what write the file - it is rewritten, never emptied.
+    #[test]
+    fn a_redirect_from_a_group_with_commands_rewrites_the_file() {
+        assert_eq!(shell_write_targets("{ cat n; } > f"), vec![rewritten("f")]);
+        assert_eq!(shell_write_targets("( cat n ) > f"), vec![rewritten("f")]);
+        assert_eq!(shell_write_targets("{ sed -n 1,10p old; cat n; sed -n '11,$p' old; } > f"), vec![rewritten("f")]);
+        assert_eq!(shell_write_targets("{ { cat a; }; cat b; } > f"), vec![rewritten("f")], "a nested group counts");
+        assert_eq!(shell_write_targets("( { cat a; } ) > f"), vec![rewritten("f")]);
+        assert_eq!(shell_write_targets("{ for x in a b; do cat $x; done; } > f"), vec![rewritten("f")]);
+    }
+
+    #[test]
+    fn a_redirect_from_a_group_that_produces_nothing_still_empties_the_file() {
+        assert_eq!(shell_write_targets("{ :; } > f"), vec![emptied("f")]);
+        assert_eq!(shell_write_targets("( : ) > f"), vec![emptied("f")]);
+        assert_eq!(shell_write_targets("{ { :; }; } > f"), vec![emptied("f")]);
+        assert_eq!(shell_write_targets("{ cat n; }; > f"), vec![emptied("f")], "a redirect after the group, on its own");
+        assert_eq!(shell_write_targets("( cat n ) && > f"), vec![emptied("f")]);
+        assert_eq!(shell_write_targets("{ cat n; } > a; > b"), vec![rewritten("a"), emptied("b")]);
+    }
+
     #[test]
     fn tee_rewrites_the_file_it_names() {
         assert_eq!(shell_write_targets("tee f"), vec![rewritten("f")]);

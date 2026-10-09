@@ -584,6 +584,23 @@ fn a_redirect_is_not_a_word_and_is_recorded_with_its_producer() {
     assert_eq!(shown[4], (s(&["cmd"]), vec![r("/dev/null", false, true)]), "a file descriptor is never a word or a target");
 }
 
+/// RH1: the redirect that follows a closing `}` or `)` has a producer when
+/// the group it closes ran a command, in both dialects.
+#[test]
+fn a_redirect_after_a_group_has_the_producer_of_the_group() {
+    let redirects =
+        |cmd: &str, d: Dialect| -> Vec<Redirect> { segments(cmd, d).into_iter().flat_map(|s| s.redirects).collect() };
+    let r = |t: &str, producer: bool| vec![Redirect { target: t.to_string(), append: false, producer }];
+    assert_eq!(redirects("{ cat n; } > f", Dialect::Sh), r("f", true));
+    assert_eq!(redirects("( cat n ) > f", Dialect::Sh), r("f", true));
+    assert_eq!(redirects("{ :; } > f", Dialect::Sh), r("f", false));
+    assert_eq!(redirects("( : ) > f", Dialect::Sh), r("f", false));
+    assert_eq!(redirects("{ cat n; }; > f", Dialect::Sh), r("f", false));
+    assert_eq!(redirects("& { cat n } > f", Dialect::PowerShell), r("f", true));
+    assert_eq!(redirects("(Get-Content n) > f", Dialect::PowerShell), r("f", true));
+    assert_eq!(redirects("> f", Dialect::PowerShell), r("f", false));
+}
+
 // ------------------------------------------------------------ where reading stops
 
 /// The measured exit (2026-09-28): two thousand `$(` after a forbidden
