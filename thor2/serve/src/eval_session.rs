@@ -1176,8 +1176,8 @@ pub fn render_start_note_within(id: &str, frozen: &Frozen, budget: usize) -> Str
 fn render_note(id: &str, frozen: &Frozen, caps: &Caps) -> String {
     let mut out = format!(
         "[THOR] The evaluation of '{}' started at log position {} ({}, {}; THOR's record '{id}'). The lists its report \
-         is held to are fixed now: nothing that fires or is written from here on is added to them, and nothing that \
-         fired only in another session is on them.",
+         is held to are fixed now: nothing that fires or is written later joins them, and nothing that fired only in \
+         another session is on them.",
         frozen.project,
         frozen.started_seq,
         frozen.started_by,
@@ -1186,7 +1186,7 @@ fn render_note(id: &str, frozen: &Frozen, caps: &Caps) -> String {
 
     out.push_str("\n\n1. JUDGEMENT - ");
     if frozen.judgement.is_empty() {
-        out.push_str("nothing that fired in this session owes a verdict, so the report is held to no judgement at all.");
+        out.push_str("nothing that fired in this session owes a verdict, so the report is held to no judgement.");
     } else {
         // WHERE IT FIRED, under each item (step 24): the last distinct places
         // this session served it, frozen with the list. A long list shows one
@@ -1208,9 +1208,9 @@ fn render_note(id: &str, frozen: &Frozen, caps: &Caps) -> String {
             // ten verdicts given in five seconds with no look at whether the
             // items were still true; the advice stood once, above the list.
             out.push_str(&format!(
-                "\n   - '{item}': first check it is still TRUE (revise it when the code says otherwise - a repair, not \
-                 noise), then mcp__thor__mark(id: \"{item}\") when it belonged where it fired, or \
-                 mcp__thor__mark(id: \"{item}\", noise: true) when it did not"
+                "\n   - '{item}': first check it is still TRUE (revise it if the code says otherwise - a repair, not noise), \
+                 then mcp__thor__mark(id: \"{item}\") if it belonged where it fired, or \
+                 mcp__thor__mark(id: \"{item}\", noise: true) if not"
             ));
             out.push_str(&fired_line(frozen.fired.get(item), per_item));
         }
@@ -1264,17 +1264,24 @@ fn teeth_section(out: &mut String, record: &str, frozen: &Frozen, machine: &Mach
             machine.projectless
         )
     };
+    // Only the outcomes that happened are named: the zero ones are the least
+    // actionable words of the note.
+    let outcomes: Vec<String> = [
+        (machine.bites, "bite and are on the rule track now"),
+        (machine.notes, "became a note"),
+        (machine.pending_hung, "pending check(s) hung"),
+        (machine.blocked, "held by a blocker only the owner can lift (see 4)"),
+        (machine.needs_agent + machine.a4_only, "need you"),
+        (machine.left_as_they_were(), "tried again and left as they were"),
+    ]
+    .iter()
+    .filter(|(n, _)| *n > 0)
+    .map(|(n, what)| format!("{n} {what}"))
+    .collect();
+    let outcomes = if outcomes.is_empty() { "nothing needed a change".to_string() } else { outcomes.join(", ") };
     out.push_str(&format!(
-        "THOR tried {tried} itself at the start (time box {} s): {} bite and are on the rule \
-         track now, {} became a note, {} pending check(s) hung, {} held by a blocker only the owner can lift (see 4), \
-         {} need you, {} tried again and left as they were; not reached this time: {}{}",
+        "THOR tried {tried} itself at the start (time box {} s): {outcomes}; not reached this time: {}{}",
         machine.box_secs,
-        machine.bites,
-        machine.notes,
-        machine.pending_hung,
-        machine.blocked,
-        machine.needs_agent + machine.a4_only,
-        machine.left_as_they_were(),
         machine.not_reached,
         match machine.not_reached {
             0 => ".".to_string(),
@@ -1301,9 +1308,8 @@ fn teeth_section(out: &mut String, record: &str, frozen: &Frozen, machine: &Mach
     } else {
         out.push_str(&format!(
             "\n   a. THE BATCH - {} rule(s) that need a fix only you can make (at most {}): {}. Make the fix each \
-             line names with the call shown; THOR tries the rule again as it is written and answers rule, note, or what \
-             is still missing. An item is done when it answers rule or note. \
-             A tag, a reason or an open point settles nothing:",
+             line names with the call shown; THOR tries the rule again and answers rule, note, or what is still \
+             missing. An item is done when it answers rule or note; a tag, a reason or an open point settles nothing:",
             batch.len(),
             model::store::EVALUATION_TEETH_BATCH,
             quoted(batch)
@@ -1350,15 +1356,15 @@ fn teeth_section(out: &mut String, record: &str, frozen: &Frozen, machine: &Mach
 fn hang_call(id: &str, first_argument: &str, files: &[String]) -> String {
     let check = match (first_argument, files) {
         ("may_change", [file]) => format!(
-            "check_kind: \"contains\", check_path: {}, check_literal: \"<the rule's subject>\"",
+            "check_kind: \"contains\", check_path: {}, check_literal: \"<the subject>\"",
             model::store::ascii_json(file)
         ),
-        ("may_change", _) => "check_kind: \"contains\", check_path: \"<the file the span is in>\", check_literal: \"<the rule's subject>\"".to_string(),
-        _ => "check_kind: \"forbidden\", check_literals: [\"<the rule's subject>\"]".to_string(),
+        ("may_change", _) => "check_kind: \"contains\", check_path: \"<the file the span is in>\", check_literal: \"<the subject>\"".to_string(),
+        _ => "check_kind: \"forbidden\", check_literals: [\"<the subject>\"]".to_string(),
     };
     format!(
-        "mcp__thor__revise(id: \"{id}\", text: \"<its text, reworded to name the rule's subject>\", {check}, \
-         because: \"<only if the rewording drops a quoted form: why, {}+ characters>\")",
+        "mcp__thor__revise(id: \"{id}\", text: \"<its text, reworded to name the subject>\", {check}, \
+         because: \"<only if it drops a quoted form: why, {}+ chars>\")",
         model::store::DISPUTE_REASON_MIN_CHARS
     )
 }
@@ -1368,11 +1374,11 @@ fn hang_call(id: &str, first_argument: &str, files: &[String]) -> String {
 /// is asked for in the words of that kind of dispute.
 fn confirm_call(id: &str, first_argument: &str, span: &str) -> String {
     let why = match first_argument {
-        "may_change" => format!("why {span} may change while the rule stays true"),
+        "may_change" => format!("why {span} may change"),
         "accept_refusing" => format!("why refusing {span} is the intent"),
-        _ => format!("why {span} is legitimate while the rule stays true"),
+        _ => format!("why {span} is legitimate"),
     };
-    format!("mcp__thor__revise(id: \"{id}\", because: \"<{why}, {}+ characters>\")", model::store::DISPUTE_REASON_MIN_CHARS)
+    format!("mcp__thor__revise(id: \"{id}\", because: \"<{why}, {}+ chars>\")", model::store::DISPUTE_REASON_MIN_CHARS)
 }
 
 /// Item c of section 2 of the start note: the disputes the agent verifies
@@ -1387,15 +1393,16 @@ fn disputes_section(out: &mut String, record: &str, machine: &MachinePass, caps:
     let ids: Vec<String> = list.iter().map(|d| d.id.clone()).collect();
     out.push_str(&format!(
         "\n   c. DISPUTES TO VERIFY - {} rule(s) stored by dispute (legitimate_calls, may_change or accept_refusing) since \
-         the previous evaluation and not verified yet (at most {}): {}. WHAT THIS MEANS: the writer said the tooth THOR \
-         built from the rule's own words is wrong here, so the rule is a note that can never refuse anything; an audit \
-         on 2026-10-07 found 7 of 11 such disputes wrong. WHAT TO DO, per rule: open it (mcp__thor__get) and the file or \
-         command it is about. If the disputed literal IS what the rule is about, or a better check exists: call 1 (hang \
-         that check). If it is only an incidental span: call 2 (confirm it with a reason naming what you read; one shorter than {min} characters is refused). WHEN AN ITEM IS DONE: THOR accepted the call (it shows rule or note for call 1, \
-         'revised' for call 2). Retracting the rule with a reason also settles an item, only for a rule that is simply \
-         wrong; a tag, a note or a line in the report settles nothing, and the report is held until every item is done. EXAMPLE: 'the sensor \
-         delay is in microseconds' disputed on the word 'delay': its subject is 'microseconds', so call 1 with \
-         check_kind \"contains\", check_path \"sensor.cfg\", check_literal \"microseconds\".",
+         the previous evaluation and not verified yet (at most {}): {}. WHAT THIS MEANS: the writer called the tooth THOR \
+         built from the rule's words wrong, so the rule is a note that can never refuse anything (an audit on \
+         2026-10-07 found 7 of 11 such disputes wrong). WHAT TO DO, per rule: open it (mcp__thor__get) and the file or \
+         command it is about. If the disputed literal IS the rule's subject, or a better check exists: call 1 (hang \
+         it). If it is only an incidental span: call 2 (confirm, with a reason naming what you read; under {min} \
+         characters is refused). WHEN AN ITEM IS DONE: THOR accepted the call (rule or note for call 1, 'revised' for \
+         call 2), or you retracted a rule that is simply wrong; a tag, a note or a line in the report settles nothing, \
+         and the report is held until every item is done. EXAMPLE: 'the sensor delay is in microseconds' disputed on \
+         'delay': its subject is 'microseconds', so call 1 with check_kind \"contains\", check_path \"sensor.cfg\", \
+         check_literal \"microseconds\".",
         list.len(),
         model::store::EVALUATION_DISPUTE_LIST,
         quoted(&ids),
@@ -1410,12 +1417,12 @@ fn disputes_section(out: &mut String, record: &str, machine: &MachinePass, caps:
             .map(|v| format!("'{}'", cut_words(v, 36)))
             .unwrap_or_else(|| "the span".to_string());
         let because = match dispute.because.as_deref().map(|b| cut_words(b, 50)).filter(|b| !b.is_empty()) {
-            Some(reason) => format!("the writer's reason: '{reason}'"),
+            Some(reason) => format!("writer's reason: '{reason}'"),
             None => "no reason recorded".to_string(),
         };
         out.push_str(&format!(
-            "\n      - '{id}': {args}; {because}.\n         Call 1, hang the real check: {hang}\n         \
-             Call 2, confirm the dispute: {confirm}",
+            "\n      - '{id}': {args}; {because}.\n         Call 1 (hang the check): {hang}\n         \
+             Call 2 (confirm the dispute): {confirm}",
             id = dispute.id,
             args = model::store::dispute_in_words(&dispute.arguments),
             hang = hang_call(&dispute.id, first, &dispute.files),
@@ -1465,9 +1472,9 @@ fn host_wide_words(count: usize, alongside: bool) -> String {
 /// example, or says there is nothing to do.
 fn signals_section(out: &mut String, record: &str, signals: &model::store::SignalsSoFar, caps: &Caps) {
     out.push_str(
-        "\n\n3. SIGNALS BEFORE YOU FILE - two signals THOR read from its log, from the previous report up to this start \
-         (refusals not yet verified at a Stop are not counted). The machine section in the reply to your filing \
-         records them again for this evaluation's own window.",
+        "\n\n3. SIGNALS BEFORE YOU FILE - two signals THOR read from its log, from the previous report that counts up to \
+         this start (refusals not yet verified at a Stop are not counted). The machine section of your filing records \
+         them again for this evaluation's own window.",
     );
     out.push_str(&format!("\n   a. {}", signals.health));
     if signals.hook_failures == 0 && signals.skew_events == 0 && signals.host_wide_failures == 0 {
@@ -1476,16 +1483,15 @@ fn signals_section(out: &mut String, record: &str, signals: &model::store::Signa
         out.push_str(&host_wide_words(signals.host_wide_failures, false));
     } else {
         out.push_str(
-            "\n      WHAT THIS MEANS: a hook launch failure is a Claude Code hook (THOR's guard or Stop hook) that could not \
-             start, so nothing from THOR reached that call; a version-skew event is a filing THOR refused because the tool \
-             server that wrote it was built from another THOR than the checker (that report is on file but does not \
-             count). WHAT TO DO: put both numbers, the hook events and the sessions in your report and tell the owner in \
-             your summary - after a skew, to restart Claude (the next end-of-turn ask then files a new report); after a \
-             launch failure, that the named hook needs his attention (exit 66 with no output next to a sleep is the \
-             machine: say so, not a broken hook). You cannot restart or repair anything. \
-             DONE WHEN: the report holds them and the owner was told. EXAMPLE: \"THOR health: 1 hook launch failure \
-             (PreToolUse, exit 126, session 0de7dc52, at 2026-10-06T04:18:30Z) - the owner should look at that hook; 0 \
-             version-skew events.\"",
+            "\n      WHAT THIS MEANS: a hook launch failure is a THOR hook (guard or Stop) that could not start, so nothing \
+             from THOR reached that call; a version-skew event is a filing refused because its tool server was built from \
+             another THOR than the checker (the report is on file but does not count). WHAT TO DO: put both numbers, the \
+             hook events and the sessions in your report and tell the owner in your summary: after a skew, to restart \
+             Claude (the next end-of-turn ask files a new report); after a launch failure, that the named hook needs his \
+             attention (exit 66 with no output next to a sleep is the machine, not a broken hook). You cannot restart or \
+             repair anything. DONE WHEN: the report holds them and the owner was told. EXAMPLE: \"THOR health: 1 hook \
+             launch failure (PreToolUse, exit 126, session 0de7dc52, at 2026-10-06T04:18:30Z) - the owner should look at \
+             that hook; 0 version-skew events.\"",
         );
         if signals.host_wide_failures > 0 {
             out.push_str(&host_wide_words(signals.host_wide_failures, true));
@@ -1515,14 +1521,14 @@ fn signals_section(out: &mut String, record: &str, signals: &model::store::Signa
     out.push_str(&format!(
         "\n      WHAT THIS MEANS: a refusal counts as a PROBABLE false block when someone other than THOR then retracted the \
          refusing rule or weakened it (cleared or changed its check, lowered its severity, dropped a binding) - a proxy, \
-         not a verdict. WHAT TO DO, per rule: run its Read call, then decide from the refused call and the \
-         file or command the rule is about whether it was legitimate. If it WAS, the weakening was right: write in the report the rule id, the refused call and why. If it \
-         was NOT, put the rule back with the restore call under it and your own reason of {}+ characters in because (a \
-         retracted rule comes back under a NEW id tagged with the old one). If you cannot tell, say so and restore \
-         nothing. DONE WHEN: every rule listed has one of those outcomes in your report, and a restore was answered rule \
-         or note. EXAMPLE: 'no-force-push' refused 'git push --force-with-lease origin main', then its check was cleared: \
-         that call is safe, so the report says \"no-force-push refused git push --force-with-lease origin main, which is \
-         safe; clearing its check was right\".",
+         not a verdict. WHAT TO DO, per rule: run its Read call, then decide from the refused call and the file or \
+         command the rule is about whether it was legitimate. If it WAS, the weakening was right: write in the report \
+         the rule id, the refused call and why. If it was NOT, put the rule back with the restore call under it and \
+         your own reason of {}+ characters in because (a retracted rule comes back under a NEW id tagged with the old \
+         one). If you cannot tell, say so and restore nothing. DONE WHEN: every rule listed has one of those outcomes \
+         in your report, and a restore was answered rule or note. EXAMPLE: 'no-force-push' refused 'git push \
+         --force-with-lease origin main', then its check was cleared: that call is safe, so the report says \
+         \"no-force-push refused git push --force-with-lease origin main, which is safe; clearing its check was right\".",
         model::store::DISPUTE_REASON_MIN_CHARS
     ));
 }
@@ -1573,8 +1579,8 @@ fn open_points_section(out: &mut String, frozen: &Frozen, caps: &Caps) {
     out.push_str("written and closed by THOR itself; none of them holds this report, and nothing here is for you to do.");
     if !own.is_empty() && caps.points {
         out.push_str(&format!(
-            "\n   - THOR's own, open ({}): {}. Each one says in its own text what clears it (`get` shows it), and it \
-             closes itself when its subject settles.",
+            "\n   - THOR's own, open ({}): {}. Each says in its own text what clears it (`get` shows it) and closes \
+             itself when its subject settles.",
             own.len(),
             own.join(", ")
         ));

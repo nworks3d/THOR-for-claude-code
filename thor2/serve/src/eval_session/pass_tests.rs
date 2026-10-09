@@ -924,21 +924,21 @@ fn a_dispute_written_since_the_previous_report_is_on_the_start_note_with_its_cal
     let note = start_note(&start);
     assert!(note.contains("c. DISPUTES TO VERIFY - 2 rule(s) stored by dispute"), "{note}");
     assert!(note.contains("WHAT THIS MEANS:") && note.contains("WHEN AN ITEM IS DONE:") && note.contains("EXAMPLE:"), "{note}");
-    assert!(note.contains(&format!("the writer's reason: '{}", &why[..45])), "{note}");
+    assert!(note.contains(&format!("writer's reason: '{}", &why[..45])), "{note}");
     assert!(note.contains("no reason recorded"), "{note}");
     for id in [&reasoned, &silent] {
         assert!(
             note.contains(&format!(
-                "Call 1, hang the real check: mcp__thor__revise(id: \"{id}\", text: \"<its text, reworded to name the rule's subject>\", \
-                 check_kind: \"forbidden\", check_literals: [\"<the rule's subject>\"], because: \"<only if the rewording drops a quoted form"
+                "Call 1 (hang the check): mcp__thor__revise(id: \"{id}\", text: \"<its text, reworded to name the subject>\", \
+                 check_kind: \"forbidden\", check_literals: [\"<the subject>\"], because: \"<only if it drops a quoted form"
             )),
             "{id}: {note}"
         );
-        assert!(note.contains(&format!("Call 2, confirm the dispute: mcp__thor__revise(id: \"{id}\", because: \"<why 'git bundle list-heads backup.bundle' is legitimate while the rule stays true, 20+ characters>\")")), "{id}: {note}");
+        assert!(note.contains(&format!("Call 2 (confirm the dispute): mcp__thor__revise(id: \"{id}\", because: \"<why 'git bundle list-heads backup.bundle' is legitimate, 20+ chars>\")")), "{id}: {note}");
     }
     assert!(note.contains("WHEN AN ITEM IS DONE: THOR accepted the call"), "{note}");
-    assert!(note.contains("one shorter than 20 characters is refused"), "call 2 says THOR enforces the length: {note}");
-    assert!(note.contains("Retracting the rule with a reason also settles an item"), "a retract is named as the other exit: {note}");
+    assert!(note.contains("under 20 characters is refused"), "call 2 says THOR enforces the length: {note}");
+    assert!(note.contains("or you retracted a rule that is simply wrong"), "a retract is named as the other exit: {note}");
     // Frozen: the record carries them, so the note and the record agree.
     assert_eq!(model::store::frozen_ids(&start).iter().filter(|id| id.starts_with("bundle-")).count(), 2);
     // Nothing to verify: the section still says so, in one line.
@@ -1027,12 +1027,12 @@ fn disputes_follow_the_batch_cap_and_the_rest_come_first_next_time() {
     assert_eq!(machine.disputes_later_ids, &ids[8..]);
     let note = start_note(&start);
     assert!(note.contains("2 more dispute(s) wait for the next evaluation, which lists them first."), "{note}");
-    assert!(!note.contains("Call 1, hang the real check: mcp__thor__revise(id: \"span-08\""), "{note}");
+    assert!(!note.contains("Call 1 (hang the check): mcp__thor__revise(id: \"span-08\""), "{note}");
     assert!(
-        note.contains("check_kind: \"contains\", check_path: \"pkg0.json\", check_literal: \"<the rule's subject>\""),
+        note.contains("check_kind: \"contains\", check_path: \"pkg0.json\", check_literal: \"<the subject>\""),
         "a span dispute hangs a contains check on the file the rule is bound to: {note}"
     );
-    assert!(note.contains("because: \"<why 'version' may change while the rule stays true, 20+ characters>\""), "{note}");
+    assert!(note.contains("because: \"<why 'version' may change, 20+ chars>\""), "{note}");
 
     // A later evaluation after a report was filed since: the two that did not
     // fit are written BEFORE that report and still come first.
@@ -1558,6 +1558,10 @@ fn busy_frozen(batch: usize, a4: usize, disputes: usize, blocks: usize, carriers
 
 const BUSY_ID: &str = "evaluation-start-demo-500";
 
+/// Bytes the live-state note keeps free below `START_NOTE_BUDGET`, for a
+/// signal and a nudge that are added to it later.
+const START_NOTE_ROOM: usize = 650;
+
 /// THE SIGNALS NEVER ARRIVED (field 2026-10-07): on a store like the live one
 /// the start note was cut at about 9 KB right after the heading of the signals
 /// section, because the open point listed 25 carrying sessions and the disputes
@@ -1569,6 +1573,10 @@ fn a_busy_start_note_shows_every_section_the_session_acts_on_within_the_hook_lim
     let frozen = busy_frozen(1, 0, 4, 1, 25, 0);
     let whole = render_start_note(BUSY_ID, &frozen);
     assert!(whole.len() <= START_NOTE_BUDGET, "this state is the live one: whole, uncut ({} bytes)", whole.len());
+    // ROOM FOR WHAT IS ADDED NEXT (collect 2: the note had 10 bytes of slack, so
+    // the next signal or nudge would have cut a list): the live state keeps at
+    // least this much below the budget.
+    assert!(whole.len() + START_NOTE_ROOM <= START_NOTE_BUDGET, "only {} bytes of room: {whole}", START_NOTE_BUDGET - whole.len());
     let note = render_start_note_within(BUSY_ID, &frozen, START_NOTE_BUDGET);
     assert!(note.len() <= START_NOTE_BUDGET, "{} bytes: {note}", note.len());
     assert!(note.len() < crate::session_start::HOOK_OUTPUT_LIMIT_BYTES, "{} bytes", note.len());
@@ -1645,11 +1653,11 @@ fn the_start_note_explains_hook_failures_that_were_the_machine_and_not_thor() {
     for part in ["WHAT THIS MEANS: 3 hook(s) failed while the machine was going to sleep or shutting down - not THOR", "WHAT TO DO: nothing", "DONE WHEN:", "EXAMPLE:"] {
         assert!(only.contains(part), "missing {part}: {only}");
     }
-    assert!(!only.contains("a hook launch failure is a Claude Code hook"), "no THOR alarm for it: {only}");
+    assert!(!only.contains("a hook launch failure is a THOR hook"), "no THOR alarm for it: {only}");
     assert!(only.is_ascii(), "plain ASCII");
 
     let mixed = render(&signals(1, 2));
-    assert!(mixed.contains("a hook launch failure is a Claude Code hook"), "{mixed}");
+    assert!(mixed.contains("a hook launch failure is a THOR hook"), "{mixed}");
     assert!(mixed.contains("The 2 marked \"failed while the machine was going to sleep or shutting down - not THOR\" are not launch failures"), "{mixed}");
 
     let neither = render(&signals(0, 0));

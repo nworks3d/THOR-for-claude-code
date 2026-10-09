@@ -216,6 +216,24 @@ not the whole session, and not the whole 16 hours. Judge only what fired
 since then; everything the previous report already covers is not this
 evaluation's business again.
 
+WHICH REPORT IS "THE PREVIOUS ONE": the last report THAT COUNTS. A report that
+is on file but did not count (a stale tool server, a filing past the tools)
+covered nothing, so the window of this evaluation - the start note's signals,
+the disputes and the rules that fired - starts at the last report that counts,
+not at the newest one on file. WHAT TO DO: take the report id from the ask's
+line "The last report that counts: '<id>'" for your SCOPE line, and name the
+others from the same ask ("on file, did not count: <why>") as dead, never as
+counted. DONE WHEN: your SCOPE line names the report that counts, and every
+dead report you mention is called dead. EXAMPLE: "SCOPE: since
+eval-demo-2026-10-08-2, the last that counted; -3 and -4 are on file and did
+not count (version skew)".
+
+THE ASK'S VERDICT COUNT. The ask says how many items are on THIS evaluation's
+verdict list (section 1 of the start note: what fired in this session and owes a
+verdict). Items that owe a verdict only because other sessions fired them are
+counted apart, are on no evaluation's list and need nothing from you. DONE WHEN:
+your verdicts match section 1, whatever the other number says.
+
 The test is not "was it useful" but **did it belong where it fired**.
 - `mcp__thor__mark(id: "<id>")` - it belonged there.
 - `mcp__thor__mark(id: "<id>", noise: true)` - it did not.
@@ -1068,7 +1086,11 @@ this evaluation (see "What you see when" above). The report counts from the
 end-of-turn check on: the Stop hook reads the answer back from THOR's log, and
 only a report that counts lets a blocked turn end and stays quiet for the next
 16 hours. If the next ask says your report is on file but does not count, it
-names why; follow that.
+names why, names every other report on file that does not count, and names the
+last one that does; follow that. A one-line "restart Claude" notice for a
+report or a stale tool server is said once per report and session, then
+nothing until the line changes: no new line at a Stop means nothing new, not
+that the problem is gone.
 
 Do not store or change anything else unless the owner asks for it. The
 exceptions are the work the steps themselves call for: the verdicts, the
