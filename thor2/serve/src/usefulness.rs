@@ -982,7 +982,8 @@ pub fn eval_report_covers(last_evaluation_seen: Option<i64>, now_unix: i64, hour
 /// ignored: a small plan is strictly weekly. No repeat ask, no risk counters:
 /// the weekly floor (`weekly_floor_due`) applies beside this in both cadences.
 pub fn eval_debt_owed(cadence: EvalCadence, accrued_minutes: i64, last_evaluation_seen: Option<i64>, now_unix: i64, rot: bool) -> bool {
-    accrued_minutes >= EVAL_FIRST_WORK_MINUTES
+    cadence != EvalCadence::Off
+        && accrued_minutes >= EVAL_FIRST_WORK_MINUTES
         && !eval_report_covers(last_evaluation_seen, now_unix, covers_hours(cadence, rot))
 }
 
@@ -1026,6 +1027,18 @@ pub enum EvalCadence {
     Weekly,
     /// Max: once a week, and once a day while the project shows rot.
     WeeklyUnlessRot,
+    /// The user switched the weekly ask off (first-session question 4). Nothing
+    /// is asked, the weekly floor included; `/thor-eval` still works by hand.
+    Off,
+}
+
+/// The rhythm this store runs: off when the user switched the weekly check off,
+/// else the one its plan gives.
+pub fn cadence_in(db: &std::path::Path) -> EvalCadence {
+    match crate::plan::weekly_check_on(db) {
+        true => cadence_for(crate::plan::current(db)),
+        false => EvalCadence::Off,
+    }
 }
 
 /// The rhythm for a plan (`serve::plan`).
@@ -1041,6 +1054,7 @@ pub fn cadence_clause(cadence: EvalCadence) -> &'static str {
     match cadence {
         EvalCadence::Weekly => "evaluation cadence: once a week per project, never daily (smaller plan)",
         EvalCadence::WeeklyUnlessRot => "evaluation cadence: once a week per project, daily while rot is found (Max plan)",
+        EvalCadence::Off => "evaluation cadence: off (the weekly ask was switched off by the owner; /thor-eval still works by hand)",
     }
 }
 
@@ -1054,6 +1068,7 @@ pub fn mode_line(cadence: EvalCadence, rot: bool) -> String {
         (EvalCadence::WeeklyUnlessRot, false) => format!(
             "Rhythm: your plan is Max, and the project looks clean, so this check runs once a week ({EVAL_WEEKLY_DAYS} days)."
         ),
+        (EvalCadence::Off, _) => "Rhythm: the weekly check is switched off.".to_string(),
         (EvalCadence::WeeklyUnlessRot, true) => {
             "Rhythm: your plan is Max and something is wrong in this project, so the check runs daily until a counting evaluation finds nothing; then it goes back to once a week."
                 .to_string()
@@ -1242,6 +1257,9 @@ pub fn project_due(
     now_unix: i64,
     cadence: EvalCadence,
 ) -> Option<bool> {
+    if cadence == EvalCadence::Off {
+        return None;
+    }
     let rot = cadence == EvalCadence::WeeklyUnlessRot && crate::eval_filing::project_rot(store, project).is_some();
     let by_clock = eval_debt_owed(
         cadence,
@@ -2313,6 +2331,22 @@ mod eval_debt_predicate_tests {
     fn the_cadence_follows_the_plan() {
         assert_eq!(cadence_for(crate::plan::Plan::Max), EvalCadence::WeeklyUnlessRot);
         assert_eq!(cadence_for(crate::plan::Plan::Small), EvalCadence::Weekly);
+    }
+
+    #[test]
+    fn a_switched_off_weekly_check_asks_nothing_and_says_so() {
+        assert!(!eval_debt_owed(EvalCadence::Off, 600, None, NOW, true), "off is off, even with rot and no report ever");
+        assert!(cadence_clause(EvalCadence::Off).contains("off"));
+        assert!(mode_line(EvalCadence::Off, true).contains("switched off"));
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        std::fs::write(&db, b"").unwrap();
+        assert_eq!(cadence_in(&db), EvalCadence::Weekly, "no plan on record: the cheap weekly rhythm");
+        crate::plan::set_weekly_check(&db, false).unwrap();
+        assert_eq!(cadence_in(&db), EvalCadence::Off);
+        crate::plan::set_weekly_check(&db, true).unwrap();
+        crate::plan::write(&db, crate::plan::Plan::Max, crate::plan::PlanSource::Asked).unwrap();
+        assert_eq!(cadence_in(&db), EvalCadence::WeeklyUnlessRot);
     }
 
     #[test]

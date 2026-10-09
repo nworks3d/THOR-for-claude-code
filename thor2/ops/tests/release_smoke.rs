@@ -610,7 +610,7 @@ impl Smoke {
         if !out.ok() {
             return Err(out.describe());
         }
-        for needed in ["walk-through-the-answer-guard-once", "say-what-actually-happened", "owner-setup-answers"] {
+        for needed in ["walk-through-the-answer-guard-once", "say-what-actually-happened", "owner-setup-answers", "first-session-questions"] {
             if !out.stdout.contains(needed) {
                 return Err(format!("`serve session-start` never lists {needed}:\n{}", out.stdout));
             }
@@ -815,7 +815,7 @@ impl Smoke {
             return Err(format!("a new memory's first turn end was not held:\n{stdout}"));
         }
         let line = parsed["systemMessage"].as_str().ok_or_else(|| format!("the hold carries no plain line:\n{stdout}"))?;
-        if !line.contains("setup questions") || line.contains('\n') {
+        if !line.contains("numbered list") || line.contains('\n') {
             return Err(format!("the plain line is not one plain sentence about setup: {line}"));
         }
         Ok(format!("held, with: {line}"))

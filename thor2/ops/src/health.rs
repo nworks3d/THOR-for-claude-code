@@ -1559,7 +1559,7 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool
             }
             // From the log too - the same time the Stop hook overwrites the
             // sidecar's copy with, so doctor never reads a hand-edited one.
-            let cadence = serve::usefulness::cadence_for(serve::plan::current(db));
+            let cadence = serve::usefulness::cadence_in(db);
             let rot = cadence == serve::usefulness::EvalCadence::WeeklyUnlessRot
                 && checkout_project.is_some_and(|p| serve::eval_filing::project_rot(&store, p).is_some());
             let window_hours = serve::usefulness::covers_hours(cadence, rot);
@@ -1757,6 +1757,9 @@ pub fn evaluations_line(db: &Path, project: Option<&str>) -> Option<String> {
 /// evaluation - a code constant, named on every doctor run so a flip can
 /// never go unseen.
 pub fn cadence_line(db: &Path) -> String {
+    if !serve::plan::weekly_check_on(db) {
+        return format!("{} - switched off in the first-session questions", serve::usefulness::cadence_clause(serve::usefulness::EvalCadence::Off));
+    }
     let (cadence, how) = match serve::plan::read(db) {
         Some((plan, source)) => (serve::usefulness::cadence_for(plan), format!("plan {} ({})", plan.word(), source.word())),
         None => (serve::usefulness::cadence_for(serve::plan::Plan::Small), "no plan on record, so the cheap weekly rhythm".to_string()),

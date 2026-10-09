@@ -217,10 +217,16 @@ per project and not per folder, when:
 
 - the project's own work clock (every session of the project together, parallel
   minutes counted once, in `eval-debt-state.json`) shows 60 minutes since the
-  newest VALID evaluation, in the cadence this build runs (`EVAL_CADENCE`,
-  rolling 16 hours: a valid report covers the next 16 hours, and after it a
-  repeat is due after three more hours of work AND a real risk - at least three
-  code changes with no test or build run since, or a context summary);
+  newest VALID evaluation, in the rhythm of the user's plan (`cadence_in`; one
+  evaluation per week per project: a valid report covers the next 7 days on a
+  smaller plan, strictly, and on Max the next 7 days too but only 24 hours while
+  the project shows rot - a defect found, a false-block sweep hit, an owed batch
+  or dispute item, a report that did not count, or an open THOR bug candidate -
+  until a counting evaluation finds none; there is no repeat after a few hours of
+  work; the plan is read from Claude Code's own `~/.claude.json`
+  (`organizationRateLimitTier`, undocumented, failing soft) and kept with its
+  source in the mode sidecar, `install --set-plan` records the user's word, and
+  `install --set-weekly-check off` switches the automatic ask off);
 - this session has at least 10 minutes of its own work in that project since
   then (the larger of the clock file's number and the session record's own
   count, so zeroing the file delays the ask at most until the record is read);
@@ -245,7 +251,7 @@ per project and not per folder, when:
   judge every quarter of an hour. What used to hold a `Stop` for the items that
   fired repeatedly since they were last judged, or for the old rules THOR's
   trial has not decided, is asked inside the project's evaluation only (its
-  frozen judgement list, its batch and its A4 list), at most once per 16 hours
+  frozen judgement list, its batch and its A4 list), which runs once a week
   per project. A fact counts ONCE PER SESSION toward the 40 that make a verdict
   owed, however often it was shown there, so 40 means about 40 sessions. The
   stale-rule guard still speaks once per session at most.
@@ -606,8 +612,8 @@ read), every report on file that does not count with the reason, and a warning
 when Claude Code's session record could not be read. The judgement debt line
 says whether the project's evaluation is due and, when it is not, how many times
 the `Stop` hook has already asked and since when. A `cadence` line always names
-which cadence this build runs (rolling 16 hours; `weekly-unless-rot` is built
-and off), and a `work clock` line speaks up when the work-clock file disagrees
+which rhythm this store runs (once a week, or daily while rot is found on Max,
+with the plan and who said so), and a `work clock` line speaks up when the work-clock file disagrees
 with the session records by more than a quarter of an hour, since that file is
 one any local process can write. An `open points` line counts THOR's own open
 points apart from the legacy ones an agent filed before THOR wrote them itself,
@@ -897,7 +903,7 @@ The `Stop` hook does not ask about these at all any more (2.5). The rules THOR
 could not decide alone are asked inside the project's evaluation - its batch of
 at most eight that need a fix only an agent can make, and its list of at most
 sixteen that only have to name their check's literal - which is asked at most
-once per 16 hours per project, of a session that has done at least 10 minutes
+once a week per project, of a session that has done at least 10 minutes
 of its own work in the project and never at its first `Stop` there. A short task
 is never held for old rules it did not touch.
 

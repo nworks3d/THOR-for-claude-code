@@ -102,7 +102,8 @@ struct Cli {
     )]
     register_root: bool,
 
-    /// Set ONLY the mode of the bug nudge, `release` or `test`, and nothing
+    /// Set ONLY the mode of the bug nudge, `release`, `test` or `off` (nothing is
+    /// then offered or sent, ever, and a later install keeps it off), and nothing
     /// else. THOR finds some of its own bugs and offers one per session to
     /// the agent, to be written up for the public THOR repository. In
     /// `release` the agent asks you for a go and then opens the issue; in
@@ -126,9 +127,52 @@ struct Cli {
     #[arg(
         long = "set-plan",
         value_name = "PLAN",
-        conflicts_with_all = ["project", "settings", "mcp_json", "no_mcp", "serve_exe", "mcp_exe", "code_index_root", "register_root", "set_mode"]
+        conflicts_with_all = ["project", "settings", "mcp_json", "no_mcp", "serve_exe", "mcp_exe", "code_index_root", "register_root", "set_mode", "set_weekly_check"]
     )]
     set_plan: Option<String>,
+
+    /// Set ONLY whether THOR's weekly check asks by itself, `on` or `off`, and
+    /// nothing else. `off` stops the automatic ask at the end of a turn; you can
+    /// still type /thor-eval yourself. Needs --db.
+    #[arg(
+        long = "set-weekly-check",
+        value_name = "on|off",
+        conflicts_with_all = ["project", "settings", "mcp_json", "no_mcp", "serve_exe", "mcp_exe", "code_index_root", "register_root", "set_mode", "set_plan"]
+    )]
+    set_weekly_check: Option<String>,
+}
+
+/// `install --set-weekly-check on|off`: write the switch and nothing else.
+fn set_weekly_check_only(db: Option<PathBuf>, word: &str) -> ExitCode {
+    let on = match word {
+        "on" => true,
+        "off" => false,
+        other => {
+            eprintln!("the weekly check is 'on' or 'off', not '{other}'. Example: install --set-weekly-check off --db <your memory>");
+            return ExitCode::from(2);
+        }
+    };
+    let Some(db) = db else {
+        eprintln!("name the memory to set this for: install --set-weekly-check {word} --db <your memory>");
+        return ExitCode::from(2);
+    };
+    if !db.is_file() {
+        eprintln!(
+            "REFUSED: there is no memory at {} - check the path given with --db (the one your assistant's hooks name).              Nothing was changed.",
+            db.display()
+        );
+        return ExitCode::FAILURE;
+    }
+    match serve::plan::set_weekly_check(&db, on) {
+        Ok(()) => {
+            println!("weekly check set to '{word}' for {}", db.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("could not write the switch: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// `install --set-plan max|small`: write the plan and nothing else.
@@ -171,10 +215,11 @@ fn set_plan_only(db: Option<PathBuf>, word: &str) -> ExitCode {
 /// `install --set-mode release|test`: write the mode and nothing else.
 fn set_mode_only(db: Option<PathBuf>, word: &str) -> ExitCode {
     let mode = match word {
-        "release" => serve::bug_report::Mode::Release,
-        "test" => serve::bug_report::Mode::Test,
+        "release" => Some(serve::bug_report::Mode::Release),
+        "test" => Some(serve::bug_report::Mode::Test),
+        "off" => None,
         other => {
-            eprintln!("the mode is 'release' or 'test', not '{other}'. Example: install --set-mode test --db <your memory>");
+            eprintln!("the mode is 'release', 'test' or 'off', not '{other}'. Example: install --set-mode test --db <your memory>");
             return ExitCode::from(2);
         }
     };
@@ -190,7 +235,11 @@ fn set_mode_only(db: Option<PathBuf>, word: &str) -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
-    match serve::thor_bugs::write_mode(&db, mode) {
+    let written = match mode {
+        Some(mode) => serve::thor_bugs::write_mode(&db, mode),
+        None => serve::thor_bugs::write_bug_reports_off(&db),
+    };
+    match written {
         Ok(()) => {
             println!("bug nudge mode set to '{word}' for {}", db.display());
             ExitCode::SUCCESS
@@ -364,6 +413,9 @@ fn main() -> ExitCode {
     if let Some(word) = cli.set_plan.as_deref() {
         return set_plan_only(cli.db, word);
     }
+    if let Some(word) = cli.set_weekly_check.as_deref() {
+        return set_weekly_check_only(cli.db, word);
+    }
 
     let data_dir = default_data_dir();
     let serve_exe = match cli.serve_exe.or_else(|| sibling("serve")) {
@@ -510,8 +562,12 @@ fn main() -> ExitCode {
             // into someone's real work uninvited, so that never happens.
             match seed_working_contract(&db) {
                 Ok(seeded) => {
-                    let stored = seeded.iter().filter(|s| s.stored).count();
+                    // The numbered first-session list is a lookup item, not a note.
+                    let stored = seeded.iter().filter(|s| s.stored && s.id != ops::questionnaire::LOOKUP_ID).count();
                     println!("+ put {stored} starting notes in it. They teach your assistant how to write notes that come back when needed, and give it a few good working habits.");
+                    if seeded.iter().any(|s| s.stored && s.id == ops::questionnaire::LOOKUP_ID) {
+                        println!("+ put the numbered list of everything this install set up in it too: your assistant shows it to you in your first session, and you answer by number (nothing waits for you).");
+                    }
                     for s in seeded.iter().filter(|s| !s.stored) {
                         let why = s.refusal.as_deref().unwrap_or("no reason given");
                         println!("  ! {} was refused: {}", s.id, why);
@@ -551,6 +607,7 @@ fn main() -> ExitCode {
                     "+ bug nudge mode 'release': if THOR finds a bug in itself, your assistant may offer to report it to the makers - it shows you the exact text first, and nothing is sent without your yes"
                 ),
                 ops::install::ModeHow::Told => println!("+ bug nudge mode '{word}'"),
+                ops::install::ModeHow::Off => println!("= bug reporting is switched off (your choice); left that way"),
             }
         }
         Err(e) => println!("  ! could not write the bug nudge mode: {e}"),

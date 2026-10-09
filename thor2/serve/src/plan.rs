@@ -177,6 +177,20 @@ pub fn write(db: &Path, plan: Plan, source: PlanSource) -> std::io::Result<()> {
     std::fs::write(mode_file(db), Value::Object(object).to_string())
 }
 
+/// Whether the weekly check is on: yes unless the user switched it off
+/// (`install --set-weekly-check off`, first-session question 4). Only the
+/// automatic ask is switched off; the user can still run `/thor-eval`.
+pub fn weekly_check_on(db: &Path) -> bool {
+    read_object(db).get("weekly_check").and_then(Value::as_str) != Some("off")
+}
+
+/// Switch the weekly check on or off, keeping every other key of the sidecar.
+pub fn set_weekly_check(db: &Path, on: bool) -> std::io::Result<()> {
+    let mut object = read_object(db);
+    object.insert("weekly_check".to_string(), Value::String(if on { "on" } else { "off" }.to_string()));
+    std::fs::write(mode_file(db), Value::Object(object).to_string())
+}
+
 /// Install: settle the plan from `claude_json`. A plan the user already
 /// confirmed or told is kept as it is; anything else is (re)detected. Returns
 /// what is on record afterwards and what the file said.
@@ -264,6 +278,22 @@ mod tests {
         assert_eq!(crate::thor_bugs::read_mode(&db), Some(crate::bug_report::Mode::Test), "the bug mode survives");
         crate::thor_bugs::write_mode(&db, crate::bug_report::Mode::Release).unwrap();
         assert_eq!(read(&db), Some((Plan::Max, PlanSource::Confirmed)), "writing the bug mode keeps the plan");
+    }
+
+    #[test]
+    fn the_weekly_check_is_on_until_the_user_switches_it_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = store(dir.path());
+        assert!(weekly_check_on(&db), "on by default, with no sidecar at all");
+        write(&db, Plan::Max, PlanSource::Confirmed).unwrap();
+        assert!(weekly_check_on(&db));
+        set_weekly_check(&db, false).unwrap();
+        assert!(!weekly_check_on(&db));
+        assert_eq!(read(&db), Some((Plan::Max, PlanSource::Confirmed)), "the plan survives");
+        crate::thor_bugs::write_mode(&db, crate::bug_report::Mode::Release).unwrap();
+        assert!(!weekly_check_on(&db), "writing the bug mode keeps the switch");
+        set_weekly_check(&db, true).unwrap();
+        assert!(weekly_check_on(&db));
     }
 
     #[test]

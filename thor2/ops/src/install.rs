@@ -355,6 +355,9 @@ pub enum ModeHow {
     Kept,
     /// Nobody said anything: the default, `release`, on every build.
     Default,
+    /// The user switched bug reporting off. The mode returned beside this is a
+    /// placeholder and means nothing; nothing is offered and nothing is sent.
+    Off,
 }
 
 /// Settle which mode the bug nudge runs in (`serve::thor_bugs`), and write it
@@ -365,6 +368,9 @@ pub enum ModeHow {
 /// mode, so a friend who builds from source is a co-tester like anyone else.
 pub fn settle_mode(db: &Path, told: Option<serve::bug_report::Mode>) -> anyhow::Result<(serve::bug_report::Mode, ModeHow)> {
     use serve::bug_report::Mode;
+    if told.is_none() && serve::thor_bugs::bug_reports_off(db) {
+        return Ok((Mode::Release, ModeHow::Off));
+    }
     let (mode, how) = match (told, serve::thor_bugs::read_mode(db)) {
         (Some(mode), _) => (mode, ModeHow::Told),
         (None, Some(mode)) => return Ok((mode, ModeHow::Kept)),
@@ -978,10 +984,10 @@ pub fn working_contract() -> Vec<model::item::Item> {
         // way for good.
         rule(
             model::store::SETUP_NOTE_ID,
-            "Setup is not finished. In your first reply tell the owner in one sentence that THOR is \
-             on with defaults (short replies, his own language, work lane only, all starting notes \
-             kept, removable any time), then store a Report 'owner-setup-answers' with those \
-             defaults or his changes and retract this note.",
+            "Setup is not finished. First reply: get the numbered list with lookup key \
+             'first-session-questions', store Report 'owner-setup-answers' with the defaults and \
+             retract this note, then show him the list in his language: answers by number, the rest \
+             keeps the default. Nothing waits.",
             "This note is still being served at session start after the owner has already \
              answered these questions and the answers are applied.",
         ),
@@ -1144,13 +1150,13 @@ pub fn workflow_starter_pack() -> Vec<model::item::Item> {
         // the owner's own.
         note(
             "orchestrator-mode-saves-quota",
-            "Orchestrator mode: the strongest model answers, judges and checks; cheaper models do the real work in helper agents, saving quota. Cheapest capable model; targeted checks, not broad searches or full test runs. Trivial one-step task: do it yourself. No strongest model: the best available steers.",
+            "Orchestrator mode saves quota: the strongest model answers, judges and checks; cheaper models do the work in helper agents, ONE helper per task, never a bundle. The chat stays free. Trivial one-step task: do it yourself. Targeted tests while working, one full run at the end.",
             "Doing all the work in the strongest model uses no more quota than letting cheaper helper agents do it.",
             vec![command("Agent")],
         ),
         note(
             "an-agent-brief-stands-alone",
-            "A spawned agent starts blank, so its brief stands alone: goal, ABSOLUTE working folder, files it may touch, no further agents, known facts (file:line), one narrow task with a stop point, a SHORT report. Parallel agents get their own folder or worktree and build directory; one agent commits.",
+            "A helper starts blank, so its brief stands alone: goal, ABSOLUTE folder, files it may touch, a SUMMARY of what is known (not a read-first list), one narrow task, a SHORT report. Check every 20-30 minutes, at most 3 times, then judge it dead by its last real activity, not its status.",
             "An agent given a brief with no working folder or limits is found to behave the same as one given a complete brief.",
             vec![command("Agent")],
         ),
@@ -1194,9 +1200,20 @@ pub fn workflow_starter_pack() -> Vec<model::item::Item> {
 /// than worked around: if the gate will not accept its own starting notes, that
 /// is worth seeing, not hiding.
 pub fn seed_working_contract(db: &Path) -> anyhow::Result<Vec<SeededItem>> {
+    let claude_json = serve::plan::default_claude_json();
+    seed_working_contract_with(db, claude_json.as_deref())
+}
+
+/// `seed_working_contract` with Claude Code's state file named, so a test can
+/// say what the first-session list shows for the plan.
+pub fn seed_working_contract_with(db: &Path, claude_json: Option<&Path>) -> anyhow::Result<Vec<SeededItem>> {
     let mut store = EventStore::new(db)?;
     let mut out = Vec::new();
-    for item in working_contract().into_iter().chain(workflow_starter_pack()) {
+    // The numbered first-session list the setup note points at: a lookup item,
+    // rendered from the same catalogue as the page in AGENTS.md.
+    let detected = claude_json.map(serve::plan::detect_in);
+    let questions = crate::questionnaire::lookup_item(detected);
+    for item in working_contract().into_iter().chain(workflow_starter_pack()).chain(std::iter::once(questions)) {
         let id = item.id.clone();
         match model::store::declare(&mut store, "install", "install", installer(), &item) {
             Ok(_) => out.push(SeededItem { id, stored: true, refusal: None }),
@@ -2304,7 +2321,8 @@ mod tests {
         ensure_store(&db).unwrap();
 
         let seeded = seed_working_contract(&db).unwrap();
-        assert_eq!(seeded.len(), working_contract().len() + workflow_starter_pack().len());
+        // The notes, the starter pack and the first-session list (a lookup item).
+        assert_eq!(seeded.len(), working_contract().len() + workflow_starter_pack().len() + 1);
         for s in &seeded {
             assert!(s.stored, "the gate refused its own starting note {}: {:?}", s.id, s.refusal);
         }
@@ -2365,7 +2383,8 @@ mod tests {
 
         assert_eq!(report.store, StoreOutcome::Created);
         assert_eq!(working_contract().len(), 22, "this test's own claim of 22 starting notes is now stale");
-        let want = 22 + workflow_starter_pack().len();
+        // 22 working-contract notes, the starter pack, and the first-session list.
+        let want = 22 + workflow_starter_pack().len() + 1;
         let stored = report.seeded.iter().filter(|s| s.stored).count();
         assert_eq!(stored, want, "expected all {want} starting notes to be stored, got {stored}");
         assert_eq!(report.rulebook.outcome, RulebookOutcome::Written);
@@ -2483,6 +2502,37 @@ mod tests {
             }
         }
         assert!(pinned <= 3, "{pinned} starter notes are pinned: every one of them is read at every session start");
+    }
+
+    /// The efficiency rules measured on 2026-10-09 (a main session at $166 and
+    /// its helpers at $492: 65k of start context per helper, bundled tasks of
+    /// 150 to 350 steps, repeated full suites, polling, re-read reports) live in
+    /// the two notes bound to the Agent tool, with no model names (they go
+    /// stale) and each under the 300 characters the gate allows.
+    #[test]
+    fn the_helper_notes_state_the_efficiency_rules_without_model_names() {
+        let pack = workflow_starter_pack();
+        let note = |id: &str| pack.iter().find(|n| n.id == id).unwrap_or_else(|| panic!("{id} left the pack")).text.to_lowercase();
+        let orchestrator = note("orchestrator-mode-saves-quota");
+        let brief = note("an-agent-brief-stands-alone");
+        for (text, must) in [
+            (&orchestrator, "one helper per task"),
+            (&orchestrator, "never a bundle"),
+            (&orchestrator, "trivial one-step task: do it yourself"),
+            (&orchestrator, "chat stays free"),
+            (&orchestrator, "targeted tests while working, one full run at the end"),
+            (&brief, "check every 20-30 minutes, at most 3 times"),
+            (&brief, "last real activity, not its status"),
+            (&brief, "summary of what is known (not a read-first list)"),
+        ] {
+            assert!(text.contains(must), "the helper notes lost '{must}': {text}");
+        }
+        for text in [&orchestrator, &brief] {
+            assert!(text.chars().count() <= 300, "{} characters: {text}", text.chars().count());
+            for model_name in ["opus", "sonnet", "haiku", "gpt", "claude", "fable"] {
+                assert!(!text.contains(model_name), "a model name goes stale: {model_name} in {text}");
+            }
+        }
     }
 
     /// A changelog and version rule depends on the project's own convention:

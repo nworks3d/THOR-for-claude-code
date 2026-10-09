@@ -342,6 +342,21 @@ fn the_mode_sidecar_round_trips_and_a_damaged_one_reads_as_none() {
 }
 
 #[test]
+fn switched_off_bug_reporting_offers_nothing_and_a_chosen_mode_turns_it_back_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    write_mode(&db, Mode::Release).unwrap();
+    add(&db, hook_launch_finding("Stop", 126));
+    assert!(!bug_reports_off(&db));
+    write_bug_reports_off(&db).unwrap();
+    assert!(bug_reports_off(&db));
+    assert_eq!(read_mode(&db), None, "no mode means nothing is offered");
+    assert_eq!(nudge_for_session(&db, "s1", crate::time::now_unix()), None, "nothing is offered while it is off");
+    write_mode(&db, Mode::Release).unwrap();
+    assert!(!bug_reports_off(&db), "choosing a mode again turns it back on");
+}
+
+#[test]
 fn a_session_gets_at_most_one_candidate_and_the_next_session_the_next_one() {
     let mut fx = Fx::new();
     two_bugs(&mut fx);

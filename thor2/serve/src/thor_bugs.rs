@@ -562,6 +562,29 @@ pub fn mode_word(mode: Mode) -> &'static str {
     }
 }
 
+/// Whether the user switched bug reporting off (`install --set-mode off`,
+/// first-session question 7). Nothing is then offered and nothing is sent, and
+/// a later plain install keeps it that way.
+pub fn bug_reports_off(db: &Path) -> bool {
+    std::fs::read_to_string(sidecar(db, MODE_FILE))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v.get("mode").and_then(|m| m.as_str()).map(|m| m == "off"))
+        .unwrap_or(false)
+}
+
+/// Switch bug reporting off. `read_mode` then answers `None`, which is the
+/// state in which THOR offers nothing at all.
+pub fn write_bug_reports_off(db: &Path) -> std::io::Result<()> {
+    let mut object = std::fs::read_to_string(sidecar(db, MODE_FILE))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    object.insert("mode".to_string(), serde_json::Value::String("off".to_string()));
+    std::fs::write(sidecar(db, MODE_FILE), serde_json::Value::Object(object).to_string())
+}
+
 /// Write the mode. Called by the installer, never by a hook.
 pub fn write_mode(db: &Path, mode: Mode) -> std::io::Result<()> {
     // The file also carries the plan (`serve::plan`): keep every other key.
@@ -830,6 +853,7 @@ pub fn doctor_line(db: &Path) -> Option<String> {
     let mode_words = match mode {
         Some(Mode::Release) => "release (a bug candidate is offered to the agent, and published only with your go)",
         Some(Mode::Test) => "test (a bug candidate is shown to the agent and reported to you, never published)",
+        None if bug_reports_off(db) => "off (switched off by the owner: nothing is offered or sent)",
         None => "not set (nothing is offered; run install again to set it)",
     };
     Some(format!(

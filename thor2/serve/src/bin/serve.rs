@@ -1214,7 +1214,7 @@ fn plain_line_for_block(event: &str, reason: &str) -> &'static str {
     let lower = reason.to_lowercase();
     match event {
         "Stop" if lower.contains("walked through setup") => {
-            "THOR (the memory your assistant uses) is finishing its setup. Your assistant settles the setup questions with sensible defaults, such as answering in your own language, so nothing is needed from you. Just say so if you want something different."
+            "THOR (the memory your assistant uses) is finishing its setup. Your assistant shows you a short numbered list of what was set up, already switched on with sensible defaults, such as answering in your own language. Answer the numbers you care about, or just carry on: nothing is needed from you."
         }
         "Stop" if lower.contains("evaluation") => {
             "THOR asks your assistant to do a short tidy-up of its memory before it finishes. It can take a few minutes. Nothing is needed from you."
@@ -2820,18 +2820,23 @@ fn setup_debt(store: &EventStore) -> Option<String> {
     model::store::show(store, model::store::SETUP_NOTE_ID).ok()?;
     Some(format!(
         "[THOR] This memory was just installed and its owner has not been walked through setup \
-         yet. Before anything else, tell him in ONE sentence that THOR is on with these defaults: \
-         short plain replies, in his own language, the work lane only (nothing personal goes \
-         into it), all the starting notes kept (any can be removed on his word), and each \
-         project named after its folder. Do not ask him to choose: apply the defaults without \
-         waiting for an answer and change only what he tells you to change. AGENTS.md's \"First \
-         session with a new owner\" section has the full questions for a person who wants to go \
-         through them. Then store what applies as '{}' (a Report with no scope is enough - this \
-         id needs none, so do not ask him to name a collection for it) and retract '{}'. \"He \
-         does not want any of this\" is itself a valid answer - write that down and this still \
-         clears. Two things settle it: the answers on record, and the note retracted.",
-        model::store::OWNER_SETUP_ANSWERS_ID,
-        model::store::SETUP_NOTE_ID
+         yet. Do this before anything else, in this same turn, so nothing waits for him: (1) read \
+         the numbered list with lookup key 'first-session-questions' (each item says what it is, \
+         why it exists, what was chosen and how to say no); (2) store what applies - the \
+         defaults: short plain replies, in his own language, the work lane only (nothing personal \
+         goes into it), all the starting notes kept, each project named after its folder - as \
+         '{answers}' (a Report with no scope is enough - this id needs none, so do not ask him to \
+         name a collection for it); (3) retract '{note}'; (4) show him the list in his own \
+         language, say that everything on it is already on, and that he can answer by number (for \
+         example \"1 yes, 3 no, the rest as you like\"). Whatever he does not mention keeps its \
+         default, and you apply the defaults without waiting for an answer. When he does answer, \
+         apply each number, say ONCE and plainly why an item exists if his answer works against \
+         him, then respect his word, and revise the answers Report (never store a second copy). \
+         AGENTS.md's \"First session with a new owner\" section has the same list. \"He does not \
+         want any of this\" is itself a valid answer - write that down and this still clears. Two \
+         things settle it: the answers on record, and the note retracted.",
+        answers = model::store::OWNER_SETUP_ANSWERS_ID,
+        note = model::store::SETUP_NOTE_ID
     ))
 }
 
@@ -3136,7 +3141,7 @@ fn skill_call_answer(
                 .map(|root| serve::attest::session_timeline(&root, session_id))
                 .unwrap_or_default();
             matches!(
-                usefulness::stop_decision(store, &state, project, session_id, &timeline, false, false, now, usefulness::cadence_for(serve::plan::current(db_path))),
+                usefulness::stop_decision(store, &state, project, session_id, &timeline, false, false, now, usefulness::cadence_in(db_path)),
                 usefulness::StopDecision::Ask(_)
             )
         };
@@ -3241,7 +3246,7 @@ fn evaluation_debt(
 ) -> Option<String> {
     let project = current_project?;
     let state = usefulness::project_eval_state(db_path, Some(project));
-    let by_floor = usefulness::project_due(store, &state, project, work, time::now_unix(), usefulness::cadence_for(serve::plan::current(db_path)))?;
+    let by_floor = usefulness::project_due(store, &state, project, work, time::now_unix(), usefulness::cadence_in(db_path))?;
     let clock = usefulness::EvalClock { work: work.clone(), own_minutes: work.accrued_secs / 60, by_floor };
     Some(evaluation_ask(store, db_path, project, &clock, Some(project), "test-session"))
 }
@@ -3608,7 +3613,7 @@ fn eval_stop_ask(
             continue;
         }
         let stop_here = folder_project == Some(project.as_str());
-        match usefulness::stop_decision(store, &state, &project, session_id, &timeline, stop_here, true, now, usefulness::cadence_for(serve::plan::current(db_path))) {
+        match usefulness::stop_decision(store, &state, &project, session_id, &timeline, stop_here, true, now, usefulness::cadence_in(db_path)) {
             usefulness::StopDecision::Ask(clock) => {
                 // A REPORT THIS SESSION FILED WAS REFUSED AS VERSION SKEW and
                 // the session has not been restarted since (field test 13,
@@ -3801,7 +3806,7 @@ fn evaluation_ask(
 
     // THE RHYTHM (part G): one evaluation per week per project, daily on Max
     // while rot is found. The ask says which applies, in one plain line.
-    let cadence = usefulness::cadence_for(serve::plan::current(db_path));
+    let cadence = usefulness::cadence_in(db_path);
     let rot = cadence == usefulness::EvalCadence::WeeklyUnlessRot && serve::eval_filing::project_rot(store, project).is_some();
     let mode = usefulness::mode_line(cadence, rot);
     let quiet_days = usefulness::covers_hours(cadence, rot) / 24;
@@ -4607,7 +4612,7 @@ mod setup_debt_tests {
 
         let reason = setup_debt(&store).expect("the note is live, so this must hold the turn");
         let lowered = reason.to_lowercase();
-        for part in ["defaults", "one sentence", "replies", "language", "starting notes", "without waiting"] {
+        for part in ["defaults", "first-session-questions", "replies", "language", "starting notes", "without waiting", "by number"] {
             assert!(lowered.contains(part), "the setup reminder never mentions '{part}': {reason}");
         }
     }

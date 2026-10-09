@@ -89,3 +89,36 @@ fn set_plan_keeps_the_bug_mode() {
     install(home.path(), &["--set-plan", "max", "--db", &db.display().to_string()]);
     assert_eq!(serve::thor_bugs::read_mode(&db), Some(serve::bug_report::Mode::Test));
 }
+
+#[test]
+fn the_weekly_check_switch_is_written_alone_and_a_second_install_keeps_it() {
+    let home = tempfile::tempdir().unwrap();
+    install(home.path(), &["--no-mcp"]);
+    let db = db_of(home.path());
+    assert!(serve::plan::weekly_check_on(&db), "on by default");
+    let out = install(home.path(), &["--set-weekly-check", "off", "--db", &db.display().to_string()]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!serve::plan::weekly_check_on(&db));
+    install(home.path(), &["--no-mcp"]);
+    assert!(!serve::plan::weekly_check_on(&db), "a plain install never switches it back on");
+    let bad = install(home.path(), &["--set-weekly-check", "sometimes", "--db", &db.display().to_string()]);
+    assert_eq!(bad.status.code(), Some(2));
+    install(home.path(), &["--set-weekly-check", "on", "--db", &db.display().to_string()]);
+    assert!(serve::plan::weekly_check_on(&db));
+}
+
+#[test]
+fn switched_off_bug_reporting_stays_off_through_a_second_install() {
+    let home = tempfile::tempdir().unwrap();
+    install(home.path(), &["--no-mcp"]);
+    let db = db_of(home.path());
+    assert_eq!(serve::thor_bugs::read_mode(&db), Some(serve::bug_report::Mode::Release));
+    let out = install(home.path(), &["--set-mode", "off", "--db", &db.display().to_string()]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(serve::thor_bugs::read_mode(&db), None, "nothing is offered");
+    let again = install(home.path(), &["--no-mcp"]);
+    assert!(String::from_utf8_lossy(&again.stdout).contains("bug reporting is switched off"), "{}", String::from_utf8_lossy(&again.stdout));
+    assert_eq!(serve::thor_bugs::read_mode(&db), None, "a plain install does not turn it back on");
+    install(home.path(), &["--set-mode", "release", "--db", &db.display().to_string()]);
+    assert_eq!(serve::thor_bugs::read_mode(&db), Some(serve::bug_report::Mode::Release), "only his word turns it back on");
+}

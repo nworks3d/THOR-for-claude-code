@@ -482,15 +482,26 @@ report it as a bug.
 Once install has run and they have restarted, a seeded note -
 `walk-through-the-answer-guard-once` - arrives at the start of every session
 until it is retracted. It exists to make sure this conversation happens once,
-before any other work, and that it covers the whole first session, not only
-the answer guard.
+before any other work, and that it covers everything the install arranged, not
+only the answer guard. The full list is in the memory as the lookup item
+`first-session-questions` (`lookup` with that key) and below on this page: they
+are the same text, rendered from one catalogue in the code.
 
-**Do not turn it into an interview.** The person asked for THOR to be installed
-and nothing more, so every point below has a default, and the defaults apply
-without waiting for an answer. Say them in ONE sentence, apply them, record
-them, and change only what they tell you to change. Someone who answers "just do
-it", or who does not answer at all, is answered by the defaults. Only a person
-who wants to go through the points one by one gets the questions.
+**Everything the install arranges or switches on is on that numbered list, so
+nothing happens silently.** Each item says what it is, why it exists (the real
+reason or the measurement behind it), what was chosen for them, and how to say
+no. **Do not turn it into an interview and never make anyone wait.** The person
+asked for THOR to be installed and nothing more, so every item has a default,
+and the defaults apply without waiting for an answer: apply them, record them,
+retract the setup note, and THEN show the list in their own language with
+"everything here is already on - tell me by number what you want different".
+They answer per number ("1 yes, 3 no, the rest as you like"); anything not
+mentioned keeps the default, and "defaults" or "doe maar" accepts all of it.
+Someone who does not answer at all is answered by the defaults.
+
+**When an answer works against them,** say ONCE, in one or two plain sentences,
+why the item exists (its "Why it exists" line), then do what they decided. They
+have the final word. Never block, never ask twice, never repeat the warning.
 
 This is held, not only asked. The session does not end while the note is
 live, and retracting it is refused until the owner's answers are on record as
@@ -500,31 +511,98 @@ with no project: a store this fresh has not named a scope yet, and this one
 item needs none - do not invent a collection for it, and do not ask him to
 name one just to get this write to land. "He is not interested" is itself a
 valid answer to record - write that down plainly and the note clears exactly
-the same way a full set of preferences would.
+the same way a full set of preferences would. When answers come later, REVISE
+that report; a second copy is worse than none.
 
-- **What this is.** In two sentences and no jargon: "This remembers what you
-  tell me about your work, so you never have to repeat it, and it brings the
-  right thing back at the right moment." Say this first, so the rest makes sense.
-- **How replies should read.** Default: short and plain, no length limit and no
-  summary line, in the language they write to you in - their own rules can be
-  written in that language even while the code stays English. Only when they
-  want it otherwise, ask how long a reply can get before it is too long and
-  whether they want a short summary line before the detail.
-- **Which lanes they want.** Default: the code-and-work memory only. The
-  personal lane for their own life - recipes, books, a training log - exists
-  anyway and needs no setup; anything personal goes to the library with
-  `shelve`, never into the code memory with `remember`.
-- **Which starting rules to keep.** Default: all of them. The install seeded the
-  starting notes listed below and five example rules into
-  `guard-response-rulebook.json`, next to the store. Each rule in that file is one
-  entry with a plain-language reminder line - edit the reminder to change what it
-  says, or delete the entry to turn the rule off.
-- **How they name their projects.** Default: the folder name. Every checkout is
-  scoped by its folder name automatically - facts stay inside that project and do
-  not compete across projects. If a folder name does not match how they call the
-  project, they can run `install --project <name> --db "<their store>"` from
-  inside the checkout to override it. Only when they tell you a name, use it -
-  never invent one.
+Say first, in two sentences and no jargon: "This remembers what you tell me
+about your work, so you never have to repeat it, and it brings the right thing
+back at the right moment." Then show the list.
+
+<!-- questionnaire:begin -->
+THOR is set up. Here is everything the install arranged or switched on, so nothing happens silently. For each one: what it is, why it exists, what was chosen for you, and how to say no.
+
+Answer by number, for example "1 yes, 3 no, the rest as you like". Whatever you do not mention keeps the choice made for you, and "defaults" accepts all of it. You can change any of it later just by asking.
+
+1. Your plan
+   What it is: I looked at Claude Code's own settings to find out which plan you have: Max, or Pro and smaller. Ask: 'The settings say <Max | Pro or smaller>. Is that right?' - or, when they do not say, 'Which is it: Max, or Pro and smaller?'
+   Why it exists: THOR checks itself on a schedule, and that check draws on the same usage limit as your own work, so on a smaller plan it runs once a week at most and never daily, which keeps your limit for you; on Max it also runs daily while something is found wrong.
+   What I chose: The plan the settings say; a smaller plan when they do not say.
+   To say no: Tell me the right plan and I record it, so the schedule follows what you really pay for.
+
+2. The connections to Claude Code
+   What it is: THOR is wired into Claude Code at four moments: when a session starts, before each tool call, when you send a message, and when a reply ends. That is how the memory speaks up by itself and how replies get checked. A backup copy of Claude Code's settings file was made first.
+   Why it exists: A memory that must be asked for stays silent, and a missing connection fails without any message: the memory simply never says a word.
+   What I chose: On.
+   To say no: Then THOR is only a notebook your assistant searches when you ask. I remove the THOR lines from Claude Code's settings file (the backup copy stays next to it), which also ends the weekly check, the reply rules and the bug offers, since they all run through those connections.
+
+3. The git hooks in every repository
+   What it is: THOR set one git setting for the whole machine so that every repository refreshes THOR's code index after each commit. Each repository's own git hooks still run; if another tool already owned that setting, THOR left it alone.
+   Why it exists: An index three days behind made 83 percent of the 'where is this used' answers name a wrong line; a fresh index made none wrong (measured at the maker, 2026-08-15).
+   What I chose: On, unless something else already owned the setting.
+   To say no: I undo it with one git command (git config --global --unset core.hooksPath). Searching the code then goes stale after each commit.
+
+4. The weekly check
+   What it is: About once a week per project (daily on Max while something is found wrong) THOR asks your assistant to run a short tidy-up of the memory before it finishes a turn: judge the notes that fired, repair stale ones and file a report. The command /thor-eval was added so you can also run it yourself.
+   Why it exists: A memory nobody maintains fills with stale notes and quietly stops helping, and a check that depends on someone remembering it does not happen.
+   What I chose: On, at the rhythm of question 1.
+   To say no: I switch the weekly ask off (install --set-weekly-check off); you can still type /thor-eval yourself, and nothing else changes.
+
+5. The starter work rules
+   What it is: A set of 12 general work habits, stored as notes that arrive right before the step they are about, once per session: changelog with every user visible change; run the tests before saying done; never commit a secret; commit push deploy only when asked; commit hygiene; check where you push and what is on main; scan before it goes public; rehearse destructive steps on a copy; pin a dependency with its reason; absolute paths not the shell working directory; script file not shell quoting; windowless processes on windows. 21 more notes teach your assistant how to write notes that come back and how to work with THOR. None of them can block anything.
+   Why it exists: They are the habits that were marked useful again and again in a memory built over months of real work, so a new memory starts with that experience instead of learning it the hard way.
+   What I chose: All on.
+   To say no: Name the ones you do not want, or say none: I remove just those notes (changelog-with-every-user-visible-change, run-the-tests-before-saying-done, never-commit-a-secret, commit-push-deploy-only-when-asked, commit-hygiene, check-where-you-push-and-what-is-on-main, scan-before-it-goes-public, rehearse-destructive-steps-on-a-copy, pin-a-dependency-with-its-reason, absolute-paths-not-the-shell-working-directory, script-file-not-shell-quoting, windowless-processes-on-windows), and a removed note simply stops arriving.
+
+6. Helper-agent mode
+   What it is: Your main assistant (the strongest model) answers, judges and checks, while cheaper models do the real work in helper agents, one helper per task. A trivial one-step job is done directly, tests are run narrowly while working and in full once at the end, and a helper that goes quiet is judged dead after about three checks. This is also true on smaller plans, and if your plan has no strongest model the best available one steers.
+   Why it exists: Measured at the maker, helpers were likely 12 to 62 percent cheaper than doing everything in the main conversation, and the chat stays free and answers at once while they work, instead of you waiting 5 to 15 minutes.
+   What I chose: On.
+   To say no: I remove the two notes that carry it (orchestrator-mode-saves-quota and an-agent-brief-stands-alone); your assistant then does the work itself in the main conversation.
+
+7. Reporting THOR's own bugs
+   What it is: Sometimes THOR finds a fault in itself. Your assistant may then offer to report it to the makers on GitHub. It shows you the exact full text first; file paths, project and folder names, computer and user names, addresses, keys and passwords are removed; nothing is sent without your yes, and saying no costs nothing.
+   Why it exists: THOR sees faults in itself that nobody reading a report would notice, and the makers can only fix what they hear about.
+   What I chose: On: it may ask you, once per fault, and sends nothing without your yes.
+   To say no: I switch it off (install --set-mode off): nothing is offered and nothing is sent, ever.
+
+8. Reply language and length
+   What it is: Your assistant answers in your language, short, with a plain-language summary first. A small file next to the memory holds five reply rules (a summary first, no reflexive disclaimers, check before asking you to look something up, keep an answer under about 1000 characters, show evidence when saying something was checked); a reply that breaks one is sent back once to be rewritten. A summary or overview you ask for may run longer.
+   Why it exists: Long, technical replies are hard to act on; the rules keep a reply to the point, and they were checked against about 6,600 real replies at the maker, and the false triggers found there were removed.
+   What I chose: Your language, short replies, all five reply rules on.
+   To say no: Tell me the language and the length you want. I change the file, or remove a single rule to turn just that one off.
+
+9. Folders for a topic
+   What it is: A plain folder with no code in it, such as a folder of recipes or travel plans, can have a memory of its own: I run one command inside it and it gets one small hidden file. Notes about that folder then come back only when you work there. Nothing is set up until you name a folder.
+   Why it exists: Notes about one subject stay out of the way of the others, so nothing from your recipe folder interrupts your code.
+   What I chose: No folders are set up yet.
+   To say no: Nothing to undo: do not name a folder. A folder you set up has one hidden file, .thor-project, that you can delete.
+
+10. Backups of the memory
+   What it is: About once a day, and when a session starts, THOR writes a copy of the whole memory into a git repository of its own on this machine. It goes somewhere else only if you name a place: a folder on a NAS or another computer you own, or a private repository.
+   Why it exists: The memory is a single file, and if the disk dies everything it learned dies with it.
+   What I chose: A daily copy on this machine; nothing leaves the machine.
+   To say no: Nothing leaves your machine unless you name a place. The local copy is one folder you can delete.
+
+FOR THE ASSISTANT (do not read this part out)
+- Apply the defaults NOW, in this same turn, without waiting for an answer, so nothing waits: store the Report 'owner-setup-answers' with them and retract the setup note. Then show the list above in the user's own language, once, and say that everything on it is already on and that he can tell you by number what he wants different (for example "1 yes, 3 no, the rest as you like"; "defaults" or "doe maar" accepts all of it).
+- Anything he does not mention keeps the default. Never ask the same question twice and never hold up his work for an answer.
+- Question 1: if the settings named a plan, ask him to confirm it with its reason; if they did not, ask which plan outright with the same reason. Record his word with install --set-plan max|small --db <store>.
+- When he answers, apply each number where it belongs, then REVISE 'owner-setup-answers' (never store a second copy): 1 install --set-plan; 2 remove THOR's lines from Claude Code's settings file; 3 git config --global --unset core.hooksPath; 4 install --set-weekly-check off|on; 5 and 6 retract the named notes (a retracted note stops arriving); 7 install --set-mode off (or release); 8 the reply file beside the store (guard-response-rulebook.json) and a stored preference for the language; 9 install --topic, run from inside the folder; 10 the backup folder and its remote.
+- A bad answer is one that works against him (for example switching off the connections and then expecting the memory to speak). Say ONCE, in one or two plain sentences, why the item exists (its 'Why' above), then do what he decided. He has the final word, you never block and never nag.
+- "He does not want any of this" is itself a valid answer: record it as the answers and apply nothing.
+<!-- questionnaire:end -->
+
+Three more facts to give in your own words, without a question:
+
+- **Lanes.** The code-and-work memory is the default. The personal lane for
+  their own life - recipes, books, a training log - exists anyway and needs no
+  setup; anything personal goes to the library with `shelve`, never into the code
+  memory with `remember`.
+- **Project names.** Every checkout is scoped by its folder name automatically -
+  facts stay inside that project and do not compete across projects. If a folder
+  name does not match how they call the project, they can run
+  `install --project <name> --db "<their store>"` from inside the checkout to
+  override it. Only when they tell you a name, use it - never invent one.
 - **That the memory is theirs to correct.** A changed fact is corrected with
   `revise`, never stored a second time - though weakening any rule (clearing or
   changing its check, lowering its severity, dropping or replacing a binding,
@@ -536,23 +614,22 @@ the same way a full set of preferences would.
   fact that fired in the wrong place is marked as noise with `mark`, instead
   of being deleted.
 
-## The one sentence, and the two calls
+## The two calls
 
-Say, in their language and your own words: THOR is on, it keeps short plain
-replies, answers in their language, uses only the work memory, keeps every starting
-note (any can be removed by saying so), and names each project after its folder.
-Then make the two calls:
+Make them in this order, in the first reply, whatever the person answers:
 
 ```
 remember(
   id:   "owner-setup-answers",
   kind: "report",
-  text: "Setup finished with the defaults, nothing asked. Replies: short and plain, in the owner's own language. Lane: work only. Starting notes and example rules: all kept. Projects: named after their folder. Any of these changes when the owner says so."
+  text: "Setup finished with the defaults, nothing asked first. Plan: <as detected or told>. Everything on the numbered list is on. Replies: short and plain, in the owner's own language. Lane: work only. Projects: named after their folder. Any of these changes when the owner says so."
 )
 retract(id: "walk-through-the-answer-guard-once", reason: "Setup finished: the owner's answers are on record as owner-setup-answers.")
 ```
 
-If they gave their own answers, put those in the text instead of the defaults.
+When the person answers by number, apply each answer where it belongs (the
+assistant rules under the list say where), then `revise` `owner-setup-answers`
+with what they chose.
 
 ## The starter set of work rules
 
@@ -588,13 +665,14 @@ Around a risky step or a tool:
 - `rehearse-destructive-steps-on-a-copy` - a delete, migration or deploy is tried on
   a throwaway copy first; never test a write path against live data.
 - `pin-a-dependency-with-its-reason` - a version pin carries a comment saying why.
-- `orchestrator-mode-saves-quota` - on by default: the strongest model answers
-  questions, judges and checks, cheaper models do the real work in helper agents,
-  a trivial one-step task is done directly, and with no strongest model on the plan
-  the best available one steers.
-- `an-agent-brief-stands-alone` - goal, absolute working folder, files it may touch,
-  no further agents, what is already known, one narrow task with a stop point, a short
-  report; parallel agents get their own folder or worktree, and one agent commits.
+- `orchestrator-mode-saves-quota` - on by default (question 6): the strongest model
+  answers, judges and checks, cheaper models do the work in helper agents, one helper
+  per task and never a bundle, the chat stays free meanwhile, a trivial one-step task
+  is done directly, and tests are run narrowly while working and in full once at the end.
+- `an-agent-brief-stands-alone` - goal, absolute folder, files it may touch, a summary
+  of what is known (not a read-first list), one narrow task, a short report; waiting is
+  a check every 20 to 30 minutes, at most three times, then the job is judged dead by
+  its last real activity, never by its status.
 - `absolute-paths-not-the-shell-working-directory` - absolute paths in every command
   and every brief.
 - `script-file-not-shell-quoting` - text with quotes or backslashes goes in a script
@@ -606,9 +684,9 @@ that comes back and about honesty, agent-spawning and memory hygiene; those are
 described in the sections below.
 
 Apply each answer where it belongs - a reply-shape rule in the rulebook file,
-a standing preference as a stored fact - then store a short summary of what he
-chose (or that he declined, or that the defaults applied) as `owner-setup-answers`,
-and only then retract `walk-through-the-answer-guard-once` so it never asks again.
+a standing preference as a stored fact - and keep `owner-setup-answers` current with
+`revise`: the defaults first (so `walk-through-the-answer-guard-once` can be retracted
+at once and never asks again), then what he chose, number by number.
 
 ---
 
