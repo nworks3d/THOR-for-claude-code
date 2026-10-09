@@ -1162,3 +1162,55 @@ fn a_forbidden_check_on_the_anchor_refuses_the_backslash_spelling() {
         assert!(!fb_ps(&anchors, &["--live"], cmd).1, "must pass: {cmd}");
     }
 }
+
+// ------------------------------------------- PowerShell assignments (FT14 H2)
+
+/// Whether the rule `install-exe-zonder-db-kiest-lege-store` (anchor
+/// `install.exe`, requires `--db`) refuses `cmd`, a PowerShell call.
+fn install_rule_refuses(cmd: &str) -> bool {
+    let items = rule(&["install.exe"], Check::Requires { when: "install.exe".to_string(), required: s(&["--db"]) });
+    absent_guard::find_requires_violation(&items, "PowerShell", Some(cmd), cmd).is_some()
+}
+
+/// The measured false block (field test 14, H2): a PowerShell line that only
+/// ASSIGNS a path ending in `install.exe` was read as running `install.exe`,
+/// because `$src='...install.exe'` is one word and `is_assignment` knew only
+/// the sh spelling.
+#[test]
+fn a_powershell_assignment_of_an_install_exe_path_runs_nothing() {
+    for cmd in [
+        "$src='C:\\tools\\bin\\install.exe'\nGet-Item $src",
+        "$src='C:\\tools\\bin\\install.exe'; Get-FileHash $src",
+        "$env:TARGET='C:\\bin\\install.exe'\nGet-Item $env:TARGET",
+        "$src+='C:\\bin\\install.exe'",
+        "$src = 'C:\\bin\\install.exe'\nGet-Item $src",
+    ] {
+        assert!(!install_rule_refuses(cmd), "must pass: {cmd}");
+    }
+    let segs = segments("$src='C:\\bin\\install.exe'", Dialect::PowerShell);
+    assert!(segs.iter().all(|g| g.program.is_empty() && g.head.is_empty()), "no program: {segs:?}");
+}
+
+/// The other side: the program is still the program, with or without an
+/// assignment in front or on another line, and sh behaves as before.
+#[test]
+fn a_real_install_exe_call_is_still_seen_as_the_program() {
+    for cmd in [
+        "install.exe",
+        "& 'C:\\bin\\install.exe' --foo",
+        "C:\\bin\\install.exe --foo",
+        "$src='x'\nC:\\bin\\install.exe --foo",
+        "$src='C:\\bin\\install.exe'; & C:\\bin\\install.exe --foo",
+    ] {
+        assert!(install_rule_refuses(cmd), "must be refused: {cmd}");
+        assert!(!install_rule_refuses(&format!("{cmd} --db x")), "must pass with --db: {cmd}");
+    }
+    // sh: a leading `NAME=value` is still skipped, and the next word is the program.
+    let segs = segments("FOO=bar install.exe --foo", Dialect::Sh);
+    assert_eq!(segs.len(), 1);
+    assert_eq!(segs[0].program, "install.exe");
+    assert_eq!(segs[0].head, vec!["install".to_string(), "--foo".to_string()]);
+    // sh does not know `$name=`: it is the program word, as before.
+    let segs = segments("$src=x install.exe", Dialect::Sh);
+    assert_eq!(segs[0].program, "$src=x");
+}

@@ -996,7 +996,7 @@ fn collect(command: &str, d: Dialect, depth: usize, start: Place, remote: bool, 
                 }
                 (unit, command_len, raw.words.join(" "))
             };
-            let (head, program) = head_and_program(&raw.words);
+            let (head, program) = head_and_program(&raw.words, d);
             let git_dir = if program == "git" || program == "git.exe" { git_dir_override(&raw.words) } else { None };
             let own_dir = match &git_dir {
                 Some(g) => Some(join_dir(place.dir.as_deref(), g)),
@@ -1157,6 +1157,19 @@ fn is_assignment(w: &str) -> bool {
     matches!(cs.next(), Some(c) if c.is_ascii_alphabetic() || c == '_') && cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// A PowerShell variable assignment typed without spaces: `$name='...'`,
+/// `$env:NAME=...`, `$name+=...` (`${name}=` is cut into three words by the
+/// scanner before it gets here, and is not handled). The word is the assignment,
+/// never the program - `$src='C:\tools\install.exe'` runs nothing (field test
+/// 14, H2). A spaced `$name = ...` needs no help: its first word is `$name`.
+fn is_ps_assignment(w: &str) -> bool {
+    let Some(rest) = w.strip_prefix('$') else { return false };
+    let Some(eq) = rest.find('=') else { return false };
+    let name = rest[..eq].trim_end_matches(['+', '-', '*', '/', '%']);
+    let mut cs = name.chars();
+    matches!(cs.next(), Some(c) if c.is_ascii_alphabetic() || c == '_') && cs.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+}
+
 /// A word's last path part, lowercased, without a `.exe` suffix.
 fn base_lower(w: &str) -> String {
     let base = w.rsplit(['/', '\\']).next().unwrap_or(w).to_lowercase();
@@ -1165,11 +1178,11 @@ fn base_lower(w: &str) -> String {
 
 /// The words with shell syntax taken off the front - see `Segment::head` -
 /// and the program they run (see `Segment::program`).
-fn head_and_program(words: &[String]) -> (Vec<String>, String) {
+fn head_and_program(words: &[String], d: Dialect) -> (Vec<String>, String) {
     let mut i = 0;
     while i < words.len() {
         let w = words[i].as_str();
-        if RESERVED.contains(&w) || is_assignment(w) {
+        if RESERVED.contains(&w) || is_assignment(w) || (d == Dialect::PowerShell && is_ps_assignment(w)) {
             i += 1;
             continue;
         }
