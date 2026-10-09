@@ -346,6 +346,43 @@ pub fn eval_command_path_from(userprofile: Option<&str>, home: Option<&str>) -> 
     userprofile.or(home).map(|h| PathBuf::from(h).join(".claude").join("commands").join("thor-eval.md"))
 }
 
+/// The file a RELEASE ARCHIVE carries next to the programs (the release
+/// workflow writes it), and nothing else does: its presence is how an install
+/// knows it was made from the official release and not from a build in a
+/// checkout. Its content is not read.
+pub const RELEASE_MARKER: &str = "THOR-RELEASE";
+
+/// How `settle_mode` came to its answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModeHow {
+    /// The owner said so (`install --set-mode`).
+    Told,
+    /// A mode was written by an earlier run; this run leaves it alone.
+    Kept,
+    /// The programs came out of a release archive.
+    ReleaseArchive,
+    /// No release marker beside the programs: a build from a checkout.
+    BuiltFromSource,
+}
+
+/// Settle which mode the bug nudge runs in (`serve::thor_bugs`), and write it
+/// beside the store at `db`. `told`: the owner's own choice, always written.
+/// Otherwise a mode already on disk is kept (a second run never flips what
+/// the owner set), else `bin_dir` decides: a release marker means `release`,
+/// anything else `test` - so a source build can never publish anything, and
+/// only an install made from the official archive may ever be asked to.
+pub fn settle_mode(db: &Path, bin_dir: &Path, told: Option<serve::bug_report::Mode>) -> anyhow::Result<(serve::bug_report::Mode, ModeHow)> {
+    use serve::bug_report::Mode;
+    let (mode, how) = match (told, serve::thor_bugs::read_mode(db)) {
+        (Some(mode), _) => (mode, ModeHow::Told),
+        (None, Some(mode)) => return Ok((mode, ModeHow::Kept)),
+        (None, None) if bin_dir.join(RELEASE_MARKER).is_file() => (Mode::Release, ModeHow::ReleaseArchive),
+        (None, None) => (Mode::Test, ModeHow::BuiltFromSource),
+    };
+    serve::thor_bugs::write_mode(db, mode)?;
+    Ok((mode, how))
+}
+
 /// Write THOR's end-of-session evaluation routine to `path`, with its two
 /// placeholders filled in from `bin_dir` and `db`.
 ///

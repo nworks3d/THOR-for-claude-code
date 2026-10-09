@@ -3723,12 +3723,15 @@ pub fn report(
     // from GROUND 29 (`model::gate::opposing_literals`), which refuses a
     // structural opposition at write time and never runs here.
     lines.extend(contradiction_line(db, checkouts));
+    // Silent unless a THOR bug candidate is waiting (`serve::thor_bugs`); the
+    // full report also says the mode once a candidate or a mode exists.
+    lines.extend(serve::thor_bugs::doctor_line(db));
     lines
 }
 
 /// The last line of `doctor --eval`: what it printed and what it left out, so a
 /// reader who needs another line knows it is one command away and not missing.
-pub const EVAL_FOOTER: &str = "doctor --eval: only the lines the evaluation routine asks for (tool server and installed programs, when one is wrong; ship, provable rules, gate, teeth, pinned, decay, crowding, false-block sweep, judgement debt, contradictions); a line the store has nothing to say about is silent, as in the full report. For anything else - the store and chain line, command anchors, hook launch failures, refusal outcomes, open points, the evaluation clock - run doctor without --eval; that takes longer, so wait for it to end and do not quote it before it has finished";
+pub const EVAL_FOOTER: &str = "doctor --eval: only the lines the evaluation routine asks for (tool server and installed programs, when one is wrong; ship, provable rules, gate, teeth, pinned, decay, crowding, false-block sweep, judgement debt, contradictions; THOR bug candidates, while one is waiting); a line the store has nothing to say about is silent, as in the full report. For anything else - the store and chain line, command anchors, hook launch failures, refusal outcomes, open points, the evaluation clock - run doctor without --eval; that takes longer, so wait for it to end and do not quote it before it has finished";
 
 /// The lines of `report` that the evaluation routine (`eval-command.example.md`)
 /// asks a reader to quote - `provable rules`, `gate`, `teeth`, `pinned`, `decay`,
@@ -3761,7 +3764,28 @@ pub fn eval_report(
     lines.extend(false_block_sweep_lines(db));
     lines.extend(judgement_debt_line(db, checkout_project, full));
     lines.extend(contradiction_line(db, checkouts));
+    lines.extend(serve::thor_bugs::open_line(db));
     lines
+}
+
+/// THOR checks its own doctor against its own routine: every labelled line
+/// `doctor --eval` prints must be one the installed evaluation routine names,
+/// or the agent is left to guess what the line means. A label the routine
+/// never mentions becomes a THOR bug candidate (`serve::thor_bugs`). Silent
+/// when the routine is not installed. Writes only the candidates sidecar.
+pub fn note_routine_gaps(db: &Path, printed: &[String]) {
+    let Some(path) = crate::install::default_eval_command_path() else { return };
+    let Ok(routine) = std::fs::read_to_string(path) else { return };
+    note_routine_gaps_against(db, &routine, printed);
+}
+
+/// `note_routine_gaps` against a routine text in hand; the labels it noted.
+pub fn note_routine_gaps_against(db: &Path, routine: &str, printed: &[String]) -> Vec<String> {
+    let gaps = serve::thor_bugs::routine_gaps(routine, printed);
+    for label in &gaps {
+        serve::thor_bugs::add(db, serve::thor_bugs::doctor_routine_finding(label));
+    }
+    gaps
 }
 
 /// The three-way answer `--gate` needs. See `gate_verdict` for exactly what

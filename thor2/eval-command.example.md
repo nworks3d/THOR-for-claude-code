@@ -1005,6 +1005,23 @@ fix installed without a restart; the filing was accepted".
 
 When neither line is printed, nothing is wrong and you file as usual.
 
+`THOR bug candidates:` (for example "THOR bug candidates: mode test (a bug
+candidate is shown to the agent and reported to you, never published); 1 new, 0
+presented, 0 reported, 0 resolved") - WHAT IT MEANS: THOR found signs of a bug
+in ITSELF (a report that was refused as version skew, a hook that would not
+start, a start note that had to leave an item out) and keeps each as a
+candidate. At the first prompt of a session THOR offers ONE candidate to that
+session's agent as a nudge that holds nothing: an issue for the public THOR
+repository, drafted from THOR's evidence with paths, project names and hosts
+removed, and sent only with the owner's yes. The line is printed only while a
+candidate is waiting. It is not a reason to withhold the report. WHAT TO DO:
+nothing here; quote the line under THOR health, and say whether you were
+offered a candidate this session and what became of it. If a nudge from this
+session is still unanswered, do what it says after the evaluation, not inside
+it. DONE WHEN: the line is quoted under THOR health. EXAMPLE: THOR health in the
+report: "THOR bug candidates: 1 new (a hook launch failure); the owner's other
+session was offered it".
+
 The last line it prints says what it left out. For one of those lines (the
 store and chain line, the command anchors, the hook launch failures, the
 refusal outcomes, the open points) run the full check, the same command

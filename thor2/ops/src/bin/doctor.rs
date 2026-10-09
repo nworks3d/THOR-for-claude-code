@@ -118,9 +118,12 @@ fn main() -> ExitCode {
         // This checkout's own project, resolved exactly as the full report does
         // below, so the judgement debt line counts the same checkout.
         let checkout_project = serve::project::resolve_project(cli.repo.as_deref().unwrap_or(&cwd));
-        for line in ops::health::eval_report(&cli.db, checkouts, cli.full, checkout_project.as_deref()) {
+        let printed = ops::health::eval_report(&cli.db, checkouts, cli.full, checkout_project.as_deref());
+        for line in &printed {
             println!("{line}");
         }
+        // THOR checks its own doctor against its own routine.
+        ops::health::note_routine_gaps(&cli.db, &printed);
         println!("{}", ops::health::EVAL_FOOTER);
         return ExitCode::SUCCESS;
     }

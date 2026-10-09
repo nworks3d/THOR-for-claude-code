@@ -1517,10 +1517,14 @@ fn declare_inner(
     // prevent: every OTHER Report still needs a scope, and this one item
     // stays exactly as findable by id and by search as any other.
     let is_the_setup_answer = item.id == crate::store::OWNER_SETUP_ANSWERS_ID;
+    // A third, as narrow: the outcome Report of a THOR bug candidate is about
+    // THOR itself (`crate::store::is_thor_bug_outcome`).
+    let is_a_thor_bug_outcome = crate::store::is_thor_bug_outcome(item);
     if !item.kind.can_fire()
         && !unscoped_allowed
         && !filed_by_key
         && !is_the_setup_answer
+        && !is_a_thor_bug_outcome
         && item.project.as_deref().map(str::trim).unwrap_or("").is_empty()
     {
         return Err(Refusal::new(
@@ -5457,6 +5461,30 @@ mod tests {
         item.text = "Dit lijkt op het antwoorden-item, maar is het niet.".to_string();
         let refusal = declare(&item).expect_err("only the exact id is exempt");
         assert_eq!(refusal.problem, NO_SCOPE_PROBLEM, "every other id still meets ground 21: {refusal:?}");
+    }
+
+    /// THE THOR BUG OUTCOME REPORT: about THOR itself, so it needs no scope -
+    /// but only when its id and its tag name one fingerprint.
+    #[test]
+    fn a_thor_bug_outcome_report_may_be_declared_with_no_project_and_nothing_that_resembles_it_may() {
+        let mut item = base(Kind::Report);
+        item.id = "thor-bug-hook-launch-1a2b3c4d".to_string();
+        item.project = None;
+        item.tags = vec!["thor-bug:hook-launch-1a2b3c4d".to_string()];
+        item.text = "OUTCOME: shown to the owner, not pushed (test environment).".to_string();
+        assert!(declare(&item).is_ok(), "the outcome of a bug candidate needs no scope");
+
+        let mut other_tag = item.clone();
+        other_tag.tags = vec!["thor-bug:something-else".to_string()];
+        assert_eq!(declare(&other_tag).expect_err("tag of another fingerprint").problem, NO_SCOPE_PROBLEM);
+
+        let mut no_tag = item.clone();
+        no_tag.tags.clear();
+        assert_eq!(declare(&no_tag).expect_err("no tag").problem, NO_SCOPE_PROBLEM);
+
+        let mut other_id = item.clone();
+        other_id.id = "my-thor-bug-hook-launch-1a2b3c4d".to_string();
+        assert_eq!(declare(&other_id).expect_err("another id").problem, NO_SCOPE_PROBLEM);
     }
 
     #[test]

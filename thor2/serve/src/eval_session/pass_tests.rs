@@ -1631,6 +1631,20 @@ fn an_overfull_start_note_cuts_from_the_least_actionable_end_and_says_so() {
     }
 }
 
+/// The lists the note gave up on are named, for the bug candidates: a note that
+/// shows everything it asks for names none, and the open points and the false
+/// blocks (which need nothing) are never counted.
+#[test]
+fn the_lists_a_start_note_cut_are_named_and_only_those_that_need_action() {
+    let light = busy_frozen(1, 0, 4, 1, 25, 0);
+    assert!(lists_cut(BUSY_ID, &light, START_NOTE_BUDGET).is_empty());
+    let overfull = busy_frozen(8, 16, 8, 8, 25, 0);
+    let cut = lists_cut(BUSY_ID, &overfull, START_NOTE_BUDGET);
+    assert!(cut.contains(&"A4 list"), "{cut:?}");
+    assert!(!cut.contains(&"batch") || (cut.contains(&"disputes") && cut.contains(&"A4 list")), "the batch is given up after the others: {cut:?}");
+    assert!(lists_cut(BUSY_ID, &overfull, usize::MAX).is_empty(), "with room for the whole note nothing is cut");
+}
+
 /// A hook failure that was the machine going to sleep or shutting down is
 /// explained in the start note with its meaning, the one thing to do (nothing),
 /// when it is done and an example; it is not a THOR failure, so the real

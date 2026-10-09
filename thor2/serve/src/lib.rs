@@ -92,6 +92,7 @@
 pub mod absent_guard;
 pub mod attest;
 pub mod audit;
+pub mod bug_report;
 pub mod capture;
 pub mod corpus;
 pub mod dead_anchor;
@@ -133,6 +134,7 @@ pub mod status;
 pub mod store_dir;
 pub mod sweep;
 pub mod teeth;
+pub mod thor_bugs;
 pub mod time;
 pub mod usefulness;
 #[cfg(feature = "semantic")]
