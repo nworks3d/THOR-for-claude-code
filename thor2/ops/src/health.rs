@@ -21,6 +21,109 @@ pub fn version_line() -> String {
     format!("doctor {}", env!("CARGO_PKG_VERSION"))
 }
 
+// ------------------------------------------------------ the short version
+//
+// THE DEFECT THIS CLOSES. The report below is written for the people who
+// build THOR and for the assistant that reads it to them: forty lines of
+// "teeth", "falsifier" and "crowding". Someone who set THOR up for a topic
+// folder and typed "is it working?" got that wall and could not tell a
+// healthy memory from a broken one. These few lines come first, say in
+// ordinary words whether the three things that matter are in place, and each
+// problem names the one next step.
+
+/// What a hook command or a tool-server entry has to contain to count as ours:
+/// the memory file's own path, compared the way the installer compares paths
+/// (separators and case folded away).
+fn folded(path: &str) -> String {
+    path.replace('\\', "/").to_lowercase()
+}
+
+/// Whether Claude Code's settings file wires a THOR hook to this memory.
+fn hooks_name_this_memory(settings: &Path, db: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(settings) else { return false };
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(&text) else { return false };
+    let want = folded(&db.display().to_string());
+    let Some(events) = root.get("hooks").and_then(|h| h.as_object()) else { return false };
+    events.values().filter_map(|groups| groups.as_array()).flatten().any(|group| {
+        group.get("hooks").and_then(|h| h.as_array()).is_some_and(|hooks| {
+            hooks.iter().filter_map(|h| h.get("command").and_then(|c| c.as_str())).any(|command| {
+                let command = folded(command);
+                command.contains(&want) && command.contains(" hook")
+            })
+        })
+    })
+}
+
+/// Whether Claude Code's tool-server file registers THOR's note-saving
+/// program for this memory.
+fn tool_server_names_this_memory(mcp_json: &Path, db: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(mcp_json) else { return false };
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(&text) else { return false };
+    let want = folded(&db.display().to_string());
+    root.get("mcpServers")
+        .and_then(|servers| servers.get("thor"))
+        .and_then(|entry| entry.get("args"))
+        .and_then(|args| args.as_array())
+        .is_some_and(|args| args.iter().filter_map(|a| a.as_str()).any(|a| folded(a) == want))
+}
+
+/// The short version of the report, in plain words: is the memory there, is
+/// it connected to Claude Code, can the assistant save notes, and is the
+/// folder this was run from a topic or project with its own memory. Nothing
+/// here uses THOR's own vocabulary, and each problem ends in one next step.
+///
+/// `settings` and `mcp_json` are the files Claude Code reads (the installer's
+/// defaults); `cwd` is the folder doctor was run from.
+pub fn plain_summary(db: &Path, cwd: &Path, settings: Option<&Path>, mcp_json: Option<&Path>) -> Vec<String> {
+    let ask = "ask your assistant to run THOR's install again, then restart Claude Code";
+    let mut lines = vec!["THOR check - the short version".to_string()];
+
+    match open_and_read(db) {
+        Err(why) => lines.push(format!("  PROBLEM: your memory file cannot be used ({why}). Do not delete anything; {ask}.")),
+        Ok(events) if !chain_intact(&events) => lines.push(
+            "  PROBLEM: your memory file looks damaged. Do not delete it: it is kept in full and can be repaired. Show your assistant the detailed report below."
+                .to_string(),
+        ),
+        Ok(_) => lines.push("  OK: your memory file is there and in good shape.".to_string()),
+    }
+
+    match settings.map(|s| hooks_name_this_memory(s, db)) {
+        Some(true) => lines.push("  OK: THOR is connected to Claude Code.".to_string()),
+        _ => lines.push(format!(
+            "  PROBLEM: Claude Code does not know about THOR yet, so the memory will not speak up. Next step: {ask}."
+        )),
+    }
+
+    match mcp_json.map(|m| tool_server_names_this_memory(m, db)) {
+        Some(true) => lines.push("  OK: your assistant can save notes.".to_string()),
+        _ => lines.push(format!(
+            "  PROBLEM: your assistant can read the memory but cannot save notes. Next step: {ask}."
+        )),
+    }
+
+    match serve::project::resolve_project(cwd) {
+        Some(key) => {
+            let usable = EventStore::open_existing(db)
+                .ok()
+                .is_some_and(|store| serve::project::registered_checkout(&store, Some(&key)).is_ok());
+            if usable {
+                lines.push(format!("  OK: this folder has its own memory, under the name '{key}'."));
+            } else {
+                lines.push(format!(
+                    "  NOTE: this folder is called '{key}' but is not set up yet. Next step: open a terminal inside it and run THOR's install with --topic added."
+                ));
+            }
+        }
+        None => lines.push(
+            "  NOTE: this folder has no memory of its own, so what you tell your assistant here is shared with every other folder. To give one subject its own memory, open that folder and run THOR's install with --topic added."
+                .to_string(),
+        ),
+    }
+
+    lines.push("Everything below is the detailed report, written for your assistant. You do not need to read it.".to_string());
+    lines
+}
+
 /// Open `db` and read every event, or explain in one line (no "memory
 /// store: " prefix - the caller adds whatever prefix fits it) why that
 /// could not be done. The one place that decides what "the store is not
@@ -7929,5 +8032,72 @@ mod launch_and_skew_tests {
         let far_future = now + 30 * 86_400;
         assert_eq!(hook_failures_line_in(Some(dir.path()), &[], far_future), None, "a month later the file is older than the span");
         assert_eq!(hook_failures_line_in(None, &[], now), None, "no transcripts folder, nothing to read");
+    }
+}
+
+#[cfg(test)]
+mod plain_summary_tests {
+    use super::*;
+
+    /// A memory file, a settings file that names it in a hook, and a tool-server
+    /// file that registers the note-saving program for it.
+    fn wired(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let db = dir.join("thor.db");
+        crate::install::ensure_store(&db).unwrap();
+        let settings = dir.join("settings.json");
+        let command = format!("\"C:\\thor2\\serve.exe\" --db \"{}\" hook", db.display());
+        std::fs::write(
+            &settings,
+            serde_json::json!({ "hooks": { "SessionStart": [ { "hooks": [ { "type": "command", "command": command } ] } ] } })
+                .to_string(),
+        )
+        .unwrap();
+        let mcp = dir.join("claude.json");
+        std::fs::write(
+            &mcp,
+            serde_json::json!({ "mcpServers": { "thor": { "type": "stdio", "command": "mcp", "args": ["--db", db.display().to_string()] } } })
+                .to_string(),
+        )
+        .unwrap();
+        (db, settings, mcp)
+    }
+
+    #[test]
+    fn a_healthy_setup_reads_ok_on_every_line_and_names_no_internal_term() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, settings, mcp) = wired(dir.path());
+        let topic = dir.path().join("Kitchen renovation");
+        std::fs::create_dir_all(&topic).unwrap();
+        std::fs::write(topic.join(".thor-project"), "Kitchen renovation\n").unwrap();
+        let mut store = EventStore::open_existing(&db).unwrap();
+        crate::install::register_root(&mut store, &topic, "Kitchen renovation", None).unwrap();
+        drop(store);
+
+        let lines = plain_summary(&db, &topic, Some(&settings), Some(&mcp));
+        let all = lines.join("\n");
+        assert!(all.contains("OK: your memory file is there"), "{all}");
+        assert!(all.contains("OK: THOR is connected to Claude Code."), "{all}");
+        assert!(all.contains("OK: your assistant can save notes."), "{all}");
+        assert!(all.contains("OK: this folder has its own memory, under the name 'Kitchen renovation'."), "{all}");
+        assert!(!all.contains("PROBLEM"), "{all}");
+        for jargon in ["teeth", "falsifier", "crowding", "scope", "checkout", "hook", "mcp", "MCP"] {
+            assert!(!all.contains(jargon), "the short version must not use {jargon:?}: {all}");
+        }
+    }
+
+    #[test]
+    fn every_problem_names_one_next_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, _, _) = wired(dir.path());
+        let lines = plain_summary(&db, dir.path(), Some(&dir.path().join("missing.json")), None);
+        let all = lines.join("\n");
+        assert!(all.contains("PROBLEM: Claude Code does not know about THOR yet"), "{all}");
+        assert!(all.contains("PROBLEM: your assistant can read the memory but cannot save notes"), "{all}");
+        assert_eq!(all.matches("Next step:").count(), 2, "{all}");
+        assert!(all.contains("NOTE: this folder has no memory of its own"), "{all}");
+        assert!(all.contains("--topic"), "the plain folder is offered the one command: {all}");
+
+        let gone = plain_summary(&dir.path().join("nowhere.db"), dir.path(), None, None).join("\n");
+        assert!(gone.contains("PROBLEM: your memory file cannot be used"), "{gone}");
     }
 }

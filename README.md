@@ -337,32 +337,57 @@ It works the way a shelf works.
 
 ## Getting started
 
-**The short way - one command.** It downloads the latest release, checks the
-download against the checksum published next to it, unpacks it into your home
-folder, and runs the whole setup.
+### The easy way: five steps, no programming tools
 
-Windows, in PowerShell:
+You need Claude Code, installed and opened at least once. Nothing else: no
+programming tools, no git, no account, no key.
 
-```powershell
-irm https://raw.githubusercontent.com/nworks3d/THOR-memory-bible-for-AI/main/install.ps1 | iex
-```
+1. **Open a terminal.** On Windows press the Windows key, type `PowerShell`
+   and press Enter. On Linux open your Terminal.
+2. **Paste ONE line and press Enter.** It downloads the latest release from this
+   project's GitHub page, checks the download against the checksum published next
+   to it, unpacks it into a `thor2` folder in your home folder, and sets
+   everything up. It prints what it did, in plain words. It needs no
+   administrator rights and installs nothing outside your own user folder.
 
-Linux:
+   Windows, in PowerShell:
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/nworks3d/THOR-memory-bible-for-AI/main/install.sh | sh
-```
+   ```powershell
+   irm https://raw.githubusercontent.com/nworks3d/THOR-memory-bible-for-AI/main/install.ps1 | iex
+   ```
 
-No administrator rights, and nothing is installed outside your own user folder.
-**The automated setup targets Claude Code today.** It touches two of its files -
-Claude Code's own settings and the list of tools it may use - and backs up both
-before it does. Rather read the script before you run it? Open that same link
-in a browser first. There is no macOS build yet, so on a Mac take the route
-below. Using a different assistant? See
+   Linux:
+
+   ```sh
+   curl -fsSL https://raw.githubusercontent.com/nworks3d/THOR-memory-bible-for-AI/main/install.sh | sh
+   ```
+
+   (On Windows, if a THOR program refuses to start, install Microsoft's "Visual
+   C++ Redistributable" and paste the line again. Pasting it again is always
+   safe.)
+3. **Close Claude Code completely and open it again.** Claude Code only learns
+   about THOR when it starts, so until you do this nothing is active.
+4. **Make a folder for your topic, and open Claude Code in it.** For example a
+   folder called `Kitchen renovation` in your Documents, with your notes, quotes
+   and PDFs inside. It does not have to be a programming project. Then tell your
+   assistant: *"Give this folder its own THOR memory, as a topic."*
+5. **Just work.** Tell your assistant things once ("the tiles come from
+   Tilehouse", "we chose the oak worktop") and in any later conversation in that
+   folder it already knows. Each topic folder has its own memory, so nothing from
+   one topic leaks into another. To check that all is well, ask your assistant:
+   *"Is THOR working?"* The first lines of its answer are a plain summary.
+
+The setup touches two of Claude Code's own files - its settings and the list of
+tools it may use - and backs up both before it does. Rather read the script
+before you run it? Open `install.ps1` or `install.sh` from this repository in a
+browser first. There is no macOS build yet, so on a Mac take the route below.
+Using a different assistant? See
 [Using it from another assistant](#using-it-from-another-assistant) below.
 
-**Or build it yourself.** You need a Rust toolchain. Nothing else: no key to
-get, no model to download first, no account.
+### For developers: build it yourself
+
+You need a Rust toolchain. Nothing else: no key to get, no model to download
+first, no account.
 
 ```sh
 cd thor2 && cargo build --release --features semantic
@@ -447,6 +472,18 @@ about. It files the project under the name of its folder - add `--project
 project's working copy: the one place THOR tries a rule's check on a file. It
 refuses to change a name that is already there, because renaming a project's
 scope would strand every note already filed under the old one.
+
+**A folder that is not a code repository** - a topic with notes and PDFs, no git
+anywhere - works the same way. Run the installer from inside it with `--topic`
+added. The folder's own name becomes the project's name, one small hidden file
+(`.thor-project`) is added to the folder, and nothing else in it is touched.
+There is no code to read, so searching inside files is not available there; your
+assistant reads the files itself and THOR remembers what you told it. Your home
+folder and a whole drive are refused as a topic, because they are far too broad.
+
+```sh
+"<path to thor2>/target/release/install.exe" --topic --db "C:\Users\you\AppData\Local\thor2\thor.db"
+```
 
 Set a project up with an earlier release? Run this once from its folder
 instead: it registers the working copy and changes nothing else.

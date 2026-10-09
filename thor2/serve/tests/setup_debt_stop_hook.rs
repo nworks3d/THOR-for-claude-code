@@ -105,6 +105,30 @@ fn a_live_setup_note_holds_the_turn_and_names_both_conditions() {
     assert!(reason.to_lowercase().contains("does not want"), "a reluctant owner must be told this is a valid answer: {reason}");
 }
 
+/// WHAT THE PERSON SEES. The block's own text is written for the assistant;
+/// Claude Code shows it on the person's screen too. Beside it goes one plain
+/// sentence for the person: what is happening, and what (little) is asked of
+/// them - with none of THOR's own words in it.
+#[test]
+fn the_held_turn_carries_one_plain_sentence_for_the_person() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let mut store = thor_core::event_store::EventStore::new(&db).unwrap();
+    declare_setup_note(&mut store);
+    drop(store);
+
+    let out = run_hook(&db, &stop_payload("s1"));
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["decision"], "block", "{out}");
+    let line = v["systemMessage"].as_str().unwrap_or_else(|| panic!("no plain line for the person: {out}"));
+    assert!(line.contains("setup questions"), "it says what this is about: {line}");
+    assert!(line.contains("answer in your own words"), "it says the one thing asked of the person: {line}");
+    for jargon in ["note", "rule", "gate", "falsifier", "scope", "hook", "AGENTS.md", "retract"] {
+        assert!(!line.contains(jargon), "the plain line must not use the word {jargon:?}: {line}");
+    }
+    assert!(!line.contains('\n'), "one line: {line}");
+}
+
 /// THE HARD CONSTRAINT: a subagent's own Stop must never be held over a
 /// setup conversation it has no owner in the room to have.
 #[test]

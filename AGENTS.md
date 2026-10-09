@@ -13,6 +13,26 @@ and check it worked before moving on. Never hand back a menu of options.
 
 # Setting them up
 
+**Which route first.** Do they have a Rust toolchain and a copy of this
+repository? Almost never, and they do not need either. If THOR is not installed
+yet, take the no-tools route:
+
+1. Tell them in one sentence what the one-line installer does: it downloads the
+   latest release from this project's GitHub page, checks it against the checksum
+   published beside it, unpacks it into a `thor2` folder in their home folder,
+   and sets everything up. (The exact lines are in the README, "Getting
+   started", step 2: `install.ps1` on Windows, `install.sh` on Linux.)
+2. Run it for them.
+3. It ends by telling them the one thing left, a restart. Carry on at step 3
+   below. Steps 1 and 2 below are the route for someone building from source:
+   the one-line installer already did both.
+
+Where things end up: the programs are in the `thor2` folder in their home
+folder (so `install.exe` there is step 2, done), and the memory is
+`%LOCALAPPDATA%\thor2\thor.db` on Windows or `~/.local/share/thor2/thor.db` on
+Linux, unless the installer printed another path on its `memory:` line. Use
+that path wherever `<their store>` appears below.
+
 **1. Build it.** They need a Rust toolchain, and nothing else.
 
 ```sh
@@ -58,7 +78,10 @@ memory would simply never speak.
 
 **3. Have them restart the assistant once.** Both of those files are read at
 startup only. Until they restart, nothing you just installed is running. This
-is the one step you cannot do for them.
+is the one step you cannot do for them. Say it as one plain instruction: "Close
+Claude Code completely - not just this conversation - and open it again, in the
+same folder. Then say hello and I will check it worked." Closing one
+conversation is not enough, and neither is a compaction.
 
 **4. Check it.**
 
@@ -66,8 +89,10 @@ is the one step you cannot do for them.
 thor2/target/release/doctor.exe --db "<their store>"
 ```
 
-One plain line per part. A missing language model is not a problem: THOR works
-without it, just with simpler matching.
+The first lines are a short plain summary: OK or PROBLEM, and every problem
+carries its one next step. Read those out to them in your own words; the long
+report under it is for you, not for them. A missing language model is not a
+problem: THOR works without it, just with simpler matching.
 
 **5. Read the project's code and register its working copy.** A fresh project
 is scoped by the name of its folder already, with no setup. This command adds
@@ -115,13 +140,69 @@ wrong place. Nothing is changed when it refuses:
   removed or renamed the old folder, run the command again from the new one.
 
 It refuses to change a name already there - renaming a scope would strand every
-note filed under the old one. Two answers you may get instead, both with the fix:
-a folder with no git in it cannot be read (start a repository there first), and a
-repository on a network share needs a `safe.directory` line before git will open it
-as you.
+note filed under the old one. A repository on a network share needs a
+`safe.directory` line before git will open it as you.
+
+A folder with no git in it is not an error and needs no repository: it is a
+topic folder, and 5b right below is its whole route.
 
 You may not invent a name. The owner names a scope; if nothing that exists fits,
 ask him and use the word he gives you.
+
+**5b. A topic folder: no code, no git.** This is the route for someone who
+wants THOR for a SUBJECT - a renovation, a thesis, a trip, a hobby - and is not
+a programmer. A folder of notes, quotes and
+PDFs is a project like any other, keyed by the folder's own name. Do the steps
+yourself; they should not have to type anything.
+
+1. **One folder per subject, with Claude Code opened in it.** If they have not
+   made it yet, ask only what the subject is called, make the folder (for
+   example `Documents/Kitchen renovation`) and tell them to open Claude Code in
+   it next time. Their home folder, `Documents` itself and a whole drive are
+   refused: they are far too broad to be one subject.
+2. **From inside that folder, run** (the full path to the installer, and
+   `--db` naming their memory):
+
+   ```sh
+   "<path to thor2>/install.exe" --topic --db "<their store>"
+   ```
+
+   The folder's name becomes the project's name and the way everything about
+   it is filed. Exactly one small hidden file, `.thor-project`, is added to the
+   folder; nothing else in it is touched. A second run says so and changes
+   nothing. `install.exe --register-root --db "<their store>"` from inside a
+   plain folder does the same in one step.
+3. **Say what happened in one sentence, in their words:** "From now on, what you
+   tell me in this folder is remembered for this topic only." Nothing about git,
+   scopes, working copies or markers.
+4. **Know what works and what does not.** A rule whose check reads a file
+   (`contains`, `absent`, `path_exists`) is tried against the topic folder's real
+   files, exactly as in a code project. `search_code`, `where_used` and
+   `outline` need a code repository: here they answer that plainly, and you read
+   the files yourself instead. Nothing fails because of it.
+5. **Prove it before you say it works.** Store one thing they said, filed under
+   the topic (pass the folder's name as `project`, or the write is refused as a
+   new collection):
+
+   ```
+   remember(
+     id:        "tiles-from-tilehouse",
+     kind:      "orientation",
+     project:   "Kitchen renovation",
+     always:    true,
+     text:      "The kitchen tiles are ordered at Tilehouse.",
+     falsifier: "A later note says the tiles come from somewhere else."
+   )
+   ```
+
+   Then, after the restart in step 3, open a fresh conversation in the same
+   folder and check that it comes back at the start. If not, the cause is nearly
+   always the restart.
+6. **Check it with `doctor`** run from inside the folder: its first lines are a
+   plain summary, and one of them reads "OK: this folder has its own memory".
+
+If `install.exe --topic` refuses, its message is plain and names the one fix.
+Nothing is changed when it refuses.
 
 **6. Prove it works before you say it works.** Store one real note, then start a
 fresh conversation and check that it comes back. Only then tell them setup is
@@ -144,7 +225,8 @@ Then open a new conversation and touch that host. If the note comes back, setup
 is done. If it does not, do not tell them it worked - the usual cause is step 3,
 the restart.
 
-**7. Optional: ask where the memory should be backed up.** Once a day THOR
+**7. Optional: ask where the memory should be backed up.** (Skip this for
+someone with no git and no NAS; offer it only when they have either.) Once a day THOR
 writes a copy of the memory into a git repository they own (the install tells
 them where it is, and the command is `backup.exe --db "<their store>" --repo
 "<that folder>"`). Ask them where the copy should go: another folder on their NAS
@@ -330,38 +412,40 @@ name one just to get this write to land. "He is not interested" is itself a
 valid answer to record - write that down plainly and the note clears exactly
 the same way a full set of preferences would.
 
-- **What this is.** In two sentences: this remembers facts about their code
-  and their work so neither of you has to repeat them, and it brings the
-  relevant ones back on its own, at the start of a session or right before a
-  risky step. Say this first, so the rest makes sense.
-- **How replies should read.** Ask how long a reply can get before it is too
-  long, whether they want a short summary line before the detail, and what
-  language they want to be answered in - their own rules can be written in
-  that language even while the code stays English.
-- **Which lanes they want.** Ask whether they want the code-and-work memory
-  only, or also the personal lane for their own life - recipes, books, a
-  training log, and the like. Either way, anything personal goes to the
-  library with `shelve`, never into the code memory with `remember`.
-- **Which starting rules to keep.** The install seeded five example rules
-  into `guard-response-rulebook.json`, next to the store. Ask which they
-  want on, off, or reworded. Each rule in that file is one entry with a
-  plain-language reminder line - edit the reminder to change what it says,
-  or delete the entry to turn the rule off.
-- **How they name their projects.** Every checkout is scoped by its folder name
-  automatically - facts stay inside that project and do not compete across
-  projects. If a folder name does not match how they call the project, they can
-  run `install --project <name> --db "<their store>"` from inside the checkout
-  to override it. Only then ask what name they want - never invent one.
-- **That the memory is theirs to correct.** A changed fact is corrected with
-  `revise`, never stored a second time - though weakening any rule (clearing or
-  changing its check, lowering its severity, dropping or replacing a binding,
-  narrowing a checked rule's reach, taking a quoted call or a flag out of its
-  text, or turning it into a report) needs a reason too, the same as removing
-  one. Clearing one of those fields outright uses its own `clear_*` flag on
-  `revise` (`clear_check`, `clear_severity`, and so on), not an empty value.
-  A fact that is simply wrong is removed with `retract` and a reason. A true
-  fact that fired in the wrong place is marked as noise with `mark`, instead
-  of being deleted.
+**Keep it short and friendly: three questions, asked one at a time, in their
+words, and "skip" is always an answer.** Someone who has never done this does
+not want a form. Everything else has a sensible default: do NOT raise it unless
+they ask.
+
+- **What this is** - say it first, in two sentences and no jargon: "This
+  remembers what you tell me about your work, so you never have to repeat it,
+  and it brings the right thing back at the right moment." Nothing more.
+- **Question 1: what language should I answer in?** Their own rules can be
+  written in that language even while code stays English.
+- **Question 2: short answers or detailed ones?** And, only if they care, a
+  one-line summary before the detail. Apply it to the reply-shape reminders in
+  `guard-response-rulebook.json`, next to the store (each entry has a
+  plain-language reminder line; edit it to change what it says).
+- **Question 3: do you also want me to keep things about your own life -
+  recipes, books, a training log - in a separate place?** Yes or no. Either way,
+  anything personal goes to the library with `shelve`, never into the work memory
+  with `remember`.
+- **Do not raise, unless they ask:** which starting rules to keep (they stay on,
+  and any can be edited or deleted later), and how projects are named (a folder
+  is named after itself; `install --project <name> --db "<their store>"` from
+  inside it overrides that - only then ask what name they want, never invent
+  one).
+- **Say once, in one sentence, that the memory is theirs to correct:** "If
+  something I remember is wrong, just tell me and I will fix it." (For you: a
+  changed fact is corrected with `revise`, never stored a second time - though
+  weakening any rule (clearing or changing its check, lowering its severity,
+  dropping or replacing a binding, narrowing a checked rule's reach, taking a
+  quoted call or a flag out of its text, or turning it into a report) needs a
+  reason too, the same as removing one. Clearing one of those fields outright
+  uses its own `clear_*` flag on `revise` (`clear_check`, `clear_severity`, and
+  so on), not an empty value. A fact that is simply wrong is removed with
+  `retract` and a reason. A true fact that fired in the wrong place is marked as
+  noise with `mark`, instead of being deleted.)
 
 Apply each answer where it belongs - a reply-shape rule in the rulebook file,
 a standing preference as a stored fact - then store a short summary of what he
@@ -387,6 +471,15 @@ a reminder line, until a new session start - also a resume or a compaction,
 which lose what you were shown. A prompt the owner types opens no new showing.
 If you need a note again, `get` it by its id. A refusal is never hidden by
 this: a rule that blocks a call blocks it every time.
+
+**What the PERSON sees when THOR holds you.** Claude Code shows the hold's text
+on their screen too, and THOR's own words ("rule", "evaluation", "falsifier")
+mean nothing to someone who has never heard of them. Beside every end-of-turn
+hold THOR puts one plain sentence for them, and you add one more: before you act on a hold, tell
+them in a single ordinary sentence what you are about to do and that nothing is
+needed from them (unless it is the first-session questions, which need their
+answer). Never read the hold's text out to them, and never ask them to decide
+something it names - the verdicts and repairs are yours.
 
 **At the end of a turn it may hold you, but only for what you did yourself.**
 THOR asks for one small thing at a time and will not let the turn close until

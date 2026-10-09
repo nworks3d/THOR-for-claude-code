@@ -173,6 +173,17 @@ pub fn decide_hooks_path(current: Option<&str>, ours: &str) -> HooksPathOutcome 
     }
 }
 
+/// Whether a `git` program can be started at all. Someone who only keeps
+/// notes about a topic may never have installed it, and the installer must
+/// then say that plainly instead of reporting a failed git command.
+pub fn git_available() -> bool {
+    std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
 /// Read git's current global `core.hooksPath`, decide, and set it only when it
 /// is free. Shelling out to `git` rather than editing its config file by hand,
 /// the same line `codeindex::gitutil` already takes: git owns that format.

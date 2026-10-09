@@ -2257,7 +2257,9 @@ pub struct SearchCodeArgs {
 /// Said plainly, because an empty result would read as "your code does not
 /// contain that" - the silent-does-less failure this whole rebuild is against.
 const NO_CODE_INDEX: &str = "no code index is configured for this server - start it with \
---code-index-db and --repo, or build one first with the codeindex command";
+--code-index-db and --repo, or build one first with the codeindex command. Code search only exists for a \
+programming project (a git repository that install has read); a plain topic folder has none, so read its \
+files directly and use lookup for what the memory holds";
 
 /// How stale this answer is, in one sentence. Defined once and shared by every
 /// code tool: provenance is prose, not a boolean, and "the checkout could not

@@ -20,11 +20,11 @@ use clap::Parser;
 use std::path::Path;
 use ops::githooks;
 use ops::install::{
-    check_registration, default_data_dir, default_eval_command_path, default_settings_path, default_user_mcp_path,
-    ensure_store, install_hooks, install_tool_server, record_project_opened, register_command_for, register_root,
-    seed_eval_command, seed_response_rulebook, seed_working_contract, standard_hooks, write_project_marker,
-    EvalCommandOutcome, HookOutcome, MarkerOutcome, RegisterOutcome, RegisterRefusal, RulebookOutcome, ServerOutcome,
-    StoreOutcome,
+    check_registration, check_registration_at, default_data_dir, default_eval_command_path, default_settings_path,
+    default_user_mcp_path, ensure_store, install_hooks, install_tool_server, record_project_opened,
+    record_topic_opened, register_command_for, register_root, seed_eval_command, seed_response_rulebook,
+    seed_working_contract, standard_hooks, topic_folder_name, write_project_marker, EvalCommandOutcome, HookOutcome,
+    MarkerOutcome, RegisterOutcome, RegisterRefusal, RulebookOutcome, ServerOutcome, StoreOutcome,
 };
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -82,15 +82,23 @@ struct Cli {
     #[arg(long)]
     project: Option<String>,
 
-    /// Register ONLY: record the checkout this is run from as its project's
+    /// Give THIS plain folder - one subject, with its notes and files in it,
+    /// no code and no git needed - a memory of its own, named after the
+    /// folder. Run it from inside that folder. It adds one small hidden file,
+    /// `.thor-project`, and touches nothing else in the folder.
+    #[arg(long, conflicts_with = "project")]
+    topic: bool,
+
+    /// Register ONLY: record the folder this is run from as its project's
     /// working copy, and nothing else - no settings, no hooks, no tool server,
-    /// no code index. Run it from inside the checkout. Needs --db, so it
-    /// registers into the memory your assistant really uses. The project is
-    /// the one the checkout already resolves to (its .thor-project marker,
+    /// no code index. Run it from inside the checkout (or, for a plain topic
+    /// folder, inside the folder: it is marked as a topic first). Needs --db,
+    /// so it registers into the memory your assistant really uses. The project
+    /// is the one the folder already resolves to (its .thor-project marker,
     /// else its folder name).
     #[arg(
         long = "register-root",
-        conflicts_with_all = ["project", "settings", "mcp_json", "no_mcp", "serve_exe", "mcp_exe", "code_index_root"]
+        conflicts_with_all = ["project", "topic", "settings", "mcp_json", "no_mcp", "serve_exe", "mcp_exe", "code_index_root"]
     )]
     register_root: bool,
 
@@ -182,9 +190,18 @@ fn existing_index_file_count(index_root: &Path, key: &str) -> anyhow::Result<usi
     Ok(usize::try_from(files).unwrap_or(0))
 }
 
-/// A folder as a registration names it: forward slashes.
-fn slashed(path: &Path) -> String {
-    path.display().to_string().replace('\\', "/")
+/// The topic a plain folder is, or would become: the folder that carries (or
+/// will carry) the `.thor-project` marker, and the key it holds. Run from a
+/// subfolder of an existing topic, it is the topic's own top. A folder with no
+/// marker yet is named after itself, except the home folder and a drive root,
+/// which are far too broad (`ops::install::topic_folder_name`).
+fn topic_of(here: &Path) -> Result<(PathBuf, String), RegisterRefusal> {
+    let dir = serve::project::plain_root(here).unwrap_or_else(|| here.to_path_buf());
+    let key = match serve::project::resolve_project(&dir) {
+        Some(key) => key,
+        None => topic_folder_name(&dir)?,
+    };
+    Ok((dir, key))
 }
 
 /// `install --register-root`: register the checkout this is run from, and
@@ -212,10 +229,33 @@ fn register_only(db: Option<PathBuf>) -> ExitCode {
         return ExitCode::FAILURE;
     }
     let here = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let key = serve::project::git_root(&here).and_then(|top| serve::project::resolve_project(&top));
-    let Some(key) = key else {
-        eprintln!("{}", RegisterRefusal::NotACheckout { cwd: slashed(&here) });
-        return ExitCode::FAILURE;
+    let existing = serve::project::git_root(&here)
+        .or_else(|| serve::project::plain_root(&here))
+        .and_then(|top| serve::project::resolve_project(&top));
+    let key = match existing {
+        Some(key) => key,
+        // Not a repository and not a marked topic yet: this IS the plain
+        // folder somebody wants a memory for, so it becomes a topic. The
+        // second-copy check runs before the marker is written, so a refusal
+        // leaves the folder exactly as it was.
+        None => {
+            let (dir, key) = match topic_of(&here) {
+                Ok(found) => found,
+                Err(refusal) => {
+                    eprintln!("{refusal}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if let Err(refusal) = check_registration_at(&db, &dir, &key) {
+                eprintln!("{refusal}");
+                return ExitCode::FAILURE;
+            }
+            if let Err(e) = write_project_marker(&dir, &key) {
+                eprintln!("could not mark this folder as a topic: {e}");
+                return ExitCode::FAILURE;
+            }
+            key
+        }
     };
     let mut store = match thor_core::event_store::EventStore::open_existing(&db) {
         Ok(store) => store,
@@ -249,7 +289,7 @@ fn register_only(db: Option<PathBuf>) -> ExitCode {
 fn print_record_outcome(key: &str, outcome: Result<RegisterOutcome, RegisterRefusal>) {
     match outcome {
         Ok(RegisterOutcome::Created { root }) => {
-            println!("+ recorded this project, '{key}', in the memory: notes filed under it land without a naming question");
+            println!("+ recorded this project, '{key}', in the memory: notes about it can now be saved without any extra question");
             println!("+ registered its working copy: {root}");
         }
         Ok(RegisterOutcome::CreatedUnderRootRecord { root }) | Ok(RegisterOutcome::Registered { root }) => {
@@ -330,9 +370,27 @@ fn main() -> ExitCode {
     // the marker, the code index or the store - so "Nothing was changed" in
     // the refusal is literally true. A project already registered at another
     // folder that still exists is refused; see `ops::install::register_root`.
-    let here = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    if let Some(key) = cli.project.clone().or_else(|| serve::project::resolve_project(&here)) {
-        if let Err(refusal) = check_registration(&db, &here, &key) {
+    let mut here = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut project = cli.project.clone();
+    // `--topic` turns the plain folder this is run from (or the topic it sits
+    // in) into one project, named after the folder. Inside a git repository
+    // there is nothing to turn: the repository already is the project.
+    if cli.topic && serve::project::git_root(&here).is_none() {
+        match topic_of(&here) {
+            Ok((dir, key)) => {
+                here = dir;
+                project = Some(key);
+            }
+            Err(refusal) => {
+                eprintln!("{refusal}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    if let Some(key) = project.clone().or_else(|| serve::project::resolve_project(&here)) {
+        let top = serve::project::git_root(&here).unwrap_or_else(|| here.clone());
+        let checked = if cli.topic { check_registration_at(&db, &top, &key) } else { check_registration(&db, &here, &key) };
+        if let Err(refusal) = checked {
             eprintln!("{refusal}");
             return ExitCode::FAILURE;
         }
@@ -360,10 +418,10 @@ fn main() -> ExitCode {
     // this whole system exists to refuse.
     if !serve_exe.exists() {
         eprintln!(
-            "there is no file at {} - refusing to write hooks that call it. A hook fails open, so \
-             this would install quietly and stay broken: the agent carries on, the memory never \
-             speaks, and nothing ever reports it. Build it first (cargo build --release --features \
-             semantic, in thor2), or name the real one with --serve-exe.",
+            "NOTHING WAS SET UP: the file {} is missing, and THOR cannot work without it. THOR is several small \
+             programs that must stay together in ONE folder: unpack the whole download there (do not copy install \
+             on its own), then run install from that folder again. (For developers: build with `cargo build \
+             --release --features semantic` in thor2, or name the real file with --serve-exe.)",
             serve_exe.display()
         );
         return ExitCode::FAILURE;
@@ -372,20 +430,18 @@ fn main() -> ExitCode {
     // later: every hook would fail open. Asked once, with `--version`, which
     // writes nothing.
     if let Some(problem) = ops::install::launch_problem(&serve_exe) {
-        eprintln!("refusing to write hooks that call a program that does not start: {problem}");
+        eprintln!("NOTHING WAS SET UP - refusing to write hooks that call a program that does not start. {problem}");
         return ExitCode::FAILURE;
     }
 
-    println!("memory:       {}", db.display());
-    println!("hooks call:   {}", serve_exe.display());
-    println!("hooks into:   {}  (backed up first)", settings.display());
+    println!("Setting THOR up. It only changes the places listed here.");
+    println!();
+    println!("memory:       {}  (everything THOR remembers is kept in this one file)", db.display());
+    println!("Claude Code:  {}  (a backup copy is made first)", settings.display());
     match (&mcp_target, &mcp_exe) {
-        (Some(p), Some(exe)) => {
-            println!("writes via:   {}", exe.display());
-            println!("registered:   {}  (backed up first)", p.display());
-        }
-        (Some(_), None) => println!("writes via:   (mcp binary not found - see below)"),
-        (None, _) => println!("writes via:   (--no-mcp - a memory the agent can read but not write)"),
+        (Some(p), Some(_)) => println!("note-saving:  {}  (a backup copy is made first)", p.display()),
+        (Some(_), None) => println!("note-saving:  the program that saves notes was not found - see below"),
+        (None, _) => println!("note-saving:  off on purpose (--no-mcp): your assistant can read the memory but not add to it"),
     }
     println!();
 
@@ -402,7 +458,7 @@ fn main() -> ExitCode {
             match seed_working_contract(&db) {
                 Ok(seeded) => {
                     let stored = seeded.iter().filter(|s| s.stored).count();
-                    println!("+ put {stored} starting notes in it, on how to write one that comes back");
+                    println!("+ put {stored} starting notes in it. They teach your assistant how to write notes that come back when needed.");
                     for s in seeded.iter().filter(|s| !s.stored) {
                         let why = s.refusal.as_deref().unwrap_or("no reason given");
                         println!("  ! {} was refused: {}", s.id, why);
@@ -410,12 +466,12 @@ fn main() -> ExitCode {
                         // in THOR: it becomes a candidate (`serve::thor_bugs`).
                         serve::thor_bugs::add(&db, serve::thor_bugs::seed_refused_finding(&s.id, why));
                     }
-                    println!("  they are ordinary notes: unpin one, rewrite it, or throw it out");
+                    println!("  You never have to read them. Any of them can be changed or deleted later: just ask your assistant.");
                 }
                 Err(e) => println!("  ! could not write the starting notes: {e}"),
             }
         }
-        Ok(StoreOutcome::AlreadyThere) => println!("= memory already there, left untouched"),
+        Ok(StoreOutcome::AlreadyThere) => println!("= your memory was already there; nothing in it was touched"),
         Err(e) => {
             eprintln!("install refused: could not create the memory: {e}");
             return ExitCode::FAILURE;
@@ -454,13 +510,13 @@ fn main() -> ExitCode {
     match seed_response_rulebook(&db) {
         Ok(report) => match report.outcome {
             RulebookOutcome::Written => {
-                println!("+ wrote a starting response-guard rulebook to {}", report.path.display())
+                println!("+ added a small file that keeps your assistant's replies tidy: {}", report.path.display())
             }
             RulebookOutcome::AlreadyThere => {
-                println!("= response-guard rulebook already at {} (left untouched)", report.path.display())
+                println!("= the reply-tidying file was already there ({}); left alone", report.path.display())
             }
         },
-        Err(e) => println!("  ! could not write the response-guard rulebook: {e}"),
+        Err(e) => println!("  ! could not write the reply-tidying file: {e}"),
     }
 
     // 1c. The end-of-session evaluation command. THOR holds a turn open for a
@@ -475,40 +531,39 @@ fn main() -> ExitCode {
             match seed_eval_command(&path, &bin_dir, &db) {
                 Ok(report) => match report.outcome {
                     EvalCommandOutcome::Written => println!(
-                        "+ wrote the evaluation routine to {} - run /thor-eval at the end of a session",
+                        "+ added the command /thor-eval for your assistant (optional: type it at the end of a work session to tidy the memory): {}",
                         report.path.display()
                     ),
                     EvalCommandOutcome::AlreadyThere => {
-                        println!("= eval command already at {}", report.path.display())
+                        println!("= the /thor-eval command was already there ({})", report.path.display())
                     }
                 },
-                Err(e) => println!("  ! could not write the evaluation routine: {e}"),
+                Err(e) => println!("  ! could not add the /thor-eval command: {e}"),
             }
         }
-        None => println!("  ! could not find your home directory to place the evaluation routine"),
+        None => println!("  ! could not find your home folder to place the /thor-eval command"),
     }
 
     // 2. The hooks: what lets the memory speak at all.
     let specs = standard_hooks(&serve_exe.display().to_string(), &db.display().to_string());
     match install_hooks(&settings, &specs) {
         Ok(report) => {
-            for (event, outcome) in &report.results {
-                match outcome {
-                    HookOutcome::Added => println!("+ hook {event}"),
-                    HookOutcome::AlreadyPresent => println!("= hook {event} (already there)"),
-                    HookOutcome::Replaced => println!("+ hook {event} (repointed a dead one)"),
-                }
+            let changed = report.results.iter().filter(|(_, o)| *o != HookOutcome::AlreadyPresent).count();
+            if changed == 0 {
+                println!("= THOR was already connected to Claude Code");
+            } else {
+                println!("+ connected THOR to Claude Code ({changed} of {} connections), so your memory speaks up by itself", report.results.len());
             }
             for old in &report.replaced {
-                println!("  replaced a hook that called a binary no longer there: {old}");
+                println!("  fixed an old connection that pointed at a program that no longer exists: {old}");
             }
-            if let Some(p) = &report.backup_path {
-                println!("  previous settings backed up to {}", p.display());
+            if let Some(p) = report.backup_path.as_ref().filter(|_| changed > 0) {
+                println!("  your previous Claude Code settings were saved as {}", p.display());
             }
         }
         Err(e) => {
-            eprintln!("install refused: {e}");
-            eprintln!("the memory was created, but nothing was wired up - fix the above and run this again");
+            eprintln!("NOTHING WAS CONNECTED to Claude Code: {e}");
+            eprintln!("Your memory file was created. Fix the problem named above, then run install again.");
             return ExitCode::FAILURE;
         }
     }
@@ -517,7 +572,11 @@ fn main() -> ExitCode {
     // know where the indexes live - without an index root there is nothing for
     // a refresh to update, and wiring a machine-wide git setting for nothing is
     // exactly the kind of surprise this installer must not spring.
-    if let Some(root) = &code_index_root {
+    // Someone who only keeps notes about a topic may never have installed git,
+    // and does not need it: say so, instead of reporting a failed git command.
+    if !githooks::git_available() {
+        println!("= git is not installed on this computer. That is fine: it is only needed to keep programming projects searchable, not for topic folders.");
+    } else if let Some(root) = &code_index_root {
         let hooks_dir = db.parent().map(|d| d.join("githooks"));
         let codeindex_exe = serve_exe.with_file_name(if cfg!(windows) {
             "codeindex.exe"
@@ -533,33 +592,33 @@ fn main() -> ExitCode {
                     Ok(results) => {
                         let added = results.iter().filter(|(_, o)| *o != HookOutcome::AlreadyPresent).count();
                         if added == 0 {
-                            println!("= git hooks already in {} ({} of them)", hooks_dir.display(), results.len());
+                            println!("= the helpers for programming projects were already in {}", hooks_dir.display());
                         } else {
-                            println!("+ {added} git hook(s) written to {}", hooks_dir.display());
+                            println!("+ wrote {added} small helper(s) for programming projects (git) to {}", hooks_dir.display());
                         }
                         match githooks::wire_hooks_path(&hooks_dir) {
                             Ok(githooks::HooksPathOutcome::Set) => {
-                                println!("+ git now runs them in every repository (core.hooksPath)");
-                                println!("  your repositories' own hooks still run: each of ours hands control back");
+                                println!("+ told git to use them, so THOR can keep a programming project searchable after every commit");
+                                println!("  your own git hooks keep working: each helper hands control back to them");
                             }
                             Ok(githooks::HooksPathOutcome::AlreadyOurs) => {
-                                println!("= git already runs them in every repository")
+                                println!("= git was already told to use them")
                             }
                             Ok(githooks::HooksPathOutcome::Foreign(theirs)) => {
-                                println!("! core.hooksPath already points at {theirs} - left alone");
-                                println!("  the index will not refresh itself until that is resolved");
+                                println!("! git is already set up to use {theirs}, so that was left alone.");
+                                println!("  Searching the code of a programming project will not update by itself until that is sorted out. Topic folders are not affected.");
                             }
-                            Err(e) => println!("! could not tell git about them: {e}"),
+                            Err(e) => println!("! could not tell git about the helpers: {e}"),
                         }
                     }
-                    Err(e) => println!("! could not write the git hooks: {e}"),
+                    Err(e) => println!("! could not write the git helpers: {e}"),
                 }
             }
             (_, false) => println!(
-                "! no codeindex binary beside {} - skipped the git hooks",
+                "! the program that reads code (codeindex) is not next to {} - skipped the git helpers",
                 serve_exe.display()
             ),
-            (None, _) => println!("! could not work out where to keep the git hooks - skipped"),
+            (None, _) => println!("! could not work out where to keep the git helpers - skipped"),
         }
     }
 
@@ -573,31 +632,32 @@ fn main() -> ExitCode {
             }
             match install_tool_server(path, "thor", &exe.display().to_string(), &args) {
                 Ok(report) => match report.outcome {
-                    ServerOutcome::Added => println!("+ tool server registered in {}", path.display()),
-                    ServerOutcome::AlreadyPresent => println!("= tool server already registered"),
+                    ServerOutcome::Added => println!("+ gave your assistant a way to save notes (registered in {})", path.display()),
+                    ServerOutcome::AlreadyPresent => println!("= your assistant could already save notes"),
                     ServerOutcome::Replaced => {
-                        println!("+ tool server registered in {}", path.display());
+                        println!("+ gave your assistant a way to save notes (registered in {})", path.display());
                         if let Some(old) = &report.replaced {
-                            println!("  replaced the previous one, which pointed at {old}");
+                            println!("  this replaced an older one that pointed at {old}");
                         }
                         if let Some(p) = &report.backup_path {
-                            println!("  previous file backed up to {}", p.display());
+                            println!("  the previous file was saved as {}", p.display());
                         }
                     }
                 },
                 Err(e) => {
-                    eprintln!("the hooks are installed, but registering the tool server failed: {e}");
+                    eprintln!("THOR is connected to Claude Code, but giving your assistant a way to save notes failed: {e}");
+                    eprintln!("Fix the problem named above, then run install again.");
                     return ExitCode::FAILURE;
                 }
             }
         }
         (Some(_), None) => {
-            eprintln!("the memory needs the `mcp` binary to be writable, and it is not next to this installer - name it with --mcp-exe, or pass --no-mcp to install a read-only memory on purpose");
+            eprintln!("The program that lets your assistant save notes (mcp) is missing next to the installer, so your assistant could only read the memory, never add to it. Unpack the whole download into one folder and run install from there again. (To install a read-only memory on purpose: add --no-mcp.)");
             return ExitCode::FAILURE;
         }
         (None, _) => {
-            println!("- no tool server registered (--no-mcp)");
-            println!("  the agent will be able to READ its memory but never write to it");
+            println!("- note-saving was left off (--no-mcp)");
+            println!("  your assistant will be able to READ the memory but never add to it");
         }
     }
 
@@ -627,17 +687,32 @@ fn main() -> ExitCode {
     // under it regardless. The flag keeps its two jobs and gains no third:
     // it writes the marker that overrides the folder-derived name, and it
     // still refuses to change a name that is already there.
-    if let Some(key) = &cli.project {
+    if let Some(key) = &project {
         match write_project_marker(&here, key) {
             Ok(MarkerOutcome::Written) => println!("+ this folder now has its own memory, under {key:?}"),
             Ok(MarkerOutcome::AlreadyThere) => println!("= this folder already has its own memory, under {key:?}"),
             Err(e) => {
-                eprintln!("everything else is installed, but the project scope was refused: {e}");
+                eprintln!("everything else is installed, but giving this folder its own memory was refused: {e}");
                 return ExitCode::FAILURE;
             }
         }
     }
-    match cli.project.or_else(|| serve::project::resolve_project(&here)) {
+    let key_here = project.or_else(|| serve::project::resolve_project(&here));
+    // A plain folder has no code to read and no commits to follow: it is
+    // registered as the topic it is, and that is all there is to do.
+    let is_plain = serve::project::git_root(&here).is_none();
+    match key_here {
+        Some(key) if is_plain => match record_topic_opened(&db, &here, &key) {
+            Ok(RegisterOutcome::Created { .. } | RegisterOutcome::CreatedUnderRootRecord { .. } | RegisterOutcome::Registered { .. }) => {
+                println!("+ '{key}' is now a topic: what you tell your assistant while working in this folder is remembered for this topic only");
+                println!("  (this folder is not a programming project, so there is no code to search; your assistant reads your files itself)");
+            }
+            Ok(RegisterOutcome::AlreadyHere { .. }) => println!("= '{key}' was already set up as a topic here"),
+            Ok(RegisterOutcome::Moved { from, to }) => {
+                println!("+ the topic '{key}' moved from {from} to {to} (the old folder is gone)")
+            }
+            Err(e) => println!("  ! could not set up this topic: {e}"),
+        },
         Some(key) => match code_index_root.as_deref().map(|r| build_project_index(r, &key, &here)).transpose() {
             Ok(Some(Some(files))) => {
                 println!("+ read this project's code, {files} file(s), so it can be searched and kept fresh on every commit");
@@ -673,13 +748,18 @@ fn main() -> ExitCode {
             Ok(None) => {}
             Err(e) => println!("- the code here could not be read ({e}) - the memory works, code search does not"),
         },
-        None => println!(
-            "- the code here was not indexed: no --project was given, and no git repository was found above this folder"
-        ),
+        None => {
+            let installer = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "install".to_string());
+            println!("- no topic set up in this folder. That is fine: THOR already works everywhere.");
+            println!("  To give one folder (one subject, like 'Kitchen renovation') its own memory, open that folder and run:  \"{installer}\" --topic");
+        }
     }
 
     println!();
-    println!("Done. Restart the agent - it reads these files once, at startup.");
-    println!("Then check it with:  doctor --db \"{}\"", db.display());
+    println!("Done. ONE THING LEFT FOR YOU: close Claude Code completely and open it again.");
+    println!("Claude Code only learns about THOR when it starts, so until you do this nothing above is active.");
+    println!("To check that THOR is healthy afterwards, ask your assistant to run THOR's doctor:");
+    let bin_dir = serve_exe.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+    println!("  {}", ops::install::doctor_invocation(&bin_dir, &db, cfg!(windows)));
     ExitCode::SUCCESS
 }

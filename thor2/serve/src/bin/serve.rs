@@ -563,7 +563,8 @@ fn stale_tool_server_line(session_id: &str) -> Option<String> {
 }
 
 fn decay_notice(store: &EventStore, db: &Path, cwd: Option<&Path>) -> Option<String> {
-    let root = project::git_root(cwd?)?;
+    let cwd = cwd?;
+    let root = project::git_root(cwd).or_else(|| project::plain_root(cwd))?;
     let project = project::resolve_project(&root)?;
 
     let stamp = db.with_file_name("decay-notice.stamp");
@@ -664,7 +665,7 @@ fn decay_notice(store: &EventStore, db: &Path, cwd: Option<&Path>) -> Option<Str
     let doctor = sibling("doctor").unwrap_or_else(|| PathBuf::from("doctor"));
     let checkouts = root.parent().unwrap_or(&root);
     Some(format!(
-        "[THOR] {project}: {dead} anchor(s) point at a file that is not there, so those facts fire nowhere, and {failing} proof(s) now come out false. Run `\"{}\" --db \"{}\" --checkouts \"{}\"` to see each one named on the decay line, then repair per id with revise (the file moved) or retract (the fact went with it). That report counts EVERY project under the checkouts directory, so its two numbers are larger than this line's, which counts only {project}.",
+        "[THOR] Some of what THOR remembers may be out of date. {project}: {dead} note(s) point at a file that has moved or gone, and {failing} no longer match the files. Nothing is broken; just ask your assistant to tidy the memory. (For your assistant: run `\"{}\" --db \"{}\" --checkouts \"{}\"` to see each one on the decay line, then repair per id with revise when the file moved or retract when the fact went with it. That report counts EVERY project under the checkouts directory, so its numbers are larger than this line's, which counts only {project}.)",
         doctor.display(), db.display(), checkouts.display()
     ))
 }
@@ -1197,17 +1198,109 @@ mod resolve_session_id_tests {
     }
 }
 
-/// `actor` is the actor stamped on every delivery (`ItemServed`) this call
-/// makes - `usefulness::ASSISTANT_DELIVERY_ACTOR` ("hook") for an ordinary
-/// run, or whatever `--actor` validated for a caller that is not an
-/// assistant harness (see that constant's own doc comment, and `Command::
-/// Hook`'s own doc comment on `actor`/`no_record`). `no_record` true skips
-/// every one of the three `deliver::record_delivery*` calls below entirely -
-/// for a measurement run - while leaving everything else, stdout included,
-/// completely unaffected: `ids` is computed exactly as before either way,
-/// only the write itself is skipped. It also holds the store's directory
-/// read-only for the whole call (`serve::store_dir`), so no state file beside
-/// the store is written either and the store is opened read-only.
+/// The one plain sentence for the PERSON that goes beside a hook's block.
+///
+/// A block's `reason` is written for the assistant, in THOR's own words, and
+/// Claude Code shows it on the person's screen as well. Someone who has never
+/// heard of any of this reads "rule", "falsifier" and "evaluation" and has no
+/// idea whether something broke. So every block also carries a top-level
+/// `systemMessage` - Claude Code's channel for the person - saying in ordinary
+/// words what is going on and what, if anything, is asked of them. The reason
+/// itself is left exactly as it was: the assistant reads that.
+///
+/// Chosen from the event and a few phrases of the reason; anything not
+/// recognised gets the general sentence, which is true of every block.
+fn plain_line_for_block(event: &str, reason: &str) -> &'static str {
+    let lower = reason.to_lowercase();
+    match event {
+        "Stop" if lower.contains("walked through setup") => {
+            "THOR (the memory your assistant uses) wants a quick chat first: your assistant will ask you a few setup questions, such as which language to answer in. Just answer in your own words, or say \"skip\"."
+        }
+        "Stop" if lower.contains("evaluation") => {
+            "THOR asks your assistant to do a short tidy-up of its memory before it finishes. It can take a few minutes. Nothing is needed from you."
+        }
+        "Stop" if lower.contains("durable decision") => {
+            "Your assistant is saving something you just decided, so it is remembered next time. Nothing is needed from you."
+        }
+        _ => "THOR asked your assistant to take care of one more small thing before it finishes. Nothing is needed from you.",
+    }
+}
+
+/// `plain_line_for_block` applied to a block at STOP, once, as
+/// `systemMessage`. Anything else is returned unchanged: a PreToolUse refusal
+/// is a different channel whose exact bytes are pinned by the golden files in
+/// `serve/tests/data/hook_golden`, and the person's confusing moment is the
+/// turn that will not end.
+fn with_line_for_the_person(event: &str, out: Option<HookOutput>) -> Option<HookOutput> {
+    if event != "Stop" {
+        return out;
+    }
+    match out {
+        Some(HookOutput::Decision(mut verdict)) => {
+            let is_block = verdict.get("decision").and_then(Value::as_str) == Some("block");
+            if is_block && verdict.get("systemMessage").is_none() {
+                let reason = verdict.get("reason").and_then(Value::as_str).unwrap_or("");
+                let line = plain_line_for_block(event, reason);
+                verdict["systemMessage"] = Value::String(line.to_string());
+            }
+            Some(HookOutput::Decision(verdict))
+        }
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod line_for_the_person_tests {
+    use super::*;
+
+    fn block(reason: &str) -> Option<HookOutput> {
+        Some(HookOutput::Decision(serde_json::json!({ "decision": "block", "reason": reason })))
+    }
+
+    fn line_of(out: Option<HookOutput>) -> String {
+        match out {
+            Some(HookOutput::Decision(v)) => v["systemMessage"].as_str().unwrap_or_default().to_string(),
+            _ => String::new(),
+        }
+    }
+
+    #[test]
+    fn every_kind_of_block_gets_one_plain_line_and_keeps_its_reason() {
+        let cases = [
+            ("Stop", "[THOR] The evaluation of 'x' is still open"),
+            ("Stop", "[THOR] The owner may have just stated a NEW durable decision"),
+            ("Stop", "[THOR] a reply rule fired"),
+        ];
+        for (event, reason) in cases {
+            let out = with_line_for_the_person(event, block(reason));
+            let Some(HookOutput::Decision(v)) = &out else { panic!("{event}: lost the block") };
+            assert_eq!(v["reason"], reason, "the assistant's own text is untouched");
+            assert_eq!(v["decision"], "block");
+            let line = line_of(out);
+            assert!(line.contains("Nothing is needed from you") || line.contains("answer in your own words"), "{event}: {line}");
+            for jargon in ["falsifier", "scope", "hook", "retract", "teeth", "evaluation", "A4"] {
+                assert!(!line.contains(jargon), "{event}: the plain line must not use {jargon:?}: {line}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_tool_call_refusal_is_left_exactly_as_it_was() {
+        let out = with_line_for_the_person("PreToolUse", block("[THOR] rule r1 forbids this text"));
+        let Some(HookOutput::Decision(v)) = out else { panic!("lost the block") };
+        assert!(v.get("systemMessage").is_none(), "{v}");
+    }
+
+    #[test]
+    fn only_a_block_gets_a_line() {
+        let warn = with_line_for_the_person("Stop", Some(HookOutput::Warn { text: "x".to_string() }));
+        assert!(matches!(warn, Some(HookOutput::Warn { .. })));
+        assert!(with_line_for_the_person("Stop", None).is_none());
+        let already = Some(HookOutput::Decision(serde_json::json!({ "decision": "block", "reason": "r", "systemMessage": "mine" })));
+        assert_eq!(line_of(with_line_for_the_person("Stop", already)), "mine");
+    }
+}
+
 /// Where the last panic of this process happened, `crate/src/file.rs:line`.
 static PANIC_AT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
@@ -1232,6 +1325,18 @@ fn panic_place(file: &str, line: u32) -> String {
 /// size Claude Code keeps whole).
 const BUG_NUDGE_ROOM_BYTES: usize = 3_500;
 
+/// `actor` is the actor stamped on every delivery (`ItemServed`) this call
+/// makes - `usefulness::ASSISTANT_DELIVERY_ACTOR` ("hook") for an ordinary
+/// run, or whatever `--actor` validated for a caller that is not an
+/// assistant harness (see that constant's own doc comment, and `Command::
+/// Hook`'s own doc comment on `actor`/`no_record`). `no_record` true skips
+/// every one of the three `deliver::record_delivery*` calls below entirely -
+/// for a measurement run - while leaving everything else, stdout included,
+/// completely unaffected: `ids` is computed exactly as before either way,
+/// only the write itself is skipped. It also holds the store's directory
+/// read-only for the whole call (`serve::store_dir`), so no state file beside
+/// the store is written either and the store is opened read-only.
+///
 /// One hook call: `hook_inner` decides what the surfaces say, and this hands a
 /// Stop notice that does not hold the turn on to the session's next turn
 /// (step 26, `serve::next_turn`). Since 2.5 such a notice goes out at Stop as
@@ -1249,9 +1354,9 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
         }
     };
     let payload: Option<Value> = serde_json::from_str(&raw).ok();
-    let out = hook_inner(db_path, Some(raw), actor, no_record);
     let event_name: String =
         payload.as_ref().and_then(|p| p.get("hook_event_name")).and_then(|v| v.as_str()).unwrap_or("PreToolUse").to_string();
+    let out = with_line_for_the_person(&event_name, hook_inner(db_path, Some(raw), actor, no_record));
     // Every Stop and whether it held the turn, for doctor's volume line
     // (`serve::volume`, step 28).
     if let (true, "Stop", Some(p)) = (!no_record, event_name.as_str(), payload.as_ref()) {
@@ -4384,7 +4489,7 @@ mod decay_notice_tests {
         anchored_rule(&mut store, "moved-file", "Some-Project", "firmware/src/secrets.h", vec![]);
 
         let notice = decay_notice(&store, &db, Some(&root)).expect("an untagged dead anchor is decay");
-        assert!(notice.contains("Some-Project: 1 anchor(s) point at a file that is not there"), "{notice}");
+        assert!(notice.contains("Some-Project: 1 note(s) point at a file that has moved or gone"), "{notice}");
     }
 
     /// THE DEFECT THIS CLOSES: doctor's decay line counts a dead DIRECTORY
@@ -4421,7 +4526,7 @@ mod decay_notice_tests {
 
         model::store::declare(&mut store, "t", "t", "t", &dir_rule("gone-dir", "fleet/gone", vec![])).unwrap();
         let notice = decay_notice(&store, &db, Some(&root)).expect("a dead Dir anchor is decay");
-        assert!(notice.contains("Some-Project: 1 anchor(s)"), "{notice}");
+        assert!(notice.contains("Some-Project: 1 note(s)"), "{notice}");
     }
 
     /// Scope: another project's dead anchor, under the same checkouts folder,
@@ -4437,7 +4542,7 @@ mod decay_notice_tests {
 
         anchored_rule(&mut store, "a-gone", "Project-A", "fleet/web/app.js", vec![]);
         let notice = decay_notice(&store, &db, Some(&root)).expect("A's own dead anchor must count");
-        assert!(notice.contains("Project-A: 1 anchor(s)"), "{notice}");
+        assert!(notice.contains("Project-A: 1 note(s)"), "{notice}");
     }
 }
 

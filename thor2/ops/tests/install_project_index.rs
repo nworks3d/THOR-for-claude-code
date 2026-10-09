@@ -169,7 +169,7 @@ fn outside_any_git_repository_nothing_is_indexed_and_the_installer_says_so() {
     );
     let stdout = stdout_of(&out);
     assert!(
-        stdout.lines().any(|l| l.contains("no git repository was found above this folder")),
+        stdout.lines().any(|l| l.contains("no topic set up in this folder")),
         "leaving --project off outside any git repository must say plainly that nothing was read, not stay silent:\n{stdout}"
     );
 

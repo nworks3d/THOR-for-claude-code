@@ -77,10 +77,13 @@ try {
 
     Write-Host "Setting up..."
     & (Join-Path $dest 'install.exe')
+    if ($LASTEXITCODE -ne 0) {
+        throw "The setup did not finish - read the message just above this one. Running the same command again is safe once that is sorted out."
+    }
 
-    Write-Host ""
-    Write-Host "Done. Restart Claude Code so it picks up the memory server."
-    Write-Host "Check on it any time with: & '$dest\doctor.exe' --db <your store>"
+    # The setup above has already printed what it did and the one step left
+    # for you. Nothing more is said here: a second, shorter "Done" that
+    # disagreed with the first was one more thing a newcomer had to reconcile.
 }
 finally {
     Remove-Item -Path $tmp -Recurse -Force -ErrorAction SilentlyContinue
