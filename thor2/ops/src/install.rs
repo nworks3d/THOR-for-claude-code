@@ -767,10 +767,10 @@ pub fn working_contract() -> Vec<model::item::Item> {
         ),
         rule(
             "a-new-project-is-one-command",
-            "Giving a folder its own memory is ONE command, run FROM the folder holding the \
-             code: `install --db <your store> --project <name>`. It writes the marker, registers \
-             this working copy, reads the code once, and keeps that reading fresh on every commit. \
-             The owner names it - never you.",
+            "Giving a folder its own memory is ONE command, run FROM that folder: `install --db \
+             <your store> --project <name>` for code, or `install --db <your store> --topic` for \
+             a plain folder of notes and files (no git). It marks the folder and registers it. \
+             The owner names a project - never you.",
             "A folder set up with that one command turns out to be missing its marker, its \
              registration, its code reading or its refresh on commit.",
         ),
@@ -1235,7 +1235,7 @@ fn project_record(id: String, key: &str, files: Option<usize>, today: &str) -> m
         ),
         None => format!(
             "Project {key}: install registered its working copy on {today}. Notes filed under \
-             '{key}' belong to this repository."
+             '{key}' belong to this project (a code repository, or a plain topic folder that has no code to search)."
         ),
     };
     model::item::Item {
@@ -1284,8 +1284,12 @@ pub enum RegisterOutcome {
 /// Why `register_root` wrote nothing. `Display` is the exact line printed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegisterRefusal {
-    /// The folder is not inside a git checkout.
+    /// The folder is neither inside a git checkout nor a marked topic folder.
     NotACheckout { cwd: String },
+    /// The folder is far too broad to be one topic: the home folder or a
+    /// whole drive. Everything a person ever does there would land in one
+    /// memory.
+    TooBroad { cwd: String },
     /// The registered folder still exists and is still a checkout of this
     /// project: a second copy.
     StillACheckout { key: String, old: String },
@@ -1303,8 +1307,14 @@ impl std::fmt::Display for RegisterRefusal {
         match self {
             RegisterRefusal::NotACheckout { cwd } => write!(
                 f,
-                "REFUSED: {cwd} is not inside a git checkout, and a working copy is registered as the top of one. \
-                 Start a repository there first (git init, then one commit), then run this again. Nothing was changed."
+                "REFUSED: {cwd} is not set up as a topic folder yet. Open a terminal INSIDE the folder for your topic \
+                 and run the installer there with --topic added (no git or code needed). Nothing was changed."
+            ),
+            RegisterRefusal::TooBroad { cwd } => write!(
+                f,
+                "REFUSED: {cwd} is your whole home folder or a whole drive, which is too broad to be one topic. Make a \
+                 folder for just one subject (for example 'Kitchen renovation'), open that folder, and run this again \
+                 from inside it. Nothing was changed."
             ),
             RegisterRefusal::StillACheckout { key, old } => write!(
                 f,
@@ -1358,6 +1368,25 @@ fn same_root(a: &str, b: &str) -> bool {
     }
 }
 
+/// The folder a registration records for `cwd`: the top of the git checkout it
+/// sits in, else the top of the marked topic folder it sits in (a plain folder
+/// with a `.thor-project` file and no git above it). `None` for any other
+/// folder.
+fn registration_top(cwd: &Path) -> Option<PathBuf> {
+    serve::project::git_root(cwd).or_else(|| serve::project::plain_root(cwd))
+}
+
+/// The name a plain folder gets as a topic: its own folder name. Refused for
+/// the home folder and for a drive root, which are far too broad to be one
+/// topic (everything a person ever does there would share one memory).
+pub fn topic_folder_name(dir: &Path) -> Result<String, RegisterRefusal> {
+    let too_broad = || RegisterRefusal::TooBroad { cwd: root_string(dir) };
+    if home_dir().is_some_and(|home| same_root(&root_string(&home), &root_string(dir))) {
+        return Err(too_broad());
+    }
+    dir.file_name().and_then(|n| n.to_str()).map(str::trim).filter(|n| !n.is_empty()).map(str::to_string).ok_or_else(too_broad)
+}
+
 /// What a registration of a checkout would do, decided before anything is
 /// written.
 enum Plan {
@@ -1397,9 +1426,19 @@ pub fn check_registration(db: &Path, cwd: &Path, key: &str) -> Result<(), Regist
     if !db.exists() {
         return Ok(());
     }
-    let Some(top) = serve::project::git_root(cwd) else { return Ok(()) };
+    let Some(top) = registration_top(cwd) else { return Ok(()) };
+    check_registration_at(db, &top, key)
+}
+
+/// `check_registration` for a folder that is already known to be the top of
+/// its project - a plain folder about to become a topic has no marker yet, so
+/// `registration_top` cannot find it from the folder alone.
+pub fn check_registration_at(db: &Path, top: &Path, key: &str) -> Result<(), RegisterRefusal> {
+    if !db.exists() {
+        return Ok(());
+    }
     let store = EventStore::open_existing(db).map_err(|e| RegisterRefusal::Store(e.to_string()))?;
-    registration_plan(&store, &root_string(&top), key).map(|_| ())
+    registration_plan(&store, &root_string(top), key).map(|_| ())
 }
 
 /// Register the checkout `cwd` sits in as project `key`'s working copy - the
@@ -1422,7 +1461,7 @@ pub fn register_root(
     key: &str,
     files: Option<usize>,
 ) -> Result<RegisterOutcome, RegisterRefusal> {
-    let Some(top) = serve::project::git_root(cwd) else {
+    let Some(top) = registration_top(cwd) else {
         return Err(RegisterRefusal::NotACheckout { cwd: root_string(cwd) });
     };
     let root = root_string(&top);
@@ -1510,6 +1549,13 @@ pub fn record_project_opened(
 ) -> Result<RegisterOutcome, RegisterRefusal> {
     let mut store = EventStore::new(db).map_err(|e| RegisterRefusal::Store(e.to_string()))?;
     register_root(&mut store, cwd, key, Some(files))
+}
+
+/// `record_project_opened` for a plain topic folder: no code was read, so the
+/// record says only that the folder was registered.
+pub fn record_topic_opened(db: &Path, cwd: &Path, key: &str) -> Result<RegisterOutcome, RegisterRefusal> {
+    let mut store = EventStore::new(db).map_err(|e| RegisterRefusal::Store(e.to_string()))?;
+    register_root(&mut store, cwd, key, None)
 }
 
 #[cfg(test)]

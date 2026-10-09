@@ -91,7 +91,10 @@ fn main() {
     // project's own checkout. Resolved once at startup, the same assumption
     // `resolve_code_index` above already makes about the working directory.
     // An HTTP connector has no meaningful working directory, so it gets none.
-    let root = std::env::current_dir().ok().and_then(|cwd| serve::project::git_root(&cwd));
+    // A plain topic folder is its own checkout (`plain_root`).
+    let root = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| serve::project::git_root(&cwd).or_else(|| serve::project::plain_root(&cwd)));
     // When that directory is a linked worktree, `root` above is its MAIN
     // checkout; the worktree itself is kept too, so a check that holds only
     // here can be refused before it is written (see `mcp`'s own

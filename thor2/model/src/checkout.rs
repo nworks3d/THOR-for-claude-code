@@ -52,7 +52,11 @@ pub fn resolve_project(start_dir: &Path) -> Option<String> {
         return Some(name);
     }
     // A worktree's root is not the project - see `git_root`'s own note.
-    let root = git_root(start_dir)?;
+    let Some(root) = git_root(start_dir) else {
+        // No repository anywhere above: a plain topic folder is still a
+        // project when it (or a folder above it) carries a marker.
+        return plain_root(start_dir).and_then(|top| read_marker(&top));
+    };
     if root != start_dir {
         if let Some(name) = read_marker(&root) {
             return Some(name);
@@ -141,6 +145,35 @@ pub fn git_root(start_dir: &Path) -> Option<PathBuf> {
     None
 }
 
+/// The top of a PLAIN TOPIC FOLDER: the nearest folder at or above `start_dir`
+/// that carries a `.thor-project` marker, when no git repository sits above
+/// `start_dir` at all. `None` inside a repository (git decides there, exactly
+/// as before) and for a folder nobody marked.
+///
+/// WHY A MARKER AND NOT THE FOLDER NAME ALONE. A session is always started in
+/// some folder, including the home folder or a drive root; naming those a
+/// project by their basename would put everything a person ever does there
+/// into one memory. A topic folder is one somebody asked for (`install
+/// --topic`), and the marker is the proof of that. Only the current marker
+/// name counts above `start_dir`: the old `.thor` name is still honoured in
+/// the folder itself, but never inherited by every folder below it.
+pub fn plain_root(start_dir: &Path) -> Option<PathBuf> {
+    if git_root(start_dir).is_some() {
+        return None;
+    }
+    let mut dir: Option<&Path> = Some(start_dir);
+    while let Some(d) = dir {
+        let named = std::fs::read_to_string(d.join(MARKER_FILE_NAME))
+            .ok()
+            .is_some_and(|content| content.lines().next().is_some_and(|line| !line.trim().is_empty()));
+        if named {
+            return Some(d.to_path_buf());
+        }
+        dir = d.parent();
+    }
+    None
+}
+
 /// The root of the LINKED WORKTREE `start_dir` sits in - the directory that
 /// carries the `.git` file - or `None` when the nearest `.git` above it is a
 /// real repository (a directory) or a file this does not recognise as a
@@ -206,9 +239,13 @@ fn main_root_of_worktree(dot_git_file: &Path) -> Option<PathBuf> {
 /// The top of the checkout `cwd` sits in: a linked worktree's own root when
 /// `cwd` is inside one, else the repository root (`git_root`), else `cwd`
 /// itself. Unlike `git_root` it never swaps a worktree for its main checkout -
-/// the place a session works in is where its files are.
+/// the place a session works in is where its files are. A plain topic folder
+/// (`plain_root`) is its own top.
 pub fn checkout_top(cwd: &Path) -> PathBuf {
-    linked_worktree_root(cwd).or_else(|| git_root(cwd)).unwrap_or_else(|| cwd.to_path_buf())
+    linked_worktree_root(cwd)
+        .or_else(|| git_root(cwd))
+        .or_else(|| plain_root(cwd))
+        .unwrap_or_else(|| cwd.to_path_buf())
 }
 
 /// Why a project's registered working copy cannot be used right now.
@@ -237,7 +274,7 @@ impl std::fmt::Display for RootProblem {
             RootProblem::NotRegistered => write!(f, "no working copy is registered"),
             RootProblem::GlobalRule => write!(f, "a global item has no working copy of its own"),
             RootProblem::Gone(p) => write!(f, "the registered folder {} no longer exists", show(p)),
-            RootProblem::NotCheckoutTop(p) => write!(f, "{} is not the top of a git checkout", show(p)),
+            RootProblem::NotCheckoutTop(p) => write!(f, "{} is not the top of a project folder (a git checkout, or a topic folder with a .thor-project file)", show(p)),
             RootProblem::Worktree(p) => write!(f, "{} is a linked worktree, not a main checkout", show(p)),
             RootProblem::ResolvesTo(p, Some(other)) => write!(f, "{} now resolves to project '{other}'", show(p)),
             RootProblem::ResolvesTo(p, None) => write!(f, "{} now resolves to no project", show(p)),
@@ -275,7 +312,10 @@ pub fn validate_checkout(root: &Path, project: &str) -> Result<PathBuf, RootProb
     if checkout_for(&root) != root {
         return Err(RootProblem::Worktree(root));
     }
-    if git_root(&root).as_deref() != Some(root.as_path()) {
+    // The top of a git checkout, or the top of a plain topic folder (the
+    // marked folder itself, with no repository anywhere above it).
+    let is_top = git_root(&root).as_deref() == Some(root.as_path()) || plain_root(&root).as_deref() == Some(root.as_path());
+    if !is_top {
         return Err(RootProblem::NotCheckoutTop(root));
     }
     let resolved = resolve_project(&root);

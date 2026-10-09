@@ -38,7 +38,8 @@
 use std::path::Path;
 
 pub use model::checkout::{
-    checkout_for, checkout_top, git_root, linked_worktree_root, registered_checkout, resolve_project, validate_checkout,
+    checkout_for, checkout_top, git_root, linked_worktree_root, plain_root, registered_checkout, resolve_project,
+    validate_checkout,
     RootProblem, MARKER_FILE_NAME, MARKER_FILE_NAMES,
 };
 
@@ -256,15 +257,36 @@ mod tests {
     }
 
     #[test]
-    fn a_marker_in_a_parent_directory_is_never_inherited_by_a_child() {
-        // Pins the deliberate scope choice: unlike the git-root walk, the
-        // marker check never climbs - it names the directory you are
-        // standing in, not something a parent folder hints at.
+    fn a_topic_folders_marker_reaches_its_subfolders_but_the_old_marker_name_does_not() {
+        // A plain topic folder has no repository to climb to, so its marker
+        // is what a subfolder (a PDFs folder, say) resolves through: a
+        // session that moves into one must keep the topic's memory. Only the
+        // current marker name is inherited; the old `.thor` names the folder
+        // it sits in and nothing below it.
         let dir = tempdir();
-        let child = dir.path().join("child");
-        fs::create_dir(&child).unwrap();
-        fs::write(dir.path().join(MARKER_FILE_NAME), "parent-project\n").unwrap();
-        assert_eq!(resolve_project(&child), None, "a parent's marker must not leak into its child");
+        let child = dir.path().join("child").join("deeper");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(dir.path().join(MARKER_FILE_NAME), "topic-folder\n").unwrap();
+        assert_eq!(resolve_project(&child), Some("topic-folder".to_string()));
+        assert_eq!(plain_root(&child), Some(dir.path().to_path_buf()));
+        assert_eq!(checkout_top(&child), dir.path().to_path_buf());
+
+        let old = tempdir();
+        let old_child = old.path().join("child");
+        fs::create_dir(&old_child).unwrap();
+        fs::write(old.path().join(".thor"), "old-style\n").unwrap();
+        assert_eq!(resolve_project(old.path()), Some("old-style".to_string()));
+        assert_eq!(resolve_project(&old_child), None, "the old marker name is never inherited");
+    }
+
+    #[test]
+    fn a_git_repository_below_a_topic_folder_is_its_own_project() {
+        let dir = tempdir();
+        fs::write(dir.path().join(MARKER_FILE_NAME), "topic-folder\n").unwrap();
+        let repo = dir.path().join("inner-repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        assert_eq!(resolve_project(&repo), Some("inner-repo".to_string()), "git decides inside a repository");
+        assert_eq!(plain_root(&repo), None);
     }
 
     #[test]
@@ -500,10 +522,26 @@ mod tests {
         fs::write(sub.join(MARKER_FILE_NAME), "beta\n").unwrap();
         assert_eq!(validate_checkout(&sub, "beta"), Err(RootProblem::NotCheckoutTop(sub.clone())));
 
+        // A folder nobody marked is no project folder at all.
         let plain = dir.path().join("plain");
         fs::create_dir_all(&plain).unwrap();
-        fs::write(plain.join(MARKER_FILE_NAME), "beta\n").unwrap();
         assert_eq!(validate_checkout(&plain, "beta"), Err(RootProblem::NotCheckoutTop(plain.clone())));
+    }
+
+    #[test]
+    fn a_marked_topic_folder_is_a_usable_working_copy_and_its_subfolder_is_not() {
+        let dir = tempdir();
+        let topic = dir.path().join("Kitchen renovation");
+        let sub = topic.join("PDFs");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(topic.join(MARKER_FILE_NAME), "Kitchen renovation\n").unwrap();
+        assert_eq!(validate_checkout(&topic, "Kitchen renovation"), Ok(topic.clone()));
+        assert_eq!(validate_checkout(&sub, "Kitchen renovation"), Err(RootProblem::NotCheckoutTop(sub.clone())));
+        // A topic that now names another project is no longer this one's.
+        assert_eq!(
+            validate_checkout(&topic, "Bathroom"),
+            Err(RootProblem::ResolvesTo(topic.clone(), Some("Kitchen renovation".to_string())))
+        );
     }
 
     #[test]

@@ -534,7 +534,8 @@ fn stale_tool_server_line(session_id: &str) -> Option<String> {
 }
 
 fn decay_notice(store: &EventStore, db: &Path, cwd: Option<&Path>) -> Option<String> {
-    let root = project::git_root(cwd?)?;
+    let cwd = cwd?;
+    let root = project::git_root(cwd).or_else(|| project::plain_root(cwd))?;
     let project = project::resolve_project(&root)?;
 
     let stamp = db.with_file_name("decay-notice.stamp");
@@ -1182,6 +1183,102 @@ mod resolve_session_id_tests {
     }
 }
 
+/// The one plain sentence for the PERSON that goes beside a hook's block.
+///
+/// A block's `reason` is written for the assistant, in THOR's own words, and
+/// Claude Code shows it on the person's screen as well. Someone who has never
+/// heard of any of this reads "rule", "falsifier" and "evaluation" and has no
+/// idea whether something broke. So every block also carries a top-level
+/// `systemMessage` - Claude Code's channel for the person - saying in ordinary
+/// words what is going on and what, if anything, is asked of them. The reason
+/// itself is left exactly as it was: the assistant reads that.
+///
+/// Chosen from the event and a few phrases of the reason; anything not
+/// recognised gets the general sentence, which is true of every block.
+fn plain_line_for_block(event: &str, reason: &str) -> &'static str {
+    let lower = reason.to_lowercase();
+    match event {
+        "Stop" if lower.contains("walked through setup") => {
+            "THOR (the memory your assistant uses) wants a quick chat first: your assistant will ask you a few setup questions, such as which language to answer in. Just answer in your own words, or say \"skip\"."
+        }
+        "Stop" if lower.contains("evaluation") => {
+            "THOR asks your assistant to do a short tidy-up of its memory before it finishes. It can take a few minutes. Nothing is needed from you."
+        }
+        "Stop" if lower.contains("durable decision") => {
+            "Your assistant is saving something you just decided, so it is remembered next time. Nothing is needed from you."
+        }
+        "Stop" => "THOR asked your assistant to take care of one more small thing before it finishes. Nothing is needed from you.",
+        "PreToolUse" => {
+            "THOR stopped one action your assistant was about to take, because of a rule that was saved earlier. Your assistant will explain or choose another way. Nothing is needed from you."
+        }
+        _ => "THOR asked your assistant to pause and check one thing. Nothing is needed from you.",
+    }
+}
+
+/// `plain_line_for_block` applied to a block, once, as `systemMessage`.
+/// Anything that is not a block is returned unchanged.
+fn with_line_for_the_person(event: &str, out: Option<HookOutput>) -> Option<HookOutput> {
+    match out {
+        Some(HookOutput::Decision(mut verdict)) => {
+            let is_block = verdict.get("decision").and_then(Value::as_str) == Some("block");
+            if is_block && verdict.get("systemMessage").is_none() {
+                let reason = verdict.get("reason").and_then(Value::as_str).unwrap_or("");
+                let line = plain_line_for_block(event, reason);
+                verdict["systemMessage"] = Value::String(line.to_string());
+            }
+            Some(HookOutput::Decision(verdict))
+        }
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod line_for_the_person_tests {
+    use super::*;
+
+    fn block(reason: &str) -> Option<HookOutput> {
+        Some(HookOutput::Decision(serde_json::json!({ "decision": "block", "reason": reason })))
+    }
+
+    fn line_of(out: Option<HookOutput>) -> String {
+        match out {
+            Some(HookOutput::Decision(v)) => v["systemMessage"].as_str().unwrap_or_default().to_string(),
+            _ => String::new(),
+        }
+    }
+
+    #[test]
+    fn every_kind_of_block_gets_one_plain_line_and_keeps_its_reason() {
+        let cases = [
+            ("Stop", "[THOR] The evaluation of 'x' is still open"),
+            ("Stop", "[THOR] The owner may have just stated a NEW durable decision"),
+            ("Stop", "[THOR] a reply rule fired"),
+            ("PreToolUse", "[THOR] rule r1 forbids this text"),
+            ("UserPromptSubmit", "[THOR] anything"),
+        ];
+        for (event, reason) in cases {
+            let out = with_line_for_the_person(event, block(reason));
+            let Some(HookOutput::Decision(v)) = &out else { panic!("{event}: lost the block") };
+            assert_eq!(v["reason"], reason, "the assistant's own text is untouched");
+            assert_eq!(v["decision"], "block");
+            let line = line_of(out);
+            assert!(line.contains("Nothing is needed from you") || line.contains("answer in your own words"), "{event}: {line}");
+            for jargon in ["falsifier", "scope", "hook", "retract", "teeth", "evaluation", "A4"] {
+                assert!(!line.contains(jargon), "{event}: the plain line must not use {jargon:?}: {line}");
+            }
+        }
+    }
+
+    #[test]
+    fn only_a_block_gets_a_line() {
+        let warn = with_line_for_the_person("Stop", Some(HookOutput::Warn { text: "x".to_string() }));
+        assert!(matches!(warn, Some(HookOutput::Warn { .. })));
+        assert!(with_line_for_the_person("Stop", None).is_none());
+        let already = Some(HookOutput::Decision(serde_json::json!({ "decision": "block", "reason": "r", "systemMessage": "mine" })));
+        assert_eq!(line_of(with_line_for_the_person("Stop", already)), "mine");
+    }
+}
+
 /// `actor` is the actor stamped on every delivery (`ItemServed`) this call
 /// makes - `usefulness::ASSISTANT_DELIVERY_ACTOR` ("hook") for an ordinary
 /// run, or whatever `--actor` validated for a caller that is not an
@@ -1193,6 +1290,7 @@ mod resolve_session_id_tests {
 /// only the write itself is skipped. It also holds the store's directory
 /// read-only for the whole call (`serve::store_dir`), so no state file beside
 /// the store is written either and the store is opened read-only.
+///
 /// One hook call: `hook_inner` decides what the surfaces say, and this hands a
 /// Stop notice that does not hold the turn on to the session's next turn
 /// (step 26, `serve::next_turn`). Since 2.5 such a notice goes out at Stop as
@@ -1210,9 +1308,9 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
         }
     };
     let payload: Option<Value> = serde_json::from_str(&raw).ok();
-    let out = hook_inner(db_path, Some(raw), actor, no_record);
     let event_name: String =
         payload.as_ref().and_then(|p| p.get("hook_event_name")).and_then(|v| v.as_str()).unwrap_or("PreToolUse").to_string();
+    let out = with_line_for_the_person(&event_name, hook_inner(db_path, Some(raw), actor, no_record));
     // Every Stop and whether it held the turn, for doctor's volume line
     // (`serve::volume`, step 28).
     if let (true, "Stop", Some(p)) = (!no_record, event_name.as_str(), payload.as_ref()) {
