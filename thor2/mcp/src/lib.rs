@@ -308,6 +308,9 @@ fn with_warnings(
         // place it lands on is already full in a registered project.
         notes.extend(model::store::global_write_crowded_in_projects(store, item, existing));
         notes.extend(unreachable_anchor_notes(store, corpus, item, existing));
+        // What the rule would have done to the calls of the last 30 days
+        // (`serve::sweep`): informs, never refuses.
+        notes.extend(serve::sweep::would_refuse_note(store, item, std::time::Duration::from_millis(1_500)));
     }
     if let Some(root) = root {
         notes.extend(file_aware_warnings(item, root));
@@ -9432,5 +9435,86 @@ mod tests {
         let info = srv.get_info();
         assert_eq!(info.server_info.name, "thor");
         assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
+    }
+
+    // ------------------------------------- the real-call note at the write gate
+
+    /// A Bash call of the record of real calls (`serve::corpus`), `days_ago`
+    /// days back, in a folder of the fixture.
+    fn real_bash_call(id: &str, command: &str, days_ago: i64, cwd: &std::path::Path) -> serve::corpus::CallRow {
+        serve::corpus::CallRow {
+            k: "c".into(),
+            id: id.into(),
+            t: serve::time::now_unix() - days_ago * 86_400,
+            s: "sess0001".into(),
+            a: false,
+            tool: "Bash".into(),
+            cwd: cwd.to_string_lossy().to_string(),
+            p: None,
+            d: None,
+            input: serde_json::json!({"command": command}),
+            r: vec![],
+            oth: false,
+            ok: Some(true),
+            h: true,
+            cut: false,
+            b: String::new(),
+        }
+    }
+
+    fn a_forbid_acme_wipe_rule(id: &str) -> RememberArgs {
+        RememberArgs {
+            id: id.to_string(),
+            kind: "rule".to_string(),
+            text: "Never run acme-tool with --wipe: it erases the demo volume.".to_string(),
+            severity: Some("costly".to_string()),
+            tags: vec![],
+            falsifier: Some("an acme-tool wipe of the demo volume turns out to be harmless".to_string()),
+            check_kind: Some("forbidden".to_string()),
+            check_literals: vec!["--wipe".to_string()],
+            targets: vec![TargetArg { kind: "command".to_string(), value: "acme-tool".to_string() }],
+            always: false,
+            ..base_remember(id)
+        }
+    }
+
+    /// The owner's standard (2026-10-09): a rule is tried against what really
+    /// happened. At write time the reply says how many real calls of the last
+    /// 30 days the new rule would have refused, with up to three, and never
+    /// refuses for it.
+    #[tokio::test]
+    async fn a_remember_of_a_rule_that_can_refuse_says_how_many_real_calls_it_would_have_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        let srv = ThorMcpServer::new(EventStore::new(&db).unwrap());
+        let rows = [
+            real_bash_call("toolu_1", "acme-tool --wipe cache", 3, dir.path()),
+            real_bash_call("toolu_2", "acme-tool --wipe all", 2, dir.path()),
+            real_bash_call("toolu_3", "acme-tool list", 2, dir.path()),
+            real_bash_call("toolu_4", "ls", 1, dir.path()),
+        ];
+        let text: String = rows.iter().map(|r| format!("{}\n", serde_json::to_string(r).unwrap())).collect();
+        std::fs::write(serve::corpus::calls_path(&db), text).unwrap();
+
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(a_forbid_acme_wipe_rule("acme-wipe-ban"))).await;
+        assert!(reply.starts_with("stored "), "informing never refuses: {reply}");
+        assert!(
+            reply.contains("note: real calls: this rule would refuse 2 of 4 real calls in the last 30 days (2 of them ran fine when they were made)"),
+            "{reply}"
+        );
+        assert_eq!(reply.matches("\n    e.g. ").count(), 2, "{reply}");
+        assert!(reply.contains("acme-tool --wipe cache") && reply.contains("acme-tool --wipe all"), "{reply}");
+
+        // A fact that is not a rule with a check says nothing of the kind.
+        let plain = srv.remember(Meta::new(), RawArgs::default(), Parameters(remembered_on_command("plain-note", "acme-tool"))).await;
+        assert!(plain.starts_with("stored ") && !plain.contains("real calls:"), "{plain}");
+    }
+
+    #[tokio::test]
+    async fn a_store_with_no_record_of_real_calls_gets_no_note_and_is_not_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let srv = ThorMcpServer::new(EventStore::new(&dir.path().join("thor.db")).unwrap());
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(a_forbid_acme_wipe_rule("acme-wipe-ban"))).await;
+        assert!(reply.starts_with("stored ") && !reply.contains("real calls:"), "{reply}");
     }
 }

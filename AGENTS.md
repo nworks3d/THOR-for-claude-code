@@ -479,6 +479,17 @@ more never counts.
      item is done when one of the two calls was accepted, and the report is
      held until every item is done; a tag or a line in the report settles
      nothing.
+   - **The false-block sweep (item d of the teeth section).** Rules, and
+     entries of the answer rulebook, that THOR found would refuse (fire on) real
+     calls (replies) of the last 30 days that ran fine. THOR replays the record of
+     real calls it keeps beside the store through the guard, so this finds what no
+     one reviewed. Each line gives the rule, how many real calls it would refuse
+     and how many of those ran fine, one example, and the call that settles it.
+     Read the example and the rule (`get`): if the call was fine, narrow the rule
+     with `revise` (a narrower check, a better anchor, and a `because` of 20+
+     characters); if the rule was right, say so in the report with the id. It is
+     done when each one has one of those outcomes in your report. `doctor` shows
+     the same rules in one line; `serve --db "<their store>" sweep` shows all of it.
    - **Open points.** THOR writes and closes these itself, for things only the
      owner can do, such as a project whose working copy is not registered.
      Rules that belong to no project and check a file share ONE open point for

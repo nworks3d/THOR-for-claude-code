@@ -1001,6 +1001,9 @@ The lines you need: `provable rules` (how many can refuse anything at all),
 `pinned` (how much of the memory is never re-read), `decay`, `crowding`,
 `ship` (how long ago the copy on another machine last succeeded; this line
 stays silent when there is no copy, and speaks up when one has gone stale),
+`false-block sweep` (rules that would refuse real calls of the last 30 days
+that ran fine; this line stays silent at zero, and the start note lists the
+same rules under 2d, each with its example and the call that settles it),
 `judgement debt` (how many items still owe a verdict, store-wide and for
 this project), and `contradictions` (how many pairs of notes carry a proof
 that cannot both be true right now; this line stays silent when there are
