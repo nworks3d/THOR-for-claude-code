@@ -203,6 +203,11 @@ impl Smoke {
     /// The one install command a new user runs, naming the three paths it
     /// writes so none of them is guessed.
     fn install(&self, cwd: &Path) -> Result<Output, String> {
+        self.install_with(cwd, &[])
+    }
+
+    /// `install` plus extra flags (`--topic`, for a plain folder).
+    fn install_with(&self, cwd: &Path, extra: &[&str]) -> Result<Output, String> {
         let mut cmd = self.command("install");
         cmd.current_dir(cwd)
             .arg("--settings")
@@ -210,7 +215,8 @@ impl Smoke {
             .arg("--mcp-json")
             .arg(self.mcp_json())
             .arg("--db")
-            .arg(self.db());
+            .arg(self.db())
+            .args(extra);
         run(cmd, None, STEP_TIMEOUT)
     }
 
@@ -510,16 +516,23 @@ impl Smoke {
     /// A remember through the packaged `mcp`, over stdio JSON-RPC, as the
     /// assistant does it. Returns the unique text it stored.
     fn step_remember_through_mcp(&self, token: &str) -> StepResult {
+        self.remember_in(&self.elsewhere(), "smoke-test-note", token, None)
+    }
+
+    /// The same, started in `cwd` (a session's own folder) and, for a topic,
+    /// filed under that topic's name.
+    fn remember_in(&self, cwd: &Path, id: &str, token: &str, project: Option<&str>) -> StepResult {
         let mut cmd = self.command("mcp");
+        cmd.current_dir(cwd);
         cmd.arg("--db").arg(self.db()).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
         let mut child = cmd.spawn().map_err(|e| format!("could not start mcp: {e}"))?;
-        let result = self.talk_to_mcp(&mut child, token);
+        let result = self.talk_to_mcp(&mut child, id, token, project);
         let _ = child.kill();
         let _ = child.wait();
         result
     }
 
-    fn talk_to_mcp(&self, child: &mut Child, token: &str) -> StepResult {
+    fn talk_to_mcp(&self, child: &mut Child, id: &str, token: &str, project: Option<&str>) -> StepResult {
         let mut stdin = child.stdin.take().ok_or("no stdin")?;
         let stdout = child.stdout.take().ok_or("no stdout")?;
         let (tx, rx) = mpsc::channel::<String>();
@@ -564,15 +577,19 @@ impl Smoke {
             return Err(format!("mcp does not offer {missing:?}; it offers {names:?}"));
         }
 
+        let mut arguments = json!({
+            "id": id,
+            "kind": "rule",
+            "text": format!("The release smoke test stored this note: {token}."),
+            "falsifier": "The smoke test finds this note gone from a fresh store.",
+            "always": true
+        });
+        if let Some(project) = project {
+            arguments["project"] = json!(project);
+        }
         send(json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
             "name": "remember",
-            "arguments": {
-                "id": "smoke-test-note",
-                "kind": "rule",
-                "text": format!("The release smoke test stored this note: {token}."),
-                "falsifier": "The smoke test finds this note gone from a fresh store.",
-                "always": true
-            }}}))?;
+            "arguments": arguments}}))?;
         let stored = reply(3)?;
         let text = stored["result"]["content"][0]["text"].as_str().unwrap_or("").to_string();
         if stored["error"].is_object() || stored["result"]["isError"] == json!(true) {
@@ -584,34 +601,165 @@ impl Smoke {
     /// Run the SessionStart hook exactly as the settings.json line names it,
     /// against the new store, and expect the stored note back.
     fn step_session_start_serves_it(&self, token: &str) -> StepResult {
+        self.session_start_in(&self.elsewhere(), token)
+    }
+
+    /// Run a hook event exactly as the settings.json line names it, from
+    /// `cwd`, with `payload` on stdin. The raw stdout.
+    fn run_hook(&self, event: &str, cwd: &Path, payload: Value) -> Result<String, String> {
         let settings = self.read_json(&self.settings())?;
-        let command = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        let command = settings["hooks"][event][0]["hooks"][0]["command"]
             .as_str()
-            .ok_or("no SessionStart command in settings.json")?;
+            .ok_or_else(|| format!("no {event} command in settings.json"))?;
         let parts = split_command(command);
         let mut cmd = Command::new(&parts[0]);
         cmd.args(&parts[1..]);
         let home = self.home();
-        cmd.current_dir(self.elsewhere()).env("HOME", &home).env("USERPROFILE", &home);
+        cmd.current_dir(cwd).env("HOME", &home).env("USERPROFILE", &home);
         cmd.env("LOCALAPPDATA", home.join("localappdata")).env("XDG_DATA_HOME", home.join("xdg-data"));
-        let payload = json!({
-            "hook_event_name": "SessionStart",
-            "session_id": "release-smoke",
-            "cwd": self.elsewhere().display().to_string(),
-            "source": "startup"
-        })
-        .to_string();
-        let out = run(cmd, Some(&payload), Duration::from_secs(60))?;
+        let out = run(cmd, Some(&payload.to_string()), Duration::from_secs(60))?;
         if !out.ok() {
             return Err(out.describe());
         }
+        Ok(out.stdout)
+    }
+
+    /// The SessionStart hook from `cwd`, expecting the stored note back.
+    fn session_start_in(&self, cwd: &Path, token: &str) -> StepResult {
+        let stdout = self.run_hook(
+            "SessionStart",
+            cwd,
+            json!({
+                "hook_event_name": "SessionStart",
+                "session_id": "release-smoke",
+                "cwd": cwd.display().to_string(),
+                "source": "startup"
+            }),
+        )?;
         let parsed: Value =
-            serde_json::from_str(out.stdout.trim()).map_err(|e| format!("hook output is not JSON ({e}): {}", out.stdout))?;
+            serde_json::from_str(stdout.trim()).map_err(|e| format!("hook output is not JSON ({e}): {stdout}"))?;
         let context = parsed["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or("");
         if !context.contains(token) {
             return Err(format!("SessionStart did not serve the stored note back. It served:\n{context}"));
         }
         Ok(format!("served {} characters, including the stored note", context.len()))
+    }
+
+    // ------------------------------------------------ a plain topic folder
+    //
+    // The walk a person makes who wants THOR for a SUBJECT, not for code
+    // (AGENTS.md 5b): a plain folder with notes and a PDF in it, no git
+    // anywhere. Each step is one thing that used to stop them.
+
+    fn topic(&self) -> PathBuf {
+        self.root.path().join("Documents").join("Kitchen renovation")
+    }
+
+    /// `install --topic` in the plain folder: it works, it is said in plain
+    /// words, the folder gets exactly one new file, and nothing mentions code
+    /// that could not be read.
+    fn step_topic_install(&self) -> StepResult {
+        let topic = self.topic();
+        std::fs::create_dir_all(topic.join("PDFs")).map_err(|e| e.to_string())?;
+        std::fs::write(topic.join("notes.txt"), "Quote from the builder. Tiles ordered at Tilehouse.\n").map_err(|e| e.to_string())?;
+        std::fs::write(topic.join("PDFs").join("quote.pdf"), "%PDF-1.4 fixture\n").map_err(|e| e.to_string())?;
+        let out = self.install_with(&topic, &["--topic"])?;
+        if !out.ok() {
+            return Err(out.describe());
+        }
+        for promised in ["is now a topic", "Kitchen renovation"] {
+            if !out.stdout.contains(promised) {
+                return Err(format!("install --topic never said {promised:?}:\n{}", out.stdout));
+            }
+        }
+        for forbidden in ["could not be read", "REFUSED", "not a git", "  ! ", "\n! "] {
+            if out.stdout.contains(forbidden) || out.stderr.contains(forbidden) {
+                return Err(format!("install --topic printed {forbidden:?}:\n{}\n{}", out.stdout, out.stderr));
+            }
+        }
+        let mut names: Vec<String> = std::fs::read_dir(&topic)
+            .map_err(|e| e.to_string())?
+            .map(|e| e.map(|e| e.file_name().to_string_lossy().to_string()).map_err(|e| e.to_string()))
+            .collect::<Result<_, _>>()?;
+        names.sort();
+        if names != [".thor-project", "PDFs", "notes.txt"] {
+            return Err(format!("the topic folder holds {names:?}, expected only one new file beside the user's own"));
+        }
+        let again = self.install_with(&topic, &["--topic"])?;
+        if !again.ok() || again.stdout.lines().any(|l| l.starts_with("+ ")) {
+            return Err(format!("a second `install --topic` changed something:\n{}", again.stdout));
+        }
+        let broad = self.install_with(&self.home(), &["--topic"])?;
+        if broad.ok() || !broad.stderr.contains("too broad to be one topic") || self.home().join(".thor-project").exists() {
+            return Err(format!("the home folder was not refused as a topic:\n{}", broad.describe()));
+        }
+        Ok("registered without git, one file added, second run quiet, home folder refused".to_string())
+    }
+
+    /// Doctor, run from inside the topic, opens with plain OK lines.
+    fn step_topic_doctor(&self) -> StepResult {
+        let mut cmd = self.command("doctor");
+        cmd.current_dir(self.topic()).arg("--db").arg(self.db());
+        let out = run(cmd, None, STEP_TIMEOUT)?;
+        if !out.ok() {
+            return Err(out.describe());
+        }
+        let head: Vec<&str> = out.stdout.lines().take(12).collect();
+        let head = head.join("\n");
+        for promised in [
+            "OK: your memory file is there",
+            "OK: THOR is connected to Claude Code.",
+            "OK: your assistant can save notes.",
+            "OK: this folder has its own memory, under the name 'Kitchen renovation'.",
+        ] {
+            if !head.contains(promised) {
+                return Err(format!("doctor's opening lines never said {promised:?}:\n{head}"));
+            }
+        }
+        if out.stdout.contains("NOT USABLE") {
+            return Err(format!("doctor called the topic's working copy unusable:\n{}", out.stdout));
+        }
+        Ok("opens with a plain summary, all OK".to_string())
+    }
+
+    /// A note filed under the topic through the packaged `mcp`, started in the
+    /// topic folder, comes back at session start in that folder - and not in
+    /// another one.
+    fn step_topic_memory_is_its_own(&self, token: &str) -> StepResult {
+        self.remember_in(&self.topic(), "smoke-topic-note", token, Some("Kitchen renovation"))?;
+        let served = self.session_start_in(&self.topic(), token)?;
+        // Another folder must not be shown the topic's note.
+        match self.session_start_in(&self.elsewhere(), token) {
+            Ok(_) => Err("the topic's note was served in an unrelated folder".to_string()),
+            Err(_) => Ok(format!("{served}; not served elsewhere")),
+        }
+    }
+
+    /// What the person sees when the first-session hold stops the turn: the
+    /// assistant's own text is untouched and one plain sentence travels
+    /// beside it.
+    fn step_hold_has_a_plain_line(&self) -> StepResult {
+        let stdout = self.run_hook(
+            "Stop",
+            &self.elsewhere(),
+            json!({
+                "hook_event_name": "Stop",
+                "session_id": "release-smoke-stop",
+                "cwd": self.elsewhere().display().to_string(),
+                "stop_hook_active": false,
+                "last_assistant_message": ""
+            }),
+        )?;
+        let parsed: Value =
+            serde_json::from_str(stdout.trim()).map_err(|e| format!("Stop output is not JSON ({e}): {stdout}"))?;
+        if parsed["decision"] != json!("block") {
+            return Err(format!("a new memory's first turn end was not held:\n{stdout}"));
+        }
+        let line = parsed["systemMessage"].as_str().ok_or_else(|| format!("the hold carries no plain line:\n{stdout}"))?;
+        if !line.contains("setup questions") || line.contains('\n') {
+            return Err(format!("the plain line is not one plain sentence about setup: {line}"));
+        }
+        Ok(format!("held, with: {line}"))
     }
 }
 
@@ -651,6 +799,11 @@ fn a_new_user_can_install_and_use_the_shipped_programs() {
     step("install inside a project (step 5)", smoke.step_project_install());
     step("remember through mcp over stdio (step 6)", smoke.step_remember_through_mcp(token));
     step("SessionStart hook serves the note back", smoke.step_session_start_serves_it(token));
+    // A person who wants THOR for a subject, not for code (AGENTS.md 5b).
+    step("topic folder: install --topic, no git (5b)", smoke.step_topic_install());
+    step("topic folder: doctor opens with a plain summary", smoke.step_topic_doctor());
+    step("topic folder: its own memory, served only there", smoke.step_topic_memory_is_its_own("topic-quartz-8812"));
+    step("a held turn carries one plain sentence", smoke.step_hold_has_a_plain_line());
 
     assert!(failed.is_empty(), "release smoke FAILED {} step(s): {}", failed.len(), failed.join("; "));
     println!("release smoke: all steps passed");

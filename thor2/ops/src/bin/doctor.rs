@@ -103,6 +103,15 @@ fn main() -> ExitCode {
     let checkouts_root = ops::health::resolve_checkouts_root(cli.checkouts.as_deref(), &cwd);
     let checkouts = checkouts_root.as_path();
 
+    // The short version first, in plain words. Not for the fast `--eval` form
+    // (a routine reads that one) and not for `--gate` (a script runs that one).
+    if !cli.eval && !cli.gate {
+        let settings = ops::install::default_settings_path();
+        let mcp_json = ops::install::default_user_mcp_path();
+        for line in ops::health::plain_summary(&cli.db, &cwd, settings.as_deref(), mcp_json.as_deref()) {
+            println!("{line}");
+        }
+    }
     println!("{}", ops::health::checkouts_root_line(&checkouts_root));
     // THOR failing to run at all comes before the per-component lines, because
     // nothing below can be trusted while it holds: a running tool server older

@@ -63,7 +63,7 @@ fn no_mcp_still_writes_the_eval_command_with_both_placeholders_substituted() {
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("wrote the evaluation routine to"),
+        stdout.contains("added the command /thor-eval for your assistant"),
         "a fresh install must report writing the eval command even under --no-mcp:\n{stdout}"
     );
 
@@ -103,7 +103,7 @@ fn a_second_no_mcp_install_leaves_the_eval_command_untouched() {
     assert!(second.status.success(), "stderr: {}", String::from_utf8_lossy(&second.stderr));
     let stdout = String::from_utf8_lossy(&second.stdout);
     assert!(
-        stdout.contains("eval command already at"),
+        stdout.contains("the /thor-eval command was already there"),
         "a second install must report the eval command as already there:\n{stdout}"
     );
     assert_eq!(

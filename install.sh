@@ -98,6 +98,6 @@ fi
 say "Setting up..."
 "$DEST/install"
 
-say ""
-say "Done. Restart Claude Code so it picks up the memory server."
-say "Check on it any time with: $DEST/doctor --db <your store>"
+# The setup above has already printed what it did and the one step left for
+# you. Nothing more is said here: a second, shorter "Done" that disagreed with
+# the first was one more thing a newcomer had to reconcile.

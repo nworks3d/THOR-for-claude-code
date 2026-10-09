@@ -636,7 +636,7 @@ fn decay_notice(store: &EventStore, db: &Path, cwd: Option<&Path>) -> Option<Str
     let doctor = sibling("doctor").unwrap_or_else(|| PathBuf::from("doctor"));
     let checkouts = root.parent().unwrap_or(&root);
     Some(format!(
-        "[THOR] {project}: {dead} anchor(s) point at a file that is not there, so those facts fire nowhere, and {failing} proof(s) now come out false. Run `\"{}\" --db \"{}\" --checkouts \"{}\"` to see each one named on the decay line, then repair per id with revise (the file moved) or retract (the fact went with it). That report counts EVERY project under the checkouts directory, so its two numbers are larger than this line's, which counts only {project}.",
+        "[THOR] Some of what THOR remembers may be out of date. {project}: {dead} note(s) point at a file that has moved or gone, and {failing} no longer match the files. Nothing is broken; just ask your assistant to tidy the memory. (For your assistant: run `\"{}\" --db \"{}\" --checkouts \"{}\"` to see each one on the decay line, then repair per id with revise when the file moved or retract when the fact went with it. That report counts EVERY project under the checkouts directory, so its numbers are larger than this line's, which counts only {project}.)",
         doctor.display(), db.display(), checkouts.display()
     ))
 }
@@ -1207,17 +1207,19 @@ fn plain_line_for_block(event: &str, reason: &str) -> &'static str {
         "Stop" if lower.contains("durable decision") => {
             "Your assistant is saving something you just decided, so it is remembered next time. Nothing is needed from you."
         }
-        "Stop" => "THOR asked your assistant to take care of one more small thing before it finishes. Nothing is needed from you.",
-        "PreToolUse" => {
-            "THOR stopped one action your assistant was about to take, because of a rule that was saved earlier. Your assistant will explain or choose another way. Nothing is needed from you."
-        }
-        _ => "THOR asked your assistant to pause and check one thing. Nothing is needed from you.",
+        _ => "THOR asked your assistant to take care of one more small thing before it finishes. Nothing is needed from you.",
     }
 }
 
-/// `plain_line_for_block` applied to a block, once, as `systemMessage`.
-/// Anything that is not a block is returned unchanged.
+/// `plain_line_for_block` applied to a block at STOP, once, as
+/// `systemMessage`. Anything else is returned unchanged: a PreToolUse refusal
+/// is a different channel whose exact bytes are pinned by the golden files in
+/// `serve/tests/data/hook_golden`, and the person's confusing moment is the
+/// turn that will not end.
 fn with_line_for_the_person(event: &str, out: Option<HookOutput>) -> Option<HookOutput> {
+    if event != "Stop" {
+        return out;
+    }
     match out {
         Some(HookOutput::Decision(mut verdict)) => {
             let is_block = verdict.get("decision").and_then(Value::as_str) == Some("block");
@@ -1253,8 +1255,6 @@ mod line_for_the_person_tests {
             ("Stop", "[THOR] The evaluation of 'x' is still open"),
             ("Stop", "[THOR] The owner may have just stated a NEW durable decision"),
             ("Stop", "[THOR] a reply rule fired"),
-            ("PreToolUse", "[THOR] rule r1 forbids this text"),
-            ("UserPromptSubmit", "[THOR] anything"),
         ];
         for (event, reason) in cases {
             let out = with_line_for_the_person(event, block(reason));
@@ -1267,6 +1267,13 @@ mod line_for_the_person_tests {
                 assert!(!line.contains(jargon), "{event}: the plain line must not use {jargon:?}: {line}");
             }
         }
+    }
+
+    #[test]
+    fn a_tool_call_refusal_is_left_exactly_as_it_was() {
+        let out = with_line_for_the_person("PreToolUse", block("[THOR] rule r1 forbids this text"));
+        let Some(HookOutput::Decision(v)) = out else { panic!("lost the block") };
+        assert!(v.get("systemMessage").is_none(), "{v}");
     }
 
     #[test]
@@ -4338,7 +4345,7 @@ mod decay_notice_tests {
         anchored_rule(&mut store, "moved-file", "Some-Project", "firmware/src/secrets.h", vec![]);
 
         let notice = decay_notice(&store, &db, Some(&root)).expect("an untagged dead anchor is decay");
-        assert!(notice.contains("Some-Project: 1 anchor(s) point at a file that is not there"), "{notice}");
+        assert!(notice.contains("Some-Project: 1 note(s) point at a file that has moved or gone"), "{notice}");
     }
 
     /// THE DEFECT THIS CLOSES: doctor's decay line counts a dead DIRECTORY
@@ -4375,7 +4382,7 @@ mod decay_notice_tests {
 
         model::store::declare(&mut store, "t", "t", "t", &dir_rule("gone-dir", "fleet/gone", vec![])).unwrap();
         let notice = decay_notice(&store, &db, Some(&root)).expect("a dead Dir anchor is decay");
-        assert!(notice.contains("Some-Project: 1 anchor(s)"), "{notice}");
+        assert!(notice.contains("Some-Project: 1 note(s)"), "{notice}");
     }
 
     /// Scope: another project's dead anchor, under the same checkouts folder,
@@ -4391,7 +4398,7 @@ mod decay_notice_tests {
 
         anchored_rule(&mut store, "a-gone", "Project-A", "fleet/web/app.js", vec![]);
         let notice = decay_notice(&store, &db, Some(&root)).expect("A's own dead anchor must count");
-        assert!(notice.contains("Project-A: 1 anchor(s)"), "{notice}");
+        assert!(notice.contains("Project-A: 1 note(s)"), "{notice}");
     }
 }
 
