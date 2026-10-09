@@ -23,13 +23,13 @@ Most notes only inform: pinned so they are handed over at the start of
 every session, or surfaced the first time your assistant reaches for the
 file or command they are about.
 
-A note that keeps being served without ever being judged makes THOR stop
-the turn and ask whether it helped or got in the way. Two bad verdicts in
-a row retire a note from being served again, though it stays there if you
-go looking for it. That ask only ever names a note your own session
-actually saw fire - never one that only ever showed up during other,
-unrelated work. Answer for a note once and this session leaves it alone for
-good, no matter how many more times it fires before you are done.
+A note that keeps being served without ever being judged is asked about in
+one block, not one note at a time: the end-of-session review (`/thor-eval`),
+which THOR asks for about once a week per project. THOR does not stop an
+ordinary turn to ask whether one note helped or got in the way. The review
+only names a note your own session actually saw fire - never one that only
+ever showed up during other, unrelated work. Two bad verdicts in a row retire
+a note from being served again, though it stays there if you go looking for it.
 
 A health check names what has rotted, out loud: proofs that now come out
 false, notes pointing at nothing, notes too crowded to ever be shown.
@@ -187,19 +187,20 @@ to looks exactly like a safety net that works.
 
 ### THOR asks, so you do not have to remember to
 
-Leaving that to whoever thinks of it means it never happens. So THOR asks, by
-itself, in two places.
+Leaving that to whoever thinks of it means it never happens. So THOR does it
+by itself, in two places.
 
-**When a note is written.** A note you call expensive, or one that spells out a
-command, a flag or a filename, is not stored until one question is answered: is
-there a text whose presence *means* the mistake is happening? If there is, the
-note gets a proof built on exactly that text. If there is not - and often there
-is not, because "check with me first" has nothing to catch - you say so and the
-note goes in unchanged. Both are real answers. Only saying nothing is not.
+**When a note is written.** You are not asked whether the note can be checked:
+THOR tries it. A rule that spells out a command, a flag or a filename is run
+through the same guard that watches your files and commands. If a check built
+on its own words really refuses the wrong change and lets ordinary changes
+through, the note is stored as a rule that can refuse. If no check holds, it is
+stored as a plain note: it still comes back at the right moment, it just cannot
+refuse anything. A note that is turned down says what to write instead.
 
-**For the notes you already had.** Once per session, THOR picks one note that
-names something concrete, has never been asked, and holds the turn until it is.
-One at a time, forever, so a memory written before any of this existed still
+**For the notes you already had.** THOR sorts the older notes itself at the
+start of each review (below). Only what needs your assistant's own judgement is
+handed over, in one block, so a memory written before any of this existed still
 gets worked through instead of being declared hopeless.
 
 A caution worth stating plainly: THOR can prove that a note is *wired* so a
@@ -209,13 +210,11 @@ guards nothing. That is why the health check reports two different numbers - how
 many notes could refuse something, and how many ever actually did. Trust the
 second one.
 
-Asking about one note at a time is a brake, not a broom: it keeps the pile
-from growing while you work, not a way to clear it in one sitting. For that,
-run `/thor-eval` at the end of a session. It walks through everything the
-memory has been served without a verdict, repairs what has quietly drifted
-out of date, and settles the debt in one pass instead of one note a day. A
-session that never runs it simply leaves that debt for the next one to
-inherit.
+The review is the broom: run `/thor-eval` at the end of a session. It walks
+through everything the memory has been served without a verdict, repairs what
+has quietly drifted out of date, and settles the debt in one pass instead of
+one note at a time. A session that never runs it simply leaves that debt for
+the next one to inherit.
 
 You do not have to remember to run it. Once a project has had an hour of work
 since its last review, and your assistant has put in at least ten minutes of
@@ -260,13 +259,15 @@ at the right moment and hope. Version 2 is the same memory with a spine.
   is held only for something the session did itself: a note it just filed where
   it will never be seen, a setup left undone, a decision you stated that was not
   stored. It will not be waved off with a promise to do it later.
-- **A copy of the memory is kept somewhere else, and you choose where.** Once a
-  day, and when a conversation starts, THOR writes the whole memory into a
-  private git repository on your machine and sends it on. If that repository has
-  a remote called `nas` (a folder on a NAS or another computer you own), the copy
-  goes there by itself and nowhere else; without one it goes to the remote the
-  repository already follows. `doctor` says where the last copy went and how
-  long ago, or that it has been failing and why. Getting it back is one command.
+- **A copy of the memory can be kept somewhere else, and you choose.** A backup
+  is a choice you make at the first session; the install does not switch one on
+  for you. Once you choose one, THOR writes the whole memory into a private git
+  repository on your machine about once a day and sends it on. If that
+  repository has a remote called `nas` (a folder on a NAS or another computer
+  you own), the copy goes there by itself and nowhere else; without one it goes
+  to the remote the repository already follows. `doctor` says where the last
+  copy went and how long ago, or that it has been failing and why. Getting it
+  back is one command.
 - **It costs almost nothing to carry.** A note is capped at 300 characters and a
   block at four notes and 1200 characters, so what lands in the conversation is
   a few hundred tokens, not a whole rules file re-read on every turn. A memory
@@ -433,9 +434,11 @@ thor2/target/release/install.exe
 It finds your assistant's own two configuration files by itself, creates your
 memory if you do not have one yet, wires THOR into your assistant, and registers
 the part your assistant writes through. It also installs a shared set of git
-hooks that run in every repository on this machine, which keeps the reading of
-your code fresh after each commit, and each one hands control back to your
-repository's own hooks so nothing already there stops working. It backs up both
+hooks that run in every repository on this machine (unless another tool already
+set git's global hooks folder, in which case THOR leaves that alone and says so),
+which keeps the reading of your code fresh after each commit, and each one hands
+control back to your repository's own hooks so nothing already there stops
+working. It backs up both
 files before it touches
 them, it never removes anything it did not put there, and running it twice
 changes nothing the second time.
@@ -597,13 +600,12 @@ simply nothing yet to refuse with.
 
 **Your first note will probably be turned down.** It asks for two things most
 people leave out: when the note should come back to you, and what would show it
-had gone wrong. If the note is about something expensive, or names a command or
-a filename, it asks a third: is there a text whose presence means the mistake is
-happening? Answering "no, there is nothing to catch here" is enough, and often
-it is the truthful answer. The refusal names everything that is missing at once
-and says what to write instead, so the second attempt usually lands. It is
-strict on purpose - a note nobody can ever prove wrong is a note that quietly
-stops being true.
+had gone wrong. If the note names a command or a filename, THOR also tries to
+build a check from your own words; when none holds, the note is stored as a
+plain note that can inform but not refuse, and that is fine. The refusal names
+everything that is missing at once and says what to write instead, so the
+second attempt usually lands. It is strict on purpose - a note nobody can ever
+prove wrong is a note that quietly stops being true.
 
 **The value arrives once you have notes about real places.** A note tied to a
 file, a folder or a command comes back exactly when you touch that thing. A
@@ -621,9 +623,9 @@ Everything above describes a memory that starts empty. If you are coming from
 version 1, or from any pile of notes written before proofs existed, the shape is
 different and worth saying plainly, because the obvious plan does not work.
 
-THOR asks you about one old note per session. That is a brake, not a broom. It
-keeps the pile from growing while you work, and it was never meant to clear one:
-at one a day, a backlog of thousands outlives you.
+THOR's weekly review handles a limited batch of old notes each time. That is a
+brake, not a broom. It keeps the pile from growing while you work, and it was
+never meant to clear one: a backlog of thousands outlives you at that pace.
 
 The broom is the health check, pointed at the folder your projects actually live
 in:
@@ -686,6 +688,47 @@ code lane:
 
 - `library` - read a shelf's index, one entry, or search across shelves
 - `shelve` - file a new entry, correct one that already exists, or retire one
+
+## Remove THOR completely
+
+Everything the install put on your computer is listed here, with how to undo
+each piece. Nothing is hidden anywhere else. Your own projects and their code
+are never changed, apart from the one small file in step 9. Your assistant can
+do all of this for you if you ask; these are the steps in plain words.
+
+1. **Close Claude Code completely.** It reads its settings once, when it opens.
+2. **Keep a copy of your notes first, if you might want them again.** Copy the
+   memory folder from step 7 somewhere safe. Deleting it in step 7 cannot be
+   undone.
+3. **Take the four THOR lines out of Claude Code's settings.** Open
+   `settings.json` in the `.claude` folder inside your home folder. Under
+   `hooks`, delete the entries for `SessionStart`, `PreToolUse`,
+   `UserPromptSubmit` and `Stop` whose command names THOR's `serve` program and
+   ends in `hook`. If you chose a backup, delete the one entry that runs the
+   backup program as well. Leave every other entry alone.
+4. **Take THOR out of the tool list.** Open `.claude.json` in your home folder
+   and delete the entry called `thor` under `mcpServers`.
+5. **Delete the `/thor-eval` command.** It is the file `thor-eval.md` in the
+   `commands` folder inside the `.claude` folder in your home folder.
+6. **Undo THOR's git setting, only if it is THOR's.** Run
+   `git config --global --get core.hooksPath`. If the folder it prints ends in
+   `thor2/githooks` (or `thor2\githooks`), run
+   `git config --global --unset core.hooksPath`. If it prints some other
+   folder, or nothing, leave it alone: it is not THOR's.
+7. **Delete the memory folder.** On Windows that is `%LOCALAPPDATA%\thor2`, on
+   Linux `~/.local/share/thor2` (the install printed it on its `memory:` line).
+   It holds your notes, the small files beside them (the reply rules, the modes,
+   the weekly-check clock), THOR's reading of your code, its git helpers, and
+   the backup folder if you chose one.
+8. **Delete the programs.** On Windows that is `thor2` in your home folder, on
+   Linux `~/.thor2`.
+9. **Delete the hidden `.thor-project` file** in each folder where you ran the
+   install with `--topic` or `--project`. It is the only thing THOR ever put
+   inside one of your own folders.
+10. **Open Claude Code again.** A new conversation should start without any THOR
+    block, and `/thor-eval` should be gone. The `settings.json.bak` and
+    `.claude.json.bak` copies the install made can be deleted; do not restore
+    them, they predate anything else you changed since.
 
 ## Documentation
 

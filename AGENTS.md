@@ -190,7 +190,10 @@ did not put there, and a second run changes nothing.
 
 It also points git at a shared set of hooks that run in every repository on this
 machine, not only this one - each one still finishes by running that repository's
-own hook, so nothing already there stops working.
+own hook, so nothing already there stops working. If git's global hooks folder
+(`core.hooksPath`) is already set to something else, the install leaves it alone
+and says so; the shared hooks are then not wired, and searching a project's code
+does not update by itself after a commit until that is sorted out.
 
 It also writes an end-of-session routine, `/thor-eval`, to your own commands
 folder. Run it at the end of a session: it walks through everything the memory has
@@ -310,12 +313,12 @@ call. If a restart never happened, the tool is simply missing - that is step 3 a
 
 ## Backup
 
-Once a day THOR writes a copy of the memory into a git repository it keeps beside the
-store (the install says where, and the command is `backup.exe --db "<their store>"
---repo "<that folder>"`). Do not ask them about it: the default, a local copy, is
-already on. Only when they ask for the copy to live somewhere else, tell them the
-options: another folder on their NAS or any machine they own is the safe choice, a
-private repository on a website the other. To send it to a NAS, create an empty bare
+The install does not set a backup up: a backup is a choice the person makes at the
+first session (it is one of the numbered first-session items below). Once they choose
+one, THOR writes a copy of the memory into a git repository it keeps beside the store
+(the command is `backup.exe --db "<their store>" --repo "<that folder>"`). Where the
+copy lives is theirs to say. There are two options: another folder on their NAS or
+any machine they own (the safe choice), or a private repository on a website. To send it to a NAS, create an empty bare
 repository there (`git init --bare <folder on the NAS>`), add it to the backup folder
 as a remote called `nas` (`git -C "<that folder>" remote add nas <the NAS folder>`),
 and push the branch once by name (`git -C "<that folder>" push nas main`). From then
@@ -419,8 +422,10 @@ found in every part of a command, though: after `cd x &&`, on a later line,
 inside `ssh host "..."` or `bash -c '...'`. For a `requires` trigger that names
 a family of names, end it with one `*`: `/thor*` catches `/thor-probe` and
 `/thor2`. A call that does nothing is never refused by a forbidden, `requires`
-or owner-approval rule: one that only asks for `--help` or `--version`, any call
-with `--help` in it, a `git push --dry-run` (or `-n`), or a PowerShell call with
+or owner-approval rule: one that only asks for `--help` or `--version`, a call
+with `--help` as the first word after the command (or after one subcommand word,
+as in `docker compose up --help`; a `--help` further along does not count), a
+`git push --dry-run` (or `-n`), or a PowerShell call with
 `-WhatIf`. The flag has to be on the same command as the rule's, not on a later
 one joined by `&&` or `;`.
 
@@ -721,7 +726,11 @@ something it names - the verdicts and repairs are yours.
 THOR asks for one small thing at a time and will not let the turn close until
 it is settled: a note you just stored onto a place too full to ever show it, the
 first-session setup, a decision of the owner you did not store, a reply that
-breaks one of the reply rules - and the evaluation. Each has one honest way out, and the message says which. Saying it
+breaks one of the reply rules, a rule that could no longer prove it still holds
+and that was met when a file was written (the stale-rule guard: once per
+session, settle it with `revise` or `retract`; it can be switched off by writing
+`{"mode": "off"}` into `stale-guard-mode.json` beside the store) - and the
+evaluation. Each has one honest way out, and the message says which. Saying it
 in your reply settles nothing - the fix has to be a real change to the note, or
 the tag that records the decision. No tag decides a rule's teeth: only its trial
 does. What it never does at a turn's end: ask for a verdict on a note that keeps
@@ -883,10 +892,9 @@ Claude Code can change the format it writes that record in. THOR then cannot
 check any filing, so it asks for no evaluation, and says so on every turn until
 THOR itself is updated. Nothing you do fixes it: tell the owner.
 
-The question about one note only ever names a note THIS session actually saw
-fire - never one that only ever showed up during other, unrelated work. Answer
-for one and this session will not ask about that same note again, however many
-more times it fires before the session ends.
+The verdict list of an evaluation only ever names a note THIS session actually
+saw fire - never one that only ever showed up during other, unrelated work.
+There is no separate question about one note at the end of an ordinary turn.
 
 ## When THOR finds a bug in itself (the co-tester section)
 
@@ -958,3 +966,5 @@ apart, not an error to work around.
 - [thor2/README.md](thor2/README.md) - the program: how it is built, what each part does
 - [thor2/CONTRACT.md](thor2/CONTRACT.md) - the standard it is judged against
 - [thor2/SPEC-ENFORCEMENT.md](thor2/SPEC-ENFORCEMENT.md) - how a note proves itself
+- [docs/WHAT-THOR-DOES.md](docs/WHAT-THOR-DOES.md) - full reference: what THOR arranges, enforces and refuses, and why
+- [README.md, "Remove THOR completely"](README.md#remove-thor-completely) - every piece the install wrote and how to undo it, for when the person asks to uninstall
