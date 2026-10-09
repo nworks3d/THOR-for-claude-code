@@ -495,6 +495,10 @@ fn requires_in(
 /// judged by the global rules only): a folder that resolves to such a project, and a
 /// repository the same call makes itself (`scratch_made_by`: `git init <dir>`,
 /// `git clone <local source> [dir]` of a folder that is not there yet).
+/// The exception that keeps a push ban from being walked around: such a
+/// repository that shares a remote with a known project's registered working
+/// copy (a second clone of the same repository, in a folder of another name)
+/// is that project's (`Live::project_of_remote`).
 ///
 /// A folder written with a variable (`git -C $b push`, `cd $b`) is read with
 /// the variables the segments before it certainly set (`shell::env_before`);
@@ -544,8 +548,10 @@ pub fn segment_projects(
                 match folder {
                     Some(other) if session_project != Some(other.as_str()) && live.knows_project(&other) => Some(other),
                     // git acts on the repository that holds its folder: one of no project this
-                    // store knows is not the session's project.
-                    Some(other) if git && session_project != Some(other.as_str()) => None,
+                    // store knows is not the session's project - unless it is a clone of a known
+                    // project's repository (a remote shared with that project's working copy), in
+                    // a folder of another name: it is still that project's, and its pushes are.
+                    Some(other) if git && session_project != Some(other.as_str()) => live.project_of_remote(dir),
                     _ => session,
                 }
             }
@@ -618,11 +624,55 @@ pub struct Live<'a> {
     store: &'a EventStore,
     items: std::cell::OnceCell<Vec<LiveItem>>,
     projects: std::cell::OnceCell<HashSet<String>>,
+    /// Each known project's registered remotes, normalised, to the project.
+    remote_owners: std::cell::OnceCell<HashMap<String, String>>,
 }
 
 impl<'a> Live<'a> {
     pub fn of(store: &'a EventStore) -> Self {
-        Live { store, items: std::cell::OnceCell::new(), projects: std::cell::OnceCell::new() }
+        Live {
+            store,
+            items: std::cell::OnceCell::new(),
+            projects: std::cell::OnceCell::new(),
+            remote_owners: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// The known project whose registered working copy shares a remote with
+    /// the repository that holds `dir`: a second clone of a project's repository
+    /// in a folder of another name is still that project. Remotes are read from
+    /// the git config files alone (`checkout::remote_urls`), spelled alike
+    /// whatever the scheme, `.git` suffix or case (`checkout::normalise_remote`),
+    /// and the registry is read once per `Live`. `None` when `dir` is no
+    /// repository, has no remote, shares none, or anything is unreadable - the
+    /// answer a repository of no known project already gets.
+    pub fn project_of_remote(&self, dir: &Path) -> Option<String> {
+        let owners = self.remote_owners.get_or_init(|| {
+            let mut known: Vec<&String> = self.projects.get_or_init(|| self.known_projects()).iter().collect();
+            known.sort();
+            let mut owners = HashMap::new();
+            for project in known {
+                let Some((root, _)) = model::store::registered_root_raw(self.store, project) else { continue };
+                for url in model::checkout::remote_urls(&root) {
+                    if let Some(remote) = model::checkout::normalise_remote(&url) {
+                        owners.entry(remote).or_insert_with(|| project.clone());
+                    }
+                }
+            }
+            owners
+        });
+        if owners.is_empty() {
+            return None;
+        }
+        let top = model::checkout::git_root(dir)?;
+        model::checkout::remote_urls(&top)
+            .iter()
+            .filter_map(|url| model::checkout::normalise_remote(url))
+            .find_map(|remote| owners.get(&remote).cloned())
+    }
+
+    fn known_projects(&self) -> HashSet<String> {
+        self.items().iter().filter_map(|li| li.item.project.clone()).collect()
     }
 
     /// Every live item of the store (`live::live_items`).
@@ -634,7 +684,7 @@ impl<'a> Live<'a> {
     /// this memory knows (a project record written by install counts, being
     /// one).
     pub fn knows_project(&self, project: &str) -> bool {
-        self.projects.get_or_init(|| self.items().iter().filter_map(|li| li.item.project.clone()).collect()).contains(project)
+        self.projects.get_or_init(|| self.known_projects()).contains(project)
     }
 }
 

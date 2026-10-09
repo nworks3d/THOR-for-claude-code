@@ -285,6 +285,93 @@ pub fn validate_checkout(root: &Path, project: &str) -> Result<PathBuf, RootProb
     Ok(root)
 }
 
+// ------------------------------------------------------------ remotes, no process
+
+/// Every URL the repository at `repo_root` names for a remote (`url` and
+/// `pushurl` of each `[remote "..."]` section of its git config), read from the
+/// config FILE: no process is started, no network is touched. `repo_root` is
+/// the top of a checkout; a linked worktree's `.git` file is followed to the
+/// repository's common config. Empty on anything unreadable, so a caller that
+/// is only looking for a match simply finds none.
+pub fn remote_urls(repo_root: &Path) -> Vec<String> {
+    let Some(config) = config_file(repo_root) else { return Vec::new() };
+    let Ok(text) = std::fs::read_to_string(config) else { return Vec::new() };
+    let mut urls = Vec::new();
+    let mut in_remote = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(header) = line.strip_prefix('[') {
+            let name = header.split(|c: char| c.is_whitespace() || c == ']').next().unwrap_or("");
+            in_remote = name.eq_ignore_ascii_case("remote") && header.contains('"');
+            continue;
+        }
+        if !in_remote {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else { continue };
+        if !(key.trim().eq_ignore_ascii_case("url") || key.trim().eq_ignore_ascii_case("pushurl")) {
+            continue;
+        }
+        let value = value.trim();
+        let value = match value.strip_prefix('"') {
+            Some(quoted) => quoted.split('"').next().unwrap_or(""),
+            None => value.split(['#', ';']).next().unwrap_or("").trim(),
+        };
+        if !value.is_empty() {
+            urls.push(value.to_string());
+        }
+    }
+    urls
+}
+
+/// The git config file of the checkout at `root`: `.git/config`, or, when
+/// `.git` is a worktree pointer file, the common repository's config.
+fn config_file(root: &Path) -> Option<PathBuf> {
+    let dot_git = root.join(".git");
+    if dot_git.is_dir() {
+        return Some(dot_git.join("config"));
+    }
+    let content = std::fs::read_to_string(&dot_git).ok()?;
+    let gitdir = content.lines().find_map(|l| l.trim().strip_prefix("gitdir:"))?.trim();
+    let gitdir = root.join(gitdir);
+    match std::fs::read_to_string(gitdir.join("commondir")) {
+        Ok(common) => Some(gitdir.join(common.trim()).join("config")),
+        Err(_) => Some(gitdir.join("config")),
+    }
+}
+
+/// A remote URL in the one form two spellings of the same remote share:
+/// `host/owner/repo`, lowercase, with no scheme, user, port, trailing slash or
+/// `.git`. `https://Host/Owner/Repo.git`, `ssh://git@host:22/owner/repo` and
+/// `git@host:owner/repo` all read `host/owner/repo`. `None` for a URL that
+/// names no host (a local path, `file://`, a Windows drive path), which never
+/// identifies a remote.
+pub fn normalise_remote(url: &str) -> Option<String> {
+    let url = url.trim();
+    let (host, path) = match url.split_once("://") {
+        Some((scheme, _)) if scheme.eq_ignore_ascii_case("file") => return None,
+        Some((_, rest)) => {
+            let (authority, path) = rest.split_once('/')?;
+            let host = authority.rsplit('@').next()?.split(':').next()?;
+            (host, path)
+        }
+        None => {
+            let (left, path) = url.split_once(':')?;
+            let host = left.rsplit('@').next()?;
+            if host.len() < 2 || host.contains(['/', '\\']) {
+                return None;
+            }
+            (host, path)
+        }
+    };
+    let path = path.trim_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path).trim_end_matches('/');
+    if host.is_empty() || path.is_empty() {
+        return None;
+    }
+    Some(format!("{}/{}", host.to_lowercase(), path.to_lowercase()))
+}
+
 // ------------------------------------------------------------ git, read only
 
 /// `git -C <root> <args>`, its stdout when it succeeds. Read-only callers
@@ -445,4 +532,45 @@ pub fn read_time_blocker(store: &EventStore, item: &Item) -> Option<Blocker> {
         return None;
     }
     in_blob(&root, &default_branch(&root), path, literal).then(|| Blocker::WorkingTreeDiffers { path: path.clone() })
+}
+
+#[cfg(test)]
+mod remote_tests {
+    use super::*;
+
+    #[test]
+    fn two_spellings_of_one_remote_read_the_same() {
+        let same = [
+            "https://example.invalid/Owner/Repo.git",
+            "https://user:secret@EXAMPLE.invalid/owner/repo/",
+            "ssh://git@example.invalid:22/owner/repo.git",
+            "git@example.invalid:owner/repo.git",
+            "example.invalid:owner/repo",
+        ];
+        for url in same {
+            assert_eq!(normalise_remote(url).as_deref(), Some("example.invalid/owner/repo"), "{url}");
+        }
+        assert_ne!(normalise_remote("https://example.invalid/owner/other.git"), normalise_remote(same[0]));
+        assert_ne!(normalise_remote("https://example.invalid/other/repo.git"), normalise_remote(same[0]));
+    }
+
+    #[test]
+    fn a_local_path_names_no_remote() {
+        for url in ["/srv/git/repo.git", "../repo", "C:/work/repo", r"C:\work\repo","file:///srv/repo.git", "", "https://example.invalid"] {
+            assert_eq!(normalise_remote(url), None, "{url:?}");
+        }
+    }
+
+    #[test]
+    fn remote_urls_come_from_the_config_file_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        std::fs::write(
+            tmp.path().join(".git/config"),
+            "[core]\n\turl = not-a-remote\n[remote \"origin\"]\n\turl = https://example.invalid/o/r.git\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n[remote \"nas\"]\n\tPushURL = \"git@example.invalid:o/r.git\" # backup\n[branch \"main\"]\n\turl = nope\n",
+        )
+        .unwrap();
+        assert_eq!(remote_urls(tmp.path()), vec!["https://example.invalid/o/r.git", "git@example.invalid:o/r.git"]);
+        assert!(remote_urls(&tmp.path().join("not-there")).is_empty());
+    }
 }

@@ -463,3 +463,124 @@ fn named(item: &model::item::Item) -> model::item::Item {
     }
     out
 }
+
+// ------------------------------------- a clone of a known project's repository
+//
+// A repository of no known project is not the session's (above), but a second
+// clone of a known project's repository, in a folder of another name, is still
+// that project's: it shares a remote with the project's registered working
+// copy, so the project's push ban reaches a push from it. Remotes are read from
+// the git config files alone; the URLs here are neutral fixtures.
+
+/// Register `root` as `key`'s working copy, the way the installer writes it.
+fn register_root(db: &Path, key: &str, root: &Path) {
+    let record = Item {
+        id: model::store::project_opened_id(key),
+        kind: Kind::Report,
+        text: format!("Project {key}: a fixture record."),
+        bindings: vec![],
+        severity: None,
+        project: Some(key.to_string()),
+        tags: vec!["project-record".to_string()],
+        expires: None,
+        key: None,
+        falsifier: None,
+        check: None,
+    };
+    let body = model::store::canonical_body(&record).unwrap();
+    let body = format!(
+        "{},\"root\":{},\"root_at\":\"2026-09-28T10:00:00Z\"}}",
+        &body[..body.len() - 1],
+        serde_json::to_string(&root.to_string_lossy()).unwrap()
+    );
+    let mut store = thor_core::event_store::EventStore::open_existing(db).unwrap();
+    store
+        .append_event("install", "install", "installer", thor_core::event_store::EventKind::FactCreated, &record.id, None, &body)
+        .unwrap();
+}
+
+/// A repository folder named `name` (no project marker, so its folder name is
+/// the project nobody ever named) with `remote` as its origin, if any.
+fn clone_of(root: &Path, name: &str, remote: Option<&str>) -> PathBuf {
+    let dir = root.join(name);
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    let config = match remote {
+        Some(url) => format!("[core]\n\tbare = false\n[remote \"origin\"]\n\turl = {url}\n"),
+        None => "[core]\n\tbare = false\n".to_string(),
+    };
+    std::fs::write(dir.join(".git").join("config"), config).unwrap();
+    dir
+}
+
+fn alpha_with_a_remote(tmp: &Path, remote: &str) -> (PathBuf, PathBuf) {
+    let db = two_projects_with_push_rules(tmp);
+    let alpha = repo(tmp, "alpha");
+    std::fs::write(alpha.join(".git").join("config"), format!("[remote \"origin\"]\n\turl = {remote}\n")).unwrap();
+    repo(tmp, "beta");
+    register_root(&db, "alpha", &alpha);
+    (db, alpha)
+}
+
+#[test]
+fn a_clone_of_a_known_projects_repository_in_another_folder_is_that_project() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (db, _alpha) = alpha_with_a_remote(tmp.path(), "https://example.invalid/owner/alpha.git");
+    let beta = tmp.path().join("beta");
+    let second = clone_of(tmp.path(), "alpha-second-copy", Some("https://example.invalid/owner/alpha.git"));
+    let text = second.to_string_lossy().replace('\\', "/");
+    for command in [format!("git -C {text} push origin main"), format!("cd {text} && git push origin main")] {
+        let out = run_hook(&db, &bash("s-clone", &beta, &command));
+        assert!(blocked(&out) && reason(&out).contains("alpha-never-pushes"), "{command} pushes alpha's repository: {out}");
+    }
+    // Only alpha's rule reaches it: beta's force-push rule is not this clone's.
+    let out = run_hook(&db, &bash("s-clone", &beta, &format!("git -C {text} status")));
+    assert!(!blocked(&out), "{out}");
+}
+
+#[test]
+fn the_https_and_the_ssh_spelling_of_one_remote_match() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (db, _alpha) = alpha_with_a_remote(tmp.path(), "https://example.invalid/Owner/Alpha.git");
+    let beta = tmp.path().join("beta");
+    for (i, url) in ["git@example.invalid:owner/alpha.git", "ssh://git@example.invalid:22/owner/alpha", "https://example.invalid/owner/alpha/"]
+        .iter()
+        .enumerate()
+    {
+        let clone = clone_of(tmp.path(), &format!("spelling-{i}"), Some(url));
+        let text = clone.to_string_lossy().replace('\\', "/");
+        let out = run_hook(&db, &bash("s-clone", &beta, &format!("git -C {text} push origin main")));
+        assert!(blocked(&out) && reason(&out).contains("alpha-never-pushes"), "{url} is alpha's remote: {out}");
+    }
+}
+
+#[test]
+fn an_unrelated_remote_or_none_is_still_not_the_sessions_nor_alphas() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (db, alpha) = alpha_with_a_remote(tmp.path(), "https://example.invalid/owner/alpha.git");
+    let unrelated = clone_of(tmp.path(), "unrelated-clone", Some("https://example.invalid/owner/other.git"));
+    let other_owner = clone_of(tmp.path(), "other-owner-clone", Some("https://example.invalid/stranger/alpha.git"));
+    let scratch = clone_of(tmp.path(), "scratch-no-remote", None);
+    let local_only = clone_of(tmp.path(), "local-only-clone", Some(&alpha.to_string_lossy().replace('\\', "/")));
+    let text = |p: &Path| p.to_string_lossy().replace('\\', "/");
+    for folder in [&unrelated, &other_owner, &scratch, &local_only] {
+        for session_cwd in [&alpha, &tmp.path().join("beta")] {
+            let out = run_hook(&db, &bash("s-clone", session_cwd, &format!("git -C {} push origin main", text(folder))));
+            assert!(!blocked(&out), "{} shares no remote with a known project: {out}", text(folder));
+        }
+    }
+    let out = run_hook(&db, &bash("s-clone", &alpha, "git push origin main"));
+    assert!(blocked(&out) && reason(&out).contains("alpha-never-pushes"), "alpha itself is still refused: {out}");
+}
+
+#[test]
+fn an_unreadable_config_keeps_todays_answer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (db, _alpha) = alpha_with_a_remote(tmp.path(), "https://example.invalid/owner/alpha.git");
+    let beta = tmp.path().join("beta");
+    let broken = clone_of(tmp.path(), "broken-config", None);
+    std::fs::remove_file(broken.join(".git").join("config")).unwrap();
+    std::fs::create_dir(broken.join(".git").join("config")).unwrap();
+    let text = broken.to_string_lossy().replace('\\', "/");
+    let out = run_hook(&db, &bash("s-clone", &beta, &format!("git -C {text} push origin main")));
+    assert!(!blocked(&out), "no remote could be read, so it is a repository of no known project: {out}");
+}
