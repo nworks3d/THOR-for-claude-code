@@ -211,6 +211,28 @@ fn a_help_request_is_not_refused_by_a_forbidden_literal_either() {
     assert!(fx.bash("gh auth refresh -s workflow -- --help"));
 }
 
+/// Field test 15, collect 19c: `--help` exempts a call only where it asks for
+/// help - first after the program or its subcommand. A custom script that is
+/// given arguments or another flag first may ignore `--help` and run, so it
+/// stays judged.
+#[test]
+fn help_exempts_only_where_it_comes_first() {
+    let fx = Fx::new(&[
+        rule("no-live-push", None, &["my-deploy"], forbidden(&["--live"]), &[]),
+        rule("no-compose-up", None, &["docker compose"], forbidden(&["--force-recreate"]), &[]),
+    ]);
+    // First after the program: help.
+    assert!(!fx.bash("my-deploy --help --live"));
+    assert!(!fx.bash("my-deploy --help"));
+    // After one subcommand word: help.
+    assert!(!fx.bash("docker compose up --help --force-recreate"));
+    // Other arguments or another flag in front: the script may ignore it.
+    assert!(fx.bash("my-deploy 10.0.0.9 --live --help"));
+    assert!(fx.bash("my-deploy --live --help"));
+    assert!(fx.bash("my-deploy 10.0.0.9 --help --live"), "an address before the flag is not a subcommand");
+    assert!(fx.bash("docker compose up -d --force-recreate --help"));
+}
+
 #[test]
 fn a_version_flag_that_takes_a_value_is_not_a_version_request() {
     let fx = Fx::new(&[rule("installs-need-a-go", None, &["cargo install"], requires("cargo install", &["go-owner"]), &[])]);
@@ -331,6 +353,27 @@ fn an_exported_sandbox_variable_answers_the_install_rule() {
     assert!(!fx.bash("USERPROFILE=/tmp/h; install.exe"));
     assert!(!fx.powershell("$env:USERPROFILE = 'C:\\sandbox'; install.exe"));
     assert!(!fx.powershell("$env:USERPROFILE='C:\\sandbox'\n.\\install.exe"));
+}
+
+/// Field test 15, collect 19d: `export USERPROFILE=<the real profile>` pointed
+/// the installer at the live profile and still passed as "a sandbox". The
+/// answer holds only when the value is somewhere else than the profile of the
+/// process that judges the call.
+#[test]
+fn the_real_profile_is_no_sandbox() {
+    let fx = Fx::new(&[install_rule()]);
+    let Some(real) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).ok().filter(|r| !r.is_empty()) else { return };
+    let slashed = real.replace('\\', "/");
+    assert!(fx.bash(&format!("export USERPROFILE={slashed}; install.exe --no-mcp")), "the real profile exported");
+    assert!(fx.bash(&format!("export USERPROFILE=\"{slashed}/\"; install.exe --no-mcp")), "quoted, with a trailing slash");
+    assert!(fx.bash(&format!("USERPROFILE={} install.exe --no-mcp", slashed.to_uppercase())), "inline, in capitals");
+    assert!(fx.bash("export USERPROFILE=$HOME; install.exe --no-mcp"), "a reference to the real home");
+    assert!(fx.bash("USERPROFILE=\"$USERPROFILE\" install.exe --no-mcp"));
+    assert!(fx.powershell(&format!("$env:USERPROFILE = '{real}'; install.exe --no-mcp")), "PowerShell, the real one");
+    // A sandbox next to it, or inside it, is a sandbox.
+    assert!(!fx.bash(&format!("export USERPROFILE={slashed}/sandbox-home; install.exe --no-mcp")));
+    assert!(!fx.bash("export USERPROFILE=/tmp/h; install.exe --no-mcp"));
+    assert!(!fx.bash(&format!("export USERPROFILE={slashed}; install.exe --db /tmp/x/thor.db")), "--db answers by itself");
 }
 
 #[test]

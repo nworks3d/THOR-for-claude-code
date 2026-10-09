@@ -236,12 +236,130 @@ pub fn turn_commands(transcript_jsonl: &str) -> Vec<String> {
             let is_shell = matches!(name, "Bash" | "PowerShell");
             if let (true, Some(command)) = (is_shell, block.get("input").and_then(|i| i.get("command")).and_then(|c| c.as_str())) {
                 commands.push(command.to_string());
+                // What the call says it is for names what it looked at as well.
+                if let Some(why) = block.get("input").and_then(|i| i.get("description")).and_then(|d| d.as_str()).filter(|d| !d.is_empty()) {
+                    commands.push(format!("[desc] {why}"));
+                }
             } else if is_observation_tool(name) {
-                commands.push(format!("[tool] {name}"));
+                // The marker carries what the call looked at (a file, a pattern,
+                // a page), so a claim can be tied to it (`turn_backs_claim`).
+                match observation_target(block.get("input")) {
+                    target if target.is_empty() => commands.push(format!("[tool] {name}")),
+                    target => commands.push(format!("[tool] {name} {target}")),
+                }
             }
         }
     }
     commands
+}
+
+/// What an observation tool call looked at, as words: its file, folder,
+/// pattern, page address or query, whichever the input carries.
+fn observation_target(input: Option<&Value>) -> String {
+    let Some(input) = input else { return String::new() };
+    ["file_path", "path", "notebook_path", "pattern", "url", "query"]
+        .iter()
+        .filter_map(|key| input.get(key).and_then(|v| v.as_str()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Words too common to tie a claim to a call, in Dutch and English, on top of
+/// the rule's own trigger words.
+const COMMON_WORDS: &[&str] = &[
+    "alle", "alles", "drie", "orde", "goed", "klopt", "staat", "zelf", "niet", "geen", "ook", "maar", "met", "voor", "naar", "nog", "wel",
+    "dus", "zijn", "wordt", "worden", "heb", "heeft", "hebben", "kan", "zou", "dat", "die", "dit", "het", "een", "van", "the", "and", "that",
+    "this", "with", "have", "has", "for", "are", "was", "were", "all", "http", "https", "www", "com", "exe", "tool",
+    // The programs and verbs of a command line: they name how a look was made,
+    // not what it looked at.
+    "git", "curl", "node", "npm", "npx", "cargo", "python", "bash", "echo", "cat", "head", "tail", "grep", "sed", "awk", "find", "get",
+    "set", "select", "object", "write", "read", "powershell", "item", "content", "path", "file", "files",
+];
+
+/// Whether a word of a command line is a path: it starts like one, or has a
+/// slash and nothing of a regular expression or a script in it.
+fn looks_like_path(word: &str) -> bool {
+    let drive = word.len() > 2 && word.as_bytes()[1] == b':' && matches!(word.as_bytes()[2], b'/' | b'\\');
+    let code = word.contains(['(', ')', '[', ']', '{', '}', '<', '>', '*', '?', '|', '=', '$', '^']);
+    !code && (drive || word.starts_with(['/', '\\', '~']) || word.starts_with("./") || word.contains(['/', '\\']))
+}
+
+/// The words that name something, from `text`: lowercased runs of letters and
+/// digits of at least three characters, a plural `s` dropped, common words and
+/// `skip` left out. A word with a path or address in it keeps only what names
+/// the thing: a file's own name (not the folders above it), a page's host and
+/// last part.
+fn naming_words(text: &str, skip: &HashSet<String>) -> HashSet<String> {
+    let mut words = HashSet::new();
+    for raw in text.split_whitespace() {
+        let raw = raw.trim_matches(|c: char| matches!(c, '"' | '\'' | '`' | '(' | ')' | ';' | ',' | '<' | '>'));
+        // `R=/c/Users/me/proj` names the folder, not the variable.
+        let raw = match raw.split_once('=') {
+            Some((name, value)) if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') => {
+                value.trim_matches(|c: char| matches!(c, '"' | '\''))
+            }
+            _ => raw,
+        };
+        let parts: Vec<&str> = match raw.split_once("://") {
+            Some((_, address)) => {
+                let host = address.split('/').next().unwrap_or("");
+                vec![host, address.rsplit('/').next().unwrap_or("")]
+            }
+            None if looks_like_path(raw) => vec![raw.rsplit(['/', '\\']).next().unwrap_or("")],
+            None => vec![raw],
+        };
+        for part in parts {
+            for word in part.split(|c: char| !c.is_alphanumeric()).filter(|w| w.chars().count() >= 3) {
+                let lower = word.to_lowercase();
+                let stem = lower.strip_suffix('s').filter(|s| s.chars().count() >= 3).unwrap_or(&lower).to_string();
+                if !COMMON_WORDS.contains(&lower.as_str()) && !skip.contains(&lower) && !skip.contains(&stem) {
+                    words.insert(stem);
+                }
+            }
+        }
+    }
+    words
+}
+
+/// The paragraphs of `lower` that carry one of the rule's trigger terms, with
+/// the one before each (what the claim is about is usually said there) and the
+/// one after (a claim "Gecontroleerd:" is followed by its list). The whole
+/// reply when no paragraph carries a term.
+fn claim_text(lower: &str, triggers: &[String]) -> String {
+    let paragraphs: Vec<&str> = lower.split("\n\n").collect();
+    let triggers: Vec<String> = triggers.iter().map(|t| t.to_lowercase()).collect();
+    let hits: Vec<usize> =
+        paragraphs.iter().enumerate().filter(|(_, p)| triggers.iter().any(|t| p.contains(t.as_str()))).map(|(i, _)| i).collect();
+    if hits.is_empty() {
+        return lower.to_string();
+    }
+    let keep = |i: usize| hits.iter().any(|h| i + 1 >= *h && i <= h + 1);
+    paragraphs.iter().enumerate().filter(|(i, _)| keep(*i)).map(|(_, p)| *p).collect::<Vec<_>>().join(" ")
+}
+
+/// Whether what the turn looked at is what a claim of checking is about (the
+/// rules marked `backed_by_turn_tools`): some call of the turn - a command, a
+/// read, a search, a page - shares a naming word with the claim (its file name,
+/// its command words, its address). A call that has nothing to do with the claim
+/// does not back it (field test 14, collect 17b: any look in the turn used to).
+/// The trigger words of the rule themselves do not count as naming anything.
+fn turn_backs_claim(rule: &Rule, haystack_lower: &str, turn_commands: &[String]) -> bool {
+    let skip: HashSet<String> = rule
+        .any_of
+        .iter()
+        .chain(&rule.all_of)
+        .flat_map(|t| t.to_lowercase().split(|c: char| !c.is_alphanumeric()).map(str::to_string).collect::<Vec<_>>())
+        .collect();
+    let claim = naming_words(&claim_text(haystack_lower, &rule.any_of), &skip);
+    turn_commands.iter().any(|call| {
+        // A marker is "[tool] Name <target>": the tool's name names nothing.
+        let call = match (call.strip_prefix("[tool] "), call.strip_prefix("[desc] ")) {
+            (Some(marker), _) => marker.split_once(' ').map_or("", |(_, target)| target),
+            (None, Some(why)) => why,
+            (None, None) => call,
+        };
+        !naming_words(call, &skip).is_disjoint(&claim)
+    })
 }
 
 /// Whether `rule`'s AND/OR/NOT/min_chars conditions hold against this
@@ -440,6 +558,13 @@ pub struct OptInRule {
     /// section. Missing, `false` or malformed all mean the rule reads every
     /// occurrence, as before this field existed.
     pub affirmative_only: bool,
+    /// `true` marks a rule whose trigger words are a PHRASE the assistant must
+    /// not use ("nog te controleren"): where the phrase sits inside quotation
+    /// marks or inline code it is mentioned, not used, whoever is speaking -
+    /// even in the assistant's own first-person sentence ('what I would once
+    /// have written as "nog te controleren"'). Missing, `false` or malformed
+    /// all mean quotes are read as before (field test 15, collect 17c).
+    pub quotes_exempt: bool,
     /// Terms whose presence in the OWNER'S OWN LAST PROMPT means he asked for
     /// what the rule's reminder tells the writer to leave out (step 29: the
     /// length rule says "no test counts", and the prompt may be "give me the
@@ -455,11 +580,13 @@ pub struct OptInRule {
     pub short_reminder: Option<String>,
     /// `true` marks a rule about a claim of having looked at something ("checked",
     /// "cannot reach"): it does not fire when the turn itself looked at
-    /// something (`turn_commands` is not empty: a shell command, a read, a
-    /// search, a page). Launching an agent or writing does not count, so a claim
-    /// relayed from an agent's report, or made in a turn that looked at nothing,
-    /// is still held. Known limit, stated here rather than rediscovered: the
-    /// guard cannot tell whether the call it saw is the one the claim is about.
+    /// something THE CLAIM NAMES (`turn_backs_claim`: a shell command, a read, a
+    /// search or a page of the turn shares a naming word with the claim - a file
+    /// name, a command word, an address). Launching an agent or writing does not
+    /// count, so a claim relayed from an agent's report, or made in a turn that
+    /// looked at nothing, is still held; so is one whose turn looked only at
+    /// something else. Known limit, stated here rather than rediscovered: a
+    /// shared word is not proof that the call checked the claim.
     /// Missing, `false` or malformed all mean the rule reads every claim.
     pub backed_by_turn_tools: bool,
     /// Words of which the OWNER'S OWN LAST PROMPT must carry at least one for
@@ -500,6 +627,7 @@ pub fn parse_opt_in_rules(text: &str) -> Vec<OptInRule> {
             // `true` keeps the rule reading every occurrence of its terms.
             let own_claims_only = r.get("own_claims_only").and_then(|v| v.as_bool()).unwrap_or(false);
             let affirmative_only = r.get("affirmative_only").and_then(|v| v.as_bool()).unwrap_or(false);
+            let quotes_exempt = r.get("quotes_exempt").and_then(|v| v.as_bool()).unwrap_or(false);
             let asked_for_any_of = str_list(r, "asked_for_any_of");
             let reminder_if_asked = r.get("reminder_if_asked").and_then(|v| v.as_str()).map(str::to_string);
             let short_reminder = r.get("short_reminder").and_then(|v| v.as_str()).map(str::to_string);
@@ -514,6 +642,7 @@ pub fn parse_opt_in_rules(text: &str) -> Vec<OptInRule> {
                 owner_reading_only,
                 own_claims_only,
                 affirmative_only,
+                quotes_exempt,
                 asked_for_any_of,
                 reminder_if_asked,
                 short_reminder,
@@ -1135,9 +1264,9 @@ fn occurrence_is_another_partys(hay: &str, at: usize, len: usize) -> bool {
 /// The trigger side of a rule (`trigger_holds`) with `own_claims_only`
 /// honoured.
 fn trigger_fires(rule: &OptInRule, haystack_lower: &str) -> bool {
-    if rule.own_claims_only || rule.affirmative_only {
+    if rule.own_claims_only || rule.affirmative_only || rule.quotes_exempt {
         trigger_holds(&rule.base, haystack_lower, &|term| {
-            occurs_as_claimed(haystack_lower, term, rule.own_claims_only, rule.affirmative_only)
+            occurs_as_claimed(haystack_lower, term, rule.own_claims_only, rule.affirmative_only, rule.quotes_exempt)
         })
     } else {
         trigger_holds(&rule.base, haystack_lower, &|term| haystack_lower.contains(term))
@@ -1183,13 +1312,22 @@ fn negated_before(hay: &str, at: usize) -> bool {
 
 /// Whether `term_lower` occurs in `hay` at least once as the assistant's
 /// claim: in its own voice when `own_voice`, not negated when `affirmative`.
-fn occurs_as_claimed(hay: &str, term_lower: &str, own_voice: bool, affirmative: bool) -> bool {
+fn occurs_as_claimed(hay: &str, term_lower: &str, own_voice: bool, affirmative: bool, quotes_exempt: bool) -> bool {
     if term_lower.is_empty() {
         return true;
     }
     hay.match_indices(term_lower).any(|(at, t)| {
-        (!own_voice || !occurrence_is_another_partys(hay, at, t.len())) && (!affirmative || !negated_before(hay, at))
+        (!own_voice || !occurrence_is_another_partys(hay, at, t.len()))
+            && (!affirmative || !negated_before(hay, at))
+            && (!quotes_exempt || !inside_quotes(hay, at))
     })
+}
+
+/// Whether byte `at` of `hay` sits inside quotation marks or inline code: an
+/// odd number of quote marks before it on its line.
+fn inside_quotes(hay: &str, at: usize) -> bool {
+    let line_start = hay[..at].rfind('\n').map_or(0, |i| i + 1);
+    hay[line_start..at].chars().filter(|c| QUOTE_MARKS.contains(c)).count() % 2 == 1
 }
 
 // --------------------------------------------------------- list exemption
@@ -1535,7 +1673,7 @@ fn evaluate_opt_in_checked(
                 && !list_exempted(r, prompt_lower, haystack_lower)
                 && !(r.owner_reading_only && is_subagent)
                 && prompt_gate_open(r, prompt_lower)
-                && !(r.backed_by_turn_tools && !turn_commands.is_empty());
+                && !(r.backed_by_turn_tools && turn_backs_claim(&r.base, haystack_lower, turn_commands));
             if !fires_before_escapes {
                 return None;
             }
@@ -2468,7 +2606,7 @@ mod tests {
         .join("
 ");
         // The earlier turn's `cargo test` is not read; this turn's Read shows as a marker.
-        assert_eq!(turn_commands(&transcript), vec!["[tool] Read".to_string(), "ls".to_string()]);
+        assert_eq!(turn_commands(&transcript), vec!["[tool] Read a".to_string(), "ls".to_string()]);
     }
 
     // -------------- step 59: the turn's own tool calls back a claim, for a rule that opts in
@@ -2509,25 +2647,89 @@ mod tests {
         ]);
         assert_eq!(
             turn_commands(&transcript),
-            vec!["[tool] Read", "[tool] Grep", "[tool] mcp__Claude_Browser__get_page_text", "[tool] WebFetch"]
+            vec![
+                "[tool] Read a.html",
+                "[tool] Grep x",
+                "[tool] mcp__Claude_Browser__get_page_text",
+                "[tool] WebFetch https://example.com"
+            ]
         );
     }
 
     #[test]
     fn a_rule_that_opts_in_is_backed_by_a_read_or_a_command_of_the_same_turn() {
-        let claim = "Zelf nagekeken. Ik heb de pagina zelf gecontroleerd: alle drie in orde.";
+        let claim = "Zelf nagekeken. Ik heb de pagina admin.html zelf gecontroleerd: alle drie in orde.";
         let bare = guard_verdict_in_turn(Some(BACKED_RULEBOOK), claim, "", false, None, &[]);
         assert!(bare.block_reason.is_some(), "no tool call in the turn: the claim stays held");
         for calls in [
-            vec![("Read", r#"{"file_path":"a.html"}"#)],
-            vec![("Grep", r#"{"pattern":"x"}"#)],
-            vec![("Bash", r#"{"command":"curl -s http://dev/health"}"#)],
-            vec![("PowerShell", r#"{"command":"Get-Service ssh-agent"}"#)],
+            vec![("Read", r#"{"file_path":"server/public/admin.html"}"#)],
+            vec![("Grep", r#"{"pattern":"admin"}"#)],
+            vec![("Bash", r#"{"command":"curl -s http://dev/admin"}"#)],
+            vec![("PowerShell", r#"{"command":"Get-Content admin.html"}"#)],
+            vec![("Bash", r#"{"command":"node check.mjs","description":"Syntax check of the admin page"}"#)],
         ] {
             let commands = turn_commands(&transcript_with_tool_calls(&calls));
             let v = guard_verdict_in_turn(Some(BACKED_RULEBOOK), claim, "", false, None, &commands);
             assert!(v.block_reason.is_none(), "{calls:?}: {:?}", v.block_reason);
         }
+    }
+
+    /// Collect 17b: any look in the turn used to back any claim of checking. A
+    /// look at something the claim does not name - another file, a listing, a
+    /// folder - does not.
+    #[test]
+    fn a_look_at_something_the_claim_does_not_name_does_not_back_it() {
+        let claim = "Zelf nagekeken. Ik heb de pagina admin.html zelf gecontroleerd: alle drie in orde.";
+        for calls in [
+            vec![("Read", r#"{"file_path":"server/notes.md"}"#)],
+            vec![("Grep", r#"{"pattern":"TODO","path":"C:\\Users\\me\\dev\\proj"}"#)],
+            vec![("Bash", r#"{"command":"ls -la"}"#)],
+            vec![("Bash", r#"{"command":"git -C C:/Users/me/dev/proj status -sb"}"#)],
+            vec![("WebFetch", r#"{"url":"https://example.com/pricing"}"#)],
+        ] {
+            let commands = turn_commands(&transcript_with_tool_calls(&calls));
+            assert!(!commands.is_empty(), "fixture sanity, the turn did look: {calls:?}");
+            let v = guard_verdict_in_turn(Some(BACKED_RULEBOOK), claim, "", false, None, &commands);
+            assert!(v.block_reason.is_some(), "{calls:?} named nothing of the claim, so the claim stays held");
+        }
+    }
+
+    /// The words the rule itself triggers on name nothing, and a file's folders
+    /// are not its name: only the file, the command words and the address count.
+    #[test]
+    fn the_trigger_words_and_the_folders_of_a_path_tie_nothing() {
+        let claim = "Gecontroleerd: de pagina is in orde.";
+        let commands = turn_commands(&transcript_with_tool_calls(&[("Bash", r#"{"command":"echo gecontroleerd"}"#)]));
+        let v = guard_verdict_in_turn(Some(BACKED_RULEBOOK), claim, "", false, None, &commands);
+        assert!(v.block_reason.is_some(), "the word the rule fires on is no tie");
+        let claim = "Gecontroleerd: de dev-omgeving draait.";
+        let commands = turn_commands(&transcript_with_tool_calls(&[("Read", r#"{"file_path":"C:\\Users\\me\\dev\\proj\\README.md"}"#)]));
+        let v = guard_verdict_in_turn(Some(BACKED_RULEBOOK), claim, "", false, None, &commands);
+        assert!(v.block_reason.is_some(), "a folder called dev is not the dev environment");
+    }
+
+    // ------------------------------------------- collect 17c: a quoted mention is no use
+
+    const QUOTES_RULEBOOK: &str = r#"[
+      {"id":"no-still-to-check","tier":"warn","own_claims_only":true,"quotes_exempt":true,
+       "any_of":["nog te controleren"],"none_of":[],"reminder":"Check it now."}
+    ]"#;
+
+    #[test]
+    fn a_quoted_mention_of_the_phrase_in_a_first_person_sentence_is_no_use_of_it() {
+        let mention = "Dat was precies het soort ding dat ik eerder zou hebben opgeschreven als \"nog te controleren\".";
+        let v = guard_verdict_in_turn(Some(QUOTES_RULEBOOK), mention, "", false, None, &[]);
+        assert!(v.warn_reason.is_none() && v.block_reason.is_none(), "{:?}", v.warn_reason);
+        let code = "Ik noemde het vroeger `nog te controleren`, maar dat doe ik niet meer.";
+        let v = guard_verdict_in_turn(Some(QUOTES_RULEBOOK), code, "", false, None, &[]);
+        assert!(v.warn_reason.is_none(), "{:?}", v.warn_reason);
+        // The phrase used for real, next to a quote, still fires; so does a rule that does not opt in.
+        let used = "Het script is nog te controleren. Eerder schreef ik \"nog te controleren\" op.";
+        let v = guard_verdict_in_turn(Some(QUOTES_RULEBOOK), used, "", false, None, &[]);
+        assert!(v.warn_reason.is_some());
+        let plain = QUOTES_RULEBOOK.replace("\"quotes_exempt\":true,", "");
+        let v = guard_verdict_in_turn(Some(&plain), mention, "", false, None, &[]);
+        assert!(v.warn_reason.is_some(), "without the field a first-person quote is still the agent's own");
     }
 
     #[test]

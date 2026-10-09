@@ -197,6 +197,38 @@ fn report_without_attestation_is_invalid() {
     assert_eq!(newest_invalid_report(&fx.store, Some("fxp")), Some((old.id.clone(), why)));
 }
 
+/// Field test 14, C2 and C3: two dead reports sit after the last one that
+/// counts. The ask names the counting one and every dead one with its reason,
+/// and a new evaluation's window starts at the counting report, not at the
+/// newest dead one - else the refusals and skew events inside a dead report's
+/// window never reach a report that counts.
+#[test]
+fn dead_reports_neither_hide_the_counting_one_nor_restart_the_window() {
+    let mut fx = Fx::new();
+    let root = fx.root();
+    crate::attest::fixture::quiet_start(&mut fx.store, S1, "fxp");
+    let good = report("eval-fxp-2026-09-28", "fxp", "TLDR: this one counts.");
+    let good_event = attested_filing(&mut fx.store, &root, S1, &good, "toolu_f1").unwrap();
+    assert_eq!(fx.stop().len(), 1);
+    let dead_a = report("eval-fxp-2026-09-29", "fxp", "TLDR: written past the tools.");
+    let dead_b = report("eval-fxp-2026-09-30", "fxp", "TLDR: written past the tools too.");
+    fx.raw(S1, EventKind::FactCreated, &dead_a, None);
+    fx.raw(S1, EventKind::FactCreated, &dead_b, None);
+    assert_eq!(fx.stop().len(), 2);
+
+    let (counting, dead) = reports_not_counted(&fx.store, "fxp");
+    assert_eq!(counting.as_deref(), Some(good.id.as_str()));
+    let ids: Vec<&str> = dead.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(ids, [dead_b.id.as_str(), dead_a.id.as_str()], "newest first, every dead one");
+    assert!(dead.iter().all(|(_, why)| !why.is_empty()), "{dead:?}");
+
+    assert!(model::store::newest_evaluation_report_seq(&fx.store, Some("fxp")) > good_event.seq, "fixture sanity: a dead report is newer");
+    let frozen = model::store::frozen_now(&fx.store, S2, "fxp", "command", 0).unwrap();
+    assert_eq!(frozen.prev_report_seq, good_event.seq, "the window starts at the report that counts");
+    assert_eq!(model::store::newest_counting_evaluation_seq(&fx.store, Some("fxp")), good_event.seq);
+    assert_eq!(model::store::newest_counting_evaluation_seq(&fx.store, Some("other")), 0);
+}
+
 // ------------------------------------------------------------- (4) the machine block
 
 /// B1 at the reader: a machine block that is not the one THOR derives from

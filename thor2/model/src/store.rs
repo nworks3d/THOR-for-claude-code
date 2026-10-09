@@ -2949,7 +2949,8 @@ fn full_reliable_anchor(candidates: &[(String, Item)], item: &Item, bindings: &[
                   too and retract the rest; move means re-anchor the sitting fact to the narrower \
                   file, directory or command it is really about; archive means retract whichever \
                   one is dated or its subject is gone. A full place is not fixed by adding another \
-                  claimant."
+                  claimant. Do NOT store the fact as an unbound Report to get past this: A Report \
+                  never fires, so the fact would be saved and never come back."
                 .to_string(),
         });
     }
@@ -5059,7 +5060,7 @@ pub fn frozen_now(store: &EventStore, session: &str, project: &str, started_by: 
         started_seq,
         started_by: started_by.to_string(),
         started_unix,
-        prev_report_seq: newest_evaluation_report_seq(store, Some(project)),
+        prev_report_seq: newest_counting_evaluation_seq(store, Some(project)),
         judgement: evaluation_judgement_list(store, Some(project), session, started_seq),
         batch: None,
         batch_later: 0,
@@ -7688,6 +7689,65 @@ pub fn evaluation_validation_of(store: &EventStore, report: &str, report_seq: i6
         .find(|v| v.report_seq == report_seq)
 }
 
+/// The event that FILED `report_id` - the last write that made it an
+/// evaluation report of its project (created it, or newly tagged it, or
+/// moved it to another project) - with the item as that event wrote it.
+pub fn filing_event(store: &EventStore, report_id: &str) -> Option<(Event, Item)> {
+    let events = store.get_events_by_entity(report_id).ok()?;
+    let mut before: Option<Item> = None;
+    let mut filing: Option<(Event, Item)> = None;
+    for event in events.iter().filter(|e| matches!(e.kind, EventKind::FactCreated | EventKind::FactRevised | EventKind::FactSuperseded)) {
+        let Ok(item) = parse_body(&event.body) else { continue };
+        let files = match &before {
+            None => gate::is_evaluation_report(&item),
+            Some(prev) => gate::newly_filed_as_evaluation(prev, &item),
+        };
+        if files {
+            filing = Some((event.clone(), item.clone()));
+        }
+        before = Some(item);
+    }
+    filing
+}
+
+/// THE ONE READER OF "THIS PROJECT'S EVALUATION": the newest VALID validator
+/// record of `project` whose report is still live, is still an evaluation
+/// report of that project, still files at the same event, and whose machine
+/// block still has the digest the validator recorded - so a later typo fix
+/// below the block keeps it, and anything that changes the block drops it.
+/// Lives in the model so the signals window of a new evaluation
+/// (`frozen_now`) starts at the same report the Stop counts.
+pub fn newest_valid_evaluation(store: &EventStore, project: Option<&str>) -> Option<EvaluationValidation> {
+    let project = project?;
+    evaluation_validations(store)
+        .into_iter()
+        .map(|(_, v)| v)
+        .filter(|v| v.valid && v.project.as_deref() == Some(project))
+        .filter(|v| validation_still_counts(store, v))
+        .max_by_key(|v| v.report_seq)
+}
+
+fn validation_still_counts(store: &EventStore, v: &EvaluationValidation) -> bool {
+    let Ok(item) = show(store, &v.report) else { return false };
+    if !gate::is_evaluation_report(&item) || item.project != v.project {
+        return false;
+    }
+    if filing_event(store, &v.report).map(|(e, _)| e.seq) != Some(v.report_seq) {
+        return false;
+    }
+    let digest = gate::machine_block(&item.text).map(machine_block_digest);
+    digest.is_some() && digest == v.machine_sha256
+}
+
+/// The filing seq of the project's newest report that COUNTS, `0` when none
+/// does. This, not the newest report of any validity, is where a new
+/// evaluation's window of signals, disputes and fired rules starts: a dead
+/// report (version skew, not attested) covered nothing, so its refusals and
+/// skew events must reach the next report that counts (field test 14, C3).
+pub fn newest_counting_evaluation_seq(store: &EventStore, project: Option<&str>) -> i64 {
+    newest_valid_evaluation(store, project).map_or(0, |v| v.report_seq)
+}
+
 /// One valid evaluation that carried an open point about a subject: who
 /// filed it, when, and which report it was.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -9111,6 +9171,9 @@ mod tests {
         assert!(msg.contains("sit-0"), "names a sitting fact so the agent can choose: {msg}");
         assert!(msg.contains("fold"), "says how to make room: {msg}");
         assert!(msg.contains("no crowding, no loose ends"), "names the rule by its own words: {msg}");
+        // Field test 14 (collect C1): an agent stored the refused fact as an
+        // unbound Report instead. A Report never fires, so the refusal says so.
+        assert!(msg.contains("A Report never fires"), "warns that a Report is no way out: {msg}");
         // Field test 2 (2026-10-01): each occupant's severity AND whether it
         // carries a check, so the writer can tell a description from a guard.
         assert!(msg.contains("'sit-0' (costly, no check)"), "severity and check status per occupant: {msg}");

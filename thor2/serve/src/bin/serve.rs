@@ -3049,7 +3049,7 @@ fn evaluation_debt(
     let state = usefulness::project_eval_state(db_path, Some(project));
     let by_floor = usefulness::project_due(store, &state, project, work, time::now_unix(), usefulness::EVAL_CADENCE)?;
     let clock = usefulness::EvalClock { work: work.clone(), own_minutes: work.accrued_secs / 60, by_floor };
-    Some(evaluation_ask(store, db_path, project, &clock, Some(project)))
+    Some(evaluation_ask(store, db_path, project, &clock, Some(project), "test-session"))
 }
 
 /// The text of a main session's Stop held by `reason`, with the evaluation
@@ -3127,6 +3127,25 @@ fn write_turn_mark(db: &Path, session_id: &str, mark: TurnMark) {
     if let Ok(text) = serde_json::to_string(&all) {
         let _ = serve::store_dir::write(&turn_marks_path(db), text);
     }
+}
+
+/// Says `line` to the session ONCE: `Some(line)` the first time, `None` on every
+/// later Stop until the line itself changes (a new report id, a new install
+/// time). Field test 14, C5: the same "report is on file but does not count"
+/// line went out on 14 Stops in two hours. Remembered in the session's turn
+/// mark, beside the void notices.
+fn said_once(db_path: &Path, session_id: &str, line: String) -> Option<String> {
+    let key = format!("said:{}", model::store::machine_block_digest(&line).chars().take(16).collect::<String>());
+    let mut marks = read_turn_marks(db_path);
+    let mut mark = marks.remove(session_id).unwrap_or_default();
+    if mark.announced.contains(&key) {
+        return None;
+    }
+    mark.announced.push(key);
+    let skip = mark.announced.len().saturating_sub(ANNOUNCED_KEEP);
+    mark.announced.drain(..skip);
+    write_turn_mark(db_path, session_id, mark);
+    Some(line)
 }
 
 /// A first-pass Stop: the log's tip now, and no hold yet in this turn (what
@@ -3405,13 +3424,15 @@ fn eval_stop_ask(
                 // The same for a session that started before the installed tool
                 // server was replaced (field test 14, H1): no dead report is
                 // needed first, and no ask is made.
+                // Said once per report (or install) and session, then quiet
+                // until the line changes (field test 14, C5).
                 if let Some(line) = stale_tool_server_line(session_id) {
-                    elsewhere.get_or_insert(line);
+                    elsewhere = elsewhere.or_else(|| said_once(db_path, session_id, line));
                     continue;
                 }
                 let root = serve::attest::transcripts_root();
                 if let Some(line) = serve::eval_filing::skew_awaiting_restart(store, &project, session_id, root.as_deref()) {
-                    elsewhere.get_or_insert(line);
+                    elsewhere = elsewhere.or_else(|| said_once(db_path, session_id, line));
                     continue;
                 }
                 // ONE HOLDER PER PROJECT (step 26): a session that is not the
@@ -3423,7 +3444,7 @@ fn eval_stop_ask(
                     elsewhere.get_or_insert_with(|| serve::holder::holder_line(&project, &session, idle_minutes, why));
                     continue;
                 }
-                let reason = evaluation_ask(store, db_path, &project, &clock, at.folder);
+                let reason = evaluation_ask(store, db_path, &project, &clock, at.folder, session_id);
                 usefulness::record_eval_debt_asked(db_path, Some(&project), now);
                 // The ask is where this evaluation starts: one start record
                 // in the log freezes the three lists its report is held to,
@@ -3464,6 +3485,56 @@ fn eval_stop_ask(
     elsewhere.map_or(EvalStop::Quiet, EvalStop::Elsewhere)
 }
 
+/// How many verdicts the evaluation about to start will hold the report to, and
+/// how many items are owed one that it will NOT list (field test 15, collect
+/// 19b: the ask always said "1 item owed a verdict", which no evaluation lists).
+/// The evaluation lists only what fired in the asked session; an item owed a
+/// verdict because other sessions fired it is counted store-wide, asked of no
+/// report and needs nothing now. The list is computed as the start computes it.
+fn verdict_list_words(store: &EventStore, project: &str, session_id: &str) -> String {
+    let (_, owed_in_project) = usefulness::judgement_debt_counts(store, Some(project));
+    let started_seq = store.get_next_seq().map(|n| n - 1).unwrap_or(0);
+    let listed = model::store::evaluation_judgement_list(store, Some(project), session_id, started_seq).len();
+    let unlisted = owed_in_project.saturating_sub(listed);
+    let on_list = match listed {
+        0 => "No item is on this evaluation's verdict list (the items that fired in this session and owe a verdict)".to_string(),
+        n => format!("{n} item(s) will be on this evaluation's verdict list (the items that fired in this session and owe a verdict)"),
+    };
+    match unlisted {
+        0 => format!("{on_list}."),
+        n => format!(
+            "{on_list}. {n} more item(s) of this project owe a verdict because other sessions fired them; no evaluation of this \
+             session lists them, they hold no report and need nothing from you."
+        ),
+    }
+}
+
+/// The reports of `project` on file that do not count, for the top of the
+/// ask (field test 14, C2): the newest first with its reason, then each older
+/// dead one, then which report is the last that COUNTS, so a dead report is
+/// never taken for a counted one. Empty when every report on file counts.
+fn not_counted_words(store: &EventStore, project: &str) -> String {
+    const LISTED: usize = 4;
+    let (counting, dead) = serve::eval_filing::reports_not_counted(store, project);
+    let Some((newest, why)) = dead.first() else { return String::new() };
+    let mut out = format!("[THOR] The report '{newest}' is on file but does not count as this project's evaluation: {why}.");
+    if dead.len() > 1 {
+        let older: Vec<String> =
+            dead.iter().skip(1).take(LISTED - 1).map(|(id, why)| format!("'{id}' (on file, did not count: {why})")).collect();
+        out.push_str(&format!(" Older ones that do not count either: {}", older.join("; ")));
+        match dead.len().saturating_sub(LISTED) {
+            0 => out.push('.'),
+            more => out.push_str(&format!("; and {more} more.")),
+        }
+    }
+    match counting {
+        Some(id) => out.push_str(&format!(" The last report that counts: '{id}'.")),
+        None => out.push_str(" No report of this project counts yet."),
+    }
+    out.push_str(" The evaluation is still owed.\n\n");
+    out
+}
+
 /// The words of the evaluation ask for `project`, from `clock` (the
 /// project's work clock and this session's own minutes). `folder_project` is
 /// where the session stands now: when the ask is about ANOTHER project (the
@@ -3474,6 +3545,7 @@ fn evaluation_ask(
     project: &str,
     clock: &usefulness::EvalClock,
     folder_project: Option<&str>,
+    session_id: &str,
 ) -> String {
     let current_project = Some(project);
     let work = &clock.work;
@@ -3481,7 +3553,7 @@ fn evaluation_ask(
     let accrued_minutes = work.accrued_secs / 60;
     let own_minutes = clock.own_minutes;
     let state = usefulness::project_eval_state(db_path, current_project);
-    let (_, owed_in_project) = usefulness::judgement_debt_counts(store, current_project);
+    let owed_words = verdict_list_words(store, project, session_id);
     // THE ASK FOLLOWS THE WORK (D11): named when the folder is elsewhere.
     let elsewhere = match folder_project {
         Some(folder) if folder == project => String::new(),
@@ -3498,14 +3570,7 @@ fn evaluation_ask(
     // validator's reason, so a session that filed one - through an older
     // binary, a script, or a call its transcript does not hold - learns why
     // it is still asked.
-    let not_counted = serve::eval_filing::newest_invalid_report(store, current_project)
-        .map(|(id, why)| {
-            format!(
-                "[THOR] The report '{id}' is on file but does not count as this project's evaluation: {why}. The \
-                 evaluation is still owed.\n\n"
-            )
-        })
-        .unwrap_or_default();
+    let not_counted = not_counted_words(store, project);
     // Named when the file is actually there to read - the same location
     // `ops::install::seed_eval_command` writes to, resolved the same way
     // (`usefulness::default_eval_command_path`, `ops/tests` proves the two
@@ -3568,8 +3633,8 @@ fn evaluation_ask(
         format!(
             "{elsewhere}{not_counted}[THOR] This session has worked here for {hours:.1} hour(s) since the last evaluation report ('{report_id}'){together}\
              {risk_text}.{floor} \
-             A new evaluation is due, covering only what happened since then plus the state of the work; \
-             {owed_in_project} item(s) are owed a verdict store-wide for this project (the evaluation's own list, fixed when it starts, may hold fewer or none). \
+             A new evaluation is due, covering only what happened since then plus the state of the work. \
+             {owed_words} \
              Run the THOR evaluation before you finish: {ask} \
              A turn cannot end until the evaluation report for this project is filed."
         )
@@ -3589,7 +3654,7 @@ fn evaluation_ask(
         format!(
             "{elsewhere}{not_counted}[THOR] This project has had no evaluation in the last {covers_hours} hours (project '{project}').{floor} \
              This session has worked here for {own_minutes} minute(s){together}; \
-             {owed_in_project} item(s) are owed a verdict store-wide for this project (the evaluation's own list, fixed when it starts, may hold fewer or none). It has been asked {asked_count} time(s) - the first \
+             {owed_words} It has been asked {asked_count} time(s) - the first \
              {} day(s) ago - with no report filed yet. \
              Run the THOR evaluation before you finish: {ask} \
              A turn cannot end until the evaluation report for this project is filed. After that it is quiet for {covers_hours} hours.",
@@ -4982,6 +5047,59 @@ mod evaluation_debt_tests {
         serve::eval_filing::fixture::valid_filing(store, transcripts.path(), session, &item, "toolu_fixture_report");
     }
 
+    /// Field test 14, C2: the ask names every report on file that does not
+    /// count, each with its reason, and the last one that does - an agent took
+    /// a dead report for a counted one when only the newest dead one was named.
+    #[test]
+    fn the_ask_names_every_dead_report_and_the_last_one_that_counts() {
+        let (dir, _db, mut store) = new_store();
+        assert_eq!(not_counted_words(&store, "thor"), "", "nothing on file, nothing to say");
+        declare_report(&mut store, "eval-thor-2026-10-01", "thor");
+        assert_eq!(not_counted_words(&store, "thor"), "", "every report on file counts");
+        for id in ["eval-thor-2026-10-02", "eval-thor-2026-10-03"] {
+            let dead = serve::eval_filing::fixture::report(id, "thor", "TLDR: written past the tools.");
+            let body = model::store::canonical_body(&dead).unwrap();
+            store.append_event("mcp", "mcp", "mcp", thor_core::event_store::EventKind::FactCreated, id, None, &body).unwrap();
+        }
+        let root = dir.path().join("transcripts");
+        serve::eval_filing::validate_new_reports(&mut store, Some(&root), serve::attest::fixture::SESSION);
+        let text = not_counted_words(&store, "thor");
+        assert!(text.starts_with("[THOR] The report 'eval-thor-2026-10-03' is on file but does not count as this project's evaluation: "), "{text}");
+        assert!(text.contains("'eval-thor-2026-10-02' (on file, did not count: "), "the older dead one is named too: {text}");
+        assert!(text.contains("The last report that counts: 'eval-thor-2026-10-01'."), "{text}");
+        assert!(text.ends_with("The evaluation is still owed.\n\n"), "{text}");
+    }
+
+    /// Field test 15, collect 19b: the ask counts what the evaluation can list
+    /// (what fired in the asked session) apart from what is owed only because
+    /// other sessions fired it, and says which is which.
+    #[test]
+    fn the_ask_counts_the_verdict_list_apart_from_what_other_sessions_owe() {
+        let (_dir, _db, mut store) = new_store();
+        owe_project(&mut store, 2, Some("thor"));
+        // The fixture serves each item in sessions s0..: session "s0" saw both.
+        let seen = verdict_list_words(&store, "thor", "s0");
+        assert_eq!(seen, "2 item(s) will be on this evaluation's verdict list (the items that fired in this session and owe a verdict).");
+        let elsewhere = verdict_list_words(&store, "thor", "never-in-the-room");
+        assert!(elsewhere.starts_with("No item is on this evaluation's verdict list"), "{elsewhere}");
+        assert!(elsewhere.contains("2 more item(s) of this project owe a verdict because other sessions fired them"), "{elsewhere}");
+        assert!(elsewhere.ends_with("need nothing from you."), "{elsewhere}");
+    }
+
+    /// Field test 14, C5: a line is said to a session once, then not again
+    /// until the line itself changes.
+    #[test]
+    fn a_line_is_said_once_per_session_until_it_changes() {
+        let (_dir, db, _store) = new_store();
+        let line = "[THOR] The report 'a' is on file but does not count.".to_string();
+        assert_eq!(said_once(&db, "s1", line.clone()), Some(line.clone()), "the first Stop says it");
+        assert_eq!(said_once(&db, "s1", line.clone()), None, "the second stays quiet");
+        assert_eq!(said_once(&db, "s1", line.clone()), None);
+        assert_eq!(said_once(&db, "s2", line.clone()), Some(line.clone()), "another session is told");
+        let changed = "[THOR] The report 'b' is on file but does not count.".to_string();
+        assert_eq!(said_once(&db, "s1", changed.clone()), Some(changed), "a new report is said again");
+    }
+
     /// Served under `usefulness::ASSISTANT_DELIVERY_ACTOR` (2026-09-19), same
     /// reason as `judgement_debt_tests`'s own `serve_as`: `owe` below claims
     /// to build real judgement debt for the context line's own count, and
@@ -5124,7 +5242,7 @@ mod evaluation_debt_tests {
         assert!(asked.contains("This project has had no evaluation in the last 16 hours"), "{asked}");
         assert!(asked.contains("This session has worked here for"), "{asked}");
         assert!(asked.contains("minute(s)"), "{asked}");
-        assert!(asked.contains("12 item(s) are owed a verdict store-wide for this project"), "{asked}");
+        assert!(asked.contains("12 more item(s) of this project owe a verdict because other sessions fired them"), "{asked}");
         assert!(asked.contains("It has been asked 1 time(s)"), "{asked}");
         assert!(asked.contains("A turn cannot end until the evaluation report for this project is filed"), "{asked}");
         assert!(asked.contains("After that it is quiet for 16 hours"), "{asked}");
@@ -5178,7 +5296,7 @@ mod evaluation_debt_tests {
         let (_dir, db, store) = new_store();
         let asked =
             evaluation_debt(&store, &db, Some("thor"), &work_minutes(90)).expect("a zero-item backlog must still owe an evaluation");
-        assert!(asked.contains("0 item(s) are owed a verdict store-wide for this project"), "{asked}");
+        assert!(asked.contains("No item is on this evaluation's verdict list"), "{asked}");
     }
 
     /// THE NO-PROJECT GUARD (`no evaluation is asked outside a project,
@@ -5390,7 +5508,7 @@ mod evaluation_debt_tests {
             asked.contains("A new evaluation is due, covering only what happened since then plus the state of the work"),
             "{asked}"
         );
-        assert!(asked.contains("5 item(s) are owed a verdict store-wide for this project"), "{asked}");
+        assert!(asked.contains("5 more item(s) of this project owe a verdict because other sessions fired them"), "{asked}");
         assert!(asked.contains("A turn cannot end until the evaluation report for this project is filed"), "{asked}");
         assert!(
             !asked.contains("It has been asked"),

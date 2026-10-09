@@ -2512,8 +2512,26 @@ pub fn bounds_a_loop(anchor: &str, seg: &Segment) -> bool {
     seg.bounded && matches!(anchor.trim().to_lowercase().as_str(), "until" | "while")
 }
 
+/// Whether `--help` is the FIRST word after `anchor` (or the second, after one
+/// subcommand word such as `up` in `docker compose up --help`), before a bare
+/// `--`. That is how a program is asked for its help. A script given other
+/// arguments first (`node tools/push.mjs 10.0.0.9 --help`) or another flag first
+/// (`--live --help`) may ignore the flag and run, so it stays judged (field test
+/// 15, collect 19c: the exemption used to trust `--help` anywhere in a segment).
+fn asks_for_help_first(anchor: &str, seg: &Segment) -> bool {
+    let Some(rest) = rest_after(anchor, seg) else { return false };
+    let rest: Vec<&String> = rest.iter().take_while(|w| *w != "--").collect();
+    let subcommand = |w: &str| !w.is_empty() && w.len() <= 20 && w.chars().all(|c| c.is_ascii_lowercase() || c == '-') && !w.starts_with('-');
+    match rest.as_slice() {
+        [first, ..] if first.as_str() == "--help" => true,
+        [first, second, ..] if subcommand(first) && second.as_str() == "--help" => true,
+        _ => false,
+    }
+}
+
 /// Whether `seg` is an invocation that does nothing: it asks the program
-/// for its help (`--help` among its words, before a bare `--`), is a pure
+/// for its help (`--help` first after the anchor, see `asks_for_help_first`,
+/// before a bare `--`), is a pure
 /// help or version call (`is_pure_help_call`), is a `git push` that is a
 /// dry run (`--dry-run`, or `-n`, which means the same for push and only for
 /// push - `git commit -n` skips hooks), or carries PowerShell's `-WhatIf`
@@ -2530,7 +2548,10 @@ pub fn is_inert_call(anchor: &str, seg: &Segment) -> bool {
     }
     let before_end = |words: &[String]| -> Vec<String> { words.iter().take_while(|w| *w != "--").cloned().collect() };
     let words = before_end(&seg.words);
-    if words.iter().any(|w| w == "--help" || w.eq_ignore_ascii_case("-whatif") || w.eq_ignore_ascii_case("-whatif:$true")) {
+    if words.iter().any(|w| w.eq_ignore_ascii_case("-whatif") || w.eq_ignore_ascii_case("-whatif:$true")) {
+        return true;
+    }
+    if asks_for_help_first(anchor, seg) {
         return true;
     }
     let head = before_end(&seg.head);

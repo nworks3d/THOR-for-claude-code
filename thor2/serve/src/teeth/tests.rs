@@ -591,6 +591,30 @@ fn listing_forms_drop_a_check_and_whole_hits_never_do() {
     assert!(receipt(&t).contains("would refuse 1, e.g. 'git push --force origin main'"), "{}", receipt(&t));
 }
 
+/// Field test 14, C6: the trial of a requires check also tries multi-statement
+/// PowerShell calls - the shape of the measured false block (a path ending in
+/// the anchor assigned, then another command) - so a trial can no longer call
+/// a check proven that the hook refuses for the wrong statement.
+#[test]
+fn a_requires_trial_tries_multi_statement_powershell_calls() {
+    let fx = Fx::new();
+    let item = rule(
+        "install-db",
+        "install.exe needs --db, or it picks an empty store.",
+        vec![cmd("install.exe")],
+        Some(Check::Requires { when: "install.exe".to_string(), required: vec!["--db".to_string()] }),
+        None,
+    );
+    let t = fx.write(&item);
+    assert!(matches!(t.outcome, Outcome::Rule { .. }), "{:?}\n{}", t.outcome, receipt(&t));
+    let attempts = &t.record.as_ref().unwrap().fields().attempts;
+    let tried = |needle: &str, outcome: AttemptOutcome| attempts.iter().any(|a| a.form.contains(needle) && a.outcome == outcome);
+    assert!(tried("PowerShell: Get-Date; install.exe", AttemptOutcome::Refused), "{attempts:?}");
+    assert!(tried("PowerShell: $x=1; install.exe", AttemptOutcome::Refused), "{attempts:?}");
+    assert!(tried("PowerShell: Get-Date; install.exe --db", AttemptOutcome::LetThrough), "{attempts:?}");
+    assert!(tried("PowerShell: $x='C:\\tools\\install.exe'; Get-Item $x", AttemptOutcome::LetThrough), "{attempts:?}");
+}
+
 // ------------------------------------------------------ (7) nothing at all
 
 /// Outcome (7): no check and nothing in the text to build one from - a
@@ -768,6 +792,28 @@ fn a_contains_check_on_a_literal_only_in_comments_is_a_note_at_write_time() {
         let t = fx.write(&item);
         assert!(matches!(t.outcome, Outcome::Rule { .. }), "{id}: {:?}\n{}", t.outcome, receipt(&t));
     }
+}
+
+/// Field test 14, C4: the literal sat in a header comment AND in the help text
+/// of the script (`device-approve.js`), so the comment filter let it through and
+/// the check was labelled "proven guard". Help text is commentary too.
+#[test]
+fn a_contains_check_on_a_literal_only_in_comments_and_help_text_is_a_note() {
+    let mut fx = Fx::new();
+    let script = "// shows \"spec phrase here\" for an unknown device\nconst HELP = `\nA device sees \"spec phrase here\" and a code.\n`;\nconsole.log(HELP);\n";
+    let beta = fx.checkout("beta", &[("tools/approve.mjs", script)], true);
+    fx.register("beta", &beta);
+    let item = rule(
+        "help-only",
+        "tools/approve.mjs documents the 'spec phrase here' wording.",
+        vec![path("tools/approve.mjs")],
+        contains("tools/approve.mjs", "spec phrase here"),
+        Some("beta"),
+    );
+    let t = fx.write(&item);
+    assert!(matches!(t.outcome, Outcome::Note { by_dispute: false, .. }), "{:?}\n{}", t.outcome, receipt(&t));
+    assert!(receipt(&t).contains("sits only in comments of tools/approve.mjs"), "{}", receipt(&t));
+    assert_eq!(t.check, None, "stored without the check");
 }
 
 /// The same literal as a tooth THOR derives from the text: it used to be

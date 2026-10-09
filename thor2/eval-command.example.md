@@ -216,6 +216,24 @@ not the whole session, and not the whole 16 hours. Judge only what fired
 since then; everything the previous report already covers is not this
 evaluation's business again.
 
+WHICH REPORT IS "THE PREVIOUS ONE": the last report THAT COUNTS. A report that
+is on file but did not count (a stale tool server, a filing past the tools)
+covered nothing, so the window of this evaluation - the start note's signals,
+the disputes and the rules that fired - starts at the last report that counts,
+not at the newest one on file. WHAT TO DO: take the report id from the ask's
+line "The last report that counts: '<id>'" for your SCOPE line, and name the
+others from the same ask ("on file, did not count: <why>") as dead, never as
+counted. DONE WHEN: your SCOPE line names the report that counts, and every
+dead report you mention is called dead. EXAMPLE: "SCOPE: since
+eval-demo-2026-10-08-2, the last that counted; -3 and -4 are on file and did
+not count (version skew)".
+
+THE ASK'S VERDICT COUNT. The ask says how many items are on THIS evaluation's
+verdict list (section 1 of the start note: what fired in this session and owes a
+verdict). Items that owe a verdict only because other sessions fired them are
+counted apart, are on no evaluation's list and need nothing from you. DONE WHEN:
+your verdicts match section 1, whatever the other number says.
+
 The test is not "was it useful" but **did it belong where it fired**.
 - `mcp__thor__mark(id: "<id>")` - it belonged there.
 - `mcp__thor__mark(id: "<id>", noise: true)` - it did not.
@@ -966,20 +984,24 @@ reply. DONE WHEN: the summary says so and no report was filed. EXAMPLE: summary:
 "the tool server is stale; restart Claude, then the evaluation is asked again;
 I filed nothing".
 
-`installed programs:` (for example "installed programs: serve.exe is build X,
-mcp.exe is build Y, doctor.exe is build Y - they were not built from the same
-source ...") - WHAT IT MEANS: the programs on disk come from different builds,
-which happens on purpose when a fix is installed into one program without a
-restart. It is not a reason to withhold the report: a filing only fails to count
-when the tool server and the checker render the machine section differently, and
-the tool server itself refuses that before it writes anything (see THOR health
-above). WHAT TO DO: file the report as usual, and put the line in it under THOR
-health. If the filing is refused with "this tool server renders the evaluation
-machine section in format", do not file again: tell the owner to restart Claude
-and end the turn. DONE WHEN: the report is on file with the line under THOR
-health, or the refusal was passed to the owner. EXAMPLE: THOR health in the
-report: "installed programs: serve.exe is a newer build than mcp.exe (a fix
-installed without a restart); the filing was accepted".
+`installed programs:` (for example "installed programs: serve.exe is build X
+(renderer 7), mcp.exe is build Y (renderer 7) - they were not built from the
+same source. Renderers match: evaluation filings count ...") - WHAT IT MEANS:
+the programs on disk come from different builds, which happens on purpose when
+a fix is installed into one program without a restart. The line names the
+machine-section renderer of each program and ends in one of two verdicts.
+"Renderers match" means a filing counts: it is not a reason to withhold the
+report, and the tool server itself refuses a mismatch before it writes anything
+(see THOR health above). "Renderers differ" means a report filed by the program
+with the older renderer is dead: treat it like the `tool server:` line (do not
+file, tell the owner to restart Claude, end the turn). WHAT TO DO when they
+match: file the report as usual, and put the line in it under THOR health. If
+the filing is refused with "this tool server renders the evaluation machine
+section in format", do not file again: tell the owner to restart Claude and end
+the turn. DONE WHEN: the report is on file with the line under THOR health, or
+the refusal or the "Renderers differ" verdict was passed to the owner. EXAMPLE:
+THOR health in the report: "installed programs: renderers match (7 and 7), a
+fix installed without a restart; the filing was accepted".
 
 When neither line is printed, nothing is wrong and you file as usual.
 
@@ -1064,7 +1086,11 @@ this evaluation (see "What you see when" above). The report counts from the
 end-of-turn check on: the Stop hook reads the answer back from THOR's log, and
 only a report that counts lets a blocked turn end and stays quiet for the next
 16 hours. If the next ask says your report is on file but does not count, it
-names why; follow that.
+names why, names every other report on file that does not count, and names the
+last one that does; follow that. A one-line "restart Claude" notice for a
+report or a stale tool server is said once per report and session, then
+nothing until the line changes: no new line at a Stop means nothing new, not
+that the problem is gone.
 
 Do not store or change anything else unless the owner asks for it. The
 exceptions are the work the steps themselves call for: the verdicts, the

@@ -464,6 +464,23 @@ pub struct Marker {
     pub provisional_quote: String,
     #[serde(default)]
     pub provisional_rule_id: String,
+    /// When the marker was written (unix seconds); `0` for one written before
+    /// this was recorded, whose clock starts the next time the file is
+    /// rewritten (`prune_markers`).
+    #[serde(default)]
+    pub flagged_unix: i64,
+}
+
+/// How long a session's marker is kept after its prompt was flagged: a session
+/// that has not come back to its debt in this long never will (field test 15,
+/// collect 19f: the file only grew, 64 sessions and 54 KB).
+pub const MARKER_KEEP_SECS: i64 = 30 * 86_400;
+
+/// Drops the markers older than `MARKER_KEEP_SECS` and starts the clock of the
+/// ones written before it was recorded.
+pub fn prune_markers(markers: &mut HashMap<String, Marker>, now_unix: i64) {
+    markers.retain(|_, m| m.flagged_unix == 0 || now_unix - m.flagged_unix <= MARKER_KEEP_SECS);
+    markers.values_mut().filter(|m| m.flagged_unix == 0).for_each(|m| m.flagged_unix = now_unix);
 }
 
 /// The fallback rulebook and the marker file both sit beside the store,
@@ -507,7 +524,21 @@ pub fn flag_marker_text(
     seq_at_flag: i64,
     rulebook_text: Option<&str>,
 ) -> Option<String> {
+    flag_marker_text_at(existing_text, session_id, prompt, seq_at_flag, rulebook_text, crate::time::now_unix())
+}
+
+/// `flag_marker_text` at a given time: the markers of sessions that came back to
+/// nothing for `MARKER_KEEP_SECS` are dropped from the file it writes.
+pub fn flag_marker_text_at(
+    existing_text: Option<&str>,
+    session_id: &str,
+    prompt: &str,
+    seq_at_flag: i64,
+    rulebook_text: Option<&str>,
+    now_unix: i64,
+) -> Option<String> {
     let mut markers = existing_text.map(read_markers).unwrap_or_default();
+    prune_markers(&mut markers, now_unix);
     let provisional = decide_capture(rulebook_text, prompt);
     markers.insert(
         session_id.to_string(),
@@ -522,6 +553,7 @@ pub fn flag_marker_text(
             provisional_tier: provisional.as_ref().map(|d| d.tier),
             provisional_quote: provisional.as_ref().map(|d| d.quote.clone()).unwrap_or_default(),
             provisional_rule_id: provisional.as_ref().map(|d| d.rule_id.clone()).unwrap_or_default(),
+            flagged_unix: now_unix,
         },
     );
     serde_json::to_string(&markers).ok()
@@ -845,6 +877,7 @@ mod tests {
             provisional_tier: None,
             provisional_quote: String::new(),
             provisional_rule_id: String::new(),
+            flagged_unix: 0,
         }
     }
 
@@ -875,6 +908,7 @@ mod tests {
             provisional_tier: None,
             provisional_quote: String::new(),
             provisional_rule_id: String::new(),
+            flagged_unix: 0,
         }
     }
 
@@ -892,6 +926,34 @@ mod tests {
         let a = markers.get("session-a").expect("session-a must see its own marker");
         assert!(a.tier.is_none(), "a freshly flagged marker must carry no AUTHORITATIVE verdict yet");
         assert_eq!(a.prompt, "from now on always run the linter first");
+    }
+
+    /// Field test 15, collect 19f: `capture-owed.json` only grew (64 sessions,
+    /// 54 KB). A marker older than 30 days goes when the file is next written;
+    /// one written before the clock existed gets its clock started then.
+    #[test]
+    fn markers_older_than_thirty_days_are_dropped_when_the_file_is_written() {
+        let day = 86_400;
+        let now = 100 * day;
+        let old = Marker { flagged_unix: now - 31 * day, ..fresh_marker("old", 1) };
+        let recent = Marker { flagged_unix: now - 29 * day, ..fresh_marker("recent", 2) };
+        let legacy = fresh_marker("legacy", 3);
+        assert_eq!(legacy.flagged_unix, 0, "fixture sanity: written before the clock existed");
+        let existing: HashMap<String, Marker> =
+            [("old".to_string(), old), ("recent".to_string(), recent), ("legacy".to_string(), legacy)].into();
+        let text = serde_json::to_string(&existing).unwrap();
+
+        let written = flag_marker_text_at(Some(&text), "new", "from now on always run the linter first", 9, Some(RULEBOOK), now).unwrap();
+        let markers = read_markers(&written);
+        let mut kept: Vec<&str> = markers.keys().map(String::as_str).collect();
+        kept.sort();
+        assert_eq!(kept, ["legacy", "new", "recent"], "the 31-day-old marker is gone");
+        assert_eq!(markers["legacy"].flagged_unix, now, "its 30 days start now");
+        assert_eq!(markers["new"].flagged_unix, now);
+        // Thirty days later the legacy marker goes too.
+        let later = flag_marker_text_at(Some(&written), "x", "ordinary request", 10, None, now + 31 * day).unwrap();
+        let markers = read_markers(&later);
+        assert!(markers.get("legacy").is_none() && markers.get("recent").is_none() && markers.contains_key("x"), "{:?}", markers.keys());
     }
 
     /// C1 never decides whether turn end may block - it records ANY
@@ -1362,6 +1424,7 @@ mod tests {
             provisional_tier: None,
             provisional_quote: String::new(),
             provisional_rule_id: String::new(),
+            flagged_unix: 0,
         };
         let reason = block_reason(&marker);
         assert!(reason.contains(&marker.quote), "must name the trigger: {reason}");

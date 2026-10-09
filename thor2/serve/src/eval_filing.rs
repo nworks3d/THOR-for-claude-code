@@ -134,21 +134,7 @@ pub struct Checked {
 /// evaluation report of its project (created it, or newly tagged it, or
 /// moved it to another project) - with the item as that event wrote it.
 pub fn filing_event(store: &EventStore, report_id: &str) -> Option<(Event, Item)> {
-    let events = store.get_events_by_entity(report_id).ok()?;
-    let mut before: Option<Item> = None;
-    let mut filing: Option<(Event, Item)> = None;
-    for event in events.iter().filter(|e| matches!(e.kind, EventKind::FactCreated | EventKind::FactRevised | EventKind::FactSuperseded)) {
-        let Ok(item) = model::store::parse_body(&event.body) else { continue };
-        let files = match &before {
-            None => model::gate::is_evaluation_report(&item),
-            Some(prev) => model::gate::newly_filed_as_evaluation(prev, &item),
-        };
-        if files {
-            filing = Some((event.clone(), item.clone()));
-        }
-        before = Some(item);
-    }
-    filing
+    model::store::filing_event(store, report_id)
 }
 
 /// Whether the transcript `files` hold tool calls THOR cannot read although one
@@ -628,25 +614,7 @@ pub fn current_validation(store: &EventStore, report: &str) -> Option<Evaluation
 /// still has the digest the validator recorded - so a later typo fix below
 /// the block keeps it, and anything that changes the block drops it.
 pub fn newest_valid_evaluation(store: &EventStore, project: Option<&str>) -> Option<EvaluationValidation> {
-    let project = project?;
-    model::store::evaluation_validations(store)
-        .into_iter()
-        .map(|(_, v)| v)
-        .filter(|v| v.valid && v.project.as_deref() == Some(project))
-        .filter(|v| still_counts(store, v))
-        .max_by_key(|v| v.report_seq)
-}
-
-fn still_counts(store: &EventStore, v: &EvaluationValidation) -> bool {
-    let Ok(item) = model::store::show(store, &v.report) else { return false };
-    if !model::gate::is_evaluation_report(&item) || item.project != v.project {
-        return false;
-    }
-    if filing_event(store, &v.report).map(|(e, _)| e.seq) != Some(v.report_seq) {
-        return false;
-    }
-    let digest = model::gate::machine_block(&item.text).map(model::store::machine_block_digest);
-    digest.is_some() && digest == v.machine_sha256
+    model::store::newest_valid_evaluation(store, project)
 }
 
 /// Every live evaluation report of `project` with its current filing's
@@ -675,6 +643,22 @@ pub fn newest_invalid_report(store: &EventStore, project: Option<&str>) -> Optio
         .into_iter()
         .filter(|(_, seq, _)| *seq > valid_seq)
         .find_map(|(id, _, v)| v.filter(|v| !v.valid).map(|v| (id, why_in_words(store, &v))))
+}
+
+/// What the evaluation ask says about the project's reports (field test 14,
+/// C2): the id of the newest report that COUNTS (`None` when none does), and
+/// every report on file after it that does not, newest first, each with the
+/// validator's reason. `newest_invalid_report` names only the newest dead one,
+/// so an agent took an older dead report for a counted one.
+pub fn reports_not_counted(store: &EventStore, project: &str) -> (Option<String>, Vec<(String, String)>) {
+    let valid = newest_valid_evaluation(store, Some(project));
+    let valid_seq = valid.as_ref().map_or(0, |v| v.report_seq);
+    let dead = reports_of_project(store, project)
+        .into_iter()
+        .filter(|(_, seq, _)| *seq > valid_seq)
+        .filter_map(|(id, _, v)| v.filter(|v| !v.valid).map(|v| (id, why_in_words(store, &v))))
+        .collect();
+    (valid.map(|v| v.report), dead)
 }
 
 // ------------------------------------------------------- version skew, before and after

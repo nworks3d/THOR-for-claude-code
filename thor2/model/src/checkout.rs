@@ -293,9 +293,78 @@ pub fn validate_checkout(root: &Path, project: &str) -> Result<PathBuf, RootProb
 /// the top of a checkout; a linked worktree's `.git` file is followed to the
 /// repository's common config. Empty on anything unreadable, so a caller that
 /// is only looking for a match simply finds none.
+///
+/// A remote that git REWRITES (`url.<base>.insteadOf = <prefix>` in this
+/// config or the user's own) is listed twice: as written and as git reads it,
+/// so a clone reached through a rewritten address still matches the project
+/// that holds the other spelling (`rewrite_remotes`).
 pub fn remote_urls(repo_root: &Path) -> Vec<String> {
     let Some(config) = config_file(repo_root) else { return Vec::new() };
     let Ok(text) = std::fs::read_to_string(config) else { return Vec::new() };
+    let mut rewrites = url_rewrites(&text);
+    rewrites.extend(user_url_rewrites());
+    rewrite_remotes(remote_urls_in(&text), &rewrites)
+}
+
+/// Every `url.<base>.insteadOf = <prefix>` (and `pushInsteadOf`) of a git
+/// config text, as (prefix, base).
+fn url_rewrites(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut base: Option<String> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(header) = line.strip_prefix('[') {
+            let mut parts = header.trim_end_matches(']').splitn(2, '"');
+            let section = parts.next().unwrap_or("").trim();
+            base = (section.eq_ignore_ascii_case("url")).then(|| parts.next().unwrap_or("").trim_end_matches('"').to_string());
+            continue;
+        }
+        let (Some(base), Some((key, value))) = (base.as_ref(), line.split_once('=')) else { continue };
+        let key = key.trim();
+        if !(key.eq_ignore_ascii_case("insteadof") || key.eq_ignore_ascii_case("pushinsteadof")) {
+            continue;
+        }
+        let value = value.trim().trim_matches('"');
+        if !value.is_empty() && !base.is_empty() {
+            out.push((value.to_string(), base.clone()));
+        }
+    }
+    out
+}
+
+/// The rewrites of the user's own git configuration (`GIT_CONFIG_GLOBAL`, else
+/// `~/.gitconfig` and the XDG file). Empty when none can be read.
+fn user_url_rewrites() -> Vec<(String, String)> {
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(PathBuf::from);
+    let mut files: Vec<PathBuf> = Vec::new();
+    match std::env::var_os("GIT_CONFIG_GLOBAL") {
+        Some(path) => files.push(PathBuf::from(path)),
+        None => {
+            files.extend(home.iter().map(|h| h.join(".gitconfig")));
+            let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| home.as_ref().map(|h| h.join(".config")));
+            files.extend(xdg.map(|x| x.join("git").join("config")));
+        }
+    }
+    files.iter().filter_map(|f| std::fs::read_to_string(f).ok()).flat_map(|text| url_rewrites(&text)).collect()
+}
+
+/// `urls`, each followed by the address git reads it as when a rewrite's
+/// prefix starts it (the longest prefix wins, as in git).
+fn rewrite_remotes(urls: Vec<String>, rewrites: &[(String, String)]) -> Vec<String> {
+    let mut out = Vec::new();
+    for url in urls {
+        let rewritten = rewrites
+            .iter()
+            .filter(|(prefix, _)| url.starts_with(prefix.as_str()))
+            .max_by_key(|(prefix, _)| prefix.len())
+            .map(|(prefix, base)| format!("{base}{}", &url[prefix.len()..]));
+        out.push(url);
+        out.extend(rewritten);
+    }
+    out
+}
+
+fn remote_urls_in(text: &str) -> Vec<String> {
     let mut urls = Vec::new();
     let mut in_remote = false;
     for line in text.lines() {
@@ -572,5 +641,32 @@ mod remote_tests {
         .unwrap();
         assert_eq!(remote_urls(tmp.path()), vec!["https://example.invalid/o/r.git", "git@example.invalid:o/r.git"]);
         assert!(remote_urls(&tmp.path().join("not-there")).is_empty());
+    }
+
+    /// A remote rewritten with `url.<base>.insteadOf` is listed as written and
+    /// as git reads it, so a clone reached through the rewritten address still
+    /// matches the project that holds the other spelling (collect 16).
+    #[test]
+    fn a_rewritten_remote_is_listed_as_git_reads_it_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        std::fs::write(
+            tmp.path().join(".git/config"),
+            "[url \"git@example.invalid:\"]\n\tinsteadOf = https://example.invalid/\n[url \"git@example.invalid:org/\"]\n\tInsteadOf = https://example.invalid/org/\n[remote \"origin\"]\n\turl = https://example.invalid/org/repo.git\n[remote \"other\"]\n\turl = https://elsewhere.invalid/x/y.git\n",
+        )
+        .unwrap();
+        let urls = remote_urls(tmp.path());
+        assert_eq!(
+            urls,
+            vec!["https://example.invalid/org/repo.git", "git@example.invalid:org/repo.git", "https://elsewhere.invalid/x/y.git"],
+            "the longest prefix wins, and an address no rewrite starts is listed once"
+        );
+        assert_eq!(normalise_remote(&urls[1]).as_deref(), Some("example.invalid/org/repo"));
+        // Pure helpers.
+        assert_eq!(
+            rewrite_remotes(vec!["gh:o/r".to_string()], &[("gh:".to_string(), "https://example.invalid/".to_string())]),
+            vec!["gh:o/r", "https://example.invalid/o/r"]
+        );
+        assert_eq!(url_rewrites("[url \"b\"]\n\tpushInsteadOf = p\n[core]\n\tinsteadOf = nope\n"), vec![("p".to_string(), "b".to_string())]);
     }
 }

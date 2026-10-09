@@ -105,10 +105,70 @@ pub fn looks_like_comment(line: &str, extension: &str) -> bool {
 /// A contains check on such a literal holds while the behaviour it is meant
 /// to guard drifts or leaves, and refuses a harmless comment cleanup: the one
 /// outcome this system counts as most expensive.
+///
+/// HELP TEXT COUNTS AS COMMENTARY (field test 14, C4): a literal that sits in
+/// the usage text of a script (a multi-line string opened on a line that names
+/// help or usage, or a line printing "usage"/"help" before it) is prose about
+/// the behaviour, not the behaviour. A check on it was labelled "proven guard"
+/// and would refuse a harmless edit of the help.
 pub fn literal_only_in_comments(body: &str, path: &str, literal: &str) -> bool {
     let extension = Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("");
-    let mut hits = body.lines().filter(|l| l.contains(literal)).peekable();
-    hits.peek().is_some() && hits.all(|l| looks_like_comment(l, extension))
+    let in_help = lines_in_help_strings(body, extension);
+    let mut hits = body
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| l.contains(literal))
+        .map(|(i, l)| looks_like_comment(l, extension) || in_help[i] || help_before_literal(l, literal))
+        .peekable();
+    hits.peek().is_some() && hits.all(|commentary| commentary)
+}
+
+/// Whether the text before the first `literal` on `line` names help or usage
+/// (`console.log('Usage: ...`, `help: '...`): a one-line help string.
+fn help_before_literal(line: &str, literal: &str) -> bool {
+    let before = line.split(literal).next().unwrap_or("").to_lowercase();
+    before.contains("usage") || before.contains("help")
+}
+
+/// For each line of `body`, whether it lies in a multi-line string (a JS or
+/// TS template literal in backticks, a Python triple-quoted string) whose
+/// opening line names help or usage (`const HELP = \``, `USAGE = """`). Other
+/// extensions have none. Comment lines are skipped so a backtick in a remark
+/// does not open a string.
+fn lines_in_help_strings(body: &str, extension: &str) -> Vec<bool> {
+    let delimiters: &[&str] = match extension {
+        "js" | "mjs" | "cjs" | "jsx" | "ts" | "tsx" => &["`"],
+        "py" => &["\"\"\"", "'''"],
+        _ => &[],
+    };
+    let mut flags = Vec::new();
+    // The help flag of the string the scan is inside, if it is inside one.
+    let mut open: Option<(&str, bool)> = None;
+    for line in body.lines() {
+        if open.is_none() && looks_like_comment(line, extension) {
+            flags.push(false);
+            continue;
+        }
+        let mut inside = open.map_or(false, |(_, help)| help);
+        for &delimiter in delimiters {
+            if open.is_some_and(|(d, _)| d != delimiter) {
+                continue;
+            }
+            if line.matches(delimiter).count() % 2 == 0 {
+                continue;
+            }
+            open = match open {
+                Some(_) => None,
+                None => {
+                    let help = help_before_literal(line, delimiter);
+                    inside = help;
+                    Some((delimiter, help))
+                }
+            };
+        }
+        flags.push(inside);
+    }
+    flags
 }
 
 /// Resolve `relative` against `root`, refusing anything that could reach
@@ -1165,5 +1225,25 @@ mod tests {
         assert!(!literal_only_in_comments("let a = 1;\n", "a.rs", "widgets"), "absent is a failing check, not a hollow one");
         assert!(!literal_only_in_comments("# widgets\nbody\n", "README.md", "widgets"), "a heading is content");
         assert!(!literal_only_in_comments("#define WIDGETS 1\n", "pins.h", "WIDGETS"));
+    }
+
+    /// Field test 14, C4: the literal of `device-approve.js` sat in a header
+    /// comment and in the HELP template literal, and a check on it was labelled
+    /// "proven guard". Help text is commentary too.
+    #[test]
+    fn a_literal_only_in_comments_and_help_text_is_comment_only() {
+        let script = "/**\n * a device sees \"not approved yet\" here\n */\nconst HELP = `\nWHAT A MARK IS\n  A device that is not approved yet sees a code.\n`;\nrun(HELP);\n";
+        assert!(literal_only_in_comments(script, "device-approve.js", "not approved yet"));
+        assert!(literal_only_in_comments("console.log('Usage: widgets <name>');\nrun();\n", "a.js", "widgets"));
+        assert!(literal_only_in_comments("USAGE = \"\"\"\nrun widgets now\n\"\"\"\nmain()\n", "a.py", "widgets"));
+        // The help text is not the only place: a use in code keeps the check.
+        let used = format!("{script}if (state === 'not approved yet') stop();\n");
+        assert!(!literal_only_in_comments(&used, "device-approve.js", "not approved yet"));
+        // A template literal that is not help text (a query, a message) is code.
+        assert!(!literal_only_in_comments("const q = `\nselect widgets from t\n`;\n", "a.js", "widgets"));
+        // The string closes: a literal after it is code again.
+        assert!(!literal_only_in_comments("const HELP = `\nuse it\n`;\nlet widgets = 1;\n", "a.js", "widgets"));
+        // Another file type has no multi-line strings read here.
+        assert!(!literal_only_in_comments("HELP = `\nwidgets\n`\n", "a.rs", "widgets"));
     }
 }
