@@ -78,7 +78,7 @@ static SESSION: OnceLock<Regex> = OnceLock::new();
 
 /// THOR's own program names: a path ending in one keeps that name, because
 /// "which program" is evidence and the folder it sits in is not.
-const PROGRAMS: &[&str] = &["serve", "mcp", "doctor", "install", "backup", "sync", "library", "codeindex"];
+const PROGRAMS: &[&str] = &["serve", "mcp", "doctor", "install", "backup", "sync", "library"];
 
 fn keep_program_name(matched: &str) -> String {
     // Punctuation that ends a sentence is not part of the path.
@@ -199,6 +199,8 @@ pub fn residue(text: &str, known: &Known) -> Vec<&'static str> {
 pub struct WriteUp<'a> {
     pub fingerprint: &'a str,
     pub signal: &'a str,
+    /// A short title, without the signal.
+    pub title: &'a str,
     pub summary: &'a str,
     pub why_thor: &'a str,
     pub evidence: &'a [String],
@@ -211,10 +213,8 @@ pub struct WriteUp<'a> {
 
 /// The issue title.
 pub fn title(w: &WriteUp<'_>, known: &Known) -> String {
-    let title = scrub(w.summary, known);
-    let first = title.trim_end_matches('.');
-    let cut: String = first.chars().take(90).collect();
-    format!("{cut} [{}]", w.signal)
+    let title = scrub(w.title, known);
+    format!("{} [{}]", title.trim().trim_end_matches('.'), w.signal)
 }
 
 /// The issue (or pull request) body: version and build, the signal, redacted
@@ -254,7 +254,7 @@ pub fn nudge(w: &WriteUp<'_>, mode: Mode, known: &Known) -> String {
     let title = title(w, known);
     let body = body(w, known);
     let fp = w.fingerprint;
-    let short: String = scrub(w.summary, known).chars().take(90).collect();
+    let short: String = scrub(w.title, known).chars().take(100).collect();
     let report_id = format!("{}{fp}", model::store::THOR_BUG_ID_PREFIX);
     let tag = format!("{}{}", crate::thor_bugs::REPORT_TAG_PREFIX, w.fingerprint);
     let mut out = String::new();
@@ -375,6 +375,7 @@ mod tests {
         WriteUp {
             fingerprint: "hook-launch-1a2b3c4d",
             signal: "hook-launch",
+            title: "Hook launch failure: SessionStart hook, exit code 126 in C:\\Users\\someone\\thor2",
             summary: "Claude Code could not start THOR's hook (SessionStart, exit code 126) in C:\\Users\\someone\\thor2.",
             why_thor: "No other program's hook failed at the same moment, so the machine was not shutting down.",
             evidence,

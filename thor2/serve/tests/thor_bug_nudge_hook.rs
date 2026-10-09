@@ -4,7 +4,7 @@
 //! never gets one, nothing is offered before an install wrote a mode, and
 //! the test-environment wording appears only in test mode.
 
-use model::store::{HookFault, SystemActor, ATTESTER_ACTOR};
+use model::store::{HookFault, ATTESTER_ACTOR};
 use serve::bug_report::Mode;
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -41,7 +41,9 @@ fn store_with_a_hook_failure() -> (tempfile::TempDir, std::path::PathBuf) {
         at: "2026-10-06T22:29:00.231Z".to_string(),
         host_wide: false,
     };
-    model::store::record_hook_fault(&mut store, "s-old", SystemActor::new(ATTESTER_ACTOR), &fault).unwrap();
+    let body = serde_json::json!({ "hook_fault": fault }).to_string();
+    let entity = model::store::hook_fault_entity("s-old");
+    store.append_event("s-old", "s-old", ATTESTER_ACTOR, thor_core::event_store::EventKind::GateStoodAside, &entity, None, &body).unwrap();
     (dir, db)
 }
 

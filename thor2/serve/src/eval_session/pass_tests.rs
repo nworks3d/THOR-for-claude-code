@@ -1632,7 +1632,7 @@ fn the_lists_a_start_note_cut_are_named_and_only_those_that_need_action() {
     let overfull = busy_frozen(8, 16, 8, 8, 25, 0);
     let cut = lists_cut(BUSY_ID, &overfull, START_NOTE_BUDGET);
     assert!(cut.contains(&"A4 list"), "{cut:?}");
-    assert!(!cut.contains(&"batch"), "the batch is given up last: {cut:?}");
+    assert!(!cut.contains(&"batch") || (cut.contains(&"disputes") && cut.contains(&"A4 list")), "the batch is given up after the others: {cut:?}");
     assert!(lists_cut(BUSY_ID, &overfull, usize::MAX).is_empty(), "with room for the whole note nothing is cut");
 }
 

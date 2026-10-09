@@ -1,6 +1,8 @@
+#![cfg(test)]
+
 use super::*;
 use model::item::{Item, Kind};
-use model::store::{EvaluationValidation, HookFault, SystemActor, VerdictShares, EVAL_VALIDATOR_ACTOR};
+use model::store::{EvaluationValidation, HookFault, VerdictShares, EVAL_VALIDATOR_ACTOR};
 
 const T0: i64 = 1_800_000_000;
 
@@ -36,7 +38,9 @@ impl Fx {
             verdicts: VerdictShares::default(),
             carry: Vec::new(),
         };
-        model::store::record_evaluation_validation(&mut self.store, SystemActor::new(EVAL_VALIDATOR_ACTOR), &record).unwrap();
+        // A fixture event written raw: a test holds no THOR actor token.
+        let body = serde_json::to_string(&record).unwrap();
+        self.store.append_event("s-filing", "s-filing", EVAL_VALIDATOR_ACTOR, EventKind::GateStoodAside, report, None, &body).unwrap();
     }
 
     fn hook_fault(&mut self, id: &str, event: &str, exit_code: i64, host_wide: bool) {
@@ -47,7 +51,9 @@ impl Fx {
             at: "2026-10-06T22:29:00.231Z".to_string(),
             host_wide,
         };
-        model::store::record_hook_fault(&mut self.store, "s-fault", SystemActor::new(ATTESTER_ACTOR), &fault).unwrap();
+        let body = serde_json::json!({ "hook_fault": fault }).to_string();
+        let entity = model::store::hook_fault_entity("s-fault");
+        self.store.append_event("s-fault", "s-fault", ATTESTER_ACTOR, EventKind::GateStoodAside, &entity, None, &body).unwrap();
     }
 }
 
@@ -73,6 +79,32 @@ fn the_same_bug_has_the_same_fingerprint_whatever_the_session_or_the_counts() {
     assert_ne!(a.fingerprint(), hook_launch_finding("Stop", 126).fingerprint());
     let sweep = |refused| sweep_finding(&SweepHit { engine_class: "Monitor loops".into(), refused, of_calls: 99, example_shape: "until".into() });
     assert_eq!(sweep(3).fingerprint(), sweep(40).fingerprint(), "counts are evidence, not identity");
+}
+
+#[test]
+fn every_kind_of_finding_has_a_short_title_and_the_whole_template() {
+    let findings = [
+        filing_finding(&skew_why(6, 7)).unwrap(),
+        filing_finding(MISMATCH_WHY).unwrap(),
+        filing_finding("the filing gate, run again on the log as it stood at seq 1, refuses it: x").unwrap(),
+        hook_launch_finding("Stop", 126),
+        hook_panic_finding("hook", "serve/src/live.rs:3"),
+        false_block_pattern_finding("git", 2, 3),
+        sweep_finding(&SweepHit { engine_class: "Monitor loops".into(), refused: 1, of_calls: 2, example_shape: "until".into() }),
+        seed_refused_finding("starter", "REFUSED: x"),
+        start_note_cut_finding(&["A4 list"]),
+        doctor_routine_finding("zebra"),
+    ];
+    for f in &findings {
+        assert!(!f.title.is_empty() && f.title.chars().count() <= 100 && !f.title.ends_with('.'), "{}: {}", f.signal.as_str(), f.title);
+        for part in [&f.summary, &f.why_thor, &f.expected, &f.actual, &f.fix_area] {
+            assert!(!part.trim().is_empty(), "{}", f.signal.as_str());
+        }
+        assert!(!f.evidence.is_empty(), "{}", f.signal.as_str());
+        for text in std::iter::once(&f.title).chain(std::iter::once(&f.summary)).chain(f.evidence.iter()) {
+            assert!(text.is_ascii(), "plain ASCII only: {text}");
+        }
+    }
 }
 
 #[test]
@@ -386,7 +418,7 @@ fn a_scan_is_not_repeated_within_five_minutes() {
 
 #[test]
 fn the_nudge_carries_nothing_private_even_when_a_detector_was_careless() {
-    let mut fx = Fx::new();
+    let fx = Fx::new();
     write_mode(&fx.db, Mode::Release).unwrap();
     let dir = fx.db.parent().unwrap().display().to_string();
     let leak = format!("REFUSED: could not write C:\\Users\\someone\\thor2\\notes at {dir} for host build-box.internal 10.9.8.7");

@@ -73,6 +73,8 @@ const EVIDENCE_LINES: usize = 5;
 const EVIDENCE_LINE_CHARS: usize = 300;
 /// A scan is not repeated within this many seconds.
 pub const SCAN_EVERY_SECONDS: i64 = 300;
+/// How far before the watermark a scan looks again for evaluation starts.
+const START_OVERLAP_EVENTS: i64 = 200;
 /// The first scan of a store with no watermark reads the log from this far
 /// back (events), not from its beginning.
 pub const FIRST_SCAN_EVENTS: i64 = 100_000;
@@ -118,6 +120,8 @@ impl Signal {
 pub struct Finding {
     pub signal: Signal,
     pub key: String,
+    /// A short issue title.
+    pub title: String,
     pub summary: String,
     pub why_thor: String,
     pub evidence: Vec<String>,
@@ -155,6 +159,7 @@ pub fn filing_finding(why: &str) -> Option<Finding> {
         let ours = why.split("this checker reads format ").nth(1).and_then(|r| r.split(' ').next()).unwrap_or("?").to_string();
         return Some(Finding {
             signal: Signal::FilingSkew,
+            title: "Evaluation report refused: tool server and checker render different formats".to_string(),
             key: format!("{theirs}>{ours}"),
             summary: format!(
                 "A finished evaluation report was refused because the tool server rendered its machine section in \
@@ -178,13 +183,15 @@ pub fn filing_finding(why: &str) -> Option<Finding> {
     if why.contains("its machine section is not the one THOR derives from the log") {
         return Some(Finding {
             signal: Signal::FilingMismatch,
+            title: "Evaluation report refused: machine section differs although the format is the same".to_string(),
             key: format!("mismatch-rev{}", model::gate::MACHINE_RENDERER_REV),
             summary: "A finished evaluation report was refused because its machine section differs from the one the \
                       checker derives from the log, although both use the same format."
                 .to_string(),
             why_thor: "The machine section is written by THOR from the log, not typed by the agent. With the same format \
                        on both sides, a difference means the renderer is not deterministic, or the log the checker replays \
-                       is not the log the writer read."
+                       is not the log the writer read. The checker's reason also covers a hand edit, so confirm in the log \
+                       that nobody edited the section before reporting."
                 .to_string(),
             evidence: vec![
                 "the validator's record says the machine section is not the derived one".to_string(),
@@ -199,6 +206,7 @@ pub fn filing_finding(why: &str) -> Option<Finding> {
     if why.starts_with("the filing gate, run again on the log as it stood") {
         return Some(Finding {
             signal: Signal::FilingGate,
+            title: "Evaluation report refused at the Stop by a gate that accepted it at write time".to_string(),
             key: "gate-rerun".to_string(),
             summary: "The filing gate, run again at the end of the turn, refused a report the write-time gate had accepted."
                 .to_string(),
@@ -225,6 +233,7 @@ pub fn hook_launch_finding(event: &str, exit_code: i64) -> Finding {
     let cause = crate::hook_faults::cause_in_words(exit_code, "");
     Finding {
         signal: Signal::HookLaunch,
+        title: format!("Hook launch failure: {event} hook, exit code {exit_code}"),
         key: format!("{event}:{exit_code}"),
         summary: format!("Claude Code could not start THOR's {event} hook (exit code {exit_code})."),
         why_thor: "No other program's hook failed at the same moment, so the machine was not suspending; the failing \
@@ -245,6 +254,7 @@ pub fn hook_launch_finding(event: &str, exit_code: i64) -> Finding {
 pub fn hook_panic_finding(event: &str, location: &str) -> Finding {
     Finding {
         signal: Signal::HookPanic,
+        title: format!("Hook panic at {location}"),
         key: location.to_string(),
         summary: format!("THOR's {event} hook panicked at {location} and said nothing."),
         why_thor: "A panic is a defect in the program by definition; the hook fails open and silent, so nothing else ever \
@@ -261,6 +271,7 @@ pub fn hook_panic_finding(event: &str, location: &str) -> Finding {
 pub fn false_block_pattern_finding(command_word: &str, rules: usize, blocks: usize) -> Finding {
     Finding {
         signal: Signal::FalseBlockPattern,
+        title: format!("Several rules loosened after refusing '{command_word}' calls"),
         key: command_word.to_string(),
         summary: format!(
             "{rules} different rules were weakened or retracted soon after refusing calls that start with '{command_word}'."
@@ -291,6 +302,7 @@ pub struct SweepHit {
 pub fn sweep_finding(hit: &SweepHit) -> Finding {
     Finding {
         signal: Signal::Sweep,
+        title: format!("Guard refuses ordinary calls: {}", hit.engine_class),
         key: hit.engine_class.clone(),
         summary: format!("A replay of real calls found the guard refusing ordinary ones ({}).", hit.engine_class),
         why_thor: "The sweep replays real calls against every rule that can refuse; a class of calls refused across \
@@ -312,6 +324,7 @@ pub fn seed_refused_finding(note_id: &str, refusal: &str) -> Finding {
     let first: String = refusal.lines().next().unwrap_or("").chars().take(200).collect();
     Finding {
         signal: Signal::SeedRefused,
+        title: format!("Write gate refuses THOR's own starting note '{note_id}'"),
         key: note_id.to_string(),
         summary: format!("The write gate refused THOR's own starting note '{note_id}' at install."),
         why_thor: "The starting notes ship with THOR and are written by the installer; a user cannot have caused their \
@@ -329,6 +342,7 @@ pub fn start_note_cut_finding(lists: &[&str]) -> Finding {
     let names = lists.join(", ");
     Finding {
         signal: Signal::StartNoteCut,
+        title: format!("Start note cuts items that need action: {names}"),
         key: names.clone(),
         summary: format!("The evaluation start note had to leave out items of: {names}."),
         why_thor: "The size budget and the order in which lists are given up are THOR's; items that need action were held \
@@ -348,6 +362,7 @@ pub fn start_note_cut_finding(lists: &[&str]) -> Finding {
 pub fn doctor_routine_finding(label: &str) -> Finding {
     Finding {
         signal: Signal::DoctorRoutine,
+        title: format!("doctor line '{label}:' is not described in the evaluation routine"),
         key: label.to_string(),
         summary: format!("doctor prints a line labelled '{label}:' that the installed evaluation routine never mentions."),
         why_thor: "Doctor and the routine are written together and ship together; the routine is what tells the agent what \
@@ -552,8 +567,8 @@ pub fn detect(store: &EventStore, since: i64) -> Vec<Finding> {
             found.extend(filing_finding(&v.why));
         }
     }
-    if let Ok(events) = store.events_of_kinds_by_actor(&[EventKind::GateStoodAside], ATTESTER_ACTOR) {
-        for event in events.iter().filter(|e| e.seq > since) {
+    if let Ok(events) = store.events_of_kinds(&[EventKind::GateStoodAside], since) {
+        for event in events.iter().filter(|e| e.actor == ATTESTER_ACTOR) {
             let Some(body) = serde_json::from_str::<serde_json::Value>(&event.body).ok() else { continue };
             let Some(fault) = body.get("hook_fault").and_then(|f| serde_json::from_value::<model::store::HookFault>(f.clone()).ok())
             else {
@@ -564,7 +579,9 @@ pub fn detect(store: &EventStore, since: i64) -> Vec<Finding> {
             }
         }
     }
-    for start in model::store::evaluation_starts_after(store, since) {
+    // A start is judged once its batch record is written, a few events after
+    // it: the overlap lets a scan that ran in between look again.
+    for start in model::store::evaluation_starts_after(store, since.saturating_sub(START_OVERLAP_EVENTS)) {
         found.extend(start_findings(&start));
     }
     found
@@ -702,9 +719,15 @@ pub fn nudge_for_session(db: &Path, session: &str, now: i64) -> Option<String> {
     if book.nudged.contains_key(session) {
         return None;
     }
+    // Between scans, with nothing waiting, a prompt costs one small file read:
+    // the store is not even opened.
+    let scan_due = now - book.last_scan_unix >= SCAN_EVERY_SECONDS || book.last_scan_unix > now;
+    if !scan_due && pick(&book, now).is_none() {
+        return None;
+    }
     let store = crate::store_dir::open_existing(db).ok()?;
     let version = version_text();
-    if now - book.last_scan_unix >= SCAN_EVERY_SECONDS || book.last_scan_unix > now {
+    if scan_due {
         scan(db, &store, &mut book, now, &version);
         book.last_scan_unix = now;
     }
@@ -715,6 +738,7 @@ pub fn nudge_for_session(db: &Path, session: &str, now: i64) -> Option<String> {
         let w = WriteUp {
             fingerprint: &c.fingerprint,
             signal: c.finding.signal.as_str(),
+            title: &c.finding.title,
             summary: &c.finding.summary,
             why_thor: &c.finding.why_thor,
             evidence: &c.finding.evidence,
