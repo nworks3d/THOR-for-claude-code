@@ -57,11 +57,13 @@ send them off to type a command or a path: you have the tools, so run it.
    in a commit, and the rest listed below), and that any can be removed by saying
    so. That to change anything they only have to tell you.
 
+---
+
 ## What the machine needs first
 
 You do this inside step 1, for them, with the package manager the system already
 has. Check each program; install it ONLY when the check fails. Never ask the
-person to type or paste anything, and never ask which way they prefer.
+person to type or paste anything, and never offer them a choice of ways.
 
 | Needed | Why | Check | Windows (winget) | macOS (brew) | Linux |
 | --- | --- | --- | --- | --- | --- |
