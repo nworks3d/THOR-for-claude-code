@@ -547,7 +547,7 @@ fn fires_for_a_main_session_and_names_the_real_eval_path_when_it_exists() {
     assert!(reason.contains("[THOR]"), "{reason}");
     assert!(reason.contains("This project has had no evaluation in the last 16 hours"), "{reason}");
     assert!(reason.contains("This session has worked here for"), "{reason}");
-    assert!(reason.contains(&format!("{OWED_CONTEXT_COUNT} item(s) are owed a verdict store-wide for this project")), "{reason}");
+    assert!(reason.contains(&format!("{OWED_CONTEXT_COUNT} more item(s) of this project owe a verdict because other sessions fired them")), "{reason}");
     assert!(reason.contains("It has been asked 1 time(s)"), "{reason}");
     let expected_path = sandbox.eval_command_path();
     assert!(reason.contains(&expected_path.display().to_string()), "must name the real eval file path: {reason}");
@@ -896,7 +896,7 @@ fn fires_with_zero_items_owed_once_worked_long_enough() {
     let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("expected a decision JSON: {e}: {out}"));
     assert_eq!(v["decision"], "block", "a zero-item backlog must still owe an evaluation: {out}");
     let reason = v["reason"].as_str().unwrap();
-    assert!(reason.contains("0 item(s) are owed a verdict store-wide for this project"), "{reason}");
+    assert!(reason.contains("No item is on this evaluation's verdict list"), "{reason}");
 }
 
 /// Case named in the build brief: the session's first serving here was less
@@ -1102,7 +1102,7 @@ fn a_report_seen_today_with_three_hours_accrued_since_fires_the_repeat_message()
         reason.contains("A new evaluation is due, covering only what happened since then plus the state of the work"),
         "{reason}"
     );
-    assert!(reason.contains(&format!("{OWED_CONTEXT_COUNT} item(s) are owed a verdict store-wide for this project")), "{reason}");
+    assert!(reason.contains(&format!("{OWED_CONTEXT_COUNT} more item(s) of this project owe a verdict because other sessions fired them")), "{reason}");
     assert!(reason.contains("A turn cannot end until the evaluation report for this project is filed"), "{reason}");
     assert!(!reason.contains("It has been asked"), "the repeat message names hours and a report id, never an ask count: {reason}");
 }

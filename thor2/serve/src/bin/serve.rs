@@ -3049,7 +3049,7 @@ fn evaluation_debt(
     let state = usefulness::project_eval_state(db_path, Some(project));
     let by_floor = usefulness::project_due(store, &state, project, work, time::now_unix(), usefulness::EVAL_CADENCE)?;
     let clock = usefulness::EvalClock { work: work.clone(), own_minutes: work.accrued_secs / 60, by_floor };
-    Some(evaluation_ask(store, db_path, project, &clock, Some(project)))
+    Some(evaluation_ask(store, db_path, project, &clock, Some(project), "test-session"))
 }
 
 /// The text of a main session's Stop held by `reason`, with the evaluation
@@ -3444,7 +3444,7 @@ fn eval_stop_ask(
                     elsewhere.get_or_insert_with(|| serve::holder::holder_line(&project, &session, idle_minutes, why));
                     continue;
                 }
-                let reason = evaluation_ask(store, db_path, &project, &clock, at.folder);
+                let reason = evaluation_ask(store, db_path, &project, &clock, at.folder, session_id);
                 usefulness::record_eval_debt_asked(db_path, Some(&project), now);
                 // The ask is where this evaluation starts: one start record
                 // in the log freezes the three lists its report is held to,
@@ -3485,6 +3485,30 @@ fn eval_stop_ask(
     elsewhere.map_or(EvalStop::Quiet, EvalStop::Elsewhere)
 }
 
+/// How many verdicts the evaluation about to start will hold the report to, and
+/// how many items are owed one that it will NOT list (field test 15, collect
+/// 19b: the ask always said "1 item owed a verdict", which no evaluation lists).
+/// The evaluation lists only what fired in the asked session; an item owed a
+/// verdict because other sessions fired it is counted store-wide, asked of no
+/// report and needs nothing now. The list is computed as the start computes it.
+fn verdict_list_words(store: &EventStore, project: &str, session_id: &str) -> String {
+    let (_, owed_in_project) = usefulness::judgement_debt_counts(store, Some(project));
+    let started_seq = store.get_next_seq().map(|n| n - 1).unwrap_or(0);
+    let listed = model::store::evaluation_judgement_list(store, Some(project), session_id, started_seq).len();
+    let unlisted = owed_in_project.saturating_sub(listed);
+    let on_list = match listed {
+        0 => "No item is on this evaluation's verdict list (the items that fired in this session and owe a verdict)".to_string(),
+        n => format!("{n} item(s) will be on this evaluation's verdict list (the items that fired in this session and owe a verdict)"),
+    };
+    match unlisted {
+        0 => format!("{on_list}."),
+        n => format!(
+            "{on_list}. {n} more item(s) of this project owe a verdict because other sessions fired them; no evaluation of this \
+             session lists them, they hold no report and need nothing from you."
+        ),
+    }
+}
+
 /// The reports of `project` on file that do not count, for the top of the
 /// ask (field test 14, C2): the newest first with its reason, then each older
 /// dead one, then which report is the last that COUNTS, so a dead report is
@@ -3521,6 +3545,7 @@ fn evaluation_ask(
     project: &str,
     clock: &usefulness::EvalClock,
     folder_project: Option<&str>,
+    session_id: &str,
 ) -> String {
     let current_project = Some(project);
     let work = &clock.work;
@@ -3528,7 +3553,7 @@ fn evaluation_ask(
     let accrued_minutes = work.accrued_secs / 60;
     let own_minutes = clock.own_minutes;
     let state = usefulness::project_eval_state(db_path, current_project);
-    let (_, owed_in_project) = usefulness::judgement_debt_counts(store, current_project);
+    let owed_words = verdict_list_words(store, project, session_id);
     // THE ASK FOLLOWS THE WORK (D11): named when the folder is elsewhere.
     let elsewhere = match folder_project {
         Some(folder) if folder == project => String::new(),
@@ -3608,8 +3633,8 @@ fn evaluation_ask(
         format!(
             "{elsewhere}{not_counted}[THOR] This session has worked here for {hours:.1} hour(s) since the last evaluation report ('{report_id}'){together}\
              {risk_text}.{floor} \
-             A new evaluation is due, covering only what happened since then plus the state of the work; \
-             {owed_in_project} item(s) are owed a verdict store-wide for this project (the evaluation's own list, fixed when it starts, may hold fewer or none). \
+             A new evaluation is due, covering only what happened since then plus the state of the work. \
+             {owed_words} \
              Run the THOR evaluation before you finish: {ask} \
              A turn cannot end until the evaluation report for this project is filed."
         )
@@ -3629,7 +3654,7 @@ fn evaluation_ask(
         format!(
             "{elsewhere}{not_counted}[THOR] This project has had no evaluation in the last {covers_hours} hours (project '{project}').{floor} \
              This session has worked here for {own_minutes} minute(s){together}; \
-             {owed_in_project} item(s) are owed a verdict store-wide for this project (the evaluation's own list, fixed when it starts, may hold fewer or none). It has been asked {asked_count} time(s) - the first \
+             {owed_words} It has been asked {asked_count} time(s) - the first \
              {} day(s) ago - with no report filed yet. \
              Run the THOR evaluation before you finish: {ask} \
              A turn cannot end until the evaluation report for this project is filed. After that it is quiet for {covers_hours} hours.",
@@ -5045,6 +5070,22 @@ mod evaluation_debt_tests {
         assert!(text.ends_with("The evaluation is still owed.\n\n"), "{text}");
     }
 
+    /// Field test 15, collect 19b: the ask counts what the evaluation can list
+    /// (what fired in the asked session) apart from what is owed only because
+    /// other sessions fired it, and says which is which.
+    #[test]
+    fn the_ask_counts_the_verdict_list_apart_from_what_other_sessions_owe() {
+        let (_dir, _db, mut store) = new_store();
+        owe_project(&mut store, 2, Some("thor"));
+        // The fixture serves each item in sessions s0..: session "s0" saw both.
+        let seen = verdict_list_words(&store, "thor", "s0");
+        assert_eq!(seen, "2 item(s) will be on this evaluation's verdict list (the items that fired in this session and owe a verdict).");
+        let elsewhere = verdict_list_words(&store, "thor", "never-in-the-room");
+        assert!(elsewhere.starts_with("No item is on this evaluation's verdict list"), "{elsewhere}");
+        assert!(elsewhere.contains("2 more item(s) of this project owe a verdict because other sessions fired them"), "{elsewhere}");
+        assert!(elsewhere.ends_with("need nothing from you."), "{elsewhere}");
+    }
+
     /// Field test 14, C5: a line is said to a session once, then not again
     /// until the line itself changes.
     #[test]
@@ -5201,7 +5242,7 @@ mod evaluation_debt_tests {
         assert!(asked.contains("This project has had no evaluation in the last 16 hours"), "{asked}");
         assert!(asked.contains("This session has worked here for"), "{asked}");
         assert!(asked.contains("minute(s)"), "{asked}");
-        assert!(asked.contains("12 item(s) are owed a verdict store-wide for this project"), "{asked}");
+        assert!(asked.contains("12 more item(s) of this project owe a verdict because other sessions fired them"), "{asked}");
         assert!(asked.contains("It has been asked 1 time(s)"), "{asked}");
         assert!(asked.contains("A turn cannot end until the evaluation report for this project is filed"), "{asked}");
         assert!(asked.contains("After that it is quiet for 16 hours"), "{asked}");
@@ -5255,7 +5296,7 @@ mod evaluation_debt_tests {
         let (_dir, db, store) = new_store();
         let asked =
             evaluation_debt(&store, &db, Some("thor"), &work_minutes(90)).expect("a zero-item backlog must still owe an evaluation");
-        assert!(asked.contains("0 item(s) are owed a verdict store-wide for this project"), "{asked}");
+        assert!(asked.contains("No item is on this evaluation's verdict list"), "{asked}");
     }
 
     /// THE NO-PROJECT GUARD (`no evaluation is asked outside a project,
@@ -5467,7 +5508,7 @@ mod evaluation_debt_tests {
             asked.contains("A new evaluation is due, covering only what happened since then plus the state of the work"),
             "{asked}"
         );
-        assert!(asked.contains("5 item(s) are owed a verdict store-wide for this project"), "{asked}");
+        assert!(asked.contains("5 more item(s) of this project owe a verdict because other sessions fired them"), "{asked}");
         assert!(asked.contains("A turn cannot end until the evaluation report for this project is filed"), "{asked}");
         assert!(
             !asked.contains("It has been asked"),
