@@ -272,7 +272,7 @@ pub fn version_skew_words<S: AsRef<str>>(programs: &[(S, Option<String>)]) -> Op
     let mut parts: Vec<String> = with_id.iter().map(|(name, id)| format!("{name} is build {id}")).collect();
     parts.extend(without_id.iter().map(|name| format!("{name} prints no build id (it is older than the others)")));
     Some(format!(
-        "installed programs: {} - they were not built from the same source, so they may count, judge and check filings differently (a report filed by the older one is refused). Copy every program from one build into the folder (run install.exe again), then restart Claude.",
+        "installed programs: {} - the programs come from different builds, which happens when a fix is installed into one program without a restart. Evaluation filings still count. Restart Claude only when a \"tool server:\" line is also printed.",
         parts.join(", ")
     ))
 }
@@ -7726,7 +7726,10 @@ mod launch_and_skew_tests {
         ];
         let line = version_skew_words(&skewed).expect("two builds");
         assert!(line.contains("serve.exe is build aaaaaaaaaaaa") && line.contains("mcp.exe is build bbbbbbbbbbbb"), "{line}");
-        assert!(line.contains("not built from the same source") && line.contains("restart Claude"), "{line}");
+        assert!(line.contains("come from different builds") && line.contains("Evaluation filings still count"), "{line}");
+        assert!(line.contains("only when a \"tool server:\" line is also printed"), "{line}");
+        assert!(!line.contains("refused") && !line.contains("run install.exe again"), "no order to reinstall or restart: {line}");
+        assert!(line.is_ascii() && !line.contains('\n'), "one plain line: {line}");
     }
 
     #[test]
