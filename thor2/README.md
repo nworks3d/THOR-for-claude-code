@@ -124,15 +124,15 @@ the owner's language, work lane only, every starting note kept), and so does the
 turn-end reminder that holds the session, so a fresh agent that never read
 AGENTS.md finishes the setup in one sentence without asking anything.
 
-Fifteen more notes make up the workflow starter pack, tagged
+Thirteen more notes make up the workflow starter pack, tagged
 `workflow-starter` (`ops::install::workflow_starter_pack`): general
 coding-workflow habits that were marked useful again and again in the store of
 the person who built this, rewritten to hold on any project - a changelog line
 with every user-visible change when the project keeps a changelog, tests run
 and the real result quoted before "done", no secret in a commit, push hygiene,
-a scan before anything goes public, complete agent briefs, and a few more.
+a scan before anything goes public, and a few more.
 None is pinned: each is bound to the moment or command it is about (commit,
-push, publish, delete, deploy, install, an agent being spawned, a `cd`, a
+push, publish, delete, deploy, install, a `cd`, a
 shell one-liner, `Start-Process`) and arrives right before it, once per
 conversation. Only two carry a check, and only on a Windows install: no
 `Start-Process` without a hidden form unless it opens something the user asked
@@ -145,6 +145,13 @@ a new user must never get a false block from a rule they did not write. They all
 is reported rather than worked around - a memory whose own gate rejects the
 notes it ships with is worth seeing. An EXISTING store is never seeded, so
 upgrading never pushes anything into someone's real notes.
+
+Helper-agent mode (the two notes `orchestrator-mode-saves-quota` and
+`an-agent-brief-stands-alone`, bound to the Agent tool) is not part of the pack:
+it is off in a new memory, and `install --set-helpers on|off --db <store>`
+stores or retracts exactly those two (`ops::install::set_helpers`). A retracted
+id cannot be created a second time (it would have two heads), so `on` after an
+`off` stores the note again and then resolves the id onto the new version.
 
 It also seeds a starting rulebook for the answer guard described below, the
 first time it finds none sitting next to the store: the same five example
@@ -230,7 +237,9 @@ per project and not per folder, when:
   source in the mode sidecar, `install --set-plan` records the user's word, and
   `install --set-weekly-check off` switches the automatic ask off, `install
   --set-backup local|<place>|off` chooses the backup, which a fresh install does
-  not make, and `install --set-recording off` stops the record of real calls);
+  not make, `install --set-helpers on|off` switches helper-agent mode, which a
+  fresh install leaves off, and `install --set-recording off` stops the record
+  of real calls);
 - this session has at least 10 minutes of its own work in that project since
   then (the larger of the clock file's number and the session record's own
   count, so zeroing the file delays the ask at most until the record is read);

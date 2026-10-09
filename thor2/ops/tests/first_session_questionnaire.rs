@@ -179,14 +179,35 @@ fn every_install_flag_the_list_names_exists_in_the_installer() {
 }
 
 #[test]
-fn helper_agent_mode_states_the_measurement_and_the_free_chat() {
+fn helper_agent_mode_is_off_by_default_and_states_the_measurement_the_free_chat_and_the_costs() {
     let q = questions().into_iter().find(|q| q.id == "helper-agents").unwrap();
+    assert!(q.line.ends_with("Default: off."), "the one line the user sees says it is off: {}", q.line);
+    assert_eq!(q.default, "Off.");
     assert!(q.why.contains("12 to 62 percent cheaper"), "{}", q.why);
     assert!(q.why.contains("chat stays free"), "{}", q.why);
-    assert_eq!(q.default, "On.");
+    // The honest side: the reasons somebody may not want it, and when no helper is used.
+    for must in [
+        "do not see the work happen",
+        "cannot steer a helper halfway",
+        "fixed context cost",
+        "small tasks cost more",
+        "knows nothing of the conversation beyond its brief",
+        "collide in the same files",
+        "extra turn",
+        "No helper is used for a question",
+    ] {
+        assert!(q.what.contains(must), "item 6 lacks '{must}': {}", q.what);
+    }
+    // The way to switch it on, and back off.
+    assert!(q.what.contains("install --set-helpers on --db <store>"), "{}", q.what);
+    assert!(q.say_no.contains("install --set-helpers off --db <store>"), "{}", q.say_no);
+    assert!(questionnaire::ASSISTANT_RULES.contains("--set-helpers on|off"), "the assistant knows the command");
+    // The two notes live outside the pack, and the questionnaire names exactly them.
+    let helper_ids: Vec<String> = ops::install::helper_mode_notes().into_iter().map(|n| n.id).collect();
+    assert_eq!(helper_ids, questionnaire::HELPER_MODE_NOTES.iter().map(|s| s.to_string()).collect::<Vec<_>>());
     for id in questionnaire::HELPER_MODE_NOTES {
-        assert!(q.say_no.contains(id), "saying no must name the note {id} to retract");
-        assert!(ops::install::workflow_starter_pack().iter().any(|n| n.id == *id), "{id} is not in the pack any more");
+        assert!(q.what.contains(id) && q.say_no.contains(id), "item 6 must name the note {id}");
+        assert!(!ops::install::workflow_starter_pack().iter().any(|n| n.id == *id), "{id} is seeded by default again");
     }
 }
 
@@ -194,7 +215,8 @@ fn helper_agent_mode_states_the_measurement_and_the_free_chat() {
 fn the_work_rules_item_lists_every_other_starter_note_and_none_twice() {
     let pack: Vec<String> = ops::install::workflow_starter_pack().into_iter().map(|n| n.id).collect();
     let rules = questionnaire::work_rule_ids();
-    assert_eq!(rules.len() + questionnaire::HELPER_MODE_NOTES.len(), pack.len(), "the two items partition the pack");
+    assert_eq!(rules, pack, "item 5 lists the whole starter pack, which holds no helper-mode note");
+    assert!(rules.iter().all(|id| !questionnaire::HELPER_MODE_NOTES.contains(&id.as_str())));
     let item = questions().into_iter().find(|q| q.id == "work-rules").unwrap();
     for id in &rules {
         assert!(item.say_no.contains(id.as_str()), "{id} cannot be named for removal");

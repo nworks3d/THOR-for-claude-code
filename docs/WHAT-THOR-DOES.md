@@ -120,13 +120,14 @@ Words used once, in plain language:
   session-start block is capped by size (about 9,500 bytes), not by the four-note rule.
 - Refuse or change: ordinary notes. Ask the assistant to unpin, reword or retract any.
 
-### A10. It adds 15 "workflow starter" notes; two refuse a console flash on Windows
+### A10. It adds 13 "workflow starter" notes; two refuse a console flash on Windows
 - What: seven around commit and push (changelog line per user-visible change, run tests and quote the
   real result, never commit a secret, commit hygiene, commit/push/deploy only when asked, check where you
-  push and what is on main, scan before anything goes public) and eight around risky steps and tools
-  (rehearse destructive steps on a copy, pin a dependency with its reason, orchestrator mode, a stand-alone
-  agent brief, absolute paths, script file not shell quoting, hidden processes on Windows, no interactive
-  scheduled task on Windows).
+  push and what is on main, scan before anything goes public) and six around risky steps and tools
+  (rehearse destructive steps on a copy, pin a dependency with its reason, absolute paths, script file not
+  shell quoting, hidden processes on Windows, no interactive scheduled task on Windows). Helper-agent mode
+  (an orchestrator note and a stand-alone agent brief) is not in this set: it is off until you say yes to
+  first-session item 6 (F15).
 - Why: they are habits that were marked useful again and again on the builder's machine, rewritten to
   hold anywhere. Only two carry a check, and only on a Windows install: windowless-processes-on-windows
   refuses a Start-Process that is not hidden (it passes -WindowStyle Hidden, -NoNewWindow, -WindowStyle
@@ -136,7 +137,7 @@ Words used once, in plain language:
   replayed over 145,976 recorded calls and every one refused legitimate work (for example a --no-verify
   ban refused 11 legitimate commits), so a new user never gets a false block from a note they did not
   write (ops/src/install.rs, the TEETH paragraph of workflow_starter_pack).
-- You notice: each arrives right before its step (commit, push, an agent being spawned...), once per
+- You notice: each arrives right before its step (commit, push, delete...), once per
   conversation. Apart from the two Windows teeth they can never refuse anything. A changelog is only
   created when you said yes to first-session item 12. Commit/push/deploy/install/delete moments are covered.
 - Refuse or change: tell the assistant to remove any; it retracts them with a reason.
@@ -393,7 +394,7 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
 - What: while the seeded setup note is live, every turn end is held until the assistant has told the
   owner in one sentence the defaults (short plain replies in his own language; work lane only; every
   starting note and example rule kept; projects named after their folder; every default on except
-  backup, which stays off until he chooses), stored them as
+  helper agents and backup, which stay off until he chooses), stored them as
   "owner-setup-answers" (a Report, no project needed), and retracted the setup note.
 - Why: a seeded sentence in a note was the entire enforcement before and was skipped. It is not an
   interview: "just do it", or no answer, is answered by the defaults.
@@ -530,7 +531,7 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
 - Refuse or change: built in.
 
 ### D8. Starter notes never refuse
-- What: the 14 workflow notes and the 22 pinned notes carry no check.
+- What: the 11 workflow notes that are not about Windows console windows, the two helper-mode notes and the 22 pinned notes carry no check.
 - Why: see A10.
 - You notice: a note appears at its moment; no refusal.
 - Refuse or change: you may hang a check on your own rules.
@@ -648,7 +649,7 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
 
 ## F. What the user can switch off or change, and how
 
-### F1. Starting notes (22 pinned, 14 workflow)
+### F1. Starting notes (22 pinned, 13 workflow)
 - What: any starting note.
 - Why: they are ordinary notes.
 - You notice: they stop arriving.
@@ -745,6 +746,20 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
   "every designed way out gets used within a day").
 - You notice: refusals with a way on.
 - Refuse or change: no.
+
+### F15. Helper-agent mode (first-session item 6) is off until you switch it on
+- What: install --set-helpers on|off --db <memory>. A new memory does not hold the two notes that carry the
+  mode (orchestrator-mode-saves-quota and an-agent-brief-stands-alone, bound to the Agent tool). On stores
+  exactly those two; off retracts them with a reason; running either twice changes nothing. A retracted id
+  cannot simply be created again, so on after off stores the note again and then resolves the id onto the
+  new version: the log keeps created, retracted, created, resolved, and the id is live with one head.
+- Why: measured at the maker, helpers were likely 12 to 62 percent cheaper and keep the chat free, but you do
+  not see the work happen and cannot steer a helper halfway, each helper starts with a fixed context cost
+  (small tasks cost more), it knows nothing of the conversation beyond its brief, parallel helpers can
+  collide in the same files, and checking the result costs an extra turn. So it is yours to choose.
+- You notice: with it off your assistant does the work itself in the main conversation; with it on, a
+  reminder arrives right before a helper agent is started.
+- Refuse or change: say "helpers on" or "helpers off" to your assistant.
 
 ---
 

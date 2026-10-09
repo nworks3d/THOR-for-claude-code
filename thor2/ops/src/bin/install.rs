@@ -164,6 +164,73 @@ struct Cli {
         conflicts_with_all = ["project", "settings", "mcp_json", "no_mcp", "serve_exe", "mcp_exe", "code_index_root", "register_root", "set_mode", "set_plan", "set_weekly_check", "set_backup", "topic"]
     )]
     set_recording: Option<String>,
+
+    /// Set ONLY helper-agent mode, `on` or `off`, and nothing else. It is OFF in
+    /// a new memory. `on` stores the two notes that carry it (your assistant
+    /// then hands work to cheaper helper agents and keeps the chat free); `off`
+    /// retracts them again. Running it twice changes nothing the second time.
+    /// Needs --db.
+    #[arg(
+        long = "set-helpers",
+        value_name = "on|off",
+        conflicts_with_all = ["project", "settings", "mcp_json", "no_mcp", "serve_exe", "mcp_exe", "code_index_root", "register_root", "set_mode", "set_plan", "set_weekly_check", "set_backup", "set_recording", "topic"]
+    )]
+    set_helpers: Option<String>,
+}
+
+/// `install --set-helpers on|off`: store or retract the two helper-mode notes
+/// and nothing else.
+fn set_helpers_only(db: Option<PathBuf>, word: &str) -> ExitCode {
+    use ops::install::{set_helpers, HelperChange};
+    let on = match word {
+        "on" => true,
+        "off" => false,
+        other => {
+            eprintln!("helper-agent mode is 'on' or 'off', not '{other}'. Example: install --set-helpers on --db <your memory>");
+            return ExitCode::from(2);
+        }
+    };
+    let Some(db) = db else {
+        eprintln!("name the memory to set this for: install --set-helpers {word} --db <your memory>");
+        return ExitCode::from(2);
+    };
+    if !db.is_file() {
+        eprintln!(
+            "REFUSED: there is no memory at {} - check the path given with --db (the one your assistant's hooks name). Nothing was changed.",
+            db.display()
+        );
+        return ExitCode::FAILURE;
+    }
+    let changes = match set_helpers(&db, on) {
+        Ok(changes) => changes,
+        Err(e) => {
+            eprintln!("could not change helper-agent mode: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut refused = false;
+    for (id, change) in &changes {
+        match change {
+            HelperChange::Stored => println!("+ stored the note '{id}'"),
+            HelperChange::Restored => println!("+ stored the note '{id}' again (it had been switched off before)"),
+            HelperChange::Retracted => println!("+ retracted the note '{id}' (history still shows it)"),
+            HelperChange::AlreadyOn => println!("= the note '{id}' was already on"),
+            HelperChange::AlreadyOff => println!("= the note '{id}' was already off"),
+            HelperChange::Refused(why) => {
+                refused = true;
+                eprintln!("! could not change the note '{id}': {why}");
+            }
+        }
+    }
+    if refused {
+        return ExitCode::FAILURE;
+    }
+    if on {
+        println!("helper-agent mode is on for {}: your assistant is reminded of it right before it starts a helper agent. Switch it off again with: install --set-helpers off --db \"{}\"", db.display(), db.display());
+    } else {
+        println!("helper-agent mode is off for {}", db.display());
+    }
+    ExitCode::SUCCESS
 }
 
 /// `install --set-recording on|off`: write the switch and nothing else.
@@ -594,6 +661,9 @@ fn main() -> ExitCode {
     }
     if let Some(word) = cli.set_recording.as_deref() {
         return set_recording_only(cli.db, word);
+    }
+    if let Some(word) = cli.set_helpers.as_deref() {
+        return set_helpers_only(cli.db, word);
     }
     if let Some(word) = cli.set_backup.as_deref() {
         return set_backup_only(cli.db, cli.settings.clone(), word);

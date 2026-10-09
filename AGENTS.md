@@ -556,7 +556,7 @@ Nothing here waits for you: ask me about any number and I explain it, say no to 
 3. Git hooks: every repository refreshes THOR's code index after each commit, so searching the code stays right. Default: on.
 4. Weekly check: about once a week THOR has your assistant tidy the memory (you can also type /thor-eval any time). Default: on.
 5. Work rules: 13 general work habits stored as notes, such as tests before 'done' and never commit a secret; they only inform, except that on Windows two refuse a console window flash. Default: all on.
-6. Helper agents: your main assistant judges while cheaper models do the work in helpers, which costs less and keeps the chat free. Default: on.
+6. Helper agents: your main assistant judges while cheaper models do the work in helpers, which can cost less and keeps the chat free. Default: off.
 7. Bug reports: your assistant may offer to report a fault in THOR on GitHub, showing you the exact text first; nothing is sent without your yes. Default: on.
 8. Replies: in your language, short, with a summary first, and five reply rules; a reply that breaks one is rewritten once. Default: on.
 9. Topic folders: a plain folder with no code, such as recipes or travel plans, can get a memory of its own when you name it. Default: none set up yet.
@@ -569,12 +569,13 @@ Answer by number (for example "1 yes, 3 no, 10 local"), ask "why 7" about any nu
 FOR THE ASSISTANT (do not read this part out)
 - Show him the short list only: the intro, one line per item and the way to answer. Never paste the detail per item (the last part of this text) at him.
 - The detail per item is yours: state an item's Why once, only when he asks about a number ("why 7") or refuses it, in one or two plain sentences, then do what he decided. If he asks and has not refused, add how to say no.
-- Apply the defaults NOW, in this same turn, without waiting for an answer, so nothing waits: store the Report 'owner-setup-answers' with them and retract the setup note. Then show the short list in the user's own language, once, and say that every default on it is already on, except backup, which stays off until he chooses, and that he can tell you by number what he wants different (for example "1 yes, 3 no, 10 local"; "defaults" or "doe maar" accepts all of it).
+- Apply the defaults NOW, in this same turn, without waiting for an answer, so nothing waits: store the Report 'owner-setup-answers' with them and retract the setup note. Then show the short list in the user's own language, once, and say that every default on it is already on, except helper agents and backup, which stay off until he chooses, and that he can tell you by number what he wants different (for example "1 yes, 3 no, 10 local"; "defaults" or "doe maar" accepts all of it).
 - Anything he does not mention keeps the default. Never ask the same question twice and never hold up his work for an answer.
-- Item 10 (backups) is the one whose default is NOT on: a fresh install wired no backup, so with the default nothing is backed up. Say that once, in one sentence, after the list, with the way to start ("backup local", or the folder or address he wants); do nothing for it until he answers.
+- Item 6 (helper agents) is off by default: say that once, in one sentence after the list, with the way to start ("helpers on"); do nothing for it until he answers yes, then run install --set-helpers on --db <store> and tell him it is on.
+- Item 10 (backups) is the second one whose default is NOT on: a fresh install wired no backup, so with the default nothing is backed up. Say that once, in one sentence, after the list, with the way to start ("backup local", or the folder or address he wants); do nothing for it until he answers.
 - Item 12 (changelog): the default is yes when this project has none. Unless he says no, create CHANGELOG.md in the project this session runs in (a '# Changelog' heading with an 'Unreleased' section, nothing invented; a project that already has one is left alone) and keep a version number only if the project already has one or he asks for one. If he says no, create nothing and do not ask again.
 - Question 1: if the settings named a plan, ask him to confirm it with its reason; if they did not, ask which plan outright with the same reason. Record his word with install --set-plan max|small --db <store>.
-- When he answers, apply each number where it belongs, then REVISE 'owner-setup-answers' (never store a second copy): 1 install --set-plan; 2 remove THOR's lines from Claude Code's settings file; 3 git config --global --unset core.hooksPath; 4 install --set-weekly-check off|on; 5 and 6 retract the named notes (a retracted note stops arriving); 7 install --set-mode off (or release); 8 the reply file beside the store (guard-response-rulebook.json) and a stored preference for the language; 9 install --topic, run from inside the folder; 10 install --set-backup local|<folder or address>|off --db <store> (it makes the git folder, adds a named place as the remote 'nas', connects one session-start backup and makes a first copy to prove it works: tell him that result in plain words, and if it failed say so and why); 11 install --set-recording on|off --db <store>; 12 CHANGELOG.md as above.
+- When he answers, apply each number where it belongs, then REVISE 'owner-setup-answers' (never store a second copy): 1 install --set-plan; 2 remove THOR's lines from Claude Code's settings file; 3 git config --global --unset core.hooksPath; 4 install --set-weekly-check off|on; 5 retract the named notes (a retracted note stops arriving); 6 install --set-helpers on|off --db <store> (on stores the two helper notes, off retracts them; running it again changes nothing); 7 install --set-mode off (or release); 8 the reply file beside the store (guard-response-rulebook.json) and a stored preference for the language; 9 install --topic, run from inside the folder; 10 install --set-backup local|<folder or address>|off --db <store> (it makes the git folder, adds a named place as the remote 'nas', connects one session-start backup and makes a first copy to prove it works: tell him that result in plain words, and if it failed say so and why); 11 install --set-recording on|off --db <store>; 12 CHANGELOG.md as above.
 - A bad answer is one that works against him (for example switching off the connections and then expecting the memory to speak). Say ONCE, in one or two plain sentences, why the item exists (its 'Why' in the detail), then do what he decided. He has the final word, you never block and never nag.
 - "He does not want any of this" is itself a valid answer: record it as the answers and apply nothing.
 
@@ -611,10 +612,10 @@ DETAIL PER ITEM (for the assistant: state an item's Why once, only when he asks 
    To say no: Name the ones you do not want, or say none: I remove just those notes (changelog-with-every-user-visible-change, run-the-tests-before-saying-done, never-commit-a-secret, commit-push-deploy-only-when-asked, commit-hygiene, check-where-you-push-and-what-is-on-main, scan-before-it-goes-public, rehearse-destructive-steps-on-a-copy, pin-a-dependency-with-its-reason, absolute-paths-not-the-shell-working-directory, script-file-not-shell-quoting, windowless-processes-on-windows, scheduled-task-not-interactive), and a removed note simply stops arriving.
 
 6. Helper-agent mode
-   What it is: Your main assistant (the strongest model) answers, judges and checks, while cheaper models do the real work in helper agents, one helper per task. No helper is used for a question or an answer, a trivial one-step job, work that needs this conversation's context or quick back-and-forth with you, or a check of a helper's own result: the main assistant does those itself. Tests are run narrowly while working and in full once at the end, and a helper that goes quiet is judged dead after about three checks. This is also true on smaller plans, and if your plan has no strongest model the best available one steers.
-   Why it exists: Measured at the maker, helpers were likely 12 to 62 percent cheaper than doing everything in the main conversation, and the chat stays free and answers at once while they work, instead of you waiting 5 to 15 minutes.
-   What I chose: On.
-   To say no: I remove the two notes that carry it (orchestrator-mode-saves-quota and an-agent-brief-stands-alone); your assistant then does the work itself in the main conversation.
+   What it is: When it is on, your main assistant (the strongest model) answers, judges and checks, while cheaper models do the real work in helper agents, one helper per task. No helper is used for a question or an answer, a trivial one-step job, work that needs this conversation's context or quick back-and-forth with you, or a check of a helper's own result: the main assistant does those itself. Tests are run narrowly while working and in full once at the end, and a helper that goes quiet is judged dead after about three checks. Why you may not want it: you do not see the work happen and cannot steer a helper halfway; each helper starts with a fixed context cost, so small tasks cost more, not less; a helper knows nothing of the conversation beyond its brief; parallel helpers can collide in the same files; and checking the result costs an extra turn. It is off in a new memory. To switch it on, say "helpers on" and I run: install --set-helpers on --db <store>. That stores the two notes that carry it (orchestrator-mode-saves-quota and an-agent-brief-stands-alone).
+   Why it exists: Measured at the maker, helpers were likely 12 to 62 percent cheaper than doing everything in the main conversation, and the chat stays free and answers at once while they work, instead of you waiting 5 to 15 minutes; it is off by default because that holds for big tasks and not for every task.
+   What I chose: Off.
+   To say no: Nothing to undo: it is off until you say yes. If you switched it on and want it off again, I run install --set-helpers off --db <store>, which retracts the two notes that carry it (orchestrator-mode-saves-quota and an-agent-brief-stands-alone); your assistant then does the work itself in the main conversation.
 
 7. Reporting THOR's own bugs
    What it is: Sometimes THOR finds a fault in itself. Your assistant may then offer to report it to the makers on GitHub. It shows you the exact full text first; file paths, project and folder names, computer and user names, addresses, keys and passwords are removed; nothing is sent without your yes, and saying no costs nothing.
@@ -683,7 +684,7 @@ Make them in this order, in the first reply, whatever the person answers:
 remember(
   id:   "owner-setup-answers",
   kind: "report",
-  text: "Setup finished with the defaults, nothing asked first. Plan: <as detected or told>. The defaults on the numbered list apply, except backup, which stays off until the owner chooses (changelog: yes when the project has none). Replies: short and plain, in the owner's own language. Lane: work only. Projects: named after their folder. Any of these changes when the owner says so."
+  text: "Setup finished with the defaults, nothing asked first. Plan: <as detected or told>. The defaults on the numbered list apply, except helper agents and backup, which stay off until the owner chooses (changelog: yes when the project has none). Replies: short and plain, in the owner's own language. Lane: work only. Projects: named after their folder. Any of these changes when the owner says so."
 )
 retract(id: "walk-through-the-answer-guard-once", reason: "Setup finished: the owner's answers are on record as owner-setup-answers.")
 ```
@@ -728,15 +729,6 @@ Around a risky step or a tool:
 - `rehearse-destructive-steps-on-a-copy` - a delete, migration or deploy is tried on
   a throwaway copy first; never test a write path against live data.
 - `pin-a-dependency-with-its-reason` - a version pin carries a comment saying why.
-- `orchestrator-mode-saves-quota` - on by default (question 6): the strongest model
-  answers, judges and checks, cheaper models do the work in helper agents, one helper
-  per task and never a bundle, the chat stays free meanwhile, no helper for a question, a
-  trivial one-step task, work needing this conversation or quick back-and-forth, or checking
-  a helper's result, and tests are run narrowly while working and in full once at the end.
-- `an-agent-brief-stands-alone` - goal, absolute folder, files it may touch, a summary
-  of what is known (not a read-first list), one narrow task, a short report; waiting is
-  a check every 20 to 30 minutes, at most three times, then the job is judged dead by
-  its last real activity, never by its status.
 - `absolute-paths-not-the-shell-working-directory` - absolute paths in every command
   and every brief.
 - `script-file-not-shell-quoting` - text with quotes or backslashes goes in a script
@@ -748,6 +740,23 @@ Around a risky step or a tool:
   `https://`, `file:///`); on other systems it is only a note.
 - `scheduled-task-not-interactive` - `schtasks /create` with `/it` opens a console window at every
   run. On a Windows install this one REFUSES it; on other systems it is only a note.
+
+Helper-agent mode is NOT in this set. It is off in a new memory (first-session item 6),
+because a helper starts with a fixed context cost, cannot be steered halfway and knows
+nothing of the conversation beyond its brief. Two more notes carry it, and
+`install --set-helpers on --db "<their store>"` stores exactly these two (`install
+--set-helpers off --db "<their store>"` retracts them again; running either twice
+changes nothing). Only run it when the person says yes to item 6:
+
+- `orchestrator-mode-saves-quota` - the strongest model answers, judges and checks,
+  cheaper models do the work in helper agents, one helper per task and never a bundle,
+  the chat stays free meanwhile, no helper for a question, a trivial one-step task, work
+  needing this conversation or quick back-and-forth, or checking a helper's result, and
+  tests are run narrowly while working and in full once at the end.
+- `an-agent-brief-stands-alone` - goal, absolute folder, files it may touch, a summary
+  of what is known (not a read-first list), one narrow task, a short report; waiting is
+  a check every 20 to 30 minutes, at most three times, then the job is judged dead by
+  its last real activity, never by its status.
 
 Besides these, the install also seeded twenty-two pinned notes about writing a note
 that comes back and about honesty, agent-spawning and memory hygiene; those are

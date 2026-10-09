@@ -43,8 +43,10 @@ use serve::plan::{Detection, Plan};
 /// The id and the key of the lookup item that carries the rendered list.
 pub const LOOKUP_ID: &str = "first-session-questions";
 
-/// The starter notes that make up helper-agent mode (question 6): everything
-/// else in the workflow pack is the plain work rules (question 5).
+/// The notes that make up helper-agent mode (question 6). They are not in the
+/// workflow pack (`install::helper_mode_notes`): the mode is off in a new
+/// memory and `install --set-helpers on` stores them. The whole workflow pack
+/// is the plain work rules (question 5).
 pub const HELPER_MODE_NOTES: &[&str] = &["orchestrator-mode-saves-quota", "an-agent-brief-stands-alone"];
 
 /// Where the rendered list sits inside `AGENTS.md`, so a test can cut it out.
@@ -79,7 +81,7 @@ pub fn plain_name(id: &str) -> String {
 /// The one-line list of the plain work rules (question 5), derived from the
 /// workflow pack so it can never be out of date.
 pub fn work_rule_ids() -> Vec<String> {
-    workflow_starter_pack().into_iter().map(|n| n.id).filter(|id| !HELPER_MODE_NOTES.contains(&id.as_str())).collect()
+    workflow_starter_pack().into_iter().map(|n| n.id).collect()
 }
 
 /// The plain work rules as one line of names.
@@ -154,11 +156,11 @@ pub fn questions() -> Vec<Question> {
             n: 6,
             id: "helper-agents",
             title: "Helper-agent mode",
-            line: "Helper agents: your main assistant judges while cheaper models do the work in helpers, which costs less and keeps the chat free. Default: on.".to_string(),
-            what: "Your main assistant (the strongest model) answers, judges and checks, while cheaper models do the real work in helper agents, one helper per task. No helper is used for a question or an answer, a trivial one-step job, work that needs this conversation's context or quick back-and-forth with you, or a check of a helper's own result: the main assistant does those itself. Tests are run narrowly while working and in full once at the end, and a helper that goes quiet is judged dead after about three checks. This is also true on smaller plans, and if your plan has no strongest model the best available one steers.".to_string(),
-            why: "Measured at the maker, helpers were likely 12 to 62 percent cheaper than doing everything in the main conversation, and the chat stays free and answers at once while they work, instead of you waiting 5 to 15 minutes.",
-            default: "On.",
-            say_no: "I remove the two notes that carry it (orchestrator-mode-saves-quota and an-agent-brief-stands-alone); your assistant then does the work itself in the main conversation.".to_string(),
+            line: "Helper agents: your main assistant judges while cheaper models do the work in helpers, which can cost less and keeps the chat free. Default: off.".to_string(),
+            what: "When it is on, your main assistant (the strongest model) answers, judges and checks, while cheaper models do the real work in helper agents, one helper per task. No helper is used for a question or an answer, a trivial one-step job, work that needs this conversation's context or quick back-and-forth with you, or a check of a helper's own result: the main assistant does those itself. Tests are run narrowly while working and in full once at the end, and a helper that goes quiet is judged dead after about three checks. Why you may not want it: you do not see the work happen and cannot steer a helper halfway; each helper starts with a fixed context cost, so small tasks cost more, not less; a helper knows nothing of the conversation beyond its brief; parallel helpers can collide in the same files; and checking the result costs an extra turn. It is off in a new memory. To switch it on, say \"helpers on\" and I run: install --set-helpers on --db <store>. That stores the two notes that carry it (orchestrator-mode-saves-quota and an-agent-brief-stands-alone).".to_string(),
+            why: "Measured at the maker, helpers were likely 12 to 62 percent cheaper than doing everything in the main conversation, and the chat stays free and answers at once while they work, instead of you waiting 5 to 15 minutes; it is off by default because that holds for big tasks and not for every task.",
+            default: "Off.",
+            say_no: "Nothing to undo: it is off until you say yes. If you switched it on and want it off again, I run install --set-helpers off --db <store>, which retracts the two notes that carry it (orchestrator-mode-saves-quota and an-agent-brief-stands-alone); your assistant then does the work itself in the main conversation.".to_string(),
         },
         Question {
             n: 7,
@@ -230,12 +232,13 @@ pub const ASSISTANT_RULES: &str = "\
 FOR THE ASSISTANT (do not read this part out)
 - Show him the short list only: the intro, one line per item and the way to answer. Never paste the detail per item (the last part of this text) at him.
 - The detail per item is yours: state an item's Why once, only when he asks about a number (\"why 7\") or refuses it, in one or two plain sentences, then do what he decided. If he asks and has not refused, add how to say no.
-- Apply the defaults NOW, in this same turn, without waiting for an answer, so nothing waits: store the Report 'owner-setup-answers' with them and retract the setup note. Then show the short list in the user's own language, once, and say that every default on it is already on, except backup, which stays off until he chooses, and that he can tell you by number what he wants different (for example \"1 yes, 3 no, 10 local\"; \"defaults\" or \"doe maar\" accepts all of it).
+- Apply the defaults NOW, in this same turn, without waiting for an answer, so nothing waits: store the Report 'owner-setup-answers' with them and retract the setup note. Then show the short list in the user's own language, once, and say that every default on it is already on, except helper agents and backup, which stay off until he chooses, and that he can tell you by number what he wants different (for example \"1 yes, 3 no, 10 local\"; \"defaults\" or \"doe maar\" accepts all of it).
 - Anything he does not mention keeps the default. Never ask the same question twice and never hold up his work for an answer.
-- Item 10 (backups) is the one whose default is NOT on: a fresh install wired no backup, so with the default nothing is backed up. Say that once, in one sentence, after the list, with the way to start (\"backup local\", or the folder or address he wants); do nothing for it until he answers.
+- Item 6 (helper agents) is off by default: say that once, in one sentence after the list, with the way to start (\"helpers on\"); do nothing for it until he answers yes, then run install --set-helpers on --db <store> and tell him it is on.
+- Item 10 (backups) is the second one whose default is NOT on: a fresh install wired no backup, so with the default nothing is backed up. Say that once, in one sentence, after the list, with the way to start (\"backup local\", or the folder or address he wants); do nothing for it until he answers.
 - Item 12 (changelog): the default is yes when this project has none. Unless he says no, create CHANGELOG.md in the project this session runs in (a '# Changelog' heading with an 'Unreleased' section, nothing invented; a project that already has one is left alone) and keep a version number only if the project already has one or he asks for one. If he says no, create nothing and do not ask again.
 - Question 1: if the settings named a plan, ask him to confirm it with its reason; if they did not, ask which plan outright with the same reason. Record his word with install --set-plan max|small --db <store>.
-- When he answers, apply each number where it belongs, then REVISE 'owner-setup-answers' (never store a second copy): 1 install --set-plan; 2 remove THOR's lines from Claude Code's settings file; 3 git config --global --unset core.hooksPath; 4 install --set-weekly-check off|on; 5 and 6 retract the named notes (a retracted note stops arriving); 7 install --set-mode off (or release); 8 the reply file beside the store (guard-response-rulebook.json) and a stored preference for the language; 9 install --topic, run from inside the folder; 10 install --set-backup local|<folder or address>|off --db <store> (it makes the git folder, adds a named place as the remote 'nas', connects one session-start backup and makes a first copy to prove it works: tell him that result in plain words, and if it failed say so and why); 11 install --set-recording on|off --db <store>; 12 CHANGELOG.md as above.
+- When he answers, apply each number where it belongs, then REVISE 'owner-setup-answers' (never store a second copy): 1 install --set-plan; 2 remove THOR's lines from Claude Code's settings file; 3 git config --global --unset core.hooksPath; 4 install --set-weekly-check off|on; 5 retract the named notes (a retracted note stops arriving); 6 install --set-helpers on|off --db <store> (on stores the two helper notes, off retracts them; running it again changes nothing); 7 install --set-mode off (or release); 8 the reply file beside the store (guard-response-rulebook.json) and a stored preference for the language; 9 install --topic, run from inside the folder; 10 install --set-backup local|<folder or address>|off --db <store> (it makes the git folder, adds a named place as the remote 'nas', connects one session-start backup and makes a first copy to prove it works: tell him that result in plain words, and if it failed say so and why); 11 install --set-recording on|off --db <store>; 12 CHANGELOG.md as above.
 - A bad answer is one that works against him (for example switching off the connections and then expecting the memory to speak). Say ONCE, in one or two plain sentences, why the item exists (its 'Why' in the detail), then do what he decided. He has the final word, you never block and never nag.
 - \"He does not want any of this\" is itself a valid answer: record it as the answers and apply nothing.";
 

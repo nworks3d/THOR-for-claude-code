@@ -1015,8 +1015,13 @@ pub fn working_contract() -> Vec<model::item::Item> {
 /// BINDINGS. None of these is pinned: a pinned note is read at every session
 /// start, and the session-start block is where THOR's token cost lives. Each
 /// is bound to the moment or the command it is about instead (commit, push,
-/// publish, delete, deploy, install, an agent being spawned), so it arrives
-/// right before the step it is about, once per context.
+/// publish, delete, deploy, install), so it arrives right before the step it
+/// is about, once per context.
+///
+/// HELPER-AGENT MODE IS NOT IN THE PACK. Its two notes (`helper_mode_notes`)
+/// are off in a new memory (the owner's decision, 2026-10-09: a helper costs a
+/// fixed start-up context and the user cannot steer it halfway, so it is not
+/// for everyone) and `install --set-helpers on` stores them.
 ///
 /// SEVERITY. None carries one, like the notes in `working_contract`. A note
 /// called costly or irreversible with no check is listed by doctor as
@@ -1071,21 +1076,7 @@ pub fn workflow_starter_pack_for(windows: bool) -> Vec<model::item::Item> {
 
     let moment = |a: Action| Binding::Moment(a);
     let command = |c: &str| Binding::Target { kind: TargetKind::Command, value: c.to_string() };
-    let note = |id: &str, text: &str, falsifier: &str, bindings: Vec<Binding>| {
-        model::item::Item {
-            id: id.to_string(),
-            kind: model::item::Kind::Rule,
-            text: text.to_string(),
-            bindings,
-            severity: None,
-            project: None,
-            tags: vec!["workflow-starter".to_string()],
-            expires: None,
-            key: None,
-            falsifier: Some(falsifier.to_string()),
-            check: None,
-        }
-    };
+    let note = starter_note;
 
     vec![
         // COMMIT (four), then PUSH (four): a place holds at most four notes
@@ -1178,18 +1169,6 @@ pub fn workflow_starter_pack_for(windows: bool) -> Vec<model::item::Item> {
         // notes at most, so these stay two or one apiece and leave room for
         // the owner's own.
         note(
-            "orchestrator-mode-saves-quota",
-            "Strongest model answers, judges, checks; cheaper models work in helpers, ONE per task, never a bundle. Chat stays free. No helper for: questions, trivial one-step tasks, work needing this chat or quick back-and-forth, checking helper results. Targeted tests while working, one full run at the end.",
-            "Doing all the work in the strongest model uses no more quota than letting cheaper helper agents do it.",
-            vec![command("Agent")],
-        ),
-        note(
-            "an-agent-brief-stands-alone",
-            "A helper starts blank, so its brief stands alone: goal, ABSOLUTE folder, files it may touch, a SUMMARY of what is known (not a read-first list), one narrow task, a SHORT report. Check every 20-30 minutes, at most 3 times, then judge it dead by its last real activity, not its status.",
-            "An agent given a brief with no working folder or limits is found to behave the same as one given a complete brief.",
-            vec![command("Agent")],
-        ),
-        note(
             "absolute-paths-not-the-shell-working-directory",
             "Do not trust the shell's working directory after a cd: it can stick into the next call \
              or reset to the repo root. Use absolute paths in every command and every agent brief, \
@@ -1246,6 +1225,128 @@ pub fn workflow_starter_pack_for(windows: bool) -> Vec<model::item::Item> {
             Check::Forbidden { literals: vec!["/it".to_string(), "/IT".to_string()] },
         ),
     ]
+}
+
+/// One starter note, as every note of the pack and of helper-agent mode is
+/// built: a global rule with the `workflow-starter` tag, no severity, no check.
+fn starter_note(id: &str, text: &str, falsifier: &str, bindings: Vec<model::item::Binding>) -> model::item::Item {
+    model::item::Item {
+        id: id.to_string(),
+        kind: model::item::Kind::Rule,
+        text: text.to_string(),
+        bindings,
+        severity: None,
+        project: None,
+        tags: vec!["workflow-starter".to_string()],
+        expires: None,
+        key: None,
+        falsifier: Some(falsifier.to_string()),
+        check: None,
+    }
+}
+
+/// The two notes that make up helper-agent mode (first-session item 6). They
+/// are NOT in `workflow_starter_pack`: the mode is off in a new memory and the
+/// user switches it on with `install --set-helpers on`, which stores exactly
+/// these (`set_helpers`). Bound to the Agent tool, so they arrive right before
+/// a helper is spawned. A command place holds four notes at most, so these stay
+/// two and leave room for the owner's own. The ids are listed in
+/// `questionnaire::HELPER_MODE_NOTES` (a test holds the two together).
+pub fn helper_mode_notes() -> Vec<model::item::Item> {
+    use model::item::{Binding, TargetKind};
+    let agent = || vec![Binding::Target { kind: TargetKind::Command, value: "Agent".to_string() }];
+    vec![
+        starter_note(
+            "orchestrator-mode-saves-quota",
+            "Strongest model answers, judges, checks; cheaper models work in helpers, ONE per task, never a bundle. Chat stays free. No helper for: questions, trivial one-step tasks, work needing this chat or quick back-and-forth, checking helper results. Targeted tests while working, one full run at the end.",
+            "Doing all the work in the strongest model uses no more quota than letting cheaper helper agents do it.",
+            agent(),
+        ),
+        starter_note(
+            "an-agent-brief-stands-alone",
+            "A helper starts blank, so its brief stands alone: goal, ABSOLUTE folder, files it may touch, a SUMMARY of what is known (not a read-first list), one narrow task, a SHORT report. Check every 20-30 minutes, at most 3 times, then judge it dead by its last real activity, not its status.",
+            "An agent given a brief with no working folder or limits is found to behave the same as one given a complete brief.",
+            agent(),
+        ),
+    ]
+}
+
+/// What `set_helpers` did to one of the two helper-mode notes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HelperChange {
+    /// Stored for the first time.
+    Stored,
+    /// Stored again after an earlier `off` retracted it (see `set_helpers`).
+    Restored,
+    /// Retracted.
+    Retracted,
+    /// `on`, and the note was live already: nothing written.
+    AlreadyOn,
+    /// `off`, and the note was not live (never stored, or retracted): nothing written.
+    AlreadyOff,
+    /// The gate or the store said no; nothing was changed for this note.
+    Refused(String),
+}
+
+/// The retraction reason `set_helpers(off)` records.
+pub const HELPERS_OFF_REASON: &str = "The owner switched helper-agent mode off (install --set-helpers off); install --set-helpers on stores it again.";
+
+/// `install --set-helpers on|off`: switch helper-agent mode (first-session
+/// item 6) by storing or retracting its two notes, `helper_mode_notes`, and
+/// nothing else. Both directions are idempotent: a second `on` or `off` writes
+/// nothing.
+///
+/// `on` goes through the same gate as any other write (`model::store::declare`),
+/// so a refusal (for example a command place already full of the owner's own
+/// notes) is reported per note, never worked around.
+///
+/// RETRACTED IDS CANNOT BE CREATED AGAIN. A retraction is a tombstone on the id
+/// for good: a create is never an upsert, and a plain second create would leave
+/// the id with two heads, which `show` and `get` refuse to read until a resolve.
+/// So `on` after an `off` does exactly those two steps in the installer's own
+/// name: create the note again (the gate judges it as new), then resolve the id
+/// keeping the new head and discarding the tombstone. The log keeps the whole
+/// story (created, retracted, created, resolved) and `history` walks it; the id
+/// is live again with ONE head, and a later `off` retracts it as before.
+pub fn set_helpers(db: &Path, on: bool) -> anyhow::Result<Vec<(String, HelperChange)>> {
+    use model::store::{declare, resolve, retract, show, ReadError};
+    let mut store = EventStore::open_existing(db)?;
+    let mut out = Vec::new();
+    for item in helper_mode_notes() {
+        let id = item.id.clone();
+        let state = show(&store, &id);
+        let change = match (on, state) {
+            (true, Ok(_)) => HelperChange::AlreadyOn,
+            (true, Err(ReadError::NotFound(_))) => match declare(&mut store, "install", "install", installer(), &item) {
+                Ok(_) => HelperChange::Stored,
+                Err(e) => HelperChange::Refused(e.to_string()),
+            },
+            (true, Err(ReadError::Retracted(_))) => match declare(&mut store, "install", "install", installer(), &item) {
+                Ok(created) => {
+                    let events = store.get_events_by_entity(&id)?;
+                    let heads = thor_core::cas::compute_head_sets(&events);
+                    let discard: Vec<String> = heads
+                        .get(&id)
+                        .map(|set| set.heads.iter().filter(|h| **h != created.this_hash).cloned().collect())
+                        .unwrap_or_default();
+                    match resolve(&mut store, "install", "install", installer(), &id, &created.this_hash, &discard, None) {
+                        Ok(_) => HelperChange::Restored,
+                        Err(e) => HelperChange::Refused(format!("stored the note again but could not settle its old retraction: {e}")),
+                    }
+                }
+                Err(e) => HelperChange::Refused(e.to_string()),
+            },
+            (true, Err(e)) => HelperChange::Refused(e.to_string()),
+            (false, Ok(_)) => match retract(&mut store, "install", "install", installer(), &id, HELPERS_OFF_REASON, None) {
+                Ok(_) => HelperChange::Retracted,
+                Err(e) => HelperChange::Refused(e.to_string()),
+            },
+            (false, Err(ReadError::NotFound(_) | ReadError::Retracted(_))) => HelperChange::AlreadyOff,
+            (false, Err(e)) => HelperChange::Refused(e.to_string()),
+        };
+        out.push((id, change));
+    }
+    Ok(out)
 }
 
 /// Write the starting notes into a store that has just been created.
@@ -2570,8 +2671,8 @@ mod tests {
     /// stale) and each under the 300 characters the gate allows.
     #[test]
     fn the_helper_notes_state_the_efficiency_rules_without_model_names() {
-        let pack = workflow_starter_pack();
-        let note = |id: &str| pack.iter().find(|n| n.id == id).unwrap_or_else(|| panic!("{id} left the pack")).text.to_lowercase();
+        let pack = helper_mode_notes();
+        let note = |id: &str| pack.iter().find(|n| n.id == id).unwrap_or_else(|| panic!("{id} left helper mode")).text.to_lowercase();
         let orchestrator = note("orchestrator-mode-saves-quota");
         let brief = note("an-agent-brief-stands-alone");
         for (text, must) in [
@@ -2591,6 +2692,25 @@ mod tests {
             for model_name in ["opus", "sonnet", "haiku", "gpt", "claude", "fable"] {
                 assert!(!text.contains(model_name), "a model name goes stale: {model_name} in {text}");
             }
+        }
+    }
+
+    /// Helper-agent mode is off in a new memory (owner decision, 2026-10-09):
+    /// its two notes are in no seeded set, and they are as generic and as small
+    /// as every other starter note.
+    #[test]
+    fn the_helper_notes_are_outside_every_seeded_set_and_as_clean_as_the_pack() {
+        let helpers = helper_mode_notes();
+        let ids: Vec<&str> = helpers.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, crate::questionnaire::HELPER_MODE_NOTES);
+        for seeded in working_contract().into_iter().chain(workflow_starter_pack()) {
+            assert!(!ids.contains(&seeded.id.as_str()), "{} is seeded into a new memory", seeded.id);
+        }
+        for item in &helpers {
+            assert_eq!(item.kind, model::item::Kind::Rule);
+            assert_eq!(item.tags, vec!["workflow-starter".to_string()]);
+            assert!(item.project.is_none() && item.check.is_none() && item.severity.is_none());
+            assert!(item.falsifier.is_some() && item.text.is_ascii() && item.text.chars().count() <= 300, "{}", item.id);
         }
     }
 
