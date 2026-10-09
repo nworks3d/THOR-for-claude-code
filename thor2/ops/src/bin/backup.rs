@@ -147,23 +147,37 @@ fn main() -> ExitCode {
     }
 
     // Where this run pushes, named once so the result and the doctor can say it.
-    let (remote_name, address) = match backup::resolve_target(&repo, cli.remote.as_deref()) {
-        Ok(target) => {
-            let address = backup::remote_url(&repo, &target.remote).unwrap_or_default();
-            (target.remote, address)
-        }
-        Err(e) => {
-            let _ = ops::backup_state::record_failure_at(&cli.db, &repo, &e.to_string(), now);
-            eprintln!("backup failed: {e}");
-            return ExitCode::FAILURE;
+    //
+    // A repository with no remote at all is a deliberate local copy
+    // (`install --set-backup local`): it names no remote, and the copy stays on
+    // this machine.
+    let local_only = !backup::has_remotes(&repo);
+    let (remote_name, address) = if local_only {
+        (String::new(), String::new())
+    } else {
+        match backup::resolve_target(&repo, cli.remote.as_deref()) {
+            Ok(target) => {
+                let address = backup::remote_url(&repo, &target.remote).unwrap_or_default();
+                (target.remote, address)
+            }
+            Err(e) => {
+                let _ = ops::backup_state::record_failure_at(&cli.db, &repo, &e.to_string(), now);
+                eprintln!("backup failed: {e}");
+                return ExitCode::FAILURE;
+            }
         }
     };
-    match backup::backup_to_remote(&store, &repo, &cli.subdir, cli.force, Some(&remote_name)) {
+    let requested = (!local_only).then_some(remote_name.as_str());
+    match backup::backup_to_remote(&store, &repo, &cli.subdir, cli.force, requested) {
         Ok(line) => {
             // "backup is Nh old ... skipping" sent nothing: the time of the last copy stays.
             let pushed = !line.starts_with("backup is ");
             ops::backup_state::record_success_for(&cli.db, &repo, &remote_name, &address, ops::backup_state::now_unix(), pushed);
-            println!("{line} (to {remote_name})");
+            if local_only {
+                println!("{line}");
+            } else {
+                println!("{line} (to {remote_name})");
+            }
             // The person who only ever reads this one line (this binary runs
             // far more often than `doctor` does) still learns the copy on
             // the NAS has gone stale - see `ops::health::ship_line`'s own
