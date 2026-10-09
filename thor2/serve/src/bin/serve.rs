@@ -2830,8 +2830,8 @@ fn setup_debt(store: &EventStore) -> Option<String> {
          goes into it), all the starting notes kept, each project named after its folder - as \
          '{answers}' (a Report with no scope is enough - this id needs none, so do not ask him to \
          name a collection for it); (3) retract '{note}'; (4) show him the list in his own \
-         language, say that everything on it is already as written (a fresh install made no \
-         backup, so say that one plainly), and that he can answer by number (for \
+         language, say that every default on it is already on, except backup, which stays \
+         off until he chooses (a fresh install made none, so say that one plainly), and that he can answer by number (for \
          example \"1 yes, 3 no, the rest as you like\"). Whatever he does not mention keeps its \
          default, and you apply the defaults without waiting for an answer. When he does answer, \
          apply each number, say ONCE and plainly why an item exists if his answer works against \

@@ -138,7 +138,7 @@ pub fn questions() -> Vec<Question> {
             id: "work-rules",
             title: "The starter work rules",
             line: format!(
-                "Work rules: {} general work habits stored as notes, such as tests before 'done' and never commit a secret; none of them can block anything. Default: all on.",
+                "Work rules: {} general work habits stored as notes, such as tests before 'done' and never commit a secret; they only inform, except that on Windows two refuse a console window flash. Default: all on.",
                 rules.len()
             ),
             what: format!(
@@ -230,7 +230,7 @@ pub const ASSISTANT_RULES: &str = "\
 FOR THE ASSISTANT (do not read this part out)
 - Show him the short list only: the intro, one line per item and the way to answer. Never paste the detail per item (the last part of this text) at him.
 - The detail per item is yours: state an item's Why once, only when he asks about a number (\"why 7\") or refuses it, in one or two plain sentences, then do what he decided. If he asks and has not refused, add how to say no.
-- Apply the defaults NOW, in this same turn, without waiting for an answer, so nothing waits: store the Report 'owner-setup-answers' with them and retract the setup note. Then show the short list in the user's own language, once, and say that everything on it is already as written and that he can tell you by number what he wants different (for example \"1 yes, 3 no, 10 local\"; \"defaults\" or \"doe maar\" accepts all of it).
+- Apply the defaults NOW, in this same turn, without waiting for an answer, so nothing waits: store the Report 'owner-setup-answers' with them and retract the setup note. Then show the short list in the user's own language, once, and say that every default on it is already on, except backup, which stays off until he chooses, and that he can tell you by number what he wants different (for example \"1 yes, 3 no, 10 local\"; \"defaults\" or \"doe maar\" accepts all of it).
 - Anything he does not mention keeps the default. Never ask the same question twice and never hold up his work for an answer.
 - Item 10 (backups) is the one whose default is NOT on: a fresh install wired no backup, so with the default nothing is backed up. Say that once, in one sentence, after the list, with the way to start (\"backup local\", or the folder or address he wants); do nothing for it until he answers.
 - Item 12 (changelog): the default is yes when this project has none. Unless he says no, create CHANGELOG.md in the project this session runs in (a '# Changelog' heading with an 'Unreleased' section, nothing invented; a project that already has one is left alone) and keep a version number only if the project already has one or he asks for one. If he says no, create nothing and do not ask again.

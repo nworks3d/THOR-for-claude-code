@@ -1096,8 +1096,8 @@ pub fn workflow_starter_pack_for(windows: bool) -> Vec<model::item::Item> {
         note(
             "changelog-with-every-user-visible-change",
             "If the project keeps a CHANGELOG, add a line for every user-visible change in the same \
-             commit, and bump the version when releases are versioned. No changelog file: do not \
-             create one unasked. Re-read the README for claims your change just made untrue.",
+             commit, and bump the version when releases are versioned. Create a changelog only if the owner said yes \
+             to first-session item 12; else keep what exists. Re-read the README for claims made untrue.",
             "A user-visible change lands with no changelog line in a project that keeps one, and the \
              next release notes still come out complete.",
             vec![moment(Action::Commit)],
@@ -1210,9 +1210,10 @@ pub fn workflow_starter_pack_for(windows: bool) -> Vec<model::item::Item> {
         with_check(
             note(
                 "windowless-processes-on-windows",
-                "On Windows Start-Process must run hidden: add -WindowStyle Hidden or -NoNewWindow. Only \
-                 something the user asked to see passes: ms-settings:, windowsdefender:, control.exe, a \
-                 .cpl file, http://, https:// or file:///. Python: CREATE_NO_WINDOW. A console flash steals focus.",
+                "On Windows Start-Process must run hidden: add -WindowStyle Hidden or -NoNewWindow. A window the \
+                 user explicitly asked to see: -WindowStyle Normal. Also fine: \
+                 ms-settings:, windowsdefender:, control.exe, a .cpl file, http://, https:// or file:///. \
+                 Python: CREATE_NO_WINDOW.",
                 "A visible console window started by an agent is found to leave the user's focus alone.",
                 vec![command("Start-Process")],
             ),

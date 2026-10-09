@@ -555,7 +555,7 @@ Nothing here waits for you: ask me about any number and I explain it, say no to 
 2. Connections: THOR is wired into Claude Code at session start, before each tool call, when you send a message and when a reply ends, so the memory speaks up by itself. Default: on.
 3. Git hooks: every repository refreshes THOR's code index after each commit, so searching the code stays right. Default: on.
 4. Weekly check: about once a week THOR has your assistant tidy the memory (you can also type /thor-eval any time). Default: on.
-5. Work rules: 12 general work habits stored as notes, such as tests before 'done' and never commit a secret; none of them can block anything. Default: all on.
+5. Work rules: 13 general work habits stored as notes, such as tests before 'done' and never commit a secret; they only inform, except that on Windows two refuse a console window flash. Default: all on.
 6. Helper agents: your main assistant judges while cheaper models do the work in helpers, which costs less and keeps the chat free. Default: on.
 7. Bug reports: your assistant may offer to report a fault in THOR on GitHub, showing you the exact text first; nothing is sent without your yes. Default: on.
 8. Replies: in your language, short, with a summary first, and five reply rules; a reply that breaks one is rewritten once. Default: on.
@@ -569,7 +569,7 @@ Answer by number (for example "1 yes, 3 no, 10 local"), ask "why 7" about any nu
 FOR THE ASSISTANT (do not read this part out)
 - Show him the short list only: the intro, one line per item and the way to answer. Never paste the detail per item (the last part of this text) at him.
 - The detail per item is yours: state an item's Why once, only when he asks about a number ("why 7") or refuses it, in one or two plain sentences, then do what he decided. If he asks and has not refused, add how to say no.
-- Apply the defaults NOW, in this same turn, without waiting for an answer, so nothing waits: store the Report 'owner-setup-answers' with them and retract the setup note. Then show the short list in the user's own language, once, and say that everything on it is already as written and that he can tell you by number what he wants different (for example "1 yes, 3 no, 10 local"; "defaults" or "doe maar" accepts all of it).
+- Apply the defaults NOW, in this same turn, without waiting for an answer, so nothing waits: store the Report 'owner-setup-answers' with them and retract the setup note. Then show the short list in the user's own language, once, and say that every default on it is already on, except backup, which stays off until he chooses, and that he can tell you by number what he wants different (for example "1 yes, 3 no, 10 local"; "defaults" or "doe maar" accepts all of it).
 - Anything he does not mention keeps the default. Never ask the same question twice and never hold up his work for an answer.
 - Item 10 (backups) is the one whose default is NOT on: a fresh install wired no backup, so with the default nothing is backed up. Say that once, in one sentence, after the list, with the way to start ("backup local", or the folder or address he wants); do nothing for it until he answers.
 - Item 12 (changelog): the default is yes when this project has none. Unless he says no, create CHANGELOG.md in the project this session runs in (a '# Changelog' heading with an 'Unreleased' section, nothing invented; a project that already has one is left alone) and keep a version number only if the project already has one or he asks for one. If he says no, create nothing and do not ask again.
@@ -683,7 +683,7 @@ Make them in this order, in the first reply, whatever the person answers:
 remember(
   id:   "owner-setup-answers",
   kind: "report",
-  text: "Setup finished with the defaults, nothing asked first. Plan: <as detected or told>. Everything on the numbered list is as written (backups: none until the owner chooses; changelog: yes when the project has none). Replies: short and plain, in the owner's own language. Lane: work only. Projects: named after their folder. Any of these changes when the owner says so."
+  text: "Setup finished with the defaults, nothing asked first. Plan: <as detected or told>. The defaults on the numbered list apply, except backup, which stays off until the owner chooses (changelog: yes when the project has none). Replies: short and plain, in the owner's own language. Lane: work only. Projects: named after their folder. Any of these changes when the owner says so."
 )
 retract(id: "walk-through-the-answer-guard-once", reason: "Setup finished: the owner's answers are on record as owner-setup-answers.")
 ```
@@ -696,10 +696,11 @@ with what they chose.
 
 A memory that was just created also gets a starter set of general coding-workflow
 rules, learnt the hard way by the person who built THOR and rewritten so that they
-hold on any project. They are ordinary notes tagged `workflow-starter`: none of them
-refuses anything (a refusing check could block a legitimate call from a project the
-author never saw, so every one only informs), each arrives right before the step it
-is about, once per conversation, and any can be removed, rewritten or unpinned like
+hold on any project. They are ordinary notes tagged `workflow-starter`: only two of them
+carry a refusing check, and only on a Windows install (they stop a console window from
+flashing); every other one only informs, because a refusing check could block a
+legitimate call from a project the author never saw. Each arrives right before the step
+it is about, once per conversation, and any can be removed, rewritten or unpinned like
 any other note. Tell the person, in one sentence, that they exist and that you can
 remove any of them on request; to remove one, `retract` it with a reason.
 
@@ -707,7 +708,8 @@ Before a commit or a push:
 
 - `changelog-with-every-user-visible-change` - if the project keeps a CHANGELOG, a
   line for every user-visible change in the same commit, and a version bump when it
-  versions releases; no changelog is created unasked.
+  versions releases. A changelog is created only when the owner said yes to first-session
+  item 12; otherwise any changelog the project already has is kept.
 - `run-the-tests-before-saying-done` - run the project's own tests or build and
   quote the real result line; never skip a hook with `--no-verify`.
 - `never-commit-a-secret` - real values in a gitignored file, a tracked template
@@ -739,8 +741,9 @@ Around a risky step or a tool:
 - `script-file-not-shell-quoting` - text with quotes or backslashes goes in a script
   file, not a one-liner.
 - `windowless-processes-on-windows` - background processes start hidden. On a Windows install this
-  one REFUSES a `Start-Process` with no `-WindowStyle` or `-NoNewWindow` unless it opens something
-  you asked to see (`ms-settings:`, `windowsdefender:`, `control.exe`, a `.cpl` file, `http://`,
+  one REFUSES a `Start-Process` with no `-WindowStyle` or `-NoNewWindow` unless it opens a window the
+  user explicitly asked to see (start that one with `-WindowStyle Normal`) or something meant
+  to be seen (`ms-settings:`, `windowsdefender:`, `control.exe`, a `.cpl` file, `http://`,
   `https://`, `file:///`); on other systems it is only a note.
 - `scheduled-task-not-interactive` - `schtasks /create` with `/it` opens a console window at every
   run. On a Windows install this one REFUSES it; on other systems it is only a note.

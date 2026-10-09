@@ -458,8 +458,10 @@ real result before saying "done", never commit a secret, no force-push of a
 shared branch, check where you push, scan before anything goes public, write a
 complete brief for every agent you spawn, and a few more. Each one arrives right
 before the step it is about - the commit, the push, the agent being spawned - and
-none of them ever refuses anything: they only inform, so a rule written for
-someone else's project cannot block yours. Ask your assistant to remove any you
+they only inform, so a rule written for someone else's project cannot block
+yours. The one exception is on Windows: two of them refuse a call that would
+flash a console window (a `Start-Process` that is not hidden, and a scheduled
+task made with `/it`). Ask your assistant to remove any you
 do not want.
 
 You only reach for a flag if your setup is unusual: `--settings` and `--mcp-json`
@@ -704,8 +706,11 @@ do all of this for you if you ask; these are the steps in plain words.
    `settings.json` in the `.claude` folder inside your home folder. Under
    `hooks`, delete the entries for `SessionStart`, `PreToolUse`,
    `UserPromptSubmit` and `Stop` whose command names THOR's `serve` program and
-   ends in `hook`. If you chose a backup, delete the one entry that runs the
-   backup program as well. Leave every other entry alone.
+   ends in `hook`. If you chose a backup, there is one more `SessionStart` entry:
+   the one whose command runs the `backup` program (`backup.exe` on Windows)
+   with `--db` naming your memory and `--repo` naming the `backup-repo` folder
+   (or the folder you chose). Delete that one as well. Leave every other entry
+   alone.
 4. **Take THOR out of the tool list.** Open `.claude.json` in your home folder
    and delete the entry called `thor` under `mcpServers`.
 5. **Delete the `/thor-eval` command.** It is the file `thor-eval.md` in the
@@ -718,8 +723,10 @@ do all of this for you if you ask; these are the steps in plain words.
 7. **Delete the memory folder.** On Windows that is `%LOCALAPPDATA%\thor2`, on
    Linux `~/.local/share/thor2` (the install printed it on its `memory:` line).
    It holds your notes, the small files beside them (the reply rules, the modes,
-   the weekly-check clock), THOR's reading of your code, its git helpers, and
-   the backup folder if you chose one.
+   the weekly-check clock, and the recording switch, which lives in
+   `thor-mode.json`), the record of real calls (`real-calls.jsonl` and
+   `real-replies.jsonl`), THOR's reading of your code, its git helpers, and the
+   `backup-repo` folder if you chose a local backup.
 8. **Delete the programs.** On Windows that is `thor2` in your home folder, on
    Linux `~/.thor2`.
 9. **Delete the hidden `.thor-project` file** in each folder where you ran the

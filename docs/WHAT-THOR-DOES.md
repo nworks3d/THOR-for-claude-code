@@ -120,18 +120,25 @@ Words used once, in plain language:
   session-start block is capped by size (about 9,500 bytes), not by the four-note rule.
 - Refuse or change: ordinary notes. Ask the assistant to unpin, reword or retract any.
 
-### A10. It adds 14 "workflow starter" notes that only inform
+### A10. It adds 15 "workflow starter" notes; two refuse a console flash on Windows
 - What: seven around commit and push (changelog line per user-visible change, run tests and quote the
   real result, never commit a secret, commit hygiene, commit/push/deploy only when asked, check where you
-  push and what is on main, scan before anything goes public) and seven around risky steps and tools
+  push and what is on main, scan before anything goes public) and eight around risky steps and tools
   (rehearse destructive steps on a copy, pin a dependency with its reason, orchestrator mode, a stand-alone
-  agent brief, absolute paths, script file not shell quoting, hidden processes on Windows).
+  agent brief, absolute paths, script file not shell quoting, hidden processes on Windows, no interactive
+  scheduled task on Windows).
 - Why: they are habits that were marked useful again and again on the builder's machine, rewritten to
-  hold anywhere. None has a check: seven candidate checks were replayed over 145,976 recorded calls and
-  every one refused legitimate work (for example a --no-verify ban refused 11 legitimate commits), so a
-  new user never gets a false block from a note they did not write (ops/src/install.rs:1018-1029).
+  hold anywhere. Only two carry a check, and only on a Windows install: windowless-processes-on-windows
+  refuses a Start-Process that is not hidden (it passes -WindowStyle Hidden, -NoNewWindow, -WindowStyle
+  Normal for a window you asked to see, and things meant to be seen such as a browser address or a control
+  panel), and scheduled-task-not-interactive refuses schtasks /create with /it. Both exist so an agent
+  never flashes a console window. All the others stay plain notes: seven other candidate checks were
+  replayed over 145,976 recorded calls and every one refused legitimate work (for example a --no-verify
+  ban refused 11 legitimate commits), so a new user never gets a false block from a note they did not
+  write (ops/src/install.rs, the TEETH paragraph of workflow_starter_pack).
 - You notice: each arrives right before its step (commit, push, an agent being spawned...), once per
-  conversation. They can never refuse anything. Commit/push/deploy/install/delete moments are covered.
+  conversation. Apart from the two Windows teeth they can never refuse anything. A changelog is only
+  created when you said yes to first-session item 12. Commit/push/deploy/install/delete moments are covered.
 - Refuse or change: tell the assistant to remove any; it retracts them with a reason.
 
 ### A11. It writes a reply rulebook with five rules
@@ -182,14 +189,21 @@ Words used once, in plain language:
 - Refuse or change: your home folder, Documents itself and a whole drive are refused as too broad.
   "install --register-root" does only the registration.
 
-### A16. Backups are NOT arranged by the install
+### A16. Backup is a first-session choice (item 10); the install arranges none
 - What: THOR has a backup program (backup.exe) that exports the memory to a git repository, with a
-  remote called "nas" preferred, and doctor reports where the last copy went.
+  remote called "nas" preferred, and doctor reports where the last copy went. A fresh install makes no
+  backup and wires no hook for it: nothing is backed up until you choose, at the first session (item 10)
+  or later. The choices are install --set-backup local|<place>|off. "local" is a git folder beside the
+  memory (backup-repo) with no remote, so nothing leaves the machine; a place (a NAS folder, another
+  computer, a private repository) becomes a remote called "nas"; "off" removes only the one
+  SessionStart hook that runs the backup, and copies already made stay. Choosing wires that hook
+  (it runs at session start, at most one copy a day) and makes a first copy at once to prove it works.
 - Why: the log is append-only and a lost file is gone. On 2026-10-01 a backup silently failed for days
   because the log passed GitHub's file limit.
-- You notice: nothing, because no hook or schedule for it is written by the install. A backup is a
-  choice the person makes at the first session.
-- Refuse or change: set it up on request (see "Backup" in AGENTS.md); restore with backup --restore-from.
+- You notice: nothing until you choose, because no hook or schedule for it is written by the install.
+  After you choose, one line says the first copy worked, or says plainly that it failed and why.
+- Refuse or change: do not choose, or choose "off" (install --set-backup off). See "Backup" in AGENTS.md;
+  restore with backup --restore-from.
 
 ### A17. It asks for one restart and a first conversation
 - What: Claude Code reads hooks and tools at startup only, so the person must close it fully and reopen.
@@ -378,7 +392,8 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
 ### C1. First-session setup, on defaults
 - What: while the seeded setup note is live, every turn end is held until the assistant has told the
   owner in one sentence the defaults (short plain replies in his own language; work lane only; every
-  starting note and example rule kept; projects named after their folder), stored them as
+  starting note and example rule kept; projects named after their folder; every default on except
+  backup, which stays off until he chooses), stored them as
   "owner-setup-answers" (a Report, no project needed), and retracted the setup note.
 - Why: a seeded sentence in a note was the entire enforcement before and was skipped. It is not an
   interview: "just do it", or no answer, is answered by the defaults.
@@ -597,8 +612,8 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
 - Refuse or change: say no; or remove thor-mode.json so nothing is offered.
 
 ### E10. Code index refreshed after each commit; the optional backup and sync
-- What: the git hook (A7) refreshes the project's code reading after each commit. The backup and sync
-  programs exist but are started by you or your schedule (see A16). "sync ship" sends events to a copy;
+- What: the git hook (A7) refreshes the project's code reading after each commit. The backup runs only
+  once you chose it (see A16); the sync program is started by you or your schedule. "sync ship" sends events to a copy;
   "doctor" names a copy or backup that has gone stale.
 - Why: a stale code reading gave wrong line numbers for 83 percent of answers.
 - You notice: nothing.
@@ -697,13 +712,33 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
 - Refuse or change: revise tags.
 
 ### F11. How to remove THOR
-- What: not documented in one place. From what install writes: remove its four entries in settings.json,
-  the "thor" entry in ~/.claude.json, and unset git's core.hooksPath if it points to THOR's folder.
-- Why: it is derived from the code, not from a doc.
+- What: README.md has a "Remove THOR completely" section with ten steps. In short: remove its four entries
+  in settings.json (plus the backup SessionStart entry if you chose a backup), the "thor" entry in
+  ~/.claude.json, the /thor-eval command, unset git's core.hooksPath if it points to THOR's folder,
+  then delete the memory folder, the programs folder and any .thor-project file.
+- Why: nothing THOR put on the computer should be left behind unknowingly.
 - You notice: THOR goes silent.
 - Refuse or change: your call; a backup of both files exists as .bak from the install.
 
-### F12. Fixed on purpose (cannot be changed by setting)
+### F12. The record of real calls can be switched off
+- What: install --set-recording off|on --db <memory>. Off writes "recording": "off" into thor-mode.json:
+  nothing new is recorded in real-calls.jsonl or real-replies.jsonl, and the false-block sweep (E6) then
+  says it has no data. What was already recorded disappears by itself after 30 days. On by default.
+- Why: the record is what found twelve wrongly blocking rules (E6); it stays on this machine, and the
+  first-session list (item 11) tells you it exists.
+- You notice: with it off, the sweep reports no data instead of rules.
+- Refuse or change: yes, with the command above.
+
+### F13. A changelog and version number (first-session item 12)
+- What: the default is yes when the project has none: the assistant creates CHANGELOG.md in the project
+  it runs in (a "Changelog" heading with an "Unreleased" section, nothing invented) and keeps a version
+  number only if the project has one or you ask for one. A project that already keeps one is left alone.
+  The starter note changelog-with-every-user-visible-change then adds a line with each change.
+- Why: every later session knows what changed and which version runs.
+- You notice: one new file, once.
+- Refuse or change: say no to item 12: nothing is created and it is not asked again.
+
+### F14. Fixed on purpose (cannot be changed by setting)
 - What: the 300-character limit, the four-per-place cap, the secret scan, the evaluation cadence, the
   need for a reason on a dispute or a weakening, who may name a new place.
 - Why: each exists because a softer version was measured to be bypassed (CONTRACT.md R2, R9; the habit
