@@ -211,6 +211,28 @@ fn a_help_request_is_not_refused_by_a_forbidden_literal_either() {
     assert!(fx.bash("gh auth refresh -s workflow -- --help"));
 }
 
+/// Field test 15, collect 19c: `--help` exempts a call only where it asks for
+/// help - first after the program or its subcommand. A custom script that is
+/// given arguments or another flag first may ignore `--help` and run, so it
+/// stays judged.
+#[test]
+fn help_exempts_only_where_it_comes_first() {
+    let fx = Fx::new(&[
+        rule("no-live-push", None, &["my-deploy"], forbidden(&["--live"]), &[]),
+        rule("no-compose-up", None, &["docker compose"], forbidden(&["--force-recreate"]), &[]),
+    ]);
+    // First after the program: help.
+    assert!(!fx.bash("my-deploy --help --live"));
+    assert!(!fx.bash("my-deploy --help"));
+    // After one subcommand word: help.
+    assert!(!fx.bash("docker compose up --help --force-recreate"));
+    // Other arguments or another flag in front: the script may ignore it.
+    assert!(fx.bash("my-deploy 10.0.0.9 --live --help"));
+    assert!(fx.bash("my-deploy --live --help"));
+    assert!(fx.bash("my-deploy 10.0.0.9 --help --live"), "an address before the flag is not a subcommand");
+    assert!(fx.bash("docker compose up -d --force-recreate --help"));
+}
+
 #[test]
 fn a_version_flag_that_takes_a_value_is_not_a_version_request() {
     let fx = Fx::new(&[rule("installs-need-a-go", None, &["cargo install"], requires("cargo install", &["go-owner"]), &[])]);
