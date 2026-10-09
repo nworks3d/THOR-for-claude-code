@@ -1488,6 +1488,52 @@ fn overview_allowed(rule: &OptInRule, prompt_lower: &str, haystack_lower: &str) 
         && haystack_lower.chars().count() <= rule.overview_max_chars
 }
 
+// ------------------------------------------------- the first-session list
+//
+// THE DEFECT THIS CLOSES (blind test of a new user's first session, 2026-10-10).
+// The first reply of a new install MUST show the numbered list of everything the
+// install arranged (`ops::questionnaire::render_list`, twelve lines, about 2,900
+// characters). The user did not ask for an overview, so the style rules about the
+// owner's own reading (`owner_reading_only`: the length rule, the summary-first
+// rule) would hold the very first reply the memory ever gives.
+//
+// The reply is recognised by SHAPE, in any language, because the assistant shows
+// the list in the user's own language: numbered lines 1 to
+// `SETUP_LIST_MIN_ITEMS`, and the two items a translation keeps verbatim
+// (the `/thor-eval` command of item 4 and the `CHANGELOG.md` file of item 12).
+// A test in `ops` renders the real list and holds that it is recognised.
+// Capped at `SETUP_LIST_MAX_CHARS`, so the exemption is for the list reply and
+// not for an essay that happens to contain one. It stands aside for
+// `owner_reading_only` rules only: the honesty rules keep reading it.
+
+/// How many numbered lines (1, 2, 3, ...) the first-session list reply must carry.
+pub const SETUP_LIST_MIN_ITEMS: usize = 10;
+
+/// The longest reply that still counts as the first-session list reply.
+pub const SETUP_LIST_MAX_CHARS: usize = 6000;
+
+/// Whether `haystack_lower` (see `haystack`) is the first-session list reply.
+pub fn is_setup_list_reply(haystack_lower: &str) -> bool {
+    if haystack_lower.chars().count() > SETUP_LIST_MAX_CHARS
+        || !haystack_lower.contains("/thor-eval")
+        || !haystack_lower.contains("changelog.md")
+    {
+        return false;
+    }
+    let mut next = 1usize;
+    for line in haystack_lower.lines() {
+        let item = line.trim_start_matches(|c: char| c == '*' || c == '_' || c == '#' || c == '-' || c == ' ');
+        let number = format!("{next}");
+        let numbered = item
+            .strip_prefix(number.as_str())
+            .is_some_and(|rest| rest.starts_with('.') || rest.starts_with(')'));
+        if numbered {
+            next += 1;
+        }
+    }
+    next > SETUP_LIST_MIN_ITEMS
+}
+
 // ------------------------------------------------------- reader scope
 //
 // THE DEFECT THIS FIELD FIXES, decided by the owner 2026-09-09, the same day
@@ -1754,6 +1800,7 @@ fn evaluate_opt_in_checked(
                 && !list_exempted(r, prompt_lower, haystack_lower)
                 && !overview_allowed(r, prompt_lower, haystack_lower)
                 && !(r.owner_reading_only && is_subagent)
+                && !(r.owner_reading_only && is_setup_list_reply(haystack_lower))
                 && prompt_gate_open(r, prompt_lower)
                 && !(r.backed_by_turn_tools && turn_backs_claim(&r.base, haystack_lower, turn_commands));
             if !fires_before_escapes {

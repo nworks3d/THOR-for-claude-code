@@ -353,3 +353,112 @@ fn the_seeded_store_carries_the_installs_real_paths_and_the_setup_note_names_the
     let note = model::store::show(&store, model::store::SETUP_NOTE_ID).unwrap();
     assert!(note.text.contains("`lookup first-session-questions`") && note.text.contains("one place to read"), "{}", note.text);
 }
+
+/// Blind test 2026-10-10: Pro and any plan below Max are "small", Max is "max",
+/// and a plan the settings do not name is small until the user says otherwise.
+#[test]
+fn the_plan_item_says_plainly_what_counts_as_small_and_what_is_the_default() {
+    let plan = &questions()[0];
+    assert!(plan.what.contains("Pro and any plan below Max count as \"small\" (install --set-plan small)"), "{}", plan.what);
+    assert!(plan.what.contains("Max counts as \"max\" (install --set-plan max)"), "{}", plan.what);
+    assert!(plan.default.contains("small") && plan.default.contains("until you say otherwise"), "{}", plan.default);
+    let rules = questionnaire::ASSISTANT_RULES;
+    assert!(rules.contains("Pro and any plan below Max count as small, and Max counts as max"), "{rules}");
+    assert!(rules.contains("a plan the settings did not name is small"), "{rules}");
+    assert!(rules.contains("install --set-plan max|small"), "{rules}");
+}
+
+/// Blind test 2026-10-10: after item 2 goes off, the way back on was nowhere.
+#[test]
+fn the_assistant_rules_say_how_to_put_the_connections_back_on() {
+    let text = questionnaire::lookup_text_with(None, &real_paths());
+    let on = "to switch them back on, run the installer again with `install --db \"C:/Users/x/AppData/Local/thor2/thor.db\"`";
+    assert!(text.contains(on), "{text}");
+    let rules = questionnaire::ASSISTANT_RULES;
+    assert!(rules.contains("a second run changes nothing") && rules.contains("a restart of Claude Code is needed again"), "{rules}");
+    // It sits beside the "no" instruction for item 2.
+    let at_no = rules.find("2 remove only THOR's four hook entries").unwrap();
+    let at_on = rules.find("to switch them back on").unwrap();
+    assert!(at_on > at_no && at_on - at_no < 400, "the way back on is beside the way off");
+}
+
+/// Items 4 and 7 run through the connections of item 2.
+#[test]
+fn the_weekly_check_and_the_bug_offers_say_they_depend_on_the_connections() {
+    for id in ["weekly-check", "bug-reports"] {
+        let q = questions().into_iter().find(|q| q.id == id).unwrap();
+        assert!(q.what.contains("runs through the connections of item 2, so it only happens while those are on"), "{id}: {}", q.what);
+    }
+}
+
+/// The 12-item list is what the first reply MUST show. Its length is far over
+/// the length rule's 1000 characters and the user did not ask for an overview,
+/// so the reply is recognised by shape and the style rules stand aside - in
+/// the shipped rulebook, with a translated list too - while an ordinary long
+/// reply is still held.
+mod first_reply_is_not_held {
+    use super::*;
+    use serve::respond;
+
+    fn rulebook() -> String {
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../guard-response-rulebook.example.json")).unwrap()
+    }
+
+    fn held(reply: &str, prompt: &str) -> bool {
+        respond::guard_verdict(Some(&rulebook()), reply, prompt, false, None).block_reason.is_some()
+    }
+
+    fn first_reply(list: &str) -> String {
+        format!(
+            "This remembers what you tell me about your work, so you never have to repeat it. It brings the right thing back at the right moment.\n\n{list}\nHelper agents are off until you say \"helpers on\". Nothing is backed up yet: say \"backup local\" to start."
+        )
+    }
+
+    #[test]
+    fn the_real_list_is_far_over_the_length_rule_and_is_recognised() {
+        let reply = first_reply(&questionnaire::render_list(None));
+        assert!(reply.chars().count() > 2000, "the list is long: {}", reply.chars().count());
+        assert!(respond::is_setup_list_reply(&respond::haystack(&reply)));
+        assert!(!held(&reply, "hallo"), "the very first reply must not be held");
+    }
+
+    #[test]
+    fn a_list_in_another_language_is_recognised_too() {
+        let mut list = String::new();
+        for q in questions() {
+            // Translated prose, but the command and the file name stay as they are.
+            let line = match q.id {
+                "weekly-check" => "Wekelijkse controle: ongeveer eens per week ruimt THOR het geheugen op (je kunt ook /thor-eval typen). Standaard: aan.".to_string(),
+                "changelog" => "Changelog: als dit project er geen heeft maak ik CHANGELOG.md aan. Standaard: ja, als het project er geen heeft.".to_string(),
+                _ => format!("Onderdeel {} dat THOR voor je heeft geregeld, in gewone woorden, zodat er niets stilletjes gebeurt. Standaard: aan.", q.id),
+            };
+            list.push_str(&format!("{}. {}\n", q.n, line));
+        }
+        let reply = first_reply(&list);
+        assert!(reply.chars().count() > 1000);
+        assert!(respond::is_setup_list_reply(&respond::haystack(&reply)));
+        assert!(!held(&reply, "hallo"));
+    }
+
+    #[test]
+    fn a_plain_long_reply_in_a_later_turn_is_still_held() {
+        let reply = "The build ran and the change is in. ".repeat(42);
+        assert!(reply.chars().count() > 1400 && reply.chars().count() < 1700);
+        assert!(!respond::is_setup_list_reply(&respond::haystack(&reply)));
+        assert!(held(&reply, "did it work?"));
+    }
+
+    #[test]
+    fn mentioning_the_command_and_the_file_without_the_list_does_not_exempt() {
+        let reply = format!("You can type /thor-eval any time, and CHANGELOG.md is kept. {}", "More words about it. ".repeat(70));
+        assert!(!respond::is_setup_list_reply(&respond::haystack(&reply)));
+        assert!(held(&reply, "did it work?"));
+    }
+
+    #[test]
+    fn the_list_inside_an_essay_is_not_the_list_reply() {
+        let reply = first_reply(&questionnaire::render_list(None)) + &"Extra prose that goes on. ".repeat(200);
+        assert!(reply.chars().count() > respond::SETUP_LIST_MAX_CHARS);
+        assert!(!respond::is_setup_list_reply(&respond::haystack(&reply)));
+    }
+}
