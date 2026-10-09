@@ -355,6 +355,27 @@ fn an_exported_sandbox_variable_answers_the_install_rule() {
     assert!(!fx.powershell("$env:USERPROFILE='C:\\sandbox'\n.\\install.exe"));
 }
 
+/// Field test 15, collect 19d: `export USERPROFILE=<the real profile>` pointed
+/// the installer at the live profile and still passed as "a sandbox". The
+/// answer holds only when the value is somewhere else than the profile of the
+/// process that judges the call.
+#[test]
+fn the_real_profile_is_no_sandbox() {
+    let fx = Fx::new(&[install_rule()]);
+    let Some(real) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).ok().filter(|r| !r.is_empty()) else { return };
+    let slashed = real.replace('\\', "/");
+    assert!(fx.bash(&format!("export USERPROFILE={slashed}; install.exe --no-mcp")), "the real profile exported");
+    assert!(fx.bash(&format!("export USERPROFILE=\"{slashed}/\"; install.exe --no-mcp")), "quoted, with a trailing slash");
+    assert!(fx.bash(&format!("USERPROFILE={} install.exe --no-mcp", slashed.to_uppercase())), "inline, in capitals");
+    assert!(fx.bash("export USERPROFILE=$HOME; install.exe --no-mcp"), "a reference to the real home");
+    assert!(fx.bash("USERPROFILE=\"$USERPROFILE\" install.exe --no-mcp"));
+    assert!(fx.powershell(&format!("$env:USERPROFILE = '{real}'; install.exe --no-mcp")), "PowerShell, the real one");
+    // A sandbox next to it, or inside it, is a sandbox.
+    assert!(!fx.bash(&format!("export USERPROFILE={slashed}/sandbox-home; install.exe --no-mcp")));
+    assert!(!fx.bash("export USERPROFILE=/tmp/h; install.exe --no-mcp"));
+    assert!(!fx.bash(&format!("export USERPROFILE={slashed}; install.exe --db /tmp/x/thor.db")), "--db answers by itself");
+}
+
 #[test]
 fn only_an_assignment_that_certainly_ran_in_this_shell_answers() {
     let fx = Fx::new(&[install_rule()]);

@@ -1029,11 +1029,18 @@ pub fn find_requires_violation_owned(
             }
             let env = std::cell::OnceCell::new();
             !required.iter().any(|r| {
-                segment.unit.contains(r.as_str())
+                let named = segment.unit.contains(r.as_str())
                     || segment.unit_words.contains(r.as_str())
                     || comments.contains(r.as_str())
                     || r.strip_suffix('=').is_some_and(|name| {
                         env.get_or_init(|| crate::shell::env_before(segments, *at)).contains_key(name)
+                    });
+                // A profile variable answers only when it points somewhere else
+                // than the real profile (field test 15, collect 19d).
+                named
+                    && !r.strip_suffix('=').is_some_and(|name| {
+                        let env = env.get_or_init(|| crate::shell::env_before(segments, *at));
+                        sets_the_real_profile(name, segment, env)
                     })
             })
         });
@@ -1050,6 +1057,45 @@ pub fn find_requires_violation_owned(
         ));
     }
     all_reasons(reasons)
+}
+
+/// The variables that name a user's profile folder.
+const PROFILE_VARIABLES: &[&str] = &["USERPROFILE", "HOME"];
+
+/// Spellings that point a profile variable at the profile it already is.
+const PROFILE_REFERENCES: &[&str] = &["$userprofile", "${userprofile}", "$home", "${home}", "%userprofile%", "$env:userprofile", "$env:home", "~"];
+
+/// A path in one comparable spelling: forward slashes, lowercase, no quotes or
+/// trailing slash, and the MSYS drive form `/c/Users/me` as `c:/users/me`.
+fn comparable_path(path: &str) -> String {
+    let path = path.trim().trim_matches(['"', '\'']).replace('\\', "/").to_lowercase();
+    let path = path.trim_end_matches('/').to_string();
+    let mut chars = path.chars();
+    match (chars.next(), chars.next(), chars.next()) {
+        (Some('/'), Some(drive), Some('/')) if drive.is_ascii_alphabetic() => format!("{drive}:{}", &path[2..]),
+        _ => path,
+    }
+}
+
+/// Whether the call sets the profile variable `name` to the REAL profile of the
+/// process that judges it (its own `USERPROFILE` or `HOME`), or to a reference
+/// that resolves there. `export USERPROFILE=<real profile>` is not a sandbox, so
+/// it must not answer the rule that asks for one. The value the call itself
+/// carries on the segment wins over an earlier export; no value that can be
+/// read (it sits inside a quoted script, say) is never a finding.
+fn sets_the_real_profile(name: &str, segment: &crate::shell::Segment, env: &std::collections::HashMap<String, String>) -> bool {
+    if !PROFILE_VARIABLES.contains(&name) {
+        return false;
+    }
+    let inline = segment.words.iter().find_map(|w| w.strip_prefix(name).and_then(|rest| rest.strip_prefix('=')));
+    let Some(value) = inline.or_else(|| env.get(name).map(String::as_str)) else { return false };
+    let value = value.trim().trim_matches(['"', '\'']);
+    if PROFILE_REFERENCES.contains(&value.to_lowercase().as_str()) {
+        return true;
+    }
+    let theirs = comparable_path(value);
+    !theirs.is_empty()
+        && PROFILE_VARIABLES.iter().filter_map(|real| std::env::var(real).ok()).any(|real| comparable_path(&real) == theirs)
 }
 
 /// The text of every shell comment in `content` (a `#` that starts a word,
