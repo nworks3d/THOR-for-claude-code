@@ -535,6 +535,18 @@ pub struct OptInRule {
     /// Empty (every rulebook before this field existed) means no such
     /// exemption, unchanged from today.
     pub list_request_any_of: Vec<String>,
+    /// Terms whose presence in the OWNER'S OWN LAST PROMPT mean he explicitly
+    /// asked for a summary or an overview ("samenvatten", "overzicht",
+    /// "summarize", "overview", "list"). Unlike `list_request_any_of` this
+    /// does not ask the reply to be list-shaped: a summary is often prose. It
+    /// raises the length at which the rule fires to `overview_max_chars`, so a
+    /// reply that IS that overview may run longer, but not without end. Empty
+    /// or `overview_max_chars` 0 (every rulebook before this field existed)
+    /// means no such allowance.
+    pub overview_request_any_of: Vec<String>,
+    /// The length (in characters) up to which a reply to an explicit request
+    /// for a summary or overview is left alone - see `overview_request_any_of`.
+    pub overview_max_chars: usize,
     /// `true` marks this rule as being about the OWNER's own reading of a
     /// reply, not about whether the agent was honest or diligent - skipped
     /// for a subagent payload (`evaluate_opt_in`'s own `is_subagent`
@@ -613,6 +625,8 @@ pub fn parse_opt_in_rules(text: &str) -> Vec<OptInRule> {
                 r.get("tier").and_then(|v| v.as_str()).and_then(Tier::from_json).unwrap_or(Tier::Block);
             let none_of_patterns = str_list(r, "none_of_patterns");
             let list_request_any_of = str_list(r, "list_request_any_of");
+            let overview_request_any_of = str_list(r, "overview_request_any_of");
+            let overview_max_chars = r.get("overview_max_chars").and_then(|v| v.as_u64()).map_or(0, |n| n as usize);
             // `.as_bool()` is `None` for anything that is not a literal JSON
             // `true`/`false` - absent, a string, a number, an object, an
             // array - and `unwrap_or(false)` reads every one of those the
@@ -639,6 +653,8 @@ pub fn parse_opt_in_rules(text: &str) -> Vec<OptInRule> {
                 tier,
                 none_of_patterns,
                 list_request_any_of,
+                overview_request_any_of,
+                overview_max_chars,
                 owner_reading_only,
                 own_claims_only,
                 affirmative_only,
@@ -1407,6 +1423,22 @@ fn list_exempted(rule: &OptInRule, prompt_lower: &str, haystack_lower: &str) -> 
     asked_for_a_list && is_mostly_list_lines(haystack_lower)
 }
 
+/// Whether the owner's prompt explicitly asked for a summary or an overview
+/// (`overview_request_any_of`) and the reply is still within the longer
+/// allowance that earns (`overview_max_chars`). Found 2026-10-09 by the
+/// answer-guard sweep: the owner asked "Kan je eens samenvatten wat de nieuwe
+/// gebruiker te zien krijgt", and the reply WAS that overview, about 1,100
+/// characters of structured prose; the length rule held it because
+/// "samenvatten" was no request word and the reply was not list-shaped. No
+/// prompt text at all, an empty term list or a zero allowance never exempts.
+fn overview_allowed(rule: &OptInRule, prompt_lower: &str, haystack_lower: &str) -> bool {
+    if rule.overview_request_any_of.is_empty() || rule.overview_max_chars == 0 || prompt_lower.is_empty() {
+        return false;
+    }
+    rule.overview_request_any_of.iter().any(|t| prompt_lower.contains(&t.to_lowercase()))
+        && haystack_lower.chars().count() <= rule.overview_max_chars
+}
+
 // ------------------------------------------------------- reader scope
 //
 // THE DEFECT THIS FIELD FIXES, decided by the owner 2026-09-09, the same day
@@ -1671,6 +1703,7 @@ fn evaluate_opt_in_checked(
             let fires_before_escapes = trigger_fires(r, haystack_lower)
                 && !positionally_escaped(r, haystack_lower)
                 && !list_exempted(r, prompt_lower, haystack_lower)
+                && !overview_allowed(r, prompt_lower, haystack_lower)
                 && !(r.owner_reading_only && is_subagent)
                 && prompt_gate_open(r, prompt_lower)
                 && !(r.backed_by_turn_tools && turn_backs_claim(&r.base, haystack_lower, turn_commands));
@@ -2862,6 +2895,63 @@ mod tests {
     fn a_long_prose_reply_still_blocks_even_when_the_prompt_asked_for_an_overview() {
         let v = guard_verdict(Some(LIST_RULEBOOK), &long_prose_reply(), "Geef je me nog een overzicht van de opties?", false, None);
         assert!(v.block_reason.is_some(), "the reply is prose, not a list, so it must still block");
+    }
+
+    // ------------------------------------- an explicit summary or overview
+    const OVERVIEW_RULEBOOK: &str = r#"[
+      {"id":"answer-is-too-long","tier":"block",
+       "any_of":[],
+       "none_of":["\n> ","```"],
+       "min_chars":1000,
+       "overview_request_any_of":["samenvat","summar","overzicht","overview","lijst","list","opsomming"],
+       "overview_max_chars":2500,
+       "reminder":"This answer is over 1000 characters."}
+    ]"#;
+
+    fn prose_of(chars: usize) -> String {
+        let mut s = String::from("Dit is de samenvatting in lopende tekst. ");
+        while s.chars().count() < chars {
+            s.push_str("Nog een zin die uitlegt wat de gebruiker te zien krijgt. ");
+        }
+        s.chars().take(chars).collect()
+    }
+
+    /// THE CASE FOUND 2026-10-09: "Kan je eens samenvatten ..." answered with a
+    /// ~1,100 character overview in prose. It was held; it must pass.
+    #[test]
+    fn an_overview_the_owner_asked_to_have_summarised_may_run_longer() {
+        let prompt = "Kan je eens samenvatten wat de nieuwe gebruiker te zien krijgt?";
+        let v = guard_verdict(Some(OVERVIEW_RULEBOOK), &prose_of(1100), prompt, false, None);
+        assert!(v.block_reason.is_none(), "{:?}", v.block_reason);
+        for ask in ["Geef me een overzicht van de opties", "Please summarize the change", "Give me an overview", "Maak een lijst van de stappen", "list the options"] {
+            let v = guard_verdict(Some(OVERVIEW_RULEBOOK), &prose_of(1800), ask, false, None);
+            assert!(v.block_reason.is_none(), "{ask}: {:?}", v.block_reason);
+        }
+    }
+
+    /// Longer is not endless: past the allowance the rule applies again.
+    #[test]
+    fn an_overview_past_the_allowance_is_still_held() {
+        let prompt = "Kan je eens samenvatten wat de nieuwe gebruiker te zien krijgt?";
+        let v = guard_verdict(Some(OVERVIEW_RULEBOOK), &prose_of(2600), prompt, false, None);
+        assert!(v.block_reason.is_some(), "2600 characters is beyond the 2500 allowance");
+    }
+
+    /// The same 1,100 characters after a prompt that asked for no summary or
+    /// overview, or with no prompt text at all, are held as before.
+    #[test]
+    fn without_an_explicit_request_the_length_rule_is_unchanged() {
+        let v = guard_verdict(Some(OVERVIEW_RULEBOOK), &prose_of(1100), "Hoe los ik dit probleem op?", false, None);
+        assert!(v.block_reason.is_some());
+        let v = guard_verdict(Some(OVERVIEW_RULEBOOK), &prose_of(1100), "", false, None);
+        assert!(v.block_reason.is_some(), "an unreadable prompt never grants the allowance");
+    }
+
+    /// A rulebook from before the field existed behaves exactly as it did.
+    #[test]
+    fn a_rulebook_without_the_overview_fields_is_unchanged() {
+        let v = guard_verdict(Some(LIST_RULEBOOK), &prose_of(1100), "Kan je eens samenvatten wat de nieuwe gebruiker te zien krijgt?", false, None);
+        assert!(v.block_reason.is_some());
     }
 
     /// Fail-open direction: an empty last prompt (transcript unreadable) is
