@@ -28,8 +28,11 @@ one block, not one note at a time: the end-of-session review (`/thor-eval`),
 which THOR asks for about once a week per project. THOR does not stop an
 ordinary turn to ask whether one note helped or got in the way. The review
 only names a note your own session actually saw fire - never one that only
-ever showed up during other, unrelated work. Two bad verdicts in a row retire
-a note from being served again, though it stays there if you go looking for it.
+ever showed up during other, unrelated work. Two "this did not belong"
+verdicts since the note was last rewritten stop a plain note from being served
+again, though it stays there if you go looking for it. A rewrite of the note's
+text, check or bindings starts that count again, and a note whose check can
+refuse is never hidden this way.
 
 A health check names what has rotted, out loud: proofs that now come out
 false, notes pointing at nothing, notes too crowded to ever be shown.
@@ -38,8 +41,15 @@ Everything that is not code - a recipe, a book, a training log - lives in
 its own library, kept apart, so it never competes with a deploy rule for
 room.
 
-Everything stays on your machine: no account, no key, no cloud - including
-what it learns about which of your notes are worth keeping.
+Everything stays on your machine by default: no account, no key, no cloud -
+including what it learns about which of your notes are worth keeping. The only
+two things that can leave it are listed under "Stays on your machine" below.
+
+**Get started.** Send this repository's link to your AI assistant (Claude Code)
+and say "install THOR". It does the whole setup itself; the only thing it asks
+of you is to close Claude Code and open it again, once.
+The full step-by-step is under [Getting started](#getting-started) further
+down. If you are the assistant, read [AGENTS.md](AGENTS.md).
 
 ---
 
@@ -76,8 +86,15 @@ never leak into another.
 files that moved, notes nothing ever reads, notes crowded out by louder ones.
 Out loud, in plain language, so you can fix them.
 
-**Stays on your machine.** No account, no key, no server. Nothing is sent
-anywhere, ever.
+**Stays on your machine.** No account, no key, no server. THOR never sends
+anything on its own. Exactly two things can leave your machine, and only
+because you say so: a bug report about THOR itself, sent to its GitHub page only
+after your explicit yes to the exact text shown (file paths, project and
+computer names, addresses, keys and passwords are removed first), and a backup
+of your memory to a place you name, if you choose one - a backup kept on this
+machine sends nothing. A short record of recent commands and replies, kept
+beside the memory so THOR can test its own rules, never leaves the machine and
+can be switched off (`install --set-recording off`).
 
 ## What that looks like in practice
 
@@ -113,7 +130,7 @@ land.
 Getting there is not free, and it is worth knowing before you start. A note only
 earns that power if it is written to earn it: tied to a real file or command,
 carrying something checkable that shows it still applies. THOR ships with a
-handful of starting notes that teach exactly that, and refuses the ones that
+set of starting notes that teach exactly that, and refuses the ones that
 cannot work. [AGENTS.md](AGENTS.md) spells out the rules of the game in full.
 
 Three things make that work, and they all live in one file on your machine:
@@ -139,8 +156,8 @@ It reads your code too. Point it at a project and it takes in the source and the
 documentation, so "how does this bit work here" gets answered from your actual
 project instead of a guess.
 
-Everything stays on your machine. No cloud, no account, no subscription, and
-nothing to sign up for. If some optional piece is missing, THOR quietly falls
+Everything stays on your machine by default. No cloud, no account, no
+subscription, and nothing to sign up for. If some optional piece is missing, THOR quietly falls
 back to a simpler way of working instead of breaking.
 
 ## A note that can actually stop you
@@ -261,31 +278,41 @@ at the right moment and hope. Version 2 is the same memory with a spine.
   stored. It will not be waved off with a promise to do it later.
 - **A copy of the memory can be kept somewhere else, and you choose.** A backup
   is a choice you make at the first session; the install does not switch one on
-  for you. Once you choose one, THOR writes the whole memory into a private git
-  repository on your machine about once a day and sends it on. If that
-  repository has a remote called `nas` (a folder on a NAS or another computer
-  you own), the copy goes there by itself and nowhere else; without one it goes
-  to the remote the repository already follows. `doctor` says where the last
-  copy went and how long ago, or that it has been failing and why. Getting it
-  back is one command.
+  for you, so until you choose, nothing is backed up. Once you choose one, THOR
+  writes the whole memory into a private git repository about once a day.
+  `install --set-backup local` keeps that repository beside the memory on this
+  machine and sends nothing anywhere (it protects against a damaged memory
+  file, not against the disk dying). `install --set-backup <folder or address>`
+  also adds the place you named (a folder on a NAS or another computer you own,
+  or a private repository) as a remote called `nas`, and the copy goes there and
+  nowhere else. `install --set-backup off` stops it. `doctor` says where the
+  last copy went and how long ago, or that it has been failing and why. Getting
+  it back is one command.
 - **It costs almost nothing to carry.** A note is capped at 300 characters and a
   block at four notes and 1200 characters, so what lands in the conversation is
   a few hundred tokens, not a whole rules file re-read on every turn. A memory
   of ten thousand notes costs the same per turn as one of fifty. Nothing calls
   out to a model to decide what to send - it is a local program reading a local
   file, so there is no network round trip in front of your keystroke. The one
-  exception is the handful you deliberately pin: those are read out in full at
-  the start of a conversation, so pin sparingly and the cap does the rest.
-  Measured on the author's own machine and memory: about 110 ms per call and
-  around 1500 characters delivered when something applies, against roughly 660
-  ms for version 1. One machine, one memory - treat it as an order of magnitude,
-  not a specification.
+  exception is the pinned notes: those are read out in full at the start of a
+  conversation (a new memory starts with 22 of them, and that block is capped at
+  about 9,500 bytes), so pin sparingly and the cap does the rest.
+- **Replies are checked too.** A new memory comes with a small file of six reply
+  rules, kept beside it: open a result-like reply with a plain summary, do not
+  ask you to check what the assistant can check itself, no reflexive
+  disclaimers, keep an answer under about 1000 characters, show evidence when
+  saying something was checked, and never say everything was checked without
+  saying what was covered. A reply that breaks one is sent back once to be
+  rewritten. A summary or overview you ask for may run longer, and the
+  first-session list is exempt from the length rule. Edit the file, delete one
+  entry, or delete the file to change or switch them off.
 - **Stale notes are hunted, not left to rot.** A note whose proof comes out
   false is reported instead of quietly going on being wrong. A note that keeps
   firing without anyone ever saying whether it belonged gets asked about, and
-  two verdicts of "this did not belong" stop it being shown while leaving it
-  findable (a rewrite of the note clears older verdicts, and a rule that can
-  refuse is never hidden this way). In version 1 a note that went wrong simply stayed.
+  two verdicts of "this did not belong" since it was last rewritten stop a plain
+  note from being shown while leaving it findable (a rewrite of its text, check
+  or bindings starts that count again, and a rule whose check can refuse is never
+  hidden this way). In version 1 a note that went wrong simply stayed.
 - **Crowding is visible and refused.** Only a few notes fit in a block, so notes
   compete. Version 2 counts that competition, tells you when you have just
   stored something onto a spot too crowded to ever show it, names what is
@@ -359,6 +386,15 @@ download, no paths to type, no Rust to install, no questions to answer - the
 first conversation after the restart finishes the setup on its own, with
 defaults you can change just by saying so.
 
+That first conversation also shows you a numbered list of everything the install
+arranged, one line each. Everything on it is already on, except two things that
+stay off until you choose: helper-agent mode (your main assistant judges while
+cheaper models do the work in helpers; `install --set-helpers on` switches it
+on) and backups (nothing is backed up until you pick `local` or a place). The
+changelog item creates a `CHANGELOG.md` in your project only if it has none and
+you do not say no. Answer by number ("1 yes, 3 no, 10 local"), or say
+"defaults"; anything you do not mention keeps its default.
+
 ### The easy way: five steps, no programming tools
 
 You need Claude Code, installed and opened at least once. Nothing else to
@@ -378,13 +414,13 @@ system's package manager, and asks you for at most one permission click.
    Windows, in PowerShell:
 
    ```powershell
-   irm https://raw.githubusercontent.com/nworks3d/thor-for-claude-code/main/install.ps1 | iex
+   irm https://raw.githubusercontent.com/nworks3d/THOR-for-claude-code/main/install.ps1 | iex
    ```
 
    Linux:
 
    ```sh
-   curl -fsSL https://raw.githubusercontent.com/nworks3d/thor-for-claude-code/main/install.sh | sh
+   curl -fsSL https://raw.githubusercontent.com/nworks3d/THOR-for-claude-code/main/install.sh | sh
    ```
 
    (On Windows, if a THOR program refuses to start, install Microsoft's "Visual
@@ -444,9 +480,9 @@ files before it touches
 them, it never removes anything it did not put there, and running it twice
 changes nothing the second time.
 
-A brand new memory does not arrive empty. It gets a handful of short notes on
-how to write a note that comes back to you later, and your assistant is handed
-them at the start of every conversation from then on. That matters more than it
+A brand new memory does not arrive empty. It gets 22 short pinned notes - how to
+write a note that comes back to you later, plus honesty and hygiene habits - and
+your assistant is handed them at the start of every conversation from then on. That matters more than it
 sounds: an assistant with nothing in front of it writes notes in a shape that
 never fires again, and neither of you would notice for weeks. They are ordinary
 notes - unpin one, rewrite it in your own words, or throw it out. An existing
@@ -456,14 +492,15 @@ It also gets a starter set of general work rules for coding with an assistant,
 the habits the author learnt the hard way: a changelog line with every
 user-visible change (when the project keeps one), run the tests and quote the
 real result before saying "done", never commit a secret, no force-push of a
-shared branch, check where you push, scan before anything goes public, write a
-complete brief for every agent you spawn, and a few more. Each one arrives right
-before the step it is about - the commit, the push, the agent being spawned - and
+shared branch, check where you push, scan before anything goes public, rehearse
+a destructive step on a copy, and a few more (13 in all). Each one arrives right
+before the step it is about - the commit, the push, the delete - and
 they only inform, so a rule written for someone else's project cannot block
 yours. The one exception is on Windows: two of them refuse a call that would
 flash a console window (a `Start-Process` that is not hidden, and a scheduled
 task made with `/it`). Ask your assistant to remove any you
-do not want.
+do not want. The two notes that carry helper-agent mode are not among them: that
+mode is off in a new memory.
 
 You only reach for a flag if your setup is unusual: `--settings` and `--mcp-json`
 send it at other files, `--db` and `--serve-exe` override where it looks, and
@@ -565,7 +602,7 @@ docker run -i --rm -v thor-data:/data ghcr.io/nworks3d/thor-mcp:2.5.0
 ```
 
 On an empty volume, the container creates a memory and seeds it with THOR's
-own handful of starting notes before it starts answering - the same first
+own set of starting notes before it starts answering - the same first
 step the setup above takes. Point `-v` at a folder or named volume that
 already holds a `thor.db` instead (a copy of the one your own build created,
 say), and that one is opened untouched. `-i` keeps input open, which is what
@@ -593,13 +630,16 @@ one has talked itself into a corner - not because it is getting long.
 Worth knowing before you start, because the beginning is the least impressive
 part and it is easy to conclude too early that nothing is happening.
 
-**Day one, it stops nothing.** A fresh memory holds a handful of starting notes:
-how to write one that comes back, plus the honesty and agent-spawning habits
-that hold on any project. The part of THOR that can refuse a
+**Day one, it stops almost nothing.** A fresh memory holds 22 pinned starting
+notes (how to write one that comes back, plus honesty, agent and hygiene habits
+that hold on any project) and 13 general work rules that arrive right before
+the step they are about. The part of THOR that can refuse a
 wrong change only works on notes that carry a proof, and you have not written
 any yet. So on the first day you get those notes at the start of a conversation
-and a nudge at the end, and no refusals at all. That is not a fault; there is
-simply nothing yet to refuse with.
+and the first-session list described under Getting started, and no refusals,
+with one exception: on Windows, two of the work rules refuse a call that would
+flash a console window. That is not a fault; there is simply nothing yet to
+refuse with.
 
 **Your first note will probably be turned down.** It asks for two things most
 people leave out: when the note should come back to you, and what would show it
@@ -760,8 +800,9 @@ do all of this for you if you ask; these are the steps in plain words.
   reason THOR exists at all. In the old Norse stories, Mimir guards the well of
   knowledge; here it set the bar THOR had to clear, and for a long stretch it
   cleared plenty of its own. Every early comparison in this project was against
-  mimir, wins and losses both published on purpose, because a rival that good
-  deserves honest numbers.
+  mimir, wins and losses both counted honestly, because a rival that good
+  deserves honest numbers (they are no longer published here; see "Does it
+  work?").
 - **Ideas borrowed, both ways.** Two things THOR does came from mimir's own
   work and were rebuilt here in THOR's own way, and mimir in turn credits THOR
   for reading code into memory and for checking memory on every message -
