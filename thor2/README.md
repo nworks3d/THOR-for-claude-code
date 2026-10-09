@@ -500,15 +500,21 @@ rule is one entry with:
   rule reads every occurrence.
 - `backed_by_turn_tools` - `true` marks a rule about a claim of having looked
   at something ("checked", "verified", "I cannot reach it"). Such a rule does
-  not fire when the turn itself looked at something: a Bash or PowerShell
-  command, a Read, Grep or Glob, a web fetch or search, or a browser or screen
-  tool, run after the owner's last prompt. Launching an agent, writing or
+  not fire when the turn itself looked at something the claim is about: a Bash
+  or PowerShell command, a Read, Grep or Glob, a web fetch or search, or a
+  browser or screen tool, run after the owner's last prompt, whose file name,
+  command words, address or stated purpose shares a word with the paragraph of
+  the claim (and the one before and after it). Launching an agent, writing or
   editing, and THOR's own memory tools do not count, so a claim relayed from an
-  agent's report, or made in a turn that looked at nothing, is still held. A
-  reply never has to name a file or a line for this: the owner's short-answer
-  rule forbids it. Known limit: the guard sees that the turn looked at
-  something, not whether it looked at the thing the claim is about. Left out,
-  the rule reads every claim.
+  agent's report, or made in a turn that looked at nothing, or only at
+  something else, is still held. A reply never has to name a file or a line for
+  this: the owner's short-answer rule forbids it. Known limit: a shared word is
+  not proof that the call checked the claim. Left out, the rule reads every
+  claim.
+- `quotes_exempt` - `true` marks a rule whose trigger is a phrase the agent
+  must not USE ("nog te controleren"): where the phrase sits inside quotation
+  marks or inline code it is mentioned, not used, even in the agent's own
+  first-person sentence. Left out, a quote is read as before.
 - `only_if_prompt_any_of` - words of which the owner's own last prompt must
   carry at least one for the rule to apply at all. "Do not ask him to commit
   what he asked you to commit" is only a defect when he asked for a commit;

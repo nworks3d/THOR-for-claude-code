@@ -45,11 +45,24 @@ fn the_reported_reply_is_held_when_the_turn_looked_at_nothing() {
 fn the_reported_reply_passes_when_the_turn_ran_a_command_or_read_something() {
     for calls in [
         vec![("Bash", r#"{"command":"curl -s http://dev.example/health"}"#)],
-        vec![("Bash", r#"{"command":"node check-dash.mjs dashboard.html"}"#)],
-        vec![("Read", r#"{"file_path":"server/public/dashboard.html"}"#)],
+        vec![("Bash", r#"{"command":"node check-admin-scripts.mjs dashboard.html"}"#)],
+        vec![("Bash", r#"{"command":"node check-dash.mjs dashboard.html","description":"Syntax check of the admin page scripts"}"#)],
+        vec![("Read", r#"{"file_path":"server/public/admin.html"}"#)],
         vec![("Grep", r#"{"pattern":"<script"}"#)],
     ] {
         assert_eq!(held(REPORTED_REPLY, &calls), None, "{calls:?}");
+    }
+}
+
+/// Collect 17b: a look at something the claim does not name backs nothing.
+#[test]
+fn the_reported_reply_is_held_when_the_turn_looked_only_at_something_else() {
+    for calls in [
+        vec![("Bash", r#"{"command":"ls -la"}"#)],
+        vec![("Read", r#"{"file_path":"server/lib/pricing.js"}"#)],
+        vec![("Bash", r#"{"command":"git -C C:/Users/me/dev/other status -sb"}"#)],
+    ] {
+        assert!(held(REPORTED_REPLY, &calls).is_some(), "{calls:?}");
     }
 }
 
