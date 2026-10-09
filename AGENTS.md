@@ -611,7 +611,7 @@ DETAIL PER ITEM (for the assistant: state an item's Why once, only when he asks 
    To say no: Name the ones you do not want, or say none: I remove just those notes (changelog-with-every-user-visible-change, run-the-tests-before-saying-done, never-commit-a-secret, commit-push-deploy-only-when-asked, commit-hygiene, check-where-you-push-and-what-is-on-main, scan-before-it-goes-public, rehearse-destructive-steps-on-a-copy, pin-a-dependency-with-its-reason, absolute-paths-not-the-shell-working-directory, script-file-not-shell-quoting, windowless-processes-on-windows, scheduled-task-not-interactive), and a removed note simply stops arriving.
 
 6. Helper-agent mode
-   What it is: Your main assistant (the strongest model) answers, judges and checks, while cheaper models do the real work in helper agents, one helper per task. A trivial one-step job is done directly, tests are run narrowly while working and in full once at the end, and a helper that goes quiet is judged dead after about three checks. This is also true on smaller plans, and if your plan has no strongest model the best available one steers.
+   What it is: Your main assistant (the strongest model) answers, judges and checks, while cheaper models do the real work in helper agents, one helper per task. No helper is used for a question or an answer, a trivial one-step job, work that needs this conversation's context or quick back-and-forth with you, or a check of a helper's own result: the main assistant does those itself. Tests are run narrowly while working and in full once at the end, and a helper that goes quiet is judged dead after about three checks. This is also true on smaller plans, and if your plan has no strongest model the best available one steers.
    Why it exists: Measured at the maker, helpers were likely 12 to 62 percent cheaper than doing everything in the main conversation, and the chat stays free and answers at once while they work, instead of you waiting 5 to 15 minutes.
    What I chose: On.
    To say no: I remove the two notes that carry it (orchestrator-mode-saves-quota and an-agent-brief-stands-alone); your assistant then does the work itself in the main conversation.
@@ -730,8 +730,9 @@ Around a risky step or a tool:
 - `pin-a-dependency-with-its-reason` - a version pin carries a comment saying why.
 - `orchestrator-mode-saves-quota` - on by default (question 6): the strongest model
   answers, judges and checks, cheaper models do the work in helper agents, one helper
-  per task and never a bundle, the chat stays free meanwhile, a trivial one-step task
-  is done directly, and tests are run narrowly while working and in full once at the end.
+  per task and never a bundle, the chat stays free meanwhile, no helper for a question, a
+  trivial one-step task, work needing this conversation or quick back-and-forth, or checking
+  a helper's result, and tests are run narrowly while working and in full once at the end.
 - `an-agent-brief-stands-alone` - goal, absolute folder, files it may touch, a summary
   of what is known (not a read-first list), one narrow task, a short report; waiting is
   a check every 20 to 30 minutes, at most three times, then the job is judged dead by

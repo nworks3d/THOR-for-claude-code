@@ -1179,7 +1179,7 @@ pub fn workflow_starter_pack_for(windows: bool) -> Vec<model::item::Item> {
         // the owner's own.
         note(
             "orchestrator-mode-saves-quota",
-            "Orchestrator mode saves quota: the strongest model answers, judges and checks; cheaper models do the work in helper agents, ONE helper per task, never a bundle. The chat stays free. Trivial one-step task: do it yourself. Targeted tests while working, one full run at the end.",
+            "Strongest model answers, judges, checks; cheaper models work in helpers, ONE per task, never a bundle. Chat stays free. No helper for: questions, trivial one-step tasks, work needing this chat or quick back-and-forth, checking helper results. Targeted tests while working, one full run at the end.",
             "Doing all the work in the strongest model uses no more quota than letting cheaper helper agents do it.",
             vec![command("Agent")],
         ),
@@ -2575,9 +2575,9 @@ mod tests {
         let orchestrator = note("orchestrator-mode-saves-quota");
         let brief = note("an-agent-brief-stands-alone");
         for (text, must) in [
-            (&orchestrator, "one helper per task"),
+            (&orchestrator, "one per task"),
             (&orchestrator, "never a bundle"),
-            (&orchestrator, "trivial one-step task: do it yourself"),
+            (&orchestrator, "no helper for: questions, trivial one-step tasks, work needing this chat or quick back-and-forth, checking helper results"),
             (&orchestrator, "chat stays free"),
             (&orchestrator, "targeted tests while working, one full run at the end"),
             (&brief, "check every 20-30 minutes, at most 3 times"),
