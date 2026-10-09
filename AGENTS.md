@@ -252,8 +252,11 @@ inside `--force-with-lease`, and `ssh` does not match inside `sshKey.mjs`. It is
 found in every part of a command, though: after `cd x &&`, on a later line,
 inside `ssh host "..."` or `bash -c '...'`. For a `requires` trigger that names
 a family of names, end it with one `*`: `/thor*` catches `/thor-probe` and
-`/thor2`. A call that only asks for `--help` or `--version` is never refused by a
-`requires` rule.
+`/thor2`. A call that does nothing is never refused by a forbidden, `requires`
+or owner-approval rule: one that only asks for `--help` or `--version`, any call
+with `--help` in it, a `git push --dry-run` (or `-n`), or a PowerShell call with
+`-WhatIf`. The flag has to be on the same command as the rule's, not on a later
+one joined by `&&` or `;`.
 
 **A file check needs the project's working copy.** THOR tries it in the
 checkout registered for the rule's project (step 5 registers it). Written from
