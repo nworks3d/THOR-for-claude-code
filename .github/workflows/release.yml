@@ -109,6 +109,10 @@ jobs:
             cp "thor2/target/release/$b${{ matrix.ext }}" dist/
           done
           cp LICENSE dist/
+          # The mark of a release archive: install reads it to set the bug
+          # nudge to `release` (a build from a checkout is `test` and sends
+          # nothing). Its content is not read.
+          echo "official release archive" > dist/THOR-RELEASE
           cd dist && 7z a -tzip "../${{ matrix.asset }}" ./*
 
       - name: Package (linux)
@@ -119,6 +123,10 @@ jobs:
             cp "thor2/target/release/$b" dist/
           done
           cp LICENSE dist/
+          # The mark of a release archive: install reads it to set the bug
+          # nudge to `release` (a build from a checkout is `test` and sends
+          # nothing). Its content is not read.
+          echo "official release archive" > dist/THOR-RELEASE
           tar czf ${{ matrix.asset }} -C dist .
 
       # No step used to run a packaged file. This one unpacks the archive that

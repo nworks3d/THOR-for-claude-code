@@ -93,6 +93,55 @@ struct Cli {
         conflicts_with_all = ["project", "settings", "mcp_json", "no_mcp", "serve_exe", "mcp_exe", "code_index_root"]
     )]
     register_root: bool,
+
+    /// Set ONLY the mode of the bug nudge, `release` or `test`, and nothing
+    /// else. THOR finds some of its own bugs and offers one per session to
+    /// the agent, to be written up for the public THOR repository. In
+    /// `release` the agent asks you for a go and then opens the issue; in
+    /// `test` (a development setup) it only shows the write-up to you and
+    /// pushes nothing. A normal install picks the mode itself: `release`
+    /// when the programs came out of a release archive, `test` otherwise,
+    /// and it never changes a mode already set. Needs --db.
+    #[arg(
+        long = "set-mode",
+        value_name = "MODE",
+        conflicts_with_all = ["project", "settings", "mcp_json", "no_mcp", "serve_exe", "mcp_exe", "code_index_root", "register_root"]
+    )]
+    set_mode: Option<String>,
+}
+
+/// `install --set-mode release|test`: write the mode and nothing else.
+fn set_mode_only(db: Option<PathBuf>, word: &str) -> ExitCode {
+    let mode = match word {
+        "release" => serve::bug_report::Mode::Release,
+        "test" => serve::bug_report::Mode::Test,
+        other => {
+            eprintln!("the mode is 'release' or 'test', not '{other}'. Example: install --set-mode test --db <your memory>");
+            return ExitCode::from(2);
+        }
+    };
+    let Some(db) = db else {
+        eprintln!("name the memory to set the mode for: install --set-mode {word} --db <your memory>");
+        return ExitCode::from(2);
+    };
+    if !db.is_file() {
+        eprintln!(
+            "REFUSED: there is no memory at {} - check the path given with --db (the one your assistant's hooks name). \
+             Nothing was changed.",
+            db.display()
+        );
+        return ExitCode::FAILURE;
+    }
+    match serve::thor_bugs::write_mode(&db, mode) {
+        Ok(()) => {
+            println!("bug nudge mode set to '{word}' for {}", db.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("could not write the mode: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// The binary named `name` sitting next to this installer, with the
@@ -218,6 +267,9 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     if cli.register_root {
         return register_only(cli.db);
+    }
+    if let Some(word) = cli.set_mode.as_deref() {
+        return set_mode_only(cli.db, word);
     }
 
     let data_dir = default_data_dir();
@@ -352,7 +404,11 @@ fn main() -> ExitCode {
                     let stored = seeded.iter().filter(|s| s.stored).count();
                     println!("+ put {stored} starting notes in it, on how to write one that comes back");
                     for s in seeded.iter().filter(|s| !s.stored) {
-                        println!("  ! {} was refused: {}", s.id, s.refusal.as_deref().unwrap_or("no reason given"));
+                        let why = s.refusal.as_deref().unwrap_or("no reason given");
+                        println!("  ! {} was refused: {}", s.id, why);
+                        // THOR's own note refused by THOR's own gate is a bug
+                        // in THOR: it becomes a candidate (`serve::thor_bugs`).
+                        serve::thor_bugs::add(&db, serve::thor_bugs::seed_refused_finding(&s.id, why));
                     }
                     println!("  they are ordinary notes: unpin one, rewrite it, or throw it out");
                 }
@@ -363,6 +419,30 @@ fn main() -> ExitCode {
         Err(e) => {
             eprintln!("install refused: could not create the memory: {e}");
             return ExitCode::FAILURE;
+        }
+    }
+
+    // 1a. The mode of the bug nudge: THOR finds some of its own bugs and offers
+    // one per session to the agent to be written up for the public THOR
+    // repository (`serve::thor_bugs`). `release` only when the programs came
+    // out of a release archive; a build from a checkout is `test`, which
+    // publishes nothing. A mode already set is kept.
+    {
+        let bin_dir = serve_exe.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+        match ops::install::settle_mode(&db, &bin_dir, None) {
+            Ok((mode, how)) => {
+                let word = serve::thor_bugs::mode_word(mode);
+                match how {
+                    ops::install::ModeHow::Kept => println!("= bug nudge mode already '{word}' (left untouched)"),
+                    ops::install::ModeHow::ReleaseArchive => println!(
+                        "+ bug nudge mode 'release': these programs came from a release archive, so THOR may offer to write up a bug it finds in itself - nothing is sent without your yes"
+                    ),
+                    _ => println!(
+                        "+ bug nudge mode '{word}': these programs were not made from a release archive, so a bug THOR finds in itself is only shown to you, never sent (change it with install --set-mode release|test --db <memory>)"
+                    ),
+                }
+            }
+            Err(e) => println!("  ! could not write the bug nudge mode: {e}"),
         }
     }
 
