@@ -16,7 +16,7 @@ fn agents_md() -> String {
 }
 
 const EVERYTHING_THE_INSTALL_ARRANGES: &[&str] =
-    &["plan", "hooks", "git-hooks", "weekly-check", "work-rules", "helper-agents", "bug-reports", "replies", "topic-folders", "backups"];
+    &["plan", "hooks", "git-hooks", "weekly-check", "work-rules", "helper-agents", "bug-reports", "replies", "topic-folders", "backups", "recording", "changelog"];
 
 /// The page a person (or an agent) reads holds exactly what the catalogue
 /// renders. Run with THOR_UPDATE_GOLDEN=1 to rewrite the block after editing
@@ -54,6 +54,7 @@ fn each_item_carries_what_why_default_and_how_to_say_no() {
             assert!(text.chars().count() > 12, "item {} ({}) has no {label}", q.n, q.id);
         }
         assert!(!q.default.trim().is_empty(), "item {} ({}) has no default", q.n, q.id);
+        assert!(!q.line.trim().is_empty() && !q.line.contains('\n'),"item {} ({}): the line is ONE line", q.n, q.id);
         assert!(!q.why.contains(". "), "item {} ({}): the why is ONE sentence: {}", q.n, q.id, q.why);
         assert!(q.why.ends_with('.'), "item {}: {}", q.n, q.why);
     }
@@ -71,13 +72,110 @@ fn the_text_is_plain_ascii_without_dashes_curly_quotes_or_ellipsis_glyphs() {
 fn the_plan_item_asks_for_confirmation_and_gives_the_reason_for_each_case() {
     let plan = &questions()[0];
     assert!(plan.why.contains("usage limit") && plan.why.contains("once a week"), "{}", plan.why);
-    let max = questionnaire::render_list(Some(Detection { plan: Plan::Max, tier_found: true }));
+    let max = questionnaire::lookup_text(Some(Detection { plan: Plan::Max, tier_found: true }));
     assert!(max.contains("The settings say: Max. Is that right?"), "{max}");
-    let small = questionnaire::render_list(Some(Detection { plan: Plan::Small, tier_found: true }));
+    let small = questionnaire::lookup_text(Some(Detection { plan: Plan::Small, tier_found: true }));
     assert!(small.contains("The settings say: Pro or smaller. Is that right?"), "{small}");
-    let missing = questionnaire::render_list(Some(Detection { plan: Plan::Small, tier_found: false }));
+    let missing = questionnaire::lookup_text(Some(Detection { plan: Plan::Small, tier_found: false }));
     assert!(missing.contains("do not say, so which is it: Max, or Pro and smaller?"), "a missing key is asked outright: {missing}");
-    assert!(max.contains(plan.why) && missing.contains(plan.why), "the reason rides with the question in every case");
+    assert!(max.contains(plan.why) && missing.contains(plan.why), "the reason rides with the question in every case, in the detail");
+    // The short list the user sees carries the question itself, in one line.
+    let shown = |d| questionnaire::render_list(Some(d)).lines().find(|l| l.starts_with("1. ")).unwrap().to_string();
+    assert!(shown(Detection { plan: Plan::Max, tier_found: true }).contains("the settings say Max - is that right?"));
+    assert!(shown(Detection { plan: Plan::Small, tier_found: true }).contains("the settings say Pro or smaller - is that right?"));
+    assert!(shown(Detection { plan: Plan::Small, tier_found: false }).contains("which is it, Max or Pro and smaller?"));
+}
+
+/// The owner found a ten-item list with four parts each overwhelming. What the
+/// user sees is now a short intro, one line per item and the way to answer; the
+/// Why and the way to say no are kept for the assistant and shown only when the
+/// user asks about a number or refuses one.
+#[test]
+fn the_list_the_user_sees_is_an_intro_of_three_lines_at_most_then_one_line_per_item() {
+    let shown = questionnaire::render_list(None);
+    assert!(!shown.contains("Why it exists") && !shown.contains("To say no") && !shown.contains("What I chose"), "no four-part items:\n{shown}");
+    let lines: Vec<&str> = shown.lines().filter(|l| !l.trim().is_empty()).collect();
+    let first_item = lines.iter().position(|l| l.starts_with("1. ")).expect("item 1");
+    assert!(first_item <= 3, "the intro is at most 3 lines, it is {first_item}:\n{shown}");
+    let items = &lines[first_item..lines.len() - 1];
+    assert_eq!(items.len(), questions().len(), "one line per item:\n{shown}");
+    for (i, line) in items.iter().enumerate() {
+        assert!(line.starts_with(&format!("{}. ", i + 1)), "{line}");
+        assert!(line.chars().count() <= 280, "item {} is not short: {} characters", i + 1, line.chars().count());
+        assert!(line.contains("Default:"), "each line carries what was chosen: {line}");
+    }
+    let closing = lines.last().unwrap();
+    assert!(closing.contains("by number") && closing.contains("defaults"), "the way to answer ends the list: {closing}");
+}
+
+#[test]
+fn the_why_and_the_way_to_say_no_sit_in_the_appendix_for_the_assistant() {
+    let text = questionnaire::lookup_text(None);
+    let appendix = &text[text.find("DETAIL PER ITEM").expect("the appendix is there")..];
+    assert!(appendix.contains("only when he asks about a number or refuses it"), "{appendix}");
+    for q in questions() {
+        let at = appendix.find(&format!("\n{}. {}\n", q.n, q.title)).unwrap_or_else(|| panic!("item {} has no detail", q.n));
+        let block = &appendix[at..];
+        let block = &block[..block.find("\n\n").unwrap_or(block.len())];
+        for part in [q.why, q.default] {
+            assert!(block.contains(part), "item {} detail lacks '{part}'", q.n);
+        }
+        assert!(block.contains(q.say_no.as_str()), "item {} detail lacks how to say no", q.n);
+    }
+    let rules = questionnaire::ASSISTANT_RULES.to_lowercase();
+    assert!(rules.contains("short list") && rules.contains("only when he asks about a number") && rules.contains("why once"), "{rules}");
+}
+
+#[test]
+fn the_backup_item_tells_the_truth_that_nothing_is_backed_up_until_the_user_answers() {
+    let q = questions().into_iter().find(|q| q.id == "backups").unwrap();
+    for must in ["NOTHING is backed up until you choose", "a copy on this machine", "a place you name", "none"] {
+        assert!(q.line.contains(must), "the one line lacks '{must}': {}", q.line);
+    }
+    for liar in ["daily copy", "About once a day"] {
+        assert!(!q.what.contains(liar) && !q.default.contains(liar), "a fresh install wires no backup, so the item must not say '{liar}'");
+    }
+    assert!(q.default.contains("nothing is backed up until you answer"), "{}", q.default);
+    assert_eq!(q.why, "The memory is a single file, and if the disk dies everything it learned dies with it.");
+    assert!(q.what.contains("not against the disk dying"), "the honest limit of a local copy: {}", q.what);
+    assert!(q.say_no.contains("--set-backup off"), "{}", q.say_no);
+    assert!(questionnaire::ASSISTANT_RULES.contains("--set-backup local"), "the assistant knows the command");
+}
+
+#[test]
+fn the_recording_item_says_what_is_kept_where_why_and_how_to_switch_it_off() {
+    let q = questions().into_iter().find(|q| q.id == "recording").unwrap();
+    for must in ["30 days", "this machine", "blanked", "wrongly block"] {
+        assert!(q.line.contains(must) || q.what.contains(must), "recording item lacks '{must}': {} / {}", q.line, q.what);
+    }
+    assert!(q.say_no.contains("--set-recording off") && q.say_no.contains("no data"), "{}", q.say_no);
+    assert!(questionnaire::ASSISTANT_RULES.contains("--set-recording on|off"));
+}
+
+#[test]
+fn the_changelog_item_is_the_owners_decision_with_a_default_of_yes() {
+    let q = questions().into_iter().find(|q| q.id == "changelog").unwrap();
+    assert!(q.line.contains("Shall I keep a changelog and version number for this project?"), "{}", q.line);
+    assert_eq!(q.why, "Every later session, and you, know exactly what changed and which version runs, without digging through history.");
+    assert!(q.default.starts_with("Yes") && q.default.contains("has none"), "{}", q.default);
+    assert!(questionnaire::ASSISTANT_RULES.contains("CHANGELOG.md"), "on yes the assistant creates the file");
+}
+
+/// Every command the list tells the assistant to run must exist in the
+/// installer, or the list promises something the install cannot do.
+#[test]
+fn every_install_flag_the_list_names_exists_in_the_installer() {
+    let help = std::process::Command::new(env!("CARGO_BIN_EXE_install")).arg("--help").output().unwrap();
+    let help = String::from_utf8_lossy(&help.stdout).to_string();
+    let text = questionnaire::lookup_text(None);
+    let mut named = 0;
+    for word in text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-')) {
+        if word.starts_with("--set-") {
+            named += 1;
+            assert!(help.contains(word), "the list names {word}, which the installer does not have");
+        }
+    }
+    assert!(named >= 6, "the list names its commands: {named}");
 }
 
 #[test]

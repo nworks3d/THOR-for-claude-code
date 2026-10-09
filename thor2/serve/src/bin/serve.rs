@@ -2821,13 +2821,16 @@ fn setup_debt(store: &EventStore) -> Option<String> {
     Some(format!(
         "[THOR] This memory was just installed and its owner has not been walked through setup \
          yet. Do this before anything else, in this same turn, so nothing waits for him: (1) read \
-         the numbered list with lookup key 'first-session-questions' (each item says what it is, \
-         why it exists, what was chosen and how to say no); (2) store what applies - the \
+         the numbered list with lookup key 'first-session-questions' (a short list to show him, \
+         one line per item, and under it the detail per item for you - what it is, why it exists, \
+         what was chosen and how to say no - to use only when he asks about a number or refuses \
+         it); (2) store what applies - the \
          defaults: short plain replies, in his own language, the work lane only (nothing personal \
          goes into it), all the starting notes kept, each project named after its folder - as \
          '{answers}' (a Report with no scope is enough - this id needs none, so do not ask him to \
          name a collection for it); (3) retract '{note}'; (4) show him the list in his own \
-         language, say that everything on it is already on, and that he can answer by number (for \
+         language, say that everything on it is already as written (a fresh install made no \
+         backup, so say that one plainly), and that he can answer by number (for \
          example \"1 yes, 3 no, the rest as you like\"). Whatever he does not mention keeps its \
          default, and you apply the defaults without waiting for an answer. When he does answer, \
          apply each number, say ONCE and plainly why an item exists if his answer works against \

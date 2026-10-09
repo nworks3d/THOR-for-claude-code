@@ -226,7 +226,9 @@ per project and not per folder, when:
   work; the plan is read from Claude Code's own `~/.claude.json`
   (`organizationRateLimitTier`, undocumented, failing soft) and kept with its
   source in the mode sidecar, `install --set-plan` records the user's word, and
-  `install --set-weekly-check off` switches the automatic ask off);
+  `install --set-weekly-check off` switches the automatic ask off, `install
+  --set-backup local|<place>|off` chooses the backup, which a fresh install does
+  not make, and `install --set-recording off` stops the record of real calls);
 - this session has at least 10 minutes of its own work in that project since
   then (the larger of the clock file's number and the session record's own
   count, so zeroing the file delays the ask at most until the record is read);
