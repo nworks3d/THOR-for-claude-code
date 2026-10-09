@@ -440,6 +440,9 @@ pub struct Report {
     pub answers: Vec<RuleLine>,
     pub rows: u64,
     pub reply_rows: u64,
+    /// The user switched recording off (`install --set-recording off`): the
+    /// corpus is not being kept, so an empty report means no data, not no finding.
+    pub recording_off: bool,
     pub covered: Covered,
     pub took_ms: u128,
 }
@@ -544,6 +547,7 @@ pub fn run(db: &Path, store: &EventStore, opts: &Opts) -> Report {
     let mut report = build_report(store, &state);
     report.covered = covered;
     report.took_ms = started.elapsed().as_millis();
+    report.recording_off = !crate::plan::recording_on(db);
     report
 }
 
@@ -1053,6 +1057,7 @@ fn build_report(store: &EventStore, state: &State) -> Report {
         answers,
         rows: state.calls.rows,
         reply_rows: state.replies.rows,
+        recording_off: false,
         covered: Covered::default(),
         took_ms: 0,
     }
@@ -1138,6 +1143,11 @@ pub fn doctor_lines(report: &Report) -> Vec<String> {
 
 /// What `serve sweep` prints.
 pub fn detail_lines(report: &Report) -> Vec<String> {
+    if report.recording_off && report.rows == 0 && report.reply_rows == 0 {
+        return vec![
+            "sweep: no data - recording of real calls and replies is switched off, so there is nothing to try the rules against. Switch it on with: install --set-recording on --db <your memory>".to_string(),
+        ];
+    }
     let mut out = vec![format!(
         "sweep: {} real call(s) and {} real reply(ies) in the corpus; tried {} call(s) and {} reply(ies) this run in {} ms{}",
         report.rows,
@@ -1175,6 +1185,7 @@ pub fn report_json(report: &Report) -> Value {
     };
     serde_json::json!({
         "rows": report.rows, "reply_rows": report.reply_rows, "complete": report.covered.complete,
+        "recording_off": report.recording_off,
         "took_ms": report.took_ms as u64, "rules": lines(&report.calls), "answers": lines(&report.answers),
     })
 }

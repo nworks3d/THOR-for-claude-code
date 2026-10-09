@@ -36,6 +36,11 @@
 //! (`load_calls`). A call whose result arrives after the line that holds it
 //! was written is a second, short line (`k:"r"`) that patches the first.
 //!
+//! THE OWNER'S OFF SWITCH. `install --set-recording off` (`plan::recording_on`)
+//! stops every write to both sidecars - the Stop, the reply record and the
+//! back-fill - and the sweep then says it has no data instead of reporting that
+//! no rule would refuse anything. What is already kept ages out in 30 days.
+//!
 //! BEST EFFORT, LIKE EVERY SIDECAR: a line that cannot be written is lost,
 //! never an error for the hook, and a held store directory (`--no-record`)
 //! is left exactly as it was (`store_dir::is_held`).
@@ -276,6 +281,9 @@ pub fn reply_row(
 
 /// Append one reply to the replies sidecar. Silent on any failure.
 pub fn record_reply(db: &Path, row: &ReplyRow) {
+    if !crate::plan::recording_on(db) {
+        return;
+    }
     let Ok(line) = serde_json::to_string(row) else { return };
     append(&replies_path(db), &[line], REPLIES_CAP_BYTES, row.t);
 }
@@ -1004,7 +1012,7 @@ pub fn read_replies(file: &Path, from: u64, max_bytes: u64, deadline: Option<Ins
 /// Back-fill the replies of `files` into the replies sidecar, resuming each
 /// from its cursor. Returns how many replies were recorded.
 pub fn backfill_replies(db: &Path, root: &Path, files: &[PathBuf], budget: Duration, now: i64) -> (usize, bool) {
-    if crate::store_dir::is_held(&replies_path(db)) {
+    if crate::store_dir::is_held(&replies_path(db)) || !crate::plan::recording_on(db) {
         return (0, true);
     }
     let deadline = Instant::now() + budget;
@@ -1079,7 +1087,7 @@ pub fn record_files(
     now: i64,
 ) -> Recorded {
     let mut recorded = Recorded { complete: true, ..Default::default() };
-    if crate::store_dir::is_held(&calls_path(db)) {
+    if crate::store_dir::is_held(&calls_path(db)) || !crate::plan::recording_on(db) {
         return recorded;
     }
     let deadline = Instant::now() + budget;

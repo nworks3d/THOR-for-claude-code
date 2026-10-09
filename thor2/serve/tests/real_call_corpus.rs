@@ -468,3 +468,27 @@ fn a_read_that_runs_out_of_time_loses_no_call_and_the_next_read_starts_where_it_
     ids.dedup();
     assert_eq!(ids.len(), 600, "every call exactly once: {} + {}", first.calls.len(), second.calls.len());
 }
+
+#[test]
+fn switching_recording_off_keeps_nothing_and_the_sweep_says_it_has_no_data() {
+    let fx = Fx::new();
+    fx.write(&[use_line("toolu_a", "Bash", json!({"command": "ls"}), 100)]);
+    assert!(serve::plan::recording_on(&fx.db()), "on until the user switches it off");
+    serve::plan::set_recording(&fx.db(), false).unwrap();
+    assert!(!serve::plan::recording_on(&fx.db()));
+
+    assert_eq!(fx.record().calls, 0, "no call is recorded at a Stop");
+    corpus::record_reply(&fx.db(), &corpus::reply_row(NOW, SESSION, false, false, "/work", "a reply", "a prompt", &[], false, false, ""));
+    let filled = corpus::backfill(&fx.db(), &fx.root(), Duration::from_secs(30), serve::time::now_unix());
+    assert_eq!((filled.calls, filled.replies), (0, 0), "and a back-fill records nothing either");
+    assert!(!corpus::calls_path(&fx.db()).exists() && !corpus::replies_path(&fx.db()).exists(), "no file is even created");
+
+    let store = thor_core::event_store::EventStore::open_read_only(&fx.db()).unwrap();
+    let report = serve::sweep::run(&fx.db(), &store, &serve::sweep::Opts::new(Duration::from_secs(5)));
+    let lines = serve::sweep::detail_lines(&report);
+    assert!(lines[0].contains("no data") && lines[0].contains("--set-recording on"), "{lines:?}");
+    assert!(!lines.iter().any(|l| l.contains("none would refuse")), "an empty sweep must not read as 'all fine': {lines:?}");
+
+    serve::plan::set_recording(&fx.db(), true).unwrap();
+    assert_eq!(fx.record().calls, 1, "switched back on, recording resumes");
+}
