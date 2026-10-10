@@ -669,10 +669,22 @@ fn start_findings(start: &EvaluationStart) -> Vec<Finding> {
     found
 }
 
+/// A refused call that is a file path, not a shell command: the target of an
+/// Edit or Write refusal is the file. The log keeps no tool name, so the shape
+/// decides: one token (no whitespace) holding a path separator. A command has
+/// at least a word and usually arguments, and is never grouped from a path.
+fn is_file_path_target(call: &str) -> bool {
+    let call = call.trim();
+    !call.is_empty() && !call.contains(char::is_whitespace) && call.contains(['/', '\\'])
+}
+
 /// The command word of the call a false-block line says was refused:
 /// `'rule': refused 'git push --force' at log seq 12, then weakened ...`.
 fn refused_command_word(line: &str) -> Option<String> {
     let call = between(line, ": refused '", "' at log seq")?;
+    if is_file_path_target(call) {
+        return None;
+    }
     let first = call.split_whitespace().next()?;
     let word = first.rsplit(['/', '\\']).next().unwrap_or(first);
     let word: String = word.chars().take(40).collect();

@@ -2,6 +2,10 @@
 
 What changed in each release, newest first. The release workflow copies the section for the tag being released to the top of the release notes and refuses to publish without one.
 
+## Unreleased
+
+- **A refused file edit is no longer taken for a command in the bug detector.** Two rules that correctly refused edits of the same file were reported as a "false-block pattern" blaming the command matcher, because the file path was read as a command word. A refused call that is one path token (no whitespace, holding a path separator) now yields no command word and is never grouped; real command-word patterns still count.
+
 ## 2.5.0 (2026-10-02)
 
 - **The first reply of a new install is no longer held for being long, and the first-session list is clearer.** The reply MUST show the twelve-item list (about 2,900 characters) and the user did not ask for an overview, so the length rule would have held the very first reply. A reply that is that list (numbered lines 1 to 10 or more, the `/thor-eval` command and `CHANGELOG.md` kept verbatim, so it works in any language, at most 6,000 characters) is now exempt from the rules about how a reply reads; the honesty rules still read it, and a plain long reply later is still held. Item 1 now says that Pro and any plan below Max count as small (`install --set-plan small`), Max as max, and that a plan the settings do not name is small until the user says otherwise. The assistant rules say how to switch the connections of item 2 back on (run `install --db <store>` again: it wires the four entries, a second run changes nothing, restart Claude Code), and items 4 and 7 say they only happen while those connections are on.

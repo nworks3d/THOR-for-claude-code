@@ -179,6 +179,21 @@ fn several_rules_loosened_after_refusing_the_same_command_word_are_one_pattern()
 }
 
 #[test]
+fn rules_loosened_after_refusing_edits_of_one_file_are_not_a_command_pattern() {
+    let block = |rule: &str, call: &str| model::store::FalseBlock {
+        rule: rule.to_string(),
+        line: format!("'{rule}': refused '{call}' at log seq 5, then weakened (check cleared) at log seq 9"),
+        restore: String::new(),
+    };
+    let edits = [block("r1", "C:\\work\\repo\\DEV-LOOP.md"), block("r2", "/home/u/repo/DEV-LOOP.md"), block("r3", "docs/DEV-LOOP.md")];
+    assert!(false_block_patterns(&edits).is_empty(), "a file path is not a command word");
+    let commands = [block("r1", "foo --x"), block("r2", "foo --y")];
+    let found = false_block_patterns(&commands);
+    assert_eq!(found.len(), 1, "real command-word patterns still count");
+    assert_eq!(found[0].key, "foo");
+}
+
+#[test]
 fn a_sweep_hit_becomes_a_candidate_through_the_hook_function() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("thor.db");
