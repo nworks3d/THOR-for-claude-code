@@ -445,6 +445,31 @@ browser first. There is no macOS build yet, so on a Mac take the route below.
 Using a different assistant? See
 [Using it from another assistant](#using-it-from-another-assistant) below.
 
+### Troubleshooting: "THOR program missing" (an antivirus took a file)
+
+Antivirus programs sometimes remove a small unsigned program such as THOR's
+`sync.exe` by mistake (a "false positive"; Windows Defender did exactly this on
+2026-10-11). THOR then tells you, at the start of a conversation and in
+`doctor`, in a line that begins `PROBLEM: THOR program missing` and names the
+file. Nothing else breaks silently any more: the hourly ship records its
+failures, and `doctor` says whether it never ran, ran and failed, or the
+program is gone. To get it back, step by step:
+
+1. Open **Windows Security** (press the Windows key, type `Windows Security`).
+2. Choose **Virus & threat protection**, then **Protection history**.
+3. Look for an entry that names the THOR file, open it, and choose
+   **Actions > Restore**.
+4. No such entry? Run THOR's install again (the same command as in the easy way
+   above): it puts the programs back.
+
+If it keeps happening, your assistant may **offer** to add a Windows Defender
+exclusion for THOR's program folder. It only does so after you say yes. What
+that does: Defender stops scanning the files in that folder, so a bad file
+placed there would not be caught. Windows shows one administrator prompt.
+Saying no is fine, and THOR never changes a Windows security setting by
+itself. You can remove the exclusion any time under Windows Security > Virus &
+threat protection > Manage settings > Exclusions.
+
 ### For developers: build it yourself
 
 You need a Rust toolchain. Nothing else: no key to get, no model to download

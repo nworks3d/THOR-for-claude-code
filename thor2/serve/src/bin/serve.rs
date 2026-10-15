@@ -2255,7 +2255,12 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                 }
                 thor_core::copy_mode::session_line(&marker)
             });
-            let extras: Vec<String> = [copy_line, reminder, registration, open_points].into_iter().flatten().collect();
+            // A THOR program a hook, the tool server or a sidecar shows in use
+            // that is not on disk (an antivirus quarantine): said every start
+            // until it is back, with the steps. Not for a subagent.
+            let missing_program = (!payload_is_from_a_subagent(&payload)).then(|| serve::missing_programs::session_line(db_path)).flatten();
+            let extras: Vec<String> =
+                [copy_line, reminder, registration, open_points, missing_program].into_iter().flatten().collect();
             let extras_len: usize = extras.iter().map(|e| e.len() + 2).sum();
             // What this project's own sessions used lately ranks first (step 31).
             let recent = match folder_project.as_deref() {

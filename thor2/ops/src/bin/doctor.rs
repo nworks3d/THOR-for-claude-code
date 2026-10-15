@@ -111,6 +111,13 @@ fn main() -> ExitCode {
         for line in ops::health::plain_summary(&cli.db, &cwd, settings.as_deref(), mcp_json.as_deref()) {
             println!("{line}");
         }
+        // A THOR program that a hook, the tool server or a scheduled task calls
+        // and that is gone (an antivirus quarantine): said here, right under the
+        // short version, because every other line depends on those programs.
+        let bin_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(std::path::Path::to_path_buf));
+        for line in ops::health::program_lines(&cli.db, settings.as_deref(), mcp_json.as_deref(), bin_dir.as_deref()) {
+            println!("{line}");
+        }
     }
     println!("{}", ops::health::checkouts_root_line(&checkouts_root));
     // THOR failing to run at all comes before the per-component lines, because

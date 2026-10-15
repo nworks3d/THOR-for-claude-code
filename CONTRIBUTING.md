@@ -115,3 +115,27 @@ cargo test --release --features semantic -p ops --test release_smoke -- --ignore
 It prints one `PASS` or `FAIL` line per step and fails if any step fails. To try
 a packaged archive instead, unpack it into a folder and set `THOR_SMOKE_BIN_DIR`
 to that folder (and `THOR_SMOKE_SEMANTIC=no` for the plain server asset).
+
+### After each release: report the Windows binaries as a false positive
+
+THOR's Windows programs are small and unsigned, which antivirus engines tend to
+flag: on 2026-10-11 Windows Defender quarantined `sync.exe` on a maintainer's
+machine (detected as `Trojan:Win32/Cloxer`) and the hourly ship failed for two
+days. So, once a release is published, a maintainer submits that release's
+Windows programs (every `.exe` in `thor2-windows-x86_64.zip`) to Microsoft as
+not malware:
+
+1. Download the published zip from the release page and unpack it into an empty
+   folder.
+2. Open the Microsoft Security Intelligence submission page
+   (https://www.microsoft.com/en-us/wdsi/filesubmission), sign in, and choose
+   "Software developer".
+3. For each `.exe`, upload it, say it is a false positive, and give the release
+   tag and the repository address as the proof of origin.
+4. Write the submission ids down in the release notes of the next release, so a
+   later report can be checked against them.
+
+Why: a submission lets Microsoft add the file to its known-good list, so a
+user's Defender stops flagging that exact build. It does not carry over to the
+next release (a new build is a new file), which is why it is a step of every
+release, not a one-off.

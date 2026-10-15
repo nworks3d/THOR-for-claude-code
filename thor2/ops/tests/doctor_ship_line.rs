@@ -11,7 +11,14 @@ use std::process::Command;
 use thor_core::event_store::{EventKind, EventStore};
 
 fn run_doctor(db: &Path) -> String {
-    let out = Command::new(env!("CARGO_BIN_EXE_doctor")).arg("--db").arg(db).output().unwrap();
+    // No scheduled-task query: this machine's own tasks must not change a
+    // fixture's report (a file that does not exist reads as no tasks).
+    let out = Command::new(env!("CARGO_BIN_EXE_doctor"))
+        .arg("--db")
+        .arg(db)
+        .env("THOR_SCHTASKS_XML", db.with_file_name("no-tasks.xml"))
+        .output()
+        .unwrap();
     assert!(
         out.status.success(),
         "doctor without --gate always exits 0: status {:?}, stderr {}",
