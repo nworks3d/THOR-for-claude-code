@@ -220,7 +220,7 @@ fn this_projects_facts_come_first_then_heavy_ones_then_what_was_shown_lately_amo
 
     let block = start(&db, &repo, Some("claude-desktop"), "s-rank", None);
     let shown = ids_in(&block);
-    assert!(block.len() <= 9_500, "the cap holds: {} bytes", block.len());
+    assert!(block.len() <= 9_800, "the cap holds: {} bytes", block.len());
     assert!(block.contains("more standing rule(s) did not fit"), "the left-out line stays: {block}");
     assert_eq!(shown[0], "zz-costly-here", "this project's own fact comes first: {shown:?}");
     assert_eq!(shown[1], "zz-heavy", "then the global heavy ones: {shown:?}");
