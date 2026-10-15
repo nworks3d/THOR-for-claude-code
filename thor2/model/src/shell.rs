@@ -1057,7 +1057,7 @@ fn collect(command: &str, d: Dialect, depth: usize, start: Place, remote: bool, 
                 }
                 (unit, command_len, raw.words.join(" "))
             };
-            let (head, program) = head_and_program(&raw.words, d);
+            let (head, program) = head_and_program(&raw.words, d, &own);
             let git_dir = if program == "git" || program == "git.exe" { git_dir_override(&raw.words) } else { None };
             let own_dir = match &git_dir {
                 Some(g) => Some(join_dir(place.dir.as_deref(), g)),
@@ -1244,6 +1244,38 @@ fn is_ps_assignment(w: &str) -> bool {
     matches!(cs.next(), Some(c) if c.is_ascii_alphabetic() || c == '_') && cs.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
 }
 
+/// The words of a PowerShell statement `$name = command args` (also
+/// `$name=command args`, `$env:NAME += command args`) with the assignment
+/// taken off the front: the command on its right runs, so it is the program
+/// (`$p = Start-Process cmd.exe` starts a process). `None` when the statement
+/// is no assignment, or when the right side is a string, a variable, a number,
+/// a group, a type or a block - `$src = 'C:\bin\install.exe'` runs nothing.
+fn ps_assigned_command(words: &[String], text: &str) -> Option<Vec<String>> {
+    let first = words.first()?;
+    let name = first.strip_prefix('$')?;
+    let value_is_bare_word = || {
+        let after = text.get(text.find('=')? + 1..)?.trim_start();
+        let c = after.chars().next()?;
+        Some(c.is_alphabetic() || matches!(c, '.' | '\\' | '/'))
+    };
+    if words.len() >= 3 && matches!(words[1].as_str(), "=" | "+=" | "-=" | "*=" | "/=" | "%=") {
+        let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | ':');
+        if !name.is_empty() && name.chars().all(plain) && value_is_bare_word()? {
+            return Some(words[2..].to_vec());
+        }
+        return None;
+    }
+    if is_ps_assignment(first) && value_is_bare_word() == Some(true) {
+        let value = &first[first.find('=')? + 1..];
+        if !value.is_empty() {
+            let mut rest = vec![value.to_string()];
+            rest.extend(words[1..].iter().cloned());
+            return Some(rest);
+        }
+    }
+    None
+}
+
 /// A word's last path part, lowercased, without a `.exe` suffix.
 fn base_lower(w: &str) -> String {
     let base = w.rsplit(['/', '\\']).next().unwrap_or(w).to_lowercase();
@@ -1251,8 +1283,18 @@ fn base_lower(w: &str) -> String {
 }
 
 /// The words with shell syntax taken off the front - see `Segment::head` -
-/// and the program they run (see `Segment::program`).
-fn head_and_program(words: &[String], d: Dialect) -> (Vec<String>, String) {
+/// and the program they run (see `Segment::program`). `text` is the
+/// segment's own text as typed (quotes kept): the words alone cannot tell
+/// `$p = 'cmd'` (a string) from `$p = cmd` (a command).
+fn head_and_program(words: &[String], d: Dialect, text: &str) -> (Vec<String>, String) {
+    let assigned;
+    let words = match (d == Dialect::PowerShell).then(|| ps_assigned_command(words, text)).flatten() {
+        Some(rest) => {
+            assigned = rest;
+            &assigned[..]
+        }
+        None => words,
+    };
     let mut i = 0;
     while i < words.len() {
         let w = words[i].as_str();
@@ -1704,6 +1746,29 @@ impl<'a> Scanner<'a> {
         }
         self.cs.len()
     }
+    /// PowerShell: whether a `(` with no word open is an argument of the
+    /// command being read (it already has words, and the first is no
+    /// keyword that takes a condition or parameter group) rather than a group
+    /// of its own (`(a; b)`, `if (...)`, `foreach (...)`).
+    fn is_argument_paren(&self) -> bool {
+        const GROUP_KEYWORDS: &[&str] =
+            &["if", "elseif", "while", "until", "for", "foreach", "switch", "catch", "trap", "function", "filter", "param", "using", "do"];
+        match self.cur.words.first() {
+            Some(first) => !GROUP_KEYWORDS.iter().any(|k| first.eq_ignore_ascii_case(k)),
+            None => false,
+        }
+    }
+
+    /// The index of the `}` closing the `{` at `open` when only digits and
+    /// commas stand between them (`{2014}`, `{1,3}`); `None` for anything else.
+    fn counted_brace_end(&self, open: usize) -> Option<usize> {
+        let mut k = open + 1;
+        while matches!(self.ch(k), Some('0'..='9' | ',')) {
+            k += 1;
+        }
+        (k > open + 1 && self.ch(k) == Some('}')).then_some(k)
+    }
+
     fn ch(&self, k: usize) -> Option<char> {
         self.cs.get(k).map(|x| x.1)
     }
@@ -2254,6 +2319,10 @@ impl<'a> Scanner<'a> {
                 }
                 '(' if sh && !self.word_open && self.ch(i + 1) == Some('(') && self.arithmetic_command() => {}
                 '(' if ps && self.word_open => self.paren_in_word(),
+                // An argument expression (`-ArgumentList (@('a') + $b) -Wait`):
+                // part of the command that already has words, so the flags
+                // after it stay in that command.
+                '(' if ps && self.is_argument_paren() => self.paren_in_word(),
                 '(' if !self.word_open => {
                     self.paren_depth += 1;
                     self.cut(i, i + 1, Sep::Open);
@@ -2266,6 +2335,17 @@ impl<'a> Scanner<'a> {
                     self.paren_depth = self.paren_depth.saturating_sub(1);
                     self.cut(i, i + 1, Sep::Close);
                     self.i += 1;
+                }
+                // A count glued to a word (`\x{2014}`, `a{2}`, `x{1,3}`) is
+                // part of that word, not a block.
+                '{' if ps && self.word_open && self.counted_brace_end(i).is_some() => {
+                    let end = self.counted_brace_end(i).unwrap_or(i);
+                    for k in i..=end {
+                        if let Some(x) = self.ch(k) {
+                            self.push(x);
+                        }
+                    }
+                    self.i = end + 1;
                 }
                 '{' | '}' if ps => {
                     self.cur.closed_by = Some(c);
@@ -2679,6 +2759,13 @@ fn starts_with_escaped_space(after: &str) -> bool {
     matches!((fwd.next(), fwd.next()), (Some('`'), Some('n' | 't' | 'r')))
 }
 
+/// A Windows-style switch: a slash and one or two letters or digits (`/it`,
+/// `/f`, `/ru`). Longer ones (`/tmp`, `/etc/passwd`) name folders as readily
+/// as flags and keep the plain boundary rule.
+fn is_slash_flag(literal: &str) -> bool {
+    literal.strip_prefix('/').is_some_and(|rest| (1..=2).contains(&rest.len()) && rest.chars().all(|c| c.is_ascii_alphanumeric()))
+}
+
 /// The byte offset of the first occurrence of `literal` in `text` that sits on
 /// token boundaries (see this module's doc comment, "TOKEN BOUNDARIES"). An
 /// escaped whitespace (`\n`, `` `n ``) next to the literal counts as the
@@ -2694,7 +2781,13 @@ pub fn find_at_boundary(text: &str, literal: &str) -> Option<usize> {
         let before = text[..at].chars().next_back();
         let rest = &text[at + literal.len()..];
         let mut after = rest.chars();
-        let left_ok = !is_word_char(first) || before.is_none_or(is_boundary_char) || ends_in_escaped_space(&text[..at]);
+        let left_ok = if is_slash_flag(literal) {
+            // A short flag (`/it`, `/f`) is a flag only where a word starts:
+            // right after `C:`, `/` or a letter it is a folder of a path.
+            before.is_none_or(|b| !(is_word_char(b) || matches!(b, ':' | '/' | '\\' | '.')))
+        } else {
+            !is_word_char(first) || before.is_none_or(is_boundary_char) || ends_in_escaped_space(&text[..at])
+        };
         let right_ok = !is_word_char(last)
             || starts_with_escaped_space(rest)
             || match after.next() {
@@ -2708,6 +2801,64 @@ pub fn find_at_boundary(text: &str, literal: &str) -> Option<usize> {
         from = at + first.len_utf8();
     }
     None
+}
+
+/// The reserved `requires` answer that a real absolute path in the call
+/// satisfies - a Windows drive path (`C:\x`, `C:/x`), a UNC path (`\\host\x`)
+/// or a Unix path of two or more parts (`/tmp/x`) - so a rule can ask "name the
+/// folder by its full path" without naming any one folder. See
+/// `names_absolute_path`; AGENTS.md documents it for the owner.
+pub const ABSOLUTE_PATH_ANSWER: &str = "<absolute-path>";
+
+/// A required answer in the form a trial writes into its clean call: the
+/// answer itself, or for `ABSOLUTE_PATH_ANSWER` a path that satisfies it.
+pub fn sample_answer(answer: &str) -> &str {
+    if answer == ABSOLUTE_PATH_ANSWER { "C:/thor-trial/work" } else { answer }
+}
+
+/// Whether `text` holds a real absolute path (see `ABSOLUTE_PATH_ANSWER`). A
+/// path starts a word: after the start, whitespace, a quote or an opening or
+/// separating mark - so the `//host/x` of a URL, `and/or/x` and `3/4/5` are not
+/// paths. A lone `/tmp` or `cmd /c` is a word, not a path.
+pub fn names_absolute_path(text: &str) -> bool {
+    let chars: Vec<char> = text.chars().collect();
+    let starts_word = |k: usize| {
+        k.checked_sub(1).and_then(|p| chars.get(p)).is_none_or(|p| p.is_whitespace() || matches!(p, '"' | '\'' | '`' | '(' | '[' | '{' | '=' | ',' | ';'))
+    };
+    let at = |k: usize| chars.get(k).copied();
+    (0..chars.len()).any(|k| {
+        let c = chars[k];
+        if c.is_ascii_alphabetic() && at(k + 1) == Some(':') && matches!(at(k + 2), Some('\\' | '/')) {
+            return starts_word(k) && at(k + 3).is_some_and(|n| !n.is_whitespace() && !matches!(n, '"' | '\''));
+        }
+        if c == '\\' && at(k + 1) == Some('\\') {
+            return starts_word(k) && at(k + 2).is_some_and(char::is_alphanumeric);
+        }
+        if c == '/' && starts_word(k) && at(k + 1).is_some_and(|n| n.is_alphanumeric() || matches!(n, '.' | '_' | '~')) {
+            let token: String = chars[k + 1..].iter().take_while(|x| !x.is_whitespace() && !matches!(x, '"' | '\'' | '`' | ')' | ']' | '}' | ',' | ';')).collect();
+            return token.split_once('/').is_some_and(|(_, rest)| rest.chars().next().is_some_and(char::is_alphanumeric));
+        }
+        false
+    })
+}
+
+/// `text` with every hyphen that stands between two letters taken out
+/// (`sub-agents` is `subagents`), the form a plain required word is also
+/// looked for in. A hyphen next to a space, a digit or the start (a flag, a
+/// range) stays.
+pub fn without_word_hyphens(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    chars
+        .iter()
+        .enumerate()
+        .filter(|&(k, &c)| {
+            !(c == '-'
+                && k > 0
+                && chars[k - 1].is_alphabetic()
+                && chars.get(k + 1).is_some_and(|n| n.is_alphabetic()))
+        })
+        .map(|(_, &c)| c)
+        .collect()
 }
 
 /// Whether `literal` occurs in `text` on token boundaries.

@@ -1234,3 +1234,174 @@ fn a_real_install_exe_call_is_still_seen_as_the_program() {
     let segs = segments("$src=x install.exe", Dialect::Sh);
     assert_eq!(segs[0].program, "$src=x");
 }
+
+// ------------------------------------------ matcher fixes (guard builder W1)
+
+/// Whether an Agent-tool rule that requires one of `req` refuses a brief.
+fn agent_brief_refused(req: &[&str], brief: &str) -> bool {
+    let items = rule(&["Agent"], Check::Requires { when: "Agent".to_string(), required: s(req) });
+    absent_guard::find_requires_violation(&items, "Agent", None, brief).is_some()
+}
+
+/// Recurring in real sessions: a rule that wants the word "subagent" refused a
+/// brief that says "sub-agents". A hyphen between two letters does not change
+/// the word a requirement asks for.
+#[test]
+fn a_hyphenated_spelling_answers_a_plain_required_word() {
+    let req = ["subagent", "subagenten"];
+    assert!(!agent_brief_refused(&req, "Do not spawn sub-agents."));
+    assert!(!agent_brief_refused(&req, "You are a sub-agent: no further delegation."));
+    assert!(!agent_brief_refused(&req, "Do not spawn subagents."));
+    assert!(agent_brief_refused(&req, "Fix the bug in parser.rs."));
+    assert!(agent_brief_refused(&req, "Fix the sub - problem, and the sub-task."));
+    // A required answer that carries its own hyphen is still taken literally.
+    assert!(agent_brief_refused(&["read-only"], "This is readonly work."));
+    assert!(!agent_brief_refused(&["read-only"], "This is read-only work."));
+    // Only a hyphen between two letters is dropped.
+    assert!(agent_brief_refused(&["3d"], "a 3-d model"));
+}
+
+/// The console-flash starter rule missed `$p = Start-Process cmd.exe ...`: the
+/// first word of the statement is the variable, not the command.
+#[test]
+fn a_powershell_assignment_of_a_command_still_runs_that_command() {
+    let req = ["-WindowStyle", "-NoNewWindow"];
+    for cmd in [
+        "$p = Start-Process cmd.exe -ArgumentList '/c dir'",
+        "$p=Start-Process cmd.exe -ArgumentList x",
+        "$p = Start-Process cmd.exe -PassThru; $p.Id",
+        "Get-Date; $p = Start-Process cmd.exe",
+        "$env:X = Start-Process cmd.exe",
+        "$p += Start-Process cmd.exe",
+    ] {
+        assert!(ps_requires_refuses(&req, cmd), "must be refused: {cmd}");
+        let with = cmd.replacen("cmd.exe", "cmd.exe -WindowStyle Hidden", 1);
+        assert!(!ps_requires_refuses(&req, &with), "must pass with the flag: {with}");
+    }
+    // A value that is a string, a variable, a number or a group runs nothing.
+    for cmd in [
+        "$p = 'Start-Process cmd.exe'",
+        "$p = \"Start-Process cmd.exe\"",
+        "$p = $q",
+        "$p = 5",
+        "$p = (1 + 2)",
+        "$p='Start-Process'",
+    ] {
+        assert!(!ps_requires_refuses(&req, cmd), "must pass: {cmd}");
+    }
+    let segs = segments("$p = Start-Process cmd.exe -PassThru", Dialect::PowerShell);
+    assert_eq!(segs[0].program, "start-process");
+    assert_eq!(segs[0].head[0], "Start-Process");
+    // sh does not know the spelling.
+    let segs = segments("$p = Start-Process cmd.exe", Dialect::Sh);
+    assert_eq!(segs[0].program, "$p");
+}
+
+/// The flags after a parenthesised argument belong to the same command: three
+/// real `$p = Start-Process ... (@(...) + $files) ... -WindowStyle Hidden`
+/// calls would otherwise be refused for want of the flag they carry.
+#[test]
+fn a_parenthesised_argument_keeps_the_flags_after_it_in_its_command() {
+    let req = ["-WindowStyle", "-NoNewWindow"];
+    let hidden = "$p = Start-Process -FilePath node -ArgumentList (@('--test') + $files) -WorkingDirectory C:\\x -WindowStyle Hidden -PassThru";
+    assert!(!ps_requires_refuses(&req, hidden));
+    assert!(!ps_requires_refuses(&req, "Start-Process ssh -RedirectStandardError ($log + '.err') -WindowStyle Hidden"));
+    let shown = hidden.replace("-WindowStyle Hidden", "-Wait");
+    assert!(ps_requires_refuses(&req, &shown));
+    // What the group runs is still its own segment.
+    assert!(fb_ps(&["docker exec"], PROD, "Write-Host (docker exec acme-prod node -e 1) -Wait").1);
+    // A group that starts a statement, and a keyword's condition, stay groups.
+    assert_eq!(ps_words("if ($x) { Start-Process a }"), ["if", "$x", "Start-Process a"]);
+    assert_eq!(ps_words("foreach ($f in $l) { Start-Process a }").len(), 3);
+    assert_eq!(ps_words("Get-Date; (Get-Item x; Get-Item y) -Wait"), ["Get-Date", "Get-Item x", "Get-Item y", "-Wait"]);
+}
+
+/// `schtasks /create ... /it` is refused; `/it` inside a path is a folder.
+#[test]
+fn a_short_slash_flag_does_not_match_inside_a_path() {
+    let anchors = ["schtasks /create"];
+    let lits = ["/it"];
+    let refused = |cmd: &str| fb(&anchors, &lits, cmd).1;
+    assert!(refused("schtasks /create /tn x /tr y /sc daily /it"));
+    assert!(refused("schtasks /create /it /tn x /tr y"));
+    assert!(refused("schtasks /create /tn x /tr y \"/it\""));
+    assert!(!refused("schtasks /create /tn x /tr C:/it/run.vbs /sc daily"));
+    assert!(!refused("schtasks /create /tn x /tr \"D:\\data/it/run.vbs\""));
+    assert!(!refused("schtasks /create /tn x /tr /home/it/run.sh"));
+    assert!(!refused("schtasks /create /tn x /tr /opt/it"));
+    // Other literals keep their way of matching: a path literal is a path.
+    assert!(fb(&["cat"], &["/etc/passwd"], "cat /mnt/etc/passwd").1);
+    assert!(fb(&["tool"], &["--force"], "tool x --force").1);
+}
+
+/// PowerShell reads `\x{2014}` or `a{2}` glued to a word as part of that word,
+/// not as a brace block: the grep that follows `Get-Date;` kept only `\x`, so a
+/// trigger or an answer written with the braces never matched.
+#[test]
+fn a_counted_brace_glued_to_a_powershell_word_stays_in_the_word() {
+    let cmd = "Get-Date; grep -nP \\x{2014} notes.md";
+    let segs = segments(cmd, Dialect::PowerShell);
+    assert_eq!(segs.len(), 2, "{segs:?}");
+    assert_eq!(segs[1].head, s(&["grep", "-nP", "\\x{2014}", "notes.md"]));
+    let items = rule(&["grep"], Check::Requires { when: "x{2014}".to_string(), required: s(&["LC_ALL"]) });
+    let refused = |c: &str| absent_guard::find_requires_violation(&items, "PowerShell", Some(c), c).is_some();
+    assert!(refused(cmd));
+    assert!(!refused("Get-Date; grep -nP \\x{2014} notes.md # LC_ALL"));
+    assert!(!refused("Get-Date; grep -nP other notes.md"));
+    // Blocks keep their meaning: a script block or a group is still split.
+    assert_eq!(ps_words("1..3 | ForEach-Object{ Start-Process x }").len(), 3);
+    assert_eq!(ps_words("if ($x){ Start-Process x }").len(), 3);
+    assert_eq!(ps_words("Get-Date; Start-Process x").len(), 2);
+}
+
+/// A rule can ask for "a real absolute path" without naming any one folder.
+#[test]
+fn the_absolute_path_answer_is_satisfied_by_a_real_absolute_path_only() {
+    let req = [model::shell::ABSOLUTE_PATH_ANSWER];
+    for ok in [
+        "Work only in C:\\Users\\someone\\scratch\\job1.",
+        "Work in c:/work/job1 please",
+        "write to 'D:\\tmp\\x'",
+        "JSON escaped C:\\\\Users\\\\someone\\\\scratch",
+        "share is \\\\fileserver\\team\\scratch",
+        "use /tmp/work/job1 for output",
+        "folder: /c/Users/someone/scratch",
+        "(see /home/me/a.txt)",
+    ] {
+        assert!(!agent_brief_refused(&req, ok), "must pass: {ok}");
+    }
+    for bad in [
+        "Work in a scratch folder.",
+        "See https://example.com/a/b for details.",
+        "Use and/or/maybe either way",
+        "run cmd /c dir",
+        "the ratio is 3/4/5",
+        "a relative path src/main.rs is not absolute",
+        "C: is a drive letter, a:b is not a path",
+        "just /tmp",
+    ] {
+        assert!(agent_brief_refused(&req, bad), "must be refused: {bad}");
+    }
+    // Besides other answers: any one of them is enough.
+    assert!(!agent_brief_refused(&["scratchpad", model::shell::ABSOLUTE_PATH_ANSWER], "use scratchpad"));
+    assert!(!agent_brief_refused(&["scratchpad", model::shell::ABSOLUTE_PATH_ANSWER], "use /tmp/a/b"));
+    // A Bash command counts the same way, in its own segment only.
+    let items = rule(&["tar"], Check::Requires { when: "tar".to_string(), required: s(&[model::shell::ABSOLUTE_PATH_ANSWER]) });
+    let bash = |c: &str| absent_guard::find_requires_violation(&items, "Bash", Some(c), c).is_some();
+    assert!(!bash("tar -xf a.tar -C /tmp/out"));
+    assert!(bash("tar -xf a.tar -C out"));
+    assert!(bash("ls /tmp/out/x; tar -xf a.tar"));
+}
+
+/// The text of a rule need not spell the token: it is a documented form, and
+/// every other answer must still be named.
+#[test]
+fn the_absolute_path_answer_needs_no_naming_in_the_rules_text() {
+    let mut items = rule(
+        &["Agent"],
+        Check::Requires { when: "Agent".to_string(), required: s(&[model::shell::ABSOLUTE_PATH_ANSWER, "scratchpad"]) },
+    );
+    items[0].item.text = "Every brief names a work folder by its absolute path.".to_string();
+    let unnamed = model::gate::unnamed_literals(&items[0].item);
+    assert_eq!(unnamed, vec!["scratchpad".to_string()]);
+}

@@ -420,7 +420,7 @@ fn forms(item: &Item, root: &Path) -> Result<Forms, String> {
             let Some(anchor) = command_anchor(&item.bindings) else {
                 return none("a requires check reaches a call only through a command anchor, and this rule has none");
             };
-            let Some(answer) = required.first() else { return none("the required set is empty") };
+            let Some(answer) = required.first().map(|a| shell::sample_answer(a)) else { return none("the required set is empty") };
             let inner = !gate::requires_trigger_names_a_binding(when, &item.bindings);
             if is_tool_name(anchor) {
                 let trigger = if inner { shell::star_stem(when.trim()).map_or(when.trim().to_string(), |s| format!("{s}-probe")) } else { "trial".to_string() };

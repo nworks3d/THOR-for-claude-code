@@ -1028,10 +1028,21 @@ pub fn find_requires_violation_owned(
                 return false;
             }
             let env = std::cell::OnceCell::new();
+            // The call with the hyphens between letters taken out ("sub-agents"
+            // says "subagents"); read only for a plain answer with no hyphen.
+            let unhyphenated = std::cell::OnceCell::new();
             !required.iter().any(|r| {
                 let named = segment.unit.contains(r.as_str())
                     || segment.unit_words.contains(r.as_str())
                     || comments.contains(r.as_str())
+                    || (r == crate::shell::ABSOLUTE_PATH_ANSWER
+                        && (crate::shell::names_absolute_path(&segment.unit) || crate::shell::names_absolute_path(&segment.unit_words)))
+                    || (!r.contains('-')
+                        && unhyphenated
+                            .get_or_init(|| {
+                                crate::shell::without_word_hyphens(&format!("{}\n{}\n{comments}", segment.unit, segment.unit_words))
+                            })
+                            .contains(r.as_str()))
                     || r.strip_suffix('=').is_some_and(|name| {
                         env.get_or_init(|| crate::shell::env_before(segments, *at)).contains_key(name)
                     });

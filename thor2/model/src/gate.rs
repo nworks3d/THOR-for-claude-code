@@ -3223,7 +3223,9 @@ pub fn unnamed_literals(item: &Item) -> Vec<String> {
             // which says it needs the owner's explicit go instead. Naming it
             // only published the marker to every agent the rule was served to.
             if !crate::store::is_owner_approval(item) {
-                out.extend(required.iter().filter(|r| !named(r)).cloned());
+                // The reserved absolute-path answer is a documented form, not
+                // a word the text could spell.
+                out.extend(required.iter().filter(|r| r.as_str() != crate::shell::ABSOLUTE_PATH_ANSWER && !named(r)).cloned());
             }
             out
         }

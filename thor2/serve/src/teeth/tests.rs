@@ -2110,3 +2110,29 @@ fn compare_tries_a_decided_rule_again_and_writes_nothing() {
     assert_eq!(compared.old_rev.as_deref(), Some("old-matcher"));
     assert_eq!(fx.store.get_all_events().unwrap().len(), before, "compare writes nothing");
 }
+
+/// A requires check that answers with the absolute-path token is tried with a
+/// real absolute path as the answer, and is stored as a rule.
+#[test]
+fn a_requires_trial_accepts_the_absolute_path_answer() {
+    let fx = Fx::new();
+    let token = model::shell::ABSOLUTE_PATH_ANSWER.to_string();
+    let item = rule(
+        "agent-names-a-folder",
+        "An Agent brief must name the absolute path of the folder the helper works in.",
+        vec![cmd("Agent")],
+        Some(Check::Requires { when: "Agent".to_string(), required: vec![token.clone()] }),
+        None,
+    );
+    let t = fx.write(&item);
+    assert!(matches!(t.outcome, Outcome::Rule { .. }), "{:?}\n{}", t.outcome, receipt(&t));
+    let shell_item = rule(
+        "tar-names-a-folder",
+        "tar must be told an absolute path to extract into.",
+        vec![cmd("tar")],
+        Some(Check::Requires { when: "tar".to_string(), required: vec![token] }),
+        None,
+    );
+    let t = fx.write(&shell_item);
+    assert!(matches!(t.outcome, Outcome::Rule { .. }), "{:?}\n{}", t.outcome, receipt(&t));
+}
