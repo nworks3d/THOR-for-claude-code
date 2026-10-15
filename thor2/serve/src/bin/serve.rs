@@ -1345,6 +1345,7 @@ const BUG_NUDGE_ROOM_BYTES: usize = 3_500;
 /// `UserPromptSubmit` opens with it as context. Never for a subagent, never on
 /// a hook run that records nothing.
 fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_record: bool) -> Option<HookOutput> {
+    let no_record = no_record || serve::store_dir::is_copy(db_path);
     let raw = match payload_text {
         Some(text) => text,
         None => {
@@ -1451,7 +1452,12 @@ fn anchors_of(shown: &[RankedItem]) -> Vec<(String, Vec<String>)> {
 }
 
 fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_record: bool) -> Option<HookOutput> {
-    let _hold = no_record.then(|| serve::store_dir::hold(db_path));
+    // A COPY store (marker beside it) never records: it behaves as `--no-record`,
+    // except that the once-per-context counts and the telemetry sidecar still work.
+    let copy = serve::store_dir::is_copy(db_path);
+    let no_record = no_record || copy;
+    let remember_shown = !no_record || copy;
+    let _hold = serve::store_dir::hold_for(db_path, no_record);
     // `payload_text` is `Some` only when the caller already read stdin (see
     // `cmd_hook`'s `--diagnose` path, which has to read it to say anything
     // about it). stdin can only be consumed once, so it is read HERE for a
@@ -1834,7 +1840,10 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                 with_eval_ask(db_path, &session_id, stop_root.as_deref(), stop_project.as_deref(), drift_note, no_record, reason);
             Some(HookOutput::Decision(serde_json::json!({ "decision": "block", "reason": text })))
         };
-        if !is_subagent {
+        // COPY MODE: every debt below is settled by a write to the log (a `remember`,
+        // `revise`, `retract` or `mark`), which this machine can only queue. Holding the
+        // turn for one would repeat until the next pull, so a copy asks for none.
+        if !is_subagent && !copy {
             if let Some(reason) = serve::store_dir::open_existing(db_path).ok().and_then(|s| setup_debt(&s)) {
                 return hold(reason);
             }
@@ -1871,7 +1880,7 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
         // subagent's turn for it spends a whole agent run on nothing he
         // asked for. Agents among themselves are not held by this; it
         // applies only to what is addressed to him.
-        if !is_subagent {
+        if !is_subagent && !copy {
             if let Some(reason) = serve::store_dir::open_existing(db_path)
                 .ok()
                 .and_then(|s| crowding_debt(&s, db_path, &session_id, stop_project.as_deref()))
@@ -2037,7 +2046,7 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
         // WARN still loses to a maintenance BLOCK whenever this DOES run -
         // only once NEITHER has anything to say does the WARN, if any,
         // finally reach the owner, on the very last line below.
-        if !is_subagent {
+        if !is_subagent && !copy {
             if let Some(output) = stale_guard_stop_check(db_path, &session_id, actor) {
                 return Some(output);
             }
@@ -2168,7 +2177,7 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             record_session_watermark(db_path, &session_id);
             // A new start (also a resume or a compaction, which lose what the
             // agent was shown): what it has been shown so far no longer counts.
-            if !no_record {
+            if remember_shown {
                 serve::repeat::reset(db_path, &serve::repeat::key_for(&session_id, None));
             }
             // THE OWNER'S GO, once (step 26): a rule whose requires check is
@@ -2237,7 +2246,16 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                     })
                 })
                 .flatten();
-            let extras: Vec<String> = [reminder, registration, open_points].into_iter().flatten().collect();
+            // COPY MODE: one plain line saying so, and a background refresh of the copy
+            // when one is due (the session keeps using the copy it has now).
+            let copy_line = (copy && !payload_is_from_a_subagent(&payload)).then(|| {
+                let marker = thor_core::copy_mode::read_marker(db_path);
+                if thor_core::copy_mode::pull_due(&marker, time::now_unix()) {
+                    thor_core::copy_mode::spawn_pull(db_path);
+                }
+                thor_core::copy_mode::session_line(&marker)
+            });
+            let extras: Vec<String> = [copy_line, reminder, registration, open_points].into_iter().flatten().collect();
             let extras_len: usize = extras.iter().map(|e| e.len() + 2).sum();
             // What this project's own sessions used lately ranks first (step 31).
             let recent = match folder_project.as_deref() {
@@ -2281,6 +2299,8 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                 }
                 let shown: Vec<&str> = shown_ids.iter().map(String::as_str).collect();
                 serve::volume::record_start(db_path, &session_id, &shown, hidden, block.len(), &left_out);
+            } else if copy {
+                deliver::copy_telemetry_served(db_path, &session_id, actor, &shown_ids, Some("session start"));
             }
             // No `verdicts` here - see `HookOutput::Context`'s own doc
             // comment: the classifier answers "is this a prohibition for the
@@ -2365,7 +2385,7 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                 serve::decay::retain_live(serve::rank::select(&candidates, &input), &decay),
                 session_kind(&payload).headless,
             );
-            let arranged = serve::repeat::arrange(db_path, &reader, &all, !no_record);
+            let arranged = serve::repeat::arrange(db_path, &reader, &all, remember_shown);
             if !no_record {
                 serve::volume::record_showing(db_path, &session_id, &arranged.displayed_ids(), arranged.suppressed);
             }
@@ -2392,6 +2412,11 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                         std::slice::from_ref(&ranked.id),
                         Some(&place),
                     );
+                }
+            } else if copy {
+                for ranked in &selection.shown {
+                    let place = prompt_place(&ranked.item.bindings, &input);
+                    deliver::copy_telemetry_served(db_path, &session_id, actor, std::slice::from_ref(&ranked.id), Some(&place));
                 }
             }
             // No `verdicts` here either, for the identical reason session
@@ -2581,7 +2606,7 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                 // session or subagent is not shown again. Display only -
                 // every refusal above ran before this and does not know of it.
                 let reader = serve::repeat::key_for(&session_id, payload.get("agent_id").and_then(|v| v.as_str()));
-                let arranged = serve::repeat::arrange(db_path, &reader, &served.all, !no_record);
+                let arranged = serve::repeat::arrange(db_path, &reader, &served.all, remember_shown);
                 if !no_record {
                     serve::volume::record_showing(db_path, &session_id, &arranged.displayed_ids(), arranged.suppressed);
                 }
@@ -2640,6 +2665,9 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                         &anchors_of(&arranged.selection.shown),
                         trigger,
                     );
+                } else if copy {
+                    let ids: Vec<String> = arranged.selection.shown.iter().map(|r| r.id.clone()).collect();
+                    deliver::copy_telemetry_served(db_path, &session_id, actor, &ids, trigger);
                 }
                 Some(HookOutput::Context { event_name, block, verdicts })
             };
@@ -4023,6 +4051,10 @@ fn record_gate(
     tool_use_id: Option<&str>,
 ) {
     let rule_id = subject.to_string();
+    if serve::store_dir::is_copy(db_path) {
+        deliver::copy_telemetry_gate(db_path, session_id, actor, refused, &rule_id, target, tool_use_id);
+        return;
+    }
     let Ok(mut store) = serve::store_dir::open_existing(db_path) else { return };
     deliver::record_gate_outcome_for_call(
         &mut store,
@@ -6024,6 +6056,198 @@ mod hook_actor_and_no_record_tests {
     }
 }
 
+
+/// COPY MODE (`thor_core::copy_mode`): a store with a marker beside it is
+/// only ever read by the hooks.
+#[cfg(test)]
+mod copy_mode_tests {
+    use super::*;
+    use model::item::{Binding, Check, Item, Kind, Severity, TargetKind};
+    use thor_core::event_store::EventKind;
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        db: PathBuf,
+        root: PathBuf,
+    }
+
+    /// A store holding one pinned rule and one rule that refuses any write
+    /// under `frozen/`, plus a checkout the hooks run in.
+    fn fixture(copy: bool) -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("frozen")).unwrap();
+        let db = dir.path().join("thor.db");
+        let mut store = EventStore::new(&db).unwrap();
+        let pinned = Item {
+            id: "pinned-1".to_string(),
+            kind: Kind::Rule,
+            text: "a pinned rule that the copy must still serve at session start".to_string(),
+            bindings: vec![Binding::Always],
+            severity: None,
+            project: None,
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some("it stops being true".to_string()),
+            check: None,
+        };
+        model::store::declare(&mut store, "seed", "seed", "seed", &pinned).unwrap();
+        let frozen = Item {
+            id: "frozen-dir".to_string(),
+            kind: Kind::Rule,
+            text: "never write under frozen/".to_string(),
+            bindings: vec![Binding::Target { kind: TargetKind::Dir, value: "frozen".to_string() }],
+            severity: Some(Severity::Irreversible),
+            project: None,
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some("frozen/ turns out to be safe to touch".to_string()),
+            check: Some(Check::PathExists { path: "frozen".to_string() }),
+        };
+        model::store::declare(&mut store, "seed", "seed", "seed", &frozen).unwrap();
+        let cargo_note = Item {
+            id: "cargo-note".to_string(),
+            kind: Kind::Orientation,
+            text: "cargo builds in this checkout take a while; run them in the background".to_string(),
+            bindings: vec![Binding::Target { kind: TargetKind::Command, value: "cargo build".to_string() }],
+            severity: None,
+            project: None,
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some("cargo builds become quick".to_string()),
+            check: None,
+        };
+        model::store::declare(&mut store, "seed", "seed", "seed", &cargo_note).unwrap();
+        drop(store);
+        if copy {
+            thor_core::copy_mode::write_marker(&db, &Default::default()).unwrap();
+        }
+        Fixture { _dir: dir, db, root }
+    }
+
+    /// (event count, chain tip, the store file's bytes)
+    fn snapshot(db: &Path) -> (usize, (i64, String), Vec<u8>) {
+        let store = EventStore::open_read_only(db).unwrap();
+        (store.event_kinds().unwrap().len(), store.contiguous_tip().unwrap(), std::fs::read(db).unwrap())
+    }
+
+    fn files_beside(db: &Path) -> Vec<String> {
+        let mut names: Vec<String> =
+            std::fs::read_dir(db.parent().unwrap()).unwrap().flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
+        names.sort();
+        names
+    }
+
+    fn payload(event: &str, root: &Path, extra: Value) -> String {
+        let mut p = serde_json::json!({ "hook_event_name": event, "session_id": "s-copy", "cwd": root.display().to_string() });
+        p.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        p.to_string()
+    }
+
+    /// One whole session: start, several tool calls, a refusal, a prompt, a stop.
+    /// Returns the SessionStart block and whether the Write was refused.
+    fn run_session(f: &Fixture) -> (String, bool) {
+        let start = hook_once(&f.db, Some(payload("SessionStart", &f.root, serde_json::json!({}))), "hook", false);
+        let block = match start {
+            Some(HookOutput::Context { block, .. }) | Some(HookOutput::ContextWithNotice { block, .. }) => block,
+            other => panic!("expected a session start block, got {other:?}"),
+        };
+        for command in ["ls", "git status", "cargo build"] {
+            let input = serde_json::json!({ "tool_name": "Bash", "tool_input": { "command": command } });
+            hook_once(&f.db, Some(payload("PreToolUse", &f.root, input)), "hook", false);
+        }
+        let write = serde_json::json!({
+            "tool_name": "Write",
+            "tool_use_id": "toolu_1",
+            "tool_input": { "file_path": "frozen/x.rs", "content": "fn x() {}" },
+        });
+        let refused = matches!(
+            hook_once(&f.db, Some(payload("PreToolUse", &f.root, write)), "hook", false),
+            Some(HookOutput::Decision(_))
+        );
+        hook_once(&f.db, Some(payload("UserPromptSubmit", &f.root, serde_json::json!({ "prompt": "please carry on" }))), "hook", false);
+        hook_once(&f.db, Some(payload("Stop", &f.root, serde_json::json!({ "last_assistant_message": "Done." }))), "hook", false);
+        (block, refused)
+    }
+
+    /// THE DEFECT THIS PREVENTS: a laptop's hooks appended to its copy of the
+    /// log and forked the chain from the main machine's.
+    #[test]
+    fn a_full_session_on_a_copy_leaves_the_store_byte_for_byte_and_keeps_its_telemetry_beside_it() {
+        let f = fixture(true);
+        let files_before = files_beside(&f.db);
+        let before = snapshot(&f.db);
+
+        let (block, refused) = run_session(&f);
+
+        let after = snapshot(&f.db);
+        assert_eq!(before.0, after.0, "the event count must not change");
+        assert_eq!(before.1, after.1, "the chain tip must not change");
+        assert!(before.2 == after.2, "the store file must be byte-identical");
+        assert!(refused, "a rule still refuses a forbidden call on a copy");
+        assert!(block.contains("pinned rule"), "the pinned rules are still served: {block}");
+        assert!(block.contains("runs a copy of the memory"), "the session says it is a copy: {block}");
+        assert!(block.contains("weekly check runs on the main machine"), "{block}");
+
+        let served = thor_core::copy_mode::telemetry_lines(&f.db, "item_served");
+        assert!(!served.is_empty(), "served items are noted in the sidecar");
+        assert!(served.iter().any(|l| l["ids"].to_string().contains("pinned-1")));
+        let refusals = thor_core::copy_mode::telemetry_lines(&f.db, "gate_refused");
+        assert_eq!(refusals.len(), 1, "the refusal is noted in the sidecar");
+        assert_eq!(refusals[0]["rule"], "frozen-dir");
+        assert_eq!(refusals[0]["tool_use_id"], "toolu_1");
+
+        let new_files: Vec<String> = files_beside(&f.db).into_iter().filter(|n| !files_before.contains(n)).collect();
+        assert!(
+            new_files.iter().all(|n| n == "copy-telemetry.jsonl" || n == "shown-counts"),
+            "a copy writes nothing beside the store but its telemetry and the once-per-context counts: {new_files:?}"
+        );
+    }
+
+    /// The once-per-context showing still works on a copy.
+    #[test]
+    fn a_copy_still_shows_a_fact_once_per_context() {
+        let f = fixture(true);
+        let call = serde_json::json!({ "tool_name": "Bash", "tool_input": { "command": "cargo build" } });
+        let show = |f: &Fixture| match hook_once(&f.db, Some(payload("PreToolUse", &f.root, call.clone())), "hook", false) {
+            Some(HookOutput::Context { block, .. }) => block,
+            _ => String::new(),
+        };
+        assert!(show(&f).contains("cargo-note"), "the first showing carries the fact");
+        assert!(!show(&f).contains("cargo-note"), "the second showing in the same context carries nothing");
+        assert!(f.db.parent().unwrap().join("shown-counts").is_dir(), "the once-per-context counts are kept beside the copy");
+    }
+
+    /// The same session on a plain store records as it always did.
+    #[test]
+    fn a_plain_store_still_records_and_writes_no_telemetry() {
+        let f = fixture(false);
+        let before = snapshot(&f.db).0;
+        let (block, refused) = run_session(&f);
+        let store = EventStore::open_existing(&f.db).unwrap();
+        let kinds: Vec<EventKind> = store.event_kinds().unwrap().into_iter().map(|(k, _)| k).collect();
+        assert!(kinds.len() > before, "a normal session appends events");
+        assert!(kinds.contains(&EventKind::ItemServed));
+        assert!(kinds.contains(&EventKind::GateRefused));
+        assert!(refused);
+        assert!(!block.contains("runs a copy of the memory"));
+        assert!(!thor_core::copy_mode::telemetry_path(&f.db).exists());
+    }
+
+    /// A copy asks for no evaluation and holds no stop for a debt only a log
+    /// write can settle.
+    #[test]
+    fn a_copy_asks_no_evaluation_at_stop() {
+        let f = fixture(true);
+        let stop = payload("Stop", &f.root, serde_json::json!({ "last_assistant_message": "Done." }));
+        let out = hook_once(&f.db, Some(stop), "hook", false);
+        assert!(!matches!(out, Some(HookOutput::Decision(_))), "a copy never holds the turn: {out:?}");
+    }
+}
 /// The JSON `cmd_hook` writes to stdout for one `HookOutput` - split out of
 /// `cmd_hook` itself so a test can inspect the exact value a payload
 /// produces without going through the real process, which calls
@@ -6231,7 +6455,8 @@ fn cmd_hook(db_path: &Path, diagnose: bool, actor: Option<String>, no_record: bo
  }
  // `--no-record` holds the store's directory for the whole call, the
  // diagnosing open below included - see `serve::store_dir`.
- let _hold = no_record.then(|| serve::store_dir::hold(db_path));
+ let no_record = no_record || serve::store_dir::is_copy(db_path);
+ let _hold = serve::store_dir::hold_for(db_path, no_record);
  // Read stdin HERE only for the diagnosing path, which has to inspect the
  // payload before the surfaces run; a normal run lets `hook_once` read it,
  // exactly as before.

@@ -29,7 +29,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use thor_core::event_store::EventStore;
 
-static HELD: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+/// The held directories; the flag is true for a COPY hold (`hold_copy`).
+static HELD: Mutex<Vec<(PathBuf, bool)>> = Mutex::new(Vec::new());
 
 /// The directory a store (or a state file beside it) lives in, exactly as the
 /// caller's own path spells it - every state file is built by joining a name
@@ -41,12 +42,13 @@ fn dir_of(path: &Path) -> PathBuf {
 /// Releases one hold when dropped.
 pub struct Hold {
     dir: PathBuf,
+    copy: bool,
 }
 
 impl Drop for Hold {
     fn drop(&mut self) {
         let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(i) = held.iter().position(|d| *d == self.dir) {
+        if let Some(i) = held.iter().position(|(d, c)| *d == self.dir && *c == self.copy) {
             held.remove(i);
         }
     }
@@ -55,14 +57,45 @@ impl Drop for Hold {
 /// Hold the directory of `db_path` read-only until the returned guard drops.
 pub fn hold(db_path: &Path) -> Hold {
     let dir = dir_of(db_path);
-    HELD.lock().unwrap_or_else(|e| e.into_inner()).push(dir.clone());
-    Hold { dir }
+    HELD.lock().unwrap_or_else(|e| e.into_inner()).push((dir.clone(), false));
+    Hold { dir, copy: false }
+}
+
+/// Hold the directory of a COPY store (`thor_core::copy_mode`): the same as
+/// `hold`, except the per-machine telemetry sidecar stays writable. The store
+/// itself is opened read-only, so no event can be appended; every other state
+/// file beside it is left alone. (The once-per-context counts live in the
+/// `shown-counts` folder below the store's directory, which `hold` never
+/// covered either, so they keep working.)
+pub fn hold_copy(db_path: &Path) -> Hold {
+    let dir = dir_of(db_path);
+    HELD.lock().unwrap_or_else(|e| e.into_inner()).push((dir.clone(), true));
+    Hold { dir, copy: true }
+}
+
+/// Whether the store at `db_path` is a copy (marker beside it, or THOR_COPY=1).
+pub fn is_copy(db_path: &Path) -> bool {
+    thor_core::copy_mode::is_copy(db_path)
+}
+
+/// Hold `db_path`'s directory the way its mode asks: a copy hold for a copy
+/// store, a full hold when `no_record`, nothing otherwise.
+pub fn hold_for(db_path: &Path, no_record: bool) -> Option<Hold> {
+    match (is_copy(db_path), no_record) {
+        (true, _) => Some(hold_copy(db_path)),
+        (false, true) => Some(hold(db_path)),
+        (false, false) => None,
+    }
 }
 
 /// Whether `path` (the store, or a file beside it) sits in a held directory.
 pub fn is_held(path: &Path) -> bool {
     let dir = dir_of(path);
-    HELD.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|d| *d == dir)
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    HELD.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|(d, copy)| *d == dir && !(*copy && name == thor_core::copy_mode::TELEMETRY))
 }
 
 /// `std::fs::write` for a state file beside the store - skipped, successfully,
@@ -120,5 +153,30 @@ mod tests {
         let state = other.path().join("state.json");
         write(&state, "written").unwrap();
         assert_eq!(std::fs::read_to_string(&state).unwrap(), "written");
+    }
+
+    #[test]
+    fn a_copy_hold_skips_every_state_write_but_the_telemetry_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        std::fs::write(&db, b"x").unwrap();
+        thor_core::copy_mode::write_marker(&db, &Default::default()).unwrap();
+        assert!(is_copy(&db));
+        let _hold = hold_for(&db, false).expect("a copy store is always held");
+        let state = dir.path().join("eval-debt-state.json");
+        write(&state, "no").unwrap();
+        assert!(!state.exists(), "a copy takes no state write");
+        let telemetry = thor_core::copy_mode::telemetry_path(&db);
+        write(&telemetry, "yes\n").unwrap();
+        assert!(telemetry.exists(), "the per-machine telemetry sidecar stays writable");
+    }
+
+    #[test]
+    fn a_plain_store_is_not_held_unless_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        assert!(hold_for(&db, false).is_none());
+        let _h = hold_for(&db, true).expect("no_record holds");
+        assert!(is_held(&dir.path().join("state.json")));
     }
 }

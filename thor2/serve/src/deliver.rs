@@ -263,6 +263,35 @@ pub fn record_gate_outcome_for_call(
     let _ = store.append_event(session_id, lineage_id, actor, kind, entity_id, None, &body);
 }
 
+
+/// COPY MODE twin of the delivery records: what `record_delivery*` would have
+/// appended to the log goes to the per-machine telemetry sidecar instead
+/// (`thor_core::copy_mode`). One line per call, the trigger redacted and cut
+/// like the log's own. Never touches the store.
+pub fn copy_telemetry_served(db: &std::path::Path, session_id: &str, actor: &str, ids: &[String], trigger: Option<&str>) {
+    if ids.is_empty() {
+        return;
+    }
+    let trigger: Option<String> = trigger.map(|t| redact_secrets(t).chars().take(TRIGGER_LIMIT).collect());
+    thor_core::copy_mode::telemetry(
+        db,
+        "item_served",
+        serde_json::json!({ "session": session_id, "actor": actor, "ids": ids, "trigger": trigger }),
+    );
+}
+
+/// COPY MODE twin of `record_gate_outcome_for_call`.
+pub fn copy_telemetry_gate(db: &std::path::Path, session_id: &str, actor: &str, refused: bool, rule: &str, target: &str, tool_use_id: Option<&str>) {
+    thor_core::copy_mode::telemetry(
+        db,
+        if refused { "gate_refused" } else { "gate_stood_aside" },
+        serde_json::json!({
+            "session": session_id, "actor": actor, "rule": rule,
+            "target": redact_secrets(target).chars().take(TRIGGER_LIMIT).collect::<String>(),
+            "tool_use_id": tool_use_id,
+        }),
+    );
+}
 #[cfg(test)]
 mod tests {
     use super::*;

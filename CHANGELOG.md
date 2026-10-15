@@ -4,6 +4,8 @@ What changed in each release, newest first. The release workflow copies the sect
 
 ## Unreleased
 
+- **A second machine can run the full hooks on a read-only copy of the memory.** A store with a `thor-copy.json` marker beside it (or `THOR_COPY=1`) is a copy: every hook arm opens it read-only and never appends an event, so the single-writer log cannot fork. What the hooks would have logged (served items, refusals) goes to `copy-telemetry.jsonl` beside the copy; the once-per-context showing keeps working; the weekly check is not asked there (session start says so in one line) and the stop holds that only a log write can settle (setup, decisions to capture, crowded places, stale rules) are off. `sync pull` refreshes the copy from the backup git clone, atomically, and keeps the old copy when it fails.
+
 - **A refused file edit is no longer taken for a command in the bug detector.** Two rules that correctly refused edits of the same file were reported as a "false-block pattern" blaming the command matcher, because the file path was read as a command word. A refused call that is one path token (no whitespace, holding a path separator) now yields no command word and is never grouped; real command-word patterns still count.
 
 ## 2.5.0 (2026-10-02)

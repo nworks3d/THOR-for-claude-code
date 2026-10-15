@@ -174,7 +174,7 @@ pub fn write(db: &Path, plan: Plan, source: PlanSource) -> std::io::Result<()> {
     let mut object = read_object(db);
     object.insert("plan".to_string(), Value::String(plan.word().to_string()));
     object.insert("plan_source".to_string(), Value::String(source.word().to_string()));
-    std::fs::write(mode_file(db), Value::Object(object).to_string())
+    crate::store_dir::write(&mode_file(db), Value::Object(object).to_string())
 }
 
 /// Whether the weekly check is on: yes unless the user switched it off
