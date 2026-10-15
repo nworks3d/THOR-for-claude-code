@@ -12,6 +12,7 @@ pub mod drain;
 pub mod githooks;
 pub mod health;
 pub mod install;
+pub mod pull;
 pub mod questionnaire;
 pub mod ship_state;
 pub mod transport;

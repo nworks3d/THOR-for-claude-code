@@ -51,6 +51,29 @@ enum Command {
         #[arg(long)]
         from: String,
     },
+    /// Refresh a COPY of the memory (a laptop's store) from the backup's git
+    /// clone: fetch, apply only the missing events to a staged copy, then swap
+    /// it in. Never touches the main store or the NAS; a failure keeps the old
+    /// copy. The first run needs `--repo` (it marks the store as a copy).
+    Pull {
+        #[arg(long)]
+        db: PathBuf,
+        /// A git clone of the backup repository. Remembered in the copy's marker.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// The folder in the clone that holds events-NNNN.jsonl (default thor2).
+        #[arg(long)]
+        subdir: Option<String>,
+        /// The git remote to pull from (default: the clone's own upstream).
+        #[arg(long)]
+        remote: Option<String>,
+        /// Do not run git; read the clone as it is.
+        #[arg(long)]
+        no_fetch: bool,
+        /// Build the copy again from the first event.
+        #[arg(long)]
+        rebuild: bool,
+    },
     /// Push the local store's backlog to the receiver at `--to`.
     Ship {
         #[arg(long)]
@@ -216,6 +239,19 @@ fn main() -> ExitCode {
             );
             Ok(())
         }),
+        Command::Pull { db, repo, subdir, remote, no_fetch, rebuild } => {
+            let started = std::time::Instant::now();
+            let opts = ops::pull::PullOptions { repo, subdir, remote, no_fetch, rebuild };
+            ops::pull::pull(&db, &opts).map(|outcome| match outcome {
+                ops::pull::PullOutcome::UpToDate { tip } => {
+                    println!("pull: the copy is up to date at seq {tip} ({} ms)", started.elapsed().as_millis())
+                }
+                ops::pull::PullOutcome::Updated { from_tip, to_tip, applied } => println!(
+                    "pull: the copy moved from seq {from_tip} to {to_tip} ({applied} events, {} ms)",
+                    started.elapsed().as_millis()
+                ),
+            })
+        }
         Command::Ship { db, to, batch } => {
             let outcome = require_token().and_then(|token| {
                 let store = thor_core::event_store::EventStore::open_existing(&db)?;

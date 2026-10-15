@@ -775,6 +775,93 @@ there is no other protection on that transport either. Run both transports -
 this one and the tool-server connector above - on a LAN or behind a private
 tunnel, never on the open internet.
 
+## Second machine (laptop)
+
+You can have the same memory on a second computer with all the hooks working
+there, while the main machine stays the only one that writes to the log. The
+laptop holds a read-only COPY of the memory. Its hooks read the copy (rules
+fire, calls are refused, pinned notes are served, search works) and never
+write to it. A note you save from the laptop is queued at the NAS replica and
+shows up on the laptop after the main machine has applied it and the next
+refresh has run.
+
+What differs on a copy, so nothing surprises you:
+
+- The weekly check (the evaluation) runs on the main machine only. A session
+  start on the laptop says so in one line.
+- What the hooks would have logged (which notes were shown, which calls were
+  refused) goes to `copy-telemetry.jsonl` beside the copy instead of the log.
+- Four things that would hold your turn at the end of a reply are off on a
+  copy, because only a write to the log can settle them: the setup question,
+  the decision-to-capture reminder, the crowded-place repair and the
+  stale-rule check. The reply rules still work.
+- The copy can be up to a day behind. It is refreshed from the backup, and the
+  backup runs at most once a day on the main machine.
+
+What you need first, on the main machine: a backup that goes somewhere the
+laptop can reach (a folder on the NAS, or a private git repository). If you
+have not chosen one yet, tell your assistant "backup" followed by the place, or
+run `install --set-backup "<folder or address>" --db "<your store>"`.
+
+Set it up on the laptop, in this order. Do steps 3 and 4 together and do not
+start Claude Code between them.
+
+1. Install THOR on the laptop the normal way (the install command in the
+   README). This puts the programs and the hooks in place.
+2. Make a clone of the backup, once. In a terminal on the laptop (use the same
+   address the main machine's backup goes to; `git clone` accepts a folder on
+   the NAS, a `\server\share\...` path, or a repository address):
+
+   ```bash
+   git clone "<the backup address>" "<a folder on the laptop, e.g. C:\Users\you\thor-backup>"
+   ```
+
+3. Remove the empty store the installer just made. Its files are in the
+   `thor2` folder of your home folder on Windows (`~/.local/share/thor2` on
+   Linux): `thor.db`, and `thor.db-wal` and `thor.db-shm` if they are there.
+   This is the laptop's own fresh store, not your memory.
+4. Build the copy. The first run reads the whole log and takes about 40 seconds
+   for 280,000 events; every later refresh takes a second or two:
+
+   ```bash
+   sync pull --db "<the store path from step 3>" --repo "<the clone from step 2>"
+   ```
+
+   It prints `pull: the copy moved from seq 0 to ...`. It also writes
+   `thor-copy.json` beside the store, which is what makes the hooks treat the
+   store as a copy. Nothing in Claude Code's settings changes.
+5. Point the laptop's tool server (the part that saves notes) at the NAS
+   replica instead of at a local store. The replica queues what you save, and
+   the main machine applies it with `sync drain`. In a terminal on the laptop:
+
+   ```bash
+   claude mcp add --transport http --scope user thor "https://<your replica's address>/mcp"
+   ```
+
+   If `thor` is already set up there, remove it first with
+   `claude mcp remove thor`. The replica's address is the one the connector
+   container is published under (see `deploy/docker-compose.yml`); it carries
+   no login of its own, so reach it only over the tunnel or private network
+   described above.
+6. Close Claude Code completely and open it again. The first session start
+   says "This machine runs a copy of the memory".
+
+From then on, every session start looks at the marker and, when the last
+refresh is older than an hour, starts `sync pull` in the background with no
+window. The session you are in keeps using the copy it has; the next one gets
+the fresher copy. The pull never touches the main store. It works on a staged
+copy and swaps it in with two renames only after the staged log ends exactly
+where the backup ends, hash included. If anything fails (no network, git
+refuses, a file is in use), the old copy stays in use and the next session
+start says, in one line, that the refresh failed and why. To refresh by hand,
+run `sync pull --db "<the store>"`; to rebuild the copy from scratch, add
+`--rebuild`. A store without the marker is never replaced by `sync pull`.
+
+Not covered by this section and not verified on a laptop: searching by meaning
+(it needs the model and the vector index, which the main machine builds) and
+the code index (`search_code`), which each machine reads from its own project
+folders.
+
 ## Asking it what applies, from your own program
 
 Something that is not an assistant can use this memory too - a local model
