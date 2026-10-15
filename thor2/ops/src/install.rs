@@ -1826,8 +1826,13 @@ enum Plan {
 /// The plan for registering `root` as `key`'s working copy, or the refusal.
 /// A registered folder that still exists is never taken over (D3), whether
 /// it still resolves to `key` or not: editing a marker is not a move.
-fn registration_plan(store: &EventStore, root: &str, key: &str) -> Result<Plan, RegisterRefusal> {
-    let Some((old, _seq)) = model::store::registered_root_raw(store, key) else { return Ok(Plan::First) };
+fn registration_plan(
+    root: &str,
+    key: &str,
+    existing: Option<&model::store::RootRegistration>,
+) -> Result<Plan, RegisterRefusal> {
+    let Some(existing) = existing else { return Ok(Plan::First) };
+    let old = PathBuf::from(&existing.root);
     let old_text = root_string(&old);
     if same_root(&old_text, root) {
         return Ok(Plan::AlreadyHere);
@@ -1863,7 +1868,22 @@ pub fn check_registration_at(db: &Path, top: &Path, key: &str) -> Result<(), Reg
         return Ok(());
     }
     let store = EventStore::open_existing(db).map_err(|e| RegisterRefusal::Store(e.to_string()))?;
-    registration_plan(&store, &root_string(top), key).map(|_| ())
+    let existing = own_registration(&store, key, false);
+    registration_plan(&root_string(top), key, existing.as_ref()).map(|_| ())
+}
+
+/// The registration of `key` that belongs to THIS machine
+/// (`model::machine::current_machine_id`): one written for it, else - when
+/// `per_machine` is false - an ordinary one (no machine id, the main
+/// machine's). A registration made for another machine is never this
+/// machine's, so it is neither refused against nor moved. With no machine ids
+/// anywhere this is the newest registration, exactly as before.
+fn own_registration(store: &EventStore, key: &str, per_machine: bool) -> Option<model::store::RootRegistration> {
+    let me = model::machine::current_machine_id();
+    let all = model::store::root_registrations(store, key);
+    let tagged = all.iter().rev().find(|r| r.machine.as_deref() == Some(me.as_str()));
+    let plain = all.iter().rev().find(|r| r.machine.is_none());
+    tagged.or(if per_machine { None } else { plain }).cloned()
 }
 
 /// Register the checkout `cwd` sits in as project `key`'s working copy - the
@@ -1886,6 +1906,22 @@ pub fn register_root(
     key: &str,
     files: Option<usize>,
 ) -> Result<RegisterOutcome, RegisterRefusal> {
+    register_root_for(store, cwd, key, files, false)
+}
+
+/// `register_root`, optionally for THIS machine only (`per_machine`, the
+/// opt-in for a project checked out on two machines at different paths): the
+/// registration is tagged with the machine id and an ordinary registration
+/// (another machine's) is neither refused against nor moved. A second
+/// checkout on this same machine is refused exactly as without the flag. A
+/// machine that already has a tagged registration keeps writing tagged ones.
+pub fn register_root_for(
+    store: &mut EventStore,
+    cwd: &Path,
+    key: &str,
+    files: Option<usize>,
+    per_machine: bool,
+) -> Result<RegisterOutcome, RegisterRefusal> {
     let Some(top) = registration_top(cwd) else {
         return Err(RegisterRefusal::NotACheckout { cwd: root_string(cwd) });
     };
@@ -1894,7 +1930,46 @@ pub fn register_root(
     if resolved.as_deref() != Some(key) {
         return Err(RegisterRefusal::ResolvesElsewhere { key: key.to_string(), root, resolved });
     }
-    let plan = registration_plan(store, &root, key)?;
+    let existing = own_registration(store, key, per_machine);
+    let plan = registration_plan(&root, key, existing.as_ref())?;
+    let machine = (per_machine || existing.as_ref().is_some_and(|r| r.machine.is_some()))
+        .then(model::machine::current_machine_id);
+    write_registration(store, key, files, root, plan, machine.as_deref())
+}
+
+/// Register `root` as `key`'s working copy FOR THE MACHINE `machine_id`, on
+/// the main machine, without looking at the folder (it lives on the other
+/// machine): the route a laptop's registration takes, because the log has
+/// one writer. The same path again writes nothing; another path replaces the
+/// machine's old one - the owner named it, and this machine cannot see the
+/// other's disk.
+pub fn register_root_remote(
+    store: &mut EventStore,
+    key: &str,
+    root: &str,
+    machine_id: &str,
+) -> Result<RegisterOutcome, RegisterRefusal> {
+    let root = root_string(Path::new(root));
+    let existing = model::store::root_registrations(store, key)
+        .into_iter()
+        .rev()
+        .find(|r| r.machine.as_deref() == Some(machine_id));
+    let plan = match existing {
+        None => Plan::First,
+        Some(old) if same_root(&root_string(Path::new(&old.root)), &root) => Plan::AlreadyHere,
+        Some(old) => Plan::MoveFrom(root_string(Path::new(&old.root))),
+    };
+    write_registration(store, key, None, root, plan, Some(machine_id))
+}
+
+fn write_registration(
+    store: &mut EventStore,
+    key: &str,
+    files: Option<usize>,
+    root: String,
+    plan: Plan,
+    machine: Option<&str>,
+) -> Result<RegisterOutcome, RegisterRefusal> {
     let at = serve::time::now_iso8601();
     let store_err = |e: model::store::WriteError| RegisterRefusal::Store(e.to_string());
     match plan {
@@ -1904,7 +1979,7 @@ pub fn register_root(
                 .pop()
                 .map(|r| r.id)
                 .unwrap_or_else(|| project_opened_record_id(key));
-            model::store::revise_project_root(store, &id, &root, &at, installer()).map_err(store_err)?;
+            model::store::revise_project_root_for(store, &id, &root, &at, machine, installer()).map_err(store_err)?;
             return Ok(RegisterOutcome::Moved { from, to: root });
         }
         Plan::First => {}
@@ -1914,11 +1989,11 @@ pub fn register_root(
     match model::store::show(store, &opened) {
         Err(model::store::ReadError::NotFound(_)) => {
             let item = project_record(opened, key, files, &today);
-            model::store::declare_project_record(store, &item, &root, &at, installer()).map_err(store_err)?;
+            model::store::declare_project_record_for(store, &item, &root, &at, machine, installer()).map_err(store_err)?;
             Ok(RegisterOutcome::Created { root })
         }
         Ok(_) => {
-            model::store::revise_project_root(store, &opened, &root, &at, installer()).map_err(store_err)?;
+            model::store::revise_project_root_for(store, &opened, &root, &at, machine, installer()).map_err(store_err)?;
             Ok(RegisterOutcome::Registered { root })
         }
         Err(model::store::ReadError::Retracted(_)) => {
@@ -1926,11 +2001,11 @@ pub fn register_root(
             match model::store::show(store, &fallback) {
                 Err(model::store::ReadError::NotFound(_)) => {
                     let item = project_record(fallback, key, files, &today);
-                    model::store::declare_project_record(store, &item, &root, &at, installer()).map_err(store_err)?;
+                    model::store::declare_project_record_for(store, &item, &root, &at, machine, installer()).map_err(store_err)?;
                     Ok(RegisterOutcome::CreatedUnderRootRecord { root })
                 }
                 Ok(_) => {
-                    model::store::revise_project_root(store, &fallback, &root, &at, installer()).map_err(store_err)?;
+                    model::store::revise_project_root_for(store, &fallback, &root, &at, machine, installer()).map_err(store_err)?;
                     Ok(RegisterOutcome::Registered { root })
                 }
                 Err(e) => Err(RegisterRefusal::Store(e.to_string())),

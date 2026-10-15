@@ -830,7 +830,19 @@ start Claude Code between them.
    It prints `pull: the copy moved from seq 0 to ...`. It also writes
    `thor-copy.json` beside the store, which is what makes the hooks treat the
    store as a copy. Nothing in Claude Code's settings changes.
-5. Point the laptop's tool server (the part that saves notes) at the NAS
+5. Register this machine's working copies, so file checks are tried against
+   this machine's own checkout. From inside each project's checkout on the
+   laptop:
+
+   ```bash
+   install --register-root --per-machine --db "<the store path from step 3>"
+   ```
+
+   Because the store is a marked copy, this automatically behaves as
+   `--ask-main`: it writes nothing (a registration written on the copy would
+   fork the log) and prints one line. Run that printed line on the main
+   machine (details below), then repeat for the next project.
+6. Point the laptop's tool server (the part that saves notes) at the NAS
    replica instead of at a local store. The replica queues what you save, and
    the main machine applies it with `sync drain`. In a terminal on the laptop:
 
@@ -843,7 +855,7 @@ start Claude Code between them.
    container is published under (see `deploy/docker-compose.yml`); it carries
    no login of its own, so reach it only over the tunnel or private network
    described above.
-6. Close Claude Code completely and open it again. The first session start
+7. Close Claude Code completely and open it again. The first session start
    says "This machine runs a copy of the memory".
 
 From then on, every session start looks at the marker and, when the last
@@ -861,6 +873,41 @@ Not covered by this section and not verified on a laptop: searching by meaning
 (it needs the model and the vector index, which the main machine builds) and
 the code index (`search_code`), which each machine reads from its own project
 folders.
+
+### Working copy per machine (step 5 in detail)
+
+Only needed when the SAME project is checked out on two machines at different
+paths. A one-machine setup does none of this and nothing about it changes.
+
+A project is normally registered at one folder. For a second machine, run this
+on the laptop, from inside its checkout:
+
+```
+install --register-root --per-machine --ask-main --db "<the laptop's copy of thor.db>"
+```
+
+(On a marked copy `--ask-main` is implied, so `--per-machine` alone does the same.)
+It writes nothing (the laptop's memory is a copy with one writer, so a
+registration written there would fork it) and prints one line. Run that line on
+the main machine:
+
+```
+install --register-machine-root "<machine id>" --project "<project>" --root "<laptop path>" --db "<main thor.db>"
+```
+
+Why a printed command and not the replica inbox: the inbox replays tool calls
+through the write gate, and a registration is not a tool call - it is an
+installer event, and the main machine cannot check a folder that lives on the
+laptop anyway. The machine id is the computer name plus the user name,
+lowercased (`THOR_MACHINE_ID` overrides it); it holds no secret.
+
+From then on every reader (the write-time trial of a file check, the guard,
+doctor, the session start) uses the registration of the machine it runs on,
+else the ordinary one (the main machine's, including every registration made
+before this existed), else today's behaviour. A second checkout on the SAME
+machine is refused exactly as before. When `sync drain` replays a laptop write
+on the main machine, a file check is tried against the main machine's checkout:
+git keeps the two equal.
 
 ## Asking it what applies, from your own program
 

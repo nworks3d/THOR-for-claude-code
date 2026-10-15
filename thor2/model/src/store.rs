@@ -860,7 +860,7 @@ fn declare_gated(
     ctx: Option<&FilingContext>,
     trial: Option<&TrialRecord>,
     att: Option<&Att>,
-    root: Option<(&str, &str)>,
+    root: Option<(&str, &str, Option<&str>)>,
     because: Option<&str>,
 ) -> Result<Event, WriteError> {
     let actor = fence(store, actor, &item.id)?;
@@ -927,8 +927,8 @@ fn declare_gated(
         body = body_with_trial(&body, trial).map_err(WriteError::Serialize)?;
     }
     body = with_att(body, att).map_err(WriteError::Serialize)?;
-    if let Some((root, at)) = root {
-        body = body_with_root(&body, root, at).map_err(WriteError::Serialize)?;
+    if let Some((root, at, machine)) = root {
+        body = body_with_root_machine(&body, root, at, machine).map_err(WriteError::Serialize)?;
     }
     store
         .append_event(session_id, lineage_id, actor, EventKind::FactCreated, &item.id, None, &body)
@@ -1228,11 +1228,23 @@ fn body_with_because(item: &Item, because: &str) -> Result<String, serde_json::E
 /// `root_at` exists because an event carries no wall-clock time of its own
 /// (see `Revision`): without it neither doctor nor the session start could
 /// say since when a working copy is registered.
+#[cfg(test)]
 fn body_with_root(body: &str, root: &str, at: &str) -> Result<String, serde_json::Error> {
+    body_with_root_machine(body, root, at, None)
+}
+
+/// `body_with_root`, plus a trailing `"machine":"<id>"` key when the working
+/// copy is registered for one machine (`model::machine`). `None` writes
+/// exactly the bytes `body_with_root` always wrote.
+fn body_with_root_machine(body: &str, root: &str, at: &str, machine: Option<&str>) -> Result<String, serde_json::Error> {
     let root = serde_json::to_string(root)?;
     let at = serde_json::to_string(at)?;
     debug_assert!(body.ends_with('}'), "canonical_body always produces a JSON object");
-    Ok(format!("{},\"root\":{root},\"root_at\":{at}}}", &body[..body.len() - 1]))
+    let machine = match machine {
+        Some(id) => format!(",\"machine\":{}", serde_json::to_string(id)?),
+        None => String::new(),
+    };
+    Ok(format!("{},\"root\":{root},\"root_at\":{at}{machine}}}", &body[..body.len() - 1]))
 }
 
 /// The `because` a `fact_revised` event body carries, if any - present only
@@ -8350,6 +8362,9 @@ pub struct RootRegistration {
     pub root: String,
     /// When, as `YYYY-MM-DDTHH:MM:SSZ`; `None` when the body carries none.
     pub at: Option<String>,
+    /// The machine it was registered for (`model::machine`); `None` for an
+    /// ordinary registration, which counts as the main machine's.
+    pub machine: Option<String>,
 }
 
 /// Every registration of project `key`'s working copy, oldest first: every
@@ -8368,7 +8383,8 @@ pub fn root_registrations(store: &EventStore, key: &str) -> Vec<RootRegistration
             let body: serde_json::Value = serde_json::from_str(&e.body).ok()?;
             let root = body.get("root")?.as_str()?.to_string();
             let at = body.get("root_at").and_then(|v| v.as_str()).map(str::to_string);
-            Some(RootRegistration { id: id.clone(), seq: e.seq, root, at })
+            let machine = body.get("machine").and_then(|v| v.as_str()).map(str::to_string);
+            Some(RootRegistration { id: id.clone(), seq: e.seq, root, at, machine })
         })
         .collect();
     out.sort_by_key(|r| r.seq);
@@ -8380,7 +8396,27 @@ pub fn root_registrations(store: &EventStore, key: &str) -> Vec<RootRegistration
 /// checks that the path still exists or is still that project's checkout;
 /// `serve::project::registered_checkout` does, every time it is read.
 pub fn registered_root_raw(store: &EventStore, key: &str) -> Option<(PathBuf, i64)> {
-    root_registrations(store, key).pop().map(|r| (PathBuf::from(r.root), r.seq))
+    registrations_for_machine(store, key, &crate::machine::current_machine_id())
+        .pop()
+        .map(|r| (PathBuf::from(r.root), r.seq))
+}
+
+/// The registrations of `key` that belong to `machine`, oldest first: the ones
+/// written for that machine; else the ordinary ones (no machine id - the main
+/// machine's); else, when only other machines' registrations exist, all of
+/// them, so a reader behaves exactly as it did before there were machines.
+/// With no machine-tagged registration at all this is `root_registrations`.
+pub fn registrations_for_machine(store: &EventStore, key: &str, machine: &str) -> Vec<RootRegistration> {
+    let all = root_registrations(store, key);
+    let own: Vec<RootRegistration> = all.iter().filter(|r| r.machine.as_deref() == Some(machine)).cloned().collect();
+    if !own.is_empty() {
+        return own;
+    }
+    let plain: Vec<RootRegistration> = all.iter().filter(|r| r.machine.is_none()).cloned().collect();
+    if !plain.is_empty() {
+        return plain;
+    }
+    all
 }
 
 /// Refused unless `id` is a project record - the only kind of item that
@@ -8406,9 +8442,22 @@ pub fn declare_project_record(
     at: &str,
     actor: SystemActor,
 ) -> Result<Event, WriteError> {
+    declare_project_record_for(store, item, root, at, None, actor)
+}
+
+/// `declare_project_record` for one machine's working copy (`machine` is a
+/// `model::machine` id); `None` is the ordinary registration.
+pub fn declare_project_record_for(
+    store: &mut EventStore,
+    item: &Item,
+    root: &str,
+    at: &str,
+    machine: Option<&str>,
+    actor: SystemActor,
+) -> Result<Event, WriteError> {
     fence(store, actor.into(), &item.id)?;
     refuse_unless_project_record(&item.id)?;
-    declare_gated(store, "install", "install", actor.into(), item, None, None, None, Some((root, at)), None)
+    declare_gated(store, "install", "install", actor.into(), item, None, None, None, Some((root, at, machine)), None)
 }
 
 /// Register (or move) the working copy on an existing project record: one
@@ -8423,11 +8472,24 @@ pub fn revise_project_root(
     at: &str,
     actor: SystemActor,
 ) -> Result<Event, WriteError> {
+    revise_project_root_for(store, id, root, at, None, actor)
+}
+
+/// `revise_project_root` for one machine's working copy; `None` is the
+/// ordinary registration.
+pub fn revise_project_root_for(
+    store: &mut EventStore,
+    id: &str,
+    root: &str,
+    at: &str,
+    machine: Option<&str>,
+    actor: SystemActor,
+) -> Result<Event, WriteError> {
     let name = fence(store, actor.into(), id)?;
     refuse_unless_project_record(id)?;
     let existing = show(store, id).map_err(|e| WriteError::Store(anyhow::anyhow!("{e}")))?;
     let body = canonical_body(&existing).map_err(WriteError::Serialize)?;
-    let body = body_with_root(&body, root, at).map_err(WriteError::Serialize)?;
+    let body = body_with_root_machine(&body, root, at, machine).map_err(WriteError::Serialize)?;
     store
         .append_mutate_checked("install", "install", name, EventKind::FactRevised, id, None, &body)
         .map_err(WriteError::Store)

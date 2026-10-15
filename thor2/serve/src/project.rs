@@ -156,7 +156,7 @@ pub fn registration_notice(
     now_unix: i64,
 ) -> Option<String> {
     let project = project?;
-    let regs = model::store::root_registrations(store, project);
+    let regs = model::store::registrations_for_machine(store, project, &model::machine::current_machine_id());
     let last = regs.last()?;
     let at_text = last.at.as_deref()?;
     let at = crate::time::unix_from_iso8601(at_text)?;

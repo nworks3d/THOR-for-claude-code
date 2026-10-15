@@ -22,7 +22,7 @@ use ops::githooks;
 use ops::install::{
     check_registration, check_registration_at, default_data_dir, default_eval_command_path, default_settings_path,
     default_user_mcp_path, ensure_store, install_hooks, install_tool_server, record_project_opened,
-    record_topic_opened, register_command_for, register_root, seed_eval_command, seed_response_rulebook,
+    record_topic_opened, register_command_for, register_root_for, register_root_remote, seed_eval_command, seed_response_rulebook,
     seed_working_contract_at, standard_hooks, topic_folder_name, write_project_marker, EvalCommandOutcome, HookOutcome,
     MarkerOutcome, RegisterOutcome, RegisterRefusal, RulebookOutcome, ServerOutcome, StoreOutcome,
 };
@@ -101,6 +101,37 @@ struct Cli {
         conflicts_with_all = ["project", "topic", "settings", "mcp_json", "no_mcp", "serve_exe", "mcp_exe", "code_index_root"]
     )]
     register_root: bool,
+
+    /// With --register-root, for a project checked out on TWO machines at
+    /// different paths (opt-in; leave it off on a one-machine setup): register
+    /// this checkout for this machine only. A second checkout on this same
+    /// machine is still refused. Add --ask-main on a machine that keeps a
+    /// copy of the memory (a laptop): nothing is written, and the one command
+    /// to run on the main machine is printed instead.
+    #[arg(long = "per-machine", requires = "register_root")]
+    per_machine: bool,
+
+    /// With --per-machine: write nothing here and print the command for the
+    /// main machine (the memory has one writer, so only the main machine can
+    /// record a registration).
+    #[arg(long = "ask-main", requires = "per_machine")]
+    ask_main: bool,
+
+    /// Main machine only: register the working copy of --project at --root for
+    /// the machine named here (the id `--per-machine --ask-main` printed). The
+    /// folder is on the other machine, so it is not looked at.
+    #[arg(
+        long = "register-machine-root",
+        value_name = "MACHINE_ID",
+        requires_all = ["project", "root_path"],
+        conflicts_with_all = ["register_root", "topic"]
+    )]
+    register_machine_root: Option<String>,
+
+    /// The checkout's absolute path on the other machine (see
+    /// --register-machine-root).
+    #[arg(long = "root", id = "root_path", value_name = "PATH")]
+    root_path: Option<PathBuf>,
 
     /// Set ONLY the mode of the bug nudge, `release`, `test` or `off` (nothing is
     /// then offered or sent, ever, and a later install keeps it off), and nothing
@@ -550,7 +581,7 @@ fn topic_of(here: &Path) -> Result<(PathBuf, String), RegisterRefusal> {
 /// nothing else. Refuses without `--db` before anything is touched (F7): a
 /// registration in the default memory, when the assistant uses another one,
 /// would be a registration nobody ever reads.
-fn register_only(db: Option<PathBuf>) -> ExitCode {
+fn register_only(db: Option<PathBuf>, per_machine: bool, ask_main: bool) -> ExitCode {
     let Some(db) = db else {
         let default = default_data_dir()
             .map(|d| d.join("thor.db").display().to_string())
@@ -606,7 +637,29 @@ fn register_only(db: Option<PathBuf>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match register_root(&mut store, &here, &key, None) {
+    // A marked copy has one writer, so --per-machine there can only ask the main machine.
+    let ask_main = ask_main || (per_machine && thor_core::copy_mode::is_copy(&db));
+    if ask_main {
+        // Validate here (is this a checkout of the project?), write nothing.
+        let top = serve::project::git_root(&here).or_else(|| serve::project::plain_root(&here));
+        let Some(top) = top.filter(|t| serve::project::resolve_project(t).as_deref() == Some(key.as_str())) else {
+            eprintln!("REFUSED: run this from inside a checkout of '{key}'. Nothing was changed.");
+            return ExitCode::FAILURE;
+        };
+        println!(
+            "This memory is a copy and has one writer, so nothing was written here. On the MAIN machine run this one \
+             line (change the --db path to the main machine's memory if it differs):"
+        );
+        println!(
+            "install{} --register-machine-root \"{}\" --project \"{key}\" --root \"{}\" --db \"{}\"",
+            std::env::consts::EXE_SUFFIX,
+            model::machine::current_machine_id(),
+            top.display().to_string().replace('\\', "/"),
+            db.display()
+        );
+        return ExitCode::SUCCESS;
+    }
+    match register_root_for(&mut store, &here, &key, None, per_machine) {
         Ok(
             RegisterOutcome::Created { root }
             | RegisterOutcome::Registered { root }
@@ -618,6 +671,38 @@ fn register_only(db: Option<PathBuf>) -> ExitCode {
         Ok(RegisterOutcome::Moved { from, to }) => {
             println!("moved '{key}' from {from} to {to} (the old checkout is gone)")
         }
+        Err(refusal) => {
+            eprintln!("{refusal}");
+            return ExitCode::FAILURE;
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// `install --register-machine-root`: on the main machine, record the working
+/// copy another machine (a laptop) keeps of `key`.
+fn register_machine_only(db: Option<PathBuf>, key: &str, root: &str, machine: &str) -> ExitCode {
+    let Some(db) = db.filter(|d| d.is_file()) else {
+        eprintln!("REFUSED: name the main memory with --db (an existing thor.db). Nothing was changed.");
+        return ExitCode::FAILURE;
+    };
+    let mut store = match thor_core::event_store::EventStore::open_existing(&db) {
+        Ok(store) => store,
+        Err(e) => {
+            eprintln!("{}", RegisterRefusal::Store(e.to_string()));
+            return ExitCode::FAILURE;
+        }
+    };
+    match register_root_remote(&mut store, key, root, machine) {
+        Ok(RegisterOutcome::AlreadyHere { root }) => {
+            println!("= '{key}' is already registered for {machine} ({root}) - nothing to do")
+        }
+        Ok(RegisterOutcome::Moved { from, to }) => println!("moved '{key}' for {machine} from {from} to {to}"),
+        Ok(
+            RegisterOutcome::Created { root }
+            | RegisterOutcome::Registered { root }
+            | RegisterOutcome::CreatedUnderRootRecord { root },
+        ) => println!("registered '{key}' for {machine} -> {root}"),
         Err(refusal) => {
             eprintln!("{refusal}");
             return ExitCode::FAILURE;
@@ -648,7 +733,10 @@ fn print_record_outcome(key: &str, outcome: Result<RegisterOutcome, RegisterRefu
 fn main() -> ExitCode {
     let cli = Cli::parse();
     if cli.register_root {
-        return register_only(cli.db);
+        return register_only(cli.db, cli.per_machine, cli.ask_main);
+    }
+    if let (Some(machine), Some(root), Some(key)) = (cli.register_machine_root.as_deref(), cli.root_path.as_deref(), cli.project.as_deref()) {
+        return register_machine_only(cli.db, key, &root.display().to_string(), machine);
     }
     if let Some(word) = cli.set_mode.as_deref() {
         return set_mode_only(cli.db, word);
