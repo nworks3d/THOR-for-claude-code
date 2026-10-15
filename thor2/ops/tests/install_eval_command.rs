@@ -78,7 +78,7 @@ fn no_mcp_still_writes_the_eval_command_with_both_placeholders_substituted() {
         written.contains(&expected_db.display().to_string()),
         "the store path must be substituted in: {written}"
     );
-    let expected_bin_dir = PathBuf::from(env!("CARGO_BIN_EXE_install")).parent().unwrap().display().to_string();
+    let expected_bin_dir = PathBuf::from(env!("CARGO_BIN_EXE_install")).parent().unwrap().display().to_string().replace('\\', "/");
     assert!(
         written.contains(&expected_bin_dir),
         "the programs folder must be substituted in: {written}"
