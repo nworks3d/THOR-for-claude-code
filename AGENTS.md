@@ -440,6 +440,22 @@ as in `docker compose up --help`; a `--help` further along does not count), a
 `-WhatIf`. The flag has to be on the same command as the rule's, not on a later
 one joined by `&&` or `;`.
 
+**A `requires` answer can be matched a little more loosely, and one answer is
+reserved.** A plain answer with no hyphen in it ("subagent") is also found when
+the call spells it with a hyphen between two letters ("sub-agents"). The
+reserved answer `<absolute-path>` is satisfied by any real absolute path in the
+command (or, for a tool such as `Agent`, in the call): a Windows drive path
+(`C:\work\x` or `C:/work/x`), a UNC path (`\\server\share`) or a Unix path of
+two or more parts (`/tmp/work`). A bare `/tmp`, a relative path, a URL and `cmd
+/c` are not absolute paths. Use it in `check_literals` of a `requires` check
+(for example `["scratchpad", "<absolute-path>"]`, where any one answer is
+enough) to ask that a call name its folder, without naming any one folder. The
+rule's text does not have to spell the token.
+
+**A short Windows switch is a flag, not a folder name.** A forbidden literal such
+as `/it` (a slash and one or two letters) matches only where a word starts, so
+`schtasks /create ... /it` is caught and `C:/it/run.vbs` is not.
+
 **A file check needs the project's working copy.** THOR tries it in the
 checkout registered for the rule's project (the install, run from inside the project, registers it). Written from
 inside that project before it is registered, the rule is refused with the one
