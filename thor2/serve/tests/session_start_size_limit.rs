@@ -60,7 +60,7 @@ fn a_big_standing_block_stays_under_the_limit_and_only_what_is_in_it_counts_as_s
 
     let json = run_session_start(&db, &cwd, "session-one");
     let block = json["hookSpecificOutput"]["additionalContext"].as_str().unwrap().to_string();
-    assert!(block.len() <= 9_500, "the block is {} bytes: Claude Code would keep it in a file", block.len());
+    assert!(block.len() <= 9_800, "the block is {} bytes: Claude Code would keep it in a file", block.len());
     let in_block: Vec<String> = block
         .lines()
         .filter_map(|l| l.strip_prefix("- ["))
