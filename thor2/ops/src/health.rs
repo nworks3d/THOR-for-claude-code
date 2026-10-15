@@ -641,13 +641,50 @@ pub fn ship_line(db: &Path) -> Option<String> {
     Some(match waiting {
         Some(0) => format!("ship: last succeeded {age_hours}h ago - fresh, nothing new has been written since"),
         Some(n) if age_hours >= SHIP_STALE_CEILING_HOURS => format!(
-            "ship: {n} change(s) not yet on the replica - last succeeded {age_hours}h ago and the hourly \
-             ship has not run since (the machine may be asleep, or the task is not firing)"
+            "ship: {n} change(s) not yet on the replica - last succeeded {age_hours}h ago and no attempt has \
+             been recorded since, so the hourly ship has not run since, or it started and died before it \
+             could record anything. Check the task's Last Run Result in Task Scheduler (a machine that was \
+             asleep looks the same); a program that was removed or quarantined is named by the line above, \
+             and a script that records its failures (thor2/deploy/ship-hourly.example.ps1) shows the error here"
         ),
         Some(_) => fresh_text(),
         None if age_hours >= SHIP_STALE_CEILING_HOURS => stale_text(),
         None => fresh_text(),
     })
+}
+
+/// The third shape of a silent ship: a scheduled task calls the ship but this
+/// store has never recorded an attempt. Either the task never ran, or its
+/// script died before it could record (the 2026-10-11 quarantine did exactly
+/// that). `None` when a sidecar exists or no task names the ship.
+pub fn ship_never_recorded_line(db: &Path, task_called: &[std::path::PathBuf]) -> Option<String> {
+    if crate::ship_state::read(db).is_some() {
+        return None;
+    }
+    let ship = task_called.iter().find(|p| {
+        let name = p.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+        name == "sync" || name.contains("ship")
+    })?;
+    Some(format!(
+        "ship: a scheduled task calls {} but nothing has ever been recorded for it - the task has never run, or its script stops before it can record a failure. Check the task's Last Run Result in Task Scheduler; the example script thor2/deploy/ship-hourly.example.ps1 records every failure, including a missing program",
+        ship.display()
+    ))
+}
+
+/// The lines about THOR programs that something calls and that are not on
+/// disk (hooks, the tool server, the sidecars' programs and the scheduled
+/// tasks), plus the ship that left no record. Empty when all is in place.
+/// Reads Windows Defender's history only when something is missing, and only
+/// as far as Windows lets this user read it.
+pub fn program_lines(db: &Path, settings: Option<&Path>, mcp_json: Option<&Path>, bin_dir: Option<&Path>) -> Vec<String> {
+    let xml = serve::missing_programs::scheduled_tasks_xml();
+    let task_called = serve::missing_programs::task_programs(&xml, &|p| std::fs::read_to_string(p).ok());
+    let gone = serve::missing_programs::find(db, settings, mcp_json, bin_dir, Some(&xml));
+    let detected = if gone.is_empty() || !cfg!(windows) { Vec::new() } else { serve::missing_programs::defender_names() };
+    serve::missing_programs::words_for(&gone, &detected, cfg!(windows))
+        .into_iter()
+        .chain(ship_never_recorded_line(db, &task_called))
+        .collect()
 }
 
 /// How many writes queued on a replica did NOT land at the drain - refused by

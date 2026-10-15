@@ -462,3 +462,27 @@ mod first_reply_is_not_held {
         assert!(!respond::is_setup_list_reply(&respond::haystack(&reply)));
     }
 }
+
+/// A missing THOR program (an antivirus quarantine) is the assistant's to
+/// explain and to OFFER a Defender exclusion for - consented, never unasked.
+/// It is an assistant rule, not a new item on the user's numbered list.
+#[test]
+fn the_assistant_rules_carry_the_consented_defender_exclusion_and_the_list_stays_twelve() {
+    let rules = questionnaire::ASSISTANT_RULES;
+    for must in [
+        "THOR program is missing",
+        "OFFER, once and never unasked",
+        "Defender stops scanning every file in that folder",
+        "one administrator prompt",
+        "saying no is fine",
+        "Only after his clear yes",
+        "Start-Process powershell -Verb RunAs -WindowStyle Hidden",
+        "Add-MpPreference -ExclusionPath",
+        "(Get-MpPreference).ExclusionPath",
+        "Never change any other Windows security setting",
+    ] {
+        assert!(rules.contains(must), "the assistant rules lost '{must}'");
+    }
+    assert_eq!(questions().len(), 12, "the exclusion is an assistant rule, not a thirteenth item");
+    assert!(!questionnaire::render_list(None).contains("Add-MpPreference"), "the short list the user sees stays clean");
+}

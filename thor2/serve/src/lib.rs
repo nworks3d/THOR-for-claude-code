@@ -113,6 +113,7 @@ pub mod live;
 pub mod lookup;
 pub mod mark;
 pub mod migrate;
+pub mod missing_programs;
 pub mod next_turn;
 pub mod notices;
 pub mod pins;

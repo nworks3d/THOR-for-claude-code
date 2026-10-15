@@ -154,3 +154,21 @@ fn the_switch_refuses_a_word_it_does_not_know_and_a_missing_memory() {
     assert!(!missing.status.success());
     assert!(said(&missing).contains("REFUSED"), "{}", said(&missing));
 }
+
+/// The brief note has to reach the session BEFORE its first Agent call: a
+/// binding to the Agent tool alone fires only at that call, when the brief is
+/// already written. `--set-helpers on` therefore also pins it (Always).
+#[test]
+fn the_brief_note_is_pinned_so_it_arrives_before_the_first_agent_call() {
+    let fx = Fx::new();
+    let out = fx.install(&["--set-helpers", "on"]);
+    assert!(out.status.success(), "{}", said(&out));
+    let brief = fx.read("an-agent-brief-stands-alone").unwrap();
+    assert!(brief.bindings.contains(&model::item::Binding::Always), "the brief note is not pinned: {:?}", brief.bindings);
+    assert!(
+        brief.bindings.iter().any(|b| matches!(b, model::item::Binding::Target { value, .. } if value == "Agent")),
+        "the brief note lost its Agent binding"
+    );
+    let orchestrator = fx.read("orchestrator-mode-saves-quota").unwrap();
+    assert!(!orchestrator.bindings.contains(&model::item::Binding::Always), "only the brief note is pinned");
+}

@@ -1283,7 +1283,9 @@ pub fn helper_mode_notes() -> Vec<model::item::Item> {
             "an-agent-brief-stands-alone",
             "A helper starts blank, so its brief stands alone: goal, ABSOLUTE folder, files it may touch, a SUMMARY of what is known (not a read-first list), one narrow task, a SHORT report. Check every 20-30 minutes, at most 3 times, then judge it dead by its last real activity, not its status.",
             "An agent given a brief with no working folder or limits is found to behave the same as one given a complete brief.",
-            agent(),
+            // Pinned as well: bound to Agent alone it would arrive at the
+            // first Agent call, after the brief was already written.
+            vec![agent().remove(0), Binding::Always],
         ),
     ]
 }
@@ -3350,6 +3352,13 @@ mod tests {
         let absolute = rules.iter().find(|r| r.base.id == "absolute-verification-claim").unwrap();
         assert!(absolute.base.any_of.contains(&"alles nagekeken".to_string()));
         assert!(!absolute.backed_by_turn_tools, "it must fire even when the turn looked at something");
+        // A helper's numbers passed on to the owner carry their source.
+        assert!(
+            absolute.base.reminder.contains("number or result a helper gave you")
+                && absolute.base.reminder.contains("'according to the helper's report'"),
+            "the reminder lost the helper-numbers label: {}",
+            absolute.base.reminder
+        );
     }
 
     /// A real checkout at `dir` with one commit, named `key` by its own

@@ -657,6 +657,29 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
 - You notice: only when you ask.
 - Refuse or change: you choose what goes there.
 
+### E14. It notices a THOR program that has gone missing, and may offer one exclusion
+- What: at every session start, and in doctor (which also reads the scheduled tasks), THOR checks that the
+  program each THOR hook, the tool-server entry, a scheduled task and the memory's own sidecars (the ship
+  and the backup) call is on disk. A missing one is named in one line with the likely cause, an antivirus
+  quarantine, and the steps: open Windows Security > Virus and threat protection > Protection history,
+  open the entry naming the file and choose Actions > Restore; or run THOR's install again. On Windows
+  doctor also shows the THOR file names Windows Defender's own detection history gives, when Windows lets
+  your user read it without administrator rights (read-only, no window).
+- Why: on 2026-10-11 Windows Defender quarantined THOR's sync program as a false positive; the hourly ship
+  failed for two days and nothing said why. The ship line is now three cases: never recorded, ran and
+  failed (with the error; the example script thor2/deploy/ship-hourly.example.ps1 records every failure,
+  a missing program included), and program missing.
+- You notice: a line starting "PROBLEM: THOR program missing" (session start and doctor). Only then may
+  your assistant OFFER, never unasked, to add a Defender exclusion for the THOR program folder. It must say
+  what that does and its risk: Defender stops scanning every file in that folder, so a bad file placed
+  there would not be caught. Windows shows one administrator prompt, and saying no is fine. Only after your
+  clear yes it runs, in an elevated PowerShell: Start-Process powershell -Verb RunAs -WindowStyle Hidden
+  -ArgumentList '-NoProfile -Command Add-MpPreference -ExclusionPath "<folder>"', and checks the result
+  with (Get-MpPreference).ExclusionPath.
+- Refuse or change: say no and nothing changes. THOR itself never changes a Windows security setting; the
+  exclusion is yours to allow and yours to remove (Windows Security > Virus and threat protection >
+  Manage settings > Exclusions).
+
 ---
 
 ## F. What the user can switch off or change, and how
