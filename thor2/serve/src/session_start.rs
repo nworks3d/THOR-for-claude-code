@@ -69,11 +69,19 @@ pub fn render(items: &[RankedItem]) -> Option<String> {
 /// longer than 10,000 characters in a file and shows the agent only its first
 /// 2 KB (measured on this machine's own transcripts: the largest output that
 /// arrived whole was 9,972 characters, the smallest that was cut was 9.8 KB,
-/// i.e. 10,035 bytes). 9,500 stays under it with room for a multi-byte letter.
-pub const HOOK_OUTPUT_LIMIT_BYTES: usize = 9_500;
+/// i.e. 10,035 bytes). The budget counts BYTES, never fewer than characters, so
+/// a multi-byte letter only makes it safer. 9,800 keeps 200 bytes under the
+/// 10,000-character line and 172 under the largest output seen whole; it was
+/// 9,500, which left about one pinned rule of slack on a full block.
+pub const HOOK_OUTPUT_LIMIT_BYTES: usize = 9_800;
 
-/// Room kept for the one-line note about the rules that did not fit.
-const NOT_FIT_NOTE_RESERVE: usize = 220;
+/// The one line that says how many standing rules were left out. Printed
+/// whenever anything is cut, never otherwise.
+fn not_fit_note(hidden: usize) -> String {
+    format!(
+        "[THOR] {hidden} more standing rule(s) did not fit in this block and are not shown. Look them up with the lookup tool when something you are about to do may be covered."
+    )
+}
 
 /// What `render_within` put in the block.
 pub struct Rendered {
@@ -138,7 +146,9 @@ pub fn render_within_ranked(
     let lines: Vec<String> = ordered.iter().map(|r| format!("- [{}] {}", r.id, r.item.text)).collect();
     let head_len: usize = head.iter().map(|l| l.len() + 1).sum();
     let all_len: usize = head_len + lines.iter().map(|l| l.len() + 1).sum::<usize>();
-    let room = if all_len <= budget { usize::MAX } else { budget.saturating_sub(NOT_FIT_NOTE_RESERVE) };
+    // The note's own room, measured with the widest count it can carry.
+    let note_reserve = not_fit_note(ordered.len()).len() + 1;
+    let room = if all_len <= budget { usize::MAX } else { budget.saturating_sub(note_reserve) };
 
     let mut out = head;
     let mut shown = Vec::new();
@@ -153,9 +163,7 @@ pub fn render_within_ranked(
     }
     let hidden = ordered.len() - shown.len();
     if hidden > 0 {
-        out.push(format!(
-            "[THOR] {hidden} more standing rule(s) did not fit in this block and are not shown. Look them up with the lookup tool when something you are about to do may be covered."
-        ));
+        out.push(not_fit_note(hidden));
     }
     Some(Rendered { text: out.join("\n"), shown, hidden })
 }
@@ -595,6 +603,36 @@ mod tests {
         }
         let in_text = r.text.lines().filter(|l| l.starts_with("- [")).count();
         assert_eq!(in_text, r.shown.len(), "what is reported shown is exactly what is in the block");
+    }
+
+    /// One rule more than fits: the cut is never silent and never over budget,
+    /// at every size around the edge.
+    #[test]
+    fn one_rule_more_than_fits_is_cut_with_the_note_and_stays_within_the_budget() {
+        for len in 150..=330 {
+            let items = select(&many(40, len), None);
+            let r = render_within(&items, HOOK_OUTPUT_LIMIT_BYTES).unwrap();
+            assert!(r.text.len() <= HOOK_OUTPUT_LIMIT_BYTES, "len {len}: {} bytes", r.text.len());
+            assert_eq!(r.text.contains("did not fit"), r.hidden > 0, "len {len}: a cut always says so, a full block never does");
+            assert_eq!(r.shown.len() + r.hidden, 40);
+        }
+    }
+
+    /// The reserve for the note is the note's real size, not a guess: a block
+    /// that must be cut leaves no more than about one rule of the budget empty.
+    #[test]
+    fn the_cut_block_keeps_no_more_spare_room_than_the_note_needs() {
+        let items = select(&many(120, 100), None);
+        let r = render_within(&items, HOOK_OUTPUT_LIMIT_BYTES).unwrap();
+        assert!(r.hidden > 0);
+        let spare = HOOK_OUTPUT_LIMIT_BYTES - r.text.len();
+        assert!(spare < 110, "{spare} bytes of the budget were left empty");
+    }
+
+    #[test]
+    fn the_hook_budget_stays_under_the_limit_claude_code_shows_whole() {
+        assert!(HOOK_OUTPUT_LIMIT_BYTES > 9_500);
+        assert!(HOOK_OUTPUT_LIMIT_BYTES <= 9_800, "10,000 characters is the line; 9,972 is the largest seen whole");
     }
 
     #[test]

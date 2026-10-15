@@ -218,6 +218,12 @@ pub fn select(candidates: &[LiveItem], input: &ServeInput) -> Vec<RankedItem> {
             .then_with(|| at_this_exact_place(&b.item, input).cmp(&at_this_exact_place(&a.item, input)))
             // 3. Then weight, as before, among items equally close.
             .then_with(|| severity_rank(a.item.severity).cmp(&severity_rank(b.item.severity)))
+            // 3b. AT EQUAL WEIGHT, THE RULE THAT CAN REFUSE BEFORE THE NOTE THAT
+            //     CAN ONLY INFORM. Measured at command `Agent`: five notes
+            //     applied, four fit, and the one with a refusing check (no
+            //     severity) fell out behind an informing note of the same
+            //     severity, on id order alone. Severity stays the first key.
+            .then_with(|| crate::sweep::can_refuse(&b.item).cmp(&crate::sweep::can_refuse(&a.item)))
             .then_with(|| {
                 let ca = closeness(&a.item.text, &input.context);
                 let cb = closeness(&b.item.text, &input.context);
@@ -800,6 +806,31 @@ mod tests {
         expected.sort();
         let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
         assert_eq!(ids, expected, "tie order must be id order, never correlated with text length");
+    }
+
+    #[test]
+    fn at_equal_severity_a_rule_that_can_refuse_ranks_above_a_note_that_only_informs() {
+        use model::item::Check;
+        let on_agent = |id: &str, check: Option<Check>, severity: Option<Severity>| {
+            let mut c = base(id, Kind::Rule);
+            c.item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "Agent".to_string() }];
+            c.item.severity = severity;
+            c.item.check = check;
+            c
+        };
+        let forbidden = || Some(Check::Forbidden { literals: vec!["--force".to_string()] });
+        let items = vec![
+            on_agent("a-note-1", None, None),
+            on_agent("a-note-2", None, None),
+            on_agent("a-note-3", None, None),
+            on_agent("a-note-4", None, None),
+            on_agent("z-rule", forbidden(), None),
+            // Severity is still the first key: a heavier note beats a lighter rule.
+            on_agent("m-heavy-note", None, Some(Severity::Costly)),
+        ];
+        let got = ids(select(&items, &running("Agent")));
+        assert_eq!(got[0], "m-heavy-note", "{got:?}");
+        assert_eq!(got[1], "z-rule", "the refusing rule must make the block of four: {got:?}");
     }
 
     #[test]

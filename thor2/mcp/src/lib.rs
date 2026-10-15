@@ -312,6 +312,7 @@ fn with_warnings(
         // (`serve::sweep`): informs, never refuses.
         notes.extend(serve::sweep::would_refuse_note(store, item, std::time::Duration::from_millis(1_500)));
     }
+    notes.extend(helper_only_moment_note(item));
     if let Some(root) = root {
         notes.extend(file_aware_warnings(item, root));
         notes.extend(suggested_check(item, root));
@@ -321,6 +322,27 @@ fn with_warnings(
     }
     let notes: Vec<String> = notes.iter().map(|n| format!("  note: {n}")).collect();
     format!("{success}\n{}", notes.join("\n"))
+}
+
+/// The moments that, in helper-agent mode, only a helper agent runs: the main
+/// session judges and writes the briefs but never pushes or deploys itself.
+const HELPER_ONLY_MOMENTS: [&str; 2] = ["push", "deploy"];
+
+/// A note when a rule is bound ONLY to moments the main session usually never
+/// reaches: it would then arrive inside a helper agent and never in the
+/// session that writes the briefs. A note, never a refusal.
+fn helper_only_moment_note(item: &model::item::Item) -> Option<String> {
+    use model::item::Binding;
+    if !item.kind.can_fire() || item.bindings.is_empty() {
+        return None;
+    }
+    let helper_moments: Vec<Binding> = HELPER_ONLY_MOMENTS.iter().filter_map(|n| model::gate::parse_moment(n).ok()).collect();
+    let only_helper_moments = item.bindings.iter().all(|b| helper_moments.contains(b));
+    only_helper_moments.then(|| {
+        "this moment is usually reached only inside helper agents, so the session that writes the briefs may never see this rule: \
+         pin it or bind it to the tool the session calls (for example 'Agent'). Nothing was refused."
+            .to_string()
+    })
 }
 
 /// The short names of the tools this server serves (`remember`, `shelve`...):
@@ -4709,6 +4731,28 @@ mod tests {
         other.text = "the other host is a different machine, keep its reports apart".to_string();
         let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(other)).await;
         assert!(reply.starts_with("stored ") && !reply.contains("GLOBAL item"), "{reply}");
+    }
+
+    #[tokio::test]
+    async fn a_rule_bound_only_to_push_or_deploy_is_stored_with_a_note_about_helper_agents() {
+        let srv = server();
+        let mut args = base_remember("push-only");
+        args.always = false;
+        args.moments = vec!["push".to_string()];
+        args.text = "check the remote and branch before a push lands".to_string();
+        args.severity = Some("house_style".to_string());
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
+        assert!(reply.starts_with("stored "), "a note is never a refusal: {reply}");
+        assert!(reply.contains("usually reached only inside helper agents"), "{reply}");
+        assert!(reply.contains("pin it or bind it to the tool the session calls"), "{reply}");
+
+        // Pinned, or also bound to a moment the session runs: no note.
+        let mut pinned = base_remember("push-pinned");
+        pinned.moments = vec!["push".to_string()];
+        pinned.text = "a different matter about pushes, kept always in view".to_string();
+        pinned.severity = Some("house_style".to_string());
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(pinned)).await;
+        assert!(reply.starts_with("stored ") && !reply.contains("helper agents"), "{reply}");
     }
 
     #[tokio::test]
