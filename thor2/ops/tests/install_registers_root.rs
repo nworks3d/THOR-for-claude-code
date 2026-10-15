@@ -393,3 +393,157 @@ fn a_per_project_install_from_a_clone_is_refused_before_anything_is_written() {
     assert_eq!(event_count(&db), events, "the record is unchanged");
     assert_eq!(registered(&db, "demo"), Some(slash(&real)));
 }
+
+// ---------------------------------------------------------------- per machine
+//
+// One project checked out on two machines at different paths (opt-in). A run
+// without `--per-machine` must stay exactly what it was.
+
+fn install_as(machine: &str, dir: &Path, sandbox: &Sandbox, args: &[&str]) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_install"));
+    cmd.current_dir(dir).args(args).env("THOR_MACHINE_ID", machine);
+    sandbox.apply(&mut cmd);
+    cmd.output().unwrap()
+}
+
+fn registrations(db: &Path, key: &str) -> Vec<model::store::RootRegistration> {
+    let store = EventStore::open_existing(db).unwrap();
+    model::store::root_registrations(&store, key)
+}
+
+fn root_for(db: &Path, key: &str, machine: &str) -> Option<String> {
+    let store = EventStore::open_existing(db).unwrap();
+    model::store::registrations_for_machine(&store, key, machine).pop().map(|r| r.root)
+}
+
+/// One machine: the refusal text is byte for byte today's, and an ordinary
+/// registration carries no machine id at all.
+#[test]
+fn one_machine_refusal_text_is_unchanged_and_writes_no_machine_id() {
+    let base = tempfile::tempdir().unwrap();
+    let hooks = no_hooks(base.path());
+    let beta = base.path().join("beta");
+    checkout(&beta, &hooks, Some("beta"), "intro only\n");
+    let copy = base.path().join("beta-copy");
+    clone(&beta, &copy, &hooks);
+    let db = fresh_store(base.path());
+    let sandbox = Sandbox::new();
+    let db_arg = db.display().to_string();
+    assert!(install_as("pc", &beta, &sandbox, &["--register-root", "--db", &db_arg]).status.success());
+    assert!(registrations(&db, "beta").iter().all(|r| r.machine.is_none()), "no flag, no machine id");
+
+    let refused = install_as("pc", &copy, &sandbox, &["--register-root", "--db", &db_arg]);
+    assert_eq!(refused.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&refused.stderr).trim_end(),
+        format!(
+            "REFUSED: 'beta' is registered at {}, which is still a checkout of it - a second copy cannot take over its \
+             registration. Nothing was changed.",
+            slash(&beta)
+        )
+    );
+}
+
+/// Two machines, one project, two paths: each resolves its own. The laptop's
+/// registration does not touch the PC's, and the PC (untagged, legacy) still
+/// resolves for every machine that has no registration of its own.
+#[test]
+fn each_machine_resolves_its_own_working_copy() {
+    let base = tempfile::tempdir().unwrap();
+    let hooks = no_hooks(base.path());
+    let pc = base.path().join("pc").join("beta");
+    std::fs::create_dir_all(pc.parent().unwrap()).unwrap();
+    checkout(&pc, &hooks, Some("beta"), "intro only\n");
+    let laptop = base.path().join("laptop").join("beta");
+    std::fs::create_dir_all(laptop.parent().unwrap()).unwrap();
+    clone(&pc, &laptop, &hooks);
+    let db = fresh_store(base.path());
+    let sandbox = Sandbox::new();
+    let db_arg = db.display().to_string();
+
+    assert!(install_as("pc/user", &pc, &sandbox, &["--register-root", "--db", &db_arg]).status.success());
+    // Without the flag the laptop is a second copy: refused, as ever.
+    let plain = install_as("laptop/user", &laptop, &sandbox, &["--register-root", "--db", &db_arg]);
+    assert_eq!(plain.status.code(), Some(1), "{}", text(&plain));
+    let events = event_count(&db);
+
+    let out = install_as("laptop/user", &laptop, &sandbox, &["--register-root", "--per-machine", "--db", &db_arg]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(event_count(&db), events + 1);
+    assert_eq!(root_for(&db, "beta", "laptop/user"), Some(slash(&laptop)));
+    assert_eq!(root_for(&db, "beta", "pc/user"), Some(slash(&pc)), "the legacy registration is the main machine's");
+    assert_eq!(root_for(&db, "beta", "tablet/user"), Some(slash(&pc)), "an unknown machine falls back to the ordinary one");
+
+    // The laptop again: nothing to write.
+    let again = install_as("laptop/user", &laptop, &sandbox, &["--register-root", "--per-machine", "--db", &db_arg]);
+    assert!(text(&again).contains("already registered here"), "{}", text(&again));
+    assert_eq!(event_count(&db), events + 1);
+    // The PC again, without the flag: its own registration, nothing written.
+    let pc_again = install_as("pc/user", &pc, &sandbox, &["--register-root", "--db", &db_arg]);
+    assert!(text(&pc_again).contains("already registered here"), "{}", text(&pc_again));
+    assert_eq!(event_count(&db), events + 1);
+}
+
+/// The same machine with a second checkout is still refused, with or without
+/// the flag.
+#[test]
+fn a_second_checkout_on_the_same_machine_is_still_refused() {
+    let base = tempfile::tempdir().unwrap();
+    let hooks = no_hooks(base.path());
+    let beta = base.path().join("beta");
+    checkout(&beta, &hooks, Some("beta"), "intro only\n");
+    let copy = base.path().join("beta-copy");
+    clone(&beta, &copy, &hooks);
+    let db = fresh_store(base.path());
+    let sandbox = Sandbox::new();
+    let db_arg = db.display().to_string();
+    assert!(install_as("laptop/user", &beta, &sandbox, &["--register-root", "--per-machine", "--db", &db_arg]).status.success());
+    let events = event_count(&db);
+
+    for args in [&["--register-root", "--per-machine", "--db", &db_arg][..], &["--register-root", "--db", &db_arg][..]] {
+        let refused = install_as("laptop/user", &copy, &sandbox, args);
+        assert_eq!(refused.status.code(), Some(1), "{}", text(&refused));
+        assert!(text(&refused).contains("which is still a checkout of it - a second copy cannot take over"), "{}", text(&refused));
+    }
+    assert_eq!(event_count(&db), events);
+}
+
+/// The laptop's copy has one writer: `--ask-main` writes nothing and prints
+/// the one line for the main machine, which records the laptop's path
+/// without looking at the (absent) folder.
+#[test]
+fn a_copy_asks_the_main_machine_to_record_its_checkout() {
+    let base = tempfile::tempdir().unwrap();
+    let hooks = no_hooks(base.path());
+    let pc = base.path().join("pc").join("beta");
+    std::fs::create_dir_all(pc.parent().unwrap()).unwrap();
+    checkout(&pc, &hooks, Some("beta"), "intro only\n");
+    let laptop = base.path().join("laptop").join("beta");
+    std::fs::create_dir_all(laptop.parent().unwrap()).unwrap();
+    clone(&pc, &laptop, &hooks);
+    let db = fresh_store(base.path());
+    let sandbox = Sandbox::new();
+    let db_arg = db.display().to_string();
+    assert!(install_as("pc/user", &pc, &sandbox, &["--register-root", "--db", &db_arg]).status.success());
+    let events = event_count(&db);
+
+    let asked = install_as("laptop/user", &laptop, &sandbox, &["--register-root", "--per-machine", "--ask-main", "--db", &db_arg]);
+    assert!(asked.status.success(), "{}", text(&asked));
+    assert_eq!(event_count(&db), events, "a copy writes nothing");
+    let said = text(&asked);
+    assert!(said.contains("--register-machine-root \"laptop/user\" --project \"beta\""), "{said}");
+    assert!(said.contains(&format!("--root \"{}\"", slash(&laptop))), "{said}");
+
+    // The main machine runs that line; the laptop folder does not exist there.
+    let elsewhere = base.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let main = install_as(
+        "pc/user",
+        &elsewhere,
+        &sandbox,
+        &["--register-machine-root", "laptop/user", "--project", "beta", "--root", "D:/laptop/beta", "--db", &db_arg],
+    );
+    assert!(main.status.success(), "{}", text(&main));
+    assert_eq!(root_for(&db, "beta", "laptop/user"), Some("D:/laptop/beta".to_string()));
+    assert_eq!(root_for(&db, "beta", "pc/user"), Some(slash(&pc)));
+}

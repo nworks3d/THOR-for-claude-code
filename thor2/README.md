@@ -775,6 +775,40 @@ there is no other protection on that transport either. Run both transports -
 this one and the tool-server connector above - on a LAN or behind a private
 tunnel, never on the open internet.
 
+### Second machine (laptop): one working copy per machine
+
+Only needed when the SAME project is checked out on two machines at different
+paths. A one-machine setup does none of this and nothing about it changes.
+
+A project is normally registered at one folder. For a second machine, run this
+on the laptop, from inside its checkout:
+
+```
+install --register-root --per-machine --ask-main --db "<the laptop's copy of thor.db>"
+```
+
+It writes nothing (the laptop's memory is a copy with one writer, so a
+registration written there would fork it) and prints one line. Run that line on
+the main machine:
+
+```
+install --register-machine-root "<machine id>" --project "<project>" --root "<laptop path>" --db "<main thor.db>"
+```
+
+Why a printed command and not the replica inbox: the inbox replays tool calls
+through the write gate, and a registration is not a tool call - it is an
+installer event, and the main machine cannot check a folder that lives on the
+laptop anyway. The machine id is the computer name plus the user name,
+lowercased (`THOR_MACHINE_ID` overrides it); it holds no secret.
+
+From then on every reader (the write-time trial of a file check, the guard,
+doctor, the session start) uses the registration of the machine it runs on,
+else the ordinary one (the main machine's, including every registration made
+before this existed), else today's behaviour. A second checkout on the SAME
+machine is refused exactly as before. When `sync drain` replays a laptop write
+on the main machine, a file check is tried against the main machine's checkout:
+git keeps the two equal.
+
 ## Asking it what applies, from your own program
 
 Something that is not an assistant can use this memory too - a local model

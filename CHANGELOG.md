@@ -4,6 +4,7 @@ What changed in each release, newest first. The release workflow copies the sect
 
 ## Unreleased
 
+- **A project can have a working copy per machine (opt-in).** `install --register-root --per-machine` registers a checkout for this machine only, `--ask-main` prints the one command a copy-holding laptop runs on the main machine (`install --register-machine-root`), and every reader resolves the registration of the machine it runs on. A normal one-machine install is unchanged.
 - **A refused file edit is no longer taken for a command in the bug detector.** Two rules that correctly refused edits of the same file were reported as a "false-block pattern" blaming the command matcher, because the file path was read as a command word. A refused call that is one path token (no whitespace, holding a path separator) now yields no command word and is never grouped; real command-word patterns still count.
 
 ## 2.5.0 (2026-10-02)

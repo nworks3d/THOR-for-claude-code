@@ -14,6 +14,7 @@ pub mod check;
 pub mod checkout;
 pub mod gate;
 pub mod item;
+pub mod machine;
 pub mod marked;
 pub mod normalize;
 pub mod refusal_outcome;

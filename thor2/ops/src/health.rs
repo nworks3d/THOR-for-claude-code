@@ -2125,7 +2125,7 @@ pub fn working_copy_lines(db: &Path) -> Vec<String> {
     let mut lines = Vec::new();
     let mut unregistered: Vec<String> = Vec::new();
     for key in &registered {
-        let regs = model::store::root_registrations(&store, key);
+        let regs = model::store::registrations_for_machine(&store, key, &model::machine::current_machine_id());
         let Some(last) = regs.last() else {
             if let Some(n) = owners.get(key) {
                 unregistered.push(format!("{key} ({n} rule(s))"));
