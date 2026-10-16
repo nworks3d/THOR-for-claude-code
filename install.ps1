@@ -11,6 +11,12 @@
 # (the memory server). Set $env:THOR_NO_SETUP = "1" beforehand to unpack only
 # and run the setup yourself later.
 #
+# SECOND MACHINE: to get a read-only copy of another machine's memory instead
+# of a memory of its own, set $env:THOR_COPY_FROM (the backup), and optionally
+# $env:THOR_COPY_SCOPES (projects, comma separated) and $env:THOR_COPY_GLOBAL =
+# "1", beforehand. The setup program reads them itself; see "Use THOR on a
+# second machine" in README.md.
+#
 # Nothing here needs administrator rights, and nothing is installed outside
 # your own user folder.
 

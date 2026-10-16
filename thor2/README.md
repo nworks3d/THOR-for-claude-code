@@ -803,6 +803,52 @@ laptop can reach (a folder on the NAS, or a private git repository). If you
 have not chosen one yet, tell your assistant "backup" followed by the place, or
 run `install --set-backup "<folder or address>" --db "<your store>"`.
 
+**The fastest route is one command**, `install --copy-from <backup>`, which
+does steps 1 to 4 below in one go, step by step in the repository README under
+"Use THOR on a second machine". It also lets you choose what the copy holds
+(next section). The numbered steps here are the same thing done by hand, plus
+the replica for saving notes (step 6), which the one command leaves out on
+purpose.
+
+### Choosing what the copy holds (a selective copy)
+
+A copy can hold only part of the memory, so a laptop that must not carry every
+project does not. `sync pull` (and `install --copy-from`) takes:
+
+- `--scope <project>`, repeatable: hold the items filed under that project.
+- `--include-global`: also hold the items that belong to no project (the
+  general work rules).
+- `--whole`: back to the whole memory (a pull with none of these keeps the
+  selection the copy already has, which is how the automatic refresh repeats it).
+
+The selection is remembered in `thor-copy.json` beside the copy (`scopes`,
+`include_global`). Nothing selected means the whole memory, built exactly as
+before: the same hash chain as the main machine, continued event by event.
+
+A selective copy is built differently, on purpose, so that nothing excluded is
+ever on the laptop. The pull reads the backup's log once to learn which items
+are in the selection (an item is kept only if every project it was ever filed
+under is chosen; an unreadable one is left out), then writes the chosen events
+to a fresh store in their original order. The copy is therefore a filtered
+derivative with its own hash chain: new sequence numbers, new hashes, and the
+revision hashes an event cites are translated to the copy's own. `doctor`
+verifies it like any memory and says `selection:` and `last pull:` on its
+`copy:` line. Refusal records and "stood aside" records are not copied (they
+hold the command or path that was judged), and a served record loses its
+`trigger`. The personal library is a separate file and is never part of a copy.
+Because the chain differs from the source's, a selective copy cannot be
+continued: it is rebuilt when the source moves, on a staged file that replaces
+the old copy in one swap, and left untouched (byte for byte) when nothing the
+selection holds changed or when anything fails.
+
+Where the pull reads the backup from decides what stays on the laptop. A plain
+folder (a NAS share) is read in place. A repository address or a bare
+repository is cloned shallow into `thor.db.source` beside the copy and that
+folder is deleted when the pull ends; the commit it was built from is
+remembered, so an unchanged backup is not downloaded again. A git clone that
+already sits on the laptop is pulled as before, but it holds the whole memory
+on that disk, and `doctor` says so.
+
 Set it up on the laptop, in this order. Do steps 3 and 4 together and do not
 start Claude Code between them.
 
@@ -826,6 +872,10 @@ start Claude Code between them.
    ```bash
    sync pull --db "<the store path from step 3>" --repo "<the clone from step 2>"
    ```
+
+   Add `--scope <project>` (repeat it) and `--include-global` to hold only part
+   of the memory. `--repo` may also be a plain folder or a repository address,
+   in which case no clone (step 2) is needed.
 
    It prints `pull: the copy moved from seq 0 to ...`. It also writes
    `thor-copy.json` beside the store, which is what makes the hooks treat the

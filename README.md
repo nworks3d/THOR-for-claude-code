@@ -597,6 +597,198 @@ instead: it registers the working copy and changes nothing else.
 If you are the assistant doing the setup, [AGENTS.md](AGENTS.md) is the
 walkthrough for the steps above.
 
+## Use THOR on a second machine
+
+You can use the same memory on a second computer, for example a laptop, and
+choose how much of it that computer gets. The second computer gets a **read-only
+copy**: your assistant there is reminded of your rules, a rule can still refuse
+a wrong step, and search works, but nothing is ever written into the copy. Notes
+you want to keep are saved on your main computer and show up on the laptop the
+next time the copy is refreshed. The copy refreshes by itself.
+
+**You choose what the copy holds.** Name the projects the laptop needs, and say
+whether it also gets your general work rules (the notes that belong to no
+project). Every other project, and your personal library, is never copied: it
+is not hidden, it is not in the copy's file at all. That makes it fit for a
+company laptop. Choose nothing and you get the whole memory.
+
+What stays on the laptop is a filtered copy with its own chain of checks, so
+`doctor` can verify it like any memory. Two honest limits: a note you did copy
+may mention a project you did not copy by name (it is only words there, nothing
+breaks), and a note that was ever filed under a project you did not choose stays
+out entirely, even if it was later made general.
+
+### What you need first (on your main computer)
+
+The copy is made from your backup, so the laptop must be able to read it. This
+part is the one thing THOR cannot do for you.
+
+1. **Find your backup.** On the main computer, run THOR's health check (ask your
+   assistant "Is THOR working?"). Look for the line that starts with `backup:`.
+   It says where the last copy went, for example `backup: last copy went to
+   backup-repo (remote nas: //nas/backups/thor), 3h ago`. The place after
+   `remote nas:` is your backup's address. If there is no such line, you have not chosen a backup yet: tell your
+   assistant "set up a backup to" followed by a folder on your NAS or a private
+   repository address, then run the health check again.
+2. **Make sure the laptop can open that place.**
+   - A folder on a NAS: on the laptop, open File Explorer (Windows) or your file
+     manager (Linux), type the folder's path in the address bar and press Enter.
+     If it asks for a user name and password, enter them and tick "Remember my
+     credentials". If the folder opens and you can see a folder called `thor2`
+     in it (or the backup's own repository files), you are done.
+   - A private repository on a website: on the laptop, open a terminal and run
+     `git ls-remote "<the address>" HEAD`. If it prints a line starting with a
+     long code, you are done. If it asks you to sign in, sign in. If it says
+     "not found" or "access denied", the laptop's account has no access yet:
+     add it on the website (Settings, then Collaborators), or ask whoever
+     manages that repository.
+   - A laptop that belongs to a company: its network or its security software
+     may block the NAS or the website. If the check above fails, ask the
+     company's IT people to allow the laptop to read that one address. Tell
+     them it is read-only.
+3. **Keep git on the laptop** only when the backup is a repository address. A
+   plain folder on a share needs no git at all.
+
+### The one command
+
+Open a terminal **inside your project's folder** on the laptop (on Windows:
+open the folder in File Explorer, click the address bar, type `powershell` and
+press Enter). Then paste ONE of these, after replacing the three parts in
+capitals. `YOUR-PROJECT` is the project's name exactly as the main computer
+knows it (the name of its folder, unless you changed it).
+
+Windows, in PowerShell:
+
+```powershell
+$env:THOR_COPY_FROM = "THE-BACKUP-ADDRESS"; $env:THOR_COPY_SCOPES = "YOUR-PROJECT"; $env:THOR_COPY_GLOBAL = "1"; irm https://raw.githubusercontent.com/nworks3d/THOR-for-claude-code/main/install.ps1 | iex
+```
+
+Linux:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/nworks3d/THOR-for-claude-code/main/install.sh | THOR_COPY_FROM="THE-BACKUP-ADDRESS" THOR_COPY_SCOPES="YOUR-PROJECT" THOR_COPY_GLOBAL=1 sh
+```
+
+- `THE-BACKUP-ADDRESS` is the place from step 1 above, for example
+  `\\nas\backups\thor` or `/mnt/nas/thor`.
+- Several projects: separate them with commas, `"project-one,project-two"`.
+- Leave out `THOR_COPY_SCOPES` and you get the project of the folder you are in.
+- Leave out `THOR_COPY_GLOBAL` and the general work rules are not copied.
+- On Windows the three `$env:` values only live in this window. Close it when
+  you are done.
+
+THOR is already unpacked on this laptop (from an earlier install)? Then run the
+installer directly instead, with the same choices as options:
+
+```powershell
+& "$HOME\thor2\install.exe" --copy-from "THE-BACKUP-ADDRESS" --scope YOUR-PROJECT --include-global
+```
+
+```sh
+~/.thor2/install --copy-from "THE-BACKUP-ADDRESS" --scope YOUR-PROJECT --include-global
+```
+
+(Repeat `--scope` for more than one project. Add `--whole-memory` instead of
+the choices to copy everything.)
+
+It downloads THOR, checks the download, connects THOR to Claude Code, makes the
+copy, and tells you what you have. This is what you see at the end (your own
+folders and numbers will differ):
+
+```
+Setting THOR up as a read-only copy of another machine's memory.
+
+= you did not name a project, so this copy holds the project of the folder you ran this in: 'acme-shop' (add --scope <name> to choose another)
++ made the copy from the backup: 3 notes in it, 3 records written (15 ms)
+  what it holds: project acme-shop, general rules (no project)
+  project 'acme-shop': 2 notes
+  general work rules: 1 notes
+  every other project, and your personal library, were left out of the copy file on purpose
++ connected THOR to Claude Code (4 of 4 connections), so the memory speaks up by itself
++ the small file that keeps your assistant's replies tidy is in place
+
+What you have now
+  the copy:       C:\Users\you\AppData\Local\thor2\thor.db
+  refreshed:      by itself, in the background, at the start of a Claude Code session (at most once an hour)
+What is read-only here
+  - nothing in this copy can be changed from this machine: your assistant reads it, and rules still fire and still refuse
+  - notes are saved on the main machine, and show up here after the next refresh
+  - the weekly check runs on the main machine only
+
+Done. ONE THING LEFT FOR YOU: close Claude Code completely and open it again.
+Claude Code only learns about THOR when it starts, so until you do this nothing above is active.
+```
+
+(The first lines, "Downloading THOR", "Checksum matches." and "Unpacked into
+...", come from the download step.) The line `! the project 'x' has no notes in
+the backup` means the project name is spelled differently on the main computer:
+run the command again with the right name. It is safe to run the command again
+at any time; a second run changes nothing it does not have to.
+
+### If it stops
+
+The command either finishes or says plainly that nothing was set up and why:
+
+- `The copy could not be made, so nothing was set up. Reason: the backup at ...
+  could not be reached` - the laptop cannot read the backup. Go back to step 2
+  of "What you need first". Nothing was left behind; run the same command again
+  when it works.
+- `This machine already has a memory of its own ... and it is not a copy, so I
+  will not replace it` - THOR was installed here the normal way first and made
+  its own empty memory. If you never saved a note here, rename the file named
+  in the message (do not delete it) and run the command again. If it holds
+  notes you wrote, keep it, and ask for help before you continue.
+
+### After the command
+
+1. **Close Claude Code completely and open it again** (not just the
+   conversation). The first session start says: *"This machine runs a copy of
+   the memory ... It holds only: project acme-shop, general rules (no project).
+   Notes of other projects are not on this machine on purpose."*
+2. **Check it.** Ask your assistant "Is THOR working?", or run this yourself
+   (Windows: `& "$HOME\thor2\doctor.exe" --db "$env:LOCALAPPDATA\thor2\thor.db"`,
+   Linux: `~/.thor2/doctor --db ~/.local/share/thor2/thor.db`). The short summary
+   at the top says, among other lines: `OK: this is a copy, selection: project
+   acme-shop, general rules (no project), last pull: 5 minutes ago, 3 items`.
+   The notes of the projects you did not choose are not missing by mistake, and
+   the check never counts them as a problem. It warns you if the copy has not
+   been refreshed for three days.
+3. **Optional: tell the main computer where the project lives on the laptop**,
+   so rules that look at a file can be checked here. From inside the project's
+   folder run the installer with `--register-root --per-machine` and
+   `--db` naming the copy. It writes nothing on the laptop and prints one line;
+   run that line on the main computer.
+
+### Change what the copy holds, or refresh it by hand
+
+```powershell
+& "$HOME\thor2\sync.exe" pull --db "$env:LOCALAPPDATA\thor2\thor.db" --scope project-one --scope project-two --include-global
+```
+
+```sh
+~/.thor2/sync pull --db ~/.local/share/thor2/thor.db --scope project-one --scope project-two --include-global
+```
+
+The choice is remembered, so a later `sync pull --db ...` with no options
+repeats it (this is what the automatic refresh does). A narrower choice removes
+what it no longer covers from the copy at the next pull. `--whole` goes back to
+the whole memory. A refresh builds a new copy next to the old one and swaps it
+in only when it is complete and checks out; if anything goes wrong (no network,
+the NAS is off) the old copy keeps working and the next session start says so
+in one line.
+
+One thing to know about a company laptop: if you point the command at a
+repository folder that already sits on the laptop (a "clone"), that folder holds
+the **complete** memory, and the health check says so. Give it the backup's
+address instead, or a plain folder on the NAS; then the whole memory is only
+read in passing and nothing of it stays on the laptop.
+
+Not covered here: saving notes from the laptop (they are saved on the main
+computer; the longer setup in [thor2/README.md](thor2/README.md), "Second
+machine (laptop)", queues them for you, but that route works on the whole
+memory), and searching by meaning. Also not yet done: a run on a real second
+computer. The steps above are covered by tests and by a full run on one machine.
+
 ## Using it from another assistant
 
 The automated setup above is for Claude Code specifically. Any other assistant

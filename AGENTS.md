@@ -9,6 +9,10 @@ anything in between.
 you are doing in ordinary words. Never hand back a menu of options, and never
 send them off to type a command or a path: you have the tools, so run it.
 
+**Is this a second computer?** If the person already uses THOR on another
+computer and wants this one to get a read-only copy of that memory (or part of
+it), do not use the steps below: go to "A second machine" further down.
+
 ## The whole install, in five steps
 
 1. **Get the machine ready and install it, from inside their project folder.**
@@ -310,6 +314,56 @@ remember(
 
 Then touch that host in the same conversation: the note comes back right before the
 call. If a restart never happened, the tool is simply missing - that is step 3 again.
+
+## A second machine (a laptop that gets a read-only copy)
+
+Use this INSTEAD of the five steps when the person says this computer is a
+second machine and they already have THOR on another one. A normal install here
+would make a memory of its own, which is not what they want. Ask only two
+things, in ordinary words: where their backup is (a folder on the NAS, a
+repository address; the main machine's `doctor` shows it on its `backup:` line)
+and which project or projects this computer needs. Say plainly that the other
+projects and their personal library will not be on this computer at all.
+
+Check that this computer can read the backup before you run anything: for an
+address run `git ls-remote "<address>" HEAD` (it must print a line starting
+with a long code), for a folder list it. If it cannot, tell the person in one
+sentence what is missing (a sign-in, access on the website, the company's IT
+allowing that one address) and stop; do not work around it.
+
+Then run ONE command from inside the project's folder (the installer reads the
+three values from the environment, or take the options on the second line of
+each pair when THOR is already unpacked):
+
+- Windows, in PowerShell:
+  `$env:THOR_COPY_FROM = "<backup>"; $env:THOR_COPY_SCOPES = "<project>"; $env:THOR_COPY_GLOBAL = "1"; irm https://raw.githubusercontent.com/nworks3d/THOR-for-claude-code/main/install.ps1 | iex`
+  or `& "$HOME\thor2\install.exe" --copy-from "<backup>" --scope <project> --include-global`
+- Linux:
+  `curl -fsSL https://raw.githubusercontent.com/nworks3d/THOR-for-claude-code/main/install.sh | THOR_COPY_FROM="<backup>" THOR_COPY_SCOPES="<project>" THOR_COPY_GLOBAL=1 sh`
+  or `~/.thor2/install --copy-from "<backup>" --scope <project> --include-global`
+
+It builds the copy from the backup, writes the marker that makes every hook
+read-only, connects the four hooks, and prints what the person has and what is
+read-only. It deliberately does not register the note-saving tool or the
+machine-wide git hooks. A scope that matches no note is called out with a line
+starting `!`: ask for the right spelling and run it again. A second run is
+safe. If it says the machine "already has a memory of its own", do not delete
+anything: tell the person what the message says.
+
+Then ask for the same one restart as in step 3, and after it run `doctor`: its
+short summary must say `OK: this is a copy, selection: ...`. Later, to change
+what the copy holds, run `sync pull --db "<the copy>" --scope <project>
+--include-global` (a narrower choice removes what it no longer covers), and
+`--whole` for the whole memory. The README section "Use THOR on a second
+machine" is the person-facing version of this; read it for the exact messages.
+
+What a copy holds: only the items filed under the chosen projects, plus the
+items that belong to no project when `--include-global` is given. An item that
+was ever filed under an unchosen project stays out, and so does anything the
+assistant could not read as a note. Refusal records are not copied, and the
+"where it fired" text of served records is removed, so no text from other
+sessions arrives. The copy is a derivative with a hash chain of its own, so
+`doctor` verifies it like any memory.
 
 ## Backup
 

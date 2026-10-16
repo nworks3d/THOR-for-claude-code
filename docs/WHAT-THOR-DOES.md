@@ -214,6 +214,30 @@ Words used once, in plain language:
 - You notice: one sentence from the assistant. It is the one thing the install cannot do for them.
 - Refuse or change: no. Until you restart, THOR is inert.
 
+### A18. Optional: a read-only copy on a second machine, of everything or of a selection you choose
+- What: only when you ask for it, with install --copy-from <your backup> (or the same values in the
+  environment variables THOR_COPY_FROM, THOR_COPY_SCOPES, THOR_COPY_GLOBAL that the one-line download
+  passes on). Instead of making a memory of its own, the install builds a read-only copy from your
+  backup, writes a small marker file (thor-copy.json) beside it that makes every hook read-only, connects
+  the four hooks and the reply-tidying file, and registers nothing that could write: no note-saving tool,
+  no machine-wide git hooks, no /thor-eval. You can name the projects the copy holds (--scope, repeatable)
+  and whether it holds the general rules (--include-global); with neither you get the project of the folder
+  you ran it in, and --whole-memory copies everything. The items of every other project, the personal
+  library, refusal records and the "where it fired" text of served records are not in the copy file at all.
+  A selective copy has a hash chain of its own, so doctor can verify it. The choice is remembered in the
+  marker and repeated by every later refresh (sync pull). The refresh runs by itself at session start, at
+  most once an hour, builds a new copy beside the old one and swaps it in only when it is complete.
+- Why: a laptop, possibly a company's, should get the part of the memory it needs and nothing else, with
+  no way for its hooks to fork the one log.
+- You notice: a long summary at the end of the install, "This machine runs a copy of the memory ... It holds
+  only: ..." at each session start, and a "copy:" line in doctor with the selection, the age of the last pull
+  and the number of items. Doctor warns when the last successful pull is older than three days, when the
+  last refresh failed, when a changed selection is not applied yet, and when the backup source is a git
+  clone on the same machine (it holds the complete memory).
+- Refuse or change: do not use the flag. To go back to the whole memory: sync pull --whole. To stop being
+  a copy, delete the folder of the copy and follow "Remove THOR completely" in the README. An existing
+  memory that is not a copy is never replaced.
+
 ---
 
 ## B. What THOR requires or enforces when notes are written
