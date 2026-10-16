@@ -297,7 +297,7 @@ mod tests {
         let created = event(1, "fact_created", "a", &item_body("a", Some("alpha")));
         let refused = event(2, "gate_refused", "a", r#"{"target":"CANARY command"}"#);
         let served = event(3, "item_served", "a", r#"{"served_at":"2026-01-01T00:00:00Z","trigger":"CANARY command"}"#);
-        let c = classes(&[created.clone()]);
+        let c = classes(std::slice::from_ref(&created));
         let mut w = Rewriter::new(c.keep(&pick(&["alpha"], false)));
         w.rewrite(&created).unwrap();
         assert!(w.rewrite(&refused).unwrap().is_none());

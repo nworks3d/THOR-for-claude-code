@@ -207,6 +207,90 @@ struct Cli {
         conflicts_with_all = ["project", "settings", "mcp_json", "no_mcp", "serve_exe", "mcp_exe", "code_index_root", "register_root", "set_mode", "set_plan", "set_weekly_check", "set_backup", "set_recording", "topic"]
     )]
     set_helpers: Option<String>,
+
+    /// SECOND MACHINE: set THOR up as a read-only COPY of another machine's
+    /// memory, built from that machine's backup, in this one command. Give the
+    /// backup as a folder (a share on a NAS), a bare repository or a git
+    /// address. Connects the hooks, makes the copy, writes no tool server (a
+    /// note written on a copy would fork the memory). The same value can be
+    /// given as the environment variable THOR_COPY_FROM, which is how the
+    /// one-line download command passes it on.
+    #[arg(
+        long = "copy-from",
+        value_name = "BACKUP",
+        conflicts_with_all = ["project", "mcp_json", "no_mcp", "mcp_exe", "register_root", "register_machine_root", "topic", "set_mode", "set_plan", "set_weekly_check", "set_backup", "set_recording", "set_helpers"]
+    )]
+    copy_from: Option<String>,
+
+    /// With --copy-from: hold only this project (repeat the flag, or give
+    /// THOR_COPY_SCOPES with commas). Without any, the project of the folder
+    /// you run this in. Everything else stays out of the copy file.
+    #[arg(long = "scope", value_name = "PROJECT")]
+    scopes: Vec<String>,
+
+    /// With --copy-from: also hold the general work rules (the items that
+    /// belong to no project). Also read from THOR_COPY_GLOBAL=1.
+    #[arg(long = "include-global")]
+    include_global: bool,
+
+    /// With --copy-from: hold the whole memory, not a selection.
+    #[arg(long = "whole-memory")]
+    whole_memory: bool,
+}
+
+/// A value from the environment, ignoring an empty one.
+fn env_value(name: &str) -> Option<String> {
+    std::env::var(name).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+}
+
+/// `install --copy-from <backup>`: the whole second-machine setup.
+fn copy_install(cli: &Cli, source: String) -> ExitCode {
+    let scopes: Vec<String> = if cli.scopes.is_empty() {
+        env_value("THOR_COPY_SCOPES").map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()).unwrap_or_default()
+    } else {
+        cli.scopes.clone()
+    };
+    let include_global =
+        cli.include_global || env_value("THOR_COPY_GLOBAL").is_some_and(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"));
+    let Some(serve_exe) = cli.serve_exe.clone().or_else(|| sibling("serve")) else {
+        eprintln!("could not work out where `serve` is - name it with --serve-exe");
+        return ExitCode::FAILURE;
+    };
+    let Some(db) = cli.db.clone().or_else(|| default_data_dir().map(|d| d.join("thor.db"))) else {
+        eprintln!("could not work out where to keep the copy - name it with --db");
+        return ExitCode::FAILURE;
+    };
+    let Some(settings) = cli.settings.clone().or_else(default_settings_path) else {
+        eprintln!("could not find your home directory to place settings.json - name it with --settings");
+        return ExitCode::FAILURE;
+    };
+    // A program that is there but cannot start would make every hook fail open.
+    if serve_exe.exists() {
+        if let Some(problem) = ops::install::launch_problem(&serve_exe) {
+            eprintln!("NOTHING WAS SET UP - refusing to write hooks that call a program that does not start. {problem}");
+            return ExitCode::FAILURE;
+        }
+    }
+    let request = ops::copy_setup::Request {
+        db,
+        source,
+        scopes,
+        include_global,
+        whole: cli.whole_memory,
+        folder: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        settings,
+        serve_exe,
+    };
+    match ops::copy_setup::run(&request) {
+        Ok(lines) => {
+            lines.iter().for_each(|line| println!("{line}"));
+            ExitCode::SUCCESS
+        }
+        Err(message) => {
+            eprintln!("{message}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// `install --set-helpers on|off`: store or retract the two helper-mode notes
@@ -755,6 +839,16 @@ fn main() -> ExitCode {
     }
     if let Some(word) = cli.set_backup.as_deref() {
         return set_backup_only(cli.db, cli.settings.clone(), word);
+    }
+
+    // SECOND MACHINE: a read-only copy, not a memory of its own. The value may
+    // come from the environment, which is how the one-line download passes it on.
+    if let Some(source) = cli.copy_from.clone().or_else(|| env_value("THOR_COPY_FROM")) {
+        return copy_install(&cli, source);
+    }
+    if !cli.scopes.is_empty() || cli.include_global || cli.whole_memory {
+        eprintln!("--scope, --include-global and --whole-memory only work together with --copy-from <the backup>. Nothing was changed.");
+        return ExitCode::FAILURE;
     }
 
     let data_dir = default_data_dir();

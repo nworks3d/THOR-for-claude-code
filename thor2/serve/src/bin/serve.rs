@@ -6243,6 +6243,29 @@ mod copy_mode_tests {
         assert!(!thor_core::copy_mode::telemetry_path(&f.db).exists());
     }
 
+    /// A SELECTIVE copy (its marker names a selection; its store holds only that
+    /// part of the memory) is read-only in exactly the same way, and the session
+    /// start says what it holds.
+    #[test]
+    fn a_selective_copy_never_appends_either_and_says_what_it_holds() {
+        let f = fixture(true);
+        let mut marker = thor_core::copy_mode::read_marker(&f.db);
+        marker.set_selection(&thor_core::copy_mode::Selection { scopes: vec!["alpha".to_string()], include_global: true });
+        marker.built_selection = marker.selection().canonical();
+        thor_core::copy_mode::write_marker(&f.db, &marker).unwrap();
+        let before = snapshot(&f.db);
+
+        let (block, refused) = run_session(&f);
+
+        let after = snapshot(&f.db);
+        assert_eq!(before.0, after.0, "the event count must not change");
+        assert_eq!(before.1, after.1, "the chain tip must not change");
+        assert!(before.2 == after.2, "the store file must be byte-identical");
+        assert!(refused, "a rule still refuses a forbidden call on a selective copy");
+        assert!(block.contains("holds only: project alpha, general rules (no project)"), "{block}");
+        assert!(thor_core::copy_mode::read_marker(&f.db).selection().is_active(), "the hooks do not touch the marker");
+    }
+
     /// A copy asks for no evaluation and holds no stop for a debt only a log
     /// write can settle.
     #[test]

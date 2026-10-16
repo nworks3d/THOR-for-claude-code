@@ -119,7 +119,10 @@ fn git(repo: &Path, args: &[&str]) -> Result<String> {
                 if let Some(mut err) = child.stderr.take() {
                     let _ = err.read_to_string(&mut why);
                 }
-                let why = why.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("no reason given").trim().to_string();
+                // The first "fatal:" line says what went wrong; the lines after it are advice.
+                let first_fatal = why.lines().find_map(|l| l.trim().strip_prefix("fatal:").map(|r| r.trim().to_string()));
+                let why = first_fatal
+                    .unwrap_or_else(|| why.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("no reason given").trim().to_string());
                 bail!("git {} failed: {why}", args.first().copied().unwrap_or(""));
             }
             None if started.elapsed() > GIT_TIMEOUT => {
@@ -185,20 +188,14 @@ fn pull_inner(db: &Path, repo: &Path, subdir: &str, opts: &PullOptions, marker: 
 fn pull_whole(db: &Path, repo: &Path, subdir: &str, opts: &PullOptions, marker: &mut Marker) -> Result<PullOutcome> {
     // A copy that was selective has a chain of its own: it cannot be continued.
     let rebuild = opts.rebuild || !marker.built_selection.is_empty();
-    if !opts.no_fetch {
-        match opts.remote.clone().or_else(|| marker.remote.clone()) {
-            Some(remote) => {
-                let branch = git(repo, &["rev-parse", "--abbrev-ref", "HEAD"])?;
-                git(repo, &["pull", "--ff-only", "--quiet", &remote, &branch])?;
-            }
-            None => {
-                git(repo, &["pull", "--ff-only", "--quiet"])?;
-            }
-        }
-    }
-    let segments = segment_files(&repo.join(subdir)).with_context(|| format!("no backup segments in {}", repo.join(subdir).display()))?;
+    let whole = Selection::default();
+    let Some(source) = open_source(db, repo, subdir, opts, marker, &whole)? else {
+        return Ok(PullOutcome::UpToDate { tip: if db.is_file() { copy_tip(db)?.0 } else { 0 } });
+    };
+    let dir = source.root.join(subdir);
+    let segments = segment_files(&dir).with_context(|| format!("no backup segments in {}", dir.display()))?;
     if segments.is_empty() {
-        bail!("no events-NNNN.jsonl in {}", repo.join(subdir).display());
+        bail!("no events-NNNN.jsonl in {}", dir.display());
     }
     let (tip, tip_hash) = if rebuild { (0, String::new()) } else { copy_tip(db)? };
     let source_event = last_event_of(segments.last().expect("checked non-empty"))?;
@@ -206,6 +203,7 @@ fn pull_whole(db: &Path, repo: &Path, subdir: &str, opts: &PullOptions, marker: 
     if source_last <= tip && !rebuild {
         marker.source_seq = source_last;
         marker.source_hash = source_event.this_hash;
+        marker.source_commit = source.commit.clone();
         return Ok(PullOutcome::UpToDate { tip });
     }
 
@@ -224,6 +222,7 @@ fn pull_whole(db: &Path, repo: &Path, subdir: &str, opts: &PullOptions, marker: 
         marker.built_selection.clear();
         marker.source_seq = source_last;
         marker.source_hash = source_event.this_hash;
+        marker.source_commit = source.commit.clone();
     }
     result
 }
@@ -301,7 +300,8 @@ fn open_source(db: &Path, repo: &Path, subdir: &str, opts: &PullOptions, marker:
     let address = repo.display().to_string();
     let home = std::path::absolute(db).unwrap_or_else(|_| db.to_path_buf());
     let home = home.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
-    let remote_head = git(&home, &["ls-remote", &address, "HEAD"])?;
+    let remote_head =
+        git(&home, &["ls-remote", &address, "HEAD"]).with_context(|| format!("the backup at {address} could not be reached"))?;
     let commit = remote_head.split_whitespace().next().unwrap_or_default().to_string();
     if !commit.is_empty()
         && !opts.rebuild
@@ -1118,6 +1118,36 @@ mod tests {
         pull(&w.copy, &PullOptions { repo: Some(bare), ..Default::default() }).unwrap();
         assert!(ids_in(&w.copy).contains(&"alpha-five".to_string()));
         assert!(!side(&w.copy, ".source").exists());
+    }
+
+    /// The whole-memory copy can also be fed from a plain folder (a share on a
+    /// NAS) or a bare repository, without keeping a clone of its own.
+    #[test]
+    fn a_whole_copy_reads_a_plain_folder_and_a_bare_repository_without_a_clone() {
+        let mut w = mixed_world();
+        let from_folder = PullOptions { repo: Some(w.repo.clone()), ..Default::default() };
+        pull(&w.copy, &from_folder).unwrap();
+        assert_eq!(tip_of(&w.copy), w.main.contiguous_tip().unwrap(), "a folder with no git in it is read as it is");
+
+        if !run_git(&w.repo, &["init", "-q", "-b", "main"]) {
+            return;
+        }
+        assert!(run_git(&w.repo, &["add", "-A"]) && run_git(&w.repo, &["commit", "-q", "-m", "backup one"]));
+        let bare = w._dir.path().join("backup.git");
+        assert!(Command::new("git").arg("clone").arg("-q").arg("--bare").arg(&w.repo).arg(&bare).status().unwrap().success());
+        let other = w._dir.path().join("laptop").join("second.db");
+        let from_bare = PullOptions { repo: Some(bare.clone()), ..Default::default() };
+        pull(&other, &from_bare).unwrap();
+        assert_eq!(tip_of(&other), w.main.contiguous_tip().unwrap());
+        assert!(!side(&other, ".source").exists());
+
+        model::store::declare(&mut w.main, "s", "s", "s", &scoped("late", None, "a late general rule about release notes")).unwrap();
+        export_segments(&w.main, &w.repo.join("thor2"), 2_000).unwrap();
+        assert!(run_git(&w.repo, &["add", "-A"]) && run_git(&w.repo, &["commit", "-q", "-m", "backup two"]));
+        assert!(run_git(&w.repo, &["push", "-q", &bare.display().to_string(), "main"]));
+        let outcome = pull(&other, &from_bare).unwrap();
+        assert!(matches!(outcome, PullOutcome::Updated { applied: 1, .. }), "only the new event is applied: {outcome:?}");
+        assert_eq!(tip_of(&other), w.main.contiguous_tip().unwrap());
     }
 
     #[test]

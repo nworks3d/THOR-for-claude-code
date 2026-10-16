@@ -207,8 +207,12 @@ pub fn pull_due(marker: &Marker, now: i64) -> bool {
 /// when the last pull failed, that the old copy is still in use.
 pub fn session_line(marker: &Marker) -> String {
     let mut line = String::from(
-        "This machine runs a copy of the memory; the weekly check runs on the main machine. Changes you make here are queued for it and show up here after the next pull.",
+        "This machine runs a copy of the memory; the weekly check runs on the main machine. Nothing is written into this copy: a note is saved on the main machine (or queued for it, when this machine is connected to the replica) and shows up here after the next pull.",
     );
+    let selection = marker.selection();
+    if selection.is_active() {
+        line.push_str(&format!(" It holds only: {}. Notes of other projects are not on this machine on purpose.", selection.describe()));
+    }
     if !marker.last_error.is_empty() {
         line.push_str(&format!(" The last refresh of the copy failed ({}), so the older copy is still in use.", marker.last_error));
     }
@@ -311,6 +315,15 @@ mod tests {
         // An older marker without the fields reads as "no selection".
         std::fs::write(marker_path(&db), r#"{"repo":"x"}"#).unwrap();
         assert!(!read_marker(&db).selection().is_active());
+    }
+
+    #[test]
+    fn the_session_line_names_a_selection_only_when_there_is_one() {
+        let mut m = Marker::default();
+        assert!(!session_line(&m).contains("holds only"));
+        m.set_selection(&Selection { scopes: vec!["alpha".into()], include_global: true });
+        let line = session_line(&m);
+        assert!(line.contains("holds only: project alpha, general rules (no project)"), "{line}");
     }
 
     #[test]

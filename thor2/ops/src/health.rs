@@ -94,8 +94,17 @@ pub fn plain_summary(db: &Path, cwd: &Path, settings: Option<&Path>, mcp_json: O
         )),
     }
 
+    // A copy of another machine's memory: say what it is, and that it has no
+    // writer on purpose (a missing note-saving tool is then not a problem).
+    let copy_summary = crate::copy_health::summary_line(db, serve::time::now_unix());
+    if let Some(summary) = &copy_summary {
+        lines.push(format!("  OK: {summary}. It is read-only on purpose: notes are saved on the main machine."));
+    }
     match mcp_json.map(|m| tool_server_names_this_memory(m, db)) {
         Some(true) => lines.push("  OK: your assistant can save notes.".to_string()),
+        _ if copy_summary.is_some() => {
+            lines.push("  NOTE: your assistant reads this copy but does not save notes into it. Notes are saved on the main machine.".to_string())
+        }
         _ => lines.push(format!(
             "  PROBLEM: your assistant can read the memory but cannot save notes. Next step: {ask}."
         )),
@@ -108,6 +117,11 @@ pub fn plain_summary(db: &Path, cwd: &Path, settings: Option<&Path>, mcp_json: O
                 .is_some_and(|store| serve::project::registered_checkout(&store, Some(&key)).is_ok());
             if usable {
                 lines.push(format!("  OK: this folder has its own memory, under the name '{key}'."));
+            } else if copy_summary.is_some() {
+                // A copy cannot record where this machine keeps the project (it has one writer).
+                lines.push(format!(
+                    "  NOTE: this folder is called '{key}'. Notes about the project are in this copy, but the main machine does not know yet where this machine keeps the folder, so file checks (rules that look at a file) cannot be tried here. Optional next step: open a terminal inside the folder and run THOR's install with --register-root --per-machine added; it prints one line to run on the main machine."
+                ));
             } else {
                 lines.push(format!(
                     "  NOTE: this folder is called '{key}' but is not set up yet. Next step: open a terminal inside it and run THOR's install with --topic added."
@@ -3819,6 +3833,8 @@ pub fn report(
     let wal_size = wal_raw_size(db);
 
     let mut lines = vec![store_line(db)];
+    // Silent unless this store is a read-only copy of another machine's memory.
+    lines.extend(crate::copy_health::lines(db, serve::time::now_unix()));
     // Silent unless the WAL has actually outgrown its own store - see
     // `wal_line_from_size`'s own doc comment for why that is the right
     // default rather than a "wal: fine" line on every ordinary run.
