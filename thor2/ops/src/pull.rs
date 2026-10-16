@@ -19,6 +19,17 @@
 //!   pull cannot be pointed at a main store by mistake.
 //! - Every failure is recorded in the marker (`last_error`) and leaves the old
 //!   copy in use: fail open, one line.
+//!
+//! SELECTIVE COPY. When the marker holds a selection (`scopes`,
+//! `include_global`), the copy is not the whole log but a filtered derivative
+//! with its own hash chain (see `copy_filter`): the events of every other
+//! project, the personal library and the session text in refusals never reach
+//! the copy file. Such a copy is built again from the source whenever the
+//! source moves (its chain differs from the source's, so it cannot be
+//! continued), always on a staged file that replaces the old copy in one
+//! swap. The source is read in place (a plain folder) or, when it is an
+//! address or a bare repository, cloned into a scratch folder that is deleted
+//! when the pull ends, so no copy of the whole memory stays on this machine.
 
 use anyhow::{bail, Context, Result};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
@@ -26,7 +37,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 use thor_core::backup::segment_files;
-use thor_core::copy_mode::{self, Marker};
+use thor_core::copy_mode::{self, Marker, Selection};
 use thor_core::event_store::{EventStore, IngestOutcome, ShippedEvent};
 
 /// Events applied per atomic batch.
@@ -49,6 +60,12 @@ pub struct PullOptions {
     pub no_fetch: bool,
     /// Rebuild the copy from the first event instead of continuing it.
     pub rebuild: bool,
+    /// SELECTIVE COPY: the project scopes to hold. Replaces the remembered selection.
+    pub scopes: Vec<String>,
+    /// SELECTIVE COPY: also hold the items that belong to no project.
+    pub include_global: bool,
+    /// Hold the whole memory again (clears the remembered selection).
+    pub whole: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -117,6 +134,11 @@ fn git(repo: &Path, args: &[&str]) -> Result<String> {
 
 /// The seq on the last line of a segment, read from its tail.
 fn last_seq_of(path: &Path) -> Result<i64> {
+    Ok(last_event_of(path)?.seq)
+}
+
+/// The last event of a segment, read from its tail.
+fn last_event_of(path: &Path) -> Result<ShippedEvent> {
     let mut file = std::fs::File::open(path)?;
     let len = file.metadata()?.len();
     let mut window: u64 = 64 * 1024;
@@ -131,7 +153,7 @@ fn last_seq_of(path: &Path) -> Result<i64> {
         // last line when it is the whole file or a later line.
         if let Some(last) = lines.next_back() {
             if let Ok(e) = serde_json::from_str::<ShippedEvent>(last) {
-                return Ok(e.seq);
+                return Ok(e);
             }
         }
         if start == 0 {
@@ -150,8 +172,19 @@ fn copy_tip(db: &Path) -> Result<(i64, String)> {
     Ok(store.contiguous_tip()?)
 }
 
-/// Pull once. Does not touch the marker; `pull` does that around it.
-fn pull_inner(db: &Path, repo: &Path, subdir: &str, opts: &PullOptions, marker: &Marker) -> Result<PullOutcome> {
+/// Pull once. Does not write the marker file; `pull` does that around it. On
+/// success it records in `marker` what the copy was built from.
+fn pull_inner(db: &Path, repo: &Path, subdir: &str, opts: &PullOptions, marker: &mut Marker, selection: &Selection) -> Result<PullOutcome> {
+    if selection.is_active() {
+        return pull_selective(db, repo, subdir, opts, marker, selection);
+    }
+    pull_whole(db, repo, subdir, opts, marker)
+}
+
+/// The whole-memory copy: continue the copy's chain with what the source added.
+fn pull_whole(db: &Path, repo: &Path, subdir: &str, opts: &PullOptions, marker: &mut Marker) -> Result<PullOutcome> {
+    // A copy that was selective has a chain of its own: it cannot be continued.
+    let rebuild = opts.rebuild || !marker.built_selection.is_empty();
     if !opts.no_fetch {
         match opts.remote.clone().or_else(|| marker.remote.clone()) {
             Some(remote) => {
@@ -167,9 +200,12 @@ fn pull_inner(db: &Path, repo: &Path, subdir: &str, opts: &PullOptions, marker: 
     if segments.is_empty() {
         bail!("no events-NNNN.jsonl in {}", repo.join(subdir).display());
     }
-    let (tip, tip_hash) = if opts.rebuild { (0, String::new()) } else { copy_tip(db)? };
-    let source_last = last_seq_of(segments.last().expect("checked non-empty"))?;
-    if source_last <= tip && !opts.rebuild {
+    let (tip, tip_hash) = if rebuild { (0, String::new()) } else { copy_tip(db)? };
+    let source_event = last_event_of(segments.last().expect("checked non-empty"))?;
+    let source_last = source_event.seq;
+    if source_last <= tip && !rebuild {
+        marker.source_seq = source_last;
+        marker.source_hash = source_event.this_hash;
         return Ok(PullOutcome::UpToDate { tip });
     }
 
@@ -182,9 +218,238 @@ fn pull_inner(db: &Path, repo: &Path, subdir: &str, opts: &PullOptions, marker: 
         }
     }
     remove_store_files(&staged);
-    let result = stage_and_swap(db, &staged, &segments, tip, &tip_hash, opts.rebuild);
+    let result = stage_and_swap(db, &staged, &segments, tip, &tip_hash, rebuild);
     remove_store_files(&staged);
+    if result.is_ok() {
+        marker.built_selection.clear();
+        marker.source_seq = source_last;
+        marker.source_hash = source_event.this_hash;
+    }
     result
+}
+
+/// What a pull reads the source from.
+struct Source {
+    /// The folder that holds `<subdir>`.
+    root: PathBuf,
+    /// The backup's commit when it was fetched from an address.
+    commit: String,
+    /// A scratch clone to delete when the pull ends.
+    scratch: Option<PathBuf>,
+}
+
+impl Drop for Source {
+    fn drop(&mut self) {
+        if let Some(scratch) = &self.scratch {
+            remove_tree(scratch);
+        }
+    }
+}
+
+/// Delete a folder tree, including the read-only files git leaves in it.
+#[allow(clippy::permissions_set_readonly_false)]
+fn remove_tree(path: &Path) {
+    fn writable(path: &Path) {
+        let Ok(entries) = std::fs::read_dir(path) else { return };
+        for entry in entries.flatten() {
+            let child = entry.path();
+            if let Ok(meta) = entry.metadata() {
+                let mut permissions = meta.permissions();
+                permissions.set_readonly(false);
+                let _ = std::fs::set_permissions(&child, permissions);
+            }
+            if child.is_dir() {
+                writable(&child);
+            }
+        }
+    }
+    if std::fs::remove_dir_all(path).is_ok() {
+        return;
+    }
+    writable(path);
+    let _ = std::fs::remove_dir_all(path);
+}
+
+/// The scratch folder a pull clones an address into, beside the copy.
+fn scratch_path(db: &Path) -> PathBuf {
+    side(db, ".source")
+}
+
+/// Find the source of a SELECTIVE pull. A git clone is pulled (as for a whole
+/// copy); a plain folder is read as it is; anything else (an address, a bare
+/// repository) is cloned shallow into a scratch folder, unless its commit is
+/// the one the copy was built from already (`Ok(None)`).
+fn open_source(db: &Path, repo: &Path, subdir: &str, opts: &PullOptions, marker: &Marker, selection: &Selection) -> Result<Option<Source>> {
+    let is_clone = repo.join(".git").exists();
+    if is_clone || repo.join(subdir).is_dir() {
+        if is_clone && !opts.no_fetch {
+            match opts.remote.clone().or_else(|| marker.remote.clone()) {
+                Some(remote) => {
+                    let branch = git(repo, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+                    git(repo, &["pull", "--ff-only", "--quiet", &remote, &branch])?;
+                }
+                None => {
+                    git(repo, &["pull", "--ff-only", "--quiet"])?;
+                }
+            }
+        }
+        return Ok(Some(Source { root: repo.to_path_buf(), commit: String::new(), scratch: None }));
+    }
+    if opts.no_fetch {
+        bail!("{} is not a folder with backup segments, and git is not allowed to fetch it", repo.display());
+    }
+    let address = repo.display().to_string();
+    let home = std::path::absolute(db).unwrap_or_else(|_| db.to_path_buf());
+    let home = home.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
+    let remote_head = git(&home, &["ls-remote", &address, "HEAD"])?;
+    let commit = remote_head.split_whitespace().next().unwrap_or_default().to_string();
+    if !commit.is_empty()
+        && !opts.rebuild
+        && db.is_file()
+        && marker.source_commit == commit
+        && marker.built_selection == selection.canonical()
+    {
+        return Ok(None);
+    }
+    let scratch = scratch_path(&home.join(db.file_name().unwrap_or_default()));
+    remove_tree(&scratch);
+    // From here on the guard deletes the scratch folder, however the pull ends.
+    let source = Source { root: scratch.clone(), commit, scratch: Some(scratch.clone()) };
+    git(&home, &["clone", "--quiet", "--depth", "1", &address, &scratch.display().to_string()])?;
+    Ok(Some(source))
+}
+
+/// Feed every source event, in order, to `visit`, checking as it goes that the
+/// source is the one unbroken hash chain it claims to be.
+fn for_each_event(segments: &[PathBuf], mut visit: impl FnMut(&ShippedEvent) -> Result<()>) -> Result<()> {
+    let mut expected = 1i64;
+    let mut prev_hash = String::new();
+    for file in segments {
+        let reader = BufReader::new(std::fs::File::open(file).with_context(|| format!("cannot read {}", file.display()))?);
+        for line in reader.lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let event: ShippedEvent = serde_json::from_str(&line).with_context(|| format!("unreadable line in {}", file.display()))?;
+            if event.seq != expected {
+                bail!("the source does not run in order: expected seq {expected}, found {}", event.seq);
+            }
+            let kind = thor_core::event_store::EventKind::from_str(&event.kind)
+                .with_context(|| format!("unknown event kind '{}' at seq {} (this program is older than the source)", event.kind, event.seq))?;
+            let canonical = thor_core::event_store::canonical_repr_parts(
+                kind,
+                &event.entity_id,
+                event.parent_rev.as_deref().filter(|p| !p.is_empty()),
+                &thor_core::event_store::canonicalize_body(&event.body),
+            );
+            let hash = thor_core::event_store::hash_event(&prev_hash, &canonical);
+            if hash != event.this_hash {
+                bail!("the source does not verify at seq {}: its recorded hash does not match its content", event.seq);
+            }
+            prev_hash = hash;
+            expected += 1;
+            visit(&event)?;
+        }
+    }
+    Ok(())
+}
+
+/// The selective copy: rebuilt from the source whenever the source (or the
+/// selection) changed, on a staged file, swapped in at the end.
+fn pull_selective(db: &Path, repo: &Path, subdir: &str, opts: &PullOptions, marker: &mut Marker, selection: &Selection) -> Result<PullOutcome> {
+    let Some(source) = open_source(db, repo, subdir, opts, marker, selection)? else {
+        // The backup's commit is the one the copy was built from.
+        return Ok(PullOutcome::UpToDate { tip: if db.is_file() { copy_tip(db)?.0 } else { 0 } });
+    };
+    let dir = source.root.join(subdir);
+    let segments = segment_files(&dir).with_context(|| format!("no backup segments in {}", dir.display()))?;
+    if segments.is_empty() {
+        bail!("no events-NNNN.jsonl in {}", dir.display());
+    }
+    let source_event = last_event_of(segments.last().expect("checked non-empty"))?;
+    let wanted = selection.canonical();
+    let old_tip = if db.is_file() { copy_tip(db)?.0 } else { 0 };
+    let unchanged = db.is_file()
+        && !opts.rebuild
+        && marker.built_selection == wanted
+        && marker.source_seq == source_event.seq
+        && marker.source_hash == source_event.this_hash;
+    if unchanged {
+        marker.source_commit = source.commit.clone();
+        return Ok(PullOutcome::UpToDate { tip: old_tip });
+    }
+
+    let staged = side(db, ".pulling");
+    if let Ok(meta) = std::fs::metadata(&staged) {
+        let age = meta.modified().ok().and_then(|m| m.elapsed().ok()).map(|d| d.as_secs()).unwrap_or(u64::MAX);
+        if age < STAGE_FRESH_SECS {
+            bail!("another pull is still running (a staged copy is {age} seconds old)");
+        }
+    }
+    remove_store_files(&staged);
+    let built = build_selective(&staged, &segments, selection);
+    let result = built.and_then(|(applied, new_tip, new_hash)| {
+        let current = if db.is_file() { Some(copy_tip(db)?) } else { None };
+        if current.as_ref() == Some(&(new_tip, new_hash)) {
+            // Nothing the selection holds has changed: the copy stays as it is.
+            return Ok(PullOutcome::UpToDate { tip: old_tip });
+        }
+        let wal = side(&staged, "-wal");
+        if std::fs::metadata(&wal).map(|m| m.len() > 0).unwrap_or(false) {
+            bail!("the staged copy left an unmerged write-ahead log; keeping the old copy");
+        }
+        swap_in(db, &staged)?;
+        Ok(PullOutcome::Updated { from_tip: old_tip, to_tip: new_tip, applied })
+    });
+    remove_store_files(&staged);
+    if result.is_ok() {
+        marker.built_selection = wanted;
+        marker.source_seq = source_event.seq;
+        marker.source_hash = source_event.this_hash;
+        marker.source_commit = source.commit.clone();
+    }
+    result
+}
+
+/// Build the selective copy at `staged`: returns the number of events it holds
+/// and its chain tip.
+fn build_selective(staged: &Path, segments: &[PathBuf], selection: &Selection) -> Result<(usize, i64, String)> {
+    let mut classes = crate::copy_filter::Classes::default();
+    for_each_event(segments, |event| {
+        classes.observe(event);
+        Ok(())
+    })?;
+    let mut rewriter = crate::copy_filter::Rewriter::new(classes.keep(selection));
+    let mut store = EventStore::new(staged).context("the staged copy cannot be created")?;
+    let mut batch: Vec<ShippedEvent> = Vec::with_capacity(CHUNK);
+    let mut applied = 0usize;
+    let mut flush = |store: &mut EventStore, batch: &mut Vec<ShippedEvent>| -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        match store.ingest_batch(batch)? {
+            IngestOutcome::Applied { applied: n, .. } => applied += n,
+            IngestOutcome::Rejected { reason, at_seq, .. } => bail!("the filtered copy does not verify (seq {at_seq}): {reason}"),
+        }
+        batch.clear();
+        Ok(())
+    };
+    for_each_event(segments, |event| {
+        if let Some(kept) = rewriter.rewrite(event)? {
+            batch.push(kept);
+            if batch.len() >= CHUNK {
+                flush(&mut store, &mut batch)?;
+            }
+        }
+        Ok(())
+    })?;
+    flush(&mut store, &mut batch)?;
+    let (tip, hash) = store.contiguous_tip()?;
+    if tip != applied as i64 {
+        bail!("the filtered copy ends at seq {tip} but holds {applied} events");
+    }
+    Ok((applied, tip, hash))
 }
 
 fn stage_and_swap(db: &Path, staged: &Path, segments: &[PathBuf], tip: i64, tip_hash: &str, rebuild: bool) -> Result<PullOutcome> {
@@ -282,6 +547,17 @@ fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(300).collect()
 }
 
+/// A scope must name a project. The words that mean "no project" are the
+/// general rules' switch, not a scope.
+fn check_scopes(selection: &Selection) -> Result<()> {
+    for scope in &selection.scopes {
+        if model::normalize::normalize_project(Some(scope)).is_none() {
+            bail!("'{scope}' is not a project name; to hold the items that belong to no project, add --include-global");
+        }
+    }
+    Ok(())
+}
+
 /// Refresh the copy at `db`. Records the attempt, the new tip and any failure
 /// in the copy's marker. On failure the old copy stays in use.
 pub fn pull(db: &Path, opts: &PullOptions) -> Result<PullOutcome> {
@@ -306,14 +582,27 @@ pub fn pull(db: &Path, opts: &PullOptions) -> Result<PullOutcome> {
     if opts.remote.is_some() {
         marker.remote = opts.remote.clone();
     }
+    // The selection: named now (it replaces the remembered one), else the
+    // remembered one, else nothing selected - the whole memory.
+    let selection = if opts.whole {
+        Selection::default()
+    } else if !opts.scopes.is_empty() || opts.include_global {
+        Selection { scopes: opts.scopes.clone(), include_global: opts.include_global }
+    } else {
+        marker.selection()
+    };
+    check_scopes(&selection)?;
+    marker.set_selection(&selection);
     marker.last_attempt_unix = copy_mode::now_unix();
     copy_mode::write_marker(db, &marker).context("the copy marker could not be written")?;
 
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pull_inner(db, &repo, &subdir, opts, &marker)))
+    let selection = marker.selection();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pull_inner(db, &repo, &subdir, opts, &mut marker, &selection)))
         .unwrap_or_else(|_| Err(anyhow::anyhow!("the pull panicked")));
     match &outcome {
         Ok(result) => {
             marker.last_error.clear();
+            marker.checked_at_unix = copy_mode::now_unix();
             match result {
                 PullOutcome::Updated { to_tip, .. } => {
                     marker.pulled_at_unix = copy_mode::now_unix();
@@ -333,6 +622,7 @@ mod tests {
     use super::*;
     use model::item::{Binding, Item, Kind};
     use thor_core::backup::export_segments;
+    use thor_core::event_store::EventKind;
 
     fn rule(id: &str) -> Item {
         Item {
@@ -541,6 +831,295 @@ mod tests {
         assert!(matches!(outcome, PullOutcome::Updated { applied: 6, .. }), "{outcome:?}");
         assert_eq!(tip_of(&w.copy), w.main.contiguous_tip().unwrap());
     }
+    // ---------------------------------------------------------------- selective copy
+
+    const CANARY_BETA: &str = "CANARYBETAXQZ";
+    const CANARY_SECRET_CMD: &str = "CANARYSESSIONCOMMANDXQZ";
+
+    fn scoped(id: &str, project: Option<&str>, words: &str) -> Item {
+        Item { project: project.map(str::to_string), text: format!("{id} {words}"), ..rule(id) }
+    }
+
+    /// A main store with two projects, general rules and telemetry that carries
+    /// session text, exported as a fake backup folder.
+    fn mixed_world() -> World {
+        let dir = tempfile::tempdir().unwrap();
+        let mut main = EventStore::new(&dir.path().join("main.db")).unwrap();
+        let items = [
+            scoped("alpha-one", Some("alpha"), "keeps the alpha pipeline honest every release"),
+            scoped("alpha-two", Some("alpha"), "guards the alpha database migrations carefully"),
+            scoped("beta-one", Some("beta"), &format!("{CANARY_BETA} describes the beta customer contract")),
+            scoped("general-one", None, "never commit credentials into any repository whatsoever"),
+        ];
+        for item in &items {
+            model::store::declare(&mut main, "s", "s", "s", item).unwrap();
+        }
+        // Telemetry that holds text from the session it happened in.
+        let refusal = serde_json::json!({ "target": CANARY_SECRET_CMD }).to_string();
+        main.append_event("s", "s", "hook", EventKind::GateRefused, "alpha-one", None, &refusal).unwrap();
+        let served = serde_json::json!({ "served_at": "2026-01-01T00:00:00Z", "trigger": CANARY_SECRET_CMD }).to_string();
+        main.append_event("s", "s", "hook", EventKind::ItemServed, "general-one", None, &served).unwrap();
+        let repo = dir.path().join("clone");
+        std::fs::create_dir_all(repo.join("thor2")).unwrap();
+        export_segments(&main, &repo.join("thor2"), 2_000).unwrap();
+        let copy_dir = dir.path().join("laptop");
+        std::fs::create_dir_all(&copy_dir).unwrap();
+        World { _dir: dir, main, repo, copy: copy_dir.join("thor.db") }
+    }
+
+    fn selecting(w: &World, scopes: &[&str], global: bool) -> PullOptions {
+        PullOptions {
+            repo: Some(w.repo.clone()),
+            no_fetch: true,
+            scopes: scopes.iter().map(|s| s.to_string()).collect(),
+            include_global: global,
+            ..Default::default()
+        }
+    }
+
+    fn remembered(w: &World) -> PullOptions {
+        PullOptions { repo: Some(w.repo.clone()), no_fetch: true, ..Default::default() }
+    }
+
+    fn ids_in(db: &Path) -> Vec<String> {
+        let store = EventStore::open_read_only(db).unwrap();
+        let mut ids: Vec<String> = serve::live::live_items(&store).into_iter().map(|i| i.id).collect();
+        ids.sort();
+        ids
+    }
+
+    /// Every byte the copy has on disk: the store file and its companions.
+    fn bytes_of_copy(db: &Path) -> Vec<u8> {
+        let mut all = Vec::new();
+        for suffix in ["", "-wal", "-shm"] {
+            all.extend(std::fs::read(side(db, suffix)).unwrap_or_default());
+        }
+        all
+    }
+
+    fn contains(haystack: &[u8], needle: &str) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle.as_bytes())
+    }
+
+    #[test]
+    fn a_selection_holds_the_chosen_scopes_and_the_general_rules_only() {
+        let w = mixed_world();
+        pull(&w.copy, &selecting(&w, &["alpha"], true)).unwrap();
+        assert_eq!(ids_in(&w.copy), vec!["alpha-one", "alpha-two", "general-one"]);
+        let marker = copy_mode::read_marker(&w.copy);
+        assert_eq!(marker.scopes, vec!["alpha".to_string()]);
+        assert!(marker.include_global);
+        assert_eq!(marker.built_selection, marker.selection().canonical());
+    }
+
+    #[test]
+    fn scopes_without_the_general_switch_leave_the_general_rules_out_and_the_switch_alone_leaves_the_projects_out() {
+        let w = mixed_world();
+        pull(&w.copy, &selecting(&w, &["alpha", "beta"], false)).unwrap();
+        assert_eq!(ids_in(&w.copy), vec!["alpha-one", "alpha-two", "beta-one"]);
+        pull(&w.copy, &selecting(&w, &[], true)).unwrap();
+        assert_eq!(ids_in(&w.copy), vec!["general-one"]);
+    }
+
+    #[test]
+    fn what_was_left_out_is_absent_from_the_copy_file_itself() {
+        let w = mixed_world();
+        pull(&w.copy, &selecting(&w, &["alpha"], true)).unwrap();
+        let bytes = bytes_of_copy(&w.copy);
+        assert!(contains(&bytes, "alpha pipeline"), "fixture sanity: the chosen text is there");
+        assert!(!contains(&bytes, CANARY_BETA), "the canary of an unselected project must not be anywhere in the copy");
+        assert!(!contains(&bytes, "beta-one"), "not even its id");
+        assert!(!contains(&bytes, CANARY_SECRET_CMD), "session text from refusals and served records is not copied");
+        assert!(!side(&w.copy, ".pulling").exists());
+    }
+
+    #[test]
+    fn the_filtered_copy_verifies_as_a_chain_of_its_own() {
+        let w = mixed_world();
+        pull(&w.copy, &selecting(&w, &["alpha"], true)).unwrap();
+        let store = EventStore::open_read_only(&w.copy).unwrap();
+        let events = store.get_all_events().unwrap();
+        assert!(thor_core::auditor::verify_chain_integrity(&events).is_ok());
+        assert!(thor_core::auditor::DifferentialAuditor::verify_consistency(&events).is_ok());
+        assert!(crate::health::store_line(&w.copy).contains("chain intact"), "{}", crate::health::store_line(&w.copy));
+        assert_ne!(tip_of(&w.copy), w.main.contiguous_tip().unwrap(), "it is a derivative, not the source chain");
+        assert_eq!(tip_of(&w.copy).0 as usize, events.len(), "the copy's own numbering has no holes");
+        assert!(store.heads_projection_current());
+    }
+
+    #[test]
+    fn a_revised_item_keeps_a_working_history_in_the_copy() {
+        let mut w = mixed_world();
+        let first = scoped("alpha-one", Some("alpha"), "keeps the alpha pipeline honest every release");
+        let second = Item { text: "alpha-one now also watches the alpha release notes".to_string(), ..first.clone() };
+        model::store::revise(&mut w.main, "s", "s", "s", &first, &second).unwrap();
+        export_segments(&w.main, &w.repo.join("thor2"), 2_000).unwrap();
+        pull(&w.copy, &selecting(&w, &["alpha"], true)).unwrap();
+        let store = EventStore::open_read_only(&w.copy).unwrap();
+        let shown = model::store::show(&store, "alpha-one").unwrap();
+        assert!(shown.text.contains("release notes"), "the head is the revision");
+        assert_eq!(model::store::history(&store, "alpha-one").unwrap().len(), 2, "both revisions, one head");
+    }
+
+    #[test]
+    fn an_item_that_mentions_a_left_out_item_still_serves() {
+        let mut w = mixed_world();
+        let mut pointer = scoped("pointer", None, "see the rule beta-one before touching the contract");
+        pointer.tags = vec!["related:beta-one".to_string()];
+        model::store::declare(&mut w.main, "s", "s", "s", &pointer).unwrap();
+        export_segments(&w.main, &w.repo.join("thor2"), 2_000).unwrap();
+        pull(&w.copy, &selecting(&w, &["alpha"], true)).unwrap();
+        let store = EventStore::open_read_only(&w.copy).unwrap();
+        let shown = model::store::show(&store, "pointer").unwrap();
+        assert!(shown.text.contains("beta-one"), "it is only words");
+        assert!(matches!(model::store::show(&store, "beta-one"), Err(model::store::ReadError::NotFound(_))), "the target is plainly not there");
+        assert!(ids_in(&w.copy).contains(&"pointer".to_string()));
+    }
+
+    #[test]
+    fn the_selection_is_remembered_and_a_later_pull_repeats_it() {
+        let mut w = mixed_world();
+        pull(&w.copy, &selecting(&w, &["alpha"], true)).unwrap();
+        model::store::declare(&mut w.main, "s", "s", "s", &scoped("alpha-three", Some("alpha"), "a third alpha rule about tagging builds")).unwrap();
+        model::store::declare(&mut w.main, "s", "s", "s", &scoped("beta-two", Some("beta"), "CANARYBETATWO another beta contract clause")).unwrap();
+        export_segments(&w.main, &w.repo.join("thor2"), 2_000).unwrap();
+        // No selection named this time: the marker's is used.
+        let outcome = pull(&w.copy, &remembered(&w)).unwrap();
+        assert!(matches!(outcome, PullOutcome::Updated { .. }), "{outcome:?}");
+        assert_eq!(ids_in(&w.copy), vec!["alpha-one", "alpha-three", "alpha-two", "general-one"]);
+        assert!(!contains(&bytes_of_copy(&w.copy), "CANARYBETATWO"));
+    }
+
+    #[test]
+    fn a_source_that_did_not_move_leaves_the_copy_untouched() {
+        let w = mixed_world();
+        pull(&w.copy, &selecting(&w, &["alpha"], true)).unwrap();
+        let bytes = std::fs::read(&w.copy).unwrap();
+        let outcome = pull(&w.copy, &remembered(&w)).unwrap();
+        assert!(matches!(outcome, PullOutcome::UpToDate { .. }), "{outcome:?}");
+        assert!(bytes == std::fs::read(&w.copy).unwrap());
+        assert!(copy_mode::read_marker(&w.copy).checked_at_unix > 0, "a successful check is recorded even when nothing changed");
+    }
+
+    #[test]
+    fn a_new_unselected_item_does_not_touch_the_copy_file() {
+        let mut w = mixed_world();
+        pull(&w.copy, &selecting(&w, &["alpha"], true)).unwrap();
+        let bytes = std::fs::read(&w.copy).unwrap();
+        model::store::declare(&mut w.main, "s", "s", "s", &scoped("beta-three", Some("beta"), "yet another beta contract clause about invoices")).unwrap();
+        export_segments(&w.main, &w.repo.join("thor2"), 2_000).unwrap();
+        let outcome = pull(&w.copy, &remembered(&w)).unwrap();
+        assert!(matches!(outcome, PullOutcome::UpToDate { .. }), "{outcome:?}");
+        assert!(bytes == std::fs::read(&w.copy).unwrap(), "nothing the selection holds changed, so the file is left as it was");
+        assert_eq!(copy_mode::read_marker(&w.copy).source_seq, w.main.contiguous_tip().unwrap().0, "yet the pull knows the source moved on");
+    }
+
+    #[test]
+    fn changing_the_selection_rebuilds_and_the_old_content_is_gone() {
+        let w = mixed_world();
+        pull(&w.copy, &selecting(&w, &["beta"], false)).unwrap();
+        assert!(contains(&bytes_of_copy(&w.copy), CANARY_BETA));
+        pull(&w.copy, &selecting(&w, &["alpha"], true)).unwrap();
+        assert_eq!(ids_in(&w.copy), vec!["alpha-one", "alpha-two", "general-one"]);
+        assert!(!contains(&bytes_of_copy(&w.copy), CANARY_BETA), "narrowing the selection removes what it no longer covers");
+    }
+
+    #[test]
+    fn selecting_nothing_is_today_the_whole_memory_with_the_sources_own_chain() {
+        let w = mixed_world();
+        pull(&w.copy, &opts(&w)).unwrap();
+        assert_eq!(tip_of(&w.copy), w.main.contiguous_tip().unwrap(), "the same chain as the source");
+        let marker = copy_mode::read_marker(&w.copy);
+        assert!(!marker.selection().is_active());
+        assert_eq!(marker.built_selection, "");
+        assert!(contains(&bytes_of_copy(&w.copy), CANARY_BETA), "everything is there");
+    }
+
+    #[test]
+    fn going_back_to_the_whole_memory_continues_from_the_source_chain() {
+        let w = mixed_world();
+        pull(&w.copy, &selecting(&w, &["alpha"], true)).unwrap();
+        let back = PullOptions { repo: Some(w.repo.clone()), no_fetch: true, whole: true, ..Default::default() };
+        pull(&w.copy, &back).unwrap();
+        assert_eq!(tip_of(&w.copy), w.main.contiguous_tip().unwrap());
+        assert!(!copy_mode::read_marker(&w.copy).selection().is_active());
+        // And the next ordinary pull is a plain continuation.
+        assert!(matches!(pull(&w.copy, &opts(&w)).unwrap(), PullOutcome::UpToDate { .. }));
+    }
+
+    #[test]
+    fn a_failed_selective_pull_keeps_the_old_copy_byte_for_byte() {
+        let mut w = mixed_world();
+        pull(&w.copy, &selecting(&w, &["alpha"], true)).unwrap();
+        let bytes = std::fs::read(&w.copy).unwrap();
+        model::store::declare(&mut w.main, "s", "s", "s", &scoped("alpha-four", Some("alpha"), "a fourth alpha rule about release branches")).unwrap();
+        export_segments(&w.main, &w.repo.join("thor2"), 2_000).unwrap();
+        let last = segment_files(&w.repo.join("thor2")).unwrap().pop().unwrap();
+        let text = std::fs::read_to_string(&last).unwrap();
+        let broken = text.replacen("a fourth alpha rule", "a fifth alpha rule", 1);
+        assert_ne!(text, broken, "fixture sanity: a body was changed");
+        std::fs::write(&last, broken).unwrap();
+        let result = pull(&w.copy, &remembered(&w));
+        assert!(result.unwrap_err().to_string().contains("does not verify"));
+        assert!(bytes == std::fs::read(&w.copy).unwrap(), "the old copy is exactly as it was");
+        assert!(!side(&w.copy, ".pulling").exists(), "the staged copy is removed");
+        let marker = copy_mode::read_marker(&w.copy);
+        assert!(!marker.last_error.is_empty());
+        assert_eq!(marker.scopes, vec!["alpha".to_string()], "and the selection is still remembered");
+    }
+
+    #[test]
+    fn a_scope_that_means_no_project_is_refused_with_the_fix() {
+        let w = mixed_world();
+        let err = pull(&w.copy, &selecting(&w, &["global"], false)).unwrap_err().to_string();
+        assert!(err.contains("--include-global"), "{err}");
+        assert!(!w.copy.exists());
+    }
+
+    #[test]
+    fn a_selective_pull_never_replaces_a_store_that_is_not_a_copy() {
+        let w = mixed_world();
+        EventStore::new(&w.copy).unwrap();
+        let bytes = std::fs::read(&w.copy).unwrap();
+        assert!(pull(&w.copy, &selecting(&w, &["alpha"], true)).unwrap_err().to_string().contains("not marked as a copy"));
+        assert!(bytes == std::fs::read(&w.copy).unwrap());
+    }
+
+    /// An address or a bare repository is cloned into a scratch folder that is
+    /// gone again when the pull ends.
+    #[test]
+    fn a_bare_repository_is_read_through_a_scratch_clone_that_is_deleted() {
+        let mut w = mixed_world();
+        if !run_git(&w.repo, &["init", "-q", "-b", "main"]) {
+            return; // no git on this machine
+        }
+        assert!(run_git(&w.repo, &["add", "-A"]) && run_git(&w.repo, &["commit", "-q", "-m", "backup one"]));
+        let bare = w._dir.path().join("backup.git");
+        let cloned = Command::new("git").arg("clone").arg("-q").arg("--bare").arg(&w.repo).arg(&bare).status().unwrap();
+        assert!(cloned.success());
+        let options = PullOptions { repo: Some(bare.clone()), scopes: vec!["alpha".into()], include_global: true, ..Default::default() };
+        pull(&w.copy, &options).unwrap();
+        assert_eq!(ids_in(&w.copy), vec!["alpha-one", "alpha-two", "general-one"]);
+        assert!(!side(&w.copy, ".source").exists(), "no copy of the whole memory stays on this machine");
+        let commit = copy_mode::read_marker(&w.copy).source_commit;
+        assert!(!commit.is_empty(), "the commit it was built from is remembered");
+
+        // The same commit again: nothing is downloaded and nothing changes.
+        let bytes = std::fs::read(&w.copy).unwrap();
+        let again = pull(&w.copy, &PullOptions { repo: Some(bare.clone()), ..Default::default() }).unwrap();
+        assert!(matches!(again, PullOutcome::UpToDate { .. }), "{again:?}");
+        assert!(bytes == std::fs::read(&w.copy).unwrap());
+
+        // A new backup commit is picked up (pushed into the bare repository).
+        model::store::declare(&mut w.main, "s", "s", "s", &scoped("alpha-five", Some("alpha"), "a fifth alpha rule about nightly jobs")).unwrap();
+        export_segments(&w.main, &w.repo.join("thor2"), 2_000).unwrap();
+        assert!(run_git(&w.repo, &["add", "-A"]) && run_git(&w.repo, &["commit", "-q", "-m", "backup two"]));
+        assert!(run_git(&w.repo, &["push", "-q", &bare.display().to_string(), "main"]));
+        pull(&w.copy, &PullOptions { repo: Some(bare), ..Default::default() }).unwrap();
+        assert!(ids_in(&w.copy).contains(&"alpha-five".to_string()));
+        assert!(!side(&w.copy, ".source").exists());
+    }
+
     #[test]
     fn the_last_seq_is_read_from_the_tail() {
         let w = world(30);

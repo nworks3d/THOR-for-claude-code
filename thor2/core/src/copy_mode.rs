@@ -49,13 +49,96 @@ pub struct Marker {
     /// The copy's chain tip when it last changed.
     #[serde(default)]
     pub tip_seq: i64,
+    /// When a pull last SUCCEEDED, whether or not it changed the copy: the
+    /// moment the copy was last known to match the source.
+    #[serde(default)]
+    pub checked_at_unix: i64,
     /// When a pull was last tried (ok or not).
     #[serde(default)]
     pub last_attempt_unix: i64,
     /// Why the last pull failed; empty when it did not.
     #[serde(default)]
     pub last_error: String,
+    /// SELECTIVE COPY: the project scopes this copy holds. Empty together with
+    /// `include_global == false` means "no selection": the whole memory.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// SELECTIVE COPY: also hold the items that belong to no project (the
+    /// general work rules).
+    #[serde(default)]
+    pub include_global: bool,
+    /// The selection the copy file was last built with (`Selection::canonical`),
+    /// empty for a whole-memory copy. A pull that finds it different from the
+    /// current selection builds the copy again from the source.
+    #[serde(default)]
+    pub built_selection: String,
+    /// The last event of the source (seq and hash) the copy was built from.
+    /// A selective copy has its own chain, so this is how a pull sees that
+    /// the source has not moved.
+    #[serde(default)]
+    pub source_seq: i64,
+    #[serde(default)]
+    pub source_hash: String,
+    /// The commit of the backup the copy was built from, when the source was
+    /// fetched from an address (so an unchanged backup is not downloaded again).
+    #[serde(default)]
+    pub source_commit: String,
 }
+
+/// Which part of the memory a copy holds. The default (nothing selected) is
+/// the whole memory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Selection {
+    pub scopes: Vec<String>,
+    pub include_global: bool,
+}
+
+impl Selection {
+    /// Whether anything was selected. A selection of nothing is the whole memory.
+    pub fn is_active(&self) -> bool {
+        !self.scopes.is_empty() || self.include_global
+    }
+
+    /// A stable text for the selection: sorted, without duplicates, so the same
+    /// choice always compares equal. Empty for "the whole memory".
+    pub fn canonical(&self) -> String {
+        if !self.is_active() {
+            return String::new();
+        }
+        let mut scopes: Vec<String> = self.scopes.iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        scopes.sort();
+        scopes.dedup();
+        format!("scopes={};global={}", scopes.join(","), self.include_global)
+    }
+
+    /// The selection in words, for a status line.
+    pub fn describe(&self) -> String {
+        if !self.is_active() {
+            return "the whole memory".to_string();
+        }
+        let mut parts: Vec<String> = self.scopes.iter().map(|s| format!("project {s}")).collect();
+        if self.include_global {
+            parts.push("general rules (no project)".to_string());
+        }
+        parts.join(", ")
+    }
+}
+
+impl Marker {
+    pub fn selection(&self) -> Selection {
+        Selection { scopes: self.scopes.clone(), include_global: self.include_global }
+    }
+
+    pub fn set_selection(&mut self, selection: &Selection) {
+        self.scopes = selection.scopes.iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        self.scopes.sort();
+        self.scopes.dedup();
+        self.include_global = selection.include_global;
+    }
+}
+
+/// `doctor` warns when the last successful change of the copy is older than this.
+pub const DOCTOR_STALE_SECS: i64 = 3 * 24 * 3600;
 
 pub fn marker_path(db: &Path) -> PathBuf {
     db.parent().unwrap_or_else(|| Path::new(".")).join(MARKER)
@@ -200,6 +283,34 @@ mod tests {
         m.last_attempt_unix = 9_000;
         assert!(!pull_due(&m, 10_000));
         assert!(pull_due(&m, 9_000 + DEFAULT_MIN_INTERVAL_SECS));
+    }
+
+    #[test]
+    fn a_selection_of_nothing_is_the_whole_memory_and_compares_stably() {
+        let none = Selection::default();
+        assert!(!none.is_active());
+        assert_eq!(none.canonical(), "");
+        assert_eq!(none.describe(), "the whole memory");
+        let a = Selection { scopes: vec!["b".into(), "a".into(), "a".into()], include_global: false };
+        let b = Selection { scopes: vec!["a".into(), "b".into()], include_global: false };
+        assert_eq!(a.canonical(), b.canonical());
+        assert_ne!(a.canonical(), Selection { include_global: true, ..b.clone() }.canonical());
+        assert!(Selection { scopes: vec![], include_global: true }.is_active(), "general rules alone are a selection");
+    }
+
+    #[test]
+    fn the_selection_survives_the_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        let mut m = Marker::default();
+        m.set_selection(&Selection { scopes: vec!["zeta".into(), "alpha".into()], include_global: true });
+        write_marker(&db, &m).unwrap();
+        let back = read_marker(&db).selection();
+        assert_eq!(back.scopes, vec!["alpha".to_string(), "zeta".to_string()]);
+        assert!(back.include_global);
+        // An older marker without the fields reads as "no selection".
+        std::fs::write(marker_path(&db), r#"{"repo":"x"}"#).unwrap();
+        assert!(!read_marker(&db).selection().is_active());
     }
 
     #[test]

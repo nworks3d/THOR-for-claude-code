@@ -8,6 +8,7 @@
 
 pub mod backup_setup;
 pub mod backup_state;
+pub mod copy_filter;
 pub mod drain;
 pub mod githooks;
 pub mod health;

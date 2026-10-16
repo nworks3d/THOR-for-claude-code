@@ -73,6 +73,18 @@ enum Command {
         /// Build the copy again from the first event.
         #[arg(long)]
         rebuild: bool,
+        /// Hold only this project (repeat the flag for more). Remembered in the
+        /// copy's marker, so later pulls repeat it. Every other project, and
+        /// the personal library, stays out of the copy file altogether.
+        #[arg(long = "scope", value_name = "PROJECT", conflicts_with = "whole")]
+        scopes: Vec<String>,
+        /// Also hold the items that belong to no project (the general work
+        /// rules). Remembered like --scope.
+        #[arg(long = "include-global", conflicts_with = "whole")]
+        include_global: bool,
+        /// Hold the whole memory again: forget a remembered selection.
+        #[arg(long)]
+        whole: bool,
     },
     /// Push the local store's backlog to the receiver at `--to`.
     Ship {
@@ -239,9 +251,9 @@ fn main() -> ExitCode {
             );
             Ok(())
         }),
-        Command::Pull { db, repo, subdir, remote, no_fetch, rebuild } => {
+        Command::Pull { db, repo, subdir, remote, no_fetch, rebuild, scopes, include_global, whole } => {
             let started = std::time::Instant::now();
-            let opts = ops::pull::PullOptions { repo, subdir, remote, no_fetch, rebuild };
+            let opts = ops::pull::PullOptions { repo, subdir, remote, no_fetch, rebuild, scopes, include_global, whole };
             ops::pull::pull(&db, &opts).map(|outcome| match outcome {
                 ops::pull::PullOutcome::UpToDate { tip } => {
                     println!("pull: the copy is up to date at seq {tip} ({} ms)", started.elapsed().as_millis())
