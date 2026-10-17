@@ -15,8 +15,10 @@
 # SECOND MACHINE: to get a read-only copy of another machine's memory instead
 # of a memory of its own, set THOR_COPY_FROM (the backup), and optionally
 # THOR_COPY_SCOPES (projects, comma separated) and THOR_COPY_GLOBAL=1, before
-# the command. The setup program reads them itself; see "Use THOR on a second
-# machine" in README.md.
+# the command. For a FULL copy of the whole memory, set THOR_COPY_WHOLE=1
+# instead of the two (only on a computer you trust, never a work laptop). The
+# setup program reads them itself; see "Use THOR on a second machine" in
+# README.md.
 #
 # Nothing here needs root, and nothing is installed outside your home folder.
 

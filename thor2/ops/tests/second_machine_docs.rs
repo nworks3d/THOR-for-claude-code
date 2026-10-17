@@ -48,9 +48,10 @@ fn every_option_the_readme_names_exists_in_the_program() {
 fn the_pages_and_the_scripts_agree_on_the_environment_variables() {
     let section = readme_section();
     let agents = read("AGENTS.md");
-    for name in ["THOR_COPY_FROM", "THOR_COPY_SCOPES", "THOR_COPY_GLOBAL"] {
+    for name in ["THOR_COPY_FROM", "THOR_COPY_SCOPES", "THOR_COPY_GLOBAL", "THOR_COPY_WHOLE"] {
         assert!(section.contains(name), "README.md never mentions {name}");
         assert!(agents.contains(name), "AGENTS.md never mentions {name}");
+        assert!(read("docs/WHAT-THOR-DOES.md").contains(name), "docs/WHAT-THOR-DOES.md never mentions {name}");
         for script in ["install.ps1", "install.sh"] {
             assert!(read(script).contains(name), "{script} never says where {name} goes");
         }

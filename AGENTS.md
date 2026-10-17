@@ -332,7 +332,7 @@ sentence what is missing (a sign-in, access on the website, the company's IT
 allowing that one address) and stop; do not work around it.
 
 Then run ONE command from inside the project's folder (the installer reads the
-three values from the environment, or take the options on the second line of
+values from the environment, or take the options on the second line of
 each pair when THOR is already unpacked):
 
 - Windows, in PowerShell:
@@ -341,6 +341,21 @@ each pair when THOR is already unpacked):
 - Linux:
   `curl -fsSL https://raw.githubusercontent.com/nworks3d/THOR-for-claude-code/main/install.sh | THOR_COPY_FROM="<backup>" THOR_COPY_SCOPES="<project>" THOR_COPY_GLOBAL=1 sh`
   or `~/.thor2/install --copy-from "<backup>" --scope <project> --include-global`
+
+For a FULL copy of the whole memory, ask only where the backup is, and say
+plainly that everything in the memory, anything personal in it included, will be
+on that computer, so it is only for a computer the person trusts and never a
+work or company laptop. Then run (no project needed):
+
+- Windows, in PowerShell:
+  `$env:THOR_COPY_FROM = "<backup>"; $env:THOR_COPY_WHOLE = "1"; irm https://raw.githubusercontent.com/nworks3d/THOR-for-claude-code/main/install.ps1 | iex`
+  or `& "$HOME\thor2\install.exe" --copy-from "<backup>" --whole-memory`
+- Linux:
+  `curl -fsSL https://raw.githubusercontent.com/nworks3d/THOR-for-claude-code/main/install.sh | THOR_COPY_FROM="<backup>" THOR_COPY_WHOLE=1 sh`
+  or `~/.thor2/install --copy-from "<backup>" --whole-memory`
+
+`THOR_COPY_WHOLE` (1, true, yes or on) wins over a project or general-rules
+choice: those are ignored and the output says so.
 
 It builds the copy from the backup, writes the marker that makes every hook
 read-only, connects the four hooks, and prints what the person has and what is

@@ -72,6 +72,7 @@ impl Fx {
             .env_remove("THOR_COPY_FROM")
             .env_remove("THOR_COPY_SCOPES")
             .env_remove("THOR_COPY_GLOBAL")
+            .env_remove("THOR_COPY_WHOLE")
             .env_remove("THOR_COPY");
         command
     }
@@ -153,6 +154,53 @@ fn the_download_one_liner_passes_its_choices_as_environment_variables() {
     let marker = thor_core::copy_mode::read_marker(&fx.db());
     assert_eq!(marker.scopes, vec!["beta".to_string()]);
     assert!(marker.include_global);
+}
+
+#[test]
+fn the_download_one_liner_can_ask_for_the_whole_memory() {
+    let fx = Fx::new();
+    let out = fx
+        .command(env!("CARGO_BIN_EXE_install"))
+        .arg("--db")
+        .arg(fx.db())
+        .arg("--settings")
+        .arg(fx.settings())
+        .arg("--serve-exe")
+        .arg(env!("CARGO_BIN_EXE_sync"))
+        .env("THOR_COPY_FROM", fx.backup())
+        .env("THOR_COPY_WHOLE", "1")
+        .output()
+        .unwrap();
+    let text = said(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("the whole memory was asked for"), "{text}");
+    let copy = bytes_of(&fx.db());
+    assert!(has(&copy, "alpha pipeline") && has(&copy, CANARY), "every project is in the copy");
+    assert!(has(&copy, "never commit credentials"), "and so are the general rules");
+    let marker = thor_core::copy_mode::read_marker(&fx.db());
+    assert!(!marker.selection().is_active(), "no selection is remembered");
+}
+
+#[test]
+fn the_whole_memory_wins_over_a_project_choice_and_says_so() {
+    let fx = Fx::new();
+    let out = fx
+        .command(env!("CARGO_BIN_EXE_install"))
+        .arg("--db")
+        .arg(fx.db())
+        .arg("--settings")
+        .arg(fx.settings())
+        .arg("--serve-exe")
+        .arg(env!("CARGO_BIN_EXE_sync"))
+        .env("THOR_COPY_FROM", fx.backup())
+        .env("THOR_COPY_SCOPES", "alpha")
+        .env("THOR_COPY_WHOLE", "yes")
+        .output()
+        .unwrap();
+    let text = said(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("are not needed and are ignored") || text.contains("are ignored"), "{text}");
+    assert!(has(&bytes_of(&fx.db()), CANARY));
 }
 
 #[test]

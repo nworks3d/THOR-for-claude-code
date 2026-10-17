@@ -233,7 +233,9 @@ struct Cli {
     #[arg(long = "include-global")]
     include_global: bool,
 
-    /// With --copy-from: hold the whole memory, not a selection.
+    /// With --copy-from: hold the whole memory, not a selection (the personal
+    /// library included: use it only on a machine you trust). Also read from
+    /// THOR_COPY_WHOLE=1. It wins over --scope and --include-global.
     #[arg(long = "whole-memory")]
     whole_memory: bool,
 }
@@ -243,6 +245,11 @@ fn env_value(name: &str) -> Option<String> {
     std::env::var(name).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
 
+/// A yes/no value from the environment: 1, true, yes or on.
+fn env_flag(name: &str) -> bool {
+    env_value(name).is_some_and(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+}
+
 /// `install --copy-from <backup>`: the whole second-machine setup.
 fn copy_install(cli: &Cli, source: String) -> ExitCode {
     let scopes: Vec<String> = if cli.scopes.is_empty() {
@@ -250,8 +257,7 @@ fn copy_install(cli: &Cli, source: String) -> ExitCode {
     } else {
         cli.scopes.clone()
     };
-    let include_global =
-        cli.include_global || env_value("THOR_COPY_GLOBAL").is_some_and(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"));
+    let include_global = cli.include_global || env_flag("THOR_COPY_GLOBAL");
     let Some(serve_exe) = cli.serve_exe.clone().or_else(|| sibling("serve")) else {
         eprintln!("could not work out where `serve` is - name it with --serve-exe");
         return ExitCode::FAILURE;
@@ -276,7 +282,7 @@ fn copy_install(cli: &Cli, source: String) -> ExitCode {
         source,
         scopes,
         include_global,
-        whole: cli.whole_memory,
+        whole: cli.whole_memory || env_flag("THOR_COPY_WHOLE"),
         folder: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         settings,
         serve_exe,

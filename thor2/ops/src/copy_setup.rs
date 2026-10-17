@@ -42,7 +42,10 @@ pub struct Request {
 fn selection_for(req: &Request) -> Result<(Selection, Vec<String>), String> {
     let mut notes = Vec::new();
     if req.whole {
-        notes.push("= the whole memory was asked for: nothing is left out of the copy".to_string());
+        notes.push("= the whole memory was asked for: nothing is left out of the copy (so use this only on a computer you trust)".to_string());
+        if !req.scopes.is_empty() || req.include_global {
+            notes.push("= because the whole memory was asked for, the project and general-rules choices were not needed and are ignored".to_string());
+        }
         return Ok((Selection::default(), notes));
     }
     if !req.scopes.is_empty() {

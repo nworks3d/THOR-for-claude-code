@@ -216,13 +216,14 @@ Words used once, in plain language:
 
 ### A18. Optional: a read-only copy on a second machine, of everything or of a selection you choose
 - What: only when you ask for it, with install --copy-from <your backup> (or the same values in the
-  environment variables THOR_COPY_FROM, THOR_COPY_SCOPES, THOR_COPY_GLOBAL that the one-line download
+  environment variables THOR_COPY_FROM, THOR_COPY_SCOPES, THOR_COPY_GLOBAL, THOR_COPY_WHOLE that the one-line download
   passes on). Instead of making a memory of its own, the install builds a read-only copy from your
   backup, writes a small marker file (thor-copy.json) beside it that makes every hook read-only, connects
   the four hooks and the reply-tidying file, and registers nothing that could write: no note-saving tool,
   no machine-wide git hooks, no /thor-eval. You can name the projects the copy holds (--scope, repeatable)
   and whether it holds the general rules (--include-global); with neither you get the project of the folder
-  you ran it in, and --whole-memory copies everything. The items of every other project, the personal
+  you ran it in, and --whole-memory (or THOR_COPY_WHOLE=1 in the one-line download) copies everything and
+  wins over a project choice, so use it only on a computer you trust, never a work or company laptop. The items of every other project, the personal
   library, refusal records and the "where it fired" text of served records are not in the copy file at all.
   A selective copy has a hash chain of its own, so doctor can verify it. The choice is remembered in the
   marker and repeated by every later refresh (sync pull). The refresh runs by itself at session start, at

@@ -674,8 +674,8 @@ curl -fsSL https://raw.githubusercontent.com/nworks3d/THOR-for-claude-code/main/
 - Several projects: separate them with commas, `"project-one,project-two"`.
 - Leave out `THOR_COPY_SCOPES` and you get the project of the folder you are in.
 - Leave out `THOR_COPY_GLOBAL` and the general work rules are not copied.
-- On Windows the three `$env:` values only live in this window. Close it when
-  you are done.
+- On Windows the `$env:` values only live in this window. Close it when you are
+  done.
 
 THOR is already unpacked on this laptop (from an earlier install)? Then run the
 installer directly instead, with the same choices as options:
@@ -690,6 +690,33 @@ installer directly instead, with the same choices as options:
 
 (Repeat `--scope` for more than one project. Add `--whole-memory` instead of
 the choices to copy everything.)
+
+### Or copy the whole memory
+
+Only do this on a computer you trust, such as your own second laptop. A full copy
+holds everything in your memory, including anything personal in it, so it does
+not belong on a work or company laptop (use the project choice above there).
+
+You do not need to name a project. Open any terminal on the laptop (on Windows:
+press the Windows key, type `powershell`, press Enter), replace
+`THE-BACKUP-ADDRESS` as above, and paste ONE of these:
+
+Windows, in PowerShell:
+
+```powershell
+$env:THOR_COPY_FROM = "THE-BACKUP-ADDRESS"; $env:THOR_COPY_WHOLE = "1"; irm https://raw.githubusercontent.com/nworks3d/THOR-for-claude-code/main/install.ps1 | iex
+```
+
+Linux:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/nworks3d/THOR-for-claude-code/main/install.sh | THOR_COPY_FROM="THE-BACKUP-ADDRESS" THOR_COPY_WHOLE=1 sh
+```
+
+`THOR_COPY_WHOLE` does the same as `--whole-memory`. If you also give
+`THOR_COPY_SCOPES` or `THOR_COPY_GLOBAL`, the full copy wins: nothing is left
+out, and the command tells you that those two were not needed. The copy is still
+read-only, and it refreshes by itself like any other copy.
 
 It downloads THOR, checks the download, connects THOR to Claude Code, makes the
 copy, and tells you what you have. This is what you see at the end (your own
