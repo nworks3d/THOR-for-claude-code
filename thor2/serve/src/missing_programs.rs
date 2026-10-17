@@ -326,12 +326,15 @@ mod tests {
         "Stop":[{"hooks":[{"type":"command","command":"C:/other/tool.exe --db y hook"}]}]}}"#;
     const MCP: &str = r#"{"mcpServers":{"thor":{"command":"C:\\Users\\a\\thor2\\mcp.exe","args":["--db","C:\\x\\thor.db"]},"other":{"command":"C:\\z\\serve.exe"}}}"#;
 
+    // The fixtures use Windows paths, which only count as absolute on Windows.
+    #[cfg(windows)]
     #[test]
     fn the_hook_and_tool_server_programs_are_found_and_other_hooks_are_not() {
         let found = programs_called(Some(SETTINGS), Some(MCP));
         assert_eq!(found, vec![PathBuf::from("C:\\Users\\a\\thor2\\serve.exe"), PathBuf::from("C:\\Users\\a\\thor2\\mcp.exe")]);
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_missing_program_is_named_once_and_a_present_one_is_not() {
         let called = programs_called(Some(SETTINGS), Some(MCP));
@@ -341,6 +344,7 @@ mod tests {
         assert!(missing(vec![PathBuf::from("mcp.exe")], &only_mcp).is_empty());
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_scheduled_task_and_the_script_it_runs_are_followed_to_the_program() {
         let xml = r#"<Task><Actions><Exec><Command>powershell.exe</Command>
@@ -378,6 +382,7 @@ mod tests {
         assert_eq!(parse_defender(text), vec!["sync.exe".to_string()]);
     }
 
+    #[cfg(windows)]
     #[test]
     fn the_windows_line_names_the_cause_the_steps_and_the_consented_exclusion() {
         let line = words_for(&[PathBuf::from("C:\\Users\\a\\thor2\\sync.exe")], &["sync.exe".to_string()], true).unwrap();
