@@ -199,6 +199,33 @@ own hook, so nothing already there stops working. If git's global hooks folder
 and says so; the shared hooks are then not wired, and searching a project's code
 does not update by itself after a commit until that is sorted out.
 
+Those shared hooks also stop one mistake that is hard to undo: a commit that adds
+a video file or a very large file. The check looks at what is staged at that
+moment, so it also catches `git add -A`, `git add .` and `git commit -a`, which
+add files nobody named. By default it stops a file ending in `mp4`, `mov`, `mkv`,
+`webm`, `avi` or `m4v` (capital letters count too) and any file above 26214400
+bytes (25 MB); a file that is only being removed is never stopped. When it stops
+a commit it prints which files and why, and the steps to take: unstage each file
+with `git restore --staged "<file>"` (`git rm --cached "<file>"` in a repository
+that has no commit yet), keep the file outside the repository, commit again. If
+that happens while you work, follow what it prints, tell the person in one plain
+sentence which file was left out and why, and do not look for a way around it:
+the rules are the person's to change, not yours. Three ordinary git settings
+change them, for one repository, or for the whole computer when `--global` comes
+right after `git config`:
+
+- `thor.mediagate.enabled` - `false` switches the check off.
+- `thor.mediagate.extensions` - the video endings, separated by spaces (default
+  `mp4 mov mkv webm avi m4v`).
+- `thor.mediagate.maxbytes` - the size limit as a plain number of bytes (default
+  `26214400`; `52428800` is 50 MB).
+
+A fourth, `thor.mediagate.parkdir`, names a folder where the message suggests
+keeping refused files. A file a project keeps on purpose is allowed with one line
+in `.gitattributes`: the path, a space and `thor-media-ok` (a path with a space
+goes in double quotes), then `git add .gitattributes`. Someone who installed THOR
+before this check existed gets it by running the installer once more.
+
 It also writes an end-of-session routine, `/thor-eval`, to your own commands
 folder. Run it at the end of a session: it walks through everything the memory has
 been served without a verdict and settles that debt in one pass, rather than

@@ -500,7 +500,9 @@ hooks that run in every repository on this machine (unless another tool already
 set git's global hooks folder, in which case THOR leaves that alone and says so),
 which keeps the reading of your code fresh after each commit, and each one hands
 control back to your repository's own hooks so nothing already there stops
-working. It backs up both
+working. The same hooks also stop a commit that would add a video file or a
+very large file (see [The media gate](#the-media-gate-no-video-or-huge-file-in-git-by-accident)
+below). It backs up both
 files before it touches
 them, it never removes anything it did not put there, and running it twice
 changes nothing the second time.
@@ -596,6 +598,84 @@ instead: it registers the working copy and changes nothing else.
 
 If you are the assistant doing the setup, [AGENTS.md](AGENTS.md) is the
 walkthrough for the steps above.
+
+## The media gate: no video or huge file in git by accident
+
+The shared git hooks the installer sets up (see "Getting started" above) also add one safety
+check at the moment you commit. If the commit would add a **video file** or a
+**file bigger than 25 MB**, git stops, nothing is committed, and a message tells
+you which files caused it and what to do. You do not have to set anything up.
+
+**Why it exists.** Git keeps every version of every file for good. A video added
+once makes the repository heavy forever, and after you have pushed it, it is very
+hard to get out again. The check looks at what is really about to be committed,
+so it also catches `git add -A`, `git add .` and `git commit -a`, which add files
+you never named.
+
+**What it stops, by default.**
+
+- a video, recognised by the ending of its name: `mp4`, `mov`, `mkv`, `webm`,
+  `avi` or `m4v` (capital letters count too, so `HOLIDAY.MP4` is stopped)
+- any file above 25 MB (26214400 bytes)
+
+A file that is only being removed is never stopped, and nothing happens to the
+files on your disk.
+
+**What to do when it stops you.** The message says the same, with your file
+names filled in:
+
+1. Take the file out of this commit: `git restore --staged "the-file.mp4"` (in a
+   brand new repository that has no commit yet, use `git rm --cached
+   "the-file.mp4"`). The file itself stays where it is on your disk.
+2. Keep the file outside the repository, for example in a folder of its own.
+3. Run your commit again.
+
+**To allow one file on purpose** (a demo video that really belongs in the
+project): open the file called `.gitattributes` in the top folder of the
+repository, or create it, and add one line with the path, a space and
+`thor-media-ok`:
+
+```
+docs/demo/intro.mp4 thor-media-ok
+```
+
+A path with a space in it goes in double quotes: `"docs/my demo.mp4"
+thor-media-ok`. Then run `git add .gitattributes` and commit again. If you keep
+videos in Git LFS, put `thor-media-ok` on the same line as the `filter=lfs`
+setting: the check goes by the ending of the name, not by what is stored.
+
+**To change the rules.** These are ordinary git settings. Run them inside a
+repository to change that repository only, or put `--global` right after `git
+config` to change every repository on this computer. The names are written in
+small letters.
+
+| Setting | What it does | Default |
+| --- | --- | --- |
+| `thor.mediagate.enabled` | `false` switches the check off (`no`, `off` and `0` work too) | on |
+| `thor.mediagate.extensions` | the video endings, separated by spaces; an empty value (`""`) stops no file for its type | `mp4 mov mkv webm avi m4v` |
+| `thor.mediagate.maxbytes` | the largest size allowed, as a plain number of bytes (not `50m`) | `26214400` |
+| `thor.mediagate.parkdir` | optional: a folder the message suggests keeping refused files in, as `<folder>/<YYYY-MM-DD>_<repository>_<subject>/` with a short `STATUS.txt` saying what the file is | not set |
+
+For example, to allow files up to 50 MB in every repository on this computer:
+
+```sh
+git config --global thor.mediagate.maxbytes 52428800
+```
+
+To take a setting back, use `git config --unset thor.mediagate.maxbytes` (add
+`--global` if you set it with `--global`).
+
+**Good to know.**
+
+- A commit that finishes a merge is not checked: it lists everything the other
+  side brought in, and that is already part of your history. One line says so.
+- Renaming a video that is already in the repository counts as adding it.
+- The check is part of THOR's shared git hooks, so it is only active where those
+  are in use. If you already had a global git hooks folder of your own, the
+  installer left it alone and the check is not active.
+- If you installed THOR before this check existed, run the installer once more
+  (the same command as in "Getting started"): it updates the hook and changes
+  nothing else.
 
 ## Use THOR on a second machine
 
@@ -1004,7 +1084,12 @@ do all of this for you if you ask; these are the steps in plain words.
    `git config --global --get core.hooksPath`. If the folder it prints ends in
    `thor2/githooks` (or `thor2\githooks`), run
    `git config --global --unset core.hooksPath`. If it prints some other
-   folder, or nothing, leave it alone: it is not THOR's.
+   folder, or nothing, leave it alone: it is not THOR's. The media gate (no
+   video or huge file in a commit) lives in that same folder, so it stops with
+   it. If you set any `thor.mediagate.` settings yourself, they are harmless
+   leftovers; to remove one, run for example
+   `git config --global --unset thor.mediagate.maxbytes` (leave out `--global`
+   inside a repository where you set it for that repository only).
 7. **Delete the memory folder.** On Windows that is `%LOCALAPPDATA%\thor2`, on
    Linux `~/.local/share/thor2` (the install printed it on its `memory:` line).
    It holds your notes, the small files beside them (the reply rules, the modes,

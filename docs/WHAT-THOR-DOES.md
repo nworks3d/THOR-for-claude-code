@@ -94,6 +94,36 @@ Words used once, in plain language:
 - Refuse or change: if you already had a global core.hooksPath, THOR leaves it alone and says code
   search will not auto-refresh until you sort it out.
 
+### A7b. The pre-commit one of those hooks stops video files and very large files (the media gate)
+- What: before it hands control to the repository's own pre-commit hook, the dispatcher looks at what is
+  staged right now and refuses the commit when a staged file is a video (ending mp4, mov, mkv, webm, avi
+  or m4v, capitals included) or is larger than 25 MB (26214400 bytes). It reads the index, so it also
+  catches `git add -A`, `git add .` and `git commit -a`, which stage files the command never names. It
+  prints every refused file with the reason (video type, or its size against the limit) and the steps to
+  take: unstage it with `git restore --staged "<file>"` (`git rm --cached` in a repository with no commit
+  yet), keep it outside the repository, commit again. Nothing is committed and no file on disk is touched.
+  A path with the git attribute `thor-media-ok` set (a line `<path> thor-media-ok` in .gitattributes, the
+  path in double quotes when it has a space) is let through. The settings are plain git config, global or
+  per repository: `thor.mediagate.enabled` (`false` switches the gate off), `thor.mediagate.extensions`
+  (the video endings, space separated, default `mp4 mov mkv webm avi m4v`), `thor.mediagate.maxbytes`
+  (a plain number of bytes, default 26214400) and `thor.mediagate.parkdir` (optional: a folder the refusal
+  suggests parking the file in, as `<parkdir>/<YYYY-MM-DD>_<repo>_<subject>/` with a STATUS.txt).
+- Why: a 26 MB 4K video went into a repository with `git add -A` and was pushed. A rule about command
+  text cannot see what `git add -A` stages, and git keeps every version for good, so a file added once
+  makes the repository heavy forever. The check costs about seven short processes per commit (one
+  `git cat-file --batch-check` reads every size at once).
+- You notice: nothing on a normal commit; on a refusal a message in plain words that names the files. It
+  never mentions how to skip the hook. Limits on purpose: a removed file is never refused, a rename counts
+  as a new file, a submodule is skipped, a commit that finishes a merge is not checked (its diff lists
+  everything the other side brought in, which is already in the history; one line says so), a file stored
+  with Git LFS needs `thor-media-ok` on its attribute line (the staged pointer is small but the ending is
+  still a video), and a name with a double quote, backslash, tab or newline is shown by git in quotes with
+  escapes and printed that way. It fails open: a missing helper program (sed, awk, git cat-file with
+  formats) finds nothing and the commit goes on. It needs the shared hooks of A7, so it is not active
+  where another tool already owns core.hooksPath, and an existing install gets it by running the
+  installer once more (it rewrites a dispatcher whose text changed).
+- Refuse or change: yes, see F16.
+
 ### A8. It writes the /thor-eval routine
 - What: a command file (thor-eval.md) in Claude Code's commands folder, with the programs folder and
   memory path filled in. It is the end-of-session review the assistant follows (see C5).
@@ -775,8 +805,9 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
 ### F11. How to remove THOR
 - What: README.md has a "Remove THOR completely" section with ten steps. In short: remove its four entries
   in settings.json (plus the backup SessionStart entry if you chose a backup), the "thor" entry in
-  ~/.claude.json, the /thor-eval command, unset git's core.hooksPath if it points to THOR's folder,
-  then delete the memory folder, the programs folder and any .thor-project file.
+  ~/.claude.json, the /thor-eval command, unset git's core.hooksPath if it points to THOR's folder
+  (the media gate, A7b, goes with it), then delete the memory folder, the programs folder and any
+  .thor-project file.
 - Why: nothing THOR put on the computer should be left behind unknowingly.
 - You notice: THOR goes silent.
 - Refuse or change: your call; a backup of both files exists as .bak from the install.
@@ -820,6 +851,22 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
 - You notice: with it off your assistant does the work itself in the main conversation; with it on, a
   reminder arrives right before a helper agent is started.
 - Refuse or change: say "helpers on" or "helpers off" to your assistant.
+
+### F16. The media gate (A7b) can be tuned, allowed per file, or switched off
+- What: all of it is plain git config, so it works per repository (no flag) or for the whole computer
+  (`--global` right after `git config`). Raise the limit: `git config thor.mediagate.maxbytes 52428800`
+  (50 MB; 104857600 is 100 MB; a plain number, a value like 50m is not understood and the default is used
+  with a notice). Change the video endings: `git config thor.mediagate.extensions "mp4 mov mkv"`; an empty
+  value (`""`) stops no file for its type, and the size limit still applies. Switch the whole gate off:
+  `git config thor.mediagate.enabled false` (no, off and 0 count as false too). Allow one file on purpose:
+  a line `<path> thor-media-ok` in .gitattributes, then `git add .gitattributes`. Suggest a parking
+  folder in the refusal: `git config thor.mediagate.parkdir "D:/parked"`. Take a setting back with
+  `git config --unset thor.mediagate.maxbytes` (add `--global` for a global one).
+- Why: the defaults suit most projects; a project that really keeps a demo video or a large data file
+  needs a way to say so that travels with the repository (the attribute) and a person needs a way to say so
+  for their own computer (the config).
+- You notice: the refusal message prints the same steps, and the exact lines for the files it refused.
+- Refuse or change: yes, with the commands above. Removing THOR (F11) removes the gate with the hooks.
 
 ---
 
