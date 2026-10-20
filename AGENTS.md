@@ -710,7 +710,7 @@ Nothing here waits for you: ask me about any number and I explain it, say no to 
 2. Connections: THOR is wired into Claude Code at session start, before each tool call, when you send a message and when a reply ends, so the memory speaks up by itself. Default: on.
 3. Git hooks: every repository refreshes THOR's code index after each commit, and refuses to commit video files or files above 25 MB. Default: on.
 4. Weekly check: about once a week THOR has your assistant tidy the memory (you can also type /thor-eval any time). Default: on.
-5. Work rules: 13 general work habits stored as notes, such as tests before 'done' and never commit a secret; they only inform, except that on Windows two refuse a console window flash. Default: all on.
+5. Work rules: 14 general work habits stored as notes, such as tests before 'done' and never commit a secret; they only inform, except that on Windows two refuse a console window flash. Default: all on.
 6. Helper agents: your main assistant judges while cheaper models do the work in helpers, which can cost less and keeps the chat free. Default: off.
 7. Bug reports: your assistant may offer to report a fault in THOR on GitHub, showing you the exact text first; nothing is sent without your yes. Default: on.
 8. Replies: in your language, short, with a summary first, and six reply rules; a reply that breaks one is rewritten once. Default: on.
@@ -787,10 +787,10 @@ DETAIL PER ITEM (for the assistant: state an item's Why once, only when he asks 
    To say no: I switch the weekly ask off (install --set-weekly-check off); you can still type /thor-eval yourself, and nothing else changes.
 
 5. The starter work rules
-   What it is: A set of 13 general work habits, stored as notes that arrive right before the step they are about, once per session: changelog with every user visible change; run the tests before saying done; never commit a secret; commit push deploy only when asked; commit hygiene; check where you push and what is on main; scan before it goes public; rehearse destructive steps on a copy; pin a dependency with its reason; absolute paths not the shell working directory; script file not shell quoting; windowless processes on windows; scheduled task not interactive. 21 more notes teach your assistant how to write notes that come back and how to work with THOR. None of them blocks a normal step; on Windows two of them, about hidden console windows, refuse the one call that would flash a window.
+   What it is: A set of 14 general work habits, stored as notes that arrive right before the step they are about, once per session: changelog with every user visible change; run the tests before saying done; never commit a secret; commit push deploy only when asked; commit hygiene; check where you push and what is on main; scan before it goes public; rehearse destructive steps on a copy; pin a dependency with its reason; absolute paths not the shell working directory; script file not shell quoting; keep only what is needed; windowless processes on windows; scheduled task not interactive. 21 more notes teach your assistant how to write notes that come back and how to work with THOR. None of them blocks a normal step; on Windows two of them, about hidden console windows, refuse the one call that would flash a window.
    Why it exists: They are the habits that were marked useful again and again in a memory built over months of real work, so a new memory starts with that experience instead of learning it the hard way.
    What I chose: All on.
-   To say no: Name the ones you do not want, or say none: I remove just those notes (changelog-with-every-user-visible-change, run-the-tests-before-saying-done, never-commit-a-secret, commit-push-deploy-only-when-asked, commit-hygiene, check-where-you-push-and-what-is-on-main, scan-before-it-goes-public, rehearse-destructive-steps-on-a-copy, pin-a-dependency-with-its-reason, absolute-paths-not-the-shell-working-directory, script-file-not-shell-quoting, windowless-processes-on-windows, scheduled-task-not-interactive), and a removed note simply stops arriving.
+   To say no: Name the ones you do not want, or say none: I remove just those notes (changelog-with-every-user-visible-change, run-the-tests-before-saying-done, never-commit-a-secret, commit-push-deploy-only-when-asked, commit-hygiene, check-where-you-push-and-what-is-on-main, scan-before-it-goes-public, rehearse-destructive-steps-on-a-copy, pin-a-dependency-with-its-reason, absolute-paths-not-the-shell-working-directory, script-file-not-shell-quoting, keep-only-what-is-needed, windowless-processes-on-windows, scheduled-task-not-interactive), and a removed note simply stops arriving.
 
 6. Helper-agent mode
    What it is: When it is on, your main assistant (the strongest model) answers, judges and checks, while cheaper models do the real work in helper agents, one helper per task. No helper is used for a question or an answer, a trivial one-step job, work that needs this conversation's context or quick back-and-forth with you, or a check of a helper's own result: the main assistant does those itself. Tests are run narrowly while working and in full once at the end, and a helper that goes quiet is judged dead after about three checks. Why you may not want it: you do not see the work happen and cannot steer a helper halfway; each helper starts with a fixed context cost, so small tasks cost more, not less; a helper knows nothing of the conversation beyond its brief; parallel helpers can collide in the same files; and checking the result costs an extra turn. It is off in a new memory. To switch it on, say "helpers on" and I run: install --set-helpers on --db <store>. That stores the two notes that carry it (orchestrator-mode-saves-quota and an-agent-brief-stands-alone).
@@ -875,6 +875,9 @@ Around a risky step or a tool:
   and every brief.
 - `script-file-not-shell-quoting` - text with quotes or backslashes goes in a script
   file, not a one-liner.
+- `keep-only-what-is-needed` - rebuildable things (build output, caches, models,
+  installers, scratch and worktree folders, database copies) stay out of a repo and a
+  backup; temporary work is cleaned up after use.
 - `windowless-processes-on-windows` - background processes start hidden. On a Windows install this
   one REFUSES a `Start-Process` with no `-WindowStyle` or `-NoNewWindow` unless it opens a window the
   user explicitly asked to see (start that one with `-WindowStyle Normal`) or something meant
@@ -891,12 +894,15 @@ nothing of the conversation beyond its brief. Two more notes carry it, and
 changes nothing). Only run it when the person says yes to item 6:
 
 - `orchestrator-mode-saves-quota` - the strongest model answers, judges and checks,
-  cheaper models do the work in helper agents, one helper per task and never a bundle,
-  the chat stays free meanwhile, no helper for a question, a trivial one-step task, work
-  needing this conversation or quick back-and-forth, or checking a helper's result, and
-  tests are run narrowly while working and in full once at the end.
+  cheaper models do the work in helper agents, one helper per task, the chat stays free
+  meanwhile, no helper for a question, a job of seconds, work needing this conversation
+  or quick back-and-forth, or checking a helper's result, tests are run narrowly while
+  working and in full once at the end, and a release is one push, all tested first,
+  nothing added after.
 - `an-agent-brief-stands-alone` - goal, absolute folder, files it may touch, a summary
-  of what is known (not a read-first list), one narrow task, a short report; waiting is
+  of what is known (not a read-first list), one narrow task, a short report; a later step
+  on the same subject goes to the same helper with a new complete brief; a long job is run
+  by the helper itself with a time limit and a log, without stopping midway; waiting is
   a check every 20 to 30 minutes, at most three times, then the job is judged dead by
   its last real activity, never by its status.
 

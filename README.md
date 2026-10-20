@@ -1059,7 +1059,7 @@ part and it is easy to conclude too early that nothing is happening.
 
 **Day one, it stops almost nothing.** A fresh memory holds 22 pinned starting
 notes (how to write one that comes back, plus honesty, agent and hygiene habits
-that hold on any project) and 13 general work rules that arrive right before
+that hold on any project) and 14 general work rules that arrive right before
 the step they are about. The part of THOR that can refuse a
 wrong change only works on notes that carry a proof, and you have not written
 any yet. So on the first day you get those notes at the start of a conversation

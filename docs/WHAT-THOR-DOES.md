@@ -153,12 +153,12 @@ Words used once, in plain language:
   session-start block is capped by size (about 9,500 bytes), not by the four-note rule.
 - Refuse or change: ordinary notes. Ask the assistant to unpin, reword or retract any.
 
-### A10. It adds 13 "workflow starter" notes; two refuse a console flash on Windows
+### A10. It adds 14 "workflow starter" notes; two refuse a console flash on Windows
 - What: seven around commit and push (changelog line per user-visible change, run tests and quote the
   real result, never commit a secret, commit hygiene, commit/push/deploy only when asked, check where you
-  push and what is on main, scan before anything goes public) and six around risky steps and tools
+  push and what is on main, scan before anything goes public) and seven around risky steps and tools
   (rehearse destructive steps on a copy, pin a dependency with its reason, absolute paths, script file not
-  shell quoting, hidden processes on Windows, no interactive scheduled task on Windows). Helper-agent mode
+  shell quoting, keep only what is needed (rebuildable things stay out of a repo or backup), hidden processes on Windows, no interactive scheduled task on Windows). Helper-agent mode
   (an orchestrator note and a stand-alone agent brief) is not in this set: it is off until you say yes to
   first-session item 6 (F15).
 - Why: they are habits that were marked useful again and again on the builder's machine, rewritten to
@@ -618,7 +618,7 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
 - Refuse or change: built in.
 
 ### D8. Starter notes never refuse
-- What: the 11 workflow notes that are not about Windows console windows, the two helper-mode notes and the 22 pinned notes carry no check.
+- What: the 12 workflow notes that are not about Windows console windows, the two helper-mode notes and the 22 pinned notes carry no check.
 - Why: see A10.
 - You notice: a note appears at its moment; no refusal.
 - Refuse or change: you may hang a check on your own rules.
@@ -791,7 +791,7 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
 
 ## F. What the user can switch off or change, and how
 
-### F1. Starting notes (22 pinned, 13 workflow)
+### F1. Starting notes (22 pinned, 14 workflow)
 - What: any starting note.
 - Why: they are ordinary notes.
 - You notice: they stop arriving.

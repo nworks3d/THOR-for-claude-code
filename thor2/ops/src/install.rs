@@ -1203,6 +1203,12 @@ pub fn workflow_starter_pack_for(windows: bool) -> Vec<model::item::Item> {
              machine.",
             vec![command("bash -c"), command("node -e"), command("python -c")],
         ),
+        note(
+            "keep-only-what-is-needed",
+            "Rebuildable things (build output, caches, models, installers, scratch and worktree folders, database copies) do not belong in a repo or a backup: ignore them or leave them out. Clean up temporary work after use.",
+            "Build output, caches or database copies committed or backed up are found to cost nothing, and scratch left behind is found harmless.",
+            vec![moment(Action::Delete), moment(Action::Install)],
+        ),
         with_check(
             note(
                 "windowless-processes-on-windows",
@@ -1275,13 +1281,13 @@ pub fn helper_mode_notes() -> Vec<model::item::Item> {
     vec![
         starter_note(
             "orchestrator-mode-saves-quota",
-            "Strongest model answers, judges, checks; cheaper models work in helpers, ONE per task, never a bundle. Chat stays free. No helper for: questions, trivial one-step tasks, work needing this chat or quick back-and-forth, checking helper results. Targeted tests while working, one full run at the end.",
+            "Strongest model answers, judges, checks; cheaper helpers work, ONE per task, never a bundle. Chat stays free. Not for: questions, jobs of seconds, work needing this chat or quick back-and-forth, checking helper results. Targeted tests, one full run last. Release: one push, tested, nothing after.",
             "Doing all the work in the strongest model uses no more quota than letting cheaper helper agents do it.",
             agent(),
         ),
         starter_note(
             "an-agent-brief-stands-alone",
-            "A helper starts blank, so its brief stands alone: goal, ABSOLUTE folder, files it may touch, a SUMMARY of what is known (not a read-first list), one narrow task, a SHORT report. Check every 20-30 minutes, at most 3 times, then judge it dead by its last real activity, not its status.",
+            "Helper starts blank: goal, ABSOLUTE folder, files it may touch, SUMMARY (not a read-first list), one narrow task, SHORT report. Same subject later: SAME helper, new full brief. Long job: it runs it, time limit, log, no stopping. Check every 20-30 min, 3 times, then judge dead by last activity.",
             "An agent given a brief with no working folder or limits is found to behave the same as one given a complete brief.",
             // Pinned as well: bound to Agent alone it would arrive at the
             // first Agent call, after the brief was already written.
@@ -2809,12 +2815,15 @@ mod tests {
         for (text, must) in [
             (&orchestrator, "one per task"),
             (&orchestrator, "never a bundle"),
-            (&orchestrator, "no helper for: questions, trivial one-step tasks, work needing this chat or quick back-and-forth, checking helper results"),
+            (&orchestrator, "not for: questions, jobs of seconds, work needing this chat or quick back-and-forth, checking helper results"),
             (&orchestrator, "chat stays free"),
-            (&orchestrator, "targeted tests while working, one full run at the end"),
-            (&brief, "check every 20-30 minutes, at most 3 times"),
-            (&brief, "last real activity, not its status"),
-            (&brief, "summary of what is known (not a read-first list)"),
+            (&orchestrator, "targeted tests, one full run last"),
+            (&orchestrator, "release: one push, tested, nothing after"),
+            (&brief, "check every 20-30 min, 3 times"),
+            (&brief, "judge dead by last activity"),
+            (&brief, "summary (not a read-first list)"),
+            (&brief, "same subject later: same helper, new full brief"),
+            (&brief, "long job: it runs it, time limit, log, no stopping"),
         ] {
             assert!(text.contains(must), "the helper notes lost '{must}': {text}");
         }
