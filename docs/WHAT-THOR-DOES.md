@@ -121,7 +121,8 @@ Words used once, in plain language:
   escapes and printed that way. It fails open: a missing helper program (sed, awk, git cat-file with
   formats) finds nothing and the commit goes on. It needs the shared hooks of A7, so it is not active
   where another tool already owns core.hooksPath, and an existing install gets it by running the
-  installer once more (it rewrites a dispatcher whose text changed).
+  installer once more (it rewrites a dispatcher whose text changed). The first-session list names it in
+  item 3 (the git hooks).
 - Refuse or change: yes, see F16.
 
 ### A8. It writes the /thor-eval routine
