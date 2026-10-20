@@ -8320,6 +8320,9 @@ pub struct Revision {
     /// For a `gate_refused` step: the call the hook refused, as the log kept
     /// it (redacted when it was written) and cut short - `refused_call_excerpt`.
     pub refused_call: Option<String>,
+    /// For an `item_served` step: when it was handed out (`ItemServed::served_at`),
+    /// so a run of them can be shown as a date range. `None` for every other step.
+    pub served_at: Option<String>,
 }
 
 /// The whole revision log for one id, oldest first, including retractions.
@@ -8338,6 +8341,11 @@ pub fn history(store: &EventStore, entity_id: &str) -> Result<Vec<Revision>, Rea
             because: because_reason(&e.body),
             a4_old_stock: trial_of(&e).ok().flatten().and_then(|r| r.fields().a4_old_stock.clone()),
             refused_call: if e.kind == EventKind::GateRefused { refused_call_excerpt(&e) } else { None },
+            served_at: if e.kind == EventKind::ItemServed {
+                serde_json::from_str::<crate::served::ItemServed>(&e.body).ok().map(|s| s.served_at)
+            } else {
+                None
+            },
         })
         .collect())
 }

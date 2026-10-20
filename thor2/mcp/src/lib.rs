@@ -2229,6 +2229,11 @@ pub struct MarkArgs {
 pub struct HistoryArgs {
     /// The id whose whole life to walk.
     pub id: String,
+    /// true returns every event in full, including each `item_served` line.
+    /// Left out, a run of consecutive `item_served` events is one summary line
+    /// (a count and the date range) and every other event stays in full.
+    #[serde(default)]
+    pub all: bool,
 }
 
 #[derive(Deserialize, Serialize, schemars::JsonSchema)]
@@ -3496,58 +3501,11 @@ impl ThorMcpServer {
         .await
     }
 
-    #[tool(description = "Code lane: walks one item's whole life by id, oldest first - every declare, revise and retraction, each with its sequence number, revision hash and author. Use get instead for only the current version. Read-only; nothing is ever deleted from the log, so this still answers for a retracted item - read it before you revise or retract again. Replies with one line per revision, or the plain 'no history for id X' for an unknown id (not an error).", annotations(title = "Show item history", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
+    #[tool(description = "Code lane: walks one item's whole life by id, oldest first - every declare, revise and retraction, each with its sequence number, revision hash and author. Use get instead for only the current version. Read-only; nothing is ever deleted from the log, so this still answers for a retracted item - read it before you revise or retract again. Consecutive item_served events (hundreds, for a rule that fires often) are summarised as ONE line with a count and the date range; every other event is kept in full; pass all: true for the full raw history. Replies with one line per revision, or the plain 'no history for id X' for an unknown id (not an error).", annotations(title = "Show item history", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn history(&self, Parameters(args): Parameters<HistoryArgs>) -> String {
         self.blocking(move |s| match model::store::history(s, &args.id) {
             Ok(log) if log.is_empty() => Ok(format!("no history for id '{}'", args.id)),
-            Ok(log) => {
-                let mut out = String::new();
-                for rev in &log {
-                    // A refusal has no item body: it names the call the hook
-                    // refused instead, which is what a reader needs to judge
-                    // whether the refusal was right.
-                    let text = rev.item.as_ref().map(|i| i.text.clone()).unwrap_or_else(|| match (rev.kind.as_str(), &rev.refused_call) {
-                        ("gate_refused", Some(call)) => format!("refused call: '{call}'"),
-                        ("gate_refused", None) => "refused call: (the log kept no text for it)".to_string(),
-                        _ => "(no readable item body at this step)".to_string(),
-                    });
-                    out.push_str(&format!(
-                        "seq {} {} by {} [{}]: {}",
-                        rev.seq,
-                        rev.kind,
-                        rev.actor,
-                        &rev.rev_hash[..rev.rev_hash.len().min(12)],
-                        text
-                    ));
-                    // Present only on a revision `gate::revise_weakening`
-                    // judged a weakening (see `store::because_reason`) - so
-                    // the owner can see, right on this line, why a rule that
-                    // could refuse a write lost its teeth, not just that it
-                    // did.
-                    if let Some(reason) = &rev.because {
-                        out.push_str(&format!(" (because: {reason})"));
-                    }
-                    // THOR's own mark (Q24), from the step's trial record -
-                    // never from anything a writer passes: an old contains
-                    // check counted as a tooth although the text does not
-                    // name it, and the fragment it guards, so a reader can
-                    // judge whether it guards the rule's subject.
-                    if let Some(mark) = &rev.a4_old_stock {
-                        out.push_str(&format!(
-                            " (THOR: old contains check counted as a tooth although the text does not name it - {})",
-                            mark.describe()
-                        ));
-                    }
-                    // The rule as it stood at this step, so a weakening or a
-                    // retract can be read - and undone - without guessing
-                    // what it took away.
-                    if let Some(stood) = rev.item.as_ref().and_then(model::store::rule_as_it_stood) {
-                        out.push_str(&format!("\n    as it stood: {stood}"));
-                    }
-                    out.push('\n');
-                }
-                Ok(out)
-            }
+            Ok(log) => Ok(render_history(&log, args.all)),
             Err(e) => Err(e.to_string()),
         })
         .await
@@ -4012,6 +3970,81 @@ pub fn run_http(
         axum::serve(listener, app).await?;
         Ok::<(), anyhow::Error>(())
     })
+}
+
+/// One revision as one history line: a refusal has no item body, so it names
+/// the call the hook refused instead, which is what a reader needs to judge
+/// whether the refusal was right.
+fn history_line(rev: &model::store::Revision) -> String {
+    let text = rev.item.as_ref().map(|i| i.text.clone()).unwrap_or_else(|| match (rev.kind.as_str(), &rev.refused_call) {
+        ("gate_refused", Some(call)) => format!("refused call: '{call}'"),
+        ("gate_refused", None) => "refused call: (the log kept no text for it)".to_string(),
+        _ => "(no readable item body at this step)".to_string(),
+    });
+    let mut out = format!(
+        "seq {} {} by {} [{}]: {}",
+        rev.seq,
+        rev.kind,
+        rev.actor,
+        &rev.rev_hash[..rev.rev_hash.len().min(12)],
+        text
+    );
+    // Present only on a revision `gate::revise_weakening` judged a weakening
+    // (see `store::because_reason`) - so the owner can see, right on this
+    // line, why a rule that could refuse a write lost its teeth.
+    if let Some(reason) = &rev.because {
+        out.push_str(&format!(" (because: {reason})"));
+    }
+    // THOR's own mark (Q24), from the step's trial record - never from
+    // anything a writer passes: an old contains check counted as a tooth
+    // although the text does not name it, and the fragment it guards.
+    if let Some(mark) = &rev.a4_old_stock {
+        out.push_str(&format!(
+            " (THOR: old contains check counted as a tooth although the text does not name it - {})",
+            mark.describe()
+        ));
+    }
+    // The rule as it stood at this step, so a weakening or a retract can be
+    // read - and undone - without guessing what it took away.
+    if let Some(stood) = rev.item.as_ref().and_then(model::store::rule_as_it_stood) {
+        out.push_str(&format!("\n    as it stood: {stood}"));
+    }
+    out
+}
+
+/// The `history` reply. With `all` every event is one full line. Without it a
+/// run of consecutive `item_served` events (hundreds, for a rule that fires
+/// often, which drowned the refusals and revisions) is ONE line with the
+/// count and the date range; every other event stays in full.
+fn render_history(log: &[model::store::Revision], all: bool) -> String {
+    let mut out = String::new();
+    let mut i = 0;
+    while i < log.len() {
+        if !all && log[i].kind == "item_served" {
+            let run = log[i..].iter().take_while(|r| r.kind == "item_served").count();
+            let served = &log[i..i + run];
+            let mut dates: Vec<&str> = served.iter().filter_map(|r| r.served_at.as_deref()).collect();
+            dates.sort_unstable();
+            let when = match (dates.first(), dates.last()) {
+                (Some(a), Some(b)) if a == b => format!(", at {a}"),
+                (Some(a), Some(b)) => format!(", {a} to {b}"),
+                _ => String::new(),
+            };
+            out.push_str(&format!(
+                "seq {}-{} item_served x{}{} (summarised; pass all: true for each one)\n",
+                served[0].seq,
+                served[run - 1].seq,
+                run,
+                when
+            ));
+            i += run;
+            continue;
+        }
+        out.push_str(&history_line(&log[i]));
+        out.push('\n');
+        i += 1;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -6100,11 +6133,81 @@ mod tests {
         }))
         .await;
 
-        let log = srv.history(Parameters(HistoryArgs { id: "weaken-history-1".to_string() })).await;
+        let log = srv.history(Parameters(HistoryArgs { id: "weaken-history-1".to_string(), all: false })).await;
         assert!(
             log.contains("(because: superseded by CI)"),
             "history must show why the check was cleared, right on the revision's own line: {log}"
         );
+    }
+
+    fn revision(seq: i64, kind: &str, served_at: Option<&str>) -> model::store::Revision {
+        model::store::Revision {
+            seq,
+            kind: kind.to_string(),
+            rev_hash: "abcdef0123456789".to_string(),
+            actor: "hook".to_string(),
+            item: None,
+            because: None,
+            a4_old_stock: None,
+            refused_call: None,
+            served_at: served_at.map(String::from),
+        }
+    }
+
+    #[test]
+    fn history_summarises_a_run_of_item_served_and_keeps_every_other_event() {
+        let log = vec![
+            revision(1, "declare", None),
+            revision(2, "item_served", Some("2026-10-01T10:00:00Z")),
+            revision(3, "item_served", Some("2026-10-03T10:00:00Z")),
+            revision(4, "item_served", Some("2026-10-02T10:00:00Z")),
+            revision(5, "gate_refused", None),
+            revision(6, "item_served", Some("2026-10-05T10:00:00Z")),
+            revision(7, "revise", None),
+        ];
+        let out = render_history(&log, false);
+        assert!(out.contains("seq 2-4 item_served x3, 2026-10-01T10:00:00Z to 2026-10-03T10:00:00Z"), "{out}");
+        assert!(out.contains("seq 6-6 item_served x1, at 2026-10-05T10:00:00Z"), "{out}");
+        for kept in ["seq 1 declare", "seq 5 gate_refused", "seq 7 revise"] {
+            assert!(out.contains(kept), "{kept} must stay in full: {out}");
+        }
+        assert!(!out.contains("seq 3 item_served"), "the run is one line: {out}");
+        assert_eq!(out.lines().count(), 5, "{out}");
+    }
+
+    #[test]
+    fn history_with_all_returns_every_item_served_line() {
+        let log = vec![
+            revision(1, "declare", None),
+            revision(2, "item_served", Some("2026-10-01T10:00:00Z")),
+            revision(3, "item_served", Some("2026-10-02T10:00:00Z")),
+        ];
+        let out = render_history(&log, true);
+        assert_eq!(out.lines().count(), 3, "{out}");
+        assert!(out.contains("seq 2 item_served") && out.contains("seq 3 item_served"), "{out}");
+        assert!(!out.contains("summarised"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn history_through_the_real_tool_folds_served_events_unless_all_is_asked() {
+        let srv = server();
+        let args = base_remember("served-history-1");
+        let args = RememberArgs { id: args.id.clone(), ..roadmap_rule(&args.id) };
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await.starts_with("stored"));
+        {
+            let mut store = srv.store.lock().unwrap();
+            for day in 1..=5 {
+                let body = format!(r#"{{"served_at":"2026-10-0{day}T08:00:00Z"}}"#);
+                store
+                    .append_event("s", "l", "hook", thor_core::event_store::EventKind::ItemServed, "served-history-1", None, &body)
+                    .unwrap();
+            }
+        }
+        let short = srv.history(Parameters(HistoryArgs { id: "served-history-1".to_string(), all: false })).await;
+        assert!(short.contains("item_served x5, 2026-10-01T08:00:00Z to 2026-10-05T08:00:00Z"), "{short}");
+        assert!(short.contains("seq 1 fact_created"), "{short}");
+        let full = srv.history(Parameters(HistoryArgs { id: "served-history-1".to_string(), all: true })).await;
+        assert_eq!(full.matches(" item_served by ").count(), 5, "{full}");
     }
 
     // --------------------------------------------------------- absent_all
