@@ -134,8 +134,14 @@ pub fn run(req: &Request) -> Result<Vec<String>, String> {
                 // A first build that failed leaves nothing behind, so a second try starts clean.
                 let _ = std::fs::remove_file(copy_mode::marker_path(&req.db));
             }
+            let reason = format!("{e:#}");
+            if let Some(fix) = crate::pull::safe_directory_fix(&reason) {
+                return Err(format!(
+                    "The copy could not be made, so nothing was set up. Reason: {reason}. Git refuses to open the backup folder because it belongs to another user account. If you trust that folder, tell git so by running this one line, then run the same command again: {fix}"
+                ));
+            }
             return Err(format!(
-                "The copy could not be made, so nothing was set up. Reason: {e:#}. Check that the backup is reachable from this machine (see \"What you need first\" in the README section \"Use THOR on a second machine\"), then run the same command again; it is safe to repeat."
+                "The copy could not be made, so nothing was set up. Reason: {reason}. Check that the backup is reachable from this machine (see \"What you need first\" in the README section \"Use THOR on a second machine\"), then run the same command again; it is safe to repeat."
             ));
         }
     };
@@ -171,7 +177,10 @@ pub fn run(req: &Request) -> Result<Vec<String>, String> {
             if changed == 0 {
                 lines.push("= THOR was already connected to Claude Code".to_string());
             } else {
-                lines.push(format!("+ connected THOR to Claude Code ({changed} of {} connections), so the memory speaks up by itself", report.results.len()));
+                lines.push(format!(
+                    "+ connected THOR's {total} hooks to Claude Code ({changed} were new), so the memory speaks up by itself; a copy registers no local tool server, so lookups go through an existing remote connection to the main machine, if you have one",
+                    total = report.results.len()
+                ));
             }
             if let Some(p) = report.backup_path.as_ref().filter(|_| changed > 0) {
                 lines.push(format!("  your previous Claude Code settings were saved as {}", p.display()));
@@ -184,7 +193,10 @@ pub fn run(req: &Request) -> Result<Vec<String>, String> {
         }
     }
     match seed_response_rulebook(&req.db) {
-        Ok(_) => lines.push("+ the small file that keeps your assistant's replies tidy is in place".to_string()),
+        Ok(report) if report.outcome == crate::install::RulebookOutcome::Written => lines.push(
+            "+ the backup carried no reply rulebook, so the default small file that keeps your assistant's replies tidy was put in place. The main machine's own rulebook arrives with its next backup: run sync pull then".to_string(),
+        ),
+        Ok(_) => lines.push("+ the file that keeps your assistant's replies tidy is in place (the main machine's, when its backup carried one)".to_string()),
         Err(e) => lines.push(format!("  ! could not write the reply-tidying file: {e}")),
     }
 
@@ -375,5 +387,32 @@ mod tests {
         let said = run(&s.req).unwrap().join("\n");
         assert!(said.contains("nothing is left out"), "{said}");
         assert!(!copy_mode::read_marker(&s.req.db).selection().is_active());
+    }
+
+    #[test]
+    fn the_connection_line_names_the_four_hooks_and_the_missing_tool_server() {
+        let s = setup();
+        let said = run(&s.req).unwrap().join("\n");
+        assert!(said.contains("connected THOR's 4 hooks to Claude Code (4 were new)"), "{said}");
+        assert!(said.contains("registers no local tool server"), "{said}");
+        assert!(said.contains("remote connection to the main machine"), "{said}");
+        assert!(!said.contains("4 of 4 connections"), "{said}");
+    }
+
+    #[test]
+    fn the_owners_reply_rulebook_from_the_backup_is_in_place_after_the_setup() {
+        let s = setup();
+        std::fs::write(s.dir.path().join("backup").join("thor2").join(crate::pull::RULEBOOK_FILE), "[\"owner\"]").unwrap();
+        let said = run(&s.req).unwrap().join("\n");
+        let beside = serve::respond::default_rulebook_path(&s.req.db);
+        assert_eq!(std::fs::read_to_string(beside).unwrap(), "[\"owner\"]");
+        assert!(!said.contains("carried no reply rulebook"), "{said}");
+    }
+
+    #[test]
+    fn a_backup_with_no_rulebook_says_so_and_the_default_is_used() {
+        let s = setup();
+        let said = run(&s.req).unwrap().join("\n");
+        assert!(said.contains("backup carried no reply rulebook") && said.contains("run sync pull"), "{said}");
     }
 }

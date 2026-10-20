@@ -146,6 +146,14 @@ fn main() -> ExitCode {
         }
     }
 
+    // The owner's reply rulebook travels too, so a copy made from this backup
+    // tidies replies the same way. Plain file copy; a failure never stops the backup.
+    match ops::pull::carry_rulebook(&cli.db, &repo.join(&cli.subdir)) {
+        Ok(true) => println!("reply rulebook: carried in the backup"),
+        Ok(false) => {}
+        Err(e) => eprintln!("reply rulebook: NOT carried ({e}) - the event log backup still runs"),
+    }
+
     // Where this run pushes, named once so the result and the doctor can say it.
     //
     // A repository with no remote at all is a deliberate local copy

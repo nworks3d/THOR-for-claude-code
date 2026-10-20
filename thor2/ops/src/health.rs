@@ -2212,7 +2212,14 @@ pub fn working_copy_lines(db: &Path) -> Vec<String> {
         }
         lines.push(line);
     }
-    if !unregistered.is_empty() {
+    if !unregistered.is_empty() && thor_core::copy_mode::is_copy(db) {
+        // A copy has one writer, the main machine: it cannot record a working copy itself.
+        lines.push(format!(
+            "working copies: NOTE (optional, nothing is wrong): this is a read-only copy, so {} project(s) have no registered working copy here: {}. Their file checks cannot be tried on this machine. To change that, run THOR's install with --register-root --per-machine inside a project's folder; it prints one line to run on the main machine",
+            unregistered.len(),
+            unregistered.join(", ")
+        ));
+    } else if !unregistered.is_empty() {
         lines.push(format!(
             "working copies: {} project(s) own rules but have no registered working copy: {} - run {} from inside \
              each one's checkout (a project not on this machine needs nothing)",
@@ -3806,6 +3813,13 @@ pub fn command_anchors_never_fired_line(db: &Path, full: bool) -> String {
     if dead.is_empty() {
         return format!(
             "command anchors never fired: none - of {with_anchors} live item(s) with command anchors, every one has an anchor that fired (at a call or at the owner's prompt), one a call can reach, or one that could not be judged"
+        );
+    }
+    if thor_core::copy_mode::is_copy(db) {
+        // A copy cannot edit a note, so a long list of fixes would only worry its owner.
+        return format!(
+            "command anchors never fired: NOTE (nothing is wrong here): {} of {with_anchors} live item(s) have only anchors that never fired. This is a read-only copy, so they are not listed and cannot be fixed on this machine; the main machine's doctor lists them",
+            dead.len()
         );
     }
     dead.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.id.cmp(&b.1.id)));

@@ -899,6 +899,29 @@ fn fires_with_zero_items_owed_once_worked_long_enough() {
     assert!(reason.contains("No item is on this evaluation's verdict list"), "{reason}");
 }
 
+/// A read-only COPY of the memory cannot start or file an evaluation (no
+/// writable store, no write tools), so its Stop must never hold the turn for
+/// one - the same store, session and work that hold a normal Stop above.
+#[test]
+fn a_copy_never_holds_the_turn_for_an_evaluation() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let sandbox = Sandbox::new();
+    let project_dir = sandbox.project_dir("thor-fixture");
+
+    let store = EventStore::new(&db).unwrap();
+    seed_session_work(&db, Some("thor-fixture"), "s1", 90);
+    drop(store);
+
+    let out = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
+    assert!(out.contains("\"block\""), "control: without the copy marker the same Stop is held: {out}");
+
+    thor_core::copy_mode::write_marker(&db, &Default::default()).unwrap();
+    let out = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
+    assert!(!out.contains("block"), "a copy must not hold the turn for an evaluation: {out}");
+    assert!(!out.contains("evaluation"), "and must not nag about one: {out}");
+}
+
 /// Case named in the build brief: the session's first serving here was less
 /// than an hour ago -> silent, however long this project has gone without a
 /// report.

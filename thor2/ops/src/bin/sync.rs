@@ -54,7 +54,10 @@ enum Command {
     /// Refresh a COPY of the memory (a laptop's store) from the backup's git
     /// clone: fetch, apply only the missing events to a staged copy, then swap
     /// it in. Never touches the main store or the NAS; a failure keeps the old
-    /// copy. The first run needs `--repo` (it marks the store as a copy).
+    /// copy. On a copy made with `install --copy-from`, just run
+    /// `sync pull --db <the copy>` with nothing else: the copy remembers its
+    /// backup and its selection. Only a store that is not a copy yet needs
+    /// `--repo` (the first run marks it as a copy).
     Pull {
         #[arg(long)]
         db: PathBuf,
@@ -254,7 +257,14 @@ fn main() -> ExitCode {
         Command::Pull { db, repo, subdir, remote, no_fetch, rebuild, scopes, include_global, whole } => {
             let started = std::time::Instant::now();
             let opts = ops::pull::PullOptions { repo, subdir, remote, no_fetch, rebuild, scopes, include_global, whole };
-            ops::pull::pull(&db, &opts).map(|outcome| match outcome {
+            ops::pull::pull(&db, &opts)
+                .map_err(|e| match ops::pull::safe_directory_fix(&format!("{e:#}")) {
+                    Some(fix) => e.context(format!(
+                        "git refuses the backup folder because it belongs to another user account; if you trust it, run this one line and try again: {fix}"
+                    )),
+                    None => e,
+                })
+                .map(|outcome| match outcome {
                 ops::pull::PullOutcome::UpToDate { tip } => {
                     println!("pull: the copy is up to date at seq {tip} ({} ms)", started.elapsed().as_millis())
                 }
