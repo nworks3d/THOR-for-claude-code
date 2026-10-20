@@ -968,6 +968,40 @@ fn a_command_inside_a_prescribed_route_is_never_forbidden() {
     }
 }
 
+/// Defect 61: a call quoted verbatim in a sentence that presents it as the way
+/// to do the job (no recommending word within reach, no negation) is never
+/// refused by a tooth built from it. The same call in a prohibition still is.
+#[test]
+fn a_call_quoted_as_the_way_to_do_it_derives_no_forbidden_tooth() {
+    let forbidden_of = |text: &str, anchor: &str| -> Vec<String> {
+        let item = rule("route", text, vec![cmd(anchor)], None, None);
+        derive(&item, None)
+            .iter()
+            .filter_map(|d| match &d.check {
+                Check::Forbidden { literals } => Some(literals.join(" ")),
+                _ => None,
+            })
+            .collect()
+    };
+    for (text, anchor) in [
+        ("Run a script on the NAS via `ssh host sh -s < file`.", "sh"),
+        ("A script on the NAS goes over `ssh host sh -s < file` from the scratchpad.", "sh"),
+        ("The working way to run a script on the NAS is `ssh host sh -s < file`.", "sh"),
+        ("The working way to run a script on the NAS is `ssh host sh -s < file`.", "ssh"),
+        ("Scripts for the NAS are started like this: `ssh host sh -s < file`", "ssh"),
+    ] {
+        let found = forbidden_of(text, anchor);
+        assert!(found.is_empty(), "{text}: {found:?}");
+    }
+    for (text, anchor) in [
+        ("Never run `sh -s < file` on the NAS.", "sh"),
+        ("`ssh host sh -s < file` breaks on the NAS.", "sh"),
+        ("The NAS refuses `ssh host sh -s < file`.", "sh"),
+    ] {
+        assert!(!forbidden_of(text, anchor).is_empty(), "{text}");
+    }
+}
+
 /// FIELD 2026-10-03 (a retracted rule): "Gebruik op de NAS `sudo docker compose
 /// -p x up -d` - kaal `docker compose up -d` ... botst" prescribes the first
 /// span and warns off the second. The recommending word opens the sentence,

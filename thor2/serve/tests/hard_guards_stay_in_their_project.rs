@@ -584,3 +584,61 @@ fn an_unreadable_config_keeps_todays_answer() {
     let out = run_hook(&db, &bash("s-clone", &beta, &format!("git -C {text} push origin main")));
     assert!(!blocked(&out), "no remote could be read, so it is a repository of no known project: {out}");
 }
+
+/// Defect 59: a push ban on project alpha, the session in alpha's checkout,
+/// and `git -C <another repository> push`: the push targets that repository,
+/// so alpha's ban is not its business, however the folder is spelled. A bare
+/// `git push` from alpha is still refused.
+#[test]
+fn a_push_naming_another_repository_with_dash_c_is_not_the_sessions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = two_projects_with_push_rules(tmp.path());
+    let alpha = repo(tmp.path(), "alpha");
+    let other = tmp.path().join("other-repo");
+    std::fs::create_dir_all(other.join(".git")).unwrap();
+    std::fs::create_dir_all(other.join("sub")).unwrap();
+    let bare =tmp.path().join("other-bare.git");
+    std::fs::create_dir_all(bare.join("objects")).unwrap();
+    std::fs::create_dir_all(bare.join("refs")).unwrap();
+    std::fs::write(bare.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    let text = |p: &Path| p.to_string_lossy().replace('\\', "/");
+    let native = other.to_string_lossy().to_string();
+    for command in [
+        format!("git -C \"{}\" push origin main", text(&other)),
+        format!("git -C '{}' push origin main", text(&other)),
+        format!("git -C \"{native}\" push origin main"),
+        format!("git -C {} push origin main", text(&other.join("sub"))),
+        format!("git -C {} push origin main", text(&bare)),
+        format!("git -C \"{}\" -c core.x=1 push origin main", text(&other)),
+    ] {
+        let out = run_hook(&db, &bash("s-59", &alpha, &command));
+        assert!(!blocked(&out), "{command} pushes another repository: {out}");
+    }
+    let out = run_hook(&db, &bash("s-59", &alpha, "git push origin main"));
+    assert!(blocked(&out) && reason(&out).contains("alpha-never-pushes"), "alpha itself is still refused: {out}");
+}
+
+/// Defect 59, the `~` spelling: `git -C ~/other-repo push` names a folder under
+/// the home folder of the judging process.
+#[test]
+fn a_push_naming_another_repository_under_the_home_folder_is_not_the_sessions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = two_projects_with_push_rules(tmp.path());
+    let alpha = repo(tmp.path(), "alpha");
+    std::fs::create_dir_all(tmp.path().join("other-repo").join(".git")).unwrap();
+    let payload = bash("s-59h", &alpha, "git -C ~/other-repo push origin main");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_serve"))
+        .arg("--db")
+        .arg(&db)
+        .arg("hook")
+        .env("USERPROFILE", tmp.path())
+        .env("HOME", tmp.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn serve");
+    let _ = child.stdin.take().unwrap().write_all(payload.as_bytes());
+    let out = String::from_utf8(child.wait_with_output().expect("wait serve").stdout).unwrap();
+    assert!(!blocked(&out), "git -C ~/other-repo pushes that repository: {out}");
+}

@@ -15,6 +15,10 @@ What changed in each release, newest first. The release workflow copies the sect
 - **New starter note `keep-only-what-is-needed`.** Rebuildable things (build output, caches, models, installers, scratch and worktree folders, database copies) stay out of a repo and a backup, and temporary work is cleaned up after use. The starter pack has 14 notes.
 - **The helper-mode notes carry four more lessons.** A follow-up on the same subject goes to the same helper with a new complete brief, a helper runs a long job itself with a time limit and a log, a release is one push with nothing added after, and jobs of seconds are done by the session itself.
 - **A reply rule can demand that a word stands in a fenced code block.** The new opt-in rulebook field `fenced_only_exempt` makes a trigger term count only outside a ``` fence. When THOR refuses a call that needs the owner's go, it now also tells the assistant to show the word the owner must type on its own line in a fenced code block, so it can be copied with one click.
+- **A `requires` answer ignores upper and lower case.** A brief that said READ-ONLY was refused although `read-only` is an accepted answer. The trigger is still matched exactly.
+- **`git -C <another repository> push` is no longer judged by the session's project.** A bare repository (no `.git` entry) and a folder written with a leading `~` are now read as the repository the push really targets, so a push ban on one project stops refusing a push into another.
+- **A call the rule's text presents as the way to do the job gets no forbidden tooth.** A quoted call in a sentence about how to run something, with no negation or warning in it, is never turned into a ban on its own flags.
+- **A wrong `targets` shape now names the right one.** `remember` and `revise` answer with `targets: [{"kind": "path"|"dir"|"symbol"|"command"|"project"|"route"|"host", "value": "..."}]` instead of "invalid type: string".
 
 ## 2.6.0 (2026-10-17)
 

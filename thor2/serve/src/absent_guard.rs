@@ -1033,9 +1033,11 @@ pub fn find_requires_violation_owned(
             // says "subagents"); read only for a plain answer with no hyphen.
             let unhyphenated = std::cell::OnceCell::new();
             !required.iter().any(|r| {
-                let named = segment.unit.contains(r.as_str())
-                    || segment.unit_words.contains(r.as_str())
-                    || comments.contains(r.as_str())
+                // Answers match without regard to case: READ-ONLY says read-only.
+                let lower = r.to_lowercase();
+                let named = contains_ignoring_case(&segment.unit, &lower)
+                    || contains_ignoring_case(&segment.unit_words, &lower)
+                    || contains_ignoring_case(&comments, &lower)
                     || (r == crate::shell::ABSOLUTE_PATH_ANSWER
                         && (crate::shell::names_absolute_path(&segment.unit) || crate::shell::names_absolute_path(&segment.unit_words)))
                     || (!r.contains('-')
@@ -1043,7 +1045,8 @@ pub fn find_requires_violation_owned(
                             .get_or_init(|| {
                                 crate::shell::without_word_hyphens(&format!("{}\n{}\n{comments}", segment.unit, segment.unit_words))
                             })
-                            .contains(r.as_str()))
+                            .to_lowercase()
+                            .contains(lower.as_str()))
                     || r.strip_suffix('=').is_some_and(|name| {
                         env.get_or_init(|| crate::shell::env_before(segments, *at)).contains_key(name)
                     });
@@ -1069,6 +1072,11 @@ pub fn find_requires_violation_owned(
         ));
     }
     all_reasons(reasons)
+}
+
+/// Whether `haystack` holds `lower_needle` (already lowercase), ignoring case.
+fn contains_ignoring_case(haystack: &str, lower_needle: &str) -> bool {
+    haystack.to_lowercase().contains(lower_needle)
 }
 
 /// The variables that name a user's profile folder.
@@ -2781,6 +2789,31 @@ mod tests {
             find_requires_violation(&items, "Agent", None, "vat samen\nhaiku").is_none(),
             "an Agent call naming haiku still passes"
         );
+    }
+
+    /// Defect 57: a brief saying READ-ONLY answers a rule that accepts read-only.
+    #[test]
+    fn a_requires_answer_matches_without_regard_to_case() {
+        let item = model::item::Item {
+            id: "agent-brief-says-read-only".to_string(),
+            kind: model::item::Kind::Rule,
+            text: "an agent brief says read-only or writes".to_string(),
+            bindings: vec![model::item::Binding::Target { kind: model::item::TargetKind::Command, value: "Agent".to_string() }],
+            severity: None,
+            project: None,
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some("a brief without it is fine".to_string()),
+            check: Some(model::item::Check::Requires {
+                when: "Agent".to_string(),
+                required: vec!["read-only".to_string(), "writes".to_string()],
+            }),
+        };
+        let items = vec![LiveItem { id: item.id.clone(), item }];
+        assert!(find_requires_violation(&items, "Agent", None, "READ-ONLY: look around").is_none());
+        assert!(find_requires_violation(&items, "Agent", None, "Read-Only task").is_none());
+        assert!(find_requires_violation(&items, "Agent", None, "look around").is_some());
     }
 
     /// THE DEFECT THIS CLOSES. Before this function stopped comparing `when`
