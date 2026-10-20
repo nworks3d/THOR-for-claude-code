@@ -193,6 +193,7 @@ fn pull_whole(db: &Path, repo: &Path, subdir: &str, opts: &PullOptions, marker: 
         return Ok(PullOutcome::UpToDate { tip: if db.is_file() { copy_tip(db)?.0 } else { 0 } });
     };
     let dir = source.root.join(subdir);
+    install_rulebook(db, &dir);
     let segments = segment_files(&dir).with_context(|| format!("no backup segments in {}", dir.display()))?;
     if segments.is_empty() {
         bail!("no events-NNNN.jsonl in {}", dir.display());
@@ -363,6 +364,7 @@ fn pull_selective(db: &Path, repo: &Path, subdir: &str, opts: &PullOptions, mark
         return Ok(PullOutcome::UpToDate { tip: if db.is_file() { copy_tip(db)?.0 } else { 0 } });
     };
     let dir = source.root.join(subdir);
+    install_rulebook(db, &dir);
     let segments = segment_files(&dir).with_context(|| format!("no backup segments in {}", dir.display()))?;
     if segments.is_empty() {
         bail!("no events-NNNN.jsonl in {}", dir.display());
@@ -541,6 +543,45 @@ fn swap_in(db: &Path, staged: &Path) -> Result<()> {
     let _ = std::fs::remove_file(side(db, "-shm"));
     let _ = std::fs::remove_file(&old);
     Ok(())
+}
+
+/// The file name of the owner's reply rulebook, in the backup and beside a store.
+pub const RULEBOOK_FILE: &str = "guard-response-rulebook.json";
+
+/// Backup side: copy the owner's reply rulebook (beside the store `db`) into
+/// the backup folder `out_dir`. `Ok(false)` when there is no rulebook.
+pub fn carry_rulebook(db: &Path, out_dir: &Path) -> std::io::Result<bool> {
+    let source = serve::respond::default_rulebook_path(db);
+    if !source.is_file() {
+        return Ok(false);
+    }
+    std::fs::create_dir_all(out_dir)?;
+    std::fs::copy(&source, out_dir.join(RULEBOOK_FILE))?;
+    Ok(true)
+}
+
+/// Put the owner's reply rulebook, if the backup carries one, beside the
+/// copy's store. A different file already there is kept as `<name>.bak`
+/// first; an identical one is left alone. A failure is never fatal to the pull.
+fn install_rulebook(db: &Path, backup_dir: &Path) {
+    let source = backup_dir.join(RULEBOOK_FILE);
+    let Ok(wanted) = std::fs::read(&source) else { return };
+    let dest = serve::respond::default_rulebook_path(db);
+    if let Ok(existing) = std::fs::read(&dest) {
+        if existing == wanted {
+            return;
+        }
+        let _ = std::fs::write(side(&dest, ".bak"), existing);
+    }
+    let _ = std::fs::write(&dest, wanted);
+}
+
+/// When git refused a folder as "dubious ownership", the exact line that
+/// lets this user open it, built from the path git names in its message.
+pub fn safe_directory_fix(error_text: &str) -> Option<String> {
+    let after = error_text.split("dubious ownership in repository at").nth(1)?;
+    let path = after.split('\'').nth(1).filter(|p| !p.is_empty())?;
+    Some(format!("git config --global --add safe.directory \"{path}\""))
 }
 
 fn one_line(text: &str) -> String {
@@ -1155,5 +1196,55 @@ mod tests {
         let w = world(30);
         let last = segment_files(&w.repo.join("thor2")).unwrap().pop().unwrap();
         assert_eq!(last_seq_of(&last).unwrap(), w.main.contiguous_tip().unwrap().0);
+    }
+
+    #[test]
+    fn git_s_dubious_ownership_refusal_becomes_the_exact_safe_directory_line() {
+        let text = "git ls-remote failed: detected dubious ownership in repository at 'D:/nas/backup.git'";
+        assert_eq!(
+            safe_directory_fix(text).as_deref(),
+            Some("git config --global --add safe.directory \"D:/nas/backup.git\"")
+        );
+        assert_eq!(safe_directory_fix("git clone failed: repository not found"), None);
+    }
+
+    #[test]
+    fn the_owners_reply_rulebook_follows_the_backup_into_the_copy_and_the_old_one_is_kept() {
+        let w = world(3);
+        let main_db = w._dir.path().join("main.db");
+        std::fs::write(main_db.parent().unwrap().join(RULEBOOK_FILE), "[\"owner rules\"]").unwrap();
+        assert!(carry_rulebook(&main_db, &w.repo.join("thor2")).unwrap());
+        assert!(!carry_rulebook(&w._dir.path().join("elsewhere").join("x.db"), &w.repo.join("thor2")).unwrap());
+
+        let beside = serve::respond::default_rulebook_path(&w.copy);
+        std::fs::write(&beside, "[\"default\"]").unwrap();
+        pull(&w.copy, &opts(&w)).unwrap();
+        assert_eq!(std::fs::read_to_string(&beside).unwrap(), "[\"owner rules\"]");
+        assert_eq!(std::fs::read_to_string(side(&beside, ".bak")).unwrap(), "[\"default\"]", "the file that was there is kept");
+
+        // An identical file is left alone: no churn in the .bak.
+        std::fs::write(side(&beside, ".bak"), "marker").unwrap();
+        pull(&w.copy, &opts(&w)).unwrap();
+        assert_eq!(std::fs::read_to_string(side(&beside, ".bak")).unwrap(), "marker");
+    }
+
+    #[test]
+    fn a_whole_copy_never_brings_the_personal_library_along() {
+        let w = world(3);
+        std::fs::write(w.repo.join("thor2").join("library.jsonl"), "{\"shelf\":\"recipes\"}\n").unwrap();
+        let whole = PullOptions { whole: true, ..opts(&w) };
+        pull(&w.copy, &whole).unwrap();
+        let beside = std::fs::read_dir(w.copy.parent().unwrap()).unwrap().flatten().map(|e| e.file_name().to_string_lossy().to_string());
+        assert!(beside.into_iter().all(|name| !name.contains("library")));
+    }
+
+    #[test]
+    fn a_backup_without_a_rulebook_leaves_the_copys_own_alone() {
+        let w = world(3);
+        let beside = serve::respond::default_rulebook_path(&w.copy);
+        std::fs::write(&beside, "[\"mine\"]").unwrap();
+        pull(&w.copy, &opts(&w)).unwrap();
+        assert_eq!(std::fs::read_to_string(&beside).unwrap(), "[\"mine\"]");
+        assert!(!side(&beside, ".bak").exists());
     }
 }

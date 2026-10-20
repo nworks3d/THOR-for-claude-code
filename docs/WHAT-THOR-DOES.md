@@ -223,8 +223,7 @@ Words used once, in plain language:
   no machine-wide git hooks, no /thor-eval. You can name the projects the copy holds (--scope, repeatable)
   and whether it holds the general rules (--include-global); with neither you get the project of the folder
   you ran it in, and --whole-memory (or THOR_COPY_WHOLE=1 in the one-line download) copies everything and
-  wins over a project choice, so use it only on a computer you trust, never a work or company laptop. The items of every other project, the personal
-  library, refusal records and the "where it fired" text of served records are not in the copy file at all.
+  wins over a project choice, so use it only on a computer you trust, never a work or company laptop (it holds every project's notes and the records of what fired; the personal library file is never copied, by either kind of copy). In a selective copy the items of every other project, refusal records and the "where it fired" text of served records are not in the copy file at all.
   A selective copy has a hash chain of its own, so doctor can verify it. The choice is remembered in the
   marker and repeated by every later refresh (sync pull). The refresh runs by itself at session start, at
   most once an hour, builds a new copy beside the old one and swaps it in only when it is complete.

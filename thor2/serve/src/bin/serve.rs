@@ -3616,6 +3616,12 @@ fn stop_eval_decision(
     may_ask: bool,
     no_record: bool,
 ) -> EvalStop {
+    // A read-only copy can neither start nor file an evaluation (no writable
+    // store, no write tools), so the turn is never held for one. The session
+    // start already says once that the weekly check runs on the main machine.
+    if serve::store_dir::is_copy(db_path) {
+        return EvalStop::Quiet;
+    }
     let Ok(mut store) = serve::store_dir::open_existing(db_path) else { return EvalStop::Quiet };
     // The folder's own answer, for the words only: when the ask is about
     // another project, it says where the session stands.

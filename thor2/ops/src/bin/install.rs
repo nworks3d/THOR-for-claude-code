@@ -233,8 +233,9 @@ struct Cli {
     #[arg(long = "include-global")]
     include_global: bool,
 
-    /// With --copy-from: hold the whole memory, not a selection (the personal
-    /// library included: use it only on a machine you trust). Also read from
+    /// With --copy-from: hold the whole notes memory, not a selection (every
+    /// project, and the records of what fired: use it only on a machine you
+    /// trust; the personal library file is never copied). Also read from
     /// THOR_COPY_WHOLE=1. It wins over --scope and --include-global.
     #[arg(long = "whole-memory")]
     whole_memory: bool,

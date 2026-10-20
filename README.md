@@ -694,8 +694,13 @@ the choices to copy everything.)
 ### Or copy the whole memory
 
 Only do this on a computer you trust, such as your own second laptop. A full copy
-holds everything in your memory, including anything personal in it, so it does
-not belong on a work or company laptop (use the project choice above there).
+holds your whole notes memory: every project, the general work rules, and the
+records of which rules fired or refused (including the commands they fired at).
+It does NOT hold your personal library (recipes, books, training log): that is
+a separate file, and neither kind of copy ever reads it. Because a full copy
+holds every project's notes, anything personal you wrote as a note is in it, so
+it does not belong on a work or company laptop (use the project choice above
+there).
 
 You do not need to name a project. Open any terminal on the laptop (on Windows:
 press the Windows key, type `powershell`, press Enter), replace
@@ -731,8 +736,8 @@ Setting THOR up as a read-only copy of another machine's memory.
   project 'acme-shop': 2 notes
   general work rules: 1 notes
   every other project, and your personal library, were left out of the copy file on purpose
-+ connected THOR to Claude Code (4 of 4 connections), so the memory speaks up by itself
-+ the small file that keeps your assistant's replies tidy is in place
++ connected THOR's 4 hooks to Claude Code (4 were new), so the memory speaks up by itself; a copy registers no local tool server, so lookups go through an existing remote connection to the main machine, if you have one
++ the file that keeps your assistant's replies tidy is in place (the main machine's, when its backup carried one)
 
 What you have now
   the copy:       C:\Users\you\AppData\Local\thor2\thor.db
@@ -760,6 +765,11 @@ The command either finishes or says plainly that nothing was set up and why:
   could not be reached` - the laptop cannot read the backup. Go back to step 2
   of "What you need first". Nothing was left behind; run the same command again
   when it works.
+- `... Git refuses to open the backup folder because it belongs to another user
+  account` - git does not trust a folder owned by someone else (common on a NAS
+  share or a USB drive). The message ends with one line that starts with
+  `git config --global --add safe.directory`. Run exactly that line once in a
+  terminal, then run the install command again.
 - `This machine already has a memory of its own ... and it is not a copy, so I
   will not replace it` - THOR was installed here the normal way first and made
   its own empty memory. If you never saved a note here, rename the file named
@@ -797,7 +807,12 @@ The command either finishes or says plainly that nothing was set up and why:
 ```
 
 The choice is remembered, so a later `sync pull --db ...` with no options
-repeats it (this is what the automatic refresh does). A narrower choice removes
+repeats it (this is what the automatic refresh does). That is also the way to
+refresh by hand: on a copy made by the install command, `sync pull --db <the
+copy>` is the whole command. The copy remembers its backup and its selection,
+so you do not name them again. The same pull brings over the main computer's
+reply-tidying file (`guard-response-rulebook.json`) when its backup carries
+one; a file already there is kept beside it as `guard-response-rulebook.json.bak`. A narrower choice removes
 what it no longer covers from the copy at the next pull. `--whole` goes back to
 the whole memory. A refresh builds a new copy next to the old one and swaps it
 in only when it is complete and checks out; if anything goes wrong (no network,

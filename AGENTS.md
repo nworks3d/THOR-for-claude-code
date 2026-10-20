@@ -343,9 +343,10 @@ each pair when THOR is already unpacked):
   or `~/.thor2/install --copy-from "<backup>" --scope <project> --include-global`
 
 For a FULL copy of the whole memory, ask only where the backup is, and say
-plainly that everything in the memory, anything personal in it included, will be
-on that computer, so it is only for a computer the person trusts and never a
-work or company laptop. Then run (no project needed):
+plainly that every project's notes and the records of what fired will be on that
+computer (the personal library file is never copied, by either kind of copy), so
+it is only for a computer the person trusts and never a work or company laptop.
+Then run (no project needed):
 
 - Windows, in PowerShell:
   `$env:THOR_COPY_FROM = "<backup>"; $env:THOR_COPY_WHOLE = "1"; irm https://raw.githubusercontent.com/nworks3d/THOR-for-claude-code/main/install.ps1 | iex`
@@ -379,6 +380,13 @@ assistant could not read as a note. Refusal records are not copied, and the
 "where it fired" text of served records is removed, so no text from other
 sessions arrives. The copy is a derivative with a hash chain of its own, so
 `doctor` verifies it like any memory.
+
+Later refreshes are a single command, `sync pull --db "<the copy>"`: the copy
+remembers its backup and its selection, so nothing else is named. A pull also
+brings over the main machine's reply rulebook (`guard-response-rulebook.json`,
+carried in the backup) and keeps any file it replaces as `.bak`. If git refuses
+the backup folder with "dubious ownership", the install prints the exact
+`git config --global --add safe.directory` line to run.
 
 ## Backup
 

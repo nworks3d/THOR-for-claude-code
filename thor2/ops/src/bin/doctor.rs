@@ -72,6 +72,16 @@ struct Cli {
     /// --gate.
     #[arg(long, conflicts_with = "gate")]
     eval: bool,
+    /// Claude Code's settings file, when it is not in the standard place (the
+    /// same flag `install` has). Without it doctor looks in `~/.claude/settings.json`
+    /// and says "Claude Code does not know about THOR" if THOR's hooks are in
+    /// another file.
+    #[arg(long)]
+    settings: Option<PathBuf>,
+    /// Claude Code's tool-server file, when it is not in the standard place
+    /// (the same flag `install` has). Default: `~/.claude.json`.
+    #[arg(long = "mcp-json")]
+    mcp_json: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -106,8 +116,8 @@ fn main() -> ExitCode {
     // The short version first, in plain words. Not for the fast `--eval` form
     // (a routine reads that one) and not for `--gate` (a script runs that one).
     if !cli.eval && !cli.gate {
-        let settings = ops::install::default_settings_path();
-        let mcp_json = ops::install::default_user_mcp_path();
+        let settings = cli.settings.clone().or_else(ops::install::default_settings_path);
+        let mcp_json = cli.mcp_json.clone().or_else(ops::install::default_user_mcp_path);
         for line in ops::health::plain_summary(&cli.db, &cwd, settings.as_deref(), mcp_json.as_deref()) {
             println!("{line}");
         }
