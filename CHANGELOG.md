@@ -14,6 +14,7 @@ What changed in each release, newest first. The release workflow copies the sect
 - **`history` folds runs of `item_served` into one line.** A rule that fires often no longer drowns its refusals and revisions: consecutive served events show as one line with a count and the date range, every other event stays in full, and `all: true` returns the raw history.
 - **New starter note `keep-only-what-is-needed`.** Rebuildable things (build output, caches, models, installers, scratch and worktree folders, database copies) stay out of a repo and a backup, and temporary work is cleaned up after use. The starter pack has 14 notes.
 - **The helper-mode notes carry four more lessons.** A follow-up on the same subject goes to the same helper with a new complete brief, a helper runs a long job itself with a time limit and a log, a release is one push with nothing added after, and jobs of seconds are done by the session itself.
+- **A reply rule can demand that a word stands in a fenced code block.** The new opt-in rulebook field `fenced_only_exempt` makes a trigger term count only outside a ``` fence. When THOR refuses a call that needs the owner's go, it now also tells the assistant to show the word the owner must type on its own line in a fenced code block, so it can be copied with one click.
 
 ## 2.6.0 (2026-10-17)
 

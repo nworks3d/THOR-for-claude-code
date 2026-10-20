@@ -553,6 +553,12 @@ rule is one entry with:
   must not USE ("nog te controleren"): where the phrase sits inside quotation
   marks or inline code it is mentioned, not used, even in the agent's own
   first-person sentence. Left out, a quote is read as before.
+- `fenced_only_exempt` - `true` marks a rule whose trigger term only counts
+  outside a fenced code block (a block opened and closed by a line of three
+  backticks). A term alone inside a fence does not fire; the same term inline,
+  in inline code or in quotes still does. Use it to demand that a word the
+  owner must type (an approval word) stands on its own line in a fence, so it
+  can be copied. Left out, fences are read as ordinary text.
 - `hedge_words_before` - single words that, earlier in the same sentence as a
   trigger term, make it a promise or a condition and not a claim ("zodra",
   "of", "once"). Left out, nothing is read as a hedge.
