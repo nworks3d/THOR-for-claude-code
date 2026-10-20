@@ -562,7 +562,7 @@ pub fn segment_projects(
                 if dir.contains('$') {
                     shell::expand_vars(dir, &shell::env_before(segments, i))
                 } else {
-                    dir.to_string()
+                    home_expanded(dir)
                 }
             });
             effective_dir(text.as_deref(), cwd)
@@ -587,6 +587,9 @@ pub fn segment_projects(
                     // project's repository (a remote shared with that project's working copy), in
                     // a folder of another name: it is still that project's, and its pushes are.
                     Some(other) if git && session_project != Some(other.as_str()) => live.project_of_remote(dir),
+                    // A bare repository has no `.git` entry to find, yet git acts on it and on
+                    // nothing else: it is not the session's repository.
+                    None if git && is_bare_repository(dir) => live.project_of_remote(dir),
                     _ => session,
                 }
             }
@@ -777,6 +780,27 @@ impl<'a> Live<'a> {
     pub fn knows_project(&self, project: &str) -> bool {
         self.projects.get_or_init(|| self.known_projects()).contains(project)
     }
+}
+
+/// `dir` with a leading `~` (the home folder, as a shell reads it) replaced by the
+/// home folder of the process that judges it; `dir` unchanged when it does not start
+/// with one, or no home folder is known (`effective_dir` then leaves it unresolved).
+fn home_expanded(dir: &str) -> String {
+    let rest = match dir.strip_prefix('~') {
+        Some("") => "",
+        Some(rest) if rest.starts_with('/') || rest.starts_with('\\') => rest,
+        _ => return dir.to_string(),
+    };
+    match std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
+        Ok(home) if !home.is_empty() => format!("{}{rest}", home.trim_end_matches(['/', '\\'])),
+        _ => dir.to_string(),
+    }
+}
+
+/// Whether `dir` is a bare git repository itself: a `HEAD` file beside an `objects` and
+/// a `refs` folder, with no `.git` above it to tell so.
+fn is_bare_repository(dir: &Path) -> bool {
+    dir.join("HEAD").is_file() && dir.join("objects").is_dir() && dir.join("refs").is_dir()
 }
 
 /// The folder a segment's own directory text names, made absolute against
