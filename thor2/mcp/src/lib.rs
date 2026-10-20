@@ -510,6 +510,55 @@ pub struct TargetArg {
     pub value: String,
 }
 
+/// The shape `targets` must have, named in every error about it.
+const TARGETS_SHAPE: &str =
+    r#"targets: [{"kind": "path"|"dir"|"symbol"|"command"|"project"|"route"|"host", "value": "..."}]"#;
+
+fn json_type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "a list",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
+/// `targets` read from JSON, with an error that names the shape wanted
+/// instead of serde's bare "invalid type: string".
+fn parse_targets(v: serde_json::Value) -> Result<Vec<TargetArg>, String> {
+    let serde_json::Value::Array(items) = v else {
+        return Err(format!("targets was given {}, but it must be a list of objects: {TARGETS_SHAPE}", json_type_name(&v)));
+    };
+    items
+        .into_iter()
+        .enumerate()
+        .map(|(i, item)| {
+            if !item.is_object() {
+                return Err(format!("targets[{i}] is {}, but every entry must be an object: {TARGETS_SHAPE}", json_type_name(&item)));
+            }
+            serde_json::from_value::<TargetArg>(item).map_err(|e| format!("targets[{i}] is not valid ({e}): {TARGETS_SHAPE}"))
+        })
+        .collect()
+}
+
+fn targets_list<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<TargetArg>, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    if v.is_null() {
+        return Ok(Vec::new());
+    }
+    parse_targets(v).map_err(serde::de::Error::custom)
+}
+
+fn targets_option<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Vec<TargetArg>>, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    if v.is_null() {
+        return Ok(None);
+    }
+    parse_targets(v).map(Some).map_err(serde::de::Error::custom)
+}
+
 /// Turn the three flat MCP fields (moments, targets, always) into the
 /// `Binding` list `model::item::Item` actually stores. The one place both
 /// `remember` and `revise` build a binding list, so the two tools can never
@@ -1845,7 +1894,7 @@ pub struct RememberArgs {
     /// Exact targets this item fires on (repeatable). Only a Rule/Orientation
     /// may bind to a target; the value must be the real path/command/etc,
     /// never a glob and never a bare role name.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "targets_list")]
     pub targets: Vec<TargetArg>,
     /// Bind this item to the pinned Always layer (served in full at every
     /// session start). Only a Rule/Orientation may set this.
@@ -2038,7 +2087,7 @@ pub struct ReviseArgs {
     pub moments: Option<Vec<String>>,
     /// Replaces the target bindings - see `moments`' own note on how the
     /// three binding fields combine.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "targets_option")]
     pub targets: Option<Vec<TargetArg>>,
     /// Replaces whether this item is bound Always - see `moments`' own note.
     #[serde(default)]
@@ -4022,6 +4071,28 @@ mod tests {
     /// A Claude Code session id, the shape `serve::attest` requires of a
     /// session whose refusals count as field evidence.
     const FIXTURE_SESSION: &str = "0de7dc52-1b97-4b66-948f-61e4438043b2";
+
+    /// Defect 63: `targets` given as a plain string names the shape wanted.
+    #[test]
+    fn a_wrong_targets_shape_names_the_shape_wanted() {
+        let remember = |targets: serde_json::Value| {
+            serde_json::from_value::<RememberArgs>(serde_json::json!({"id": "x", "kind": "rule", "text": "t", "targets": targets}))
+        };
+        let revise = |targets: serde_json::Value| serde_json::from_value::<ReviseArgs>(serde_json::json!({"id": "x", "targets": targets}));
+        for err in [
+            remember(serde_json::json!("git push")).err().unwrap().to_string(),
+            remember(serde_json::json!(["git push"])).err().unwrap().to_string(),
+            remember(serde_json::json!([{"value": "git push"}])).err().unwrap().to_string(),
+            revise(serde_json::json!("git push")).err().unwrap().to_string(),
+        ] {
+            assert!(err.contains("\"kind\": \"path\"|\"dir\"|\"symbol\"|\"command\"|\"project\"|\"route\"|\"host\""), "{err}");
+            assert!(err.contains("\"value\""), "{err}");
+        }
+        let ok = remember(serde_json::json!([{"kind": "command", "value": "git push"}])).unwrap();
+        assert_eq!(ok.targets.len(), 1);
+        assert!(remember(serde_json::Value::Null).unwrap().targets.is_empty());
+        assert!(revise(serde_json::Value::Null).unwrap().targets.is_none());
+    }
 
     fn server() -> ThorMcpServer {
         ThorMcpServer::new(EventStore::in_memory().unwrap())

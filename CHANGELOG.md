@@ -4,6 +4,11 @@ What changed in each release, newest first. The release workflow copies the sect
 
 ## Unreleased
 
+- **A `requires` answer ignores upper and lower case.** A brief that said READ-ONLY was refused although `read-only` is an accepted answer. The trigger is still matched exactly.
+- **`git -C <another repository> push` is no longer judged by the session's project.** A bare repository (no `.git` entry) and a folder written with a leading `~` are now read as the repository the push really targets, so a push ban on one project stops refusing a push into another.
+- **A call the rule's text presents as the way to do the job gets no forbidden tooth.** A quoted call in a sentence about how to run something, with no negation or warning in it, is never turned into a ban on its own flags.
+- **A wrong `targets` shape now names the right one.** `remember` and `revise` answer with `targets: [{"kind": "path"|"dir"|"symbol"|"command"|"project"|"route"|"host", "value": "..."}]` instead of "invalid type: string".
+
 ## 2.6.0 (2026-10-17)
 
 **What changed.** You can now use THOR on a second computer, such as a laptop, with one command: it keeps a read-only copy of your memory there, and you choose which projects the copy holds, so a work laptop need not hold everything. If an antivirus removes one of THOR's programs, THOR now says which one is missing and how to get it back, instead of going quiet. THOR's check for its own faults no longer mistakes a refused file edit for a faulty command. The note shown at the start of a session has a little more room and is cut exactly, a rule that can refuse a wrong step now comes before a note that only informs, and a rule can ask a command to name a full folder path. The one-line install can also ask for a full copy of the memory on a second computer. Several fixes make rules read Windows command lines correctly: a plain word also matches its hyphenated spelling, and assignments, short switches and braces no longer confuse the matching.

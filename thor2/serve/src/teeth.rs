@@ -879,12 +879,71 @@ fn derive(item: &Item, root: Option<&Path>) -> Vec<Derived> {
     let out = derive_all(item, root);
     let raw: Vec<&str> = item.text.split_whitespace().collect();
     let recommended: Vec<String> = recommended_fragments(item, &raw);
+    let prescribed = prescribed_spans(item, &raw);
     out.into_iter()
         .filter(|d| match &d.check {
-            Check::Forbidden { literals } => !literals.iter().any(|l| recommended.iter().any(|r| r == l)),
+            Check::Forbidden { literals } => {
+                !literals.iter().any(|l| recommended.iter().any(|r| r == l))
+                    && !literals.iter().any(|l| prescribed.iter().any(|span| contains_words(span, l)))
+            }
             _ => true,
         })
         .collect()
+}
+
+/// Words that say the call beside them goes wrong or is refused: a sentence
+/// holding one of them quotes the call to warn off it, never to prescribe it.
+const WARNING: &[&str] = &[
+    "refuse", "refuses", "refused", "block", "blocks", "blocked", "break", "breaks", "broke", "clash", "clashes", "fail", "fails",
+    "failed", "hang", "hangs", "kills", "destroys", "wipes", "deletes", "loses", "corrupts", "crash", "crashes", "error", "errors",
+    "dangerous", "destructive", "unsafe", "bad", "wrong", "harmful", "botst", "faalt", "kapot", "gevaarlijk", "fout",
+];
+
+/// Words that say the sentence tells HOW to do a job: a call quoted beside one is
+/// the way to do it, not a thing to ban.
+const ROUTE: &[&str] = &[
+    "run", "runs", "running", "start", "starts", "started", "via", "over", "through", "goes", "go", "way", "route", "pipe", "pipes",
+    "piped", "send", "sent", "feed", "feeds", "execute", "executes", "invoke", "invoked",
+];
+
+/// The words of every call the text quotes verbatim (a backtick or quote span of
+/// two words or more) in a sentence that neither negates nor warns: the text
+/// presents that call as the way to do the job, so a tooth built from it would
+/// refuse the very call the rule prescribes (defect 61). A sentence ends at
+/// `.`, `!` or `?` only: "Never do this: `x -f`" keeps its prohibition.
+fn prescribed_spans(item: &Item, raw: &[&str]) -> Vec<Vec<String>> {
+    let word = |t: &str| t.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'').to_lowercase();
+    let ends = |t: &str| t.ends_with(['.', '!', '?']);
+    let mut out = Vec::new();
+    for c in gate::teeth_candidates(item) {
+        if !matches!(c.source, gate::CandidateSource::Backtick | gate::CandidateSource::Quoted) {
+            continue;
+        }
+        let words: Vec<&str> = c.value.split_whitespace().collect();
+        if words.len() < 2 {
+            continue;
+        }
+        let Some(at) = span_position(raw, &words) else { continue };
+        let before = raw[..at].iter().rev().take_while(|t| !ends(t));
+        let mut stop = false;
+        let after = raw[at..].iter().take_while(|t| !std::mem::replace(&mut stop, ends(t)));
+        let sentence: Vec<String> = before.chain(after).map(|t| word(t)).collect();
+        if sentence.iter().any(|w| NEGATING.contains(&w.as_str()) || WARNING.contains(&w.as_str())) {
+            continue;
+        }
+        if !sentence.iter().any(|w| ROUTE.contains(&w.as_str())) {
+            continue;
+        }
+        out.push(words.iter().map(|w| w.to_string()).collect());
+    }
+    out
+}
+
+/// Whether `literal`'s whitespace-separated words stand next to each other, in
+/// order, among `span`'s words.
+fn contains_words(span: &[String], literal: &str) -> bool {
+    let wanted: Vec<&str> = literal.split_whitespace().collect();
+    !wanted.is_empty() && span.windows(wanted.len()).any(|w| w.iter().zip(&wanted).all(|(a, b)| a == b))
 }
 
 /// Every flag or fragment the text names right after a command it
