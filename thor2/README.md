@@ -124,7 +124,7 @@ the owner's language, work lane only, every starting note kept), and so does the
 turn-end reminder that holds the session, so a fresh agent that never read
 AGENTS.md finishes the setup in one sentence without asking anything.
 
-Thirteen more notes make up the workflow starter pack, tagged
+Fourteen more notes make up the workflow starter pack, tagged
 `workflow-starter` (`ops::install::workflow_starter_pack`): general
 coding-workflow habits that were marked useful again and again in the store of
 the person who built this, rewritten to hold on any project - a changelog line

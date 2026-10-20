@@ -4,6 +4,10 @@ What changed in each release, newest first. The release workflow copies the sect
 
 ## Unreleased
 
+- **`history` folds runs of `item_served` into one line.** A rule that fires often no longer drowns its refusals and revisions: consecutive served events show as one line with a count and the date range, every other event stays in full, and `all: true` returns the raw history.
+- **New starter note `keep-only-what-is-needed`.** Rebuildable things (build output, caches, models, installers, scratch and worktree folders, database copies) stay out of a repo and a backup, and temporary work is cleaned up after use. The starter pack has 14 notes.
+- **The helper-mode notes carry four more lessons.** A follow-up on the same subject goes to the same helper with a new complete brief, a helper runs a long job itself with a time limit and a log, a release is one push with nothing added after, and jobs of seconds are done by the session itself.
+
 ## 2.6.0 (2026-10-17)
 
 **What changed.** You can now use THOR on a second computer, such as a laptop, with one command: it keeps a read-only copy of your memory there, and you choose which projects the copy holds, so a work laptop need not hold everything. If an antivirus removes one of THOR's programs, THOR now says which one is missing and how to get it back, instead of going quiet. THOR's check for its own faults no longer mistakes a refused file edit for a faulty command. The note shown at the start of a session has a little more room and is cut exactly, a rule that can refuse a wrong step now comes before a note that only informs, and a rule can ask a command to name a full folder path. The one-line install can also ask for a full copy of the memory on a second computer. Several fixes make rules read Windows command lines correctly: a plain word also matches its hyphenated spelling, and assignments, short switches and braces no longer confuse the matching.
