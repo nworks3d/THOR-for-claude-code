@@ -408,6 +408,46 @@ then names the place the last copy went. The memory can be rebuilt from it with
 `backup.exe --db "<a new store path>" --restore-from "<the thor2 folder of the
 backup>"`.
 
+## Two folders the person may name (only when they ask)
+
+Nothing here is on by default and nothing here is part of the setup: do it only
+when the person says they have such a folder. THOR only ever reads these folders;
+it never deletes, moves or edits anything in them. Ask them for the full path and
+run the command yourself (they type nothing). A network path such as
+`\\nas\projects\tools` works. Each command checks that the folder exists and
+answers before it writes anything, and prints in plain words what it set; read
+that out to them in your own words.
+
+- A **temp-until-live folder** holds one sub-folder per production, named
+  `<YYYY-MM-DD>_<repo>_<subject>` (for example `2026-10-20_shop_banner`), each
+  with a `STATUS.txt` whose first line starts with `STATUS:`. A production that is
+  live has `STATUS: live` there, which means it may be deleted. Name it with
+  `install --set-temp-folder "<full path>" --db "<their store>"`. From then on the
+  first session start of a day names the productions that say they may be deleted
+  and those older than 30 days that are not live, and `doctor` shows the same. Tell
+  the person what it names and delete nothing unless they say so for that folder.
+- A **tools folder** holds one sub-folder per reusable helper tool, each with a
+  `README.txt` (or `README.md`) whose first line says in one sentence what the tool
+  does. Name it with `install --set-tools-folder "<full path>" --db "<their store>"`.
+  From then on EVERY session start lists the tools (one line each, built from the
+  folders, nobody maintains it), so look there before writing a new helper script.
+  A new reusable helper gets its own sub-folder with a README whose first line says
+  what it does. At most once a day a session start also names a tool folder with no
+  README, a README with no first line, and script files lying loose in the tools
+  folder. And when you write a script file (`.py`, `.ps1`, `.sh`, `.js` and a few
+  more) outside any git repository, and it is still there 30 minutes later, the end
+  of the turn is held once: move the reusable ones into the tools folder with a
+  README, delete the one-offs. A script made by a shell redirect is not noticed.
+- Both settings are in `work-folders.json` beside the memory
+  (`{"temp_until_live": "...", "temp_max_age_days": 30, "tools": "..."}`, every key
+  optional). `install --set-temp-folder off --db "<their store>"` and
+  `install --set-tools-folder off --db "<their store>"` switch them off again;
+  both flags can be given in one call. The age limit of 30 days is changed by
+  editing that number by hand.
+- If a folder is on a share that is switched off, a session start never waits for
+  it (about 1.5 seconds in total): it shows the list it kept last time, marked with
+  its date, or says nothing. `doctor` says when it cannot read a folder.
+
 ## The tools you have
 
 After the restart you get sixteen. These are the ones setup needs; the rest

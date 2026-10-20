@@ -88,6 +88,16 @@
 //! `absent_guard` recorded as unable to prove its own currency is still
 //! outstanding. See `stale_guard`'s own doc comment, and `bin/serve.rs`'s
 //! `stale_guard_stop_check` for where it sits in the Stop arm.
+//!
+//! `work_folders` and `leftover_scripts` are off until the owner names a
+//! temp-until-live folder or a tools folder (`work-folders.json` beside the
+//! store). `work_folders` adds lines to the session-start block (a once-a-day
+//! notice of productions that may be deleted, a once-a-day check of the tools
+//! folder, and the list of helper tools at every start), reading both folders
+//! under one time limit so an unreachable share can never hold a start;
+//! `leftover_scripts` notes script files written outside any git work tree
+//! and holds a turn end once per file per session. Neither ever deletes,
+//! moves or writes inside the owner's folders.
 
 pub mod absent_guard;
 pub mod attest;
@@ -108,6 +118,7 @@ pub mod holder;
 pub mod hook_faults;
 pub mod input;
 pub mod judge;
+pub mod leftover_scripts;
 pub mod legit;
 pub mod live;
 pub mod lookup;
@@ -143,6 +154,7 @@ pub mod usefulness;
 #[cfg(feature = "semantic")]
 pub mod vectors;
 pub mod volume;
+pub mod work_folders;
 
 use thor_core::event_store::EventStore;
 

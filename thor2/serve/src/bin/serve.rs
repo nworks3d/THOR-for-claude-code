@@ -1216,6 +1216,10 @@ fn plain_line_for_block(event: &str, reason: &str) -> &'static str {
         "Stop" if lower.contains("walked through setup") => {
             "THOR (the memory your assistant uses) is finishing its setup. Your assistant shows you a short numbered list of what was set up, already switched on with sensible defaults, such as answering in your own language. Answer the numbers you care about, or just carry on: nothing is needed from you."
         }
+        // Before the evaluation arm: an evaluation ask can ride along with this hold.
+        "Stop" if lower.contains(&serve::leftover_scripts::HOLD_MARKER.to_lowercase()) => {
+            "Your assistant left a few helper scripts outside your projects. THOR asks it to keep the useful ones in your tools folder and delete the rest before it finishes. Nothing is needed from you."
+        }
         "Stop" if lower.contains("evaluation") => {
             "THOR asks your assistant to do a short tidy-up of its memory before it finishes. It can take a few minutes. Nothing is needed from you."
         }
@@ -1270,6 +1274,7 @@ mod line_for_the_person_tests {
             ("Stop", "[THOR] The evaluation of 'x' is still open"),
             ("Stop", "[THOR] The owner may have just stated a NEW durable decision"),
             ("Stop", "[THOR] a reply rule fired"),
+            ("Stop", "[THOR] Script file(s) were written outside any git repository during this session\n\nThe evaluation of 'x' is still open"),
         ];
         for (event, reason) in cases {
             let out = with_line_for_the_person(event, block(reason));
@@ -1282,6 +1287,17 @@ mod line_for_the_person_tests {
                 assert!(!line.contains(jargon), "{event}: the plain line must not use {jargon:?}: {line}");
             }
         }
+    }
+
+    #[test]
+    fn the_leftover_script_hold_is_described_as_itself_even_with_an_evaluation_ask_beside_it() {
+        let out = with_line_for_the_person(
+            "Stop",
+            block("[THOR] Script file(s) were written outside any git repository during this session\n\nThe evaluation of 'x' is still open"),
+        );
+        let line = line_of(out);
+        assert!(line.contains("helper scripts"), "{line}");
+        assert!(!line.contains("memory"), "it is not the evaluation sentence: {line}");
     }
 
     #[test]
@@ -1889,6 +1905,18 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             }
         }
 
+        // SCRIPT FILES LEFT OUTSIDE ANY GIT REPOSITORY (`serve::leftover_scripts`),
+        // only when the owner named a tools folder: once per file per session,
+        // for a file still there and untouched for 30 minutes. Like the debts
+        // above it is about this session's own doing, so it is never asked of
+        // a subagent; a copy takes no state write, so it could not remember
+        // having asked and asks nothing.
+        if !is_subagent && !copy {
+            if let Some(reason) = serve::leftover_scripts::hold_reason(db_path, &session_id, time::now_unix()) {
+                return hold(reason);
+            }
+        }
+
         // THE EVALUATION DEBT (2026-09-12, moved ahead of the judgement debt
         // below; its own trigger rewritten SEVEN TIMES, three of them on
         // 2026-09-16, three on 2026-09-17 - see `usefulness`'s own
@@ -2139,6 +2167,21 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
         None
     };
 
+    // LEFTOVER SCRIPTS (`serve::leftover_scripts`): a script file this call is
+    // about to write outside any git repository is noted, when the owner named
+    // a tools folder, so the turn end can ask what to keep. Every other call
+    // costs a tool-name comparison and an extension check, no disk read.
+    if event_name == "PreToolUse" {
+        serve::leftover_scripts::record_write(
+            db_path,
+            &session_id,
+            payload.get("tool_name").and_then(|v| v.as_str()).unwrap_or(""),
+            payload.get("tool_input"),
+            session_cwd.as_deref(),
+            time::now_unix(),
+        );
+    }
+
     let mut store = serve::store_dir::open_for_hook(db_path)?;
 
     match event_name.as_str() {
@@ -2259,8 +2302,28 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             // that is not on disk (an antivirus quarantine): said every start
             // until it is back, with the steps. Not for a subagent.
             let missing_program = (!payload_is_from_a_subagent(&payload)).then(|| serve::missing_programs::session_line(db_path)).flatten();
-            let extras: Vec<String> =
-                [copy_line, reminder, registration, open_points, missing_program].into_iter().flatten().collect();
+            // The owner's two work folders, when named (`serve::work_folders`):
+            // the temp-until-live notice and the tools-folder check once a day,
+            // the helper-tools overview every start. Both folders are read on
+            // worker threads under one time limit, so an unreachable network
+            // share can never hold a session start. Not for a subagent.
+            let work_folders = match payload_is_from_a_subagent(&payload) {
+                true => Vec::new(),
+                false => serve::work_folders::session_start_lines(
+                    db_path,
+                    time::now_unix(),
+                    !kind.headless,
+                    !no_record,
+                    serve::work_folders::HOOK_READ_LIMIT,
+                    &serve::work_folders::READERS,
+                )
+                .into_lines(),
+            };
+            let extras: Vec<String> = [copy_line, reminder, registration, open_points, missing_program]
+                .into_iter()
+                .flatten()
+                .chain(work_folders)
+                .collect();
             let extras_len: usize = extras.iter().map(|e| e.len() + 2).sum();
             // What this project's own sessions used lately ranks first (step 31).
             let recent = match folder_project.as_deref() {
