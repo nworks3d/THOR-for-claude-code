@@ -769,6 +769,10 @@ To take a setting back, use `git config --unset thor.mediagate.maxbytes` (add
 - A commit that finishes a merge is not checked: it lists everything the other
   side brought in, and that is already part of your history. One line says so.
 - Renaming a video that is already in the repository counts as adding it.
+- THOR's own backup folder is left out of this check on purpose: the copies of
+  your memory it keeps there can be larger than 25 MB, so THOR sets
+  `thor.mediagate.enabled` to `false` in that one folder's own git settings
+  (each time it makes a copy), and every other repository keeps the check.
 - The check is part of THOR's shared git hooks, so it is only active where those
   are in use. If you already had a global git hooks folder of your own, the
   installer left it alone and the check is not active.

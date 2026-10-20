@@ -121,8 +121,10 @@ Words used once, in plain language:
   escapes and printed that way. It fails open: a missing helper program (sed, awk, git cat-file with
   formats) finds nothing and the commit goes on. It needs the shared hooks of A7, so it is not active
   where another tool already owns core.hooksPath, and an existing install gets it by running the
-  installer once more (it rewrites a dispatcher whose text changed). The first-session list names it in
-  item 3 (the git hooks).
+  installer once more (it rewrites a dispatcher whose text changed). The folder THOR keeps its backup in
+  (A16) is left out on purpose: the backup program sets `thor.mediagate.enabled` to `false` in that folder's
+  own git config each time it makes a copy, because a copy of the memory can be above the limit, and no
+  other repository is affected. The first-session list names it in item 3 (the git hooks).
 - Refuse or change: yes, see F16.
 
 ### A8. It writes the /thor-eval routine
@@ -231,6 +233,9 @@ Words used once, in plain language:
   computer, a private repository) becomes a remote called "nas"; "off" removes only the one
   SessionStart hook that runs the backup, and copies already made stay. Choosing wires that hook
   (it runs at session start, at most one copy a day) and makes a first copy at once to prove it works.
+  The backup folder is exempt from the media gate (A7b): a copy of the memory is cut into files of up to
+  50 MB, and the gate would refuse them, so the folder's own git config gets `thor.mediagate.enabled=false`
+  when you choose and again before every backup commit.
 - Why: the log is append-only and a lost file is gone. On 2026-10-01 a backup silently failed for days
   because the log passed GitHub's file limit.
 - You notice: nothing until you choose, because no hook or schedule for it is written by the install.

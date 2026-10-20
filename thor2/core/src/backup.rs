@@ -65,6 +65,35 @@ fn failure_reason(stderr: &str) -> String {
     }
 }
 
+/// The git setting THOR's shared `pre-commit` hook (the media gate) reads to
+/// know it is switched off.
+const MEDIA_GATE_SWITCH: &str = "thor.mediagate.enabled";
+
+/// Make sure THOR's own media gate can never stop a backup commit in `repo`.
+///
+/// WHY THIS EXISTS. The machine-wide `pre-commit` hook refuses any staged file
+/// above 25 MiB by default, and an export segment is cut at up to
+/// `SEGMENT_MAX_BYTES` (50 MB). Where the hook is wired, the first backup
+/// commit that touched a full segment was refused and the backup stopped
+/// for good: segments of 47.7, 47.7 and 40.5 MB were seen on the owner's PC.
+/// The backup repository is THOR's own, and it holds nothing but the export, so
+/// the gate has no job there.
+///
+/// HOW. `thor.mediagate.enabled=false` in the repository's LOCAL config only:
+/// every other repository keeps the gate, and nothing here uses `--no-verify`
+/// or touches `core.hooksPath`, so the dispatcher still hands control to the
+/// repository's own hooks after the (now quiet) gate. Reads first and writes
+/// only when the value is not already false, so calling it before every commit
+/// is one cheap `git config` and a repeat run changes nothing. An install made
+/// before this existed is fixed by its next backup.
+pub fn exempt_from_media_gate(repo: &Path) -> anyhow::Result<()> {
+    let current = git_text(repo, &["config", "--local", "--bool", "--get", MEDIA_GATE_SWITCH]);
+    if current.as_deref() == Some("false") {
+        return Ok(());
+    }
+    git(repo, &["config", "--local", MEDIA_GATE_SWITCH, "false"])
+}
+
 /// Age in hours of the last commit reachable from local `HEAD` that touched
 /// `subdir`, or None if there is none. Used only when there is no upstream
 /// to measure from instead - see `last_commit_age_hours_at`.
@@ -319,6 +348,9 @@ fn backup_inner(
     if clean {
         return Ok(prefix(format!("no change since last backup ({n} events) - nothing to commit")));
     }
+    // Every time, not once at setup: a repository connected before this check
+    // existed has to be fixed by its next backup, not by a reinstall.
+    exempt_from_media_gate(repo)?;
     git(repo, &["commit", "-m", &format!("{subdir} backup ({n} events)")])?;
     if local_only {
         return Ok(prefix(format!("committed {subdir} local backup ({n} events); no remote, so nothing left this machine")));
@@ -1168,5 +1200,48 @@ mod tests {
         assert_eq!(target.branch, "main");
         assert_eq!(target.tracking.as_deref(), Some("refs/remotes/nas/main"));
         assert_eq!(remote_url(&fx.work, "nas").as_deref(), Some(nas.to_str().unwrap()));
+    }
+
+    // ------------------------------------------ THOR's media gate stays out
+
+    fn local_gate_switch(repo: &Path) -> Option<String> {
+        git_text(repo, &["config", "--local", "--bool", "--get", MEDIA_GATE_SWITCH])
+    }
+
+    #[test]
+    fn a_backup_turns_the_media_gate_off_in_its_own_repository_and_touches_nothing_else() {
+        let fx = make_git_fixture();
+        git_ok(&fx.work, &["config", "--local", "core.hooksPath", "hooks-of-this-repository"]);
+        assert_eq!(local_gate_switch(&fx.work), None, "the fixture starts with the gate on");
+        let mut store = EventStore::in_memory().unwrap();
+        seed(&mut store);
+
+        backup_to_repo(&store, &fx.work, "thor2", true).unwrap();
+
+        assert_eq!(local_gate_switch(&fx.work).as_deref(), Some("false"));
+        assert_eq!(
+            git_text(&fx.work, &["config", "--local", "--get", "core.hooksPath"]).as_deref(),
+            Some("hooks-of-this-repository"),
+            "the repository's other hooks are not rerouted"
+        );
+        assert_eq!(local_gate_switch(&fx.remote), None, "the remote is not touched");
+    }
+
+    #[test]
+    fn exempting_twice_changes_nothing_and_a_gate_left_on_is_corrected() {
+        let fx = make_git_fixture();
+        exempt_from_media_gate(&fx.work).unwrap();
+        exempt_from_media_gate(&fx.work).unwrap();
+        let all = git_text(&fx.work, &["config", "--local", "--get-all", MEDIA_GATE_SWITCH]).unwrap();
+        assert_eq!(all, "false", "one value, written once");
+
+        git_ok(&fx.work, &["config", "--local", MEDIA_GATE_SWITCH, "true"]);
+        exempt_from_media_gate(&fx.work).unwrap();
+        assert_eq!(local_gate_switch(&fx.work).as_deref(), Some("false"));
+
+        // "off" already means false to the gate: it is left as the person wrote it.
+        git_ok(&fx.work, &["config", "--local", MEDIA_GATE_SWITCH, "off"]);
+        exempt_from_media_gate(&fx.work).unwrap();
+        assert_eq!(git_text(&fx.work, &["config", "--local", "--get", MEDIA_GATE_SWITCH]).as_deref(), Some("off"));
     }
 }

@@ -199,9 +199,11 @@ pub struct Prepared {
     pub dropped_remote: bool,
 }
 
-/// Make `repo` a git folder on branch `main` that can commit, and set its
-/// remote to match the choice: none for `place == None`, `nas` otherwise (the
-/// branch is pushed once so the first backup has something to sync with).
+/// Make `repo` a git folder on branch `main` that can commit and that THOR's
+/// media gate leaves alone (see `thor_core::backup::exempt_from_media_gate`),
+/// and set its remote to match the choice: none for `place == None`, `nas`
+/// otherwise (the branch is pushed once so the first backup has something to
+/// sync with).
 pub fn prepare_repo(repo: &Path, place: Option<&str>) -> anyhow::Result<Prepared> {
     let created = !repo.join(".git").exists();
     if created {
@@ -216,6 +218,11 @@ pub fn prepare_repo(repo: &Path, place: Option<&str>) -> anyhow::Result<Prepared
     if git(Some(repo), &["config", "user.email"]).unwrap_or_default().is_empty() {
         git(Some(repo), &["config", "user.email", "thor-backup@localhost.invalid"])?;
     }
+    // The export segments are far above the media gate's size limit, and the
+    // gate must never stop THOR's own backup commit. The backup program sets
+    // this again before every commit; doing it here also covers the empty
+    // commit below and a folder the person commits into by hand.
+    thor_core::backup::exempt_from_media_gate(repo)?;
     let has_nas = git(Some(repo), &["remote"]).unwrap_or_default().lines().any(|r| r.trim() == "nas");
     match place {
         None => {
