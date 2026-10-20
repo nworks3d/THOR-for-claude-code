@@ -577,6 +577,11 @@ pub struct OptInRule {
     /// have written as "nog te controleren"'). Missing, `false` or malformed
     /// all mean quotes are read as before (field test 15, collect 17c).
     pub quotes_exempt: bool,
+    /// `true` marks a rule whose trigger term only counts OUTSIDE a fenced
+    /// code block. Inline backticks and plain quotes do not exempt it: the
+    /// rule wants the term on its own line in a fence, so the reader can copy
+    /// it. Missing, `false` or malformed: fences are read as ordinary text.
+    pub fenced_only_exempt: bool,
     /// Terms whose presence in the OWNER'S OWN LAST PROMPT means he asked for
     /// what the rule's reminder tells the writer to leave out (step 29: the
     /// length rule says "no test counts", and the prompt may be "give me the
@@ -657,6 +662,7 @@ pub fn parse_opt_in_rules(text: &str) -> Vec<OptInRule> {
             let own_claims_only = r.get("own_claims_only").and_then(|v| v.as_bool()).unwrap_or(false);
             let affirmative_only = r.get("affirmative_only").and_then(|v| v.as_bool()).unwrap_or(false);
             let quotes_exempt = r.get("quotes_exempt").and_then(|v| v.as_bool()).unwrap_or(false);
+            let fenced_only_exempt = r.get("fenced_only_exempt").and_then(|v| v.as_bool()).unwrap_or(false);
             let asked_for_any_of = str_list(r, "asked_for_any_of");
             let reminder_if_asked = r.get("reminder_if_asked").and_then(|v| v.as_str()).map(str::to_string);
             let short_reminder = r.get("short_reminder").and_then(|v| v.as_str()).map(str::to_string);
@@ -677,6 +683,7 @@ pub fn parse_opt_in_rules(text: &str) -> Vec<OptInRule> {
                 own_claims_only,
                 affirmative_only,
                 quotes_exempt,
+                fenced_only_exempt,
                 asked_for_any_of,
                 reminder_if_asked,
                 short_reminder,
@@ -1302,7 +1309,7 @@ fn occurrence_is_another_partys(hay: &str, at: usize, len: usize) -> bool {
 /// honoured.
 fn trigger_fires(rule: &OptInRule, haystack_lower: &str) -> bool {
     let scopes = !rule.hedge_words_before.is_empty() || !rule.scope_words_after.is_empty() || rule.list_label_scopes;
-    if rule.own_claims_only || rule.affirmative_only || rule.quotes_exempt || scopes {
+    if rule.own_claims_only || rule.affirmative_only || rule.quotes_exempt || rule.fenced_only_exempt || scopes {
         trigger_holds(&rule.base, haystack_lower, &|term| occurs_as_claimed(haystack_lower, term, rule))
     } else {
         trigger_holds(&rule.base, haystack_lower, &|term| haystack_lower.contains(term))
@@ -1358,6 +1365,7 @@ fn occurs_as_claimed(hay: &str, term_lower: &str, rule: &OptInRule) -> bool {
         (!rule.own_claims_only || !occurrence_is_another_partys(hay, at, t.len()))
             && (!rule.affirmative_only || !negated_before(hay, at))
             && (!rule.quotes_exempt || !inside_quotes(hay, at))
+            && (!rule.fenced_only_exempt || !inside_fence(hay, at))
             && !occurrence_is_scoped(rule, hay, at, t.len())
     })
 }
@@ -1386,6 +1394,25 @@ fn occurrence_is_scoped(rule: &OptInRule, hay: &str, at: usize, len: usize) -> b
     }
     let line = &hay[line_start..at];
     rule.list_label_scopes && is_list_line(line) && line.contains(':')
+}
+
+/// Whether byte `at` of `hay` sits on a line inside a fenced code block
+/// (between two lines that start with three backticks).
+fn inside_fence(hay: &str, at: usize) -> bool {
+    let mut in_fence = false;
+    let mut offset = 0usize;
+    for line in hay.split('\n') {
+        let end = offset + line.len();
+        let is_fence = line.trim_start().starts_with("```");
+        if at >= offset && at <= end {
+            return in_fence && !is_fence;
+        }
+        if is_fence {
+            in_fence = !in_fence;
+        }
+        offset = end + 1;
+    }
+    false
 }
 
 /// Whether byte `at` of `hay` sits inside quotation marks or inline code: an
@@ -2859,6 +2886,20 @@ mod tests {
         let plain = QUOTES_RULEBOOK.replace("\"quotes_exempt\":true,", "");
         let v = guard_verdict_in_turn(Some(&plain), mention, "", false, None, &[]);
         assert!(v.warn_reason.is_some(), "without the field a first-person quote is still the agent's own");
+    }
+
+    const FENCED_RULEBOOK: &str = r#"[
+      {"id":"word-in-fence","tier":"warn","fenced_only_exempt":true,
+       "any_of":["codeword"],"none_of":[],"reminder":"Put the word in a fenced block."}
+    ]"#;
+
+    #[test]
+    fn fenced_only_exempt_fires_inline_and_in_inline_code_but_not_alone_in_a_fence() {
+        let fires = |reply: &str| guard_verdict_in_turn(Some(FENCED_RULEBOOK), reply, "", false, None, &[]).warn_reason.is_some();
+        assert!(fires("Please type codeword to continue."), "inline in a sentence");
+        assert!(fires("Please type `codeword` to continue."), "inline code is not a fence");
+        assert!(!fires("Please type this:\n```\ncodeword\n```\nThanks."), "alone in a fence");
+        assert!(fires("Type codeword.\n```\ncodeword\n```\n"), "in a fence and inline");
     }
 
     #[test]

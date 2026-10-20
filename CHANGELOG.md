@@ -4,6 +4,8 @@ What changed in each release, newest first. The release workflow copies the sect
 
 ## Unreleased
 
+- **A reply rule can demand that a word stands in a fenced code block.** The new opt-in rulebook field `fenced_only_exempt` makes a trigger term count only outside a ``` fence. When THOR refuses a call that needs the owner's go, it now also tells the assistant to show the word the owner must type on its own line in a fenced code block, so it can be copied with one click.
+
 ## 2.6.0 (2026-10-17)
 
 **What changed.** You can now use THOR on a second computer, such as a laptop, with one command: it keeps a read-only copy of your memory there, and you choose which projects the copy holds, so a work laptop need not hold everything. If an antivirus removes one of THOR's programs, THOR now says which one is missing and how to get it back, instead of going quiet. THOR's check for its own faults no longer mistakes a refused file edit for a faulty command. The note shown at the start of a session has a little more room and is cut exactly, a rule that can refuse a wrong step now comes before a note that only informs, and a rule can ask a command to name a full folder path. The one-line install can also ask for a full copy of the memory on a second computer. Several fixes make rules read Windows command lines correctly: a plain word also matches its hyphenated spelling, and assignments, short switches and braces no longer confuse the matching.
