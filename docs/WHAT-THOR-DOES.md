@@ -533,6 +533,24 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
 - You notice: a single tidy-up line.
 - Refuse or change: stale-guard-mode.json {"mode": "off"}.
 
+### C9. Script files left outside any git repository (only when a tools folder is named)
+- What: only when the owner has named a tools folder (F17). Before a Write, Edit, MultiEdit or
+  NotebookEdit tool call runs, THOR notes the file when it is a script (.py .ps1 .psm1 .mjs .cjs .js .ts
+  .sh .bat .cmd .vbs) that lies outside every git work tree, outside the tools folder and outside the
+  temp-until-live folder. The note is kept per session in leftover-scripts.json beside the memory (a
+  session's notes are forgotten after 14 days). At a turn end THOR lists the noted files that still exist
+  and were last changed more than 30 minutes ago, and holds the turn once: move each reusable one into a
+  new sub-folder of the tools folder with a README.txt whose first line says in one sentence what the tool
+  does, and delete the one-offs. Each file is asked about once per session, so a later turn end never
+  holds for it again. Never for a subagent's stop (but a subagent's writes are noted for the main session),
+  and never on a copy of the memory, which takes no state write and so could not remember having asked.
+- Why: a helper script left in a scratch folder is found again by accident or never, and the next session
+  writes the same script a second time.
+- You notice: a single plain sentence from Claude Code ("Your assistant left a few helper scripts outside
+  your projects... Nothing is needed from you"). Not covered: a script made by a shell redirect
+  (echo ... > x.py) never passes through the file tools and is not noticed.
+- Refuse or change: install --set-tools-folder off --db <memory>.
+
 ---
 
 ## D. What THOR refuses while the assistant works
@@ -736,6 +754,34 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
   exclusion is yours to allow and yours to remove (Windows Security > Virus and threat protection >
   Manage settings > Exclusions).
 
+### E15. It reads two folders the owner may name: a temp-until-live folder and a tools folder
+- What: both are off until the owner names a folder (F17). THOR only reads them; it never deletes, moves
+  or writes inside either.
+  Temp-until-live: one sub-folder per production, named <YYYY-MM-DD>_<repo>_<subject>, each with a
+  STATUS.txt whose first line starts with "STATUS:". A first line starting with "STATUS: live" (any letter
+  case) means the production is live and may be deleted; a production whose date prefix is older than
+  temp_max_age_days (30 unless the file says other) and that is not live is named as old. A session start
+  says so at most once a day (one line naming the folders, capped; a day with nothing to say is not
+  used up), and doctor has the same in its short version (a NOTE line) and in the detailed report.
+  Tools: one sub-folder per helper tool, each with a README.txt or README.md whose first non-empty line says
+  in one sentence what the tool does. EVERY session start hands the assistant "Helper tools available in
+  <folder>:" and one line per tool ("<folder name> - <that first line>", cut to about 100 characters),
+  about 2,000 bytes at most (then "... and N more in <folder>"), and one sentence: look here before writing
+  a new helper script. The list is built from the folders, so nobody maintains it. It is kept in
+  tools-overview-cache.json beside the memory with a fingerprint (folder names, README sizes and times)
+  and built again only when the fingerprint changes. At most once a day it also names a tool folder with
+  no README, a README with no first line, and script files lying loose in the tools folder.
+  Network folders: every read runs on a worker thread with about 1.5 seconds in total, so a share that is
+  switched off or unreachable can never hold a session start. On timeout or error the temp notice is
+  silent and the tools list falls back to the cached copy (its first line then carries the date it was
+  built and says the folder could not be reached just now), or is silent. A headless run gets the tools
+  list but not the notices, so a headless run never uses up the day's showing. Not for a subagent.
+- Why: finished jobs that nobody deletes pile up, and a helper script that nobody can find gets written
+  again. A list built from the folders cannot go out of date the way a list somebody keeps does.
+- You notice: up to three paragraphs at the start of a session; "NOTE: in your temp-until-live folder..." in
+  doctor.
+- Refuse or change: install --set-temp-folder off, install --set-tools-folder off (F17).
+
 ---
 
 ## F. What the user can switch off or change, and how
@@ -868,6 +914,19 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
   for their own computer (the config).
 - You notice: the refusal message prints the same steps, and the exact lines for the files it refused.
 - Refuse or change: yes, with the commands above. Removing THOR (F11) removes the gate with the hooks.
+
+### F17. The temp-until-live folder and the tools folder: name them, change the age limit, switch them off
+- What: work-folders.json beside the memory: {"temp_until_live": "<full path>", "temp_max_age_days": 30,
+  "tools": "<full path>"}; every key is optional and a missing or malformed file means nothing is named.
+  install --set-temp-folder <full path|off> --db <memory> and install --set-tools-folder <full path|off>
+  --db <memory> write the keys (both may be given in one call). Each path must be a full path to a folder
+  that exists and answers (a network path such as \\server\share\tools works); everything is checked before
+  anything is written, a file somebody edited into invalid JSON is not overwritten, and the command prints in
+  plain words what it set. Naming the temp folder also writes temp_max_age_days (30), so the knob is
+  visible; change the number by hand to change the age limit. off removes only that folder's key.
+- Why: both are the owner's own folders, so nothing about them can be guessed or defaulted.
+- You notice: nothing at all until a folder is named.
+- Refuse or change: yes, with the commands above; or delete work-folders.json.
 
 ---
 

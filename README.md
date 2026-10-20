@@ -376,6 +376,105 @@ It works the way a shelf works.
   the words you ask with are rarely the words you wrote - it hands you the shelf
   to read instead. Asking for "ribbetjes" when you wrote "ribben" finds it.
 
+## Two folders THOR can keep tidy (optional)
+
+Both are off until you name a folder. THOR only ever **reads** these folders:
+it never deletes, moves or edits anything in them. If you never name one,
+nothing in this section happens.
+
+You never have to type a command yourself: tell your assistant "set my
+temp-until-live folder to D:\Work\temp-until-live" (or "my tools folder") and it
+runs the right one. The commands are shown below so you can see what happens.
+In them, `install` is the program in THOR's folder (`$HOME\thor2\install.exe` on
+Windows, `~/.thor2/install` on Linux), and `--db` names your memory file
+(`$env:LOCALAPPDATA\thor2\thor.db` on Windows, `~/.local/share/thor2/thor.db` on
+Linux).
+
+### A folder for jobs that are waiting to go live
+
+Suppose you build things for other people: a banner, a flyer, a print job, a
+website change. While a job is unfinished it sits in a temporary folder, and
+once it is live that copy can go. It is easy to lose track of which is which.
+
+What the folder has to look like (this is the part you do yourself):
+
+1. One sub-folder per job, named with the date, the project and a short
+   subject: `2026-10-20_shop_banner`.
+2. In each sub-folder a plain text file called `STATUS.txt`. Its first line
+   starts with `STATUS:` and says where the job stands, for example
+   `STATUS: waiting for the client`.
+3. When the job is finished and live, change that first line to
+   `STATUS: live`. That is the signal that the sub-folder may be deleted.
+
+Then tell THOR where the folder is (a network folder such as
+`\\nas\projects\temp-until-live` works too):
+
+```powershell
+& "$HOME\thor2\install.exe" --set-temp-folder "D:\Work\temp-until-live" --db "$env:LOCALAPPDATA\thor2\thor.db"
+```
+
+```sh
+~/.thor2/install --set-temp-folder "/srv/work/temp-until-live" --db ~/.local/share/thor2/thor.db
+```
+
+It checks that the folder exists before it writes anything, and prints in plain
+words what it set. From then on, the first time you start a session on a day,
+your assistant is told something like "temp-until-live: 2 production folder(s)
+say they may be deleted (...), 1 folder(s) are older than 30 days and not marked
+live (...)", and tells you. You decide, and you delete the folders yourself.
+"Older than 30 days" is read from the date in the folder name; to change the
+30, open `work-folders.json` (it sits next to `thor.db`) in a text editor and
+change the number after `temp_max_age_days`. `doctor` shows the same thing.
+To switch it off again: the same command with `--set-temp-folder off`.
+
+### A folder for your helper tools
+
+Every time you ask your assistant for a small script (rename these files, merge
+these PDFs) it writes one, and next week it writes the same script again,
+because it did not know the first one existed. A tools folder fixes that.
+
+What the folder has to look like:
+
+1. One sub-folder per tool, named after what it does: `pdf-merge`.
+2. In each sub-folder a `README.txt` (or `README.md`) whose very first line says
+   in one sentence what the tool does: `Merges several PDF files into one.`
+3. The tool's scripts live in the same sub-folder.
+
+Tell THOR where it is:
+
+```powershell
+& "$HOME\thor2\install.exe" --set-tools-folder "D:\Work\tools" --db "$env:LOCALAPPDATA\thor2\thor.db"
+```
+
+```sh
+~/.thor2/install --set-tools-folder "/srv/work/tools" --db ~/.local/share/thor2/thor.db
+```
+
+What you get:
+
+- **A list at the start of every session**: "Helper tools available in
+  D:\Work\tools:" and one line per tool, taken from the first line of its README.
+  Nobody keeps the list up to date; it is built from the folders. THOR keeps a
+  copy beside your memory and builds it again only when something in the folder
+  changed, so it costs next to nothing.
+- **A check, at most once a day**: a tool folder without a README, a README
+  whose first line is empty, or script files lying loose in the tools folder
+  instead of in a sub-folder of their own.
+- **Leftover scripts are asked about, once.** When your assistant writes a
+  script file (`.py`, `.ps1`, `.sh`, `.js` and a few more) somewhere that is not
+  a git project, not the tools folder and not the temp-until-live folder, and it
+  is still there and untouched 30 minutes later, the end of that turn is held
+  once. Your assistant is asked to move the useful ones into the tools folder
+  with a README, and to delete the one-offs. A file is asked about once per
+  session, so this can never turn into a loop. Only files written with Claude
+  Code's own file tools are noticed; a script created by a shell command
+  (`echo ... > x.py`) is not.
+
+If a folder is on a network share that is switched off, a session start never
+waits for it: THOR gives up after about a second and a half, shows the list it
+kept last time (marked with its date) or says nothing. To switch it off again:
+the same command with `--set-tools-folder off`.
+
 ## Getting started
 
 **The shortest way - let your assistant do it.** Send your assistant the link to

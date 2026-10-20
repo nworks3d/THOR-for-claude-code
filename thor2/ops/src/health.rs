@@ -134,8 +134,27 @@ pub fn plain_summary(db: &Path, cwd: &Path, settings: Option<&Path>, mcp_json: O
         ),
     }
 
+    // Silent unless the owner named a temp-until-live or tools folder AND it
+    // needs a look (or cannot be reached).
+    for note in work_folders_report(db).notes {
+        lines.push(format!("  NOTE: {note}"));
+    }
+
     lines.push("Everything below is the detailed report, written for your assistant. You do not need to read it.".to_string());
     lines
+}
+
+/// What `doctor` says about the two folders the owner may name
+/// (`serve::work_folders`): temp-until-live and tools. Read afresh, with a time
+/// limit, so a network share that is switched off costs a few seconds and a
+/// sentence, never a hang. Empty when neither is named.
+pub fn work_folders_report(db: &Path) -> serve::work_folders::DoctorLines {
+    serve::work_folders::doctor_lines(
+        db,
+        serve::time::now_unix(),
+        serve::work_folders::DOCTOR_READ_LIMIT,
+        &serve::work_folders::READERS,
+    )
 }
 
 /// Open `db` and read every event, or explain in one line (no "memory
@@ -3851,6 +3870,8 @@ pub fn report(
     lines.extend(ship_line(db));
     // Where the last off-site copy went, or that it is failing right now.
     lines.extend(backup_line(db));
+    // Silent unless a temp-until-live or tools folder is named.
+    lines.extend(work_folders_report(db).detail);
     lines.extend(drain_refusals_line(db));
     lines.extend([
         falsifier_line(db),
@@ -8157,6 +8178,37 @@ mod plain_summary_tests {
         for jargon in ["teeth", "falsifier", "crowding", "scope", "checkout", "hook", "mcp", "MCP"] {
             assert!(!all.contains(jargon), "the short version must not use {jargon:?}: {all}");
         }
+    }
+
+    #[test]
+    fn the_two_work_folders_add_a_note_and_a_report_line_only_when_they_are_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, settings, mcp) = wired(dir.path());
+        let before = plain_summary(&db, dir.path(), Some(&settings), Some(&mcp));
+        assert!(before.iter().all(|l| !l.contains("temp-until-live") && !l.contains("tools folder")), "{before:?}");
+        assert!(report(&db, None, None, None, None, None, false, None).iter().all(|l| !l.starts_with("work folders:")));
+
+        let temp = dir.path().join("temp-until-live");
+        let tools = dir.path().join("tools");
+        std::fs::create_dir_all(temp.join("2026-10-01_shop_done")).unwrap();
+        std::fs::write(temp.join("2026-10-01_shop_done").join("STATUS.txt"), "STATUS: live\n").unwrap();
+        std::fs::create_dir_all(tools.join("no-readme")).unwrap();
+        serve::work_folders::set_temp_folder(&db, Some(&temp.display().to_string())).unwrap();
+        serve::work_folders::set_tools_folder(&db, Some(&tools.display().to_string())).unwrap();
+
+        let lines = plain_summary(&db, dir.path(), Some(&settings), Some(&mcp));
+        let notes: Vec<&String> = lines.iter().filter(|l| l.starts_with("  NOTE: in your ")).collect();
+        assert_eq!(notes.len(), 2, "{lines:?}");
+        assert!(notes[0].contains("temp-until-live folder, 1 production folder(s) say they may be deleted"), "{notes:?}");
+        assert!(notes[1].contains("tools folder, 1 tool folder(s) have no README"), "{notes:?}");
+        assert!(lines.last().unwrap().starts_with("Everything below is the detailed report"), "the notes come before the detailed report: {lines:?}");
+        for jargon in ["teeth", "falsifier", "crowding", "scope", "checkout", "hook", "mcp", "MCP"] {
+            assert!(notes.iter().all(|n| !n.contains(jargon)), "the note must not use {jargon:?}: {notes:?}");
+        }
+
+        let detail: Vec<String> = report(&db, None, None, None, None, None, false, None).into_iter().filter(|l| l.starts_with("work folders:")).collect();
+        assert_eq!(detail.len(), 2, "{detail:?}");
+        assert!(detail[0].contains("temp-until-live") && detail[1].contains("tools"), "{detail:?}");
     }
 
     #[test]

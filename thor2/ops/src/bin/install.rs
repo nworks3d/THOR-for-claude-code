@@ -208,6 +208,34 @@ struct Cli {
     )]
     set_helpers: Option<String>,
 
+    /// Set ONLY the temp-until-live folder, and nothing else: the folder that
+    /// holds one sub-folder per production, named <YYYY-MM-DD>_<repo>_<subject>,
+    /// each with a STATUS.txt whose first line starts with "STATUS:" (a
+    /// production that is finished has "STATUS: live" there and may be deleted).
+    /// Give the full path, or `off` to switch it off. A session start then says,
+    /// once a day, which productions may be deleted or are older than 30 days.
+    /// THOR only reads the folder and deletes nothing. Needs --db.
+    #[arg(
+        long = "set-temp-folder",
+        value_name = "PATH|off",
+        conflicts_with_all = ["project", "settings", "mcp_json", "no_mcp", "serve_exe", "mcp_exe", "code_index_root", "register_root", "set_mode", "set_plan", "set_weekly_check", "set_backup", "set_recording", "set_helpers", "topic", "copy_from"]
+    )]
+    set_temp_folder: Option<String>,
+
+    /// Set ONLY the tools folder, and nothing else: the folder that holds one
+    /// sub-folder per reusable helper tool, each with a README.txt (or
+    /// README.md) whose first line says in one sentence what the tool does.
+    /// Give the full path, or `off` to switch it off. Every session start then
+    /// lists the tools to your assistant, and a turn is held once to tidy up
+    /// script files left outside any git repository. THOR only reads the
+    /// folder. Needs --db.
+    #[arg(
+        long = "set-tools-folder",
+        value_name = "PATH|off",
+        conflicts_with_all = ["project", "settings", "mcp_json", "no_mcp", "serve_exe", "mcp_exe", "code_index_root", "register_root", "set_mode", "set_plan", "set_weekly_check", "set_backup", "set_recording", "set_helpers", "topic", "copy_from"]
+    )]
+    set_tools_folder: Option<String>,
+
     /// SECOND MACHINE: set THOR up as a read-only COPY of another machine's
     /// memory, built from that machine's backup, in this one command. Give the
     /// backup as a folder (a share on a NAS), a bare repository or a git
@@ -350,6 +378,71 @@ fn set_helpers_only(db: Option<PathBuf>, word: &str) -> ExitCode {
         println!("helper-agent mode is on for {}: your assistant is reminded of it right before it starts a helper agent. Switch it off again with: install --set-helpers off --db \"{}\"", db.display(), db.display());
     } else {
         println!("helper-agent mode is off for {}", db.display());
+    }
+    ExitCode::SUCCESS
+}
+
+/// `install --set-temp-folder <folder|off>` and `--set-tools-folder <folder|off>`:
+/// write the two folder names into `work-folders.json` beside the memory, and
+/// nothing else. Every value is checked before anything is written, so a
+/// refusal changes nothing.
+fn set_work_folders_only(db: Option<PathBuf>, temp: Option<&str>, tools: Option<&str>) -> ExitCode {
+    use serve::work_folders::{check_folder, path, set_temp_folder, set_tools_folder};
+    let Some(db) = db else {
+        eprintln!("name the memory to set this for: install --set-temp-folder <full path of the folder> --db <your memory>");
+        return ExitCode::from(2);
+    };
+    if !db.is_file() {
+        eprintln!(
+            "REFUSED: there is no memory at {} - check the path given with --db (the one your assistant's hooks name). Nothing was changed.",
+            db.display()
+        );
+        return ExitCode::FAILURE;
+    }
+    // None = switch off, Some = the checked folder.
+    let mut chosen: Vec<(&str, Option<String>)> = Vec::new();
+    for (flag, value) in [("--set-temp-folder", temp), ("--set-tools-folder", tools)] {
+        let Some(value) = value else { continue };
+        if value.trim().eq_ignore_ascii_case("off") {
+            chosen.push((flag, None));
+            continue;
+        }
+        match check_folder(value) {
+            Ok(folder) => chosen.push((flag, Some(folder))),
+            Err(why) => {
+                eprintln!("REFUSED: {flag}: {why} Nothing was changed.");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let file = path(&db);
+    for (flag, folder) in &chosen {
+        let written = match *flag {
+            "--set-temp-folder" => set_temp_folder(&db, folder.as_deref()),
+            _ => set_tools_folder(&db, folder.as_deref()),
+        };
+        if let Err(e) = written {
+            eprintln!("could not write {}: {e}. Nothing more was changed.", file.display());
+            return ExitCode::FAILURE;
+        }
+        match (*flag, folder) {
+            ("--set-temp-folder", Some(folder)) => {
+                let days = serve::work_folders::settings(&db).temp_max_age_days;
+                println!("+ temp-until-live folder set to {folder} (written in {}).", file.display());
+                println!("  At the start of a session THOR now tells your assistant, at most once a day, which production folders in it say \"STATUS: live\" (they may be deleted) and which are older than {days} days. THOR only reads the folder: it never deletes, moves or changes anything in it.");
+                println!("  What each production folder needs: a name like 2026-10-20_shop_banner (date, repository, subject) and a STATUS.txt whose first line starts with \"STATUS:\". When the production is finished, change that line to \"STATUS: live\".");
+                println!("  To change the {days} days, open {} in a text editor and change the number after \"temp_max_age_days\".", file.display());
+                println!("  To switch this off again: install --set-temp-folder off --db \"{}\"", db.display());
+            }
+            ("--set-temp-folder", None) => println!("+ temp-until-live folder switched off: THOR no longer looks at it. Nothing in the folder was touched."),
+            (_, Some(folder)) => {
+                println!("+ tools folder set to {folder} (written in {}).", file.display());
+                println!("  Every session now starts with a list of the helper tools in it, one line per sub-folder, taken from the first line of the README.txt (or README.md) in that sub-folder. Nobody has to keep the list: it is built from the folders.");
+                println!("  A new reusable helper gets its own sub-folder there with a README.txt whose first line says in one sentence what it does. Script files written outside any git repository during a session are asked about once, 30 minutes after they were last changed: keep a useful one in the tools folder, delete a one-off. THOR only reads the folder and deletes nothing.");
+                println!("  To switch this off again: install --set-tools-folder off --db \"{}\"", db.display());
+            }
+            (_, None) => println!("+ tools folder switched off: no list, no check, no question about leftover scripts. Nothing in the folder was touched."),
+        }
     }
     ExitCode::SUCCESS
 }
@@ -842,6 +935,9 @@ fn main() -> ExitCode {
     }
     if let Some(word) = cli.set_helpers.as_deref() {
         return set_helpers_only(cli.db, word);
+    }
+    if cli.set_temp_folder.is_some() || cli.set_tools_folder.is_some() {
+        return set_work_folders_only(cli.db, cli.set_temp_folder.as_deref(), cli.set_tools_folder.as_deref());
     }
     if let Some(word) = cli.set_backup.as_deref() {
         return set_backup_only(cli.db, cli.settings.clone(), word);
