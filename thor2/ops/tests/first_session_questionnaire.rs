@@ -126,6 +126,26 @@ fn the_why_and_the_way_to_say_no_sit_in_the_appendix_for_the_assistant() {
     assert!(rules.contains("short list") && rules.contains("only when he asks about a number") && rules.contains("why once"), "{rules}");
 }
 
+/// The media gate is something the install switches on, so item 3 names it:
+/// the short line says what it is and the default, the detail says why it
+/// exists and how to turn off only the gate versus all the git hooks.
+#[test]
+fn the_git_hooks_item_names_the_media_gate_and_both_ways_to_switch_things_off() {
+    let q = questions().into_iter().find(|q| q.id == "git-hooks").unwrap();
+    assert!(q.line.contains("video files") && q.line.contains("25 MB") && q.line.ends_with("Default: on."), "{}", q.line);
+    assert!(q.line.chars().count() <= 200, "the short line stays short and plain: {}", q.line);
+    assert!(q.what.contains("thor.mediagate.maxbytes") && q.what.contains("thor-media-ok"), "{}", q.what);
+    assert!(q.what.contains("whole machine or for one repository"), "{}", q.what);
+    assert!(q.why.contains("26.7 MB 4K video") && q.why.contains("2026-10-20") && q.why.contains("typed commands"), "{}", q.why);
+    assert!(q.why.contains("83 percent"), "the original reason stays: {}", q.why);
+    assert!(q.say_no.contains("git config --global --unset core.hooksPath"), "{}", q.say_no);
+    assert!(q.say_no.contains("git config --global thor.mediagate.enabled false"), "{}", q.say_no);
+    assert!(
+        questionnaire::ASSISTANT_RULES.contains("thor.mediagate.enabled false"),
+        "the assistant knows how to turn off only the gate"
+    );
+}
+
 #[test]
 fn the_backup_item_tells_the_truth_that_nothing_is_backed_up_until_the_user_answers() {
     let q = questions().into_iter().find(|q| q.id == "backups").unwrap();

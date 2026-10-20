@@ -1171,6 +1171,15 @@ fn main() -> ExitCode {
                 match githooks::install_git_hooks(&hooks_dir, &exe, &index_root) {
                     Ok(results) => {
                         let added = results.iter().filter(|(_, o)| *o != HookOutcome::AlreadyPresent).count();
+                        // The media gate lives in the pre-commit helper: say so
+                        // whenever that one was written or changed.
+                        let gate_is_new = results
+                            .iter()
+                            .any(|(event, outcome)| event == "pre-commit" && *outcome != HookOutcome::AlreadyPresent);
+                        let say_gate = || {
+                            println!("+ git now also stops a commit that adds a video file or a file above 25 MB, in every repository");
+                            println!("  its message says what to do instead; the README section \"The media gate\" tells how to allow one file or change the limit");
+                        };
                         if added == 0 {
                             println!("= the helpers for programming projects were already in {}", hooks_dir.display());
                         } else {
@@ -1180,9 +1189,13 @@ fn main() -> ExitCode {
                             Ok(githooks::HooksPathOutcome::Set) => {
                                 println!("+ told git to use them, so THOR can keep a programming project searchable after every commit");
                                 println!("  your own git hooks keep working: each helper hands control back to them");
+                                say_gate();
                             }
                             Ok(githooks::HooksPathOutcome::AlreadyOurs) => {
-                                println!("= git was already told to use them")
+                                println!("= git was already told to use them");
+                                if gate_is_new {
+                                    say_gate();
+                                }
                             }
                             Ok(githooks::HooksPathOutcome::Foreign(theirs)) => {
                                 println!("! git is already set up to use {theirs}, so that was left alone.");
