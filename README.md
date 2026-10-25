@@ -1014,6 +1014,23 @@ machine (laptop)", queues them for you, but that route works on the whole
 memory), and searching by meaning. Also not yet done: a run on a real second
 computer. The steps above are covered by tests and by a full run on one machine.
 
+### When the other machine stops answering
+
+If you keep a copy of your memory on another machine that stays on (a NAS, a
+small server) so your phone and laptop can reach it, THOR now tells you when
+that machine does not answer. Each time a session starts, THOR tries once, for
+less than a second, to reach the address your hourly copy goes to. If nobody
+answers, you see one line saying that THOR's copy on that machine does not
+answer, so your other devices have no memory connection. The health check
+(ask your assistant "Is THOR working?") shows the same thing as a PROBLEM line.
+
+What to do, step by step: that machine has probably restarted, for example
+after an automatic update. If its data folder is encrypted, unlock it first.
+Then start THOR's programs on it again (on a NAS: open its container manager
+and start the THOR containers). The line disappears by itself once the machine
+answers. If you never copy your memory to another machine, you will never see
+this line.
+
 ## Using it from another assistant
 
 The automated setup above is for Claude Code specifically. Any other assistant

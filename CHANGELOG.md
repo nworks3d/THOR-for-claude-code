@@ -4,6 +4,8 @@ What changed in each release, newest first. The release workflow copies the sect
 
 ## Unreleased
 
+- The session start and doctor now say plainly when the copy of your memory on another machine does not answer (for example after it restarted with a locked data folder), instead of only pointing at Task Scheduler.
+
 ## 2.6.1 (2026-10-20)
 
 What changed: THOR now stops a commit that adds a video or a very large file in every repository, can watch a temp-until-live folder and a tools folder you name, and no longer lets its own backup get stopped by that check. Setting up a second computer is clearer and quieter, and that copy now gets your reply rules too. Rules are easier to write correctly: answers ignore upper and lower case, a call a rule itself prescribes no longer gets a forbidden check, and a wrong `targets` shape tells you the right one. `history` is shorter, and there are new starter notes.

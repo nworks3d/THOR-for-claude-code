@@ -2319,7 +2319,11 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                 )
                 .into_lines(),
             };
-            let extras: Vec<String> = [copy_line, reminder, registration, open_points, missing_program]
+            // The copy on the other machine does not answer: one plain line,
+            // after a connect under a hard 800 ms limit (`serve::replica_reach`).
+            // Silent without a known target and when the copy answers.
+            let replica_down = (!payload_is_from_a_subagent(&payload)).then(|| serve::replica_reach::down_line(db_path)).flatten();
+            let extras: Vec<String> = [copy_line, reminder, registration, open_points, missing_program, replica_down]
                 .into_iter()
                 .flatten()
                 .chain(work_folders)
