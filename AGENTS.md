@@ -415,6 +415,19 @@ carried in the backup) and keeps any file it replaces as `.bak`. If git refuses
 the backup folder with "dubious ownership", the install prints the exact
 `git config --global --add safe.directory` line to run.
 
+## When the other machine stops answering
+
+THOR remembers where `sync ship` last sent the memory (the receiver address, in
+`sync-ship-target.json` beside the store). At every session start and in
+`doctor` it tries one connection to that host and port, abandoned after 800 ms,
+so a machine that is off never delays a start. If nothing answers, the session
+start prints one plain line and `doctor` prints the same words as a PROBLEM line
+in its short summary; the `ship:` line then names the dead copy instead of
+sending the person to Task Scheduler. When you see it, tell the person in plain
+words: the other machine may have restarted; if its data folder is encrypted they
+must unlock it, then start its THOR containers again. Nothing to configure:
+no known target means no line, and an answering receiver means no line.
+
 ## Backup
 
 A fresh install makes NO backup: nothing is backed up until the person chooses

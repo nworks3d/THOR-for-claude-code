@@ -275,6 +275,11 @@ fn main() -> ExitCode {
             })
         }
         Command::Ship { db, to, batch } => {
+            // Remember where the copy lives so the session start and doctor
+            // can say plainly when it does not answer.
+            if let Err(e) = serve::replica_reach::record_target(&db, &to) {
+                eprintln!("ship target NOT recorded ({e})");
+            }
             let outcome = require_token().and_then(|token| {
                 let store = thor_core::event_store::EventStore::open_existing(&db)?;
                 let summary = transport::push_once(&store, &to, &token, batch)?;

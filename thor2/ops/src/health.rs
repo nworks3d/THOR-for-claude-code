@@ -110,6 +110,11 @@ pub fn plain_summary(db: &Path, cwd: &Path, settings: Option<&Path>, mcp_json: O
         )),
     }
 
+    // Silent unless a ship target is known and that machine does not answer.
+    if let Some(words) = serve::replica_reach::down_line(db) {
+        lines.push(format!("  PROBLEM: {words}"));
+    }
+
     match serve::project::resolve_project(cwd) {
         Some(key) => {
             let usable = EventStore::open_existing(db)
@@ -670,6 +675,15 @@ pub fn ship_line(db: &Path) -> Option<String> {
         let (local_seq, _) = store.contiguous_tip().ok()?;
         Some(local_seq.saturating_sub(covered).max(0))
     });
+
+    // A copy that does not answer explains a silent ship better than the
+    // Task Scheduler hint below, so say that instead (never both).
+    let stale_without_attempt = waiting.is_some_and(|n| n > 0) && age_hours >= SHIP_STALE_CEILING_HOURS;
+    if stale_without_attempt || (waiting.is_none() && age_hours >= SHIP_STALE_CEILING_HOURS) {
+        if let Some(host) = serve::replica_reach::down_host(db, serve::replica_reach::REACH_LIMIT) {
+            return Some(format!("ship: last succeeded {age_hours}h ago and the copy on {host} does not answer - see the PROBLEM line at the top"));
+        }
+    }
 
     Some(match waiting {
         Some(0) => format!("ship: last succeeded {age_hours}h ago - fresh, nothing new has been written since"),
@@ -8192,6 +8206,32 @@ mod plain_summary_tests {
         for jargon in ["teeth", "falsifier", "crowding", "scope", "checkout", "hook", "mcp", "MCP"] {
             assert!(!all.contains(jargon), "the short version must not use {jargon:?}: {all}");
         }
+    }
+
+    #[test]
+    fn a_copy_that_does_not_answer_is_a_problem_line_and_replaces_the_task_scheduler_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, settings, mcp) = wired(dir.path());
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        // No target known: nothing new.
+        let quiet = plain_summary(&db, dir.path(), Some(&settings), Some(&mcp)).join("\n");
+        assert!(!quiet.contains("does not answer"), "{quiet}");
+
+        serve::replica_reach::record_target(&db, &format!("http://127.0.0.1:{closed}")).unwrap();
+        let all = plain_summary(&db, dir.path(), Some(&settings), Some(&mcp)).join("\n");
+        assert!(all.contains("PROBLEM: THOR's copy on 127.0.0.1 does not answer"), "{all}");
+
+        // A silent ship past the ceiling names the copy, not Task Scheduler.
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let mut store = EventStore::open_existing(&db).unwrap();
+        store.append_event("s", "l", "act", thor_core::event_store::EventKind::FactCreated, "e1", None, "body").unwrap();
+        drop(store);
+        crate::ship_state::record_success_at(&db, 0, now - 48 * 3600).unwrap();
+        let line = ship_line(&db).unwrap();
+        assert!(line.contains("does not answer") && !line.contains("Task Scheduler"), "{line}");
     }
 
     #[test]

@@ -154,6 +154,7 @@ pub mod usefulness;
 #[cfg(feature = "semantic")]
 pub mod vectors;
 pub mod volume;
+pub mod replica_reach;
 pub mod work_folders;
 
 use thor_core::event_store::EventStore;
