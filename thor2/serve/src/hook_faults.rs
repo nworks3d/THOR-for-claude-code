@@ -66,6 +66,11 @@ pub fn cause_in_words(exit_code: i64, stderr: &str) -> &'static str {
 /// failed in the same second with exit 66 and no output.
 pub const HOST_WIDE_WINDOW_MS: i64 = 2_000;
 
+/// An exit-66 failure with no stderr that took less than this many
+/// milliseconds looks like a process killed at once by the machine stopping;
+/// such a failure is only a THOR candidate when it happens twice.
+pub const QUICK_SILENT_MS: i64 = 500;
+
 /// Every THOR hook launch failure recorded in the transcript file `path`.
 /// A failure is marked `host_wide` when a hook of another program failed in
 /// the same file within `HOST_WIDE_WINDOW_MS` with the same exit code: the
@@ -73,6 +78,53 @@ pub const HOST_WIDE_WINDOW_MS: i64 = 2_000;
 /// Fails quiet: an unreadable file, an unreadable line or a record of another
 /// shape is skipped, never an error.
 pub fn faults_in_file(path: &Path) -> Vec<Scanned> {
+    faults_in_file_with(path, &machine_was_stopping_near)
+}
+
+/// How close, in seconds, a logged shutdown, restart or sleep must be to a
+/// failure for the failure to count as the machine's.
+pub const POWER_EVENT_WINDOW_SECS: i64 = 5;
+/// The longest THOR waits for the system event log to answer.
+const POWER_LOG_LIMIT: std::time::Duration = std::time::Duration::from_millis(2500);
+
+/// Whether the machine logged a shutdown, restart or sleep (or the wake that
+/// ends one) within `POWER_EVENT_WINDOW_SECS` of `unix` seconds. On Windows it
+/// reads the System event log (ids 1074, 6006, 42 and the Power-Troubleshooter
+/// wake, id 1) without opening a window. Anywhere else, or when the log cannot
+/// be read in time, it answers false: today's behaviour. (Linux is skipped on
+/// purpose: `last -x` output has no format worth trusting for a few seconds.)
+pub fn machine_was_stopping_near(unix: i64) -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
+    let from = crate::time::iso8601_from_unix(unix - POWER_EVENT_WINDOW_SECS);
+    let to = crate::time::iso8601_from_unix(unix + POWER_EVENT_WINDOW_SECS);
+    crate::work_folders::within(POWER_LOG_LIMIT, move || power_event_in_log(&from, &to)).unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn power_event_in_log(from: &str, to: &str) -> bool {
+    use std::os::windows::process::CommandExt;
+    let query = format!(
+        "*[System[(EventID=1074 or EventID=6006 or EventID=42 or (EventID=1 and Provider[@Name='Microsoft-Windows-Power-Troubleshooter'])) \
+         and TimeCreated[@SystemTime>='{from}' and @SystemTime<='{to}']]]"
+    );
+    std::process::Command::new("wevtutil")
+        .args(["qe", "System", &format!("/q:{query}"), "/c:1", "/f:xml"])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .output()
+        .map(|out| out.status.success() && String::from_utf8_lossy(&out.stdout).contains("<Event"))
+        .unwrap_or(false)
+}
+
+#[cfg(not(windows))]
+fn power_event_in_log(_from: &str, _to: &str) -> bool {
+    false
+}
+
+/// `faults_in_file` with the machine's own log passed in (`true` = the
+/// machine logged a shutdown, restart or sleep near that unix second).
+pub fn faults_in_file_with(path: &Path, machine_stopping_near: &dyn Fn(i64) -> bool) -> Vec<Scanned> {
     let Ok(file) = std::fs::File::open(path) else { return Vec::new() };
     let mut reader = BufReader::new(file);
     let mut found = Vec::new();
@@ -98,7 +150,8 @@ pub fn faults_in_file(path: &Path) -> Vec<Scanned> {
     for scanned in &mut found {
         let Some(at) = millis_of_timestamp(&scanned.fault.at) else { continue };
         scanned.fault.host_wide =
-            others.iter().any(|(exit, other)| *exit == scanned.fault.exit_code && (other - at).abs() <= HOST_WIDE_WINDOW_MS);
+            others.iter().any(|(exit, other)| *exit == scanned.fault.exit_code && (other - at).abs() <= HOST_WIDE_WINDOW_MS)
+                || machine_stopping_near(at.div_euclid(1000));
     }
     found
 }
@@ -161,6 +214,9 @@ fn scanned_of(record: &Value, attachment: &Value) -> Option<Scanned> {
             exit_code,
             at: record.get("timestamp")?.as_str()?.to_string(),
             host_wide: false,
+            quick_silent: exit_code == 66
+                && stderr.trim().is_empty()
+                && attachment.get("durationMs").and_then(Value::as_i64).is_some_and(|ms| ms < QUICK_SILENT_MS),
         },
         cause: cause_in_words(exit_code, stderr),
     })
@@ -326,7 +382,48 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join(format!("{SESSION}.jsonl"));
         std::fs::write(&file, lines.join("\n") + "\n").unwrap();
-        faults_in_file(&file).into_iter().map(|s| (s.fault.tool_use_id, s.fault.host_wide)).collect()
+        faults_in_file_with(&file, &|_| false).into_iter().map(|s| (s.fault.tool_use_id, s.fault.host_wide)).collect()
+    }
+
+    /// 2026-10-21 18:43:28 local: Windows logged a shutdown (event 1074) in the
+    /// very second a lone THOR hook failed with exit 66. No other hook failed.
+    #[test]
+    fn a_lone_failure_beside_a_logged_shutdown_is_host_wide() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(format!("{SESSION}.jsonl"));
+        let at = "2026-10-21T16:43:28.400Z";
+        std::fs::write(&file, failure_line_at(OURS, 66, "", "toolu-1", at) + "\n").unwrap();
+        let unix = crate::eval_filing::unix_of_timestamp(at).unwrap();
+        let asked = std::cell::RefCell::new(Vec::new());
+        let found = faults_in_file_with(&file, &|t| {
+            asked.borrow_mut().push(t);
+            t == unix
+        });
+        assert!(found[0].fault.host_wide, "the machine logged a shutdown in that second");
+        assert_eq!(*asked.borrow(), [unix]);
+        assert!(!faults_in_file_with(&file, &|_| false)[0].fault.host_wide, "log unreadable or silent: as today");
+    }
+
+    #[test]
+    fn exit_66_with_no_stderr_and_under_500_ms_is_marked_quick_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(format!("{SESSION}.jsonl"));
+        let line = |exit: i64, stderr: &str, ms: i64, id: &str| {
+            failure_line(OURS, exit, stderr, id).replace("\"durationMs\":1316", &format!("\"durationMs\":{ms}"))
+        };
+        let lines = [
+            line(66, "", 120, "quick"),
+            line(66, "", 900, "slow"),
+            line(66, "boom", 120, "noisy"),
+            line(126, "", 120, "other-code"),
+        ];
+        std::fs::write(&file, lines.join("\n") + "\n").unwrap();
+        let marks: Vec<(String, bool)> =
+            faults_in_file_with(&file, &|_| false).into_iter().map(|s| (s.fault.tool_use_id, s.fault.quick_silent)).collect();
+        assert_eq!(
+            marks,
+            [("quick".to_string(), true), ("slow".to_string(), false), ("noisy".to_string(), false), ("other-code".to_string(), false)]
+        );
     }
 
     /// 2026-10-06 04:18Z: the PC was suspending, three THOR hooks and a node

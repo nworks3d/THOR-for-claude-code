@@ -84,7 +84,8 @@ struct Fx {
 
 fn fixture() -> Fx {
     let dir = tempfile::tempdir().unwrap();
-    let db = dir.path().join("store.db");
+    std::fs::create_dir_all(dir.path().join("store")).unwrap();
+    let db = dir.path().join("store").join("store.db");
     thor_core::event_store::EventStore::new(&db).unwrap();
     let work = dir.path().join("work");
     let scratch = dir.path().join("scratch");
@@ -125,8 +126,8 @@ fn with_no_settings_file_a_session_start_has_no_trace_of_either_folder() {
     let fx = fixture();
     let block = start(&fx.db, &fx.work, "s1");
     assert!(!block.contains("Helper tools") && !block.contains("temp-until-live") && !block.contains("tools folder check"), "{block}");
-    assert!(!fx.dir.path().join("tools-overview-cache.json").exists());
-    assert!(!fx.dir.path().join("leftover-scripts.json").exists());
+    assert!(!fx.db.parent().unwrap().join("tools-overview-cache.json").exists());
+    assert!(!fx.db.parent().unwrap().join("leftover-scripts.json").exists());
 }
 
 #[test]
@@ -145,7 +146,7 @@ fn a_session_start_lists_the_helper_tools_built_from_the_folders() {
         assert!(block.contains("img-resize - Resize every image in a folder"), "{session}: {block}");
         assert!(block.contains("Look here before writing a new helper script"), "{session}: {block}");
     }
-    assert!(fx.dir.path().join("tools-overview-cache.json").exists(), "the overview is kept beside the store");
+    assert!(fx.db.parent().unwrap().join("tools-overview-cache.json").exists(), "the overview is kept beside the store");
 
     // The overview follows the folder: a new tool shows up at the next start.
     std::fs::create_dir_all(fx.tools.join("zip-all")).unwrap();
@@ -217,7 +218,7 @@ fn nothing_is_asked_without_a_tools_folder_or_for_files_that_are_not_leftovers()
     std::fs::write(&early, "x\n").unwrap();
     write_call(&fx.db, &fx.work, "s1", "Write", &early);
     age(&early, 90);
-    assert!(!fx.dir.path().join("leftover-scripts.json").exists());
+    assert!(!fx.db.parent().unwrap().join("leftover-scripts.json").exists());
     assert_eq!(stop(&fx.db, &fx.work, "s1"), serde_json::Value::Null);
 
     name_the_folders(&fx);

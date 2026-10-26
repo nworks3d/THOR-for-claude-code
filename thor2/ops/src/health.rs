@@ -8074,6 +8074,7 @@ mod launch_and_skew_tests {
                 exit_code: exit,
                 at: at.to_string(),
                 host_wide: false,
+                quick_silent: false,
             },
             cause,
         }

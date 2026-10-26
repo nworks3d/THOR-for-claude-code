@@ -50,6 +50,7 @@ impl Fx {
             exit_code,
             at: "2026-10-06T22:29:00.231Z".to_string(),
             host_wide,
+            quick_silent: false,
         };
         let body = serde_json::json!({ "hook_fault": fault }).to_string();
         let entity = model::store::hook_fault_entity("s-fault");
@@ -157,6 +158,33 @@ fn detect_finds_refused_filings_and_hook_failures_but_not_host_wide_ones() {
     assert_eq!(signals, vec![Signal::FilingSkew, Signal::HookLaunch], "{found:?}");
     assert_eq!(found[1].key, "SessionStart:126");
     assert!(detect(&fx.store, i64::MAX).is_empty(), "nothing after the end of the log");
+}
+
+#[test]
+fn a_quick_silent_exit_66_is_a_candidate_only_when_it_happens_twice() {
+    let quick = |fx: &mut Fx, id: &str| {
+        let fault = HookFault {
+            tool_use_id: id.to_string(),
+            hook_event: "UserPromptSubmit".to_string(),
+            exit_code: 66,
+            at: "2026-10-21T16:43:28.100Z".to_string(),
+            host_wide: false,
+            quick_silent: true,
+        };
+        let body = serde_json::json!({ "hook_fault": fault }).to_string();
+        let entity = model::store::hook_fault_entity("s-quick");
+        fx.store.append_event("s-quick", "s-quick", ATTESTER_ACTOR, EventKind::GateStoodAside, &entity, None, &body).unwrap();
+    };
+    let mut fx = Fx::new();
+    quick(&mut fx, "toolu-q1");
+    assert!(detect(&fx.store, 0).is_empty(), "once is the machine stopping, not a candidate");
+    quick(&mut fx, "toolu-q2");
+    let found = detect(&fx.store, 0);
+    assert_eq!(found.len(), 2, "twice: both are candidates: {found:?}");
+    assert!(found.iter().all(|f| f.signal == Signal::HookLaunch));
+    // A slow or noisy exit 66 is a candidate at once.
+    fx.hook_fault("toolu-slow", "Stop", 66, false);
+    assert_eq!(detect(&fx.store, 0).iter().filter(|f| f.key == "Stop:66").count(), 1);
 }
 
 #[test]
