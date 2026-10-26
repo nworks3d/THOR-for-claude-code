@@ -641,9 +641,10 @@ pub fn detect(store: &EventStore, since: i64) -> Vec<Finding> {
             else {
                 continue;
             };
-            if !fault.host_wide {
-                found.push(hook_launch_finding(&fault.hook_event, fault.exit_code));
+            if fault.host_wide || (fault.quick_silent && !quick_silent_repeated(store, &fault)) {
+                continue;
             }
+            found.push(hook_launch_finding(&fault.hook_event, fault.exit_code));
         }
     }
     // A start is judged once its batch record is written, a few events after
@@ -652,6 +653,24 @@ pub fn detect(store: &EventStore, since: i64) -> Vec<Finding> {
         found.extend(start_findings(&start));
     }
     found
+}
+
+/// Whether a quick, silent, non-host-wide failure (see
+/// `HookFault::quick_silent`) was recorded at least twice in the whole log, as
+/// two different tool calls. One alone is most likely the machine stopping.
+fn quick_silent_repeated(store: &EventStore, fault: &model::store::HookFault) -> bool {
+    let Ok(events) = store.events_of_kinds(&[EventKind::GateStoodAside], 0) else { return true };
+    let mut ids: Vec<String> = events
+        .iter()
+        .filter(|e| e.actor == ATTESTER_ACTOR)
+        .filter_map(|e| serde_json::from_str::<serde_json::Value>(&e.body).ok())
+        .filter_map(|body| body.get("hook_fault").and_then(|f| serde_json::from_value::<model::store::HookFault>(f.clone()).ok()))
+        .filter(|f| f.quick_silent && !f.host_wide && f.hook_event == fault.hook_event && f.exit_code == fault.exit_code)
+        .map(|f| f.tool_use_id)
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids.len() >= 2
 }
 
 /// What one evaluation start record says about THOR.

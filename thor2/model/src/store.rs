@@ -6651,6 +6651,10 @@ pub struct HookFault {
     /// THOR's. Records written before this field existed read as false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub host_wide: bool,
+    /// Exit code 66, empty stderr and under 500 ms: the shape of a process the
+    /// machine killed as it stopped. One of these alone is not a THOR candidate.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub quick_silent: bool,
 }
 
 /// How a host-wide hook failure is worded in the evaluation's health line, the
@@ -11957,7 +11961,7 @@ mod tests {
     }
 
     fn hook_fault(id: &str) -> HookFault {
-        HookFault { tool_use_id: id.to_string(), hook_event: "SessionStart".to_string(), exit_code: 126, at: "2026-10-06T22:29:00.231Z".to_string(), host_wide: false }
+        HookFault { tool_use_id: id.to_string(), hook_event: "SessionStart".to_string(), exit_code: 126, at: "2026-10-06T22:29:00.231Z".to_string(), host_wide: false, quick_silent: false }
     }
 
     /// The machine section says how healthy THOR itself was in the window: the

@@ -40,6 +40,7 @@ fn store_with_a_hook_failure() -> (tempfile::TempDir, std::path::PathBuf) {
         exit_code: 126,
         at: "2026-10-06T22:29:00.231Z".to_string(),
         host_wide: false,
+        quick_silent: false,
     };
     let body = serde_json::json!({ "hook_fault": fault }).to_string();
     let entity = model::store::hook_fault_entity("s-old");

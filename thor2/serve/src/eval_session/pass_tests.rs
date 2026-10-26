@@ -1430,6 +1430,22 @@ fn either_exit_of_a_demotion_settles_the_batch_item_and_a_bare_revise_does_not()
     assert_eq!(model::store::current_verdict(&fx.store, "ban"), CurrentVerdict::RuleWired);
 }
 
+/// A revise that only adds a dispute changes something a trial reads: the
+/// trial runs with it (it is not the "NOTHING WAS SETTLED" no-op), while the
+/// same revise without a dispute stays the no-op.
+#[test]
+fn a_revise_that_only_adds_a_dispute_runs_the_trial() {
+    let (mut fx, _start) = demoted_start();
+    let mut corpus = crate::legit::Corpus::load(&fx.store);
+    let head = model::store::show(&fx.store, "ban").unwrap();
+    let because = "refusing every form of this reset is the whole intent of the ban";
+    let dispute = teeth::Disputes { accept_refusing: vec!["git -C alpha-dev reset --hard".to_string()], ..Default::default() };
+    let tried = teeth::trial_for_write(&mut fx.store, Some(&fx.db), &teeth::SessionCtx::default(), &mut corpus, &head, Some(&head), Some(because), &dispute, false);
+    assert!(!matches!(tried, teeth::WriteTrial::Unchanged { .. }), "a new dispute must be tried: {tried:?}");
+    let none = teeth::trial_for_write(&mut fx.store, Some(&fx.db), &teeth::SessionCtx::default(), &mut corpus, &head, Some(&head), Some(because), &teeth::Disputes::default(), false);
+    assert!(matches!(none, teeth::WriteTrial::Unchanged { .. }), "no dispute, no change: still the no-op");
+}
+
 /// A rule's check kind other than a forbidden command check has no literals
 /// to name: the call still carries the shape, with the agent's own words
 /// where only the agent knows them.

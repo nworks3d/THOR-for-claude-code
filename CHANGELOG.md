@@ -4,6 +4,10 @@ What changed in each release, newest first. The release workflow copies the sect
 
 ## Unreleased
 
+- **The leftover-script hold no longer names THOR's own files.** Scripts in the folder that holds the store or in the folder the running program lives in (for example a scheduled task's helper) are left out of the end-of-turn "script files outside any git repository" hold.
+- **A revise that only adds or changes a dispute is now tried.** `legitimate_calls`, `may_change` and `accept_refusing` count as something a trial reads, so such a revise no longer answers "NOTHING WAS SETTLED" without trying the dispute.
+- **A hook launch failure while the machine shuts down or sleeps is no longer reported as a THOR bug.** On Windows the System event log (ids 1074, 6006, 42 and the wake event 1) is read, windowless and time boxed, and a failure within 5 seconds of one is marked host-wide; if the log cannot be read nothing changes. An exit 66 with empty stderr that took under 500 ms is a bug candidate only when it happens twice.
+
 ## 2.6.1 (2026-10-20)
 
 What changed: THOR now stops a commit that adds a video or a very large file in every repository, can watch a temp-until-live folder and a tools folder you name, and no longer lets its own backup get stopped by that check. Setting up a second computer is clearer and quieter, and that copy now gets your reply rules too. Rules are easier to write correctly: answers ignore upper and lower case, a call a rule itself prescribes no longer gets a forbidden check, and a wrong `targets` shape tells you the right one. `history` is shorter, and there are new starter notes.

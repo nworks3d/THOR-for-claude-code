@@ -1310,7 +1310,7 @@ pub struct SessionCtx {
 }
 
 /// The writer's disputes and accepted refusals (K22, K8(d)).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Disputes {
     pub legitimate_calls: Vec<String>,
     pub may_change: Vec<String>,
@@ -3370,7 +3370,10 @@ pub fn trial_for_write(
     if let Some(before) = before {
         let verdict = model::store::current_verdict(store, &item.id);
         let retry = retry_undecided && matches!(verdict, model::store::CurrentVerdict::Undecided { .. });
-        if !retry && model::store::fingerprint(before) == model::store::fingerprint(item) {
+        // A dispute the head does not stand on yet IS something a trial reads:
+        // a revise that only adds or changes one must run the trial with it.
+        let new_dispute = !disputes.is_empty() && *disputes != standing_disputes(store, before);
+        if !retry && !new_dispute && model::store::fingerprint(before) == model::store::fingerprint(item) {
             // The label is the head's own: a writer never sets one, and a
             // write that changes nothing tried keeps the one the head has.
             let mut kept = item.clone();

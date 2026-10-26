@@ -113,6 +113,15 @@ pub fn is_inside(path: &str, folder: &str) -> bool {
 
 // ---------------------------------------------------------------- recording
 
+/// Whether `file` lies in THOR's own folders: the one holding the store and the
+/// one the running program was installed in. Scripts there (a scheduled
+/// task's, a backup helper) belong to THOR's setup, not to a session's scratch.
+fn in_thor_folder(db: &Path, file: &str) -> bool {
+    let store = db.parent().filter(|p| !p.as_os_str().is_empty());
+    let program = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf));
+    store.map(Path::to_path_buf).into_iter().chain(program).any(|folder| is_inside(file, &folder.display().to_string()))
+}
+
 /// Whether a git work tree (a `.git` folder or file) sits at or above `dir`.
 /// `None` when the lookup did not answer in time.
 fn in_git_work_tree(dir: &Path) -> Option<bool> {
@@ -156,7 +165,7 @@ pub fn record_write_with(
     };
     let absolute_text = absolute.display().to_string();
     let exempt = std::iter::once(&tools).chain(settings.temp_until_live.as_ref()).any(|folder| is_inside(&absolute_text, &folder.display().to_string()));
-    if exempt {
+    if exempt || in_thor_folder(db, &absolute_text) {
         return;
     }
     let Some(parent) = absolute.parent() else { return };
@@ -213,6 +222,7 @@ pub fn hold_reason(db: &Path, session_id: &str, now: i64) -> Option<String> {
         .files
         .iter()
         .filter(|file| !record.held.iter().any(|held| normalize(held) == normalize(file)))
+        .filter(|file| !in_thor_folder(db, file))
         .cloned()
         .collect();
     if candidates.is_empty() {
@@ -248,7 +258,8 @@ mod tests {
 
     fn fixture() -> Fx {
         let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("thor.db");
+        std::fs::create_dir_all(dir.path().join("store")).unwrap();
+        let db = dir.path().join("store").join("thor.db");
         std::fs::write(&db, b"").unwrap();
         let tools = dir.path().join("tools");
         let temp = dir.path().join("temp-until-live");
@@ -368,6 +379,21 @@ mod tests {
         std::fs::create_dir_all(&near).unwrap();
         write(&fx, "s1", "Write", &near.join("old.py"));
         assert_eq!(noted(&fx, "s1").len(), 1);
+    }
+
+    #[test]
+    fn a_script_in_thors_own_store_folder_is_not_noted_or_held() {
+        let fx = fixture();
+        // The store folder is the fixture's temp dir: a script beside the store.
+        let own = make_script(fx.db.parent().unwrap(), "ship-naar-nas.ps1");
+        write(&fx, "s1", "Write", &own);
+        write(&fx, "s1", "Write", &fx.db.parent().unwrap().join("sub").join("x.py"));
+        assert!(noted(&fx, "s1").is_empty(), "{:?}", noted(&fx, "s1"));
+        // A note made by an older build is not held either.
+        let mut book = Book::new();
+        book.insert("s2".into(), SessionRecord { at: NOW, files: vec![own.display().to_string()], held: vec![] });
+        write_book(&fx.db, &book);
+        assert_eq!(hold_reason(&fx.db, "s2", mtime(&own) + 3_600), None);
     }
 
     #[test]
