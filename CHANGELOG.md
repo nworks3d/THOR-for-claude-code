@@ -4,6 +4,10 @@ What changed in each release, newest first. The release workflow copies the sect
 
 ## Unreleased
 
+## 2.6.2 (2026-10-26)
+
+What changed: THOR now says plainly when the copy of your memory on another machine does not answer. A copy can now file its own weekly check, and it counts. Three smaller fixes: THOR no longer lists its own files as leftover scripts, a change to a rule's exceptions is now tested like any other change, and a program failing to start while the computer shuts down or sleeps is no longer reported as a THOR fault.
+
 - The session start and doctor now say plainly when the copy of your memory on another machine does not answer (for example after it restarted with a locked data folder), instead of only pointing at Task Scheduler.
 - **The leftover-script hold no longer names THOR's own files.** Scripts in the folder that holds the store or in the folder the running program lives in (for example a scheduled task's helper) are left out of the end-of-turn "script files outside any git repository" hold.
 - **A revise that only adds or changes a dispute is now tried.** `legitimate_calls`, `may_change` and `accept_refusing` count as something a trial reads, so such a revise no longer answers "NOTHING WAS SETTLED" without trying the dispute.
