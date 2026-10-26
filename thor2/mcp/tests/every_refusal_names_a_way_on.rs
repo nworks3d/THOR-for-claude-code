@@ -463,13 +463,13 @@ fn evaluation_start_reserved_says_pick_another_id_and_that_lands() {
 }
 
 #[test]
-fn replica_evaluation_filing_says_file_it_on_the_main_machine_and_that_lands() {
+fn replica_evaluation_filing_is_queued_with_a_note_on_its_proof_and_still_files_on_the_main_machine() {
     let fx = Fx::new(&["demo"]);
     let inbox = fx.dir().join("inbox.jsonl");
     let report = json!({"id": "eval-demo-1", "kind": "report", "project": "demo", "tags": ["evaluation-report"], "text": "An evaluation of demo."});
     let mut replica = Replica::start(&fx.db, &inbox);
     let reply = replica.call("remember", report.clone());
-    assert!(reply.starts_with("REFUSED:") && reply.contains("file the report from a session on the main machine"), "{reply}");
+    assert!(reply.starts_with("queued for the main machine") && reply.contains("sent its proof to the main machine"), "{reply}");
     drop(replica);
     // On the main machine, in the session that runs the evaluation, through
     // THOR's own tool (step 15): it files.

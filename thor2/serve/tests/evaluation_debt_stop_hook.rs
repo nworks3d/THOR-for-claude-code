@@ -2384,3 +2384,173 @@ fn a_session_older_than_the_installed_tool_server_is_told_to_restart_and_a_fresh
     assert!(!is_block(&out), "an open evaluation is not held for once the tool server is older: {out}");
     assert!(out.contains("Restart Claude; the evaluation is asked again after the restart"), "{out}");
 }
+
+// ------------------------------------------------- the weekly check on a copy
+//
+// A read-only copy connected to the replica connector asks the weekly check
+// again (`serve::copy_eval`): it holds the turn with a copy-specific ask, and
+// at the next Stop sends the proof of the filing it read in its own
+// transcript. These run the real hook against a stub connector.
+
+/// A stand-in for the replica connector: answers 200 to everything and keeps
+/// every request as (request line, body).
+struct StubConnector {
+    base: String,
+    seen: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+}
+
+fn stub_connector() -> StubConnector {
+    use std::io::Read as _;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> = Default::default();
+    let keep = seen.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut buf).unwrap_or(0);
+                raw.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&raw).to_string();
+                let Some((head, body)) = text.split_once("\r\n\r\n") else {
+                    if n == 0 {
+                        break;
+                    }
+                    continue;
+                };
+                let wanted: usize = head
+                    .lines()
+                    .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").and_then(|v| v.trim().parse().ok()))
+                    .unwrap_or(0);
+                if body.len() >= wanted || n == 0 {
+                    keep.lock().unwrap().push((head.lines().next().unwrap_or_default().to_string(), body.to_string()));
+                    break;
+                }
+            }
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        }
+    });
+    StubConnector { base, seen }
+}
+
+/// A copy of the project `fxp` that is due for its weekly check, connected to
+/// `connector`: the store, the marker, two turns of work in the transcript.
+fn due_copy(sandbox: &Sandbox, connector: Option<&str>, session: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let fxp = sandbox.project_dir("fxp");
+    drop(EventStore::new(&db).unwrap());
+    seed_project_clock(&db, "fxp", 90);
+    seed_own_work(&db, "fxp", session, 30, 1);
+    let now = serve::time::now_unix();
+    serve::attest::fixture::work_in(&transcripts(sandbox), session, &fxp, now - 40 * 60, 10);
+    serve::attest::fixture::work_in(&transcripts(sandbox), session, &fxp, now - 20 * 60, 10);
+    let marker = thor_core::copy_mode::Marker { connector: connector.map(str::to_string), ..Default::default() };
+    thor_core::copy_mode::write_marker(&db, &marker).unwrap();
+    (dir, db, fxp)
+}
+
+fn filing_input(text: &str) -> serde_json::Value {
+    serde_json::json!({"id": "eval-fxp-2026-10-26", "kind": "report", "project": "fxp", "tags": ["evaluation-report"], "text": text})
+}
+
+/// R-copy-1: a copy connected to a reachable connector is asked the weekly
+/// check at its Stop, with the copy's own instructions, and nothing on the
+/// copy's log changes.
+#[test]
+fn a_copy_stop_asks_the_weekly_check_through_the_connector() {
+    let connector = stub_connector();
+    let sandbox = Sandbox::new();
+    let s = uuid(90);
+    let (_dir, db, fxp) = due_copy(&sandbox, Some(&connector.base), &s);
+    let before = EventStore::open_read_only(&db).unwrap().event_kinds().unwrap().len();
+
+    let out = run_hook(&db, &stop_payload(&s, &fxp), &sandbox);
+
+    assert!(is_block(&out), "a due copy with a reachable connector is held: {out}");
+    assert!(out.contains("read-only copy of the memory") && out.contains("mcp__thor__remember"), "the copy's own ask: {out}");
+    assert!(out.contains("eval-fxp-"), "it names the report id to use: {out}");
+    assert!(connector.seen.lock().unwrap().iter().any(|(line, _)| line.starts_with("GET /copy/ping")), "the connector was pinged first");
+    let after = EventStore::open_read_only(&db).unwrap().event_kinds().unwrap().len();
+    assert_eq!(before, after, "the copy's log is untouched");
+}
+
+/// R-copy-2: after the report is filed through the connector, the next Stop
+/// sends the attestation, and the main machine's verifier accepts it for the
+/// queued report - and refuses it for a report whose text differs.
+#[test]
+fn a_filed_report_is_sent_with_a_proof_the_main_machine_can_verify() {
+    let connector = stub_connector();
+    let sandbox = Sandbox::new();
+    let s = uuid(91);
+    let (_dir, db, fxp) = due_copy(&sandbox, Some(&connector.base), &s);
+    assert!(is_block(&run_hook(&db, &stop_payload(&s, &fxp), &sandbox)));
+
+    let input = filing_input("Judged the notes I used; one was stale.");
+    serve::attest::fixture::main_transcript(&transcripts(&sandbox), &s)
+        .let_through(
+            "toolu_file",
+            "mcp__thor__remember",
+            &input,
+            "x",
+            "queued for the main machine (remember, capture cap-91). This connector is a replica",
+        )
+        .write();
+    let out = run_hook(&db, &retry_stop_payload(&s, &fxp), &sandbox);
+    assert!(!is_block(&out) && out.contains("was sent to the main machine with its proof"), "{out}");
+
+    let seen = connector.seen.lock().unwrap().clone();
+    let (_, body) = seen.iter().find(|(line, _)| line.starts_with("POST /copy/attest")).expect("the attestation was posted");
+    let att: serve::copy_eval::CopyAttestation = serde_json::from_str(body).unwrap();
+    assert_eq!((att.session.as_str(), att.tool_use_id.as_str(), att.capture_id.as_str()), (s.as_str(), "toolu_file", "cap-91"));
+    let mut queued = thor_core::inbox::InboxOp::new("remember", input.clone());
+    queued.capture_id = "cap-91".to_string();
+    assert_eq!(serve::copy_eval::verify(&att, &queued), Ok(()));
+    let mut forged = thor_core::inbox::InboxOp::new("remember", filing_input("A different text, queued by someone else."));
+    forged.capture_id = "cap-91".to_string();
+    assert!(serve::copy_eval::verify(&att, &forged).is_err());
+
+    // Sent once: the same project is not asked again for a day.
+    let again = run_hook(&db, &stop_payload(&s, &fxp), &sandbox);
+    assert!(!is_block(&again), "{again}");
+    assert_eq!(connector.seen.lock().unwrap().iter().filter(|(l, _)| l.starts_with("POST /copy/attest")).count(), 1);
+}
+
+/// R-copy-3: no connector reachable means nothing is held, and one plain line
+/// says the check is asked again when the connection is back.
+#[test]
+fn an_unreachable_connector_holds_nothing_and_says_so() {
+    let sandbox = Sandbox::new();
+    let s = uuid(92);
+    let (_dir, db, fxp) = due_copy(&sandbox, Some("http://127.0.0.1:1"), &s);
+    let out = run_hook(&db, &stop_payload(&s, &fxp), &sandbox);
+    assert!(!is_block(&out), "an unreachable connector never holds the turn: {out}");
+    assert!(out.contains("cannot be reached") && out.contains("asked again when the connection is back"), "{out}");
+}
+
+/// R-copy-3b: a copy with no connector at all stays as it was - nothing held,
+/// nothing said.
+#[test]
+fn a_copy_without_a_connector_is_never_held_for_the_weekly_check() {
+    let sandbox = Sandbox::new();
+    let s = uuid(93);
+    let (_dir, db, fxp) = due_copy(&sandbox, None, &s);
+    let out = run_hook(&db, &stop_payload(&s, &fxp), &sandbox);
+    assert!(!is_block(&out) && !out.contains("connector"), "{out}");
+}
+
+/// R-copy-4: the session start of a connected copy says in one sentence where
+/// its writes go; one without a connector keeps the old sentence.
+#[test]
+fn a_connected_copy_says_at_session_start_that_writes_go_through_the_queue() {
+    let sandbox = Sandbox::new();
+    let s = uuid(94);
+    let (_dir, db, fxp) = due_copy(&sandbox, Some("http://127.0.0.1:1"), &s);
+    let out = run_hook(&db, &session_start_payload(&s, &fxp), &sandbox);
+    assert!(out.contains("go through the connector's queue and land on the main machine within the hour"), "{out}");
+    let (_dir2, db2, fxp2) = due_copy(&sandbox, None, &uuid(95));
+    let out = run_hook(&db2, &session_start_payload(&uuid(95), &fxp2), &sandbox);
+    assert!(out.contains("the weekly check runs on the main machine") && !out.contains("connector's queue"), "{out}");
+}

@@ -1714,9 +1714,21 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             if !is_subagent && !no_record {
                 release_lease_when_paid(db_path, &session_id);
             }
-            let owed = match is_subagent || no_record {
-                true => None,
-                false => evaluation_after_a_hold(db_path, &session_id, &payload),
+            let owed = match (is_subagent, copy) {
+                (true, _) => None,
+                // A copy's own filing: sent with its proof as soon as the
+                // transcript shows it, held again (a few times) while it is not.
+                (false, true) => {
+                    let cwd = payload.get("cwd").and_then(|v| v.as_str()).map(Path::new);
+                    let at = project::session_project(db_path, &session_id, cwd);
+                    match copy_eval_stop(db_path, &session_id, at.as_deref(), false) {
+                        EvalStop::Ask(text) => Some(Rehold::Hold(text)),
+                        EvalStop::Elsewhere(line) => Some(Rehold::Say(line)),
+                        EvalStop::Quiet => None,
+                    }
+                }
+                (false, false) if no_record => None,
+                (false, false) => evaluation_after_a_hold(db_path, &session_id, &payload),
             };
             match owed {
                 Some(Rehold::Hold(reason)) => {
@@ -2296,7 +2308,7 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                 if thor_core::copy_mode::pull_due(&marker, time::now_unix()) {
                     thor_core::copy_mode::spawn_pull(db_path);
                 }
-                thor_core::copy_mode::session_line(&marker)
+                thor_core::copy_mode::session_line_with(&marker, serve::copy_eval::connector_base(db_path).is_some())
             });
             // A THOR program a hook, the tool server or a sidecar shows in use
             // that is not on disk (an antivirus quarantine): said every start
@@ -3683,11 +3695,13 @@ fn stop_eval_decision(
     may_ask: bool,
     no_record: bool,
 ) -> EvalStop {
-    // A read-only copy can neither start nor file an evaluation (no writable
-    // store, no write tools), so the turn is never held for one. The session
-    // start already says once that the weekly check runs on the main machine.
+    // A read-only copy cannot start an evaluation on its own log or file one
+    // there. When it is connected to the replica connector, its weekly check
+    // goes through the connector's queue and the main machine counts it from
+    // the copy's attestation (`serve::copy_eval`); without a connector the
+    // weekly check stays on the main machine and nothing is held here.
     if serve::store_dir::is_copy(db_path) {
-        return EvalStop::Quiet;
+        return copy_eval_stop(db_path, session_id, stop_project, may_ask);
     }
     let Ok(mut store) = serve::store_dir::open_existing(db_path) else { return EvalStop::Quiet };
     // The folder's own answer, for the words only: when the ask is about
@@ -3695,6 +3709,27 @@ fn stop_eval_decision(
     let folder_own = stop_root.and_then(project::resolve_project);
     let at = EvalStopAt { project: stop_project, folder: folder_own.as_deref() };
     eval_stop_ask(&mut store, db_path, session_id, at, time::now_unix(), may_ask, no_record)
+}
+
+/// The weekly check of a read-only copy at a Stop (`serve::copy_eval::copy_stop`)
+/// as the Stop's evaluation decision: an ask holds the turn, a line rides along
+/// without holding, and no connector (or none reachable) holds nothing.
+fn copy_eval_stop(db_path: &Path, session_id: &str, stop_project: Option<&str>, may_ask: bool) -> EvalStop {
+    let root = serve::attest::transcripts_root();
+    let stop = serve::copy_eval::copy_stop(
+        db_path,
+        session_id,
+        stop_project,
+        root.as_deref(),
+        time::now_unix(),
+        may_ask,
+        &serve::copy_eval::RealNet,
+    );
+    match stop {
+        serve::copy_eval::CopyStop::Ask(text) => EvalStop::Ask(text),
+        serve::copy_eval::CopyStop::Say(line) => EvalStop::Elsewhere(line),
+        serve::copy_eval::CopyStop::Quiet => EvalStop::Quiet,
+    }
 }
 
 fn eval_stop_ask(

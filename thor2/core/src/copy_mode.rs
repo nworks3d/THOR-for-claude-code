@@ -83,6 +83,13 @@ pub struct Marker {
     /// fetched from an address (so an unchanged backup is not downloaded again).
     #[serde(default)]
     pub source_commit: String,
+    /// The base address of the replica connector this copy writes through
+    /// (for example `https://mcp.example.com`), when the owner named one.
+    /// Without it the copy looks for the `thor` tool server in Claude Code's
+    /// own `~/.claude.json`. Used by the weekly check on a copy
+    /// (`serve::copy_eval`).
+    #[serde(default)]
+    pub connector: Option<String>,
 }
 
 /// Which part of the memory a copy holds. The default (nothing selected) is
@@ -206,9 +213,19 @@ pub fn pull_due(marker: &Marker, now: i64) -> bool {
 /// The one plain line a session start says on a copy machine. It also says,
 /// when the last pull failed, that the old copy is still in use.
 pub fn session_line(marker: &Marker) -> String {
-    let mut line = String::from(
-        "This machine runs a copy of the memory; the weekly check runs on the main machine. Nothing is written into this copy: a note is saved on the main machine (or queued for it, when this machine is connected to the replica) and shows up here after the next pull.",
-    );
+    session_line_with(marker, false)
+}
+
+/// `session_line`, told whether the replica connector is configured on this
+/// machine: then the weekly check is asked here too, and the sentence about
+/// the connector's queue replaces the one about the main machine.
+pub fn session_line_with(marker: &Marker, connected: bool) -> String {
+    let mut line = match connected {
+        true => format!("This machine runs a copy of the memory. Nothing is written into this copy. {CONNECTOR_LINE}"),
+        false => String::from(
+            "This machine runs a copy of the memory; the weekly check runs on the main machine. Nothing is written into this copy: a note is saved on the main machine (or queued for it, when this machine is connected to the replica) and shows up here after the next pull.",
+        ),
+    };
     let selection = marker.selection();
     if selection.is_active() {
         line.push_str(&format!(" It holds only: {}. Notes of other projects are not on this machine on purpose.", selection.describe()));
@@ -218,6 +235,10 @@ pub fn session_line(marker: &Marker) -> String {
     }
     line
 }
+
+/// The one plain sentence a session start adds on a copy that is connected to
+/// the replica connector: where its writes go and how long they take.
+pub const CONNECTOR_LINE: &str = "This machine is connected to the replica connector: notes and corrections written here (and the weekly check's report) go through the connector's queue and land on the main machine within the hour.";
 
 /// Start `sync pull` for this copy in the background, with no console window,
 /// and do not wait for it. The session uses the copy as it is now; the pull

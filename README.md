@@ -928,7 +928,7 @@ What you have now
 What is read-only here
   - nothing in this copy can be changed from this machine: your assistant reads it, and rules still fire and still refuse
   - notes are saved on the main machine, and show up here after the next refresh
-  - the weekly check runs on the main machine only
+  - the weekly check runs on the main machine, unless this machine is also connected to the replica connector (then it is asked here too)
 
 Done. ONE THING LEFT FOR YOU: close Claude Code completely and open it again.
 Claude Code only learns about THOR when it starts, so until you do this nothing above is active.
@@ -978,6 +978,50 @@ The command either finishes or says plainly that nothing was set up and why:
    folder run the installer with `--register-root --per-machine` and
    `--db` naming the copy. It writes nothing on the laptop and prints one line;
    run that line on the main computer.
+
+### The weekly check on a copy (only when the laptop is connected to the replica connector)
+
+Everything above works without this. It is for a laptop that also has a **remote
+connection** to your memory (the "replica connector", the web address of the
+THOR tool server on your NAS; Claude Code's own list of tool servers has it
+under the name `thor`). If you do not have one, skip this section: the weekly
+check then stays on your main computer, exactly as before.
+
+What changes when the connection is there:
+
+1. **The laptop says so at the start of a session**, in one sentence: notes and
+   corrections written there go through the connector's queue and land on the main
+   computer within the hour.
+2. **The weekly check is asked on the laptop too**, by the same rhythm as on the
+   main computer: about once a week for each project, only after ten minutes of
+   real work in a session, and never at the very first turn. Your assistant is
+   asked to judge the notes it used, correct what is wrong, and write a short
+   report with the memory tool. Nothing is needed from you.
+3. **The laptop checks the report itself.** When the turn ends, THOR reads
+   Claude Code's own record of that session on the laptop, sees that the report
+   really was filed by your assistant in that session, and sends a signed
+   proof of it to the connector, next to the report.
+4. **The main computer matches the two** the next time it collects the queue (that
+   is `sync drain`, within the hour). The report counts when the proof matches the
+   report word for word. A proof that does not match (a changed text, a changed
+   session, a changed seal), or no proof within a day, files the report as "does not
+   count", with the reason written in the report, and the next ask names it.
+5. **If the connector cannot be reached**, nothing is held. One line says that the
+   check will be asked again when the connection is back.
+
+What a weekly check made on a laptop covers, and what it does not: the verdicts
+and corrections your assistant made there, and its own summary. The list of notes
+owed a verdict from other sessions, the batch of rules waiting for THOR's trial,
+the disputes to verify and the sweep for rules that block real work live on the
+main computer and are settled by its own weekly check. The report says this in its
+machine section. A laptop keeps no record of which notes fired, so it cannot
+list them. The proof shows that the report is the one the laptop's session
+filed; the connector has no password of its own (the tunnel in front of it is
+the gate), so it does not show who sent it.
+
+If the connector's address is not in Claude Code's tool servers, you can name it
+for the copy: put `"connector": "https://your-connector-address"` in the copy's
+`thor-copy.json` (the small file next to the copy's `thor.db`).
 
 ### Change what the copy holds, or refresh it by hand
 

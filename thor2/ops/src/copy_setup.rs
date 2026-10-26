@@ -207,7 +207,7 @@ pub fn run(req: &Request) -> Result<Vec<String>, String> {
     lines.push("What is read-only here".to_string());
     lines.push("  - nothing in this copy can be changed from this machine: your assistant reads it, and rules still fire and still refuse".to_string());
     lines.push("  - notes are saved on the main machine, and show up here after the next refresh".to_string());
-    lines.push("  - the weekly check runs on the main machine only".to_string());
+    lines.push("  - the weekly check runs on the main machine, unless this machine is also connected to the replica connector (then it is asked here too)".to_string());
     lines.push(String::new());
     lines.push("Done. ONE THING LEFT FOR YOU: close Claude Code completely and open it again.".to_string());
     lines.push("Claude Code only learns about THOR when it starts, so until you do this nothing above is active.".to_string());
