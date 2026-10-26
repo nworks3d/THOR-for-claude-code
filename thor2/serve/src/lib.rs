@@ -104,6 +104,7 @@ pub mod attest;
 pub mod audit;
 pub mod bug_report;
 pub mod capture;
+pub mod copy_eval;
 pub mod corpus;
 pub mod dead_anchor;
 pub mod decay;

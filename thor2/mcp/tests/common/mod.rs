@@ -358,6 +358,25 @@ impl Replica {
         text.split("data: ").skip(1).find_map(|chunk| serde_json::from_str::<serde_json::Value>(chunk.lines().next().unwrap_or("")).ok())
     }
 
+    /// One plain HTTP request to the connector's own routes (not MCP): the
+    /// status code and the body.
+    pub fn http(&self, method: &str, path: &str, body: &str) -> (u16, String) {
+        use std::io::Read;
+        let mut stream = std::net::TcpStream::connect(&self.addr).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            self.addr,
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut raw = Vec::new();
+        let _ = stream.read_to_end(&mut raw);
+        let text = String::from_utf8_lossy(&raw).to_string();
+        let code = text.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+        (code, text.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default())
+    }
+
     /// A tool call's text, as the agent on the replica reads it.
     pub fn call(&mut self, tool: &str, args: serde_json::Value) -> String {
         let id = self.next_id;

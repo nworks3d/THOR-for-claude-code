@@ -22,6 +22,7 @@ use thor_core::event_store::EventStore;
 use thor_core::inbox::InboxOp;
 
 use crate::transport::{ack_inbox, pull_inbox};
+use serve::copy_eval;
 
 /// What one drain did, as data, so the CLI and any caller render it in their
 /// own words rather than parsing a printed line.
@@ -72,7 +73,18 @@ pub fn drain_from(db: &Path, base: &str, token: &str) -> anyhow::Result<DrainSum
         );
     }
     if pulled.ops.is_empty() {
-        return Ok(DrainSummary { pulled: 0, applied: 0, not_applied: 0, lines: Vec::new() });
+        // Nothing new, but a copy's report may be waiting for an attestation
+        // that came in an earlier drain, or have waited long enough to be filed
+        // dead: settle what is held.
+        let mut summary = DrainSummary { pulled: 0, applied: 0, not_applied: 0, lines: Vec::new() };
+        let mut pending = copy_eval::Pending::read(db);
+        if !pending.is_empty() {
+            let mut stranded = Vec::new();
+            settle_held(db, &mut pending, &mut summary, &mut stranded)?;
+            let refs: Vec<&InboxOp> = stranded.iter().collect();
+            park_stranded(db, &refs, &mut summary.lines);
+        }
+        return Ok(summary);
     }
 
     // THE VERSION GUARD, and it runs BEFORE a single call is applied.
@@ -117,14 +129,29 @@ pub fn drain_from(db: &Path, base: &str, token: &str) -> anyhow::Result<DrainSum
     let server = mcp::ThorMcpServer::new(store).with_library(library::default_path(db));
 
     let runtime = tokio::runtime::Runtime::new()?;
-    let (applied, not_applied, mut lines, stranded) = runtime.block_on(async {
+    // A copy's weekly-check report and the proof of it are not replayed: they
+    // are held until they meet (`serve::copy_eval`).
+    let mut pending = copy_eval::Pending::read(db);
+    let (applied, not_applied, mut lines, mut stranded) = runtime.block_on(async {
         let mut applied = 0usize;
         let mut not_applied = 0usize;
         let mut lines = Vec::new();
-        let mut stranded: Vec<&InboxOp> = Vec::new();
+        let mut stranded: Vec<InboxOp> = Vec::new();
+        let now = unix_now();
         // Sequentially and in capture order: a revise that follows a remember
         // in the same batch has to see the item the remember created.
         for op in &pulled.ops {
+            if copy_eval::is_copy_report(op) || op.tool == copy_eval::ATTEST_TOOL {
+                match copy_eval::absorb(&mut pending, op, now) {
+                    Ok(line) => lines.push(format!("HELD {line}")),
+                    Err(why) => {
+                        not_applied += 1;
+                        lines.push(format!("LOST {}: {why}", label(op)));
+                        stranded.push(op.clone());
+                    }
+                }
+                continue;
+            }
             match server.apply_captured(op).await {
                 mcp::CapturedOutcome::Applied(text) => {
                     applied += 1;
@@ -133,12 +160,21 @@ pub fn drain_from(db: &Path, base: &str, token: &str) -> anyhow::Result<DrainSum
                 mcp::CapturedOutcome::NotApplied(text) => {
                     not_applied += 1;
                     lines.push(format!("LOST {}: {text}", label(op)));
-                    stranded.push(op);
+                    stranded.push(op.clone());
                 }
             }
         }
         (applied, not_applied, lines, stranded)
     });
+    drop(server);
+    let mut summary = DrainSummary { pulled: pulled.ops.len(), applied, not_applied, lines: Vec::new() };
+    // The held reports that now have their attestation (or have waited too
+    // long) are filed, the rest stay held in the file beside the store - saved
+    // BEFORE the ack, so a crash between the two loses nothing.
+    settle_held(db, &mut pending, &mut summary, &mut stranded)?;
+    let (applied, not_applied) = (summary.applied, summary.not_applied);
+    lines.append(&mut summary.lines);
+    let stranded: Vec<&InboxOp> = stranded.iter().collect();
 
     // NOTHING IS DROPPED WITHOUT A COPY, added 2026-08-17 after auditing this
     // path rather than after losing something.
@@ -155,28 +191,62 @@ pub fn drain_from(db: &Path, base: &str, token: &str) -> anyhow::Result<DrainSum
     // So every call that did not land is written out beside the store first.
     // The queue still clears, the report still says what happened, and the
     // writes themselves are still on disk to look at or replay by hand.
-    if !stranded.is_empty() {
-        let path = stranded_path(db);
-        match append_stranded(&path, &stranded) {
-            Ok(()) => lines.push(format!(
-                "the {} call(s) above were kept in {} - the queue clears either way, so this file is the only copy",
-                stranded.len(),
-                path.display()
-            )),
-            // Never let this stop the drain: the batch has already been
-            // applied, and failing here would only strand it a second time.
-            Err(e) => lines.push(format!(
-                "WARNING: the {} call(s) above could NOT be written to {} ({e}), so they exist nowhere now",
-                stranded.len(),
-                path.display()
-            )),
-        }
-    }
+    park_stranded(db, &stranded, &mut lines);
 
     // Only now, once every call in the batch has been attempted.
     ack_inbox(base, token)?;
 
     Ok(DrainSummary { pulled: pulled.ops.len(), applied, not_applied, lines })
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// Write the calls that did not land beside the store, and say so in `lines`.
+fn park_stranded(db: &Path, stranded: &[&InboxOp], lines: &mut Vec<String>) {
+    if stranded.is_empty() {
+        return;
+    }
+    let path = stranded_path(db);
+    match append_stranded(&path, stranded) {
+        Ok(()) => lines.push(format!(
+            "the {} call(s) above were kept in {} - the queue clears either way, so this file is the only copy",
+            stranded.len(),
+            path.display()
+        )),
+        // Never let this stop the drain: the batch has already been
+        // applied, and failing here would only strand it a second time.
+        Err(e) => lines.push(format!(
+            "WARNING: the {} call(s) above could NOT be written to {} ({e}), so they exist nowhere now",
+            stranded.len(),
+            path.display()
+        )),
+    }
+}
+
+/// File the copy-evaluation reports held in `pending` that have their
+/// attestation (or waited too long), save what is still held, and fold the
+/// outcome into `summary`. Reports that could not be filed at all are added to
+/// `stranded`.
+pub fn settle_held(
+    db: &Path,
+    pending: &mut copy_eval::Pending,
+    summary: &mut DrainSummary,
+    stranded: &mut Vec<InboxOp>,
+) -> anyhow::Result<()> {
+    let mut store = EventStore::open_existing(db)?;
+    let settled = copy_eval::settle(&mut store, pending, unix_now());
+    summary.applied += settled.applied;
+    summary.not_applied += settled.not_applied;
+    summary.lines.extend(settled.lines);
+    stranded.extend(settled.stranded);
+    if let Err(e) = pending.write(db) {
+        summary.lines.push(format!(
+            "WARNING: the held copy evaluations could NOT be saved beside the store ({e}); the next drain may not find them"
+        ));
+    }
+    Ok(())
 }
 
 /// Where a call that could not be replayed is parked: beside the store it was

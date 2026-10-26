@@ -1682,9 +1682,18 @@ fn installed_checker_version() -> Option<String> {
     serve::eval_filing::installed_checker_version(exe.parent()?)
 }
 
-/// The on-the-spot refusal of an evaluation report at a replica (F13).
-const REPLICA_EVALUATION_REFUSAL: &str = "REFUSED: an evaluation is filed on the main machine, in the session that \
-ran it - a replica cannot attest it. Nothing was queued: file the report from a session on the main machine.";
+/// The on-the-spot refusal of a REVISE that would turn an item into an
+/// evaluation report at a replica (F13). A copy's weekly-check report is filed
+/// NEW with remember: the copy's Stop attests that one from the session's
+/// transcript (`serve::copy_eval`), and nothing attests a revise.
+const REPLICA_EVALUATION_REFUSAL: &str = "REFUSED: a weekly-check report is filed with remember (kind report, tag \
+evaluation-report), in the session that ran the check - a revise cannot turn an existing item into one from a replica. \
+Nothing was queued.";
+
+/// What a replica adds to the 'queued' reply of a weekly-check report.
+const REPLICA_EVALUATION_HINT: &str = " This is a weekly-check report: it counts once this session's Stop has checked the \
+filing against the session's own transcript and sent its proof to the main machine - that happens by itself when the turn \
+ends, and the report is then applied on the next drain.";
 
 /// A REPLICA JUDGES WHAT IT CAN, ON THE SPOT (F13). A replica queues a write
 /// for the main machine, and a refusal there reaches only the drain's report
@@ -1699,9 +1708,6 @@ fn replica_refusal_for_remember(store: &EventStore, args: &RememberArgs) -> Resu
     refuse_an_open_point_tag(&args.tags, None)?;
     refuse_a_dispute_without_reason(args.because.as_deref(), &args.legitimate_calls, &args.may_change, &args.accept_refusing)?;
     let item = remembered_item(args)?;
-    if is_evaluation_report(&item) {
-        return Err(REPLICA_EVALUATION_REFUSAL.to_string());
-    }
     model::store::fence(store, ACTOR.into(), &item.id).map_err(|e| format!("REFUSED: {e}"))?;
     model::gate::declare(&normalized_item(&item)).map_err(|r| gate_refusal(r, store))
 }
@@ -2688,7 +2694,12 @@ impl ThorMcpServer {
             }
         }
         if let Some(queued) = self.capture("remember", &args) {
-            return queued;
+            let weekly_check = Kind::from_str(&args.kind).is_ok_and(|k| k == Kind::Report)
+                && args.tags.iter().any(|t| t == model::store::EVALUATION_REPORT_TAG);
+            return match weekly_check && queued.starts_with("queued") {
+                true => format!("{queued}{REPLICA_EVALUATION_HINT}"),
+                false => queued,
+            };
         }
         let stamp = self.stamp("remember", meta, raw);
         let root = self.root.clone();
@@ -3739,7 +3750,7 @@ pub fn unreplayable_tools(ops: &[InboxOp]) -> Vec<String> {
     let mut unknown: Vec<String> = ops
         .iter()
         .map(|op| op.tool.clone())
-        .filter(|tool| !REPLAYABLE_TOOLS.contains(&tool.as_str()))
+        .filter(|tool| !REPLAYABLE_TOOLS.contains(&tool.as_str()) && tool.as_str() != serve::copy_eval::ATTEST_TOOL)
         .collect();
     unknown.sort();
     unknown.dedup();
@@ -4007,7 +4018,7 @@ pub fn run_http(
                 cfg
             },
         );
-        let app = axum::Router::new().nest_service("/mcp", service);
+        let app = axum::Router::new().nest_service("/mcp", service).merge(copy_routes(inbox.clone()));
         let listener = tokio::net::TcpListener::bind(bind).await?;
         let actual = listener.local_addr()?;
         println!("THOR replica connector listening on http://{actual}/mcp");
@@ -4019,6 +4030,44 @@ pub fn run_http(
         axum::serve(listener, app).await?;
         Ok::<(), anyhow::Error>(())
     })
+}
+
+/// The two plain routes a read-only COPY's Stop hook speaks to (it has no MCP
+/// client): `GET /copy/ping` says the connector is up, and `POST /copy/attest`
+/// queues the copy's attestation of a weekly-check report into the same inbox
+/// as the writes (`serve::copy_eval`). The main machine pairs it with the
+/// queued report at the drain and verifies them against each other; nothing
+/// is applied here. Like the rest of this surface they carry no auth of their
+/// own - the tunnel in front of the connector is the gate.
+pub fn copy_routes(inbox: PathBuf) -> axum::Router {
+    use axum::extract::State;
+    use axum::routing::{get, post};
+    async fn attest(State(inbox): State<Arc<PathBuf>>, body: String) -> (axum::http::StatusCode, String) {
+        match queue_copy_attestation(&inbox, &body) {
+            Ok(capture_id) => (axum::http::StatusCode::OK, format!("queued ({capture_id})")),
+            Err(why) => (axum::http::StatusCode::BAD_REQUEST, why),
+        }
+    }
+    axum::Router::new()
+        .route("/copy/ping", get(|| async { "ok" }))
+        .route("/copy/attest", post(attest))
+        .with_state(Arc::new(inbox))
+}
+
+/// Queue the attestation in `body` as a `copy_attest` capture; its capture id.
+/// Refuses what is not a well-formed attestation, so the inbox never holds a
+/// line the drain could not read.
+pub fn queue_copy_attestation(inbox: &Path, body: &str) -> Result<String, String> {
+    if body.len() > 64 * 1024 {
+        return Err("the attestation is larger than 64 KB".to_string());
+    }
+    let value: serde_json::Value = serde_json::from_str(body).map_err(|e| format!("the attestation is not JSON: {e}"))?;
+    serde_json::from_value::<serve::copy_eval::CopyAttestation>(value.clone())
+        .map_err(|e| format!("the attestation does not parse: {e}"))?;
+    let op = InboxOp::new(serve::copy_eval::ATTEST_TOOL, value);
+    let capture_id = op.capture_id.clone();
+    inbox::append(inbox, &op).map_err(|e| format!("the attestation could not be queued: {e}"))?;
+    Ok(capture_id)
 }
 
 /// One revision as one history line: a refusal has no item body, so it names

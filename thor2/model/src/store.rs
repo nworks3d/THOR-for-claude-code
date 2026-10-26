@@ -819,7 +819,7 @@ pub fn declare_in_scoped_because<'a>(
             }));
         }
     }
-    declare_gated(store, session_id, lineage_id, actor, item, ctx, trial, att, None, because)
+    declare_gated(store, session_id, lineage_id, actor, item, ctx, trial, att, None, because, None)
 }
 
 pub fn declare<'a>(
@@ -843,7 +843,7 @@ pub fn declare_scoped<'a>(
     ctx: Option<&FilingContext>,
     att: Option<&Att>,
 ) -> Result<Event, WriteError> {
-    declare_gated(store, session_id, lineage_id, actor.into(), item, ctx, None, att, None, None)
+    declare_gated(store, session_id, lineage_id, actor.into(), item, ctx, None, att, None, None, None)
 }
 
 /// Everything `declare_scoped` does, plus the trial record `declare_in_scoped`
@@ -862,6 +862,7 @@ fn declare_gated(
     att: Option<&Att>,
     root: Option<(&str, &str, Option<&str>)>,
     because: Option<&str>,
+    copy_machine: Option<&str>,
 ) -> Result<Event, WriteError> {
     let actor = fence(store, actor, &item.id)?;
     let item = normalized(item);
@@ -917,7 +918,18 @@ fn declare_gated(
     // A no-op for every write that is not itself an evaluation report. One
     // that passes is stored with THOR's machine section above the writer's
     // own text (step 15).
-    let item = filed_evaluation_report(store, &item, None, ctx).map_err(WriteError::Refused)?.unwrap_or(item);
+    // A report written in a session on a read-only copy (`file_copy_evaluation`)
+    // is stored with the machine section the drain composed from the copy's
+    // attestation, and takes no filing context: there is no evaluation start
+    // on this log for it.
+    let item = match copy_machine {
+        Some(block) => {
+            let mut filed = item.clone();
+            filed.text = format!("{block}{}", item.text);
+            filed
+        }
+        None => filed_evaluation_report(store, &item, None, ctx).map_err(WriteError::Refused)?.unwrap_or(item),
+    };
     let reason = because.map(str::trim).filter(|r| !r.is_empty());
     let mut body = match reason {
         Some(reason) => body_with_because(&item, reason).map_err(WriteError::Serialize)?,
@@ -7755,6 +7767,83 @@ pub fn record_evaluation_validation(
         .map_err(|e| WriteError::Store(e.into()))
 }
 
+/// A weekly-check report written in a session on a read-only COPY, ready to be
+/// filed on the main log by the drain (`file_copy_evaluation`).
+pub struct CopyFiling<'a> {
+    /// The copy's Claude Code session (the filing event's session column).
+    pub session: &'a str,
+    /// The report as the copy wrote it: Report kind, the evaluation-report tag,
+    /// its project, the writer's own text.
+    pub report: &'a Item,
+    /// What THOR composed for the machine section from the copy's attestation,
+    /// below its header line (plain lines, no section marker).
+    pub machine_lines: &'a str,
+    /// The transcript timestamp of the filing call's result, from the
+    /// attestation; `None` when the attestation named none.
+    pub filed_at: Option<&'a str>,
+    /// `Ok` when the attestation matched the queued report, else the reason
+    /// the report does not count.
+    pub verdict: Result<(), String>,
+}
+
+/// FILE A COPY'S WEEKLY-CHECK REPORT on the main log. The report is stored as an
+/// ordinary evaluation report whose machine section is the one THOR composed
+/// from the copy's attestation (`CopyFiling::machine_lines`), and the
+/// validator's record is written at once - valid when the attestation matched,
+/// else with the reason - so the Stop's own validator, which could only call
+/// it "not attested", never judges it. A filing that fails the write gate
+/// (a taken id, a report with no project) writes nothing, not even a record.
+pub fn file_copy_evaluation(store: &mut EventStore, filing: &CopyFiling<'_>) -> Result<(Event, bool), WriteError> {
+    if !gate::is_evaluation_report(filing.report) {
+        return Err(WriteError::Refused(Refusal {
+            problem: "a copy's weekly-check report must be a Report carrying the evaluation-report tag".to_string(),
+            fix: "queue it again with kind report and the evaluation-report tag".to_string(),
+        }));
+    }
+    if gate::names_a_section_header(&filing.report.text) {
+        return Err(WriteError::Refused(typed_header_refusal()));
+    }
+    let tip = store.get_next_seq().map(|next| next - 1).unwrap_or(0);
+    let block = format!(
+        "{}\n{}\n\n{}\n",
+        gate::machine_section_begin(tip, tip),
+        filing.machine_lines.trim_end(),
+        gate::AGENT_SECTION_BEGIN
+    );
+    let actor = SystemActor::new(EVAL_VALIDATOR_ACTOR);
+    let event = declare_gated(
+        store,
+        filing.session,
+        filing.session,
+        WriteActor::System(actor),
+        filing.report,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(&block),
+    )?;
+    let record = EvaluationValidation {
+        valid: filing.verdict.is_ok(),
+        why: filing.verdict.clone().err().unwrap_or_default(),
+        drift: false,
+        report: filing.report.id.clone(),
+        report_seq: event.seq,
+        project: filing.report.project.clone(),
+        session: filing.session.to_string(),
+        agent: None,
+        started_seq: Some(tip),
+        filed_seq: Some(tip),
+        filed_at: filing.filed_at.map(str::to_string),
+        machine_sha256: Some(machine_block_digest(&block)),
+        verdicts: VerdictShares::default(),
+        carry: Vec::new(),
+    };
+    record_evaluation_validation(store, actor, &record)?;
+    Ok((event, record.valid))
+}
+
 /// Every validator record on the log, oldest first, as (record seq,
 /// validation): the first one per filing (report, report_seq) only. Reads
 /// the validator's own events alone. Empty on an unreadable log - then
@@ -8465,7 +8554,7 @@ pub fn declare_project_record_for(
 ) -> Result<Event, WriteError> {
     fence(store, actor.into(), &item.id)?;
     refuse_unless_project_record(&item.id)?;
-    declare_gated(store, "install", "install", actor.into(), item, None, None, None, Some((root, at, machine)), None)
+    declare_gated(store, "install", "install", actor.into(), item, None, None, None, Some((root, at, machine)), None, None)
 }
 
 /// Register (or move) the working copy on an existing project record: one

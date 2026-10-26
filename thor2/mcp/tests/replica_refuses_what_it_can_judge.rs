@@ -4,8 +4,8 @@
 //! A replica queues a write for the main machine, and a refusal there reaches
 //! only the drain's report and doctor - never the session on the replica that
 //! wrote it. So everything that needs no working copy is judged right here
-//! and refused on the spot: an evaluation report (only the main machine, in
-//! the session that ran it, can attest one), a check whose literal the text
+//! and refused on the spot: a revise that would make an evaluation report
+//! (a weekly-check report is filed new, and the copy's Stop attests it), a check whose literal the text
 //! does not name (A4), the note track, a `teeth:` label, a reserved id, the
 //! widened weakenings. What passes all of that queues exactly as before; the
 //! trial itself still runs at the drain.
@@ -22,22 +22,57 @@ fn replica() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
     (tmp, db, inbox)
 }
 
-/// R8.24: an evaluation report is refused on the spot and nothing is queued.
+/// Owner decision 2026-10-26 ("the report is made where the session runs"): a
+/// weekly-check report is no longer refused at a replica. It is queued, and
+/// the reply says it counts once the copy's Stop has sent its proof. The
+/// main machine holds it until the attestation arrives (`ops::drain`).
 #[test]
-fn r8_24_an_evaluation_report_is_refused_on_the_spot() {
+fn a_weekly_check_report_is_queued_with_a_note_on_how_it_counts() {
     let (_tmp, db, inbox) = replica();
     let mut r = Replica::start(&db, &inbox);
     let reply = r.call(
         "remember",
         json!({"id": "eval-demo-1", "kind": "report", "project": "demo", "tags": ["evaluation-report"], "text": "An evaluation of demo."}),
     );
-    assert!(
-        reply.starts_with(
-            "REFUSED: an evaluation is filed on the main machine, in the session that ran it - a replica cannot attest it"
-        ),
-        "{reply}"
-    );
-    assert!(queued(&inbox).is_empty(), "nothing queued");
+    assert!(reply.starts_with("queued for the main machine (remember, capture "), "{reply}");
+    assert!(reply.contains("weekly-check report") && reply.contains("sent its proof"), "{reply}");
+    assert_eq!(queued(&inbox).len(), 1, "queued");
+}
+
+/// The copy's Stop hook speaks plain HTTP to the connector: a ping, and the
+/// attestation, queued into the same inbox as a `copy_attest` capture. What is
+/// not an attestation is refused and queues nothing.
+#[test]
+fn the_connector_queues_a_copys_attestation_and_refuses_anything_else() {
+    let (_tmp, db, inbox) = replica();
+    let r = Replica::start(&db, &inbox);
+    assert_eq!(r.http("GET", "/copy/ping", "").0, 200, "the ping answers");
+
+    let att = serve::copy_eval::CopyAttestation {
+        v: serve::copy_eval::ATTESTATION_VERSION,
+        session: "11111111-2222-4333-8444-555555555555".to_string(),
+        project: "demo".to_string(),
+        report: "eval-demo-1".to_string(),
+        tool_use_id: "toolu_1".to_string(),
+        capture_id: "cap-1".to_string(),
+        text_sha256: serve::copy_eval::text_digest("An evaluation of demo."),
+        attested_at: "2026-10-26T10:00:00.000Z".to_string(),
+        covered: vec![],
+        seal: String::new(),
+    }
+    .sealed();
+    let (code, _) = r.http("POST", "/copy/attest", &serde_json::to_string(&att).unwrap());
+    assert_eq!(code, 200);
+    let ops = queued(&inbox);
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0].tool, "copy_attest");
+    assert_eq!(ops[0].args["capture_id"], "cap-1");
+
+    let (code, why) = r.http("POST", "/copy/attest", "{\"not\": \"an attestation\"}");
+    assert_eq!(code, 400, "{why}");
+    let (code, _) = r.http("POST", "/copy/attest", "no json at all");
+    assert_eq!(code, 400);
+    assert_eq!(queued(&inbox).len(), 1, "nothing else was queued");
 }
 
 /// R8.24: a rule whose check names a literal its text never names is
