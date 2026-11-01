@@ -786,6 +786,7 @@ fn register_only(db: Option<PathBuf>, per_machine: bool, ask_main: bool) -> Exit
         return ExitCode::FAILURE;
     }
     let here = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    serve::project::load_known_scopes(&db);
     let existing = serve::project::git_root(&here)
         .or_else(|| serve::project::plain_root(&here))
         .and_then(|top| serve::project::resolve_project(&top));
@@ -826,7 +827,7 @@ fn register_only(db: Option<PathBuf>, per_machine: bool, ask_main: bool) -> Exit
     if ask_main {
         // Validate here (is this a checkout of the project?), write nothing.
         let top = serve::project::git_root(&here).or_else(|| serve::project::plain_root(&here));
-        let Some(top) = top.filter(|t| serve::project::resolve_project(t).as_deref() == Some(key.as_str())) else {
+        let Some(top) = top.filter(|t| serve::project::resolve_project(t).is_some_and(|r| serve::project::same_project_name(&r, &key))) else {
             eprintln!("REFUSED: run this from inside a checkout of '{key}'. Nothing was changed.");
             return ExitCode::FAILURE;
         };
@@ -979,6 +980,10 @@ fn main() -> ExitCode {
     let code_index_root = cli
         .code_index_root
         .or_else(|| db.parent().map(|d| d.join("codeindex")));
+    // This folder is filed under the spelling an existing project already has
+    // (case, spaces and hyphens do not open a second project). The code index
+    // below keeps the folder's own name: the git hook finds it by that name.
+    serve::project::load_known_scopes(&db);
 
     // The two files this command WRITES to. Defaulted to Claude Code's own
     // per-user locations (see default_settings_path / default_user_mcp_path)
@@ -1388,6 +1393,9 @@ fn main() -> ExitCode {
         }
     }
     let key_here = project.or_else(|| serve::project::resolve_project(&here));
+    // The code index is named by the folder itself, not by the project it is
+    // filed under: the git hook that refreshes it has no memory to ask.
+    let index_key = serve::project::folder_own_name(&here).or_else(|| key_here.clone()).unwrap_or_default();
     // A plain folder has no code to read and no commits to follow: it is
     // registered as the topic it is, and that is all there is to do.
     let is_plain = serve::project::git_root(&here).is_none();
@@ -1403,7 +1411,7 @@ fn main() -> ExitCode {
             }
             Err(e) => println!("  ! could not set up this topic: {e}"),
         },
-        Some(key) => match code_index_root.as_deref().map(|r| build_project_index(r, &key, &here)).transpose() {
+        Some(key) => match code_index_root.as_deref().map(|r| build_project_index(r, &index_key, &here)).transpose() {
             Ok(Some(Some(files))) => {
                 println!("+ read this project's code, {files} file(s), so it can be searched and kept fresh on every commit");
                 // Immediately after the read succeeds: opens the project in
@@ -1429,7 +1437,7 @@ fn main() -> ExitCode {
                 // THIS branch prints "already recorded" and writes nothing
                 // more (see `record_project_opened`'s own doc comment).
                 if let Some(root) = code_index_root.as_deref() {
-                    match existing_index_file_count(root, &key) {
+                    match existing_index_file_count(root, &index_key) {
                         Ok(files) => print_record_outcome(&key, record_project_opened(&db, &here, &key, files)),
                         Err(e) => println!("  ! could not read the existing code index to record this project: {e}"),
                     }

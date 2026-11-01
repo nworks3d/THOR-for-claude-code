@@ -284,6 +284,12 @@ Words used once, in plain language:
   the more you use it (README.md:489-492).
 - You notice: nothing; notes just stay in their project.
 - Refuse or change: --project / .thor-project overrides the name; it refuses to change an existing name.
+- One name, one spelling: a name that differs from an existing project only in case, spaces or hyphens
+  ("Acme tool tracking", "Acme-tool-tracking") is the same project. A folder is resolved to the spelling
+  the memory already has (the exact one first, else the one with most items); a plain folder with no
+  repository and no marker, named like a project, belongs to it; a write that would file under a second
+  spelling is refused with the spelling to use. Nothing stored is renamed or merged. doctor names the
+  pairs that already exist, with the one thing to do (tell the assistant which spelling to keep).
 
 ### B2. Nobody but the owner opens a new project, shelf or place
 - What: a write that would open a new collection is refused unless the owner named it; the assistant
@@ -550,6 +556,15 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
 - You notice: a few minutes of tidy-up. Nothing is needed from you.
 - Refuse or change: see C5. If Claude Code changes the format of its session record, THOR cannot check
   filings, asks for none, and says so on every turn until THOR is updated.
+- Old tool server: a session whose tool server (loaded when Claude Code starts) is older than the installed
+  one would file a report that does not count. THOR asks for no evaluation and holds no turn in that
+  session, says so once (not at every turn), starts nothing for /thor-eval, and refuses to file a report
+  up front ("this tool server is older than the installed one ... restart Claude"). The cure is a restart.
+- Probable false blocks are listed worst first (the rule that refused the most real calls), at most 8, and
+  the line that counts the rest names the command that lists them all: doctor --db "<store>" --full.
+- The old rules the 20-second box did not reach lead the next start, in the order they were left, taken from
+  the newest start of the project whose pass finished, so over successive evaluations every rule gets its
+  turn.
 
 ### C7. Open points and the owner's queue
 - What: for things only the owner can lift (a project without a working copy, a mid-change checkout, a

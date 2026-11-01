@@ -17,6 +17,12 @@
 //! 4. Otherwise that repository directory's basename.
 //! 5. Otherwise, no project: the caller falls back to the global layer only.
 //!
+//! Where a command has told the module which project scopes the memory holds
+//! ([`load_known_scopes`]), the name from steps 1 to 4 is spelled the way an
+//! existing scope spells it when the two differ only in case, spaces and
+//! hyphens, and a plain folder (step 5) whose own name matches a scope belongs
+//! to it - so a folder never opens a second spelling of a project.
+//!
 //! Steps 2 to 4 exist because both of this module's measured defects had one
 //! shape: an item named a project that resolution could never produce. See
 //! [`MARKER_FILE_NAMES`] and [`git_root`] for the two cases, and
@@ -38,10 +44,22 @@
 use std::path::Path;
 
 pub use model::checkout::{
-    checkout_for, checkout_top, git_root, linked_worktree_root, plain_root, registered_checkout, resolve_project,
-    validate_checkout,
+    checkout_for, checkout_top, existing_scope_for, folder_own_name, git_root, linked_worktree_root, plain_root, project_match_key, registered_checkout,
+    resolve_project, same_project_name, split_scopes, use_known_scopes, validate_checkout,
     RootProblem, MARKER_FILE_NAME, MARKER_FILE_NAMES,
 };
+
+/// Tell `resolve_project` (on this thread) which project scopes the memory at
+/// `db` holds, so a folder is resolved to the spelling an existing project
+/// already has (case, spaces and hyphens do not make a second project). One
+/// grouped read of the heads projection, read-only; a memory that cannot be
+/// read tells it none, and the folder's own name stands. Called once at the
+/// start of a command that resolves folders (a hook, doctor, install, the
+/// tool server).
+pub fn load_known_scopes(db: &Path) {
+    let scopes = thor_core::event_store::EventStore::open_read_only(db).map(|store| store.project_scope_counts()).unwrap_or_default();
+    use_known_scopes(scopes);
+}
 
 /// May an item declared under `item_project` be served to a session sitting in
 /// `session_project`? The ONE place that answers this - every injection

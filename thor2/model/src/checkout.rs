@@ -47,7 +47,27 @@ pub const MARKER_FILE_NAME: &str = ".thor-project";
 /// (missing directory, unreadable marker file, no git root anywhere above
 /// `start_dir`) collapses to `None`, the same "nothing to say" the rest of
 /// the read/serve boundary uses.
+///
+/// THE NAME IS MATCHED TO AN EXISTING PROJECT. When the process has told this
+/// module which project scopes the memory already holds
+/// (`use_known_scopes`), the name the folder gives is spelled the way an
+/// existing scope spells it when the two differ only in case, spaces and
+/// hyphens ("Acme tool tracking" and "Acme-tool-tracking"), so a folder can
+/// never open a second scope for a project that already has one. A plain
+/// folder (no repository above it, no marker) whose own name matches a scope
+/// that way belongs to that project too. With no scopes told - a unit test, a
+/// process that never loaded them - the answer is the folder's own name, as
+/// it always was. Nothing stored is renamed or merged by this.
 pub fn resolve_project(start_dir: &Path) -> Option<String> {
+    match folder_own_name(start_dir) {
+        Some(name) => Some(known_scope_for(&name).unwrap_or(name)),
+        None => start_dir.file_name().and_then(|n| n.to_str()).and_then(known_scope_for),
+    }
+}
+
+/// The name the folder itself gives, with no memory consulted: a marker, else
+/// the repository's, else none.
+pub fn folder_own_name(start_dir: &Path) -> Option<String> {
     if let Some(name) = read_marker(start_dir) {
         return Some(name);
     }
@@ -63,6 +83,102 @@ pub fn resolve_project(start_dir: &Path) -> Option<String> {
         }
     }
     root.file_name().and_then(|n| n.to_str()).map(str::to_string)
+}
+
+thread_local! {
+    /// The project scopes the memory holds, with their item counts, as
+    /// `use_known_scopes` was last told on THIS thread (a hook is one short
+    /// process; a test runs on its own thread, so nothing leaks between them).
+    static KNOWN_SCOPES: std::cell::RefCell<Vec<(String, i64)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Tell this module which project scopes exist, so `resolve_project` spells a
+/// folder's name the way the memory already does. Replaces what was told
+/// before; an empty list switches the matching off.
+pub fn use_known_scopes(scopes: Vec<(String, i64)>) {
+    KNOWN_SCOPES.with(|known| *known.borrow_mut() = scopes);
+}
+
+fn known_scope_for(name: &str) -> Option<String> {
+    KNOWN_SCOPES.with(|known| existing_scope_for(&known.borrow(), name))
+}
+
+/// The key two spellings of one project name share: lower case, and every run
+/// of spaces and hyphens one hyphen ("Acme tool tracking", "Acme-tool-tracking"
+/// and "acme  Tool-Tracking" are one key). Outer separators are dropped.
+/// Nothing else is folded: "acme_tool" is another name.
+pub fn project_match_key(name: &str) -> String {
+    let mut key = String::new();
+    let mut pending_separator = false;
+    for c in name.trim().chars() {
+        if c == ' ' || c == '-' {
+            pending_separator = !key.is_empty();
+            continue;
+        }
+        if pending_separator {
+            key.push('-');
+            pending_separator = false;
+        }
+        key.extend(c.to_lowercase());
+    }
+    key
+}
+
+/// Whether two project names are one name written two ways
+/// (`project_match_key`). An empty name is nobody's.
+pub fn same_project_name(a: &str, b: &str) -> bool {
+    let key = project_match_key(a);
+    !key.is_empty() && key == project_match_key(b)
+}
+
+/// The existing scope a folder's name stands for. `scopes` is every project
+/// scope the store holds with how many items it has. In order: the name itself
+/// when it is a scope (exact spelling wins); else the scope that spells it the
+/// same way apart from case, spaces and hyphens - and when several do, the
+/// one with most items (ties: the first by name), so a new split is never
+/// made and the choice never depends on order. `None` when no scope matches
+/// (the name is then genuinely new).
+///
+/// Only a lookup: no stored scope is ever renamed or merged by it.
+pub fn existing_scope_for(scopes: &[(String, i64)], name: &str) -> Option<String> {
+    if scopes.iter().any(|(s, _)| s == name) {
+        return Some(name.to_string());
+    }
+    let wanted = project_match_key(name);
+    if wanted.is_empty() {
+        return None;
+    }
+    let mut best: Option<&(String, i64)> = None;
+    for scope in scopes.iter().filter(|(s, _)| project_match_key(s) == wanted) {
+        if best.is_none_or(|b| scope.1 > b.1) {
+            best = Some(scope);
+        }
+    }
+    best.map(|(s, _)| s.clone())
+}
+
+/// Groups of existing scopes that are one name written differently (they share
+/// a `project_match_key`), each group sorted by name with its item counts, the
+/// groups sorted too. The split `existing_scope_for` prevents and `doctor`
+/// reports. Scopes with a single spelling are left out.
+pub fn split_scopes(scopes: &[(String, i64)]) -> Vec<Vec<(String, i64)>> {
+    let mut groups: std::collections::BTreeMap<String, Vec<(String, i64)>> = Default::default();
+    for scope in scopes {
+        let key = project_match_key(&scope.0);
+        if !key.is_empty() {
+            groups.entry(key).or_default().push(scope.clone());
+        }
+    }
+    groups
+        .into_values()
+        .filter(|g| g.len() > 1)
+        .map(|mut g| {
+            g.sort();
+            g.dedup();
+            g
+        })
+        .filter(|g| g.len() > 1)
+        .collect()
 }
 
 /// Marker file names, in the order they are tried. `.thor-project` is this
@@ -319,7 +435,8 @@ pub fn validate_checkout(root: &Path, project: &str) -> Result<PathBuf, RootProb
         return Err(RootProblem::NotCheckoutTop(root));
     }
     let resolved = resolve_project(&root);
-    if resolved.as_deref() != Some(project) {
+    // The same project spelled another way (case, spaces, hyphens) is still it.
+    if !resolved.as_deref().is_some_and(|r| same_project_name(r, project)) {
         return Err(RootProblem::ResolvesTo(root, resolved));
     }
     Ok(root)
@@ -708,5 +825,84 @@ mod remote_tests {
             vec!["gh:o/r", "https://example.invalid/o/r"]
         );
         assert_eq!(url_rewrites("[url \"b\"]\n\tpushInsteadOf = p\n[core]\n\tinsteadOf = nope\n"), vec![("p".to_string(), "b".to_string())]);
+    }
+
+    fn scopes(list: &[(&str, i64)]) -> Vec<(String, i64)> {
+        list.iter().map(|(name, n)| (name.to_string(), *n)).collect()
+    }
+
+    /// Case, spaces and hyphens are one name; nothing else is folded.
+    #[test]
+    fn spaces_hyphens_and_case_are_one_project_name() {
+        assert_eq!(project_match_key("Acme tool tracking"), "acme-tool-tracking");
+        assert_eq!(project_match_key("Acme-tool-tracking"), "acme-tool-tracking");
+        assert_eq!(project_match_key("  acme  Tool--Tracking "), "acme-tool-tracking");
+        assert_ne!(project_match_key("acme_tool_tracking"), project_match_key("acme-tool-tracking"), "an underscore is another name");
+        assert!(same_project_name("Sensor Board", "sensor-board"));
+        assert!(!same_project_name("Sensor Board", "Acme Shop"));
+        assert!(!same_project_name("", ""), "an empty name is nobody's");
+        assert_eq!(project_match_key(" - "), "");
+    }
+
+    /// The exact spelling wins; else the spelling with most items; no match is
+    /// genuinely new; nothing is invented.
+    #[test]
+    fn a_name_is_matched_to_the_scope_that_already_exists() {
+        let held = scopes(&[("Acme-tool-tracking", 40), ("Acme tool tracking", 12), ("Investments", 5)]);
+        assert_eq!(existing_scope_for(&held, "Acme tool tracking").as_deref(), Some("Acme tool tracking"), "the exact spelling is kept");
+        assert_eq!(existing_scope_for(&held, "acme TOOL tracking").as_deref(), Some("Acme-tool-tracking"), "the spelling with most items");
+        assert_eq!(existing_scope_for(&held, "investments").as_deref(), Some("Investments"));
+        assert_eq!(existing_scope_for(&held, "Board"), None);
+        assert_eq!(existing_scope_for(&[], "anything"), None);
+        let tied = scopes(&[("b c", 3), ("b-c", 3)]);
+        assert_eq!(existing_scope_for(&tied, "B  C").as_deref(), Some("b c"), "a tie goes to the first by name");
+    }
+
+    /// Existing scopes that differ only that way are found; the rest are not.
+    #[test]
+    fn scopes_that_differ_only_in_case_spaces_or_hyphens_are_grouped() {
+        let held = scopes(&[("Acme-tool-tracking", 40), ("Acme tool tracking", 12), ("Investments", 5), ("Acme-Shop", 9), ("acme shop", 1), ("acme-shop", 2)]);
+        let groups = split_scopes(&held);
+        assert_eq!(groups.len(), 2, "{groups:?}");
+        let names = |g: &[(String, i64)]| g.iter().map(|(n, _)| n.clone()).collect::<Vec<String>>();
+        assert!(groups.iter().any(|g| names(g) == ["Acme tool tracking", "Acme-tool-tracking"]), "{groups:?}");
+        assert!(groups.iter().any(|g| names(g) == ["Acme-Shop", "acme shop", "acme-shop"]), "{groups:?}");
+        assert!(split_scopes(&scopes(&[("a", 1), ("b", 1)])).is_empty());
+    }
+
+    /// A folder is resolved to the project that already exists, whatever its
+    /// own spelling; a plain folder with no marker and no repository belongs
+    /// to the project of its own name; and with nothing told, the folder's own
+    /// name stands, as it always did.
+    #[test]
+    fn a_folder_resolves_to_the_existing_spelling_and_a_new_split_cannot_open() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("Acme tool tracking");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let plain = dir.path().join("Sensor-Board");
+        fs::create_dir_all(&plain).unwrap();
+        let unknown = dir.path().join("Something else");
+        fs::create_dir_all(&unknown).unwrap();
+
+        // Nothing told: the folder's own answer.
+        use_known_scopes(Vec::new());
+        assert_eq!(resolve_project(&repo).as_deref(), Some("Acme tool tracking"));
+        assert_eq!(resolve_project(&plain), None, "a plain folder is no project by name alone");
+
+        use_known_scopes(scopes(&[("Acme-tool-tracking", 40), ("sensor board", 7)]));
+        assert_eq!(resolve_project(&repo).as_deref(), Some("Acme-tool-tracking"), "no second scope: the existing spelling");
+        assert_eq!(resolve_project(&plain).as_deref(), Some("sensor board"), "a plain folder named like a scope belongs to it");
+        assert_eq!(resolve_project(&unknown), None, "a plain folder named like nothing stays no project");
+        fs::write(repo.join(MARKER_FILE_NAME), "Acme Tool Tracking\n").unwrap();
+        assert_eq!(resolve_project(&repo).as_deref(), Some("Acme-tool-tracking"), "a marker is matched too");
+        assert_eq!(folder_own_name(&repo).as_deref(), Some("Acme Tool Tracking"), "the folder's own name is still readable");
+
+        // A registered working copy is still the project's, spelled either way.
+        assert!(validate_checkout(&repo, "Acme-tool-tracking").is_ok());
+        assert!(validate_checkout(&repo, "acme tool tracking").is_ok(), "the same project spelled another way");
+        assert!(matches!(validate_checkout(&repo, "Investments"), Err(RootProblem::ResolvesTo(_, Some(_)))), "another project is still refused");
+
+        use_known_scopes(Vec::new());
     }
 }

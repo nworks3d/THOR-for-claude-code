@@ -830,6 +830,19 @@ fn refuse_a_new_collection(
     if named_by_owner.map(str::trim).is_some_and(|n| n.eq_ignore_ascii_case(&wanted)) {
         return Ok(());
     }
+    // THE SAME NAME WRITTEN ANOTHER WAY (case, spaces, hyphens): not a new
+    // collection but a second spelling of one that exists, and filing under it
+    // would split the project in two ('Acme tool tracking' and
+    // 'Acme-tool-tracking' both existed). Refused with the spelling to use.
+    // Nothing stored is renamed or merged by this.
+    let scopes: Vec<(String, i64)> = known.scopes.iter().map(|s| (s.scope.clone(), (s.documents + s.fireable) as i64)).collect();
+    if let Some(existing) = serve::project::existing_scope_for(&scopes, &wanted) {
+        return Err(format!(
+            "REFUSED: '{wanted}' is not a new collection, it is another spelling of '{existing}', which already exists. Filing \
+             under '{wanted}' would split one project in two, so what is filed under one would not be found under the other. \
+             Write the same item again with project: '{existing}'. Nothing was written."
+        ));
+    }
     if let Some(mismatch) = named_by_owner.map(str::trim).filter(|n| !n.is_empty()) {
         return Err(format!(
             "REFUSED: this write says the owner named a new collection '{mismatch}', but it files the item \
@@ -1834,6 +1847,42 @@ fn refuse_a_filing_the_checker_would_not_count(item: &Item, checker_version: imp
         Some(refusal) => Err(refusal),
         None => Ok(()),
     }
+}
+
+/// When this tool server started (unix seconds), noted once by `main` before
+/// anything else. Unset (a test, an embedding) means "unknown": nothing is
+/// refused on it.
+static STARTED_UNIX: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+
+/// Notes the start of this tool server. The first call wins.
+pub fn note_start() {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+    let _ = STARTED_UNIX.set(now);
+}
+
+/// A FILING FROM A TOOL SERVER OLDER THAN THE INSTALLED ONE, REFUSED BEFORE IT
+/// IS WRITTEN (`serve::eval_filing::stale_tool_server_refusal`). `started` is
+/// when this tool server started, `installed` the installed `mcp` program (the
+/// file beside this one, which the installer replaces); both are asked only for
+/// an evaluation report, so a plain remember never pays for them.
+fn refuse_a_filing_from_a_stale_tool_server(
+    item: &Item,
+    started: impl FnOnce() -> Option<i64>,
+    installed: impl FnOnce() -> Option<PathBuf>,
+) -> Result<(), String> {
+    if !is_evaluation_report(item) {
+        return Ok(());
+    }
+    match serve::eval_filing::stale_tool_server_refusal(started(), installed().as_deref()) {
+        Some(refusal) => Err(refusal),
+        None => Ok(()),
+    }
+}
+
+/// The installed tool server: the `mcp` program beside the one running.
+fn installed_tool_server() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    Some(exe.parent()?.join(format!("mcp{}", std::env::consts::EXE_SUFFIX)))
 }
 
 /// The installed checker's `--version` output, from the folder this tool
@@ -2881,6 +2930,7 @@ impl ThorMcpServer {
             refuse_an_open_point_tag(&args.tags, None)?;
             refuse_a_dispute_without_reason(args.because.as_deref(), &args.legitimate_calls, &args.may_change, &args.accept_refusing)?;
             let item = remembered_item(&args)?;
+            refuse_a_filing_from_a_stale_tool_server(&item, || STARTED_UNIX.get().copied(), installed_tool_server)?;
             refuse_a_filing_the_checker_would_not_count(&item, installed_checker_version)?;
             refuse_a_worktree_only_check(
                 item.check.as_ref(),
@@ -5424,6 +5474,35 @@ mod tests {
         // A report that is not an evaluation filing never even asks.
         report.tags.clear();
         assert!(refuse_a_filing_the_checker_would_not_count(&report, || panic!("asked for a plain report")).is_ok());
+    }
+
+    /// A tool server that started before the installed program was replaced
+    /// refuses to FILE an evaluation report (it would be on file and dead),
+    /// whatever the renderer format says, and only for a report.
+    #[test]
+    fn a_report_is_refused_when_this_tool_server_started_before_the_installed_one_was_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let installed = dir.path().join("mcp.exe");
+        std::fs::write(&installed, b"mcp").unwrap();
+        let written = 2_000_000_000u64;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&installed)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(written))
+            .unwrap();
+
+        let mut report = remembered_item(&base_remember("eval-demo-2026-10-21")).unwrap();
+        report.kind = Kind::Report;
+        report.tags = vec![model::store::EVALUATION_REPORT_TAG.to_string()];
+        let refused = refuse_a_filing_from_a_stale_tool_server(&report, || Some(written as i64 - 60), || Some(installed.clone())).unwrap_err();
+        assert!(refused.starts_with("REFUSED: this tool server is older than the installed one"), "{refused}");
+        assert!(refused.contains("restart Claude") && refused.contains("Nothing was written"), "{refused}");
+        assert!(refuse_a_filing_from_a_stale_tool_server(&report, || Some(written as i64 + 60), || Some(installed.clone())).is_ok());
+        assert!(refuse_a_filing_from_a_stale_tool_server(&report, || None, || Some(installed.clone())).is_ok(), "start unknown");
+        // A report that is not an evaluation filing never even asks.
+        report.tags.clear();
+        assert!(refuse_a_filing_from_a_stale_tool_server(&report, || panic!("asked"), || panic!("asked")).is_ok());
     }
 
     /// R14.4 (step 14): open points are written and closed by THOR itself. A
@@ -9027,6 +9106,34 @@ mod tests {
         fits.project = Some("eten".to_string());
         fits.text = "Zoete aardappel uit de oven met bruine boter.".to_string();
         assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(fits)).await.starts_with("stored"));
+    }
+
+    /// ANOTHER SPELLING OF A COLLECTION THAT EXISTS IS NOT A NEW COLLECTION
+    /// ('Acme tool tracking' and 'Acme-tool-tracking' both existed): the write
+    /// is refused with the spelling to use and nothing is written; the exact
+    /// spelling, and a spelling the owner named himself, still land.
+    #[tokio::test]
+    async fn another_spelling_of_an_existing_collection_is_refused_with_the_spelling_to_use() {
+        let srv = server_knowing(&["Acme-tool-tracking"]);
+        let other_spelling = |named_by_owner: Option<&str>| {
+            let mut other = blank_report("acme-1");
+            other.project = Some("Acme tool tracking".to_string());
+            other.text = "The tracker prints one label per tool.".to_string();
+            other.new_collection_named_by_owner = named_by_owner.map(str::to_string);
+            other
+        };
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(other_spelling(None))).await;
+        assert!(reply.starts_with("REFUSED"), "{reply}");
+        assert!(reply.contains("another spelling of 'Acme-tool-tracking'") && reply.contains("project: 'Acme-tool-tracking'"), "{reply}");
+        assert!(reply.contains("Nothing was written"), "{reply}");
+        assert!(!srv.store.lock().unwrap().get_all_events().unwrap().iter().any(|e| e.entity_id == "acme-1"), "nothing was stored");
+
+        let mut exact = blank_report("acme-2");
+        exact.project = Some("Acme-tool-tracking".to_string());
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(exact)).await.starts_with("stored"));
+
+        let named = other_spelling(Some("Acme tool tracking"));
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(named)).await.starts_with("stored"), "the owner has the final word");
     }
 
     /// The one new name this door allows: the checkout's own project key, which

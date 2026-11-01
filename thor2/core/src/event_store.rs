@@ -1242,6 +1242,36 @@ impl EventStore {
             .ok()
     }
 
+    /// Every project scope the store holds a live (non-retracted) item under,
+    /// with how many items that is: the `project` field of each current head's
+    /// body, read by SQLite in one grouped query over the heads projection (a
+    /// body that is not JSON is skipped). Empty when the projection is not
+    /// current or the query cannot run (the caller then simply knows no scope,
+    /// which is the safe direction for a name lookup). Ordered by name.
+    ///
+    /// NOT `entity_meta.project`: that column is the core layer's own scope (the
+    /// prefix of an entity id before a colon), which a THOR item never has - its
+    /// project lives in its body.
+    pub fn project_scope_counts(&self) -> Vec<(String, i64)> {
+        if !self.heads_projection_current() {
+            return Vec::new();
+        }
+        let sql = format!(
+            "SELECT p, COUNT(DISTINCT entity_id) FROM (
+                 SELECT h.entity_id AS entity_id,
+                        CASE WHEN json_valid(e.body) THEN json_extract(e.body, '$.project') END AS p
+                 FROM head_state h
+                 JOIN event e ON e.seq = h.head_seq
+                 WHERE e.kind <> '{}'
+             ) WHERE typeof(p) = 'text' AND p <> ''
+             GROUP BY p ORDER BY p",
+            EventKind::FactRetracted.as_str()
+        );
+        let Ok(mut stmt) = self.conn.prepare(&sql) else { return Vec::new() };
+        let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))) else { return Vec::new() };
+        rows.filter_map(Result::ok).collect()
+    }
+
     /// Every current head as its full event row, with the head count and the
     /// effective project of its entity - the anchored-pass workload (walk all
     /// heads once) without the O(log) fold. Ordered by entity for determinism.
@@ -2819,6 +2849,28 @@ mod tests {
             1,
             "and the heads themselves must be right, not just 'current'"
         );
+    }
+
+    /// The project scopes of the live items, from the bodies' `project` field:
+    /// a retracted item no longer counts, a body that is not JSON or names no
+    /// project is skipped, and the ids' own colon scope is not a project here.
+    #[test]
+    fn project_scope_counts_read_the_project_of_each_live_head() {
+        let mut store = EventStore::in_memory().unwrap();
+        let mut put = |id: &str, body: &str| store.append_event("s", "l", "t", EventKind::FactCreated, id, None, body).unwrap();
+        put("a", r#"{"text":"x","project":"Acme tool tracking"}"#);
+        put("b", r#"{"text":"y","project":"Acme tool tracking"}"#);
+        put("c", r#"{"text":"z","project":"Acme-tool-tracking"}"#);
+        put("d", r#"{"text":"no project"}"#);
+        put("e", "not json at all");
+        put("P:colon-id", r#"{"text":"colon","project":null}"#);
+        let gone = put("f", r#"{"text":"gone","project":"Retired"}"#);
+        store.append_event("s", "l", "t", EventKind::FactRetracted, "f", Some(&gone.this_hash), r#"{"project":"Retired"}"#).unwrap();
+        assert_eq!(
+            store.project_scope_counts(),
+            vec![("Acme tool tracking".to_string(), 2), ("Acme-tool-tracking".to_string(), 1)]
+        );
+        assert!(EventStore::in_memory().unwrap().project_scope_counts().is_empty(), "an empty store knows no scope");
     }
 
     /// projected_head_events serves every current head as its full event row

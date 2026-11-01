@@ -139,6 +139,11 @@ pub fn plain_summary(db: &Path, cwd: &Path, settings: Option<&Path>, mcp_json: O
         ),
     }
 
+    // Silent unless two project names differ only in case, spaces or hyphens.
+    for line in split_scope_lines(db) {
+        lines.push(format!("  NOTE: {line}"));
+    }
+
     // Silent unless the owner named a temp-until-live or tools folder AND it
     // needs a look (or cannot be reached).
     for note in work_folders_report(db).notes {
@@ -2110,6 +2115,42 @@ pub fn semantic_line(model_dir: Option<&Path>) -> String {
     serve::semantic_paths::mode_line(model_dir)
 }
 
+/// Project names the memory holds that are ONE name written two ways (case,
+/// spaces, hyphens: 'Acme tool tracking' and 'Acme-tool-tracking'), one line
+/// per name, each with the one thing to do. Silent when there are none. A
+/// folder is resolved to the spelling that exists, so no new split opens
+/// (`model::checkout::existing_scope_for`); the ones already there are the
+/// owner's to join, and nothing is ever renamed or merged by THOR itself.
+pub fn split_scope_lines(db: &Path) -> Vec<String> {
+    let Ok(store) = EventStore::open_existing(db) else { return Vec::new() };
+    split_scope_words(&store.project_scope_counts())
+}
+
+/// `split_scope_lines` over the scopes and their item counts.
+fn split_scope_words(scopes: &[(String, i64)]) -> Vec<String> {
+    model::checkout::split_scopes(scopes)
+        .into_iter()
+        .map(|group| {
+            // Keep the spelling with the most items (ties: the first by name).
+            let keep = group.iter().max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0))).map(|(name, _)| name.clone()).unwrap_or_default();
+            let named: Vec<String> = group.iter().map(|(name, n)| format!("'{name}' ({n} item(s))")).collect();
+            let others: Vec<String> = group.iter().filter(|(name, _)| *name != keep).map(|(name, _)| format!("'{name}'")).collect();
+            format!(
+                "project names: {} are one name written {} ways, so what is filed under one is not found under the other. THOR \
+                 changed nothing. The one thing to do: tell your assistant to keep '{keep}' - it then moves the items of {} over \
+                 to it one by one, each with a revise that sets project to '{keep}', and nothing is lost. Until then each folder \
+                 is filed under the spelling its own name has, and a new item cannot open a third spelling.",
+                named.join(" and "),
+                match group.len() {
+                    2 => "two".to_string(),
+                    n => n.to_string(),
+                },
+                others.join(" and ")
+            )
+        })
+        .collect()
+}
+
 /// Component 6: project keys held by live items that NO checkout under
 /// `checkouts` resolves to - items that can never reach a pushed surface
 /// because nothing answers to their name.
@@ -3282,7 +3323,17 @@ fn refusal_outcomes_at(db: &Path, full: bool, now: i64) -> Vec<String> {
     if all.is_empty() {
         return Vec::new();
     }
-    let probable: Vec<_> = all.iter().filter(|(_, f, _)| f.probable_false_block()).map(|(_, f, call)| (f, call)).collect();
+    let mut probable: Vec<_> = all.iter().filter(|(_, f, _)| f.probable_false_block()).map(|(_, f, call)| (f, call)).collect();
+    // The rules that refused the most calls first, so the few that are listed
+    // are the worst ones (blocks of one rule together, ties in log order).
+    let mut per_rule: std::collections::HashMap<&str, (usize, usize)> = Default::default();
+    for (place, (f, _)) in probable.iter().enumerate() {
+        per_rule.entry(f.rule.as_str()).or_insert((0, place)).0 += 1;
+    }
+    probable.sort_by_key(|(f, _)| {
+        let (count, first) = per_rule.get(f.rule.as_str()).copied().unwrap_or((0, 0));
+        (std::cmp::Reverse(count), first)
+    });
     let noisy = all.iter().filter(|(_, f, _)| f.fate == Fate::MarkedNoise).count();
     let young = all.iter().filter(|(t, _, _)| t.is_some_and(|t| now - t < window)).count();
     let mut line = format!(
@@ -3303,7 +3354,7 @@ fn refusal_outcomes_at(db: &Path, full: bool, now: i64) -> Vec<String> {
     // followed); a long list stops at `FALSE_BLOCKS_LISTED` unless --full.
     let shown = if full { probable.len() } else { probable.len().min(model::store::FALSE_BLOCKS_LISTED) };
     if probable.len() > shown {
-        line.push_str(" --full lists them all.");
+        line.push_str(" --full lists them all, the rules that refused the most calls first.");
     }
     let mut out = vec![line];
     for (f, call) in probable.iter().take(shown) {
@@ -3442,7 +3493,7 @@ fn project_crowding_text(
     // resolves to one of the checkouts above - probed the same way a Path
     // anchor is, just below, but with nothing on disk to check for existence
     // against: a command is text a Rule/Orientation names, never a file this
-    // function could look up. Added 2026-09-17 (measured, Printer-stuff eval
+    // function could look up. Added 2026-09-17 (measured, Investments eval
     // 2): `serve why --command "node tools/push.mjs"` showed 7 items
     // applying and 4 shown, while this line, probing files only, reported
     // nothing for that project - the crowd was real and this line could not
@@ -3914,6 +3965,8 @@ pub fn report(
         orphan_projects_line(db, checkouts),
     ]);
     lines.extend(working_copy_lines(db));
+    // Silent unless two project names differ only in case, spaces or hyphens.
+    lines.extend(split_scope_lines(db));
     // Silent unless a real refusal is on the log.
     lines.extend(refusal_outcomes_line(db, full));
     // Silent unless a rule would refuse real calls that ran fine.
@@ -4146,6 +4199,54 @@ mod tests {
         store
             .append_event("legacy", &item.id, "migration", thor_core::event_store::EventKind::FactCreated, &item.id, None, &body)
             .unwrap();
+    }
+
+    /// Two project names that are one name written two ways get one line each
+    /// with the one thing to do, in doctor's report and in the short summary;
+    /// names that differ in more than case, spaces and hyphens, and a memory
+    /// with no such split, are silent. Nothing is renamed or merged.
+    #[test]
+    fn doctor_names_project_names_that_differ_only_in_case_spaces_or_hyphens() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut s = EventStore::new(&db).unwrap();
+            for (id, project) in [
+                ("v1", "Acme tool tracking"),
+                ("v2", "Acme tool tracking"),
+                ("v3", "Acme-tool-tracking"),
+                ("v4", "Acme-tool-tracking"),
+                ("v5", "Acme-tool-tracking"),
+                ("p1", "Investments"),
+            ] {
+                let mut r = rule(id);
+                r.project = Some(project.to_string());
+                legacy_declare(&mut s, &r);
+            }
+        }
+        let lines = split_scope_lines(&db);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line = &lines[0];
+        assert!(line.contains("'Acme tool tracking' (2 item(s)) and 'Acme-tool-tracking' (3 item(s)) are one name written two ways"), "{line}");
+        assert!(line.contains("THOR changed nothing"), "{line}");
+        assert!(line.contains("tell your assistant to keep 'Acme-tool-tracking'") && line.contains("moves the items of 'Acme tool tracking' over"), "{line}");
+        assert!(line.contains("sets project to 'Acme-tool-tracking'"), "{line}");
+        assert!(!line.contains("Investments"), "{line}");
+
+        let summary = plain_summary(&db, dir.path(), None, None);
+        assert!(summary.iter().any(|l| l.starts_with("  NOTE: project names: 'Acme tool tracking'")), "{summary:?}");
+
+        let clean = dir.path().join("clean.db");
+        {
+            let mut s = EventStore::new(&clean).unwrap();
+            let mut r = rule("c1");
+            r.project = Some("Acme".to_string());
+            legacy_declare(&mut s, &r);
+            let mut r = rule("c2");
+            r.project = Some("Acme tracking".to_string());
+            legacy_declare(&mut s, &r);
+        }
+        assert!(split_scope_lines(&clean).is_empty(), "different names are not a split");
     }
 
     /// FIELD TEST 12, R5: a project whose working copy is a repository nested
@@ -6218,7 +6319,7 @@ mod tests {
         let now = serve::time::unix_from_iso8601("2026-10-01T00:00:00Z").unwrap();
         let lines = refusal_outcomes_at(&db, false, now);
         assert_eq!(lines.len(), 1 + model::store::FALSE_BLOCKS_LISTED + 1, "{lines:?}");
-        assert!(lines[0].contains("--full lists them all."), "{lines:?}");
+        assert!(lines[0].contains("--full lists them all, the rules that refused the most calls first."), "{lines:?}");
         assert_eq!(lines.last().unwrap(), "  probable false block: and 2 more, not listed here");
         let first = lines.iter().find(|l| l.contains("'rule-00'")).expect("rule-00 is named");
         assert!(first.contains("[redacted]") && !first.contains("ghp_abcdef"), "{first}");
@@ -7017,7 +7118,7 @@ mod tests {
         assert!(!line.contains("--checkouts"), "a checkout WAS given: {line}");
     }
 
-    /// THE DEFECT THIS PREVENTS (measured 2026-09-17, Printer-stuff eval 2):
+    /// THE DEFECT THIS PREVENTS (measured 2026-09-17, Investments eval 2):
     /// `serve why --command "node tools/push.mjs"` showed 7 items applying
     /// and 4 shown, while this line - probing `TargetKind::Path` bindings
     /// only - reported nothing for that project at all. More than

@@ -2383,6 +2383,34 @@ fn a_session_older_than_the_installed_tool_server_is_told_to_restart_and_a_fresh
     let out = run(&retry_stop_payload(&fresh, &project_dir));
     assert!(!is_block(&out), "an open evaluation is not held for once the tool server is older: {out}");
     assert!(out.contains("Restart Claude; the evaluation is asked again after the restart"), "{out}");
+
+    // The line is said ONCE per session: the next retries of the held turn (and
+    // the next turn's first Stop) stay quiet about it.
+    for _ in 0..2 {
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            served_in(&mut store, "thor-fixture", &fresh, 0);
+        }
+        let out = run(&retry_stop_payload(&fresh, &project_dir));
+        assert!(!out.contains("Restart Claude"), "said once per session, not on every Stop: {out}");
+        assert!(!is_block(&out), "{out}");
+    }
+    let out = run(&stop_payload(&fresh, &project_dir));
+    assert!(!out.contains("Restart Claude"), "a new turn's first Stop does not repeat it either: {out}");
+
+    // The typed command starts nothing in a stale session: it says why.
+    let typed = serde_json::json!({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": old,
+        "cwd": project_dir.to_string_lossy(),
+        "prompt": "/thor-eval",
+    })
+    .to_string();
+    let out = run(&typed);
+    assert!(out.contains("No evaluation was started in this session"), "{out}");
+    assert!(out.contains("Restart Claude"), "{out}");
+    let store = EventStore::open_existing(&db).unwrap();
+    assert!(model::store::evaluation_starts_of_session(&store, &old).is_empty(), "the command started nothing");
 }
 
 // ------------------------------------------------- the weekly check on a copy

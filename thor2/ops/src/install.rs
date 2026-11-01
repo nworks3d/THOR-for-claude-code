@@ -1846,7 +1846,7 @@ fn registration_plan(
         return Ok(Plan::AlreadyHere);
     }
     if old.exists() {
-        return Err(if serve::project::resolve_project(&old).as_deref() == Some(key) {
+        return Err(if serve::project::resolve_project(&old).is_some_and(|r| serve::project::same_project_name(&r, key)) {
             RegisterRefusal::StillACheckout { key: key.to_string(), old: old_text }
         } else {
             RegisterRefusal::StillExists { key: key.to_string(), old: old_text }
@@ -1935,7 +1935,8 @@ pub fn register_root_for(
     };
     let root = root_string(&top);
     let resolved = serve::project::resolve_project(&top);
-    if resolved.as_deref() != Some(key) {
+    // The same project spelled another way (case, spaces, hyphens) is still it.
+    if !resolved.as_deref().is_some_and(|r| serve::project::same_project_name(r, key)) {
         return Err(RegisterRefusal::ResolvesElsewhere { key: key.to_string(), root, resolved });
     }
     let existing = own_registration(store, key, per_machine);

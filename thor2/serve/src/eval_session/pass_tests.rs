@@ -690,6 +690,51 @@ fn the_pass_stops_at_its_time_box_and_resumes() {
     assert!(resumed_note(&resumed[0]).contains("THOR finished deciding the old rules of 'beta'"));
 }
 
+/// Nine rules that stay owed however often they are tried (a project with no
+/// registered working copy: a blocker only the owner can lift), and a time box
+/// that reaches three of them. Every rule must get its turn over successive
+/// evaluations and none may starve - also when an evaluation in between was
+/// started and never finished (its hook killed, its session quiet): that
+/// start recorded nothing about what it reached, so the next one carries on
+/// from the last pass that did, instead of beginning at the head again.
+#[test]
+fn rules_left_unreached_by_the_time_box_lead_the_next_start_until_every_rule_had_its_turn() {
+    let mut fx = Fx::new();
+    let ids: Vec<String> = (0..9).map(|n| format!("owed-{n}")).collect();
+    for (n, id) in ids.iter().enumerate() {
+        fx.legacy(&rule(id, &format!("README.md keeps `line {n}`."), vec![path("README.md")], contains("README.md", &format!("line {n}")), Some("gamma")));
+    }
+    let reached = |start: &EvaluationStart| -> Vec<String> {
+        start.frozen.machine.as_ref().unwrap().items.iter().map(|i| i.id.clone()).collect()
+    };
+    let round = |fx: &mut Fx, session: &str| -> EvaluationStart {
+        fx.quiet_others(session, "gamma");
+        let began = begin(&fx.db, &mut fx.store, session, "gamma", "command").unwrap();
+        decide_until(&mut fx.store, began.start, 20, &mut |tried| tried >= 3)
+    };
+
+    let first = round(&mut fx, S1);
+    assert_eq!(reached(&first), ids[0..3].to_vec(), "oldest write first");
+    assert_eq!(first.frozen.machine.as_ref().unwrap().not_reached_ids, ids[3..].to_vec());
+
+    // A start that never got its pass: nothing recorded about what it reached.
+    fx.quiet_others(S2, "gamma");
+    let cut = begin(&fx.db, &mut fx.store, S2, "gamma", "stop-ask").unwrap().start;
+    assert!(!cut.frozen.decided());
+
+    let second = round(&mut fx, S3);
+    assert_eq!(reached(&second), ids[3..6].to_vec(), "the unfinished start between hid what the first one left: {:?}", reached(&second));
+    let third = round(&mut fx, S4);
+    assert_eq!(reached(&third), ids[6..9].to_vec());
+
+    // Everyone has had a turn; the next pass begins the circle again.
+    let mut seen: Vec<String> = [&first, &second, &third].iter().flat_map(|s| reached(s)).collect();
+    seen.sort();
+    assert_eq!(seen, ids, "every rule was tried once in three passes");
+    let fourth = round(&mut fx, S5);
+    assert_eq!(reached(&fourth), ids[0..3].to_vec(), "the ones tried longest ago go first");
+}
+
 /// F10: the pass never runs `git log -S` - the search that made a machine
 /// pass outrun the hook timeout. An absent check whose literal once lived in
 /// the file's history gets no history evidence from the pass, and this
@@ -1619,6 +1664,20 @@ fn a_busy_start_note_shows_every_section_the_session_acts_on_within_the_hook_lim
     // The owner queue is a count and the last three sessions, not 25 sessions.
     assert!(note.contains("carried by 25 valid evaluation(s), the last 3: session"), "{note}");
     assert!(note.matches(" on 2026-10-").count() <= 4, "three carriers and the audit date, not 25 sessions: {note}");
+}
+
+/// "138 probable false blocks ... 130 more were not listed": the line that
+/// says how many are not listed also names the command that lists every one,
+/// and says the listed ones are the rules that refused the most calls.
+#[test]
+fn the_false_blocks_not_listed_come_with_the_command_that_lists_them() {
+    let mut frozen = busy_frozen(0, 0, 0, 8, 0, 0);
+    frozen.machine.as_mut().unwrap().signals.as_mut().unwrap().false_blocks_more = 130;
+    let note = render_start_note(BUSY_ID, &frozen);
+    assert!(note.contains("130 more are not listed here"), "{note}");
+    assert!(note.contains("the rules that refused the most calls"), "{note}");
+    assert!(note.contains(&format!("`{}`", model::store::doctor_full_command_for(None))), "{note}");
+    assert!(model::store::doctor_full_command_for(None).contains("--full"));
 }
 
 /// A note that cannot fit cuts from the least actionable end, and says what it

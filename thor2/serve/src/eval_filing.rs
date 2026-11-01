@@ -773,8 +773,7 @@ pub fn skew_awaiting_restart(store: &EventStore, project: &str, session: &str, r
 /// installed program or its time cannot be read, when the transcript is
 /// missing or records no start, or when the session started after the install.
 pub fn tool_server_stale(session: &str, root: Option<&Path>, mcp_exe: Option<&Path>) -> Option<String> {
-    let installed = std::fs::metadata(mcp_exe?).ok()?.modified().ok()?;
-    let installed = installed.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64;
+    let installed = installed_unix_of(mcp_exe?)?;
     let files = attest::session_transcripts(root?, session);
     let started = last_session_start(&files)?;
     if started >= installed {
@@ -787,6 +786,40 @@ pub fn tool_server_stale(session: &str, root: Option<&Path>, mcp_exe: Option<&Pa
         crate::time::iso8601_from_unix(started),
         crate::time::iso8601_from_unix(installed)
     ))
+}
+
+/// THE REFUSAL OF A FILING FROM A TOOL SERVER THAT IS OLDER THAN THE INSTALLED
+/// ONE (found in two projects' evaluation reports, 2026-10-20 and 2026-10-21).
+/// The tool server loads only when Claude starts. When the program was replaced
+/// after that, the report it renders is built by the old program and is on
+/// file but dead. `checker_skew_refusal` catches the case where the renderer
+/// format differs; this catches the rest, from the one fact the tool server
+/// knows for certain: when IT started, against when the installed `mcp` file
+/// was written. `None` (nothing refused: a courtesy ahead of the Stop, never a
+/// new way to block a filing) when either time is unknown or the tool server is
+/// not older.
+pub fn stale_tool_server_refusal(started_unix: Option<i64>, installed_mcp: Option<&Path>) -> Option<String> {
+    let started = started_unix?;
+    let installed = installed_unix_of(installed_mcp?)?;
+    if started >= installed {
+        return None;
+    }
+    Some(format!(
+        "REFUSED: this tool server is older than the installed one (it started at {}, the installed tool server was replaced \
+         at {}), so a report filed now would be on file and would not count. Nothing was written. WHAT TO DO: tell the owner \
+         to restart Claude (the tool server loads only when Claude starts), and end your turn; the evaluation is asked again \
+         after the restart and you file the report then. DONE WHEN: the owner restarted Claude and the ask came again. Do not \
+         retry the filing in this session: it would be refused the same way.",
+        crate::time::iso8601_from_unix(started),
+        crate::time::iso8601_from_unix(installed)
+    ))
+}
+
+/// When the file at `path` was last written, in unix seconds; `None` when it
+/// cannot be read.
+fn installed_unix_of(path: &Path) -> Option<i64> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    Some(modified.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64)
 }
 
 /// The newest `SessionStart:startup` or `SessionStart:resume` time (unix
