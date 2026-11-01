@@ -247,6 +247,31 @@ mod tests {
         assert!(line(&old, NOW).contains("older than 7 days"), "{}", line(&old, NOW));
     }
 
+    /// Field case: a Python project ran `python -m unittest` and was told to run
+    /// its ten-minute suite again, because only pytest was recognised.
+    #[test]
+    fn every_python_test_command_is_a_test_run() {
+        for command in [
+            "python -m unittest discover -s tests",
+            "python3 -m unittest tests.test_a",
+            "py -m unittest -v",
+            "py -3 -m unittest",
+            "cd C:/proj && python.exe -m unittest",
+            "python -m coverage run -m unittest",
+            "python -m pytest -x",
+            "py -m pytest tests",
+            "pytest -q",
+        ] {
+            let signal = of(&[edit("1", NOW - 5 * HOUR, "app.py"), bash("2", NOW - 4 * HOUR, command, Some(true))]);
+            assert!(signal.last_run.is_some(), "not seen as a test run: {command}");
+            assert!(signal.may_skip(NOW), "a green run with no change after it may be skipped: {command}");
+        }
+        let after = of(&[bash("1", NOW - 4 * HOUR, "python -m unittest", Some(true)), edit("2", NOW - HOUR, "app.py")]);
+        assert!(!after.may_skip(NOW), "a code change after the run still means run again");
+        let not_a_run = of(&[bash("1", NOW - HOUR, "python manage.py migrate", Some(true))]);
+        assert_eq!(not_a_run.last_run, None);
+    }
+
     #[test]
     fn no_run_on_record_says_run_the_tests() {
         let none = of(&[edit("1", NOW - HOUR, "src/a.rs")]);

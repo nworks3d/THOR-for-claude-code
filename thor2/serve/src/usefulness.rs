@@ -1491,7 +1491,7 @@ pub const EVAL_REPEAT_MIN_UNTESTED_EDITS: u32 = 3;
 /// commands THAT file pre-approves for running THIS evaluation routine
 /// itself, a Rust workspace's own subset of this list).
 pub const EVAL_TEST_RUNNER_COMMANDS: &[&str] =
-    &["cargo test", "cargo build", "npm test", "npm run test", "npm run verify", "node --test", "pytest", "python -m pytest", "pio run", "pio test", "make test", "go test", "dotnet test"];
+    &["cargo test", "cargo build", "npm test", "npm run test", "npm run verify", "node --test", "pytest", "python -m pytest", "python -m unittest", "python3 -m unittest", "py -m unittest", "py -3 -m unittest", "-m unittest", "pio run", "pio test", "make test", "go test", "dotnet test"];
 
 /// File extensions an Edit/Write/NotebookEdit call never counts toward
 /// `edits_since_test` for, even with no test or build run since - prose and
