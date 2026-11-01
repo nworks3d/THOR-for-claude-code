@@ -416,8 +416,8 @@ fn the_judgement_list_is_fixed_when_the_evaluation_starts() {
         serve::teeth::fixture::decide(s, "remember-bound-during");
     });
     with_store(&db, |s| {
-        served(s, "owed-before-start", 40);
-        served(s, "remember-bound-during", 39);
+        served(s, "owed-before-start", model::store::JUDGEMENT_DEBT_AFTER);
+        served(s, "remember-bound-during", model::store::JUDGEMENT_DEBT_AFTER - 1);
     });
     open_start(&db, "s", "p");
     // The evaluation's own writes fire it past the threshold, after the start.

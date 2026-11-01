@@ -540,9 +540,12 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
 
 ### C6. What happens inside an evaluation
 - What: THOR writes a start record in its log and freezes three lists: verdicts (notes that fired this
-  session and went 40 sessions without a verdict), a batch (at most 8 rules only an agent can fix) and
-  an A4 list (at most 16 that only need to name their literal), plus disputes to verify (at most 8) and
-  the false-block sweep. THOR first tries the old rules itself for up to 20 seconds. The assistant gives
+  session and went 10 sessions without a verdict, the most-served first, at most 5 per evaluation), a
+  batch (at most 8 rules only an agent can fix) and an A4 list (at most 16 that only need to name
+  their literal), plus disputes to verify (at most 8), the false-block sweep and the crowded places
+  (at most 3 files or commands that more than 4 facts are bound to, so the lowest ranked are never
+  shown at their moment; each is settled by a real fold, move or retract of its facts, and a place
+  where every fact is a heavier refusing rule is never listed). THOR first tries the old rules itself for up to 20 seconds. The assistant gives
   verdicts with the mark tool, makes the named fixes, ends the turn once, then files the report.
 - Why: verdicts given by script or another session settle nothing (205 verdicts in four minutes were
   given blind on 2026-10-01 and three were wrong). Only a report filed through THOR's own tool, validated

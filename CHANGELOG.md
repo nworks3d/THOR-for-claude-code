@@ -4,6 +4,9 @@ What changed in each release, newest first. The release workflow copies the sect
 
 ## Unreleased
 
+- **An evaluation now really asks whether notes helped.** The judgement threshold was 40 sessions, so all 36 evaluation reports of 2026-10-20..11-01 listed 0 items while 628 notes were served again and again and never marked useful. It is now 10 sessions, and an evaluation lists at most 5 of the owed notes, the most-served first (the rest wait for the next evaluation), so the lower threshold never becomes a wall of verdicts. Doctor's judgement debt line, the start note, the first-session text, `AGENTS.md` and the docs say the same numbers. Doctor's one-way flag on an evaluation's verdicts now starts at five, a full list (it could never reach ten again), and its `unjudged` line uses the same 10.
+- **An evaluation repairs crowded places.** A file or command that more than 4 facts are bound to (the project's own and the global ones) shows only 4 at its moment, so the lowest ranked are outranked and silent when they matter. The start note now lists at most 3 such places with the facts on each, and the report is held until each is brought back to 4 or fewer by a real fold, move or retract - the same way the batch is held. A place where every fact is a heavier refusing rule is never listed, because no honest exit exists. A test now pins that a rule that can refuse keeps a place in the shown block over informing notes of the same weight.
+
 ## 2.6.4 (2026-11-01)
 
 What changed: A copy of your memory on another machine now sends the proof of its weekly report through the same THOR tool as the report itself, so no connection address is needed any more.

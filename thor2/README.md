@@ -181,8 +181,8 @@ written by the reserved actor `eval-machine`), never a file beside the store:
 only the hook knows which session is which, so it writes the record, and the
 tool server finds it again by the session id it runs under. The record
 freezes three lists, none of which can grow afterwards: the judgement
-list (what fired in that session and in 40 sessions or more since its last verdict,
-a fact counting once per session),
+list (what fired in that session and in 10 sessions or more since its last verdict,
+a fact counting once per session; the most-served first, at most 5),
 the batch (at most 8 old rules only an agent can fix) and the A4 list (at
 most 16 rules whose check bites and whose text only has to name its literal).
 Right after it, THOR's machine pass tries the project's old rules itself, in a
@@ -265,8 +265,15 @@ per project and not per folder, when:
   fired repeatedly since they were last judged, or for the old rules THOR's
   trial has not decided, is asked inside the project's evaluation only (its
   frozen judgement list, its batch and its A4 list), which runs once a week
-  per project. A fact counts ONCE PER SESSION toward the 40 that make a verdict
-  owed, however often it was shown there, so 40 means about 40 sessions. The
+  per project. A fact counts ONCE PER SESSION toward the 10 that make a verdict
+  owed, however often it was shown there, so 10 means about 10 sessions (it was
+  40 until 2026-11-01, which was so high that 36 evaluation reports in a row
+  listed nothing). An evaluation lists at most 5 of the owed notes, the
+  most-served first, so the lower threshold never becomes a wall of verdicts.
+  It also lists at most 3 crowded places (a file or command with more than 4
+  facts bound to it, where the lowest ranked are never shown at their moment),
+  each settled by a real fold, move or retract and held like the batch; a place
+  where every fact is a heavier refusing rule is never listed. The
   stale-rule guard still speaks once per session at most.
 
 Inside a turn the ask already held, the `Stop` of that turn holds again while
@@ -635,7 +642,7 @@ nothing.
 An `evaluations` line names the newest evaluation report that COUNTS for this
 checkout's project (valid, and filed by which session), the last five valid
 ones with how their verdicts split (`eval-<id>: <u> useful, <n> noise, <s>
-skipped (<p>% useful)`), a flag when ten or more verdicts all went one way (a
+skipped (<p>% useful)`), a flag when five or more verdicts all went one way (a
 blind pass looks exactly like that, and nothing can tell whether the items were
 read), every report on file that does not count with the reason, and a warning
 when Claude Code's session record could not be read. The judgement debt line

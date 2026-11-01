@@ -1366,7 +1366,10 @@ pub fn decay_line(db: &Path, checkouts: Option<&Path>, full: bool) -> String {
 /// count it where someone will see it. Proof coverage sat at 3 of 3004
 /// until a line here said so out loud, and it is 246 a day later.
 pub fn unjudged_line(db: &Path) -> String {
-    const HEAVY: usize = 40;
+    // The same number the judgement debt starts at (it was 40 until
+    // 2026-11-01): a count of servings here, of sessions there, but one
+    // threshold for "served enough that someone should have judged it".
+    const HEAVY: usize = serve::usefulness::JUDGEMENT_DEBT_AFTER;
     let Ok(store) = EventStore::open_existing(db) else {
         return "unjudged: store unreadable, not checked".to_string();
     };
@@ -1599,6 +1602,7 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool
         return (!lines.is_empty()).then(|| lines.join("\n"));
     }
     let threshold = serve::usefulness::JUDGEMENT_DEBT_AFTER;
+    let cap = serve::usefulness::EVALUATION_JUDGEMENT_LIST_CAP;
     let mut problem_lines: Vec<String> = Vec::new();
     let mut out = vec![match checkout_project {
         Some(project) => format!(
@@ -1606,7 +1610,8 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool
              the last one, or never judged at all; pinned items excluded - the owner answered that question \
              by pinning them) - {in_project} of them apply to this checkout ('{project}', or global); they are \
              never asked at the end of a turn, and an evaluation asks about one only when the evaluating session saw \
-             it fire - so an item that never fires there stays owed until it is settled with mark or retract; the \
+             it fire, the most-served first and at most {cap} per evaluation - so an item that never fires there \
+             stays owed until it is settled with mark or retract; the \
              longest owed are named below, each with its sessions since its last verdict"
         ),
         None => format!(
@@ -1614,7 +1619,8 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool
              the last one, or never judged at all; pinned items excluded - the owner answered that question \
              by pinning them) - this checkout resolves to no project, so only the {in_project} global one(s) \
              among them could ever be asked about here; they are never asked at the end of a turn, and an \
-             evaluation asks about one only when the evaluating session saw it fire - so an item that never fires \
+             evaluation asks about one only when the evaluating session saw it fire, the most-served first and at \
+             most {cap} per evaluation - so an item that never fires \
              there stays owed until it is settled with mark or retract; the longest owed are named below, each \
              with its sessions since its last verdict"
         ),
@@ -1791,7 +1797,7 @@ fn report_problem_lines(store: &EventStore, project: &str) -> Vec<String> {
 /// THE EVALUATIONS OF THIS CHECKOUT'S PROJECT (step 16, B7): the newest one
 /// that counts, then the last five valid ones, each with how its verdicts
 /// split - "eval-<id>: <u> useful, <n> noise, <s> skipped (<p>% useful)" -
-/// and a flag on one whose ten or more verdicts all went one way (a blind
+/// and a flag on one whose five or more verdicts all went one way (a blind
 /// pass looks exactly like that). Every report on file that does not count
 /// is named with its reason, and the format-drift line when the newest
 /// check found the transcript unreadable (D14). Silent outside a project and
@@ -5299,7 +5305,10 @@ mod tests {
             !line.contains("probed-only"),
             "an item pushed over the threshold by another actor alone must never be named as debt: {line}"
         );
-        assert!(line.contains("'probe' (40x)"), "must name the other actor and its firing count: {line}");
+        assert!(
+            line.contains(&format!("'probe' ({}x)", serve::usefulness::JUDGEMENT_DEBT_AFTER)),
+            "must name the other actor and its firing count: {line}"
+        );
         assert!(
             line.contains("not counted as") && line.contains("debt"),
             "must say plainly that this is not counted as debt: {line}"
@@ -5328,7 +5337,7 @@ mod tests {
         let line = judgement_debt_line(&db, None, false)
             .expect("another actor's own traffic must still speak, even with zero real debt");
         assert!(!line.contains("probed-only"), "still never named as debt: {line}");
-        assert!(line.contains("'probe' (40x)"), "{line}");
+        assert!(line.contains(&format!("'probe' ({}x)", serve::usefulness::JUDGEMENT_DEBT_AFTER)), "{line}");
     }
 
     // ----------------------------------------------------- contradiction_line
@@ -7791,14 +7800,15 @@ mod tests {
         serve::eval_filing::fixture::valid_filing(store, transcripts.path(), session, &report, "toolu_filing")
     }
 
-    /// G16.4 (B7): 7 useful, 2 noise, 1 skipped - doctor names the newest
-    /// evaluation that counts and its share, "78% useful", and no flag.
+    /// G16.4 (B7): 3 useful, 1 noise, 1 skipped (a full list of five) - doctor
+    /// names the newest evaluation that counts and its share, "75% useful",
+    /// and no flag.
     #[test]
     fn evaluations_line_shows_the_share() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
-        let record = evaluation_with_verdicts(&mut EventStore::new(&db).unwrap(), "fxp", 7, 2, 1);
-        assert_eq!((record.verdicts.useful, record.verdicts.noise, record.verdicts.skipped), (7, 2, 1), "{record:?}");
+        let record = evaluation_with_verdicts(&mut EventStore::new(&db).unwrap(), "fxp", 3, 1, 1);
+        assert_eq!((record.verdicts.useful, record.verdicts.noise, record.verdicts.skipped), (3, 1, 1), "{record:?}");
         let line = evaluations_line(&db, Some("fxp")).expect("a valid evaluation, the line must speak");
         assert!(
             line.starts_with(&format!(
@@ -7806,34 +7816,34 @@ mod tests {
             )),
             "{line}"
         );
-        assert!(line.contains("  eval-fxp-2026-09-30: 7 useful, 2 noise, 1 skipped (78% useful)"), "{line}");
+        assert!(line.contains("  eval-fxp-2026-09-30: 3 useful, 1 noise, 1 skipped (75% useful)"), "{line}");
         assert!(!line.contains("every verdict went one way"), "{line}");
         assert_eq!(evaluations_line(&db, Some("other")), None, "silent for a project with no report at all");
         assert_eq!(evaluations_line(&db, None), None, "silent outside a project");
     }
 
-    /// R16.6 (B7): 12 items on the list, every one judged useful - doctor
-    /// flags it: a blind pass looks exactly like this.
+    /// R16.6 (B7): a whole judgement list (the cap, five items) judged useful,
+    /// every one - doctor flags it: a blind pass looks exactly like this.
     #[test]
-    fn one_way_flag_at_ten_verdicts() {
+    fn one_way_flag_at_a_full_list_of_verdicts() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
-        evaluation_with_verdicts(&mut EventStore::new(&db).unwrap(), "fxp", 12, 0, 0);
+        evaluation_with_verdicts(&mut EventStore::new(&db).unwrap(), "fxp", 5, 0, 0);
         let line = evaluations_line(&db, Some("fxp")).unwrap();
         assert!(
             line.contains(
-                "eval-fxp-2026-09-30: 12 useful, 0 noise, 0 skipped (100% useful) - every verdict went one way - a blind pass \
+                "eval-fxp-2026-09-30: 5 useful, 0 noise, 0 skipped (100% useful) - every verdict went one way - a blind pass \
                  looks exactly like this; nothing here can tell whether the items were read"
             ),
             "{line}"
         );
 
-        // Nine the same way is below the flag's floor.
+        // Four the same way is below the flag's floor.
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
-        evaluation_with_verdicts(&mut EventStore::new(&db).unwrap(), "fxp", 0, 9, 0);
+        evaluation_with_verdicts(&mut EventStore::new(&db).unwrap(), "fxp", 0, 4, 0);
         let line = evaluations_line(&db, Some("fxp")).unwrap();
-        assert!(line.contains("0 useful, 9 noise, 0 skipped (0% useful)") && !line.contains("went one way"), "{line}");
+        assert!(line.contains("0 useful, 4 noise, 0 skipped (0% useful)") && !line.contains("went one way"), "{line}");
     }
 
     /// B5, B6: THOR's own open points of a project a valid evaluation was

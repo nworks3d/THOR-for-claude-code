@@ -205,6 +205,12 @@ fn agents_md_gives_the_numbers_the_evaluation_really_uses() {
         format!("at most {} that only have to name", model::store::EVALUATION_A4_LIST),
         format!("at least {} minutes of its own work", serve::usefulness::EVAL_OWN_WORK_MINUTES),
         format!("{} sessions or more without a verdict", model::store::JUDGEMENT_DEBT_AFTER),
+        format!(
+            "the most-served first, at most {} per evaluation",
+            model::store::EVALUATION_JUDGEMENT_LIST_CAP
+        ),
+        format!("The note lists at most {} such places", model::store::EVALUATION_OUTRANKED_LIST),
+        format!("holds {} or fewer", model::item::MAX_ITEMS),
         format!("at least {} characters", model::store::NOT_JUDGEABLE_REASON_MIN_CHARS),
         format!("covers the next {} days", serve::usefulness::EVAL_WEEKLY_DAYS),
         format!("covers the next {} hours", serve::usefulness::EVAL_ROT_RECHECK_HOURS),

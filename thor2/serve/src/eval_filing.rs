@@ -895,8 +895,11 @@ pub fn drift_recorded(store: &EventStore) -> bool {
 }
 
 /// The one-way flag (B7): at least this many verdicts on an evaluation's
-/// list, every one the same way.
-pub const ONE_WAY_AT: usize = 10;
+/// list, every one the same way. A whole judgement list: since 2026-11-01 an
+/// evaluation lists at most `EVALUATION_JUDGEMENT_LIST_CAP` items, so the old
+/// floor of ten could never be reached again and the flag would have died
+/// silently.
+pub const ONE_WAY_AT: usize = crate::usefulness::EVALUATION_JUDGEMENT_LIST_CAP;
 
 /// "eval-<id>: <u> useful, <n> noise, <s> skipped (<p>% useful)" for one
 /// valid evaluation - `p` rounded, and "no verdict" when none was given.

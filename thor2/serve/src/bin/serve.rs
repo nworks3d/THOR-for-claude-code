@@ -3569,6 +3569,10 @@ fn evaluation_after_a_hold(db_path: &Path, session_id: &str, payload: &Value) ->
         }
         let judgement = model::store::evaluation_judgement_owed(&store, start, &[]);
         let teeth = model::store::evaluation_frozen_batch_owed(&store, start);
+        let crowded = match model::store::evaluation_outranked_owed(&store, start).len() {
+            0 => String::new(),
+            n => format!(", {n} crowded place(s) still holding more facts than a block shows"),
+        };
         let foreign = model::store::frozen_writes_in_window(&store, start, None).foreign_pending.len();
         let foreign = match foreign {
             0 => String::new(),
@@ -3581,7 +3585,7 @@ fn evaluation_after_a_hold(db_path: &Path, session_id: &str, payload: &Value) ->
              with the THOR tool itself - mcp__thor__remember with kind report, project '{project}', tags \
              [\"evaluation-report\"], id eval-{project}-<date> and your own plain summary as its text. If anything is still \
              owed, the filing names it, one by one; do that and file again. Owed right now: {} judgement item(s) without \
-             a verdict or a not-judgeable tag, {} rule(s) of the batch and the A4 list{foreign}. Do not tell the owner \
+             a verdict or a not-judgeable tag, {} rule(s) of the batch and the A4 list{crowded}{foreign}. Do not tell the owner \
              'next turn': file in this one.",
             start.id,
             judgement.owed.len(),
