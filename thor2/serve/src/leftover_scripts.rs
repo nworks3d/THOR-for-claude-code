@@ -19,6 +19,16 @@
 //!    it for the owner, who alone says yes to a delete. A file is asked
 //!    about ONCE per session: the hold marks it, and a later turn end does not
 //!    hold for it again, so the question can never become a loop.
+//! 3. A file written by a background agent (a subagent) of this session that is
+//!    still running is left alone: the agent is probably using it, and a delete
+//!    would break its work. The note records which agent wrote the file; the
+//!    agent counts as running while its own transcript file, or its last noted
+//!    write, is less than 30 minutes old. The file is asked about, once, as soon
+//!    as the agent has been quiet that long.
+//! 4. The note file is changed under a small lock file beside it. A background
+//!    agent's tool calls note files while the turn end marks files as asked
+//!    about; without the lock one of them could overwrite the other's change and
+//!    the same file would be asked about again.
 //!
 //! WHAT THIS DOES NOT SEE. Only the file tools are watched. A script made by a
 //! shell redirect (`echo ... > x.py`, `cat <<EOF > x.ps1`) never passes
@@ -68,6 +78,13 @@ struct SessionRecord {
     /// Files this session was already asked about.
     #[serde(default)]
     held: Vec<String>,
+    /// The subagent that last wrote a noted file (path as `normalize` spells it,
+    /// then the agent id). A file the main session wrote has no entry.
+    #[serde(default)]
+    writers: BTreeMap<String, String>,
+    /// When each subagent last wrote a noted file (unix seconds).
+    #[serde(default)]
+    agents: BTreeMap<String, i64>,
 }
 
 type Book = BTreeMap<String, SessionRecord>;
@@ -82,6 +99,49 @@ fn read_book(db: &Path) -> Book {
 fn write_book(db: &Path, book: &Book) {
     if let Ok(text) = serde_json::to_string(book) {
         let _ = store_dir::write(&book_path(db), text);
+    }
+}
+
+/// The lock file beside the note file.
+const LOCK_FILE: &str = "leftover-scripts.lock";
+/// How long a change waits for the lock before it goes on without.
+const LOCK_WAIT: Duration = Duration::from_secs(1);
+/// A lock older than this was left by a hook that died.
+const LOCK_STALE: Duration = Duration::from_secs(10);
+
+/// The lock, released (the file removed) when dropped. `None` inside means
+/// none was taken: a copy of the memory, or a lock that stayed taken.
+struct BookLock(Option<PathBuf>);
+
+impl Drop for BookLock {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Wait for the lock for up to `LOCK_WAIT`, then go on without it: a hook that
+/// is slow or a lock that is stuck must never hold a tool call or a turn end.
+fn lock_book(db: &Path) -> BookLock {
+    let path = db.parent().unwrap_or_else(|| Path::new(".")).join(LOCK_FILE);
+    if store_dir::is_held(&path) {
+        return BookLock(None);
+    }
+    let started = std::time::Instant::now();
+    loop {
+        if std::fs::OpenOptions::new().write(true).create_new(true).open(&path).is_ok() {
+            return BookLock(Some(path));
+        }
+        let stale = std::fs::metadata(&path).and_then(|m| m.modified()).ok().and_then(|at| at.elapsed().ok()).is_some_and(|age| age > LOCK_STALE);
+        if stale {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        if started.elapsed() > LOCK_WAIT {
+            return BookLock(None);
+        }
+        std::thread::sleep(Duration::from_millis(15));
     }
 }
 
@@ -134,15 +194,20 @@ fn in_git_work_tree(dir: &Path) -> Option<bool> {
 /// Note a tool call's file when it is a leftover candidate. Called before every
 /// tool call; the cheap checks come first, so an ordinary call costs a string
 /// comparison.
-pub fn record_write(db: &Path, session_id: &str, tool_name: &str, tool_input: Option<&Value>, cwd: Option<&Path>, now: i64) {
-    record_write_with(db, session_id, tool_name, tool_input, cwd, now, &in_git_work_tree);
+///
+/// `agent` is the subagent the call is made by (the hook payload's `agent_id`),
+/// `None` for the main session.
+pub fn record_write(db: &Path, session_id: &str, agent: Option<&str>, tool_name: &str, tool_input: Option<&Value>, cwd: Option<&Path>, now: i64) {
+    record_write_with(db, session_id, agent, tool_name, tool_input, cwd, now, &in_git_work_tree);
 }
 
 /// `record_write` with the git lookup passed in (`None` = unknown, which notes
 /// nothing).
+#[allow(clippy::too_many_arguments)]
 pub fn record_write_with(
     db: &Path,
     session_id: &str,
+    agent: Option<&str>,
     tool_name: &str,
     tool_input: Option<&Value>,
     cwd: Option<&Path>,
@@ -175,6 +240,7 @@ pub fn record_write_with(
         return;
     }
 
+    let _lock = lock_book(db);
     let mut book = read_book(db);
     book.retain(|_, record| now - record.at < KEEP_SECS);
     let record = book.entry(session_id.to_string()).or_default();
@@ -182,6 +248,16 @@ pub fn record_write_with(
     let key = normalize(&absolute_text);
     if record.files.len() < MAX_FILES_PER_SESSION && !record.files.iter().any(|known| normalize(known) == key) {
         record.files.push(absolute_text);
+    }
+    // The latest writer of the file decides who it belongs to.
+    match agent.filter(|a| !a.is_empty()) {
+        Some(agent) => {
+            record.writers.insert(key, agent.to_string());
+            record.agents.insert(agent.to_string(), now);
+        }
+        None => {
+            record.writers.remove(&key);
+        }
     }
     write_book(db, &book);
 }
@@ -213,20 +289,52 @@ fn message(files: &[String], tools: &str) -> String {
     out
 }
 
+/// When the subagent `agent` of `session` last did anything, as its own
+/// transcript file (`agent-<id>.jsonl` under the session's folder, any depth)
+/// says, in unix seconds. `None` when no such file is found.
+fn agent_transcript_activity(root: Option<&Path>, session: &str, agent: &str) -> Option<i64> {
+    let stem = format!("agent-{agent}");
+    crate::attest::session_transcripts(root?, session)
+        .into_iter()
+        .filter(|file| file.file_stem().is_some_and(|s| s.to_string_lossy() == stem))
+        .filter_map(|file| std::fs::metadata(file).ok()?.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|since| since.as_secs() as i64)
+        .max()
+}
+
 /// What the turn end should say about leftover scripts, or `None`. Marks the
 /// files it lists as asked about, so the same file is never asked about twice
-/// in one session.
+/// in one session. A file a still-running subagent wrote is neither listed nor
+/// marked.
 pub fn hold_reason(db: &Path, session_id: &str, now: i64) -> Option<String> {
+    let root = crate::attest::transcripts_root();
+    hold_reason_with(db, session_id, now, &|agent| agent_transcript_activity(root.as_deref(), session_id, agent))
+}
+
+/// `hold_reason` with the subagents' last activity passed in (agent id to unix
+/// seconds, `None` = not known).
+pub fn hold_reason_with(db: &Path, session_id: &str, now: i64, agent_activity: &dyn Fn(&str) -> Option<i64>) -> Option<String> {
     let tools = work_folders::settings(db).tools?;
-    let mut book = read_book(db);
-    let record = book.get_mut(session_id)?;
-    let candidates: Vec<String> = record
+    let book = read_book(db);
+    let record = book.get(session_id)?;
+    let mut candidates: Vec<String> = record
         .files
         .iter()
         .filter(|file| !record.held.iter().any(|held| normalize(held) == normalize(file)))
         .filter(|file| !in_thor_folder(db, file))
         .cloned()
         .collect();
+    // A subagent that did something less than half an hour ago may still be
+    // using what it wrote: its files wait until it has been quiet that long.
+    let mut running: BTreeMap<String, bool> = BTreeMap::new();
+    candidates.retain(|file| {
+        let Some(agent) = record.writers.get(&normalize(file)) else { return true };
+        let busy = *running.entry(agent.clone()).or_insert_with(|| {
+            let last = [record.agents.get(agent).copied(), agent_activity(agent)].into_iter().flatten().max();
+            last.is_some_and(|at| now - at <= MIN_AGE_SECS)
+        });
+        !busy
+    });
     if candidates.is_empty() {
         return None;
     }
@@ -238,6 +346,11 @@ pub fn hold_reason(db: &Path, session_id: &str, now: i64) -> Option<String> {
     if due.is_empty() {
         return None;
     }
+    // Mark them under the lock, on a fresh read: a subagent's tool call may have
+    // changed the note file since it was read above.
+    let _lock = lock_book(db);
+    let mut book = read_book(db);
+    let record = book.get_mut(session_id)?;
     record.held.extend(due.iter().cloned());
     write_book(db, &book);
     Some(message(&due, &tools.display().to_string()))
@@ -280,7 +393,7 @@ mod tests {
 
     fn write(fx: &Fx, session: &str, tool: &str, file: &Path) {
         let input = json!({ "file_path": file.display().to_string() });
-        record_write_with(&fx.db, session, tool, Some(&input), None, NOW, &outside_git);
+        record_write_with(&fx.db, session, None, tool, Some(&input), None, NOW, &outside_git);
     }
 
     fn noted(fx: &Fx, session: &str) -> Vec<String> {
@@ -339,7 +452,7 @@ mod tests {
         }
         assert_eq!(noted(&fx, "s2").len(), 2);
         let notebook = json!({ "notebook_path": fx.scratch.join("n.sh").display().to_string() });
-        record_write_with(&fx.db, "s3", "NotebookEdit", Some(&notebook), None, NOW, &outside_git);
+        record_write_with(&fx.db, "s3", None, "NotebookEdit", Some(&notebook), None, NOW, &outside_git);
         assert_eq!(noted(&fx, "s3").len(), 1, "a notebook call names its file by notebook_path");
     }
 
@@ -363,8 +476,8 @@ mod tests {
         for tool in ["Bash", "Read", "Grep", "Agent", "PowerShell", ""] {
             write(&fx, "s1", tool, &file);
         }
-        record_write_with(&fx.db, "s1", "Write", None, None, NOW, &outside_git);
-        record_write_with(&fx.db, "s1", "Write", Some(&json!({ "content": "x" })), None, NOW, &outside_git);
+        record_write_with(&fx.db, "s1", None, "Write", None, None, NOW, &outside_git);
+        record_write_with(&fx.db, "s1", None, "Write", Some(&json!({ "content": "x" })), None, NOW, &outside_git);
         assert!(noted(&fx, "s1").is_empty());
         assert!(!book_path(&fx.db).exists(), "nothing noted, nothing written");
     }
@@ -393,7 +506,7 @@ mod tests {
         assert!(noted(&fx, "s1").is_empty(), "{:?}", noted(&fx, "s1"));
         // A note made by an older build is not held either.
         let mut book = Book::new();
-        book.insert("s2".into(), SessionRecord { at: NOW, files: vec![own.display().to_string()], held: vec![] });
+        book.insert("s2".into(), SessionRecord { at: NOW, files: vec![own.display().to_string()], ..Default::default() });
         write_book(&fx.db, &book);
         assert_eq!(hold_reason(&fx.db, "s2", mtime(&own) + 3_600), None);
     }
@@ -407,7 +520,7 @@ mod tests {
         // The real lookup, not a stand-in.
         for file in [repo.join("build.py"), repo.join("scripts").join("deep").join("run.sh")] {
             let input = json!({ "file_path": file.display().to_string() });
-            record_write(&fx.db, "s1", "Write", Some(&input), None, NOW);
+            record_write(&fx.db, "s1", None, "Write", Some(&input), None, NOW);
         }
         assert!(noted(&fx, "s1").is_empty());
         // A worktree has a `.git` FILE.
@@ -415,12 +528,12 @@ mod tests {
         std::fs::create_dir_all(&worktree).unwrap();
         std::fs::write(worktree.join(".git"), "gitdir: /elsewhere/.git/worktrees/wt\n").unwrap();
         let input = json!({ "file_path": worktree.join("x.py").display().to_string() });
-        record_write(&fx.db, "s1", "Write", Some(&input), None, NOW);
+        record_write(&fx.db, "s1", None, "Write", Some(&input), None, NOW);
         assert!(noted(&fx, "s1").is_empty());
         // And a lookup that is not sure notes nothing.
         let input = json!({ "file_path": fx.scratch.join("x.py").display().to_string() });
-        record_write_with(&fx.db, "s1", "Write", Some(&input), None, NOW, &|_| None);
-        record_write_with(&fx.db, "s1", "Write", Some(&input), None, NOW, &|_| Some(true));
+        record_write_with(&fx.db, "s1", None, "Write", Some(&input), None, NOW, &|_| None);
+        record_write_with(&fx.db, "s1", None, "Write", Some(&input), None, NOW, &|_| Some(true));
         assert!(noted(&fx, "s1").is_empty());
     }
 
@@ -433,7 +546,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("thor.db");
         let input = json!({ "file_path": dir.path().join("fix.py").display().to_string() });
-        record_write_with(&db, "s1", "Write", Some(&input), None, NOW, &outside_git);
+        record_write_with(&db, "s1", None, "Write", Some(&input), None, NOW, &outside_git);
         assert!(!book_path(&db).exists(), "no settings file at all");
     }
 
@@ -441,9 +554,9 @@ mod tests {
     fn a_relative_path_is_read_against_the_working_folder() {
         let fx = fixture();
         let input = json!({ "file_path": "helper.py" });
-        record_write_with(&fx.db, "s1", "Write", Some(&input), Some(&fx.scratch), NOW, &outside_git);
+        record_write_with(&fx.db, "s1", None, "Write", Some(&input), Some(&fx.scratch), NOW, &outside_git);
         assert_eq!(noted(&fx, "s1"), vec![fx.scratch.join("helper.py").display().to_string()]);
-        record_write_with(&fx.db, "s2", "Write", Some(&input), None, NOW, &outside_git);
+        record_write_with(&fx.db, "s2", None, "Write", Some(&input), None, NOW, &outside_git);
         assert!(noted(&fx, "s2").is_empty(), "no folder to read it against");
     }
 
@@ -463,7 +576,7 @@ mod tests {
         let fx = fixture();
         write(&fx, "old", "Write", &fx.scratch.join("a.py"));
         let input = json!({ "file_path": fx.scratch.join("b.py").display().to_string() });
-        record_write_with(&fx.db, "new", "Write", Some(&input), None, NOW + KEEP_SECS + 1, &outside_git);
+        record_write_with(&fx.db, "new", None, "Write", Some(&input), None, NOW + KEEP_SECS + 1, &outside_git);
         let book = read_book(&fx.db);
         assert!(book.contains_key("new") && !book.contains_key("old"), "{:?}", book.keys().collect::<Vec<_>>());
     }
@@ -593,5 +706,125 @@ mod tests {
         write(&fx, "s1", "Write", &fx.scratch.join("fix.py"));
         assert!(!book_path(&fx.db).exists(), "a held directory takes no write");
         assert_eq!(hold_reason(&fx.db, "s1", NOW * 2), None);
+    }
+
+    // ------------------------------------------------- a still-running subagent
+
+    fn write_by(fx: &Fx, session: &str, agent: &str, file: &Path, at: i64) {
+        let input = json!({ "file_path": file.display().to_string() });
+        record_write_with(&fx.db, session, Some(agent), "Write", Some(&input), None, at, &outside_git);
+    }
+
+    fn never_seen(_: &str) -> Option<i64> {
+        None
+    }
+
+    #[test]
+    fn a_file_a_running_subagent_wrote_is_not_asked_about_until_it_has_been_quiet() {
+        let fx = fixture();
+        let file = make_script(&fx.scratch, "helper.py");
+        let changed = mtime(&file);
+        write_by(&fx, "s1", "agent1", &file, changed);
+        // The file itself is old enough, but the agent wrote it 31 minutes ago
+        // and its transcript was touched 5 minutes ago: it is still running.
+        let late = changed + 31 * 60;
+        let busy = |_: &str| Some(late - 5 * 60);
+        assert_eq!(hold_reason_with(&fx.db, "s1", late, &busy), None, "running agent: not asked");
+        assert_eq!(hold_reason_with(&fx.db, "s1", late + 10 * 60, &busy), None, "still not asked, and not marked either");
+        // Once the agent has been quiet for more than half an hour it is asked, once.
+        let quiet = |_: &str| Some(late - 40 * 60);
+        let reason = hold_reason_with(&fx.db, "s1", late, &quiet).expect("agent finished");
+        assert!(reason.contains("helper.py"), "{reason}");
+        assert_eq!(hold_reason_with(&fx.db, "s1", late + 60, &quiet), None, "once only");
+    }
+
+    #[test]
+    fn a_subagent_without_a_transcript_counts_as_running_by_its_last_noted_write() {
+        let fx = fixture();
+        let file = make_script(&fx.scratch, "helper.py");
+        let changed = mtime(&file);
+        write_by(&fx, "s1", "agent1", &file, changed + 20 * 60);
+        // The agent wrote at +20 min: at +31 min it is 11 minutes quiet.
+        assert_eq!(hold_reason_with(&fx.db, "s1", changed + 31 * 60, &never_seen), None);
+        // At +51 min it has been quiet more than 30 minutes.
+        assert!(hold_reason_with(&fx.db, "s1", changed + 51 * 60, &never_seen).is_some());
+    }
+
+    #[test]
+    fn only_the_files_of_the_running_agent_wait() {
+        let fx = fixture();
+        let theirs = make_script(&fx.scratch, "theirs.py");
+        let mine = make_script(&fx.scratch, "mine.py");
+        let changed = mtime(&theirs).max(mtime(&mine));
+        write_by(&fx, "s1", "busy", &theirs, changed);
+        write(&fx, "s1", "Write", &mine);
+        let late = changed + 3_600;
+        let activity = |agent: &str| (agent == "busy").then_some(late - 60);
+        let reason = hold_reason_with(&fx.db, "s1", late, &activity).expect("the main session's own file");
+        assert!(reason.contains("mine.py") && !reason.contains("theirs.py"), "{reason}");
+        // A later write by the main session takes the file over from the agent.
+        write(&fx, "s1", "Write", &theirs);
+        let reason = hold_reason_with(&fx.db, "s1", late + 60, &activity).expect("now the main session's file");
+        assert!(reason.contains("theirs.py"), "{reason}");
+    }
+
+    #[test]
+    fn the_subagents_transcript_file_is_how_its_activity_is_read() {
+        let root = tempfile::tempdir().unwrap();
+        let session = "0a8aa202-cf49-4bf1-a39d-c7177a6a81af";
+        let folder = root.path().join("C--proj").join(session).join("subagents");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("agent-abc123.jsonl"), "{}\n").unwrap();
+        std::fs::write(folder.join("agent-other.jsonl"), "{}\n").unwrap();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        let seen = agent_transcript_activity(Some(root.path()), session, "abc123").expect("its transcript exists");
+        assert!((now - seen).abs() < 60, "{now} {seen}");
+        assert_eq!(agent_transcript_activity(Some(root.path()), session, "abc"), None, "a prefix is not the agent");
+        assert_eq!(agent_transcript_activity(Some(root.path()), "not-a-session", "abc123"), None);
+        assert_eq!(agent_transcript_activity(None, session, "abc123"), None);
+    }
+
+    /// The field case: a running agent writes scratch scripts all the time
+    /// while the turn end marks files as asked about. The note file is changed
+    /// under a lock, so neither change overwrites the other and no file is
+    /// asked about twice.
+    #[test]
+    fn writes_by_an_agent_and_the_turn_end_never_lose_each_others_changes() {
+        let fx = fixture();
+        let first = make_script(&fx.scratch, "first.py");
+        write(&fx, "s1", "Write", &first);
+        let late = mtime(&first) + 3_600;
+        let db = fx.db.clone();
+        let scratch = fx.scratch.clone();
+        let writer = std::thread::spawn(move || {
+            for i in 0..40 {
+                let input = json!({ "file_path": scratch.join(format!("agent{i}.py")).display().to_string() });
+                record_write_with(&db, "s1", Some("a1"), "Write", Some(&input), None, NOW, &outside_git);
+            }
+        });
+        let mut asked = 0;
+        for _ in 0..40 {
+            if hold_reason_with(&fx.db, "s1", late, &never_seen).is_some_and(|r| r.contains("first.py")) {
+                asked += 1;
+            }
+        }
+        writer.join().unwrap();
+        assert_eq!(asked, 1, "first.py is asked about exactly once");
+        let record = read_book(&fx.db).remove("s1").unwrap();
+        assert_eq!(record.files.len(), 41, "no noted file is lost");
+        assert!(!fx.db.parent().unwrap().join(LOCK_FILE).exists(), "the lock is released");
+    }
+
+    #[test]
+    fn a_lock_left_by_a_dead_hook_does_not_stop_the_note() {
+        let fx = fixture();
+        let lock = fx.db.parent().unwrap().join(LOCK_FILE);
+        std::fs::write(&lock, "").unwrap();
+        // Not stale yet: the change waits a second, then goes on without the lock.
+        let started = std::time::Instant::now();
+        write(&fx, "s1", "Write", &fx.scratch.join("fix.py"));
+        assert_eq!(noted(&fx, "s1").len(), 1);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(lock.exists(), "a lock this call did not take is not removed");
     }
 }

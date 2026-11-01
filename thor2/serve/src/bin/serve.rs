@@ -2187,6 +2187,7 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
         serve::leftover_scripts::record_write(
             db_path,
             &session_id,
+            payload.get("agent_id").and_then(|v| v.as_str()),
             payload.get("tool_name").and_then(|v| v.as_str()).unwrap_or(""),
             payload.get("tool_input"),
             session_cwd.as_deref(),
