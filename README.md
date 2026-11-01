@@ -304,8 +304,13 @@ at the right moment and hope. Version 2 is the same memory with a spine.
   saying something was checked, and never say everything was checked without
   saying what was covered. A reply that breaks one is sent back once to be
   rewritten. A summary or overview you ask for may run longer, and the
-  first-session list is exempt from the length rule. Edit the file, delete one
-  entry, or delete the file to change or switch them off.
+  first-session list is exempt from the length rule. The first prompt you type
+  in a session also carries one short line with that limit, so the first answer
+  is already short and is not written twice. Edit the file, delete one
+  entry, or delete the file to change or switch them off. A rule with
+  `expected_language` (for example `"nl"`) can also hold a reply that comes
+  out in English while you write in that language; the seeded file has none,
+  see `thor2/README.md`.
 - **Stale notes are hunted, not left to rot.** A note whose proof comes out
   false is reported instead of quietly going on being wrong. A note that keeps
   firing without anyone ever saying whether it belonged gets asked about, and

@@ -582,6 +582,13 @@ pub struct OptInRule {
     /// rule wants the term on its own line in a fence, so the reader can copy
     /// it. Missing, `false` or malformed: fences are read as ordinary text.
     pub fenced_only_exempt: bool,
+    /// The language the owner writes in ("nl", "de", "fr", "es"): the rule
+    /// fires only for a reply that clearly reads as English while the owner's
+    /// last prompt was in this language (see "reply language" below). Missing:
+    /// no language condition at all. Present but not a string, or a code with
+    /// no word list: the rule never fires, because a guess about a language is
+    /// never worth a hold.
+    pub expected_language: Option<String>,
     /// Terms whose presence in the OWNER'S OWN LAST PROMPT means he asked for
     /// what the rule's reminder tells the writer to leave out (step 29: the
     /// length rule says "no test counts", and the prompt may be "give me the
@@ -663,6 +670,10 @@ pub fn parse_opt_in_rules(text: &str) -> Vec<OptInRule> {
             let affirmative_only = r.get("affirmative_only").and_then(|v| v.as_bool()).unwrap_or(false);
             let quotes_exempt = r.get("quotes_exempt").and_then(|v| v.as_bool()).unwrap_or(false);
             let fenced_only_exempt = r.get("fenced_only_exempt").and_then(|v| v.as_bool()).unwrap_or(false);
+            // Present but unusable (a number, an empty string) is kept as an
+            // empty code with no word list, so the rule never fires: a rule
+            // with no other trigger would otherwise fire on every reply.
+            let expected_language = r.get("expected_language").map(|v| v.as_str().unwrap_or("").trim().to_lowercase());
             let asked_for_any_of = str_list(r, "asked_for_any_of");
             let reminder_if_asked = r.get("reminder_if_asked").and_then(|v| v.as_str()).map(str::to_string);
             let short_reminder = r.get("short_reminder").and_then(|v| v.as_str()).map(str::to_string);
@@ -684,6 +695,7 @@ pub fn parse_opt_in_rules(text: &str) -> Vec<OptInRule> {
                 affirmative_only,
                 quotes_exempt,
                 fenced_only_exempt,
+                expected_language,
                 asked_for_any_of,
                 reminder_if_asked,
                 short_reminder,
@@ -1422,6 +1434,142 @@ fn inside_quotes(hay: &str, at: usize) -> bool {
     hay[line_start..at].chars().filter(|c| QUOTE_MARKS.contains(c)).count() % 2 == 1
 }
 
+// ----------------------------------------------------------- reply language
+//
+// FOUND IN A REAL EVALUATION (report of 2026-10-30): the closing
+// messages of a session came out in English for an owner who writes Dutch, and
+// nothing in the guard looked at the language at all.
+//
+// A rule opts in with `expected_language: "nl"` (also "de", "fr", "es"). It
+// then fires only when ALL of this holds, and stays silent on any doubt:
+//   - the reply's plain prose is at least `LANGUAGE_MIN_PROSE_CHARS` long
+//     (fenced code, inline code, blockquotes and quoted text are left out);
+//   - that prose clearly reads as English: at least a fifth of its words are
+//     English function words that are no word of the expected language, and
+//     the expected language's own words are rare in it;
+//   - the owner's last prompt shows the expected language: at least two of its
+//     words, and more than it has English ones. A prompt that is short, in
+//     English, mixed or unreadable never fires the rule, so an owner who
+//     switches to English for a moment is never answered with a reminder.
+// A language with no word list (or "en") never fires. Words, not guesses: a
+// reply is judged on function-word counts only, so a wrong verdict needs a
+// reply that is mostly English function words inside a conversation the owner
+// holds in the other language.
+
+/// The least plain prose, in characters, a reply needs before its language is
+/// read at all.
+const LANGUAGE_MIN_PROSE_CHARS: usize = 200;
+
+/// The least words of prose a reply needs, so a few long words never decide.
+const LANGUAGE_MIN_WORDS: usize = 30;
+
+/// English function words that are not words of Dutch, German, French or
+/// Spanish ("of", "is", "in", "on", "was", "had", "been", "we", "me" and "he"
+/// are left out: Dutch or German use them).
+const ENGLISH_WORDS: &[&str] = &[
+    "the", "and", "to", "that", "with", "this", "are", "for", "it", "you", "not", "have", "from", "but", "which", "will", "be", "or",
+    "they", "there", "would", "can", "has", "its", "what", "when", "then", "than", "your", "our", "their", "all", "also", "only",
+    "if", "were", "should", "could", "these", "those", "into", "about", "because", "them", "some", "any", "more", "my", "do",
+    "does", "did", "by", "at", "i",
+];
+
+const DUTCH_WORDS: &[&str] = &[
+    "de", "het", "een", "en", "van", "dat", "niet", "die", "ik", "je", "op", "te", "met", "voor", "zijn", "er", "maar", "ook",
+    "als", "dan", "nog", "wel", "naar", "bij", "aan", "om", "dit", "deze", "kan", "wordt", "heb", "heeft", "uit", "over", "zo",
+    "hij", "ons", "mijn", "wat", "hoe", "waar", "dus", "nu", "alles", "doe", "kun", "graag", "ja", "nee", "is", "in", "of", "was",
+    "we", "ze", "zou", "moet", "gaat", "geen", "tot", "worden",
+];
+
+const GERMAN_WORDS: &[&str] = &[
+    "ich", "und", "der", "die", "das", "nicht", "ist", "ein", "eine", "zu", "mit", "f\u{fc}r", "auf", "dass", "auch", "den", "dem",
+    "von", "sie", "wir", "es", "im", "aber", "wie", "was", "kann", "bitte", "ja", "nein", "noch", "nur", "wenn", "oder", "bei",
+    "sind", "wird", "habe", "hat",
+];
+
+const FRENCH_WORDS: &[&str] = &[
+    "le", "la", "les", "un", "une", "des", "et", "est", "que", "qui", "pas", "pour", "dans", "avec", "je", "tu", "il", "nous",
+    "vous", "ce", "cette", "sur", "mais", "ou", "au", "du", "ne", "plus", "tr\u{e8}s", "merci", "oui", "non", "sont", "fait",
+];
+
+const SPANISH_WORDS: &[&str] = &[
+    "el", "la", "los", "las", "un", "una", "y", "es", "que", "no", "por", "para", "con", "en", "se", "mi", "lo", "como", "pero",
+    "m\u{e1}s", "muy", "gracias", "hola", "este", "esta", "del", "al", "son", "est\u{e1}",
+];
+
+/// The function words of a language the guard can read, or `None`.
+fn language_words(code: &str) -> Option<&'static [&'static str]> {
+    match code {
+        "nl" => Some(DUTCH_WORDS),
+        "de" => Some(GERMAN_WORDS),
+        "fr" => Some(FRENCH_WORDS),
+        "es" => Some(SPANISH_WORDS),
+        _ => None,
+    }
+}
+
+/// The plain prose of a text (already lowercased): without fenced code
+/// blocks, blockquote lines, inline code and quoted text. Quoted words are
+/// reading material, not the language the writer writes in.
+fn plain_prose(lower: &str) -> String {
+    let mut in_fence = false;
+    let mut kept: Vec<String> = Vec::new();
+    for line in lower.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence || trimmed.starts_with('>') {
+            continue;
+        }
+        kept.push(blank_closed_quotes(line));
+    }
+    kept.join("\n")
+}
+
+/// How many of `text`'s words are in each of two word lists, and how many
+/// words (anything with a letter) there are.
+fn word_hits(text: &str, first: &[&str], second: &[&str]) -> (usize, usize, usize) {
+    let (mut a, mut b, mut total) = (0, 0, 0);
+    for (_, _, word) in words(text) {
+        if !word.chars().any(char::is_alphabetic) {
+            continue;
+        }
+        total += 1;
+        a += usize::from(first.contains(&word.as_str()));
+        b += usize::from(second.contains(&word.as_str()));
+    }
+    (a, b, total)
+}
+
+/// Whether the owner's prompt shows `expected` words: two or more of them, and
+/// more than English ones.
+fn prompt_shows_language(prompt_lower: &str, expected: &[&str]) -> bool {
+    let (own, english, _) = word_hits(&plain_prose(prompt_lower), expected, ENGLISH_WORDS);
+    own >= 2 && own > english
+}
+
+/// Whether the prose clearly reads as English and not as `expected`.
+fn prose_is_clearly_english(prose: &str, expected: &[&str]) -> bool {
+    if prose.chars().count() < LANGUAGE_MIN_PROSE_CHARS {
+        return false;
+    }
+    let (english, own, total) = word_hits(prose, ENGLISH_WORDS, expected);
+    total >= LANGUAGE_MIN_WORDS && english * 5 >= total && own * 4 < english
+}
+
+/// The language gate of a rule: `true` when the rule has no
+/// `expected_language` (nothing to gate), else only for an English reply to a
+/// prompt in the expected language (see this section's comment).
+fn language_gate_open(rule: &OptInRule, haystack_lower: &str, prompt_lower: &str) -> bool {
+    let Some(code) = rule.expected_language.as_deref() else { return true };
+    let Some(expected) = language_words(code) else { return false };
+    if prompt_lower.is_empty() || !prompt_shows_language(prompt_lower, expected) {
+        return false;
+    }
+    prose_is_clearly_english(&plain_prose(haystack_lower), expected)
+}
+
 // --------------------------------------------------------- list exemption
 //
 // FALSE BLOCK A, reported by the owner from other sessions, fixed
@@ -1829,6 +1977,7 @@ fn evaluate_opt_in_checked(
                 && !(r.owner_reading_only && is_subagent)
                 && !(r.owner_reading_only && is_setup_list_reply(haystack_lower))
                 && prompt_gate_open(r, prompt_lower)
+                && language_gate_open(r, haystack_lower, prompt_lower)
                 && !(r.backed_by_turn_tools && turn_backs_claim(&r.base, haystack_lower, turn_commands));
             if !fires_before_escapes {
                 return None;
@@ -2900,6 +3049,112 @@ mod tests {
         assert!(fires("Please type `codeword` to continue."), "inline code is not a fence");
         assert!(!fires("Please type this:\n```\ncodeword\n```\nThanks."), "alone in a fence");
         assert!(fires("Type codeword.\n```\ncodeword\n```\n"), "in a fence and inline");
+    }
+
+    const LANGUAGE_RULEBOOK: &str = r#"[
+      {"id":"reply-language","tier":"warn","owner_reading_only":true,"expected_language":"nl",
+       "reminder":"Answer in Dutch."}
+    ]"#;
+
+    const DUTCH_PROMPT: &str = "Kan je dit even voor mij afronden en de resultaten laten zien?";
+
+    const ENGLISH_REPLY: &str = "I finished the review and found that the tests were passing for all of the changes in this branch. \
+        There are two things that you should know about: the build is slower than it was, and the cache will not be used when \
+        the files are not in the same folder. If you want, I can look into them next, because they would be easy to fix.";
+
+    const DUTCH_REPLY: &str = "Ik ben klaar met de review en heb gezien dat alle tests van de wijzigingen in deze branch slagen. \
+        Er zijn twee dingen die je moet weten: de build is trager dan hij was, en de cache wordt niet gebruikt als de bestanden \
+        niet in dezelfde map staan. Als je wilt, kijk ik daar daarna naar, want het is een kleine aanpassing en dan is het klaar.";
+
+    fn language_fires(reply: &str, prompt: &str) -> bool {
+        guard_verdict_in_turn(Some(LANGUAGE_RULEBOOK), reply, prompt, false, None, &[]).warn_reason.is_some()
+    }
+
+    #[test]
+    fn an_english_reply_to_a_dutch_prompt_fires_the_language_rule_and_a_dutch_one_does_not() {
+        assert!(language_fires(ENGLISH_REPLY, DUTCH_PROMPT));
+        assert!(!language_fires(DUTCH_REPLY, DUTCH_PROMPT));
+    }
+
+    #[test]
+    fn the_language_rule_is_silent_without_proof_that_the_owner_wrote_dutch() {
+        assert!(!language_fires(ENGLISH_REPLY, ""), "no prompt could be read");
+        assert!(!language_fires(ENGLISH_REPLY, "ok"), "a prompt too short to tell");
+        assert!(!language_fires(ENGLISH_REPLY, "yes, please do that and show me the results"), "an English prompt");
+        assert!(
+            !language_fires(ENGLISH_REPLY, "Kan je dit fixen? The log says: the build has failed because the cache is not there and it will not be used"),
+            "a mixed prompt with more English than Dutch"
+        );
+        assert!(language_fires(ENGLISH_REPLY, "ja doe maar"), "two Dutch words and no English one");
+    }
+
+    #[test]
+    fn the_language_rule_reads_only_plain_prose_of_enough_length() {
+        let short = "I finished the review and the tests are passing for all of the changes.";
+        assert!(!language_fires(short, DUTCH_PROMPT), "under 200 characters of prose");
+        let dutch_with_code = format!(
+            "{DUTCH_REPLY}\n```\nthe build is slower than it was and the cache will not be used when all of the files are there\n```\n\
+             > the log says that you should not be using the cache because it would not be there for all of them\n\
+             Het commando was `if the file is not there then do the thing that you have been asked`."
+        );
+        assert!(!language_fires(&dutch_with_code, DUTCH_PROMPT), "code, a blockquote and inline code are not prose");
+        let dutch_with_quote = format!(
+            "{DUTCH_REPLY} De fout was \"the build has failed because the cache could not be used for all of the files that were there\"."
+        );
+        assert!(!language_fires(&dutch_with_quote, DUTCH_PROMPT), "quoted text is not prose");
+        let english_around_code = format!("{ENGLISH_REPLY}\n```\nde build is trager dan hij was\n```\n");
+        assert!(language_fires(&english_around_code, DUTCH_PROMPT), "a fence does not hide English prose around it");
+    }
+
+    #[test]
+    fn a_dutch_reply_full_of_english_terms_is_not_english() {
+        let reply = "De commit staat op de branch en de pull request is open. De CI draait de unit tests, de linter en de build, \
+            en de release notes zijn gemaakt. Het cache-probleem is opgelost: de runner pakt nu de lockfile mee, en de deploy \
+            naar staging gaat daarna automatisch. Jij hoeft niets te doen, ik meld het als de merge klaar is en de tag staat.";
+        assert!(!language_fires(reply, DUTCH_PROMPT));
+    }
+
+    #[test]
+    fn the_language_rule_needs_the_field_a_known_language_and_a_main_session() {
+        let without = LANGUAGE_RULEBOOK.replace("\"expected_language\":\"nl\",", "");
+        assert!(
+            guard_verdict_in_turn(Some(&without), ENGLISH_REPLY, DUTCH_PROMPT, false, None, &[]).warn_reason.is_some(),
+            "a rule without the field is an ordinary rule with no trigger and keeps firing"
+        );
+        let unknown = LANGUAGE_RULEBOOK.replace("\"nl\"", "\"xx\"");
+        assert!(guard_verdict_in_turn(Some(&unknown), ENGLISH_REPLY, DUTCH_PROMPT, false, None, &[]).warn_reason.is_none());
+        let english = LANGUAGE_RULEBOOK.replace("\"nl\"", "\"en\"");
+        assert!(guard_verdict_in_turn(Some(&english), ENGLISH_REPLY, DUTCH_PROMPT, false, None, &[]).warn_reason.is_none());
+        let not_a_string = LANGUAGE_RULEBOOK.replace("\"nl\"", "7");
+        assert!(
+            guard_verdict_in_turn(Some(&not_a_string), ENGLISH_REPLY, DUTCH_PROMPT, false, None, &[]).warn_reason.is_none(),
+            "a malformed value never fires: the rule has no other trigger"
+        );
+        assert!(guard_verdict_in_turn(Some(&not_a_string), DUTCH_REPLY, DUTCH_PROMPT, false, None, &[]).warn_reason.is_none());
+        assert!(
+            guard_verdict_in_turn(Some(LANGUAGE_RULEBOOK), ENGLISH_REPLY, DUTCH_PROMPT, true, None, &[]).warn_reason.is_none(),
+            "a helper agent's report is not the owner's reading"
+        );
+    }
+
+    #[test]
+    fn the_language_rule_reads_the_other_listed_languages_too() {
+        let rule = |code: &str| LANGUAGE_RULEBOOK.replace("\"nl\"", &format!("\"{code}\""));
+        let fires = |code: &str, prompt: &str| {
+            guard_verdict_in_turn(Some(&rule(code)), ENGLISH_REPLY, prompt, false, None, &[]).warn_reason.is_some()
+        };
+        assert!(fires("de", "Kannst du bitte noch die Ergebnisse zeigen und das nicht vergessen?"));
+        assert!(fires("fr", "Peux-tu me montrer les r\u{e9}sultats, et ne pas oublier le test avec une explication ?"));
+        assert!(fires("es", "Puedes mostrarme los resultados y no olvidar la prueba con una explicaci\u{f3}n?"));
+        assert!(!fires("de", DUTCH_PROMPT), "a Dutch prompt is no German one");
+    }
+
+    #[test]
+    fn the_language_rule_combines_with_the_ordinary_triggers() {
+        let rulebook = r#"[{"id":"nl-and-long","tier":"warn","expected_language":"nl","min_chars":900,"reminder":"x"}]"#;
+        let verdict = |reply: &str| guard_verdict_in_turn(Some(rulebook), reply, DUTCH_PROMPT, false, None, &[]).warn_reason.is_some();
+        assert!(!verdict(ENGLISH_REPLY), "min_chars still applies");
+        assert!(verdict(&format!("{ENGLISH_REPLY} {ENGLISH_REPLY} {ENGLISH_REPLY}")));
     }
 
     #[test]

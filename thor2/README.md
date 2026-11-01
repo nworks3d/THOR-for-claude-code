@@ -559,6 +559,24 @@ rule is one entry with:
   in inline code or in quotes still does. Use it to demand that a word the
   owner must type (an approval word) stands on its own line in a fence, so it
   can be copied. Left out, fences are read as ordinary text.
+- `expected_language` - the language the owner writes in: `"nl"`, `"de"`,
+  `"fr"` or `"es"`. A rule with this field fires only on a reply that clearly
+  reads as English while the owner's last prompt was in that language, so it
+  needs no other trigger word. It is off unless you add such a rule: the
+  seeded rulebook has none. It reads function words only. The prose of the
+  reply must be at least 200 characters and 30 words, with fenced code,
+  inline code, blockquote lines and quoted text left out, and at least a fifth
+  of those words must be English function words ("the", "and", "that", ...)
+  while the owner's language is rare in them. The prompt must show at least
+  two words of the owner's language and more of them than English ones, so a
+  short, English, mixed or unreadable prompt never fires it. Any other code
+  (including "en") or a value that is not a string never fires. Example, as a
+  new entry in `guard-response-rulebook.json`:
+  `{"id": "reply-language", "tier": "warn", "owner_reading_only": true,
+  "expected_language": "nl", "reminder": "Write this answer in Dutch, the
+  language the owner writes in."}`. Measured at the maker (2026-11-01) over
+  13,400 final replies in real Claude Code transcripts, 9,986 of them after a
+  Dutch prompt: it fired on 3, and all three replies were English.
 - `hedge_words_before` - single words that, earlier in the same sentence as a
   trigger term, make it a promise or a condition and not a claim ("zodra",
   "of", "once"). Left out, nothing is read as a hedge.

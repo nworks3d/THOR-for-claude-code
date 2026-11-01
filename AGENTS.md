@@ -930,7 +930,8 @@ Around a risky step or a tool:
 - `absolute-paths-not-the-shell-working-directory` - absolute paths in every command
   and every brief.
 - `script-file-not-shell-quoting` - text with quotes or backslashes goes in a script
-  file, not a one-liner.
+  file, not a one-liner; in PowerShell the remote script for `ssh` goes in on stdin,
+  because nested double quotes get re-quoted.
 - `keep-only-what-is-needed` - rebuildable things (build output, caches, models,
   installers, scratch and worktree folders, database copies) stay out of a repo and a
   backup; each session and helper works in its own folder and cleans it up when done;
@@ -938,7 +939,8 @@ Around a risky step or a tool:
   the owner's yes.
 - `windowless-processes-on-windows` - background processes start hidden. On a Windows install this
   one REFUSES a `Start-Process` with no `-WindowStyle` or `-NoNewWindow` unless it opens a window the
-  user explicitly asked to see (start that one with `-WindowStyle Normal`) or something meant
+  user explicitly asked to see (start that one with `-WindowStyle Normal`; the refusal says so in
+  one sentence) or something meant
   to be seen (`ms-settings:`, `windowsdefender:`, `control.exe`, a `.cpl` file, `http://`,
   `https://`, `file:///`); on other systems it is only a note.
 - `scheduled-task-not-interactive` - `schtasks /create` with `/it` opens a console window at every
@@ -1036,6 +1038,11 @@ when all of this holds:
   since then - a session that only looked in for a moment is never held;
 - it is not this session's first turn-end in that project - the first one is
   never held.
+
+A NEW ask also waits while the session is still in its first turn and has only
+read files (one typed prompt from the owner, then nothing but Read, Grep or Glob),
+such as a long routine being read for the first time: it comes at the next
+turn-end instead. An evaluation this session already opened is never deferred.
 
 It follows the work, not the folder: a session that worked in project A and then
 moved to another folder is still asked about A, and the message says so. One

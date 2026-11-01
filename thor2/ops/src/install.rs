@@ -1198,7 +1198,8 @@ pub fn workflow_starter_pack_for(windows: bool) -> Vec<model::item::Item> {
             "script-file-not-shell-quoting",
             "Text with quotes, backticks, $ or backslashes goes into a script file written with the \
              Write tool, then run that file. A bash -c, node -e or python -c one-liner, or a \
-             heredoc, can silently mangle it and the error points at the wrong line.",
+             heredoc, can silently mangle it. In PowerShell, feed the remote script to ssh via \
+             stdin: nested double quotes get re-quoted.",
             "Nested quotes and backslashes pass intact through a shell one-liner or heredoc on this \
              machine.",
             vec![command("bash -c"), command("node -e"), command("python -c")],
@@ -1212,8 +1213,8 @@ pub fn workflow_starter_pack_for(windows: bool) -> Vec<model::item::Item> {
         with_check(
             note(
                 "windowless-processes-on-windows",
-                "On Windows Start-Process must run hidden: add -WindowStyle Hidden or -NoNewWindow. A window the \
-                 user explicitly asked to see: -WindowStyle Normal. Also fine: \
+                "On Windows Start-Process must run hidden: add -WindowStyle Hidden or -NoNewWindow. If the user \
+                 asked to see this window, use -WindowStyle Normal. Also fine: \
                  ms-settings:, windowsdefender:, control.exe, a .cpl file, http://, https:// or file:///. \
                  Python: CREATE_NO_WINDOW.",
                 "A visible console window started by an agent is found to leave the user's focus alone.",
@@ -2867,6 +2868,32 @@ mod tests {
         assert!(note.text.to_lowercase().contains("if the project keeps a changelog"), "{}", note.text);
         assert!(note.check.is_none(), "a project convention is never a refusal");
         assert!(note.bindings.contains(&model::item::Binding::Moment(intent::Action::Commit)));
+    }
+
+    /// Found in three real evaluation reports (2026-10-22 to 2026-10-30): the refusal
+    /// of a visible `Start-Process` carries the note's text, so that text must
+    /// say in one plain sentence what to do for a window the user asked for.
+    #[test]
+    fn the_windowless_note_says_in_one_sentence_how_to_open_a_window_the_user_asked_for() {
+        let pack = workflow_starter_pack();
+        let note = pack.iter().find(|i| i.id == "windowless-processes-on-windows").unwrap();
+        assert!(note.text.contains("If the user asked to see this window, use -WindowStyle Normal."), "{}", note.text);
+        assert!(note.text.chars().count() <= 300, "{} characters", note.text.chars().count());
+    }
+
+    /// Found in a real evaluation report (2026-10-19): PowerShell 5.1 re-quotes escaped double
+    /// quotes inside an ssh argument and it cost three tries. The note about
+    /// script files says to feed the remote script to ssh on stdin, and
+    /// informs only. Its places are unchanged: a command place holds four
+    /// notes at most, and `ssh` is a place the owner's own notes use.
+    #[test]
+    fn the_quoting_note_names_the_powershell_ssh_trap_and_stays_a_note() {
+        let pack = workflow_starter_pack();
+        let note = pack.iter().find(|i| i.id == "script-file-not-shell-quoting").unwrap();
+        assert!(note.text.contains("In PowerShell, feed the remote script to ssh via stdin"), "{}", note.text);
+        assert!(note.text.chars().count() <= 300, "{} characters", note.text.chars().count());
+        assert!(note.check.is_none(), "inform only");
+        assert_eq!(note.bindings.len(), 3, "bash -c, node -e and python -c");
     }
 
     /// Only a check proven against real calls may ride in the pack, and the
