@@ -45,6 +45,12 @@
 //! mismatch files it dead with the reason. No attestation within a day files
 //! it dead too. Nothing is ever counted on a text's word.
 //!
+//! ONE REPORT UNDER AN ID. A session may file the same report id twice (the
+//! first never got its proof). The proven filings settle first, newest capture
+//! first; any other held filing of an id whose report already counts is closed
+//! as SUPERSEDED, not filed, and its capture is remembered so a replay or the
+//! late proof of it files nothing.
+//!
 //! WHAT A COPY'S EVALUATION COVERS, SAID PLAINLY IN THE MACHINE SECTION. A copy
 //! keeps no record of which notes fired, and the frozen lists live in the main
 //! machine's log. So a copy's evaluation holds only what a copy can do: the
@@ -746,6 +752,12 @@ pub fn absorb(pending: &mut Pending, op: &InboxOp, now: i64) -> Result<String, S
     Ok(format!("copy evaluation report '{id}' (capture {}) held until its attestation arrives", op.capture_id))
 }
 
+/// The log seq of the filing of report `id` when that filing counts (its
+/// validator's record is valid), else `None`.
+fn counting_filing_seq(store: &EventStore, id: &str) -> Option<i64> {
+    crate::eval_filing::current_validation(store, id).filter(|v| v.valid).map(|v| v.report_seq)
+}
+
 fn captured_at(op: &InboxOp) -> i64 {
     op.ts.parse().unwrap_or(0)
 }
@@ -779,10 +791,27 @@ fn report_item(op: &InboxOp) -> Result<Item, String> {
 /// report never came is dropped after the same wait.
 pub fn settle(store: &mut EventStore, pending: &mut Pending, now: i64) -> Settled {
     let mut out = Settled::default();
-    let reports = std::mem::take(&mut pending.reports);
+    let mut reports = std::mem::take(&mut pending.reports);
+    // EXACTLY ONE REPORT STANDS UNDER AN ID. A session can file the same report
+    // id twice (the first filing never got its proof, the second did), so the
+    // proven ones settle first, newest capture first: the one that counts is
+    // on the log before an unproven or older one is looked at, and that one is
+    // then closed as superseded instead of being filed dead on top of it.
+    reports.sort_by_key(|op| (!pending.attests.iter().any(|(_, a)| a.capture_id == op.capture_id), std::cmp::Reverse(captured_at(op))));
     for op in reports {
         let id = op.args.get("id").and_then(Value::as_str).unwrap_or("?").to_string();
         let found = pending.attests.iter().position(|(_, a)| a.capture_id == op.capture_id);
+        if let Some(seq) = counting_filing_seq(store, &id) {
+            if let Some(at) = found {
+                pending.attests.remove(at);
+            }
+            pending.done.push(op.capture_id.clone());
+            out.lines.push(format!(
+                "SUPERSEDED copy evaluation report '{id}' (capture {}): a report with that id already counts (log seq {seq}), so this one is closed and not filed",
+                op.capture_id
+            ));
+            continue;
+        }
         let expired = now - captured_at(&op) > WAIT_FOR_ATTESTATION_SECS;
         let (attestation, verdict) = match (found, expired) {
             (Some(at), _) => {

@@ -281,3 +281,119 @@ fn an_attestation_queued_by_an_older_connector_still_counts() {
     assert!(ok, "{out}");
     assert_eq!(counted(&f).as_deref(), Some("eval-demo-1"), "{out}");
 }
+
+/// How many times report `eval-demo-1` was filed on the log, and how many
+/// validator records it has: exactly one of each may stand under an id.
+fn filings_of_the_report(f: &Fixture) -> (usize, usize) {
+    let store = EventStore::open_existing(&f.main).unwrap();
+    let created = store.get_events_by_entity("eval-demo-1").unwrap().iter().filter(|e| e.kind == thor_core::event_store::EventKind::FactCreated).count();
+    let records = model::store::evaluation_validations(&store).iter().filter(|(_, v)| v.report == "eval-demo-1").count();
+    (created, records)
+}
+
+/// Make every report the drain holds look a day old, as if the wait were over.
+fn age_the_held_reports(f: &Fixture) {
+    let mut pending = copy_eval::Pending::read(&f.main);
+    for op in &mut pending.reports {
+        op.ts = "1000000000".to_string();
+    }
+    pending.write(&f.main).unwrap();
+}
+
+/// THE LAPTOP CASE. A session filed the same report id twice: capture A never
+/// got a proof, capture B did. When B's proof arrives A has waited out its day
+/// too. A must be closed as superseded, not filed dead on top of B.
+#[test]
+fn an_unproven_filing_is_superseded_by_the_proven_one_of_the_same_id() {
+    let f = fixture();
+    inbox::append(&f.inbox, &report_op("cap-a", "The first filing, never proven.")).unwrap();
+    let (ok, out) = drain(&f);
+    assert!(ok && out.contains("attestation has not arrived yet"), "{out}");
+    age_the_held_reports(&f);
+
+    inbox::append(&f.inbox, &report_op("cap-b", TEXT)).unwrap();
+    inbox::append(&f.inbox, &attestation_op("cap-b", TEXT)).unwrap();
+    let (ok, out) = drain(&f);
+
+    assert!(ok, "{out}");
+    assert!(out.contains("SUPERSEDED") && out.contains("cap-a") && out.contains("already counts"), "{out}");
+    assert!(!out.contains("no attestation arrived"), "the older filing is not filed dead: {out}");
+    assert_eq!(counted(&f).as_deref(), Some("eval-demo-1"));
+    assert_eq!(filings_of_the_report(&f), (1, 1), "exactly one report stands under the id");
+    assert!(copy_eval::Pending::read(&f.main).is_empty(), "nothing stays held");
+}
+
+/// A filing of a counted id reaches the queue late and its day has run out: it
+/// is closed as superseded, never filed dead.
+#[test]
+fn a_later_arriving_filing_of_a_counted_id_is_superseded_even_after_a_day() {
+    let f = fixture();
+    inbox::append(&f.inbox, &report_op("cap-b", TEXT)).unwrap();
+    inbox::append(&f.inbox, &attestation_op("cap-b", TEXT)).unwrap();
+    let (ok, out) = drain(&f);
+    assert!(ok && out.contains("COUNTS"), "{out}");
+
+    let mut late = report_op("cap-a", "A filing that reached the queue late.");
+    late.ts = "1000000000".to_string();
+    inbox::append(&f.inbox, &late).unwrap();
+    let (ok, out) = drain(&f);
+
+    assert!(ok, "{out}");
+    assert!(out.contains("SUPERSEDED") && !out.contains("no attestation arrived"), "{out}");
+    assert_eq!(filings_of_the_report(&f), (1, 1));
+    assert_eq!(counted(&f).as_deref(), Some("eval-demo-1"));
+}
+
+/// The proof of the OLDER filing arrives after the newer one was filed: it
+/// files nothing, and a replay of either capture afterwards files nothing.
+#[test]
+fn the_proof_of_the_older_filing_arriving_late_files_nothing() {
+    let f = fixture();
+    inbox::append(&f.inbox, &report_op("cap-a", "The first filing.")).unwrap();
+    let (ok, out) = drain(&f);
+    assert!(ok, "{out}");
+
+    inbox::append(&f.inbox, &report_op("cap-b", TEXT)).unwrap();
+    inbox::append(&f.inbox, &attestation_op("cap-b", TEXT)).unwrap();
+    let (ok, out) = drain(&f);
+    assert!(ok && out.contains("SUPERSEDED"), "{out}");
+    assert_eq!(filings_of_the_report(&f), (1, 1));
+
+    inbox::append(&f.inbox, &attestation_op("cap-a", "The first filing.")).unwrap();
+    let (ok, out) = drain(&f);
+    assert!(ok, "{out}");
+    assert!(out.contains("already known"), "{out}");
+    assert_eq!(filings_of_the_report(&f), (1, 1));
+
+    inbox::append(&f.inbox, &report_op("cap-a", "The first filing.")).unwrap();
+    inbox::append(&f.inbox, &report_op("cap-b", TEXT)).unwrap();
+    inbox::append(&f.inbox, &attestation_op("cap-a", "The first filing.")).unwrap();
+    inbox::append(&f.inbox, &attestation_op("cap-b", TEXT)).unwrap();
+    let (ok, out) = drain(&f);
+    assert!(ok, "{out}");
+    assert_eq!(filings_of_the_report(&f), (1, 1), "a replayed batch files nothing: {out}");
+    assert_eq!(counted(&f).as_deref(), Some("eval-demo-1"));
+    assert!(copy_eval::Pending::read(&f.main).is_empty(), "no proof or report is left held: {out}");
+}
+
+/// Both filings were proven and arrive in one batch: the newer capture counts,
+/// the older is superseded - one report under the id, whatever the order.
+#[test]
+fn two_proven_filings_of_one_id_leave_exactly_one_report() {
+    let f = fixture();
+    let mut older = report_op("cap-a", "The first filing.");
+    older.ts = "1700000000".to_string();
+    inbox::append(&f.inbox, &attestation_op("cap-a", "The first filing.")).unwrap();
+    inbox::append(&f.inbox, &older).unwrap();
+    inbox::append(&f.inbox, &report_op("cap-b", TEXT)).unwrap();
+    inbox::append(&f.inbox, &attestation_op("cap-b", TEXT)).unwrap();
+
+    let (ok, out) = drain(&f);
+
+    assert!(ok, "{out}");
+    assert!(out.contains("SUPERSEDED") && out.contains("capture cap-a"), "{out}");
+    assert_eq!(filings_of_the_report(&f), (1, 1));
+    let store = EventStore::open_existing(&f.main).unwrap();
+    let item = model::store::show(&store, "eval-demo-1").unwrap();
+    assert!(item.text.ends_with(TEXT), "the newer capture is the one that stands: {}", item.text);
+}

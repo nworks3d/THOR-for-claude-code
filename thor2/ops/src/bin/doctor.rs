@@ -4,6 +4,25 @@ use clap::Parser;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+// Doctor's exit status is decided by `--gate` alone, never by what it prints.
+// `println!` panics (exit 101) when the reader of its output has gone away - a
+// `| head`, a closed terminal, a harness that stopped reading - and that
+// turned a report with no PROBLEM line into a failing exit. These write and
+// ignore a closed pipe instead.
+macro_rules! say {
+    ($($arg:tt)*) => {{
+        use std::io::Write;
+        let _ = writeln!(std::io::stdout(), $($arg)*);
+    }};
+}
+
+macro_rules! say_err {
+    ($($arg:tt)*) => {{
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
 #[derive(Parser)]
 #[command(
     name = "doctor",
@@ -88,13 +107,13 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     // This folder's project is spelled the way the memory already spells it.
     serve::project::load_known_scopes(&cli.db);
-    println!("{}", ops::health::version_line());
+    say!("{}", ops::health::version_line());
 
     let token = match &cli.to {
         Some(_) => match std::env::var("THOR_SYNC_TOKEN") {
             Ok(t) if !t.trim().is_empty() => Some(t),
             _ => {
-                eprintln!("THOR_SYNC_TOKEN is not set - cannot check the replica named with --to");
+                say_err!("THOR_SYNC_TOKEN is not set - cannot check the replica named with --to");
                 None
             }
         },
@@ -121,17 +140,17 @@ fn main() -> ExitCode {
         let settings = cli.settings.clone().or_else(ops::install::default_settings_path);
         let mcp_json = cli.mcp_json.clone().or_else(ops::install::default_user_mcp_path);
         for line in ops::health::plain_summary(&cli.db, &cwd, settings.as_deref(), mcp_json.as_deref()) {
-            println!("{line}");
+            say!("{line}");
         }
         // A THOR program that a hook, the tool server or a scheduled task calls
         // and that is gone (an antivirus quarantine): said here, right under the
         // short version, because every other line depends on those programs.
         let bin_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(std::path::Path::to_path_buf));
         for line in ops::health::program_lines(&cli.db, settings.as_deref(), mcp_json.as_deref(), bin_dir.as_deref()) {
-            println!("{line}");
+            say!("{line}");
         }
     }
-    println!("{}", ops::health::checkouts_root_line(&checkouts_root));
+    say!("{}", ops::health::checkouts_root_line(&checkouts_root));
     // THOR failing to run at all comes before the per-component lines, because
     // nothing below can be trusted while it holds: a running tool server older
     // than its program on disk (field test 5, D4) and installed programs built
@@ -140,7 +159,7 @@ fn main() -> ExitCode {
     // two lines that predict a report that would be on file and dead.
     if let Some(bin_dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(std::path::Path::to_path_buf)) {
         let lines = [ops::health::stale_tool_server_line(&bin_dir), ops::health::version_skew_line(&bin_dir)];
-        lines.into_iter().flatten().for_each(|line| println!("{line}"));
+        lines.into_iter().flatten().for_each(|line| say!("{line}"));
     }
     if cli.eval {
         // This checkout's own project, resolved exactly as the full report does
@@ -148,16 +167,16 @@ fn main() -> ExitCode {
         let checkout_project = serve::project::resolve_project(cli.repo.as_deref().unwrap_or(&cwd));
         let printed = ops::health::eval_report(&cli.db, checkouts, cli.full, checkout_project.as_deref());
         for line in &printed {
-            println!("{line}");
+            say!("{line}");
         }
         // THOR checks its own doctor against its own routine.
         ops::health::note_routine_gaps(&cli.db, &printed);
-        println!("{}", ops::health::EVAL_FOOTER);
+        say!("{}", ops::health::EVAL_FOOTER);
         return ExitCode::SUCCESS;
     }
     // Hooks Claude Code could not start come right after, in the full report.
     if let Some(line) = ops::health::hook_failures_line(serve::time::now_unix()) {
-        println!("{line}");
+        say!("{line}");
     }
     // This checkout's own project, the same resolver every real injection
     // surface uses (`serve::project::resolve_project`) - an explicit --repo
@@ -177,7 +196,7 @@ fn main() -> ExitCode {
         cli.full,
         checkout_project.as_deref(),
     ) {
-        println!("{line}");
+        say!("{line}");
     }
 
     // --gate turns the report above into an exit code, reusing its verdict

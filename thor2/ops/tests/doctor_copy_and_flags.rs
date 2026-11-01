@@ -72,6 +72,71 @@ fn a_copy_softens_the_working_copy_line_and_does_not_list_the_never_fired_anchor
     assert!(!out.contains("command anchor never fired: dead-anchor"), "the list is not printed on a copy:\n{out}");
 }
 
+/// The real doctor binary on a copy: its exit status and stdout, in a clean home.
+fn doctor_status(db: &Path, home: &Path) -> (Option<i32>, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_doctor"))
+        .arg("--db")
+        .arg(db)
+        .env("USERPROFILE", home)
+        .env("HOME", home)
+        .env("THOR_SCHTASKS_XML", home.join("tasks.xml"))
+        .output()
+        .unwrap();
+    (out.status.code(), String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+fn fixture_copy(dir: &Path) -> std::path::PathBuf {
+    let db = fixture(dir);
+    let now = thor_core::copy_mode::now_unix();
+    let marker = thor_core::copy_mode::Marker { scopes: vec!["alpha".to_string()], include_global: true, pulled_at_unix: now, checked_at_unix: now, ..Default::default() };
+    thor_core::copy_mode::write_marker(&db, &marker).unwrap();
+    db
+}
+
+/// Without `--gate`, doctor's exit status never depends on what it prints: a
+/// copy (no tool server, no working copy, and the like) exits 0, and so does a
+/// report that does print a PROBLEM line, on a copy and on the main machine.
+#[test]
+fn doctor_exits_zero_on_a_copy_and_on_a_memory_with_a_problem_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fixture_copy(dir.path());
+    let (code, out) = doctor_status(&db, dir.path());
+    assert!(out.contains("OK: this is a copy"), "{out}");
+    assert_eq!(code, Some(0), "{out}");
+
+    let main = tempfile::tempdir().unwrap();
+    let db = fixture(main.path());
+    let (code, out) = doctor_status(&db, main.path());
+    assert!(out.lines().any(|l| l.trim_start().starts_with("PROBLEM")), "the fixture memory has a problem line:\n{out}");
+    assert_eq!(code, Some(0), "{out}");
+}
+
+/// A reader that goes away (`| head`, a harness that stopped reading) used to
+/// make doctor panic on its next print and exit 101 though nothing was wrong.
+#[test]
+fn doctor_exits_zero_when_whoever_reads_its_output_goes_away() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+    let dir = tempfile::tempdir().unwrap();
+    let db = fixture_copy(dir.path());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_doctor"))
+        .arg("--db")
+        .arg(&db)
+        .env("USERPROFILE", dir.path())
+        .env("HOME", dir.path())
+        .env("THOR_SCHTASKS_XML", dir.path().join("tasks.xml"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut first = String::new();
+    BufReader::new(child.stdout.take().unwrap()).read_line(&mut first).unwrap();
+    assert!(first.starts_with("doctor "), "{first}");
+    // The reader is dropped here; the rest of the report goes nowhere.
+    let status = child.wait().unwrap();
+    assert_eq!(status.code(), Some(0), "a closed output is not a failing doctor");
+}
+
 #[test]
 fn settings_and_mcp_json_flags_point_doctor_at_files_in_other_places() {
     let dir = tempfile::tempdir().unwrap();
