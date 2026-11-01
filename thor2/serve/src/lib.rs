@@ -121,6 +121,7 @@ pub mod input;
 pub mod judge;
 pub mod leftover_scripts;
 pub mod legit;
+pub mod length_reminder;
 pub mod live;
 pub mod lookup;
 pub mod mark;

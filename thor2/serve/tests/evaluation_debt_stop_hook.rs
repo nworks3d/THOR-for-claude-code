@@ -2599,3 +2599,64 @@ fn a_connected_copy_says_at_session_start_that_writes_go_through_the_queue() {
     let out = run_hook(&db2, &session_start_payload(&uuid(95), &fxp2), &sandbox);
     assert!(out.contains("the weekly check runs on the main machine") && !out.contains("connector's queue"), "{out}");
 }
+
+/// A session that typed ONE prompt and has done nothing since but read.
+fn read_only_first_turn(sandbox: &Sandbox, session: &str) -> serve::attest::fixture::Transcript {
+    let line = |value: serde_json::Value| value.to_string();
+    let mut transcript = serve::attest::fixture::main_transcript(&transcripts(sandbox), session);
+    transcript
+        .raw(&line(serde_json::json!({"type": "user", "message": {"role": "user", "content": "run the routine in routine.md"}})))
+        .raw(&line(serde_json::json!({"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "routine.md"}}]}})))
+        .write();
+    transcript
+}
+
+/// Report of 2026-10-19: a due session that typed ONE prompt and has
+/// only read files since (a long routine being read for the first time) is not
+/// asked yet - the ask comes at its next Stop, once anything but reading was
+/// done.
+#[test]
+fn a_new_ask_waits_while_the_first_turn_only_reads_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let sandbox = Sandbox::new();
+    let fxp = sandbox.project_dir("fxp");
+    drop(EventStore::new(&db).unwrap());
+    seed_project_clock(&db, "fxp", 90);
+    let s = uuid(97);
+    seed_own_work(&db, "fxp", &s, 30, 1);
+    let mut transcript = read_only_first_turn(&sandbox, &s);
+    let waiting = run_hook(&db, &stop_payload(&s, &fxp), &sandbox);
+    assert!(!is_block(&waiting), "the first turn only read: {waiting}");
+
+    transcript
+        .raw(
+            &serde_json::json!({"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t2", "name": "Bash", "input": {"command": "cargo test"}}]}})
+            .to_string(),
+        )
+        .write();
+    let asked = run_hook(&db, &stop_payload(&s, &fxp), &sandbox);
+    assert!(is_block(&asked), "it did more than read: {asked}");
+}
+
+/// An evaluation the session already opened is never deferred by the same
+/// rule: its hold stays on every turn end until the report counts.
+#[test]
+fn an_evaluation_the_session_opened_is_asked_even_while_it_only_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let sandbox = Sandbox::new();
+    let fxp = sandbox.project_dir("fxp");
+    let s = uuid(98);
+    {
+        let mut store = EventStore::new(&db).unwrap();
+        serve::attest::fixture::quiet_start_at(&mut store, &s, "fxp", serve::time::now_unix() - 5 * 60);
+    }
+    seed_project_clock(&db, "fxp", 90);
+    seed_own_work(&db, "fxp", &s, 30, 1);
+    read_only_first_turn(&sandbox, &s);
+    let out = run_hook(&db, &stop_payload(&s, &fxp), &sandbox);
+    assert!(is_block(&out), "{out}");
+}

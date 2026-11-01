@@ -1403,10 +1403,23 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
             let bug_nudge = (owner_typed && in_front < BUG_NUDGE_ROOM_BYTES)
                 .then(|| serve::thor_bugs::nudge_for_session(db_path, &session_id, serve::time::now_unix()))
                 .flatten();
-            if waiting.is_empty() && bug_nudge.is_none() {
+            // THE LENGTH REMINDER (`serve::length_reminder`): one short line on
+            // the session's first typed prompt, so the first answer is already
+            // short. Same room rule as the nudge: deferred, not spent, when the
+            // prompt already carries a long block.
+            let length_line = (owner_typed && in_front < BUG_NUDGE_ROOM_BYTES)
+                .then(|| serve::length_reminder::for_session(db_path, &session_id, serve::time::now_unix()))
+                .flatten();
+            if waiting.is_empty() && bug_nudge.is_none() && length_line.is_none() {
                 return out;
             }
             let mut notes = if waiting.is_empty() { String::new() } else { serve::next_turn::render(&waiting) };
+            if let Some(line) = length_line {
+                if !notes.is_empty() {
+                    notes.push_str("\n\n");
+                }
+                notes.push_str(&line);
+            }
             if let Some(nudge) = bug_nudge {
                 if !notes.is_empty() {
                     notes.push_str("\n\n");
@@ -3765,6 +3778,16 @@ fn eval_stop_ask(
         let stop_here = folder_project == Some(project.as_str());
         match usefulness::stop_decision(store, &state, &project, session_id, &timeline, stop_here, true, now, usefulness::cadence_in(db_path)) {
             usefulness::StopDecision::Ask(clock) => {
+                // A NEW ASK WAITS WHILE THE FIRST TURN ONLY READS (report of
+                // 2026-10-19): a session that typed one prompt and has
+                // done nothing but read files is still taking in what it was
+                // handed, often a long routine. The ask comes at the next
+                // Stop. An evaluation this session already opened is never
+                // deferred.
+                let open = model::store::open_evaluation_start_at(store, session_id, &project, now).is_some();
+                if !open && serve::attest::transcripts_root().is_some_and(|root| serve::attest::first_turn_only_read(&root, session_id)) {
+                    continue;
+                }
                 // A REPORT THIS SESSION FILED WAS REFUSED AS VERSION SKEW and
                 // the session has not been restarted since (field test 13,
                 // D2): its tool server is still the old build, so a fresh
@@ -6324,6 +6347,47 @@ mod copy_mode_tests {
             new_files.iter().all(|n| n == "copy-telemetry.jsonl" || n == "shown-counts"),
             "a copy writes nothing beside the store but its telemetry and the once-per-context counts: {new_files:?}"
         );
+    }
+
+    /// THE LENGTH REMINDER: the session's first typed prompt carries the
+    /// rulebook's own limit in one line, a later prompt of that session does
+    /// not, another session gets it, a helper agent and a copy get nothing, and
+    /// without the length rule in the rulebook nothing is said or written.
+    #[test]
+    fn the_first_typed_prompt_of_a_session_carries_the_length_reminder_once() {
+        let prompt = |f: &Fixture, session: &str, extra: Value| {
+            let mut p = serde_json::json!({ "prompt": "please carry on" });
+            p.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            let mut text: Value = serde_json::from_str(&payload("UserPromptSubmit", &f.root, p)).unwrap();
+            text["session_id"] = serde_json::json!(session);
+            match hook_once(&f.db, Some(text.to_string()), "hook", false) {
+                Some(HookOutput::Context { block, .. }) | Some(HookOutput::ContextWithNotice { block, .. }) => block,
+                _ => String::new(),
+            }
+        };
+        let f = fixture(false);
+        assert!(!prompt(&f, "s-len", serde_json::json!({})).contains("Reminder: the reply guard"), "no rulebook, no line");
+        assert!(!files_beside(&f.db).contains(&serve::length_reminder::FILE.to_string()), "nothing is written when nothing is said");
+
+        let rulebook = r#"[{"id":"answer-is-too-long","tier":"block","min_chars":1200,"reminder":"r"}]"#;
+        std::fs::write(serve::respond::default_rulebook_path(&f.db), rulebook).unwrap();
+        let first = prompt(&f, "s-len", serde_json::json!({}));
+        assert!(first.contains("Reminder: the reply guard holds an answer over 1200 characters"), "{first}");
+        assert!(!prompt(&f, "s-len", serde_json::json!({})).contains("Reminder: the reply guard"), "once per session");
+        assert!(prompt(&f, "s-other", serde_json::json!({})).contains("Reminder: the reply guard"), "another session");
+        assert!(
+            !prompt(&f, "s-helper", serde_json::json!({ "agent_id": "agent-1" })).contains("Reminder: the reply guard"),
+            "a helper agent is not the owner"
+        );
+        assert!(
+            !prompt(&f, "s-notice", serde_json::json!({ "prompt": "<task-notification>done</task-notification>" })).contains("Reminder: the reply guard"),
+            "a notification is not the owner typing"
+        );
+
+        let copy = fixture(true);
+        std::fs::write(serve::respond::default_rulebook_path(&copy.db), rulebook).unwrap();
+        assert!(!prompt(&copy, "s-copy", serde_json::json!({})).contains("Reminder: the reply guard"), "a copy records nothing");
+        assert!(!files_beside(&copy.db).contains(&serve::length_reminder::FILE.to_string()));
     }
 
     /// The once-per-context showing still works on a copy.

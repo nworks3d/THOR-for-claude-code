@@ -1477,6 +1477,68 @@ pub fn earlier_turn_in(timeline: &[TimedLine], project: &str) -> bool {
         && prompts[..prompts.len() - 1].iter().any(|l| l.project.as_deref().is_none_or(|p| p == project))
 }
 
+/// THE SESSION IS STILL IN ITS FIRST TURN AND HAS ONLY READ FILES (found in
+/// Report of 2026-10-19: the weekly ask landed while the session was
+/// reading a long routine for the first time).
+///
+/// The first Stop of a session is free (Q10), but a Stop that held the first
+/// turn (any hold) makes the next Stop of that same turn the second one, and
+/// that one could be asked. A session that has typed exactly ONE prompt and has
+/// done nothing since but read (`Read`, `Grep`, `Glob`, `NotebookRead`) is
+/// taking in what it was handed, not finishing work: the new ask waits for the
+/// next Stop, where it is asked as before. An evaluation already open in the
+/// session is never deferred (the caller's rule), and a turn with no tool call
+/// at all is not "reading", so it is asked as before.
+///
+/// Fail-open toward asking: no readable main transcript, one longer than the
+/// tail read (the first prompt may be cut off), a second typed prompt, a
+/// compaction summary, or any other tool call all answer `false`.
+pub fn first_turn_only_read(root: &Path, session: &str) -> bool {
+    let Some(main) = session_transcripts(root, session).into_iter().find(|p| p.file_stem().and_then(|s| s.to_str()) == Some(session)) else {
+        return false;
+    };
+    if std::fs::metadata(&main).map_or(true, |m| m.len() > TRANSCRIPT_TAIL_BYTES) {
+        return false;
+    }
+    first_turn_only_read_in(&tail_lines(&main))
+}
+
+/// `first_turn_only_read` over the lines of the main transcript.
+fn first_turn_only_read_in(lines: &[String]) -> bool {
+    let (mut prompts, mut calls) = (0, 0);
+    for line in lines {
+        let Ok(entry) = serde_json::from_str::<Value>(line) else { continue };
+        if entry.get("isSidechain").and_then(|v| v.as_bool()) == Some(true) {
+            continue;
+        }
+        if entry.get("isCompactSummary").and_then(|v| v.as_bool()) == Some(true) {
+            return false;
+        }
+        match entry.get("type").and_then(|t| t.as_str()) {
+            Some("user") if entry.get("isMeta").and_then(|v| v.as_bool()) != Some(true) && is_typed_prompt(line) => {
+                prompts += 1;
+                if prompts > 1 {
+                    return false;
+                }
+            }
+            Some("assistant") => {
+                let blocks = entry.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_array());
+                for block in blocks.into_iter().flatten() {
+                    if block.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
+                        continue;
+                    }
+                    calls += 1;
+                    if !matches!(block.get("name").and_then(|n| n.as_str()), Some("Read" | "Grep" | "Glob" | "NotebookRead")) {
+                        return false;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    prompts == 1 && calls > 0
+}
+
 /// Every project the timeline attributes a line to, in the order first seen.
 pub fn projects_in(timeline: &[TimedLine]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -2754,6 +2816,90 @@ mod clock_tests {
         let two = session_timeline(&root, S);
         assert!(earlier_turn_in(&two, "alpha"), "the first turn began in alpha");
         assert!(!earlier_turn_in(&two, "beta"), "beta's only turn is the newest");
+    }
+
+    fn typed(text: &str) -> String {
+        serde_json::json!({"type": "user", "message": {"role": "user", "content": text}}).to_string()
+    }
+
+    fn call(tool: &str) -> String {
+        serde_json::json!({"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "looking"},
+            {"type": "tool_use", "id": "toolu_1", "name": tool, "input": {"file_path": "C:/x/routine.md"}}
+        ]}})
+        .to_string()
+    }
+
+    fn result() -> String {
+        serde_json::json!({"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_1", "content": "text of the file"}
+        ]}})
+        .to_string()
+    }
+
+    /// THE FIRST TURN THAT ONLY READS (report of 2026-10-19): one
+    /// typed prompt and nothing but reads since is "still reading"; any other
+    /// tool, a second prompt, a turn with no tool call, a compaction or a
+    /// helper's own lines change the answer toward asking.
+    #[test]
+    fn a_first_turn_that_only_read_files_is_told_from_the_others() {
+        let lines = |v: &[String]| v.to_vec();
+        let reading = [typed("run the routine in routine.md"), call("Read"), result(), call("Grep"), result(), call("Glob"), result()];
+        assert!(first_turn_only_read_in(&lines(&reading)));
+        let stop_feedback = [reading.to_vec(), vec![typed("Stop hook feedback:\n[THOR] shorten it"), call("Read"), result()]].concat();
+        assert!(first_turn_only_read_in(&stop_feedback), "a hold's feedback is no second prompt");
+
+        let ran_a_command = [typed("go"), call("Read"), result(), call("Bash"), result()];
+        assert!(!first_turn_only_read_in(&lines(&ran_a_command)), "a command is work");
+        let edited = [typed("go"), call("Read"), result(), call("Edit"), result()];
+        assert!(!first_turn_only_read_in(&lines(&edited)));
+        let launched = [typed("go"), call("Agent"), result()];
+        assert!(!first_turn_only_read_in(&lines(&launched)), "launching a helper is not reading");
+        let second_prompt = [typed("go"), call("Read"), result(), typed("and now?"), call("Read"), result()];
+        assert!(!first_turn_only_read_in(&lines(&second_prompt)), "only the first turn is protected");
+        let no_calls = [typed("what is 2+2")];
+        assert!(!first_turn_only_read_in(&lines(&no_calls)), "no reads, nothing to protect");
+        assert!(!first_turn_only_read_in(&[]));
+        let compacted = [
+            serde_json::json!({"type": "user", "isCompactSummary": true, "message": {"role": "user", "content": "summary"}}).to_string(),
+            typed("go"),
+            call("Read"),
+            result(),
+        ];
+        assert!(!first_turn_only_read_in(&lines(&compacted)), "a compacted session is not at its start");
+        let helper_ran_a_command = [
+            typed("go"),
+            call("Read"),
+            serde_json::json!({"type": "assistant", "isSidechain": true, "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t", "name": "Bash", "input": {"command": "ls"}}]}})
+            .to_string(),
+        ];
+        assert!(first_turn_only_read_in(&lines(&helper_ran_a_command)), "a helper's own lines are not this session's turn");
+        assert!(!first_turn_only_read_in(&["not json".to_string(), typed("go")]), "no calls, no claim");
+    }
+
+    #[test]
+    fn the_read_only_first_turn_is_read_from_the_main_transcript_file_only() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("projects");
+        let alpha = project_dir(home.path(), "alpha");
+        assert!(!first_turn_only_read(&root, S), "no transcript");
+        let mut transcript = fixture::main_transcript(&root, S);
+        let stamped = |line: String| {
+            let mut v: Value = serde_json::from_str(&line).unwrap();
+            v["cwd"] = serde_json::json!(alpha.to_string_lossy());
+            v["timestamp"] = serde_json::json!("2026-10-19T10:00:00.000Z");
+            v.to_string()
+        };
+        for line in [typed("run the routine"), call("Read"), result()] {
+            transcript.raw(&stamped(line));
+        }
+        transcript.write();
+        assert!(first_turn_only_read(&root, S));
+        assert!(!first_turn_only_read(&root, "not-a-session"));
+        let mut more = fixture::main_transcript(&root, S);
+        more.raw(&stamped(call("Bash"))).write();
+        assert!(!first_turn_only_read(&root, S), "a command since");
     }
 
     /// One bounded read: only the last `TRANSCRIPT_TAIL_BYTES` of a file are
