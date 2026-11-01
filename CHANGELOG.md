@@ -4,6 +4,12 @@ What changed in each release, newest first. The release workflow copies the sect
 
 ## Unreleased
 
+- **A reply rule can check the language of the reply.** The new opt-in field `expected_language` (`nl`, `de`, `fr` or `es`) in the reply rulebook makes a rule fire on a reply that clearly reads as English when the owner's last prompt was in that language. Closing messages had come out in English for a Dutch owner and nothing noticed. It counts function words in the plain prose only (code, quotes and blockquotes are left out), needs at least 200 characters of prose, and stays silent on a short, English, mixed or unreadable prompt. The seeded rulebook has no such rule, so nothing changes until one is added. Documented in `thor2/README.md`.
+- **The first prompt of a session carries the length limit.** The reply guard holds an answer over its limit and the assistant then wrote it again, so the owner read it twice. A Stop runs after the reply and cannot warn first, so one short line with the limit from the owner's own rulebook is now added to the first prompt he types in a session (once per session, nothing when the length rule is not in his file, never for a helper agent or a copy).
+- **The weekly check is not asked in a first turn that only read files.** A session that typed one prompt and has done nothing since but read (Read, Grep, Glob), for instance a long routine being read for the first time, is asked at its next turn end instead. An evaluation the session already opened is never deferred.
+- **The refusal of a visible `Start-Process` says how to open a window you asked for.** The note now reads "If the user asked to see this window, use -WindowStyle Normal."
+- **The note about script files names the PowerShell ssh trap.** PowerShell 5.1 re-quotes nested double quotes in an ssh argument; the note now says to feed the remote script to ssh via stdin. It still only informs.
+
 ## 2.6.4 (2026-11-01)
 
 What changed: A copy of your memory on another machine now sends the proof of its weekly report through the same THOR tool as the report itself, so no connection address is needed any more.

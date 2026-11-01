@@ -165,7 +165,8 @@ Words used once, in plain language:
   hold anywhere. Only two carry a check, and only on a Windows install: windowless-processes-on-windows
   refuses a Start-Process that is not hidden (it passes -WindowStyle Hidden, -NoNewWindow, -WindowStyle
   Normal for a window you asked to see, and things meant to be seen such as a browser address or a control
-  panel), and scheduled-task-not-interactive refuses schtasks /create with /it. Both exist so an agent
+  panel; the refusal says so in one sentence: if the user asked to see this window, use -WindowStyle
+  Normal), and scheduled-task-not-interactive refuses schtasks /create with /it. Both exist so an agent
   never flashes a console window. All the others stay plain notes: seven other candidate checks were
   replayed over 145,976 recorded calls and every one refused legitimate work (for example a --no-verify
   ban refused 11 legitimate commits), so a new user never gets a false block from a note they did not
@@ -183,9 +184,14 @@ Words used once, in plain language:
   "everything checks out") is held unless it says what it covered. All six block when they fire (no tier means block).
 - Why: so the end-of-reply check has something to check from the first session instead of silently
   checking nothing. The content is a neutral example, not the user's choice.
-- You notice: see C4. Some trigger words are Dutch ("gepusht", "kun je checken").
+- You notice: see C4. Some trigger words are Dutch ("gepusht", "kun je checken"). On the first
+  prompt you type in a session your assistant also gets one short line with the length limit of the
+  length rule (once per session, read from the rulebook itself, nothing when the rule is not in your
+  file), so the first answer is already short instead of being written twice.
 - Refuse or change: edit a rule's reminder line, delete an entry or the file to switch it off. Never
-  overwritten once present.
+  overwritten once present. One more field is available but no rule uses it in the file:
+  `expected_language` (nl, de, fr or es) makes a rule fire on a reply that clearly reads as English when your last prompt
+  was in that language (see thor2/README.md for the exact reading; off unless you add such a rule).
 
 ### A12. It settles the bug-reporting mode
 - What: writes thor-mode.json = "release" (on every build) unless a mode is already set, and closes bug
@@ -520,7 +526,10 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
 - What: per project, at a turn end, THOR asks for the full /thor-eval review when: the project has had 60
   minutes of work since the last valid review (all sessions added, parallel minutes counted once); this
   session has done 10 minutes of its own work there; it is not this session's first turn end there; no
-  other session is running that project's review (active in the last 30 minutes). The rhythm is one
+  other session is running that project's review (active in the last 30 minutes). A NEW ask also waits
+  while the session is still in its first turn and has only read files (one typed prompt, then nothing
+  but Read, Grep or Glob), for instance a long routine being read for the first time: it comes at the
+  next turn end. A review the session already opened is never deferred. The rhythm is one
   evaluation per week per project, tied to your plan (first-session item 1): on a smaller plan (Pro and
   anything below Max, or a plan THOR could not read) a valid report covers the next 7 days, whatever is
   found. On Max it is the same week, but it goes daily (a report covers the next 24 hours) while the
