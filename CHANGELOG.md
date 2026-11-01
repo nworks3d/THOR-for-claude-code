@@ -4,6 +4,10 @@ What changed in each release, newest first. The release workflow copies the sect
 
 ## Unreleased
 
+## 2.6.3 (2026-11-01)
+
+What changed: An assistant is never told to delete anything without your own yes. The question about leftover script files now waits while a helper agent is still working, and is asked only once per file. Python projects that run their tests with `python -m unittest` now count as having run them. A `lookup` answer is capped so it can no longer overflow the tool limit. The reminder shown after a compaction now also says that numbers and names from the summary are unverified. The error messages for wrong arguments to `remember` and `revise` are clearer.
+
 - **The leftover-script hold leaves a running helper's files alone, and no longer asks twice about one file.** A script written by a background agent (subagent) of the session is not asked about while that agent is still working: the note now records which agent wrote each file, and the agent counts as running while its own transcript file or its last noted write is less than 30 minutes old. Once it has been quiet that long, the file is asked about once, as before. The note file is also changed under a small lock now: a running helper's tool calls and the turn end both changed it, and one could overwrite the other, which made an already asked file come back (reproduced in a test: noted files were lost without the lock).
 - **`python -m unittest` counts as a test run.** The test signal and the accrued-work clock knew only `pytest`, so a Python project that had just run its suite was told to run it again. `python -m unittest`, `python3 -m unittest`, `py -m unittest`, `py -3 -m unittest` and any `-m unittest` are recognised next to the existing `pytest` and `python -m pytest` forms.
 - **`lookup` can no longer overflow the tool limit.** The answer is held to about 20000 characters: a long body (a Report) is cut to a first part that ends with its id and "use get with id ... for the rest", short rules stay whole and keep their rank, and the reply ends with how many results were cut. A `lookup` by key is cut the same way.
