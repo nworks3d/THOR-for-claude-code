@@ -1205,7 +1205,7 @@ pub fn workflow_starter_pack_for(windows: bool) -> Vec<model::item::Item> {
         ),
         note(
             "keep-only-what-is-needed",
-            "Rebuildable things (build output, caches, models, installers, scratch and worktree folders, database copies) do not belong in a repo or a backup: ignore them or leave them out. Clean up temporary work after use.",
+            "Rebuildable things (build output, caches, models, installers, scratch and worktree folders, database copies) do not belong in a repo or a backup: ignore them or leave them out. List temporary work for the owner and remove it only after his own yes.",
             "Build output, caches or database copies committed or backed up are found to cost nothing, and scratch left behind is found harmless.",
             vec![moment(Action::Delete), moment(Action::Install)],
         ),

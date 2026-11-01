@@ -4,6 +4,8 @@ What changed in each release, newest first. The release workflow copies the sect
 
 ## Unreleased
 
+- **An assistant never deletes anything without the owner's own yes** (owner decision 2026-11-01: useful material was thrown away too quickly). The end-of-turn hold for script files left outside any git repository no longer says "delete the one-offs": a reusable helper is still moved into the tools folder with a README, any other file stays where it is and is named for the owner in one sentence, and it is deleted only after the owner's own yes. The hold still asks once per file per session. The starter note `keep-only-what-is-needed` now says temporary work is listed for the owner and removed only after his own yes, and `README.md`, `AGENTS.md`, `docs/WHAT-THOR-DOES.md` and the tools-folder text of `install` say the same.
+
 ## 2.6.2 (2026-10-26)
 
 What changed: THOR now says plainly when the copy of your memory on another machine does not answer. A copy can now file its own weekly check, and it counts. Three smaller fixes: THOR no longer lists its own files as leftover scripts, a change to a rule's exceptions is now tested like any other change, and a program failing to start while the computer shuts down or sleeps is no longer reported as a THOR fault.

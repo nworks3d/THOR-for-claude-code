@@ -2,9 +2,10 @@
 //!
 //! Only when the owner has named a tools folder (`work_folders`, key `tools`).
 //! A helper script written to a scratch folder is either worth keeping, and
-//! then it belongs in the tools folder with a README, or it was a one-off and
-//! should be deleted. Left alone it is neither: it is found again by accident,
-//! or never. So:
+//! then it belongs in the tools folder with a README, or it is something else
+//! and is listed for the owner, who decides. Left alone it is neither: it is
+//! found again by accident, or never. Nothing is ever deleted without the
+//! owner's own yes. So:
 //!
 //! 1. Before a Write, Edit, MultiEdit or NotebookEdit tool call runs,
 //!    `record_write` notes the file when it is a script (`.py`, `.ps1`, ...),
@@ -14,7 +15,8 @@
 //! 2. At the end of a turn, `hold_reason` lists the noted files that still
 //!    exist and were last changed more than 30 minutes ago, and asks the
 //!    assistant to move each reusable one into the tools folder (with a README
-//!    whose first line says what it does) or to delete it. A file is asked
+//!    whose first line says what it does) or to leave it where it is and list
+//!    it for the owner, who alone says yes to a delete. A file is asked
 //!    about ONCE per session: the hold marks it, and a later turn end does not
 //!    hold for it again, so the question can never become a loop.
 //!
@@ -206,7 +208,7 @@ fn message(files: &[String], tools: &str) -> String {
         out.push_str(&format!("...and {} more.\n", files.len() - MAX_LISTED));
     }
     out.push_str(&format!(
-        "Your tools folder is {tools}. For each file: if it is a reusable helper, move it into a new sub-folder of the tools folder (one folder per tool, named after what it does) and add a README.txt in that sub-folder whose first line says in one sentence what the tool does; if it was a one-off, delete it. Then end the turn. THOR will not ask again about these files in this session."
+        "Your tools folder is {tools}. For each file: if it is a reusable helper, move it into a new sub-folder of the tools folder (one folder per tool, named after what it does) and add a README.txt in that sub-folder whose first line says in one sentence what the tool does. Any other file stays where it is: do not delete it. Name those files for the owner in one sentence in your reply, and delete one only after the owner's own yes. Then end the turn. THOR will not ask again about these files in this session."
     ));
     out
 }
@@ -490,11 +492,29 @@ mod tests {
         assert!(reason.contains(&file.display().to_string()), "{reason}");
         assert!(reason.contains(&fx.tools.display().to_string()), "{reason}");
         assert!(reason.contains("README.txt") && reason.contains("first line says in one sentence what the tool does"), "{reason}");
-        assert!(reason.contains("if it was a one-off, delete it"), "{reason}");
+        assert!(reason.contains("Any other file stays where it is"), "{reason}");
         assert!(reason.contains("will not ask again"), "{reason}");
 
         assert_eq!(hold_reason(&fx.db, "s1", changed + 3_600), None, "never twice for the same file in one session");
         assert_eq!(hold_reason(&fx.db, "s1", changed + 86_400), None);
+    }
+
+    /// Owner decision 2026-11-01: nothing is deleted without the owner's own
+    /// yes. The hold may mention deleting only to forbid it or to put it behind
+    /// that yes, and it still has its one way out (move the helper, end the turn).
+    #[test]
+    fn the_hold_never_tells_the_assistant_to_delete_without_the_owners_yes() {
+        let fx = fixture();
+        let file = make_script(&fx.scratch, "fix.py");
+        write(&fx, "s1", "Write", &file);
+        let reason = hold_reason(&fx.db, "s1", mtime(&file) + 31 * 60).expect("a file left over");
+        let lower = reason.to_lowercase();
+        assert!(!lower.contains("one-off") && !lower.contains("clean up") && !lower.contains("throw away"), "{reason}");
+        assert!(lower.contains("owner's own yes"), "{reason}");
+        for sentence in lower.split(". ").filter(|s| s.contains("delete")) {
+            assert!(sentence.contains("do not delete") || sentence.contains("only after the owner's own yes"), "unguarded delete: {sentence}");
+        }
+        assert!(reason.contains("Then end the turn") && reason.contains("will not ask again"), "one honest way out: {reason}");
     }
 
     #[test]
