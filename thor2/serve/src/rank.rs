@@ -833,6 +833,42 @@ mod tests {
         assert_eq!(got[1], "z-rule", "the refusing rule must make the block of four: {got:?}");
     }
 
+    /// THE BLOCK, NOT ONLY THE ORDER: the four places a block has go to the
+    /// rule that can refuse before the notes that only inform, at equal
+    /// severity, wherever the pool comes from (a file, a command, a moment) -
+    /// and its id sorting last changes nothing.
+    #[test]
+    fn the_shown_block_keeps_a_refusing_rule_over_informing_notes_at_equal_severity() {
+        use model::item::Check;
+        let forbidden = || Some(Check::Forbidden { literals: vec!["--force".to_string()] });
+        let pool = |binding: Binding, input: ServeInput| {
+            let mut items: Vec<LiveItem> = (1..=5)
+                .map(|n| {
+                    let mut c = base(&format!("a-note-{n}"), Kind::Rule);
+                    c.item.bindings = vec![binding.clone()];
+                    c.item.severity = Some(Severity::HouseStyle);
+                    c
+                })
+                .collect();
+            let mut rule = base("z-rule", Kind::Rule);
+            rule.item.bindings = vec![binding];
+            rule.item.severity = Some(Severity::HouseStyle);
+            rule.item.check = forbidden();
+            items.push(rule);
+            let shown = crate::render::cap(select(&items, &input));
+            assert_eq!(shown.withheld, 2, "six apply, four fit");
+            shown.shown.into_iter().map(|r| r.id).collect::<Vec<_>>()
+        };
+        let mut file = ServeInput::default();
+        file.add_file("deploy.sh");
+        let at_file = pool(Binding::Target { kind: TargetKind::Path, value: "deploy.sh".to_string() }, file);
+        assert_eq!(at_file[0], "z-rule", "{at_file:?}");
+        let at_command = pool(Binding::Target { kind: TargetKind::Command, value: "Agent".to_string() }, running("Agent"));
+        assert_eq!(at_command[0], "z-rule", "{at_command:?}");
+        let at_moment = pool(Binding::Moment(Action::Configure), input_matching_base());
+        assert_eq!(at_moment[0], "z-rule", "{at_moment:?}");
+    }
+
     #[test]
     fn target_matches_is_the_only_definition_used_here() {
         // Pins the single-normalization doctrine (R6) locally: target_matches

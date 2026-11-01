@@ -3183,6 +3183,157 @@ impl FullPlace {
     }
 }
 
+/// A CROWDED PLACE of one project (`outranked_places`): a Path, Dir or Command
+/// anchor where more live facts apply than one block ever shows, so the lowest
+/// ranked of them can be outranked and never reach the reader at the very
+/// moment they were written for. Frozen in an evaluation's start record
+/// (`Frozen::outranked`) with the occupants it had then.
+///
+/// WHY IT IS AN EVALUATION'S JOB. The write gate refuses a NEW claimant on a
+/// full place (`full_reliable_anchor`), but it cannot see what was already
+/// there: measured 2026-10-26, an evaluation report named a phone rule "never
+/// shown at its commit moment (outranked)", and global rules counted per
+/// project landed on places with six occupants. Doctor printed `outranked:`
+/// lines for weeks and nothing ever settled them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutrankedPlace {
+    pub kind: crate::item::TargetKind,
+    pub value: String,
+    /// The ids of the facts on it at the start: refusing rules first, then by
+    /// weight, then by id.
+    pub occupants: Vec<String>,
+}
+
+impl OutrankedPlace {
+    /// "src/a.rs" or "npm run deploy (command)".
+    pub fn label(&self) -> String {
+        match self.kind {
+            crate::item::TargetKind::Command => format!("{} (command)", self.value),
+            _ => self.value.clone(),
+        }
+    }
+}
+
+/// The live facts of `candidates` that compete at the place `kind`/`value` for
+/// `project`: the gate's own count (`pool_rivals`), seen from a probe that
+/// belongs to the project, so its own facts and the global tier both count.
+fn place_occupants<'a>(
+    candidates: &'a [(String, Item)],
+    project: &str,
+    kind: crate::item::TargetKind,
+    value: &str,
+) -> Vec<&'a (String, Item)> {
+    let probe = Item {
+        id: String::new(),
+        kind: Kind::Rule,
+        text: String::new(),
+        bindings: Vec::new(),
+        severity: None,
+        project: Some(project.to_string()),
+        tags: Vec::new(),
+        expires: None,
+        key: None,
+        falsifier: None,
+        check: None,
+    };
+    pool_rivals(candidates, &probe, &Binding::Target { kind, value: value.to_string() })
+}
+
+/// Whether a rule holds its place against any tidying: its check can refuse
+/// (the trial's own verdict, as `FullPlace::of` reads it) and it is at least
+/// costly - heavier than the informing text around it.
+fn holds_its_place(store: &EventStore, id: &str, item: &Item) -> bool {
+    matches!(current_verdict(store, id), CurrentVerdict::RuleProven | CurrentVerdict::RuleWired)
+        && crate::item::severity_rank(item.severity) <= crate::item::severity_rank(Some(crate::item::Severity::Costly))
+}
+
+/// Whether a crowded place can be brought back to `item::MAX_ITEMS` by
+/// honest work: at most that many of its occupants are rules that hold their
+/// place. A place where EVERY occupant is a heavier refusing rule (more than a
+/// block holds, all of them protected) has no fold, move or retract that is
+/// honest, so it is never listed and never owed.
+fn place_has_an_honest_exit(store: &EventStore, occupants: &[&(String, Item)]) -> bool {
+    occupants.iter().filter(|(id, item)| holds_its_place(store, id, item)).count() <= crate::item::MAX_ITEMS
+}
+
+/// The crowded places of `project` at this moment, at most
+/// `EVALUATION_OUTRANKED_LIST`, the most crowded first. A place is crowded when
+/// more than `item::MAX_ITEMS` live firing facts of the project or of the
+/// global tier are bound to it (counted exactly as the write gate counts a
+/// place, `pool_rivals`), and it is listed only when honest work can settle it
+/// (`place_has_an_honest_exit`). Two anchors with the same occupants are one
+/// place. Pure: reads the log, writes nothing.
+pub fn outranked_places(store: &EventStore, project: &str) -> Vec<OutrankedPlace> {
+    let candidates = all_live_items(store);
+    let mut anchors: Vec<(crate::item::TargetKind, String)> = Vec::new();
+    for (_, item) in candidates.iter().filter(|(_, i)| i.kind.can_fire() && project_applies_to(i.project.as_deref(), Some(project))) {
+        for binding in &item.bindings {
+            let Binding::Target { kind, value } = binding else { continue };
+            if !matches!(
+                kind,
+                crate::item::TargetKind::Path | crate::item::TargetKind::Dir | crate::item::TargetKind::Command
+            ) {
+                continue;
+            }
+            if !anchors.iter().any(|(k, v)| k == kind && v == value) {
+                anchors.push((*kind, value.clone()));
+            }
+        }
+    }
+    let mut seen: HashSet<Vec<String>> = HashSet::new();
+    let mut places: Vec<OutrankedPlace> = Vec::new();
+    for (kind, value) in anchors {
+        let rivals = place_occupants(&candidates, project, kind, &value);
+        if rivals.len() <= crate::item::MAX_ITEMS {
+            continue;
+        }
+        let mut by_id: Vec<String> = rivals.iter().map(|(id, _)| id.clone()).collect();
+        by_id.sort();
+        if !seen.insert(by_id) {
+            continue;
+        }
+        if !place_has_an_honest_exit(store, &rivals) {
+            continue;
+        }
+        let mut ordered: Vec<(bool, u8, &str)> = rivals
+            .iter()
+            .map(|(id, item)| {
+                let refusing = matches!(current_verdict(store, id), CurrentVerdict::RuleProven | CurrentVerdict::RuleWired);
+                (!refusing, crate::item::severity_rank(item.severity), id.as_str())
+            })
+            .collect();
+        ordered.sort();
+        places.push(OutrankedPlace { kind, value, occupants: ordered.into_iter().map(|(_, _, id)| id.to_string()).collect() });
+    }
+    places.sort_by(|a, b| b.occupants.len().cmp(&a.occupants.len()).then_with(|| a.value.cmp(&b.value)));
+    places.truncate(EVALUATION_OUTRANKED_LIST);
+    places
+}
+
+/// The crowded places of `start`'s frozen list that are STILL crowded, each as
+/// (its label, the ids on it now) - what the filing gate holds that report to.
+/// A place settles only by work on the occupants (a fold, a move, a retract:
+/// the count drops to what a block shows); a place that lost its honest exit
+/// since the start is no longer owed. Writes to the frozen occupants are
+/// judged by the same door check as every frozen item (`frozen_ids`).
+pub fn evaluation_outranked_owed(store: &EventStore, start: &EvaluationStart) -> Vec<(String, Vec<String>)> {
+    if start.frozen.outranked.is_empty() {
+        return Vec::new();
+    }
+    let candidates = all_live_items(store);
+    let project = start.frozen.project.as_str();
+    start
+        .frozen
+        .outranked
+        .iter()
+        .filter_map(|place| {
+            let rivals = place_occupants(&candidates, project, place.kind, &place.value);
+            (rivals.len() > crate::item::MAX_ITEMS && place_has_an_honest_exit(store, &rivals))
+                .then(|| (place.label(), rivals.iter().map(|(id, _)| id.clone()).collect()))
+        })
+        .collect()
+}
+
 /// THE OWNER'S GO (step 26). A rule carrying this tag on a `requires` check
 /// is satisfied only by the OWNER's own words: its required literal must stand
 /// in his own message in this session - a real user turn of the transcript,
@@ -3591,7 +3742,23 @@ pub const EVALUATION_REPORT_TAG: &str = "evaluation-report";
 /// `serve::usefulness::JUDGEMENT_DEBT_AFTER` exactly (kept equal by hand:
 /// `model` cannot import it, for the same reason every other constant in this
 /// section is reimplemented rather than shared).
-pub const JUDGEMENT_DEBT_AFTER: usize = 40;
+pub const JUDGEMENT_DEBT_AFTER: usize = 10;
+
+/// The most notes one evaluation's judgement list holds, most-served first
+/// (`evaluation_judgement_list`). Measured 2026-11-01: with a threshold of 40
+/// sessions all 36 evaluation reports of 2026-10-20..11-01 showed "0 item(s)
+/// on the frozen list" while `status` showed 628 notes served again and again
+/// and never marked useful - nobody ever said whether a note helped. A lower
+/// threshold alone would swing to the opposite wall (hundreds of verdicts in
+/// one evaluation, the bulk dodging the batch cap exists to stop), so the list
+/// is capped: five honest verdicts per evaluation; the rest stay owed
+/// store-wide and the next evaluation asks for the next five. Mirrors
+/// `serve::usefulness::EVALUATION_JUDGEMENT_LIST_CAP` (kept equal by a test).
+pub const EVALUATION_JUDGEMENT_LIST_CAP: usize = 5;
+
+/// The most crowded places one evaluation's start note lists
+/// (`outranked_places`), most occupants first.
+pub const EVALUATION_OUTRANKED_LIST: usize = 3;
 
 /// The actor a real delivery is stamped with - mirrors `serve::usefulness::
 /// ASSISTANT_DELIVERY_ACTOR` exactly, same reason.
@@ -4461,7 +4628,7 @@ fn changes_an_item(kind: EventKind) -> bool {
 }
 
 /// Every id on `start`'s frozen lists - judgement, batch, A4 list, disputes to
-/// verify - once each, in that order.
+/// verify, the occupants of its crowded places - once each, in that order.
 pub fn frozen_ids(start: &EvaluationStart) -> Vec<String> {
     let mut seen: HashSet<&str> = HashSet::new();
     start
@@ -4471,6 +4638,7 @@ pub fn frozen_ids(start: &EvaluationStart) -> Vec<String> {
         .chain(start.frozen.batch())
         .chain(start.frozen.a4_list())
         .chain(start.frozen.dispute_list().iter().map(|d| &d.id))
+        .chain(start.frozen.outranked.iter().flat_map(|p| p.occupants.iter()))
         .filter(|id| seen.insert(id.as_str()))
         .cloned()
         .collect()
@@ -4848,6 +5016,12 @@ pub struct Frozen {
     /// minutes without looking.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub fired: BTreeMap<String, Firings>,
+    /// The crowded places of the project at the start (`outranked_places`): at
+    /// most `EVALUATION_OUTRANKED_LIST`, each settled by a real fold, move or
+    /// retract of its occupants (`evaluation_outranked_owed`). Empty for a
+    /// record written before this field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outranked: Vec<OutrankedPlace>,
 }
 
 /// How one item fired in one session (`Frozen::fired`, `session_firings`).
@@ -5120,6 +5294,7 @@ pub fn frozen_now(store: &EventStore, session: &str, project: &str, started_by: 
         void: None,
         superseded: None,
         fired: BTreeMap::new(),
+        outranked: outranked_places(store, project),
     })
     .map(|mut frozen| {
         let mut fired = session_firings(store, session, &frozen.judgement, started_seq);
@@ -5512,9 +5687,11 @@ pub fn not_judgeable_reason<'a>(tags: &'a [String], id: &str) -> Option<&'a str>
 /// must settle, and whether each one already is.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EvaluationJudgement {
-    /// Still owed: fired in this session before the evaluation started, 40+
-    /// times since its last verdict as of that moment, no verdict since, and
-    /// not skipped with a reason.
+    /// Still owed: on the frozen list (fired in this session before the
+    /// evaluation started, in `JUDGEMENT_DEBT_AFTER`+ sessions since its last
+    /// verdict as of that moment, the most-served
+    /// `EVALUATION_JUDGEMENT_LIST_CAP`), no verdict since, and not skipped
+    /// with a reason.
     pub owed: Vec<String>,
     /// Given a verdict since the evaluation started, or no longer live.
     pub settled: Vec<String>,
@@ -5549,6 +5726,11 @@ pub struct EvaluationJudgement {
 /// the evaluation's own writes - and every rule bound to the `remember` moment
 /// they fire - from growing the list while it is being paid.
 ///
+/// THE CAP: at most `EVALUATION_JUDGEMENT_LIST_CAP` items, the most-served
+/// (most sessions) first - never everything that is owed at once. The rest stay
+/// owed store-wide (doctor's judgement debt) and the next evaluation lists the
+/// next ones.
+///
 /// ONLY ATTESTED VERDICTS RESET A COUNT HERE (D9): a verdict whose recorded
 /// verification (`attested_write_seqs`) does not say it came through an
 /// attested THOR call - a `serve mark` from a shell, a side-door client, an
@@ -5580,17 +5762,20 @@ pub fn evaluation_judgement_list(store: &EventStore, project: Option<&str>, sess
     }
     let live = all_live_items(store);
     let live_by_id: HashMap<&str, &Item> = live.iter().map(|(id, it)| (id.as_str(), it)).collect();
-    let mut ids: Vec<String> = sessions_at_start
+    let mut owed: Vec<(usize, String)> = sessions_at_start
         .iter()
         .filter(|(id, sessions)| sessions.len() >= JUDGEMENT_DEBT_AFTER && fired_here.contains(**id))
-        .filter_map(|(id, _)| {
+        .filter_map(|(id, sessions)| {
             let item = live_by_id.get(id)?;
             let pinned = item.bindings.iter().any(|b| matches!(b, Binding::Always));
-            (!pinned && project_applies_to(item.project.as_deref(), project)).then(|| id.to_string())
+            (!pinned && project_applies_to(item.project.as_deref(), project)).then(|| (sessions.len(), id.to_string()))
         })
         .collect();
-    ids.sort();
-    ids
+    // THE CAP: the most-served first, ties by id so the list is the same on
+    // every read of the same log. The rest stay owed store-wide.
+    owed.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    owed.truncate(EVALUATION_JUDGEMENT_LIST_CAP);
+    owed.into_iter().map(|(_, id)| id).collect()
 }
 
 /// The set one evaluation must settle, split by state. `report_tags` are the
@@ -6168,6 +6353,31 @@ fn check_evaluation_report_filing(store: &EventStore, item: &Item, ctx: Option<&
              call settles it, and so does retracting the rule with a reason when it is simply wrong; a tag, a note elsewhere or a \
              report that says it was checked settles nothing",
             disputes_owed.len()
+        ));
+    }
+
+    // THE CROWDED PLACES: the ones the start record froze, settled only by a
+    // real fold, move or retract that brings the place back to what a block
+    // shows. A tag, a reason or a line in the report settles nothing.
+    let crowded_owed = evaluation_outranked_owed(store, start);
+    if !crowded_owed.is_empty() {
+        let named = crowded_owed
+            .iter()
+            .map(|(label, ids)| format!("'{label}' ({} facts: {})", ids.len(), ids.iter().map(|id| format!("'{id}'")).collect::<Vec<_>>().join(", ")))
+            .collect::<Vec<_>>()
+            .join("; ");
+        missing.push(format!(
+            "{} crowded place(s) on this evaluation's frozen list (at most {EVALUATION_OUTRANKED_LIST}, fixed by THOR at \
+             the start) still hold more than the {} facts one block shows, so the lowest ranked of them are outranked and \
+             never shown at their moment: {named}. Make room by doing one of three things to the occupants, until each \
+             place holds {} or fewer: FOLD - revise one occupant to carry another's point, then retract the other with a \
+             reason naming the survivor; MOVE - revise one occupant's bindings to the narrower file or command it is \
+             really about; RETRACT - retract one that is stale, with a reason saying what changed. A fact with no check \
+             gives way before a rule whose check can refuse, and a true check is never cleared to get past this. A tag, a \
+             reason or a line in the report settles nothing",
+            crowded_owed.len(),
+            crate::item::MAX_ITEMS,
+            crate::item::MAX_ITEMS
         ));
     }
 
@@ -10765,6 +10975,201 @@ mod tests {
         declare_scoped(store, &session, "l", "mcp", report, Some(&ctx), Some(&att))
     }
 
+    // ------------------------- the verdict cap and the crowded places (2026-11-01)
+
+    /// A rule bound to the file `path`, for the crowded-place tests. Written
+    /// raw: the write gate refuses a fifth claimant on a full place, and the
+    /// stores this is about were filled before it did.
+    fn at_path(id: &str, project: Option<&str>, path: &str) -> Item {
+        Item {
+            id: id.to_string(),
+            kind: Kind::Rule,
+            text: format!("fixture rule {id} about {path}"),
+            bindings: vec![Binding::Target { kind: TargetKind::Path, value: path.to_string() }],
+            severity: None,
+            project: project.map(str::to_string),
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some("this turns out to be wrong".to_string()),
+            check: None,
+        }
+    }
+
+    /// `at_path`, an informing note: decided by a Note trial.
+    fn put_note_at(store: &mut EventStore, id: &str, project: Option<&str>, path: &str) {
+        let item = at_path(id, project, path);
+        legacy_tried(store, &item, &sealed(&item, RecordedVerdict::Note));
+    }
+
+    /// `at_path`, a costly rule whose check can refuse: decided as a wired rule.
+    fn put_refusing_at(store: &mut EventStore, id: &str, project: Option<&str>, path: &str) {
+        let mut item = at_path(id, project, path);
+        item.severity = Some(Severity::Costly);
+        // The text names the check's literal (A4), or the trial leaves it undecided.
+        item.text = format!("fixture rule {id}: never use --force on {path}");
+        item.check = Some(Check::Forbidden { literals: vec!["--force".to_string()] });
+        legacy_tried(store, &item, &sealed(&item, RecordedVerdict::RuleWired));
+    }
+
+    #[test]
+    fn the_judgement_threshold_and_caps_are_the_owners_numbers() {
+        assert_eq!(JUDGEMENT_DEBT_AFTER, 10);
+        assert_eq!(EVALUATION_JUDGEMENT_LIST_CAP, 5);
+        assert_eq!(EVALUATION_OUTRANKED_LIST, 3);
+    }
+
+    #[test]
+    fn the_judgement_list_holds_at_most_five_items_the_most_served_first() {
+        let mut store = EventStore::in_memory().unwrap();
+        for n in 0..8 {
+            declare_noted(&mut store, &light_command_rule(&format!("cap-rule-{n}"), "cap"));
+            // 10, 11, ... 17 sessions: rule 7 is the most served.
+            serve_in(&mut store, "s", &format!("cap-rule-{n}"), JUDGEMENT_DEBT_AFTER + n);
+        }
+        let list = evaluation_judgement_list(&store, Some("cap"), "s", i64::MAX);
+        assert_eq!(list, ["cap-rule-7", "cap-rule-6", "cap-rule-5", "cap-rule-4", "cap-rule-3"], "{list:?}");
+        assert_eq!(judgement_debt_in_project(&store, Some("cap")).len(), 8, "the rest stays owed store-wide");
+    }
+
+    #[test]
+    fn items_served_in_equally_many_sessions_are_listed_by_id() {
+        let mut store = EventStore::in_memory().unwrap();
+        for id in ["tie-f", "tie-b", "tie-e", "tie-a", "tie-d", "tie-c", "tie-g"] {
+            declare_noted(&mut store, &light_command_rule(id, "tie"));
+            serve_in(&mut store, "s", id, JUDGEMENT_DEBT_AFTER);
+        }
+        let list = evaluation_judgement_list(&store, Some("tie"), "s", i64::MAX);
+        assert_eq!(list, ["tie-a", "tie-b", "tie-c", "tie-d", "tie-e"], "{list:?}");
+    }
+
+    #[test]
+    fn one_session_short_of_the_threshold_is_not_on_the_list_and_the_threshold_is() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare_noted(&mut store, &light_command_rule("short", "t"));
+        declare_noted(&mut store, &light_command_rule("enough", "t"));
+        serve_in(&mut store, "s", "short", JUDGEMENT_DEBT_AFTER - 1);
+        serve_in(&mut store, "s", "enough", JUDGEMENT_DEBT_AFTER);
+        assert_eq!(evaluation_judgement_list(&store, Some("t"), "s", i64::MAX), ["enough"]);
+    }
+
+    #[test]
+    fn a_place_holds_exactly_what_a_block_shows_before_it_is_crowded() {
+        let mut store = EventStore::in_memory().unwrap();
+        for n in 0..crate::item::MAX_ITEMS {
+            put_note_at(&mut store, &format!("full-{n}"), Some("crowd"), "deploy.sh");
+        }
+        assert!(outranked_places(&store, "crowd").is_empty(), "four facts fill a block exactly");
+        put_note_at(&mut store, "full-4", Some("crowd"), "deploy.sh");
+        // A global fact counts for every project, so a project's own five and
+        // one global are six.
+        put_note_at(&mut store, "global-on-it", None, "deploy.sh");
+        let places = outranked_places(&store, "crowd");
+        assert_eq!(places.len(), 1, "{places:?}");
+        assert_eq!((places[0].value.as_str(), places[0].occupants.len()), ("deploy.sh", 6), "{places:?}");
+        assert!(places[0].occupants.contains(&"global-on-it".to_string()), "{places:?}");
+        // Another project sees only the global one of them.
+        assert!(outranked_places(&store, "elsewhere").is_empty());
+    }
+
+    #[test]
+    fn a_crowded_place_lists_its_refusing_rules_first() {
+        let mut store = EventStore::in_memory().unwrap();
+        for n in 0..4 {
+            put_note_at(&mut store, &format!("a-note-{n}"), Some("order"), "go.sh");
+        }
+        put_refusing_at(&mut store, "z-rule", Some("order"), "go.sh");
+        let places = outranked_places(&store, "order");
+        assert_eq!(places[0].occupants[0], "z-rule", "{places:?}");
+    }
+
+    #[test]
+    fn a_place_where_nothing_honest_can_give_way_is_never_listed() {
+        let mut store = EventStore::in_memory().unwrap();
+        // Six heavier refusing rules: every exit would clear a true check.
+        for n in 0..6 {
+            put_refusing_at(&mut store, &format!("hard-{n}"), Some("hard"), "release.sh");
+        }
+        assert!(outranked_places(&store, "hard").is_empty());
+        // Four of them and two informing notes: removing the notes is honest.
+        let mut store = EventStore::in_memory().unwrap();
+        for n in 0..4 {
+            put_refusing_at(&mut store, &format!("hard-{n}"), Some("mix"), "release.sh");
+        }
+        put_note_at(&mut store, "soft-0", Some("mix"), "release.sh");
+        put_note_at(&mut store, "soft-1", Some("mix"), "release.sh");
+        assert_eq!(outranked_places(&store, "mix").len(), 1);
+        // Five of them and one note: removing the note still leaves five.
+        let mut store = EventStore::in_memory().unwrap();
+        for n in 0..5 {
+            put_refusing_at(&mut store, &format!("hard-{n}"), Some("five"), "release.sh");
+        }
+        put_note_at(&mut store, "soft-0", Some("five"), "release.sh");
+        assert!(outranked_places(&store, "five").is_empty());
+    }
+
+    #[test]
+    fn an_evaluation_lists_at_most_three_crowded_places_the_most_crowded_first() {
+        let mut store = EventStore::in_memory().unwrap();
+        for (file, count) in [("a.sh", 5), ("b.sh", 9), ("c.sh", 6), ("d.sh", 7), ("e.sh", 5)] {
+            for n in 0..count {
+                put_note_at(&mut store, &format!("{}-{n}", file.trim_end_matches(".sh")), Some("many"), file);
+            }
+        }
+        let places = outranked_places(&store, "many");
+        let named: Vec<(&str, usize)> = places.iter().map(|p| (p.value.as_str(), p.occupants.len())).collect();
+        assert_eq!(named, [("b.sh", 9), ("d.sh", 7), ("c.sh", 6)]);
+    }
+
+    #[test]
+    fn a_start_freezes_the_crowded_places_and_a_real_retract_settles_one() {
+        let mut store = EventStore::in_memory().unwrap();
+        for n in 0..6 {
+            put_note_at(&mut store, &format!("crowd-{n}"), Some("crowd"), "deploy.sh");
+        }
+        let start = record_start(&mut store, "s", "crowd");
+        assert_eq!(start.frozen.outranked.len(), 1, "{:?}", start.frozen.outranked);
+        let ids = frozen_ids(&start);
+        assert!(ids.contains(&"crowd-0".to_string()) && ids.contains(&"crowd-5".to_string()), "its occupants are frozen: {ids:?}");
+        assert_eq!(evaluation_outranked_owed(&store, &start).len(), 1);
+
+        retract(&mut store, "s", "l", "a", "crowd-5", "stale, the deploy moved to CI", None).unwrap();
+        assert_eq!(evaluation_outranked_owed(&store, &start).len(), 1, "five facts are still more than a block shows");
+        retract(&mut store, "s", "l", "a", "crowd-4", "stale, the deploy moved to CI", None).unwrap();
+        assert!(evaluation_outranked_owed(&store, &start).is_empty(), "four facts fill a block: settled");
+    }
+
+    #[test]
+    fn a_move_settles_a_crowded_place_too() {
+        let mut store = EventStore::in_memory().unwrap();
+        for n in 0..5 {
+            put_note_at(&mut store, &format!("move-{n}"), Some("mv"), "deploy.sh");
+        }
+        let start = record_start(&mut store, "s", "mv");
+        assert_eq!(evaluation_outranked_owed(&store, &start).len(), 1);
+        let before = at_path("move-4", Some("mv"), "deploy.sh");
+        let mut after = before.clone();
+        after.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "scripts/ci.sh".to_string() }];
+        revise(&mut store, "s", "l", "a", &before, &after).unwrap();
+        assert!(evaluation_outranked_owed(&store, &start).is_empty());
+    }
+
+    #[test]
+    fn a_report_is_refused_while_a_crowded_place_is_still_crowded_and_files_once_it_is_not() {
+        let mut store = EventStore::in_memory().unwrap();
+        for n in 0..6 {
+            put_note_at(&mut store, &format!("crowd-{n}"), Some("crowd"), "deploy.sh");
+        }
+        let err = file_now(&mut store, &eval_report("eval-crowd-1", "crowd")).unwrap_err();
+        let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
+        assert!(refusal.problem.contains("1 crowded place(s)") && refusal.problem.contains("'deploy.sh' (6 facts"), "{}", refusal.problem);
+        assert!(refusal.problem.contains("FOLD") && refusal.problem.contains("MOVE") && refusal.problem.contains("RETRACT"), "{}", refusal.problem);
+
+        retract(&mut store, "s", "l", "a", "crowd-5", "stale, the deploy moved to CI", None).unwrap();
+        retract(&mut store, "s", "l", "a", "crowd-4", "stale, the deploy moved to CI", None).unwrap();
+        file_now(&mut store, &eval_report("eval-crowd-1", "crowd")).expect("a place a block can show whole holds nothing back");
+    }
+
     /// B5, B6: a point in the OWNER QUEUE - its subject carried by a valid
     /// evaluation, still blocked at the next start - holds no filing: the
     /// report of that next evaluation files. It counts against the owner's
@@ -11190,6 +11595,7 @@ mod tests {
             void: None,
             superseded: None,
             fired: Default::default(),
+            outranked: Vec::new(),
         };
         assert_eq!(false_block_sweep_line(&frozen), "", "nothing found, nothing said");
         signals.sweep = vec![

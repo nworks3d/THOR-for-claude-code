@@ -1570,6 +1570,7 @@ fn busy_frozen(batch: usize, a4: usize, disputes: usize, blocks: usize, carriers
         void: None,
         superseded: None,
         fired: std::collections::BTreeMap::new(),
+        outranked: Vec::new(),
     }
 }
 
@@ -1619,6 +1620,66 @@ fn a_busy_start_note_shows_every_section_the_session_acts_on_within_the_hook_lim
     // The owner queue is a count and the last three sessions, not 25 sessions.
     assert!(note.contains("carried by 25 valid evaluation(s), the last 3: session"), "{note}");
     assert!(note.matches(" on 2026-10-").count() <= 4, "three carriers and the audit date, not 25 sessions: {note}");
+}
+
+/// The crowded places of a start record as the busiest store makes them: three
+/// places, each with a dozen long-named facts.
+fn crowded_places() -> Vec<model::store::OutrankedPlace> {
+    ["scripts/deploy-to-production.sh", "docker compose up --build --force-recreate", "src/components/billing/InvoiceTable.tsx"]
+        .iter()
+        .enumerate()
+        .map(|(p, value)| model::store::OutrankedPlace {
+            kind: if value.starts_with("docker") { model::item::TargetKind::Command } else { model::item::TargetKind::Path },
+            value: value.to_string(),
+            occupants: (0..12).map(|n| format!("a-rather-long-fact-id-about-the-place-{p}-number-{n:02}")).collect(),
+        })
+        .collect()
+}
+
+/// THE CROWDED PLACES JOIN THE NOTE WITHOUT BREAKING ITS SIZE: three places of
+/// twelve facts, on top of the busiest state the other tests build, still fit
+/// the budget (cut from the far end, never silently), the list is whole when
+/// there is room, and the sections the session acts on survive.
+#[test]
+fn crowded_places_fit_the_start_note_within_the_size_budget() {
+    // A full verdict list and three full places: all shown, with what they mean,
+    // and the places are what a cut takes last of the lists the session acts on
+    // besides the verdicts.
+    let mut frozen = busy_frozen(0, 0, 0, 0, 0, 5);
+    frozen.outranked = crowded_places();
+    let note = render_start_note_within(BUSY_ID, &frozen, START_NOTE_BUDGET);
+    assert!(note.len() <= START_NOTE_BUDGET, "{} bytes", note.len());
+    assert!(
+        !note.contains("of this list are NOT shown here"),
+        "five verdicts and three places lose nothing the session acts on ({} bytes): {note}",
+        note.len()
+    );
+    for must in [
+        "e. CROWDED PLACES - 3 place(s) (at most 3)",
+        "FOLD",
+        "MOVE",
+        "RETRACT",
+        "DONE WHEN: the place holds 4 or fewer facts",
+        "'scripts/deploy-to-production.sh': 12 facts",
+        "'docker compose up --build --force-recreate (command)': 12 facts",
+        "the most-served first, at most 5 per evaluation",
+        "'judged-rule-4'",
+    ] {
+        assert!(note.contains(must), "missing {must}: {note}");
+    }
+
+    // The busiest state of every list at once: the budget still holds, the
+    // batch and the disputes survive, and any cut is named.
+    let mut frozen = busy_frozen(8, 16, 8, 8, 25, 5);
+    frozen.outranked = crowded_places();
+    let note = render_start_note_within(BUSY_ID, &frozen, START_NOTE_BUDGET);
+    assert!(note.len() <= START_NOTE_BUDGET, "{} bytes: {note}", note.len());
+    assert!(note.contains("a. THE BATCH") && note.contains("c. DISPUTES TO VERIFY"), "{note}");
+    assert!(note.contains("NOT shown here"), "a cut says so: {note}");
+    assert!(
+        model::store::EVALUATION_OUTRANKED_LIST == 3 && frozen.outranked.len() == model::store::EVALUATION_OUTRANKED_LIST,
+        "the fixture holds a full list of places"
+    );
 }
 
 /// A note that cannot fit cuts from the least actionable end, and says what it

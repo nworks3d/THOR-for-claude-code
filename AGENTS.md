@@ -1088,9 +1088,10 @@ half an hour or more never counts.
    them. THOR then decides the old rules of the project itself - for up to 20
    seconds - and shows you a note with three parts. If the note says THOR is
    still deciding, end the turn once and read it again.
-   - **Verdicts.** The notes that fired in this session and that went 40 sessions
+   - **Verdicts.** The notes that fired in this session and that went 10 sessions
      or more without a verdict (a note counts once per session, however often it
-     was shown there). Give each one with the THOR tool (`mark`), or skip it
+     was shown there), the most-served first, at most 5 per evaluation (the rest
+     stay owed and the next evaluation lists the next ones). Give each one with the THOR tool (`mark`), or skip it
      honestly by tagging the report `not-judgeable:<id>:<reason>` (a real
      reason of at least 12 characters). A verdict given any other way - a
      command line, a script, another session - settles nothing and is listed
@@ -1125,6 +1126,19 @@ half an hour or more never counts.
      characters); if the rule was right, say so in the report with the id. It is
      done when each one has one of those outcomes in your report. `doctor` shows
      the same rules in one line; `serve --db "<their store>" sweep` shows all of it.
+   - **Crowded places (item e of the teeth section).** A file or command that
+     more than 4 facts are bound to (the project's own and the global ones),
+     so the lowest ranked are outranked and never shown at their moment: a
+     block shows 4 at most. The note lists at most 3 such places with the facts
+     on each. Make room with a real fold (revise one fact to carry another's
+     point, then retract the other with a reason naming the survivor), move
+     (revise one fact's bindings to the narrower file or command it is really
+     about) or retract (one that is stale, with a reason), until the place
+     holds 4 or fewer. A fact with no check gives way before a rule whose check
+     can refuse; never clear a true check to get past it. A place where every
+     fact is a heavier refusing rule is never listed. The report is held
+     until each place is done; a tag, a reason or a line in the report settles
+     nothing.
    - **Open points.** THOR writes and closes these itself, for things only the
      owner can do, such as a project whose working copy is not registered.
      Rules that belong to no project and check a file share ONE open point for

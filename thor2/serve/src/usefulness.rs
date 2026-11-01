@@ -87,11 +87,14 @@ mod tests {
 /// How many SESSIONS an item must have fired in, since its last verdict, before
 /// it is owed one - asked about inside the project's evaluation only, never at
 /// a turn's end (step 28). It counts once per session, however often the item
-/// was shown there (the owner's decision, 2026-10-02: 40 then means about 40
-/// sessions). One number shared by the evaluation's judgement list, the filing
-/// gate and doctor, so none of them can drift from it. High on purpose: this
-/// is about the handful of rules that are in front of a reader constantly, not
-/// about everything served.
+/// was shown there (the owner's decision, 2026-10-02: the number then means
+/// that many sessions). One number shared by the evaluation's judgement list, the filing
+/// gate and doctor, so none of them can drift from it. It was 40 until
+/// 2026-11-01, which was too high to ever ask anything: every evaluation report
+/// of the previous two weeks listed 0 items while hundreds of notes were served
+/// again and again and never judged. The evaluation lists at most
+/// `EVALUATION_JUDGEMENT_LIST_CAP` of the owed notes, most-served first, so the
+/// lower threshold does not turn into a wall of verdicts.
 ///
 /// "SINCE its last verdict", not "with no verdict ever", and the difference
 /// is the whole point. A lifetime judged-set meant one answer settled an
@@ -100,8 +103,13 @@ mod tests {
 /// outranked a reader who would answer differently today. It also made the
 /// cheap answer the damaging one, because the debt asks first about the
 /// items that fire most - exactly the ones whose bindings are worth
-/// revisiting. Forty more firings is a long way to earn a second question.
-pub const JUDGEMENT_DEBT_AFTER: usize = 40;
+/// revisiting. Ten more sessions is a long way to earn a second question.
+pub const JUDGEMENT_DEBT_AFTER: usize = 10;
+
+/// The most notes one evaluation lists for a verdict, most-served first - the
+/// owner's decision of 2026-11-01. Mirrors
+/// `model::store::EVALUATION_JUDGEMENT_LIST_CAP` (kept equal by a test).
+pub const EVALUATION_JUDGEMENT_LIST_CAP: usize = 5;
 
 /// The actor the hook stamps on every delivery (`ItemServed`) it records for
 /// a real assistant session - and the ONLY actor whose firings ever become
@@ -535,6 +543,15 @@ mod judgement_debt_counting_tests {
         for i in 0..times {
             crate::deliver::record_delivery(store, &crate::deliver::nth_session("s", i), "s", ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &[id.to_string()]);
         }
+    }
+
+    /// `model` cannot import this crate's constants, so it keeps its own copies;
+    /// they must never drift apart (the owner's numbers, 2026-11-01).
+    #[test]
+    fn the_judgement_numbers_are_the_same_in_model_and_serve() {
+        assert_eq!(JUDGEMENT_DEBT_AFTER, model::store::JUDGEMENT_DEBT_AFTER);
+        assert_eq!(EVALUATION_JUDGEMENT_LIST_CAP, model::store::EVALUATION_JUDGEMENT_LIST_CAP);
+        assert_eq!((JUDGEMENT_DEBT_AFTER, EVALUATION_JUDGEMENT_LIST_CAP), (10, 5));
     }
 
     #[test]

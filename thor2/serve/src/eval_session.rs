@@ -1128,6 +1128,7 @@ struct Caps {
     disputes: usize,
     blocks: usize,
     sweep: usize,
+    crowded: usize,
     /// List THOR's own open points one by one, or only count them.
     points: bool,
 }
@@ -1141,6 +1142,7 @@ impl Caps {
             disputes: usize::MAX,
             blocks: usize::MAX,
             sweep: usize::MAX,
+            crowded: usize::MAX,
             points: true,
         }
     }
@@ -1177,6 +1179,7 @@ impl Caps {
             || one_above(&mut self.sweep, sweep, 1)
             || one_above(&mut self.disputes, disputes, 1)
             || one(&mut self.batch, frozen.batch().len())
+            || one(&mut self.crowded, frozen.outranked.len())
             || one(&mut self.sweep, sweep)
             || one(&mut self.disputes, disputes)
             || one(&mut self.judgement, frozen.judgement.len())
@@ -1241,6 +1244,9 @@ pub fn lists_cut(id: &str, frozen: &Frozen, budget: usize) -> Vec<&'static str> 
     if frozen.dispute_list().len() > caps.disputes {
         cut.push("disputes");
     }
+    if frozen.outranked.len() > caps.crowded {
+        cut.push("crowded places");
+    }
     cut
 }
 
@@ -1265,13 +1271,14 @@ fn render_note(id: &str, frozen: &Frozen, caps: &Caps) -> String {
         let per_item = if frozen.judgement.len() > model::store::FIRED_FULL_LIST_MAX { 1 } else { model::store::FIRED_TRIGGERS };
         out.push_str(&format!(
             "{} item(s) that fired in this session and had fired in {}+ sessions since their last verdict (a fact counts \
-             once per session): {}. Under each \
+             once per session; the most-served first, at most {} per evaluation, the rest wait for the next one): {}. Under each \
              one is where it fired in this session (its last {per_item} distinct place(s); \
              mcp__thor__get(id: \"<id>\", fired: true) shows its recent firings). Judge each one by whether it \
              belonged THERE, with the THOR tool itself - a verdict from a shell, a script or another session settles \
              nothing:",
             frozen.judgement.len(),
             model::store::JUDGEMENT_DEBT_AFTER,
+            model::store::EVALUATION_JUDGEMENT_LIST_CAP,
             quoted(&frozen.judgement)
         ));
         for item in frozen.judgement.iter().take(caps.judgement) {
@@ -1304,6 +1311,7 @@ fn render_note(id: &str, frozen: &Frozen, caps: &Caps) -> String {
             if let Some(signals) = machine.signals.as_ref().filter(|s| !s.sweep.is_empty()) {
                 sweep_section(&mut out, id, signals, caps);
             }
+            crowded_section(&mut out, id, frozen, caps);
         }
     }
 
@@ -1549,6 +1557,39 @@ fn sweep_section(out: &mut String, record: &str, signals: &model::store::Signals
     }
     if signals.sweep_more > 0 {
         out.push_str(&format!("\n      {} more are named by `serve sweep`, not here.", signals.sweep_more));
+    }
+}
+
+/// Item e of section 2 of the start note: the crowded places of the project
+/// (`Frozen::outranked`), each with the facts that sit on it. Only present when
+/// there are some. Says what it means, the three exits, when an item is done
+/// and an example - a signal without those makes an agent guess.
+fn crowded_section(out: &mut String, record: &str, frozen: &Frozen, caps: &Caps) {
+    let list = &frozen.outranked;
+    if list.is_empty() {
+        return;
+    }
+    let max = model::item::MAX_ITEMS;
+    out.push_str(&format!(
+        "\n   e. CROWDED PLACES - {} place(s) (at most {}) where more than {max} facts apply, so the lowest ranked are \
+         outranked and never shown at their moment. WHAT THIS MEANS: a block shows {max} facts at most; a rule that \
+         lost its place there is silent exactly when it was written for. WHAT TO DO, per place: read its facts \
+         (mcp__thor__get) and do one of three things until it holds {max} or fewer: FOLD - mcp__thor__revise one fact \
+         to carry another's point, then mcp__thor__retract the other with a reason naming the survivor; MOVE - \
+         mcp__thor__revise one fact's bindings to the narrower file or command it is really about; RETRACT - \
+         mcp__thor__retract one that is stale, with a reason. A fact with no check gives way before a rule whose check \
+         can refuse; never clear a check that is true. A place where every fact is a heavier refusing rule is not \
+         listed. DONE WHEN: the place holds {max} or fewer facts; a tag, a reason or a line in the report settles \
+         nothing, and the report is held until every place is done. EXAMPLE: 'deploy.sh' holds 6 facts, two of them \
+         say the same: revise one to carry both, retract the other, retract a stale third.",
+        list.len(),
+        model::store::EVALUATION_OUTRANKED_LIST,
+    ));
+    for place in list.iter().take(caps.crowded) {
+        out.push_str(&format!("\n      - '{}': {} facts, {}", place.label(), place.occupants.len(), quoted(&place.occupants)));
+    }
+    if list.len() > caps.crowded {
+        out.push_str(&more_line(list.len() - caps.crowded, record));
     }
 }
 
@@ -2135,15 +2176,15 @@ mod tests {
         assert!(!note.contains("was not recorded"), "{note}");
     }
 
-    /// The places stay bounded: a judgement list longer than
-    /// `model::store::FIRED_FULL_LIST_MAX` keeps, and shows, one place per
-    /// item.
+    /// The list stays bounded: however many items owe a verdict, the start
+    /// freezes and shows at most `EVALUATION_JUDGEMENT_LIST_CAP` of them (the
+    /// most-served first, here all equal so by id), and says so.
     #[test]
-    fn a_long_judgement_list_keeps_one_place_per_item() {
+    fn a_long_judgement_list_is_cut_to_the_cap() {
         let dir = tempfile::tempdir().unwrap();
         let (db, mut store) = store_with_events(dir.path(), 1);
         let now = crate::time::now_unix();
-        let n = model::store::FIRED_FULL_LIST_MAX + 1;
+        let n = model::store::EVALUATION_JUDGEMENT_LIST_CAP + 4;
         for i in 0..n {
             let id = format!("fx-long-{i:02}");
             noted_rule(&mut store, &id, model::item::Binding::Target { kind: model::item::TargetKind::Command, value: format!("make t{i}") });
@@ -2152,11 +2193,13 @@ mod tests {
             fire_here(&mut store, "sess", &id, 1, now - 300, Some(&format!("make t{i} --new")));
         }
         let started = start(&db, &mut store, "sess", "p", "stop-ask").unwrap();
-        assert_eq!(started.start.frozen.judgement.len(), n);
-        assert!(started.start.frozen.fired.values().all(|f| f.triggers.len() == 1), "one place per item when the list is long");
+        let cap = model::store::EVALUATION_JUDGEMENT_LIST_CAP;
+        let expected: Vec<String> = (0..cap).map(|i| format!("fx-long-{i:02}")).collect();
+        assert_eq!(started.start.frozen.judgement, expected, "{n} owed, the first {cap} by id are frozen");
         let note = start_note(&started.start);
-        assert!(note.contains("fired here 40 time(s); last at: 'make t0 --new'\n"), "{note}");
-        assert!(!note.contains("--old"), "{note}");
+        assert!(note.contains(&format!("the most-served first, at most {cap} per evaluation")), "{note}");
+        assert!(note.contains("fired here 40 time(s); last at: 'make t0 --new' | 'make t0 --old'"), "{note}");
+        assert!(!note.contains(&format!("fx-long-{cap:02}")), "the sixth owed item is not on this evaluation's list: {note}");
     }
 
     /// File a report for `session`'s open evaluation of "p" the way Claude

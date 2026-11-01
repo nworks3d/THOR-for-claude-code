@@ -283,8 +283,9 @@ mcp__thor__ server is the authority.
 
 Your list is the one the start note printed under JUDGEMENT, frozen when the
 evaluation started: exactly the items that fired in THIS session and had
-fired in 40 sessions or more since their last verdict (a fact counts once per
-session). Judge only those. A pinned
+fired in 10 sessions or more since their last verdict (a fact counts once per
+session), the most-served first and at most 5 per evaluation (the next
+evaluation lists the next ones). Judge only those. A pinned
 item is never on it: the owner already answered whether it belongs there by
 pinning it. Never `mark` an item that is not on your frozen list, even if it
 fired in the wrong place: a wrong-place firing off the list goes to step 7 as
@@ -445,6 +446,20 @@ handle only what the start note handed you under TEETH:
   owner and for the next evaluation's item c. You do not verify lists 2 and 3,
   nothing there is owed by you, and a rule of item c does not need to appear in
   them.
+- **CROWDED PLACES (item e of the start note)**: a file or command that more
+  than four facts are bound to, listed with the facts on it (at most three
+  places). WHAT IT MEANS: a block shows four facts at most, so the lowest
+  ranked ones are outranked and silent exactly when they were written for.
+  WHAT TO DO, per place: open the facts (`mcp__thor__get`) and bring the place
+  to four or fewer by one of three real changes - FOLD (revise one fact to
+  carry another's point, then retract the other with a reason naming the
+  survivor), MOVE (revise one fact's bindings to the narrower file or command it
+  is really about) or RETRACT (a stale fact, with a reason saying what
+  changed). A fact with no check gives way before a rule whose check can
+  refuse, and a true check is never cleared to get past this. DONE WHEN: the
+  place holds four or fewer facts. A tag, a reason or a line in the report
+  settles nothing, and the report cannot be filed until every place is done. A
+  place where every fact is a heavier refusing rule is never listed.
 - **A DEMOTION in the batch**: a batch line that starts with "DEMOTION, nothing
   written". WHAT IT MEANS: THOR's matcher (the code that reads a command and
   decides whether a rule refuses it) changed between builds. This rule bit when
