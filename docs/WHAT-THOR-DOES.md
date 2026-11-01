@@ -568,8 +568,9 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
   session's notes are forgotten after 14 days). At a turn end THOR lists the noted files that still exist
   and were last changed more than 30 minutes ago, and holds the turn once: move each reusable one into a
   new sub-folder of the tools folder with a README.txt whose first line says in one sentence what the tool
-  does; any other file stays where it is, is named to the owner in one sentence, and is deleted only after
-  the owner's own yes. Each file is asked about once per session, so a later turn end never
+  does (a new version replaces the old tool there); a throwaway script may be deleted; anything usable or
+  in doubt stays where it is, is named to the owner in one sentence, and is deleted only after the
+  owner's own yes. Each file is asked about once per session, so a later turn end never
   holds for it again. Never for a subagent's stop (but a subagent's writes are noted for the main session),
   and never on a copy of the memory, which takes no state write and so could not remember having asked.
 - Why: a helper script left in a scratch folder is found again by accident or never, and the next session

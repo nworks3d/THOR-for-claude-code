@@ -439,7 +439,7 @@ fn set_work_folders_only(db: Option<PathBuf>, temp: Option<&str>, tools: Option<
             (_, Some(folder)) => {
                 println!("+ tools folder set to {folder} (written in {}).", file.display());
                 println!("  Every session now starts with a list of the helper tools in it, one line per sub-folder, taken from the first line of the README.txt (or README.md) in that sub-folder. Nobody has to keep the list: it is built from the folders.");
-                println!("  A new reusable helper gets its own sub-folder there with a README.txt whose first line says in one sentence what it does. Script files written outside any git repository during a session are asked about once, 30 minutes after they were last changed: keep a useful one in the tools folder, and tell the owner about any other (it is deleted only after the owner's own yes). THOR only reads the folder and deletes nothing.");
+                println!("  A new reusable helper gets its own sub-folder there with a README.txt whose first line says in one sentence what it does. Script files written outside any git repository during a session are asked about once, 30 minutes after they were last changed: keep a useful one in the tools folder (a new version replaces the old tool), delete a throwaway one, and tell the owner about anything usable or in doubt (it is deleted only after the owner's own yes). THOR only reads the folder and deletes nothing.");
                 println!("  To switch this off again: install --set-tools-folder off --db \"{}\"", db.display());
             }
             (_, None) => println!("+ tools folder switched off: no list, no check, no question about leftover scripts. Nothing in the folder was touched."),

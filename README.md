@@ -465,8 +465,9 @@ What you get:
   a git project, not the tools folder and not the temp-until-live folder, and it
   is still there and untouched 30 minutes later, the end of that turn is held
   once. Your assistant is asked to move the useful ones into the tools folder
-  with a README. Any other file stays where it is: your assistant tells you
-  about it and deletes nothing without your own yes. A file is asked about once per
+  with a README (a new version replaces the old tool) and may delete throwaway
+  scripts. Anything useful or in doubt stays where it is: your assistant tells
+  you about it and deletes it only after your own yes. A file is asked about once per
   session, so this can never turn into a loop. Only files written with Claude
   Code's own file tools are noticed; a script created by a shell command
   (`echo ... > x.py`) is not.

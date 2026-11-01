@@ -509,9 +509,10 @@ that out to them in your own words.
   folder. And when you write a script file (`.py`, `.ps1`, `.sh`, `.js` and a few
   more) outside any git repository, and it is still there 30 minutes later, the end
   of the turn is held once: move the reusable ones into the tools folder with a
-  README; any other file stays where it is, you name it for the owner in one
-  sentence, and you delete it only after the owner's own yes. A script made by a
-  shell redirect is not noticed.
+  README (a new version replaces the old tool there); a throwaway script may be
+  deleted; anything usable or in doubt stays where it is, you name it for the
+  owner in one sentence, and you delete it only after the owner's own yes. A
+  script made by a shell redirect is not noticed.
 - Both settings are in `work-folders.json` beside the memory
   (`{"temp_until_live": "...", "temp_max_age_days": 30, "tools": "..."}`, every key
   optional). `install --set-temp-folder off --db "<their store>"` and
@@ -924,7 +925,9 @@ Around a risky step or a tool:
   file, not a one-liner.
 - `keep-only-what-is-needed` - rebuildable things (build output, caches, models,
   installers, scratch and worktree folders, database copies) stay out of a repo and a
-  backup; temporary work is listed for the owner and removed only after his own yes.
+  backup; each session and helper works in its own folder and cleans it up when done;
+  junk goes and a new tool replaces the old; usable or doubtful files go only after
+  the owner's yes.
 - `windowless-processes-on-windows` - background processes start hidden. On a Windows install this
   one REFUSES a `Start-Process` with no `-WindowStyle` or `-NoNewWindow` unless it opens a window the
   user explicitly asked to see (start that one with `-WindowStyle Normal`) or something meant
