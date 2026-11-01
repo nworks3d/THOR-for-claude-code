@@ -83,11 +83,11 @@ pub struct Marker {
     /// fetched from an address (so an unchanged backup is not downloaded again).
     #[serde(default)]
     pub source_commit: String,
-    /// The base address of the replica connector this copy writes through
-    /// (for example `https://mcp.example.com`), when the owner named one.
-    /// Without it the copy looks for the `thor` tool server in Claude Code's
-    /// own `~/.claude.json`. Used by the weekly check on a copy
-    /// (`serve::copy_eval`).
+    /// A sign that this copy has the replica connector wired (any text, for
+    /// example its address), for a connector that is in neither of Claude
+    /// Code's own files. Not needed: a session that uses a connector added in
+    /// claude.ai is recognised by its own transcript. Used by the weekly check
+    /// on a copy (`serve::copy_eval`).
     #[serde(default)]
     pub connector: Option<String>,
 }
@@ -223,7 +223,7 @@ pub fn session_line_with(marker: &Marker, connected: bool) -> String {
     let mut line = match connected {
         true => format!("This machine runs a copy of the memory. Nothing is written into this copy. {CONNECTOR_LINE}"),
         false => String::from(
-            "This machine runs a copy of the memory; the weekly check runs on the main machine. Nothing is written into this copy: a note is saved on the main machine (or queued for it, when this machine is connected to the replica) and shows up here after the next pull.",
+            "This machine runs a copy of the memory; the weekly check runs on the main machine, unless this session has the replica connector's tools (then it is asked here too). Nothing is written into this copy: a note is saved on the main machine (or queued for it, in a session that has those tools) and shows up here after the next pull.",
         ),
     };
     let selection = marker.selection();

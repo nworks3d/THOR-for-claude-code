@@ -469,7 +469,7 @@ fn replica_evaluation_filing_is_queued_with_a_note_on_its_proof_and_still_files_
     let report = json!({"id": "eval-demo-1", "kind": "report", "project": "demo", "tags": ["evaluation-report"], "text": "An evaluation of demo."});
     let mut replica = Replica::start(&fx.db, &inbox);
     let reply = replica.call("remember", report.clone());
-    assert!(reply.starts_with("queued for the main machine") && reply.contains("sent its proof to the main machine"), "{reply}");
+    assert!(reply.starts_with("queued for the main machine") && reply.contains("copy-attestation"), "{reply}");
     drop(replica);
     // On the main machine, in the session that runs the evaluation, through
     // THOR's own tool (step 15): it files.

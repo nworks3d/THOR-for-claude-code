@@ -3,8 +3,9 @@
 //! The real `sync recv --inbox` (the receiver beside the connector) and the
 //! real `sync drain`, over loopback - never the live store, never the NAS. The
 //! queue is filled the way the connector fills it: `inbox::append` of the
-//! report as a captured `remember`, and of the copy's attestation as a
-//! `copy_attest` capture (`mcp::copy_routes`).
+//! report as a captured `remember`, and of the copy's attestation as the
+//! captured `remember` of a note tagged `copy-attestation` (the call the copy's
+//! Stop hands its session, `serve::copy_eval`).
 //!
 //! What must hold: a report counts only when an attestation with its capture id
 //! matches it; a forged, edited or missing attestation never counts and the
@@ -84,7 +85,19 @@ fn report_op(capture: &str, text: &str) -> InboxOp {
 }
 
 fn attestation_op(capture: &str, text: &str) -> InboxOp {
-    let att = CopyAttestation {
+    note_op(&attestation(capture, text))
+}
+
+/// The queued call of the note that carries `att`, as the connector captured it.
+fn note_op(att: &CopyAttestation) -> InboxOp {
+    InboxOp::new(
+        "remember",
+        json!({"id": copy_eval::attestation_id(&att.capture_id), "kind": "report", "project": "demo", "tags": [copy_eval::ATTESTATION_TAG], "text": att.to_text()}),
+    )
+}
+
+fn attestation(capture: &str, text: &str) -> CopyAttestation {
+    CopyAttestation {
         v: copy_eval::ATTESTATION_VERSION,
         session: SESSION.to_string(),
         project: "demo".to_string(),
@@ -96,8 +109,7 @@ fn attestation_op(capture: &str, text: &str) -> InboxOp {
         covered: vec![copy_eval::Covered { tool: "mark".into(), id: "some-note".into(), capture_id: "cap-mark".into() }],
         seal: String::new(),
     }
-    .sealed();
-    InboxOp::new(copy_eval::ATTEST_TOOL, serde_json::to_value(att).unwrap())
+    .sealed()
 }
 
 fn drain(f: &Fixture) -> (bool, String) {
@@ -187,9 +199,9 @@ fn an_attestation_for_another_text_never_counts_and_says_why() {
 fn an_edited_attestation_fails_its_seal() {
     let f = fixture();
     inbox::append(&f.inbox, &report_op("cap-1", TEXT)).unwrap();
-    let mut forged = attestation_op("cap-1", TEXT);
-    forged.args["session"] = json!("99999999-2222-4333-8444-555555555555");
-    inbox::append(&f.inbox, &forged).unwrap();
+    let mut forged = attestation("cap-1", TEXT);
+    forged.session = "99999999-2222-4333-8444-555555555555".to_string();
+    inbox::append(&f.inbox, &note_op(&forged)).unwrap();
 
     let (ok, out) = drain(&f);
 
@@ -233,4 +245,39 @@ fn a_replayed_batch_does_not_file_the_report_twice() {
     assert!(ok, "{out}");
     assert!(out.contains("already known"), "{out}");
     assert_eq!(counted(&f).as_deref(), Some("eval-demo-1"));
+}
+
+/// The proof is read, never kept: the attestation note is not a memory item on
+/// the main log, and a note whose text is no attestation is parked, not lost.
+#[test]
+fn the_attestation_note_is_not_stored_and_a_mangled_one_is_parked() {
+    let f = fixture();
+    inbox::append(&f.inbox, &report_op("cap-1", TEXT)).unwrap();
+    inbox::append(&f.inbox, &attestation_op("cap-1", TEXT)).unwrap();
+    let (ok, out) = drain(&f);
+    assert!(ok, "{out}");
+    assert_eq!(counted(&f).as_deref(), Some("eval-demo-1"));
+    let store = EventStore::open_existing(&f.main).unwrap();
+    assert!(model::store::show(&store, "eval-attest-cap-1").is_err(), "the proof note itself is not on the log");
+
+    let mangled = InboxOp::new(
+        "remember",
+        json!({"id": "eval-attest-cap-2", "kind": "report", "project": "demo", "tags": ["copy-attestation"], "text": "I sent the proof."}),
+    );
+    inbox::append(&f.inbox, &mangled).unwrap();
+    let (ok, out) = drain(&f);
+    assert!(!ok, "a proof nobody can read is a failed drain, not a silent one: {out}");
+    assert!(out.contains("copy attestation does not parse") && out.contains("1 NOT applied") && out.contains("stranded-captures"), "{out}");
+}
+
+/// An attestation a 2.6.2 connector queued from its `/copy/attest` route is
+/// still read.
+#[test]
+fn an_attestation_queued_by_an_older_connector_still_counts() {
+    let f = fixture();
+    inbox::append(&f.inbox, &report_op("cap-1", TEXT)).unwrap();
+    inbox::append(&f.inbox, &InboxOp::new(copy_eval::LEGACY_ATTEST_TOOL, serde_json::to_value(attestation("cap-1", TEXT)).unwrap())).unwrap();
+    let (ok, out) = drain(&f);
+    assert!(ok, "{out}");
+    assert_eq!(counted(&f).as_deref(), Some("eval-demo-1"), "{out}");
 }

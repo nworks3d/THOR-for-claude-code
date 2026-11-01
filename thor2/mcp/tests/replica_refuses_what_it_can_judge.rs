@@ -24,7 +24,7 @@ fn replica() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
 
 /// Owner decision 2026-10-26 ("the report is made where the session runs"): a
 /// weekly-check report is no longer refused at a replica. It is queued, and
-/// the reply says it counts once the copy's Stop has sent its proof. The
+/// the reply says it counts once the main machine has its proof. The
 /// main machine holds it until the attestation arrives (`ops::drain`).
 #[test]
 fn a_weekly_check_report_is_queued_with_a_note_on_how_it_counts() {
@@ -35,19 +35,19 @@ fn a_weekly_check_report_is_queued_with_a_note_on_how_it_counts() {
         json!({"id": "eval-demo-1", "kind": "report", "project": "demo", "tags": ["evaluation-report"], "text": "An evaluation of demo."}),
     );
     assert!(reply.starts_with("queued for the main machine (remember, capture "), "{reply}");
-    assert!(reply.contains("weekly-check report") && reply.contains("sent its proof"), "{reply}");
+    assert!(reply.contains("weekly-check report") && reply.contains("copy-attestation"), "{reply}");
     assert_eq!(queued(&inbox).len(), 1, "queued");
 }
 
-/// The copy's Stop hook speaks plain HTTP to the connector: a ping, and the
-/// attestation, queued into the same inbox as a `copy_attest` capture. What is
-/// not an attestation is refused and queues nothing.
+/// The copy's proof travels through the same tool as the report: a note tagged
+/// `copy-attestation` whose text is the sealed attestation, copied exactly. It
+/// queues as an ordinary write (not as an evaluation report, which would need
+/// its own proof), and one that was changed on the way is refused on the spot
+/// with nothing queued.
 #[test]
-fn the_connector_queues_a_copys_attestation_and_refuses_anything_else() {
+fn a_copys_attestation_note_is_queued_and_a_changed_one_is_refused() {
     let (_tmp, db, inbox) = replica();
-    let r = Replica::start(&db, &inbox);
-    assert_eq!(r.http("GET", "/copy/ping", "").0, 200, "the ping answers");
-
+    let mut r = Replica::start(&db, &inbox);
     let att = serve::copy_eval::CopyAttestation {
         v: serve::copy_eval::ATTESTATION_VERSION,
         session: "11111111-2222-4333-8444-555555555555".to_string(),
@@ -61,17 +61,20 @@ fn the_connector_queues_a_copys_attestation_and_refuses_anything_else() {
         seal: String::new(),
     }
     .sealed();
-    let (code, _) = r.http("POST", "/copy/attest", &serde_json::to_string(&att).unwrap());
-    assert_eq!(code, 200);
+    let note = |text: &str, id: &str| json!({"id": id, "kind": "report", "project": "demo", "tags": ["copy-attestation"], "text": text});
+
+    let reply = r.call("remember", note(&att.to_text(), "eval-attest-cap-1"));
+    assert!(reply.starts_with("queued for the main machine (remember, capture ") && !reply.contains("weekly-check report"), "{reply}");
     let ops = queued(&inbox);
     assert_eq!(ops.len(), 1);
-    assert_eq!(ops[0].tool, "copy_attest");
-    assert_eq!(ops[0].args["capture_id"], "cap-1");
+    assert!(serve::copy_eval::is_copy_attestation(&ops[0]) && !serve::copy_eval::is_copy_report(&ops[0]));
 
-    let (code, why) = r.http("POST", "/copy/attest", "{\"not\": \"an attestation\"}");
-    assert_eq!(code, 400, "{why}");
-    let (code, _) = r.http("POST", "/copy/attest", "no json at all");
-    assert_eq!(code, 400);
+    let reply = r.call("remember", note(&att.to_text().replace("toolu_1", "toolu_2"), "eval-attest-cap-1"));
+    assert!(reply.starts_with("REFUSED:") && reply.contains("own seal"), "{reply}");
+    let reply = r.call("remember", note("The proof was sent.", "eval-attest-cap-1"));
+    assert!(reply.starts_with("REFUSED:") && reply.contains("copied exactly"), "{reply}");
+    let reply = r.call("remember", note(&att.to_text(), "my-own-id"));
+    assert!(reply.starts_with("REFUSED:") && reply.contains("eval-attest-cap-1"), "{reply}");
     assert_eq!(queued(&inbox).len(), 1, "nothing else was queued");
 }
 

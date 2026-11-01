@@ -409,28 +409,36 @@ sessions arrives. The copy is a derivative with a hash chain of its own, so
 `doctor` verifies it like any memory.
 
 **The weekly check on a copy.** A copy cannot start an evaluation on its own
-log, but when the person's Claude Code also has the remote connection to their
-memory (the `thor` tool server is an `http` one, or the copy's `thor-copy.json`
-names it with `"connector": "<address>"`), the copy's Stop asks the weekly check
-again, by the same rhythm as the main machine (the plan's cadence, ten minutes of
-the session's own work, never the first turn). The ask is the copy's own and
+log, but in a session where the person's assistant has the remote connection to
+their memory (the replica connector's `thor` tools, however it was added: in
+Claude's connector settings, or as an `http` tool server in Claude Code), the
+copy's Stop asks the weekly check again, by the same rhythm as the main machine
+(the plan's cadence, ten minutes of the session's own work, never the first
+turn). Nobody has to name the connector's web address: THOR sees the connection
+in the session's own transcript (a THOR tool was called, a reply said "queued
+for the main machine", or the tool list names THOR's tools). A session with no
+sign of it is left alone, and nothing is said. The ask is the copy's own and
 says what to do step by step: mark the notes that helped or did not belong,
 correct or retract wrong ones, and file the report with `mcp__thor__remember`
 (kind `report`, tag `evaluation-report`, id `eval-<project>-<date>`); the
 connector queues all of it. At the next Stop THOR reads the session's own
 transcript, sees that filing call and its "queued ... capture <id>" result, and
-sends a sealed proof (session, tool-use id, capture id, sha256 of the report
-text) to the connector. The main machine holds the queued report until the
-proof arrives and matches it (`sync drain`); then it files the report with a
-machine section that says plainly what a copy's evaluation covers (the
-session's own verdicts and corrections) and what stays owed on the main machine
-(the frozen verdict list, the batch and A4 list, the disputes, the false-block
-sweep), and the report counts. A proof that does not match, or none within a day,
-files it as not counting, with the reason. If the connector cannot be reached,
-nothing is held; one line says the check is asked again when the connection is
-back. Tell the person none of this unless they ask; just say what you are doing
-when you are held ("filing the weekly report through the connection"), and
-that nothing is needed from them.
+holds the turn once more with the exact call that sends the proof: the same
+`mcp__thor__remember` tool, kind `report`, id `eval-attest-<capture id>`, tag
+`copy-attestation`, and as the text the sealed proof (session, tool-use id,
+capture id, sha256 of the report text) exactly as printed. Copy it character for
+character; the connector refuses a text that was changed and says so, and then
+you repeat the call. THOR holds that turn only once for a report. The main
+machine holds the queued report until the proof note arrives and matches it
+(`sync drain`, which reads the note and does not keep it); then it files the
+report with a machine section that says plainly what a copy's evaluation covers
+(the session's own verdicts and corrections) and what stays owed on the main
+machine (the frozen verdict list, the batch and A4 list, the disputes, the
+false-block sweep), and the report counts. A proof that does not match, or none
+within a day, files it as not counting, with the reason. Tell the person none of
+this unless they ask; just say what you are doing when you are held ("filing
+the weekly report through the connection", "sending the proof of it"), and that
+nothing is needed from them.
 
 Later refreshes are a single command, `sync pull --db "<the copy>"`: the copy
 remembers its backup and its selection, so nothing else is named. A pull also

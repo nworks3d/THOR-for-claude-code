@@ -5,30 +5,39 @@
 //! report the way the main machine does. What it CAN do is what a session on
 //! it already does: call the THOR tool server, which on a copy is the replica
 //! connector, and the connector QUEUES every write for the main machine.
-//! This module is the rest of that road, in two halves.
+//! This module is the rest of that road, in two halves. Nothing here needs the
+//! connector's address: a session's THOR tools may come from a connector that
+//! is added in claude.ai (Claude's own signed-in connection), whose address
+//! is stored nowhere on the machine and which only that connection can pass.
+//! So the proof travels through the SAME tool as the report.
 //!
 //! THE COPY'S HALF (`copy_stop`, run by the Stop hook):
 //!
 //! 1. When the project is due (the same rhythm as the main machine: the cadence
 //!    of the plan, ten minutes of the session's own work, never its first Stop,
-//!    `usefulness::stop_decision`) and the connector answers, the Stop holds the
-//!    turn with a copy-specific ask: judge, correct, and file the report with
-//!    `mcp__thor__remember` (kind report, tag evaluation-report). The connector
-//!    queues it and answers "queued ... capture <id>".
+//!    `usefulness::stop_decision`) and the session is connected (`connected`:
+//!    a configured connector, or THOR tools in this session's own transcript),
+//!    the Stop holds the turn with a copy-specific ask: judge, correct, and
+//!    file the report with `mcp__thor__remember` (kind report, tag
+//!    evaluation-report). The connector queues it and answers "queued ...
+//!    capture <id>".
 //! 2. At the next Stop, THOR reads Claude Code's own transcript of the session
 //!    (`find_filing`): the filing must be a real tool call of that session with
 //!    a non-error result naming its queue capture id. It then builds an
 //!    ATTESTATION (`CopyAttestation`: session, project, report id, tool-use id,
 //!    capture id, the sha256 of the report text, the transcript time of the
 //!    result, the session's other queued writes, and a seal over all of it)
-//!    and posts it to the connector (`POST <connector>/copy/attest`), which
-//!    queues it in the SAME inbox as a `copy_attest` call. No MCP client is
-//!    needed: the Stop speaks plain HTTP (`Net`).
+//!    and holds the turn ONCE more, with the exact `remember` call that sends
+//!    it (`proof_text`): kind report, id `eval-attest-<capture id>`, tag
+//!    `copy-attestation`, the attestation as the text. The connector queues
+//!    that call like any write. It is never held a second time for the same
+//!    capture.
 //!
 //! THE MAIN MACHINE'S HALF (`settle`, run by `sync drain`): a queued
 //! evaluation report is not replayed as an ordinary `remember` (it would be
 //! refused: no evaluation start is open on this log for it). It is HELD until
-//! an attestation with its capture id arrives. Then `verify` compares the two:
+//! the queued attestation note with its capture id arrives (`is_copy_attestation`;
+//! it is read, never stored as a memory item). Then `verify` compares the two:
 //! the seal, the capture id, the report id, the project and the sha256 of the
 //! queued text. A match files the report with the machine section THOR composes
 //! from the attestation (`machine_lines`) and a valid validator record, so the
@@ -45,9 +54,10 @@
 //! main machine, whose own weekly check settles them.
 //!
 //! WHAT THIS DOES NOT PROVE. The connector carries no auth of its own (the
-//! tunnel is the gate), so the attestation proves that the report is the one
-//! the copy's Stop verified in a transcript, not who sent it. A forged one
-//! needs the connector's address and a report that was really queued.
+//! tunnel or Claude's connection is the gate), so the attestation proves that
+//! the report is the one the copy's Stop verified in a transcript, not who
+//! sent it. A forged one needs a connection to the connector and a report
+//! that was really queued, and the seal stops an edited one.
 
 use crate::attest;
 use model::item::{Item, Kind};
@@ -58,8 +68,13 @@ use std::path::{Path, PathBuf};
 use thor_core::event_store::EventStore;
 use thor_core::inbox::InboxOp;
 
-/// The captured call name of an attestation in the connector's inbox.
-pub const ATTEST_TOOL: &str = "copy_attest";
+/// The tag of the queued note that carries an attestation (a Report written
+/// with `remember`, never stored as a memory item: the drain reads it).
+pub const ATTESTATION_TAG: &str = "copy-attestation";
+/// The captured call name a 2.6.2 connector gave an attestation posted to its
+/// `/copy/attest` route. Nothing writes it any more; the drain still reads one
+/// that is already queued, and the version guard still lets it through.
+pub const LEGACY_ATTEST_TOOL: &str = "copy_attest";
 /// The format of `CopyAttestation`.
 pub const ATTESTATION_VERSION: u32 = 1;
 /// How long a held report waits for its attestation before it is filed dead.
@@ -69,8 +84,6 @@ pub const WAIT_FOR_ATTESTATION_SECS: i64 = 24 * 3600;
 pub const SUPPRESS_AFTER_SEND_SECS: i64 = 24 * 3600;
 /// How many times one turn is held again for a report that is not filed.
 pub const MAX_REHOLDS: u32 = 2;
-/// How long an unreachable connector is left alone before the next try.
-const UNREACHABLE_BACKOFF_SECS: i64 = 600;
 const QUEUED_PREFIX: &str = "queued for the main machine (";
 const REPORT_TAG: &str = model::store::EVALUATION_REPORT_TAG;
 
@@ -135,6 +148,41 @@ impl CopyAttestation {
         self.seal = self.seal_of();
         self
     }
+
+    /// The attestation as the text of the note that carries it: one line.
+    pub fn to_text(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    /// An attestation from the text of a note. The text between the first `{`
+    /// and the last `}` is read, so a session that wrapped the line in a code
+    /// fence still sends a proof; a changed word still breaks the seal.
+    pub fn from_text(text: &str) -> Result<Self, String> {
+        let (Some(from), Some(to)) = (text.find('{'), text.rfind('}')) else { return Err("the text holds no attestation".to_string()) };
+        serde_json::from_str(&text[from..=to.max(from)]).map_err(|e| e.to_string())
+    }
+}
+
+/// The replica connector's on-the-spot check of a note tagged
+/// `copy-attestation`: the text must be an attestation that still matches its
+/// own seal, written under the id and project it names. A session that
+/// paraphrased it hears so now, while it can still repeat the call, instead of
+/// in a drain report nobody reads.
+pub fn check_attestation_note(id: &str, project: Option<&str>, text: &str) -> Result<(), String> {
+    let att = CopyAttestation::from_text(text).map_err(|why| {
+        format!("REFUSED: a copy-attestation note must carry the attestation THOR printed, copied exactly, as its text ({why}). Nothing was queued; call it again with the text as printed.")
+    })?;
+    if att.seal != att.seal_of() {
+        return Err("REFUSED: this attestation does not match its own seal - a character of it was changed. Nothing was queued; copy the text exactly as THOR printed it and call again.".to_string());
+    }
+    if id != attestation_id(&att.capture_id) || project != Some(att.project.as_str()) {
+        return Err(format!(
+            "REFUSED: this attestation belongs under id '{}' and project '{}'. Nothing was queued; call again with those.",
+            attestation_id(&att.capture_id),
+            att.project
+        ));
+    }
+    Ok(())
 }
 
 /// Whether the attestation `att` is the proof of the queued report `op`, and
@@ -209,111 +257,79 @@ pub fn machine_lines(att: Option<&CopyAttestation>, verdict: &Result<(), String>
     out
 }
 
-// -------------------------------------------------------- the transport (copy)
+// ------------------------------------------------------- is this session connected
 
-/// What the Stop needs from the network: one GET to see the connector answer,
-/// one POST of the attestation. Behind a trait so a test needs no server.
-pub trait Net {
-    fn get(&self, url: &str) -> Result<(), String>;
-    fn post_json(&self, url: &str, body: &str) -> Result<(), String>;
+/// Whether this copy has a replica connector WIRED: the copy marker's
+/// `connector` (any text), else a `thor` tool server of Claude Code's
+/// `~/.claude.json` that is an http one. A connector added in claude.ai is in
+/// neither place - `session_has_connector` sees that one.
+pub fn connector_configured(db: &Path) -> bool {
+    let named = thor_core::copy_mode::read_marker(db).connector.is_some_and(|c| !c.trim().is_empty());
+    named || crate::plan::default_claude_json().is_some_and(|path| connector_in(&path))
 }
 
-/// The real transport: plain `http://` over a socket (the LAN or a loopback
-/// connector), `https://` through the system's own `curl` (a tunnel in front
-/// of the connector), both under a few seconds' limit, no console window.
-pub struct RealNet;
-
-const NET_LIMIT: std::time::Duration = std::time::Duration::from_secs(4);
-
-impl Net for RealNet {
-    fn get(&self, url: &str) -> Result<(), String> {
-        request("GET", url, None)
-    }
-    fn post_json(&self, url: &str, body: &str) -> Result<(), String> {
-        request("POST", url, Some(body))
-    }
+/// `connector_configured`, for one Claude Code config file.
+pub fn connector_in(claude_json: &Path) -> bool {
+    let Some(root) = std::fs::read_to_string(claude_json).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()) else { return false };
+    root.get("mcpServers")
+        .and_then(|servers| servers.get("thor"))
+        .and_then(|server| server.get("url"))
+        .and_then(Value::as_str)
+        .is_some_and(|url| url.starts_with("http://") || url.starts_with("https://"))
 }
 
-fn request(method: &str, url: &str, body: Option<&str>) -> Result<(), String> {
-    match url.strip_prefix("http://") {
-        Some(rest) => plain_http(method, rest, body),
-        None if url.starts_with("https://") => curl(method, url, body),
-        None => Err(format!("'{url}' is not an http or https address")),
-    }
+/// The THOR tools that name a THOR server on their own: the writes, and the
+/// code tools and the library tool no other memory server has.
+const THOR_TOOLS: &[&str] = &["remember", "revise", "retract", "mark", "pin", "unpin", "resolve", "shelve", "where_used", "search_code", "outline", "library"];
+
+fn is_thor_tool(name: &str) -> bool {
+    name.rsplit_once("__").is_some_and(|(server, tool)| server.starts_with("mcp__") && THOR_TOOLS.contains(&tool))
 }
 
-fn plain_http(method: &str, rest: &str, body: Option<&str>) -> Result<(), String> {
-    use std::io::{Read, Write};
-    use std::net::ToSocketAddrs;
-    let (host, path) = match rest.split_once('/') {
-        Some((host, path)) => (host, format!("/{path}")),
-        None => (rest, "/".to_string()),
-    };
-    let target = if host.contains(':') { host.to_string() } else { format!("{host}:80") };
-    let addr = target.to_socket_addrs().map_err(|e| format!("{host}: {e}"))?.next().ok_or_else(|| format!("{host}: no address"))?;
-    let mut stream = std::net::TcpStream::connect_timeout(&addr, NET_LIMIT).map_err(|e| format!("{host}: {e}"))?;
-    let _ = stream.set_read_timeout(Some(NET_LIMIT));
-    let _ = stream.set_write_timeout(Some(NET_LIMIT));
-    let payload = body.unwrap_or("");
-    let head = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-        payload.len()
-    );
-    stream.write_all(head.as_bytes()).and_then(|_| stream.write_all(payload.as_bytes())).map_err(|e| format!("{host}: {e}"))?;
-    let mut reply = Vec::new();
-    let _ = stream.take(64 * 1024).read_to_end(&mut reply);
-    let text = String::from_utf8_lossy(&reply);
-    let status = text.lines().next().and_then(|l| l.split_whitespace().nth(1)).and_then(|s| s.parse::<u16>().ok());
-    match status {
-        Some(code) if (200..300).contains(&code) => Ok(()),
-        Some(code) => Err(format!("{host} answered {code}")),
-        None => Err(format!("{host} did not answer")),
+/// WHETHER THIS SESSION HAS THE REPLICA CONNECTOR'S TOOLS, from its own
+/// transcript (a hook cannot ask Claude Code what tools a session has). Any of:
+/// a call of a THOR tool; a result saying "queued for the main machine (...)"
+/// (the replica's own reply); or a tool list (`deferred_tools_delta`) naming
+/// THOR's `remember` and `where_used` on one server. A tool of a session whose
+/// tools are not deferred leaves no trace until it is used, so such a session
+/// is not asked before then.
+pub fn session_has_connector(files: &[PathBuf]) -> bool {
+    use std::io::{BufRead, BufReader};
+    for file in files {
+        let Ok(handle) = std::fs::File::open(file) else { continue };
+        for line in BufReader::new(handle).lines() {
+            let Ok(line) = line else { break };
+            if !line.contains("mcp__") && !line.contains(QUEUED_PREFIX) {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+            if lists_thor_tools(&v) {
+                return true;
+            }
+            let Some(blocks) = v.get("message").and_then(|m| m.get("content")).and_then(Value::as_array) else { continue };
+            for block in blocks {
+                let kind = block.get("type").and_then(Value::as_str);
+                let called = kind == Some("tool_use") && block.get("name").and_then(Value::as_str).is_some_and(is_thor_tool);
+                let queued = kind == Some("tool_result") && attest::result_text(block.get("content")).contains(QUEUED_PREFIX);
+                if called || queued {
+                    return true;
+                }
+            }
+        }
     }
+    false
 }
 
-fn curl(method: &str, url: &str, body: Option<&str>) -> Result<(), String> {
-    let mut command = std::process::Command::new("curl");
-    command.args(["--silent", "--show-error", "--fail", "--max-time", "6", "-o"]);
-    command.arg(if cfg!(windows) { "NUL" } else { "/dev/null" });
-    command.args(["-X", method]);
-    if let Some(body) = body {
-        command.args(["-H", "Content-Type: application/json", "--data-binary", body]);
-    }
-    command.arg(url);
-    command.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
-    let output = command.output().map_err(|e| format!("curl could not run: {e}"))?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let why = String::from_utf8_lossy(&output.stderr);
-    Err(why.lines().next().unwrap_or("curl failed").trim().to_string())
-}
-
-/// The connector's base address (no trailing slash, no `/mcp`): the copy
-/// marker's `connector`, else the `thor` tool server of Claude Code's
-/// `~/.claude.json` when it is an http server. `None` when this copy has no
-/// connector - the weekly check then stays on the main machine.
-pub fn connector_base(db: &Path) -> Option<String> {
-    let named = thor_core::copy_mode::read_marker(db).connector.map(|c| c.trim().to_string()).filter(|c| !c.is_empty());
-    named.map(|c| clean_base(&c)).or_else(|| connector_in(&crate::plan::default_claude_json()?))
-}
-
-/// `connector_base`, from one Claude Code config file.
-pub fn connector_in(claude_json: &Path) -> Option<String> {
-    let root: Value = serde_json::from_str(&std::fs::read_to_string(claude_json).ok()?).ok()?;
-    let server = root.get("mcpServers")?.get("thor")?;
-    let url = server.get("url")?.as_str()?;
-    (url.starts_with("http://") || url.starts_with("https://")).then(|| clean_base(url))
-}
-
-fn clean_base(url: &str) -> String {
-    let url = url.trim().trim_end_matches('/');
-    url.strip_suffix("/mcp").unwrap_or(url).trim_end_matches('/').to_string()
+/// A `deferred_tools_delta` attachment (Claude Code's list of the tools a
+/// session has, written when they are announced) that names `remember` and
+/// `where_used` of one MCP server.
+fn lists_thor_tools(line: &Value) -> bool {
+    let Some(attachment) = line.get("attachment").filter(|a| a.get("type").and_then(Value::as_str) == Some("deferred_tools_delta")) else { return false };
+    let Some(names) = attachment.get("addedNames").and_then(Value::as_array) else { return false };
+    let names: Vec<&str> = names.iter().filter_map(Value::as_str).collect();
+    let servers_with = |tool: &str| -> HashSet<&str> { names.iter().filter_map(|n| n.strip_suffix(tool)?.strip_suffix("__")).collect() };
+    let withwhere = servers_with("where_used");
+    servers_with("remember").iter().any(|server| server.starts_with("mcp__") && withwhere.contains(server))
 }
 
 // ------------------------------------------------- the copy reading its transcript
@@ -454,9 +470,6 @@ pub fn find_filing(files: &[PathBuf], session: &str, project: Option<&str>) -> F
 pub struct CopyEvalState {
     #[serde(default)]
     pub asks: BTreeMap<String, Ask>,
-    /// Do not try the connector again before this unix time.
-    #[serde(default)]
-    pub unreachable_until: i64,
 }
 
 /// One weekly check asked of one session in one project.
@@ -466,6 +479,8 @@ pub struct Ask {
     pub asked_unix: i64,
     #[serde(default)]
     pub holds: u32,
+    /// When the session was handed the call that sends the proof of its
+    /// report (held for once, never again for the same ask).
     #[serde(default)]
     pub sent_unix: Option<i64>,
     #[serde(default)]
@@ -512,8 +527,9 @@ fn ask_text(project: &str, date: &str) -> String {
          2. File the report with the THOR tool and only with it: mcp__thor__remember(id: \"eval-{project}-{date}\", kind: \"report\", \
          project: \"{project}\", tags: [\"evaluation-report\"], text: your own summary in plain words - what you judged, what you \
          corrected, and anything that chafed). Do not write a machine section; the main machine adds it.\n\
-         3. End the turn once. THOR checks the filing against this session's own transcript and sends proof of it to the main \
-         machine; the report counts when the main machine has applied the queue, within the hour.\n\
+         3. End the turn once. THOR then checks the filing against this session's own transcript and hands you one more call to \
+         make: the proof of the filing, for the main machine. Make that call and end the turn again; the report counts when the main \
+         machine has applied the queue, within the hour.\n\
          The parts of an evaluation that live on the main machine (the frozen verdict list, the batch of rules for the teeth trial, \
          the disputes and the false-block sweep) are not part of an evaluation made here: they stay owed there and its own weekly \
          check settles them."
@@ -528,10 +544,29 @@ fn rehold_text(project: &str, left: u32) -> String {
     )
 }
 
-fn sent_line(report: &str) -> String {
+/// The id of the note that carries the attestation of the report queued as
+/// `capture_id`.
+pub fn attestation_id(capture_id: &str) -> String {
+    format!("eval-attest-{capture_id}")
+}
+
+/// The hold that hands the session the call that sends its proof: the exact
+/// `remember` arguments, the attestation as the text.
+fn proof_text(att: &CopyAttestation) -> String {
     format!(
-        "[THOR] Your weekly-check report '{report}' was sent to the main machine with its proof, taken from this session's own \
-         transcript. It counts once the main machine has applied the queue, within the hour; nothing more is needed from you."
+        "[THOR] Your weekly-check report '{report}' is filed and queued. One more call sends the main machine the proof of it \
+         (a copy-attestation, taken from this session's own transcript). Tell the owner in one plain sentence that you are sending \
+         the proof of the weekly check; nothing is needed from them. Then call mcp__thor__remember with exactly these arguments and \
+         end the turn. Copy the text character for character: do not change, wrap, shorten or explain it, because the main machine \
+         refuses a proof that was edited.\n\
+         id: \"{id}\"\nkind: \"report\"\nproject: \"{project}\"\ntags: [\"{tag}\"]\ntext: {text}\n\
+         The connector queues it like any other write; the main machine reads it to file your report and does not keep it as a note. \
+         You are not held for it again. The report counts once the main machine has applied the queue, within the hour.",
+        report = att.report,
+        id = attestation_id(&att.capture_id),
+        project = att.project,
+        tag = ATTESTATION_TAG,
+        text = att.to_text()
     )
 }
 
@@ -539,43 +574,26 @@ fn sent_line(report: &str) -> String {
 /// the project the Stop was counted in; `transcripts` the root of Claude Code's
 /// transcripts; `may_ask` is false at a Stop that may not start a new ask (a
 /// second pass of a held turn, or a transcript THOR cannot read). Nothing here
-/// writes the store, and nothing is held while no connector is configured or
-/// reachable.
-pub fn copy_stop(
-    db: &Path,
-    session: &str,
-    folder_project: Option<&str>,
-    transcripts: Option<&Path>,
-    now: i64,
-    may_ask: bool,
-    net: &dyn Net,
-) -> CopyStop {
-    let (Some(base), Some(root)) = (connector_base(db), transcripts) else { return CopyStop::Quiet };
+/// writes the store, and nothing is held for a session that shows no sign of
+/// the connector's tools (`session_has_connector`, `connector_configured`).
+pub fn copy_stop(db: &Path, session: &str, folder_project: Option<&str>, transcripts: Option<&Path>, now: i64, may_ask: bool) -> CopyStop {
+    let Some(root) = transcripts else { return CopyStop::Quiet };
     let _hold = crate::store_dir::hold_copy(db);
     let mut state = read_state(db);
-    // The ask this session already holds: send its proof when the report is
-    // filed, hold again while it is not (a bounded number of times).
+    // The ask this session already holds: hand it the call that sends the
+    // proof when its report is filed, hold again while it is not (a bounded
+    // number of times).
     let open = state.asks.iter().find(|(_, a)| a.session == session && a.sent_unix.is_none() && !a.gave_up).map(|(p, _)| p.clone());
     if let Some(project) = open {
         let files = attest::session_transcripts(root, session);
         match find_filing(&files, session, Some(&project)) {
             Filing::Found(att) => {
-                let body = serde_json::to_string(&att).unwrap_or_default();
-                return match net.post_json(&format!("{base}/copy/attest"), &body) {
-                    Ok(()) => {
-                        if let Some(ask) = state.asks.get_mut(&project) {
-                            ask.sent_unix = Some(now);
-                            ask.report = Some(att.report.clone());
-                        }
-                        write_state(db, &state);
-                        CopyStop::Say(sent_line(&att.report))
-                    }
-                    Err(why) => CopyStop::Say(format!(
-                        "[THOR] Your weekly-check report '{}' is filed, but its proof could not be sent to the connector ({why}). \
-                         THOR tries again at the next Stop; nothing is held.",
-                        att.report
-                    )),
-                };
+                if let Some(ask) = state.asks.get_mut(&project) {
+                    ask.sent_unix = Some(now);
+                    ask.report = Some(att.report.clone());
+                }
+                write_state(db, &state);
+                return CopyStop::Ask(proof_text(&att));
             }
             Filing::Pending => return CopyStop::Quiet,
             Filing::None => {
@@ -596,9 +614,6 @@ pub fn copy_stop(
         }
     }
     if !may_ask {
-        return CopyStop::Quiet;
-    }
-    if state.unreachable_until > now {
         return CopyStop::Quiet;
     }
     let Ok(store) = crate::store_dir::open_existing(db) else { return CopyStop::Quiet };
@@ -630,13 +645,10 @@ pub fn copy_stop(
         if !matches!(decision, crate::usefulness::StopDecision::Ask(_)) {
             continue;
         }
-        if let Err(why) = net.get(&format!("{base}/copy/ping")) {
-            state.unreachable_until = now + UNREACHABLE_BACKOFF_SECS;
-            write_state(db, &state);
-            return CopyStop::Say(format!(
-                "[THOR] The weekly check of '{project}' is due, but the connector cannot be reached from this machine right now \
-                 ({why}), so nothing is held. It is asked again when the connection is back."
-            ));
+        // Due. It is asked only where the report can be filed: a session with
+        // no sign of THOR's connector tools is left alone, and says nothing.
+        if !connector_configured(db) && !session_has_connector(&attest::session_transcripts(root, session)) {
+            return CopyStop::Quiet;
         }
         state.asks.insert(
             project.clone(),
@@ -690,6 +702,15 @@ pub fn is_copy_report(op: &InboxOp) -> bool {
     op.tool == "remember" && is_report_filing("remember", &op.args)
 }
 
+/// Whether a captured call carries a copy's attestation: the note the copy's
+/// Stop asked its session to write (a report tagged `copy-attestation`), or
+/// the call a 2.6.2 connector made of a posted one.
+pub fn is_copy_attestation(op: &InboxOp) -> bool {
+    let tagged = op.args.get("kind").and_then(Value::as_str) == Some("report")
+        && op.args.get("tags").and_then(Value::as_array).is_some_and(|tags| tags.iter().any(|t| t.as_str() == Some(ATTESTATION_TAG)));
+    op.tool == LEGACY_ATTEST_TOOL || (op.tool == "remember" && tagged)
+}
+
 /// What one drain's settling did.
 #[derive(Debug, Default)]
 pub struct Settled {
@@ -704,8 +725,12 @@ pub struct Settled {
 /// parsed and kept. `Err` when an attestation cannot be read. A capture
 /// already settled earlier is skipped with a line.
 pub fn absorb(pending: &mut Pending, op: &InboxOp, now: i64) -> Result<String, String> {
-    if op.tool == ATTEST_TOOL {
-        let att: CopyAttestation = serde_json::from_value(op.args.clone()).map_err(|e| format!("copy attestation does not parse: {e}"))?;
+    if is_copy_attestation(op) {
+        let att = match op.tool == LEGACY_ATTEST_TOOL {
+            true => serde_json::from_value(op.args.clone()).map_err(|e| e.to_string()),
+            false => CopyAttestation::from_text(op.args.get("text").and_then(Value::as_str).unwrap_or_default()),
+        }
+        .map_err(|e| format!("copy attestation does not parse: {e}"))?;
         if pending.done.contains(&att.capture_id) || pending.attests.iter().any(|(_, a)| a.capture_id == att.capture_id) {
             return Ok(format!("attestation for capture {} is already known", att.capture_id));
         }
@@ -931,13 +956,88 @@ mod tests {
     }
 
     #[test]
-    fn the_connector_is_found_in_the_marker_or_in_claude_json() {
+    fn a_configured_connector_is_found_in_claude_json() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = dir.path().join("claude.json");
         std::fs::write(&cfg, r#"{"mcpServers":{"thor":{"type":"http","url":"https://mcp.example.com/mcp"}}}"#).unwrap();
-        assert_eq!(connector_in(&cfg).as_deref(), Some("https://mcp.example.com"));
+        assert!(connector_in(&cfg));
         std::fs::write(&cfg, r#"{"mcpServers":{"thor":{"type":"stdio","command":"mcp"}}}"#).unwrap();
-        assert_eq!(connector_in(&cfg), None, "a local tool server is no connector");
-        assert_eq!(clean_base("http://10.0.0.5:8078/mcp/"), "http://10.0.0.5:8078");
+        assert!(!connector_in(&cfg), "a local tool server is no connector");
+    }
+
+    #[test]
+    fn the_proof_text_is_the_exact_call_and_reads_back_into_the_same_attestation() {
+        let att = good_attestation("Judged two notes.");
+        let text = proof_text(&att);
+        assert!(text.contains("mcp__thor__remember") && text.contains("id: \"eval-attest-cap-1\""), "{text}");
+        assert!(text.contains("tags: [\"copy-attestation\"]") && text.contains("project: \"demo\""), "{text}");
+        let line = text.lines().find_map(|l| l.strip_prefix("text: ")).expect("the text line");
+        assert_eq!(CopyAttestation::from_text(line), Ok(att.clone()));
+        assert_eq!(CopyAttestation::from_text(&format!("```json
+{line}
+```")), Ok(att.clone()), "a code fence around it is tolerated");
+        assert_eq!(check_attestation_note("eval-attest-cap-1", Some("demo"), line), Ok(()));
+    }
+
+    #[test]
+    fn a_changed_attestation_note_is_refused_on_the_spot() {
+        let att = good_attestation("Judged two notes.");
+        let line = att.to_text();
+        let edited = line.replace("toolu_file", "toolu_other");
+        assert!(check_attestation_note("eval-attest-cap-1", Some("demo"), &edited).unwrap_err().contains("own seal"));
+        assert!(check_attestation_note("eval-attest-cap-1", Some("demo"), "I sent the proof.").unwrap_err().contains("copied exactly"));
+        let wrong_id = check_attestation_note("eval-attest-cap-9", Some("demo"), &line).unwrap_err();
+        assert!(wrong_id.contains("eval-attest-cap-1") && wrong_id.contains("'demo'"), "{wrong_id}");
+        assert!(check_attestation_note("eval-attest-cap-1", Some("other"), &line).is_err());
+    }
+
+    #[test]
+    fn a_queued_attestation_note_is_recognised_by_the_drain() {
+        let att = good_attestation("Judged two notes.");
+        let note = |tags: Value, kind: &str| InboxOp::new("remember", json!({"id": "eval-attest-cap-1", "kind": kind, "project": "demo", "tags": tags, "text": att.to_text()}));
+        assert!(is_copy_attestation(&note(json!(["copy-attestation"]), "report")));
+        assert!(!is_copy_attestation(&note(json!(["evaluation-report"]), "report")), "a report is not its proof");
+        assert!(!is_copy_attestation(&note(json!(["copy-attestation"]), "rule")));
+        assert!(is_copy_attestation(&InboxOp::new(LEGACY_ATTEST_TOOL, serde_json::to_value(&att).unwrap())));
+        let mut pending = Pending::default();
+        assert!(absorb(&mut pending, &note(json!(["copy-attestation"]), "report"), 100).unwrap().contains("received"));
+        assert_eq!(pending.attests.len(), 1);
+        let mangled = InboxOp::new("remember", json!({"id": "x", "kind": "report", "project": "demo", "tags": ["copy-attestation"], "text": "no proof here"}));
+        assert!(absorb(&mut pending, &mangled, 100).unwrap_err().contains("does not parse"));
+    }
+
+    fn lines_to_transcript(root: &Path, lines: &[Value]) -> Vec<PathBuf> {
+        let mut transcript = fixture::main_transcript(root, SESSION);
+        for line in lines {
+            transcript.raw(&line.to_string());
+        }
+        transcript.write();
+        attest::session_transcripts(root, SESSION)
+    }
+
+    #[test]
+    fn a_session_shows_the_connector_by_its_calls_its_queued_replies_or_its_tool_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let none = lines_to_transcript(dir.path(), &[json!({"type": "user", "message": {"role": "user", "content": "mcp__thor__remember is just a word here"}})]);
+        assert!(!session_has_connector(&none), "a word in a prompt proves nothing");
+        let other = tempfile::tempdir().unwrap();
+        let tool_list = |names: Value| json!({"type": "attachment", "attachment": {"type": "deferred_tools_delta", "addedNames": names}});
+        let files = lines_to_transcript(other.path(), &[tool_list(json!(["mcp__a1b2__remember", "mcp__docs__where_used"]))]);
+        assert!(!session_has_connector(&files), "two servers: no one of them is THOR's");
+        let again = tempfile::tempdir().unwrap();
+        let files = lines_to_transcript(again.path(), &[tool_list(json!(["Bash", "mcp__a1b2__remember", "mcp__a1b2__where_used", "mcp__a1b2__lookup"]))]);
+        assert!(session_has_connector(&files), "THOR's tool list");
+        let called = tempfile::tempdir().unwrap();
+        let files = lines_to_transcript(
+            called.path(),
+            &[json!({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "mcp__claude_ai_Thor__mark", "input": {"id": "x"}}]}})],
+        );
+        assert!(session_has_connector(&files), "a call of a THOR tool");
+        let replied = tempfile::tempdir().unwrap();
+        let files = lines_to_transcript(
+            replied.path(),
+            &[json!({"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "queued for the main machine (revise, capture c9). This connector is a replica"}]}})],
+        );
+        assert!(session_has_connector(&files), "a replica's own reply");
     }
 }

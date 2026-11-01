@@ -157,7 +157,7 @@ pub enum Found {
 
 /// The text of a `tool_result` block's content: a string, or the text of
 /// every text block in an array.
-fn result_text(content: Option<&Value>) -> String {
+pub(crate) fn result_text(content: Option<&Value>) -> String {
     match content {
         Some(Value::String(s)) => s.clone(),
         Some(Value::Array(blocks)) => {

@@ -141,7 +141,7 @@ pub fn drain_from(db: &Path, base: &str, token: &str) -> anyhow::Result<DrainSum
         // Sequentially and in capture order: a revise that follows a remember
         // in the same batch has to see the item the remember created.
         for op in &pulled.ops {
-            if copy_eval::is_copy_report(op) || op.tool == copy_eval::ATTEST_TOOL {
+            if copy_eval::is_copy_report(op) || copy_eval::is_copy_attestation(op) {
                 match copy_eval::absorb(&mut pending, op, now) {
                     Ok(line) => lines.push(format!("HELD {line}")),
                     Err(why) => {

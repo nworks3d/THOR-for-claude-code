@@ -443,27 +443,33 @@ Words used once, in plain language:
 - Refuse or change: not installed by default.
 
 ### B19b. The weekly check on a copy that is connected to the replica
-- What: a read-only copy whose Claude Code also reaches the replica connector (the `thor` tool server is an
-  http one, or `thor-copy.json` has a `connector` address) is asked the weekly check at its Stop, by the main
-  machine's rhythm and with its own instructions. The report is filed through the connector (queued like any
-  write). At the next Stop the copy reads the session's own transcript, confirms the filing call and the
-  connector's "queued ... capture <id>" reply, and sends a sealed attestation (session, tool-use id, capture id,
-  sha256 of the report text, time of the result, the session's other queued writes) to the connector
-  (`POST /copy/attest`, queued next to the writes). `sync drain` holds the report until the attestation arrives,
-  verifies the two against each other, and files the report with a machine section derived from the
-  attestation and a valid validator record, so it counts. A mismatch, or no attestation within 24 hours, files
+- What: a read-only copy, in a session that has the replica connector's tools, is asked the weekly check at
+  its Stop, by the main machine's rhythm and with its own instructions. No address is needed: the session has
+  the tools when its own transcript shows it (a call of a THOR tool, a "queued for the main machine" reply, or
+  a tool list naming THOR's tools), or when the copy is wired to a connector (`thor-copy.json` has a
+  `connector` text, or Claude Code's `thor` tool server is an http one). The report is filed through the
+  connector (queued like any write). At the next Stop the copy reads the session's own transcript, confirms
+  the filing call and the connector's "queued ... capture <id>" reply, builds a sealed attestation (session,
+  tool-use id, capture id, sha256 of the report text, time of the result, the session's other queued writes)
+  and holds the turn once with the exact call that sends it: `remember`, kind report, id
+  `eval-attest-<capture id>`, tag `copy-attestation`, the attestation as the text. The connector refuses such a
+  note whose text was changed (it no longer matches its own seal) and queues the rest like any write. `sync drain`
+  holds the report until the attestation note arrives, reads it without keeping it as a note, verifies the two
+  against each other, and files the report with a machine section derived from the attestation and a valid
+  validator record, so it counts. A mismatch, or no attestation within 24 hours, files
   it as not counting with the reason (the next ask names it). The machine section says what a copy cannot
   compute: the frozen verdict list (a copy keeps no record of which notes fired), the batch and A4 list, the
   disputes and the false-block sweep stay owed on the main machine.
 - Why: owner decision 2026-10-26, "the report is made where the session runs": the weekly check no longer
   needs a session on the main machine.
 - You notice: a session start sentence on the copy (writes land on the main machine within the hour), one
-  hold per due project, a "sent to the main machine with its proof" line, and `HELD`/`OK`/`DEAD` lines in the
-  drain report. With no connector reachable nothing is held and one line says it is asked again later.
-- Limits: the connector has no password of its own (the tunnel is the gate), so the attestation shows that the
-  report is the one the copy verified in a transcript, not who sent it. A project is not asked again on the
-  copy for 24 hours after its report was sent.
-- Refuse or change: remove the connector from the copy's tool servers (and `connector` from `thor-copy.json`).
+  hold per due project for the report and one for the proof call, and `HELD`/`OK`/`DEAD` lines in the drain
+  report. A session with no sign of the connector's tools is not held and nothing is said.
+- Limits: the connector has no password of its own (the connection to it is the gate), so the attestation shows
+  that the report is the one the copy verified in a transcript, not who sent it. A project is not asked again on
+  the copy for 24 hours after its proof call was handed out. A session whose tools are not deferred and not yet
+  used leaves no trace in its transcript, so it is not asked before its first THOR tool call.
+- Refuse or change: remove the connector from the session's tools (and `connector` from `thor-copy.json`).
 
 ---
 
