@@ -159,3 +159,38 @@ fn the_sessionstart_output_for_a_compact_payload_is_otherwise_unchanged() {
         "this fixture has no anchored items, so no decay notice should appear either: {compact_json}"
     );
 }
+
+#[test]
+fn the_reminder_says_figures_from_the_summary_are_unverified_too() {
+    let text = serve::session_start::COMPACT_REMINDER;
+    assert!(text.contains("summary is not proof"), "{text}");
+    for word in ["Numbers", "sizes", "names", "paths", "unverified", "measure them again before you state them"] {
+        assert!(text.contains(word), "missing '{word}': {text}");
+    }
+    assert!(text.len() < 600, "one short paragraph: {} bytes", text.len());
+}
+
+/// The longer reminder rides inside the session-start size budget: with far
+/// more standing rules than fit, the block still stays under what Claude Code
+/// shows whole, and it is the rules that give way, not the reminder.
+#[test]
+fn the_longer_reminder_still_fits_the_session_start_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("store.db");
+    {
+        let mut db = EventStore::new(&db_path).unwrap();
+        for n in 0..80 {
+            let mut item = always_rule(&format!("rule-{n:02}"));
+            let words: Vec<String> = (0..40).map(|i| format!("w{n}x{i}")).collect();
+            item.text = format!("standing rule {n}: {}", words.join(" "));
+            store::declare(&mut db, "s", "l", "a", &item).unwrap();
+        }
+    }
+    let payload = session_start_payload(serde_json::json!({"source": "compact"}));
+    let (status, stdout, _) = run_hook(&db_path, &payload);
+    assert_eq!(status.code(), Some(0));
+    let json: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+    let block = json["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+    assert!(block.contains(serve::session_start::COMPACT_REMINDER), "the reminder is whole");
+    assert!(block.len() <= serve::session_start::HOOK_OUTPUT_LIMIT_BYTES, "{} bytes", block.len());
+}

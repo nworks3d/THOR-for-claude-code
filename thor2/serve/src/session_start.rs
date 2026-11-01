@@ -277,7 +277,7 @@ pub fn split_for_session_start(items: Vec<RankedItem>, headless: bool) -> (Vec<R
 /// the owner's own stored rules (see `render::FRAMING_LINE`'s doc comment
 /// for that other, narrower framing problem - this text is THOR's own,
 /// not the owner's, so it does not need it).
-pub const COMPACT_REMINDER: &str = "[THOR] This session's context was just summarized, so the summary is not proof of anything in it. Before you call something done, tested, flashed, deployed or live, check it again now - run the check, read the file, or ask the machine.";
+pub const COMPACT_REMINDER: &str = "[THOR] This session's context was just summarized, so the summary is not proof of anything in it. Before you call something done, tested, flashed, deployed or live, check it again now - run the check, read the file, or ask the machine. Numbers, sizes, names and paths taken from the summary are unverified too: measure them again before you state them.";
 
 /// `Some(COMPACT_REMINDER)` exactly when this SessionStart payload is the
 /// main session's own (`is_subagent` false) and its `source` field reads
