@@ -4,6 +4,10 @@ What changed in each release, newest first. The release workflow copies the sect
 
 ## Unreleased
 
+## 2.6.4 (2026-11-01)
+
+What changed: A copy of your memory on another machine now sends the proof of its weekly report through the same THOR tool as the report itself, so no connection address is needed any more.
+
 - **A copy's weekly check works with a connector whose address is stored nowhere.** The first real test (2026-11-01) showed that a laptop whose THOR tools come from a connector added in claude.ai was never asked the weekly check, and that its proof could not be sent: the address is in no file, and the public address only lets Claude's own signed-in connection through. Now a copy counts as connected when the session's own transcript shows THOR's tools (a THOR tool call, a "queued for the main machine" reply, or a tool list naming them) or the copy is wired to a connector, and the proof travels through the same tool as the report: after the report is filed, the Stop holds the turn once with the exact `remember` call (kind report, id `eval-attest-<capture id>`, tag `copy-attestation`, the sealed attestation as the text). The connector refuses such a note whose text was changed, `sync drain` reads it without keeping it as a note, and the report counts as before. A session with no sign of the connector is still never held. The `POST /copy/attest` and `GET /copy/ping` routes and the curl path are removed; a proof already queued through the old route is still read. Documented in `README.md`, `AGENTS.md` and `docs/WHAT-THOR-DOES.md` (B19b).
 
 ## 2.6.3 (2026-11-01)
