@@ -170,11 +170,24 @@ impl Stamp {
 /// so the length limit, the typography rules and every other ground still
 /// apply to what comes out.
 fn edited_text(current: &str, args: &ReviseArgs) -> Result<String, String> {
-    let modes = [args.text.is_some(), args.append.is_some(), args.replace_from.is_some()];
-    if modes.iter().filter(|m| **m).count() > 1 {
+    let given: Vec<&str> = [("text", args.text.is_some()), ("append", args.append.is_some()), ("replace_from", args.replace_from.is_some())]
+        .into_iter()
+        .filter(|(_, present)| *present)
+        .map(|(name, _)| name)
+        .collect();
+    if given.len() > 1 {
+        return Err(format!(
+            "this call gave {} together, but a revise changes the body in exactly one way: text (the \
+             whole new body), append (words added to the end) or replace_from with replace_to (one \
+             phrase swapped). Nothing was changed. To do both, make two revise calls one after the \
+             other, or put the whole result in text - read the current body with get first.",
+            given.join(" and ")
+        ));
+    }
+    if args.replace_to.is_some() && args.replace_from.is_none() {
         return Err(
-            "give exactly one of text, append or replace_from - say what the body IS, or say what \
-             to change about it, never both"
+            "replace_to was given without replace_from, so there is nothing to swap. Nothing was changed. \
+             Pass replace_from with the phrase to find, or use text for a whole new body or append to add to the end."
                 .to_string(),
         );
     }
@@ -557,6 +570,154 @@ fn targets_option<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Vec<T
         return Ok(None);
     }
     parse_targets(v).map(Some).map_err(serde::de::Error::custom)
+}
+
+/// A list-of-strings argument (`moments`, `tags`, `check_literals`,
+/// `legitimate_calls`, `may_change`, `accept_refusing`) read from JSON, with an
+/// error that names the field and the shape wanted instead of serde's bare
+/// "invalid type: string ..., expected a sequence". The usual slip is one
+/// string where a list belongs, so that case also shows the corrected spelling.
+fn parse_string_list(field: &str, v: serde_json::Value) -> Result<Vec<String>, String> {
+    let shape = format!("{field}: [\"...\", \"...\"]");
+    let serde_json::Value::Array(items) = v else {
+        let fix = match &v {
+            serde_json::Value::String(one) => format!(" For one entry write {field}: [{one:?}]."),
+            _ => String::new(),
+        };
+        return Err(format!("{field} was given {}, but it must be a list of strings: {shape}.{fix}", json_type_name(&v)));
+    };
+    items
+        .into_iter()
+        .enumerate()
+        .map(|(i, item)| match item {
+            serde_json::Value::String(text) => Ok(text),
+            other => Err(format!("{field}[{i}] is {}, but every entry must be a string: {shape}", json_type_name(&other))),
+        })
+        .collect()
+}
+
+/// One deserializer per list field: `deserialize_with` takes no argument, so
+/// the field name is baked into each function. `null` reads as no list.
+macro_rules! string_list_readers {
+    ($($list:ident, $option:ident => $field:literal;)*) => {$(
+        #[allow(dead_code)]
+        fn $list<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+            let v = serde_json::Value::deserialize(d)?;
+            if v.is_null() {
+                return Ok(Vec::new());
+            }
+            parse_string_list($field, v).map_err(serde::de::Error::custom)
+        }
+
+        #[allow(dead_code)]
+        fn $option<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Vec<String>>, D::Error> {
+            let v = serde_json::Value::deserialize(d)?;
+            if v.is_null() {
+                return Ok(None);
+            }
+            parse_string_list($field, v).map(Some).map_err(serde::de::Error::custom)
+        }
+    )*};
+}
+
+string_list_readers! {
+    tags_list, tags_option => "tags";
+    moments_list, moments_option => "moments";
+    check_literals_list, check_literals_option => "check_literals";
+    legitimate_calls_list, legitimate_calls_option => "legitimate_calls";
+    may_change_list, may_change_option => "may_change";
+    accept_refusing_list, accept_refusing_option => "accept_refusing";
+}
+
+/// `always` read from JSON: a real boolean, or an error that shows the spelling
+/// (a quoted "true" is the usual slip).
+fn parse_always(v: serde_json::Value) -> Result<bool, String> {
+    match v {
+        serde_json::Value::Bool(b) => Ok(b),
+        serde_json::Value::String(s) => Err(format!("always was given the string {s:?}, but it must be true or false without quotes: always: true")),
+        other => Err(format!("always was given {}, but it must be true or false: always: true", json_type_name(&other))),
+    }
+}
+
+fn always_flag<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    if v.is_null() {
+        return Ok(false);
+    }
+    parse_always(v).map_err(serde::de::Error::custom)
+}
+
+fn always_option<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    if v.is_null() {
+        return Ok(None);
+    }
+    parse_always(v).map(Some).map_err(serde::de::Error::custom)
+}
+
+/// The most characters one `lookup` answer carries. Claude Code refuses a tool
+/// result above its own limit (a lookup that returned 115k to 175k characters
+/// was refused whole), so the answer is cut here, openly, before it gets there.
+const LOOKUP_MAX_CHARS: usize = 20_000;
+/// Left out of the cap for the lines that follow the hits (counts, notes).
+const LOOKUP_NOTES_ROOM: usize = 1_500;
+/// A cut hit keeps at least this much of its text.
+const LOOKUP_MIN_TEXT_CHARS: usize = 300;
+/// What the cut notice at the end of one hit may take, at most.
+const LOOKUP_CUT_NOTICE_ROOM: usize = 120;
+
+/// The text of a hit cut to `keep` characters, with the id and the way to read
+/// the rest. Text that fits is returned unchanged.
+fn cut_hit_text(id: &str, text: &str, keep: usize) -> String {
+    let total = text.chars().count();
+    if total <= keep {
+        return text.to_string();
+    }
+    let first: String = text.chars().take(keep).collect();
+    format!("{first} ... [cut, {} more characters of {id}: use get with id {id} for the rest]", total - keep)
+}
+
+/// The hit lines of one `lookup` answer (`head` is "id (Kind): ", then the
+/// text), within `budget` characters. Rank and order are never touched: only
+/// the text is shortened, and only as much as needed. The cap on a hit's text
+/// is the largest one that makes everything fit, so a short rule always stays
+/// whole and the long reports give way. Returns the lines and how many hits
+/// were cut.
+fn lookup_hit_lines(hits: &[(String, String, String)], budget: usize) -> (String, usize) {
+    let longest = hits.iter().map(|(_, _, text)| text.chars().count()).max().unwrap_or(0);
+    let cost = |cap: usize| -> usize {
+        hits.iter()
+            .map(|(_, head, text)| {
+                let len = text.chars().count();
+                head.chars().count() + len.min(cap) + 1 + if len > cap { LOOKUP_CUT_NOTICE_ROOM } else { 0 }
+            })
+            .sum()
+    };
+    let cap = if cost(longest) <= budget {
+        longest
+    } else {
+        let (mut low, mut high) = (LOOKUP_MIN_TEXT_CHARS, longest);
+        while low < high {
+            let middle = (low + high).div_ceil(2);
+            if cost(middle) <= budget {
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+        low
+    };
+    let mut out = String::new();
+    let mut cut = 0;
+    for (id, head, text) in hits {
+        if text.chars().count() > cap {
+            cut += 1;
+        }
+        out.push_str(head);
+        out.push_str(&cut_hit_text(id, text, cap));
+        out.push('\n');
+    }
+    (out, cut)
 }
 
 /// Turn the three flat MCP fields (moments, targets, always) into the
@@ -1844,7 +2005,7 @@ pub struct RememberArgs {
     /// Project this item belongs to. Omit for a global, cross-project item.
     #[serde(default)]
     pub project: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "tags_list")]
     pub tags: Vec<String>,
     /// ISO-8601 date. Only a Report may carry this - a Rule, Orientation,
     /// Lookup or Chunk with an expiry is refused (they last until revised).
@@ -1888,14 +2049,14 @@ pub struct RememberArgs {
     /// check_kind except requires, which takes the trigger first - one of this item's own command
     /// bindings, or a specific literal inside the bound command such as "-p my-dev" in an ssh call -
     /// then every answer that satisfies it.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "check_literals_list")]
     pub check_literals: Vec<String>,
     /// Action names this item fires on (repeatable), e.g. ["push"]. Only a Rule/Orientation may
     /// bind to a moment. The ones that actually fire are derived from a real command or file path
     /// (publish, commit, push, deploy and the rest - see intent::from_command/from_path), plus
     /// remember itself. answer and claim_done are refused on a NEW binding: nothing produces either
     /// yet, so a rule bound only to one would store cleanly and never fire.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "moments_list")]
     pub moments: Vec<String>,
     /// Exact targets this item fires on (repeatable). Only a Rule/Orientation
     /// may bind to a target; the value must be the real path/command/etc,
@@ -1904,7 +2065,7 @@ pub struct RememberArgs {
     pub targets: Vec<TargetArg>,
     /// Bind this item to the pinned Always layer (served in full at every
     /// session start). Only a Rule/Orientation may set this.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "always_flag")]
     pub always: bool,
     /// THE OWNER JUST NAMED A NEW COLLECTION - repeat that name here exactly as he gave it, and it
     /// will be opened. The only way an unopened collection can be written to: nothing existing fit,
@@ -1926,19 +2087,19 @@ pub struct RememberArgs {
     /// tooth's command, be refused by it, differ from the forbidden form THOR built itself, and
     /// carry something beyond the command and the literal. Then the rule is stored as a note by
     /// dispute, which doctor lists for the owner. Needs `because`. Leave it out otherwise.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "legitimate_calls_list")]
     pub legitimate_calls: Vec<String>,
     /// ONLY after a refusal said THOR derived a contains check from this rule's text and a file: the
     /// span you name as one that MAY CHANGE in that file - e.g. ["version"] for a rule that names
     /// the version line of package.json. It must be exactly the derived check's literal. Then the
     /// rule is stored as a note by dispute, which doctor lists for the owner. Needs `because`. Leave it out otherwise.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "may_change_list")]
     pub may_change: Vec<String>,
     /// ONLY after a refusal said your check would refuse most of the real calls it reaches: one of
     /// the calls it listed, named because refusing it IS the intent - e.g. ["git push origin main"]
     /// for a "never push this repository until the owner says so" ban. The rule stays on the rule
     /// track, and doctor lists every rule kept this way. Needs `because`. Otherwise narrow the check instead.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "accept_refusing_list")]
     pub accept_refusing: Vec<String>,
 }
 
@@ -2015,7 +2176,7 @@ pub struct ReviseArgs {
     /// on purpose - the same omit-keeps/empty-clears convention as
     /// severity/project/expires/key/falsifier, spelled with a list: omitted means unmentioned, an
     /// empty array means deliberately cleared, a real list replaces the whole set.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "tags_option")]
     pub tags: Option<Vec<String>>,
     /// Omit to keep the current expiry; pass "" to clear it (see
     /// `clear_expires` below for the spelling that reaches this server from
@@ -2072,7 +2233,7 @@ pub struct ReviseArgs {
     /// own note on why this is a repeatable field rather than a delimited string. Same
     /// omit/clear/replace convention as check_kind: an empty list here reads the same as omitting
     /// it, since a list has no separate way to say 'given, but deliberately empty'.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "check_literals_list")]
     pub check_literals: Vec<String>,
     /// Set true to clear the check - the same clear `check_kind: ""` above
     /// documents, same fix and convention as `clear_severity`'s own doc
@@ -2089,14 +2250,14 @@ pub struct ReviseArgs {
     /// RememberArgs' own note on which moments actually fire - a NEW answer/
     /// claim_done binding is refused here too, though one the item already
     /// carried stays correctable.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "moments_option")]
     pub moments: Option<Vec<String>>,
     /// Replaces the target bindings - see `moments`' own note on how the
     /// three binding fields combine.
     #[serde(default, deserialize_with = "targets_option")]
     pub targets: Option<Vec<TargetArg>>,
     /// Replaces whether this item is bound Always - see `moments`' own note.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "always_option")]
     pub always: Option<bool>,
     /// THE OWNER JUST NAMED A NEW COLLECTION - repeat that name here, exactly
     /// as he gave it. Same field, same rule and same one flow as on remember:
@@ -2127,19 +2288,19 @@ pub struct ReviseArgs {
     /// tooth's command, be refused by it, differ from the forbidden form THOR built itself, and
     /// carry something beyond the command and the literal. Then the rule is stored as a note by
     /// dispute, which doctor lists for the owner. Needs `because`. Leave it out otherwise.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "legitimate_calls_list")]
     pub legitimate_calls: Vec<String>,
     /// ONLY after a refusal said THOR derived a contains check from this rule's text and a file: the
     /// span you name as one that MAY CHANGE in that file - e.g. ["version"] for a rule that names
     /// the version line of package.json. It must be exactly the derived check's literal. Then the
     /// rule is stored as a note by dispute, which doctor lists for the owner. Needs `because`. Leave it out otherwise.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "may_change_list")]
     pub may_change: Vec<String>,
     /// ONLY after a refusal said your check would refuse most of the real calls it reaches: one of
     /// the calls it listed, named because refusing it IS the intent - e.g. ["git push origin main"]
     /// for a "never push this repository until the owner says so" ban. The rule stays on the rule
     /// track, and doctor lists every rule kept this way. Needs `because`. Otherwise narrow the check instead.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "accept_refusing_list")]
     pub accept_refusing: Vec<String>,
 }
 
@@ -2780,7 +2941,7 @@ impl ThorMcpServer {
         .await
     }
 
-    #[tool(description = "Code lane: corrects an EXISTING item by id through the same write gate as remember; a field left unmentioned keeps its current value, and none may silently vanish - clear one with clear_severity/clear_project/clear_expires/clear_key/clear_falsifier/clear_check; an empty string on the field is the harness-only equivalent, and a flag plus a real value for that field is refused. Weakening a checked rule (its check, severity, a binding, or scope) needs because: one sentence, kept in history. On a replica this queues instead of writing ('queued for the main machine' is not an error). Prefer this over remember for an existing item that merely changed; retract, with its own reason, is for one that is simply wrong. Refuses, with the exact reason, on remember's grounds (a secret token newly written into the text or falsifier included), plus a dropped field or an unexplained weakening. A revise that changes its text, anchors, check, project or severity is tried again (a revise naming only the id tries a rule no trial has decided yet); one that changes only tags, falsifier, expires or key keeps its verdict. Replies with the revised id and event sequence, or the refusal text.", annotations(title = "Revise an item", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false))]
+    #[tool(description = "Code lane: corrects an EXISTING item by id through the same write gate as remember; the body changes in exactly ONE way per call - text (the whole new body), append (words added to the end) or replace_from with replace_to (one phrase swapped), never two of them together (refused, nothing changed: make two calls instead); a field left unmentioned keeps its current value, and none may silently vanish - clear one with clear_severity/clear_project/clear_expires/clear_key/clear_falsifier/clear_check; an empty string on the field is the harness-only equivalent, and a flag plus a real value for that field is refused. Weakening a checked rule (its check, severity, a binding, or scope) needs because: one sentence, kept in history. On a replica this queues instead of writing ('queued for the main machine' is not an error). Prefer this over remember for an existing item that merely changed; retract, with its own reason, is for one that is simply wrong. Refuses, with the exact reason, on remember's grounds (a secret token newly written into the text or falsifier included), plus a dropped field or an unexplained weakening. A revise that changes its text, anchors, check, project or severity is tried again (a revise naming only the id tries a rule no trial has decided yet); one that changes only tags, falsifier, expires or key keeps its verdict. Replies with the revised id and event sequence, or the refusal text.", annotations(title = "Revise an item", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false))]
     async fn revise(&self, meta: Meta, raw: RawArgs, Parameters(args): Parameters<ReviseArgs>) -> String {
         if self.inbox.is_some() {
             let judged = {
@@ -3035,7 +3196,7 @@ impl ThorMcpServer {
         .await
     }
 
-    #[tool(description = "Code lane: searches THOR's memory - every project, archive kinds (Report, Chunk) included - never scoped to only the current project. Call this before remember, so an existing near-duplicate becomes a revise instead. No arguments returns the catalogue of scopes; scope alone lists everything filed there; scope with query narrows a search to it; query alone searches everywhere; key answers only a Lookup item's own exact key (query, scope and kind are then ignored); kind narrows a search to rule, orientation, report or chunk - several at once with a comma, and 'fires' as shorthand for every kind that can fire at a moment, which is what you want when the fact has to steer an action (case-insensitive, an obvious plural such as 'rules' accepted) - without it, Report hits tend to dominate a plain search since their own text runs long, and asking for kind lookup is refused rather than silently answered empty, since a Lookup register only ever answers to its own key. Read-only, and never an injection surface - nothing here reaches you unprompted. Replies with up to 25 matching lines (id, kind, text) and how many more exist, the catalogue, or a plain 'no matches'.", annotations(title = "Search the memory", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
+    #[tool(description = "Code lane: searches THOR's memory - every project, archive kinds (Report, Chunk) included - never scoped to only the current project. Call this before remember, so an existing near-duplicate becomes a revise instead. No arguments returns the catalogue of scopes; scope alone lists everything filed there; scope with query narrows a search to it; query alone searches everywhere; key answers only a Lookup item's own exact key (query, scope and kind are then ignored); kind narrows a search to rule, orientation, report or chunk - several at once with a comma, and 'fires' as shorthand for every kind that can fire at a moment, which is what you want when the fact has to steer an action (case-insensitive, an obvious plural such as 'rules' accepted) - without it, Report hits tend to dominate a plain search since their own text runs long, and asking for kind lookup is refused rather than silently answered empty, since a Lookup register only ever answers to its own key. Read-only, and never an injection surface - nothing here reaches you unprompted. Replies with up to 25 matching lines (id, kind, text) and how many more exist, the catalogue, or a plain 'no matches'. The whole reply stays near 20000 characters: a long body (a Report) is cut to its first part and says to use get with its id for the rest, short rules stay whole, and the reply ends with how many were cut.", annotations(title = "Search the memory", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn lookup(&self, Parameters(args): Parameters<LookupArgs>) -> String {
         let vectors = self.vectors.clone();
         #[cfg(feature = "semantic")]
@@ -3043,7 +3204,12 @@ impl ThorMcpServer {
         self.blocking(move |s| {
             if let Some(key) = args.key.as_deref().filter(|k| !k.is_empty()) {
                 return match serve::lookup::by_key(s, key) {
-                    Some(hit) => Ok(format!("{} ({:?}): {}", hit.id, hit.item.kind, hit.item.text)),
+                    Some(hit) => Ok(format!(
+                        "{} ({:?}): {}",
+                        hit.id,
+                        hit.item.kind,
+                        cut_hit_text(&hit.id, &hit.item.text, LOOKUP_MAX_CHARS - LOOKUP_NOTES_ROOM)
+                    )),
                     None => Ok(format!("no lookup found for key '{key}'")),
                 };
             }
@@ -3156,10 +3322,20 @@ impl ThorMcpServer {
             // one by id with get - and the line below says exactly how much is
             // not shown, because a cap nobody is told about is the same defect
             // in a politer form.
+            //
+            // A SECOND CAP, ON CHARACTERS (2.6.3). 25 whole Report bodies came to
+            // 115k to 175k characters and Claude Code refused the answer. The
+            // hit lines are held to `LOOKUP_MAX_CHARS`: the long bodies are
+            // cut to a first part (with their id and "use get for the rest"),
+            // the short rules stay whole, and the rank is untouched.
             const MAX_HITS: usize = 25;
-            for hit in hits.iter().take(MAX_HITS) {
-                out.push_str(&format!("{} ({:?}): {}\n", hit.id, hit.item.kind, hit.item.text));
-            }
+            let shown: Vec<(String, String, String)> = hits
+                .iter()
+                .take(MAX_HITS)
+                .map(|hit| (hit.id.clone(), format!("{} ({:?}): ", hit.id, hit.item.kind), hit.item.text.clone()))
+                .collect();
+            let (lines, cut) = lookup_hit_lines(&shown, LOOKUP_MAX_CHARS - LOOKUP_NOTES_ROOM);
+            out.push_str(&lines);
             // Every hit shown came from the meaning leg alone, nothing
             // literally matched the query at all - say so, since an answer
             // built entirely from semantic extras otherwise looks exactly
@@ -3181,6 +3357,11 @@ impl ThorMcpServer {
             if withheld > 0 {
                 out.push_str(&format!(
                     "({withheld} match(es) held back: their own expiry date has passed. Ask for one by id with get if you need it.)\n"
+                ));
+            }
+            if cut > 0 {
+                out.push_str(&format!(
+                    "({cut} result(s) above were cut to fit about {LOOKUP_MAX_CHARS} characters. Each says where it was cut; ask for the whole text with get and the id.)\n"
                 ));
             }
             Ok(out)
@@ -4174,6 +4355,180 @@ mod tests {
         assert_eq!(ok.targets.len(), 1);
         assert!(remember(serde_json::Value::Null).unwrap().targets.is_empty());
         assert!(revise(serde_json::Value::Null).unwrap().targets.is_none());
+    }
+
+    /// A list given as one string, or an entry that is not a string, names the
+    /// field and the shape wanted, the same way `targets` does.
+    #[test]
+    fn a_wrong_list_shape_names_the_field_and_the_shape_wanted() {
+        let remember = |field: &str, value: serde_json::Value| {
+            let mut args = serde_json::json!({"id": "x", "kind": "rule", "text": "t"});
+            args[field] = value;
+            serde_json::from_value::<RememberArgs>(args)
+        };
+        let revise = |field: &str, value: serde_json::Value| {
+            let mut args = serde_json::json!({"id": "x"});
+            args[field] = value;
+            serde_json::from_value::<ReviseArgs>(args)
+        };
+        for field in ["moments", "tags", "check_literals", "legitimate_calls", "may_change", "accept_refusing"] {
+            let err = remember(field, serde_json::json!("push")).err().unwrap().to_string();
+            assert!(err.contains(&format!("{field} was given a string")) && err.contains(&format!("{field}: [\"push\"]")), "{err}");
+            assert!(!err.contains("invalid type"), "serde's bare wording must not be what the caller reads: {err}");
+            let err = revise(field, serde_json::json!("push")).err().unwrap().to_string();
+            assert!(err.contains(&format!("{field} was given a string")) && err.contains("list of strings"), "{err}");
+            let err = revise(field, serde_json::json!(["ok", 7])).err().unwrap().to_string();
+            assert!(err.contains(&format!("{field}[1] is a number")) && err.contains("must be a string"), "{err}");
+            let ok = remember(field, serde_json::json!(["a", "b"]));
+            assert!(ok.is_ok(), "{field}: a real list still parses");
+            assert!(remember(field, serde_json::Value::Null).is_ok(), "{field}: null reads as no list");
+        }
+        let err = remember("always", serde_json::json!("true")).err().unwrap().to_string();
+        assert!(err.contains("always was given the string \"true\"") && err.contains("always: true"), "{err}");
+        let err = revise("always", serde_json::json!(1)).err().unwrap().to_string();
+        assert!(err.contains("always was given a number"), "{err}");
+        assert!(remember("always", serde_json::json!(true)).unwrap().always);
+        assert_eq!(revise("always", serde_json::json!(false)).unwrap().always, Some(false));
+        assert_eq!(revise("always", serde_json::Value::Null).unwrap().always, None);
+        assert_eq!(revise("moments", serde_json::json!(["push"])).unwrap().moments, Some(vec!["push".to_string()]));
+        assert_eq!(revise("tags", serde_json::json!([])).unwrap().tags, Some(Vec::new()));
+        assert_eq!(revise("tags", serde_json::Value::Null).unwrap().tags, None);
+    }
+
+    /// Field case: `append` together with `replace_from` was refused with a
+    /// sentence that did not say what to do, and the tool description did not
+    /// say that the two cannot be combined.
+    #[tokio::test]
+    async fn append_with_replace_from_is_refused_and_says_what_to_do() {
+        let srv = server();
+        stored(&srv, "combo-1", "the changelog lives in CHANGELOG.md at the repo root").await;
+        let reply = srv
+            .revise(Meta::new(), RawArgs::default(), Parameters(ReviseArgs {
+                id: "combo-1".to_string(),
+                append: Some("and more".to_string()),
+                replace_from: Some("CHANGELOG.md".to_string()),
+                replace_to: Some("HISTORY.md".to_string()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(reply.contains("REFUSED"), "{reply}");
+        assert!(reply.contains("append and replace_from together"), "it names what was combined: {reply}");
+        assert!(reply.contains("two revise calls") && reply.contains("Nothing was changed"), "it names the way on: {reply}");
+        assert_eq!(body(&srv, "combo-1").await, "the changelog lives in CHANGELOG.md at the repo root");
+
+        // The two steps it suggests each work on their own.
+        let first = srv
+            .revise(Meta::new(), RawArgs::default(), Parameters(ReviseArgs {
+                id: "combo-1".to_string(),
+                replace_from: Some("CHANGELOG.md".to_string()),
+                replace_to: Some("HISTORY.md".to_string()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(first.starts_with("revised"), "{first}");
+        let second = srv
+            .revise(Meta::new(), RawArgs::default(), Parameters(ReviseArgs {
+                id: "combo-1".to_string(),
+                append: Some("and more".to_string()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(second.starts_with("revised"), "{second}");
+        assert_eq!(body(&srv, "combo-1").await, "the changelog lives in HISTORY.md at the repo root and more");
+    }
+
+    #[tokio::test]
+    async fn replace_to_without_replace_from_is_refused_instead_of_ignored() {
+        let srv = server();
+        stored(&srv, "combo-2", "the changelog lives in CHANGELOG.md at the repo root").await;
+        let reply = srv
+            .revise(Meta::new(), RawArgs::default(), Parameters(ReviseArgs {
+                id: "combo-2".to_string(),
+                replace_to: Some("HISTORY.md".to_string()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(reply.contains("REFUSED") && reply.contains("replace_to was given without replace_from"), "{reply}");
+        assert!(reply.contains("Nothing was changed"), "{reply}");
+    }
+
+    #[test]
+    fn the_revise_description_says_the_body_changes_one_way_per_call() {
+        let description = ThorMcpServer::tool_router()
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "revise")
+            .and_then(|tool| tool.description.map(|d| d.to_string()))
+            .expect("revise has a description");
+        assert!(description.contains("exactly ONE way per call") && description.contains("never two of them together"), "{description}");
+    }
+
+    // ----------------------------------------------- the lookup answer's size cap
+
+    fn big_report(id: &str, text: String) -> RememberArgs {
+        RememberArgs { text, expires: Some("2027-01-01".to_string()), ..blank_report(id) }
+    }
+
+    /// Field case: a lookup returned 115k to 175k characters and Claude Code
+    /// refused it. Long Report bodies are cut with their id and the way to read
+    /// the rest; a short rule stays whole and keeps its rank.
+    #[tokio::test]
+    async fn a_lookup_answer_is_capped_and_a_short_rule_is_never_pushed_out_by_a_long_report() {
+        let srv = server_knowing(&["test-project"]);
+        for n in 0..12 {
+            let words: Vec<String> = (0..900).map(|i| format!("w{n}x{i}")).collect();
+            let text = format!("zebrafish evaluation report {n}: {}", words.join(" "));
+            let stored = srv.remember(Meta::new(), RawArgs::default(), Parameters(big_report(&format!("long-report-{n:02}"), text))).await;
+            assert!(stored.starts_with("stored"), "{stored}");
+        }
+        stored(&srv, "short-zebrafish-rule", "A zebrafish rule that is short and must stay whole.").await;
+
+        let reply = srv
+            .lookup(Parameters(LookupArgs { scope: None, query: Some("zebrafish".to_string()), key: None, kind: None }))
+            .await;
+        assert!(reply.chars().count() <= 20_000, "{} characters", reply.chars().count());
+        assert!(reply.contains("A zebrafish rule that is short and must stay whole."), "the short rule stays whole: {reply}");
+        assert!(reply.contains("short-zebrafish-rule"), "{reply}");
+        assert!(reply.contains("use get with id long-report-"), "a cut hit names its id and get: {reply}");
+        let cut_line = reply.lines().last().unwrap_or("");
+        assert!(cut_line.contains("12 result(s) above were cut"), "the reply ends with how many were cut: {reply}");
+    }
+
+    #[tokio::test]
+    async fn a_lookup_answer_that_fits_is_not_changed_and_says_nothing_about_cuts() {
+        let srv = server_knowing(&["test-project"]);
+        let stored = srv.remember(Meta::new(), RawArgs::default(), Parameters(big_report("small-1", "a short octopus note".to_string()))).await;
+        assert!(stored.starts_with("stored"), "{stored}");
+        let reply = srv
+            .lookup(Parameters(LookupArgs { scope: None, query: Some("octopus".to_string()), key: None, kind: None }))
+            .await;
+        assert!(reply.contains("small-1 (Report): a short octopus note\n"), "{reply}");
+        assert!(!reply.contains("cut"), "{reply}");
+    }
+
+    #[test]
+    fn the_cap_cuts_only_what_it_must() {
+        let hit = |id: &str, len: usize| (id.to_string(), format!("{id} (Report): "), "x".repeat(len));
+        // Fits whole: nothing is cut.
+        let (lines, cut) = lookup_hit_lines(&[hit("a", 100), hit("b", 200)], 18_500);
+        assert_eq!(cut, 0);
+        assert!(!lines.contains("cut"), "{lines}");
+        // Two long, one short: only the long ones are cut, the short one is whole.
+        let hits = [hit("long-1", 50_000), hit("short", 80), hit("long-2", 50_000)];
+        let (lines, cut) = lookup_hit_lines(&hits, 18_500);
+        assert_eq!(cut, 2);
+        assert!(lines.chars().count() <= 18_500, "{} characters", lines.chars().count());
+        assert!(lines.contains(&format!("short (Report): {}\n", "x".repeat(80))), "the short hit is whole");
+        assert!(lines.contains("use get with id long-1 for the rest") && lines.contains("use get with id long-2 for the rest"));
+        assert!(lines.find("long-1").unwrap() < lines.find("short").unwrap() && lines.find("short").unwrap() < lines.find("long-2").unwrap(), "order is kept");
+        // The cut keeps the first part, on a character boundary.
+        let (lines, _) = lookup_hit_lines(&[("e".to_string(), "e (Report): ".to_string(), "\u{e9}".repeat(40_000))], 1_000);
+        assert!(lines.starts_with("e (Report): \u{e9}\u{e9}"), "{}", &lines[..40]);
+        // Even 25 huge hits keep a readable first part each.
+        let many: Vec<_> = (0..25).map(|n| hit(&format!("r{n:02}"), 100_000)).collect();
+        let (lines, cut) = lookup_hit_lines(&many, 18_500);
+        assert_eq!(cut, 25);
+        assert!(lines.chars().count() <= 20_000, "{} characters", lines.chars().count());
     }
 
     fn server() -> ThorMcpServer {
