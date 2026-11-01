@@ -190,7 +190,12 @@ time box of 20 seconds (`THOR_MACHINE_PASS_SECS`, 1 to 200), and writes a
 rule, a note or an open point of its own for each; what it could not decide
 goes to the batch or the A4 list, and the start note shows both with the exact
 call for each item. A pass the hook did not finish (it was killed, or the box
-ran out) is finished by the next `Stop`. Keep the routine under a name of your
+ran out) is finished by the next `Stop`. Rules the box ended before are named in the
+batch record and LEAD the next start's pass, in the order they were left, so over
+successive evaluations every old rule gets its turn and none starves. The start whose
+pass led the next one is the newest of the project whose pass FINISHED: a start that
+never got its pass (its hook was killed, its session went quiet) left no list, and is
+skipped rather than read as "nothing was left". Keep the routine under a name of your
 own as well? List that name, one per line, in `eval-command-names.txt` beside
 the store, and opening it under that name starts an evaluation too.
 
@@ -207,6 +212,17 @@ also refused while the batch or the A4 list is not settled, while THOR is still
 deciding, while the verdicts given in the same turn are not checked yet, and
 when a frozen item was changed outside an attested call of the evaluation (that
 voids it; the next `Stop` starts a fresh one).
+
+**The tool server must be as new as the installed program.** A session whose `mcp`
+(the tool server, loaded once when Claude Code starts) is older than the installed one
+would file a report that is on file and does not count. THOR says so before that
+happens: the end-of-turn ask is not made and the turn is not held, the line "This
+session's tool server is older than the installed one ... Restart Claude" is said once
+per session (not at every turn), `/thor-eval` starts nothing in such a session and says
+why, and a `remember` of an evaluation report is refused up front with the same plain
+reason ("REFUSED: this tool server is older than the installed one ... Nothing was
+written"), judged from the time the tool server started against the time the installed
+`mcp` file was written.
 
 At the first main-session `Stop` after a filing, THOR validates it once and
 records the answer in the log (`eval-validator`, `valid` or not, with the
@@ -425,6 +441,18 @@ queue, and against no project's budget. A `mark` given from a shell with
 `serve mark` still writes a verdict, but it is outside an attested call: it is
 not counted as judgement debt settled, it does not shrink a judgement list, and
 the machine section lists it as a side door.
+
+**One project, one spelling.** A project name that differs from an existing one only in
+case, spaces or hyphens ("Acme tool tracking", "Acme-tool-tracking") is the same name.
+A folder is resolved to the spelling the memory already has (the exact spelling first,
+else the spelling with most items), a plain folder with no repository and no marker
+whose own name matches a project belongs to it, a registered working copy counts as
+that project whichever way its folder is spelled, and a write that would file under a
+second spelling is refused with the spelling to use (the owner can still name a new
+collection). The code index keeps the folder's own name, because the git hook that
+refreshes it has no memory to ask. Nothing stored is renamed or merged: `doctor` names
+the pairs that already exist ("project names: ... are one name written two ways") with
+the one thing to do.
 
 `--project <key>` additionally writes a `.thor-project` marker in the current
 directory to override the project name. By default, a checkout is scoped to the
@@ -1187,6 +1215,12 @@ against them, so nobody has to hunt for a rule that refuses what it should not.
   that was walked around without weakening the rule. `remember` and `revise` of a
   rule that can refuse say `real calls: this rule would refuse K of N real calls
   in the last 30 days`, with up to three examples; they inform and never refuse.
+
+**Probable false blocks are listed worst first.** The refusal-outcomes line (the start
+note, the report's machine section, `doctor`) lists at most eight probable false blocks
+- a refusal followed by a weakening or retract of the refusing rule - with the rule that
+refused the most real calls first, a rule's blocks together. When more exist the line
+says how many and names the command that lists every one: `doctor --db "<store>" --full`.
 
 There is a second gate that keeps the number from rotting once you start
 using it. Adding a fact to a target that already holds one whose own proof

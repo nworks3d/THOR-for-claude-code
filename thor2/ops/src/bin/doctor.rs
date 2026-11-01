@@ -86,6 +86,8 @@ struct Cli {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    // This folder's project is spelled the way the memory already spells it.
+    serve::project::load_known_scopes(&cli.db);
     println!("{}", ops::health::version_line());
 
     let token = match &cli.to {

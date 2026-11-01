@@ -834,6 +834,25 @@ fn mcp_installed_at(dir: &Path, at: i64) -> PathBuf {
     path
 }
 
+/// A tool server that started before the installed one was written refuses
+/// to file, with the plain reason; a newer or unknown one refuses nothing.
+#[test]
+fn a_tool_server_older_than_the_installed_one_refuses_to_file_with_the_plain_reason() {
+    let fx = Fx::new();
+    let now = crate::time::now_unix();
+    let mcp = mcp_installed_at(fx.dir.path(), now - 3600);
+
+    let refused = stale_tool_server_refusal(Some(now - 7200), Some(&mcp)).expect("started before the install");
+    assert!(refused.starts_with("REFUSED: this tool server is older than the installed one"), "{refused}");
+    assert!(refused.contains("would not count") && refused.contains("Nothing was written"), "{refused}");
+    assert!(refused.contains("restart Claude"), "{refused}");
+    assert_eq!(stale_tool_server_refusal(Some(now - 60), Some(&mcp)), None, "started after the install");
+    assert_eq!(stale_tool_server_refusal(Some(now - 3600), Some(&mcp)), None, "started the second it was written");
+    assert_eq!(stale_tool_server_refusal(None, Some(&mcp)), None, "start unknown: nothing refused");
+    assert_eq!(stale_tool_server_refusal(Some(now - 7200), None), None, "no installed program to compare");
+    assert_eq!(stale_tool_server_refusal(Some(now - 7200), Some(&fx.dir.path().join("missing.exe"))), None);
+}
+
 /// A session that started before the tool server was replaced is told to
 /// restart, with no hold; one that started after it is asked normally; and
 /// every unreadable case fails open (field test 14, H1).

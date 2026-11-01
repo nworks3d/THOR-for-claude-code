@@ -294,6 +294,16 @@ inside that folder, naming the memory (`--db`, the path the install printed on i
 Add `--project "<project-name>"` only when the folder is not called what they call
 the project, and only when they told you the name: you may not invent one.
 
+**A name that differs only in case, spaces or hyphens is the same project.** The
+installer, the hooks and the tool server resolve a folder to the spelling the
+memory already has ("Acme tool tracking" and "Acme-tool-tracking" are one
+project), so a second spelling never opens a second collection, and a write that
+would file under one is refused with the spelling to use: repeat the write with
+that spelling. If `doctor` says two project names "are one name written two ways",
+they already exist; nothing was merged. Ask the owner which spelling to keep, then
+move the items of the other with `revise` (set `project` to the kept spelling), one
+by one. Never do that unasked.
+
 **A project an earlier release already read has no working copy yet.** Nothing
 registers it by itself. Run this once from inside that checkout - it records the
 folder and touches nothing else, no settings and no code reading:
@@ -1126,6 +1136,10 @@ half an hour or more never counts.
      characters); if the rule was right, say so in the report with the id. It is
      done when each one has one of those outcomes in your report. `doctor` shows
      the same rules in one line; `serve --db "<their store>" sweep` shows all of it.
+     The probable false blocks (a refusal followed by a weakening of the rule) are
+     listed worst first, the rules that refused the most real calls on top, at most
+     8; when more exist the line says so and names the command that lists every
+     one (`doctor --db "<their store>" --full`).
    - **Crowded places (item e of the teeth section).** A file or command that
      more than 4 facts are bound to (the project's own and the global ones),
      so the lowest ranked are outranked and never shown at their moment: a
@@ -1192,6 +1206,16 @@ use those three only when you can say why.
 Claude Code can change the format it writes that record in. THOR then cannot
 check any filing, so it asks for no evaluation, and says so on every turn until
 THOR itself is updated. Nothing you do fixes it: tell the owner.
+
+**When this session's tool server is older than the installed one.** The tool
+server (`mcp`) loads only when Claude Code starts. After THOR was upgraded, a
+session that started before it still runs the old one, and a report it files is on
+file but does not count. THOR then asks for no evaluation and holds no turn in
+that session, says so once (not at every turn), starts nothing when `/thor-eval`
+is typed, and refuses an evaluation report up front ("this tool server is older
+than the installed one ... Nothing was written"). Do not retry: tell the owner in
+one sentence to close Claude Code completely and open it again; the evaluation is
+asked again after that.
 
 The verdict list of an evaluation only ever names a note THIS session actually
 saw fire - never one that only ever showed up during other, unrelated work.

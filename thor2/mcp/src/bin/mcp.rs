@@ -63,7 +63,9 @@ struct Cli {
 /// from somebody else's repository, which would be worse than not answering.
 fn resolve_code_index(root: &Path) -> Option<mcp::CodeIndexPaths> {
     let cwd = std::env::current_dir().ok()?;
-    let project = serve::project::resolve_project(&cwd)?;
+    // The index is named by the folder itself, not by the project it is filed
+    // under: the git hook that refreshes it has no memory to ask.
+    let project = serve::project::folder_own_name(&cwd)?;
     let repo = serve::project::git_root(&cwd)?;
     let index_db = root.join(format!("{project}.db"));
     index_db.exists().then_some(mcp::CodeIndexPaths { index_db, repo })
@@ -76,7 +78,14 @@ fn main() {
         println!("{}", serve::version_line("mcp"));
         return;
     }
+    // First thing: the filing of an evaluation report compares this with the
+    // installed program (`mcp::note_start`).
+    mcp::note_start();
     let cli = Cli::parse();
+    // The project of the folder this server runs in is spelled the way the
+    // memory already spells it (case, spaces and hyphens do not make a second
+    // project). Done once, here: the server's own thread resolves it.
+    serve::project::load_known_scopes(&cli.db);
     let code = match (cli.code_index_db, cli.repo) {
         (Some(index_db), Some(repo)) => Some(mcp::CodeIndexPaths { index_db, repo }),
         // clap's `requires` makes the half-given cases unreachable.

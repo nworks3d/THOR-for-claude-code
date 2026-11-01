@@ -5490,11 +5490,21 @@ pub fn superseded_words(superseded: &FrozenSuperseded) -> String {
 }
 
 /// The newest evaluation start of `project` written before log seq
-/// `before_seq`, in any session - where a machine pass reads which rules the
-/// previous pass did not reach.
+/// `before_seq`, in any session, WHOSE MACHINE PASS FINISHED - where a machine
+/// pass reads which rules the previous pass did not reach.
+///
+/// A start whose pass never finished (its hook was killed, its session went
+/// quiet and a later start superseded it) left no record of what it reached,
+/// so it is skipped for the newest one that did. Taking it instead handed the
+/// next pass an empty list: the order began again at the head, and a pool of
+/// rules that stay owed after being tried (a blocker, a need for the agent)
+/// kept the same first rules at the head and never reached the rest.
 pub fn previous_evaluation_start(store: &EventStore, project: &str, before_seq: i64) -> Option<EvaluationStart> {
     let events = store.events_of_kinds(&[EventKind::FactCreated, EventKind::FactRevised], 0).ok()?;
-    starts_in(&events).into_iter().filter(|s| s.frozen.project == project && s.seq < before_seq).max_by_key(|s| s.seq)
+    starts_in(&events)
+        .into_iter()
+        .filter(|s| s.frozen.project == project && s.seq < before_seq && s.frozen.machine.is_some())
+        .max_by_key(|s| s.seq)
 }
 
 /// Every evaluation start record written after log seq `since`, in any
@@ -7247,7 +7257,29 @@ fn refusal_outcomes(log: &LogAt, window: &[Event], except_session: Option<&str>)
             });
         }
     }
+    rank_by_refusals(&mut out.blocks);
     out
+}
+
+/// The probable false blocks with the rule that refused most real calls
+/// first, so the few a list shows are the worst ones; blocks of one rule stay
+/// together and every tie keeps the order the log gave.
+pub fn rank_by_refusals(blocks: &mut [FalseBlock]) {
+    // (how many blocks, where the rule first appears) per rule.
+    let mut seen: std::collections::HashMap<String, (usize, usize)> = Default::default();
+    for (place, block) in blocks.iter().enumerate() {
+        seen.entry(block.rule.clone()).or_insert((0, place)).0 += 1;
+    }
+    blocks.sort_by_key(|block| {
+        let (count, first) = seen.get(&block.rule).copied().unwrap_or((0, 0));
+        (std::cmp::Reverse(count), first)
+    });
+}
+
+/// The command that lists EVERY probable false block, not only the first
+/// `FALSE_BLOCKS_LISTED`: doctor with `--full`, naming the memory it reads.
+pub fn doctor_full_command_for(db: Option<&Path>) -> String {
+    format!("doctor{} --db \"{}\" --full", std::env::consts::EXE_SUFFIX, db_argument(db))
 }
 
 /// The summary sentence of REFUSAL OUTCOMES for `place` ("in the window").
@@ -7282,7 +7314,8 @@ fn false_block_lines(blocks: &[FalseBlock]) -> String {
         return String::new();
     }
     let mut out = format!(
-        "\nprobable false blocks, each with the call that was refused and what followed (at most {FALSE_BLOCKS_LISTED} are listed):"
+        "\nprobable false blocks, each with the call that was refused and what followed (at most {FALSE_BLOCKS_LISTED} are listed, \
+         the rules that refused the most calls first):"
     );
     for block in blocks.iter().take(FALSE_BLOCKS_LISTED) {
         // The same two lines the start note gives, so the filing reply never
@@ -7293,7 +7326,11 @@ fn false_block_lines(blocks: &[FalseBlock]) -> String {
         ));
     }
     if blocks.len() > FALSE_BLOCKS_LISTED {
-        out.push_str(&format!("\n- and {} more, not listed here", blocks.len() - FALSE_BLOCKS_LISTED));
+        out.push_str(&format!(
+            "\n- and {} more, not listed here; every one is listed by: {}",
+            blocks.len() - FALSE_BLOCKS_LISTED,
+            doctor_full_command_for(None)
+        ));
     }
     out
 }
@@ -12080,7 +12117,7 @@ mod tests {
         // what followed. The one left alone, the unverified and the evaluating
         // session's own are not listed.
         assert!(
-            section.contains("\nprobable false blocks, each with the call that was refused and what followed (at most 8 are listed):"),
+            section.contains("\nprobable false blocks, each with the call that was refused and what followed (at most 8 are listed, the rules that refused the most calls first):"),
             "{section}"
         );
         assert!(
@@ -12242,11 +12279,40 @@ mod tests {
         let from = section.find("\nprobable false blocks, each with").expect(&section);
         let block = &section[from..from + section[from..].find("\n\n").expect(&section)];
         assert_eq!(block.matches("\n- 'cap-").count(), 8, "eight are listed: {block}");
-        assert!(block.ends_with("\n- and 2 more, not listed here"), "{block}");
+        assert!(block.contains("\n- and 2 more, not listed here; every one is listed by: doctor"), "{block}");
+        assert!(block.contains("--full"), "{block}");
         let first = block.lines().find(|l| l.starts_with("- 'cap-00'")).expect(block);
         assert!(first.contains("[redacted]") && !first.contains("ghp_abcdef"), "a secret is redacted: {first}");
         let second = block.lines().find(|l| l.starts_with("- 'cap-01'")).expect(block);
         assert!(second.contains(&format!("{}...'", "x".repeat(100))) && !second.contains(&"x".repeat(200)), "a long call is cut: {second}");
+    }
+
+    /// The probable false blocks a list shows are the worst ones: the rule that
+    /// refused the most real calls first, a rule's blocks together, ties in the
+    /// order the log gave. Past the cap the line names the command that lists
+    /// every one.
+    #[test]
+    fn the_false_blocks_listed_are_ranked_by_how_many_calls_each_rule_refused() {
+        let block = |rule: &str, n: usize| FalseBlock { rule: rule.to_string(), line: format!("'{rule}' #{n}"), restore: String::new() };
+        // Log order: one-off, twice, one-off, three times, twice, three times.
+        let mut blocks = vec![
+            block("once-a", 1),
+            block("twice", 1),
+            block("once-b", 1),
+            block("thrice", 1),
+            block("twice", 2),
+            block("thrice", 2),
+            block("thrice", 3),
+        ];
+        rank_by_refusals(&mut blocks);
+        let order: Vec<String> = blocks.iter().map(|b| b.line.clone()).collect();
+        assert_eq!(order, ["'thrice' #1", "'thrice' #2", "'thrice' #3", "'twice' #1", "'twice' #2", "'once-a' #1", "'once-b' #1"]);
+
+        let many: Vec<FalseBlock> = (0..138).map(|n| block(&format!("r{n}"), 1)).collect();
+        let text = false_block_lines(&many);
+        assert!(text.contains("the rules that refused the most calls first"), "{text}");
+        assert!(text.contains("and 130 more, not listed here; every one is listed by: "), "{text}");
+        assert!(text.contains(&doctor_full_command_for(None)) && text.contains("--full"), "{text}");
     }
 
     /// THE OWNER'S GO (step 26), at the write gate: the marker of a rule marked

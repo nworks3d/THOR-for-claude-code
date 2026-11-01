@@ -314,11 +314,25 @@ pub fn try_begin(db: &Path, store: &mut EventStore, session_id: &str, project: &
 /// the record on the log is read back; failing that, `start` comes back
 /// undecided and the next Stop tries again.
 pub fn decide(store: &mut EventStore, start: EvaluationStart, time_box: Duration) -> EvaluationStart {
+    let deadline = Instant::now() + time_box;
+    decide_until(store, start, time_box.as_secs(), &mut |_| Instant::now() >= deadline)
+}
+
+/// `decide`, with the point where the pass stops given as a question: `stop`
+/// is asked before each old rule, with the number of rules tried so far in
+/// this pass, and the pass ends at the first `true`. `decide` asks the clock;
+/// a test asks a count, which the clock cannot give it.
+pub fn decide_until(
+    store: &mut EventStore,
+    start: EvaluationStart,
+    box_secs: u64,
+    stop: &mut dyn FnMut(usize) -> bool,
+) -> EvaluationStart {
     if start.frozen.decided() {
         return start;
     }
     let project = start.frozen.project.clone();
-    let passed = machine_pass(store, &project, &start, Instant::now() + time_box, time_box.as_secs());
+    let passed = machine_pass_until(store, &project, &start, box_secs, stop);
     let mut frozen = start.frozen.clone();
     frozen.batch = Some(passed.batch.clone());
     frozen.batch_later = passed.batch_later;
@@ -943,6 +957,17 @@ pub fn refresh_old_anchor_full_points(store: &mut EventStore, project: &str) -> 
 /// longer holds. It never writes the batch record: `decide` does, from what
 /// this returns. `box_secs` is only recorded.
 pub fn machine_pass(store: &mut EventStore, project: &str, start: &EvaluationStart, deadline: Instant, box_secs: u64) -> Passed {
+    machine_pass_until(store, project, start, box_secs, &mut |_| Instant::now() >= deadline)
+}
+
+/// `machine_pass`, ending where `stop` says (see `decide_until`).
+fn machine_pass_until(
+    store: &mut EventStore,
+    project: &str,
+    start: &EvaluationStart,
+    box_secs: u64,
+    stop: &mut dyn FnMut(usize) -> bool,
+) -> Passed {
     let db = store.path();
     let session = start.frozen.session.clone();
     let corpus = Corpus::load(store);
@@ -951,7 +976,7 @@ pub fn machine_pass(store: &mut EventStore, project: &str, start: &EvaluationSta
     let order = candidates(store, project, start, &compared);
     let mut machine = MachinePass { box_secs, ..MachinePass::default() };
     for (place, candidate) in order.iter().enumerate() {
-        if Instant::now() >= deadline {
+        if stop(place) {
             machine.not_reached_ids = order[place..].iter().map(|c| c.id.clone()).collect();
             break;
         }
@@ -1666,8 +1691,12 @@ fn signals_section(out: &mut String, record: &str, signals: &model::store::Signa
     }
     if signals.false_blocks_more > 0 {
         out.push_str(&format!(
-            "\n      {} more are not listed here; the machine section of your report names up to {} again.",
+            "\n      {} more are not listed here (the {} above are the rules that refused the most calls); every one is listed \
+             by running `{}` (the memory path is the one in your hooks). The machine section of your report names up to \
+             {} again.",
             signals.false_blocks_more,
+            signals.false_blocks.len().min(caps.blocks),
+            model::store::doctor_full_command_for(None),
             model::store::FALSE_BLOCKS_LISTED
         ));
     }

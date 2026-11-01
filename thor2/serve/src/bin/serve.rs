@@ -454,6 +454,9 @@ fn main() {
         return;
     }
     let cli = Cli::parse();
+    // A folder is resolved to the spelling an existing project already has
+    // (case, spaces and hyphens do not make a second project).
+    project::load_known_scopes(&cli.db);
     match cli.command {
         Command::Hook { diagnose, actor, no_record } => cmd_hook(&cli.db, diagnose, actor, no_record),
         Command::Check(args) => cmd_check(&cli.db, &build_input(&args), args.json),
@@ -560,6 +563,13 @@ fn sibling(name: &str) -> Option<PathBuf> {
 fn stale_tool_server_line(session_id: &str) -> Option<String> {
     let mcp = sibling("mcp");
     serve::eval_filing::tool_server_stale(session_id, serve::attest::transcripts_root().as_deref(), mcp.as_deref())
+}
+
+/// What the evaluation routine (the typed command, the skill call) answers in
+/// a session whose tool server is older than the installed one: nothing is
+/// started, because the report filed from here would be refused up front.
+fn not_started_in_a_stale_session(stale_line: &str) -> String {
+    format!("[THOR] No evaluation was started in this session. {stale_line}")
 }
 
 fn decay_notice(store: &EventStore, db: &Path, cwd: Option<&Path>) -> Option<String> {
@@ -2449,6 +2459,11 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                 && serve::eval_session::prompt_starts_evaluation(prompt_text, &serve::eval_session::command_names(db_path));
             let eval_note = if typed && !no_record {
                 session_project.as_deref().and_then(|p| {
+                    // No evaluation starts in a session whose tool server is
+                    // older than the installed one: its report could not count.
+                    if let Some(line) = stale_tool_server_line(&session_id) {
+                        return Some(not_started_in_a_stale_session(&line));
+                    }
                     match serve::eval_session::try_start(db_path, &mut store, &session_id, p, "command") {
                         Ok(started) => Some(match started.fresh {
                             true => serve::eval_session::start_note(&started.start),
@@ -3251,6 +3266,9 @@ fn skill_call_answer(
     payload: &Value,
     no_record: bool,
 ) -> String {
+    if let Some(line) = stale_tool_server_line(session_id) {
+        return not_started_in_a_stale_session(&line);
+    }
     if let Some(open) = serve::eval_session::open_evaluation(store, session_id, project) {
         // An open evaluation whose machine pass was cut off is finished here
         // (`start` keeps the open one and only writes its batch record).
@@ -3462,13 +3480,19 @@ fn write_turn_mark(db: &Path, session_id: &str, mark: TurnMark) {
     }
 }
 
+/// The key under which a line said once is remembered in the turn mark's
+/// `announced` list: it changes when the line changes.
+fn said_key(line: &str) -> String {
+    format!("said:{}", model::store::machine_block_digest(line).chars().take(16).collect::<String>())
+}
+
 /// Says `line` to the session ONCE: `Some(line)` the first time, `None` on every
 /// later Stop until the line itself changes (a new report id, a new install
 /// time). Field test 14, C5: the same "report is on file but does not count"
 /// line went out on 14 Stops in two hours. Remembered in the session's turn
 /// mark, beside the void notices.
 fn said_once(db_path: &Path, session_id: &str, line: String) -> Option<String> {
-    let key = format!("said:{}", model::store::machine_block_digest(&line).chars().take(16).collect::<String>());
+    let key = said_key(&line);
     let mut marks = read_turn_marks(db_path);
     let mut mark = marks.remove(session_id).unwrap_or_default();
     if mark.announced.contains(&key) {
@@ -3560,9 +3584,15 @@ fn evaluation_after_a_hold(db_path: &Path, session_id: &str, payload: &Value) ->
     if let Some(start) = open.first() {
         let project = &start.frozen.project;
         // A session whose tool server is older than the installed one cannot
-        // file a report that counts: no hold for it (field test 14, H1).
+        // file a report that counts: no hold for it (field test 14, H1). Said
+        // once per session, like the same line at the first-pass Stop: it used
+        // to ride along on every Stop of every held turn.
         if let Some(line) = stale_tool_server_line(session_id) {
-            return Some(quiet(line, None));
+            let key = said_key(&line);
+            if announced.contains(&key) {
+                return None;
+            }
+            return Some(quiet(line, Some(&key)));
         }
         if !may_hold {
             return Some(quiet(format!(
