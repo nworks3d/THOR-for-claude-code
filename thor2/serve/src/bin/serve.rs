@@ -1218,7 +1218,7 @@ fn plain_line_for_block(event: &str, reason: &str) -> &'static str {
         }
         // Before the evaluation arm: an evaluation ask can ride along with this hold.
         "Stop" if lower.contains(&serve::leftover_scripts::HOLD_MARKER.to_lowercase()) => {
-            "Your assistant left a few helper scripts outside your projects. THOR asks it to keep the useful ones in your tools folder and delete the rest before it finishes. Nothing is needed from you."
+            "Your assistant left a few helper scripts outside your projects. THOR asks it to keep the useful ones in your tools folder and tell you about the rest before it finishes. Nothing is deleted without your yes. Nothing is needed from you."
         }
         "Stop" if lower.contains("evaluation") => {
             "THOR asks your assistant to do a short tidy-up of its memory before it finishes. It can take a few minutes. Nothing is needed from you."

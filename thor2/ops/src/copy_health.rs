@@ -95,7 +95,7 @@ pub fn lines(db: &Path, now: i64) -> Vec<String> {
     };
     if leftover.exists() {
         out.push(format!(
-            "copy: NOTE {} is left over from a pull that did not finish. It holds the complete memory; delete the folder.",
+            "copy: NOTE {} is left over from a pull that did not finish. It holds the complete memory; tell the owner, and delete the folder only after the owner's own yes.",
             leftover.display()
         ));
     }
