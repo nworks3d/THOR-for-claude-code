@@ -29,21 +29,24 @@ impl Drop for Receiver {
     }
 }
 
-/// An OS-assigned free port: bind a throwaway listener, read the port back,
-/// drop it. `sync recv --bind` cannot report back which port it actually
-/// bound (it prints the literal `--bind` string, not the socket's real
-/// address - see `transport::run_receiver`), so the caller has to already
-/// know the port before starting it.
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
-}
+/// Receivers start in a line. A port picked by binding port 0 and dropping the
+/// listener is free again at once, so two tests picking at the same moment were
+/// handed the same port: the second receiver failed to bind and exited, and its
+/// test talked to the first test's receiver. Holding this lock from the pick
+/// until the receiver listens keeps the port taken before the next pick.
+static RECEIVER_START: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Start a real `sync recv` fixture receiver on `port`, backed by a fresh
+/// Start a real `sync recv` fixture receiver on a free port, backed by a fresh
 /// store at `db`, and block until it actually accepts connections - spawning
 /// a process is not instantaneous, and shipping against a receiver that has
-/// not bound yet would fail for a reason this file is not testing.
-fn start_receiver(db: &Path, port: u16) -> Receiver {
-    let child = Command::new(env!("CARGO_BIN_EXE_sync"))
+/// not bound yet would fail for a reason this file is not testing. `sync recv
+/// --bind` cannot report back which port it bound (it prints the literal
+/// `--bind` string, see `transport::run_receiver`), so the port is picked here
+/// and returned.
+fn start_receiver(db: &Path) -> (Receiver, u16) {
+    let _one_at_a_time = RECEIVER_START.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sync"))
         .args(["recv", "--db"])
         .arg(db)
         .args(["--bind", &format!("127.0.0.1:{port}")])
@@ -62,7 +65,8 @@ fn start_receiver(db: &Path, port: u16) -> Receiver {
         assert!(std::time::Instant::now() < deadline, "the fixture receiver never started listening on {addr}");
         std::thread::sleep(Duration::from_millis(50));
     }
-    Receiver(child)
+    assert!(child.try_wait().unwrap().is_none(), "the receiver exited at once: port {port} was not its own");
+    (Receiver(child), port)
 }
 
 /// A local store with a couple of events in it - something for `sync ship`
@@ -98,8 +102,7 @@ fn a_refused_ship_exits_non_zero_with_one_clear_message_and_records_the_failure(
     let receiver_db = dir.path().join("receiver.db");
     let shipper_db = dir.path().join("shipper.db");
     seed_shipper(&shipper_db);
-    let port = free_port();
-    let _receiver = start_receiver(&receiver_db, port);
+    let (_receiver, port) = start_receiver(&receiver_db);
     let to = format!("http://127.0.0.1:{port}");
 
     let before = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
@@ -140,8 +143,7 @@ fn a_successful_ship_records_the_last_success() {
     let receiver_db = dir.path().join("receiver.db");
     let shipper_db = dir.path().join("shipper.db");
     seed_shipper(&shipper_db);
-    let port = free_port();
-    let _receiver = start_receiver(&receiver_db, port);
+    let (_receiver, port) = start_receiver(&receiver_db);
     let to = format!("http://127.0.0.1:{port}");
 
     let before = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
@@ -170,8 +172,7 @@ fn shipping_nothing_new_is_still_a_success_and_still_updates_the_timestamp() {
     let receiver_db = dir.path().join("receiver.db");
     let shipper_db = dir.path().join("shipper.db");
     seed_shipper(&shipper_db);
-    let port = free_port();
-    let _receiver = start_receiver(&receiver_db, port);
+    let (_receiver, port) = start_receiver(&receiver_db);
     let to = format!("http://127.0.0.1:{port}");
 
     let first = run_ship(&shipper_db, &to, TOKEN);

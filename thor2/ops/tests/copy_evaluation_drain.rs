@@ -33,12 +33,21 @@ impl Drop for Receiver {
     }
 }
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
-}
+/// Fixtures start in a line: a port picked by binding port 0 and dropping the
+/// listener is free again at once, so two tests picking at the same moment were
+/// handed the SAME port. The second receiver then failed to bind and exited
+/// while its test's readiness probe connected to the first test's receiver, and
+/// the drain read another fixture's inbox (seen as `cap-a` in a test that never
+/// queued it). Holding this lock from the pick until the receiver listens keeps
+/// the port taken before the next test may pick.
+static RECEIVER_START: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn start_receiver(db: &Path, inbox: &Path, port: u16) -> Receiver {
-    let child = Command::new(env!("CARGO_BIN_EXE_sync"))
+/// Start a real `sync recv` on a free port and return it with that port, once
+/// it actually listens.
+fn start_receiver(db: &Path, inbox: &Path) -> (Receiver, u16) {
+    let _one_at_a_time = RECEIVER_START.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sync"))
         .args(["recv", "--db"])
         .arg(db)
         .args(["--bind", &format!("127.0.0.1:{port}"), "--inbox"])
@@ -54,7 +63,8 @@ fn start_receiver(db: &Path, inbox: &Path, port: u16) -> Receiver {
         assert!(std::time::Instant::now() < deadline, "the receiver never listened");
         std::thread::sleep(Duration::from_millis(50));
     }
-    Receiver(child)
+    assert!(child.try_wait().unwrap().is_none(), "the receiver exited at once: port {port} was not its own");
+    (Receiver(child), port)
 }
 
 struct Fixture {
@@ -70,8 +80,7 @@ fn fixture() -> Fixture {
     let main = dir.path().join("main.db");
     drop(EventStore::new(&main).unwrap());
     let inbox = dir.path().join("inbox.jsonl");
-    let port = free_port();
-    let receiver = start_receiver(&dir.path().join("replica.db"), &inbox, port);
+    let (receiver, port) = start_receiver(&dir.path().join("replica.db"), &inbox);
     Fixture { _dir: dir, main, inbox, _receiver: receiver, base: format!("http://127.0.0.1:{port}") }
 }
 
