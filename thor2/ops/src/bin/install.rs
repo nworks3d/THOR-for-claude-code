@@ -740,6 +740,22 @@ fn build_project_index(index_root: &Path, key: &str, repo: &Path) -> anyhow::Res
 /// the branch below that finds one already built: there is no fresh
 /// `BuildStats` to report there, but the sidecar itself still knows how many
 /// files it holds.
+/// The closing lines about restarting Claude Code. It reads THOR's connections
+/// and its tool server only when it starts (and the tool server reads the code
+/// index once, then), so a restart is asked for only when this run changed one
+/// of those, or on the very first install; any other run says none is needed.
+fn restart_lines(because: &[&str]) -> Vec<String> {
+    if because.is_empty() {
+        return vec![
+            "Done. Nothing is left for you to do: nothing that Claude Code loads when it starts was changed, so you do not need to restart it.".to_string(),
+        ];
+    }
+    vec![
+        "Done. ONE THING LEFT FOR YOU: close Claude Code completely and open it again.".to_string(),
+        format!("Claude Code only learns about THOR when it starts, so until you do this nothing above is active ({}).", because.join("; ")),
+    ]
+}
+
 fn existing_index_file_count(index_root: &Path, key: &str) -> anyhow::Result<usize> {
     let db = index_root.join(format!("{key}.db"));
     let store = codeindex::Store::open(&db).map_err(|e| anyhow::anyhow!(e))?;
@@ -1094,8 +1110,14 @@ fn main() -> ExitCode {
 
     // 1. The store. First, because every later step points at it, and because
     // the health check refuses to run without one.
+    // WHY CLAUDE CODE MUST BE RESTARTED, collected as the run goes: it loads
+    // its hooks and its tool servers only when it starts, and the tool server
+    // picks its code index once at its start. A run that changed none of
+    // those, on a machine that was set up before, needs no restart.
+    let mut restart_because: Vec<&str> = Vec::new();
     match ensure_store(&db) {
         Ok(StoreOutcome::Created) => {
+            restart_because.push("this is the first install");
             println!("+ created a memory at {}", db.display());
             // Only ever on a store this run created. A brand new memory is
             // empty, and an agent with nothing in front of it writes notes in
@@ -1231,6 +1253,9 @@ fn main() -> ExitCode {
     match install_hooks(&settings, &specs) {
         Ok(report) => {
             let changed = report.results.iter().filter(|(_, o)| *o != HookOutcome::AlreadyPresent).count();
+            if changed > 0 {
+                restart_because.push("THOR's connections in Claude Code's settings changed");
+            }
             if changed == 0 {
                 println!("= THOR was already connected to Claude Code");
             } else {
@@ -1327,9 +1352,13 @@ fn main() -> ExitCode {
             }
             match install_tool_server(path, "thor", &exe.display().to_string(), &args) {
                 Ok(report) => match report.outcome {
-                    ServerOutcome::Added => println!("+ gave your assistant a way to save notes (registered in {})", path.display()),
+                    ServerOutcome::Added => {
+                        restart_because.push("the note-saving program was registered");
+                        println!("+ gave your assistant a way to save notes (registered in {})", path.display())
+                    }
                     ServerOutcome::AlreadyPresent => println!("= your assistant could already save notes"),
                     ServerOutcome::Replaced => {
+                        restart_because.push("the note-saving program was registered");
                         println!("+ gave your assistant a way to save notes (registered in {})", path.display());
                         if let Some(old) = &report.replaced {
                             println!("  this replaced an older one that pointed at {old}");
@@ -1413,6 +1442,7 @@ fn main() -> ExitCode {
         },
         Some(key) => match code_index_root.as_deref().map(|r| build_project_index(r, &index_key, &here)).transpose() {
             Ok(Some(Some(files))) => {
+                restart_because.push("this project's code was read for the first time");
                 println!("+ read this project's code, {files} file(s), so it can be searched and kept fresh on every commit");
                 // Immediately after the read succeeds: opens the project in
                 // the memory itself, so the very first `remember` filed under
@@ -1454,10 +1484,26 @@ fn main() -> ExitCode {
     }
 
     println!();
-    println!("Done. ONE THING LEFT FOR YOU: close Claude Code completely and open it again.");
-    println!("Claude Code only learns about THOR when it starts, so until you do this nothing above is active.");
+    for line in restart_lines(&restart_because) {
+        println!("{line}");
+    }
     println!("To check that THOR is healthy afterwards, ask your assistant to run THOR's doctor:");
     let bin_dir = serve_exe.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
     println!("  {}", ops::install::doctor_invocation(&bin_dir, &db, cfg!(windows)));
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod restart_tests {
+    use super::restart_lines;
+
+    #[test]
+    fn a_restart_is_asked_for_only_when_something_a_restart_loads_changed() {
+        let none = restart_lines(&[]).join("\n");
+        assert!(none.contains("do not need to restart"), "{none}");
+        assert!(!none.contains("ONE THING LEFT"), "{none}");
+        let some = restart_lines(&["THOR's connections in Claude Code's settings changed"]).join("\n");
+        assert!(some.contains("ONE THING LEFT FOR YOU: close Claude Code completely"), "{some}");
+        assert!(some.contains("connections in Claude Code's settings changed"), "{some}");
+    }
 }

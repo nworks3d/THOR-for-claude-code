@@ -947,6 +947,12 @@ the backup` means the project name is spelled differently on the main computer:
 run the command again with the right name. It is safe to run the command again
 at any time; a second run changes nothing it does not have to.
 
+The last two lines ask you to restart Claude Code only when this run changed
+something that Claude Code loads when it starts (the connections in its
+settings, or the note-saving program), or on the very first install. A repeat
+run that changed none of those ends with "Done. Nothing is left for you to do"
+instead, and you do not need to restart.
+
 ### If it stops
 
 The command either finishes or says plainly that nothing was set up and why:
