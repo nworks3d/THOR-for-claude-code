@@ -171,9 +171,14 @@ pub fn run(req: &Request) -> Result<Vec<String>, String> {
     }
 
     let specs = standard_hooks(&req.serve_exe.display().to_string(), &req.db.display().to_string());
+    // A restart is asked for only when something Claude Code loads at its
+    // start changed: the hook wiring in its settings. A copy registers no
+    // local tool server, and each hook starts the current `serve` fresh.
+    let mut restart_needed = false;
     match install_hooks(&req.settings, &specs) {
         Ok(report) => {
             let changed = report.results.iter().filter(|(_, o)| *o != HookOutcome::AlreadyPresent).count();
+            restart_needed = changed > 0;
             if changed == 0 {
                 lines.push("= THOR was already connected to Claude Code".to_string());
             } else {
@@ -209,8 +214,12 @@ pub fn run(req: &Request) -> Result<Vec<String>, String> {
     lines.push("  - notes are saved on the main machine, and show up here after the next refresh".to_string());
     lines.push("  - the weekly check runs on the main machine, unless the session has the replica connector's tools (then it is asked here too)".to_string());
     lines.push(String::new());
-    lines.push("Done. ONE THING LEFT FOR YOU: close Claude Code completely and open it again.".to_string());
-    lines.push("Claude Code only learns about THOR when it starts, so until you do this nothing above is active.".to_string());
+    if restart_needed {
+        lines.push("Done. ONE THING LEFT FOR YOU: close Claude Code completely and open it again.".to_string());
+        lines.push("Claude Code only learns about THOR when it starts, so until you do this nothing above is active.".to_string());
+    } else {
+        lines.push("Done. Nothing is left for you to do: THOR was already connected to Claude Code, and each hook reads the refreshed copy by itself, so you do not need to restart Claude Code.".to_string());
+    }
     Ok(lines)
 }
 
@@ -281,7 +290,7 @@ mod tests {
         assert!(said.contains("general work rules: 1 notes"), "{said}");
         assert!(said.contains("left out of the copy file on purpose"), "{said}");
         assert!(said.contains("What is read-only here"), "{said}");
-        assert!(said.contains("close Claude Code completely"), "{said}");
+        assert!(said.contains("ONE THING LEFT FOR YOU") && said.contains("close Claude Code completely"), "new hooks need a restart: {said}");
         assert!(copy_mode::is_copy(&s.req.db));
         let marker = copy_mode::read_marker(&s.req.db);
         assert_eq!(marker.scopes, vec!["alpha".to_string()]);
@@ -302,6 +311,8 @@ mod tests {
         let again = run(&s.req).unwrap().join("\n");
         assert!(again.contains("already up to date"), "{again}");
         assert!(again.contains("already connected"), "{again}");
+        assert!(!again.contains("ONE THING LEFT"), "nothing a restart loads changed: {again}");
+        assert!(again.contains("do not need to restart Claude Code"), "{again}");
         assert!(before == std::fs::read(&s.req.db).unwrap());
     }
 
