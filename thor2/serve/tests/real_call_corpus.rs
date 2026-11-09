@@ -492,3 +492,19 @@ fn switching_recording_off_keeps_nothing_and_the_sweep_says_it_has_no_data() {
     serve::plan::set_recording(&fx.db(), true).unwrap();
     assert_eq!(fx.record().calls, 1, "switched back on, recording resumes");
 }
+
+#[test]
+fn a_background_start_is_recorded_with_an_unknown_outcome_not_as_passed() {
+    let fx = Fx::new();
+    fx.write(&[
+        use_line("toolu_bg", "Bash", json!({"command": "cargo test", "run_in_background": true}), 100),
+        result_line("toolu_bg", "Command running in background with ID: b1", false, 99),
+        use_line("toolu_fg", "Bash", json!({"command": "cargo test"}), 90),
+        result_line("toolu_fg", "test result: ok", false, 89),
+    ]);
+    corpus::backfill(&fx.db(), &fx.root(), Duration::from_secs(30), NOW);
+    let rows = corpus::load_calls(&fx.db(), NOW);
+    let ok_of = |id: &str| rows.iter().find(|c| c.id == id).unwrap().ok;
+    assert_eq!(ok_of("toolu_bg"), None, "a background start says only that it started");
+    assert_eq!(ok_of("toolu_fg"), Some(true));
+}

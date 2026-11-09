@@ -5,6 +5,7 @@ What changed in each release, newest first. The release workflow copies the sect
 ## Unreleased
 
 - **A noise mark is no longer set aside as a side door.** Claude Code writes each tool call twice in the session transcript (`noise: true` and `"noise": "true"`), and the attester read that as two different calls. The two forms are now one call, and a verdict that was set aside can be given again; the reply says it was set aside and why.
+- **Starting a test run in the background is no longer counted as a passed run.** The record kept the outcome of every tool result as "ok", so a background start (whose result only says it started) read as "passed" in the evaluation's test signal. Its outcome is now unknown and the signal says it was started in the background, so run it again.
 
 ## 2.6.4 (2026-11-01)
 

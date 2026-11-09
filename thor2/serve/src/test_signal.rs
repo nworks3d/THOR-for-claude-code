@@ -56,6 +56,8 @@ pub struct LastRun {
     pub runner: String,
     /// `None` when the result was never seen.
     pub ok: Option<bool>,
+    /// The run was only STARTED in the background; its outcome was not seen.
+    pub background: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,7 +103,7 @@ pub fn signal_of<'a>(rows: impl Iterator<Item = &'a CallRow>) -> TestSignal {
     let mut changes_since = 0usize;
     for row in rows {
         if let Some(runner) = command_of(row).and_then(runner_in) {
-            last_run = Some(LastRun { at: row.t, runner: runner.to_string(), ok: row.ok });
+            last_run = Some(LastRun { at: row.t, runner: runner.to_string(), ok: row.ok, background: corpus::started_in_background(&row.input) });
             changes_since = 0;
         } else if is_change(row) {
             changes_since += 1;
@@ -138,6 +140,7 @@ pub fn line(signal: &TestSignal, now: i64) -> String {
     let result = match run.ok {
         Some(true) => "passed",
         Some(false) => "FAILED",
+        None if run.background => "started in the background, result unknown",
         None => "result not recorded",
     };
     let run_words = format!("last run: {} {result}, {}", run.runner, age_words(now, run.at));
@@ -146,6 +149,8 @@ pub fn line(signal: &TestSignal, now: i64) -> String {
     }
     let why = if signal.changes_since > 0 {
         format!("{} code change(s) since the last test or build run", signal.changes_since)
+    } else if run.background && run.ok.is_none() {
+        "the last run was only started in the background and its result is unknown, so run it again".to_string()
     } else if run.ok != Some(true) {
         "the last run did not pass or its result is unknown".to_string()
     } else {
@@ -245,6 +250,17 @@ mod tests {
         let old = of(&[bash("1", NOW - 8 * DAY, "go test ./...", Some(true))]);
         assert!(!old.may_skip(NOW));
         assert!(line(&old, NOW).contains("older than 7 days"), "{}", line(&old, NOW));
+    }
+
+    /// A test run started in the background answers only that it started.
+    #[test]
+    fn a_background_start_is_not_a_passed_run() {
+        let started = row("1", NOW - HOUR, "Bash", json!({ "command": "cargo test", "run_in_background": true }), None);
+        let signal = of(&[started]);
+        assert!(!signal.may_skip(NOW));
+        let text = line(&signal, NOW);
+        assert!(!text.contains("passed"), "{text}");
+        assert!(text.contains("started in the background, result unknown") && text.contains("run it again"), "{text}");
     }
 
     /// Field case: a Python project ran `python -m unittest` and was told to run

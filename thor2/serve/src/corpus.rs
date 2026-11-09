@@ -824,7 +824,9 @@ pub fn read_slice(
                             slice.patches.last_mut().expect("just pushed")
                         }
                     };
-                    target.ok = Some(!is_error);
+                    // A background start (`run_in_background`) answers only that it
+                    // STARTED: its outcome is unknown, never a pass.
+                    target.ok = if !is_error && started_in_background(&target.input) { None } else { Some(!is_error) };
                     for rule in rules {
                         if !target.r.contains(&rule) {
                             target.r.push(rule);
@@ -838,6 +840,16 @@ pub fn read_slice(
     }
     slice.end = consumed;
     Ok(slice)
+}
+
+/// Whether a call's input asks to run in the background (a boolean, or its
+/// text form, which Claude Code also writes).
+pub fn started_in_background(input: &Value) -> bool {
+    match input.get("run_in_background") {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(s)) => s == "true",
+        _ => false,
+    }
 }
 
 fn patch_row(id: &str, t: i64) -> CallRow {
