@@ -2602,6 +2602,56 @@ pub struct CodeIndexPaths {
     pub repo: std::path::PathBuf,
 }
 
+/// The sentence a revise adds when this session had already judged the item
+/// and the revise changed its text, check or bindings: that verdict judged the
+/// version before the change (`usefulness::noise_since_last_change` counts
+/// only verdicts since such a change), so it no longer stands for the new one.
+fn verdict_set_aside_by_revise(
+    store: &EventStore,
+    session: &str,
+    before: &model::item::Item,
+    after: &model::item::Item,
+    revise_seq: i64,
+) -> Option<String> {
+    if before.text == after.text && before.check == after.check && before.bindings == after.bindings {
+        return None;
+    }
+    let events = store.get_events_by_entity(&after.id).ok()?;
+    let earlier = events.iter().rev().find(|e| {
+        e.seq < revise_seq
+            && e.session_id == session
+            && matches!(
+                e.kind,
+                thor_core::event_store::EventKind::ItemMarkedUseful | thor_core::event_store::EventKind::ItemMarkedNoise
+            )
+    })?;
+    Some(format!(
+        " - NOTE: your verdict on this item from this session (event seq {}) judged the version before this revise, \
+         so it is set aside for the new version: give it again with mark if it should count (an evaluation's \
+         judgement list needs a verdict on the item as it stands)",
+        earlier.seq
+    ))
+}
+
+/// Whether the `fact_revised` at `seq` changed the item's text, check or
+/// bindings against the head just before it (`events`: the item's own events).
+fn revise_changed_the_rule(events: &[thor_core::event_store::Event], seq: i64) -> bool {
+    let parse = |e: &thor_core::event_store::Event| model::store::parse_body(&e.body).ok();
+    let Some(now) = events.iter().find(|e| e.seq == seq).and_then(parse) else { return false };
+    let Some(before) = events
+        .iter()
+        .filter(|e| {
+            e.seq < seq
+                && matches!(e.kind, thor_core::event_store::EventKind::FactCreated | thor_core::event_store::EventKind::FactRevised)
+        })
+        .next_back()
+        .and_then(parse)
+    else {
+        return false;
+    };
+    before.text != now.text || before.check != now.check || before.bindings != now.bindings
+}
+
 /// One verdict `mark` itself has written for an item, kept only long enough
 /// to catch an exact repeat from the SAME process - see `ThorMcpServer::
 /// mark_history`'s own doc comment for why a process is the session boundary
@@ -3162,6 +3212,12 @@ impl ThorMcpServer {
                             success.push_str(&format!("; because: {reason}"));
                         }
                     }
+                    // A verdict this session gave BEFORE a revise that changed
+                    // what the rule says judged the old version: say so now,
+                    // not when the filing is refused.
+                    if let Some(note) = verdict_set_aside_by_revise(s, stamp.column(), &existing, &written, event.seq) {
+                        success.push_str(&note);
+                    }
                     // A revise that FILED an evaluation report: the same
                     // receipt a remember gives.
                     success.push_str(&evaluation_receipt(s, &written, ctx.as_ref(), event.seq));
@@ -3634,6 +3690,17 @@ impl ThorMcpServer {
                     let verdict = model::store::recorded_write_verdicts(&events).remove(&seq)?;
                     (!verdict.attested).then_some(verdict.why)
                 });
+                let revised_since = prev.seq.is_some_and(|seq| {
+                    let Ok(events) = s.get_events_by_entity(&args.id) else { return false };
+                    events
+                        .iter()
+                        .filter(|e| e.seq > seq && e.kind == thor_core::event_store::EventKind::FactRevised)
+                        .any(|e| revise_changed_the_rule(&events, e.seq))
+                });
+                let set_aside = match (set_aside, revised_since) {
+                    (None, true) => Some("the item was revised after it, so it judged the old version".to_string()),
+                    (other, _) => other,
+                };
                 if let Some(why) = set_aside {
                     owed_again_note = format!(
                         "this session's earlier {}{} was SET ASIDE and counted for nothing ({why}); this one is \
@@ -9661,6 +9728,35 @@ mod tests {
         let noise_events =
             events.iter().filter(|e| e.kind == thor_core::event_store::EventKind::ItemMarkedNoise).count();
         assert_eq!(noise_events, 1, "the repeat must not have written a second noise event");
+    }
+
+    /// A revise that changes what a rule says sets this session's earlier
+    /// verdict on it aside: the revise reply says so, and the verdict can be
+    /// given again.
+    #[tokio::test]
+    async fn a_revise_after_a_mark_says_the_verdict_is_set_aside_and_a_new_mark_is_accepted() {
+        let srv = server();
+        let mut args = base_remember("revised-after-mark");
+        args.always = false;
+        args.targets = vec![TargetArg { kind: "command".to_string(), value: "revised-after-mark-command".to_string() }];
+        srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
+        fired_once(&srv, "revised-after-mark");
+        let first = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "revised-after-mark".to_string(), noise: false })).await;
+        assert!(first.contains("marked useful"), "{first}");
+
+        let revised = srv
+            .revise(Meta::new(), RawArgs::default(), Parameters(ReviseArgs {
+                id: "revised-after-mark".to_string(),
+                append: Some(" and a little more".to_string()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(revised.starts_with("revised"), "{revised}");
+        assert!(revised.contains("set aside") && revised.contains("give it again with mark"), "{revised}");
+
+        let again = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "revised-after-mark".to_string(), noise: false })).await;
+        assert!(again.contains("marked useful") && again.contains("SET ASIDE"), "{again}");
+        assert!(!again.contains("not counted again"), "{again}");
     }
 
     /// A verdict the Stop set aside counts for nothing, so giving it again is
