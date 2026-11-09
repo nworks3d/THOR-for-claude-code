@@ -284,7 +284,11 @@ pub fn try_begin(db: &Path, store: &mut EventStore, session_id: &str, project: &
             return Err(StartRefused::Store);
         }
     }
-    let frozen = model::store::frozen_now(store, session_id, project, started_by, now).ok_or(StartRefused::Store)?;
+    let mut frozen = model::store::frozen_now(store, session_id, project, started_by, now).ok_or(StartRefused::Store)?;
+    if let Some(db) = store.path() {
+        let replies = crate::corpus::load_replies(&db, now);
+        add_prompt_excerpts(&mut frozen, &replies);
+    }
     let id = model::store::evaluation_start_id(project, frozen.started_seq);
     let item = Item {
         id: id.clone(),
@@ -1112,6 +1116,49 @@ fn machine_pass_until(
     let batch: Vec<String> = needing.iter().take(model::store::EVALUATION_TEETH_BATCH).cloned().collect();
     let a4_list: Vec<String> = naming.iter().take(model::store::EVALUATION_A4_LIST).cloned().collect();
     Passed { batch_later: needing.len() - batch.len(), batch, a4_list, machine }
+}
+
+/// The longest stretch of the owner's prompt a "(prompt) word" place carries.
+pub const PROMPT_EXCERPT_CHARS: usize = 80;
+
+/// A firing from a typed prompt is logged as "(prompt) word" only: the log
+/// keeps none of the owner's text. After a context summary the session then
+/// cannot tell whether the item belonged there. So the places frozen with the
+/// list get a short excerpt of the prompt around the matched word, read from
+/// the real-call record's replies (`corpus::ReplyRow::prompt`, already passed
+/// through `deliver::redact_secrets`) of the same session. A place with no
+/// such prompt on record stays as it was.
+pub fn add_prompt_excerpts(frozen: &mut model::store::Frozen, replies: &[crate::corpus::ReplyRow]) {
+    let session: String = frozen.session.chars().take(8).collect();
+    for firings in frozen.fired.values_mut() {
+        for trigger in firings.triggers.iter_mut() {
+            let Some(words) = trigger.strip_prefix("(prompt) ") else { continue };
+            let found = replies.iter().rev().filter(|r| r.s == session).find_map(|r| {
+                words.split(',').map(str::trim).filter(|w| !w.is_empty()).find_map(|w| prompt_excerpt(&r.prompt, w))
+            });
+            if let Some(excerpt) = found {
+                *trigger = format!("{trigger} - \"{excerpt}\"");
+            }
+        }
+    }
+}
+
+/// At most `PROMPT_EXCERPT_CHARS` characters of `prompt` around the first
+/// (case-blind) `word`, on one line, with "..." where it was cut.
+fn prompt_excerpt(prompt: &str, word: &str) -> Option<String> {
+    let flat: Vec<char> = prompt.split_whitespace().collect::<Vec<_>>().join(" ").chars().collect();
+    let lower: Vec<char> = flat.iter().map(|c| c.to_ascii_lowercase()).collect();
+    let needle: Vec<char> = word.chars().map(|c| c.to_ascii_lowercase()).collect();
+    if needle.is_empty() || needle.len() > lower.len() {
+        return None;
+    }
+    let at = (0..=lower.len() - needle.len()).find(|&i| lower[i..i + needle.len()] == needle[..])?;
+    let room = PROMPT_EXCERPT_CHARS.saturating_sub(needle.len());
+    let start = at.saturating_sub(room / 2);
+    let end = (start + PROMPT_EXCERPT_CHARS).min(flat.len());
+    let start = end.saturating_sub(PROMPT_EXCERPT_CHARS).min(start);
+    let body: String = flat[start..end].iter().collect();
+    Some(format!("{}{}{}", if start > 0 { "..." } else { "" }, body, if end < flat.len() { "..." } else { "" }))
 }
 
 /// The line under one judgement item: how often it fired in this session and
@@ -2164,6 +2211,38 @@ mod tests {
             "the places this session saw it fire, newest first: {note}"
         );
         assert!(!note.contains("git push elsewhere"), "another session's firing is not this one's: {note}");
+    }
+
+    /// A firing from a typed prompt was shown as "(prompt) ram" only, which a
+    /// session after a context summary could not judge. The place now carries
+    /// a short excerpt of the prompt around the matched word, with secrets
+    /// blanked the way the real-call record blanks them.
+    #[test]
+    fn a_prompt_firing_in_the_start_note_carries_a_short_blanked_excerpt_of_the_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, mut store) = store_with_events(dir.path(), 1);
+        let now = crate::time::now_unix();
+        noted_rule(&mut store, "fx-prompted", model::item::Binding::Target { kind: model::item::TargetKind::Command, value: "ram".to_string() });
+        pad(&mut store, "fx-prompted", now - 900);
+        fire_here(&mut store, "sess", "fx-prompted", 40, now - 600, Some("(prompt) ram"));
+        let prompt = format!(
+            "{} how much RAM does the printer board have? password=hunter2hunter2 {}",
+            "background words ".repeat(12),
+            "and more trailing words ".repeat(12)
+        );
+        crate::corpus::record_reply(&db, &crate::corpus::reply_row(now - 500, "sess", false, false, "/work", "a reply", &prompt, &[], false, false, ""));
+        let started = start(&db, &mut store, "sess", "p", "stop-ask").unwrap();
+        let note = start_note(&started.start);
+        let line = note.lines().find(|l| l.contains("(prompt) ram")).expect("the place is listed");
+        assert!(line.contains("how much RAM does the printer board have?"), "{line}");
+        assert!(!line.contains("hunter2"), "a secret is blanked before it is kept: {line}");
+        let quoted = line.split('"').nth(1).expect("the excerpt is quoted");
+        assert!(quoted.chars().count() <= super::PROMPT_EXCERPT_CHARS + 6, "short: {quoted}");
+        // A place with no prompt on record is left as it was.
+        let mut frozen = started.start.frozen.clone();
+        frozen.fired.values_mut().for_each(|f| f.triggers = vec!["(prompt) unknownword".to_string()]);
+        super::add_prompt_excerpts(&mut frozen, &crate::corpus::load_replies(&db, now));
+        assert!(frozen.fired.values().all(|f| f.triggers == vec!["(prompt) unknownword".to_string()]));
     }
 
     /// FIELD TEST 2, defect 1 (2026-10-01): an evaluation started by an older
