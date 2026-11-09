@@ -1624,12 +1624,18 @@ fn comment_only_contains(check: &Check, root: &Path) -> Option<String> {
 /// Whether a file check holds in `root`: `Ok(())`, `Err(Ok(what))` when it is
 /// false (with what is missing or present), `Err(Err(why))` when the file
 /// cannot be read.
-fn truth(check: &Check, root: &Path) -> Result<(), Result<String, String>> {
+fn truth(item: &Item, check: &Check, root: &Path) -> Result<(), Result<String, String>> {
     let Some(path) = check_path(check) else { return Ok(()) };
     if !root.join(path).exists() {
         return Err(Ok(format!("{path} does not exist")));
     }
-    match model::check::run(check, root) {
+    // A rule with no project and an absolute path is tried directly.
+    let outcome = if model::checkout::absolute_path_check_without_project(item).is_some() {
+        model::check::run_absolute(check)
+    } else {
+        model::check::run(check, root)
+    };
+    match outcome {
         model::check::Outcome::Holds => Ok(()),
         model::check::Outcome::Fails => Err(Ok(match check {
             Check::Contains { literal, .. } => format!("{path} does not contain '{}'", gate::shown_literal(literal)),
@@ -2115,7 +2121,7 @@ impl<'a> Work<'a> {
         // (3) false in the registered checkout.
         if let (Some(check), Some(root)) = (&w, &root_ok) {
             if is_file_check(check) {
-                match truth(check, root) {
+                match truth(item, check, root) {
                     Ok(()) => {}
                     Err(Err(why)) if old_stock => return self.not_old_stock(format!("{why} in {}", root.display())),
                     Err(Ok(what)) if old_stock => return self.not_old_stock(format!("{what} in {}", root.display())),
@@ -2131,7 +2137,7 @@ impl<'a> Work<'a> {
                     }
                     Err(Ok(what)) => {
                         let own = self.session.own_checkout.as_ref().filter(|own| *own != root);
-                        let holds_in_own = own.is_some_and(|own| truth(check, own).is_ok())
+                        let holds_in_own = own.is_some_and(|own| truth(item, check, own).is_ok())
                             && same_project(self.session.own_project.as_deref(), item.project.as_deref());
                         if holds_in_own && matches!(self.mode, Mode::Write) {
                             self.receipt.push(format!(
@@ -2523,7 +2529,7 @@ impl<'a> Work<'a> {
         let Some(check) = &item.check else { return false };
         let try_root = if is_file_check(check) {
             match root {
-                Some(root) if truth(check, root).is_ok() => root.to_path_buf(),
+                Some(root) if truth(item, check, root).is_ok() => root.to_path_buf(),
                 _ => return false,
             }
         } else {
@@ -2575,7 +2581,7 @@ impl<'a> Work<'a> {
             return false;
         };
         let item = self.item();
-        if model::checkout::binds_the_file(item, path) || truth(check, root).is_err() {
+        if model::checkout::binds_the_file(item, path) || truth(item, check, root).is_err() {
             return false;
         }
         let mut bound = item.clone();

@@ -489,10 +489,51 @@ pub fn run(check: &Check, root: &Path) -> Outcome {
     }
 }
 
+/// Try a `path_exists` or `absent` check that names an ABSOLUTE path, for a
+/// rule with no project (it has no working copy to try the check in; see
+/// `checkout::absolute_path_check_without_project`). `run` refuses every
+/// absolute path on purpose - a project's check must stay inside its working
+/// copy - so this is a separate door, open to those two kinds only.
+/// `CannotRun` for any other check.
+pub fn run_absolute(check: &Check) -> Outcome {
+    match check {
+        Check::PathExists { path } => {
+            if Path::new(path).exists() {
+                Outcome::Holds
+            } else {
+                Outcome::Fails
+            }
+        }
+        Check::Absent { path, literal } => match read_bounded_targets(Path::new(path), true) {
+            Some(contents) if contents.iter().any(|content| content.contains(literal.as_str())) => Outcome::Fails,
+            Some(_) => Outcome::Holds,
+            None => Outcome::CannotRun,
+        },
+        _ => Outcome::CannotRun,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+
+    // -------------------------------------------------------- run_absolute
+
+    #[test]
+    fn an_absolute_path_is_tried_only_through_the_absolute_door() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        fs::write(&file, b"keep me").unwrap();
+        let abs = file.display().to_string();
+        let exists = Check::PathExists { path: abs.clone() };
+        assert_eq!(run(&exists, dir.path()), Outcome::CannotRun, "run keeps refusing an absolute path");
+        assert_eq!(run_absolute(&exists), Outcome::Holds);
+        assert_eq!(run_absolute(&Check::PathExists { path: format!("{abs}.gone") }), Outcome::Fails);
+        assert_eq!(run_absolute(&Check::Absent { path: abs.clone(), literal: "keep".to_string() }), Outcome::Fails);
+        assert_eq!(run_absolute(&Check::Absent { path: abs, literal: "other".to_string() }), Outcome::Holds);
+        assert_eq!(run_absolute(&Check::Contains { path: "x".to_string(), literal: "y".to_string() }), Outcome::CannotRun);
+    }
 
     // -------------------------------------------------------- PathExists
 

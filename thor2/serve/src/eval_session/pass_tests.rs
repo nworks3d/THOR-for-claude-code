@@ -373,11 +373,16 @@ fn a_global_file_check_is_a_machine_blocker_never_the_agents_batch() {
     let mut fx = Fx::new();
     let beta = fx.checkout("beta", &[("NOTES.md", "keep me\n")], true);
     fx.register("beta", &beta);
-    fx.legacy(&rule("glob-abs", "The doctor binary lives at C:/fxp/bin/doctor.exe.", vec![cmd("doctor")], Some(Check::PathExists { path: "C:/fxp/bin/doctor.exe".to_string() }), None));
+    let abs_dir = tempfile::tempdir().unwrap();
+    std::fs::write(abs_dir.path().join("settings.txt"), "a readable text file\n").unwrap();
+    let here = abs_dir.path().join("settings.txt").display().to_string().replace('\\', "/");
+    fx.legacy(&rule("glob-abs", &format!("The test program lives at {here}."), vec![path(&here)], Some(Check::PathExists { path: here.clone() }), None));
     fx.legacy(&rule("glob-rel", "Every repo keeps `eol=lf` in .gitattributes.", vec![cmd("git add")], contains(".gitattributes", "eol=lf"), None));
     let start = fx.start(S1, "beta");
     let machine = start.frozen.machine.clone().unwrap();
-    assert_eq!(outcome_of(&start, "glob-abs"), MachineOutcome::Blocked);
+    // An ABSOLUTE path needs no working copy: it is tried directly and is not
+    // held by the blocker. Only the relative one is.
+    assert_ne!(outcome_of(&start, "glob-abs"), MachineOutcome::Blocked);
     assert_eq!(outcome_of(&start, "glob-rel"), MachineOutcome::Blocked);
     assert!(start.frozen.batch().is_empty() && start.frozen.a4_list().is_empty(), "{:?} {:?}", start.frozen.batch(), start.frozen.a4_list());
     // Step 21: one point for the whole store, in no project.
@@ -385,23 +390,24 @@ fn a_global_file_check_is_a_machine_blocker_never_the_agents_batch() {
     let points = model::store::open_points(&fx.store, None);
     let point = points.iter().find(|p| p.id == model::store::GLOBAL_RULES_POINT_ID).unwrap_or_else(|| panic!("{points:?}"));
     assert_eq!((point.subject.as_deref(), point.blocker.as_deref()), (Some(model::store::GLOBAL_RULES_SUBJECT), Some("no-working-copy")));
-    assert!(point.text.contains("'glob-abs'") && point.text.contains("'glob-rel'"), "{}", point.text);
+    assert!(!point.text.contains("'glob-abs'") && point.text.contains("'glob-rel'"), "{}", point.text);
     assert!(point.text.contains("Nothing needs doing") && point.text.contains("clearing a check that is true is never the way"), "{}", point.text);
     assert!(point.text.contains("give it that project (mcp__thor__revise"), "{}", point.text);
     assert!(point.text.contains("one for the whole memory"), "{}", point.text);
     assert_eq!(machine.points.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), vec![model::store::GLOBAL_RULES_POINT_ID]);
-    assert!(start_note(&start).contains("one point for the whole memory: holds 2 rule(s) with no project"), "{}", start_note(&start));
-    for id in ["glob-abs", "glob-rel"] {
+    assert!(start_note(&start).contains("one point for the whole memory: holds 1 rule(s) with no project"), "{}", start_note(&start));
+    for id in ["glob-rel"] {
         assert!(matches!(model::store::settlement(&fx.store, id, Some(&start)), Settlement::Settled(Settled::Blocked(_))), "{id}");
         assert!(matches!(model::store::settlement(&fx.store, id, None), Settlement::Settled(Settled::Blocked(_))), "{id}: not rot at read time either");
-        assert!(model::store::show(&fx.store, id).unwrap().check.is_some(), "{id}: its check stays");
     }
+    assert!(!matches!(model::store::settlement(&fx.store, "glob-abs", None), Settlement::Settled(Settled::Blocked(_))), "glob-abs is tried directly");
+    assert!(model::store::show(&fx.store, "glob-rel").unwrap().check.is_some(), "glob-rel: its check stays");
     file(&mut fx, &start, "eval-beta-1").expect("rules held by THOR's blocker hold no filing");
 
     // Both turn out to be about beta and get beta (the named way). Nothing
     // with no project carries a file check now: the next start closes the
     // point.
-    for id in ["glob-abs", "glob-rel"] {
+    for id in ["glob-rel"] {
         let before = model::store::show(&fx.store, id).unwrap();
         let moved = Item { project: Some("beta".to_string()), ..before.clone() };
         model::store::revise_because(&mut fx.store, "s", "l", "a", &before, &moved, &before, Some("fixture: the rule is about beta")).unwrap();
