@@ -4,6 +4,10 @@ What changed in each release, newest first. The release workflow copies the sect
 
 ## Unreleased
 
+## 2.6.5 (2026-11-09)
+
+What changed: Your verdicts on notes count again, also when a note did not belong where it fired. A rule bound to an address with a port now really fires, a rule can now refuse a tool by its name, and a rule whose check works can no longer disappear silently when notes are folded together. The restart question only comes when a restart is really needed, and the open point that stood in every evaluation closes by itself.
+
 - **A noise mark is no longer set aside as a side door.** Claude Code writes each tool call twice in the session transcript (`noise: true` and `"noise": "true"`), and the attester read that as two different calls. The two forms are now one call, and a verdict that was set aside can be given again; the reply says it was set aside and why.
 - **Starting a test run in the background is no longer counted as a passed run.** The record kept the outcome of every tool result as "ok", so a background start (whose result only says it started) read as "passed" in the evaluation's test signal. Its outcome is now unknown and the signal says it was started in the background, so run it again.
 - **A revise now says when it sets your earlier verdict aside.** A verdict judges the version of a rule it was given on; a revise that changes the text, check or bindings leaves it judging the old version, and the reply used to say nothing until the evaluation filing was refused. The revise reply now names that verdict and says to give it again, and a new `mark` is accepted instead of being refused as a repeat.
