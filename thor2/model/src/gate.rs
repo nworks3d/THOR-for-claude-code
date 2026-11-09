@@ -1799,7 +1799,19 @@ pub fn is_evaluation_report(item: &Item) -> bool {
 /// of a real store: an old report of one project re-scoped to another went
 /// straight through. A move is a filing for the project it lands in.
 pub fn newly_filed_as_evaluation(existing: &Item, updated: &Item) -> bool {
-    is_evaluation_report(updated) && (!is_evaluation_report(existing) || existing.project != updated.project)
+    is_evaluation_report(updated)
+        && (!is_evaluation_report(existing) || !same_project_or_respelled(existing.project.as_deref(), updated.project.as_deref()))
+}
+
+/// The same project, or one name written two ways (`checkout::same_project_name`:
+/// case, spaces and hyphens). Moving a report between two spellings of one
+/// project is a correction of its scope, not a filing for another project.
+fn same_project_or_respelled(a: Option<&str>, b: Option<&str>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => a == b || crate::checkout::same_project_name(a, b),
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 /// What a revise that changes a filed report's machine section is told.
@@ -8057,5 +8069,12 @@ mod machine_section_tests {
         moved.text = "TLDR: evaluation of other.".to_string();
         assert!(newly_filed_as_evaluation(&existing, &moved));
         revise(&existing, &moved).expect("a move is a new filing, judged by the store");
+        // A leftover spelling of the SAME project is not another project:
+        // moving the report between the two spellings is no new filing.
+        let mut spelled = existing.clone();
+        spelled.project = Some("FXP".to_string());
+        assert_eq!(existing.project.as_deref(), Some("fxp"));
+        assert!(!newly_filed_as_evaluation(&existing, &spelled), "one name written two ways");
+        revise(&existing, &spelled).expect("a respelled scope keeps the machine section untouched");
     }
 }
