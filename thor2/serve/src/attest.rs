@@ -262,6 +262,23 @@ fn scan(files: &[PathBuf], ids: &HashSet<&str>, wanted: impl Fn(&str) -> bool) -
     out
 }
 
+/// Claude Code writes one tool call twice: the assistant entry keeps the
+/// input as typed (`noise: true`), a later api-request copy keeps scalars as
+/// strings (`"noise": "true"`). The two are the same call.
+fn scalars_as_text(v: &Value) -> Value {
+    match v {
+        Value::Bool(b) => Value::String(b.to_string()),
+        Value::Number(n) => Value::String(n.to_string()),
+        Value::Array(a) => Value::Array(a.iter().map(scalars_as_text).collect()),
+        Value::Object(o) => Value::Object(o.iter().map(|(k, v)| (k.clone(), scalars_as_text(v))).collect()),
+        other => other.clone(),
+    }
+}
+
+fn same_input(a: &Value, b: &Value) -> bool {
+    a == b || scalars_as_text(a) == scalars_as_text(b)
+}
+
 /// One id's scan, as a `Found`.
 fn found_of(collected: Option<Collected>) -> Found {
     let Some(collected) = collected else { return Found::Nothing };
@@ -269,7 +286,7 @@ fn found_of(collected: Option<Collected>) -> Found {
     uses.sort_by(|a, b| a.0.cmp(&b.0));
     let mut distinct: Vec<UseLine> = Vec::new();
     for (_, call) in uses {
-        if !distinct.iter().any(|d| d.0 == call.0 && d.1 == call.1) {
+        if !distinct.iter().any(|d| d.0 == call.0 && same_input(&d.1, &call.1)) {
             distinct.push(call);
         }
     }
@@ -2267,6 +2284,22 @@ mod tests {
         t.block("toolu_D", "Bash", &json!({"command": "a"}), "r").block("toolu_D", "Bash", &json!({"command": "b"}), "r");
         t.write();
         assert_eq!(find_call(&session_transcripts(root.path(), S1), "toolu_D"), Found::Conflicting);
+    }
+
+    /// Claude Code writes a call twice, once with `noise: true` and once as an
+    /// api-request copy with `"noise": "true"`: that is one call, not two.
+    #[test]
+    fn the_same_call_with_scalars_written_as_text_is_one_call() {
+        let root = tempfile::tempdir().unwrap();
+        let mut t = main_transcript(root.path(), S1);
+        t.block("toolu_E", "mark", &json!({"id": "x", "noise": true, "n": 3}), "r")
+            .block("toolu_E", "mark", &json!({"id": "x", "noise": "true", "n": "3"}), "r");
+        t.write();
+        assert!(matches!(find_call(&session_transcripts(root.path(), S1), "toolu_E"), Found::Call(_)));
+        let mut t = main_transcript(root.path(), S2);
+        t.block("toolu_F", "mark", &json!({"noise": true}), "r").block("toolu_F", "mark", &json!({"noise": "false"}), "r");
+        t.write();
+        assert_eq!(find_call(&session_transcripts(root.path(), S2), "toolu_F"), Found::Conflicting);
     }
 
     /// R7a.2 and the structural half of the predicate, each on its own: a

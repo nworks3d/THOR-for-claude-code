@@ -4,6 +4,8 @@ What changed in each release, newest first. The release workflow copies the sect
 
 ## Unreleased
 
+- **A noise mark is no longer set aside as a side door.** Claude Code writes each tool call twice in the session transcript (`noise: true` and `"noise": "true"`), and the attester read that as two different calls. The two forms are now one call, and a verdict that was set aside can be given again; the reply says it was set aside and why.
+
 ## 2.6.4 (2026-11-01)
 
 What changed: A copy of your memory on another machine now files its own weekly report, and the proof of it travels through the same THOR tool as the report, so no connection address is needed any more; this was tested on a real second machine. A note can now be judged after 10 sessions instead of 40, with at most 5 per evaluation, so the weekly check really asks whether notes helped. An evaluation also repairs crowded places, where too many facts are bound to one file or command. You can switch on an opt-in check that a reply is in your language, and the first prompt of a session now carries the length limit once. A folder resolves to the project the memory already has, whatever its spelling of spaces, hyphens and case. Old rules no longer starve in the teeth pass, and a report from a tool server older than the installed one is refused up front instead of silently not counting. `doctor` no longer crashes when its output is cut off.

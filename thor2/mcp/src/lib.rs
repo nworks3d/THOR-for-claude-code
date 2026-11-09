@@ -3554,7 +3554,7 @@ impl ThorMcpServer {
         }
     }
 
-    #[tool(description = "Code lane: judges an item you were served or looked up. Default records that it HELPED, which clears noise recorded before it (a later noise mark still counts - the newest verdict wins). Pass noise:true for the opposite; two noise marks since the last useful one (or since the last change to its text, check or bindings) retire the item from the injection surfaces, though it stays fully findable via lookup; a rule whose check can refuse is never retired this way. A second call THIS SESSION for the same id with the same verdict writes nothing and says so, unless the item fired in 10 more sessions since, in which case it is owed again and written; a different verdict is written and the earlier one is named in the reply. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refused when the item is not live (retracted or archived) - there is nothing to judge. Also refused, with nothing written, when the item is pinned (Always-bound): the owner already answered by pinning it, so a verdict changes nothing - unpin it first if it should be judged instead. Replies with the verdict recorded and its event sequence, or the refusal text.", annotations(title = "Record a verdict", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false))]
+    #[tool(description = "Code lane: judges an item you were served or looked up. Default records that it HELPED, which clears noise recorded before it (a later noise mark still counts - the newest verdict wins). Pass noise:true for the opposite; two noise marks since the last useful one (or since the last change to its text, check or bindings) retire the item from the injection surfaces, though it stays fully findable via lookup; a rule whose check can refuse is never retired this way. A second call THIS SESSION for the same id with the same verdict writes nothing and says so, unless the earlier one was set aside by the Stop (not an attested THOR call), in which case it is written again and the reply says why, or unless the item fired in 10 more sessions since, in which case it is owed again and written; a different verdict is written and the earlier one is named in the reply. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refused when the item is not live (retracted or archived) - there is nothing to judge. Also refused, with nothing written, when the item is pinned (Always-bound): the owner already answered by pinning it, so a verdict changes nothing - unpin it first if it should be judged instead. Replies with the verdict recorded and its event sequence, or the refusal text.", annotations(title = "Record a verdict", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false))]
     async fn mark(&self, meta: Meta, raw: RawArgs, Parameters(args): Parameters<MarkArgs>) -> String {
         // A repeat of the SAME verdict on the SAME id, from THIS process, is
         // caught before anything else runs - before even a replica's own
@@ -3626,7 +3626,22 @@ impl ThorMcpServer {
             // after it.
             let mut owed_again_note = String::new();
             if let Some(prev) = previous {
-                if prev.noise == noise {
+                // AN EARLIER VERDICT THE STOP SET ASIDE (it was not an
+                // attested THOR call) counts for nothing, so giving it
+                // again is not a repeat: write it afresh and say so.
+                let set_aside = prev.seq.and_then(|seq| {
+                    let events = s.events_of_kinds(&[thor_core::event_store::EventKind::GateStoodAside], 0).ok()?;
+                    let verdict = model::store::recorded_write_verdicts(&events).remove(&seq)?;
+                    (!verdict.attested).then_some(verdict.why)
+                });
+                if let Some(why) = set_aside {
+                    owed_again_note = format!(
+                        "this session's earlier {}{} was SET ASIDE and counted for nothing ({why}); this one is \
+                         written afresh and is the one that counts. ",
+                        prev.verdict_word(),
+                        prev.seq_suffix()
+                    );
+                } else if prev.noise == noise {
                     let prev_seq = prev.seq.unwrap_or_else(|| {
                         unreachable!("a seq:None repeat already returned before self.blocking")
                     });
@@ -3747,7 +3762,7 @@ impl ThorMcpServer {
                     // write - so this guard was implicit; now it has to be
                     // explicit.
                     if let Some(prev) = previous {
-                        if prev.noise != noise {
+                        if prev.noise != noise && owed_again_note.is_empty() {
                             reply.push_str(&format!(
                                 " - this session's earlier {}{} stands in history; the later verdict is the one \
                                  that counts",
@@ -9646,6 +9661,45 @@ mod tests {
         let noise_events =
             events.iter().filter(|e| e.kind == thor_core::event_store::EventKind::ItemMarkedNoise).count();
         assert_eq!(noise_events, 1, "the repeat must not have written a second noise event");
+    }
+
+    /// A verdict the Stop set aside counts for nothing, so giving it again is
+    /// not a repeat: it is written again and the reply says why.
+    #[tokio::test]
+    async fn a_verdict_that_was_set_aside_can_be_given_again_and_the_reply_says_why() {
+        let srv = server();
+        let mut args = base_remember("set-aside-noise");
+        args.always = false;
+        args.targets = vec![TargetArg { kind: "command".to_string(), value: "set-aside-command".to_string() }];
+        srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
+        fired_once(&srv, "set-aside-noise");
+
+        let first = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "set-aside-noise".to_string(), noise: true })).await;
+        assert!(first.contains("marked noise"), "{first}");
+        let seq: i64 = first.rsplit("event seq ").next().unwrap().trim_end_matches(')').parse().unwrap();
+
+        {
+            let mut store = srv.store.lock().unwrap();
+            model::store::record_write_verification(
+                &mut store,
+                "mcp",
+                model::store::SystemActor::new(model::store::ATTESTER_ACTOR),
+                "set-aside-noise",
+                seq,
+                false,
+                None,
+                "not an attested THOR call: two different calls under one id",
+            )
+            .unwrap();
+        }
+
+        let second = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "set-aside-noise".to_string(), noise: true })).await;
+        assert!(second.contains("marked noise"), "a set-aside verdict is givable again: {second}");
+        assert!(second.contains("SET ASIDE") && second.contains("two different calls under one id"), "{second}");
+        assert!(!second.contains("not counted again"), "{second}");
+
+        let third = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "set-aside-noise".to_string(), noise: true })).await;
+        assert!(third.contains("not counted again"), "the fresh verdict is a normal one again: {third}");
     }
 
     /// THE DEFECT THIS PREVENTS (measured 2026-09-17, Printer-stuff eval 1):
