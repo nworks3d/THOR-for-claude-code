@@ -2487,6 +2487,18 @@ fn pool_rivals<'a>(
         }
         _ => None,
     };
+    // The files and hosts that command names are targets of the same call
+    // (`ServeInput::add_command`): a fact bound to one of them is in the same
+    // block, so it is an occupant of the place too. One implementation, the
+    // one `serve why` reads (`normalize::paths_in_command`).
+    let named_in_command: Vec<(crate::item::TargetKind, String)> = match binding {
+        Binding::Target { kind: crate::item::TargetKind::Command, value } => crate::normalize::paths_in_command(value)
+            .into_iter()
+            .map(|p| (crate::item::TargetKind::Path, p))
+            .chain(crate::normalize::hosts_in_command(value).into_iter().map(|h| (crate::item::TargetKind::Host, h)))
+            .collect(),
+        _ => Vec::new(),
+    };
     let Some(kind_match): Option<&dyn Fn(&Binding) -> bool> = (match binding {
         Binding::Always => None,
         Binding::Moment(_) => Some(&|b: &Binding| matches!((b, binding), (Binding::Moment(x), Binding::Moment(y)) if x == y)),
@@ -2496,6 +2508,7 @@ fn pool_rivals<'a>(
                     || new_command.as_ref().is_some_and(|segments| {
                         *bk == crate::item::TargetKind::Command && crate::shell::reaches_any(bv, segments)
                     })
+                    || named_in_command.iter().any(|(k, v)| k == bk && crate::normalize::target_matches(*bk, bv, *k, v))
             }
             _ => false,
         }),
