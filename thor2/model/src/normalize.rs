@@ -142,13 +142,28 @@ pub fn paths_in_command(command: &str) -> Vec<String> {
 /// editing a file.
 pub fn hosts_in_command(command: &str) -> Vec<String> {
     let mut out = Vec::new();
+    let mut add = |host: String| {
+        if !host.is_empty() && host.contains('.') && !out.contains(&host) {
+            out.push(host);
+        }
+    };
     for token in shell_tokens(command) {
-        let candidate = match token.split_once("://") {
+        // A host with its PORT (`http://127.0.0.1:27182/x`, `nc 127.0.0.1:27182`)
+        // is offered twice: as the bare host, which a binding without a port
+        // matches as it always did, and as `host:port`, which only a binding
+        // that names exactly that port can equal. Another port never matches.
+        match token.split_once("://") {
             // Strip scheme, then userinfo, then path, then port.
             Some((_, rest)) => {
                 let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
                 let authority = authority.rsplit('@').next().unwrap_or(authority);
-                authority.split(':').next().unwrap_or(authority).to_string()
+                let host = authority.split(':').next().unwrap_or(authority).to_string();
+                if let Some(port) = authority.split_once(':').map(|(_, p)| p).filter(|p| is_port(p)) {
+                    add(host.clone());
+                    add(format!("{host}:{port}"));
+                } else {
+                    add(host);
+                }
             }
             None => {
                 if token.contains('/') || token.starts_with('-') {
@@ -156,27 +171,47 @@ pub fn hosts_in_command(command: &str) -> Vec<String> {
                 }
                 // `ssh admin@host` names a host as plainly as a URL does.
                 let token = token.rsplit('@').next().unwrap_or(&token).to_string();
+                // A bare `host:port` token. A bare address with no port is not
+                // read as a host (it never was).
+                if let Some((host, port)) = token.rsplit_once(':').filter(|(_, p)| is_port(p)) {
+                    if looks_like_host(host) {
+                        add(host.to_string());
+                        add(format!("{host}:{port}"));
+                    }
+                    continue;
+                }
                 match extension_of(&token) {
                     // A dotted name whose tail is a source extension is a
                     // file, not a host.
                     Some(ext) if crate::gate::FILE_EXTENSIONS.contains(&ext.to_lowercase().as_str()) => continue,
                     Some(ext) if ext.chars().all(|c| c.is_ascii_alphabetic()) && ext.len() >= 2 => {
-                        token.split(':').next().unwrap_or(&token).to_string()
+                        add(token.split(':').next().unwrap_or(&token).to_string());
                     }
                     _ => continue,
                 }
             }
-        };
-        if candidate.is_empty() || !candidate.contains('.') {
-            continue;
-        }
-        if !out.contains(&candidate) {
-            out.push(candidate);
         }
     }
     out
 }
 
+fn is_port(text: &str) -> bool {
+    (1..=5).contains(&text.len()) && text.chars().all(|c| c.is_ascii_digit())
+}
+
+/// A dotted IPv4 address, or a dotted name whose tail is letters and not a
+/// source extension - the shapes `hosts_in_command` accepts as a host.
+fn looks_like_host(host: &str) -> bool {
+    let ipv4 = host.split('.').count() == 4 && host.split('.').all(|part| (1..=3).contains(&part.len()) && part.chars().all(|c| c.is_ascii_digit()));
+    ipv4 || match extension_of(host) {
+        Some(ext) => {
+            ext.chars().all(|c| c.is_ascii_alphabetic())
+                && ext.len() >= 2
+                && !crate::gate::FILE_EXTENSIONS.contains(&ext.to_lowercase().as_str())
+        }
+        None => false,
+    }
+}
 
 #[cfg(test)]
 mod dir_anchor_tests {

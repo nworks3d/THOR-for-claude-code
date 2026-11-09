@@ -379,18 +379,17 @@ mod tests {
         assert_eq!(store.get_next_seq().unwrap(), before, "read-only");
     }
 
-    /// The port: a URL with the port and a bare `ip:port` token both mention
-    /// the host the binding stores; a call that reaches the rule is no gap.
+    /// The port: a URL with the port and a bare `ip:port` token both reach a
+    /// Host binding that names that port, so the probe no longer lists them
+    /// (it used to: the binding never fired on them).
     #[test]
-    fn a_host_with_its_port_is_found_in_a_url_and_in_a_bare_token() {
+    fn a_call_the_host_binding_with_a_port_now_reaches_is_not_listed() {
         let store = store_with(&fusion_rule());
         let calls = vec![
             call("c1", 100, "Bash", json!({ "command": format!("curl http://{HOST}/x") })),
             call("c2", 200, "Bash", json!({ "command": format!("nc {HOST}") })),
             call("t1", 300, "mcp__fusion__create_body", json!({ "name": HOST })),
         ];
-        let gaps = probe(&store, &calls);
-        assert_eq!(gaps.len(), 1, "{gaps:?}");
-        assert!(gaps[0].calls >= 2, "both shell calls mention the host: {:?}", gaps[0]);
+        assert!(probe(&store, &calls).is_empty(), "{:?}", probe(&store, &calls));
     }
 }

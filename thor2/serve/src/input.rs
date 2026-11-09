@@ -479,6 +479,39 @@ mod tests {
         assert_eq!(paths_in_command("cargo test --all-targets"), Vec::<String>::new());
     }
 
+    /// Whether a Host binding `binding` is reached by the command, the way the
+    /// hook compares them.
+    fn host_binding_reaches(binding: &str, command: &str) -> bool {
+        let mut input = ServeInput::default();
+        input.add_command(command);
+        input.targets.iter().any(|(kind, value)| model::normalize::target_matches(TargetKind::Host, binding, *kind, value))
+    }
+
+    /// A Host binding that carries a port never fired: a URL lost its port and
+    /// a bare `host:port` token was skipped. Now a binding with a port is
+    /// reached by a call that names exactly that host and port.
+    #[test]
+    fn a_host_binding_with_a_port_is_reached_by_that_host_and_port_only() {
+        let binding = "127.0.0.1:27182";
+        assert!(host_binding_reaches(binding, "curl http://127.0.0.1:27182/x"), "a URL authority");
+        assert!(host_binding_reaches(binding, "nc 127.0.0.1:27182"), "a bare host:port token");
+        assert!(host_binding_reaches(binding, "curl -s http://user@127.0.0.1:27182/x?y=1"));
+        assert!(!host_binding_reaches(binding, "curl http://127.0.0.1:9999/x"), "another port");
+        assert!(!host_binding_reaches(binding, "nc 127.0.0.1:9999"), "another port, bare");
+        assert!(!host_binding_reaches(binding, "curl http://127.0.0.1/x"), "no port at all");
+        assert!(!host_binding_reaches(binding, "nc 10.0.0.9:27182"), "another host");
+        // A binding with no port behaves as it always did.
+        assert!(host_binding_reaches("quote.example.com", "curl https://quote.example.com/orders"));
+        assert!(host_binding_reaches("quote.example.com", "curl https://quote.example.com:8443/orders"), "a portless binding still reaches the host on any port");
+        assert!(host_binding_reaches("quote.example.com", "ssh quote.example.com"));
+        assert!(!host_binding_reaches("quote.example.com", "curl https://other.example.com/"));
+        // A bare address without a port is still not read as a host.
+        assert_eq!(hosts_in_command("ping 127.0.0.1"), Vec::<String>::new());
+        assert_eq!(hosts_in_command("nc 127.0.0.1:27182"), vec!["127.0.0.1", "127.0.0.1:27182"]);
+        // A file with a colon-number tail is no host.
+        assert_eq!(hosts_in_command("grep x src/main.rs:12"), Vec::<String>::new());
+    }
+
     #[test]
     fn a_url_yields_its_host() {
         assert_eq!(hosts_in_command("curl https://quote.example.com/orders?id=3"), vec!["quote.example.com"]);
