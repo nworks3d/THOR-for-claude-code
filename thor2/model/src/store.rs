@@ -13849,6 +13849,65 @@ mod tests {
         retract(&mut store, "s", "l", "a", "n4-proven", "folded into 'n4-survivor'", None).expect("a covering survivor");
     }
 
+    /// N4, file checks: a rule with a biting `contains` check on a file in a
+    /// registered working copy is refused on retract unless a survivor carries
+    /// the same file and literal (the qwen.mjs case).
+    #[test]
+    fn n4_a_contains_check_on_a_registered_file_needs_a_survivor_with_the_same_file_and_literal() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = dir.path().join("gamma");
+        std::fs::create_dir_all(&checkout).unwrap();
+        let hooks = dir.path().join("no-hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git").arg("-C").arg(&checkout).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "core.hooksPath", hooks.to_str().unwrap()]);
+        git(&["config", "user.email", "fixture@example.invalid"]);
+        git(&["config", "user.name", "fixture"]);
+        std::fs::write(checkout.join("qwen.mjs"), "const model = 'qwen';\nkeep me\n").unwrap();
+        git(&["add", "qwen.mjs"]);
+        git(&["commit", "-q", "-m", "qwen"]);
+        let mut store = EventStore::in_memory().unwrap();
+        let record = project_record("gamma");
+        let body = body_with_root(&canonical_body(&record).unwrap(), checkout.to_str().unwrap(), "2026-09-29T00:00:00Z").unwrap();
+        store.append_event("install", "install", INSTALLER_ACTOR, EventKind::FactCreated, &record.id, None, &body).unwrap();
+
+        let make = |id: &str, text: &str, literal: &str| {
+            let mut item = heavy_command_rule(id, "gamma");
+            item.severity = None;
+            item.tags = vec![];
+            item.text = text.to_string();
+            item.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "qwen.mjs".to_string() }];
+            item.check = Some(Check::Contains { path: "qwen.mjs".to_string(), literal: literal.to_string() });
+            item
+        };
+        let guard = make("n4-file-guard", "qwen.mjs keeps the line `keep me` for the runner.", "keep me");
+        declare_tried(&mut store, &guard, &sealed(&guard, RecordedVerdict::RuleWired));
+
+        // Refused: a generic reason, with the revise that carries the check over.
+        let err = retract(&mut store, "s", "l", "a", "n4-file-guard", "folded into the model note", None).unwrap_err().to_string();
+        assert!(err.contains("names no live item whose check covers it"), "{err}");
+        assert!(err.contains("check_path") && err.contains("qwen.mjs") && err.contains("keep me"), "the revise names the file and literal: {err}");
+        assert!(show(&store, "n4-file-guard").is_ok(), "nothing was retracted");
+
+        // A survivor on the same file with ANOTHER literal does not cover it.
+        let other = make("n4-file-other", "qwen.mjs keeps the line `const model` too.", "const model");
+        declare_tried(&mut store, &other, &sealed(&other, RecordedVerdict::RuleWired));
+        assert!(retract(&mut store, "s", "l", "a", "n4-file-guard", "folded into 'n4-file-other'", None).is_err());
+
+        // Allowed: the survivor carries the same file and literal.
+        let same = make("n4-file-same", "qwen.mjs also keeps `keep me`, in the survivor.", "keep me");
+        declare_tried(&mut store, &same, &sealed(&same, RecordedVerdict::RuleWired));
+        retract(&mut store, "s", "l", "a", "n4-file-guard", "folded into 'n4-file-same'", None).expect("a covering survivor");
+
+        // A check that cannot run now (the file is gone) is not a biting check.
+        std::fs::remove_file(checkout.join("qwen.mjs")).unwrap();
+        retract(&mut store, "s", "l", "a", "n4-file-same", "the file is gone, nothing left to guard", None).expect("a dead check retracts as before");
+    }
+
     /// A note, and a rule with no check, retract exactly as before.
     #[test]
     fn n4_retracting_a_note_or_a_rule_without_a_biting_check_is_unchanged() {
