@@ -3437,6 +3437,10 @@ pub enum CandidateSource {
     Quoted,
     /// A flag token in the text (`-a`, `--force`).
     Flag,
+    /// A flag token that sits in an ASIDE of the text (see `aside_tokens`): it
+    /// is mentioned as an example, not forbidden or prescribed, so no tooth is
+    /// built from it and removing it from the text costs nothing.
+    Aside,
     /// A path token in the text.
     Path,
     /// The value of one of the item's Command, Path or Dir anchors.
@@ -3444,10 +3448,10 @@ pub enum CandidateSource {
 }
 
 impl CandidateSource {
-    /// Whether the candidate was read out of the text (every source but an
-    /// anchor).
+    /// Whether the candidate was read out of the text as something a tooth
+    /// can be built from (every source but an anchor and an aside).
     pub fn is_text(self) -> bool {
-        !matches!(self, CandidateSource::Anchor(_))
+        !matches!(self, CandidateSource::Anchor(_) | CandidateSource::Aside)
     }
 }
 
@@ -3536,6 +3540,89 @@ fn flag_token(token: &str) -> Option<&str> {
     (flag.len() >= 2).then_some(flag)
 }
 
+/// Words that say a flag beside them is forbidden or avoided. Lowercase,
+/// English and Dutch.
+pub const NEGATING: &[&str] = &[
+    "never", "not", "no", "don't", "dont", "avoid", "nooit", "niet", "geen", "vermijd", "zonder", "without", "forbidden",
+    "verboden",
+];
+
+/// Words that say the call beside them goes wrong or is refused: a sentence
+/// holding one of them quotes the call to warn off it, never to prescribe it.
+pub const WARNING: &[&str] = &[
+    "refuse", "refuses", "refused", "block", "blocks", "blocked", "break", "breaks", "broke", "clash", "clashes", "fail", "fails",
+    "failed", "hang", "hangs", "kills", "destroys", "wipes", "deletes", "loses", "corrupts", "crash", "crashes", "error", "errors",
+    "dangerous", "destructive", "unsafe", "bad", "wrong", "harmful", "botst", "faalt", "kapot", "gevaarlijk", "fout",
+];
+
+/// Example markers: what follows one, up to the end of the sentence, is an
+/// example. Compared on lowercase tokens with their edge punctuation removed.
+const EXAMPLE_MARKERS: &[&str] = &["like", "e.g", "i.e", "zoals", "bijvoorbeeld", "bv", "such", "for"];
+
+/// For each whitespace-separated token of `text`: whether it sits in an ASIDE,
+/// a place where the text only MENTIONS a flag as an example, so no tooth may
+/// be built from it. An aside is a parenthesis or bracket, or what follows an
+/// example marker (`like`, `e.g.`, `i.e.`, `such as`, `for example`, `zoals`,
+/// `bijvoorbeeld`, `bv.`) up to the end of its sentence - and only in a
+/// sentence with no NEGATING and no WARNING word anywhere in it, so a real
+/// prohibition ("never use --force", "(--watch hangs the session)") keeps its
+/// tooth. A token on or inside a backtick span is never in an aside. Narrow on
+/// purpose: it can only REMOVE a tooth, never add one.
+pub fn aside_tokens(text: &str) -> Vec<bool> {
+    let raw: Vec<&str> = text.split_whitespace().collect();
+    let word = |t: &str| t.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'').to_lowercase();
+    let mut aside = vec![false; raw.len()];
+    // Sentences: a run of tokens ending at one that ends in . ! ? (an example
+    // marker such as "e.g." or "bv." does not end one).
+    let mut start = 0;
+    while start < raw.len() {
+        let mut end = start;
+        while end < raw.len() {
+            let t = raw[end];
+            let w = word(t);
+            let marker = matches!(w.as_str(), "e.g" | "i.e" | "bv");
+            if !marker && t.ends_with(['.', '!', '?']) {
+                break;
+            }
+            end += 1;
+        }
+        let end = end.min(raw.len() - 1);
+        let sentence = &raw[start..=end];
+        let blocked = sentence.iter().any(|t| {
+            let w = word(t);
+            NEGATING.contains(&w.as_str()) || WARNING.contains(&w.as_str())
+        });
+        if !blocked {
+            let mut depth = 0i32;
+            let mut in_example = false;
+            let mut ticks_open = false;
+            for (k, t) in sentence.iter().enumerate() {
+                let at = start + k;
+                let ticks = t.matches('`').count();
+                let on_span = ticks_open || ticks > 0;
+                if ticks % 2 == 1 {
+                    ticks_open = !ticks_open;
+                }
+                let w = word(t);
+                if !in_example {
+                    let two = sentence.get(k + 1).map(|n| word(n));
+                    in_example = match w.as_str() {
+                        "such" => two.as_deref() == Some("as"),
+                        "for" => two.as_deref() == Some("example"),
+                        other => EXAMPLE_MARKERS.contains(&other) && other != "such" && other != "for",
+                    };
+                }
+                depth += t.matches(['(', '[']).count() as i32;
+                aside[at] = !on_span && (depth > 0 || in_example);
+                depth -= t.matches([')', ']']).count() as i32;
+                depth = depth.max(0);
+            }
+        }
+        start = end + 1;
+    }
+    aside
+}
+
 /// Whether `token` looks like a path: an absolute drive path (`C:/x`,
 /// `C:\x`), a UNC path (`\\server\share`), or a separator plus an extension
 /// (`docs/a.md`, `src\main.rs`) - so prose like `en/of` never qualifies.
@@ -3575,14 +3662,25 @@ pub fn teeth_candidates(item: &Item) -> Vec<Candidate> {
     for span in quoted_spans(&item.text) {
         push(&mut out, span, CandidateSource::Quoted);
     }
-    for token in item.text.split_whitespace() {
+    let aside = aside_tokens(&item.text);
+    let mut aside_flags: Vec<&str> = Vec::new();
+    for (i, token) in item.text.split_whitespace().enumerate() {
         let token = bare_token(token);
         if let Some(flag) = flag_token(token) {
-            push(&mut out, flag, CandidateSource::Flag);
+            if aside.get(i).copied().unwrap_or(false) {
+                aside_flags.push(flag);
+            } else {
+                push(&mut out, flag, CandidateSource::Flag);
+            }
         }
         if path_token(token) {
             push(&mut out, token, CandidateSource::Path);
         }
+    }
+    // A flag that is ONLY ever named in an aside is listed as one; a flag also
+    // named outside any aside stays the real candidate it already is.
+    for flag in aside_flags {
+        push(&mut out, flag, CandidateSource::Aside);
     }
     for binding in &item.bindings {
         if let Binding::Target { kind: kind @ (TargetKind::Command | TargetKind::Path | TargetKind::Dir), value } = binding {
@@ -8076,5 +8174,50 @@ mod machine_section_tests {
         assert_eq!(existing.project.as_deref(), Some("fxp"));
         assert!(!newly_filed_as_evaluation(&existing, &spelled), "one name written two ways");
         revise(&existing, &spelled).expect("a respelled scope keeps the machine section untouched");
+    }
+}
+
+#[cfg(test)]
+mod aside_tests {
+    use super::*;
+
+    fn item(text: &str) -> Item {
+        Item {
+            id: "x".to_string(),
+            kind: Kind::Rule,
+            text: text.to_string(),
+            bindings: vec![Binding::Target { kind: TargetKind::Command, value: "vitest".to_string() }],
+            severity: None,
+            project: None,
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: None,
+            check: None,
+        }
+    }
+
+    #[test]
+    fn an_aside_flag_is_no_text_candidate_and_removing_it_costs_nothing() {
+        let with = item("Run vitest in CI (like --watch, which the dev server uses).");
+        let flag = teeth_candidates(&with).into_iter().find(|c| c.value == "--watch").unwrap();
+        assert_eq!(flag.source, CandidateSource::Aside);
+        assert!(!flag.source.is_text());
+        let without = item("Run vitest in CI.");
+        assert!(weakenings_widened(&with, &without).iter().all(|w| w.label != "text candidate removed"));
+
+        let real = item("Never run vitest --watch.");
+        let flag = teeth_candidates(&real).into_iter().find(|c| c.value == "--watch").unwrap();
+        assert_eq!(flag.source, CandidateSource::Flag);
+        let gone = item("Run vitest.");
+        assert!(weakenings_widened(&real, &gone).iter().any(|w| w.label == "text candidate removed"));
+    }
+
+    #[test]
+    fn a_flag_named_both_in_an_aside_and_in_a_prohibition_stays_a_real_candidate() {
+        let both = item("Never run vitest --watch (like --watch in the dev server).");
+        let flags: Vec<_> = teeth_candidates(&both).into_iter().filter(|c| c.value == "--watch").collect();
+        assert_eq!(flags.len(), 1);
+        assert_eq!(flags[0].source, CandidateSource::Flag);
     }
 }

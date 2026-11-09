@@ -61,6 +61,7 @@ use thor_core::event_store::{Event, EventKind, EventStore};
 use crate::guard_verdict;
 use crate::legit::{self, Corpus, RealCall};
 use crate::project::{self, RootProblem};
+use model::gate::{NEGATING, WARNING};
 use crate::shell;
 use model::gate;
 use model::item::{Binding, Check, Item, TargetKind};
@@ -710,10 +711,6 @@ const RECOMMENDING: &[&str] = &[
     // --check"), which is no prohibition of it (field test 5, D9).
     "runs", "uses", "adds", "passes", "draait", "gebruikt", "voegt", "kiest", "voert", "voer", "geef", "geeft",
 ];
-const NEGATING: &[&str] = &[
-    "never", "not", "no", "don't", "dont", "avoid", "nooit", "niet", "geen", "vermijd", "zonder", "without", "forbidden",
-    "verboden",
-];
 
 /// THE INVERSE TOOTH (step 26, field test 2 defect 2): whether the words just
 /// before position `at` of `text`'s tokens - at most three, never across the
@@ -891,13 +888,6 @@ fn derive(item: &Item, root: Option<&Path>) -> Vec<Derived> {
         .collect()
 }
 
-/// Words that say the call beside them goes wrong or is refused: a sentence
-/// holding one of them quotes the call to warn off it, never to prescribe it.
-const WARNING: &[&str] = &[
-    "refuse", "refuses", "refused", "block", "blocks", "blocked", "break", "breaks", "broke", "clash", "clashes", "fail", "fails",
-    "failed", "hang", "hangs", "kills", "destroys", "wipes", "deletes", "loses", "corrupts", "crash", "crashes", "error", "errors",
-    "dangerous", "destructive", "unsafe", "bad", "wrong", "harmful", "botst", "faalt", "kapot", "gevaarlijk", "fout",
-];
 
 /// Words that say the sentence tells HOW to do a job: a call quoted beside one is
 /// the way to do it, not a thing to ban.
@@ -1040,14 +1030,23 @@ fn derive_all(item: &Item, root: Option<&Path>) -> Vec<Derived> {
         .split_whitespace()
         .map(|t| t.trim_matches(|c: char| matches!(c, '`' | '\'' | '"' | '(' | ')' | ',' | ';' | ':' | '.' | '!' | '?')).to_string())
         .collect();
+    // A flag named in an ASIDE (in parentheses, or after "like", "e.g.", "for
+    // example", "zoals" with no negating or warning word in the sentence) is
+    // mentioned, not prescribed or forbidden: no tooth is built from it.
+    let aside = gate::aside_tokens(&item.text);
     for anchor in &anchors {
         let aw: Vec<&str> = anchor.split(' ').collect();
         for i in 0..tokens.len() {
             if i + aw.len() > tokens.len() || !tokens[i..i + aw.len()].iter().zip(&aw).all(|(t, a)| t.eq_ignore_ascii_case(a)) {
                 continue;
             }
-            let window = &tokens[i + aw.len()..(i + aw.len() + 3).min(tokens.len())];
-            if let Some(flag) = window.iter().find_map(|t| leading_flag(t)) {
+            let from = i + aw.len();
+            let window = &tokens[from..(from + 3).min(tokens.len())];
+            if let Some(flag) = window
+                .iter()
+                .enumerate()
+                .find_map(|(k, t)| leading_flag(t).filter(|_| !aside.get(from + k).copied().unwrap_or(false)))
+            {
                 let origin = Origin::Text(format!("the flag '{flag}' after '{anchor}' in the text"));
                 out.push(Derived { check: Check::Forbidden { literals: vec![flag.to_string()] }, proposed: None, origin: origin.clone() });
                 out.push(Derived { check: Check::Requires { when: anchor.clone(), required: vec![flag.to_string()] }, proposed: None, origin });

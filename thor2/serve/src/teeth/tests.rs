@@ -908,6 +908,40 @@ fn a_flag_the_text_recommends_is_never_forbidden() {
     assert!(message.contains("forbidden '--no-index' on 'git grep'"), "{message}");
 }
 
+/// N7: a flag named in an ASIDE (a parenthesis, or after "like", "e.g.",
+/// "for example", "zoals") is mentioned, not forbidden: it derives no tooth. A
+/// flag in a real prohibition or a warning keeps its tooth.
+#[test]
+fn n7_a_flag_in_an_aside_derives_no_tooth_but_a_real_prohibition_still_does() {
+    let forbidden = |text: &str| -> Vec<String> {
+        let item = rule("a", text, vec![cmd("vitest")], None, None);
+        derive(&item, None)
+            .iter()
+            .filter_map(|d| match &d.check {
+                Check::Forbidden { literals } => Some(literals.join(" ")),
+                _ => None,
+            })
+            .collect()
+    };
+    for text in [
+        "Run `vitest run` in CI (like --watch, which the dev server uses).",
+        "Run vitest in CI for the report (--wait is only for the dev server).",
+        "Run vitest in CI, e.g. --watch is for local work.",
+        "Run vitest in CI, for example --watch for local work.",
+        "Draai vitest in CI, zoals --watch lokaal.",
+    ] {
+        assert!(forbidden(text).is_empty(), "{text}: {:?}", forbidden(text));
+    }
+    for text in [
+        "Never run vitest --watch.",
+        "The vitest (--watch hangs the session).",
+        "Do not run vitest (like --watch) in CI.",
+        "Never use vitest --watch in CI.",
+    ] {
+        assert!(!forbidden(text).is_empty(), "{text}: a real prohibition keeps its tooth");
+    }
+}
+
 /// Field test 5 (D9): "npm run verify draait set-version.js --check" describes
 /// what the command runs; it is no prohibition of the flag.
 #[test]
