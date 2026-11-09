@@ -174,7 +174,7 @@ pub fn run(req: &Request) -> Result<Vec<String>, String> {
     // A restart is asked for only when something Claude Code loads at its
     // start changed: the hook wiring in its settings. A copy registers no
     // local tool server, and each hook starts the current `serve` fresh.
-    let mut restart_needed = false;
+    let restart_needed: bool;
     match install_hooks(&req.settings, &specs) {
         Ok(report) => {
             let changed = report.results.iter().filter(|(_, o)| *o != HookOutcome::AlreadyPresent).count();

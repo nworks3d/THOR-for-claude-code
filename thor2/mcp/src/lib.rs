@@ -9776,17 +9776,26 @@ mod tests {
 
         {
             let mut store = srv.store.lock().unwrap();
-            model::store::record_write_verification(
-                &mut store,
-                "mcp",
-                model::store::SystemActor::new(model::store::ATTESTER_ACTOR),
-                "set-aside-noise",
-                seq,
-                false,
-                None,
-                "not an attested THOR call: two different calls under one id",
-            )
-            .unwrap();
+            // A fixture event written raw: a test holds no THOR actor token.
+            let body = serde_json::json!({
+                "event_seq": seq,
+                "attested": false,
+                "session": "mcp",
+                "agent_id": null,
+                "why": "not an attested THOR call: two different calls under one id",
+            })
+            .to_string();
+            store
+                .append_event(
+                    "mcp",
+                    "mcp",
+                    model::store::ATTESTER_ACTOR,
+                    thor_core::event_store::EventKind::GateStoodAside,
+                    "set-aside-noise",
+                    None,
+                    &body,
+                )
+                .unwrap();
         }
 
         let second = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "set-aside-noise".to_string(), noise: true })).await;

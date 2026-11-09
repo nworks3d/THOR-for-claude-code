@@ -238,16 +238,23 @@ fn dead_reports_neither_hide_the_counting_one_nor_restart_the_window() {
 fn a_new_project_does_not_inherit_the_hook_failures_another_projects_evaluation_listed() {
     let mut fx = Fx::new();
     let root = fx.root();
-    let attester = model::store::SystemActor::new(model::store::ATTESTER_ACTOR);
-    let fault = |id: &str| model::store::HookFault {
-        tool_use_id: id.to_string(),
-        hook_event: "SessionStart".to_string(),
-        exit_code: 126,
-        at: "2026-10-06T22:29:00Z".to_string(),
-        host_wide: false,
-        quick_silent: false,
+    // A fixture event written raw: a test holds no THOR actor token.
+    let record_fault = |store: &mut thor_core::event_store::EventStore, id: &str| {
+        let fault = model::store::HookFault {
+            tool_use_id: id.to_string(),
+            hook_event: "SessionStart".to_string(),
+            exit_code: 126,
+            at: "2026-10-06T22:29:00Z".to_string(),
+            host_wide: false,
+            quick_silent: false,
+        };
+        let body = serde_json::json!({ "hook_fault": fault }).to_string();
+        let entity = model::store::hook_fault_entity(S1);
+        store
+            .append_event(S1, S1, model::store::ATTESTER_ACTOR, EventKind::GateStoodAside, &entity, None, &body)
+            .unwrap();
     };
-    assert!(model::store::record_hook_fault(&mut fx.store, S1, attester, &fault("toolu_old")).unwrap().is_some());
+    record_fault(&mut fx.store, "toolu_old");
     crate::attest::fixture::quiet_start(&mut fx.store, S1, "fxp");
     let good = report("eval-fxp-2026-10-12", "fxp", "TLDR: this one counts.");
     attested_filing(&mut fx.store, &root, S1, &good, "toolu_f1").unwrap();
@@ -259,7 +266,7 @@ fn a_new_project_does_not_inherit_the_hook_failures_another_projects_evaluation_
     assert_eq!(signals.hook_failures, 0, "already listed by fxp's evaluation: {}", signals.health);
 
     // A failure after that evaluation is new, and is listed.
-    assert!(model::store::record_hook_fault(&mut fx.store, S1, attester, &fault("toolu_new")).unwrap().is_some());
+    record_fault(&mut fx.store, "toolu_new");
     let tip = fx.store.get_next_seq().unwrap() - 1;
     let signals = model::store::signals_so_far(&fx.store, 0, tip, &std::collections::HashSet::new());
     assert_eq!(signals.hook_failures, 1, "{}", signals.health);
