@@ -7382,7 +7382,14 @@ pub fn signals_so_far(
 ) -> SignalsSoFar {
     let window: Vec<Event> =
         store.events_since(prev_report_seq).unwrap_or_default().into_iter().filter(|e| e.seq <= started_seq).collect();
-    let health = health_facts(&window, "since the previous report", host_wide_ids);
+    // THOR's own health is the machine's, not the project's: a hook that
+    // failed to launch or a filing refused as version skew, already listed in
+    // ANY project's counting evaluation, is not listed again by the first
+    // evaluation of another project (field 2026-10: a SessionStart exit 126
+    // of 2026-10-06 came back in a new project on 2026-10-12).
+    let health_from = prev_report_seq.max(newest_counting_evaluation_seq_of_any_project(store));
+    let health_window: Vec<Event> = window.iter().filter(|e| e.seq > health_from).cloned().collect();
+    let health = health_facts(&health_window, "since the previous report", host_wide_ids);
     let log = LogAt::new(store, started_seq);
     // Before the start, the evaluating session's own verified refusals count:
     // they are on the log already and cannot be provoked for the report. Only
@@ -8179,6 +8186,20 @@ fn validation_still_counts(store: &EventStore, v: &EvaluationValidation) -> bool
 /// skew events must reach the next report that counts (field test 14, C3).
 pub fn newest_counting_evaluation_seq(store: &EventStore, project: Option<&str>) -> i64 {
     newest_valid_evaluation(store, project).map_or(0, |v| v.report_seq)
+}
+
+/// The filing seq of the newest report that COUNTS, of any project; `0` when
+/// none does. THOR's own health (hook failures, version skew) belongs to the
+/// machine, so an evaluation of any project that counted has listed what came
+/// before it.
+pub fn newest_counting_evaluation_seq_of_any_project(store: &EventStore) -> i64 {
+    evaluation_validations(store)
+        .into_iter()
+        .map(|(_, v)| v)
+        .filter(|v| v.valid && validation_still_counts(store, v))
+        .map(|v| v.report_seq)
+        .max()
+        .unwrap_or(0)
 }
 
 /// One valid evaluation that carried an open point about a subject: who

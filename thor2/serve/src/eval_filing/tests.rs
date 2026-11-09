@@ -229,6 +229,42 @@ fn dead_reports_neither_hide_the_counting_one_nor_restart_the_window() {
     assert_eq!(model::store::newest_counting_evaluation_seq(&fx.store, Some("other")), 0);
 }
 
+/// 2026-10-12: the first evaluation of a project listed a hook launch failure
+/// of 2026-10-06 that another project's counting evaluation had already
+/// listed. THOR's health belongs to the machine: what an evaluation of ANY
+/// project that counted already covered is not listed again, and a failure
+/// after it still is.
+#[test]
+fn a_new_project_does_not_inherit_the_hook_failures_another_projects_evaluation_listed() {
+    let mut fx = Fx::new();
+    let root = fx.root();
+    let attester = model::store::SystemActor::new(model::store::ATTESTER_ACTOR);
+    let fault = |id: &str| model::store::HookFault {
+        tool_use_id: id.to_string(),
+        hook_event: "SessionStart".to_string(),
+        exit_code: 126,
+        at: "2026-10-06T22:29:00Z".to_string(),
+        host_wide: false,
+        quick_silent: false,
+    };
+    assert!(model::store::record_hook_fault(&mut fx.store, S1, attester, &fault("toolu_old")).unwrap().is_some());
+    crate::attest::fixture::quiet_start(&mut fx.store, S1, "fxp");
+    let good = report("eval-fxp-2026-10-12", "fxp", "TLDR: this one counts.");
+    attested_filing(&mut fx.store, &root, S1, &good, "toolu_f1").unwrap();
+    assert_eq!(fx.stop().len(), 1);
+
+    // The first evaluation of ANOTHER project (no report of its own: 0).
+    let tip = fx.store.get_next_seq().unwrap() - 1;
+    let signals = model::store::signals_so_far(&fx.store, 0, tip, &std::collections::HashSet::new());
+    assert_eq!(signals.hook_failures, 0, "already listed by fxp's evaluation: {}", signals.health);
+
+    // A failure after that evaluation is new, and is listed.
+    assert!(model::store::record_hook_fault(&mut fx.store, S1, attester, &fault("toolu_new")).unwrap().is_some());
+    let tip = fx.store.get_next_seq().unwrap() - 1;
+    let signals = model::store::signals_so_far(&fx.store, 0, tip, &std::collections::HashSet::new());
+    assert_eq!(signals.hook_failures, 1, "{}", signals.health);
+}
+
 // ------------------------------------------------------------- (4) the machine block
 
 /// B1 at the reader: a machine block that is not the one THOR derives from
