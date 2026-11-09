@@ -1969,6 +1969,12 @@ fn first_command_violation<'a>(
                 }
             }
             for literal in literals {
+                // A WHOLE-TOOL BAN (N14): on a tool call the segment's unit is
+                // the input VALUES, never the tool's name, so a literal equal
+                // to the anchor is hit by the reach itself.
+                if segment.tool && literal.eq_ignore_ascii_case(anchor) {
+                    return Some(CommandHit { item: candidate, anchor, literal, site: (segment.raw.clone(), literal.to_string()) });
+                }
                 if let Some(site) = crate::shell::literal_site(segment, literal) {
                     return Some(CommandHit { item: candidate, anchor, literal, site });
                 }

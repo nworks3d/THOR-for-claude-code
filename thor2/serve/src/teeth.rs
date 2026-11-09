@@ -387,6 +387,33 @@ fn forms(item: &Item, root: &Path) -> Result<Forms, String> {
     match &item.check {
         None => none("this rule carries no check"),
         Some(Check::Forbidden { literals }) => {
+            if let Some(anchor) = command_anchor(&item.bindings).filter(|a| shell::names_a_tool(a)) {
+                // A TOOL by its name (N14): the same tool-call form the
+                // `requires` branch builds. A whole-tool ban is tried with the
+                // tool itself (refused) and with a shell command that only
+                // names it, and a sibling tool of the same server (let through);
+                // a value literal is tried inside the tool's input.
+                let tool_call = |prompt: &str| Call {
+                    shown: format!("{anchor} with '{prompt}'"),
+                    tool: anchor.to_string(),
+                    input: json!({ "prompt": prompt }),
+                };
+                let collapsed = literals.iter().any(|l| l.eq_ignore_ascii_case(anchor));
+                let mut clean = vec![bash(&format!("echo {anchor}"))];
+                if let Some((server, _)) = anchor.strip_prefix("mcp__").and_then(|rest| rest.rsplit_once("__")) {
+                    clean.push(Call {
+                        shown: format!("mcp__{server}__other-trial with 'trial'"),
+                        tool: format!("mcp__{server}__other-trial"),
+                        input: json!({ "prompt": "trial" }),
+                    });
+                }
+                if collapsed {
+                    return Ok(Forms { forbidden: vec![tool_call("trial")], clean, collapsed: true, file: None });
+                }
+                clean.insert(0, tool_call("trial"));
+                let forbidden = literals.iter().map(|l| tool_call(l)).collect();
+                return Ok(Forms { forbidden, clean, collapsed: false, file: None });
+            }
             if let Some(anchor) = command_anchor(&item.bindings) {
                 let anchor = anchor.split_whitespace().collect::<Vec<_>>().join(" ");
                 let words: Vec<&str> = anchor.split(' ').collect();

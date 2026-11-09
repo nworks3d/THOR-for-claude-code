@@ -2572,7 +2572,7 @@ const TOOL_NAMES: &[&str] = &[
 
 /// Whether `anchor` is spelled as one of the tools (`TOOL_NAMES`, or an
 /// `mcp__` tool), case exact.
-fn names_a_tool(anchor: &str) -> bool {
+pub fn names_a_tool(anchor: &str) -> bool {
     let first = anchor.split_whitespace().next().unwrap_or("");
     first.starts_with("mcp__") || TOOL_NAMES.contains(&first)
 }

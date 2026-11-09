@@ -374,6 +374,53 @@ fn a_whole_command_ban_prints_the_cleaner_anchor_as_advice() {
     assert!(r.contains("Advice: bind to 'git push' with the literal '--force' - THOR tried exactly that and it bites"), "{r}");
 }
 
+// ------------------------------------------- N14: a forbidden check on a tool
+
+/// N14: a `forbidden` check works on a tool call by the tool's NAME. A rule
+/// bound to an MCP tool whose forbidden literal is the tool's own name refuses
+/// that tool, and only that tool: not a sibling tool, and not a shell command
+/// that merely mentions the name in its text. The write-time trial reports it
+/// as a rule.
+#[test]
+fn n14_a_whole_tool_ban_refuses_the_tool_call_and_nothing_that_only_mentions_it() {
+    let mut fx = Fx::new();
+    let tool = "mcp__demo__preview_start";
+    let item = rule("no-preview", "Never use mcp__demo__preview_start; the owner starts previews himself.", vec![cmd(tool)], forbidden(&[tool]), None);
+    // The trial at remember time reports a rule, not a note.
+    let t = fx.write(&item);
+    assert_eq!(t.outcome, Outcome::Rule { proven: false }, "{}", receipt(&t));
+    fx.legacy(&item);
+    let root = fx.dir.path().to_path_buf();
+    let judge = |tool: &str, input: serde_json::Value| {
+        crate::guard_verdict::pre_tool(&fx.store, tool, Some(&input), None, Some(&root), Some(&root), None).verdict
+    };
+    let refused = judge(tool, json!({ "prompt": "start it" }));
+    assert!(refused.as_ref().is_some_and(|v| v.rule_id.as_deref() == Some("no-preview")), "{refused:?}");
+    assert!(judge(tool, json!({})).is_some(), "an empty input is the tool call too");
+    assert!(judge("mcp__demo__other", json!({ "prompt": "start it" })).is_none(), "a sibling tool is not reached");
+    assert!(judge("Bash", json!({ "command": "echo mcp__demo__preview_start" })).is_none(), "a shell command naming it in text is not the tool");
+    assert!(judge("Grep", json!({ "pattern": "mcp__demo__preview_start" })).is_none(), "a search for the name is not the tool");
+}
+
+/// A value literal on a tool is looked for in the tool's input values only,
+/// on token boundaries; the tool's reach still decides which calls are judged.
+#[test]
+fn n14_a_value_literal_on_a_tool_is_found_in_its_input_values_only() {
+    let mut fx = Fx::new();
+    let tool = "mcp__demo__run";
+    let item = rule("no-skip", "Never pass --no-verify through mcp__demo__run.", vec![cmd(tool)], forbidden(&["--no-verify"]), None);
+    let t = fx.write(&item);
+    assert_eq!(t.outcome, Outcome::Rule { proven: false }, "{}", receipt(&t));
+    fx.legacy(&item);
+    let root = fx.dir.path().to_path_buf();
+    let judge = |tool: &str, input: serde_json::Value| {
+        crate::guard_verdict::pre_tool(&fx.store, tool, Some(&input), None, Some(&root), Some(&root), None).verdict
+    };
+    assert!(judge(tool, json!({ "cmd": "git commit --no-verify" })).is_some());
+    assert!(judge(tool, json!({ "cmd": "git commit" })).is_none());
+    assert!(judge("Grep", json!({ "pattern": "git commit --no-verify" })).is_none(), "another tool is not reached");
+}
+
 // ------------------------------------------------------------ (5) it bites
 
 /// G7b.1 (K18): NOTES.md = 'keep me\nsecond line keep me\nplain line',

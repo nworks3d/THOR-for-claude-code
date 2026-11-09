@@ -177,7 +177,7 @@ pub fn pre_tool_in(
         return judged;
     }
     let call = Call::of(live, tool_name, tool_input, project, cwd);
-    let by_command = command_in(live, tool_input, call.as_ref(), root, cwd);
+    let by_command = command_in(live, tool_name, project, tool_input, call.as_ref(), root, cwd);
     judged.pools.command = by_command.pools.command;
     if by_command.verdict.is_some() {
         judged.verdict = by_command.verdict;
@@ -360,18 +360,46 @@ pub fn command(
 ) -> Judgement {
     let live = Live::of(store);
     let call = Call::of(&live, tool_name, tool_input, project, cwd);
-    command_in(&live, tool_input, call.as_ref(), root, cwd)
+    command_in(&live, tool_name, project, tool_input, call.as_ref(), root, cwd)
+}
+
+/// A `forbidden` check on a TOOL, by its name (N14). A call with no `command`
+/// (an MCP tool, `Agent`, `WebFetch`) is cut as the one pseudo-segment
+/// `requires_in` already builds: the tool's name is its head and the
+/// flattened input values are its unit. A rule whose Command anchor names
+/// that tool reaches it, and its forbidden literals are looked for in those
+/// values, or - for a whole-tool ban, a literal equal to the anchor - hit by
+/// the reach itself. A call to ANY OTHER tool, or a shell command that only
+/// mentions the name in its text, is not reached. Whole-tool matching only:
+/// no input field is addressed.
+fn tool_in(live: &Live, tool: &str, project: Option<&str>, tool_input: Option<&Value>, root: Option<&Path>) -> Judgement {
+    let content = tool_input.map(tool_input_values).unwrap_or_default();
+    let segments = [shell::tool_segment(tool, &content)];
+    let projects = [project.map(str::to_string)];
+    let verdict = absent_guard::find_command_violation_in(live.items(), &segments, Some(&projects), root).map(|(reason, anchor)| Verdict {
+        rule_id: absent_guard::rule_id_of(&reason).map(str::to_string),
+        target: tool.to_string(),
+        repeat: Some(RepeatKey::Command(absent_guard::attempt_key(&anchor, Some(tool)))),
+        reason,
+    });
+    Judgement { verdict, pools: Pools::default() }
 }
 
 fn command_in(
     live: &Live,
+    tool_name: &str,
+    project: Option<&str>,
     tool_input: Option<&Value>,
     call: Option<&Call>,
     root: Option<&Path>,
     cwd: Option<&Path>,
 ) -> Judgement {
     let (Some(command), Some(call)) = (absent_guard::proposed_command(tool_input), call) else {
-        return Judgement::default();
+        return if absent_guard::proposed_command(tool_input).is_none() {
+            tool_in(live, tool_name, project, tool_input, root)
+        } else {
+            Judgement::default()
+        };
     };
 
     for at in input::shell_writes_in(&call.segments) {
