@@ -275,9 +275,9 @@ fn backfill_reads_every_recent_transcript_once() {
         format!("{}\n", use_line("toolu_c", "Bash", json!({"command": "pwd"}), 80)),
     )
     .unwrap();
-    let done = corpus::backfill(&fx.db(), &fx.root(), Duration::from_secs(30), serve::time::now_unix());
+    let done = corpus::backfill(&fx.db(), &fx.root(), Duration::from_secs(30), NOW);
     assert_eq!((done.files_total, done.files_read, done.calls, done.complete), (2, 2, 3, true));
-    let again = corpus::backfill(&fx.db(), &fx.root(), Duration::from_secs(30), serve::time::now_unix());
+    let again = corpus::backfill(&fx.db(), &fx.root(), Duration::from_secs(30), NOW);
     assert_eq!(again.calls, 0, "a second backfill finds nothing new");
 }
 
@@ -354,7 +354,7 @@ fn a_subagents_stop_records_its_reply_but_leaves_the_calls_to_the_main_session()
             "cwd": fx.dir.path().to_string_lossy(), "last_assistant_message": "all done here.",
         }),
     );
-    let now = serve::time::now_unix();
+    let now = NOW;
     assert!(corpus::load_calls(&fx.db(), now).is_empty());
     let replies = corpus::load_replies(&fx.db(), now);
     assert_eq!(replies.len(), 1);
@@ -420,7 +420,7 @@ fn a_back_fill_reads_each_reply_with_its_prompt_its_tool_calls_and_what_the_guar
 #[test]
 fn a_back_fill_of_replies_runs_once_and_a_reply_the_live_stop_also_recorded_counts_once() {
     let fx = Fx::new();
-    let now = serve::time::now_unix();
+    let now = NOW;
     let recent = |ago: i64| format!("{}.000Z", serve::time::iso8601_from_unix(now - ago).trim_end_matches('Z'));
     let lines = vec![
         json!({"type": "user", "timestamp": recent(900), "sessionId": SESSION, "message": {"role": "user", "content": "status?"}}).to_string(),
@@ -445,8 +445,8 @@ fn the_stop_stamps_each_call_with_the_build_that_recorded_it_and_a_back_fill_doe
     assert_eq!(fx.calls()[0].b, serve::BUILD_ID, "a live Stop knows its own build");
     let other = Fx::new();
     other.write(&[use_line("toolu_b", "Bash", json!({"command": "ls"}), 100)]);
-    corpus::backfill(&other.db(), &other.root(), Duration::from_secs(30), serve::time::now_unix());
-    let rows = corpus::load_calls(&other.db(), serve::time::now_unix());
+    corpus::backfill(&other.db(), &other.root(), Duration::from_secs(30), NOW);
+    let rows = corpus::load_calls(&other.db(), NOW);
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].b, "", "a call read back from a transcript has no known engine");
 }
@@ -479,7 +479,7 @@ fn switching_recording_off_keeps_nothing_and_the_sweep_says_it_has_no_data() {
 
     assert_eq!(fx.record().calls, 0, "no call is recorded at a Stop");
     corpus::record_reply(&fx.db(), &corpus::reply_row(NOW, SESSION, false, false, "/work", "a reply", "a prompt", &[], false, false, ""));
-    let filled = corpus::backfill(&fx.db(), &fx.root(), Duration::from_secs(30), serve::time::now_unix());
+    let filled = corpus::backfill(&fx.db(), &fx.root(), Duration::from_secs(30), NOW);
     assert_eq!((filled.calls, filled.replies), (0, 0), "and a back-fill records nothing either");
     assert!(!corpus::calls_path(&fx.db()).exists() && !corpus::replies_path(&fx.db()).exists(), "no file is even created");
 
