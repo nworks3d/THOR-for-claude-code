@@ -7121,7 +7121,7 @@ fn check_arguments(check: &Check) -> String {
 }
 
 /// Bindings as the `moments`, `targets` and `always` arguments of a call.
-fn binding_arguments(bindings: &[Binding]) -> String {
+pub fn binding_arguments(bindings: &[Binding]) -> String {
     let moments: Vec<String> = bindings
         .iter()
         .filter_map(|b| match b {
