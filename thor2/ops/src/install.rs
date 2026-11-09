@@ -2987,6 +2987,48 @@ mod tests {
         }
     }
 
+    /// Helper-agent mode is switched off by retracting its two notes. They
+    /// carry no check, so the retract guard for a biting check (N4) never
+    /// stands in the way, and `install --set-helpers off` still works.
+    #[test]
+    fn set_helpers_off_still_retracts_its_notes_because_they_carry_no_check() {
+        assert!(helper_mode_notes().iter().all(|n| n.check.is_none()), "a helper note must never carry a check");
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        EventStore::new(&db).unwrap();
+        let on = set_helpers(&db, true).unwrap();
+        assert!(on.iter().all(|(_, change)| matches!(change, HelperChange::Stored)), "{on:?}");
+        let off = set_helpers(&db, false).unwrap();
+        assert_eq!(off.len(), 2);
+        assert!(off.iter().all(|(_, change)| matches!(change, HelperChange::Retracted)), "{off:?}");
+    }
+
+    /// A starter note that carries a refusing check is removed in two steps,
+    /// the way the first-session catalogue and AGENTS.md say: clear its check
+    /// with a revise that says why, then retract it. Before THOR has tried the
+    /// check (a fresh install) the retract goes through as before; once it
+    /// bites, the retract guard (N4) asks for the clearing first.
+    #[test]
+    fn a_windows_starter_note_is_removed_by_clearing_its_check_then_retracting() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = EventStore::new(&dir.path().join("thor.db")).unwrap();
+        let pack = workflow_starter_pack_for(true);
+        for id in ["windowless-processes-on-windows", "scheduled-task-not-interactive"] {
+            let note = pack.iter().find(|n| n.id == id).unwrap();
+            assert!(note.check.is_some(), "{id} carries a refusing check on Windows");
+            model::store::declare(&mut store, "install", "install", installer(), note).unwrap();
+            let mut cleared = note.clone();
+            cleared.check = None;
+            let baseline = model::gate::ClearedFields { check: true, ..Default::default() }.baseline(note);
+            model::store::revise_because(&mut store, "s", "l", "mcp", &baseline, &cleared, note, Some("the owner does not want this note"))
+                .unwrap_or_else(|e| panic!("{id}: clearing the check: {e}"));
+            assert!(model::store::show(&store, id).unwrap().check.is_none());
+            model::store::retract(&mut store, "s", "l", "mcp", id, "the owner does not want the note named windowless-processes in his setup", None)
+                .unwrap_or_else(|e| panic!("{id}: retract after clearing: {e}"));
+            assert!(model::store::show(&store, id).is_err(), "{id} is retracted");
+        }
+    }
+
     /// A block shows at most four notes (`model::item::MAX_ITEMS`) and a
     /// command place holds at most four, so the pack must not crowd one
     /// moment or command past what a block can carry in one showing, and must
