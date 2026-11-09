@@ -1495,6 +1495,33 @@ fn every_refusal_and_needs_agent_text_is_in_the_refusal_table() {
     }
 }
 
+/// A rule with no project whose `path_exists` check names an ABSOLUTE path
+/// needs no working copy: a retest tries it directly instead of holding it
+/// in the global open point; a relative path on such a rule stays blocked.
+#[test]
+fn an_absolute_path_check_on_a_rule_with_no_project_is_tried_directly() {
+    let mut fx = Fx::new();
+    let dir = tempfile::tempdir().unwrap();
+    let there = dir.path().join("settings.json");
+    fs::write(&there, "{}").unwrap();
+    let shown = there.display().to_string();
+    let absolute = rule(
+        "abs-global",
+        &format!("The file {shown} exists on every machine."),
+        vec![path(&shown)],
+        Some(Check::PathExists { path: shown.clone() }),
+        None,
+    );
+    fx.legacy(&absolute);
+    assert!(
+        !matches!(fx.retest("abs-global").outcome, Maintenance::Blocked(ref b) if b.is_global_rules()),
+        "an absolute path needs no working copy"
+    );
+    let relative = rule("rel-global", "Keep README.md around.", vec![path("README.md")], Some(Check::PathExists { path: "README.md".to_string() }), None);
+    fx.legacy(&relative);
+    assert!(matches!(fx.retest("rel-global").outcome, Maintenance::Blocked(ref b) if b.is_global_rules()));
+}
+
 // --------------------------------------------- exits the wiring exposed (step 8)
 
 /// A reason tag on the rule must never keep a tooth built from its own text

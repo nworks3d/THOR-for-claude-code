@@ -13304,6 +13304,32 @@ mod tests {
         global.project = None;
         legacy(&mut store, &global);
         assert_eq!(settlement(&store, "global-keeps", None), Settlement::Settled(Settled::Blocked(Blocker::global_rules())));
+
+        // A no-project rule whose check names an ABSOLUTE path needs no
+        // working copy: it is tried directly, so it is held by no blocker and
+        // belongs to no global open point. A relative path keeps the blocker.
+        let here = checkout.join("NOTES.md").display().to_string();
+        let mut absolute = rule.clone();
+        absolute.id = "global-absolute".to_string();
+        absolute.project = None;
+        absolute.check = Some(Check::PathExists { path: here });
+        absolute.text = format!("The file {} stays where the notes live.", absolute.check.as_ref().map(crate::store::check_in_words).unwrap_or_default());
+        legacy(&mut store, &absolute);
+        assert_eq!(crate::checkout::read_time_blocker(&store, &absolute), None, "an absolute path needs no working copy");
+        assert_ne!(
+            settlement(&store, "global-absolute", None),
+            Settlement::Settled(Settled::Blocked(Blocker::global_rules())),
+            "not held in the global open point"
+        );
+        let mut relative = absolute.clone();
+        relative.check = Some(Check::PathExists { path: "NOTES.md".to_string() });
+        assert_eq!(crate::checkout::read_time_blocker(&store, &relative), Some(Blocker::global_rules()));
+        for path in ["C:/work/x", r"C:\work\x", "//server/share/x", r"\\server\share\x", "/srv/x"] {
+            assert!(crate::checkout::is_absolute_path(path), "{path}");
+        }
+        for path in ["x/y", "NOTES.md", "./x", "../x", "C:x"] {
+            assert!(!crate::checkout::is_absolute_path(path), "{path}");
+        }
     }
 
     /// Retracted, or taken off the rule track: settled; a rule with a note

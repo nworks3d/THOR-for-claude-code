@@ -3045,7 +3045,7 @@ pub fn retest(store: &EventStore, db: Option<&Path>, id: &str, corpus: &Corpus) 
             item.check = Some(p.check.clone());
         }
     }
-    let root = project::registered_checkout(store, item.project.as_deref());
+    let root = model::checkout::check_root(store, &item);
     let env = Env { store, db };
     let hist = history(store, id, item.check.as_ref());
     let write = Write { item: &item, before: Some(&head_item), because: None, parent_rev: Some(head_rev.clone()) };
@@ -3400,7 +3400,7 @@ pub fn trial_for_write(
         }
     }
     corpus.refresh(store);
-    let root = project::registered_checkout(store, item.project.as_deref());
+    let root = model::checkout::check_root(store, &item);
     let hist = history_for_write(store, before, item, because);
     let parent_rev = before.and_then(|_| head(store, &item.id).ok()).map(|(_, rev)| rev);
     let trial_result = {

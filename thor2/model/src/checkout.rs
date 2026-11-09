@@ -713,6 +713,38 @@ pub fn full_path_place(store: &EventStore, item: &Item, root: &Path, path: &str)
     crate::store::FullPlace::of(store, item, path)
 }
 
+/// Whether `path` is absolute on any system THOR runs on: a Windows drive
+/// (`C:\x`, `C:/x`), a UNC path (`\\server\share`, `//server/share`) or a
+/// Unix path (`/srv/x`).
+pub fn is_absolute_path(path: &str) -> bool {
+    let b = path.as_bytes();
+    let drive = b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'/' || b[2] == b'\\');
+    drive || path.starts_with('/') || path.starts_with("\\\\")
+}
+
+/// The absolute path of a `path_exists` or `absent` check of a rule with NO
+/// project. Such a check is tried directly (its root does not matter); a
+/// relative path, or a rule with a project, keeps the registered working copy.
+pub fn absolute_path_check_without_project(item: &Item) -> Option<&str> {
+    if crate::normalize::normalize_project(item.project.as_deref()).is_some() {
+        return None;
+    }
+    match item.check.as_ref()? {
+        Check::PathExists { path } | Check::Absent { path, .. } if is_absolute_path(path) => Some(path),
+        _ => None,
+    }
+}
+
+/// The folder a file check of `item` is tried in: the registered working copy
+/// of its project, or - for a no-project rule with an absolute path - the
+/// store's own folder (the path overrides it).
+pub fn check_root(store: &EventStore, item: &Item) -> Result<PathBuf, RootProblem> {
+    if absolute_path_check_without_project(item).is_some() {
+        return Ok(store.path().and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_else(std::env::temp_dir));
+    }
+    registered_checkout(store, item.project.as_deref())
+}
+
 /// What holds `item` from being decided right now, judged at READ time the
 /// same way `serve::teeth::retest` judges it, so a reader never demands a
 /// retest whose answer is "blocked" (F9):
@@ -731,6 +763,11 @@ pub fn full_path_place(store: &EventStore, item: &Item, root: &Path, path: &str)
 /// check whose file lacks its literal. `None` for every item nothing blocks.
 pub fn read_time_blocker(store: &EventStore, item: &Item) -> Option<Blocker> {
     let check = item.check.as_ref().filter(|c| is_file_check(c))?;
+    // A rule with no project whose check names an ABSOLUTE path needs no
+    // working copy: the path is the same on this machine whatever the folder.
+    if absolute_path_check_without_project(item).is_some() {
+        return None;
+    }
     // A rule with no project has no working copy at all to try a file check
     // in (step 20, K10): blocked, counted apart, the owner's to decide.
     let Some(project) = crate::normalize::normalize_project(item.project.as_deref()) else {
