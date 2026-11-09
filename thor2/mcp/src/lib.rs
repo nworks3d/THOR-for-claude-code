@@ -1285,12 +1285,24 @@ fn recent_firings(store: &EventStore, id: &str, session: Option<&str>) -> String
     if served.is_empty() {
         return format!("WHERE IT FIRED {whose}: never.");
     }
+    let replies = store.path().map(|db| serve::corpus::load_replies(&db, serve::time::now_unix()));
     let mut out = format!("WHERE IT FIRED {whose}: {} time(s); the newest {}:", served.len(), served.len().min(FIRINGS_SHOWN));
     for event in served.iter().take(FIRINGS_SHOWN) {
         let body = serde_json::from_str::<model::served::ItemServed>(&event.body).ok();
         let at = body.as_ref().map(|b| b.served_at.clone()).unwrap_or_default();
         let place = match body.and_then(|b| b.trigger).filter(|t| !t.trim().is_empty()) {
-            Some(t) => format!("'{}'", model::store::trigger_excerpt(&t, &anchors)),
+            Some(t) => {
+                let shown = format!("'{}'", model::store::trigger_excerpt(&t, &anchors));
+                // A prompt firing: a short piece of the prompt, read now from
+                // the real-call record (never stored on the log).
+                let excerpt = replies
+                    .as_deref()
+                    .and_then(|r| serve::eval_session::prompt_excerpt_for_place(r, &event.session_id, &t));
+                match excerpt {
+                    Some(e) => format!("{shown} - \"{e}\""),
+                    None => shown,
+                }
+            }
             None => model::store::FIRED_WITHOUT_TRIGGER.to_string(),
         };
         let who = if session.is_none() { format!(" (session {})", event.session_id) } else { String::new() };

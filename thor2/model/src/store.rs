@@ -5034,6 +5034,12 @@ pub struct Firings {
     /// own anchor when it names one.
     #[serde(default)]
     pub triggers: Vec<String>,
+    /// For a trigger from a typed prompt, a short piece of that prompt read
+    /// at render time from the real-call record (`excerpts[i]` belongs to
+    /// `triggers[i]`). NEVER serialized: the owner's words are kept out of
+    /// every log event, the start record included.
+    #[serde(skip)]
+    pub excerpts: Vec<Option<String>>,
 }
 
 /// How many distinct triggers per item `session_firings` keeps.

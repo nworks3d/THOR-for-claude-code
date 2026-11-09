@@ -116,7 +116,11 @@ pub fn retire_handover_sidecar(db: &Path) {
 /// with where each judgement item fired filled in at read time when the start
 /// record carries none (`with_fired`).
 pub fn open_evaluation(store: &EventStore, session_id: &str, project: &str) -> Option<EvaluationStart> {
-    model::store::open_evaluation_start(store, session_id, project).map(|start| with_fired(store, start))
+    model::store::open_evaluation_start(store, session_id, project).map(|start| {
+        let mut start = with_fired(store, start);
+        fill_prompt_excerpts(store, &mut start);
+        start
+    })
 }
 
 /// READ-TIME FALLBACK FOR WHERE IT FIRED (step 26, field test 2 defect 1): a
@@ -284,11 +288,7 @@ pub fn try_begin(db: &Path, store: &mut EventStore, session_id: &str, project: &
             return Err(StartRefused::Store);
         }
     }
-    let mut frozen = model::store::frozen_now(store, session_id, project, started_by, now).ok_or(StartRefused::Store)?;
-    if let Some(db) = store.path() {
-        let replies = crate::corpus::load_replies(&db, now);
-        add_prompt_excerpts(&mut frozen, &replies);
-    }
+    let frozen = model::store::frozen_now(store, session_id, project, started_by, now).ok_or(StartRefused::Store)?;
     let id = model::store::evaluation_start_id(project, frozen.started_seq);
     let item = Item {
         id: id.clone(),
@@ -304,7 +304,10 @@ pub fn try_begin(db: &Path, store: &mut EventStore, session_id: &str, project: &
         check: None,
     };
     match model::store::record_evaluation_start(store, eval_machine(), &item, &frozen) {
-        Ok(start) => Ok(Started { start, fresh: true }),
+        Ok(mut start) => {
+            fill_prompt_excerpts(store, &mut start);
+            Ok(Started { start, fresh: true })
+        }
         // Raced by another start for the same position: read the one that
         // landed.
         Err(_) => open_evaluation(store, session_id, project).map(|start| Started { start, fresh: false }).ok_or(StartRefused::Store),
@@ -338,6 +341,8 @@ pub fn decide_until(
     let project = start.frozen.project.clone();
     let passed = machine_pass_until(store, &project, &start, box_secs, stop);
     let mut frozen = start.frozen.clone();
+    // The text stored on the log never carries the owner's words.
+    frozen.fired.values_mut().for_each(|f| f.excerpts.clear());
     frozen.batch = Some(passed.batch.clone());
     frozen.batch_later = passed.batch_later;
     frozen.a4_list = Some(passed.a4_list.clone());
@@ -353,7 +358,10 @@ pub fn decide_until(
         passed.a4_list,
         passed.machine,
     ) {
-        Ok(decided) => decided,
+        Ok(mut decided) => {
+            fill_prompt_excerpts(store, &mut decided);
+            decided
+        }
         Err(_) => open_evaluation(store, &start.frozen.session, &project).unwrap_or(start),
     }
 }
@@ -1122,24 +1130,32 @@ fn machine_pass_until(
 pub const PROMPT_EXCERPT_CHARS: usize = 80;
 
 /// A firing from a typed prompt is logged as "(prompt) word" only: the log
-/// keeps none of the owner's text. After a context summary the session then
-/// cannot tell whether the item belonged there. So the places frozen with the
-/// list get a short excerpt of the prompt around the matched word, read from
-/// the real-call record's replies (`corpus::ReplyRow::prompt`, already passed
-/// through `deliver::redact_secrets`) of the same session. A place with no
-/// such prompt on record stays as it was.
-pub fn add_prompt_excerpts(frozen: &mut model::store::Frozen, replies: &[crate::corpus::ReplyRow]) {
-    let session: String = frozen.session.chars().take(8).collect();
-    for firings in frozen.fired.values_mut() {
-        for trigger in firings.triggers.iter_mut() {
-            let Some(words) = trigger.strip_prefix("(prompt) ") else { continue };
-            let found = replies.iter().rev().filter(|r| r.s == session).find_map(|r| {
-                words.split(',').map(str::trim).filter(|w| !w.is_empty()).find_map(|w| prompt_excerpt(&r.prompt, w))
-            });
-            if let Some(excerpt) = found {
-                *trigger = format!("{trigger} - \"{excerpt}\"");
-            }
-        }
+/// keeps none of the owner's text, and neither does any record built from it
+/// (the start record and its frozen places included). After a context summary
+/// the session then cannot tell whether the item belonged there. So, at
+/// RENDER time only, a short excerpt of the prompt around the matched word is
+/// read from the real-call record's replies (`corpus::ReplyRow::prompt`,
+/// already passed through `deliver::redact_secrets` and pruned after 30 days)
+/// of the same session. A place with no such prompt left on record shows
+/// nothing extra.
+pub fn prompt_excerpt_for_place(replies: &[crate::corpus::ReplyRow], session: &str, place: &str) -> Option<String> {
+    let words = place.strip_prefix("(prompt) ")?;
+    let session: String = session.chars().take(8).collect();
+    replies.iter().rev().filter(|r| r.s == session).find_map(|r| {
+        words.split(',').map(str::trim).filter(|w| !w.is_empty()).find_map(|w| prompt_excerpt(&r.prompt, w))
+    })
+}
+
+/// Fill the never-stored `Firings::excerpts` of `start` for display.
+pub fn fill_prompt_excerpts(store: &EventStore, start: &mut EvaluationStart) {
+    let Some(db) = store.path() else { return };
+    if !start.frozen.fired.values().any(|f| f.triggers.iter().any(|t| t.starts_with("(prompt) "))) {
+        return;
+    }
+    let replies = crate::corpus::load_replies(&db, crate::time::now_unix());
+    let session = start.frozen.session.clone();
+    for firings in start.frozen.fired.values_mut() {
+        firings.excerpts = firings.triggers.iter().map(|t| prompt_excerpt_for_place(&replies, &session, t)).collect();
     }
 }
 
@@ -1166,7 +1182,17 @@ fn prompt_excerpt(prompt: &str, word: &str) -> Option<String> {
 pub fn fired_line(fired: Option<&model::store::Firings>, per_item: usize) -> String {
     match fired {
         Some(f) if !f.triggers.is_empty() => {
-            let places = f.triggers.iter().take(per_item).map(|t| format!("'{t}'")).collect::<Vec<_>>().join(" | ");
+            let places = f
+                .triggers
+                .iter()
+                .enumerate()
+                .take(per_item)
+                .map(|(i, t)| match f.excerpts.get(i).and_then(|e| e.as_deref()) {
+                    Some(excerpt) => format!("'{t}' - \"{excerpt}\""),
+                    None => format!("'{t}'"),
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
             format!("\n       fired here {} time(s); last at: {places}", f.count)
         }
         Some(f) => format!("\n       fired here {} time(s)", f.count),
@@ -2238,11 +2264,19 @@ mod tests {
         assert!(!line.contains("hunter2"), "a secret is blanked before it is kept: {line}");
         let quoted = line.split('"').nth(1).expect("the excerpt is quoted");
         assert!(quoted.chars().count() <= super::PROMPT_EXCERPT_CHARS + 6, "short: {quoted}");
-        // A place with no prompt on record is left as it was.
-        let mut frozen = started.start.frozen.clone();
-        frozen.fired.values_mut().for_each(|f| f.triggers = vec!["(prompt) unknownword".to_string()]);
-        super::add_prompt_excerpts(&mut frozen, &crate::corpus::load_replies(&db, now));
-        assert!(frozen.fired.values().all(|f| f.triggers == vec!["(prompt) unknownword".to_string()]));
+        // THE OWNER'S WORDS STAY OUT OF EVERY LOG EVENT: not the start record,
+        // not the frozen place, not the stored note.
+        for event in store.events_since(0).unwrap() {
+            assert!(!event.body.contains("how much RAM does the printer board"), "an event carries the prompt: {}", event.entity_id);
+        }
+        // Read back later, the excerpt is rendered again from the record.
+        let reopened = open_evaluation(&store, "sess", "p").unwrap();
+        assert!(start_note(&reopened).contains("how much RAM does the printer board have?"));
+        // Once the replies record is pruned, nothing extra is shown.
+        std::fs::remove_file(crate::corpus::replies_path(&db)).unwrap();
+        let pruned = open_evaluation(&store, "sess", "p").unwrap();
+        let note = start_note(&pruned);
+        assert!(note.contains("(prompt) ram") && !note.contains("how much RAM"), "{note}");
     }
 
     /// FIELD TEST 2, defect 1 (2026-10-01): an evaluation started by an older
