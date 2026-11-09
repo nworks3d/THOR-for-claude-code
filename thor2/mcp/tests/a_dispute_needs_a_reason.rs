@@ -195,7 +195,12 @@ fn a_retracted_rule_comes_back_with_a_remember_under_a_new_id() {
     args["check_literals"] = json!(["system prune"]);
     let reply = mcp.call("remember", args.clone());
     assert!(reply.starts_with("stored 'no-prune'"), "{reply}");
-    let reply = mcp.call("retract", json!({ "id": "no-prune", "reason": "the docker system prune ban is replaced by a cleanup job" }));
+    // A rule whose check bites is retracted only with a survivor that keeps it.
+    let mut survivor = args.clone();
+    survivor["id"] = json!("prune-ban");
+    survivor["text"] = json!("Do not run `docker system prune` on build hosts, ever.");
+    assert!(mcp.call("remember", survivor).starts_with("stored 'prune-ban'"));
+    let reply = mcp.call("retract", json!({ "id": "no-prune", "reason": "the docker system prune ban moved into 'prune-ban'" }));
     assert!(reply.starts_with("retracted no-prune"), "{reply}");
     assert!(get_missing(&mut mcp, "no-prune"));
 
@@ -229,7 +234,11 @@ fn remembering_a_retracted_id_again_leaves_it_with_two_heads() {
     args["check_kind"] = json!("forbidden");
     args["check_literals"] = json!(["system prune"]);
     assert!(mcp.call("remember", args.clone()).starts_with("stored 'no-prune'"));
-    assert!(mcp.call("retract", json!({ "id": "no-prune", "reason": "the docker system prune ban is replaced by a cleanup job" })).starts_with("retracted no-prune"));
+    let mut survivor = args.clone();
+    survivor["id"] = json!("prune-ban");
+    survivor["text"] = json!("Do not run `docker system prune` on build hosts, ever.");
+    assert!(mcp.call("remember", survivor).starts_with("stored 'prune-ban'"));
+    assert!(mcp.call("retract", json!({ "id": "no-prune", "reason": "the docker system prune ban moved into 'prune-ban'" })).starts_with("retracted no-prune"));
     let again = mcp.call("remember", args);
     println!("{again}");
     assert!(mcp.call("get", json!({ "id": "no-prune" })).contains("diverged"), "same id twice: two heads");

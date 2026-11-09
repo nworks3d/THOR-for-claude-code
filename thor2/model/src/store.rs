@@ -8629,6 +8629,17 @@ pub fn retract<'a>(
         Err(ReadError::Parse(_)) => {} // unreadable body, still retractable
         Err(e) => return Err(WriteError::Store(anyhow::anyhow!("{e}"))),
     }
+    // A CHECK THAT BITES IS NOT RETRACTED WITHOUT A SURVIVOR THAT KEEPS IT
+    // (N4). Folding a crowded place meant "revise one to carry the point,
+    // retract the rest", and the check went out with the retracted rule:
+    // measured, three refusing checks and a contains check were lost that way.
+    // Only a check that runs now and holds can block this; a rule with no
+    // check, a note, or a check whose file is gone retracts as before.
+    if let Ok(item) = show(store, entity_id) {
+        if let Some(refusal) = retract_would_lose_a_check(store, entity_id, &item, reason) {
+            return Err(WriteError::Refused(refusal));
+        }
+    }
     // The one ground `retract` itself enforces (see `gate::retract`'s own
     // doc comment). The `entity_id == SETUP_NOTE_ID` guard means the extra
     // read on the right only ever runs for the one id this could possibly
@@ -8648,6 +8659,91 @@ pub fn retract<'a>(
             &body,
         )
         .map_err(WriteError::Store)
+}
+
+/// Whether the check of `item` (live as `id`) bites right now: the trial
+/// decided it is a rule, and the check runs here and holds. A file check
+/// needs a working copy to run in (or an absolute path on a rule with no
+/// project); with none it cannot run now, so it never blocks anything.
+fn check_bites_now(store: &EventStore, id: &str, item: &Item) -> bool {
+    let Some(check) = item.check.as_ref() else { return false };
+    if !item.kind.can_fire() || !matches!(current_verdict(store, id), CurrentVerdict::RuleProven | CurrentVerdict::RuleWired) {
+        return false;
+    }
+    if !crate::checkout::is_file_check(check) {
+        return true;
+    }
+    if crate::checkout::absolute_path_check_without_project(item).is_some() {
+        return crate::check::run_absolute(check) == crate::check::Outcome::Holds;
+    }
+    match crate::checkout::check_root(store, item) {
+        Ok(root) => crate::check::run(check, &root) == crate::check::Outcome::Holds,
+        Err(_) => false,
+    }
+}
+
+/// Whether `successor`'s check keeps everything `lost` checks: the same file
+/// and literal, a superset of the literals, or the same trigger and answers.
+/// A forbidden check also needs a command anchor on the survivor that reaches
+/// each command anchor of the retracted rule.
+fn check_covers(successor: &Item, lost: &Item) -> bool {
+    let (Some(got), Some(was)) = (successor.check.as_ref(), lost.check.as_ref()) else { return false };
+    let superset = |have: &[String], need: &[String]| need.iter().all(|n| have.iter().any(|h| h == n));
+    let commands = |item: &Item| -> Vec<String> {
+        item.bindings
+            .iter()
+            .filter_map(|b| match b {
+                Binding::Target { kind: crate::item::TargetKind::Command, value } => Some(value.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let reaches = || {
+        let have = commands(successor);
+        commands(lost).iter().all(|c| have.iter().any(|h| h == c || command_covers(h, c)))
+    };
+    match (got, was) {
+        (Check::Forbidden { literals: have }, Check::Forbidden { literals: need }) => superset(have, need) && reaches(),
+        (Check::Contains { path: a, literal: x }, Check::Contains { path: b, literal: y }) => a == b && x == y,
+        (Check::Absent { path: a, literal: x }, Check::Absent { path: b, literal: y }) => a == b && x == y,
+        (Check::AbsentAll { path: a, literals: have }, Check::AbsentAll { path: b, literals: need }) => a == b && superset(have, need),
+        (Check::AbsentAll { path: a, literals: have }, Check::Absent { path: b, literal }) => a == b && have.iter().any(|h| h == literal),
+        (Check::PathExists { path: a }, Check::PathExists { path: b }) => a == b,
+        (Check::Requires { when: wa, required: have }, Check::Requires { when: wb, required: need }) => wa == wb && superset(have, need),
+        _ => false,
+    }
+}
+
+/// The refusal for a retract that would lose a check that bites, or `None`
+/// when the retract may go ahead: the item's check does not bite now, or the
+/// reason names (by id) a live item whose check covers it.
+fn retract_would_lose_a_check(store: &EventStore, id: &str, item: &Item, reason: &str) -> Option<Refusal> {
+    if !check_bites_now(store, id, item) {
+        return None;
+    }
+    let check = item.check.as_ref()?;
+    let named_survivor = reason
+        .split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':')))
+        .filter(|word| !word.is_empty() && *word != id)
+        .filter_map(|word| show(store, word).ok().map(|survivor| (word, survivor)))
+        .any(|(_, survivor)| survivor.kind.can_fire() && check_covers(&survivor, item));
+    if named_survivor {
+        return None;
+    }
+    Some(Refusal {
+        problem: format!(
+            "'{id}' carries a check that bites ({}), and retracting it would lose that check: the reason names no \
+             live item whose check covers it",
+            check_in_words(check)
+        ),
+        fix: format!(
+            "carry the check onto the item that survives, then retract naming that item's id in the reason: \
+             mcp__thor__revise(id: \"<the survivor's id>\", {}, because: \"<it now carries the check of '{id}', at least 20 \
+             characters>\"), then retract '{id}' with a reason that quotes the survivor's id. If the rule is simply \
+             wrong, clear its check first with a revise that says why",
+            check_arguments(check)
+        ),
+    })
 }
 
 /// Settle a diverged entity by naming which head survives. Every current head
@@ -13710,6 +13806,67 @@ mod tests {
         store.append_event("legacy", &item.id, "migration", EventKind::FactCreated, &item.id, None, &body).unwrap();
     }
 
+    /// N4: retracting a rule whose check bites is refused unless the reason
+    /// names a live successor whose check covers it.
+    #[test]
+    fn n4_a_retract_may_not_lose_a_check_that_bites_without_a_covering_survivor() {
+        let mut store = EventStore::in_memory().unwrap();
+        let mut proven = wired_forbidden("n4-proven", "p", "--force");
+        proven.severity = None;
+        proven.text = "Never push with --force.".to_string();
+        proven.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "git push".to_string() }];
+        declare_tried(&mut store, &proven, &sealed(&proven, RecordedVerdict::RuleWired));
+        let mut note = heavy_command_rule("n4-note", "p");
+        note.severity = None;
+        note.tags = vec![];
+        note.check = None;
+        note.text = "Pushes go through the release script.".to_string();
+        note.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "git push".to_string() }];
+        legacy(&mut store, &note);
+
+        // Refused: a generic reason, and a survivor that carries no check.
+        let err = retract(&mut store, "s", "l", "a", "n4-proven", "folded into the release note", None).unwrap_err().to_string();
+        assert!(err.contains("loses") || err.contains("lose that check"), "{err}");
+        assert!(err.contains("mcp__thor__revise(id: \"<the survivor's id>\"") && err.contains("--force"), "{err}");
+        let err = retract(&mut store, "s", "l", "a", "n4-proven", "folded into 'n4-note'", None).unwrap_err().to_string();
+        assert!(err.contains("names no live item whose check covers it"), "{err}");
+        assert!(show(&store, "n4-proven").is_ok(), "nothing was retracted");
+
+        // A survivor with a NARROWER literal set does not cover it.
+        let mut narrow = wired_forbidden("n4-narrow", "p", "--no-verify");
+        narrow.severity = None;
+        narrow.text = "Never commit with --no-verify.".to_string();
+        narrow.bindings = proven.bindings.clone();
+        declare_tried(&mut store, &narrow, &sealed(&narrow, RecordedVerdict::RuleWired));
+        assert!(retract(&mut store, "s", "l", "a", "n4-proven", "folded into 'n4-narrow'", None).is_err());
+
+        // Allowed: the survivor carries the same check and the reason names it.
+        let mut survivor = wired_forbidden("n4-survivor", "p", "--force");
+        survivor.severity = None;
+        survivor.text = "Never push with --force (kept here).".to_string();
+        survivor.bindings = proven.bindings.clone();
+        declare_tried(&mut store, &survivor, &sealed(&survivor, RecordedVerdict::RuleWired));
+        retract(&mut store, "s", "l", "a", "n4-proven", "folded into 'n4-survivor'", None).expect("a covering survivor");
+    }
+
+    /// A note, and a rule with no check, retract exactly as before.
+    #[test]
+    fn n4_retracting_a_note_or_a_rule_without_a_biting_check_is_unchanged() {
+        let mut store = EventStore::in_memory().unwrap();
+        let mut note = heavy_command_rule("n4-plain", "p");
+        note.severity = None;
+        note.tags = vec![];
+        note.check = None;
+        legacy(&mut store, &note);
+        retract(&mut store, "s", "l", "a", "n4-plain", "stale, the deploy moved to CI", None).expect("a note retracts freely");
+
+        // A legacy rule whose check no trial has decided bites nothing yet.
+        let mut undecided = wired_forbidden("n4-undecided", "p", "--force");
+        undecided.severity = None;
+        legacy(&mut store, &undecided);
+        retract(&mut store, "s", "l", "a", "n4-undecided", "stale, the deploy moved to CI", None).expect("no biting check, no block");
+    }
+
     fn wired_forbidden(id: &str, project: &str, literal: &str) -> Item {
         let mut item = heavy_command_rule(id, project);
         item.tags = vec![TEETH_WIRED_TAG.to_string()];
@@ -14958,7 +15115,10 @@ mod tests {
 
         let gone = force_push_rule("gone");
         declare_tried(&mut store, &gone, &sealed(&gone, RecordedVerdict::RuleWired));
-        retract(&mut store, "s", "l", "a", "gone", "a fixture retraction of the git push rule", None).unwrap();
+        let mut kept = force_push_rule("gone-kept");
+        kept.text = "Do not push to main with `--force` ever.".to_string();
+        declare_tried(&mut store, &kept, &sealed(&kept, RecordedVerdict::RuleWired));
+        retract(&mut store, "s", "l", "a", "gone", "a fixture retraction of the git push rule, kept in 'gone-kept'", None).unwrap();
         assert_eq!(current_verdict(&store, "gone"), undecided("it was retracted"));
 
         let split = force_push_rule("split");

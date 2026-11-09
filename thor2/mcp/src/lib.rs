@@ -513,7 +513,7 @@ recreate the one ranked pool THOR was built to remove.";
 /// One target binding as an MCP argument: a JSON-schema-friendly stand-in for
 /// `model::item::Binding::Target`, since `TargetKind` itself has no direct
 /// schema derive wired up for external callers.
-#[derive(Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TargetArg {
     /// One of: path, dir, symbol, command, project, route, host.
     pub kind: String,
@@ -2054,7 +2054,7 @@ fn write_binding_change(
 // own doc comment for the full reasoning, including the CLI side's
 // equivalent (a repeatable `--check-literals` flag, for the same reason).
 
-#[derive(Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RememberArgs {
     /// Caller-chosen id, kept forever. Pick something short, stable and
@@ -3902,7 +3902,7 @@ impl ThorMcpServer {
         .await
     }
 
-    #[tool(description = "Code lane: removes an item that is simply WRONG or no longer applies - it stops being live everywhere (session start, the moment of action, lookup), but nothing is deleted, and history still walks it. Use revise instead when the item merely changed. A reason is required; a blank one is refused. On a replica this queues instead of writing ('queued for the main machine' is not an error). Bringing the fact back later is a fresh remember, never a revise of the tombstone. Replies 'retracted <id> (<reason>) (event seq N)', or the refusal text.", annotations(title = "Retract an item", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false))]
+    #[tool(description = "Code lane: removes an item that is simply WRONG or no longer applies - it stops being live everywhere (session start, the moment of action, lookup), but nothing is deleted, and history still walks it. Use revise instead when the item merely changed. A reason is required; a blank one is refused. A rule whose check bites is refused unless the reason names, by id, a live item whose check covers it; the refusal prints the revise that carries the check over. On a replica this queues instead of writing ('queued for the main machine' is not an error). Bringing the fact back later is a fresh remember, never a revise of the tombstone. Replies 'retracted <id> (<reason>) (event seq N)', or the refusal text.", annotations(title = "Retract an item", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false))]
     async fn retract(&self, meta: Meta, raw: RawArgs, Parameters(args): Parameters<RetractArgs>) -> String {
         // THOR's own open point (step 14) is never a writer's to close: it
         // closes itself at the first evaluation start after its subject
@@ -5713,15 +5713,22 @@ mod tests {
             targets: vec![TargetArg { kind: "command".to_string(), value: "git push".to_string() }],
             always: false,
         };
+        let mut survivor = args.clone();
+        survivor.id = "push-rules".to_string();
+        survivor.text = "never force-push, the --force flag is refused".to_string();
         let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.starts_with("stored "), "{reply}");
+        // N4: no survivor yet, so the check would be lost: refused, nothing retracted.
+        let reason = "folded into 'push-rules': it carries the --force point now".to_string();
         let reply = srv
-            .retract(
-                Meta::new(),
-                RawArgs::default(),
-                Parameters(RetractArgs { id: "guarded-1".to_string(), reason: "folded into 'push-rules': it carries the --force point now".to_string() }),
-            )
+            .retract(Meta::new(), RawArgs::default(), Parameters(RetractArgs { id: "guarded-1".to_string(), reason: reason.clone() }))
             .await;
+        assert!(reply.contains("names no live item whose check covers it"), "{reply}");
+        assert!(reply.contains("mcp__thor__revise(id:"), "the refusal prints the revise that carries the check over: {reply}");
+        // With a live survivor that carries the same check, it goes through.
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(survivor)).await;
+        assert!(reply.starts_with("stored "), "{reply}");
+        let reply = srv.retract(Meta::new(), RawArgs::default(), Parameters(RetractArgs { id: "guarded-1".to_string(), reason })).await;
         assert!(reply.starts_with("retracted guarded-1"), "{reply}");
         assert!(reply.contains("WARNING: its check held"), "{reply}");
         assert!(reply.contains("forbidden '--force'"), "the reply names the lost check: {reply}");
