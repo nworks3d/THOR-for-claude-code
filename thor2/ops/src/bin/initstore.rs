@@ -33,7 +33,7 @@ struct Cli {
     /// Path to the store. Created - with the working contract and the
     /// response-guard rulebook - when it does not exist yet; left completely
     /// untouched when it does.
-    #[arg(long)]
+    #[arg(long, value_parser = thor_core::app_data::parse_db_path)]
     db: PathBuf,
 }
 

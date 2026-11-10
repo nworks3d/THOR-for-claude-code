@@ -68,7 +68,7 @@ struct Cli {
     /// Where the memory lives. Defaults to the per-user data directory, never
     /// next to the binaries: a store inside a build output directory is one
     /// `cargo clean` away from being gone.
-    #[arg(long)]
+    #[arg(long, value_parser = thor_core::app_data::parse_db_path)]
     db: Option<PathBuf>,
 
     /// A directory of code indexes, one per project. Defaults to `codeindex`
@@ -291,7 +291,7 @@ fn copy_install(cli: &Cli, source: String) -> ExitCode {
         eprintln!("could not work out where `serve` is - name it with --serve-exe");
         return ExitCode::FAILURE;
     };
-    let Some(db) = cli.db.clone().or_else(|| default_data_dir().map(|d| d.join("thor.db"))) else {
+    let Some(db) = cli.db.clone().or_else(|| default_data_dir().map(|d| thor_core::app_data::resolve(&d.join("thor.db")))) else {
         eprintln!("could not work out where to keep the copy - name it with --db");
         return ExitCode::FAILURE;
     };
@@ -986,7 +986,7 @@ fn main() -> ExitCode {
     // with nothing saying why. A missing binary here becomes `None`, which the
     // step-3 match turns into a loud refusal, not a dead registration.
     let mcp_exe = cli.mcp_exe.or_else(|| sibling("mcp")).filter(|p| p.exists());
-    let db = match cli.db.or_else(|| data_dir.as_ref().map(|d| d.join("thor.db"))) {
+    let db = match cli.db.or_else(|| data_dir.as_ref().map(|d| thor_core::app_data::resolve(&d.join("thor.db")))) {
         Some(p) => p,
         None => {
             eprintln!("could not work out where to keep the memory - name it with --db");

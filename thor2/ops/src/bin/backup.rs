@@ -29,7 +29,7 @@ use thor_core::event_store::EventStore;
 struct Cli {
     /// Path to the store to back up, or - with --restore-from - the FRESH store
     /// to rebuild into.
-    #[arg(long)]
+    #[arg(long, value_parser = thor_core::app_data::parse_db_path)]
     db: PathBuf,
     /// Path to an existing git clone (it needs a remote to push to).
     /// Required for a backup; ignored when restoring.

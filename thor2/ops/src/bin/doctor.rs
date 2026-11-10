@@ -30,7 +30,7 @@ macro_rules! say_err {
     about = "One plain-language line per component: the memory store, the code index, the replica, and how many rules still lack a falsifier"
 )]
 struct Cli {
-    #[arg(long)]
+    #[arg(long, value_parser = thor_core::app_data::parse_db_path)]
     db: PathBuf,
     #[arg(long = "index-db")]
     index_db: Option<PathBuf>,

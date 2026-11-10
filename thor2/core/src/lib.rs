@@ -6,6 +6,7 @@ pub mod auditor;
 pub mod repo;
 pub mod backup;
 pub mod ledger;
+pub mod app_data;
 pub mod copy_mode;
 
 /// True when `arg` is either spelling of the version flag. THE GAP THIS

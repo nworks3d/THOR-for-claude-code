@@ -32,7 +32,7 @@ use thor_core::event_store::EventStore;
 #[command(name = "serve", about = "Select, rank, cap and render items - one path, four channels")]
 struct Cli {
     /// Path to the core event-log database.
-    #[arg(long)]
+    #[arg(long, value_parser = thor_core::app_data::parse_db_path)]
     db: PathBuf,
 
     #[command(subcommand)]
