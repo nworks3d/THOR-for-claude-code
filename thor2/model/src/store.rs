@@ -6219,6 +6219,25 @@ pub fn movable_scope_counts(store: &EventStore) -> Vec<(String, i64)> {
     counts
 }
 
+/// The scopes a project NAME is resolved or accepted against: the ones that
+/// hold items an assistant can move (`movable_scope_counts`), plus a scope only
+/// THOR's own records use when no other spelling of its name holds real items
+/// (a project right after its first evaluation start is still a project). A
+/// spelling only THOR's own records use, beside a spelling with real items, is
+/// left out, so nothing new is ever filed under it. Nothing stored changes.
+pub fn resolvable_scope_counts(store: &EventStore) -> Vec<(String, i64)> {
+    let mut scopes = movable_scope_counts(store);
+    let movable_keys: Vec<String> = scopes.iter().map(|(name, _)| crate::checkout::project_match_key(name)).collect();
+    for (name, n) in store.project_scope_counts() {
+        let named = scopes.iter().any(|(s, _)| *s == name);
+        if !named && !movable_keys.contains(&crate::checkout::project_match_key(&name)) {
+            scopes.push((name, n));
+        }
+    }
+    scopes.sort();
+    scopes
+}
+
 /// Every live open point scoped EXACTLY to `project` (an open point belongs
 /// to the project it is about): THOR's own first, then the legacy ones, each
 /// group oldest first (ascending creation seq; a failed seq lookup sorts an

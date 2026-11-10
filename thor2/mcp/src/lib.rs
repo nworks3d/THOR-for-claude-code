@@ -814,7 +814,13 @@ fn refuse_a_new_collection(
     }
     let Some(wanted) = filed_under(item) else { return Ok(()) };
     let known = serve::lookup::catalog(store);
-    if known.scopes.iter().any(|s| s.scope.eq_ignore_ascii_case(&wanted)) {
+    // Judged by the items an assistant can move: a spelling only THOR's own
+    // records use, beside a real one, is not an existing project.
+    let resolvable = model::store::resolvable_scope_counts(store);
+    let only_thors_own = |scope: &str| {
+        !resolvable.iter().any(|(s, _)| s == scope) && store.project_scope_counts().iter().any(|(s, _)| s == scope)
+    };
+    if known.scopes.iter().any(|s| s.scope.eq_ignore_ascii_case(&wanted) && !only_thors_own(&s.scope)) {
         return Ok(());
     }
     if checkout_project(root).is_some_and(|p| p.eq_ignore_ascii_case(&wanted)) {
@@ -835,7 +841,12 @@ fn refuse_a_new_collection(
     // would split the project in two ('Acme tool tracking' and
     // 'Acme-tool-tracking' both existed). Refused with the spelling to use.
     // Nothing stored is renamed or merged by this.
-    let scopes: Vec<(String, i64)> = known.scopes.iter().map(|s| (s.scope.clone(), (s.documents + s.fireable) as i64)).collect();
+    let scopes: Vec<(String, i64)> = known
+        .scopes
+        .iter()
+        .filter(|s| !only_thors_own(&s.scope))
+        .map(|s| (s.scope.clone(), (s.documents + s.fireable) as i64))
+        .collect();
     if let Some(existing) = serve::project::existing_scope_for(&scopes, &wanted) {
         return Err(format!(
             "REFUSED: '{wanted}' is not a new collection, it is another spelling of '{existing}', which already exists. Filing \
@@ -9235,6 +9246,49 @@ mod tests {
 
         let named = other_spelling(Some("Acme tool tracking"));
         assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(named)).await.starts_with("stored"), "the owner has the final word");
+    }
+
+    /// A spelling only THOR's own records use (an evaluation start) is not an
+    /// existing project beside a spelling with real items: a write under it is
+    /// refused with the real spelling. A project with ONLY THOR's own records
+    /// and no other spelling still takes a write, as before.
+    #[tokio::test]
+    async fn a_spelling_only_thors_own_records_use_is_not_an_existing_project() {
+        let srv = server_knowing(&["Acme tool tracking"]);
+        let own = |id: &str, project: &str| {
+            let item = model::item::Item {
+                id: id.to_string(),
+                kind: Kind::Report,
+                text: "THOR's own record".to_string(),
+                bindings: Vec::new(),
+                severity: None,
+                project: Some(project.to_string()),
+                tags: Vec::new(),
+                expires: None,
+                key: None,
+                falsifier: None,
+                check: None,
+            };
+            let event = (id.to_string(), model::store::canonical_body(&item).unwrap());
+            srv.store
+                .lock()
+                .unwrap()
+                .append_event("s", "s", "eval-machine", thor_core::event_store::EventKind::FactCreated, &event.0, None, &event.1)
+                .unwrap();
+        };
+        own("evaluation-start-acme-tool-tracking-7", "Acme-tool-tracking");
+        let blocker = model::store::Blocker::WorkingTreeDiffers { path: "a.md".to_string() };
+        own(&model::store::machine_point_id("Acme-tool-tracking", &blocker), "Acme-tool-tracking");
+        own("evaluation-start-fresh-3", "Fresh");
+
+        let mut other = blank_report("acme-3");
+        other.project = Some("Acme-tool-tracking".to_string());
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(other)).await;
+        assert!(reply.starts_with("REFUSED") && reply.contains("another spelling of 'Acme tool tracking'"), "{reply}");
+
+        let mut fresh = blank_report("fresh-1");
+        fresh.project = Some("Fresh".to_string());
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(fresh)).await.starts_with("stored"));
     }
 
     /// The one new name this door allows: the checkout's own project key, which

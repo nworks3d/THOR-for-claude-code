@@ -57,7 +57,7 @@ pub use model::checkout::{
 /// start of a command that resolves folders (a hook, doctor, install, the
 /// tool server).
 pub fn load_known_scopes(db: &Path) {
-    let scopes = thor_core::event_store::EventStore::open_read_only(db).map(|store| store.project_scope_counts()).unwrap_or_default();
+    let scopes = thor_core::event_store::EventStore::open_read_only(db).map(|store| model::store::resolvable_scope_counts(&store)).unwrap_or_default();
     use_known_scopes(scopes);
 }
 
@@ -220,6 +220,36 @@ mod tests {
 
     fn tempdir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    /// A folder named like a spelling only THOR's own records use resolves to
+    /// the spelling that holds real items; a project with only THOR's own
+    /// records and no other spelling still resolves to itself.
+    #[test]
+    fn a_folder_never_resolves_to_a_spelling_only_thors_own_records_use() {
+        let dir = tempdir();
+        let db = dir.path().join("t.db");
+        {
+            let mut store = thor_core::event_store::EventStore::new(&db).unwrap();
+            let mut put = |actor: &str, id: &str, project: &str| {
+                let body = format!(r#"{{"text":"x","project":"{project}"}}"#);
+                store.append_event("s", "s", actor, thor_core::event_store::EventKind::FactCreated, id, None, &body).unwrap();
+            };
+            put("owner", "real-1", "Acme tool tracking");
+            put("eval-machine", "evaluation-start-acme-tool-tracking-4", "Acme-tool-tracking");
+            put("eval-machine", "evaluation-start-fresh-5", "Fresh");
+        }
+        let folder = |name: &str| {
+            let f = dir.path().join(name);
+            fs::create_dir_all(&f).unwrap();
+            fs::write(f.join(MARKER_FILE_NAME), format!("{name}\n")).unwrap();
+            f
+        };
+        let (stray, fresh) = (folder("Acme-tool-tracking"), folder("Fresh"));
+        load_known_scopes(&db);
+        assert_eq!(resolve_project(&stray), Some("Acme tool tracking".to_string()));
+        assert_eq!(resolve_project(&fresh), Some("Fresh".to_string()));
+        use_known_scopes(Vec::new());
     }
 
     #[test]
