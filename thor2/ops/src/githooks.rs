@@ -74,7 +74,7 @@ fi
 exit 0
 "#;
 
-/// The work `post-commit` does before it chains: resolve which project this
+/// The work `post-commit`, `post-merge`, `post-rewrite` and `post-checkout` do before they chain: resolve which project this
 /// repository is, and refresh that project's index if one exists.
 ///
 /// Resolution mirrors `serve::project` exactly - a `.thor-project` marker file's
@@ -294,17 +294,30 @@ EOF
 thor_media_gate || exit 1
 "##;
 
+fn refresh_block(codeindex_exe: &str, index_root: &str) -> String {
+    REFRESH
+        .replace("@CODEINDEX@", codeindex_exe)
+        .replace("@INDEX_ROOT@", index_root)
+}
+
 /// The exact text of one dispatcher. Pure, so a test can read it without
 /// touching a filesystem or a git config.
 pub fn dispatcher_body(event: &str, codeindex_exe: &str, index_root: &str) -> String {
     let mut body = String::from(HEADER);
     match event {
         "pre-commit" => body.push_str(MEDIA_GATE),
-        "post-commit" => body.push_str(
-            &REFRESH
-                .replace("@CODEINDEX@", codeindex_exe)
-                .replace("@INDEX_ROOT@", index_root),
-        ),
+        // A commit, a merge (a pull and a fast-forward fire it too) and a
+        // rewrite (rebase, amend) each move the checked-out code.
+        "post-commit" | "post-merge" | "post-rewrite" => {
+            body.push_str(&refresh_block(codeindex_exe, index_root))
+        }
+        // A branch switch moves the code too, but git calls this hook for a
+        // checkout of single files as well, with 0 as the third argument.
+        "post-checkout" => {
+            body.push_str("\nif [ \"$3\" = \"1\" ]; then");
+            body.push_str(&refresh_block(codeindex_exe, index_root));
+            body.push_str("fi\n");
+        }
         _ => {}
     }
     body.push_str(&CHAIN.replace("@EVENT@", event));
@@ -522,6 +535,56 @@ mod tests {
             body.contains("[ -f \"$INDEX_ROOT/$key.db\" ]"),
             "a repository THOR has no index for must be left completely alone"
         );
+    }
+
+    #[test]
+    fn merge_rewrite_and_branch_switch_refresh_and_other_hooks_do_not() {
+        for event in ["post-commit", "post-merge", "post-rewrite", "post-checkout"] {
+            let body = dispatcher_body(event, EXE, ROOT);
+            assert!(body.contains(EXE) && body.contains("refresh"), "{event} must refresh");
+            assert!(body.contains(&format!("hooks/{event}")), "{event} must still chain");
+            assert!(body.trim_end().ends_with("exit 0"));
+        }
+        let checkout = dispatcher_body("post-checkout", EXE, ROOT);
+        let guard = "if [ \"$3\" = \"1\" ]; then";
+        assert!(checkout.contains(guard), "only a branch switch refreshes");
+        assert!(checkout.find(guard).unwrap() < checkout.find(EXE).unwrap());
+        for event in ["pre-push", "pre-rebase", "commit-msg", "prepare-commit-msg"] {
+            assert!(!dispatcher_body(event, EXE, ROOT).contains(EXE), "{event} must not refresh");
+        }
+    }
+
+    #[test]
+    fn a_fast_forward_merge_refreshes_and_a_file_checkout_does_not() {
+        let repo = GateRepo::new();
+        // A stand-in for the code index program: it appends one line per call.
+        let fake = repo.root.path().join("fakeindex.sh");
+        let log = repo.root.path().join("calls.log");
+        fs::write(&fake, format!("#!/bin/sh\necho \"$3\" >> \"{}\"\n", slashes(&log))).unwrap();
+        let index_root = repo.root.path().join("index");
+        fs::create_dir_all(&index_root).unwrap();
+        // The project key is the repository folder's name.
+        fs::write(index_root.join("repo.db"), "").unwrap();
+        install_git_hooks(&repo.hooks(), &slashes(&fake), &slashes(&index_root)).unwrap();
+        let calls = || fs::read_to_string(&log).unwrap_or_default().lines().count();
+
+        repo.write("a.txt", b"one\n");
+        repo.stage_all();
+        assert!(repo.commit("one").status.success());
+        repo.git_ok(&["branch", "side"]);
+        repo.git_ok(&["checkout", "--quiet", "side"]);
+        repo.write("a.txt", b"two\n");
+        repo.stage_all();
+        assert!(repo.commit("two").status.success());
+        repo.git_ok(&["checkout", "--quiet", "-"]);
+
+        let before = calls();
+        repo.git_ok(&["merge", "--quiet", "--ff-only", "side"]);
+        assert_eq!(calls(), before + 1, "a fast-forward merge refreshes the index once");
+
+        let before = calls();
+        repo.git_ok(&["checkout", "--quiet", "HEAD~1", "--", "a.txt"]);
+        assert_eq!(calls(), before, "a checkout of a single file must not refresh");
     }
 
     /// The list is a safety floor: an event missing here is a repository hook

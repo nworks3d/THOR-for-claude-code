@@ -463,7 +463,7 @@ invisible from every surface.
 
 Either way the project's name was decided, `install` also reads that project's
 code once (so `search_code`, `where_used` and `outline` can answer for it,
-refreshed automatically on every later commit), records that same name in the
+refreshed automatically on every later commit, merge or pull, rebase and branch switch), records that same name in the
 memory itself the moment the read succeeds - so the project's first `remember`
 never has to ask which collection it belongs to - and registers the checkout it
 runs in as that project's working copy. The working copy is the one folder THOR

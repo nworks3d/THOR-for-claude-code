@@ -71,7 +71,7 @@ person to type or paste anything, and never offer them a choice of ways.
 
 | Needed | Why | Check | Windows (winget) | macOS (brew) | Linux |
 | --- | --- | --- | --- | --- | --- |
-| git | Reads a project's code and keeps that reading fresh after each commit. On Windows, Git for Windows also provides Git Bash, the shell Claude Code runs its hooks through. | `git --version` | `winget install --id Git.Git -e --source winget --silent --accept-package-agreements --accept-source-agreements` | `brew install git` | apt: `sudo apt-get install -y git`; dnf: `sudo dnf install -y git` |
+| git | Reads a project's code and keeps that reading fresh after a commit, a merge or pull, a rebase and a branch switch. On Windows, Git for Windows also provides Git Bash, the shell Claude Code runs its hooks through. | `git --version` | `winget install --id Git.Git -e --source winget --silent --accept-package-agreements --accept-source-agreements` | `brew install git` | apt: `sudo apt-get install -y git`; dnf: `sudo dnf install -y git` |
 | Python 3 | Helper scripts that assistants write and run for a person's work commonly use it. | `python --version` (`python3 --version` on macOS and Linux) must print `Python 3.` The Microsoft Store stub that opens the Store instead is NOT Python. | `winget install --id Python.Python.3.12 -e --source winget --silent --accept-package-agreements --accept-source-agreements` | `brew install python` | apt: `sudo apt-get install -y python3`; dnf: `sudo dnf install -y python3` |
 | The C++ runtime (Windows only) | THOR's programs need it; nearly every machine has it. `install.ps1` checks it and stops with this very command if it is missing. | the programs refuse to start | `winget install --id Microsoft.VCRedist.2015+.x64 -e --source winget --silent --accept-package-agreements --accept-source-agreements` | not needed | not needed |
 
@@ -197,7 +197,7 @@ machine, not only this one - each one still finishes by running that repository'
 own hook, so nothing already there stops working. If git's global hooks folder
 (`core.hooksPath`) is already set to something else, the install leaves it alone
 and says so; the shared hooks are then not wired, and searching a project's code
-does not update by itself after a commit until that is sorted out.
+does not update by itself after a commit, a merge or pull, a rebase and a branch switch until that is sorted out.
 
 Those shared hooks also stop one mistake that is hard to undo: a commit that adds
 a video file or a very large file. The check looks at what is staged at that
@@ -233,7 +233,7 @@ leaving it for the next session to inherit.
 
 Run from inside a git project, it also reads that project's code once, so
 searching the code, finding where a symbol is used and outlining a file answer
-there at all, and from then on every commit keeps that reading fresh by itself.
+there at all, and from then on a commit, a merge or pull, a rebase and a branch switch each keep that reading fresh by itself.
 That same successful read opens the project in the memory, so a note lands under
 this project's name without ever being asked to name a new collection. It also
 registers that checkout as the project's working copy: the one folder THOR tries
