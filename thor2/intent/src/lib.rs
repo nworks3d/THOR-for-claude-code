@@ -166,7 +166,7 @@ fn re_i(pattern: &str) -> regex::Regex {
 
 /// Ordered, deliberately narrow patterns over a COMMAND string. Anything
 /// requiring cleverness belongs in a test first.
-fn command_rules() -> Vec<(regex::Regex, Action, &'static str)> {
+fn build_command_rules() -> Vec<(regex::Regex, Action, &'static str)> {
     [
         // publish
         (r"\bgh\s+repo\s+(edit|create)\b.*--visibility\s+public", Action::Publish, "repo made public"),
@@ -213,7 +213,7 @@ fn command_rules() -> Vec<(regex::Regex, Action, &'static str)> {
 /// Ordered, deliberately narrow patterns over a FILE PATH (already seen with
 /// backslashes normalized to forward slashes by the caller of `from_path`,
 /// but normalized again here defensively).
-fn path_rules() -> Vec<(regex::Regex, Action, &'static str)> {
+fn build_path_rules() -> Vec<(regex::Regex, Action, &'static str)> {
     [
         (r"(^|/)\.env(\.|$)", Action::Credentials, "env file"),
         (r"(^|/)(id_rsa|id_ed25519|authorized_keys)$", Action::Credentials, "ssh key material"),
@@ -232,7 +232,7 @@ fn path_rules() -> Vec<(regex::Regex, Action, &'static str)> {
 
 /// Phrases in the assistant's own draft that assert completion. Deliberately
 /// narrow: a claim is a statement about the world, not enthusiasm.
-fn claim_rules() -> Vec<(regex::Regex, &'static str)> {
+fn build_claim_rules() -> Vec<(regex::Regex, &'static str)> {
     [
         (r"\b(all\s+)?tests?\s+(pass|passing|are\s+green)\b", "tests reported green"),
         (r"\b(alle\s+)?tests?\s+(slagen|groen|zijn\s+groen)\b", "tests reported green"),
@@ -247,11 +247,35 @@ fn claim_rules() -> Vec<(regex::Regex, &'static str)> {
     .collect()
 }
 
-fn prod_hint() -> regex::Regex {
+fn build_prod_hint() -> regex::Regex {
     re_i(r"\b(prod|production|live)\b")
 }
-fn money_hint() -> regex::Regex {
+fn build_money_hint() -> regex::Regex {
     re_i(r"\b(price|pricing|invoice|vat|btw|payment|refund|prijs)\b")
+}
+
+// Each pattern set is compiled once per process: building them costs about a
+// millisecond, which every hook call and every replay of the record of real
+// calls would otherwise pay again.
+fn command_rules() -> &'static [(regex::Regex, Action, &'static str)] {
+    static RULES: std::sync::OnceLock<Vec<(regex::Regex, Action, &'static str)>> = std::sync::OnceLock::new();
+    RULES.get_or_init(build_command_rules)
+}
+fn path_rules() -> &'static [(regex::Regex, Action, &'static str)] {
+    static RULES: std::sync::OnceLock<Vec<(regex::Regex, Action, &'static str)>> = std::sync::OnceLock::new();
+    RULES.get_or_init(build_path_rules)
+}
+fn claim_rules() -> &'static [(regex::Regex, &'static str)] {
+    static RULES: std::sync::OnceLock<Vec<(regex::Regex, &'static str)>> = std::sync::OnceLock::new();
+    RULES.get_or_init(build_claim_rules)
+}
+fn prod_hint() -> &'static regex::Regex {
+    static HINT: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    HINT.get_or_init(build_prod_hint)
+}
+fn money_hint() -> &'static regex::Regex {
+    static HINT: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    HINT.get_or_init(build_money_hint)
 }
 
 fn scan(text: &str, rules: &[(regex::Regex, Action, &'static str)]) -> Vec<Signal> {
@@ -273,7 +297,7 @@ pub fn from_command(command: &str) -> Vec<Signal> {
     if command.is_empty() {
         return Vec::new();
     }
-    let mut signals = scan(command, &command_rules());
+    let mut signals = scan(command, command_rules());
     if prod_hint().is_match(command) {
         signals.push(Signal::new(Action::ProdData, "command names prod"));
     }
@@ -287,7 +311,7 @@ pub fn from_path(path: &str) -> Vec<Signal> {
         return Vec::new();
     }
     let norm = path.replace('\\', "/");
-    let mut signals = scan(&norm, &path_rules());
+    let mut signals = scan(&norm, path_rules());
     if money_hint().is_match(&norm) {
         signals.push(Signal::new(Action::Spend, "path names money"));
     }
@@ -303,7 +327,7 @@ pub fn from_path(path: &str) -> Vec<Signal> {
 /// itself the action a rule can govern (e.g. "always open with a summary").
 pub fn from_draft(text: &str) -> Vec<Signal> {
     let mut signals = vec![Signal::new(Action::Answer, "a reply is being made")];
-    for (re, label) in &claim_rules() {
+    for (re, label) in claim_rules() {
         if re.is_match(text) {
             signals.push(Signal::new(Action::ClaimDone, *label));
             break;

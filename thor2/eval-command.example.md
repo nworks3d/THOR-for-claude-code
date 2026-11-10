@@ -1062,6 +1062,35 @@ it. DONE WHEN: the line is quoted under THOR health. EXAMPLE: THOR health in the
 report: "THOR bug candidates: 1 new (a hook launch failure); the owner's other
 session was offered it".
 
+`route probe:` (for example "route probe: rule 'no-new-bodies' is bound to
+127.0.0.1:27182, and 12 real call(s) of the last 30 days run a script with
+that host in it, or write the host into a script, without reaching the rule
+(example: PowerShell: powershell -File fusion.ps1 (runs C:/work/fusion.ps1,
+which names the host)). If that route is meant to be covered:
+mcp__thor__revise(id: "no-new-bodies", ..., targets: [..., {kind: "path",
+value: "C:/work/fusion.ps1"}], ...)") - WHAT IT MEANS: a rule is bound to a
+host, and real calls of the last 30 days reached that host through a script,
+which the rule's bindings never fire on because the address sits inside the
+script file and the command line names no host. The probe only lists such
+routes; it blocks and changes nothing. Only two kinds of call count: a command
+that really executes a script (an interpreter followed by the file, the file
+as the command, or a `&` or `.` call) whose content on record, written to that
+same path, names the host; and a Write or Edit that puts the host into a
+script file. A plain mention of the host in a command's text (a grep for it),
+in an agent brief, in a tool argument or in a document is never counted. When
+the time allowed ran out, a last "route probe: stopped after N second(s) ..."
+line says the list may be incomplete. WHAT TO DO: for each line read the
+example and decide whether that script is meant to be covered. If it is, make
+the exact `mcp__thor__revise` call the line gives, with a `because` of 20 or
+more characters. If it is not (the script is harmless), change nothing and say
+so in your remarks, naming the rule. For the "stopped after" line, run `serve sweep` (it takes longer) when
+you need the full list. The line "and N more rule(s), not listed here" means
+the same for the rest. DONE WHEN: each listed rule either has its revise call
+accepted or a remark in the report saying why that route stays uncovered.
+EXAMPLE: remarks in the report: "route probe: rule 'no-new-bodies' - added
+C:/work/fusion.ps1 as a path binding; rule 'old-host-note' - the one call is a
+curl --help, left as it is".
+
 The last line it prints says what it left out. For one of those lines (the
 store and chain line, the command anchors, the hook launch failures, the
 refusal outcomes, the open points) run the full check, the same command
