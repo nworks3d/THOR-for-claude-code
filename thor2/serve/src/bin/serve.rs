@@ -7553,7 +7553,7 @@ fn cmd_sweep(db_path: &Path, full: bool, backfill: bool, budget_secs: u64, json:
         return;
     }
     lines.extend(serve::sweep::detail_lines(&report));
-    lines.extend(serve::route_probe::lines_for(db_path, &store, time::now_unix(), budget.min(std::time::Duration::from_secs(20))));
+    lines.extend(serve::route_probe::lines_for(db_path, &store, time::now_unix(), budget.min(std::time::Duration::from_secs(20)), true));
     println!("{}", lines.join("\n"));
 }
 

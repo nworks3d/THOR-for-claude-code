@@ -505,15 +505,20 @@ pub fn probe_within(store: &EventStore, calls: &[CallRow], deadline: Option<Inst
 /// The lines doctor and `serve sweep` show: silent when no rule has a route it
 /// does not reach.
 pub fn lines(gaps: &[RouteGap]) -> Vec<String> {
+    lines_listing(gaps, MAX_RULES_LISTED)
+}
+
+/// [`lines`] naming at most `listed` rules (`serve sweep` names them all).
+pub fn lines_listing(gaps: &[RouteGap], listed: usize) -> Vec<String> {
     let mut out = Vec::new();
-    for gap in gaps.iter().take(MAX_RULES_LISTED) {
+    for gap in gaps.iter().take(listed) {
         out.push(format!(
             "route probe: rule '{}' is bound to {}, and {} real call(s) of the last 30 days mention it without reaching the rule (example: {}). If that route is meant to be covered: {}",
             gap.rule, gap.host, gap.calls, gap.example, gap.revise
         ));
     }
-    if gaps.len() > MAX_RULES_LISTED {
-        out.push(format!("route probe: and {} more rule(s), not listed here (run serve sweep)", gaps.len() - MAX_RULES_LISTED));
+    if gaps.len() > listed {
+        out.push(format!("route probe: and {} more rule(s), not listed here (run serve sweep)", gaps.len() - listed));
     }
     out
 }
@@ -538,7 +543,7 @@ const CALLS_KEPT: usize = 200_000;
 /// route, so only those lines of the record are parsed: one cheap pass for
 /// the calls that name a host, and a second for the calls that name a file
 /// the first pass saw written with a host in it.
-pub fn lines_for(db: &Path, store: &EventStore, now: i64, budget: Duration) -> Vec<String> {
+pub fn lines_for(db: &Path, store: &EventStore, now: i64, budget: Duration, in_sweep: bool) -> Vec<String> {
     let deadline = Instant::now() + budget;
     let needles = needles_of(&rules_of(store));
     if needles.is_empty() {
@@ -562,11 +567,12 @@ pub fn lines_for(db: &Path, store: &EventStore, now: i64, budget: Duration) -> V
         calls.sort_by_key(|r| r.t);
     }
     let (gaps, stopped_at) = probe_within(store, &calls, Some(deadline));
-    let mut out = lines(&gaps);
+    let mut out = lines_listing(&gaps, if in_sweep { usize::MAX } else { MAX_RULES_LISTED });
     if stopped_at.is_some() {
         out.push(format!(
-            "route probe: stopped after {} second(s) before every real call of the last 30 days was checked, so the list may be incomplete (run serve sweep for a longer look)",
-            budget.as_secs()
+            "route probe: stopped after {} second(s) before every real call of the last 30 days was checked, so the list may be incomplete{}",
+            budget.as_secs(),
+            if in_sweep { "" } else { " (run serve sweep for a longer look)" }
         ));
     } else if cut {
         out.push(format!(
@@ -781,9 +787,24 @@ mod tests {
         let text: Vec<String> = rows.iter().map(|r| serde_json::to_string(r).unwrap()).collect();
         std::fs::write(corpus::calls_path(&db), text.join("\n") + "\n").unwrap();
         let store = store_with(&fusion_rule());
-        let lines = lines_for(&db, &store, 500, Duration::from_secs(30));
+        let lines = lines_for(&db, &store, 500, Duration::from_secs(30), false);
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].contains("2 real call(s)") && lines[0].contains("runs C:/work/fusion-script.ps1"), "{}", lines[0]);
+    }
+
+    /// `serve sweep` is the longer look: it lists every rule and never sends
+    /// the reader to itself; doctor keeps its short list and the pointer.
+    #[test]
+    fn the_sweep_lists_every_rule_and_does_not_point_to_itself() {
+        let gaps: Vec<RouteGap> = (0..MAX_RULES_LISTED + 3)
+            .map(|i| RouteGap { rule: format!("r{i}"), host: "h".into(), calls: 1, example: "e".into(), revise: "v".into() })
+            .collect();
+        let short = lines(&gaps);
+        assert_eq!(short.len(), MAX_RULES_LISTED + 1);
+        assert!(short.last().unwrap().contains("run serve sweep"));
+        let all = lines_listing(&gaps, usize::MAX);
+        assert_eq!(all.len(), gaps.len());
+        assert!(all.iter().all(|l| !l.contains("serve sweep")), "{all:?}");
     }
 
     /// A probe past its deadline stops and says how far it got.
