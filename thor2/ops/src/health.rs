@@ -3412,11 +3412,9 @@ const DOCTOR_SWEEP_SECS: u64 = 8;
 pub fn false_block_sweep_lines(db: &Path) -> Vec<String> {
     let Ok(store) = EventStore::open_existing(db) else { return Vec::new() };
     let report = serve::sweep::run(db, &store, &serve::sweep::Opts::new(std::time::Duration::from_secs(DOCTOR_SWEEP_SECS)));
-    let mut lines = serve::sweep::doctor_lines(&report);
-    // The route probe (item 71): rules bound to a host whose route in real
-    // calls their bindings never reach. Reports only; silent at zero.
-    lines.extend(serve::route_probe::lines_for(db, &store, serve::time::now_unix(), std::time::Duration::from_secs(3), false));
-    lines
+    // The route probe is not part of doctor: its findings are too noisy for a
+    // report that runs at every evaluation. `serve sweep` still prints it.
+    serve::sweep::doctor_lines(&report)
 }
 
 pub fn crowding_line(db: &Path, checkouts: Option<&Path>, full: bool) -> String {

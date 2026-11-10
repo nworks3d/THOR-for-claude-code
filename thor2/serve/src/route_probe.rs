@@ -22,8 +22,13 @@
 //!
 //! WHAT IT NEVER DOES. It only REPORTS. It blocks nothing, writes nothing and
 //! widens no binding: the owner or the evaluating agent adds the real binding
-//! knowingly. It runs at doctor and `serve sweep` time on data THOR already
-//! keeps, so the hot path pays nothing.
+//! knowingly. It runs at `serve sweep` time only (not in doctor) on data THOR
+//! already keeps, so the hot path pays nothing.
+//!
+//! KNOWN LIMITS. A host read from a rule's own text can be something that is
+//! no host at all (an e-mail address, a file extension). And a script that
+//! merely lives on a share named like the host is counted as talking to it.
+//! That is why doctor does not print this: it is a look someone asks for.
 
 use crate::corpus::{self, CallRow};
 use crate::input::{self, ServeInput};
