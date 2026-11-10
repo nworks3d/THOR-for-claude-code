@@ -174,12 +174,14 @@ a verdict. Written even under `--no-mcp`, since the file should already be
 there the day writes are turned on. A later install refreshes an existing
 copy to the routine of the new programs, judged by content: a copy THOR
 wrote and nobody changed is simply replaced (`eval-routine-written.json`
-beside the memory records the hash of what THOR last wrote), and a copy the
+beside the memory records the hash of what THOR last wrote and of the template it
+was made from), and a copy the
 owner changed, or one from before that record existed, is first saved in the
 `eval-routine-backups` folder beside the memory as `thor-eval.<date>.md.bak`
 (never in the commands folder, and never over an earlier backup). `doctor`'s
-short version says so when the installed routine is not the one these programs
-ship.
+short version says so when the installer has not written the installed routine
+from the template these programs ship (judged by that record, so it does not
+matter how a path is spelled); one install run settles it.
 
 Opening that routine starts an evaluation, and so does the `Stop` hook's ask
 for one. The start is a record in the memory's own log (`evaluation-start-<project>-<seq>`,

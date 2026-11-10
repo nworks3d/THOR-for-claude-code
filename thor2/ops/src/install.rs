@@ -442,9 +442,8 @@ pub fn seed_eval_command(path: &Path, bin_dir: &Path, db: &Path) -> anyhow::Resu
     let existing_hash = eval_routine_hash(&String::from_utf8_lossy(&existing));
     let recorded = read_eval_routine_record(db);
     if existing_hash == wanted_hash {
-        if recorded.as_deref() != Some(wanted_hash.as_str()) {
-            write_eval_routine_record(db, &wanted_hash);
-        }
+        // Always: an older record may lack the template identity.
+        write_eval_routine_record(db, &wanted_hash);
         return Ok(report(EvalCommandOutcome::AlreadyThere, None));
     }
     let backup = if recorded.as_deref() == Some(existing_hash.as_str()) {
@@ -458,11 +457,24 @@ pub fn seed_eval_command(path: &Path, bin_dir: &Path, db: &Path) -> anyhow::Resu
     Ok(report(outcome, backup))
 }
 
-/// Whether the routine at `path` is the one this build renders for this
-/// machine. `None` when there is no routine file (nothing to compare).
-pub fn eval_command_is_current(path: &Path, bin_dir: &Path, db: &Path) -> Option<bool> {
-    let existing = fs::read(path).ok()?;
-    Some(eval_routine_hash(&String::from_utf8_lossy(&existing)) == eval_routine_hash(&render_eval_command(bin_dir, db)))
+/// Whether the routine installed at `path` was written from the template this
+/// build ships. Judged by the template identity the installer recorded beside
+/// the memory, never by rendered text: the rendered text carries paths, and the
+/// same path has several spellings, so a comparison of text could call an
+/// up-to-date routine stale. `None` when no routine is installed; `Some(false)`
+/// also when there is no record or it has no template identity (the installer
+/// has not run since these programs arrived).
+pub fn eval_command_matches_these_programs(path: &Path, db: &Path) -> Option<bool> {
+    if !path.exists() {
+        return None;
+    }
+    Some(read_eval_routine_template(db).as_deref() == Some(eval_template_identity().as_str()))
+}
+
+/// The identity of the template this build ships: the hash of its text before
+/// any placeholder is filled in.
+fn eval_template_identity() -> String {
+    eval_routine_hash(EVAL_COMMAND_TEMPLATE)
 }
 
 /// The hash of a routine text: sha256, through the one hash function the
@@ -474,7 +486,12 @@ fn eval_routine_hash(text: &str) -> String {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct EvalRoutineRecord {
+    /// Hash of the routine text THOR last wrote.
     hash: String,
+    /// Hash of the template that text was made from; absent in a record written
+    /// by an earlier build.
+    #[serde(default)]
+    template: Option<String>,
 }
 
 /// The small record beside the memory of the hash of the routine THOR itself
@@ -488,16 +505,25 @@ pub fn eval_routine_backup_dir(db: &Path) -> PathBuf {
     db.parent().unwrap_or_else(|| Path::new(".")).join("eval-routine-backups")
 }
 
-fn read_eval_routine_record(db: &Path) -> Option<String> {
+fn read_whole_eval_routine_record(db: &Path) -> Option<EvalRoutineRecord> {
     let text = fs::read_to_string(eval_routine_record_path(db)).ok()?;
-    serde_json::from_str::<EvalRoutineRecord>(&text).ok().map(|r| r.hash)
+    serde_json::from_str::<EvalRoutineRecord>(&text).ok()
+}
+
+fn read_eval_routine_record(db: &Path) -> Option<String> {
+    read_whole_eval_routine_record(db).map(|r| r.hash)
+}
+
+fn read_eval_routine_template(db: &Path) -> Option<String> {
+    read_whole_eval_routine_record(db).and_then(|r| r.template)
 }
 
 /// Best effort on purpose: a record that cannot be written only means the next
 /// install treats the routine as possibly changed and keeps a copy of it first,
 /// which loses nothing, so it must never stop the routine itself from landing.
 fn write_eval_routine_record(db: &Path, hash: &str) {
-    if let Ok(json) = serde_json::to_string(&EvalRoutineRecord { hash: hash.to_string() }) {
+    let record = EvalRoutineRecord { hash: hash.to_string(), template: Some(eval_template_identity()) };
+    if let Ok(json) = serde_json::to_string(&record) {
         let _ = fs::write(eval_routine_record_path(db), json);
     }
 }
@@ -3524,6 +3550,32 @@ mod tests {
         assert_eq!(read_eval_routine_record(&sb.db), Some(eval_routine_hash(&sb.current())));
         assert!(sb.backups().is_empty());
         assert_eq!(sb.seed().outcome, EvalCommandOutcome::AlreadyThere);
+    }
+
+    #[test]
+    fn every_eval_routine_case_leaves_the_record_with_both_values() {
+        let sb = RoutineSandbox::new();
+        let both = |sb: &RoutineSandbox| {
+            assert_eq!(read_eval_routine_record(&sb.db), Some(eval_routine_hash(&sb.current())));
+            assert_eq!(read_eval_routine_template(&sb.db), Some(eval_template_identity()));
+        };
+        fs::remove_dir(sb.path.parent().unwrap()).unwrap();
+        sb.seed();
+        both(&sb);
+        // Up to date, but the record is one from an earlier build (no template).
+        fs::write(eval_routine_record_path(&sb.db), format!(r#"{{"hash":"{}"}}"#, eval_routine_hash(&sb.current()))).unwrap();
+        assert_eq!(read_eval_routine_template(&sb.db), None);
+        assert_eq!(sb.seed().outcome, EvalCommandOutcome::AlreadyThere);
+        both(&sb);
+        // Replaced, with and without a copy.
+        let old = "old\n";
+        fs::write(&sb.path, old).unwrap();
+        write_eval_routine_record(&sb.db, &eval_routine_hash(old));
+        assert_eq!(sb.seed().outcome, EvalCommandOutcome::Refreshed);
+        both(&sb);
+        fs::write(&sb.path, "edited\n").unwrap();
+        assert_eq!(sb.seed().outcome, EvalCommandOutcome::RefreshedKeepingCopy);
+        both(&sb);
     }
 
     #[test]

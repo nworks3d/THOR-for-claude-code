@@ -165,9 +165,8 @@ pub fn plain_summary(db: &Path, cwd: &Path, settings: Option<&Path>, mcp_json: O
     }
 
     // Silent unless the installed evaluation routine is not the one these programs ship.
-    let bin_dir = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf));
-    if let (Some(routine), Some(bin_dir)) = (crate::install::default_eval_command_path(), bin_dir) {
-        lines.extend(eval_routine_note(db, &routine, &bin_dir));
+    if let Some(routine) = crate::install::default_eval_command_path() {
+        lines.extend(eval_routine_note(db, &routine));
     }
 
     lines.push("Everything below is the detailed report, written for your assistant. You do not need to read it.".to_string());
@@ -175,11 +174,12 @@ pub fn plain_summary(db: &Path, cwd: &Path, settings: Option<&Path>, mcp_json: O
 }
 
 /// The one NOTE of the short summary about the end-of-session routine
-/// (`/thor-eval`): present when a routine is installed at `routine` and is not
-/// the one this build renders for this machine, absent when it matches or when
-/// no routine is installed.
-pub fn eval_routine_note(db: &Path, routine: &Path, bin_dir: &Path) -> Option<String> {
-    match crate::install::eval_command_is_current(routine, bin_dir, db) {
+/// (`/thor-eval`): present when a routine is installed at `routine` and the
+/// installer did not write it from the template this build ships (or left no
+/// record of it), absent when it did or when no routine is installed. Judged
+/// by the template, never by rendered text, so no spelling of a path matters.
+pub fn eval_routine_note(db: &Path, routine: &Path) -> Option<String> {
+    match crate::install::eval_command_matches_these_programs(routine, db) {
         Some(false) => Some(
             "  NOTE: the evaluation routine on this machine (the /thor-eval command) is not the one these programs ship, so your assistant may misread parts of an evaluation. Next step: ask your assistant to run THOR's install again; it puts the current routine in place and keeps a changed one as a copy."
                 .to_string(),
@@ -8499,23 +8499,37 @@ mod plain_summary_tests {
         let routine = dir.path().join("commands").join("thor-eval.md");
 
         // No routine installed: no line.
-        assert_eq!(eval_routine_note(&db, &routine, &bin), None);
+        assert_eq!(eval_routine_note(&db, &routine), None);
 
-        // The routine this build renders: no line.
-        std::fs::create_dir_all(routine.parent().unwrap()).unwrap();
-        std::fs::write(&routine, crate::install::render_eval_command(&bin, &db)).unwrap();
-        assert_eq!(eval_routine_note(&db, &routine, &bin), None);
+        // Written by the installer: no line, also when doctor is given the same
+        // memory under another spelling (forward slashes), and also when the
+        // owner changed the file afterwards.
+        crate::install::seed_eval_command(&routine, &bin, &db).unwrap();
+        assert_eq!(eval_routine_note(&db, &routine), None);
+        let other_spelling = std::path::PathBuf::from(db.display().to_string().replace('\\', "/"));
+        assert_eq!(eval_routine_note(&other_spelling, &routine), None);
+        std::fs::write(&routine, "the owner's own edit\n").unwrap();
+        assert_eq!(eval_routine_note(&db, &routine), None);
 
-        // An older or changed routine: one NOTE with the one next step.
-        std::fs::write(&routine, "an older routine\n").unwrap();
-        let note = eval_routine_note(&db, &routine, &bin).expect("a note");
+        // A record made from an older template: one NOTE with the one next step.
+        let record = crate::install::eval_routine_record_path(&db);
+        std::fs::write(&record, r#"{"hash":"x","template":"an older template"}"#).unwrap();
+        let note = eval_routine_note(&db, &routine).expect("a note");
         assert!(note.starts_with("  NOTE: the evaluation routine on this machine"), "{note}");
         assert!(note.contains("Next step: ask your assistant to run THOR's install again"), "{note}");
         assert!(note.contains("keeps a changed one as a copy"), "{note}");
 
+        // A record without a template identity (written by an earlier build): the note.
+        std::fs::write(&record, r#"{"hash":"x"}"#).unwrap();
+        assert!(eval_routine_note(&db, &routine).is_some());
+
+        // No record at all: the note.
+        std::fs::remove_file(&record).unwrap();
+        assert!(eval_routine_note(&db, &routine).is_some());
+
         // Running the install's own step brings it back to no line.
         crate::install::seed_eval_command(&routine, &bin, &db).unwrap();
-        assert_eq!(eval_routine_note(&db, &routine, &bin), None);
+        assert_eq!(eval_routine_note(&db, &routine), None);
     }
 
     #[test]
