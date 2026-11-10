@@ -6,11 +6,19 @@
 //!
 //! WHAT THIS DOES. For every live rule bound to a host (and every rule bound
 //! to a tool by name, with the hosts its own text names), it looks through the
-//! 30-day record of real calls (`corpus`) for calls that MENTION that host -
-//! in the command, in the content of a Write or Edit, or in a script file the
-//! call runs (when that file's content is in the record, which is cheap) - and
-//! that the rule's bindings never reached. It names such a rule with an
-//! example call and the `revise` that would add the missing binding.
+//! 30-day record of real calls (`corpus`) for the two kinds of call that are a
+//! route to that host the rule's bindings never reached: a shell call that
+//! EXECUTES a script file whose recorded content names the host (the content
+//! comes from the Write and Edit calls on record, matched by full path), and a
+//! Write or Edit that PUTS the host into a script file. It names such a rule
+//! with an example call and the `revise` that adds a path binding to that
+//! script.
+//!
+//! WHAT IT DOES NOT COUNT. A plain mention of the host in a command's text (a
+//! grep for it), in an agent brief, in a tool argument or in a document is
+//! text about the host, not a route to it: the guard's own host extraction
+//! finds no host there, and binding a rule on that would widen it on no
+//! evidence.
 //!
 //! WHAT IT NEVER DOES. It only REPORTS. It blocks nothing, writes nothing and
 //! widens no binding: the owner or the evaluating agent adds the real binding
@@ -455,6 +463,11 @@ pub fn probe_within(store: &EventStore, calls: &[CallRow], deadline: Option<Inst
         }
         let text = call_text(row);
         let named: Vec<bool> = needles.iter().map(|n| text.contains(n)).collect();
+        let writes_script = is_writer(&row.tool)
+            && row.input.get("file_path").and_then(|p| p.as_str()).is_some_and(|p| {
+                let flat = p.replace('\\', "/").to_lowercase();
+                SCRIPT_EXTENSIONS.iter().any(|e| flat.ends_with(e))
+            });
         // The shell call read as a command, once and only when needed.
         let command = row.input.get("command").and_then(|c| c.as_str());
         let mut segments: Option<Vec<model::shell::Segment>> = None;
@@ -477,7 +490,12 @@ pub fn probe_within(store: &EventStore, calls: &[CallRow], deadline: Option<Inst
                 let needle = host.to_lowercase();
                 let Some(n) = needles.iter().position(|x| *x == needle) else { continue };
                 let via_script = scripts.iter().find(|f| f.hits.contains(&n)).map(|f| f.path.as_str());
-                if !named[n] && via_script.is_none() {
+                // Only two kinds of call are a route: a shell call that runs a
+                // script with the host in it, and a Write or Edit that puts
+                // the host into a script. A mention of the host in a command,
+                // a brief, a tool argument or a document is only text.
+                let writes_host_into_script = named[n] && writes_script;
+                if via_script.is_none() && !writes_host_into_script {
                     continue;
                 }
                 let needs_moments = item.bindings.iter().any(|b| matches!(b, Binding::Moment(_)));
@@ -513,7 +531,7 @@ pub fn lines_listing(gaps: &[RouteGap], listed: usize) -> Vec<String> {
     let mut out = Vec::new();
     for gap in gaps.iter().take(listed) {
         out.push(format!(
-            "route probe: rule '{}' is bound to {}, and {} real call(s) of the last 30 days mention it without reaching the rule (example: {}). If that route is meant to be covered: {}",
+            "route probe: rule '{}' is bound to {}, and {} real call(s) of the last 30 days run a script with that host in it, or write the host into a script, without reaching the rule (example: {}). If that route is meant to be covered: {}",
             gap.rule, gap.host, gap.calls, gap.example, gap.revise
         ));
     }
@@ -703,8 +721,7 @@ mod tests {
         let store = store_with(&fusion_rule());
         let calls = vec![written(path), call("p", 200, tool, json!({ "command": command }))];
         let gaps = probe(&store, &calls);
-        assert_eq!(gaps.len(), 1, "{gaps:?}");
-        (gaps[0].calls, gaps[0].example.clone())
+        gaps.first().map(|g| (g.calls, g.example.clone())).unwrap_or((0, String::new()))
     }
 
     /// The field case: a document that a command only edits, reads, copies or
@@ -720,9 +737,34 @@ mod tests {
             "git add docs/CHANGELOG.md",
         ] {
             let (calls, example) = run_of("C:/work/docs/CHANGELOG.md", "Bash", command);
-            assert_eq!(calls, 1, "only the write names the host: {command}");
-            assert!(!example.contains("runs"), "{command}: {example}");
+            assert_eq!(calls, 0, "a document is no route, written or edited: {command}");
+            assert!(example.is_empty(), "{command}: {example}");
         }
+    }
+
+    /// A plain mention of the host is text about it, not a route: a grep for
+    /// it, an agent brief, a tool argument, an Edit of a document.
+    #[test]
+    fn a_plain_mention_of_the_host_is_not_counted() {
+        let store = store_with(&fusion_rule());
+        let calls = vec![
+            call("g", 100, "Bash", json!({ "command": format!("grep -rn '{HOST}' docs/") })),
+            call("a", 200, "Agent", json!({ "prompt": format!("The fusion server listens on {HOST}; do not touch it.") })),
+            call("e", 300, "Edit", json!({ "file_path": "C:/work/README.md", "old_string": "x", "new_string": format!("server at {HOST}") })),
+            call("t", 400, "mcp__other__tool", json!({ "address": HOST })),
+        ];
+        assert!(probe(&store, &calls).is_empty(), "{:?}", probe(&store, &calls));
+    }
+
+    /// Writing the host into a script is counted, so the rule can be bound
+    /// before the route is first used.
+    #[test]
+    fn a_write_of_a_script_that_names_the_host_is_counted() {
+        let store = store_with(&fusion_rule());
+        let calls = vec![call("w", 100, "Write", json!({ "file_path": "C:/work/x.py", "content": format!("requests.get('http://{HOST}/x')") }))];
+        let gaps = probe(&store, &calls);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert!(gaps[0].revise.contains("C:/work/x.py"), "{}", gaps[0].revise);
     }
 
     /// A bare file name is not enough: the same name in another folder is
