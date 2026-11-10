@@ -4,6 +4,14 @@ What changed in each release, newest first. The release workflow copies the sect
 
 ## Unreleased
 
+## 2.6.7 (2026-11-10)
+
+What changed: Running THOR's install again now brings the /thor-eval routine up to date with the programs, where an upgrade used to keep the routine of the first install for ever. Doctor tells you when the routine on your machine is not the one the programs ship. The reading of a project's code is now also refreshed after a pull or merge, a rebase and a switch to another branch, not only after a commit.
+
+- **The installer keeps the /thor-eval routine up to date.** An upgrade used to leave the routine of the first install in place. Running the installer again now replaces it with the one the programs ship. A routine you changed yourself is first saved as a copy beside the memory; an unchanged one is simply replaced.
+- **Doctor says when the routine is out of date.** Its short summary notes that the /thor-eval routine on the machine is not the one these programs ship, with the one next step to take.
+- **The code index is refreshed after more than a commit.** The reading of a project's code, behind searching the code and finding where a name is used, is now also refreshed after a pull or merge, a rebase and a switch to another branch. Run the installer once to get the new git hooks.
+
 ## 2.6.6 (2026-11-10)
 
 What changed: Doctor is fast again: it had grown from seconds to about five minutes. THOR now finds its memory and its search model also when a program runs outside the Claude desktop app, so the hourly refresh of search by meaning no longer skips. The route probe is more careful and is no longer part of doctor, the store-wide open point closes when it should, and a second spelling of a project name can no longer come back.
