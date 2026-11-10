@@ -48,7 +48,19 @@ pub fn default_model_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
         .ok()
         .or_else(|| std::env::var("HOME").ok().map(|h| Path::new(&h).join(".local").join("share")))?;
-    Some(base.join("thor").join("model"))
+    Some(model_dir_in(&base, thor_core::app_data::local_app_data().as_deref()))
+}
+
+/// `<base>/thor/model`, or - for a program running outside the Claude desktop
+/// app on Windows, where that folder only exists under the app's package
+/// folder - the physical folder the app created. `app_data` is the per-user
+/// local app data folder (`None` off Windows).
+fn model_dir_in(base: &Path, app_data: Option<&Path>) -> PathBuf {
+    let dir = base.join("thor").join("model");
+    match app_data {
+        Some(app_data) => thor_core::app_data::resolve_in(&dir, app_data),
+        None => dir,
+    }
 }
 
 /// True iff every file `MODEL_FILES` names is present in `dir` - a cheap
@@ -125,6 +137,21 @@ pub fn mode_line(model_dir: Option<&Path>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_model_dir_falls_back_to_the_app_package_folder() {
+        let local = tempfile::tempdir().unwrap();
+        let physical = local.path().join("Packages").join("Claude_x").join("LocalCache").join("Local").join("thor").join("model");
+        std::fs::create_dir_all(&physical).unwrap();
+        assert_eq!(model_dir_in(local.path(), Some(local.path())), physical, "outside the app the physical folder is the model");
+        assert_eq!(
+            model_dir_in(local.path(), None),
+            local.path().join("thor").join("model"),
+            "off Windows nothing is looked up"
+        );
+        std::fs::create_dir_all(local.path().join("thor").join("model")).unwrap();
+        assert_eq!(model_dir_in(local.path(), Some(local.path())), local.path().join("thor").join("model"));
+    }
 
     #[test]
     fn model_present_is_false_on_an_empty_directory() {

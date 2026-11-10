@@ -28,7 +28,7 @@ struct Cli {
 enum Command {
     /// Listen on `--bind` and ingest shipped batches into the store at `--db`.
     Recv {
-        #[arg(long)]
+        #[arg(long, value_parser = thor_core::app_data::parse_db_path)]
         db: PathBuf,
         /// Address to listen on, e.g. 0.0.0.0:5555.
         #[arg(long)]
@@ -44,7 +44,7 @@ enum Command {
     /// `--db`, and let the receiver drop its copy. Run this on the authority
     /// (the machine whose log is allowed to grow), before the ship.
     Drain {
-        #[arg(long)]
+        #[arg(long, value_parser = thor_core::app_data::parse_db_path)]
         db: PathBuf,
         /// Base URL of the receiver holding the captures, e.g.
         /// http://10.0.0.50:5556.
@@ -59,7 +59,7 @@ enum Command {
     /// backup and its selection. Only a store that is not a copy yet needs
     /// `--repo` (the first run marks it as a copy).
     Pull {
-        #[arg(long)]
+        #[arg(long, value_parser = thor_core::app_data::parse_db_path)]
         db: PathBuf,
         /// A git clone of the backup repository. Remembered in the copy's marker.
         #[arg(long)]
@@ -91,7 +91,7 @@ enum Command {
     },
     /// Push the local store's backlog to the receiver at `--to`.
     Ship {
-        #[arg(long)]
+        #[arg(long, value_parser = thor_core::app_data::parse_db_path)]
         db: PathBuf,
         #[arg(long)]
         to: String,
@@ -100,7 +100,7 @@ enum Command {
     },
     /// Local tip, and - with `--to` - the replica's tip and the lag between them.
     Status {
-        #[arg(long)]
+        #[arg(long, value_parser = thor_core::app_data::parse_db_path)]
         db: PathBuf,
         #[arg(long)]
         to: Option<String>,
@@ -215,7 +215,7 @@ where
     std::panic::set_hook(previous_hook);
     match result {
         Ok(Ok(line)) => line,
-        Ok(Err(e)) => Some(format!("vectors refresh: skipped ({})", one_line(&e.to_string()))),
+        Ok(Err(e)) => Some(format!("vectors refresh: skipped ({})", error_chain_line(&e))),
         Err(_) => Some("vectors refresh: skipped (panicked)".to_string()),
     }
 }
@@ -227,6 +227,14 @@ where
 #[cfg(feature = "semantic")]
 fn one_line(reason: &str) -> String {
     reason.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// An error with every cause in its chain ("reading model file X: The system
+/// cannot find the file specified"), on one line - the top message alone hid
+/// WHY a scheduled refresh skipped.
+#[cfg(feature = "semantic")]
+fn error_chain_line(error: &anyhow::Error) -> String {
+    one_line(&format!("{error:#}"))
 }
 
 fn main() -> ExitCode {
@@ -412,6 +420,17 @@ mod tests {
     }
 
     // --------------------------------------------------- run_vectors_refresh()
+
+    /// THE LOG MUST SAY WHY: the cause of a skipped refresh, not just its top
+    /// message, reaches the one line.
+    #[test]
+    fn the_skip_line_names_the_underlying_cause() {
+        let cause = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
+        let error = anyhow::Error::new(cause).context("reading model file X");
+        let line = error_chain_line(&error);
+        assert!(line.contains("reading model file X") && line.contains("file not found"), "{line}");
+        assert!(!line.contains(char::from(10)));
+    }
 
     /// THE SHIP-PATH GUARANTEE: a `serve::vectors::refresh` failure (here, a
     /// model directory that resolves but holds none of the real model files)

@@ -1,4 +1,4 @@
-//! The health check: one plain-language line per component, no jargon, no
+//! The helet wanted: Vec<String> = thor_core::app_data::spellings(db).iter().map(|s| folded(&s.display().to_string())).collect();any(|a| wanted.contains(&folded(a))))lth check: one plain-language line per component, no jargon, no
 //! silent gaps. Every reader here degrades to an honest "not configured" or
 //! "unreachable" line instead of an error that stops the other lines from
 //! printing - a health check that dies on the first broken thing is worse
@@ -40,15 +40,29 @@ fn folded(path: &str) -> String {
 
 /// Whether Claude Code's settings file wires a THOR hook to this memory.
 fn hooks_name_this_memory(settings: &Path, db: &Path) -> bool {
+    match thor_core::app_data::local_app_data() {
+        Some(base) => hooks_name_this_memory_in(settings, db, &base),
+        None => hooks_name_memory_spelled(settings, &[db.to_path_buf()]),
+    }
+}
+
+/// `hooks_name_this_memory` for a given local app data folder: a hook that
+/// names the memory by the short path the Claude desktop app shows and a `db`
+/// given as the physical path (or the reverse) name the same file.
+fn hooks_name_this_memory_in(settings: &Path, db: &Path, app_data: &Path) -> bool {
+    hooks_name_memory_spelled(settings, &thor_core::app_data::spellings_in(db, app_data))
+}
+
+fn hooks_name_memory_spelled(settings: &Path, spellings: &[std::path::PathBuf]) -> bool {
     let Ok(text) = std::fs::read_to_string(settings) else { return false };
     let Ok(root) = serde_json::from_str::<serde_json::Value>(&text) else { return false };
-    let want = folded(&db.display().to_string());
+    let wanted: Vec<String> = spellings.iter().map(|s| folded(&s.display().to_string())).collect();
     let Some(events) = root.get("hooks").and_then(|h| h.as_object()) else { return false };
     events.values().filter_map(|groups| groups.as_array()).flatten().any(|group| {
         group.get("hooks").and_then(|h| h.as_array()).is_some_and(|hooks| {
             hooks.iter().filter_map(|h| h.get("command").and_then(|c| c.as_str())).any(|command| {
                 let command = folded(command);
-                command.contains(&want) && command.contains(" hook")
+                wanted.iter().any(|want| command.contains(want.as_str())) && command.contains(" hook")
             })
         })
     })
@@ -59,12 +73,12 @@ fn hooks_name_this_memory(settings: &Path, db: &Path) -> bool {
 fn tool_server_names_this_memory(mcp_json: &Path, db: &Path) -> bool {
     let Ok(text) = std::fs::read_to_string(mcp_json) else { return false };
     let Ok(root) = serde_json::from_str::<serde_json::Value>(&text) else { return false };
-    let want = folded(&db.display().to_string());
+    let wanted: Vec<String> = thor_core::app_data::spellings(db).iter().map(|s| folded(&s.display().to_string())).collect();
     root.get("mcpServers")
         .and_then(|servers| servers.get("thor"))
         .and_then(|entry| entry.get("args"))
         .and_then(|args| args.as_array())
-        .is_some_and(|args| args.iter().filter_map(|a| a.as_str()).any(|a| folded(a) == want))
+        .is_some_and(|args| args.iter().filter_map(|a| a.as_str()).any(|a| wanted.contains(&folded(a))))
 }
 
 /// The short version of the report, in plain words: is the memory there, is
@@ -4166,6 +4180,41 @@ mod tests {
     use model::item::{Binding, Check, Item, Kind, TargetKind};
     use model::store;
     use thor_core::event_store::EventKind;
+
+    // ------------------------------------------------- one memory, two spellings
+
+    fn settings_with_hook_db(dir: &Path, db: &Path) -> std::path::PathBuf {
+        let command = format!("\"C:/thor2/serve.exe\" --db \"{}\" hook", db.display());
+        let settings = serde_json::json!({ "hooks": { "PreToolUse": [ { "hooks": [ { "type": "command", "command": command } ] } ] } });
+        let path = dir.join("settings.json");
+        std::fs::write(&path, settings.to_string()).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_hook_naming_the_short_path_matches_the_physical_path_given_to_doctor() {
+        let local = tempfile::tempdir().unwrap();
+        let short = local.path().join("thor2").join("thor.db");
+        let physical = local.path().join("Packages").join("Claude_x").join("LocalCache").join("Local").join("thor2").join("thor.db");
+        std::fs::create_dir_all(physical.parent().unwrap()).unwrap();
+        std::fs::write(&physical, b"x").unwrap();
+        let settings = settings_with_hook_db(local.path(), &short);
+        assert!(hooks_name_this_memory_in(&settings, &physical, local.path()), "same file, two spellings");
+        assert!(hooks_name_this_memory_in(&settings, &short, local.path()));
+        let other = local.path().join("elsewhere").join("thor.db");
+        assert!(!hooks_name_this_memory_in(&settings, &other, local.path()), "a different memory still does not match");
+    }
+
+    #[test]
+    fn a_hook_naming_the_physical_path_matches_the_short_path() {
+        let local = tempfile::tempdir().unwrap();
+        let short = local.path().join("thor2").join("thor.db");
+        let physical = local.path().join("Packages").join("Claude_x").join("LocalCache").join("Local").join("thor2").join("thor.db");
+        std::fs::create_dir_all(physical.parent().unwrap()).unwrap();
+        std::fs::write(&physical, b"x").unwrap();
+        let settings = settings_with_hook_db(local.path(), &physical);
+        assert!(hooks_name_this_memory_in(&settings, &short, local.path()));
+    }
 
     // ------------------------------------------------------------ identity
 

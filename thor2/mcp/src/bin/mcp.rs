@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 )]
 struct Cli {
     /// Path to the core event-log database. Must already exist.
-    #[arg(long)]
+    #[arg(long, value_parser = thor_core::app_data::parse_db_path)]
     db: PathBuf,
     /// Path to a code index built with the `codeindex` command.
     #[arg(long, requires = "repo")]
