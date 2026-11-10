@@ -2126,10 +2126,12 @@ pub fn semantic_line(model_dir: Option<&Path>) -> String {
 /// per name, each with the one thing to do. Silent when there are none. A
 /// folder is resolved to the spelling that exists, so no new split opens
 /// (`model::checkout::existing_scope_for`); the ones already there are the
-/// owner's to join, and nothing is ever renamed or merged by THOR itself.
+/// owner's to join, and nothing is ever renamed or merged by THOR itself. Only
+/// items the assistant can move count: THOR's own records (evaluation starts,
+/// its open points) are left out, so a spelling only they use is no note.
 pub fn split_scope_lines(db: &Path) -> Vec<String> {
     let Ok(store) = EventStore::open_existing(db) else { return Vec::new() };
-    split_scope_words(&store.project_scope_counts())
+    split_scope_words(&model::store::movable_scope_counts(&store))
 }
 
 /// `split_scope_lines` over the scopes and their item counts.
@@ -4257,6 +4259,47 @@ mod tests {
             legacy_declare(&mut s, &r);
         }
         assert!(split_scope_lines(&clean).is_empty(), "different names are not a split");
+    }
+
+    /// THOR's own records (an evaluation start, its open points) cannot be
+    /// moved by an assistant, so a spelling only they use is no note, and one
+    /// that also holds a movable item counts only that item.
+    #[test]
+    fn the_two_spellings_note_counts_only_items_the_assistant_can_move() {
+        let own = |s: &mut EventStore, id: &str, project: &str| {
+            let body = format!(r#"{{"text":"THOR's own record","project":"{project}"}}"#);
+            s.append_event("s", "s", "eval-machine", thor_core::event_store::EventKind::FactCreated, id, None, &body).unwrap();
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut s = EventStore::new(&db).unwrap();
+            for id in ["v1", "v2"] {
+                let mut r = rule(id);
+                r.project = Some("Acme tool tracking".to_string());
+                legacy_declare(&mut s, &r);
+            }
+            own(&mut s, "evaluation-start-acme-tool-tracking-7", "Acme-tool-tracking");
+            let blocker = store::Blocker::WorkingTreeDiffers { path: "a.md".to_string() };
+            own(&mut s, &store::machine_point_id("Acme-tool-tracking", &blocker), "Acme-tool-tracking");
+        }
+        assert!(split_scope_lines(&db).is_empty(), "only THOR's own records use the second spelling: {:?}", split_scope_lines(&db));
+        let summary = plain_summary(&db, dir.path(), None, None);
+        assert!(!summary.iter().any(|l| l.contains("one name written two ways")), "{summary:?}");
+
+        {
+            let mut s = EventStore::new(&db).unwrap();
+            let mut r = rule("v3");
+            r.project = Some("Acme-tool-tracking".to_string());
+            legacy_declare(&mut s, &r);
+        }
+        let lines = split_scope_lines(&db);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("'Acme tool tracking' (2 item(s)) and 'Acme-tool-tracking' (1 item(s)) are one name written two ways"),
+            "{}",
+            lines[0]
+        );
     }
 
     /// FIELD TEST 12, R5: a project whose working copy is a repository nested

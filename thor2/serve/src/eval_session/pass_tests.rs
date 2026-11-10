@@ -420,6 +420,63 @@ fn a_global_file_check_is_a_machine_blocker_never_the_agents_batch() {
     );
 }
 
+/// The store-wide point is lifted when only an ABSOLUTE-path rule with no
+/// project is left (the trial tries it for real, so it holds nothing), and
+/// stays held while a rule with no project and a RELATIVE path is left.
+#[test]
+fn the_store_wide_point_ignores_an_absolute_path_rule_and_keeps_a_relative_one() {
+    let mut fx = Fx::new();
+    let abs_dir = tempfile::tempdir().unwrap();
+    std::fs::write(abs_dir.path().join("settings.txt"), "a readable text file\n").unwrap();
+    let here = abs_dir.path().join("settings.txt").display().to_string().replace('\\', "/");
+    let global = Blocker::global_rules();
+    fx.legacy(&rule("glob-abs", &format!("The test program lives at {here}."), vec![path(&here)], Some(Check::PathExists { path: here.clone() }), None));
+    let reason = lifted(&fx.store, "beta", &global).expect("an absolute path holds nothing: the point is lifted");
+    assert!(reason.contains("no rule with no project carries a file check"), "{reason}");
+
+    fx.legacy(&rule("glob-rel", "Every repo keeps `eol=lf` in .gitattributes.", vec![cmd("git add")], contains(".gitattributes", "eol=lf"), None));
+    assert_eq!(lifted(&fx.store, "beta", &global), None, "a relative path still needs a working copy");
+
+    model::store::retract(&mut fx.store, "s", "l", "a", "glob-rel", "fixture: the rule about 'git add' and 'eol=lf' is gone", None).unwrap();
+    assert!(lifted(&fx.store, "beta", &global).is_some(), "only the absolute rule is left");
+}
+
+/// A start asked for under another spelling of a project the memory already
+/// holds is filed under the spelling it has, and THOR's own record under the
+/// other spelling does not keep that spelling alive for the next start.
+#[test]
+fn a_start_is_filed_under_the_spelling_the_memory_already_has() {
+    let mut fx = Fx::new();
+    fx.legacy(&rule("acme-rule", "Acme keeps its notes.", vec![cmd("git add")], None, Some("Acme tool tracking")));
+    let start = fx.start(S1, "Acme-tool-tracking");
+    assert_eq!(start.frozen.project, "Acme tool tracking");
+    assert_eq!(model::store::show(&fx.store, &start.id).unwrap().project.as_deref(), Some("Acme tool tracking"));
+
+    // A record of THOR's own left under the other spelling by an older build.
+    let stray = Item {
+        id: "evaluation-start-acme-tool-tracking-9999".to_string(),
+        kind: Kind::Report,
+        text: "THOR's own record".to_string(),
+        bindings: vec![],
+        severity: None,
+        project: Some("Acme-tool-tracking".to_string()),
+        tags: vec![model::store::EVALUATION_START_TAG.to_string()],
+        expires: None,
+        key: None,
+        falsifier: None,
+        check: None,
+    };
+    let body = model::store::canonical_body(&stray).unwrap();
+    fx.store.append_event(S1, S1, model::store::EVAL_MACHINE_ACTOR, EventKind::FactCreated, &stray.id, None, &body).unwrap();
+    assert!(
+        fx.store.project_scope_counts().iter().any(|(name, _)| name == "Acme-tool-tracking"),
+        "fixture sanity: the stray record makes the other spelling a scope"
+    );
+    fx.quiet_others(S2, "Acme tool tracking");
+    let next = fx.start(S2, "Acme-tool-tracking");
+    assert_eq!(next.frozen.project, "Acme tool tracking", "THOR's own record is not a spelling an assistant could keep");
+}
+
 /// Step 22 (C3b B4 L433-L470), narrowed by step 26: an OLD orientation
 /// carries a `path_exists` check on a file it is not anchored to, and the only
 /// way to name the file (anchor the rule to it) is refused by the crowding

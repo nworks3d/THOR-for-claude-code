@@ -6191,6 +6191,34 @@ pub fn is_machine_point(store: &EventStore, id: &str) -> bool {
         .is_some_and(|head| head.actor == EVAL_MACHINE_ACTOR && head.kind != EventKind::FactRetracted)
 }
 
+/// `EventStore::project_scope_counts` without THOR's own records: evaluation
+/// start records and THOR's own open points (written by `eval-machine` only,
+/// so no assistant can move them to another spelling). A project spelling
+/// that only THOR's own records are filed under is not a scope an assistant
+/// could join or keep, so neither doctor's two-spellings note nor the
+/// spelling a new evaluation start is filed under may count it.
+pub fn movable_scope_counts(store: &EventStore) -> Vec<(String, i64)> {
+    let mut counts = store.project_scope_counts();
+    let Ok(heads) = store.projected_head_events() else { return counts };
+    let mut seen = std::collections::HashSet::new();
+    for (event, _, _) in heads {
+        let own = event.kind != EventKind::FactRetracted
+            && event.actor == EVAL_MACHINE_ACTOR
+            && (event.entity_id.starts_with(EVALUATION_START_PREFIX) || is_machine_point_id(&event.entity_id));
+        if !own || !seen.insert(event.entity_id.clone()) {
+            continue;
+        }
+        let project = serde_json::from_str::<serde_json::Value>(&event.body)
+            .ok()
+            .and_then(|body| body.get("project").and_then(|p| p.as_str()).map(str::to_string));
+        if let Some(entry) = project.and_then(|p| counts.iter_mut().find(|(name, _)| *name == p)) {
+            entry.1 -= 1;
+        }
+    }
+    counts.retain(|(_, n)| *n > 0);
+    counts
+}
+
 /// Every live open point scoped EXACTLY to `project` (an open point belongs
 /// to the project it is about): THOR's own first, then the legacy ones, each
 /// group oldest first (ascending creation seq; a failed seq lookup sorts an
@@ -8265,14 +8293,22 @@ pub fn carried_by_valid_evaluations(store: &EventStore, project: &str, subject: 
 }
 
 /// The carrying sessions in words: "session S1 on 2026-09-30, S2 (agent a1)
-/// on 2026-10-01" - each with the date its filing's result was written.
+/// on 2026-10-01" - each with the date its filing's result was written. Past
+/// `CARRIERS_NAMED` carriers it gives the count and names only the last ones
+/// ("127 valid evaluation(s), the last 3: session ..."), so the open point's
+/// text and doctor's owner queue line never grow with every evaluation.
 pub fn carriers_in_words(carriers: &[Carrier]) -> String {
     let one = |c: &Carrier| {
         let agent = c.agent.as_deref().map(|a| format!(" (agent {})", plain(a))).unwrap_or_default();
         let date = c.filed_at.get(..10).unwrap_or(c.filed_at.as_str());
         format!("{}{agent} on {}", plain(&c.session), plain(date))
     };
-    format!("session {}", carriers.iter().map(one).collect::<Vec<_>>().join(", "))
+    let shown = carriers.len().saturating_sub(CARRIERS_NAMED);
+    let named = carriers.iter().skip(shown).map(one).collect::<Vec<_>>().join(", ");
+    match shown {
+        0 => format!("session {named}"),
+        _ => format!("{} valid evaluation(s), the last {CARRIERS_NAMED}: session {named}", carriers.len()),
+    }
 }
 
 /// How many carrying evaluations the start note names (`carriers_compact`).
@@ -8282,7 +8318,7 @@ pub const CARRIERS_NAMED: usize = 3;
 /// push the lists the session acts on out of the size Claude Code shows:
 /// how many valid evaluations carried the subject, then the last
 /// `CARRIERS_NAMED` of them by the first eight characters of their session and
-/// their date. The whole list stays in the point's own text (`get`).
+/// their date. The point's own text (`get`) names the last ones too.
 pub fn carriers_compact(carriers: &[Carrier]) -> String {
     format!("carried by {} valid evaluation(s), {}", carriers.len(), carriers_last(carriers))
 }
@@ -9019,6 +9055,21 @@ mod tests {
         item.id = id.to_string();
         item.text = text.to_string();
         item
+    }
+
+    #[test]
+    fn carriers_in_words_names_the_count_and_only_the_last_three_past_three() {
+        let carrier = |n: usize| Carrier {
+            session: format!("s{n}"),
+            agent: None,
+            filed_at: "2026-09-01T10:00:00Z".to_string(),
+            report: format!("eval-{n}"),
+        };
+        let all: Vec<Carrier> = (1..=127).map(carrier).collect();
+        assert_eq!(carriers_in_words(&all[..3]), "session s1 on 2026-09-01, s2 on 2026-09-01, s3 on 2026-09-01");
+        let words = carriers_in_words(&all);
+        assert_eq!(words, "127 valid evaluation(s), the last 3: session s125 on 2026-09-01, s126 on 2026-09-01, s127 on 2026-09-01");
+        assert!(words.len() < 200 && !words.contains("s124"), "{words}");
     }
 
     #[test]

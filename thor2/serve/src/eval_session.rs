@@ -259,7 +259,17 @@ pub fn running_elsewhere_note(start: &EvaluationStart, idle_minutes: i64) -> Str
 /// it has been quiet longer - never voided: its verdicts and edits stay.
 pub fn try_begin(db: &Path, store: &mut EventStore, session_id: &str, project: &str, started_by: &str) -> Result<Started, StartRefused> {
     retire_handover_sidecar(db);
-    if let Some(open) = open_evaluation(store, session_id, project) {
+    // The start record is filed under the spelling the memory already has for
+    // this project (case, spaces and hyphens do not make a second one), the
+    // same resolution the tool server uses - judged from the items an
+    // assistant can move, so THOR's own records never keep a second spelling
+    // alive. A caller that took its name from an older sidecar gets it here.
+    let respelled = model::checkout::existing_scope_for(&model::store::movable_scope_counts(store), project);
+    let asked = project;
+    let project = respelled.as_deref().unwrap_or(project);
+    // An evaluation this session already opened under the name as asked is
+    // still its own.
+    if let Some(open) = open_evaluation(store, session_id, project).or_else(|| open_evaluation(store, session_id, asked)) {
         return Ok(Started { start: open, fresh: false });
     }
     let now = crate::time::now_unix();
@@ -767,13 +777,14 @@ fn point_text_of(store: &EventStore, project: &str, blocker: &Blocker, rules: &[
     match blocker {
         Blocker::NoWorkingCopy { .. } if blocker.is_global_rules() => format!(
             "THOR's own open point, one for the whole memory (not for one project): {} rule(s) with no project carry a \
-             check that reads a file, and a rule with no project has no working copy THOR could try that check in: \
+             check that reads a file by a relative path (an absolute path is tried as it is and holds nothing), and \
+             a rule with no project has no working copy THOR could try that check in: \
              {}.{more} Every project's evaluation holds these rules by this one point, and none of them is that \
              evaluation's to settle. Nothing needs doing: each keeps its check and is counted apart - clearing a check \
              that is true is never the way past this. Only when a rule is really about one project: give it that \
              project (mcp__thor__revise with the rule's id, project and a because); otherwise the owner decides. This \
              point closes itself at the first evaluation start, in any project, after no rule with no project carries \
-             a file check.",
+             a file check that needs a working copy (one with a relative path).",
             rules.len(),
             named(rules)
         ),
@@ -848,12 +859,13 @@ fn point_text_of(store: &EventStore, project: &str, blocker: &Blocker, rules: &[
 fn lifted(store: &EventStore, project: &str, blocker: &Blocker) -> Option<String> {
     match blocker {
         Blocker::NoWorkingCopy { .. } if blocker.is_global_rules() => {
+            // The same judgement the trial and doctor use: a rule with no
+            // project and an ABSOLUTE path is tried for real and holds nothing.
             let still = crate::live::live_items(store).into_iter().any(|li| {
                 li.item.kind.can_fire()
-                    && model::normalize::normalize_project(li.item.project.as_deref()).is_none()
-                    && li.item.check.as_ref().is_some_and(model::checkout::is_file_check)
+                    && model::checkout::read_time_blocker(store, &li.item).is_some_and(|b| b.is_global_rules())
             });
-            (!still).then(|| "no rule with no project carries a file check any more".to_string())
+            (!still).then(|| "no rule with no project carries a file check that needs a working copy any more".to_string())
         }
         Blocker::NoWorkingCopy { project: held } => {
             project::registered_checkout(store, Some(held)).is_ok().then(|| "the working copy is registered now".to_string())
