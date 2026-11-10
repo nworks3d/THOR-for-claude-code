@@ -38,7 +38,7 @@ Words used once, in plain language:
 ### A2. The agent checks the machine for git, Python 3 and the C++ runtime
 - What: when the AI assistant does the install, it first checks git, Python 3 and (Windows) the C++
   runtime, and installs only what is missing through winget, brew, apt or dnf.
-- Why: git reads a project's code and keeps that reading fresh after each commit; Python is used by the
+- Why: git reads a project's code and keeps that reading fresh after a commit, a merge or pull, a rebase and a branch switch; Python is used by the
   helper scripts assistants write for a person's work. The aim is zero typing by the person (AGENTS.md:62-88).
 - You notice: at most one system permission prompt (winget or sudo). That click is yours.
 - Refuse or change: you can decline the system prompt; then the assistant stops and says so. Rust is
@@ -84,7 +84,7 @@ Words used once, in plain language:
 
 ### A7. It points git at a shared set of hooks for every repository
 - What: it writes small dispatcher scripts for nine git events into a folder beside the memory and sets
-  git's global core.hooksPath to it. After each commit the one for post-commit refreshes the project's
+  git's global core.hooksPath to it. After a commit, a merge or pull, a rebase and a branch switch the matching hooks refresh the project's
   code reading. Every dispatcher then runs that repository's own hook, so nothing already there stops.
 - Why: an index three days behind made 83 percent of "who uses this" answers point at a wrong line,
   against 0 percent when fresh (githooks.rs:3-14). A naive hooksPath would silently switch off a
@@ -764,8 +764,8 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
 - You notice: one question, in your language; "no" sends nothing.
 - Refuse or change: say no; or remove thor-mode.json so nothing is offered.
 
-### E10. Code index refreshed after each commit; the optional backup and sync
-- What: the git hook (A7) refreshes the project's code reading after each commit. The backup runs only
+### E10. Code index refreshed after a commit, a merge or pull, a rebase and a branch switch; the optional backup and sync
+- What: the git hook (A7) refreshes the project's code reading after a commit, a merge or pull, a rebase and a branch switch. The backup runs only
   once you chose it (see A16); the sync program is started by you or your schedule. "sync ship" sends events to a copy;
   "doctor" names a copy or backup that has gone stale.
 - Why: a stale code reading gave wrong line numbers for 83 percent of answers.

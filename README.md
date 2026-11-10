@@ -604,7 +604,7 @@ memory if you do not have one yet, wires THOR into your assistant, and registers
 the part your assistant writes through. It also installs a shared set of git
 hooks that run in every repository on this machine (unless another tool already
 set git's global hooks folder, in which case THOR leaves that alone and says so),
-which keeps the reading of your code fresh after each commit, and each one hands
+which keeps the reading of your code fresh after a commit, a merge or pull, a rebase and a branch switch, and each one hands
 control back to your repository's own hooks so nothing already there stops
 working. The same hooks also stop a commit that would add a video file or a
 very large file (see [The media gate](#the-media-gate-no-video-or-huge-file-in-git-by-accident)
