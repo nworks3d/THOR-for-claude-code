@@ -4,6 +4,16 @@ What changed in each release, newest first. The release workflow copies the sect
 
 ## Unreleased
 
+## 2.6.6 (2026-11-10)
+
+What changed: Doctor is fast again: it had grown from seconds to about five minutes. THOR now finds its memory and its search model also when a program runs outside the Claude desktop app, so the hourly refresh of search by meaning no longer skips. The route probe is more careful and is no longer part of doctor, the store-wide open point closes when it should, and a second spelling of a project name can no longer come back.
+
+- **Doctor is fast again.** It had grown from seconds to about five minutes, because the route probe ran outside its time limit and patterns were rebuilt on every call. Patterns are now built once per process.
+- **The route probe counts only real routes, and is no longer part of doctor.** It no longer counts documents, searches or briefs that merely mention a host; it counts only a script that runs, or is written, with the host in it. On real data it still named things that are no host at all and scripts that merely live on a share named like the host, so doctor and `doctor --eval` print no `route probe:` line any more. It stays in `serve sweep`, as a look someone asks for.
+- **THOR finds its memory and its search model outside the Claude desktop app.** On Windows, a program started by a scheduled task, a terminal or ssh did not see the memory and the model that the desktop app sets up, so the hourly refresh of search by meaning skipped. It now looks in the usual places itself, and the skip line says why when it still skips.
+- **The store-wide open point closes when only absolute-path rules are left.** It stayed open while the rules left in it were rules with an absolute path check, which need no working copy. Its carried-by list now shows the count and the last 3 rules instead of every one.
+- **A second spelling of a project name can no longer come back.** The two-spellings note in doctor no longer counts THOR's own records, a new evaluation start is filed under the spelling the memory already has, and a folder or a write can no longer bring a second spelling back.
+
 ## 2.6.5 (2026-11-09)
 
 What changed: Your verdicts on notes count again, also when a note did not belong where it fired. A rule bound to an address with a port now really fires, a rule can now refuse a tool by its name, and a rule whose check works can no longer disappear silently when notes are folded together. The restart question only comes when a restart is really needed, and the open point that stood in every evaluation closes by itself.
