@@ -194,14 +194,23 @@ pub fn seed_response_rulebook(db: &Path) -> anyhow::Result<RulebookReport> {
 /// What happened to the end-of-session evaluation command on this run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvalCommandOutcome {
+    /// There was no routine: this run wrote it.
     Written,
+    /// The routine is exactly the one this build ships for this machine.
     AlreadyThere,
+    /// An older routine THOR itself wrote, never changed since: replaced.
+    Refreshed,
+    /// A routine the owner changed (or one written before THOR kept a record):
+    /// copied to `EvalCommandReport::backup`, then replaced.
+    RefreshedKeepingCopy,
 }
 
 #[derive(Debug, Clone)]
 pub struct EvalCommandReport {
     pub outcome: EvalCommandOutcome,
     pub path: PathBuf,
+    /// Where the old routine was copied; only set for `RefreshedKeepingCopy`.
+    pub backup: Option<PathBuf>,
 }
 
 /// The generic end-of-session evaluation routine this installer ships, its
@@ -309,7 +318,7 @@ fn serve_program(bin_dir: &Path) -> PathBuf {
 /// command, in the exact form `model::store::retest_command_with` prints) -
 /// with this install run's own resolution for the current platform (see
 /// `doctor_invocation`/`doctor_allow_invocation`).
-fn render_eval_command(bin_dir: &Path, db: &Path) -> String {
+pub fn render_eval_command(bin_dir: &Path, db: &Path) -> String {
     EVAL_COMMAND_TEMPLATE
         .replace("{{THOR_DOCTOR}}", &doctor_invocation(bin_dir, db, cfg!(windows)))
         .replace("{{THOR_DOCTOR_BASH}}", &doctor_bash_invocation(bin_dir, db, cfg!(windows)))
@@ -406,20 +415,115 @@ pub fn settle_mode(db: &Path, told: Option<serve::bug_report::Mode>) -> anyhow::
 /// it is already there the day writes are turned on, instead of a second
 /// install being needed just to fetch it.
 ///
-/// An existing file - the owner's own edited copy, or one an earlier install
-/// already wrote - is never opened, merged or overwritten: the same "only
-/// ever write into an absence" stance as `seed_response_rulebook`.
+/// A routine that is already there is brought up to date by CONTENT, never by
+/// the date of the file, and nothing the owner wrote is lost:
+/// - exactly what this build renders: left alone;
+/// - different, and its hash is the one THOR recorded when it last wrote it
+///   (`eval_routine_record_path`): nobody changed it, so it is replaced;
+/// - different, and there is no record or the hash differs from it (the owner
+///   edited it, or it was written before the record existed): first copied
+///   to `eval_routine_backup_dir` (never the commands folder, where any `.md`
+///   file would become a slash command), then replaced.
 pub fn seed_eval_command(path: &Path, bin_dir: &Path, db: &Path) -> anyhow::Result<EvalCommandReport> {
-    if path.exists() {
-        return Ok(EvalCommandReport { outcome: EvalCommandOutcome::AlreadyThere, path: path.to_path_buf() });
+    let wanted = render_eval_command(bin_dir, db);
+    let wanted_hash = eval_routine_hash(&wanted);
+    let report = |outcome, backup| EvalCommandReport { outcome, path: path.to_path_buf(), backup };
+    if !path.exists() {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        fs::write(path, &wanted)?;
+        write_eval_routine_record(db, &wanted_hash);
+        return Ok(report(EvalCommandOutcome::Written, None));
     }
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
+    let existing = fs::read(path)?;
+    let existing_hash = eval_routine_hash(&String::from_utf8_lossy(&existing));
+    let recorded = read_eval_routine_record(db);
+    if existing_hash == wanted_hash {
+        if recorded.as_deref() != Some(wanted_hash.as_str()) {
+            write_eval_routine_record(db, &wanted_hash);
+        }
+        return Ok(report(EvalCommandOutcome::AlreadyThere, None));
+    }
+    let backup = if recorded.as_deref() == Some(existing_hash.as_str()) {
+        None
+    } else {
+        Some(copy_eval_routine_aside(db, &existing)?)
+    };
+    fs::write(path, &wanted)?;
+    write_eval_routine_record(db, &wanted_hash);
+    let outcome = if backup.is_some() { EvalCommandOutcome::RefreshedKeepingCopy } else { EvalCommandOutcome::Refreshed };
+    Ok(report(outcome, backup))
+}
+
+/// Whether the routine at `path` is the one this build renders for this
+/// machine. `None` when there is no routine file (nothing to compare).
+pub fn eval_command_is_current(path: &Path, bin_dir: &Path, db: &Path) -> Option<bool> {
+    let existing = fs::read(path).ok()?;
+    Some(eval_routine_hash(&String::from_utf8_lossy(&existing)) == eval_routine_hash(&render_eval_command(bin_dir, db)))
+}
+
+/// The hash of a routine text: sha256, through the one hash function the
+/// workspace already has (`thor_core::event_store::hash_event`, with a fixed
+/// prefix so a routine's hash is never mistaken for an event's).
+fn eval_routine_hash(text: &str) -> String {
+    thor_core::event_store::hash_event("thor-eval-routine", text)
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct EvalRoutineRecord {
+    hash: String,
+}
+
+/// The small record beside the memory of the hash of the routine THOR itself
+/// last wrote.
+pub fn eval_routine_record_path(db: &Path) -> PathBuf {
+    db.parent().unwrap_or_else(|| Path::new(".")).join("eval-routine-written.json")
+}
+
+/// Where the old routine goes when the owner had changed it, beside the memory.
+pub fn eval_routine_backup_dir(db: &Path) -> PathBuf {
+    db.parent().unwrap_or_else(|| Path::new(".")).join("eval-routine-backups")
+}
+
+fn read_eval_routine_record(db: &Path) -> Option<String> {
+    let text = fs::read_to_string(eval_routine_record_path(db)).ok()?;
+    serde_json::from_str::<EvalRoutineRecord>(&text).ok().map(|r| r.hash)
+}
+
+/// Best effort on purpose: a record that cannot be written only means the next
+/// install treats the routine as possibly changed and keeps a copy of it first,
+/// which loses nothing, so it must never stop the routine itself from landing.
+fn write_eval_routine_record(db: &Path, hash: &str) {
+    if let Ok(json) = serde_json::to_string(&EvalRoutineRecord { hash: hash.to_string() }) {
+        let _ = fs::write(eval_routine_record_path(db), json);
+    }
+}
+
+/// Save `old` as `thor-eval.<date>.md.bak` (then `-2`, `-3`, ... on the same
+/// day) in the backup folder. An earlier backup is never overwritten: each
+/// name is claimed with `create_new`.
+fn copy_eval_routine_aside(db: &Path, old: &[u8]) -> anyhow::Result<PathBuf> {
+    use std::io::Write;
+    let dir = eval_routine_backup_dir(db);
+    fs::create_dir_all(&dir)?;
+    let today = serve::time::now_iso8601();
+    let day = today.get(..10).unwrap_or("undated");
+    for n in 1u32.. {
+        let name = if n == 1 { format!("thor-eval.{day}.md.bak") } else { format!("thor-eval.{day}-{n}.md.bak") };
+        let candidate = dir.join(name);
+        match fs::OpenOptions::new().write(true).create_new(true).open(&candidate) {
+            Ok(mut file) => {
+                file.write_all(old)?;
+                return Ok(candidate);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
         }
     }
-    fs::write(path, render_eval_command(bin_dir, db))?;
-    Ok(EvalCommandReport { outcome: EvalCommandOutcome::Written, path: path.to_path_buf() })
+    unreachable!("the loop only ends by returning")
 }
 
 /// One hook this installer knows how to place: which event fires it, an
@@ -3362,25 +3466,127 @@ mod tests {
         assert!(!allows("C:/fake/thor2/bin/serve.exe --db C:/other/thor.db retest --id 'x'"), "another store is not allowed");
     }
 
-    /// The defect this guards against: an installer that "refreshes" the
-    /// eval command on every run would silently overwrite an owner's own
-    /// edited copy the next time a binary gets rebuilt - the same failure
-    /// `seed_response_rulebook_leaves_an_existing_file_untouched` guards
-    /// against for the rulebook.
-    #[test]
-    fn seed_eval_command_leaves_an_edited_copy_untouched() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("thor-eval.md");
-        let owners_own = "the owner's own edited routine\n";
-        fs::write(&path, owners_own).unwrap();
+    /// A sandbox for the routine tests: the commands folder file, the store
+    /// path beside which the record and the backups go, and the programs folder.
+    struct RoutineSandbox {
+        _dir: tempfile::TempDir,
+        path: PathBuf,
+        db: PathBuf,
+        bin: PathBuf,
+    }
 
-        let report = seed_eval_command(&path, Path::new("bin"), Path::new("thor.db")).unwrap();
+    impl RoutineSandbox {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("commands").join("thor-eval.md");
+            let db = dir.path().join("memory").join("thor.db");
+            fs::create_dir_all(db.parent().unwrap()).unwrap();
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let bin = dir.path().join("bin");
+            Self { _dir: dir, path, db, bin }
+        }
+        fn seed(&self) -> EvalCommandReport {
+            seed_eval_command(&self.path, &self.bin, &self.db).unwrap()
+        }
+        fn current(&self) -> String {
+            render_eval_command(&self.bin, &self.db)
+        }
+        fn backups(&self) -> Vec<PathBuf> {
+            match fs::read_dir(eval_routine_backup_dir(&self.db)) {
+                Ok(entries) => entries.map(|e| e.unwrap().path()).collect(),
+                Err(_) => Vec::new(),
+            }
+        }
+        fn commands_folder_files(&self) -> usize {
+            fs::read_dir(self.path.parent().unwrap()).unwrap().count()
+        }
+    }
+
+    #[test]
+    fn eval_routine_missing_is_written_and_recorded() {
+        let sb = RoutineSandbox::new();
+        fs::remove_dir(sb.path.parent().unwrap()).unwrap();
+        let report = sb.seed();
+        assert_eq!(report.outcome, EvalCommandOutcome::Written);
+        assert_eq!(fs::read_to_string(&sb.path).unwrap(), sb.current());
+        assert_eq!(read_eval_routine_record(&sb.db), Some(eval_routine_hash(&sb.current())));
+        assert!(sb.backups().is_empty());
+    }
+
+    #[test]
+    fn eval_routine_already_current_is_left_alone_and_gets_a_record_when_none_exists() {
+        let sb = RoutineSandbox::new();
+        fs::write(&sb.path, sb.current()).unwrap();
+        assert_eq!(read_eval_routine_record(&sb.db), None);
+        let report = sb.seed();
         assert_eq!(report.outcome, EvalCommandOutcome::AlreadyThere);
-        assert_eq!(
-            fs::read_to_string(&path).unwrap(),
-            owners_own,
-            "an edited copy must never be overwritten, seeded or not"
-        );
+        assert_eq!(fs::read_to_string(&sb.path).unwrap(), sb.current());
+        assert_eq!(read_eval_routine_record(&sb.db), Some(eval_routine_hash(&sb.current())));
+        assert!(sb.backups().is_empty());
+        assert_eq!(sb.seed().outcome, EvalCommandOutcome::AlreadyThere);
+    }
+
+    #[test]
+    fn eval_routine_written_by_thor_and_never_changed_is_replaced_without_a_backup() {
+        let sb = RoutineSandbox::new();
+        let old = "an older routine THOR wrote\n";
+        fs::write(&sb.path, old).unwrap();
+        write_eval_routine_record(&sb.db, &eval_routine_hash(old));
+        let report = sb.seed();
+        assert_eq!(report.outcome, EvalCommandOutcome::Refreshed);
+        assert_eq!(report.backup, None);
+        assert_eq!(fs::read_to_string(&sb.path).unwrap(), sb.current());
+        assert_eq!(read_eval_routine_record(&sb.db), Some(eval_routine_hash(&sb.current())));
+        assert!(sb.backups().is_empty());
+    }
+
+    #[test]
+    fn eval_routine_with_no_record_is_copied_aside_then_replaced() {
+        let sb = RoutineSandbox::new();
+        let old = "a routine from before there was a record\n";
+        fs::write(&sb.path, old).unwrap();
+        let report = sb.seed();
+        assert_eq!(report.outcome, EvalCommandOutcome::RefreshedKeepingCopy);
+        let backup = report.backup.expect("a backup path");
+        assert_eq!(fs::read_to_string(&backup).unwrap(), old);
+        assert!(backup.starts_with(eval_routine_backup_dir(&sb.db)));
+        assert!(backup.to_string_lossy().ends_with(".md.bak"), "{backup:?}");
+        assert_eq!(fs::read_to_string(&sb.path).unwrap(), sb.current());
+        assert_eq!(read_eval_routine_record(&sb.db), Some(eval_routine_hash(&sb.current())));
+        assert_eq!(sb.commands_folder_files(), 1, "no backup may sit in the commands folder");
+    }
+
+    #[test]
+    fn eval_routine_the_owner_changed_is_copied_aside_then_replaced() {
+        let sb = RoutineSandbox::new();
+        let written = "what THOR wrote\n";
+        write_eval_routine_record(&sb.db, &eval_routine_hash(written));
+        let edited = "what THOR wrote\nplus a line of the owner's own\n";
+        fs::write(&sb.path, edited).unwrap();
+        let report = sb.seed();
+        assert_eq!(report.outcome, EvalCommandOutcome::RefreshedKeepingCopy);
+        assert_eq!(fs::read_to_string(report.backup.unwrap()).unwrap(), edited);
+        assert_eq!(fs::read_to_string(&sb.path).unwrap(), sb.current());
+        assert_eq!(sb.commands_folder_files(), 1);
+    }
+
+    #[test]
+    fn eval_routine_backup_never_overwrites_an_earlier_one() {
+        let sb = RoutineSandbox::new();
+        let mut kept = Vec::new();
+        for i in 0..3 {
+            let old = format!("the owner's version number {i}\n");
+            fs::write(&sb.path, &old).unwrap();
+            let report = sb.seed();
+            assert_eq!(report.outcome, EvalCommandOutcome::RefreshedKeepingCopy);
+            kept.push((report.backup.unwrap(), old));
+        }
+        let names: std::collections::HashSet<&PathBuf> = kept.iter().map(|(p, _)| p).collect();
+        assert_eq!(names.len(), 3, "three different backup files: {kept:?}");
+        for (backup, old) in &kept {
+            assert_eq!(&fs::read_to_string(backup).unwrap(), old, "{backup:?} was overwritten");
+        }
+        assert_eq!(sb.backups().len(), 3);
     }
 
     /// Required to actually prove the seeded file is usable, not merely

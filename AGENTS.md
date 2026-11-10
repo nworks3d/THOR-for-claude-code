@@ -229,7 +229,10 @@ before this check existed gets it by running the installer once more.
 It also writes an end-of-session routine, `/thor-eval`, to your own commands
 folder. Run it at the end of a session: it walks through everything the memory has
 been served without a verdict and settles that debt in one pass, rather than
-leaving it for the next session to inherit.
+leaving it for the next session to inherit. A later install refreshes that
+routine to the one that belongs to the new programs; if the person had changed it,
+the old file is first kept as a copy in the `eval-routine-backups` folder beside the
+memory (the install prints the exact path), so nothing they wrote is lost.
 
 Run from inside a git project, it also reads that project's code once, so
 searching the code, finding where a symbol is used and outlining a file answer

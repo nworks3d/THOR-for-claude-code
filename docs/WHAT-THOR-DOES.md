@@ -134,8 +134,12 @@ Words used once, in plain language:
   the notes that were served without a verdict.
 - You notice: "added the command /thor-eval". Its allowed-tools list pre-approves only specific
   commands (git status/diff/log, test and build commands, THOR's doctor and retest), never a bare shell.
-- Refuse or change: an existing copy is never overwritten, so you can edit it. eval-command-names.txt
-  beside the memory lists extra names for it. Written even with --no-mcp.
+- Refuse or change: a later install refreshes the routine to the one that belongs to the new
+  programs. A copy you changed is first kept as a copy, thor-eval.<date>.md.bak in the
+  eval-routine-backups folder beside the memory (the install prints the full path), so your edits
+  are not lost; an unchanged copy is simply replaced. doctor says so when the routine is not the
+  one these programs ship. eval-command-names.txt beside the memory lists extra names for it.
+  Written even with --no-mcp.
 
 ### A9. It puts 22 pinned starting notes in a new memory
 - What: ten are about writing a note that actually comes back (anchor it to the real file, revise

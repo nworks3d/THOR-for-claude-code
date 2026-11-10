@@ -1226,9 +1226,8 @@ fn main() -> ExitCode {
     // 1c. The end-of-session evaluation command. THOR holds a turn open for a
     // verdict on one served note at a time; this is how that debt gets
     // settled in bulk. Written regardless of --no-mcp (see
-    // seed_eval_command's own doc comment for why), and never overwrites a
-    // copy that is already there - the owner's own edited version, or one an
-    // earlier install already wrote.
+    // seed_eval_command's own doc comment for why). A copy that is already
+    // there is brought up to date; one the owner changed is saved first.
     match default_eval_command_path() {
         Some(path) => {
             let bin_dir = serve_exe.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
@@ -1239,7 +1238,18 @@ fn main() -> ExitCode {
                         report.path.display()
                     ),
                     EvalCommandOutcome::AlreadyThere => {
-                        println!("= the /thor-eval command was already there ({})", report.path.display())
+                        println!("= the /thor-eval command was already there and is up to date ({})", report.path.display())
+                    }
+                    EvalCommandOutcome::Refreshed => println!(
+                        "+ updated the /thor-eval command to the one that belongs to these programs; you had not changed the old one, so nothing was lost ({})",
+                        report.path.display()
+                    ),
+                    EvalCommandOutcome::RefreshedKeepingCopy => {
+                        let copy = report.backup.as_ref().map(|b| b.display().to_string()).unwrap_or_default();
+                        println!(
+                            "+ updated the /thor-eval command to the one that belongs to these programs ({}). The old one differed from what THOR wrote, so it was saved as {copy} - any changes you made yourself are in that file",
+                            report.path.display()
+                        )
                     }
                 },
                 Err(e) => println!("  ! could not add the /thor-eval command: {e}"),

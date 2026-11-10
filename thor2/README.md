@@ -171,9 +171,15 @@ Claude Code's own commands folder, the first time it finds none there: a
 generic template with this run's own programs folder and store filled in,
 so running `/thor-eval` settles whatever the memory has been served without
 a verdict. Written even under `--no-mcp`, since the file should already be
-there the day writes are turned on. An existing copy - the owner's own
-edited version, or one an earlier install already wrote - is left exactly
-as it is.
+there the day writes are turned on. A later install refreshes an existing
+copy to the routine of the new programs, judged by content: a copy THOR
+wrote and nobody changed is simply replaced (`eval-routine-written.json`
+beside the memory records the hash of what THOR last wrote), and a copy the
+owner changed, or one from before that record existed, is first saved in the
+`eval-routine-backups` folder beside the memory as `thor-eval.<date>.md.bak`
+(never in the commands folder, and never over an earlier backup). `doctor`'s
+short version says so when the installed routine is not the one these programs
+ship.
 
 Opening that routine starts an evaluation, and so does the `Stop` hook's ask
 for one. The start is a record in the memory's own log (`evaluation-start-<project>-<seq>`,

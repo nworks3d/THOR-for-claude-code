@@ -164,8 +164,28 @@ pub fn plain_summary(db: &Path, cwd: &Path, settings: Option<&Path>, mcp_json: O
         lines.push(format!("  NOTE: {note}"));
     }
 
+    // Silent unless the installed evaluation routine is not the one these programs ship.
+    let bin_dir = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf));
+    if let (Some(routine), Some(bin_dir)) = (crate::install::default_eval_command_path(), bin_dir) {
+        lines.extend(eval_routine_note(db, &routine, &bin_dir));
+    }
+
     lines.push("Everything below is the detailed report, written for your assistant. You do not need to read it.".to_string());
     lines
+}
+
+/// The one NOTE of the short summary about the end-of-session routine
+/// (`/thor-eval`): present when a routine is installed at `routine` and is not
+/// the one this build renders for this machine, absent when it matches or when
+/// no routine is installed.
+pub fn eval_routine_note(db: &Path, routine: &Path, bin_dir: &Path) -> Option<String> {
+    match crate::install::eval_command_is_current(routine, bin_dir, db) {
+        Some(false) => Some(
+            "  NOTE: the evaluation routine on this machine (the /thor-eval command) is not the one these programs ship, so your assistant may misread parts of an evaluation. Next step: ask your assistant to run THOR's install again; it puts the current routine in place and keeps a changed one as a copy."
+                .to_string(),
+        ),
+        _ => None,
+    }
 }
 
 /// What `doctor` says about the two folders the owner may name
@@ -8472,6 +8492,33 @@ mod plain_summary_tests {
     }
 
     #[test]
+    fn the_short_summary_notes_a_routine_that_is_not_the_one_these_programs_ship() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        let bin = dir.path().join("bin");
+        let routine = dir.path().join("commands").join("thor-eval.md");
+
+        // No routine installed: no line.
+        assert_eq!(eval_routine_note(&db, &routine, &bin), None);
+
+        // The routine this build renders: no line.
+        std::fs::create_dir_all(routine.parent().unwrap()).unwrap();
+        std::fs::write(&routine, crate::install::render_eval_command(&bin, &db)).unwrap();
+        assert_eq!(eval_routine_note(&db, &routine, &bin), None);
+
+        // An older or changed routine: one NOTE with the one next step.
+        std::fs::write(&routine, "an older routine\n").unwrap();
+        let note = eval_routine_note(&db, &routine, &bin).expect("a note");
+        assert!(note.starts_with("  NOTE: the evaluation routine on this machine"), "{note}");
+        assert!(note.contains("Next step: ask your assistant to run THOR's install again"), "{note}");
+        assert!(note.contains("keeps a changed one as a copy"), "{note}");
+
+        // Running the install's own step brings it back to no line.
+        crate::install::seed_eval_command(&routine, &bin, &db).unwrap();
+        assert_eq!(eval_routine_note(&db, &routine, &bin), None);
+    }
+
+    #[test]
     fn every_problem_names_one_next_step() {
         let dir = tempfile::tempdir().unwrap();
         let (db, _, _) = wired(dir.path());
@@ -8479,7 +8526,11 @@ mod plain_summary_tests {
         let all = lines.join("\n");
         assert!(all.contains("PROBLEM: Claude Code does not know about THOR yet"), "{all}");
         assert!(all.contains("PROBLEM: your assistant can read the memory but cannot save notes"), "{all}");
-        assert_eq!(all.matches("Next step:").count(), 2, "{all}");
+        // Only the PROBLEM lines are counted: a NOTE about this machine's real
+        // /thor-eval routine may also be there, and may name its own next step.
+        let problems: Vec<&str> = lines.iter().map(String::as_str).filter(|l| l.starts_with("  PROBLEM")).collect();
+        assert_eq!(problems.len(), 2, "{all}");
+        assert!(problems.iter().all(|l| l.contains("Next step:")), "{all}");
         assert!(all.contains("NOTE: this folder has no memory of its own"), "{all}");
         assert!(all.contains("--topic"), "the plain folder is offered the one command: {all}");
 
