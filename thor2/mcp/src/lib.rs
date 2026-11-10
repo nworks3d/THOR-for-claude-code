@@ -817,8 +817,9 @@ fn refuse_a_new_collection(
     // Judged by the items an assistant can move: a spelling only THOR's own
     // records use, beside a real one, is not an existing project.
     let resolvable = model::store::resolvable_scope_counts(store);
+    let all_scopes = store.project_scope_counts();
     let only_thors_own = |scope: &str| {
-        !resolvable.iter().any(|(s, _)| s == scope) && store.project_scope_counts().iter().any(|(s, _)| s == scope)
+        !resolvable.iter().any(|(s, _)| s == scope) && all_scopes.iter().any(|(s, _)| s == scope)
     };
     if known.scopes.iter().any(|s| s.scope.eq_ignore_ascii_case(&wanted) && !only_thors_own(&s.scope)) {
         return Ok(());
