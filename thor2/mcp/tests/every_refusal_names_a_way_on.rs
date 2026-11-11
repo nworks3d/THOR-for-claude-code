@@ -232,6 +232,30 @@ fn majority_names_accept_refusing_and_naming_a_listed_call_lets_the_write_land()
     assert!(landed(&reply), "{reply}");
 }
 
+#[test]
+fn majority_shows_five_calls_and_still_accepts_one_that_is_not_shown() {
+    let fx = Fx::new(&["demo"]);
+    let calls: Vec<String> = (0..8).map(|i| format!("git grep -n w{i} src")).collect();
+    let refs: Vec<&str> = calls.iter().map(|c| c.as_str()).collect();
+    served(&fx.db, OTHER_SESSION, &refs);
+    let mut mcp = fx.mcp();
+    let mut args = rule("grep-ban-long", "Never run `git grep` in this repository.", Some("demo"));
+    args["targets"] = json!([{ "kind": "command", "value": "git grep" }]);
+    args["check_kind"] = json!("forbidden");
+    args["check_literals"] = json!(["git grep"]);
+    let reply = mcp.call("remember", args.clone());
+    assert!(reply.starts_with("REFUSED:") && reply.contains(way_on("majority")), "{reply}");
+    assert!(reply.contains("and 3 more"), "only five calls are shown, the rest counted: {reply}");
+    let first = reply.lines().next().unwrap().to_string();
+    assert_eq!(first.matches("git grep -n w").count(), 5, "{reply}");
+    // The check still runs against the full list: a call that was not shown is accepted.
+    let not_shown = calls.iter().find(|c| !first.contains(c.as_str())).expect("three calls are not shown");
+    args["accept_refusing"] = json!([not_shown]);
+    args["because"] = json!(WHY);
+    let reply = mcp.call("remember", args);
+    assert!(landed(&reply), "{reply}");
+}
+
 // ------------------------------------------------------------ needs the agent (retest)
 
 #[test]

@@ -553,9 +553,8 @@ fn r7b_11_a_check_refusing_most_real_calls_needs_the_agent() {
     let (code, message) = refusal(&fx.write(&item));
     assert_eq!(code, RefuseCode::Majority);
     assert!(message.contains("would refuse 6 of the 6 real calls"), "{message}");
-    for n in 0..6 {
-        assert!(message.contains(&format!("git grep -n pattern-{n} src")), "{message}");
-    }
+    assert_eq!(message.matches("git grep -n pattern-").count(), 5, "five calls are shown: {message}");
+    assert!(message.contains("and 1 more"), "{message}");
     assert!(message.contains("narrow the check") && message.contains("accept_refusing"), "{message}");
 
     let accept = Disputes { accept_refusing: vec!["git grep -n pattern-3 src".to_string()], ..Default::default() };

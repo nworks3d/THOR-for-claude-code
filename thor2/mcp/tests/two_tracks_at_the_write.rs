@@ -178,7 +178,7 @@ fn r8_4_a_check_refusing_most_real_calls_needs_the_writer_and_accept_refusing_ke
     let reply = mcp.call("remember", args.clone());
     println!("R8.4: {reply}");
     assert!(reply.starts_with("REFUSED: your check would refuse 6 of the 6 real calls it reaches in the log"), "{reply}");
-    assert!(reply.contains("'git push origin main'") && reply.contains("accept_refusing"), "{reply}");
+    assert!(reply.lines().next().unwrap().matches("'git push origin ").count() == 5 && reply.contains("and 1 more") && reply.contains("accept_refusing"), "{reply}");
     assert!(reply.contains("narrow the check"), "{reply}");
     // F4: the narrower tooth THOR built from the text is named with it.
     assert!(reply.contains("forbidden '--force' on 'git push' refuses 'git push --force'"), "{reply}");

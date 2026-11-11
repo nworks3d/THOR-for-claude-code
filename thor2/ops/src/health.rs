@@ -287,15 +287,15 @@ pub fn code_index_line(index_db: Option<&Path>, repo: Option<&Path>) -> String {
                 Err(e) => format!("code index: could not be checked ({e})"),
             }
         }
-        (None, None) => "code index: not configured".to_string(),
-        _ => "code index: not configured (pass both the index and the repository to check one)".to_string(),
+        (None, None) => "code index: not checked (name one with --index-db and --repo to check it)".to_string(),
+        _ => "code index: not checked (pass both --index-db and --repo to check one)".to_string(),
     }
 }
 
 /// Component 4: is a replica configured, and does it run level with us.
 pub fn replica_line(db: &Path, replica: Option<(&str, &str)>) -> String {
     let Some((base, token)) = replica else {
-        return "replica: not configured".to_string();
+        return "replica: not checked (name a copy with --to to check it)".to_string();
     };
     let store = match EventStore::open_existing(db) {
         Ok(s) => s,
@@ -2709,7 +2709,7 @@ pub fn teeth_line(db: &Path, full: bool) -> String {
     let evaluations = a4_only.div_ceil(A4_PER_EVALUATION);
     out.push(format!(
         "teeth rot: {} live rule(s) and orientation(s) have no current verdict from THOR's trial, whatever their \
-         weight - {rot_heavy} of them heavy (the plan's starting line: 306 heavy, 171 with neither); {a4_only} of \
+         weight - {rot_heavy} of them heavy; {a4_only} of \
          them owe only the A4 naming fix (at {A4_PER_EVALUATION} per evaluation: {evaluations} evaluation(s)). The \
          finish line is 0; each one is decided by `serve retest --id <id>`",
         rot.len()
@@ -5649,7 +5649,7 @@ mod tests {
 
     #[test]
     fn code_index_line_says_plainly_when_not_configured() {
-        assert_eq!(code_index_line(None, None), "code index: not configured");
+        assert_eq!(code_index_line(None, None), "code index: not checked (name one with --index-db and --repo to check it)");
     }
 
     #[test]
@@ -5657,7 +5657,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
         EventStore::new(&db).unwrap();
-        assert_eq!(replica_line(&db, None), "replica: not configured");
+        assert_eq!(replica_line(&db, None), "replica: not checked (name a copy with --to to check it)");
     }
 
     // --------------------------------------------------------------- ship
@@ -6559,7 +6559,7 @@ mod tests {
         }
         let line = teeth_line(&db, true);
         assert!(line.contains("teeth rot: 4 live rule(s) and orientation(s) have no current verdict"), "{line}");
-        assert!(line.contains("1 of them heavy (the plan's starting line: 306 heavy, 171 with neither)"), "{line}");
+        assert!(line.contains("1 of them heavy"), "{line}");
         assert!(line.contains("1 of them owe only the A4 naming fix (at 16 per evaluation: 1 evaluation(s))"), "{line}");
         assert!(line.contains("teeth verdicts: 0 proven and 0 wired on the rule track; 1 note(s)"), "{line}");
         assert!(line.contains("  undecided: rewritten [global] its text changed after its last trial"), "{line}");

@@ -612,6 +612,24 @@ impl Replay {
     }
 }
 
+/// How many refused calls a reply prints. One reply once listed every call and
+/// ran to about 54,000 characters, which made an evaluation void.
+const SHOWN_CALLS: usize = 5;
+
+/// The first few calls a check would refuse, quoted, then how many more there
+/// are. `accept_refusing` is still checked against the whole list, so a call
+/// that is not shown here is accepted too.
+fn shown_calls(listed: &[String]) -> String {
+    let mut out = listed.iter().take(SHOWN_CALLS).map(|c| format!("'{c}'")).collect::<Vec<_>>().join(", ");
+    if listed.len() > SHOWN_CALLS {
+        out.push_str(&format!(
+            " and {} more (not shown to keep this short; accept_refusing takes any call the check would refuse, shown or not)",
+            listed.len() - SHOWN_CALLS
+        ));
+    }
+    out
+}
+
 /// Replay a command check over the real calls its anchor reaches, through the
 /// hook's own pipeline. A forbidden check can only refuse a call carrying one
 /// of its literals, so a call without any is let through without running.
@@ -2250,7 +2268,7 @@ impl<'a> Work<'a> {
                             format!(
                                 "accept_refusing names {}, which is not one of the listed calls. Name one of: {}",
                                 bad.iter().map(|b| format!("'{b}'")).collect::<Vec<_>>().join(", "),
-                                listed.iter().map(|c| format!("'{c}'")).collect::<Vec<_>>().join(", ")
+                                shown_calls(&listed)
                             ),
                         );
                     }
@@ -2262,7 +2280,7 @@ impl<'a> Work<'a> {
                              least 20 characters saying why refusing them is right)",
                             listed.len(),
                             r.reached + r.refused_cut.len(),
-                            listed.iter().map(|c| format!("'{c}'")).collect::<Vec<_>>().join(", ")
+                            shown_calls(&listed)
                         );
                         // F4 (R8.4): when a tooth THOR builds from the rule's own
                         // text bites, name it too - it is the narrower check.
