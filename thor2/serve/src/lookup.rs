@@ -88,8 +88,20 @@ pub struct LiteralLeg {
     pub text_hits: Vec<LookupHit>,
     pub id_hits: Vec<LookupHit>,
     pub stem_hits: Vec<LookupHit>,
+    /// The id of the item whose whole id is the whole query (trimmed, any
+    /// case). That item goes first in every answer; it is the only hit that
+    /// may move ahead of the others.
+    pub first_id: Option<String>,
     /// Matches held back because their own expiry date has passed.
     pub withheld: usize,
+}
+
+/// Move the element with this id to the front, keeping the others in order.
+fn move_to_front<T>(items: &mut Vec<T>, id: Option<&str>, id_of: impl Fn(&T) -> &str) {
+    if let Some(at) = id.and_then(|id| items.iter().position(|x| id_of(x) == id)) {
+        let x = items.remove(at);
+        items.insert(0, x);
+    }
 }
 
 impl LiteralLeg {
@@ -99,6 +111,7 @@ impl LiteralLeg {
         let mut all = self.text_hits;
         all.extend(self.id_hits);
         all.extend(self.stem_hits);
+        move_to_front(&mut all, self.first_id.as_deref(), |h| h.id.as_str());
         all
     }
 
@@ -132,6 +145,8 @@ pub fn stem_match_note() -> &'static str {
 /// word shorter than `MIN_STEM_WORD_LETTERS` is never cut down to a stem.
 const MIN_ID_WORD_CHARS: usize = 4;
 const MIN_STEM_WORD_LETTERS: usize = 6;
+/// More stem hits than this and the whole stem step is dropped for the query.
+const MAX_STEM_HITS: usize = 10;
 
 /// How many leading letters of an `n`-letter word make its stem: all but the
 /// last three, and never fewer than five.
@@ -265,26 +280,42 @@ pub fn literal_leg(store: &EventStore, query: &str) -> LiteralLeg {
     let mut id_hits = Vec::new();
     let mut stem_hits = Vec::new();
     let mut withheld = 0;
+    let mut stem_expired = 0;
     for (i, hit) in candidates.into_iter().enumerate() {
-        let group = if in_text[i] {
-            &mut text_hits
+        let (group, expired_count) = if in_text[i] {
+            (&mut text_hits, &mut withheld)
         } else if in_id[i] {
-            &mut id_hits
+            (&mut id_hits, &mut withheld)
         } else if in_stem[i] {
-            &mut stem_hits
+            (&mut stem_hits, &mut stem_expired)
         } else {
             continue;
         };
         if is_expired(&hit.item, &today) {
-            withheld += 1;
+            *expired_count += 1;
         } else {
             group.push(hit);
         }
     }
+    // A stem step that came back wide is dropped whole, as if it had not run:
+    // its hits would stand before the meaning hits and push out hits that
+    // were shown before. Expired stem matches are dropped with it.
+    if stem_hits.len() + stem_expired > MAX_STEM_HITS {
+        stem_hits.clear();
+        stem_expired = 0;
+    }
+    withheld += stem_expired;
     for group in [&mut text_hits, &mut id_hits, &mut stem_hits] {
         group.sort_by(|a, b| a.id.cmp(&b.id));
     }
-    LiteralLeg { text_hits, id_hits, stem_hits, withheld }
+    let whole = q.trim();
+    let first_id = text_hits
+        .iter()
+        .chain(&id_hits)
+        .map(|h| h.id.as_str())
+        .find(|id| id.to_lowercase() == whole)
+        .map(str::to_string);
+    LiteralLeg { text_hits, id_hits, stem_hits, first_id, withheld }
 }
 
 // ------------------------------------------------------- surface 4: catalogue
@@ -1321,6 +1352,7 @@ pub fn search_best_effort_cached(
     // id hit the meaning leg already placed stays where it was placed.
     let placed: HashSet<String> = out.iter().map(|h| h.id.clone()).collect();
     out.extend(leg.id_hits.into_iter().filter(|h| !placed.contains(&h.id)));
+    move_to_front(&mut out, leg.first_id.as_deref(), |h| h.id.as_str());
     out
 }
 
@@ -1484,6 +1516,8 @@ pub fn explain_best_effort(
     for hit in id_only {
         hits.push(ExplainedHit { id: hit.id, item: hit.item, literal: true, similarity: None });
     }
+
+    move_to_front(&mut hits, leg.first_id.as_deref(), |h| h.id.as_str());
 
     let target = explain_id.map(|id| {
         if lit_order.iter().any(|x| x == id) || id_only_ids.contains(id) {
@@ -2162,6 +2196,36 @@ mod tests {
         let leg = literal_leg(&db, "checks release");
         assert_eq!(leg.withheld, 1);
         assert!(leg.stem_hits.is_empty() && leg.text_hits.is_empty());
+    }
+
+    #[test]
+    fn a_query_equal_to_a_whole_id_puts_that_item_first() {
+        let mut db = id_store();
+        // Text hits that sort before the id and hold the id as a phrase.
+        store::declare(&mut db, "s", "l", "a", &item("aaa-note", Kind::Report, "see a-0123456789abcdef for details", None)).unwrap();
+        let hits = search(&db, "A-0123456789ABCDEF");
+        assert_eq!(ids(&hits), ["a-0123456789abcdef", "aaa-note"]);
+        let hits = search(&db, "  watering-schedule-tomatoes ");
+        assert_eq!(hits[0].id, "watering-schedule-tomatoes");
+    }
+
+    fn stem_store(n: usize) -> EventStore {
+        let mut db = EventStore::in_memory().unwrap();
+        for i in 0..n {
+            let text = format!("Checking happens before the release number {i}");
+            store::declare(&mut db, "s", "l", "a", &item(&format!("n{i:02}"), Kind::Report, &text, None)).unwrap();
+        }
+        db
+    }
+
+    #[test]
+    fn a_stem_step_with_ten_hits_is_kept_and_with_eleven_is_dropped() {
+        let kept = literal_leg(&stem_store(10), "checkings release");
+        assert_eq!(kept.stem_hits.len(), 10);
+        assert!(kept.stem_only());
+        let dropped = literal_leg(&stem_store(11), "checkings release");
+        assert!(dropped.stem_hits.is_empty() && !dropped.found_any() && dropped.withheld == 0);
+        assert!(search(&stem_store(11), "checkings release").is_empty());
     }
 
     #[test]

@@ -7031,6 +7031,7 @@ fn render_search_reply(
     kinds: &[Kind],
     unfiltered_count: usize,
     literal_found_any: bool,
+    stems_only: bool,
     withheld: usize,
 ) -> String {
     let mut out = String::new();
@@ -7061,6 +7062,12 @@ fn render_search_reply(
         // comment).
         if let Some(note) = lookup::meaning_only_note(literal_found_any) {
             out.push_str(note);
+            out.push('\n');
+        }
+        // The literal hits stand on word stems alone - the same one line the
+        // agent's lookup tool gives.
+        if stems_only {
+            out.push_str(lookup::stem_match_note());
             out.push('\n');
         }
     }
@@ -7148,11 +7155,12 @@ fn build_search_reply(
     explain: bool,
     explain_id: Option<&str>,
 ) -> String {
-    let (literal_hits, withheld) = lookup::search_with_expired(store, query);
+    let leg = lookup::literal_leg(store, query);
+    let (withheld, literal_found_any, stems_only) = (leg.withheld, leg.found_any(), leg.stem_only());
     let hits = lookup::search_best_effort(store, vectors_path, None, query);
     let unfiltered_count = hits.len();
     let hits = lookup::only_kinds(hits, kinds);
-    let mut out = render_search_reply(&hits, query, kinds, unfiltered_count, !literal_hits.is_empty(), withheld);
+    let mut out = render_search_reply(&hits, query, kinds, unfiltered_count, literal_found_any, stems_only, withheld);
     if explain || explain_id.is_some() {
         let explanation = lookup::explain_best_effort(store, vectors_path, None, query, explain_id);
         out.push_str(&render_explain_block(&explanation, &hits, explain, explain_id));
