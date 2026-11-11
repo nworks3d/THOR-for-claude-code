@@ -765,6 +765,8 @@ fn a_report_written_past_the_gate_does_not_count_at_the_stop() {
     let v: Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("expected a block: {e}: {out}"));
     assert_eq!(v["decision"], "block", "{out}");
     let reason = v["reason"].as_str().unwrap();
+    // An evaluation with nothing on its lists says so first; the dead report follows.
+    let reason = reason.split_once("\n\n").map_or(reason, |(_, rest)| rest);
     assert!(
         reason.starts_with(&format!(
             "[THOR] The report '{REPORT}' is on file but does not count as this project's evaluation: not filed through an \

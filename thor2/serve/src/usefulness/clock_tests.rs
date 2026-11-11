@@ -298,3 +298,52 @@ fn an_open_thor_bug_candidate_is_rot_until_it_is_reported() {
     std::fs::write(db.parent().unwrap().join(crate::thor_bugs::FILE), serde_json::to_string(&book).unwrap()).unwrap();
     assert_eq!(crate::eval_filing::project_rot(&store, "fxp"), None, "reported: the rot is gone");
 }
+
+// ------------------------------------------------- debt an evaluation can be handed
+
+/// `id` served to the assistant in session `session`.
+fn serve_to(store: &mut EventStore, session: &str, id: &str) {
+    let at = crate::time::iso8601_from_unix(crate::time::now_unix());
+    crate::deliver::record_delivery_with_trigger(store, session, session, ASSISTANT_DELIVERY_ACTOR, &at, &[id.to_string()], None);
+}
+
+/// A verdict debt that fired nowhere since the project's last counting
+/// evaluation started keeps no project on the daily rhythm: no evaluation can
+/// be handed it. One that fired only in sessions that never touched the
+/// project is no better. One that fired in a session of the project is rot.
+#[test]
+fn debt_nobody_can_be_handed_is_not_rot() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let root = tempfile::tempdir().unwrap();
+    let mut store = EventStore::new(&db).unwrap();
+    let mut global = rule("fx-global", "fxp");
+    global.project = None;
+    model::store::declare(&mut store, "fixture", "fixture", "fixture", &global).unwrap();
+    let mut anchor = rule("fx-anchor", "fxp");
+    anchor.kind = Kind::Report;
+    anchor.bindings = vec![];
+    anchor.falsifier = None;
+    model::store::declare(&mut store, "fixture", "fixture", "fixture", &anchor).unwrap();
+    for i in 0..model::store::JUDGEMENT_DEBT_AFTER {
+        serve_to(&mut store, &format!("old-{i}"), "fx-global");
+    }
+    valid_evaluation(&mut store, root.path(), "fxp", 2);
+    let owed = judgement_debt_named(&store, Some("fxp"));
+    assert_eq!(owed.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(), vec!["fx-global"], "fixture sanity: the debt is owed");
+    assert_eq!(crate::eval_filing::project_rot(&store, "fxp"), None, "dormant debt: not rot");
+
+    for i in 0..3 {
+        serve_to(&mut store, &format!("elsewhere-{i}"), "fx-global");
+    }
+    assert_eq!(crate::eval_filing::project_rot(&store, "fxp"), None, "fired only in sessions that never touched the project: not rot");
+
+    serve_to(&mut store, "elsewhere-1", "fx-anchor");
+    assert_eq!(
+        crate::eval_filing::project_rot(&store, "fxp"),
+        Some("1 item(s) owe a verdict".to_string()),
+        "fired in a session of the project since the evaluation: an evaluation can be handed it"
+    );
+    // doctor's own count is untouched by the narrower rot test
+    assert_eq!(judgement_debt_counts(&store, Some("fxp")).1, 1);
+}

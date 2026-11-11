@@ -8,6 +8,12 @@ no prior knowledge for this: everything is below. Do not skip a step because
 it seems like there is "nothing to report" - write "nothing" for that step
 explicitly instead. An empty step is a finding; a skipped step is a gap.
 
+If the first line of the start note THOR shows you says that NOTHING IS ON THIS
+EVALUATION'S LISTS, you do not need the rest of this file: file the report with
+the one call that line gives (a report of one or two plain sentences, through
+the THOR tool; THOR writes the machine section itself) and the evaluation is
+done.
+
 Invent nothing. If a step turned up nothing, say so. A made-up finding costs
 more than a missed one.
 
@@ -86,8 +92,10 @@ A report that counts covers the next 7 days. On a smaller plan (Pro and
 anything below Max, or a plan THOR could not read) that is strict: the next ask
 comes after a week, whatever is found. On Max it is the same week, but a day
 (24 hours) while the project shows rot: a defect found, a false-block sweep
-hit, a batch or dispute item left owed, a report that did not count, or a THOR
-bug candidate waiting; it goes back to weekly the first time a counting
+hit, a batch or dispute item left owed, a report that did not count, a rule owed
+a verdict that was shown in a session of the project since the last evaluation
+started (a debt that fired nowhere since then is on no list, so it is not rot),
+or a THOR bug candidate waiting; it goes back to weekly the first time a counting
 evaluation finds none of that. The ask says in one line which mode applies and
 why. Do not try to run this routine more often than the ask: nothing is gained.
 

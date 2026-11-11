@@ -75,12 +75,57 @@ pub fn render(items: &[RankedItem]) -> Option<String> {
 /// 9,500, which left about one pinned rule of slack on a full block.
 pub const HOOK_OUTPUT_LIMIT_BYTES: usize = 9_800;
 
-/// The one line that says how many standing rules were left out. Printed
-/// whenever anything is cut, never otherwise.
-fn not_fit_note(hidden: usize) -> String {
-    format!(
-        "[THOR] {hidden} more standing rule(s) did not fit in this block and are not shown. Look them up with the lookup tool when something you are about to do may be covered."
-    )
+/// The most bytes of rule ids the "did not fit" line names. The rest is
+/// counted ("and N more"). Nothing may be crowded out silently, and the line
+/// comes out of the same budget as the rules.
+pub const HIDDEN_IDS_ALLOWANCE: usize = 400;
+
+/// A rule that did not fit: its id, and whether `Always` is its only binding.
+/// Such a rule is reachable nowhere else (no command, file or moment brings it
+/// back), so the line names those first.
+struct Hidden<'a> {
+    id: &'a str,
+    only_always: bool,
+}
+
+/// The one line that says which standing rules were left out: the ones bound
+/// to nothing but `Always` first, then the others, at most
+/// `HIDDEN_IDS_ALLOWANCE` bytes of ids, then "and N more". Printed whenever
+/// anything is cut, never otherwise.
+fn not_fit_note(hidden: &[Hidden]) -> String {
+    let mut named_only_always: Vec<&str> = Vec::new();
+    let mut named_others: Vec<&str> = Vec::new();
+    let mut used = 0;
+    let in_order = hidden.iter().filter(|h| h.only_always).chain(hidden.iter().filter(|h| !h.only_always));
+    for h in in_order {
+        let cost = h.id.len() + if used == 0 { 0 } else { 2 };
+        if used + cost > HIDDEN_IDS_ALLOWANCE {
+            break;
+        }
+        used += cost;
+        match h.only_always {
+            true => named_only_always.push(h.id),
+            false => named_others.push(h.id),
+        }
+    }
+    let rest = hidden.len() - named_only_always.len() - named_others.len();
+    let mut note = format!("[THOR] {} more standing rule(s) did not fit in this block and are not shown.", hidden.len());
+    if !named_only_always.is_empty() {
+        note.push_str(&format!(
+            " These are bound to nothing but 'always', so nothing else brings them back: {}.",
+            named_only_always.join(", ")
+        ));
+    }
+    if !named_others.is_empty() {
+        note.push_str(&format!(" Also not shown: {}.", named_others.join(", ")));
+    }
+    if rest > 0 {
+        note.push_str(&format!(" And {rest} more."));
+    }
+    note.push_str(
+        " Open one with the get tool (give it the id), or use the lookup tool when something you are about to do may be covered.",
+    );
+    note
 }
 
 /// What `render_within` put in the block.
@@ -90,6 +135,9 @@ pub struct Rendered {
     pub shown: Vec<String>,
     /// How many standing rules did not fit and are not in `text`.
     pub hidden: usize,
+    /// The ids of those rules: the ones bound to nothing but `Always` first,
+    /// then the others, each in block order.
+    pub hidden_ids: Vec<String>,
 }
 
 /// The standing-rules block, kept within `budget` bytes. Nothing is cut in the
@@ -146,26 +194,190 @@ pub fn render_within_ranked(
     let lines: Vec<String> = ordered.iter().map(|r| format!("- [{}] {}", r.id, r.item.text)).collect();
     let head_len: usize = head.iter().map(|l| l.len() + 1).sum();
     let all_len: usize = head_len + lines.iter().map(|l| l.len() + 1).sum::<usize>();
-    // The note's own room, measured with the widest count it can carry.
-    let note_reserve = not_fit_note(ordered.len()).len() + 1;
-    let room = if all_len <= budget { usize::MAX } else { budget.saturating_sub(note_reserve) };
-
+    // The note names the rules it hides, so its length depends on which rules
+    // those are, and which are hidden depends on the room the note leaves.
+    // Place the rules in `room`, write the note for what did not fit, and if
+    // rules plus note are over the budget take the excess off the room and
+    // place again. The room only ever shrinks, so this ends; the block is never
+    // over `budget`, and `hidden` is what really is not in it.
+    let mut room = if all_len <= budget { usize::MAX } else { budget };
+    let (shown_at, note) = loop {
+        let mut used = head_len;
+        let mut shown_at: Vec<usize> = Vec::new();
+        for (at, line) in lines.iter().enumerate() {
+            if used.saturating_add(line.len() + 1) > room {
+                continue;
+            }
+            used += line.len() + 1;
+            shown_at.push(at);
+        }
+        if shown_at.len() == ordered.len() {
+            break (shown_at, None);
+        }
+        let hidden: Vec<Hidden> = (0..ordered.len())
+            .filter(|at| !shown_at.contains(at))
+            .map(|at| Hidden {
+                id: &ordered[at].id,
+                only_always: ordered[at].item.bindings.iter().all(|b| matches!(b, Binding::Always)),
+            })
+            .collect();
+        let note = not_fit_note(&hidden);
+        let total = used + note.len() + 1;
+        if total <= budget || shown_at.is_empty() {
+            break (shown_at, Some((note, hidden)));
+        }
+        room = used - (total - budget);
+    };
     let mut out = head;
     let mut shown = Vec::new();
-    let mut used = head_len;
-    for (ranked, line) in ordered.iter().zip(lines) {
-        if used.saturating_add(line.len() + 1) > room {
-            continue;
+    for at in &shown_at {
+        shown.push(ordered[*at].id.clone());
+        out.push(lines[*at].clone());
+    }
+    let (hidden, hidden_ids) = match note {
+        Some((note, hidden)) => {
+            out.push(note);
+            let first = hidden.iter().filter(|h| h.only_always).chain(hidden.iter().filter(|h| !h.only_always));
+            (hidden.len(), first.map(|h| h.id.to_string()).collect())
         }
-        used += line.len() + 1;
-        shown.push(ranked.id.clone());
-        out.push(line);
+        None => (0, Vec::new()),
+    };
+    Some(Rendered { text: out.join("\n"), shown, hidden, hidden_ids })
+}
+
+/// How many days back "fired in this project lately" looks, for the ranking of
+/// the session start block.
+pub const RECENT_FACTS_DAYS: i64 = 14;
+
+/// The ids shown in this project's own sessions in the last `RECENT_FACTS_DAYS`
+/// days (`render_within_ranked` puts them first). Empty without a project.
+pub fn recent_in_project(db: &std::path::Path, project: Option<&str>, now_unix: i64) -> std::collections::BTreeSet<String> {
+    let Some(project) = project else { return Default::default() };
+    let from = now_unix - RECENT_FACTS_DAYS * 86_400;
+    let sessions = crate::usefulness::sessions_of_project_since(db, project, from);
+    crate::volume::shown_in_sessions_since(db, &sessions, from)
+}
+
+/// The standing-rules block an interactive session start in `project` would
+/// build, with the other lines a start carries (`start_extras`) taking room: the same
+/// selection, the same ranking and the same fitting as the hook, so doctor and
+/// the session start can never disagree about which rules do not fit. `None`
+/// when no standing rule applies.
+pub fn render_for_project(
+    store: &thor_core::event_store::EventStore,
+    db: &std::path::Path,
+    project: Option<&str>,
+    now_unix: i64,
+) -> Option<Rendered> {
+    let candidates = crate::live::always_candidates(store);
+    let decay = crate::decay::DecayContext::load(store);
+    let (items, _) = split_for_session_start(crate::decay::retain_live(select(&candidates, project), &decay), false);
+    let recent = recent_in_project(db, project, now_unix);
+    // The lines a real start adds take room too; nothing is recorded or started.
+    let extras = start_extras(
+        store,
+        db,
+        project,
+        &ExtrasFor { source: Some("startup"), headless: false, subagent: false, record: false, copy: thor_core::copy_mode::is_copy(db), refresh_copy: false },
+    );
+    let extras_len: usize = extras.iter().map(|e| e.len() + 2).sum();
+    render_within_ranked(&items, HOOK_OUTPUT_LIMIT_BYTES.saturating_sub(extras_len), &recent)
+}
+
+/// What decides which extra lines a session start carries.
+pub struct ExtrasFor<'a> {
+    /// The payload's `source` ("startup", "resume", "compact", ...).
+    pub source: Option<&'a str>,
+    pub headless: bool,
+    pub subagent: bool,
+    /// Whether a notice shown now is recorded as shown (`serve::notices`).
+    pub record: bool,
+    /// The store is a read-only copy of another machine's memory.
+    pub copy: bool,
+    /// Whether a due refresh of a copy is started in the background (the
+    /// hook does; doctor only measures).
+    pub refresh_copy: bool,
+}
+
+/// Every line a session start carries besides the standing rules, in the order
+/// they follow them: the copy line, the compaction reminder, the registration
+/// notice, the open points, a missing program, the work folders and a copy that
+/// does not answer. The hook subtracts their size from the rules' room, and
+/// doctor does the same through this one function, so doctor reports what a
+/// real start hides.
+pub fn start_extras(
+    store: &thor_core::event_store::EventStore,
+    db: &std::path::Path,
+    project: Option<&str>,
+    f: &ExtrasFor,
+) -> Vec<String> {
+    let now = crate::time::now_unix();
+    let reminder = compact_reminder(f.source, f.subagent);
+    // One line, for seven days after this project's working copy was
+    // registered or moved (`project::registration_notice`), at most once a day
+    // per project. Neither it nor the open points reach a headless session.
+    let registration = crate::project::registration_notice(store, project, now)
+        .filter(|_| !f.headless && crate::notices::due(db, project.unwrap_or(""), "registration", now, f.record));
+    let open_points = (!f.subagent && !f.headless)
+        .then(|| open_points_session_start_note(store, project, &|p| crate::notices::due(db, p, "open-points", now, f.record)))
+        .flatten();
+    let copy_line = (f.copy && !f.subagent).then(|| {
+        let marker = thor_core::copy_mode::read_marker(db);
+        if f.refresh_copy && thor_core::copy_mode::pull_due(&marker, now) {
+            thor_core::copy_mode::spawn_pull(db);
+        }
+        thor_core::copy_mode::session_line_with(&marker, crate::copy_eval::connector_configured(db))
+    });
+    let missing_program = (!f.subagent).then(|| crate::missing_programs::session_line(db)).flatten();
+    let work_folders = match f.subagent {
+        true => Vec::new(),
+        false => crate::work_folders::session_start_lines(
+            db,
+            now,
+            !f.headless,
+            f.record,
+            crate::work_folders::HOOK_READ_LIMIT,
+            &crate::work_folders::READERS,
+        )
+        .into_lines(),
+    };
+    let replica_down = (!f.subagent).then(|| crate::replica_reach::down_line(db)).flatten();
+    [copy_line, reminder, registration, open_points, missing_program, replica_down]
+        .into_iter()
+        .flatten()
+        .chain(work_folders)
+        .collect()
+}
+
+/// This project's own open points (`model::store::open_points`), as ONE line
+/// at `SessionStart`: how many there are, and that they are the owner's
+/// (step 27). Field test 3 (2026-10-01): the list of them - THOR's own, legacy
+/// ones that "settle nothing", and a stale text that still said "the owner
+/// decides" - was put in front of every agent at every start, and an agent can
+/// do nothing about any of them. Their texts are no longer injected; `doctor`
+/// and `lookup` have them. `None` when the project has none open.
+///
+/// OVER THE OWNER'S BUDGET (step 16, B6): when more of THOR's own points of
+/// the project wait on the owner (`model::store::owner_queue`) than
+/// `model::store::OPEN_POINTS_OWNER_BUDGET`, the line is preceded by the
+/// banner that says so. Nothing is refused over it. The call site never
+/// shows this to a subagent.
+fn open_points_session_start_note(store: &thor_core::event_store::EventStore, project: Option<&str>, line_is_due: &dyn Fn(&str) -> bool) -> Option<String> {
+    let points = model::store::open_points(store, project);
+    if points.is_empty() {
+        return None;
     }
-    let hidden = ordered.len() - shown.len();
-    if hidden > 0 {
-        out.push(not_fit_note(hidden));
+    let queue = project.map(|p| model::store::owner_queue(store, p)).unwrap_or_default();
+    let mut lines: Vec<String> = project.and_then(|p| model::store::owner_queue_banner(p, queue.len())).into_iter().collect();
+    // The count line is shown once a day per project (`serve::notices`); the
+    // banner above it, when the owner's budget is over, is shown every time.
+    if line_is_due(project.unwrap_or("")) {
+        lines.push(format!(
+            "[THOR] {} open point(s) in this project are the owner's to read, not a task for this session (doctor lists them).",
+            points.len()
+        ));
     }
-    Some(Rendered { text: out.join("\n"), shown, hidden })
+    (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
 /// A fact tagged this way is written for the owner's interactive chat (he
@@ -771,5 +983,88 @@ mod tests {
         let (kept, left_out) = split_for_session_start(all, false);
         assert_eq!(kept.len(), 16, "an interactive session is not capped");
         assert!(left_out.global_capped.is_empty());
+    }
+
+    // ------------------------------------------ naming the rules that did not fit
+
+    /// The count the "did not fit" line states, or `None` without the line.
+    fn stated_hidden(text: &str) -> Option<usize> {
+        let line = text.lines().find(|l| l.contains("did not fit"))?;
+        line.trim_start_matches("[THOR] ").split(' ').next()?.parse().ok()
+    }
+
+    /// A few rules hidden: every id is named, the ones bound to nothing but
+    /// 'always' first, and the reader is told how to open one.
+    #[test]
+    fn a_few_hidden_rules_are_named_with_the_always_only_ones_first() {
+        let mut all = many(40, 280);
+        // The lightest ids come last in block order; give two of the hidden
+        // ones a second binding so they can be told apart.
+        for c in all.iter_mut().filter(|c| c.id == "id-037" || c.id == "id-038") {
+            c.item.bindings.push(Binding::Target { kind: TargetKind::Command, value: "git".to_string() });
+        }
+        let items = select(&all, None);
+        let r = render_within(&items, HOOK_OUTPUT_LIMIT_BYTES).unwrap();
+        assert!(r.hidden > 0 && r.hidden < 10, "fixture: a few hidden, got {}", r.hidden);
+        let note = r.text.lines().last().unwrap();
+        assert!(note.starts_with(&format!("[THOR] {} more standing rule(s) did not fit", r.hidden)), "{note}");
+        for id in &r.hidden_ids {
+            assert!(note.contains(id.as_str()), "{id} must be named: {note}");
+        }
+        assert!(note.contains("get tool"), "{note}");
+        assert!(!note.contains("more."), "all are named, so no 'and N more': {note}");
+        let first_other = r.hidden_ids.iter().position(|id| id == "id-037" || id == "id-038");
+        if let Some(at) = first_other {
+            let only_always_before = r.hidden_ids[..at].iter().all(|id| id != "id-037" && id != "id-038");
+            assert!(only_always_before, "the always-only ones come first: {:?}", r.hidden_ids);
+            assert!(note.find("bound to nothing but 'always'").unwrap() < note.find("Also not shown").unwrap(), "{note}");
+        }
+    }
+
+    /// Many hidden: the ids stay inside the allowance, the rest is counted, and
+    /// the block still fits.
+    #[test]
+    fn many_hidden_rules_are_named_up_to_the_allowance_and_the_rest_counted() {
+        let items = select(&many(150, 100), None);
+        let r = render_within(&items, HOOK_OUTPUT_LIMIT_BYTES).unwrap();
+        assert!(r.hidden > 60, "fixture: many hidden, got {}", r.hidden);
+        assert!(r.text.len() <= HOOK_OUTPUT_LIMIT_BYTES, "{} bytes", r.text.len());
+        let note = r.text.lines().last().unwrap();
+        let named = r.hidden_ids.iter().filter(|id| note.contains(id.as_str())).count();
+        assert!(named < r.hidden, "not all fit in the allowance");
+        assert!(named * "id-000".len() + named.saturating_sub(1) * 2 <= HIDDEN_IDS_ALLOWANCE, "{named} ids named");
+        assert!(note.contains(&format!(" And {} more.", r.hidden - named)), "{note}");
+        assert_eq!(stated_hidden(&r.text), Some(r.hidden));
+        assert_eq!(r.shown.len() + r.hidden, 150);
+    }
+
+    /// A store where everything fits prints no such line.
+    #[test]
+    fn nothing_hidden_means_no_line_and_no_ids() {
+        let items = select(&many(10, 100), None);
+        let r = render_within(&items, HOOK_OUTPUT_LIMIT_BYTES).unwrap();
+        assert_eq!((r.hidden, r.hidden_ids.len()), (0, 0));
+        assert!(!r.text.contains("did not fit"));
+    }
+
+    /// The limit holds for every number of rules from 0 to 200, at several
+    /// rule sizes, and the count the line states is the count really hidden.
+    #[test]
+    fn the_byte_limit_holds_for_every_number_of_rules_from_0_to_200() {
+        for len in [20, 100, 280] {
+            for n in 0..=200 {
+                let items = select(&many(n, len), None);
+                let Some(r) = render_within(&items, HOOK_OUTPUT_LIMIT_BYTES) else {
+                    assert_eq!(n, 0);
+                    continue;
+                };
+                assert!(r.text.len() <= HOOK_OUTPUT_LIMIT_BYTES, "n {n} len {len}: {} bytes", r.text.len());
+                assert_eq!(r.shown.len() + r.hidden, n, "n {n} len {len}");
+                assert_eq!(r.hidden_ids.len(), r.hidden);
+                assert_eq!(stated_hidden(&r.text), (r.hidden > 0).then_some(r.hidden), "n {n} len {len}");
+                let in_text = r.text.lines().filter(|l| l.starts_with("- [")).count();
+                assert_eq!(in_text, r.shown.len(), "n {n} len {len}: shown is what is in the block");
+            }
+        }
     }
 }

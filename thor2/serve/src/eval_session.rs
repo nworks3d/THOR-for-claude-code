@@ -1360,8 +1360,55 @@ pub fn lists_cut(id: &str, frozen: &Frozen, budget: usize) -> Vec<&'static str> 
     cut
 }
 
+/// Whether the evaluation has nothing on any of its lists: THOR has finished
+/// deciding, and there is no item to judge, no batch, no A4 list, no dispute,
+/// no sweep item or probable false block, no crowded place, no open point, and
+/// no hook failure or version skew to report. Such an evaluation is filed at
+/// once with a one-line report.
+pub fn nothing_to_do(frozen: &Frozen) -> bool {
+    let Some(machine) = frozen.machine.as_ref().filter(|_| frozen.decided()) else { return false };
+    let quiet_signals = machine.signals.as_ref().map_or(true, |s| {
+        s.sweep.is_empty()
+            && s.false_blocks.is_empty()
+            && s.hook_failures == 0
+            && s.skew_events == 0
+            && s.host_wide_failures == 0
+    });
+    frozen.judgement.is_empty()
+        && frozen.batch().is_empty()
+        && frozen.a4_list().is_empty()
+        && frozen.dispute_list().is_empty()
+        && frozen.outranked.is_empty()
+        && frozen.open_points.is_empty()
+        && machine.points.is_empty()
+        && quiet_signals
+}
+
+/// The first line of the Stop ask and of the start note when `nothing_to_do`:
+/// says so, gives the one call that files the report at once, and says the
+/// routine file does not have to be read for it. `None` when something is on
+/// a list. The guarantees stay: the report is filed with the THOR tool, THOR
+/// writes the machine section itself, and the turn is held until a report that
+/// counts is on file.
+pub fn nothing_to_do_line(frozen: &Frozen) -> Option<String> {
+    if !nothing_to_do(frozen) {
+        return None;
+    }
+    let date: String = crate::time::iso8601_from_unix(frozen.started_unix).chars().take(10).collect();
+    let project = &frozen.project;
+    Some(format!(
+        "[THOR] NOTHING IS ON THIS EVALUATION'S LISTS (no item to judge, no teeth batch, no A4 list, no dispute, no sweep item, \
+         no crowded place, no open point), so you do not have to read the routine file for it. File the report at once with \
+         the THOR tool: mcp__thor__remember(id: \"eval-{project}-{date}\", kind: \"report\", project: \"{project}\", \
+         tags: [\"evaluation-report\"], text: \"<one or two plain sentences: nothing was on the lists, so nothing was judged \
+         or repaired>\"). THOR writes the machine section of the report itself, and the turn cannot end until a report \
+         that counts is on file."
+    ))
+}
+
 fn render_note(id: &str, frozen: &Frozen, caps: &Caps) -> String {
-    let mut out = format!(
+    let mut out = nothing_to_do_line(frozen).map(|line| format!("{line}\n\n")).unwrap_or_default();
+    out.push_str(&format!(
         "[THOR] The evaluation of '{}' started at log position {} ({}, {}; THOR's record '{id}'). The lists its report \
          is held to are fixed now: nothing that fires or is written later joins them, and nothing that fired only in \
          another session is on them.",
@@ -1369,7 +1416,7 @@ fn render_note(id: &str, frozen: &Frozen, caps: &Caps) -> String {
         frozen.started_seq,
         frozen.started_by,
         crate::time::iso8601_from_unix(frozen.started_unix)
-    );
+    ));
 
     out.push_str("\n\n1. JUDGEMENT - ");
     if frozen.judgement.is_empty() {
@@ -1883,6 +1930,23 @@ pub fn start_note_after(start: &EvaluationStart, in_front: usize) -> String {
     render_start_note_within(&start.id, &start.frozen, START_NOTE_BUDGET.saturating_sub(in_front))
 }
 
+/// The Stop ask with the start note beside it. When the evaluation has
+/// nothing on its lists (`nothing_to_do_line`), that line comes FIRST, in front
+/// of the ask, and is not repeated at the top of the note.
+pub fn ask_with_note(ask: &str, start: &EvaluationStart) -> String {
+    let front = nothing_to_do_line(&start.frozen);
+    let in_front = ask.len() + front.as_ref().map_or(0, |l| l.len() + 2) + 2;
+    let note = start_note_after(start, in_front);
+    let note = match &front {
+        Some(line) => note.strip_prefix(&format!("{line}\n\n")).unwrap_or(&note).to_string(),
+        None => note,
+    };
+    match front {
+        Some(line) => format!("{line}\n\n{ask}\n\n{note}"),
+        None => format!("{ask}\n\n{note}"),
+    }
+}
+
 /// What the session is told when it opens the routine while an evaluation
 /// of `project` is already open: where, since when, and - when it is this
 /// session's own - the start note again.
@@ -2048,7 +2112,7 @@ mod tests {
         let item = model::store::show(&store, "evaluation-start-acme-demo-3").unwrap();
         assert_eq!(item.kind, Kind::Report);
         assert_eq!(item.tags, vec![model::store::EVALUATION_START_TAG.to_string()]);
-        assert!(item.text.starts_with("[THOR] The evaluation of 'Acme Demo' started at log position 3"), "{}", item.text);
+        assert!(item.text.contains("[THOR] The evaluation of 'Acme Demo' started at log position 3"), "{}", item.text);
     }
 
     /// A second start signal - the Stop hook asking again on the next turn,
@@ -2499,5 +2563,50 @@ mod tests {
         assert!(fresh.fresh, "the next signal starts a fresh evaluation: {fresh:?}");
         assert_ne!(fresh.start.id, started.start.id);
         assert!(fresh.start.frozen.started_seq > started.start.frozen.started_seq);
+    }
+
+    /// An evaluation with nothing on its lists says so in its first line, in
+    /// the start note and in the Stop ask, gives the one call that files the
+    /// report, and says the routine file need not be read. With anything on a
+    /// list the line is absent.
+    #[test]
+    fn an_evaluation_with_empty_lists_says_so_first_and_gives_the_filing_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, mut store) = store_with_events(dir.path(), 3);
+        let started = start(&db, &mut store, "sess", "Acme Demo", "stop-ask").unwrap();
+        let frozen = &started.start.frozen;
+        assert!(nothing_to_do(frozen), "fixture sanity: an empty store has nothing to do");
+        let line = nothing_to_do_line(frozen).expect("the line");
+        for part in [
+            "NOTHING IS ON THIS EVALUATION'S LISTS",
+            "do not have to read the routine file",
+            "mcp__thor__remember(id: \"eval-Acme Demo-",
+            "kind: \"report\"",
+            "project: \"Acme Demo\"",
+            "tags: [\"evaluation-report\"]",
+            "one or two plain sentences",
+            "THOR writes the machine section",
+            "the turn cannot end until a report that counts is on file",
+        ] {
+            assert!(line.contains(part), "missing {part:?} in {line}");
+        }
+        let note = start_note(&started.start);
+        assert!(note.starts_with(&line), "the start note opens with it: {note}");
+        let ask = ask_with_note("[THOR] The ask.", &started.start);
+        assert!(ask.starts_with(&line), "the Stop ask opens with it: {ask}");
+        assert_eq!(ask.matches("NOTHING IS ON THIS EVALUATION'S LISTS").count(), 1, "said once: {ask}");
+        assert!(ask.contains("[THOR] The ask.") && ask.contains("1. JUDGEMENT"), "the ask and the lists stay: {ask}");
+
+        // Anything on a list takes the line away.
+        let mut judged = frozen.clone();
+        judged.judgement.push("some-rule".to_string());
+        assert!(nothing_to_do_line(&judged).is_none());
+        assert!(!start_note_after(&EvaluationStart { frozen: judged.clone(), ..started.start.clone() }, 0).contains("NOTHING IS ON"));
+        let mut crowded = frozen.clone();
+        crowded.open_points.push("legacy-point".to_string());
+        assert!(!nothing_to_do(&crowded));
+        let mut undecided = frozen.clone();
+        undecided.batch = None;
+        assert!(!nothing_to_do(&undecided), "while THOR is still deciding nothing is claimed");
     }
 }

@@ -1079,10 +1079,17 @@ fn on_max_rot_brings_the_ask_back_after_a_day() {
     let project_dir = sandbox.project_dir("thor-fixture");
 
     let mut store = EventStore::new(&db).unwrap();
-    declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
+    let owed = declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
     drop(store);
     serve::plan::write(&db, serve::plan::Plan::Max, serve::plan::PlanSource::Confirmed).unwrap();
     seed_valid_report(&db, "thor-fixture", serve::time::now_unix() - 2 * 86400, "eval-thor-fixture-covering");
+    // The debt is rot only while an evaluation can still be handed it: the
+    // items are shown again in a session of the project after the report.
+    let mut store = EventStore::open_existing(&db).unwrap();
+    for id in &owed {
+        serve::deliver::record_delivery(&mut store, "after-report", "fixture", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-11-10T00:00:00Z", &[id.clone()]);
+    }
+    drop(store);
     seed_session_work(&db, Some("thor-fixture"), "s1", 61);
     let out = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
     let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("Max with rot must be asked after a day: {e}: {out}"));
@@ -1510,6 +1517,9 @@ fn a_report_written_past_the_gate_does_not_count() {
     let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("expected a block: {e}: {out}"));
     assert_eq!(v["decision"], "block", "{out}");
     let reason = v["reason"].as_str().unwrap();
+    // An evaluation with nothing on its lists says so first (the filing call
+    // follows); the dead report is named right behind it.
+    let reason = reason.split_once("\n\n").map_or(reason, |(_, rest)| rest);
     assert!(
         reason.starts_with(
             "[THOR] The report 'eval-thor-fixture-2026-09-28' is on file but does not count as this project's evaluation: not \

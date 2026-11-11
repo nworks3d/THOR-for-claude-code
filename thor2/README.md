@@ -254,8 +254,10 @@ per project and not per folder, when:
   evaluation per week per project: a valid report covers the next 7 days on a
   smaller plan, strictly, and on Max the next 7 days too but only 24 hours while
   the project shows rot - a defect found, a false-block sweep hit, an owed batch
-  or dispute item, a report that did not count, or an open THOR bug candidate -
-  until a counting evaluation finds none; there is no repeat after a few hours of
+  or dispute item, a report that did not count, a rule owed a verdict that was
+  shown in a session of the project since the last evaluation started (debt that
+  fired nowhere since is on no list, so it is not rot), or an open THOR bug
+  candidate - until a counting evaluation finds none; there is no repeat after a few hours of
   work; the plan is read from Claude Code's own `~/.claude.json`
   (`organizationRateLimitTier`, undocumented, failing soft) and kept with its
   source in the mode sidecar, `install --set-plan` records the user's word, and

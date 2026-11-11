@@ -544,7 +544,9 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
   anything below Max, or a plan THOR could not read) a valid report covers the next 7 days, whatever is
   found. On Max it is the same week, but it goes daily (a report covers the next 24 hours) while the
   project shows rot (a defect, a false-block sweep hit, an owed batch or dispute item, a report that
-  did not count, a THOR bug candidate), and back to weekly once a counting evaluation finds none. There
+  did not count, a rule owed a verdict that was shown in a session of the project since the last
+  evaluation started - a debt that fired nowhere since then is on no list and is not rot - a THOR bug
+  candidate), and back to weekly once a counting evaluation finds none. There
   is no re-ask after a few hours of work. Any project worked in during the last 7 days with no valid
   review in 7 days is due regardless.
 - Why: owner's decision of 2026-10-02: one block, inside the evaluation, instead of something to judge

@@ -1084,8 +1084,10 @@ could not read) that is strict: the next ask comes after a week, whatever is
 found, so the evaluation leaves the owner's limit for his own work. On Max the
 week is the same, but it goes daily (a report then covers the next 24 hours)
 while the project shows rot: a defect found, a false-block sweep hit, a batch
-or dispute item left owed, a report that did not count, or a THOR bug candidate
-waiting. It goes back to weekly the first time a counting evaluation finds none
+or dispute item left owed, a report that did not count, a rule owed a verdict
+that was shown in a session of the project since the last evaluation started
+(a debt that fired nowhere since then is on no list, so it is not rot), or a
+THOR bug candidate waiting. It goes back to weekly the first time a counting evaluation finds none
 of that. THOR reads the plan from Claude Code's own settings at install and
 confirms it with the owner as question 1 of the first-session questions
 (`install --set-plan max|small` records his answer). There is no re-ask after a

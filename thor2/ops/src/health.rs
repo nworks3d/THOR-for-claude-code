@@ -2331,6 +2331,63 @@ pub fn working_copy_lines(db: &Path) -> Vec<String> {
     lines
 }
 
+/// Standing rules that do not fit in the session start block, per registered
+/// project. ONE line: in how many registered projects some do not fit, and the
+/// smallest and largest hidden count; silent when everything fits everywhere.
+/// With `full`, one more line per project names the hidden rules.
+///
+/// THE SAME FUNCTION THE SESSION START USES (`serve::session_start::
+/// render_for_project`, which runs the hook's own selection, ranking and
+/// fitting) with the same extra lines a start adds (`start_extras`), never a second
+/// implementation, so it reports what a real start hides.
+pub fn standing_rules_overflow_lines(db: &Path, full: bool) -> Vec<String> {
+    let Ok(store) = EventStore::open_existing(db) else { return Vec::new() };
+    let machine = model::machine::current_machine_id();
+    let mut projects: std::collections::BTreeSet<String> = Default::default();
+    for li in serve::live::live_items(&store) {
+        let key = li
+            .id
+            .strip_prefix("project-")
+            .and_then(|rest| rest.strip_suffix("-opened-by-install").or_else(|| rest.strip_suffix("-root-by-install")));
+        if let Some(key) = key {
+            projects.insert(key.to_string());
+        }
+        if li.item.kind.can_fire() {
+            projects.extend(li.item.project.clone());
+        }
+    }
+    let now = serve::time::now_unix();
+    let mut cut: Vec<(String, Vec<String>)> = Vec::new();
+    let mut registered = 0usize;
+    for key in &projects {
+        if model::store::registrations_for_machine(&store, key, &machine).is_empty() {
+            continue;
+        }
+        registered += 1;
+        if let Some(r) = serve::session_start::render_for_project(&store, db, Some(key), now).filter(|r| r.hidden > 0) {
+            cut.push((key.clone(), r.hidden_ids));
+        }
+    }
+    if cut.is_empty() {
+        return Vec::new();
+    }
+    let smallest = cut.iter().map(|(_, ids)| ids.len()).min().unwrap_or(0);
+    let largest = cut.iter().map(|(_, ids)| ids.len()).max().unwrap_or(0);
+    let mut lines = vec![format!(
+        "standing rules: in {} of {registered} registered project(s), some standing rules do not fit in the session start block \
+         (smallest {smallest}, largest {largest} hidden in one project, as a session start there would). The block names \
+         them, and the get tool opens one{}",
+        cut.len(),
+        if full { "; the ids per project follow" } else { "; run doctor with --full to list the ids per project" }
+    )];
+    if full {
+        for (key, ids) in &cut {
+            lines.push(format!("standing rules not shown at a session start in '{key}' ({}): {}", ids.len(), ids.join(", ")));
+        }
+    }
+    lines
+}
+
 /// Same-file pairs of live Rule/Orientation checks whose proofs currently
 /// disagree - one comes back `Holds`, the other `Fails`, on the exact same
 /// file, right now. See `serve/examples/check_contradictions.rs`'s own "(b)
@@ -4009,6 +4066,8 @@ pub fn report(
         orphan_projects_line(db, checkouts),
     ]);
     lines.extend(working_copy_lines(db));
+    // Silent unless standing rules do not fit at a session start somewhere.
+    lines.extend(standing_rules_overflow_lines(db, full));
     // Silent unless two project names differ only in case, spaces or hyphens.
     lines.extend(split_scope_lines(db));
     // Silent unless a real refusal is on the log.
@@ -7212,6 +7271,65 @@ mod tests {
         let missing = lines.iter().find(|l| l.starts_with("working copies:")).expect("the unregistered line");
         assert!(missing.contains("1 project(s) own rules but have no registered working copy: gamma (1 rule(s))"), "{missing}");
         assert!(missing.contains(&format!("--register-root --db \"{}\"", db.display())), "{missing}");
+    }
+
+    /// Doctor says in ONE line in how many registered projects standing rules
+    /// do not fit at a session start (smallest and largest hidden count), lists
+    /// the ids only with --full, and is silent when everything fits.
+    #[test]
+    fn doctor_counts_the_projects_where_standing_rules_do_not_fit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        EventStore::new(&db).unwrap();
+        let hooks = dir.path().join("no-hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let alpha = dir.path().join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git").arg("-C").arg(&alpha).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "--quiet"]);
+        git(&["config", "core.hooksPath", &hooks.display().to_string()]);
+        git(&["config", "user.email", "fixture@example.invalid"]);
+        git(&["config", "user.name", "fixture"]);
+        std::fs::write(alpha.join(".thor-project"), "alpha\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "--quiet", "-m", "initial"]);
+        {
+            let mut s = EventStore::new(&db).unwrap();
+            crate::install::register_root(&mut s, &alpha, "alpha", None).unwrap();
+            for n in 0..5 {
+                let mut small = rule(&format!("small-{n}"));
+                small.text = format!("small fixture {n} {}", ["alpha", "bravo", "charlie", "delta", "echo"][n]);
+                store::declare(&mut s, "s", "l", "a", &small).unwrap();
+            }
+        }
+        assert_eq!(standing_rules_overflow_lines(&db, false), Vec::<String>::new(), "everything fits: no such line");
+        {
+            let mut s = EventStore::new(&db).unwrap();
+            for n in 0..80 {
+                let mut big = rule(&format!("big-{n:03}"));
+                big.text = format!("big fixture {n:03} about {} {}", ["pins", "paths", "plugs", "pipes"][n % 4], "w".repeat(200));
+                store::declare(&mut s, "s", "l", "a", &big).unwrap();
+            }
+        }
+        let expected = serve::session_start::render_for_project(
+            &EventStore::open_existing(&db).unwrap(),
+            &db,
+            Some("alpha"),
+            serve::time::now_unix(),
+        )
+        .unwrap();
+        assert!(expected.hidden > 0, "fixture: some do not fit");
+        let lines = standing_rules_overflow_lines(&db, false);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("in 1 of 1 registered project(s)"), "{}", lines[0]);
+        assert!(lines[0].contains(&format!("smallest {0}, largest {0}", expected.hidden)), "{}", lines[0]);
+        assert!(lines[0].contains("--full"), "{}", lines[0]);
+        let full = standing_rules_overflow_lines(&db, true);
+        assert_eq!(full.len(), 2, "{full:?}");
+        assert!(full[1].contains("'alpha'") && full[1].contains(&expected.hidden_ids[0]), "{}", full[1]);
     }
 
     /// THE DEFECT THIS PREVENTS: a health line that goes quiet exactly when it

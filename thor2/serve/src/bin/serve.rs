@@ -2297,23 +2297,6 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             // went through a compaction (see `session_start::compact_
             // reminder`'s own doc comment).
             let source = payload.get("source").and_then(|v| v.as_str());
-            let reminder = session_start::compact_reminder(source, payload_is_from_a_subagent(&payload));
-            // One line, for seven days after this project's working copy was
-            // registered or moved: the first registration is first-come
-            // (N11), so whoever made it is named where the owner looks - see
-            // `project::registration_notice`.
-            // Shown at most once a day per project (`serve::notices`).
-            // Neither this line nor the open points below reach a headless
-            // session (step 32): they are for the owner, an agent can act on
-            // neither, and a headless run must not use up the day's showing.
-            let registration = project::registration_notice(&store, folder_project.as_deref(), time::now_unix()).filter(|_| {
-                !kind.headless
-                    && serve::notices::due(db_path, folder_project.as_deref().unwrap_or(""), "registration", time::now_unix(), !no_record)
-            });
-            // Handed over (2026-09-25), capped: this project's own open
-            // points - see `open_points_session_start_note`'s own doc comment.
-            // Never a subagent's (step 16, B6): the open points - and the
-            // owner-queue banner above them - are for the owner's own session.
             // THE FULL-PLACE POINTS AN OLDER BUILD LEFT (step 27, D4): judged
             // again under the current rule before they are counted - see
             // `eval_session::refresh_old_anchor_full_points`.
@@ -2322,62 +2305,25 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                     serve::eval_session::refresh_old_anchor_full_points(&mut store, project);
                 }
             }
-            let open_points = (!payload_is_from_a_subagent(&payload) && !kind.headless)
-                .then(|| {
-                    open_points_session_start_note(&store, folder_project.as_deref(), &|project| {
-                        serve::notices::due(db_path, project, "open-points", time::now_unix(), !no_record)
-                    })
-                })
-                .flatten();
-            // COPY MODE: one plain line saying so, and a background refresh of the copy
-            // when one is due (the session keeps using the copy it has now).
-            let copy_line = (copy && !payload_is_from_a_subagent(&payload)).then(|| {
-                let marker = thor_core::copy_mode::read_marker(db_path);
-                if thor_core::copy_mode::pull_due(&marker, time::now_unix()) {
-                    thor_core::copy_mode::spawn_pull(db_path);
-                }
-                thor_core::copy_mode::session_line_with(&marker, serve::copy_eval::connector_configured(db_path))
-            });
-            // A THOR program a hook, the tool server or a sidecar shows in use
-            // that is not on disk (an antivirus quarantine): said every start
-            // until it is back, with the steps. Not for a subagent.
-            let missing_program = (!payload_is_from_a_subagent(&payload)).then(|| serve::missing_programs::session_line(db_path)).flatten();
-            // The owner's two work folders, when named (`serve::work_folders`):
-            // the temp-until-live notice and the tools-folder check once a day,
-            // the helper-tools overview every start. Both folders are read on
-            // worker threads under one time limit, so an unreachable network
-            // share can never hold a session start. Not for a subagent.
-            let work_folders = match payload_is_from_a_subagent(&payload) {
-                true => Vec::new(),
-                false => serve::work_folders::session_start_lines(
-                    db_path,
-                    time::now_unix(),
-                    !kind.headless,
-                    !no_record,
-                    serve::work_folders::HOOK_READ_LIMIT,
-                    &serve::work_folders::READERS,
-                )
-                .into_lines(),
-            };
-            // The copy on the other machine does not answer: one plain line,
-            // after a connect under a hard 800 ms limit (`serve::replica_reach`).
-            // Silent without a known target and when the copy answers.
-            let replica_down = (!payload_is_from_a_subagent(&payload)).then(|| serve::replica_reach::down_line(db_path)).flatten();
-            let extras: Vec<String> = [copy_line, reminder, registration, open_points, missing_program, replica_down]
-                .into_iter()
-                .flatten()
-                .chain(work_folders)
-                .collect();
+            // Every line besides the standing rules (compaction reminder, registration
+            // notice, open points, copy line, missing program, work folders, copy down):
+            // built by `session_start::start_extras`, which doctor calls too.
+            let extras = session_start::start_extras(
+                &store,
+                db_path,
+                folder_project.as_deref(),
+                &session_start::ExtrasFor {
+                    source,
+                    headless: kind.headless,
+                    subagent: payload_is_from_a_subagent(&payload),
+                    record: !no_record,
+                    copy,
+                    refresh_copy: true,
+                },
+            );
             let extras_len: usize = extras.iter().map(|e| e.len() + 2).sum();
             // What this project's own sessions used lately ranks first (step 31).
-            let recent = match folder_project.as_deref() {
-                Some(project) => {
-                    let from = time::now_unix() - RECENT_FACTS_DAYS * 86_400;
-                    let sessions = usefulness::sessions_of_project_since(db_path, project, from);
-                    serve::volume::shown_in_sessions_since(db_path, &sessions, from)
-                }
-                None => Default::default(),
-            };
+            let recent = session_start::recent_in_project(db_path, folder_project.as_deref(), time::now_unix());
             let rules = session_start::render_within_ranked(
                 &items,
                 session_start::HOOK_OUTPUT_LIMIT_BYTES.saturating_sub(extras_len),
@@ -3875,10 +3821,7 @@ fn eval_stop_ask(
                 }
                 let reason = format!("{}{reason}", routine_changed_lines(session_id));
                 return EvalStop::Ask(match started {
-                    Some(started) => {
-                        let note = serve::eval_session::start_note_after(&started.start, reason.len() + 2);
-                        format!("{reason}\n\n{note}")
-                    }
+                    Some(started) => serve::eval_session::ask_with_note(&reason, &started.start),
                     None => reason,
                 });
             }
@@ -4040,41 +3983,6 @@ fn evaluation_ask(
         usefulness::days_ago(now, first_asked)
     )
 }
-
-/// This project's own open points (`model::store::open_points`), as ONE line
-/// at `SessionStart`: how many there are, and that they are the owner's
-/// (step 27). Field test 3 (2026-10-01): the list of them - THOR's own, legacy
-/// ones that "settle nothing", and a stale text that still said "the owner
-/// decides" - was put in front of every agent at every start, and an agent can
-/// do nothing about any of them. Their texts are no longer injected; `doctor`
-/// and `lookup` have them. `None` when the project has none open.
-///
-/// OVER THE OWNER'S BUDGET (step 16, B6): when more of THOR's own points of
-/// the project wait on the owner (`model::store::owner_queue`) than
-/// `model::store::OPEN_POINTS_OWNER_BUDGET`, the line is preceded by the
-/// banner that says so. Nothing is refused over it. The call site never
-/// shows this to a subagent.
-fn open_points_session_start_note(store: &EventStore, project: Option<&str>, line_is_due: &dyn Fn(&str) -> bool) -> Option<String> {
-    let points = model::store::open_points(store, project);
-    if points.is_empty() {
-        return None;
-    }
-    let queue = project.map(|p| model::store::owner_queue(store, p)).unwrap_or_default();
-    let mut lines: Vec<String> = project.and_then(|p| model::store::owner_queue_banner(p, queue.len())).into_iter().collect();
-    // The count line is shown once a day per project (`serve::notices`); the
-    // banner above it, when the owner's budget is over, is shown every time.
-    if line_is_due(project.unwrap_or("")) {
-        lines.push(format!(
-            "[THOR] {} open point(s) in this project are the owner's to read, not a task for this session (doctor lists them).",
-            points.len()
-        ));
-    }
-    (!lines.is_empty()).then(|| lines.join("\n"))
-}
-
-/// How many days back "fired in this project lately" looks, for the ranking of
-/// the session start block.
-const RECENT_FACTS_DAYS: i64 = 14;
 
 /// How this session was started, and whether that makes it headless
 /// (`session_start::entrypoint_is_headless`). Claude Code names it in

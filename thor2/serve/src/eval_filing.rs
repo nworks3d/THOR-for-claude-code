@@ -867,7 +867,9 @@ fn restarted_after(files: &[PathBuf], after_unix: i64) -> bool {
 /// (a judgement list, a teeth batch, an A4 list or THOR's own open points);
 /// since that evaluation, a report that does not count, a write to an item
 /// of the project outside an attested THOR call, a live rule of the project
-/// that `settlement` calls owed, judgement debt in the project, an open THOR bug
+/// that `settlement` calls owed, judgement debt in the project that was served
+/// since that evaluation started in a session of the project (debt that fired
+/// nowhere since then is on no list, so it is not rot), an open THOR bug
 /// candidate, or a rule of the project the false-block sweep flags.
 pub fn project_rot(store: &EventStore, project: &str) -> Option<String> {
     let Some(valid) = newest_valid_evaluation(store, Some(project)) else {
@@ -905,7 +907,7 @@ pub fn project_rot(store: &EventStore, project: &str) -> Option<String> {
     if let Some(li) = rot {
         return Some(format!("the rule '{}' has no verdict (rot)", li.id));
     }
-    let (_, owed) = crate::usefulness::judgement_debt_counts(store, Some(project));
+    let owed = reachable_judgement_debt(store, project, valid.started_seq.unwrap_or(valid.report_seq));
     if owed > 0 {
         return Some(format!("{owed} item(s) owe a verdict"));
     }
@@ -919,6 +921,43 @@ pub fn project_rot(store: &EventStore, project: &str) -> Option<String> {
     }
     let ids = crate::usefulness::items_of_project(store, project);
     crate::sweep::flagged_rule_ids(&db, store).into_iter().find(|id| ids.contains(id)).map(|id| format!("the false-block sweep flags the rule '{id}'"))
+}
+
+/// HOW MANY OF THE ITEMS OWED A VERDICT IN `project` AN EVALUATION OF IT CAN
+/// STILL BE HANDED: the owed items (the project's own and the global ones, as
+/// `judgement_debt_named` counts them) that were served after log seq
+/// `since_seq` (the start of the project's last counting evaluation) in a
+/// session of this project. A session counts as "of this project" when it was
+/// served at least one item scoped exactly to the project after `since_seq`;
+/// the log carries no project column on a serving, and a session's start serves
+/// the project's own rules, so this finds the sessions that worked there.
+/// Debt that fired nowhere since that evaluation started can be on no
+/// evaluation's verdict list, so it does not keep the project on the daily
+/// rhythm (measured 2026-11-10: 15 dormant global items did, for weeks).
+/// Doctor's debt list and the ask's line about other sessions are unchanged.
+fn reachable_judgement_debt(store: &EventStore, project: &str, since_seq: i64) -> usize {
+    let owed: std::collections::HashSet<String> =
+        crate::usefulness::judgement_debt_named(store, Some(project)).into_iter().map(|d| d.id).collect();
+    if owed.is_empty() {
+        return 0;
+    }
+    let Ok(events) = store.firings_and_verdicts() else { return 0 };
+    let own = crate::usefulness::items_of_project(store, project);
+    let served =
+        |kind: &EventKind, actor: &str| *kind == EventKind::ItemServed && actor == crate::usefulness::ASSISTANT_DELIVERY_ACTOR;
+    let sessions: std::collections::HashSet<&str> = events
+        .iter()
+        .filter(|(seq, kind, id, actor, _)| *seq > since_seq && served(kind, actor) && own.contains(id))
+        .map(|(.., session)| session.as_str())
+        .collect();
+    let reached: std::collections::HashSet<&str> = events
+        .iter()
+        .filter(|(seq, kind, id, actor, session)| {
+            *seq > since_seq && served(kind, actor) && owed.contains(id) && sessions.contains(session.as_str())
+        })
+        .map(|(_, _, id, ..)| id.as_str())
+        .collect();
+    reached.len()
 }
 
 /// Whether the newest validator record on the log says the transcript was in
