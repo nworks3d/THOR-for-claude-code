@@ -7416,7 +7416,7 @@ fn cmd_status(db_path: &Path, index_db: Option<&Path>, repo: Option<&Path>) {
             Ok(p) => println!("\n{}", format_code_provenance(&p)),
             Err(e) => println!("\ncode index: {e}"),
         },
-        (None, None) => println!("\ncode index: not configured (pass --index-db and --repo to check one)"),
+        (None, None) => println!("\ncode index: not checked (pass --index-db and --repo to check one)"),
         _ => println!("\ncode index: both --index-db and --repo are required to check one"),
     }
 }

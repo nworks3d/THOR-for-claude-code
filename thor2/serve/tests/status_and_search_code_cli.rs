@@ -49,7 +49,7 @@ fn status_cli_reports_kind_counts_and_never_fired_with_no_code_index_named() {
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(stdout.contains("Rule"), "expected a Rule row: {stdout}");
     assert!(stdout.contains("declared, never fired: 2 of 2"), "expected both undelivered rules counted: {stdout}");
-    assert!(stdout.contains("not configured"), "no --index-db/--repo were given, so the code index must say so plainly: {stdout}");
+    assert!(stdout.contains("not checked"), "no --index-db/--repo were given, so the code index must say so plainly: {stdout}");
 }
 
 #[test]

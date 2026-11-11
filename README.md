@@ -506,7 +506,7 @@ you do not say no. Answer by number ("1 yes, 3 no, 10 local"), or say
 You need Claude Code, installed and opened at least once. Nothing else to
 prepare: no account, no key. The paste-one-line route below needs neither git nor
 Python. When you let your assistant install THOR instead, it checks your computer
-for git and Python (which its own tools use), installs what is missing through your
+for git (needed for code projects) and Python (the helper scripts an assistant writes for you commonly use it), installs what is missing through your
 system's package manager, and asks you for at most one permission click.
 
 1. **Open a terminal.** On Windows press the Windows key, type `PowerShell`

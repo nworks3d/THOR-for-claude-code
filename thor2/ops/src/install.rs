@@ -1794,7 +1794,7 @@ fn project_record(id: String, key: &str, files: Option<usize>, today: &str) -> m
     let text = match files {
         Some(files) => format!(
             "Project {key}: install read its code on {today} ({files} file(s)) so it can be \
-             searched with search_code and kept fresh after each commit, merge or pull, rebase and branch switch. Notes filed under '{key}' \
+             searched with search_code and kept fresh after a commit, a merge or pull, a rebase and a branch switch. Notes filed under '{key}' \
              belong to this repository."
         ),
         None => format!(
@@ -3748,7 +3748,7 @@ mod tests {
             item.text,
             format!(
                 "Project demo-shop: install read its code on {today} (7 file(s)) so it can be \
-                 searched with search_code and kept fresh after each commit, merge or pull, rebase and branch switch. Notes filed under \
+                 searched with search_code and kept fresh after a commit, a merge or pull, a rebase and a branch switch. Notes filed under \
                  'demo-shop' belong to this repository."
             )
         );

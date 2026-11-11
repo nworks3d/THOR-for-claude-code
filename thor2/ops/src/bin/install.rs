@@ -1324,7 +1324,7 @@ fn main() -> ExitCode {
                         }
                         match githooks::wire_hooks_path(&hooks_dir) {
                             Ok(githooks::HooksPathOutcome::Set) => {
-                                println!("+ told git to use them, so THOR can keep a programming project searchable after every commit");
+                                println!("+ told git to use them, so THOR can keep a programming project searchable after a commit, a merge or pull, a rebase and a branch switch");
                                 println!("  your own git hooks keep working: each helper hands control back to them");
                                 say_gate();
                             }
@@ -1453,7 +1453,7 @@ fn main() -> ExitCode {
         Some(key) => match code_index_root.as_deref().map(|r| build_project_index(r, &index_key, &here)).transpose() {
             Ok(Some(Some(files))) => {
                 restart_because.push("this project's code was read for the first time");
-                println!("+ read this project's code, {files} file(s), so it can be searched and kept fresh on every commit");
+                println!("+ read this project's code, {files} file(s), so it can be searched and kept fresh after a commit, a merge or pull, a rebase and a branch switch");
                 // Immediately after the read succeeds: opens the project in
                 // the memory itself, so the very first `remember` filed under
                 // it is never refused as an unknown collection (see
@@ -1464,7 +1464,7 @@ fn main() -> ExitCode {
                 print_record_outcome(&key, record_project_opened(&db, &here, &key, files));
             }
             Ok(Some(None)) => {
-                println!("= this project's code was already read; every commit keeps it fresh");
+                println!("= this project's code was already read; a commit, a merge or pull, a rebase and a branch switch each keep it fresh");
                 // THE UPGRADE GAP THIS CLOSES: an owner who installed before
                 // `record_project_opened` existed (or any run that finds a
                 // sidecar but lost the record some other way) hits this

@@ -1,5 +1,5 @@
 //! The git side of installation: one machine-wide hooks directory, so the code
-//! index refreshes itself after each commit, merge or pull, rebase and branch switch in every repository without anyone
+//! index refreshes itself after a commit, a merge or pull, a rebase and a branch switch in every repository without anyone
 //! having to remember to run anything.
 //!
 //! Why machine-wide and not one hook per repository. `codeindex::store::refresh`
