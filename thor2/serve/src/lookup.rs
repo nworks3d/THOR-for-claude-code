@@ -251,7 +251,7 @@ pub fn literal_leg(store: &EventStore, query: &str) -> LiteralLeg {
         .zip(&in_text)
         .map(|(h, text)| {
             !*text
-                && (id_matches(h, &q)
+                && (id_matches(h, q.trim())
                     || (use_all_words && words.iter().all(|w| haystack_contains(h, w) || id_matches(h, w))))
         })
         .collect();
