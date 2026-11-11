@@ -264,24 +264,45 @@ pub fn recent_in_project(db: &std::path::Path, project: Option<&str>, now_unix: 
 /// the session start can never disagree about which rules do not fit. `None`
 /// when no standing rule applies.
 pub fn render_for_project(
+    ctx: &DoctorStart,
     store: &thor_core::event_store::EventStore,
     db: &std::path::Path,
     project: Option<&str>,
     now_unix: i64,
 ) -> Option<Rendered> {
-    let candidates = crate::live::always_candidates(store);
-    let decay = crate::decay::DecayContext::load(store);
-    let (items, _) = split_for_session_start(crate::decay::retain_live(select(&candidates, project), &decay), false);
+    let (items, _) = split_for_session_start(crate::decay::retain_live(select(&ctx.candidates, project), &ctx.decay), false);
     let recent = recent_in_project(db, project, now_unix);
-    // The lines a real start adds take room too; nothing is recorded or started.
-    let extras = start_extras(
-        store,
-        db,
-        project,
-        &ExtrasFor { source: Some("startup"), headless: false, subagent: false, record: false, copy: thor_core::copy_mode::is_copy(db), refresh_copy: false },
-    );
+    let (registration, open_points) = project_extras(store, db, project, &ctx.flags());
+    let extras = assemble_extras(ctx.shared.clone(), registration, open_points);
     let extras_len: usize = extras.iter().map(|e| e.len() + 2).sum();
     render_within_ranked(&items, HOOK_OUTPUT_LIMIT_BYTES.saturating_sub(extras_len), &recent)
+}
+
+/// What doctor reads ONCE per run for every project it measures: the standing
+/// rules' candidates, the decay state and the extra lines that are the same
+/// for every project. Nothing is recorded or started.
+pub struct DoctorStart {
+    candidates: Vec<LiveItem>,
+    decay: crate::decay::DecayContext,
+    shared: SharedExtras,
+    copy: bool,
+}
+
+impl DoctorStart {
+    pub fn load(store: &thor_core::event_store::EventStore, db: &std::path::Path) -> Self {
+        let copy = thor_core::copy_mode::is_copy(db);
+        let flags = ExtrasFor { source: Some("startup"), headless: false, subagent: false, record: false, copy, refresh_copy: false };
+        DoctorStart {
+            candidates: crate::live::always_candidates(store),
+            decay: crate::decay::DecayContext::load(store),
+            shared: shared_extras(db, &flags),
+            copy,
+        }
+    }
+
+    fn flags(&self) -> ExtrasFor<'static> {
+        ExtrasFor { source: Some("startup"), headless: false, subagent: false, record: false, copy: self.copy, refresh_copy: false }
+    }
 }
 
 /// What decides which extra lines a session start carries.
@@ -299,28 +320,22 @@ pub struct ExtrasFor<'a> {
     pub refresh_copy: bool,
 }
 
-/// Every line a session start carries besides the standing rules, in the order
-/// they follow them: the copy line, the compaction reminder, the registration
-/// notice, the open points, a missing program, the work folders and a copy that
-/// does not answer. The hook subtracts their size from the rules' room, and
-/// doctor does the same through this one function, so doctor reports what a
-/// real start hides.
-pub fn start_extras(
-    store: &thor_core::event_store::EventStore,
-    db: &std::path::Path,
-    project: Option<&str>,
-    f: &ExtrasFor,
-) -> Vec<String> {
+/// The extra lines of a session start that are the same for every project on
+/// this machine: the copy line, the compaction reminder, a missing program, the
+/// work folders and a copy that does not answer. Reading them can touch a
+/// network share and the other machine, so doctor builds them ONCE per run.
+#[derive(Clone)]
+pub struct SharedExtras {
+    copy_line: Option<String>,
+    reminder: Option<String>,
+    missing_program: Option<String>,
+    work_folders: Vec<String>,
+    replica_down: Option<String>,
+}
+
+/// Build the lines that do not depend on the project.
+pub fn shared_extras(db: &std::path::Path, f: &ExtrasFor) -> SharedExtras {
     let now = crate::time::now_unix();
-    let reminder = compact_reminder(f.source, f.subagent);
-    // One line, for seven days after this project's working copy was
-    // registered or moved (`project::registration_notice`), at most once a day
-    // per project. Neither it nor the open points reach a headless session.
-    let registration = crate::project::registration_notice(store, project, now)
-        .filter(|_| !f.headless && crate::notices::due(db, project.unwrap_or(""), "registration", now, f.record));
-    let open_points = (!f.subagent && !f.headless)
-        .then(|| open_points_session_start_note(store, project, &|p| crate::notices::due(db, p, "open-points", now, f.record)))
-        .flatten();
     let copy_line = (f.copy && !f.subagent).then(|| {
         let marker = thor_core::copy_mode::read_marker(db);
         if f.refresh_copy && thor_core::copy_mode::pull_due(&marker, now) {
@@ -328,7 +343,6 @@ pub fn start_extras(
         }
         thor_core::copy_mode::session_line_with(&marker, crate::copy_eval::connector_configured(db))
     });
-    let missing_program = (!f.subagent).then(|| crate::missing_programs::session_line(db)).flatten();
     let work_folders = match f.subagent {
         true => Vec::new(),
         false => crate::work_folders::session_start_lines(
@@ -341,11 +355,55 @@ pub fn start_extras(
         )
         .into_lines(),
     };
-    let replica_down = (!f.subagent).then(|| crate::replica_reach::down_line(db)).flatten();
-    [copy_line, reminder, registration, open_points, missing_program, replica_down]
+    SharedExtras {
+        copy_line,
+        reminder: compact_reminder(f.source, f.subagent),
+        missing_program: (!f.subagent).then(|| crate::missing_programs::session_line(db)).flatten(),
+        work_folders,
+        replica_down: (!f.subagent).then(|| crate::replica_reach::down_line(db)).flatten(),
+    }
+}
+
+/// The two extra lines that depend on the project: the registration notice
+/// (for seven days after its working copy was registered or moved, at most once
+/// a day per project; `project::registration_notice`) and the open points.
+/// Neither reaches a headless session.
+fn project_extras(
+    store: &thor_core::event_store::EventStore,
+    db: &std::path::Path,
+    project: Option<&str>,
+    f: &ExtrasFor,
+) -> (Option<String>, Option<String>) {
+    let now = crate::time::now_unix();
+    let registration = crate::project::registration_notice(store, project, now)
+        .filter(|_| !f.headless && crate::notices::due(db, project.unwrap_or(""), "registration", now, f.record));
+    let open_points = (!f.subagent && !f.headless)
+        .then(|| open_points_session_start_note(store, project, &|p| crate::notices::due(db, p, "open-points", now, f.record)))
+        .flatten();
+    (registration, open_points)
+}
+
+/// Every line a session start carries besides the standing rules, in the order
+/// they follow them: the copy line, the compaction reminder, the registration
+/// notice, the open points, a missing program, the work folders and a copy that
+/// does not answer. The hook subtracts their size from the rules' room, and
+/// doctor does the same through the same two builders, so doctor reports what
+/// a real start hides.
+pub fn start_extras(
+    store: &thor_core::event_store::EventStore,
+    db: &std::path::Path,
+    project: Option<&str>,
+    f: &ExtrasFor,
+) -> Vec<String> {
+    let (registration, open_points) = project_extras(store, db, project, f);
+    assemble_extras(shared_extras(db, f), registration, open_points)
+}
+
+fn assemble_extras(shared: SharedExtras, registration: Option<String>, open_points: Option<String>) -> Vec<String> {
+    [shared.copy_line, shared.reminder, registration, open_points, shared.missing_program, shared.replica_down]
         .into_iter()
         .flatten()
-        .chain(work_folders)
+        .chain(shared.work_folders)
         .collect()
 }
 

@@ -2357,6 +2357,7 @@ pub fn standing_rules_overflow_lines(db: &Path, full: bool) -> Vec<String> {
         }
     }
     let now = serve::time::now_unix();
+    let start = serve::session_start::DoctorStart::load(&store, db);
     let mut cut: Vec<(String, Vec<String>)> = Vec::new();
     let mut registered = 0usize;
     for key in &projects {
@@ -2364,7 +2365,7 @@ pub fn standing_rules_overflow_lines(db: &Path, full: bool) -> Vec<String> {
             continue;
         }
         registered += 1;
-        if let Some(r) = serve::session_start::render_for_project(&store, db, Some(key), now).filter(|r| r.hidden > 0) {
+        if let Some(r) = serve::session_start::render_for_project(&start, &store, db, Some(key), now).filter(|r| r.hidden > 0) {
             cut.push((key.clone(), r.hidden_ids));
         }
     }
@@ -7314,8 +7315,10 @@ mod tests {
                 store::declare(&mut s, "s", "l", "a", &big).unwrap();
             }
         }
+        let opened = EventStore::open_existing(&db).unwrap();
         let expected = serve::session_start::render_for_project(
-            &EventStore::open_existing(&db).unwrap(),
+            &serve::session_start::DoctorStart::load(&opened, &db),
+            &opened,
             &db,
             Some("alpha"),
             serve::time::now_unix(),
