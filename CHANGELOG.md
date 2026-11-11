@@ -4,6 +4,20 @@ What changed in each release, newest first. The release workflow copies the sect
 
 ## Unreleased
 
+## 2.6.8 (2026-11-11)
+
+What changed: The hook that runs before every tool call is faster on a memory that has grown long, and a note about the shell command grep no longer shows up when Claude Code's own Grep tool runs. Search also finds a note by its id and by other forms of a long word. The daily upkeep check stops asking for verdicts nobody can give, an evaluation with nothing to judge says so at once, and the session start tells you which standing rules did not fit. Doctor and the first-run texts no longer show numbers from the maker's own memory.
+
+- **The hook before every tool call is faster on a long-lived memory.** On a memory of 318,000 events it went from about 0.79 s to about 0.49 s. It used to walk the whole log twice to find the useful and noise marks; it now reads only those marks. The memory file gets a small derived index the first time it is written to after the upgrade; nothing else changes and nothing is lost.
+- **A note about the shell command grep, agent or write is no longer shown when Claude Code's Grep, Agent or Write tool runs.** A tool name was read as a shell word, so a note about the command `grep` appeared on every Grep tool call. A note written with the tool's exact name still appears on that tool.
+- **The daily upkeep check on the Max plan only counts what a session can be handed.** It used to run daily for verdict debt on notes that had not fired in any session of the project since the last evaluation, which nobody could ever judge. Such debt no longer triggers it.
+- **An evaluation with nothing to judge says so first.** Its first line says there is nothing to judge and gives the one call that files the report, so the routine file need not be read.
+- **The session start names the standing rules that did not fit.** The pinned block has a size limit; the rules that were left out are now listed by id, those reachable nowhere else first. Doctor shows in how many projects this happens, and with `--full` the ids.
+- **Search also looks in an item's id.** A query that is exactly an id puts that item first. When no item contains the exact words of a search of several words, long words may match by their first letters; the reply says so, and above 10 such hits the step is ignored. The command line shows the same note.
+- **Doctor and `serve status` no longer show numbers from the maker's own memory.** Where a check was not run they say "not checked" and name the option that runs it (the code index or the replica).
+- **The texts of the first run are truer.** The README gives the real reason THOR wants git and Python, every text says the reading of a project's code is refreshed after a commit, a merge or pull, a rebase and a branch switch, and AGENTS.md states the real count of notes a new memory is given.
+- **A refusal that lists the real calls a rule would refuse shows five and "and N more".** A long list used to fill the screen.
+
 ## 2.6.7 (2026-11-10)
 
 What changed: Running THOR's install again now brings the /thor-eval routine up to date with the programs, where an upgrade used to keep the routine of the first install for ever. Doctor tells you when the routine on your machine is not the one the programs ship. The reading of a project's code is now also refreshed after a pull or merge, a rebase and a switch to another branch, not only after a commit.
