@@ -108,12 +108,14 @@ pub struct DecayContext {
 }
 
 impl DecayContext {
-    /// Load the two folds a decay decision needs, once, from the real store.
+    /// Load what a decay decision needs, once, from the real store: one pass over the verdict events.
     pub fn load(store: &EventStore) -> Self {
         // Deliberately does NOT fold the serving history any more: a serving
         // count decides nothing here, so loading it on every hook call would
         // be work done to reach a number nobody reads.
-        let mut noise = crate::usefulness::noise_since_last_useful(store);
+        // One pass over the verdict events only (an index on kind answers it
+        // without reading the firings), not two folds over the whole log.
+        let (ever_marked_useful, mut noise) = crate::usefulness::mark_folds(store);
         // A verdict judged the version it was given on. Only an id that
         // already sits at the threshold can change the answer, so only those
         // pay for a look at their own revisions.
@@ -123,7 +125,7 @@ impl DecayContext {
             }
             *count = crate::usefulness::noise_since_last_change(store, id);
         }
-        DecayContext { ever_marked_useful: crate::usefulness::ever_marked_useful(store), noise }
+        DecayContext { ever_marked_useful, noise }
     }
 
     /// Was this item ever marked useful? Exposed so `status` can report the
@@ -423,6 +425,95 @@ mod tests {
         item.tags = vec!["housekeeping".to_string()];
         revise_raw(&mut store, &item);
         assert!(DecayContext::load(&store).is_stale(&item));
+    }
+
+    /// The decay context as it was loaded before the verdict-only pass: two
+    /// folds over the whole log (`usefulness::ever_marked_useful`,
+    /// `noise_since_last_useful`, both still there) and a look at the revisions
+    /// of every id at the threshold. Kept here as the oracle.
+    fn load_by_the_old_folds(store: &EventStore) -> DecayContext {
+        let mut noise = crate::usefulness::noise_since_last_useful(store);
+        for (id, count) in noise.iter_mut() {
+            if *count < NOISE_MARKS_BEFORE_STALE {
+                continue;
+            }
+            *count = crate::usefulness::noise_since_last_change(store, id);
+        }
+        DecayContext { ever_marked_useful: crate::usefulness::ever_marked_useful(store), noise }
+    }
+
+    fn serve_n(store: &mut EventStore, id: &str, n: usize) {
+        for _ in 0..n {
+            store
+                .append_event("s", "l", "hook", thor_core::event_store::EventKind::ItemServed, id, None, "{}")
+                .unwrap();
+        }
+    }
+
+    /// The hook loads the decay context on every call, so it reads only the
+    /// verdict events now. It must find exactly what the two whole-log folds
+    /// found: the same ids ever marked useful, the same noise counts (a useful
+    /// mark resets, a revision of text, check or bindings resets, a tag change
+    /// does not), with firings and revisions interleaved.
+    #[test]
+    fn the_verdict_only_pass_equals_the_old_whole_log_folds() {
+        let mut store = EventStore::in_memory().unwrap();
+        stored_rule(&mut store, "a", "text a", None);
+        let mut b = stored_rule(&mut store, "b", "text b", None);
+        let mut c = stored_rule(&mut store, "c", "text c", None);
+        stored_rule(&mut store, "d", "text d", None);
+        stored_rule(&mut store, "e", "text e", None);
+        serve_n(&mut store, "a", 3);
+        noise_n(&mut store, "a", 3);
+        crate::mark::record_useful(&mut store, "s", "l", "a", "2026-10-01T00:00:00Z", "a", None).unwrap();
+        serve_n(&mut store, "b", 2);
+        noise_n(&mut store, "b", 2);
+        b.text = "text b rewritten".to_string();
+        revise_raw(&mut store, &b);
+        noise_n(&mut store, "b", 1);
+        serve_n(&mut store, "a", 2);
+        noise_n(&mut store, "a", 1);
+        noise_n(&mut store, "c", 2);
+        c.tags = vec!["only-a-tag".to_string()];
+        revise_raw(&mut store, &c);
+        noise_n(&mut store, "d", 4);
+        crate::mark::record_useful(&mut store, "s", "l", "a", "2026-10-02T00:00:00Z", "e", None).unwrap();
+        noise_n(&mut store, "ghost", 2);
+        serve_n(&mut store, "d", 5);
+
+        let now = DecayContext::load(&store);
+        let old = load_by_the_old_folds(&store);
+        assert_eq!(now.ever_marked_useful, old.ever_marked_useful);
+        assert_eq!(now.noise, old.noise);
+        // And the fixture really exercises each branch.
+        assert!(now.was_ever_marked_useful("a") && now.was_ever_marked_useful("e") && !now.was_ever_marked_useful("d"));
+        assert_eq!(now.noise.get("a"), Some(&1), "noise after the useful mark");
+        assert_eq!(now.noise.get("b"), Some(&1), "a text revision cleared the older verdicts");
+        assert_eq!(now.noise.get("c"), Some(&2), "a tag change keeps them");
+        assert_eq!(now.noise.get("d"), Some(&4));
+        assert_eq!(now.noise.get("e"), Some(&0));
+    }
+
+    /// The same equality on a store file opened the way the hook opens it
+    /// (read-only), so the connection that runs the narrow query is the real one.
+    #[test]
+    fn the_verdict_only_pass_equals_the_old_folds_on_a_read_only_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        {
+            let mut store = EventStore::new(&path).unwrap();
+            stored_rule(&mut store, "a", "text a", None);
+            serve_n(&mut store, "a", 4);
+            noise_n(&mut store, "a", 2);
+            crate::mark::record_useful(&mut store, "s", "l", "a", "2026-10-01T00:00:00Z", "a", None).unwrap();
+            noise_n(&mut store, "a", 2);
+        }
+        let reader = EventStore::open_read_only(&path).unwrap();
+        let now = DecayContext::load(&reader);
+        let old = load_by_the_old_folds(&reader);
+        assert_eq!(now.ever_marked_useful, old.ever_marked_useful);
+        assert_eq!(now.noise, old.noise);
+        assert_eq!(now.noise.get("a"), Some(&2));
     }
 
     /// FIX 2: a rule whose check can refuse is never retired from showing,

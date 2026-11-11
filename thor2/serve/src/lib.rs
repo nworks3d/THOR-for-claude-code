@@ -217,9 +217,9 @@ pub fn serve(store: &EventStore, input: &input::ServeInput) -> Served {
 /// one unchanging store and can therefore load the decay context once
 /// instead of once per input.
 ///
-/// WHY THIS EXISTS, MEASURED 2026-09-17. `DecayContext::load` folds the
-/// whole event log twice (`ever_marked_useful`, `noise_since_last_useful`),
-/// which is the right trade for a single hook call and the wrong one for a
+/// WHY THIS EXISTS, MEASURED 2026-09-17. `DecayContext::load` used to fold the
+/// whole event log twice; it now reads one pass over the verdict events only
+/// (`usefulness::mark_folds`). That is the right trade for a single hook call and the wrong one for a
 /// probe loop: `ops::health::crowding_line` serves every resolvable anchor
 /// in every checkout, and when it gained command anchors that same day the
 /// health check went from 1m20s to 2m38s on a 163k-event store - the added

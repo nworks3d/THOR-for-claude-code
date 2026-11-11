@@ -595,7 +595,7 @@ impl EventStore {
         // A bigger page cache than SQLite's 2MB default (negative = KiB, so
         // 20000 = ~20MB): this connection reads the SAME event-table pages
         // more than once in a single hook call (the heads projection join,
-        // then `event_kinds` runs twice for the two decay folds), and the
+        // then the verdict read of the decay context), and the
         // default cache is smaller than the log on any real store, so the
         // second and third reads were paying for a disk fetch that the first
         // read had already done moments earlier. Read-only tuning: changes
@@ -737,6 +737,12 @@ impl EventStore {
             );
             CREATE INDEX IF NOT EXISTS idx_event_entity ON event(entity_id);
             CREATE INDEX IF NOT EXISTS idx_event_hash ON event(this_hash);
+            -- Derived, like every index here: lets a reader of a few kinds out of
+            -- a long log (the verdicts the decay folds read) skip the 98 percent
+            -- of the rows that are firings. Nothing reads it for correctness: a
+            -- store without it (read-only open of an older store, a copy) gives
+            -- the same rows by a scan, only slower.
+            CREATE INDEX IF NOT EXISTS idx_event_kind_seq ON event(kind, seq);
             -- Recall projection (M1): a contentless FTS5 index over body_ch,
             -- keyed by the event seq (rowid). Written in the SAME transaction as
             -- the event append (see insert_event), so the index can never lag the
@@ -1819,6 +1825,30 @@ impl EventStore {
     pub fn event_kinds(&self) -> SqlResult<Vec<(EventKind, String)>> {
         let mut stmt = self.conn.prepare_cached("SELECT kind, entity_id FROM event ORDER BY seq")?;
         let rows = stmt.query_map([], |row| {
+            let kind_str: &str = row.get_ref(0)?.as_str()?;
+            let kind = EventKind::from_str(kind_str).ok_or(rusqlite::Error::InvalidQuery)?;
+            let entity_id: String = row.get(1)?;
+            Ok((kind, entity_id))
+        })?;
+        rows.collect()
+    }
+
+    /// Every event of one of `kinds` as `(kind, entity_id)`, in log order. The
+    /// narrow sibling of `event_kinds` for a caller that wants only a few kinds
+    /// out of a long log (the decay folds read two verdict kinds out of a log
+    /// that is mostly firings). It returns exactly the rows `event_kinds` would
+    /// for those kinds, in the same order, with or without `idx_event_kind_seq`:
+    /// the index only decides how fast. A store that lacks it (opened read-only,
+    /// a copy, an older store) is scanned. An empty `kinds` reads nothing.
+    pub fn event_kinds_of(&self, kinds: &[EventKind]) -> SqlResult<Vec<(EventKind, String)>> {
+        if kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let marks = vec!["?"; kinds.len()].join(", ");
+        let sql = format!("SELECT kind, entity_id FROM event WHERE kind IN ({marks}) ORDER BY seq");
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        let names: Vec<&str> = kinds.iter().map(|k| k.as_str()).collect();
+        let rows = stmt.query_map(rusqlite::params_from_iter(names), |row| {
             let kind_str: &str = row.get_ref(0)?.as_str()?;
             let kind = EventKind::from_str(kind_str).ok_or(rusqlite::Error::InvalidQuery)?;
             let entity_id: String = row.get(1)?;
@@ -3776,5 +3806,75 @@ mod item_binding_tests {
         }
         let actors: Vec<&str> = with_actor.iter().map(|(_, _, a)| a.as_str()).collect();
         assert_eq!(actors, vec!["hook", "probe", "hook"], "actor column, in log order");
+    }
+
+    /// Fill a file store with a mix of kinds, marks last-and-first included.
+    fn store_with_mixed_kinds(path: &Path) {
+        let mut store = EventStore::new(path).unwrap();
+        for (kind, entity) in [
+            (EventKind::FactCreated, "a"),
+            (EventKind::ItemServed, "a"),
+            (EventKind::ItemMarkedNoise, "a"),
+            (EventKind::ItemServed, "b"),
+            (EventKind::ItemMarkedUseful, "b"),
+            (EventKind::ItemServed, "a"),
+            (EventKind::FactRevised, "a"),
+            (EventKind::ItemMarkedNoise, "a"),
+            (EventKind::ItemServed, "c"),
+        ] {
+            store.append_event("s", "l", "hook", kind, entity, None, "{}").unwrap();
+        }
+    }
+
+    /// The narrow read returns exactly the rows of the whole-log read for the
+    /// same kinds, in the same order, whether or not the derived index exists.
+    /// A writer creates the index; a store from before it, a copy or a replica
+    /// does not have it and a read-only open cannot create it, so the same
+    /// question must still be answered, by a scan.
+    #[test]
+    fn event_kinds_of_matches_the_whole_log_read_with_and_without_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        store_with_mixed_kinds(&path);
+        let marks = [EventKind::ItemMarkedUseful, EventKind::ItemMarkedNoise];
+        let oracle = |store: &EventStore| -> Vec<(EventKind, String)> {
+            store.event_kinds().unwrap().into_iter().filter(|(k, _)| marks.contains(k)).collect()
+        };
+        let index_exists = |path: &Path| -> bool {
+            let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_event_kind_seq'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+                == 1
+        };
+
+        assert!(index_exists(&path), "a writer's schema creates the index");
+        let writer = EventStore::new(&path).unwrap();
+        assert_eq!(writer.event_kinds_of(&marks).unwrap(), oracle(&writer));
+        assert_eq!(writer.event_kinds_of(&marks).unwrap().len(), 3);
+        assert!(writer.event_kinds_of(&[]).unwrap().is_empty(), "no kinds reads nothing");
+        drop(writer);
+
+        // Strip the index the way an older store lacks it, then read it read-only.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("DROP INDEX idx_event_kind_seq").unwrap();
+        }
+        assert!(!index_exists(&path));
+        let reader = EventStore::open_read_only(&path).unwrap();
+        assert_eq!(reader.event_kinds_of(&marks).unwrap(), oracle(&reader), "a scan answers the same");
+        assert_eq!(reader.event_kinds_of(&[EventKind::ItemServed]).unwrap().len(), 4);
+        drop(reader);
+        assert!(!index_exists(&path), "a read-only open must not create the index");
+
+        // The next writer open builds it again, with the log untouched.
+        let hashes = |s: &EventStore| s.get_all_events().unwrap().into_iter().map(|e| (e.seq, e.this_hash)).collect::<Vec<_>>();
+        let before = hashes(&EventStore::open_existing(&path).unwrap());
+        let writer = EventStore::new(&path).unwrap();
+        assert!(index_exists(&path));
+        assert_eq!(hashes(&writer), before, "an index changes no event");
     }
 }

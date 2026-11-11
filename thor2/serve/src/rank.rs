@@ -153,8 +153,25 @@ fn command_segments(input: &ServeInput) -> Vec<Vec<Segment>> {
         .targets
         .iter()
         .filter(|(kind, _)| *kind == TargetKind::Command)
-        .map(|(_, command)| crate::shell::segments(command, input.dialect))
+        .map(|(_, command)| {
+            if offered_as_a_tool_name(input, command) {
+                vec![crate::shell::tool_segment(command, "")]
+            } else {
+                crate::shell::segments(command, input.dialect)
+            }
+        })
         .collect()
+}
+
+/// Is this Command target the bare NAME of the tool being called
+/// (`ServeInput::add_tool_name`: `Agent`, `Grep`, `Write`) rather than shell
+/// text? Such a name is read as the tool's own pseudo-segment, as the guards
+/// read it (`shell::tool_segment`, `shell::reaches_call`), so an anchor spelled
+/// as the tool reaches its call and the shell word `grep` does not reach the
+/// Grep tool. An explicit Command target given by hand (`check --target
+/// command:..`) names no tool and stays shell text.
+fn offered_as_a_tool_name(input: &ServeInput, command: &str) -> bool {
+    !input.shell_call && input.command.as_deref() == Some(command)
 }
 
 /// Is this item even eligible to reach a gate at all? Delegates to the ONE
@@ -964,6 +981,51 @@ mod tests {
         assert!(select(&[lock()], &running("sed -i s/1/2/ server/package.json")).is_empty());
         assert!(select(&[manifest], &running("sed -i s/1/2/ server/package-lock.json")).is_empty());
         assert_eq!(ids(select(&[lock()], &running("sed -i s/1/2/ server/package-lock.json"))), vec!["lock"]);
+    }
+
+    fn bound_to_command(id: &str, anchor: &str) -> LiveItem {
+        let mut c = base(id, Kind::Rule);
+        c.item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: anchor.to_string() }];
+        c
+    }
+
+    fn tool_call(name: &str) -> ServeInput {
+        let mut input = ServeInput::default();
+        input.add_tool_name(name);
+        input
+    }
+
+    /// THE SERVING SIDE OF THE TOOL-NAME FIX (the guards were fixed first,
+    /// `shell::tool_segment`): an anchor spelled exactly as the tool still
+    /// reaches that tool's call.
+    #[test]
+    fn an_anchor_spelled_as_the_tool_still_reaches_the_tool_call() {
+        for tool in ["Agent", "Workflow", "Write", "Grep"] {
+            let facts = [bound_to_command("on-tool", tool)];
+            assert_eq!(ids(select(&facts, &tool_call(tool))), vec!["on-tool"], "{tool}");
+        }
+        let facts = [bound_to_command("on-mcp", "mcp__thor__remember")];
+        assert_eq!(ids(select(&facts, &tool_call("mcp__thor__remember"))), vec!["on-mcp"]);
+    }
+
+    /// A lower-case shell word is not the tool of the same name: a note about
+    /// the shell program `grep` was served on every call of the Grep tool.
+    #[test]
+    fn a_shell_word_anchor_no_longer_reaches_the_tool_of_the_same_name() {
+        for (anchor, tool) in [("grep", "Grep"), ("agent", "Agent"), ("write", "Write"), ("glob", "Glob")] {
+            let facts = [bound_to_command("on-shell-word", anchor)];
+            assert!(select(&facts, &tool_call(tool)).is_empty(), "{anchor} must not reach the {tool} tool");
+        }
+    }
+
+    /// The shell program itself still gets its note, alone or inside a
+    /// compound call.
+    #[test]
+    fn a_shell_call_still_reaches_its_command_anchor() {
+        let facts = [bound_to_command("on-grep", "grep")];
+        assert_eq!(ids(select(&facts, &running("grep -P x file"))), vec!["on-grep"]);
+        assert_eq!(ids(select(&facts, &running("cd repo && grep -rn x ."))), vec!["on-grep"]);
+        assert!(select(&facts, &running("ls")).is_empty());
     }
 
     /// The Grep and Glob TOOLS are offered as a tool name, not as a shell

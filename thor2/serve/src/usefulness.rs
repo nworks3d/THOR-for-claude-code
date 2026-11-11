@@ -767,6 +767,34 @@ pub fn noise_since_last_useful(store: &EventStore) -> HashMap<String, usize> {
     counts
 }
 
+/// What decay needs from the verdicts, in ONE pass over the verdict events only:
+/// `(ever_marked_useful, noise_since_last_useful)`, equal to what those two
+/// functions return, but read with `EventStore::event_kinds_of` so the log's
+/// firings (98 percent of it on a long-lived store) are never read, and once
+/// instead of twice. `decay::DecayContext::load` runs on every hook call.
+///
+/// Same fail-open as the two folds it replaces: a broken log yields two empty
+/// collections. The old folds stay as they are (other callers, and the oracle
+/// the equality test compares this against).
+pub fn mark_folds(store: &EventStore) -> (HashSet<String>, HashMap<String, usize>) {
+    let Ok(events) = store.event_kinds_of(&[EventKind::ItemMarkedUseful, EventKind::ItemMarkedNoise]) else {
+        return (HashSet::new(), HashMap::new());
+    };
+    let mut ever_useful: HashSet<String> = HashSet::new();
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for (kind, id) in events {
+        match kind {
+            EventKind::ItemMarkedUseful => {
+                counts.insert(id.clone(), 0);
+                ever_useful.insert(id);
+            }
+            EventKind::ItemMarkedNoise => *counts.entry(id).or_default() += 1,
+            _ => {}
+        }
+    }
+    (ever_useful, counts)
+}
+
 /// `id`'s noise marks since its last mark of usefulness OR its last revision
 /// that changed what the rule says: its text, its check or its bindings.
 ///
