@@ -2409,7 +2409,7 @@ pub struct GetArgs {
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LookupArgs {
-    /// Free-text search over every live item's text and tags, any project,
+    /// Free-text search over every live item's text, tags and id, any project,
     /// archive kinds (Report/Chunk) included - never a Lookup item (those
     /// answer only to their own `key`, see below).
     #[serde(default)]
@@ -3332,7 +3332,7 @@ impl ThorMcpServer {
         .await
     }
 
-    #[tool(description = "Code lane: searches THOR's memory - every project, archive kinds (Report, Chunk) included - never scoped to only the current project. Call this before remember, so an existing near-duplicate becomes a revise instead. No arguments returns the catalogue of scopes; scope alone lists everything filed there; scope with query narrows a search to it; query alone searches everywhere; key answers only a Lookup item's own exact key (query, scope and kind are then ignored); kind narrows a search to rule, orientation, report or chunk - several at once with a comma, and 'fires' as shorthand for every kind that can fire at a moment, which is what you want when the fact has to steer an action (case-insensitive, an obvious plural such as 'rules' accepted) - without it, Report hits tend to dominate a plain search since their own text runs long, and asking for kind lookup is refused rather than silently answered empty, since a Lookup register only ever answers to its own key. Read-only, and never an injection surface - nothing here reaches you unprompted. Replies with up to 25 matching lines (id, kind, text) and how many more exist, the catalogue, or a plain 'no matches'. The whole reply stays near 20000 characters: a long body (a Report) is cut to its first part and says to use get with its id for the rest, short rules stay whole, and the reply ends with how many were cut.", annotations(title = "Search the memory", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
+    #[tool(description = "Code lane: searches THOR's memory - every project, archive kinds (Report, Chunk) included - never scoped to only the current project. Call this before remember, so an existing near-duplicate becomes a revise instead. No arguments returns the catalogue of scopes; scope alone lists everything filed there; scope with query narrows a search to it; query alone searches everywhere; key answers only a Lookup item's own exact key (query, scope and kind are then ignored); kind narrows a search to rule, orientation, report or chunk - several at once with a comma, and 'fires' as shorthand for every kind that can fire at a moment, which is what you want when the fact has to steer an action (case-insensitive, an obvious plural such as 'rules' accepted) - without it, Report hits tend to dominate a plain search since their own text runs long, and asking for kind lookup is refused rather than silently answered empty, since a Lookup register only ever answers to its own key. Read-only, and never an injection surface - nothing here reaches you unprompted. A query word is looked for in an item's text, tags and id: an id is read as words only when it is a readable slug and the word has 4 or more letters, or when the word is the whole id (so a machine-made id can be pasted whole); a hit found only by its id comes after the others. When no item holds the exact words, a multi-word query is tried again with each long word matched by its first letters (other word forms), and the reply says so in one line. Replies with up to 25 matching lines (id, kind, text) and how many more exist, the catalogue, or a plain 'no matches'. The whole reply stays near 20000 characters: a long body (a Report) is cut to its first part and says to use get with its id for the rest, short rules stay whole, and the reply ends with how many were cut.", annotations(title = "Search the memory", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn lookup(&self, Parameters(args): Parameters<LookupArgs>) -> String {
         let vectors = self.vectors.clone();
         #[cfg(feature = "semantic")]
@@ -3419,8 +3419,10 @@ impl ThorMcpServer {
             // and whether the LITERAL leg (search's own text match) found
             // anything at all for this query - the precondition
             // `meaning_only_note` below needs, independent of scope/kind.
-            let (literal_hits, withheld) = serve::lookup::search_with_expired(s, query);
-            let literal_found_any = !literal_hits.is_empty();
+            let leg = serve::lookup::literal_leg(s, query);
+            let withheld = leg.withheld;
+            let literal_found_any = leg.found_any();
+            let stems_only = leg.stem_only();
             let mut out = String::new();
             if hits.is_empty() {
                 // A thin answer must name the kind when one was asked for, so
@@ -3480,6 +3482,12 @@ impl ThorMcpServer {
             if !hits.is_empty() {
                 if let Some(note) = serve::lookup::meaning_only_note(literal_found_any) {
                     out.push_str(note);
+                    out.push('\n');
+                }
+                // Nothing held the exact words: the literal hits above stand
+                // on word stems alone. Said in one plain line.
+                if stems_only {
+                    out.push_str(serve::lookup::stem_match_note());
                     out.push('\n');
                 }
             }

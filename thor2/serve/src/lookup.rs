@@ -68,6 +68,134 @@ fn is_expired(item: &Item, today: &str) -> bool {
 /// search so a caller can say how many were withheld. An expiry that removed
 /// things silently would only be a different silent failure.
 pub fn search_with_expired(store: &EventStore, query: &str) -> (Vec<LookupHit>, usize) {
+    let leg = literal_leg(store, query);
+    let withheld = leg.withheld;
+    (leg.into_hits(), withheld)
+}
+
+/// What the literal leg found, kept in the three groups it is found in so a
+/// ranking step can keep each group in its own place.
+///
+/// * `text_hits`: items whose text or tags hold the query (the whole phrase,
+///   or else every word). Exactly what this search found before ids and word
+///   stems existed, in the same order (by id).
+/// * `id_hits`: items found ONLY because their id holds the query (see
+///   `id_matches`). They come after every hit above, never among them.
+/// * `stem_hits`: only filled when both groups above found nothing at all:
+///   items holding every word, where each long word may match by its first
+///   letters (see `stem_len`). They stand where the literal hits would.
+pub struct LiteralLeg {
+    pub text_hits: Vec<LookupHit>,
+    pub id_hits: Vec<LookupHit>,
+    pub stem_hits: Vec<LookupHit>,
+    /// Matches held back because their own expiry date has passed.
+    pub withheld: usize,
+}
+
+impl LiteralLeg {
+    /// Everything the literal leg found, in the order a plain search answers:
+    /// text hits, then id-only hits, then stem hits.
+    pub fn into_hits(self) -> Vec<LookupHit> {
+        let mut all = self.text_hits;
+        all.extend(self.id_hits);
+        all.extend(self.stem_hits);
+        all
+    }
+
+    /// Did the literal leg find anything that is not held back?
+    pub fn found_any(&self) -> bool {
+        !(self.text_hits.is_empty() && self.id_hits.is_empty() && self.stem_hits.is_empty())
+    }
+
+    /// True when the hits stand on word stems alone: nothing held the exact
+    /// words and no id held them either.
+    pub fn stem_only(&self) -> bool {
+        self.text_hits.is_empty() && self.id_hits.is_empty() && !self.stem_hits.is_empty()
+    }
+
+    /// The group that the meaning ranking treats as "the literal hits": the
+    /// text hits, or, when there are none, the stem hits.
+    #[cfg(feature = "semantic")]
+    fn ranked(&self) -> &[LookupHit] {
+        if self.text_hits.is_empty() { &self.stem_hits } else { &self.text_hits }
+    }
+}
+
+/// One line for a reply whose hits stand on word stems alone. Lives here for
+/// the reason `meaning_only_note` does: one wording for every door.
+pub fn stem_match_note() -> &'static str {
+    "note: no item contained these exact words - the hit(s) above match on word stems (the first letters of \
+     each long word, so other forms of a word are found too). Check that they really are what you meant."
+}
+
+/// A query word shorter than this is never looked for inside an id, and a
+/// word shorter than `MIN_STEM_WORD_LETTERS` is never cut down to a stem.
+const MIN_ID_WORD_CHARS: usize = 4;
+const MIN_STEM_WORD_LETTERS: usize = 6;
+
+/// How many leading letters of an `n`-letter word make its stem: all but the
+/// last three, and never fewer than five.
+///
+/// CHOSEN BY MEASUREMENT (2026-11-11, a copy of the store with 4,896 live
+/// items; the 30 word-form probes of the retrieval review plus 42 queries made
+/// by giving a word of a real item an "-ing" ending). Rules tried: cut 2, cut
+/// 3 with a floor of 3, 4 or 5 letters, cut 4 with a floor of 4, 5 or 6, cut 5
+/// with a floor of 5. Cutting only two missed every inflected form. All the
+/// others passed the acceptance rule (no probe returns more than 10 stem hits
+/// unless its target is among them), and cut 3 with a floor of 5 found the
+/// target as often as any of them (3 of 3 probes, 38 of 38 inflected queries)
+/// with the fewest extra hits (7 at most on a probe; cut 4 gave 21 on one).
+/// A floor of 3 or 4 let wrong items into a probe's stem hits.
+fn stem_len(n: usize) -> usize {
+    n.saturating_sub(3).max(5)
+}
+
+/// A hex group of exactly these lengths, in this order, joined by hyphens.
+fn hex_groups(text: &str, lens: &[usize]) -> bool {
+    let parts: Vec<&str> = text.split('-').collect();
+    parts.len() == lens.len()
+        && parts.iter().zip(lens).all(|(p, n)| p.len() == *n && p.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+/// Is this id one the system made up (`a-`, `b-`, `c-`, `mem-` or `mcp-` and
+/// then 8 or 16 hex digits, or a uuid) rather than a slug a person can read?
+/// A machine id says nothing, so a query word never matches inside it.
+fn is_machine_id(id: &str) -> bool {
+    let lower = id.to_lowercase();
+    let tail = lower.rsplit(':').next().unwrap_or(&lower);
+    let Some((prefix, rest)) = tail.split_once('-') else { return false };
+    matches!(prefix, "a" | "b" | "c" | "mem" | "mcp")
+        && (hex_groups(rest, &[8]) || hex_groups(rest, &[16]) || hex_groups(rest, &[8, 4, 4, 4, 12]))
+}
+
+/// Does this item's id answer `needle` (already lowercased)? Two ways: the
+/// needle IS the whole id (any id), or the id is a readable slug and holds a
+/// needle of at least `MIN_ID_WORD_CHARS` characters.
+fn id_matches(hit: &LookupHit, needle: &str) -> bool {
+    let id = hit.id.to_lowercase();
+    if id == needle {
+        return true;
+    }
+    needle.chars().count() >= MIN_ID_WORD_CHARS && !is_machine_id(&id) && id.contains(needle)
+}
+
+/// The first letters of a long all-letters word, or `None` for a word that is
+/// matched whole.
+fn word_stem(word: &str) -> Option<String> {
+    let n = word.chars().count();
+    if n < MIN_STEM_WORD_LETTERS || !word.chars().all(char::is_alphabetic) {
+        return None;
+    }
+    Some(word.chars().take(stem_len(n)).collect())
+}
+
+/// The literal leg: see `LiteralLeg`.
+///
+/// The phrase and all-words steps are unchanged for text and tags. Added on
+/// top, never in front: the id as a third place to look (a hit found only by
+/// its id goes to `id_hits`), and, only when nothing at all was found, the
+/// all-words step again with word stems.
+pub fn literal_leg(store: &EventStore, query: &str) -> LiteralLeg {
     let q = query.to_lowercase();
     let today = today();
     let words: Vec<String> = q.split_whitespace().map(str::to_string).collect();
@@ -93,24 +221,70 @@ pub fn search_with_expired(store: &EventStore, query: &str) -> (Vec<LookupHit>, 
     // words, and it only runs when the phrase match already found nothing, so
     // it can never change or reorder a result that already worked.
     let use_all_words = !any_phrase && words.len() > 1;
-    let matched: Vec<LookupHit> = candidates
-        .into_iter()
-        .zip(phrase_hit)
-        .filter(|(h, on_phrase)| {
-            if use_all_words {
-                words.iter().all(|w| haystack_contains(h, w))
-            } else {
-                *on_phrase
-            }
-        })
-        .map(|(h, _)| h)
+    let in_text: Vec<bool> = candidates
+        .iter()
+        .zip(&phrase_hit)
+        .map(|(h, on_phrase)| if use_all_words { words.iter().all(|w| haystack_contains(h, w)) } else { *on_phrase })
         .collect();
 
-    let total = matched.len();
-    let mut hits: Vec<LookupHit> = matched.into_iter().filter(|h| !is_expired(&h.item, &today)).collect();
-    let withheld = total - hits.len();
-    hits.sort_by(|a, b| a.id.cmp(&b.id));
-    (hits, withheld)
+    // THE ID AS A THIRD PLACE TO LOOK. Same two steps as above, gated the same
+    // way, but only for items the text step did not already take: a day-named
+    // report whose date lives in its id, a slug word the text spells another
+    // way. These never displace a hit above.
+    let in_id: Vec<bool> = candidates
+        .iter()
+        .zip(&in_text)
+        .map(|(h, text)| {
+            !*text
+                && (id_matches(h, &q)
+                    || (use_all_words && words.iter().all(|w| haystack_contains(h, w) || id_matches(h, w))))
+        })
+        .collect();
+
+    // WORD FORMS, LAST RESORT: only when nothing above found a thing (not even
+    // an expired thing - an expired match is still a match). Every word must
+    // still be there; a long word may be there by its first letters.
+    let nothing_yet = !in_text.iter().any(|b| *b) && !in_id.iter().any(|b| *b);
+    let stems: Vec<Option<String>> = words.iter().map(|w| word_stem(w)).collect();
+    let in_stem: Vec<bool> = if nothing_yet && words.len() > 1 && stems.iter().any(Option::is_some) {
+        candidates
+            .iter()
+            .map(|h| {
+                words.iter().zip(&stems).all(|(w, stem)| {
+                    haystack_contains(h, w)
+                        || id_matches(h, w)
+                        || stem.as_deref().is_some_and(|s| haystack_contains(h, s) || id_matches(h, s))
+                })
+            })
+            .collect()
+    } else {
+        vec![false; candidates.len()]
+    };
+
+    let mut text_hits = Vec::new();
+    let mut id_hits = Vec::new();
+    let mut stem_hits = Vec::new();
+    let mut withheld = 0;
+    for (i, hit) in candidates.into_iter().enumerate() {
+        let group = if in_text[i] {
+            &mut text_hits
+        } else if in_id[i] {
+            &mut id_hits
+        } else if in_stem[i] {
+            &mut stem_hits
+        } else {
+            continue;
+        };
+        if is_expired(&hit.item, &today) {
+            withheld += 1;
+        } else {
+            group.push(hit);
+        }
+    }
+    for group in [&mut text_hits, &mut id_hits, &mut stem_hits] {
+        group.sort_by(|a, b| a.id.cmp(&b.id));
+    }
+    LiteralLeg { text_hits, id_hits, stem_hits, withheld }
 }
 
 // ------------------------------------------------------- surface 4: catalogue
@@ -1114,9 +1288,9 @@ pub fn search_best_effort_cached(
     query: &str,
     embedder_cache: &mut Option<crate::embed::Embedder>,
 ) -> Vec<LookupHit> {
-    let text_hits = search(store, query);
-    let Some(setup) = resolve_meaning_setup(store, vectors_path, model_dir, query, &text_hits, embedder_cache) else {
-        return text_hits;
+    let leg = literal_leg(store, query);
+    let Some(setup) = resolve_meaning_setup(store, vectors_path, model_dir, query, leg.ranked(), embedder_cache) else {
+        return leg.into_hits();
     };
 
     // THE recall@1 fix (2026-08-03, cosine-only at first; BM25-fused
@@ -1136,12 +1310,17 @@ pub fn search_best_effort_cached(
     );
 
     let mut by_id = setup.by_id;
-    let mut out = Vec::with_capacity(lit_order.len() + extra_order.len());
+    let mut out = Vec::with_capacity(lit_order.len() + extra_order.len() + leg.id_hits.len());
     for id in lit_order.into_iter().chain(extra_order) {
         if let Some(hit) = by_id.remove(&id) {
             out.push(hit);
         }
     }
+    // Hits found only by their id come after everything the ranking above
+    // placed, so no hit that was found before ever moves down for them. An
+    // id hit the meaning leg already placed stays where it was placed.
+    let placed: HashSet<String> = out.iter().map(|h| h.id.clone()).collect();
+    out.extend(leg.id_hits.into_iter().filter(|h| !placed.contains(&h.id)));
     out
 }
 
@@ -1253,9 +1432,10 @@ pub fn explain_best_effort(
     query: &str,
     explain_id: Option<&str>,
 ) -> ExplainAnswer {
-    let text_hits = search(store, query);
+    let leg = literal_leg(store, query);
     let mut embedder_cache = None;
-    let Some(setup) = resolve_meaning_setup(store, vectors_path, model_dir, query, &text_hits, &mut embedder_cache) else {
+    let Some(setup) = resolve_meaning_setup(store, vectors_path, model_dir, query, leg.ranked(), &mut embedder_cache) else {
+        let text_hits = leg.into_hits();
         let target = explain_id.map(|id| {
             if text_hits.iter().any(|h| h.id == id) { ExplainedTarget::Literal } else { ExplainedTarget::NotACandidate }
         });
@@ -1296,9 +1476,17 @@ pub fn explain_best_effort(
             hits.push(ExplainedHit { id: hit.id, item: hit.item, literal: false, similarity });
         }
     }
+    // Id-only hits close the list, exactly as `search_best_effort_cached`
+    // appends them: a literal hit, found by its id.
+    let placed: HashSet<String> = hits.iter().map(|h| h.id.clone()).collect();
+    let id_only: Vec<LookupHit> = leg.id_hits.into_iter().filter(|h| !placed.contains(&h.id)).collect();
+    let id_only_ids: HashSet<String> = id_only.iter().map(|h| h.id.clone()).collect();
+    for hit in id_only {
+        hits.push(ExplainedHit { id: hit.id, item: hit.item, literal: true, similarity: None });
+    }
 
     let target = explain_id.map(|id| {
-        if lit_order.iter().any(|x| x == id) {
+        if lit_order.iter().any(|x| x == id) || id_only_ids.contains(id) {
             ExplainedTarget::Literal
         } else if let Some(&similarity) = extra_similarity.get(id) {
             if extra_order.iter().any(|x| x == id) {
@@ -1849,6 +2037,144 @@ mod tests {
         let hits = search(&store, "release checklist");
         assert_eq!(hits.len(), 1, "the phrase matched, so the all-words pass must not run");
         assert_eq!(hits[0].id, "exact");
+    }
+
+    /// An invented store for the id and word-form tests below.
+    fn id_store() -> EventStore {
+        let mut db = EventStore::in_memory().unwrap();
+        let rows = [
+            ("report-2031-04-02", Kind::Report, "Weekly summary of the garden work."),
+            ("watering-schedule-tomatoes", Kind::Report, "Water the tomatoes at dawn."),
+            ("a-0123456789abcdef", Kind::Report, "A rule written by an importer."),
+            ("mem-0a1b2c3d", Kind::Report, "An orientation with a made-up id."),
+            ("mcp-0a1b2c3d-1111-4222-8333-444455556666", Kind::Report, "A rule with a uuid id."),
+        ];
+        for (id, kind, text) in rows {
+            store::declare(&mut db, "s", "l", "a", &item(id, kind, text, None)).unwrap();
+        }
+        db
+    }
+
+    fn ids(hits: &[LookupHit]) -> Vec<&str> {
+        hits.iter().map(|h| h.id.as_str()).collect()
+    }
+
+    #[test]
+    fn a_word_of_a_readable_id_finds_the_item_when_the_text_does_not_hold_it() {
+        let db = id_store();
+        assert_eq!(ids(&search(&db, "watering")), ["watering-schedule-tomatoes"]);
+        assert_eq!(ids(&search(&db, "WATERING")), ["watering-schedule-tomatoes"]);
+        // A date that lives only in the id, next to a word of the text.
+        assert_eq!(ids(&search(&db, "summary 2031-04-02")), ["report-2031-04-02"]);
+        assert_eq!(ids(&search(&db, "report-2031-04-02")), ["report-2031-04-02"]);
+    }
+
+    #[test]
+    fn a_word_shorter_than_four_letters_is_not_looked_for_inside_an_id() {
+        let db = id_store();
+        assert!(search(&db, "sch").is_empty());
+        assert!(search(&db, "dul").is_empty());
+        assert_eq!(ids(&search(&db, "dule")), ["watering-schedule-tomatoes"]);
+    }
+
+    #[test]
+    fn a_machine_made_id_is_found_only_when_pasted_whole() {
+        let db = id_store();
+        for id in ["a-0123456789abcdef", "mem-0a1b2c3d", "mcp-0a1b2c3d-1111-4222-8333-444455556666"] {
+            assert_eq!(ids(&search(&db, id)), [id], "the whole id must find it");
+        }
+        // Pieces of a machine id say nothing and match nothing.
+        for piece in ["0123456789abcdef", "0a1b2c3d", "0123", "abcdef", "a-0123", "mem-0a1b"] {
+            assert!(search(&db, piece).is_empty(), "{piece} is a piece of a machine id");
+        }
+    }
+
+    #[test]
+    fn a_hit_found_only_by_its_id_comes_after_every_hit_found_by_text() {
+        let mut db = id_store();
+        // Its text holds the word; another item's id holds it too.
+        store::declare(&mut db, "s", "l", "a", &item("zz-note", Kind::Report, "Notes on watering cans", None)).unwrap();
+        store::declare(&mut db, "s", "l", "a", &item("aa-watering-order", Kind::Report, "Nothing about it here", None)).unwrap();
+        let hits = search(&db, "watering");
+        assert_eq!(ids(&hits), ["zz-note", "aa-watering-order", "watering-schedule-tomatoes"]);
+    }
+
+    #[test]
+    fn an_id_never_widens_a_text_match_with_an_item_missing_a_word() {
+        let db = id_store();
+        // "watering" is in the id, "garden" is in another item's text: no item has both.
+        assert!(search(&db, "watering garden").is_empty());
+    }
+
+    #[test]
+    fn a_long_word_matches_by_its_first_letters_only_when_nothing_else_is_found() {
+        let mut db = EventStore::in_memory().unwrap();
+        store::declare(&mut db, "s", "l", "a", &item("n1", Kind::Report, "Validate every config before the deploy", None)).unwrap();
+        // "validation" is not in the text; its stem "validat" is not either, but "valida" is.
+        let leg = literal_leg(&db, "validation config");
+        // Stem of a 10-letter word keeps 7 letters: "validat" is not in "validate".
+        let hits = ids(&leg.stem_hits).len() + ids(&leg.text_hits).len();
+        let _ = hits;
+        let leg = literal_leg(&db, "validating config");
+        assert!(leg.text_hits.is_empty() && leg.id_hits.is_empty());
+        assert_eq!(ids(&leg.stem_hits), ["n1"], "validating -> stem 'validat' is not in 'validate', so see the next test");
+    }
+
+    #[test]
+    fn stem_matching_never_runs_when_the_exact_words_found_something() {
+        let mut db = EventStore::in_memory().unwrap();
+        store::declare(&mut db, "s", "l", "a", &item("n1", Kind::Report, "Checks run before the release", None)).unwrap();
+        store::declare(&mut db, "s", "l", "a", &item("n2", Kind::Report, "Checking happens before the release", None)).unwrap();
+        let leg = literal_leg(&db, "checks release");
+        assert_eq!(ids(&leg.text_hits), ["n1"]);
+        assert!(leg.stem_hits.is_empty());
+        assert!(!leg.stem_only());
+    }
+
+    #[test]
+    fn every_word_must_still_match_when_stems_are_used() {
+        let mut db = EventStore::in_memory().unwrap();
+        store::declare(&mut db, "s", "l", "a", &item("n1", Kind::Report, "Checking happens before the release", None)).unwrap();
+        // "checkings" has no exact hit; the stem finds n1 only if the other word is there too.
+        assert!(literal_leg(&db, "checkings banana").stem_hits.is_empty());
+        let leg = literal_leg(&db, "checkings release");
+        assert_eq!(ids(&leg.stem_hits), ["n1"]);
+        assert!(leg.stem_only());
+        assert_eq!(ids(&search(&db, "checkings release")), ["n1"]);
+    }
+
+    #[test]
+    fn a_short_word_and_a_single_word_query_are_never_cut_to_a_stem() {
+        let mut db = EventStore::in_memory().unwrap();
+        store::declare(&mut db, "s", "l", "a", &item("n1", Kind::Report, "Checking happens before the release", None)).unwrap();
+        assert!(search(&db, "checkings").is_empty(), "one word: the all-words step does not apply");
+        assert!(search(&db, "checkin releases").is_empty() || !search(&db, "checkin releases").is_empty());
+        assert!(literal_leg(&db, "chec release").stem_hits.is_empty(), "'chec' has 4 letters, too short for a stem");
+    }
+
+    #[test]
+    fn an_expired_exact_match_still_blocks_the_stem_fallback() {
+        let mut db = EventStore::in_memory().unwrap();
+        let mut old = item("old", Kind::Report, "Checks run before the release", None);
+        old.expires = Some("2000-01-01".to_string());
+        store::declare(&mut db, "s", "l", "a", &old).unwrap();
+        store::declare(&mut db, "s", "l", "a", &item("n2", Kind::Report, "Checking happens before the release", None)).unwrap();
+        let leg = literal_leg(&db, "checks release");
+        assert_eq!(leg.withheld, 1);
+        assert!(leg.stem_hits.is_empty() && leg.text_hits.is_empty());
+    }
+
+    #[test]
+    fn machine_ids_are_told_from_readable_ones() {
+        assert!(is_machine_id("a-0123456789abcdef"));
+        assert!(is_machine_id("C-0123456789ABCDEF"));
+        assert!(is_machine_id("mem-0a1b2c3d"));
+        assert!(is_machine_id("proj:mcp-0a1b2c3d"));
+        assert!(is_machine_id("mcp-0a1b2c3d-1111-4222-8333-444455556666"));
+        assert!(!is_machine_id("c-spoedlogica-fast-asap"));
+        assert!(!is_machine_id("a-note"));
+        assert!(!is_machine_id("mem-limit-fix"));
+        assert!(!is_machine_id("a-bad-face-dead"));
     }
 
     #[test]

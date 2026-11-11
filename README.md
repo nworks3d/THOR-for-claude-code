@@ -1239,7 +1239,8 @@ split in two.
 - `unpin` - stop it being one
 - `get` - show one item whole, by id
 - `lookup` - search everything - every project, by scope, by key, or by free
-  text
+  text (looked for in an item's text, its tags and its id; other forms of a word
+  are found when nothing matched the exact words)
 - `history` - walk one item's whole past, oldest first
 - `mark` - judge whether something you were served actually helped
 - `status` - how much of the memory can actually stop a mistake, and how much

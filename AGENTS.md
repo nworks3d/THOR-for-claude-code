@@ -551,7 +551,10 @@ announce themselves.
 
 - `remember` - store a new note. `revise` - correct one that exists. Prefer
   revise: a second copy of a note is worse than no note.
-- `lookup` - search everything, any project, before you store. `get` - read one
+- `lookup` - search everything, any project, before you store. It looks in a
+  note's text, tags and id (a word of a readable id, or a whole machine-made
+  id), and when nothing holds your exact words it also tries other forms of
+  your long words and says so. `get` - read one
   note by its id. `history` - walk one note's whole life.
 - `status` - what is in the memory right now.
 - `retract` - remove a note that is simply wrong, with a reason. `mark` - record

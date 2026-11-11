@@ -1084,7 +1084,14 @@ being a rail.
 assistant that then reads the answer. It is not a way to fetch the one fact
 that answers a question, and it is worth knowing why before you build on it.
 A search first tries your words literally - the whole phrase, and failing
-that, every single word has to appear somewhere in the item. A ten-word
+that, every single word has to appear somewhere in the item (in its text, its
+tags or its id: a word of 4 or more letters is also looked for inside a
+readable id, such as a date in a report's name, and a machine-made id is found
+only when you give the whole id; a hit found only by its id comes after the
+others). Only when nothing at all matched, and the query has several words,
+each long word of 6 letters or more may match by its first letters (all but
+its last three, at least five), so other forms of a word are found; the reply
+then says that the match is on word stems. A ten-word
 question therefore matches nothing literally, and everything you get back
 comes from meaning search instead. That leg scores an item by its best
 chunk, so a long report, split into many chunks, gets many attempts while a
