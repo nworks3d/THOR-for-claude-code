@@ -561,6 +561,11 @@ mod tests {
         let fake = repo.root.path().join("fakeindex.sh");
         let log = repo.root.path().join("calls.log");
         fs::write(&fake, format!("#!/bin/sh\necho \"$3\" >> \"{}\"\n", slashes(&log))).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        }
         let index_root = repo.root.path().join("index");
         fs::create_dir_all(&index_root).unwrap();
         // The project key is the repository folder's name.
