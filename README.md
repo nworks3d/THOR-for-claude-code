@@ -651,7 +651,7 @@ yours. The one exception is on Windows: two of them refuse a call that would
 flash a console window (a `Start-Process` that is not hidden, and a scheduled
 task made with `/it`). Ask your assistant to remove any you
 do not want. The two notes that carry helper-agent mode are not among them: that
-mode is off in a new memory.
+mode is on in a new memory, and you switch it off by saying "helpers off".
 
 You only reach for a flag if your setup is unusual: `--settings` and `--mcp-json`
 send it at other files, `--db` and `--serve-exe` override where it looks, and

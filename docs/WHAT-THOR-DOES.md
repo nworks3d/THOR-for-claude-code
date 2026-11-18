@@ -508,7 +508,7 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
 - What: while the seeded setup note is live, every turn end is held until the assistant has told the
   owner in one sentence the defaults (short plain replies in his own language; work lane only; every
   starting note and example rule kept; projects named after their folder; every default on except
-  helper agents and backup, which stay off until he chooses), stored them as
+  backup, which follows his answer to the welcome), stored them as
   "owner-setup-answers" (a Report, no project needed), and retracted the setup note.
 - Why: a seeded sentence in a note was the entire enforcement before and was skipped. It is not an
   interview: "just do it", or no answer, is answered by the defaults.
@@ -979,18 +979,19 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
 - You notice: refusals with a way on.
 - Refuse or change: no.
 
-### F15. Helper-agent mode (first-session item 6) is off until you switch it on
-- What: install --set-helpers on|off --db <memory>. A new memory does not hold the two notes that carry the
-  mode (orchestrator-mode-saves-quota and an-agent-brief-stands-alone, bound to the Agent tool). On stores
+### F15. Helper-agent mode (first-session item 6) is on in a new memory
+- What: install --set-helpers on|off --db <memory>. A NEW memory also stores the two notes that carry the
+  mode (orchestrator-mode-saves-quota and an-agent-brief-stands-alone, bound to the Agent tool); an existing
+  memory is never touched. On stores
   exactly those two; off retracts them with a reason; running either twice changes nothing. A retracted id
   cannot simply be created again, so on after off stores the note again and then resolves the id onto the
   new version: the log keeps created, retracted, created, resolved, and the id is live with one head.
 - Why: measured at the maker, helpers were likely 12 to 62 percent cheaper and keep the chat free, but you do
   not see the work happen and cannot steer a helper halfway, each helper starts with a fixed context cost
   (small tasks cost more), it knows nothing of the conversation beyond its brief, parallel helpers can
-  collide in the same files, and checking the result costs an extra turn. So it is yours to choose.
-- You notice: with it off your assistant does the work itself in the main conversation; with it on, a
-  reminder arrives right before a helper agent is started.
+  collide in the same files, and checking the result costs an extra turn. So it is on by default and yours to switch off.
+- You notice: with it on, a reminder arrives right before a helper agent is started; with it off your
+  assistant does the work itself in the main conversation.
 - Refuse or change: say "helpers on" or "helpers off" to your assistant.
 
 ### F16. The media gate (A7b) can be tuned, allowed per file, or switched off

@@ -1623,7 +1623,7 @@ pub fn seed_working_contract_at(
     // rendered from the same catalogue as the page in AGENTS.md.
     let detected = claude_json.map(serve::plan::detect_in);
     let questions = crate::questionnaire::lookup_item_with(detected, paths);
-    for item in working_contract().into_iter().chain(workflow_starter_pack()).chain(std::iter::once(questions)) {
+    for item in working_contract().into_iter().chain(workflow_starter_pack()).chain(helper_mode_notes()).chain(std::iter::once(questions)) {
         let id = item.id.clone();
         match model::store::declare(&mut store, "install", "install", installer(), &item) {
             Ok(_) => out.push(SeededItem { id, stored: true, refusal: None }),
@@ -2916,7 +2916,7 @@ mod tests {
 
         let seeded = seed_working_contract(&db).unwrap();
         // The notes, the starter pack and the first-session list (a lookup item).
-        assert_eq!(seeded.len(), working_contract().len() + workflow_starter_pack().len() + 1);
+        assert_eq!(seeded.len(), working_contract().len() + workflow_starter_pack().len() + helper_mode_notes().len() + 1);
         for s in &seeded {
             assert!(s.stored, "the gate refused its own starting note {}: {:?}", s.id, s.refusal);
         }
@@ -2978,7 +2978,7 @@ mod tests {
         assert_eq!(report.store, StoreOutcome::Created);
         assert_eq!(working_contract().len(), 22, "this test's own claim of 22 starting notes is now stale");
         // 22 working-contract notes, the starter pack, and the first-session list.
-        let want = 22 + workflow_starter_pack().len() + 1;
+        let want = 22 + workflow_starter_pack().len() + helper_mode_notes().len() + 1;
         let stored = report.seeded.iter().filter(|s| s.stored).count();
         assert_eq!(stored, want, "expected all {want} starting notes to be stored, got {stored}");
         assert_eq!(report.rulebook.outcome, RulebookOutcome::Written);
@@ -3132,16 +3132,24 @@ mod tests {
         }
     }
 
-    /// Helper-agent mode is off in a new memory (owner decision, 2026-10-09):
-    /// its two notes are in no seeded set, and they are as generic and as small
-    /// as every other starter note.
+    /// Helper-agent mode is ON in a new memory (owner decision, 2026-11-18, it
+    /// had been off since 2026-10-09): its two notes are seeded into a NEW
+    /// store beside the pack, never in the pack itself, and they are as
+    /// generic and as small as every other starter note.
     #[test]
     fn the_helper_notes_are_outside_every_seeded_set_and_as_clean_as_the_pack() {
         let helpers = helper_mode_notes();
         let ids: Vec<&str> = helpers.iter().map(|n| n.id.as_str()).collect();
         assert_eq!(ids, crate::questionnaire::HELPER_MODE_NOTES);
         for seeded in working_contract().into_iter().chain(workflow_starter_pack()) {
-            assert!(!ids.contains(&seeded.id.as_str()), "{} is seeded into a new memory", seeded.id);
+            assert!(!ids.contains(&seeded.id.as_str()), "{} is in the pack itself", seeded.id);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        ensure_store(&db).unwrap();
+        let seeded = seed_working_contract(&db).unwrap();
+        for id in &ids {
+            assert!(seeded.iter().any(|s| s.id == *id && s.stored), "{id} is not seeded into a new memory");
         }
         for item in &helpers {
             assert_eq!(item.kind, model::item::Kind::Rule);

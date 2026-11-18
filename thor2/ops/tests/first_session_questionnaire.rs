@@ -290,8 +290,8 @@ fn every_install_flag_the_list_names_exists_in_the_installer() {
 #[test]
 fn helper_agent_mode_is_off_by_default_and_states_the_measurement_the_free_chat_and_the_costs() {
     let q = questions().into_iter().find(|q| q.id == "helper-agents").unwrap();
-    assert!(q.line.ends_with("Default: off."), "the one line the user sees says it is off: {}", q.line);
-    assert_eq!(q.default, "Off.");
+    assert!(q.line.contains("Default: on") && q.line.contains("helpers off"), "the one line the user sees says it is on and how to stop: {}", q.line);
+    assert_eq!(q.default, "On.");
     assert!(q.why.contains("12 to 62 percent cheaper"), "{}", q.why);
     assert!(q.why.contains("chat stays free"), "{}", q.why);
     // The honest side: the reasons somebody may not want it, and when no helper is used.
@@ -308,7 +308,7 @@ fn helper_agent_mode_is_off_by_default_and_states_the_measurement_the_free_chat_
         assert!(q.what.contains(must), "item 6 lacks '{must}': {}", q.what);
     }
     // The way to switch it on, and back off.
-    assert!(q.what.contains("install --set-helpers on --db <store>"), "{}", q.what);
+    assert!(q.what.contains("install --set-helpers off --db <store>") && q.what.contains("on in a new memory"), "{}", q.what);
     assert!(q.say_no.contains("install --set-helpers off --db <store>"), "{}", q.say_no);
     assert!(questionnaire::ASSISTANT_RULES.contains("--set-helpers on|off"), "the assistant knows the command");
     // The two notes live outside the pack, and the questionnaire names exactly them.

@@ -1,7 +1,7 @@
 //! `install --set-helpers on|off`: helper-agent mode (first-session item 6) is
-//! OFF in a new memory and is switched on by one command. These tests hold the
-//! three promises: a fresh memory has neither note, `on` stores exactly the two
-//! notes, `off` retracts them with a reason, and both are safe to repeat. A
+//! ON in a new memory (its two notes are seeded) and is switched off or on by one
+//! command. These tests hold the promises: a new memory has both notes, an old
+//! memory without them gets exactly the two when switched `on`, `off` retracts them with a reason, and both are safe to repeat. A
 //! retracted id cannot simply be stored again (a create is never an upsert, a
 //! second one would leave the id with two heads), so `on` after `off` must still
 //! work: that round trip is tested too.
@@ -23,6 +23,14 @@ impl Fx {
         ops::install::ensure_store(&fx.db()).unwrap();
         let seeded = ops::install::seed_working_contract(&fx.db()).unwrap();
         assert!(seeded.iter().all(|s| s.stored), "refused: {:?}", seeded.iter().filter(|s| !s.stored).collect::<Vec<_>>());
+        fx
+    }
+    /// An OLD memory: a store made before helper mode was seeded, with no
+    /// starting notes at all.
+    fn empty() -> Fx {
+        let fx = Fx { home: tempfile::tempdir().unwrap() };
+        std::fs::create_dir_all(fx.db().parent().unwrap()).unwrap();
+        ops::install::ensure_store(&fx.db()).unwrap();
         fx
     }
     fn db(&self) -> PathBuf {
@@ -62,16 +70,25 @@ fn said(out: &Output) -> String {
 }
 
 #[test]
-fn a_fresh_memory_has_neither_helper_note() {
+fn a_new_memory_has_both_helper_notes() {
     let fx = Fx::new();
     for id in NOTES {
-        assert!(matches!(fx.read(id), Err(ReadError::NotFound(_))), "{id} must not be seeded by default");
+        assert!(fx.read(id).is_ok(), "{id} must be seeded into a new memory");
+    }
+    assert!(fx.read(NOTES[1]).unwrap().bindings.contains(&model::item::Binding::Always), "the brief note is pinned from the start");
+}
+
+#[test]
+fn an_old_memory_without_them_is_not_touched_by_seeding_or_by_off() {
+    let fx = Fx::empty();
+    for id in NOTES {
+        assert!(matches!(fx.read(id), Err(ReadError::NotFound(_))), "{id} must not appear in an existing memory");
     }
 }
 
 #[test]
 fn on_stores_exactly_the_two_notes_and_is_idempotent() {
-    let fx = Fx::new();
+    let fx = Fx::empty();
     let out = fx.install(&["--set-helpers", "on"]);
     assert!(out.status.success(), "{}", said(&out));
     for id in NOTES {
@@ -111,7 +128,7 @@ fn off_retracts_both_with_a_reason_and_is_idempotent() {
 
 #[test]
 fn off_on_a_memory_that_never_had_them_changes_nothing() {
-    let fx = Fx::new();
+    let fx = Fx::empty();
     let before = fx.event_count();
     let out = fx.install(&["--set-helpers", "off"]);
     assert!(out.status.success(), "{}", said(&out));
