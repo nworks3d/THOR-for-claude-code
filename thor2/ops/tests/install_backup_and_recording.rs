@@ -213,6 +213,28 @@ fn recording_can_be_switched_off_and_on_and_a_bad_word_is_refused() {
 }
 
 #[test]
+fn the_reply_language_can_be_chosen_changed_and_removed_and_a_bad_code_is_refused() {
+    let fx = Fx::new();
+    assert_eq!(serve::plan::reply_language(&fx.db()), None, "nothing is chosen on a fresh install");
+    let set = fx.install(&["--set-language", "nl"]);
+    assert!(set.status.success(), "{}", said(&set));
+    assert!(said(&set).contains("set to Dutch"), "{}", said(&set));
+    assert_eq!(serve::plan::reply_language(&fx.db()).as_deref(), Some("nl"));
+    let file = fx.db().parent().unwrap().join("thor-mode.json");
+    let first = std::fs::read(&file).unwrap();
+    assert!(fx.install(&["--set-language", "NL"]).status.success());
+    assert_eq!(std::fs::read(&file).unwrap(), first, "a second run changes nothing");
+    let bad = fx.install(&["--set-language", "klingon"]);
+    assert_eq!(bad.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("nl, en, de, fr, es"), "{}", said(&bad));
+    assert_eq!(serve::plan::reply_language(&fx.db()).as_deref(), Some("nl"), "a bad code changes nothing");
+    let off = fx.install(&["--set-language", "off"]);
+    assert!(off.status.success(), "{}", said(&off));
+    assert!(said(&off).contains("no language is checked"), "{}", said(&off));
+    assert_eq!(serve::plan::reply_language(&fx.db()), None);
+}
+
+#[test]
 fn the_backup_hook_is_the_same_hook_in_any_path_spelling() {
     let a = ops::backup_setup::hook_spec("C:\\thor\\backup.exe", "C:\\thor\\thor.db", "C:\\thor\\backup-repo");
     let dir = tempfile::tempdir().unwrap();

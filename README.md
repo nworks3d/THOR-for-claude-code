@@ -297,6 +297,13 @@ at the right moment and hope. Version 2 is the same memory with a spine.
   exception is the pinned notes: those are read out in full at the start of a
   conversation (a new memory starts with 22 of them, and that block is capped at
   about 9,500 bytes), so pin sparingly and the cap does the rest.
+- **The language you are answered in can be checked.** The first-session list asks
+  which language your assistant should talk to you in. Tell it, for example, "Dutch"
+  and it runs `install --set-language nl --db <your memory>` (nl, en, de, fr or es;
+  `off` removes it). From then on a reply to you that clearly reads as another
+  language is sent back once to be rewritten, also right after an English message
+  from a helper or from THOR itself. Short replies, code, quotes, file paths and
+  helpers' reports are never judged, and until you choose, no language is checked.
 - **Replies are checked too.** A new memory comes with a small file of six reply
   rules, kept beside it: open a result-like reply with a plain summary, do not
   ask you to check what the assistant can check itself, no reflexive

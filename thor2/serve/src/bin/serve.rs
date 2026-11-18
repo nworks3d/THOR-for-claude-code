@@ -1716,7 +1716,10 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             // the session did something since the last hold, and at most
             // `REHOLD_MAX` times in one turn, so it can never loop.
             let guard_text = (!msg.trim().is_empty()).then(|| {
-                let rulebook_text = std::fs::read_to_string(respond::default_rulebook_path(db_path)).ok();
+                let rulebook_text = respond::rulebook_with_language(
+                    std::fs::read_to_string(respond::default_rulebook_path(db_path)).ok(),
+                    serve::plan::reply_language(db_path).as_deref(),
+                );
                 let last_prompt = last_user_prompt_from_payload(&payload);
                 let commands = turn_commands_from_payload(&payload);
                 let verdict = respond::guard_verdict_in_turn(
@@ -1821,7 +1824,10 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
         let warn_text: Option<String> = if msg.trim().is_empty() {
             None
         } else {
-            let rulebook_text = std::fs::read_to_string(respond::default_rulebook_path(db_path)).ok();
+            let rulebook_text = respond::rulebook_with_language(
+                std::fs::read_to_string(respond::default_rulebook_path(db_path)).ok(),
+                serve::plan::reply_language(db_path).as_deref(),
+            );
             let last_prompt = last_user_prompt_from_payload(&payload);
             let commands = turn_commands_from_payload(&payload);
             let verdict = respond::guard_verdict_in_turn(

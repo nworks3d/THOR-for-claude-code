@@ -188,6 +188,11 @@ Words used once, in plain language:
   "everything checks out") is held unless it says what it covered. All six block when they fire (no tier means block).
 - Why: so the end-of-reply check has something to check from the first session instead of silently
   checking nothing. The content is a neutral example, not the user's choice.
+- Language (first-session item 8, opt-in): nothing about language is checked until the owner names one
+  (`install --set-language nl|en|de|fr|es|off`, kept in thor-mode.json beside the memory). Then a reply for the owner
+  that clearly reads as another of those languages (plain prose of 200+ characters and 30+ words, code, quotes, paths
+  and helper reports left out, decided by counting function words) is sent back once to be rewritten. The owner's last
+  prompt is not consulted, so it also works right after an English machine message.
 - You notice: see C4. Some trigger words are Dutch ("gepusht", "kun je checken"). On the first
   prompt you type in a session your assistant also gets one short line with the length limit of the
   length rule (once per session, read from the rulebook itself, nothing when the rule is not in your

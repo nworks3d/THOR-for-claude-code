@@ -633,6 +633,13 @@ pub struct OptInRule {
     /// a colon ("- **Deploy config:** alles klopt") as scoped by that label.
     /// Missing, `false` or malformed all mean the label scopes nothing.
     pub list_label_scopes: bool,
+    /// `true` marks the rule THOR adds itself when the owner chose a language
+    /// (`install --set-language`): `expected_language` is then the language
+    /// the owner chose, the rule needs no proof from the owner's last prompt
+    /// (that prompt may be a machine message in English), and it fires for a
+    /// reply that clearly reads as ANY other supported language. Missing,
+    /// `false` or malformed: the older English-after-a-Dutch-prompt reading.
+    pub language_chosen: bool,
 }
 
 /// Parse the rulebook into `OptInRule`s: every field `parse_rules` reads,
@@ -682,6 +689,7 @@ pub fn parse_opt_in_rules(text: &str) -> Vec<OptInRule> {
             let hedge_words_before = str_list(r, "hedge_words_before");
             let scope_words_after = str_list(r, "scope_words_after");
             let list_label_scopes = r.get("list_label_scopes").and_then(|v| v.as_bool()).unwrap_or(false);
+            let language_chosen = r.get("language_chosen").and_then(|v| v.as_bool()).unwrap_or(false);
             Some(OptInRule {
                 base,
                 before,
@@ -704,6 +712,7 @@ pub fn parse_opt_in_rules(text: &str) -> Vec<OptInRule> {
                 hedge_words_before,
                 scope_words_after,
                 list_label_scopes,
+                language_chosen,
             })
         })
         .collect()
@@ -1558,11 +1567,109 @@ fn prose_is_clearly_english(prose: &str, expected: &[&str]) -> bool {
     total >= LANGUAGE_MIN_WORDS && english * 5 >= total && own * 4 < english
 }
 
+// ------------------------------------------------- the language the owner chose
+//
+// `install --set-language <code>` writes the owner's choice beside the store
+// (`plan::reply_language`). With no choice nothing below runs at all. With one,
+// `rulebook_with_language` adds a blocking rule for the owner's own reading, and
+// a reply is sent back once when its plain prose clearly reads as another
+// supported language. The prompt is not consulted: the failure this exists for is
+// a reply that drifts into English right after an English MACHINE message (a
+// helper's report, a hook note, a summary), when the last prompt proves nothing.
+// Same word-count reading as above, silent on any doubt.
+
+/// The languages the owner can choose and the detector can tell apart:
+/// (code, English name).
+pub const CHOOSABLE_LANGUAGES: &[(&str, &str)] =
+    &[("nl", "Dutch"), ("en", "English"), ("de", "German"), ("fr", "French"), ("es", "Spanish")];
+
+/// The English name of a choosable language code, or `None`.
+pub fn language_name(code: &str) -> Option<&'static str> {
+    CHOOSABLE_LANGUAGES.iter().find(|(c, _)| *c == code).map(|(_, n)| *n)
+}
+
+fn chosen_words(code: &str) -> Option<&'static [&'static str]> {
+    if code == "en" {
+        Some(ENGLISH_WORDS)
+    } else {
+        language_words(code)
+    }
+}
+
+/// Words that sit in another language's list and are also plain English, so
+/// they count as evidence for neither side.
+const SHARED_WITH_ENGLISH: &[&str] = &["is", "in", "of", "was", "we", "me", "he", "on", "an", "as", "so", "am", "over", "even", "had"];
+
+/// `text` without the tokens that are paths, addresses or mail addresses.
+fn without_paths(text: &str) -> String {
+    let keep = |t: &&str| !(t.contains('/') || t.contains('\\') || t.contains('@'));
+    text.lines().map(|l| l.split_whitespace().filter(keep).collect::<Vec<_>>().join(" ")).collect::<Vec<_>>().join("\n")
+}
+
+/// Whether plain `prose` clearly reads as a supported language other than
+/// `expected`: long enough, and one other language's own function words (the
+/// ones the expected language does not share) make up at least a fifth of all
+/// words while the expected language's words stay under a quarter of those.
+fn prose_is_clearly_other_language(prose: &str, expected: &str) -> bool {
+    let Some(own_list) = chosen_words(expected) else { return false };
+    if prose.chars().count() < LANGUAGE_MIN_PROSE_CHARS {
+        return false;
+    }
+    let mut total = 0;
+    let mut own = 0;
+    let mut other: Vec<usize> = vec![0; CHOOSABLE_LANGUAGES.len()];
+    for (_, _, word) in words(prose) {
+        if !word.chars().any(char::is_alphabetic) {
+            continue;
+        }
+        total += 1;
+        if SHARED_WITH_ENGLISH.contains(&word.as_str()) {
+            continue; // reads as the same word in English: proves nothing either way
+        }
+        if own_list.contains(&word.as_str()) {
+            own += 1;
+            continue;
+        }
+        for (i, (code, _)) in CHOOSABLE_LANGUAGES.iter().enumerate() {
+            if *code != expected && chosen_words(code).is_some_and(|l| l.contains(&word.as_str())) {
+                other[i] += 1;
+            }
+        }
+    }
+    total >= LANGUAGE_MIN_WORDS && other.iter().any(|&hits| hits * 5 >= total && own * 4 < hits)
+}
+
+/// The rulebook text with the owner's chosen-language rule added, or the
+/// rulebook unchanged when no language was chosen. An unreadable rulebook is
+/// replaced by just that one rule: the choice must hold on its own.
+pub fn rulebook_with_language(rulebook_text: Option<String>, language: Option<&str>) -> Option<String> {
+    let Some(code) = language else { return rulebook_text };
+    let Some(name) = language_name(code) else { return rulebook_text };
+    let mut rules = match rulebook_text.as_deref().map(serde_json::from_str::<Value>) {
+        Some(Ok(Value::Array(a))) => a,
+        _ => vec![],
+    };
+    rules.push(serde_json::json!({
+        "id": "reply-language-chosen",
+        "tier": "block",
+        "owner_reading_only": true,
+        "expected_language": code,
+        "language_chosen": true,
+        "reminder": format!(
+            "This reply is for the owner, who chose {name} as the language you talk in, but it reads as another language. Rewrite it in {name}. This holds also right after a machine message (a helper's report, a hook note, a summary): the owner reads {name}. Code, file names and quoted text may stay as they are."
+        ),
+    }));
+    Some(Value::Array(rules).to_string())
+}
+
 /// The language gate of a rule: `true` when the rule has no
 /// `expected_language` (nothing to gate), else only for an English reply to a
 /// prompt in the expected language (see this section's comment).
 fn language_gate_open(rule: &OptInRule, haystack_lower: &str, prompt_lower: &str) -> bool {
     let Some(code) = rule.expected_language.as_deref() else { return true };
+    if rule.language_chosen {
+        return prose_is_clearly_other_language(&without_paths(&plain_prose(haystack_lower)), code);
+    }
     let Some(expected) = language_words(code) else { return false };
     if prompt_lower.is_empty() || !prompt_shows_language(prompt_lower, expected) {
         return false;
@@ -3547,5 +3654,93 @@ mod tests {
     fn a_negation_further_back_than_its_reach_leaves_the_claim_a_claim() {
         let msg = "Niet alles ging goed, maar daarna is het uiteindelijk toch allemaal netjes gepusht.";
         assert!(blocks(VERSION_RULE, msg), "{msg}");
+    }
+
+    // ------------------------------------------------ the language the owner chose
+
+    const MACHINE_PROMPT: &str = "<task-notification> The helper finished the task and the tests are passing for all of the changes.";
+
+    /// Whether a reply is sent back with the owner's chosen language set to `code`.
+    fn chosen_fires(code: Option<&str>, reply: &str, prompt: &str, is_subagent: bool) -> bool {
+        let rulebook = rulebook_with_language(None, code);
+        guard_verdict_in_turn(rulebook.as_deref(), reply, prompt, is_subagent, None, &[]).block_reason.is_some()
+    }
+
+    #[test]
+    fn a_clearly_english_reply_is_sent_back_when_dutch_is_chosen_whatever_the_last_prompt_was() {
+        assert!(chosen_fires(Some("nl"), ENGLISH_REPLY, DUTCH_PROMPT, false));
+        assert!(chosen_fires(Some("nl"), ENGLISH_REPLY, "", false), "no prompt at all");
+        assert!(chosen_fires(Some("nl"), ENGLISH_REPLY, MACHINE_PROMPT, false), "right after an English machine message");
+        let reason = guard_verdict_in_turn(rulebook_with_language(None, Some("nl")).as_deref(), ENGLISH_REPLY, "", false, None, &[])
+            .block_reason
+            .unwrap();
+        assert!(reason.contains("Rewrite it in Dutch") && reason.contains("machine message"), "{reason}");
+    }
+
+    #[test]
+    fn a_dutch_reply_passes_when_dutch_is_chosen() {
+        assert!(!chosen_fires(Some("nl"), DUTCH_REPLY, MACHINE_PROMPT, false));
+        let mixed = "De commit staat op de branch en de pull request is open. De CI draait de unit tests, de linter en de build, \
+            en de release notes zijn gemaakt. Het cache-probleem is opgelost: de runner pakt nu de lockfile mee, en de deploy \
+            naar staging gaat daarna automatisch. Jij hoeft niets te doen, ik meld het als de merge klaar is en de tag staat.";
+        assert!(!chosen_fires(Some("nl"), mixed, MACHINE_PROMPT, false), "Dutch full of English terms is Dutch");
+    }
+
+    #[test]
+    fn with_no_language_chosen_nothing_is_checked_and_the_rulebook_is_untouched() {
+        assert!(!chosen_fires(None, ENGLISH_REPLY, DUTCH_PROMPT, false));
+        let book = Some(RULEBOOK.to_string());
+        assert_eq!(rulebook_with_language(book.clone(), None), book);
+        assert_eq!(rulebook_with_language(book.clone(), Some("xx")), book, "an unknown code adds nothing");
+        assert_eq!(rulebook_with_language(None, None), None);
+    }
+
+    #[test]
+    fn the_chosen_language_rule_joins_an_existing_rulebook_and_survives_a_broken_one() {
+        let joined = rulebook_with_language(Some(RULEBOOK.to_string()), Some("nl")).unwrap();
+        assert_eq!(parse_opt_in_rules(&joined).len(), parse_opt_in_rules(RULEBOOK).len() + 1);
+        let alone = rulebook_with_language(Some("{ not json".to_string()), Some("nl")).unwrap();
+        assert_eq!(parse_opt_in_rules(&alone).len(), 1);
+        assert!(guard_verdict_in_turn(Some(&alone), ENGLISH_REPLY, "", false, None, &[]).block_reason.is_some());
+    }
+
+    #[test]
+    fn a_reply_for_an_agent_or_too_short_or_only_code_or_quoted_is_left_alone() {
+        assert!(!chosen_fires(Some("nl"), ENGLISH_REPLY, "", true), "a helper's report is not the owner's reading");
+        let short = "I finished the review and the tests are passing for all of the changes.";
+        assert!(!chosen_fires(Some("nl"), short, "", false), "too short to judge");
+        let code_heavy = format!(
+            "{DUTCH_REPLY}\n```\nthe build is slower than it was and the cache will not be used when all of the files are there\n\
+             and this is what you should see if it would be working for all of them\n```\n\
+             > the log says that you should not be using the cache because it would not be there for all of them\n\
+             Het commando was `if the file is not there then do the thing that you have been asked`."
+        );
+        assert!(!chosen_fires(Some("nl"), &code_heavy, "", false), "code, a blockquote and inline code are not prose");
+        let quoted = format!(
+            "{DUTCH_REPLY} De fout was \"the build has failed because the cache could not be used for all of the files that were there\"."
+        );
+        assert!(!chosen_fires(Some("nl"), &quoted, "", false), "quoted foreign text is not the language of the reply");
+        let paths = format!("{DUTCH_REPLY} C:/work/the/build/and/cache/that/will/not/be/used/for/all/of/them.txt https://example.com/the/and/for");
+        assert!(!chosen_fires(Some("nl"), &paths, "", false), "paths and addresses are not prose");
+        let english_around_code = format!("{ENGLISH_REPLY}\n```\nde build is trager dan hij was\n```\n");
+        assert!(chosen_fires(Some("nl"), &english_around_code, "", false), "a fence does not hide English prose around it");
+    }
+
+    #[test]
+    fn a_half_and_half_reply_is_not_clearly_another_language() {
+        let mixed = format!("{DUTCH_REPLY} {}", &ENGLISH_REPLY[..ENGLISH_REPLY.len() / 2]);
+        assert!(!chosen_fires(Some("nl"), &mixed, "", false));
+    }
+
+    #[test]
+    fn the_other_choosable_languages_work_both_ways() {
+        let german = "Ich habe die \u{dc}berpr\u{fc}fung beendet und gesehen, dass alle Tests f\u{fc}r die \u{c4}nderungen in diesem Zweig bestanden sind. \
+            Es gibt zwei Dinge, die Sie wissen sollten: der Build ist langsamer als er war, und der Cache wird nicht benutzt, wenn die Dateien \
+            nicht im gleichen Ordner sind. Wenn Sie wollen, kann ich das danach pr\u{fc}fen, denn es ist nur eine kleine Anpassung und dann ist es fertig.";
+        assert!(chosen_fires(Some("de"), ENGLISH_REPLY, "", false));
+        assert!(!chosen_fires(Some("de"), german, "", false));
+        assert!(chosen_fires(Some("nl"), german, "", false), "German is another language than Dutch");
+        assert!(chosen_fires(Some("en"), DUTCH_REPLY, "", false));
+        assert!(!chosen_fires(Some("en"), ENGLISH_REPLY, "", false));
     }
 }

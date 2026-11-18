@@ -207,6 +207,30 @@ pub fn set_recording(db: &Path, on: bool) -> std::io::Result<()> {
     std::fs::write(mode_file(db), Value::Object(object).to_string())
 }
 
+/// The language the owner chose for replies (`install --set-language`), or
+/// `None` when none was chosen: then the reply guard checks no language at all.
+/// An unknown code on file counts as no choice.
+pub fn reply_language(db: &Path) -> Option<String> {
+    let code = read_object(db).get("language").and_then(Value::as_str)?.to_string();
+    crate::respond::language_name(&code).map(|_| code)
+}
+
+/// Record the owner's chosen reply language, or remove it with `None`, keeping
+/// every other key of the sidecar. Setting what is already set writes the same
+/// bytes again.
+pub fn set_reply_language(db: &Path, code: Option<&str>) -> std::io::Result<()> {
+    let mut object = read_object(db);
+    match code {
+        Some(c) => {
+            object.insert("language".to_string(), Value::String(c.to_string()));
+        }
+        None => {
+            object.remove("language");
+        }
+    }
+    std::fs::write(mode_file(db), Value::Object(object).to_string())
+}
+
 /// Install: settle the plan from `claude_json`. A plan the user already
 /// confirmed or told is kept as it is; anything else is (re)detected. Returns
 /// what is on record afterwards and what the file said.
@@ -310,6 +334,25 @@ mod tests {
         assert!(!weekly_check_on(&db), "writing the bug mode keeps the switch");
         set_weekly_check(&db, true).unwrap();
         assert!(weekly_check_on(&db));
+    }
+
+    #[test]
+    fn the_reply_language_is_absent_until_chosen_keeps_the_other_keys_and_ignores_an_unknown_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = store(dir.path());
+        assert_eq!(reply_language(&db), None, "nothing chosen, nothing checked");
+        write(&db, Plan::Max, PlanSource::Confirmed).unwrap();
+        set_reply_language(&db, Some("nl")).unwrap();
+        assert_eq!(reply_language(&db).as_deref(), Some("nl"));
+        assert_eq!(read(&db), Some((Plan::Max, PlanSource::Confirmed)), "the plan survives");
+        set_recording(&db, false).unwrap();
+        assert_eq!(reply_language(&db).as_deref(), Some("nl"), "another switch keeps it");
+        set_reply_language(&db, Some("xx")).unwrap();
+        assert_eq!(reply_language(&db), None, "a code with no detector counts as no choice");
+        set_reply_language(&db, Some("de")).unwrap();
+        set_reply_language(&db, None).unwrap();
+        assert_eq!(reply_language(&db), None);
+        assert!(!recording_on(&db), "removing the language keeps the other keys");
     }
 
     #[test]

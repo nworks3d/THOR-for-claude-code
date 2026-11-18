@@ -196,6 +196,18 @@ struct Cli {
     )]
     set_recording: Option<String>,
 
+    /// Set ONLY the language your assistant talks to you in (`nl`, `en`, `de`,
+    /// `fr` or `es`), or `off`, and nothing else. Once a language is set, a
+    /// reply meant for you that clearly reads as another language is sent back
+    /// once to be rewritten. With none set, no language is checked. Running it
+    /// twice changes nothing the second time. Needs --db.
+    #[arg(
+        long = "set-language",
+        value_name = "CODE|off",
+        conflicts_with_all = ["project", "settings", "mcp_json", "no_mcp", "serve_exe", "mcp_exe", "code_index_root", "register_root", "set_mode", "set_plan", "set_weekly_check", "set_backup", "set_recording", "set_helpers", "set_temp_folder", "set_tools_folder", "topic", "copy_from"]
+    )]
+    set_language: Option<String>,
+
     /// Set ONLY helper-agent mode, `on` or `off`, and nothing else. It is OFF in
     /// a new memory. `on` stores the two notes that carry it (your assistant
     /// then hands work to cheaper helper agents and keeps the chat free); `off`
@@ -446,6 +458,55 @@ fn set_work_folders_only(db: Option<PathBuf>, temp: Option<&str>, tools: Option<
         }
     }
     ExitCode::SUCCESS
+}
+
+/// `install --set-language <code>|off`: write the owner's chosen reply language
+/// (or remove it) and nothing else.
+fn set_language_only(db: Option<PathBuf>, word: &str) -> ExitCode {
+    let word = word.trim().to_lowercase();
+    let code = if word == "off" {
+        None
+    } else if serve::respond::language_name(&word).is_some() {
+        Some(word.as_str())
+    } else {
+        let known: Vec<&str> = serve::respond::CHOOSABLE_LANGUAGES.iter().map(|(c, _)| *c).collect();
+        eprintln!(
+            "'{word}' is not a language THOR can check. Use one of: {}, or 'off'. Example: install --set-language nl --db <your memory>. Nothing was changed.",
+            known.join(", ")
+        );
+        return ExitCode::from(2);
+    };
+    let Some(db) = db else {
+        eprintln!("name the memory to set this for: install --set-language {word} --db <your memory>");
+        return ExitCode::from(2);
+    };
+    if !db.is_file() {
+        eprintln!(
+            "REFUSED: there is no memory at {} - check the path given with --db (the one your assistant's hooks name). Nothing was changed.",
+            db.display()
+        );
+        return ExitCode::FAILURE;
+    }
+    match serve::plan::set_reply_language(&db, code) {
+        Ok(()) => {
+            match code.and_then(serve::respond::language_name) {
+                Some(name) => println!(
+                    "reply language set to {name} ({word}) for {}: a reply meant for you that clearly reads as another language is sent back once to be rewritten in {name}. Short replies, code and quoted text are never judged. To switch it off: install --set-language off --db \"{}\"",
+                    db.display(),
+                    db.display()
+                ),
+                None => println!(
+                    "reply language check switched off for {}: no language is checked any more. Your assistant still answers in the language you write in.",
+                    db.display()
+                ),
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("could not write the language: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// `install --set-recording on|off`: write the switch and nothing else.
@@ -950,6 +1011,9 @@ fn main() -> ExitCode {
     }
     if let Some(word) = cli.set_recording.as_deref() {
         return set_recording_only(cli.db, word);
+    }
+    if let Some(word) = cli.set_language.as_deref() {
+        return set_language_only(cli.db, word);
     }
     if let Some(word) = cli.set_helpers.as_deref() {
         return set_helpers_only(cli.db, word);
