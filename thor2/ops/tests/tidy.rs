@@ -237,3 +237,21 @@ fn a_file_in_the_desktop_apps_scratch_workspace_is_moved_out_but_never_a_folder_
     assert!(said.contains("! REFUSED") && said.contains("application data"), "a folder inside AppData is still refused: {said}");
     assert!(!sb.path(&format!("{scratch}/new-folder")).exists());
 }
+
+/// A conversation without a folder often writes into Claude Code's own
+/// per-session scratchpad under Temp, which a restart clears: such a file is
+/// moved out too, while other files under Temp stay where they are.
+#[test]
+fn a_file_in_a_claude_scratchpad_under_temp_is_moved_out_and_other_temp_files_stay() {
+    let sb = Sandbox::new();
+    let pad = "AppData/Local/Temp/claude/C--Users-x-AppData-Roaming-Claude-scratch-workspaces-u1/s1/scratchpad";
+    let letter = sb.file(&format!("{pad}/motivation-letter.md"), "letter");
+    let other_temp = sb.file("AppData/Local/Temp/installer.log", "log");
+    let folder = sb.path("Documents/Cv en werk zoeken");
+    let out = sb.tidy(serde_json::json!([{ "folder": s(&folder), "files": [s(&letter), s(&other_temp)] }]));
+    assert!(out.status.success(), "{}", text(&out));
+    let said = text(&out);
+    assert!(said.contains("moved 1 file(s)"), "{said}");
+    assert!(folder.join("motivation-letter.md").is_file() && !letter.exists());
+    assert!(other_temp.is_file(), "other files under Temp are left alone: {said}");
+}

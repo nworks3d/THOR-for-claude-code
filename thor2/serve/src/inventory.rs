@@ -164,6 +164,35 @@ pub fn is_app_scratch(p: &Path) -> bool {
     before.contains(&"appdata") && before.iter().any(|s| *s == "claude" || s.starts_with("claude-"))
 }
 
+/// Is `p` inside a per-session scratchpad Claude Code keeps under the system's
+/// temporary folder (`AppData\Local\Temp\claude\...\scratchpad`)? A
+/// conversation without a folder often writes its files there, and that folder
+/// is cleared by a restart or a clean-up, so such a file is at risk too.
+pub fn is_temp_scratchpad(p: &Path) -> bool {
+    let n = norm(p);
+    let parts: Vec<&str> = n.split('/').collect();
+    // Every AppData\Local\Temp in the path is tried, not only the first: a home
+    // folder can itself sit under another one (a test sandbox does).
+    (0..parts.len().saturating_sub(3)).any(|i| {
+        parts[i..i + 3] == ["appdata", "local", "temp"] && parts[i + 3] == "claude" && parts[i + 4..].contains(&"scratchpad")
+    })
+}
+
+/// A written file that sits in a place the app or the system may clear.
+pub fn is_at_risk(p: &Path) -> bool {
+    is_app_scratch(p) || is_temp_scratchpad(p)
+}
+
+/// `system_place` for a FILE that is to be moved out: a file in a temporary
+/// place (`is_at_risk`) is the person's work and may be moved out of it.
+pub fn file_source_system_place(home: &Path, file: &Path) -> Option<&'static str> {
+    if is_at_risk(file) {
+        None
+    } else {
+        system_place(home, file)
+    }
+}
+
 /// `system_place` for a place THOR READS FROM: a scratch workspace of the
 /// desktop app is the person's work (loose conversations), not a program's own
 /// folder. Never use this for a place something is put INTO.
@@ -347,7 +376,7 @@ pub fn read_session(file: &Path) -> Option<(String, SessionInfo)> {
         return None;
     }
     let id = file.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
-    let files: Vec<WrittenFile> = files.into_iter().map(|p| WrittenFile { exists: Path::new(&p).exists(), at_risk: is_app_scratch(Path::new(&p)), path: p }).collect();
+    let files: Vec<WrittenFile> = files.into_iter().map(|p| WrittenFile { exists: Path::new(&p).exists(), at_risk: is_at_risk(Path::new(&p)), path: p }).collect();
     let info = SessionInfo {
         session_id: id,
         file: file.display().to_string(),
@@ -587,6 +616,17 @@ pub fn digest(file: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_claude_scratchpad_under_temp_is_at_risk_and_other_temp_files_are_not() {
+        let pad = Path::new("C:/Users/ann/AppData/Local/Temp/claude/C--Users-ann-x/s1/scratchpad/cv.md");
+        assert!(is_temp_scratchpad(pad) && is_at_risk(pad));
+        assert!(!is_at_risk(Path::new("C:/Users/ann/AppData/Local/Temp/installer.log")));
+        assert!(!is_at_risk(Path::new("C:/Users/ann/Documents/cv.md")));
+        let home = Path::new("C:/Users/ann");
+        assert_eq!(file_source_system_place(home, pad), None, "a file in a scratchpad may be moved out");
+        assert!(file_source_system_place(home, Path::new("C:/Users/ann/AppData/Local/Temp/installer.log")).is_some());
+    }
 
     #[test]
     fn broad_places_are_named() {
