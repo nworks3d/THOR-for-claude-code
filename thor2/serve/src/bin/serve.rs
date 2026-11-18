@@ -1240,15 +1240,15 @@ fn plain_line_for_block(event: &str, reason: &str) -> &'static str {
 // carries one of these as `systemMessage`; a test walks them all and fails on
 // THOR's own vocabulary (rule, falsifier, evaluation, scope, teeth, hook, MCP,
 // collection, store). Each says what happened and that nothing is needed.
-const LINE_SETUP: &str = "THOR (the memory your assistant uses) is finishing its setup. Your assistant welcomes you and asks one short question: you can simply answer \"yes\". Nothing else is needed from you.";
-const LINE_SCRIPTS: &str = "Your assistant left a few helper scripts outside your projects. THOR asks it to sort them before it finishes: it keeps the useful ones in your tools folder, deletes the throwaway ones, and asks you about anything in doubt. Nothing is needed from you unless it asks.";
-const LINE_COPY_PROOF: &str = "THOR is sending the proof of this week's memory check from this read-only copy to your main machine. Your assistant makes one more small call. Nothing is needed from you.";
-const LINE_TIDY_UP: &str = "THOR asks your assistant to do a short tidy-up of its memory before it finishes. It can take a few minutes. Nothing is needed from you.";
-const LINE_DECISION: &str = "Your assistant is saving something you just decided, so it is remembered next time. Nothing is needed from you.";
-const LINE_NOTES_OUT_OF_DATE: &str = "THOR noticed that some saved notes may be out of date, and asks your assistant to check them before it finishes. Nothing is needed from you.";
-const LINE_NEEDS_YOUR_OK: &str = "THOR paused one action of your assistant because it needs your OK first. Your assistant will ask you in plain words: just answer it. Nothing else is needed from you.";
-const LINE_ACTION_STOPPED: &str = "THOR stopped one action your assistant was about to take, because it goes against a note that was saved earlier. Your assistant is choosing another way. Nothing is needed from you.";
-const LINE_ONE_MORE_THING: &str = "THOR asked your assistant to take care of one more small thing before it finishes (for example to rewrite an answer that is too long or in another language). Nothing is needed from you.";
+const LINE_SETUP: &str = "THOR (the memory your assistant uses) is finishing its setup. Your assistant welcomes you and asks one short question with a few choices: you can simply answer \"yes\". Nothing else is needed from you.";
+const LINE_SCRIPTS: &str = "Your assistant left a few small helper files outside your projects. THOR asks it to tidy them up: useful ones are kept in your tools folder, leftovers are deleted, and it asks you first about anything unclear. You do not need to do anything unless it asks you.";
+const LINE_COPY_PROOF: &str = "THOR is sending proof of this week's memory check from this computer's copy of your memory to your main computer. Your assistant does one more small step. You do not need to do anything.";
+const LINE_TIDY_UP: &str = "THOR asks your assistant to tidy up the memory now, before it finishes its answer. This can take a few minutes. You do not need to do anything.";
+const LINE_DECISION: &str = "Your assistant is saving something you just decided, so it is remembered next time. You do not need to do anything.";
+const LINE_NOTES_OUT_OF_DATE: &str = "THOR noticed that some saved notes may be out of date, and asks your assistant to check them before it finishes its answer. You do not need to do anything.";
+const LINE_NEEDS_YOUR_OK: &str = "THOR paused one step of your assistant's work because it needs your OK first. Your assistant will ask you in plain words: just answer it. Nothing else is needed from you.";
+const LINE_ACTION_STOPPED: &str = "THOR stopped one step your assistant was about to take, because it went against something saved in the memory earlier. Your assistant will try another way. You do not need to do anything.";
+const LINE_ONE_MORE_THING: &str = "THOR asked your assistant to do one more small thing before it finishes its answer. For example, it may rewrite an answer that is too long. You do not need to do anything.";
 
 /// Every sentence above, for the test that walks them.
 #[cfg(test)]
@@ -1314,7 +1314,7 @@ mod line_for_the_person_tests {
             assert_eq!(v["reason"], reason, "the assistant's own text is untouched");
             assert_eq!(v["decision"], "block");
             let line = line_of(out);
-            assert!(line.contains("Nothing is needed from you") || line.contains("answer in your own words"), "{event}: {line}");
+            assert!(line.contains("You do not need to do anything") || line.contains("Nothing else is needed from you"), "{event}: {line}");
             for jargon in ["falsifier", "scope", "hook", "retract", "teeth", "evaluation", "A4"] {
                 assert!(!line.contains(jargon), "{event}: the plain line must not use {jargon:?}: {line}");
             }
@@ -1328,7 +1328,7 @@ mod line_for_the_person_tests {
             block("[THOR] Script file(s) were written outside any git repository during this session\n\nThe evaluation of 'x' is still open"),
         );
         let line = line_of(out);
-        assert!(line.contains("helper scripts"), "{line}");
+        assert!(line.contains("small helper files"), "{line}");
         assert!(!line.contains("memory"), "it is not the evaluation sentence: {line}");
     }
 
@@ -1339,7 +1339,7 @@ mod line_for_the_person_tests {
         let Some(HookOutput::Decision(v)) = &out else { panic!("lost the block") };
         assert_eq!(v["reason"], reason, "the assistant's own text is untouched");
         let line = line_of(out);
-        assert!(line.contains("stopped one action") && line.contains("Nothing is needed from you"), "{line}");
+        assert!(line.contains("stopped one step") && line.contains("You do not need to do anything"), "{line}");
         let approval = line_of(with_line_for_the_person("PreToolUse", block("[THOR] rule r2 applies here: this call needs the owner's explicit go")));
         assert!(approval.contains("needs your OK first"), "{approval}");
     }
@@ -1350,7 +1350,7 @@ mod line_for_the_person_tests {
     #[test]
     fn every_sentence_a_person_sees_is_plain_and_uses_no_thor_vocabulary() {
         for line in PERSON_LINES {
-            assert!(line.contains("Nothing is needed from you") || line.contains("Nothing else is needed from you"), "{line}");
+            assert!(line.contains("You do not need to do anything") || line.contains("Nothing else is needed from you"), "{line}");
             assert!(line.is_ascii(), "{line}");
             let words: Vec<String> = line.to_lowercase().split(|c: char| !c.is_alphanumeric()).map(str::to_string).collect();
             for jargon in ["rule", "rules", "falsifier", "evaluation", "scope", "teeth", "hook", "hooks", "mcp", "collection", "store", "retract", "lookup", "pinned"] {

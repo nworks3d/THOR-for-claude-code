@@ -97,17 +97,18 @@ fn the_plan_item_is_recorded_never_asked_and_gives_the_reason_for_each_case() {
 fn the_welcome_is_short_plain_and_carries_every_point() {
     let w = questionnaire::render_welcome();
     for must in [
-        "THOR is set up. From now on I remember what you tell me about your work",
-        "also in a new conversation next week",
+        "Your memory helper THOR is set up. From now on I remember what you tell me about your work.",
+        "I bring it back by myself when you need it, also in a new conversation next week.",
         "You do not have to learn anything. Just talk to me as you always do.",
         "\"Remember that the contractor is called Jan and comes on Tuesdays.\"",
         "\"What do you know about the kitchen?\"",
         "\"That is no longer right: the tiles now come from another shop.\"",
         "This is what I will set up for you:",
-        "1. Every day a safety copy of your memory on this computer.",
+        "1. Once a day, a safety copy of everything I remember, on this computer.",
         "2. I talk to you in <language>.",
-        "3. Everything for this work is kept in the folder <folder>, and we work from there.",
-        "Shall I set it up like this? Just say \"yes\", or tell me by number what you want different, for example \"2 English\" or \"3 figure it out yourself\".",
+        "3. Everything for this work goes in the folder <folder>. That is where we work together.",
+        "Shall I set it up like this? Just say \"yes\".",
+        "Want something different? Tell me the number and what you want, for example \"2 English\" or \"3 figure it out yourself\".",
         "\"what is switched on?\"",
     ] {
         assert!(w.contains(must), "the welcome lacks '{must}':\n{w}");
@@ -117,7 +118,7 @@ fn the_welcome_is_short_plain_and_carries_every_point() {
 {w}");
     assert_eq!(w.matches("Shall I set it up like this?").count(), 1, "exactly one question");
     let lowered = w.to_lowercase();
-    for banned in ["git", "hook", "plan", "helper", "weekly", "changelog", "index", "repository", "commit"] {
+    for banned in ["git", "hook", "plan", "helper assistant", "weekly", "changelog", "index", "repository", "commit"] {
         assert!(!lowered.contains(banned), "the welcome mentions '{banned}':\n{w}");
     }
     assert!(w.is_ascii() && w.chars().count() < 1000, "{} characters", w.chars().count());
@@ -163,6 +164,8 @@ fn the_assistant_sets_language_by_itself_asks_two_questions_and_hides_the_techni
         "Apply nothing of proposals 1 to 3 before he answers",
         "a plain \"yes\"",
         "Proposal 3 (the folder)",
+        "name <folder> by its real name on this computer",
+        "call a session \"a conversation\"",
         "never the home folder, the Documents, Desktop or Downloads folder itself, a drive root, or anything under AppData or Program Files",
         "install --topic --db <store>",
         "figure it out yourself",
@@ -189,7 +192,10 @@ fn the_list_the_user_sees_is_an_intro_of_three_lines_at_most_then_one_line_per_i
     for (i, line) in items.iter().enumerate() {
         assert!(line.starts_with(&format!("{}. ", i + 1)), "{line}");
         assert!(line.chars().count() <= 280, "item {} is not short: {} characters", i + 1, line.chars().count());
-        assert!(line.contains("Default:"), "each line carries what was chosen: {line}");
+        assert!(line.contains("Now:") && !line.contains("Default"), "each line says how it is now, in plain words: {line}");
+        for sentence in line.split(". ") {
+            assert!(sentence.split_whitespace().count() <= 25, "item {} has a long sentence: {sentence}", i + 1);
+        }
     }
     let closing = lines.last().unwrap();
     assert!(closing.contains("by number") && closing.contains("defaults"), "the way to answer ends the list: {closing}");
@@ -219,7 +225,7 @@ fn the_why_and_the_way_to_say_no_sit_in_the_appendix_for_the_assistant() {
 #[test]
 fn the_git_hooks_item_names_the_media_gate_and_both_ways_to_switch_things_off() {
     let q = questions().into_iter().find(|q| q.id == "git-hooks").unwrap();
-    assert!(q.line.contains("video files") && q.line.contains("25 MB") && q.line.ends_with("Default: on."), "{}", q.line);
+    assert!(q.line.contains("video files") && q.line.contains("25 MB") && q.line.ends_with("Now: on."), "{}", q.line);
     assert!(q.line.chars().count() <= 200, "the short line stays short and plain: {}", q.line);
     assert!(q.what.contains("thor.mediagate.maxbytes") && q.what.contains("thor-media-ok"), "{}", q.what);
     assert!(q.what.contains("whole machine or for one repository"), "{}", q.what);
@@ -264,7 +270,7 @@ fn the_changelog_item_is_the_owners_decision_with_a_default_of_yes() {
     let q = questions().into_iter().find(|q| q.id == "changelog").unwrap();
     // The user's line is a statement of what happens, never a question.
     assert!(!q.line.contains('?'), "item 12 is a statement, not a question: {}", q.line);
-    assert!(q.line.contains("I create CHANGELOG.md") && q.line.contains("say no and I do not"), "{}", q.line);
+    assert!(q.line.contains("I create CHANGELOG.md") && q.line.contains("If you say no, I do not create it"), "{}", q.line);
     assert_eq!(q.why, "Every later session, and you, know exactly what changed and which version runs, without digging through history.");
     assert!(q.default.starts_with("Yes") && q.default.contains("has none"), "{}", q.default);
     assert!(questionnaire::ASSISTANT_RULES.contains("CHANGELOG.md"), "on yes the assistant creates the file");
@@ -290,7 +296,7 @@ fn every_install_flag_the_list_names_exists_in_the_installer() {
 #[test]
 fn helper_agent_mode_is_off_by_default_and_states_the_measurement_the_free_chat_and_the_costs() {
     let q = questions().into_iter().find(|q| q.id == "helper-agents").unwrap();
-    assert!(q.line.contains("Default: on") && q.line.contains("helpers off"), "the one line the user sees says it is on and how to stop: {}", q.line);
+    assert!(q.line.contains("Now: on") && q.line.contains("helpers off"), "the one line the user sees says it is on and how to stop: {}", q.line);
     assert_eq!(q.default, "On.");
     assert!(q.why.contains("12 to 62 percent cheaper"), "{}", q.why);
     assert!(q.why.contains("chat stays free"), "{}", q.why);
@@ -605,7 +611,7 @@ fn off_topic_work_gets_its_own_session_by_a_short_pinned_note_and_named_tools() 
     assert_eq!(note.kind, model::item::Kind::Orientation);
     assert_eq!(note.bindings, vec![model::item::Binding::Always], "pinned");
     assert!(note.falsifier.is_some() && note.text.is_ascii() && note.text.chars().count() < 300, "{}", note.text.chars().count());
-    for must in ["does not fit this session's work or folder", "one plain sentence", "install --topic", "move and rename this session", "They type nothing"] {
+    for must in ["does not fit this conversation's work or folder", "one sentence", "install --topic", "move and rename this one", "Documents folder (real local name)", "They type nothing"] {
         assert!(note.text.contains(must), "the note lacks '{must}': {}", note.text);
     }
     let rules = questionnaire::ASSISTANT_RULES;

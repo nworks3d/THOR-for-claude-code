@@ -1,2 +1,2 @@
 exit 0
-{"decision":"block","reason":"[THOR] rule w-docs-todo forbids this text (\"nothing in docs carries TODO\"); found in what is about to be written: \"TODO\n\"","systemMessage":"THOR stopped one action your assistant was about to take, because it goes against a note that was saved earlier. Your assistant is choosing another way. Nothing is needed from you."}
+{"decision":"block","reason":"[THOR] rule w-docs-todo forbids this text (\"nothing in docs carries TODO\"); found in what is about to be written: \"TODO\n\"","systemMessage":"THOR stopped one step your assistant was about to take, because it went against something saved in the memory earlier. Your assistant will try another way. You do not need to do anything."}

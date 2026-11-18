@@ -110,7 +110,7 @@ pub fn questions() -> Vec<Question> {
             n: 1,
             id: "plan",
             title: "Your plan",
-            line: "Your Claude plan: I noticed which Claude subscription you have ({PLAN_SHORT}), so THOR's weekly self-check does not use up your usage allowance. Default: taken from Claude's settings.".to_string(),
+            line: "Your Claude plan: I noticed which Claude subscription you have ({PLAN_SHORT}). That way THOR's weekly self-check does not use up your usage allowance. Now: taken from Claude's settings.".to_string(),
             what: "I looked at Claude Code's own settings to find out which plan you have: Max, or Pro and smaller. Pro and any plan below Max count as \"small\" (install --set-plan small); Max counts as \"max\" (install --set-plan max). {PLAN_LINE} Never ask him about it and never mention it unless he asks.".to_string(),
             why: "THOR checks itself on a schedule, and that check draws on the same usage limit as your own work, so on a smaller plan it runs once a week at most and never daily, which keeps your limit for you; on Max it also runs daily while something is found wrong.",
             default: "The plan the settings say; small (Pro or smaller) when they do not say, until you say otherwise.",
@@ -120,7 +120,7 @@ pub fn questions() -> Vec<Question> {
             n: 2,
             id: "hooks",
             title: "The connections to Claude Code",
-            line: "Link to Claude: THOR is linked into Claude Code (the program you talk to me in) at four moments - when a conversation starts, before I use a tool, when you send a message and when I finish a reply - so the memory speaks up by itself. Default: on.".to_string(),
+            line: "Link to Claude: THOR is connected to Claude Code, the program you talk to me in. So the memory speaks up by itself when a conversation starts, before I take an action, and when I finish an answer. Now: on.".to_string(),
             what: "THOR is wired into Claude Code at four moments: when a session starts, before each tool call, when you send a message, and when a reply ends. That is how the memory speaks up by itself and how replies get checked. A backup copy of Claude Code's settings file was made first.".to_string(),
             why: "A memory that must be asked for stays silent, and a missing connection fails without any message: the memory simply never says a word.",
             default: "On.",
@@ -130,7 +130,7 @@ pub fn questions() -> Vec<Question> {
             n: 3,
             id: "git-hooks",
             title: "The git hooks in every repository",
-            line: "Code tracking: for software projects kept with git, THOR keeps its map of your code current and stops video files or files over 25 MB being saved into a project by mistake. Default: on.".to_string(),
+            line: "Code tracking: for software projects, THOR keeps its map of your code current. It also stops video files or files over 25 MB being saved by mistake. Now: on.".to_string(),
             what: "THOR set one git setting for the whole machine so that every repository refreshes THOR's code index after a commit, a merge or pull, a rebase and a branch switch. The same setting also makes git refuse to commit video files (mp4, mov, mkv, webm, avi, m4v) and files above 25 MB. That check is settable for the whole machine or for one repository (git settings thor.mediagate.maxbytes and thor.mediagate.extensions), and one file can be allowed on purpose with a line '<path> thor-media-ok' in .gitattributes. Each repository's own git hooks still run; if another tool already owned that setting, THOR left it alone, and then neither the refresh nor the check is active.".to_string(),
             why: "An index three days behind made 83 percent of the 'where is this used' answers name a wrong line while a fresh one made none wrong (measured at the maker, 2026-08-15), and a 26.7 MB 4K video plus slides got committed and pushed with a plain git add of everything in one real repository on 2026-10-20, which a check on typed commands cannot see because it never shows what such an add stages.",
             default: "On (the video and size check included), unless something else already owned the setting.",
@@ -140,7 +140,7 @@ pub fn questions() -> Vec<Question> {
             n: 4,
             id: "weekly-check",
             title: "The weekly check",
-            line: "Weekly tidy-up: about once a week I tidy THOR's memory for you, and you can ask me for it any time (it is called /thor-eval). Default: on.".to_string(),
+            line: "Weekly tidy-up: about once a week I tidy THOR's memory for you. You can also ask me to do it at any time. Now: on.".to_string(),
             what: "About once a week per project (daily on Max while something is found wrong) THOR asks your assistant to run a short tidy-up of the memory before it finishes a turn: judge the notes that fired, repair stale ones and file a report. The command /thor-eval was added so you can also run it yourself. The ask runs through the connections of item 2, so it only happens while those are on.".to_string(),
             why: "A memory nobody maintains fills with stale notes and quietly stops helping, and a check that depends on someone remembering it does not happen.",
             default: "On, at the rhythm of question 1.",
@@ -151,7 +151,7 @@ pub fn questions() -> Vec<Question> {
             id: "work-rules",
             title: "The starter work rules",
             line: format!(
-                "Work habits: {} good working habits are stored as notes I follow, such as running the tests before I say something is done and never saving a password where others can see it. They only remind me; none blocks normal work. Default: all on.",
+                "Work habits: {} good working habits are stored as reminders I follow. For example, I check my work before I say it is done. I never save a password where others can see it. They only remind me. Now: all on.",
                 rules.len()
             ),
             what: format!(
@@ -166,9 +166,9 @@ pub fn questions() -> Vec<Question> {
         Question {
             n: 6,
             id: "helper-agents",
-            title: "Helper-agent mode",
-            line: "Helper assistants: I can hand big jobs to cheaper helper assistants working in the background, which can cost less and keeps our chat free. Default: on - say \"helpers off\" to stop.".to_string(),
-            what: "When it is on, your main assistant (the strongest model) answers, judges and checks, while cheaper models do the real work in helper agents, one helper per task. No helper is used for a question or an answer, a trivial one-step job, work that needs this conversation's context or quick back-and-forth with you, or a check of a helper's own result: the main assistant does those itself. Tests are run narrowly while working and in full once at the end, and a helper that goes quiet is judged dead after about three checks. Why you may not want it: you do not see the work happen and cannot steer a helper halfway; each helper starts with a fixed context cost, so small tasks cost more, not less; a helper knows nothing of the conversation beyond its brief; parallel helpers can collide in the same files; and checking the result costs an extra turn. It is on in a new memory: the two notes that carry it (orchestrator-mode-saves-quota and an-agent-brief-stands-alone) are stored. To switch it off, say \"helpers off\" and I run: install --set-helpers off --db <store>; to switch it on again, install --set-helpers on --db <store>.".to_string(),
+            title: "Helper assistants",
+            line: "Helper assistants: I can hand big jobs to cheaper helper assistants that work in the background. That can cost less and keeps our conversation free. Now: on - say \"helpers off\" to stop.".to_string(),
+            what: "When it is on, your main assistant (the strongest model) answers, judges and checks, while cheaper models do the real work in helper assistants, one helper per task. No helper is used for a question or an answer, a trivial one-step job, work that needs this conversation's context or quick back-and-forth with you, or a check of a helper's own result: the main assistant does those itself. Tests are run narrowly while working and in full once at the end, and a helper that goes quiet is judged dead after about three checks. Why you may not want it: you do not see the work happen and cannot steer a helper halfway; each helper starts with a fixed context cost, so small tasks cost more, not less; a helper knows nothing of the conversation beyond its brief; parallel helpers can collide in the same files; and checking the result costs an extra turn. It is on in a new memory: the two notes that carry it (orchestrator-mode-saves-quota and an-agent-brief-stands-alone) are stored. To switch it off, say \"helpers off\" and I run: install --set-helpers off --db <store>; to switch it on again, install --set-helpers on --db <store>.".to_string(),
             why: "Measured at the maker, helpers were likely 12 to 62 percent cheaper than doing everything in the main conversation, and the chat stays free and answers at once while they work, instead of you waiting 5 to 15 minutes; it is on by default because that holds for big tasks, and you can switch it off.",
             default: "On.",
             say_no: "Say \"helpers off\" and I run install --set-helpers off --db <store>, which retracts the two notes that carry it (orchestrator-mode-saves-quota and an-agent-brief-stands-alone); your assistant then does the work itself in the main conversation. To get it back, install --set-helpers on --db <store>.".to_string(),
@@ -177,7 +177,7 @@ pub fn questions() -> Vec<Question> {
             n: 7,
             id: "bug-reports",
             title: "Reporting THOR's own bugs",
-            line: "Reporting faults: if THOR finds a fault in itself I may offer to report it to its makers, and I show you the exact text first; nothing is sent without your yes. Default: on.".to_string(),
+            line: "Reporting faults: if THOR finds a fault in itself, I may offer to report it to its makers. I always show you the exact text first, and nothing is sent without your yes. Now: on.".to_string(),
             what: "Sometimes THOR finds a fault in itself. Your assistant may then offer to report it to the makers on GitHub. It shows you the exact full text first; file paths, project and folder names, computer and user names, addresses, keys and passwords are removed; nothing is sent without your yes, and saying no costs nothing. The offer runs through the connections of item 2, so it only happens while those are on.".to_string(),
             why: "THOR sees faults in itself that nobody reading a report would notice, and the makers can only fix what they hear about.",
             default: "On: it may ask you, once per fault, and sends nothing without your yes.",
@@ -187,7 +187,7 @@ pub fn questions() -> Vec<Question> {
             n: 8,
             id: "replies",
             title: "Language, reply length and reply rules",
-            line: format!("Language and replies: I talk to you in the language you write in, keep replies short with a summary first, and follow {reply_rules} reply rules that my replies are checked against. Default: on."),
+            line: format!("Language and replies: I talk to you in the language you write in and keep my answers short, with a summary first. I also follow {reply_rules} reply rules that my answers are checked against. Now: on."),
             what: format!("Two things. First, the language: you can choose the one your assistant talks to you in (nl, en, de, fr or es). I set it automatically to the language you write in (when it is one of those five) and the first reply says so; a reply meant for you that clearly reads as another language is then sent back once to be rewritten in yours, also right after a machine message such as a helper's report. Short replies, code, file names and quoted text are never judged, and a reply the detector is unsure about is left alone. If you say it is the wrong language, I switch it. Second, the shape: your assistant answers short, with a plain-language summary first. A small file next to the memory holds {reply_rules} reply rules (a summary first, no reflexive disclaimers, check before asking you to look something up, keep an answer under about 1000 characters, show evidence when saying something was checked, and never say everything was checked without saying what was covered); a reply that breaks one is sent back once to be rewritten. A summary or overview you ask for may run longer."),
             why: "Replies drift into English right after English machine input in real sessions of the maker (measured 2026-11-18), so a written rule is not enough and the choice is checked at the end of every reply, while the reply rules keep a reply short and to the point and were checked against about 6,600 real replies with their false triggers removed.",
             default: "The language you write in, set automatically and checked; short replies and all the reply rules on.",
@@ -197,7 +197,7 @@ pub fn questions() -> Vec<Question> {
             n: 9,
             id: "topic-folders",
             title: "Folders for a topic",
-            line: "Folders for a subject: an ordinary folder without code, such as recipes or travel plans, can get a memory of its own when you tell me which folder. Default: none yet.".to_string(),
+            line: "Folders for a subject: an ordinary folder without code, such as recipes or travel plans, can get a memory of its own. Just tell me which folder. Now: none yet.".to_string(),
             what: "A plain folder with no code in it, such as a folder of recipes or travel plans, can have a memory of its own: I run one command inside it and it gets one small hidden file. Notes about that folder then come back only when you work there. Nothing is set up until you name a folder.".to_string(),
             why: "Notes about one subject stay out of the way of the others, so nothing from your recipe folder interrupts your code.",
             default: "No folders are set up yet.",
@@ -207,7 +207,7 @@ pub fn questions() -> Vec<Question> {
             n: 10,
             id: "backups",
             title: "Backups of the memory",
-            line: "Safety copy: NOTHING is backed up until you choose: a copy on this machine, a place you name (a NAS, another computer or a private online store), or none. Default: none yet.".to_string(),
+            line: "Safety copy: NOTHING is backed up until you choose. You can choose a copy on this machine. Or a place you name: a network drive (a NAS), another computer or a private online storage place. Or none. Now: none yet.".to_string(),
             what: "A backup copy of the whole memory in a git folder. A fresh install makes NO backup, so until you answer nothing is copied anywhere. You choose one of three: a copy on this machine (a git folder beside the memory; nothing leaves the machine, and it protects against a damaged or wrongly edited memory, not against the disk dying), a place you name (a folder on a NAS or another computer you own, or a private repository; that survives the disk dying), or none. Once you choose, THOR copies when a session starts, at most once a day, and makes the first copy at once to prove it works. To start, say \"backup local\", or name the place.".to_string(),
             why: "The memory is a single file, and if the disk dies everything it learned dies with it.",
             default: "None: nothing is backed up until you answer.",
@@ -217,7 +217,7 @@ pub fn questions() -> Vec<Question> {
             n: 11,
             id: "recording",
             title: "A record of real calls",
-            line: "Record of my work: for 30 days, only on this machine, THOR keeps the commands I ran and my replies (passwords and keys blanked out) to find rules that would wrongly block you. Default: on.".to_string(),
+            line: "Record of my work: for 30 days, only on this machine, THOR keeps the instructions I carried out and my answers. Passwords and secret codes are hidden. This helps to find its own rules that wrongly stop normal work. Now: on.".to_string(),
             what: "THOR keeps, in two files next to the memory, the commands your assistant ran and the replies it gave in the last 30 days. The files stay on this machine and are never sent anywhere. Passwords and keys THOR recognises are blanked out before anything is written, and every line older than 30 days is deleted by itself. THOR then replays its rules against that record to find a rule that would wrongly block you.".to_string(),
             why: "Replaying 146,000 real calls found 12 rules that blocked calls which were fine, and no review of the reports had shown them (measured at the maker, 2026-10-09).",
             default: "On.",
@@ -227,7 +227,7 @@ pub fn questions() -> Vec<Question> {
             n: 12,
             id: "changelog",
             title: "A changelog and version number",
-            line: "Change log: in a software project kept with git that has none, I create CHANGELOG.md (a file listing each change) and note each change in it; say no and I do not. Default: yes, in such projects.".to_string(),
+            line: "Change log: in a software project that has none, I create CHANGELOG.md, a file that lists each change, and keep it up to date. If you say no, I do not create it. Now: yes, in such projects.".to_string(),
             what: "A changelog is a file, CHANGELOG.md, with one line for every change you can see, and a version number says which state of the project is running. Only in a project that is a git repository and has none do I create the file and add a line with each change from then on; a project that already keeps one is left as it is, and a folder that is not a git repository gets none.".to_string(),
             why: "Every later session, and you, know exactly what changed and which version runs, without digging through history.",
             default: "Yes, in a git project that has none.",
@@ -246,12 +246,13 @@ FOR THE ASSISTANT (do not read this part out)
 - The welcome is ONE question over three numbered proposals. Apply nothing of proposals 1 to 3 before he answers, except that meanwhile you speak the language he writes in. His answer is ONE reply: a plain \"yes\" (or any plain agreement) applies all three proposals; a number with a new value (for example \"2 English\" or \"3 figure it out yourself\") changes only that item; a number he leaves out keeps its proposal. Then revise 'owner-setup-answers' with what was applied. Every other default is applied at once, in this same turn, and never mentioned.
 - Proposal 1 (a daily safety copy): when applied run install --set-backup local --db <store> and say the result in one plain sentence (it makes a copy on this computer and a first copy at once to prove it works; if it failed, say so and why in plain words, and when git is missing say that the copy needs git). Until it is applied nothing is backed up.
 - Proposal 2 (the language): <language> is the language he writes in. When applied and it is nl, en, de, fr or es, run install --set-language <code> --db <store> and say in one sentence that it is set; for any other language set nothing and say plainly that it cannot be checked but that you will still write in it. A number 2 with another language switches to that one by the same rule.
+- Names for a person: name <folder> by its real name on this computer (for example \"Documenten\" on a Dutch Windows, not \"Documents\"), and in the person's language call a session \"a conversation\".
 - Proposal 3 (the folder): <folder> is your proposal. Propose the folder this session runs in when it is a specific folder; never the home folder, the Documents, Desktop or Downloads folder itself, a drive root, or anything under AppData or Program Files. Otherwise propose a new folder inside Documents, named after what the person said they work on, or \"My work\" in their language. When applied: when the folder is not a git repository, create it if needed and run the installer with --topic from inside it (install --topic --db <store>); when it is a git repository it is already a project (run install --db <store> from inside it if it is not registered). Say the result in one plain sentence. On \"3 figure it out yourself\": choose by the same rule, create and register it the same way, and say in one plain sentence which folder it is. On \"3\" plus a folder: use that folder by the same rule; a home, Documents, Desktop, Downloads or drive root answer gets a subfolder inside it proposed instead, in one sentence. Whenever the folder is not the one this session runs in, tell the person in plain click steps that from now on they open Claude Code in that folder (in the Claude desktop app: when starting a new session, choose that folder), and that this is the only thing they do differently. Never mention git, topic markers, scopes or registration to the person.
 - NEVER ask about the plan and never look it up yourself: the installer already read it from Claude Code's settings, and THE TWO CALLS below carry it. Record that word with install --set-plan max|small --db <store> (Pro and any plan below Max count as small, and Max counts as max; a plan the settings did not name is small) and never mention it.
-- NEVER mention in the first reply: the plan, git, hooks, helper agents, the weekly check, the work rules, the record of real calls, bug reports, changelogs, topic markers or scopes. They are on the full numbered list and come up only when he asks.
+- NEVER mention in the first reply: the plan, git, hooks, helper assistants, the weekly check, the work rules, the record of real calls, bug reports, changelogs, topic markers or scopes. They are on the full numbered list and come up only when he asks.
 - The full numbered list (THE FULL LIST below) is shown ONLY when he asks what is switched on (for example \"what is switched on?\"), never in the first reply. Show him the short list only: the intro, one line per item and the way to answer; never paste the detail per item (the last part of this text) at him. Its numbers 1 to 12 are stable and in order.
 - The detail per item is yours: state an item's Why once, only when he asks about a number (\"why 7\") or refuses it, in one or two plain sentences, then do what he decided. If he asks and has not refused, add how to say no.
-- Anything he does not mention keeps the default. Item 6 (helper agents) is on by default (a new memory stores its two notes) and is never mentioned in the first reply: when he says \"helpers off\" run install --set-helpers off --db <store> and tell him it is off.
+- Anything he does not mention keeps the default. Item 6 (helper assistants) is on by default (a new memory stores its two notes) and is never mentioned in the first reply: when he says \"helpers off\" run install --set-helpers off --db <store> and tell him it is off.
 - Item 10 (backups) is off until he accepts proposal 1 of the welcome; a place he names (a folder or an address) is install --set-backup <place> --db <store>.
 - Item 12 (changelog): only in a project that is a git repository and has no CHANGELOG.md, create CHANGELOG.md in the project this session runs in (a '# Changelog' heading with an 'Unreleased' section, nothing invented) and keep a version number only if the project already has one or he asks for one; do not mention it in the first reply. In a folder that is not a git repository create no CHANGELOG.md and never mention one. If he says no, create nothing and do not ask again.
 - When he answers, apply each number where it belongs, then REVISE 'owner-setup-answers' (never store a second copy): 1 install --set-plan; 2 remove only THOR's four hook entries from the settings file (item 2 below says which and what stays), then tell him it takes effect after he restarts Claude Code (to switch them back on, run the installer again with `install --db <store>`: it wires the four entries again, a second run changes nothing, and a restart of Claude Code is needed again); 3 git config --global --unset core.hooksPath (turns off all of it), or only the video and size check: git config --global thor.mediagate.enabled false; 4 install --set-weekly-check off|on; 5 retract the named notes (a retracted note stops arriving; a note whose refusing check bites, such as windowless-processes-on-windows or scheduled-task-not-interactive once THOR has tried it, is refused at the retract, so first clear its check with mcp__thor__revise(id, clear_check: true, because: <why, 20+ characters>) and then retract it); 6 install --set-helpers on|off --db <store> (on stores the two helper notes, off retracts them; running it again changes nothing); 7 install --set-mode off (or release); 8 the language: install --set-language <code>|off --db <store> (nl, en, de, fr or es; an unknown code is refused with the list), and for the reply rules the reply file beside the store (guard-response-rulebook.json); 9 install --topic, run from inside the folder; 10 install --set-backup local|<folder or address>|off --db <store> (it makes the git folder, adds a named place as the remote 'nas', connects one session-start backup and makes a first copy to prove it works: tell him that result in plain words, and if it failed say so and why); 11 install --set-recording on|off --db <store>; 12 CHANGELOG.md as above.
@@ -268,16 +269,17 @@ FOR THE ASSISTANT (do not read this part out)
 /// "say first" sentences and the numbered list in the first reply: the full
 /// list is shown only when the person asks what is switched on.
 const WELCOME: &str = "\
-THOR is set up. From now on I remember what you tell me about your work, and I bring it back by myself when it matters - also in a new conversation next week.
+Your memory helper THOR is set up. From now on I remember what you tell me about your work. I bring it back by myself when you need it, also in a new conversation next week.
 You do not have to learn anything. Just talk to me as you always do. For example:
 - \"Remember that the contractor is called Jan and comes on Tuesdays.\"
 - \"What do you know about the kitchen?\"
 - \"That is no longer right: the tiles now come from another shop.\"
 This is what I will set up for you:
-1. Every day a safety copy of your memory on this computer.
+1. Once a day, a safety copy of everything I remember, on this computer.
 2. I talk to you in <language>.
-3. Everything for this work is kept in the folder <folder>, and we work from there.
-Shall I set it up like this? Just say \"yes\", or tell me by number what you want different, for example \"2 English\" or \"3 figure it out yourself\".
+3. Everything for this work goes in the folder <folder>. That is where we work together.
+Shall I set it up like this? Just say \"yes\".
+Want something different? Tell me the number and what you want, for example \"2 English\" or \"3 figure it out yourself\".
 Want to see everything that is switched on? Ask me: \"what is switched on?\"";
 
 /// The welcome, as the assistant says it in its first reply.
@@ -303,7 +305,7 @@ THE TWO CALLS (make them in this order, in your first reply, whatever he answers
 remember(
   id:   \"owner-setup-answers\",
   kind: \"report\",
-  text: \"Setup finished with the defaults, nothing asked first. Plan: {PLAN}. The defaults on the numbered list apply (helper agents are on), except backup, which stays off until the owner chooses (changelog: yes, only in a git project that has none). Backup, language and work folder follow the owner's answer to the welcome (a plain yes accepts the proposals). Replies: short and plain, in the owner's own language. Lane: work only. Projects: named after their folder. Any of these changes when the owner says so.\"
+  text: \"Setup finished with the defaults, nothing asked first. Plan: {PLAN}. The defaults on the numbered list apply (helper assistants are on), except backup, which stays off until the owner chooses (changelog: yes, only in a git project that has none). Backup, language and work folder follow the owner's answer to the welcome (a plain yes accepts the proposals). Replies: short and plain, in the owner's own language. Lane: work only. Projects: named after their folder. Any of these changes when the owner says so.\"
 )
 retract(id: \"walk-through-the-answer-guard-once\", reason: \"Setup finished: the owner's answers are on record as owner-setup-answers.\")
 Give the report NO project: a store this fresh has not named a scope yet, so do not invent one and do not ask him to name one. The retract is refused until the remember call has landed, so make them in this order. When he later answers the two questions or by number, apply each answer where it belongs (the rules above), then revise 'owner-setup-answers' with what he chose; a second copy is worse than none. \"He is not interested\" is also a valid answer to record.";

@@ -1781,8 +1781,8 @@ fn overview_allowed(rule: &OptInRule, prompt_lower: &str, haystack_lower: &str) 
 //
 // The reply is recognised by SHAPE, in any language, because the assistant shows
 // the list in the user's own language: numbered lines 1 to
-// `SETUP_LIST_MIN_ITEMS`, and the two items a translation keeps verbatim
-// (the `/thor-eval` command of item 4 and the `CHANGELOG.md` file of item 12).
+// `SETUP_LIST_MIN_ITEMS`, and the one item a translation keeps verbatim
+// (the `CHANGELOG.md` file of item 12).
 // A test in `ops` renders the real list and holds that it is recognised.
 // Capped at `SETUP_LIST_MAX_CHARS`, so the exemption is for the list reply and
 // not for an essay that happens to contain one. It stands aside for
@@ -1797,7 +1797,6 @@ pub const SETUP_LIST_MAX_CHARS: usize = 6000;
 /// Whether `haystack_lower` (see `haystack`) is the first-session list reply.
 pub fn is_setup_list_reply(haystack_lower: &str) -> bool {
     if haystack_lower.chars().count() > SETUP_LIST_MAX_CHARS
-        || !haystack_lower.contains("/thor-eval")
         || !haystack_lower.contains("changelog.md")
     {
         return false;

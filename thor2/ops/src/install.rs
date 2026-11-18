@@ -1479,7 +1479,7 @@ pub const OFF_TOPIC_NOTE_ID: &str = "off-topic-work-gets-its-own-session";
 
 /// Its text: short on purpose (the tools that do it are named in the first-session
 /// text, `questionnaire::ASSISTANT_RULES`).
-pub const OFF_TOPIC_NOTE_TEXT: &str = "A subject that does not fit this session's work or folder: say so in one plain sentence, offer its own session. On yes: make a folder in Documents named after it, run install --topic there, then move and rename this session if it has no work yet, else prepare a new one. They type nothing.";
+pub const OFF_TOPIC_NOTE_TEXT: &str = "A topic that does not fit this conversation's work or folder: say so in one sentence, offer its own conversation. On yes: make a folder in their Documents folder (real local name), run install --topic there, move and rename this one if it has no work yet, else prepare a new one. They type nothing.";
 
 /// One starter note, as every note of the pack and of helper-agent mode is
 /// built: a global rule with the `workflow-starter` tag, no severity, no check.
