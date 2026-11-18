@@ -240,11 +240,11 @@ pub fn questions() -> Vec<Question> {
 /// What the assistant does with the answers. Not read out to the user.
 pub const ASSISTANT_RULES: &str = "\
 FOR THE ASSISTANT (do not read this part out)
-- This text is the whole job; you need nothing else. In your first reply, in this order: say the welcome of SAY FIRST (in the person's own language, warm and plain, every point kept, nothing technical added), make THE TWO CALLS, and apply the defaults. Every call, command and path you need is written out below (see PATHS ON THIS MACHINE), so never ask him for a path or a command.
+- This text is the whole job; you need nothing else. In your first reply, in this order: say the welcome of SAY FIRST (in the person's own language, warm and plain, every point kept, nothing technical added), make THE TWO CALLS, and apply the defaults. Every call, command and path you need is written out below (see PATHS ON THIS MACHINE), so never ask him for a path or a command. If the THOR tools remember and retract are not loaded in this session yet, load them first (in Claude Code: ToolSearch with select:mcp__thor__remember,mcp__thor__retract).
 - Apply the defaults NOW, in this same turn, without waiting for an answer, so nothing waits: store the Report 'owner-setup-answers' with them and retract the setup note. Never ask the same question twice and never hold up his work for an answer.
 - Language: set it AUTOMATICALLY, in this same turn, to the language he writes in: when it is nl, en, de, fr or es run install --set-language <code> --db <store> (for any other language set nothing). Put that language in question 2 of the welcome. When he answers 'no, X': if X is one of the five run install --set-language <code of X> --db <store> and say in one sentence that it is switched; otherwise say plainly that it cannot be checked but that you will still write in it. Then revise 'owner-setup-answers' with the language.
 - Question 1 of the welcome (a daily safety copy): on a yes run install --set-backup local --db <store> and say the result in one plain sentence (it makes a copy on this computer and a first copy at once to prove it works; if it failed, say so and why in plain words, and when git is missing say that the copy needs git). On a no do nothing and do not ask again. Until he says yes nothing is backed up.
-- NEVER ask about the plan: record what the settings say with install --set-plan max|small --db <store> (Pro and any plan below Max count as small, and Max counts as max; a plan the settings did not name is small) and never mention it.
+- NEVER ask about the plan and never look it up yourself: the installer already read it from Claude Code's settings, and THE TWO CALLS below carry it. Record that word with install --set-plan max|small --db <store> (Pro and any plan below Max count as small, and Max counts as max; a plan the settings did not name is small) and never mention it.
 - NEVER mention in the first reply: the plan, git, hooks, helper agents, the weekly check, the work rules, the record of real calls, bug reports, changelogs or topic folders. They are on the full numbered list and come up only when he asks.
 - The full numbered list (THE FULL LIST below) is shown ONLY when he asks what is switched on (for example \"what is switched on?\"), never in the first reply. Show him the short list only: the intro, one line per item and the way to answer; never paste the detail per item (the last part of this text) at him. Its numbers 1 to 12 are stable and in order.
 - The detail per item is yours: state an item's Why once, only when he asks about a number (\"why 7\") or refuses it, in one or two plain sentences, then do what he decided. If he asks and has not refused, add how to say no.
@@ -280,7 +280,7 @@ pub fn render_welcome() -> String {
 
 /// What to say before anything else.
 fn say_first() -> String {
-    format!("SAY FIRST (before anything else, in his own language, exactly this and nothing more; put the language he writes in where <language> stands):\n{}", render_welcome())
+    format!("SAY FIRST (before anything else, in his own language, warm and plain, every point kept and nothing added; put the language he writes in where <language> stands):\n{}", render_welcome())
 }
 
 /// Three facts to give in your own words, without a question.

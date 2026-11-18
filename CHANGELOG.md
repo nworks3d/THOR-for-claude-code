@@ -2,11 +2,12 @@
 
 What changed in each release, newest first. The release workflow copies the section for the tag being released to the top of the release notes and refuses to publish without one.
 
-## Unreleased
+## 2.6.10 (2026-11-18)
+
+What changed: A first install on Windows now works for someone who has never done this before. The install command installs git and the C++ runtime by itself, THOR's connections to Claude Code no longer need git or PowerShell and can never lock your assistant out, the first reply is a short welcome with two questions instead of a list of settings, and your assistant can remove THOR for you without touching any other program.
 
 - **A first install on a Windows computer without Git no longer leaves your assistant locked out.** THOR's connections to Claude Code were written as one command line, which PowerShell (used when Git Bash is missing) cannot read; every connection failed and the one before each tool call blocked every tool. On Windows they are now written so the program starts directly, and a connection that cannot start never blocks anything. Running the setup again rewrites an older connection in place; restart Claude Code once afterwards.
 - **The Windows install command now installs what is missing by itself.** It installs git and Microsoft's Visual C++ runtime with winget first (Windows may ask permission once for each), instead of stopping and asking you to type a command. If git cannot be installed it carries on; if the runtime cannot be installed it stops and says why.
-
 - **The first reply is now a short welcome, not a list of twelve settings.** It says THOR remembers what you tell it, gives three examples of what to say, and asks two short questions (a daily safety copy, and whether it picked the right language, which it now sets by itself from how you write). The plan, git, hooks, helper assistants and the rest are no longer mentioned or asked about. The numbered list of everything that is switched on is shown only when you ask "what is switched on?", in plain words, and a folder that is not a software project gets no CHANGELOG.md.
 - **Your assistant can now remove THOR for you.** `install --uninstall --db <memory>` takes out only THOR's own connections, then after a restart `install --uninstall --finish --db <memory>` removes the leftovers, keeps your memory unless you say to delete it (`--delete-memory`), and names THOR's program folder for the assistant to delete. It never removes git, Python or the Visual C++ runtime.
 - **THOR's hook-failure check also reads the Windows form of its connections.** A failure of a connection written in the new form is recognised like the old one.

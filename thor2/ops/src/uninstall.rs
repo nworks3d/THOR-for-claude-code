@@ -345,6 +345,7 @@ impl PhaseTwoReport {
         }
         if !self.memory_deleted.is_empty() {
             lines.push(format!("+ deleted your memory ({} item(s), as you asked)", self.memory_deleted.len()));
+            lines.push("= kept, if you have them: THOR's safety copies (backup-repo) and your personal library (library.db)".to_string());
         }
         if let Some(path) = &self.memory_kept {
             lines.push(format!("= your memory was kept at {}; delete that folder yourself any time", path.display()));
@@ -359,8 +360,10 @@ impl PhaseTwoReport {
 
 /// The files that make up the memory and its sidecars. THOR's own data
 /// folder (named `thor2`) is deleted entry by entry except `backup-repo`, the
-/// person's safety copies; any other folder only loses the files named after
-/// the memory file.
+/// person's safety copies, and the personal library (`library.db` and its
+/// sidecars), which is the person's own everyday knowledge and not part of the
+/// work memory; any other folder only loses the files named after the memory
+/// file.
 fn memory_entries(db: &Path) -> Vec<PathBuf> {
     let Some(dir) = db.parent() else { return Vec::new() };
     let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
@@ -372,7 +375,7 @@ fn memory_entries(db: &Path) -> Vec<PathBuf> {
         .filter(|p| {
             let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
             if own_folder {
-                name != "backup-repo"
+                name != "backup-repo" && !name.starts_with("library.db")
             } else {
                 name.starts_with(&stem)
             }
@@ -585,6 +588,7 @@ mod tests {
         std::fs::write(data.join("thor.db"), b"memory").unwrap();
         std::fs::write(data.join("thor.db-wal"), b"wal").unwrap();
         std::fs::write(data.join("work-folders.json"), b"{}").unwrap();
+        std::fs::write(data.join("library.db"), b"recipes").unwrap();
         let t = Targets {
             settings: dir.join("settings.json"),
             claude_json: dir.join(".claude.json"),
@@ -631,6 +635,7 @@ mod tests {
         let data = t.db.parent().unwrap();
         assert!(!t.db.exists() && !data.join("thor.db-wal").exists() && !data.join("work-folders.json").exists());
         assert!(data.join("backup-repo").exists(), "the safety copies are never deleted by this");
+        assert!(data.join("library.db").exists(), "the personal library is not the work memory and stays");
     }
 
     #[test]
