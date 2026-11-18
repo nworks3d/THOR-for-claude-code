@@ -27,8 +27,10 @@ A note that keeps being served without ever being judged is asked about in
 one block, not one note at a time: the end-of-session review (`/thor-eval`),
 which THOR asks for about once a week per project. THOR does not stop an
 ordinary turn to ask whether one note helped or got in the way. The review
-only names a note your own session actually saw fire - never one that only
-ever showed up during other, unrelated work. Two "this did not belong"
+only names a note that fired in your own session, or in another session of
+the same project - never one that only showed up in
+other, unrelated projects. For a note that fired elsewhere, the review shows
+where and when it fired. Two "this did not belong"
 verdicts since the note was last rewritten stop a plain note from being served
 again, though it stays there if you go looking for it. A rewrite of the note's
 text, check or bindings starts that count again, and a note whose check can

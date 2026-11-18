@@ -384,7 +384,22 @@ fn the_filing_refusal_names_the_items_that_owe_a_judgement() {
 // real server, with the hook's start record written by hand.
 
 #[test]
-fn a_report_is_never_held_for_items_that_fired_only_in_another_session() {
+fn a_report_is_never_held_for_items_that_fired_only_in_another_project() {
+    let tmp = tempfile::tempdir().unwrap();
+    let elsewhere = rule("fired-in-q", Some("q"), None, vec![command("fixture-cmd")], vec![]);
+    let db = store_with(tmp.path(), &[report("seed-p", "p", &[]), elsewhere]);
+    with_store(&db, |s| {
+        serve::teeth::fixture::decide(s, "fired-in-q");
+    });
+    with_store(&db, |s| served_in(s, "a-parallel-session", "fired-in-q", 40));
+    open_start(&db, "this-session", "p");
+    let mut mcp = Mcp::start_as(&db, tmp.path(), Some("this-session"));
+    let reply = mcp.call_meta("remember", eval_report_args("eval-new", "p"));
+    assert!(reply.starts_with("stored"), "an item of another project is not this report's to settle: {reply}");
+}
+
+#[test]
+fn a_report_is_held_for_items_that_fired_only_in_another_session_of_the_project() {
     let tmp = tempfile::tempdir().unwrap();
     let elsewhere = rule("fired-elsewhere", Some("p"), None, vec![command("fixture-cmd")], vec![]);
     let db = store_with(tmp.path(), &[report("seed-p", "p", &[]), elsewhere]);
@@ -398,7 +413,11 @@ fn a_report_is_never_held_for_items_that_fired_only_in_another_session() {
     open_start(&db, "this-session", "p");
     let mut mcp = Mcp::start_as(&db, tmp.path(), Some("this-session"));
     let reply = mcp.call_meta("remember", eval_report_args("eval-new", "p"));
-    assert!(reply.starts_with("stored"), "another session's firings are not this report's to settle: {reply}");
+    assert!(reply.contains("REFUSED") && reply.contains("'fired-elsewhere'"), "another session of the project fired it: {reply}");
+    let mut args = eval_report_args("eval-new", "p");
+    args["tags"] = serde_json::json!(["evaluation-report", "not-judgeable:fired-elsewhere:the place it fired in is not enough"]);
+    let reply = mcp.call_meta("remember", args);
+    assert!(reply.starts_with("stored"), "an explicit skip with a reason settles it: {reply}");
     assert!(reply.contains("1 item(s) stay owed store-wide"), "and the receipt says what stays owed: {reply}");
 }
 

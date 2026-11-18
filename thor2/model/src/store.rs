@@ -5053,6 +5053,16 @@ pub struct Firings {
     /// every log event, the start record included.
     #[serde(skip)]
     pub excerpts: Vec<Option<String>>,
+    /// True when the item did NOT fire in the evaluating session and is on the
+    /// list because it fired in another session of the project since its last
+    /// verdict (`other_session_firings`): `count` and `triggers` then read
+    /// from those other sessions.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub elsewhere: bool,
+    /// The date (`YYYY-MM-DD`, as the serving recorded it) of the newest
+    /// firing read here. Only set for an `elsewhere` item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_date: Option<String>,
 }
 
 /// How many distinct triggers per item `session_firings` keeps.
@@ -5143,6 +5153,84 @@ pub fn session_firings(store: &EventStore, session: &str, ids: &[String], until_
         entry.count += 1;
         if entry.triggers.len() < FIRED_TRIGGERS && !entry.triggers.contains(&shown) {
             entry.triggers.push(shown);
+        }
+    }
+    out
+}
+
+/// The sessions, up to log seq `until_seq`, that were served an item whose id is
+/// in `own` (the live items scoped exactly to one project): the sessions that
+/// worked in that project. The log carries no project column on a serving, and
+/// a session start serves the project's own items, so this finds them (the same
+/// reading `serve::eval_filing::reachable_judgement_debt` uses).
+fn project_sessions_of<'a>(
+    events: &'a [(i64, EventKind, String, String, String)],
+    own: &HashSet<&str>,
+    until_seq: i64,
+) -> HashSet<&'a str> {
+    events
+        .iter()
+        .filter(|(seq, kind, id, actor, _)| {
+            *seq <= until_seq && *kind == EventKind::ItemServed && actor == ASSISTANT_DELIVERY_ACTOR && own.contains(id.as_str())
+        })
+        .map(|(.., event_session)| event_session.as_str())
+        .collect()
+}
+
+/// How each of `ids` fired in sessions OTHER than `session` that worked in
+/// `project` (`project_sessions_of`), since the item's last attested verdict
+/// and at or before `until_seq` (`Firings::elsewhere`): the count, the last
+/// distinct places (already redacted when the serving was recorded) and the
+/// date of the newest firing. An id with no such firing is left out. Fails
+/// open to an empty map.
+pub fn other_session_firings(store: &EventStore, session: &str, project: &str, ids: &[String], until_seq: i64) -> BTreeMap<String, Firings> {
+    let mut out: BTreeMap<String, Firings> = BTreeMap::new();
+    let Ok(all) = store.firings_and_verdicts() else { return out };
+    let live = all_live_items(store);
+    let own: HashSet<&str> = live.iter().filter(|(_, it)| it.project.as_deref() == Some(project)).map(|(id, _)| id.as_str()).collect();
+    let project_sessions = project_sessions_of(&all, &own, until_seq);
+    let attested = attested_write_seqs(store);
+    for id in ids {
+        let Ok(events) = store.get_events_by_entity(id) else { continue };
+        let since_seq = events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::ItemMarkedUseful | EventKind::ItemMarkedNoise) && attested.contains(&e.seq))
+            .map(|e| e.seq)
+            .max()
+            .unwrap_or(0);
+        let anchors: Vec<String> = show(store, id)
+            .map(|item| {
+                item.bindings
+                    .iter()
+                    .filter_map(|b| match b {
+                        Binding::Target { value, .. } => Some(value.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for event in events.iter().rev().filter(|e| {
+            e.kind == EventKind::ItemServed
+                && e.actor == ASSISTANT_DELIVERY_ACTOR
+                && e.session_id != session
+                && project_sessions.contains(e.session_id.as_str())
+                && e.seq > since_seq
+                && e.seq <= until_seq
+        }) {
+            let body = serde_json::from_str::<crate::served::ItemServed>(&event.body).ok();
+            let shown = match body.as_ref().and_then(|b| b.trigger.as_deref()).map(str::trim).filter(|t| !t.is_empty()) {
+                Some(t) => trigger_excerpt(t, &anchors),
+                None => FIRED_WITHOUT_TRIGGER.to_string(),
+            };
+            let entry = out.entry(id.clone()).or_default();
+            entry.elsewhere = true;
+            entry.count += 1;
+            if entry.last_date.is_none() {
+                entry.last_date = body.map(|b| b.served_at.chars().take(10).collect::<String>()).filter(|d| !d.is_empty());
+            }
+            if entry.triggers.len() < FIRED_TRIGGERS && !entry.triggers.contains(&shown) {
+                entry.triggers.push(shown);
+            }
         }
     }
     out
@@ -5317,6 +5405,10 @@ pub fn frozen_now(store: &EventStore, session: &str, project: &str, started_by: 
     })
     .map(|mut frozen| {
         let mut fired = session_firings(store, session, &frozen.judgement, started_seq);
+        // An item on the list that this session never saw fire: where it fired
+        // in the project's other sessions, so it can be judged with context.
+        let elsewhere: Vec<String> = frozen.judgement.iter().filter(|id| !fired.contains_key(*id)).cloned().collect();
+        fired.extend(other_session_firings(store, session, project, &elsewhere, started_seq));
         if frozen.judgement.len() > FIRED_FULL_LIST_MAX {
             fired.values_mut().for_each(|f| f.triggers.truncate(1));
         }
@@ -5746,8 +5838,14 @@ pub struct EvaluationJudgement {
 /// `JUDGEMENT_DEBT_AFTER`+ SESSIONS (assistant deliveries only, once per
 /// session, exactly as the store-wide debt counts) since its own last
 /// ATTESTED verdict, AND it fired in `session` at least once at or before the
-/// start - the "was the reader being asked ever in the room" test: a verdict
-/// guessed on an item the evaluating session never saw is no verdict. This is
+/// start, OR in another session of `project` (a session served an item scoped
+/// exactly to it, `project_sessions_of`) since that last verdict. The second
+/// half is what keeps
+/// debt that fired in parallel sessions from being on no list, ever (measured
+/// 2026-11-18: every project's report said "nothing is on the lists" while
+/// 12 to 14 items of it owed a verdict); the item's line shows where and when
+/// it fired there (`other_session_firings`) and the report can skip it with a
+/// `not-judgeable` tag. This is
 /// the ONLY place the owner is asked for a judgement (step 28): no Stop holds
 /// a turn for it any more. It must also still be live,
 /// still apply to `project` and still not be pinned. A firing after the start
@@ -5755,8 +5853,9 @@ pub struct EvaluationJudgement {
 /// the evaluation's own writes - and every rule bound to the `remember` moment
 /// they fire - from growing the list while it is being paid.
 ///
-/// THE CAP: at most `EVALUATION_JUDGEMENT_LIST_CAP` items, the most-served
-/// (most sessions) first - never everything that is owed at once. The rest stay
+/// THE CAP: at most `EVALUATION_JUDGEMENT_LIST_CAP` items, those `session`
+/// saw fire first, then the most-served (most sessions) - never everything
+/// that is owed at once. The rest stay
 /// owed store-wide (doctor's judgement debt) and the next evaluation lists the
 /// next ones.
 ///
@@ -5768,10 +5867,23 @@ pub struct EvaluationJudgement {
 pub fn evaluation_judgement_list(store: &EventStore, project: Option<&str>, session: &str, started_seq: i64) -> Vec<String> {
     let Ok(events) = store.firings_and_verdicts() else { return Vec::new() };
     let attested = attested_write_seqs(store);
+    let live = all_live_items(store);
+    // THE OTHER SESSIONS OF THE PROJECT (`project_sessions_of`): an owed item
+    // that fired in one of them since its last verdict is reachable by this
+    // evaluation even when this session never saw it fire. (No lower bound
+    // than the item's own last verdict: a bound at the previous evaluation
+    // would drop what that evaluation's cap left over, which the cap promises
+    // the next evaluation.)
+    let own: HashSet<&str> = match project {
+        Some(p) => live.iter().filter(|(_, it)| it.project.as_deref() == Some(p)).map(|(id, _)| id.as_str()).collect(),
+        None => HashSet::new(),
+    };
+    let project_sessions = project_sessions_of(&events, &own, started_seq);
     // The sessions that were served each item since its last verdict, as of
     // the start: an item counts once per session (step 28).
     let mut sessions_at_start: HashMap<&str, HashSet<&str>> = HashMap::new();
     let mut fired_here: HashSet<&str> = HashSet::new();
+    let mut fired_in_project: HashSet<&str> = HashSet::new();
     for (seq, kind, id, actor, event_session) in &events {
         if *seq > started_seq {
             continue;
@@ -5782,29 +5894,37 @@ pub fn evaluation_judgement_list(store: &EventStore, project: Option<&str>, sess
                 if event_session == session {
                     fired_here.insert(id.as_str());
                 }
+                if project_sessions.contains(event_session.as_str()) {
+                    fired_in_project.insert(id.as_str());
+                }
             }
             EventKind::ItemMarkedUseful | EventKind::ItemMarkedNoise if attested.contains(seq) => {
                 sessions_at_start.insert(id.as_str(), HashSet::new());
+                fired_in_project.remove(id.as_str());
             }
             _ => {}
         }
     }
-    let live = all_live_items(store);
     let live_by_id: HashMap<&str, &Item> = live.iter().map(|(id, it)| (id.as_str(), it)).collect();
-    let mut owed: Vec<(usize, String)> = sessions_at_start
+    // (fired in this session, sessions served, id)
+    let mut owed: Vec<(bool, usize, String)> = sessions_at_start
         .iter()
-        .filter(|(id, sessions)| sessions.len() >= JUDGEMENT_DEBT_AFTER && fired_here.contains(**id))
+        .filter(|(id, sessions)| {
+            sessions.len() >= JUDGEMENT_DEBT_AFTER && (fired_here.contains(**id) || fired_in_project.contains(**id))
+        })
         .filter_map(|(id, sessions)| {
             let item = live_by_id.get(id)?;
             let pinned = item.bindings.iter().any(|b| matches!(b, Binding::Always));
-            (!pinned && project_applies_to(item.project.as_deref(), project)).then(|| (sessions.len(), id.to_string()))
+            (!pinned && project_applies_to(item.project.as_deref(), project))
+                .then(|| (fired_here.contains(id), sessions.len(), id.to_string()))
         })
         .collect();
-    // THE CAP: the most-served first, ties by id so the list is the same on
-    // every read of the same log. The rest stay owed store-wide.
-    owed.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    // THE CAP: what this session saw fire first, then the most-served, ties
+    // by id so the list is the same on every read of the same log. The rest
+    // stay owed store-wide.
+    owed.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)).then_with(|| a.2.cmp(&b.2)));
     owed.truncate(EVALUATION_JUDGEMENT_LIST_CAP);
-    owed.into_iter().map(|(_, id)| id).collect()
+    owed.into_iter().map(|(_, _, id)| id).collect()
 }
 
 /// The set one evaluation must settle, split by state. `report_tags` are the
@@ -6363,10 +6483,11 @@ fn check_evaluation_report_filing(store: &EventStore, item: &Item, ctx: Option<&
     if !judgement.owed.is_empty() {
         let named = judgement.owed.iter().map(|id| format!("'{id}'")).collect::<Vec<_>>().join(", ");
         missing.push(format!(
-            "{} item(s) fired in this session before this evaluation started (log position {}) and still owe a \
+            "{} item(s) fired in this session (or, on the list, in another session of this project) \
+             before this evaluation started (log position {}) and still owe a \
              judgement - each had fired in {JUDGEMENT_DEBT_AFTER}+ sessions since its last verdict by then: {named}. This \
-             list was fixed when the evaluation started and cannot grow: nothing that fires after that, and nothing \
-             that fired only in another session, is this report's to settle. Only a verdict this session gives \
+             list was fixed when the evaluation started and cannot grow: nothing that fires after that is this \
+             report's to settle. Only a verdict this session gives \
              through the THOR tool itself counts - one from another session, or from a shell or a script, settles \
              nothing - and a verdict given in this turn counts once the turn has ended (THOR checks it against the \
              session's transcript at the Stop), so end the turn once before filing again. For each one, read where \
@@ -10979,21 +11100,73 @@ mod tests {
     // sessions fired items this session never saw. It ended up stamping sixty
     // items useful. These pin the fix (see `evaluation_judgement_owed`).
 
-    /// Items that fired only in another session stay owed store-wide, but
-    /// never hold this session's report.
+    /// An owed item that fired only in another session of the project is on
+    /// this evaluation's list and holds its report, with the place and the
+    /// date of those firings kept beside it; the honest exit is the
+    /// not-judgeable tag.
     #[test]
-    fn an_item_that_fired_only_in_another_session_never_holds_this_report() {
+    fn an_item_that_fired_only_in_another_session_of_the_project_is_listed_and_holds_the_report() {
         let mut store = EventStore::in_memory().unwrap();
         declare_noted(&mut store, &light_command_rule("elsewhere", "w"));
-        serve_in(&mut store, "other-session", "elsewhere", JUDGEMENT_DEBT_AFTER);
+        for i in 0..JUDGEMENT_DEBT_AFTER {
+            let session = format!("other-{i}");
+            let body = r#"{"served_at":"2026-11-17T10:00:00Z","trigger":"git push origin main"}"#;
+            store.append_event(&session, &session, ASSISTANT_DELIVERY_ACTOR, EventKind::ItemServed, "elsewhere", None, body).unwrap();
+        }
         let start = record_start(&mut store, "this-session", "w");
+        assert_eq!(start.frozen.judgement, ["elsewhere"], "it is on the list although this session never saw it fire");
+        let fired = &start.frozen.fired["elsewhere"];
+        assert!(fired.elsewhere, "{fired:?}");
+        assert_eq!(fired.count, JUDGEMENT_DEBT_AFTER);
+        assert_eq!(fired.last_date.as_deref(), Some("2026-11-17"));
+        assert_eq!(fired.triggers, ["git push origin main"]);
 
-        file_in(&mut store, &eval_report("eval-w-1", "w"), &start).expect("another session's firings are not this report's to settle");
-        assert_eq!(
-            judgement_debt_in_project(&store, Some("w")),
-            vec!["elsewhere".to_string()],
-            "it stays owed store-wide, where doctor keeps naming it"
-        );
+        let err = file_in(&mut store, &eval_report("eval-w-1", "w"), &start).unwrap_err();
+        let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
+        assert!(refusal.problem.contains("'elsewhere'"), "{}", refusal.problem);
+
+        let mut skipped = eval_report("eval-w-2", "w");
+        skipped.tags.push("not-judgeable:elsewhere:the firing context is not enough to judge it".to_string());
+        file_in(&mut store, &skipped, &start).expect("a not-judgeable tag with a reason settles it for this filing");
+        assert_eq!(judgement_debt_in_project(&store, Some("w")), vec!["elsewhere".to_string()], "it stays owed store-wide");
+    }
+
+    /// An item that fired only in sessions that worked in ANOTHER project is
+    /// not on this project's list, and holds nothing.
+    #[test]
+    fn an_item_that_fired_only_in_another_project_is_not_listed() {
+        let mut store = EventStore::in_memory().unwrap();
+        let mut global = light_command_rule("everywhere", "w");
+        global.project = None;
+        declare_noted(&mut store, &global);
+        declare_noted(&mut store, &light_command_rule("only-q", "q"));
+        serve_in(&mut store, "q-session", "only-q", 1);
+        serve_in(&mut store, "q-session", "everywhere", JUDGEMENT_DEBT_AFTER);
+        assert_eq!(evaluation_judgement_list(&store, Some("w"), "this-session", i64::MAX), Vec::<String>::new());
+        let start = record_start(&mut store, "this-session", "w");
+        file_in(&mut store, &eval_report("eval-w-1", "w"), &start).expect("nothing of project w is owed");
+        // The same global item, once a session that worked in w was served it too, is.
+        declare_noted(&mut store, &light_command_rule("own-w", "w"));
+        serve_in(&mut store, "q-session", "own-w", 1);
+        assert_eq!(evaluation_judgement_list(&store, Some("w"), "this-session", i64::MAX), ["everywhere"]);
+    }
+
+    /// What this session saw fire comes first, then the most-served; five at
+    /// most, whichever session fired them.
+    #[test]
+    fn the_list_keeps_this_sessions_items_first_and_stops_at_five() {
+        let mut store = EventStore::in_memory().unwrap();
+        for n in 0..3 {
+            declare_noted(&mut store, &light_command_rule(&format!("mine-{n}"), "pr"));
+            serve_in(&mut store, "s", &format!("mine-{n}"), JUDGEMENT_DEBT_AFTER);
+        }
+        for n in 0..4 {
+            declare_noted(&mut store, &light_command_rule(&format!("theirs-{n}"), "pr"));
+            serve_in(&mut store, "t", &format!("theirs-{n}"), JUDGEMENT_DEBT_AFTER + 5 + n);
+        }
+        let list = evaluation_judgement_list(&store, Some("pr"), "s", i64::MAX);
+        assert_eq!(list, ["mine-0", "mine-1", "mine-2", "theirs-3", "theirs-2"], "{list:?}");
+        assert_eq!(judgement_debt_in_project(&store, Some("pr")).len(), 7, "the rest stays owed store-wide");
     }
 
     /// STEP 28: a fact counts ONCE PER SESSION toward the 40 that make a verdict

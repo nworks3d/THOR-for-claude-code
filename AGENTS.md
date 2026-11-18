@@ -1112,14 +1112,17 @@ half an hour or more never counts.
 1. **It starts in THOR's own record, not in a file.** Opening `/thor-eval` or
    being asked at the end of a turn writes a start note into the memory's log,
    and from that moment the lists below are frozen: nothing that fires or is
-   written later is added, and nothing that only fired in another session is on
-   them. THOR then decides the old rules of the project itself - for up to 20
+   written later is added. THOR then decides the old rules of the project itself - for up to 20
    seconds - and shows you a note with three parts. If the note says THOR is
    still deciding, end the turn once and read it again.
-   - **Verdicts.** The notes that fired in this session and that went 10 sessions
-     or more without a verdict (a note counts once per session, however often it
-     was shown there), the most-served first, at most 5 per evaluation (the rest
-     stay owed and the next evaluation lists the next ones). Give each one with the THOR tool (`mark`), or skip it
+   - **Verdicts.** The notes that fired in this session, or in another session
+     of this project, and that went 10
+     sessions or more without a verdict (a note counts once per session, however
+     often it was shown there), the most-served first, at most 5 per evaluation,
+     the ones this session saw fire ahead of the rest (the rest stay owed and the
+     next evaluation lists the next ones). A note that fired only in another session
+     shows where and when it fired; when that is not enough to judge it, skip it
+     (see below). Give each one with the THOR tool (`mark`), or skip it
      honestly by tagging the report `not-judgeable:<id>:<reason>` (a real
      reason of at least 12 characters). A verdict given any other way - a
      command line, a script, another session - settles nothing and is listed
@@ -1235,8 +1238,11 @@ than the installed one ... Nothing was written"). Do not retry: tell the owner i
 one sentence to close Claude Code completely and open it again; the evaluation is
 asked again after that.
 
-The verdict list of an evaluation only ever names a note THIS session actually
-saw fire - never one that only ever showed up during other, unrelated work.
+The verdict list of an evaluation names a note that fired in THIS session, or in
+another session of the same project - never
+one that only showed up in other, unrelated projects. A note that fired only in
+another session carries the place and date of those firings, and the honest exit
+`not-judgeable:<id>:<reason>` when that is not enough.
 There is no separate question about one note at the end of an ordinary turn.
 
 ## When THOR finds a bug in itself (the co-tester section)

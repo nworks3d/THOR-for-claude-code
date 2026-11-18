@@ -189,7 +189,8 @@ written by the reserved actor `eval-machine`), never a file beside the store:
 only the hook knows which session is which, so it writes the record, and the
 tool server finds it again by the session id it runs under. The record
 freezes three lists, none of which can grow afterwards: the judgement
-list (what fired in that session and in 10 sessions or more since its last verdict,
+list (what fired in that session or in another session of the project,
+and in 10 sessions or more since its last verdict,
 a fact counting once per session; the most-served first, at most 5),
 the batch (at most 8 old rules only an agent can fix) and the A4 list (at
 most 16 rules whose check bites and whose text only has to name its literal).

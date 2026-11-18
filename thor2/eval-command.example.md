@@ -107,8 +107,7 @@ THE EVALUATION STARTS IN THOR'S LOG, never in a file and never at filing. It
 starts when you open this routine (as a skill, or when the owner types the
 command) or when the Stop hook asks for it. At that moment THOR writes a
 start record and freezes three lists, which cannot grow: nothing that fires
-or is written afterwards is added, and nothing that fired only in another
-session is on them. Then THOR decides the old rules of the project ITSELF,
+or is written afterwards is added. Then THOR decides the old rules of the project ITSELF,
 for up to the time box that the start note names (20 seconds by default) (the rules it did not reach in that time are counted in
 the note as "not reached this time: N" - they are not owed in this evaluation
 and they lead the next start), and the note it shows you afterwards names four
@@ -262,9 +261,10 @@ eval-demo-2026-10-08-2, the last that counted; -3 and -4 are on file and did
 not count (version skew)".
 
 THE ASK'S VERDICT COUNT. The ask says how many items are on THIS evaluation's
-verdict list (section 1 of the start note: what fired in this session and owes a
-verdict). Items that owe a verdict only because other sessions fired them are
-counted apart, are on no evaluation's list and need nothing from you. DONE WHEN:
+verdict list (section 1 of the start note: what fired in this session, or in
+another session of this project, and owes a verdict). Items that owe a verdict
+but fired in no session of the project, or did not fit under the cap, are counted apart, are on no list and need
+nothing from you. DONE WHEN:
 your verdicts match section 1, whatever the other number says.
 
 The test is not "was it useful" but **did it belong where it fired**.
@@ -290,19 +290,24 @@ retry the call, first with and then without a project prefix - the local
 mcp__thor__ server is the authority.
 
 Your list is the one the start note printed under JUDGEMENT, frozen when the
-evaluation started: exactly the items that fired in THIS session and had
-fired in 10 sessions or more since their last verdict (a fact counts once per
-session), the most-served first and at most 5 per evaluation (the next
-evaluation lists the next ones). Judge only those. A pinned
+evaluation started: exactly the items that fired in THIS session or in another
+session of this project, and had fired in 10
+sessions or more since their last verdict (a fact counts once per session), the
+most-served first and at most 5 per evaluation, the ones this session saw fire
+ahead of the others (the next evaluation lists the next ones). Judge only those. A pinned
 item is never on it: the owner already answered whether it belongs there by
 pinning it. Never `mark` an item that is not on your frozen list, even if it
 fired in the wrong place: a wrong-place firing off the list goes to step 7 as
 friction (anchor), not to a verdict.
 
 Judge each item by WHERE it fired, never by its text alone. Under every item
-the start note shows where it fired in this session - how often, and its last
-places (the command or file); `mcp__thor__get(id: "<id>", fired: true)` shows
-an item's recent firings. With a list of more than about 50 items, build a
+the start note shows where it fired - how often, and its last places (the
+command or file); `mcp__thor__get(id: "<id>", fired: true)` shows an item's
+recent firings in this session. An item marked "fired only in another session
+of this project" never fired in your session: its line gives the places and the
+date of its firings there, and when that is not enough to judge whether it
+belonged, skip it with the tag `not-judgeable:<id>:<reason>` instead of
+guessing. Such a verdict is still a THOR `mark` call of this session. With a list of more than about 50 items, build a
 firing map FIRST: one pass over this session's transcript (a subagent may only
 READ it, to build the map) that says, per id, on which call it fired - then
 judge. Every verdict, THOR call and filing stays the session's own. Never

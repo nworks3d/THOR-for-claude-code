@@ -1003,6 +1003,7 @@ pub mod fixture {
     /// Returns the validator's record of it; panics when the filing is
     /// refused or the record is not valid, naming why.
     pub fn valid_filing(store: &mut EventStore, root: &Path, session: &str, report: &Item, tool_use_id: &str) -> EvaluationValidation {
+        let report = &skipping_the_list(store, session, report);
         attest::fixture::attested_filing(store, root, session, report, tool_use_id)
             .unwrap_or_else(|e| panic!("the fixture filing of '{}' was refused: {e}", report.id));
         validated(store, root, session, report)
@@ -1018,11 +1019,26 @@ pub mod fixture {
         tool_use_id: &str,
         at: i64,
     ) -> EvaluationValidation {
+        let report = &skipping_the_list(store, session, report);
         let stamp = crate::time::iso8601_from_unix(at);
         attest::fixture::attested_filing_unverified_at(store, root, session, report, tool_use_id, &stamp)
             .unwrap_or_else(|e| panic!("the fixture filing of '{}' was refused: {e}", report.id));
         attest::record_write_verifications_in(store, session, Some(root));
         validated(store, root, session, report)
+    }
+
+    /// `report` plus a not-judgeable tag for every item the verdict list of an
+    /// evaluation starting now would hold it to: a fixture that only needs a
+    /// report that COUNTS gives no verdicts.
+    fn skipping_the_list(store: &EventStore, session: &str, report: &Item) -> Item {
+        let mut report = report.clone();
+        if let Some(project) = report.project.clone() {
+            let frozen = model::store::frozen_now(store, session, &project, "skill", crate::time::now_unix());
+            for id in frozen.map(|f| f.judgement).unwrap_or_default() {
+                report.tags.push(format!("{}{id}:the fixture gives no verdicts", model::store::NOT_JUDGEABLE_TAG_PREFIX));
+            }
+        }
+        report
     }
 
     fn validated(store: &mut EventStore, root: &Path, session: &str, report: &Item) -> EvaluationValidation {

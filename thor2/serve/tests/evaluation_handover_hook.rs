@@ -230,7 +230,12 @@ fn stop_ask_writes_one_start_record() {
     assert_eq!((start.frozen.session.as_str(), start.frozen.project.as_str()), ("s1", "proj"));
     assert_eq!(start.frozen.started_seq, before, "it starts at the log's tip when the hook asks");
     assert_eq!(start.frozen.started_by, "stop-ask");
-    assert_eq!(start.frozen.judgement, vec!["seen-here".to_string()], "what fired only elsewhere is not on the list");
+    assert_eq!(
+        start.frozen.judgement,
+        vec!["seen-here".to_string(), "seen-elsewhere".to_string()],
+        "what fired in another session of the project is on the list, after what this session saw fire"
+    );
+    assert!(start.frozen.fired["seen-elsewhere"].elsewhere && !start.frozen.fired["seen-here"].elsewhere);
     // Both rules had no verdict: THOR's pass tried them itself, oldest write
     // first, found nothing to build a tooth from, and wrote each as a note -
     // so nothing is left for the session's batch.
@@ -363,9 +368,9 @@ fn typed_command_always_starts() {
     let note = context(&run_hook(&db, prompt("s1", &cwd, "/t-eval"), &sandbox));
     assert!(note.contains(&format!("started at log position {before}")), "{note}");
     let start = only_start(&db, "s1");
-    assert_eq!(start.frozen.judgement, vec!["seen-here".to_string()]);
+    assert_eq!(start.frozen.judgement, vec!["seen-here".to_string(), "seen-elsewhere".to_string()]);
     assert_note_names_the_frozen_lists(&note, &start);
-    assert!(!note.contains("mcp__thor__mark(id: \"seen-elsewhere\")"), "only the frozen ids are named for a verdict: {note}");
+    assert!(note.contains("fired only in another session of this project"), "the other session's item says so: {note}");
 
     let again = context(&run_hook(&db, prompt("s1", &cwd, "/thor-eval"), &sandbox));
     assert!(again.contains("already open since log seq") && again.contains("started at log position"), "{again}");

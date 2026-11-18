@@ -1648,8 +1648,9 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool
             "judgement debt: {total} item(s) store-wide are owed a verdict (fired in {threshold}+ sessions since \
              the last one, or never judged at all; pinned items excluded - the owner answered that question \
              by pinning them) - {in_project} of them apply to this checkout ('{project}', or global); they are \
-             never asked at the end of a turn, and an evaluation asks about one only when the evaluating session saw \
-             it fire, the most-served first and at most {cap} per evaluation - so an item that never fires there \
+             never asked at the end of a turn, and an evaluation asks about one only when it fired in the evaluating \
+             session or in another session of the project, the most-served first \
+             and at most {cap} per evaluation - so an item that fired in no session of the project \
              stays owed until it is settled with mark or retract; the \
              longest owed are named below, each with its sessions since its last verdict"
         ),
@@ -1658,9 +1659,10 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool
              the last one, or never judged at all; pinned items excluded - the owner answered that question \
              by pinning them) - this checkout resolves to no project, so only the {in_project} global one(s) \
              among them could ever be asked about here; they are never asked at the end of a turn, and an \
-             evaluation asks about one only when the evaluating session saw it fire, the most-served first and at \
-             most {cap} per evaluation - so an item that never fires \
-             there stays owed until it is settled with mark or retract; the longest owed are named below, each \
+             evaluation asks about one only when it fired in the evaluating session or in another session of the \
+             project, the most-served first and at \
+             most {cap} per evaluation - so an item that fired in no session of the project \
+             stays owed until it is settled with mark or retract; the longest owed are named below, each \
              with its sessions since its last verdict"
         ),
     }];
@@ -4773,9 +4775,9 @@ mod tests {
     }
 
     /// Field test 11: the line promised that every owed item "is asked about
-    /// inside the project's next evaluation". By design an evaluation asks
-    /// only about items the EVALUATING session saw fire, so an owed item that
-    /// never fires there is never asked. The sentence now says exactly that,
+    /// inside the project's next evaluation". An evaluation asks only about
+    /// items that fired in the evaluating session or in another session of the
+    /// project, so an owed item that fired in none is not asked. The sentence now says exactly that,
     /// and points at the two calls that settle such an item by hand.
     #[test]
     fn judgement_debt_line_promises_only_what_the_evaluation_does() {
@@ -4795,7 +4797,7 @@ mod tests {
             let line = judgement_debt_line(&db, project, false).expect("something is owed, the line must speak");
             let first = line.lines().next().unwrap();
             assert!(!first.contains("asked about inside the project's next evaluation"), "the old promise is gone: {first}");
-            assert!(first.contains("only when the evaluating session saw it fire"), "{first}");
+            assert!(first.contains("only when it fired in the evaluating session or in another session of the"), "{first}");
             assert!(first.contains("mark or retract"), "and says how to settle the rest: {first}");
             assert!(first.contains("sessions since its last verdict"), "and what the number after each name means: {first}");
         }
@@ -5426,7 +5428,10 @@ mod tests {
             let mut store = EventStore::new(&db).unwrap();
             declare_owed_for_eval_debt(&mut store, 12, "thor");
             let transcripts = tempfile::tempdir().unwrap();
-            let item = report_item("eval-thor-2026-09-16", "thor");
+            let mut item = report_item("eval-thor-2026-09-16", "thor");
+            // The fixture gives no verdicts: skip what the list would hold it to.
+            let listed = model::store::frozen_now(&store, DOCTOR_EVALUATOR, "thor", "skill", 0).unwrap().judgement;
+            item.tags.extend(listed.iter().map(|id| format!("not-judgeable:{id}:the fixture gives no verdicts")));
             serve::attest::fixture::attested_filing(&mut store, transcripts.path(), DOCTOR_EVALUATOR, &item, "toolu_unchecked").unwrap();
         }
         let line = judgement_debt_line(&db, Some("thor"), false).expect("a real backlog, the line must speak");

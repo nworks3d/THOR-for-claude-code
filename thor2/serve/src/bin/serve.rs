@@ -3843,23 +3843,26 @@ fn eval_stop_ask(
 /// How many verdicts the evaluation about to start will hold the report to, and
 /// how many items are owed one that it will NOT list (field test 15, collect
 /// 19b: the ask always said "1 item owed a verdict", which no evaluation lists).
-/// The evaluation lists only what fired in the asked session; an item owed a
-/// verdict because other sessions fired it is counted store-wide, asked of no
-/// report and needs nothing now. The list is computed as the start computes it.
+/// The evaluation lists what fired in the asked session or in another session
+/// of the project (at most the cap). An item owed a verdict that fired in no
+/// session of the project, or that did not fit under the cap, is counted
+/// store-wide, asked of no report and needs nothing now. The list is computed as the start computes it.
 fn verdict_list_words(store: &EventStore, project: &str, session_id: &str) -> String {
     let (_, owed_in_project) = usefulness::judgement_debt_counts(store, Some(project));
     let started_seq = store.get_next_seq().map(|n| n - 1).unwrap_or(0);
     let listed = model::store::evaluation_judgement_list(store, Some(project), session_id, started_seq).len();
     let unlisted = owed_in_project.saturating_sub(listed);
     let on_list = match listed {
-        0 => "No item is on this evaluation's verdict list (the items that fired in this session and owe a verdict)".to_string(),
-        n => format!("{n} item(s) will be on this evaluation's verdict list (the items that fired in this session and owe a verdict)"),
+        0 => "No item is on this evaluation's verdict list (the items that fired in this session or in another session of this project, and owe a verdict)".to_string(),
+        n => format!("{n} item(s) will be on this evaluation's verdict list (the items that fired in this session or in another session of this project, and owe a verdict)"),
     };
     match unlisted {
         0 => format!("{on_list}."),
         n => format!(
-            "{on_list}. {n} more item(s) of this project owe a verdict because other sessions fired them; no evaluation of this \
-             session lists them, they hold no report and need nothing from you."
+            "{on_list}. {n} more item(s) of this project owe a verdict but are not on this list (they fired in no session of \
+             this project, or did not fit under the cap of {}); they hold no report and need \
+             nothing from you now.",
+            model::store::EVALUATION_JUDGEMENT_LIST_CAP
         ),
     }
 }
@@ -5387,19 +5390,36 @@ mod evaluation_debt_tests {
     }
 
     /// Field test 15, collect 19b: the ask counts what the evaluation can list
-    /// (what fired in the asked session) apart from what is owed only because
-    /// other sessions fired it, and says which is which.
+    /// (what fired in the asked session or in another session of the project)
+    /// apart from what is owed but not on the list, and says which is which.
     #[test]
-    fn the_ask_counts_the_verdict_list_apart_from_what_other_sessions_owe() {
+    fn the_ask_counts_the_verdict_list_apart_from_what_is_owed_but_not_listed() {
         let (_dir, _db, mut store) = new_store();
         owe_project(&mut store, 2, Some("thor"));
         // The fixture serves each item in sessions s0..: session "s0" saw both.
+        let on_list = "(the items that fired in this session or in another session of this project, and owe a verdict)";
         let seen = verdict_list_words(&store, "thor", "s0");
-        assert_eq!(seen, "2 item(s) will be on this evaluation's verdict list (the items that fired in this session and owe a verdict).");
+        assert_eq!(seen, format!("2 item(s) will be on this evaluation's verdict list {on_list}."));
+        // A session that never saw them fire: they fired in other sessions of
+        // the project, so they are on the list all the same.
         let elsewhere = verdict_list_words(&store, "thor", "never-in-the-room");
-        assert!(elsewhere.starts_with("No item is on this evaluation's verdict list"), "{elsewhere}");
-        assert!(elsewhere.contains("2 more item(s) of this project owe a verdict because other sessions fired them"), "{elsewhere}");
-        assert!(elsewhere.ends_with("need nothing from you."), "{elsewhere}");
+        assert_eq!(elsewhere, format!("2 item(s) will be on this evaluation's verdict list {on_list}."));
+
+        // Past the cap the rest is owed but not on the list, and says so.
+        let (_dir, _db, mut store) = new_store();
+        owe_project(&mut store, 7, Some("thor"));
+        let capped = verdict_list_words(&store, "thor", "never-in-the-room");
+        assert!(capped.starts_with("5 item(s) will be on this evaluation's verdict list"), "{capped}");
+        assert!(capped.contains("2 more item(s) of this project owe a verdict but are not on this list"), "{capped}");
+        assert!(capped.ends_with("need nothing from you now."), "{capped}");
+
+        // Global items that fired only in sessions that never worked in the
+        // project are not reachable from its evaluation.
+        let (_dir, _db, mut store) = new_store();
+        owe_project(&mut store, 3, None);
+        let unreachable = verdict_list_words(&store, "thor", "never-in-the-room");
+        assert!(unreachable.starts_with("No item is on this evaluation's verdict list"), "{unreachable}");
+        assert!(unreachable.contains("3 more item(s) of this project owe a verdict but are not on this list"), "{unreachable}");
     }
 
     /// Field test 14, C5: a line is said to a session once, then not again
@@ -5558,7 +5578,8 @@ mod evaluation_debt_tests {
         assert!(asked.contains("This project has had no evaluation in the last 7 day(s)"), "{asked}");
         assert!(asked.contains("This session has worked here for"), "{asked}");
         assert!(asked.contains("minute(s)"), "{asked}");
-        assert!(asked.contains("12 more item(s) of this project owe a verdict because other sessions fired them"), "{asked}");
+        assert!(asked.contains("5 item(s) will be on this evaluation's verdict list"), "{asked}");
+        assert!(asked.contains("7 more item(s) of this project owe a verdict but are not on this list"), "{asked}");
         assert!(asked.contains("It has been asked 1 time(s)"), "{asked}");
         assert!(asked.contains("A turn cannot end until the evaluation report for this project is filed"), "{asked}");
         assert!(asked.contains("After that it is quiet for 7 day(s)"), "{asked}");

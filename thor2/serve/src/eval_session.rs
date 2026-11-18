@@ -1193,6 +1193,15 @@ fn prompt_excerpt(prompt: &str, word: &str) -> Option<String> {
 /// where, newest place first - at most `per_item` places.
 pub fn fired_line(fired: Option<&model::store::Firings>, per_item: usize) -> String {
     match fired {
+        Some(f) if f.elsewhere => {
+            let when = f.last_date.as_deref().map(|d| format!(", last on {d}")).unwrap_or_default();
+            let places = f.triggers.iter().take(per_item).map(|t| format!("'{t}'")).collect::<Vec<_>>().join(" | ");
+            format!(
+                "\n       fired only in another session of this project: {} time(s){when}; last at: {places}. If this place is \
+                 not enough to judge it, skip it with the not-judgeable tag",
+                f.count
+            )
+        }
         Some(f) if !f.triggers.is_empty() => {
             let places = f
                 .triggers
@@ -1410,8 +1419,7 @@ fn render_note(id: &str, frozen: &Frozen, caps: &Caps) -> String {
     let mut out = nothing_to_do_line(frozen).map(|line| format!("{line}\n\n")).unwrap_or_default();
     out.push_str(&format!(
         "[THOR] The evaluation of '{}' started at log position {} ({}, {}; THOR's record '{id}'). The lists its report \
-         is held to are fixed now: nothing that fires or is written later joins them, and nothing that fired only in \
-         another session is on them.",
+         is held to are fixed now: nothing that fires or is written later joins them.",
         frozen.project,
         frozen.started_seq,
         frozen.started_by,
@@ -1420,16 +1428,17 @@ fn render_note(id: &str, frozen: &Frozen, caps: &Caps) -> String {
 
     out.push_str("\n\n1. JUDGEMENT - ");
     if frozen.judgement.is_empty() {
-        out.push_str("nothing that fired in this session owes a verdict, so the report is held to no judgement.");
+        out.push_str("no item that fired in this session, or in another session of this project, owes a verdict, so the report is held to no judgement.");
     } else {
         // WHERE IT FIRED, under each item (step 24): the last distinct places
         // this session served it, frozen with the list. A long list shows one
         // place per item, so the note stays bounded.
         let per_item = if frozen.judgement.len() > model::store::FIRED_FULL_LIST_MAX { 1 } else { model::store::FIRED_TRIGGERS };
         out.push_str(&format!(
-            "{} item(s) that fired in this session and had fired in {}+ sessions since their last verdict (a fact counts \
-             once per session; the most-served first, at most {} per evaluation, the rest wait for the next one): {}. Under each \
-             one is where it fired in this session (its last {per_item} distinct place(s); \
+            "{} item(s) that fired in this session, or in another session of this project, \
+             and had fired in {}+ sessions since their last verdict (a fact counts once per session; the most-served \
+             first, at most {} per evaluation, the ones this session saw fire ahead of the rest; the rest wait for the next \
+             one): {}. Under each one is where it fired (here or in the other session; its last {per_item} distinct place(s); \
              mcp__thor__get(id: \"<id>\", fired: true) shows its recent firings). Judge each one by whether it \
              belonged THERE, with the THOR tool itself - a verdict from a shell, a script or another session settles \
              nothing:",
@@ -2512,7 +2521,7 @@ mod tests {
         let note = start_note(&started.start);
         let stored = model::store::show(&store, &started.start.id).unwrap();
         assert_eq!(note, stored.text, "the record's text is the note");
-        assert!(note.contains("1. JUDGEMENT - nothing that fired in this session owes a verdict"), "{note}");
+        assert!(note.contains("1. JUDGEMENT - no item that fired in this session, or in another session of this project, owes a verdict"), "{note}");
         assert!(note.contains("2. TEETH - no rule"), "{note}");
         assert!(note.contains("4. OPEN POINTS - none."), "{note}");
     }
