@@ -7,8 +7,10 @@
 //! that refuses to retract or rewrite the note before it is settled. This
 //! module judges what only the session's own transcript can show:
 //!
-//! 1. a proposal: an assistant message that carries
-//!    `model::store::ORDER_PROPOSAL_MARKER` and a numbered list;
+//! 1. a proposal: the first assistant message with visible text that comes
+//!    after a tool call running `serve ... inventory` (not `--digest`) and holds
+//!    a numbered list starting at 1. (nothing is added to the message: this is
+//!    read from what really happened in the record);
 //! 2. the person's answer: a real message they typed AFTER it (never a hook's
 //!    text, a tool result, a helper's text or a quoted line: the same reader
 //!    the owner-approval guard uses, `attest::owner_text`);
@@ -27,7 +29,7 @@ use std::path::Path;
 /// One thing in the transcript that matters here, in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Entry {
-    /// An assistant message carrying the proposal marker and a numbered list;
+    /// The proposal (see the module doc);
     /// `items` is how many numbered items it holds.
     Proposal { at: i64, items: usize },
     /// A real message the person typed.
@@ -64,32 +66,59 @@ fn numbered_items(text: &str) -> usize {
     next - 1
 }
 
-fn assistant_text(line: &serde_json::Value) -> Option<String> {
-    if line.get("type").and_then(|t| t.as_str()) != Some("assistant") {
-        return None;
-    }
-    if line.get("isSidechain").and_then(|b| b.as_bool()) == Some(true) {
-        return None;
-    }
-    let items = line.get("message")?.get("content")?.as_array()?;
-    let text: Vec<&str> = items
-        .iter()
-        .filter(|i| i.get("type").and_then(|t| t.as_str()) == Some("text"))
-        .filter_map(|i| i.get("text").and_then(|t| t.as_str()))
+/// Whether a shell command runs THOR's `serve` with the `inventory` subcommand
+/// as a separate word and without `--digest`: the program name is `serve` or
+/// `serve.exe`, bare or as the end of a quoted or plain path.
+pub fn runs_inventory(command: &str) -> bool {
+    let tokens: Vec<String> = command
+        .split_whitespace()
+        .map(|t| t.trim_matches(|c| c == '"' || c == '\'' || c == '&' || c == ';' || c == '|' || c == '(' || c == ')').to_string())
+        .filter(|t| !t.is_empty())
         .collect();
-    (!text.is_empty()).then(|| text.join("\n"))
+    if tokens.iter().any(|t| t == "--digest" || t.starts_with("--digest=")) {
+        return false;
+    }
+    let is_serve = |t: &str| {
+        let base = t.rsplit(['/', '\\']).next().unwrap_or("").to_lowercase();
+        base == "serve" || base == "serve.exe"
+    };
+    tokens.iter().position(|t| is_serve(t)).is_some_and(|at| tokens[at + 1..].iter().any(|t| t == "inventory"))
 }
 
-/// The proposals and the person's real messages of one transcript, in order.
+/// The proposal and the person's real messages of one transcript, in order.
+/// The proposal is the first assistant message with visible text after an
+/// inventory call (`runs_inventory`) that holds a numbered list; text in the
+/// same message as an inventory call counts only when it comes after it.
 pub fn timeline_of(text: &str) -> Vec<Entry> {
     let mut out = Vec::new();
+    let mut inventory_seen = false;
+    let mut proposed = false;
     for raw in text.lines() {
         let Ok(line) = serde_json::from_str::<serde_json::Value>(raw) else { continue };
         let at = line.get("timestamp").and_then(|t| t.as_str()).and_then(crate::eval_filing::unix_of_timestamp).unwrap_or(0);
-        if let Some(said) = assistant_text(&line) {
-            let items = numbered_items(&said);
-            if said.contains(model::store::ORDER_PROPOSAL_MARKER) && items >= 1 {
-                out.push(Entry::Proposal { at, items });
+        let main_assistant = line.get("type").and_then(|t| t.as_str()) == Some("assistant")
+            && line.get("isSidechain").and_then(|b| b.as_bool()) != Some(true);
+        if main_assistant {
+            let items = line.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_array());
+            for item in items.into_iter().flatten() {
+                match item.get("type").and_then(|t| t.as_str()) {
+                    Some("tool_use") => {
+                        let shell = matches!(item.get("name").and_then(|n| n.as_str()), Some("Bash") | Some("PowerShell"));
+                        let command = item.get("input").and_then(|i| i.get("command")).and_then(|c| c.as_str()).unwrap_or("");
+                        if shell && runs_inventory(command) {
+                            inventory_seen = true;
+                        }
+                    }
+                    Some("text") if inventory_seen && !proposed => {
+                        let said = item.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                        let n = numbered_items(said);
+                        if n >= 1 {
+                            proposed = true;
+                            out.push(Entry::Proposal { at, items: n });
+                        }
+                    }
+                    _ => {}
+                }
             }
         } else if let Some(person) = crate::attest::owner_text(raw) {
             out.push(Entry::Person { at, text: person });
@@ -160,13 +189,12 @@ pub enum Verdict {
 /// Judge the session. `evidence` is the log's `order_evidence`, `answer` the
 /// text of the Report `order-earlier-work-answer` when one is on file.
 pub fn judge(timeline: &[Entry], evidence: &[OrderEvidence], answer: Option<&str>) -> Verdict {
-    let marker = model::store::ORDER_PROPOSAL_MARKER;
     let proposal = timeline.iter().position(|e| matches!(e, Entry::Proposal { .. }));
     let Some(p) = proposal else {
         return Verdict::Owed(format!(
             "No proposal was shown to the person in this session. Run `serve inventory`: when it finds nothing to order it \
-             settles this by itself; otherwise write the numbered proposal of THE TIDY STEP in the person's language and end \
-             it with the marker {marker} on a line of its own, then wait for their answer"
+             settles this by itself; otherwise write the numbered proposal of THE TIDY STEP in the person's language, as a numbered list \
+             (a line starting with 1.) in the message right after the inventory call, then wait for their answer"
         ));
     };
     let Entry::Proposal { items, .. } = timeline[p] else { unreachable!() };
@@ -323,12 +351,56 @@ mod tests {
         assert!(matches!(judge(&t, &[], Some("\"no way\"")), Verdict::Owed(_)));
     }
 
+    fn tool(command: &str) -> String {
+        serde_json::json!({"type":"assistant","timestamp":"2026-03-02T10:00:30Z","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"command":command}}]}}).to_string()
+    }
+
+    fn said(at: &str, text: &str) -> String {
+        serde_json::json!({"type":"assistant","timestamp":at,"message":{"role":"assistant","content":[{"type":"text","text":text}]}}).to_string()
+    }
+
     #[test]
-    fn timeline_reads_only_real_prompts_and_marked_proposals() {
-        let marker = model::store::ORDER_PROPOSAL_MARKER;
+    fn only_a_plain_inventory_call_counts() {
+        assert!(runs_inventory("serve --db thor.db inventory"));
+        assert!(runs_inventory("\"C:\\Users\\ann\\thor2\\serve.exe\" --db \"C:\\x\\thor.db\" inventory"));
+        assert!(runs_inventory("& 'C:/thor2/serve.exe' --db x inventory --json"));
+        assert!(runs_inventory("cd x && ~/.thor2/serve --db y inventory"));
+        assert!(!runs_inventory("serve --db thor.db inventory --digest session.jsonl"));
+        assert!(!runs_inventory("serve --db thor.db status"));
+        assert!(!runs_inventory("echo inventory"));
+        assert!(!runs_inventory("observe --db x inventory"));
+    }
+
+    #[test]
+    fn the_proposal_is_read_from_what_happened_not_from_a_marker() {
+        let list = "Proposal:\n1. CV\n2. Trip\nShall I?";
+        // A numbered message BEFORE any inventory call is not a proposal.
+        let before = [said("2026-03-02T10:00:00Z", list), tool("serve --db x inventory")].join("\n");
+        assert!(!timeline_of(&before).iter().any(|e| matches!(e, Entry::Proposal { .. })));
+        // An inventory --digest call alone does not count.
+        let digest = [tool("serve --db x inventory --digest s.jsonl"), said("2026-03-02T10:01:00Z", list)].join("\n");
+        assert!(!timeline_of(&digest).iter().any(|e| matches!(e, Entry::Proposal { .. })));
+        // After the inventory call, a message with no numbered list is not it; the next one that has a list is.
+        let real = [
+            tool("serve --db x inventory"),
+            said("2026-03-02T10:01:00Z", "Let me read some of the sessions first."),
+            said("2026-03-02T10:02:00Z", list),
+            said("2026-03-02T10:03:00Z", "1. a later numbered message"),
+        ]
+        .join("\n");
+        let t = timeline_of(&real);
+        assert_eq!(t.len(), 1, "{t:?}");
+        assert!(matches!(t[0], Entry::Proposal { items: 2, at } if at == crate::eval_filing::unix_of_timestamp("2026-03-02T10:02:00Z").unwrap()));
+        // A sidechain (helper) message never counts.
+        let helper = format!("{}\n{}", tool("serve --db x inventory"), r#"{"type":"assistant","isSidechain":true,"timestamp":"2026-03-02T10:01:00Z","message":{"role":"assistant","content":[{"type":"text","text":"1. helper list"}]}}"#);
+        assert!(timeline_of(&helper).is_empty());
+    }
+
+    #[test]
+    fn timeline_reads_only_real_prompts() {
         let lines = [
-            r#"{"type":"assistant","timestamp":"2026-03-02T10:00:00Z","message":{"role":"assistant","content":[{"type":"text","text":"Plain chat, 1. not a proposal"}]}}"#.to_string(),
-            serde_json::json!({"type":"assistant","timestamp":"2026-03-02T10:01:00Z","message":{"role":"assistant","content":[{"type":"text","text":format!("Proposal\n1. CV\n2. Trip\n{marker}")}]}}).to_string(),
+            tool("serve --db x inventory"),
+            said("2026-03-02T10:01:00Z", "Proposal\n1. CV\n2. Trip"),
             r#"{"type":"user","timestamp":"2026-03-02T10:02:00Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"x","content":"no way"}]}}"#.to_string(),
             r#"{"type":"user","isMeta":true,"timestamp":"2026-03-02T10:03:00Z","message":{"role":"user","content":"no, hook text"}}"#.to_string(),
             r#"{"type":"user","timestamp":"2026-03-02T10:04:00Z","message":{"role":"user","content":"> quoted no\nyes please"}}"#.to_string(),

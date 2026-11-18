@@ -260,8 +260,8 @@ Words used once, in plain language:
   or unpinned before. Only evidence THOR checks itself settles it: "serve inventory" finding nothing to order
   in the real transcripts folder (it writes that record itself), "install --tidy" run after the person's
   answer, or, for what the person refused, a Report order-earlier-work-answer quoting their own words, which
-  THOR must find in a message they typed after the proposal (the proposal carries an invisible marker, an HTML
-  comment). Words with no refusal in them read as a yes; a partly refused answer needs both. An existing
+  THOR must find in a message they typed after the proposal (the proposal is the first message with a numbered
+  list after the assistant ran the inventory, read from the session record; nothing is added to it). Words with no refusal in them read as a yes; a partly refused answer needs both. An existing
   memory never gets the note.
 - Why: a new user's first complaint was that Claude puts everything randomly everywhere. New files now
   have a fixed place per subject (the pinned starter note files-go-in-the-folder-of-their-subject).

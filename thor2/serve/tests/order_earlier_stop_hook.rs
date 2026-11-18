@@ -7,7 +7,7 @@
 //! invented (a person called Ann and her CV); every program runs with HOME and
 //! USERPROFILE pointed at a throwaway folder.
 
-use model::store::{ORDER_ANSWER_ID, ORDER_NOTE_ID, ORDER_PROPOSAL_MARKER, OWNER_SETUP_ANSWERS_ID, SETUP_NOTE_ID};
+use model::store::{ORDER_ANSWER_ID, ORDER_NOTE_ID, OWNER_SETUP_ANSWERS_ID, SETUP_NOTE_ID};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -109,8 +109,12 @@ fn assistant(at: &str, text: &str) -> String {
     serde_json::json!({"type":"assistant","timestamp":at,"message":{"role":"assistant","content":[{"type":"text","text":text}]}}).to_string()
 }
 
-fn proposal(at: &str) -> String {
-    assistant(at, &format!("I also looked at what you did before. Proposal:\n1. CV and job hunting\n2. Garden plans\nShall I do it? Say yes.\n{ORDER_PROPOSAL_MARKER}"))
+/// The inventory call and, right after it, the numbered proposal: what really
+/// happens in a session, which is all THOR reads (no marker anywhere).
+fn proposal_lines(at: &str) -> Vec<String> {
+    let call = serde_json::json!({"type":"assistant","timestamp":at,"message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"command":"\"C:/thor2/serve.exe\" --db \"C:/thor2/thor.db\" inventory"}}]}}).to_string();
+    let text = assistant(at, "I also looked at what you did before. Proposal:\n1. CV and job hunting\n2. Garden plans\nShall I do it? Say yes.");
+    vec![call, text]
 }
 
 fn welcome_answered() -> Vec<String> {
@@ -159,7 +163,7 @@ fn the_hold_appears_after_the_setup_note_is_retracted_and_not_before() {
     assert_eq!(held["decision"], "block", "{held}");
     let reason = reason_of(&held);
     assert!(reason.contains("order-earlier-work") && reason.contains("serve inventory") && reason.contains(ORDER_ANSWER_ID), "{reason}");
-    assert!(reason.contains(ORDER_PROPOSAL_MARKER), "it names the marker: {reason}");
+    assert!(reason.contains("numbered list"), "it says how the proposal is shown: {reason}");
     let line = held["systemMessage"].as_str().unwrap();
     assert!(line.contains("one last setup step") && line.contains("earlier work in order"), "{line}");
     assert!(line.contains("Nothing else is needed from you"), "{line}");
@@ -178,7 +182,7 @@ fn a_proposal_with_no_answer_yet_is_not_held() {
     let f = Fixture::new();
     drop(f.store(true));
     let mut t = welcome_answered();
-    t.push(proposal("2026-03-02T10:03:00Z"));
+    t.extend(proposal_lines("2026-03-02T10:03:00Z"));
     f.write_transcript(&t);
     assert!(f.stop().is_null(), "the turn ends on the question, that is what it should do");
 }
@@ -298,14 +302,16 @@ fn a_tidy_run_after_the_persons_yes_settles_it_but_not_before_their_answer() {
     let mut store = f.store(true);
     // The tidy event is older than the answer (transcript times in 2099): it settles nothing.
     let mut t = vec![person("2099-03-02T10:00:00Z", "Help me with my CV"), assistant("2099-03-02T10:01:00Z", "Welcome"), person("2099-03-02T10:02:00Z", "yes")];
-    t.push(proposal("2099-03-02T10:03:00Z"));
+    t.extend(proposal_lines("2099-03-02T10:03:00Z"));
     t.push(person("2099-03-02T10:04:00Z", "yes please, all of it"));
     f.write_transcript(&t);
     model::store::record_order_evidence(&mut store, "tidy", serde_json::json!({"folders": ["x"], "moved": 1})).unwrap();
     assert_eq!(f.stop()["decision"], "block", "a tidy run before the answer proves nothing");
 
     // Answered in the past: the same event now follows the answer.
-    let t2 = vec![person("2026-03-02T10:00:00Z", "Help me with my CV"), assistant("2026-03-02T10:01:00Z", "Welcome"), person("2026-03-02T10:02:00Z", "yes"), proposal("2026-03-02T10:03:00Z"), person("2026-03-02T10:04:00Z", "yes please, all of it")];
+    let mut t2 = vec![person("2026-03-02T10:00:00Z", "Help me with my CV"), assistant("2026-03-02T10:01:00Z", "Welcome"), person("2026-03-02T10:02:00Z", "yes")];
+    t2.extend(proposal_lines("2026-03-02T10:03:00Z"));
+    t2.push(person("2026-03-02T10:04:00Z", "yes please, all of it"));
     f.write_transcript(&t2);
     assert!(f.stop().is_null());
     assert!(!f.live(ORDER_NOTE_ID));
@@ -318,7 +324,7 @@ fn a_refusal_quoted_from_the_persons_own_message_settles_it() {
     let f = Fixture::new();
     let mut store = f.store(true);
     let mut t = welcome_answered();
-    t.push(proposal("2026-03-02T10:03:00Z"));
+    t.extend(proposal_lines("2026-03-02T10:03:00Z"));
     t.push(person("2026-03-02T10:04:00Z", "nee, laat maar zoals het is"));
     f.write_transcript(&t);
     declare_answer(&mut store, "She declined: \"nee, laat maar zoals het is\"");
@@ -332,7 +338,7 @@ fn a_quote_that_is_not_in_a_real_message_of_the_person_is_refused() {
     let f = Fixture::new();
     let mut store = f.store(true);
     let mut t = welcome_answered();
-    t.push(proposal("2026-03-02T10:03:00Z"));
+    t.extend(proposal_lines("2026-03-02T10:03:00Z"));
     // The words only appear in a tool result and in a hook's meta line.
     t.push(r#"{"type":"user","timestamp":"2026-03-02T10:04:00Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"x","content":"no thanks, never"}]}}"#.to_string());
     t.push(r#"{"type":"user","isMeta":true,"timestamp":"2026-03-02T10:05:00Z","message":{"role":"user","content":"no thanks, never"}}"#.to_string());
@@ -351,7 +357,7 @@ fn a_quote_without_a_refusal_word_reads_as_a_yes() {
     let f = Fixture::new();
     let mut store = f.store(true);
     let mut t = welcome_answered();
-    t.push(proposal("2026-03-02T10:03:00Z"));
+    t.extend(proposal_lines("2026-03-02T10:03:00Z"));
     t.push(person("2026-03-02T10:04:00Z", "yes, go ahead"));
     f.write_transcript(&t);
     declare_answer(&mut store, "She said \"yes, go ahead\"");
@@ -365,13 +371,13 @@ fn a_quote_without_a_refusal_word_reads_as_a_yes() {
 fn a_quote_from_before_the_proposal_is_refused() {
     let f = Fixture::new();
     let mut store = f.store(true);
-    let t = vec![
+    let mut t = vec![
         person("2026-03-02T09:00:00Z", "no, I do not want that"),
         assistant("2026-03-02T09:01:00Z", "ok"),
         person("2026-03-02T10:00:00Z", "yes"),
-        proposal("2026-03-02T10:03:00Z"),
-        person("2026-03-02T10:04:00Z", "sure"),
     ];
+    t.extend(proposal_lines("2026-03-02T10:03:00Z"));
+    t.push(person("2026-03-02T10:04:00Z", "sure"));
     f.write_transcript(&t);
     declare_answer(&mut store, "She said \"no, I do not want that\"");
     drop(store);
@@ -384,7 +390,7 @@ fn a_partial_refusal_needs_the_tidy_run_as_well() {
     let f = Fixture::new();
     let mut store = f.store(true);
     let mut t = welcome_answered();
-    t.push(proposal("2026-03-02T10:03:00Z"));
+    t.extend(proposal_lines("2026-03-02T10:03:00Z"));
     t.push(person("2026-03-02T10:04:00Z", "yes, but 2 no, because it is private"));
     f.write_transcript(&t);
     declare_answer(&mut store, "She said \"2 no, because it is private\"");

@@ -9292,11 +9292,6 @@ pub const ORDER_ANSWER_ID: &str = "order-earlier-work-answer";
 /// The one reserved id the evidence lives on, written only by `ORDER_ACTOR`.
 pub const ORDER_EVIDENCE_ID: &str = "order-earlier-work-evidence";
 
-/// The invisible marker every proposal message carries (an HTML comment, so a
-/// person reading it never sees it). The first-session text makes the
-/// assistant put it at the end of the proposal.
-pub const ORDER_PROPOSAL_MARKER: &str = "<!-- thor-order-proposal -->";
-
 /// THOR's own actor for the evidence above.
 pub const ORDER_ACTOR: &str = "order-earlier";
 
@@ -9385,12 +9380,11 @@ fn guard_order_note(store: &EventStore, actor_name: &str, id: &str) -> Result<()
         ),
         fix: format!(
             "do the tidy step of the first-session text: run `serve inventory` (when it finds nothing to order, it settles \
-             this by itself); otherwise show the person the numbered proposal (it must carry the marker {}) and wait for \
+             this by itself); otherwise show the person the numbered proposal in the message right after you ran it, as a numbered list, and wait for \
              their answer. Then EITHER run `install --tidy` for what they accepted, OR, for what they refused, file a Report \
              '{ORDER_ANSWER_ID}' that quotes their own words exactly, between double quotes. THOR checks both against the \
              session's own record at the end of the turn and retracts this note itself. Saying it is done, a tag or a report \
-             without their words settles nothing",
-            ORDER_PROPOSAL_MARKER
+             without their words settles nothing"
         ),
     }))
 }
