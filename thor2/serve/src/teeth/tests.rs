@@ -421,6 +421,72 @@ fn n14_a_value_literal_on_a_tool_is_found_in_its_input_values_only() {
     assert!(judge("Grep", json!({ "pattern": "git commit --no-verify" })).is_none(), "another tool is not reached");
 }
 
+/// A `key=value` literal on a tool addresses ONE top-level input field: the
+/// trial tries it as that field (and the same field with a longer value), and
+/// the guard refuses the field but not the word in a brief, a longer value or a
+/// field whose name only ends the same way.
+#[test]
+fn a_field_literal_on_a_tool_matches_that_field_and_nothing_else() {
+    let mut fx = Fx::new();
+    let item = rule("no-fable", "Never spawn an Agent with `model=fable`.", vec![cmd("Agent")], forbidden(&["model=fable"]), None);
+    let t = fx.write(&item);
+    assert_eq!(t.outcome, Outcome::Rule { proven: false }, "{}", receipt(&t));
+    assert!(receipt(&t).contains("Agent with model=fable (refused)") && receipt(&t).contains("Agent with model=fable2"), "{}", receipt(&t));
+    fx.legacy(&item);
+    let root = fx.dir.path().to_path_buf();
+    let judge = |input: serde_json::Value| {
+        crate::guard_verdict::pre_tool(&fx.store, "Agent", Some(&input), None, Some(&root), Some(&root), None).verdict
+    };
+    assert!(judge(json!({ "model": "fable", "prompt": "do the work" })).is_some());
+    assert!(judge(json!({ "model": "sonnet", "prompt": "fable wrote the first draft" })).is_none(), "the word in a brief is not the field");
+    assert!(judge(json!({ "model": "fable2", "prompt": "x" })).is_none(), "a longer value is another model");
+    assert!(judge(json!({ "xmodel": "fable", "prompt": "x" })).is_none(), "another field name");
+    assert!(judge(json!({ "prompt": "x", "nested": { "model": "fable" } })).is_none(), "only top-level fields are addressed");
+}
+
+/// The same for a `requires` answer: `model=sonnet` is satisfied by that field
+/// only - not by the word `Sonnet` in the brief, a longer value or another key.
+#[test]
+fn a_field_answer_on_a_tool_is_satisfied_by_that_field_only() {
+    let mut fx = Fx::new();
+    let check = Some(Check::Requires { when: "Agent".to_string(), required: vec!["model=sonnet".to_string(), "model=haiku".to_string()] });
+    let item = rule("name-a-model", "Every Agent call names `model=sonnet` or `model=haiku`.", vec![cmd("Agent")], check, None);
+    let t = fx.write(&item);
+    assert_eq!(t.outcome, Outcome::Rule { proven: false }, "{}", receipt(&t));
+    fx.legacy(&item);
+    let root = fx.dir.path().to_path_buf();
+    let judge = |input: serde_json::Value| {
+        crate::guard_verdict::pre_tool(&fx.store, "Agent", Some(&input), None, Some(&root), Some(&root), None).verdict
+    };
+    assert!(judge(json!({ "model": "sonnet", "prompt": "do the work" })).is_none());
+    assert!(judge(json!({ "model": "Haiku", "prompt": "do the work" })).is_none(), "case is ignored, as for every answer");
+    assert!(judge(json!({ "model": "fable", "prompt": "Sonnet wrote the first draft" })).is_some(), "the word in a brief is not the field");
+    assert!(judge(json!({ "model": "sonnet2", "prompt": "x" })).is_some(), "a longer value is another model");
+    assert!(judge(json!({ "xmodel": "sonnet", "prompt": "x" })).is_some(), "another field name");
+    assert!(judge(json!({ "prompt": "x" })).is_some(), "no model at all");
+}
+
+/// Measured on the real calls: a field NAME must never answer or trip a plain
+/// literal. An Agent call with a `subagent_type` field and a brief that never
+/// says "subagent" still lacks the answer "subagent".
+#[test]
+fn a_field_name_never_answers_a_plain_requires_answer_or_trips_a_plain_literal() {
+    let mut fx = Fx::new();
+    let ask = Some(Check::Requires { when: "Agent".to_string(), required: vec!["subagent".to_string()] });
+    let ban = forbidden(&["model"]);
+    fx.legacy(&rule("forbid-subagents", "Every Agent brief says the word subagent.", vec![cmd("Agent")], ask, None));
+    fx.legacy(&rule("no-model-word", "Never write the word model in an Agent call: `model`.", vec![cmd("Agent")], ban, None));
+    let root = fx.dir.path().to_path_buf();
+    let judge = |input: serde_json::Value| {
+        crate::guard_verdict::pre_tool(&fx.store, "Agent", Some(&input), None, Some(&root), Some(&root), None).verdict
+    };
+    let refused = judge(json!({ "subagent_type": "Explore", "prompt": "noop" }));
+    assert!(refused.as_ref().is_some_and(|v| v.rule_id.as_deref() == Some("forbid-subagents")), "{refused:?}");
+    assert!(judge(json!({ "subagent_type": "Explore", "prompt": "no subagents here" })).is_none());
+    let named = judge(json!({ "model": "haiku", "prompt": "subagent" }));
+    assert!(named.is_none(), "the field name `model` is not the word model: {named:?}");
+}
+
 // ------------------------------------------------------------ (5) it bites
 
 /// G7b.1 (K18): NOTES.md = 'keep me\nsecond line keep me\nplain line',

@@ -4,6 +4,8 @@ What changed in each release, newest first. The release workflow copies the sect
 
 ## Unreleased
 
+- **A rule on a tool call can address one input field.** For Agent, Workflow or an MCP tool, a forbidden literal or a `requires` answer written as `model=fable` matches that top-level field only, so it no longer confuses the field with the word `fable` in a brief. The write-time trial tries such a literal as the field. Plain literals behave as before.
+
 ## 2.6.8 (2026-11-11)
 
 What changed: The hook that runs before every tool call is faster on a memory that has grown long, and a note about the shell command grep no longer shows up when Claude Code's own Grep tool runs. Search also finds a note by its id and by other forms of a long word. The daily upkeep check stops asking for verdicts nobody can give, an evaluation with nothing to judge says so at once, and the session start tells you which standing rules did not fit. Doctor and the first-run texts no longer show numbers from the maker's own memory.

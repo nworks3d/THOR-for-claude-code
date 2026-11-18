@@ -1035,7 +1035,14 @@ pub fn find_requires_violation_owned(
             !required.iter().any(|r| {
                 // Answers match without regard to case: READ-ONLY says read-only.
                 let lower = r.to_lowercase();
-                let named = contains_ignoring_case(&segment.unit, &lower)
+                // A `key=value` answer on a tool call names one input field: it
+                // must stand on token boundaries (`model=sonnet` is not
+                // `model=sonnet2` or `xmodel=sonnet`).
+                let field = segment.tool && crate::shell::field_token(r).is_some();
+                let named = if field {
+                    crate::shell::literal_at_boundary(&segment.fields.to_lowercase(), &lower)
+                } else {
+                    contains_ignoring_case(&segment.unit, &lower)
                     || contains_ignoring_case(&segment.unit_words, &lower)
                     || contains_ignoring_case(&comments, &lower)
                     || (r == crate::shell::ABSOLUTE_PATH_ANSWER
@@ -1049,7 +1056,8 @@ pub fn find_requires_violation_owned(
                             .contains(lower.as_str()))
                     || r.strip_suffix('=').is_some_and(|name| {
                         env.get_or_init(|| crate::shell::env_before(segments, *at)).contains_key(name)
-                    });
+                    })
+                };
                 // A profile variable answers only when it points somewhere else
                 // than the real profile (field test 15, collect 19d).
                 named

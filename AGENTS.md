@@ -660,6 +660,15 @@ two or more parts (`/tmp/work`). A bare `/tmp`, a relative path, a URL and `cmd
 enough) to ask that a call name its folder, without naming any one folder. The
 rule's text does not have to spell the token.
 
+**On a tool call, a `key=value` literal addresses one input field.** For a call
+with no command (`Agent`, `Workflow`, an MCP tool) a forbidden literal or a
+`requires` answer written as `model=fable` matches the top-level input field
+`model` and nothing else: not the word `fable` in a brief, not `model=fable2`,
+not `xmodel=fable`. A string field counts only when its value is at most 64
+characters with no whitespace (a number or a boolean always counts), and a
+nested field is not addressed. A plain literal without `=` is still looked for
+in the values, as before, and a field's name never counts as a value.
+
 **A short Windows switch is a flag, not a folder name.** A forbidden literal such
 as `/it` (a slash and one or two letters) matches only where a word starts, so
 `schtasks /create ... /it` is caught and `C:/it/run.vbs` is not.

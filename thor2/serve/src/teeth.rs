@@ -411,7 +411,24 @@ fn forms(item: &Item, root: &Path) -> Result<Forms, String> {
                     return Ok(Forms { forbidden: vec![tool_call("trial")], clean, collapsed: true, file: None });
                 }
                 clean.insert(0, tool_call("trial"));
-                let forbidden = literals.iter().map(|l| tool_call(l)).collect();
+                // A `key=value` literal addresses one input field: it is tried
+                // as that field, and the same field with a longer value is
+                // let through (the literal stands on token boundaries).
+                let field_call = |key: &str, value: &str| Call {
+                    shown: format!("{anchor} with {key}={value}"),
+                    tool: anchor.to_string(),
+                    input: json!({ key: value }),
+                };
+                for (key, value) in literals.iter().filter_map(|l| shell::field_token(l)) {
+                    clean.push(field_call(key, &format!("{value}2")));
+                }
+                let forbidden = literals
+                    .iter()
+                    .map(|l| match shell::field_token(l) {
+                        Some((key, value)) => field_call(key, value),
+                        None => tool_call(l),
+                    })
+                    .collect();
                 return Ok(Forms { forbidden, clean, collapsed: false, file: None });
             }
             if let Some(anchor) = command_anchor(&item.bindings) {
@@ -457,11 +474,28 @@ fn forms(item: &Item, root: &Path) -> Result<Forms, String> {
                     tool: anchor.to_string(),
                     input: json!({ "prompt": prompt }),
                 };
-                let mut clean = vec![tool_call(format!("{trigger} {answer}"))];
+                // A `key=value` answer addresses one input field: the clean call
+                // carries that field, and the same field with a longer value
+                // is one more call the rule still refuses.
+                let with_field = |tail: &str| {
+                    let (key, value) = shell::field_token(answer)?;
+                    let value = format!("{value}{tail}");
+                    Some(Call {
+                        shown: format!("{anchor} with '{trigger}' and {key}={value}"),
+                        tool: anchor.to_string(),
+                        input: json!({ "prompt": trigger, key: value }),
+                    })
+                };
+                let mut forbidden = vec![tool_call(trigger.clone())];
+                let mut clean = match with_field("") {
+                    Some(call) => vec![call],
+                    None => vec![tool_call(format!("{trigger} {answer}"))],
+                };
+                forbidden.extend(with_field("2"));
                 if inner {
                     clean.push(tool_call("trial".to_string()));
                 }
-                return Ok(Forms { forbidden: vec![tool_call(trigger)], clean, collapsed: false, file: None });
+                return Ok(Forms { forbidden, clean, collapsed: false, file: None });
             }
             let attempt = requires_attempt(item, anchor);
             let mut clean = vec![bash(&format!("{attempt} {answer}"))];

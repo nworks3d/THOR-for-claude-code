@@ -212,6 +212,10 @@ pub struct Segment {
     pub command_len: usize,
     /// The unit's words with quotes removed, joined by single spaces.
     pub unit_words: String,
+    /// Only on a tool call's pseudo-segment (`tool_segment_with_fields`): one
+    /// `key=value` token per top-level scalar input field, one per line. Read
+    /// only for a literal that is itself a `field_token`; empty otherwise.
+    pub fields: String,
     /// The directory this segment certainly runs in, as the call wrote it,
     /// when an earlier `cd`/`pushd`/`Set-Location` on the line that certainly
     /// took effect says so (see this module's doc comment, "THE FOLDER";
@@ -312,6 +316,7 @@ fn flat_segment(command: &str) -> Segment {
         unit: command.to_string(),
         command_len: command.len(),
         unit_words,
+        fields: String::new(),
         dir: None,
         any_cd_dir: None,
         depth: 0,
@@ -328,6 +333,11 @@ fn flat_segment(command: &str) -> Segment {
 /// Workflow, WebFetch, an MCP tool): the tool's own name is its head, and its
 /// unit is the call's flattened input.
 pub fn tool_segment(tool: &str, content: &str) -> Segment {
+    tool_segment_with_fields(tool, content, "")
+}
+
+/// `tool_segment`, carrying the call's `key=value` field tokens (see `field_token`).
+pub fn tool_segment_with_fields(tool: &str, content: &str, fields: &str) -> Segment {
     Segment {
         words: vec![tool.to_string()],
         head: vec![tool.to_string()],
@@ -336,6 +346,7 @@ pub fn tool_segment(tool: &str, content: &str) -> Segment {
         unit: content.to_string(),
         command_len: content.len(),
         unit_words: content.split_whitespace().collect::<Vec<_>>().join(" "),
+        fields: fields.to_string(),
         dir: None,
         any_cd_dir: None,
         depth: 0,
@@ -1087,6 +1098,7 @@ fn collect(command: &str, d: Dialect, depth: usize, start: Place, remote: bool, 
                 unit,
                 command_len,
                 unit_words,
+                fields: String::new(),
                 dir: own_dir.clone(),
                 any_cd_dir: own_any.clone(),
                 depth,
@@ -2810,6 +2822,20 @@ pub fn find_at_boundary(text: &str, literal: &str) -> Option<usize> {
 /// `names_absolute_path`; AGENTS.md documents it for the owner.
 pub const ABSOLUTE_PATH_ANSWER: &str = "<absolute-path>";
 
+/// A `key=value` literal that addresses ONE top-level input field of a tool
+/// call (`model=fable`), split into its key and value. The key is a plain
+/// name (letters, digits, `_`, `.`, `-`, not starting with `-`, so a flag like
+/// `--model=x` is not one) and the value is non-empty without whitespace -
+/// the shape of the tokens `guard_verdict` adds to a tool call's content.
+pub fn field_token(text: &str) -> Option<(&str, &str)> {
+    let (key, value) = text.split_once('=')?;
+    let key_ok = !key.is_empty()
+        && !key.starts_with('-')
+        && key.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '-'));
+    let value_ok = !value.is_empty() && !value.chars().any(char::is_whitespace);
+    (key_ok && value_ok).then_some((key, value))
+}
+
 /// A required answer in the form a trial writes into its clean call: the
 /// answer itself, or for `ABSOLUTE_PATH_ANSWER` a path that satisfies it.
 pub fn sample_answer(answer: &str) -> &str {
@@ -2876,6 +2902,11 @@ fn collapsed(literal: &str) -> String {
 /// in (the unit's raw text, its joined words, or the joined head) and the
 /// literal as found there. `None` when it is in none of them.
 pub fn literal_site(seg: &Segment, literal: &str) -> Option<(String, String)> {
+    // A `key=value` literal on a tool call names one input field: it is read
+    // in the field tokens and nowhere else.
+    if seg.tool && field_token(literal).is_some() {
+        return literal_at_boundary(&seg.fields, literal).then(|| (seg.fields.clone(), literal.to_string()));
+    }
     if let Some(at) = find_at_boundary(&seg.unit, literal) {
         // Quote the part it sits in: the command text, or what follows it.
         let cut = seg.command_len.min(seg.unit.len());

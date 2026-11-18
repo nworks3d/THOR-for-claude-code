@@ -370,11 +370,13 @@ pub fn command(
 /// that tool reaches it, and its forbidden literals are looked for in those
 /// values, or - for a whole-tool ban, a literal equal to the anchor - hit by
 /// the reach itself. A call to ANY OTHER tool, or a shell command that only
-/// mentions the name in its text, is not reached. Whole-tool matching only:
-/// no input field is addressed.
+/// mentions the name in its text, is not reached. A literal of the form
+/// `key=value` addresses one top-level input field (`tool_call_fields`);
+/// every other literal is looked for in the values.
 fn tool_in(live: &Live, tool: &str, project: Option<&str>, tool_input: Option<&Value>, root: Option<&Path>) -> Judgement {
     let content = tool_input.map(tool_input_values).unwrap_or_default();
-    let segments = [shell::tool_segment(tool, &content)];
+    let fields = tool_input.map(tool_call_fields).unwrap_or_default();
+    let segments = [shell::tool_segment_with_fields(tool, &content, &fields)];
     let projects = [project.map(str::to_string)];
     let verdict = absent_guard::find_command_violation_in(live.items(), &segments, Some(&projects), root).map(|(reason, anchor)| Verdict {
         rule_id: absent_guard::rule_id_of(&reason).map(str::to_string),
@@ -509,16 +511,17 @@ fn requires_in(
     project: Option<&str>,
     owner: Option<absent_guard::OwnerWords>,
 ) -> Option<Verdict> {
+    let command = absent_guard::proposed_command(tool_input);
     let content = tool_input_values(tool_input?);
     if content.is_empty() {
         return None;
     }
     let candidates = live.items();
-    let command = absent_guard::proposed_command(tool_input);
     let reason = match call {
         Some(call) => absent_guard::find_requires_violation_owned(&candidates, &call.segments, Some(&call.projects), &content, owner),
         None => {
-            let segments = [shell::tool_segment(tool, &content)];
+            let fields = tool_input.map(tool_call_fields).unwrap_or_default();
+            let segments = [shell::tool_segment_with_fields(tool, &content, &fields)];
             let projects = [project.map(str::to_string)];
             absent_guard::find_requires_violation_owned(&candidates, &segments, Some(&projects), &content, owner)
         }
@@ -982,6 +985,37 @@ fn tool_input_values(input: &Value) -> String {
     out.join("\n")
 }
 
+/// How long a string field's value may be and still get a `key=value` token.
+const MAX_FIELD_TOKEN_VALUE: usize = 64;
+
+/// The field tokens of a tool call that carries no command: one `key=value`
+/// line per TOP-LEVEL scalar field, so a rule can address one field
+/// (`model=fable`) apart from the same word in a brief. They are kept apart
+/// from the flattened values (`tool_input_values`, unchanged) in the segment's
+/// `fields`, and only a literal of that same `key=value` shape reads them -
+/// so a field NAME never answers or trips a plain literal. A string value gets
+/// a token only when it is short (at most `MAX_FIELD_TOKEN_VALUE` characters)
+/// and has no whitespace - an identifier or a flag, never prose; a number or
+/// a boolean always gets one. The key must be a plain name (`shell::field_token`).
+fn tool_call_fields(input: &Value) -> String {
+    let Value::Object(map) = input else { return String::new() };
+    let mut tokens = Vec::new();
+    for (key, value) in map {
+        let value = match value {
+            Value::String(s) if s.chars().count() <= MAX_FIELD_TOKEN_VALUE => s.clone(),
+            Value::Number(n) => n.to_string(),
+            Value::Bool(b) => b.to_string(),
+            _ => continue,
+        };
+        let token = format!("{key}={value}");
+        if shell::field_token(&token).is_some_and(|(k, _)| k == key) {
+            tokens.push(token);
+        }
+    }
+    tokens.join("
+")
+}
+
 #[cfg(test)]
 mod judged_path_tests {
     use super::*;
@@ -1097,5 +1131,62 @@ mod tool_input_values_tests {
             !tool_input_values(&input).contains("too-deep"),
             "a value past the cap must be left out, not walked into"
         );
+    }
+
+    fn tokens(input: &Value) -> Vec<String> {
+        tool_call_fields(input).lines().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn every_short_top_level_scalar_field_gets_a_token_and_the_values_stay_as_they_were() {
+        let input = serde_json::json!({ "model": "fable", "n": 3, "background": true, "gone": null });
+        assert!(!tool_input_values(&input).contains("model="), "the values carry no field name");
+        let mut got = tokens(&input);
+        got.sort();
+        assert_eq!(got, ["background=true", "model=fable", "n=3"]);
+    }
+
+    #[test]
+    fn prose_long_values_nested_fields_and_odd_keys_get_no_token() {
+        let long = "x".repeat(MAX_FIELD_TOKEN_VALUE + 1);
+        let exactly = "y".repeat(MAX_FIELD_TOKEN_VALUE);
+        let input = serde_json::json!({
+            "prompt": "Sonnet wrote the first draft",
+            "long": long,
+            "edge": exactly,
+            "empty": "",
+            "nested": { "model": "fable" },
+            "list": ["a"],
+            "bad key": "v",
+            "a=b": "v",
+        });
+        assert_eq!(tokens(&input), [format!("edge={exactly}")]);
+    }
+
+    #[test]
+    fn a_call_that_is_not_an_object_has_no_tokens() {
+        assert!(tokens(&serde_json::json!("fable")).is_empty());
+        assert!(tokens(&serde_json::json!(["a"])).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod field_token_shape_tests {
+    use crate::shell;
+
+    #[test]
+    fn a_field_literal_is_a_plain_key_and_a_whitespace_free_value() {
+        assert_eq!(shell::field_token("model=fable"), Some(("model", "fable")));
+        assert_eq!(shell::field_token("run_in_background=true"), Some(("run_in_background", "true")));
+        for not in ["fable", "model=", "=fable", "--model=fable", "a b=c", "model=a b", "FOO="] {
+            assert_eq!(shell::field_token(not), None, "{not:?}");
+        }
+    }
+
+    #[test]
+    fn the_boundary_decides_a_field_literal_in_the_content() {
+        assert!(shell::literal_at_boundary("x\nmodel=fable", "model=fable"));
+        assert!(!shell::literal_at_boundary("x\nmodel=fable2", "model=fable"));
+        assert!(!shell::literal_at_boundary("x\nxmodel=fable", "model=fable"));
     }
 }

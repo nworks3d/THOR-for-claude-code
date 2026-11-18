@@ -636,6 +636,8 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
 ### D2. A forgotten required part (requires)
 - What: a rule can demand that a call also contains one of a set of answers (for example every Agent
   call names a cheap model). A trigger may be a literal inside the command; end it with * for a family.
+  On a tool call with no command (Agent, an MCP tool) an answer or a forbidden literal written as
+  `model=fable` addresses that one top-level input field, not the word in a brief.
 - Why: forgetting leaves no text to look for, so "forbidden" cannot see it.
 - You notice: the call is refused naming what is missing.
 - Refuse or change: same as D1.
