@@ -1223,33 +1223,52 @@ mod resolve_session_id_tests {
 fn plain_line_for_block(event: &str, reason: &str) -> &'static str {
     let lower = reason.to_lowercase();
     match event {
-        "Stop" if lower.contains("walked through setup") => {
-            "THOR (the memory your assistant uses) is finishing its setup. Your assistant shows you a short numbered list of what was set up, already switched on with sensible defaults, such as answering in your own language. Answer the numbers you care about, or just carry on: nothing is needed from you."
-        }
+        "Stop" if lower.contains("walked through setup") => LINE_SETUP,
         // Before the evaluation arm: an evaluation ask can ride along with this hold.
-        "Stop" if lower.contains(&serve::leftover_scripts::HOLD_MARKER.to_lowercase()) => {
-            "Your assistant left a few helper scripts outside your projects. THOR asks it to sort them before it finishes: it keeps the useful ones in your tools folder, deletes the throwaway ones, and asks you about anything in doubt. Nothing is needed from you unless it asks."
-        }
-        "Stop" if lower.contains("copy-attestation") => {
-            "THOR is sending the proof of this week's memory check from this read-only copy to your main machine. Your assistant makes one more small call. Nothing is needed from you."
-        }
-        "Stop" if lower.contains("evaluation") => {
-            "THOR asks your assistant to do a short tidy-up of its memory before it finishes. It can take a few minutes. Nothing is needed from you."
-        }
-        "Stop" if lower.contains("durable decision") => {
-            "Your assistant is saving something you just decided, so it is remembered next time. Nothing is needed from you."
-        }
-        _ => "THOR asked your assistant to take care of one more small thing before it finishes. Nothing is needed from you.",
+        "Stop" if lower.contains(&serve::leftover_scripts::HOLD_MARKER.to_lowercase()) => LINE_SCRIPTS,
+        "Stop" if lower.contains("copy-attestation") => LINE_COPY_PROOF,
+        "Stop" if lower.contains("evaluation") => LINE_TIDY_UP,
+        "Stop" if lower.contains("durable decision") => LINE_DECISION,
+        "Stop" if lower.contains("could not prove themselves") => LINE_NOTES_OUT_OF_DATE,
+        "PreToolUse" if lower.contains("needs the owner's explicit go") => LINE_NEEDS_YOUR_OK,
+        "PreToolUse" => LINE_ACTION_STOPPED,
+        _ => LINE_ONE_MORE_THING,
     }
 }
 
-/// `plain_line_for_block` applied to a block at STOP, once, as
-/// `systemMessage`. Anything else is returned unchanged: a PreToolUse refusal
-/// is a different channel whose exact bytes are pinned by the golden files in
-/// `serve/tests/data/hook_golden`, and the person's confusing moment is the
-/// turn that will not end.
+// THE SENTENCES A PERSON SEES. Every hold and every refusal of a tool call
+// carries one of these as `systemMessage`; a test walks them all and fails on
+// THOR's own vocabulary (rule, falsifier, evaluation, scope, teeth, hook, MCP,
+// collection, store). Each says what happened and that nothing is needed.
+const LINE_SETUP: &str = "THOR (the memory your assistant uses) is finishing its setup. Your assistant welcomes you and asks one short question: you can simply answer \"yes\". Nothing else is needed from you.";
+const LINE_SCRIPTS: &str = "Your assistant left a few helper scripts outside your projects. THOR asks it to sort them before it finishes: it keeps the useful ones in your tools folder, deletes the throwaway ones, and asks you about anything in doubt. Nothing is needed from you unless it asks.";
+const LINE_COPY_PROOF: &str = "THOR is sending the proof of this week's memory check from this read-only copy to your main machine. Your assistant makes one more small call. Nothing is needed from you.";
+const LINE_TIDY_UP: &str = "THOR asks your assistant to do a short tidy-up of its memory before it finishes. It can take a few minutes. Nothing is needed from you.";
+const LINE_DECISION: &str = "Your assistant is saving something you just decided, so it is remembered next time. Nothing is needed from you.";
+const LINE_NOTES_OUT_OF_DATE: &str = "THOR noticed that some saved notes may be out of date, and asks your assistant to check them before it finishes. Nothing is needed from you.";
+const LINE_NEEDS_YOUR_OK: &str = "THOR paused one action of your assistant because it needs your OK first. Your assistant will ask you in plain words: just answer it. Nothing else is needed from you.";
+const LINE_ACTION_STOPPED: &str = "THOR stopped one action your assistant was about to take, because it goes against a note that was saved earlier. Your assistant is choosing another way. Nothing is needed from you.";
+const LINE_ONE_MORE_THING: &str = "THOR asked your assistant to take care of one more small thing before it finishes (for example to rewrite an answer that is too long or in another language). Nothing is needed from you.";
+
+/// Every sentence above, for the test that walks them.
+#[cfg(test)]
+const PERSON_LINES: [&str; 9] = [
+    LINE_SETUP,
+    LINE_SCRIPTS,
+    LINE_COPY_PROOF,
+    LINE_TIDY_UP,
+    LINE_DECISION,
+    LINE_NOTES_OUT_OF_DATE,
+    LINE_NEEDS_YOUR_OK,
+    LINE_ACTION_STOPPED,
+    LINE_ONE_MORE_THING,
+];
+
+/// `plain_line_for_block` applied to a block, once, as `systemMessage`: at STOP
+/// (the turn that will not end) and at PRE-TOOL-USE (an action that was
+/// refused). Anything else is returned unchanged.
 fn with_line_for_the_person(event: &str, out: Option<HookOutput>) -> Option<HookOutput> {
-    if event != "Stop" {
+    if event != "Stop" && event != "PreToolUse" {
         return out;
     }
     match out {
@@ -1314,10 +1333,36 @@ mod line_for_the_person_tests {
     }
 
     #[test]
-    fn a_tool_call_refusal_is_left_exactly_as_it_was() {
-        let out = with_line_for_the_person("PreToolUse", block("[THOR] rule r1 forbids this text"));
-        let Some(HookOutput::Decision(v)) = out else { panic!("lost the block") };
-        assert!(v.get("systemMessage").is_none(), "{v}");
+    fn a_tool_call_refusal_gets_a_plain_line_and_keeps_its_reason() {
+        let reason = "[THOR] rule r1 forbids this text";
+        let out = with_line_for_the_person("PreToolUse", block(reason));
+        let Some(HookOutput::Decision(v)) = &out else { panic!("lost the block") };
+        assert_eq!(v["reason"], reason, "the assistant's own text is untouched");
+        let line = line_of(out);
+        assert!(line.contains("stopped one action") && line.contains("Nothing is needed from you"), "{line}");
+        let approval = line_of(with_line_for_the_person("PreToolUse", block("[THOR] rule r2 applies here: this call needs the owner's explicit go")));
+        assert!(approval.contains("needs your OK first"), "{approval}");
+    }
+
+    /// Walk every sentence a person can see on a hold or a refusal: each says
+    /// that nothing (more) is needed, is plain ASCII, and uses none of THOR's
+    /// own words.
+    #[test]
+    fn every_sentence_a_person_sees_is_plain_and_uses_no_thor_vocabulary() {
+        for line in PERSON_LINES {
+            assert!(line.contains("Nothing is needed from you") || line.contains("Nothing else is needed from you"), "{line}");
+            assert!(line.is_ascii(), "{line}");
+            let words: Vec<String> = line.to_lowercase().split(|c: char| !c.is_alphanumeric()).map(str::to_string).collect();
+            for jargon in ["rule", "rules", "falsifier", "evaluation", "scope", "teeth", "hook", "hooks", "mcp", "collection", "store", "retract", "lookup", "pinned"] {
+                assert!(!words.iter().any(|w| w == jargon), "the sentence uses the word {jargon:?}: {line}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_setup_and_notes_out_of_date_holds_get_their_own_sentence() {
+        assert_eq!(line_of(with_line_for_the_person("Stop", block("[THOR] ... has not been walked through setup yet"))), LINE_SETUP);
+        assert!(line_of(with_line_for_the_person("Stop", block("[THOR] These rules could not prove themselves while work was going on"))).contains("out of date"));
     }
 
     #[test]

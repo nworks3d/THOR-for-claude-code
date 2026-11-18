@@ -1,2 +1,2 @@
 exit 0
-{"decision":"block","reason":"[THOR] rule f-marker forbids this text (\"no file ever carries DO-NOT-SHIP\"); found in what is about to be written: \"DO-NOT-SHIP\""}
+{"decision":"block","reason":"[THOR] rule f-marker forbids this text (\"no file ever carries DO-NOT-SHIP\"); found in what is about to be written: \"DO-NOT-SHIP\"","systemMessage":"THOR stopped one action your assistant was about to take, because it goes against a note that was saved earlier. Your assistant is choosing another way. Nothing is needed from you."}

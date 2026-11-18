@@ -143,9 +143,20 @@ fn pre_tool_decides_exactly_what_the_hook_printed() {
                     // The block exactly as the hook prints it, normalized the
                     // same way the golden file was.
                     let printed = serde_json::json!({ "decision": "block", "reason": verdict.reason }).to_string();
+                    // The hook also prints a plain `systemMessage` for the person
+                    // (added 2026-11-18 to every refusal, by hand, in each golden
+                    // file); the decision itself is `decision` and `reason`.
+                    let golden_decision = serde_json::from_str::<serde_json::Value>(golden_stdout)
+                        .map(|mut v| {
+                            if let Some(object) = v.as_object_mut() {
+                                object.remove("systemMessage");
+                            }
+                            v.to_string()
+                        })
+                        .unwrap_or_else(|_| golden_stdout.to_string());
                     assert_eq!(
                         fixtures::normalize(&printed, base.path(), serve_exe()),
-                        golden_stdout,
+                        golden_decision,
                         "{name}: pre_tool words the refusal differently from the hook"
                     );
                     assert_eq!(
