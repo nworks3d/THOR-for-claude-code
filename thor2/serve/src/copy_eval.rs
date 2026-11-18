@@ -521,7 +521,17 @@ pub enum CopyStop {
     Quiet,
 }
 
-fn ask_text(project: &str, date: &str) -> String {
+/// The first free report id of `project` on the day of `now`, read from the
+/// copy's own store; the plain `eval-<project>-<date>` when it cannot be read.
+fn report_id_now(db: &Path, project: &str, now: i64) -> String {
+    let date: String = crate::time::iso8601_from_unix(now).chars().take(10).collect();
+    match crate::store_dir::open_existing(db) {
+        Ok(store) => model::store::free_evaluation_report_id(&store, project, &date),
+        Err(_) => format!("eval-{project}-{date}"),
+    }
+}
+
+fn ask_text(project: &str, report_id: &str) -> String {
     format!(
         "[THOR] The weekly check of '{project}' is due. This machine runs a read-only copy of the memory, so the report is filed \
          through the connector (the 'thor' tool server), which queues it for the main machine. Tell the owner in one plain sentence \
@@ -530,7 +540,7 @@ fn ask_text(project: &str, date: &str) -> String {
          did not belong where it fired, call it with noise true. Correct a note that is wrong with mcp__thor__revise, and remove one \
          that is simply gone with mcp__thor__retract (a reason is required). All of these are queued for the main machine. A copy \
          keeps no record of which notes fired, so judge from what you saw in this session; if you cannot honestly judge one, leave it.\n\
-         2. File the report with the THOR tool and only with it: mcp__thor__remember(id: \"eval-{project}-{date}\", kind: \"report\", \
+         2. File the report with the THOR tool and only with it: mcp__thor__remember(id: \"{report_id}\", kind: \"report\", \
          project: \"{project}\", tags: [\"evaluation-report\"], text: your own summary in plain words - what you judged, what you \
          corrected, and anything that chafed). Do not write a machine section; the main machine adds it.\n\
          3. End the turn once. THOR then checks the filing against this session's own transcript and hands you one more call to \
@@ -542,10 +552,10 @@ fn ask_text(project: &str, date: &str) -> String {
     )
 }
 
-fn rehold_text(project: &str, left: u32) -> String {
+fn rehold_text(project: &str, report_id: &str, left: u32) -> String {
     format!(
         "[THOR] The weekly-check report of '{project}' is not filed yet. File it now with mcp__thor__remember (kind report, project \
-         '{project}', tags [\"evaluation-report\"], id eval-{project}-<date>, your own summary as the text), then end the turn. \
+         '{project}', tags [\"evaluation-report\"], id {report_id}, your own summary as the text), then end the turn. \
          You can be held {left} more time(s) for it in this session."
     )
 }
@@ -608,7 +618,7 @@ pub fn copy_stop(db: &Path, session: &str, folder_project: Option<&str>, transcr
                     ask.holds += 1;
                     let left = MAX_REHOLDS - ask.holds;
                     write_state(db, &state);
-                    return CopyStop::Ask(rehold_text(&project, left));
+                    return CopyStop::Ask(rehold_text(&project, &report_id_now(db, &project, now), left));
                 }
                 ask.gave_up = true;
                 write_state(db, &state);
@@ -661,8 +671,7 @@ pub fn copy_stop(db: &Path, session: &str, folder_project: Option<&str>, transcr
             Ask { session: session.to_string(), asked_unix: now, holds: 0, sent_unix: None, report: None, gave_up: false },
         );
         write_state(db, &state);
-        let date: String = crate::time::iso8601_from_unix(now).chars().take(10).collect();
-        return CopyStop::Ask(ask_text(&project, &date));
+        return CopyStop::Ask(ask_text(&project, &report_id_now(db, &project, now)));
     }
     CopyStop::Quiet
 }

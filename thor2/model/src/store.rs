@@ -5035,6 +5035,12 @@ pub struct Frozen {
     /// record written before this field existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub outranked: Vec<OutrankedPlace>,
+    /// The id the evaluator is told to file its report under: the first free
+    /// one on the day the evaluation started (`free_evaluation_report_id`).
+    /// Empty for a record written before this field existed; every reader
+    /// then names the plain `eval-<project>-<date>` id.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub report_id: String,
 }
 
 /// How one item fired in one session (`Frozen::fired`, `session_firings`).
@@ -5053,6 +5059,11 @@ pub struct Firings {
     /// every log event, the start record included.
     #[serde(skip)]
     pub excerpts: Vec<Option<String>>,
+    /// For an `elsewhere` item: the first 8 characters of the session each
+    /// trigger was served in (`sessions[i]` belongs to `triggers[i]`), so a
+    /// prompt place can be read back from that session's own record.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sessions: Vec<String>,
     /// True when the item did NOT fire in the evaluating session and is on the
     /// list because it fired in another session of the project since its last
     /// verdict (`other_session_firings`): `count` and `triggers` then read
@@ -5230,6 +5241,7 @@ pub fn other_session_firings(store: &EventStore, session: &str, project: &str, i
             }
             if entry.triggers.len() < FIRED_TRIGGERS && !entry.triggers.contains(&shown) {
                 entry.triggers.push(shown);
+                entry.sessions.push(event.session_id.chars().take(8).collect());
             }
         }
     }
@@ -5402,6 +5414,7 @@ pub fn frozen_now(store: &EventStore, session: &str, project: &str, started_by: 
         superseded: None,
         fired: BTreeMap::new(),
         outranked: outranked_places(store, project),
+        report_id: String::new(),
     })
     .map(|mut frozen| {
         let mut fired = session_firings(store, session, &frozen.judgement, started_seq);
@@ -5634,6 +5647,44 @@ pub fn evaluation_starts_of_session(store: &EventStore, session: &str) -> Vec<Ev
         return Vec::new();
     };
     starts_in(&events).into_iter().filter(|s| s.frozen.session == session).collect()
+}
+
+/// The id an evaluation report of `project` is filed under on `date`
+/// (`YYYY-MM-DD`): `eval-<project>-<date>` when no item holds it, else
+/// `eval-<project>-<date>-2`, `-3`, ... - the first one nothing holds. A second
+/// evaluation of a project on the same day names the next one, so it never
+/// writes over the report of the first. Every text that tells an evaluator
+/// which id to use names this one.
+pub fn free_evaluation_report_id(store: &EventStore, project: &str, date: &str) -> String {
+    let base = format!("eval-{project}-{date}");
+    let taken = |id: &str| store.get_events_by_entity(id).map(|events| !events.is_empty()).unwrap_or(false);
+    if !taken(&base) {
+        return base;
+    }
+    (2..)
+        .map(|n| format!("{base}-{n}"))
+        .find(|id| !taken(id))
+        .expect("an unbounded range always yields a free id")
+}
+
+/// The refusal of a filing whose id already holds an evaluation report that is
+/// not the open evaluation's own: filing over it would overwrite the earlier
+/// evaluation's report and never close this one. `None` when the id is free,
+/// or holds the evaluating session's own report of this evaluation (a
+/// correction of it stays allowed).
+pub fn report_id_taken_refusal(store: &EventStore, start: &EvaluationStart, id: &str, date: &str) -> Option<Refusal> {
+    let existing = show(store, id).ok()?;
+    if !gate::is_evaluation_report(&existing) || filing_seq_after(store, id, start).is_some() {
+        return None;
+    }
+    let free = free_evaluation_report_id(store, &start.frozen.project, date);
+    Some(Refusal {
+        problem: format!(
+            "'{id}' already holds an evaluation report that was filed before this evaluation started; filing over it would \
+             overwrite that report and this evaluation would stay open"
+        ),
+        fix: format!("file this evaluation's report under the free id '{free}' (the same call with that id); nothing was written"),
+    })
 }
 
 /// Whether the evaluation `start` records has filed its OWN report: a live
@@ -11119,6 +11170,8 @@ mod tests {
         assert!(fired.elsewhere, "{fired:?}");
         assert_eq!(fired.count, JUDGEMENT_DEBT_AFTER);
         assert_eq!(fired.last_date.as_deref(), Some("2026-11-17"));
+        assert_eq!(fired.sessions.len(), fired.triggers.len(), "each place keeps the session it was served in: {fired:?}");
+        assert!(fired.sessions.iter().all(|s| s.starts_with("other-")), "{fired:?}");
         assert_eq!(fired.triggers, ["git push origin main"]);
 
         let err = file_in(&mut store, &eval_report("eval-w-1", "w"), &start).unwrap_err();
@@ -11389,6 +11442,42 @@ mod tests {
         };
         let ctx = FilingContext::new(INFLIGHT_SEEN, start.clone()).expect("seen in flight gives a context");
         declare_scoped(store, &session, "l", "mcp", report, Some(&ctx), Some(&att))
+    }
+
+    /// A SECOND EVALUATION OF A PROJECT ON THE SAME DAY (field test
+    /// 2026-11-18): every text named `eval-<project>-<date>`, which the first
+    /// evaluation's report already held, so the second one could only
+    /// overwrite it and never closed. The free id is now named, a filing under
+    /// the taken one is refused with that id, and filing under it closes the
+    /// evaluation while the first report stays as it was.
+    #[test]
+    fn a_second_evaluation_on_the_same_day_is_told_the_next_free_id_and_closes_under_it() {
+        let mut store = EventStore::in_memory().unwrap();
+        let day = "2026-11-18";
+        let plain = format!("eval-p-{day}");
+        assert_eq!(free_evaluation_report_id(&store, "p", day), plain, "nothing holds it yet");
+
+        file_now(&mut store, &eval_report(&plain, "p")).expect("the first evaluation files its report");
+        let first_text = show(&store, &plain).unwrap().text;
+        assert_eq!(free_evaluation_report_id(&store, "p", day), format!("{plain}-2"));
+        assert_eq!(free_evaluation_report_id(&store, "q", day), format!("eval-q-{day}"), "another project is untouched");
+
+        let second = record_start(&mut store, "s", "p");
+        assert!(evaluation_still_open(&store, &second, now_unix_secs()));
+        let refused = report_id_taken_refusal(&store, &second, &plain, day).expect("the earlier report's id is refused");
+        assert!(refused.fix.contains(&format!("'{plain}-2'")) && refused.fix.contains("nothing was written"), "{}", refused.fix);
+        assert!(refused.problem.contains(&plain), "{}", refused.problem);
+        assert_eq!(report_id_taken_refusal(&store, &second, &format!("{plain}-2"), day), None, "the free id is fine");
+
+        file_in(&mut store, &eval_report(&format!("{plain}-2"), "p"), &second).expect("the free id files");
+        assert!(!evaluation_still_open(&store, &second, now_unix_secs()), "filing under -2 closes the second evaluation");
+        assert_eq!(show(&store, &plain).unwrap().text, first_text, "the first report is untouched");
+        assert_eq!(free_evaluation_report_id(&store, "p", day), format!("{plain}-3"));
+        assert_eq!(
+            report_id_taken_refusal(&store, &second, &format!("{plain}-2"), day),
+            None,
+            "a correction of the evaluator's own report of this evaluation stays allowed"
+        );
     }
 
     // ------------------------- the verdict cap and the crowded places (2026-11-01)
@@ -12012,6 +12101,7 @@ mod tests {
             superseded: None,
             fired: Default::default(),
             outranked: Vec::new(),
+            report_id: String::new(),
         };
         assert_eq!(false_block_sweep_line(&frozen), "", "nothing found, nothing said");
         signals.sweep = vec![

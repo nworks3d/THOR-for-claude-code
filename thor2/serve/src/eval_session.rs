@@ -298,7 +298,8 @@ pub fn try_begin(db: &Path, store: &mut EventStore, session_id: &str, project: &
             return Err(StartRefused::Store);
         }
     }
-    let frozen = model::store::frozen_now(store, session_id, project, started_by, now).ok_or(StartRefused::Store)?;
+    let mut frozen = model::store::frozen_now(store, session_id, project, started_by, now).ok_or(StartRefused::Store)?;
+    frozen.report_id = model::store::free_evaluation_report_id(store, project, &start_date(&frozen));
     let id = model::store::evaluation_start_id(project, frozen.started_seq);
     let item = Item {
         id: id.clone(),
@@ -1138,6 +1139,9 @@ fn machine_pass_until(
     Passed { batch_later: needing.len() - batch.len(), batch, a4_list, machine }
 }
 
+/// The place a pinned standing rule is logged at when a session starts.
+const SESSION_START_PLACE: &str = "session start";
+
 /// The longest stretch of the owner's prompt a "(prompt) word" place carries.
 pub const PROMPT_EXCERPT_CHARS: usize = 80;
 
@@ -1167,7 +1171,14 @@ pub fn fill_prompt_excerpts(store: &EventStore, start: &mut EvaluationStart) {
     let replies = crate::corpus::load_replies(&db, crate::time::now_unix());
     let session = start.frozen.session.clone();
     for firings in start.frozen.fired.values_mut() {
-        firings.excerpts = firings.triggers.iter().map(|t| prompt_excerpt_for_place(&replies, &session, t)).collect();
+        // An item served in another session reads from THAT session's prompts.
+        let sessions = firings.sessions.clone();
+        firings.excerpts = firings
+            .triggers
+            .iter()
+            .enumerate()
+            .map(|(i, t)| prompt_excerpt_for_place(&replies, sessions.get(i).unwrap_or(&session), t))
+            .collect();
     }
 }
 
@@ -1195,10 +1206,39 @@ pub fn fired_line(fired: Option<&model::store::Firings>, per_item: usize) -> Str
     match fired {
         Some(f) if f.elsewhere => {
             let when = f.last_date.as_deref().map(|d| format!(", last on {d}")).unwrap_or_default();
-            let places = f.triggers.iter().take(per_item).map(|t| format!("'{t}'")).collect::<Vec<_>>().join(" | ");
+            let places = f
+                .triggers
+                .iter()
+                .enumerate()
+                .take(per_item)
+                .map(|(i, t)| match f.excerpts.get(i).and_then(|e| e.as_deref()) {
+                    Some(excerpt) => format!("'{t}' - \"{excerpt}\""),
+                    None => format!("'{t}'"),
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let shown = || f.triggers.iter().take(per_item);
+            let advice = if shown().any(|t| t == SESSION_START_PLACE) {
+                // A pinned standing rule is served at every session start: no
+                // other session is needed to judge whether it belongs there.
+                "That place is the session start: it was shown as a standing rule at the start of that session. The question is \
+                 whether it still belongs at EVERY session start - judge that from its own text and the owner's rules, no other \
+                 session is needed; mark it as noise if it should not be pinned"
+                    .to_string()
+            } else if let Some(words) = shown().find_map(|t| t.strip_prefix("(prompt) ")) {
+                let excerpt = match f.excerpts.iter().take(per_item).flatten().next() {
+                    Some(_) => "the owner's prompt around them is quoted above",
+                    None => "the prompt itself is no longer on record",
+                };
+                format!(
+                    "That place is a typed prompt of the owner: the words '{words}' of it reached this item ({excerpt}). Judge \
+                     whether it belonged to a prompt about that; if that is not enough to judge it, skip it with the not-judgeable tag"
+                )
+            } else {
+                "If this place is not enough to judge it, skip it with the not-judgeable tag".to_string()
+            };
             format!(
-                "\n       fired only in another session of this project: {} time(s){when}; last at: {places}. If this place is \
-                 not enough to judge it, skip it with the not-judgeable tag",
+                "\n       fired only in another session of this project: {} time(s){when}; last at: {places}. {advice}",
                 f.count
             )
         }
@@ -1393,6 +1433,34 @@ pub fn nothing_to_do(frozen: &Frozen) -> bool {
         && quiet_signals
 }
 
+/// The day (`YYYY-MM-DD`) the evaluation started.
+fn start_date(frozen: &Frozen) -> String {
+    crate::time::iso8601_from_unix(frozen.started_unix).chars().take(10).collect()
+}
+
+/// The id every text names for this evaluation's report: the first free id
+/// at the start (`Frozen::report_id`), or the plain `eval-<project>-<date>`
+/// for a record written before that field existed.
+pub fn report_id_named(frozen: &Frozen) -> String {
+    match frozen.report_id.is_empty() {
+        true => format!("eval-{}-{}", frozen.project, start_date(frozen)),
+        false => frozen.report_id.clone(),
+    }
+}
+
+/// The first free report id RIGHT NOW for `frozen`'s evaluation: what a Stop
+/// that holds the turn names, so a record that predates `Frozen::report_id`
+/// is not told an id an earlier report already holds.
+pub fn free_report_id_now(store: &EventStore, frozen: &Frozen) -> String {
+    model::store::free_evaluation_report_id(store, &frozen.project, &start_date(frozen))
+}
+
+/// The day (`YYYY-MM-DD`) the evaluation `frozen` records started: the date
+/// part of every report id it names.
+pub fn started_on(frozen: &Frozen) -> String {
+    start_date(frozen)
+}
+
 /// The first line of the Stop ask and of the start note when `nothing_to_do`:
 /// says so, gives the one call that files the report at once, and says the
 /// routine file does not have to be read for it. `None` when something is on
@@ -1403,12 +1471,12 @@ pub fn nothing_to_do_line(frozen: &Frozen) -> Option<String> {
     if !nothing_to_do(frozen) {
         return None;
     }
-    let date: String = crate::time::iso8601_from_unix(frozen.started_unix).chars().take(10).collect();
+    let report_id = report_id_named(frozen);
     let project = &frozen.project;
     Some(format!(
         "[THOR] NOTHING IS ON THIS EVALUATION'S LISTS (no item to judge, no teeth batch, no A4 list, no dispute, no sweep item, \
          no crowded place, no open point), so you do not have to read the routine file for it. File the report at once with \
-         the THOR tool: mcp__thor__remember(id: \"eval-{project}-{date}\", kind: \"report\", project: \"{project}\", \
+         the THOR tool: mcp__thor__remember(id: \"{report_id}\", kind: \"report\", project: \"{project}\", \
          tags: [\"evaluation-report\"], text: \"<one or two plain sentences: nothing was on the lists, so nothing was judged \
          or repaired>\"). THOR writes the machine section of the report itself, and the turn cannot end until a report \
          that counts is on file."
@@ -2617,5 +2685,79 @@ mod tests {
         let mut undecided = frozen.clone();
         undecided.batch = None;
         assert!(!nothing_to_do(&undecided), "while THOR is still deciding nothing is claimed");
+    }
+
+    /// FIELD TEST 2026-11-18: a second evaluation of a project on the same day
+    /// was told `eval-<project>-<date>`, which the first one's report already
+    /// held. The start now freezes the first FREE id and every text names it.
+    #[test]
+    fn a_second_evaluation_on_the_same_day_is_told_the_next_free_report_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, mut store) = store_with_events(dir.path(), 3);
+        let first = start(&db, &mut store, "sess", "Acme Demo", "stop-ask").unwrap();
+        let date = started_on(&first.start.frozen);
+        let plain = format!("eval-Acme Demo-{date}");
+        assert_eq!(first.start.frozen.report_id, plain);
+        let line = nothing_to_do_line(&first.start.frozen).expect("the line");
+        assert!(line.contains(&format!("id: \"{plain}\",")), "{line}");
+
+        // The first evaluation's report now holds that id.
+        let earlier = Item {
+            id: plain.clone(),
+            kind: Kind::Report,
+            text: "the first evaluation of the day".to_string(),
+            bindings: vec![],
+            severity: None,
+            project: Some("Acme Demo".to_string()),
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: None,
+            check: None,
+        };
+        model::store::declare(&mut store, "fixture", "fixture", "fixture", &earlier).unwrap();
+        assert_eq!(free_report_id_now(&store, &first.start.frozen), format!("{plain}-2"), "the Stop names the free one");
+
+        let mut second = model::store::frozen_now(&store, "sess-2", "Acme Demo", "stop-ask", first.start.frozen.started_unix).unwrap();
+        second.report_id = model::store::free_evaluation_report_id(&store, "Acme Demo", &started_on(&second));
+        second.batch = Some(vec![]);
+        second.a4_list = Some(vec![]);
+        second.machine = Some(model::store::MachinePass::default());
+        let line = nothing_to_do_line(&second).expect("the line");
+        assert!(line.contains(&format!("id: \"{plain}-2\",")) && !line.contains(&format!("id: \"{plain}\",")), "{line}");
+
+        // A record written before the field existed names the plain id.
+        second.report_id.clear();
+        assert!(nothing_to_do_line(&second).unwrap().contains(&format!("id: \"{plain}\",")));
+    }
+
+    /// FIELD TEST 2026-11-18: an item that fired in another session only at
+    /// its session start, or on a typed prompt, showed a place that gave the
+    /// evaluator nothing to judge, so every one was skipped.
+    #[test]
+    fn an_item_that_fired_elsewhere_at_session_start_or_on_a_prompt_says_what_to_judge() {
+        let place = |trigger: &str| model::store::Firings {
+            count: 3,
+            triggers: vec![trigger.to_string()],
+            elsewhere: true,
+            last_date: Some("2026-11-17".to_string()),
+            sessions: vec!["abcd1234".to_string()],
+            ..Default::default()
+        };
+        let line = fired_line(Some(&place("session start")), 3);
+        assert!(line.contains("fired only in another session of this project: 3 time(s), last on 2026-11-17"), "{line}");
+        assert!(line.contains("shown as a standing rule at the start of that session"), "{line}");
+        assert!(line.contains("whether it still belongs at EVERY session start"), "{line}");
+        assert!(line.contains("no other session is needed") && line.contains("mark it as noise if it should not be pinned"), "{line}");
+
+        let mut prompted = place("(prompt) ram, board");
+        let bare = fired_line(Some(&prompted), 3);
+        assert!(bare.contains("words 'ram, board' of it reached this item") && bare.contains("no longer on record"), "{bare}");
+        prompted.excerpts = vec![Some("how much RAM does the board have?".to_string())];
+        let quoted = fired_line(Some(&prompted), 3);
+        assert!(quoted.contains("\"how much RAM does the board have?\"") && quoted.contains("quoted above"), "{quoted}");
+
+        let other = fired_line(Some(&place("git push origin main")), 3);
+        assert!(other.contains("If this place is not enough to judge it, skip it with the not-judgeable tag"), "{other}");
     }
 }

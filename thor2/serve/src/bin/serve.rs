@@ -3574,11 +3574,12 @@ fn evaluation_after_a_hold(db_path: &Path, session_id: &str, payload: &Value) ->
             n => format!(", {n} write(s) by another session not checked yet"),
         };
         let reread = routine_changed_lines(session_id);
+        let report_id = serve::eval_session::free_report_id_now(&store, &start.frozen);
         return Some(held(format!(
             "{reread}[THOR] The evaluation of '{project}' ('{}') is still open and its report is not filed, so this turn is held \
              again. Every verdict and write of this turn was checked at this Stop: file the report NOW, in this turn, \
              with the THOR tool itself - mcp__thor__remember with kind report, project '{project}', tags \
-             [\"evaluation-report\"], id eval-{project}-<date> and your own plain summary as its text. If anything is still \
+             [\"evaluation-report\"], id {report_id} and your own plain summary as its text. If anything is still \
              owed, the filing names it, one by one; do that and file again. Owed right now: {} judgement item(s) without \
              a verdict or a not-judgeable tag, {} rule(s) of the batch and the A4 list{crowded}{foreign}. Do not tell the owner \
              'next turn': file in this one.",

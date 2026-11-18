@@ -1085,7 +1085,7 @@ fn refuse_a_forged_teeth_tag(id: &str, tags: &[String]) -> Result<(), String> {
             "invalid 'id': '{id}' begins with '{prefix}', which THOR keeps for its own record of an evaluation start - \
              only THOR writes one, when an evaluation starts, and nothing else may change it. Nothing was written. \
              Give your own item an id that does not begin with '{prefix}' (for an evaluation report: \
-             'eval-<project>-<date>').",
+             'eval-<project>-<date>', or that id with -2, -3 ... added when it is already taken).",
             id = id.trim(),
             prefix = model::store::EVALUATION_START_PREFIX
         ));
@@ -1395,6 +1395,14 @@ fn filing_context(
     let Some(start) = model::store::open_evaluation_start(store, session, project) else {
         return Err(sentence(model::store::no_open_evaluation_refusal(store, session, project)));
     };
+    if before.is_none() {
+        // A NEW filing under an id that already holds an earlier evaluation's
+        // report would overwrite it and never close this evaluation.
+        let date = serve::eval_session::started_on(&start.frozen);
+        if let Some(taken) = model::store::report_id_taken_refusal(store, &start, &normalized_item(item).id, &date) {
+            return Err(sentence(taken));
+        }
+    }
     if let Some(outside) = model::store::frozen_writes_in_window(store, &start, None).outside.into_iter().next() {
         serve::eval_session::void(store, &start, &outside);
         return Err(sentence(model::store::changed_behind_refusal(&outside)));
@@ -6154,6 +6162,60 @@ mod tests {
         // A side door files nothing, whatever is settled.
         let side = srv.remember(Meta::new(), RawArgs::default(), Parameters(report("eval-newer"))).await;
         assert!(side.contains("not coming through a THOR tool call") && side.contains("no toolUseId in the call's _meta"), "{side}");
+    }
+    /// FIELD TEST 2026-11-18: a second evaluation of a project filed under the
+    /// id of the first one's report. `remember` said "stored" but overwrote
+    /// the earlier report and the evaluation stayed open. Now the filing is
+    /// refused with nothing written and the free id named; under that id it
+    /// files, closes the evaluation, and the earlier report is untouched.
+    #[tokio::test]
+    async fn a_filing_under_an_earlier_evaluations_report_id_is_refused_with_the_free_id() {
+        const EVALUATOR: &str = "lib-second-evaluator";
+        let srv = server_knowing(&["test-project"])
+            .with_session(serve::teeth::SessionCtx { session_id: Some(EVALUATOR.to_string()), ..Default::default() });
+        let transcripts = tempfile::tempdir().unwrap();
+        let earlier_text;
+        {
+            let mut s = srv.store.lock().unwrap();
+            let mut previous = model::store::show(&s, "seed-test-project").unwrap();
+            previous.id = "eval-earlier-today".to_string();
+            previous.text = "the first evaluation of test-project today".to_string();
+            previous.tags = vec![model::store::EVALUATION_REPORT_TAG.to_string()];
+            serve::attest::fixture::attested_filing(&mut s, transcripts.path(), "seed", &previous, "toolu_earlier").unwrap();
+            earlier_text = model::store::show(&s, "eval-earlier-today").unwrap().text;
+        }
+        serve::attest::fixture::live_batch_start(&mut srv.store.lock().unwrap(), EVALUATOR, "test-project");
+        let called = |id: &str| {
+            let mut meta = Meta::new();
+            meta.0.insert(serve::attest::META_TOOL_USE_ID.to_string(), serde_json::json!(id));
+            meta
+        };
+        let report = |id: &str| RememberArgs {
+            tags: vec![model::store::EVALUATION_REPORT_TAG.to_string()],
+            text: format!("the second evaluation, filed as {id}"),
+            ..blank_report(id)
+        };
+        let events_before = srv.store.lock().unwrap().get_next_seq().unwrap();
+
+        let refused = srv.remember(called("toolu_taken"), RawArgs::default(), Parameters(report("eval-earlier-today"))).await;
+        let free = {
+            let s = srv.store.lock().unwrap();
+            let start = model::store::open_evaluation_start(&s, EVALUATOR, "test-project").expect("still open");
+            model::store::free_evaluation_report_id(&s, "test-project", &serve::eval_session::started_on(&start.frozen))
+        };
+        assert!(refused.starts_with("REFUSED") && refused.contains("'eval-earlier-today' already holds an evaluation report"), "{refused}");
+        assert!(refused.contains(&format!("'{free}'")) && refused.contains("nothing was written"), "the free id is named: {refused}");
+        {
+            let s = srv.store.lock().unwrap();
+            assert_eq!(s.get_next_seq().unwrap(), events_before, "nothing was written");
+            assert_eq!(model::store::show(&s, "eval-earlier-today").unwrap().text, earlier_text, "the earlier report is untouched");
+        }
+
+        let filed = srv.remember(called("toolu_free"), RawArgs::default(), Parameters(report(&free))).await;
+        assert!(filed.starts_with("stored "), "{filed}");
+        let s = srv.store.lock().unwrap();
+        assert_eq!(model::store::open_evaluation_start(&s, EVALUATOR, "test-project"), None, "filing under the free id closes it");
+        assert_eq!(model::store::show(&s, "eval-earlier-today").unwrap().text, earlier_text, "the earlier report is still untouched");
     }
     /// Severity is part of what a trial tries (its fingerprint), so a revise
     /// that changes ONLY the severity runs the trial again - lowering it is no

@@ -713,6 +713,57 @@ fn a_turn_held_for_the_evaluation_is_held_again_until_its_report_is_filed() {
     assert!(then.contains("is still open and its report is not filed"), "never silent while it is owed: {then}");
 }
 
+/// FIELD TEST 2026-11-18: the hold named `eval-<project>-<date>` also when an
+/// earlier evaluation's report already held that id. It names the first FREE
+/// id: the plain one while nothing holds it, `-2` once something does.
+#[test]
+fn the_hold_names_the_first_free_report_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let sandbox = Sandbox::new();
+    let fxp = sandbox.project_dir("fxp");
+    let s = uuid(41);
+    drop(EventStore::new(&db).unwrap());
+    seed_session_work(&db, Some("fxp"), &s, 90);
+    let first = run_hook(&db, &stop_payload(&s, &fxp), &sandbox);
+    assert!(is_block(&first), "{first}");
+    let started = {
+        let store = EventStore::new(&db).unwrap();
+        model::store::evaluation_starts_of_session(&store, &s).pop().expect("the ask started one")
+    };
+    let date: String = serve::time::iso8601_from_unix(started.frozen.started_unix).chars().take(10).collect();
+    let plain = format!("eval-fxp-{date}");
+
+    {
+        let mut store = EventStore::new(&db).unwrap();
+        served_in(&mut store, "fxp", &s, 0);
+    }
+    let again = run_hook(&db, &retry_stop_payload(&s, &fxp), &sandbox);
+    assert!(again.contains(&format!("id {plain} and your own plain summary")), "{again}");
+
+    // An earlier evaluation's report holds the plain id now.
+    {
+        let mut store = EventStore::new(&db).unwrap();
+        let earlier = model::item::Item {
+            id: plain.clone(),
+            kind: model::item::Kind::Report,
+            text: "the first evaluation of the day".to_string(),
+            bindings: vec![],
+            severity: None,
+            project: Some("fxp".to_string()),
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: None,
+            check: None,
+        };
+        model::store::declare(&mut store, "fixture", "fixture", "fixture", &earlier).unwrap();
+        served_in(&mut store, "fxp", &s, 1);
+    }
+    let taken = run_hook(&db, &retry_stop_payload(&s, &fxp), &sandbox);
+    assert!(taken.contains(&format!("id {plain}-2 and your own plain summary")), "{taken}");
+}
+
 /// FIELD DEFECT 2, the void half: a filing refused as void promised "the next
 /// Stop starts a fresh evaluation", and the Stop of the held turn let the
 /// session go silently. Now that Stop starts the fresh evaluation it promised

@@ -1026,16 +1026,22 @@ BEFORE YOU FILE, read the first lines it prints. Two lines can start differently
 and they mean different things.
 
 `tool server:` (for example "tool server: 1 running mcp.exe process(es) started
-before mcp.exe was replaced") - WHAT IT MEANS: the tool server you file through
-is older than the installed mcp.exe, so a report filed now would be refused as
-version skew and be a dead report. WHAT TO DO: do not file; tell the owner in
-your summary to restart Claude, and end the turn. The next end-of-turn ask files
-the report. STEPS 1 TO 8 STAY: you still do them all, and the verdicts, batch
-calls and other THOR calls you make are written and count; only the filing is
-withheld. With no report filed, the summary for the owner goes in your chat
-reply. DONE WHEN: the summary says so and no report was filed. EXAMPLE: summary:
-"the tool server is stale; restart Claude, then the evaluation is asked again;
-I filed nothing".
+before mcp.exe was replaced") - WHAT IT MEANS: it names the running tool
+servers of OTHER Claude Code sessions that started before the program was
+replaced, and the time of the swap. It says nothing about yours: a session that
+started after that time already runs the new program, and so does yours when
+it started after it. WHAT TO DO: if this session started after the swap time
+the line names, ignore the line and file as usual. Only when this session
+started BEFORE it, a report filed now would be refused as version skew and be
+a dead report: then do not file, tell the owner in your summary to restart
+Claude, and end the turn; the next end-of-turn ask files the report. When you
+are unsure which it is, try to file: the filing itself is refused, with
+nothing written, when your tool server is the old one. STEPS 1 TO 8 STAY: you
+still do them all, and the verdicts, batch calls and other THOR calls you make
+are written and count. With no report filed, the summary for the owner goes in
+your chat reply. DONE WHEN: the filing was made, or the summary says it was
+withheld. EXAMPLE: summary: "this session's tool server is stale; restart
+Claude, then the evaluation is asked again; I filed nothing".
 
 `installed programs:` (for example "installed programs: serve.exe is build X
 (renderer 7), mcp.exe is build Y (renderer 7) - they were not built from the
@@ -1148,8 +1154,10 @@ hunt it for real THOR defects. THOR writes the facts of the evaluation
 itself, from its log, and puts them in front of your text:
 
 - Call `mcp__thor__remember` with kind `report`, the project you evaluated,
-  tags `["evaluation-report"]`, id `eval-<project>-<YYYY-MM-DD>` (a second
-  one the same day gets `-2`), and a text that is ONLY your TLDR and remarks:
+  tags `["evaluation-report"]`, id `eval-<project>-<YYYY-MM-DD>` (when
+  an earlier evaluation of the project already holds that id, the first free
+  one: `-2`, then `-3`; the start note and the hold at the end of a turn name
+  it, and a filing under a taken id is refused with nothing written), and a text that is ONLY your TLDR and remarks:
   the plain-language summary and then the eight points above, exactly as you
   gave them to the owner.
 - Do not write a section of your own for what was judged, the teeth, the open

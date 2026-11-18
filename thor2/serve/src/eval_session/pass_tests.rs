@@ -1679,6 +1679,7 @@ fn busy_frozen(batch: usize, a4: usize, disputes: usize, blocks: usize, carriers
         superseded: None,
         fired: std::collections::BTreeMap::new(),
         outranked: Vec::new(),
+        report_id: String::new(),
     }
 }
 

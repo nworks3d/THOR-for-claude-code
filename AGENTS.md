@@ -433,7 +433,7 @@ for the main machine", or the tool list names THOR's tools). A session with no
 sign of it is left alone, and nothing is said. The ask is the copy's own and
 says what to do step by step: mark the notes that helped or did not belong,
 correct or retract wrong ones, and file the report with `mcp__thor__remember`
-(kind `report`, tag `evaluation-report`, id `eval-<project>-<date>`); the
+(kind `report`, tag `evaluation-report`, id `eval-<project>-<date>`, or that id with `-2`, `-3` added when it is already taken: the ask names it); the
 connector queues all of it. At the next Stop THOR reads the session's own
 transcript, sees that filing call and its "queued ... capture <id>" result, and
 holds the turn once more with the exact call that sends the proof: the same
@@ -1185,7 +1185,7 @@ half an hour or more never counts.
    says so: end the turn once, then file again.
 3. **File the report with the THOR tool, and only with it.** Use `remember`:
    kind `report`, the project, tags `["evaluation-report"]`, the id
-   `eval-<project>-<date>`, and a text that is only your summary in plain words
+   `eval-<project>-<date>` (the first free one: `-2`, then `-3`, when an earlier evaluation of the day holds it; the start note and the hold at the end of a turn name it, and a filing under a taken id is refused), and a text that is only your summary in plain words
    and your remarks. THOR writes the facts itself, from its log, in front of
    your text - what was judged, what it decided, what it refused, which
    writes bypassed the tools - and nobody, you included, can edit that part. If

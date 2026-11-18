@@ -360,10 +360,10 @@ fn stale_servers_line(replaced_unix: i64, started: &[(u32, i64)]) -> Option<Stri
         .iter()
         .map(|(pid, start)| format!("{pid} (started {})", serve::time::iso8601_from_unix(*start)))
         .collect();
+    let swapped = serve::time::iso8601_from_unix(replaced_unix);
     Some(format!(
-        "tool server: {} running mcp.exe process(es) started before mcp.exe was replaced ({}): {} - they still run the OLD program and may count and judge differently. Restart Claude to load the new tool server.",
+        "tool server: {} running mcp.exe process(es) started before mcp.exe was replaced ({swapped}): {} - they belong to Claude Code sessions that started before the swap and still run the OLD program; a session started after {swapped} already runs the new one, so only those older sessions need a restart.",
         stale.len(),
-        serve::time::iso8601_from_unix(replaced_unix),
         ids.join(", ")
     ))
 }
@@ -5881,7 +5881,10 @@ mod tests {
         let line = stale_servers_line(1_790_000_000, &[(111, 1_789_990_000), (222, 1_790_000_500)]).expect("one is stale");
         assert!(line.starts_with("tool server: 1 running mcp.exe process(es) started before mcp.exe was replaced"), "{line}");
         assert!(line.contains("111 (started 2026-") && !line.contains("222"), "{line}");
-        assert!(line.contains("Restart Claude to load the new tool server"), "{line}");
+        assert!(line.contains("belong to Claude Code sessions that started before the swap"), "{line}");
+        assert!(line.contains("a session started after 2026-") && line.contains("already runs the new one"), "{line}");
+        assert!(line.contains("only those older sessions need a restart"), "{line}");
+        assert_eq!(line.lines().count(), 1, "one line: {line}");
         assert_eq!(stale_servers_line(1_790_000_000, &[(222, 1_790_000_500)]), None, "a newer process is fine");
         assert_eq!(stale_servers_line(1_790_000_000, &[]), None, "none running is fine");
     }

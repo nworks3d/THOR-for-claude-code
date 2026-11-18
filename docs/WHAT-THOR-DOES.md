@@ -585,6 +585,15 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
   one would file a report that does not count. THOR asks for no evaluation and holds no turn in that
   session, says so once (not at every turn), starts nothing for /thor-eval, and refuses to file a report
   up front ("this tool server is older than the installed one ... restart Claude"). The cure is a restart.
+  Doctor's "tool server:" line is about OTHER sessions: it names the running tool servers that started
+  before the program was replaced and the time of the swap; a session started after that time already runs
+  the new program, and only the older sessions need a restart.
+- The report id is the first free one: eval-<project>-<date>, then -2, -3 when an earlier evaluation of the
+  day already holds it. The start note and the hold at the end of a turn name it, and a filing under an id
+  that already holds an earlier evaluation's report is refused with the free id named, nothing written.
+- A verdict item that fired only in another session says where: for a standing rule shown at session start
+  the question is whether it still belongs at every session start (judged from its text), for a typed prompt
+  the words that reached it, with a short excerpt when the record still holds it.
 - Probable false blocks are listed worst first (the rule that refused the most real calls), at most 8, and
   the line that counts the rest names the command that lists them all: doctor --db "<store>" --full.
 - The old rules the 20-second box did not reach lead the next start, in the order they were left, taken from
