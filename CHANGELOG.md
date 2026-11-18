@@ -2,7 +2,11 @@
 
 What changed in each release, newest first. The release workflow copies the section for the tag being released to the top of the release notes and refuses to publish without one.
 
-## Unreleased
+## 2.6.9 (2026-11-18)
+
+What changed: You can choose the language your assistant talks to you in, and once you have, a reply in another language is sent back to be rewritten. A rule on a tool call can now look at one field of the call, such as the model a helper agent runs on, instead of all of its text at once. The weekly evaluation no longer comes back empty while notes of the project still wait for a verdict.
+
+Since 2.6.4, the last release published here, these versions also landed and are part of this one: 2.6.5 makes your verdicts on notes count again and lets a rule refuse a tool by its name; 2.6.6 makes doctor fast again; 2.6.7 keeps the /thor-eval routine and the code index up to date after an upgrade, a pull, a rebase or a branch switch; 2.6.8 makes the hook before every tool call faster and lets search find a note by its id. Each has its own section below.
 
 - **A rule on a tool call can address one input field.** For Agent, Workflow or an MCP tool, a forbidden literal or a `requires` answer written as `model=fable` matches that top-level field only, so it no longer confuses the field with the word `fable` in a brief. The write-time trial tries such a literal as the field. Plain literals behave as before.
 - **You can choose the language your assistant talks to you in, and the choice is checked.** Item 8 of the first-session list is now a question about it. Once you name one (nl, en, de, fr or es; `install --set-language nl --db <store>`), a reply meant for you that clearly reads as another language is sent back once to be rewritten, also right after an English machine message such as a helper's report. Short replies, code, quotes, paths and helper reports are never judged, and until you choose, nothing is checked. `install --set-language off` removes it.
