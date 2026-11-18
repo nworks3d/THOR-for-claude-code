@@ -939,7 +939,12 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
 - Refuse or change: revise tags.
 
 ### F11. How to remove THOR
-- What: README.md has a "Remove THOR completely" section with ten steps. In short: remove its four entries
+- What: `install --uninstall --db <memory>` removes THOR's own hook entries (every event, both forms, the
+  backup one too), the "thor" tool server, the /thor-eval command and git's core.hooksPath when it is THOR's;
+  `install --uninstall --finish --db <memory> [--delete-memory]` then refuses while a THOR program runs,
+  removes the .bak copies, keeps the memory unless told, and names the program folder to delete. It never
+  removes git, Python or the Visual C++ runtime. README.md has a "Remove THOR completely" section with the
+  same steps by hand (ten). In short: remove its four entries
   in settings.json (plus the backup SessionStart entry if you chose a backup), the "thor" entry in
   ~/.claude.json, the /thor-eval command, unset git's core.hooksPath if it points to THOR's folder
   (the media gate, A7b, goes with it), then delete the memory folder, the programs folder and any

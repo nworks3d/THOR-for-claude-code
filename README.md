@@ -1267,10 +1267,31 @@ code lane:
 
 ## Remove THOR completely
 
-Everything the install put on your computer is listed here, with how to undo
-each piece. Nothing is hidden anywhere else. Your own projects and their code
-are never changed, apart from the one small file in step 9. Your assistant can
-do all of this for you if you ask; these are the steps in plain words.
+Just tell your assistant: *"Remove THOR."* It does every step itself and you type
+nothing:
+
+1. It runs `install --uninstall --db "<your memory>"`. That takes out only what
+   THOR put in Claude Code: THOR's connections in the settings (every other entry
+   there is left exactly as it was), THOR's note-saving connection, the
+   `/thor-eval` command, and git's global hooks folder but only when it is
+   THOR's. It then asks you to close Claude Code completely and open it again,
+   and to say "finish removing THOR".
+2. After that restart it asks you one question, once: *do you also want your
+   memory (your notes) deleted?* The safe default is no, it is kept. Then it runs
+   `install --uninstall --finish --db "<your memory>"` (with `--delete-memory`
+   only if you said yes). That refuses while any THOR program is still running,
+   removes the saved copies of Claude Code's settings files that THOR's install
+   made, and ends by naming THOR's program folder.
+3. It deletes that program folder itself (to the Recycle Bin).
+
+**THOR never removes git, Python, Microsoft's Visual C++ runtime or any other
+program, and never offers to.** Claude Code itself uses git on Windows; removing
+it would break your assistant. Your own projects and their code are never
+changed, apart from the one small hidden `.thor-project` file in step 9 below,
+which your assistant also removes on request.
+
+If you ever want to do it by hand, everything the install put on your computer
+is listed here, with how to undo each piece. Nothing is hidden anywhere else.
 
 1. **Close Claude Code completely.** It reads its settings once, when it opens.
 2. **Keep a copy of your notes first, if you might want them again.** Copy the

@@ -19,3 +19,4 @@ pub mod pull;
 pub mod questionnaire;
 pub mod ship_state;
 pub mod transport;
+pub mod uninstall;

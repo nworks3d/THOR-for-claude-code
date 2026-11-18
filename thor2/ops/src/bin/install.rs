@@ -248,6 +248,29 @@ struct Cli {
     )]
     set_tools_folder: Option<String>,
 
+    /// Take THOR out again, step one (Claude Code may be running): removes only
+    /// THOR's own connections from Claude Code's settings, THOR's note-saving
+    /// connection, the /thor-eval command and git's global hooks folder when it
+    /// is THOR's. It never removes git, Python, the Visual C++ runtime or any
+    /// other program. Ends by saying to restart Claude Code. Needs --db.
+    #[arg(
+        long = "uninstall",
+        conflicts_with_all = ["project", "mcp_exe", "no_mcp", "serve_exe", "code_index_root", "register_root", "topic", "copy_from", "set_mode", "set_plan", "set_weekly_check", "set_backup", "set_recording", "set_language", "set_helpers", "set_temp_folder", "set_tools_folder"]
+    )]
+    uninstall: bool,
+
+    /// With --uninstall: step two, after Claude Code was closed and opened again.
+    /// Refuses while a THOR program is still running, removes the saved copies
+    /// of Claude Code's settings files, and keeps your memory unless you add
+    /// --delete-memory. Ends by naming the program folder to delete.
+    #[arg(long = "finish", requires = "uninstall")]
+    finish: bool,
+
+    /// With --uninstall --finish: also delete the memory and its side files
+    /// (your safety copies in backup-repo stay). Without it the memory is kept.
+    #[arg(long = "delete-memory", requires = "finish")]
+    delete_memory: bool,
+
     /// SECOND MACHINE: set THOR up as a read-only COPY of another machine's
     /// memory, built from that machine's backup, in this one command. Give the
     /// backup as a folder (a share on a NAS), a bare repository or a git
@@ -995,8 +1018,54 @@ fn print_record_outcome(key: &str, outcome: Result<RegisterOutcome, RegisterRefu
     }
 }
 
+/// `install --uninstall [--finish [--delete-memory]]`: see `ops::uninstall`.
+fn uninstall_main(cli: &Cli) -> ExitCode {
+    let Some(db) = cli.db.clone().or_else(|| default_data_dir().map(|d| thor_core::app_data::resolve(&d.join("thor.db")))) else {
+        eprintln!("NOTHING WAS CHANGED: could not work out which memory to remove - name it with --db");
+        return ExitCode::FAILURE;
+    };
+    let (Some(settings), Some(claude_json)) = (cli.settings.clone().or_else(default_settings_path), cli.mcp_json.clone().or_else(default_user_mcp_path)) else {
+        eprintln!("NOTHING WAS CHANGED: could not find your home folder to find Claude Code's files");
+        return ExitCode::FAILURE;
+    };
+    let targets = ops::uninstall::Targets { settings, claude_json, eval_command: default_eval_command_path(), db };
+    if cli.finish {
+        let Some(bin_dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)) else {
+            eprintln!("NOTHING WAS CHANGED: could not work out where THOR's programs are");
+            return ExitCode::FAILURE;
+        };
+        return match ops::uninstall::phase_two(&targets, &bin_dir, cli.delete_memory, &ops::uninstall::RealProcesses) {
+            Ok(report) => {
+                for line in report.plain_lines() {
+                    println!("{line}");
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    match ops::uninstall::phase_one(&targets, &ops::uninstall::RealGit) {
+        Ok(report) => {
+            for line in report.plain_lines() {
+                println!("{line}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("NOTHING WAS FULLY REMOVED: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if cli.uninstall {
+        return uninstall_main(&cli);
+    }
     if cli.register_root {
         return register_only(cli.db, cli.per_machine, cli.ask_main);
     }

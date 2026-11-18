@@ -1329,6 +1329,34 @@ apart, not an error to work around.
 
 ---
 
+## If the person asks you to remove THOR
+
+You do every step yourself; the person types nothing. NEVER remove, and never
+offer to remove, git, Python, Microsoft's Visual C++ runtime or any other program:
+Claude Code itself uses git on Windows, and an uninstall script that took it out
+once left a person without a working assistant. Do not write a script for them to
+run by hand.
+
+1. Run `"<bin>/install" --uninstall --db "<their store>"` (`<bin>` is the folder
+   THOR is unpacked in). It removes only THOR's own entries in Claude Code's
+   settings (every other entry stays exactly as it was), THOR's note-saving
+   connection, the `/thor-eval` command, and git's global hooks folder only when
+   it is THOR's. Tell them in plain words what it removed.
+2. Ask for the one restart, in one sentence: "Close Claude Code completely and
+   open it again, then say: finish removing THOR."
+3. After the restart, ask ONE plain question: "Shall I also delete your memory,
+   all the notes THOR kept? The safe answer is no, then it stays on this
+   computer." Then run `"<bin>/install" --uninstall --finish --db "<their store>"`,
+   adding `--delete-memory` only on a clear yes. It refuses (nothing changed) while
+   a THOR program is still running: then ask for the restart again.
+4. It ends by naming THOR's program folder. Delete that folder yourself with
+   `Remove-Item` (to the Recycle Bin is fine). A program cannot delete the folder
+   it runs from, which is why this is a separate step.
+5. The hidden `.thor-project` file in each topic folder is the only thing THOR put
+   inside their own folders: remove it on request.
+
+---
+
 ## More detail, when you need it
 
 - [thor2/README.md](thor2/README.md) - the program: how it is built, what each part does
