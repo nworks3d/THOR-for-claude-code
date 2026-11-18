@@ -120,6 +120,43 @@ fn local_makes_a_git_folder_wires_one_session_start_hook_and_proves_it_with_a_fi
     assert!(fx.commands("SessionStart").iter().any(|c| c.contains("other")), "a foreign hook is untouched");
 }
 
+/// A backup connection an earlier install wrote as one command line is
+/// rewritten in place by a plain install on Windows (Claude Code runs such a
+/// line in PowerShell when Git Bash is missing, where it never starts), and
+/// never doubled; a second install changes nothing.
+#[test]
+fn a_plain_install_rewrites_an_old_backup_connection_in_place_and_adds_none() {
+    let fx = Fx::new();
+    std::fs::create_dir_all(fx.settings().parent().unwrap()).unwrap();
+    let old = format!("\"C:\\thor\\backup.exe\" --db \"{}\" --repo \"C:\\copies\"", fx.db().display());
+    let settings = serde_json::json!({ "hooks": { "SessionStart": [ { "hooks": [ { "type": "command", "command": old } ] } ] } });
+    std::fs::write(fx.settings(), serde_json::to_string_pretty(&settings).unwrap()).unwrap();
+
+    let out = fx.install(&[]);
+    assert!(out.status.success(), "{}", said(&out));
+    assert_eq!(fx.backup_hooks().len(), 1, "never a second backup connection: {:?}", fx.backup_hooks());
+    let entry = fx.settings_json()["hooks"]["SessionStart"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|g| g["hooks"].as_array().cloned().unwrap_or_default())
+        .find(|h| h["command"].as_str().is_some_and(|c| c.contains("backup")))
+        .unwrap();
+    if cfg!(windows) {
+        assert_eq!(entry["command"], serde_json::json!("C:\\thor\\backup.exe"), "{entry}");
+        assert_eq!(entry["args"][2], serde_json::json!("--repo"), "{entry}");
+        assert_eq!(entry["onFailure"], serde_json::json!("continue"), "{entry}");
+        assert!(said(&out).contains("rewrote the backup's connection"), "{}", said(&out));
+    } else {
+        assert_eq!(entry["command"], serde_json::json!(old), "other systems keep the one-line form");
+    }
+
+    let before = std::fs::read_to_string(fx.settings()).unwrap();
+    let again = fx.install(&[]);
+    assert!(again.status.success(), "{}", said(&again));
+    assert_eq!(std::fs::read_to_string(fx.settings()).unwrap(), before, "a second install changes nothing");
+}
+
 #[test]
 fn choosing_local_twice_adds_nothing_the_second_time() {
     let fx = Fx::new();

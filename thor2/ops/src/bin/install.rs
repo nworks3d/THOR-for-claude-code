@@ -23,7 +23,7 @@ use ops::install::{
     check_registration, check_registration_at, default_data_dir, default_eval_command_path, default_settings_path,
     default_user_mcp_path, ensure_store, install_hooks, install_tool_server, record_project_opened,
     record_topic_opened, register_command_for, register_root_for, register_root_remote, seed_eval_command, seed_response_rulebook,
-    seed_working_contract_at, standard_hooks, topic_folder_name, write_project_marker, EvalCommandOutcome, HookOutcome,
+    seed_working_contract_at, standard_hooks, topic_folder_name, write_project_marker, EvalCommandOutcome, HookOutcome, HookSpec,
     MarkerOutcome, RegisterOutcome, RegisterRefusal, RulebookOutcome, ServerOutcome, StoreOutcome,
 };
 use std::path::PathBuf;
@@ -1422,6 +1422,25 @@ fn main() -> ExitCode {
             eprintln!("NOTHING WAS CONNECTED to Claude Code: {e}");
             eprintln!("Your memory file was created. Fix the problem named above, then run install again.");
             return ExitCode::FAILURE;
+        }
+    }
+
+    // 2b. A backup connection wired by an earlier install keeps its own
+    // program, memory and folder; it is only rewritten in place in the form
+    // Windows can always start (on Windows without Git Bash a shell-form line
+    // never runs, so the daily copy would silently stop). Nothing is added.
+    if let Ok(existing) = ops::backup_setup::backup_hooks_for(&settings, &db) {
+        let specs: Vec<HookSpec> =
+            existing.into_iter().map(|command| HookSpec { event: "SessionStart", matcher: None, command }).collect();
+        if !specs.is_empty() {
+            match install_hooks(&settings, &specs) {
+                Ok(report) if report.results.iter().any(|(_, o)| *o == HookOutcome::Upgraded) => {
+                    restart_because.push("the backup's connection in Claude Code's settings changed");
+                    println!("  rewrote the backup's connection in the form Windows can always start; close Claude Code completely and open it again for that to take effect");
+                }
+                Ok(_) => {}
+                Err(e) => println!("  ! could not check the backup's connection: {e}"),
+            }
         }
     }
 
