@@ -148,7 +148,7 @@ fn many_sessions_are_capped_and_the_rest_counted() {
     let mut buf = Vec::new();
     let args = inventory_args(&f, &[], &mut buf);
     let (text, _) = serve(&args);
-    assert!(text.contains("listed: 40 (5 left out)"), "{text}");
+    assert!(text.contains("listed: 40 (5 left out: 5 not in order, 0 in order)"), "{text}");
 }
 
 #[test]
@@ -200,4 +200,55 @@ fn a_garbled_line_is_skipped_not_an_error() {
     let args = inventory_args(&f, &[], &mut buf);
     let (text, ok) = serve(&args);
     assert!(ok && text.contains("first prompt: Hello there"), "{text}");
+}
+
+fn scratch_dir(f: &Fixture) -> PathBuf {
+    f.home().join("AppData").join("Roaming").join("Claude").join("scratch-workspaces").join("u1").join("u2").join("scratch-2026-03-01-abc123")
+}
+
+#[test]
+fn a_scratch_workspace_session_is_listed_as_without_a_folder_and_its_files_are_at_risk() {
+    let f = Fixture::new();
+    let scratch = scratch_dir(&f);
+    std::fs::create_dir_all(&scratch).unwrap();
+    let cv = scratch.join("cv-draft.docx");
+    std::fs::write(&cv, "x").unwrap();
+    let kept = f.home().join("Documents").join("notes.txt");
+    std::fs::write(&kept, "x").unwrap();
+    f.session("scr1", &scratch, "2026-03-01", &[user("Write my CV"), tool("Write", "file_path", &cv), tool("Write", "file_path", &kept)]);
+    // Claude Code's own per-session scratchpad is still not the person's work.
+    let temp = f.home().join("AppData").join("Local").join("Temp").join("claude").join("x").join("scratchpad");
+    std::fs::create_dir_all(&temp).unwrap();
+    f.session("tmp1", &temp, "2026-03-02", &[user("internal helper work")]);
+    let mut buf = Vec::new();
+    let args = inventory_args(&f, &[], &mut buf);
+    let (text, ok) = serve(&args);
+    assert!(ok, "{text}");
+    assert!(text.contains("CONVERSATIONS WITHOUT A FOLDER (the Claude desktop app runs these in a temporary scratch workspace"), "{text}");
+    assert!(text.contains("first prompt: Write my CV"), "{text}");
+    assert!(text.contains("exists AT RISK") && text.contains("cv-draft.docx"), "{text}");
+    let notes_line = text.lines().find(|l| l.contains("notes.txt")).unwrap();
+    assert!(!notes_line.contains("AT RISK"), "{notes_line}");
+    assert!(!text.contains("internal helper work"), "a Temp scratchpad session stays skipped: {text}");
+    assert!(text.contains("Sessions with something typed by the person: 1"), "{text}");
+}
+
+#[test]
+fn the_cap_keeps_unordered_sessions_before_ordered_ones() {
+    let f = Fixture::new();
+    let desktop = f.home().join("Desktop");
+    let repo = f.home().join("dev").join("site");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    // Three ordered sessions, NEWER than 42 unordered ones.
+    for i in 0..3 {
+        f.session(&format!("ord{i}"), &repo, "2026-06-01", &[user(&format!("repo question {i}"))]);
+    }
+    for i in 0..42 {
+        f.session(&format!("un{i:02}"), &desktop, "2026-04-01", &[user(&format!("desktop question {i}"))]);
+    }
+    let mut buf = Vec::new();
+    let args = inventory_args(&f, &[], &mut buf);
+    let (text, _) = serve(&args);
+    assert!(text.contains("listed: 40 (5 left out: 2 not in order, 3 in order)"), "{text}");
+    assert!(!text.contains("repo question"), "no ordered session is listed while unordered ones are left out: {text}");
 }

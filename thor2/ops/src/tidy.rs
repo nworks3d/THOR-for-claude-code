@@ -30,7 +30,7 @@
 //! undo reaches the one before. The folders and their memories stay.
 
 use serde::{Deserialize, Serialize};
-use serve::inventory::{broad_place, is_inside, norm, system_place};
+use serve::inventory::{broad_place, is_inside, norm, source_system_place, system_place};
 use std::path::{Path, PathBuf};
 
 use crate::install::{check_registration_at, record_topic_opened, topic_of, write_project_marker, RegisterOutcome};
@@ -120,7 +120,9 @@ fn refuse_file(home: &Path, file: &Path, target: &Path) -> Option<String> {
     if !is_inside(home, file) {
         return Some("it is outside your home folder".to_string());
     }
-    if let Some(s) = system_place(home, file) {
+    // A file may come out of the desktop app's scratch workspace (a temporary
+    // place the app may clean up); a folder is never made there (`refuse_folder`).
+    if let Some(s) = source_system_place(home, file) {
         return Some(format!("it belongs to {s}"));
     }
     let parent = file.parent().unwrap_or(file);

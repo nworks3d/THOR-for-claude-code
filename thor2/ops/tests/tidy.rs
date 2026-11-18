@@ -217,3 +217,23 @@ fn a_broken_plan_changes_nothing() {
     assert!(!out.status.success());
     assert!(text(&out).contains("Nothing was changed"), "{}", text(&out));
 }
+
+#[test]
+fn a_file_in_the_desktop_apps_scratch_workspace_is_moved_out_but_never_a_folder_made_there() {
+    let sb = Sandbox::new();
+    let scratch = "AppData/Roaming/Claude/scratch-workspaces/u1/u2/scratch-2026-03-01-abc123";
+    let cv = sb.file(&format!("{scratch}/cv-draft.docx"), "cv");
+    let other_appdata = sb.file("AppData/Local/Thing/state.db", "db");
+    let folder = sb.path("Documents/Cv en werk zoeken");
+    let out = sb.tidy(serde_json::json!([
+        { "folder": s(&folder), "files": [s(&cv), s(&other_appdata)] },
+        { "folder": s(&sb.path(&format!("{scratch}/new-folder"))), "files": [] },
+    ]));
+    assert!(out.status.success(), "{}", text(&out));
+    let said = text(&out);
+    assert!(said.contains("moved 1 file(s)"), "{said}");
+    assert!(folder.join("cv-draft.docx").is_file() && !cv.exists());
+    assert!(other_appdata.is_file(), "other application data is still left alone: {said}");
+    assert!(said.contains("! REFUSED") && said.contains("application data"), "a folder inside AppData is still refused: {said}");
+    assert!(!sb.path(&format!("{scratch}/new-folder")).exists());
+}

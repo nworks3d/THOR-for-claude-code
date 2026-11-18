@@ -40,6 +40,9 @@ pub const DIGEST_CHARS: usize = 20_000;
 pub struct WrittenFile {
     pub path: String,
     pub exists: bool,
+    /// The file sits in a Claude desktop app scratch workspace, a temporary
+    /// place the app may clean up.
+    pub at_risk: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -63,6 +66,9 @@ pub struct FolderInfo {
     pub ordered: bool,
     /// Why it is not in order: "home folder", "Desktop", "no project", ...
     pub why_not_ordered: Option<String>,
+    /// The conversations ran in the desktop app's scratch workspace ("No
+    /// folder" in its sidebar).
+    pub without_folder: bool,
     pub sessions: Vec<SessionInfo>,
 }
 
@@ -70,6 +76,8 @@ pub struct FolderInfo {
 pub struct Inventory {
     pub sessions_found: usize,
     pub sessions_left_out: usize,
+    pub sessions_left_out_unordered: usize,
+    pub sessions_left_out_ordered: usize,
     pub folders: Vec<FolderInfo>,
     /// Files sessions wrote straight into the home folder, Desktop,
     /// Documents or Downloads.
@@ -142,6 +150,29 @@ pub fn system_place(home: &Path, dir: &Path) -> Option<&'static str> {
         }
     }
     None
+}
+
+/// Whether a path lies in a Claude desktop app SCRATCH WORKSPACE: where the app
+/// runs a conversation that has no folder ("No folder" in its sidebar). Under
+/// application data, below a folder named `claude` or `claude-...` (the
+/// `Claude` and `Claude-Data\\claude-<id>` folders), then `scratch-workspaces`.
+pub fn is_app_scratch(p: &Path) -> bool {
+    let n = norm(p);
+    let parts: Vec<&str> = n.split('/').collect();
+    let Some(at) = parts.iter().position(|s| *s == "scratch-workspaces") else { return false };
+    let before = &parts[..at];
+    before.contains(&"appdata") && before.iter().any(|s| *s == "claude" || s.starts_with("claude-"))
+}
+
+/// `system_place` for a place THOR READS FROM: a scratch workspace of the
+/// desktop app is the person's work (loose conversations), not a program's own
+/// folder. Never use this for a place something is put INTO.
+pub fn source_system_place(home: &Path, dir: &Path) -> Option<&'static str> {
+    if is_app_scratch(dir) {
+        None
+    } else {
+        system_place(home, dir)
+    }
 }
 
 /// Is `p` somewhere below `home` (not `home` itself)?
@@ -316,7 +347,7 @@ pub fn read_session(file: &Path) -> Option<(String, SessionInfo)> {
         return None;
     }
     let id = file.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
-    let files: Vec<WrittenFile> = files.into_iter().map(|p| WrittenFile { exists: Path::new(&p).exists(), path: p }).collect();
+    let files: Vec<WrittenFile> = files.into_iter().map(|p| WrittenFile { exists: Path::new(&p).exists(), at_risk: is_app_scratch(Path::new(&p)), path: p }).collect();
     let info = SessionInfo {
         session_id: id,
         file: file.display().to_string(),
@@ -364,17 +395,23 @@ pub fn inventory(projects_dir: &Path, home: &Path) -> Inventory {
         if let Some((cwd, info)) = read_session(&file) {
             // Sessions that ran inside a program's own folders (application
             // data, Claude's settings) are not the person's work.
-            if !cwd.is_empty() && system_place(home, Path::new(&cwd)).is_some() {
+            if !cwd.is_empty() && source_system_place(home, Path::new(&cwd)).is_some() {
                 continue;
             }
             all.push((cwd, info));
         }
     }
     let sessions_found = all.len();
-    // Newest first, then keep the cap.
-    all.sort_by(|a, b| b.1.last.cmp(&a.1.last).then_with(|| a.1.session_id.cmp(&b.1.session_id)));
-    let sessions_left_out = sessions_found.saturating_sub(MAX_SESSIONS);
-    all.truncate(MAX_SESSIONS);
+    // Not in order first (the ones to put in order), newest first inside each
+    // half, then keep the cap: no unordered session is left out while an
+    // ordered one is listed.
+    let mut keyed: Vec<(bool, String, SessionInfo)> = all.into_iter().map(|(cwd, info)| (classify(home, Path::new(&cwd)).0, cwd, info)).collect();
+    keyed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.2.last.cmp(&a.2.last)).then_with(|| a.2.session_id.cmp(&b.2.session_id)));
+    let dropped = keyed.split_off(keyed.len().min(MAX_SESSIONS));
+    let sessions_left_out = dropped.len();
+    let sessions_left_out_ordered = dropped.iter().filter(|d| d.0).count();
+    let sessions_left_out_unordered = sessions_left_out - sessions_left_out_ordered;
+    let all: Vec<(String, SessionInfo)> = keyed.into_iter().map(|(_, cwd, info)| (cwd, info)).collect();
 
     let mut by_folder: BTreeMap<String, FolderInfo> = BTreeMap::new();
     let mut loose: Vec<WrittenFile> = Vec::new();
@@ -393,16 +430,16 @@ pub fn inventory(projects_dir: &Path, home: &Path) -> Inventory {
         let entry = by_folder.entry(key).or_insert_with(|| {
             let dir = Path::new(&cwd);
             let (ordered, why) = classify(home, dir);
-            FolderInfo { folder: cwd.clone(), folder_exists: dir.is_dir(), ordered, why_not_ordered: why, sessions: Vec::new() }
+            FolderInfo { folder: cwd.clone(), folder_exists: dir.is_dir(), ordered, why_not_ordered: why, without_folder: is_app_scratch(dir), sessions: Vec::new() }
         });
         entry.sessions.push(info);
     }
     let mut folders: Vec<FolderInfo> = by_folder.into_values().collect();
     // Not in order first; inside each half, the busiest folder first.
-    folders.sort_by(|a, b| a.ordered.cmp(&b.ordered).then(b.sessions.len().cmp(&a.sessions.len())).then(a.folder.cmp(&b.folder)));
+    folders.sort_by(|a, b| b.without_folder.cmp(&a.without_folder).then(a.ordered.cmp(&b.ordered)).then(b.sessions.len().cmp(&a.sessions.len())).then(a.folder.cmp(&b.folder)));
     let loose_files_left_out = loose.len().saturating_sub(MAX_FILES);
     loose.truncate(MAX_FILES);
-    Inventory { sessions_found, sessions_left_out, folders, loose_files: loose, loose_files_left_out }
+    Inventory { sessions_found, sessions_left_out, sessions_left_out_unordered, sessions_left_out_ordered, folders, loose_files: loose, loose_files_left_out }
 }
 
 /// A folder is in order when it is a git repository or already a THOR project
@@ -410,6 +447,9 @@ pub fn inventory(projects_dir: &Path, home: &Path) -> Inventory {
 fn classify(home: &Path, dir: &Path) -> (bool, Option<String>) {
     if dir.as_os_str().is_empty() {
         return (false, Some("no folder recorded".to_string()));
+    }
+    if is_app_scratch(dir) {
+        return (false, Some("no folder".to_string()));
     }
     if let Some(w) = broad_place(home, dir) {
         return (false, Some(w));
@@ -425,10 +465,12 @@ pub fn render_text(inv: &Inventory) -> String {
     let not_ordered = inv.folders.iter().filter(|f| !f.ordered).count();
     out.push_str("Earlier Claude Code sessions on this computer (read-only look, nothing was changed)\n");
     out.push_str(&format!(
-        "Sessions with something typed by the person: {}, listed: {} ({} left out). Folders: {} ({} not in order yet).\n",
+        "Sessions with something typed by the person: {}, listed: {} ({} left out: {} not in order, {} in order). Folders: {} ({} not in order yet).\n",
         inv.sessions_found,
         inv.sessions_found - inv.sessions_left_out,
         inv.sessions_left_out,
+        inv.sessions_left_out_unordered,
+        inv.sessions_left_out_ordered,
         inv.folders.len(),
         not_ordered
     ));
@@ -436,7 +478,29 @@ pub fn render_text(inv: &Inventory) -> String {
         out.push_str("Nothing to order: no earlier sessions found.\n");
         return out;
     }
-    for f in &inv.folders {
+    let file_line = |w: &WrittenFile| {
+        format!("{}{} {}", if w.exists { "exists" } else { "gone  " }, if w.at_risk { " AT RISK" } else { "" }, w.path)
+    };
+    if inv.folders.iter().any(|f| f.without_folder) {
+        out.push_str("\nCONVERSATIONS WITHOUT A FOLDER (the Claude desktop app runs these in a temporary scratch workspace it may clean up; files marked AT RISK sit there, so propose them first)\n");
+        for f in inv.folders.iter().filter(|f| f.without_folder) {
+            for s in &f.sessions {
+                out.push_str(&format!("  session {}  {} .. {}  {} prompt(s)  [workspace {}]\n", s.session_id, s.first, s.last, s.prompts, f.folder));
+                out.push_str(&format!("    first prompt: {}\n", s.first_prompt));
+                out.push_str(&format!("    transcript: {}\n", s.file));
+                if !s.files.is_empty() {
+                    out.push_str("    wrote:\n");
+                    for w in &s.files {
+                        out.push_str(&format!("      {}\n", file_line(w)));
+                    }
+                    if s.files_left_out > 0 {
+                        out.push_str(&format!("      ... and {} more file(s) left out\n", s.files_left_out));
+                    }
+                }
+            }
+        }
+    }
+    for f in inv.folders.iter().filter(|f| !f.without_folder) {
         let state = match (&f.why_not_ordered, f.folder_exists) {
             (None, true) => "in order (a git repository or a THOR project)".to_string(),
             (None, false) => "in order, but the folder is gone".to_string(),
@@ -451,7 +515,7 @@ pub fn render_text(inv: &Inventory) -> String {
             if !s.files.is_empty() {
                 out.push_str("    wrote:\n");
                 for w in &s.files {
-                    out.push_str(&format!("      {} {}\n", if w.exists { "exists" } else { "gone  " }, w.path));
+                    out.push_str(&format!("      {}\n", file_line(w)));
                 }
                 if s.files_left_out > 0 {
                     out.push_str(&format!("      ... and {} more file(s) left out\n", s.files_left_out));
@@ -462,7 +526,7 @@ pub fn render_text(inv: &Inventory) -> String {
     if !inv.loose_files.is_empty() {
         out.push_str("\nLOOSE FILES that sessions wrote straight into the home folder, Desktop, Documents or Downloads\n");
         for w in &inv.loose_files {
-            out.push_str(&format!("  {} {}\n", if w.exists { "exists" } else { "gone  " }, w.path));
+            out.push_str(&format!("  {}\n", file_line(w)));
         }
         if inv.loose_files_left_out > 0 {
             out.push_str(&format!("  ... and {} more left out\n", inv.loose_files_left_out));
