@@ -103,12 +103,18 @@ fn the_welcome_is_short_plain_and_carries_every_point() {
         "\"Remember that the contractor is called Jan and comes on Tuesdays.\"",
         "\"What do you know about the kitchen?\"",
         "\"That is no longer right: the tiles now come from another shop.\"",
-        "1. Shall I make a safety copy of your memory on this computer every day? (yes or no)",
-        "2. I talk to you in <language>. Is that right? (yes, or name another language)",
+        "Three short questions. Answer with yes or no per number, for example \"1 yes, 2 yes, 3 yes\":",
+        "1. Shall I make a safety copy of your memory on this computer every day?",
+        "2. I talk to you in <language>. Is that right? (If not, say which language.)",
+        "3. I keep everything for this work in the folder <folder>, and we work from there. Is that right? (If not, name another folder, or say \"figure it out yourself\".)",
         "\"what is switched on?\"",
     ] {
         assert!(w.contains(must), "the welcome lacks '{must}':\n{w}");
     }
+    let numbered: Vec<&str> = w.lines().filter(|l| l.len() > 3 && l.as_bytes()[0].is_ascii_digit() && l[1..].starts_with(". ")).collect();
+    assert_eq!(numbered.len(), 3, "exactly three numbered questions:
+{w}");
+    assert!(w.contains("1 yes, 2 yes, 3 yes"), "the yes/no answer example is there");
     let lowered = w.to_lowercase();
     for banned in ["git", "hook", "plan", "helper", "weekly", "changelog", "index", "repository", "commit"] {
         assert!(!lowered.contains(banned), "the welcome mentions '{banned}':\n{w}");
@@ -125,7 +131,7 @@ fn the_welcome_is_short_plain_and_carries_every_point() {
 #[test]
 fn the_welcome_is_not_held_by_the_reply_rules() {
     let rulebook = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../guard-response-rulebook.example.json")).unwrap();
-    let reply = questionnaire::render_welcome().replace("<language>", "English");
+    let reply = questionnaire::render_welcome().replace("<language>", "English").replace("<folder>", "C:/Users/x/Documents/Kitchen");
     let verdict = serve::respond::guard_verdict(Some(&rulebook), &reply, "hello", false, None);
     assert!(verdict.block_reason.is_none(), "{:?}", verdict.block_reason);
 }
@@ -152,6 +158,12 @@ fn the_assistant_sets_language_by_itself_asks_two_questions_and_hides_the_techni
         "In a folder that is not a git repository create no CHANGELOG.md and never mention one",
         "ONLY when he asks what is switched on",
         "numbers 1 to 12 are stable",
+        "Question 3 of the welcome",
+        "never the home folder, the Documents, Desktop or Downloads folder itself, a drive root, or anything under AppData or Program Files",
+        "install --topic --db <store>",
+        "figure it out yourself",
+        "they open Claude Code in that folder",
+        "Never mention git, topic markers, scopes or registration to the person",
     ] {
         assert!(rules.contains(must), "the assistant rules lack '{must}'");
     }

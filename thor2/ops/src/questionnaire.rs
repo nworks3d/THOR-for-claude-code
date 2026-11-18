@@ -244,8 +244,10 @@ FOR THE ASSISTANT (do not read this part out)
 - Apply the defaults NOW, in this same turn, without waiting for an answer, so nothing waits: store the Report 'owner-setup-answers' with them and retract the setup note. Never ask the same question twice and never hold up his work for an answer.
 - Language: set it AUTOMATICALLY, in this same turn, to the language he writes in: when it is nl, en, de, fr or es run install --set-language <code> --db <store> (for any other language set nothing). Put that language in question 2 of the welcome. When he answers 'no, X': if X is one of the five run install --set-language <code of X> --db <store> and say in one sentence that it is switched; otherwise say plainly that it cannot be checked but that you will still write in it. Then revise 'owner-setup-answers' with the language.
 - Question 1 of the welcome (a daily safety copy): on a yes run install --set-backup local --db <store> and say the result in one plain sentence (it makes a copy on this computer and a first copy at once to prove it works; if it failed, say so and why in plain words, and when git is missing say that the copy needs git). On a no do nothing and do not ask again. Until he says yes nothing is backed up.
+- Question 3 of the welcome (the folder): <folder> is your proposal. Propose the folder this session runs in when it is a specific folder; never the home folder, the Documents, Desktop or Downloads folder itself, a drive root, or anything under AppData or Program Files. Otherwise propose a new folder inside Documents, named after what the person said they work on, or \"My work\" in their language. On a yes: when the folder is not a git repository, create it if needed and run the installer with --topic from inside it (install --topic --db <store>); when it is a git repository it is already a project (run install --db <store> from inside it if it is not registered). Say the result in one plain sentence. On \"figure it out yourself\": choose by the same rule, create and register it the same way, and say in one plain sentence which folder it is. On a no plus a folder: use that folder by the same rule; a home, Documents, Desktop, Downloads or drive root answer gets a subfolder inside it proposed instead, in one sentence. Whenever the folder is not the one this session runs in, tell the person in plain click steps that from now on they open Claude Code in that folder (in the Claude desktop app: when starting a new session, choose that folder), and that this is the only thing they do differently. Never mention git, topic markers, scopes or registration to the person. Revise 'owner-setup-answers' with the folder.
+- The person answers the three questions with yes or no per number (for example \"1 yes, 2 yes, 3 yes\"); a number he leaves out keeps its default (question 1: no copy yet, 2: the language he writes in, 3: your proposal).
 - NEVER ask about the plan and never look it up yourself: the installer already read it from Claude Code's settings, and THE TWO CALLS below carry it. Record that word with install --set-plan max|small --db <store> (Pro and any plan below Max count as small, and Max counts as max; a plan the settings did not name is small) and never mention it.
-- NEVER mention in the first reply: the plan, git, hooks, helper agents, the weekly check, the work rules, the record of real calls, bug reports, changelogs or topic folders. They are on the full numbered list and come up only when he asks.
+- NEVER mention in the first reply: the plan, git, hooks, helper agents, the weekly check, the work rules, the record of real calls, bug reports, changelogs, topic markers or scopes. They are on the full numbered list and come up only when he asks.
 - The full numbered list (THE FULL LIST below) is shown ONLY when he asks what is switched on (for example \"what is switched on?\"), never in the first reply. Show him the short list only: the intro, one line per item and the way to answer; never paste the detail per item (the last part of this text) at him. Its numbers 1 to 12 are stable and in order.
 - The detail per item is yours: state an item's Why once, only when he asks about a number (\"why 7\") or refuses it, in one or two plain sentences, then do what he decided. If he asks and has not refused, add how to say no.
 - Anything he does not mention keeps the default. Item 6 (helper agents) is off by default: do nothing for it until he says \"helpers on\", then run install --set-helpers on --db <store> and tell him it is on.
@@ -268,9 +270,10 @@ You do not have to learn anything. Just talk to me as you always do. For example
 - \"Remember that the contractor is called Jan and comes on Tuesdays.\"
 - \"What do you know about the kitchen?\"
 - \"That is no longer right: the tiles now come from another shop.\"
-Everything is already set up for you. Two short questions, answer only if you want to:
-1. Shall I make a safety copy of your memory on this computer every day? (yes or no)
-2. I talk to you in <language>. Is that right? (yes, or name another language)
+Three short questions. Answer with yes or no per number, for example \"1 yes, 2 yes, 3 yes\":
+1. Shall I make a safety copy of your memory on this computer every day?
+2. I talk to you in <language>. Is that right? (If not, say which language.)
+3. I keep everything for this work in the folder <folder>, and we work from there. Is that right? (If not, name another folder, or say \"figure it out yourself\".)
 Want to see everything that is switched on? Ask me: \"what is switched on?\"";
 
 /// The welcome, as the assistant says it in its first reply.
@@ -280,7 +283,7 @@ pub fn render_welcome() -> String {
 
 /// What to say before anything else.
 fn say_first() -> String {
-    format!("SAY FIRST (before anything else, in his own language, warm and plain, every point kept and nothing added; put the language he writes in where <language> stands):\n{}", render_welcome())
+    format!("SAY FIRST (before anything else, in his own language, warm and plain, every point kept and nothing added; put the language he writes in where <language> stands and your proposed folder (see question 3) where <folder> stands):\n{}", render_welcome())
 }
 
 /// Three facts to give in your own words, without a question.
