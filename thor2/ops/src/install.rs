@@ -2466,7 +2466,10 @@ mod tests {
         let path = dir.path().join("settings.json");
         let new_exe = dir.path().join("serve.exe");
         fs::write(&new_exe, b"x").unwrap();
-        install_hooks_as(&path, &standard_hooks("C:\\gone\\serve.exe", "C:\\fake\\thor.db"), true).unwrap();
+        // Built from the temp folder, not written as "C:\\...": on Linux a
+        // backslash is no separator, so the program name would not be found.
+        let gone = dir.path().join("gone").join("serve.exe");
+        install_hooks_as(&path, &standard_hooks(&gone.display().to_string(), "C:\\fake\\thor.db"), true).unwrap();
         let moved = standard_hooks(&new_exe.display().to_string(), "C:\\fake\\thor.db");
         let report = install_hooks_as(&path, &moved, true).unwrap();
         assert!(report.results.iter().all(|(_, o)| *o == HookOutcome::Replaced), "{:?}", report.results);
