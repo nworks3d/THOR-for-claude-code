@@ -1,4 +1,5 @@
-# Install THOR on Windows, in one command. Open PowerShell and paste:
+# Install THOR on Windows, in one command. The assistant runs it in PowerShell
+# (the person types and pastes nothing):
 #
 #   irm https://raw.githubusercontent.com/nworks3d/THOR-for-claude-code/main/install.ps1 | iex
 #
@@ -9,7 +10,7 @@
 # Two files of yours are touched by that last step, and both are backed up to
 # <name>.bak first: Claude Code's settings.json (the hooks) and .claude.json
 # (the memory server). Set $env:THOR_NO_SETUP = "1" beforehand to unpack only
-# and run the setup yourself later.
+# and run the setup afterwards.
 #
 # SECOND MACHINE: to get a read-only copy of another machine's memory instead
 # of a memory of its own, set $env:THOR_COPY_FROM (the backup), and optionally
@@ -19,8 +20,8 @@
 # The setup program reads them itself; see "Use THOR on a second machine" in
 # README.md.
 #
-# If git or Microsoft's Visual C++ runtime is missing, winget installs it first
-# (Windows may ask permission once). THOR itself needs no administrator rights
+# If git or Microsoft's Visual C++ runtime is missing, winget installs it first,
+# or else the official installer does (Windows may ask permission once). THOR itself needs no administrator rights
 # and is installed only in your own user folder.
 
 $ErrorActionPreference = 'Stop'
@@ -43,9 +44,11 @@ if ([Environment]::Is64BitOperatingSystem -ne $true) {
     throw "Only 64-bit Windows is published. Build from source for anything else."
 }
 
-# Programs THOR needs are installed here first, by winget, in this console (no
-# new window). Windows may ask permission once per program - that click is the
-# only part nobody else can do.
+# Programs THOR needs are installed here first, in this console (no new
+# window), by winget, and when winget is missing or does not finish, by the
+# program's own official installer, downloaded and run silently by this script.
+# Nobody is ever asked to download, paste or run anything. Windows may ask
+# permission once per program: clicking Yes is the only part nobody else can do.
 function Test-Winget {
     return [bool](Get-Command winget -ErrorAction SilentlyContinue)
 }
@@ -63,9 +66,60 @@ function Install-WithWinget([string]$id) {
     return ($LASTEXITCODE -eq 0)
 }
 
+# Download an official installer into a new empty temp folder, run it only if
+# its digital signature is valid, wait for it, and delete the folder again.
+# Returns $true when it ran and exited with 0 or 3010 (restart pending).
+function Install-FromDownload([string]$url, [string]$fileName, [string[]]$installerArgs, [string]$what) {
+    $folder = Join-Path ([System.IO.Path]::GetTempPath()) ("thor-dl-" + [System.Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $folder | Out-Null
+    try {
+        $file = Join-Path $folder $fileName
+        try {
+            Invoke-WebRequest -Uri $url -OutFile $file -UseBasicParsing
+        } catch {
+            Write-Host "The $what installer could not be downloaded: $($_.Exception.Message)"
+            return $false
+        }
+        $signature = Get-AuthenticodeSignature -FilePath $file
+        if ($signature.Status -ne 'Valid') {
+            Write-Host "The downloaded $what installer was NOT run because its digital signature is not valid ($($signature.Status))."
+            return $false
+        }
+        $process = Start-Process -FilePath $file -ArgumentList $installerArgs -Wait -PassThru -WindowStyle Hidden
+        return (($process.ExitCode -eq 0) -or ($process.ExitCode -eq 3010))
+    } catch {
+        Write-Host "The $what installer could not be run: $($_.Exception.Message)"
+        return $false
+    } finally {
+        Remove-Item -Path $folder -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Install-GitFromDownload {
+    try {
+        $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/git-for-windows/git/releases/latest' -UseBasicParsing -Headers @{ 'User-Agent' = 'thor-install' }
+    } catch {
+        Write-Host "The latest Git for Windows release could not be looked up: $($_.Exception.Message)"
+        return $false
+    }
+    $assets = @($release.assets | Where-Object { $_.name -match '^Git-[0-9.]+-64-bit\.exe$' })
+    if ($assets.Count -eq 0) {
+        Write-Host "The latest Git for Windows release has no 64-bit installer."
+        return $false
+    }
+    return (Install-FromDownload $assets[0].browser_download_url $assets[0].name @('/VERYSILENT', '/NORESTART', '/NOCANCEL', '/SP-', '/SUPPRESSMSGBOXES') 'Git for Windows')
+}
+
+function Install-RuntimeFromDownload {
+    return (Install-FromDownload 'https://aka.ms/vs/17/release/vc_redist.x64.exe' 'vc_redist.x64.exe' @('/install', '/quiet', '/norestart') "Microsoft Visual C++ runtime")
+}
+
 function Test-Git {
     return [bool](Get-Command git -ErrorAction SilentlyContinue)
 }
+
+# Windows PowerShell 5.1 does not use a modern secure protocol by default.
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
 
 # git: THOR reads a project's code with it, and Claude Code runs its hooks
 # through Git Bash. THOR's own hooks work without it, so a failure here is
@@ -76,10 +130,15 @@ if (-not (Test-Git)) {
         [void](Install-WithWinget 'Git.Git')
         Update-SessionPath
     }
+    if (-not (Test-Git)) {
+        Write-Host "Installing git with its own installer instead."
+        [void](Install-GitFromDownload)
+        Update-SessionPath
+    }
     if (Test-Git) {
         Write-Host "git is installed."
     } else {
-        Write-Host "git could not be installed here (winget is missing or the install did not finish). Carrying on without it: THOR works, but it cannot read a project's code until git is installed from https://git-scm.com/download/win."
+        Write-Host "git could not be installed on this computer (winget and the official installer both failed). Carrying on without it: THOR works, but it cannot read a project's code until git can be installed."
     }
 }
 
@@ -97,9 +156,13 @@ if ($missing.Count -gt 0) {
     }
     $missing = @($runtimeFiles | Where-Object { -not (Test-Path (Join-Path $system $_)) })
     if ($missing.Count -gt 0) {
-        throw ("The Microsoft Visual C++ runtime is missing ($($missing -join ', ')) and could not be installed here, " +
-            "so THOR's programs would not start. Nothing was installed. Install it from " +
-            "https://aka.ms/vs/17/release/vc_redist.x64.exe, then run this script again.")
+        Write-Host "Installing the runtime with its own installer instead."
+        [void](Install-RuntimeFromDownload)
+        $missing = @($runtimeFiles | Where-Object { -not (Test-Path (Join-Path $system $_)) })
+    }
+    if ($missing.Count -gt 0) {
+        throw ("The Microsoft Visual C++ runtime ($($missing -join ', ')) could not be installed on this computer " +
+            "(winget and the official installer both failed), so THOR's programs would not start. Nothing was installed.")
     }
     Write-Host "The Visual C++ runtime is installed."
 }
@@ -116,7 +179,7 @@ try {
         Invoke-WebRequest -Uri "$base/$asset" -OutFile $zip
         Invoke-WebRequest -Uri "$base/$asset.sha256" -OutFile $sha
     } catch {
-        throw "Download failed: $($_.Exception.Message). You can also grab the file by hand from https://github.com/$repo/releases/latest"
+        throw "THOR could not be downloaded: $($_.Exception.Message). Nothing was installed."
     }
 
     # The checksum file is "<hash>  <filename>", so only the first field counts.
@@ -144,7 +207,7 @@ try {
 
     if ($env:THOR_NO_SETUP -eq '1') {
         Write-Host ""
-        Write-Host "Skipped the setup because THOR_NO_SETUP is 1. Run it yourself with:"
+        Write-Host "Skipped the setup because THOR_NO_SETUP is 1. The setup program is:"
         Write-Host "  & '$dest\install.exe'"
         return
     }
