@@ -612,7 +612,7 @@ fn set_backup_only(db: Option<PathBuf>, settings: Option<PathBuf>, word: &str) -
         };
     }
     let Some(backup_exe) = sibling("backup").filter(|p| p.exists()) else {
-        eprintln!("NOTHING WAS CHANGED: the backup program (backup) is missing next to the installer. THOR is several small programs that must stay together in one folder: unpack the whole download there and run this again.");
+        eprintln!("NOTHING WAS CHANGED: the backup program (backup) is missing next to the installer. THOR is several small programs that must stay together in one folder: the assistant runs the install command again, which downloads and unpacks the whole set into one folder, then runs this again.");
         return ExitCode::FAILURE;
     };
     let repo = default_repo(&db);
@@ -635,7 +635,7 @@ fn set_backup_only(db: Option<PathBuf>, settings: Option<PathBuf>, word: &str) -
         }
     }
     if !ops::githooks::git_available() {
-        eprintln!("NOTHING WAS CHANGED: git is not installed on this computer, and the backup is a git folder. Install git first, then run this again.");
+        eprintln!("NOTHING WAS CHANGED: git is not installed on this computer, and the backup is a git folder. The install command installs git by itself: the assistant runs it again, then runs this again.");
         return ExitCode::FAILURE;
     }
     let place = match &choice {
@@ -1218,8 +1218,8 @@ fn main() -> ExitCode {
     if !serve_exe.exists() {
         eprintln!(
             "NOTHING WAS SET UP: the file {} is missing, and THOR cannot work without it. THOR is several small \
-             programs that must stay together in ONE folder: unpack the whole download there (do not copy install \
-             on its own), then run install from that folder again. (For developers: build with `cargo build \
+             programs that must stay together in ONE folder: the assistant runs the install command again, which \
+             downloads and unpacks the whole set into one folder (install is never copied on its own). (For developers: build with `cargo build \
              --release --features semantic` in thor2, or name the real file with --serve-exe.)",
             serve_exe.display()
         );
@@ -1629,7 +1629,7 @@ fn main() -> ExitCode {
         None => {
             let installer = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "install".to_string());
             println!("- no topic set up in this folder. That is fine: THOR already works everywhere.");
-            println!("  To give one folder (one subject, like 'Kitchen renovation') its own memory, open that folder and run:  \"{installer}\" --topic");
+            println!("  To give one folder (one subject, like 'Kitchen renovation') its own memory, the assistant runs this inside that folder:  \"{installer}\" --topic");
         }
     }
 

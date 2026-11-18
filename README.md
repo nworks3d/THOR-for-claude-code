@@ -502,62 +502,69 @@ download, no paths to type, no Rust to install, no questions to answer - the
 first conversation after the restart finishes the setup on its own, with
 defaults you can change just by saying so.
 
-That first conversation also shows you a numbered list of everything the install
-arranged, one line each. Everything on it is already on, except two things that
-stay off until you choose: helper-agent mode (your main assistant judges while
-cheaper models do the work in helpers; `install --set-helpers on` switches it
-on) and backups (nothing is backed up until you pick `local` or a place). The
-changelog item creates a `CHANGELOG.md` in your project only if it has none and
-you do not say no. Answer by number ("1 yes, 3 no, 10 local"), or say
-"defaults"; anything you do not mention keeps its default.
+That first conversation is a short welcome, not a list of settings. It says THOR
+is set up and remembers what you tell it, gives three examples of what to say,
+and asks three short questions, each answered with yes or no per number ("1 yes,
+2 yes, 3 yes"): a daily safety copy of your memory on your computer, the language
+it talks to you in, and the folder where everything for this work is kept and
+where you work from (or "figure it out yourself"). Everything else is already on
+with sensible defaults. To see all of it, ask: *"what is switched on?"* - you get
+a numbered list in plain words, and anything you do not mention keeps its
+default.
 
-### The easy way: five steps, no programming tools
+### The easy way: four steps, nothing to type
 
 You need Claude Code, installed and opened at least once. Nothing else to
-prepare: no account, no key. The paste-one-line route below needs neither git nor
-Python. When you let your assistant install THOR instead, it checks your computer
-for git (needed for code projects) and Python (the helper scripts an assistant writes for you commonly use it), installs what is missing through your
-system's package manager, and asks you for at most one permission click.
+prepare: no account, no key, no terminal, no git, no Python. Your assistant does
+the installing; if your computer is missing git or Microsoft's "Visual C++
+Redistributable" it installs them itself first.
 
-1. **Open a terminal.** On Windows press the Windows key, type `PowerShell`
-   and press Enter. On Linux open your Terminal.
-2. **Paste ONE line and press Enter.** It downloads the latest release from this
-   project's GitHub page, checks the download against the checksum published next
-   to it, unpacks it into a `thor2` folder in your home folder, and sets
-   everything up. It prints what it did, in plain words. It needs no
-   administrator rights and installs nothing outside your own user folder.
-
-   Windows, in PowerShell:
-
-   ```powershell
-   irm https://raw.githubusercontent.com/nworks3d/THOR-for-claude-code/main/install.ps1 | iex
-   ```
-
-   Linux:
-
-   ```sh
-   curl -fsSL https://raw.githubusercontent.com/nworks3d/THOR-for-claude-code/main/install.sh | sh
-   ```
-
-   (On Windows this line first installs what THOR needs and your computer is
-   missing: git, and Microsoft's "Visual C++ Redistributable". Windows may ask
-   permission once for each; click Yes. Pasting the line again is always safe.)
-3. **Close Claude Code completely and open it again.** Claude Code only learns
-   about THOR when it starts, so until you do this nothing is active.
-4. **Make a folder for your topic, and open Claude Code in it.** For example a
-   folder called `Kitchen renovation` in your Documents, with your notes, quotes
-   and PDFs inside. It does not have to be a programming project. Then tell your
-   assistant: *"Give this folder its own THOR memory, as a topic."*
-5. **Just work.** Tell your assistant things once ("the tiles come from
+1. **Tell your assistant: "Install THOR"** and give it the link to this page.
+   It reads [AGENTS.md](AGENTS.md), runs everything, and checks that it worked.
+   Windows may show one permission window while it installs a missing program:
+   click **Yes**. That is the only click that is not in Claude Code itself.
+2. **Close Claude Code completely and open it again.** Claude Code only learns
+   about THOR when it starts, so until you do this nothing is active. In the
+   Claude desktop app, quit it from its menu and open it again.
+3. **Answer the three short questions** in your assistant's first message, each
+   with yes or no per number ("1 yes, 2 yes, 3 yes"). One of them is the folder
+   where everything for this work is kept; if your assistant proposes a new
+   folder, from now on you open Claude Code in that folder (in the Claude desktop
+   app, choose that folder when you start a new session). That is the only thing
+   you do differently.
+4. **Just work.** Tell your assistant things once ("the tiles come from
    Tilehouse", "we chose the oak worktop") and in any later conversation in that
-   folder it already knows. Each topic folder has its own memory, so nothing from
-   one topic leaks into another. To check that all is well, ask your assistant:
+   folder it already knows. Each folder has its own memory, so nothing from one
+   topic leaks into another. To check that all is well, ask your assistant:
    *"Is THOR working?"* The first lines of its answer are a plain summary.
 
+What your assistant runs for step 1, so you can read it first: it downloads the
+latest release from this project's GitHub page, checks the download against the
+checksum published next to it, unpacks it into a `thor2` folder in your home
+folder, and sets everything up, printing what it did in plain words. It needs
+no administrator rights and installs nothing outside your own user folder
+(apart from git and the C++ runtime when they are missing). Windows, in
+PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/nworks3d/THOR-for-claude-code/main/install.ps1 | iex
+```
+
+Linux:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/nworks3d/THOR-for-claude-code/main/install.sh | sh
+```
+
+On Windows that script installs what is missing - git, and Microsoft's "Visual
+C++ Redistributable" - with the system's package manager (winget), or, when
+that is not there or does not finish, with the program's own official installer
+that it downloads and runs silently, after checking its digital signature.
+Running it again is always safe.
+
 The setup touches two of Claude Code's own files - its settings and the list of
-tools it may use - and backs up both before it does. Rather read the script
-before you run it? Open `install.ps1` or `install.sh` from this repository in a
-browser first. There is no macOS build yet, so on a Mac take the route below.
+tools it may use - and backs up both before it does. There is no macOS build yet,
+so on a Mac your assistant takes the route below.
 Using a different assistant? See
 [Using it from another assistant](#using-it-from-another-assistant) below.
 
@@ -575,8 +582,8 @@ program is gone. To get it back, step by step:
 2. Choose **Virus & threat protection**, then **Protection history**.
 3. Look for an entry that names the THOR file, open it, and choose
    **Actions > Restore**.
-4. No such entry? Run THOR's install again (the same command as in the easy way
-   above): it puts the programs back.
+4. No such entry? Tell your assistant, which runs THOR's install again (the
+   same command as in the easy way above): it puts the programs back.
 
 If it keeps happening, your assistant may **offer** to add a Windows Defender
 exclusion for THOR's program folder. It only does so after you say yes. What
@@ -836,9 +843,9 @@ part is the one thing THOR cannot do for you.
      If it asks for a user name and password, enter them and tick "Remember my
      credentials". If the folder opens and you can see a folder called `thor2`
      in it (or the backup's own repository files), you are done.
-   - A private repository on a website: on the laptop, open a terminal and run
-     `git ls-remote "<the address>" HEAD`. If it prints a line starting with a
-     long code, you are done. If it asks you to sign in, sign in. If it says
+   - A private repository on a website: your assistant on the laptop checks it
+     itself (it runs `git ls-remote "<the address>" HEAD`; a line starting with a
+     long code means it works). If the website asks you to sign in, sign in. If it says
      "not found" or "access denied", the laptop's account has no access yet:
      add it on the website (Settings, then Collaborators), or ask whoever
      manages that repository.
@@ -851,10 +858,9 @@ part is the one thing THOR cannot do for you.
 
 ### The one command
 
-Open a terminal **inside your project's folder** on the laptop (on Windows:
-open the folder in File Explorer, click the address bar, type `powershell` and
-press Enter). Then paste ONE of these, after replacing the three parts in
-capitals. `YOUR-PROJECT` is the project's name exactly as the main computer
+Tell your assistant on the laptop, in your project's folder, that you want a
+copy: it asks you only for the backup's address and the project's name, and then
+runs ONE of these itself, with the three parts in capitals filled in. `YOUR-PROJECT` is the project's name exactly as the main computer
 knows it (the name of its folder, unless you changed it).
 
 Windows, in PowerShell:
@@ -902,9 +908,9 @@ holds every project's notes, anything personal you wrote as a note is in it, so
 it does not belong on a work or company laptop (use the project choice above
 there).
 
-You do not need to name a project. Open any terminal on the laptop (on Windows:
-press the Windows key, type `powershell`, press Enter), replace
-`THE-BACKUP-ADDRESS` as above, and paste ONE of these:
+You do not need to name a project. Tell your assistant on the laptop that you
+want the whole memory; it fills in `THE-BACKUP-ADDRESS` as above and runs ONE of
+these itself:
 
 Windows, in PowerShell:
 
@@ -988,7 +994,7 @@ The command either finishes or says plainly that nothing was set up and why:
    conversation). The first session start says: *"This machine runs a copy of
    the memory ... It holds only: project acme-shop, general rules (no project).
    Notes of other projects are not on this machine on purpose."*
-2. **Check it.** Ask your assistant "Is THOR working?", or run this yourself
+2. **Check it.** Ask your assistant "Is THOR working?"; it runs the check itself
    (Windows: `& "$HOME\thor2\doctor.exe" --db "$env:LOCALAPPDATA\thor2\thor.db"`,
    Linux: `~/.thor2/doctor --db ~/.local/share/thor2/thor.db`). The short summary
    at the top says, among other lines: `OK: this is a copy, selection: project

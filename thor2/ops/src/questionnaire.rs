@@ -139,11 +139,11 @@ pub fn questions() -> Vec<Question> {
             n: 4,
             id: "weekly-check",
             title: "The weekly check",
-            line: "Weekly tidy-up: about once a week I tidy THOR's memory for you, and you can ask for it any time by typing /thor-eval. Default: on.".to_string(),
+            line: "Weekly tidy-up: about once a week I tidy THOR's memory for you, and you can ask me for it any time (it is called /thor-eval). Default: on.".to_string(),
             what: "About once a week per project (daily on Max while something is found wrong) THOR asks your assistant to run a short tidy-up of the memory before it finishes a turn: judge the notes that fired, repair stale ones and file a report. The command /thor-eval was added so you can also run it yourself. The ask runs through the connections of item 2, so it only happens while those are on.".to_string(),
             why: "A memory nobody maintains fills with stale notes and quietly stops helping, and a check that depends on someone remembering it does not happen.",
             default: "On, at the rhythm of question 1.",
-            say_no: "I switch the weekly ask off (install --set-weekly-check off); you can still type /thor-eval yourself, and nothing else changes.".to_string(),
+            say_no: "I switch the weekly ask off (install --set-weekly-check off); you can still ask me for it any time (I run /thor-eval), and nothing else changes.".to_string(),
         },
         Question {
             n: 5,

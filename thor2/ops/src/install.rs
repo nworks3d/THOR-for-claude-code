@@ -579,12 +579,12 @@ pub fn launch_problem(serve_exe: &Path) -> Option<String> {
         Err(e) => Some(format!(
             "{} could not be started ({e}). Windows or your antivirus is probably blocking it (Smart App Control and \
              Code Integrity do this to programs they do not know), or the file is damaged. THOR does not change that \
-             setting: allow the program in Windows Security, or build it again, then run this again.",
+             setting: the assistant takes the person through the few clicks in Windows Security that allow the program (or downloads THOR again), then runs this again.",
             serve_exe.display()
         )),
         Ok(out) if !out.status.success() => Some(format!(
-            "{} started but exited with {} when asked for its version, so a hook that calls it would fail too. Build it \
-             again, then run this again.",
+            "{} started but exited with {} when asked for its version, so a hook that calls it would fail too. The assistant \
+             downloads THOR again (the install command does it), then runs this again.",
             serve_exe.display(),
             out.status
         )),
@@ -1952,13 +1952,13 @@ impl std::fmt::Display for RegisterRefusal {
         match self {
             RegisterRefusal::NotACheckout { cwd } => write!(
                 f,
-                "REFUSED: {cwd} is not set up as a topic folder yet. Open a terminal INSIDE the folder for your topic \
-                 and run the installer there with --topic added (no git or code needed). Nothing was changed."
+                "REFUSED: {cwd} is not set up as a topic folder yet. The assistant runs the installer from INSIDE the folder for the topic \
+                 with --topic added (no git or code needed). Nothing was changed."
             ),
             RegisterRefusal::TooBroad { cwd } => write!(
                 f,
                 "REFUSED: {cwd} is your whole home folder or a whole drive, which is too broad to be one topic. Make a \
-                 folder for just one subject (for example 'Kitchen renovation'), open that folder, and run this again \
+                 folder for just one subject (for example 'Kitchen renovation') and the assistant runs this again \
                  from inside it. Nothing was changed."
             ),
             RegisterRefusal::StillACheckout { key, old } => write!(

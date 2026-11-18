@@ -139,7 +139,7 @@ fn git_command(dir: Option<&Path>) -> Command {
 
 /// Run git and return what it printed, or git's own reason for failing.
 fn git(dir: Option<&Path>, args: &[&str]) -> anyhow::Result<String> {
-    let out = git_command(dir).args(args).output().map_err(|e| anyhow::anyhow!("git could not be started ({e}); install git first"))?;
+    let out = git_command(dir).args(args).output().map_err(|e| anyhow::anyhow!("git could not be started ({e}); git is needed, and the install command installs it"))?;
     if !out.status.success() {
         let reason = String::from_utf8_lossy(&out.stderr);
         let reason = reason.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("no reason given");

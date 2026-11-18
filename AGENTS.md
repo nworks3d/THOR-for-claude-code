@@ -184,7 +184,11 @@ from the latest release, verify the `.sha256` beside it, unpack it into
 `%USERPROFILE%\thor2` (Windows) or `~/.thor2` (Linux; `THOR_HOME` changes it) and
 run the archive's `install` program with no arguments. On Windows the script first
 installs git and Microsoft's Visual C++ runtime with `winget` when they are missing
-(Windows may ask permission once for each; nobody types anything). If git cannot be
+(Windows may ask permission once for each; nobody types anything), and when winget
+is missing or does not finish it downloads the official installer itself, runs it
+silently only if its digital signature is valid, and checks again. NEVER hand the
+person a download link or a command when an install fails: say in one plain
+sentence what could not be installed and why, and carry on. If git cannot be
 installed the script says so and carries on, because THOR's hooks work without it;
 if the runtime cannot be installed it stops and says why, since the programs could
 not start. THOR itself needs no administrator rights. On Windows the installer
@@ -849,7 +853,7 @@ Nothing here waits for you: ask me about any number and I explain it, say no to 
 1. Your Claude plan: I noticed which Claude subscription you have (as Claude's settings say), so THOR's weekly self-check does not use up your usage allowance. Default: taken from Claude's settings.
 2. Link to Claude: THOR is linked into Claude Code (the program you talk to me in) at four moments - when a conversation starts, before I use a tool, when you send a message and when I finish a reply - so the memory speaks up by itself. Default: on.
 3. Code tracking: for software projects kept with git, THOR keeps its map of your code current and stops video files or files over 25 MB being saved into a project by mistake. Default: on.
-4. Weekly tidy-up: about once a week I tidy THOR's memory for you, and you can ask for it any time by typing /thor-eval. Default: on.
+4. Weekly tidy-up: about once a week I tidy THOR's memory for you, and you can ask me for it any time (it is called /thor-eval). Default: on.
 5. Work habits: 14 good working habits are stored as notes I follow, such as running the tests before I say something is done and never saving a password where others can see it. They only remind me; none blocks normal work. Default: all on.
 6. Helper assistants: I can hand big jobs to cheaper helper assistants working in the background, which can cost less and keeps our chat free. Default: off.
 7. Reporting faults: if THOR finds a fault in itself I may offer to report it to its makers, and I show you the exact text first; nothing is sent without your yes. Default: on.
@@ -885,7 +889,7 @@ DETAIL PER ITEM (for the assistant: state an item's Why once, only when he asks 
    What it is: About once a week per project (daily on Max while something is found wrong) THOR asks your assistant to run a short tidy-up of the memory before it finishes a turn: judge the notes that fired, repair stale ones and file a report. The command /thor-eval was added so you can also run it yourself. The ask runs through the connections of item 2, so it only happens while those are on.
    Why it exists: A memory nobody maintains fills with stale notes and quietly stops helping, and a check that depends on someone remembering it does not happen.
    What I chose: On, at the rhythm of question 1.
-   To say no: I switch the weekly ask off (install --set-weekly-check off); you can still type /thor-eval yourself, and nothing else changes.
+   To say no: I switch the weekly ask off (install --set-weekly-check off); you can still ask me for it any time (I run /thor-eval), and nothing else changes.
 
 5. The starter work rules
    What it is: A set of 14 general work habits, stored as notes that arrive right before the step they are about, once per session: changelog with every user visible change; run the tests before saying done; never commit a secret; commit push deploy only when asked; commit hygiene; check where you push and what is on main; scan before it goes public; rehearse destructive steps on a copy; pin a dependency with its reason; absolute paths not the shell working directory; script file not shell quoting; keep only what is needed; windowless processes on windows; scheduled task not interactive. 21 more notes teach your assistant how to write notes that come back and how to work with THOR. None of them blocks a normal step; on Windows two of them, about hidden console windows, refuse the one call that would flash a window.

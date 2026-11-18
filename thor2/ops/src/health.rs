@@ -140,16 +140,16 @@ pub fn plain_summary(db: &Path, cwd: &Path, settings: Option<&Path>, mcp_json: O
             } else if copy_summary.is_some() {
                 // A copy cannot record where this machine keeps the project (it has one writer).
                 lines.push(format!(
-                    "  NOTE: this folder is called '{key}'. Notes about the project are in this copy, but the main machine does not know yet where this machine keeps the folder, so file checks (rules that look at a file) cannot be tried here. Optional next step: open a terminal inside the folder and run THOR's install with --register-root --per-machine added; it prints one line to run on the main machine."
+                    "  NOTE: this folder is called '{key}'. Notes about the project are in this copy, but the main machine does not know yet where this machine keeps the folder, so file checks (rules that look at a file) cannot be tried here. Optional next step: ask your assistant to run THOR's install inside the folder with --register-root --per-machine added; it prints one line to run on the main machine."
                 ));
             } else {
                 lines.push(format!(
-                    "  NOTE: this folder is called '{key}' but is not set up yet. Next step: open a terminal inside it and run THOR's install with --topic added."
+                    "  NOTE: this folder is called '{key}' but is not set up yet. Next step: ask your assistant to give it its own memory (it runs THOR's install inside the folder with --topic added)."
                 ));
             }
         }
         None => lines.push(
-            "  NOTE: this folder has no memory of its own, so what you tell your assistant here is shared with every other folder. To give one subject its own memory, open that folder and run THOR's install with --topic added."
+            "  NOTE: this folder has no memory of its own, so what you tell your assistant here is shared with every other folder. To give one subject its own memory, ask your assistant to do it (it runs THOR's install inside that folder with --topic added)."
                 .to_string(),
         ),
     }
@@ -580,7 +580,7 @@ pub fn hook_failures_words(faults: &[serve::hook_faults::Scanned], blocks: &[i64
     let mut out = String::new();
     if !parts.is_empty() {
         out = format!(
-            "{}. THOR cannot change Windows security settings: allow the program there (or in your antivirus), then restart Claude.",
+            "{}. THOR cannot change Windows security settings itself. Your assistant can take you through the few clicks in Windows Security (or your antivirus) that allow the program; after that the person has to restart Claude Code once.",
             parts.join("; ")
         );
     }
