@@ -22,8 +22,8 @@ use ops::githooks;
 use ops::install::{
     check_registration, check_registration_at, default_data_dir, default_eval_command_path, default_settings_path,
     default_user_mcp_path, ensure_store, install_hooks, install_tool_server, record_project_opened,
-    record_topic_opened, register_command_for, register_root_for, register_root_remote, seed_eval_command, seed_response_rulebook,
-    seed_working_contract_at, standard_hooks, topic_folder_name, write_project_marker, EvalCommandOutcome, HookOutcome, HookSpec,
+    record_topic_opened, register_command_for, topic_of, register_root_for, register_root_remote, seed_eval_command, seed_response_rulebook,
+    seed_working_contract_at, standard_hooks, write_project_marker, EvalCommandOutcome, HookOutcome, HookSpec,
     MarkerOutcome, RegisterOutcome, RegisterRefusal, RulebookOutcome, ServerOutcome, StoreOutcome,
 };
 use std::path::PathBuf;
@@ -247,6 +247,34 @@ struct Cli {
         conflicts_with_all = ["project", "settings", "mcp_json", "no_mcp", "serve_exe", "mcp_exe", "code_index_root", "register_root", "set_mode", "set_plan", "set_weekly_check", "set_backup", "set_recording", "set_helpers", "topic", "copy_from"]
     )]
     set_tools_folder: Option<String>,
+
+    /// Put the person's loose files in order: carry out a plan (--plan) of
+    /// `[{"folder": "<absolute path>", "files": ["<absolute path>", ...]}]`.
+    /// Each folder is made if needed and given its own memory exactly as
+    /// --topic does, and each file is moved into it. Never deletes, never
+    /// overwrites (a taken name becomes "name (2)"), never touches a file
+    /// outside the home folder or inside a git repository, and refuses the
+    /// home folder, Desktop, Documents, Downloads, a drive root and a
+    /// program's own folders. Every move is written to an undo log beside the
+    /// memory. Needs --db.
+    #[arg(
+        long = "tidy",
+        requires = "plan",
+        conflicts_with_all = ["project", "mcp_exe", "no_mcp", "serve_exe", "code_index_root", "register_root", "topic", "copy_from", "set_mode", "set_plan", "set_weekly_check", "set_backup", "set_recording", "set_language", "set_helpers", "set_temp_folder", "set_tools_folder", "uninstall", "tidy_undo"]
+    )]
+    tidy: bool,
+
+    /// With --tidy: the JSON file that holds the plan.
+    #[arg(long = "plan", value_name = "FILE", requires = "tidy")]
+    plan: Option<PathBuf>,
+
+    /// Put the files of the newest tidy-up back where they were (never
+    /// overwriting anything; the folders it made stay). Needs --db.
+    #[arg(
+        long = "tidy-undo",
+        conflicts_with_all = ["project", "mcp_exe", "no_mcp", "serve_exe", "code_index_root", "register_root", "topic", "copy_from", "set_mode", "set_plan", "set_weekly_check", "set_backup", "set_recording", "set_language", "set_helpers", "set_temp_folder", "set_tools_folder", "uninstall"]
+    )]
+    tidy_undo: bool,
 
     /// Take THOR out again, step one (Claude Code may be running): removes only
     /// THOR's own connections from Claude Code's settings, THOR's note-saving
@@ -850,20 +878,6 @@ fn existing_index_file_count(index_root: &Path, key: &str) -> anyhow::Result<usi
     Ok(usize::try_from(files).unwrap_or(0))
 }
 
-/// The topic a plain folder is, or would become: the folder that carries (or
-/// will carry) the `.thor-project` marker, and the key it holds. Run from a
-/// subfolder of an existing topic, it is the topic's own top. A folder with no
-/// marker yet is named after itself, except the home folder and a drive root,
-/// which are far too broad (`ops::install::topic_folder_name`).
-fn topic_of(here: &Path) -> Result<(PathBuf, String), RegisterRefusal> {
-    let dir = serve::project::plain_root(here).unwrap_or_else(|| here.to_path_buf());
-    let key = match serve::project::resolve_project(&dir) {
-        Some(key) => key,
-        None => topic_folder_name(&dir)?,
-    };
-    Ok((dir, key))
-}
-
 /// `install --register-root`: register the checkout this is run from, and
 /// nothing else. Refuses without `--db` before anything is touched (F7): a
 /// registration in the default memory, when the assistant uses another one,
@@ -1018,6 +1032,40 @@ fn print_record_outcome(key: &str, outcome: Result<RegisterOutcome, RegisterRefu
     }
 }
 
+/// `install --tidy --plan <file>` and `install --tidy-undo`: see `ops::tidy`.
+fn tidy_main(cli: &Cli) -> ExitCode {
+    let Some(db) = cli.db.clone().filter(|d| d.is_file()) else {
+        eprintln!("REFUSED: name the memory with --db (an existing thor.db). Nothing was changed.");
+        return ExitCode::FAILURE;
+    };
+    let Some(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).ok().map(PathBuf::from) else {
+        eprintln!("REFUSED: could not find your home folder. Nothing was changed.");
+        return ExitCode::FAILURE;
+    };
+    serve::project::load_known_scopes(&db);
+    let result = if cli.tidy_undo {
+        ops::tidy::undo(&db, &home)
+    } else {
+        let plan = cli.plan.clone().unwrap_or_default();
+        match std::fs::read_to_string(&plan) {
+            Ok(text) => ops::tidy::tidy(&db, &text, &home),
+            Err(e) => Err(format!("cannot read the plan {}: {e}. Nothing was changed.", plan.display())),
+        }
+    };
+    match result {
+        Ok(lines) => {
+            for l in lines {
+                println!("{l}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// `install --uninstall [--finish [--delete-memory]]`: see `ops::uninstall`.
 fn uninstall_main(cli: &Cli) -> ExitCode {
     let Some(db) = cli.db.clone().or_else(|| default_data_dir().map(|d| thor_core::app_data::resolve(&d.join("thor.db")))) else {
@@ -1065,6 +1113,9 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     if cli.uninstall {
         return uninstall_main(&cli);
+    }
+    if cli.tidy || cli.tidy_undo {
+        return tidy_main(&cli);
     }
     if cli.register_root {
         return register_only(cli.db, cli.per_machine, cli.ask_main);

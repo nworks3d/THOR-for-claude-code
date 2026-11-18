@@ -18,5 +18,6 @@ pub mod install;
 pub mod pull;
 pub mod questionnaire;
 pub mod ship_state;
+pub mod tidy;
 pub mod transport;
 pub mod uninstall;

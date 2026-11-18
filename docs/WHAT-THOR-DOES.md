@@ -160,13 +160,13 @@ Words used once, in plain language:
   session-start block is capped by size (about 9,500 bytes), not by the four-note rule.
 - Refuse or change: ordinary notes. Ask the assistant to unpin, reword or retract any.
 
-### A10. It adds 15 "workflow starter" notes; two refuse a console flash on Windows
+### A10. It adds 16 "workflow starter" notes; two refuse a console flash on Windows
 - What: seven around commit and push (changelog line per user-visible change, run tests and quote the
   real result, never commit a secret, commit hygiene, commit/push/deploy only when asked, check where you
   push and what is on main, scan before anything goes public) and seven around risky steps and tools
   (rehearse destructive steps on a copy, pin a dependency with its reason, absolute paths, script file not
   shell quoting, keep only what is needed (rebuildable things stay out of a repo or backup), hidden processes on Windows, no interactive scheduled task on Windows),
-  plus one pinned note: a subject that does not belong to the session gets a session of its own, prepared
+  plus two pinned notes: new files go in the folder of their subject and never loose in the home folder, Desktop, Downloads or Documents itself; and a subject that does not belong to the session gets a session of its own, prepared
   by the assistant. Helper-agent mode (an orchestrator note and a stand-alone agent brief) is not in this
   set but is stored with it in a new memory (first-session item 6, F15).
 - Why: they are habits that were marked useful again and again on the builder's machine, rewritten to
@@ -242,6 +242,29 @@ Words used once, in plain language:
   A file check on a rule still works against the folder's real files.
 - Refuse or change: your home folder, Documents itself and a whole drive are refused as too broad.
   "install --register-root" does only the registration.
+
+### A15b. After the welcome it offers to put earlier work in order
+- What: once the welcome is answered, the assistant runs "serve inventory" (read-only: it reads the
+  transcripts of your earlier Claude Code sessions under ~/.claude/projects and lists, per session, the
+  folder, the dates, the first thing you typed and the files it wrote, plus the loose files in the home
+  folder, Desktop, Documents and Downloads; "serve inventory --digest <session>" prints one session as
+  short text with anything that looks like a secret blanked out). It groups them by subject and sends ONE
+  numbered proposal: a fixed folder per subject, the files that go in it, what it remembers from the old
+  conversations. On a yes it runs "install --tidy --plan <file>": each folder is made if needed and gets
+  its own memory exactly as "install --topic" does, and each file is moved in. It then stores the lasting
+  facts of the old conversations in that subject's memory and, in the Claude desktop app, groups the old
+  conversations per subject in the sidebar.
+- Why: a new user's first complaint was that Claude puts everything randomly everywhere. New files now
+  have a fixed place per subject (the pinned starter note files-go-in-the-folder-of-their-subject).
+- You notice: one message with a numbered list after the welcome; nothing at all when there is nothing
+  to order. No file is ever deleted or overwritten (a taken name gets " (2)", " (3)"). A file outside your
+  home folder, in a program's own folder or inside a git repository is left where it is. The home folder,
+  Desktop, Documents, Downloads, a drive root, application data and program files are refused as folders,
+  with a plain reason, and the next item still runs. Every move goes in an undo log (tidy-<date>-<n>.json
+  beside the memory).
+- Refuse or change: "2 no, because ..." leaves one subject exactly as it is (the reason is recorded in
+  owner-setup-answers). Ask the assistant to put it all back: it runs "install --tidy-undo", which moves the
+  files of the newest tidy-up back without overwriting anything (the folders and their memory stay).
 
 ### A16. Backup is a first-session choice (item 10); the install arranges none
 - What: THOR has a backup program (backup.exe) that exports the memory to a git repository, with a
@@ -703,7 +726,7 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
 - Refuse or change: built in.
 
 ### D8. Starter notes never refuse
-- What: the 12 workflow notes that are not about Windows console windows, the two helper-mode notes and the 22 pinned notes carry no check.
+- What: the 14 workflow notes that are not about Windows console windows, the two helper-mode notes and the 22 pinned notes carry no check.
 - Why: see A10.
 - You notice: a note appears at its moment; no refusal.
 - Refuse or change: you may hang a check on your own rules.
@@ -876,7 +899,7 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
 
 ## F. What the user can switch off or change, and how
 
-### F1. Starting notes (22 pinned, 15 workflow)
+### F1. Starting notes (22 pinned, 16 workflow)
 - What: any starting note.
 - Why: they are ordinary notes.
 - You notice: they stop arriving.

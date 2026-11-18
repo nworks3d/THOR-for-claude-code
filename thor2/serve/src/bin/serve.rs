@@ -157,6 +157,30 @@ enum Command {
     /// at all. Read-only. The same answer the agent's `lookup` gives when it
     /// is called with neither a query nor a key - one definition, two doors.
     Catalog,
+    /// A read-only look at the EARLIER Claude Code sessions on this computer,
+    /// so the assistant can propose to put the person's work in order (one
+    /// fixed folder per subject, with its own memory): per session the folder
+    /// it ran in, the dates, the first thing the person typed, how many
+    /// prompts, and the files it wrote (still there or gone), grouped by
+    /// folder with the folders not in order first, plus the loose files left
+    /// in the home folder, Desktop, Documents or Downloads. Writes nothing.
+    /// With `--digest <transcript>`: one session as short plain text instead.
+    Inventory {
+        /// Print the same as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Read the transcripts from here instead of ~/.claude/projects (tests).
+        #[arg(long)]
+        projects_dir: Option<PathBuf>,
+        /// Treat this as the home folder instead of the real one (tests).
+        #[arg(long)]
+        home: Option<PathBuf>,
+        /// One session (a transcript file named by a listing) as plain text:
+        /// what the person typed, the assistant's last reply to each prompt,
+        /// one line per tool call; at most about 20000 characters, never a secret.
+        #[arg(long)]
+        digest: Option<PathBuf>,
+    },
     /// One scope, opened: every item filed under it, one line each, complete
     /// and in date order. The step after `catalog` - and the same answer the
     /// agent's `lookup` gives when it is called with a scope and no query.
@@ -475,6 +499,7 @@ fn main() {
             let store = open_store_or_die(&cli.db);
             print!("{}", lookup::render_catalog(&lookup::catalog(&store)));
         }
+        Command::Inventory { json, projects_dir, home, digest } => cmd_inventory(json, projects_dir, home, digest),
         Command::Scope { name } => {
             let store = open_store_or_die(&cli.db);
             print!("{}", lookup::render_scope(&name, &lookup::in_scope(&store, &name)));
@@ -7030,6 +7055,32 @@ mod prose_marking_tests {
 
         let lines = why_lines(&items, &shown_ids, "git push --force origin main");
         assert_eq!(lines.len(), 2, "{lines:?}");
+    }
+}
+
+/// `serve inventory`: see `serve::inventory`. Read-only, exit 0 unless the
+/// home folder cannot be found or the digest file cannot be read.
+fn cmd_inventory(json: bool, projects_dir: Option<PathBuf>, home: Option<PathBuf>, digest: Option<PathBuf>) {
+    if let Some(file) = digest {
+        match serve::inventory::digest(&file) {
+            Ok(text) => print!("{text}"),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    let Some(home) = home.or_else(serve::inventory::home_dir) else {
+        eprintln!("could not find the home folder; name it with --home");
+        std::process::exit(1);
+    };
+    let dir = projects_dir.unwrap_or_else(|| serve::inventory::default_projects_dir(&home));
+    let inv = serve::inventory::inventory(&dir, &home);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&inv).unwrap_or_default());
+    } else {
+        print!("{}", serve::inventory::render_text(&inv));
     }
 }
 

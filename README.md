@@ -513,6 +513,20 @@ with sensible defaults. To see all of it, ask: *"what is switched on?"* - you ge
 a numbered list in plain words, and anything you do not mention keeps its
 default.
 
+**If you already worked with Claude before, THOR offers to put that in order.**
+Right after you answer the welcome, it looks (only reading, changing nothing)
+at your earlier conversations with Claude on this computer and at the files they
+left loose in your home folder, Desktop, Documents or Downloads. If there is
+something to order, it sends you one message with a numbered proposal: one fixed
+folder per subject (for example your CV and job hunting, or a renovation), the
+files that belong in it, and what it remembers from those earlier conversations.
+Say "yes" to accept all of it, or "2 no, because ..." to leave one out. Nothing
+is deleted: files are only moved, a file is never overwritten (a taken name gets
+a number), files of a programming project and files outside your home folder
+stay where they are, and every move is written down so your assistant can put
+all of it back whenever you ask. From then on, new files for a subject go in the
+folder of that subject. If there is nothing to order, it says nothing about it.
+
 ### The easy way: four steps, nothing to type
 
 You need Claude Code, installed and opened at least once. Nothing else to
@@ -1172,8 +1186,8 @@ part and it is easy to conclude too early that nothing is happening.
 
 **Day one, it stops almost nothing.** A fresh memory holds 22 pinned starting
 notes (how to write one that comes back, plus honesty, agent and hygiene habits
-that hold on any project) and 15 general work notes (14 work rules that arrive right before
-the step they are about, and one that makes a subject that does not belong to a session get a session of its own). The part of THOR that can refuse a
+that hold on any project) and 16 general work notes (14 work rules that arrive right before
+the step they are about, one that makes a subject that does not belong to a session get a session of its own, and one that keeps new files in the folder of their subject). The part of THOR that can refuse a
 wrong change only works on notes that carry a proof, and you have not written
 any yet. So on the first day you get those notes at the start of a conversation
 and the first-session list described under Getting started, and no refusals,

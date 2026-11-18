@@ -1471,8 +1471,25 @@ pub fn workflow_starter_pack_for(windows: bool) -> Vec<model::item::Item> {
                 vec![Binding::Always],
             )
         },
+        // Where new files go. Pinned like the note above: no tool or file to
+        // bind to, it matters whenever a file is about to be written.
+        model::item::Item {
+            kind: model::item::Kind::Orientation,
+            ..note(
+                FILES_IN_SUBJECT_FOLDER_NOTE_ID,
+                FILES_IN_SUBJECT_FOLDER_NOTE_TEXT,
+                "Files the assistant writes loose into the home, Desktop, Downloads or Documents folder are found just as easy to find again as files in a folder of their subject.",
+                vec![Binding::Always],
+            )
+        },
     ]
 }
+
+/// The id of the starter note that keeps new files out of the broad places.
+pub const FILES_IN_SUBJECT_FOLDER_NOTE_ID: &str = "files-go-in-the-folder-of-their-subject";
+
+/// Its text (under 300 characters, a test holds that).
+pub const FILES_IN_SUBJECT_FOLDER_NOTE_TEXT: &str = "New files for the person go in the folder of the subject being worked on, never loose in the home folder, Desktop, Downloads or Documents itself. A new subject gets its own folder first (install --topic from inside it), then the files.";
 
 /// The id of the starter note that makes off-topic work get its own session.
 pub const OFF_TOPIC_NOTE_ID: &str = "off-topic-work-gets-its-own-session";
@@ -2049,6 +2066,20 @@ pub fn topic_folder_name(dir: &Path) -> Result<String, RegisterRefusal> {
         return Err(too_broad());
     }
     dir.file_name().and_then(|n| n.to_str()).map(str::trim).filter(|n| !n.is_empty()).map(str::to_string).ok_or_else(too_broad)
+}
+
+/// The topic a plain folder is, or would become: the folder that carries (or
+/// will carry) the `.thor-project` marker, and the key it holds. Run from a
+/// subfolder of an existing topic, it is the topic's own top. A folder with no
+/// marker yet is named after itself, except the home folder and a drive root,
+/// which are far too broad (`ops::install::topic_folder_name`).
+pub fn topic_of(here: &Path) -> Result<(PathBuf, String), RegisterRefusal> {
+    let dir = serve::project::plain_root(here).unwrap_or_else(|| here.to_path_buf());
+    let key = match serve::project::resolve_project(&dir) {
+        Some(key) => key,
+        None => topic_folder_name(&dir)?,
+    };
+    Ok((dir, key))
 }
 
 /// What a registration of a checkout would do, decided before anything is
@@ -3089,7 +3120,7 @@ mod tests {
             assert!(ids.insert(item.id.clone()), "{} is in the pack twice", item.id);
             // The one pinned orientation of the pack (off-topic work gets its own
             // session) is read at session start; every other note is a rule.
-            let off_topic = item.id == OFF_TOPIC_NOTE_ID;
+            let off_topic = item.id == OFF_TOPIC_NOTE_ID || item.id == FILES_IN_SUBJECT_FOLDER_NOTE_ID;
             let kind = if off_topic { model::item::Kind::Orientation } else { model::item::Kind::Rule };
             assert_eq!(item.kind, kind, "{}", item.id);
             assert!(item.project.is_none(), "{} is scoped to a project, a new user has none", item.id);
@@ -3407,7 +3438,7 @@ mod tests {
         let store = EventStore::open_read_only(&db).unwrap();
         let live = serve::live::live_items(&store);
         for item in workflow_starter_pack() {
-            if item.id == OFF_TOPIC_NOTE_ID {
+            if item.id == OFF_TOPIC_NOTE_ID || item.id == FILES_IN_SUBJECT_FOLDER_NOTE_ID {
                 assert_eq!(item.bindings, vec![model::item::Binding::Always], "the off-topic note is pinned, served at session start");
                 continue;
             }
