@@ -809,7 +809,7 @@ fn refuse_a_new_collection(
     root: Option<&std::path::Path>,
     named_by_owner: Option<&str>,
 ) -> Result<(), String> {
-    if item.id == model::store::OWNER_SETUP_ANSWERS_ID {
+    if item.id == model::store::OWNER_SETUP_ANSWERS_ID || item.id == model::store::ORDER_ANSWER_ID {
         return Ok(());
     }
     let Some(wanted) = filed_under(item) else { return Ok(()) };

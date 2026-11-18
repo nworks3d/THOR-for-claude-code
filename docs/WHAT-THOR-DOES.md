@@ -254,6 +254,15 @@ Words used once, in plain language:
   its own memory exactly as "install --topic" does, and each file is moved in. It then stores the lasting
   facts of the old conversations in that subject's memory and, in the Claude desktop app, groups the old
   conversations per subject in the sidebar.
+- It cannot be skipped: a new memory also carries a pinned note, order-earlier-work-once. Once the welcome is
+  answered, THOR holds the end of every turn (not the turn that ends on the proposal itself, not a helper's,
+  not a headless run, not a copy) until it finds the step settled, and the note cannot be retracted, rewritten
+  or unpinned before. Only evidence THOR checks itself settles it: "serve inventory" finding nothing to order
+  in the real transcripts folder (it writes that record itself), "install --tidy" run after the person's
+  answer, or, for what the person refused, a Report order-earlier-work-answer quoting their own words, which
+  THOR must find in a message they typed after the proposal (the proposal carries an invisible marker, an HTML
+  comment). Words with no refusal in them read as a yes; a partly refused answer needs both. An existing
+  memory never gets the note.
 - Why: a new user's first complaint was that Claude puts everything randomly everywhere. New files now
   have a fixed place per subject (the pinned starter note files-go-in-the-folder-of-their-subject).
 - You notice: one message with a numbered list after the welcome; nothing at all when there is nothing

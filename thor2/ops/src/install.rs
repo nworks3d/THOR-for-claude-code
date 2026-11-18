@@ -1226,6 +1226,34 @@ pub fn working_contract() -> Vec<model::item::Item> {
     ]
 }
 
+/// The last setup step, seeded into a NEW store only (like the helper notes,
+/// never into an existing one, and a copy never has it): a pinned note telling
+/// the assistant that right after the welcome is answered it runs the tidy step
+/// of the first-session text. `serve`'s Stop hold (`order_debt`) keeps the
+/// session on it until THOR itself finds it settled, and the store refuses to
+/// retract or rewrite it before (`model::store::guard_order_note`).
+pub fn order_earlier_note() -> model::item::Item {
+    model::item::Item {
+        id: model::store::ORDER_NOTE_ID.to_string(),
+        kind: model::item::Kind::Orientation,
+        text: "Last setup step: once the welcome is answered, run THE TIDY STEP of `lookup first-session-questions` (serve \
+               inventory, then a numbered proposal to order earlier work). The session is held until THOR itself finds it settled. \
+               Never retract this note yourself."
+            .to_string(),
+        bindings: vec![model::item::Binding::Always],
+        severity: None,
+        project: None,
+        tags: vec!["working-contract".to_string()],
+        expires: None,
+        key: None,
+        falsifier: Some(
+            "This note is still served after the person was offered the proposal and answered it, or after serve inventory found nothing to order."
+                .to_string(),
+        ),
+        check: None,
+    }
+}
+
 /// The workflow starter pack: the coding-workflow habits that, in a store
 /// built up over months of real use, were marked useful again and again (or
 /// served thousands of times) and that hold for ANY developer on ANY project.
@@ -1659,7 +1687,7 @@ pub fn seed_working_contract_at(
     // rendered from the same catalogue as the page in AGENTS.md.
     let detected = claude_json.map(serve::plan::detect_in);
     let questions = crate::questionnaire::lookup_item_with(detected, paths);
-    for item in working_contract().into_iter().chain(workflow_starter_pack()).chain(helper_mode_notes()).chain(std::iter::once(questions)) {
+    for item in working_contract().into_iter().chain(workflow_starter_pack()).chain(helper_mode_notes()).chain(std::iter::once(order_earlier_note())).chain(std::iter::once(questions)) {
         let id = item.id.clone();
         match model::store::declare(&mut store, "install", "install", installer(), &item) {
             Ok(_) => out.push(SeededItem { id, stored: true, refusal: None }),
@@ -2966,7 +2994,7 @@ mod tests {
 
         let seeded = seed_working_contract(&db).unwrap();
         // The notes, the starter pack and the first-session list (a lookup item).
-        assert_eq!(seeded.len(), working_contract().len() + workflow_starter_pack().len() + helper_mode_notes().len() + 1);
+        assert_eq!(seeded.len(), working_contract().len() + workflow_starter_pack().len() + helper_mode_notes().len() + 2);
         for s in &seeded {
             assert!(s.stored, "the gate refused its own starting note {}: {:?}", s.id, s.refusal);
         }
@@ -3028,7 +3056,7 @@ mod tests {
         assert_eq!(report.store, StoreOutcome::Created);
         assert_eq!(working_contract().len(), 22, "this test's own claim of 22 starting notes is now stale");
         // 22 working-contract notes, the starter pack, and the first-session list.
-        let want = 22 + workflow_starter_pack().len() + helper_mode_notes().len() + 1;
+        let want = 22 + workflow_starter_pack().len() + helper_mode_notes().len() + 2;
         let stored = report.seeded.iter().filter(|s| s.stored).count();
         assert_eq!(stored, want, "expected all {want} starting notes to be stored, got {stored}");
         assert_eq!(report.rulebook.outcome, RulebookOutcome::Written);

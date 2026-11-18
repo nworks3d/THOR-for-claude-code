@@ -183,6 +183,7 @@ pub fn tidy(db: &Path, plan_text: &str, home: &Path) -> Result<Vec<String>, Stri
     };
     let mut log = UndoLog { made: serve::time::now_iso8601(), ..Default::default() };
     let mut lines = Vec::new();
+    let mut ready_folders: Vec<String> = Vec::new();
     for entry in &plan {
         let folder = PathBuf::from(&entry.folder);
         if let Some(why) = refuse_folder(home, &folder) {
@@ -235,6 +236,7 @@ pub fn tidy(db: &Path, plan_text: &str, home: &Path) -> Result<Vec<String>, Stri
             }
         }
         let verb = if existed { "= the folder was already there" } else { "+ made the folder" };
+        ready_folders.push(entry.folder.clone());
         lines.push(format!("{verb} {} ({memory}): moved {moved} file(s) into it", entry.folder));
         lines.extend(skipped);
         if !log.moves.is_empty() {
@@ -245,6 +247,21 @@ pub fn tidy(db: &Path, plan_text: &str, home: &Path) -> Result<Vec<String>, Stri
         lines.push("No file was moved, so there is nothing to undo.".to_string());
     } else {
         lines.push(format!("Every move is written down, so all of it can be put back with: install --tidy-undo ({}).", log_path.display()));
+    }
+    // THOR's own record that a plan was carried out: part of what settles the
+    // tidy step (`model::store::record_order_evidence`; the Stop hook checks it
+    // against the person's answer). Only when a folder was really made ready.
+    if !ready_folders.is_empty() && (!log.moves.is_empty() || !log.folders.is_empty()) {
+        if let Ok(mut store) = thor_core::event_store::EventStore::open_existing(db) {
+            if model::store::show(&store, model::store::ORDER_NOTE_ID).is_ok() {
+                let body = serde_json::json!({
+                    "folders": ready_folders,
+                    "moved": log.moves.len(),
+                    "undo_log": if log.moves.is_empty() { String::new() } else { log_path.display().to_string() },
+                });
+                let _ = model::store::record_order_evidence(&mut store, "tidy", body);
+            }
+        }
     }
     Ok(lines)
 }

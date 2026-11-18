@@ -163,7 +163,9 @@ enum Command {
     /// it ran in, the dates, the first thing the person typed, how many
     /// prompts, and the files it wrote (still there or gone), grouped by
     /// folder with the folders not in order first, plus the loose files left
-    /// in the home folder, Desktop, Documents or Downloads. Writes nothing.
+    /// in the home folder, Desktop, Documents or Downloads. Changes no file; its
+    /// one write is a record in THOR's own log when it finds nothing to order in
+    /// the real transcripts folder (it settles the tidy step by itself).
     /// With `--digest <transcript>`: one session as short plain text instead.
     Inventory {
         /// Print the same as JSON.
@@ -499,7 +501,7 @@ fn main() {
             let store = open_store_or_die(&cli.db);
             print!("{}", lookup::render_catalog(&lookup::catalog(&store)));
         }
-        Command::Inventory { json, projects_dir, home, digest } => cmd_inventory(json, projects_dir, home, digest),
+        Command::Inventory { json, projects_dir, home, digest } => cmd_inventory(&cli.db, json, projects_dir, home, digest),
         Command::Scope { name } => {
             let store = open_store_or_die(&cli.db);
             print!("{}", lookup::render_scope(&name, &lookup::in_scope(&store, &name)));
@@ -1249,6 +1251,7 @@ fn plain_line_for_block(event: &str, reason: &str) -> &'static str {
     let lower = reason.to_lowercase();
     match event {
         "Stop" if lower.contains("walked through setup") => LINE_SETUP,
+        "Stop" if lower.contains("[thor] order-earlier-work") => LINE_ORDER,
         // Before the evaluation arm: an evaluation ask can ride along with this hold.
         "Stop" if lower.contains(&serve::leftover_scripts::HOLD_MARKER.to_lowercase()) => LINE_SCRIPTS,
         "Stop" if lower.contains("copy-attestation") => LINE_COPY_PROOF,
@@ -1266,6 +1269,7 @@ fn plain_line_for_block(event: &str, reason: &str) -> &'static str {
 // THOR's own vocabulary (rule, falsifier, evaluation, scope, teeth, hook, MCP,
 // collection, store). Each says what happened and that nothing is needed.
 const LINE_SETUP: &str = "THOR (the memory your assistant uses) is finishing its setup. Your assistant welcomes you and asks one short question with a few choices: you can simply answer \"yes\". Nothing else is needed from you.";
+const LINE_ORDER: &str = "THOR asks your assistant to finish one last setup step: a proposal to put your earlier work in order. It asks you one short question. Nothing else is needed from you.";
 const LINE_SCRIPTS: &str = "Your assistant left a few small helper files outside your projects. THOR asks it to tidy them up: useful ones are kept in your tools folder, leftovers are deleted, and it asks you first about anything unclear. You do not need to do anything unless it asks you.";
 const LINE_COPY_PROOF: &str = "THOR is sending proof of this week's memory check from this computer's copy of your memory to your main computer. Your assistant does one more small step. You do not need to do anything.";
 const LINE_TIDY_UP: &str = "THOR asks your assistant to tidy up the memory now, before it finishes its answer. This can take a few minutes. You do not need to do anything.";
@@ -1277,7 +1281,8 @@ const LINE_ONE_MORE_THING: &str = "THOR asked your assistant to do one more smal
 
 /// Every sentence above, for the test that walks them.
 #[cfg(test)]
-const PERSON_LINES: [&str; 9] = [
+const PERSON_LINES: [&str; 10] = [
+    LINE_ORDER,
     LINE_SETUP,
     LINE_SCRIPTS,
     LINE_COPY_PROOF,
@@ -1977,6 +1982,15 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
         if !is_subagent && !copy {
             if let Some(reason) = serve::store_dir::open_existing(db_path).ok().and_then(|s| setup_debt(&s)) {
                 return hold(reason);
+            }
+
+            // THE LAST SETUP STEP: offering to put earlier work in order.
+            // Never in a headless session (no person to ask), never before the
+            // first-session setup note is retracted.
+            if !session_kind(&payload).headless {
+                if let Some(reason) = order_debt(db_path, &payload, &session_id, no_record) {
+                    return hold(reason);
+                }
             }
 
             if let Some(reason) = capture_stop_check(db_path, &session_id) {
@@ -3028,6 +3042,72 @@ fn setup_debt(store: &EventStore) -> Option<String> {
         answers = model::store::OWNER_SETUP_ANSWERS_ID,
         note = model::store::SETUP_NOTE_ID
     ))
+}
+
+/// THE LAST SETUP STEP: while the pinned note `order-earlier-work-once` is live
+/// and the first-session setup note is already retracted, the end of a turn is
+/// held until the person was offered to put their earlier work in order and it
+/// was carried out or they refused it themselves.
+///
+/// What settles it is judged here from evidence THOR checks itself, never from
+/// the assistant's word: the log's own evidence (`serve inventory` found nothing
+/// to order; `install --tidy` ran) and this session's transcript (a proposal
+/// carrying the marker, a real message of the person after it, their quoted
+/// words) - see `serve::order_earlier`. A settled step is written down and the
+/// note retracted by THOR itself. A proposal shown with no answer yet is the
+/// turn ending on the question, which is what it should do: no hold then.
+///
+/// Fails open like every other debt: no note, no store, no readable transcript
+/// all read as nothing to say. A store that never got the note (an existing
+/// install, a copy) never holds.
+fn order_debt(db_path: &Path, payload: &Value, session_id: &str, no_record: bool) -> Option<String> {
+    let mut store = serve::store_dir::open_existing(db_path).ok()?;
+    model::store::show(&store, model::store::ORDER_NOTE_ID).ok()?;
+    if model::store::show(&store, model::store::SETUP_NOTE_ID).is_ok() {
+        return None;
+    }
+    let settle = |store: &mut EventStore, how: &str| {
+        if !no_record {
+            let _ = model::store::settle_order_note(store, how);
+        }
+    };
+    let evidence = model::store::order_evidence(&store);
+    if evidence.iter().any(|e| e.kind == "settled" || model::store::nothing_evidence_counts(e)) {
+        settle(&mut store, "nothing to order, or settled earlier");
+        return None;
+    }
+    let named = payload.get("transcript_path").and_then(|v| v.as_str()).map(PathBuf::from);
+    let root = serve::attest::transcripts_root();
+    let transcript = serve::attest::main_transcript_of(named.as_deref(), root.as_deref(), session_id)?;
+    let timeline = serve::order_earlier::timeline(&transcript)?;
+    // The welcome comes first: the turn that says it ends on its question, and
+    // only when the person has typed a second message (their answer to it) is
+    // there anything to order. A proposal already shown counts at once.
+    let people = timeline.iter().filter(|e| matches!(e, serve::order_earlier::Entry::Person { .. })).count();
+    let proposed = timeline.iter().any(|e| matches!(e, serve::order_earlier::Entry::Proposal { .. }));
+    if people < 2 && !proposed {
+        return None;
+    }
+    let answer = model::store::show(&store, model::store::ORDER_ANSWER_ID).ok().map(|i| i.text);
+    match serve::order_earlier::judge(&timeline, &evidence, answer.as_deref()) {
+        serve::order_earlier::Verdict::Settled(how) => {
+            settle(&mut store, &how);
+            None
+        }
+        serve::order_earlier::Verdict::Waiting => None,
+        serve::order_earlier::Verdict::Owed(what) => Some(format!(
+            "[THOR] order-earlier-work: one last setup step is still owed. The first-session text (lookup key \
+             'first-session-questions', under THE TIDY STEP) says that right after the welcome the person is offered to \
+             put their earlier work with Claude in order. {what}. Only what THOR checks itself settles this: \
+             `serve inventory` finding nothing to order; `install --tidy` run after the person answered the proposal; or, \
+             for what they refused, the Report '{answers}' that quotes their own words exactly between double quotes, \
+             found in a message they typed after the proposal. Your own claim that it is done, a tag, or a report without \
+             their words settles nothing, and '{note}' cannot be retracted by you before: THOR retracts it itself once it \
+             is settled.",
+            answers = model::store::ORDER_ANSWER_ID,
+            note = model::store::ORDER_NOTE_ID
+        )),
+    }
 }
 
 /// Where this session's watermark lives: the store's tip as it stood when the
@@ -7060,7 +7140,7 @@ mod prose_marking_tests {
 
 /// `serve inventory`: see `serve::inventory`. Read-only, exit 0 unless the
 /// home folder cannot be found or the digest file cannot be read.
-fn cmd_inventory(json: bool, projects_dir: Option<PathBuf>, home: Option<PathBuf>, digest: Option<PathBuf>) {
+fn cmd_inventory(db_path: &Path, json: bool, projects_dir: Option<PathBuf>, home: Option<PathBuf>, digest: Option<PathBuf>) {
     if let Some(file) = digest {
         match serve::inventory::digest(&file) {
             Ok(text) => print!("{text}"),
@@ -7075,8 +7155,26 @@ fn cmd_inventory(json: bool, projects_dir: Option<PathBuf>, home: Option<PathBuf
         eprintln!("could not find the home folder; name it with --home");
         std::process::exit(1);
     };
+    let real_folders = projects_dir.is_none();
     let dir = projects_dir.unwrap_or_else(|| serve::inventory::default_projects_dir(&home));
     let inv = serve::inventory::inventory(&dir, &home);
+    // Nothing to order, found in the real transcripts folder: THOR's own proof
+    // for the tidy step (`model::store::order_settled`). Never for a folder
+    // named by hand: an empty one proves nothing. The folder is recorded so
+    // that a changed home folder in the environment cannot pass for the real one.
+    if real_folders && inv.folders.iter().all(|f| f.ordered) && inv.loose_files.is_empty() && db_path.is_file() {
+        if let Ok(mut store) = EventStore::open_existing(db_path) {
+            if model::store::show(&store, model::store::ORDER_NOTE_ID).is_ok() {
+                let body = serde_json::json!({
+                    "projects_dir": model::store::norm_path(&dir),
+                    "sessions": inv.sessions_found,
+                    "folders": inv.folders.len(),
+                    "loose_files": inv.loose_files.len(),
+                });
+                let _ = model::store::record_order_evidence(&mut store, "nothing", body);
+            }
+        }
+    }
     if json {
         println!("{}", serde_json::to_string_pretty(&inv).unwrap_or_default());
     } else {

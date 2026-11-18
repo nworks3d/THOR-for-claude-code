@@ -118,6 +118,7 @@ pub mod guard_verdict;
 pub mod holder;
 pub mod hook_faults;
 pub mod inventory;
+pub mod order_earlier;
 pub mod input;
 pub mod judge;
 pub mod leftover_scripts;

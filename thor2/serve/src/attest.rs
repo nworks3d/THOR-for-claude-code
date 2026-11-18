@@ -1308,7 +1308,7 @@ pub fn owner_messages(transcript: &Path, last: usize) -> Result<Vec<String>, Str
 
 /// The owner's own words on one transcript line, or `None` when the line is
 /// not a message he typed (see `owner_messages`).
-fn owner_text(line: &str) -> Option<String> {
+pub fn owner_text(line: &str) -> Option<String> {
     let v: Value = serde_json::from_str(line).ok()?;
     if v.get("type").and_then(|t| t.as_str()) != Some("user") {
         return None;

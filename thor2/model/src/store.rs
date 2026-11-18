@@ -110,6 +110,7 @@ pub const RESERVED_ACTORS: &[&str] = &[
     "eval-machine",
     "eval-validator",
     "attester",
+    "order-earlier",
     "teeth-probe",
     "hook",
 ];
@@ -230,6 +231,9 @@ pub fn reserved_id_owner(entity_id: &str) -> Option<&'static str> {
     if entity_id == A4_CUTOFF_ID {
         return Some(RETEST_ACTOR);
     }
+    if entity_id == ORDER_EVIDENCE_ID {
+        return Some(ORDER_ACTOR);
+    }
     None
 }
 
@@ -288,6 +292,11 @@ fn reserved_id_refusal(store: &EventStore, entity_id: &str, owner: &str) -> Refu
                 "run {} from inside the checkout instead",
                 register_command_for(store.path().as_deref())
             ),
+        }
+    } else if owner == ORDER_ACTOR {
+        Refusal {
+            problem: format!("'{entity_id}' is THOR's own record of the tidy step, written only by `serve inventory` and `install --tidy` themselves"),
+            fix: format!("do the tidy step of the first-session text; give your own item an id other than '{ORDER_EVIDENCE_ID}'"),
         }
     } else if owner == RETEST_ACTOR {
         Refusal {
@@ -961,6 +970,7 @@ pub fn revise<'a>(
     updated: &Item,
 ) -> Result<Event, WriteError> {
     let actor = fence(store, actor.into(), &updated.id)?;
+    guard_order_note(store, actor, &updated.id)?;
     // BOTH sides are normalised before the dropped-field check. An item
     // already stored with project "global" is a global item; rewriting it as
     // `None` says the same thing, so it must not read as dropping the field.
@@ -1089,6 +1099,7 @@ pub fn revise_tried_scoped<'a>(
     att: Option<&Att>,
 ) -> Result<Event, WriteError> {
     let actor = fence(store, actor.into(), &updated.id)?;
+    guard_order_note(store, actor, &updated.id)?;
     let existing = normalized(existing);
     let updated = normalized(updated);
     let before = normalized(before);
@@ -8665,6 +8676,7 @@ pub fn archive<'a>(
     root: Option<&Path>,
 ) -> Result<Event, WriteError> {
     let actor = fence(store, actor.into(), entity_id)?;
+    guard_order_note(store, actor, entity_id)?;
     let reason = reason.trim();
     if reason.is_empty() {
         return Err(WriteError::Refused(Refusal {
@@ -8850,6 +8862,7 @@ pub fn retract<'a>(
     att: Option<&Att>,
 ) -> Result<Event, WriteError> {
     let actor = fence(store, actor.into(), entity_id)?;
+    guard_order_note(store, actor, entity_id)?;
     let reason = reason.trim();
     if reason.is_empty() {
         return Err(WriteError::Refused(Refusal {
@@ -9247,6 +9260,148 @@ pub fn revise_project_root_for(
     store
         .append_mutate_checked("install", "install", name, EventKind::FactRevised, id, None, &body)
         .map_err(WriteError::Store)
+}
+
+// ------------------------------------------- ordering earlier work (the tidy step)
+//
+// WHY THIS IS HERE. After the first-session welcome is answered, the assistant
+// must offer to put the person's earlier work in order (`serve inventory`,
+// then `install --tidy`). A request in a note's prose was never enough, so the
+// pinned note `ORDER_NOTE_ID` is held by the Stop hook until it is SETTLED,
+// and it cannot be retracted, revised or unpinned until then. What settles it
+// is evidence THOR checks itself, kept on one reserved id by one reserved
+// actor, so no assistant can write it any other way:
+//
+// - `nothing`: `serve inventory` itself found nothing in an unordered place;
+// - `tidy`: `install --tidy` itself carried a plan out (folders, files, log);
+// - `settled`: the Stop hook verified the rest (a refusal quoted from the
+//   person's own prompt, or a tidy event that follows the person's answer)
+//   and wrote this as its last act, right before it retracts the note.
+//
+// The model layer only keeps the log and the guard; the transcript checks
+// live in `serve::order_earlier`.
+
+/// The pinned note a NEW store is seeded with (`ops::install::working_contract`).
+pub const ORDER_NOTE_ID: &str = "order-earlier-work-once";
+
+/// The Report the assistant files when the person refused the proposal (or
+/// part of it), quoting their own words. THOR accepts it only after it found
+/// those words in a real message of the person (`serve::order_earlier`).
+pub const ORDER_ANSWER_ID: &str = "order-earlier-work-answer";
+
+/// The one reserved id the evidence lives on, written only by `ORDER_ACTOR`.
+pub const ORDER_EVIDENCE_ID: &str = "order-earlier-work-evidence";
+
+/// The invisible marker every proposal message carries (an HTML comment, so a
+/// person reading it never sees it). The first-session text makes the
+/// assistant put it at the end of the proposal.
+pub const ORDER_PROPOSAL_MARKER: &str = "<!-- thor-order-proposal -->";
+
+/// THOR's own actor for the evidence above.
+pub const ORDER_ACTOR: &str = "order-earlier";
+
+/// One piece of evidence on `ORDER_EVIDENCE_ID`.
+#[derive(Debug, Clone)]
+pub struct OrderEvidence {
+    pub seq: i64,
+    /// `nothing`, `tidy` or `settled`.
+    pub kind: String,
+    /// Unix seconds when it was written.
+    pub at: i64,
+    pub body: serde_json::Value,
+}
+
+/// `<home>/.claude/projects` as `serve inventory` reads it, in the comparable
+/// form of `norm_path`. `None` without a home folder.
+pub fn default_projects_dir_text() -> Option<String> {
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+    Some(norm_path(&PathBuf::from(home).join(".claude").join("projects")))
+}
+
+/// A path as text for comparing: forward slashes, no trailing slash, lower case.
+pub fn norm_path(p: &Path) -> String {
+    let s = p.display().to_string().replace('\\', "/");
+    s.strip_prefix("//?/").unwrap_or(&s).trim_end_matches('/').to_lowercase()
+}
+
+/// Record a piece of evidence (`kind` is `nothing`, `tidy` or `settled`).
+/// Written as THOR's own actor on the reserved id, so nothing else can.
+pub fn record_order_evidence(store: &mut EventStore, kind: &str, mut body: serde_json::Value) -> Result<(), WriteError> {
+    let actor = SystemActor::new(ORDER_ACTOR);
+    let name = fence(store, actor.into(), ORDER_EVIDENCE_ID)?;
+    let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    body["kind"] = serde_json::Value::String(kind.to_string());
+    body["at"] = serde_json::Value::from(at);
+    store
+        .append_event(ORDER_ACTOR, ORDER_ACTOR, name, EventKind::GateStoodAside, ORDER_EVIDENCE_ID, None, &body.to_string())
+        .map(|_| ())
+        .map_err(|e| WriteError::Store(e.into()))
+}
+
+/// Every piece of evidence, oldest first.
+pub fn order_evidence(store: &EventStore) -> Vec<OrderEvidence> {
+    let Ok(events) = store.get_events_by_entity(ORDER_EVIDENCE_ID) else { return Vec::new() };
+    let mut out: Vec<OrderEvidence> = events
+        .iter()
+        .filter(|e| e.actor == ORDER_ACTOR && e.kind == EventKind::GateStoodAside)
+        .filter_map(|e| {
+            let body: serde_json::Value = serde_json::from_str(&e.body).ok()?;
+            Some(OrderEvidence {
+                seq: e.seq,
+                kind: body.get("kind")?.as_str()?.to_string(),
+                at: body.get("at").and_then(|v| v.as_i64()).unwrap_or(0),
+                body,
+            })
+        })
+        .collect();
+    out.sort_by_key(|e| e.seq);
+    out
+}
+
+/// Whether `evidence` is a "nothing to order" record that really was made by
+/// reading THIS computer's own transcripts (not a folder an assistant named).
+pub fn nothing_evidence_counts(evidence: &OrderEvidence) -> bool {
+    evidence.kind == "nothing"
+        && evidence.body.get("projects_dir").and_then(|v| v.as_str()).map(|d| d.to_lowercase())
+            == default_projects_dir_text()
+}
+
+/// Whether the note may now go: THOR's own `settled` record, or a `nothing`
+/// record from the real transcripts folder.
+pub fn order_settled(store: &EventStore) -> bool {
+    order_evidence(store).iter().any(|e| e.kind == "settled" || nothing_evidence_counts(e))
+}
+
+/// Refuse a change to the live `ORDER_NOTE_ID` until it is settled. Only THOR's
+/// own actor may change it before.
+fn guard_order_note(store: &EventStore, actor_name: &str, id: &str) -> Result<(), WriteError> {
+    if id != ORDER_NOTE_ID || actor_name == ORDER_ACTOR || show(store, id).is_err() || order_settled(store) {
+        return Ok(());
+    }
+    Err(WriteError::Refused(Refusal {
+        problem: format!(
+            "'{ORDER_NOTE_ID}' cannot be retracted, revised or unpinned yet: nothing THOR checked itself shows that the \
+             person was offered to put their earlier work in order, and answered"
+        ),
+        fix: format!(
+            "do the tidy step of the first-session text: run `serve inventory` (when it finds nothing to order, it settles \
+             this by itself); otherwise show the person the numbered proposal (it must carry the marker {}) and wait for \
+             their answer. Then EITHER run `install --tidy` for what they accepted, OR, for what they refused, file a Report \
+             '{ORDER_ANSWER_ID}' that quotes their own words exactly, between double quotes. THOR checks both against the \
+             session's own record at the end of the turn and retracts this note itself. Saying it is done, a tag or a report \
+             without their words settles nothing",
+            ORDER_PROPOSAL_MARKER
+        ),
+    }))
+}
+
+/// THOR's last act on the note: write `settled` and retract it as THOR itself.
+pub fn settle_order_note(store: &mut EventStore, how: &str) -> Result<(), WriteError> {
+    record_order_evidence(store, "settled", serde_json::json!({ "how": how }))?;
+    if show(store, ORDER_NOTE_ID).is_ok() {
+        retract(store, ORDER_ACTOR, ORDER_ACTOR, SystemActor::new(ORDER_ACTOR), ORDER_NOTE_ID, &format!("settled: {how}"), None)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

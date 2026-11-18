@@ -526,6 +526,9 @@ a number), files of a programming project and files outside your home folder
 stay where they are, and every move is written down so your assistant can put
 all of it back whenever you ask. From then on, new files for a subject go in the
 folder of that subject. If there is nothing to order, it says nothing about it.
+THOR makes sure this offer really happens: your assistant cannot skip it, and it
+counts as done only when you answered it yourself (yes, or no for what you do
+not want).
 
 ### The easy way: four steps, nothing to type
 
