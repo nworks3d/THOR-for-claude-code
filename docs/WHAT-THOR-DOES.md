@@ -160,14 +160,15 @@ Words used once, in plain language:
   session-start block is capped by size (about 9,500 bytes), not by the four-note rule.
 - Refuse or change: ordinary notes. Ask the assistant to unpin, reword or retract any.
 
-### A10. It adds 14 "workflow starter" notes; two refuse a console flash on Windows
+### A10. It adds 15 "workflow starter" notes; two refuse a console flash on Windows
 - What: seven around commit and push (changelog line per user-visible change, run tests and quote the
   real result, never commit a secret, commit hygiene, commit/push/deploy only when asked, check where you
   push and what is on main, scan before anything goes public) and seven around risky steps and tools
   (rehearse destructive steps on a copy, pin a dependency with its reason, absolute paths, script file not
-  shell quoting, keep only what is needed (rebuildable things stay out of a repo or backup), hidden processes on Windows, no interactive scheduled task on Windows). Helper-agent mode
-  (an orchestrator note and a stand-alone agent brief) is not in this set: it is off until you say yes to
-  first-session item 6 (F15).
+  shell quoting, keep only what is needed (rebuildable things stay out of a repo or backup), hidden processes on Windows, no interactive scheduled task on Windows),
+  plus one pinned note: a subject that does not belong to the session gets a session of its own, prepared
+  by the assistant. Helper-agent mode (an orchestrator note and a stand-alone agent brief) is not in this
+  set but is stored with it in a new memory (first-session item 6, F15).
 - Why: they are habits that were marked useful again and again on the builder's machine, rewritten to
   hold anywhere. Only two carry a check, and only on a Windows install: windowless-processes-on-windows
   refuses a Start-Process that is not hidden (it passes -WindowStyle Hidden, -NoNewWindow, -WindowStyle
@@ -875,7 +876,7 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
 
 ## F. What the user can switch off or change, and how
 
-### F1. Starting notes (22 pinned, 14 workflow)
+### F1. Starting notes (22 pinned, 15 workflow)
 - What: any starting note.
 - Why: they are ordinary notes.
 - You notice: they stop arriving.

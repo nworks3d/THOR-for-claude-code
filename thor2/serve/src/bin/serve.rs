@@ -2314,7 +2314,7 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             // Every line besides the standing rules (compaction reminder, registration
             // notice, open points, copy line, missing program, work folders, copy down):
             // built by `session_start::start_extras`, which doctor calls too.
-            let extras = session_start::start_extras(
+            let mut extras = session_start::start_extras(
                 &store,
                 db_path,
                 folder_project.as_deref(),
@@ -2327,6 +2327,12 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                     refresh_copy: true,
                 },
             );
+            // A session in a folder that belongs to no project is told to propose
+            // a folder for this work and to move there (`other_project`). Not for a
+            // headless session, a subagent or a read-only copy.
+            if folder_project.is_none() && !kind.headless && !payload_is_from_a_subagent(&payload) && !copy {
+                extras.push(serve::other_project::no_project_line());
+            }
             let extras_len: usize = extras.iter().map(|e| e.len() + 2).sum();
             // What this project's own sessions used lately ranks first (step 31).
             let recent = session_start::recent_in_project(db_path, folder_project.as_deref(), time::now_unix());
@@ -2443,6 +2449,15 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                 return eval_note.map(|block| HookOutput::Context { event_name, block, verdicts: Vec::new() });
             }
 
+            // The prompt names ANOTHER project that has its own folder: the
+            // assistant is told to propose a session there (`other_project`).
+            let eval_note = match (eval_note, serve::other_project::named_in_prompt(&store, prompt_text, session_project.as_deref())) {
+                (Some(note), Some(other)) => Some(format!("{note}
+
+{}", serve::other_project::prompt_note(&other))),
+                (None, Some(other)) => Some(serve::other_project::prompt_note(&other)),
+                (note, None) => note,
+            };
             let candidates = serve::live::live_items(&store);
             let mut input = prompt::resolve(prompt_text, &candidates);
             input.project = folder_project.clone();

@@ -1459,8 +1459,27 @@ pub fn workflow_starter_pack_for(windows: bool) -> Vec<model::item::Item> {
             ),
             Check::Forbidden { literals: vec!["/it".to_string(), "/IT".to_string()] },
         ),
+        // A subject that does not belong to this session gets its own session,
+        // prepared by the assistant so the person only clicks. An orientation,
+        // pinned: it has no tool or file to bind to, it is read at session start.
+        model::item::Item {
+            kind: model::item::Kind::Orientation,
+            ..note(
+                OFF_TOPIC_NOTE_ID,
+                OFF_TOPIC_NOTE_TEXT,
+                "A person starts on an unrelated subject in this session and the assistant never offers a session of its own for it.",
+                vec![Binding::Always],
+            )
+        },
     ]
 }
+
+/// The id of the starter note that makes off-topic work get its own session.
+pub const OFF_TOPIC_NOTE_ID: &str = "off-topic-work-gets-its-own-session";
+
+/// Its text: short on purpose (the tools that do it are named in the first-session
+/// text, `questionnaire::ASSISTANT_RULES`).
+pub const OFF_TOPIC_NOTE_TEXT: &str = "A subject that does not fit this session's work or folder: say so in one plain sentence, offer its own session. On yes: make a folder in Documents named after it, run install --topic there, then move and rename this session if it has no work yet, else prepare a new one. They type nothing.";
 
 /// One starter note, as every note of the pack and of helper-agent mode is
 /// built: a global rule with the `workflow-starter` tag, no severity, no check.
@@ -3068,7 +3087,11 @@ mod tests {
         let mut pinned = 0;
         for item in &pack {
             assert!(ids.insert(item.id.clone()), "{} is in the pack twice", item.id);
-            assert_eq!(item.kind, model::item::Kind::Rule, "{}", item.id);
+            // The one pinned orientation of the pack (off-topic work gets its own
+            // session) is read at session start; every other note is a rule.
+            let off_topic = item.id == OFF_TOPIC_NOTE_ID;
+            let kind = if off_topic { model::item::Kind::Orientation } else { model::item::Kind::Rule };
+            assert_eq!(item.kind, kind, "{}", item.id);
             assert!(item.project.is_none(), "{} is scoped to a project, a new user has none", item.id);
             assert_eq!(item.tags, vec!["workflow-starter".to_string()], "{}", item.id);
             assert!(item.falsifier.is_some(), "{} names nothing that would prove it wrong", item.id);
@@ -3384,6 +3407,10 @@ mod tests {
         let store = EventStore::open_read_only(&db).unwrap();
         let live = serve::live::live_items(&store);
         for item in workflow_starter_pack() {
+            if item.id == OFF_TOPIC_NOTE_ID {
+                assert_eq!(item.bindings, vec![model::item::Binding::Always], "the off-topic note is pinned, served at session start");
+                continue;
+            }
             let mut input = serve::input::ServeInput::default();
             for b in &item.bindings {
                 match b {

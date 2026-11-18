@@ -593,3 +593,38 @@ fn the_assistant_rules_carry_the_consented_defender_exclusion_and_the_list_stays
     assert_eq!(questions().len(), 12, "the exclusion is an assistant rule, not a thirteenth item");
     assert!(!questionnaire::render_list(None).contains("Add-MpPreference"), "the short list the user sees stays clean");
 }
+
+/// Off-topic work gets its own session: a short pinned note in the starter
+/// pack, and the desktop-app tools that do it named in the assistant rules.
+#[test]
+fn off_topic_work_gets_its_own_session_by_a_short_pinned_note_and_named_tools() {
+    let note = ops::install::workflow_starter_pack()
+        .into_iter()
+        .find(|n| n.id == ops::install::OFF_TOPIC_NOTE_ID)
+        .expect("the starter pack carries the off-topic note");
+    assert_eq!(note.kind, model::item::Kind::Orientation);
+    assert_eq!(note.bindings, vec![model::item::Binding::Always], "pinned");
+    assert!(note.falsifier.is_some() && note.text.is_ascii() && note.text.chars().count() < 300, "{}", note.text.chars().count());
+    for must in ["does not fit this session's work or folder", "one plain sentence", "install --topic", "move and rename this session", "They type nothing"] {
+        assert!(note.text.contains(must), "the note lacks '{must}': {}", note.text);
+    }
+    let rules = questionnaire::ASSISTANT_RULES;
+    for must in [
+        "mcp__ccd_directory__change_directory",
+        "mcp__ccd_session_mgmt__set_session_title",
+        "mcp__ccd_session__spawn_task",
+        "otherwise give plain click steps",
+    ] {
+        // The rules say it as "When you do not have these tools, give plain click steps".
+        let ok = rules.contains(must) || (must.starts_with("otherwise") && rules.contains("When you do not have these tools, give plain click steps"));
+        assert!(ok, "the assistant rules lack '{must}'");
+    }
+    assert!(!note.text.contains("mcp__"), "the tool names stay out of the short note");
+}
+
+/// When THOR holds or refuses, the assistant tells the person in plain words.
+#[test]
+fn the_assistant_rules_say_how_to_tell_the_person_about_a_hold_or_refusal() {
+    let rules = questionnaire::ASSISTANT_RULES;
+    assert!(rules.contains("When THOR holds or refuses") && rules.contains("one short plain sentence") && rules.contains("nothing is needed from them"));
+}
