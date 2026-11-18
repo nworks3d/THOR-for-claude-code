@@ -54,7 +54,10 @@ Words used once, in plain language:
 
 ### A4. It wires four hooks into Claude Code's settings.json
 - What: SessionStart, PreToolUse (every tool), UserPromptSubmit and Stop all run the same "serve hook"
-  command from the THOR folder.
+  command from the THOR folder. On Windows each entry starts the program directly (a "command" plus an
+  "args" list, and "onFailure": "continue"), so it works whether Claude Code runs hooks in Git Bash or in
+  PowerShell, and a hook that cannot start never blocks a tool call. An older one-line entry of THOR's is
+  rewritten in place on the next run (restart Claude Code once afterwards). Other systems keep the one line.
 - Why: without them the memory never speaks and nothing announces it. This was caught on 2026-08-03,
   when the hooks had --db in the wrong place and every hook would have exited with an error silently.
 - You notice: "connected THOR to Claude Code". settings.json is first copied to settings.json.bak (only once: an existing .bak is never replaced, so it keeps your file as it was before THOR), nothing

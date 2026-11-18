@@ -2,6 +2,11 @@
 
 What changed in each release, newest first. The release workflow copies the section for the tag being released to the top of the release notes and refuses to publish without one.
 
+## Unreleased
+
+- **A first install on a Windows computer without Git no longer leaves your assistant locked out.** THOR's connections to Claude Code were written as one command line, which PowerShell (used when Git Bash is missing) cannot read; every connection failed and the one before each tool call blocked every tool. On Windows they are now written so the program starts directly, and a connection that cannot start never blocks anything. Running the setup again rewrites an older connection in place; restart Claude Code once afterwards.
+- **The Windows install command now installs what is missing by itself.** It installs git and Microsoft's Visual C++ runtime with winget first (Windows may ask permission once for each), instead of stopping and asking you to type a command. If git cannot be installed it carries on; if the runtime cannot be installed it stops and says why.
+
 ## 2.6.9 (2026-11-18)
 
 What changed: You can choose the language your assistant talks to you in, and once you have, a reply in another language is sent back to be rewritten. A rule on a tool call can now look at one field of the call, such as the model a helper agent runs on, instead of all of its text at once. The weekly evaluation no longer comes back empty while notes of the project still wait for a verdict, and a second evaluation on the same day can be filed.

@@ -128,6 +128,18 @@ fn drain<R: Read + Send + 'static>(mut reader: R) -> mpsc::Receiver<String> {
 
 /// Split a hook command the way the installer writes it:
 /// `"<exe>" --db "<db>" hook`. Quotes group, nothing else is special.
+fn hook_parts(hook: &Value) -> Option<Vec<String>> {
+    let command = hook["command"].as_str()?;
+    match hook["args"].as_array() {
+        Some(args) => {
+            let mut parts = vec![command.to_string()];
+            parts.extend(args.iter().filter_map(|a| a.as_str().map(str::to_string)));
+            Some(parts)
+        }
+        None => Some(split_command(command)),
+    }
+}
+
 fn split_command(command: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut current = String::new();
@@ -340,13 +352,13 @@ impl Smoke {
             let groups = settings["hooks"][event]
                 .as_array()
                 .ok_or_else(|| format!("settings.json has no hooks.{event} list"))?;
-            let command = groups
+            let parts = groups
                 .iter()
                 .flat_map(|g| g["hooks"].as_array().into_iter().flatten())
-                .filter_map(|h| h["command"].as_str())
-                .find(|c| c.contains(" hook"))
+                .filter_map(hook_parts)
+                .find(|p| p.last().is_some_and(|w| w == "hook"))
                 .ok_or_else(|| format!("hooks.{event} has no hook command"))?;
-            let parts = split_command(command);
+            let command = parts.join(" ");
             let exe = parts.first().ok_or_else(|| format!("hooks.{event} command is empty"))?;
             if !Path::new(exe).is_file() {
                 return Err(format!("hooks.{event} calls {exe}, which does not exist"));
@@ -622,10 +634,7 @@ impl Smoke {
     /// is answered with the commit notes, before the commit runs.
     fn step_starter_pack_reaches_the_commit_hook(&self) -> StepResult {
         let settings = self.read_json(&self.settings())?;
-        let command = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
-            .as_str()
-            .ok_or("no PreToolUse command in settings.json")?;
-        let parts = split_command(command);
+        let parts = hook_parts(&settings["hooks"]["PreToolUse"][0]["hooks"][0]).ok_or("no PreToolUse command in settings.json")?;
         let mut cmd = Command::new(&parts[0]);
         cmd.args(&parts[1..]);
         let home = self.home();
@@ -667,10 +676,7 @@ impl Smoke {
     /// `cwd`, with `payload` on stdin. The raw stdout.
     fn run_hook(&self, event: &str, cwd: &Path, payload: Value) -> Result<String, String> {
         let settings = self.read_json(&self.settings())?;
-        let command = settings["hooks"][event][0]["hooks"][0]["command"]
-            .as_str()
-            .ok_or_else(|| format!("no {event} command in settings.json"))?;
-        let parts = split_command(command);
+        let parts = hook_parts(&settings["hooks"][event][0]["hooks"][0]).ok_or_else(|| format!("no {event} command in settings.json"))?;
         let mut cmd = Command::new(&parts[0]);
         cmd.args(&parts[1..]);
         let home = self.home();

@@ -19,8 +19,9 @@
 # The setup program reads them itself; see "Use THOR on a second machine" in
 # README.md.
 #
-# Nothing here needs administrator rights, and nothing is installed outside
-# your own user folder.
+# If git or Microsoft's Visual C++ runtime is missing, winget installs it first
+# (Windows may ask permission once). THOR itself needs no administrator rights
+# and is installed only in your own user folder.
 
 $ErrorActionPreference = 'Stop'
 # Without this, Invoke-WebRequest spends most of its time drawing a progress
@@ -42,17 +43,65 @@ if ([Environment]::Is64BitOperatingSystem -ne $true) {
     throw "Only 64-bit Windows is published. Build from source for anything else."
 }
 
+# Programs THOR needs are installed here first, by winget, in this console (no
+# new window). Windows may ask permission once per program - that click is the
+# only part nobody else can do.
+function Test-Winget {
+    return [bool](Get-Command winget -ErrorAction SilentlyContinue)
+}
+
+# A program installed a moment ago is not on the PATH of this console yet:
+# read the PATH again from Windows itself.
+function Update-SessionPath {
+    $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    $user = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $env:Path = (@($machine, $user) | Where-Object { $_ }) -join ';'
+}
+
+function Install-WithWinget([string]$id) {
+    & winget install --id $id -e --source winget --silent --accept-package-agreements --accept-source-agreements
+    return ($LASTEXITCODE -eq 0)
+}
+
+function Test-Git {
+    return [bool](Get-Command git -ErrorAction SilentlyContinue)
+}
+
+# git: THOR reads a project's code with it, and Claude Code runs its hooks
+# through Git Bash. THOR's own hooks work without it, so a failure here is
+# said plainly and the install carries on.
+if (-not (Test-Git)) {
+    Write-Host "Installing git first: THOR reads a project's code with it, and Claude Code runs its hooks through it."
+    if (Test-Winget) {
+        [void](Install-WithWinget 'Git.Git')
+        Update-SessionPath
+    }
+    if (Test-Git) {
+        Write-Host "git is installed."
+    } else {
+        Write-Host "git could not be installed here (winget is missing or the install did not finish). Carrying on without it: THOR works, but it cannot read a project's code until git is installed from https://git-scm.com/download/win."
+    }
+}
+
 # The programs need Microsoft's Visual C++ runtime. Without it Windows opens a
 # modal error box when a program starts, which nobody can click away from a
-# script, so look first and say exactly what to do. Most machines already have
-# it. If this one does not: winget installs it, and Windows may ask permission
-# once - that click is the only part nobody else can do.
+# script, so look first. Most machines already have it; if this one does not,
+# install it the same way.
 $system = [Environment]::GetFolderPath('System')
-$missing = @('vcruntime140.dll', 'msvcp140.dll') | Where-Object { -not (Test-Path (Join-Path $system $_)) }
-if ($missing) {
-    throw ("The Microsoft Visual C++ runtime is missing ($($missing -join ', ')). Install it with this one command, " +
-        "then run this script again: winget install --id Microsoft.VCRedist.2015+.x64 -e --silent " +
-        "(Windows may ask for permission once - click Yes).")
+$runtimeFiles = @('vcruntime140.dll', 'msvcp140.dll')
+$missing = @($runtimeFiles | Where-Object { -not (Test-Path (Join-Path $system $_)) })
+if ($missing.Count -gt 0) {
+    Write-Host "Installing Microsoft's Visual C++ runtime first: THOR's programs cannot start without it."
+    if (Test-Winget) {
+        [void](Install-WithWinget 'Microsoft.VCRedist.2015+.x64')
+    }
+    $missing = @($runtimeFiles | Where-Object { -not (Test-Path (Join-Path $system $_)) })
+    if ($missing.Count -gt 0) {
+        throw ("The Microsoft Visual C++ runtime is missing ($($missing -join ', ')) and could not be installed here, " +
+            "so THOR's programs would not start. Nothing was installed. Install it from " +
+            "https://aka.ms/vs/17/release/vc_redist.x64.exe, then run this script again.")
+    }
+    Write-Host "The Visual C++ runtime is installed."
 }
 
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("thor-install-" + [System.Guid]::NewGuid().ToString('N'))

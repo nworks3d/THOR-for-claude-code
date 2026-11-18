@@ -23,6 +23,8 @@ it), do not use the steps below: go to "A second machine" further down.
      as written in "What the machine needs first" right below this list. Say in
      one sentence what you are about to install and why. The system may show ONE
      permission prompt for it; that click is the person's, and they type nothing.
+     On Windows the install command below installs a missing git and a missing C++
+     runtime by itself first, so you only check them yourself on other systems.
    - Then run the one command for their system:
      - Windows, in PowerShell:
        `irm https://raw.githubusercontent.com/nworks3d/THOR-for-claude-code/main/install.ps1 | iex`
@@ -71,9 +73,9 @@ person to type or paste anything, and never offer them a choice of ways.
 
 | Needed | Why | Check | Windows (winget) | macOS (brew) | Linux |
 | --- | --- | --- | --- | --- | --- |
-| git | Reads a project's code and keeps that reading fresh after a commit, a merge or pull, a rebase and a branch switch. On Windows, Git for Windows also provides Git Bash, the shell Claude Code runs its hooks through. | `git --version` | `winget install --id Git.Git -e --source winget --silent --accept-package-agreements --accept-source-agreements` | `brew install git` | apt: `sudo apt-get install -y git`; dnf: `sudo dnf install -y git` |
+| git | Reads a project's code and keeps that reading fresh after a commit, a merge or pull, a rebase and a branch switch. On Windows, Git for Windows also provides Git Bash, the shell Claude Code runs its hooks through. On Windows `install.ps1` installs it itself when it is missing, so there only check it on the other systems. | `git --version` | `winget install --id Git.Git -e --source winget --silent --accept-package-agreements --accept-source-agreements` | `brew install git` | apt: `sudo apt-get install -y git`; dnf: `sudo dnf install -y git` |
 | Python 3 | Helper scripts that assistants write and run for a person's work commonly use it. | `python --version` (`python3 --version` on macOS and Linux) must print `Python 3.` The Microsoft Store stub that opens the Store instead is NOT Python. | `winget install --id Python.Python.3.12 -e --source winget --silent --accept-package-agreements --accept-source-agreements` | `brew install python` | apt: `sudo apt-get install -y python3`; dnf: `sudo dnf install -y python3` |
-| The C++ runtime (Windows only) | THOR's programs need it; nearly every machine has it. `install.ps1` checks it and stops with this very command if it is missing. | the programs refuse to start | `winget install --id Microsoft.VCRedist.2015+.x64 -e --source winget --silent --accept-package-agreements --accept-source-agreements` | not needed | not needed |
+| The C++ runtime (Windows only) | THOR's programs need it; nearly every machine has it. `install.ps1` installs it itself with this very command if it is missing (and stops only if that fails). | the programs refuse to start | `winget install --id Microsoft.VCRedist.2015+.x64 -e --source winget --silent --accept-package-agreements --accept-source-agreements` | not needed | not needed |
 
 - A program that was just installed is not on the PATH of the terminal you are
   in. Open a new terminal (or ask for a fresh PATH) before you check it again.
@@ -181,9 +183,15 @@ The scripts download `thor2-windows-x86_64.zip` or `thor2-linux-x86_64.tar.gz`
 from the latest release, verify the `.sha256` beside it, unpack it into
 `%USERPROFILE%\thor2` (Windows) or `~/.thor2` (Linux; `THOR_HOME` changes it) and
 run the archive's `install` program with no arguments. On Windows the script first
-checks for Microsoft's Visual C++ runtime, which almost every machine has; if it is
-missing the script stops and prints the one `winget` command that installs it
-(Windows may ask permission once). Nothing needs administrator rights otherwise.
+installs git and Microsoft's Visual C++ runtime with `winget` when they are missing
+(Windows may ask permission once for each; nobody types anything). If git cannot be
+installed the script says so and carries on, because THOR's hooks work without it;
+if the runtime cannot be installed it stops and says why, since the programs could
+not start. THOR itself needs no administrator rights. On Windows the installer
+writes THOR's four hooks in a form that starts the program directly, with no shell
+in between (a `command` plus an `args` list and `onFailure: continue`), so they work
+whether Claude Code runs hooks in Git Bash or in PowerShell; an older shell-form
+entry of THOR's is rewritten in place on the next run and needs one restart.
 
 `install` in the common case takes no arguments at all. It finds Claude Code's own
 two config files by itself - the per-user `settings.json` for the hooks, and

@@ -58,7 +58,7 @@ impl Fx {
                 groups
                     .iter()
                     .flat_map(|g| g["hooks"].as_array().cloned().unwrap_or_default())
-                    .filter_map(|h| h["command"].as_str().map(str::to_string))
+                    .filter_map(|h| serve::missing_programs::hook_command_line(&h))
                     .collect()
             })
             .unwrap_or_default()

@@ -643,6 +643,9 @@ fn set_backup_only(db: Option<PathBuf>, settings: Option<PathBuf>, word: &str) -
         Ok(report) if report.results.iter().all(|(_, o)| *o == HookOutcome::AlreadyPresent) => {
             println!("= the backup was already connected to Claude Code")
         }
+        Ok(report) if report.results.iter().all(|(_, o)| *o == HookOutcome::Upgraded) => {
+            println!("+ rewrote the backup's connection in the form Windows can always start; close Claude Code completely and open it again for that to take effect")
+        }
         Ok(_) => println!("+ connected the backup to Claude Code: it runs when a session starts (at most one copy a day)"),
         Err(e) => {
             eprintln!("the backup folder is ready but connecting it to Claude Code failed: {e}");
@@ -1334,6 +1337,10 @@ fn main() -> ExitCode {
                 println!("= THOR was already connected to Claude Code");
             } else {
                 println!("+ connected THOR to Claude Code ({changed} of {} connections), so your memory speaks up by itself", report.results.len());
+            }
+            let upgraded = report.results.iter().filter(|(_, o)| *o == HookOutcome::Upgraded).count();
+            if upgraded > 0 {
+                println!("  rewrote {upgraded} older connection(s) in the form Windows can always start, with no shell in between; close Claude Code completely and open it again for that to take effect");
             }
             for old in &report.replaced {
                 println!("  fixed an old connection that pointed at a program that no longer exists: {old}");

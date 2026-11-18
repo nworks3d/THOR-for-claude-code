@@ -60,9 +60,10 @@ fn hooks_name_memory_spelled(settings: &Path, spellings: &[std::path::PathBuf]) 
     let Some(events) = root.get("hooks").and_then(|h| h.as_object()) else { return false };
     events.values().filter_map(|groups| groups.as_array()).flatten().any(|group| {
         group.get("hooks").and_then(|h| h.as_array()).is_some_and(|hooks| {
-            hooks.iter().filter_map(|h| h.get("command").and_then(|c| c.as_str())).any(|command| {
-                let command = folded(command);
-                wanted.iter().any(|want| command.contains(want.as_str())) && command.contains(" hook")
+            hooks.iter().filter_map(serve::missing_programs::hook_command_line).any(|command| {
+                let command = folded(&command);
+                wanted.iter().any(|want| command.contains(want.as_str()))
+                    && (command.contains(" hook") || command.contains(" \"hook\""))
             })
         })
     })
@@ -4300,6 +4301,22 @@ mod tests {
         std::fs::write(&physical, b"x").unwrap();
         let settings = settings_with_hook_db(local.path(), &physical);
         assert!(hooks_name_this_memory_in(&settings, &short, local.path()));
+    }
+
+    #[test]
+    fn an_exec_form_hook_counts_as_connected() {
+        let local = tempfile::tempdir().unwrap();
+        let db = local.path().join("thor2").join("thor.db");
+        let hook = serde_json::json!({
+            "type": "command", "command": "C:/thor2/serve.exe",
+            "args": ["--db", db.display().to_string(), "hook"], "onFailure": "continue"
+        });
+        let settings = serde_json::json!({ "hooks": { "PreToolUse": [ { "hooks": [ hook ] } ] } });
+        let path = local.path().join("settings.json");
+        std::fs::write(&path, settings.to_string()).unwrap();
+        assert!(hooks_name_this_memory_in(&path, &db, local.path()));
+        let other = local.path().join("elsewhere").join("thor.db");
+        assert!(!hooks_name_this_memory_in(&path, &other, local.path()), "another memory still does not match");
     }
 
     // ------------------------------------------------------------ identity

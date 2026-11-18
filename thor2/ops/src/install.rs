@@ -629,6 +629,9 @@ pub enum HookOutcome {
     /// An older hook of ours was pointing at a binary that is no longer on
     /// disk, and this run repointed it. See `stale_thor_command`.
     Replaced,
+    /// A hook of ours written in shell form, rewritten in place to exec form
+    /// (Windows). Needs a Claude Code restart to take effect.
+    Upgraded,
 }
 
 /// The executable a hook command calls, when the command has the shape this
@@ -662,8 +665,8 @@ fn stale_thor_command(group: &Value, exe: &str) -> Option<String> {
             continue;
         }
         let command = hook.get("command").and_then(Value::as_str)?;
-        let Some(their_exe) = exe_in_command(command) else { continue };
-        if Path::new(their_exe).file_name() == Some(ours) && !Path::new(their_exe).exists() {
+        let Some(their_exe) = hook_exe(hook) else { continue };
+        if Path::new(&their_exe).file_name() == Some(ours) && !Path::new(&their_exe).exists() {
             return Some(command.to_string());
         }
     }
@@ -694,12 +697,7 @@ fn group_has_command(group: &Value, command: &str) -> bool {
     group
         .get("hooks")
         .and_then(Value::as_array)
-        .map(|hooks| {
-            hooks.iter().any(|h| {
-                h.get("type").and_then(Value::as_str) == Some("command")
-                    && h.get("command").and_then(Value::as_str).is_some_and(|c| same_spelling(c, command))
-            })
-        })
+        .map(|hooks| hooks.iter().any(|h| hook_words(h).is_some_and(|words| words == command_words(command))))
         .unwrap_or(false)
 }
 
@@ -720,6 +718,12 @@ pub(crate) fn flatten_word(word: &str) -> String {
 /// and an unquoted spelling of the same path reduce to the same word. A
 /// backslash is NOT an escape here: on Windows it is the path separator.
 pub(crate) fn command_words(command: &str) -> Vec<String> {
+    raw_command_words(command).iter().map(|w| flatten_word(w)).collect()
+}
+
+/// `command_words` without the path flattening: the words exactly as written,
+/// quotes removed. Exec form needs them this way (a program and its arguments).
+fn raw_command_words(command: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut current = String::new();
     let mut in_word = false;
@@ -732,8 +736,7 @@ pub(crate) fn command_words(command: &str) -> Vec<String> {
             }
             c if c.is_whitespace() && !quoted => {
                 if in_word {
-                    words.push(flatten_word(&current));
-                    current.clear();
+                    words.push(std::mem::take(&mut current));
                     in_word = false;
                 }
             }
@@ -744,9 +747,64 @@ pub(crate) fn command_words(command: &str) -> Vec<String> {
         }
     }
     if in_word {
-        words.push(flatten_word(&current));
+        words.push(current);
     }
     words
+}
+
+/// The words of one hook entry, flattened, whichever form it is in: shell form
+/// (`"command"` is the whole line) or exec form (`"command"` is the program and
+/// `"args"` its arguments, one argument per element).
+fn hook_words(hook: &Value) -> Option<Vec<String>> {
+    if hook.get("type").and_then(Value::as_str) != Some("command") {
+        return None;
+    }
+    let command = hook.get("command").and_then(Value::as_str)?;
+    match hook.get("args").and_then(Value::as_array) {
+        None => Some(command_words(command)),
+        Some(args) => {
+            let mut words = vec![flatten_word(command)];
+            words.extend(args.iter().filter_map(Value::as_str).map(flatten_word));
+            Some(words)
+        }
+    }
+}
+
+/// The program one hook entry runs, in either form.
+fn hook_exe(hook: &Value) -> Option<String> {
+    let command = hook.get("command").and_then(Value::as_str)?;
+    if hook.get("args").is_some_and(Value::is_array) {
+        return Some(command.to_string());
+    }
+    exe_in_command(command).map(str::to_string)
+}
+
+/// Write `spec` into one hook entry. Exec form (Windows): the program in
+/// `command`, each argument its own element of `args`, and `onFailure:
+/// continue` so a hook that cannot start never blocks the call it watches.
+/// Shell form: the whole line in `command`, and no `args`.
+fn write_spec(hook: &mut Value, spec: &HookSpec, exec: bool) {
+    let words = raw_command_words(&spec.command);
+    match (exec, words.split_first()) {
+        (true, Some((program, args))) => {
+            hook["command"] = json!(program);
+            hook["args"] = json!(args);
+            hook["onFailure"] = json!("continue");
+        }
+        _ => {
+            hook["command"] = json!(spec.command);
+            if let Some(object) = hook.as_object_mut() {
+                object.remove("args");
+            }
+        }
+    }
+}
+
+/// Whether THOR's hooks are written in exec form on this system: Windows runs
+/// a shell-form line in PowerShell when Git Bash is not installed, and there a
+/// quoted program path followed by arguments does not parse.
+fn exec_form_here() -> bool {
+    cfg!(windows)
 }
 
 /// True iff two command lines call the same program with the same arguments,
@@ -757,10 +815,10 @@ pub fn same_spelling(a: &str, b: &str) -> bool {
     a == b || command_words(a) == command_words(b)
 }
 
-fn new_group(spec: &HookSpec) -> Value {
-    let mut group = json!({
-        "hooks": [ { "type": "command", "command": spec.command } ]
-    });
+fn new_group(spec: &HookSpec, exec: bool) -> Value {
+    let mut hook = json!({ "type": "command" });
+    write_spec(&mut hook, spec, exec);
+    let mut group = json!({ "hooks": [ hook ] });
     if let Some(matcher) = spec.matcher {
         group["matcher"] = json!(matcher);
     }
@@ -797,6 +855,14 @@ pub fn backup_once(path: &Path, raw: &str) -> std::io::Result<std::path::PathBuf
 ///   else's hook, or THOR's own from an earlier install) is left byte-for-
 ///   byte as it was.
 pub fn install_hooks(path: &Path, specs: &[HookSpec]) -> anyhow::Result<InstallReport> {
+    install_hooks_as(path, specs, exec_form_here())
+}
+
+/// `install_hooks` with the form chosen by the caller (`exec` true writes the
+/// exec form of the module docs of `write_spec`). A hook of ours that is
+/// already there in shell form is rewritten in place to exec form when `exec`
+/// is true (outcome `Upgraded`); a hook that is not ours is never touched.
+pub fn install_hooks_as(path: &Path, specs: &[HookSpec], exec: bool) -> anyhow::Result<InstallReport> {
     let existed = path.exists();
     let raw = if existed { fs::read_to_string(path)? } else { "{}".to_string() };
 
@@ -850,7 +916,22 @@ pub fn install_hooks(path: &Path, specs: &[HookSpec]) -> anyhow::Result<InstallR
         let array = array.as_array_mut().expect("checked above: this key is an array");
 
         if array.iter().any(|group| group_has_command(group, &spec.command)) {
-            results.push((spec.event.to_string(), HookOutcome::AlreadyPresent));
+            let wanted = command_words(&spec.command);
+            let mut upgraded = false;
+            if exec {
+                for group in array.iter_mut() {
+                    let Some(hooks) = group.get_mut("hooks").and_then(Value::as_array_mut) else { continue };
+                    for hook in hooks.iter_mut() {
+                        let shell_form = hook.get("args").is_none();
+                        if shell_form && hook_words(hook).is_some_and(|words| words == wanted) {
+                            write_spec(hook, spec, true);
+                            upgraded = true;
+                        }
+                    }
+                }
+            }
+            let outcome = if upgraded { HookOutcome::Upgraded } else { HookOutcome::AlreadyPresent };
+            results.push((spec.event.to_string(), outcome));
             continue;
         }
 
@@ -865,7 +946,7 @@ pub fn install_hooks(path: &Path, specs: &[HookSpec]) -> anyhow::Result<InstallR
             if let Some(hooks) = group.get_mut("hooks").and_then(Value::as_array_mut) {
                 for hook in hooks.iter_mut() {
                     if hook.get("command").and_then(Value::as_str) == Some(old.as_str()) {
-                        hook["command"] = json!(spec.command);
+                        write_spec(hook, spec, exec);
                     }
                 }
             }
@@ -879,7 +960,7 @@ pub fn install_hooks(path: &Path, specs: &[HookSpec]) -> anyhow::Result<InstallR
                 results.push((spec.event.to_string(), HookOutcome::Replaced));
             }
             None => {
-                array.push(new_group(spec));
+                array.push(new_group(spec, exec));
                 results.push((spec.event.to_string(), HookOutcome::Added));
             }
         }
@@ -2231,6 +2312,90 @@ mod tests {
             let sub_at = spec.command.find(" hook").expect("the command must call the hook subcommand");
             assert!(db_at < sub_at, "--db is a global option, so it comes first: {}", spec.command);
         }
+    }
+
+    /// A fresh write in exec form: program in `command`, one argument per
+    /// `args` element, and `onFailure: continue` so a hook that cannot start
+    /// never blocks the tool call it watches (Windows without Git Bash).
+    #[test]
+    fn a_fresh_write_in_exec_form_has_args_and_on_failure_continue() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        install_hooks_as(&path, &specs(), true).unwrap();
+        let written: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        for event in ["SessionStart", "PreToolUse", "UserPromptSubmit", "Stop"] {
+            let hook = &written["hooks"][event][0]["hooks"][0];
+            assert_eq!(hook["type"], json!("command"));
+            assert_eq!(hook["command"], json!("C:\\fake\\serve.exe"), "{event}");
+            assert_eq!(hook["args"], json!(["--db", "C:\\fake\\thor.db", "hook"]), "{event}");
+            assert_eq!(hook["onFailure"], json!("continue"), "{event}");
+        }
+        assert_eq!(written["hooks"]["PreToolUse"][0]["matcher"], json!("*"));
+        // The platform default is exec form on Windows and shell form elsewhere.
+        let other = dir.path().join("platform.json");
+        install_hooks(&other, &specs()).unwrap();
+        let platform: Value = serde_json::from_str(&fs::read_to_string(&other).unwrap()).unwrap();
+        assert_eq!(platform["hooks"]["Stop"][0]["hooks"][0].get("args").is_some(), cfg!(windows));
+    }
+
+    /// A shell-form entry of ours from an older install is rewritten in place
+    /// (same group, same position), and a second run changes nothing.
+    #[test]
+    fn an_old_shell_form_entry_of_ours_is_upgraded_in_place_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        install_hooks_as(&path, &specs(), false).unwrap();
+        let old: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(old["hooks"]["Stop"][0]["hooks"][0].get("args").is_none());
+
+        let upgrade = install_hooks_as(&path, &specs(), true).unwrap();
+        assert!(upgrade.results.iter().all(|(_, o)| *o == HookOutcome::Upgraded), "{:?}", upgrade.results);
+        let now: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        for event in ["SessionStart", "PreToolUse", "UserPromptSubmit", "Stop"] {
+            assert_eq!(now["hooks"][event].as_array().unwrap().len(), 1, "{event}: rewritten in place, not appended");
+            let hook = &now["hooks"][event][0]["hooks"][0];
+            assert_eq!(hook["command"], json!("C:\\fake\\serve.exe"));
+            assert_eq!(hook["args"], json!(["--db", "C:\\fake\\thor.db", "hook"]));
+            assert_eq!(hook["onFailure"], json!("continue"));
+        }
+
+        let before = fs::read(&path).unwrap();
+        let again = install_hooks_as(&path, &specs(), true).unwrap();
+        assert!(again.results.iter().all(|(_, o)| *o == HookOutcome::AlreadyPresent), "{:?}", again.results);
+        assert_eq!(fs::read(&path).unwrap(), before, "a second run must not change the file");
+    }
+
+    /// A hook that is not ours, in either form, is never touched by an upgrade.
+    #[test]
+    fn a_foreign_hook_stays_byte_identical_through_an_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let foreign_shell = json!({"hooks": [{"type": "command", "command": "\"C:\\\\tools\\\\other.exe\" --db \"C:\\\\fake\\\\thor.db\" hook"}]});
+        let foreign_exec = json!({"hooks": [{"type": "command", "command": "node", "args": ["x.js", "hook"]}]});
+        let start = json!({"hooks": {"Stop": [foreign_shell, foreign_exec]}});
+        fs::write(&path, serde_json::to_string_pretty(&start).unwrap()).unwrap();
+
+        install_hooks_as(&path, &specs(), true).unwrap();
+        let now: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(now["hooks"]["Stop"][0], start["hooks"]["Stop"][0]);
+        assert_eq!(now["hooks"]["Stop"][1], start["hooks"]["Stop"][1]);
+        assert_eq!(now["hooks"]["Stop"].as_array().unwrap().len(), 3, "ours was appended after theirs");
+    }
+
+    #[test]
+    fn a_hook_pointing_at_a_vanished_program_is_repointed_in_exec_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let new_exe = dir.path().join("serve.exe");
+        fs::write(&new_exe, b"x").unwrap();
+        install_hooks_as(&path, &standard_hooks("C:\\gone\\serve.exe", "C:\\fake\\thor.db"), true).unwrap();
+        let moved = standard_hooks(&new_exe.display().to_string(), "C:\\fake\\thor.db");
+        let report = install_hooks_as(&path, &moved, true).unwrap();
+        assert!(report.results.iter().all(|(_, o)| *o == HookOutcome::Replaced), "{:?}", report.results);
+        let now: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let hook = &now["hooks"]["Stop"][0]["hooks"][0];
+        assert_eq!(hook["command"], json!(new_exe.display().to_string()));
+        assert_eq!(hook["onFailure"], json!("continue"));
     }
 
     #[test]

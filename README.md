@@ -538,9 +538,9 @@ system's package manager, and asks you for at most one permission click.
    curl -fsSL https://raw.githubusercontent.com/nworks3d/THOR-for-claude-code/main/install.sh | sh
    ```
 
-   (On Windows, if a THOR program refuses to start, install Microsoft's "Visual
-   C++ Redistributable" and paste the line again. Pasting it again is always
-   safe.)
+   (On Windows this line first installs what THOR needs and your computer is
+   missing: git, and Microsoft's "Visual C++ Redistributable". Windows may ask
+   permission once for each; click Yes. Pasting the line again is always safe.)
 3. **Close Claude Code completely and open it again.** Claude Code only learns
    about THOR when it starts, so until you do this nothing is active.
 4. **Make a folder for your topic, and open Claude Code in it.** For example a
@@ -1280,7 +1280,9 @@ do all of this for you if you ask; these are the steps in plain words.
    `settings.json` in the `.claude` folder inside your home folder. Under
    `hooks`, delete the entries for `SessionStart`, `PreToolUse`,
    `UserPromptSubmit` and `Stop` whose command names THOR's `serve` program and
-   ends in `hook`. If you chose a backup, there is one more `SessionStart` entry:
+   ends in `hook` (on Windows the entry reads `"command": "...\serve.exe"` with
+   `"args": ["--db", "...", "hook"]`; on other systems it is one line ending in
+   `hook`). If you chose a backup, there is one more `SessionStart` entry:
    the one whose command runs the `backup` program (`backup.exe` on Windows)
    with `--db` naming your memory and `--repo` naming the `backup-repo` folder
    (or the folder you chose). Delete that one as well. Leave every other entry
