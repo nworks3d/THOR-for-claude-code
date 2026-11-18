@@ -504,10 +504,11 @@ defaults you can change just by saying so.
 
 That first conversation is a short welcome, not a list of settings. It says THOR
 is set up and remembers what you tell it, gives three examples of what to say,
-and asks three short questions, each answered with yes or no per number ("1 yes,
-2 yes, 3 yes"): a daily safety copy of your memory on your computer, the language
-it talks to you in, and the folder where everything for this work is kept and
-where you work from (or "figure it out yourself"). Everything else is already on
+and asks one question over three proposals: a daily safety copy of your memory
+on your computer, the language it talks to you in, and the folder where
+everything for this work is kept and where you work from. Say "yes" to accept
+them all, or tell it by number what you want different ("2 English", "3 figure it
+out yourself"). Everything else is already on
 with sensible defaults. To see all of it, ask: *"what is switched on?"* - you get
 a numbered list in plain words, and anything you do not mention keeps its
 default.
@@ -526,12 +527,12 @@ Redistributable" it installs them itself first.
 2. **Close Claude Code completely and open it again.** Claude Code only learns
    about THOR when it starts, so until you do this nothing is active. In the
    Claude desktop app, quit it from its menu and open it again.
-3. **Answer the three short questions** in your assistant's first message, each
-   with yes or no per number ("1 yes, 2 yes, 3 yes"). One of them is the folder
-   where everything for this work is kept; if your assistant proposes a new
-   folder, from now on you open Claude Code in that folder (in the Claude desktop
-   app, choose that folder when you start a new session). That is the only thing
-   you do differently.
+3. **Say "yes"** to your assistant's first message, which proposes three things
+   (a daily safety copy, the language, and the folder where everything for this
+   work is kept), or tell it by number what you want different. If it proposes a
+   new folder, from now on you open Claude Code in that folder (in the Claude
+   desktop app, choose that folder when you start a new session). That is the
+   only thing you do differently.
 4. **Just work.** Tell your assistant things once ("the tiles come from
    Tilehouse", "we chose the oak worktop") and in any later conversation in that
    folder it already knows. Each folder has its own memory, so nothing from one

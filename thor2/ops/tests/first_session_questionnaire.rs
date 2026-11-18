@@ -103,18 +103,19 @@ fn the_welcome_is_short_plain_and_carries_every_point() {
         "\"Remember that the contractor is called Jan and comes on Tuesdays.\"",
         "\"What do you know about the kitchen?\"",
         "\"That is no longer right: the tiles now come from another shop.\"",
-        "Three short questions. Answer with yes or no per number, for example \"1 yes, 2 yes, 3 yes\":",
-        "1. Shall I make a safety copy of your memory on this computer every day?",
-        "2. I talk to you in <language>. Is that right? (If not, say which language.)",
-        "3. I keep everything for this work in the folder <folder>, and we work from there. Is that right? (If not, name another folder, or say \"figure it out yourself\".)",
+        "This is what I will set up for you:",
+        "1. Every day a safety copy of your memory on this computer.",
+        "2. I talk to you in <language>.",
+        "3. Everything for this work is kept in the folder <folder>, and we work from there.",
+        "Shall I set it up like this? Just say \"yes\", or tell me by number what you want different, for example \"2 English\" or \"3 figure it out yourself\".",
         "\"what is switched on?\"",
     ] {
         assert!(w.contains(must), "the welcome lacks '{must}':\n{w}");
     }
     let numbered: Vec<&str> = w.lines().filter(|l| l.len() > 3 && l.as_bytes()[0].is_ascii_digit() && l[1..].starts_with(". ")).collect();
-    assert_eq!(numbered.len(), 3, "exactly three numbered questions:
+    assert_eq!(numbered.len(), 3, "exactly three numbered proposals:
 {w}");
-    assert!(w.contains("1 yes, 2 yes, 3 yes"), "the yes/no answer example is there");
+    assert_eq!(w.matches("Shall I set it up like this?").count(), 1, "exactly one question");
     let lowered = w.to_lowercase();
     for banned in ["git", "hook", "plan", "helper", "weekly", "changelog", "index", "repository", "commit"] {
         assert!(!lowered.contains(banned), "the welcome mentions '{banned}':\n{w}");
@@ -151,14 +152,17 @@ fn the_full_list_lines_hold_no_jargon_a_beginner_cannot_place() {
 fn the_assistant_sets_language_by_itself_asks_two_questions_and_hides_the_technical_items() {
     let rules = questionnaire::ASSISTANT_RULES;
     for must in [
-        "AUTOMATICALLY",
+        "Proposal 2 (the language)",
         "install --set-language <code> --db <store>",
         "install --set-backup local --db <store>",
         "NEVER mention in the first reply",
         "In a folder that is not a git repository create no CHANGELOG.md and never mention one",
         "ONLY when he asks what is switched on",
         "numbers 1 to 12 are stable",
-        "Question 3 of the welcome",
+        "ONE question over three numbered proposals",
+        "Apply nothing of proposals 1 to 3 before he answers",
+        "a plain \"yes\"",
+        "Proposal 3 (the folder)",
         "never the home folder, the Documents, Desktop or Downloads folder itself, a drive root, or anything under AppData or Program Files",
         "install --topic --db <store>",
         "figure it out yourself",
