@@ -1219,7 +1219,7 @@ pub fn working_contract() -> Vec<model::item::Item> {
             model::store::SETUP_NOTE_ID,
             "Setup is not finished. In your first reply, `lookup first-session-questions` is the \
              one place to read: the exact calls, paths and what to say. Apply the defaults at once \
-             (store 'owner-setup-answers', retract this note, show him the list). Nothing waits.",
+             (store 'owner-setup-answers', retract this note, say the welcome). Nothing waits.",
             "This note is still being served at session start after the owner has already \
              answered these questions and the answers are applied.",
         ),

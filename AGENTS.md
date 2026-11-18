@@ -744,29 +744,30 @@ only the answer guard. The full list is in the memory as the lookup item
 `first-session-questions` (`lookup` with that key) and below on this page: they
 are the same text, rendered from one catalogue in the code.
 
-**Everything the install arranges or switches on is on that numbered list, so
-nothing happens silently.** The list has two layers, because four parts under
-every item was too much to read. **The person is shown only the short layer:** a
-two-line intro, ONE line per item (what it is, and what was chosen for them),
-and how to answer. **The full layer is yours,** in the appendix under the
-assistant rules: per item what it is, why it exists (the real reason or the
-measurement behind it), what was chosen, and how to say no. You state an item's
-why ONCE, and only when the person asks about that number ("why 7") or says no to
-it. **Do not turn it into an interview and never make anyone wait.** The person
-asked for THOR to be installed and nothing more, so every item has a default,
-and the defaults apply without waiting for an answer: apply them, record them,
-retract the setup note, and THEN show the short list in their own language with
-"everything here is already as written - tell me by number what you want
-different". They answer per number ("1 yes, 3 no, 10 local"); anything not
-mentioned keeps the default, and "defaults" or "doe maar" accepts all of it.
-Someone who does not answer at all is answered by the defaults.
+**What the person sees in your first reply is a short welcome, not a list.** It
+says that THOR is set up and remembers what they say, gives three examples of
+what to say, and asks two short questions: a daily safety copy on this computer
+(yes or no) and the language you talk to them in (set automatically to the
+language they write in). The text is in the block below under SAY FIRST; say it in
+their own language. Never mention in that reply the plan, git, hooks, helper
+agents, the weekly check, the work rules, the record of real calls, bug reports,
+changelogs or topic folders.
 
-**Two items are not simply "on".** Backups (10): a fresh install wires NO backup,
-so with the default nothing is backed up; say that once, and that `backup local`
-or a named folder or address starts one (`install --set-backup`, which also makes
-a first copy to prove it works). Changelog (12): the default is yes when the
-project has none, so you create `CHANGELOG.md` in the project you are in, unless
-they say no.
+**Everything the install arranges or switches on is still on a numbered list, so
+nothing happens silently, but it is shown ONLY when the person asks what is
+switched on.** The list has two layers: ONE plain line per item (numbers 1 to 12,
+stable), and for you the detail per item (what it is, why it exists, what was
+chosen, how to say no). You state an item's why ONCE, and only when the person asks
+about that number ("why 7") or says no to it. **Do not turn it into an interview
+and never make anyone wait.** Every item has a default and the defaults apply
+without waiting for an answer: apply them, record them, retract the setup note.
+Anything the person does not mention keeps the default.
+
+**Two items are not simply "on".** Backups (10): a fresh install wires NO backup;
+the welcome asks once, and a yes runs `install --set-backup local`, which also
+makes a first copy to prove it works. Changelog (12): only in a git project that
+has none do you create `CHANGELOG.md`, quietly; in a folder that is not a git
+repository you create none and never mention one.
 
 **When an answer works against them,** say ONCE, in one or two plain sentences,
 why the item exists (its "Why it exists" line in the appendix), then do what they
@@ -792,52 +793,43 @@ facts. The person's own project does not hold this page, so the served text
 carries all of it; it is rendered from one catalogue in the code, here and there.
 
 <!-- questionnaire:begin -->
-THOR is set up. Here is everything the install arranged or switched on, so nothing happens silently, one line each with what I chose for you.
-Nothing here waits for you: ask me about any number and I explain it, say no to any number and I switch it off.
-
-1. Your plan: I read your plan from Claude Code's settings (the settings' answer goes here; when they say nothing, ask: Max, or Pro and smaller?), so THOR's self-check does not eat your usage limit. Default: what the settings say.
-2. Connections: THOR is wired into Claude Code at session start, before each tool call, when you send a message and when a reply ends, so the memory speaks up by itself. Default: on.
-3. Git hooks: every repository refreshes THOR's code index after a commit, a merge or pull, a rebase and a branch switch, and refuses to commit video files or files above 25 MB. Default: on.
-4. Weekly check: about once a week THOR has your assistant tidy the memory (you can also type /thor-eval any time). Default: on.
-5. Work rules: 14 general work habits stored as notes, such as tests before 'done' and never commit a secret; they only inform, except that on Windows two refuse a console window flash. Default: all on.
-6. Helper agents: your main assistant judges while cheaper models do the work in helpers, which can cost less and keeps the chat free. Default: off.
-7. Bug reports: your assistant may offer to report a fault in THOR on GitHub, showing you the exact text first; nothing is sent without your yes. Default: on.
-8. Language: which language should I talk to you in? Name one (for example 'nl') and every reply to you is checked for it. Also short replies, a summary first and six reply rules. Default: your language, not checked; replies short, rules on.
-9. Topic folders: a plain folder with no code, such as recipes or travel plans, can get a memory of its own when you name it. Default: none set up yet.
-10. Backups: NOTHING is backed up until you choose: a copy on this machine, a place you name (a NAS, another computer, a private repository), or none. Default: none yet.
-11. Record of real calls: for 30 days, on this machine only, THOR keeps your commands and replies with passwords and keys blanked, to find rules that would wrongly block you. Default: on.
-12. Changelog: when this project has no changelog I create CHANGELOG.md and note each change in it; say no and I do not. Default: yes, when the project has none.
-
-Answer by number (for example "1 yes, 3 no, 10 local"), ask "why 7" about any number, or say "defaults" to accept all of it; you can change any of it later just by asking.
-
 FOR THE ASSISTANT (do not read this part out)
-- This text is the whole job; you need nothing else. In your first reply, in this order: say the SAY FIRST sentences, make THE TWO CALLS, then show the short list. Every call, command and path you need is written out below (see PATHS ON THIS MACHINE), so never ask him for a path or a command.
-- Show him the short list only: the intro, one line per item and the way to answer. Never paste the detail per item (the last part of this text) at him.
+- This text is the whole job; you need nothing else. In your first reply, in this order: say the welcome of SAY FIRST (in the person's own language, warm and plain, every point kept, nothing technical added), make THE TWO CALLS, and apply the defaults. Every call, command and path you need is written out below (see PATHS ON THIS MACHINE), so never ask him for a path or a command.
+- Apply the defaults NOW, in this same turn, without waiting for an answer, so nothing waits: store the Report 'owner-setup-answers' with them and retract the setup note. Never ask the same question twice and never hold up his work for an answer.
+- Language: set it AUTOMATICALLY, in this same turn, to the language he writes in: when it is nl, en, de, fr or es run install --set-language <code> --db <store> (for any other language set nothing). Put that language in question 2 of the welcome. When he answers 'no, X': if X is one of the five run install --set-language <code of X> --db <store> and say in one sentence that it is switched; otherwise say plainly that it cannot be checked but that you will still write in it. Then revise 'owner-setup-answers' with the language.
+- Question 1 of the welcome (a daily safety copy): on a yes run install --set-backup local --db <store> and say the result in one plain sentence (it makes a copy on this computer and a first copy at once to prove it works; if it failed, say so and why in plain words, and when git is missing say that the copy needs git). On a no do nothing and do not ask again. Until he says yes nothing is backed up.
+- NEVER ask about the plan: record what the settings say with install --set-plan max|small --db <store> (Pro and any plan below Max count as small, and Max counts as max; a plan the settings did not name is small) and never mention it.
+- NEVER mention in the first reply: the plan, git, hooks, helper agents, the weekly check, the work rules, the record of real calls, bug reports, changelogs or topic folders. They are on the full numbered list and come up only when he asks.
+- The full numbered list (THE FULL LIST below) is shown ONLY when he asks what is switched on (for example "what is switched on?"), never in the first reply. Show him the short list only: the intro, one line per item and the way to answer; never paste the detail per item (the last part of this text) at him. Its numbers 1 to 12 are stable and in order.
 - The detail per item is yours: state an item's Why once, only when he asks about a number ("why 7") or refuses it, in one or two plain sentences, then do what he decided. If he asks and has not refused, add how to say no.
-- Apply the defaults NOW, in this same turn, without waiting for an answer, so nothing waits: store the Report 'owner-setup-answers' with them and retract the setup note. Then show the short list in the user's own language, once, and say that every default on it is already on, except helper agents, backup and the language check, which stay off until he chooses, and that he can tell you by number what he wants different (for example "1 yes, 3 no, 10 local"; "defaults" or "doe maar" accepts all of it).
-- Anything he does not mention keeps the default. Never ask the same question twice and never hold up his work for an answer.
-- Item 6 (helper agents) is off by default: say that once, in one sentence after the list, with the way to start ("helpers on"); do nothing for it until he answers yes, then run install --set-helpers on --db <store> and tell him it is on.
-- Item 10 (backups) is the second one whose default is NOT on: a fresh install wired no backup, so with the default nothing is backed up. Say that once, in one sentence, after the list, with the way to start ("backup local", or the folder or address he wants); do nothing for it until he answers.
-- Item 8 (language) is a question, and no language is checked until he names one: say that once, in one sentence after the list. When he names a language (nl, en, de, fr or es), run install --set-language <code> --db <store>, tell him from then on a reply to him in another language is sent back once, and revise 'owner-setup-answers' with the language.
-- Item 12 (changelog): the default is yes when this project has none. Unless he says no, create CHANGELOG.md in the project this session runs in (a '# Changelog' heading with an 'Unreleased' section, nothing invented; a project that already has one is left alone) and keep a version number only if the project already has one or he asks for one. If he says no, create nothing and do not ask again.
-- Question 1: if the settings named a plan, ask him to confirm it with its reason; if they did not, ask which plan outright with the same reason. Say plainly that Pro and any plan below Max count as small, and Max counts as max. Until he says otherwise, a plan the settings did not name is small. Record his word with install --set-plan max|small --db <store>.
+- Anything he does not mention keeps the default. Item 6 (helper agents) is off by default: do nothing for it until he says "helpers on", then run install --set-helpers on --db <store> and tell him it is on.
+- Item 10 (backups) is also off until he chooses: the welcome asks the daily copy on this computer; a place he names (a folder or an address) is install --set-backup <place> --db <store>.
+- Item 12 (changelog): only in a project that is a git repository and has no CHANGELOG.md, create CHANGELOG.md in the project this session runs in (a '# Changelog' heading with an 'Unreleased' section, nothing invented) and keep a version number only if the project already has one or he asks for one; do not mention it in the first reply. In a folder that is not a git repository create no CHANGELOG.md and never mention one. If he says no, create nothing and do not ask again.
 - When he answers, apply each number where it belongs, then REVISE 'owner-setup-answers' (never store a second copy): 1 install --set-plan; 2 remove only THOR's four hook entries from the settings file (item 2 below says which and what stays), then tell him it takes effect after he restarts Claude Code (to switch them back on, run the installer again with `install --db <store>`: it wires the four entries again, a second run changes nothing, and a restart of Claude Code is needed again); 3 git config --global --unset core.hooksPath (turns off all of it), or only the video and size check: git config --global thor.mediagate.enabled false; 4 install --set-weekly-check off|on; 5 retract the named notes (a retracted note stops arriving; a note whose refusing check bites, such as windowless-processes-on-windows or scheduled-task-not-interactive once THOR has tried it, is refused at the retract, so first clear its check with mcp__thor__revise(id, clear_check: true, because: <why, 20+ characters>) and then retract it); 6 install --set-helpers on|off --db <store> (on stores the two helper notes, off retracts them; running it again changes nothing); 7 install --set-mode off (or release); 8 the language: install --set-language <code>|off --db <store> (nl, en, de, fr or es; an unknown code is refused with the list), and for the reply rules the reply file beside the store (guard-response-rulebook.json); 9 install --topic, run from inside the folder; 10 install --set-backup local|<folder or address>|off --db <store> (it makes the git folder, adds a named place as the remote 'nas', connects one session-start backup and makes a first copy to prove it works: tell him that result in plain words, and if it failed say so and why); 11 install --set-recording on|off --db <store>; 12 CHANGELOG.md as above.
 - A bad answer is one that works against him (for example switching off the connections and then expecting the memory to speak). Say ONCE, in one or two plain sentences, why the item exists (its 'Why' in the detail), then do what he decided. He has the final word, you never block and never nag.
 - A THOR line that says a THOR program is missing (an antivirus may have quarantined it): tell him in one plain sentence what it found and the Windows Security steps it names. You may OFFER, once and never unasked, to add a Windows Defender exclusion for the THOR program folder: say what it does and its risk (Defender stops scanning every file in that folder), that Windows shows one administrator prompt, and that saying no is fine. Only after his clear yes run the exact command the line gives (Start-Process powershell -Verb RunAs -WindowStyle Hidden, running Add-MpPreference -ExclusionPath on the folder) and check it with (Get-MpPreference).ExclusionPath. Never change any other Windows security setting.
 - A fact he tells you whose anchor you do not know (for example "staging needs the VPN" and he has not named the host): never invent a hostname, and never leave the fact unstored or ask him first. Store it with the best real anchor you do have (a file or a command it is about); when there is none, store it as kind orientation with always true (pinned, so it still comes back), with its falsifier. Then offer once, in one sentence, to attach it to the hostname if he gives it, and when he does, revise that note with the target (kind host, value the hostname).
 - "He does not want any of this" is itself a valid answer: record it as the answers and apply nothing.
 
-SAY FIRST (before anything else, in his language, no jargon):
-"This remembers what you tell me about your work, so you never have to repeat it. It brings the right thing back at the right moment."
+SAY FIRST (before anything else, in his own language, exactly this and nothing more; put the language he writes in where <language> stands):
+THOR is set up. From now on I remember what you tell me about your work, and I bring it back by myself when it matters - also in a new conversation next week.
+You do not have to learn anything. Just talk to me as you always do. For example:
+- "Remember that the contractor is called Jan and comes on Tuesdays."
+- "What do you know about the kitchen?"
+- "That is no longer right: the tiles now come from another shop."
+Everything is already set up for you. Two short questions, answer only if you want to:
+1. Shall I make a safety copy of your memory on this computer every day? (yes or no)
+2. I talk to you in <language>. Is that right? (yes, or name another language)
+Want to see everything that is switched on? Ask me: "what is switched on?"
 
 THE TWO CALLS (make them in this order, in your first reply, whatever he answers; use the THOR tools remember and retract):
 remember(
   id:   "owner-setup-answers",
   kind: "report",
-  text: "Setup finished with the defaults, nothing asked first. Plan: <as detected or told>. The defaults on the numbered list apply, except helper agents, backup and the language check, which stay off until the owner chooses (changelog: yes when the project has none). Replies: short and plain, in the owner's own language (not checked until he names one). Lane: work only. Projects: named after their folder. Any of these changes when the owner says so."
+  text: "Setup finished with the defaults, nothing asked first. Plan: <as detected>. The defaults on the numbered list apply, except helper agents and backup, which stay off until the owner chooses (changelog: yes, only in a git project that has none). Language: set automatically to the language the owner writes in. Replies: short and plain, in the owner's own language. Lane: work only. Projects: named after their folder. Any of these changes when the owner says so."
 )
 retract(id: "walk-through-the-answer-guard-once", reason: "Setup finished: the owner's answers are on record as owner-setup-answers.")
-Give the report NO project: a store this fresh has not named a scope yet, so do not invent one and do not ask him to name one. The retract is refused until the remember call has landed, so make them in this order. When he later answers by number, apply each answer where it belongs (the rules above), then revise 'owner-setup-answers' with what he chose; a second copy is worse than none. "He is not interested" is also a valid answer to record.
+Give the report NO project: a store this fresh has not named a scope yet, so do not invent one and do not ask him to name one. The retract is refused until the remember call has landed, so make them in this order. When he later answers the two questions or by number, apply each answer where it belongs (the rules above), then revise 'owner-setup-answers' with what he chose; a second copy is worse than none. "He is not interested" is also a valid answer to record.
 
 PATHS ON THIS MACHINE (use them exactly; never ask him for a path)
 - The installer program: the install program in the thor2 folder (install.exe on Windows). Wherever this text says `install ...`, run this program with those arguments (a quoted path runs as a command in Bash; in PowerShell put & in front).
@@ -850,13 +842,32 @@ THREE MORE FACTS (give them in your own words, without a question):
 - Project names. Every checkout is scoped by its folder name automatically - facts stay inside that project and do not compete across projects. If a folder name does not match how they call the project, they can run `install --project <name> --db <store>` from inside the checkout to override it. Only when they tell you a name, use it - never invent one.
 - The memory is theirs to correct. A changed fact is corrected with `revise`, never stored a second time - though weakening any rule (clearing or changing its check, lowering its severity, dropping or replacing a binding, narrowing a checked rule's reach, taking a quoted call or a flag out of its text, or turning it into a report) needs a reason too, the same as removing one. Clearing one of those fields outright uses its own `clear_*` flag on `revise` (`clear_check`, `clear_severity`, and so on), not an empty value. A fact that is simply wrong is removed with `retract` and a reason. A true fact that fired in the wrong place is marked as noise with `mark`, instead of being deleted.
 
+THE FULL LIST (show it ONLY when he asks what is switched on, never in the first reply):
+Here is everything THOR has switched on for you, so nothing happens silently - one line each.
+Nothing here waits for you: ask me about any number and I explain it, say no to any number and I switch it off.
+
+1. Your Claude plan: I noticed which Claude subscription you have (as Claude's settings say), so THOR's weekly self-check does not use up your usage allowance. Default: taken from Claude's settings.
+2. Link to Claude: THOR is linked into Claude Code (the program you talk to me in) at four moments - when a conversation starts, before I use a tool, when you send a message and when I finish a reply - so the memory speaks up by itself. Default: on.
+3. Code tracking: for software projects kept with git, THOR keeps its map of your code current and stops video files or files over 25 MB being saved into a project by mistake. Default: on.
+4. Weekly tidy-up: about once a week I tidy THOR's memory for you, and you can ask for it any time by typing /thor-eval. Default: on.
+5. Work habits: 14 good working habits are stored as notes I follow, such as running the tests before I say something is done and never saving a password where others can see it. They only remind me; none blocks normal work. Default: all on.
+6. Helper assistants: I can hand big jobs to cheaper helper assistants working in the background, which can cost less and keeps our chat free. Default: off.
+7. Reporting faults: if THOR finds a fault in itself I may offer to report it to its makers, and I show you the exact text first; nothing is sent without your yes. Default: on.
+8. Language and replies: I talk to you in the language you write in, keep replies short with a summary first, and follow six reply rules that my replies are checked against. Default: on.
+9. Folders for a subject: an ordinary folder without code, such as recipes or travel plans, can get a memory of its own when you tell me which folder. Default: none yet.
+10. Safety copy: NOTHING is backed up until you choose: a copy on this machine, a place you name (a NAS, another computer or a private online store), or none. Default: none yet.
+11. Record of my work: for 30 days, only on this machine, THOR keeps the commands I ran and my replies (passwords and keys blanked out) to find rules that would wrongly block you. Default: on.
+12. Change log: in a software project kept with git that has none, I create CHANGELOG.md (a file listing each change) and note each change in it; say no and I do not. Default: yes, in such projects.
+
+Answer by number (for example "1 yes, 3 no, 10 local"), ask "why 7" about any number, or say "defaults" to accept all of it; you can change any of it later just by asking.
+
 DETAIL PER ITEM (for the assistant: state an item's Why once, only when he asks about a number or refuses it; never read all of this out)
 
 1. Your plan
-   What it is: I looked at Claude Code's own settings to find out which plan you have: Max, or Pro and smaller. Pro and any plan below Max count as "small" (install --set-plan small); Max counts as "max" (install --set-plan max). Ask: 'The settings say <Max | Pro or smaller>. Is that right?' - or, when they do not say, 'Which is it: Max, or Pro and smaller?'
+   What it is: I looked at Claude Code's own settings to find out which plan you have: Max, or Pro and smaller. Pro and any plan below Max count as "small" (install --set-plan small); Max counts as "max" (install --set-plan max). Record what the settings say, and small when they say nothing. Never ask him about it and never mention it unless he asks.
    Why it exists: THOR checks itself on a schedule, and that check draws on the same usage limit as your own work, so on a smaller plan it runs once a week at most and never daily, which keeps your limit for you; on Max it also runs daily while something is found wrong.
    What I chose: The plan the settings say; small (Pro or smaller) when they do not say, until you say otherwise.
-   To say no: Tell me the right plan and I record it, so the schedule follows what you really pay for.
+   To say no: If he says the plan is wrong, I record the right one, so the schedule follows what he really pays for.
 
 2. The connections to Claude Code
    What it is: THOR is wired into Claude Code at four moments: when a session starts, before each tool call, when you send a message, and when a reply ends. That is how the memory speaks up by itself and how replies get checked. A backup copy of Claude Code's settings file was made first.
@@ -895,9 +906,9 @@ DETAIL PER ITEM (for the assistant: state an item's Why once, only when he asks 
    To say no: I switch it off (install --set-mode off): nothing is offered and nothing is sent, ever.
 
 8. Language, reply length and reply rules
-   What it is: Two things. First, the language: you can choose the one your assistant talks to you in (nl, en, de, fr or es). Once you do, a reply meant for you that clearly reads as another language is sent back once to be rewritten in yours, also right after a machine message such as a helper's report. Short replies, code, file names and quoted text are never judged, and a reply the detector is unsure about is left alone. Until you choose, no language is checked. Second, the shape: your assistant answers short, with a plain-language summary first. A small file next to the memory holds six reply rules (a summary first, no reflexive disclaimers, check before asking you to look something up, keep an answer under about 1000 characters, show evidence when saying something was checked, and never say everything was checked without saying what was covered); a reply that breaks one is sent back once to be rewritten. A summary or overview you ask for may run longer.
+   What it is: Two things. First, the language: you can choose the one your assistant talks to you in (nl, en, de, fr or es). I set it automatically to the language you write in (when it is one of those five) and the first reply says so; a reply meant for you that clearly reads as another language is then sent back once to be rewritten in yours, also right after a machine message such as a helper's report. Short replies, code, file names and quoted text are never judged, and a reply the detector is unsure about is left alone. If you say it is the wrong language, I switch it. Second, the shape: your assistant answers short, with a plain-language summary first. A small file next to the memory holds six reply rules (a summary first, no reflexive disclaimers, check before asking you to look something up, keep an answer under about 1000 characters, show evidence when saying something was checked, and never say everything was checked without saying what was covered); a reply that breaks one is sent back once to be rewritten. A summary or overview you ask for may run longer.
    Why it exists: Replies drift into English right after English machine input in real sessions of the maker (measured 2026-11-18), so a written rule is not enough and the choice is checked at the end of every reply, while the reply rules keep a reply short and to the point and were checked against about 6,600 real replies with their false triggers removed.
-   What I chose: No language is checked until you name one; short replies and all the reply rules on.
+   What I chose: The language you write in, set automatically and checked; short replies and all the reply rules on.
    To say no: Name the language you want and I run install --set-language <code> --db <store> (for example nl); to stop checking it again, install --set-language off --db <store>. For the length or a single reply rule, tell me and I change the file or remove just that rule.
 
 9. Folders for a topic
@@ -919,9 +930,9 @@ DETAIL PER ITEM (for the assistant: state an item's Why once, only when he asks 
    To say no: I switch it off (install --set-recording off): nothing new is recorded and the check for wrongly blocking rules then says it has no data; what was already recorded disappears by itself after 30 days.
 
 12. A changelog and version number
-   What it is: A changelog is a file, CHANGELOG.md, with one line for every change you can see, and a version number says which state of the project is running. If this project has none I create the file now and add a line with each change from then on; a project that already keeps one is left as it is.
+   What it is: A changelog is a file, CHANGELOG.md, with one line for every change you can see, and a version number says which state of the project is running. Only in a project that is a git repository and has none do I create the file and add a line with each change from then on; a project that already keeps one is left as it is, and a folder that is not a git repository gets none.
    Why it exists: Every later session, and you, know exactly what changed and which version runs, without digging through history.
-   What I chose: Yes, when this project has none.
+   What I chose: Yes, in a git project that has none.
    To say no: Then I create no file and do not ask again; the starter work rule about changelogs (item 5) stays, and it only applies to a project that keeps one.
 <!-- questionnaire:end -->
 

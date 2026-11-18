@@ -69,21 +69,92 @@ fn the_text_is_plain_ascii_without_dashes_curly_quotes_or_ellipsis_glyphs() {
 }
 
 #[test]
-fn the_plan_item_asks_for_confirmation_and_gives_the_reason_for_each_case() {
+fn the_plan_item_is_recorded_never_asked_and_gives_the_reason_for_each_case() {
     let plan = &questions()[0];
     assert!(plan.why.contains("usage limit") && plan.why.contains("once a week"), "{}", plan.why);
     let max = questionnaire::lookup_text(Some(Detection { plan: Plan::Max, tier_found: true }));
-    assert!(max.contains("The settings say: Max. Is that right?"), "{max}");
+    assert!(max.contains("The settings say: Max, so record max."), "{max}");
     let small = questionnaire::lookup_text(Some(Detection { plan: Plan::Small, tier_found: true }));
-    assert!(small.contains("The settings say: Pro or smaller. Is that right?"), "{small}");
+    assert!(small.contains("The settings say: Pro or smaller, so record small."), "{small}");
     let missing = questionnaire::lookup_text(Some(Detection { plan: Plan::Small, tier_found: false }));
-    assert!(missing.contains("do not say, so which is it: Max, or Pro and smaller?"), "a missing key is asked outright: {missing}");
-    assert!(max.contains(plan.why) && missing.contains(plan.why), "the reason rides with the question in every case, in the detail");
-    // The short list the user sees carries the question itself, in one line.
+    assert!(missing.contains("The settings do not say, so record small."), "a missing key is small, never asked: {missing}");
+    assert!(max.contains(plan.why) && missing.contains(plan.why), "the reason rides with the item in every case, in the detail");
+    assert!(questionnaire::ASSISTANT_RULES.contains("NEVER ask about the plan"));
+    for text in [&max, &small, &missing] {
+        assert!(!text.contains("Is that right?\" - or") && !text.contains("which is it: Max"), "no plan question is left: {text}");
+    }
+    // The line the user sees on the full list says what was noticed, never asks.
     let shown = |d| questionnaire::render_list(Some(d)).lines().find(|l| l.starts_with("1. ")).unwrap().to_string();
-    assert!(shown(Detection { plan: Plan::Max, tier_found: true }).contains("the settings say Max - is that right?"));
-    assert!(shown(Detection { plan: Plan::Small, tier_found: true }).contains("the settings say Pro or smaller - is that right?"));
-    assert!(shown(Detection { plan: Plan::Small, tier_found: false }).contains("which is it, Max or Pro and smaller?"));
+    assert!(shown(Detection { plan: Plan::Max, tier_found: true }).contains("Max, as Claude's settings say"));
+    assert!(shown(Detection { plan: Plan::Small, tier_found: true }).contains("Pro or smaller, as Claude's settings say"));
+    assert!(!shown(Detection { plan: Plan::Small, tier_found: false }).contains('?'));
+}
+
+/// The first reply is a short welcome, not the numbered list: what the person
+/// sees has the three examples and the two questions, and none of the words a
+/// beginner cannot place.
+#[test]
+fn the_welcome_is_short_plain_and_carries_every_point() {
+    let w = questionnaire::render_welcome();
+    for must in [
+        "THOR is set up. From now on I remember what you tell me about your work",
+        "also in a new conversation next week",
+        "You do not have to learn anything. Just talk to me as you always do.",
+        "\"Remember that the contractor is called Jan and comes on Tuesdays.\"",
+        "\"What do you know about the kitchen?\"",
+        "\"That is no longer right: the tiles now come from another shop.\"",
+        "1. Shall I make a safety copy of your memory on this computer every day? (yes or no)",
+        "2. I talk to you in <language>. Is that right? (yes, or name another language)",
+        "\"what is switched on?\"",
+    ] {
+        assert!(w.contains(must), "the welcome lacks '{must}':\n{w}");
+    }
+    let lowered = w.to_lowercase();
+    for banned in ["git", "hook", "plan", "helper", "weekly", "changelog", "index", "repository", "commit"] {
+        assert!(!lowered.contains(banned), "the welcome mentions '{banned}':\n{w}");
+    }
+    assert!(w.is_ascii() && w.chars().count() < 1000, "{} characters", w.chars().count());
+    let text = questionnaire::lookup_text(None);
+    assert!(text.contains(&w), "the served text carries the welcome exactly");
+    let welcome_at = text.find("SAY FIRST").unwrap();
+    let list_at = text.find("THE FULL LIST").unwrap();
+    assert!(welcome_at < list_at, "the welcome comes before the list, which is shown only on request");
+}
+
+/// The first reply must not be held by the reply rules (length, summary first).
+#[test]
+fn the_welcome_is_not_held_by_the_reply_rules() {
+    let rulebook = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../guard-response-rulebook.example.json")).unwrap();
+    let reply = questionnaire::render_welcome().replace("<language>", "English");
+    let verdict = serve::respond::guard_verdict(Some(&rulebook), &reply, "hello", false, None);
+    assert!(verdict.block_reason.is_none(), "{:?}", verdict.block_reason);
+}
+
+/// The lines of the full list are for someone who has never seen a terminal.
+#[test]
+fn the_full_list_lines_hold_no_jargon_a_beginner_cannot_place() {
+    for q in questions() {
+        let lowered = q.line.to_lowercase();
+        for banned in ["hook", "index", "repository", "pretooluse", "tool call", "commit", "agents", "session start"] {
+            assert!(!lowered.contains(banned), "item {} line mentions '{banned}': {}", q.n, q.line);
+        }
+    }
+}
+
+#[test]
+fn the_assistant_sets_language_by_itself_asks_two_questions_and_hides_the_technical_items() {
+    let rules = questionnaire::ASSISTANT_RULES;
+    for must in [
+        "AUTOMATICALLY",
+        "install --set-language <code> --db <store>",
+        "install --set-backup local --db <store>",
+        "NEVER mention in the first reply",
+        "In a folder that is not a git repository create no CHANGELOG.md and never mention one",
+        "ONLY when he asks what is switched on",
+        "numbers 1 to 12 are stable",
+    ] {
+        assert!(rules.contains(must), "the assistant rules lack '{must}'");
+    }
 }
 
 /// The owner found a ten-item list with four parts each overwhelming. What the
@@ -285,7 +356,7 @@ fn a_fresh_store_holds_the_list_under_its_key_and_the_setup_note_points_at_it() 
     for n in 1..=questions().len() {
         assert!(item.text.contains(&format!("\n{n}. ")), "item {n} missing");
     }
-    assert!(item.text.contains("The settings say: Max. Is that right?"), "the detected plan rides in the list");
+    assert!(item.text.contains("The settings say: Max, so record max."), "the detected plan rides in the list");
     assert!(item.text.contains("FOR THE ASSISTANT"), "and so does what to do with the answers");
 
     let note = model::store::show(&store, model::store::SETUP_NOTE_ID).unwrap();
@@ -348,7 +419,7 @@ fn without_known_paths_the_text_describes_each_one_instead_of_leaving_a_hole() {
     let text = questionnaire::lookup_text(None);
     let paths = &text[text.find("PATHS ON THIS MACHINE").unwrap()..];
     assert!(paths.contains("install program in the thor2 folder") && paths.contains("~/.claude/settings.json") && paths.contains("~/.claude.json"), "{paths}");
-    assert!(text.contains("Plan: <as detected or told>"), "the page for any user keeps the plan open");
+    assert!(text.contains("Plan: <as detected>"), "the page for any user keeps the plan open");
 }
 
 #[test]

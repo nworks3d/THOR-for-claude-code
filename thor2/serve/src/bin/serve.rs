@@ -2919,16 +2919,20 @@ fn setup_debt(store: &EventStore) -> Option<String> {
     Some(format!(
         "[THOR] This memory was just installed and its owner has not been walked through setup \
          yet. Do this before anything else, in this same turn, so nothing waits for him: (1) read \
-         the numbered list with lookup key 'first-session-questions' (a short list to show him, \
-         one line per item, and under it the detail per item for you - what it is, why it exists, \
+         the item with lookup key 'first-session-questions' (what to say first, and a full \
+         numbered list that you show him ONLY if he asks what is switched on, with under it the \
+         detail per item for you - what it is, why it exists, \
          what was chosen and how to say no - to use only when he asks about a number or refuses \
          it); (2) store what applies - the \
          defaults: short plain replies, in his own language, the work lane only (nothing personal \
          goes into it), all the starting notes kept, each project named after its folder - as \
          '{answers}' (a Report with no scope is enough - this id needs none, so do not ask him to \
-         name a collection for it); (3) retract '{note}'; (4) show him the list in his own \
-         language, say that every default on it is already on, except backup, which stays \
-         off until he chooses (a fresh install made none, so say that one plainly), and that he can answer by number (for \
+         name a collection for it); (3) retract '{note}'; (4) say the short welcome from that item \
+         in his own language (never the numbered list, and never mention the plan, git, hooks, \
+         helper agents or the weekly check), set his language automatically to the one he writes \
+         in, and ask only the two short questions in it. If he asks what is switched on, show the \
+         list and say that every default on it is already on, except backup, which stays \
+         off until he chooses, and that he can answer by number (for \
          example \"1 yes, 3 no, the rest as you like\"). Whatever he does not mention keeps its \
          default, and you apply the defaults without waiting for an answer. When he does answer, \
          apply each number, say ONCE and plainly why an item exists if his answer works against \
