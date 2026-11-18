@@ -931,3 +931,82 @@ fn a_session_older_than_the_installed_tool_server_is_told_to_restart_and_a_fresh
     assert_eq!(tool_server_stale(S1, None, Some(&mcp)), None, "no transcripts folder");
     assert_eq!(tool_server_stale(S1, Some(&root), None), None, "no tool server path");
 }
+
+// ------------------------------------------- the verdict list does not starve
+
+const OWED: [&str; 6] = ["owed-0", "owed-1", "owed-2", "owed-3", "owed-4", "owed-5"];
+
+/// Six owed rules of `fxp`: `owed-i` was served in `16 - i` sessions, so the
+/// most-served come first and the cap (5) leaves `owed-5` out.
+fn six_owed_rules(fx: &mut Fx) {
+    for (i, id) in OWED.iter().enumerate() {
+        let target = Binding::Target { kind: TargetKind::Command, value: format!("tool{i}") };
+        let item = rule(id, &format!("fixture rule {id} of fxp"), vec![target], None, "fxp");
+        model::store::declare(&mut fx.store, "fixture", "fixture", "fixture", &item).unwrap();
+        serve_in_sessions(fx, id, "old", 16 - i);
+    }
+}
+
+fn serve_in_sessions(fx: &mut Fx, id: &str, prefix: &str, n: usize) {
+    for k in 0..n {
+        let session = format!("{prefix}-{k}");
+        fx.store.append_event(&session, &session, model::store::ASSISTANT_DELIVERY_ACTOR, EventKind::ItemServed, id, None, "{}").unwrap();
+    }
+}
+
+fn list_for(fx: &Fx, session: &str) -> Vec<String> {
+    let tip = fx.store.get_next_seq().unwrap() - 1;
+    model::store::evaluation_judgement_list(&fx.store, Some("fxp"), session, tip)
+}
+
+fn counting_report_skipping_the_list(fx: &mut Fx, session: &str, id: &str) {
+    let root = fx.root();
+    valid_filing(&mut fx.store, &root, session, &report(id, "fxp", "TLDR: skipped what it could not judge."), &format!("toolu_{id}"));
+}
+
+/// FIELD TEST 2026-11-18: a not-judgeable skip settled an item for one filing
+/// only, so the same five most-served items came back at every evaluation and
+/// the rest were never reached. An item a counting report skipped since its
+/// last verdict now waits behind every owed item that was not skipped.
+#[test]
+fn an_item_skipped_in_a_counting_report_drops_behind_an_unskipped_one_with_fewer_sessions() {
+    let mut fx = Fx::new();
+    six_owed_rules(&mut fx);
+    assert_eq!(list_for(&fx, S2), OWED[..5], "fixture sanity: the cap leaves owed-5 out");
+    counting_report_skipping_the_list(&mut fx, S1, "eval-fxp-1");
+    assert_eq!(list_for(&fx, S2), [OWED[5], OWED[0], OWED[1], OWED[2], OWED[3]], "owed-5 has its turn, the skipped ones follow");
+}
+
+#[test]
+fn a_later_verdict_clears_the_skip() {
+    let mut fx = Fx::new();
+    six_owed_rules(&mut fx);
+    counting_report_skipping_the_list(&mut fx, S1, "eval-fxp-1");
+    let root = fx.root();
+    crate::attest::fixture::attested_mark(&mut fx.store, &root, S3, OWED[0], false, "toolu_mark0");
+    serve_in_sessions(&mut fx, OWED[0], "new", 17);
+    assert_eq!(list_for(&fx, S2)[..2], [OWED[0], OWED[5]], "owed again after the verdict, and not skipped since: most-served first");
+}
+
+#[test]
+fn an_item_the_evaluating_session_saw_fire_is_still_listed_first_even_if_skipped() {
+    let mut fx = Fx::new();
+    six_owed_rules(&mut fx);
+    counting_report_skipping_the_list(&mut fx, S1, "eval-fxp-1");
+    // S2 itself is served owed-4 (skipped earlier): it has its own context now.
+    fx.store.append_event(S2, S2, model::store::ASSISTANT_DELIVERY_ACTOR, EventKind::ItemServed, OWED[4], None, "{}").unwrap();
+    assert_eq!(list_for(&fx, S2)[..3], [OWED[4], OWED[5], OWED[0]]);
+}
+
+#[test]
+fn with_every_owed_item_skipped_the_one_skipped_longest_ago_comes_first() {
+    let mut fx = Fx::new();
+    six_owed_rules(&mut fx);
+    counting_report_skipping_the_list(&mut fx, S1, "eval-fxp-1"); // skips 0..=4
+    counting_report_skipping_the_list(&mut fx, S2, "eval-fxp-2"); // skips 5, 0, 1, 2, 3
+    assert_eq!(
+        list_for(&fx, S3),
+        [OWED[4], OWED[0], OWED[1], OWED[2], OWED[3]],
+        "owed-4 was skipped longest ago; the rest were all skipped in the second report, most-served first"
+    );
+}

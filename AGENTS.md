@@ -1120,7 +1120,7 @@ half an hour or more never counts.
      sessions or more without a verdict (a note counts once per session, however
      often it was shown there), the most-served first, at most 5 per evaluation,
      the ones this session saw fire ahead of the rest (the rest stay owed and the
-     next evaluation lists the next ones). A note that fired only in another session
+     next evaluation lists the next ones; a note a counting report skipped as not judgeable waits behind the others until each has had its turn). A note that fired only in another session
      shows where and when it fired; when that is not enough to judge it, skip it
      (see below). Give each one with the THOR tool (`mark`), or skip it
      honestly by tagging the report `not-judgeable:<id>:<reason>` (a real

@@ -294,7 +294,9 @@ evaluation started: exactly the items that fired in THIS session or in another
 session of this project, and had fired in 10
 sessions or more since their last verdict (a fact counts once per session), the
 most-served first and at most 5 per evaluation, the ones this session saw fire
-ahead of the others (the next evaluation lists the next ones). Judge only those. A pinned
+ahead of the others (the next evaluation lists the next ones; a note skipped as
+not-judgeable in an earlier counting report waits behind the others until each has
+had its turn, the one skipped longest ago first). Judge only those. A pinned
 item is never on it: the owner already answered whether it belongs there by
 pinning it. Never `mark` an item that is not on your frozen list, even if it
 fired in the wrong place: a wrong-place firing off the list goes to step 7 as

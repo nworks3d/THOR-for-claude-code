@@ -5935,6 +5935,7 @@ pub fn evaluation_judgement_list(store: &EventStore, project: Option<&str>, sess
     let mut sessions_at_start: HashMap<&str, HashSet<&str>> = HashMap::new();
     let mut fired_here: HashSet<&str> = HashSet::new();
     let mut fired_in_project: HashSet<&str> = HashSet::new();
+    let mut last_verdict: HashMap<&str, i64> = HashMap::new();
     for (seq, kind, id, actor, event_session) in &events {
         if *seq > started_seq {
             continue;
@@ -5952,13 +5953,16 @@ pub fn evaluation_judgement_list(store: &EventStore, project: Option<&str>, sess
             EventKind::ItemMarkedUseful | EventKind::ItemMarkedNoise if attested.contains(seq) => {
                 sessions_at_start.insert(id.as_str(), HashSet::new());
                 fired_in_project.remove(id.as_str());
+                last_verdict.insert(id.as_str(), *seq);
             }
             _ => {}
         }
     }
+    let skipped_at = skip_seqs(store, project, started_seq);
     let live_by_id: HashMap<&str, &Item> = live.iter().map(|(id, it)| (id.as_str(), it)).collect();
-    // (fired in this session, sessions served, id)
-    let mut owed: Vec<(bool, usize, String)> = sessions_at_start
+    // (fired in this session, filing seq of the newest counting report that
+    // skipped it since its last verdict, sessions served, id)
+    let mut owed: Vec<(bool, Option<i64>, usize, String)> = sessions_at_start
         .iter()
         .filter(|(id, sessions)| {
             sessions.len() >= JUDGEMENT_DEBT_AFTER && (fired_here.contains(**id) || fired_in_project.contains(**id))
@@ -5966,16 +5970,55 @@ pub fn evaluation_judgement_list(store: &EventStore, project: Option<&str>, sess
         .filter_map(|(id, sessions)| {
             let item = live_by_id.get(id)?;
             let pinned = item.bindings.iter().any(|b| matches!(b, Binding::Always));
+            let skipped = skipped_at.get(*id).copied().filter(|skip| *skip > last_verdict.get(id).copied().unwrap_or(0));
             (!pinned && project_applies_to(item.project.as_deref(), project))
-                .then(|| (fired_here.contains(id), sessions.len(), id.to_string()))
+                .then(|| (fired_here.contains(id), skipped, sessions.len(), id.to_string()))
         })
         .collect();
-    // THE CAP: what this session saw fire first, then the most-served, ties
-    // by id so the list is the same on every read of the same log. The rest
-    // stay owed store-wide.
-    owed.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)).then_with(|| a.2.cmp(&b.2)));
+    // THE CAP: what this session saw fire first; then what no counting report
+    // skipped since the item's last verdict, the most-served first; then the
+    // skipped ones, the one skipped longest ago first (a skip settles an item
+    // for one filing only, so without this the same most-served items came
+    // back at every evaluation and the rest were never reached). Ties by id so
+    // the list is the same on every read of the same log. The rest stay owed
+    // store-wide.
+    owed.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.1.is_some().cmp(&b.1.is_some()))
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| a.3.cmp(&b.3))
+    });
     owed.truncate(EVALUATION_JUDGEMENT_LIST_CAP);
-    owed.into_iter().map(|(_, _, id)| id).collect()
+    owed.into_iter().map(|(_, _, _, id)| id).collect()
+}
+
+/// For each item id: the filing seq of the NEWEST counting evaluation report
+/// of `project`, filed at or before `until_seq`, that skipped it with a
+/// `not-judgeable` tag. Empty without a project.
+fn skip_seqs(store: &EventStore, project: Option<&str>, until_seq: i64) -> HashMap<String, i64> {
+    let mut out: HashMap<String, i64> = HashMap::new();
+    let Some(project) = project else { return out };
+    for (_, v) in evaluation_validations(store) {
+        if !v.valid || v.project.as_deref() != Some(project) || v.report_seq > until_seq || !validation_still_counts(store, &v) {
+            continue;
+        }
+        let Ok(report) = show(store, &v.report) else { continue };
+        for tag in &report.tags {
+            let Some(rest) = tag.strip_prefix(NOT_JUDGEABLE_TAG_PREFIX) else { continue };
+            // The id is everything before the last colon that leaves a long
+            // enough reason (ids may contain colons).
+            for (at, _) in rest.match_indices(':') {
+                let id = &rest[..at];
+                if not_judgeable_reason(std::slice::from_ref(tag), id).is_some() {
+                    let seq = out.entry(id.to_string()).or_insert(0);
+                    *seq = (*seq).max(v.report_seq);
+                    break;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// The set one evaluation must settle, split by state. `report_tags` are the
