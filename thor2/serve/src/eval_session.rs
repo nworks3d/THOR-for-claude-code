@@ -258,6 +258,19 @@ pub fn running_elsewhere_note(start: &EvaluationStart, idle_minutes: i64) -> Str
 /// `model::store::EVALUATION_IDLE_MINUTES`, and is closed as SUPERSEDED once
 /// it has been quiet longer - never voided: its verdicts and edits stay.
 pub fn try_begin(db: &Path, store: &mut EventStore, session_id: &str, project: &str, started_by: &str) -> Result<Started, StartRefused> {
+    try_begin_in(db, store, session_id, project, started_by, crate::attest::transcripts_root().as_deref())
+}
+
+/// `try_begin`, reading the owner's messages (`crate::said`) from the session
+/// transcripts under `transcripts` instead of the real folder.
+pub fn try_begin_in(
+    db: &Path,
+    store: &mut EventStore,
+    session_id: &str,
+    project: &str,
+    started_by: &str,
+    transcripts: Option<&Path>,
+) -> Result<Started, StartRefused> {
     retire_handover_sidecar(db);
     // The start record is filed under the spelling the memory already has for
     // this project (case, spaces and hyphens do not make a second one), the
@@ -300,6 +313,7 @@ pub fn try_begin(db: &Path, store: &mut EventStore, session_id: &str, project: &
     }
     let mut frozen = model::store::frozen_now(store, session_id, project, started_by, now).ok_or(StartRefused::Store)?;
     frozen.report_id = model::store::free_evaluation_report_id(store, project, &start_date(&frozen));
+    frozen.said = crate::said::freeze(db, transcripts, project, now);
     let id = model::store::evaluation_start_id(project, frozen.started_seq);
     let item = Item {
         id: id.clone(),
@@ -1200,6 +1214,23 @@ fn prompt_excerpt(prompt: &str, word: &str) -> Option<String> {
     Some(format!("{}{}{}", if start > 0 { "..." } else { "" }, body, if end < flat.len() { "..." } else { "" }))
 }
 
+/// Whether a recorded place reads as the NAME OF A TOOL (`Agent`, `Artifact`,
+/// `mcp__thor__remember`): one word with no path or option marks, starting with
+/// a capital letter or `mcp__`. A bare lower-case command word is not one.
+fn looks_like_a_tool_name(place: &str) -> bool {
+    let word = !place.is_empty() && place.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' || c == ':');
+    word && (place.starts_with("mcp__") || place.chars().next().is_some_and(|c| c.is_ascii_uppercase()))
+}
+
+/// An excerpt of a call as it is shown: one line, secrets blanked, at most 120 characters.
+fn call_excerpt(raw: &str) -> String {
+    let one_line = crate::inventory::redact(&raw.split_whitespace().collect::<Vec<_>>().join(" "));
+    match one_line.chars().count() > 120 {
+        true => format!("{}...", one_line.chars().take(120).collect::<String>()),
+        false => one_line,
+    }
+}
+
 /// The line under one judgement item: how often it fired in this session and
 /// where, newest place first - at most `per_item` places.
 pub fn fired_line(fired: Option<&model::store::Firings>, per_item: usize) -> String {
@@ -1212,7 +1243,7 @@ pub fn fired_line(fired: Option<&model::store::Firings>, per_item: usize) -> Str
                 .enumerate()
                 .take(per_item)
                 .map(|(i, t)| match f.excerpts.get(i).and_then(|e| e.as_deref()) {
-                    Some(excerpt) => format!("'{t}' - \"{excerpt}\""),
+                    Some(excerpt) => format!("'{t}' - \"{}\"", crate::inventory::redact(excerpt)),
                     None => format!("'{t}'"),
                 })
                 .collect::<Vec<_>>()
@@ -1234,6 +1265,25 @@ pub fn fired_line(fired: Option<&model::store::Firings>, per_item: usize) -> Str
                     "That place is a typed prompt of the owner: the words '{words}' of it reached this item ({excerpt}). Judge \
                      whether it belonged to a prompt about that; if that is not enough to judge it, skip it with the not-judgeable tag"
                 )
+            } else if let Some((at, tool)) = shown().enumerate().find(|(_, t)| looks_like_a_tool_name(t)) {
+                // A tool call with no command and no file (an Agent or MCP
+                // call) fired it by the tool's name: that name and the date are
+                // all the serving record holds, plus an excerpt when it has one.
+                let excerpt = f
+                    .excerpts
+                    .get(at)
+                    .and_then(|e| e.as_deref())
+                    .map(|e| format!(" and an excerpt of the call: \"{}\"", call_excerpt(e)))
+                    .unwrap_or_else(|| ", and no excerpt of the call".to_string());
+                format!(
+                    "That place is a call of the tool '{tool}' that carried no command and no file: the serving record holds \
+                     the tool's name{excerpt}, and the date above. Judge whether this item belongs at a call of that tool from \
+                     its own text; if that is not enough to judge it, skip it with the not-judgeable tag"
+                )
+            } else if shown().any(|t| t == model::store::FIRED_WITHOUT_TRIGGER) {
+                "That firing was recorded by an older build with no place at all: the record holds only the date above, neither \
+                 a command, a file nor the tool's name. If that is not enough to judge it, skip it with the not-judgeable tag"
+                    .to_string()
             } else {
                 "If this place is not enough to judge it, skip it with the not-judgeable tag".to_string()
             };
@@ -1249,7 +1299,7 @@ pub fn fired_line(fired: Option<&model::store::Firings>, per_item: usize) -> Str
                 .enumerate()
                 .take(per_item)
                 .map(|(i, t)| match f.excerpts.get(i).and_then(|e| e.as_deref()) {
-                    Some(excerpt) => format!("'{t}' - \"{excerpt}\""),
+                    Some(excerpt) => format!("'{t}' - \"{}\"", crate::inventory::redact(excerpt)),
                     None => format!("'{t}'"),
                 })
                 .collect::<Vec<_>>()
@@ -1428,6 +1478,7 @@ pub fn nothing_to_do(frozen: &Frozen) -> bool {
         && frozen.a4_list().is_empty()
         && frozen.dispute_list().is_empty()
         && frozen.outranked.is_empty()
+        && frozen.said.as_ref().map_or(true, |s| s.total == 0)
         && frozen.open_points.is_empty()
         && machine.points.is_empty()
         && quiet_signals
@@ -1546,6 +1597,7 @@ fn render_note(id: &str, frozen: &Frozen, caps: &Caps) -> String {
                 sweep_section(&mut out, id, signals, caps);
             }
             crowded_section(&mut out, id, frozen, caps);
+            said_section(&mut out, frozen);
         }
     }
 
@@ -1820,11 +1872,72 @@ fn crowded_section(out: &mut String, record: &str, frozen: &Frozen, caps: &Caps)
         model::store::EVALUATION_OUTRANKED_LIST,
     ));
     for place in list.iter().take(caps.crowded) {
+        if place.always {
+            // The session start block: its limit is bytes, not a count. The ids
+            // are the pinned facts it cuts, so the note names a few of them.
+            const NAMED: usize = 8;
+            let shown = &place.occupants[..place.occupants.len().min(NAMED)];
+            let rest = place.occupants.len() - shown.len();
+            out.push_str(&format!(
+                "\n      - '{}': {} pinned fact(s) do not fit in the {} bytes a session start carries and are cut from \
+                 it, so they are never shown there: {}{}. Same three exits (fold, bind one to the command, file, tool \
+                 or moment it is about and unpin it, retract a stale one); done when the block fits.",
+                place.label(),
+                place.occupants.len(),
+                model::item::HOOK_OUTPUT_LIMIT_BYTES,
+                quoted(shown),
+                if rest > 0 { format!(" and {rest} more") } else { String::new() }
+            ));
+            continue;
+        }
         out.push_str(&format!("\n      - '{}': {} facts, {}", place.label(), place.occupants.len(), quoted(&place.occupants)));
     }
     if list.len() > caps.crowded {
         out.push_str(&more_line(list.len() - caps.crowded, record));
     }
+}
+
+/// Item f of section 2 of the start note: what the owner typed since the
+/// project's previous evaluation (`Frozen::said`). Only present when there is
+/// a message. Says what it means, the exact command, what to store, when it is
+/// done and an example - a signal without those makes an agent guess.
+fn said_section(out: &mut String, frozen: &Frozen) {
+    let Some(said) = frozen.said.as_ref().filter(|s| s.total > 0) else { return };
+    let waiting = match said.waiting() {
+        0 => String::new(),
+        n => format!(
+            "; the print holds the oldest {} and the {n} newer ones wait for the next evaluation (the next window starts \
+             after the last message printed, so none is dropped)",
+            said.shown
+        ),
+    };
+    let unreadable = match said.unreadable {
+        0 => String::new(),
+        n => format!(" {n} transcript file(s) could not be read and are not on the list."),
+    };
+    out.push_str(&format!(
+        "\n   f. WHAT WENT WRONG AND WHAT THE OWNER WANTS - {} message(s) the owner typed in this project since {} (short and \
+         repeated ones left out, secrets blanked){waiting}.{unreadable} WHAT THIS MEANS: an owner who is new to this never \
+         says \"this is a rule\"; they just talk, so the mistakes made and the wishes that should hold later are in these \
+         messages, in whatever language, and THOR has no word list to find them with. WHAT TO DO: run `{}` (it prints the \
+         list, oldest first, one line each with its date), read every line, then answer three questions. 1. Where did the \
+         owner have to correct you, say something twice, or have something undone? Each of those is a mistake. 2. Which of \
+         those mistakes would happen again in a new conversation if nothing is stored? For each one, look it up first \
+         (mcp__thor__lookup), then store a rule (mcp__thor__remember) or correct the note that should have prevented it \
+         (mcp__thor__revise): one fact per note, bound to the file, command or moment it is about, with a falsifier, never \
+         a secret. 3. Did the owner say how he wants something done, also for later? Store that the same way. In your \
+         report, write a line that starts with `MISTAKES:` and under it one line per mistake: what it was, and the id of \
+         the rule that now prevents it, or one sentence on why it needs none (a one-off). With nothing found, write \
+         `MISTAKES: none`. DONE WHEN: the print command has run in this session after the start and the line is in your \
+         report; THOR checks both and refuses the report without them, but it cannot check the judgement itself. EXAMPLE: \
+         the owner wrote \"I told you to ask before deleting\" after a file was removed: that is a mistake; store a rule \
+         bound to the delete command, falsifier \"the owner says deleting no longer needs asking\", and write \"MISTAKES:\" \
+         then \"- deleted a file without asking: rule ask-before-delete\"; \"ok go ahead with that\" is no mistake and \
+         no wish.",
+        said.total,
+        crate::said::date_of_ms(said.since_ms),
+        said.command
+    ));
 }
 
 /// The start note's words about hook failures that were the machine going to

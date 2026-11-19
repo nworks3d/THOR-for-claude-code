@@ -1516,7 +1516,7 @@ fn declare_inner(
     // a Lookup is exempt by key, costs nothing this ground was built to
     // prevent: every OTHER Report still needs a scope, and this one item
     // stays exactly as findable by id and by search as any other.
-    let is_the_setup_answer = item.id == crate::store::OWNER_SETUP_ANSWERS_ID;
+    let is_the_setup_answer = item.id == crate::store::OWNER_SETUP_ANSWERS_ID || item.id == crate::store::ORDER_ANSWER_ID;
     // A third, as narrow: the outcome Report of a THOR bug candidate is about
     // THOR itself (`crate::store::is_thor_bug_outcome`).
     let is_a_thor_bug_outcome = crate::store::is_thor_bug_outcome(item);
@@ -1715,7 +1715,7 @@ fn dropped_field(name: &'static str) -> Refusal {
 /// validator compares like with like: a section written by a tool server of
 /// another revision is version skew, not an edit. A header with no revision
 /// was written before this existed.
-pub const MACHINE_RENDERER_REV: u32 = 9;
+pub const MACHINE_RENDERER_REV: u32 = 11;
 
 /// The machine section's first line, with `<N>` (the log position the
 /// evaluation started at), `<F>` (the log position it was filed at) and `<R>`

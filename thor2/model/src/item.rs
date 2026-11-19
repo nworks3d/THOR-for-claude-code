@@ -968,6 +968,52 @@ mod tests {
 /// existing caller uses: one definition, two doors.
 pub const MAX_ITEMS: usize = 4;
 
+/// The byte length of `serve::render::FRAMING_LINE`, the first line of every
+/// standing-rules block. The text stays in `serve` (a rule guards it there); the
+/// write gate only needs its size, and a `serve` test fails the day the two
+/// differ.
+pub const FRAMING_LINE_BYTES: usize = 73;
+
+/// The second line of the standing-rules block, right after the framing line.
+pub const STANDING_RULES_HEADER: &str = "Standing rules for this session:";
+
+/// The most bytes a session start hook output may carry (see
+/// `serve::session_start` for how 9,800 was measured). Here, not there, because
+/// the write gate refuses a pin that would not fit in it.
+pub const HOOK_OUTPUT_LIMIT_BYTES: usize = 9_800;
+
+/// Appended to a session start right after Claude Code has summarized the
+/// conversation (`serve::session_start::compact_reminder`). It must always be
+/// shown: it is the one line that says the summary is no proof, so it has a
+/// reserve in the hook output of exactly its own size. Here, not in `serve`,
+/// because the write gate counts that reserve too.
+pub const COMPACT_REMINDER: &str = "[THOR] This session's context was just summarized, so the summary is not proof of anything in it. Before you call something done, tested, flashed, deployed or live, check it again now - run the check, read the file, or ask the machine. Numbers, sizes, names and paths taken from the summary are unverified too: measure them again before you state them.";
+
+/// The one line a session start adds when other extra lines did not fit in what
+/// the standing rules left (`serve::session_start::fit_extras`). It must always
+/// be shown, so that nothing is left out silently: it has a reserve of its own size.
+pub const EXTRAS_DROPPED_NOTE: &str = "[THOR] Some other lines of this session start did not fit in the hook output next to the standing rules and are left out; doctor shows what a start adds.";
+
+/// The bytes the standing rules leave free in a session start for the two lines
+/// that must always be shown, each with its two-byte separator.
+pub const START_EXTRAS_RESERVE_BYTES: usize = COMPACT_REMINDER.len() + 2 + EXTRAS_DROPPED_NOTE.len() + 2;
+
+/// The most bytes the block of standing rules may take: the hook output limit
+/// less the reserve. The write gate refuses a pin past it, and the session start
+/// gives the rules this room first, so what the gate accepts is shown.
+pub const STANDING_BLOCK_LIMIT_BYTES: usize = HOOK_OUTPUT_LIMIT_BYTES - START_EXTRAS_RESERVE_BYTES;
+
+/// One standing rule as its block line, without the newline.
+pub fn standing_line(id: &str, text: &str) -> String {
+    format!("- [{id}] {text}")
+}
+
+/// The bytes the two head lines of a standing-rules block take, newlines
+/// included.
+pub fn standing_head_bytes() -> usize {
+    FRAMING_LINE_BYTES + 1 + STANDING_RULES_HEADER.len() + 1
+}
+
 /// Severity, heaviest first, with a missing severity sinking below every
 /// declared one - never landing between costly and irreversible, and never
 /// silently acting as if it were between irreversible and costly either.

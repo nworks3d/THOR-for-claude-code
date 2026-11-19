@@ -124,14 +124,14 @@ the owner's language, work lane only, every starting note kept), and so does the
 turn-end reminder that holds the session, so a fresh agent that never read
 AGENTS.md finishes the setup in one sentence without asking anything.
 
-Fourteen more notes make up the workflow starter pack, tagged
+Sixteen more notes make up the workflow starter pack, tagged
 `workflow-starter` (`ops::install::workflow_starter_pack`): general
 coding-workflow habits that were marked useful again and again in the store of
 the person who built this, rewritten to hold on any project - a changelog line
 with every user-visible change when the project keeps a changelog, tests run
 and the real result quoted before "done", no secret in a commit, push hygiene,
 a scan before anything goes public, and a few more.
-None is pinned: each is bound to the moment or command it is about (commit,
+Two are pinned (a subject that does not belong to a session gets a session of its own; new files go in the folder of their subject); each of the others is bound to the moment or command it is about (commit,
 push, publish, delete, deploy, install, a `cd`, a
 shell one-liner, `Start-Process`) and arrives right before it, once per
 conversation. Only two carry a check, and only on a Windows install: no
@@ -672,7 +672,7 @@ counts, and without `agent_id` the field changes nothing.
 target/release/doctor.exe --db "<store>"
 ```
 
-Its first line always names the build it was run from (`doctor 2.6.9`), so a
+Its first line always names the build it was run from (`doctor 2.6.11`), so a
 report you paste somewhere says which version made it - every program in this
 directory answers the same way to `--version` or `-V`, on its own, with no
 store needed.

@@ -42,10 +42,12 @@ jobs:
           - name: thor2 / linux (default)
             os: ubuntu-latest
             features: ""
+            smoke_semantic: "no"
           # The client shape, and the one the owner actually runs.
           - name: thor2 / windows (semantic)
             os: windows-latest
             features: "--features semantic"
+            smoke_semantic: "yes"
 
     steps:
       - uses: actions/checkout@v4
@@ -63,7 +65,26 @@ jobs:
       # 1137 tests across 78 binaries.
       - name: Test
         working-directory: thor2
-        run: cargo test --release ${{ matrix.features }} --all-targets
+        # --no-fail-fast: one run shows every failing test binary, not only the
+        # first, so a fix is not found out one push at a time.
+        run: cargo test --release ${{ matrix.features }} --all-targets --no-fail-fast
+
+      # The same new-user walk the release runs on each packaged archive, here on
+      # every push, so a tag never meets it for the first time. The programs
+      # are the ones the Build step made; the test itself checks that this list
+      # still equals SHIPPED_BINS in release.yml.
+      - name: Smoke test (the built programs, like a new user)
+        shell: bash
+        working-directory: thor2
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/smoke-bin"
+          ext=""; [ "$RUNNER_OS" = "Windows" ] && ext=".exe"
+          for b in install doctor serve mcp codeindex backup sync migrate backfill_teeth; do
+            cp "target/release/$b$ext" "$GITHUB_WORKSPACE/smoke-bin/"
+          done
+          THOR_SMOKE_BIN_DIR="$GITHUB_WORKSPACE/smoke-bin" \
+          THOR_SMOKE_SEMANTIC="${{ matrix.smoke_semantic }}" \
+            cargo test --release ${{ matrix.features }} -p ops --test release_smoke -- --ignored --nocapture
 
   # This repository is public and its test fixtures are written while looking at
   # the maintainer's real, private memory store - so private identifiers leak in

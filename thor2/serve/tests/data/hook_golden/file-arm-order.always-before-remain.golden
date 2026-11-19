@@ -1,2 +1,2 @@
 exit 0
-{"decision":"block","reason":"[THOR] rule w-banned forbids this text (\"no file ever carries BANNED-WORD or FIXME\"); found in what is about to be written: \"BANNED-WORD\n\""}
+{"decision":"block","reason":"[THOR] rule w-banned forbids this text (\"no file ever carries BANNED-WORD or FIXME\"); found in what is about to be written: \"BANNED-WORD\n\"","systemMessage":"THOR stopped one step your assistant was about to take, because it went against something saved in the memory earlier. Your assistant will try another way. You do not need to do anything."}

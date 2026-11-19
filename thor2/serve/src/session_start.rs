@@ -73,7 +73,10 @@ pub fn render(items: &[RankedItem]) -> Option<String> {
 /// a multi-byte letter only makes it safer. 9,800 keeps 200 bytes under the
 /// 10,000-character line and 172 under the largest output seen whole; it was
 /// 9,500, which left about one pinned rule of slack on a full block.
-pub const HOOK_OUTPUT_LIMIT_BYTES: usize = 9_800;
+///
+/// The number lives in `model::item`, because the write gate refuses a pin that
+/// would not fit in it; this is the same constant.
+pub const HOOK_OUTPUT_LIMIT_BYTES: usize = model::item::HOOK_OUTPUT_LIMIT_BYTES;
 
 /// The most bytes of rule ids the "did not fit" line names. The rest is
 /// counted ("and N more"). Nothing may be crowded out silently, and the line
@@ -176,7 +179,7 @@ pub fn render_within_ranked(
     if items.is_empty() {
         return None;
     }
-    let head: Vec<String> = vec![crate::render::FRAMING_LINE.to_string(), "Standing rules for this session:".to_string()];
+    let head: Vec<String> = vec![crate::render::FRAMING_LINE.to_string(), model::item::STANDING_RULES_HEADER.to_string()];
     // Claude Code keeps a long hook output in a file and shows the agent only
     // its first 2 KB (measured 2026-10-01: 53 items, 16 KB, 6 visible), so the
     // order decides what is seen. The sort is stable: ids order what is left.
@@ -191,7 +194,7 @@ pub fn render_within_ranked(
     };
     let mut ordered: Vec<&RankedItem> = items.iter().collect();
     ordered.sort_by_key(|r| (place(r), !recent.contains(&r.id), r.item.severity.map_or(3u8, |s| s as u8)));
-    let lines: Vec<String> = ordered.iter().map(|r| format!("- [{}] {}", r.id, r.item.text)).collect();
+    let lines: Vec<String> = ordered.iter().map(|r| model::item::standing_line(&r.id, &r.item.text)).collect();
     let head_len: usize = head.iter().map(|l| l.len() + 1).sum();
     let all_len: usize = head_len + lines.iter().map(|l| l.len() + 1).sum::<usize>();
     // The note names the rules it hides, so its length depends on which rules
@@ -259,49 +262,81 @@ pub fn recent_in_project(db: &std::path::Path, project: Option<&str>, now_unix: 
 }
 
 /// The standing-rules block an interactive session start in `project` would
-/// build, with the other lines a start carries (`start_extras`) taking room: the same
-/// selection, the same ranking and the same fitting as the hook, so doctor and
-/// the session start can never disagree about which rules do not fit. `None`
+/// build: the same selection, the same ranking and the same fitting as the
+/// hook, so doctor and the session start can never disagree about which rules
+/// do not fit. The rules take their room first (`STANDING_BLOCK_LIMIT_BYTES`),
+/// so the other lines of a start never change which rules are shown. `None`
 /// when no standing rule applies.
-pub fn render_for_project(
-    ctx: &DoctorStart,
-    store: &thor_core::event_store::EventStore,
-    db: &std::path::Path,
-    project: Option<&str>,
-    now_unix: i64,
-) -> Option<Rendered> {
+pub fn render_for_project(ctx: &DoctorStart, db: &std::path::Path, project: Option<&str>, now_unix: i64) -> Option<Rendered> {
     let (items, _) = split_for_session_start(crate::decay::retain_live(select(&ctx.candidates, project), &ctx.decay), false);
     let recent = recent_in_project(db, project, now_unix);
-    let (registration, open_points) = project_extras(store, db, project, &ctx.flags());
-    let extras = assemble_extras(ctx.shared.clone(), registration, open_points);
-    let extras_len: usize = extras.iter().map(|e| e.len() + 2).sum();
-    render_within_ranked(&items, HOOK_OUTPUT_LIMIT_BYTES.saturating_sub(extras_len), &recent)
+    render_within_ranked(&items, model::item::STANDING_BLOCK_LIMIT_BYTES, &recent)
+}
+
+/// The extra lines of a start that fit next to `rules_len` bytes of standing
+/// rules, in their order. The rules took their room first
+/// (`STANDING_BLOCK_LIMIT_BYTES`), so the compaction reminder, which must always
+/// be shown, always fits in the reserve. THE ORDER WHEN ROOM IS SHORT: the
+/// reminder, then every short line that someone must act on (the copy line, the
+/// registration notice, open points, a missing program, a copy that does not
+/// answer, the folder notices, the no-project line), in the order they come,
+/// and last the tools overview, which takes what is left and shrinks to fit
+/// (`work_folders::shrink_overview`: fewer tool lines, at the smallest one line).
+/// A line that does not fit is left out, and then ONE line says so
+/// (`EXTRAS_DROPPED_NOTE`, also in the reserve): nothing is left out silently.
+pub fn fit_extras(rules_len: usize, extras: Vec<String>) -> Vec<String> {
+    let cost = |line: &String| line.len() + 2;
+    let is_overview = |line: &String| line.starts_with(crate::work_folders::OVERVIEW_PREFIX);
+    let room = HOOK_OUTPUT_LIMIT_BYTES.saturating_sub(rules_len);
+    let note_cost = model::item::EXTRAS_DROPPED_NOTE.len() + 2;
+    for with_note in [false, true] {
+        let mut left = room.saturating_sub(if with_note { note_cost } else { 0 });
+        left = left.saturating_sub(extras.iter().filter(|e| *e == COMPACT_REMINDER).map(cost).sum());
+        let mut kept: Vec<Option<String>> = vec![None; extras.len()];
+        let mut dropped = false;
+        for (at, line) in extras.iter().enumerate() {
+            if line == COMPACT_REMINDER {
+                kept[at] = Some(line.clone());
+            } else if !is_overview(line) {
+                if cost(line) <= left {
+                    left -= cost(line);
+                    kept[at] = Some(line.clone());
+                } else {
+                    dropped = true;
+                }
+            }
+        }
+        for (at, line) in extras.iter().enumerate().filter(|(_, line)| is_overview(line)) {
+            match crate::work_folders::shrink_overview(line, left.saturating_sub(2)) {
+                Some(text) => {
+                    left -= cost(&text);
+                    kept[at] = Some(text);
+                }
+                None => dropped = true,
+            }
+        }
+        if dropped && !with_note {
+            continue;
+        }
+        let mut out: Vec<String> = kept.into_iter().flatten().collect();
+        if dropped {
+            out.push(model::item::EXTRAS_DROPPED_NOTE.to_string());
+        }
+        return out;
+    }
+    extras
 }
 
 /// What doctor reads ONCE per run for every project it measures: the standing
-/// rules' candidates, the decay state and the extra lines that are the same
-/// for every project. Nothing is recorded or started.
+/// rules' candidates and the decay state. Nothing is recorded or started.
 pub struct DoctorStart {
     candidates: Vec<LiveItem>,
     decay: crate::decay::DecayContext,
-    shared: SharedExtras,
-    copy: bool,
 }
 
 impl DoctorStart {
-    pub fn load(store: &thor_core::event_store::EventStore, db: &std::path::Path) -> Self {
-        let copy = thor_core::copy_mode::is_copy(db);
-        let flags = ExtrasFor { source: Some("startup"), headless: false, subagent: false, record: false, copy, refresh_copy: false };
-        DoctorStart {
-            candidates: crate::live::always_candidates(store),
-            decay: crate::decay::DecayContext::load(store),
-            shared: shared_extras(db, &flags),
-            copy,
-        }
-    }
-
-    fn flags(&self) -> ExtrasFor<'static> {
-        ExtrasFor { source: Some("startup"), headless: false, subagent: false, record: false, copy: self.copy, refresh_copy: false }
+    pub fn load(store: &thor_core::event_store::EventStore, _db: &std::path::Path) -> Self {
+        DoctorStart { candidates: crate::live::always_candidates(store), decay: crate::decay::DecayContext::load(store) }
     }
 }
 
@@ -547,7 +582,7 @@ pub fn split_for_session_start(items: Vec<RankedItem>, headless: bool) -> (Vec<R
 /// the owner's own stored rules (see `render::FRAMING_LINE`'s doc comment
 /// for that other, narrower framing problem - this text is THOR's own,
 /// not the owner's, so it does not need it).
-pub const COMPACT_REMINDER: &str = "[THOR] This session's context was just summarized, so the summary is not proof of anything in it. Before you call something done, tested, flashed, deployed or live, check it again now - run the check, read the file, or ask the machine. Numbers, sizes, names and paths taken from the summary are unverified too: measure them again before you state them.";
+pub use model::item::COMPACT_REMINDER;
 
 /// `Some(COMPACT_REMINDER)` exactly when this SessionStart payload is the
 /// main session's own (`is_subagent` false) and its `source` field reads
@@ -903,6 +938,19 @@ mod tests {
     fn the_hook_budget_stays_under_the_limit_claude_code_shows_whole() {
         assert!(HOOK_OUTPUT_LIMIT_BYTES > 9_500);
         assert!(HOOK_OUTPUT_LIMIT_BYTES <= 9_800, "10,000 characters is the line; 9,972 is the largest seen whole");
+    }
+
+    /// The write gate (`model::store`) counts the block's bytes from numbers in
+    /// `model::item`; they must equal what this module really builds, or a pin
+    /// would be refused or let through on a wrong count.
+    #[test]
+    fn the_write_gates_byte_count_is_the_blocks_real_size() {
+        assert_eq!(model::item::FRAMING_LINE_BYTES, crate::render::FRAMING_LINE.len());
+        let items = select(&many(7, 123), None);
+        let r = render(&items).unwrap();
+        let counted = model::item::standing_head_bytes()
+            + items.iter().map(|i| model::item::standing_line(&i.id, &i.item.text).len() + 1).sum::<usize>();
+        assert_eq!(counted, r.len() + 1, "one newline per line, the last one included");
     }
 
     #[test]

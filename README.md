@@ -299,13 +299,14 @@ at the right moment and hope. Version 2 is the same memory with a spine.
   exception is the pinned notes: those are read out in full at the start of a
   conversation (a new memory starts with 22 of them, and that block is capped at
   about 9,500 bytes), so pin sparingly and the cap does the rest.
-- **The language you are answered in can be checked.** The first-session list asks
-  which language your assistant should talk to you in. Tell it, for example, "Dutch"
-  and it runs `install --set-language nl --db <your memory>` (nl, en, de, fr or es;
-  `off` removes it). From then on a reply to you that clearly reads as another
-  language is sent back once to be rewritten, also right after an English message
-  from a helper or from THOR itself. Short replies, code, quotes, file paths and
-  helpers' reports are never judged, and until you choose, no language is checked.
+- **The language you are answered in is checked.** In its first reply your
+  assistant sets it by itself to the language you write in (nl, en, de, fr or es,
+  with `install --set-language <code> --db <your memory>`) and asks whether that is
+  right; name another one and it switches, and `off` removes it. From then on a
+  reply to you that clearly reads as another language is sent back once to be
+  rewritten, also right after an English message from a helper or from THOR
+  itself. Short replies, code, quotes, file paths and helpers' reports are never
+  judged.
 - **Replies are checked too.** A new memory comes with a small file of six reply
   rules, kept beside it: open a result-like reply with a plain summary, do not
   ask you to check what the assistant can check itself, no reflexive
@@ -501,62 +502,92 @@ download, no paths to type, no Rust to install, no questions to answer - the
 first conversation after the restart finishes the setup on its own, with
 defaults you can change just by saying so.
 
-That first conversation also shows you a numbered list of everything the install
-arranged, one line each. Everything on it is already on, except two things that
-stay off until you choose: helper-agent mode (your main assistant judges while
-cheaper models do the work in helpers; `install --set-helpers on` switches it
-on) and backups (nothing is backed up until you pick `local` or a place). The
-changelog item creates a `CHANGELOG.md` in your project only if it has none and
-you do not say no. Answer by number ("1 yes, 3 no, 10 local"), or say
-"defaults"; anything you do not mention keeps its default.
+That first conversation is a short welcome, not a list of settings. It says THOR
+is set up and remembers what you tell it, gives three examples of what to say,
+and asks one question over three proposals: a daily safety copy of your memory
+on your computer, the language it talks to you in, and the folder where
+everything for this work is kept and where you work from. Say "yes" to accept
+them all, or tell it by number what you want different ("2 English", "3 figure it
+out yourself"). Everything else is already on
+with sensible defaults. To see all of it, ask: *"what is switched on?"* - you get
+a numbered list in plain words, and anything you do not mention keeps its
+default.
 
-### The easy way: five steps, no programming tools
+**If you already worked with Claude before, THOR offers to put that in order.**
+Right after you answer the welcome, it looks (only reading, changing nothing)
+at your earlier conversations with Claude on this computer and at the files they
+left loose in your home folder, Desktop, Documents or Downloads. If there is
+something to order, it sends you one message with a numbered proposal: one fixed
+folder per subject (for example your CV and job hunting, or a renovation), the
+files that belong in it, and what it remembers from those earlier conversations.
+Say "yes" to accept all of it, or "2 no, because ..." to leave one out. Nothing
+is deleted: files are only moved, a file is never overwritten (a taken name gets
+a number), files of a programming project and files outside your home folder
+stay where they are, and every move is written down so your assistant can put
+all of it back whenever you ask. From then on, new files for a subject go in the
+folder of that subject. If there is nothing to order, it says nothing about it.
+THOR makes sure this offer really happens: your assistant cannot skip it, and it
+counts as done only when you answered it yourself (yes, or no for what you do
+not want).
+
+### The easy way: four steps, nothing to type
 
 You need Claude Code, installed and opened at least once. Nothing else to
-prepare: no account, no key. The paste-one-line route below needs neither git nor
-Python. When you let your assistant install THOR instead, it checks your computer
-for git (needed for code projects) and Python (the helper scripts an assistant writes for you commonly use it), installs what is missing through your
-system's package manager, and asks you for at most one permission click.
+prepare: no account, no key, no terminal, no git, no Python. Your assistant does
+the installing; if your computer is missing git or Microsoft's "Visual C++
+Redistributable" it installs them itself first.
 
-1. **Open a terminal.** On Windows press the Windows key, type `PowerShell`
-   and press Enter. On Linux open your Terminal.
-2. **Paste ONE line and press Enter.** It downloads the latest release from this
-   project's GitHub page, checks the download against the checksum published next
-   to it, unpacks it into a `thor2` folder in your home folder, and sets
-   everything up. It prints what it did, in plain words. It needs no
-   administrator rights and installs nothing outside your own user folder.
-
-   Windows, in PowerShell:
-
-   ```powershell
-   irm https://raw.githubusercontent.com/nworks3d/THOR-for-claude-code/main/install.ps1 | iex
-   ```
-
-   Linux:
-
-   ```sh
-   curl -fsSL https://raw.githubusercontent.com/nworks3d/THOR-for-claude-code/main/install.sh | sh
-   ```
-
-   (On Windows, if a THOR program refuses to start, install Microsoft's "Visual
-   C++ Redistributable" and paste the line again. Pasting it again is always
-   safe.)
-3. **Close Claude Code completely and open it again.** Claude Code only learns
-   about THOR when it starts, so until you do this nothing is active.
-4. **Make a folder for your topic, and open Claude Code in it.** For example a
-   folder called `Kitchen renovation` in your Documents, with your notes, quotes
-   and PDFs inside. It does not have to be a programming project. Then tell your
-   assistant: *"Give this folder its own THOR memory, as a topic."*
-5. **Just work.** Tell your assistant things once ("the tiles come from
+1. **Tell your assistant: "Install THOR"** and give it the link to this page.
+   It reads [AGENTS.md](AGENTS.md), runs everything, and checks that it worked.
+   Windows may show one permission window while it installs a missing program:
+   click **Yes**. That is the only click that is not in Claude Code itself.
+   If your assistant says Claude Code stopped it from installing, answer
+   **"yes, go ahead"**. If it is stopped a second time, look under the box where
+   you type: there is a selector that is set to automatic. Set it to the choice
+   that asks you before each step, say "go on", and click to allow when Claude
+   Code asks. You never have to type or paste a command yourself.
+2. **Close Claude Code completely and open it again.** Claude Code only learns
+   about THOR when it starts, so until you do this nothing is active. In the
+   Claude desktop app, quit it from its menu and open it again.
+3. **Say "yes"** to your assistant's first message, which proposes three things
+   (a daily safety copy, the language, and the folder where everything for this
+   work is kept), or tell it by number what you want different. If it proposes a
+   new folder, from now on you open Claude Code in that folder (in the Claude
+   desktop app, choose that folder when you start a new session). That is the
+   only thing you do differently.
+4. **Just work.** Tell your assistant things once ("the tiles come from
    Tilehouse", "we chose the oak worktop") and in any later conversation in that
-   folder it already knows. Each topic folder has its own memory, so nothing from
-   one topic leaks into another. To check that all is well, ask your assistant:
+   folder it already knows. Each folder has its own memory, so nothing from one
+   topic leaks into another. To check that all is well, ask your assistant:
    *"Is THOR working?"* The first lines of its answer are a plain summary.
 
+What your assistant runs for step 1, so you can read it first: it downloads the
+latest release from this project's GitHub page, checks the download against the
+checksum published next to it, unpacks it into a `thor2` folder in your home
+folder, and sets everything up, printing what it did in plain words. It needs
+no administrator rights and installs nothing outside your own user folder
+(apart from git and the C++ runtime when they are missing). Windows, in
+PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/nworks3d/THOR-for-claude-code/main/install.ps1 | iex
+```
+
+Linux:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/nworks3d/THOR-for-claude-code/main/install.sh | sh
+```
+
+On Windows that script installs what is missing - git, and Microsoft's "Visual
+C++ Redistributable" - with the system's package manager (winget), or, when
+that is not there or does not finish, with the program's own official installer
+that it downloads and runs silently, after checking its digital signature.
+Running it again is always safe.
+
 The setup touches two of Claude Code's own files - its settings and the list of
-tools it may use - and backs up both before it does. Rather read the script
-before you run it? Open `install.ps1` or `install.sh` from this repository in a
-browser first. There is no macOS build yet, so on a Mac take the route below.
+tools it may use - and backs up both before it does. There is no macOS build yet,
+so on a Mac your assistant takes the route below.
 Using a different assistant? See
 [Using it from another assistant](#using-it-from-another-assistant) below.
 
@@ -574,8 +605,8 @@ program is gone. To get it back, step by step:
 2. Choose **Virus & threat protection**, then **Protection history**.
 3. Look for an entry that names the THOR file, open it, and choose
    **Actions > Restore**.
-4. No such entry? Run THOR's install again (the same command as in the easy way
-   above): it puts the programs back.
+4. No such entry? Tell your assistant, which runs THOR's install again (the
+   same command as in the easy way above): it puts the programs back.
 
 If it keeps happening, your assistant may **offer** to add a Windows Defender
 exclusion for THOR's program folder. It only does so after you say yes. What
@@ -641,8 +672,8 @@ they only inform, so a rule written for someone else's project cannot block
 yours. The one exception is on Windows: two of them refuse a call that would
 flash a console window (a `Start-Process` that is not hidden, and a scheduled
 task made with `/it`). Ask your assistant to remove any you
-do not want. The two notes that carry helper-agent mode are not among them: that
-mode is off in a new memory.
+do not want. The two notes that carry helper assistants are not among them: that
+mode is on in a new memory, and you switch it off by saying "helpers off".
 
 You only reach for a flag if your setup is unusual: `--settings` and `--mcp-json`
 send it at other files, `--db` and `--serve-exe` override where it looks, and
@@ -835,9 +866,9 @@ part is the one thing THOR cannot do for you.
      If it asks for a user name and password, enter them and tick "Remember my
      credentials". If the folder opens and you can see a folder called `thor2`
      in it (or the backup's own repository files), you are done.
-   - A private repository on a website: on the laptop, open a terminal and run
-     `git ls-remote "<the address>" HEAD`. If it prints a line starting with a
-     long code, you are done. If it asks you to sign in, sign in. If it says
+   - A private repository on a website: your assistant on the laptop checks it
+     itself (it runs `git ls-remote "<the address>" HEAD`; a line starting with a
+     long code means it works). If the website asks you to sign in, sign in. If it says
      "not found" or "access denied", the laptop's account has no access yet:
      add it on the website (Settings, then Collaborators), or ask whoever
      manages that repository.
@@ -850,10 +881,9 @@ part is the one thing THOR cannot do for you.
 
 ### The one command
 
-Open a terminal **inside your project's folder** on the laptop (on Windows:
-open the folder in File Explorer, click the address bar, type `powershell` and
-press Enter). Then paste ONE of these, after replacing the three parts in
-capitals. `YOUR-PROJECT` is the project's name exactly as the main computer
+Tell your assistant on the laptop, in your project's folder, that you want a
+copy: it asks you only for the backup's address and the project's name, and then
+runs ONE of these itself, with the three parts in capitals filled in. `YOUR-PROJECT` is the project's name exactly as the main computer
 knows it (the name of its folder, unless you changed it).
 
 Windows, in PowerShell:
@@ -901,9 +931,9 @@ holds every project's notes, anything personal you wrote as a note is in it, so
 it does not belong on a work or company laptop (use the project choice above
 there).
 
-You do not need to name a project. Open any terminal on the laptop (on Windows:
-press the Windows key, type `powershell`, press Enter), replace
-`THE-BACKUP-ADDRESS` as above, and paste ONE of these:
+You do not need to name a project. Tell your assistant on the laptop that you
+want the whole memory; it fills in `THE-BACKUP-ADDRESS` as above and runs ONE of
+these itself:
 
 Windows, in PowerShell:
 
@@ -987,7 +1017,7 @@ The command either finishes or says plainly that nothing was set up and why:
    conversation). The first session start says: *"This machine runs a copy of
    the memory ... It holds only: project acme-shop, general rules (no project).
    Notes of other projects are not on this machine on purpose."*
-2. **Check it.** Ask your assistant "Is THOR working?", or run this yourself
+2. **Check it.** Ask your assistant "Is THOR working?"; it runs the check itself
    (Windows: `& "$HOME\thor2\doctor.exe" --db "$env:LOCALAPPDATA\thor2\thor.db"`,
    Linux: `~/.thor2/doctor --db ~/.local/share/thor2/thor.db`). The short summary
    at the top says, among other lines: `OK: this is a copy, selection: project
@@ -1120,7 +1150,7 @@ A generic client config, the shape most tool-calling assistants expect:
       "args": [
         "run", "-i", "--rm",
         "-v", "thor-data:/data",
-        "ghcr.io/nworks3d/thor-mcp:2.6.9"
+        "ghcr.io/nworks3d/thor-mcp:2.6.11"
       ]
     }
   }
@@ -1130,7 +1160,7 @@ A generic client config, the shape most tool-calling assistants expect:
 ### Run it as a container
 
 ```bash
-docker run -i --rm -v thor-data:/data ghcr.io/nworks3d/thor-mcp:2.6.9
+docker run -i --rm -v thor-data:/data ghcr.io/nworks3d/thor-mcp:2.6.11
 ```
 
 On an empty volume, the container creates a memory and seeds it with THOR's
@@ -1164,8 +1194,8 @@ part and it is easy to conclude too early that nothing is happening.
 
 **Day one, it stops almost nothing.** A fresh memory holds 22 pinned starting
 notes (how to write one that comes back, plus honesty, agent and hygiene habits
-that hold on any project) and 14 general work rules that arrive right before
-the step they are about. The part of THOR that can refuse a
+that hold on any project) and 16 general work notes (14 work rules that arrive right before
+the step they are about, one that makes a subject that does not belong to a session get a session of its own, and one that keeps new files in the folder of their subject). The part of THOR that can refuse a
 wrong change only works on notes that carry a proof, and you have not written
 any yet. So on the first day you get those notes at the start of a conversation
 and the first-session list described under Getting started, and no refusals,
@@ -1267,10 +1297,31 @@ code lane:
 
 ## Remove THOR completely
 
-Everything the install put on your computer is listed here, with how to undo
-each piece. Nothing is hidden anywhere else. Your own projects and their code
-are never changed, apart from the one small file in step 9. Your assistant can
-do all of this for you if you ask; these are the steps in plain words.
+Just tell your assistant: *"Remove THOR."* It does every step itself and you type
+nothing:
+
+1. It runs `install --uninstall --db "<your memory>"`. That takes out only what
+   THOR put in Claude Code: THOR's connections in the settings (every other entry
+   there is left exactly as it was), THOR's note-saving connection, the
+   `/thor-eval` command, and git's global hooks folder but only when it is
+   THOR's. It then asks you to close Claude Code completely and open it again,
+   and to say "finish removing THOR".
+2. After that restart it asks you one question, once: *do you also want your
+   memory (your notes) deleted?* The safe default is no, it is kept. Then it runs
+   `install --uninstall --finish --db "<your memory>"` (with `--delete-memory`
+   only if you said yes). That refuses while any THOR program is still running,
+   removes the saved copies of Claude Code's settings files that THOR's install
+   made, and ends by naming THOR's program folder.
+3. It deletes that program folder itself (to the Recycle Bin).
+
+**THOR never removes git, Python, Microsoft's Visual C++ runtime or any other
+program, and never offers to.** Claude Code itself uses git on Windows; removing
+it would break your assistant. Your own projects and their code are never
+changed, apart from the one small hidden `.thor-project` file in step 9 below,
+which your assistant also removes on request.
+
+If you ever want to do it by hand, everything the install put on your computer
+is listed here, with how to undo each piece. Nothing is hidden anywhere else.
 
 1. **Close Claude Code completely.** It reads its settings once, when it opens.
 2. **Keep a copy of your notes first, if you might want them again.** Copy the
@@ -1280,7 +1331,9 @@ do all of this for you if you ask; these are the steps in plain words.
    `settings.json` in the `.claude` folder inside your home folder. Under
    `hooks`, delete the entries for `SessionStart`, `PreToolUse`,
    `UserPromptSubmit` and `Stop` whose command names THOR's `serve` program and
-   ends in `hook`. If you chose a backup, there is one more `SessionStart` entry:
+   ends in `hook` (on Windows the entry reads `"command": "...\serve.exe"` with
+   `"args": ["--db", "...", "hook"]`; on other systems it is one line ending in
+   `hook`). If you chose a backup, there is one more `SessionStart` entry:
    the one whose command runs the `backup` program (`backup.exe` on Windows)
    with `--db` naming your memory and `--repo` naming the `backup-repo` folder
    (or the folder you chose). Delete that one as well. Leave every other entry

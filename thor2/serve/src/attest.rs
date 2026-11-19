@@ -279,6 +279,30 @@ fn same_input(a: &Value, b: &Value) -> bool {
     a == b || scalars_as_text(a) == scalars_as_text(b)
 }
 
+/// Whether the transcript's `input` and the arguments the tool server got
+/// (`digest`, from `args_digest`) are the same call. The transcript may hold
+/// only the api-request copy with scalars as text (`"noise": "true"`) while
+/// the server got `noise: true`, so a scalar written as text counts as equal.
+fn input_matches_digest(input: &Value, digest: &str) -> bool {
+    model::store::args_digest(input) == digest || model::store::args_digest(&text_as_scalars(input)) == digest
+}
+
+/// The inverse of `scalars_as_text`: `"true"`, `"false"` and a whole number
+/// written as text become the bool or number they spell.
+fn text_as_scalars(v: &Value) -> Value {
+    match v {
+        Value::String(s) if s == "true" => Value::Bool(true),
+        Value::String(s) if s == "false" => Value::Bool(false),
+        Value::String(s) => match s.parse::<i64>() {
+            Ok(n) if n.to_string() == *s => Value::from(n),
+            _ => v.clone(),
+        },
+        Value::Array(a) => Value::Array(a.iter().map(text_as_scalars).collect()),
+        Value::Object(o) => Value::Object(o.iter().map(|(k, v)| (k.clone(), text_as_scalars(v))).collect()),
+        other => other.clone(),
+    }
+}
+
 /// One id's scan, as a `Found`.
 fn found_of(collected: Option<Collected>) -> Found {
     let Some(collected) = collected else { return Found::Nothing };
@@ -747,7 +771,7 @@ pub fn check_call_in_flight(
         Found::Call(call) if write_tool(&call.name) != Some(tool) => {
             InFlight::SideDoor(format!("{id} is a {} call, not mcp__thor__{tool}", call.name))
         }
-        Found::Call(call) if model::store::args_digest(&call.input) != model::store::args_digest(args) => {
+        Found::Call(call) if !input_matches_digest(&call.input, &model::store::args_digest(args)) => {
             InFlight::SideDoor(format!("the arguments differ from the ones Claude Code sent for {id}"))
         }
         Found::Call(_) => InFlight::Seen,
@@ -850,7 +874,7 @@ fn judge_write(event: &Event, claim: &Claim, found: Found) -> Option<WriteAttest
         let wanted: Vec<String> = tools.iter().map(|t| format!("mcp__thor__{t}")).collect();
         return no(format!("{id} is a {} call, not {}", call.name, wanted.join(" or ")));
     }
-    if model::store::args_digest(&call.input) != claim.digest {
+    if !input_matches_digest(&call.input, &claim.digest) {
         return no("the arguments differ from the ones Claude Code sent".to_string());
     }
     if call.results.is_empty() {
@@ -1308,7 +1332,7 @@ pub fn owner_messages(transcript: &Path, last: usize) -> Result<Vec<String>, Str
 
 /// The owner's own words on one transcript line, or `None` when the line is
 /// not a message he typed (see `owner_messages`).
-fn owner_text(line: &str) -> Option<String> {
+pub fn owner_text(line: &str) -> Option<String> {
     let v: Value = serde_json::from_str(line).ok()?;
     if v.get("type").and_then(|t| t.as_str()) != Some("user") {
         return None;
@@ -2632,6 +2656,36 @@ mod write_tests {
         let replay_verdict = replayed.get(&e.seq).expect("recorded");
         assert!(!replay_verdict.attested, "{replay_verdict:?}");
         assert_eq!(replay_verdict.why, "the arguments differ from the ones Claude Code sent");
+    }
+
+    /// A mark whose transcript holds the call with `"noise": "true"` (Claude
+    /// Code's api-request copy) while the tool server received `noise: true`
+    /// is the same call: attested. A different id or verdict is still not.
+    #[test]
+    fn mark_with_noise_text_in_the_transcript_attests() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = EventStore::in_memory().unwrap();
+        let tool = "mcp__thor__mark";
+        let sent = json!({"id": "b-1", "noise": true});
+        let mut t = main_transcript(root.path(), S);
+        t.call("toolu_N", tool, &json!({"id": "b-1", "noise": "true"})).write();
+        let att = att_for_call(&meta("toolu_N"), Some(S), &sent, "mark", Some(root.path()));
+        assert_eq!(att.inflight.as_deref(), Some(model::store::INFLIGHT_SEEN), "{att:?}");
+        let event = crate::mark::record_noise(&mut store, S, "mcp", "mcp", "2026-09-28T00:00:02Z", "b-1", Some(&att)).unwrap();
+        let marker = write_marker(tool, Some("toolu_N"), Some(&sent)).unwrap();
+        t.hook_context("toolu_N", tool, &marker).result("toolu_N", &format!("marked: b-1 (event seq {})", event.seq)).write();
+        assert!(matches!(verify_write(&event, Some(root.path())), Some(WriteAttestation::Attested { .. })));
+
+        // Red: a different verdict or a different id is still a side door.
+        let useful = json!({"id": "b-1"});
+        let why = check_call_in_flight(&meta("toolu_N"), Some(S), &useful, "mark", Some(root.path()));
+        assert!(matches!(why, InFlight::SideDoor(_)), "{why:?}");
+        let other = json!({"id": "b-2", "noise": true});
+        let why = check_call_in_flight(&meta("toolu_N"), Some(S), &other, "mark", Some(root.path()));
+        assert!(matches!(why, InFlight::SideDoor(_)), "{why:?}");
+        let flipped = json!({"id": "b-1", "noise": false});
+        let why = check_call_in_flight(&meta("toolu_N"), Some(S), &flipped, "mark", Some(root.path()));
+        assert!(matches!(why, InFlight::SideDoor(_)), "{why:?}");
     }
 
     /// The result must name THIS write's seq, exactly: a replayed real id

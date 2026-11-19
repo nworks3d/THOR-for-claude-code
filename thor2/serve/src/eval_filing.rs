@@ -595,6 +595,10 @@ pub fn validate_new_reports(store: &mut EventStore, root: Option<&Path>, session
         }
         let Some(record) = check(store, &id, root).record else { continue };
         if record_validation(store, &record).is_some() {
+            // A report that counts moves the cursor of what the owner said.
+            if record.valid {
+                crate::said::advance_for_valid(store, &record);
+            }
             written.push(record);
         }
     }

@@ -110,6 +110,7 @@ pub const RESERVED_ACTORS: &[&str] = &[
     "eval-machine",
     "eval-validator",
     "attester",
+    "order-earlier",
     "teeth-probe",
     "hook",
 ];
@@ -230,6 +231,9 @@ pub fn reserved_id_owner(entity_id: &str) -> Option<&'static str> {
     if entity_id == A4_CUTOFF_ID {
         return Some(RETEST_ACTOR);
     }
+    if entity_id == ORDER_EVIDENCE_ID {
+        return Some(ORDER_ACTOR);
+    }
     None
 }
 
@@ -288,6 +292,11 @@ fn reserved_id_refusal(store: &EventStore, entity_id: &str, owner: &str) -> Refu
                 "run {} from inside the checkout instead",
                 register_command_for(store.path().as_deref())
             ),
+        }
+    } else if owner == ORDER_ACTOR {
+        Refusal {
+            problem: format!("'{entity_id}' is THOR's own record of the tidy step, written only by `serve inventory` and `install --tidy` themselves"),
+            fix: format!("do the tidy step of the first-session text; give your own item an id other than '{ORDER_EVIDENCE_ID}'"),
         }
     } else if owner == RETEST_ACTOR {
         Refusal {
@@ -961,6 +970,7 @@ pub fn revise<'a>(
     updated: &Item,
 ) -> Result<Event, WriteError> {
     let actor = fence(store, actor.into(), &updated.id)?;
+    guard_order_note(store, actor, &updated.id)?;
     // BOTH sides are normalised before the dropped-field check. An item
     // already stored with project "global" is a global item; rewriting it as
     // `None` says the same thing, so it must not read as dropping the field.
@@ -1089,6 +1099,7 @@ pub fn revise_tried_scoped<'a>(
     att: Option<&Att>,
 ) -> Result<Event, WriteError> {
     let actor = fence(store, actor.into(), &updated.id)?;
+    guard_order_note(store, actor, &updated.id)?;
     let existing = normalized(existing);
     let updated = normalized(updated);
     let before = normalized(before);
@@ -2446,9 +2457,11 @@ pub enum Capacity {
 /// Which live items would compete with `item` at the moment `binding` stands
 /// for.
 ///
-/// `Always` is deliberately not a pool: session start serves every pinned
-/// item in full and caps nothing, so a pin never takes another pin's place
-/// (CONTRACT: the five surfaces never share a candidate pool).
+/// `Always` is deliberately not a pool here: session start ranks nothing, so a
+/// pin never takes another pin's place by rank (CONTRACT: the five surfaces
+/// never share a candidate pool). What it CAN run out of is bytes: the block
+/// holds `HOOK_OUTPUT_LIMIT_BYTES`, and that place is counted separately
+/// (`standing_overflow_refusal`, `standing_overflow_place`).
 ///
 /// Scope follows what actually gets served: a project item competes with its
 /// own project and with the global tier that reaches every project. A GLOBAL
@@ -2643,7 +2656,7 @@ fn busiest_narrower_call<'a>(
 pub fn capacity(store: &EventStore, item: &Item) -> anyhow::Result<Capacity> {
     let bindings: Vec<&Binding> =
         item.bindings.iter().filter(|b| !matches!(b, Binding::Always)).collect();
-    if bindings.is_empty() || !item.kind.can_fire() {
+    if (bindings.is_empty() && !is_standing(item)) || !item.kind.can_fire() {
         return Ok(Capacity::Fine);
     }
     let candidates = if store.heads_projection_current() {
@@ -2651,6 +2664,16 @@ pub fn capacity(store: &EventStore, item: &Item) -> anyhow::Result<Capacity> {
     } else {
         live_items_from_fold(store)?
     };
+
+    // THE ALWAYS PLACE IS A PLACE TOO: the session start block holds what fits
+    // in `HOOK_OUTPUT_LIMIT_BYTES`, and a pin that no longer fits would push a
+    // standing rule out of it. Refused like a full file or command place.
+    if let Some(refusal) = standing_overflow_refusal(&candidates, item) {
+        return Ok(Capacity::Full(refusal));
+    }
+    if bindings.is_empty() {
+        return Ok(Capacity::Fine);
+    }
 
     if let Some(refusal) = full_reliable_anchor(&candidates, item, &bindings) {
         return Ok(Capacity::Full(refusal));
@@ -2887,6 +2910,146 @@ pub fn capacity_for_revise(
         describe(binding)
     )))
 }
+
+/// Whether `item` is served at every session start: a firing kind bound
+/// `Always` (the filter `serve::session_start::select` applies).
+fn is_standing(item: &Item) -> bool {
+    item.kind.can_fire() && item.bindings.iter().any(|b| matches!(b, Binding::Always))
+}
+
+/// The standing items the session start block of `project` (`None`: a block
+/// with global items only) holds: the live ones that apply there, with
+/// `replacing` standing in for its own earlier version, or added when it is new.
+/// Counts the stale ones `serve::decay` would drop too, so it errs towards
+/// refusing, never towards a silent cut.
+fn standing_in_block<'a>(
+    candidates: &'a [(String, Item)],
+    project: Option<&str>,
+    replacing: Option<&'a Item>,
+) -> Vec<(&'a str, &'a Item)> {
+    let mut block: Vec<(&str, &Item)> = candidates
+        .iter()
+        .filter(|(_, other)| is_standing(other) && project_applies_to(other.project.as_deref(), project))
+        .filter(|(id, _)| replacing.is_none_or(|r| r.id != *id))
+        .map(|(id, other)| (id.as_str(), other))
+        .collect();
+    if let Some(new) = replacing {
+        if is_standing(new) && project_applies_to(new.project.as_deref(), project) {
+            block.push((new.id.as_str(), new));
+        }
+    }
+    block
+}
+
+/// The bytes a block of `items` takes, the way `serve::session_start` lays it out.
+fn standing_block_bytes(items: &[(&str, &Item)]) -> usize {
+    crate::item::standing_head_bytes()
+        + items.iter().map(|(id, item)| crate::item::standing_line(id, &item.text).len() + 1).sum::<usize>()
+}
+
+/// Refuses a write that would make a session start block overflow
+/// `HOOK_OUTPUT_LIMIT_BYTES`: it adds `Always` to an item, or makes a pinned
+/// item's text longer, in a block that would then no longer fit. The block of a
+/// project is its own pinned items plus the global ones; a global write is
+/// judged in every project that has a pin and in the global-only block.
+///
+/// WHY A REFUSAL: a block that does not fit cuts the rest and only NAMES it
+/// (`serve::session_start::not_fit_note`), so a standing rule is silent for the
+/// whole session. Measured on the owner's store: 24 pinned notes did not fit.
+/// A write that leaves a block as it was or smaller (an unpin, a shorter text, a
+/// change to some other field) is never refused, so the exits below stay open
+/// even in a store that already overflows.
+fn standing_overflow_refusal(candidates: &[(String, Item)], item: &Item) -> Option<Refusal> {
+    if !is_standing(item) {
+        return None;
+    }
+    let was_standing = candidates.iter().find(|(id, _)| *id == item.id).is_some_and(|(_, prev)| is_standing(prev));
+    let mut projects: Vec<Option<&str>> = vec![item.project.as_deref()];
+    if item.project.is_none() {
+        let mut named: Vec<&str> = candidates.iter().filter(|(_, o)| is_standing(o)).filter_map(|(_, o)| o.project.as_deref()).collect();
+        named.sort();
+        named.dedup();
+        projects.extend(named.into_iter().map(Some));
+    }
+    let mut worst: Option<(usize, Option<&str>)> = None;
+    for project in projects {
+        let before = standing_block_bytes(&standing_in_block(candidates, project, None));
+        let after = standing_block_bytes(&standing_in_block(candidates, project, Some(item)));
+        if after <= crate::item::STANDING_BLOCK_LIMIT_BYTES || (was_standing && after <= before) {
+            continue;
+        }
+        if worst.is_none_or(|(bytes, _)| after > bytes) {
+            worst = Some((after, project));
+        }
+    }
+    let (after, project) = worst?;
+    let block = standing_in_block(candidates, project, Some(item));
+    let mut biggest: Vec<(&str, usize)> =
+        block.iter().map(|(id, o)| (*id, crate::item::standing_line(id, &o.text).len() + 1)).collect();
+    biggest.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    let named = biggest.iter().take(5).map(|(id, bytes)| format!("'{id}' ({bytes} bytes)")).collect::<Vec<_>>().join(", ");
+    let whose = match project {
+        Some(p) => format!("the session start block of project '{p}' (its own pinned facts and the global ones)"),
+        None => "the session start block (the global pinned facts)".to_string(),
+    };
+    Some(Refusal {
+        problem: format!(
+            "{whose} would be {after} bytes with this write, over the {} bytes the standing rules may take in a session start (the rest is kept for two lines that must always \
+             be shown), so a standing rule would be cut from it and only named. {} pinned fact(s) stand in it, this one included; \
+             the largest: {named}",
+            crate::item::STANDING_BLOCK_LIMIT_BYTES,
+            block.len()
+        ),
+        fix: "make room first, then this write goes through untouched. FOLD: revise one pinned fact to carry \
+              another's point, then retract the other with a reason naming the survivor. MOVE: bind one pinned fact \
+              to the command, file, tool or moment it is really about and unpin it, so it comes back right before \
+              that step instead of at every start. RETRACT: retract a stale one, with a reason saying what changed. \
+              Do NOT store the fact as an unbound Report to get past this: a Report never fires, so it would be \
+              saved and never come back."
+            .to_string(),
+    })
+}
+
+/// The pinned facts of `project`'s block that do NOT fit `HOOK_OUTPUT_LIMIT_BYTES`
+/// right now, as a crowded place; `None` while the block fits. Order and fitting
+/// follow `serve::session_start::render_within_ranked` without its recency
+/// ranking (not known here): this project's facts first, then global heavy,
+/// house style and unweighted; a line that does not fit is skipped and the next
+/// may still fit. The occupants are the ones left out, in that order.
+fn standing_overflow_place(candidates: &[(String, Item)], project: &str) -> Option<OutrankedPlace> {
+    let mut block = standing_in_block(candidates, Some(project), None);
+    if standing_block_bytes(&block) <= crate::item::STANDING_BLOCK_LIMIT_BYTES {
+        return None;
+    }
+    let place = |item: &Item| -> u8 {
+        match (item.project.is_some(), crate::item::severity_rank(item.severity)) {
+            (true, _) => 0,
+            (false, rank) if rank <= crate::item::severity_rank(Some(crate::item::Severity::Costly)) => 1,
+            (false, rank) if rank <= crate::item::severity_rank(Some(crate::item::Severity::HouseStyle)) => 2,
+            (false, _) => 3,
+        }
+    };
+    block.sort_by_key(|(_, item)| (place(item), crate::item::severity_rank(item.severity)));
+    let mut used = crate::item::standing_head_bytes();
+    let mut left_out: Vec<String> = Vec::new();
+    for (id, item) in &block {
+        let line = crate::item::standing_line(id, &item.text).len() + 1;
+        if used + line > crate::item::STANDING_BLOCK_LIMIT_BYTES {
+            left_out.push(id.to_string());
+        } else {
+            used += line;
+        }
+    }
+    (!left_out.is_empty()).then(|| OutrankedPlace {
+        kind: crate::item::TargetKind::Path,
+        value: STANDING_PLACE_LABEL.to_string(),
+        occupants: left_out,
+        always: true,
+    })
+}
+
+/// How an evaluation names the always place.
+pub const STANDING_PLACE_LABEL: &str = "the pinned standing rules (session start block)";
 
 /// One binding, in the words a refusal can use.
 fn describe(binding: &Binding) -> String {
@@ -3215,11 +3378,19 @@ pub struct OutrankedPlace {
     /// The ids of the facts on it at the start: refusing rules first, then by
     /// weight, then by id.
     pub occupants: Vec<String>,
+    /// The ALWAYS place: the pinned facts of the session start block, which
+    /// holds what fits in `HOOK_OUTPUT_LIMIT_BYTES`. Then `kind` and `value` are
+    /// only a label and `occupants` are the pinned facts that do not fit now.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub always: bool,
 }
 
 impl OutrankedPlace {
     /// "src/a.rs" or "npm run deploy (command)".
     pub fn label(&self) -> String {
+        if self.always {
+            return STANDING_PLACE_LABEL.to_string();
+        }
         match self.kind {
             crate::item::TargetKind::Command => format!("{} (command)", self.value),
             _ => self.value.clone(),
@@ -3316,9 +3487,20 @@ pub fn outranked_places(store: &EventStore, project: &str) -> Vec<OutrankedPlace
             })
             .collect();
         ordered.sort();
-        places.push(OutrankedPlace { kind, value, occupants: ordered.into_iter().map(|(_, _, id)| id.to_string()).collect() });
+        places.push(OutrankedPlace {
+            kind,
+            value,
+            occupants: ordered.into_iter().map(|(_, _, id)| id.to_string()).collect(),
+            always: false,
+        });
     }
     places.sort_by(|a, b| b.occupants.len().cmp(&a.occupants.len()).then_with(|| a.value.cmp(&b.value)));
+    // An overflowing session start block is listed first, whatever its count:
+    // it is the one place where standing rules are cut, and it must never fall
+    // off the end of the list.
+    if let Some(standing) = standing_overflow_place(&candidates, project) {
+        places.insert(0, standing);
+    }
     places.truncate(EVALUATION_OUTRANKED_LIST);
     places
 }
@@ -3340,6 +3522,11 @@ pub fn evaluation_outranked_owed(store: &EventStore, start: &EvaluationStart) ->
         .outranked
         .iter()
         .filter_map(|place| {
+            if place.always {
+                // Settled when the block fits again; owed with the facts that
+                // are left out now.
+                return standing_overflow_place(&candidates, project).map(|now| (place.label(), now.occupants));
+            }
             let rivals = place_occupants(&candidates, project, place.kind, &place.value);
             (rivals.len() > crate::item::MAX_ITEMS && place_has_an_honest_exit(store, &rivals))
                 .then(|| (place.label(), rivals.iter().map(|(id, _)| id.clone()).collect()))
@@ -4358,6 +4545,72 @@ fn project_applies_to(item_project: Option<&str>, checkout_project: Option<&str>
     item_project.is_none() || item_project == checkout_project
 }
 
+/// The trigger a serving carries at the session start block (`serve session-start`).
+pub const SESSION_START_TRIGGER: &str = "session start";
+
+/// The log seq of the last write that CHANGED the bindings of the item whose
+/// events are `events` (oldest first), 0 when they never changed. Two writes
+/// with the same bindings (a revise of the text or the falsifier) are no
+/// change, however the list is ordered.
+fn bindings_changed_at(events: &[Event]) -> i64 {
+    let key = |item: &Item| {
+        let mut parts: Vec<String> = item.bindings.iter().filter_map(|b| serde_json::to_string(b).ok()).collect();
+        parts.sort();
+        parts
+    };
+    let mut last = 0;
+    let mut before: Option<Vec<String>> = None;
+    for event in events.iter().filter(|e| matches!(e.kind, EventKind::FactCreated | EventKind::FactRevised)) {
+        let Ok(item) = parse_body(&event.body) else { continue };
+        let now = key(&item);
+        if before.as_ref().is_some_and(|b| *b != now) {
+            last = event.seq;
+        }
+        before = Some(now);
+    }
+    last
+}
+
+/// THE SESSIONS A FIRING COUNTS FROM TOWARD THE VERDICT DEBT. `servings` are
+/// the (log seq, session) of the item's assistant firings since its last
+/// attested verdict. A firing counts only while the place it fired at is still
+/// a place the item is bound to, and nobody can judge one that is not (field
+/// reports, four in one week: an item listed for a verdict because of
+/// session-start firings although it was no longer pinned).
+///
+/// What the serving record holds decides how exactly that can be told. It holds
+/// the trigger text only (a command, a file path, "session start" or nothing),
+/// not which binding matched it, so:
+/// - PRECISE where the record is enough: a session-start firing counts only
+///   while the item is still pinned (an `Always` binding);
+/// - FALLBACK for every other firing: one from before the item's last change
+///   of bindings does not count (`bindings_changed_at`).
+/// A revise that leaves the bindings as they are changes nothing here, so it
+/// is no way to dodge a verdict. An item with fewer than `JUDGEMENT_DEBT_AFTER`
+/// sessions is returned as it is: it cannot reach the debt either way.
+pub fn counted_sessions(store: &EventStore, id: &str, servings: &[(i64, String)]) -> HashSet<String> {
+    let all: HashSet<String> = servings.iter().map(|(_, s)| s.clone()).collect();
+    if all.len() < JUDGEMENT_DEBT_AFTER {
+        return all;
+    }
+    let Ok(events) = store.get_events_by_entity(id) else { return all };
+    let changed = bindings_changed_at(&events);
+    let pinned = show(store, id).is_ok_and(|item| item.bindings.iter().any(|b| matches!(b, Binding::Always)));
+    let at_session_start: HashSet<i64> = events
+        .iter()
+        .filter(|e| e.kind == EventKind::ItemServed)
+        .filter(|e| {
+            serde_json::from_str::<crate::served::ItemServed>(&e.body).ok().and_then(|b| b.trigger).as_deref() == Some(SESSION_START_TRIGGER)
+        })
+        .map(|e| e.seq)
+        .collect();
+    servings
+        .iter()
+        .filter(|(seq, _)| *seq >= changed && (pinned || !at_session_start.contains(seq)))
+        .map(|(_, session)| session.clone())
+        .collect()
+}
+
 /// Mirrors `serve::usefulness::served_since_last_verdict` exactly: how many
 /// times each item has fired (`ItemServed`, stamped by `ASSISTANT_DELIVERY_
 /// ACTOR`) since its own last ATTESTED verdict (an `ItemMarkedUseful`/
@@ -4369,20 +4622,21 @@ fn project_applies_to(item_project: Option<&str>, checkout_project: Option<&str>
 fn served_since_last_verdict_local(store: &EventStore) -> HashMap<String, usize> {
     let Ok(events) = store.firings_and_verdicts() else { return HashMap::new() };
     let attested = attested_write_seqs(store);
-    // Counted once per session (step 28): the sessions served since the last verdict.
-    let mut sessions: HashMap<String, HashSet<String>> = HashMap::new();
+    // Counted once per session (step 28): the sessions served since the last
+    // verdict, and only the firings that still count (`counted_sessions`).
+    let mut servings: HashMap<String, Vec<(i64, String)>> = HashMap::new();
     for (seq, kind, id, actor, session) in events {
         match kind {
             EventKind::ItemServed if actor == ASSISTANT_DELIVERY_ACTOR => {
-                sessions.entry(id).or_default().insert(session);
+                servings.entry(id).or_default().push((seq, session));
             }
             EventKind::ItemMarkedUseful | EventKind::ItemMarkedNoise if attested.contains(&seq) => {
-                sessions.insert(id, HashSet::new());
+                servings.insert(id, Vec::new());
             }
             _ => {}
         }
     }
-    sessions.into_iter().map(|(id, sessions)| (id, sessions.len())).collect()
+    servings.into_iter().map(|(id, list)| { let n = counted_sessions(store, &id, &list).len(); (id, n) }).collect()
 }
 
 /// How many live, non-pinned items THIS project owes a verdict on right now,
@@ -5041,6 +5295,41 @@ pub struct Frozen {
     /// then names the plain `eval-<project>-<date>` id.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub report_id: String,
+    /// What the owner typed since the project's previous evaluation, frozen as
+    /// a window and counts only (`SaidFrozen`): the owner's own words are never
+    /// written to the log. `None` when the list was empty and every transcript
+    /// could be read, and for a record written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub said: Option<SaidFrozen>,
+}
+
+/// The frozen part "what the owner said" of an evaluation start (`serve::said`
+/// builds it). Only the window and the counts are kept; the messages are read
+/// again from the session transcripts, inside the same window, by `serve said`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SaidFrozen {
+    /// The window's lower end, in milliseconds since 1970: only messages typed
+    /// AFTER it are on the list.
+    pub since_ms: i64,
+    /// The window's upper end, in milliseconds: messages typed at or before it.
+    pub until_ms: i64,
+    /// How many messages the window held (short and repeated ones left out).
+    pub total: usize,
+    /// How many of them `serve said` prints (the print is capped), oldest first.
+    pub shown: usize,
+    /// The time of the last message shown, in milliseconds; 0 when none.
+    pub through_ms: i64,
+    /// How many transcripts of the project could not be read.
+    pub unreadable: usize,
+    /// The exact command that prints the list.
+    pub command: String,
+}
+
+impl SaidFrozen {
+    /// How many messages wait for the next evaluation.
+    pub fn waiting(&self) -> usize {
+        self.total.saturating_sub(self.shown)
+    }
 }
 
 /// How one item fired in one session (`Frozen::fired`, `session_firings`).
@@ -5415,6 +5704,7 @@ pub fn frozen_now(store: &EventStore, session: &str, project: &str, started_by: 
         fired: BTreeMap::new(),
         outranked: outranked_places(store, project),
         report_id: String::new(),
+        said: None,
     })
     .map(|mut frozen| {
         let mut fired = session_firings(store, session, &frozen.judgement, started_seq);
@@ -5673,9 +5963,17 @@ pub fn free_evaluation_report_id(store: &EventStore, project: &str, date: &str) 
 /// or holds the evaluating session's own report of this evaluation (a
 /// correction of it stays allowed).
 pub fn report_id_taken_refusal(store: &EventStore, start: &EvaluationStart, id: &str, date: &str) -> Option<Refusal> {
-    let existing = show(store, id).ok()?;
-    if !gate::is_evaluation_report(&existing) || filing_seq_after(store, id, start).is_some() {
-        return None;
+    match show(store, id) {
+        Ok(existing) => {
+            if !gate::is_evaluation_report(&existing) || filing_seq_after(store, id, start).is_some() {
+                return None;
+            }
+        }
+        // A diverged id has no single item to read, but it is held all the same
+        // (`free_evaluation_report_id` counts it taken): filing under it would
+        // add to a split history. Any other read failure leaves the id alone.
+        Err(ReadError::Diverged(_)) => {}
+        Err(_) => return None,
     }
     let free = free_evaluation_report_id(store, &start.frozen.project, date);
     Some(Refusal {
@@ -5930,11 +6228,11 @@ pub fn evaluation_judgement_list(store: &EventStore, project: Option<&str>, sess
         None => HashSet::new(),
     };
     let project_sessions = project_sessions_of(&events, &own, started_seq);
-    // The sessions that were served each item since its last verdict, as of
-    // the start: an item counts once per session (step 28).
-    let mut sessions_at_start: HashMap<&str, HashSet<&str>> = HashMap::new();
-    let mut fired_here: HashSet<&str> = HashSet::new();
-    let mut fired_in_project: HashSet<&str> = HashSet::new();
+    // The firings of each item since its last verdict, as of the start. An
+    // item counts once per session (step 28), and only for the firings that
+    // still count (`counted_sessions`: a place it is no longer bound to is no
+    // place to judge it at).
+    let mut servings: HashMap<&str, Vec<(i64, String)>> = HashMap::new();
     let mut last_verdict: HashMap<&str, i64> = HashMap::new();
     for (seq, kind, id, actor, event_session) in &events {
         if *seq > started_seq {
@@ -5942,21 +6240,27 @@ pub fn evaluation_judgement_list(store: &EventStore, project: Option<&str>, sess
         }
         match kind {
             EventKind::ItemServed if actor == ASSISTANT_DELIVERY_ACTOR => {
-                sessions_at_start.entry(id.as_str()).or_default().insert(event_session.as_str());
-                if event_session == session {
-                    fired_here.insert(id.as_str());
-                }
-                if project_sessions.contains(event_session.as_str()) {
-                    fired_in_project.insert(id.as_str());
-                }
+                servings.entry(id.as_str()).or_default().push((*seq, event_session.clone()));
             }
             EventKind::ItemMarkedUseful | EventKind::ItemMarkedNoise if attested.contains(seq) => {
-                sessions_at_start.insert(id.as_str(), HashSet::new());
-                fired_in_project.remove(id.as_str());
+                servings.insert(id.as_str(), Vec::new());
                 last_verdict.insert(id.as_str(), *seq);
             }
             _ => {}
         }
+    }
+    let mut sessions_at_start: HashMap<&str, HashSet<String>> = HashMap::new();
+    let mut fired_here: HashSet<&str> = HashSet::new();
+    let mut fired_in_project: HashSet<&str> = HashSet::new();
+    for (id, list) in &servings {
+        let counted = counted_sessions(store, id, list);
+        if counted.contains(session) {
+            fired_here.insert(id);
+        }
+        if counted.iter().any(|s| project_sessions.contains(s.as_str())) {
+            fired_in_project.insert(id);
+        }
+        sessions_at_start.insert(id, counted);
     }
     let skipped_at = skip_seqs(store, project, started_seq);
     let live_by_id: HashMap<&str, &Item> = live.iter().map(|(id, it)| (id.as_str(), it)).collect();
@@ -6369,6 +6673,62 @@ fn retest_prefix(program: &Path, db: Option<&Path>) -> String {
     format!("{} --db {}", word(program.display().to_string()), word(db_argument(db)))
 }
 
+/// Whether `text` has a line that starts with `MISTAKES:` (leading white space
+/// and a list marker are allowed): the line an evaluation report with a
+/// non-empty list of what the owner said must carry.
+pub fn has_mistakes_line(text: &str) -> bool {
+    text.lines().any(|l| l.trim_start().trim_start_matches(['*', '-', '#', ' ']).starts_with("MISTAKES:"))
+}
+
+/// The command that prints what the owner said in `project`
+/// (`serve said --project '<project>'`), in the same shell-neutral form as
+/// `retest_command_with`.
+pub fn said_command_with(program: &Path, db: Option<&Path>, project: &str) -> String {
+    format!("{} said --project '{project}'", retest_prefix(program, db))
+}
+
+/// `said_command_with` for the `serve` next to the running program.
+pub fn said_command_for(db: Option<&Path>, project: &str) -> String {
+    let name = format!("serve{}", std::env::consts::EXE_SUFFIX);
+    let beside = std::env::current_exe().ok().and_then(|exe| exe.parent().map(|dir| dir.join(&name))).filter(|p| p.is_file());
+    said_command_with(&beside.unwrap_or_else(|| PathBuf::from(name)), db, project)
+}
+
+/// The `allowed-tools` entry that pre-approves `said_command_with` for any
+/// project: `Bash(<serve> --db <store> said:*)`.
+pub fn said_allow_entry(program: &Path, db: Option<&Path>) -> String {
+    format!("Bash({} said:*)", retest_prefix(program, db))
+}
+
+/// The kind of order evidence that records: this session printed the list of
+/// what the owner said (`serve said`) after its evaluation started. Written by
+/// THOR itself, from the session's own transcript, when the filing is made.
+pub const SAID_PRINTED_KIND: &str = "said-printed";
+
+/// Record that the session of `start` printed what the owner said.
+pub fn record_said_printed(store: &mut EventStore, start: &EvaluationStart) -> Result<(), WriteError> {
+    record_order_evidence(
+        store,
+        SAID_PRINTED_KIND,
+        serde_json::json!({ "start": start.id, "session": start.frozen.session }),
+    )
+}
+
+/// Whether `events` (the evidence id's events, oldest first) hold the
+/// `said-printed` record of the evaluation `start_id`.
+fn said_printed_in(events: &[Event], start_id: &str) -> bool {
+    events.iter().filter(|e| e.actor == ORDER_ACTOR && e.kind == EventKind::GateStoodAside).any(|e| {
+        serde_json::from_str::<serde_json::Value>(&e.body)
+            .ok()
+            .is_some_and(|b| b.get("kind").and_then(|v| v.as_str()) == Some(SAID_PRINTED_KIND) && b.get("start").and_then(|v| v.as_str()) == Some(start_id))
+    })
+}
+
+/// Whether the evaluation `start` has the `said-printed` record on the log.
+pub fn said_printed(store: &EventStore, start: &EvaluationStart) -> bool {
+    store.get_events_by_entity(ORDER_EVIDENCE_ID).map(|events| said_printed_in(&events, &start.id)).unwrap_or(false)
+}
+
 /// One live open point, as handed to a reader: its id, its text, and whether
 /// it is THOR's own (`machine`, with its subject and blocker code) or a legacy
 /// one an agent filed before step 14 (with the carried count its tags record).
@@ -6654,7 +7014,20 @@ fn check_evaluation_report_filing(store: &EventStore, item: &Item, ctx: Option<&
     if !crowded_owed.is_empty() {
         let named = crowded_owed
             .iter()
-            .map(|(label, ids)| format!("'{label}' ({} facts: {})", ids.len(), ids.iter().map(|id| format!("'{id}'")).collect::<Vec<_>>().join(", ")))
+            .map(|(label, ids)| {
+                let listed = ids.iter().map(|id| format!("'{id}'")).collect::<Vec<_>>().join(", ");
+                if label == STANDING_PLACE_LABEL {
+                    format!(
+                        "'{label}' ({} pinned facts do not fit in the {} bytes a session start carries and are cut from \
+                         it, so they are silent: {listed}; make the block fit by folding, by binding one to the step it \
+                         is about and unpinning it, or by retracting a stale one - until nothing is cut)",
+                        ids.len(),
+                        crate::item::STANDING_BLOCK_LIMIT_BYTES
+                    )
+                } else {
+                    format!("'{label}' ({} facts: {listed})", ids.len())
+                }
+            })
             .collect::<Vec<_>>()
             .join("; ");
         missing.push(format!(
@@ -6670,6 +7043,35 @@ fn check_evaluation_report_filing(store: &EventStore, item: &Item, ctx: Option<&
             crate::item::MAX_ITEMS,
             crate::item::MAX_ITEMS
         ));
+    }
+
+    // WHAT THE OWNER SAID: with a message on the frozen list, the report is held
+    // until THOR saw, in this session's own transcript, the command that prints
+    // the list run after the evaluation started. Reading it well and storing
+    // the wishes in it is the writer's own judgement, which THOR cannot check.
+    if let Some(said) = start.frozen.said.as_ref().filter(|s| s.total > 0) {
+        if !said_printed(store, start) {
+            missing.push(format!(
+                "{} message(s) the owner typed since the previous evaluation are on this evaluation's frozen list, and THOR \
+                 did not see in this session's transcript the command that prints them run after the evaluation started. Run \
+                 `{}` (it prints the list, oldest first), read it, and for every message that says how the owner wants \
+                 something done in a way that should still hold in a later conversation, look it up first (mcp__thor__lookup) \
+                 and then store it or correct the note that already holds it (mcp__thor__remember or mcp__thor__revise). \
+                 Then file this report again; THOR reads the transcript when you file, and if the call is not on disk yet, \
+                 end the turn once first. Saying in the report that you read it settles nothing",
+                said.total, said.command
+            ));
+        }
+        if !has_mistakes_line(&item.text) {
+            missing.push(
+                "this evaluation's frozen list of what the owner said is not empty, so the report's own text must hold a line \
+                 that starts with `MISTAKES:`. Add it: under it one line per mistake (where the owner had to correct you, say \
+                 something twice or have something undone), each with what it was and the id of the rule that now prevents it, \
+                 or one sentence on why it needs none (a one-off). With nothing found, write `MISTAKES: none`. THOR checks \
+                 that the line is there, not what it says"
+                    .to_string(),
+            );
+        }
     }
 
     // WRITES OF THE FILING TURN: stamped as this session's own THOR calls,
@@ -7495,6 +7897,8 @@ struct RefusalOutcomes {
     verified: usize,
     probable: usize,
     blocks: Vec<FalseBlock>,
+    /// Every rule with a verified refusal in the window and how many, most refusals first.
+    refusing: Vec<(String, usize)>,
 }
 
 /// The real refusals the hook made in `window` (the same ones the REFUSED
@@ -7508,12 +7912,14 @@ fn refusal_outcomes(log: &LogAt, window: &[Event], except_session: Option<&str>)
         .collect();
     let rules: std::collections::BTreeSet<&str> =
         window.iter().filter(|e| in_window.contains(&e.seq)).map(|e| e.entity_id.as_str()).collect();
-    let mut out = RefusalOutcomes { verified: 0, probable: 0, blocks: Vec::new() };
+    let mut out = RefusalOutcomes { verified: 0, probable: 0, blocks: Vec::new(), refusing: Vec::new() };
     for rule in rules {
         let events = log.entity(rule);
         let verdicts = recorded_refusal_verdicts(&events);
         let is_real = |e: &Event, _: &Item, _: i64| in_window.contains(&e.seq) && verdicts.get(&e.seq).is_some_and(|(field, _)| *field);
+        let mut refused = 0;
         for fate in crate::refusal_outcome::fates(rule, &events, &is_real, &|_, _| true) {
+            refused += 1;
             out.verified += 1;
             if !fate.probable_false_block() {
                 continue;
@@ -7537,8 +7943,12 @@ fn refusal_outcomes(log: &LogAt, window: &[Event], except_session: Option<&str>)
                 restore: restore_call(&plain(rule), &fate.then, now.as_ref()),
             });
         }
+        if refused > 0 {
+            out.refusing.push((plain(rule), refused));
+        }
     }
     rank_by_refusals(&mut out.blocks);
+    out.refusing.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     out
 }
 
@@ -7575,8 +7985,22 @@ fn refusal_outcomes_sentence(o: &RefusalOutcomes, place: &str, whose: &str) -> S
         o.verified,
         o.probable,
         crate::refusal_outcome::rate_words(o.probable, o.verified)
-    )
+    ) + &refusing_named(o)
 }
+
+/// The rules that refused real calls, most refusals first, at most
+/// `REFUSING_RULES_NAMED`, then "and N more": the sentence says which rules,
+/// not only how many calls.
+fn refusing_named(o: &RefusalOutcomes) -> String {
+    let named: Vec<String> = o.refusing.iter().take(REFUSING_RULES_NAMED).map(|(rule, n)| format!("'{rule}' ({n}x)")).collect();
+    match o.refusing.len().saturating_sub(REFUSING_RULES_NAMED) {
+        0 => format!(" Rules that refused: {}.", named.join(", ")),
+        more => format!(" Rules that refused: {} and {more} more.", named.join(", ")),
+    }
+}
+
+/// How many refusing rules a REFUSAL OUTCOMES line names.
+const REFUSING_RULES_NAMED: usize = 8;
 
 /// Whose refusals a REFUSAL OUTCOMES line counts: the start note's line covers
 /// the whole span since the previous report, the evaluating session's own
@@ -8002,6 +8426,9 @@ fn machine_section(store: &EventStore, start: &EvaluationStart, filed_seq: i64) 
     summary.checks_weakened = checks.len();
     out.push_str(&disputes_in_window(&window, &log, project, session));
     out.push_str(&frozen_disputes_section(&log, start, session));
+    if let Some(said) = &frozen.said {
+        out.push_str(&said_section(&log, &window, start, said, project));
+    }
 
     // ---- OPEN POINTS: THOR's own as the start's pass left them, each with
     // how many valid evaluations carried it (recorded by the validator,
@@ -8135,6 +8562,39 @@ fn machine_section(store: &EventStore, start: &EvaluationStart, filed_seq: i64) 
     out.push_str(&format!("\nchecked at the end of this turn: {} write(s).", unverified.len()));
     unverified.iter().for_each(|line| out.push_str(line));
     (out, summary)
+}
+
+/// WHAT THE OWNER SAID, for the machine section: the counts THOR knows from its
+/// own log and the start record - how many messages were on the frozen list, how
+/// many wait for the next evaluation, whether the session printed the list, how
+/// many notes were created or revised in the window. Which wishes the writer
+/// stored is the writer's own word and is not verified here.
+fn said_section(log: &LogAt, window: &[Event], start: &EvaluationStart, said: &SaidFrozen, project: Option<&str>) -> String {
+    let printed = said_printed_in(&log.entity(ORDER_EVIDENCE_ID), &start.id);
+    let mut touched: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for event in window.iter().filter(|e| matches!(e.kind, EventKind::FactCreated | EventKind::FactRevised)) {
+        if RESERVED_ACTORS.contains(&event.actor.as_str()) {
+            continue;
+        }
+        let events = log.entity(&event.entity_id);
+        let Some(head) = item_before(&events, i64::MAX) else { continue };
+        if head.kind != Kind::Report && project_applies_to(head.project.as_deref(), project) {
+            touched.insert(event.entity_id.as_str());
+        }
+    }
+    format!(
+        "\n\nWHAT THE OWNER SAID: {} message(s) typed since the previous evaluation were on the frozen list ({} printable, {} \
+         wait for the next evaluation); the print command ran in this session after the start: {}; {} transcript file(s) \
+         could not be read; {} note(s) were created or revised in the window (every note written there, not only \
+         the wishes). Which wishes were stored, or that there were none, is in the writer's own text below: THOR cannot \
+         verify that judgement.",
+        said.total,
+        said.shown,
+        said.waiting(),
+        if printed { "yes" } else { "no" },
+        said.unreadable,
+        touched.len()
+    )
 }
 
 /// The rules a REFUSED line names: each with how many refusals it had when
@@ -8665,6 +9125,7 @@ pub fn archive<'a>(
     root: Option<&Path>,
 ) -> Result<Event, WriteError> {
     let actor = fence(store, actor.into(), entity_id)?;
+    guard_order_note(store, actor, entity_id)?;
     let reason = reason.trim();
     if reason.is_empty() {
         return Err(WriteError::Refused(Refusal {
@@ -8850,6 +9311,7 @@ pub fn retract<'a>(
     att: Option<&Att>,
 ) -> Result<Event, WriteError> {
     let actor = fence(store, actor.into(), entity_id)?;
+    guard_order_note(store, actor, entity_id)?;
     let reason = reason.trim();
     if reason.is_empty() {
         return Err(WriteError::Refused(Refusal {
@@ -9247,6 +9709,142 @@ pub fn revise_project_root_for(
     store
         .append_mutate_checked("install", "install", name, EventKind::FactRevised, id, None, &body)
         .map_err(WriteError::Store)
+}
+
+// ------------------------------------------- ordering earlier work (the tidy step)
+//
+// WHY THIS IS HERE. After the first-session welcome is answered, the assistant
+// must offer to put the person's earlier work in order (`serve inventory`,
+// then `install --tidy`). A request in a note's prose was never enough, so the
+// pinned note `ORDER_NOTE_ID` is held by the Stop hook until it is SETTLED,
+// and it cannot be retracted, revised or unpinned until then. What settles it
+// is evidence THOR checks itself, kept on one reserved id by one reserved
+// actor, so no assistant can write it any other way:
+//
+// - `nothing`: `serve inventory` itself found nothing in an unordered place;
+// - `tidy`: `install --tidy` itself carried a plan out (folders, files, log);
+// - `settled`: the Stop hook verified the rest (a refusal quoted from the
+//   person's own prompt, or a tidy event that follows the person's answer)
+//   and wrote this as its last act, right before it retracts the note.
+//
+// The model layer only keeps the log and the guard; the transcript checks
+// live in `serve::order_earlier`.
+
+/// The pinned note a NEW store is seeded with (`ops::install::working_contract`).
+pub const ORDER_NOTE_ID: &str = "order-earlier-work-once";
+
+/// The Report the assistant files when the person refused the proposal (or
+/// part of it), quoting their own words. THOR accepts it only after it found
+/// those words in a real message of the person (`serve::order_earlier`).
+pub const ORDER_ANSWER_ID: &str = "order-earlier-work-answer";
+
+/// The one reserved id the evidence lives on, written only by `ORDER_ACTOR`.
+pub const ORDER_EVIDENCE_ID: &str = "order-earlier-work-evidence";
+
+/// THOR's own actor for the evidence above.
+pub const ORDER_ACTOR: &str = "order-earlier";
+
+/// One piece of evidence on `ORDER_EVIDENCE_ID`.
+#[derive(Debug, Clone)]
+pub struct OrderEvidence {
+    pub seq: i64,
+    /// `nothing`, `tidy` or `settled`.
+    pub kind: String,
+    /// Unix seconds when it was written.
+    pub at: i64,
+    pub body: serde_json::Value,
+}
+
+/// `<home>/.claude/projects` as `serve inventory` reads it, in the comparable
+/// form of `norm_path`. `None` without a home folder.
+pub fn default_projects_dir_text() -> Option<String> {
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+    Some(norm_path(&PathBuf::from(home).join(".claude").join("projects")))
+}
+
+/// A path as text for comparing: forward slashes, no trailing slash, lower case.
+pub fn norm_path(p: &Path) -> String {
+    let s = p.display().to_string().replace('\\', "/");
+    s.strip_prefix("//?/").unwrap_or(&s).trim_end_matches('/').to_lowercase()
+}
+
+/// Record a piece of evidence (`kind` is `nothing`, `tidy` or `settled`).
+/// Written as THOR's own actor on the reserved id, so nothing else can.
+pub fn record_order_evidence(store: &mut EventStore, kind: &str, mut body: serde_json::Value) -> Result<(), WriteError> {
+    let actor = SystemActor::new(ORDER_ACTOR);
+    let name = fence(store, actor.into(), ORDER_EVIDENCE_ID)?;
+    let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    body["kind"] = serde_json::Value::String(kind.to_string());
+    body["at"] = serde_json::Value::from(at);
+    store
+        .append_event(ORDER_ACTOR, ORDER_ACTOR, name, EventKind::GateStoodAside, ORDER_EVIDENCE_ID, None, &body.to_string())
+        .map(|_| ())
+        .map_err(|e| WriteError::Store(e.into()))
+}
+
+/// Every piece of evidence, oldest first.
+pub fn order_evidence(store: &EventStore) -> Vec<OrderEvidence> {
+    let Ok(events) = store.get_events_by_entity(ORDER_EVIDENCE_ID) else { return Vec::new() };
+    let mut out: Vec<OrderEvidence> = events
+        .iter()
+        .filter(|e| e.actor == ORDER_ACTOR && e.kind == EventKind::GateStoodAside)
+        .filter_map(|e| {
+            let body: serde_json::Value = serde_json::from_str(&e.body).ok()?;
+            Some(OrderEvidence {
+                seq: e.seq,
+                kind: body.get("kind")?.as_str()?.to_string(),
+                at: body.get("at").and_then(|v| v.as_i64()).unwrap_or(0),
+                body,
+            })
+        })
+        .collect();
+    out.sort_by_key(|e| e.seq);
+    out
+}
+
+/// Whether `evidence` is a "nothing to order" record that really was made by
+/// reading THIS computer's own transcripts (not a folder an assistant named).
+pub fn nothing_evidence_counts(evidence: &OrderEvidence) -> bool {
+    evidence.kind == "nothing"
+        && evidence.body.get("projects_dir").and_then(|v| v.as_str()).map(|d| d.to_lowercase())
+            == default_projects_dir_text()
+}
+
+/// Whether the note may now go: THOR's own `settled` record, or a `nothing`
+/// record from the real transcripts folder.
+pub fn order_settled(store: &EventStore) -> bool {
+    order_evidence(store).iter().any(|e| e.kind == "settled" || nothing_evidence_counts(e))
+}
+
+/// Refuse a change to the live `ORDER_NOTE_ID` until it is settled. Only THOR's
+/// own actor may change it before.
+fn guard_order_note(store: &EventStore, actor_name: &str, id: &str) -> Result<(), WriteError> {
+    if id != ORDER_NOTE_ID || actor_name == ORDER_ACTOR || show(store, id).is_err() || order_settled(store) {
+        return Ok(());
+    }
+    Err(WriteError::Refused(Refusal {
+        problem: format!(
+            "'{ORDER_NOTE_ID}' cannot be retracted, revised or unpinned yet: nothing THOR checked itself shows that the \
+             person was offered to put their earlier work in order, and answered"
+        ),
+        fix: format!(
+            "do the tidy step of the first-session text: run `serve inventory` (when it finds nothing to order, it settles \
+             this by itself); otherwise show the person the numbered proposal in the message right after you ran it, as a numbered list, and wait for \
+             their answer. Then EITHER run `install --tidy` for what they accepted, OR, for what they refused, file a Report \
+             '{ORDER_ANSWER_ID}' that quotes their own words exactly, between double quotes. THOR checks both against the \
+             session's own record at the end of the turn and retracts this note itself. Saying it is done, a tag or a report \
+             without their words settles nothing"
+        ),
+    }))
+}
+
+/// THOR's last act on the note: write `settled` and retract it as THOR itself.
+pub fn settle_order_note(store: &mut EventStore, how: &str) -> Result<(), WriteError> {
+    record_order_evidence(store, "settled", serde_json::json!({ "how": how }))?;
+    if show(store, ORDER_NOTE_ID).is_ok() {
+        retract(store, ORDER_ACTOR, ORDER_ACTOR, SystemActor::new(ORDER_ACTOR), ORDER_NOTE_ID, &format!("settled: {how}"), None)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -11523,6 +12121,25 @@ mod tests {
         );
     }
 
+    /// Field case 2026-11-18: `eval-Trade bot-2026-11-18` had two heads, `show`
+    /// fails on it, and the id was not counted taken, so another evaluation
+    /// could be filed under it. A diverged id is taken, with the usual refusal.
+    #[test]
+    fn a_diverged_report_id_counts_as_taken_and_names_the_next_free_id() {
+        let mut store = EventStore::in_memory().unwrap();
+        let day = "2026-11-18";
+        let id = format!("eval-p-{day}");
+        store.append_event("s1", "l1", "test", EventKind::FactCreated, &id, None, "not json").unwrap();
+        store.append_event("s1", "l1", "test", EventKind::FactRevised, &id, Some("stale"), "also not json").unwrap();
+        assert!(matches!(show(&store, &id), Err(ReadError::Diverged(_))), "the fixture is diverged");
+
+        let start = record_start(&mut store, "s", "p");
+        let refused = report_id_taken_refusal(&store, &start, &id, day).expect("a diverged id is taken");
+        assert!(refused.fix.contains(&format!("'{id}-2'")) && refused.fix.contains("nothing was written"), "{}", refused.fix);
+        assert!(refused.problem.contains(&id), "{}", refused.problem);
+        assert_eq!(report_id_taken_refusal(&store, &start, &format!("{id}-2"), day), None, "the next id is free");
+    }
+
     // ------------------------- the verdict cap and the crowded places (2026-11-01)
 
     /// A rule bound to the file `path`, for the crowded-place tests. Written
@@ -11685,6 +12302,146 @@ mod tests {
         assert_eq!(evaluation_outranked_owed(&store, &start).len(), 1, "five facts are still more than a block shows");
         retract(&mut store, "s", "l", "a", "crowd-4", "stale, the deploy moved to CI", None).unwrap();
         assert!(evaluation_outranked_owed(&store, &start).is_empty(), "four facts fill a block: settled");
+    }
+
+    // ------------------------------------------- the always place (the session start block)
+
+    fn pinned_item(id: &str, project: Option<&str>, text_len: usize) -> Item {
+        Item {
+            id: id.to_string(),
+            kind: Kind::Rule,
+            text: format!("{id} {}", "w".repeat(text_len)),
+            bindings: vec![Binding::Always],
+            severity: None,
+            project: project.map(str::to_string),
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some("this turns out to be wrong".to_string()),
+            check: None,
+        }
+    }
+
+    fn standing_bytes(store: &EventStore, project: &str) -> usize {
+        let candidates = all_live_items(store);
+        standing_block_bytes(&standing_in_block(&candidates, Some(project), None))
+    }
+
+    /// A store whose block of project `p` is as full as 260-character pins make
+    /// it: less than one more of them fits. Returns the bytes still free.
+    fn fill_standing_block(store: &mut EventStore) -> usize {
+        let mut n = 0;
+        while standing_bytes(store, "p") + 280 <= crate::item::STANDING_BLOCK_LIMIT_BYTES {
+            legacy_tried(store, &pinned_item(&format!("pin-{n:03}"), Some("p"), 260), &sealed(&pinned_item(&format!("pin-{n:03}"), Some("p"), 260), RecordedVerdict::Note));
+            n += 1;
+        }
+        crate::item::STANDING_BLOCK_LIMIT_BYTES - standing_bytes(store, "p")
+    }
+
+    #[test]
+    fn a_pin_that_would_overflow_the_session_start_block_is_refused_and_stores_nothing() {
+        let mut store = EventStore::in_memory().unwrap();
+        let free = fill_standing_block(&mut store);
+        assert!(free < 280, "fixture: the block is full");
+        let before = all_live_items(&store).len();
+
+        let err = declare(&mut store, "s", "l", "a", &pinned_item("one-too-many", Some("p"), 270)).unwrap_err();
+        let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
+        assert!(refusal.problem.contains("session start block of project 'p'"), "{}", refusal.problem);
+        assert!(refusal.problem.contains(&crate::item::STANDING_BLOCK_LIMIT_BYTES.to_string()), "{}", refusal.problem);
+        for exit in ["FOLD", "MOVE", "RETRACT"] {
+            assert!(refusal.fix.contains(exit), "{}", refusal.fix);
+        }
+        assert_eq!(all_live_items(&store).len(), before, "nothing was stored");
+        assert!(show(&store, "one-too-many").is_err());
+
+        // A global pin is judged in every project that has pins.
+        let err = declare(&mut store, "s", "l", "a", &pinned_item("global-too-many", None, 270)).unwrap_err();
+        assert!(matches!(err, WriteError::Refused(_)), "{err}");
+    }
+
+    #[test]
+    fn a_pin_that_fits_the_session_start_block_passes() {
+        let mut store = EventStore::in_memory().unwrap();
+        let free = fill_standing_block(&mut store);
+        let len = free - "- [fits] fits ".len() - 1;
+        let fits = pinned_item("fits", Some("p"), len);
+        assert_eq!(crate::item::standing_line("fits", &fits.text).len() + 1, free, "fixture: exactly the room left");
+        declare(&mut store, "s", "l", "a", &fits).expect("a pin that fits is stored");
+        assert_eq!(standing_bytes(&store, "p"), crate::item::STANDING_BLOCK_LIMIT_BYTES);
+        // An empty store takes a first pin.
+        let mut empty = EventStore::in_memory().unwrap();
+        declare(&mut empty, "s", "l", "a", &pinned_item("first", Some("p"), 280)).expect("room is plenty");
+    }
+
+    #[test]
+    fn pinning_revising_longer_and_other_writes_follow_the_same_count() {
+        let mut store = EventStore::in_memory().unwrap();
+        fill_standing_block(&mut store);
+        // A fact bound to a file is not in the block; it may be written freely.
+        let mut elsewhere = at_path("elsewhere", Some("p"), "src/a.rs");
+        elsewhere.text = format!("{} {}", elsewhere.text, "w".repeat(250));
+        declare(&mut store, "s", "l", "a", &elsewhere).expect("a file-bound fact never touches the block");
+        // Pinning it (the pin tool is a revise adding Always) is refused.
+        let mut pinned = elsewhere.clone();
+        pinned.bindings.push(Binding::Always);
+        let err = revise(&mut store, "s", "l", "a", &elsewhere, &pinned).unwrap_err();
+        assert!(matches!(err, WriteError::Refused(ref r) if r.problem.contains("session start block")), "{err}");
+        // A pinned fact made longer is refused, shorter or equal passes.
+        let pin = show(&store, "pin-000").unwrap();
+        let mut longer = pin.clone();
+        longer.text.push_str(&"w".repeat(300));
+        assert!(matches!(revise(&mut store, "s", "l", "a", &pin, &longer), Err(WriteError::Refused(_))));
+        let mut shorter = pin.clone();
+        shorter.text.truncate(100);
+        revise(&mut store, "s", "l", "a", &pin, &shorter).expect("a shorter pin makes room");
+    }
+
+    #[test]
+    fn retracting_a_pin_makes_room_for_the_write_that_was_refused() {
+        let mut store = EventStore::in_memory().unwrap();
+        fill_standing_block(&mut store);
+        let probe = pinned_item("probe", Some("p"), 270);
+        assert!(declare(&mut store, "s", "l", "a", &probe).is_err());
+        retract(&mut store, "s", "l", "a", "pin-000", "stale, the deploy moved to CI", None).unwrap();
+        declare(&mut store, "s", "l", "a", &probe).expect("room after the retract");
+    }
+
+    #[test]
+    fn an_overflowing_session_start_block_is_the_first_crowded_place_and_a_retract_settles_it() {
+        let mut store = EventStore::in_memory().unwrap();
+        // Fixtures written straight to the log, as the owner's store got there:
+        // 40 pins of 260 characters do not fit in 9,800 bytes.
+        for n in 0..40 {
+            let item = pinned_item(&format!("pin-{n:03}"), Some("p"), 260);
+            legacy_tried(&mut store, &item, &sealed(&item, RecordedVerdict::Note));
+        }
+        // And a crowded file place that has more occupants than the pinned one.
+        for n in 0..9 {
+            put_note_at(&mut store, &format!("crowd-{n}"), Some("p"), "deploy.sh");
+        }
+        let places = outranked_places(&store, "p");
+        assert!(places[0].always && places[0].label() == STANDING_PLACE_LABEL, "{places:?}");
+        assert_eq!(places[1].value, "deploy.sh", "{places:?}");
+        let left_out = places[0].occupants.len();
+        assert!(left_out >= 5, "40 pins of 272 bytes leave about 6 out: {left_out}");
+
+        let start = record_start(&mut store, "s", "p");
+        assert!(start.frozen.outranked[0].always);
+        assert!(evaluation_outranked_owed(&store, &start).iter().any(|(label, _)| label == STANDING_PLACE_LABEL));
+
+        // Retract until the block fits: settled.
+        for n in 0..40 {
+            if !evaluation_outranked_owed(&store, &start).iter().any(|(label, _)| label == STANDING_PLACE_LABEL) {
+                break;
+            }
+            retract(&mut store, "s", "l", "a", &format!("pin-{n:03}"), "stale, the deploy moved to CI", None).unwrap();
+        }
+        assert!(!evaluation_outranked_owed(&store, &start).iter().any(|(label, _)| label == STANDING_PLACE_LABEL));
+        assert!(standing_bytes(&store, "p") <= crate::item::STANDING_BLOCK_LIMIT_BYTES);
+        assert!(outranked_places(&store, "p").iter().all(|p| !p.always), "a block that fits is not listed");
+        // A place of another project that holds no pins is never listed for it.
+        assert!(outranked_places(&store, "elsewhere").iter().all(|p| !p.always));
     }
 
     #[test]
@@ -12145,6 +12902,7 @@ mod tests {
             fired: Default::default(),
             outranked: Vec::new(),
             report_id: String::new(),
+            said: None,
         };
         assert_eq!(false_block_sweep_line(&frozen), "", "nothing found, nothing said");
         signals.sweep = vec![
@@ -12625,6 +13383,7 @@ mod tests {
         assert!(line.contains("2 followed by a weakening or retract of the refusing rule (probable false blocks)"), "{line}");
         assert!(line.contains(&crate::refusal_outcome::rate_words(2, 3)), "{line}");
         assert!(line.contains("A proxy"), "{line}");
+        assert!(line.contains("Rules that refused: 'ro-gone' (1x), 'ro-same' (1x), 'ro-weak' (1x)."), "the rules are named, not only counted: {line}");
         // Each probable false block is named: the rule, the refused call, and
         // what followed. The one left alone, the unverified and the evaluating
         // session's own are not listed.
@@ -13165,7 +13924,7 @@ mod tests {
 
         let signals = signals_so_far(&store, 0, started_seq, &HashSet::new());
         assert!(signals.refusals.starts_with("REFUSAL OUTCOMES since the previous report: 1 verified refusal(s), 0 followed by"), "{}", signals.refusals);
-        assert!(signals.refusals.ends_with("Refusals of every session count, yours included."), "{}", signals.refusals);
+        assert!(signals.refusals.ends_with("Refusals of every session count, yours included. Rules that refused: 'own-rule' (1x)."), "{}", signals.refusals);
 
         let start = record_start(&mut store, "mp-session", "mp");
         let own_inside = store.append_event("mp-session", "mp-session", "hook", EventKind::GateRefused, "own-rule", None, body).unwrap().seq;
@@ -16347,6 +17106,87 @@ mod tests {
         assert!(
             matches!(current_verdict(&store, "old"), CurrentVerdict::Undecided { why } if why.starts_with("A4: 'keep me'")),
             "the old record matches the text again, and still counts for nothing"
+        );
+    }
+
+    // ---- the verdict debt counts only firings at a place the item is still bound to
+
+    fn serve_at(store: &mut EventStore, id: &str, trigger: &str, n: usize, first: usize) {
+        let body = format!("{{\"served_at\":\"2026-09-12T00:00:00Z\",\"trigger\":{}}}", serde_json::to_string(trigger).unwrap());
+        for i in first..first + n {
+            store.append_event(&format!("d-{i}"), "l", ASSISTANT_DELIVERY_ACTOR, EventKind::ItemServed, id, None, &body).unwrap();
+        }
+    }
+
+    fn rebind(store: &mut EventStore, old: &Item, new: &Item) {
+        revise_because(store, "s", "l", "a", old, new, old, Some("fixture: the bindings change on purpose here")).unwrap();
+    }
+
+    fn debt_rule(id: &str, bindings: Vec<Binding>) -> Item {
+        Item { bindings, severity: None, tags: vec![], ..heavy_command_rule(id, "p") }
+    }
+
+    fn command(value: &str) -> Binding {
+        Binding::Target { kind: TargetKind::Command, value: value.to_string() }
+    }
+
+    fn owed(store: &EventStore, id: &str) -> bool {
+        judgement_debt_in_project(store, Some("p")).iter().any(|owed| owed == id)
+    }
+
+    /// Session-start firings of an item that is no longer pinned owe nothing,
+    /// and firings at a place it is bound to now still do.
+    #[test]
+    fn firings_from_before_a_rebind_are_no_debt_and_later_ones_are() {
+        let mut store = EventStore::in_memory().unwrap();
+        let pinned = debt_rule("was-pinned", vec![Binding::Always]);
+        let raw = canonical_body(&pinned).unwrap();
+        store.append_event("s", "l", "a", EventKind::FactCreated, "was-pinned", None, &raw).unwrap();
+        serve_at(&mut store, "was-pinned", SESSION_START_TRIGGER, JUDGEMENT_DEBT_AFTER, 0);
+        let mut unpinned = pinned.clone();
+        unpinned.bindings = vec![command("git push")];
+        rebind(&mut store, &pinned, &unpinned);
+        assert!(!owed(&store, "was-pinned"), "firings at a place it is no longer bound to are nothing to judge");
+        serve_at(&mut store, "was-pinned", "git push origin main", JUDGEMENT_DEBT_AFTER, 100);
+        assert!(owed(&store, "was-pinned"), "firings at the place it is bound to now count");
+    }
+
+    /// The precise form: a session-start firing of an item that is not pinned
+    /// does not count even with no rebind in between; a revise that leaves the
+    /// bindings alone resets nothing.
+    #[test]
+    fn a_session_start_firing_needs_a_pin_and_a_trivial_revise_dodges_nothing() {
+        let mut store = EventStore::in_memory().unwrap();
+        let item = debt_rule("bound", vec![command("git push")]);
+        let raw = canonical_body(&item).unwrap();
+        store.append_event("s", "l", "a", EventKind::FactCreated, "bound", None, &raw).unwrap();
+        serve_at(&mut store, "bound", SESSION_START_TRIGGER, JUDGEMENT_DEBT_AFTER, 0);
+        assert!(!owed(&store, "bound"), "a pin firing of an unpinned item counts for nothing");
+        serve_at(&mut store, "bound", "git push --force", JUDGEMENT_DEBT_AFTER, 100);
+        assert!(owed(&store, "bound"));
+        let mut text_only = item.clone();
+        text_only.text = "fixture heavy rule, reworded".to_string();
+        rebind(&mut store, &item, &text_only);
+        assert!(owed(&store, "bound"), "a revise that keeps the bindings resets nothing");
+        let mut moved = item.clone();
+        moved.bindings = vec![command("git commit")];
+        rebind(&mut store, &text_only, &moved);
+        assert!(!owed(&store, "bound"), "a real change of bindings does");
+    }
+
+    /// The refusing rules are named, most refusals first, at most eight, then how many more.
+    #[test]
+    fn the_refusing_rules_are_named_most_refusals_first_at_most_eight() {
+        let mut refusing: Vec<(String, usize)> = (0..11).map(|n| (format!("rule-{n:02}"), if n == 7 { 9 } else { 1 })).collect();
+        refusing.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let outcomes = RefusalOutcomes { verified: 19, probable: 0, blocks: Vec::new(), refusing };
+        let line = refusal_outcomes_sentence(&outcomes, "in the window", "Whose.");
+        assert!(
+            line.ends_with(
+                "Rules that refused: 'rule-07' (9x), 'rule-00' (1x), 'rule-01' (1x), 'rule-02' (1x), 'rule-03' (1x), \
+                 'rule-04' (1x), 'rule-05' (1x), 'rule-06' (1x) and 3 more."
+            ),
+            "{line}"
         );
     }
 }

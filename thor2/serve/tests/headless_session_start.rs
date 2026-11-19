@@ -183,6 +183,14 @@ fn now_unix() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
 }
 
+/// Writes `item` straight to the log, past the write gate: these fixtures build
+/// a store that ALREADY overflows the session start block (as an older store
+/// did), which the gate now refuses to create.
+fn store_overflowing(s: &mut EventStore, item: &Item) {
+    let body = store::canonical_body(item).unwrap();
+    s.append_event("legacy", &item.id, "migration", thor_core::event_store::EventKind::FactCreated, &item.id, None, &body).unwrap();
+}
+
 #[test]
 fn this_projects_facts_come_first_then_heavy_ones_then_what_was_shown_lately_among_house_style() {
     let dir = tempfile::tempdir().unwrap();
@@ -193,12 +201,12 @@ fn this_projects_facts_come_first_then_heavy_ones_then_what_was_shown_lately_amo
         let mut s = EventStore::new(&db).unwrap();
         for i in 0..30 {
             // ids sort so that, without the ranking, "zz-recent" would be last
-            store::declare(&mut s, "s", "l", "a", &bulky(&format!("aa-light-{i:02}"), Some(Severity::HouseStyle), None)).unwrap();
+            store_overflowing(&mut s, &bulky(&format!("aa-light-{i:02}"), Some(Severity::HouseStyle), None));
         }
-        store::declare(&mut s, "s", "l", "a", &bulky("zz-recent", Some(Severity::HouseStyle), None)).unwrap();
-        store::declare(&mut s, "s", "l", "a", &bulky("zz-unweighted", None, None)).unwrap();
-        store::declare(&mut s, "s", "l", "a", &bulky("zz-heavy", Some(Severity::Irreversible), None)).unwrap();
-        store::declare(&mut s, "s", "l", "a", &bulky("zz-costly-here", Some(Severity::Costly), Some("sample-quote-repo"))).unwrap();
+        store_overflowing(&mut s, &bulky("zz-recent", Some(Severity::HouseStyle), None));
+        store_overflowing(&mut s, &bulky("zz-unweighted", None, None));
+        store_overflowing(&mut s, &bulky("zz-heavy", Some(Severity::Irreversible), None));
+        store_overflowing(&mut s, &bulky("zz-costly-here", Some(Severity::Costly), Some("sample-quote-repo")));
     }
     let now = now_unix();
     std::fs::write(

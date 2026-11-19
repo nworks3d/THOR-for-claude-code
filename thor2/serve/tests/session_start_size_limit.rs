@@ -45,6 +45,14 @@ fn run_session_start(db: &std::path::Path, cwd: &std::path::Path, session: &str)
     serde_json::from_slice(&out.stdout).expect("the hook prints one JSON value")
 }
 
+/// Writes `item` straight to the log, past the write gate: these fixtures build
+/// a store that ALREADY overflows the session start block (as an older store
+/// did), which the gate now refuses to create.
+fn store_overflowing(s: &mut EventStore, item: &Item) {
+    let body = store::canonical_body(item).unwrap();
+    s.append_event("legacy", &item.id, "migration", thor_core::event_store::EventKind::FactCreated, &item.id, None, &body).unwrap();
+}
+
 #[test]
 fn a_big_standing_block_stays_under_the_limit_and_only_what_is_in_it_counts_as_served() {
     let dir = tempfile::tempdir().unwrap();
@@ -52,7 +60,7 @@ fn a_big_standing_block_stays_under_the_limit_and_only_what_is_in_it_counts_as_s
     {
         let mut s = EventStore::new(&db).unwrap();
         for i in 0..53 {
-            store::declare(&mut s, "s", "l", "a", &standing_rule(i)).unwrap();
+            store_overflowing(&mut s, &standing_rule(i));
         }
     }
     let cwd = dir.path().join("workdir");
@@ -98,7 +106,7 @@ fn a_small_standing_block_is_unchanged_and_all_of_it_counts_as_served() {
     {
         let mut s = EventStore::new(&db).unwrap();
         for i in 0..4 {
-            store::declare(&mut s, "s", "l", "a", &standing_rule(i)).unwrap();
+            store_overflowing(&mut s, &standing_rule(i));
         }
     }
     let cwd = dir.path().join("workdir");
@@ -115,4 +123,236 @@ fn a_small_standing_block_is_unchanged_and_all_of_it_counts_as_served() {
         .filter(|e| e.kind == EventKind::ItemServed && e.session_id == "session-two")
         .count();
     assert_eq!(served, 4);
+}
+
+/// THE PINNED NOTES KEEP THEIR PLACE. The write gate lets the standing rules
+/// fill the block up to `STANDING_BLOCK_LIMIT_BYTES`; the real session start,
+/// with every extra line it can carry at its largest here (the compaction
+/// reminder, the no-project line and a full tools overview), must still show
+/// every one of those rules, whole, within the hook output limit, keep the
+/// compaction reminder whole, and say that the other extras were left out.
+#[test]
+fn a_block_the_gate_filled_to_its_limit_still_shows_every_pinned_note_beside_every_extra() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("store.db");
+    let mut ids: Vec<String> = Vec::new();
+    let mut used = model::item::standing_head_bytes();
+    {
+        let mut s = EventStore::new(&db).unwrap();
+        // Descending lengths: each pass of the loop adds a note while the gate allows it.
+        for len in (20..=260).rev() {
+            let mut item = standing_rule(len);
+            item.id = format!("pin-{len:03}");
+            item.text = format!("{len:03} {}", "w".repeat(len));
+            if store::declare(&mut s, "s", "l", "a", &item).is_ok() {
+                used += model::item::standing_line(&item.id, &item.text).len() + 1;
+                ids.push(item.id);
+            }
+        }
+    }
+    let room = model::item::STANDING_BLOCK_LIMIT_BYTES - used;
+    assert!(room < 40 && ids.len() > 10, "fixture: the gate filled the block ({room} bytes left, {} notes)", ids.len());
+
+    // A full tools overview, one of the extras with a cap of its own.
+    let tools = dir.path().join("tools");
+    for n in 0..60 {
+        let tool = tools.join(format!("tool-{n:02}"));
+        std::fs::create_dir_all(&tool).unwrap();
+        std::fs::write(tool.join("README.txt"), format!("Tool number {n} does one small job and says so in one plain line of text\n")).unwrap();
+    }
+    std::fs::write(dir.path().join("work-folders.json"), serde_json::json!({ "tools": tools }).to_string()).unwrap();
+    // A folder that belongs to no project: the start adds the no-project line.
+    let cwd = dir.path().join("workdir");
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let payload = serde_json::json!({ "session_id": "s-full", "hook_event_name": "SessionStart", "source": "compact", "cwd": cwd.to_string_lossy() });
+    let mut child = Command::new(env!("CARGO_BIN_EXE_serve"))
+        .arg("--db")
+        .arg(&db)
+        .arg("hook")
+        .current_dir(&cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let _ = child.stdin.take().unwrap().write_all(payload.to_string().as_bytes());
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let block = json["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+
+    assert!(block.len() <= model::item::HOOK_OUTPUT_LIMIT_BYTES, "{} bytes", block.len());
+    for id in &ids {
+        assert!(block.contains(&format!("- [{id}] ")), "pinned note {id} lost its place: {block}");
+    }
+    assert!(!block.contains("did not fit in this block"), "no standing rule may be cut: {block}");
+    assert!(block.contains(model::item::COMPACT_REMINDER), "the reminder is whole");
+    // The room left is the reserve: the other extras (the no-project line, the tools overview) give way.
+    assert!(!block.contains("belongs to no project") && !block.contains("Helper tools"), "{block}");
+    assert!(block.contains(model::item::EXTRAS_DROPPED_NOTE), "what did not fit is said: {block}");
+}
+
+/// `fit_extras` on its own: an extra that must be shown never loses its place,
+/// the rest give way, and a drop is always named.
+#[test]
+fn extras_give_way_to_the_standing_rules_and_a_drop_is_named() {
+    let reminder = serve::session_start::COMPACT_REMINDER.to_string();
+    let big = "x".repeat(6_000);
+    let rules_len = model::item::STANDING_BLOCK_LIMIT_BYTES;
+    let kept = serve::session_start::fit_extras(rules_len, vec![big.clone(), reminder.clone(), "short".to_string()]);
+    assert!(kept.contains(&reminder) && !kept.contains(&big), "{kept:?}");
+    assert_eq!(kept.last().map(String::as_str), Some(model::item::EXTRAS_DROPPED_NOTE));
+    let total: usize = rules_len + kept.iter().map(|e| e.len() + 2).sum::<usize>();
+    assert!(total <= model::item::HOOK_OUTPUT_LIMIT_BYTES, "{total}");
+    // Plenty of room: nothing is left out and nothing is said.
+    let all = serve::session_start::fit_extras(100, vec![big.clone(), reminder.clone()]);
+    assert_eq!(all, vec![big, reminder]);
+}
+
+// ---------------------------------------------------------------------------
+// The tools overview shrinks to the room the pinned notes leave, it does not vanish.
+
+/// Pinned notes up to `target` bytes of standing block; returns their ids.
+fn pins_up_to(db: &std::path::Path, target: usize) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut used = model::item::standing_head_bytes();
+    let mut s = EventStore::new(db).unwrap();
+    for len in (20..=260).rev() {
+        let mut item = standing_rule(len);
+        item.id = format!("pin-{len:03}");
+        item.text = format!("{len:03} {}", "w".repeat(len));
+        let line = model::item::standing_line(&item.id, &item.text).len() + 1;
+        if used + line <= target && store::declare(&mut s, "s", "l", "a", &item).is_ok() {
+            used += line;
+            ids.push(item.id);
+        }
+    }
+    ids
+}
+
+/// A tools folder of 60 tools named in the store's settings; returns its label.
+fn sixty_tools(dir: &std::path::Path) -> String {
+    let tools = dir.join("tools");
+    for n in 0..60 {
+        let tool = tools.join(format!("tool-{n:02}"));
+        std::fs::create_dir_all(&tool).unwrap();
+        std::fs::write(tool.join("README.txt"), format!("Tool number {n} does one small job and says so in one plain line of text\n")).unwrap();
+    }
+    std::fs::write(dir.join("work-folders.json"), serde_json::json!({ "tools": tools }).to_string()).unwrap();
+    tools.display().to_string()
+}
+
+/// A compact start in a folder of no project (so the reminder and the
+/// no-project line come before the overview); the block it printed.
+fn compact_start(db: &std::path::Path, dir: &std::path::Path, session: &str) -> String {
+    let cwd = dir.join("workdir");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let payload = serde_json::json!({ "session_id": session, "hook_event_name": "SessionStart", "source": "compact", "cwd": cwd.to_string_lossy() });
+    let mut child = Command::new(env!("CARGO_BIN_EXE_serve"))
+        .arg("--db")
+        .arg(db)
+        .arg("hook")
+        .current_dir(&cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let _ = child.stdin.take().unwrap().write_all(payload.to_string().as_bytes());
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    json["hookSpecificOutput"]["additionalContext"].as_str().unwrap().to_string()
+}
+
+/// The bytes a start keeps for the lines before the overview: the reminder and
+/// the no-project line, each with its separator.
+fn lines_before_the_overview() -> usize {
+    model::item::COMPACT_REMINDER.len() + 2 + serve::other_project::no_project_line().len() + 2
+}
+
+fn check_pins_and_limit(block: &str, ids: &[String]) {
+    assert!(block.len() <= model::item::HOOK_OUTPUT_LIMIT_BYTES, "{} bytes", block.len());
+    for id in ids {
+        assert!(block.contains(&format!("- [{id}] ")), "pinned note {id} lost its place");
+    }
+    assert!(block.contains(model::item::COMPACT_REMINDER) && block.contains("belongs to no project"), "the lines that come first are there");
+}
+
+#[test]
+fn with_plenty_of_room_the_overview_is_as_it_always_was() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("store.db");
+    let ids = pins_up_to(&db, 3_000);
+    let label = sixty_tools(dir.path());
+    let block = compact_start(&db, dir.path(), "s-plenty");
+    check_pins_and_limit(&block, &ids);
+    let serve::work_folders::ToolsRead::Built { overview, .. } = serve::work_folders::read_tools(std::path::Path::new(&label), None).unwrap() else { panic!("built") };
+    assert!(block.contains(&overview), "the whole overview, unchanged: {block}");
+    assert!(!block.contains("did not fit in the hook output"), "{block}");
+}
+
+#[test]
+fn with_a_nearly_full_pinned_block_the_overview_shows_fewer_tools_and_counts_the_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("store.db");
+    let wanted = 900;
+    let ids = pins_up_to(&db, model::item::HOOK_OUTPUT_LIMIT_BYTES - lines_before_the_overview() - wanted - 2);
+    let label = sixty_tools(dir.path());
+    let block = compact_start(&db, dir.path(), "s-fewer");
+    check_pins_and_limit(&block, &ids);
+    let shown = block.lines().filter(|l| l.starts_with("tool-")).count();
+    assert!(shown > 0 && shown < 15, "fewer tool lines than the full overview: {shown}");
+    assert!(block.contains(&format!("... and {} more in {label}", 60 - shown)), "{block}");
+    assert!(block.contains(serve::work_folders::OVERVIEW_ADVICE));
+    assert!(!block.contains("did not fit in the hook output"), "shrunk, not dropped: {block}");
+}
+
+#[test]
+fn with_room_for_one_line_the_overview_is_one_line_that_counts_the_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("store.db");
+    let label = sixty_tools(dir.path());
+    let one = serve::work_folders::overview_one_line(&label, 60);
+    let ids = pins_up_to(&db, model::item::HOOK_OUTPUT_LIMIT_BYTES - lines_before_the_overview() - one.len() - 2 - 5);
+    let block = compact_start(&db, dir.path(), "s-one");
+    check_pins_and_limit(&block, &ids);
+    assert!(block.contains(&one), "{block}");
+    assert!(block.lines().all(|l| !l.starts_with("tool-")) && !block.contains("Helper tools available in"), "{block}");
+    assert!(!block.contains("did not fit in the hook output"), "{block}");
+}
+
+#[test]
+fn with_no_room_the_overview_is_dropped_and_the_drop_is_named() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("store.db");
+    let label = sixty_tools(dir.path());
+    let one = serve::work_folders::overview_one_line(&label, 60);
+    let ids = pins_up_to(&db, model::item::STANDING_BLOCK_LIMIT_BYTES);
+    let block = compact_start(&db, dir.path(), "s-none");
+    assert!(block.len() <= model::item::HOOK_OUTPUT_LIMIT_BYTES, "{} bytes", block.len());
+    for id in &ids {
+        assert!(block.contains(&format!("- [{id}] ")), "pinned note {id} lost its place");
+    }
+    assert!(!block.contains(&one) && !block.contains("Helper tools"), "{block}");
+    assert!(block.contains(model::item::EXTRAS_DROPPED_NOTE) && block.contains(model::item::COMPACT_REMINDER), "{block}");
+}
+
+/// The order when room is short: the short lines come before the overview.
+#[test]
+fn a_short_warning_is_kept_before_the_overview_is_shrunk() {
+    let warning = "[THOR] a short warning someone must act on".to_string();
+    let overview = {
+        let tools: Vec<serve::work_folders::ToolEntry> = (0..30)
+            .map(|n| serve::work_folders::ToolEntry { name: format!("t{n:02}"), readme: serve::work_folders::ReadmeState::Line("does a job".to_string()) })
+            .collect();
+        serve::work_folders::assemble("/srv/tools", &tools, &[]).0
+    };
+    let rules_len = model::item::HOOK_OUTPUT_LIMIT_BYTES - model::item::COMPACT_REMINDER.len() - 2 - warning.len() - 2 - 300;
+    let kept = serve::session_start::fit_extras(rules_len, vec![overview.clone(), warning.clone(), model::item::COMPACT_REMINDER.to_string()]);
+    assert!(kept.contains(&warning), "{kept:?}");
+    let shrunk = kept.iter().find(|l| l.starts_with("Helper tools")).expect("shrunk, not dropped");
+    assert!(shrunk.len() <= 300 && shrunk.len() < overview.len(), "{shrunk}");
+    assert!(!kept.contains(&model::item::EXTRAS_DROPPED_NOTE.to_string()), "{kept:?}");
 }

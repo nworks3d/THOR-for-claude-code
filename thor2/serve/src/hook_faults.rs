@@ -31,17 +31,39 @@ pub struct Scanned {
 /// Whether `command` is THOR's own hook command, the shape the installer
 /// writes: `"<path>/serve.exe" --db "<db>" hook`. Any other hook, and
 /// `backup.exe` (whose failures `doctor` already reports), is not ours.
+///
+/// Since Windows hooks are written in exec form (a program plus an argument
+/// list), three more shapes count: the program and its arguments joined into
+/// one string with every word quoted (`"serve.exe" "--db" "x" "hook"`), the
+/// same unquoted, and the bare program path alone (an attachment that carries
+/// the program in `command` and the arguments elsewhere). How Claude Code
+/// records an exec-form hook in the transcript is not documented, so all of
+/// these are accepted.
 pub fn is_thor_hook_command(command: &str) -> bool {
     let command = command.trim();
-    if !command.ends_with(" hook") {
-        return false;
-    }
     let program = match command.strip_prefix('"') {
         Some(rest) => rest.split('"').next().unwrap_or(""),
         None => command.split_whitespace().next().unwrap_or(""),
     };
     let name = program.rsplit(['/', '\\']).next().unwrap_or("").to_ascii_lowercase();
-    name == "serve.exe" || name == "serve"
+    if name != "serve.exe" && name != "serve" {
+        return false;
+    }
+    let tail = command.trim_end_matches('"');
+    let bare_program = command == program || command == format!("\"{program}\"");
+    bare_program || tail.ends_with(" hook") || tail.ends_with(" \"hook")
+}
+
+/// The command of a hook attachment as one line: `command`, followed by its
+/// `args` (exec form) when the record carries them, each word quoted.
+fn attachment_command(attachment: &Value) -> Option<String> {
+    let command = attachment.get("command")?.as_str()?;
+    let Some(args) = attachment.get("args").and_then(Value::as_array) else { return Some(command.to_string()) };
+    let mut line = format!("\"{command}\"");
+    for arg in args.iter().filter_map(Value::as_str) {
+        line.push_str(&format!(" \"{arg}\""));
+    }
+    Some(line)
 }
 
 /// The cause of a launch failure in plain words, from the exit code and the
@@ -191,7 +213,8 @@ fn failure_of(line: &str) -> Option<Failure> {
     if attachment.get("type")?.as_str()? != MARK {
         return None;
     }
-    let command = attachment.get("command")?.as_str()?;
+    let command = attachment_command(attachment)?;
+    let command = command.as_str();
     if is_thor_hook_command(command) {
         return scanned_of(&record, attachment).map(Failure::Thor);
     }
@@ -285,6 +308,30 @@ mod tests {
         assert!(!is_thor_hook_command("\"C:\\thor2\\bin\\backup.exe\" --db \"C:\\x\\thor.db\" --repo \"C:\\b\""));
         assert!(!is_thor_hook_command("\"C:\\tools\\other.exe\" hook"));
         assert!(!is_thor_hook_command("\"C:\\thor2\\bin\\serve.exe\" --db \"C:\\x\\thor.db\" status"));
+    }
+
+    #[test]
+    fn the_exec_form_of_thors_hook_is_recognised_too() {
+        // program and arguments joined, every word quoted
+        assert!(is_thor_hook_command("\"C:\\Users\\someone\\thor2\\serve.exe\" \"--db\" \"C:\\x\\thor.db\" \"hook\""));
+        // joined, only the program quoted (a path with spaces)
+        assert!(is_thor_hook_command("\"C:\\Program Files\\thor2\\serve.exe\" --db C:\\x\\thor.db hook"));
+        // the bare program path, arguments recorded elsewhere
+        assert!(is_thor_hook_command("C:\\Users\\someone\\thor2\\serve.exe"));
+        assert!(is_thor_hook_command("\"C:\\Users\\someone\\thor2\\serve.exe\""));
+        // still not ours
+        assert!(!is_thor_hook_command("\"C:\\thor2\\backup.exe\" \"--db\" \"C:\\x\\thor.db\" \"hook\""));
+        assert!(!is_thor_hook_command("\"C:\\thor2\\serve.exe\" \"--db\" \"C:\\x\\thor.db\" \"status\""));
+        assert!(!is_thor_hook_command("node"));
+    }
+
+    #[test]
+    fn an_attachment_with_args_is_read_as_one_command() {
+        let attachment = serde_json::json!({"command": "C:\\thor2\\serve.exe", "args": ["--db", "C:\\x\\thor.db", "hook"]});
+        let line = attachment_command(&attachment).unwrap();
+        assert!(is_thor_hook_command(&line), "{line}");
+        let plain = serde_json::json!({"command": "C:\\thor2\\serve.exe --db C:\\x\\thor.db hook"});
+        assert!(is_thor_hook_command(&attachment_command(&plain).unwrap()));
     }
 
     #[test]

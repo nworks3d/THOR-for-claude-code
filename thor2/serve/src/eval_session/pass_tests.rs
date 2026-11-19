@@ -196,7 +196,15 @@ fn report(id: &str, project: &str) -> Item {
 /// files one (step 15): a filing context - the call seen in flight, the start
 /// record it files for.
 fn file(fx: &mut Fx, start: &EvaluationStart, id: &str) -> Result<Event, model::store::WriteError> {
-    let item = report(id, &start.frozen.project);
+    file_text(fx, start, id, None)
+}
+
+/// `file` with the report's own text given.
+fn file_text(fx: &mut Fx, start: &EvaluationStart, id: &str, text: Option<&str>) -> Result<Event, model::store::WriteError> {
+    let mut item = report(id, &start.frozen.project);
+    if let Some(text) = text {
+        item.text = text.to_string();
+    }
     let ctx = model::store::FilingContext::new(model::store::INFLIGHT_SEEN, start.clone());
     model::store::declare_scoped(&mut fx.store, &start.frozen.session, "l", "mcp", &item, ctx.as_ref(), None)
 }
@@ -1680,6 +1688,7 @@ fn busy_frozen(batch: usize, a4: usize, disputes: usize, blocks: usize, carriers
         fired: std::collections::BTreeMap::new(),
         outranked: Vec::new(),
         report_id: String::new(),
+        said: None,
     }
 }
 
@@ -1741,8 +1750,34 @@ fn crowded_places() -> Vec<model::store::OutrankedPlace> {
             kind: if value.starts_with("docker") { model::item::TargetKind::Command } else { model::item::TargetKind::Path },
             value: value.to_string(),
             occupants: (0..12).map(|n| format!("a-rather-long-fact-id-about-the-place-{p}-number-{n:02}")).collect(),
+            always: false,
         })
         .collect()
+}
+
+/// The always place (the pinned facts the session start block cuts) is listed in
+/// the start note with what it means and the exits, and names at most eight ids.
+#[test]
+fn the_overflowing_always_place_is_named_in_the_start_note() {
+    let mut frozen = busy_frozen(0, 0, 0, 0, 0, 0);
+    frozen.outranked = vec![model::store::OutrankedPlace {
+        kind: model::item::TargetKind::Path,
+        value: model::store::STANDING_PLACE_LABEL.to_string(),
+        occupants: (0..24).map(|n| format!("pinned-{n:02}")).collect(),
+        always: true,
+    }];
+    let note = render_start_note_within(BUSY_ID, &frozen, START_NOTE_BUDGET);
+    for must in [
+        "e. CROWDED PLACES - 1 place(s)",
+        "'the pinned standing rules (session start block)': 24 pinned fact(s) do not fit",
+        "'pinned-00'",
+        "'pinned-07'",
+        "and 16 more",
+        "unpin it",
+    ] {
+        assert!(note.contains(must), "missing {must}: {note}");
+    }
+    assert!(!note.contains("'pinned-08'"), "only eight ids are named: {note}");
 }
 
 /// THE CROWDED PLACES JOIN THE NOTE WITHOUT BREAKING ITS SIZE: three places of
@@ -2001,4 +2036,264 @@ fn the_sweeps_findings_are_part_of_the_frozen_signals_and_an_older_record_reads_
     }
     let older: Frozen = serde_json::from_value(value).unwrap();
     assert!(older.machine.unwrap().signals.unwrap().sweep.is_empty());
+}
+
+// ------------------------------------------------------------ what the owner said
+
+/// A transcripts folder for the "what the owner said" cases: one main session
+/// of a plain folder that is project `project`, holding the given owner
+/// messages (typed so many minutes before now), and room for the evaluating
+/// session's own transcript.
+struct SaidFx {
+    root: PathBuf,
+    cwd: PathBuf,
+}
+
+impl SaidFx {
+    fn new(fx: &Fx, project: &str, messages: &[(&str, i64)]) -> SaidFx {
+        let root = fx.dir.path().join("transcripts");
+        let cwd = fx.dir.path().join(project);
+        fs::create_dir_all(&cwd).unwrap();
+        fs::write(cwd.join(crate::project::MARKER_FILE_NAME), format!("{project}\n")).unwrap();
+        let said = SaidFx { root, cwd };
+        let now = crate::time::now_unix();
+        let lines: Vec<String> = messages
+            .iter()
+            .map(|(text, minutes_ago)| {
+                serde_json::json!({
+                    "type": "user", "timestamp": crate::time::iso8601_from_unix(now - minutes_ago * 60),
+                    "cwd": said.cwd.to_string_lossy(), "message": {"role": "user", "content": text},
+                })
+                .to_string()
+            })
+            .collect();
+        said.write("a", "5e1f0c3a-0000-4000-8000-0000000000aa", &lines);
+        said
+    }
+
+    fn write(&self, folder: &str, session: &str, lines: &[String]) {
+        let dir = self.root.join(folder);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(format!("{session}.jsonl")), lines.join("\n")).unwrap();
+    }
+
+    /// The evaluating session's own transcript: it ran `command` in a shell
+    /// `seconds_after` seconds after `start`.
+    fn ran(&self, session: &str, start: &EvaluationStart, command: &str, seconds_after: i64) {
+        let line = serde_json::json!({
+            "type": "assistant", "timestamp": crate::time::iso8601_from_unix(start.frozen.started_unix + seconds_after),
+            "cwd": self.cwd.parent().unwrap().to_string_lossy(),
+            "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": command}}]},
+        })
+        .to_string();
+        self.write("b", session, &[line]);
+    }
+
+    fn begin(&self, fx: &mut Fx, session: &str, project: &str) -> EvaluationStart {
+        fx.quiet_others(session, project);
+        let began = try_begin_in(&fx.db, &mut fx.store, session, project, "command", Some(&self.root)).unwrap();
+        decide(&mut fx.store, began.start, WIDE)
+    }
+}
+
+/// The list holds only what the owner typed in this project and window, as a
+/// window and counts on the log: his words are never written there.
+#[test]
+fn the_frozen_list_is_a_window_and_counts_and_the_note_names_the_command() {
+    let mut fx = Fx::new();
+    let said = SaidFx::new(
+        &fx,
+        "demo",
+        &[
+            ("please always answer me in short sentences", 30),
+            ("yes", 20),
+            ("keep every commit message plain and short", 10),
+            ("an old message that is long enough but too old", 60 * 24 * 9),
+        ],
+    );
+    let start = said.begin(&mut fx, S1, "demo");
+    let frozen = start.frozen.said.clone().expect("a list was frozen");
+    assert_eq!((frozen.total, frozen.shown, frozen.waiting(), frozen.unreadable), (2, 2, 0, 0));
+    assert!(frozen.command.contains(" said --project 'demo'"), "{}", frozen.command);
+    assert!(frozen.command.contains(&*fx.db.to_string_lossy().replace('\\', "/")), "the command names the store: {}", frozen.command);
+
+    let note = start_note(&start);
+    assert!(note.contains("f. WHAT WENT WRONG AND WHAT THE OWNER WANTS - 2 message(s)"), "{note}");
+    assert!(note.contains("`MISTAKES:`") && note.contains("MISTAKES: none"), "{note}");
+    assert!(note.contains(&frozen.command), "the exact command is in the note: {note}");
+    assert!(note.contains("look it up first"), "{note}");
+    let on_log = model::store::show(&fx.store, &start.id).unwrap().text;
+    let record = fx.events_of(&start.id).iter().map(|e| e.body.clone()).collect::<String>();
+    for words in ["answer me in short sentences", "commit message plain"] {
+        assert!(!on_log.contains(words) && !record.contains(words), "the owner's words are not on the log");
+    }
+    assert!(!nothing_to_do(&start.frozen), "a message on the list is something to do");
+}
+
+/// An empty list asks nothing, and the short path is still reached.
+#[test]
+fn an_empty_list_asks_nothing_and_the_short_path_is_kept() {
+    let mut fx = Fx::new();
+    let said = SaidFx::new(&fx, "demo", &[("yes", 5), ("go", 4)]);
+    let start = said.begin(&mut fx, S1, "demo");
+    assert_eq!(start.frozen.said, None);
+    assert!(nothing_to_do(&start.frozen));
+    assert!(nothing_to_do_line(&start.frozen).is_some());
+    assert!(!start_note(&start).contains("WHAT THE OWNER WANTS"));
+    file(&mut fx, &start, "eval-demo-1").expect("an empty list requires no MISTAKES line");
+}
+
+/// The report is held without the print command in the session's transcript,
+/// and a report with the command on record is accepted; the machine section
+/// shows the block.
+#[test]
+fn the_report_is_held_until_the_print_command_is_in_the_transcript() {
+    let mut fx = Fx::new();
+    let said = SaidFx::new(&fx, "demo", &[("always ask me before you delete anything", 30), ("keep the answers short please", 10)]);
+    let start = said.begin(&mut fx, S1, "demo");
+    let command = start.frozen.said.as_ref().unwrap().command.clone();
+
+    // Nothing in the transcript yet: held, and the refusal names the command.
+    assert!(!crate::said::record_print_evidence(&mut fx.store, Some(&said.root), &start));
+    let held = file(&mut fx, &start, "eval-demo-1").unwrap_err().to_string();
+    assert!(held.contains("prints them") && held.contains(&command), "{held}");
+
+    // A command that is not the print (another project, a digest, no project) does not count.
+    for wrong in ["serve --db x said --project other", "serve --db x inventory --digest s.jsonl", "serve --db x said"] {
+        said.ran(S1, &start, wrong, 5);
+        assert!(!crate::said::record_print_evidence(&mut fx.store, Some(&said.root), &start), "{wrong}");
+    }
+    // Run BEFORE the start does not count either.
+    said.ran(S1, &start, &command, -60);
+    assert!(!crate::said::record_print_evidence(&mut fx.store, Some(&said.root), &start));
+
+    // The real command, after the start: the evidence is written and the filing passes.
+    said.ran(S1, &start, &command, 5);
+    assert!(crate::said::record_print_evidence(&mut fx.store, Some(&said.root), &start));
+    assert!(model::store::said_printed(&fx.store, &start));
+    fx.legacy(&rule("kept-wish", "Ask before deleting anything.", vec![cmd("rm")], None, Some("demo")));
+    let no_line = file(&mut fx, &start, "eval-demo-1").unwrap_err().to_string();
+    assert!(no_line.contains("`MISTAKES:`") && no_line.contains("MISTAKES: none"), "{no_line}");
+    assert!(model::store::show(&fx.store, "eval-demo-1").is_err(), "nothing was written");
+    file_text(&mut fx, &start, "eval-demo-1", Some("TLDR.
+MISTAKES:
+- deleted without asking: rule kept-wish")).expect("the print is on record and the line is there");
+    let text = model::store::show(&fx.store, "eval-demo-1").unwrap().text;
+    assert!(
+        text.contains(
+            "WHAT THE OWNER SAID: 2 message(s) typed since the previous evaluation were on the frozen list (2 printable, 0 wait \
+             for the next evaluation); the print command ran in this session after the start: yes; 0 transcript file(s) could not \
+             be read; 1 note(s) were created or revised in the window"
+        ),
+        "{text}"
+    );
+    assert!(text.contains("THOR cannot verify that judgement"), "{text}");
+}
+
+/// A list longer than the print cap: the oldest part is shown, the rest waits,
+/// and the cursor moves only to the last message shown - and only when the
+/// report counts.
+#[test]
+fn the_cursor_moves_to_the_last_message_shown_and_only_when_the_report_counts() {
+    let mut fx = Fx::new();
+    let long: Vec<(String, i64)> = (0..60).map(|n| (format!("{n:02} {}", "always remember this wish ".repeat(40)), 600 - n * 5)).collect();
+    let borrowed: Vec<(&str, i64)> = long.iter().map(|(t, m)| (t.as_str(), *m)).collect();
+    let said = SaidFx::new(&fx, "demo", &borrowed);
+    let start = said.begin(&mut fx, S1, "demo");
+    let frozen = start.frozen.said.clone().unwrap();
+    assert_eq!(frozen.total, 60);
+    assert!(frozen.shown > 0 && frozen.shown < 60, "{frozen:?}");
+    assert_eq!(frozen.waiting(), 60 - frozen.shown);
+    let printed = crate::said::print_for(&fx.store, Some(&said.root), "demo").unwrap();
+    assert!(printed.trim_end().ends_with(&format!("{} newer message(s) wait for the next evaluation.", frozen.waiting())), "{printed}");
+    assert!(printed.contains("00 always remember"), "the oldest part is printed");
+
+    // A report that is on file but does not count (no transcript backs its filing): the cursor stays.
+    said.ran(S1, &start, &frozen.command, 5);
+    assert!(crate::said::record_print_evidence(&mut fx.store, Some(&said.root), &start));
+    file_text(&mut fx, &start, "eval-demo-1", Some("MISTAKES: none")).unwrap();
+    let written = crate::eval_filing::validate_new_reports(&mut fx.store, Some(&said.root), S1);
+    assert!(!written.is_empty() && written.iter().all(|r| !r.valid), "{written:?}");
+    assert_eq!(crate::said::cursor_of(&fx.db, "demo"), None, "a report that does not count moves nothing");
+
+    // A report that counts moves it to the last message shown, nothing further.
+    let counts = model::store::EvaluationValidation {
+        valid: true,
+        why: String::new(),
+        drift: false,
+        report: "eval-demo-1".to_string(),
+        report_seq: 0,
+        project: Some("demo".to_string()),
+        session: S1.to_string(),
+        agent: None,
+        started_seq: Some(start.frozen.started_seq),
+        filed_seq: None,
+        filed_at: None,
+        machine_sha256: None,
+        verdicts: Default::default(),
+        carry: Vec::new(),
+    };
+    crate::said::advance_for_valid(&fx.store, &counts);
+    assert_eq!(crate::said::cursor_of(&fx.db, "demo"), Some(frozen.through_ms));
+    let last_shown = crate::said::collect_in(&said.root, "demo", frozen.since_ms, frozen.until_ms).list[frozen.shown - 1].at_ms;
+    assert_eq!(frozen.through_ms, last_shown);
+
+    // The next evaluation starts after the cursor: it lists exactly what waited.
+    let next = said.begin(&mut fx, S2, "demo");
+    let again = next.frozen.said.clone().unwrap();
+    assert_eq!(again.since_ms, frozen.through_ms);
+    assert_eq!(again.total, 60 - frozen.shown, "nothing was dropped and nothing is read twice");
+}
+
+/// A transcript that cannot be read never fails the evaluation: the machine
+/// section says how many could not be read.
+#[test]
+fn unreadable_transcripts_are_counted_in_the_machine_section() {
+    let mut fx = Fx::new();
+    let said = SaidFx::new(&fx, "demo", &[("always ask me before you delete anything", 30)]);
+    let mut start = said.begin(&mut fx, S1, "demo");
+    start.frozen.said.as_mut().unwrap().unreadable = 3;
+    let tip = fx.store.get_next_seq().unwrap() - 1;
+    let section = model::store::render_machine_section(&fx.store, &start, tip);
+    assert!(section.contains("3 transcript file(s) could not be read"), "{section}");
+    // A file that holds no valid lines is skipped, not an error.
+    said.write("c", "5e1f0c3a-0000-4000-8000-0000000000bb", &["not json at all".to_string(), "\u{fffd}\u{fffd}".to_string()]);
+    let got = crate::said::collect_in(&said.root, "demo", 0, i64::MAX);
+    assert_eq!((got.list.len(), got.unreadable), (1, 0));
+}
+
+// ------------------------------------------------ a firing at a tool call with no command
+
+/// An item that fired only in another session at a tool call with no command
+/// and no file shows the tool's name and the date, not just the skip exit.
+#[test]
+fn a_firing_at_a_tool_call_without_a_command_shows_the_tool_name_and_the_date() {
+    let fired = model::store::Firings {
+        count: 3,
+        triggers: vec!["Agent".to_string()],
+        excerpts: Vec::new(),
+        sessions: vec!["5e1f0c3a".to_string()],
+        elsewhere: true,
+        last_date: Some("2026-11-02".to_string()),
+    };
+    let line = fired_line(Some(&fired), 3);
+    assert!(line.contains("last on 2026-11-02") && line.contains("'Agent'"), "{line}");
+    assert!(line.contains("a call of the tool 'Agent' that carried no command and no file"), "{line}");
+    assert!(line.contains("no excerpt of the call"), "the record holds none: {line}");
+    assert!(line.contains("not-judgeable"), "the exit stays: {line}");
+
+    // With an excerpt: cut to 120 characters, secrets blanked.
+    let token = format!("{}{}", "ghp_", "a".repeat(30));
+    let with = model::store::Firings { excerpts: vec![Some(format!("use {token} {}", "long ".repeat(60)))], ..fired.clone() };
+    let line = fired_line(Some(&with), 3);
+    assert!(line.contains("an excerpt of the call: \"use [secret removed] long"), "{line}");
+    assert!(!line.contains(&token));
+    let excerpt = line.split("excerpt of the call: \"").nth(1).unwrap().split('"').next().unwrap();
+    assert!(excerpt.chars().count() <= 123, "{}", excerpt.chars().count());
+
+    // A bare command word is not a tool name, and a record with no place says what it lacks.
+    let command = model::store::Firings { triggers: vec!["ls".to_string()], ..fired.clone() };
+    assert!(!fired_line(Some(&command), 3).contains("a call of the tool"));
+    let none = model::store::Firings { triggers: vec![model::store::FIRED_WITHOUT_TRIGGER.to_string()], ..fired };
+    assert!(fired_line(Some(&none), 3).contains("neither a command, a file nor the tool's name"));
 }

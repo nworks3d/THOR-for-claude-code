@@ -315,7 +315,9 @@ fn serve_program(bin_dir: &Path) -> PathBuf {
 /// routine tells a reader to wait for), `{{THOR_DOCTOR_ALLOW}}` (the
 /// matching `allowed-tools` entry that pre-approves it) and
 /// `{{THOR_RETEST_ALLOW}}` (the entry that pre-approves THOR's own retest
-/// command, in the exact form `model::store::retest_command_with` prints) -
+/// command, in the exact form `model::store::retest_command_with` prints),
+/// `{{THOR_SAID_ALLOW}}` (the entry that pre-approves `serve said`, the print of
+/// what the owner typed) -
 /// with this install run's own resolution for the current platform (see
 /// `doctor_invocation`/`doctor_allow_invocation`).
 pub fn render_eval_command(bin_dir: &Path, db: &Path) -> String {
@@ -326,6 +328,7 @@ pub fn render_eval_command(bin_dir: &Path, db: &Path) -> String {
         .replace("{{THOR_DOCTOR_EVAL_BASH}}", &doctor_eval_bash_invocation(bin_dir, db, cfg!(windows)))
         .replace("{{THOR_DOCTOR_ALLOW}}", &doctor_allow_invocation(bin_dir, cfg!(windows)))
         .replace("{{THOR_RETEST_ALLOW}}", &model::store::retest_allow_entry(&serve_program(bin_dir), Some(db)))
+        .replace("{{THOR_SAID_ALLOW}}", &model::store::said_allow_entry(&serve_program(bin_dir), Some(db)))
 }
 
 /// Claude Code's per-user commands folder: `~/.claude/commands`. Same base
@@ -579,12 +582,12 @@ pub fn launch_problem(serve_exe: &Path) -> Option<String> {
         Err(e) => Some(format!(
             "{} could not be started ({e}). Windows or your antivirus is probably blocking it (Smart App Control and \
              Code Integrity do this to programs they do not know), or the file is damaged. THOR does not change that \
-             setting: allow the program in Windows Security, or build it again, then run this again.",
+             setting: the assistant takes the person through the few clicks in Windows Security that allow the program (or downloads THOR again), then runs this again.",
             serve_exe.display()
         )),
         Ok(out) if !out.status.success() => Some(format!(
-            "{} started but exited with {} when asked for its version, so a hook that calls it would fail too. Build it \
-             again, then run this again.",
+            "{} started but exited with {} when asked for its version, so a hook that calls it would fail too. The assistant \
+             downloads THOR again (the install command does it), then runs this again.",
             serve_exe.display(),
             out.status
         )),
@@ -629,6 +632,9 @@ pub enum HookOutcome {
     /// An older hook of ours was pointing at a binary that is no longer on
     /// disk, and this run repointed it. See `stale_thor_command`.
     Replaced,
+    /// A hook of ours written in shell form, rewritten in place to exec form
+    /// (Windows). Needs a Claude Code restart to take effect.
+    Upgraded,
 }
 
 /// The executable a hook command calls, when the command has the shape this
@@ -662,8 +668,8 @@ fn stale_thor_command(group: &Value, exe: &str) -> Option<String> {
             continue;
         }
         let command = hook.get("command").and_then(Value::as_str)?;
-        let Some(their_exe) = exe_in_command(command) else { continue };
-        if Path::new(their_exe).file_name() == Some(ours) && !Path::new(their_exe).exists() {
+        let Some(their_exe) = hook_exe(hook) else { continue };
+        if Path::new(&their_exe).file_name() == Some(ours) && !Path::new(&their_exe).exists() {
             return Some(command.to_string());
         }
     }
@@ -694,12 +700,7 @@ fn group_has_command(group: &Value, command: &str) -> bool {
     group
         .get("hooks")
         .and_then(Value::as_array)
-        .map(|hooks| {
-            hooks.iter().any(|h| {
-                h.get("type").and_then(Value::as_str) == Some("command")
-                    && h.get("command").and_then(Value::as_str).is_some_and(|c| same_spelling(c, command))
-            })
-        })
+        .map(|hooks| hooks.iter().any(|h| hook_words(h).is_some_and(|words| words == command_words(command))))
         .unwrap_or(false)
 }
 
@@ -720,6 +721,12 @@ pub(crate) fn flatten_word(word: &str) -> String {
 /// and an unquoted spelling of the same path reduce to the same word. A
 /// backslash is NOT an escape here: on Windows it is the path separator.
 pub(crate) fn command_words(command: &str) -> Vec<String> {
+    raw_command_words(command).iter().map(|w| flatten_word(w)).collect()
+}
+
+/// `command_words` without the path flattening: the words exactly as written,
+/// quotes removed. Exec form needs them this way (a program and its arguments).
+fn raw_command_words(command: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut current = String::new();
     let mut in_word = false;
@@ -732,8 +739,7 @@ pub(crate) fn command_words(command: &str) -> Vec<String> {
             }
             c if c.is_whitespace() && !quoted => {
                 if in_word {
-                    words.push(flatten_word(&current));
-                    current.clear();
+                    words.push(std::mem::take(&mut current));
                     in_word = false;
                 }
             }
@@ -744,9 +750,64 @@ pub(crate) fn command_words(command: &str) -> Vec<String> {
         }
     }
     if in_word {
-        words.push(flatten_word(&current));
+        words.push(current);
     }
     words
+}
+
+/// The words of one hook entry, flattened, whichever form it is in: shell form
+/// (`"command"` is the whole line) or exec form (`"command"` is the program and
+/// `"args"` its arguments, one argument per element).
+fn hook_words(hook: &Value) -> Option<Vec<String>> {
+    if hook.get("type").and_then(Value::as_str) != Some("command") {
+        return None;
+    }
+    let command = hook.get("command").and_then(Value::as_str)?;
+    match hook.get("args").and_then(Value::as_array) {
+        None => Some(command_words(command)),
+        Some(args) => {
+            let mut words = vec![flatten_word(command)];
+            words.extend(args.iter().filter_map(Value::as_str).map(flatten_word));
+            Some(words)
+        }
+    }
+}
+
+/// The program one hook entry runs, in either form.
+fn hook_exe(hook: &Value) -> Option<String> {
+    let command = hook.get("command").and_then(Value::as_str)?;
+    if hook.get("args").is_some_and(Value::is_array) {
+        return Some(command.to_string());
+    }
+    exe_in_command(command).map(str::to_string)
+}
+
+/// Write `spec` into one hook entry. Exec form (Windows): the program in
+/// `command`, each argument its own element of `args`, and `onFailure:
+/// continue` so a hook that cannot start never blocks the call it watches.
+/// Shell form: the whole line in `command`, and no `args`.
+fn write_spec(hook: &mut Value, spec: &HookSpec, exec: bool) {
+    let words = raw_command_words(&spec.command);
+    match (exec, words.split_first()) {
+        (true, Some((program, args))) => {
+            hook["command"] = json!(program);
+            hook["args"] = json!(args);
+            hook["onFailure"] = json!("continue");
+        }
+        _ => {
+            hook["command"] = json!(spec.command);
+            if let Some(object) = hook.as_object_mut() {
+                object.remove("args");
+            }
+        }
+    }
+}
+
+/// Whether THOR's hooks are written in exec form on this system: Windows runs
+/// a shell-form line in PowerShell when Git Bash is not installed, and there a
+/// quoted program path followed by arguments does not parse.
+fn exec_form_here() -> bool {
+    cfg!(windows)
 }
 
 /// True iff two command lines call the same program with the same arguments,
@@ -757,10 +818,10 @@ pub fn same_spelling(a: &str, b: &str) -> bool {
     a == b || command_words(a) == command_words(b)
 }
 
-fn new_group(spec: &HookSpec) -> Value {
-    let mut group = json!({
-        "hooks": [ { "type": "command", "command": spec.command } ]
-    });
+fn new_group(spec: &HookSpec, exec: bool) -> Value {
+    let mut hook = json!({ "type": "command" });
+    write_spec(&mut hook, spec, exec);
+    let mut group = json!({ "hooks": [ hook ] });
     if let Some(matcher) = spec.matcher {
         group["matcher"] = json!(matcher);
     }
@@ -797,6 +858,14 @@ pub fn backup_once(path: &Path, raw: &str) -> std::io::Result<std::path::PathBuf
 ///   else's hook, or THOR's own from an earlier install) is left byte-for-
 ///   byte as it was.
 pub fn install_hooks(path: &Path, specs: &[HookSpec]) -> anyhow::Result<InstallReport> {
+    install_hooks_as(path, specs, exec_form_here())
+}
+
+/// `install_hooks` with the form chosen by the caller (`exec` true writes the
+/// exec form of the module docs of `write_spec`). A hook of ours that is
+/// already there in shell form is rewritten in place to exec form when `exec`
+/// is true (outcome `Upgraded`); a hook that is not ours is never touched.
+pub fn install_hooks_as(path: &Path, specs: &[HookSpec], exec: bool) -> anyhow::Result<InstallReport> {
     let existed = path.exists();
     let raw = if existed { fs::read_to_string(path)? } else { "{}".to_string() };
 
@@ -850,7 +919,22 @@ pub fn install_hooks(path: &Path, specs: &[HookSpec]) -> anyhow::Result<InstallR
         let array = array.as_array_mut().expect("checked above: this key is an array");
 
         if array.iter().any(|group| group_has_command(group, &spec.command)) {
-            results.push((spec.event.to_string(), HookOutcome::AlreadyPresent));
+            let wanted = command_words(&spec.command);
+            let mut upgraded = false;
+            if exec {
+                for group in array.iter_mut() {
+                    let Some(hooks) = group.get_mut("hooks").and_then(Value::as_array_mut) else { continue };
+                    for hook in hooks.iter_mut() {
+                        let shell_form = hook.get("args").is_none();
+                        if shell_form && hook_words(hook).is_some_and(|words| words == wanted) {
+                            write_spec(hook, spec, true);
+                            upgraded = true;
+                        }
+                    }
+                }
+            }
+            let outcome = if upgraded { HookOutcome::Upgraded } else { HookOutcome::AlreadyPresent };
+            results.push((spec.event.to_string(), outcome));
             continue;
         }
 
@@ -865,7 +949,7 @@ pub fn install_hooks(path: &Path, specs: &[HookSpec]) -> anyhow::Result<InstallR
             if let Some(hooks) = group.get_mut("hooks").and_then(Value::as_array_mut) {
                 for hook in hooks.iter_mut() {
                     if hook.get("command").and_then(Value::as_str) == Some(old.as_str()) {
-                        hook["command"] = json!(spec.command);
+                        write_spec(hook, spec, exec);
                     }
                 }
             }
@@ -879,7 +963,7 @@ pub fn install_hooks(path: &Path, specs: &[HookSpec]) -> anyhow::Result<InstallR
                 results.push((spec.event.to_string(), HookOutcome::Replaced));
             }
             None => {
-                array.push(new_group(spec));
+                array.push(new_group(spec, exec));
                 results.push((spec.event.to_string(), HookOutcome::Added));
             }
         }
@@ -1138,11 +1222,39 @@ pub fn working_contract() -> Vec<model::item::Item> {
             model::store::SETUP_NOTE_ID,
             "Setup is not finished. In your first reply, `lookup first-session-questions` is the \
              one place to read: the exact calls, paths and what to say. Apply the defaults at once \
-             (store 'owner-setup-answers', retract this note, show him the list). Nothing waits.",
+             (store 'owner-setup-answers', retract this note, say the welcome). Nothing waits.",
             "This note is still being served at session start after the owner has already \
              answered these questions and the answers are applied.",
         ),
     ]
+}
+
+/// The last setup step, seeded into a NEW store only (like the helper notes,
+/// never into an existing one, and a copy never has it): a pinned note telling
+/// the assistant that right after the welcome is answered it runs the tidy step
+/// of the first-session text. `serve`'s Stop hold (`order_debt`) keeps the
+/// session on it until THOR itself finds it settled, and the store refuses to
+/// retract or rewrite it before (`model::store::guard_order_note`).
+pub fn order_earlier_note() -> model::item::Item {
+    model::item::Item {
+        id: model::store::ORDER_NOTE_ID.to_string(),
+        kind: model::item::Kind::Orientation,
+        text: "Last setup step: once the welcome is answered, run THE TIDY STEP of `lookup first-session-questions` (serve \
+               inventory, then a numbered proposal to order earlier work). The session is held until THOR itself finds it settled. \
+               Never retract this note yourself."
+            .to_string(),
+        bindings: vec![model::item::Binding::Always],
+        severity: None,
+        project: None,
+        tags: vec!["working-contract".to_string()],
+        expires: None,
+        key: None,
+        falsifier: Some(
+            "This note is still served after the person was offered the proposal and answered it, or after serve inventory found nothing to order."
+                .to_string(),
+        ),
+        check: None,
+    }
 }
 
 /// The workflow starter pack: the coding-workflow habits that, in a store
@@ -1378,8 +1490,44 @@ pub fn workflow_starter_pack_for(windows: bool) -> Vec<model::item::Item> {
             ),
             Check::Forbidden { literals: vec!["/it".to_string(), "/IT".to_string()] },
         ),
+        // A subject that does not belong to this session gets its own session,
+        // prepared by the assistant so the person only clicks. An orientation,
+        // pinned: it has no tool or file to bind to, it is read at session start.
+        model::item::Item {
+            kind: model::item::Kind::Orientation,
+            ..note(
+                OFF_TOPIC_NOTE_ID,
+                OFF_TOPIC_NOTE_TEXT,
+                "A person starts on an unrelated subject in this session and the assistant never offers a session of its own for it.",
+                vec![Binding::Always],
+            )
+        },
+        // Where new files go. Pinned like the note above: no tool or file to
+        // bind to, it matters whenever a file is about to be written.
+        model::item::Item {
+            kind: model::item::Kind::Orientation,
+            ..note(
+                FILES_IN_SUBJECT_FOLDER_NOTE_ID,
+                FILES_IN_SUBJECT_FOLDER_NOTE_TEXT,
+                "Files the assistant writes loose into the home, Desktop, Downloads or Documents folder are found just as easy to find again as files in a folder of their subject.",
+                vec![Binding::Always],
+            )
+        },
     ]
 }
+
+/// The id of the starter note that keeps new files out of the broad places.
+pub const FILES_IN_SUBJECT_FOLDER_NOTE_ID: &str = "files-go-in-the-folder-of-their-subject";
+
+/// Its text (under 300 characters, a test holds that).
+pub const FILES_IN_SUBJECT_FOLDER_NOTE_TEXT: &str = "New files for the person go in the folder of the subject being worked on, never loose in the home folder, Desktop, Downloads or Documents itself. A new subject gets its own folder first (install --topic from inside it), then the files.";
+
+/// The id of the starter note that makes off-topic work get its own session.
+pub const OFF_TOPIC_NOTE_ID: &str = "off-topic-work-gets-its-own-session";
+
+/// Its text: short on purpose (the tools that do it are named in the first-session
+/// text, `questionnaire::ASSISTANT_RULES`).
+pub const OFF_TOPIC_NOTE_TEXT: &str = "A topic that does not fit this conversation's work or folder: say so in one sentence, offer its own conversation. On yes: make a folder in their Documents folder (real local name), run install --topic there, move and rename this one if it has no work yet, else prepare a new one. They type nothing.";
 
 /// One starter note, as every note of the pack and of helper-agent mode is
 /// built: a global rule with the `workflow-starter` tag, no severity, no check.
@@ -1542,7 +1690,7 @@ pub fn seed_working_contract_at(
     // rendered from the same catalogue as the page in AGENTS.md.
     let detected = claude_json.map(serve::plan::detect_in);
     let questions = crate::questionnaire::lookup_item_with(detected, paths);
-    for item in working_contract().into_iter().chain(workflow_starter_pack()).chain(std::iter::once(questions)) {
+    for item in working_contract().into_iter().chain(workflow_starter_pack()).chain(helper_mode_notes()).chain(std::iter::once(order_earlier_note())).chain(std::iter::once(questions)) {
         let id = item.id.clone();
         match model::store::declare(&mut store, "install", "install", installer(), &item) {
             Ok(_) => out.push(SeededItem { id, stored: true, refusal: None }),
@@ -1871,13 +2019,13 @@ impl std::fmt::Display for RegisterRefusal {
         match self {
             RegisterRefusal::NotACheckout { cwd } => write!(
                 f,
-                "REFUSED: {cwd} is not set up as a topic folder yet. Open a terminal INSIDE the folder for your topic \
-                 and run the installer there with --topic added (no git or code needed). Nothing was changed."
+                "REFUSED: {cwd} is not set up as a topic folder yet. The assistant runs the installer from INSIDE the folder for the topic \
+                 with --topic added (no git or code needed). Nothing was changed."
             ),
             RegisterRefusal::TooBroad { cwd } => write!(
                 f,
                 "REFUSED: {cwd} is your whole home folder or a whole drive, which is too broad to be one topic. Make a \
-                 folder for just one subject (for example 'Kitchen renovation'), open that folder, and run this again \
+                 folder for just one subject (for example 'Kitchen renovation') and the assistant runs this again \
                  from inside it. Nothing was changed."
             ),
             RegisterRefusal::StillACheckout { key, old } => write!(
@@ -1949,6 +2097,20 @@ pub fn topic_folder_name(dir: &Path) -> Result<String, RegisterRefusal> {
         return Err(too_broad());
     }
     dir.file_name().and_then(|n| n.to_str()).map(str::trim).filter(|n| !n.is_empty()).map(str::to_string).ok_or_else(too_broad)
+}
+
+/// The topic a plain folder is, or would become: the folder that carries (or
+/// will carry) the `.thor-project` marker, and the key it holds. Run from a
+/// subfolder of an existing topic, it is the topic's own top. A folder with no
+/// marker yet is named after itself, except the home folder and a drive root,
+/// which are far too broad (`ops::install::topic_folder_name`).
+pub fn topic_of(here: &Path) -> Result<(PathBuf, String), RegisterRefusal> {
+    let dir = serve::project::plain_root(here).unwrap_or_else(|| here.to_path_buf());
+    let key = match serve::project::resolve_project(&dir) {
+        Some(key) => key,
+        None => topic_folder_name(&dir)?,
+    };
+    Ok((dir, key))
 }
 
 /// What a registration of a checkout would do, decided before anything is
@@ -2231,6 +2393,93 @@ mod tests {
             let sub_at = spec.command.find(" hook").expect("the command must call the hook subcommand");
             assert!(db_at < sub_at, "--db is a global option, so it comes first: {}", spec.command);
         }
+    }
+
+    /// A fresh write in exec form: program in `command`, one argument per
+    /// `args` element, and `onFailure: continue` so a hook that cannot start
+    /// never blocks the tool call it watches (Windows without Git Bash).
+    #[test]
+    fn a_fresh_write_in_exec_form_has_args_and_on_failure_continue() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        install_hooks_as(&path, &specs(), true).unwrap();
+        let written: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        for event in ["SessionStart", "PreToolUse", "UserPromptSubmit", "Stop"] {
+            let hook = &written["hooks"][event][0]["hooks"][0];
+            assert_eq!(hook["type"], json!("command"));
+            assert_eq!(hook["command"], json!("C:\\fake\\serve.exe"), "{event}");
+            assert_eq!(hook["args"], json!(["--db", "C:\\fake\\thor.db", "hook"]), "{event}");
+            assert_eq!(hook["onFailure"], json!("continue"), "{event}");
+        }
+        assert_eq!(written["hooks"]["PreToolUse"][0]["matcher"], json!("*"));
+        // The platform default is exec form on Windows and shell form elsewhere.
+        let other = dir.path().join("platform.json");
+        install_hooks(&other, &specs()).unwrap();
+        let platform: Value = serde_json::from_str(&fs::read_to_string(&other).unwrap()).unwrap();
+        assert_eq!(platform["hooks"]["Stop"][0]["hooks"][0].get("args").is_some(), cfg!(windows));
+    }
+
+    /// A shell-form entry of ours from an older install is rewritten in place
+    /// (same group, same position), and a second run changes nothing.
+    #[test]
+    fn an_old_shell_form_entry_of_ours_is_upgraded_in_place_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        install_hooks_as(&path, &specs(), false).unwrap();
+        let old: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(old["hooks"]["Stop"][0]["hooks"][0].get("args").is_none());
+
+        let upgrade = install_hooks_as(&path, &specs(), true).unwrap();
+        assert!(upgrade.results.iter().all(|(_, o)| *o == HookOutcome::Upgraded), "{:?}", upgrade.results);
+        let now: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        for event in ["SessionStart", "PreToolUse", "UserPromptSubmit", "Stop"] {
+            assert_eq!(now["hooks"][event].as_array().unwrap().len(), 1, "{event}: rewritten in place, not appended");
+            let hook = &now["hooks"][event][0]["hooks"][0];
+            assert_eq!(hook["command"], json!("C:\\fake\\serve.exe"));
+            assert_eq!(hook["args"], json!(["--db", "C:\\fake\\thor.db", "hook"]));
+            assert_eq!(hook["onFailure"], json!("continue"));
+        }
+
+        let before = fs::read(&path).unwrap();
+        let again = install_hooks_as(&path, &specs(), true).unwrap();
+        assert!(again.results.iter().all(|(_, o)| *o == HookOutcome::AlreadyPresent), "{:?}", again.results);
+        assert_eq!(fs::read(&path).unwrap(), before, "a second run must not change the file");
+    }
+
+    /// A hook that is not ours, in either form, is never touched by an upgrade.
+    #[test]
+    fn a_foreign_hook_stays_byte_identical_through_an_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let foreign_shell = json!({"hooks": [{"type": "command", "command": "\"C:\\\\tools\\\\other.exe\" --db \"C:\\\\fake\\\\thor.db\" hook"}]});
+        let foreign_exec = json!({"hooks": [{"type": "command", "command": "node", "args": ["x.js", "hook"]}]});
+        let start = json!({"hooks": {"Stop": [foreign_shell, foreign_exec]}});
+        fs::write(&path, serde_json::to_string_pretty(&start).unwrap()).unwrap();
+
+        install_hooks_as(&path, &specs(), true).unwrap();
+        let now: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(now["hooks"]["Stop"][0], start["hooks"]["Stop"][0]);
+        assert_eq!(now["hooks"]["Stop"][1], start["hooks"]["Stop"][1]);
+        assert_eq!(now["hooks"]["Stop"].as_array().unwrap().len(), 3, "ours was appended after theirs");
+    }
+
+    #[test]
+    fn a_hook_pointing_at_a_vanished_program_is_repointed_in_exec_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let new_exe = dir.path().join("serve.exe");
+        fs::write(&new_exe, b"x").unwrap();
+        // Built from the temp folder, not written as "C:\\...": on Linux a
+        // backslash is no separator, so the program name would not be found.
+        let gone = dir.path().join("gone").join("serve.exe");
+        install_hooks_as(&path, &standard_hooks(&gone.display().to_string(), "C:\\fake\\thor.db"), true).unwrap();
+        let moved = standard_hooks(&new_exe.display().to_string(), "C:\\fake\\thor.db");
+        let report = install_hooks_as(&path, &moved, true).unwrap();
+        assert!(report.results.iter().all(|(_, o)| *o == HookOutcome::Replaced), "{:?}", report.results);
+        let now: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let hook = &now["hooks"]["Stop"][0]["hooks"][0];
+        assert_eq!(hook["command"], json!(new_exe.display().to_string()));
+        assert_eq!(hook["onFailure"], json!("continue"));
     }
 
     #[test]
@@ -2751,10 +3000,30 @@ mod tests {
 
         let seeded = seed_working_contract(&db).unwrap();
         // The notes, the starter pack and the first-session list (a lookup item).
-        assert_eq!(seeded.len(), working_contract().len() + workflow_starter_pack().len() + 1);
+        assert_eq!(seeded.len(), working_contract().len() + workflow_starter_pack().len() + helper_mode_notes().len() + 2);
         for s in &seeded {
             assert!(s.stored, "the gate refused its own starting note {}: {:?}", s.id, s.refusal);
         }
+    }
+
+    /// The seeded pack is the standing block of every new user, and the write
+    /// gate now refuses a pin that does not fit it (`model::store::capacity`).
+    /// So the pack must fit the session start block whole, with real room left
+    /// for the user's own first pinned notes, counted by the block builder the
+    /// hook itself uses and not by the gate's own count.
+    #[test]
+    fn the_seeded_pack_fits_the_session_start_block_with_room_to_spare() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        ensure_store(&db).unwrap();
+        seed_working_contract(&db).unwrap();
+        let store = EventStore::open_existing(&db).unwrap();
+        let items = serve::session_start::select(&serve::live::always_candidates(&store), None);
+        assert!(items.len() >= 20, "the pack is pinned: {} standing notes", items.len());
+        let block = serve::session_start::render_within(&items, serve::session_start::HOOK_OUTPUT_LIMIT_BYTES).unwrap();
+        assert_eq!(block.hidden, 0, "the seeded pack must not cut one of its own notes: {:?}", block.hidden_ids);
+        let spare = serve::session_start::HOOK_OUTPUT_LIMIT_BYTES - block.text.len();
+        assert!(spare >= 1_500, "only {spare} bytes are left for the user's own pinned notes (pack: {} bytes)", block.text.len());
     }
 
     /// The defect this guards against: a starting note that is stored but
@@ -2813,7 +3082,7 @@ mod tests {
         assert_eq!(report.store, StoreOutcome::Created);
         assert_eq!(working_contract().len(), 22, "this test's own claim of 22 starting notes is now stale");
         // 22 working-contract notes, the starter pack, and the first-session list.
-        let want = 22 + workflow_starter_pack().len() + 1;
+        let want = 22 + workflow_starter_pack().len() + helper_mode_notes().len() + 2;
         let stored = report.seeded.iter().filter(|s| s.stored).count();
         assert_eq!(stored, want, "expected all {want} starting notes to be stored, got {stored}");
         assert_eq!(report.rulebook.outcome, RulebookOutcome::Written);
@@ -2903,7 +3172,11 @@ mod tests {
         let mut pinned = 0;
         for item in &pack {
             assert!(ids.insert(item.id.clone()), "{} is in the pack twice", item.id);
-            assert_eq!(item.kind, model::item::Kind::Rule, "{}", item.id);
+            // The one pinned orientation of the pack (off-topic work gets its own
+            // session) is read at session start; every other note is a rule.
+            let off_topic = item.id == OFF_TOPIC_NOTE_ID || item.id == FILES_IN_SUBJECT_FOLDER_NOTE_ID;
+            let kind = if off_topic { model::item::Kind::Orientation } else { model::item::Kind::Rule };
+            assert_eq!(item.kind, kind, "{}", item.id);
             assert!(item.project.is_none(), "{} is scoped to a project, a new user has none", item.id);
             assert_eq!(item.tags, vec!["workflow-starter".to_string()], "{}", item.id);
             assert!(item.falsifier.is_some(), "{} names nothing that would prove it wrong", item.id);
@@ -2967,16 +3240,24 @@ mod tests {
         }
     }
 
-    /// Helper-agent mode is off in a new memory (owner decision, 2026-10-09):
-    /// its two notes are in no seeded set, and they are as generic and as small
-    /// as every other starter note.
+    /// Helper-agent mode is ON in a new memory (owner decision, 2026-11-18, it
+    /// had been off since 2026-10-09): its two notes are seeded into a NEW
+    /// store beside the pack, never in the pack itself, and they are as
+    /// generic and as small as every other starter note.
     #[test]
     fn the_helper_notes_are_outside_every_seeded_set_and_as_clean_as_the_pack() {
         let helpers = helper_mode_notes();
         let ids: Vec<&str> = helpers.iter().map(|n| n.id.as_str()).collect();
         assert_eq!(ids, crate::questionnaire::HELPER_MODE_NOTES);
         for seeded in working_contract().into_iter().chain(workflow_starter_pack()) {
-            assert!(!ids.contains(&seeded.id.as_str()), "{} is seeded into a new memory", seeded.id);
+            assert!(!ids.contains(&seeded.id.as_str()), "{} is in the pack itself", seeded.id);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        ensure_store(&db).unwrap();
+        let seeded = seed_working_contract(&db).unwrap();
+        for id in &ids {
+            assert!(seeded.iter().any(|s| s.id == *id && s.stored), "{id} is not seeded into a new memory");
         }
         for item in &helpers {
             assert_eq!(item.kind, model::item::Kind::Rule);
@@ -3211,6 +3492,10 @@ mod tests {
         let store = EventStore::open_read_only(&db).unwrap();
         let live = serve::live::live_items(&store);
         for item in workflow_starter_pack() {
+            if item.id == OFF_TOPIC_NOTE_ID || item.id == FILES_IN_SUBJECT_FOLDER_NOTE_ID {
+                assert_eq!(item.bindings, vec![model::item::Binding::Always], "the off-topic note is pinned, served at session start");
+                continue;
+            }
             let mut input = serve::input::ServeInput::default();
             for b in &item.bindings {
                 match b {

@@ -1,2 +1,2 @@
 exit 0
-{"decision":"block","reason":"[THOR] rule l-vendor forbids writing here (\"nothing under vendor is edited by hand\"); vendor is a protected location and <BASE>/location/alpha/vendor/lock.json may not be written."}
+{"decision":"block","reason":"[THOR] rule l-vendor forbids writing here (\"nothing under vendor is edited by hand\"); vendor is a protected location and <BASE>/location/alpha/vendor/lock.json may not be written.","systemMessage":"THOR stopped one step your assistant was about to take, because it went against something saved in the memory earlier. Your assistant will try another way. You do not need to do anything."}

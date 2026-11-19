@@ -641,6 +641,59 @@ pub fn assemble(root: &str, tools: &[ToolEntry], loose_scripts: &[String]) -> (S
     (out.join("\n"), findings)
 }
 
+/// What every overview starts with (also the cached one that says it is old).
+pub const OVERVIEW_PREFIX: &str = "Helper tools available in ";
+
+/// The smallest form of the overview: one line with how many tools there are,
+/// where the folder is, and to look there first.
+pub fn overview_one_line(root: &str, total: usize) -> String {
+    format!("Helper tools in {root}: {total} tool(s). Look there before writing a new helper script.")
+}
+
+/// `overview` made to fit `budget` bytes, never longer than it was: unchanged
+/// when it fits; otherwise as many tool lines as fit, with the rest counted in
+/// the "... and N more in <folder>" line; at the smallest the one line of
+/// `overview_one_line`. `None` when not even that fits. A text that is not an
+/// overview built by `assemble` is returned whole or not at all.
+pub fn shrink_overview(overview: &str, budget: usize) -> Option<String> {
+    if overview.len() <= budget {
+        return Some(overview.to_string());
+    }
+    let mut lines: Vec<&str> = overview.lines().collect();
+    let header = *lines.first()?;
+    let rest = header.strip_prefix(OVERVIEW_PREFIX)?;
+    if lines.last() != Some(&OVERVIEW_ADVICE) {
+        return None;
+    }
+    lines.pop();
+    lines.remove(0);
+    let mut root = match rest.find(" (list from") {
+        Some(at) => rest[..at].to_string(),
+        None => rest.trim_end_matches(':').to_string(),
+    };
+    let mut more_before = 0;
+    if let Some((count, named_root)) = lines.last().and_then(|l| l.strip_prefix("... and ")).and_then(|l| l.split_once(" more in ")) {
+        more_before = count.parse::<usize>().ok()?;
+        root = named_root.to_string();
+        lines.pop();
+    }
+    lines.retain(|l| *l != "none yet");
+    let total = lines.len() + more_before;
+    for kept in (1..=lines.len()).rev() {
+        let mut out = vec![header.to_string()];
+        out.extend(lines[..kept].iter().map(|l| l.to_string()));
+        if total > kept {
+            out.push(more_line(total - kept, &root));
+        }
+        out.push(OVERVIEW_ADVICE.to_string());
+        let text = out.join("\n");
+        if text.len() <= budget {
+            return Some(text);
+        }
+    }
+    Some(overview_one_line(&root, total)).filter(|line| line.len() <= budget)
+}
+
 /// What one read of the tools folder found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolsRead {
@@ -1137,6 +1190,41 @@ mod tests {
         for no in ["README.md", "notes.txt", "py", "x.pyc", ".gitignore", "x.json"] {
             assert!(!is_script_name(no), "{no}");
         }
+    }
+
+    fn many_tools(count: usize) -> String {
+        let tools: Vec<ToolEntry> = (0..count)
+            .map(|n| ToolEntry { name: format!("tool-{n:02}"), readme: ReadmeState::Line(format!("does job number {n} in one plain line")) })
+            .collect();
+        assemble("/srv/tools", &tools, &[]).0
+    }
+
+    /// The overview shrinks to what is left: fewer tool lines with a right
+    /// count, then one line, then nothing; it never grows and an overview that
+    /// fits is unchanged.
+    #[test]
+    fn the_overview_shrinks_to_the_room_and_disappears_only_when_one_line_does_not_fit() {
+        let full = many_tools(30);
+        assert_eq!(shrink_overview(&full, full.len()).as_deref(), Some(full.as_str()), "room enough: unchanged");
+
+        let half = shrink_overview(&full, full.len() / 2).expect("shrinks");
+        assert!(half.len() <= full.len() / 2 && half.starts_with("Helper tools available in /srv/tools:\n"), "{half}");
+        let shown = half.lines().filter(|l| l.starts_with("tool-")).count();
+        assert!(shown > 0 && shown < 30, "{half}");
+        assert!(half.contains(&format!("... and {} more in /srv/tools", 30 - shown)), "{half}");
+        assert!(half.ends_with(OVERVIEW_ADVICE), "{half}");
+
+        // An overview that already named more tools keeps counting them.
+        let capped = many_tools(80);
+        let again = shrink_overview(&capped, capped.len() / 2).unwrap();
+        let shown = again.lines().filter(|l| l.starts_with("tool-")).count();
+        assert!(again.contains(&format!("... and {} more in /srv/tools", 80 - shown)), "{again}");
+
+        let one = overview_one_line("/srv/tools", 30);
+        assert!(one.contains("30 tool(s)") && one.contains("/srv/tools") && one.contains("before writing a new helper script"), "{one}");
+        assert_eq!(shrink_overview(&full, one.len()).as_deref(), Some(one.as_str()));
+        assert_eq!(shrink_overview(&full, one.len() - 1), None, "not even one line fits: dropped");
+        assert!(!one.contains('\n'));
     }
 
     fn tools_fixture() -> (tempfile::TempDir, PathBuf) {

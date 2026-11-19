@@ -2653,6 +2653,44 @@ fn the_proof_the_hook_hands_out_makes_the_queued_report_count_at_the_drain() {
     assert!(model::store::show(&store, "eval-attest-cap-96").is_err(), "the proof note is read, not kept");
 }
 
+/// A copy whose report proof was handed `days_ago` days ago (`sent`), or whose
+/// ask was never proven (`None`), in a project that is due again by the clock.
+fn copy_asked_before(sent_days_ago: Option<i64>, n: u32) -> String {
+    let sandbox = Sandbox::new();
+    let s = uuid(n);
+    let (_dir, db, fxp) = due_copy(&sandbox, None, &s);
+    session_used_the_connector(&sandbox, &s);
+    let now = serve::time::now_unix();
+    let mut state = serve::copy_eval::CopyEvalState::default();
+    let other = uuid(n + 50);
+    state.asks.insert(
+        "fxp".to_string(),
+        serve::copy_eval::Ask {
+            session: other,
+            asked_unix: now - 9 * 86400,
+            holds: 0,
+            sent_unix: sent_days_ago.map(|d| now - d * 86400),
+            report: None,
+            gave_up: false,
+        },
+    );
+    std::fs::write(serve::copy_eval::state_path(&db), serde_json::to_string(&state).unwrap()).unwrap();
+    run_hook(&db, &stop_payload(&s, &fxp), &sandbox)
+}
+
+/// Field report 2026-11-13: a copy asked again one day after its report was
+/// sent, while the report was still queued. A proven report holds the next ask
+/// off for the weekly rhythm; one never proven is asked as before.
+#[test]
+fn a_copy_is_not_asked_again_before_the_weekly_rhythm_after_a_proven_report() {
+    let two_days = copy_asked_before(Some(2), 60);
+    assert!(!is_block(&two_days), "sent 2 days ago, not asked: {two_days}");
+    let eight_days = copy_asked_before(Some(8), 61);
+    assert!(is_block(&eight_days), "sent 8 days ago, asked again: {eight_days}");
+    let never_proven = copy_asked_before(None, 62);
+    assert!(is_block(&never_proven), "never proven, asked as before: {never_proven}");
+}
+
 /// R-copy-3: a copy with a connector marker is asked even when its session
 /// shows no tools yet (the marker is the owner's word that it is wired).
 #[test]

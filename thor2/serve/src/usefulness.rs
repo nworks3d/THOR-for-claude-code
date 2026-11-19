@@ -166,21 +166,21 @@ pub const ASSISTANT_DELIVERY_ACTOR: &str = "hook";
 pub fn served_since_last_verdict(store: &EventStore) -> HashMap<String, usize> {
     let Ok(events) = store.firings_and_verdicts() else { return HashMap::new() };
     let attested = model::store::attested_write_seqs(store);
-    // The sessions that were served each item since its last verdict: an item
-    // counts ONCE PER SESSION (step 28), however often it was shown there.
-    let mut sessions: HashMap<String, HashSet<String>> = HashMap::new();
+    // Counted once per session (step 28): the sessions served since the last
+    // verdict, and only the firings that still count (`counted_sessions`).
+    let mut servings: HashMap<String, Vec<(i64, String)>> = HashMap::new();
     for (seq, kind, id, actor, session) in events {
         match kind {
             EventKind::ItemServed if actor == ASSISTANT_DELIVERY_ACTOR => {
-                sessions.entry(id).or_default().insert(session);
+                servings.entry(id).or_default().push((seq, session));
             }
             EventKind::ItemMarkedUseful | EventKind::ItemMarkedNoise if attested.contains(&seq) => {
-                sessions.insert(id, HashSet::new());
+                servings.insert(id, Vec::new());
             }
             _ => {}
         }
     }
-    sessions.into_iter().map(|(id, sessions)| (id, sessions.len())).collect()
+    servings.into_iter().map(|(id, list)| { let n = model::store::counted_sessions(store, &id, &list).len(); (id, n) }).collect()
 }
 
 /// How many verdicts (`ItemMarkedUseful`/`ItemMarkedNoise`) on the log have

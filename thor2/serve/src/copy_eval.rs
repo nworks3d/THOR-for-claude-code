@@ -85,9 +85,14 @@ pub const LEGACY_ATTEST_TOOL: &str = "copy_attest";
 pub const ATTESTATION_VERSION: u32 = 1;
 /// How long a held report waits for its attestation before it is filed dead.
 pub const WAIT_FOR_ATTESTATION_SECS: i64 = 24 * 3600;
-/// How long a project is not asked again after its report was sent: the main
-/// machine has to drain, ship, and the copy to pull before the log shows it.
-pub const SUPPRESS_AFTER_SEND_SECS: i64 = 24 * 3600;
+/// How long a project is not asked again after its report was sent: as long as
+/// that report covers on the main machine (the weekly rhythm; the daily one
+/// while rot is found needs the log, which a copy cannot see, so it is the week).
+/// The report travels through a queue, so the copy cannot see it in its own
+/// store until a later pull, and must not ask again before the rhythm says so.
+pub fn suppress_after_send_secs(cadence: crate::usefulness::EvalCadence) -> i64 {
+    crate::usefulness::covers_hours(cadence, false) * 3600
+}
 /// How many times one turn is held again for a report that is not filed.
 pub const MAX_REHOLDS: u32 = 2;
 const QUEUED_PREFIX: &str = "queued for the main machine (";
@@ -640,8 +645,9 @@ pub fn copy_stop(db: &Path, session: &str, folder_project: Option<&str>, transcr
         folder_project,
         &attest::projects_in(&timeline),
     );
+    let suppress_secs = suppress_after_send_secs(crate::usefulness::cadence_in(db));
     for project in candidates {
-        let recently = |a: &Ask| a.sent_unix.is_some_and(|t| now - t < SUPPRESS_AFTER_SEND_SECS) || (a.sent_unix.is_none() && a.session != session && now - a.asked_unix < 1800);
+        let recently = |a: &Ask| a.sent_unix.is_some_and(|t| now - t < suppress_secs) || (a.sent_unix.is_none() && a.session != session && now - a.asked_unix < 1800);
         if state.asks.get(&project).is_some_and(recently) {
             continue;
         }

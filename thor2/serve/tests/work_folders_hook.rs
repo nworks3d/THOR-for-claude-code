@@ -201,7 +201,7 @@ fn a_script_left_outside_git_is_asked_about_once_at_a_turn_end() {
     assert!(reason.contains("fix_images.py") && reason.contains("try-this.ps1"), "{reason}");
     assert!(reason.contains(&fx.tools.display().to_string()) && reason.contains("README.txt"), "{reason}");
     let for_the_person = held["systemMessage"].as_str().unwrap();
-    assert!(for_the_person.contains("helper scripts") && for_the_person.contains("Nothing is needed from you"), "{for_the_person}");
+    assert!(for_the_person.contains("small helper files") && for_the_person.contains("You do not need to do anything"), "{for_the_person}");
 
     assert_eq!(stop(&fx.db, &fx.work, "s1"), serde_json::Value::Null, "never twice for the same files in one session");
     assert_eq!(stop(&fx.db, &fx.work, "s2"), serde_json::Value::Null, "another session never wrote them");

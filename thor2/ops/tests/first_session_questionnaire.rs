@@ -69,21 +69,111 @@ fn the_text_is_plain_ascii_without_dashes_curly_quotes_or_ellipsis_glyphs() {
 }
 
 #[test]
-fn the_plan_item_asks_for_confirmation_and_gives_the_reason_for_each_case() {
+fn the_plan_item_is_recorded_never_asked_and_gives_the_reason_for_each_case() {
     let plan = &questions()[0];
     assert!(plan.why.contains("usage limit") && plan.why.contains("once a week"), "{}", plan.why);
     let max = questionnaire::lookup_text(Some(Detection { plan: Plan::Max, tier_found: true }));
-    assert!(max.contains("The settings say: Max. Is that right?"), "{max}");
+    assert!(max.contains("The settings say: Max, so record max."), "{max}");
     let small = questionnaire::lookup_text(Some(Detection { plan: Plan::Small, tier_found: true }));
-    assert!(small.contains("The settings say: Pro or smaller. Is that right?"), "{small}");
+    assert!(small.contains("The settings say: Pro or smaller, so record small."), "{small}");
     let missing = questionnaire::lookup_text(Some(Detection { plan: Plan::Small, tier_found: false }));
-    assert!(missing.contains("do not say, so which is it: Max, or Pro and smaller?"), "a missing key is asked outright: {missing}");
-    assert!(max.contains(plan.why) && missing.contains(plan.why), "the reason rides with the question in every case, in the detail");
-    // The short list the user sees carries the question itself, in one line.
+    assert!(missing.contains("The settings do not say, so record small."), "a missing key is small, never asked: {missing}");
+    assert!(max.contains(plan.why) && missing.contains(plan.why), "the reason rides with the item in every case, in the detail");
+    assert!(questionnaire::ASSISTANT_RULES.contains("NEVER ask about the plan"));
+    for text in [&max, &small, &missing] {
+        assert!(!text.contains("Is that right?\" - or") && !text.contains("which is it: Max"), "no plan question is left: {text}");
+    }
+    // The line the user sees on the full list says what was noticed, never asks.
     let shown = |d| questionnaire::render_list(Some(d)).lines().find(|l| l.starts_with("1. ")).unwrap().to_string();
-    assert!(shown(Detection { plan: Plan::Max, tier_found: true }).contains("the settings say Max - is that right?"));
-    assert!(shown(Detection { plan: Plan::Small, tier_found: true }).contains("the settings say Pro or smaller - is that right?"));
-    assert!(shown(Detection { plan: Plan::Small, tier_found: false }).contains("which is it, Max or Pro and smaller?"));
+    assert!(shown(Detection { plan: Plan::Max, tier_found: true }).contains("Max, as Claude's settings say"));
+    assert!(shown(Detection { plan: Plan::Small, tier_found: true }).contains("Pro or smaller, as Claude's settings say"));
+    assert!(!shown(Detection { plan: Plan::Small, tier_found: false }).contains('?'));
+}
+
+/// The first reply is a short welcome, not the numbered list: what the person
+/// sees has the three examples and the two questions, and none of the words a
+/// beginner cannot place.
+#[test]
+fn the_welcome_is_short_plain_and_carries_every_point() {
+    let w = questionnaire::render_welcome();
+    for must in [
+        "Your memory helper THOR is set up. From now on I remember what you tell me about your work.",
+        "I bring it back by myself when you need it, also in a new conversation next week.",
+        "You do not have to learn anything. Just talk to me as you always do.",
+        "\"Remember that the contractor is called Jan and comes on Tuesdays.\"",
+        "\"What do you know about the kitchen?\"",
+        "\"That is no longer right: the tiles now come from another shop.\"",
+        "This is what I will set up for you:",
+        "1. Once a day, a safety copy of everything I remember, on this computer.",
+        "2. I talk to you in <language>.",
+        "3. Everything for this work goes in the folder <folder>. That is where we work together.",
+        "Shall I set it up like this? Just say \"yes\".",
+        "Want something different? Tell me the number and what you want, for example \"2 English\" or \"3 figure it out yourself\".",
+        "\"what is switched on?\"",
+    ] {
+        assert!(w.contains(must), "the welcome lacks '{must}':\n{w}");
+    }
+    let numbered: Vec<&str> = w.lines().filter(|l| l.len() > 3 && l.as_bytes()[0].is_ascii_digit() && l[1..].starts_with(". ")).collect();
+    assert_eq!(numbered.len(), 3, "exactly three numbered proposals:
+{w}");
+    assert_eq!(w.matches("Shall I set it up like this?").count(), 1, "exactly one question");
+    let lowered = w.to_lowercase();
+    for banned in ["git", "hook", "plan", "helper assistant", "weekly", "changelog", "index", "repository", "commit"] {
+        assert!(!lowered.contains(banned), "the welcome mentions '{banned}':\n{w}");
+    }
+    assert!(w.is_ascii() && w.chars().count() < 1000, "{} characters", w.chars().count());
+    let text = questionnaire::lookup_text(None);
+    assert!(text.contains(&w), "the served text carries the welcome exactly");
+    let welcome_at = text.find("SAY FIRST").unwrap();
+    let list_at = text.find("THE FULL LIST").unwrap();
+    assert!(welcome_at < list_at, "the welcome comes before the list, which is shown only on request");
+}
+
+/// The first reply must not be held by the reply rules (length, summary first).
+#[test]
+fn the_welcome_is_not_held_by_the_reply_rules() {
+    let rulebook = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../guard-response-rulebook.example.json")).unwrap();
+    let reply = questionnaire::render_welcome().replace("<language>", "English").replace("<folder>", "C:/Users/x/Documents/Kitchen");
+    let verdict = serve::respond::guard_verdict(Some(&rulebook), &reply, "hello", false, None);
+    assert!(verdict.block_reason.is_none(), "{:?}", verdict.block_reason);
+}
+
+/// The lines of the full list are for someone who has never seen a terminal.
+#[test]
+fn the_full_list_lines_hold_no_jargon_a_beginner_cannot_place() {
+    for q in questions() {
+        let lowered = q.line.to_lowercase();
+        for banned in ["hook", "index", "repository", "pretooluse", "tool call", "commit", "agents", "session start"] {
+            assert!(!lowered.contains(banned), "item {} line mentions '{banned}': {}", q.n, q.line);
+        }
+    }
+}
+
+#[test]
+fn the_assistant_sets_language_by_itself_asks_two_questions_and_hides_the_technical_items() {
+    let rules = questionnaire::ASSISTANT_RULES;
+    for must in [
+        "Proposal 2 (the language)",
+        "install --set-language <code> --db <store>",
+        "install --set-backup local --db <store>",
+        "NEVER mention in the first reply",
+        "In a folder that is not a git repository create no CHANGELOG.md and never mention one",
+        "ONLY when he asks what is switched on",
+        "numbers 1 to 12 are stable",
+        "ONE question over three numbered proposals",
+        "Apply nothing of proposals 1 to 3 before he answers",
+        "a plain \"yes\"",
+        "Proposal 3 (the folder)",
+        "name <folder> by its real name on this computer",
+        "call a session \"a conversation\"",
+        "never the home folder, the Documents, Desktop or Downloads folder itself, a drive root, or anything under AppData or Program Files",
+        "install --topic --db <store>",
+        "figure it out yourself",
+        "they open Claude Code in that folder",
+        "Never mention git, topic markers, scopes or registration to the person",
+    ] {
+        assert!(rules.contains(must), "the assistant rules lack '{must}'");
+    }
 }
 
 /// The owner found a ten-item list with four parts each overwhelming. What the
@@ -102,7 +192,10 @@ fn the_list_the_user_sees_is_an_intro_of_three_lines_at_most_then_one_line_per_i
     for (i, line) in items.iter().enumerate() {
         assert!(line.starts_with(&format!("{}. ", i + 1)), "{line}");
         assert!(line.chars().count() <= 280, "item {} is not short: {} characters", i + 1, line.chars().count());
-        assert!(line.contains("Default:"), "each line carries what was chosen: {line}");
+        assert!(line.contains("Now:") && !line.contains("Default"), "each line says how it is now, in plain words: {line}");
+        for sentence in line.split(". ") {
+            assert!(sentence.split_whitespace().count() <= 25, "item {} has a long sentence: {sentence}", i + 1);
+        }
     }
     let closing = lines.last().unwrap();
     assert!(closing.contains("by number") && closing.contains("defaults"), "the way to answer ends the list: {closing}");
@@ -132,7 +225,7 @@ fn the_why_and_the_way_to_say_no_sit_in_the_appendix_for_the_assistant() {
 #[test]
 fn the_git_hooks_item_names_the_media_gate_and_both_ways_to_switch_things_off() {
     let q = questions().into_iter().find(|q| q.id == "git-hooks").unwrap();
-    assert!(q.line.contains("video files") && q.line.contains("25 MB") && q.line.ends_with("Default: on."), "{}", q.line);
+    assert!(q.line.contains("video files") && q.line.contains("25 MB") && q.line.ends_with("Now: on."), "{}", q.line);
     assert!(q.line.chars().count() <= 200, "the short line stays short and plain: {}", q.line);
     assert!(q.what.contains("thor.mediagate.maxbytes") && q.what.contains("thor-media-ok"), "{}", q.what);
     assert!(q.what.contains("whole machine or for one repository"), "{}", q.what);
@@ -177,7 +270,7 @@ fn the_changelog_item_is_the_owners_decision_with_a_default_of_yes() {
     let q = questions().into_iter().find(|q| q.id == "changelog").unwrap();
     // The user's line is a statement of what happens, never a question.
     assert!(!q.line.contains('?'), "item 12 is a statement, not a question: {}", q.line);
-    assert!(q.line.contains("I create CHANGELOG.md") && q.line.contains("say no and I do not"), "{}", q.line);
+    assert!(q.line.contains("I create CHANGELOG.md") && q.line.contains("If you say no, I do not create it"), "{}", q.line);
     assert_eq!(q.why, "Every later session, and you, know exactly what changed and which version runs, without digging through history.");
     assert!(q.default.starts_with("Yes") && q.default.contains("has none"), "{}", q.default);
     assert!(questionnaire::ASSISTANT_RULES.contains("CHANGELOG.md"), "on yes the assistant creates the file");
@@ -203,8 +296,8 @@ fn every_install_flag_the_list_names_exists_in_the_installer() {
 #[test]
 fn helper_agent_mode_is_off_by_default_and_states_the_measurement_the_free_chat_and_the_costs() {
     let q = questions().into_iter().find(|q| q.id == "helper-agents").unwrap();
-    assert!(q.line.ends_with("Default: off."), "the one line the user sees says it is off: {}", q.line);
-    assert_eq!(q.default, "Off.");
+    assert!(q.line.contains("Now: on") && q.line.contains("helpers off"), "the one line the user sees says it is on and how to stop: {}", q.line);
+    assert_eq!(q.default, "On.");
     assert!(q.why.contains("12 to 62 percent cheaper"), "{}", q.why);
     assert!(q.why.contains("chat stays free"), "{}", q.why);
     // The honest side: the reasons somebody may not want it, and when no helper is used.
@@ -221,7 +314,7 @@ fn helper_agent_mode_is_off_by_default_and_states_the_measurement_the_free_chat_
         assert!(q.what.contains(must), "item 6 lacks '{must}': {}", q.what);
     }
     // The way to switch it on, and back off.
-    assert!(q.what.contains("install --set-helpers on --db <store>"), "{}", q.what);
+    assert!(q.what.contains("install --set-helpers off --db <store>") && q.what.contains("on in a new memory"), "{}", q.what);
     assert!(q.say_no.contains("install --set-helpers off --db <store>"), "{}", q.say_no);
     assert!(questionnaire::ASSISTANT_RULES.contains("--set-helpers on|off"), "the assistant knows the command");
     // The two notes live outside the pack, and the questionnaire names exactly them.
@@ -285,7 +378,7 @@ fn a_fresh_store_holds_the_list_under_its_key_and_the_setup_note_points_at_it() 
     for n in 1..=questions().len() {
         assert!(item.text.contains(&format!("\n{n}. ")), "item {n} missing");
     }
-    assert!(item.text.contains("The settings say: Max. Is that right?"), "the detected plan rides in the list");
+    assert!(item.text.contains("The settings say: Max, so record max."), "the detected plan rides in the list");
     assert!(item.text.contains("FOR THE ASSISTANT"), "and so does what to do with the answers");
 
     let note = model::store::show(&store, model::store::SETUP_NOTE_ID).unwrap();
@@ -348,7 +441,7 @@ fn without_known_paths_the_text_describes_each_one_instead_of_leaving_a_hole() {
     let text = questionnaire::lookup_text(None);
     let paths = &text[text.find("PATHS ON THIS MACHINE").unwrap()..];
     assert!(paths.contains("install program in the thor2 folder") && paths.contains("~/.claude/settings.json") && paths.contains("~/.claude.json"), "{paths}");
-    assert!(text.contains("Plan: <as detected or told>"), "the page for any user keeps the plan open");
+    assert!(text.contains("Plan: <as detected>"), "the page for any user keeps the plan open");
 }
 
 #[test]
@@ -505,4 +598,39 @@ fn the_assistant_rules_carry_the_consented_defender_exclusion_and_the_list_stays
     }
     assert_eq!(questions().len(), 12, "the exclusion is an assistant rule, not a thirteenth item");
     assert!(!questionnaire::render_list(None).contains("Add-MpPreference"), "the short list the user sees stays clean");
+}
+
+/// Off-topic work gets its own session: a short pinned note in the starter
+/// pack, and the desktop-app tools that do it named in the assistant rules.
+#[test]
+fn off_topic_work_gets_its_own_session_by_a_short_pinned_note_and_named_tools() {
+    let note = ops::install::workflow_starter_pack()
+        .into_iter()
+        .find(|n| n.id == ops::install::OFF_TOPIC_NOTE_ID)
+        .expect("the starter pack carries the off-topic note");
+    assert_eq!(note.kind, model::item::Kind::Orientation);
+    assert_eq!(note.bindings, vec![model::item::Binding::Always], "pinned");
+    assert!(note.falsifier.is_some() && note.text.is_ascii() && note.text.chars().count() < 300, "{}", note.text.chars().count());
+    for must in ["does not fit this conversation's work or folder", "one sentence", "install --topic", "move and rename this one", "Documents folder (real local name)", "They type nothing"] {
+        assert!(note.text.contains(must), "the note lacks '{must}': {}", note.text);
+    }
+    let rules = questionnaire::ASSISTANT_RULES;
+    for must in [
+        "mcp__ccd_directory__change_directory",
+        "mcp__ccd_session_mgmt__set_session_title",
+        "mcp__ccd_session__spawn_task",
+        "otherwise give plain click steps",
+    ] {
+        // The rules say it as "When you do not have these tools, give plain click steps".
+        let ok = rules.contains(must) || (must.starts_with("otherwise") && rules.contains("When you do not have these tools, give plain click steps"));
+        assert!(ok, "the assistant rules lack '{must}'");
+    }
+    assert!(!note.text.contains("mcp__"), "the tool names stay out of the short note");
+}
+
+/// When THOR holds or refuses, the assistant tells the person in plain words.
+#[test]
+fn the_assistant_rules_say_how_to_tell_the_person_about_a_hold_or_refusal() {
+    let rules = questionnaire::ASSISTANT_RULES;
+    assert!(rules.contains("When THOR holds or refuses") && rules.contains("one short plain sentence") && rules.contains("nothing is needed from them"));
 }

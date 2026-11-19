@@ -214,6 +214,24 @@ fn side_door_client_filing_is_refused_and_writes_nothing() {
     assert!(mcp.call("get", json!({"id": REPORT})).contains("no item"), "get finds nothing");
 }
 
+/// The reply to a verdict the writer saw in the transcript does not say it
+/// will not count, and does not promise more than the Stop will confirm.
+#[test]
+fn a_seen_verdict_reply_leaves_the_confirming_to_the_end_of_turn_check() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Session::new(tmp.path());
+    let mut mcp = s.mcp();
+    s.call(&mut mcp, "remember", note("seen-verdict"), "toolu_sv1");
+    {
+        let mut store = EventStore::open_existing(&s.db).unwrap();
+        serve::deliver::record_delivery(&mut store, WRITING_SESSION, WRITING_SESSION, "hook", "2026-09-28T00:00:00Z", &["seen-verdict".to_string()]);
+    }
+    let reply = s.call(&mut mcp, "mark", json!({"id": "seen-verdict"}), "toolu_sv2");
+    assert!(reply.starts_with("marked useful: "), "{reply}");
+    assert!(reply.contains("end-of-turn check still has to confirm") && !reply.contains("NOT count"), "{reply}");
+    assert_eq!(named_seq(&reply), last_of(&s.db, "seen-verdict", EventKind::ItemMarkedUseful).seq, "{reply}");
+}
+
 /// G15.1 (K21, F2): the filing call's own tool_use line reaches the
 /// transcript only after the call. The writer sees it unseen, never refuses
 /// for that and never waits: the report is stored, naming the session, and
@@ -1045,4 +1063,58 @@ fn the_machine_pass_writes_its_start_first_and_resumes_after_a_kill() {
     assert!(resumed.frozen.decided(), "{resumed:?}");
     assert_eq!(events_of(&s.db, &resumed.id).len(), 2, "the batch record is written, once");
     assert!(!s.stop().contains("finished deciding"), "a later Stop resumes nothing");
+}
+
+// ------------------------------------------------ what went wrong and what the owner wants
+
+/// The whole path, through the real binaries: the owner's messages freeze at
+/// the start, the print command runs in the session, a report without the
+/// MISTAKES line is refused, the one with it is stored, the Stop validates it
+/// as counting - and only then the cursor moves, to the last message printed.
+#[test]
+fn a_counting_report_moves_the_cursor_to_the_last_printed_message() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Session::new(tmp.path());
+    let cwd = s.cwd.clone();
+    let typed = |s: &mut Session, text: &str| {
+        s.line(json!({"type": "user", "cwd": cwd, "message": {"role": "user", "content": text}}));
+    };
+    typed(&mut s, "always ask me before you delete anything");
+    typed(&mut s, "yes");
+    start_evaluation(&mut s);
+    let start = s.open_start("demo").unwrap();
+    let said = start.frozen.said.clone().expect("the owner's message was frozen");
+    assert_eq!((said.total, said.shown), (1, 1), "{said:?}");
+    assert_eq!(serve::said::cursor_of(&s.db, "demo"), None);
+
+    // The print command, run for real, and as the session's transcript holds it.
+    let out = std::process::Command::new(serve_exe())
+        .arg("--db")
+        .arg(&s.db)
+        .args(["said", "--project", "demo"])
+        .env("USERPROFILE", &s.home)
+        .env("HOME", &s.home)
+        .output()
+        .unwrap();
+    let printed = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(out.status.success() && printed.contains("always ask me before you delete anything") && !printed.contains("] yes"), "{printed}");
+    s.bash_call("toolu_said", &said.command, &printed);
+
+    // Held without the MISTAKES line, and nothing is written.
+    let mut mcp = s.mcp();
+    let refused = s.call_unseen(&mut mcp, "remember", report_args(REPORT, "demo", TLDR), "toolu_file0");
+    assert!(!refused.starts_with("stored") && refused.contains("MISTAKES:"), "{refused}");
+    assert!(events_of(&s.db, REPORT).is_empty(), "nothing was written");
+
+    let text = format!("{TLDR}\nMISTAKES:\n- deleted a file without asking: one-off, the owner approved it after");
+    let reply = s.call_unseen(&mut mcp, "remember", report_args(REPORT, "demo", &text), "toolu_file1");
+    assert!(reply.starts_with(&format!("stored '{REPORT}' (Report, event seq ")), "{reply}");
+    assert_eq!(serve::said::cursor_of(&s.db, "demo"), None, "filing moves nothing: only a report that counts does");
+
+    assert!(s.stop().trim().is_empty());
+    let store = EventStore::open_existing(&s.db).unwrap();
+    let record = serve::eval_filing::current_validation(&store, REPORT).expect("validated at the Stop");
+    assert!(record.valid, "{record:?}");
+    assert_eq!(serve::said::cursor_of(&s.db, "demo"), Some(said.through_ms));
+    assert!(said.through_ms > 0);
 }

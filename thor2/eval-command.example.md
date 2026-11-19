@@ -1,6 +1,6 @@
 ---
 description: THOR session evaluation - judge what fired, repair what has rotted, give teeth to what nothing could stop, capture what was missing, report what the gate did and where it chafed, and close with a plain-language summary
-allowed-tools: mcp__thor__mark, mcp__thor__get, mcp__thor__lookup, mcp__thor__remember, mcp__thor__revise, mcp__thor__retract, mcp__thor__status, mcp__thor__history, Read, Grep, Glob, Bash(git status:*), Bash(git diff:*), Bash(git log:*), Bash(cargo test:*), Bash(cargo build:*), Bash(npm test:*), Bash(npm run verify:*), Bash(node --test:*), Bash(pio run:*), Bash(pio test:*), {{THOR_DOCTOR_ALLOW}}, {{THOR_RETEST_ALLOW}}
+allowed-tools: mcp__thor__mark, mcp__thor__get, mcp__thor__lookup, mcp__thor__remember, mcp__thor__revise, mcp__thor__retract, mcp__thor__status, mcp__thor__history, Read, Grep, Glob, Bash(git status:*), Bash(git diff:*), Bash(git log:*), Bash(cargo test:*), Bash(cargo build:*), Bash(npm test:*), Bash(npm run verify:*), Bash(node --test:*), Bash(pio run:*), Bash(pio test:*), {{THOR_DOCTOR_ALLOW}}, {{THOR_RETEST_ALLOW}}, {{THOR_SAID_ALLOW}}
 ---
 
 THOR session evaluation. Work through steps 1 to 8, then the report. You need
@@ -115,7 +115,8 @@ things, ordered by what you must act on, with what needs no action last:
 1. JUDGEMENT - the items you give a verdict on (step 2);
 2. TEETH - what THOR decided by itself, then the lists that are yours: the
    batch (at most eight rules), the A4 list (at most sixteen) and the
-   disputes to verify (item c), each item with its reason and the exact call
+   disputes to verify (item c), and what went wrong and what the owner wants (item f, see step 5),
+   each item with its reason and the exact call
    to make (step 4);
 3. SIGNALS BEFORE YOU FILE - THOR's health and the refusal outcomes THOR
    already knows at the start, each with its meaning, its calls and when it is
@@ -662,6 +663,55 @@ The reply to a write says which of three things THOR found: RULE, NOTE, or
 REFUSED (nothing written, and the one thing to do). All other forms only
 inform, and that is usually the right choice.
 
+### What went wrong and what the owner wants (item f of the start note)
+
+When the owner typed messages since this project's previous evaluation, the
+start note names how many and the exact command that prints them
+(`serve ... said --project <name>`). Run it, from the shell, as the note
+gives it. It prints the owner's own messages, oldest first, one line each with
+its date; short and repeated ones are left out and secrets are blanked. When
+the list is longer than about 20,000 characters, the last line says how many
+newer messages wait for the next evaluation: those are not yours to read now.
+
+Why this is here: an owner who is new to this never says "this is a rule". They
+just talk. The mistakes you made and the wishes that should hold later are in
+what they typed, in whatever language, and THOR has no word list to find them
+with. You are the one who reads.
+
+Read what the owner typed, then answer three questions.
+1. Where did the owner have to correct you, say something twice, or have
+   something undone? Each of those is a mistake.
+2. Which of those mistakes would happen again in a new conversation if nothing
+   is stored? For each one, look it up first (`mcp__thor__lookup`), so you do
+   not store a second copy. Then store a rule (`mcp__thor__remember`) or correct
+   the note that should have prevented it (`mcp__thor__revise`): one fact per
+   note, bound to the file, command or moment it is about, with a falsifier,
+   never a secret.
+3. Did the owner say how he wants something done, also for later? Store that
+   the same way.
+
+Everything else - a question, a thanks, a request for this one job - needs
+nothing. Store nothing you are not sure was meant to last.
+
+In your report, write a line that starts with `MISTAKES:` and under it one line
+per mistake: what it was, and the id of the rule that now prevents it, or one
+sentence on why it needs none (a one-off). With nothing found, write
+`MISTAKES: none`.
+
+Example: the owner wrote "I told you to ask before deleting" after a file was
+removed. That is a mistake: store a rule bound to the delete command, falsifier
+"the owner says deleting no longer needs asking", and report
+`MISTAKES:` then `- deleted a file without asking: rule ask-before-delete`.
+"ok go ahead with that" is no mistake and no wish.
+
+Done when the print command has run in this session after the evaluation
+started and the `MISTAKES:` line is in your report. THOR checks both: it sees
+the print command in your transcript when you file, and a report without the
+line is refused, with nothing written. When the list was empty, none of this is
+asked. THOR cannot check the judgement itself (whether you found the mistakes
+or stored the right rules); it only counts the messages, whether the list was
+printed, how many notes changed and how many transcripts could not be read.
+
 Step 5 is done once every fact you tried to capture is actually stored - no
 attempt is left hanging on a refusal from the gate.
 
@@ -995,7 +1045,9 @@ maintenance that THOR's rules let you decide yourself.
    every dispute you verified, with the call (1 or 2, or the retract) and your
    reason; and every rule you saved with `legitimate_calls`, `may_change` or
    `accept_refusing`, with the reason;
-5. what you stored that had been missing;
+5. what you stored that had been missing, and which wishes of the owner you
+   stored from item f of the start note, and the `MISTAKES:` line with one line
+   per mistake (or `MISTAKES: none`);
 6. what the gate did - including every false block, every rule the REFUSAL
    OUTCOMES line names with its outcome, the THOR health numbers with the hook
    events and sessions it names, and every refusal of your own write actions;

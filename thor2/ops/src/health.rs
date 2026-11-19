@@ -60,9 +60,10 @@ fn hooks_name_memory_spelled(settings: &Path, spellings: &[std::path::PathBuf]) 
     let Some(events) = root.get("hooks").and_then(|h| h.as_object()) else { return false };
     events.values().filter_map(|groups| groups.as_array()).flatten().any(|group| {
         group.get("hooks").and_then(|h| h.as_array()).is_some_and(|hooks| {
-            hooks.iter().filter_map(|h| h.get("command").and_then(|c| c.as_str())).any(|command| {
-                let command = folded(command);
-                wanted.iter().any(|want| command.contains(want.as_str())) && command.contains(" hook")
+            hooks.iter().filter_map(serve::missing_programs::hook_command_line).any(|command| {
+                let command = folded(&command);
+                wanted.iter().any(|want| command.contains(want.as_str()))
+                    && (command.contains(" hook") || command.contains(" \"hook\""))
             })
         })
     })
@@ -139,16 +140,16 @@ pub fn plain_summary(db: &Path, cwd: &Path, settings: Option<&Path>, mcp_json: O
             } else if copy_summary.is_some() {
                 // A copy cannot record where this machine keeps the project (it has one writer).
                 lines.push(format!(
-                    "  NOTE: this folder is called '{key}'. Notes about the project are in this copy, but the main machine does not know yet where this machine keeps the folder, so file checks (rules that look at a file) cannot be tried here. Optional next step: open a terminal inside the folder and run THOR's install with --register-root --per-machine added; it prints one line to run on the main machine."
+                    "  NOTE: this folder is called '{key}'. Notes about the project are in this copy, but the main machine does not know yet where this machine keeps the folder, so file checks (rules that look at a file) cannot be tried here. Optional next step: ask your assistant to run THOR's install inside the folder with --register-root --per-machine added; it prints one line to run on the main machine."
                 ));
             } else {
                 lines.push(format!(
-                    "  NOTE: this folder is called '{key}' but is not set up yet. Next step: open a terminal inside it and run THOR's install with --topic added."
+                    "  NOTE: this folder is called '{key}' but is not set up yet. Next step: ask your assistant to give it its own memory (it runs THOR's install inside the folder with --topic added)."
                 ));
             }
         }
         None => lines.push(
-            "  NOTE: this folder has no memory of its own, so what you tell your assistant here is shared with every other folder. To give one subject its own memory, open that folder and run THOR's install with --topic added."
+            "  NOTE: this folder has no memory of its own, so what you tell your assistant here is shared with every other folder. To give one subject its own memory, ask your assistant to do it (it runs THOR's install inside that folder with --topic added)."
                 .to_string(),
         ),
     }
@@ -579,7 +580,7 @@ pub fn hook_failures_words(faults: &[serve::hook_faults::Scanned], blocks: &[i64
     let mut out = String::new();
     if !parts.is_empty() {
         out = format!(
-            "{}. THOR cannot change Windows security settings: allow the program there (or in your antivirus), then restart Claude.",
+            "{}. THOR cannot change Windows security settings itself. Your assistant can take you through the few clicks in Windows Security (or your antivirus) that allow the program; after that the person has to restart Claude Code once.",
             parts.join("; ")
         );
     }
@@ -2340,8 +2341,7 @@ pub fn working_copy_lines(db: &Path) -> Vec<String> {
 ///
 /// THE SAME FUNCTION THE SESSION START USES (`serve::session_start::
 /// render_for_project`, which runs the hook's own selection, ranking and
-/// fitting) with the same extra lines a start adds (`start_extras`), never a second
-/// implementation, so it reports what a real start hides.
+/// fitting), never a second implementation, so it reports what a real start hides.
 pub fn standing_rules_overflow_lines(db: &Path, full: bool) -> Vec<String> {
     let Ok(store) = EventStore::open_existing(db) else { return Vec::new() };
     let machine = model::machine::current_machine_id();
@@ -2367,7 +2367,7 @@ pub fn standing_rules_overflow_lines(db: &Path, full: bool) -> Vec<String> {
             continue;
         }
         registered += 1;
-        if let Some(r) = serve::session_start::render_for_project(&start, &store, db, Some(key), now).filter(|r| r.hidden > 0) {
+        if let Some(r) = serve::session_start::render_for_project(&start, db, Some(key), now).filter(|r| r.hidden > 0) {
             cut.push((key.clone(), r.hidden_ids));
         }
     }
@@ -4300,6 +4300,22 @@ mod tests {
         std::fs::write(&physical, b"x").unwrap();
         let settings = settings_with_hook_db(local.path(), &physical);
         assert!(hooks_name_this_memory_in(&settings, &short, local.path()));
+    }
+
+    #[test]
+    fn an_exec_form_hook_counts_as_connected() {
+        let local = tempfile::tempdir().unwrap();
+        let db = local.path().join("thor2").join("thor.db");
+        let hook = serde_json::json!({
+            "type": "command", "command": "C:/thor2/serve.exe",
+            "args": ["--db", db.display().to_string(), "hook"], "onFailure": "continue"
+        });
+        let settings = serde_json::json!({ "hooks": { "PreToolUse": [ { "hooks": [ hook ] } ] } });
+        let path = local.path().join("settings.json");
+        std::fs::write(&path, settings.to_string()).unwrap();
+        assert!(hooks_name_this_memory_in(&path, &db, local.path()));
+        let other = local.path().join("elsewhere").join("thor.db");
+        assert!(!hooks_name_this_memory_in(&path, &other, local.path()), "another memory still does not match");
     }
 
     // ------------------------------------------------------------ identity
@@ -7320,13 +7336,14 @@ mod tests {
             for n in 0..80 {
                 let mut big = rule(&format!("big-{n:03}"));
                 big.text = format!("big fixture {n:03} about {} {}", ["pins", "paths", "plugs", "pipes"][n % 4], "w".repeat(200));
-                store::declare(&mut s, "s", "l", "a", &big).unwrap();
+                // Past the write gate: this is a store that already overflows.
+                let body = store::canonical_body(&big).unwrap();
+                s.append_event("legacy", &big.id, "migration", thor_core::event_store::EventKind::FactCreated, &big.id, None, &body).unwrap();
             }
         }
         let opened = EventStore::open_existing(&db).unwrap();
         let expected = serve::session_start::render_for_project(
             &serve::session_start::DoctorStart::load(&opened, &db),
-            &opened,
             &db,
             Some("alpha"),
             serve::time::now_unix(),

@@ -200,6 +200,8 @@ jobs:
       - name: Publish
         uses: softprops/action-gh-release@v2
         with:
+          # A manual run is started on a branch, so the tag must be named here.
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
           files: dist/*
           draft: true
           generate_release_notes: true

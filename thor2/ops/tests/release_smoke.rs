@@ -128,6 +128,18 @@ fn drain<R: Read + Send + 'static>(mut reader: R) -> mpsc::Receiver<String> {
 
 /// Split a hook command the way the installer writes it:
 /// `"<exe>" --db "<db>" hook`. Quotes group, nothing else is special.
+fn hook_parts(hook: &Value) -> Option<Vec<String>> {
+    let command = hook["command"].as_str()?;
+    match hook["args"].as_array() {
+        Some(args) => {
+            let mut parts = vec![command.to_string()];
+            parts.extend(args.iter().filter_map(|a| a.as_str().map(str::to_string)));
+            Some(parts)
+        }
+        None => Some(split_command(command)),
+    }
+}
+
 fn split_command(command: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut current = String::new();
@@ -340,13 +352,13 @@ impl Smoke {
             let groups = settings["hooks"][event]
                 .as_array()
                 .ok_or_else(|| format!("settings.json has no hooks.{event} list"))?;
-            let command = groups
+            let parts = groups
                 .iter()
                 .flat_map(|g| g["hooks"].as_array().into_iter().flatten())
-                .filter_map(|h| h["command"].as_str())
-                .find(|c| c.contains(" hook"))
+                .filter_map(hook_parts)
+                .find(|p| p.last().is_some_and(|w| w == "hook"))
                 .ok_or_else(|| format!("hooks.{event} has no hook command"))?;
-            let parts = split_command(command);
+            let command = parts.join(" ");
             let exe = parts.first().ok_or_else(|| format!("hooks.{event} command is empty"))?;
             if !Path::new(exe).is_file() {
                 return Err(format!("hooks.{event} calls {exe}, which does not exist"));
@@ -399,13 +411,17 @@ impl Smoke {
         if !out.ok() {
             return Err(out.describe());
         }
-        let held: u32 = out
-            .stdout
-            .lines()
-            .find_map(|l| l.strip_prefix("Rule")?.trim().parse().ok())
-            .ok_or_else(|| format!("serve status shows no Rule count:\n{}", out.stdout))?;
-        if said == 0 || held != said {
-            return Err(format!("install said it put {said} notes in, the store holds {held} rules"));
+        // The starting notes are rules and pinned orientations; install counts both.
+        let count = |kind: &str| -> Option<u32> {
+            out.stdout.lines().find_map(|l| l.strip_prefix(kind)?.trim().parse().ok())
+        };
+        let rules = count("Rule").ok_or_else(|| format!("serve status shows no Rule count:\n{}", out.stdout))?;
+        let orientations =
+            count("Orientation").ok_or_else(|| format!("serve status shows no Orientation count:\n{}", out.stdout))?;
+        if said == 0 || rules + orientations != said {
+            return Err(format!(
+                "install said it put {said} notes in, the store holds {rules} rules and {orientations} orientations"
+            ));
         }
         let rulebook = self.db().parent().unwrap().join("guard-response-rulebook.json");
         if !rulebook.is_file() {
@@ -419,7 +435,7 @@ impl Smoke {
         if !gitconfig.contains("hooksPath") {
             return Err("core.hooksPath did not land in the sandbox's own git config".to_string());
         }
-        Ok(format!("{held} seeded rules in the store, plus the rulebook, /thor-eval and the git hooks"))
+        Ok(format!("{said} seeded notes in the store, plus the rulebook, /thor-eval and the git hooks"))
     }
 
     /// AGENTS.md step 4. One plain line per part: the version, the chain, the
@@ -622,10 +638,7 @@ impl Smoke {
     /// is answered with the commit notes, before the commit runs.
     fn step_starter_pack_reaches_the_commit_hook(&self) -> StepResult {
         let settings = self.read_json(&self.settings())?;
-        let command = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
-            .as_str()
-            .ok_or("no PreToolUse command in settings.json")?;
-        let parts = split_command(command);
+        let parts = hook_parts(&settings["hooks"]["PreToolUse"][0]["hooks"][0]).ok_or("no PreToolUse command in settings.json")?;
         let mut cmd = Command::new(&parts[0]);
         cmd.args(&parts[1..]);
         let home = self.home();
@@ -667,10 +680,7 @@ impl Smoke {
     /// `cwd`, with `payload` on stdin. The raw stdout.
     fn run_hook(&self, event: &str, cwd: &Path, payload: Value) -> Result<String, String> {
         let settings = self.read_json(&self.settings())?;
-        let command = settings["hooks"][event][0]["hooks"][0]["command"]
-            .as_str()
-            .ok_or_else(|| format!("no {event} command in settings.json"))?;
-        let parts = split_command(command);
+        let parts = hook_parts(&settings["hooks"][event][0]["hooks"][0]).ok_or_else(|| format!("no {event} command in settings.json"))?;
         let mut cmd = Command::new(&parts[0]);
         cmd.args(&parts[1..]);
         let home = self.home();
@@ -815,7 +825,7 @@ impl Smoke {
             return Err(format!("a new memory's first turn end was not held:\n{stdout}"));
         }
         let line = parsed["systemMessage"].as_str().ok_or_else(|| format!("the hold carries no plain line:\n{stdout}"))?;
-        if !line.contains("numbered list") || line.contains('\n') {
+        if !line.contains("finishing its setup") || line.contains('\n') {
             return Err(format!("the plain line is not one plain sentence about setup: {line}"));
         }
         Ok(format!("held, with: {line}"))

@@ -23,6 +23,7 @@
 //! command in another path spelling is the same hook.
 
 use crate::install::{command_words, flatten_word, HookSpec};
+use serve::missing_programs::hook_command_line;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -88,8 +89,8 @@ pub fn backup_hooks_for(settings: &Path, db: &Path) -> anyhow::Result<Vec<String
     let mut found = Vec::new();
     for group in root["hooks"]["SessionStart"].as_array().into_iter().flatten() {
         for hook in group["hooks"].as_array().into_iter().flatten() {
-            if let Some(command) = hook["command"].as_str().filter(|c| is_backup_command_for(c, &db)) {
-                found.push(command.to_string());
+            if let Some(command) = hook_command_line(hook).filter(|c| is_backup_command_for(c, &db)) {
+                found.push(command);
             }
         }
     }
@@ -112,7 +113,7 @@ pub fn remove_backup_hook(settings: &Path, db: &Path) -> anyhow::Result<usize> {
         for group in groups.iter_mut() {
             if let Some(hooks) = group["hooks"].as_array_mut() {
                 let before = hooks.len();
-                hooks.retain(|h| !h["command"].as_str().is_some_and(|c| is_backup_command_for(c, &db)));
+                hooks.retain(|h| !hook_command_line(h).is_some_and(|c| is_backup_command_for(&c, &db)));
                 removed += before - hooks.len();
             }
         }
@@ -138,7 +139,7 @@ fn git_command(dir: Option<&Path>) -> Command {
 
 /// Run git and return what it printed, or git's own reason for failing.
 fn git(dir: Option<&Path>, args: &[&str]) -> anyhow::Result<String> {
-    let out = git_command(dir).args(args).output().map_err(|e| anyhow::anyhow!("git could not be started ({e}); install git first"))?;
+    let out = git_command(dir).args(args).output().map_err(|e| anyhow::anyhow!("git could not be started ({e}); git is needed, and the install command installs it"))?;
     if !out.status.success() {
         let reason = String::from_utf8_lossy(&out.stderr);
         let reason = reason.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("no reason given");

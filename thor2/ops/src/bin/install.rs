@@ -22,8 +22,8 @@ use ops::githooks;
 use ops::install::{
     check_registration, check_registration_at, default_data_dir, default_eval_command_path, default_settings_path,
     default_user_mcp_path, ensure_store, install_hooks, install_tool_server, record_project_opened,
-    record_topic_opened, register_command_for, register_root_for, register_root_remote, seed_eval_command, seed_response_rulebook,
-    seed_working_contract_at, standard_hooks, topic_folder_name, write_project_marker, EvalCommandOutcome, HookOutcome,
+    record_topic_opened, register_command_for, topic_of, register_root_for, register_root_remote, seed_eval_command, seed_response_rulebook,
+    seed_working_contract_at, standard_hooks, write_project_marker, EvalCommandOutcome, HookOutcome, HookSpec,
     MarkerOutcome, RegisterOutcome, RegisterRefusal, RulebookOutcome, ServerOutcome, StoreOutcome,
 };
 use std::path::PathBuf;
@@ -247,6 +247,57 @@ struct Cli {
         conflicts_with_all = ["project", "settings", "mcp_json", "no_mcp", "serve_exe", "mcp_exe", "code_index_root", "register_root", "set_mode", "set_plan", "set_weekly_check", "set_backup", "set_recording", "set_helpers", "topic", "copy_from"]
     )]
     set_tools_folder: Option<String>,
+
+    /// Put the person's loose files in order: carry out a plan (--plan) of
+    /// `[{"folder": "<absolute path>", "files": ["<absolute path>", ...]}]`.
+    /// Each folder is made if needed and given its own memory exactly as
+    /// --topic does, and each file is moved into it. Never deletes, never
+    /// overwrites (a taken name becomes "name (2)"), never touches a file
+    /// outside the home folder or inside a git repository, and refuses the
+    /// home folder, Desktop, Documents, Downloads, a drive root and a
+    /// program's own folders. Every move is written to an undo log beside the
+    /// memory. Needs --db.
+    #[arg(
+        long = "tidy",
+        requires = "plan",
+        conflicts_with_all = ["project", "mcp_exe", "no_mcp", "serve_exe", "code_index_root", "register_root", "topic", "copy_from", "set_mode", "set_plan", "set_weekly_check", "set_backup", "set_recording", "set_language", "set_helpers", "set_temp_folder", "set_tools_folder", "uninstall", "tidy_undo"]
+    )]
+    tidy: bool,
+
+    /// With --tidy: the JSON file that holds the plan.
+    #[arg(long = "plan", value_name = "FILE", requires = "tidy")]
+    plan: Option<PathBuf>,
+
+    /// Put the files of the newest tidy-up back where they were (never
+    /// overwriting anything; the folders it made stay). Needs --db.
+    #[arg(
+        long = "tidy-undo",
+        conflicts_with_all = ["project", "mcp_exe", "no_mcp", "serve_exe", "code_index_root", "register_root", "topic", "copy_from", "set_mode", "set_plan", "set_weekly_check", "set_backup", "set_recording", "set_language", "set_helpers", "set_temp_folder", "set_tools_folder", "uninstall"]
+    )]
+    tidy_undo: bool,
+
+    /// Take THOR out again, step one (Claude Code may be running): removes only
+    /// THOR's own connections from Claude Code's settings, THOR's note-saving
+    /// connection, the /thor-eval command and git's global hooks folder when it
+    /// is THOR's. It never removes git, Python, the Visual C++ runtime or any
+    /// other program. Ends by saying to restart Claude Code. Needs --db.
+    #[arg(
+        long = "uninstall",
+        conflicts_with_all = ["project", "mcp_exe", "no_mcp", "serve_exe", "code_index_root", "register_root", "topic", "copy_from", "set_mode", "set_plan", "set_weekly_check", "set_backup", "set_recording", "set_language", "set_helpers", "set_temp_folder", "set_tools_folder"]
+    )]
+    uninstall: bool,
+
+    /// With --uninstall: step two, after Claude Code was closed and opened again.
+    /// Refuses while a THOR program is still running, removes the saved copies
+    /// of Claude Code's settings files, and keeps your memory unless you add
+    /// --delete-memory. Ends by naming the program folder to delete.
+    #[arg(long = "finish", requires = "uninstall")]
+    finish: bool,
+
+    /// With --uninstall --finish: also delete the memory and its side files
+    /// (your safety copies in backup-repo stay). Without it the memory is kept.
+    #[arg(long = "delete-memory", requires = "finish")]
+    delete_memory: bool,
 
     /// SECOND MACHINE: set THOR up as a read-only COPY of another machine's
     /// memory, built from that machine's backup, in this one command. Give the
@@ -589,7 +640,7 @@ fn set_backup_only(db: Option<PathBuf>, settings: Option<PathBuf>, word: &str) -
         };
     }
     let Some(backup_exe) = sibling("backup").filter(|p| p.exists()) else {
-        eprintln!("NOTHING WAS CHANGED: the backup program (backup) is missing next to the installer. THOR is several small programs that must stay together in one folder: unpack the whole download there and run this again.");
+        eprintln!("NOTHING WAS CHANGED: the backup program (backup) is missing next to the installer. THOR is several small programs that must stay together in one folder: the assistant runs the install command again, which downloads and unpacks the whole set into one folder, then runs this again.");
         return ExitCode::FAILURE;
     };
     let repo = default_repo(&db);
@@ -612,7 +663,7 @@ fn set_backup_only(db: Option<PathBuf>, settings: Option<PathBuf>, word: &str) -
         }
     }
     if !ops::githooks::git_available() {
-        eprintln!("NOTHING WAS CHANGED: git is not installed on this computer, and the backup is a git folder. Install git first, then run this again.");
+        eprintln!("NOTHING WAS CHANGED: git is not installed on this computer, and the backup is a git folder. The install command installs git by itself: the assistant runs it again, then runs this again.");
         return ExitCode::FAILURE;
     }
     let place = match &choice {
@@ -642,6 +693,9 @@ fn set_backup_only(db: Option<PathBuf>, settings: Option<PathBuf>, word: &str) -
     match install_hooks(&settings, &[spec]) {
         Ok(report) if report.results.iter().all(|(_, o)| *o == HookOutcome::AlreadyPresent) => {
             println!("= the backup was already connected to Claude Code")
+        }
+        Ok(report) if report.results.iter().all(|(_, o)| *o == HookOutcome::Upgraded) => {
+            println!("+ rewrote the backup's connection in the form Windows can always start; close Claude Code completely and open it again for that to take effect")
         }
         Ok(_) => println!("+ connected the backup to Claude Code: it runs when a session starts (at most one copy a day)"),
         Err(e) => {
@@ -824,20 +878,6 @@ fn existing_index_file_count(index_root: &Path, key: &str) -> anyhow::Result<usi
     Ok(usize::try_from(files).unwrap_or(0))
 }
 
-/// The topic a plain folder is, or would become: the folder that carries (or
-/// will carry) the `.thor-project` marker, and the key it holds. Run from a
-/// subfolder of an existing topic, it is the topic's own top. A folder with no
-/// marker yet is named after itself, except the home folder and a drive root,
-/// which are far too broad (`ops::install::topic_folder_name`).
-fn topic_of(here: &Path) -> Result<(PathBuf, String), RegisterRefusal> {
-    let dir = serve::project::plain_root(here).unwrap_or_else(|| here.to_path_buf());
-    let key = match serve::project::resolve_project(&dir) {
-        Some(key) => key,
-        None => topic_folder_name(&dir)?,
-    };
-    Ok((dir, key))
-}
-
 /// `install --register-root`: register the checkout this is run from, and
 /// nothing else. Refuses without `--db` before anything is touched (F7): a
 /// registration in the default memory, when the assistant uses another one,
@@ -992,8 +1032,91 @@ fn print_record_outcome(key: &str, outcome: Result<RegisterOutcome, RegisterRefu
     }
 }
 
+/// `install --tidy --plan <file>` and `install --tidy-undo`: see `ops::tidy`.
+fn tidy_main(cli: &Cli) -> ExitCode {
+    let Some(db) = cli.db.clone().filter(|d| d.is_file()) else {
+        eprintln!("REFUSED: name the memory with --db (an existing thor.db). Nothing was changed.");
+        return ExitCode::FAILURE;
+    };
+    let Some(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).ok().map(PathBuf::from) else {
+        eprintln!("REFUSED: could not find your home folder. Nothing was changed.");
+        return ExitCode::FAILURE;
+    };
+    serve::project::load_known_scopes(&db);
+    let result = if cli.tidy_undo {
+        ops::tidy::undo(&db, &home)
+    } else {
+        let plan = cli.plan.clone().unwrap_or_default();
+        match std::fs::read_to_string(&plan) {
+            Ok(text) => ops::tidy::tidy(&db, &text, &home),
+            Err(e) => Err(format!("cannot read the plan {}: {e}. Nothing was changed.", plan.display())),
+        }
+    };
+    match result {
+        Ok(lines) => {
+            for l in lines {
+                println!("{l}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `install --uninstall [--finish [--delete-memory]]`: see `ops::uninstall`.
+fn uninstall_main(cli: &Cli) -> ExitCode {
+    let Some(db) = cli.db.clone().or_else(|| default_data_dir().map(|d| thor_core::app_data::resolve(&d.join("thor.db")))) else {
+        eprintln!("NOTHING WAS CHANGED: could not work out which memory to remove - name it with --db");
+        return ExitCode::FAILURE;
+    };
+    let (Some(settings), Some(claude_json)) = (cli.settings.clone().or_else(default_settings_path), cli.mcp_json.clone().or_else(default_user_mcp_path)) else {
+        eprintln!("NOTHING WAS CHANGED: could not find your home folder to find Claude Code's files");
+        return ExitCode::FAILURE;
+    };
+    let targets = ops::uninstall::Targets { settings, claude_json, eval_command: default_eval_command_path(), db };
+    if cli.finish {
+        let Some(bin_dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)) else {
+            eprintln!("NOTHING WAS CHANGED: could not work out where THOR's programs are");
+            return ExitCode::FAILURE;
+        };
+        return match ops::uninstall::phase_two(&targets, &bin_dir, cli.delete_memory, &ops::uninstall::RealProcesses) {
+            Ok(report) => {
+                for line in report.plain_lines() {
+                    println!("{line}");
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    match ops::uninstall::phase_one(&targets, &ops::uninstall::RealGit) {
+        Ok(report) => {
+            for line in report.plain_lines() {
+                println!("{line}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("NOTHING WAS FULLY REMOVED: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if cli.uninstall {
+        return uninstall_main(&cli);
+    }
+    if cli.tidy || cli.tidy_undo {
+        return tidy_main(&cli);
+    }
     if cli.register_root {
         return register_only(cli.db, cli.per_machine, cli.ask_main);
     }
@@ -1146,8 +1269,8 @@ fn main() -> ExitCode {
     if !serve_exe.exists() {
         eprintln!(
             "NOTHING WAS SET UP: the file {} is missing, and THOR cannot work without it. THOR is several small \
-             programs that must stay together in ONE folder: unpack the whole download there (do not copy install \
-             on its own), then run install from that folder again. (For developers: build with `cargo build \
+             programs that must stay together in ONE folder: the assistant runs the install command again, which \
+             downloads and unpacks the whole set into one folder (install is never copied on its own). (For developers: build with `cargo build \
              --release --features semantic` in thor2, or name the real file with --serve-exe.)",
             serve_exe.display()
         );
@@ -1335,6 +1458,10 @@ fn main() -> ExitCode {
             } else {
                 println!("+ connected THOR to Claude Code ({changed} of {} connections), so your memory speaks up by itself", report.results.len());
             }
+            let upgraded = report.results.iter().filter(|(_, o)| *o == HookOutcome::Upgraded).count();
+            if upgraded > 0 {
+                println!("  rewrote {upgraded} older connection(s) in the form Windows can always start, with no shell in between; close Claude Code completely and open it again for that to take effect");
+            }
             for old in &report.replaced {
                 println!("  fixed an old connection that pointed at a program that no longer exists: {old}");
             }
@@ -1346,6 +1473,25 @@ fn main() -> ExitCode {
             eprintln!("NOTHING WAS CONNECTED to Claude Code: {e}");
             eprintln!("Your memory file was created. Fix the problem named above, then run install again.");
             return ExitCode::FAILURE;
+        }
+    }
+
+    // 2b. A backup connection wired by an earlier install keeps its own
+    // program, memory and folder; it is only rewritten in place in the form
+    // Windows can always start (on Windows without Git Bash a shell-form line
+    // never runs, so the daily copy would silently stop). Nothing is added.
+    if let Ok(existing) = ops::backup_setup::backup_hooks_for(&settings, &db) {
+        let specs: Vec<HookSpec> =
+            existing.into_iter().map(|command| HookSpec { event: "SessionStart", matcher: None, command }).collect();
+        if !specs.is_empty() {
+            match install_hooks(&settings, &specs) {
+                Ok(report) if report.results.iter().any(|(_, o)| *o == HookOutcome::Upgraded) => {
+                    restart_because.push("the backup's connection in Claude Code's settings changed");
+                    println!("  rewrote the backup's connection in the form Windows can always start; close Claude Code completely and open it again for that to take effect");
+                }
+                Ok(_) => {}
+                Err(e) => println!("  ! could not check the backup's connection: {e}"),
+            }
         }
     }
 
@@ -1553,7 +1699,7 @@ fn main() -> ExitCode {
         None => {
             let installer = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "install".to_string());
             println!("- no topic set up in this folder. That is fine: THOR already works everywhere.");
-            println!("  To give one folder (one subject, like 'Kitchen renovation') its own memory, open that folder and run:  \"{installer}\" --topic");
+            println!("  To give one folder (one subject, like 'Kitchen renovation') its own memory, the assistant runs this inside that folder:  \"{installer}\" --topic");
         }
     }
 

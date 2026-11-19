@@ -173,6 +173,14 @@ fn the_reminder_says_figures_from_the_summary_are_unverified_too() {
 /// The longer reminder rides inside the session-start size budget: with far
 /// more standing rules than fit, the block still stays under what Claude Code
 /// shows whole, and it is the rules that give way, not the reminder.
+/// Writes `item` straight to the log, past the write gate: these fixtures build
+/// a store that ALREADY overflows the session start block (as an older store
+/// did), which the gate now refuses to create.
+fn store_overflowing(s: &mut EventStore, item: &Item) {
+    let body = store::canonical_body(item).unwrap();
+    s.append_event("legacy", &item.id, "migration", thor_core::event_store::EventKind::FactCreated, &item.id, None, &body).unwrap();
+}
+
 #[test]
 fn the_longer_reminder_still_fits_the_session_start_budget() {
     let dir = tempfile::tempdir().unwrap();
@@ -183,7 +191,7 @@ fn the_longer_reminder_still_fits_the_session_start_budget() {
             let mut item = always_rule(&format!("rule-{n:02}"));
             let words: Vec<String> = (0..40).map(|i| format!("w{n}x{i}")).collect();
             item.text = format!("standing rule {n}: {}", words.join(" "));
-            store::declare(&mut db, "s", "l", "a", &item).unwrap();
+            store_overflowing(&mut db, &item);
         }
     }
     let payload = session_start_payload(serde_json::json!({"source": "compact"}));

@@ -54,7 +54,10 @@ Words used once, in plain language:
 
 ### A4. It wires four hooks into Claude Code's settings.json
 - What: SessionStart, PreToolUse (every tool), UserPromptSubmit and Stop all run the same "serve hook"
-  command from the THOR folder.
+  command from the THOR folder. On Windows each entry starts the program directly (a "command" plus an
+  "args" list, and "onFailure": "continue"), so it works whether Claude Code runs hooks in Git Bash or in
+  PowerShell, and a hook that cannot start never blocks a tool call. An older one-line entry of THOR's is
+  rewritten in place on the next run (restart Claude Code once afterwards). Other systems keep the one line.
 - Why: without them the memory never speaks and nothing announces it. This was caught on 2026-08-03,
   when the hooks had --db in the wrong place and every hook would have exited with an error silently.
 - You notice: "connected THOR to Claude Code". settings.json is first copied to settings.json.bak (only once: an existing .bak is never replaced, so it keeps your file as it was before THOR), nothing
@@ -157,14 +160,15 @@ Words used once, in plain language:
   session-start block is capped by size (about 9,500 bytes), not by the four-note rule.
 - Refuse or change: ordinary notes. Ask the assistant to unpin, reword or retract any.
 
-### A10. It adds 14 "workflow starter" notes; two refuse a console flash on Windows
+### A10. It adds 16 "workflow starter" notes; two refuse a console flash on Windows
 - What: seven around commit and push (changelog line per user-visible change, run tests and quote the
   real result, never commit a secret, commit hygiene, commit/push/deploy only when asked, check where you
   push and what is on main, scan before anything goes public) and seven around risky steps and tools
   (rehearse destructive steps on a copy, pin a dependency with its reason, absolute paths, script file not
-  shell quoting, keep only what is needed (rebuildable things stay out of a repo or backup), hidden processes on Windows, no interactive scheduled task on Windows). Helper-agent mode
-  (an orchestrator note and a stand-alone agent brief) is not in this set: it is off until you say yes to
-  first-session item 6 (F15).
+  shell quoting, keep only what is needed (rebuildable things stay out of a repo or backup), hidden processes on Windows, no interactive scheduled task on Windows),
+  plus two pinned notes: new files go in the folder of their subject and never loose in the home folder, Desktop, Downloads or Documents itself; and a subject that does not belong to the session gets a session of its own, prepared
+  by the assistant. Helper-agent mode (an orchestrator note and a stand-alone agent brief) is not in this
+  set but is stored with it in a new memory (first-session item 6, F15).
 - Why: they are habits that were marked useful again and again on the builder's machine, rewritten to
   hold anywhere. Only two carry a check, and only on a Windows install: windowless-processes-on-windows
   refuses a Start-Process that is not hidden (it passes -WindowStyle Hidden, -NoNewWindow, -WindowStyle
@@ -238,6 +242,38 @@ Words used once, in plain language:
   A file check on a rule still works against the folder's real files.
 - Refuse or change: your home folder, Documents itself and a whole drive are refused as too broad.
   "install --register-root" does only the registration.
+
+### A15b. After the welcome it offers to put earlier work in order
+- What: once the welcome is answered, the assistant runs "serve inventory" (read-only: it reads the
+  transcripts of your earlier Claude Code sessions under ~/.claude/projects and lists, per session, the
+  folder, the dates, the first thing you typed and the files it wrote, plus the loose files in the home
+  folder, Desktop, Documents and Downloads; "serve inventory --digest <session>" prints one session as
+  short text with anything that looks like a secret blanked out). It groups them by subject and sends ONE
+  numbered proposal: a fixed folder per subject, the files that go in it, what it remembers from the old
+  conversations. On a yes it runs "install --tidy --plan <file>": each folder is made if needed and gets
+  its own memory exactly as "install --topic" does, and each file is moved in. It then stores the lasting
+  facts of the old conversations in that subject's memory and, in the Claude desktop app, groups the old
+  conversations per subject in the sidebar.
+- It cannot be skipped: a new memory also carries a pinned note, order-earlier-work-once. Once the welcome is
+  answered, THOR holds the end of every turn (not the turn that ends on the proposal itself, not a helper's,
+  not a headless run, not a copy) until it finds the step settled, and the note cannot be retracted, rewritten
+  or unpinned before. Only evidence THOR checks itself settles it: "serve inventory" finding nothing to order
+  in the real transcripts folder (it writes that record itself), "install --tidy" run after the person's
+  answer, or, for what the person refused, a Report order-earlier-work-answer quoting their own words, which
+  THOR must find in a message they typed after the proposal (the proposal is the first message with a numbered
+  list after the assistant ran the inventory, read from the session record; nothing is added to it). Words with no refusal in them read as a yes; a partly refused answer needs both. An existing
+  memory never gets the note.
+- Why: a new user's first complaint was that Claude puts everything randomly everywhere. New files now
+  have a fixed place per subject (the pinned starter note files-go-in-the-folder-of-their-subject).
+- You notice: one message with a numbered list after the welcome; nothing at all when there is nothing
+  to order. No file is ever deleted or overwritten (a taken name gets " (2)", " (3)"). A file outside your
+  home folder, in a program's own folder or inside a git repository is left where it is. The home folder,
+  Desktop, Documents, Downloads, a drive root, application data and program files are refused as folders,
+  with a plain reason, and the next item still runs. Every move goes in an undo log (tidy-<date>-<n>.json
+  beside the memory).
+- Refuse or change: "2 no, because ..." leaves one subject exactly as it is (the reason is recorded in
+  owner-setup-answers). Ask the assistant to put it all back: it runs "install --tidy-undo", which moves the
+  files of the newest tidy-up back without overwriting anything (the folders and their memory stay).
 
 ### A16. Backup is a first-session choice (item 10); the install arranges none
 - What: THOR has a backup program (backup.exe) that exports the memory to a git repository, with a
@@ -505,7 +541,7 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
 - What: while the seeded setup note is live, every turn end is held until the assistant has told the
   owner in one sentence the defaults (short plain replies in his own language; work lane only; every
   starting note and example rule kept; projects named after their folder; every default on except
-  helper agents and backup, which stay off until he chooses), stored them as
+  backup, which follows his answer to the welcome), stored them as
   "owner-setup-answers" (a Report, no project needed), and retracted the setup note.
 - Why: a seeded sentence in a note was the entire enforcement before and was skipped. It is not an
   interview: "just do it", or no answer, is answered by the defaults.
@@ -573,8 +609,29 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
   their literal), plus disputes to verify (at most 8), the false-block sweep and the crowded places
   (at most 3 files or commands that more than 4 facts are bound to, so the lowest ranked are never
   shown at their moment; each is settled by a real fold, move or retract of its facts, and a place
-  where every fact is a heavier refusing rule is never listed). THOR first tries the old rules itself for up to 20 seconds. The assistant gives
+  where every fact is a heavier refusing rule is never listed; the session start block counts as a
+  place too, and is listed first when pinned notes no longer fit in it, see E1). THOR first tries the old rules itself for up to 20 seconds. The assistant gives
   verdicts with the mark tool, makes the named fixes, ends the turn once, then files the report.
+- The part "what went wrong and what the owner wants" (item f, the fourth frozen list): THOR also freezes
+  a window of the messages the owner typed in the project's main sessions since the previous evaluation
+  that counts (the last 7 days when there is none): 20 characters or longer, identical texts once,
+  secrets blanked. The log keeps only the window and the counts, never the words. The start note names
+  the count and the command that prints them (`serve said --project <name>`, oldest first, at most about
+  20,000 characters, with a last line saying how many newer messages wait for the next evaluation). The
+  assistant reads them and answers three questions: where did the owner have to correct it, say
+  something twice or have something undone (each is a mistake); which of those would happen again in a
+  new conversation if nothing is stored (for each: look it up, then store a rule or correct the note
+  that should have prevented it); and did the owner say how he wants something done, also for later
+  (store that the same way). Its report carries a line starting with `MISTAKES:` and one line per
+  mistake with the id of the rule that now prevents it, or why it needs none, or `MISTAKES: none`. An
+  empty list asks nothing. The report is held until THOR sees the print command in the session's own
+  transcript after the start, and a filing whose own text has no `MISTAKES:` line is refused with
+  nothing written. THOR checks that the list was printed and that the line is there. It cannot check
+  the judgement itself: whether the assistant found the mistakes or stored the right rules. The machine
+  section counts the messages, those that wait, whether the list was printed, the notes created or
+  revised and the transcripts that could not be read. A cursor beside the store moves to the last
+  message printed, only when a report that counts is filed. A copy (second machine) has its own
+  evaluation path and has no such list.
 - Why: verdicts given by script or another session settle nothing (205 verdicts in four minutes were
   given blind on 2026-10-01 and three were wrong). Only a report filed through THOR's own tool, validated
   at the next stop, counts.
@@ -699,7 +756,7 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
 - Refuse or change: built in.
 
 ### D8. Starter notes never refuse
-- What: the 12 workflow notes that are not about Windows console windows, the two helper-mode notes and the 22 pinned notes carry no check.
+- What: the 14 workflow notes that are not about Windows console windows, the two helper-mode notes and the 22 pinned notes carry no check.
 - Why: see A10.
 - You notice: a note appears at its moment; no refusal.
 - Refuse or change: you may hang a check on your own rules.
@@ -716,6 +773,21 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
 - You notice: a "Standing rules for this session" block; a headless run (claude -p) leaves out notes tagged
   interactive-only and caps global notes at 8.
 - Refuse or change: unpin, retract, or tag interactive-only.
+- Never cut silently: the block is a place that can be full, like a file or command. A new pinned note
+  (remember or revise adding Always, or pin), or a pinned note made longer, is refused when the block of
+  that project (its own pinned notes plus the global ones; a global note is judged in every project)
+  would no longer fit in 9,291 bytes (the 9,800 a start can carry, less 509 kept for two lines that must always be shown), and nothing is stored. The refusal names the largest pinned notes
+  and three exits: fold two that say the same, bind one to the command, file, tool or moment it is
+  about and unpin it, or retract a stale one with a reason. An unpin, a retract or a shorter note is never
+  refused. A memory that already overflows lists its cut notes first under the evaluation's crowded
+  places, and the report is held until the block fits. A fresh install's own notes fit with room left
+  (a test checks it). The pinned notes take their room first. The other lines of a start get what is
+  left, in this order when room is short: the compaction reminder (always shown, it has the reserve),
+  then the short lines someone must act on (a copy line, registration notice, open points, a missing
+  program, a copy that does not answer, the no-project line), and last the tools overview, which gets
+  shorter (fewer tool lines, the rest counted in "... and N more in <folder>", at the smallest one line
+  with the number of tools) instead of disappearing. A line that does not fit at all is left out and one
+  line says that lines were left out.
 
 ### E2. After a compaction: "the summary is not proof"
 - What: a session that starts right after a compaction gets one extra line telling the assistant to
@@ -853,7 +925,8 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
   in one sentence what the tool does. EVERY session start hands the assistant "Helper tools available in
   <folder>:" and one line per tool ("<folder name> - <that first line>", cut to about 100 characters),
   about 2,000 bytes at most (then "... and N more in <folder>"), and one sentence: look here before writing
-  a new helper script. The list is built from the folders, so nobody maintains it. It is kept in
+  a new helper script. When the pinned notes leave little room at a session start the overview is made
+  shorter to fit, down to one line that says how many tools there are and where the folder is. The list is built from the folders, so nobody maintains it. It is kept in
   tools-overview-cache.json beside the memory with a fingerprint (folder names, README sizes and times)
   and built again only when the fingerprint changes. At most once a day it also names a tool folder with
   no README, a README with no first line, and script files lying loose in the tools folder.
@@ -872,7 +945,7 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
 
 ## F. What the user can switch off or change, and how
 
-### F1. Starting notes (22 pinned, 14 workflow)
+### F1. Starting notes (22 pinned, 16 workflow)
 - What: any starting note.
 - Why: they are ordinary notes.
 - You notice: they stop arriving.
@@ -936,7 +1009,12 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
 - Refuse or change: revise tags.
 
 ### F11. How to remove THOR
-- What: README.md has a "Remove THOR completely" section with ten steps. In short: remove its four entries
+- What: `install --uninstall --db <memory>` removes THOR's own hook entries (every event, both forms, the
+  backup one too), the "thor" tool server, the /thor-eval command and git's core.hooksPath when it is THOR's;
+  `install --uninstall --finish --db <memory> [--delete-memory]` then refuses while a THOR program runs,
+  removes the .bak copies, keeps the memory unless told, and names the program folder to delete. It never
+  removes git, Python or the Visual C++ runtime. README.md has a "Remove THOR completely" section with the
+  same steps by hand (ten). In short: remove its four entries
   in settings.json (plus the backup SessionStart entry if you chose a backup), the "thor" entry in
   ~/.claude.json, the /thor-eval command, unset git's core.hooksPath if it points to THOR's folder
   (the media gate, A7b, goes with it), then delete the memory folder, the programs folder and any
@@ -971,18 +1049,19 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
 - You notice: refusals with a way on.
 - Refuse or change: no.
 
-### F15. Helper-agent mode (first-session item 6) is off until you switch it on
-- What: install --set-helpers on|off --db <memory>. A new memory does not hold the two notes that carry the
-  mode (orchestrator-mode-saves-quota and an-agent-brief-stands-alone, bound to the Agent tool). On stores
+### F15. Helper-agent mode (first-session item 6) is on in a new memory
+- What: install --set-helpers on|off --db <memory>. A NEW memory also stores the two notes that carry the
+  mode (orchestrator-mode-saves-quota and an-agent-brief-stands-alone, bound to the Agent tool); an existing
+  memory is never touched. On stores
   exactly those two; off retracts them with a reason; running either twice changes nothing. A retracted id
   cannot simply be created again, so on after off stores the note again and then resolves the id onto the
   new version: the log keeps created, retracted, created, resolved, and the id is live with one head.
 - Why: measured at the maker, helpers were likely 12 to 62 percent cheaper and keep the chat free, but you do
   not see the work happen and cannot steer a helper halfway, each helper starts with a fixed context cost
   (small tasks cost more), it knows nothing of the conversation beyond its brief, parallel helpers can
-  collide in the same files, and checking the result costs an extra turn. So it is yours to choose.
-- You notice: with it off your assistant does the work itself in the main conversation; with it on, a
-  reminder arrives right before a helper agent is started.
+  collide in the same files, and checking the result costs an extra turn. So it is on by default and yours to switch off.
+- You notice: with it on, a reminder arrives right before a helper agent is started; with it off your
+  assistant does the work itself in the main conversation.
 - Refuse or change: say "helpers on" or "helpers off" to your assistant.
 
 ### F16. The media gate (A7b) can be tuned, allowed per file, or switched off

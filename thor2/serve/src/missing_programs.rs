@@ -73,6 +73,22 @@ fn expand_env(word: &str) -> Option<String> {
     Some(out)
 }
 
+/// The command of one hook entry as one quoted line, whichever form it is in:
+/// shell form (`"command"` holds the whole line) is returned as it is, exec
+/// form (`"command"` is the program and `"args"` its arguments) is joined with
+/// every word quoted, so a reader can treat both alike.
+pub fn hook_command_line(hook: &serde_json::Value) -> Option<String> {
+    let command = hook.get("command")?.as_str()?;
+    let Some(args) = hook.get("args").and_then(|a| a.as_array()) else {
+        return Some(command.to_string());
+    };
+    let mut line = format!("\"{command}\"");
+    for arg in args.iter().filter_map(|a| a.as_str()) {
+        line.push_str(&format!(" \"{arg}\""));
+    }
+    Some(line)
+}
+
 /// The THOR programs the hooks of Claude Code's settings file call, and the
 /// program of the `thor` tool server in its tool-server file. Other programs'
 /// hooks are never read as ours.
@@ -86,8 +102,9 @@ pub fn programs_called(settings_text: Option<&str>, mcp_text: Option<&str>) -> V
                 .flatten()
                 .filter_map(|group| group.get("hooks").and_then(|h| h.as_array()))
                 .flatten()
-                .filter_map(|hook| hook.get("command").and_then(|c| c.as_str()));
+                .filter_map(hook_command_line);
             for command in commands {
+                let command = command.as_str();
                 let Some(program) = first_word(command).map(PathBuf::from) else { continue };
                 if is_thor_program(&program) && command.contains("--db") {
                     out.push(program);

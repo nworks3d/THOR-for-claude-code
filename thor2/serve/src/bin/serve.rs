@@ -157,6 +157,46 @@ enum Command {
     /// at all. Read-only. The same answer the agent's `lookup` gives when it
     /// is called with neither a query nor a key - one definition, two doors.
     Catalog,
+    /// A read-only look at the EARLIER Claude Code sessions on this computer,
+    /// so the assistant can propose to put the person's work in order (one
+    /// fixed folder per subject, with its own memory): per session the folder
+    /// it ran in, the dates, the first thing the person typed, how many
+    /// prompts, and the files it wrote (still there or gone), grouped by
+    /// folder with the folders not in order first, plus the loose files left
+    /// in the home folder, Desktop, Documents or Downloads. Changes no file; its
+    /// one write is a record in THOR's own log when it finds nothing to order in
+    /// the real transcripts folder (it settles the tidy step by itself).
+    /// With `--digest <transcript>`: one session as short plain text instead.
+    Inventory {
+        /// Print the same as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Read the transcripts from here instead of ~/.claude/projects (tests).
+        #[arg(long)]
+        projects_dir: Option<PathBuf>,
+        /// Treat this as the home folder instead of the real one (tests).
+        #[arg(long)]
+        home: Option<PathBuf>,
+        /// One session (a transcript file named by a listing) as plain text:
+        /// what the person typed, the assistant's last reply to each prompt,
+        /// one line per tool call; at most about 20000 characters, never a secret.
+        #[arg(long)]
+        digest: Option<PathBuf>,
+    },
+    /// What the owner typed in a project since its previous evaluation: the
+    /// list the open evaluation froze at its start, read again from the
+    /// session transcripts, oldest first, one line each with its date, secrets
+    /// blanked, at most about 20000 characters. When the list is longer the
+    /// last line says how many newer messages wait for the next evaluation.
+    /// Read-only. The evaluation's report is held until this has been run.
+    Said {
+        /// The project, as the evaluation's start note names it.
+        #[arg(long)]
+        project: String,
+        /// Read the transcripts from here instead of ~/.claude/projects (tests).
+        #[arg(long)]
+        projects_dir: Option<PathBuf>,
+    },
     /// One scope, opened: every item filed under it, one line each, complete
     /// and in date order. The step after `catalog` - and the same answer the
     /// agent's `lookup` gives when it is called with a scope and no query.
@@ -475,6 +515,8 @@ fn main() {
             let store = open_store_or_die(&cli.db);
             print!("{}", lookup::render_catalog(&lookup::catalog(&store)));
         }
+        Command::Inventory { json, projects_dir, home, digest } => cmd_inventory(&cli.db, json, projects_dir, home, digest),
+        Command::Said { project, projects_dir } => cmd_said(&cli.db, &project, projects_dir),
         Command::Scope { name } => {
             let store = open_store_or_die(&cli.db);
             print!("{}", lookup::render_scope(&name, &lookup::in_scope(&store, &name)));
@@ -1223,33 +1265,55 @@ mod resolve_session_id_tests {
 fn plain_line_for_block(event: &str, reason: &str) -> &'static str {
     let lower = reason.to_lowercase();
     match event {
-        "Stop" if lower.contains("walked through setup") => {
-            "THOR (the memory your assistant uses) is finishing its setup. Your assistant shows you a short numbered list of what was set up, already switched on with sensible defaults, such as answering in your own language. Answer the numbers you care about, or just carry on: nothing is needed from you."
-        }
+        "Stop" if lower.contains("walked through setup") => LINE_SETUP,
+        "Stop" if lower.contains("[thor] order-earlier-work") => LINE_ORDER,
         // Before the evaluation arm: an evaluation ask can ride along with this hold.
-        "Stop" if lower.contains(&serve::leftover_scripts::HOLD_MARKER.to_lowercase()) => {
-            "Your assistant left a few helper scripts outside your projects. THOR asks it to sort them before it finishes: it keeps the useful ones in your tools folder, deletes the throwaway ones, and asks you about anything in doubt. Nothing is needed from you unless it asks."
-        }
-        "Stop" if lower.contains("copy-attestation") => {
-            "THOR is sending the proof of this week's memory check from this read-only copy to your main machine. Your assistant makes one more small call. Nothing is needed from you."
-        }
-        "Stop" if lower.contains("evaluation") => {
-            "THOR asks your assistant to do a short tidy-up of its memory before it finishes. It can take a few minutes. Nothing is needed from you."
-        }
-        "Stop" if lower.contains("durable decision") => {
-            "Your assistant is saving something you just decided, so it is remembered next time. Nothing is needed from you."
-        }
-        _ => "THOR asked your assistant to take care of one more small thing before it finishes. Nothing is needed from you.",
+        "Stop" if lower.contains(&serve::leftover_scripts::HOLD_MARKER.to_lowercase()) => LINE_SCRIPTS,
+        "Stop" if lower.contains("copy-attestation") => LINE_COPY_PROOF,
+        "Stop" if lower.contains("evaluation") => LINE_TIDY_UP,
+        "Stop" if lower.contains("durable decision") => LINE_DECISION,
+        "Stop" if lower.contains("could not prove themselves") => LINE_NOTES_OUT_OF_DATE,
+        "PreToolUse" if lower.contains("needs the owner's explicit go") => LINE_NEEDS_YOUR_OK,
+        "PreToolUse" => LINE_ACTION_STOPPED,
+        _ => LINE_ONE_MORE_THING,
     }
 }
 
-/// `plain_line_for_block` applied to a block at STOP, once, as
-/// `systemMessage`. Anything else is returned unchanged: a PreToolUse refusal
-/// is a different channel whose exact bytes are pinned by the golden files in
-/// `serve/tests/data/hook_golden`, and the person's confusing moment is the
-/// turn that will not end.
+// THE SENTENCES A PERSON SEES. Every hold and every refusal of a tool call
+// carries one of these as `systemMessage`; a test walks them all and fails on
+// THOR's own vocabulary (rule, falsifier, evaluation, scope, teeth, hook, MCP,
+// collection, store). Each says what happened and that nothing is needed.
+const LINE_SETUP: &str = "THOR (the memory your assistant uses) is finishing its setup. Your assistant welcomes you and asks one short question with a few choices: you can simply answer \"yes\". Nothing else is needed from you.";
+const LINE_ORDER: &str = "THOR asks your assistant to finish one last setup step: a proposal to put your earlier work in order. It asks you one short question. Nothing else is needed from you.";
+const LINE_SCRIPTS: &str = "Your assistant left a few small helper files outside your projects. THOR asks it to tidy them up: useful ones are kept in your tools folder, leftovers are deleted, and it asks you first about anything unclear. You do not need to do anything unless it asks you.";
+const LINE_COPY_PROOF: &str = "THOR is sending proof of this week's memory check from this computer's copy of your memory to your main computer. Your assistant does one more small step. You do not need to do anything.";
+const LINE_TIDY_UP: &str = "THOR asks your assistant to tidy up the memory now, before it finishes its answer. This can take a few minutes. You do not need to do anything.";
+const LINE_DECISION: &str = "Your assistant is saving something you just decided, so it is remembered next time. You do not need to do anything.";
+const LINE_NOTES_OUT_OF_DATE: &str = "THOR noticed that some saved notes may be out of date, and asks your assistant to check them before it finishes its answer. You do not need to do anything.";
+const LINE_NEEDS_YOUR_OK: &str = "THOR paused one step of your assistant's work because it needs your OK first. Your assistant will ask you in plain words: just answer it. Nothing else is needed from you.";
+const LINE_ACTION_STOPPED: &str = "THOR stopped one step your assistant was about to take, because it went against something saved in the memory earlier. Your assistant will try another way. You do not need to do anything.";
+const LINE_ONE_MORE_THING: &str = "THOR asked your assistant to do one more small thing before it finishes its answer. For example, it may rewrite an answer that is too long. You do not need to do anything.";
+
+/// Every sentence above, for the test that walks them.
+#[cfg(test)]
+const PERSON_LINES: [&str; 10] = [
+    LINE_ORDER,
+    LINE_SETUP,
+    LINE_SCRIPTS,
+    LINE_COPY_PROOF,
+    LINE_TIDY_UP,
+    LINE_DECISION,
+    LINE_NOTES_OUT_OF_DATE,
+    LINE_NEEDS_YOUR_OK,
+    LINE_ACTION_STOPPED,
+    LINE_ONE_MORE_THING,
+];
+
+/// `plain_line_for_block` applied to a block, once, as `systemMessage`: at STOP
+/// (the turn that will not end) and at PRE-TOOL-USE (an action that was
+/// refused). Anything else is returned unchanged.
 fn with_line_for_the_person(event: &str, out: Option<HookOutput>) -> Option<HookOutput> {
-    if event != "Stop" {
+    if event != "Stop" && event != "PreToolUse" {
         return out;
     }
     match out {
@@ -1295,7 +1359,7 @@ mod line_for_the_person_tests {
             assert_eq!(v["reason"], reason, "the assistant's own text is untouched");
             assert_eq!(v["decision"], "block");
             let line = line_of(out);
-            assert!(line.contains("Nothing is needed from you") || line.contains("answer in your own words"), "{event}: {line}");
+            assert!(line.contains("You do not need to do anything") || line.contains("Nothing else is needed from you"), "{event}: {line}");
             for jargon in ["falsifier", "scope", "hook", "retract", "teeth", "evaluation", "A4"] {
                 assert!(!line.contains(jargon), "{event}: the plain line must not use {jargon:?}: {line}");
             }
@@ -1309,15 +1373,41 @@ mod line_for_the_person_tests {
             block("[THOR] Script file(s) were written outside any git repository during this session\n\nThe evaluation of 'x' is still open"),
         );
         let line = line_of(out);
-        assert!(line.contains("helper scripts"), "{line}");
+        assert!(line.contains("small helper files"), "{line}");
         assert!(!line.contains("memory"), "it is not the evaluation sentence: {line}");
     }
 
     #[test]
-    fn a_tool_call_refusal_is_left_exactly_as_it_was() {
-        let out = with_line_for_the_person("PreToolUse", block("[THOR] rule r1 forbids this text"));
-        let Some(HookOutput::Decision(v)) = out else { panic!("lost the block") };
-        assert!(v.get("systemMessage").is_none(), "{v}");
+    fn a_tool_call_refusal_gets_a_plain_line_and_keeps_its_reason() {
+        let reason = "[THOR] rule r1 forbids this text";
+        let out = with_line_for_the_person("PreToolUse", block(reason));
+        let Some(HookOutput::Decision(v)) = &out else { panic!("lost the block") };
+        assert_eq!(v["reason"], reason, "the assistant's own text is untouched");
+        let line = line_of(out);
+        assert!(line.contains("stopped one step") && line.contains("You do not need to do anything"), "{line}");
+        let approval = line_of(with_line_for_the_person("PreToolUse", block("[THOR] rule r2 applies here: this call needs the owner's explicit go")));
+        assert!(approval.contains("needs your OK first"), "{approval}");
+    }
+
+    /// Walk every sentence a person can see on a hold or a refusal: each says
+    /// that nothing (more) is needed, is plain ASCII, and uses none of THOR's
+    /// own words.
+    #[test]
+    fn every_sentence_a_person_sees_is_plain_and_uses_no_thor_vocabulary() {
+        for line in PERSON_LINES {
+            assert!(line.contains("You do not need to do anything") || line.contains("Nothing else is needed from you"), "{line}");
+            assert!(line.is_ascii(), "{line}");
+            let words: Vec<String> = line.to_lowercase().split(|c: char| !c.is_alphanumeric()).map(str::to_string).collect();
+            for jargon in ["rule", "rules", "falsifier", "evaluation", "scope", "teeth", "hook", "hooks", "mcp", "collection", "store", "retract", "lookup", "pinned"] {
+                assert!(!words.iter().any(|w| w == jargon), "the sentence uses the word {jargon:?}: {line}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_setup_and_notes_out_of_date_holds_get_their_own_sentence() {
+        assert_eq!(line_of(with_line_for_the_person("Stop", block("[THOR] ... has not been walked through setup yet"))), LINE_SETUP);
+        assert!(line_of(with_line_for_the_person("Stop", block("[THOR] These rules could not prove themselves while work was going on"))).contains("out of date"));
     }
 
     #[test]
@@ -1909,6 +1999,15 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                 return hold(reason);
             }
 
+            // THE LAST SETUP STEP: offering to put earlier work in order.
+            // Never in a headless session (no person to ask), never before the
+            // first-session setup note is retracted.
+            if !session_kind(&payload).headless {
+                if let Some(reason) = order_debt(db_path, &payload, &session_id, no_record) {
+                    return hold(reason);
+                }
+            }
+
             if let Some(reason) = capture_stop_check(db_path, &session_id) {
                 return hold(reason);
             }
@@ -2292,10 +2391,11 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             // THE BLOCK STAYS UNDER WHAT CLAUDE CODE SHOWS WHOLE (step 29). A
             // hook output over 10,000 characters is kept in a file and the
             // agent sees only its first 2 KB; THOR used to count every rule of
-            // such a block as shown. So the extras below (compaction reminder,
-            // registration notice, open points) are made first, the standing
-            // rules get what room is left, and only the rules that really are
-            // in the block are recorded as shown.
+            // such a block as shown. So the standing rules take their room first
+            // (`STANDING_BLOCK_LIMIT_BYTES`, which keeps a reserve for the two lines
+            // that must always be shown), the extras (compaction reminder,
+            // registration notice, open points) get what is left, and only the
+            // rules that really are in the block are recorded as shown.
             //
             // The compaction reminder has its own gate, at its own call site,
             // deliberately never chained onto the rules' early return: a
@@ -2314,7 +2414,7 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             // Every line besides the standing rules (compaction reminder, registration
             // notice, open points, copy line, missing program, work folders, copy down):
             // built by `session_start::start_extras`, which doctor calls too.
-            let extras = session_start::start_extras(
+            let mut extras = session_start::start_extras(
                 &store,
                 db_path,
                 folder_project.as_deref(),
@@ -2327,18 +2427,25 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                     refresh_copy: true,
                 },
             );
-            let extras_len: usize = extras.iter().map(|e| e.len() + 2).sum();
+            // A session in a folder that belongs to no project is told to propose
+            // a folder for this work and to move there (`other_project`). Not for a
+            // headless session, a subagent or a read-only copy.
+            if folder_project.is_none() && !kind.headless && !payload_is_from_a_subagent(&payload) && !copy {
+                extras.push(serve::other_project::no_project_line());
+            }
             // What this project's own sessions used lately ranks first (step 31).
             let recent = session_start::recent_in_project(db_path, folder_project.as_deref(), time::now_unix());
             let rules = session_start::render_within_ranked(
                 &items,
-                session_start::HOOK_OUTPUT_LIMIT_BYTES.saturating_sub(extras_len),
+                model::item::STANDING_BLOCK_LIMIT_BYTES,
                 &recent,
             );
             let (rules_text, shown_ids, hidden) = match rules {
                 Some(r) => (Some(r.text), r.shown, r.hidden),
                 None => (None, Vec::new(), 0),
             };
+            // The rules took their room first; the extras get what is left.
+            let extras = session_start::fit_extras(rules_text.as_ref().map_or(0, |t| t.len()), extras);
             let block = rules_text.into_iter().chain(extras).collect::<Vec<String>>().join("\n\n");
             if block.is_empty() {
                 return None;
@@ -2443,6 +2550,15 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                 return eval_note.map(|block| HookOutput::Context { event_name, block, verdicts: Vec::new() });
             }
 
+            // The prompt names ANOTHER project that has its own folder: the
+            // assistant is told to propose a session there (`other_project`).
+            let eval_note = match (eval_note, serve::other_project::named_in_prompt(&store, prompt_text, session_project.as_deref())) {
+                (Some(note), Some(other)) => Some(format!("{note}
+
+{}", serve::other_project::prompt_note(&other))),
+                (None, Some(other)) => Some(serve::other_project::prompt_note(&other)),
+                (note, None) => note,
+            };
             let candidates = serve::live::live_items(&store);
             let mut input = prompt::resolve(prompt_text, &candidates);
             input.project = folder_project.clone();
@@ -2919,16 +3035,20 @@ fn setup_debt(store: &EventStore) -> Option<String> {
     Some(format!(
         "[THOR] This memory was just installed and its owner has not been walked through setup \
          yet. Do this before anything else, in this same turn, so nothing waits for him: (1) read \
-         the numbered list with lookup key 'first-session-questions' (a short list to show him, \
-         one line per item, and under it the detail per item for you - what it is, why it exists, \
+         the item with lookup key 'first-session-questions' (what to say first, and a full \
+         numbered list that you show him ONLY if he asks what is switched on, with under it the \
+         detail per item for you - what it is, why it exists, \
          what was chosen and how to say no - to use only when he asks about a number or refuses \
          it); (2) store what applies - the \
          defaults: short plain replies, in his own language, the work lane only (nothing personal \
          goes into it), all the starting notes kept, each project named after its folder - as \
          '{answers}' (a Report with no scope is enough - this id needs none, so do not ask him to \
-         name a collection for it); (3) retract '{note}'; (4) show him the list in his own \
-         language, say that every default on it is already on, except backup, which stays \
-         off until he chooses (a fresh install made none, so say that one plainly), and that he can answer by number (for \
+         name a collection for it); (3) retract '{note}'; (4) say the short welcome from that item \
+         in his own language (never the numbered list, and never mention the plan, git, hooks, \
+         helper agents or the weekly check), speak the language he writes \
+         in, and ask only the one question in it (a plain yes accepts its three proposals: safety copy, language, folder). If he asks what is switched on, show the \
+         list and say that every default on it is already on, except backup, which stays \
+         off until he chooses, and that he can answer by number (for \
          example \"1 yes, 3 no, the rest as you like\"). Whatever he does not mention keeps its \
          default, and you apply the defaults without waiting for an answer. When he does answer, \
          apply each number, say ONCE and plainly why an item exists if his answer works against \
@@ -2939,6 +3059,72 @@ fn setup_debt(store: &EventStore) -> Option<String> {
         answers = model::store::OWNER_SETUP_ANSWERS_ID,
         note = model::store::SETUP_NOTE_ID
     ))
+}
+
+/// THE LAST SETUP STEP: while the pinned note `order-earlier-work-once` is live
+/// and the first-session setup note is already retracted, the end of a turn is
+/// held until the person was offered to put their earlier work in order and it
+/// was carried out or they refused it themselves.
+///
+/// What settles it is judged here from evidence THOR checks itself, never from
+/// the assistant's word: the log's own evidence (`serve inventory` found nothing
+/// to order; `install --tidy` ran) and this session's transcript (a proposal
+/// carrying the marker, a real message of the person after it, their quoted
+/// words) - see `serve::order_earlier`. A settled step is written down and the
+/// note retracted by THOR itself. A proposal shown with no answer yet is the
+/// turn ending on the question, which is what it should do: no hold then.
+///
+/// Fails open like every other debt: no note, no store, no readable transcript
+/// all read as nothing to say. A store that never got the note (an existing
+/// install, a copy) never holds.
+fn order_debt(db_path: &Path, payload: &Value, session_id: &str, no_record: bool) -> Option<String> {
+    let mut store = serve::store_dir::open_existing(db_path).ok()?;
+    model::store::show(&store, model::store::ORDER_NOTE_ID).ok()?;
+    if model::store::show(&store, model::store::SETUP_NOTE_ID).is_ok() {
+        return None;
+    }
+    let settle = |store: &mut EventStore, how: &str| {
+        if !no_record {
+            let _ = model::store::settle_order_note(store, how);
+        }
+    };
+    let evidence = model::store::order_evidence(&store);
+    if evidence.iter().any(|e| e.kind == "settled" || model::store::nothing_evidence_counts(e)) {
+        settle(&mut store, "nothing to order, or settled earlier");
+        return None;
+    }
+    let named = payload.get("transcript_path").and_then(|v| v.as_str()).map(PathBuf::from);
+    let root = serve::attest::transcripts_root();
+    let transcript = serve::attest::main_transcript_of(named.as_deref(), root.as_deref(), session_id)?;
+    let timeline = serve::order_earlier::timeline(&transcript)?;
+    // The welcome comes first: the turn that says it ends on its question, and
+    // only when the person has typed a second message (their answer to it) is
+    // there anything to order. A proposal already shown counts at once.
+    let people = timeline.iter().filter(|e| matches!(e, serve::order_earlier::Entry::Person { .. })).count();
+    let proposed = timeline.iter().any(|e| matches!(e, serve::order_earlier::Entry::Proposal { .. }));
+    if people < 2 && !proposed {
+        return None;
+    }
+    let answer = model::store::show(&store, model::store::ORDER_ANSWER_ID).ok().map(|i| i.text);
+    match serve::order_earlier::judge(&timeline, &evidence, answer.as_deref()) {
+        serve::order_earlier::Verdict::Settled(how) => {
+            settle(&mut store, &how);
+            None
+        }
+        serve::order_earlier::Verdict::Waiting => None,
+        serve::order_earlier::Verdict::Owed(what) => Some(format!(
+            "[THOR] order-earlier-work: one last setup step is still owed. The first-session text (lookup key \
+             'first-session-questions', under THE TIDY STEP) says that right after the welcome the person is offered to \
+             put their earlier work with Claude in order. {what}. Only what THOR checks itself settles this: \
+             `serve inventory` finding nothing to order; `install --tidy` run after the person answered the proposal; or, \
+             for what they refused, the Report '{answers}' that quotes their own words exactly between double quotes, \
+             found in a message they typed after the proposal. Your own claim that it is done, a tag, or a report without \
+             their words settles nothing, and '{note}' cannot be retracted by you before: THOR retracts it itself once it \
+             is settled.",
+            answers = model::store::ORDER_ANSWER_ID,
+            note = model::store::ORDER_NOTE_ID
+        )),
+    }
 }
 
 /// Where this session's watermark lives: the store's tip as it stood when the
@@ -6966,6 +7152,70 @@ mod prose_marking_tests {
 
         let lines = why_lines(&items, &shown_ids, "git push --force origin main");
         assert_eq!(lines.len(), 2, "{lines:?}");
+    }
+}
+
+/// `serve inventory`: see `serve::inventory`. Read-only, exit 0 unless the
+/// home folder cannot be found or the digest file cannot be read.
+fn cmd_inventory(db_path: &Path, json: bool, projects_dir: Option<PathBuf>, home: Option<PathBuf>, digest: Option<PathBuf>) {
+    if let Some(file) = digest {
+        match serve::inventory::digest(&file) {
+            Ok(text) => print!("{text}"),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    let Some(home) = home.or_else(serve::inventory::home_dir) else {
+        eprintln!("could not find the home folder; name it with --home");
+        std::process::exit(1);
+    };
+    let real_folders = projects_dir.is_none();
+    let dir = projects_dir.unwrap_or_else(|| serve::inventory::default_projects_dir(&home));
+    let inv = serve::inventory::inventory(&dir, &home);
+    // Nothing to order, found in the real transcripts folder: THOR's own proof
+    // for the tidy step (`model::store::order_settled`). Never for a folder
+    // named by hand: an empty one proves nothing. The folder is recorded so
+    // that a changed home folder in the environment cannot pass for the real one.
+    if real_folders && inv.folders.iter().all(|f| f.ordered) && inv.loose_files.is_empty() && db_path.is_file() {
+        if let Ok(mut store) = EventStore::open_existing(db_path) {
+            if model::store::show(&store, model::store::ORDER_NOTE_ID).is_ok() {
+                let body = serde_json::json!({
+                    "projects_dir": model::store::norm_path(&dir),
+                    "sessions": inv.sessions_found,
+                    "folders": inv.folders.len(),
+                    "loose_files": inv.loose_files.len(),
+                });
+                let _ = model::store::record_order_evidence(&mut store, "nothing", body);
+            }
+        }
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&inv).unwrap_or_default());
+    } else {
+        print!("{}", serve::inventory::render_text(&inv));
+    }
+}
+
+/// `serve said --project <name>`: see `serve::said`. Read-only; exit 1 when no
+/// open evaluation of the project holds a list.
+fn cmd_said(db_path: &Path, project: &str, projects_dir: Option<PathBuf>) {
+    project::load_known_scopes(db_path);
+    let Ok(store) = EventStore::open_read_only(db_path) else {
+        eprintln!("could not open store at {}", db_path.display());
+        std::process::exit(1);
+    };
+    let spelled = model::checkout::existing_scope_for(&model::store::movable_scope_counts(&store), project);
+    let project = spelled.as_deref().unwrap_or(project);
+    let root = projects_dir.or_else(serve::attest::transcripts_root);
+    match serve::said::print_for(&store, root.as_deref(), project) {
+        Ok(text) => print!("{text}"),
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
     }
 }
 

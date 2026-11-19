@@ -136,6 +136,21 @@ struct Stamp {
     session: Option<String>,
 }
 
+/// What a mark reply may say about whether the verdict counts, from the
+/// writer's own check at call time (`serve::attest::check_call_in_flight`).
+/// A side door is certain to be set aside by the Stop, so the reply says so
+/// and names the one thing to do. A call seen, or not on disk yet, is
+/// confirmed only at the end of the turn, so the reply promises nothing more.
+fn verdict_standing(att: &model::store::Att) -> String {
+    if att.inflight.as_deref() == Some(model::store::INFLIGHT_SIDE_DOOR) {
+        let why = att.side_door.as_deref().unwrap_or("it is not a call Claude Code made");
+        return format!(
+            "this verdict will NOT count ({why}); give it again by calling the THOR mark tool yourself in this session"
+        );
+    }
+    "recorded; the end-of-turn check still has to confirm that it counts".to_string()
+}
+
 impl Stamp {
     /// The stamp itself: `serve::attest::att_for_call`, which reads the
     /// session's transcripts - so it runs inside the blocking closure.
@@ -809,7 +824,7 @@ fn refuse_a_new_collection(
     root: Option<&std::path::Path>,
     named_by_owner: Option<&str>,
 ) -> Result<(), String> {
-    if item.id == model::store::OWNER_SETUP_ANSWERS_ID {
+    if item.id == model::store::OWNER_SETUP_ANSWERS_ID || item.id == model::store::ORDER_ANSWER_ID {
         return Ok(());
     }
     let Some(wanted) = filed_under(item) else { return Ok(()) };
@@ -1395,6 +1410,10 @@ fn filing_context(
     let Some(start) = model::store::open_evaluation_start(store, session, project) else {
         return Err(sentence(model::store::no_open_evaluation_refusal(store, session, project)));
     };
+    // What the owner said: when the session's own transcript shows it printed
+    // the list after the start, THOR writes that down on the log, where the
+    // gate and the machine section read it.
+    serve::said::record_print_evidence(store, serve::attest::transcripts_root().as_deref(), &start);
     if before.is_none() {
         // A NEW filing under an id that already holds an earlier evaluation's
         // report would overwrite it and never close this evaluation.
@@ -3696,7 +3715,7 @@ impl ThorMcpServer {
             return match previous {
                 Some(prev) => format!(
                     "{queued} - this session's earlier {}{} stands in history; the later verdict is the one \
-                     that counts",
+                     that stands",
                     prev.verdict_word(),
                     prev.seq_suffix()
                 ),
@@ -3744,7 +3763,7 @@ impl ThorMcpServer {
                 if let Some(why) = set_aside {
                     owed_again_note = format!(
                         "this session's earlier {}{} was SET ASIDE and counted for nothing ({why}); this one is \
-                         written afresh and is the one that counts. ",
+                         written afresh. ",
                         prev.verdict_word(),
                         prev.seq_suffix()
                     );
@@ -3872,7 +3891,7 @@ impl ThorMcpServer {
                         if prev.noise != noise && owed_again_note.is_empty() {
                             reply.push_str(&format!(
                                 " - this session's earlier {}{} stands in history; the later verdict is the one \
-                                 that counts",
+                                 that stands",
                                 prev.verdict_word(),
                                 prev.seq_suffix()
                             ));
@@ -3880,7 +3899,7 @@ impl ThorMcpServer {
                     }
                     // Named last, the way every write tool's reply names it:
                     // the Stop reads it back to tie this call to its event.
-                    Ok(format!("{owed_again_note}{reply} (event seq {})", event.seq))
+                    Ok(format!("{owed_again_note}{reply} - {} (event seq {})", verdict_standing(&att), event.seq))
                 }
                 Err(e) => Err(format!("could not record the mark: {e}")),
             }
@@ -9861,6 +9880,9 @@ mod tests {
 
         let first = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "repeat-noise".to_string(), noise: true })).await;
         assert!(first.contains("marked noise"), "{first}");
+        // No `_meta` here, so the writer's own check already knows this call is a side door.
+        assert!(first.contains("will NOT count") && first.contains("no toolUseId") && first.contains("mark tool yourself"), "{first}");
+        assert!(!first.contains("is the one that counts"), "{first}");
 
         let second = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "repeat-noise".to_string(), noise: true })).await;
         assert!(second.contains("already judged noise this session"), "{second}");
@@ -9901,6 +9923,27 @@ mod tests {
         let again = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "revised-after-mark".to_string(), noise: false })).await;
         assert!(again.contains("marked useful") && again.contains("SET ASIDE"), "{again}");
         assert!(!again.contains("not counted again"), "{again}");
+    }
+
+    /// The reply to a verdict only promises what is true: a side door is told
+    /// it will not count; a call seen or not yet on disk is told the end-of-turn
+    /// check still has to confirm it.
+    #[test]
+    fn the_mark_reply_promises_only_what_the_writers_own_check_shows() {
+        let att = |inflight: &str, why: Option<&str>| model::store::Att {
+            tool_use_id: None,
+            args_sha256: String::new(),
+            session_hint: None,
+            inflight: Some(inflight.to_string()),
+            side_door: why.map(str::to_string),
+        };
+        let door = verdict_standing(&att(model::store::INFLIGHT_SIDE_DOOR, Some("two different calls under one id")));
+        assert!(door.contains("will NOT count") && door.contains("two different calls under one id"), "{door}");
+        assert!(door.contains("THOR mark tool yourself"), "{door}");
+        for inflight in [model::store::INFLIGHT_SEEN, model::store::INFLIGHT_UNSEEN] {
+            let open = verdict_standing(&att(inflight, None));
+            assert!(open.contains("end-of-turn check still has to confirm") && !open.contains("NOT"), "{open}");
+        }
     }
 
     /// A verdict the Stop set aside counts for nothing, so giving it again is
@@ -10055,7 +10098,7 @@ mod tests {
         assert!(second.contains("this session's earlier useful"), "{second}");
         assert!(second.contains("event seq"), "{second}");
         assert!(
-            second.contains("the later verdict is the one that counts"),
+            second.contains("the later verdict is the one that stands"),
             "{second}"
         );
 
