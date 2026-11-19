@@ -537,18 +537,23 @@ prepare: no account, no key, no terminal, no git, no Python. Your assistant does
 the installing; if your computer is missing git or Microsoft's "Visual C++
 Redistributable" it installs them itself first.
 
-1. **Tell your assistant: "Install THOR"** and give it the link to this page.
-   It reads [AGENTS.md](AGENTS.md), runs everything, and checks that it worked.
-   Windows may show one permission window while it installs a missing program:
-   click **Yes**. That is the only click that is not in Claude Code itself.
-   If your assistant says Claude Code stopped it from installing, answer
-   **"yes, go ahead"**. If it is stopped a second time, look under the box where
-   you type: there is a selector that is set to automatic. Set it to the choice
-   that asks you before each step, say "go on", and click to allow when Claude
-   Code asks. You never have to type or paste a command yourself.
+1. **Set the selector under the box where you type to "Bypass permissions",
+   then tell your assistant: "Install THOR"** and give it the link to this page.
+   The selector is the small word right under the box where you type, at the
+   right, next to the name of the model. It says how much your assistant may do
+   by itself and normally reads "Auto". On "Auto", Claude Code stops your
+   assistant from installing THOR, because THOR connects itself to Claude
+   Code's own settings. So first click that word and choose **Bypass
+   permissions**. Your assistant then reads [AGENTS.md](AGENTS.md), runs
+   everything, and checks that it worked. Windows may show one permission window while it installs a missing
+   program: click **Yes**. If your assistant already said it was stopped, change
+   the selector and say "go on". You never have to type or paste a command
+   yourself.
 2. **Close Claude Code completely and open it again.** Claude Code only learns
    about THOR when it starts, so until you do this nothing is active. In the
-   Claude desktop app, quit it from its menu and open it again.
+   Claude desktop app, quit it from its menu and open it again. If you changed
+   the selector in step 1, set it back to "Auto" now: while it is on "Bypass
+   permissions", Claude Code asks you nothing before your assistant acts.
 3. **Say "yes"** to your assistant's first message, which proposes three things
    (a daily safety copy, the language, and the folder where everything for this
    work is kept), or tell it by number what you want different. If it proposes a
