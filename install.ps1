@@ -174,7 +174,7 @@ try {
     $zip = Join-Path $tmp $asset
     $sha = "$zip.sha256"
 
-    Write-Host "Downloading THOR (about 60 MB)..."
+    Write-Host "Downloading THOR (about 90 MB)..."
     try {
         Invoke-WebRequest -Uri "$base/$asset" -OutFile $zip
         Invoke-WebRequest -Uri "$base/$asset.sha256" -OutFile $sha

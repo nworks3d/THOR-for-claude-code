@@ -564,10 +564,13 @@ Redistributable" it installs them itself first.
 What your assistant runs for step 1, so you can read it first: it downloads the
 latest release from this project's GitHub page, checks the download against the
 checksum published next to it, unpacks it into a `thor2` folder in your home
-folder, and sets everything up, printing what it did in plain words. It needs
-no administrator rights and installs nothing outside your own user folder
-(apart from git and the C++ runtime when they are missing). Windows, in
-PowerShell:
+folder, and sets everything up, printing what it did in plain words. The
+checksum shows that the download arrived whole and undamaged; it does not prove
+who made it, because both files come from the same GitHub page. THOR itself
+needs no administrator rights and is installed only in your own user folder.
+Two other programs are installed for the whole computer when they are missing:
+git and Microsoft's Visual C++ runtime. For each of them Windows may ask your
+permission once. Windows, in PowerShell:
 
 ```powershell
 irm https://raw.githubusercontent.com/nworks3d/THOR-for-claude-code/main/install.ps1 | iex

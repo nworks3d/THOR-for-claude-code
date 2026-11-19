@@ -77,7 +77,7 @@ fi
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
-say "Downloading THOR (about 80 MB)..."
+say "Downloading THOR (about 115 MB)..."
 fetch "$BASE/$ASSET" "$tmp/$ASSET" || die "download failed. Check your connection, or grab the file by hand from https://github.com/$REPO/releases/latest"
 fetch "$BASE/$ASSET.sha256" "$tmp/$ASSET.sha256" || die "the checksum file could not be downloaded, so the archive cannot be verified."
 
