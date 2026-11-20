@@ -343,12 +343,53 @@ pub fn print_for(store: &EventStore, root: Option<&Path>, project: &str) -> Resu
 
 // ------------------------------------------------------------- evidence
 
+/// Splits a shell command into words the way Bash and PowerShell do for the
+/// forms THOR prints: white space separates words except inside single or
+/// double quotes, the quotes themselves are dropped (`--project='a b'` is one
+/// word `--project=a b`), and a backslash before a space or, outside single
+/// quotes, before a quote keeps that character (`a\ b`). Any other backslash is
+/// literal, so Windows paths such as `C:\thor2\serve.exe` stay whole.
+fn shell_words(command: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut started = false;
+    let mut quote: Option<char> = None;
+    let mut chars = command.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(q), _) if c == q => quote = None,
+            (Some('\''), _) => word.push(c),
+            (Some(_), '\\') if matches!(chars.peek(), Some('"')) => word.push(chars.next().unwrap()),
+            (Some(_), _) => word.push(c),
+            (None, '"' | '\'') => {
+                quote = Some(c);
+                started = true;
+            }
+            (None, '\\') if matches!(chars.peek(), Some(' ' | '"' | '\'')) => {
+                word.push(chars.next().unwrap());
+                started = true;
+            }
+            (None, _) if c.is_whitespace() => {
+                if started || !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+                started = false;
+            }
+            (None, _) => word.push(c),
+        }
+    }
+    if started || !word.is_empty() {
+        words.push(word);
+    }
+    words
+}
+
 /// Whether a shell command runs THOR's `serve` with the `said` subcommand and
 /// `--project <project>` (the program is `serve` or `serve.exe`, bare or at the
 /// end of a path; the project may be quoted).
 pub fn runs_said(command: &str, project: &str) -> bool {
-    let clean = |t: &str| t.trim_matches(|c| c == '"' || c == '\'' || c == '&' || c == ';' || c == '|' || c == '(' || c == ')').to_string();
-    let tokens: Vec<String> = command.split_whitespace().map(clean).filter(|t| !t.is_empty()).collect();
+    let clean = |t: String| t.trim_matches(|c| c == '&' || c == ';' || c == '|' || c == '(' || c == ')').to_string();
+    let tokens: Vec<String> = shell_words(command).into_iter().map(clean).filter(|t| !t.is_empty()).collect();
     let is_serve = |t: &str| {
         let base = t.rsplit(['/', '\\']).next().unwrap_or("").to_lowercase();
         base == "serve" || base == "serve.exe"
@@ -547,5 +588,37 @@ mod tests {
         assert!(!runs_said("serve --db x said", "demo"));
         assert!(!runs_said("serve --db x status --project demo", "demo"));
         assert!(!runs_said("echo said --project demo", "demo"));
+    }
+
+    #[test]
+    fn a_project_name_with_a_space_passes_in_every_quoting_form() {
+        for command in [
+            "serve --db x said --project 'Trade bot'",
+            "serve --db x said --project \"Trade bot\"",
+            "serve --db x said --project=\"Trade bot\"",
+            "serve --db x said --project='Trade bot'",
+            "serve --db x said --project Trade\\ bot",
+            "& \"C:\\thor2\\serve.exe\" --db \"C:\\my store\\thor.db\" said --project 'Trade bot'",
+            "cd x && serve --db x said --project 'Trade bot' | head",
+            "serve --db x said --project trade-bot",
+        ] {
+            assert!(runs_said(command, "Trade bot"), "{command}");
+        }
+        assert!(!runs_said("serve --db x said --project 'Trade'", "Trade bot"));
+        assert!(!runs_said("serve --db x said --project Trade bot", "Trade bot"), "an unquoted space ends the name");
+        assert!(!runs_said("serve --db x said --project 'Other bot'", "Trade bot"));
+        assert!(!runs_said("serve --db x said --project \"Trade bot", "Trade bot x"));
+    }
+
+    #[test]
+    fn the_start_notes_own_printed_command_passes_for_a_spaced_name() {
+        let db = std::path::Path::new("C:/my store/thor.db");
+        for program in [std::path::Path::new("C:/thor2/serve.exe"), std::path::Path::new("serve"), std::path::Path::new("C:/Program Files/thor/serve.exe")] {
+            let printed = model::store::said_command_with(program, Some(db), "Trade bot");
+            assert!(runs_said(&printed, "Trade bot"), "{printed}");
+            // PowerShell form of the same command: call operator in front.
+            assert!(runs_said(&format!("& {printed}"), "Trade bot"), "& {printed}");
+            assert!(!runs_said(&printed, "Other bot"), "{printed}");
+        }
     }
 }
