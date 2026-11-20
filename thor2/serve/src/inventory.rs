@@ -99,11 +99,36 @@ pub struct Inventory {
 
 // ------------------------------------------------------------------ places
 
-/// The text form of a path for comparing: forward slashes, no trailing slash,
-/// `.` and `..` resolved lexically (never looking at the disk), and lower case
-/// on Windows only (its paths do not care about case; elsewhere two names that
-/// differ in case are two folders).
-pub fn norm(p: &Path) -> String {
+// Two different questions are asked of a path, and they are kept apart on purpose:
+//
+// 1. IDENTITY of a whole path: is this folder the home folder, is this file inside
+//    that target, is this the path the snapshot named. That follows the system:
+//    case does not matter on Windows, and not for any path that starts with a
+//    drive letter (`C:/...`) wherever the program runs; on Linux and macOS a
+//    path without a drive letter is case-sensitive (two names that differ in
+//    case are two folders). This is `norm` / `norm_with`.
+// 2. RECOGNISING a name or a pattern inside a path: the broad folder names
+//    (Desktop, Documents ...), OneDrive, AppData/Local/Temp, claude/scratchpad,
+//    scratch-workspaces, Program Files. These are names Windows and the apps
+//    write in their own case ("AppData", "Program Files"), and a person's
+//    transcript can come from another machine, so they are matched
+//    case-insensitively on EVERY system. That is `pattern_form`.
+//
+// Mixing the two (lower-casing only on Windows and then matching lower-case
+// names) is what broke the Linux build of 2.6.12.
+
+/// Whether `s` (a path with forward slashes) starts with a drive letter, `X:`.
+fn has_drive_letter(s: &str) -> bool {
+    let mut chars = s.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic()) && chars.next() == Some(':')
+}
+
+/// The text form of a path for comparing its IDENTITY: forward slashes, no
+/// trailing slash, `.` and `..` resolved lexically (never looking at the disk),
+/// and lower case when `system_folds_case` (Windows) or when the path starts
+/// with a drive letter. `norm` calls this with the system's answer; a test calls
+/// it with `false` to see what Linux does.
+pub fn norm_with(p: &Path, system_folds_case: bool) -> String {
     let s = p.display().to_string().replace('\\', "/");
     let s = s.strip_prefix("//?/").unwrap_or(&s);
     let mut parts: Vec<&str> = Vec::new();
@@ -124,11 +149,22 @@ pub fn norm(p: &Path) -> String {
     }
     let joined = parts.join("/");
     let t = joined.trim_end_matches('/');
-    if cfg!(windows) {
+    if system_folds_case || has_drive_letter(t) {
         t.to_lowercase()
     } else {
         t.to_string()
     }
+}
+
+/// `norm_with` for this system: the identity form of a path.
+pub fn norm(p: &Path) -> String {
+    norm_with(p, cfg!(windows))
+}
+
+/// The form of a path in which NAMES and patterns are recognised: always lower
+/// case, whatever the system (see the comment above).
+fn pattern_form(p: &Path) -> String {
+    norm_with(p, true)
 }
 
 /// The user's home folder: `USERPROFILE`, then `HOME`.
@@ -149,18 +185,26 @@ const BROAD_NAMES: [(&str, &str); 6] = [
 /// the home folder, Desktop, Documents, Downloads (also below a OneDrive
 /// folder) or a drive root? The word it gives is for the person's eyes.
 pub fn broad_place(home: &Path, dir: &Path) -> Option<String> {
-    let d = norm(dir);
+    broad_place_with(home, dir, cfg!(windows))
+}
+
+/// `broad_place` with the system's case answer given (see `norm_with`). The
+/// home folder is an identity question; the folder names are recognised in any case.
+pub fn broad_place_with(home: &Path, dir: &Path, system_folds_case: bool) -> Option<String> {
+    let id = |p: &Path| norm_with(p, system_folds_case);
+    let d = id(dir);
     if d.is_empty() || d.ends_with(':') || dir.parent().is_none_or(|p| p.as_os_str().is_empty()) {
         return Some("drive root".to_string());
     }
-    let h = norm(home);
+    let h = id(home);
     if d == h {
         return Some("home folder".to_string());
     }
     let name = dir.file_name().and_then(|n| n.to_str()).map(str::to_lowercase).unwrap_or_default();
-    let parent = dir.parent().map(norm).unwrap_or_default();
+    let parent = dir.parent().map(id).unwrap_or_default();
     let under_home = parent == h;
-    let under_onedrive = parent.strip_prefix(&format!("{h}/")).is_some_and(|rest| !rest.contains('/') && rest.starts_with("onedrive"));
+    let under_onedrive =
+        parent.strip_prefix(&format!("{h}/")).is_some_and(|rest| !rest.contains('/') && rest.to_lowercase().starts_with("onedrive"));
     if under_home || under_onedrive {
         if let Some((_, label)) = BROAD_NAMES.iter().find(|(n, _)| *n == name) {
             return Some((*label).to_string());
@@ -172,11 +216,18 @@ pub fn broad_place(home: &Path, dir: &Path) -> Option<String> {
 /// A folder that belongs to a program, not to the person's work (application
 /// data, program files, Claude's own settings folder).
 pub fn system_place(home: &Path, dir: &Path) -> Option<&'static str> {
+    system_place_with(home, dir, cfg!(windows))
+}
+
+/// `system_place` with the system's case answer given (see `norm_with`). Where
+/// the home folder ends is an identity question; the program folder names after
+/// it are recognised in any case.
+pub fn system_place_with(home: &Path, dir: &Path, system_folds_case: bool) -> Option<&'static str> {
     // Only the part below the home folder counts: the home folder itself may
     // sit anywhere (a test folder under a temp folder, say).
-    let full = norm(dir);
-    let h = format!("{}/", norm(home));
-    let below = full.strip_prefix(&h).unwrap_or(&full);
+    let full = norm_with(dir, system_folds_case);
+    let h = format!("{}/", norm_with(home, system_folds_case));
+    let below = full.strip_prefix(&h).unwrap_or(&full).to_lowercase();
     let d = format!("/{below}/");
     for (needle, label) in [("/appdata/", "application data"), ("/program files/", "program files"), ("/program files (x86)/", "program files"), ("/.claude/", "Claude's own settings")] {
         if d.contains(needle) {
@@ -191,7 +242,7 @@ pub fn system_place(home: &Path, dir: &Path) -> Option<&'static str> {
 /// application data, below a folder named `claude` or `claude-...` (the
 /// `Claude` and `Claude-Data\\claude-<id>` folders), then `scratch-workspaces`.
 pub fn is_app_scratch(p: &Path) -> bool {
-    let n = norm(p);
+    let n = pattern_form(p);
     let parts: Vec<&str> = n.split('/').collect();
     let Some(at) = parts.iter().position(|s| *s == "scratch-workspaces") else { return false };
     let before = &parts[..at];
@@ -203,7 +254,7 @@ pub fn is_app_scratch(p: &Path) -> bool {
 /// conversation without a folder often writes its files there, and that folder
 /// is cleared by a restart or a clean-up, so such a file is at risk too.
 pub fn is_temp_scratchpad(p: &Path) -> bool {
-    let n = norm(p);
+    let n = pattern_form(p);
     let parts: Vec<&str> = n.split('/').collect();
     // Every AppData\Local\Temp in the path is tried, not only the first: a home
     // folder can itself sit under another one (a test sandbox does).
@@ -240,8 +291,13 @@ pub fn source_system_place(home: &Path, dir: &Path) -> Option<&'static str> {
 
 /// Is `p` somewhere below `home` (not `home` itself)?
 pub fn is_inside(home: &Path, p: &Path) -> bool {
-    let h = norm(home);
-    let n = norm(p);
+    is_inside_with(home, p, cfg!(windows))
+}
+
+/// `is_inside` with the system's case answer given (see `norm_with`).
+pub fn is_inside_with(home: &Path, p: &Path, system_folds_case: bool) -> bool {
+    let h = norm_with(home, system_folds_case);
+    let n = norm_with(p, system_folds_case);
     n.starts_with(&format!("{h}/"))
 }
 
@@ -784,6 +840,89 @@ mod tests {
         assert_eq!(broad_place(home, Path::new("C:/Users/ann/OneDrive/Documents")).as_deref(), Some("Documents"));
         assert_eq!(broad_place(home, Path::new("C:/")).as_deref(), Some("drive root"));
         assert_eq!(broad_place(home, Path::new("C:/Users/ann/Documents/Cv en werk zoeken")), None);
+    }
+
+    // ------------------------------------------------ case: identity vs recognising names
+
+    /// The two behaviours of `norm`, on every system: `false` is what Linux and
+    /// macOS do, `true` is what Windows does.
+    #[test]
+    fn identity_folds_case_on_windows_and_for_drive_letters_only() {
+        let n = |s: &str, fold: bool| norm_with(Path::new(s), fold);
+        assert_eq!(n("/tmp/.tmpAbC/Docs", false), "/tmp/.tmpAbC/Docs", "Linux: case is kept");
+        assert_eq!(n("/tmp/.tmpAbC/Docs", true), "/tmp/.tmpabc/docs", "Windows: case is folded");
+        assert_eq!(n("C:/Users/Ann/x", false), "c:/users/ann/x", "a drive letter path folds even on Linux");
+        assert_eq!(n("c:\\Users\\ANN", false), "c:/users/ann");
+        assert_eq!(n("/a/B/../c/./d/", false), "/a/c/d");
+    }
+
+    #[test]
+    fn a_home_folder_with_capitals_in_its_name_is_still_the_home_folder_on_linux() {
+        // A tempdir-like name with capitals, as the CI machines make them.
+        let home = Path::new("/tmp/.tmpjloTEP");
+        for fold in [false, true] {
+            assert_eq!(broad_place_with(home, home, fold).as_deref(), Some("home folder"), "fold {fold}");
+            assert_eq!(broad_place_with(home, &home.join("Desktop"), fold).as_deref(), Some("Desktop"), "fold {fold}");
+            assert!(is_inside_with(home, &home.join("Documents").join("Cv"), fold), "fold {fold}");
+            assert!(!is_inside_with(home, home, fold));
+        }
+    }
+
+    #[test]
+    fn folder_names_are_recognised_in_any_case_on_every_system() {
+        let home = Path::new("/tmp/.tmpAbC");
+        for fold in [false, true] {
+            for (dir, want) in [
+                ("/tmp/.tmpAbC/DESKTOP", "Desktop"),
+                ("/tmp/.tmpAbC/documenten", "Documents"),
+                ("/tmp/.tmpAbC/DownLoads", "Downloads"),
+                ("/tmp/.tmpAbC/OneDrive - Contoso/Documents", "Documents"),
+                ("/tmp/.tmpAbC/ONEDRIVE/desktop", "Desktop"),
+            ] {
+                assert_eq!(broad_place_with(home, Path::new(dir), fold).as_deref(), Some(want), "{dir} fold {fold}");
+            }
+            assert_eq!(broad_place_with(home, Path::new("/tmp/.tmpAbC/Documents/Cv"), fold), None);
+            // Program folders below the home folder, in the case Windows writes them.
+            for dir in ["/tmp/.tmpAbC/AppData/Local/Thing", "/tmp/.tmpAbC/Program Files/Thing", "/tmp/.tmpAbC/Program Files (x86)/T", "/tmp/.tmpAbC/.CLAUDE/projects"] {
+                assert!(system_place_with(home, Path::new(dir), fold).is_some(), "{dir} fold {fold}");
+            }
+            assert_eq!(system_place_with(home, Path::new("/tmp/.tmpAbC/Documents/Cv"), fold), None);
+        }
+    }
+
+    #[test]
+    fn a_temp_scratchpad_and_a_scratch_workspace_are_recognised_in_any_case() {
+        for pad in [
+            "/home/x/AppData/Local/Temp/claude/C--Users-ann/s1/scratchpad/cv.md",
+            "/home/x/APPDATA/LOCAL/TEMP/Claude/s/SCRATCHPAD/cv.md",
+            "C:/Users/ann/AppData/Local/Temp/claude/x/scratchpad/cv.md",
+        ] {
+            assert!(is_temp_scratchpad(Path::new(pad)) && is_at_risk(Path::new(pad)), "{pad}");
+        }
+        assert!(!is_at_risk(Path::new("/home/x/AppData/Local/Temp/installer.log")));
+        for ws in [
+            "/home/x/AppData/Roaming/Claude/local-agent-mode-sessions/scratch-workspaces/abc",
+            "/home/x/APPDATA/Roaming/CLAUDE-Data/claude-1/Scratch-Workspaces/abc",
+        ] {
+            assert!(is_app_scratch(Path::new(ws)) && is_at_risk(Path::new(ws)), "{ws}");
+        }
+        assert!(!is_app_scratch(Path::new("/home/x/Documents/scratch-workspaces/abc")));
+    }
+
+    /// Identity: a sibling that differs only in case is another folder on Linux
+    /// and the same folder on Windows; a drive-letter path is case-blind anywhere.
+    #[test]
+    fn a_sibling_that_differs_only_in_case_is_another_folder_on_linux_and_the_same_on_windows() {
+        let home = Path::new("/tmp/.tmpAbC");
+        let sibling = Path::new("/tmp/.tmpabc/Desktop");
+        assert_eq!(broad_place_with(home, sibling, false), None, "Linux: a different folder");
+        assert_eq!(broad_place_with(home, sibling, true).as_deref(), Some("Desktop"), "Windows: the same folder");
+        assert!(!is_inside_with(home, Path::new("/tmp/.tmpabc/x"), false));
+        assert!(is_inside_with(home, Path::new("/tmp/.tmpabc/x"), true));
+        // Drive letters fold on any system.
+        let drive_home = Path::new("C:/Users/ann");
+        assert_eq!(broad_place_with(drive_home, Path::new("C:/Users/Ann/Desktop"), false).as_deref(), Some("Desktop"));
+        assert!(is_inside_with(drive_home, Path::new("c:/USERS/ann/x"), false));
     }
 
     #[test]
