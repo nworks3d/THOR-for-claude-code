@@ -748,3 +748,53 @@ fn d3_hanging_a_check_drops_the_no_literal_reason_tag_by_itself() {
     assert!(!item.tags.iter().any(|t| t.starts_with("no-literal:")), "{:?}", item.tags);
     assert!(item.check.is_some());
 }
+
+/// A revise never wires a tooth THOR built from the new text: a command-bound
+/// rule whose text names a flag as advice ("install --uninstall, then install
+/// again") is refused with the check named and the exact call to hang it, and
+/// nothing is stored. An explicit check_kind still wires; a check the rule
+/// already carried is kept by a text revise; remember answers the same way.
+#[test]
+fn a_revise_never_wires_a_derived_tooth_silently() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = store(tmp.path(), &["demo"]);
+    let mut mcp = Mcp::start(&db, tmp.path());
+    let advice = "Bij een dubbele hook: install --uninstall, dan opnieuw install.";
+
+    // remember with the same text: refused, the check named.
+    let mut fresh = rule("hook-advice", "Install the hook once per machine.", Some("demo"));
+    fresh["targets"] = command_target("install");
+    assert!(mcp.call("remember", fresh.clone()).contains("teeth: note"));
+    let mut direct = fresh.clone();
+    direct["id"] = json!("hook-direct");
+    direct["text"] = json!(advice);
+    let reply = mcp.call("remember", direct);
+    assert!(reply.starts_with("REFUSED: THOR built a tooth from your own text and it bites"), "{reply}");
+
+    // revise of the note: not wired, the reply names the check, nothing stored.
+    let reply = mcp.call("revise", json!({"id": "hook-advice", "text": advice}));
+    println!("revise advice: {reply}");
+    assert!(reply.starts_with("REFUSED: THOR built a tooth from your own text and it bites"), "{reply}");
+    assert!(reply.contains("Hang it: check_kind forbidden, check_literals ['--uninstall']"), "{reply}");
+    let item = get(&mut mcp, "hook-advice");
+    assert!(item.check.is_none() && item.text == "Install the hook once per machine.", "{item:?}");
+
+    // An explicit check_kind still wires.
+    let reply = mcp.call(
+        "revise",
+        json!({"id": "hook-advice", "text": advice, "check_kind": "forbidden", "check_literals": ["--uninstall"]}),
+    );
+    assert!(reply.starts_with("revised 'hook-advice'") && reply.contains("teeth: wired, not proven"), "{reply}");
+    assert!(get(&mut mcp, "hook-advice").check.is_some());
+
+    // An existing check is kept by a later text revise.
+    let reply = mcp.call(
+        "revise",
+        json!({"id": "hook-advice", "text": "Bij een dubbele hook: install --uninstall, dan opnieuw install. Nooit ook install --uninstall tweemaal."}),
+    );
+    assert!(reply.starts_with("revised 'hook-advice'"), "{reply}");
+    assert_eq!(
+        get(&mut mcp, "hook-advice").check,
+        Some(Check::Forbidden { literals: vec!["--uninstall".to_string()] })
+    );
+}
