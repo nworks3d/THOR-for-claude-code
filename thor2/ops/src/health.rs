@@ -368,33 +368,64 @@ pub fn stale_tool_server_line(bin_dir: &Path) -> Option<String> {
     stale_servers_line(modified_unix, &started)
 }
 
-/// The words of the finding, from when the file was replaced and the
-/// `(process id, start time)` of every running tool server.
-fn stale_servers_line(replaced_unix: i64, started: &[(u32, i64)]) -> Option<String> {
-    let stale: Vec<&(u32, i64)> = started.iter().filter(|(_, start)| *start < replaced_unix).collect();
-    if stale.is_empty() {
+/// One running tool server: its process id, its start time in Unix seconds and
+/// the name of the program that started it (empty when that is unknown).
+type RunningServer = (u32, i64, String);
+
+/// Whether a tool server was started by Claude Code itself. Another program can
+/// embed THOR's tool server too (a local model's own harness, measured
+/// 2026-11-20: a `node.exe` parent); restarting Claude never changes those, so
+/// they are no Claude session that "needs a restart".
+fn started_by_claude(parent: &str) -> bool {
+    let name = parent.trim().to_lowercase();
+    name == "claude" || name == "claude.exe"
+}
+
+/// The words of the finding, from when the file was replaced and every running
+/// tool server.
+fn stale_servers_line(replaced_unix: i64, started: &[RunningServer]) -> Option<String> {
+    let stale: Vec<&RunningServer> = started.iter().filter(|(_, start, _)| *start < replaced_unix).collect();
+    let (claude, other): (Vec<&RunningServer>, Vec<&RunningServer>) = stale.into_iter().partition(|(_, _, parent)| started_by_claude(parent));
+    if claude.is_empty() && other.is_empty() {
         return None;
     }
-    let ids: Vec<String> = stale
-        .iter()
-        .map(|(pid, start)| format!("{pid} (started {})", serve::time::iso8601_from_unix(*start)))
-        .collect();
     let swapped = serve::time::iso8601_from_unix(replaced_unix);
-    Some(format!(
-        "tool server: {} running mcp.exe process(es) started before mcp.exe was replaced ({swapped}): {} - they belong to Claude Code sessions that started before the swap and still run the OLD program; a session started after {swapped} already runs the new one, so only those older sessions need a restart.",
-        stale.len(),
-        ids.join(", ")
-    ))
+    let named = |list: &[&RunningServer]| {
+        list.iter()
+            .map(|(pid, start, _)| format!("{pid} (started {})", serve::time::iso8601_from_unix(*start)))
+            .collect::<Vec<String>>()
+            .join(", ")
+    };
+    let mut parts = Vec::new();
+    if !claude.is_empty() {
+        parts.push(format!(
+            "{} running mcp.exe process(es) of Claude Code started before mcp.exe was replaced ({swapped}): {} - they belong to Claude Code sessions that started before the swap and still run the OLD program; a session started after {swapped} already runs the new one, so only those older sessions need a restart",
+            claude.len(),
+            named(&claude)
+        ));
+    }
+    if !other.is_empty() {
+        let mut parents: Vec<String> = other.iter().map(|(_, _, p)| if p.trim().is_empty() { "unknown".to_string() } else { p.trim().to_string() }).collect();
+        parents.sort();
+        parents.dedup();
+        parts.push(format!(
+            "{} older mcp.exe process(es) run under another program ({}): {} - not a Claude Code session, so no Claude session needs a restart for them",
+            other.len(),
+            parents.join(", "),
+            named(&other)
+        ));
+    }
+    Some(format!("tool server: {}.", parts.join("; ")))
 }
 
 /// Every running process of `exe`, as (process id, start time in Unix
 /// seconds). Windows only: asks PowerShell, windowless; anywhere else, or when
 /// that fails, an empty list (the finding is then simply not made).
 #[cfg(windows)]
-fn running_tool_servers(exe: &Path) -> Vec<(u32, i64)> {
+fn running_tool_servers(exe: &Path) -> Vec<RunningServer> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let script = "Get-Process -Name mcp -ErrorAction SilentlyContinue | ForEach-Object { $_.Id.ToString() + '|' + ([DateTimeOffset]$_.StartTime).ToUnixTimeSeconds() + '|' + $_.Path }";
+    let script = "Get-CimInstance Win32_Process -Filter \"Name='mcp.exe'\" -ErrorAction SilentlyContinue | ForEach-Object { $p = Get-CimInstance Win32_Process -Filter (\"ProcessId=\" + $_.ParentProcessId) -ErrorAction SilentlyContinue; $n = if ($p) { $p.Name } else { '' }; $_.ProcessId.ToString() + '|' + ([DateTimeOffset]$_.CreationDate).ToUnixTimeSeconds() + '|' + $n + '|' + $_.ExecutablePath }";
     let Ok(out) = std::process::Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .creation_flags(CREATE_NO_WINDOW)
@@ -406,17 +437,18 @@ fn running_tool_servers(exe: &Path) -> Vec<(u32, i64)> {
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|line| {
-            let mut parts = line.trim().splitn(3, '|');
+            let mut parts = line.trim().splitn(4, '|');
             let pid = parts.next()?.parse::<u32>().ok()?;
             let start = parts.next()?.parse::<i64>().ok()?;
+            let parent = parts.next()?.to_string();
             let path = parts.next()?.replace('/', "\\").to_lowercase();
-            (path == wanted).then_some((pid, start))
+            (path == wanted).then_some((pid, start, parent))
         })
         .collect()
 }
 
 #[cfg(not(windows))]
-fn running_tool_servers(_exe: &Path) -> Vec<(u32, i64)> {
+fn running_tool_servers(_exe: &Path) -> Vec<RunningServer> {
     Vec::new()
 }
 
@@ -5925,15 +5957,32 @@ mod tests {
 
     #[test]
     fn a_tool_server_started_before_the_program_was_replaced_is_named() {
-        let line = stale_servers_line(1_790_000_000, &[(111, 1_789_990_000), (222, 1_790_000_500)]).expect("one is stale");
-        assert!(line.starts_with("tool server: 1 running mcp.exe process(es) started before mcp.exe was replaced"), "{line}");
+        let claude = |pid, start| (pid, start, "claude.exe".to_string());
+        let line = stale_servers_line(1_790_000_000, &[claude(111, 1_789_990_000), claude(222, 1_790_000_500)]).expect("one is stale");
+        assert!(line.starts_with("tool server: 1 running mcp.exe process(es) of Claude Code started before mcp.exe was replaced"), "{line}");
         assert!(line.contains("111 (started 2026-") && !line.contains("222"), "{line}");
         assert!(line.contains("belong to Claude Code sessions that started before the swap"), "{line}");
         assert!(line.contains("a session started after 2026-") && line.contains("already runs the new one"), "{line}");
         assert!(line.contains("only those older sessions need a restart"), "{line}");
+        assert!(!line.contains("another program"), "{line}");
         assert_eq!(line.lines().count(), 1, "one line: {line}");
-        assert_eq!(stale_servers_line(1_790_000_000, &[(222, 1_790_000_500)]), None, "a newer process is fine");
+        assert_eq!(stale_servers_line(1_790_000_000, &[claude(222, 1_790_000_500)]), None, "a newer process is fine");
         assert_eq!(stale_servers_line(1_790_000_000, &[]), None, "none running is fine");
+    }
+
+    #[test]
+    fn an_old_tool_server_under_another_program_is_no_claude_session() {
+        // Measured 2026-11-20: a local model's harness (node.exe) kept a THOR tool
+        // server from days before, and the old line told every Claude session to
+        // restart for it.
+        let line = stale_servers_line(1_790_000_000, &[(333, 1_789_000_000, "node.exe".to_string()), (444, 1_790_000_500, "claude.exe".to_string())])
+            .expect("the old one is named");
+        assert!(line.contains("run under another program (node.exe): 333"), "{line}");
+        assert!(line.contains("not a Claude Code session"), "{line}");
+        assert!(!line.contains("of Claude Code started before"), "no Claude session is named: {line}");
+        assert!(!line.contains("need a restart") || line.contains("no Claude session needs a restart"), "{line}");
+        assert!(started_by_claude("claude.exe") && started_by_claude("Claude.exe") && started_by_claude("claude"));
+        assert!(!started_by_claude("node.exe") && !started_by_claude(""));
     }
 
     #[test]

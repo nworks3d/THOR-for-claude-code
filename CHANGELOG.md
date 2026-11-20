@@ -26,6 +26,7 @@ What changed: The last setup step, putting what you did with Claude before in or
 - **A conversation in the app's temporary place is now asked to move to a project folder.** The line that tells your assistant a session belongs to no project is never cut any more, names the project folders THOR knows, is repeated at the first message of a resumed conversation, and the end of the first turn is held once, whatever it did, so your assistant proposes one folder and asks you only yes or no.
 - **The weekly check's first message now fits whole, so no item is left out.** When it would be too long, it first says what to do with an item once for the whole list and shows each item as one short line, and only then leaves items out from the end. THOR no longer reports its own bug for a cut that points to the whole note.
 - **A restarted conversation can still file the weekly report after the programs were replaced by another build.** The report is accepted and counts when the running tool server and the installed program read it in the same way. Only a different reading still refuses it, and the restart line is then only information.
+- **The health check no longer tells you to restart Claude for a tool server that belongs to another program.** Only THOR tool servers started by Claude Code count as a Claude session that runs an old build. One started by another program, such as a local model's own helper, is named apart and never asks for a restart.
 
 ## 2.6.11 (2026-11-19)
 

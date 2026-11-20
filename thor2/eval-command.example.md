@@ -1139,12 +1139,14 @@ file's `allowed-tools` pre-approves, so no permission prompt interrupts it:
 BEFORE YOU FILE, read the first lines it prints. Two lines can start differently,
 and they mean different things.
 
-`tool server:` (for example "tool server: 1 running mcp.exe process(es) started
-before mcp.exe was replaced") - WHAT IT MEANS: it names the running tool
-servers of OTHER Claude Code sessions that started before the program was
+`tool server:` (for example "tool server: 1 running mcp.exe process(es) of Claude
+Code started before mcp.exe was replaced") - WHAT IT MEANS: it names the running
+tool servers of OTHER Claude Code sessions that started before the program was
 replaced, and the time of the swap. It says nothing about yours: a session that
 started after that time already runs the new program, and so does yours when
-it started after it. WHAT TO DO: if this session started after the swap time
+it started after it. A part saying a process runs "under another program" (for
+example a local model's own harness) is never a Claude Code session: ignore it,
+it never means a restart. WHAT TO DO: if this session started after the swap time
 the line names, ignore the line and file as usual. Only when this session
 started BEFORE it, a report filed now would be refused as version skew and be
 a dead report: then do not file, tell the owner in your summary to restart
