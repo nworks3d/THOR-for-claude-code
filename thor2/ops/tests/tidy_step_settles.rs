@@ -513,11 +513,23 @@ fn only_a_file_inside_the_temporary_workspace_blocks() {
 
 #[test]
 fn paths_are_compared_without_dots_and_case_only_matters_on_windows() {
-    let n = |s: &str| serve::inventory::norm(Path::new(s));
-    assert_eq!(n("/a/b/../c/./d/"), "/a/c/d");
-    assert_eq!(n("C:/Users/Ann/../Bob/x"), if cfg!(windows) { "c:/users/bob/x" } else { "C:/Users/Bob/x" });
-    assert_eq!(n("/A/b"), if cfg!(windows) { "/a/b" } else { "/A/b" });
-    assert_eq!(n("C:/../x"), if cfg!(windows) { "c:/x" } else { "C:/x" });
+    // `norm_with` takes the system's answer as a parameter, so both systems are
+    // checked on any host: `true` is Windows, `false` is Linux and macOS.
+    let win = |s: &str| serve::inventory::norm_with(Path::new(s), true);
+    let unix = |s: &str| serve::inventory::norm_with(Path::new(s), false);
+    assert_eq!(win("/a/b/../c/./d/"), "/a/c/d");
+    assert_eq!(unix("/a/b/../c/./d/"), "/a/c/d");
+    // A path with a drive letter is a Windows path wherever it is read (a
+    // transcript from a Windows machine), so it folds case on every system.
+    assert_eq!(win("C:/Users/Ann/../Bob/x"), "c:/users/bob/x");
+    assert_eq!(unix("C:/Users/Ann/../Bob/x"), "c:/users/bob/x");
+    // Without a drive letter, case only matters off Windows.
+    assert_eq!(win("/A/b"), "/a/b");
+    assert_eq!(unix("/A/b"), "/A/b");
+    assert_eq!(win("C:/../x"), "c:/x");
+    assert_eq!(unix("C:/../x"), "c:/x");
+    // `norm` is the one of the system the test runs on.
+    assert_eq!(serve::inventory::norm(Path::new("/A/b")), if cfg!(windows) { "/a/b" } else { "/A/b" });
     // A file inside the target reached through a ".." is still inside it.
     let dir = tempfile::tempdir().unwrap();
     let (home, db) = store_with_note(dir.path());

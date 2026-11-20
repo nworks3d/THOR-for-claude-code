@@ -153,29 +153,12 @@ fn a_block_the_gate_filled_to_its_limit_still_shows_every_pinned_note_beside_eve
     let room = model::item::NO_PROJECT_STANDING_LIMIT_BYTES - used;
     assert!(room < 40 && ids.len() > 10, "fixture: the gate filled the block ({room} bytes left, {} notes)", ids.len());
 
-    // A full tools overview, one of the extras with a cap of its own.
-    let _ = sixty_tools(dir.path());
     fill_the_no_project_line(&db, dir.path());
-    // A folder that belongs to no project: the start adds the no-project line.
-    let cwd = dir.path().join("workdir");
-    std::fs::create_dir_all(&cwd).unwrap();
-
-    let payload = serde_json::json!({ "session_id": "s-full", "hook_event_name": "SessionStart", "source": "compact", "cwd": cwd.to_string_lossy() });
-    let mut child = Command::new(env!("CARGO_BIN_EXE_serve"))
-        .arg("--db")
-        .arg(&db)
-        .arg("hook")
-        .current_dir(&cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let _ = child.stdin.take().unwrap().write_all(payload.to_string().as_bytes());
-    let out = child.wait_with_output().unwrap();
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
-    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    let block = json["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+    // What the block leaves free without a tools overview, then a full overview
+    // (one of the extras with a cap of its own) that is longer than that.
+    let bare = compact_start(&db, dir.path(), "s-bare");
+    let _ = sixty_tools_too_long_for(dir.path(), model::item::HOOK_OUTPUT_LIMIT_BYTES - bare.len());
+    let block = compact_start(&db, dir.path(), "s-full");
 
     assert!(block.len() <= model::item::HOOK_OUTPUT_LIMIT_BYTES, "{} bytes", block.len());
     for id in &ids {
@@ -263,9 +246,22 @@ fn fill_the_no_project_line(db: &std::path::Path, dir: &std::path::Path) {
 
 /// A tools folder of 60 tools named in the store's settings; returns its label.
 fn sixty_tools(dir: &std::path::Path) -> String {
-    // A long folder name: the no-project line leaves a little of its reserve free,
-    // and the one-line overview must still be longer than that to be left out.
-    let tools = dir.join("tools-folder-with-a-rather-long-name-so-that-even-the-shortest-overview-line-needs-room-and-does-not-fit-in-what-the-no-project-line-leaves-free");
+    sixty_tools_in(dir, dir.join("tools-folder-with-a-rather-long-name"))
+}
+
+/// Sixty tools in a folder whose full path makes even the one-line overview
+/// longer than the `room` the block has left. The length of a temp folder differs
+/// per system (a Windows one is far longer than `/tmp/.tmpXXXX`), so the name is
+/// padded from the path it really sits in, never from a guess.
+fn sixty_tools_too_long_for(dir: &std::path::Path, room: usize) -> String {
+    let overhead = serve::work_folders::overview_one_line("", 60).len();
+    let wanted_path = room + 1 - overhead.min(room);
+    let prefix = dir.display().to_string().len() + 1;
+    let name = "t".repeat(wanted_path.saturating_sub(prefix).max(10));
+    sixty_tools_in(dir, dir.join(name))
+}
+
+fn sixty_tools_in(dir: &std::path::Path, tools: std::path::PathBuf) -> String {
     for n in 0..60 {
         let tool = tools.join(format!("tool-{n:02}"));
         std::fs::create_dir_all(&tool).unwrap();
@@ -359,10 +355,11 @@ fn with_room_for_one_line_the_overview_is_one_line_that_counts_the_tools() {
 fn with_no_room_the_overview_is_dropped_and_the_drop_is_named() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("store.db");
-    let label = sixty_tools(dir.path());
-    let one = serve::work_folders::overview_one_line(&label, 60);
     let ids = pins_up_to(&db, model::item::NO_PROJECT_STANDING_LIMIT_BYTES);
     fill_the_no_project_line(&db, dir.path());
+    let bare = compact_start(&db, dir.path(), "s-bare");
+    let label = sixty_tools_too_long_for(dir.path(), model::item::HOOK_OUTPUT_LIMIT_BYTES - bare.len());
+    let one = serve::work_folders::overview_one_line(&label, 60);
     let block = compact_start(&db, dir.path(), "s-none");
     assert!(block.len() <= model::item::HOOK_OUTPUT_LIMIT_BYTES, "{} bytes", block.len());
     for id in &ids {
