@@ -253,20 +253,26 @@ Words used once, in plain language:
   conversations. On a yes it runs "install --tidy --plan <file>": each folder is made if needed and gets
   its own memory exactly as "install --topic" does, and each file is moved in. It then stores the lasting
   facts of the old conversations in that subject's memory and, in the Claude desktop app, groups the old
-  conversations per subject in the sidebar.
+  conversations per subject in the sidebar. Each accepted subject other than the one this conversation is in gets a
+  conversation prepared with a one-click card: you never open or pick a folder by hand.
 - It cannot be skipped: a new memory also carries a pinned note, order-earlier-work-once. Once the welcome is
   answered, THOR holds the end of every turn (not the turn that ends on the proposal itself, not a helper's,
   not a headless run, not a copy) until it finds the step settled, and the note cannot be retracted, rewritten
-  or unpinned before. Only evidence THOR checks itself settles it: "serve inventory" finding nothing to order
-  in the real transcripts folder (it writes that record itself), "install --tidy" run after the person's
-  answer, or, for what the person refused, a Report order-earlier-work-answer quoting their own words, which
+  or unpinned before. Only ONE conversation owns this step and is held for it (the first one held for it); any other
+  conversation gets one plain line and is never held, unless the owner has been quiet for 30 minutes, when the next
+  conversation that ends a turn takes it over. The weekly check never waits for it: this note is not one of the rules the check judges. Only evidence THOR checks itself settles it: "serve inventory" finding nothing to order
+  in the real transcripts folder (it writes that record itself; a conversation the desktop app ran without a
+  folder and that left no file that still exists counts as nothing to move, and is only marked as such in the
+  listing), "install --tidy" run after the person's answer (it leaves its record also when every file already
+  lay in its folder and nothing had to move), or, for what the person refused, a Report order-earlier-work-answer quoting their own words, which
   THOR must find in a message they typed after the proposal (the proposal is the first message with a numbered
-  list after the assistant ran the inventory, read from the session record; nothing is added to it). Words with no refusal in them read as a yes; a partly refused answer needs both. An existing
+  list after the assistant ran the inventory, read from the session record; nothing is added to it; a
+  bulleted, bold, quoted or table-shaped numbered list counts too). The quote must be one whole message the person typed after the proposal (not a piece of it), in any words or language (THOR keeps no list of refusal words); a quote that names item numbers refuses only those, and a partly refused answer needs both. A question is not the answer, a tidy run counts only when at least one folder of its plan was accepted, and a loose file that vanished without a tidy run keeps "nothing to order" from being believed. An existing
   memory never gets the note.
 - Why: a new user's first complaint was that Claude puts everything randomly everywhere. New files now
   have a fixed place per subject (the pinned starter note files-go-in-the-folder-of-their-subject).
 - You notice: one message with a numbered list after the welcome; nothing at all when there is nothing
-  to order. No file is ever deleted or overwritten (a taken name gets " (2)", " (3)"). A file outside your
+  to order. No file is ever deleted or overwritten (a taken name gets " (2)", " (3)"). A file that already lies anywhere inside its subject folder stays where it is. A file outside your
   home folder, in a program's own folder or inside a git repository is left where it is. The home folder,
   Desktop, Documents, Downloads, a drive root, application data and program files are refused as folders,
   with a plain reason, and the next item still runs. Every move goes in an undo log (tidy-<date>-<n>.json
@@ -603,7 +609,7 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
 ### C6. What happens inside an evaluation
 - What: THOR writes a start record in its log and freezes three lists: verdicts (notes that fired in this
   session, or in another session of the project, and went 10 sessions
-  without a verdict, the most-served first, at most 5 per evaluation, this session's ahead of the rest, then notes not skipped before, a note skipped as not judgeable waiting behind the others until each has had its turn; a note that
+  without a verdict, the most-served first, a quarter of what could be listed (at least 5 and at most 15 per evaluation, and the start note says how many more wait), this session's ahead of the rest, then notes not skipped before, a note skipped as not judgeable waiting behind the others until each has had its turn; a note that
   fired only in another session shows where and when, and can be skipped with a not-judgeable tag), a
   batch (at most 8 rules only an agent can fix) and an A4 list (at most 16 that only need to name
   their literal), plus disputes to verify (at most 8), the false-block sweep and the crowded places
@@ -612,6 +618,7 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
   where every fact is a heavier refusing rule is never listed; the session start block counts as a
   place too, and is listed first when pinned notes no longer fit in it, see E1). THOR first tries the old rules itself for up to 20 seconds. The assistant gives
   verdicts with the mark tool, makes the named fixes, ends the turn once, then files the report.
+- Pinned notes: the start record also freezes at most 3 pinned notes to re-read (the ones re-read longest ago, none listed or confirmed in the last 30 days, only ones served in the project). A pinned note is the owner's standing choice, so it is never listed for a verdict and never called noise (`mark` refuses a noise mark on it). The assistant reads each one with `get` and confirms it with a useful mark (still right and still needed at every start; it stays pinned; a mark with no `get` of the note in this evaluation is a rubber stamp and settles nothing) or rewrites its text with `revise` (made right, or shorter); the report is held until each has one. An unpin is never asked for, suggested or counted: a note that should not be pinned is for the owner to decide. The `unpin` tool follows his rule that a pinned note comes down only when it is proven out of date, has no use any more and cannot be replaced by a corrected text: it needs a reason of at least 20 characters, is refused while the note's own check holds, it got a useful mark in the last 90 days or it was revised in the last 30 days, and goes through anyway when the reason quotes, between double quotes, one whole message the owner typed in the session (THOR checks that in the hook). The note's id must appear in his message or in the assistant message right before it, and a revise that removes the pin and a retract of a pinned note pass the same gate. Every pinned note taken down through a tool call is listed for him in doctor and in the next evaluation's machine section, saying how it was let through (proven out of date, no check and no recent use, or on his own words).
 - The part "what went wrong and what the owner wants" (item f, the fourth frozen list): THOR also freezes
   a window of the messages the owner typed in the project's main sessions since the previous evaluation
   that counts (the last 7 days when there is none): 20 characters or longer, identical texts once,
@@ -671,6 +678,11 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
 - Why: a rule that can no longer prove itself should not quietly go on being wrong.
 - You notice: a single tidy-up line.
 - Refuse or change: stale-guard-mode.json {"mode": "off"}.
+- Also at a turn end: if a forbidden-text check of a rule held when the turn's first change-capable tool call ran and a change made during the
+  turn by a script (not by an Edit or Write) broke it, the turn is held and names the rule, the file and
+  the text. The way out is to undo the change; if the owner wants it, ask the owner first. It holds at
+  most twice per violation, then says one line and leaves it to the owner. This is not a stale rule, so
+  the stale-rule guard stays out of it.
 
 ### C9. Script files left outside any git repository (only when a tools folder is named)
 - What: only when the owner has named a tools folder (F17). Before a Write, Edit, MultiEdit or

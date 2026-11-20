@@ -117,11 +117,16 @@ fn proposal_lines(at: &str) -> Vec<String> {
     vec![call, text]
 }
 
+fn setup_call(at: &str) -> String {
+    serde_json::json!({"type":"assistant","timestamp":at,"message":{"role":"assistant","content":[{"type":"tool_use","name":"mcp__thor__remember","input":{"id":"owner-setup-answers","kind":"report","text":"Setup finished."}}]}}).to_string()
+}
+
 fn welcome_answered() -> Vec<String> {
     vec![
         person("2026-03-02T10:00:00Z", "Help me with my CV"),
         assistant("2026-03-02T10:01:00Z", "Welcome. Shall I set it up like this?"),
         person("2026-03-02T10:02:00Z", "yes"),
+        setup_call("2026-03-02T10:02:30Z"),
     ]
 }
 
@@ -348,23 +353,41 @@ fn a_quote_that_is_not_in_a_real_message_of_the_person_is_refused() {
     drop(store);
     let v = f.stop();
     assert_eq!(v["decision"], "block", "{v}");
-    assert!(reason_of(&v).contains("none of the quoted words is in a message the person typed"), "{}", reason_of(&v));
+    assert!(reason_of(&v).contains("none of the quoted words is a whole message the person typed"), "{}", reason_of(&v));
     assert!(f.live(ORDER_NOTE_ID));
 }
 
+/// No word list on the refusal route: a refusal in any language, however short
+/// ("not now", "laat maar"), is settled by a Report that quotes the person's own
+/// message exactly. Words that are not in any message of the person still settle nothing.
 #[test]
-fn a_quote_without_a_refusal_word_reads_as_a_yes() {
+fn a_quote_of_any_message_the_person_typed_settles_the_refusal_in_any_language() {
+    for said in ["not now", "laat maar", "skip it", "later", "niks doen"] {
+        let f = Fixture::new();
+        let mut store = f.store(true);
+        let mut t = welcome_answered();
+        t.extend(proposal_lines("2026-03-02T10:03:00Z"));
+        t.push(person("2026-03-02T10:04:00Z", said));
+        f.write_transcript(&t);
+        // Before the Report: held, and the hold names the refusal route in any words.
+        let held = f.stop();
+        assert_eq!(held["decision"], "block", "{said}");
+        assert!(reason_of(&held).contains("in any words or any language"), "{}", reason_of(&held));
+        declare_answer(&mut store, &format!("She said \"{said}\""));
+        drop(store);
+        assert!(f.stop().is_null(), "{said}");
+        assert!(!f.live(ORDER_NOTE_ID), "{said}");
+    }
+    // Words that are in no message of the person settle nothing.
     let f = Fixture::new();
     let mut store = f.store(true);
     let mut t = welcome_answered();
     t.extend(proposal_lines("2026-03-02T10:03:00Z"));
-    t.push(person("2026-03-02T10:04:00Z", "yes, go ahead"));
+    t.push(person("2026-03-02T10:04:00Z", "not now"));
     f.write_transcript(&t);
-    declare_answer(&mut store, "She said \"yes, go ahead\"");
+    declare_answer(&mut store, "She said \"never ever\"");
     drop(store);
-    let v = f.stop();
-    assert_eq!(v["decision"], "block");
-    assert!(reason_of(&v).contains("read as a yes") && reason_of(&v).contains("install --tidy"), "{}", reason_of(&v));
+    assert_eq!(f.stop()["decision"], "block");
 }
 
 #[test]
@@ -393,7 +416,7 @@ fn a_partial_refusal_needs_the_tidy_run_as_well() {
     t.extend(proposal_lines("2026-03-02T10:03:00Z"));
     t.push(person("2026-03-02T10:04:00Z", "yes, but 2 no, because it is private"));
     f.write_transcript(&t);
-    declare_answer(&mut store, "She said \"2 no, because it is private\"");
+    declare_answer(&mut store, "She said \"yes, but 2 no, because it is private\"");
     let v = f.stop();
     assert_eq!(v["decision"], "block");
     assert!(reason_of(&v).contains("install --tidy"), "{}", reason_of(&v));
@@ -405,3 +428,38 @@ fn a_partial_refusal_needs_the_tidy_run_as_well() {
 
 #[allow(dead_code)]
 fn unused(_: &Path) {}
+
+/// A piece of a message is not the message: quoting "Wait" from "Wait, I first want
+/// to think about it" settles nothing; the whole message does.
+#[test]
+fn a_piece_of_a_message_does_not_settle_the_step_but_the_whole_message_does() {
+    for (quote, settles) in [("Wait", false), ("Wait, I first want to think about it", true)] {
+        let f = Fixture::new();
+        let mut store = f.store(true);
+        let mut t = welcome_answered();
+        t.extend(proposal_lines("2026-03-02T10:03:00Z"));
+        t.push(person("2026-03-02T10:04:00Z", "Wait, I first want to think about it"));
+        f.write_transcript(&t);
+        declare_answer(&mut store, &format!("She said \"{quote}\""));
+        drop(store);
+        assert_eq!(f.stop().is_null(), settles, "{quote}");
+        assert_eq!(f.live(ORDER_NOTE_ID), !settles, "{quote}");
+    }
+}
+
+/// A message that holds quote characters, or is one letter, can be quoted whole.
+#[test]
+fn a_message_with_quote_characters_or_one_letter_settles_when_quoted_whole() {
+    for said in ["nee, laat \"Reizen\" maar staan", "n"] {
+        let f = Fixture::new();
+        let mut store = f.store(true);
+        let mut t = welcome_answered();
+        t.extend(proposal_lines("2026-03-02T10:03:00Z"));
+        t.push(person("2026-03-02T10:04:00Z", said));
+        f.write_transcript(&t);
+        declare_answer(&mut store, &format!("She said \"{said}\""));
+        drop(store);
+        assert!(f.stop().is_null(), "{said}");
+        assert!(!f.live(ORDER_NOTE_ID), "{said}");
+    }
+}

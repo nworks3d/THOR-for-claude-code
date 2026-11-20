@@ -146,6 +146,7 @@ fn an_unchecked_write_of_another_session_is_checked_at_this_sessions_stop() {
         session_hint: Some(S2.to_string()),
         inflight: Some(model::store::INFLIGHT_UNSEEN.to_string()),
         side_door: None,
+        unpin: None,
     };
     let seq = model::store::revise_tried_scoped(&mut store, S2, "mcp", "mcp", &before, &after, &before, None, None, None, None, Some(&att))
         .unwrap()

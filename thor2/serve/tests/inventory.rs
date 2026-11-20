@@ -135,7 +135,8 @@ fn json_form_has_the_same_facts() {
     assert_eq!(v["folders"][0]["ordered"], false);
     assert_eq!(v["folders"][1]["ordered"], true);
     assert_eq!(v["folders"][0]["sessions"][0]["prompts"], 2);
-    assert_eq!(v["loose_files"].as_array().unwrap().len(), 2);
+    // The draft in Desktop is gone: only the file that still exists is loose (fix: gone files are dropped).
+    assert_eq!(v["loose_files"].as_array().unwrap().len(), 1);
 }
 
 #[test]

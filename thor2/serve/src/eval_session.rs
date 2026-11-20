@@ -474,6 +474,11 @@ fn candidates(store: &EventStore, project: &str, start: &EvaluationStart, compar
     let live: Vec<crate::live::LiveItem> = crate::live::live_items(store)
         .into_iter()
         .filter(|li| li.item.kind.can_fire() && project::applies_to(li.item.project.as_deref(), Some(project)))
+        // The tidy step's own pinned note is held and settled by its own Stop
+        // hold (`order_debt`); the write gate refuses the machine's trial
+        // write on it until then, so it never belongs on an evaluation's
+        // batch, and never holds an evaluation report.
+        .filter(|li| li.id != model::store::ORDER_NOTE_ID)
         .collect();
     let fired: HashSet<String> = store
         .events_of_kinds(&[EventKind::ItemServed], start.frozen.prev_report_seq)
@@ -1474,6 +1479,7 @@ pub fn nothing_to_do(frozen: &Frozen) -> bool {
             && s.host_wide_failures == 0
     });
     frozen.judgement.is_empty()
+        && frozen.reread.is_empty()
         && frozen.batch().is_empty()
         && frozen.a4_list().is_empty()
         && frozen.dispute_list().is_empty()
@@ -1525,7 +1531,7 @@ pub fn nothing_to_do_line(frozen: &Frozen) -> Option<String> {
     let report_id = report_id_named(frozen);
     let project = &frozen.project;
     Some(format!(
-        "[THOR] NOTHING IS ON THIS EVALUATION'S LISTS (no item to judge, no teeth batch, no A4 list, no dispute, no sweep item, \
+        "[THOR] NOTHING IS ON THIS EVALUATION'S LISTS (no item to judge, no pinned note to re-read, no teeth batch, no A4 list, no dispute, no sweep item, \
          no crowded place, no open point), so you do not have to read the routine file for it. File the report at once with \
          the THOR tool: mcp__thor__remember(id: \"{report_id}\", kind: \"report\", project: \"{project}\", \
          tags: [\"evaluation-report\"], text: \"<one or two plain sentences: nothing was on the lists, so nothing was judged \
@@ -1556,14 +1562,16 @@ fn render_note(id: &str, frozen: &Frozen, caps: &Caps) -> String {
         out.push_str(&format!(
             "{} item(s) that fired in this session, or in another session of this project, \
              and had fired in {}+ sessions since their last verdict (a fact counts once per session; the most-served \
-             first, at most {} per evaluation, the ones this session saw fire ahead of the rest; the rest wait for the next \
-             one): {}. Under each one is where it fired (here or in the other session; its last {per_item} distinct place(s); \
+             first, a quarter of what could be listed - at least {} and at most {} per evaluation - the ones this session \
+             saw fire ahead of the rest; {} more wait for the next evaluation): {}. Under each one is where it fired (here or in the other session; its last {per_item} distinct place(s); \
              mcp__thor__get(id: \"<id>\", fired: true) shows its recent firings). Judge each one by whether it \
              belonged THERE, with the THOR tool itself - a verdict from a shell, a script or another session settles \
              nothing:",
             frozen.judgement.len(),
             model::store::JUDGEMENT_DEBT_AFTER,
-            model::store::EVALUATION_JUDGEMENT_LIST_CAP,
+            model::store::EVALUATION_JUDGEMENT_LIST_MIN,
+            model::store::EVALUATION_JUDGEMENT_LIST_MAX,
+            frozen.judgement_later,
             quoted(&frozen.judgement)
         ));
         for item in frozen.judgement.iter().take(caps.judgement) {
@@ -1584,6 +1592,34 @@ fn render_note(id: &str, frozen: &Frozen, caps: &Caps) -> String {
             "\n   If you cannot judge one honestly, do not guess: add the tag '{}<id>:<reason>' to the report instead.",
             model::store::NOT_JUDGEABLE_TAG_PREFIX
         ));
+    }
+
+    // THE PINNED NOTES TO RE-READ (2026-11-20): shown only when the evaluation
+    // listed any. A re-read, never an unpin.
+    if !frozen.reread.is_empty() {
+        out.push_str(&format!(
+            "\n\n1b. PINNED NOTES TO RE-READ - {} pinned note(s) (at most {} per evaluation, the ones re-read longest ago, \
+             none within {} days of its last re-read): {}. A pinned note is the owner's standing choice, so it is RE-READ \
+             here and never unpinned. WHAT THIS MEANS: it is served at every session start, and nobody has looked at it \
+             for a while. For each one: read it (mcp__thor__get(id: \"<id>\")), check it against the code or the facts it \
+             is about, and do exactly ONE of two things with the THOR tool itself:",
+            frozen.reread.len(),
+            model::store::EVALUATION_REREAD_LIST,
+            model::store::REREAD_MIN_DAYS,
+            quoted(&frozen.reread)
+        ));
+        for item in &frozen.reread {
+            out.push_str(&format!(
+                "\n   - '{item}': mcp__thor__mark(id: \"{item}\") if it is still right and still needed at every session \
+                 start, or mcp__thor__revise(id: \"{item}\", text: \"<its text made right, or shorter>\")"
+            ));
+        }
+        out.push_str(
+            "\n   If you think one should not be pinned at all, say so in your report for the owner and leave it pinned: do \
+             not unpin it, and do not mark it noise (that is refused). A tag, a reason or an unpin settles nothing. The \
+             report is held until each one has a mark or a rewrite, and a mark or a revise of this turn counts once the \
+             turn has ended.",
+        );
     }
 
     out.push_str("\n\n2. TEETH - ");
@@ -2585,14 +2621,15 @@ mod tests {
     }
 
     /// The list stays bounded: however many items owe a verdict, the start
-    /// freezes and shows at most `EVALUATION_JUDGEMENT_LIST_CAP` of them (the
-    /// most-served first, here all equal so by id), and says so.
+    /// freezes and shows a quarter of them, at least `EVALUATION_JUDGEMENT_LIST_MIN`
+    /// and at most `EVALUATION_JUDGEMENT_LIST_MAX` (the most-served first, here
+    /// all equal so by id), and says how many still wait.
     #[test]
     fn a_long_judgement_list_is_cut_to_the_cap() {
         let dir = tempfile::tempdir().unwrap();
         let (db, mut store) = store_with_events(dir.path(), 1);
         let now = crate::time::now_unix();
-        let n = model::store::EVALUATION_JUDGEMENT_LIST_CAP + 4;
+        let n = model::store::EVALUATION_JUDGEMENT_LIST_MIN + 4;
         for i in 0..n {
             let id = format!("fx-long-{i:02}");
             noted_rule(&mut store, &id, model::item::Binding::Target { kind: model::item::TargetKind::Command, value: format!("make t{i}") });
@@ -2601,11 +2638,21 @@ mod tests {
             fire_here(&mut store, "sess", &id, 1, now - 300, Some(&format!("make t{i} --new")));
         }
         let started = start(&db, &mut store, "sess", "p", "stop-ask").unwrap();
-        let cap = model::store::EVALUATION_JUDGEMENT_LIST_CAP;
+        let cap = model::store::judgement_list_cap(n);
+        assert_eq!(cap, model::store::EVALUATION_JUDGEMENT_LIST_MIN, "a small backlog is listed at the minimum");
         let expected: Vec<String> = (0..cap).map(|i| format!("fx-long-{i:02}")).collect();
         assert_eq!(started.start.frozen.judgement, expected, "{n} owed, the first {cap} by id are frozen");
+        assert_eq!(started.start.frozen.judgement_later, n - cap);
         let note = start_note(&started.start);
-        assert!(note.contains(&format!("the most-served first, at most {cap} per evaluation")), "{note}");
+        assert!(
+            note.contains(&format!(
+                "a quarter of what could be listed - at least {} and at most {} per evaluation",
+                model::store::EVALUATION_JUDGEMENT_LIST_MIN,
+                model::store::EVALUATION_JUDGEMENT_LIST_MAX
+            )),
+            "{note}"
+        );
+        assert!(note.contains(&format!("{} more wait for the next evaluation", n - cap)), "the start note says how many still wait: {note}");
         assert!(note.contains("fired here 40 time(s); last at: 'make t0 --new' | 'make t0 --old'"), "{note}");
         assert!(!note.contains(&format!("fx-long-{cap:02}")), "the sixth owed item is not on this evaluation's list: {note}");
     }

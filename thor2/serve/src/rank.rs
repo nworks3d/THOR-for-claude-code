@@ -117,6 +117,65 @@ fn binding_matches(binding: &Binding, input: &ServeInput, item_project: Option<&
     }
 }
 
+/// The place label of one binding (`model::marked::place_label`), the same text
+/// whether it is written into a verdict or compared at serve time. `Always`
+/// is no place: a pinned item is served everywhere and never silenced.
+pub fn binding_place(binding: &Binding) -> Option<String> {
+    match binding {
+        Binding::Always => None,
+        Binding::Moment(action) => Some(model::marked::place_label("moment", &format!("{action:?}"))),
+        Binding::Target { kind, value } => Some(model::marked::place_label(&format!("{kind:?}"), value)),
+    }
+}
+
+/// The places of `item` that `input` reaches: the label of every binding that
+/// matches it, in the item's own order. Empty when the input reaches the item
+/// through none of them (a prompt, a pinned item at session start).
+pub fn matched_places(item: &Item, input: &ServeInput) -> Vec<String> {
+    let commands = command_segments(input);
+    let mut out: Vec<String> = Vec::new();
+    for binding in &item.bindings {
+        if binding_matches(binding, input, item.project.as_deref(), &commands) {
+            if let Some(label) = binding_place(binding) {
+                if !out.contains(&label) {
+                    out.push(label);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The places of `item` that a recorded trigger (the command, tool name or file
+/// a serving was recorded with) reaches: what a noise or useful mark is about
+/// when it names no place of its own. The trigger does not say whether it was a
+/// command or a file, so it is offered as both.
+pub fn places_of_trigger(item: &Item, trigger: &str) -> Vec<String> {
+    let mut input = ServeInput::default();
+    input.add_command(trigger);
+    input.add_file(trigger);
+    matched_places(item, &input)
+}
+
+/// The place label for a place a marker NAMED: one of `item`'s own places, given
+/// either whole (`path:src/lib.rs`) or by its value alone (`src/lib.rs`, slashes
+/// and, on Windows, case as you like). A place the item is not bound to is refused with the
+/// list of the ones it has, because a verdict about a place no serving can ever
+/// reach would silence nothing and say nothing.
+pub fn resolve_place(item: &Item, named: &str) -> Result<String, String> {
+    let wanted = model::marked::place_value(named);
+    let wanted = wanted.as_str();
+    let labels: Vec<String> = item.bindings.iter().filter_map(binding_place).collect();
+    if let Some(found) = labels.iter().find(|l| l.as_str() == wanted || l.split_once(':').is_some_and(|(_, v)| v == wanted)) {
+        return Ok(found.clone());
+    }
+    let have = if labels.is_empty() { "none (it is bound to no place: leave `place` out)".to_string() } else { labels.join(", ") };
+    Err(format!(
+        "'{named}' is not one of the places '{}' is bound to. Its places: {have}. Nothing was recorded. Pass one of them as `place`, or leave `place` out to use the place it last fired in this session",
+        item.id
+    ))
+}
+
 /// THE READ-ONLY RULE (step 32). A call that only looks (`cat`, `grep`, `ls`,
 /// `git diff` ... - `read_only::is_read_only_call`) cannot break what a fact
 /// about CHANGING a file is about, so a fact reached on such a call only

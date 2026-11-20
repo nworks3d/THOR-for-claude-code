@@ -547,7 +547,7 @@ fn fires_for_a_main_session_and_names_the_real_eval_path_when_it_exists() {
     assert!(reason.contains("[THOR]"), "{reason}");
     assert!(reason.contains("This project has had no evaluation in the last 7 day(s)"), "{reason}");
     assert!(reason.contains("This session has worked here for"), "{reason}");
-    let listed = model::store::EVALUATION_JUDGEMENT_LIST_CAP;
+    let listed = model::store::EVALUATION_JUDGEMENT_LIST_MIN;
     assert!(reason.contains(&format!("{listed} item(s) will be on this evaluation's verdict list")), "{reason}");
     assert!(
         reason.contains(&format!("{} more item(s) of this project owe a verdict but are not on this list", OWED_CONTEXT_COUNT - listed)),

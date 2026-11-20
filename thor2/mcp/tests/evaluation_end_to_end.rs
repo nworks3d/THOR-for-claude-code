@@ -100,7 +100,7 @@ fn every_write_reply_names_its_event_seq() {
     assert_eq!(named_seq(&reply), last_of(&s.db, id, EventKind::FactRevised).seq, "revise: {reply}");
     let reply = s.call(&mut mcp, "pin", json!({"id": id}), "toolu_q3");
     assert_eq!(named_seq(&reply), last_of(&s.db, id, EventKind::FactRevised).seq, "pin: {reply}");
-    let reply = s.call(&mut mcp, "unpin", json!({"id": id}), "toolu_q4");
+    let reply = s.call(&mut mcp, "unpin", json!({"id": id, "because": "proven out of date: nothing of it is left and nothing replaces it"}), "toolu_q4");
     assert_eq!(named_seq(&reply), last_of(&s.db, id, EventKind::FactRevised).seq, "unpin: {reply}");
     {
         let mut store = EventStore::open_existing(&s.db).unwrap();
@@ -1117,4 +1117,147 @@ fn a_counting_report_moves_the_cursor_to_the_last_printed_message() {
     assert!(record.valid, "{record:?}");
     assert_eq!(serve::said::cursor_of(&s.db, "demo"), Some(said.through_ms));
     assert!(said.through_ms > 0);
+}
+
+// ------------------------------------------------ pinned notes to re-read (2026-11-20)
+
+/// THE PINNED RE-READ, end to end through the real hook and the tool server: an
+/// evaluation starts and lists a pinned note for re-reading; the report is held
+/// until the note got a useful mark or a rewrite of its text through the tool
+/// server (checked at the Stop); a noise mark on it is refused; an unpin settles
+/// nothing and is refused for lack of a reason; and the report then files and
+/// counts, the machine section naming how it was settled. The note stays pinned.
+#[test]
+fn a_pinned_note_listed_for_re_reading_holds_the_report_until_it_is_confirmed_or_rewritten() {
+    for how in ["mark", "revise"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = Session::new(tmp.path());
+        let id = "pinned-eval-note";
+        let item = Item {
+            id: id.to_string(),
+            kind: Kind::Rule,
+            text: "Always say which folder a command ran in, before and after it.".to_string(),
+            bindings: vec![Binding::Always],
+            severity: None,
+            project: Some("demo".to_string()),
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some("a command ran with no folder named and nobody minded".to_string()),
+            check: None,
+        };
+        seed_raw(&s.db, &item);
+        {
+            let mut store = EventStore::open_existing(&s.db).unwrap();
+            serve::teeth::fixture::decide(&mut store, id);
+            serve::deliver::record_delivery(&mut store, "an-earlier-session", "an-earlier-session", "hook", "2026-09-28T00:00:00Z", &[id.to_string()]);
+        }
+
+        let note = s.prompt("/t-eval");
+        assert!(note.contains("1b. PINNED NOTES TO RE-READ") && note.contains(id), "the start note lists it: {note}");
+        let start = s.open_start("demo").expect("the start record is on the log");
+        assert_eq!(start.frozen.reread, vec![id.to_string()]);
+
+        let mut mcp = s.mcp();
+        // Held: nothing re-read yet.
+        let held = s.call(&mut mcp, "remember", report_args(REPORT, "demo", TLDR), "toolu_file0");
+        assert!(held.starts_with("REFUSED") && held.contains(&format!("'{id}'")) && held.contains("never unpinned"), "{held}");
+        assert!(events_of(&s.db, REPORT).is_empty(), "nothing was written");
+
+        // A noise mark is refused, and so is an unpin with no reason: neither settles it.
+        let noise = s.call(&mut mcp, "mark", json!({"id": id, "noise": true}), "toolu_noise");
+        assert!(noise.starts_with("pinned:") && noise.contains("tell the owner"), "{noise}");
+        let unpin = s.call(&mut mcp, "unpin", json!({"id": id}), "toolu_unpin");
+        assert!(unpin.starts_with("REFUSED") && unpin.contains("needs `because`"), "{unpin}");
+        s.stop();
+        let still_held = s.call(&mut mcp, "remember", report_args(REPORT, "demo", TLDR), "toolu_file1");
+        assert!(still_held.starts_with("REFUSED") && still_held.contains(&format!("'{id}'")), "{still_held}");
+
+        // The re-read: a useful mark after reading the note with get, or a rewrite of the text.
+        let done = if how == "mark" {
+            // A rubber stamp first: a mark with no read of the note settles nothing, and the
+            // hold says to read the note with get.
+            let stamped = s.call(&mut mcp, "mark", json!({"id": id}), "toolu_mark");
+            assert!(stamped.starts_with("marked useful"), "{stamped}");
+            s.stop();
+            let unread = s.call(&mut mcp, "remember", report_args(REPORT, "demo", TLDR), "toolu_file1b");
+            assert!(unread.starts_with("REFUSED") && unread.contains("rubber stamp") && unread.contains("read the note with get"), "{unread}");
+            assert!(events_of(&s.db, REPORT).is_empty(), "nothing was written");
+            let read = s.call(&mut mcp, "get", json!({"id": id}), "toolu_get");
+            assert!(read.contains(id), "{read}");
+            read
+        } else {
+            s.call(&mut mcp, "revise", json!({"id": id, "text": "Say which folder a command ran in."}), "toolu_revise")
+        };
+        assert!(done.contains(id) || done.starts_with("revised"), "{done}");
+        s.stop();
+        let filed = s.call(&mut mcp, "remember", report_args(REPORT, "demo", TLDR), "toolu_file2");
+        assert!(filed.starts_with(&format!("stored '{REPORT}'")), "{how}: {filed}");
+        assert!(s.stop().trim().is_empty(), "the report counts, so the Stop is silent");
+
+        let store = EventStore::open_existing(&s.db).unwrap();
+        let record = serve::eval_filing::current_validation(&store, REPORT).expect("validated at the Stop");
+        assert!(record.valid, "{how}: {record:?}");
+        let report = model::store::show(&store, REPORT).unwrap().text;
+        assert!(report.contains("PINNED RE-READ: 1 pinned note(s)"), "{report}");
+        let line = if how == "mark" { "confirmed - useful mark" } else { "rewritten - revise of its text" };
+        if how == "mark" {
+            assert!(report.contains("after reading it with get"), "{report}");
+        }
+        assert!(report.contains(&format!("'{id}': {line}")), "{report}");
+        assert!(model::store::show(&store, id).unwrap().bindings.contains(&Binding::Always), "it stays pinned");
+    }
+}
+
+/// A FORGED OWNER WITNESS (review round): the record of what the owner said is a plain
+/// file beside the memory, so the hook refuses every Edit, Write or shell call that
+/// names it, and a record that is not this session's, this note's, this reason's and
+/// fresh exempts nothing. Whatever still slips past is listed for the owner.
+#[test]
+fn a_forged_owner_witness_is_refused_and_the_hook_will_not_write_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Session::new(tmp.path());
+    let id = "pinned-forge";
+    let item = Item {
+        id: id.to_string(),
+        kind: Kind::Rule,
+        text: "Always say which folder a command ran in, before and after it.".to_string(),
+        bindings: vec![Binding::Always, Binding::Target { kind: TargetKind::Path, value: "src/forge.rs".to_string() }],
+        severity: None,
+        project: Some("demo".to_string()),
+        tags: vec![],
+        expires: None,
+        key: None,
+        falsifier: Some("a command ran with no folder named and nobody minded".to_string()),
+        check: None,
+    };
+    seed_raw(&s.db, &item);
+    {
+        // In use: marked useful today.
+        let mut store = EventStore::open_existing(&s.db).unwrap();
+        let body = format!("{{\"marked_at\":\"{}\"}}", serve::time::now_iso8601());
+        store.append_event("s", "l", "mcp", EventKind::ItemMarkedUseful, id, None, &body).unwrap();
+    }
+    let file = s.db.with_file_name(serve::unpin_gate::PROTECTED_FILE);
+    let hook = |payload: Value| -> Value { serde_json::from_str(&s.hook(payload)).unwrap_or(Value::Null) };
+    // The hook refuses a Write, an Edit and a shell command that name the file.
+    for (tool, input) in [
+        ("Write", json!({"file_path": file, "content": "[]"})),
+        ("Edit", json!({"file_path": file, "old_string": "a", "new_string": "b"})),
+        ("Bash", json!({"command": format!("echo [] > {}", file.display())})),
+    ] {
+        let out = hook(json!({"hook_event_name": "PreToolUse", "session_id": s.id, "cwd": s.cwd, "transcript_path": s.transcript, "tool_name": tool, "tool_input": input}));
+        assert_eq!(out["decision"], "block", "{tool}: {out}");
+        assert!(out["reason"].as_str().unwrap_or_default().contains("Nothing was changed"), "{out}");
+    }
+    // A forged record (written by hand, here) for ANOTHER session is useless: the unpin is refused.
+    let because = "the owner asked for it: \"Haal pinned-forge maar los, het is verouderd.\"";
+    let forged = json!([{ "id": id, "because": serve::order_earlier::plain(because), "session": "another-session", "at": serve::time::now_unix() }]);
+    std::fs::write(&file, forged.to_string()).unwrap();
+    let mut mcp = s.mcp();
+    let refused = s.call(&mut mcp, "unpin", json!({"id": id, "because": because}), "toolu_forged");
+    assert!(refused.starts_with("REFUSED") && refused.contains("useful mark in the last 90 days"), "{refused}");
+    assert!(model::store::show(&EventStore::open_existing(&s.db).unwrap(), id).unwrap().bindings.contains(&Binding::Always));
+    // Nothing was taken down, so nothing is listed.
+    assert!(model::store::tool_unpins(&EventStore::open_existing(&s.db).unwrap(), 0, i64::MAX).is_empty());
 }

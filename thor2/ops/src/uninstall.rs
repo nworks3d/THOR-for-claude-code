@@ -364,6 +364,12 @@ impl PhaseTwoReport {
 /// sidecars), which is the person's own everyday knowledge and not part of the
 /// work memory; any other folder only loses the files named after the memory
 /// file.
+/// THOR's own files of the tidy step beside the memory: who owns the step, the
+/// snapshot of loose files taken at the install, and the undo logs of tidy runs.
+fn is_tidy_sidecar(name: &str) -> bool {
+    name == "order-owner.json" || name == "loose-snapshot.json" || crate::tidy::is_undo_log_name(name)
+}
+
 fn memory_entries(db: &Path) -> Vec<PathBuf> {
     let Some(dir) = db.parent() else { return Vec::new() };
     let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
@@ -377,7 +383,7 @@ fn memory_entries(db: &Path) -> Vec<PathBuf> {
             if own_folder {
                 name != "backup-repo" && !name.starts_with("library.db")
             } else {
-                name.starts_with(&stem)
+                name.starts_with(&stem) || is_tidy_sidecar(&name)
             }
         })
         .collect()
@@ -418,6 +424,9 @@ pub fn phase_two(
             }
         }
     } else if let Some(dir) = targets.db.parent() {
+        // The memory stays, but who owns the tidy step is a note about a session
+        // that is over: only that file goes.
+        let _ = std::fs::remove_file(dir.join("order-owner.json"));
         report.memory_kept = Some(dir.to_path_buf());
     }
     Ok(report)
@@ -589,6 +598,9 @@ mod tests {
         std::fs::write(data.join("thor.db-wal"), b"wal").unwrap();
         std::fs::write(data.join("work-folders.json"), b"{}").unwrap();
         std::fs::write(data.join("library.db"), b"recipes").unwrap();
+        std::fs::write(data.join("order-owner.json"), b"{}").unwrap();
+        std::fs::write(data.join("loose-snapshot.json"), b"[]").unwrap();
+        std::fs::write(data.join("tidy-2026-11-19-1.json"), b"{}").unwrap();
         let t = Targets {
             settings: dir.join("settings.json"),
             claude_json: dir.join(".claude.json"),
@@ -618,6 +630,9 @@ mod tests {
         let none = FakeProcesses(RefCell::new(vec![]));
         let report = phase_two(&t, dir.path(), false, &none).unwrap();
         assert!(t.db.exists(), "the memory stays without --delete-memory");
+        let data = t.db.parent().unwrap();
+        assert!(!data.join("order-owner.json").exists(), "only the owner file of the tidy step goes when the memory stays");
+        assert!(data.join("loose-snapshot.json").exists() && data.join("tidy-2026-11-19-1.json").exists());
         assert!(report.memory_deleted.is_empty() && report.memory_kept.is_some());
         assert_eq!(report.backup_copies_removed.len(), 2);
         assert!(!dir.path().join("settings.json.bak").exists() && !dir.path().join(".claude.json.bak").exists());
@@ -631,11 +646,38 @@ mod tests {
         let t = data_dir_with_memory(dir.path());
         let none = FakeProcesses(RefCell::new(vec![]));
         let report = phase_two(&t, dir.path(), true, &none).unwrap();
-        assert_eq!(report.memory_deleted.len(), 3, "{report:?}");
+        assert_eq!(report.memory_deleted.len(), 6, "{report:?}");
         let data = t.db.parent().unwrap();
         assert!(!t.db.exists() && !data.join("thor.db-wal").exists() && !data.join("work-folders.json").exists());
+        for side in ["order-owner.json", "loose-snapshot.json", "tidy-2026-11-19-1.json"] {
+            assert!(!data.join(side).exists(), "{side} goes with the memory");
+        }
         assert!(data.join("backup-repo").exists(), "the safety copies are never deleted by this");
         assert!(data.join("library.db").exists(), "the personal library is not the work memory and stays");
+    }
+
+    #[test]
+    fn phase_two_deletes_the_tidy_sidecars_in_a_folder_not_named_thor2_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("thor.db"), b"memory").unwrap();
+        std::fs::write(data.join("order-owner.json"), b"{}").unwrap();
+        std::fs::write(data.join("loose-snapshot.json"), b"[]").unwrap();
+        std::fs::write(data.join("tidy-2026-11-19-1.json"), b"{}").unwrap();
+        std::fs::write(data.join("notes.txt"), b"mine").unwrap();
+        std::fs::write(data.join("tidy-plan-for-friday.json"), b"mine too").unwrap();
+        std::fs::write(dir.path().join("settings.json"), "{}").unwrap();
+        let t = Targets { settings: dir.path().join("settings.json"), claude_json: dir.path().join(".claude.json"), eval_command: None, db: data.join("thor.db") };
+        let none = FakeProcesses(RefCell::new(vec![]));
+        phase_two(&t, dir.path(), true, &none).unwrap();
+        for gone in ["thor.db", "order-owner.json", "loose-snapshot.json", "tidy-2026-11-19-1.json"] {
+            assert!(!data.join(gone).exists(), "{gone}");
+        }
+        assert!(data.join("notes.txt").exists(), "a folder that is not THOR's own keeps what is not THOR's");
+        assert!(data.join("tidy-plan-for-friday.json").exists(), "only THOR's exact undo log name goes, not any tidy-*.json");
+        assert!(crate::tidy::is_undo_log_name("tidy-2026-11-19-12.json") && crate::tidy::is_undo_log_name("tidy-2026-11-19-1.undone.json"));
+        assert!(!crate::tidy::is_undo_log_name("tidy-plan.json") && !crate::tidy::is_undo_log_name("tidy-2026-11-19-x.json") && !crate::tidy::is_undo_log_name("tidy-26-11-19-1.json"));
     }
 
     #[test]

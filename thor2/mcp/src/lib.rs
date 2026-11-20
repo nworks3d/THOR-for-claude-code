@@ -112,6 +112,11 @@ const ACTOR: &str = "mcp";
 /// server Claude Code starts writes under its session hint instead (step 12).
 const NO_SESSION: &str = "mcp";
 
+/// What a copy (replica) says when a take-down of a pinned note is queued: the
+/// owner's own words can only be witnessed in a session on the main machine.
+const REPLICA_TAKEDOWN_NOTE: &str = "A pinned note comes down on the main machine only: the owner's own words cannot be \
+     witnessed from a copy, so this is judged there, by the same rule (proven out of date and unused).";
+
 /// A write call's arguments exactly as they arrived, cloned before
 /// `Parameters<T>` takes them - so the schema stays generated from `T`, and
 /// the digest is of what the client really sent (step 12: the transcript's
@@ -1357,7 +1362,6 @@ fn normalized_item(item: &Item) -> Item {
 /// that can refuse (or is marked expensive) is a weakening the store asks a
 /// reason for, and this tool exists to do exactly that one thing - so the
 /// reason is the tool's own, written into the item's history.
-const UNPIN_BECAUSE: &str = "unpinned with the unpin tool: the Always binding was removed on purpose, every other binding stays";
 
 /// THE FILING CONTEXT of a write that files an evaluation report (step 15,
 /// K21, F2), or the refusal of one that cannot count. `before` is the head a
@@ -1605,7 +1609,9 @@ fn plan_revise(existing: &Item, args: &ReviseArgs) -> Result<RevisePlan, String>
         build_bindings(
             args.moments.as_deref().unwrap_or(&[]),
             args.targets.as_deref().unwrap_or(&[]),
-            args.always.unwrap_or(false),
+            // A revise that does not mention `always` KEEPS the pin: only an explicit
+            // `always: false` (or the unpin tool) takes it off, and both pass the owner's rule.
+            args.always.unwrap_or_else(|| existing.bindings.contains(&Binding::Always)),
         )
         .map_err(|e| format!("invalid binding: {e}"))?
     } else {
@@ -2016,8 +2022,10 @@ fn write_binding_change(
     because: Option<&str>,
     verb: &str,
     stamp: &Stamp,
+    unpin: Option<model::store::UnpinStamp>,
 ) -> Result<String, String> {
-    let att = stamp.att();
+    let mut att = stamp.att();
+    att.unpin = unpin;
     refuse_a_side_door_on_a_frozen_item(store, &existing.id, &att)?;
     model::gate::revise(&normalized_item(existing), &normalized_item(updated))
         .map_err(|r| format!("REFUSED: {}", model::store::WriteError::Refused(r)))?;
@@ -2350,9 +2358,11 @@ pub struct ReviseArgs {
     /// check instead.
     #[serde(default)]
     pub clear_check: bool,
-    /// Replaces the moment bindings. Give this, `targets`, and/or `always`
-    /// TOGETHER to replace the WHOLE binding list in one call - when none of
-    /// the three are given, the existing bindings are kept untouched. See
+    /// Replaces the moment bindings. Give this and/or `targets` to replace the
+    /// moment and target bindings in one call - when neither is given, the
+    /// existing bindings are kept untouched. A pinned note STAYS pinned unless
+    /// `always` says false: the pin comes down only by `always: false` or the
+    /// unpin tool, and both pass the owner's unpin rule. See
     /// RememberArgs' own note on which moments actually fire - a NEW answer/
     /// claim_done binding is refused here too, though one the item already
     /// carried stays correctable.
@@ -2420,6 +2430,12 @@ pub struct PinArgs {
 pub struct UnpinArgs {
     /// The id to unpin (remove the Always binding from it).
     pub id: String,
+    /// Why, in one sentence of at least 20 characters: that the note is proven
+    /// out of date, has no use any more and cannot be replaced by a corrected
+    /// text. Kept in the note's history. When the OWNER asked for the unpin, put
+    /// his whole message here between double quotes.
+    #[serde(default)]
+    pub because: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -2536,6 +2552,54 @@ pub struct ShelveArgs {
     pub retire_because: Option<String>,
 }
 
+/// What a recorded verdict did, in plain words: where it applies and what one
+/// more of it would do. Read back from the store, so it is what decay will see.
+fn mark_reply(store: &EventStore, id: &str, noise: bool, place: Option<&str>, pinned: bool, can_refuse: bool) -> String {
+    let tally = serve::decay::DecayContext::load(store).tally_of(id);
+    let silenced_everywhere = tally.placeless >= serve::decay::NOISE_MARKS_BEFORE_STALE
+        || tally.places.len() >= serve::decay::NOISE_PLACES_BEFORE_GLOBAL;
+    if noise && can_refuse {
+        let at = place.map(|p| format!(" at {p}")).unwrap_or_default();
+        return format!(
+            "marked noise: {id}{at} - recorded, but this rule's check can refuse, so it is never silenced, at any place; it stays shown"
+        );
+    }
+    if noise {
+        match place {
+            Some(place) if silenced_everywhere => format!(
+                "marked noise: {id} at {place} - with its other noise marks since the last useful mark it is no longer shown \
+                 anywhere (noise at {} different places); it stays findable via lookup",
+                tally.places.len()
+            ),
+            Some(place) if tally.at(place) >= serve::decay::NOISE_MARKS_BEFORE_STALE => format!(
+                "marked noise: {id} at {place} - it is no longer shown for {place} (it stays shown everywhere else, and \
+                 findable via lookup); a useful mark at {place}, or a change to its text, check or bindings, brings it back there"
+            ),
+            Some(place) => format!(
+                "marked noise: {id} at {place} - one more noise mark for {place} silences it there; it is still shown \
+                 everywhere else (noise at {} different places silences it everywhere)",
+                serve::decay::NOISE_PLACES_BEFORE_GLOBAL
+            ),
+            None => format!(
+                "marked noise: {id} (no place of its own: it fired nowhere this session that could be named, so this counts for \
+                 everywhere - {}+ of these, with no mark of usefulness, retires it from the injection surfaces; it stays findable \
+                 via lookup. Pass place: \"<one of its places>\" to mark one place only)",
+                serve::decay::NOISE_MARKS_BEFORE_STALE
+            ),
+        }
+    } else {
+        let pinned_note = if pinned { " - a pinned note re-read and confirmed: it stays pinned" } else { "" };
+        match place {
+            Some(place) => format!(
+                "marked useful: {id} at {place} (clears the noise recorded for {place} before it; the noise at other places stands){pinned_note}"
+            ),
+            None => format!(
+                "marked useful: {id} (clears the noise recorded before it, at every place; a later noise mark still counts){pinned_note}"
+            ),
+        }
+    }
+}
+
 #[derive(Deserialize, Serialize, schemars::JsonSchema)]
 pub struct MarkArgs {
     /// The id of the item being judged.
@@ -2545,6 +2609,13 @@ pub struct MarkArgs {
     /// from the injection surfaces; it stays fully findable via lookup.
     #[serde(default)]
     pub noise: bool,
+    /// The PLACE this verdict is about: a path, directory, command, tool or
+    /// moment the item is bound to (one of the places a `get` shows). Left out,
+    /// it is the place the item last fired in THIS session. Two noise marks at
+    /// the same place silence the item there only; a useful mark at a place
+    /// clears that place's noise marks only.
+    #[serde(default)]
+    pub place: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -3098,7 +3169,7 @@ impl ThorMcpServer {
         .await
     }
 
-    #[tool(description = "Code lane: corrects an EXISTING item by id through the same write gate as remember; the body changes in exactly ONE way per call - text (the whole new body), append (words added to the end) or replace_from with replace_to (one phrase swapped), never two of them together (refused, nothing changed: make two calls instead); a field left unmentioned keeps its current value, and none may silently vanish - clear one with clear_severity/clear_project/clear_expires/clear_key/clear_falsifier/clear_check; an empty string on the field is the harness-only equivalent, and a flag plus a real value for that field is refused. Weakening a checked rule (its check, severity, a binding, or scope) needs because: one sentence, kept in history. On a replica this queues instead of writing ('queued for the main machine' is not an error). Prefer this over remember for an existing item that merely changed; retract, with its own reason, is for one that is simply wrong. Refuses, with the exact reason, on remember's grounds (a secret token newly written into the text or falsifier included), plus a dropped field or an unexplained weakening. A revise that changes its text, anchors, check, project or severity is tried again (a revise naming only the id tries a rule no trial has decided yet); one that changes only tags, falsifier, expires or key keeps its verdict. Replies with the revised id and event sequence, or the refusal text.", annotations(title = "Revise an item", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false))]
+    #[tool(description = "Code lane: corrects an EXISTING item by id through the same write gate as remember; the body changes in exactly ONE way per call - text (the whole new body), append (words added to the end) or replace_from with replace_to (one phrase swapped), never two of them together (refused, nothing changed: make two calls instead); a field left unmentioned keeps its current value, and none may silently vanish - clear one with clear_severity/clear_project/clear_expires/clear_key/clear_falsifier/clear_check; an empty string on the field is the harness-only equivalent, and a flag plus a real value for that field is refused. A revise that gives moments or targets without `always` KEEPS the pin; only `always: false` (or the unpin tool) takes it off, and both pass the owner's unpin rule. Weakening a checked rule (its check, severity, a binding, or scope) needs because: one sentence, kept in history. On a replica this queues instead of writing ('queued for the main machine' is not an error). Prefer this over remember for an existing item that merely changed; retract, with its own reason, is for one that is simply wrong. Refuses, with the exact reason, on remember's grounds (a secret token newly written into the text or falsifier included), plus a dropped field or an unexplained weakening. A revise that changes its text, anchors, check, project or severity is tried again (a revise naming only the id tries a rule no trial has decided yet); one that changes only tags, falsifier, expires or key keeps its verdict. Replies with the revised id and event sequence, or the refusal text.", annotations(title = "Revise an item", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false))]
     async fn revise(&self, meta: Meta, raw: RawArgs, Parameters(args): Parameters<ReviseArgs>) -> String {
         if self.inbox.is_some() {
             let judged = {
@@ -3109,8 +3180,15 @@ impl ThorMcpServer {
                 return refused;
             }
         }
+        let replica_takedown = self.inbox.is_some() && {
+            let store = self.store.lock().unwrap_or_else(|p| p.into_inner());
+            model::store::show(&store, &args.id).ok().is_some_and(|existing| {
+                serve::unpin_gate::is_pinned(&existing.bindings)
+                    && plan_revise(&existing, &args).is_ok_and(|plan| !serve::unpin_gate::is_pinned(&plan.updated.bindings))
+            })
+        };
         if let Some(queued) = self.capture("revise", &args) {
-            return queued;
+            return if replica_takedown { format!("{queued} {REPLICA_TAKEDOWN_NOTE}") } else { queued };
         }
         let stamp = self.stamp("revise", meta, raw);
         // The checkout this server was started in, for the worktree check and
@@ -3137,9 +3215,24 @@ impl ThorMcpServer {
             refuse_an_open_point_tag(args.tags.as_deref().unwrap_or(&[]), Some(&existing))?;
             // A side-door call on an item an open evaluation froze: refused
             // before anything is tried or written (step 15, D10).
-            let att = stamp.att();
+            let mut att = stamp.att();
             refuse_a_side_door_on_a_frozen_item(s, &args.id, &att)?;
             let RevisePlan { mut updated, mut gate_existing, tags_cleared, dropped_reasons, bare } = plan_revise(&existing, &args)?;
+            // A revise that removes the pin takes the note down like the unpin tool does, and
+            // passes the very same gate (`serve::unpin_gate`).
+            if serve::unpin_gate::is_pinned(&existing.bindings) && !serve::unpin_gate::is_pinned(&updated.bindings) {
+                let root = revise_root.as_deref().cloned().or_else(|| std::env::current_dir().ok()).unwrap_or_default();
+                let (_, stamped) = serve::unpin_gate::judge(
+                    s,
+                    &existing,
+                    args.because.as_deref(),
+                    &root,
+                    session.session_id.as_deref(),
+                    serve::time::now_unix(),
+                    serve::unpin_gate::Takedown::Revise,
+                )?;
+                att.unpin = Some(stamped);
+            }
             // A filed evaluation report keeps THOR's machine section (step
             // 15): a `text` that carries no section header is the writer's
             // own new TLDR and remarks, stored below the section as it
@@ -3293,7 +3386,7 @@ impl ThorMcpServer {
     /// any binding at all is refused there, exactly as it is for `remember`),
     /// and both are tried like any revise: the binding is the rule's reach
     /// (`write_binding_change`).
-    #[tool(description = "Code lane: adds the Always binding to an existing item, so it is served in full at every session start; every other binding and field stays untouched. A pinned item owes no verdict from that point on - mark refuses it and points back here to unpin. Use revise instead when anything besides the binding needs to change. Idempotent - pinning an already-pinned item changes nothing and is not an error. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refused, loudly, when the item's kind may carry no binding at all (a Report or Chunk). Replies 'pinned' with the event sequence, 'already pinned', or the refusal text.", annotations(title = "Pin an item", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
+    #[tool(description = "Code lane: adds the Always binding to an existing item, so it is served in full at every session start; every other binding and field stays untouched. A pinned item owes no verdict from that point on: it is never called noise (mark refuses that) and the weekly evaluation only has it re-read - confirmed with a useful mark or rewritten with revise - never unpinned; unpinning is the owner's call. Use revise instead when anything besides the binding needs to change. Idempotent - pinning an already-pinned item changes nothing and is not an error. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refused, loudly, when the item's kind may carry no binding at all (a Report or Chunk). Replies 'pinned' with the event sequence, 'already pinned', or the refusal text.", annotations(title = "Pin an item", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn pin(&self, meta: Meta, raw: RawArgs, Parameters(args): Parameters<PinArgs>) -> String {
         if let Some(queued) = self.capture("pin", &args) {
             return queued;
@@ -3308,24 +3401,38 @@ impl ThorMcpServer {
             }
             let mut updated = existing.clone();
             updated.bindings.push(Binding::Always);
-            write_binding_change(s, &corpus, &session, &existing, &updated, None, "pinned", &stamp)
+            write_binding_change(s, &corpus, &session, &existing, &updated, None, "pinned", &stamp, None)
         })
         .await
     }
 
-    #[tool(description = "Code lane: removes the Always binding from an existing item; every other binding and field stays untouched. Use revise instead when anything besides the binding needs to change. Idempotent - unpinning an item with no Always binding changes nothing and is not an error. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refused, loudly, when removing Always would leave the item with no binding left to ever fire on - give it a Moment or Target binding first, or leave it pinned. Replies 'unpinned' with the event sequence, 'already unpinned', or the refusal text.", annotations(title = "Unpin an item", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
+    #[tool(description = "Code lane: removes the Always binding from an existing item; every other binding and field stays untouched. THE OWNER'S RULE: a pinned note is the owner's standing choice and comes down only when it is proven out of date, has no use any more and cannot be replaced by a corrected text. `because` is required (one sentence, at least 20 characters, kept in the note's history). The unpin is REFUSED, with nothing written, while the note carries a check that holds right now, got a useful mark in the last 90 days, or was revised in the last 30 days; revise its text instead. When the owner himself asked for it, put his whole message in `because` between double quotes: THOR checks it against what he typed in this session (the note's id must appear in that message or in the assistant message right before it), and then the unpin goes through. A revise that removes the pin and a retract of a pinned note pass the same gate. EVERY pinned note taken down through a tool call is listed for the owner, saying how it was let through. Use revise instead when anything besides the binding needs to change. Idempotent - unpinning an item with no Always binding changes nothing and is not an error. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refused, loudly, when removing Always would leave the item with no binding left to ever fire on - give it a Moment or Target binding first, or leave it pinned. Replies 'unpinned' with the event sequence, 'already unpinned', or the refusal text.", annotations(title = "Unpin an item", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn unpin(&self, meta: Meta, raw: RawArgs, Parameters(args): Parameters<UnpinArgs>) -> String {
         if let Some(queued) = self.capture("unpin", &args) {
-            return queued;
+            return format!("{queued} {REPLICA_TAKEDOWN_NOTE}");
         }
         let stamp = self.stamp("unpin", meta, raw);
         let corpus = self.corpus.clone();
         let session = self.session.clone();
+        let root = self.root.clone();
         self.blocking(move |s| {
             let existing = model::store::show(s, &args.id).map_err(|e| format!("cannot unpin: {e}"))?;
             if !existing.bindings.contains(&Binding::Always) {
                 return Ok(format!("already unpinned: '{}' (no Always binding present)", existing.id));
             }
+            // THE OWNER'S RULE (`serve::unpin_gate`): a reason first, then proof that the
+            // note is out of date and unused - or the owner's own words, which only the
+            // hook can check against the transcript and leaves a record of.
+            let root = root.as_deref().cloned().or_else(|| std::env::current_dir().ok()).unwrap_or_default();
+            let (because, stamped) = serve::unpin_gate::judge(
+                s,
+                &existing,
+                args.because.as_deref(),
+                &root,
+                session.session_id.as_deref(),
+                serve::time::now_unix(),
+                serve::unpin_gate::Takedown::Unpin,
+            )?;
             let remaining: Vec<Binding> = existing.bindings.iter().filter(|b| **b != Binding::Always).cloned().collect();
             if remaining.is_empty() {
                 return Err(format!(
@@ -3338,7 +3445,7 @@ impl ThorMcpServer {
             }
             let mut updated = existing.clone();
             updated.bindings = remaining;
-            write_binding_change(s, &corpus, &session, &existing, &updated, Some(UNPIN_BECAUSE), "unpinned", &stamp)
+            write_binding_change(s, &corpus, &session, &existing, &updated, Some(&because), "unpinned", &stamp, Some(stamped))
         })
         .await
     }
@@ -3359,7 +3466,7 @@ impl ThorMcpServer {
         .await
     }
 
-    #[tool(description = "Code lane: searches THOR's memory - every project, archive kinds (Report, Chunk) included - never scoped to only the current project. Call this before remember, so an existing near-duplicate becomes a revise instead. No arguments returns the catalogue of scopes; scope alone lists everything filed there; scope with query narrows a search to it; query alone searches everywhere; key answers only a Lookup item's own exact key (query, scope and kind are then ignored); kind narrows a search to rule, orientation, report or chunk - several at once with a comma, and 'fires' as shorthand for every kind that can fire at a moment, which is what you want when the fact has to steer an action (case-insensitive, an obvious plural such as 'rules' accepted) - without it, Report hits tend to dominate a plain search since their own text runs long, and asking for kind lookup is refused rather than silently answered empty, since a Lookup register only ever answers to its own key. Read-only, and never an injection surface - nothing here reaches you unprompted. A query word is looked for in an item's text, tags and id: an id is read as words only when it is a readable slug and the word has 4 or more letters, or when the word is the whole id (so a machine-made id can be pasted whole); a hit found only by its id comes after the others. When no item holds the exact words, a multi-word query is tried again with each long word matched by its first letters (other word forms), and the reply says so in one line. Replies with up to 25 matching lines (id, kind, text) and how many more exist, the catalogue, or a plain 'no matches'. The whole reply stays near 20000 characters: a long body (a Report) is cut to its first part and says to use get with its id for the rest, short rules stay whole, and the reply ends with how many were cut.", annotations(title = "Search the memory", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
+    #[tool(description = "Code lane: searches THOR's memory - every project, archive kinds (Report, Chunk) included - never scoped to only the current project. Call this before remember, so an existing near-duplicate becomes a revise instead. No arguments returns the catalogue of scopes; scope alone lists everything filed there; scope with query narrows a search to it; query alone searches everywhere; key answers only a Lookup item's own exact key (query, scope and kind are then ignored); kind narrows a search to rule, orientation, report or chunk - several at once with a comma, and 'fires' as shorthand for every kind that can fire at a moment, which is what you want when the fact has to steer an action (case-insensitive, an obvious plural such as 'rules' accepted) - without it, Report hits tend to dominate a plain search since their own text runs long, and asking for kind lookup is refused rather than silently answered empty, since a Lookup register only ever answers to its own key. Read-only, and never an injection surface - nothing here reaches you unprompted. A query word is looked for in an item's text, tags and id: an id is read as words only when it is a readable slug and the word has 4 or more letters, or when the word is the whole id (so a machine-made id can be pasted whole); a hit found only by its id comes after the others. When no item holds the exact words, a multi-word query is tried again with each long word matched by its first letters (other word forms), and the reply says so in one line. A lookup with no clear hit is not an answer: check the project's own files, and say 'not found' rather than guess. Replies with up to 25 matching lines (id, kind, text) and how many more exist, the catalogue, or a plain 'no matches'. The whole reply stays near 20000 characters: a long body (a Report) is cut to its first part and says to use get with its id for the rest, short rules stay whole, and the reply ends with how many were cut.", annotations(title = "Search the memory", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn lookup(&self, Parameters(args): Parameters<LookupArgs>) -> String {
         let vectors = self.vectors.clone();
         #[cfg(feature = "semantic")]
@@ -3518,6 +3625,12 @@ impl ThorMcpServer {
                     out.push('\n');
                 }
             }
+            // No literal answer (no matches, meaning-only or stem-only hits):
+            // a memory search is one source, not the end of the road.
+            if let Some(hint) = serve::lookup::look_in_files_hint(hits.is_empty(), literal_found_any, stems_only) {
+                out.push_str(hint);
+                out.push('\n');
+            }
             if hits.len() > MAX_HITS {
                 out.push_str(&format!(
                     "({} more match(es) not shown, of {} in total. Add a word to narrow it, or ask for one by id with get.)\n",
@@ -3669,7 +3782,7 @@ impl ThorMcpServer {
         }
     }
 
-    #[tool(description = "Code lane: judges an item you were served or looked up. Default records that it HELPED, which clears noise recorded before it (a later noise mark still counts - the newest verdict wins). Pass noise:true for the opposite; two noise marks since the last useful one (or since the last change to its text, check or bindings) retire the item from the injection surfaces, though it stays fully findable via lookup; a rule whose check can refuse is never retired this way. A second call THIS SESSION for the same id with the same verdict writes nothing and says so, unless the earlier one was set aside by the Stop (not an attested THOR call), in which case it is written again and the reply says why, or unless the item fired in 10 more sessions since, in which case it is owed again and written; a different verdict is written and the earlier one is named in the reply. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refused when the item is not live (retracted or archived) - there is nothing to judge. Also refused, with nothing written, when the item is pinned (Always-bound): the owner already answered by pinning it, so a verdict changes nothing - unpin it first if it should be judged instead. Replies with the verdict recorded and its event sequence, or the refusal text.", annotations(title = "Record a verdict", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false))]
+    #[tool(description = "Code lane: judges an item you were served or looked up. Default records that it HELPED, which clears noise recorded before it (a later noise mark still counts - the newest verdict wins). Pass noise:true for the opposite. A verdict is about a PLACE: the file, directory, command, tool or moment the item is bound to where it last fired in this session, or the one you name in `place` (one of the places `get` shows). Two noise marks at the SAME place (since the last useful mark there, or since the last change to its text, check or bindings) silence the item at that place only - it is still served elsewhere; marks at three different places, or two marks with no place, silence it everywhere. The item stays fully findable via lookup, and a rule whose check can refuse is never silenced this way. A useful mark at a place clears that place's noise only; one with no place clears all. A second call THIS SESSION for the same id with the same verdict writes nothing and says so, unless the earlier one was set aside by the Stop (not an attested THOR call), in which case it is written again and the reply says why, or unless the item fired in 10 more sessions since, in which case it is owed again and written; a different verdict is written and the earlier one is named in the reply. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refused when the item is not live (retracted or archived) - there is nothing to judge. A pinned (Always-bound) item is the owner's standing choice: a useful mark on it is recorded (a re-read found it still right and still needed at every start; it stays pinned), but a noise mark is refused with nothing written - correct its text with revise, or tell the owner it may not belong pinned; never unpin it yourself. Replies with the verdict recorded and its event sequence, or the refusal text.", annotations(title = "Record a verdict", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false))]
     async fn mark(&self, meta: Meta, raw: RawArgs, Parameters(args): Parameters<MarkArgs>) -> String {
         // A repeat of the SAME verdict on the SAME id, from THIS process, is
         // caught before anything else runs - before even a replica's own
@@ -3812,25 +3925,25 @@ impl ThorMcpServer {
                     args.id
                 ));
             };
-            // A VERDICT ON A PINNED ITEM CHANGES NOTHING. `serve::decay::
-            // DecayContext::is_stale` ignores every verdict on an
-            // `Always`-bound item outright ("an Always-bound item is NEVER
-            // stale... it is what Always means"), so writing one here would
-            // be recorded and then read by nothing - the owner already
-            // answered "did it belong where it fired" the moment he pinned
-            // it. Measured 2026-09-12: an evaluation was spent judging more
-            // than thirty of these for nothing, two of them pinned on
-            // purpose. Checked before any write, and before `mark_history`
-            // is ever touched, so a repeat of this same refusal never reads
-            // as "already judged this session" (see `mark_history`'s own
-            // doc comment above `mark` itself). Only a Rule or Orientation
-            // can carry `Always` at all, so this branch is simply never
-            // reached for a Report or Chunk.
-            if serve::usefulness::is_pinned(&live_item.item.bindings) {
+            // A PINNED ITEM IS RE-READ, NEVER CALLED NOISE (2026-11-20). A pin
+            // is the owner's standing choice (`serve::decay::DecayContext::
+            // is_stale` ignores every noise mark on an `Always`-bound item
+            // outright), so a noise verdict could only be read by nothing, and
+            // it would be a way to say "unpin this" without the owner. What the
+            // evaluation asks of a pinned note is a RE-READ: a useful mark says
+            // it is still right and still needed at every start, and a revise
+            // makes its text right or shorter. A useful mark is therefore
+            // recorded; a noise mark is refused, with the two honest exits.
+            // Checked before any write, and before `mark_history` is touched.
+            let pinned = serve::usefulness::is_pinned(&live_item.item.bindings);
+            if pinned && noise {
                 return Err(format!(
-                    "pinned: '{}' is served at every session start by the owner's choice, so a verdict changes \
-                     nothing - `unpin` it if it should stop appearing",
-                    args.id
+                    "pinned: '{}' is served at every session start by the owner's choice, so it is never called noise. \
+                     If what it says is no longer fully right, correct it with mcp__thor__revise (its text, made right \
+                     or shorter). If you think it should not be pinned any more, tell the owner and let them decide - \
+                     do not unpin it yourself. If it is still right and still needed at every start, \
+                     mcp__thor__mark(id: \"{}\") records that. Nothing was recorded",
+                    args.id, args.id
                 ));
             }
             // A VERDICT ON SOMETHING THAT NEVER FIRED IS NOT A VERDICT
@@ -3852,12 +3965,34 @@ impl ThorMcpServer {
                     args.id
                 ));
             }
+            // THE PLACE THIS VERDICT IS ABOUT (2026-11-20): the one the marker
+            // named, which must be one of the places the item is bound to, else
+            // the binding the item last fired through in THIS session. An item
+            // that did not fire here (or fired with no place of its own)
+            // records no place, and counts for everywhere, as a verdict always did.
+            let place: Option<String> = match args.place.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+                Some(named) => match serve::rank::resolve_place(&live_item.item, named) {
+                    Ok(label) => Some(label),
+                    Err(problem) => return Err(problem),
+                },
+                None => s
+                    .get_events_by_entity(&args.id)
+                    .ok()
+                    .and_then(|events| {
+                        events
+                            .iter()
+                            .rev()
+                            .filter(|e| e.kind == thor_core::event_store::EventKind::ItemServed && e.session_id == stamp.column())
+                            .filter_map(|e| serde_json::from_str::<model::served::ItemServed>(&e.body).ok().and_then(|b| b.trigger))
+                            .find_map(|trigger| serve::rank::places_of_trigger(&live_item.item, &trigger).into_iter().next())
+                    }),
+            };
             let now = serve::time::now_iso8601();
             let att = stamp.att();
             let written = if noise {
-                serve::mark::record_noise(s, stamp.column(), LINEAGE_ID, ACTOR, &now, &args.id, Some(&att))
+                serve::mark::record_noise_at(s, stamp.column(), LINEAGE_ID, ACTOR, &now, &args.id, Some(&att), place.as_deref())
             } else {
-                serve::mark::record_useful(s, stamp.column(), LINEAGE_ID, ACTOR, &now, &args.id, Some(&att))
+                serve::mark::record_useful_at(s, stamp.column(), LINEAGE_ID, ACTOR, &now, &args.id, Some(&att), place.as_deref())
             };
             match written {
                 Ok(event) => {
@@ -3865,18 +4000,7 @@ impl ThorMcpServer {
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
                         .insert(id_for_history, MarkRecord { noise, seq: Some(event.seq) });
-                    let mut reply = if noise {
-                        format!(
-                            "marked noise: {} ({}+ of these, with no mark of usefulness, retires it from the injection surfaces; it stays findable via lookup)",
-                            args.id,
-                            serve::decay::NOISE_MARKS_BEFORE_STALE
-                        )
-                    } else {
-                        format!(
-                            "marked useful: {} (clears the noise recorded before it; a later noise mark still counts)",
-                            args.id
-                        )
-                    };
+                    let mut reply = mark_reply(&*s, &args.id, noise, place.as_deref(), pinned, serve::sweep::can_refuse(&live_item.item));
                     // The "stands in history" clause is about a DIFFERENT
                     // earlier verdict this session gave way to - never about
                     // the SAME verdict written again because it was owed
@@ -3949,7 +4073,7 @@ impl ThorMcpServer {
         .await
     }
 
-    #[tool(description = "Code lane: removes an item that is simply WRONG or no longer applies - it stops being live everywhere (session start, the moment of action, lookup), but nothing is deleted, and history still walks it. Use revise instead when the item merely changed. A reason is required; a blank one is refused. A rule whose check bites is refused unless the reason names, by id, a live item whose check covers it; the refusal prints the revise that carries the check over. On a replica this queues instead of writing ('queued for the main machine' is not an error). Bringing the fact back later is a fresh remember, never a revise of the tombstone. Replies 'retracted <id> (<reason>) (event seq N)', or the refusal text.", annotations(title = "Retract an item", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false))]
+    #[tool(description = "Code lane: removes an item that is simply WRONG or no longer applies - it stops being live everywhere (session start, the moment of action, lookup), but nothing is deleted, and history still walks it. Use revise instead when the item merely changed. A reason is required; a blank one is refused. A PINNED note is the owner's standing choice and passes the unpin rule: the reason must be at least 20 characters and the retract is refused while the note's own check holds, it got a useful mark in the last 90 days or it was revised in the last 30 days (rewrite its text with revise instead), unless the reason quotes, between double quotes, the owner's own whole message about that note. A rule whose check bites is refused unless the reason names, by id, a live item whose check covers it; the refusal prints the revise that carries the check over. On a replica this queues instead of writing ('queued for the main machine' is not an error). Bringing the fact back later is a fresh remember, never a revise of the tombstone. Replies 'retracted <id> (<reason>) (event seq N)', or the refusal text.", annotations(title = "Retract an item", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false))]
     async fn retract(&self, meta: Meta, raw: RawArgs, Parameters(args): Parameters<RetractArgs>) -> String {
         // THOR's own open point (step 14) is never a writer's to close: it
         // closes itself at the first evaluation start after its subject
@@ -3963,13 +4087,36 @@ impl ThorMcpServer {
                 model::store::MACHINE_POINT_REFUSAL
             );
         }
+        let replica_takedown = self.inbox.is_some() && {
+            let store = self.store.lock().unwrap_or_else(|p| p.into_inner());
+            model::store::show(&store, &args.id).ok().is_some_and(|existing| serve::unpin_gate::is_pinned(&existing.bindings))
+        };
         if let Some(queued) = self.capture("retract", &args) {
-            return queued;
+            return if replica_takedown { format!("{queued} {REPLICA_TAKEDOWN_NOTE}") } else { queued };
         }
         let stamp = self.stamp("retract", meta, raw);
+        let root = self.root.clone();
+        let session = self.session.clone();
         self.blocking(move |s| {
-            let att = stamp.att();
+            let mut att = stamp.att();
             refuse_a_side_door_on_a_frozen_item(s, &args.id, &att)?;
+            // A retract of a pinned note takes it down: the same gate as the unpin tool, and
+            // its refusal says to rewrite the text or bring the owner's own words.
+            if let Ok(existing) = model::store::show(s, &args.id) {
+                if serve::unpin_gate::is_pinned(&existing.bindings) {
+                    let root = root.as_deref().cloned().or_else(|| std::env::current_dir().ok()).unwrap_or_default();
+                    let (_, stamped) = serve::unpin_gate::judge(
+                        s,
+                        &existing,
+                        Some(&args.reason),
+                        &root,
+                        session.session_id.as_deref(),
+                        serve::time::now_unix(),
+                        serve::unpin_gate::Takedown::Retract,
+                    )?;
+                    att.unpin = Some(stamped);
+                }
+            }
             let lost = model::store::show(s, &args.id).ok().and_then(|item| lost_check_warning(s, &item));
             match model::store::retract(s, stamp.column(), LINEAGE_ID, ACTOR, &args.id, &args.reason, Some(&att)) {
                 Ok(event) => Ok(format!(
@@ -8488,7 +8635,7 @@ mod tests {
         args.targets = vec![TargetArg { kind: "path".to_string(), value: "src/unpin_test.rs".to_string() }];
         assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await.starts_with("stored"));
 
-        let reply = srv.unpin(Meta::new(), RawArgs::default(), Parameters(UnpinArgs { id: "unpin-1".to_string() })).await;
+        let reply = srv.unpin(Meta::new(), RawArgs::default(), Parameters(UnpinArgs { id: "unpin-1".to_string(), because: Some(STALE_BECAUSE.to_string()) })).await;
         assert!(reply.starts_with("unpinned"), "{reply}");
 
         let get_reply = srv.get(Parameters(GetArgs { id: "unpin-1".to_string(), fired: None })).await;
@@ -8511,7 +8658,7 @@ mod tests {
         // base_remember is Always-bound only: no moments, no targets.
         assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(base_remember("unpin-2"))).await.starts_with("stored"));
 
-        let reply = srv.unpin(Meta::new(), RawArgs::default(), Parameters(UnpinArgs { id: "unpin-2".to_string() })).await;
+        let reply = srv.unpin(Meta::new(), RawArgs::default(), Parameters(UnpinArgs { id: "unpin-2".to_string(), because: Some(STALE_BECAUSE.to_string()) })).await;
         assert!(reply.contains("REFUSED"), "expected a loud refusal, got: {reply}");
         assert!(reply.contains("no binding"), "expected the reason to name the empty-binding problem: {reply}");
 
@@ -8821,7 +8968,7 @@ mod tests {
             .await
             .starts_with("retracted"));
 
-        let reply = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "weg-ermee".to_string(), noise: true })).await;
+        let reply = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "weg-ermee".to_string(), noise: true, place: None })).await;
         assert!(reply.contains("not live"), "{reply}");
         assert!(reply.contains("Nothing was recorded"), "{reply}");
     }
@@ -9267,7 +9414,7 @@ mod tests {
             .await
             .starts_with("retracted"));
 
-        let reply = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "weg-hiermee".to_string(), noise: true })).await;
+        let reply = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "weg-hiermee".to_string(), noise: true, place: None })).await;
         assert!(reply.contains("not live"), "{reply}");
         assert!(reply.contains("Nothing was recorded"), "{reply}");
     }
@@ -9673,6 +9820,53 @@ mod tests {
         );
     }
 
+    async fn lookup_reply_for(text: &str, query: &str) -> String {
+        let srv = server_knowing(&["test-project"]);
+        let mut report = blank_report("gizmo-1");
+        report.text = text.to_string();
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(report)).await.starts_with("stored"));
+        srv.lookup(Parameters(LookupArgs { scope: None, query: Some(query.to_string()), key: None, kind: None }))
+            .await
+    }
+
+    /// No literal answer: the reply tells the assistant to look in the files too.
+    #[tokio::test]
+    async fn lookup_without_a_literal_answer_says_to_look_in_the_projects_files() {
+        let hint = serve::lookup::LOOK_IN_FILES_HINT;
+        // (a) no matches at all
+        let reply = lookup_reply_for("a gizmo has nothing to do with the other word", "zzzqqq").await;
+        assert!(reply.contains("no matches for 'zzzqqq'"), "{reply}");
+        assert!(reply.contains(hint), "{reply}");
+        // (c) word stems only
+        let reply = lookup_reply_for("Checking happens before the release", "checkings release").await;
+        assert!(reply.contains("word stems"), "{reply}");
+        assert!(reply.contains(hint), "{reply}");
+        assert!(reply.len() < LOOKUP_MAX_CHARS, "the reply keeps its size limit");
+        // literal hit: no line
+        let reply = lookup_reply_for("a gizmo has nothing to do with the other word", "gizmo").await;
+        assert!(reply.contains("gizmo-1"), "{reply}");
+        assert!(!reply.contains(hint), "a literal hit must not carry the line: {reply}");
+    }
+
+    /// The hint rides on the meaning-only note too, and stays inside the size
+    /// limit even when the hits fill the budget.
+    #[test]
+    fn the_look_in_files_line_fits_in_the_notes_room() {
+        assert!(serve::lookup::LOOK_IN_FILES_HINT.len() * 3 < LOOKUP_NOTES_ROOM);
+    }
+
+    /// The tool description tells the assistant once that no clear hit is not an answer.
+    #[test]
+    fn the_lookup_description_says_no_clear_hit_is_not_an_answer() {
+        let tools = ThorMcpServer::tool_router().list_all();
+        let tool = tools.iter().find(|t| t.name.as_ref() == "lookup").expect("lookup");
+        let description = tool.description.as_deref().unwrap_or("");
+        assert!(
+            description.contains("A lookup with no clear hit is not an answer: check the project's own files, and say 'not found' rather than guess."),
+            "{description}"
+        );
+    }
+
     fn blank_report(id: &str) -> RememberArgs {
         RememberArgs {
             because: None,
@@ -9718,7 +9912,7 @@ mod tests {
         args.targets = vec![TargetArg { kind: "command".to_string(), value: "force-push".to_string() }];
         srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         fired_once(&srv, "mark-1");
-        let reply = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "mark-1".to_string(), noise: false })).await;
+        let reply = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "mark-1".to_string(), noise: false, place: None })).await;
         assert!(reply.contains("marked useful: mark-1"), "{reply}");
 
         let store = srv.store.lock().unwrap();
@@ -9727,32 +9921,52 @@ mod tests {
 
     // ------------------------------------------------- mark on a pinned item
 
-    /// THE DEFECT THIS PREVENTS: `serve::decay::DecayContext::is_stale`
-    /// ignores every verdict on an `Always`-bound item outright, so a
-    /// verdict written here would be recorded and then read by nothing.
-    /// Measured 2026-09-12: an evaluation was spent judging more than thirty
-    /// of these for nothing, two of them pinned by the owner on purpose.
+    /// A PINNED NOTE IS RE-READ, NEVER CALLED NOISE (2026-11-20). `serve::decay::
+    /// DecayContext::is_stale` ignores every noise mark on an `Always`-bound
+    /// item, and a noise mark would be a way to say "unpin this" without the
+    /// owner. The refusal names the two honest exits (revise the text, tell the
+    /// owner) and says not to unpin it oneself; nothing is written.
     #[tokio::test]
-    async fn marking_a_pinned_item_writes_no_event_and_names_unpin() {
+    async fn a_noise_mark_on_a_pinned_item_is_refused_and_writes_nothing() {
         let srv = server();
-        // base_remember is Always-bound by default (see the pin/unpin tests
-        // above) - exactly the shape this refusal exists for.
+        // base_remember is Always-bound by default (see the pin/unpin tests above).
         srv.remember(Meta::new(), RawArgs::default(), Parameters(base_remember("pinned-mark-1"))).await;
+        fired_once(&srv, "pinned-mark-1");
 
-        let reply = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "pinned-mark-1".to_string(), noise: false })).await;
+        let reply = srv
+            .mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "pinned-mark-1".to_string(), noise: true, place: None }))
+            .await;
         assert!(reply.starts_with("pinned:"), "{reply}");
         assert!(reply.contains("pinned-mark-1"), "{reply}");
-        assert!(reply.contains("unpin"), "must point at the way out: {reply}");
+        assert!(reply.contains("mcp__thor__revise"), "must point at correcting the text: {reply}");
+        assert!(reply.contains("tell the owner") && reply.contains("do not unpin it yourself"), "must not suggest an unpin: {reply}");
 
         let store = srv.store.lock().unwrap();
         let events = store.get_events_by_entity("pinned-mark-1").unwrap();
         assert!(
-            events.iter().all(|e| {
-                e.kind != thor_core::event_store::EventKind::ItemMarkedUseful
-                    && e.kind != thor_core::event_store::EventKind::ItemMarkedNoise
-            }),
-            "a pinned item must receive no verdict event at all: {events:?}"
+            events.iter().all(|e| e.kind != thor_core::event_store::EventKind::ItemMarkedNoise),
+            "a pinned item must receive no noise event at all: {events:?}"
         );
+    }
+
+    /// THE RE-READ ANSWER: a useful mark on a pinned note says it is still right
+    /// and still needed at every start. It is recorded, and the note stays pinned.
+    #[tokio::test]
+    async fn a_useful_mark_on_a_pinned_item_is_recorded_and_leaves_it_pinned() {
+        let srv = server();
+        srv.remember(Meta::new(), RawArgs::default(), Parameters(base_remember("pinned-mark-3"))).await;
+        fired_once(&srv, "pinned-mark-3");
+
+        let reply = srv
+            .mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "pinned-mark-3".to_string(), noise: false, place: None }))
+            .await;
+        assert!(reply.contains("marked useful: pinned-mark-3"), "{reply}");
+        assert!(reply.contains("stays pinned"), "{reply}");
+        let store = srv.store.lock().unwrap();
+        let events = store.get_events_by_entity("pinned-mark-3").unwrap();
+        assert!(events.iter().any(|e| e.kind == thor_core::event_store::EventKind::ItemMarkedUseful), "{events:?}");
+        let item = model::store::show(&store, "pinned-mark-3").unwrap();
+        assert!(item.bindings.iter().any(|b| matches!(b, model::item::Binding::Always)), "a mark never unpins");
     }
 
     /// THE OTHER HALF: a trigger-bound item is unaffected by the refusal
@@ -9766,25 +9980,150 @@ mod tests {
         srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         fired_once(&srv, "trigger-mark-1");
 
-        let reply = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "trigger-mark-1".to_string(), noise: false })).await;
+        let reply = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "trigger-mark-1".to_string(), noise: false, place: None })).await;
         assert!(reply.contains("marked useful: trigger-mark-1"), "{reply}");
     }
 
     /// THE REPEAT MAP MUST STAY UNTOUCHED by the pinned branch specifically:
-    /// a second call reaches the SAME pinned refusal again, never "already
-    /// judged this session" - proving the first call never wrote into
+    /// a second noise call reaches the SAME pinned refusal again, never
+    /// "already judged this session" - proving the first call never wrote into
     /// `mark_history`.
     #[tokio::test]
-    async fn marking_a_pinned_item_twice_never_reads_as_a_repeat() {
+    async fn refusing_noise_on_a_pinned_item_twice_never_reads_as_a_repeat() {
         let srv = server();
         srv.remember(Meta::new(), RawArgs::default(), Parameters(base_remember("pinned-mark-2"))).await;
+        fired_once(&srv, "pinned-mark-2");
 
-        let first = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "pinned-mark-2".to_string(), noise: false })).await;
+        let first = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "pinned-mark-2".to_string(), noise: true, place: None })).await;
         assert!(first.starts_with("pinned:"), "{first}");
 
-        let second = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "pinned-mark-2".to_string(), noise: true })).await;
+        let second = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "pinned-mark-2".to_string(), noise: true, place: None })).await;
         assert!(second.starts_with("pinned:"), "the repeat map must not have recorded the first call: {second}");
         assert!(!second.contains("already judged"), "{second}");
+    }
+
+    // ------------------------------------------------------ noise per place
+
+    fn fired_here_at(srv: &ThorMcpServer, id: &str, trigger: &str) {
+        let mut store = srv.store.lock().unwrap();
+        serve::deliver::record_delivery_with_trigger(
+            &mut store,
+            NO_SESSION,
+            "l",
+            "hook",
+            "2026-11-20T00:00:00Z",
+            &[id.to_string()],
+            Some(trigger),
+        );
+    }
+
+    /// The mark takes the place from where the item last fired in the marking
+    /// session, says so, and two such marks silence it at that place only.
+    #[tokio::test]
+    async fn a_noise_mark_takes_the_place_the_item_last_fired_at_in_this_session() {
+        let db = tempfile::tempdir().unwrap();
+        let db_path = db.path().join("t.db");
+        {
+            // Seeded through the owner's own path: filing into a collection
+            // nobody has named is refused at the agent door on purpose.
+            let mut store = EventStore::new(&db_path).unwrap();
+            let seed = model::item::Item {
+                id: "seed-some-project".to_string(),
+                kind: Kind::Report,
+                text: "the owner named the collection 'some-project'".to_string(),
+                bindings: Vec::new(),
+                severity: None,
+                project: Some("some-project".to_string()),
+                tags: Vec::new(),
+                expires: None,
+                key: None,
+                falsifier: None,
+                check: None,
+            };
+            model::store::declare(&mut store, "seed", "seed", "owner", &seed).unwrap();
+        }
+        let srv = ThorMcpServer::new(EventStore::new(&db_path).unwrap());
+        let mut args = base_remember("placed-1");
+        args.always = false;
+        args.project = Some("some-project".to_string());
+        args.targets = vec![
+            TargetArg { kind: "path".to_string(), value: "src/noisy.rs".to_string() },
+            TargetArg { kind: "path".to_string(), value: "src/quiet.rs".to_string() },
+        ];
+        let stored = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
+        assert!(!stored.to_lowercase().contains("refus"), "{stored}");
+        fired_here_at(&srv, "placed-1", "src/noisy.rs");
+
+        let first = srv
+            .mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "placed-1".to_string(), noise: true, place: None }))
+            .await;
+        assert!(first.contains("marked noise: placed-1 at path:src/noisy.rs"), "{first}");
+        assert!(first.contains("one more noise mark for path:src/noisy.rs silences it there"), "{first}");
+
+        // A second SESSION (fresh server, same store) marks it at the same place.
+        let second_session = ThorMcpServer::new(EventStore::new(&db_path).unwrap());
+        let second = second_session
+            .mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "placed-1".to_string(), noise: true, place: None }))
+            .await;
+        assert!(second.contains("no longer shown for path:src/noisy.rs"), "{second}");
+
+        let store = EventStore::new(&db_path).unwrap();
+        let decay = serve::decay::DecayContext::load(&store);
+        let item = model::store::show(&store, "placed-1").unwrap();
+        let touching = |path: &str| {
+            let mut input = serve::input::ServeInput::default();
+            input.add_file(path);
+            input
+        };
+        assert!(decay.is_stale_at(&item, &touching("src/noisy.rs")), "silenced at the place it was marked at");
+        assert!(!decay.is_stale_at(&item, &touching("src/quiet.rs")), "still served at its other place");
+        assert!(!decay.is_stale(&item));
+    }
+
+    /// An item that fired nowhere this session records no place: the mark counts
+    /// for everywhere, exactly as before, and the reply says how to name one.
+    #[tokio::test]
+    async fn a_noise_mark_with_no_place_to_name_counts_for_everywhere() {
+        let srv = server_knowing(&["some-project"]);
+        let mut args = base_remember("placeless-1");
+        args.always = false;
+        args.project = Some("some-project".to_string());
+        args.targets = vec![TargetArg { kind: "path".to_string(), value: "src/noisy.rs".to_string() }];
+        srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
+        fired_once(&srv, "placeless-1"); // fired in session "s", not this one
+        let reply = srv
+            .mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "placeless-1".to_string(), noise: true, place: None }))
+            .await;
+        assert!(reply.contains("marked noise: placeless-1 (no place of its own"), "{reply}");
+        assert!(reply.contains("place:"), "{reply}");
+    }
+
+    /// A place the marker names must be one of the item's own; a stranger is refused.
+    #[tokio::test]
+    async fn a_named_place_must_be_one_of_the_items_own() {
+        let srv = server_knowing(&["some-project"]);
+        let mut args = base_remember("named-1");
+        args.always = false;
+        args.project = Some("some-project".to_string());
+        args.targets = vec![TargetArg { kind: "path".to_string(), value: "src/noisy.rs".to_string() }];
+        srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
+        fired_once(&srv, "named-1");
+        let refused = srv
+            .mark(
+                Meta::new(),
+                RawArgs::default(),
+                Parameters(MarkArgs { id: "named-1".to_string(), noise: true, place: Some("src/elsewhere.rs".to_string()) }),
+            )
+            .await;
+        assert!(refused.contains("not one of the places") && refused.contains("path:src/noisy.rs"), "{refused}");
+        let ok = srv
+            .mark(
+                Meta::new(),
+                RawArgs::default(),
+                Parameters(MarkArgs { id: "named-1".to_string(), noise: false, place: Some("src\\noisy.rs".to_string()) }),
+            )
+            .await;
+        assert!(ok.contains("marked useful: named-1 at path:src/noisy.rs"), "{ok}");
     }
 
     /// The noise side, end to end through the tool: two judgements take an
@@ -9840,7 +10179,7 @@ mod tests {
             // A fresh server per verdict: a different SESSION judging the
             // same item once, never the same session asked twice.
             let session = ThorMcpServer::new(EventStore::new(&db_path).unwrap());
-            let reply = session.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "noisy-1".to_string(), noise: true })).await;
+            let reply = session.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "noisy-1".to_string(), noise: true, place: None })).await;
             assert!(reply.contains("marked noise"), "{reply}");
         }
         {
@@ -9878,13 +10217,13 @@ mod tests {
         srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         fired_once(&srv, "repeat-noise");
 
-        let first = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "repeat-noise".to_string(), noise: true })).await;
+        let first = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "repeat-noise".to_string(), noise: true, place: None })).await;
         assert!(first.contains("marked noise"), "{first}");
         // No `_meta` here, so the writer's own check already knows this call is a side door.
         assert!(first.contains("will NOT count") && first.contains("no toolUseId") && first.contains("mark tool yourself"), "{first}");
         assert!(!first.contains("is the one that counts"), "{first}");
 
-        let second = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "repeat-noise".to_string(), noise: true })).await;
+        let second = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "repeat-noise".to_string(), noise: true, place: None })).await;
         assert!(second.contains("already judged noise this session"), "{second}");
         assert!(second.contains("event seq"), "the earlier verdict's own seq must be named: {second}");
         assert!(second.contains("not counted again"), "{second}");
@@ -9907,7 +10246,7 @@ mod tests {
         args.targets = vec![TargetArg { kind: "command".to_string(), value: "revised-after-mark-command".to_string() }];
         srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         fired_once(&srv, "revised-after-mark");
-        let first = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "revised-after-mark".to_string(), noise: false })).await;
+        let first = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "revised-after-mark".to_string(), noise: false, place: None })).await;
         assert!(first.contains("marked useful"), "{first}");
 
         let revised = srv
@@ -9920,7 +10259,7 @@ mod tests {
         assert!(revised.starts_with("revised"), "{revised}");
         assert!(revised.contains("set aside") && revised.contains("give it again with mark"), "{revised}");
 
-        let again = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "revised-after-mark".to_string(), noise: false })).await;
+        let again = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "revised-after-mark".to_string(), noise: false, place: None })).await;
         assert!(again.contains("marked useful") && again.contains("SET ASIDE"), "{again}");
         assert!(!again.contains("not counted again"), "{again}");
     }
@@ -9936,6 +10275,7 @@ mod tests {
             session_hint: None,
             inflight: Some(inflight.to_string()),
             side_door: why.map(str::to_string),
+            unpin: None,
         };
         let door = verdict_standing(&att(model::store::INFLIGHT_SIDE_DOOR, Some("two different calls under one id")));
         assert!(door.contains("will NOT count") && door.contains("two different calls under one id"), "{door}");
@@ -9957,7 +10297,7 @@ mod tests {
         srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         fired_once(&srv, "set-aside-noise");
 
-        let first = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "set-aside-noise".to_string(), noise: true })).await;
+        let first = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "set-aside-noise".to_string(), noise: true, place: None })).await;
         assert!(first.contains("marked noise"), "{first}");
         let seq: i64 = first.rsplit("event seq ").next().unwrap().trim_end_matches(')').parse().unwrap();
 
@@ -9985,12 +10325,12 @@ mod tests {
                 .unwrap();
         }
 
-        let second = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "set-aside-noise".to_string(), noise: true })).await;
+        let second = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "set-aside-noise".to_string(), noise: true, place: None })).await;
         assert!(second.contains("marked noise"), "a set-aside verdict is givable again: {second}");
         assert!(second.contains("SET ASIDE") && second.contains("two different calls under one id"), "{second}");
         assert!(!second.contains("not counted again"), "{second}");
 
-        let third = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "set-aside-noise".to_string(), noise: true })).await;
+        let third = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "set-aside-noise".to_string(), noise: true, place: None })).await;
         assert!(third.contains("not counted again"), "the fresh verdict is a normal one again: {third}");
     }
 
@@ -10011,7 +10351,7 @@ mod tests {
         srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         fired_once(&srv, "owed-again");
 
-        let first = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "owed-again".to_string(), noise: true })).await;
+        let first = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "owed-again".to_string(), noise: true, place: None })).await;
         assert!(first.contains("marked noise"), "{first}");
 
         {
@@ -10021,7 +10361,7 @@ mod tests {
             }
         }
 
-        let second = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "owed-again".to_string(), noise: true })).await;
+        let second = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "owed-again".to_string(), noise: true, place: None })).await;
         assert!(
             second.starts_with("judged noise again: it fired"),
             "must open with the owed-again note, before the normal reply text: {second}"
@@ -10052,7 +10392,7 @@ mod tests {
         srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         fired_once(&srv, "not-owed-again");
 
-        let first = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "not-owed-again".to_string(), noise: true })).await;
+        let first = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "not-owed-again".to_string(), noise: true, place: None })).await;
         assert!(first.contains("marked noise"), "{first}");
 
         {
@@ -10062,7 +10402,7 @@ mod tests {
             }
         }
 
-        let second = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "not-owed-again".to_string(), noise: true })).await;
+        let second = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "not-owed-again".to_string(), noise: true, place: None })).await;
         assert!(second.contains("already judged noise this session"), "{second}");
         assert!(second.contains("not counted again"), "{second}");
         assert!(!second.starts_with("judged noise again"), "one short of the threshold is not owed again: {second}");
@@ -10090,10 +10430,10 @@ mod tests {
         srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         fired_once(&srv, "change-of-mind");
 
-        let first = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "change-of-mind".to_string(), noise: false })).await;
+        let first = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "change-of-mind".to_string(), noise: false, place: None })).await;
         assert!(first.contains("marked useful"), "{first}");
 
-        let second = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "change-of-mind".to_string(), noise: true })).await;
+        let second = srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "change-of-mind".to_string(), noise: true, place: None })).await;
         assert!(second.contains("marked noise"), "a different verdict must still be written: {second}");
         assert!(second.contains("this session's earlier useful"), "{second}");
         assert!(second.contains("event seq"), "{second}");
@@ -10131,17 +10471,17 @@ mod tests {
         let srv1 = server();
         srv1.remember(Meta::new(), RawArgs::default(), Parameters(trigger_bound("fresh-process-1"))).await;
         fired_once(&srv1, "fresh-process-1");
-        let on_first = srv1.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "fresh-process-1".to_string(), noise: false })).await;
+        let on_first = srv1.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "fresh-process-1".to_string(), noise: false, place: None })).await;
         assert!(on_first.contains("marked useful"), "{on_first}");
         let repeat_same_instance =
-            srv1.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "fresh-process-1".to_string(), noise: false })).await;
+            srv1.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "fresh-process-1".to_string(), noise: false, place: None })).await;
         assert!(repeat_same_instance.contains("already judged"), "{repeat_same_instance}");
 
         let srv2 = server();
         srv2.remember(Meta::new(), RawArgs::default(), Parameters(trigger_bound("fresh-process-1"))).await;
         fired_once(&srv2, "fresh-process-1");
         let on_fresh_instance =
-            srv2.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "fresh-process-1".to_string(), noise: false })).await;
+            srv2.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "fresh-process-1".to_string(), noise: false, place: None })).await;
         assert!(
             on_fresh_instance.contains("marked useful"),
             "a fresh process must write again, not remember another instance's verdict: {on_fresh_instance}"
@@ -10561,5 +10901,479 @@ mod tests {
         let srv = ThorMcpServer::new(EventStore::new(&dir.path().join("thor.db")).unwrap());
         let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(a_forbid_acme_wipe_rule("acme-wipe-ban"))).await;
         assert!(reply.starts_with("stored ") && !reply.contains("real calls:"), "{reply}");
+    }
+
+    // ------------------------------------------------ the owner's rule for unpinning
+
+    const STALE_BECAUSE: &str = "proven out of date: the thing it describes was removed and nothing replaces it";
+
+    /// A file-backed server (so a hook record can be read back), the memory
+    /// knowing 'some-project', its root a throwaway folder.
+    fn unpin_fixture() -> (tempfile::TempDir, std::path::PathBuf, ThorMcpServer) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.db");
+        {
+            let mut store = EventStore::new(&db_path).unwrap();
+            let seed = model::item::Item {
+                id: "seed-some-project".to_string(),
+                kind: Kind::Report,
+                text: "the owner named the collection 'some-project'".to_string(),
+                bindings: Vec::new(),
+                severity: None,
+                project: Some("some-project".to_string()),
+                tags: Vec::new(),
+                expires: None,
+                key: None,
+                falsifier: None,
+                check: None,
+            };
+            model::store::declare(&mut store, "seed", "seed", "owner", &seed).unwrap();
+        }
+        let srv = ThorMcpServer::new(EventStore::new(&db_path).unwrap()).with_root(dir.path().to_path_buf());
+        (dir, db_path, srv)
+    }
+
+    /// A serving dated `at`, so the writes after it are dated the same.
+    fn dated_serving(srv: &ThorMcpServer, at: &str) {
+        let body = format!("{{\"served_at\":\"{at}\"}}");
+        srv.store.lock().unwrap().append_event("s", "l", "hook", thor_core::event_store::EventKind::ItemServed, "some-other-note", None, &body).unwrap();
+    }
+
+    /// A pinned note with a target binding left over, written on `date`.
+    async fn pinned_note(srv: &ThorMcpServer, id: &str, date: &str) {
+        dated_serving(srv, date);
+        let mut args = base_remember(id);
+        // Two notes of one memory must not read as copies of each other.
+        args.text = match id {
+            "gate-new" => "Quote the invoice number in every payment reminder you draft.".to_string(),
+            "gate-old" => "Printer firmware updates wait until the weekend, never mid-job.".to_string(),
+            "gate-old2" => "Tomato seedlings go outside only after the last frost.".to_string(),
+            "ask-a" => "Release notes list the user-visible changes, newest first.".to_string(),
+            "ask-b" => "Backups of the photo library run over the wired network only.".to_string(),
+            "fold-a" => "Sunday dinners start at six, with the long table set for eight.".to_string(),
+            "fold-b" => "The ferry to the island leaves at nine and returns before dusk.".to_string(),
+            "fold-c" => "Winter tyres go on in November and come off again at Easter.".to_string(),
+            "fold-bb" => "The mountain hut books out three months ahead in summer.".to_string(),
+            "mistake" => "Compost goes behind the shed, never next to the vegetable beds.".to_string(),
+            "keep-pin" => "Receipts for the accountant are scanned on the first of each month.".to_string(),
+            _ => "never force-push to main".to_string(),
+        };
+        args.severity = None;
+        args.tags = vec![];
+        args.always = true;
+        args.project = Some("some-project".to_string());
+        args.targets = vec![TargetArg { kind: "path".to_string(), value: format!("src/{id}.rs") }];
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
+        assert!(reply.starts_with("stored"), "{reply}");
+    }
+
+    /// A pinned note created and then REVISED just now: in use by the rule's third test
+    /// (a creation alone is no maintenance).
+    async fn pinned_note_revised_now(srv: &ThorMcpServer, id: &str) {
+        pinned_note(srv, id, &serve::time::now_iso8601()).await;
+        let reply = srv
+            .revise(Meta::new(), RawArgs::default(), Parameters(ReviseArgs { id: id.to_string(), append: Some("Mind it.".to_string()), ..Default::default() }))
+            .await;
+        assert!(reply.starts_with("revised"), "{reply}");
+    }
+
+    async fn try_unpin(srv: &ThorMcpServer, id: &str, because: Option<&str>) -> String {
+        srv.unpin(Meta::new(), RawArgs::default(), Parameters(UnpinArgs { id: id.to_string(), because: because.map(str::to_string) })).await
+    }
+
+    fn still_pinned(srv: &ThorMcpServer, id: &str) -> bool {
+        model::store::show(&srv.store.lock().unwrap(), id).unwrap().bindings.contains(&Binding::Always)
+    }
+
+    #[tokio::test]
+    async fn an_unpin_without_a_reason_is_refused_and_writes_nothing() {
+        let (_dir, _db, srv) = unpin_fixture();
+        pinned_note(&srv, "up-none", "2026-01-01T00:00:00Z").await;
+        for because in [None, Some("too short")] {
+            let reply = try_unpin(&srv, "up-none", because).await;
+            assert!(reply.starts_with("REFUSED") && reply.contains("needs `because`") && reply.contains("20"), "{reply}");
+        }
+        assert!(still_pinned(&srv, "up-none"));
+    }
+
+    /// (c) revised in the last 30 days: someone just maintained it.
+    #[tokio::test]
+    async fn an_unpin_of_a_note_revised_in_the_last_thirty_days_is_refused() {
+        let (_dir, _db, srv) = unpin_fixture();
+        pinned_note_revised_now(&srv, "up-new").await;
+        let reply = try_unpin(&srv, "up-new", Some(STALE_BECAUSE)).await;
+        assert!(reply.starts_with("REFUSED") && reply.contains("revised in the last 30 days"), "{reply}");
+        assert!(reply.contains("standing choice") && reply.contains("mcp__thor__revise") && reply.contains("whole message"), "{reply}");
+        assert!(still_pinned(&srv, "up-new"), "a refused unpin writes nothing");
+    }
+
+    /// (b) a useful mark in the last 90 days: it is still used.
+    #[tokio::test]
+    async fn an_unpin_of_a_note_marked_useful_in_the_last_ninety_days_is_refused() {
+        let (_dir, _db, srv) = unpin_fixture();
+        pinned_note(&srv, "up-used", "2026-01-01T00:00:00Z").await;
+        let body = format!("{{\"marked_at\":\"{}\"}}", serve::time::now_iso8601());
+        srv.store.lock().unwrap().append_event("s", "l", "mcp", thor_core::event_store::EventKind::ItemMarkedUseful, "up-used", None, &body).unwrap();
+        let reply = try_unpin(&srv, "up-used", Some(STALE_BECAUSE)).await;
+        assert!(reply.starts_with("REFUSED") && reply.contains("useful mark in the last 90 days"), "{reply}");
+        assert!(still_pinned(&srv, "up-used"));
+        // An old mark does not count.
+        let (_dir, _db, srv) = unpin_fixture();
+        pinned_note(&srv, "up-old-mark", "2026-01-01T00:00:00Z").await;
+        srv.store.lock().unwrap().append_event("s", "l", "mcp", thor_core::event_store::EventKind::ItemMarkedUseful, "up-old-mark", None, "{\"marked_at\":\"2026-01-02T00:00:00Z\"}").unwrap();
+        assert!(try_unpin(&srv, "up-old-mark", Some(STALE_BECAUSE)).await.starts_with("unpinned"));
+    }
+
+    /// (a) a check that holds right now; once the check fails the note is proven
+    /// stale and the unpin goes through with its reason, which the history keeps.
+    #[tokio::test]
+    async fn a_check_that_holds_refuses_and_a_check_that_failed_lets_the_unpin_through() {
+        let (dir, _db, srv) = unpin_fixture();
+        // A note that carries a check (written straight through the owner's path:
+        // the tool only keeps a check that can refuse a call).
+        std::fs::write(dir.path().join("proof.txt"), "here").unwrap();
+        dated_serving(&srv, "2026-01-01T00:00:00Z");
+        let item = model::item::Item {
+            id: "up-check".to_string(),
+            kind: Kind::Rule,
+            text: "The file proof.txt is the proof this note is current.".to_string(),
+            bindings: vec![Binding::Target { kind: model::item::TargetKind::Path, value: "proof.txt".to_string() }, Binding::Always],
+            severity: None,
+            project: Some("some-project".to_string()),
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some("proof.txt is gone and nothing replaces it".to_string()),
+            check: Some(model::item::Check::PathExists { path: "proof.txt".to_string() }),
+        };
+        model::store::declare(&mut srv.store.lock().unwrap(), "s", "l", "owner", &item).unwrap();
+        let stored = model::store::show(&srv.store.lock().unwrap(), "up-check").unwrap();
+        let reply = try_unpin(&srv, "up-check", Some(STALE_BECAUSE)).await;
+        assert!(reply.starts_with("REFUSED") && reply.contains("its own check holds right now"), "{reply} / {stored:?}");
+        assert!(still_pinned(&srv, "up-check"));
+
+        std::fs::remove_file(dir.path().join("proof.txt")).unwrap();
+        let reply = try_unpin(&srv, "up-check", Some(STALE_BECAUSE)).await;
+        assert!(reply.starts_with("unpinned"), "{reply}");
+        assert!(!still_pinned(&srv, "up-check"));
+        let history = srv.history(Parameters(HistoryArgs { id: "up-check".to_string(), all: false })).await;
+        assert!(history.contains(STALE_BECAUSE), "the reason is kept in the history: {history}");
+        // Nothing the owner said: it is listed for him.
+        let listed = model::store::tool_unpins(&srv.store.lock().unwrap(), 0, i64::MAX);
+        assert_eq!(listed.len(), 1);
+        assert_eq!((listed[0].id.as_str(), listed[0].because.as_str(), listed[0].stamp.witnessed), ("up-check", STALE_BECAUSE, false));
+        assert_eq!(listed[0].stamp.kind, model::store::UNPIN_CHECK_FAILED, "a check that failed: proven out of date");
+    }
+
+    /// THE OWNER'S OWN DECISION: his whole message, quoted and witnessed by the
+    /// hook, lets the unpin through although the note was just marked useful; a
+    /// piece of it, or a quote nobody witnessed, does not.
+    #[tokio::test]
+    async fn the_owners_whole_message_lets_an_unpin_through_and_a_piece_of_it_does_not() {
+        let (dir, db, srv) = unpin_fixture();
+        pinned_note(&srv, "up-owner", "2026-01-01T00:00:00Z").await;
+        let body = format!("{{\"marked_at\":\"{}\"}}", serve::time::now_iso8601());
+        srv.store.lock().unwrap().append_event("s", "l", "mcp", thor_core::event_store::EventKind::ItemMarkedUseful, "up-owner", None, &body).unwrap();
+        let message = "Haal up-owner maar los, die heb ik niet meer nodig.";
+        let transcript = dir.path().join("session.jsonl");
+        let line = serde_json::json!({"type": "user", "message": {"role": "user", "content": message}});
+        std::fs::write(&transcript, format!("{line}\n")).unwrap();
+        let hook = |because: &str| {
+            serve::unpin_gate::witness(
+                &db,
+                &serde_json::json!({ "tool_input": { "id": "up-owner", "because": because }, "transcript_path": transcript.to_string_lossy() }),
+                serve::time::now_unix(),
+            )
+        };
+
+        // A quote the hook never witnessed is only text.
+        let whole = format!("the owner asked for it: \"{message}\"");
+        assert!(try_unpin(&srv, "up-owner", Some(&whole)).await.contains("could not confirm"), "an unwitnessed quote exempts nothing");
+        // A piece of his message is not his message.
+        let piece = "the owner asked for it: \"Haal up-owner maar los\"";
+        hook(piece);
+        assert!(try_unpin(&srv, "up-owner", Some(piece)).await.starts_with("REFUSED"), "a partial quote does not count");
+        assert!(still_pinned(&srv, "up-owner"));
+        // The whole message, witnessed.
+        hook(&whole);
+        let reply = try_unpin(&srv, "up-owner", Some(&whole)).await;
+        assert!(reply.starts_with("unpinned"), "{reply}");
+        assert!(!still_pinned(&srv, "up-owner"));
+        let listed = model::store::tool_unpins(&srv.store.lock().unwrap(), 0, i64::MAX);
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].stamp.witnessed && listed[0].stamp.kind == model::store::UNPIN_OWNER_WORDS, "{listed:?}");
+        assert!(model::store::unpin_line(&listed[0]).starts_with("unpinned on the owner's own words: up-owner"), "{listed:?}");
+    }
+
+    async fn try_revise_unpin(srv: &ThorMcpServer, id: &str, because: Option<&str>) -> String {
+        srv.revise(
+            Meta::new(),
+            RawArgs::default(),
+            Parameters(ReviseArgs {
+                id: id.to_string(),
+                always: Some(false),
+                targets: Some(vec![TargetArg { kind: "path".to_string(), value: format!("src/{id}.rs") }]),
+                because: because.map(str::to_string),
+                ..Default::default()
+            }),
+        )
+        .await
+    }
+
+    async fn try_retract(srv: &ThorMcpServer, id: &str, reason: &str) -> String {
+        srv.retract(Meta::new(), RawArgs::default(), Parameters(RetractArgs { id: id.to_string(), reason: reason.to_string() })).await
+    }
+
+    fn is_retracted(srv: &ThorMcpServer, id: &str) -> bool {
+        model::store::show(&srv.store.lock().unwrap(), id).is_err()
+    }
+
+    /// ITEM 6: a revise that removes `Always`, and a retract of a pinned note, pass the
+    /// SAME gate as the unpin tool: refused while the note is in use (the refusal for a
+    /// retract says to rewrite the text or bring the owner's words), through when its
+    /// check failed, and through on the owner's own words.
+    #[tokio::test]
+    async fn a_revise_that_drops_the_pin_and_a_retract_pass_the_same_gate_as_unpin() {
+        let (dir, db, srv) = unpin_fixture();
+        // In use: revised in the last 30 days.
+        pinned_note_revised_now(&srv, "gate-new").await;
+        let reply = try_revise_unpin(&srv, "gate-new", Some(STALE_BECAUSE)).await;
+        assert!(reply.starts_with("REFUSED") && reply.contains("revised in the last 30 days"), "{reply}");
+        assert!(still_pinned(&srv, "gate-new"), "a refused revise writes nothing");
+        let reply = try_retract(&srv, "gate-new", STALE_BECAUSE).await;
+        assert!(reply.starts_with("REFUSED") && reply.contains("rewrite the text so it is right again") && reply.contains("owner's own words"), "{reply}");
+        assert!(!is_retracted(&srv, "gate-new"), "nothing was retracted");
+        // A reason is required for both.
+        assert!(try_revise_unpin(&srv, "gate-new", None).await.contains("needs `because`"));
+        assert!(try_retract(&srv, "gate-new", "short").await.contains("needs `reason`"));
+
+        // Through when the note is old and its check failed (no check, no recent use).
+        pinned_note(&srv, "gate-old", "2026-01-01T00:00:00Z").await;
+        assert!(try_revise_unpin(&srv, "gate-old", Some(STALE_BECAUSE)).await.starts_with("revised"), "an old unused note");
+        assert!(!still_pinned(&srv, "gate-old"));
+        pinned_note(&srv, "gate-old2", "2026-01-01T00:00:00Z").await;
+        let retracted = try_retract(&srv, "gate-old2", STALE_BECAUSE).await;
+        assert!(retracted.starts_with("retracted"), "{retracted}");
+        assert!(is_retracted(&srv, "gate-old2"));
+        // Every one is listed, with how it was let through.
+        let listed = model::store::tool_unpins(&srv.store.lock().unwrap(), 0, i64::MAX);
+        assert_eq!(listed.iter().map(|u| (u.id.as_str(), u.how)).collect::<Vec<_>>(), [("gate-old", "unpinned"), ("gate-old2", "retracted")]);
+
+        // The owner's own words about THIS note lift the refusal, retract included.
+        let message = "Gooi gate-new maar weg, dat is verouderd en ik wil het niet meer.";
+        let transcript = dir.path().join("session.jsonl");
+        std::fs::write(&transcript, format!("{}\n", serde_json::json!({"type": "user", "message": {"role": "user", "content": message}}))).unwrap();
+        let because = format!("the owner asked for it: \"{message}\"");
+        serve::unpin_gate::witness(
+            &db,
+            &serde_json::json!({ "tool_input": { "id": "gate-new", "reason": because }, "transcript_path": transcript.to_string_lossy() }),
+            serve::time::now_unix(),
+        );
+        assert!(try_retract(&srv, "gate-new", &because).await.starts_with("retracted"));
+        assert!(is_retracted(&srv, "gate-new"));
+    }
+
+    /// ITEM 3: an "ok" lifts the refusal only for the note the assistant had just asked
+    /// about; an "ok" about something else unlocks nothing.
+    #[tokio::test]
+    async fn an_ok_about_another_note_does_not_unlock_an_unpin() {
+        let (dir, db, srv) = unpin_fixture();
+        pinned_note_revised_now(&srv, "ask-a").await;
+        pinned_note_revised_now(&srv, "ask-b").await;
+        let transcript = dir.path().join("session.jsonl");
+        let lines = [
+            serde_json::json!({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Shall I unpin the note ask-a?"}]}}),
+            serde_json::json!({"type": "user", "message": {"role": "user", "content": "ok, that is fine"}}),
+        ];
+        std::fs::write(&transcript, lines.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
+        let because = "he said \"ok, that is fine\"";
+        for id in ["ask-b", "ask-a"] {
+            serve::unpin_gate::witness(
+                &db,
+                &serde_json::json!({ "tool_input": { "id": id, "because": because }, "transcript_path": transcript.to_string_lossy() }),
+                serve::time::now_unix(),
+            );
+        }
+        let other = try_unpin(&srv, "ask-b", Some(because)).await;
+        assert!(other.starts_with("REFUSED") && other.contains("could not confirm"), "an ok about another note: {other}");
+        assert!(still_pinned(&srv, "ask-b"));
+        assert!(try_unpin(&srv, "ask-a", Some(because)).await.starts_with("unpinned"), "the ok answered a question about ask-a");
+    }
+
+    /// ITEM 2: the label comes from the event's own stamp. An unwitnessed reason that
+    /// imitates the owner's label is listed as unwitnessed, in the owner's words for it.
+    #[tokio::test]
+    async fn a_reason_that_imitates_the_owners_label_is_listed_as_unwitnessed() {
+        let (_dir, _db, srv) = unpin_fixture();
+        pinned_note(&srv, "imitate", "2026-01-01T00:00:00Z").await;
+        let because = "the owner's own words, checked by THOR: \"he told me so in the chat earlier\"";
+        assert!(try_unpin(&srv, "imitate", Some(because)).await.starts_with("unpinned"), "an old unused note may come down");
+        let listed = model::store::tool_unpins(&srv.store.lock().unwrap(), 0, i64::MAX);
+        assert_eq!(listed.len(), 1);
+        assert!(!listed[0].stamp.witnessed, "{listed:?}");
+        assert!(model::store::unpin_line(&listed[0]).contains("without the owner's own words"), "{listed:?}");
+    }
+
+    /// ITEM 7: from a copy, a queued take-down of a pinned note says in one plain line that
+    /// it is done on the main machine, and nothing is written locally.
+    #[tokio::test]
+    async fn a_queued_take_down_from_a_copy_says_it_is_done_on_the_main_machine() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.db");
+        {
+            let mut store = EventStore::new(&db_path).unwrap();
+            let item = model::item::Item {
+                id: "rp-pinned".to_string(),
+                kind: Kind::Rule,
+                text: "Say which folder a command ran in.".to_string(),
+                bindings: vec![Binding::Always, Binding::Target { kind: model::item::TargetKind::Path, value: "src/rp-pinned.rs".to_string() }],
+                severity: None,
+                project: Some("some-project".to_string()),
+                tags: vec![],
+                expires: None,
+                key: None,
+                falsifier: Some("a command ran with no folder named and nobody minded".to_string()),
+                check: None,
+            };
+            model::store::declare(&mut store, "s", "l", "owner", &item).unwrap();
+        }
+        let inbox = dir.path().join("inbox");
+        let srv = ThorMcpServer::new(EventStore::new(&db_path).unwrap()).with_capture_inbox(inbox);
+        let unpin = try_unpin(&srv, "rp-pinned", Some(STALE_BECAUSE)).await;
+        let revise = try_revise_unpin(&srv, "rp-pinned", Some(STALE_BECAUSE)).await;
+        let retract = try_retract(&srv, "rp-pinned", STALE_BECAUSE).await;
+        for reply in [&unpin, &revise, &retract] {
+            assert!(reply.starts_with("queued for the main machine") && reply.contains("comes down on the main machine only"), "{reply}");
+        }
+        assert!(still_pinned(&srv, "rp-pinned"), "nothing is written on a copy");
+    }
+
+    // ------------------------------------------------ the last review round
+
+    async fn shorten(srv: &ThorMcpServer, id: &str, text: &str) -> String {
+        srv.revise(Meta::new(), RawArgs::default(), Parameters(ReviseArgs { id: id.to_string(), text: Some(text.to_string()), ..Default::default() }))
+            .await
+    }
+
+    /// A FOLD counts only when the survivor's id stands in the reason as a whole word, the
+    /// survivor is live, pinned, OLD (created over 24 hours ago) and was rewritten in the
+    /// last hour after the retracted note's last change. Anything else is no fold.
+    #[tokio::test]
+    async fn only_an_honest_fold_into_an_old_rewritten_pinned_survivor_passes_and_the_survivor_is_then_protected() {
+        let (_dir, _db, srv) = unpin_fixture();
+        // An old pinned survivor, a seeded unrelated old pinned note, and a note in use.
+        pinned_note(&srv, "fold-b", "2026-01-01T00:00:00Z").await;
+        pinned_note(&srv, "keep-pin", "2026-01-01T00:00:00Z").await; // unrelated, old, never rewritten
+        pinned_note(&srv, "fold-bb", "2026-01-01T00:00:00Z").await; // its id merely CONTAINS fold-b
+        pinned_note_revised_now(&srv, "fold-a").await;
+        // Shortening the text of a pinned note in use is not a take-down.
+        assert!(shorten(&srv, "fold-a", "Sunday dinners start at six.").await.starts_with("revised"));
+        assert!(still_pinned(&srv, "fold-a"));
+
+        // No fold: no survivor named; an unrelated pinned note's id; a survivor named only as part of a longer word.
+        let reason = "it says the same as the other note, to my eye, so folding it is fine";
+        assert!(try_retract(&srv, "fold-a", reason).await.starts_with("REFUSED"));
+        let unrelated = try_retract(&srv, "fold-a", "folded into keep-pin, which now carries the point about dinner").await;
+        assert!(unrelated.starts_with("REFUSED") && unrelated.contains("not rewritten in the last 60 minutes"), "{unrelated}");
+        assert!(unrelated.contains("rewrite the surviving pinned note so it carries this point, then retract this one naming its id"), "{unrelated}");
+        // A fold into an old pinned note that was NOT rewritten is refused (fold-b, so far).
+        assert!(try_retract(&srv, "fold-a", "folded into fold-b, which now carries the point about dinner").await.starts_with("REFUSED"));
+        // A fold into a note pinned in THIS session (created just now, even if rewritten) is refused.
+        pinned_note_revised_now(&srv, "fold-c").await;
+        let fresh = try_retract(&srv, "fold-a", "folded into fold-c, which now carries the point about dinner").await;
+        assert!(fresh.starts_with("REFUSED") && fresh.contains("not an old pinned note"), "{fresh}");
+        assert!(!is_retracted(&srv, "fold-a"), "nothing was retracted so far");
+
+        // The survivor is rewritten just now to carry the point; a token that is only a substring of a longer id does not count.
+        dated_serving(&srv, &serve::time::now_iso8601());
+        assert!(shorten(&srv, "fold-b", "Sunday dinners start at six, the ferry leaves at nine.").await.starts_with("revised"));
+        let substring = try_retract(&srv, "fold-a", "folded into fold-bb, which now carries the point about dinner").await;
+        assert!(substring.starts_with("REFUSED"), "fold-b only as a substring of fold-bb is no token: {substring}");
+        // The honest fold.
+        let folded = try_retract(&srv, "fold-a", "folded into fold-b, which now carries the point about dinner.").await;
+        assert!(folded.starts_with("retracted"), "{folded}");
+        assert!(is_retracted(&srv, "fold-a"));
+        let listed = model::store::tool_unpins(&srv.store.lock().unwrap(), 0, i64::MAX);
+        assert_eq!(listed.len(), 1);
+        assert!(model::store::unpin_line(&listed[0]).contains("retracted folded into fold-b: fold-a"), "{listed:?}");
+
+        // The survivor was revised just now, so it is in use itself: neither retract nor unpin passes without the owner.
+        let retract = try_retract(&srv, "fold-b", "folded into keep-pin, which says it better than this one").await;
+        assert!(retract.starts_with("REFUSED") && retract.contains("revised in the last 30 days"), "{retract}");
+        let unpin = try_unpin(&srv, "fold-b", Some(STALE_BECAUSE)).await;
+        assert!(unpin.starts_with("REFUSED") && unpin.contains("revised in the last 30 days"), "{unpin}");
+        assert!(still_pinned(&srv, "fold-b"));
+    }
+
+    /// ITEM 2: the creation is no maintenance. A pinned note made by mistake five days ago,
+    /// no check, no useful mark, can be retracted with a reason - and is listed.
+    #[tokio::test]
+    async fn a_pinned_note_created_five_days_ago_can_be_retracted_with_a_reason() {
+        let (_dir, _db, srv) = unpin_fixture();
+        let five_days_ago = serve::time::iso8601_from_unix(serve::time::now_unix() - 5 * 86_400);
+        pinned_note(&srv, "mistake", &five_days_ago).await;
+        let reply = try_retract(&srv, "mistake", "made by mistake, it was never meant to be a standing rule").await;
+        assert!(reply.starts_with("retracted"), "{reply}");
+        let listed = model::store::tool_unpins(&srv.store.lock().unwrap(), 0, i64::MAX);
+        assert_eq!(listed.len(), 1);
+        assert!(model::store::unpin_line(&listed[0]).contains("no check and no recent use: mistake"), "{listed:?}");
+        // A REAL revision a few days ago does count.
+        pinned_note(&srv, "fold-a", "2026-01-01T00:00:00Z").await;
+        dated_serving(&srv, &five_days_ago);
+        let revised = srv
+            .revise(Meta::new(), RawArgs::default(), Parameters(ReviseArgs { id: "fold-a".to_string(), text: Some("Sunday dinners start at six.".to_string()), ..Default::default() }))
+            .await;
+        assert!(revised.starts_with("revised"), "{revised}");
+        let refused = try_retract(&srv, "fold-a", "made by mistake, it was never meant to be a standing rule").await;
+        assert!(refused.starts_with("REFUSED") && refused.contains("revised in the last 30 days"), "{refused}");
+    }
+
+    /// ITEM 3: a revise that gives targets and does not mention `always` KEEPS the pin; an
+    /// explicit `always: false` is the take-down and passes the gate: refused on a note in
+    /// use (naming the gate), through and listed on a stale one.
+    #[tokio::test]
+    async fn a_revise_without_always_keeps_the_pin_and_always_false_is_gated() {
+        let (_dir, _db, srv) = unpin_fixture();
+        pinned_note_revised_now(&srv, "keep-pin").await;
+        let kept = srv
+            .revise(
+                Meta::new(),
+                RawArgs::default(),
+                Parameters(ReviseArgs {
+                    id: "keep-pin".to_string(),
+                    targets: Some(vec![TargetArg { kind: "path".to_string(), value: "src/other-place.rs".to_string() }]),
+                    because: Some("the note moves to the place it is really about, it is not going away".to_string()),
+                    ..Default::default()
+                }),
+            )
+            .await;
+        assert!(kept.starts_with("revised"), "{kept}");
+        assert!(still_pinned(&srv, "keep-pin"), "no `always` mentioned: the pin stays");
+        let item = model::store::show(&srv.store.lock().unwrap(), "keep-pin").unwrap();
+        assert!(item.bindings.iter().any(|b| matches!(b, Binding::Target { value, .. } if value == "src/other-place.rs")), "{item:?}");
+
+        // Explicit always false on a note in use (revised just now): refused, naming the rule.
+        let refused = srv
+            .revise(
+                Meta::new(),
+                RawArgs::default(),
+                Parameters(ReviseArgs {
+                    id: "keep-pin".to_string(),
+                    always: Some(false),
+                    targets: Some(vec![TargetArg { kind: "path".to_string(), value: "src/other-place.rs".to_string() }]),
+                    because: Some(STALE_BECAUSE.to_string()),
+                    ..Default::default()
+                }),
+            )
+            .await;
+        assert!(refused.starts_with("REFUSED") && refused.contains("owner's rule for taking a pinned note down"), "{refused}");
+        assert!(still_pinned(&srv, "keep-pin"));
+
+        // A stale one passes and is listed.
+        pinned_note(&srv, "gate-old", "2026-01-01T00:00:00Z").await;
+        assert!(try_revise_unpin(&srv, "gate-old", Some(STALE_BECAUSE)).await.starts_with("revised"));
+        assert!(!still_pinned(&srv, "gate-old"));
+        let listed = model::store::tool_unpins(&srv.store.lock().unwrap(), 0, i64::MAX);
+        assert_eq!(listed.iter().map(|u| u.id.as_str()).collect::<Vec<_>>(), ["gate-old"]);
     }
 }

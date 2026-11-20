@@ -526,9 +526,23 @@ a number), files of a programming project and files outside your home folder
 stay where they are, and every move is written down so your assistant can put
 all of it back whenever you ask. From then on, new files for a subject go in the
 folder of that subject. If there is nothing to order, it says nothing about it.
+An old conversation that left no file behind has nothing to move and is simply
+skipped, and so is a file that already lies in its folder.
 THOR makes sure this offer really happens: your assistant cannot skip it, and it
 counts as done only when you answered it yourself (yes, or no for what you do
 not want).
+
+### If your assistant is only a chat
+
+A plain chat on claude.ai, or the chat in the Claude app, cannot install
+anything on your computer. If you gave this page to such a chat, it should answer
+with these steps:
+
+1. Open the Claude app on your computer.
+2. Click **Code** at the top.
+3. Under the box where you type, click the small word that says **Auto** and
+   choose **Bypass permissions**.
+4. Type: Install THOR, followed by the link to this page.
 
 ### The easy way: four steps, nothing to type
 
@@ -557,9 +571,10 @@ Redistributable" it installs them itself first.
 3. **Say "yes"** to your assistant's first message, which proposes three things
    (a daily safety copy, the language, and the folder where everything for this
    work is kept), or tell it by number what you want different. If it proposes a
-   new folder, from now on you open Claude Code in that folder (in the Claude
-   desktop app, choose that folder when you start a new session). That is the
-   only thing you do differently.
+   new folder, your assistant moves the conversation into it by itself, or
+   prepares a new conversation there and tells you to click it. In the Claude
+   app you never open or choose a folder yourself; only in a plain terminal does
+   your assistant ask you to open Claude Code in the new folder.
 4. **Just work.** Tell your assistant things once ("the tiles come from
    Tilehouse", "we chose the oak worktop") and in any later conversation in that
    folder it already knows. Each folder has its own memory, so nothing from one
@@ -1158,7 +1173,7 @@ A generic client config, the shape most tool-calling assistants expect:
       "args": [
         "run", "-i", "--rm",
         "-v", "thor-data:/data",
-        "ghcr.io/nworks3d/thor-mcp:2.6.11"
+        "ghcr.io/nworks3d/thor-mcp:2.6.12"
       ]
     }
   }
@@ -1168,7 +1183,7 @@ A generic client config, the shape most tool-calling assistants expect:
 ### Run it as a container
 
 ```bash
-docker run -i --rm -v thor-data:/data ghcr.io/nworks3d/thor-mcp:2.6.11
+docker run -i --rm -v thor-data:/data ghcr.io/nworks3d/thor-mcp:2.6.12
 ```
 
 On an empty volume, the container creates a memory and seeds it with THOR's
@@ -1262,10 +1277,13 @@ handed to anyone, stays findable, and the reason you gave stays attached to it.
 Use it for a week and see whether your assistant stops asking you the same
 things. That is the only test that answers the question you actually have.
 
-THOR was measured head to head against another memory tool for months, and those
-numbers are not here any more. Not because they were bad - they were good - but
-because a score measured on someone else's notes tells you about them, not about
-you. The tool is here. The verdict is yours.
+In two small rounds of tests, the same assistant did the same kinds of tasks 10 times with THOR and 10 times without, on the author's own small-business project. Things the business does not want on its website ended up there in 9 of 10 runs without THOR in the first round (1 of 10 with it, after a gap that was closed afterwards and is not measured), and a forbidden word the user asked for was written without any warning in 19 of 30 requests without THOR against 1 of 30 with it. With THOR the assistant also answered more project questions correctly (17.8 of 20 against 11.6) and its replies were about a third shorter. Cost and time showed no clear saving, and THOR adds a lot of text to each run, so the benefit is not free. It is one project and 10 runs per side, so treat it as a hint, not proof.
+
+![THOR benchmark: things kept off the website, recall, user insists, reply length, cost and time](docs/benchmark/benchmark.svg)
+
+The method, both rounds, every number and the limits are in
+[docs/benchmark/README.md](docs/benchmark/README.md). The verdict on your own
+project is still yours.
 
 ## The sixteen tools
 

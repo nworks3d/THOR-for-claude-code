@@ -1337,6 +1337,11 @@ fn main() -> ExitCode {
                 }
                 Err(e) => println!("  ! could not write the starting notes: {e}"),
             }
+            // The loose files that exist right now (paths only): a later "nothing to
+            // order" is not believed for files that vanished behind the tidy step's back.
+            if let Some(home) = serve::inventory::home_dir() {
+                let _ = serve::inventory::snapshot_loose_now(&db, &home);
+            }
         }
         Ok(StoreOutcome::AlreadyThere) => println!("= your memory was already there; nothing in it was touched"),
         Err(e) => {

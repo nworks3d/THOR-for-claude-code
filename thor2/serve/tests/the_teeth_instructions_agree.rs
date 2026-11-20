@@ -206,8 +206,9 @@ fn agents_md_gives_the_numbers_the_evaluation_really_uses() {
         format!("at least {} minutes of its own work", serve::usefulness::EVAL_OWN_WORK_MINUTES),
         format!("{} sessions or more without a verdict", model::store::JUDGEMENT_DEBT_AFTER),
         format!(
-            "the most-served first, at most {} per evaluation",
-            model::store::EVALUATION_JUDGEMENT_LIST_CAP
+            "the most-served first, a quarter of what could be listed, at least {} and at most {} per evaluation",
+            model::store::EVALUATION_JUDGEMENT_LIST_MIN,
+            model::store::EVALUATION_JUDGEMENT_LIST_MAX
         ),
         format!("The note lists at most {} such places", model::store::EVALUATION_OUTRANKED_LIST),
         format!("holds {} or fewer", model::item::MAX_ITEMS),
@@ -303,5 +304,79 @@ fn the_routine_explains_every_new_evaluation_signal_in_the_words_thor_prints() {
         ("probable false blocks, each with the call that was refused and what followed", &model),
     ] {
         assert!(where_.contains(phrase), "the code must print '{phrase}', which the routine describes");
+    }
+}
+
+/// THE PINNED RE-READ AND THE DYNAMIC CAP (2026-11-20): AGENTS.md, the routine,
+/// the docs, the start note and the filing refusal all say the same things, with
+/// the code's own numbers: at most `EVALUATION_REREAD_LIST` pinned notes, none
+/// within `REREAD_MIN_DAYS` days, settled by a useful mark or a rewrite, never
+/// by an unpin; and a list of a quarter of the backlog between the two bounds.
+#[test]
+fn the_texts_describe_the_pinned_reread_and_the_dynamic_cap_with_the_codes_numbers() {
+    let squash = |text: String| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let agents = squash(
+        std::fs::read_to_string(thor2().parent().expect("thor2/ sits in the repository").join("AGENTS.md")).expect("AGENTS.md"),
+    );
+    let docs = squash(
+        std::fs::read_to_string(thor2().parent().expect("thor2/ sits in the repository").join("docs/WHAT-THOR-DOES.md"))
+            .expect("docs/WHAT-THOR-DOES.md"),
+    );
+    let routine = routine();
+    assert_eq!((model::store::EVALUATION_REREAD_LIST, model::store::REREAD_MIN_DAYS), (3, 30), "the texts below say 3 and 30");
+    assert!(
+        agents.contains("lists at most 3 pinned notes") && agents.contains("none listed or confirmed in the last 30 days"),
+        "AGENTS.md must give the re-read numbers"
+    );
+    assert!(routine.contains("it lists at most three pinned notes") && routine.contains("in the last 30 days"), "the routine must give them too");
+    assert!(docs.contains("at most 3 pinned notes to re-read") && docs.contains("last 30 days"), "docs/WHAT-THOR-DOES.md must too");
+    for (name, text, phrase) in [
+        ("AGENTS.md", &agents, "an unpin is never asked for or counted"),
+        ("the routine", &routine, "do NOT unpin it"),
+        ("docs/WHAT-THOR-DOES.md", &docs, "An unpin is never asked for, suggested or counted"),
+    ] {
+        assert!(text.contains(phrase), "{name} must say a re-read never unpins: '{phrase}'");
+    }
+    // The start note and the filing refusal name the two calls and refuse the unpin.
+    // Rust source spells a long string over several lines with a trailing backslash.
+    let joined = |rel: &str| squash(read(rel).replace("\\\n", ""));
+    let note = joined("serve/src/eval_session.rs");
+    assert!(
+        note.contains("1b. PINNED NOTES TO RE-READ") && note.contains("do not unpin it, and do not mark it noise"),
+        "the start note must say it"
+    );
+    let gate = joined("model/src/store.rs");
+    assert!(
+        gate.contains("it is re-read, never unpinned") && gate.contains("do not unpin it, and do not mark it noise"),
+        "the filing refusal must say it"
+    );
+    // The cap.
+    assert_eq!((model::store::EVALUATION_JUDGEMENT_LIST_MIN, model::store::EVALUATION_JUDGEMENT_LIST_MAX), (5, 15));
+    assert!(routine.contains("at least 5 and at most 15"), "the routine must give the bounds of the list");
+    assert!(docs.contains("at least 5 and at most 15"), "the docs must give the bounds of the list");
+    // `mark`'s own description names the place and the pinned refusal.
+    let mcp = read("mcp/src/lib.rs");
+    assert!(
+        mcp.contains("A verdict is about a PLACE") && mcp.contains("a noise mark is refused with nothing written"),
+        "mark's description must say it"
+    );
+}
+
+/// THE OWNER'S RULE FOR UNPINNING (2026-11-20): every text that tells an agent
+/// about the unpin tool gives the same numbers the gate really uses.
+#[test]
+fn the_texts_describe_the_unpin_rule_with_the_gates_numbers() {
+    use serve::unpin_gate::{BECAUSE_MIN_CHARS, REVISED_DAYS, USEFUL_DAYS};
+    assert_eq!((BECAUSE_MIN_CHARS, USEFUL_DAYS, REVISED_DAYS), (20, 90, 30), "the texts below say 20, 90 and 30");
+    let squash = |text: String| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let repo = thor2().parent().expect("thor2/ sits in the repository").to_path_buf();
+    let agents = squash(std::fs::read_to_string(repo.join("AGENTS.md")).expect("AGENTS.md"));
+    let docs = squash(std::fs::read_to_string(repo.join("docs/WHAT-THOR-DOES.md")).expect("docs"));
+    let routine = routine();
+    let mcp = squash(read("mcp/src/lib.rs"));
+    for (name, text) in [("AGENTS.md", &agents), ("docs/WHAT-THOR-DOES.md", &docs), ("the routine", &routine), ("the unpin tool's description", &mcp)] {
+        assert!(text.contains("last 90 days") && text.contains("last 30 days"), "{name} must give the 90 and 30 days");
+        assert!(text.contains("at least 20 characters"), "{name} must give the length of the reason");
+        assert!(text.contains("whole message"), "{name} must name the owner's own words");
     }
 }

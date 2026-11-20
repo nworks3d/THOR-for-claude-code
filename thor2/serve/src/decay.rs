@@ -74,7 +74,9 @@
 //! `status`/`doctor` still report "served N times, never marked" as something
 //! to look at, never as a filter.
 
+use crate::input::ServeInput;
 use crate::rank::RankedItem;
+use crate::usefulness::NoiseTally;
 use model::item::{Binding, Item};
 use std::collections::{HashMap, HashSet};
 use thor_core::event_store::EventStore;
@@ -100,11 +102,31 @@ pub const STALE_AFTER_SERVINGS: usize = 5;
 /// nearly four times as much on a signal that has not repeated itself.
 pub const NOISE_MARKS_BEFORE_STALE: usize = 2;
 
+/// Noise marks at this many DIFFERENT places say a note is wrong in general, not
+/// at one place, and silence it everywhere - today's global rule, reached by
+/// places. Two marks at one place silence the note at that place only
+/// (`NOISE_MARKS_BEFORE_STALE`); two marks that name no place (every mark
+/// written before places existed) silence it everywhere, as they always did.
+pub const NOISE_PLACES_BEFORE_GLOBAL: usize = 3;
+
+/// THE ONE comparison with `NOISE_MARKS_BEFORE_STALE`: is this many marks enough?
+/// `serve/tests/decay_is_decided_in_exactly_one_place.rs` fails if the literal
+/// is ever spelled anywhere else.
+fn enough_marks(n: usize) -> bool {
+    n >= NOISE_MARKS_BEFORE_STALE
+}
+
+/// Could this tally silence the note somewhere? Only then is the note's own
+/// history (its revisions since the marks) worth reading.
+fn reaches_a_threshold(tally: &NoiseTally) -> bool {
+    enough_marks(tally.placeless) || tally.places.values().any(|n| enough_marks(*n)) || tally.places.len() >= NOISE_PLACES_BEFORE_GLOBAL
+}
+
 /// Everything decay needs about the store, loaded once per call so a serving
 /// path folds the log a single time rather than once per candidate.
 pub struct DecayContext {
     ever_marked_useful: HashSet<String>,
-    noise: HashMap<String, usize>,
+    noise: HashMap<String, NoiseTally>,
 }
 
 impl DecayContext {
@@ -117,13 +139,13 @@ impl DecayContext {
         // without reading the firings), not two folds over the whole log.
         let (ever_marked_useful, mut noise) = crate::usefulness::mark_folds(store);
         // A verdict judged the version it was given on. Only an id that
-        // already sits at the threshold can change the answer, so only those
+        // already sits at a threshold can change the answer, so only those
         // pay for a look at their own revisions.
-        for (id, count) in noise.iter_mut() {
-            if *count < NOISE_MARKS_BEFORE_STALE {
+        for (id, tally) in noise.iter_mut() {
+            if !reaches_a_threshold(tally) {
                 continue;
             }
-            *count = crate::usefulness::noise_since_last_change(store, id);
+            *tally = crate::usefulness::tally_since_last_change(store, id);
         }
         DecayContext { ever_marked_useful, noise }
     }
@@ -142,16 +164,8 @@ impl DecayContext {
         DecayContext { ever_marked_useful: HashSet::new(), noise: HashMap::new() }
     }
 
-    /// Whether this item is currently stale: called noise at least
-    /// `NOISE_MARKS_BEFORE_STALE` times SINCE the last time anyone called it
-    /// useful (never "and never once marked useful" - see below). The one
-    /// comparison this whole module exists to make - see `serve/tests/
-    /// decay_is_decided_in_exactly_one_place.rs`, which fails if this literal
-    /// expression is ever duplicated elsewhere in this crate.
-    ///
-    /// A SERVING COUNT DECIDES NOTHING HERE, and that is the whole lesson of
-    /// this module's own doc comment: firing often is what relevance looks
-    /// like, so retiring on it is backwards.
+    /// Whether this item is NEVER hidden, whatever was said about it: pinned,
+    /// or a rule whose check can refuse.
     ///
     /// An `Always`-bound item is NEVER stale, and that is not a tuning knob -
     /// it is what `Always` means. Every other binding says "fire when this
@@ -159,7 +173,8 @@ impl DecayContext {
     /// to standing, which is the strongest mark of usefulness there is. A pin
     /// is already a mark, so retiring one for never having been marked
     /// retires it for the wrong reason. Taking a standing rule down is an
-    /// unpin, and that is the owner's own act.
+    /// unpin, and that is the owner's own act (the evaluation re-reads a pinned
+    /// note and has it confirmed or rewritten, never unpinned).
     ///
     /// MEASURED, ON THE FIRST REAL DAY (2026-08-03), so this is not a
     /// precaution: the owner runs several Claude Code sessions at once, and
@@ -171,22 +186,59 @@ impl DecayContext {
     /// two out (CONTRACT.md R9: a compensating knob is a reported design
     /// failure, not a fix). The modelling error was treating a pin as
     /// something that still has to earn its place.
+    ///
+    /// A rule whose check can refuse is never hidden either. The write guard
+    /// refuses with it whether or not decay shows it, so hiding it would
+    /// mean a refusal from a rule the user is never shown.
+    fn is_exempt(item: &Item) -> bool {
+        item.bindings.iter().any(|b| matches!(b, Binding::Always)) || crate::sweep::can_refuse(item)
+    }
+
+    /// Whether this item is currently stale EVERYWHERE: called noise at least
+    /// `NOISE_MARKS_BEFORE_STALE` times with no place named, or at
+    /// `NOISE_PLACES_BEFORE_GLOBAL` different places, SINCE the last time anyone
+    /// called it useful (never "and never once marked useful" - see below). The
+    /// one place this module decides it - see `serve/tests/
+    /// decay_is_decided_in_exactly_one_place.rs`, which fails if the literal
+    /// comparison is ever duplicated elsewhere in this crate.
+    ///
+    /// A SERVING COUNT DECIDES NOTHING HERE, and that is the whole lesson of
+    /// this module's own doc comment: firing often is what relevance looks
+    /// like, so retiring on it is backwards. Nor is it "was it ever marked
+    /// useful": that form made one verdict permanent and let the maintenance
+    /// loop freeze exactly the items that already dominate - see
+    /// `usefulness::noise_since_last_useful`. A useful mark still protects: it
+    /// clears the marks before it.
     pub fn is_stale(&self, item: &Item) -> bool {
-        if item.bindings.iter().any(|b| matches!(b, Binding::Always)) {
+        if Self::is_exempt(item) {
             return false;
         }
-        // A rule whose check can refuse is never hidden. The write guard
-        // refuses with it whether or not decay shows it, so hiding it would
-        // mean a refusal from a rule the user is never shown.
-        if crate::sweep::can_refuse(item) {
+        self.noise
+            .get(&item.id)
+            .is_some_and(|tally| enough_marks(tally.placeless) || tally.places.len() >= NOISE_PLACES_BEFORE_GLOBAL)
+    }
+
+    /// Whether this item is stale at the places `input` reaches it through:
+    /// stale everywhere (`is_stale`), or called noise at least
+    /// `NOISE_MARKS_BEFORE_STALE` times at one of those very places. At any
+    /// other place it is still served.
+    pub fn is_stale_at(&self, item: &Item, input: &ServeInput) -> bool {
+        if self.is_stale(item) {
+            return true;
+        }
+        if Self::is_exempt(item) {
             return false;
         }
-        // Deliberately NOT "was it ever marked useful". That form made one
-        // verdict permanent and let the maintenance loop freeze exactly the
-        // items that already dominate - see
-        // `usefulness::noise_since_last_useful`. A useful mark still
-        // protects: it resets the count below to zero.
-        self.noise.get(&item.id).copied().unwrap_or(0) >= NOISE_MARKS_BEFORE_STALE
+        let Some(tally) = self.noise.get(&item.id) else { return false };
+        if !tally.places.values().any(|n| enough_marks(*n)) {
+            return false;
+        }
+        crate::rank::matched_places(item, input).iter().any(|place| enough_marks(tally.at(place)))
+    }
+
+    /// Where the noise marks of `id` stand, for the mark tool's reply.
+    pub fn tally_of(&self, id: &str) -> NoiseTally {
+        self.noise.get(id).cloned().unwrap_or_default()
     }
 }
 
@@ -220,6 +272,14 @@ impl DecayContext {
 /// an agent's own noise verdict on the refusal it just received.
 pub fn retain_live(items: Vec<RankedItem>, decay: &DecayContext) -> Vec<RankedItem> {
     items.into_iter().filter(|r| !decay.is_stale(&r.item)).collect()
+}
+
+/// `retain_live` for a surface that knows what is happening (a file, a command,
+/// a tool, a prompt): an item called noise twice AT the place `input` reaches
+/// it through is dropped here too, and still served at every other place.
+/// Order-preserving, exactly like `retain_live`.
+pub fn retain_live_at(items: Vec<RankedItem>, decay: &DecayContext, input: &ServeInput) -> Vec<RankedItem> {
+    items.into_iter().filter(|r| !decay.is_stale_at(&r.item, input)).collect()
 }
 
 #[cfg(test)]
@@ -261,7 +321,7 @@ mod tests {
     /// A context where `id` was called noise `n` times and served a lot.
     fn called_noise(id: &str, n: usize) -> DecayContext {
         let mut noise = HashMap::new();
-        noise.insert(id.to_string(), n);
+        noise.insert(id.to_string(), NoiseTally::placeless(n));
         DecayContext { ever_marked_useful: HashSet::new(), noise }
     }
 
@@ -431,15 +491,21 @@ mod tests {
     /// folds over the whole log (`usefulness::ever_marked_useful`,
     /// `noise_since_last_useful`, both still there) and a look at the revisions
     /// of every id at the threshold. Kept here as the oracle.
-    fn load_by_the_old_folds(store: &EventStore) -> DecayContext {
+    fn load_by_the_old_folds(store: &EventStore) -> (HashSet<String>, HashMap<String, usize>) {
         let mut noise = crate::usefulness::noise_since_last_useful(store);
         for (id, count) in noise.iter_mut() {
             if *count < NOISE_MARKS_BEFORE_STALE {
                 continue;
             }
-            *count = crate::usefulness::noise_since_last_change(store, id);
+            *count = crate::usefulness::tally_since_last_change(store, id).total();
         }
-        DecayContext { ever_marked_useful: crate::usefulness::ever_marked_useful(store), noise }
+        (crate::usefulness::ever_marked_useful(store), noise)
+    }
+
+    /// What the context holds, as the plain counts the old folds produced (a
+    /// store with no place in any verdict has only placeless marks).
+    fn counts_of(decay: &DecayContext) -> HashMap<String, usize> {
+        decay.noise.iter().map(|(id, tally)| (id.clone(), tally.total())).collect()
     }
 
     fn serve_n(store: &mut EventStore, id: &str, n: usize) {
@@ -483,15 +549,16 @@ mod tests {
 
         let now = DecayContext::load(&store);
         let old = load_by_the_old_folds(&store);
-        assert_eq!(now.ever_marked_useful, old.ever_marked_useful);
-        assert_eq!(now.noise, old.noise);
+        assert_eq!(now.ever_marked_useful, old.0);
+        assert_eq!(counts_of(&now), old.1);
         // And the fixture really exercises each branch.
         assert!(now.was_ever_marked_useful("a") && now.was_ever_marked_useful("e") && !now.was_ever_marked_useful("d"));
-        assert_eq!(now.noise.get("a"), Some(&1), "noise after the useful mark");
-        assert_eq!(now.noise.get("b"), Some(&1), "a text revision cleared the older verdicts");
-        assert_eq!(now.noise.get("c"), Some(&2), "a tag change keeps them");
-        assert_eq!(now.noise.get("d"), Some(&4));
-        assert_eq!(now.noise.get("e"), Some(&0));
+        let counts = counts_of(&now);
+        assert_eq!(counts.get("a"), Some(&1), "noise after the useful mark");
+        assert_eq!(counts.get("b"), Some(&1), "a text revision cleared the older verdicts");
+        assert_eq!(counts.get("c"), Some(&2), "a tag change keeps them");
+        assert_eq!(counts.get("d"), Some(&4));
+        assert_eq!(counts.get("e"), Some(&0));
     }
 
     /// The same equality on a store file opened the way the hook opens it
@@ -511,9 +578,9 @@ mod tests {
         let reader = EventStore::open_read_only(&path).unwrap();
         let now = DecayContext::load(&reader);
         let old = load_by_the_old_folds(&reader);
-        assert_eq!(now.ever_marked_useful, old.ever_marked_useful);
-        assert_eq!(now.noise, old.noise);
-        assert_eq!(now.noise.get("a"), Some(&2));
+        assert_eq!(now.ever_marked_useful, old.0);
+        assert_eq!(counts_of(&now), old.1);
+        assert_eq!(counts_of(&now).get("a"), Some(&2));
     }
 
     /// FIX 2: a rule whose check can refuse is never retired from showing,
@@ -555,7 +622,7 @@ mod tests {
     #[test]
     fn retain_live_drops_only_the_retired_item_and_keeps_order() {
         let mut noise = HashMap::new();
-        noise.insert("noisy-1".to_string(), NOISE_MARKS_BEFORE_STALE);
+        noise.insert("noisy-1".to_string(), NoiseTally::placeless(NOISE_MARKS_BEFORE_STALE));
         let decay = DecayContext { ever_marked_useful: HashSet::new(), noise };
         let items = vec![ranked_from(bound("first")), ranked_from(bound("noisy-1")), ranked_from(bound("last"))];
         let ids: Vec<String> = retain_live(items, &decay).iter().map(|r| r.id.clone()).collect();
@@ -571,5 +638,177 @@ mod tests {
         assert!(judged("i1", &verdicts).is_stale(&bound("i1")), "fixture sanity: retired before any mark");
         verdicts.push(true);
         assert!(!judged("i1", &verdicts).is_stale(&bound("i1")));
+    }
+
+    // ---------------------------------------------------- noise per place (2026-11-20)
+
+    fn two_files() -> Item {
+        let mut item = item_of(
+            "two-files",
+            vec![
+                Binding::Target { kind: model::item::TargetKind::Path, value: "src/a.rs".to_string() },
+                Binding::Target { kind: model::item::TargetKind::Path, value: "src/b.rs".to_string() },
+            ],
+        );
+        item.project = Some("p".to_string());
+        item
+    }
+
+    fn touching(path: &str) -> ServeInput {
+        let mut input = ServeInput::default();
+        input.add_file(path);
+        input
+    }
+
+    fn mark_at(store: &mut EventStore, id: &str, noise: bool, n: usize, place: Option<&str>) {
+        for i in 0..n {
+            let at = format!("2026-11-{:02}T00:00:00Z", i + 1);
+            if noise {
+                crate::mark::record_noise_at(store, "s", "l", "a", &at, id, None, place).unwrap();
+            } else {
+                crate::mark::record_useful_at(store, "s", "l", "a", &at, id, None, place).unwrap();
+            }
+        }
+    }
+
+    fn declared_two_files(store: &mut EventStore) -> Item {
+        let mut item = two_files();
+        item.falsifier = Some("it stops being true".to_string());
+        model::store::declare(store, "t", "t", "t", &item).expect("fixture must store");
+        item
+    }
+
+    /// THE POINT: two noise marks at one place silence the note THERE and
+    /// nowhere else.
+    #[test]
+    fn two_noise_marks_at_one_place_silence_it_there_only() {
+        let mut store = EventStore::in_memory().unwrap();
+        let item = declared_two_files(&mut store);
+        mark_at(&mut store, "two-files", true, NOISE_MARKS_BEFORE_STALE, Some("path:src/a.rs"));
+        let decay = DecayContext::load(&store);
+        assert!(decay.is_stale_at(&item, &touching("src/a.rs")), "silenced at the place it was called noise at");
+        assert!(!decay.is_stale_at(&item, &touching("src/b.rs")), "still served at its other place");
+        assert!(!decay.is_stale(&item), "and not stale everywhere");
+        let ids = |input: &ServeInput| -> Vec<String> {
+            retain_live_at(vec![ranked_from(item.clone())], &decay, input).iter().map(|r| r.id.clone()).collect()
+        };
+        assert!(ids(&touching("src/a.rs")).is_empty());
+        assert_eq!(ids(&touching("src/b.rs")), vec!["two-files".to_string()]);
+    }
+
+    #[test]
+    fn one_noise_mark_per_place_silences_nothing() {
+        let mut store = EventStore::in_memory().unwrap();
+        let item = declared_two_files(&mut store);
+        mark_at(&mut store, "two-files", true, 1, Some("path:src/a.rs"));
+        mark_at(&mut store, "two-files", true, 1, Some("path:src/b.rs"));
+        let decay = DecayContext::load(&store);
+        assert!(!decay.is_stale_at(&item, &touching("src/a.rs")) && !decay.is_stale_at(&item, &touching("src/b.rs")));
+    }
+
+    /// OLD STORES BEHAVE AS BEFORE: two marks with no place silence the note
+    /// everywhere, whatever the place.
+    #[test]
+    fn two_placeless_noise_marks_still_silence_it_everywhere() {
+        let mut store = EventStore::in_memory().unwrap();
+        let item = declared_two_files(&mut store);
+        mark_at(&mut store, "two-files", true, NOISE_MARKS_BEFORE_STALE, None);
+        let decay = DecayContext::load(&store);
+        assert!(decay.is_stale(&item));
+        assert!(decay.is_stale_at(&item, &touching("src/a.rs")) && decay.is_stale_at(&item, &touching("src/b.rs")));
+        assert!(decay.is_stale_at(&item, &touching("somewhere/else.rs")));
+    }
+
+    #[test]
+    fn one_placeless_mark_and_one_placed_mark_do_not_add_up() {
+        let mut store = EventStore::in_memory().unwrap();
+        let item = declared_two_files(&mut store);
+        mark_at(&mut store, "two-files", true, 1, None);
+        mark_at(&mut store, "two-files", true, 1, Some("path:src/a.rs"));
+        let decay = DecayContext::load(&store);
+        assert!(!decay.is_stale_at(&item, &touching("src/a.rs")));
+    }
+
+    /// Marks at three different places say the note is wrong in general.
+    #[test]
+    fn noise_at_three_different_places_silences_it_everywhere() {
+        let mut store = EventStore::in_memory().unwrap();
+        let item = declared_two_files(&mut store);
+        for place in ["path:src/a.rs", "path:src/b.rs", "command:cargo"] {
+            mark_at(&mut store, "two-files", true, 1, Some(place));
+        }
+        let decay = DecayContext::load(&store);
+        assert!(decay.is_stale(&item), "three places, one mark each");
+        assert!(decay.is_stale_at(&item, &touching("src/never-seen.rs")));
+        // Two places are not enough.
+        let mut store = EventStore::in_memory().unwrap();
+        let item = declared_two_files(&mut store);
+        for place in ["path:src/a.rs", "path:src/b.rs"] {
+            mark_at(&mut store, "two-files", true, 1, Some(place));
+        }
+        assert!(!DecayContext::load(&store).is_stale(&item));
+    }
+
+    /// A useful mark at a place clears that place's noise only; a placeless one
+    /// clears them all, as it always did.
+    #[test]
+    fn a_useful_mark_at_a_place_clears_that_places_noise() {
+        let mut store = EventStore::in_memory().unwrap();
+        let item = declared_two_files(&mut store);
+        mark_at(&mut store, "two-files", true, NOISE_MARKS_BEFORE_STALE, Some("path:src/a.rs"));
+        mark_at(&mut store, "two-files", true, NOISE_MARKS_BEFORE_STALE, Some("path:src/b.rs"));
+        let decay = DecayContext::load(&store);
+        assert!(decay.is_stale_at(&item, &touching("src/a.rs")) && decay.is_stale_at(&item, &touching("src/b.rs")));
+        mark_at(&mut store, "two-files", false, 1, Some("path:src/a.rs"));
+        let decay = DecayContext::load(&store);
+        assert!(!decay.is_stale_at(&item, &touching("src/a.rs")), "brought back where it was confirmed");
+        assert!(decay.is_stale_at(&item, &touching("src/b.rs")), "the other place stays silenced");
+        mark_at(&mut store, "two-files", false, 1, None);
+        let decay = DecayContext::load(&store);
+        assert!(!decay.is_stale_at(&item, &touching("src/b.rs")), "a placeless useful mark clears every place");
+    }
+
+    /// A verdict judged the version served when it was given: a rewrite clears
+    /// the marks at every place.
+    #[test]
+    fn a_text_change_clears_the_noise_at_every_place() {
+        let mut store = EventStore::in_memory().unwrap();
+        let mut item = declared_two_files(&mut store);
+        mark_at(&mut store, "two-files", true, NOISE_MARKS_BEFORE_STALE, Some("path:src/a.rs"));
+        assert!(DecayContext::load(&store).is_stale_at(&item, &touching("src/a.rs")));
+        item.text = "a better text".to_string();
+        revise_raw(&mut store, &item);
+        assert!(!DecayContext::load(&store).is_stale_at(&item, &touching("src/a.rs")));
+    }
+
+    #[test]
+    fn a_pinned_or_refusing_item_is_never_silenced_at_a_place() {
+        let mut armed = two_files();
+        armed.check = Some(model::item::Check::Forbidden { literals: vec!["--force".to_string()] });
+        let mut decay = DecayContext::empty();
+        decay.noise.insert("two-files".to_string(), NoiseTally { placeless: 0, places: [("path:src/a.rs".to_string(), 5)].into() });
+        assert!(!decay.is_stale_at(&armed, &touching("src/a.rs")), "a rule whose check can refuse stays shown");
+        let mut pinned = two_files();
+        pinned.bindings.push(Binding::Always);
+        assert!(!decay.is_stale_at(&pinned, &touching("src/a.rs")), "a pinned note is never hidden");
+    }
+
+    /// A command place, as a serving records it: the command text reaches the
+    /// binding, so the place a mark derives from the trigger is the binding's.
+    #[test]
+    fn a_trigger_names_the_binding_it_reached() {
+        let item = item_of(
+            "cmd",
+            vec![
+                Binding::Target { kind: model::item::TargetKind::Command, value: "git push".to_string() },
+                Binding::Target { kind: model::item::TargetKind::Path, value: "src/a.rs".to_string() },
+            ],
+        );
+        assert_eq!(crate::rank::places_of_trigger(&item, "git push origin main"), vec!["command:git push".to_string()]);
+        assert_eq!(crate::rank::places_of_trigger(&item, "src/a.rs"), vec!["path:src/a.rs".to_string()]);
+        assert!(crate::rank::places_of_trigger(&item, "ls -la").is_empty());
+        assert_eq!(crate::rank::resolve_place(&item, "src\\a.rs").unwrap(), "path:src/a.rs");
+        assert_eq!(crate::rank::resolve_place(&item, "command:git push").unwrap(), "command:git push");
+        assert!(crate::rank::resolve_place(&item, "src/zzz.rs").unwrap_err().contains("command:git push"));
     }
 }

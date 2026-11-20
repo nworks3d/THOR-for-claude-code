@@ -1678,6 +1678,8 @@ fn busy_frozen(batch: usize, a4: usize, disputes: usize, blocks: usize, carriers
         started_unix: 1_790_000_000,
         prev_report_seq: 0,
         judgement: (0..judgement).map(|n| format!("judged-rule-{n}")).collect(),
+        judgement_later: 0,
+        reread: vec![],
         batch: Some(batch_ids),
         batch_later: 0,
         a4_list: Some(a4_ids),
@@ -1806,7 +1808,7 @@ fn crowded_places_fit_the_start_note_within_the_size_budget() {
         "DONE WHEN: the place holds 4 or fewer facts",
         "'scripts/deploy-to-production.sh': 12 facts",
         "'docker compose up --build --force-recreate (command)': 12 facts",
-        "the most-served first, at most 5 per evaluation",
+        "the most-served first, a quarter of what could be listed - at least 5 and at most 15 per evaluation",
         "'judged-rule-4'",
     ] {
         assert!(note.contains(must), "missing {must}: {note}");
@@ -2296,4 +2298,25 @@ fn a_firing_at_a_tool_call_without_a_command_shows_the_tool_name_and_the_date() 
     assert!(!fired_line(Some(&command), 3).contains("a call of the tool"));
     let none = model::store::Firings { triggers: vec![model::store::FIRED_WITHOUT_TRIGGER.to_string()], ..fired };
     assert!(fired_line(Some(&none), 3).contains("neither a command, a file nor the tool's name"));
+}
+
+// ------------------------------------------------ pinned notes to re-read (2026-11-20)
+
+/// The start note carries the re-read section only when the evaluation listed
+/// pinned notes; it names both calls, refuses the unpin, and a list with only
+/// a pinned note on it is not "nothing to do".
+#[test]
+fn the_start_note_lists_the_pinned_notes_to_re_read_and_never_offers_an_unpin() {
+    let mut frozen = busy_frozen(0, 0, 0, 0, 0, 0);
+    let plain = render_start_note("evaluation-start-demo-500", &frozen);
+    assert!(!plain.contains("PINNED NOTES TO RE-READ"), "no section without a listed note");
+
+    frozen.reread = vec!["pinned-one".to_string(), "pinned-two".to_string()];
+    let note = render_start_note("evaluation-start-demo-500", &frozen);
+    assert!(note.contains("1b. PINNED NOTES TO RE-READ - 2 pinned note(s)"), "{note}");
+    assert!(note.contains("'pinned-one', 'pinned-two'") || note.contains("pinned-one"), "{note}");
+    assert!(note.contains("mcp__thor__mark(id: \"pinned-one\")") && note.contains("mcp__thor__revise(id: \"pinned-two\""), "{note}");
+    assert!(note.contains("do not unpin it, and do not mark it noise"), "{note}");
+    assert!(!note.contains("unpin it if"), "the note never suggests an unpin: {note}");
+    assert!(!nothing_to_do(&frozen), "a pinned note to re-read is something to do");
 }

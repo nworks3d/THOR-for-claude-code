@@ -102,6 +102,24 @@ pub fn plain_summary(db: &Path, cwd: &Path, settings: Option<&Path>, mcp_json: O
         Ok(_) => lines.push("  OK: your memory file is there and in good shape.".to_string()),
     }
 
+    // EVERY pinned note taken down through a tool call (unpin, a revise that removes the
+    // pin, a retract), whatever its reason, with how THOR let it through: the owner's rule
+    // is only as good as his seeing what got past it. The last 30 days, five shown, the
+    // rest counted.
+    if let Ok(store) = EventStore::open_existing(db) {
+        let now = serve::time::now_unix();
+        let recent: Vec<_> = model::store::tool_unpins(&store, 0, i64::MAX)
+            .into_iter()
+            .filter(|u| model::store::time_near_seq(&store, u.seq).is_some_and(|at| now - at < 30 * 86_400))
+            .collect();
+        for u in recent.iter().take(5) {
+            lines.push(format!("  NOTE: {}", model::store::unpin_line(u)));
+        }
+        if recent.len() > 5 {
+            lines.push(format!("  NOTE: {} more pinned note(s) were taken down in the last 30 days", recent.len() - 5));
+        }
+    }
+
     match settings.map(|s| hooks_name_this_memory(s, db)) {
         Some(true) => lines.push("  OK: THOR is connected to Claude Code.".to_string()),
         _ => lines.push(format!(
@@ -1642,7 +1660,11 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool
         return (!lines.is_empty()).then(|| lines.join("\n"));
     }
     let threshold = serve::usefulness::JUDGEMENT_DEBT_AFTER;
-    let cap = serve::usefulness::EVALUATION_JUDGEMENT_LIST_CAP;
+    let cap = format!(
+        "{} to {}, a quarter of what could be listed",
+        model::store::EVALUATION_JUDGEMENT_LIST_MIN,
+        model::store::EVALUATION_JUDGEMENT_LIST_MAX
+    );
     let mut problem_lines: Vec<String> = Vec::new();
     let mut out = vec![match checkout_project {
         Some(project) => format!(
@@ -1651,7 +1673,7 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool
              by pinning them) - {in_project} of them apply to this checkout ('{project}', or global); they are \
              never asked at the end of a turn, and an evaluation asks about one only when it fired in the evaluating \
              session or in another session of the project, the most-served first \
-             and at most {cap} per evaluation - so an item that fired in no session of the project \
+             and {cap} per evaluation - so an item that fired in no session of the project \
              stays owed until it is settled with mark or retract; the \
              longest owed are named below, each with its sessions since its last verdict"
         ),
@@ -1661,8 +1683,8 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool
              by pinning them) - this checkout resolves to no project, so only the {in_project} global one(s) \
              among them could ever be asked about here; they are never asked at the end of a turn, and an \
              evaluation asks about one only when it fired in the evaluating session or in another session of the \
-             project, the most-served first and at \
-             most {cap} per evaluation - so an item that fired in no session of the project \
+             project, the most-served first, \
+             {cap} per evaluation - so an item that fired in no session of the project \
              stays owed until it is settled with mark or retract; the longest owed are named below, each \
              with its sessions since its last verdict"
         ),
@@ -3292,6 +3314,9 @@ pub fn gate_line(db: &Path) -> String {
     let mut rules: std::collections::BTreeMap<String, usize> = Default::default();
     let mut sessions: std::collections::BTreeMap<String, usize> = Default::default();
     let mut actors: std::collections::BTreeMap<String, usize> = Default::default();
+    // Rules broken during a turn by a script and left broken after THOR asked
+    // twice to undo it (`serve::turn_violation`): the owner's call.
+    let mut left_standing: std::collections::BTreeMap<String, usize> = Default::default();
     for event in &events {
         match event.kind {
             thor_core::event_store::EventKind::GateRefused => {
@@ -3301,7 +3326,10 @@ pub fn gate_line(db: &Path) -> String {
                 *actors.entry(event.actor.clone()).or_default() += 1;
             }
             thor_core::event_store::EventKind::GateStoodAside if !RECORDS_NOT_STAND_ASIDES.contains(&event.actor.as_str()) => {
-                stood_aside += 1
+                stood_aside += 1;
+                if let Some(rule) = event.entity_id.strip_prefix("turn-violation:") {
+                    *left_standing.entry(rule.to_string()).or_default() += 1;
+                }
             }
             _ => {}
         }
@@ -3347,6 +3375,9 @@ pub fn gate_line(db: &Path) -> String {
     }
     if named.len() > NAMES_AT_MOST {
         out.push(format!("  refused by: and {} more rule(s), not named here", named.len() - NAMES_AT_MOST));
+    }
+    for (rule, count) in left_standing.iter().take(NAMES_AT_MOST) {
+        out.push(format!("  broken by a script and left broken after two holds: {rule} ({count}x) - the owner decides"));
     }
     out.join("\n")
 }

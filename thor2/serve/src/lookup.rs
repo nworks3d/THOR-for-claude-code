@@ -141,6 +141,23 @@ pub fn stem_match_note() -> &'static str {
      each long word, so other forms of a word are found too). Check that they really are what you meant."
 }
 
+/// The one line a reply owes its caller when the search found no literal
+/// answer: no matches at all, meaning-search hits only, or word-stem hits only.
+/// A memory search that ends there is not an answer: the project's own files
+/// are the other source. `None` when literal hits were found. One wording for
+/// every door (the agent's `lookup` tool and the CLI `search`).
+pub fn look_in_files_hint(no_matches: bool, literal_found_any: bool, stems_only: bool) -> Option<&'static str> {
+    if no_matches || !literal_found_any || stems_only {
+        Some(LOOK_IN_FILES_HINT)
+    } else {
+        None
+    }
+}
+
+/// The wording of `look_in_files_hint`. Under about 220 characters.
+pub const LOOK_IN_FILES_HINT: &str = "next: retry with one or two distinctive words, one question per search. The memory is one source: \
+     also check the project's own files; do not answer from a hit that only resembles the question; say so if not found.";
+
 /// A query word shorter than this is never looked for inside an id, and a
 /// word shorter than `MIN_STEM_WORD_LETTERS` is never cut down to a stem.
 const MIN_ID_WORD_CHARS: usize = 4;
@@ -2015,6 +2032,19 @@ mod tests {
     fn meaning_only_note_appears_only_when_the_literal_leg_found_nothing() {
         assert!(meaning_only_note(false).is_some(), "no literal hit at all must add the honesty note");
         assert!(meaning_only_note(true).is_none(), "a literal hit must never carry this note");
+    }
+
+    /// The look-in-the-files line comes for every reply without a literal
+    /// answer (no matches, meaning-only, stem-only) and never with literal hits.
+    #[test]
+    fn look_in_files_hint_appears_only_without_a_literal_answer() {
+        assert_eq!(look_in_files_hint(true, false, false), Some(LOOK_IN_FILES_HINT), "no matches");
+        assert_eq!(look_in_files_hint(false, false, false), Some(LOOK_IN_FILES_HINT), "meaning only");
+        assert_eq!(look_in_files_hint(false, true, true), Some(LOOK_IN_FILES_HINT), "stems only");
+        assert_eq!(look_in_files_hint(false, true, false), None, "literal hits");
+        assert!(LOOK_IN_FILES_HINT.chars().count() < 220, "one short line");
+        assert!(!LOOK_IN_FILES_HINT.contains('\n'));
+        assert!(LOOK_IN_FILES_HINT.contains("project's own files"));
     }
 
     /// THE DEFECT THIS PREVENTS: a kind-filtered search that finds nothing

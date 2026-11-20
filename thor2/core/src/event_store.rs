@@ -1214,6 +1214,17 @@ impl EventStore {
         tip == max_seq && max_seq > 0
     }
 
+    /// A cheap fingerprint of "the live items changed": the newest `head_seq`
+    /// of any current head and how many current heads there are. The newest
+    /// seq moves whenever an item is created, revised or retracted (a new head
+    /// always carries a newer seq) and never for telemetry; the count moves
+    /// when a head is deleted without a new one added (resolving a diverged
+    /// item). For a cache of a derived list. Only meaningful when the
+    /// projection is current.
+    pub fn projected_heads_fingerprint(&self) -> SqlResult<(i64, i64)> {
+        self.conn.query_row("SELECT COALESCE(MAX(head_seq), 0), COUNT(*) FROM head_state", [], |r| Ok((r.get(0)?, r.get(1)?)))
+    }
+
     /// Is this rev a CURRENT head of its entity? (Point lookup on the PK.)
     pub fn projected_is_head(&self, entity_id: &str, rev_hash: &str) -> bool {
         self.conn
@@ -1853,6 +1864,27 @@ impl EventStore {
             let kind = EventKind::from_str(kind_str).ok_or(rusqlite::Error::InvalidQuery)?;
             let entity_id: String = row.get(1)?;
             Ok((kind, entity_id))
+        })?;
+        rows.collect()
+    }
+
+    /// Every verdict (`item_marked_useful`, `item_marked_noise`) as `(seq, kind,
+    /// entity_id, place)`, in log order, `place` being the `"place"` the verdict's
+    /// body names, when it names one. The body is read only for the rows that
+    /// carry a place at all (a `LIKE` on the column), so a long log of plain
+    /// verdicts costs no more than `event_kinds_of` did.
+    pub fn verdict_places(&self) -> SqlResult<Vec<(i64, EventKind, String, Option<String>)>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT seq, kind, entity_id, CASE WHEN body LIKE '%\"place\"%' THEN body ELSE NULL END FROM event WHERE kind IN ('item_marked_useful', 'item_marked_noise') ORDER BY seq",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let kind_str: &str = row.get_ref(1)?.as_str()?;
+            let kind = EventKind::from_str(kind_str).ok_or(rusqlite::Error::InvalidQuery)?;
+            let body: Option<String> = row.get(3)?;
+            let place = body
+                .and_then(|b| serde_json::from_str::<serde_json::Value>(&b).ok())
+                .and_then(|v| v.get("place").and_then(|p| p.as_str()).map(str::to_string));
+            Ok((row.get::<_, i64>(0)?, kind, row.get::<_, String>(2)?, place))
         })?;
         rows.collect()
     }
@@ -2589,6 +2621,20 @@ mod fts_integrity_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A resolve of a diverged item deletes heads and adds none: the newest
+    /// seq stays, the fingerprint must still move.
+    #[test]
+    fn the_heads_fingerprint_moves_when_a_head_is_deleted_without_a_new_one() {
+        let mut store = EventStore::in_memory().unwrap();
+        store.append_event("s", "l", "t", EventKind::FactCreated, "P:old", None, "old").unwrap();
+        store.append_event("s", "l", "t", EventKind::FactCreated, "P:new", None, "new").unwrap();
+        let before = store.projected_heads_fingerprint().unwrap();
+        store.conn.execute("DELETE FROM head_state WHERE entity_id = 'P:old'", []).unwrap();
+        let after = store.projected_heads_fingerprint().unwrap();
+        assert_eq!(before.0, after.0, "the newest head seq did not move");
+        assert_ne!(before, after, "the fingerprint must");
+    }
 
     /// Both file-backed constructors must cap how large the WAL is allowed
     /// to stay after a checkpoint reclaims it - `journal_size_limit` is a

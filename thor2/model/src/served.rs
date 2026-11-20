@@ -138,7 +138,7 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 /// fail-open read, never a panic, for a body this crate did not necessarily
 /// write itself - see `served_count`'s own doc comment for why 0 is the safe
 /// fallback everywhere a `None` here ends up.
-fn unix_from_iso8601(s: &str) -> Option<i64> {
+pub(crate) fn unix_from_iso8601(s: &str) -> Option<i64> {
     let b = s.as_bytes();
     if b.len() != 20
         || b[4] != b'-'

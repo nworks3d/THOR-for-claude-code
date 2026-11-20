@@ -1037,10 +1037,10 @@ pub fn working_contract() -> Vec<model::item::Item> {
         ),
         rule(
             "a-new-project-is-one-command",
-            "Giving a folder its own memory is ONE command, run FROM that folder: `install --db \
-             <your store> --project <name>` for code, or `install --db <your store> --topic` for \
-             a plain folder of notes and files (no git). It marks the folder and registers it. \
-             The owner names a project - never you.",
+            "Giving a folder its own memory is ONE command: run the install program from inside it, \
+             naming the store and, for code, the project, or, for a plain folder, the topic \
+             option. It marks and registers the folder. Options: lookup first-session-questions. \
+             The owner names a project, never you.",
             "A folder set up with that one command turns out to be missing its marker, its \
              registration, its code reading or its refresh on commit.",
         ),
@@ -1439,8 +1439,8 @@ pub fn workflow_starter_pack_for(windows: bool) -> Vec<model::item::Item> {
         note(
             "script-file-not-shell-quoting",
             "Text with quotes, backticks, $ or backslashes goes into a script file written with the \
-             Write tool, then run that file. A bash -c, node -e or python -c one-liner, or a \
-             heredoc, can silently mangle it. In PowerShell, feed the remote script to ssh via \
+             Write tool, then run that file. A one-liner for bash, node or python, or a heredoc, \
+             can silently mangle it. In PowerShell, feed the remote script to ssh via \
              stdin: nested double quotes get re-quoted.",
             "Nested quotes and backslashes pass intact through a shell one-liner or heredoc on this \
              machine.",
@@ -3156,7 +3156,9 @@ mod tests {
             assert!(model::gate::unnamed_literals(&item).is_empty(), "{}", item.id);
         }
         let install = working_contract().into_iter().find(|i| i.id == "a-new-project-is-one-command").unwrap();
-        assert!(install.text.contains("`install --db <your store> --project <name>`"), "{}", install.text);
+        assert!(install.text.contains("ONE command") && install.text.contains("first-session-questions"), "{}", install.text);
+        // No flag and no backtick span: THOR builds no tooth from its own words.
+        assert!(!install.text.contains("--") && !install.text.contains('`'), "{}", install.text);
     }
 
     /// THE DEFECT THIS GUARDS AGAINST: a starter pack that is stored and then

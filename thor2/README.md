@@ -191,7 +191,8 @@ tool server finds it again by the session id it runs under. The record
 freezes three lists, none of which can grow afterwards: the judgement
 list (what fired in that session or in another session of the project,
 and in 10 sessions or more since its last verdict,
-a fact counting once per session; the most-served first, at most 5),
+a fact counting once per session; the most-served first, a quarter of what
+could be listed, at least 5 and at most 15),
 the batch (at most 8 old rules only an agent can fix) and the A4 list (at
 most 16 rules whose check bites and whose text only has to name its literal).
 Right after it, THOR's machine pass tries the project's old rules itself, in a
@@ -295,8 +296,11 @@ per project and not per folder, when:
   per project. A fact counts ONCE PER SESSION toward the 10 that make a verdict
   owed, however often it was shown there, so 10 means about 10 sessions (it was
   40 until 2026-11-01, which was so high that 36 evaluation reports in a row
-  listed nothing). An evaluation lists at most 5 of the owed notes, the
-  most-served first, so the lower threshold never becomes a wall of verdicts.
+  listed nothing). An evaluation lists a quarter of the notes it
+  could list (at least 5, at most 15), the most-served first, so the lower
+  threshold never becomes a wall of verdicts and a backlog clears in about
+  four evaluations. It also lists at most 3 pinned notes to re-read, each
+  settled by a useful mark or a rewrite of its text, never by an unpin.
   It also lists at most 3 crowded places (a file or command with more than 4
   facts bound to it, where the lowest ranked are never shown at their moment),
   each settled by a real fold, move or retract and held like the batch; a place
@@ -672,7 +676,7 @@ counts, and without `agent_id` the field changes nothing.
 target/release/doctor.exe --db "<store>"
 ```
 
-Its first line always names the build it was run from (`doctor 2.6.11`), so a
+Its first line always names the build it was run from (`doctor 2.6.12`), so a
 report you paste somewhere says which version made it - every program in this
 directory answers the same way to `--version` or `-V`, on its own, with no
 store needed.
@@ -1112,6 +1116,11 @@ So, from a program: two or three distinctive words, not a sentence, and
 `--kind rule` when it is a rule you want. And when what you really need is
 "tell me what applies to what I am about to do", use the moment door above
 instead - that is the one built for it.
+
+When a search finds no literal answer (no matches, or only meaning or word-stem
+hits), the reply ends with one line telling the caller to retry with one or two
+distinctive words and to look in the project's own files too, not to answer from
+a hit that only resembles the question.
 
 ## Run the tests
 

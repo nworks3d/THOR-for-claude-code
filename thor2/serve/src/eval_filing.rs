@@ -508,7 +508,7 @@ fn shares(log: &EventStore, start: &EvaluationStart, filed_seq: i64, project: &s
         let verdicts = model::store::recorded_write_verdicts(&events);
         match model::store::write_door(event, &verdicts, session) {
             WriteDoor::Attested { .. } => {
-                if !start.frozen.judgement.contains(&event.entity_id) {
+                if !start.frozen.judgement.contains(&event.entity_id) && !start.frozen.reread.contains(&event.entity_id) {
                     shares.off_list += 1;
                 }
             }
@@ -885,6 +885,7 @@ pub fn project_rot(store: &EventStore, project: &str) -> Option<String> {
     if let Some(start) = start {
         let machine_points = start.frozen.machine.as_ref().map_or(0, |m| m.points.len());
         let to_do = start.frozen.judgement.len()
+            + start.frozen.reread.len()
             + start.frozen.batch().len()
             + start.frozen.a4_list().len()
             + machine_points;
@@ -972,10 +973,10 @@ pub fn drift_recorded(store: &EventStore) -> bool {
 
 /// The one-way flag (B7): at least this many verdicts on an evaluation's
 /// list, every one the same way. A whole judgement list: since 2026-11-01 an
-/// evaluation lists at most `EVALUATION_JUDGEMENT_LIST_CAP` items, so the old
-/// floor of ten could never be reached again and the flag would have died
-/// silently.
-pub const ONE_WAY_AT: usize = crate::usefulness::EVALUATION_JUDGEMENT_LIST_CAP;
+/// evaluation lists as few as `EVALUATION_JUDGEMENT_LIST_MIN` items, so the old
+/// floor of ten could not be reached by a small list and the flag would have
+/// died silently.
+pub const ONE_WAY_AT: usize = crate::usefulness::EVALUATION_JUDGEMENT_LIST_MIN;
 
 /// "eval-<id>: <u> useful, <n> noise, <s> skipped (<p>% useful)" for one
 /// valid evaluation - `p` rounded, and "no verdict" when none was given.

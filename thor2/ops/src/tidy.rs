@@ -130,7 +130,8 @@ fn refuse_file(home: &Path, file: &Path, target: &Path) -> Option<String> {
     if serve::project::git_root(parent).is_some() {
         return Some("it belongs to a programming project (a git repository)".to_string());
     }
-    if norm(parent) == norm(target) {
+    // Anywhere inside the target, at any depth: it is already in that folder.
+    if norm(parent) == norm(target) || norm(parent).starts_with(&format!("{}/", norm(target))) {
         return Some("it is already in that folder".to_string());
     }
     None
@@ -138,6 +139,17 @@ fn refuse_file(home: &Path, file: &Path, target: &Path) -> Option<String> {
 
 fn today() -> String {
     serve::time::now_iso8601().chars().take(10).collect()
+}
+
+/// Whether `name` is exactly how a tidy undo log is named beside the memory:
+/// `tidy-YYYY-MM-DD-<n>.json`, or `tidy-YYYY-MM-DD-<n>.undone.json` once it was
+/// used. Nothing else (a file of the person's called tidy-something.json) is one.
+pub fn is_undo_log_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("tidy-").and_then(|r| r.strip_suffix(".json")) else { return false };
+    let rest = rest.strip_suffix(".undone").unwrap_or(rest);
+    let parts: Vec<&str> = rest.split('-').collect();
+    let digits = |s: &str, n: Option<usize>| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()) && n.is_none_or(|n| s.len() == n);
+    parts.len() == 4 && digits(parts[0], Some(4)) && digits(parts[1], Some(2)) && digits(parts[2], Some(2)) && digits(parts[3], None)
 }
 
 fn log_files(dir: &Path) -> Vec<(String, u32, PathBuf)> {
@@ -187,21 +199,26 @@ pub fn tidy(db: &Path, plan_text: &str, home: &Path) -> Result<Vec<String>, Stri
     let mut log = UndoLog { made: serve::time::now_iso8601(), ..Default::default() };
     let mut lines = Vec::new();
     let mut ready_folders: Vec<String> = Vec::new();
+    // Folders and files the plan named that were refused or left alone.
+    let mut refused = 0usize;
     for entry in &plan {
         let folder = PathBuf::from(&entry.folder);
         if let Some(why) = refuse_folder(home, &folder) {
             lines.push(format!("! REFUSED {}: {why}. Nothing was moved for this one.", entry.folder));
+            refused += 1 + entry.files.len();
             continue;
         }
         let (top, key) = match topic_of(&folder) {
             Ok(found) => found,
             Err(refusal) => {
                 lines.push(format!("! {refusal}"));
+                refused += 1 + entry.files.len();
                 continue;
             }
         };
         if let Err(refusal) = check_registration_at(db, &top, &key) {
             lines.push(format!("! {refusal}"));
+            refused += 1 + entry.files.len();
             continue;
         }
         let existed = folder.is_dir();
@@ -226,6 +243,7 @@ pub fn tidy(db: &Path, plan_text: &str, home: &Path) -> Result<Vec<String>, Stri
             let file = PathBuf::from(f);
             if let Some(why) = refuse_file(home, &file, &folder) {
                 skipped.push(format!("  - left {f}: {why}"));
+                refused += 1;
                 continue;
             }
             let Some(name) = file.file_name() else { continue };
@@ -253,13 +271,19 @@ pub fn tidy(db: &Path, plan_text: &str, home: &Path) -> Result<Vec<String>, Stri
     }
     // THOR's own record that a plan was carried out: part of what settles the
     // tidy step (`model::store::record_order_evidence`; the Stop hook checks it
-    // against the person's answer). Only when a folder was really made ready.
-    if !ready_folders.is_empty() && (!log.moves.is_empty() || !log.folders.is_empty()) {
+    // against the person's answer). Whenever at least one folder of the plan
+    // passed the folder-level checks (made ready, or already a valid subject
+    // folder), also when everything already lay in place or all of its files were
+    // refused: the record says how many files moved and how many entries were
+    // refused. A plan whose folders were all refused (a drive root, the home
+    // folder, Documents ...) or that names none writes nothing.
+    if !ready_folders.is_empty() {
         if let Ok(mut store) = thor_core::event_store::EventStore::open_existing(db) {
             if model::store::show(&store, model::store::ORDER_NOTE_ID).is_ok() {
                 let body = serde_json::json!({
                     "folders": ready_folders,
                     "moved": log.moves.len(),
+                    "refused": refused,
                     "undo_log": if log.moves.is_empty() { String::new() } else { log_path.display().to_string() },
                 });
                 let _ = model::store::record_order_evidence(&mut store, "tidy", body);

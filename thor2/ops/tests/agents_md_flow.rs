@@ -162,3 +162,26 @@ fn the_windows_script_checks_the_c_runtime_before_it_runs_anything() {
     assert!(check < run, "the runtime check comes after the first run of install.exe");
     assert!(text.contains("winget"), "install.ps1 does not print the command that installs the runtime");
 }
+
+/// An assistant that cannot run anything (a plain chat) is told, at the very top
+/// of AGENTS.md and in the README, to answer with four click steps and no
+/// command, and no folder choice.
+#[test]
+fn a_plain_chat_gets_four_click_steps_and_no_command() {
+    let agents = read("AGENTS.md");
+    let heading = agents.find("## The whole install").expect("heading");
+    let top = &agents[..heading];
+    for must in [
+        "Can you not run commands on their computer?",
+        "you never give them a command",
+        "Open the Claude app on your computer.",
+        "Click **Code** at the top.",
+        "choose **Bypass permissions**",
+        "Install THOR, followed by the link to this page",
+    ] {
+        assert!(top.contains(must), "the top of AGENTS.md lacks '{must}'");
+    }
+    assert!(!top.to_lowercase().contains("folder"), "no folder choice in the chat answer");
+    let readme = read("README.md");
+    assert!(readme.contains("### If your assistant is only a chat") && readme.contains("Click **Code** at the top."));
+}

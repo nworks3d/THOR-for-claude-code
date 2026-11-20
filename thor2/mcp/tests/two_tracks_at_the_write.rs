@@ -622,7 +622,19 @@ fn g8_12_an_old_a4_failure_never_blocks_an_unpin() {
         },
     );
     let mut mcp = Mcp::start(&db, tmp.path());
-    let reply = mcp.call("unpin", json!({"id": "pinned-old"}));
+    // The rule carries a check that holds, so only the owner's own words take it down:
+    // his whole message quoted in `because`, witnessed by the hook (`serve::unpin_gate`).
+    let message = "Haal pinned-old maar los, ik heb hem vervangen door een betere.";
+    let transcript = tmp.path().join("owner-session.jsonl");
+    std::fs::write(&transcript, format!("{}
+", json!({"type": "user", "message": {"role": "user", "content": message}}))).unwrap();
+    let because = format!("the owner asked for it: \"{message}\"");
+    serve::unpin_gate::witness(
+        &db,
+        &json!({"tool_input": {"id": "pinned-old", "because": because}, "transcript_path": transcript}),
+        serve::time::now_unix(),
+    );
+    let reply = mcp.call("unpin", json!({"id": "pinned-old", "because": because}));
     println!("G8.12 unpin: {reply}");
     assert!(reply.starts_with("unpinned 'pinned-old'"), "{reply}");
     assert!(reply.contains("teeth: undecided - A4: '--mirror' not named in the text"), "{reply}");

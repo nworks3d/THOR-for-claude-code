@@ -341,7 +341,7 @@ fn read_bounded_bytes(path: &Path) -> Option<Vec<u8>> {
 /// `Holds` (no file contains anything) and `Contains` correctly `Fails` (no
 /// file contains the literal either) - see `run`'s own match arms for where
 /// that falls out of this returning `Some(vec![])`.
-fn read_bounded_targets(resolved: &Path, lossy_text: bool) -> Option<Vec<String>> {
+pub fn read_bounded_targets(resolved: &Path, lossy_text: bool) -> Option<Vec<String>> {
     if resolved.is_dir() {
         let mut contents = Vec::new();
         for entry in std::fs::read_dir(resolved).ok()? {

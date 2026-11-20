@@ -93,7 +93,7 @@ mod tests {
 /// 2026-11-01, which was too high to ever ask anything: every evaluation report
 /// of the previous two weeks listed 0 items while hundreds of notes were served
 /// again and again and never judged. The evaluation lists at most
-/// `EVALUATION_JUDGEMENT_LIST_CAP` of the owed notes, most-served first, so the
+/// `model::store::judgement_list_cap` of the owed notes, most-served first, so the
 /// lower threshold does not turn into a wall of verdicts.
 ///
 /// "SINCE its last verdict", not "with no verdict ever", and the difference
@@ -106,10 +106,12 @@ mod tests {
 /// revisiting. Ten more sessions is a long way to earn a second question.
 pub const JUDGEMENT_DEBT_AFTER: usize = 10;
 
-/// The most notes one evaluation lists for a verdict, most-served first - the
-/// owner's decision of 2026-11-01. Mirrors
-/// `model::store::EVALUATION_JUDGEMENT_LIST_CAP` (kept equal by a test).
-pub const EVALUATION_JUDGEMENT_LIST_CAP: usize = 5;
+/// The fewest notes one evaluation lists for a verdict when anything is owed,
+/// most-served first - the owner's decision of 2026-11-01; since 2026-11-20 the
+/// list grows with the backlog up to `model::store::EVALUATION_JUDGEMENT_LIST_MAX`
+/// (`model::store::judgement_list_cap`). Mirrors
+/// `model::store::EVALUATION_JUDGEMENT_LIST_MIN` (kept equal by a test).
+pub const EVALUATION_JUDGEMENT_LIST_MIN: usize = 5;
 
 /// The actor the hook stamps on every delivery (`ItemServed`) it records for
 /// a real assistant session - and the ONLY actor whose firings ever become
@@ -550,8 +552,8 @@ mod judgement_debt_counting_tests {
     #[test]
     fn the_judgement_numbers_are_the_same_in_model_and_serve() {
         assert_eq!(JUDGEMENT_DEBT_AFTER, model::store::JUDGEMENT_DEBT_AFTER);
-        assert_eq!(EVALUATION_JUDGEMENT_LIST_CAP, model::store::EVALUATION_JUDGEMENT_LIST_CAP);
-        assert_eq!((JUDGEMENT_DEBT_AFTER, EVALUATION_JUDGEMENT_LIST_CAP), (10, 5));
+        assert_eq!(EVALUATION_JUDGEMENT_LIST_MIN, model::store::EVALUATION_JUDGEMENT_LIST_MIN);
+        assert_eq!((JUDGEMENT_DEBT_AFTER, EVALUATION_JUDGEMENT_LIST_MIN), (10, 5));
     }
 
     #[test]
@@ -767,32 +769,92 @@ pub fn noise_since_last_useful(store: &EventStore) -> HashMap<String, usize> {
     counts
 }
 
-/// What decay needs from the verdicts, in ONE pass over the verdict events only:
-/// `(ever_marked_useful, noise_since_last_useful)`, equal to what those two
-/// functions return, but read with `EventStore::event_kinds_of` so the log's
-/// firings (98 percent of it on a long-lived store) are never read, and once
-/// instead of twice. `decay::DecayContext::load` runs on every hook call.
+/// The noise recorded about one item since its last useful mark and its last
+/// change of text, check or bindings, split by PLACE (2026-11-20).
 ///
-/// Same fail-open as the two folds it replaces: a broken log yields two empty
-/// collections. The old folds stay as they are (other callers, and the oracle
-/// the equality test compares this against).
-pub fn mark_folds(store: &EventStore) -> (HashSet<String>, HashMap<String, usize>) {
-    let Ok(events) = store.event_kinds_of(&[EventKind::ItemMarkedUseful, EventKind::ItemMarkedNoise]) else {
+/// A noise mark names the place it is about when it can (`model::marked::
+/// place_label`: the binding the note last fired through in the marking
+/// session, or a place the marker named). Two marks at the SAME place silence
+/// the note at that place only (`DecayContext::is_stale_at`). A mark with no
+/// place - every one written before places existed - counts for everywhere, so
+/// two of those silence the note everywhere, exactly as before. Marks at
+/// `decay::NOISE_PLACES_BEFORE_GLOBAL` or more DIFFERENT places say the note is
+/// wrong in general, and silence it everywhere too.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NoiseTally {
+    /// Noise marks that name no place.
+    pub placeless: usize,
+    /// Noise marks per place label, only places with at least one left.
+    pub places: std::collections::BTreeMap<String, usize>,
+}
+
+impl NoiseTally {
+    /// A tally of `n` marks that name no place (what a store with no places in
+    /// it always holds).
+    pub fn placeless(n: usize) -> Self {
+        NoiseTally { placeless: n, places: Default::default() }
+    }
+
+    pub fn add_noise(&mut self, place: Option<&str>) {
+        match place {
+            Some(p) => *self.places.entry(p.to_string()).or_default() += 1,
+            None => self.placeless += 1,
+        }
+    }
+
+    /// A useful mark: at a place it clears that place's marks only; with no
+    /// place it clears them all, as a useful mark always did.
+    pub fn clear_useful(&mut self, place: Option<&str>) {
+        match place {
+            Some(p) => {
+                self.places.remove(p);
+            }
+            None => *self = NoiseTally::default(),
+        }
+    }
+
+    /// Every mark this tally holds, whatever its place.
+    pub fn total(&self) -> usize {
+        self.placeless + self.places.values().sum::<usize>()
+    }
+
+    /// Marks at one place (never the placeless ones).
+    pub fn at(&self, place: &str) -> usize {
+        self.places.get(place).copied().unwrap_or(0)
+    }
+}
+
+/// What decay needs from the verdicts, in ONE pass over the verdict events only:
+/// `(ever_marked_useful, noise since the last useful mark, per place)`, read with
+/// `EventStore::verdict_places` so the log's firings (98 percent of it on a
+/// long-lived store) are never read, and once instead of twice.
+/// `decay::DecayContext::load` runs on every hook call.
+///
+/// For a store whose verdicts all name no place the tallies hold exactly the
+/// counts `noise_since_last_useful` returns. Fails open like the folds it
+/// replaced: a broken log yields two empty collections.
+pub fn mark_folds(store: &EventStore) -> (HashSet<String>, HashMap<String, NoiseTally>) {
+    let Ok(events) = store.verdict_places() else {
         return (HashSet::new(), HashMap::new());
     };
     let mut ever_useful: HashSet<String> = HashSet::new();
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    for (kind, id) in events {
+    let mut tallies: HashMap<String, NoiseTally> = HashMap::new();
+    for (_, kind, id, place) in events {
         match kind {
             EventKind::ItemMarkedUseful => {
-                counts.insert(id.clone(), 0);
+                tallies.entry(id.clone()).or_default().clear_useful(place.as_deref());
                 ever_useful.insert(id);
             }
-            EventKind::ItemMarkedNoise => *counts.entry(id).or_default() += 1,
+            EventKind::ItemMarkedNoise => tallies.entry(id).or_default().add_noise(place.as_deref()),
             _ => {}
         }
     }
-    (ever_useful, counts)
+    (ever_useful, tallies)
+}
+
+/// The place a verdict event's body names, when it names one.
+fn place_in_body(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body).ok()?.get("place")?.as_str().map(str::to_string)
 }
 
 /// `id`'s noise marks since its last mark of usefulness OR its last revision
@@ -806,30 +868,30 @@ pub fn mark_folds(store: &EventStore) -> (HashSet<String>, HashMap<String, usize
 /// it clears nothing.
 ///
 /// One entity's own events only, so the caller pays for it only for the few
-/// ids that already sit at the threshold. A body that does not parse is
+/// ids that already sit at a threshold. A body that does not parse is
 /// skipped and clears nothing.
-pub fn noise_since_last_change(store: &EventStore, id: &str) -> usize {
-    let Ok(events) = store.get_events_by_entity(id) else { return 0 };
-    let mut noise = 0usize;
+pub fn tally_since_last_change(store: &EventStore, id: &str) -> NoiseTally {
+    let Ok(events) = store.get_events_by_entity(id) else { return NoiseTally::default() };
+    let mut tally = NoiseTally::default();
     let mut before: Option<model::item::Item> = None;
     for event in events {
         match event.kind {
-            EventKind::ItemMarkedUseful => noise = 0,
-            EventKind::ItemMarkedNoise => noise += 1,
+            EventKind::ItemMarkedUseful => tally.clear_useful(place_in_body(&event.body).as_deref()),
+            EventKind::ItemMarkedNoise => tally.add_noise(place_in_body(&event.body).as_deref()),
             EventKind::FactCreated | EventKind::FactRevised => {
                 let Ok(item) = model::store::parse_body(&event.body) else { continue };
                 let changed = before
                     .as_ref()
                     .is_some_and(|b| b.text != item.text || b.check != item.check || b.bindings != item.bindings);
                 if changed {
-                    noise = 0;
+                    tally = NoiseTally::default();
                 }
                 before = Some(item);
             }
             _ => {}
         }
     }
-    noise
+    tally
 }
 
 // ------------------------------------------------------------------------

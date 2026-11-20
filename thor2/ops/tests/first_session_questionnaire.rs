@@ -169,7 +169,10 @@ fn the_assistant_sets_language_by_itself_asks_two_questions_and_hides_the_techni
         "never the home folder, the Documents, Desktop or Downloads folder itself, a drive root, or anything under AppData or Program Files",
         "install --topic --db <store>",
         "figure it out yourself",
-        "they open Claude Code in that folder",
+        "they never open or pick a folder",
+        "mcp__ccd_directory__request_directory",
+        "check the working folder",
+        "to click the card",
         "Never mention git, topic markers, scopes or registration to the person",
     ] {
         assert!(rules.contains(must), "the assistant rules lack '{must}'");

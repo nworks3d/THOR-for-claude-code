@@ -157,6 +157,8 @@ pub mod teeth;
 pub mod test_signal;
 pub mod thor_bugs;
 pub mod time;
+pub mod turn_violation;
+pub mod unpin_gate;
 pub mod usefulness;
 #[cfg(feature = "semantic")]
 pub mod vectors;
@@ -245,7 +247,7 @@ pub fn serve_with_decay(
 /// `live::candidate_pool_key`): everything after reading the pool, and the
 /// only copy of it - `serve_with_decay` calls this too.
 pub fn serve_from_candidates(candidates: &[live::LiveItem], input: &input::ServeInput, decay: &decay::DecayContext) -> Served {
-    let all = decay::retain_live(rank::select(candidates, input), decay);
+    let all = decay::retain_live_at(rank::select(candidates, input), decay, input);
     let selection = render::cap(all.clone());
     Served { all, selection }
 }
@@ -260,7 +262,7 @@ pub fn serve_prompt(store: &EventStore, prompt_text: &str) -> Served {
     let candidates = live::live_items(store);
     let input = prompt::resolve(prompt_text, &candidates);
     let decay = decay::DecayContext::load(store);
-    let all = decay::retain_live(rank::select(&candidates, &input), &decay);
+    let all = decay::retain_live_at(rank::select(&candidates, &input), &decay, &input);
     let selection = render::cap(all.clone());
     Served { all, selection }
 }

@@ -28,10 +28,19 @@ A useful mark is not a dead signal. The latest verdict is what counts:
 - a useful mark clears whatever noise came before it and resets the count to
   zero;
 - a noise mark after that counts again, on its own;
-- two noise marks since the last useful mark (and since its last change of
-  text, check or bindings; a rule whose check can refuse is never taken out)
-  take a fact out of the
-  injection channels - it stays findable through lookup regardless.
+- a verdict is about a PLACE: the file, directory, command, tool or moment the
+  fact is bound to where it last fired in this session, or the place you name
+  with `place: "<one of its places>"`. Two noise marks at the SAME place (since
+  the last useful mark there, and since its last change of text, check or
+  bindings) take the fact out of the injection channels at that place only - it
+  is still served at its other places. Marks at three different places, or two
+  marks that name no place, take it out everywhere; a rule whose check can
+  refuse is never taken out. It stays findable through lookup regardless;
+- a useful mark at a place clears that place's noise only, one with no place
+  clears all of it;
+- a PINNED note is never taken out, and is never called noise: `mark` refuses a
+  noise mark on one. A pinned note is the owner's standing choice; it is
+  re-read (see "Re-read the pinned notes", below), and you never unpin one.
 
 No Stop hook asks for a verdict on a single item any more (since THOR
 2.5): the items that fired in many sessions without a verdict wait for this
@@ -112,7 +121,8 @@ for up to the time box that the start note names (20 seconds by default) (the ru
 the note as "not reached this time: N" - they are not owed in this evaluation
 and they lead the next start), and the note it shows you afterwards names four
 things, ordered by what you must act on, with what needs no action last:
-1. JUDGEMENT - the items you give a verdict on (step 2);
+1. JUDGEMENT - the items you give a verdict on (step 2) and, when it lists any,
+   the pinned notes you re-read (step 2, "Re-read the pinned notes");
 2. TEETH - what THOR decided by itself, then the lists that are yours: the
    batch (at most eight rules), the A4 list (at most sixteen) and the
    disputes to verify (item c), and what went wrong and what the owner wants (item f, see step 5),
@@ -294,12 +304,14 @@ Your list is the one the start note printed under JUDGEMENT, frozen when the
 evaluation started: exactly the items that fired in THIS session or in another
 session of this project, and had fired in 10
 sessions or more since their last verdict (a fact counts once per session), the
-most-served first and at most 5 per evaluation, the ones this session saw fire
-ahead of the others (the next evaluation lists the next ones; a note skipped as
+most-served first, a quarter of what could be listed (at least 5 and at most 15
+per evaluation: a backlog of 20 or fewer lists 5, one of 100 lists 15), the ones
+this session saw fire ahead of the others (the start note says how many more wait;
+the next evaluation lists the next ones; a note skipped as
 not-judgeable in an earlier counting report waits behind the others until each has
 had its turn, the one skipped longest ago first). Judge only those. A pinned
 item is never on it: the owner already answered whether it belongs there by
-pinning it. Never `mark` an item that is not on your frozen list, even if it
+pinning it (it gets a re-read instead, below). Never `mark` an item that is not on your frozen list, even if it
 fired in the wrong place: a wrong-place firing off the list goes to step 7 as
 friction (anchor), not to a verdict.
 
@@ -345,7 +357,55 @@ The health check's `judgement debt` line names the debt of the whole store
 for this checkout, including items that only fired in other sessions. Those
 are not this report's to settle and never hold it; judge one of them only if
 you saw it fire yourself and know where. Step 2 is done once every
-item on your list carries a verdict or a skip tag with a reason.
+item on your list carries a verdict or a skip tag with a reason, and every
+pinned note on your re-read list (below) has been confirmed or rewritten.
+
+### Re-read the pinned notes
+
+When the start note has a section "1b. PINNED NOTES TO RE-READ", it lists at
+most three pinned notes: the ones nobody has looked at for the longest time,
+none that was listed, confirmed or rewritten in the last 30 days, all of them
+served in this project (its own pinned notes, or global ones). WHAT THIS MEANS: a
+pinned note is served at every session start, so a note that has become wrong or
+too long costs every session; nobody judges them otherwise. It is the owner's
+standing choice, so what you do is RE-READ it, never unpin it.
+
+For each one: `mcp__thor__get(id: "<id>")`, read it, check it against the code or
+the facts it is about, and do exactly ONE of two things with the THOR tool
+itself:
+- `mcp__thor__mark(id: "<id>")` when it is still right and still needed at every
+  session start. A useful mark on a pinned note is recorded and the note stays
+  pinned; it settles the re-read only when this session read the note with
+  `mcp__thor__get` after the evaluation started (THOR reads that from the
+  transcript at the Stop), so a mark with no read is a rubber stamp and the
+  report stays held;
+- `mcp__thor__revise(id: "<id>", text: "<its text made right, or shorter>")` when
+  it is not fully right, or when a shorter text says the same.
+
+If you think a pinned note should not be pinned at all, say so in your report,
+for the owner, and leave it pinned: do NOT unpin it, and do not mark it noise
+(`mark` refuses that, with a message saying the same). An unpin is never an
+outcome of a re-read: THOR does not count it, it does not suggest one, and a note
+you unpinned stays owed until it is pinned again and confirmed or rewritten. A
+tag, a reason or a line in the report settles nothing. The same rules as for
+verdicts apply: only a call of this session counts, and a mark or a revise given
+in this turn counts once the turn has ended (end the turn once before filing).
+WHEN IT IS DONE: every note on the re-read list has a useful mark or a changed
+text from this session. EXAMPLE: `mcp__thor__mark(id: "tijden-in-lokale-tijd")`.
+
+A revise that removes the pin and a retract of a pinned note follow the same
+rule, and every pinned note taken down through a tool call is listed for the
+owner. The `unpin` tool itself follows the owner's rule that a pinned note comes down
+only when it is proven out of date, has no use any more and cannot be replaced by
+a corrected text. It needs a `because` (one sentence, at least 20 characters),
+and it is REFUSED while the note's own check holds, while the note got a useful
+mark in the last 90 days, or while it was revised in the last 30 days. Only the
+owner's own decision overrides that: his whole message, between double quotes,
+in `because`, which THOR checks against what he typed in this session (the
+note's id must appear in that message or in the assistant message right before
+it); a take-down on his words also settles the re-read of that note. Every one
+is listed for him, in doctor and in the machine section of the next report, with
+how it was let through.
 
 ## 3. Repair what has rotted (this is not noise)
 

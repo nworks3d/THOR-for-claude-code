@@ -204,7 +204,15 @@ fn a_second_run_of_the_same_plan_is_safe() {
     let said = text(&out);
     assert!(said.contains("= the folder was already there") && said.contains("moved 0 file(s)"), "{said}");
     assert!(said.contains("nothing to undo"), "{said}");
-    assert_eq!(EventStore::open_existing(&sb.db()).unwrap().get_all_events().unwrap().len(), events, "no second registration");
+    // No second registration: the only new event is THOR's own tidy record, which says 0 files moved.
+    let store = EventStore::open_existing(&sb.db()).unwrap();
+    let after = store.get_all_events().unwrap().len();
+    let records: Vec<_> = model::store::order_evidence(&store).into_iter().filter(|e| e.kind == "tidy").collect();
+    let seeded = model::store::show(&store, model::store::ORDER_NOTE_ID).is_ok();
+    assert_eq!(after, events + usize::from(seeded), "events {events} -> {after}");
+    if seeded {
+        assert_eq!(records.last().unwrap().body["moved"], 0);
+    }
     assert_eq!(std::fs::read_to_string(folder.join("cv.docx")).unwrap(), "cv");
     assert!(!folder.join("cv (2).docx").exists());
 }

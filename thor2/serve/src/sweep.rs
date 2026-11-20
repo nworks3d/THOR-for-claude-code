@@ -503,6 +503,14 @@ pub fn time_of_seq(store: &EventStore, seq: i64) -> Option<i64> {
     None
 }
 
+/// When the rule was last REVISED: the time of its newest revised event, its
+/// creation not counted. `None` when it was never revised or cannot be told.
+pub fn last_revised_at(store: &EventStore, id: &str) -> Option<i64> {
+    let events = store.get_events_by_entity(id).ok()?;
+    let last = events.iter().rev().find(|e| e.kind == EventKind::FactRevised)?;
+    time_of_seq(store, last.seq)
+}
+
 /// When the rule last changed: the time of its newest created or revised
 /// event. `None` when it cannot be told.
 pub fn rule_changed_at(store: &EventStore, id: &str) -> Option<i64> {

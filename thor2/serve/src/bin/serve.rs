@@ -338,6 +338,13 @@ enum Command {
         /// the injection surfaces - it stays fully findable via search.
         #[arg(long)]
         noise: bool,
+        /// The place this verdict is about: one of the places the item is bound
+        /// to (a path, directory, command, tool or moment). Two noise marks at
+        /// the same place silence the item there only. Left out, the mark has no
+        /// place (a command line has no session to take the place the item last
+        /// fired in from) and counts for everywhere.
+        #[arg(long)]
+        place: Option<String>,
     },
     /// Rebuild the meaning-search vector sidecar (feature `semantic`) from
     /// every live item `search` itself covers (any project, archive kinds
@@ -525,7 +532,7 @@ fn main() {
         Command::WhereUsed { index_db, repo, name, limit } => cmd_where_used(&index_db, &repo, &name, limit),
         Command::Outline { index_db, path } => cmd_outline(&index_db, &path),
         Command::Status { index_db, repo } => cmd_status(&cli.db, index_db.as_deref(), repo.as_deref()),
-        Command::Mark { id, noise } => cmd_mark(&cli.db, &id, noise),
+        Command::Mark { id, noise, place } => cmd_mark(&cli.db, &id, noise, place.as_deref()),
         Command::Sweep { full, backfill, budget_secs, json, rule } => cmd_sweep(&cli.db, full, backfill, budget_secs, json, rule.as_deref()),
         Command::Retest { id, project, all, apply, compare, allow_demote } => {
             cmd_retest(&cli.db, id.as_deref(), project.as_deref(), all, apply, compare, allow_demote)
@@ -1670,6 +1677,9 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                     // the transcript and nothing in THOR: written to the log
                     // here, so the evaluation's machine section can say so.
                     serve::attest::record_hook_faults(&mut store, &session_id);
+                    // The notes this session read with `get`: a useful mark on a pinned note
+                    // listed for a re-read counts only after one.
+                    serve::attest::record_note_reads(&mut store, &session_id);
                     // THE READER OF A FILING (step 16): every evaluation
                     // report on file whose filing has no validator record
                     // yet is validated once - after the verifications above,
@@ -1795,6 +1805,12 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
         // that decides, rule by rule, whether `is_subagent` excuses this
         // particular fire.
         if already_fired {
+            // The retry Stop of a held turn never holds the tidy step again, but it
+            // still records this conversation's stake (the proposal may have been
+            // shown in the very turn that was held) and may settle the step.
+            if !is_subagent && !copy && !no_record && !session_kind(&payload).headless {
+                let _ = order_debt(db_path, &payload, &session_id, no_record);
+            }
             // A Stop that already held this turn once may not hold it again
             // (loop safety): a resumed note still arrives, as a warning.
             // ONE EXCEPTION (step 24): the evaluation this session owes. Field
@@ -1994,6 +2010,7 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
         // COPY MODE: every debt below is settled by a write to the log (a `remember`,
         // `revise`, `retract` or `mark`), which this machine can only queue. Holding the
         // turn for one would repeat until the next pull, so a copy asks for none.
+        let mut order_say: Option<String> = None;
         if !is_subagent && !copy {
             if let Some(reason) = serve::store_dir::open_existing(db_path).ok().and_then(|s| setup_debt(&s)) {
                 return hold(reason);
@@ -2003,8 +2020,10 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             // Never in a headless session (no person to ask), never before the
             // first-session setup note is retracted.
             if !session_kind(&payload).headless {
-                if let Some(reason) = order_debt(db_path, &payload, &session_id, no_record) {
-                    return hold(reason);
+                match order_debt(db_path, &payload, &session_id, no_record) {
+                    Some(OrderStop::Hold(reason)) => return hold(reason),
+                    Some(OrderStop::Say { owner }) => order_say = Some(owner),
+                    None => {}
                 }
             }
 
@@ -2059,6 +2078,22 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             if let Some(reason) = serve::leftover_scripts::hold_reason(db_path, &session_id, time::now_unix()) {
                 return hold(reason);
             }
+        }
+
+        // A RULE BROKEN THIS TURN BY A ROUTE NO TOOL GUARD SAW (a script that
+        // edited a guarded file): `serve::turn_violation`. Held like the debts
+        // above, so the evaluation ask rides with it. The ids it covers are kept
+        // away from the stale-rule guard below: a check that held and now fails
+        // is a violation, never staleness.
+        let mut turn_say: Option<String> = None;
+        let mut turn_covered: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if !is_subagent && !copy && !no_record {
+            let found = turn_violation_stop_check(db_path, &session_id, actor, stop_root.as_deref(), stop_project.as_deref());
+            if let Some(reason) = found.hold {
+                return hold(reason);
+            }
+            turn_say = found.say;
+            turn_covered = found.covered;
         }
 
         // THE EVALUATION DEBT (2026-09-12, moved ahead of the judgement debt
@@ -2189,7 +2224,8 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
         }
         // What rides with whatever this Stop still says: the drift line and
         // the running-evaluation line.
-        let riders: Vec<String> = drift_note.map(str::to_string).into_iter().chain(elsewhere_note).collect();
+        let mut riders: Vec<String> =
+            drift_note.map(str::to_string).into_iter().chain(elsewhere_note).chain(turn_say).collect();
 
         // NO JUDGEMENT ASK AND NO RULE-UPKEEP ASK HERE (step 28). The owner's
         // decision, 2026-10-02: "1x per sessie is meer dan voldoende" and
@@ -2219,7 +2255,7 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
         // only once NEITHER has anything to say does the WARN, if any,
         // finally reach the owner, on the very last line below.
         if !is_subagent && !copy {
-            if let Some(output) = stale_guard_stop_check(db_path, &session_id, actor) {
+            if let Some(output) = stale_guard_stop_check(db_path, &session_id, actor, &turn_covered) {
                 return Some(output);
             }
         }
@@ -2227,6 +2263,17 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
         // back, so the next session asked holds (step 26).
         if !is_subagent && !no_record {
             serve::holder::release(db_path, &session_id);
+        }
+        // The plain line of a conversation that does not own the tidy step: said once
+        // per (this conversation, its owner), and marked as said only here, where it
+        // really goes out (a Stop that held or returned earlier never used it up).
+        if let Some(owner) = order_say {
+            let line = serve::order_earlier::not_yours_line();
+            if no_record {
+                riders.push(line);
+            } else if let Some(line) = said_once_keyed(db_path, &session_id, &format!("order-owner:{owner}"), line) {
+                riders.push(line);
+            }
         }
         let warn_text = match (warn_text, riders.is_empty()) {
             (Some(text), false) => Some(format!("{}\n\n{text}", riders.join("\n\n"))),
@@ -2489,6 +2536,11 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             // raw text under a top-level "prompt" field (never under
             // tool_input, which is a PreToolUse-only shape).
             let prompt_text = payload.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+            // A TURN STARTS: the snapshot of the previous turn is retired; the next shell
+            // command of this turn takes a fresh one (`serve::turn_violation`).
+            if !no_record && !payload_is_from_a_subagent(&payload) {
+                serve::turn_violation::turn_started(db_path, &session_id);
+            }
             if prompt_text.trim().is_empty() {
                 return None;
             }
@@ -2567,7 +2619,7 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             }
             let decay = DecayContext::load(&store);
             let all = session_start::for_session_kind(
-                serve::decay::retain_live(serve::rank::select(&candidates, &input), &decay),
+                serve::decay::retain_live_at(serve::rank::select(&candidates, &input), &decay, &input),
                 session_kind(&payload).headless,
             );
             let arranged = serve::repeat::arrange(db_path, &reader, &all, remember_shown);
@@ -2617,6 +2669,13 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             let tool_input = payload.get("tool_input");
             let file_path = tool_input.and_then(|t| t.get("file_path")).and_then(|v| v.as_str());
             let tool_name = payload.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
+            // THE FIRST CALL OF A TURN THAT IS NOT READ-ONLY takes the snapshot of the
+            // forbidden-text checks (`serve::turn_violation`), before it runs: forbidden
+            // text can come in through a shell, an MCP file tool, a notebook edit. A
+            // turn made of reads only never takes one.
+            if !no_record && serve::turn_violation::takes_snapshot(tool_name) {
+                turn_violation_snapshot(&store, db_path, &session_id, session_cwd.as_deref(), folder_project.as_deref(), session_project.as_deref());
+            }
 
             // OPENING THE EVALUATION ROUTINE AS A SKILL (`serve::eval_session`),
             // before any guard can return. It starts an evaluation ONLY while
@@ -2658,6 +2717,19 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                 capture::SinkVerdict::Warn(reason) => Some(reason),
                 _ => None,
             };
+
+            // THE UNPIN GATE (`serve::unpin_gate`). First: no Edit, Write or shell call may name
+            // the record file the gate keeps beside the memory. Then the WITNESS: a call that
+            // takes a pinned note down (unpin, revise, retract) whose reason quotes a whole
+            // message the owner typed about that note is checked against this session's
+            // transcript here, because only the hook can see it; the tool server accepts such a
+            // quote only when this left its record. The hook never blocks a take-down itself.
+            if let Some(reason) = serve::unpin_gate::protected_file_refusal(tool_name, tool_input) {
+                return Some(HookOutput::Decision(serde_json::json!({ "decision": "block", "reason": reason })));
+            }
+            if serve::unpin_gate::is_gated_call(tool_name) {
+                serve::unpin_gate::witness(db_path, &payload, time::now_unix());
+            }
 
             // THE HARD GUARDS, all decided by `serve::guard_verdict::pre_tool`
             // in hook order: the file write, then the command (its shell writes
@@ -3061,6 +3133,14 @@ fn setup_debt(store: &EventStore) -> Option<String> {
     ))
 }
 
+/// What `order_debt` says: a hold for the owner of the step, or one plain line
+/// (never a hold) for any other conversation, which names the owner only to
+/// key the once-per-conversation memory of having said it.
+enum OrderStop {
+    Hold(String),
+    Say { owner: String },
+}
+
 /// THE LAST SETUP STEP: while the pinned note `order-earlier-work-once` is live
 /// and the first-session setup note is already retracted, the end of a turn is
 /// held until the person was offered to put their earlier work in order and it
@@ -3077,7 +3157,7 @@ fn setup_debt(store: &EventStore) -> Option<String> {
 /// Fails open like every other debt: no note, no store, no readable transcript
 /// all read as nothing to say. A store that never got the note (an existing
 /// install, a copy) never holds.
-fn order_debt(db_path: &Path, payload: &Value, session_id: &str, no_record: bool) -> Option<String> {
+fn order_debt(db_path: &Path, payload: &Value, session_id: &str, no_record: bool) -> Option<OrderStop> {
     let mut store = serve::store_dir::open_existing(db_path).ok()?;
     model::store::show(&store, model::store::ORDER_NOTE_ID).ok()?;
     if model::store::show(&store, model::store::SETUP_NOTE_ID).is_ok() {
@@ -3105,25 +3185,43 @@ fn order_debt(db_path: &Path, payload: &Value, session_id: &str, no_record: bool
     if people < 2 && !proposed {
         return None;
     }
+    // THE JUDGEMENT RUNS IN EVERY CONVERSATION: a step settled in any of them is
+    // settled for all (the record is written and the note retracted by THOR).
+    // ONE OWNER: only the conversation that owns the step is held while it is
+    // owed; any other gets one plain line and is never held. The step follows
+    // the proposal: the conversation whose own record shows it takes the step
+    // from one that has not shown it; before any proposal the owner is the first
+    // conversation held; an owner quiet for 30 minutes is taken over.
     let answer = model::store::show(&store, model::store::ORDER_ANSWER_ID).ok().map(|i| i.text);
+    let rank = serve::order_earlier::rank_of(&timeline);
+    let now = time::now_unix();
     match serve::order_earlier::judge(&timeline, &evidence, answer.as_deref()) {
         serve::order_earlier::Verdict::Settled(how) => {
             settle(&mut store, &how);
             None
         }
-        serve::order_earlier::Verdict::Waiting => None,
-        serve::order_earlier::Verdict::Owed(what) => Some(format!(
-            "[THOR] order-earlier-work: one last setup step is still owed. The first-session text (lookup key \
-             'first-session-questions', under THE TIDY STEP) says that right after the welcome the person is offered to \
-             put their earlier work with Claude in order. {what}. Only what THOR checks itself settles this: \
-             `serve inventory` finding nothing to order; `install --tidy` run after the person answered the proposal; or, \
-             for what they refused, the Report '{answers}' that quotes their own words exactly between double quotes, \
-             found in a message they typed after the proposal. Your own claim that it is done, a tag, or a report without \
-             their words settles nothing, and '{note}' cannot be retracted by you before: THOR retracts it itself once it \
-             is settled.",
-            answers = model::store::ORDER_ANSWER_ID,
-            note = model::store::ORDER_NOTE_ID
-        )),
+        serve::order_earlier::Verdict::Waiting => {
+            // The turn ends on the question, which is right; the step is now this conversation's.
+            let _ = serve::order_earlier::claim_or_defer(&store, db_path, session_id, now, !no_record, rank);
+            None
+        }
+        serve::order_earlier::Verdict::Owed(what) => {
+            match serve::order_earlier::claim_or_defer(&store, db_path, session_id, now, !no_record, rank) {
+                serve::order_earlier::Owns::Other { session, .. } => Some(OrderStop::Say { owner: session }),
+                serve::order_earlier::Owns::Me => Some(OrderStop::Hold(format!(
+                    "[THOR] order-earlier-work: one last setup step is still owed. The first-session text (lookup key \
+                     'first-session-questions', under THE TIDY STEP) says that right after the welcome the person is offered to \
+                     put their earlier work with Claude in order. {what}. Only what THOR checks itself settles this: \
+                     `serve inventory` finding nothing to order; `install --tidy` run after the person answered the proposal; or, \
+                     for what they refused, the Report '{answers}' that quotes their own words (any message they typed after the \
+                     proposal) exactly between double quotes. Your own claim that it is done, a tag, or a report without \
+                     their words settles nothing, and '{note}' cannot be retracted by you before: THOR retracts it itself once it \
+                     is settled.",
+                    answers = model::store::ORDER_ANSWER_ID,
+                    note = model::store::ORDER_NOTE_ID
+                ))),
+            }
+        }
     }
 }
 
@@ -3631,6 +3729,13 @@ fn said_key(line: &str) -> String {
 /// mark, beside the void notices.
 fn said_once(db_path: &Path, session_id: &str, line: String) -> Option<String> {
     let key = said_key(&line);
+    said_once_keyed(db_path, session_id, &key, line)
+}
+
+/// `said_once` with the key given: for a line whose words are the same however
+/// often it is said, and whose memory is about something else (who owns a step).
+fn said_once_keyed(db_path: &Path, session_id: &str, key: &str, line: String) -> Option<String> {
+    let key = key.to_string();
     let mut marks = read_turn_marks(db_path);
     let mut mark = marks.remove(session_id).unwrap_or_default();
     if mark.announced.contains(&key) {
@@ -4037,7 +4142,8 @@ fn eval_stop_ask(
 fn verdict_list_words(store: &EventStore, project: &str, session_id: &str) -> String {
     let (_, owed_in_project) = usefulness::judgement_debt_counts(store, Some(project));
     let started_seq = store.get_next_seq().map(|n| n - 1).unwrap_or(0);
-    let listed = model::store::evaluation_judgement_list(store, Some(project), session_id, started_seq).len();
+    let reachable = model::store::evaluation_judgement_candidates(store, Some(project), session_id, started_seq).ids.len();
+    let listed = reachable.min(model::store::judgement_list_cap(reachable));
     let unlisted = owed_in_project.saturating_sub(listed);
     let on_list = match listed {
         0 => "No item is on this evaluation's verdict list (the items that fired in this session or in another session of this project, and owe a verdict)".to_string(),
@@ -4047,9 +4153,11 @@ fn verdict_list_words(store: &EventStore, project: &str, session_id: &str) -> St
         0 => format!("{on_list}."),
         n => format!(
             "{on_list}. {n} more item(s) of this project owe a verdict but are not on this list (they fired in no session of \
-             this project, or did not fit under the cap of {}); they hold no report and need \
-             nothing from you now.",
-            model::store::EVALUATION_JUDGEMENT_LIST_CAP
+             this project, or did not fit under this evaluation's cap of {}, a quarter of what could be listed, \
+             at least {} and at most {}); they hold no report and need nothing from you now.",
+            model::store::judgement_list_cap(reachable),
+            model::store::EVALUATION_JUDGEMENT_LIST_MIN,
+            model::store::EVALUATION_JUDGEMENT_LIST_MAX
         ),
     }
 }
@@ -4550,7 +4658,12 @@ fn record_command_guard_staleness(
 /// end silently. A single failed per-item lookup aborts the WHOLE check
 /// (via `?`, propagating `None` immediately) rather than guessing for just
 /// that one entry - the simplest rule that still never blocks on a doubt.
-fn stale_guard_stop_check(db_path: &Path, session_id: &str, actor: &str) -> Option<HookOutput> {
+fn stale_guard_stop_check(
+    db_path: &Path,
+    session_id: &str,
+    actor: &str,
+    broken_this_turn: &std::collections::HashSet<String>,
+) -> Option<HookOutput> {
     let mode_text = std::fs::read_to_string(stale_guard::default_mode_config_path(db_path)).ok();
     if stale_guard::resolve_mode(mode_text.as_deref()) == stale_guard::Mode::Off {
         return None;
@@ -4569,7 +4682,11 @@ fn stale_guard_stop_check(db_path: &Path, session_id: &str, actor: &str) -> Opti
     let already_nudged = stale_guard::already_blocked(&blocked, session_id);
 
     let stale_text = std::fs::read_to_string(absent_guard::default_stale_path(db_path)).ok()?;
-    let stale = absent_guard::read_stale(&stale_text);
+    let mut stale = absent_guard::read_stale(&stale_text);
+    // A rule broken during this very turn (`serve::turn_violation`) is a
+    // violation, not a rule gone stale: it is answered by undoing the change,
+    // never by revising or retracting the rule.
+    stale.retain(|id, _| !broken_this_turn.contains(id));
     if stale.is_empty() {
         return None;
     }
@@ -4611,6 +4728,51 @@ fn stale_guard_stop_check(db_path: &Path, session_id: &str, actor: &str) -> Opti
         "decision": "block",
         "reason": reason,
     })))
+}
+
+/// The first shell command of a turn: remember which forbidden-text checks
+/// already fail (`serve::turn_violation`), once per turn. Best effort, silent
+/// on any failure.
+fn turn_violation_snapshot(
+    store: &EventStore,
+    db_path: &Path,
+    session_id: &str,
+    cwd: Option<&Path>,
+    folder_project: Option<&str>,
+    session_project: Option<&str>,
+) {
+    if serve::turn_violation::has_snapshot(db_path, session_id) {
+        return;
+    }
+    let Some(root) = project::guard_root(store, cwd, folder_project, session_project) else { return };
+    let items = serve::turn_violation::rules(db_path, store);
+    serve::turn_violation::snapshot(db_path, session_id, &items, session_project, &root, time::now_unix());
+}
+
+/// The turn end's half of `serve::turn_violation`, with the log record for a
+/// violation THOR stops holding after the cap (so doctor can count it). Fail
+/// open: no store, no root or no snapshot is an empty answer.
+fn turn_violation_stop_check(
+    db_path: &Path,
+    session_id: &str,
+    actor: &str,
+    cwd: Option<&Path>,
+    session_project: Option<&str>,
+) -> serve::turn_violation::Found {
+    // A turn that ran no shell command has no snapshot: nothing is read or checked.
+    if !serve::turn_violation::has_snapshot(db_path, session_id) {
+        return Default::default();
+    }
+    let Ok(store) = serve::store_dir::open_existing(db_path) else { return Default::default() };
+    let folder_project = cwd.and_then(project::resolve_project);
+    let Some(root) = project::guard_root(&store, cwd, folder_project.as_deref(), session_project) else { return Default::default() };
+    let items = serve::turn_violation::rules(db_path, &store);
+    drop(store);
+    let found = serve::turn_violation::stop_check(db_path, session_id, &items, session_project, &root);
+    for id in &found.stood_aside {
+        record_gate(db_path, session_id, actor, false, &format!("turn-violation:{id}"), "stop", None);
+    }
+    found
 }
 
 // ---------------------------------------------------- the Remember moment
@@ -7174,12 +7336,13 @@ fn cmd_inventory(db_path: &Path, json: bool, projects_dir: Option<PathBuf>, home
     };
     let real_folders = projects_dir.is_none();
     let dir = projects_dir.unwrap_or_else(|| serve::inventory::default_projects_dir(&home));
-    let inv = serve::inventory::inventory(&dir, &home);
+    let mut inv = serve::inventory::inventory(&dir, &home);
+    serve::inventory::apply_snapshot(&mut inv, db_path);
     // Nothing to order, found in the real transcripts folder: THOR's own proof
     // for the tidy step (`model::store::order_settled`). Never for a folder
     // named by hand: an empty one proves nothing. The folder is recorded so
     // that a changed home folder in the environment cannot pass for the real one.
-    if real_folders && inv.folders.iter().all(|f| f.ordered) && inv.loose_files.is_empty() && db_path.is_file() {
+    if real_folders && inv.folders.iter().all(|f| f.ordered || f.nothing_to_move) && inv.loose_files.is_empty() && inv.vanished.is_empty() && db_path.is_file() {
         if let Ok(mut store) = EventStore::open_existing(db_path) {
             if model::store::show(&store, model::store::ORDER_NOTE_ID).is_ok() {
                 let body = serde_json::json!({
@@ -7273,7 +7436,7 @@ fn cmd_prompt(db_path: &Path, text: &str) {
         return;
     }
     let decay = DecayContext::load(&store);
-    let all = serve::decay::retain_live(serve::rank::select(&candidates, &input), &decay);
+    let all = serve::decay::retain_live_at(serve::rank::select(&candidates, &input), &decay, &input);
     let selection = render::cap(all);
     match render::render_text(&selection, &input) {
         Some(block) => println!("{block}"),
@@ -7348,6 +7511,10 @@ fn render_search_reply(
             out.push_str(lookup::stem_match_note());
             out.push('\n');
         }
+    }
+    if let Some(hint) = lookup::look_in_files_hint(hits.is_empty(), literal_found_any, stems_only) {
+        out.push_str(hint);
+        out.push('\n');
     }
     if withheld > 0 {
         out.push_str(&format!(
@@ -7751,13 +7918,23 @@ fn cmd_sweep(db_path: &Path, full: bool, backfill: bool, budget_secs: u64, json:
     println!("{}", lines.join("\n"));
 }
 
-fn cmd_mark(db_path: &Path, id: &str, noise: bool) {
+fn cmd_mark(db_path: &Path, id: &str, noise: bool, place: Option<&str>) {
     let mut store = open_store_or_die(db_path);
     let now = time::now_iso8601();
+    let place = match place.map(str::trim).filter(|p| !p.is_empty()) {
+        None => None,
+        Some(named) => match model::store::show(&store, id).map_err(|e| e.to_string()).and_then(|item| serve::rank::resolve_place(&item, named)) {
+            Ok(label) => Some(label),
+            Err(problem) => {
+                eprintln!("could not record the mark for {id}: {problem}");
+                std::process::exit(2);
+            }
+        },
+    };
     let written = if noise {
-        mark::record_noise(&mut store, "cli", "cli", "cli", &now, id, None)
+        mark::record_noise_at(&mut store, "cli", "cli", "cli", &now, id, None, place.as_deref())
     } else {
-        mark::record_useful(&mut store, "cli", "cli", "cli", &now, id, None)
+        mark::record_useful_at(&mut store, "cli", "cli", "cli", &now, id, None, place.as_deref())
     };
     // A verdict typed here is written, and counts for decay, but it clears no
     // judgement debt: only a verdict made through THOR's own `mark` tool in a

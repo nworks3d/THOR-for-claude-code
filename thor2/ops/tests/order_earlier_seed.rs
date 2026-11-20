@@ -35,7 +35,7 @@ fn the_note_is_short_plain_and_has_no_dashes() {
 }
 
 #[test]
-fn a_tidy_run_leaves_thors_own_record_and_only_when_it_did_something() {
+fn a_tidy_run_leaves_thors_own_record_and_also_when_it_moved_nothing_but_not_for_an_empty_plan() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().join("home");
     std::fs::create_dir_all(home.join("Desktop")).unwrap();
@@ -55,8 +55,17 @@ fn a_tidy_run_leaves_thors_own_record_and_only_when_it_did_something() {
     assert_eq!(evidence[0].body["moved"], 1);
     drop(store);
 
-    // The same plan again does nothing, so it records nothing.
+    // The same plan again moves nothing, but a plan was still carried out for a
+    // valid folder, so it leaves a second record that says 0 files moved.
     ops::tidy::tidy(&db, &plan, &home).unwrap();
     let store = EventStore::open_existing(&db).unwrap();
-    assert_eq!(model::store::order_evidence(&store).len(), 1);
+    let again = model::store::order_evidence(&store);
+    assert_eq!(again.len(), 2, "{again:?}");
+    assert_eq!(again[1].body["moved"], 0);
+    drop(store);
+
+    // An empty plan (no folder at all) records nothing.
+    ops::tidy::tidy(&db, "[]", &home).unwrap();
+    let store = EventStore::open_existing(&db).unwrap();
+    assert_eq!(model::store::order_evidence(&store).len(), 2);
 }

@@ -69,6 +69,12 @@ pub struct FolderInfo {
     /// The conversations ran in the desktop app's scratch workspace ("No
     /// folder" in its sidebar).
     pub without_folder: bool,
+    /// A conversation without a folder that wrote no file that still exists:
+    /// there is nothing to move out of the temporary workspace, so it does
+    /// not stand in the way of "nothing to order". It stays in the listing
+    /// because what it taught can still be stored. Always false for a
+    /// folder that is not a temporary workspace.
+    pub nothing_to_move: bool,
     pub sessions: Vec<SessionInfo>,
 }
 
@@ -83,18 +89,46 @@ pub struct Inventory {
     /// Documents or Downloads.
     pub loose_files: Vec<WrittenFile>,
     pub loose_files_left_out: usize,
+    /// Files that were loose when THOR was installed (the snapshot beside the
+    /// store), are gone now, and are in no tidy undo log: someone moved or
+    /// deleted them behind the tidy step's back. They stay listed, and they
+    /// stand in the way of "nothing to order". Empty without a snapshot.
+    #[serde(default)]
+    pub vanished: Vec<String>,
 }
 
 // ------------------------------------------------------------------ places
 
 /// The text form of a path for comparing: forward slashes, no trailing slash,
-/// lower case (Windows paths do not care about case, and being too eager here
-/// only makes a folder count as "broad", the safe side).
+/// `.` and `..` resolved lexically (never looking at the disk), and lower case
+/// on Windows only (its paths do not care about case; elsewhere two names that
+/// differ in case are two folders).
 pub fn norm(p: &Path) -> String {
     let s = p.display().to_string().replace('\\', "/");
     let s = s.strip_prefix("//?/").unwrap_or(&s);
-    let t = s.trim_end_matches('/');
-    t.to_lowercase()
+    let mut parts: Vec<&str> = Vec::new();
+    for (i, part) in s.split('/').enumerate() {
+        match part {
+            "" if i > 0 => {}
+            "." => {}
+            ".." => {
+                // Go up one level, but never above the root or a drive.
+                if parts.last().is_some_and(|l| !l.is_empty() && !l.ends_with(':') && *l != "..") {
+                    parts.pop();
+                } else if parts.is_empty() {
+                    parts.push("..");
+                }
+            }
+            other => parts.push(other),
+        }
+    }
+    let joined = parts.join("/");
+    let t = joined.trim_end_matches('/');
+    if cfg!(windows) {
+        t.to_lowercase()
+    } else {
+        t.to_string()
+    }
 }
 
 /// The user's home folder: `USERPROFILE`, then `HOME`.
@@ -344,7 +378,9 @@ pub fn read_session(file: &Path) -> Option<(String, SessionInfo)> {
     for line in content.lines() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
         let (c, ts) = cwd_and_ts(&v);
-        if cwd.is_none() {
+        // The LAST folder the transcript records: a conversation that moved to
+        // another folder mid-way belongs to where it ended up.
+        if c.is_some() {
             cwd = c;
         }
         if let Some(ts) = ts.filter(|t| t.get(..10).is_some()) {
@@ -444,10 +480,18 @@ pub fn inventory(projects_dir: &Path, home: &Path) -> Inventory {
 
     let mut by_folder: BTreeMap<String, FolderInfo> = BTreeMap::new();
     let mut loose: Vec<WrittenFile> = Vec::new();
+    // Folders (by key) where some session wrote a file that still exists.
+    let mut has_existing: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for (cwd, mut info) in all {
+        // Only a file that still sits in the app's temporary workspace (marked AT
+        // RISK) is something to move out of it.
+        if info.files.iter().any(|f| f.exists && f.at_risk) {
+            has_existing.insert(norm(Path::new(&cwd)));
+        }
         for f in &info.files {
             let parent = Path::new(&f.path).parent().map(Path::to_path_buf).unwrap_or_default();
-            if broad_place(home, &parent).is_some_and(|w| w != "drive root") && !loose.iter().any(|l| l.path == f.path) {
+            // A file that is gone is not loose any more (it was moved or deleted).
+            if f.exists && broad_place(home, &parent).is_some_and(|w| w != "drive root") && !loose.iter().any(|l| l.path == f.path) {
                 loose.push(f.clone());
             }
         }
@@ -459,16 +503,19 @@ pub fn inventory(projects_dir: &Path, home: &Path) -> Inventory {
         let entry = by_folder.entry(key).or_insert_with(|| {
             let dir = Path::new(&cwd);
             let (ordered, why) = classify(home, dir);
-            FolderInfo { folder: cwd.clone(), folder_exists: dir.is_dir(), ordered, why_not_ordered: why, without_folder: is_app_scratch(dir), sessions: Vec::new() }
+            FolderInfo { folder: cwd.clone(), folder_exists: dir.is_dir(), ordered, why_not_ordered: why, without_folder: is_app_scratch(dir), nothing_to_move: false, sessions: Vec::new() }
         });
         entry.sessions.push(info);
+    }
+    for (key, f) in by_folder.iter_mut() {
+        f.nothing_to_move = f.without_folder && !has_existing.contains(key);
     }
     let mut folders: Vec<FolderInfo> = by_folder.into_values().collect();
     // Not in order first; inside each half, the busiest folder first.
     folders.sort_by(|a, b| b.without_folder.cmp(&a.without_folder).then(a.ordered.cmp(&b.ordered)).then(b.sessions.len().cmp(&a.sessions.len())).then(a.folder.cmp(&b.folder)));
     let loose_files_left_out = loose.len().saturating_sub(MAX_FILES);
     loose.truncate(MAX_FILES);
-    Inventory { sessions_found, sessions_left_out, sessions_left_out_unordered, sessions_left_out_ordered, folders, loose_files: loose, loose_files_left_out }
+    Inventory { sessions_found, sessions_left_out, sessions_left_out_unordered, sessions_left_out_ordered, folders, loose_files: loose, loose_files_left_out, vanished: Vec::new() }
 }
 
 /// A folder is in order when it is a git repository or already a THOR project
@@ -489,9 +536,100 @@ fn classify(home: &Path, dir: &Path) -> (bool, Option<String>) {
     (false, Some("no project".to_string()))
 }
 
+// ------------------------------------------------------------ the loose-file snapshot
+
+/// Beside the store: the loose files that existed when THOR was installed.
+pub const SNAPSHOT_FILE: &str = "loose-snapshot.json";
+
+fn snapshot_path(db: &Path) -> PathBuf {
+    db.parent().unwrap_or_else(|| Path::new(".")).join(SNAPSHOT_FILE)
+}
+
+/// The most paths the snapshot keeps: a hard cap so the file stays small on a
+/// machine with a very long history. Files beyond it are simply not protected.
+pub const SNAPSHOT_CAP: usize = 2000;
+
+/// The existing files that matter for the snapshot, read from EVERY session
+/// before any listing cap (`MAX_FILES`) cuts anything: loose files in the home
+/// folder, Desktop, Documents or Downloads, and files inside the app's
+/// temporary workspace (the AT RISK ones).
+fn files_worth_a_snapshot(projects_dir: &Path, home: &Path) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for file in transcript_files(projects_dir) {
+        let Some((cwd, info)) = read_session(&file) else { continue };
+        if !cwd.is_empty() && source_system_place(home, Path::new(&cwd)).is_some() {
+            continue;
+        }
+        for f in info.files {
+            if !f.exists {
+                continue;
+            }
+            let parent = Path::new(&f.path).parent().map(Path::to_path_buf).unwrap_or_default();
+            let loose = broad_place(home, &parent).is_some_and(|w| w != "drive root");
+            if (loose || f.at_risk) && !out.contains(&f.path) {
+                out.push(f.path);
+                if out.len() >= SNAPSHOT_CAP {
+                    return out;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Record the paths (nothing else) of the existing loose files and of the
+/// existing files in the app's temporary workspace, right now. Called once when
+/// the tidy note is seeded; files already gone then never appear.
+pub fn snapshot_loose_now(db: &Path, home: &Path) -> std::io::Result<usize> {
+    let paths = files_worth_a_snapshot(&default_projects_dir(home), home);
+    std::fs::write(snapshot_path(db), serde_json::to_string(&paths).unwrap_or_default())?;
+    Ok(paths.len())
+}
+
+/// The snapshot, `None` for a store seeded before it existed (2.6.11 or older).
+pub fn read_snapshot(db: &Path) -> Option<Vec<String>> {
+    std::fs::read_to_string(snapshot_path(db)).ok().and_then(|t| serde_json::from_str(&t).ok())
+}
+
+/// Every path a tidy run moved away from (the `from` of every move in every
+/// undo log beside the store, undone ones included), in comparable form.
+fn moved_by_a_tidy(db: &Path) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let Ok(rd) = std::fs::read_dir(db.parent().unwrap_or_else(|| Path::new("."))) else { return out };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if !(name.starts_with("tidy-") && name.ends_with(".json")) {
+            continue;
+        }
+        let Some(v) = std::fs::read_to_string(e.path()).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()) else { continue };
+        for m in v.get("moves").and_then(|m| m.as_array()).into_iter().flatten() {
+            if let Some(from) = m.get("from").and_then(|f| f.as_str()) {
+                out.insert(norm(Path::new(from)));
+            }
+        }
+    }
+    out
+}
+
+/// Fill `inv.vanished` from the snapshot: a loose file of the snapshot that is
+/// gone and that no tidy moved. A store with no snapshot keeps today's behaviour.
+pub fn apply_snapshot(inv: &mut Inventory, db: &Path) {
+    let Some(snapshot) = read_snapshot(db) else { return };
+    let moved = moved_by_a_tidy(db);
+    inv.vanished = snapshot.into_iter().filter(|p| !Path::new(p).exists() && !moved.contains(&norm(Path::new(p)))).collect();
+    // A conversation without a folder whose temporary file vanished behind the
+    // tidy step's back is not "nothing to move": it stays not in order.
+    let gone: std::collections::HashSet<String> = inv.vanished.iter().map(|p| norm(Path::new(p))).collect();
+    for f in inv.folders.iter_mut().filter(|f| f.without_folder) {
+        if f.sessions.iter().any(|s| s.files.iter().any(|w| gone.contains(&norm(Path::new(&w.path))))) {
+            f.nothing_to_move = false;
+        }
+    }
+}
+
 pub fn render_text(inv: &Inventory) -> String {
     let mut out = String::new();
-    let not_ordered = inv.folders.iter().filter(|f| !f.ordered).count();
+    let not_ordered = inv.folders.iter().filter(|f| !f.ordered && !f.nothing_to_move).count();
     out.push_str("Earlier Claude Code sessions on this computer (read-only look, nothing was changed)\n");
     out.push_str(&format!(
         "Sessions with something typed by the person: {}, listed: {} ({} left out: {} not in order, {} in order). Folders: {} ({} not in order yet).\n",
@@ -515,6 +653,9 @@ pub fn render_text(inv: &Inventory) -> String {
         for f in inv.folders.iter().filter(|f| f.without_folder) {
             for s in &f.sessions {
                 out.push_str(&format!("  session {}  {} .. {}  {} prompt(s)  [workspace {}]\n", s.session_id, s.first, s.last, s.prompts, f.folder));
+                if f.nothing_to_move {
+                    out.push_str("    NOTHING TO MOVE: this conversation left no file behind that still exists, so it does not stand in the way; you can still store what it taught\n");
+                }
                 out.push_str(&format!("    first prompt: {}\n", s.first_prompt));
                 out.push_str(&format!("    transcript: {}\n", s.file));
                 if !s.files.is_empty() {
@@ -550,6 +691,12 @@ pub fn render_text(inv: &Inventory) -> String {
                     out.push_str(&format!("      ... and {} more file(s) left out\n", s.files_left_out));
                 }
             }
+        }
+    }
+    if !inv.vanished.is_empty() {
+        out.push_str("\nNO LONGER THERE (these files were loose when THOR was installed, are gone now, and no tidy-up moved them; the proposal and the person's answer are still the way to settle the step)\n");
+        for p in &inv.vanished {
+            out.push_str(&format!("  gone   {p}\n"));
         }
     }
     if !inv.loose_files.is_empty() {

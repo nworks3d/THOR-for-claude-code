@@ -39,8 +39,24 @@ pub fn record_useful<'a>(
     id: &str,
     att: Option<&Att>,
 ) -> anyhow::Result<Event> {
+    record_useful_at(store, session_id, lineage_id, actor, marked_at, id, att, None)
+}
+
+/// `record_useful` for a verdict that is about one PLACE (`model::marked::
+/// place_label`): it clears the noise recorded at that place only. `None` is
+/// the plain mark, which clears the noise of every place.
+pub fn record_useful_at<'a>(
+    store: &mut EventStore,
+    session_id: &str,
+    lineage_id: &str,
+    actor: impl Into<WriteActor<'a>>,
+    marked_at: &str,
+    id: &str,
+    att: Option<&Att>,
+    place: Option<&str>,
+) -> anyhow::Result<Event> {
     let actor = fence(store, actor.into(), id).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let body = serde_json::to_string(&ItemMarkedUseful { marked_at: marked_at.to_string() })?;
+    let body = serde_json::to_string(&ItemMarkedUseful { marked_at: marked_at.to_string(), place: place.map(str::to_string) })?;
     let body = model::store::with_att(body, att)?;
     store.append_event(session_id, lineage_id, actor, EventKind::ItemMarkedUseful, id, None, &body)
 }
@@ -62,8 +78,24 @@ pub fn record_noise<'a>(
     id: &str,
     att: Option<&Att>,
 ) -> anyhow::Result<Event> {
+    record_noise_at(store, session_id, lineage_id, actor, marked_at, id, att, None)
+}
+
+/// `record_noise` for a verdict that is about one PLACE (`model::marked::
+/// place_label`): two of these at the same place silence the item at that place
+/// only (`crate::decay`). `None` is the plain mark, which counts for everywhere.
+pub fn record_noise_at<'a>(
+    store: &mut EventStore,
+    session_id: &str,
+    lineage_id: &str,
+    actor: impl Into<WriteActor<'a>>,
+    marked_at: &str,
+    id: &str,
+    att: Option<&Att>,
+    place: Option<&str>,
+) -> anyhow::Result<Event> {
     let actor = fence(store, actor.into(), id).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let body = serde_json::to_string(&ItemMarkedNoise { marked_at: marked_at.to_string() })?;
+    let body = serde_json::to_string(&ItemMarkedNoise { marked_at: marked_at.to_string(), place: place.map(str::to_string) })?;
     let body = model::store::with_att(body, att)?;
     store.append_event(session_id, lineage_id, actor, EventKind::ItemMarkedNoise, id, None, &body)
 }

@@ -3000,11 +3000,13 @@ fn standing_overflow_refusal(candidates: &[(String, Item)], item: &Item) -> Opti
             crate::item::STANDING_BLOCK_LIMIT_BYTES,
             block.len()
         ),
-        fix: "make room first, then this write goes through untouched. FOLD: revise one pinned fact to carry \
-              another's point, then retract the other with a reason naming the survivor. MOVE: bind one pinned fact \
-              to the command, file, tool or moment it is really about and unpin it, so it comes back right before \
-              that step instead of at every start. RETRACT: retract a stale one, with a reason saying what changed. \
-              Do NOT store the fact as an unbound Report to get past this: a Report never fires, so it would be \
+        fix: "make room first, then this write goes through untouched. SHORTEN FIRST - this always works: revise the \
+              text of a pinned fact so it says the same in fewer words (a revise that only shortens a pinned note is \
+              never refused). THEN FOLD: rewrite an OLD pinned fact (created over 24 hours ago) so it carries \
+              another's point, then within the hour retract the other with a reason naming the survivor's id as a \
+              whole word (a fold is not a loss). LAST, a take-down: only when the \
+              note is proven out of date and unused, or on the owner's own words (his whole message about that note, \
+              quoted). Do NOT store the fact as an unbound Report to get past this: a Report never fires, so it would be \
               saved and never come back."
             .to_string(),
     })
@@ -3944,17 +3946,43 @@ pub const EVALUATION_REPORT_TAG: &str = "evaluation-report";
 /// section is reimplemented rather than shared).
 pub const JUDGEMENT_DEBT_AFTER: usize = 10;
 
-/// The most notes one evaluation's judgement list holds, most-served first
-/// (`evaluation_judgement_list`). Measured 2026-11-01: with a threshold of 40
-/// sessions all 36 evaluation reports of 2026-10-20..11-01 showed "0 item(s)
-/// on the frozen list" while `status` showed 628 notes served again and again
-/// and never marked useful - nobody ever said whether a note helped. A lower
-/// threshold alone would swing to the opposite wall (hundreds of verdicts in
-/// one evaluation, the bulk dodging the batch cap exists to stop), so the list
-/// is capped: five honest verdicts per evaluation; the rest stay owed
-/// store-wide and the next evaluation asks for the next five. Mirrors
-/// `serve::usefulness::EVALUATION_JUDGEMENT_LIST_CAP` (kept equal by a test).
-pub const EVALUATION_JUDGEMENT_LIST_CAP: usize = 5;
+/// The fewest notes one evaluation's judgement list holds when anything is owed
+/// at all, and the size it had until 2026-11-20 (`judgement_list_cap`).
+/// Measured 2026-11-01: with a threshold of 40 sessions all 36 evaluation
+/// reports of 2026-10-20..11-01 showed "0 item(s) on the frozen list" while
+/// `status` showed 628 notes served again and again and never marked useful -
+/// nobody ever said whether a note helped. A lower threshold alone would swing
+/// to the opposite wall (hundreds of verdicts in one evaluation, the bulk
+/// dodging the batch cap exists to stop), so the list is capped; the rest stay
+/// owed store-wide and the next evaluation asks for the next ones. Mirrors
+/// `serve::usefulness::EVALUATION_JUDGEMENT_LIST_MIN` (kept equal by a test).
+pub const EVALUATION_JUDGEMENT_LIST_MIN: usize = 5;
+
+/// The most notes one evaluation's judgement list ever holds, whatever the
+/// backlog (`judgement_list_cap`): above this a list turns into rubber-stamping.
+pub const EVALUATION_JUDGEMENT_LIST_MAX: usize = 15;
+
+/// A backlog is spread over about this many evaluations: the list holds a
+/// quarter of what is owed (`judgement_list_cap`).
+pub const EVALUATION_JUDGEMENT_BACKLOG_EVALUATIONS: usize = 4;
+
+/// How many notes the list of an evaluation holds when `owed` notes could be on
+/// it (`evaluation_judgement_list`, `evaluation_judgement_candidates`): a
+/// quarter of them, so that a backlog clears in about four evaluations - but
+/// never fewer than `EVALUATION_JUDGEMENT_LIST_MIN` (a small backlog is still
+/// asked at once) and never more than `EVALUATION_JUDGEMENT_LIST_MAX`.
+///
+/// MEASURED on a copy of the owner's memory (2026-11-20): 173 evaluations had
+/// started; the 58 that really listed notes (since the threshold fell to 10
+/// sessions) listed 583 in all and the evaluating session gave an attested
+/// verdict on 519 of them (89 percent), so a list of that size is judged, not
+/// skipped. The notes an evaluation could list, by today's definition applied at
+/// each start, had a median of 22 (largest 65), so the list of 5 left most of the
+/// backlog for later evaluations; a quarter of it would have been 6 at the
+/// median and 15 at the most.
+pub fn judgement_list_cap(owed: usize) -> usize {
+    owed.div_ceil(EVALUATION_JUDGEMENT_BACKLOG_EVALUATIONS).clamp(EVALUATION_JUDGEMENT_LIST_MIN, EVALUATION_JUDGEMENT_LIST_MAX)
+}
 
 /// The most crowded places one evaluation's start note lists
 /// (`outranked_places`), most occupants first.
@@ -4112,7 +4140,37 @@ pub struct Att {
     /// Why the call is a side door, with `INFLIGHT_SIDE_DOOR`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub side_door: Option<String>,
+    /// ONLY on a write that takes a pinned note down (the unpin tool, a revise that
+    /// removes `Always`, a retract of a pinned note): what the tool server found
+    /// when it let the call through. A field of its own, written by the tool
+    /// server alone, never read back out of the writer's `because`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unpin: Option<UnpinStamp>,
 }
+
+/// How the tool server came to let a pinned note come down (`Att::unpin`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnpinStamp {
+    /// `UNPIN_CHECK_FAILED`, `UNPIN_NO_USE` or `UNPIN_OWNER_WORDS`.
+    pub kind: String,
+    /// True only when THOR's hook saw, in this session's transcript, the owner's own
+    /// whole message quoted in the reason (`serve::unpin_gate`). The one thing that
+    /// counts as the owner's words.
+    pub witnessed: bool,
+    /// For `UNPIN_FOLDED`: the id of the LIVE, PINNED note that now carries the point.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub into: Option<String>,
+}
+
+/// A fold, not a loss: a retract whose reason names the id of a live pinned note.
+pub const UNPIN_FOLDED: &str = "folded";
+
+/// The note carried a check and that check no longer held: proven out of date.
+pub const UNPIN_CHECK_FAILED: &str = "check_failed";
+/// The note carried no check and had no use in the last 90 days and no revision in the last 30.
+pub const UNPIN_NO_USE: &str = "no_use";
+/// The owner's own words, quoted whole and witnessed by the hook.
+pub const UNPIN_OWNER_WORDS: &str = "owner_words";
 
 /// The digest of a tool call's arguments: `hash_event("", <canonical JSON>)`,
 /// where the canonical JSON is `serde_json`'s own serialisation of the value
@@ -4902,6 +4960,7 @@ pub fn frozen_ids(start: &EvaluationStart) -> Vec<String> {
         .frozen
         .judgement
         .iter()
+        .chain(start.frozen.reread.iter())
         .chain(start.frozen.batch())
         .chain(start.frozen.a4_list())
         .chain(start.frozen.dispute_list().iter().map(|d| &d.id))
@@ -5224,6 +5283,10 @@ impl MachinePass {
     }
 }
 
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
 /// The lists an evaluation start froze, spliced into the start record's body
 /// as the trailing key `"frozen"`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -5244,6 +5307,18 @@ pub struct Frozen {
     pub prev_report_seq: i64,
     /// The judgement list (`evaluation_judgement_list`).
     pub judgement: Vec<String>,
+    /// How many more notes could have been on the judgement list but did not fit
+    /// under its cap (`judgement_list_cap`): they stay owed and the next
+    /// evaluation asks for them. Zero for a record written before this field
+    /// existed.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub judgement_later: usize,
+    /// The pinned notes to re-read (`evaluation_reread_list`): at most
+    /// `EVALUATION_REREAD_LIST`, each settled by a useful mark or a rewrite of
+    /// its text, never by an unpin. Empty for a record written before this
+    /// field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reread: Vec<String>,
     /// The teeth batch: at most `EVALUATION_TEETH_BATCH` rule ids that need
     /// the agent. `None` until THOR's machine pass has finished and written
     /// the batch record - the marker of a pass still to run.
@@ -5680,6 +5755,7 @@ fn starts_in(events: &[Event]) -> Vec<EvaluationStart> {
 /// record is on the log (`record_evaluation_batch`). Pure: nothing is written.
 pub fn frozen_now(store: &EventStore, session: &str, project: &str, started_by: &str, started_unix: i64) -> Option<Frozen> {
     let started_seq = store.get_next_seq().ok()? - 1;
+    let judged = evaluation_judgement_candidates(store, Some(project), session, started_seq);
     Some(Frozen {
         session: session.to_string(),
         project: project.to_string(),
@@ -5687,7 +5763,9 @@ pub fn frozen_now(store: &EventStore, session: &str, project: &str, started_by: 
         started_by: started_by.to_string(),
         started_unix,
         prev_report_seq: newest_counting_evaluation_seq(store, Some(project)),
-        judgement: evaluation_judgement_list(store, Some(project), session, started_seq),
+        judgement: judged.ids.iter().take(judgement_list_cap(judged.ids.len())).cloned().collect(),
+        judgement_later: judged.ids.len() - judged.ids.len().min(judgement_list_cap(judged.ids.len())),
+        reread: evaluation_reread_list(store, Some(project), started_unix, started_seq),
         batch: None,
         batch_later: 0,
         a4_list: None,
@@ -6160,7 +6238,7 @@ pub struct EvaluationJudgement {
     /// Still owed: on the frozen list (fired in this session before the
     /// evaluation started, in `JUDGEMENT_DEBT_AFTER`+ sessions since its last
     /// verdict as of that moment, the most-served
-    /// `EVALUATION_JUDGEMENT_LIST_CAP`), no verdict since, and not skipped
+    /// `judgement_list_cap`), no verdict since, and not skipped
     /// with a reason.
     pub owed: Vec<String>,
     /// Given a verdict since the evaluation started, or no longer live.
@@ -6202,7 +6280,8 @@ pub struct EvaluationJudgement {
 /// the evaluation's own writes - and every rule bound to the `remember` moment
 /// they fire - from growing the list while it is being paid.
 ///
-/// THE CAP: at most `EVALUATION_JUDGEMENT_LIST_CAP` items, those `session`
+/// THE CAP: at most `judgement_list_cap(owed)` items - a quarter of what could be listed, at
+/// least `EVALUATION_JUDGEMENT_LIST_MIN` and at most `EVALUATION_JUDGEMENT_LIST_MAX` - those `session`
 /// saw fire first, then the most-served (most sessions) - never everything
 /// that is owed at once. The rest stay
 /// owed store-wide (doctor's judgement debt) and the next evaluation lists the
@@ -6214,7 +6293,31 @@ pub struct EvaluationJudgement {
 /// older binary - resets nothing, so it cannot shrink the list before the
 /// evaluation even starts.
 pub fn evaluation_judgement_list(store: &EventStore, project: Option<&str>, session: &str, started_seq: i64) -> Vec<String> {
-    let Ok(events) = store.firings_and_verdicts() else { return Vec::new() };
+    let mut candidates = evaluation_judgement_candidates(store, project, session, started_seq);
+    let cap = judgement_list_cap(candidates.ids.len());
+    candidates.ids.truncate(cap);
+    candidates.ids
+}
+
+/// Every note an evaluation of `project` by `session` could list for a verdict
+/// at log position `started_seq`, BEFORE the cap, in the order the cap keeps
+/// them (`evaluation_judgement_list` takes the first `judgement_list_cap` of
+/// them), and how many of those this session itself saw fire.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JudgementCandidates {
+    pub ids: Vec<String>,
+    pub fired_here: usize,
+}
+
+/// The candidates of `evaluation_judgement_list`, uncapped: the set and the
+/// order are exactly the ones its doc comment describes. FAILS OPEN to none.
+pub fn evaluation_judgement_candidates(
+    store: &EventStore,
+    project: Option<&str>,
+    session: &str,
+    started_seq: i64,
+) -> JudgementCandidates {
+    let Ok(events) = store.firings_and_verdicts() else { return JudgementCandidates::default() };
     let attested = attested_write_seqs(store);
     let live = all_live_items(store);
     // THE OTHER SESSIONS OF THE PROJECT (`project_sessions_of`): an owed item
@@ -6293,8 +6396,359 @@ pub fn evaluation_judgement_list(store: &EventStore, project: Option<&str>, sess
             .then_with(|| b.2.cmp(&a.2))
             .then_with(|| a.3.cmp(&b.3))
     });
-    owed.truncate(EVALUATION_JUDGEMENT_LIST_CAP);
-    owed.into_iter().map(|(_, _, _, id)| id).collect()
+    let fired_here = owed.iter().filter(|o| o.0).count();
+    JudgementCandidates { ids: owed.into_iter().map(|(_, _, _, id)| id).collect(), fired_here }
+}
+
+// ------------------------------------------------ pinned notes to re-read (2026-11-20)
+//
+// THE GAP. A pinned (Always-bound) note is the owner's standing choice, so decay
+// never hides it and the judgement list never asks about it. Measured on the
+// owner's memory: 12 pinned notes were 59% of everything injected in a
+// benchmark, 32 of 49 pinned notes had never been examined by anything, and
+// nobody ever judged them. The evaluation therefore RE-READS a few of them each
+// time - and what it asks is a re-read, never a verdict that could unpin one: the
+// assistant confirms the note (a useful mark: still right, still needed at every
+// start) or makes its text right or shorter (a revise). An unpin is never asked
+// for, suggested or counted; a pinned note that should not be pinned is the
+// owner's call, and the assistant is told to say so instead of doing it.
+
+/// The most pinned notes one evaluation lists for a re-read.
+pub const EVALUATION_REREAD_LIST: usize = 3;
+
+/// A pinned note is listed again no sooner than this many days after it was last
+/// listed, confirmed or rewritten.
+pub const REREAD_MIN_DAYS: i64 = 30;
+
+/// The unix time near a log position: the `served_at` of the nearest earlier
+/// serving (an event carries no time of its own, so this is a lower bound).
+pub fn time_near_seq(store: &EventStore, seq: i64) -> Option<i64> {
+    for s in (seq.saturating_sub(400)..=seq).rev() {
+        let Ok(Some(event)) = store.get_event_by_seq(s) else { continue };
+        if event.kind != EventKind::ItemServed {
+            continue;
+        }
+        if let Some(at) = serde_json::from_str::<crate::served::ItemServed>(&event.body)
+            .ok()
+            .and_then(|b| crate::served::unix_from_iso8601(&b.served_at))
+        {
+            return Some(at);
+        }
+    }
+    None
+}
+
+/// The pinned notes an evaluation of `project` starting at `started_unix` (log
+/// position `started_seq`) lists for a re-read: at most
+/// `EVALUATION_REREAD_LIST`, the ones reviewed longest ago first (never reviewed
+/// first), and none that was reviewed in the last `REREAD_MIN_DAYS` days.
+///
+/// A note is a candidate when it is a live Rule or Orientation with an `Always`
+/// binding that is served in this project (its own, or global), and was served
+/// at least once (a note nobody saw fire cannot be confirmed). It was REVIEWED
+/// at the newest of: an evaluation that listed it (the start record's own
+/// time; a void or superseded evaluation does not count), an attested useful
+/// or noise mark of it, and its own last write (a rewrite or a pin is a look
+/// at it, dated by the nearest serving before it). FAILS OPEN to an empty list
+/// on an unreadable log.
+pub fn evaluation_reread_list(store: &EventStore, project: Option<&str>, started_unix: i64, started_seq: i64) -> Vec<String> {
+    let live = all_live_items(store);
+    let candidates: Vec<(&String, &Item)> = live
+        .iter()
+        .filter(|(_, it)| it.kind.can_fire() && it.bindings.iter().any(|b| matches!(b, Binding::Always)))
+        .filter(|(_, it)| project_applies_to(it.project.as_deref(), project))
+        .map(|(id, it)| (id, it))
+        .collect();
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let Ok(firings) = store.firings_and_verdicts() else { return Vec::new() };
+    let served: HashSet<&str> = firings
+        .iter()
+        .filter(|(seq, kind, _, actor, _)| *seq <= started_seq && *kind == EventKind::ItemServed && actor == ASSISTANT_DELIVERY_ACTOR)
+        .map(|(_, _, id, _, _)| id.as_str())
+        .collect();
+
+    // When each pinned note was last LISTED by an evaluation that was not
+    // closed as void or superseded.
+    let mut reviewed: HashMap<&str, i64> = HashMap::new();
+    if let Ok(events) = store.events_of_kinds(&[EventKind::FactCreated, EventKind::FactRevised], 0) {
+        for start in starts_in(&events) {
+            if start.frozen.void.is_some() || start.frozen.superseded.is_some() || start.seq > started_seq {
+                continue;
+            }
+            for id in &start.frozen.reread {
+                if let Some((known, _)) = candidates.iter().find(|(c, _)| *c == id) {
+                    let at = reviewed.entry(known.as_str()).or_insert(0);
+                    *at = (*at).max(start.frozen.started_unix);
+                }
+            }
+        }
+    }
+    // An attested verdict of it.
+    let attested = attested_write_seqs(store);
+    if let Ok(marks) = store.events_of_kinds(&[EventKind::ItemMarkedUseful, EventKind::ItemMarkedNoise], 0) {
+        for event in marks.iter().filter(|e| e.seq <= started_seq && attested.contains(&e.seq)) {
+            let Some((known, _)) = candidates.iter().find(|(c, _)| **c == event.entity_id) else { continue };
+            let at = serde_json::from_str::<serde_json::Value>(&event.body)
+                .ok()
+                .and_then(|v| v.get("marked_at").and_then(|a| a.as_str()).and_then(crate::served::unix_from_iso8601));
+            if let Some(at) = at {
+                let slot = reviewed.entry(known.as_str()).or_insert(0);
+                *slot = (*slot).max(at);
+            }
+        }
+    }
+
+    let min_gap = REREAD_MIN_DAYS * 86_400;
+    let mut due: Vec<(Option<i64>, String)> = Vec::new();
+    for (id, _) in candidates {
+        if !served.contains(id.as_str()) {
+            continue;
+        }
+        // Its own last write: a rewrite (or a pin) is a look at it too.
+        let written = store
+            .get_events_by_entity(id)
+            .ok()
+            .and_then(|events| events.iter().filter(|e| e.seq <= started_seq && writes_the_item(e.kind)).map(|e| e.seq).max())
+            .and_then(|seq| time_near_seq(store, seq));
+        let last = [reviewed.get(id.as_str()).copied(), written].into_iter().flatten().max();
+        if last.is_some_and(|at| started_unix.saturating_sub(at) < min_gap) {
+            continue;
+        }
+        due.push((last, id.clone()));
+    }
+    // Never reviewed first, then the one reviewed longest ago; ties by id.
+    due.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    due.truncate(EVALUATION_REREAD_LIST);
+    due.into_iter().map(|(_, id)| id).collect()
+}
+
+// ------------------------------------------------ pinned notes taken down (2026-11-20)
+//
+// The owner's rule: a pinned note comes down only when it is proven STALE, without
+// use AND without a replacement. The tool server enforces it (`serve::unpin_gate`)
+// for the unpin tool, for a revise that removes `Always` and for a retract of a
+// pinned note. THE REAL PROTECTION IS TRANSPARENCY, not any one check: whatever a
+// determined writer manages to get past a gate, EVERY note taken down through a
+// tool call is listed here for the owner, whatever its reason, with how the tool
+// server let it through - recorded in the event's own `att.unpin` field by the tool
+// server, never read out of the writer's reason text.
+
+/// One pinned note taken down through a tool call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolUnpin {
+    pub id: String,
+    /// "unpinned" or "retracted".
+    pub how: &'static str,
+    pub stamp: UnpinStamp,
+    /// The reason the writer gave (for the owner's words, the quoted message).
+    pub because: String,
+    pub seq: i64,
+}
+
+/// Every pinned note taken down through a tool call at a log position after
+/// `after_seq` (up to `until_seq`): a revise that dropped `Always`, or a retract of
+/// a note that was pinned, carrying the tool server's `att.unpin` stamp. An older
+/// write with no stamp is not listed. FAILS OPEN to none.
+pub fn tool_unpins(store: &EventStore, after_seq: i64, until_seq: i64) -> Vec<ToolUnpin> {
+    let Ok(events) = store.events_of_kinds(&[EventKind::FactCreated, EventKind::FactRevised, EventKind::FactRetracted], 0) else {
+        return Vec::new();
+    };
+    let mut pinned: HashMap<&str, bool> = HashMap::new();
+    let mut out = Vec::new();
+    for event in &events {
+        let (how, now) = if event.kind == EventKind::FactRetracted {
+            ("retracted", false)
+        } else {
+            let Ok(item) = parse_body(&event.body) else { continue };
+            ("unpinned", item.bindings.iter().any(|b| matches!(b, Binding::Always)))
+        };
+        let was = pinned.insert(event.entity_id.as_str(), now).unwrap_or(false);
+        if !(was && !now) || event.seq <= after_seq || event.seq > until_seq {
+            continue;
+        }
+        let Some(stamp) = att_of(&event.body).and_then(|a| a.unpin) else { continue };
+        let because = if how == "retracted" { tombstone_reason(&event.body) } else { because_reason(&event.body).unwrap_or_default() };
+        out.push(ToolUnpin { id: event.entity_id.clone(), how, stamp, because, seq: event.seq });
+    }
+    out
+}
+
+/// The line the owner reads for one of them, in doctor and in the machine section.
+pub fn unpin_line(u: &ToolUnpin) -> String {
+    let id = plain(&u.id);
+    let reason = plain(&u.because);
+    match (u.stamp.witnessed, u.stamp.kind.as_str()) {
+        (_, UNPIN_FOLDED) => format!(
+            "{} folded into {}: {id}, {reason}",
+            u.how,
+            plain(u.stamp.into.as_deref().unwrap_or("another pinned note"))
+        ),
+        (true, _) => format!("{} on the owner's own words: {id}, \"{reason}\"", u.how),
+        (false, UNPIN_CHECK_FAILED) => {
+            format!("{} without the owner's own words, proven out of date (its check failed): {id}, {reason}", u.how)
+        }
+        (false, _) => format!("{} without the owner's own words, no check and no recent use: {id}, {reason}", u.how),
+    }
+}
+
+// ------------------------------------------------ that the evaluating session read a note
+
+/// The entity a session's note reads are recorded on.
+pub fn note_read_entity(session_id: &str) -> String {
+    format!("note-read:{session_id}")
+}
+
+/// One `get` of a note that THOR read in a session's transcript.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteRead {
+    pub id: String,
+    pub tool_use_id: String,
+    /// When the transcript line was written, unix seconds.
+    pub at: i64,
+}
+
+/// Record that the transcript of `session_id` holds a `get` of `read.id`, once per
+/// `tool_use_id`: ONE `gate_stood_aside` by the attester on `note_read_entity`.
+pub fn record_note_read(store: &mut EventStore, session_id: &str, actor: SystemActor, read: &NoteRead) -> Result<Option<Event>, WriteError> {
+    if actor.name() != ATTESTER_ACTOR {
+        return Err(WriteError::Refused(Refusal {
+            problem: format!("a note read is recorded by THOR's attester only, not by '{}'", actor.name()),
+            fix: "let the Stop hook record it (serve::attest::record_note_reads)".to_string(),
+        }));
+    }
+    let entity = note_read_entity(session_id);
+    let events = store.get_events_by_entity(&entity).map_err(|e| WriteError::Store(e.into()))?;
+    if note_reads_in(&events).iter().any(|r| r.tool_use_id == read.tool_use_id) {
+        return Ok(None);
+    }
+    let name = fence(store, actor.into(), &entity)?;
+    let body = serde_json::json!({ "note_read": { "id": read.id, "tool_use_id": read.tool_use_id, "at": read.at } }).to_string();
+    store
+        .append_event(session_id, session_id, name, EventKind::GateStoodAside, &entity, None, &body)
+        .map(Some)
+        .map_err(|e| WriteError::Store(e.into()))
+}
+
+/// Every note read the attester recorded in `events` (one entity's events).
+pub fn note_reads_in(events: &[Event]) -> Vec<NoteRead> {
+    events
+        .iter()
+        .filter(|e| e.kind == EventKind::GateStoodAside && e.actor == ATTESTER_ACTOR)
+        .filter_map(|e| serde_json::from_str::<serde_json::Value>(&e.body).ok())
+        .filter_map(|body| {
+            let r = body.get("note_read")?;
+            Some(NoteRead {
+                id: r.get("id")?.as_str()?.to_string(),
+                tool_use_id: r.get("tool_use_id")?.as_str()?.to_string(),
+                at: r.get("at")?.as_i64()?,
+            })
+        })
+        .collect()
+}
+
+/// The re-read half of one evaluation's filing, split by state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EvaluationReread {
+    /// Still owed: no useful mark that follows a read of the note, and no rewrite
+    /// of its text, by an attested THOR call of the evaluating session since the
+    /// start.
+    pub owed: Vec<String>,
+    /// Confirmed (a useful mark after reading it with `get`) or rewritten (a revise
+    /// that changed its text) by an attested THOR call of the evaluating session,
+    /// taken down on the owner's own words, or changed by another session's
+    /// attested call.
+    pub settled: Vec<String>,
+    /// Of the owed ones: confirmed or rewritten by a THOR call of the evaluating
+    /// session that is not verified yet, as (id, log seq).
+    pub unverified: Vec<(String, i64)>,
+    /// Of the owed ones: unpinned by the evaluating session WITHOUT the owner's own
+    /// words. An unpin of that kind is never an outcome - they stay owed until the
+    /// note is pinned again and confirmed or rewritten.
+    pub unpinned: Vec<String>,
+    /// Of the owed ones: given a useful mark, but the evaluating session never
+    /// read the note with `get` after the evaluation started (a rubber stamp).
+    pub unread: Vec<String>,
+}
+
+/// What `start`'s frozen re-read list still owes. A listed note is SETTLED by one
+/// of three things, each read from the RECORDED verification of the write
+/// (`recorded_write_verdicts`): a revise that changed its TEXT, or a useful mark
+/// that follows a read of the note (the session called `get` for that id after the
+/// evaluation started, recorded from its transcript by `record_note_read`), both
+/// by an attested THOR call of the evaluating session and only while the note is
+/// still pinned; or the note taken down on the OWNER'S OWN WORDS (a stamped unpin
+/// the hook witnessed). A noise mark never reaches the log for a pinned note, a
+/// tag or a reason settles nothing, and an unpin without the owner's words is no
+/// outcome: it leaves the note owed. A listed note that is gone, or that someone
+/// else unpinned, is no longer this report's to settle.
+pub fn evaluation_reread_owed(store: &EventStore, start: &EvaluationStart) -> EvaluationReread {
+    let session = start.frozen.session.as_str();
+    let started_seq = start.frozen.started_seq;
+    let live = all_live_items(store);
+    let live_by_id: HashMap<&str, &Item> = live.iter().map(|(id, it)| (id.as_str(), it)).collect();
+    let reads = store.get_events_by_entity(&note_read_entity(session)).map(|e| note_reads_in(&e)).unwrap_or_default();
+    let read_since_start = |id: &str| reads.iter().any(|r| r.id == id && r.at >= start.frozen.started_unix);
+    let mut result = EvaluationReread::default();
+    for id in &start.frozen.reread {
+        let Ok(events) = store.get_events_by_entity(id) else {
+            result.owed.push(id.clone());
+            continue;
+        };
+        let Some(now) = live_by_id.get(id.as_str()) else { continue };
+        let Some(at_start) = item_before(&events, started_seq + 1) else { continue };
+        if !at_start.bindings.iter().any(|b| matches!(b, Binding::Always)) {
+            continue;
+        }
+        let verified = recorded_write_verdicts(&events);
+        let after = |e: &&Event| e.seq > started_seq;
+        let pinned_now = now.bindings.iter().any(|b| matches!(b, Binding::Always));
+        if !pinned_now {
+            let ours: Vec<&Event> = events
+                .iter()
+                .filter(after)
+                .filter(|e| changes_an_item(e.kind))
+                .filter(|e| attested_for_session(&verified, e.seq, session) || write_door(e, &verified, session) == WriteDoor::Pending)
+                .collect();
+            let on_owner_words = ours.iter().any(|e| att_of(&e.body).and_then(|a| a.unpin).is_some_and(|u| u.witnessed));
+            if on_owner_words {
+                result.settled.push(id.clone());
+            } else if !ours.is_empty() {
+                result.unpinned.push(id.clone());
+                result.owed.push(id.clone());
+            }
+            continue;
+        }
+        let confirmed: Vec<&Event> = events.iter().filter(after).filter(|e| e.kind == EventKind::ItemMarkedUseful).collect();
+        let rewritten: Vec<&Event> = events
+            .iter()
+            .filter(after)
+            .filter(|e| e.kind == EventKind::FactRevised)
+            .filter(|e| item_before(&events, e.seq + 1).is_some_and(|after_it| after_it.text != at_start.text))
+            .collect();
+        let rewrote = rewritten.iter().any(|e| attested_for_session(&verified, e.seq, session));
+        let marked = confirmed.iter().any(|e| attested_for_session(&verified, e.seq, session));
+        if rewrote || (marked && read_since_start(id)) {
+            result.settled.push(id.clone());
+        } else if credited_in(&events, started_seq, session).is_some() {
+            result.settled.push(id.clone());
+        } else {
+            if marked {
+                result.unread.push(id.clone());
+            }
+            if let Some(e) = confirmed
+                .iter()
+                .chain(rewritten.iter())
+                .rev()
+                .find(|e| write_door(e, &verified, session) == WriteDoor::Pending)
+            {
+                result.unverified.push((id.clone(), e.seq));
+            }
+            result.owed.push(id.clone());
+        }
+    }
+    result
 }
 
 /// For each item id: the filing seq of the NEWEST counting evaluation report
@@ -6955,6 +7409,43 @@ fn check_evaluation_report_filing(store: &EventStore, item: &Item, ctx: Option<&
         ));
     }
 
+    // THE PINNED NOTES TO RE-READ: the ones the start record froze. A pinned note
+    // is the owner's standing choice, so what is asked of it is a re-read: a
+    // useful mark (still right, still needed at every start) or a rewrite of its
+    // text (made right, or shorter). Never an unpin, and nothing else settles one.
+    let reread = evaluation_reread_owed(store, start);
+    if !reread.owed.is_empty() {
+        let named = reread.owed.iter().map(|id| format!("'{id}'")).collect::<Vec<_>>().join(", ");
+        let mut unpinned = if reread.unpinned.is_empty() {
+            String::new()
+        } else {
+            let ids = reread.unpinned.iter().map(|id| format!("'{id}'")).collect::<Vec<_>>().join(", ");
+            format!(
+                " {ids} was unpinned by this session without the owner's own words: that is never an outcome of a re-read \
+                 and settles nothing - pin it again with mcp__thor__pin(id: \"<id>\") and then confirm or rewrite it."
+            )
+        };
+        if !reread.unread.is_empty() {
+            let ids = reread.unread.iter().map(|id| format!("'{id}'")).collect::<Vec<_>>().join(", ");
+            unpinned.push_str(&format!(
+                " {ids} got a useful mark, but this session never read the note with mcp__thor__get after the evaluation \
+                 started, so the mark is a rubber stamp and settles nothing: read the note with get, then confirm or rewrite it."
+            ));
+        }
+        missing.push(format!(
+            "{} pinned note(s) on this evaluation's frozen re-read list (at most {EVALUATION_REREAD_LIST}, fixed when the \
+             evaluation started) have not been re-read: {named}.{unpinned} A pinned note is the owner's standing choice, so \
+             it is re-read, never unpinned. For each one read it (mcp__thor__get) and do exactly ONE of two things with the \
+             THOR tool itself: mcp__thor__mark(id: \"<id>\") when it is still right and still needed at every session start, \
+             or mcp__thor__revise(id: \"<id>\", ...) with its text made right, or shorter. If you think it should not be \
+             pinned at all, say so in the report for the owner and leave it pinned - do not unpin it, and do not mark it \
+             noise (that is refused). A mark settles it only after you read the note with get in this evaluation. A tag, a \
+             reason or an unpin of your own settles nothing, and a mark or a revise of this turn counts once the turn has \
+             ended",
+            reread.owed.len()
+        ));
+    }
+
     // THE BATCH AND THE A4 LIST: the ones the start record holds - a rule on
     // them that settles never pulls the next owed rule in, so the lists the
     // session was shown at the start are the whole of what it is held to.
@@ -7019,8 +7510,10 @@ fn check_evaluation_report_filing(store: &EventStore, item: &Item, ctx: Option<&
                 if label == STANDING_PLACE_LABEL {
                     format!(
                         "'{label}' ({} pinned facts do not fit in the {} bytes a session start carries and are cut from \
-                         it, so they are silent: {listed}; make the block fit by folding, by binding one to the step it \
-                         is about and unpinning it, or by retracting a stale one - until nothing is cut)",
+                         it, so they are silent: {listed}; make the block fit - first SHORTEN the text of a pinned note with \
+                         revise (this always works, and a revise that only shortens one is never refused), then FOLD two that \
+                         say the same (rewrite the older pinned note to carry the point, then within the hour retract the \
+                         other with a reason naming that survivor's id as a whole word), and only then a take-down on the owner's own words - until nothing is cut)",
                         ids.len(),
                         crate::item::STANDING_BLOCK_LIMIT_BYTES
                     )
@@ -7079,6 +7572,7 @@ fn check_evaluation_report_filing(store: &EventStore, item: &Item, ctx: Option<&
     // once is the whole of what settles them.
     let mut unverified: Vec<String> =
         judgement.unverified.iter().map(|(id, seq)| format!("'{id}' (its verdict at log seq {seq})")).collect();
+    unverified.extend(reread.unverified.iter().map(|(id, seq)| format!("'{id}' (its re-read at log seq {seq})")));
     unverified.extend(written.pending.iter().map(|(id, seq)| format!("'{id}' (written at log seq {seq})")));
     if !unverified.is_empty() {
         missing.push(format!(
@@ -8302,6 +8796,64 @@ fn machine_section(store: &EventStore, start: &EvaluationStart, filed_seq: i64) 
         "\ntotals: {} useful, {} noise, {} skipped, {} retracted or taken off the rule track, {} pinned{credited}; {share}.",
         summary.useful, summary.noise, summary.skipped, summary.gone, summary.pinned
     ));
+
+    // ---- PINNED RE-READ (only when the evaluation listed any)
+    if !frozen.reread.is_empty() {
+        out.push_str(&format!(
+            "\n\nPINNED RE-READ: {} pinned note(s) on the frozen list. A pinned note is re-read - read with get and confirmed \
+             with a useful mark, or rewritten - and never unpinned by the assistant.",
+            frozen.reread.len()
+        ));
+        let reads = log.entity(&note_read_entity(session));
+        let reads = note_reads_in(&reads);
+        for id in &frozen.reread {
+            let events = log.entity(id);
+            let verdicts = recorded_write_verdicts(&events);
+            let at_start = item_before(&events, n + 1);
+            let attested = |e: &&Event| matches!(write_door(e, &verdicts, session), WriteDoor::Attested { .. });
+            let confirmed = events.iter().filter(|e| e.seq > n && e.kind == EventKind::ItemMarkedUseful).filter(attested).next_back();
+            let rewritten = events
+                .iter()
+                .filter(|e| e.seq > n && e.kind == EventKind::FactRevised)
+                .filter(|e| {
+                    item_before(&events, e.seq + 1).is_some_and(|now| at_start.as_ref().is_some_and(|before| before.text != now.text))
+                })
+                .filter(attested)
+                .next_back();
+            let still_pinned = item_before(&events, i64::MAX)
+                .is_some_and(|now| now.bindings.iter().any(|b| matches!(b, Binding::Always)));
+            let read = reads.iter().any(|r| r.id == *id && r.at >= frozen.started_unix);
+            let on_owner_words = events
+                .iter()
+                .filter(|e| e.seq > n && changes_an_item(e.kind))
+                .any(|e| att_of(&e.body).and_then(|a| a.unpin).is_some_and(|u| u.witnessed));
+            let line = match (confirmed, rewritten, still_pinned) {
+                (_, _, false) if on_owner_words => "taken down on the owner's own words - settled".to_string(),
+                (_, _, false) => "no longer pinned - an unpin without the owner's own words is never an outcome of a re-read".to_string(),
+                (_, Some(event), true) => format!("rewritten - revise of its text at log seq {}", event.seq),
+                (Some(event), None, true) if read => format!("confirmed - useful mark at log seq {}, after reading it with get", event.seq),
+                (Some(event), None, true) => {
+                    format!("NOT settled - useful mark at log seq {} but the note was never read with get in this evaluation", event.seq)
+                }
+                (None, None, true) => "no re-read from this evaluation".to_string(),
+            };
+            out.push_str(&format!("\n- '{}': {line}", plain(id)));
+        }
+    }
+
+    // ---- PINNED NOTES TAKEN DOWN THROUGH A TOOL CALL (only when there is one). Every
+    // one is listed, whatever its reason: the owner sees what got past the gate.
+    let taken_down = tool_unpins(store, frozen.prev_report_seq, filed_seq);
+    if !taken_down.is_empty() {
+        out.push_str(&format!(
+            "\n\nPINNED NOTES TAKEN DOWN THROUGH A TOOL CALL since the previous evaluation: {}. Every one is listed for the \
+             owner, whatever the reason given; each line says how THOR let it through.",
+            taken_down.len()
+        ));
+        for u in &taken_down {
+            out.push_str(&format!("\n- {}", unpin_line(u)));
+        }
+    }
 
     // ---- TEETH
     out.push_str("\n\nTEETH: ");
@@ -12080,6 +12632,7 @@ mod tests {
             session_hint: Some(session.clone()),
             inflight: Some(INFLIGHT_SEEN.to_string()),
             side_door: None,
+            unpin: None,
         };
         let ctx = FilingContext::new(INFLIGHT_SEEN, start.clone()).expect("seen in flight gives a context");
         declare_scoped(store, &session, "l", "mcp", report, Some(&ctx), Some(&att))
@@ -12180,7 +12733,7 @@ mod tests {
     #[test]
     fn the_judgement_threshold_and_caps_are_the_owners_numbers() {
         assert_eq!(JUDGEMENT_DEBT_AFTER, 10);
-        assert_eq!(EVALUATION_JUDGEMENT_LIST_CAP, 5);
+        assert_eq!((EVALUATION_JUDGEMENT_LIST_MIN, EVALUATION_JUDGEMENT_LIST_MAX, EVALUATION_JUDGEMENT_BACKLOG_EVALUATIONS), (5, 15, 4));
         assert_eq!(EVALUATION_OUTRANKED_LIST, 3);
     }
 
@@ -12349,9 +12902,9 @@ mod tests {
         let WriteError::Refused(refusal) = err else { panic!("expected a refusal: {err}") };
         assert!(refusal.problem.contains("session start block of project 'p'"), "{}", refusal.problem);
         assert!(refusal.problem.contains(&crate::item::STANDING_BLOCK_LIMIT_BYTES.to_string()), "{}", refusal.problem);
-        for exit in ["FOLD", "MOVE", "RETRACT"] {
-            assert!(refusal.fix.contains(exit), "{}", refusal.fix);
-        }
+        // The exit that always works comes first, then the fold, then a take-down.
+        let (shorten, fold, down) = (refusal.fix.find("SHORTEN FIRST"), refusal.fix.find("THEN FOLD"), refusal.fix.find("LAST, a take-down"));
+        assert!(shorten.is_some() && fold > shorten && down > fold, "{}", refusal.fix);
         assert_eq!(all_live_items(&store).len(), before, "nothing was stored");
         assert!(show(&store, "one-too-many").is_err());
 
@@ -12750,6 +13303,7 @@ mod tests {
             session_hint: Some("tn-session".to_string()),
             inflight: Some(INFLIGHT_UNSEEN.to_string()),
             side_door: None,
+            unpin: None,
         };
         let body = with_att(serde_json::json!({"id": "tn-marked"}).to_string(), Some(&stamp("toolu_mark"))).unwrap();
         let mark = store.append_event("tn-session", "tn-session", "mcp", EventKind::ItemMarkedUseful, "tn-marked", None, &body).unwrap();
@@ -12892,6 +13446,8 @@ mod tests {
             started_unix: 1_790_000_000,
             prev_report_seq: 0,
             judgement: vec![],
+            judgement_later: 0,
+            reread: vec![],
             batch: Some(vec![]),
             batch_later: 0,
             a4_list: Some(vec![]),
@@ -17188,5 +17744,345 @@ mod tests {
             ),
             "{line}"
         );
+    }
+
+    // ------------------------------------------------ pinned notes to re-read (2026-11-20)
+
+    fn pinned_rule(id: &str, project: &str) -> Item {
+        let mut item = light_command_rule(id, project);
+        item.bindings = vec![Binding::Always];
+        item
+    }
+
+    /// A pinned note the assistant saw at a session start.
+    fn declare_pinned_and_serve(store: &mut EventStore, id: &str, project: &str) {
+        declare_noted(store, &pinned_rule(id, project));
+        serve_in(store, "seen", id, 1);
+    }
+
+    fn rewrite(store: &mut EventStore, session: &str, id: &str, text: &str) -> i64 {
+        let before = show(store, id).unwrap();
+        let mut after = before.clone();
+        after.text = text.to_string();
+        let seq = revise(store, session, "l", "mcp", &before, &after).unwrap().seq;
+        attest(store, session, id, seq);
+        seq
+    }
+
+    /// THE POINT: a pinned note on the re-read list is settled by a useful mark
+    /// or by a rewrite of its text, from the evaluating session's attested call,
+    /// and by nothing else - and the filing is held until each one is.
+    #[test]
+    fn a_pinned_note_listed_for_re_reading_is_settled_by_a_useful_mark_or_a_rewrite() {
+        let mut store = EventStore::in_memory().unwrap();
+        for id in ["rr-a", "rr-b", "rr-c"] {
+            declare_pinned_and_serve(&mut store, id, "rr");
+        }
+        let start = record_start(&mut store, "rr-session", "rr");
+        assert_eq!(start.frozen.reread, vec!["rr-a".to_string(), "rr-b".to_string(), "rr-c".to_string()]);
+        assert_eq!(evaluation_reread_owed(&store, &start).owed.len(), 3, "nothing is settled yet");
+        let err = file_in(&mut store, &eval_report("eval-rr-1", "rr"), &start).unwrap_err().to_string();
+        assert!(err.contains("'rr-a'") && err.contains("never unpinned"), "{err}");
+        assert!(err.contains("mcp__thor__mark") && err.contains("mcp__thor__revise"), "the two ways out are named: {err}");
+
+        // A tag, a reason, a mark from another session and an unattested mark settle nothing.
+        let mut tagged = eval_report("eval-rr-1", "rr");
+        tagged.tags.push(format!("{NOT_JUDGEABLE_TAG_PREFIX}rr-a:the fixture says it cannot be read"));
+        assert!(file_in(&mut store, &tagged, &start).is_err(), "a skip tag does not settle a re-read");
+        mark_verified(&mut store, "rr-a", "another-session", true);
+        mark_verified(&mut store, "rr-a", "rr-session", false);
+        assert_eq!(evaluation_reread_owed(&store, &start).settled, Vec::<String>::new());
+
+        // A useful mark of the session settles one (after it read the note); a changed text another.
+        mark_verified(&mut store, "rr-a", "rr-session", true);
+        note_read(&mut store, &start, "rr-a", 1);
+        note_read(&mut store, &start, "rr-c", 1);
+        rewrite(&mut store, "rr-session", "rr-b", "a shorter and right text for the pinned note");
+        // A revise that leaves the text as it was is no re-read.
+        let before = show(&store, "rr-c").unwrap();
+        let mut retagged = before.clone();
+        retagged.tags = vec!["housekeeping".to_string()];
+        let seq = revise(&mut store, "rr-session", "l", "mcp", &before, &retagged).unwrap().seq;
+        attest(&mut store, "rr-session", "rr-c", seq);
+        let state = evaluation_reread_owed(&store, &start);
+        assert_eq!(state.settled, vec!["rr-a".to_string(), "rr-b".to_string()]);
+        assert_eq!(state.owed, vec!["rr-c".to_string()], "a tag change is not a re-read");
+
+        mark_verified(&mut store, "rr-c", "rr-session", true);
+        assert!(evaluation_reread_owed(&store, &start).owed.is_empty());
+        file_in(&mut store, &eval_report("eval-rr-1", "rr"), &start).expect("every listed pinned note was re-read");
+        // The note is still pinned: nothing here ever takes a pin off.
+        for id in ["rr-a", "rr-b", "rr-c"] {
+            assert!(show(&store, id).unwrap().bindings.iter().any(|b| matches!(b, Binding::Always)), "{id} stays pinned");
+        }
+        let section = render_machine_section(&store, &start, i64::MAX);
+        assert!(section.contains("PINNED RE-READ: 3 pinned note(s)"), "{section}");
+        assert!(section.contains("'rr-a': confirmed") && section.contains("'rr-b': rewritten"), "{section}");
+    }
+
+    /// AN UNPIN IS NEVER AN OUTCOME: the session that unpins a listed note leaves
+    /// it owed, even with a useful mark after it; a noise mark settles nothing.
+    #[test]
+    fn an_unpin_never_settles_a_re_read_and_a_noise_mark_settles_nothing() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare_pinned_and_serve(&mut store, "up-a", "up");
+        declare_pinned_and_serve(&mut store, "up-b", "up");
+        let start = record_start(&mut store, "up-session", "up");
+        assert_eq!(start.frozen.reread, vec!["up-a".to_string(), "up-b".to_string()]);
+
+        let before = show(&store, "up-a").unwrap();
+        let mut unpinned = before.clone();
+        unpinned.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "force-push".to_string() }];
+        let seq = revise(&mut store, "up-session", "l", "mcp", &before, &unpinned).unwrap().seq;
+        attest(&mut store, "up-session", "up-a", seq);
+        mark_verified(&mut store, "up-a", "up-session", true);
+        // A noise mark that reached the log anyway (the tool refuses it) is no re-read.
+        let noise = store.append_event("up-session", "up-session", "mcp", EventKind::ItemMarkedNoise, "up-b", None, "{}").unwrap().seq;
+        attest(&mut store, "up-session", "up-b", noise);
+
+        let state = evaluation_reread_owed(&store, &start);
+        assert_eq!(state.settled, Vec::<String>::new());
+        assert_eq!(state.owed, vec!["up-a".to_string(), "up-b".to_string()]);
+        assert_eq!(state.unpinned, vec!["up-a".to_string()]);
+        let err = file_in(&mut store, &eval_report("eval-up-1", "up"), &start).unwrap_err().to_string();
+        assert!(err.contains("was unpinned by this session") && err.contains("never an outcome"), "{err}");
+
+        // An unpin by anyone else is not this report's to settle.
+        let mut elsewhere = EventStore::in_memory().unwrap();
+        declare_pinned_and_serve(&mut elsewhere, "up-c", "up");
+        let start = record_start(&mut elsewhere, "up-session", "up");
+        let before = show(&elsewhere, "up-c").unwrap();
+        let mut unpinned = before.clone();
+        unpinned.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "force-push".to_string() }];
+        revise(&mut elsewhere, "the-owner", "l", "owner", &before, &unpinned).unwrap();
+        let state = evaluation_reread_owed(&elsewhere, &start);
+        assert!(state.owed.is_empty() && state.settled.is_empty(), "{state:?}");
+    }
+
+    /// AT MOST THREE per evaluation, only notes served in this project (its own
+    /// or global), only notes somebody saw fire.
+    #[test]
+    fn at_most_three_pinned_notes_are_listed_and_only_those_served_in_the_project() {
+        let mut store = EventStore::in_memory().unwrap();
+        for n in 0..5 {
+            declare_pinned_and_serve(&mut store, &format!("lim-{n}"), "lim");
+        }
+        declare_pinned_and_serve(&mut store, "lim-other-project", "elsewhere");
+        let mut global = pinned_rule("lim-global", "x");
+        global.project = None;
+        declare_noted(&mut store, &global);
+        serve_in(&mut store, "seen", "lim-global", 1);
+        declare_noted(&mut store, &pinned_rule("lim-never-served", "lim"));
+        let mut not_pinned = light_command_rule("lim-bound", "lim");
+        not_pinned.severity = None;
+        declare_noted(&mut store, &not_pinned);
+        serve_in(&mut store, "seen", "lim-bound", 1);
+
+        let list = evaluation_reread_list(&store, Some("lim"), now_unix_secs(), i64::MAX);
+        assert_eq!(list.len(), EVALUATION_REREAD_LIST);
+        assert_eq!(EVALUATION_REREAD_LIST, 3);
+        for id in &list {
+            assert!(id.starts_with("lim-") && !["lim-other-project", "lim-never-served", "lim-bound"].contains(&id.as_str()), "{id}");
+        }
+        let everything: Vec<String> = ["lim-0", "lim-1", "lim-2", "lim-3", "lim-4", "lim-global"].iter().map(|s| s.to_string()).collect();
+        assert!(list.iter().all(|id| everything.contains(id)), "only this project's own and global pinned notes: {list:?}");
+    }
+
+    /// NONE MORE OFTEN THAN ONCE PER 30 DAYS, and the one reviewed longest ago
+    /// comes first. A note an evaluation listed is not listed by the next one.
+    #[test]
+    fn a_pinned_note_is_not_listed_again_within_thirty_days_and_the_oldest_review_leads() {
+        assert_eq!(REREAD_MIN_DAYS, 30);
+        let mut store = EventStore::in_memory().unwrap();
+        for n in 0..5 {
+            declare_pinned_and_serve(&mut store, &format!("age-{n}"), "age");
+        }
+        let first = record_start(&mut store, "age-session", "age");
+        assert_eq!(first.frozen.reread, vec!["age-0".to_string(), "age-1".to_string(), "age-2".to_string()]);
+        // The next evaluation, right after: only the two it did not list.
+        let second = record_start(&mut store, "age-session-2", "age");
+        assert_eq!(second.frozen.reread, vec!["age-3".to_string(), "age-4".to_string()], "the three just listed wait 30 days");
+        // 29 days later still nothing; 31 days later the three listed first
+        // (the older review) lead again.
+        let t0 = first.frozen.started_unix;
+        assert!(evaluation_reread_list(&store, Some("age"), t0 + 29 * 86_400, i64::MAX).is_empty());
+        let later = evaluation_reread_list(&store, Some("age"), t0 + 31 * 86_400, i64::MAX);
+        assert_eq!(later.len(), EVALUATION_REREAD_LIST);
+        assert!(later.iter().all(|id| id.starts_with("age-")));
+    }
+
+    /// An attested mark of a pinned note is a review too, dated by its own
+    /// `marked_at`: a recent one keeps it off the list, an old one does not.
+    #[test]
+    fn a_recent_attested_mark_keeps_a_pinned_note_off_the_list() {
+        let mut store = EventStore::in_memory().unwrap();
+        for id in ["mk-recent", "mk-old", "mk-never"] {
+            declare_pinned_and_serve(&mut store, id, "mk");
+        }
+        let now = crate::served::unix_from_iso8601("2026-11-20T12:00:00Z").unwrap();
+        for (id, at) in [("mk-recent", "2026-11-10T00:00:00Z"), ("mk-old", "2026-08-01T00:00:00Z")] {
+            let body = format!("{{\"marked_at\":\"{at}\"}}");
+            let seq = store.append_event("s", "l", "mcp", EventKind::ItemMarkedUseful, id, None, &body).unwrap().seq;
+            attest(&mut store, "s", id, seq);
+        }
+        let list = evaluation_reread_list(&store, Some("mk"), now, i64::MAX);
+        assert_eq!(list, vec!["mk-never".to_string(), "mk-old".to_string()], "never reviewed first, then the oldest; the recent one waits");
+    }
+
+    // ------------------------------------------------ the dynamic cap (2026-11-20)
+
+    /// A quarter of what could be listed, never fewer than 5 and never more than 15.
+    #[test]
+    fn the_cap_is_a_quarter_of_the_backlog_between_five_and_fifteen() {
+        assert_eq!(judgement_list_cap(0), 5, "an empty backlog still names the floor");
+        assert_eq!(judgement_list_cap(5), 5);
+        assert_eq!(judgement_list_cap(20), 5, "a quarter of 20 is the floor");
+        assert_eq!(judgement_list_cap(21), 6, "a quarter of 21 rounds up");
+        assert_eq!(judgement_list_cap(60), 15);
+        assert_eq!(judgement_list_cap(100), 15, "a backlog of 100 is capped, never a list of 25");
+        assert_eq!(judgement_list_cap(10_000), EVALUATION_JUDGEMENT_LIST_MAX);
+    }
+
+    /// The list an evaluation really freezes follows the same sizes, the
+    /// most-served first, and the start record counts the rest.
+    #[test]
+    fn the_judgement_list_holds_a_quarter_of_the_notes_it_could_list() {
+        for (owed, listed) in [(0usize, 0usize), (5, 5), (21, 6), (100, 15)] {
+            let mut store = EventStore::in_memory().unwrap();
+            for n in 0..owed {
+                let id = format!("cap-{n:03}");
+                declare_noted(&mut store, &light_command_rule(&id, "cap"));
+                serve_in(&mut store, "capsess", &id, JUDGEMENT_DEBT_AFTER + (owed - n));
+            }
+            let list = evaluation_judgement_list(&store, Some("cap"), "capsess", i64::MAX);
+            assert_eq!(list.len(), listed, "{owed} owed");
+            assert_eq!(list.first().map(String::as_str), (owed > 0).then_some("cap-000"), "the most-served first");
+            let frozen = frozen_now(&store, "capsess", "cap", "skill", 0).unwrap();
+            assert_eq!(frozen.judgement, list);
+            assert_eq!(frozen.judgement_later, owed - listed, "the start record says how many still wait");
+        }
+    }
+
+    // ------------------------------------------------ pinned notes taken down (2026-11-20)
+
+    /// A take-down as the tool server writes it: the item without `Always`, with its
+    /// reason and its own stamp in `att`.
+    fn take_down(store: &mut EventStore, session: &str, id: &str, because: &str, stamp: UnpinStamp) -> i64 {
+        let mut item = show(store, id).unwrap();
+        item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "force-push".to_string() }];
+        let mut body = serde_json::to_value(&item).unwrap();
+        body["because"] = serde_json::Value::String(because.to_string());
+        let att = Att { unpin: Some(stamp), ..Default::default() };
+        let body = with_att(body.to_string(), Some(&att)).unwrap();
+        store.append_mutate_checked(session, "l", "mcp", EventKind::FactRevised, id, None, &body).unwrap().seq
+    }
+
+    fn stamp(kind: &str, witnessed: bool) -> UnpinStamp {
+        UnpinStamp { kind: kind.to_string(), witnessed, into: None }
+    }
+
+    /// The attester's record that `session` called `get` for `id`, `offset` seconds after the start.
+    fn note_read(store: &mut EventStore, start: &EvaluationStart, id: &str, offset: i64) {
+        let read = NoteRead { id: id.to_string(), tool_use_id: format!("toolu_get_{id}_{offset}"), at: start.frozen.started_unix + offset };
+        record_note_read(store, &start.frozen.session, SystemActor::new(ATTESTER_ACTOR), &read).unwrap();
+    }
+
+    /// EVERY note taken down through a tool call is listed, whatever its reason, with
+    /// how the tool server let it through - read from the event's own stamp, so a
+    /// reason that imitates the owner's label is listed as what it is.
+    #[test]
+    fn every_take_down_is_listed_and_the_label_is_never_read_from_the_reason() {
+        let mut store = EventStore::in_memory().unwrap();
+        for id in ["un-a", "un-b", "un-c", "un-d"] {
+            declare_pinned_and_serve(&mut store, id, "un");
+        }
+        take_down(&mut store, "s", "un-a", "proven out of date and nothing replaces it", stamp(UNPIN_CHECK_FAILED, false));
+        take_down(&mut store, "s", "un-b", "the owner asked: \"haal un-b maar weg\"", stamp(UNPIN_OWNER_WORDS, true));
+        take_down(&mut store, "s", "un-c", "no check and no recent use of it at all", stamp(UNPIN_NO_USE, false));
+        // The reviewer's scenario: an unwitnessed reason that imitates the owner's label.
+        take_down(&mut store, "s", "un-d", "the owner's own words, checked by THOR: \"he said so\"", stamp(UNPIN_NO_USE, false));
+        let listed = tool_unpins(&store, 0, i64::MAX);
+        assert_eq!(listed.iter().map(|u| u.id.as_str()).collect::<Vec<_>>(), ["un-a", "un-b", "un-c", "un-d"], "all four: {listed:?}");
+        let lines: Vec<String> = listed.iter().map(unpin_line).collect();
+        assert!(lines[0].contains("proven out of date (its check failed)") && lines[0].contains("without the owner's own words"), "{lines:?}");
+        assert!(lines[1].starts_with("unpinned on the owner's own words: un-b, \""), "{lines:?}");
+        assert!(lines[2].contains("no check and no recent use") && lines[2].contains("without the owner's own words"), "{lines:?}");
+        assert!(lines[3].contains("without the owner's own words"), "the imitated label is listed as unwitnessed: {lines:?}");
+        assert!(tool_unpins(&store, listed[0].seq, i64::MAX).iter().all(|u| u.id != "un-a"), "only after the given position");
+
+        // A write with no stamp (an older unpin, or another door) is not listed, and neither is a retract of a note never pinned.
+        declare_pinned_and_serve(&mut store, "un-old", "un");
+        let mut item = show(&store, "un-old").unwrap();
+        item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "force-push".to_string() }];
+        store.append_mutate_checked("s", "l", "mcp", EventKind::FactRevised, "un-old", None, &serde_json::to_string(&item).unwrap()).unwrap();
+        assert_eq!(tool_unpins(&store, 0, i64::MAX).len(), 4);
+
+        // The next evaluation's machine section lists them all.
+        let start = record_start(&mut store, "un-session", "un");
+        let section = render_machine_section(&store, &start, i64::MAX);
+        assert!(section.contains("PINNED NOTES TAKEN DOWN THROUGH A TOOL CALL"), "{section}");
+        assert!(section.contains("- unpinned on the owner's own words: un-b") && section.contains("un-d"), "{section}");
+    }
+
+    /// A retract of a pinned note is listed too.
+    #[test]
+    fn a_retract_of_a_pinned_note_is_listed() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare_pinned_and_serve(&mut store, "rt-pinned", "rt");
+        let att = Att { unpin: Some(stamp(UNPIN_NO_USE, false)), ..Default::default() };
+        retract(&mut store, "s", "l", "mcp", "rt-pinned", "nothing of it is left, nothing replaces it", Some(&att)).unwrap();
+        let listed = tool_unpins(&store, 0, i64::MAX);
+        assert_eq!(listed.len(), 1);
+        assert!(unpin_line(&listed[0]).starts_with("retracted without the owner's own words, no check and no recent use: rt-pinned"), "{listed:?}");
+    }
+
+    /// A WITNESSED take-down settles the re-read of that note; one without the owner's
+    /// words does not.
+    #[test]
+    fn a_witnessed_take_down_settles_the_re_read_and_an_unwitnessed_one_does_not() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare_pinned_and_serve(&mut store, "wt-a", "wt");
+        declare_pinned_and_serve(&mut store, "wt-b", "wt");
+        let start = record_start(&mut store, "wt-session", "wt");
+        assert_eq!(start.frozen.reread, vec!["wt-a".to_string(), "wt-b".to_string()]);
+        let seq = take_down(&mut store, "wt-session", "wt-a", "the owner asked: \"haal wt-a weg\"", stamp(UNPIN_OWNER_WORDS, true));
+        attest(&mut store, "wt-session", "wt-a", seq);
+        let seq = take_down(&mut store, "wt-session", "wt-b", "proven out of date and nothing replaces it", stamp(UNPIN_NO_USE, false));
+        attest(&mut store, "wt-session", "wt-b", seq);
+        let state = evaluation_reread_owed(&store, &start);
+        assert_eq!(state.settled, vec!["wt-a".to_string()], "{state:?}");
+        assert_eq!(state.owed, vec!["wt-b".to_string()]);
+        assert_eq!(state.unpinned, vec!["wt-b".to_string()]);
+        let section = render_machine_section(&store, &start, i64::MAX);
+        assert!(section.contains("'wt-a': taken down on the owner's own words - settled"), "{section}");
+    }
+
+    /// THE RUBBER STAMP: a useful mark settles a listed pinned note only after the
+    /// evaluating session read it with `get` since the evaluation started.
+    #[test]
+    fn a_useful_mark_settles_a_pinned_note_only_after_a_read_of_it() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare_pinned_and_serve(&mut store, "rs-a", "rs");
+        let start = record_start(&mut store, "rs-session", "rs");
+        mark_verified(&mut store, "rs-a", "rs-session", true);
+        let state = evaluation_reread_owed(&store, &start);
+        assert_eq!((state.owed.clone(), state.settled.clone(), state.unread.clone()), (vec!["rs-a".to_string()], vec![], vec!["rs-a".to_string()]), "{state:?}");
+        let err = file_in(&mut store, &eval_report("eval-rs-1", "rs"), &start).unwrap_err().to_string();
+        assert!(err.contains("never read the note with mcp__thor__get") && err.contains("read the note with get, then confirm or rewrite it"), "{err}");
+
+        // A read from before the evaluation started does not count; one after does.
+        note_read(&mut store, &start, "rs-a", -60);
+        assert_eq!(evaluation_reread_owed(&store, &start).owed, vec!["rs-a".to_string()]);
+        note_read(&mut store, &start, "rs-a", 5);
+        let state = evaluation_reread_owed(&store, &start);
+        assert!(state.owed.is_empty() && state.settled == vec!["rs-a".to_string()], "{state:?}");
+        file_in(&mut store, &eval_report("eval-rs-1", "rs"), &start).expect("read, then confirmed");
+        assert!(render_machine_section(&store, &start, i64::MAX).contains("'rs-a': confirmed - useful mark"), "after reading it with get");
+
+        // A rewrite settles by itself, with no read.
+        declare_pinned_and_serve(&mut store, "rs-b", "rs2");
+        let second = record_start(&mut store, "rs-session-2", "rs2");
+        rewrite(&mut store, "rs-session-2", "rs-b", "a shorter and right text for the pinned note");
+        assert_eq!(evaluation_reread_owed(&store, &second).settled, vec!["rs-b".to_string()]);
     }
 }

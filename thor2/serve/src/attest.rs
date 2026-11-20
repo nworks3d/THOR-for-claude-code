@@ -799,6 +799,7 @@ pub fn att_for_call(
         session_hint: env_session.filter(|s| !s.trim().is_empty()).map(str::to_string),
         inflight: Some(inflight.to_string()),
         side_door,
+        unpin: None,
     }
 }
 
@@ -1014,6 +1015,54 @@ pub fn record_hook_faults_in(store: &mut EventStore, session: &str, root: Option
             let written = model::store::record_hook_fault(store, session, SystemActor::new(ATTESTER_ACTOR), &found.fault);
             if matches!(written, Ok(Some(_))) {
                 recorded += 1;
+            }
+        }
+    }
+    recorded
+}
+
+/// Every `get` of a note that `session`'s main transcript holds, written to the log
+/// once each (`model::store::record_note_read`), with the time of its line. The
+/// weekly evaluation counts a useful mark on a pinned note only after the session
+/// read the note this way (`model::store::evaluation_reread_owed`). Runs at the
+/// session's Stop and never holds a turn. Returns how many it recorded.
+pub fn record_note_reads(store: &mut EventStore, session: &str) -> usize {
+    record_note_reads_in(store, session, transcripts_root().as_deref())
+}
+
+/// `record_note_reads` against the transcripts under `root`.
+pub fn record_note_reads_in(store: &mut EventStore, session: &str, root: Option<&Path>) -> usize {
+    let Some(root) = root else { return 0 };
+    let mut recorded = 0;
+    for file in session_transcripts(root, session) {
+        let Ok(text) = std::fs::read_to_string(&file) else { continue };
+        for raw in text.lines() {
+            if !raw.contains("__get") {
+                continue;
+            }
+            let Ok(line) = serde_json::from_str::<Value>(raw) else { continue };
+            let main_assistant = line.get("type").and_then(|t| t.as_str()) == Some("assistant")
+                && line.get("isSidechain").and_then(|b| b.as_bool()) != Some(true);
+            if !main_assistant {
+                continue;
+            }
+            let at = line.get("timestamp").and_then(|t| t.as_str()).and_then(crate::eval_filing::unix_of_timestamp).unwrap_or(0);
+            for block in line.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_array()).into_iter().flatten() {
+                let is_get = block.get("type").and_then(|t| t.as_str()) == Some("tool_use")
+                    && block.get("name").and_then(|n| n.as_str()).is_some_and(|n| n.ends_with("__get"));
+                let (Some(id), Some(tool_use_id)) = (
+                    block.get("input").and_then(|i| i.get("id")).and_then(|v| v.as_str()),
+                    block.get("id").and_then(|v| v.as_str()),
+                ) else {
+                    continue;
+                };
+                if !is_get {
+                    continue;
+                }
+                let read = model::store::NoteRead { id: id.to_string(), tool_use_id: tool_use_id.to_string(), at };
+                if matches!(model::store::record_note_read(store, session, SystemActor::new(ATTESTER_ACTOR), &read), Ok(Some(_))) {
+                    recorded += 1;
+                }
             }
         }
     }
