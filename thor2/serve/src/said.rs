@@ -348,8 +348,9 @@ pub fn print_for(store: &EventStore, root: Option<&Path>, project: &str) -> Resu
 /// double quotes, the quotes themselves are dropped (`--project='a b'` is one
 /// word `--project=a b`), and a backslash before a space or, outside single
 /// quotes, before a quote keeps that character (`a\ b`). Any other backslash is
-/// literal, so Windows paths such as `C:\thor2\serve.exe` stay whole.
-fn shell_words(command: &str) -> Vec<String> {
+/// literal, so Windows paths such as `C:\thor2\serve.exe` stay whole. PowerShell
+/// (`powershell`) has no backslash escape at all: there a backslash is always literal.
+fn shell_words(command: &str, powershell: bool) -> Vec<String> {
     let mut words = Vec::new();
     let mut word = String::new();
     let mut started = false;
@@ -359,13 +360,13 @@ fn shell_words(command: &str) -> Vec<String> {
         match (quote, c) {
             (Some(q), _) if c == q => quote = None,
             (Some('\''), _) => word.push(c),
-            (Some(_), '\\') if matches!(chars.peek(), Some('"')) => word.push(chars.next().unwrap()),
+            (Some(_), '\\') if !powershell && matches!(chars.peek(), Some('"')) => word.push(chars.next().unwrap()),
             (Some(_), _) => word.push(c),
             (None, '"' | '\'') => {
                 quote = Some(c);
                 started = true;
             }
-            (None, '\\') if matches!(chars.peek(), Some(' ' | '"' | '\'')) => {
+            (None, '\\') if !powershell && matches!(chars.peek(), Some(' ' | '"' | '\'')) => {
                 word.push(chars.next().unwrap());
                 started = true;
             }
@@ -388,8 +389,13 @@ fn shell_words(command: &str) -> Vec<String> {
 /// `--project <project>` (the program is `serve` or `serve.exe`, bare or at the
 /// end of a path; the project may be quoted).
 pub fn runs_said(command: &str, project: &str) -> bool {
+    runs_said_in(command, project, false)
+}
+
+/// `runs_said` for a command of the PowerShell tool (`powershell`) or of Bash.
+pub fn runs_said_in(command: &str, project: &str, powershell: bool) -> bool {
     let clean = |t: String| t.trim_matches(|c| c == '&' || c == ';' || c == '|' || c == '(' || c == ')').to_string();
-    let tokens: Vec<String> = shell_words(command).into_iter().map(clean).filter(|t| !t.is_empty()).collect();
+    let tokens: Vec<String> = shell_words(command, powershell).into_iter().map(clean).filter(|t| !t.is_empty()).collect();
     let is_serve = |t: &str| {
         let base = t.rsplit(['/', '\\']).next().unwrap_or("").to_lowercase();
         base == "serve" || base == "serve.exe"
@@ -422,9 +428,9 @@ pub fn printed_in_transcript(transcript: &Path, started_unix: i64, project: &str
         }
         let items = line.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_array());
         items.into_iter().flatten().any(|item| {
-            let shell = item.get("type").and_then(|t| t.as_str()) == Some("tool_use")
-                && matches!(item.get("name").and_then(|n| n.as_str()), Some("Bash") | Some("PowerShell"));
-            shell && runs_said(item.get("input").and_then(|i| i.get("command")).and_then(|c| c.as_str()).unwrap_or(""), project)
+            let tool = item.get("name").and_then(|n| n.as_str());
+            let shell = item.get("type").and_then(|t| t.as_str()) == Some("tool_use") && matches!(tool, Some("Bash") | Some("PowerShell"));
+            shell && runs_said_in(item.get("input").and_then(|i| i.get("command")).and_then(|c| c.as_str()).unwrap_or(""), project, tool == Some("PowerShell"))
         })
     })
 }
@@ -608,6 +614,25 @@ mod tests {
         assert!(!runs_said("serve --db x said --project Trade bot", "Trade bot"), "an unquoted space ends the name");
         assert!(!runs_said("serve --db x said --project 'Other bot'", "Trade bot"));
         assert!(!runs_said("serve --db x said --project \"Trade bot", "Trade bot x"));
+    }
+
+    #[test]
+    fn a_backslash_before_a_quote_is_literal_in_powershell_and_an_escape_in_bash() {
+        let ps = "Set-Location \"C:\\x\\\"; & C:/Users/a/thor2/serve.exe --db y said --project 'Trade bot'";
+        assert!(runs_said_in(ps, "Trade bot", true), "PowerShell closes the word at the quote");
+        assert!(!runs_said_in(ps, "Trade bot", false), "Bash reads the backslash as an escape");
+        assert!(runs_said_in("serve --db \"a \\\"b\\\" c\" said --project demo", "demo", false));
+        // Through the transcript reader: the tool name decides.
+        let dir = tempfile::tempdir().unwrap();
+        let line = |tool: &str| {
+            serde_json::json!({ "type": "assistant", "timestamp": "2026-11-20T10:00:00Z",
+                "message": { "content": [{ "type": "tool_use", "name": tool, "input": { "command": ps } }] } })
+            .to_string()
+        };
+        std::fs::write(dir.path().join("p.jsonl"), line("PowerShell")).unwrap();
+        std::fs::write(dir.path().join("b.jsonl"), line("Bash")).unwrap();
+        assert!(printed_in_transcript(&dir.path().join("p.jsonl"), 0, "Trade bot"));
+        assert!(!printed_in_transcript(&dir.path().join("b.jsonl"), 0, "Trade bot"));
     }
 
     #[test]

@@ -3779,6 +3779,10 @@ fn no_project_prompt_line(
     if folder_project.is_some() || no_record || session_kind(payload).headless || payload_is_from_a_subagent(payload) || serve::other_project::ask_is_off(db_path) {
         return None;
     }
+    // The welcome of a new owner proposes the folder itself (proposal 3).
+    if serve::other_project::first_session_open(store) {
+        return None;
+    }
     said_once_keyed(db_path, session_id, NO_PROJECT_LINE_KEY, String::new())?;
     let known = serve::other_project::known_folders(store, serve::other_project::KNOWN_FOLDERS_MAX);
     Some(serve::other_project::no_project_line_with(&known))
@@ -3795,10 +3799,14 @@ fn no_project_stop_hold(db_path: &Path, payload: &Value, session_id: &str, stop_
     }
     let text = std::fs::read_to_string(payload.get("transcript_path")?.as_str()?).ok()?;
     let facts = serve::other_project::transcript_facts(&text);
-    if facts.moved_or_prepared {
+    if facts.moved_or_prepared || facts.retracted_setup_note {
         return None;
     }
     let store = serve::store_dir::open_existing(db_path).ok()?;
+    // The welcome of a new owner proposes the folder itself (proposal 3).
+    if serve::other_project::first_session_open(&store) {
+        return None;
+    }
     let known = serve::other_project::known_folders(&store, serve::other_project::KNOWN_FOLDERS_MAX);
     said_once_keyed(db_path, session_id, NO_PROJECT_HOLD_KEY, serve::other_project::stop_hold_text(&known))
 }

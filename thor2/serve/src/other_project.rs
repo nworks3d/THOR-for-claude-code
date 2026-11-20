@@ -178,6 +178,16 @@ pub struct TranscriptFacts {
     /// The session already called `change_directory`, `request_directory` or
     /// `spawn_task` (any tool whose name ends in one of them), in any turn.
     pub moved_or_prepared: bool,
+    /// The session itself retracted the first-session setup note: it is the
+    /// welcome conversation, whose proposal 3 already covers the folder.
+    pub retracted_setup_note: bool,
+}
+
+/// Whether the first-session setup (the setup note, then the tidy step's note)
+/// is still open: the welcome proposes the folder itself then, so no second
+/// question about it is asked.
+pub fn first_session_open(store: &EventStore) -> bool {
+    model::store::show(store, model::store::SETUP_NOTE_ID).is_ok() || model::store::show(store, model::store::ORDER_NOTE_ID).is_ok()
 }
 
 /// Reads a transcript (Claude Code's JSONL) for `TranscriptFacts`. Lines that
@@ -192,6 +202,9 @@ pub fn transcript_facts(transcript_jsonl: &str) -> TranscriptFacts {
         let Some(blocks) = entry.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_array()) else { continue };
         for block in blocks.iter().filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use")) {
             let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            if name.ends_with("retract") && block.get("input").is_some_and(|i| i.to_string().contains(model::store::SETUP_NOTE_ID)) {
+                facts.retracted_setup_note = true;
+            }
             if ["change_directory", "request_directory", "spawn_task"].iter().any(|moving| name.ends_with(moving)) {
                 facts.moved_or_prepared = true;
             }

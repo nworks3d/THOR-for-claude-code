@@ -308,3 +308,91 @@ fn the_transcript_facts_count_this_turn_and_remember_a_move_from_any_turn() {
     assert!(facts.moved_or_prepared);
     assert_eq!(serve::other_project::transcript_facts("not json\n\n"), serve::other_project::TranscriptFacts::default());
 }
+
+// ---------------------------------------------------------------------------
+// The first-session welcome already proposes the folder: no second question.
+
+/// The install's own notes: the setup note (live or retracted, with the answers
+/// on record) and the tidy step's note (live or not there).
+fn install_notes(f: &Fixture, setup_live: bool, order_live: bool) {
+    let mut store = EventStore::new(&f.db).unwrap();
+    let note = |id: &str, kind: Kind| Item {
+        id: id.to_string(),
+        kind,
+        text: "fixture note".to_string(),
+        bindings: if kind == Kind::Report { vec![] } else { vec![Binding::Always] },
+        severity: None,
+        project: None,
+        tags: vec!["working-contract".to_string()],
+        expires: None,
+        key: None,
+        falsifier: Some("fixture falsifier".to_string()),
+        check: None,
+    };
+    model::store::declare(&mut store, "install", "install", "install-fixture", &note(model::store::SETUP_NOTE_ID, Kind::Rule)).unwrap();
+    if order_live {
+        model::store::declare(&mut store, "install", "install", "install-fixture", &note(model::store::ORDER_NOTE_ID, Kind::Orientation)).unwrap();
+    }
+    if !setup_live {
+        model::store::declare(&mut store, "install", "install", "install-fixture", &note(model::store::OWNER_SETUP_ANSWERS_ID, Kind::Report)).unwrap();
+        model::store::retract(&mut store, "s", "l", "fixture", model::store::SETUP_NOTE_ID, "answered", None).unwrap();
+    }
+}
+
+fn first_prompt(f: &Fixture, session: &str) -> String {
+    hook(f, &f.nowhere, with_session(session, serde_json::json!({ "hook_event_name": "UserPromptSubmit", "prompt": "please water the tomatoes" })))
+}
+
+#[test]
+fn the_beginner_flow_gets_no_second_folder_question() {
+    let f = fixture();
+    install_notes(&f, true, true);
+    // The welcome conversation: the first prompt carries no no-project line either.
+    assert!(!first_prompt(&f, "welcome-1").contains("belongs to no project"));
+    // Stop 1: the setup hold. Stop 2 (the setup note is live or just retracted): no folder hold.
+    let log = transcript(&f, "welcome", &["Bash"]);
+    let first = stop(&f, &f.nowhere, "welcome-1", &log, serde_json::json!({}));
+    assert!(first.contains("walked through setup") && !held(&first), "{first}");
+    {
+        let mut store = EventStore::new(&f.db).unwrap();
+        let answers = Item {
+            id: model::store::OWNER_SETUP_ANSWERS_ID.to_string(),
+            kind: Kind::Report,
+            text: "fixture note".to_string(),
+            bindings: vec![],
+            severity: None,
+            project: None,
+            tags: vec!["working-contract".to_string()],
+            expires: None,
+            key: None,
+            falsifier: Some("fixture falsifier".to_string()),
+            check: None,
+        };
+        model::store::declare(&mut store, "install", "install", "install-fixture", &answers).unwrap();
+        model::store::retract(&mut store, "s", "l", "fixture", model::store::SETUP_NOTE_ID, "answered", None).unwrap();
+    }
+    // The tidy note is still live: no folder hold.
+    assert!(!held(&stop(&f, &f.nowhere, "welcome-1", &log, serde_json::json!({}))));
+    // The tidy note gone too, but this very session retracted the setup note: still none.
+    {
+        let mut store = EventStore::new(&f.db).unwrap();
+        let _ = model::store::retract(&mut store, "s", "l", "fixture", model::store::ORDER_NOTE_ID, "settled", None);
+    }
+    let mut lines = std::fs::read_to_string(&log).unwrap();
+    lines.push_str(&serde_json::json!({ "type": "assistant", "message": { "content": [
+        { "type": "tool_use", "id": "r", "name": "mcp__thor__retract", "input": { "id": model::store::SETUP_NOTE_ID, "reason": "done" } }
+    ] } }).to_string());
+    lines.push('\n');
+    std::fs::write(&log, lines).unwrap();
+    assert!(!held(&stop(&f, &f.nowhere, "welcome-2", &log, serde_json::json!({}))));
+}
+
+#[test]
+fn after_the_setup_is_finished_a_new_conversation_with_no_folder_is_held_once() {
+    let f = fixture();
+    install_notes(&f, false, false);
+    assert!(first_prompt(&f, "later-1").contains("belongs to no project"));
+    let log = transcript(&f, "later", &["Bash"]);
+    assert!(held(&stop(&f, &f.nowhere, "later-1", &log, serde_json::json!({}))));
+    assert!(!held(&stop(&f, &f.nowhere, "later-1", &log, serde_json::json!({}))));
+}

@@ -802,7 +802,7 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
   the no-project line has its reserve only in a folder of no project, and is at most 600 bytes and names up to 10 project folders THOR
   knows, so the assistant can propose one and ask the person yes or no; it is repeated once at the first
   message of a resumed conversation, and the end of the first turn of such a conversation is held once, whatever the turn did, never for an
-  agent, a headless session or a copy; `{"mode": "off"}` in `no-project-ask-mode.json` beside the memory
+  agent, a headless session, a copy or a new owner's first-session welcome, which proposes the folder itself; `{"mode": "off"}` in `no-project-ask-mode.json` beside the memory
   switches the repeat and the hold off), then the short lines someone must act on (a copy line,
   registration notice, open points, a missing program, a copy that does not answer), and last the tools overview, which gets
   shorter (fewer tool lines, the rest counted in "... and N more in <folder>", at the smallest one line
