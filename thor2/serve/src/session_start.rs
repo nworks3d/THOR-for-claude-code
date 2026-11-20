@@ -270,14 +270,14 @@ pub fn recent_in_project(db: &std::path::Path, project: Option<&str>, now_unix: 
 pub fn render_for_project(ctx: &DoctorStart, db: &std::path::Path, project: Option<&str>, now_unix: i64) -> Option<Rendered> {
     let (items, _) = split_for_session_start(crate::decay::retain_live(select(&ctx.candidates, project), &ctx.decay), false);
     let recent = recent_in_project(db, project, now_unix);
-    render_within_ranked(&items, model::item::STANDING_BLOCK_LIMIT_BYTES, &recent)
+    render_within_ranked(&items, model::item::standing_limit_for(project), &recent)
 }
 
 /// The extra lines of a start that fit next to `rules_len` bytes of standing
 /// rules, in their order. The rules took their room first
-/// (`STANDING_BLOCK_LIMIT_BYTES`), so the compaction reminder, which must always
-/// be shown, always fits in the reserve. THE ORDER WHEN ROOM IS SHORT: the
-/// reminder, then every short line that someone must act on (the copy line, the
+/// (`STANDING_BLOCK_LIMIT_BYTES`), so the compaction reminder, which must always be shown, always fits in the
+/// reserve; in a folder of no project the rules get `NO_PROJECT_STANDING_LIMIT_BYTES`, which also keeps the no-project line's room. THE ORDER WHEN
+/// ROOM IS SHORT: the reminder, the no-project line, then every short line that someone must act on (the copy line, the
 /// registration notice, open points, a missing program, a copy that does not
 /// answer, the folder notices, the no-project line), in the order they come,
 /// and last the tools overview, which takes what is left and shrinks to fit
@@ -287,15 +287,18 @@ pub fn render_for_project(ctx: &DoctorStart, db: &std::path::Path, project: Opti
 pub fn fit_extras(rules_len: usize, extras: Vec<String>) -> Vec<String> {
     let cost = |line: &String| line.len() + 2;
     let is_overview = |line: &String| line.starts_with(crate::work_folders::OVERVIEW_PREFIX);
+    // The two lines that are never left out: the compaction reminder and the
+    // no-project line (it has its own reserve, `NO_PROJECT_LINE_MAX_BYTES`).
+    let must_show = |line: &String| line == COMPACT_REMINDER || line.starts_with(crate::other_project::NO_PROJECT_PREFIX);
     let room = HOOK_OUTPUT_LIMIT_BYTES.saturating_sub(rules_len);
     let note_cost = model::item::EXTRAS_DROPPED_NOTE.len() + 2;
     for with_note in [false, true] {
         let mut left = room.saturating_sub(if with_note { note_cost } else { 0 });
-        left = left.saturating_sub(extras.iter().filter(|e| *e == COMPACT_REMINDER).map(cost).sum());
+        left = left.saturating_sub(extras.iter().filter(|e| must_show(e)).map(cost).sum());
         let mut kept: Vec<Option<String>> = vec![None; extras.len()];
         let mut dropped = false;
         for (at, line) in extras.iter().enumerate() {
-            if line == COMPACT_REMINDER {
+            if must_show(line) {
                 kept[at] = Some(line.clone());
             } else if !is_overview(line) {
                 if cost(line) <= left {

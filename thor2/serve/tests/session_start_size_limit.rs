@@ -126,7 +126,7 @@ fn a_small_standing_block_is_unchanged_and_all_of_it_counts_as_served() {
 }
 
 /// THE PINNED NOTES KEEP THEIR PLACE. The write gate lets the standing rules
-/// fill the block up to `STANDING_BLOCK_LIMIT_BYTES`; the real session start,
+/// fill the block up to `NO_PROJECT_STANDING_LIMIT_BYTES`; the real session start,
 /// with every extra line it can carry at its largest here (the compaction
 /// reminder, the no-project line and a full tools overview), must still show
 /// every one of those rules, whole, within the hook output limit, keep the
@@ -150,17 +150,12 @@ fn a_block_the_gate_filled_to_its_limit_still_shows_every_pinned_note_beside_eve
             }
         }
     }
-    let room = model::item::STANDING_BLOCK_LIMIT_BYTES - used;
+    let room = model::item::NO_PROJECT_STANDING_LIMIT_BYTES - used;
     assert!(room < 40 && ids.len() > 10, "fixture: the gate filled the block ({room} bytes left, {} notes)", ids.len());
 
     // A full tools overview, one of the extras with a cap of its own.
-    let tools = dir.path().join("tools");
-    for n in 0..60 {
-        let tool = tools.join(format!("tool-{n:02}"));
-        std::fs::create_dir_all(&tool).unwrap();
-        std::fs::write(tool.join("README.txt"), format!("Tool number {n} does one small job and says so in one plain line of text\n")).unwrap();
-    }
-    std::fs::write(dir.path().join("work-folders.json"), serde_json::json!({ "tools": tools }).to_string()).unwrap();
+    let _ = sixty_tools(dir.path());
+    fill_the_no_project_line(&db, dir.path());
     // A folder that belongs to no project: the start adds the no-project line.
     let cwd = dir.path().join("workdir");
     std::fs::create_dir_all(&cwd).unwrap();
@@ -188,8 +183,9 @@ fn a_block_the_gate_filled_to_its_limit_still_shows_every_pinned_note_beside_eve
     }
     assert!(!block.contains("did not fit in this block"), "no standing rule may be cut: {block}");
     assert!(block.contains(model::item::COMPACT_REMINDER), "the reminder is whole");
-    // The room left is the reserve: the other extras (the no-project line, the tools overview) give way.
-    assert!(!block.contains("belongs to no project") && !block.contains("Helper tools"), "{block}");
+    // The room left is the reserve: the tools overview gives way, the no-project line never does.
+    assert!(block.contains("belongs to no project") && block.contains("request_directory"), "the no-project line survives a full pinned block: {block}");
+    assert!(!block.contains("Helper tools"), "{block}");
     assert!(block.contains(model::item::EXTRAS_DROPPED_NOTE), "what did not fit is said: {block}");
 }
 
@@ -199,10 +195,16 @@ fn a_block_the_gate_filled_to_its_limit_still_shows_every_pinned_note_beside_eve
 fn extras_give_way_to_the_standing_rules_and_a_drop_is_named() {
     let reminder = serve::session_start::COMPACT_REMINDER.to_string();
     let big = "x".repeat(6_000);
-    let rules_len = model::item::STANDING_BLOCK_LIMIT_BYTES;
+    let rules_len = model::item::NO_PROJECT_STANDING_LIMIT_BYTES;
     let kept = serve::session_start::fit_extras(rules_len, vec![big.clone(), reminder.clone(), "short".to_string()]);
     assert!(kept.contains(&reminder) && !kept.contains(&big), "{kept:?}");
     assert_eq!(kept.last().map(String::as_str), Some(model::item::EXTRAS_DROPPED_NOTE));
+    let total: usize = rules_len + kept.iter().map(|e| e.len() + 2).sum::<usize>();
+    assert!(total <= model::item::HOOK_OUTPUT_LIMIT_BYTES, "{total}");
+    // The no-project line is never the one that gives way.
+    let line = serve::other_project::no_project_line();
+    let kept = serve::session_start::fit_extras(rules_len, vec![big.clone(), line.clone(), reminder.clone()]);
+    assert!(kept.contains(&line) && kept.contains(&reminder) && !kept.contains(&big), "{kept:?}");
     let total: usize = rules_len + kept.iter().map(|e| e.len() + 2).sum::<usize>();
     assert!(total <= model::item::HOOK_OUTPUT_LIMIT_BYTES, "{total}");
     // Plenty of room: nothing is left out and nothing is said.
@@ -231,9 +233,39 @@ fn pins_up_to(db: &std::path::Path, target: usize) -> Vec<String> {
     ids
 }
 
+/// Registers working copies of a few long-named projects, so the no-project line
+/// names folders and takes nearly all of its own reserve (what is left free is
+/// small); the tests that need a full block use it.
+fn fill_the_no_project_line(db: &std::path::Path, dir: &std::path::Path) {
+    let mut s = EventStore::new(db).unwrap();
+    for n in 0..10 {
+        let name = format!("Registered-project-with-a-long-name-{n}");
+        let root = dir.join(&name);
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let record = Item {
+            id: store::project_opened_id(&name),
+            kind: Kind::Report,
+            text: format!("Project {name}: a fixture record."),
+            bindings: Vec::new(),
+            severity: None,
+            project: Some(name.clone()),
+            tags: vec!["project-record".to_string()],
+            expires: None,
+            key: None,
+            falsifier: None,
+            check: None,
+        };
+        let body = store::canonical_body(&record).unwrap();
+        let body = format!("{},\"root\":{},\"root_at\":\"2026-09-29T00:00:00Z\"}}", &body[..body.len() - 1], serde_json::to_string(root.to_str().unwrap()).unwrap());
+        s.append_event("install", "install", store::INSTALLER_ACTOR, EventKind::FactCreated, &record.id, None, &body).unwrap();
+    }
+}
+
 /// A tools folder of 60 tools named in the store's settings; returns its label.
 fn sixty_tools(dir: &std::path::Path) -> String {
-    let tools = dir.join("tools");
+    // A long folder name: the no-project line leaves a little of its reserve free,
+    // and the one-line overview must still be longer than that to be left out.
+    let tools = dir.join("tools-folder-with-a-rather-long-name-so-that-even-the-shortest-overview-line-needs-room-and-does-not-fit-in-what-the-no-project-line-leaves-free");
     for n in 0..60 {
         let tool = tools.join(format!("tool-{n:02}"));
         std::fs::create_dir_all(&tool).unwrap();
@@ -329,7 +361,8 @@ fn with_no_room_the_overview_is_dropped_and_the_drop_is_named() {
     let db = dir.path().join("store.db");
     let label = sixty_tools(dir.path());
     let one = serve::work_folders::overview_one_line(&label, 60);
-    let ids = pins_up_to(&db, model::item::STANDING_BLOCK_LIMIT_BYTES);
+    let ids = pins_up_to(&db, model::item::NO_PROJECT_STANDING_LIMIT_BYTES);
+    fill_the_no_project_line(&db, dir.path());
     let block = compact_start(&db, dir.path(), "s-none");
     assert!(block.len() <= model::item::HOOK_OUTPUT_LIMIT_BYTES, "{} bytes", block.len());
     for id in &ids {
@@ -355,4 +388,52 @@ fn a_short_warning_is_kept_before_the_overview_is_shrunk() {
     let shrunk = kept.iter().find(|l| l.starts_with("Helper tools")).expect("shrunk, not dropped");
     assert!(shrunk.len() <= 300 && shrunk.len() < overview.len(), "{shrunk}");
     assert!(!kept.contains(&model::item::EXTRAS_DROPPED_NOTE.to_string()), "{kept:?}");
+}
+
+/// THE BUDGET IS PER SORT OF START. The line for a folder of no project takes its
+/// room from the rules of that block only: the write gate judges the global pins
+/// against it, and a project keeps the whole old budget.
+#[test]
+fn only_the_block_of_a_folder_of_no_project_gives_room_to_the_line() {
+    assert_eq!(model::item::STANDING_BLOCK_LIMIT_BYTES, 9_800 - model::item::START_EXTRAS_RESERVE_BYTES);
+    assert_eq!(model::item::NO_PROJECT_STANDING_LIMIT_BYTES + model::item::NO_PROJECT_LINE_MAX_BYTES + 2, model::item::STANDING_BLOCK_LIMIT_BYTES);
+
+    // Global pins: the gate stops them at the no-project limit, whatever is asked.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("store.db");
+    let ids = pins_up_to(&db, model::item::STANDING_BLOCK_LIMIT_BYTES);
+    let used: usize = model::item::standing_head_bytes()
+        + ids.iter().map(|id| {
+            let len: usize = id[4..].parse().unwrap();
+            model::item::standing_line(id, &format!("{len:03} {}", "w".repeat(len))).len() + 1
+        }).sum::<usize>();
+    assert!(used <= model::item::NO_PROJECT_STANDING_LIMIT_BYTES, "{used}");
+
+    // A project's own pins may fill the old budget, and a start in that folder shows them all.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("store.db");
+    let project = dir.path().join("proj");
+    std::fs::create_dir_all(project.join(".git")).unwrap();
+    let mut shown = Vec::new();
+    let mut used = model::item::standing_head_bytes();
+    {
+        let mut s = EventStore::new(&db).unwrap();
+        for len in (20..=260).rev() {
+            let mut item = standing_rule(len);
+            item.id = format!("pin-{len:03}");
+            item.text = format!("{len:03} {}", "w".repeat(len));
+            item.project = Some("proj".to_string());
+            if store::declare(&mut s, "s", "l", "a", &item).is_ok() {
+                used += model::item::standing_line(&item.id, &item.text).len() + 1;
+                shown.push(item.id);
+            }
+        }
+    }
+    assert!(used > model::item::NO_PROJECT_STANDING_LIMIT_BYTES && used <= model::item::STANDING_BLOCK_LIMIT_BYTES, "{used}");
+    let json = run_session_start(&db, &project, "s-project");
+    let block = json["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+    for id in &shown {
+        assert!(block.contains(&format!("- [{id}] ")), "{id} lost its place in a project");
+    }
+    assert!(!block.contains("belongs to no project"), "{block}");
 }

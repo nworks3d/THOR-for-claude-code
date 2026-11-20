@@ -2975,7 +2975,7 @@ fn standing_overflow_refusal(candidates: &[(String, Item)], item: &Item) -> Opti
     for project in projects {
         let before = standing_block_bytes(&standing_in_block(candidates, project, None));
         let after = standing_block_bytes(&standing_in_block(candidates, project, Some(item)));
-        if after <= crate::item::STANDING_BLOCK_LIMIT_BYTES || (was_standing && after <= before) {
+        if after <= crate::item::standing_limit_for(project) || (was_standing && after <= before) {
             continue;
         }
         if worst.is_none_or(|(bytes, _)| after > bytes) {
@@ -2997,7 +2997,7 @@ fn standing_overflow_refusal(candidates: &[(String, Item)], item: &Item) -> Opti
             "{whose} would be {after} bytes with this write, over the {} bytes the standing rules may take in a session start (the rest is kept for two lines that must always \
              be shown), so a standing rule would be cut from it and only named. {} pinned fact(s) stand in it, this one included; \
              the largest: {named}",
-            crate::item::STANDING_BLOCK_LIMIT_BYTES,
+            crate::item::standing_limit_for(project),
             block.len()
         ),
         fix: "make room first, then this write goes through untouched. SHORTEN FIRST - this always works: revise the \

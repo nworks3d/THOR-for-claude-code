@@ -994,6 +994,11 @@ pub const COMPACT_REMINDER: &str = "[THOR] This session's context was just summa
 /// be shown, so that nothing is left out silently: it has a reserve of its own size.
 pub const EXTRAS_DROPPED_NOTE: &str = "[THOR] Some other lines of this session start did not fit in the hook output next to the standing rules and are left out; doctor shows what a start adds.";
 
+/// The most bytes the line for a session in a folder of no project may take
+/// (`serve::other_project::no_project_line_with` shortens itself to it). It must
+/// always be shown, so a session start in such a folder reserves its room.
+pub const NO_PROJECT_LINE_MAX_BYTES: usize = 600;
+
 /// The bytes the standing rules leave free in a session start for the two lines
 /// that must always be shown, each with its two-byte separator.
 pub const START_EXTRAS_RESERVE_BYTES: usize = COMPACT_REMINDER.len() + 2 + EXTRAS_DROPPED_NOTE.len() + 2;
@@ -1002,6 +1007,20 @@ pub const START_EXTRAS_RESERVE_BYTES: usize = COMPACT_REMINDER.len() + 2 + EXTRA
 /// less the reserve. The write gate refuses a pin past it, and the session start
 /// gives the rules this room first, so what the gate accepts is shown.
 pub const STANDING_BLOCK_LIMIT_BYTES: usize = HOOK_OUTPUT_LIMIT_BYTES - START_EXTRAS_RESERVE_BYTES;
+
+/// The same limit for the block of a session in a folder of no project (only the
+/// global pinned notes are served there): it also keeps the room of the
+/// no-project line. A project's block keeps `STANDING_BLOCK_LIMIT_BYTES`.
+pub const NO_PROJECT_STANDING_LIMIT_BYTES: usize = STANDING_BLOCK_LIMIT_BYTES - (NO_PROJECT_LINE_MAX_BYTES + 2);
+
+/// The most bytes the standing rules of a block for `project` may take.
+pub fn standing_limit_for(project: Option<&str>) -> usize {
+    if project.is_none() {
+        NO_PROJECT_STANDING_LIMIT_BYTES
+    } else {
+        STANDING_BLOCK_LIMIT_BYTES
+    }
+}
 
 /// One standing rule as its block line, without the newline.
 pub fn standing_line(id: &str, text: &str) -> String {

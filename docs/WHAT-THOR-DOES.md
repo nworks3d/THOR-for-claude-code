@@ -788,15 +788,19 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
 - Never cut silently: the block is a place that can be full, like a file or command. A new pinned note
   (remember or revise adding Always, or pin), or a pinned note made longer, is refused when the block of
   that project (its own pinned notes plus the global ones; a global note is judged in every project)
-  would no longer fit in 9,291 bytes (the 9,800 a start can carry, less 509 kept for two lines that must always be shown), and nothing is stored. The refusal names the largest pinned notes
+  would no longer fit in 9,291 bytes (the 9,800 a start can carry, less 509 kept for two lines that must always be shown; the global-only block of a folder of no project gets 8,689, because it also keeps 602 for the no-project line), and nothing is stored. The refusal names the largest pinned notes
   and three exits: fold two that say the same, bind one to the command, file, tool or moment it is
   about and unpin it, or retract a stale one with a reason. An unpin, a retract or a shorter note is never
   refused. A memory that already overflows lists its cut notes first under the evaluation's crowded
   places, and the report is held until the block fits. A fresh install's own notes fit with room left
   (a test checks it). The pinned notes take their room first. The other lines of a start get what is
-  left, in this order when room is short: the compaction reminder (always shown, it has the reserve),
-  then the short lines someone must act on (a copy line, registration notice, open points, a missing
-  program, a copy that does not answer, the no-project line), and last the tools overview, which gets
+  left, in this order when room is short: the compaction reminder and the no-project line (always shown;
+  the no-project line has its reserve only in a folder of no project, and is at most 600 bytes and names up to 10 project folders THOR
+  knows, so the assistant can propose one and ask the person yes or no; it is repeated once at the first
+  message of a resumed conversation, and the end of the first turn of such a conversation is held once, whatever the turn did, never for an
+  agent, a headless session or a copy; `{"mode": "off"}` in `no-project-ask-mode.json` beside the memory
+  switches the repeat and the hold off), then the short lines someone must act on (a copy line,
+  registration notice, open points, a missing program, a copy that does not answer), and last the tools overview, which gets
   shorter (fewer tool lines, the rest counted in "... and N more in <folder>", at the smallest one line
   with the number of tools) instead of disappearing. A line that does not fit at all is left out and one
   line says that lines were left out.

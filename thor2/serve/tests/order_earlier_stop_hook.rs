@@ -23,6 +23,8 @@ impl Fixture {
     fn new() -> Self {
         let f = Self { root: tempfile::tempdir().unwrap() };
         std::fs::create_dir_all(f.projects().join("enc")).unwrap();
+        // The folder belongs to no project; the ask to move is not what these tests are about.
+        std::fs::write(f.root.path().join("no-project-ask-mode.json"), "{\"mode\": \"off\"}").unwrap();
         f
     }
     fn db(&self) -> PathBuf {

@@ -60,6 +60,8 @@ fn fixture() -> tempfile::TempDir {
     let db = dir.path().join("thor.db");
     thor_core::event_store::EventStore::new(&db).unwrap();
     std::fs::write(dir.path().join("guard-capture-rulebook.json"), CAPTURE_RULEBOOK).unwrap();
+    // These tests are about the capture guard, in a folder of no project: the ask to move is off.
+    std::fs::write(dir.path().join("no-project-ask-mode.json"), "{\"mode\": \"off\"}").unwrap();
     dir
 }
 

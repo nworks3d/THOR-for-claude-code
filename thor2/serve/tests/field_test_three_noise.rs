@@ -25,7 +25,10 @@ struct Fx {
 
 impl Fx {
     fn new() -> Self {
-        Fx { dir: tempfile::tempdir().unwrap(), home: tempfile::tempdir().unwrap() }
+        let fx = Fx { dir: tempfile::tempdir().unwrap(), home: tempfile::tempdir().unwrap() };
+        // The folder belongs to no project; the ask to move is not what these tests are about.
+        std::fs::write(fx.dir.path().join("no-project-ask-mode.json"), "{\"mode\": \"off\"}").unwrap();
+        fx
     }
     fn db(&self) -> PathBuf {
         self.dir.path().join("thor.db")

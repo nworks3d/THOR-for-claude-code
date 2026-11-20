@@ -1272,6 +1272,7 @@ mod resolve_session_id_tests {
 fn plain_line_for_block(event: &str, reason: &str) -> &'static str {
     let lower = reason.to_lowercase();
     match event {
+        "Stop" if lower.contains(&serve::other_project::HOLD_MARKER.to_lowercase()) => LINE_NO_PROJECT,
         "Stop" if lower.contains("walked through setup") => LINE_SETUP,
         "Stop" if lower.contains("[thor] order-earlier-work") => LINE_ORDER,
         // Before the evaluation arm: an evaluation ask can ride along with this hold.
@@ -1293,6 +1294,7 @@ fn plain_line_for_block(event: &str, reason: &str) -> &'static str {
 const LINE_SETUP: &str = "THOR (the memory your assistant uses) is finishing its setup. Your assistant welcomes you and asks one short question with a few choices: you can simply answer \"yes\". Nothing else is needed from you.";
 const LINE_ORDER: &str = "THOR asks your assistant to finish one last setup step: a proposal to put your earlier work in order. It asks you one short question. Nothing else is needed from you.";
 const LINE_SCRIPTS: &str = "Your assistant left a few small helper files outside your projects. THOR asks it to tidy them up: useful ones are kept in your tools folder, leftovers are deleted, and it asks you first about anything unclear. You do not need to do anything unless it asks you.";
+const LINE_NO_PROJECT: &str = "This conversation has no project folder, so what is said here cannot be kept under a project. Your assistant proposes a folder and asks you one question: just answer yes or no. Nothing else is needed from you.";
 const LINE_COPY_PROOF: &str = "THOR is sending proof of this week's memory check from this computer's copy of your memory to your main computer. Your assistant does one more small step. You do not need to do anything.";
 const LINE_TIDY_UP: &str = "THOR asks your assistant to tidy up the memory now, before it finishes its answer. This can take a few minutes. You do not need to do anything.";
 const LINE_DECISION: &str = "Your assistant is saving something you just decided, so it is remembered next time. You do not need to do anything.";
@@ -1303,7 +1305,8 @@ const LINE_ONE_MORE_THING: &str = "THOR asked your assistant to do one more smal
 
 /// Every sentence above, for the test that walks them.
 #[cfg(test)]
-const PERSON_LINES: [&str; 10] = [
+const PERSON_LINES: [&str; 11] = [
+    LINE_NO_PROJECT,
     LINE_ORDER,
     LINE_SETUP,
     LINE_SCRIPTS,
@@ -2080,6 +2083,17 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             }
         }
 
+        // A CONVERSATION IN A FOLDER OF NO PROJECT (the app's temporary place), at its
+        // first turn end (a plain question too) and never moved: held ONCE per session, so the person is asked
+        // to move it to a project folder (`serve::other_project`). Never for a
+        // subagent, a copy or a session that records nothing, and the transcript is
+        // read only when the folder belongs to no project.
+        if !is_subagent && !copy && !no_record {
+            if let Some(reason) = no_project_stop_hold(db_path, &payload, &session_id, stop_root.as_deref(), stop_project.as_deref()) {
+                return hold(reason);
+            }
+        }
+
         // A RULE BROKEN THIS TURN BY A ROUTE NO TOOL GUARD SAW (a script that
         // edited a guarded file): `serve::turn_violation`. Held like the debts
         // above, so the evaluation ask rides with it. The ids it covers are kept
@@ -2477,14 +2491,24 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             // A session in a folder that belongs to no project is told to propose
             // a folder for this work and to move there (`other_project`). Not for a
             // headless session, a subagent or a read-only copy.
+            // The line is never cut (its room is reserved before the standing rules
+            // are fitted), and it names the project folders THOR knows. Delivered
+            // here, so the first prompt of this session does not repeat it.
+            let mut rules_limit = model::item::STANDING_BLOCK_LIMIT_BYTES;
             if folder_project.is_none() && !kind.headless && !payload_is_from_a_subagent(&payload) && !copy {
-                extras.push(serve::other_project::no_project_line());
+                // Only here the line's room is taken from the rules: a project keeps its whole budget.
+                rules_limit = model::item::NO_PROJECT_STANDING_LIMIT_BYTES;
+                let known = serve::other_project::known_folders(&store, serve::other_project::KNOWN_FOLDERS_MAX);
+                extras.push(serve::other_project::no_project_line_with(&known));
+                if !no_record {
+                    let _ = said_once_keyed(db_path, &session_id, NO_PROJECT_LINE_KEY, String::new());
+                }
             }
             // What this project's own sessions used lately ranks first (step 31).
             let recent = session_start::recent_in_project(db_path, folder_project.as_deref(), time::now_unix());
             let rules = session_start::render_within_ranked(
                 &items,
-                model::item::STANDING_BLOCK_LIMIT_BYTES,
+                rules_limit,
                 &recent,
             );
             let (rules_text, shown_ids, hidden) = match rules {
@@ -2602,6 +2626,14 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                 return eval_note.map(|block| HookOutput::Context { event_name, block, verdicts: Vec::new() });
             }
 
+            // A conversation in a folder of no project whose start never told the
+            // assistant (a resumed one, or one whose start block is long gone) is
+            // told at its first prompt, once.
+            let eval_note = match (eval_note, no_project_prompt_line(&store, db_path, &payload, &session_id, folder_project.as_deref(), no_record || copy)) {
+                (Some(note), Some(line)) => Some(format!("{note}\n\n{line}")),
+                (None, Some(line)) => Some(line),
+                (note, None) => note,
+            };
             // The prompt names ANOTHER project that has its own folder: the
             // assistant is told to propose a session there (`other_project`).
             let eval_note = match (eval_note, serve::other_project::named_in_prompt(&store, prompt_text, session_project.as_deref())) {
@@ -3714,6 +3746,50 @@ fn write_turn_mark(db: &Path, session_id: &str, mark: TurnMark) {
     if let Ok(text) = serde_json::to_string(&all) {
         let _ = serve::store_dir::write(&turn_marks_path(db), text);
     }
+}
+
+/// The marks in the turn mark's `announced` list for the no-project line (said
+/// at a session start or at the first prompt) and the one hold at Stop.
+const NO_PROJECT_LINE_KEY: &str = "no-project-line";
+const NO_PROJECT_HOLD_KEY: &str = "no-project-hold";
+
+/// The no-project line for the first owner prompt of a session in a folder of
+/// no project, once per session: `None` when the session's start already said it,
+/// when the folder belongs to a project, for a headless session or a subagent, and
+/// when nothing can be recorded (a copy, or a session that is not recorded).
+fn no_project_prompt_line(
+    store: &EventStore,
+    db_path: &Path,
+    payload: &Value,
+    session_id: &str,
+    folder_project: Option<&str>,
+    no_record: bool,
+) -> Option<String> {
+    if folder_project.is_some() || no_record || session_kind(payload).headless || payload_is_from_a_subagent(payload) || serve::other_project::ask_is_off(db_path) {
+        return None;
+    }
+    said_once_keyed(db_path, session_id, NO_PROJECT_LINE_KEY, String::new())?;
+    let known = serve::other_project::known_folders(store, serve::other_project::KNOWN_FOLDERS_MAX);
+    Some(serve::other_project::no_project_line_with(&known))
+}
+
+/// The hold at the end of a turn for a conversation in a folder of no project:
+/// `Some(reason)` at most once per session, at its first turn end whatever the
+/// turn did, and only when the transcript shows no move or prepared conversation yet. The
+/// transcript is read only after the folder is known to belong to no project.
+fn no_project_stop_hold(db_path: &Path, payload: &Value, session_id: &str, stop_root: Option<&Path>, stop_project: Option<&str>) -> Option<String> {
+    // The session's own project (kept after a `cd`) and the folder's both count.
+    if stop_project.is_some() || project::resolve_project(stop_root?).is_some() || session_kind(payload).headless || serve::other_project::ask_is_off(db_path) {
+        return None;
+    }
+    let text = std::fs::read_to_string(payload.get("transcript_path")?.as_str()?).ok()?;
+    let facts = serve::other_project::transcript_facts(&text);
+    if facts.moved_or_prepared {
+        return None;
+    }
+    let store = serve::store_dir::open_existing(db_path).ok()?;
+    let known = serve::other_project::known_folders(&store, serve::other_project::KNOWN_FOLDERS_MAX);
+    said_once_keyed(db_path, session_id, NO_PROJECT_HOLD_KEY, serve::other_project::stop_hold_text(&known))
 }
 
 /// The key under which a line said once is remembered in the turn mark's
