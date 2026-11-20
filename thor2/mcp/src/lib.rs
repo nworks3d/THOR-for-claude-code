@@ -1900,15 +1900,19 @@ fn refuse_a_filing_the_checker_would_not_count(item: &Item, checker_version: imp
     if !is_evaluation_report(item) {
         return Ok(());
     }
-    match serve::eval_filing::checker_skew_refusal(model::gate::MACHINE_RENDERER_REV, checker_version().as_deref()) {
+    match serve::eval_filing::checker_skew_refusal(
+        model::gate::MACHINE_RENDERER_REV,
+        model::gate::FILING_FORMAT_REV,
+        checker_version().as_deref(),
+    ) {
         Some(refusal) => Err(refusal),
         None => Ok(()),
     }
 }
 
 /// When this tool server started (unix seconds), noted once by `main` before
-/// anything else. Unset (a test, an embedding) means "unknown": nothing is
-/// refused on it.
+/// anything else. Unset (a test, an embedding) means "unknown". Written beside the
+/// memory with this build's report formats (`note_build`).
 static STARTED_UNIX: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
 
 /// Notes the start of this tool server. The first call wins.
@@ -1917,29 +1921,19 @@ pub fn note_start() {
     let _ = STARTED_UNIX.set(now);
 }
 
-/// A FILING FROM A TOOL SERVER OLDER THAN THE INSTALLED ONE, REFUSED BEFORE IT
-/// IS WRITTEN (`serve::eval_filing::stale_tool_server_refusal`). `started` is
-/// when this tool server started, `installed` the installed `mcp` program (the
-/// file beside this one, which the installer replaces); both are asked only for
-/// an evaluation report, so a plain remember never pays for them.
-fn refuse_a_filing_from_a_stale_tool_server(
-    item: &Item,
-    started: impl FnOnce() -> Option<i64>,
-    installed: impl FnOnce() -> Option<PathBuf>,
-) -> Result<(), String> {
-    if !is_evaluation_report(item) {
-        return Ok(());
-    }
-    match serve::eval_filing::stale_tool_server_refusal(started(), installed().as_deref()) {
-        Some(refusal) => Err(refusal),
-        None => Ok(()),
-    }
-}
-
-/// The installed tool server: the `mcp` program beside the one running.
-fn installed_tool_server() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    Some(exe.parent()?.join(format!("mcp{}", std::env::consts::EXE_SUFFIX)))
+/// Records, beside the memory, which machine-section renderer and filing format this
+/// tool server files with, under its session: the Stop reads it to tell a session
+/// that only runs an older build (a report still counts) from one whose reports would
+/// be dead (`serve::eval_filing::tool_server_stale`).
+pub fn note_build(db: &std::path::Path) {
+    let session = std::env::var("CLAUDE_CODE_SESSION_ID").unwrap_or_default();
+    serve::eval_filing::note_tool_server_build(
+        db,
+        &session,
+        STARTED_UNIX.get().copied().unwrap_or(0),
+        model::gate::MACHINE_RENDERER_REV,
+        model::gate::FILING_FORMAT_REV,
+    );
 }
 
 /// The installed checker's `--version` output, from the folder this tool
@@ -3102,7 +3096,6 @@ impl ThorMcpServer {
             refuse_an_open_point_tag(&args.tags, None)?;
             refuse_a_dispute_without_reason(args.because.as_deref(), &args.legitimate_calls, &args.may_change, &args.accept_refusing)?;
             let item = remembered_item(&args)?;
-            refuse_a_filing_from_a_stale_tool_server(&item, || STARTED_UNIX.get().copied(), installed_tool_server)?;
             refuse_a_filing_the_checker_would_not_count(&item, installed_checker_version)?;
             refuse_a_worktree_only_check(
                 item.check.as_ref(),
@@ -5756,41 +5749,35 @@ mod tests {
         let refused = refuse_a_filing_the_checker_would_not_count(&report, || Some(newer.clone())).unwrap_err();
         assert!(refused.starts_with("REFUSED: this tool server renders the evaluation machine section in format"), "{refused}");
         assert!(refused.contains("restart Claude") && refused.contains("Nothing was written"), "{refused}");
-        let same = format!("serve 2.5.0 (build 0123456789ab, renderer {})\n", model::gate::MACHINE_RENDERER_REV);
+        let same = format!(
+            "serve 2.5.0 (build 0123456789ab, renderer {}, filing {})\n",
+            model::gate::MACHINE_RENDERER_REV,
+            model::gate::FILING_FORMAT_REV
+        );
         assert!(refuse_a_filing_the_checker_would_not_count(&report, || Some(same.clone())).is_ok());
+        // ANOTHER BUILD, THE SAME FORMATS: a small fix install (another build id, another version
+        // even) changes neither number, so a tool server started before it still files, and it counts.
+        let other_build = format!(
+            "serve 2.6.13 (build ffffffffffff, renderer {}, filing {})\n",
+            model::gate::MACHINE_RENDERER_REV,
+            model::gate::FILING_FORMAT_REV
+        );
+        assert!(refuse_a_filing_the_checker_would_not_count(&report, || Some(other_build.clone())).is_ok());
+        // A different FILING format refuses, with the same renderer.
+        let other_filing = format!(
+            "serve 2.6.13 (build ffffffffffff, renderer {}, filing {})\n",
+            model::gate::MACHINE_RENDERER_REV,
+            model::gate::FILING_FORMAT_REV + 1
+        );
+        let refused = refuse_a_filing_the_checker_would_not_count(&report, || Some(other_filing.clone())).unwrap_err();
+        assert!(refused.contains("filing format") && refused.contains("would not count"), "{refused}");
+        // An older checker that prints no filing number is judged on the renderer alone.
+        let no_filing = format!("serve 2.5.0 (build 0123456789ab, renderer {})\n", model::gate::MACHINE_RENDERER_REV);
+        assert!(refuse_a_filing_the_checker_would_not_count(&report, || Some(no_filing.clone())).is_ok());
         assert!(refuse_a_filing_the_checker_would_not_count(&report, || None).is_ok(), "no checker to ask: nothing refused");
         // A report that is not an evaluation filing never even asks.
         report.tags.clear();
         assert!(refuse_a_filing_the_checker_would_not_count(&report, || panic!("asked for a plain report")).is_ok());
-    }
-
-    /// A tool server that started before the installed program was replaced
-    /// refuses to FILE an evaluation report (it would be on file and dead),
-    /// whatever the renderer format says, and only for a report.
-    #[test]
-    fn a_report_is_refused_when_this_tool_server_started_before_the_installed_one_was_written() {
-        let dir = tempfile::tempdir().unwrap();
-        let installed = dir.path().join("mcp.exe");
-        std::fs::write(&installed, b"mcp").unwrap();
-        let written = 2_000_000_000u64;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&installed)
-            .unwrap()
-            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(written))
-            .unwrap();
-
-        let mut report = remembered_item(&base_remember("eval-demo-2026-10-21")).unwrap();
-        report.kind = Kind::Report;
-        report.tags = vec![model::store::EVALUATION_REPORT_TAG.to_string()];
-        let refused = refuse_a_filing_from_a_stale_tool_server(&report, || Some(written as i64 - 60), || Some(installed.clone())).unwrap_err();
-        assert!(refused.starts_with("REFUSED: this tool server is older than the installed one"), "{refused}");
-        assert!(refused.contains("restart Claude") && refused.contains("Nothing was written"), "{refused}");
-        assert!(refuse_a_filing_from_a_stale_tool_server(&report, || Some(written as i64 + 60), || Some(installed.clone())).is_ok());
-        assert!(refuse_a_filing_from_a_stale_tool_server(&report, || None, || Some(installed.clone())).is_ok(), "start unknown");
-        // A report that is not an evaluation filing never even asks.
-        report.tags.clear();
-        assert!(refuse_a_filing_from_a_stale_tool_server(&report, || panic!("asked"), || panic!("asked")).is_ok());
     }
 
     /// R14.4 (step 14): open points are written and closed by THOR itself. A

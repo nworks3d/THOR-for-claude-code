@@ -172,12 +172,17 @@ use thor_core::event_store::EventStore;
 /// from one tree carry one id, a program built before a change another.
 pub const BUILD_ID: &str = env!("THOR_BUILD_ID");
 
-/// What `--version` prints: `serve 2.5.0 (build 0123456789ab, renderer 7)`. The
+/// What `--version` prints: `serve 2.5.0 (build 0123456789ab, renderer 7, filing 1)`. The
 /// renderer revision (`model::gate::MACHINE_RENDERER_REV`) is the one number a
 /// filed evaluation report is checked against, so a tool server asked to file
 /// one can read it from the installed checker (`eval_filing::checker_skew_refusal`).
 pub fn version_line(program: &str) -> String {
-    format!("{program} {} (build {BUILD_ID}, renderer {})", env!("CARGO_PKG_VERSION"), model::gate::MACHINE_RENDERER_REV)
+    format!(
+        "{program} {} (build {BUILD_ID}, renderer {}, filing {})",
+        env!("CARGO_PKG_VERSION"),
+        model::gate::MACHINE_RENDERER_REV,
+        model::gate::FILING_FORMAT_REV
+    )
 }
 
 /// The build id inside the output of some program's `--version`, or `None` for
@@ -193,7 +198,14 @@ pub fn build_id_in(version_output: &str) -> Option<&str> {
 /// this was printed).
 pub fn renderer_in(version_output: &str) -> Option<u32> {
     let (_, rest) = version_output.split_once(", renderer ")?;
-    rest.split(')').next()?.trim().parse().ok()
+    rest.split([')', ',']).next()?.trim().parse().ok()
+}
+
+/// The evaluation filing format inside the output of some program's `--version`
+/// (`model::gate::FILING_FORMAT_REV`), or `None` for a program that prints none.
+pub fn filing_in(version_output: &str) -> Option<u32> {
+    let (_, rest) = version_output.split_once(", filing ")?;
+    rest.split([')', ',']).next()?.trim().parse().ok()
 }
 
 /// The whole read side of the one serving path, run once: select what

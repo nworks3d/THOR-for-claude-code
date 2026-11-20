@@ -2320,3 +2320,96 @@ fn the_start_note_lists_the_pinned_notes_to_re_read_and_never_offers_an_unpin() 
     assert!(!note.contains("unpin it if"), "the note never suggests an unpin: {note}");
     assert!(!nothing_to_do(&frozen), "a pinned note to re-read is something to do");
 }
+
+// ------------------------------------------------ the list says it once (2026-11-20)
+
+/// A realistic busy evaluation: 15 items to judge with places that fired (three
+/// long places each, some in another session), 3 pinned notes to re-read, 8
+/// refusal outcomes and item f.
+fn realistic_busy_frozen() -> Frozen {
+    let mut frozen = busy_frozen(0, 0, 0, 8, 25, 15);
+    if let Some(signals) = frozen.machine.as_mut().and_then(|m| m.signals.as_mut()) {
+        signals.hook_failures = 0;
+        signals.health = "THOR health since the previous report: 0 hook launch failure(s), 0 version-skew event(s).".to_string();
+    }
+    frozen.reread = (0..3).map(|n| format!("pinned-note-{n}")).collect();
+    frozen.said = Some(model::store::SaidFrozen {
+        since_ms: 1_789_000_000_000,
+        until_ms: 1_790_000_000_000,
+        total: 40,
+        shown: 40,
+        through_ms: 1_789_900_000_000,
+        unreadable: 0,
+        command: "serve --db \"C:/store/thor.db\" said --project \"demo\"".to_string(),
+    });
+    for (n, id) in frozen.judgement.clone().into_iter().enumerate() {
+        frozen.fired.insert(
+            id,
+            model::store::Firings {
+                count: 3 + n,
+                triggers: (0..3)
+                    .map(|k| format!("C:/Users/someone/dev/a-long-project-name/src/some/deeply/nested/module-{n}/file-{k}.rs and more words to fill it up"))
+                    .collect(),
+                excerpts: vec![None, None, None],
+                sessions: Vec::new(),
+                elsewhere: n % 3 == 0,
+                last_date: (n % 3 == 0).then(|| "2026-11-19".to_string()),
+            },
+        );
+    }
+    frozen
+}
+
+/// The note that was cut on a real machine (15 items, 3 re-reads, 8 refusal
+/// outcomes, item f) now fits whole: the instruction is said once for the list,
+/// each item is one short line, and every id is there.
+#[test]
+fn a_realistic_busy_note_fits_the_budget_with_every_id_and_no_cut() {
+    let frozen = realistic_busy_frozen();
+    let whole = render_start_note(BUSY_ID, &frozen);
+    assert!(whole.len() > START_NOTE_BUDGET, "the long form does not fit, so the compact form is what is tested: {}", whole.len());
+    let note = render_start_note_within(BUSY_ID, &frozen, START_NOTE_BUDGET);
+    assert!(note.len() <= START_NOTE_BUDGET, "{} bytes: {note}", note.len());
+    assert!(!note.contains("NOT shown here"), "nothing is cut: {note}");
+    for n in 0..15 {
+        assert!(note.contains(&format!("\n   - 'judged-rule-{n}'")), "judged-rule-{n}: {note}");
+    }
+    for n in 0..3 {
+        assert!(note.contains(&format!("'pinned-note-{n}'")), "pinned-note-{n}");
+    }
+    for n in 0..8 {
+        assert!(note.contains(&format!("refused-rule-{n}")), "refused-rule-{n}");
+    }
+    assert!(note.contains("mcp__thor__mark(id: \"<id>\", noise: true)"), "the instruction is said once: {note}");
+    assert_eq!(note.matches("first check it is still TRUE").count(), 1, "said once, not per item");
+    assert!(lists_cut(BUSY_ID, &frozen, START_NOTE_BUDGET).is_empty());
+    assert!(note.is_ascii(), "plain ASCII");
+}
+
+/// A light note keeps the full per-item text: the short form is only the first
+/// thing given up when the note would not fit.
+#[test]
+fn a_note_that_fits_keeps_the_full_text_per_item() {
+    let frozen = busy_frozen(1, 0, 1, 1, 1, 3);
+    let note = render_start_note_within(BUSY_ID, &frozen, START_NOTE_BUDGET);
+    assert_eq!(note.matches("first check it is still TRUE").count(), 3, "{note}");
+}
+
+/// A cut the note makes on purpose, with the whole note on the record and a
+/// pointer to it, is not a bug in THOR: no candidate. One with no pointer, or
+/// with an id missing from the whole note, is.
+#[test]
+fn a_deliberate_cut_with_a_way_to_the_whole_note_raises_no_bug_candidate() {
+    let frozen = busy_frozen(8, 16, 8, 8, 25, 0);
+    assert!(!lists_cut(BUSY_ID, &frozen, START_NOTE_BUDGET).is_empty(), "the fixture is cut");
+    assert!(lists_cut_without_a_way_to_the_rest(BUSY_ID, &frozen, START_NOTE_BUDGET).is_empty());
+    let start = model::store::EvaluationStart { id: BUSY_ID.to_string(), seq: 500, frozen, batch_seq: Some(501) };
+    let found = crate::thor_bugs::start_findings(&start);
+    assert!(found.iter().all(|f| f.signal != crate::thor_bugs::Signal::StartNoteCut), "{found:?}");
+
+    let whole = "'a' 'b'";
+    let pointer = format!("mcp__thor__get(id: \"{BUSY_ID}\")");
+    assert!(!way_to_the_rest_is_missing(&pointer, whole, BUSY_ID, ["a", "b"].into_iter()));
+    assert!(way_to_the_rest_is_missing("cut, and no word of where the rest is", whole, BUSY_ID, ["a"].into_iter()), "no pointer");
+    assert!(way_to_the_rest_is_missing(&pointer, whole, BUSY_ID, ["a", "missing"].into_iter()), "an id the whole note lacks");
+}

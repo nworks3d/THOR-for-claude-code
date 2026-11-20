@@ -38,3 +38,14 @@ fn the_renderer_revision_is_read_back_from_a_version_line() {
     assert_eq!(serve::renderer_in(""), None);
     assert_eq!(serve::renderer_in(&serve::version_line("serve")), Some(model::gate::MACHINE_RENDERER_REV));
 }
+
+/// The filing format rides on the same line (2026-11-20): a tool server reads both numbers
+/// from the installed checker, and a program that prints none is judged on the renderer alone.
+#[test]
+fn the_filing_format_is_read_back_from_a_version_line() {
+    assert_eq!(serve::filing_in("serve 2.6.12 (build 0123456789ab, renderer 11, filing 3)\n"), Some(3));
+    assert_eq!(serve::renderer_in("serve 2.6.12 (build 0123456789ab, renderer 11, filing 3)\n"), Some(11), "the renderer still ends at the comma");
+    assert_eq!(serve::filing_in("serve 2.6.12 (build 0123456789ab, renderer 11)\n"), None, "an older program prints none");
+    assert_eq!(serve::filing_in("serve 2.6.12 (build 0123456789ab, renderer 11, filing x)"), None);
+    assert_eq!(serve::filing_in(&serve::version_line("serve")), Some(model::gate::FILING_FORMAT_REV));
+}

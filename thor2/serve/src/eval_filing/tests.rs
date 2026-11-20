@@ -763,17 +763,17 @@ fn the_owner_queue_point_text_has_no_lost_line_break() {
 fn a_filing_the_installed_checker_could_not_count_is_refused_before_it_is_written() {
     let own = model::gate::MACHINE_RENDERER_REV;
     let same = serve_version(own);
-    assert_eq!(checker_skew_refusal(own, Some(&same)), None, "the same format: nothing to say");
-    let newer = checker_skew_refusal(own, Some(&serve_version(own + 1))).expect("a newer checker");
+    assert_eq!(checker_skew_refusal(own, model::gate::FILING_FORMAT_REV, Some(&same)), None, "the same format: nothing to say");
+    let newer = checker_skew_refusal(own, model::gate::FILING_FORMAT_REV, Some(&serve_version(own + 1))).expect("a newer checker");
     assert!(newer.starts_with("REFUSED: this tool server renders the evaluation machine section in format"), "{newer}");
     assert!(newer.contains(&format!("format {own}")) && newer.contains(&format!("reads format {}", own + 1)), "{newer}");
     assert!(newer.contains("Nothing was written") && newer.contains("restart Claude"), "{newer}");
     assert!(newer.contains("end your turn") && newer.contains("DONE WHEN"), "{newer}");
-    assert!(checker_skew_refusal(own + 1, Some(&serve_version(own))).is_some(), "a tool server newer than the checker is skew too");
+    assert!(checker_skew_refusal(own + 1, model::gate::FILING_FORMAT_REV, Some(&serve_version(own))).is_some(), "a tool server newer than the checker is skew too");
     // Never a new way to block: a checker that cannot be run, or prints no revision, refuses nothing.
-    assert_eq!(checker_skew_refusal(own, None), None);
-    assert_eq!(checker_skew_refusal(own, Some("serve 2.5.0 (build 0123456789ab)\n")), None);
-    assert_eq!(checker_skew_refusal(own, Some("")), None);
+    assert_eq!(checker_skew_refusal(own, model::gate::FILING_FORMAT_REV, None), None);
+    assert_eq!(checker_skew_refusal(own, model::gate::FILING_FORMAT_REV, Some("serve 2.5.0 (build 0123456789ab)\n")), None);
+    assert_eq!(checker_skew_refusal(own, model::gate::FILING_FORMAT_REV, Some("")), None);
     let nowhere = tempfile::tempdir().unwrap();
     assert_eq!(installed_checker_version(nowhere.path()), None, "no serve program beside it");
 }
@@ -877,25 +877,6 @@ fn mcp_installed_at(dir: &Path, at: i64) -> PathBuf {
     path
 }
 
-/// A tool server that started before the installed one was written refuses
-/// to file, with the plain reason; a newer or unknown one refuses nothing.
-#[test]
-fn a_tool_server_older_than_the_installed_one_refuses_to_file_with_the_plain_reason() {
-    let fx = Fx::new();
-    let now = crate::time::now_unix();
-    let mcp = mcp_installed_at(fx.dir.path(), now - 3600);
-
-    let refused = stale_tool_server_refusal(Some(now - 7200), Some(&mcp)).expect("started before the install");
-    assert!(refused.starts_with("REFUSED: this tool server is older than the installed one"), "{refused}");
-    assert!(refused.contains("would not count") && refused.contains("Nothing was written"), "{refused}");
-    assert!(refused.contains("restart Claude"), "{refused}");
-    assert_eq!(stale_tool_server_refusal(Some(now - 60), Some(&mcp)), None, "started after the install");
-    assert_eq!(stale_tool_server_refusal(Some(now - 3600), Some(&mcp)), None, "started the second it was written");
-    assert_eq!(stale_tool_server_refusal(None, Some(&mcp)), None, "start unknown: nothing refused");
-    assert_eq!(stale_tool_server_refusal(Some(now - 7200), None), None, "no installed program to compare");
-    assert_eq!(stale_tool_server_refusal(Some(now - 7200), Some(&fx.dir.path().join("missing.exe"))), None);
-}
-
 /// A session that started before the tool server was replaced is told to
 /// restart, with no hold; one that started after it is asked normally; and
 /// every unreadable case fails open (field test 14, H1).
@@ -909,27 +890,72 @@ fn a_session_older_than_the_installed_tool_server_is_told_to_restart_and_a_fresh
 
     // Started two hours ago: older than the install an hour ago.
     main_transcript(&root, S1).raw(&session_start_line("startup", now - 7200, S1)).write();
-    let line = tool_server_stale(S1, Some(&root), Some(&mcp)).expect("older than the installed tool server");
+    let line = tool_server_stale(S1, Some(&root), Some(&mcp), None).expect("older than the installed tool server").line;
     assert!(line.contains("Restart Claude; the evaluation is asked again after the restart"), "{line}");
     assert!(line.contains("does not hold the turn"), "{line}");
 
     // Its LAST start counts, and a compaction is no start.
     main_transcript(&root, S1).raw(&session_start_line("compact", now - 60, S1)).write();
-    assert!(tool_server_stale(S1, Some(&root), Some(&mcp)).is_some(), "a compaction restarts no tool server");
+    assert!(tool_server_stale(S1, Some(&root), Some(&mcp), None).is_some(), "a compaction restarts no tool server");
     main_transcript(&root, S1).raw(&session_start_line("resume", now - 1800, S1)).write();
-    assert_eq!(tool_server_stale(S1, Some(&root), Some(&mcp)), None, "resumed after the install: asked normally");
+    assert_eq!(tool_server_stale(S1, Some(&root), Some(&mcp), None), None, "resumed after the install: asked normally");
 
     // A fresh session (started after the install) is asked normally.
     main_transcript(&root, S2).raw(&session_start_line("startup", now - 600, S2)).write();
-    assert_eq!(tool_server_stale(S2, Some(&root), Some(&mcp)), None);
+    assert_eq!(tool_server_stale(S2, Some(&root), Some(&mcp), None), None);
 
     // Fail open: no transcript, no start record, no tool server, no folder.
-    assert_eq!(tool_server_stale(S3, Some(&root), Some(&mcp)), None, "no transcript");
+    assert_eq!(tool_server_stale(S3, Some(&root), Some(&mcp), None), None, "no transcript");
     main_transcript(&root, S3).prompt_context("nothing about a start").write();
-    assert_eq!(tool_server_stale(S3, Some(&root), Some(&mcp)), None, "no start record");
-    assert_eq!(tool_server_stale(S1, Some(&root), Some(&fx.dir.path().join("missing.exe"))), None, "no tool server");
-    assert_eq!(tool_server_stale(S1, None, Some(&mcp)), None, "no transcripts folder");
-    assert_eq!(tool_server_stale(S1, Some(&root), None), None, "no tool server path");
+    assert_eq!(tool_server_stale(S3, Some(&root), Some(&mcp), None), None, "no start record");
+    assert_eq!(tool_server_stale(S1, Some(&root), Some(&fx.dir.path().join("missing.exe")), None), None, "no tool server");
+    assert_eq!(tool_server_stale(S1, None, Some(&mcp), None), None, "no transcripts folder");
+    assert_eq!(tool_server_stale(S1, Some(&root), None, None), None, "no tool server path");
+}
+
+/// BOTH DIRECTIONS (2026-11-20). A session whose tool server is an older BUILD than the
+/// installed one but records the SAME machine-section renderer and filing format gets
+/// information, not a ban: its report counts. A different format, or nothing recorded,
+/// keeps the strict line (a report filed now would not count).
+#[test]
+fn an_older_build_with_the_same_report_formats_is_information_and_a_different_format_is_not() {
+    let fx = Fx::new();
+    let root = fx.root();
+    let now = crate::time::now_unix();
+    let mcp = mcp_installed_at(fx.dir.path(), now - 3600);
+    let db = fx.dir.path().join("thor.db");
+    main_transcript(&root, S1).raw(&session_start_line("startup", now - 7200, S1)).write();
+
+    // Nothing recorded by the tool server: strict, as before.
+    let gap = tool_server_stale(S1, Some(&root), Some(&mcp), Some(&db)).expect("older than the installed tool server");
+    assert!(!gap.counts && gap.line.contains("would not count") && gap.line.contains("Restart Claude"), "{gap:?}");
+
+    // The same renderer and filing format: information, and it counts.
+    note_tool_server_build(&db, S1, now - 7200, model::gate::MACHINE_RENDERER_REV, model::gate::FILING_FORMAT_REV);
+    let gap = tool_server_stale(S1, Some(&root), Some(&mcp), Some(&db)).expect("still an older build");
+    assert!(gap.counts, "{gap:?}");
+    assert!(gap.line.starts_with("[THOR] For your information") && gap.line.contains("a report filed now counts"), "{gap:?}");
+    assert!(!gap.line.contains("would not count"), "{gap:?}");
+
+    // Another filing format, or another renderer: strict.
+    note_tool_server_build(&db, S1, now - 7200, model::gate::MACHINE_RENDERER_REV, model::gate::FILING_FORMAT_REV + 1);
+    assert!(!tool_server_stale(S1, Some(&root), Some(&mcp), Some(&db)).unwrap().counts, "another filing format");
+    note_tool_server_build(&db, S1, now - 7200, model::gate::MACHINE_RENDERER_REV + 1, model::gate::FILING_FORMAT_REV);
+    assert!(!tool_server_stale(S1, Some(&root), Some(&mcp), Some(&db)).unwrap().counts, "another renderer");
+    assert_eq!(tool_server_build(&db, S1), Some((model::gate::MACHINE_RENDERER_REV + 1, model::gate::FILING_FORMAT_REV)));
+}
+
+/// The skew refusal of a filing looks at the two numbers only: another build id or version
+/// is no reason to refuse, a different renderer or filing format is.
+#[test]
+fn a_filing_is_refused_only_for_another_renderer_or_filing_format() {
+    let (r, f) = (model::gate::MACHINE_RENDERER_REV, model::gate::FILING_FORMAT_REV);
+    let line = |renderer: u32, filing: u32| format!("serve 9.9.9 (build abcdefabcdef, renderer {renderer}, filing {filing})\n");
+    assert_eq!(checker_skew_refusal(r, f, Some(&line(r, f))), None, "another build, the same formats");
+    assert!(checker_skew_refusal(r, f, Some(&line(r + 1, f))).unwrap().contains("would not count"));
+    assert!(checker_skew_refusal(r, f, Some(&line(r, f + 1))).unwrap().contains("filing format"));
+    assert_eq!(checker_skew_refusal(r, f, Some(&format!("serve 2.5.0 (build abcdefabcdef, renderer {r})\n"))), None, "an older checker names no filing format");
+    assert_eq!(checker_skew_refusal(r, f, None), None, "no checker to ask");
 }
 
 // ------------------------------------------- the verdict list does not starve

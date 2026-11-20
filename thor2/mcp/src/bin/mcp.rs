@@ -82,6 +82,8 @@ fn main() {
     // installed program (`mcp::note_start`).
     mcp::note_start();
     let cli = Cli::parse();
+    // Which report formats this tool server files with, for the Stop (see `mcp::note_build`).
+    mcp::note_build(&cli.db);
     // The project of the folder this server runs in is spelled the way the
     // memory already spells it (case, spaces and hyphens do not make a second
     // project). Done once, here: the server's own thread resolves it.

@@ -2792,3 +2792,67 @@ fn an_evaluation_the_session_opened_is_asked_even_while_it_only_reads() {
     let out = run_hook(&db, &stop_payload(&s, &fxp), &sandbox);
     assert!(is_block(&out), "{out}");
 }
+
+/// 2026-11-20: a session whose tool server is an older BUILD than the installed one but
+/// recorded the same machine-section renderer and filing format is asked and held as
+/// usual - its report counts - with ONE line of information instead of "restart". A
+/// session that recorded another format (or nothing) keeps the strict line and no ask.
+#[test]
+fn an_older_build_with_the_same_report_formats_is_asked_normally_with_one_line_of_information() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let sandbox = Sandbox::new();
+    let project_dir = sandbox.project_dir("thor-fixture");
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let serve_copy = bin.join(format!("serve{}", std::env::consts::EXE_SUFFIX));
+    std::fs::copy(env!("CARGO_BIN_EXE_serve"), &serve_copy).unwrap();
+    let mcp = bin.join(format!("mcp{}", std::env::consts::EXE_SUFFIX));
+    std::fs::write(&mcp, b"fake tool server").unwrap();
+    let now = serve::time::now_unix();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&mcp)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs((now - 3600) as u64))
+        .unwrap();
+    let run = |payload: &str| {
+        let mut cmd = Command::new(&serve_copy);
+        cmd.arg("--db").arg(&db).arg("hook").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        sandbox.apply(&mut cmd);
+        let mut child = cmd.spawn().expect("spawn the serve copy");
+        let _ = child.stdin.take().unwrap().write_all(payload.as_bytes());
+        let out = child.wait_with_output().expect("wait serve");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    drop(EventStore::new(&db).unwrap());
+    let write_transcript = |session: &str| {
+        let path = transcripts(&sandbox).join("C--fixture").join(format!("{session}.jsonl"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let line = serde_json::json!({
+            "type": "attachment",
+            "attachment": {"type": "hook_success", "hookName": "SessionStart:startup", "hookEvent": "SessionStart", "exitCode": 0},
+            "timestamp": serve::time::iso8601_from_unix(now - 7200),
+            "sessionId": session,
+        });
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+    };
+
+    // Another filing format: strict, no ask.
+    let other = uuid(92);
+    write_transcript(&other);
+    seed_session_work(&db, Some("thor-fixture"), &other, 90);
+    serve::eval_filing::note_tool_server_build(&db, &other, now - 7200, model::gate::MACHINE_RENDERER_REV, model::gate::FILING_FORMAT_REV + 1);
+    let out = run(&stop_payload(&other, &project_dir));
+    assert!(!is_block(&out) && out.contains("would not count"), "{out}");
+
+    // The same formats: asked and held, with the information line riding along.
+    let same = uuid(91);
+    write_transcript(&same);
+    seed_session_work(&db, Some("thor-fixture"), &same, 90);
+    serve::eval_filing::note_tool_server_build(&db, &same, now - 7200, model::gate::MACHINE_RENDERER_REV, model::gate::FILING_FORMAT_REV);
+    let out = run(&stop_payload(&same, &project_dir));
+    assert!(is_block(&out), "a report from this build counts, so the evaluation is asked: {out}");
+    assert!(out.contains("For your information") && out.contains("a report filed now counts"), "{out}");
+    assert!(!out.contains("would not count"), "{out}");
+}

@@ -645,10 +645,14 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
 - You notice: a few minutes of tidy-up. Nothing is needed from you.
 - Refuse or change: see C5. If Claude Code changes the format of its session record, THOR cannot check
   filings, asks for none, and says so on every turn until THOR is updated.
-- Old tool server: a session whose tool server (loaded when Claude Code starts) is older than the installed
-  one would file a report that does not count. THOR asks for no evaluation and holds no turn in that
-  session, says so once (not at every turn), starts nothing for /thor-eval, and refuses to file a report
-  up front ("this tool server is older than the installed one ... restart Claude"). The cure is a restart.
+- Old tool server: a session whose tool server (loaded when Claude Code starts) is an older BUILD than the
+  installed one is fine as long as it renders the machine section and files evaluation reports the same way
+  as the installed checker (both print a renderer number and a filing-format number on their `--version`
+  line): its report counts, the check is asked as usual, and the Stop says once, as information, that a
+  restart would pick up the new build. Only a different renderer or filing format would file a report that
+  does not count: THOR then asks for no evaluation and holds no turn in that session, says so once, starts
+  nothing for /thor-eval, and refuses to file a report up front ("this tool server renders the evaluation
+  machine section in format ... Nothing was written"). The cure is a restart.
   Doctor's "tool server:" line is about OTHER sessions: it names the running tool servers that started
   before the program was replaced and the time of the swap; a session started after that time already runs
   the new program, and only the older sessions need a restart.

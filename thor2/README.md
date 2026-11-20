@@ -223,16 +223,19 @@ deciding, while the verdicts given in the same turn are not checked yet, and
 when a frozen item was changed outside an attested call of the evaluation (that
 voids it; the next `Stop` starts a fresh one).
 
-**The tool server must be as new as the installed program.** A session whose `mcp`
-(the tool server, loaded once when Claude Code starts) is older than the installed one
-would file a report that is on file and does not count. THOR says so before that
-happens: the end-of-turn ask is not made and the turn is not held, the line "This
-session's tool server is older than the installed one ... Restart Claude" is said once
-per session (not at every turn), `/thor-eval` starts nothing in such a session and says
-why, and a `remember` of an evaluation report is refused up front with the same plain
-reason ("REFUSED: this tool server is older than the installed one ... Nothing was
-written"), judged from the time the tool server started against the time the installed
-`mcp` file was written.
+**The tool server must file reports the way the installed program reads them.** A session
+whose `mcp` (the tool server, loaded once when Claude Code starts) is an older BUILD than the
+installed one is fine while both use the same machine-section renderer
+(`model::gate::MACHINE_RENDERER_REV`) and the same evaluation filing format
+(`model::gate::FILING_FORMAT_REV`, bumped with any change a filed report depends on that the
+machine section does not show); each program prints both on its `--version` line, and the tool
+server notes its own beside the memory when it starts. Then a report counts, the ask is made as
+usual and the Stop says once, as information, that a restart would pick up the new build. With a
+DIFFERENT renderer or filing format (or nothing recorded) a report would be on file and not count:
+the end-of-turn ask is not made, the turn is not held, "This session's tool server is older than
+the installed one ... Restart Claude" is said once, `/thor-eval` starts nothing and says why, and a
+`remember` of an evaluation report is refused up front ("REFUSED: this tool server renders the
+evaluation machine section in format ... Nothing was written").
 
 At the first main-session `Stop` after a filing, THOR validates it once and
 records the answer in the log (`eval-validator`, `valid` or not, with the

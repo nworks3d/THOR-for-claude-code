@@ -24,6 +24,8 @@ What changed: The last setup step, putting what you did with Claude before in or
 - **The weekly tidy-up asks about more notes when many are waiting.** It lists a quarter of the notes it could list, at least 5 and at most 15, so a backlog clears in about four rounds, and the start note says how many are listed and how many still wait.
 - **A search with no clear answer now tells the assistant to look in the project's own files too.** When a lookup finds no matches, or only hits from meaning or word stems, the reply adds one line: search again with one or two distinctive words, and do not answer from a hit that only resembles the question. The tool description says the same once.
 - **A conversation in the app's temporary place is now asked to move to a project folder.** The line that tells your assistant a session belongs to no project is never cut any more, names the project folders THOR knows, is repeated at the first message of a resumed conversation, and the end of the first turn is held once, whatever it did, so your assistant proposes one folder and asks you only yes or no.
+- **The weekly check's first message now fits whole, so no item is left out.** When it would be too long, it first says what to do with an item once for the whole list and shows each item as one short line, and only then leaves items out from the end. THOR no longer reports its own bug for a cut that points to the whole note.
+- **A restarted conversation can still file the weekly report after the programs were replaced by another build.** The report is accepted and counts when the running tool server and the installed program read it in the same way. Only a different reading still refuses it, and the restart line is then only information.
 
 ## 2.6.11 (2026-11-19)
 

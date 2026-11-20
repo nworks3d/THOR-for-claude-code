@@ -1431,15 +1431,18 @@ Claude Code can change the format it writes that record in. THOR then cannot
 check any filing, so it asks for no evaluation, and says so on every turn until
 THOR itself is updated. Nothing you do fixes it: tell the owner.
 
-**When this session's tool server is older than the installed one.** The tool
-server (`mcp`) loads only when Claude Code starts. After THOR was upgraded, a
-session that started before it still runs the old one, and a report it files is on
-file but does not count. THOR then asks for no evaluation and holds no turn in
-that session, says so once (not at every turn), starts nothing when `/thor-eval`
-is typed, and refuses an evaluation report up front ("this tool server is older
-than the installed one ... Nothing was written"). Do not retry: tell the owner in
-one sentence to close Claude Code completely and open it again; the evaluation is
-asked again after that.
+**When this session's tool server is an older build than the installed one.** The
+tool server (`mcp`) loads only when Claude Code starts, so after a THOR install a
+running session still has the old build. That alone is no problem: when its
+machine-section renderer and its evaluation filing format are the same ones the
+installed checker reads (each program prints both on its `--version` line), a
+report it files counts, the weekly check is asked as usual, and the Stop says once,
+as information, that a restart would pick up the new build. Only a DIFFERENT
+renderer or filing format makes the tool server refuse an evaluation report up
+front ("this tool server renders the evaluation machine section in format ... Nothing
+was written") and makes the Stop ask for no evaluation and hold no turn, with one
+line saying so. Then do not retry: tell the owner in one sentence to close Claude
+Code completely and open it again; the evaluation is asked again after that.
 
 The verdict list of an evaluation names a note that fired in THIS session, or in
 another session of the same project - never

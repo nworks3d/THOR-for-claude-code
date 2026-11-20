@@ -1316,6 +1316,22 @@ pub fn fired_line(fired: Option<&model::store::Firings>, per_item: usize) -> Str
     }
 }
 
+/// The compact line under one judgement item: how often it fired and the last
+/// place, cut to 40 characters. Said the same way for a firing here and in
+/// another session; what to do about an unclear place is said once for the list.
+fn compact_fired_line(fired: Option<&model::store::Firings>) -> String {
+    let place = |f: &model::store::Firings| match f.triggers.first() {
+        Some(t) if t.chars().count() > 40 => format!(", last at '{}...'", t.chars().take(40).collect::<String>()),
+        Some(t) => format!(", last at '{t}'"),
+        None => String::new(),
+    };
+    match fired {
+        Some(f) if f.elsewhere => format!(" - fired in another session {} time(s){}", f.count, place(f)),
+        Some(f) => format!(" - fired here {} time(s){}", f.count, place(f)),
+        None => " - where it fired was not recorded".to_string(),
+    }
+}
+
 fn quoted(ids: &[String]) -> String {
     ids.iter().map(|id| format!("'{id}'")).collect::<Vec<_>>().join(", ")
 }
@@ -1345,6 +1361,11 @@ struct Caps {
     crowded: usize,
     /// List THOR's own open points one by one, or only count them.
     points: bool,
+    /// The compact form of the judgement and the re-read lists: what to do
+    /// with an item is said once for the list and each item is one short line
+    /// (its id, how often and where it fired last). The first thing given up
+    /// when the note is too long: it cuts no item and hides no id.
+    compact: bool,
 }
 
 impl Caps {
@@ -1358,6 +1379,7 @@ impl Caps {
             sweep: usize::MAX,
             crowded: usize::MAX,
             points: true,
+            compact: false,
         }
     }
 
@@ -1377,6 +1399,11 @@ impl Caps {
             true
         }
         let one = |cap: &mut usize, len: usize| one_above(cap, len, 0);
+        // SHORTER BEFORE CUT: say it once per list, keep every item and id.
+        if !self.compact {
+            self.compact = true;
+            return true;
+        }
         if self.points {
             self.points = false;
             return true;
@@ -1462,6 +1489,39 @@ pub fn lists_cut(id: &str, frozen: &Frozen, budget: usize) -> Vec<&'static str> 
         cut.push("crowded places");
     }
     cut
+}
+
+/// The lists `lists_cut` names, but only when the cut is NOT a deliberate one:
+/// a cut with the whole note on the record (every id of the lists in it) and a
+/// pointer to it in the shown note is how the note is meant to work. What is
+/// left is a real defect of THOR's: the shown note has no pointer, or the whole
+/// note does not hold an item of the lists.
+pub fn lists_cut_without_a_way_to_the_rest(id: &str, frozen: &Frozen, budget: usize) -> Vec<&'static str> {
+    let cut = lists_cut(id, frozen, budget);
+    if cut.is_empty() {
+        return cut;
+    }
+    let shown = render_start_note_within(id, frozen, budget);
+    let whole = render_start_note(id, frozen);
+    let ids = frozen
+        .judgement
+        .iter()
+        .map(String::as_str)
+        .chain(frozen.batch().iter().map(String::as_str))
+        .chain(frozen.a4_list().iter().map(String::as_str))
+        .chain(frozen.dispute_list().iter().map(|d| d.id.as_str()));
+    match way_to_the_rest_is_missing(&shown, &whole, id, ids) {
+        true => cut,
+        false => Vec::new(),
+    }
+}
+
+/// Whether a cut note leaves the session no way to the rest: the shown note
+/// does not point at the record (`mcp__thor__get(id: "<record>")`), or the
+/// whole note does not hold one of the listed ids.
+fn way_to_the_rest_is_missing<'a>(shown: &str, whole: &str, record: &str, ids: impl Iterator<Item = &'a str>) -> bool {
+    let pointer = format!("mcp__thor__get(id: \"{record}\")");
+    !shown.contains(&pointer) || ids.into_iter().any(|item| !whole.contains(&format!("'{item}'")))
 }
 
 /// Whether the evaluation has nothing on any of its lists: THOR has finished
@@ -1559,22 +1619,47 @@ fn render_note(id: &str, frozen: &Frozen, caps: &Caps) -> String {
         // this session served it, frozen with the list. A long list shows one
         // place per item, so the note stays bounded.
         let per_item = if frozen.judgement.len() > model::store::FIRED_FULL_LIST_MAX { 1 } else { model::store::FIRED_TRIGGERS };
+        let how_to_judge = if caps.compact {
+            "Under each one is how often and where it fired last (mcp__thor__get(id: \"<id>\", fired: true) shows its recent \
+             firings). For EACH one: first check it is still TRUE (revise it if the code says otherwise - a repair, not noise), \
+             then mcp__thor__mark(id: \"<id>\") if it belonged where it fired, or mcp__thor__mark(id: \"<id>\", noise: true) \
+             if not. Use the THOR tool itself - a verdict from a shell, a script or another session settles nothing:"
+                .to_string()
+        } else {
+            format!(
+                "Under each one is where it fired (here or in the other session; its last {per_item} distinct place(s); \
+                 mcp__thor__get(id: \"<id>\", fired: true) shows its recent firings). Judge each one by whether it \
+                 belonged THERE, with the THOR tool itself - a verdict from a shell, a script or another session settles \
+                 nothing:"
+            )
+        };
+        let basis = match caps.compact {
+            true => format!("; {} more wait for the next evaluation", frozen.judgement_later),
+            false => format!(
+                " (a fact counts once per session; the most-served first, a quarter of what could be listed - at least {} \
+                 and at most {} per evaluation - the ones this session saw fire ahead of the rest; {} more wait for the \
+                 next evaluation)",
+                model::store::EVALUATION_JUDGEMENT_LIST_MIN,
+                model::store::EVALUATION_JUDGEMENT_LIST_MAX,
+                frozen.judgement_later
+            ),
+        };
         out.push_str(&format!(
-            "{} item(s) that fired in this session, or in another session of this project, \
-             and had fired in {}+ sessions since their last verdict (a fact counts once per session; the most-served \
-             first, a quarter of what could be listed - at least {} and at most {} per evaluation - the ones this session \
-             saw fire ahead of the rest; {} more wait for the next evaluation): {}. Under each one is where it fired (here or in the other session; its last {per_item} distinct place(s); \
-             mcp__thor__get(id: \"<id>\", fired: true) shows its recent firings). Judge each one by whether it \
-             belonged THERE, with the THOR tool itself - a verdict from a shell, a script or another session settles \
-             nothing:",
+            "{} item(s) that fired in this session, or in another session of this project, and had fired in {}+ \
+             sessions since their last verdict{basis}{ids}. {how_to_judge}",
             frozen.judgement.len(),
             model::store::JUDGEMENT_DEBT_AFTER,
-            model::store::EVALUATION_JUDGEMENT_LIST_MIN,
-            model::store::EVALUATION_JUDGEMENT_LIST_MAX,
-            frozen.judgement_later,
-            quoted(&frozen.judgement)
+            // The short form lists each id once, on its own line; only a cut list keeps the ids up here.
+            ids = match caps.compact && caps.judgement >= frozen.judgement.len() {
+                true => String::new(),
+                false => format!(": {}", quoted(&frozen.judgement)),
+            }
         ));
         for item in frozen.judgement.iter().take(caps.judgement) {
+            if caps.compact {
+                out.push_str(&format!("\n   - '{item}'{}", compact_fired_line(frozen.fired.get(item))));
+                continue;
+            }
             // CHECK TRUTH FIRST, on every line (step 26): field test 2 saw
             // ten verdicts given in five seconds with no look at whether the
             // items were still true; the advice stood once, above the list.
@@ -1600,19 +1685,30 @@ fn render_note(id: &str, frozen: &Frozen, caps: &Caps) -> String {
         out.push_str(&format!(
             "\n\n1b. PINNED NOTES TO RE-READ - {} pinned note(s) (at most {} per evaluation, the ones re-read longest ago, \
              none within {} days of its last re-read): {}. A pinned note is the owner's standing choice, so it is RE-READ \
-             here and never unpinned. WHAT THIS MEANS: it is served at every session start, and nobody has looked at it \
-             for a while. For each one: read it (mcp__thor__get(id: \"<id>\")), check it against the code or the facts it \
-             is about, and do exactly ONE of two things with the THOR tool itself:",
+             here and never unpinned. {why}For each one: read it (mcp__thor__get(id: \"<id>\")), check it against the \
+             code or the facts it is about, and do exactly ONE of two things with the THOR tool itself:",
             frozen.reread.len(),
             model::store::EVALUATION_REREAD_LIST,
             model::store::REREAD_MIN_DAYS,
-            quoted(&frozen.reread)
+            quoted(&frozen.reread),
+            why = match caps.compact {
+                true => "",
+                false => "WHAT THIS MEANS: it is served at every session start, and nobody has looked at it for a while. ",
+            }
         ));
-        for item in &frozen.reread {
-            out.push_str(&format!(
-                "\n   - '{item}': mcp__thor__mark(id: \"{item}\") if it is still right and still needed at every session \
-                 start, or mcp__thor__revise(id: \"{item}\", text: \"<its text made right, or shorter>\")"
-            ));
+        if caps.compact {
+            // The ids stand in the list above; the two calls are said once.
+            out.push_str(
+                "\n   For EACH id: mcp__thor__mark(id: \"<id>\") if it is still right and still needed at every session \
+                 start, or mcp__thor__revise(id: \"<id>\", text: \"<its text made right, or shorter>\")",
+            );
+        } else {
+            for item in &frozen.reread {
+                out.push_str(&format!(
+                    "\n   - '{item}': mcp__thor__mark(id: \"{item}\") if it is still right and still needed at every session \
+                     start, or mcp__thor__revise(id: \"{item}\", text: \"<its text made right, or shorter>\")"
+                ));
+            }
         }
         out.push_str(
             "\n   If you think one should not be pinned at all, say so in your report for the owner and leave it pinned: do \
@@ -1633,7 +1729,7 @@ fn render_note(id: &str, frozen: &Frozen, caps: &Caps) -> String {
                 sweep_section(&mut out, id, signals, caps);
             }
             crowded_section(&mut out, id, frozen, caps);
-            said_section(&mut out, frozen);
+            said_section(&mut out, frozen, caps);
         }
     }
 
@@ -1937,7 +2033,7 @@ fn crowded_section(out: &mut String, record: &str, frozen: &Frozen, caps: &Caps)
 /// project's previous evaluation (`Frozen::said`). Only present when there is
 /// a message. Says what it means, the exact command, what to store, when it is
 /// done and an example - a signal without those makes an agent guess.
-fn said_section(out: &mut String, frozen: &Frozen) {
+fn said_section(out: &mut String, frozen: &Frozen, caps: &Caps) {
     let Some(said) = frozen.said.as_ref().filter(|s| s.total > 0) else { return };
     let waiting = match said.waiting() {
         0 => String::new(),
@@ -1965,14 +2061,20 @@ fn said_section(out: &mut String, frozen: &Frozen) {
          report, write a line that starts with `MISTAKES:` and under it one line per mistake: what it was, and the id of \
          the rule that now prevents it, or one sentence on why it needs none (a one-off). With nothing found, write \
          `MISTAKES: none`. DONE WHEN: the print command has run in this session after the start and the line is in your \
-         report; THOR checks both and refuses the report without them, but it cannot check the judgement itself. EXAMPLE: \
-         the owner wrote \"I told you to ask before deleting\" after a file was removed: that is a mistake; store a rule \
-         bound to the delete command, falsifier \"the owner says deleting no longer needs asking\", and write \"MISTAKES:\" \
-         then \"- deleted a file without asking: rule ask-before-delete\"; \"ok go ahead with that\" is no mistake and \
-         no wish.",
+         report; THOR checks both and refuses the report without them, but it cannot check the judgement itself.{example}",
         said.total,
         crate::said::date_of_ms(said.since_ms),
-        said.command
+        said.command,
+        // The example is the first thing the short form leaves out of this item.
+        example = match caps.compact {
+            true => "",
+            false => {
+                " EXAMPLE: the owner wrote \"I told you to ask before deleting\" after a file was removed: that is a \
+                 mistake; store a rule bound to the delete command, falsifier \"the owner says deleting no longer needs \
+                 asking\", and write \"MISTAKES:\" then \"- deleted a file without asking: rule ask-before-delete\"; \
+                 \"ok go ahead with that\" is no mistake and no wish."
+            }
+        }
     ));
 }
 
@@ -2007,11 +2109,17 @@ fn host_wide_words(count: usize, alongside: bool) -> String {
 /// it files. Each says what it means, the exact calls, when it is done and an
 /// example, or says there is nothing to do.
 fn signals_section(out: &mut String, record: &str, signals: &model::store::SignalsSoFar, caps: &Caps) {
-    out.push_str(
-        "\n\n3. SIGNALS BEFORE YOU FILE - two signals THOR read from its log, from the previous report that counts up to \
-         this start (refusals not yet verified at a Stop are not counted). The machine section of your filing records \
-         them again for this evaluation's own window.",
-    );
+    out.push_str(match caps.compact {
+        true => {
+            "\n\n3. SIGNALS BEFORE YOU FILE - two signals from THOR's log since the previous report that counts; the \
+             machine section of your filing records them again for this evaluation's own window."
+        }
+        false => {
+            "\n\n3. SIGNALS BEFORE YOU FILE - two signals THOR read from its log, from the previous report that counts up to \
+             this start (refusals not yet verified at a Stop are not counted). The machine section of your filing records \
+             them again for this evaluation's own window."
+        }
+    });
     out.push_str(&format!("\n   a. {}", signals.health));
     if signals.hook_failures == 0 && signals.skew_events == 0 && signals.host_wide_failures == 0 {
         out.push_str("\n      Nothing to do here.");
@@ -2039,6 +2147,15 @@ fn signals_section(out: &mut String, record: &str, signals: &model::store::Signa
         return;
     }
     for block in signals.false_blocks.iter().take(caps.blocks) {
+        if caps.compact {
+            // The read call is the same for every rule: it is said once below.
+            let restore = block.restore.replace(
+                "because: \"<why the weakening was a mistake - at least 20 characters>\"",
+                "because: \"<why>\"",
+            );
+            out.push_str(&format!("\n      - {}\n         restore: {restore}", block.line));
+            continue;
+        }
         out.push_str(&format!(
             "\n      - {}\n         Read: mcp__thor__history(id: \"{}\")\n         If the refusal was right, restore: {}",
             block.line, block.rule, block.restore
@@ -2061,15 +2178,25 @@ fn signals_section(out: &mut String, record: &str, signals: &model::store::Signa
     out.push_str(&format!(
         "\n      WHAT THIS MEANS: a refusal counts as a PROBABLE false block when someone other than THOR then retracted the \
          refusing rule or weakened it (cleared or changed its check, lowered its severity, dropped a binding) - a proxy, \
-         not a verdict. WHAT TO DO, per rule: run its Read call, then decide from the refused call and the file or \
+         not a verdict. WHAT TO DO, per rule: {read}, then decide from the refused call and the file or \
          command the rule is about whether it was legitimate. If it WAS, the weakening was right: write in the report \
          the rule id, the refused call and why. If it was NOT, put the rule back with the restore call under it and \
          your own reason of {}+ characters in because (a retracted rule comes back under a NEW id tagged with the old \
          one). If you cannot tell, say so and restore nothing. DONE WHEN: every rule listed has one of those outcomes \
-         in your report, and a restore was answered rule or note. EXAMPLE: 'no-force-push' refused 'git push \
-         --force-with-lease origin main', then its check was cleared: that call is safe, so the report says \
-         \"no-force-push refused git push --force-with-lease origin main, which is safe; clearing its check was right\".",
-        model::store::DISPUTE_REASON_MIN_CHARS
+         in your report, and a restore was answered rule or note.{example}",
+        model::store::DISPUTE_REASON_MIN_CHARS,
+        example = match caps.compact {
+            true => "",
+            false => {
+                " EXAMPLE: 'no-force-push' refused 'git push --force-with-lease origin main', then its check was cleared: \
+                 that call is safe, so the report says \"no-force-push refused git push --force-with-lease origin main, \
+                 which is safe; clearing its check was right\"."
+            }
+        },
+        read = match caps.compact {
+            true => "read it (mcp__thor__history(id: \"<rule>\"))",
+            false => "run its Read call",
+        }
     ));
 }
 

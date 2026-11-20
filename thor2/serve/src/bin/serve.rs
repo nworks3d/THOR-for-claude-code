@@ -609,9 +609,20 @@ fn sibling(name: &str) -> Option<PathBuf> {
 /// The one line to say instead of an evaluation ask or hold when this
 /// session's tool server is older than the installed one (field test 14, H1).
 /// The installed tool server is the `mcp` program beside this checker.
-fn stale_tool_server_line(session_id: &str) -> Option<String> {
+fn stale_tool_server_line(session_id: &str, db_path: &Path) -> Option<String> {
+    tool_server_gap(session_id, db_path).filter(|gap| !gap.counts).map(|gap| gap.line)
+}
+
+/// The informational line for a session whose tool server is an older BUILD than the
+/// installed one but files and is checked the same way (its report counts): said once,
+/// never a reason to skip or hold an evaluation.
+fn tool_server_info_line(session_id: &str, db_path: &Path) -> Option<String> {
+    tool_server_gap(session_id, db_path).filter(|gap| gap.counts).map(|gap| gap.line)
+}
+
+fn tool_server_gap(session_id: &str, db_path: &Path) -> Option<serve::eval_filing::ServerGap> {
     let mcp = sibling("mcp");
-    serve::eval_filing::tool_server_stale(session_id, serve::attest::transcripts_root().as_deref(), mcp.as_deref())
+    serve::eval_filing::tool_server_stale(session_id, serve::attest::transcripts_root().as_deref(), mcp.as_deref(), Some(db_path))
 }
 
 /// What the evaluation routine (the typed command, the skill call) answers in
@@ -2596,7 +2607,7 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                 session_project.as_deref().and_then(|p| {
                     // No evaluation starts in a session whose tool server is
                     // older than the installed one: its report could not count.
-                    if let Some(line) = stale_tool_server_line(&session_id) {
+                    if let Some(line) = stale_tool_server_line(&session_id, db_path) {
                         return Some(not_started_in_a_stale_session(&line));
                     }
                     match serve::eval_session::try_start(db_path, &mut store, &session_id, p, "command") {
@@ -3534,7 +3545,7 @@ fn skill_call_answer(
     payload: &Value,
     no_record: bool,
 ) -> String {
-    if let Some(line) = stale_tool_server_line(session_id) {
+    if let Some(line) = stale_tool_server_line(session_id, db_path) {
         return not_started_in_a_stale_session(&line);
     }
     if let Some(open) = serve::eval_session::open_evaluation(store, session_id, project) {
@@ -3906,7 +3917,7 @@ fn evaluation_after_a_hold(db_path: &Path, session_id: &str, payload: &Value) ->
         // file a report that counts: no hold for it (field test 14, H1). Said
         // once per session, like the same line at the first-pass Stop: it used
         // to ride along on every Stop of every held turn.
-        if let Some(line) = stale_tool_server_line(session_id) {
+        if let Some(line) = stale_tool_server_line(session_id, db_path) {
             let key = said_key(&line);
             if announced.contains(&key) {
                 return None;
@@ -4152,10 +4163,12 @@ fn eval_stop_ask(
                 // needed first, and no ask is made.
                 // Said once per report (or install) and session, then quiet
                 // until the line changes (field test 14, C5).
-                if let Some(line) = stale_tool_server_line(session_id) {
+                if let Some(line) = stale_tool_server_line(session_id, db_path) {
                     elsewhere = elsewhere.or_else(|| said_once(db_path, session_id, line));
                     continue;
                 }
+                // An older BUILD whose reports still count: said once, as information, with the ask.
+                let build_info = tool_server_info_line(session_id, db_path).and_then(|line| said_once(db_path, session_id, line));
                 let root = serve::attest::transcripts_root();
                 if let Some(line) = serve::eval_filing::skew_awaiting_restart(store, &project, session_id, root.as_deref()) {
                     elsewhere = elsewhere.or_else(|| said_once(db_path, session_id, line));
@@ -4193,7 +4206,8 @@ fn eval_stop_ask(
                 if !no_record {
                     serve::holder::claim(db_path, &project, session_id, now);
                 }
-                let reason = format!("{}{reason}", routine_changed_lines(session_id));
+                let build_info = build_info.map(|line| format!("{line}\n\n")).unwrap_or_default();
+                let reason = format!("{build_info}{}{reason}", routine_changed_lines(session_id));
                 return EvalStop::Ask(match started {
                     Some(started) => serve::eval_session::ask_with_note(&reason, &started.start),
                     None => reason,

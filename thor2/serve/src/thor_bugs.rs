@@ -674,10 +674,11 @@ fn quick_silent_repeated(store: &EventStore, fault: &model::store::HookFault) ->
 }
 
 /// What one evaluation start record says about THOR.
-fn start_findings(start: &EvaluationStart) -> Vec<Finding> {
+pub(crate) fn start_findings(start: &EvaluationStart) -> Vec<Finding> {
     let mut found = Vec::new();
     if start.frozen.decided() {
-        let cut = crate::eval_session::lists_cut(&start.id, &start.frozen, crate::eval_session::START_NOTE_BUDGET);
+        // A deliberate cut with the whole note on the record and a pointer to it is not a bug.
+        let cut = crate::eval_session::lists_cut_without_a_way_to_the_rest(&start.id, &start.frozen, crate::eval_session::START_NOTE_BUDGET);
         if !cut.is_empty() {
             found.push(start_note_cut_finding(&cut));
         }

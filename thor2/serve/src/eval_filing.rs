@@ -686,14 +686,21 @@ pub fn reports_not_counted(store: &EventStore, project: &str) -> (Option<String>
 /// it could not be run or prints no revision (an older program) - then
 /// nothing is refused: this is a courtesy ahead of the Stop, never a new way
 /// to block a filing.
-pub fn checker_skew_refusal(own_revision: u32, checker_version: Option<&str>) -> Option<String> {
-    let theirs = crate::renderer_in(checker_version?)?;
-    if theirs == own_revision {
+pub fn checker_skew_refusal(own_revision: u32, own_filing: u32, checker_version: Option<&str>) -> Option<String> {
+    let version = checker_version?;
+    let renderer_differs = crate::renderer_in(version).is_some_and(|theirs| theirs != own_revision);
+    let filing_differs = crate::filing_in(version).is_some_and(|theirs| theirs != own_filing);
+    if !renderer_differs && !filing_differs {
+        // Equal (or an older checker prints nothing to compare): a small fix install that
+        // changed neither number blocks nobody's evaluation.
         return None;
     }
+    let theirs = crate::renderer_in(version).map_or("none".to_string(), |n| n.to_string());
+    let their_filing = crate::filing_in(version).map_or("none".to_string(), |n| n.to_string());
     Some(format!(
-        "REFUSED: this tool server renders the evaluation machine section in format {own_revision}, but the installed checker \
-         (serve.exe) reads format {theirs}, so a report filed now would be on file and would not count. Nothing was written. \
+        "REFUSED: this tool server renders the evaluation machine section in format {own_revision} and files reports in \
+         filing format {own_filing}, but the installed checker (serve.exe) reads format {theirs} and filing format \
+         {their_filing}, so a report filed now would be on file and would not count. Nothing was written. \
          WHAT TO DO: tell the owner to restart Claude (the tool server loads only when Claude starts), and end your turn; the \
          next end-of-turn ask starts the evaluation again and you file the report then. DONE WHEN: the owner restarted Claude \
          and the ask came again. Do not retry the filing in this session: it would be refused the same way."
@@ -767,56 +774,92 @@ pub fn skew_awaiting_restart(store: &EventStore, project: &str, session: &str, r
     ))
 }
 
-/// THIS SESSION'S TOOL SERVER IS OLDER THAN THE INSTALLED ONE (field test 14,
+/// WHAT THE TOOL SERVER OF A SESSION SAYS ABOUT ITS OWN BUILD, written once when it starts
+/// (`note_tool_server_build`): the machine-section renderer and the filing format it
+/// files with. The Stop cannot ask a running program, so it reads this to tell a
+/// session whose build only DIFFERS from the installed one (nothing it files is
+/// affected) from one whose reports would not count.
+const BUILDS_FILE: &str = "tool-server-builds.json";
+const BUILDS_KEPT: usize = 40;
+
+/// Remember, beside the memory, which renderer and filing format the tool server of
+/// `session` runs. Best effort: a failure only means the Stop stays strict.
+pub fn note_tool_server_build(db: &Path, session: &str, started: i64, renderer: u32, filing: u32) {
+    if session.trim().is_empty() {
+        return;
+    }
+    let path = db.with_file_name(BUILDS_FILE);
+    let mut all: Vec<Value> = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    all.retain(|e| e.get("session").and_then(Value::as_str) != Some(session));
+    all.push(serde_json::json!({ "session": session, "started": started, "renderer": renderer, "filing": filing }));
+    let skip = all.len().saturating_sub(BUILDS_KEPT);
+    let all: Vec<Value> = all.into_iter().skip(skip).collect();
+    let _ = std::fs::write(&path, serde_json::to_string(&all).unwrap_or_default());
+}
+
+/// The (renderer, filing format) the tool server of `session` recorded, if it did.
+pub fn tool_server_build(db: &Path, session: &str) -> Option<(u32, u32)> {
+    let all: Vec<Value> = serde_json::from_str(&std::fs::read_to_string(db.with_file_name(BUILDS_FILE)).ok()?).ok()?;
+    let entry = all.iter().rev().find(|e| e.get("session").and_then(Value::as_str) == Some(session))?;
+    Some((entry.get("renderer")?.as_u64()? as u32, entry.get("filing")?.as_u64()? as u32))
+}
+
+/// A session whose tool server is an older build than the installed one, and what that means.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerGap {
+    /// The one plain line to say.
+    pub line: String,
+    /// True when the tool server's report format equals the installed checker's: a
+    /// report it files COUNTS, so the line is information and nothing is held back.
+    pub counts: bool,
+}
+
+/// THIS SESSION'S TOOL SERVER IS AN OLDER BUILD THAN THE INSTALLED ONE (field test 14,
 /// H1): the session's last `SessionStart:startup` or `SessionStart:resume` in
 /// its transcript is older than the modification time of the installed tool
-/// server (`mcp_exe`). A tool server loads only when Claude starts, so a
-/// report filed now would be built by the old program and would be dead; the
-/// Stop must not ask for it nor hold the turn for it. Returns the one plain
-/// line to say instead. `None` (fail open: the ask is never lost) when the
-/// installed program or its time cannot be read, when the transcript is
-/// missing or records no start, or when the session started after the install.
-pub fn tool_server_stale(session: &str, root: Option<&Path>, mcp_exe: Option<&Path>) -> Option<String> {
+/// server (`mcp_exe`). A tool server loads only when Claude starts. When it
+/// recorded the same machine-section renderer and filing format this checker
+/// reads (`note_tool_server_build`), a report it files counts: the line is
+/// information (`counts`) and the evaluation is asked as usual. Otherwise (a
+/// different format, or nothing recorded) a report filed now would be dead, and
+/// the Stop must not ask for it nor hold the turn. `None` (fail open: the ask is
+/// never lost) when the installed program or its time cannot be read, when the
+/// transcript is missing or records no start, or when the session started after the install.
+pub fn tool_server_stale(session: &str, root: Option<&Path>, mcp_exe: Option<&Path>, db: Option<&Path>) -> Option<ServerGap> {
     let installed = installed_unix_of(mcp_exe?)?;
     let files = attest::session_transcripts(root?, session);
     let started = last_session_start(&files)?;
     if started >= installed {
         return None;
     }
-    Some(format!(
-        "[THOR] This session's tool server is older than the installed one (the session started at {}, the tool server \
-         was replaced at {}). A report filed now would be on file and would not count. Restart Claude; the evaluation is \
-         asked again after the restart, and you file the report then. This Stop does not hold the turn.",
-        crate::time::iso8601_from_unix(started),
-        crate::time::iso8601_from_unix(installed)
-    ))
-}
-
-/// THE REFUSAL OF A FILING FROM A TOOL SERVER THAT IS OLDER THAN THE INSTALLED
-/// ONE (found in two projects' evaluation reports, 2026-10-20 and 2026-10-21).
-/// The tool server loads only when Claude starts. When the program was replaced
-/// after that, the report it renders is built by the old program and is on
-/// file but dead. `checker_skew_refusal` catches the case where the renderer
-/// format differs; this catches the rest, from the one fact the tool server
-/// knows for certain: when IT started, against when the installed `mcp` file
-/// was written. `None` (nothing refused: a courtesy ahead of the Stop, never a
-/// new way to block a filing) when either time is unknown or the tool server is
-/// not older.
-pub fn stale_tool_server_refusal(started_unix: Option<i64>, installed_mcp: Option<&Path>) -> Option<String> {
-    let started = started_unix?;
-    let installed = installed_unix_of(installed_mcp?)?;
-    if started >= installed {
-        return None;
+    let same_format = db.and_then(|db| tool_server_build(db, session))
+        == Some((model::gate::MACHINE_RENDERER_REV, model::gate::FILING_FORMAT_REV));
+    if same_format {
+        return Some(ServerGap {
+            line: format!(
+                "[THOR] For your information: this session's tool server is an older build than the installed one (the \
+                 session started at {}, the tool server was replaced at {}). Both build and check evaluation reports the \
+                 same way (machine section format {}, filing format {}), so a report filed now counts. Nothing is needed; \
+                 restarting Claude picks up the new build when it suits you.",
+                crate::time::iso8601_from_unix(started),
+                crate::time::iso8601_from_unix(installed),
+                model::gate::MACHINE_RENDERER_REV,
+                model::gate::FILING_FORMAT_REV
+            ),
+            counts: true,
+        });
     }
-    Some(format!(
-        "REFUSED: this tool server is older than the installed one (it started at {}, the installed tool server was replaced \
-         at {}), so a report filed now would be on file and would not count. Nothing was written. WHAT TO DO: tell the owner \
-         to restart Claude (the tool server loads only when Claude starts), and end your turn; the evaluation is asked again \
-         after the restart and you file the report then. DONE WHEN: the owner restarted Claude and the ask came again. Do not \
-         retry the filing in this session: it would be refused the same way.",
-        crate::time::iso8601_from_unix(started),
-        crate::time::iso8601_from_unix(installed)
-    ))
+    Some(ServerGap {
+        line: format!(
+            "[THOR] This session's tool server is older than the installed one (the session started at {}, the tool server \
+             was replaced at {}) and builds evaluation reports another way, or says nothing about how. A report filed now \
+             would be on file and would not count. Restart Claude; the evaluation is asked again after the restart, and you \
+             file the report then. This Stop does not hold the turn.",
+            crate::time::iso8601_from_unix(started),
+            crate::time::iso8601_from_unix(installed)
+        ),
+        counts: false,
+    })
 }
 
 /// When the file at `path` was last written, in unix seconds; `None` when it

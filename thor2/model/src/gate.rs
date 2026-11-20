@@ -1717,6 +1717,19 @@ fn dropped_field(name: &'static str) -> Refusal {
 /// was written before this existed.
 pub const MACHINE_RENDERER_REV: u32 = 11;
 
+/// The revision of how an evaluation report is FILED and CHECKED: the filing gate's
+/// grounds, the frozen lists a start record carries, the attestation records a Stop
+/// writes (`Att`, the verifications, the note reads) and the checker that re-reads a
+/// filing from them. A tool server of one build and a checker of another file and
+/// count reports for each other as long as BOTH this number and
+/// `MACHINE_RENDERER_REV` are equal (`serve::eval_filing::checker_skew_refusal`);
+/// a small fix install that changes neither blocks nobody's evaluation. BUMP IT with
+/// any change a filed report depends on that the machine section does not show: a new
+/// ground in `check_evaluation_report_filing`, a new field in `Frozen` the gate holds
+/// a report to, a changed attestation record. An older program prints none and is
+/// not refused on it (`serve::filing_in`).
+pub const FILING_FORMAT_REV: u32 = 1;
+
 /// The machine section's first line, with `<N>` (the log position the
 /// evaluation started at), `<F>` (the log position it was filed at) and `<R>`
 /// (`MACHINE_RENDERER_REV`) still to fill in (`machine_section_begin`).
