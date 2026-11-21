@@ -133,6 +133,18 @@ fn a_mismatch_with_the_same_format_and_a_rerun_gate_refusal_are_candidates() {
     assert_eq!(filing_finding(gate).unwrap().signal, Signal::FilingGate);
 }
 
+/// Two differing copies of the filing call are Claude Code's format, never
+/// the agent's: a candidate, the same one in every session.
+#[test]
+fn two_differing_copies_of_the_filing_call_are_a_candidate() {
+    let a = "not filed through an attested THOR tool call (the transcript of session s1 holds two different tool calls under toolu_A)";
+    let b = "not filed through an attested THOR tool call (the transcript of session s2 holds two different tool calls under toolu_B)";
+    let first = filing_finding(a).expect("Claude Code's copies are THOR's to read");
+    assert_eq!(first.signal, Signal::TranscriptCopies);
+    assert_eq!(first.fingerprint(), filing_finding(b).unwrap().fingerprint());
+    assert!(!first.key.contains("toolu") && !first.key.contains("s1"), "{}", first.key);
+}
+
 #[test]
 fn a_refusal_that_is_the_agents_or_the_machines_is_no_candidate() {
     for why in [

@@ -263,12 +263,15 @@ fn scan(files: &[PathBuf], ids: &HashSet<&str>, wanted: impl Fn(&str) -> bool) -
 }
 
 /// Claude Code writes one tool call twice: the assistant entry keeps the
-/// input as typed (`noise: true`), a later api-request copy keeps scalars as
-/// strings (`"noise": "true"`). The two are the same call.
+/// input as typed (`noise: true`, `tags: ["a"]`), a later api-request copy
+/// keeps scalars as strings (`"noise": "true"`) and lists and objects as their
+/// JSON text (`"tags": "[\"a\"]"`, seen from 2026-11-21 in `api-request-blob`
+/// records). The two are the same call.
 fn scalars_as_text(v: &Value) -> Value {
     match v {
         Value::Bool(b) => Value::String(b.to_string()),
         Value::Number(n) => Value::String(n.to_string()),
+        Value::String(s) => json_text(s).map_or_else(|| v.clone(), |parsed| scalars_as_text(&parsed)),
         Value::Array(a) => Value::Array(a.iter().map(scalars_as_text).collect()),
         Value::Object(o) => Value::Object(o.iter().map(|(k, v)| (k.clone(), scalars_as_text(v))).collect()),
         other => other.clone(),
@@ -287,14 +290,24 @@ fn input_matches_digest(input: &Value, digest: &str) -> bool {
     model::store::args_digest(input) == digest || model::store::args_digest(&text_as_scalars(input)) == digest
 }
 
-/// The inverse of `scalars_as_text`: `"true"`, `"false"` and a whole number
-/// written as text become the bool or number they spell.
+/// A string that is the JSON text of a list or an object, parsed. Any other
+/// string (plain text, a number, "true") is left alone.
+fn json_text(s: &str) -> Option<Value> {
+    if !s.starts_with('[') && !s.starts_with('{') {
+        return None;
+    }
+    serde_json::from_str::<Value>(s).ok().filter(|p| p.is_array() || p.is_object())
+}
+
+/// The inverse of `scalars_as_text`: `"true"`, `"false"`, a whole number and
+/// the JSON text of a list or object become the value they spell.
 fn text_as_scalars(v: &Value) -> Value {
     match v {
         Value::String(s) if s == "true" => Value::Bool(true),
         Value::String(s) if s == "false" => Value::Bool(false),
-        Value::String(s) => match s.parse::<i64>() {
-            Ok(n) if n.to_string() == *s => Value::from(n),
+        Value::String(s) => match (json_text(s), s.parse::<i64>()) {
+            (Some(parsed), _) => text_as_scalars(&parsed),
+            (None, Ok(n)) if n.to_string() == *s => Value::from(n),
             _ => v.clone(),
         },
         Value::Array(a) => Value::Array(a.iter().map(text_as_scalars).collect()),
@@ -2373,6 +2386,32 @@ mod tests {
         t.block("toolu_F", "mark", &json!({"noise": true}), "r").block("toolu_F", "mark", &json!({"noise": "false"}), "r");
         t.write();
         assert_eq!(find_call(&session_transcripts(root.path(), S2), "toolu_F"), Found::Conflicting);
+    }
+
+    /// Since 2026-11-21 the api-request copy also holds a list or an object as
+    /// its JSON text (`"tags": "[\"evaluation-report\"]"`): still one call, and
+    /// it still matches the arguments the tool server got. A list with other
+    /// contents is still a second call.
+    #[test]
+    fn the_same_call_with_a_list_written_as_json_text_is_one_call() {
+        let root = tempfile::tempdir().unwrap();
+        let typed = json!({"id": "r", "kind": "report", "tags": ["evaluation-report"], "targets": [{"kind": "file", "value": "a"}]});
+        let blob = json!({"id": "r", "kind": "report", "tags": "[\"evaluation-report\"]", "targets": "[{\"kind\": \"file\", \"value\": \"a\"}]"});
+        let mut t = main_transcript(root.path(), S1);
+        t.block("toolu_L", "remember", &typed, "r").block("toolu_L", "remember", &blob, "r");
+        t.write();
+        assert!(matches!(find_call(&session_transcripts(root.path(), S1), "toolu_L"), Found::Call(_)));
+        assert!(input_matches_digest(&blob, &model::store::args_digest(&typed)));
+
+        let mut t = main_transcript(root.path(), S2);
+        let other = json!({"id": "r", "kind": "report", "tags": "[\"something-else\"]", "targets": "[{\"kind\": \"file\", \"value\": \"a\"}]"});
+        t.block("toolu_M", "remember", &typed, "r").block("toolu_M", "remember", &other, "r");
+        t.write();
+        assert_eq!(find_call(&session_transcripts(root.path(), S2), "toolu_M"), Found::Conflicting);
+        assert!(!input_matches_digest(&other, &model::store::args_digest(&typed)));
+        // Plain text that only starts like a list stays text.
+        assert_eq!(json_text("[not json"), None);
+        assert_eq!(json_text("plain"), None);
     }
 
     /// R7a.2 and the structural half of the predicate, each on its own: a

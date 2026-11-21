@@ -95,6 +95,7 @@ pub enum Signal {
     SeedRefused,
     StartNoteCut,
     DoctorRoutine,
+    TranscriptCopies,
 }
 
 impl Signal {
@@ -110,6 +111,7 @@ impl Signal {
             Signal::SeedRefused => "seed-refused",
             Signal::StartNoteCut => "start-note-cut",
             Signal::DoctorRoutine => "doctor-routine",
+            Signal::TranscriptCopies => "transcript-copies",
         }
     }
 }
@@ -217,6 +219,24 @@ pub fn filing_finding(why: &str) -> Option<Finding> {
             expected: "The write-time gate and the Stop-time re-run agree.".to_string(),
             actual: "The write was accepted and then judged not to count.".to_string(),
             fix_area: "model::store::evaluation_filing_refusal and its two callers (mcp write, serve::eval_filing)".to_string(),
+        });
+    }
+    if why.contains("holds two different tool calls under") {
+        return Some(Finding {
+            signal: Signal::TranscriptCopies,
+            title: "Evaluation report refused: two copies of one tool call in the transcript differ".to_string(),
+            key: "two-copies".to_string(),
+            summary: "A finished evaluation report was refused because the session's transcript holds two different \
+                      tool calls under the one id of the filing call."
+                .to_string(),
+            why_thor: "Only Claude Code writes a tool call into the transcript, and an id belongs to one call, so two \
+                       copies that differ mean Claude Code now writes the copy in a form THOR does not read as the same \
+                       call (seen 2026-11-21: lists written as JSON text). The agent cannot cause it."
+                .to_string(),
+            evidence: vec!["the validator's record says the transcript holds two different tool calls under the filing's id".to_string()],
+            expected: "Every copy Claude Code writes of one call counts as that one call.".to_string(),
+            actual: "The report was written, and refused at the next end of turn, so the evaluation was lost.".to_string(),
+            fix_area: "serve::attest scalars_as_text, text_as_scalars and found_of".to_string(),
         });
     }
     None

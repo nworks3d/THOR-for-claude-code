@@ -2,6 +2,13 @@
 
 What changed in each release, newest first. The release workflow copies the section for the tag being released to the top of the release notes and refuses to publish without one.
 
+## 2.6.13 (2026-11-21)
+
+What changed: The weekly check works again with the newest Claude Code.
+
+- **Weekly reports count again.** After a Claude Code update, every weekly report was refused and the conversation was held at the end of each turn. THOR now reads the new way Claude Code stores a conversation.
+- **THOR says so if it happens again.** If Claude Code changes that format once more, THOR reports it as a fault of its own instead of only refusing the report.
+
 ## 2.6.12 (2026-11-20)
 
 What changed: The last setup step, putting what you did with Claude before in order, now finishes in every case instead of sometimes staying open, and only one conversation at a time is held for it. Your assistant now moves the conversation into the proposed folder itself, so in the Claude app you never open or choose a folder yourself. The install text is also more exact, and gives plain click steps when the link was given to an ordinary chat.
