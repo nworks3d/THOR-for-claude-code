@@ -572,9 +572,11 @@ fn fires_for_a_main_session_and_names_the_real_eval_path_when_it_exists() {
         "{reason}"
     );
     assert!(reason.contains("It has been asked 1 time(s)"), "{reason}");
+    // Only items to judge are on the lists: the short path gives the steps and
+    // does not send the session to the routine file.
     let expected_path = sandbox.eval_command_path();
-    assert!(reason.contains(&expected_path.display().to_string()), "must name the real eval file path: {reason}");
-    assert!(reason.contains("/thor-eval"), "must tell the owner how to run it: {reason}");
+    assert!(reason.contains("THIS EVALUATION IS SHORT"), "{reason}");
+    assert!(!reason.contains(&expected_path.display().to_string()), "the short path must not name the routine file: {reason}");
     assert!(reason.contains("A turn cannot end until the evaluation report for this project is filed"), "{reason}");
     assert!(reason.contains("After that it is quiet for 7 day(s)"), "{reason}");
 }
@@ -602,13 +604,10 @@ fn falls_back_to_the_generic_note_when_no_eval_file_exists() {
         !reason.contains(&sandbox.home.path().display().to_string()),
         "must never claim a path that does not exist: {reason}"
     );
-    assert!(reason.contains("no evaluation routine is installed"), "{reason}");
-    assert!(reason.contains("install"), "must say install writes one: {reason}");
-    assert!(
-        reason.contains(&format!("--db \"{}\"", db.display())),
-        "the printed install command names the store this hook reads (F7): {reason}"
-    );
-    assert!(reason.contains("/thor-eval"), "{reason}");
+    // Only items to judge are on the lists: the short path needs no routine
+    // file, so nothing is said about one being missing.
+    assert!(reason.contains("THIS EVALUATION IS SHORT"), "{reason}");
+    assert!(!reason.contains("no evaluation routine is installed"), "{reason}");
 }
 
 /// Case named in the build brief: a store where BOTH the evaluation and the

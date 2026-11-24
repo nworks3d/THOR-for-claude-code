@@ -1530,6 +1530,16 @@ fn way_to_the_rest_is_missing<'a>(shown: &str, whole: &str, record: &str, ids: i
 /// no hook failure or version skew to report. Such an evaluation is filed at
 /// once with a one-line report.
 pub fn nothing_to_do(frozen: &Frozen) -> bool {
+    only_light_lists(frozen) && frozen.judgement.is_empty() && frozen.reread.is_empty() && !has_said(frozen)
+}
+
+fn has_said(frozen: &Frozen) -> bool {
+    frozen.said.as_ref().map_or(false, |s| s.total > 0)
+}
+
+/// THOR has finished deciding and every list except the three light ones
+/// (judgement, pinned re-read, owner messages) is empty, with quiet signals.
+fn only_light_lists(frozen: &Frozen) -> bool {
     let Some(machine) = frozen.machine.as_ref().filter(|_| frozen.decided()) else { return false };
     let quiet_signals = machine.signals.as_ref().map_or(true, |s| {
         s.sweep.is_empty()
@@ -1538,16 +1548,80 @@ pub fn nothing_to_do(frozen: &Frozen) -> bool {
             && s.skew_events == 0
             && s.host_wide_failures == 0
     });
-    frozen.judgement.is_empty()
-        && frozen.reread.is_empty()
-        && frozen.batch().is_empty()
+    frozen.batch().is_empty()
         && frozen.a4_list().is_empty()
         && frozen.dispute_list().is_empty()
         && frozen.outranked.is_empty()
-        && frozen.said.as_ref().map_or(true, |s| s.total == 0)
         && frozen.open_points.is_empty()
         && machine.points.is_empty()
         && quiet_signals
+}
+
+/// Whether the evaluation is a SHORT one: something to judge, a pinned note to
+/// re-read and/or owner messages are on its lists, and nothing else is.
+pub fn short_evaluation(frozen: &Frozen) -> bool {
+    only_light_lists(frozen) && !nothing_to_do(frozen)
+}
+
+/// The line the Stop ask carries for a short evaluation: the complete steps,
+/// in the order the filing gate checks them, so the routine file is not read.
+/// `None` when the evaluation is not short.
+pub fn short_evaluation_line(frozen: &Frozen) -> Option<String> {
+    if !short_evaluation(frozen) {
+        return None;
+    }
+    let report_id = report_id_named(frozen);
+    let project = &frozen.project;
+    let mut steps: Vec<String> = Vec::new();
+    if !frozen.judgement.is_empty() {
+        steps.push(format!(
+            "For EACH item to judge in the note below: mcp__thor__get(id: \"<id>\", fired: true), check it is still TRUE \
+             (revise it if not), then mcp__thor__mark(id: \"<id>\") if it belonged where it fired, or \
+             mcp__thor__mark(id: \"<id>\", noise: true) if not. If you cannot judge one honestly, add the tag '{}<id>:<reason>' \
+             to the report instead.",
+            model::store::NOT_JUDGEABLE_TAG_PREFIX
+        ));
+    }
+    if !frozen.reread.is_empty() {
+        steps.push(
+            "For EACH pinned note to re-read: mcp__thor__get(id: \"<id>\"), then mcp__thor__mark(id: \"<id>\") if it is still \
+             right, or mcp__thor__revise(id: \"<id>\", text: \"<its text made right, or shorter>\"). Never unpin it, never mark it noise."
+                .to_string(),
+        );
+    }
+    if let Some(said) = frozen.said.as_ref().filter(|s| s.total > 0) {
+        steps.push(format!(
+            "Run `{}`, read every line, store what should hold later (mcp__thor__lookup first, then mcp__thor__remember or \
+             mcp__thor__revise), and write a line `MISTAKES:` in the report with one line per mistake (`MISTAKES: none` if none).",
+            said.command
+        ));
+    }
+    steps.push("End the turn once, so THOR can check your calls; the report is refused before that.".to_string());
+    steps.push(format!(
+        "File the report: mcp__thor__remember(id: \"{report_id}\", kind: \"report\", project: \"{project}\", \
+         tags: [\"evaluation-report\"], text: \"<your summary in plain words: what you judged, re-read or stored>\")."
+    ));
+    let numbered: Vec<String> = steps.iter().enumerate().map(|(i, s)| format!("{}. {s}", i + 1)).collect();
+    Some(format!(
+        "[THOR] THIS EVALUATION IS SHORT (only items to judge, pinned notes to re-read and/or owner messages; no batch, A4 \
+         list, dispute, sweep item, crowded place or open point), so you do not have to read the routine file. Do these in \
+         order, with the THOR tools themselves (a call from a shell or a script settles nothing): {} THOR writes the \
+         machine section of the report itself, and the turn cannot end until a report that counts is on file.",
+        numbered.join(" ")
+    ))
+}
+
+/// The words that tell the session to read the routine file, up to the place
+/// the short path replaces them (see `ask_with_note`).
+fn without_routine(ask: &str) -> String {
+    const FROM: &str = "before you finish: ";
+    const TO: &str = " A turn cannot end";
+    match (ask.find(FROM), ask.find(TO)) {
+        (Some(a), Some(b)) if a + FROM.len() <= b => {
+            format!("{}the steps are below.{}", &ask[..a + FROM.len()], &ask[b..])
+        }
+        _ => ask.to_string(),
+    }
 }
 
 /// The day (`YYYY-MM-DD`) the evaluation started.
@@ -2287,6 +2361,13 @@ pub fn start_note_after(start: &EvaluationStart, in_front: usize) -> String {
 /// nothing on its lists (`nothing_to_do_line`), that line comes FIRST, in front
 /// of the ask, and is not repeated at the top of the note.
 pub fn ask_with_note(ask: &str, start: &EvaluationStart) -> String {
+    // A SHORT evaluation: the steps follow the ask (so what the ask opens with
+    // stays first) and the ask no longer sends the session to the routine file.
+    if let Some(line) = short_evaluation_line(&start.frozen) {
+        let ask = without_routine(ask);
+        let note = start_note_after(start, ask.len() + line.len() + 4);
+        return format!("{ask}\n\n{line}\n\n{note}");
+    }
     let front = nothing_to_do_line(&start.frozen);
     let in_front = ask.len() + front.as_ref().map_or(0, |l| l.len() + 2) + 2;
     let note = start_note_after(start, in_front);
@@ -2972,6 +3053,54 @@ mod tests {
         let mut undecided = frozen.clone();
         undecided.batch = None;
         assert!(!nothing_to_do(&undecided), "while THOR is still deciding nothing is claimed");
+    }
+
+    /// A SHORT evaluation (only judgement, pinned re-read and/or owner messages
+    /// on its lists) carries the complete steps and no instruction to read the
+    /// routine file; any other list item keeps that instruction.
+    #[test]
+    fn a_short_evaluation_carries_the_steps_and_any_other_list_keeps_the_routine() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, mut store) = store_with_events(dir.path(), 3);
+        let started = start(&db, &mut store, "sess", "Acme Demo", "stop-ask").unwrap();
+        let ask = "[THOR] Due. Run the THOR evaluation before you finish: read '/x/thor-eval.md' and do what it says. \
+                   The owner can type /thor-eval to run it. A turn cannot end until the report is filed.";
+        let with = |frozen: Frozen| ask_with_note(ask, &EvaluationStart { frozen, ..started.start.clone() });
+
+        let mut judged = started.start.frozen.clone();
+        judged.judgement.push("some-rule".to_string());
+        assert!(short_evaluation(&judged));
+        let text = with(judged.clone());
+        for part in [
+            "THIS EVALUATION IS SHORT",
+            "do not have to read the routine file",
+            "mcp__thor__get(id: \"<id>\", fired: true)",
+            "mcp__thor__mark(id: \"<id>\", noise: true)",
+            "End the turn once",
+            "mcp__thor__remember(id: \"eval-Acme Demo-",
+            "tags: [\"evaluation-report\"]",
+        ] {
+            assert!(text.contains(part), "missing {part:?} in {text}");
+        }
+        assert!(!text.contains("thor-eval.md") && !text.contains("do what it says"), "no routine instruction: {text}");
+        assert!(text.contains("A turn cannot end"), "the rest of the ask stays: {text}");
+
+        let mut pinned = started.start.frozen.clone();
+        pinned.reread.push("pinned-note".to_string());
+        assert!(short_evaluation_line(&pinned).unwrap().contains("Never unpin it"));
+
+        for other in [
+            |f: &mut Frozen| f.open_points.push("legacy-point".to_string()),
+            |f: &mut Frozen| f.batch = Some(vec!["a-rule".to_string()]),
+        ] {
+            let mut frozen = judged.clone();
+            other(&mut frozen);
+            assert!(!short_evaluation(&frozen));
+            let text = with(frozen);
+            assert!(text.contains("read '/x/thor-eval.md' and do what it says"), "the routine stays: {text}");
+            assert!(!text.contains("THIS EVALUATION IS SHORT"));
+        }
+        assert!(!short_evaluation(&started.start.frozen), "an empty evaluation is the other short path");
     }
 
     /// FIELD TEST 2026-11-18: a second evaluation of a project on the same day

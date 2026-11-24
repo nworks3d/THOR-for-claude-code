@@ -11,6 +11,7 @@ What changed: The weekly check is quieter and more reliable, and a pin can no lo
 - **Better warnings after an update.** A resumed conversation is only told to restart when its tool server really is older than the installed one.
 - **Pins are checked more strictly.** A pin on a note tied to one place needs a reason why it holds in every conversation. When the start block is full, THOR stops and asks you, and a note you approve is delivered whole at your first message. `doctor` shows how full the start block is per project.
 - **Clearer edits.** Changing a note now says which bindings were removed and which were kept.
+- **A short weekly check is short.** When only a few notes have to be judged or re-read, the assistant gets the steps right in the request and no longer reads the whole routine file first.
 
 ## 2.6.13 (2026-11-21)
 
