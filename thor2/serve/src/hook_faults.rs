@@ -148,7 +148,8 @@ fn power_event_in_log(_from: &str, _to: &str) -> bool {
 /// machine logged a shutdown, restart or sleep near that unix second).
 pub fn faults_in_file_with(path: &Path, machine_stopping_near: &dyn Fn(i64) -> bool) -> Vec<Scanned> {
     let Ok(file) = std::fs::File::open(path) else { return Vec::new() };
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::with_capacity(256 * 1024, file);
+    let finder = memchr::memmem::Finder::new(MARK);
     let mut found = Vec::new();
     // (exit code, time in milliseconds) of every hook of another program.
     let mut others: Vec<(i64, i64)> = Vec::new();
@@ -159,10 +160,12 @@ pub fn faults_in_file_with(path: &Path, machine_stopping_near: &dyn Fn(i64) -> b
             Ok(0) | Err(_) => break,
             Ok(_) => {}
         }
-        let line = String::from_utf8_lossy(&raw);
-        if !line.contains(MARK) {
+        // The search runs on the raw bytes: turning an invalid byte into a
+        // replacement character cannot make or break a match of ASCII text.
+        if finder.find(&raw).is_none() {
             continue;
         }
+        let line = String::from_utf8_lossy(&raw);
         match failure_of(&line) {
             Some(Failure::Thor(scanned)) => found.push(scanned),
             Some(Failure::Other { exit_code, at }) => others.push((exit_code, at)),
@@ -378,6 +381,18 @@ mod tests {
         assert_eq!(model::store::hook_faults_in(&events).len(), 2);
         assert_eq!(crate::attest::record_hook_faults_in(&mut store, SESSION, None), 0, "no transcripts folder: nothing");
         assert_eq!(crate::attest::record_hook_faults_in(&mut store, "not-a-session", Some(dir.path())), 0);
+    }
+
+    #[test]
+    fn a_stop_out_of_time_leaves_the_failures_for_the_next_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("C--Users-someone-dev-demo");
+        std::fs::create_dir_all(&project).unwrap();
+        let lines = [failure_line(OURS, 126, "", "toolu-1")];
+        std::fs::write(project.join(format!("{SESSION}.jsonl")), lines.join("\n") + "\n").unwrap();
+        let mut store = thor_core::event_store::EventStore::in_memory().unwrap();
+        assert_eq!(crate::attest::record_hook_faults_until(&mut store, SESSION, Some(dir.path()), &|| false), 0);
+        assert_eq!(crate::attest::record_hook_faults_in(&mut store, SESSION, Some(dir.path())), 1, "the next Stop records it");
     }
 
     #[test]

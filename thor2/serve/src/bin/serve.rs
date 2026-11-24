@@ -1118,36 +1118,21 @@ fn record_reply_in_corpus(
     serve::corpus::record_reply(db_path, &row);
 }
 
-/// The owner's own last typed prompt, for `respond::guard_verdict`'s
-/// `list_request_any_of` exemption (FALSE BLOCK A - see
-/// `respond::last_user_prompt`'s own doc comment for the full story).
-/// Unlike the reply text (`last_assistant_message`, read
-/// straight off the Stop payload), Claude Code does not hand the prompt over
-/// the same way - it names the session's transcript file in
-/// `transcript_path` instead, so this reads THAT and hands the raw text to
-/// `respond::last_user_prompt`, the pure parser. Empty string on anything
-/// unreadable (no `transcript_path`, the file is gone or unparseable) -
-/// fail-open, same stance as every other optional signal on this path: the
-/// exemption then simply does not apply, exactly the behaviour this project
-/// had before it existed, never a NEW block.
-fn last_user_prompt_from_payload(payload: &Value) -> String {
+/// The owner's own last typed prompt (`respond::last_user_prompt`, for the
+/// guard's `list_request_any_of` exemption) and the shell commands the assistant
+/// ran in this turn (`respond::turn_commands`), both read out of the transcript
+/// the payload names, from ONE read of it: a long session's file is large, and
+/// reading it twice per Stop cost seconds. Both are empty on anything
+/// unreadable (no `transcript_path`, the file is gone), fail-open: the
+/// exemption then does not apply and no evidence is claimed.
+fn turn_view_from_payload(payload: &Value) -> (String, Vec<String>) {
     let Some(path) = payload.get("transcript_path").and_then(|v| v.as_str()) else {
-        return String::new();
+        return (String::new(), Vec::new());
     };
     let Ok(text) = std::fs::read_to_string(path) else {
-        return String::new();
+        return (String::new(), Vec::new());
     };
-    respond::last_user_prompt(&text).unwrap_or_default()
-}
-
-/// The shell commands the assistant ran in this turn, read out of the
-/// transcript the payload names (`respond::turn_commands`); empty on anything
-/// unreadable, so no evidence is then claimed.
-fn turn_commands_from_payload(payload: &Value) -> Vec<String> {
-    let Some(path) = payload.get("transcript_path").and_then(|v| v.as_str()) else {
-        return Vec::new();
-    };
-    std::fs::read_to_string(path).map(|text| respond::turn_commands(&text)).unwrap_or_default()
+    (respond::last_user_prompt(&text).unwrap_or_default(), respond::turn_commands(&text))
 }
 
 /// This invocation's own session identity: the payload's own `session_id`
@@ -1682,28 +1667,49 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
         // below). Never for a subagent's Stop: the evaluation is the main
         // session's.
         let mut resumed: Vec<model::store::EvaluationStart> = Vec::new();
+        // THE UPKEEP BUDGET (`serve::stop_budget`): the steps below that only
+        // catch the log up with things already done each ask it before they
+        // start, and once it is spent they wait for the next Stop. The checks
+        // that refuse or protect never ask.
+        let budget = serve::stop_budget::StopBudget::new();
         if !no_record {
             if let Ok(mut store) = serve::store_dir::open_existing(db_path) {
-                serve::attest::record_refusal_verifications(&mut store, &session_id);
-                serve::attest::record_write_verifications(&mut store, &session_id);
+                if budget.allow(db_path, "refusal verifications", true) {
+                    serve::attest::record_refusal_verifications(&mut store, &session_id);
+                }
+                if budget.allow(db_path, "write verifications", true) {
+                    serve::attest::record_write_verifications(&mut store, &session_id);
+                }
                 if !payload_is_from_a_subagent(&payload) {
                     // ANOTHER SESSION'S WRITES on this session's open
                     // evaluation lists (step 24): checked here, so a filing
                     // never waits on a session that went quiet.
-                    serve::attest::record_foreign_write_verifications(&mut store, &session_id);
+                    if budget.allow(db_path, "foreign write verifications", true) {
+                        serve::attest::record_foreign_write_verifications(&mut store, &session_id);
+                    }
                     // A hook Claude Code could not start leaves a record in
                     // the transcript and nothing in THOR: written to the log
                     // here, so the evaluation's machine section can say so.
-                    serve::attest::record_hook_faults(&mut store, &session_id);
+                    if budget.allow(db_path, "hook faults", true) {
+                        let more = || budget.allow(db_path, "hook faults", true);
+                        serve::attest::record_hook_faults_until(&mut store, &session_id, serve::attest::transcripts_root().as_deref(), &more);
+                    }
                     // The notes this session read with `get`: a useful mark on a pinned note
                     // listed for a re-read counts only after one.
-                    serve::attest::record_note_reads(&mut store, &session_id);
+                    if budget.allow(db_path, "note reads", true) {
+                        let more = || budget.allow(db_path, "note reads", true);
+                        serve::attest::record_note_reads_until(&mut store, &session_id, serve::attest::transcripts_root().as_deref(), &more);
+                    }
                     // THE READER OF A FILING (step 16): every evaluation
                     // report on file whose filing has no validator record
                     // yet is validated once - after the verifications above,
                     // which it reads - and the answer recorded.
-                    serve::eval_filing::validate_new_reports(&mut store, serve::attest::transcripts_root().as_deref(), &session_id);
-                    resumed = serve::eval_session::resume(&mut store, &session_id);
+                    if budget.allow(db_path, "report validation", true) {
+                        serve::eval_filing::validate_new_reports(&mut store, serve::attest::transcripts_root().as_deref(), &session_id);
+                    }
+                    if budget.allow(db_path, "evaluation resume", true) {
+                        resumed = serve::eval_session::resume(&mut store, &session_id);
+                    }
                 }
             }
             // The evaluation's old handover file is gone for good (step 13):
@@ -1716,7 +1722,7 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             // Stop already reads, only what is new, within a time box. A
             // subagent's Stop adds nothing: the main session's covers its
             // files.
-            if !payload_is_from_a_subagent(&payload) {
+            if !payload_is_from_a_subagent(&payload) && budget.allow(db_path, "real-call corpus", true) {
                 let named = payload.get("transcript_path").and_then(|v| v.as_str()).map(Path::new);
                 let at = payload.get("cwd").and_then(|v| v.as_str()).map(Path::new);
                 let fallback = project::session_project(db_path, &session_id, at);
@@ -1844,8 +1850,7 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                     std::fs::read_to_string(respond::default_rulebook_path(db_path)).ok(),
                     serve::plan::reply_language(db_path).as_deref(),
                 );
-                let last_prompt = last_user_prompt_from_payload(&payload);
-                let commands = turn_commands_from_payload(&payload);
+                let (last_prompt, commands) = turn_view_from_payload(&payload);
                 let verdict = respond::guard_verdict_in_turn(
                     rulebook_text.as_deref(),
                     msg,
@@ -1952,8 +1957,7 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                 std::fs::read_to_string(respond::default_rulebook_path(db_path)).ok(),
                 serve::plan::reply_language(db_path).as_deref(),
             );
-            let last_prompt = last_user_prompt_from_payload(&payload);
-            let commands = turn_commands_from_payload(&payload);
+            let (last_prompt, commands) = turn_view_from_payload(&payload);
             let verdict = respond::guard_verdict_in_turn(
                 rulebook_text.as_deref(),
                 msg,
@@ -2080,7 +2084,7 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
         if !is_subagent && !copy {
             if let Some(reason) = serve::store_dir::open_existing(db_path)
                 .ok()
-                .and_then(|s| crowding_debt(&s, db_path, &session_id, stop_project.as_deref()))
+                .and_then(|s| crowding_debt_within(&s, db_path, &session_id, stop_project.as_deref(), &budget))
             {
                 return hold(reason);
             }
@@ -2092,7 +2096,7 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
         // above it is about this session's own doing, so it is never asked of
         // a subagent; a copy takes no state write, so it could not remember
         // having asked and asks nothing.
-        if !is_subagent && !copy {
+        if !is_subagent && !copy && budget.allow(db_path, "leftover scripts", true) {
             if let Some(reason) = serve::leftover_scripts::hold_reason(db_path, &session_id, time::now_unix()) {
                 return hold(reason);
             }
@@ -2242,7 +2246,7 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
         // The Stop itself was counted above, before the Response Guard
         // (step 20).
         let mut elsewhere_note: Option<String> = None;
-        if !is_subagent {
+        if !is_subagent && budget.allow(db_path, "evaluation ask", true) {
             match stop_eval_decision(db_path, &session_id, stop_root.as_deref(), stop_project.as_deref(), drift_note.is_none(), no_record) {
                 EvalStop::Ask(reason) => {
                     return Some(HookOutput::Decision(serde_json::json!({ "decision": "block", "reason": reason })));
@@ -3489,19 +3493,41 @@ fn written_by_a_session_write(event: &thor_core::event_store::Event, session_id:
 /// THE THING THE OWNER ASKED FOR THREE DAYS RUNNING, and did not have until
 /// 2026-08-09: the system finding, by itself, which facts deserve to reach the
 /// gate.
+#[cfg(test)]
 fn crowding_debt(
     store: &EventStore,
     db_path: &Path,
     session_id: &str,
     current_project: Option<&str>,
 ) -> Option<String> {
-    use thor_core::event_store::EventKind;
-    let since = session_watermark(db_path, session_id)?;
-    let events = store.get_all_events().ok()?;
+    crowding_debt_within(store, db_path, session_id, current_project, &serve::stop_budget::StopBudget::unlimited())
+}
 
-    // Written during this session: a declare or a revise above the watermark.
+/// `crowding_debt` that examines only what is new since this session's last
+/// look (`serve::crowding_seen`): the notes written above the stored log
+/// position plus the notes still owed an answer. A note found fine is not
+/// looked at again. When `budget` runs out part-way, the notes not yet looked at
+/// are kept as owed and examined at the next Stop.
+fn crowding_debt_within(
+    store: &EventStore,
+    db_path: &Path,
+    session_id: &str,
+    current_project: Option<&str>,
+    budget: &serve::stop_budget::StopBudget,
+) -> Option<String> {
+    use thor_core::event_store::EventKind;
+    let watermark = session_watermark(db_path, session_id)?;
+    let seen = serve::crowding_seen::load(db_path, session_id);
+    let since = seen.as_ref().map_or(watermark, |s| s.seq.max(watermark));
+    let events = store
+        .events_of_kinds(&[EventKind::FactCreated, EventKind::FactRevised, EventKind::FactRetracted], since)
+        .ok()?;
+    let top = events.last().map_or(since, |e| e.seq.max(since));
+
+    // Owed from earlier Stops first (they were written first), then written
+    // since: a declare or a revise above the stored position.
     // Retractions are read too, because retracting IS one of the three ways out.
-    let mut written: Vec<String> = Vec::new();
+    let mut written: Vec<String> = seen.map(|s| s.pending).unwrap_or_default();
     let mut settled: std::collections::HashSet<String> = Default::default();
     for e in &events {
         if e.seq <= since {
@@ -3523,7 +3549,17 @@ fn crowding_debt(
         }
     }
 
-    for id in written {
+    // Notes still owed an answer, in the order they were written: in debt, or
+    // (for now) another project's, or not yet looked at.
+    let mut owed: Vec<String> = Vec::new();
+    let mut message: Option<String> = None;
+    let mut queue = written.into_iter();
+    while let Some(id) = queue.next() {
+        if !budget.allow(db_path, "crowding check", true) {
+            owed.push(id);
+            owed.extend(queue.by_ref());
+            break;
+        }
         if settled.contains(&id) {
             continue;
         }
@@ -3543,6 +3579,9 @@ fn crowding_debt(
         // filtered - the watermark stands alone, exactly as before.
         if let (Some(cur), Some(p)) = (current_project, item.project.as_deref()) {
             if cur != p {
+                // Not this session's as long as it works in `cur`; kept, so a
+                // session that moves to `p` is still asked, as before.
+                owed.push(id);
                 continue;
             }
         }
@@ -3580,12 +3619,17 @@ fn crowding_debt(
         if reaches_a_block(store, &id, &item) {
             continue;
         }
-        return Some(format!(
+        let text = format!(
             "[THOR] '{id}' was stored this session onto a place that is already full, so it will probably never be read there. The memory said so when you wrote it. Deal with it before ending the turn, in this order: (1) FOLD it - if an existing item almost says the same thing, revise that one to carry your point and retract yours; (2) RE-ANCHOR it - if it is really about a narrower file or command than the one it hangs on, move it there with revise; (3) LEAVE IT - and this exit is narrower than it sounds, so read the condition before taking it. It is honest ONLY when the seats are held by rules that can each REFUSE a write: archiving one of those is refused by the gate anyway, and folding it would spend a check. If the seats are held by DESCRIPTIONS instead, this is the wrong answer - archive a description to free its seat, since it stays fully findable and the rule that can actually block takes its place. When the condition really holds: say in your reply which items hold it, and add '{}' to its tags with revise - BARE, exactly as written here: this tag is matched whole, so appending a reason to it is silently ignored and this will keep asking every turn (that is the opposite of 'no-literal:<why>', which requires one). mark is a verdict on where an item fired and cannot tag anything. Recorded that way it is a decision rather than an oversight. Saying it only in prose settles nothing and this will ask again next turn. What you never do is raise its severity to make it visible: that pushes a heavier warning out to show a lighter one. The note said: {note} The item says: {}",
  model::store::CROWDED_ON_PURPOSE_TAG, item.text
-        ));
+        );
+        owed.push(id);
+        if message.is_none() {
+            message = Some(text);
+        }
     }
-    None
+    serve::crowding_seen::save(db_path, session_id, serve::crowding_seen::Seen { seq: top, pending: owed, at: 0 }, time::now_unix());
+    message
 }
 
 /// What a `Skill` (or `SlashCommand`) call opening the evaluation routine
@@ -5843,6 +5887,137 @@ mod crowding_debt_tests {
             crowding_debt(&store, &db, "now", None).is_none(),
             "a directory-only item's note is Broad, never Crowded, and must never be read as debt"
         );
+    }
+
+    /// A note with room: it lands on a file nobody else claims.
+    fn roomy(id: &str) -> Item {
+        let mut item = path_newcomer(id, "p", "the nightly report is written before the first quote of the day");
+        item.bindings = vec![Binding::Target { kind: model::item::TargetKind::Path, value: "reports/nightly.txt".to_string() }];
+        item
+    }
+
+    fn spent() -> serve::stop_budget::StopBudget {
+        serve::stop_budget::StopBudget::with_limit(std::time::Duration::ZERO)
+    }
+
+    /// A second Stop with nothing new looks at nothing: a spent budget is never
+    /// asked, because there is no note to ask it about.
+    #[test]
+    fn a_second_stop_with_nothing_new_examines_zero_notes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        crowd_a_moment(&mut store, "p");
+        record_session_watermark(&db, "now");
+        model::store::declare(&mut store, "mcp", "mcp", "t", &roomy("fine")).unwrap();
+        assert!(crowding_debt(&store, &db, "now", None).is_none());
+        let seen = serve::crowding_seen::load(&db, "now").expect("the first Stop keeps its progress");
+        assert!(seen.pending.is_empty());
+
+        let budget = spent();
+        assert!(crowding_debt_within(&store, &db, "now", None, &budget).is_none());
+        assert!(!budget.skipped(), "nothing was left to examine, so no step asked for time");
+    }
+
+    /// A note found fine is not looked at again: it stays fine here even when
+    /// the place it sits on fills up afterwards.
+    #[test]
+    fn a_note_found_fine_is_not_examined_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        record_session_watermark(&db, "now");
+        model::store::declare(&mut store, "mcp", "mcp", "t", &crowded_newcomer("mine", "p")).unwrap();
+        assert!(crowding_debt(&store, &db, "now", None).is_none(), "an empty pool has room");
+        crowd_a_moment(&mut store, "p");
+        assert!(crowding_debt(&store, &db, "now", None).is_none(), "already found fine, so not asked about again");
+    }
+
+    /// A note written after the stored position is examined at the next Stop.
+    #[test]
+    fn a_note_written_after_the_stored_position_is_examined() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        crowd_a_moment(&mut store, "p");
+        record_session_watermark(&db, "now");
+        model::store::declare(&mut store, "mcp", "mcp", "t", &roomy("fine")).unwrap();
+        assert!(crowding_debt(&store, &db, "now", None).is_none());
+        model::store::declare(&mut store, "mcp", "mcp", "t", &crowded_newcomer("mine", "p")).unwrap();
+        let asked = crowding_debt(&store, &db, "now", None).expect("the new crowded note holds the turn");
+        assert!(asked.contains("mine") && asked.contains("FOLD"), "{asked}");
+    }
+
+    /// A debt found at one Stop keeps holding at the next, with nothing new in
+    /// the log, until it is settled; then it stops, and the state forgets it.
+    #[test]
+    fn a_pending_debt_keeps_holding_until_it_is_settled() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        crowd_a_moment(&mut store, "p");
+        record_session_watermark(&db, "now");
+        model::store::declare(&mut store, "mcp", "mcp", "t", &crowded_newcomer("mine", "p")).unwrap();
+        let first = crowding_debt(&store, &db, "now", None).expect("fixture sanity");
+        assert_eq!(serve::crowding_seen::load(&db, "now").unwrap().pending, vec!["mine".to_string()]);
+        assert_eq!(crowding_debt(&store, &db, "now", None).as_deref(), Some(first.as_str()), "the same words at the next Stop");
+
+        model::store::retract(&mut store, "mcp", "mcp", "t", "mine", "folded into the item that already said it", None).unwrap();
+        assert!(crowding_debt(&store, &db, "now", None).is_none());
+        assert!(serve::crowding_seen::load(&db, "now").unwrap().pending.is_empty());
+    }
+
+    /// Tagging it crowded-on-purpose is another way out of a pending debt.
+    #[test]
+    fn a_pending_debt_ends_when_the_note_is_tagged_crowded_on_purpose() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        crowd_a_moment(&mut store, "p");
+        record_session_watermark(&db, "now");
+        let mine = crowded_newcomer("mine", "p");
+        model::store::declare(&mut store, "mcp", "mcp", "t", &mine).unwrap();
+        assert!(crowding_debt(&store, &db, "now", None).is_some());
+        let mut tagged = mine.clone();
+        tagged.tags.push(model::store::CROWDED_ON_PURPOSE_TAG.to_string());
+        model::store::revise(&mut store, "mcp", "mcp", "t", &mine, &tagged).unwrap();
+        assert!(crowding_debt(&store, &db, "now", None).is_none());
+        assert!(serve::crowding_seen::load(&db, "now").unwrap().pending.is_empty());
+    }
+
+    /// A session with no state behaves as before: it starts from its watermark.
+    #[test]
+    fn a_session_with_no_state_starts_from_its_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        crowd_a_moment(&mut store, "p");
+        record_session_watermark(&db, "now");
+        model::store::declare(&mut store, "mcp", "mcp", "t", &crowded_newcomer("mine", "p")).unwrap();
+        assert!(serve::crowding_seen::load(&db, "now").is_none());
+        assert!(crowding_debt(&store, &db, "now", None).is_some());
+        std::fs::remove_file(serve::crowding_seen::path(&db)).unwrap();
+        assert!(crowding_debt(&store, &db, "now", None).is_some(), "a lost state file costs one full look, never a missed debt");
+    }
+
+    /// A spent budget leaves the notes it did not reach as owed, records the
+    /// skip, and the next Stop (with time) examines them.
+    #[test]
+    fn a_spent_budget_leaves_the_notes_for_the_next_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        crowd_a_moment(&mut store, "p");
+        record_session_watermark(&db, "now");
+        model::store::declare(&mut store, "mcp", "mcp", "t", &crowded_newcomer("mine", "p")).unwrap();
+
+        let budget = spent();
+        assert!(crowding_debt_within(&store, &db, "now", None, &budget).is_none(), "no time: nothing is said");
+        assert!(budget.skipped());
+        assert_eq!(serve::stop_budget::read(&db).count, 1);
+        assert_eq!(serve::crowding_seen::load(&db, "now").unwrap().pending, vec!["mine".to_string()]);
+
+        assert!(crowding_debt(&store, &db, "now", None).is_some(), "the next Stop catches up and holds the turn");
     }
 }
 

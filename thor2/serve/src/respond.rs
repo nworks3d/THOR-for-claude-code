@@ -220,10 +220,19 @@ fn is_observation_tool(name: &str) -> bool {
 /// that looks (`is_observation_tool`). Empty when the transcript is unreadable
 /// (fail-open: no evidence is claimed).
 pub fn turn_commands(transcript_jsonl: &str) -> Vec<String> {
-    let entries: Vec<Value> = transcript_jsonl.lines().filter_map(|l| serde_json::from_str::<Value>(l.trim()).ok()).collect();
-    let start = entries.iter().rposition(|e| owner_prompt_of(e).is_some()).map_or(0, |i| i + 1);
+    // The turn is every entry after the owner's last prompt. Walking back from
+    // the end finds it by parsing only that tail, not the whole transcript.
+    let mut turn: Vec<Value> = Vec::new();
+    for line in transcript_jsonl.lines().rev() {
+        let Ok(entry) = serde_json::from_str::<Value>(line.trim()) else { continue };
+        if owner_prompt_of(&entry).is_some() {
+            break;
+        }
+        turn.push(entry);
+    }
+    turn.reverse();
     let mut commands = Vec::new();
-    for entry in &entries[start..] {
+    for entry in &turn {
         if entry.get("type").and_then(|t| t.as_str()) != Some("assistant") {
             continue;
         }
@@ -3042,6 +3051,20 @@ mod tests {
             ));
         }
         lines.join("\n")
+    }
+
+    /// The turn is what follows the owner's LAST prompt: earlier turns, lines that
+    /// do not parse and a truncated last line do not change it, and a transcript
+    /// with no prompt at all is one turn from its first line.
+    #[test]
+    fn the_turn_is_everything_after_the_last_owner_prompt() {
+        let call = |c: &str| format!(r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","name":"Bash","input":{{"command":"{c}"}}}}]}}}}"#);
+        let prompt = |t: &str| format!(r#"{{"type":"user","message":{{"content":"{t}"}}}}"#);
+        let transcript = [call("old"), prompt("one"), call("older"), prompt("two"), "not json".to_string(), call("new"), call("newer")].join("\n");
+        assert_eq!(turn_commands(&transcript), vec!["new", "newer"]);
+        assert_eq!(turn_commands(&format!("{transcript}\n{{\"type\":\"assistant\",\"mess")), vec!["new", "newer"]);
+        assert_eq!(turn_commands(&[call("a"), call("b")].join("\n")), vec!["a", "b"]);
+        assert!(turn_commands("").is_empty());
     }
 
     #[test]

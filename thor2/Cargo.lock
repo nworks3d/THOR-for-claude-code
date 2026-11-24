@@ -2852,6 +2852,7 @@ dependencies = [
  "codeindex",
  "fastembed",
  "intent",
+ "memchr",
  "model",
  "regex",
  "rusqlite",

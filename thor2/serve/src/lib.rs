@@ -158,6 +158,8 @@ pub mod teeth;
 pub mod test_signal;
 pub mod thor_bugs;
 pub mod time;
+pub mod stop_budget;
+pub mod crowding_seen;
 pub mod turn_violation;
 pub mod unpin_gate;
 pub mod usefulness;

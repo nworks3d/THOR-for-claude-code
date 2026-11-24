@@ -544,6 +544,14 @@ through; the evaluation ask is the one exception, see C5); it is never applied t
 sentence beside it ("THOR asks your assistant to do a short tidy-up... Nothing is needed from you").
 The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
 
+The upkeep part of a Stop has a time limit of 5 seconds. The checks that refuse or protect (the reply rules,
+the first-session setup, a decision that was not stored, the stale-rule guard, the rule-violation holds)
+always run. The upkeep that only catches the log up (verifying earlier writes against the transcript,
+validating filed reports, recording the real-call corpus, the crowding check, leftover scripts and the
+evaluation ask) stops once the 5 seconds are spent, and what it left is done at the next Stop, from its own
+state, so nothing is lost. `doctor` says how often a Stop ran out of time. The crowding check (C3 below)
+remembers per session how far it has looked, so a long conversation does not make it slower.
+
 ### C1. First-session setup, on defaults
 - What: while the seeded setup note is live, every turn end is held until the assistant has told the
   owner in one sentence the defaults (short plain replies in his own language; work lane only; every

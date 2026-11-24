@@ -1016,14 +1016,24 @@ pub fn record_foreign_write_verifications_in(store: &mut EventStore, session: &s
 /// it is how a failure THOR itself could not report reaches the log, and so the
 /// evaluation's machine section. Returns how many it recorded.
 pub fn record_hook_faults(store: &mut EventStore, session: &str) -> usize {
-    record_hook_faults_in(store, session, transcripts_root().as_deref())
+    record_hook_faults_until(store, session, transcripts_root().as_deref(), &|| true)
 }
 
 /// `record_hook_faults` against the transcripts under `root`.
 pub fn record_hook_faults_in(store: &mut EventStore, session: &str, root: Option<&Path>) -> usize {
+    record_hook_faults_until(store, session, root, &|| true)
+}
+
+/// `record_hook_faults_in` that asks `more` before each transcript file and stops
+/// at the first `false`: a file left unread is read at the next Stop, because
+/// each failure is recorded once whenever it is found.
+pub fn record_hook_faults_until(store: &mut EventStore, session: &str, root: Option<&Path>, more: &dyn Fn() -> bool) -> usize {
     let Some(root) = root else { return 0 };
     let mut recorded = 0;
     for file in session_transcripts(root, session) {
+        if !more() {
+            break;
+        }
         for found in crate::hook_faults::faults_in_file(&file) {
             let written = model::store::record_hook_fault(store, session, SystemActor::new(ATTESTER_ACTOR), &found.fault);
             if matches!(written, Ok(Some(_))) {
@@ -1034,25 +1044,58 @@ pub fn record_hook_faults_in(store: &mut EventStore, session: &str, root: Option
     recorded
 }
 
+/// The lines of `file` that hold `needle`, as `fs::read_to_string(file)` followed
+/// by `str::lines` would find them, read in one streaming pass instead of
+/// holding the whole file: `None` when the file cannot be read or is not valid
+/// UTF-8 anywhere (as `read_to_string` then fails), so a caller skips the file
+/// exactly as before. The cheap byte search comes first; only a line that holds
+/// the needle is turned into a `String`.
+fn lines_containing(file: &Path, needle: &[u8]) -> Option<Vec<String>> {
+    let handle = std::fs::File::open(file).ok()?;
+    let finder = memchr::memmem::Finder::new(needle);
+    let mut reader = BufReader::with_capacity(256 * 1024, handle);
+    let mut raw = Vec::new();
+    let mut found = Vec::new();
+    loop {
+        raw.clear();
+        if reader.read_until(b'\n', &mut raw).ok()? == 0 {
+            return Some(found);
+        }
+        let text = std::str::from_utf8(&raw).ok()?;
+        let line = text.strip_suffix('\n').unwrap_or(text);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if finder.find(line.as_bytes()).is_some() {
+            found.push(line.to_string());
+        }
+    }
+}
+
 /// Every `get` of a note that `session`'s main transcript holds, written to the log
 /// once each (`model::store::record_note_read`), with the time of its line. The
 /// weekly evaluation counts a useful mark on a pinned note only after the session
 /// read the note this way (`model::store::evaluation_reread_owed`). Runs at the
 /// session's Stop and never holds a turn. Returns how many it recorded.
 pub fn record_note_reads(store: &mut EventStore, session: &str) -> usize {
-    record_note_reads_in(store, session, transcripts_root().as_deref())
+    record_note_reads_until(store, session, transcripts_root().as_deref(), &|| true)
 }
 
 /// `record_note_reads` against the transcripts under `root`.
 pub fn record_note_reads_in(store: &mut EventStore, session: &str, root: Option<&Path>) -> usize {
+    record_note_reads_until(store, session, root, &|| true)
+}
+
+/// `record_note_reads_in` that asks `more` before each transcript file and stops
+/// at the first `false`: a file left unread is read at the next Stop, because
+/// each read is recorded once whenever it is found.
+pub fn record_note_reads_until(store: &mut EventStore, session: &str, root: Option<&Path>, more: &dyn Fn() -> bool) -> usize {
     let Some(root) = root else { return 0 };
     let mut recorded = 0;
     for file in session_transcripts(root, session) {
-        let Ok(text) = std::fs::read_to_string(&file) else { continue };
-        for raw in text.lines() {
-            if !raw.contains("__get") {
-                continue;
-            }
+        if !more() {
+            break;
+        }
+        let Some(candidates) = lines_containing(&file, b"__get") else { continue };
+        for raw in candidates.iter().map(String::as_str) {
             let Ok(line) = serde_json::from_str::<Value>(raw) else { continue };
             let main_assistant = line.get("type").and_then(|t| t.as_str()) == Some("assistant")
                 && line.get("isSidechain").and_then(|b| b.as_bool()) != Some(true);
@@ -2185,6 +2228,57 @@ mod tests {
 
     const S1: &str = "0de7dc52-1b97-4b66-948f-61e4438043b2";
     const S2: &str = "373e8610-8130-490d-ac29-56aa98709fd1";
+
+    #[test]
+    fn lines_containing_finds_the_lines_read_to_string_and_lines_would() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("t.jsonl");
+        // Windows line ends, an empty line, a last line with no line end at all
+        // (a line still being written), and a needle at the very start.
+        std::fs::write(&file, "a __get b\r\nno match\r\n\r\n__get\nlast __get").unwrap();
+        let expected: Vec<String> =
+            std::fs::read_to_string(&file).unwrap().lines().filter(|l| l.contains("__get")).map(str::to_string).collect();
+        assert_eq!(lines_containing(&file, b"__get"), Some(expected.clone()));
+        assert_eq!(expected, vec!["a __get b", "__get", "last __get"]);
+    }
+
+    #[test]
+    fn lines_containing_skips_a_file_that_is_missing_or_not_text() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(lines_containing(&dir.path().join("missing.jsonl"), b"__get"), None);
+        // One bad byte anywhere, even on a line without the needle, makes the
+        // whole file unreadable as text, as `read_to_string` did.
+        let file = dir.path().join("bad.jsonl");
+        std::fs::write(&file, b"x __get\n\xff\xfe broken\n").unwrap();
+        assert_eq!(lines_containing(&file, b"__get"), None);
+    }
+
+    #[test]
+    fn lines_containing_reads_what_is_on_disk_when_it_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("t.jsonl");
+        std::fs::write(&file, "one __get\n").unwrap();
+        assert_eq!(lines_containing(&file, b"__get").unwrap().len(), 1);
+        let mut more = std::fs::OpenOptions::new().append(true).open(&file).unwrap();
+        std::io::Write::write_all(&mut more, b"two __get\n").unwrap();
+        assert_eq!(lines_containing(&file, b"__get").unwrap().len(), 2, "a file that grew is read to its new end");
+    }
+
+    #[test]
+    fn a_stop_out_of_time_leaves_the_note_reads_for_the_next_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("C--Users-someone-dev-demo");
+        std::fs::create_dir_all(&project).unwrap();
+        let line = json!({
+            "type": "assistant", "timestamp": "2026-11-01T10:00:00.000Z",
+            "message": {"content": [{"type": "tool_use", "id": "toolu_1", "name": "mcp__thor__get", "input": {"id": "some-note"}}]}
+        });
+        std::fs::write(project.join(format!("{S1}.jsonl")), format!("{line}\n")).unwrap();
+        let mut store = EventStore::in_memory().unwrap();
+        assert_eq!(record_note_reads_until(&mut store, S1, Some(dir.path()), &|| false), 0);
+        assert_eq!(record_note_reads_in(&mut store, S1, Some(dir.path())), 1, "the next Stop records the read");
+        assert_eq!(record_note_reads_in(&mut store, S1, Some(dir.path())), 0, "and only once");
+    }
 
     fn absent_rule() -> Item {
         Item {

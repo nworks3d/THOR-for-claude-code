@@ -1174,6 +1174,11 @@ needed from them (unless it is the first-session questions, which need their
 answer). Never read the hold's text out to them, and never ask them to decide
 something it names - the verdicts and repairs are yours.
 
+**The end of a turn is quick, and has a time limit.** The upkeep THOR does at a Stop (checking earlier
+writes against the conversation, filing reports, the crowding check, the evaluation ask) stops after 5
+seconds of its own time and finishes at the next Stop. The checks that refuse or protect are not part of
+that and always run. `doctor` shows how often it happened; nothing is needed from the person.
+
 **At the end of a turn it may hold you, but only for what you did yourself.**
 THOR asks for one small thing at a time and will not let the turn close until
 it is settled: a note you just stored onto a place too full to ever show it, the

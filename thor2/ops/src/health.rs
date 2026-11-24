@@ -578,6 +578,24 @@ fn code_integrity_blocks(_since_unix: i64) -> Vec<i64> {
     Vec::new()
 }
 
+/// How often a Stop ran out of its time for upkeep (`serve::stop_budget`). The
+/// steps it skipped are done at the next Stop, so this is information, not a
+/// fault; it says so, and names the step that was cut first at the latest one.
+/// Silent when it never happened.
+pub fn stop_budget_line(db: &Path) -> Option<String> {
+    let skips = serve::stop_budget::read(db);
+    if skips.count == 0 {
+        return None;
+    }
+    Some(format!(
+        "stop upkeep: {} Stop(s) ran out of their {} seconds and left the rest of the upkeep for the next one (last: {}, cut at '{}'); nothing is lost",
+        skips.count,
+        serve::stop_budget::STOP_UPKEEP_BUDGET.as_secs(),
+        serve::time::iso8601_from_unix(skips.last_at),
+        skips.last_step
+    ))
+}
+
 /// THE FAILURE NOBODY COULD REPORT. A hook Claude Code cannot start (Windows
 /// Smart App Control or an antivirus blocking `serve.exe`, a permission, the
 /// wrong shell) leaves a record in the session's transcript and nothing in
@@ -4178,6 +4196,8 @@ pub fn report(
     // `ship_line`'s own doc comment for why "never shipped" is not itself a
     // finding worth a permanent line.
     lines.extend(ship_line(db));
+    // Silent unless a Stop has ever run out of its upkeep time.
+    lines.extend(stop_budget_line(db));
     // Where the last off-site copy went, or that it is failing right now.
     lines.extend(backup_line(db));
     // Silent unless a temp-until-live or tools folder is named.
@@ -4445,6 +4465,17 @@ mod tests {
     use model::item::{Binding, Check, Item, Kind, TargetKind};
     use model::store;
     use thor_core::event_store::EventKind;
+
+    #[test]
+    fn the_stop_upkeep_line_is_silent_until_a_stop_runs_out_of_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        assert_eq!(stop_budget_line(&db), None);
+        let budget = serve::stop_budget::StopBudget::with_limit(std::time::Duration::ZERO);
+        assert!(!budget.allow(&db, "report validation", true));
+        let line = stop_budget_line(&db).expect("one Stop ran out of time");
+        assert!(line.contains("1 Stop(s)") && line.contains("report validation") && line.contains("nothing is lost"), "{line}");
+    }
 
     // ------------------------------------------------- one memory, two spellings
 
