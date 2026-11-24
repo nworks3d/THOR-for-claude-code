@@ -1005,7 +1005,20 @@ fn reachable_judgement_debt(store: &EventStore, project: &str, since_seq: i64) -
         })
         .map(|(_, _, id, ..)| id.as_str())
         .collect();
-    reached.len()
+    // A serving that recorded no place cannot be judged from another session, so
+    // it is no rot: only an item with a serving that holds a place counts.
+    reached
+        .into_iter()
+        .filter(|id| {
+            store.get_events_by_entity(id).unwrap_or_default().iter().any(|e| {
+                e.seq > since_seq
+                    && e.kind == EventKind::ItemServed
+                    && e.actor == crate::usefulness::ASSISTANT_DELIVERY_ACTOR
+                    && sessions.contains(e.session_id.as_str())
+                    && model::store::served_with_a_place(e)
+            })
+        })
+        .count()
 }
 
 /// Whether the newest validator record on the log says the transcript was in

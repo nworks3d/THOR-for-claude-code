@@ -304,7 +304,7 @@ fn declare_owed_items(store: &mut EventStore, n: usize, project: Option<&str>) -
         // these fixtures are about the judgement and evaluation debts.
         serve::teeth::fixture::decide(store, &id);
         for i in 0..AFTER {
-            serve::deliver::record_delivery(store, &serve::deliver::nth_session("fixture", i), "fixture", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &[id.clone()]);
+            serve::deliver::record_delivery_with_trigger(store, &serve::deliver::nth_session("fixture", i), "fixture", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &[id.clone()], Some("git push origin main"));
         }
         ids.push(id);
     }
@@ -1143,7 +1143,7 @@ fn on_max_rot_brings_the_ask_back_after_a_day() {
     // items are shown again in a session of the project after the report.
     let mut store = EventStore::open_existing(&db).unwrap();
     for id in &owed {
-        serve::deliver::record_delivery(&mut store, "after-report", "fixture", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-11-10T00:00:00Z", &[id.clone()]);
+        serve::deliver::record_delivery_with_trigger(&mut store, "after-report", "fixture", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-11-10T00:00:00Z", &[id.clone()], Some("git push origin main"));
     }
     drop(store);
     seed_session_work(&db, Some("thor-fixture"), "s1", 61);

@@ -976,7 +976,7 @@ fn six_owed_rules(fx: &mut Fx) {
 fn serve_in_sessions(fx: &mut Fx, id: &str, prefix: &str, n: usize) {
     for k in 0..n {
         let session = format!("{prefix}-{k}");
-        fx.store.append_event(&session, &session, model::store::ASSISTANT_DELIVERY_ACTOR, EventKind::ItemServed, id, None, "{}").unwrap();
+        fx.store.append_event(&session, &session, model::store::ASSISTANT_DELIVERY_ACTOR, EventKind::ItemServed, id, None, r#"{"served_at":"2026-11-17T10:00:00Z","trigger":"git push origin main"}"#).unwrap();
     }
 }
 

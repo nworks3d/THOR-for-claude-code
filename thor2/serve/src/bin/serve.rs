@@ -5893,7 +5893,7 @@ mod evaluation_debt_tests {
     fn serve_it(store: &mut EventStore, id: &str, times: usize) {
         for i in 0..times {
             let session = format!("s{i}");
-            deliver::record_delivery(store, &session, &session, usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-08-07T00:00:00Z", &[id.to_string()]);
+            deliver::record_delivery_with_trigger(store, &session, &session, usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-08-07T00:00:00Z", &[id.to_string()], Some("git push origin main"));
         }
     }
 

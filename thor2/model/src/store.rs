@@ -5456,6 +5456,15 @@ pub const FIRED_TRIGGER_CHARS: usize = 120;
 /// or a tool call the hook recorded no trigger for).
 pub const FIRED_WITHOUT_TRIGGER: &str = "(a prompt or a tool call with no command or file)";
 
+/// Whether a serving event records a place (a command, a file, a tool name or a
+/// prompt): one with none cannot be judged by a session that did not see it.
+pub fn served_with_a_place(event: &Event) -> bool {
+    serde_json::from_str::<crate::served::ItemServed>(&event.body)
+        .ok()
+        .and_then(|b| b.trigger)
+        .is_some_and(|t| !t.trim().is_empty())
+}
+
 /// `trigger` cut to `FIRED_TRIGGER_CHARS` characters: the part around the
 /// first of `anchors` it names (slashes compared alike, case ignored), else
 /// its start.
@@ -6365,6 +6374,24 @@ pub fn evaluation_judgement_candidates(
         }
         sessions_at_start.insert(id, counted);
     }
+    // An item that fired only in other sessions, and only at places the serving
+    // record holds nothing of, cannot be judged from this session: it is not
+    // put on the list until it fires somewhere a session can see.
+    let unseen: HashSet<String> = match project {
+        Some(p) => {
+            let elsewhere_only: Vec<String> = sessions_at_start
+                .iter()
+                .filter(|(id, sessions)| sessions.len() >= JUDGEMENT_DEBT_AFTER && !fired_here.contains(**id) && fired_in_project.contains(**id))
+                .map(|(id, _)| id.to_string())
+                .collect();
+            other_session_firings(store, session, p, &elsewhere_only, started_seq)
+                .into_iter()
+                .filter(|(_, f)| f.triggers.iter().all(|t| t == FIRED_WITHOUT_TRIGGER))
+                .map(|(id, _)| id)
+                .collect()
+        }
+        None => HashSet::new(),
+    };
     let skipped_at = skip_seqs(store, project, started_seq);
     let live_by_id: HashMap<&str, &Item> = live.iter().map(|(id, it)| (id.as_str(), it)).collect();
     // (fired in this session, filing seq of the newest counting report that
@@ -6372,7 +6399,9 @@ pub fn evaluation_judgement_candidates(
     let mut owed: Vec<(bool, Option<i64>, usize, String)> = sessions_at_start
         .iter()
         .filter(|(id, sessions)| {
-            sessions.len() >= JUDGEMENT_DEBT_AFTER && (fired_here.contains(**id) || fired_in_project.contains(**id))
+            sessions.len() >= JUDGEMENT_DEBT_AFTER
+                && (fired_here.contains(**id) || fired_in_project.contains(**id))
+                && !unseen.contains(**id)
         })
         .filter_map(|(id, sessions)| {
             let item = live_by_id.get(id)?;
@@ -12164,6 +12193,16 @@ mod tests {
         }
     }
 
+    /// `serve_in` with a place recorded on each serving, so another session's
+    /// firing can be judged from the list.
+    fn serve_in_at_a_place(store: &mut EventStore, session: &str, id: &str, n: usize) {
+        for i in 0..n {
+            let this = if i == 0 { session.to_string() } else { format!("{session}-{i}") };
+            let body = r#"{"served_at":"2026-11-17T10:00:00Z","trigger":"git push origin main"}"#;
+            store.append_event(&this, session, ASSISTANT_DELIVERY_ACTOR, EventKind::ItemServed, id, None, body).unwrap();
+        }
+    }
+
     /// FILE `report` THE WAY THE TOOL SERVER DOES (step 15), in one go:
     /// session "s" starts an evaluation of the report's project right now
     /// (`record_start`: the start record, then the batch record with the
@@ -12387,7 +12426,7 @@ mod tests {
         declare_noted(&mut store, &global);
         declare_noted(&mut store, &light_command_rule("only-q", "q"));
         serve_in(&mut store, "q-session", "only-q", 1);
-        serve_in(&mut store, "q-session", "everywhere", JUDGEMENT_DEBT_AFTER);
+        serve_in_at_a_place(&mut store, "q-session", "everywhere", JUDGEMENT_DEBT_AFTER);
         assert_eq!(evaluation_judgement_list(&store, Some("w"), "this-session", i64::MAX), Vec::<String>::new());
         let start = record_start(&mut store, "this-session", "w");
         file_in(&mut store, &eval_report("eval-w-1", "w"), &start).expect("nothing of project w is owed");
@@ -12408,7 +12447,7 @@ mod tests {
         }
         for n in 0..4 {
             declare_noted(&mut store, &light_command_rule(&format!("theirs-{n}"), "pr"));
-            serve_in(&mut store, "t", &format!("theirs-{n}"), JUDGEMENT_DEBT_AFTER + 5 + n);
+            serve_in_at_a_place(&mut store, "t", &format!("theirs-{n}"), JUDGEMENT_DEBT_AFTER + 5 + n);
         }
         let list = evaluation_judgement_list(&store, Some("pr"), "s", i64::MAX);
         assert_eq!(list, ["mine-0", "mine-1", "mine-2", "theirs-3", "theirs-2"], "{list:?}");

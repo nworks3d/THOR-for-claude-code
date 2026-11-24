@@ -341,6 +341,21 @@ fn debt_nobody_can_be_handed_is_not_rot() {
     serve_to(&mut store, "elsewhere-1", "fx-anchor");
     assert_eq!(
         crate::eval_filing::project_rot(&store, "fxp"),
+        None,
+        "fired in a session of the project but at no recorded place: nobody can judge it, so not rot"
+    );
+    let at = crate::time::iso8601_from_unix(crate::time::now_unix());
+    crate::deliver::record_delivery_with_trigger(
+        &mut store,
+        "elsewhere-1",
+        "elsewhere-1",
+        ASSISTANT_DELIVERY_ACTOR,
+        &at,
+        &["fx-global".to_string()],
+        Some("git push origin main"),
+    );
+    assert_eq!(
+        crate::eval_filing::project_rot(&store, "fxp"),
         Some("1 item(s) owe a verdict".to_string()),
         "fired in a session of the project since the evaluation: an evaluation can be handed it"
     );

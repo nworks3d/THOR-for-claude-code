@@ -116,7 +116,7 @@ fn fired_rule(store: &mut EventStore, id: &str, project: &str, session: &str, n:
     };
     model::store::declare(store, "fixture", "fixture", "fixture", &item).unwrap();
     for i in 0..n {
-        serve::deliver::record_delivery(store, &serve::deliver::nth_session(session, i), session, serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-26T00:00:00Z", &[id.to_string()]);
+        serve::deliver::record_delivery_with_trigger(store, &serve::deliver::nth_session(session, i), session, serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-26T00:00:00Z", &[id.to_string()], Some("git push origin main"));
     }
 }
 
