@@ -24,6 +24,22 @@ pub fn select(candidates: &[LiveItem], project: Option<&str>) -> Vec<RankedItem>
         .iter()
         .filter(|c| c.item.kind.can_fire())
         .filter(|c| c.item.bindings.iter().any(|b| matches!(b, Binding::Always)))
+        // An overflow pin is not in this block: the first prompt delivers it (`select_overflow`).
+        .filter(|c| !model::store::is_overflow_pin(&c.item))
+        .filter(|c| crate::project::applies_to(c.item.project.as_deref(), project))
+        .map(|c| RankedItem { id: c.id.clone(), item: c.item.clone() })
+        .collect()
+}
+
+/// The overflow pins that apply in `project` (its own and the global ones): pinned notes written on
+/// the owner's own go because the session start block was full. Delivered whole at the first
+/// prompt of each context, within `model::item::HOOK_OUTPUT_LIMIT_BYTES`.
+pub fn select_overflow(candidates: &[LiveItem], project: Option<&str>) -> Vec<RankedItem> {
+    candidates
+        .iter()
+        .filter(|c| c.item.kind.can_fire())
+        .filter(|c| c.item.bindings.iter().any(|b| matches!(b, Binding::Always)))
+        .filter(|c| model::store::is_overflow_pin(&c.item))
         .filter(|c| crate::project::applies_to(c.item.project.as_deref(), project))
         .map(|c| RankedItem { id: c.id.clone(), item: c.item.clone() })
         .collect()

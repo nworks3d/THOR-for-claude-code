@@ -1403,14 +1403,33 @@ that block like any other place. A `remember` or `revise` that adds `Always`, a
 `pin`, or a pinned note made longer is refused when the block of that project
 (its own pinned notes plus the global ones; a global write is judged in every
 project) would no longer fit, and nothing is stored. The refusal names the
-largest pinned notes and the same three exits: fold two that say the same, bind
-one to the command, file, tool or moment it is really about and unpin it, or
-retract a stale one with a reason. An unpin, a retract or a shorter note is
-never refused, so those exits always work, also in a memory that already
-overflows. A memory that already overflows lists the pinned notes that do not
-fit under "Crowded places" in the evaluation, first, and the report is held
-until the block fits again. Never answer it by storing the note as a Report:
-a Report never fires.
+largest pinned notes and the steps, in this order: fold pinned notes that say
+the same, unpin or retract those that no longer carry anything, and if none can
+go, ask the owner. An unpin, a retract or a shorter note is never refused, so
+those exits always work, also in a memory that already overflows. A memory that
+already overflows lists the pinned notes that do not fit under "Crowded
+places" in the evaluation, first, and the report is held until the block fits
+again. Never answer it by storing the note as a Report: a Report never fires.
+
+The start block is only for rules that hold in EVERY conversation (how long
+answers are, how sessions and helpers work together). A rule about one specific
+place or subject binds to its file, command or moment and arrives when it is
+needed. So a `remember`, `revise` or `pin` that ADDS `Always` to a rule that
+also names a place (a path, directory, command, symbol, route or host) is
+refused, with nothing written. The way out is `because`: one sentence of at
+least 20 characters saying why this rule must hold in every conversation. The
+pin is then written, the reason stays in the note's history, and doctor lists
+every pin kept this way. Pins that already stand are not touched.
+
+The way out of a full block is the owner's own go. Put his whole message,
+between double quotes, in `because` (his message, or yours right before it,
+must name the note's id; THOR checks it against what he typed in this session,
+the same check an unpin on his words uses). The note is then written as an
+OVERFLOW pin: it is not in the session start block, which keeps its byte limit,
+but is delivered whole at the first prompt of each conversation, once, within a
+second budget of the same size. A pin that would not fit there either is
+refused with the same text. Doctor's `pinned:` lines name the overflow pins per
+project, and its `pinned exceptions:` lines list every pin kept this way.
 
 **The owner's go is his to type.** A rule that needs the owner's explicit go
 (tagged `owner-approval`) is answered only by his own message, this turn or

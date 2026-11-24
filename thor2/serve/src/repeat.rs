@@ -180,6 +180,23 @@ fn without_near_duplicates(all: &[RankedItem]) -> Vec<&RankedItem> {
     kept.into_iter().map(|(item, _)| item).collect()
 }
 
+/// The items of `all` this context has not been shown in full yet (no near-duplicate merging, no
+/// cap: overflow pins are delivered whole).
+pub fn unseen(db: &Path, key: &str, all: &[RankedItem]) -> Vec<RankedItem> {
+    let seen = read(db, key);
+    all.iter().filter(|item| !seen.seen.contains(&item.id)).cloned().collect()
+}
+
+/// Count `ids` as shown in full to this context.
+pub fn mark_seen(db: &Path, key: &str, ids: &[String]) {
+    if ids.is_empty() {
+        return;
+    }
+    let mut seen = read(db, key);
+    seen.seen.extend(ids.iter().cloned());
+    write(db, key, &seen);
+}
+
 /// Decide what one block shows this context, and count it. `all` is the ranked
 /// list the block would have been made from; `record` is false for a run that
 /// must leave no trace (the counts are then read but not written).

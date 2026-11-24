@@ -78,8 +78,8 @@ fn every_injection_surface_caller_applies_retain_live() {
     assert_eq!(lib_rs.matches("decay::retain_live").count(), 2, "serve() and serve_prompt() must both apply decay");
     assert_eq!(
         bin_serve_rs.matches("decay::retain_live").count(),
-        4,
-        "the hook channel's SessionStart and UserPromptSubmit branches, cmd_session_start and \
+        5,
+        "the hook channel's SessionStart and UserPromptSubmit branches (the prompt one twice: its overflow pins too), cmd_session_start and \
          cmd_prompt must all apply decay (the PreToolUse branch and cmd_check/cmd_why go through \
          serve::serve, which already does)"
     );

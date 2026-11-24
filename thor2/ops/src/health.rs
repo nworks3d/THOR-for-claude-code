@@ -3314,12 +3314,45 @@ pub fn pinned_block_lines(db: &Path) -> Vec<String> {
             let whose = block.project.as_deref().map_or("global notes only".to_string(), |p| format!("project '{p}'"));
             let largest = block.largest.iter().map(|(id, bytes)| format!("{id} ({bytes} bytes)")).collect::<Vec<_>>().join(", ");
             let state = if block.used > block.limit { "OVER the limit - a session start cuts the rest" } else { "fits" };
+            let overflow = if block.overflow.is_empty() {
+                String::new()
+            } else {
+                let named = block.overflow.iter().map(|(id, bytes)| format!("{id} ({bytes} bytes)")).collect::<Vec<_>>().join(", ");
+                format!("; overflow pins (not in the block, delivered whole at the first prompt): {named}")
+            };
             format!(
-                "pinned: start block of {whose}: {} of {} bytes used by {} pinned note(s), {state}; largest: {largest}",
+                "pinned: start block of {whose}: {} of {} bytes used by {} pinned note(s), {state}; largest: {largest}{overflow}",
                 block.used, block.limit, block.count
             )
         })
         .collect()
+}
+
+/// THE PINS KEPT AS EXCEPTIONS (owner's decision, 2026-11-24): every pin bound to a place that was
+/// kept with a reason ("must hold in every conversation"), and every overflow pin (written on the
+/// owner's own go). The reasons are in each note's history. Silent when there are none.
+pub fn pin_exception_lines(db: &Path) -> Vec<String> {
+    let Ok(store) = EventStore::open_existing(db) else { return Vec::new() };
+    let (place, overflow) = model::store::pin_exceptions(&store);
+    let named = |list: &[(String, Option<String>)]| {
+        list.iter().map(|(id, project)| format!("{id} [{}]", project.as_deref().unwrap_or("global"))).collect::<Vec<_>>().join(", ")
+    };
+    let mut lines = Vec::new();
+    if !place.is_empty() {
+        lines.push(format!(
+            "pinned exceptions: {} pin(s) bound to a place were kept with a reason that they must hold in every conversation (the reason is in each note's history): {}",
+            place.len(),
+            named(&place)
+        ));
+    }
+    if !overflow.is_empty() {
+        lines.push(format!(
+            "pinned exceptions: {} overflow pin(s) written on the owner's own go, delivered whole at the first prompt of each conversation instead of the session start block: {}",
+            overflow.len(),
+            named(&overflow)
+        ));
+    }
+    lines
 }
 
 /// The one definition of "this check can refuse something", shared by
@@ -4158,6 +4191,7 @@ pub fn report(
         pinned_line(db),
     ]);
     lines.extend(pinned_block_lines(db));
+    lines.extend(pin_exception_lines(db));
     lines.extend([
         decay_line(db, checkouts, full),
         crowding_line(db, checkouts, full),
@@ -4241,6 +4275,7 @@ pub fn eval_report(
         pinned_line(db),
     ]);
     lines.extend(pinned_block_lines(db));
+    lines.extend(pin_exception_lines(db));
     lines.extend([decay_line(db, checkouts, full), crowding_line(db, checkouts, full)]);
     lines.extend(false_block_sweep_lines(db));
     lines.extend(judgement_debt_line(db, checkout_project, full));
@@ -7258,6 +7293,39 @@ mod tests {
         let at = |id: &str| line.find(id).unwrap_or(usize::MAX);
         assert!(at("pin-b") < at("pin-d") && at("pin-d") < at("pin-c"), "biggest first: {line}");
         assert!(!line.contains("pin-a"), "only the three largest: {line}");
+    }
+
+    #[test]
+    fn doctor_names_the_overflow_pins_per_project_and_lists_the_pins_kept_as_exceptions() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut s = EventStore::new(&db).unwrap();
+            let mut inblock = rule("in-block");
+            inblock.text = "Keep every answer short and plain.".to_string();
+            inblock.project = Some("fixture-project".to_string());
+            store::declare(&mut s, "s", "l", "a", &inblock).unwrap();
+            let mut overflow = rule("over-1");
+            overflow.text = "Answer in the language the owner writes in.".to_string();
+            overflow.project = Some("fixture-project".to_string());
+            overflow.tags = vec![model::store::OVERFLOW_PIN_TAG.to_string()];
+            store::declare(&mut s, "s", "l", "a", &overflow).unwrap();
+            let mut place = rule("place-1");
+            place.text = "Quote the ticket number in every commit message.".to_string();
+            place.project = Some("fixture-project".to_string());
+            place.tags = vec![model::store::PIN_PLACE_REASON_TAG.to_string()];
+            store::declare(&mut s, "s", "l", "a", &place).unwrap();
+        }
+        let lines = pinned_block_lines(&db);
+        let line = lines.iter().find(|l| l.contains("'fixture-project'")).expect("a line for the project");
+        assert!(line.contains("by 2 pinned note(s)"), "the overflow pin is not counted in the block: {line}");
+        assert!(line.contains("overflow pins (not in the block, delivered whole at the first prompt): over-1 ("), "{line}");
+        let kept = pin_exception_lines(&db).join("\n");
+        assert!(kept.contains("1 pin(s) bound to a place were kept with a reason") && kept.contains("place-1 [fixture-project]"), "{kept}");
+        assert!(kept.contains("1 overflow pin(s) written on the owner's own go") && kept.contains("over-1 [fixture-project]"), "{kept}");
+        let none = dir.path().join("empty.db");
+        drop(EventStore::new(&none).unwrap());
+        assert!(pin_exception_lines(&none).is_empty(), "silent when there are none");
     }
 
     #[test]
