@@ -146,8 +146,9 @@ fn eval_prints_only_the_lines_the_routine_asks_for_and_each_is_the_full_reports_
     // Every line of it, bar the footer, is a line of the full report - the same
     // computation, not a second one - and in the same order.
     let full_set: HashSet<&str> = full.iter().map(String::as_str).collect();
-    let body = &eval[..eval.len() - 1];
-    for line in body {
+    // (the short form's own "and N more ... line(s)" notes aside)
+    let body: Vec<String> = eval[..eval.len() - 1].iter().filter(|l| !l.starts_with("  and ") || !l.contains("--eval --full")).cloned().collect();
+    for line in &body {
         assert!(full_set.contains(line.as_str()), "--eval line is not in the full report: {line}");
     }
     let positions: Vec<usize> = body.iter().map(|l| full.iter().position(|f| f == l).unwrap()).collect();

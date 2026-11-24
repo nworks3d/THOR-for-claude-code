@@ -4156,6 +4156,9 @@ pub fn report(
         gate_line(db),
         teeth_line(db, full),
         pinned_line(db),
+    ]);
+    lines.extend(pinned_block_lines(db));
+    lines.extend([
         decay_line(db, checkouts, full),
         crowding_line(db, checkouts, full),
         unjudged_line(db),
@@ -4165,7 +4168,6 @@ pub fn report(
     lines.extend(working_copy_lines(db));
     // Silent unless standing rules do not fit at a session start somewhere.
     lines.extend(standing_rules_overflow_lines(db, full));
-    lines.extend(pinned_block_lines(db));
     // Silent unless two project names differ only in case, spaces or hyphens.
     lines.extend(split_scope_lines(db));
     // Silent unless a real refusal is on the log.
