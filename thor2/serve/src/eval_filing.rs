@@ -799,9 +799,20 @@ pub fn note_tool_server_build(db: &Path, session: &str, started: i64, renderer: 
 
 /// The (renderer, filing format) the tool server of `session` recorded, if it did.
 pub fn tool_server_build(db: &Path, session: &str) -> Option<(u32, u32)> {
-    let all: Vec<Value> = serde_json::from_str(&std::fs::read_to_string(db.with_file_name(BUILDS_FILE)).ok()?).ok()?;
-    let entry = all.iter().rev().find(|e| e.get("session").and_then(Value::as_str) == Some(session))?;
+    let entry = tool_server_entry(db, session)?;
     Some((entry.get("renderer")?.as_u64()? as u32, entry.get("filing")?.as_u64()? as u32))
+}
+
+/// The unix time the tool server of `session` says it started (it records itself again at
+/// every start or resume, so this is the running server's own start). `None` when nothing
+/// usable is recorded.
+pub fn tool_server_started(db: &Path, session: &str) -> Option<i64> {
+    tool_server_entry(db, session)?.get("started")?.as_i64().filter(|started| *started > 0)
+}
+
+fn tool_server_entry(db: &Path, session: &str) -> Option<Value> {
+    let all: Vec<Value> = serde_json::from_str(&std::fs::read_to_string(db.with_file_name(BUILDS_FILE)).ok()?).ok()?;
+    all.into_iter().rev().find(|e| e.get("session").and_then(Value::as_str) == Some(session))
 }
 
 /// A session whose tool server is an older build than the installed one, and what that means.
@@ -827,8 +838,12 @@ pub struct ServerGap {
 /// transcript is missing or records no start, or when the session started after the install.
 pub fn tool_server_stale(session: &str, root: Option<&Path>, mcp_exe: Option<&Path>, db: Option<&Path>) -> Option<ServerGap> {
     let installed = installed_unix_of(mcp_exe?)?;
-    let files = attest::session_transcripts(root?, session);
-    let started = last_session_start(&files)?;
+    // The running tool server's own start (it records itself at every start or resume) counts
+    // as well as the transcript's last start record: a resumed session whose transcript has no
+    // resume record is judged by the build it actually runs.
+    let from_transcript = root.and_then(|root| last_session_start(&attest::session_transcripts(root, session)));
+    let reported = db.and_then(|db| tool_server_started(db, session));
+    let started = from_transcript.max(reported)?;
     if started >= installed {
         return None;
     }
