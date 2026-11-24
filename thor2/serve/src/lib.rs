@@ -152,6 +152,7 @@ pub mod stale_guard;
 pub mod status;
 pub mod store_dir;
 pub mod route_probe;
+pub mod script_routes;
 pub mod sweep;
 pub mod teeth;
 pub mod test_signal;

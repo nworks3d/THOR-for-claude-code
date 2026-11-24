@@ -241,7 +241,7 @@ pub fn within<T: Send + 'static>(limit: Duration, work: impl FnOnce() -> T + Sen
 /// The text of the first bytes of a file the way an editor wrote it: UTF-8
 /// with or without a byte-order mark, or UTF-16 with one (what a PowerShell
 /// redirect writes).
-fn decode_text(bytes: &[u8]) -> String {
+pub(crate) fn decode_text(bytes: &[u8]) -> String {
     let utf16 = |rest: &[u8], to_unit: fn([u8; 2]) -> u16| {
         // A trailing odd byte, from a read cut in the middle of a letter, is dropped.
         let units: Vec<u16> = rest.chunks(2).filter(|pair| pair.len() == 2).map(|pair| to_unit([pair[0], pair[1]])).collect();

@@ -239,6 +239,7 @@ mod tests {
                 falsifier: None,
                 check: None,
             },
+            via: None,
         }
     }
 

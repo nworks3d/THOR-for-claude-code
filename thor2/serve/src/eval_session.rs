@@ -2068,7 +2068,7 @@ fn crowded_section(out: &mut String, record: &str, frozen: &Frozen, caps: &Caps)
          lost its place there is silent exactly when it was written for. WHAT TO DO, per place: read its facts \
          (mcp__thor__get) and do one of three things until it holds {max} or fewer: FOLD - mcp__thor__revise one fact \
          to carry another's point, then mcp__thor__retract the other with a reason naming the survivor; MOVE - \
-         mcp__thor__revise one fact's bindings to the narrower file or command it is really about; RETRACT - \
+         mcp__thor__revise one fact's bindings to the narrower file, command or host it is really about; RETRACT - \
          mcp__thor__retract one that is stale, with a reason. A fact with no check gives way before a rule whose check \
          can refuse; never clear a check that is true. A place where every fact is a heavier refusing rule is not \
          listed. DONE WHEN: the place holds {max} or fewer facts; a tag, a reason or a line in the report settles \

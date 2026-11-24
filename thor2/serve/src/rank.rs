@@ -22,6 +22,11 @@ use std::sync::OnceLock;
 pub struct RankedItem {
     pub id: String,
     pub item: Item,
+    /// Set when the fact applies ONLY through a script the call runs (a host or
+    /// a tool name the script file holds, never the command line): the script
+    /// and what it names, as `run.ps1 names 127.0.0.1:27182`. `None` for a fact
+    /// the call itself reaches.
+    pub via: Option<String>,
 }
 
 /// Moved to `model::item` so the write gate can rank a candidate against its
@@ -82,6 +87,32 @@ pub use model::normalize::target_matches;
 /// `target_matches` let a project-scoped, repo-relative anchor reach a file
 /// far outside the project (measured 2026-09-08).
 fn binding_matches(binding: &Binding, input: &ServeInput, item_project: Option<&str>, commands: &[Vec<Segment>]) -> bool {
+    binding_matches_directly(binding, input, item_project, commands) || route_of(binding, input).is_some()
+}
+
+/// The script (and the literal it names) through which `binding` is reached
+/// when the call itself does not reach it: a Host binding equal to a host the
+/// script holds, or a Command binding naming an MCP tool whose last part
+/// (8+ characters, with an underscore) the script holds as a word. `None`
+/// whenever the input carries no routes, which is every input but the hook's.
+pub fn route_of<'a>(binding: &Binding, input: &'a ServeInput) -> Option<(&'a crate::script_routes::RouteTargets, String)> {
+    if input.routes.is_empty() {
+        return None;
+    }
+    match binding {
+        Binding::Target { kind: TargetKind::Host, value } => input.routes.iter().find_map(|route| {
+            route.hosts.iter().find(|h| target_matches(TargetKind::Host, value, TargetKind::Host, h)).map(|h| (route, h.clone()))
+        }),
+        Binding::Target { kind: TargetKind::Command, value } => {
+            let suffix = crate::script_routes::tool_suffix(value)?;
+            input.routes.iter().find(|route| crate::script_routes::words_reach_tool(&route.words, value)).map(|route| (route, suffix))
+        }
+        _ => None,
+    }
+}
+
+/// [`binding_matches`] without the routes: what the call itself reaches.
+fn binding_matches_directly(binding: &Binding, input: &ServeInput, item_project: Option<&str>, commands: &[Vec<Segment>]) -> bool {
     match binding {
         Binding::Always => false,
         Binding::Moment(action) => input.moments.contains(action),
@@ -154,7 +185,42 @@ pub fn places_of_trigger(item: &Item, trigger: &str) -> Vec<String> {
     let mut input = ServeInput::default();
     input.add_command(trigger);
     input.add_file(trigger);
+    // A serving that reached the item through a script's content was recorded
+    // as `<command> (via <script>, names <literal>)`: read the route back.
+    if let Some(route) = route_in_trigger(trigger) {
+        input.routes.push(route);
+    }
     matched_places(item, &input)
+}
+
+/// The marker a route serving's trigger carries (`record_route_trigger`).
+const VIA_MARK: &str = " (via ";
+
+/// The trigger a fact reached through a script is recorded with: the command
+/// as typed, then which script and what it names.
+pub fn route_trigger(command: &str, via: &str) -> String {
+    // The command is cut first so the route, which comes last, always survives
+    // the length limit a recorded trigger is held to.
+    let command: String = if command.chars().count() > 240 { format!("{}...", command.chars().take(240).collect::<String>()) } else { command.to_string() };
+    let command = command.as_str();
+    match via.split_once(" names ") {
+        Some((script, literal)) => format!("{command}{VIA_MARK}{script}, names {literal})"),
+        None => format!("{command}{VIA_MARK}{via})"),
+    }
+}
+
+/// The route a trigger written by [`route_trigger`] names: the literal is
+/// offered as a host and as a tool-name word, and each only matches a binding
+/// of its own kind.
+fn route_in_trigger(trigger: &str) -> Option<crate::script_routes::RouteTargets> {
+    let (_, tail) = trigger.rsplit_once(VIA_MARK)?;
+    let tail = tail.strip_suffix(')')?;
+    let (script, literal) = tail.split_once(", names ")?;
+    Some(crate::script_routes::RouteTargets {
+        script: script.to_string(),
+        hosts: vec![literal.to_string()],
+        words: vec![literal.to_lowercase()],
+    })
 }
 
 /// The place label for a place a marker NAMED: one of `item`'s own places, given
@@ -267,16 +333,29 @@ pub fn select(candidates: &[LiveItem], input: &ServeInput) -> Vec<RankedItem> {
         .filter(|c| crate::project::applies_to(c.item.project.as_deref(), input.project.as_deref()))
         .filter(|c| c.item.bindings.iter().any(|b| binding_matches(b, input, c.item.project.as_deref(), &commands)))
         .filter(|c| !skipped_on_a_read_only_call(c, input, &commands))
-        .map(|c| RankedItem { id: c.id.clone(), item: c.item.clone() })
+        .map(|c| {
+            // Reached only through a script's content: say through which.
+            let direct = c.item.bindings.iter().any(|b| binding_matches_directly(b, input, c.item.project.as_deref(), &commands));
+            let via = if direct {
+                None
+            } else {
+                c.item.bindings.iter().find_map(|b| route_of(b, input)).map(|(route, literal)| format!("{} names {literal}", route.script))
+            };
+            RankedItem { id: c.id.clone(), item: c.item.clone(), via }
+        })
         .collect();
 
     hits.sort_by(|a, b| {
-        // 1. IRREVERSIBLE KEEPS THE TOP BAND, always. Nothing lighter may
-        //    displace a warning about something that cannot be undone, whatever
-        //    else is true of it. This band is what makes the rest of this
-        //    ordering safe to change at all.
-        irreversible(&a.item)
-            .cmp(&irreversible(&b.item))
+        // 0. A FACT REACHED ONLY THROUGH A SCRIPT COMES AFTER EVERY FACT THE CALL
+        //    ITSELF REACHES. The route is an inference, so it never takes a
+        //    direct fact's place, whatever its weight.
+        a.via.is_some()
+            .cmp(&b.via.is_some())
+            // 1. IRREVERSIBLE KEEPS THE TOP BAND, always. Nothing lighter may
+            //    displace a warning about something that cannot be undone, whatever
+            //    else is true of it. This band is what makes the rest of this
+            //    ordering safe to change at all.
+            .then_with(|| irreversible(&a.item).cmp(&irreversible(&b.item)))
             // 2. THEN THE ONE ANCHORED AT WHAT YOU ARE TOUCHING. Measured on
             //    the owner's store, 2026-08-09: opening the busiest file in it
             //    showed four general warnings about deploying and none of the
@@ -384,6 +463,7 @@ mod tests {
             root: None,
             shell_call: false,
             dialect: Default::default(),
+            routes: vec![],
         }
     }
 
@@ -406,6 +486,7 @@ mod tests {
             root: None,
             shell_call: false,
             dialect: Default::default(),
+            routes: vec![],
         }
     }
 
@@ -599,6 +680,7 @@ mod tests {
             root: None,
             shell_call: false,
             dialect: Default::default(),
+            routes: vec![],
         };
         assert!(select(&[c.clone_for_test()], &miss).is_empty());
         let hit = ServeInput {
@@ -611,6 +693,7 @@ mod tests {
             root: None,
             shell_call: false,
             dialect: Default::default(),
+            routes: vec![],
         };
         assert_eq!(select(&[c], &hit).len(), 1);
     }
@@ -635,6 +718,7 @@ mod tests {
             root: None,
             shell_call: false,
             dialect: Default::default(),
+            routes: vec![],
         };
         assert_eq!(select(&[c], &input).len(), 1);
     }
@@ -658,6 +742,7 @@ mod tests {
             root: None,
             shell_call: false,
             dialect: Default::default(),
+            routes: vec![],
         };
         assert_eq!(select(&[c], &input).len(), 1);
     }
@@ -683,6 +768,7 @@ mod tests {
             root: None,
             shell_call: false,
             dialect: Default::default(),
+            routes: vec![],
         };
         assert_eq!(select(&[c.clone_for_test()], &with_args).len(), 1, "the arguments are the normal case");
 
@@ -699,6 +785,7 @@ mod tests {
                 root: None,
                 shell_call: false,
                 dialect: Default::default(),
+                routes: vec![],
             };
             assert!(select(&[c.clone_for_test()], &input).is_empty(), "must not fire on: {miss}");
         }
@@ -722,6 +809,7 @@ mod tests {
             root: None,
             shell_call: false,
             dialect: Default::default(),
+            routes: vec![],
         };
         for hit in [
             "cd repo && gh repo edit acme/x --visibility public",
@@ -749,6 +837,7 @@ mod tests {
             root: None,
             shell_call: false,
             dialect: Default::default(),
+            routes: vec![],
         };
         assert!(select(&[c], &input).is_empty(), "a Command binding must not answer a Path target");
     }
@@ -804,6 +893,7 @@ mod tests {
             root: None,
             shell_call: false,
             dialect: Default::default(),
+            routes: vec![],
         };
         let hits = select(&[generic, specific], &input);
         assert_eq!(hits[0].id, "s", "the item naming the real command/path must rank first");
@@ -1097,5 +1187,137 @@ mod tests {
         input.add_tool_name("Grep");
         input.add_target(TargetKind::Path, "src/lib.rs");
         assert_eq!(ids(select(&facts, &input)), vec!["anchored"]);
+    }
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+    use crate::script_routes::RouteTargets;
+
+    fn fact(id: &str, binding: Binding) -> LiveItem {
+        LiveItem {
+            id: id.to_string(),
+            item: Item {
+                id: id.to_string(),
+                kind: Kind::Orientation,
+                text: format!("fact {id}"),
+                bindings: vec![binding],
+                severity: None,
+                project: None,
+                tags: vec![],
+                expires: None,
+                key: None,
+                falsifier: None,
+                check: None,
+            },
+        }
+    }
+
+    fn host(value: &str) -> Binding {
+        Binding::Target { kind: TargetKind::Host, value: value.to_string() }
+    }
+
+    fn command(value: &str) -> Binding {
+        Binding::Target { kind: TargetKind::Command, value: value.to_string() }
+    }
+
+    fn script_call(hosts: &[&str], words: &[&str]) -> ServeInput {
+        let mut input = ServeInput::default();
+        input.add_command("powershell -File run.ps1");
+        input.routes = vec![RouteTargets {
+            script: "run.ps1".to_string(),
+            hosts: hosts.iter().map(|h| h.to_string()).collect(),
+            words: words.iter().map(|w| w.to_string()).collect(),
+        }];
+        input
+    }
+
+    #[test]
+    fn a_host_binding_is_reached_by_a_route_host_and_by_host_and_port_exactly() {
+        let candidates = vec![
+            fact("bare", host("127.0.0.1")),
+            fact("port", host("127.0.0.1:27182")),
+            fact("other-port", host("127.0.0.1:9999")),
+            fact("elsewhere", host("10.1.1.1")),
+        ];
+        let hits = select(&candidates, &script_call(&["127.0.0.1", "127.0.0.1:27182"], &[]));
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(ids, vec!["bare", "port"], "{ids:?}");
+        assert!(hits.iter().all(|h| h.via.is_some()));
+        assert_eq!(hits[0].via.as_deref(), Some("run.ps1 names 127.0.0.1"));
+        assert_eq!(hits[1].via.as_deref(), Some("run.ps1 names 127.0.0.1:27182"), "a port binding is equalled only by the same host and port");
+    }
+
+    #[test]
+    fn a_tool_binding_is_reached_by_the_tool_suffix_and_by_no_shorter_one() {
+        let candidates = vec![
+            fact("fusion", command("mcp__Autodesk_Fusion__fusion_mcp_execute")),
+            fact("short", command("mcp__Autodesk_Fusion__execute")),
+            fact("other", command("mcp__Autodesk_Fusion__fusion_mcp_other")),
+        ];
+        let hits = select(&candidates, &script_call(&[], &["fusion_mcp_execute", "execute"]));
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(ids, vec!["fusion"], "{ids:?}");
+        assert_eq!(hits[0].via.as_deref(), Some("run.ps1 names fusion_mcp_execute"));
+    }
+
+    #[test]
+    fn a_direct_hit_has_no_via_and_comes_before_a_route_only_fact() {
+        let mut direct = fact("direct", host("127.0.0.1:27182"));
+        direct.item.bindings.push(Binding::Moment(intent::Action::Configure));
+        let mut heavy = fact("heavy-route", host("127.0.0.1:27182"));
+        heavy.item.severity = Some(Severity::Irreversible);
+        let mut input = script_call(&["127.0.0.1:27182"], &[]);
+        input.moments.push(intent::Action::Configure);
+        let hits = select(&[heavy, direct], &input);
+        assert_eq!(hits[0].id, "direct");
+        assert_eq!(hits[0].via, None);
+        assert_eq!(hits[1].id, "heavy-route", "an irreversible route fact still comes after a direct fact");
+        assert!(hits[1].via.is_some());
+    }
+
+    #[test]
+    fn without_routes_nothing_changes() {
+        let candidates = vec![fact("port", host("127.0.0.1:27182"))];
+        let mut input = ServeInput::default();
+        input.add_command("powershell -File run.ps1");
+        assert!(select(&candidates, &input).is_empty());
+    }
+
+    #[test]
+    fn a_route_place_is_named_for_a_mark_and_read_back_from_its_trigger() {
+        let item = fact("port", host("127.0.0.1:27182")).item;
+        let input = script_call(&["127.0.0.1:27182"], &[]);
+        assert_eq!(matched_places(&item, &input), vec![binding_place(&item.bindings[0]).unwrap()]);
+        let trigger = route_trigger("powershell -File run.ps1", "run.ps1 names 127.0.0.1:27182");
+        assert_eq!(trigger, "powershell -File run.ps1 (via run.ps1, names 127.0.0.1:27182)");
+        assert_eq!(places_of_trigger(&item, &trigger), vec![binding_place(&item.bindings[0]).unwrap()]);
+        assert!(resolve_place(&item, "127.0.0.1:27182").is_ok(), "a mark can name the host place");
+        let tool = fact("tool", command("mcp__A__fusion_mcp_execute")).item;
+        let trigger = route_trigger("bash x.sh", "x.sh names fusion_mcp_execute");
+        assert_eq!(places_of_trigger(&tool, &trigger), vec![binding_place(&tool.bindings[0]).unwrap()]);
+    }
+
+    #[test]
+    fn a_long_command_never_cuts_the_route_off_a_recorded_trigger() {
+        let long = format!("bash {}", "x".repeat(900));
+        let trigger = route_trigger(&long, "x.sh names 10.0.0.1:80");
+        assert!(trigger.chars().count() < crate::deliver::TRIGGER_LIMIT, "{}", trigger.chars().count());
+        assert!(trigger.ends_with("(via x.sh, names 10.0.0.1:80)"));
+    }
+
+    /// THE SILENT FAILURE: a call that names no host never makes the host rules
+    /// candidates, unless the pool asks for the Host kind because a script
+    /// holds one.
+    #[test]
+    fn the_candidate_pool_asks_for_hosts_when_only_a_script_holds_one() {
+        let mut input = ServeInput::default();
+        input.add_command("powershell -File run.ps1");
+        let (_, without) = crate::live::candidate_pool_key(&input);
+        assert!(!without.iter().any(|k| k == "host"), "{without:?}");
+        input.routes = vec![RouteTargets { script: "run.ps1".to_string(), hosts: vec!["127.0.0.1:27182".to_string()], words: vec![] }];
+        let (_, with) = crate::live::candidate_pool_key(&input);
+        assert!(with.iter().any(|k| k == "host"), "{with:?}");
     }
 }

@@ -91,7 +91,13 @@ pub struct Selection {
     /// The ids of what the cut withheld, in rank order, so the block can name
     /// them (step 29) instead of pointing at a command.
     pub withheld_ids: Vec<String>,
+    /// Which of `withheld_ids` apply only through a script the call runs.
+    pub withheld_routed: Vec<String>,
 }
+
+/// How many facts reached only through a script one block may carry. They fill
+/// only the slots the facts the call itself reaches leave empty.
+pub const MAX_ROUTED: usize = 2;
 
 /// How many withheld ids the block names; the rest is only counted.
 const NAMED_WITHHELD: usize = 5;
@@ -103,22 +109,39 @@ const NAMED_WITHHELD: usize = 5;
 /// invariant, not a hope, and so a future change to MAX_TEXT_CHARS cannot
 /// silently blow the block open.
 pub fn cap(ranked: Vec<RankedItem>) -> Selection {
-    let mut shown = Vec::new();
+    let mut shown: Vec<RankedItem> = Vec::new();
     let mut used = 0usize;
-    let mut iter = ranked.into_iter().peekable();
-    while let Some(item) = iter.peek() {
-        if shown.len() >= MAX_ITEMS {
-            break;
+    let mut routed = 0usize;
+    let mut withheld: Vec<RankedItem> = Vec::new();
+    // Once the count or the char budget is hit, everything after it is cut, in
+    // order (the old `break`). A fact reached only through a script is cut on
+    // its own when two already stand (`MAX_ROUTED`), without stopping the rest.
+    let mut full = false;
+    for item in ranked {
+        if full || shown.len() >= MAX_ITEMS {
+            full = true;
+            withheld.push(item);
+            continue;
         }
         let len = item.item.text.chars().count();
         if used + len > MAX_BLOCK_CHARS {
-            break;
+            full = true;
+            withheld.push(item);
+            continue;
+        }
+        if item.via.is_some() {
+            if routed >= MAX_ROUTED {
+                withheld.push(item);
+                continue;
+            }
+            routed += 1;
         }
         used += len;
-        shown.push(iter.next().expect("peeked"));
+        shown.push(item);
     }
-    let withheld_ids: Vec<String> = iter.map(|r| r.id).collect();
-    Selection { shown, withheld: withheld_ids.len(), withheld_ids }
+    let withheld_routed: Vec<String> = withheld.iter().filter(|r| r.via.is_some()).map(|r| r.id.clone()).collect();
+    let withheld_ids: Vec<String> = withheld.into_iter().map(|r| r.id).collect();
+    Selection { shown, withheld: withheld_ids.len(), withheld_ids, withheld_routed }
 }
 
 /// The block text, or None when nothing was shown - the serve path's "or
@@ -158,7 +181,13 @@ pub fn render_text(selection: &Selection, input: &ServeInput) -> Option<String> 
     // is the last place to spend a second line per item on something whose
     // value was already banked at write time.
     for ranked in &selection.shown {
-        lines.push(format!("- [{}] {}", ranked.id, ranked.item.text));
+        match ranked.via.as_deref().map(|via| via.split_once(" names ").unwrap_or((via, ""))) {
+            Some((script, literal)) => lines.push(format!(
+                "- [{}] {} (reached through {script}, which names {literal}; the command line does not)",
+                ranked.id, ranked.item.text
+            )),
+            None => lines.push(format!("- [{}] {}", ranked.id, ranked.item.text)),
+        }
     }
     if selection.withheld > 0 {
         lines.push(withheld_line(selection));
@@ -171,7 +200,15 @@ pub fn render_text(selection: &Selection, input: &ServeInput) -> Option<String> 
 /// tool call - a 17 KB line when the call was a long shell script. An id is
 /// something an agent can read with the get tool as it stands.
 fn withheld_line(selection: &Selection) -> String {
-    let named: Vec<&str> = selection.withheld_ids.iter().take(NAMED_WITHHELD).map(String::as_str).collect();
+    let named: Vec<String> = selection
+        .withheld_ids
+        .iter()
+        .take(NAMED_WITHHELD)
+        .map(|id| match selection.withheld_routed.contains(id) {
+            true => format!("{id} (through the script)"),
+            false => id.clone(),
+        })
+        .collect();
     let rest = selection.withheld.saturating_sub(named.len());
     let ids = match (named.is_empty(), rest) {
         (true, _) => String::new(),
@@ -202,6 +239,7 @@ mod tests {
                 falsifier: None,
                 check: None,
             },
+            via: None,
         }
     }
 
@@ -258,6 +296,43 @@ mod tests {
         assert!(text.contains("2 more item(s) apply here: i4, i5"), "block: {text}");
     }
 
+    fn routed(id: &str) -> RankedItem {
+        RankedItem { via: Some("run.ps1 names 127.0.0.1:27182".to_string()), ..ranked(id, 10) }
+    }
+
+    #[test]
+    fn route_facts_fill_only_the_slots_direct_facts_leave_empty() {
+        let mut items: Vec<RankedItem> = (0..3).map(|i| ranked(&format!("d{i}"), 10)).collect();
+        items.extend((0..5).map(|i| routed(&format!("r{i}"))));
+        let sel = cap(items);
+        let shown: Vec<&str> = sel.shown.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(shown, vec!["d0", "d1", "d2", "r0"], "direct facts keep their slots");
+        assert_eq!(sel.withheld, 4);
+        let text = render_text(&sel, &ServeInput::default()).unwrap();
+        assert!(text.contains("r1 (through the script), r2 (through the script)"), "{text}");
+        assert!(text.contains("- [r0] fact") || text.contains("(reached through run.ps1, which names 127.0.0.1:27182; the command line does not)"), "{text}");
+    }
+
+    #[test]
+    fn at_most_two_route_facts_stand_in_one_block() {
+        let mut items = vec![ranked("d0", 10)];
+        items.extend((0..5).map(|i| routed(&format!("r{i}"))));
+        let sel = cap(items);
+        assert_eq!(sel.shown.len(), 3);
+        assert_eq!(sel.shown.iter().filter(|r| r.via.is_some()).count(), MAX_ROUTED);
+        assert_eq!(sel.withheld_routed, vec!["r2", "r3", "r4"]);
+    }
+
+    #[test]
+    fn four_direct_facts_leave_no_room_for_a_route_fact() {
+        let mut items: Vec<RankedItem> = (0..4).map(|i| ranked(&format!("d{i}"), 10)).collect();
+        items.push(routed("r0"));
+        let sel = cap(items);
+        assert_eq!(sel.shown.len(), 4);
+        assert!(sel.shown.iter().all(|r| r.via.is_none()));
+        assert_eq!(sel.withheld_ids, vec!["r0"]);
+    }
+
     #[test]
     fn nothing_shown_renders_no_block() {
         let sel = cap(Vec::new());
@@ -282,6 +357,7 @@ mod tests {
                 falsifier: None,
                 check: None,
             },
+            via: None,
         }];
         let sel = cap(items);
         let text = render_text(&sel, &ServeInput::default()).unwrap();

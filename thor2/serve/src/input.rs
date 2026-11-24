@@ -274,9 +274,22 @@ pub struct ServeInput {
     /// in PowerShell, so `rank::select` must read the call in the dialect it
     /// was typed in (`dialect_for`).
     pub dialect: crate::shell::Dialect,
+    /// What the scripts this call runs name (`script_routes::look_through`).
+    /// Read only by the serving path (matching, rendering, recording), never by
+    /// a guard: a route is an inference, so it can inform and never refuse.
+    /// Empty unless `add_script_routes` was called.
+    pub routes: Vec<crate::script_routes::RouteTargets>,
 }
 
 impl ServeInput {
+    /// Read the script files the shell call `command` runs and keep the hosts and
+    /// tool-name words they hold. Called by the hook after the guard has
+    /// decided, never by `add_command` (which `check`, `why` and the probes
+    /// share and which must stay pure). Silent on anything it cannot read.
+    pub fn add_script_routes(&mut self, tool: &str, command: &str, cwd: Option<&std::path::Path>) {
+        self.routes = crate::script_routes::look_through(tool, command, cwd);
+    }
+
     pub fn is_empty(&self) -> bool {
         self.moments.is_empty() && self.targets.is_empty()
     }

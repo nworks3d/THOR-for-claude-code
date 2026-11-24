@@ -315,7 +315,7 @@ mod tests {
     }
 
     fn ranked_from(item: Item) -> RankedItem {
-        RankedItem { id: item.id.clone(), item }
+        RankedItem { id: item.id.clone(), item, via: None }
     }
 
     /// A context where `id` was called noise `n` times and served a lot.

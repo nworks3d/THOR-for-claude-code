@@ -27,7 +27,7 @@ pub fn select(candidates: &[LiveItem], project: Option<&str>) -> Vec<RankedItem>
         // An overflow pin is not in this block: the first prompt delivers it (`select_overflow`).
         .filter(|c| !model::store::is_overflow_pin(&c.item))
         .filter(|c| crate::project::applies_to(c.item.project.as_deref(), project))
-        .map(|c| RankedItem { id: c.id.clone(), item: c.item.clone() })
+        .map(|c| RankedItem { id: c.id.clone(), item: c.item.clone(), via: None })
         .collect()
 }
 
@@ -41,7 +41,7 @@ pub fn select_overflow(candidates: &[LiveItem], project: Option<&str>) -> Vec<Ra
         .filter(|c| c.item.bindings.iter().any(|b| matches!(b, Binding::Always)))
         .filter(|c| model::store::is_overflow_pin(&c.item))
         .filter(|c| crate::project::applies_to(c.item.project.as_deref(), project))
-        .map(|c| RankedItem { id: c.id.clone(), item: c.item.clone() })
+        .map(|c| RankedItem { id: c.id.clone(), item: c.item.clone(), via: None })
         .collect()
 }
 

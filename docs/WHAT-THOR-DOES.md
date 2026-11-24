@@ -403,6 +403,7 @@ Words used once, in plain language:
   a note onto a place that already holds as many as can ever show is refused (heavier rivals, and lighter
   ones too). The refusal lists every occupant, its weight and whether it can refuse, and three exits: fold
   two that say the same, move one to the narrower place it is really about, or retract a stale one with a reason.
+  A host that more than four notes are bound to is listed as a crowded place in the weekly check as well.
 - Why: measured on the owner's store: the worst place held 38 notes for 4 seats, and 239 of 698 eligible
   notes were never shown anywhere (CONTRACT.md R1/R2). A memory fills with advice nobody sees.
 - You notice: the assistant has to tidy before it can store. It is never turned into a question for you.
@@ -830,7 +831,10 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
 - What: when you type a prompt that names a place or an action, and right before a file or command
   that a note is about, the relevant notes (at most four, 1200 characters) are put in front of the
   assistant, once per context (the main conversation, and each subagent on its own). A refusal is never
-  hidden by this.
+  hidden by this. When a command runs a script file, that one file is read too (a quarter of a second at
+  most), and a note bound to a host or an MCP tool name the script holds is offered as well, marked as
+  reached through the script. Those come after every note the command itself reaches, fill only free
+  places (at most two in a block) and only inform: they never refuse a call.
 - Why: not a search box to remember; a memory that shows up on time.
 - You notice: nothing, unless something relevant appears.
 - Refuse or change: edit or retract notes. A bare generic word (dev, src, test, docs) never fires a path.

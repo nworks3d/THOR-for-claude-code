@@ -5,14 +5,17 @@
 //! file and the command line named no host.
 //!
 //! WHAT THIS DOES. For every live rule bound to a host (and every rule bound
-//! to a tool by name, with the hosts its own text names), it looks through the
-//! 30-day record of real calls (`corpus`) for the two kinds of call that are a
-//! route to that host the rule's bindings never reached: a shell call that
-//! EXECUTES a script file whose recorded content names the host (the content
-//! comes from the Write and Edit calls on record, matched by full path), and a
-//! Write or Edit that PUTS the host into a script file. It names such a rule
-//! with an example call and the `revise` that adds a path binding to that
-//! script.
+//! to a tool by name, with the hosts its own text names and the tool's own
+//! name), it looks through the 30-day record of real calls (`corpus`) for the
+//! two kinds of call that are a route to that host or tool the rule's bindings
+//! never reached: a shell call that EXECUTES a script file that names it, and a
+//! Write or Edit that PUTS it into a script file. The script's content is read
+//! from the disk the way the hook reads it (`script_routes`, with a deadline),
+//! and from the Write and Edit calls on record (matched by full path) when the
+//! script is gone. Each gap says whether the hook's look-through already
+//! reaches it. It names such a rule with an example call and the `revise` that
+//! adds a binding for that script (its folder, when the gate would refuse the
+//! script's own place).
 //!
 //! WHAT IT DOES NOT COUNT. A plain mention of the host in a command's text (a
 //! grep for it), in an agent brief, in a tool argument or in a document is
@@ -32,9 +35,10 @@
 
 use crate::corpus::{self, CallRow};
 use crate::input::{self, ServeInput};
+use crate::script_routes::{file_name_of, script_of, script_path, SCRIPT_EXTENSIONS};
 use model::item::{Binding, Item, TargetKind};
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use thor_core::event_store::EventStore;
 
@@ -45,7 +49,13 @@ pub const MAX_RULES_LISTED: usize = 8;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteGap {
     pub rule: String,
+    /// The host, or the tool-name suffix, the route leads to.
     pub host: String,
+    /// What the rule is bound to that this stands for, as a few words: `host
+    /// 127.0.0.1:27182` or `the tool mcp__x__fusion_mcp_execute`.
+    pub bound_to: String,
+    /// Whether the hook's look-through reaches this route now (A), or why not.
+    pub reach: Reach,
     /// How many real calls mention the host and were never reached.
     pub calls: usize,
     /// The newest such call, in a few words.
@@ -55,9 +65,55 @@ pub struct RouteGap {
     pub revise: String,
 }
 
+/// Whether the hook's look-through (`script_routes`) reaches a route now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    /// The script can be read from the disk now, so the hook offers the rule
+    /// when a call runs it.
+    Now,
+    /// A script was written that holds it: the hook reaches it once a call runs
+    /// that script and the file is on disk.
+    Later,
+    /// The hook cannot reach it, for this reason. A true remaining gap.
+    Cannot(&'static str),
+}
+
+impl Reach {
+    fn words(self) -> String {
+        match self {
+            Reach::Now => "The hook already offers this rule when such a script runs, as information".to_string(),
+            Reach::Later => "The hook will offer this rule once a call runs that script and it is on disk".to_string(),
+            Reach::Cannot(why) => format!("The hook cannot reach this: {why}"),
+        }
+    }
+}
+
+/// What a rule stands for in a script: a host, or the tool-name suffix of a
+/// tool it is bound to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Lit {
+    text: String,
+    tool: bool,
+}
+
 /// The hosts a rule stands for: its Host bindings, plus - for a rule bound to a
-/// tool by name - the hosts its own text names.
-fn hosts_of(item: &Item) -> Vec<String> {
+/// tool by name - the hosts its own text names, plus the tool-name suffix of
+/// every MCP tool it is bound to (`script_routes::tool_suffix`).
+fn hosts_of(item: &Item) -> Vec<Lit> {
+    let mut lits: Vec<Lit> = literals_of(item).into_iter().map(|text| Lit { text, tool: false }).collect();
+    for binding in &item.bindings {
+        if let Binding::Target { kind: TargetKind::Command, value } = binding {
+            if let Some(suffix) = crate::script_routes::tool_suffix(value) {
+                if !lits.iter().any(|l| l.text == suffix) {
+                    lits.push(Lit { text: suffix, tool: true });
+                }
+            }
+        }
+    }
+    lits
+}
+
+fn literals_of(item: &Item) -> Vec<String> {
     let mut hosts: Vec<String> = item
         .bindings
         .iter()
@@ -112,10 +168,6 @@ fn call_text(row: &CallRow) -> String {
     text.to_lowercase()
 }
 
-fn file_name_of(path: &str) -> String {
-    path.replace('\\', "/").rsplit('/').next().unwrap_or("").to_lowercase()
-}
-
 /// A path as a key: forward slashes, lowercase, no leading `./`.
 fn norm_path(path: &str) -> String {
     let flat = path.trim().replace('\\', "/").to_lowercase();
@@ -124,96 +176,6 @@ fn norm_path(path: &str) -> String {
 
 fn is_absolute(path: &str) -> bool {
     path.starts_with('/') || path.starts_with('~') || path.as_bytes().get(1) == Some(&b':')
-}
-
-/// Programs that run the script file they are given.
-const INTERPRETERS: &[&str] = &[
-    "node", "nodejs", "python", "python3", "py", "bash", "sh", "zsh", "dash", "ksh", "ruby", "perl", "php", "deno", "bun", "tsx", "ts-node",
-    "cscript", "wscript", "pwsh", "powershell", "cmd",
-];
-
-/// Words in front of the program that change nothing about what runs.
-const PASS_THROUGH: &[&str] = &["sudo", "env", "nohup", "exec", "command", "time", "nice"];
-
-const SCRIPT_EXTENSIONS: &[&str] = &[".ps1", ".sh", ".bash", ".py", ".js", ".mjs", ".cjs", ".ts", ".bat", ".cmd", ".rb", ".pl", ".vbs", ".php"];
-
-/// PowerShell options that take a value, which is not the script.
-const POWERSHELL_VALUE_FLAGS: &[&str] = &["-executionpolicy", "-ep", "-windowstyle", "-w", "-workingdirectory", "-wd", "-configurationname", "-version"];
-
-/// The script file an interpreter is told to run, if its arguments name one.
-fn script_argument(program: &str, args: &[String]) -> Option<String> {
-    match program {
-        "pwsh" | "powershell" => {
-            let mut i = 0;
-            while i < args.len() {
-                let arg = args[i].to_ascii_lowercase();
-                if arg == "-file" || arg == "-f" {
-                    return args.get(i + 1).cloned();
-                }
-                if matches!(arg.as_str(), "-command" | "-c" | "-encodedcommand" | "-e") {
-                    return None;
-                }
-                if !arg.starts_with('-') {
-                    return Some(args[i].clone());
-                }
-                i += if POWERSHELL_VALUE_FLAGS.contains(&arg.as_str()) { 2 } else { 1 };
-            }
-            None
-        }
-        "cmd" => {
-            let at = args.iter().position(|a| matches!(a.to_ascii_lowercase().as_str(), "/c" | "/k"))?;
-            args.get(at + 1)?.split_whitespace().next().map(str::to_string)
-        }
-        _ => {
-            for arg in args {
-                if matches!(arg.as_str(), "-c" | "-e" | "-m" | "-p" | "--eval" | "--print") {
-                    return None;
-                }
-                if !arg.starts_with('-') {
-                    return Some(arg.clone());
-                }
-            }
-            None
-        }
-    }
-}
-
-/// The script files a shell call really executes: an interpreter followed by
-/// the file, the file itself as the command, or a `&` / `.` / `source` call.
-/// A file that is only edited, read, copied or moved is not in the list.
-fn executed_scripts(segments: &[model::shell::Segment]) -> Vec<String> {
-    let mut out = Vec::new();
-    for seg in segments.iter().filter(|s| !s.remote && !s.tool) {
-        let words = &seg.words;
-        let mut i = 0;
-        while i < words.len() {
-            let word = words[i].to_ascii_lowercase();
-            let assignment = word
-                .split_once('=')
-                .is_some_and(|(name, _)| !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
-            if !assignment && !PASS_THROUGH.contains(&word.as_str()) {
-                break;
-            }
-            i += 1;
-        }
-        let Some(first) = words.get(i) else { continue };
-        let rest = &words[i + 1..];
-        if matches!(first.as_str(), "&" | "." | "source") {
-            out.extend(rest.first().cloned());
-            continue;
-        }
-        let program = file_name_of(first);
-        let program = program.strip_suffix(".exe").unwrap_or(&program);
-        if INTERPRETERS.contains(&program) {
-            out.extend(script_argument(program, rest));
-        } else {
-            let flat = first.replace('\\', "/").to_lowercase();
-            if flat.contains('/') || SCRIPT_EXTENSIONS.iter().any(|e| flat.ends_with(e)) {
-                out.push(first.clone());
-            }
-        }
-    }
-    out
 }
 
 /// What Write and Edit calls put on record, by full normalised path.
@@ -347,12 +309,49 @@ fn missing_binding(row: &CallRow, via_script: Option<&str>) -> (TargetKind, Stri
     (TargetKind::Command, row.tool.clone())
 }
 
-fn revise_for(item: &Item, id: &str, extra: &(TargetKind, String)) -> String {
-    let mut bindings = item.bindings.clone();
-    bindings.push(Binding::Target { kind: extra.0, value: extra.1.clone() });
+/// Whether the write gate would refuse `item` as it stands (a place already
+/// full of rivals).
+fn gate_refuses(store: &EventStore, item: &Item) -> bool {
+    matches!(model::store::capacity(store, item), Ok(model::store::Capacity::Full(_)) | Ok(model::store::Capacity::DeadOnArrival(_)))
+}
+
+/// The `revise` that adds `extra` to the rule, as a call text. A Path binding
+/// the gate would refuse (the script's own place already holds a block's worth
+/// of facts) is replaced by the Dir of its folder, and the text says so.
+fn revise_for(store: &EventStore, item: &Item, id: &str, extra: &(TargetKind, String)) -> String {
+    let call = |bindings: &[Binding]| {
+        format!(
+            "mcp__thor__revise(id: \"{id}\", {}, because: \"<this route reaches the same host, at least 20 characters>\")",
+            model::store::binding_arguments(bindings)
+        )
+    };
+    let with = |kind: TargetKind, value: &str| {
+        let mut bindings = item.bindings.clone();
+        bindings.push(Binding::Target { kind, value: value.to_string() });
+        let mut updated = item.clone();
+        updated.id = id.to_string();
+        updated.bindings = bindings.clone();
+        (bindings, updated)
+    };
+    let (bindings, updated) = with(extra.0, &extra.1);
+    if extra.0 != TargetKind::Path || !gate_refuses(store, &updated) {
+        return call(&bindings);
+    }
+    let flat = extra.1.replace('\\', "/");
+    let Some((folder, _)) = flat.rsplit_once('/').filter(|(f, _)| !f.is_empty()) else {
+        return format!("{} (the script's own place already holds {} facts, so the gate would refuse this)", call(&bindings), model::item::MAX_ITEMS);
+    };
+    let (dir_bindings, dir_updated) = with(TargetKind::Dir, folder);
+    if gate_refuses(store, &dir_updated) {
+        return format!(
+            "no call is offered: the script's own place and its folder {folder} both already hold {} facts, so the gate would refuse either binding. Make room there first (fold, move or retract one of them)",
+            model::item::MAX_ITEMS
+        );
+    }
     format!(
-        "mcp__thor__revise(id: \"{id}\", {}, because: \"<this route reaches the same host, at least 20 characters>\")",
-        model::store::binding_arguments(&bindings)
+        "{} (the script's own place already holds {} facts and would refuse a binding, so this binds its folder {folder} instead)",
+        call(&dir_bindings),
+        model::item::MAX_ITEMS
     )
 }
 
@@ -365,31 +364,51 @@ pub fn probe(store: &EventStore, calls: &[CallRow]) -> Vec<RouteGap> {
 
 /// What the probe found for one rule and host: how many calls, and the newest
 /// one (its place in the calls and the script it ran).
-struct Found<'a> {
+struct Found {
     calls: usize,
     t: i64,
     at: usize,
-    via_script: Option<&'a str>,
+    via_script: Option<String>,
+    reach: Reach,
 }
 
 /// The gaps, most calls first, from what was found per (rule, host) place.
 /// The example and the `revise` text are built here, once per gap, not for
 /// every call.
-fn gaps_of(rules: &Rules, calls: &[CallRow], found: BTreeMap<(usize, usize), Found>) -> Vec<RouteGap> {
+fn gaps_of(store: &EventStore, rules: &Rules, calls: &[CallRow], found: BTreeMap<(usize, usize), Found>) -> Vec<RouteGap> {
     let mut out: Vec<RouteGap> = found
         .into_iter()
         .map(|((r, h), f)| {
-            let (id, item, hosts) = &rules[r];
+            let (id, item, lits) = &rules[r];
             let row = &calls[f.at];
+            let lit = &lits[h];
+            let what = if lit.tool { "the tool" } else { "the host" };
+            let bound_to = if lit.tool {
+                let full = item
+                    .bindings
+                    .iter()
+                    .find_map(|b| match b {
+                        Binding::Target { kind: TargetKind::Command, value } if crate::script_routes::tool_suffix(value).as_deref() == Some(lit.text.as_str()) => {
+                            value.split_whitespace().next().map(str::to_string)
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| lit.text.clone());
+                format!("the tool {full}")
+            } else {
+                format!("host {}", lit.text)
+            };
             RouteGap {
                 rule: id.clone(),
-                host: hosts[h].clone(),
+                host: lit.text.clone(),
+                bound_to,
+                reach: f.reach,
                 calls: f.calls,
-                example: match f.via_script {
-                    Some(script) => format!("{} (runs {script}, which names the host)", example_of(row)),
+                example: match &f.via_script {
+                    Some(script) => format!("{} (runs {script}, which names {what})", example_of(row)),
                     None => example_of(row),
                 },
-                revise: revise_for(item, id, &missing_binding(row, f.via_script)),
+                revise: revise_for(store, item, id, &missing_binding(row, f.via_script.as_deref())),
             }
         })
         .collect();
@@ -397,27 +416,28 @@ fn gaps_of(rules: &Rules, calls: &[CallRow], found: BTreeMap<(usize, usize), Fou
     out
 }
 
-type Rules = Vec<(String, Item, Vec<String>)>;
+type Rules = Vec<(String, Item, Vec<Lit>)>;
 
-/// The live rules that stand for at least one host, with those hosts.
+/// The live rules that stand for at least one host or tool, with those.
 fn rules_of(store: &EventStore) -> Rules {
     crate::live::live_items(store)
         .into_iter()
         .filter(|li| li.item.kind.can_fire())
         .map(|li| {
-            let hosts = hosts_of(&li.item);
-            (li.id, li.item, hosts)
+            let lits = hosts_of(&li.item);
+            (li.id, li.item, lits)
         })
-        .filter(|(_, _, hosts)| !hosts.is_empty())
+        .filter(|(_, _, lits)| !lits.is_empty())
         .collect()
 }
 
-/// Every host once, lowercase: what a call or a written file is searched for.
+/// Every host and tool word once, lowercase: what a call or a written file is
+/// searched for.
 fn needles_of(rules: &Rules) -> Vec<String> {
     let mut needles: Vec<String> = Vec::new();
-    for (_, _, hosts) in rules {
-        for host in hosts {
-            let needle = host.to_lowercase();
+    for (_, _, lits) in rules {
+        for lit in lits {
+            let needle = lit.text.to_lowercase();
             if !needles.contains(&needle) {
                 needles.push(needle);
             }
@@ -426,17 +446,118 @@ fn needles_of(rules: &Rules) -> Vec<String> {
     needles
 }
 
+/// A normalised path as the key of a script's content.
+fn key_of(path: &Path) -> String {
+    norm_path(&path.to_string_lossy())
+}
+
+/// The script files shell calls run, read from the disk NOW (what the hook
+/// would read): by normalised path, the needles (by index) each holds. A path
+/// that cannot be read is absent, and so is every path on a share that did not
+/// answer.
+#[derive(Default)]
+pub struct DiskScripts {
+    by_path: HashMap<String, Vec<usize>>,
+}
+
+/// How many distinct script paths one probe tries to read.
+const MAX_DISK_PATHS: usize = 4000;
+
+/// The share a path lives on (`//server/share`), so one dead share is asked
+/// once.
+fn share_of(key: &str) -> Option<String> {
+    let rest = key.strip_prefix("//")?;
+    let mut parts = rest.split('/');
+    Some(format!("//{}/{}", parts.next()?, parts.next().unwrap_or("")))
+}
+
+/// What the script of segment `seg` of `row` resolves to, the way the hook
+/// resolves it (`script_routes::script_path`, against the call's own `cwd`).
+fn resolved(row: &CallRow, seg: &model::shell::Segment, script: &str) -> Option<PathBuf> {
+    let cwd = (!row.cwd.is_empty()).then(|| Path::new(row.cwd.as_str()));
+    script_path(script, seg.dir.as_deref(), seg.dir != seg.any_cd_dir, cwd)
+}
+
+/// The scripts the shell calls in `calls` run that are on the disk now, read
+/// the way the hook reads them, and which of `needles` each holds. Stops at
+/// `deadline`; a read that does not answer in time marks its whole share dead.
+pub fn disk_scripts(calls: &[CallRow], needles: &[String], deadline: Option<Instant>) -> DiskScripts {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for row in calls.iter().filter(|r| is_shell(&r.tool)) {
+        let Some(command) = row.input.get("command").and_then(|c| c.as_str()) else { continue };
+        let lower = command.to_lowercase();
+        if !SCRIPT_EXTENSIONS.iter().any(|e| lower.contains(e)) {
+            continue;
+        }
+        for seg in model::shell::call_segments(&row.tool, command).iter().filter(|s| !s.remote && !s.tool) {
+            let Some(script) = script_of(seg) else { continue };
+            let Some(path) = resolved(row, seg, &script) else { continue };
+            if seen.insert(key_of(&path)) {
+                paths.push(path);
+            }
+        }
+        if paths.len() >= MAX_DISK_PATHS {
+            break;
+        }
+    }
+    let mut out = DiskScripts::default();
+    let mut dead_shares: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for path in paths {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            break;
+        }
+        let key = key_of(&path);
+        let share = share_of(&key);
+        if share.as_ref().is_some_and(|s| dead_shares.contains(s)) {
+            continue;
+        }
+        let wait = deadline
+            .map(|d| d.saturating_duration_since(Instant::now()))
+            .unwrap_or(crate::script_routes::BUDGET)
+            .min(crate::script_routes::BUDGET);
+        let target = path.clone();
+        match crate::work_folders::within(wait, move || crate::script_routes::read_script(&target)) {
+            None => {
+                dead_shares.extend(share);
+            }
+            Some(None) => {}
+            Some(Some(text)) => {
+                let text = text.to_lowercase();
+                let hits = (0..needles.len()).filter(|n| text.contains(&needles[*n])).collect();
+                out.by_path.insert(key, hits);
+            }
+        }
+    }
+    out
+}
+
 /// [`probe`] that stops at `deadline`. The second answer is how many of the
 /// calls it looked at when it stopped early, `None` when it saw them all.
 pub fn probe_within(store: &EventStore, calls: &[CallRow], deadline: Option<Instant>) -> (Vec<RouteGap>, Option<usize>) {
+    probe_with(store, calls, deadline, &DiskScripts::default())
+}
+
+/// One script a shell call runs that holds a needle: where it is, which
+/// needles, and whether the hook reaches it.
+struct ScriptHit {
+    path: String,
+    hits: Vec<usize>,
+    reach: Reach,
+}
+
+/// [`probe_within`] with the script files read from the disk (`disk_scripts`):
+/// a script on the disk decides over what the Write record says it held, and
+/// is one the hook reaches now.
+pub fn probe_with(store: &EventStore, calls: &[CallRow], deadline: Option<Instant>, disk: &DiskScripts) -> (Vec<RouteGap>, Option<usize>) {
     let rules = rules_of(store);
     if rules.is_empty() {
         return (Vec::new(), None);
     }
     let out_of_time = |seen: usize| seen % 16 == 0 && deadline.is_some_and(|d| Instant::now() >= d);
     let needles = needles_of(&rules);
-    // The content written by Write and Edit calls, by full path: a script a
-    // later call runs is read from here, never from the disk.
+    // The content written by Write and Edit calls, by full path: the fallback
+    // for a script that is no longer on the disk.
     let mut written = Written::default();
     for (seen, row) in calls.iter().enumerate() {
         if out_of_time(seen) {
@@ -449,8 +570,8 @@ pub fn probe_within(store: &EventStore, calls: &[CallRow], deadline: Option<Inst
             written.add(path, &call_text(row));
         }
     }
-    // Which hosts each written file names, once; only the names of the files
-    // that name any are worth looking for in a command.
+    // Which needles each written file holds, once; only the names of the files
+    // that hold any are worth looking for in a command.
     let mut hot_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (key, file) in written.files.iter_mut() {
         file.hits = (0..needles.len()).filter(|n| file.content.contains(&needles[*n])).collect();
@@ -459,12 +580,12 @@ pub fn probe_within(store: &EventStore, calls: &[CallRow], deadline: Option<Inst
             hot_names.insert(file_name_of(key));
         }
     }
-    // Per rule and host: how many calls, and the newest one. The example and
+    // Per rule and literal: how many calls, and the newest one. The example and
     // the `revise` text are built once at the end, not for every call.
     let mut found: BTreeMap<(usize, usize), Found> = BTreeMap::new();
     for (seen, row) in calls.iter().enumerate() {
         if out_of_time(seen) {
-            return (gaps_of(&rules, &calls, found), Some(seen));
+            return (gaps_of(store, &rules, calls, found), Some(seen));
         }
         let text = call_text(row);
         let named: Vec<bool> = needles.iter().map(|n| text.contains(n)).collect();
@@ -476,13 +597,33 @@ pub fn probe_within(store: &EventStore, calls: &[CallRow], deadline: Option<Inst
         // The shell call read as a command, once and only when needed.
         let command = row.input.get("command").and_then(|c| c.as_str());
         let mut segments: Option<Vec<model::shell::Segment>> = None;
-        // The written files this shell call really executes that name a host.
-        let mut scripts: Vec<&WrittenFile> = Vec::new();
-        if is_shell(&row.tool) && !hot_names.is_empty() {
-            let mentions_one = input::paths_in_command(command.unwrap_or("")).iter().any(|p| hot_names.contains(&file_name_of(p)));
-            if mentions_one {
-                for script in executed_scripts(segments_of(&mut segments, &row.tool, command)) {
-                    scripts.extend(written.find(&script).into_iter().filter(|f| !f.hits.is_empty()));
+        // The scripts this shell call really executes that hold a needle.
+        let mut scripts: Vec<ScriptHit> = Vec::new();
+        if is_shell(&row.tool) && (!hot_names.is_empty() || !disk.by_path.is_empty()) {
+            let lower = command.unwrap_or("").to_lowercase();
+            if SCRIPT_EXTENSIONS.iter().any(|e| lower.contains(e)) {
+                let run: Vec<(String, Option<PathBuf>)> = segments_of(&mut segments, &row.tool, command)
+                    .iter()
+                    .filter(|s| !s.remote && !s.tool)
+                    .filter_map(|seg| script_of(seg).map(|script| (script.clone(), resolved(row, seg, &script))))
+                    .collect();
+                for (script, path) in run {
+                    // A script on the disk now decides: the hook reads it.
+                    if let Some(path) = &path {
+                        if let Some(hits) = disk.by_path.get(&key_of(path)) {
+                            if !hits.is_empty() {
+                                scripts.push(ScriptHit { path: path.to_string_lossy().replace('\\', "/"), hits: hits.clone(), reach: Reach::Now });
+                            }
+                            continue;
+                        }
+                    }
+                    let why = match path {
+                        None => "the script's path holds a variable or a glob, or its folder cannot be told",
+                        Some(_) => "the script is not on the disk any more (what it held comes from the record of what was written)",
+                    };
+                    for file in written.find(&script).into_iter().filter(|f| !f.hits.is_empty()) {
+                        scripts.push(ScriptHit { path: file.path.clone(), hits: file.hits.clone(), reach: Reach::Cannot(why) });
+                    }
                 }
             }
         }
@@ -490,17 +631,17 @@ pub fn probe_within(store: &EventStore, calls: &[CallRow], deadline: Option<Inst
         // for a rule bound to a moment, else the targets alone.
         let mut targets_input: Option<ServeInput> = None;
         let mut full_input: Option<ServeInput> = None;
-        for (r, (_, item, hosts)) in rules.iter().enumerate() {
-            for (h, host) in hosts.iter().enumerate() {
-                let needle = host.to_lowercase();
+        for (r, (_, item, lits)) in rules.iter().enumerate() {
+            for (h, lit) in lits.iter().enumerate() {
+                let needle = lit.text.to_lowercase();
                 let Some(n) = needles.iter().position(|x| *x == needle) else { continue };
-                let via_script = scripts.iter().find(|f| f.hits.contains(&n)).map(|f| f.path.as_str());
+                let via = scripts.iter().find(|f| f.hits.contains(&n));
                 // Only two kinds of call are a route: a shell call that runs a
                 // script with the host in it, and a Write or Edit that puts
                 // the host into a script. A mention of the host in a command,
                 // a brief, a tool argument or a document is only text.
-                let writes_host_into_script = named[n] && writes_script;
-                if via_script.is_none() && !writes_host_into_script {
+                let writes_it_into_script = named[n] && writes_script;
+                if via.is_none() && !writes_it_into_script {
                     continue;
                 }
                 let needs_moments = item.bindings.iter().any(|b| matches!(b, Binding::Moment(_)));
@@ -512,17 +653,19 @@ pub fn probe_within(store: &EventStore, calls: &[CallRow], deadline: Option<Inst
                 if reached(item, call_input, segments_of(&mut segments, &row.tool, command)) {
                     continue;
                 }
-                let entry = found.entry((r, h)).or_insert(Found { calls: 0, t: i64::MIN, at: seen, via_script: None });
+                let reach = via.map(|f| f.reach).unwrap_or(Reach::Later);
+                let entry = found.entry((r, h)).or_insert(Found { calls: 0, t: i64::MIN, at: seen, via_script: None, reach });
                 entry.calls += 1;
                 if row.t >= entry.t {
                     entry.t = row.t;
                     entry.at = seen;
-                    entry.via_script = via_script;
+                    entry.via_script = via.map(|f| f.path.clone());
+                    entry.reach = reach;
                 }
             }
         }
     }
-    (gaps_of(&rules, &calls, found), None)
+    (gaps_of(store, &rules, calls, found), None)
 }
 
 /// The lines doctor and `serve sweep` show: silent when no rule has a route it
@@ -535,9 +678,20 @@ pub fn lines(gaps: &[RouteGap]) -> Vec<String> {
 pub fn lines_listing(gaps: &[RouteGap], listed: usize) -> Vec<String> {
     let mut out = Vec::new();
     for gap in gaps.iter().take(listed) {
+        let what = if gap.bound_to.is_empty() { gap.host.clone() } else { gap.bound_to.clone() };
+        let covered = match gap.reach {
+            Reach::Now => "Nothing to do unless the rule should also refuse (a refusing check needs a real binding), and then:",
+            _ => "If that route is meant to be covered:",
+        };
         out.push(format!(
-            "route probe: rule '{}' is bound to {}, and {} real call(s) of the last 30 days run a script with that host in it, or write the host into a script, without reaching the rule (example: {}). If that route is meant to be covered: {}",
-            gap.rule, gap.host, gap.calls, gap.example, gap.revise
+            "route probe: rule '{}' is bound to {}, and {} real call(s) of the last 30 days run a script with that host or tool name in it, or write it into a script, without reaching the rule (example: {}). {}. {} {}",
+            gap.rule,
+            what,
+            gap.calls,
+            gap.example,
+            gap.reach.words(),
+            covered,
+            gap.revise
         ));
     }
     if gaps.len() > listed {
@@ -581,15 +735,21 @@ pub fn lines_for(db: &Path, store: &EventStore, now: i64, budget: Duration, in_s
             hot_names.push(name);
         }
     }
-    if !hot_names.is_empty() {
-        let names_a_file = any_of(&hot_names);
-        let (more, _, more_cut) = corpus::select_calls(db, now, CALLS_KEPT, &|line| names_a_file.is_match(line));
-        cut |= more_cut;
-        let known: std::collections::HashSet<String> = calls.iter().map(|r| r.id.clone()).collect();
-        calls.extend(more.into_iter().filter(|r| is_shell(&r.tool) && !known.contains(&r.id)));
-        calls.sort_by_key(|r| r.t);
-    }
-    let (gaps, stopped_at) = probe_within(store, &calls, Some(deadline));
+    // The second pass: the shell calls that name a file written with a host,
+    // and every shell call that runs a script at all (the script is read from
+    // the disk, and may hold a host the record never saw written).
+    let runs_a_script = regex::Regex::new(&format!(r"(?i)(?:{})", SCRIPT_EXTENSIONS.iter().map(|e| regex::escape(e)).collect::<Vec<_>>().join("|")))
+        .expect("escaped extensions make a valid pattern");
+    let names_a_file = (!hot_names.is_empty()).then(|| any_of(&hot_names));
+    let (more, _, more_cut) = corpus::select_calls(db, now, CALLS_KEPT, &|line| {
+        names_a_file.as_ref().is_some_and(|re| re.is_match(line)) || runs_a_script.is_match(line)
+    });
+    cut |= more_cut;
+    let known: std::collections::HashSet<String> = calls.iter().map(|r| r.id.clone()).collect();
+    calls.extend(more.into_iter().filter(|r| is_shell(&r.tool) && !known.contains(&r.id)));
+    calls.sort_by_key(|r| r.t);
+    let disk = disk_scripts(&calls, &needles, Some(deadline));
+    let (gaps, stopped_at) = probe_with(store, &calls, Some(deadline), &disk);
     let mut out = lines_listing(&gaps, if in_sweep { usize::MAX } else { MAX_RULES_LISTED });
     if stopped_at.is_some() {
         out.push(format!(
@@ -844,7 +1004,15 @@ mod tests {
     #[test]
     fn the_sweep_lists_every_rule_and_does_not_point_to_itself() {
         let gaps: Vec<RouteGap> = (0..MAX_RULES_LISTED + 3)
-            .map(|i| RouteGap { rule: format!("r{i}"), host: "h".into(), calls: 1, example: "e".into(), revise: "v".into() })
+            .map(|i| RouteGap {
+                rule: format!("r{i}"),
+                host: "h".into(),
+                bound_to: "host h".into(),
+                reach: Reach::Now,
+                calls: 1,
+                example: "e".into(),
+                revise: "v".into(),
+            })
             .collect();
         let short = lines(&gaps);
         assert_eq!(short.len(), MAX_RULES_LISTED + 1);
@@ -864,5 +1032,108 @@ mod tests {
         assert!(stopped_at.is_some());
         let (gaps, stopped_at) = probe_within(&store, &calls, None);
         assert!(stopped_at.is_none() && gaps.is_empty());
+    }
+
+    // ------------------------------------------------ B: the extended probe
+
+    fn in_folder(id: &str, t: i64, tool: &str, cwd: &str, command: &str) -> CallRow {
+        serde_json::from_value(json!({ "k": "c", "id": id, "t": t, "tool": tool, "cwd": cwd, "in": { "command": command } })).unwrap()
+    }
+
+    fn script_folder(name: &str, content: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("thor-route-probe-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("run.ps1"), content).unwrap();
+        dir
+    }
+
+    /// The content comes from the disk, read the way the hook reads it: a
+    /// script the Write record never saw (or saw clipped) is found, a relative
+    /// path is resolved against the call's own folder, and the gap says the
+    /// hook already reaches it.
+    #[test]
+    fn a_script_on_the_disk_is_found_by_its_content_and_labelled_as_reached() {
+        let dir = script_folder("disk", &format!("$u = 'http://{HOST}/create'\n"));
+        let store = store_with(&fusion_rule());
+        let cwd = dir.to_string_lossy().to_string();
+        let calls = vec![in_folder("p1", 200, "PowerShell", &cwd, "powershell -File run.ps1")];
+        let needles = needles_of(&rules_of(&store));
+        let disk = disk_scripts(&calls, &needles, None);
+        let (gaps, _) = probe_with(&store, &calls, None, &disk);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert_eq!(gaps[0].reach, Reach::Now);
+        assert!(gaps[0].example.contains("run.ps1"), "{}", gaps[0].example);
+        assert!(lines(&gaps)[0].contains("already offers this rule"), "{}", lines(&gaps)[0]);
+        // The same call with no folder on record cannot be resolved: no read.
+        let calls = vec![in_folder("p2", 200, "PowerShell", "", "powershell -File run.ps1")];
+        let disk = disk_scripts(&calls, &needles, None);
+        assert!(probe_with(&store, &calls, None, &disk).0.is_empty());
+    }
+
+    /// A script that is gone from the disk is a gap the hook cannot reach, and
+    /// says why; its content still comes from the record.
+    #[test]
+    fn a_script_gone_from_the_disk_is_labelled_as_unreachable_with_its_reason() {
+        let store = store_with(&fusion_rule());
+        let calls = vec![
+            call("w1", 100, "Write", json!({ "file_path": "C:/gone/fusion-script.ps1", "content": format!("curl http://{HOST}/x") })),
+            call("p1", 200, "PowerShell", json!({ "command": "powershell -File C:/gone/fusion-script.ps1" })),
+            call("p2", 300, "PowerShell", json!({ "command": "powershell -File $env:W/fusion-script.ps1" })),
+        ];
+        let needles = needles_of(&rules_of(&store));
+        let disk = disk_scripts(&calls, &needles, None);
+        let (gaps, _) = probe_with(&store, &calls, None, &disk);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        match gaps[0].reach {
+            Reach::Cannot(why) => assert!(why.contains("not on the disk") || why.contains("variable"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(lines(&gaps)[0].contains("cannot reach this"), "{}", lines(&gaps)[0]);
+    }
+
+    /// The tool-name route: a script that holds the last part of a bound MCP
+    /// tool is reported next to the host route.
+    #[test]
+    fn a_script_that_names_the_bound_tool_is_a_route() {
+        let tool_rule = rule(
+            "no-new-bodies",
+            "Make no new bodies through the fusion tool.",
+            vec![Binding::Target { kind: TargetKind::Command, value: "mcp__Autodesk_Fusion__fusion_mcp_execute".to_string() }],
+        );
+        let store = store_with(&tool_rule);
+        let calls = vec![
+            call("w1", 100, "Write", json!({ "file_path": "C:/work/fusion-script.ps1", "content": "name = \"fusion_mcp_execute\"" })),
+            call("p1", 200, "PowerShell", json!({ "command": "powershell -File C:/work/fusion-script.ps1" })),
+        ];
+        let gaps = probe(&store, &calls);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert_eq!(gaps[0].host, "fusion_mcp_execute");
+        assert!(gaps[0].bound_to.contains("mcp__Autodesk_Fusion__fusion_mcp_execute"), "{}", gaps[0].bound_to);
+        assert!(gaps[0].example.contains("which names the tool"), "{}", gaps[0].example);
+    }
+
+    /// The printed `revise` is checked against the write gate: a script place
+    /// that already holds a block's worth of facts would refuse a Path binding,
+    /// so the call binds the script's folder instead and says so.
+    #[test]
+    fn a_revise_the_gate_would_refuse_is_replaced_by_the_scripts_folder() {
+        let mut store = EventStore::in_memory().unwrap();
+        for n in 0..model::item::MAX_ITEMS {
+            let busy = rule(
+                &format!("busy-{n}"),
+                &format!("busy fact number {n} about the script"),
+                vec![Binding::Target { kind: TargetKind::Path, value: "C:/work/fusion-script.ps1".to_string() }],
+            );
+            model::store::declare(&mut store, "s", "s", "owner", &busy).unwrap();
+        }
+        model::store::declare(&mut store, "s", "s", "owner", &fusion_rule()).unwrap();
+        let calls = vec![
+            call("w1", 100, "Write", json!({ "file_path": "C:/work/fusion-script.ps1", "content": format!("curl http://{HOST}/x") })),
+            call("p1", 200, "PowerShell", json!({ "command": "powershell -File C:/work/fusion-script.ps1" })),
+        ];
+        let gaps = probe(&store, &calls);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert!(gaps[0].revise.contains("binds its folder C:/work instead"), "{}", gaps[0].revise);
+        assert!(gaps[0].revise.contains("dir"), "{}", gaps[0].revise);
     }
 }

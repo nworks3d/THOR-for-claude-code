@@ -187,6 +187,13 @@ pub fn candidate_pool_key(input: &ServeInput) -> (Vec<String>, Vec<String>) {
     if target_kinds.iter().any(|k| k == &target_kind_wire(model::item::TargetKind::Path)) {
         target_kinds.push(target_kind_wire(model::item::TargetKind::Dir));
     }
+    // A SCRIPT THAT HOLDS A HOST must also fetch the rules bound to that host,
+    // or a call that names no host on its command line never makes them
+    // candidates and the look-through silently does nothing. (A bound tool name
+    // needs nothing extra: a shell call always carries a Command target.)
+    if input.routes.iter().any(|r| !r.hosts.is_empty()) {
+        target_kinds.push(target_kind_wire(model::item::TargetKind::Host));
+    }
     target_kinds.sort();
     target_kinds.dedup();
     (moments, target_kinds)

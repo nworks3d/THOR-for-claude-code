@@ -810,6 +810,9 @@ fn check_rows(all: &[RankedItem], shown_ids: &std::collections::HashSet<&str>, c
         .map(|(r, (id, verdict))| {
             debug_assert_eq!(r.id, id, "classify_moment must return one verdict per item, in all's own order");
             let (verdict, matched_literal) = match verdict {
+                // A fact reached only through a script is an inference: it is
+                // advice, never read as the basis of a refusal.
+                _ if r.via.is_some() => ("advice", None),
                 absent_guard::Verdict::Prohibition { literal } => ("prohibition", Some(literal)),
                 absent_guard::Verdict::Advice => ("advice", None),
             };
@@ -856,6 +859,7 @@ mod check_rows_json_tests {
                 falsifier: Some(format!("{id} turns out not to matter")),
                 check,
             },
+            via: None,
         }
     }
 
@@ -2881,6 +2885,13 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                 };
                 if let Some(command) = absent_guard::proposed_command(tool_input) {
                     input.add_command(command);
+                    // THE SCRIPT LOOK-THROUGH (item 71): the hosts and tool names
+                    // inside a script this call runs, so a fact bound to them
+                    // is offered too. After the guard above has decided, and
+                    // informing only: nothing it finds can refuse a call.
+                    if matches!(tool_name, "Bash" | "PowerShell") {
+                        input.add_script_routes(tool_name, command, session_cwd.as_deref());
+                    }
                 } else {
                     // THE TOOL-NAME REACH THIS CLOSES. MEASURED: a Rule bound to
                     // Target command "Agent"/"Artifact"/"SendUserFile" was only
@@ -2992,15 +3003,32 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                 // the place blank (step 27, D9).
                 let trigger = trigger.or(Some(tool_name).filter(|t| !t.is_empty()));
                 if !no_record {
+                    // A fact reached only through a script is recorded with its
+                    // route, so the evaluation shows where it fired.
+                    let (direct, routed): (Vec<RankedItem>, Vec<RankedItem>) =
+                        arranged.selection.shown.iter().cloned().partition(|r| r.via.is_none());
+                    let served_at = time::now_iso8601();
                     deliver::record_delivery_around_anchors(
                         &mut store,
                         &session_id,
                         &session_id,
                         actor,
-                        &time::now_iso8601(),
-                        &anchors_of(&arranged.selection.shown),
+                        &served_at,
+                        &anchors_of(&direct),
                         trigger,
                     );
+                    for fact in &routed {
+                        let route_trigger = trigger.map(|t| serve::rank::route_trigger(t, fact.via.as_deref().unwrap_or("")));
+                        deliver::record_delivery_around_anchors(
+                            &mut store,
+                            &session_id,
+                            &session_id,
+                            actor,
+                            &served_at,
+                            &[(fact.id.clone(), Vec::new())],
+                            route_trigger.as_deref(),
+                        );
+                    }
                 } else if copy {
                     let ids: Vec<String> = arranged.selection.shown.iter().map(|r| r.id.clone()).collect();
                     deliver::copy_telemetry_served(db_path, &session_id, actor, &ids, trigger);
@@ -7379,6 +7407,7 @@ mod prose_marking_tests {
                 falsifier: Some(format!("{id} turns out fine anyway")),
                 check,
             },
+            via: None,
         }
     }
 
@@ -7397,7 +7426,7 @@ mod prose_marking_tests {
             ranked_command_item("p1", Some(Check::Forbidden { literals: vec!["--force".to_string()] })),
             ranked_command_item("a1", None),
         ];
-        let selection = render::Selection { shown: shown.clone(), withheld: 0, withheld_ids: Vec::new() };
+        let selection = render::Selection { shown: shown.clone(), withheld: 0, withheld_ids: Vec::new(), withheld_routed: Vec::new() };
         let input = ServeInput { command: Some("git push --force origin main".to_string()), ..Default::default() };
         let before = render::render_text(&selection, &input)
             .expect("fixture must render a block");
@@ -7421,7 +7450,7 @@ mod prose_marking_tests {
     #[test]
     fn a_block_with_no_prohibition_is_returned_unchanged() {
         let shown = vec![ranked_command_item("a1", None)];
-        let selection = render::Selection { shown: shown.clone(), withheld: 0, withheld_ids: Vec::new() };
+        let selection = render::Selection { shown: shown.clone(), withheld: 0, withheld_ids: Vec::new(), withheld_routed: Vec::new() };
         let input = ServeInput { command: Some("git status".to_string()), ..Default::default() };
         let before = render::render_text(&selection, &input).unwrap();
 
@@ -7449,7 +7478,7 @@ mod prose_marking_tests {
         );
         let mut all = heavier.clone();
         all.push(outranked.clone());
-        let selection = render::Selection { shown: heavier.clone(), withheld: 1, withheld_ids: vec!["held-back".to_string()] };
+        let selection = render::Selection { shown: heavier.clone(), withheld: 1, withheld_ids: vec!["held-back".to_string()], withheld_routed: Vec::new() };
         // A command the fixtures' own anchor ("git push") reaches - see
         // `rows_stay_paired_with_the_right_item_across_several_at_once`.
         let command = "git push --no-verify origin main";

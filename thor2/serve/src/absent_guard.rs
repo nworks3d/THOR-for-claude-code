@@ -2990,6 +2990,7 @@ sonnet").is_none(),
                 falsifier: Some(format!("{id} turns out not to matter")),
                 check: Some(Check::Absent { path: check_path.to_string(), literal: literal.to_string() }),
             },
+            via: None,
         }
     }
 
@@ -3017,6 +3018,7 @@ sonnet").is_none(),
                     literals: literals.iter().map(|s| s.to_string()).collect(),
                 }),
             },
+            via: None,
         }
     }
 
@@ -5292,7 +5294,7 @@ sonnet").is_none(),
             falsifier: Some("the irreversible thing turns out fine".to_string()),
             check: None,
         };
-        let ranked = vec![RankedItem { id: item.id.clone(), item }];
+        let ranked = vec![RankedItem { id: item.id.clone(), item, via: None }];
         let verdicts = classify_moment(&ranked, "rm -rf /", None);
         assert_eq!(verdicts, vec![("irreversible-no-check".to_string(), Verdict::Advice)]);
     }
@@ -5335,7 +5337,7 @@ sonnet").is_none(),
             .expect("sanity: the guard must actually refuse this command");
         assert!(reason.contains("no-public"), "{reason}");
 
-        let ranked = vec![RankedItem { id: live.id.clone(), item: live.item.clone() }];
+        let ranked = vec![RankedItem { id: live.id.clone(), item: live.item.clone(), via: None }];
         let verdicts = classify_moment(&ranked, command, None);
         assert_eq!(
             verdicts,

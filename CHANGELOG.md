@@ -12,6 +12,7 @@ What changed: The weekly check is quieter and more reliable, and a pin can no lo
 - **Pins are checked more strictly.** A pin on a note tied to one place needs a reason why it holds in every conversation. When the start block is full, THOR stops and asks you, and a note you approve is delivered whole at your first message. `doctor` shows how full the start block is per project.
 - **Clearer edits.** Changing a note now says which bindings were removed and which were kept.
 - **A short weekly check is short.** When only a few notes have to be judged or re-read, the assistant gets the steps right in the request and no longer reads the whole routine file first.
+- **Notes now arrive when a script holds the host or tool they are about.** A command that runs a script file used to miss a note tied to a host or an MCP tool the script uses, because the command line named neither. THOR now reads that script, offers the note marked as reached through the script (after the ones the command itself reaches, at most two), and the weekly check also lists a host that too many notes are tied to.
 
 ## 2.6.13 (2026-11-21)
 

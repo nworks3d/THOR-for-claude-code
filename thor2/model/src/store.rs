@@ -3654,9 +3654,16 @@ pub fn outranked_places(store: &EventStore, project: &str) -> Vec<OutrankedPlace
     for (_, item) in candidates.iter().filter(|(_, i)| i.kind.can_fire() && project_applies_to(i.project.as_deref(), Some(project))) {
         for binding in &item.bindings {
             let Binding::Target { kind, value } = binding else { continue };
+            // A HOST crowds like a file does (measured 2026-11-24: three hosts held
+            // five live facts each and a block shows four), so it is listed. The
+            // write gate (`full_reliable_anchor`) still counts only Path, Dir and
+            // Command: refusing a fifth fact on a host is a separate decision.
             if !matches!(
                 kind,
-                crate::item::TargetKind::Path | crate::item::TargetKind::Dir | crate::item::TargetKind::Command
+                crate::item::TargetKind::Path
+                    | crate::item::TargetKind::Dir
+                    | crate::item::TargetKind::Command
+                    | crate::item::TargetKind::Host
             ) {
                 continue;
             }
@@ -13059,6 +13066,26 @@ mod tests {
         assert!(places[0].occupants.contains(&"global-on-it".to_string()), "{places:?}");
         // Another project sees only the global one of them.
         assert!(outranked_places(&store, "elsewhere").is_empty());
+    }
+
+    /// A HOST crowds like a file: five facts on one host are listed, four are
+    /// not, and the write gate (which counts Path, Dir and Command) still takes
+    /// the fifth.
+    #[test]
+    fn a_crowded_host_is_listed_and_the_write_gate_still_accepts_a_fifth() {
+        let mut store = EventStore::in_memory().unwrap();
+        for n in 0..5 {
+            let mut item = at_path(&format!("host-{n}"), Some("crowd"), "127.0.0.1:27182");
+            item.bindings = vec![Binding::Target { kind: TargetKind::Host, value: "127.0.0.1:27182".to_string() }];
+            legacy_tried(&mut store, &item, &sealed(&item, RecordedVerdict::Note));
+            if n == 3 {
+                assert!(outranked_places(&store, "crowd").is_empty(), "four facts on a host fill a block exactly");
+            }
+        }
+        let places = outranked_places(&store, "crowd");
+        assert_eq!(places.len(), 1, "{places:?}");
+        assert_eq!((places[0].kind, places[0].value.as_str(), places[0].occupants.len()), (TargetKind::Host, "127.0.0.1:27182", 5));
+        assert_eq!(places[0].label(), "127.0.0.1:27182");
     }
 
     #[test]
