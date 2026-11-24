@@ -1132,3 +1132,64 @@ fn a_report_by_thor_with_text_of_its_own_below_the_section_is_not_accepted() {
     file_as_thor_for_test(&mut fx.store, S1, &item);
     assert!(!check(&fx.store, "eval-fxp-early", None).record.expect("a record").valid);
 }
+
+// ------------------------------------------- the weekly rhythm: what was left open
+
+/// FIELD CASE 2026-11-25: every project stayed on the daily rhythm for ever,
+/// because the rot check counted what the last evaluation STARTED with. It now
+/// counts what that evaluation LEFT open.
+#[test]
+fn an_evaluation_that_started_with_items_and_settled_them_leaves_the_project_weekly() {
+    let mut fx = Fx::new();
+    six_owed_rules(&mut fx);
+    counting_report_skipping_the_list(&mut fx, S1, "eval-fxp-1");
+    let counted = model::store::newest_valid_evaluation(&fx.store, Some("fxp")).expect("it counts");
+    let start = model::store::evaluation_starts_of_session(&fx.store, S1)
+        .into_iter()
+        .find(|s| Some(s.frozen.started_seq) == counted.started_seq)
+        .expect("its start");
+    assert!(!start.frozen.judgement.is_empty(), "fixture sanity: it started with a verdict list");
+    // The fixture rules themselves have no verdict of their own (another
+    // branch of `project_rot`); this one is about what the evaluation left.
+    assert_eq!(left_open(&fx.store, &start, &counted.report), None, "everything on its list was answered");
+    let why = project_rot(&fx.store, "fxp").unwrap_or_default();
+    assert!(!why.contains("started with"), "the start's list size no longer decides: {why}");
+}
+
+#[test]
+fn one_item_left_without_a_verdict_keeps_the_project_daily_and_is_named() {
+    let mut fx = Fx::new();
+    six_owed_rules(&mut fx);
+    let start = crate::attest::fixture::quiet_start(&mut fx.store, S1, "fxp");
+    assert!(start.frozen.judgement.len() >= 2, "fixture sanity: {:?}", start.frozen.judgement);
+    let mut filed = report("eval-fxp-1", "fxp", "TLDR: skipped most of it.");
+    let (left, rest) = start.frozen.judgement.split_first().unwrap();
+    for id in rest {
+        filed.tags.push(format!("{}{id}:the fixture could not judge it", model::store::NOT_JUDGEABLE_TAG_PREFIX));
+    }
+    fx.raw(S1, EventKind::FactCreated, &filed, None);
+    let why = left_open(&fx.store, &start, "eval-fxp-1").expect("one item has no answer");
+    assert!(why.contains("1 item(s) without a verdict") && why.contains(left.as_str()), "{why}");
+    let mut all = report("eval-fxp-2", "fxp", "TLDR: skipped all of it.");
+    for id in &start.frozen.judgement {
+        all.tags.push(format!("{}{id}:the fixture could not judge it", model::store::NOT_JUDGEABLE_TAG_PREFIX));
+    }
+    fx.raw(S1, EventKind::FactCreated, &all, None);
+    assert_eq!(left_open(&fx.store, &start, "eval-fxp-2"), None, "skipped with a reason: answered");
+}
+
+#[test]
+fn an_owner_queue_open_point_alone_does_not_keep_the_project_daily() {
+    let mut fx = Fx::new();
+    let mut start = crate::attest::fixture::quiet_start(&mut fx.store, S1, "fxp");
+    let mut pass = start.frozen.machine.clone().unwrap_or_default();
+    pass.points.push(model::store::MachinePoint {
+        id: "fixture-point".to_string(),
+        blocker: model::store::MachineBlocker::of(&model::store::Blocker::NoWorkingCopy { project: "fxp".to_string() }),
+        rules: Vec::new(),
+        carried_by: Vec::new(),
+    });
+    start.frozen.machine = Some(pass);
+    fx.raw(S1, EventKind::FactCreated, &report("eval-fxp-1", "fxp", "TLDR: nothing to do but the owner's point."), None);
+    assert_eq!(left_open(&fx.store, &start, "eval-fxp-1"), None);
+}

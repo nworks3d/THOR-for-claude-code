@@ -1030,10 +1030,35 @@ fn restarted_after(files: &[PathBuf], after_unix: i64) -> bool {
     })
 }
 
+/// WHAT THE LAST COUNTING EVALUATION LEFT OPEN, in words, or `None` when every
+/// item of its frozen lists has its answer. It asks the very functions that hold
+/// a report until each item is done (`evaluation_judgement_owed` with the
+/// report's own `not-judgeable` skips, `evaluation_reread_owed`,
+/// `evaluation_frozen_batch_owed`, `evaluation_frozen_disputes_owed`), so there
+/// is one definition of "done". THOR's own open points (the owner's queue) are
+/// not counted: no evaluation can settle them.
+fn left_open(store: &EventStore, start: &model::store::EvaluationStart, report: &str) -> Option<String> {
+    let tags = model::store::show(store, report).map(|r| r.tags).unwrap_or_default();
+    let judgement = model::store::evaluation_judgement_owed(store, start, &tags).owed;
+    if let Some(id) = judgement.first() {
+        return Some(format!("{} item(s) without a verdict, for example '{id}'", judgement.len()));
+    }
+    let reread = model::store::evaluation_reread_owed(store, start).owed;
+    if let Some(id) = reread.first() {
+        return Some(format!("{} pinned note(s) not re-read, for example '{id}'", reread.len()));
+    }
+    let teeth = model::store::evaluation_frozen_batch_owed(store, start);
+    if let Some((id, why)) = teeth.first() {
+        return Some(format!("{} rule(s) still undecided, for example '{id}' ({why})", teeth.len()));
+    }
+    let disputes = model::store::evaluation_frozen_disputes_owed(store, start);
+    disputes.first().map(|(id, _)| format!("{} dispute(s) not verified, for example '{id}'", disputes.len()))
+}
+
 /// WHETHER `project` SHOWS ROT, for the weekly cadence (step 17), from the log
 /// only: why it does, or `None` for a clean project. Rot is any of: no valid
-/// evaluation at all; the newest valid evaluation's start had anything to do
-/// (a judgement list, a teeth batch, an A4 list or THOR's own open points);
+/// evaluation at all; the newest valid evaluation left something of its frozen
+/// lists open (a verdict, a re-read, a teeth batch or A4 rule, a dispute);
 /// since that evaluation, a report that does not count, a write to an item
 /// of the project outside an attested THOR call, a live rule of the project
 /// that `settlement` calls owed, judgement debt in the project that was served
@@ -1047,16 +1072,8 @@ pub fn project_rot(store: &EventStore, project: &str) -> Option<String> {
     let start = model::store::evaluation_starts_of_session(store, &valid.session)
         .into_iter()
         .find(|s| s.frozen.project == project && Some(s.frozen.started_seq) == valid.started_seq);
-    if let Some(start) = start {
-        let machine_points = start.frozen.machine.as_ref().map_or(0, |m| m.points.len());
-        let to_do = start.frozen.judgement.len()
-            + start.frozen.reread.len()
-            + start.frozen.batch().len()
-            + start.frozen.a4_list().len()
-            + machine_points;
-        if to_do > 0 {
-            return Some(format!("its last evaluation ('{}') started with {to_do} thing(s) to do", valid.report));
-        }
+    if let Some(open) = start.as_ref().and_then(|s| left_open(store, s, &valid.report)) {
+        return Some(format!("its last evaluation ('{}') left {open}", valid.report));
     }
     if let Some((id, _)) = newest_invalid_report(store, Some(project)) {
         return Some(format!("the report '{id}' does not count"));

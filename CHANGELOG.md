@@ -16,6 +16,7 @@ What changed: The weekly check is quieter and more reliable, and a pin can no lo
 - **A rule that asks for a go-word can let harmless calls through.** For example, a mail rule can now pass a mail that goes only to your own address and still ask for the word on every other mail. Anything else in the call (a second address, a copy, a saved draft) brings the rule back.
 - **You can change a rule that needs your go from any conversation.** The refusal now says how: you ask for it in your own message and the assistant repeats the change with your whole message quoted. THOR checks the quote against what you typed and refuses a loosening without it.
 - **Notes now arrive when a script holds the host or tool they are about.** A command that runs a script file used to miss a note tied to a host or an MCP tool the script uses, because the command line named neither. THOR now reads that script, offers the note marked as reached through the script (after the ones the command itself reaches, at most two), and the weekly check also lists a host that too many notes are tied to.
+- **The weekly check goes back to once a week when nothing is left open.** On Max it used to stay daily for ever, because it counted what the last check started with. It now counts only what that check left undone, and the owner's own open points no longer keep it daily.
 
 ## 2.6.13 (2026-11-21)
 
