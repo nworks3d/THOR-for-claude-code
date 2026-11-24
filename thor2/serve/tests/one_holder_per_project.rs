@@ -80,6 +80,31 @@ fn notice(v: &serde_json::Value) -> String {
 /// Seed `session`'s own work in `project` and the project's clock, so the
 /// evaluation is due for it at a Stop that is not its first there.
 fn due_for(db: &std::path::Path, project: &str, session: &str, minutes: i64) {
+    // One rule owing a verdict: an evaluation with nothing on any list is
+    // settled by THOR itself and holds no turn.
+    let mut store = EventStore::new(db).unwrap();
+    let id = format!("owed-{project}");
+    if model::store::show(&store, &id).is_err() {
+        let item = model::item::Item {
+            id: id.clone(),
+            kind: model::item::Kind::Rule,
+            text: "fixture rule owing a verdict".to_string(),
+            bindings: vec![model::item::Binding::Target { kind: model::item::TargetKind::Command, value: "fixture-owed-command".to_string() }],
+            severity: None,
+            project: Some(project.to_string()),
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some("the fixture rule turns out to be wrong".to_string()),
+            check: None,
+        };
+        model::store::declare(&mut store, "fixture", "fixture", "fixture", &item).unwrap();
+        serve::teeth::fixture::decide(&mut store, &id);
+        for i in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
+            serve::deliver::record_delivery_with_trigger(&mut store, &serve::deliver::nth_session("fixture", i), "fixture", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &[id.clone()], Some("git push origin main"));
+        }
+    }
+    drop(store);
     let mut all = serve::usefulness::read_eval_debt_state(db);
     let entry = all.entry(project.to_string()).or_default();
     let now = serve::time::now_unix();

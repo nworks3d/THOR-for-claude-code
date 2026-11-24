@@ -181,6 +181,31 @@ fn start_evaluation(s: &mut Session) -> model::store::EvaluationStart {
     s.open_start("demo").expect("the start record is on the log")
 }
 
+/// `start_evaluation` for a test that needs the Stop to ASK: an evaluation with
+/// nothing on any list and quiet signals is settled by THOR itself and holds no
+/// turn, so a hook failure of an earlier session is on record first (a signal
+/// that is not quiet keeps the ask).
+fn start_evaluation_that_is_asked(s: &mut Session) -> model::store::EvaluationStart {
+    record_a_hook_failure(s);
+    start_evaluation(s)
+}
+
+/// A hook failure of an earlier session on the log: a signal that is not quiet.
+fn record_a_hook_failure(s: &Session) {
+    let fault = model::store::HookFault {
+        tool_use_id: "toolu-fixture".to_string(),
+        hook_event: "SessionStart".to_string(),
+        exit_code: 126,
+        at: "2026-10-06T22:29:00.231Z".to_string(),
+        host_wide: false,
+        quick_silent: false,
+    };
+    let body = json!({ "hook_fault": fault }).to_string();
+    let entity = model::store::hook_fault_entity("s-old");
+    let mut store = EventStore::new(&s.db).unwrap();
+    store.append_event("s-old", "s-old", model::store::ATTESTER_ACTOR, EventKind::GateStoodAside, &entity, None, &body).unwrap();
+}
+
 /// R15.1 (EV Z1 a): a second JSON-RPC client - no Claude Code, no hook, no
 /// transcript - files the report. Measured before step 15: "stored
 /// 'eval-fxp-2026-09-28' (Report, event seq 68) judgement: no hook record
@@ -640,7 +665,7 @@ fn worked(s: &Session, minutes: i64) {
 fn attested_filing_then_stop_is_silent() {
     let tmp = tempfile::tempdir().unwrap();
     let mut s = Session::new(tmp.path());
-    start_evaluation(&mut s);
+    start_evaluation_that_is_asked(&mut s);
     worked(&s, 90);
     let asked = s.stop();
     assert!(asked.contains("\"decision\":\"block\"") && asked.contains("Run the THOR evaluation"), "fixture sanity: {asked}");
@@ -772,6 +797,7 @@ fn the_model_cli_cannot_file_an_evaluation() {
 fn a_report_written_past_the_gate_does_not_count_at_the_stop() {
     let tmp = tempfile::tempdir().unwrap();
     let s = Session::new(tmp.path());
+    record_a_hook_failure(&s);
     let report = serve::eval_filing::fixture::report(REPORT, "demo", TLDR);
     {
         let mut store = EventStore::open_existing(&s.db).unwrap();
@@ -783,8 +809,6 @@ fn a_report_written_past_the_gate_does_not_count_at_the_stop() {
     let v: Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("expected a block: {e}: {out}"));
     assert_eq!(v["decision"], "block", "{out}");
     let reason = v["reason"].as_str().unwrap();
-    // An evaluation with nothing on its lists says so first; the dead report follows.
-    let reason = reason.split_once("\n\n").map_or(reason, |(_, rest)| rest);
     assert!(
         reason.starts_with(&format!(
             "[THOR] The report '{REPORT}' is on file but does not count as this project's evaluation: not filed through an \
@@ -807,6 +831,7 @@ fn a_report_written_past_the_gate_does_not_count_at_the_stop() {
 fn an_edited_debt_sidecar_does_not_silence_the_stop() {
     let tmp = tempfile::tempdir().unwrap();
     let s = Session::new(tmp.path());
+    record_a_hook_failure(&s);
     worked(&s, 90);
     let first = s.stop();
     assert!(first.contains("\"decision\":\"block\"") && first.contains("Run the THOR evaluation"), "fixture sanity: {first}");

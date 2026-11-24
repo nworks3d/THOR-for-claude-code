@@ -325,6 +325,11 @@ pub fn check(store: &EventStore, report_id: &str, root: Option<&Path>) -> Checke
 
 fn judge(store: &EventStore, event: &Event, filed: &Item, root: Option<&Path>, record: &mut EvaluationValidation) -> Validation {
     let invalid = |why: String| Validation::Invalid(why);
+    // A report THOR filed itself for an evaluation with nothing on any list:
+    // no tool call and no transcript, so it is judged on the log alone.
+    if event.actor == model::store::EVAL_MACHINE_ACTOR {
+        return judge_machine_filed(store, event, filed, record);
+    }
     // (1) a THOR call at all: a stamp, a tool call id, a Claude Code session.
     let claim = match attest::claim_of(event) {
         Ok(claim) => claim,
@@ -488,6 +493,108 @@ fn judge(store: &EventStore, event: &Event, filed: &Item, root: Option<&Path>, r
         filed_at,
         machine_sha256: digest,
     })
+}
+
+/// The one sentence a report THOR filed itself carries below its machine section.
+pub const MACHINE_FILED_LINE: &str =
+    "THOR filed this report itself: nothing was on any list of this evaluation, so no session was held for it.";
+
+/// THE EMPTY EVALUATION, SETTLED BY THOR. When `start` has nothing on any list
+/// and every signal is quiet (`eval_session::nothing_to_do`), file its report
+/// here, without a turn: a Report by `eval-machine` holding the machine section
+/// as the log stands and `MACHINE_FILED_LINE`, then validated and recorded like
+/// any filing, so the clock and the owner's-message window advance as a report
+/// that counts does. `None` when anything is on a list (the existing ask
+/// stays) or the report did not validate.
+pub fn settle_empty_evaluation(store: &mut EventStore, start: &EvaluationStart) -> Option<EvaluationValidation> {
+    if !crate::eval_session::nothing_to_do(&start.frozen) {
+        return None;
+    }
+    let f = store.get_next_seq().ok()? - 1;
+    let section = model::store::render_machine_section(store, start, f);
+    let id = crate::eval_session::free_report_id_now(store, &start.frozen);
+    let item = Item {
+        id: id.clone(),
+        kind: model::item::Kind::Report,
+        text: format!("{section}\n\n{}\n{MACHINE_FILED_LINE}\n", model::gate::AGENT_SECTION_BEGIN),
+        bindings: vec![],
+        severity: None,
+        project: Some(start.frozen.project.clone()),
+        tags: vec![model::store::EVALUATION_REPORT_TAG.to_string()],
+        expires: None,
+        key: None,
+        falsifier: None,
+        check: None,
+    };
+    model::store::record_machine_filed_report(store, SystemActor::new(model::store::EVAL_MACHINE_ACTOR), &start.frozen.session, &item).ok()?;
+    let record = check(store, &id, None).record?;
+    record_validation(store, &record)?;
+    if !record.valid {
+        return None;
+    }
+    crate::said::advance_for_valid(store, &record);
+    Some(record)
+}
+
+/// For tests: write `item` as THOR itself would, past `settle_empty_evaluation`'s
+/// own conditions, to see what the validator makes of it.
+#[cfg(test)]
+pub(crate) fn file_as_thor_for_test(store: &mut EventStore, session: &str, item: &Item) {
+    model::store::record_machine_filed_report(store, SystemActor::new(model::store::EVAL_MACHINE_ACTOR), session, item).unwrap();
+}
+
+/// `judge` for a report filed by `eval-machine`: valid only when the log, read
+/// as it stood at the filing, shows an evaluation of that session and project
+/// with nothing on any list, the machine section is the one THOR derives, the
+/// text below it is exactly `MACHINE_FILED_LINE`, and nothing was changed behind
+/// the evaluation.
+fn judge_machine_filed(store: &EventStore, event: &Event, filed: &Item, record: &mut EvaluationValidation) -> Validation {
+    let invalid = |why: &str| Validation::Invalid(format!("not a report THOR may file itself: {why}"));
+    if event.kind != EventKind::FactCreated {
+        return invalid("it was not created by THOR");
+    }
+    let Some(block) = model::gate::machine_block(&filed.text) else { return invalid("it carries no machine section") };
+    let Some((n, f)) = model::gate::machine_section_range(&filed.text) else { return invalid("its machine section names no log positions") };
+    record.started_seq = Some(n);
+    record.filed_seq = Some(f);
+    if !(n < f && f < event.seq) {
+        return invalid("its log positions do not come before its filing");
+    }
+    if model::gate::agent_section(&filed.text) != format!("{MACHINE_FILED_LINE}\n") {
+        return invalid("it carries text of its own below the machine section");
+    }
+    let project = filed.project.clone().unwrap_or_default();
+    let session = event.session_id.clone();
+    let Ok(at_filing) = store.truncated_copy(f) else {
+        return Validation::Pending("the log could not be read as it stood at the filing".to_string());
+    };
+    let Some(start) = model::store::evaluation_starts_of_session(&at_filing, &session)
+        .into_iter()
+        .filter(|s| s.frozen.project == project && s.frozen.started_seq == n)
+        .max_by_key(|s| s.seq)
+    else {
+        return invalid("the log holds no start record for it");
+    };
+    if !crate::eval_session::nothing_to_do(&start.frozen) {
+        return invalid("something was on a list of its evaluation");
+    }
+    if start.frozen.is_void() || start.frozen.is_superseded() {
+        return invalid("its evaluation is closed");
+    }
+    if !model::store::frozen_writes_judged(store, &start, Some(f), None).outside.is_empty() {
+        return invalid("an item was changed behind its evaluation");
+    }
+    let digest = model::store::machine_block_digest(block);
+    record.machine_sha256 = Some(digest.clone());
+    let expected = format!("{}\n\n{}\n", model::store::render_machine_section(&at_filing, &start, f), model::gate::AGENT_SECTION_BEGIN);
+    if block != expected {
+        return invalid("its machine section is not the one THOR derives from the log");
+    }
+    let filed_at = crate::time::iso8601_from_unix(crate::time::now_unix());
+    record.filed_at = Some(filed_at.clone());
+    record.verdicts = shares(&at_filing, &start, f, &project);
+    record.carry = carry(store, &at_filing, &start, &project, &session, None);
+    Validation::Valid(Valid { session, agent: None, started_seq: n, filed_seq: f, filed_at, machine_sha256: digest })
 }
 
 /// How the verdicts of the evaluation `start` split, on the log as it stood at

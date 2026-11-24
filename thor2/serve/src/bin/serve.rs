@@ -4201,7 +4201,21 @@ fn eval_stop_ask(
                 let started = match no_record {
                     true => None,
                     false => match serve::eval_session::try_start(db_path, store, session_id, &project, "stop-ask") {
-                        Ok(started) => Some(started),
+                        Ok(started) => {
+                            // NOTHING ON ANY LIST: THOR settles it itself, no
+                            // ask and no held turn - one plain line instead.
+                            if serve::eval_filing::settle_empty_evaluation(store, &started.start).is_some() {
+                                usefulness::update_eval_debt_state(store, db_path, Some(&project), now);
+                                elsewhere.get_or_insert_with(|| {
+                                    format!(
+                                        "[THOR] The evaluation of '{project}' had nothing on any list, so THOR filed its report itself. \
+                                         Nothing is needed from you."
+                                    )
+                                });
+                                continue;
+                            }
+                            Some(started)
+                        }
                         // Another session started it between the decision and
                         // this start (step 24): one line, no hold.
                         Err(serve::eval_session::StartRefused::RunningElsewhere { start, idle_minutes }) => {

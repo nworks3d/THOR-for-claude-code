@@ -360,6 +360,24 @@ fn seed_session_work(db: &Path, project: Option<&str>, session_id: &str, minutes
 /// longer enough, so `seed_session_work`'s own all-default risk (0, false)
 /// would silently stay silent for any of those.
 fn seed_session_work_with_risk(db: &Path, project: Option<&str>, session_id: &str, minutes: i64, edits_since_test: u32, compacted_since_anchor: bool) {
+    seed_session_work_bare(db, project, session_id, minutes, edits_since_test, compacted_since_anchor);
+    if let Some(project) = project {
+        listed_item(db, project);
+    }
+}
+
+/// One rule owing a verdict, so the project's evaluation has something on its list: an evaluation with nothing on any list is settled by THOR itself and holds no turn. Declared once per project.
+fn listed_item(db: &Path, project: &str) {
+    let mut store = EventStore::new(db).unwrap();
+    if model::store::show(&store, &format!("owed-{project}-00")).is_ok() {
+        return;
+    }
+    let ids = declare_owed_items(&mut store, 1, Some(project));
+    let _ = ids;
+}
+
+/// The sidecar seeding alone, with nothing on the project's lists.
+fn seed_session_work_bare(db: &Path, project: Option<&str>, session_id: &str, minutes: i64, edits_since_test: u32, compacted_since_anchor: bool) {
     let mut all = serve::usefulness::read_eval_debt_state(db);
     let key = project.unwrap_or("").to_string();
     let mut entry = all.get(&key).cloned().unwrap_or_default();
@@ -811,6 +829,7 @@ fn one_project_runs_one_evaluation_and_a_quiet_one_is_taken_over() {
     let case = |quiet_minutes: i64| -> (String, std::path::PathBuf, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("thor.db");
+        listed_item(&db, "fxp");
         {
             let mut store = EventStore::new(&db).unwrap();
             serve::attest::fixture::quiet_start_at(&mut store, &s1, "fxp", now - 90 * 60);
@@ -945,14 +964,14 @@ fn fires_with_zero_items_owed_once_worked_long_enough() {
     let project_dir = sandbox.project_dir("thor-fixture");
 
     let store = EventStore::new(&db).unwrap();
-    seed_session_work(&db, Some("thor-fixture"), "s1", 90);
+    seed_session_work_bare(&db, Some("thor-fixture"), "s1", 90, 0, false);
     drop(store);
 
+    // Nothing on any list: THOR settles the evaluation itself, no turn is held.
     let out = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
-    let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("expected a decision JSON: {e}: {out}"));
-    assert_eq!(v["decision"], "block", "a zero-item backlog must still owe an evaluation: {out}");
-    let reason = v["reason"].as_str().unwrap();
-    assert!(reason.contains("No item is on this evaluation's verdict list"), "{reason}");
+    assert!(!is_block(&out), "a zero-item evaluation is settled by THOR: {out}");
+    let store = EventStore::new(&db).unwrap();
+    assert!(model::store::newest_valid_evaluation(&store, Some("thor-fixture")).is_some(), "its report counts");
 }
 
 /// A read-only COPY of the memory cannot start or file an evaluation (no
@@ -1573,9 +1592,6 @@ fn a_report_written_past_the_gate_does_not_count() {
     let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("expected a block: {e}: {out}"));
     assert_eq!(v["decision"], "block", "{out}");
     let reason = v["reason"].as_str().unwrap();
-    // An evaluation with nothing on its lists says so first (the filing call
-    // follows); the dead report is named right behind it.
-    let reason = reason.split_once("\n\n").map_or(reason, |(_, rest)| rest);
     assert!(
         reason.starts_with(
             "[THOR] The report 'eval-thor-fixture-2026-09-28' is on file but does not count as this project's evaluation: not \
@@ -1646,6 +1662,7 @@ fn age_sidecar(db: &Path, secs: i64) {
 /// Seed `session`'s OWN work in `project` (`minutes`, and how many of its
 /// Stops were seen there) without touching the project's clock.
 fn seed_own_work(db: &Path, project: &str, session: &str, minutes: i64, stops: u32) {
+    listed_item(db, project);
     let mut all = serve::usefulness::read_eval_debt_state(db);
     let entry = all.entry(project.to_string()).or_default();
     let now = serve::time::now_unix();
@@ -1664,6 +1681,7 @@ fn seed_own_work(db: &Path, project: &str, session: &str, minutes: i64, stops: u
 
 /// Set the PROJECT's own clock to `minutes`.
 fn seed_project_clock(db: &Path, project: &str, minutes: i64) {
+    listed_item(db, project);
     let mut all = serve::usefulness::read_eval_debt_state(db);
     let entry = all.entry(project.to_string()).or_default();
     let now = serve::time::now_unix();
@@ -1721,6 +1739,7 @@ fn two_short_sessions_add_up() {
     let sandbox = Sandbox::new();
     let fxp = sandbox.project_dir("fxp");
     drop(EventStore::new(&db).unwrap());
+    listed_item(&db, "fxp");
     let (s1, s2) = (uuid(1), uuid(2));
     for _ in 0..=20 {
         run_hook(&db, &pretooluse_payload(&s1, &fxp), &sandbox);
@@ -1849,6 +1868,7 @@ fn a_running_evaluation_elsewhere_is_not_asked_twice() {
     let sandbox = Sandbox::new();
     let fxp = sandbox.project_dir("fxp");
     let (s1, s2) = (uuid(9), uuid(10));
+    listed_item(&db, "fxp");
     {
         let mut store = EventStore::new(&db).unwrap();
         let now = serve::time::now_unix();
@@ -1877,6 +1897,7 @@ fn zeroed_sidecar_is_overruled_by_the_transcript() {
     let fxp = sandbox.project_dir("fxp");
     let s2 = uuid(13);
     drop(EventStore::new(&db).unwrap());
+    listed_item(&db, "fxp");
     seed_project_clock(&db, "fxp", 70);
     seed_own_work(&db, "fxp", &s2, 0, 1);
     let control = run_hook(&db, &stop_payload(&s2, &fxp), &sandbox);
@@ -1892,6 +1913,7 @@ fn zeroed_sidecar_is_overruled_by_the_transcript() {
     // evaluation, so the weekly floor holds.
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("thor.db");
+    listed_item(&db, "fxp");
     {
         let mut store = EventStore::new(&db).unwrap();
         served_in(&mut store, "fxp", &s2, 0);
@@ -1918,6 +1940,7 @@ fn zeroed_project_clock_meets_the_weekly_floor() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("thor.db");
         drop(EventStore::new(&db).unwrap());
+        listed_item(&db, "fxp");
         if let Some(days) = eval_days {
             seed_valid_report(&db, "fxp", now - days * 86_400, "eval-fxp-fixture");
         }
@@ -2081,6 +2104,7 @@ fn a_capture_block_carries_the_evaluation_ask() {
     let sandbox = Sandbox::new();
     let fxp = sandbox.project_dir("fxp");
     drop(EventStore::new(&db).unwrap());
+    listed_item(&db, "fxp");
     let s = uuid(67);
     let prompt = serde_json::json!({
         "hook_event_name": "UserPromptSubmit",
@@ -2782,6 +2806,7 @@ fn an_evaluation_the_session_opened_is_asked_even_while_it_only_reads() {
     let sandbox = Sandbox::new();
     let fxp = sandbox.project_dir("fxp");
     let s = uuid(98);
+    listed_item(&db, "fxp");
     {
         let mut store = EventStore::new(&db).unwrap();
         serve::attest::fixture::quiet_start_at(&mut store, &s, "fxp", serve::time::now_unix() - 5 * 60);
@@ -2855,4 +2880,31 @@ fn an_older_build_with_the_same_report_formats_is_asked_normally_with_one_line_o
     assert!(is_block(&out), "a report from this build counts, so the evaluation is asked: {out}");
     assert!(out.contains("For your information") && out.contains("a report filed now counts"), "{out}");
     assert!(!out.contains("would not count"), "{out}");
+}
+
+/// AN EVALUATION WITH NOTHING ON ANY LIST IS SETTLED BY THOR: no hold and no
+/// ask, one plain line, a report that counts, and the next ask only when the
+/// project is due again.
+#[test]
+fn an_empty_evaluation_is_settled_by_thor_without_a_hold() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let sandbox = Sandbox::new();
+    let fxp = sandbox.project_dir("fxp");
+    let s = uuid(41);
+    drop(EventStore::new(&db).unwrap());
+    seed_session_work_bare(&db, Some("fxp"), &s, 90, 0, false);
+    let out = run_hook(&db, &stop_payload(&s, &fxp), &sandbox);
+    assert!(!is_block(&out), "nothing was on any list, so no turn is held: {out}");
+    assert!(out.contains("THOR filed its report itself"), "{out}");
+    {
+        let store = EventStore::new(&db).unwrap();
+        let valid = model::store::newest_valid_evaluation(&store, Some("fxp")).expect("the report counts");
+        assert!(valid.report.starts_with("eval-fxp-"), "{valid:?}");
+        assert!(model::store::open_evaluation_start(&store, &s, "fxp").is_none(), "its evaluation is closed");
+        let events = store.get_events_by_entity(&valid.report).unwrap();
+        assert!(events.iter().any(|e| e.kind == EventKind::FactCreated && e.actor == model::store::EVAL_MACHINE_ACTOR), "written by THOR itself");
+    }
+    let next = run_hook(&db, &retry_stop_payload(&s, &fxp), &sandbox);
+    assert!(!is_block(&next), "quiet until the project is due again: {next}");
 }

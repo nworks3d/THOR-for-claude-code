@@ -5843,6 +5843,30 @@ pub fn record_evaluation_start(
     Ok(EvaluationStart { id: item.id.clone(), seq: event.seq, frozen: frozen.clone(), batch_seq: None })
 }
 
+/// Write an evaluation report that THOR files itself, for an evaluation with
+/// nothing on any list: one `fact_created` by `eval-machine`, in the session of
+/// the evaluation, straight onto the log. A tool call can never write it (the
+/// tool server's actors are refused the reserved `eval-machine` name), and the
+/// validator accepts it only when it recomputes that nothing was to do
+/// (`serve::eval_filing`).
+pub fn record_machine_filed_report(store: &mut EventStore, actor: SystemActor, session: &str, item: &Item) -> Result<Event, WriteError> {
+    if actor.name() != EVAL_MACHINE_ACTOR {
+        return Err(WriteError::Refused(Refusal {
+            problem: format!("an evaluation report is filed by THOR itself through eval-machine only, not by '{}'", actor.name()),
+            fix: "file it with the THOR tool, in the session that runs the evaluation".to_string(),
+        }));
+    }
+    if !gate::is_evaluation_report(item) {
+        return Err(WriteError::Refused(Refusal {
+            problem: format!("'{}' is not an evaluation report", item.id),
+            fix: format!("write a Report tagged '{EVALUATION_REPORT_TAG}'"),
+        }));
+    }
+    let name = fence(store, actor.into(), &item.id)?;
+    let body = canonical_body(&normalized(item)).map_err(WriteError::Serialize)?;
+    store.append_created_unique(session, session, name, &item.id, &body, |_, _, _| false).map_err(WriteError::Store)
+}
+
 /// Write the batch record: ONE `fact_revised` by `eval-machine` on the start
 /// record `start`, whose body is the record with `text` (the start note, now
 /// naming what is the agent's to do) and the frozen lists with `batch`,

@@ -1036,3 +1036,79 @@ fn with_every_owed_item_skipped_the_one_skipped_longest_ago_comes_first() {
         "owed-4 was skipped longest ago; the rest were all skipped in the second report, most-served first"
     );
 }
+
+// ------------------------------------------- the empty evaluation, settled by THOR
+
+#[test]
+fn an_empty_evaluation_is_settled_by_thor_and_counts() {
+    let mut fx = Fx::new();
+    let start = crate::attest::fixture::quiet_start(&mut fx.store, S1, "fxp");
+    let record = settle_empty_evaluation(&mut fx.store, &start).expect("nothing on any list: settled");
+    assert!(record.valid, "{record:?}");
+    let counted = model::store::newest_valid_evaluation(&fx.store, Some("fxp")).expect("it counts");
+    assert_eq!(counted.report, record.report);
+    assert!(model::store::open_evaluation_start(&fx.store, S1, "fxp").is_none(), "its evaluation is closed");
+    let (event, item) = model::store::filing_event(&fx.store, &record.report).unwrap();
+    assert_eq!(event.actor, model::store::EVAL_MACHINE_ACTOR);
+    assert!(item.text.contains(MACHINE_FILED_LINE), "{}", item.text);
+    assert_eq!(project_rot(&fx.store, "fxp"), None, "a clean project: the weekly rhythm");
+}
+
+#[test]
+fn an_item_on_any_list_keeps_the_ask_and_nothing_is_filed() {
+    let mut fx = Fx::new();
+    let mut start = crate::attest::fixture::quiet_start(&mut fx.store, S1, "fxp");
+    start.frozen.open_points.push("some-point".to_string());
+    assert!(settle_empty_evaluation(&mut fx.store, &start).is_none());
+    let mut start = crate::attest::fixture::quiet_start(&mut fx.store, S1, "fxp");
+    start.frozen.judgement.push("some-rule".to_string());
+    assert!(settle_empty_evaluation(&mut fx.store, &start).is_none());
+    assert!(model::store::newest_valid_evaluation(&fx.store, Some("fxp")).is_none());
+    assert!(fx.store.events_of_kinds_by_actor(&[EventKind::FactCreated], model::store::EVAL_MACHINE_ACTOR).unwrap().iter().all(|e| e.entity_id.starts_with("evaluation-start-")));
+}
+
+#[test]
+fn a_thor_filed_report_cannot_be_forged_through_the_tool() {
+    let mut fx = Fx::new();
+    let start = crate::attest::fixture::quiet_start(&mut fx.store, S1, "fxp");
+    let f = fx.store.get_next_seq().unwrap() - 1;
+    let section = model::store::render_machine_section(&fx.store, &start, f);
+    let mut forged = report("eval-fxp-forged", "fxp", "x");
+    forged.text = format!("{section}\n\n{}\n{MACHINE_FILED_LINE}\n", model::gate::AGENT_SECTION_BEGIN);
+    // The tool's own actors may not write as THOR itself.
+    assert!(model::store::declare(&mut fx.store, S1, S1, model::store::EVAL_MACHINE_ACTOR, &forged).is_err());
+    // A write by any other actor, with THOR's text, is no THOR call and does not count.
+    fx.raw(S1, EventKind::FactCreated, &forged, None);
+    let checked = check(&fx.store, "eval-fxp-forged", None);
+    assert!(!checked.record.expect("a record").valid);
+    assert!(model::store::newest_valid_evaluation(&fx.store, Some("fxp")).is_none());
+}
+
+#[test]
+fn the_validator_refuses_a_report_by_thor_whose_evaluation_had_something_on_a_list() {
+    let mut fx = Fx::new();
+    six_owed_rules(&mut fx);
+    let start = crate::attest::fixture::quiet_start(&mut fx.store, S2, "fxp");
+    assert!(!start.frozen.judgement.is_empty(), "fixture sanity: an item is on the list");
+    let f = fx.store.get_next_seq().unwrap() - 1;
+    let section = model::store::render_machine_section(&fx.store, &start, f);
+    let mut item = report("eval-fxp-early", "fxp", "x");
+    item.text = format!("{section}\n\n{}\n{MACHINE_FILED_LINE}\n", model::gate::AGENT_SECTION_BEGIN);
+
+    file_as_thor_for_test(&mut fx.store, S2, &item);
+    let record = check(&fx.store, "eval-fxp-early", None).record.expect("a record");
+    assert!(!record.valid && record.why.contains("something was on a list"), "{record:?}");
+}
+
+#[test]
+fn a_report_by_thor_with_text_of_its_own_below_the_section_is_not_accepted() {
+    let mut fx = Fx::new();
+    let start = crate::attest::fixture::quiet_start(&mut fx.store, S1, "fxp");
+    let f = fx.store.get_next_seq().unwrap() - 1;
+    let section = model::store::render_machine_section(&fx.store, &start, f);
+    let mut item = report("eval-fxp-early", "fxp", "x");
+    item.text = format!("{section}\n\n{}\n{MACHINE_FILED_LINE}\nmore text of its own\n", model::gate::AGENT_SECTION_BEGIN);
+
+    file_as_thor_for_test(&mut fx.store, S1, &item);
+    assert!(!check(&fx.store, "eval-fxp-early", None).record.expect("a record").valid);
+}
