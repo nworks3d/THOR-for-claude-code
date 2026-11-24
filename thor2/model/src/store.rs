@@ -7837,6 +7837,11 @@ pub struct MachineSummary {
 /// character outside printable ASCII is written as its code point, so the
 /// section never carries a glyph, a line break or a control character.
 fn plain(text: &str) -> String {
+    plain_to(text, 200)
+}
+
+/// `plain`, cut at `limit` characters instead of 200.
+fn plain_to(text: &str, limit: usize) -> String {
     let mut out = String::new();
     for c in text.chars() {
         if c == ' ' || c.is_ascii_graphic() {
@@ -7848,8 +7853,8 @@ fn plain(text: &str) -> String {
         }
     }
     let collapsed = out.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.chars().count() > 200 {
-        format!("{}...", collapsed.chars().take(200).collect::<String>())
+    if collapsed.chars().count() > limit {
+        format!("{}...", collapsed.chars().take(limit).collect::<String>())
     } else {
         collapsed
     }
@@ -8250,8 +8255,9 @@ fn health_facts(window: &[Event], place: &str, host_wide_ids: &HashSet<String>) 
     HealthFacts { hook_failures: faults.len(), host_wide_failures: host_wide.len(), skew_events: skews.len(), sentence }
 }
 
-/// The longest refused call a line shows, in characters.
-const REFUSED_CALL_SHOWN: usize = 120;
+/// The longest refused call a line shows, in characters. The log keeps the whole call (secrets blanked);
+/// 120 cut an ssh call before the part that shows whether the refusal was right (2026-11-22).
+const REFUSED_CALL_SHOWN: usize = 800;
 
 /// How many probable false blocks the machine section, the start note and
 /// doctor name before they say how many more there are.
@@ -8272,7 +8278,7 @@ pub fn refused_call_excerpt(event: &Event) -> Option<String> {
         from = found.end;
     }
     masked.push_str(&target[from..]);
-    let flat = plain(&masked);
+    let flat = plain_to(&masked, usize::MAX);
     if flat.is_empty() {
         return None;
     }
@@ -14134,11 +14140,12 @@ mod tests {
             ids.push(item.id);
         }
         let start = record_start(&mut store, "mp-session", "mp");
-        let long = "x".repeat(300);
+        let long = "x".repeat(1000);
         for (n, id) in ids.iter().enumerate() {
             let target = match n {
                 0 => "curl -H 'Authorization: Bearer ghp_abcdefghijklmnopqrstuvwxyz0123456789ABCD' https://example.test".to_string(),
                 1 => long.clone(),
+                2 => format!("ssh host \"{}\"", "y".repeat(400)),
                 _ => "files/x.md".to_string(),
             };
             let body = serde_json::json!({"at": "2026-10-01T00:00:00Z", "target": target, "tool_use_id": "toolu_1"}).to_string();
@@ -14156,8 +14163,10 @@ mod tests {
         assert!(block.contains("--full"), "{block}");
         let first = block.lines().find(|l| l.starts_with("- 'cap-00'")).expect(block);
         assert!(first.contains("[redacted]") && !first.contains("ghp_abcdef"), "a secret is redacted: {first}");
+        let third = block.lines().find(|l| l.starts_with("- 'cap-02'")).expect(block);
+        assert!(third.contains(&"y".repeat(400)), "a 400 character ssh call is kept whole, it was cut at 120: {third}");
         let second = block.lines().find(|l| l.starts_with("- 'cap-01'")).expect(block);
-        assert!(second.contains(&format!("{}...'", "x".repeat(100))) && !second.contains(&"x".repeat(200)), "a long call is cut: {second}");
+        assert!(second.contains(&format!("{}...'", "x".repeat(REFUSED_CALL_SHOWN))) && !second.contains(&"x".repeat(REFUSED_CALL_SHOWN + 1)), "a long call is cut: {second}");
     }
 
     /// The probable false blocks a list shows are the worst ones: the rule that
