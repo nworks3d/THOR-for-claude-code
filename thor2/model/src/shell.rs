@@ -216,6 +216,10 @@ pub struct Segment {
     /// `key=value` token per top-level scalar input field, one per line. Read
     /// only for a literal that is itself a `field_token`; empty otherwise.
     pub fields: String,
+    /// Only on a tool call's pseudo-segment: every top-level input field with
+    /// the values it holds (`input_fields`). Read only by a `requires`
+    /// exemption (`exempt_call`); empty otherwise.
+    pub input: Vec<(String, InputField)>,
     /// The directory this segment certainly runs in, as the call wrote it,
     /// when an earlier `cd`/`pushd`/`Set-Location` on the line that certainly
     /// took effect says so (see this module's doc comment, "THE FOLDER";
@@ -317,6 +321,7 @@ fn flat_segment(command: &str) -> Segment {
         command_len: command.len(),
         unit_words,
         fields: String::new(),
+        input: Vec::new(),
         dir: None,
         any_cd_dir: None,
         depth: 0,
@@ -347,6 +352,7 @@ pub fn tool_segment_with_fields(tool: &str, content: &str, fields: &str) -> Segm
         command_len: content.len(),
         unit_words: content.split_whitespace().collect::<Vec<_>>().join(" "),
         fields: fields.to_string(),
+        input: Vec::new(),
         dir: None,
         any_cd_dir: None,
         depth: 0,
@@ -1099,6 +1105,7 @@ fn collect(command: &str, d: Dialect, depth: usize, start: Place, remote: bool, 
                 command_len,
                 unit_words,
                 fields: String::new(),
+                input: Vec::new(),
                 dir: own_dir.clone(),
                 any_cd_dir: own_any.clone(),
                 depth,
@@ -2834,6 +2841,91 @@ pub fn field_token(text: &str) -> Option<(&str, &str)> {
         && key.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '-'));
     let value_ok = !value.is_empty() && !value.chars().any(char::is_whitespace);
     (key_ok && value_ok).then_some((key, value))
+}
+
+/// What one top-level input field of a tool call holds, for a `requires`
+/// exemption (`exempt_call`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputField {
+    /// The values it gives: a string is one, an array of strings is its
+    /// elements, null is none.
+    Values(Vec<String>),
+    /// An object, a nested array, a number or a boolean: never exempt.
+    Unreadable,
+}
+
+/// Every top-level input field of a tool call with what it holds.
+pub fn input_fields(input: &serde_json::Value) -> Vec<(String, InputField)> {
+    use serde_json::Value;
+    let Value::Object(map) = input else { return Vec::new() };
+    map.iter()
+        .map(|(key, value)| {
+            let field = match value {
+                Value::Null => InputField::Values(Vec::new()),
+                Value::String(s) => InputField::Values(vec![s.clone()]),
+                Value::Array(items) => {
+                    let strings: Vec<String> = items.iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
+                    if strings.len() == items.len() { InputField::Values(strings) } else { InputField::Unreadable }
+                }
+                _ => InputField::Unreadable,
+            };
+            (key.clone(), field)
+        })
+        .collect()
+}
+
+/// One `field=value` token of a requires exemption: the field and the value,
+/// which may be empty (`draftId=` means the field must be absent or empty).
+pub fn exempt_token(token: &str) -> Option<(&str, &str)> {
+    let (field, value) = token.split_once('=')?;
+    let field = field.trim();
+    let name_ok = !field.is_empty()
+        && !field.starts_with('-')
+        && field.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '-'));
+    name_ok.then_some((field, value.trim()))
+}
+
+/// Whether a TOOL call is exempt from a `requires` rule by its `exempt` list
+/// of `field=value` tokens. A shell command never is. The call is exempt when
+/// (a) every value it gives for every field the list names is one of that
+/// field's listed values (a field listed only with an empty value must be
+/// absent or empty), and (b) at least one field with a non-empty listed value
+/// holds at least one value. Values compare trimmed, without regard to case,
+/// whole value only. A field the list does not name is ignored.
+pub fn exempt_call(segment: &Segment, exempt: &[String]) -> bool {
+    if !segment.tool || exempt.is_empty() {
+        return false;
+    }
+    let mut listed: Vec<(&str, Vec<String>)> = Vec::new();
+    for token in exempt {
+        let Some((field, value)) = exempt_token(token) else { return false };
+        let at = match listed.iter().position(|(f, _)| *f == field) {
+            Some(at) => at,
+            None => {
+                listed.push((field, Vec::new()));
+                listed.len() - 1
+            }
+        };
+        if !value.is_empty() {
+            listed[at].1.push(value.to_lowercase());
+        }
+    }
+    let mut some_present = false;
+    for (field, allowed) in &listed {
+        let held = segment.input.iter().find(|(f, _)| f == field).map(|(_, v)| v);
+        let values: Vec<String> = match held {
+            None => Vec::new(),
+            Some(InputField::Unreadable) => return false,
+            Some(InputField::Values(v)) => v.iter().map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect(),
+        };
+        if values.iter().any(|v| !allowed.contains(v)) {
+            return false;
+        }
+        if !allowed.is_empty() && !values.is_empty() {
+            some_present = true;
+        }
+    }
+    some_present
 }
 
 /// A required answer in the form a trial writes into its clean call: the

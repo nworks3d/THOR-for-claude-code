@@ -3314,7 +3314,7 @@ mod step_26_tests {
             expires: None,
             key: None,
             falsifier: Some("Sending without a go turns out harmless.".to_string()),
-            check: Some(Check::Requires { when: "send".to_string(), required: vec!["go-owner".to_string()] }),
+            check: Some(Check::Requires { when: "send".to_string(), required: vec!["go-owner".to_string()], exempt: Vec::new() }),
         };
         const SESSION: &str = "0de7dc52-1b97-4b66-948f-61e4438043b2";
         let mut store = EventStore::in_memory().unwrap();

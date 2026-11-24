@@ -193,6 +193,43 @@ pub fn judge(
     Ok((because, UnpinStamp { kind: kind.to_string(), witnessed, into: None }))
 }
 
+/// THE OWNER'S GO FOR A RULE THAT NEEDS HIS GO (`model::store::is_owner_approval`).
+/// A rule only the owner's own message can answer is not the assistant's to
+/// loosen either: a revise that loosens it (`model::gate::owner_rule_loosened`,
+/// `what` says how) or a retract of it passes only when `because` (`field`
+/// says which argument carries it) quotes, between double quotes, one WHOLE
+/// message the owner typed in this session, with the rule's id in that message
+/// or in the assistant message right before it - the very check an unpin on the
+/// owner's words uses (the hook witnesses the quote, `owner_go_recorded` reads
+/// it). Narrowing or strengthening the rule needs none of this. THOR's own
+/// writers (the installer, the sweep) write through the store, never through
+/// this gate.
+pub fn owner_rule_go(
+    store: &EventStore,
+    id: &str,
+    because: Option<&str>,
+    session: Option<&str>,
+    now: i64,
+    what: &[String],
+    field: &str,
+) -> Result<(), String> {
+    let given = because.map(str::trim).unwrap_or_default();
+    let witnessed = store.path().as_deref().is_some_and(|db| owner_go_recorded(db, id, given, session, now));
+    if witnessed {
+        return Ok(());
+    }
+    let quoted = !crate::order_earlier::quote_candidates(given).is_empty();
+    let unwitnessed = if quoted {
+        " The words you quoted are not one whole message the owner typed in this session that names this rule (a piece of it, a message about something else, a helper's text and your own text do not count)."
+    } else {
+        ""
+    };
+    Err(format!(
+        "REFUSED: nothing was changed. '{id}' is a rule that needs the owner's explicit go, and this call loosens it: {}.{unwitnessed} Only the owner can loosen such a rule, and THOR accepts it only on his own typed words. Ask the owner whether he wants this (name the rule's id '{id}' in your question). When he has said so in his own message in this session, repeat the call with `{field}` holding his whole message between double quotes.",
+        what.join("; ")
+    ))
+}
+
 /// How long before a fold the surviving note must have been created when the tool
 /// server does not know when its session started.
 const FOLD_SURVIVOR_MIN_AGE_SECS: i64 = 24 * 3_600;

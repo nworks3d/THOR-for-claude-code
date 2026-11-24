@@ -8011,7 +8011,10 @@ pub fn check_named(check: &Check) -> String {
         Check::Absent { path, literal } => format!("absent {} in {path}", lit(literal)),
         Check::AbsentAll { path, literals } => format!("absent_all {} in {path}", all(literals)),
         Check::Forbidden { literals } => format!("forbidden {}", all(literals)),
-        Check::Requires { when, required } => format!("requires {} on '{when}'", all(required)),
+        Check::Requires { when, required, exempt } if exempt.is_empty() => format!("requires {} on '{when}'", all(required)),
+        Check::Requires { when, required, exempt } => {
+            format!("requires {} on '{when}', except a call holding only {}", all(required), all(exempt))
+        }
     }
 }
 
@@ -8535,10 +8538,14 @@ fn check_arguments(check: &Check) -> String {
             format!("check_kind: \"absent_all\", check_path: {}, check_literals: [{}]", ascii_json(path), list(literals))
         }
         Check::Forbidden { literals } => format!("check_kind: \"forbidden\", check_literals: [{}]", list(literals)),
-        Check::Requires { when, required } => {
+        Check::Requires { when, required, exempt } => {
             let mut all = vec![when.clone()];
             all.extend(required.iter().cloned());
-            format!("check_kind: \"requires\", check_literals: [{}]", list(&all))
+            let mut call = format!("check_kind: \"requires\", check_literals: [{}]", list(&all));
+            if !exempt.is_empty() {
+                call.push_str(&format!(", check_exempt: [{}]", list(exempt)));
+            }
+            call
         }
     }
 }
@@ -10261,7 +10268,9 @@ fn check_covers(successor: &Item, lost: &Item) -> bool {
         (Check::AbsentAll { path: a, literals: have }, Check::AbsentAll { path: b, literals: need }) => a == b && superset(have, need),
         (Check::AbsentAll { path: a, literals: have }, Check::Absent { path: b, literal }) => a == b && have.iter().any(|h| h == literal),
         (Check::PathExists { path: a }, Check::PathExists { path: b }) => a == b,
-        (Check::Requires { when: wa, required: have }, Check::Requires { when: wb, required: need }) => wa == wb && superset(have, need),
+        (Check::Requires { when: wa, required: have, exempt: ea }, Check::Requires { when: wb, required: need, exempt: eb }) => {
+            wa == wb && superset(have, need) && superset(eb, ea)
+        }
         _ => false,
     }
 }
@@ -14482,7 +14491,7 @@ mod tests {
         let mut rule = heavy_command_rule("og-rule", "og");
         rule.tags = vec![OWNER_APPROVAL_TAG.to_string()];
         rule.text = "Never touch the fixture command without the owner's explicit go.".to_string();
-        rule.check = Some(Check::Requires { when: "fixture-command-og-rule".to_string(), required: vec!["go-owner".to_string()] });
+        rule.check = Some(Check::Requires { when: "fixture-command-og-rule".to_string(), required: vec!["go-owner".to_string()], exempt: Vec::new() });
         assert!(gate::unnamed_literals(&rule).is_empty(), "the owner's marker is exempt from A4");
         declare(&mut store, "s", "l", "a", &rule).expect("an owner rule whose text does not name its marker");
 
@@ -14503,9 +14512,9 @@ mod tests {
         let mut old = heavy_command_rule("og-old", "og");
         old.tags.clear();
         old.text = "Never touch the fixture command without go-owner in the call.".to_string();
-        old.check = Some(Check::Requires { when: "fixture-command-og-old".to_string(), required: vec!["go-owner".to_string()] });
+        old.check = Some(Check::Requires { when: "fixture-command-og-old".to_string(), required: vec!["go-owner".to_string()], exempt: Vec::new() });
         legacy(&mut store, &old);
-        let other = Check::Requires { when: "fixture-command-og-other".to_string(), required: vec!["--dry-run".to_string()] };
+        let other = Check::Requires { when: "fixture-command-og-other".to_string(), required: vec!["--dry-run".to_string()], exempt: Vec::new() };
         let mut not_a_marker = heavy_command_rule("og-other", "og");
         not_a_marker.tags.clear();
         not_a_marker.text = "The fixture command always runs with --dry-run first.".to_string();
@@ -17903,7 +17912,7 @@ mod tests {
             Check::Absent { path: "NOTES.md".to_string(), literal: "drop me".to_string() },
             Check::AbsentAll { path: "NOTES.md".to_string(), literals: vec!["drop me".to_string()] },
             Check::PathExists { path: "NOTES.md".to_string() },
-            Check::Requires { when: "git tag".to_string(), required: vec!["-s".to_string()] },
+            Check::Requires { when: "git tag".to_string(), required: vec!["-s".to_string()], exempt: Vec::new() },
         ];
         for check in checks {
             let mut store = EventStore::in_memory().unwrap();

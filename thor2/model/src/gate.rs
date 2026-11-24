@@ -425,7 +425,7 @@ fn check_check(check: &Check) -> Result<(), Refusal> {
             check_literal_list(literals, "an absent_all check")
         }
         Check::Forbidden { literals } => check_literal_list(literals, "a forbidden check"),
-        Check::Requires { when, required } => check_requires(when, required),
+        Check::Requires { when, required, .. } => check_requires(when, required),
     }
 }
 
@@ -894,7 +894,7 @@ pub fn teeth_triggers(item: &Item) -> Vec<String> {
                 literals.iter().for_each(|l| push(l));
             }
             Check::Absent { literal, .. } | Check::Contains { literal, .. } => push(literal),
-            Check::Requires { when, required } => {
+            Check::Requires { when, required, .. } => {
                 push(when);
                 required.iter().for_each(|r| push(r));
             }
@@ -1630,6 +1630,40 @@ fn declare_inner(
     // find_requires_violation`). Such a trigger must be specific enough to
     // mean something inside a command - see `inner_trigger_is_specific` -
     // and the item still needs a Command binding for it to live in.
+    // GROUND 24b: an exemption of a `requires` check is the owner's choice to
+    // let some calls through, so it says so in the text: each token reads
+    // `field=value`, at least one has a value (otherwise no call can ever be
+    // exempt), and every value is named in the rule's own text.
+    if let Some(Check::Requires { exempt, .. }) = &item.check {
+        let mut with_value = false;
+        for token in exempt {
+            let Some((field, value)) = crate::shell::exempt_token(token) else {
+                return Err(Refusal::new(
+                    format!("a requires check's exemption entry '{token}' is not 'field=value'"),
+                    "write each exemption as the tool's input field, an equals sign and the allowed value (for example 'to=me@example.test'), or 'field=' alone for a field that must be absent or empty",
+                ));
+            };
+            if value.is_empty() {
+                continue;
+            }
+            with_value = true;
+            if !literal_is_named(&item.text, value) {
+                return Err(Refusal::new(
+                    format!(
+                        "this requires check lets a call through when '{field}' holds '{}', but the rule's own text does not name that value",
+                        shown_literal(value)
+                    ),
+                    format!("say in the text which '{field}' value passes without the answer (name '{}'), or drop the exemption", shown_literal(value)),
+                ));
+            }
+        }
+        if !exempt.is_empty() && !with_value {
+            return Err(Refusal::new(
+                "a requires check's exemption names only empty values, so no call could ever be exempt",
+                "give at least one 'field=value' with a value, or drop the exemption",
+            ));
+        }
+    }
     if let Some(Check::Requires { when, .. }) = &item.check {
         let has_command_binding =
             item.bindings.iter().any(|b| matches!(b, Binding::Target { kind: TargetKind::Command, .. }));
@@ -2469,6 +2503,25 @@ pub fn build_check(
     literal: Option<String>,
     literals: Vec<String>,
 ) -> Result<Option<Check>, String> {
+    build_check_exempt(kind, path, literal, literals, Vec::new())
+}
+
+/// [`build_check`] with a `requires` exemption (`check_exempt`): `field=value`
+/// tokens naming what a TOOL call may hold to pass without an answer. Refused
+/// with any other kind, and for a token that is not `field=value`.
+pub fn build_check_exempt(
+    kind: Option<&str>,
+    path: Option<String>,
+    literal: Option<String>,
+    literals: Vec<String>,
+    exempt: Vec<String>,
+) -> Result<Option<Check>, String> {
+    if !exempt.is_empty() && kind != Some("requires") {
+        return Err(
+            "check_exempt was given, but only check_kind 'requires' takes one: it names what a tool call may hold to pass without the rule's answer"
+                .to_string(),
+        );
+    }
     if literal.is_some() && !literals.is_empty() {
         return Err(
             "both check_literal and check_literals were given - check_literal names a single \
@@ -2529,7 +2582,25 @@ pub fn build_check(
                     .to_string(),
             );
         }
-        return Ok(Some(Check::Requires { when, required }));
+        let mut tokens: Vec<String> = Vec::new();
+        for token in &exempt {
+            let Some((field, value)) = crate::shell::exempt_token(token) else {
+                return Err(format!(
+                    "check_exempt entry {token:?} is not 'field=value': name a top-level input field of the tool, an equals sign and the value that is allowed (for example \"to=me@example.test\"), or 'field=' alone for a field that must be absent or empty"
+                ));
+            };
+            let token = format!("{field}={value}");
+            if !tokens.contains(&token) {
+                tokens.push(token);
+            }
+        }
+        if !tokens.is_empty() && !tokens.iter().any(|t| !t.ends_with('=')) {
+            return Err(
+                "check_exempt names only empty values, so no call could ever be exempt: it needs at least one                  'field=value' with a value"
+                    .to_string(),
+            );
+        }
+        return Ok(Some(Check::Requires { when, required, exempt: tokens }));
     }
     if kind == "forbidden" {
         if let Some(path) = path {
@@ -3235,7 +3306,7 @@ pub fn unnamed_literals(item: &Item) -> Vec<String> {
         Check::Absent { literal, .. } | Check::Contains { literal, .. } => {
             if named(literal) { Vec::new() } else { vec![literal.clone()] }
         }
-        Check::Requires { when, required } => {
+        Check::Requires { when, required, .. } => {
             let mut out = Vec::new();
             let trimmed = when.trim();
             let stem = trimmed.strip_suffix('*').unwrap_or(trimmed).trim();
@@ -3802,6 +3873,47 @@ pub fn weakenings_widened(before: &Item, updated: &Item) -> Vec<Weakening> {
         });
     }
     found
+}
+
+/// What a revise of a rule that needs THE OWNER'S GO (`store::is_owner_approval`)
+/// loosens, in plain words - empty for any other rule, and empty when the
+/// revise only narrows or strengthens it. These are the changes that need the
+/// owner's own whole message quoted (`serve::unpin_gate`): everything
+/// `weakenings_widened` finds, except a check change that keeps the same
+/// trigger and neither adds an answer nor widens the exemption, plus an
+/// exemption that is new or wider. A retract of such a rule is judged by the
+/// caller (it has no `updated`).
+pub fn owner_rule_loosened(before: &Item, updated: &Item) -> Vec<String> {
+    if !crate::store::is_owner_approval(before) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for w in weakenings_widened(before, updated) {
+        if w.label == "check changed" {
+            continue;
+        }
+        out.push(w.problem);
+    }
+    if let (Some(old), Some(new)) = (&before.check, &updated.check) {
+        if old != new {
+            let narrower = match (old, new) {
+                (
+                    Check::Requires { when: wa, required: ra, exempt: ea },
+                    Check::Requires { when: wb, required: rb, exempt: eb },
+                ) => wa == wb && rb.iter().all(|r| ra.contains(r)) && eb.iter().all(|e| ea.contains(e)),
+                _ => false,
+            };
+            if !narrower {
+                out.push(match (old, new) {
+                    (Check::Requires { exempt: ea, .. }, Check::Requires { exempt: eb, .. }) if eb.iter().any(|e| !ea.contains(e)) => {
+                        "this adds or widens what a call may hold to pass the rule without the owner's go".to_string()
+                    }
+                    _ => "this changes the check of a rule that needs the owner's go".to_string(),
+                });
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -5716,7 +5828,7 @@ mod tests {
     fn a_requires_check_with_an_empty_trigger_is_refused() {
         let mut item = base(Kind::Rule);
         item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "git commit".to_string() }];
-        item.check = Some(Check::Requires { when: "   ".to_string(), required: vec!["issue:".to_string()] });
+        item.check = Some(Check::Requires { when: "   ".to_string(), required: vec!["issue:".to_string()], exempt: Vec::new() });
         let err = declare(&item).unwrap_err();
         assert!(err.problem.contains("trigger"), "names what is wrong: {}", err.problem);
     }
@@ -5725,7 +5837,7 @@ mod tests {
     fn a_requires_check_with_no_required_answers_is_refused() {
         let mut item = base(Kind::Rule);
         item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "git commit".to_string() }];
-        item.check = Some(Check::Requires { when: "git commit".to_string(), required: vec![] });
+        item.check = Some(Check::Requires { when: "git commit".to_string(), required: vec![], exempt: Vec::new() });
         let err = declare(&item).unwrap_err();
         assert!(err.problem.contains("nothing it requires"), "names what is wrong: {}", err.problem);
     }
@@ -5739,6 +5851,7 @@ mod tests {
         item.check = Some(Check::Requires {
             when: "git commit".to_string(),
             required: vec!["issue:".to_string(), "".to_string()],
+            exempt: Vec::new(),
         });
         let err = declare(&item).unwrap_err();
         assert!(err.problem.contains("empty entry"), "names what is wrong: {}", err.problem);
@@ -5749,7 +5862,7 @@ mod tests {
         let mut item = base(Kind::Rule);
         item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "git commit".to_string() }];
         item.check =
-            Some(Check::Requires { when: "git commit".to_string(), required: vec!["git commit".to_string()] });
+            Some(Check::Requires { when: "git commit".to_string(), required: vec!["git commit".to_string()], exempt: Vec::new() });
         let err = declare(&item).unwrap_err();
         assert!(err.problem.contains("own trigger"), "names what is wrong: {}", err.problem);
     }
@@ -5763,7 +5876,7 @@ mod tests {
         // `check_requires`'s own doc comment). "ok" must still be accepted.
         let mut item = base(Kind::Rule);
         item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "git commit".to_string() }];
-        item.check = Some(Check::Requires { when: "git commit".to_string(), required: vec!["ok".to_string()] });
+        item.check = Some(Check::Requires { when: "git commit".to_string(), required: vec!["ok".to_string()], exempt: Vec::new() });
         assert!(declare(&naming(&item)).is_ok());
     }
 
@@ -5774,6 +5887,7 @@ mod tests {
         item.check = Some(Check::Requires {
             when: "git commit".to_string(),
             required: vec!["issue:".to_string(), "no-issue".to_string()],
+            exempt: Vec::new(),
         });
         assert!(declare(&naming(&item)).is_ok());
     }
@@ -5795,7 +5909,7 @@ mod tests {
     fn a_requires_check_bound_always_is_refused() {
         let mut item = base(Kind::Rule);
         item.bindings = vec![Binding::Always];
-        item.check = Some(Check::Requires { when: "Agent".to_string(), required: vec!["haiku".to_string()] });
+        item.check = Some(Check::Requires { when: "Agent".to_string(), required: vec!["haiku".to_string()], exempt: Vec::new() });
         let err = declare(&item).unwrap_err();
         assert!(err.problem.contains("Always"), "names what is wrong: {}", err.problem);
         assert!(err.fix.contains("command or tool"), "points at the fix: {}", err.fix);
@@ -5807,7 +5921,7 @@ mod tests {
     fn a_requires_check_moved_off_always_onto_a_command_is_accepted() {
         let mut item = base(Kind::Rule);
         item.bindings = vec![Binding::Always];
-        item.check = Some(Check::Requires { when: "Agent".to_string(), required: vec!["haiku".to_string()] });
+        item.check = Some(Check::Requires { when: "Agent".to_string(), required: vec!["haiku".to_string()], exempt: Vec::new() });
         assert!(declare(&naming(&item)).is_err());
 
         item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "Agent".to_string() }];
@@ -5822,7 +5936,7 @@ mod tests {
     fn pinning_a_command_bound_requires_item_is_refused() {
         let mut existing = base(Kind::Rule);
         existing.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "Agent".to_string() }];
-        existing.check = Some(Check::Requires { when: "Agent".to_string(), required: vec!["haiku".to_string()] });
+        existing.check = Some(Check::Requires { when: "Agent".to_string(), required: vec!["haiku".to_string()], exempt: Vec::new() });
 
         let mut updated = existing.clone();
         updated.bindings.push(Binding::Always);
@@ -5847,6 +5961,7 @@ mod tests {
         item.check = Some(Check::Requires {
             when: "Agent".to_string(),
             required: vec!["haiku".to_string(), "sonnet".to_string()],
+            exempt: Vec::new(),
         });
         assert!(declare(&item).is_ok(), "the rule already on the owner's machine must still declare");
     }
@@ -5873,7 +5988,7 @@ mod tests {
         for (binding, when) in [("git commit", "push"), ("ssh", "dev"), ("ssh", "-p")] {
             let mut item = base(Kind::Rule);
             item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: binding.to_string() }];
-            item.check = Some(Check::Requires { when: when.to_string(), required: vec!["issue:".to_string()] });
+            item.check = Some(Check::Requires { when: when.to_string(), required: vec!["issue:".to_string()], exempt: Vec::new() });
             let err = declare(&item).unwrap_err();
             assert!(err.problem.contains(&format!("'{when}'")), "names the trigger: {}", err.problem);
             assert!(err.problem.contains("not specific enough"), "{}", err.problem);
@@ -5892,6 +6007,7 @@ mod tests {
         item.check = Some(Check::Requires {
             when: "-p acme-dev".to_string(),
             required: vec!["-f docker-compose.dev.yml".to_string()],
+            exempt: Vec::new(),
         });
         assert!(declare(&naming(&item)).is_ok(), "{:?}", declare(&naming(&item)));
     }
@@ -5904,7 +6020,7 @@ mod tests {
     fn a_trigger_narrower_than_its_binding_is_an_inner_trigger() {
         let mut item = base(Kind::Rule);
         item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "git".to_string() }];
-        item.check = Some(Check::Requires { when: "git commit".to_string(), required: vec!["issue:".to_string()] });
+        item.check = Some(Check::Requires { when: "git commit".to_string(), required: vec!["issue:".to_string()], exempt: Vec::new() });
         assert!(declare(&naming(&item)).is_ok(), "{:?}", declare(&naming(&item)));
     }
 
@@ -5917,6 +6033,7 @@ mod tests {
         item.check = Some(Check::Requires {
             when: "-p acme-dev".to_string(),
             required: vec!["-f docker-compose.dev.yml".to_string()],
+            exempt: Vec::new(),
         });
         let err = declare(&item).unwrap_err();
         assert!(err.problem.contains("no Command binding"), "{}", err.problem);
@@ -5926,7 +6043,7 @@ mod tests {
     fn a_trigger_equal_to_its_single_binding_is_accepted() {
         let mut item = base(Kind::Rule);
         item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "Agent".to_string() }];
-        item.check = Some(Check::Requires { when: "Agent".to_string(), required: vec!["haiku".to_string()] });
+        item.check = Some(Check::Requires { when: "Agent".to_string(), required: vec!["haiku".to_string()], exempt: Vec::new() });
         assert!(declare(&naming(&item)).is_ok());
     }
 
@@ -5942,7 +6059,7 @@ mod tests {
             Binding::Target { kind: TargetKind::Command, value: "Agent".to_string() },
             Binding::Target { kind: TargetKind::Command, value: "Workflow".to_string() },
         ];
-        item.check = Some(Check::Requires { when: "Agent".to_string(), required: vec!["haiku".to_string()] });
+        item.check = Some(Check::Requires { when: "Agent".to_string(), required: vec!["haiku".to_string()], exempt: Vec::new() });
         assert!(declare(&naming(&item)).is_ok(), "naming only one of several bindings is not a dead binding any more");
     }
 
@@ -5958,6 +6075,7 @@ mod tests {
             item.check = Some(Check::Requires {
                 when: when.to_string(),
                 required: vec!["thor2".to_string(), "scratchpad".to_string()],
+                exempt: Vec::new(),
             });
             declare(&naming(&item))
         };
@@ -5997,7 +6115,7 @@ mod tests {
     fn a_trigger_matching_a_binding_only_by_case_is_accepted() {
         let mut item = base(Kind::Rule);
         item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "Agent".to_string() }];
-        item.check = Some(Check::Requires { when: "AGENT".to_string(), required: vec!["haiku".to_string()] });
+        item.check = Some(Check::Requires { when: "AGENT".to_string(), required: vec!["haiku".to_string()], exempt: Vec::new() });
         assert!(declare(&naming(&item)).is_ok());
     }
 
@@ -6485,7 +6603,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             check,
-            Some(Check::Requires { when: "agent(".to_string(), required: vec!["model:".to_string()] })
+            Some(Check::Requires { when: "agent(".to_string(), required: vec!["model:".to_string()], exempt: Vec::new() })
         );
     }
 
@@ -6506,7 +6624,8 @@ mod tests {
             many,
             Some(Check::Requires {
                 when: "Agent".to_string(),
-                required: vec!["haiku".to_string(), "sonnet".to_string()]
+                required: vec!["haiku".to_string(), "sonnet".to_string()],
+                exempt: Vec::new(),
             })
         );
     }
@@ -7566,6 +7685,7 @@ mod two_tracks_tests {
                 Some(Check::Requires {
                     when: when.to_string(),
                     required: required.iter().map(|r| r.to_string()).collect(),
+                    exempt: Vec::new(),
                 }),
             )
         };
@@ -8232,5 +8352,126 @@ mod aside_tests {
         let flags: Vec<_> = teeth_candidates(&both).into_iter().filter(|c| c.value == "--watch").collect();
         assert_eq!(flags.len(), 1);
         assert_eq!(flags[0].source, CandidateSource::Flag);
+    }
+}
+
+#[cfg(test)]
+mod exemption_tests {
+    use super::*;
+    use crate::item::{Binding, Check, Item, Kind, Severity, TargetKind};
+
+    fn base(kind: Kind) -> Item {
+        Item {
+            id: "id-1".to_string(),
+            kind,
+            text: "do the thing".to_string(),
+            bindings: vec![],
+            severity: None,
+            project: Some("test-project".to_string()),
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some("the fixture turns out wrong".to_string()),
+            check: None,
+        }
+    }
+
+    // ------------------------------------------------ a requires exemption
+
+    fn mail_rule(exempt: &[&str], text: &str) -> Item {
+        let mut item = base(Kind::Rule);
+        item.text = text.to_string();
+        item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "mcp__zz__send_message".to_string() }];
+        item.check = Some(Check::Requires {
+            when: "mcp__zz__send_message".to_string(),
+            required: vec!["go-word".to_string()],
+            exempt: exempt.iter().map(|e| e.to_string()).collect(),
+        });
+        item
+    }
+
+    #[test]
+    fn an_exemption_value_must_be_named_in_the_rules_text() {
+        let unnamed = mail_rule(&["to=me@example.test"], "Mail needs go-word, always.");
+        let err = declare(&unnamed).expect_err("the exemption value is not named");
+        assert!(err.problem.contains("me@example.test") && err.problem.contains("does not name that value"), "{}", err.problem);
+        let named = mail_rule(&["to=me@example.test"], "Mail needs go-word, except a mail only to me@example.test.");
+        assert!(declare(&named).is_ok());
+        // An empty value (the field must be absent) needs no naming, but one real value must exist.
+        let both = mail_rule(&["to=me@example.test", "draftId="], "Mail needs go-word, except a mail only to me@example.test.");
+        assert!(declare(&both).is_ok());
+        let only_empty = mail_rule(&["draftId="], "Mail needs go-word.");
+        assert!(declare(&only_empty).unwrap_err().problem.contains("only empty values"));
+        let bad = mail_rule(&["not a token"], "Mail needs go-word.");
+        assert!(declare(&bad).unwrap_err().problem.contains("not 'field=value'"));
+    }
+
+    #[test]
+    fn build_check_exempt_takes_the_exemption_with_requires_only() {
+        let literals = vec!["mcp__zz__send_message".to_string(), "go-word".to_string()];
+        let built =
+            build_check_exempt(Some("requires"), None, None, literals.clone(), vec![" to = me@example.test ".to_string()]).unwrap();
+        assert_eq!(
+            built,
+            Some(Check::Requires {
+                when: "mcp__zz__send_message".to_string(),
+                required: vec!["go-word".to_string()],
+                exempt: vec!["to=me@example.test".to_string()],
+            })
+        );
+        assert!(build_check_exempt(Some("forbidden"), None, None, vec!["x".to_string()], vec!["to=a".to_string()]).is_err());
+        assert!(build_check_exempt(Some("requires"), None, None, literals.clone(), vec!["oops".to_string()]).is_err());
+        assert!(build_check_exempt(Some("requires"), None, None, literals, vec!["to=".to_string()]).is_err());
+    }
+
+    fn owner_rule(exempt: &[&str]) -> Item {
+        let mut item = mail_rule(exempt, "Mail needs go-word, except a mail only to me@example.test.");
+        item.tags = vec![crate::store::OWNER_APPROVAL_TAG.to_string()];
+        item.severity = Some(Severity::Costly);
+        item
+    }
+
+    #[test]
+    fn only_a_loosening_of_a_rule_that_needs_the_owners_go_is_named() {
+        let before = owner_rule(&["to=me@example.test"]);
+        // Nothing changed, or only the text: nothing to say.
+        assert!(owner_rule_loosened(&before, &before).is_empty());
+        let mut reworded = before.clone();
+        reworded.falsifier = Some("another falsifier".to_string());
+        assert!(owner_rule_loosened(&before, &reworded).is_empty());
+
+        // Loosening: the exemption widens or appears, the check goes, the tag goes, the severity drops.
+        let wider = owner_rule(&["to=me@example.test", "cc=me@example.test"]);
+        assert!(owner_rule_loosened(&before, &wider).iter().any(|p| p.contains("adds or widens")));
+        let appears = owner_rule(&["to=me@example.test"]);
+        assert!(owner_rule_loosened(&owner_rule(&[]), &appears).iter().any(|p| p.contains("adds or widens")));
+        let mut cleared = before.clone();
+        cleared.check = None;
+        assert!(!owner_rule_loosened(&before, &cleared).is_empty());
+        let mut untagged = before.clone();
+        untagged.tags.clear();
+        assert!(owner_rule_loosened(&before, &untagged).iter().any(|p| p.contains("owner's go")));
+        let mut lower = before.clone();
+        lower.severity = Some(Severity::HouseStyle);
+        assert!(!owner_rule_loosened(&before, &lower).is_empty());
+        let mut more_answers = before.clone();
+        if let Some(Check::Requires { required, .. }) = &mut more_answers.check {
+            required.push("go-other".to_string());
+        }
+        assert!(!owner_rule_loosened(&before, &more_answers).is_empty(), "one more answer opens the rule wider");
+
+        // Narrowing or strengthening: no quote needed.
+        assert!(owner_rule_loosened(&wider, &before).is_empty(), "a narrower exemption");
+        assert!(owner_rule_loosened(&before, &owner_rule(&[])).is_empty(), "no exemption at all");
+        let mut higher = before.clone();
+        higher.severity = Some(Severity::Irreversible);
+        assert!(owner_rule_loosened(&before, &higher).is_empty());
+
+        // A rule that does not need the owner's go is not this gate's business.
+        let mut plain = before.clone();
+        plain.tags.clear();
+        let mut plain_wider = wider.clone();
+        plain_wider.tags.clear();
+        assert!(owner_rule_loosened(&plain, &plain_wider).is_empty());
     }
 }

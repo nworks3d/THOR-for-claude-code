@@ -117,6 +117,10 @@ const NO_SESSION: &str = "mcp";
 const REPLICA_TAKEDOWN_NOTE: &str = "A pinned note comes down on the main machine only: the owner's own words cannot be \
      witnessed from a copy, so this is judged there, by the same rule (proven out of date and unused).";
 
+/// What a copy (replica) says when a change that loosens a rule needing the
+/// owner's go is queued: his own words cannot be witnessed from a copy either.
+const REPLICA_LOOSEN_NOTE: &str = "A rule that needs the owner's go is changed on the main machine only: the owner's own words cannot be witnessed from a copy, so this is judged there, by the same rule (his whole message quoted in the reason).";
+
 /// A write call's arguments exactly as they arrived, cloned before
 /// `Parameters<T>` takes them - so the schema stays generated from `T`, and
 /// the digest is of what the client really sent (step 12: the transcript's
@@ -514,7 +518,7 @@ proof of a Rule/Orientation's own currency, alongside the required falsifier, ne
 it. Only a check that is tried and currently HOLDS can block a write; prose alone can inform, \
 never block. Six kinds: path_exists, contains, absent, absent_all (a literal set in one file or \
 directory), forbidden (a literal set with no file at all), requires (a trigger plus every \
-acceptable answer, catching something FORGOTTEN rather than written). Prefer forbidden with \
+acceptable answer, catching something FORGOTTEN rather than written; a requires check on a tool can also take check_exempt, field=value entries naming what a call may hold to pass without the answer). Prefer forbidden with \
 nothing to anchor to; prefer the anchored kinds when a real file could move or its content \
 could change.\n\nBINDINGS: a Rule/Orientation needs at least one - a Moment (only what a real \
 command or file actually produces fires: publish, commit, deploy and the rest, plus remember \
@@ -644,6 +648,7 @@ string_list_readers! {
     tags_list, tags_option => "tags";
     moments_list, moments_option => "moments";
     check_literals_list, check_literals_option => "check_literals";
+    check_exempt_list, check_exempt_option => "check_exempt";
     legitimate_calls_list, legitimate_calls_option => "legitimate_calls";
     may_change_list, may_change_option => "may_change";
     accept_refusing_list, accept_refusing_option => "accept_refusing";
@@ -1766,14 +1771,40 @@ fn plan_revise(existing: &Item, args: &ReviseArgs) -> Result<RevisePlan, String>
     } else {
         args.check_kind.clone()
     };
-    let check = if check_kind_arg.is_none()
+    let only_exempt = check_kind_arg.is_none()
+        && args.check_path.is_none()
+        && args.check_literal.is_none()
+        && args.check_literals.is_empty()
+        && !args.check_exempt.is_empty();
+    let check = if only_exempt {
+        // Only the exemption was given: the trigger and the answers stay,
+        // the exemption is replaced.
+        match &existing.check {
+            Some(model::item::Check::Requires { when, required, .. }) => {
+                let mut literals = vec![when.clone()];
+                literals.extend(required.iter().cloned());
+                model::gate::build_check_exempt(Some("requires"), None, None, literals, args.check_exempt.clone())
+                    .map_err(|e| format!("invalid check: {e}"))?
+            }
+            _ => {
+                return Err(
+                    "invalid check: check_exempt was given, but this item carries no requires check - only a requires check takes an exemption"
+                        .to_string(),
+                );
+            }
+        }
+    } else if check_kind_arg.is_none()
         && args.check_path.is_none()
         && args.check_literal.is_none()
         && args.check_literals.is_empty()
     {
         existing.check.clone()
     } else if check_kind_arg.as_deref() == Some("") {
-        if args.check_path.is_some() || args.check_literal.is_some() || !args.check_literals.is_empty() {
+        if args.check_path.is_some()
+            || args.check_literal.is_some()
+            || !args.check_literals.is_empty()
+            || !args.check_exempt.is_empty()
+        {
             return Err(
                 "invalid check: the check was cleared (check_kind \"\" or clear_check) but \
                  check_path, check_literal or check_literals was also given - clearing a \
@@ -1784,11 +1815,12 @@ fn plan_revise(existing: &Item, args: &ReviseArgs) -> Result<RevisePlan, String>
         }
         None
     } else {
-        model::gate::build_check(
+        model::gate::build_check_exempt(
             check_kind_arg.as_deref(),
             args.check_path.clone(),
             args.check_literal.clone(),
             args.check_literals.clone(),
+            args.check_exempt.clone(),
         )
         .map_err(|e| format!("invalid check: {e}"))?
     };
@@ -1871,6 +1903,7 @@ fn plan_revise(existing: &Item, args: &ReviseArgs) -> Result<RevisePlan, String>
         && args.check_path.is_none()
         && args.check_literal.is_none()
         && args.check_literals.is_empty()
+        && args.check_exempt.is_empty()
         && args.moments.is_none()
         && args.targets.is_none()
         && args.always.is_none()
@@ -1889,11 +1922,12 @@ fn remembered_item(args: &RememberArgs) -> Result<Item, String> {
         Some(v) => Some(Severity::from_str(v).map_err(|e| format!("invalid 'severity': {e}"))?),
     };
     let bindings = build_bindings(&args.moments, &args.targets, args.always).map_err(|e| format!("invalid binding: {e}"))?;
-    let check = model::gate::build_check(
+    let check = model::gate::build_check_exempt(
         args.check_kind.as_deref(),
         args.check_path.clone(),
         args.check_literal.clone(),
         args.check_literals.clone(),
+        args.check_exempt.clone(),
     )
     .map_err(|e| format!("invalid check: {e}"))?;
     Ok(Item {
@@ -2248,6 +2282,15 @@ pub struct RememberArgs {
     /// then every answer that satisfies it.
     #[serde(default, deserialize_with = "check_literals_list")]
     pub check_literals: Vec<String>,
+    /// Only for check_kind requires: calls of a TOOL that pass the rule without its answer. Each entry is
+    /// "field=value", a top-level input field of the tool and the one value it may hold (for example
+    /// "to=me@example.test"); "field=" alone means that field must be absent or empty. A call is exempt when
+    /// every value it gives for every field named here is one of that field's listed values, and at least one
+    /// field with a listed value is present; values compare trimmed and without regard to case, whole value
+    /// only. A shell command is never exempt. Every value must be named in the rule's own text. Adding or
+    /// widening one on a rule that needs the owner's go needs the owner's whole message in `because`.
+    #[serde(default, deserialize_with = "check_exempt_list")]
+    pub check_exempt: Vec<String>,
     /// Action names this item fires on (repeatable), e.g. ["push"]. Only a Rule/Orientation may
     /// bind to a moment. The ones that actually fire are derived from a real command or file path
     /// (publish, commit, push, deploy and the rest - see intent::from_command/from_path), plus
@@ -2432,6 +2475,16 @@ pub struct ReviseArgs {
     /// it, since a list has no separate way to say 'given, but deliberately empty'.
     #[serde(default, deserialize_with = "check_literals_list")]
     pub check_literals: Vec<String>,
+    /// Only for check_kind requires: calls of a TOOL that pass the rule without its answer. Each entry is
+    /// "field=value", a top-level input field of the tool and the one value it may hold (for example
+    /// "to=me@example.test"); "field=" alone means that field must be absent or empty. A call is exempt when
+    /// every value it gives for every field named here is one of that field's listed values, and at least one
+    /// field with a listed value is present; values compare trimmed and without regard to case, whole value
+    /// only. A shell command is never exempt. Every value must be named in the rule's own text. Adding or
+    /// widening one on a rule that needs the owner's go needs the owner's whole message in `because`. On a revise, giving only check_exempt keeps the rule's trigger and answers and replaces
+    /// the exemption; to drop it, repeat check_kind and check_literals without check_exempt.
+    #[serde(default, deserialize_with = "check_exempt_list")]
+    pub check_exempt: Vec<String>,
     /// Set true to clear the check - the same clear `check_kind: ""` above
     /// documents, same fix and convention as `clear_severity`'s own doc
     /// comment (see there for the defect and the evidence). Refused, naming
@@ -3278,8 +3331,22 @@ impl ThorMcpServer {
                     && plan_revise(&existing, &args).is_ok_and(|plan| !serve::unpin_gate::is_pinned(&plan.updated.bindings))
             })
         };
+        let replica_loosen = self.inbox.is_some() && {
+            let store = self.store.lock().unwrap_or_else(|p| p.into_inner());
+            model::store::show(&store, &args.id).ok().is_some_and(|existing| {
+                plan_revise(&existing, &args).is_ok_and(|plan| {
+                    !model::gate::owner_rule_loosened(&normalized_item(&existing), &normalized_item(&plan.updated)).is_empty()
+                })
+            })
+        };
         if let Some(queued) = self.capture("revise", &args) {
-            return if replica_takedown { format!("{queued} {REPLICA_TAKEDOWN_NOTE}") } else { queued };
+            return if replica_takedown {
+                format!("{queued} {REPLICA_TAKEDOWN_NOTE}")
+            } else if replica_loosen {
+                format!("{queued} {REPLICA_LOOSEN_NOTE}")
+            } else {
+                queued
+            };
         }
         let stamp = self.stamp("revise", meta, raw);
         // The checkout this server was started in, for the worktree check and
@@ -3310,6 +3377,20 @@ impl ThorMcpServer {
             refuse_a_side_door_on_a_frozen_item(s, &args.id, &att)?;
             let RevisePlan { mut updated, mut gate_existing, tags_cleared, dropped_reasons, bare } = plan_revise(&existing, &args)?;
             settle_pin_exceptions(s, Some(&existing), &mut updated, args.because.as_deref(), session.session_id.as_deref())?;
+            // A rule that needs the owner's go is loosened only on his own
+            // words (`serve::unpin_gate::owner_rule_go`).
+            let loosened = model::gate::owner_rule_loosened(&normalized_item(&existing), &normalized_item(&updated));
+            if !loosened.is_empty() {
+                serve::unpin_gate::owner_rule_go(
+                    s,
+                    &args.id,
+                    args.because.as_deref(),
+                    session.session_id.as_deref(),
+                    serve::time::now_unix(),
+                    &loosened,
+                    "because",
+                )?;
+            }
             // A revise that removes the pin takes the note down like the unpin tool does, and
             // passes the very same gate (`serve::unpin_gate`).
             if serve::unpin_gate::is_pinned(&existing.bindings) && !serve::unpin_gate::is_pinned(&updated.bindings) {
@@ -4189,8 +4270,18 @@ impl ThorMcpServer {
             let store = self.store.lock().unwrap_or_else(|p| p.into_inner());
             model::store::show(&store, &args.id).ok().is_some_and(|existing| serve::unpin_gate::is_pinned(&existing.bindings))
         };
+        let replica_loosen = self.inbox.is_some() && {
+            let store = self.store.lock().unwrap_or_else(|p| p.into_inner());
+            model::store::show(&store, &args.id).ok().is_some_and(|existing| model::store::is_owner_approval(&existing))
+        };
         if let Some(queued) = self.capture("retract", &args) {
-            return if replica_takedown { format!("{queued} {REPLICA_TAKEDOWN_NOTE}") } else { queued };
+            return if replica_takedown {
+                format!("{queued} {REPLICA_TAKEDOWN_NOTE}")
+            } else if replica_loosen {
+                format!("{queued} {REPLICA_LOOSEN_NOTE}")
+            } else {
+                queued
+            };
         }
         let stamp = self.stamp("retract", meta, raw);
         let root = self.root.clone();
@@ -4198,6 +4289,18 @@ impl ThorMcpServer {
         self.blocking(move |s| {
             let mut att = stamp.att();
             refuse_a_side_door_on_a_frozen_item(s, &args.id, &att)?;
+            // A rule that needs the owner's go is retracted only on his own words.
+            if model::store::show(s, &args.id).ok().is_some_and(|existing| model::store::is_owner_approval(&existing)) {
+                serve::unpin_gate::owner_rule_go(
+                    s,
+                    &args.id,
+                    Some(&args.reason),
+                    session.session_id.as_deref(),
+                    serve::time::now_unix(),
+                    &["this retracts it".to_string()],
+                    "reason",
+                )?;
+            }
             // A retract of a pinned note takes it down: the same gate as the unpin tool, and
             // its refusal says to rewrite the text or bring the owner's own words.
             if let Ok(existing) = model::store::show(s, &args.id) {
@@ -5106,6 +5209,7 @@ mod tests {
             check_path: None,
             check_literal: None,
             check_literals: vec![],
+            check_exempt: vec![],
             moments: vec![],
             targets: vec![],
             always: true,
@@ -5252,6 +5356,7 @@ mod tests {
             check_path: None,
             check_literal: None,
             check_literals: vec![],
+            check_exempt: vec![],
             // Naming any one of the three replaces the WHOLE binding list
             // (see `moments`' own doc comment on `ReviseArgs`) - all three
             // empty/false drops the fixture's only binding (Always),
@@ -5824,6 +5929,7 @@ mod tests {
             check_path: None,
             check_literal: None,
             check_literals: vec![],
+            check_exempt: vec![],
             moments: None,
             targets: None,
             always: None,
@@ -6035,6 +6141,7 @@ mod tests {
             check_path: None,
             check_literal: None,
             check_literals: vec!["--force".to_string()],
+            check_exempt: vec![],
             moments: vec![],
             targets: vec![TargetArg { kind: "command".to_string(), value: "git push".to_string() }],
             always: false,
@@ -6100,6 +6207,7 @@ mod tests {
             check_path: None,
             check_literal: None,
             check_literals: vec!["--force".to_string()],
+            check_exempt: vec![],
             moments: vec![],
             targets: vec![TargetArg { kind: "command".to_string(), value: "git push".to_string() }],
             always: false,
@@ -6159,6 +6267,7 @@ mod tests {
             check_path: None,
             check_literal: None,
             check_literals: vec!["--force".to_string()],
+            check_exempt: vec![],
             moments: vec![],
             targets: vec![TargetArg { kind: "command".to_string(), value: "git push".to_string() }],
             always: false,
@@ -6211,6 +6320,7 @@ mod tests {
             check_path: None,
             check_literal: None,
             check_literals: vec!["--force".to_string()],
+            check_exempt: vec![],
             moments: vec![],
             targets: vec![TargetArg { kind: "command".to_string(), value: "git push --force".to_string() }],
             always: false,
@@ -6255,6 +6365,7 @@ mod tests {
             check_path: None,
             check_literal: None,
             check_literals: vec!["--force".to_string()],
+            check_exempt: vec![],
             moments: vec![],
             targets: vec![TargetArg { kind: "command".to_string(), value: "git push".to_string() }],
             always: false,
@@ -6293,6 +6404,7 @@ mod tests {
             check_path: None,
             check_literal: None,
             check_literals: vec!["--force".to_string()],
+            check_exempt: vec![],
             moments: vec![],
             targets: vec![TargetArg { kind: "command".to_string(), value: "git push".to_string() }],
             always: false,
@@ -6335,6 +6447,7 @@ mod tests {
             check_path: None,
             check_literal: None,
             check_literals: vec!["--force".to_string()],
+            check_exempt: vec![],
             moments: vec![],
             targets: vec![TargetArg { kind: "command".to_string(), value: "git push".to_string() }],
             always: false,
@@ -6624,6 +6737,7 @@ mod tests {
             check_path: None,
             check_literal: None,
             check_literals: vec![],
+            check_exempt: vec![],
             moments: None,
             targets: None,
             always: None,
@@ -6821,6 +6935,7 @@ mod tests {
             check_path: None,
             check_literal: None,
             check_literals: vec![],
+            check_exempt: vec![],
             moments: None,
             targets: None,
             always: None,
@@ -6872,6 +6987,7 @@ mod tests {
             check_path: None,
             check_literal: None,
             check_literals: vec![],
+            check_exempt: vec![],
             moments: None,
             targets: None,
             always: None,
@@ -6930,6 +7046,7 @@ mod tests {
             check_path: None,
             check_literal: None,
             check_literals: vec![],
+            check_exempt: vec![],
             moments: None,
             targets: None,
             always: None,
@@ -6976,6 +7093,7 @@ mod tests {
             check_path: Some("OTHER.md".to_string()),
             check_literal: None,
             check_literals: vec![],
+            check_exempt: vec![],
             moments: None,
             targets: None,
             always: None,
@@ -7042,6 +7160,7 @@ mod tests {
             check_path: None,
             check_literal: None,
             check_literals: vec![],
+            check_exempt: vec![],
             moments: None,
             targets: None,
             always: None,
@@ -7345,6 +7464,7 @@ mod tests {
             check_path: None,
             check_literal: None,
             check_literals: vec![],
+            check_exempt: vec![],
             moments: None,
             targets: None,
             always: None,
@@ -7415,6 +7535,7 @@ mod tests {
             check_path: Some("docs/STYLE.md".to_string()),
             check_literal: None,
             check_literals: vec!["\u{2014}".to_string(), "\u{2013}".to_string(), "\u{2026}".to_string()],
+            check_exempt: vec![],
             moments: None,
             targets: None,
             always: None,
@@ -7554,6 +7675,7 @@ mod tests {
             check_path: None,
             check_literal: None,
             check_literals: vec![],
+            check_exempt: vec![],
             moments: None,
             targets: None,
             always: None,
@@ -7626,6 +7748,7 @@ mod tests {
             check_path: None,
             check_literal: None,
             check_literals: vec!["\u{2014}".to_string()],
+            check_exempt: vec![],
             moments: None,
             targets: Some(vec![]),
             always: Some(true),
@@ -7684,6 +7807,7 @@ mod tests {
             check_path: None,
             check_literal: None,
             check_literals: vec![],
+            check_exempt: vec![],
             moments: None,
             targets: None,
             always: None,
@@ -7748,6 +7872,7 @@ mod tests {
             check_path: None,
             check_literal: None,
             check_literals: vec![],
+            check_exempt: vec![],
             moments: None,
             targets: None,
             always: None,
@@ -7802,6 +7927,7 @@ mod tests {
             check_path: None,
             check_literal: None,
             check_literals: vec![],
+            check_exempt: vec![],
             moments: None,
             targets: None,
             always: None,
@@ -7856,6 +7982,7 @@ mod tests {
             check_path: None,
             check_literal: None,
             check_literals: vec![],
+            check_exempt: vec![],
             moments: None,
             targets: None,
             always: None,
@@ -7902,6 +8029,7 @@ mod tests {
             check_path: None,
             check_literal: None,
             check_literals: vec![],
+            check_exempt: vec![],
             moments: None,
             targets: None,
             always: None,
@@ -7954,6 +8082,7 @@ mod tests {
             check_path: None,
             check_literal: None,
             check_literals: vec![],
+            check_exempt: vec![],
             moments: None,
             targets: None,
             always: None,
@@ -8005,6 +8134,7 @@ mod tests {
             check_path: None,
             check_literal: None,
             check_literals: vec![],
+            check_exempt: vec![],
             moments: None,
             targets: None,
             always: None,
@@ -8073,6 +8203,7 @@ mod tests {
             check_path: None,
             check_literal: None,
             check_literals: vec![],
+            check_exempt: vec![],
             // Never had a clear convention - still a silent drop (see the
             // sibling test above on why naming any one of the three empties
             // all three).
@@ -8151,6 +8282,7 @@ mod tests {
             check_path: None,
             check_literal: None,
             check_literals: vec![],
+            check_exempt: vec![],
             moments: None,
             targets: None,
             always: None,
@@ -8206,6 +8338,7 @@ mod tests {
             check_path: None,
             check_literal: None,
             check_literals: vec![],
+            check_exempt: vec![],
             moments: None,
             targets: None,
             always: None,
@@ -8259,6 +8392,7 @@ mod tests {
             check_path: None,
             check_literal: None,
             check_literals: vec![],
+            check_exempt: vec![],
             moments: None,
             targets: None,
             always: None,
@@ -10202,6 +10336,7 @@ mod tests {
             check_path: None,
             check_literal: None,
             check_literals: vec![],
+            check_exempt: vec![],
             moments: vec![],
             targets: vec![],
             always: false,
@@ -11167,6 +11302,7 @@ mod tests {
             falsifier: Some("an acme-tool wipe of the demo volume turns out to be harmless".to_string()),
             check_kind: Some("forbidden".to_string()),
             check_literals: vec!["--wipe".to_string()],
+            check_exempt: vec![],
             targets: vec![TargetArg { kind: "command".to_string(), value: "acme-tool".to_string() }],
             always: false,
             ..base_remember(id)
@@ -11432,6 +11568,183 @@ mod tests {
 
     async fn try_retract(srv: &ThorMcpServer, id: &str, reason: &str) -> String {
         srv.retract(Meta::new(), RawArgs::default(), Parameters(RetractArgs { id: id.to_string(), reason: reason.to_string() })).await
+    }
+
+    // ------------------------------------------------ a rule that needs the owner's go
+
+    const MAIL_RULE: &str = "mail-needs-the-owners-go";
+    const MAIL_TOOL: &str = "mcp__zz__send_message";
+    const MAIL_TEXT: &str = "A mail needs the owner's explicit go (go-owner).";
+
+    /// A rule that needs the owner's go, written straight into the store.
+    fn mail_rule_server() -> (tempfile::TempDir, std::path::PathBuf, ThorMcpServer) {
+        let (dir, db, srv) = unpin_fixture();
+        let item = model::item::Item {
+            id: MAIL_RULE.to_string(),
+            kind: Kind::Rule,
+            text: MAIL_TEXT.to_string(),
+            bindings: vec![Binding::Target { kind: model::item::TargetKind::Command, value: MAIL_TOOL.to_string() }],
+            severity: Some(ItemSeverity::Costly),
+            project: Some("some-project".to_string()),
+            tags: vec![model::store::OWNER_APPROVAL_TAG.to_string()],
+            expires: None,
+            key: None,
+            falsifier: Some("the owner lets agents mail anyone on their own".to_string()),
+            check: Some(Check::Requires { when: MAIL_TOOL.to_string(), required: vec!["go-owner".to_string()], exempt: Vec::new() }),
+        };
+        model::store::declare(&mut srv.store.lock().unwrap(), "s", "l", "a", &item).expect("the fixture rule");
+        (dir, db, srv)
+    }
+
+    fn mail_rule_item(srv: &ThorMcpServer) -> model::item::Item {
+        model::store::show(&srv.store.lock().unwrap(), MAIL_RULE).unwrap()
+    }
+
+    /// The owner's own message, in a transcript, witnessed the way the hook does.
+    fn owner_says(dir: &tempfile::TempDir, db: &std::path::Path, message: &str, field_is_reason: bool) -> String {
+        let transcript = dir.path().join("owner-session.jsonl");
+        let line = serde_json::json!({"type": "user", "message": {"role": "user", "content": message}});
+        std::fs::write(&transcript, format!("{line}\n")).unwrap();
+        let quote = format!("the owner asked for it: \"{message}\"");
+        let key = if field_is_reason { "reason" } else { "because" };
+        serve::unpin_gate::witness(
+            db,
+            &serde_json::json!({ "tool_input": { "id": MAIL_RULE, key: quote }, "transcript_path": transcript.to_string_lossy() }),
+            serve::time::now_unix(),
+        );
+        quote
+    }
+
+    async fn add_exemption(srv: &ThorMcpServer, because: Option<&str>) -> String {
+        srv.revise(
+            Meta::new(),
+            RawArgs::default(),
+            Parameters(ReviseArgs {
+                id: MAIL_RULE.to_string(),
+                append: Some(" Except a mail only to me@example.test.".to_string()),
+                check_exempt: vec!["to=me@example.test".to_string(), "draftId=".to_string()],
+                because: because.map(str::to_string),
+                ..Default::default()
+            }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn adding_an_exemption_to_a_rule_that_needs_the_owners_go_takes_his_quoted_message() {
+        let (dir, db, srv) = mail_rule_server();
+        let message = "Ja, mail-needs-the-owners-go mag een uitzondering krijgen voor mails aan mijzelf.";
+
+        // No reason, a plain reason and a quote nobody witnessed all stand in front of the same door.
+        for because in [None, Some("the owner is fine with mails to himself, he said so earlier"), Some(format!("he said \"{message}\"").as_str())] {
+            let reply = add_exemption(&srv, because).await;
+            assert!(reply.starts_with("REFUSED") && reply.contains("needs the owner's explicit go"), "{reply}");
+            assert!(reply.contains("adds or widens") && reply.contains("`because`") && reply.contains("double quotes"), "{reply}");
+        }
+        assert!(mail_rule_item(&srv).check == Some(Check::Requires { when: MAIL_TOOL.to_string(), required: vec!["go-owner".to_string()], exempt: Vec::new() }));
+
+        // A piece of his message is not his message.
+        let quote = owner_says(&dir, &db, message, false);
+        let piece = "the owner asked for it: \"Ja, mail-needs-the-owners-go mag een uitzondering krijgen\"";
+        serve::unpin_gate::witness(
+            &db,
+            &serde_json::json!({ "tool_input": { "id": MAIL_RULE, "because": piece }, "transcript_path": dir.path().join("owner-session.jsonl").to_string_lossy() }),
+            serve::time::now_unix(),
+        );
+        let reply = add_exemption(&srv, Some(piece)).await;
+        assert!(reply.starts_with("REFUSED"), "a quote of his message only counts when it is the whole of what he typed: {reply}");
+
+        // His whole message, witnessed by the hook, lets it through, and the exemption is stored.
+        let reply = add_exemption(&srv, Some(&quote)).await;
+        assert!(reply.starts_with("revised"), "{reply}");
+        let item = mail_rule_item(&srv);
+        assert_eq!(
+            item.check,
+            Some(Check::Requires {
+                when: MAIL_TOOL.to_string(),
+                required: vec!["go-owner".to_string()],
+                exempt: vec!["to=me@example.test".to_string(), "draftId=".to_string()],
+            })
+        );
+        assert!(item.tags.contains(&model::store::OWNER_APPROVAL_TAG.to_string()), "still a rule that needs his go");
+        // The quoted message is kept as the reason in the history.
+        let history = model::store::history(&srv.store.lock().unwrap(), MAIL_RULE).unwrap();
+        assert!(history.len() >= 2, "the revision is in the history");
+    }
+
+    #[tokio::test]
+    async fn the_exemption_alone_keeps_the_trigger_and_the_answers() {
+        let (dir, db, srv) = mail_rule_server();
+        let message = "Ja, mail-needs-the-owners-go mag een uitzondering krijgen voor mails aan mijzelf.";
+        let quote = owner_says(&dir, &db, message, false);
+        assert!(add_exemption(&srv, Some(&quote)).await.starts_with("revised"));
+        // Asking only for an exemption on a rule that has none to keep is refused plainly.
+        let reply = srv
+            .revise(
+                Meta::new(),
+                RawArgs::default(),
+                Parameters(ReviseArgs { id: "seed-some-project".to_string(), check_exempt: vec!["to=a@example.test".to_string()], ..Default::default() }),
+            )
+            .await;
+        assert!(reply.contains("only a requires check takes an exemption"), "{reply}");
+        // An exemption on any other kind of check is refused at the door.
+        let mut args = roadmap_rule("not-a-requires");
+        args.project = Some("some-project".to_string());
+        args.check_kind = Some("forbidden".to_string());
+        args.check_exempt = vec!["to=a@example.test".to_string()];
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
+        assert!(reply.contains("only check_kind 'requires' takes one"), "{reply}");
+    }
+
+    #[tokio::test]
+    async fn narrowing_a_rule_that_needs_the_owners_go_takes_no_quote_and_loosening_it_in_other_ways_does() {
+        let (dir, db, srv) = mail_rule_server();
+        let message = "Ja, mail-needs-the-owners-go mag een uitzondering krijgen voor mails aan mijzelf.";
+        let quote = owner_says(&dir, &db, message, false);
+        assert!(add_exemption(&srv, Some(&quote)).await.starts_with("revised"));
+
+        // Taking the exemption away again is a narrowing: a plain reason is enough.
+        let reply = srv
+            .revise(
+                Meta::new(),
+                RawArgs::default(),
+                Parameters(ReviseArgs {
+                    id: MAIL_RULE.to_string(),
+                    check_kind: Some("requires".to_string()),
+                    check_literals: vec![MAIL_TOOL.to_string(), "go-owner".to_string()],
+                    because: Some("the exemption is not wanted after all, so the rule is strict again".to_string()),
+                    ..Default::default()
+                }),
+            )
+            .await;
+        assert!(reply.starts_with("revised"), "{reply}");
+        assert!(matches!(mail_rule_item(&srv).check, Some(Check::Requires { exempt, .. }) if exempt.is_empty()));
+
+        // Dropping the tag, lowering the severity and clearing the check each need his words.
+        for args in [
+            ReviseArgs { id: MAIL_RULE.to_string(), tags: Some(vec![]), because: Some("not needed any more, says the agent".to_string()), ..Default::default() },
+            ReviseArgs { id: MAIL_RULE.to_string(), severity: Some("house_style".to_string()), because: Some("less important now, says the agent".to_string()), ..Default::default() },
+            ReviseArgs { id: MAIL_RULE.to_string(), clear_check: true, because: Some("the check is in the way, says the agent".to_string()), ..Default::default() },
+        ] {
+            let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(args)).await;
+            assert!(reply.starts_with("REFUSED") && reply.contains("needs the owner's explicit go"), "{reply}");
+        }
+        let item = mail_rule_item(&srv);
+        assert!(item.tags.contains(&model::store::OWNER_APPROVAL_TAG.to_string()) && item.check.is_some() && item.severity == Some(ItemSeverity::Costly));
+    }
+
+    #[tokio::test]
+    async fn a_retract_of_a_rule_that_needs_the_owners_go_takes_his_quoted_message_too() {
+        let (dir, db, srv) = mail_rule_server();
+        let reply = try_retract(&srv, MAIL_RULE, "this rule about mail is not wanted any more, remove it please").await;
+        assert!(reply.starts_with("REFUSED") && reply.contains("needs the owner's explicit go") && reply.contains("`reason`"), "{reply}");
+        assert!(!is_retracted(&srv, MAIL_RULE));
+
+        let message = "Ja, haal mail-needs-the-owners-go maar weg, ik wil dat slot niet meer.";
+        let quote = owner_says(&dir, &db, message, true);
+        let reply = try_retract(&srv, MAIL_RULE, &quote).await;
+        assert!(reply.starts_with("retracted"), "{reply}");
+        assert!(is_retracted(&srv, MAIL_RULE));
     }
 
     fn is_retracted(srv: &ThorMcpServer, id: &str) -> bool {

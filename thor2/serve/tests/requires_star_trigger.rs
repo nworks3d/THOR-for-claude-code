@@ -28,6 +28,7 @@ fn star_rule(when: &str) -> Item {
         check: Some(Check::Requires {
             when: when.to_string(),
             required: vec!["thor2".to_string(), "scratchpad".to_string()],
+            exempt: Vec::new(),
         }),
     }
 }

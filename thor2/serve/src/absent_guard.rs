@@ -835,7 +835,7 @@ fn forbidden_literals(check: &Check) -> Option<&[String]> {
 /// The trigger and the requirement a `Check::Requires` carries.
 fn requires_pair(check: &Check) -> Option<(&str, &[String])> {
     match check {
-        Check::Requires { when, required } => Some((when.as_str(), required.as_slice())),
+        Check::Requires { when, required, .. } => Some((when.as_str(), required.as_slice())),
         _ => None,
     }
 }
@@ -945,6 +945,12 @@ pub fn find_requires_violation_in(
     find_requires_violation_owned(items, segments, scope, content, None)
 }
 
+/// The sentence every refusal of a rule that needs the owner's go carries: he
+/// can change or lift the rule himself, in any session (`unpin_gate`).
+pub const OWNER_CAN_CHANGE_IT: &str = "The owner can also change or lift this rule himself, in any session: when he asks \
+     for that in his own message, revise the rule (mcp__thor__revise) and put his whole message, between double \
+     quotes, in `because` - THOR checks the quote against what he typed in this session.";
+
 /// Where a live hook reads the owner's own words from: his last messages of
 /// this session (`attest::owner_messages`), or why they cannot be read.
 pub type OwnerWords<'a> = &'a dyn Fn() -> Result<Vec<String>, String>;
@@ -989,6 +995,13 @@ pub fn find_requires_violation_owned(
                 if crate::shell::is_inert_call(anchor, segment) {
                     return None;
                 }
+                // A tool call that holds only what the rule's exemption lists
+                // owes no answer, and the owner's words are not read for it.
+                if let Check::Requires { exempt, .. } = check {
+                    if crate::shell::exempt_call(segment, exempt) {
+                        return None;
+                    }
+                }
                 Some((*anchor, segment, i))
             })
             .collect();
@@ -1005,7 +1018,7 @@ pub fn find_requires_violation_owned(
                          message, in this turn or the one before, must say {}. Writing it in the call does not count, and \
                          neither does a subagent's hand-back or quoted text. Nothing was done. Ask the owner; once he has \
                          said it, run the call again. When you ask, show the exact word he has to type on its own line \
-                         inside a fenced code block, so he can copy it with one click. {}",
+                         inside a fenced code block, so he can copy it with one click. {OWNER_CAN_CHANGE_IT} {}",
                         candidate.id,
                         answers.join(" or "),
                         candidate.item.text
@@ -1016,7 +1029,7 @@ pub fn find_requires_violation_owned(
                     reasons.push(format!(
                         "[THOR] rule {} applies here: this call trips {trips} and needs the owner's explicit go, but THOR \
                          cannot read this session's transcript ({why}), so it cannot see one and refuses rather than guess. \
-                         Nothing was done. Ask the owner to run it himself. {}",
+                         Nothing was done. Ask the owner to run it himself. {OWNER_CAN_CHANGE_IT} {}",
                         candidate.id, candidate.item.text
                     ));
                     continue;
@@ -2566,6 +2579,7 @@ mod tests {
             check: Some(model::item::Check::Requires {
                 when: "Workflow".to_string(),
                 required: vec!["model".to_string()],
+                exempt: Vec::new(),
             }),
         };
         vec![LiveItem { id: item.id.clone(), item }]
@@ -2648,6 +2662,7 @@ mod tests {
             check: Some(model::item::Check::Requires {
                 when: "git commit".to_string(),
                 required: vec!["issue:".to_string()],
+                exempt: Vec::new(),
             }),
         };
         let items = vec![LiveItem { id: item.id.clone(), item }];
@@ -2716,6 +2731,7 @@ mod tests {
             check: Some(model::item::Check::Requires {
                 when: "-p acme-dev".to_string(),
                 required: vec!["-f docker-compose.dev.yml".to_string()],
+                exempt: Vec::new(),
             }),
         };
         vec![LiveItem { id: item.id.clone(), item }]
@@ -2791,6 +2807,7 @@ mod tests {
             check: Some(model::item::Check::Requires {
                 when: "Agent".to_string(),
                 required: vec!["haiku".to_string(), "sonnet".to_string()],
+                exempt: Vec::new(),
             }),
         };
         let items = vec![LiveItem { id: item.id.clone(), item }];
@@ -2822,6 +2839,7 @@ mod tests {
             check: Some(model::item::Check::Requires {
                 when: "Agent".to_string(),
                 required: vec!["read-only".to_string(), "writes".to_string()],
+                exempt: Vec::new(),
             }),
         };
         let items = vec![LiveItem { id: item.id.clone(), item }];
@@ -2860,6 +2878,7 @@ mod tests {
             check: Some(model::item::Check::Requires {
                 when: "Agent".to_string(),
                 required: vec!["haiku".to_string(), "sonnet".to_string()],
+                exempt: Vec::new(),
             }),
         };
         let items = vec![LiveItem { id: item.id.clone(), item }];
@@ -2903,6 +2922,7 @@ mod tests {
             check: Some(model::item::Check::Requires {
                 when: "Agent".to_string(),
                 required: vec!["haiku".to_string(), "sonnet".to_string()],
+                exempt: Vec::new(),
             }),
         };
         let items = vec![LiveItem { id: item.id.clone(), item }];
@@ -5313,7 +5333,7 @@ sonnet").is_none(),
             Check::Absent { path: "README.md".to_string(), literal: "TODO".to_string() },
             Check::AbsentAll { path: "README.md".to_string(), literals: vec!["TODO".to_string()] },
             Check::PathExists { path: "README.md".to_string() },
-            Check::Requires { when: "git commit".to_string(), required: vec!["issue:".to_string()] },
+            Check::Requires { when: "git commit".to_string(), required: vec!["issue:".to_string()], exempt: Vec::new() },
         ] {
             let verdict = classify_check(Some(&check), "git commit -m TODO", None);
             assert_eq!(verdict, Verdict::Advice, "{check:?} must never be a prohibition here");

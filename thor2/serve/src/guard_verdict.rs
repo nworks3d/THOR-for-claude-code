@@ -521,7 +521,9 @@ fn requires_in(
         Some(call) => absent_guard::find_requires_violation_owned(&candidates, &call.segments, Some(&call.projects), &content, owner),
         None => {
             let fields = tool_input.map(tool_call_fields).unwrap_or_default();
-            let segments = [shell::tool_segment_with_fields(tool, &content, &fields)];
+            let mut segment = shell::tool_segment_with_fields(tool, &content, &fields);
+            segment.input = tool_input.map(shell::input_fields).unwrap_or_default();
+            let segments = [segment];
             let projects = [project.map(str::to_string)];
             absent_guard::find_requires_violation_owned(&candidates, &segments, Some(&projects), &content, owner)
         }

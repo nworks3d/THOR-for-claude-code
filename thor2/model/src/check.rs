@@ -1215,7 +1215,7 @@ mod tests {
     fn a_requires_check_cannot_run_it_has_no_call_to_read() {
         let dir = tempfile::tempdir().unwrap();
         let check =
-            Check::Requires { when: "git commit".to_string(), required: vec!["issue:".to_string()] };
+            Check::Requires { when: "git commit".to_string(), required: vec!["issue:".to_string()], exempt: Vec::new() };
         assert_eq!(run(&check, dir.path()), Outcome::CannotRun);
     }
 
@@ -1228,7 +1228,7 @@ mod tests {
         let missing_root = outer.path().join("this-directory-was-never-created");
         assert!(!missing_root.exists(), "sanity: the root really does not exist");
 
-        let check = Check::Requires { when: "Agent".to_string(), required: vec!["haiku".to_string()] };
+        let check = Check::Requires { when: "Agent".to_string(), required: vec!["haiku".to_string()], exempt: Vec::new() };
         assert_eq!(run(&check, &missing_root), Outcome::CannotRun);
     }
 

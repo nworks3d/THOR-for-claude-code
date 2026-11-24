@@ -388,7 +388,7 @@ fn main() {
                     serve::absent_guard::find_command_violation_in(&one, &segs, Some(&projects), Some(root)).is_some(),
                     substring_forbidden(&anchors, literals, &segs, &applies),
                 ),
-                Some(Check::Requires { when, required }) => {
+                Some(Check::Requires { when, required, .. }) => {
                     let inner = !model::gate::requires_trigger_names_a_binding(when, &item.item.bindings);
                     (
                         session_applies && old::requires_refuses(&anchors, inner, when, required, &call.command, &call.content),

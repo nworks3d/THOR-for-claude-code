@@ -591,7 +591,7 @@ mod tests {
     fn a_rule_whose_check_can_refuse_never_decays() {
         for check in [
             model::item::Check::Forbidden { literals: vec!["--force".to_string()] },
-            model::item::Check::Requires { when: "Agent".to_string(), required: vec!["model".to_string()] },
+            model::item::Check::Requires { when: "Agent".to_string(), required: vec!["model".to_string()], exempt: Vec::new() },
             model::item::Check::Absent { path: "a.txt".to_string(), literal: "x".to_string() },
             model::item::Check::AbsentAll { path: "a.txt".to_string(), literals: vec!["x".to_string()] },
             model::item::Check::Contains { path: "a.txt".to_string(), literal: "x".to_string() },

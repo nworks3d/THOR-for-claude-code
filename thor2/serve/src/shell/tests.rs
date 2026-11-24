@@ -123,7 +123,7 @@ fn fb_ps(anchors: &[&str], lits: &[&str], cmd: &str) -> (bool, bool) {
 /// (HEAD today, the real guard now) for a requires rule, the call's content
 /// being the command itself (a Bash call's only input value).
 fn rq(anchors: &[&str], when: &str, req: &[&str], cmd: &str) -> (bool, bool) {
-    let items = rule(anchors, Check::Requires { when: when.to_string(), required: s(req) });
+    let items = rule(anchors, Check::Requires { when: when.to_string(), required: s(req), exempt: Vec::new() });
     let now = absent_guard::find_requires_violation(&items, "Bash", Some(cmd), cmd).is_some();
     (head::requires_refuses(&s(anchors), when, &s(req), cmd), now)
 }
@@ -461,7 +461,7 @@ fn required_answers_and_file_checks_keep_substring_matching() {
     // A requires ANSWER is a plain substring of the call's input: `--no-deps`
     // inside `--no-deps-please` still satisfies it (strict matching there
     // would refuse more, never less).
-    let items = rule(&["pip install"], Check::Requires { when: "pip install".to_string(), required: s(&["--no-deps"]) });
+    let items = rule(&["pip install"], Check::Requires { when: "pip install".to_string(), required: s(&["--no-deps"]), exempt: Vec::new() });
     let cmd = "pip install --no-deps-please x";
     assert!(absent_guard::find_requires_violation(&items, "Bash", Some(cmd), cmd).is_none());
     // A file-content check (an always-bound forbidden literal in content)
@@ -1047,7 +1047,7 @@ fn a_deep_directory_stack_never_crashes_the_reader() {
 /// Whether a requires rule on `Start-Process` refuses `cmd`, a PowerShell
 /// call, for want of one of `req`.
 fn ps_requires_refuses(req: &[&str], cmd: &str) -> bool {
-    let items = rule(&["Start-Process"], Check::Requires { when: "Start-Process".to_string(), required: s(req) });
+    let items = rule(&["Start-Process"], Check::Requires { when: "Start-Process".to_string(), required: s(req), exempt: Vec::new() });
     absent_guard::find_requires_violation(&items, "PowerShell", Some(cmd), cmd).is_some()
 }
 
@@ -1188,7 +1188,7 @@ fn a_forbidden_check_on_the_anchor_refuses_the_backslash_spelling() {
 /// Whether the rule `install-exe-zonder-db-kiest-lege-store` (anchor
 /// `install.exe`, requires `--db`) refuses `cmd`, a PowerShell call.
 fn install_rule_refuses(cmd: &str) -> bool {
-    let items = rule(&["install.exe"], Check::Requires { when: "install.exe".to_string(), required: s(&["--db"]) });
+    let items = rule(&["install.exe"], Check::Requires { when: "install.exe".to_string(), required: s(&["--db"]), exempt: Vec::new() });
     absent_guard::find_requires_violation(&items, "PowerShell", Some(cmd), cmd).is_some()
 }
 
@@ -1239,7 +1239,7 @@ fn a_real_install_exe_call_is_still_seen_as_the_program() {
 
 /// Whether an Agent-tool rule that requires one of `req` refuses a brief.
 fn agent_brief_refused(req: &[&str], brief: &str) -> bool {
-    let items = rule(&["Agent"], Check::Requires { when: "Agent".to_string(), required: s(req) });
+    let items = rule(&["Agent"], Check::Requires { when: "Agent".to_string(), required: s(req), exempt: Vec::new() });
     absent_guard::find_requires_violation(&items, "Agent", None, brief).is_some()
 }
 
@@ -1343,7 +1343,7 @@ fn a_counted_brace_glued_to_a_powershell_word_stays_in_the_word() {
     let segs = segments(cmd, Dialect::PowerShell);
     assert_eq!(segs.len(), 2, "{segs:?}");
     assert_eq!(segs[1].head, s(&["grep", "-nP", "\\x{2014}", "notes.md"]));
-    let items = rule(&["grep"], Check::Requires { when: "x{2014}".to_string(), required: s(&["LC_ALL"]) });
+    let items = rule(&["grep"], Check::Requires { when: "x{2014}".to_string(), required: s(&["LC_ALL"]), exempt: Vec::new() });
     let refused = |c: &str| absent_guard::find_requires_violation(&items, "PowerShell", Some(c), c).is_some();
     assert!(refused(cmd));
     assert!(!refused("Get-Date; grep -nP \\x{2014} notes.md # LC_ALL"));
@@ -1386,7 +1386,7 @@ fn the_absolute_path_answer_is_satisfied_by_a_real_absolute_path_only() {
     assert!(!agent_brief_refused(&["scratchpad", model::shell::ABSOLUTE_PATH_ANSWER], "use scratchpad"));
     assert!(!agent_brief_refused(&["scratchpad", model::shell::ABSOLUTE_PATH_ANSWER], "use /tmp/a/b"));
     // A Bash command counts the same way, in its own segment only.
-    let items = rule(&["tar"], Check::Requires { when: "tar".to_string(), required: s(&[model::shell::ABSOLUTE_PATH_ANSWER]) });
+    let items = rule(&["tar"], Check::Requires { when: "tar".to_string(), required: s(&[model::shell::ABSOLUTE_PATH_ANSWER]), exempt: Vec::new() });
     let bash = |c: &str| absent_guard::find_requires_violation(&items, "Bash", Some(c), c).is_some();
     assert!(!bash("tar -xf a.tar -C /tmp/out"));
     assert!(bash("tar -xf a.tar -C out"));
@@ -1399,9 +1399,83 @@ fn the_absolute_path_answer_is_satisfied_by_a_real_absolute_path_only() {
 fn the_absolute_path_answer_needs_no_naming_in_the_rules_text() {
     let mut items = rule(
         &["Agent"],
-        Check::Requires { when: "Agent".to_string(), required: s(&[model::shell::ABSOLUTE_PATH_ANSWER, "scratchpad"]) },
+        Check::Requires { when: "Agent".to_string(), required: s(&[model::shell::ABSOLUTE_PATH_ANSWER, "scratchpad"]), exempt: Vec::new() },
     );
     items[0].item.text = "Every brief names a work folder by its absolute path.".to_string();
     let unnamed = model::gate::unnamed_literals(&items[0].item);
     assert_eq!(unnamed, vec!["scratchpad".to_string()]);
+}
+
+// ------------------------------------------------ a requires exemption (exempt_call)
+
+fn tool_call_segment(input: serde_json::Value) -> Segment {
+    let mut segment = tool_segment("mcp__zz__send_message", "x");
+    segment.input = input_fields(&input);
+    segment
+}
+
+fn own_address_only() -> Vec<String> {
+    ["to=me@example.test", "cc=me@example.test", "bcc=me@example.test", "draftId="].map(str::to_string).to_vec()
+}
+
+#[test]
+fn a_call_holding_only_the_listed_values_is_exempt() {
+    let exempt = own_address_only();
+    let call = |input: serde_json::Value| exempt_call(&tool_call_segment(input), &exempt);
+    assert!(call(serde_json::json!({"to": ["me@example.test"], "subject": "hi"})));
+    // Case and white space around a value do not matter; a string or a list both read.
+    assert!(call(serde_json::json!({"to": ["ME@Example.Test "]})));
+    assert!(call(serde_json::json!({"to": "me@example.test"})));
+    // A listed field that is empty or null is no value, an empty draftId is absent.
+    assert!(call(serde_json::json!({"to": ["me@example.test"], "cc": [], "bcc": null, "draftId": ""})));
+    // Fields the list does not name are ignored.
+    assert!(call(serde_json::json!({"to": ["me@example.test"], "body": "to: other@example.test", "attachments": [{"x": 1}]})));
+}
+
+#[test]
+fn any_other_value_a_missing_field_or_an_odd_shape_is_not_exempt() {
+    let exempt = own_address_only();
+    let call = |input: serde_json::Value| exempt_call(&tool_call_segment(input), &exempt);
+    assert!(!call(serde_json::json!({"to": ["me@example.test", "other@example.test"]})), "one foreign address");
+    assert!(!call(serde_json::json!({"to": ["me@example.test"], "cc": ["other@example.test"]})), "a foreign cc");
+    assert!(!call(serde_json::json!({"to": ["me@example.test"], "bcc": "other@example.test"})), "a foreign bcc");
+    assert!(!call(serde_json::json!({"to": ["me@example.test"], "draftId": "d1"})), "a draft sends something else");
+    assert!(!call(serde_json::json!({"subject": "hi"})), "no recipient at all");
+    assert!(!call(serde_json::json!({"to": []})), "an empty recipient list");
+    assert!(!call(serde_json::json!({"to": ["Me <me@example.test>"]})), "the whole value, not a part of it");
+    assert!(!call(serde_json::json!({"to": [["me@example.test"]]})), "a nested list");
+    assert!(!call(serde_json::json!({"to": {"a": "me@example.test"}})), "an object");
+    assert!(!call(serde_json::json!({"to": 5})), "a number");
+    assert!(!call(serde_json::json!({"to": ["me@example.test", 7]})), "a number among strings");
+}
+
+#[test]
+fn a_shell_command_and_an_empty_list_are_never_exempt() {
+    let exempt = own_address_only();
+    let shell = call_segments("Bash", "send me@example.test").remove(0);
+    assert!(!exempt_call(&shell, &exempt));
+    let mut forged = shell;
+    forged.input = input_fields(&serde_json::json!({"to": ["me@example.test"]}));
+    assert!(!exempt_call(&forged, &exempt), "only a tool call's own segment can be exempt");
+    assert!(!exempt_call(&tool_call_segment(serde_json::json!({"to": ["me@example.test"]})), &[]));
+    assert!(!exempt_call(&tool_call_segment(serde_json::json!({"to": ["me@example.test"]})), &["not a token".to_string()]));
+}
+
+#[test]
+fn an_exempt_call_owes_no_answer_and_a_plain_one_still_does() {
+    let mut items = rule(
+        &["mcp__zz__send_message"],
+        Check::Requires { when: "mcp__zz__send_message".to_string(), required: s(&["go-word"]), exempt: own_address_only() },
+    );
+    items[0].item.text = "Mail needs go-word, except a mail only to me@example.test.".to_string();
+    let violation = |input: serde_json::Value| {
+        let content = input.to_string();
+        let mut segment = tool_segment_with_fields("mcp__zz__send_message", &content, "");
+        segment.input = input_fields(&input);
+        absent_guard::find_requires_violation_in(&items, &[segment], None, &content).is_some()
+    };
+    assert!(!violation(serde_json::json!({"to": ["me@example.test"]})));
+    assert!(violation(serde_json::json!({"to": ["me@example.test", "other@example.test"]})));
+    assert!(violation(serde_json::json!({"to": ["other@example.test"]})));
+    assert!(!violation(serde_json::json!({"to": ["other@example.test"], "body": "go-word"})), "the answer still answers");
 }

@@ -40,7 +40,7 @@ impl Fx {
             expires: None,
             key: None,
             falsifier: Some("the owner asks agents to deploy prod on their own".to_string()),
-            check: Some(Check::Requires { when: "deploy-prod".to_string(), required: vec![MARKER.to_string()] }),
+            check: Some(Check::Requires { when: "deploy-prod".to_string(), required: vec![MARKER.to_string()], exempt: Vec::new() }),
         };
         let item = named(&item);
         model::store::declare(&mut store, "s", "l", "a", &item).expect("fixture rule");
@@ -177,7 +177,7 @@ fn a_go_marker_requires_rule_is_migrated_to_the_owners_go_at_session_start() {
     let store = EventStore::new(&fx.db()).unwrap();
     let item = model::store::show(&store, "prod-needs-the-owners-go").unwrap();
     assert!(item.tags.iter().any(|t| t == model::store::OWNER_APPROVAL_TAG), "{:?}", item.tags);
-    assert_eq!(item.check, Some(Check::Requires { when: "deploy-prod".to_string(), required: vec![MARKER.to_string()] }), "its trigger is kept");
+    assert_eq!(item.check, Some(Check::Requires { when: "deploy-prod".to_string(), required: vec![MARKER.to_string()], exempt: Vec::new() }), "its trigger is kept");
     drop(store);
     assert!(blocked(&fx.bash(&format!("deploy-prod --now {MARKER}"))), "the marker in the call no longer counts");
 }

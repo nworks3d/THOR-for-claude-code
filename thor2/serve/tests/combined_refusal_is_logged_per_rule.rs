@@ -23,7 +23,7 @@ fn declare_rule(store: &mut thor_core::event_store::EventStore, id: &str, requir
         expires: None,
         key: None,
         falsifier: Some("a brief without it works fine".to_string()),
-        check: Some(model::item::Check::Requires { when: "Agent".to_string(), required: vec![required.to_string()] }),
+        check: Some(model::item::Check::Requires { when: "Agent".to_string(), required: vec![required.to_string()], exempt: Vec::new() }),
     };
     model::store::declare(store, "s", "l", "a", &item).expect("the write gate must accept the rule");
 }

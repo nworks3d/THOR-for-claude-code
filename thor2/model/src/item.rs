@@ -212,6 +212,15 @@ pub enum Check {
         /// this form.
         #[serde(deserialize_with = "one_or_many")]
         required: Vec<String>,
+        /// A TOOL call that holds only these values passes without an answer:
+        /// `field=value` tokens, `field=` meaning the field is absent or
+        /// empty (`shell::exempt_call` says exactly how a call is read).
+        /// Optional and never written when empty, so every body and hash
+        /// written before it existed stays byte for byte the same, and an
+        /// older build, which ignores the key, still reads the rule - and
+        /// then judges it with no exemption, which is stricter, never looser.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        exempt: Vec<String>,
     },
 }
 
@@ -628,6 +637,7 @@ mod tests {
             Check::Requires {
                 when: "git commit".to_string(),
                 required: vec!["issue:".to_string(), "no-issue".to_string()],
+                exempt: Vec::new(),
             },
         ] {
             let json = serde_json::to_string(&check).unwrap();
@@ -766,7 +776,7 @@ mod tests {
         let check: Check = serde_json::from_str(old).expect("the older shape must still parse");
         assert_eq!(
             check,
-            Check::Requires { when: "agent(".to_string(), required: vec!["model".to_string()] }
+            Check::Requires { when: "agent(".to_string(), required: vec!["model".to_string()], exempt: Vec::new() }
         );
 
         let new = r#"{"requires":{"when":"Agent","required":["haiku","sonnet"]}}"#;
@@ -775,7 +785,8 @@ mod tests {
             check,
             Check::Requires {
                 when: "Agent".to_string(),
-                required: vec!["haiku".to_string(), "sonnet".to_string()]
+                required: vec!["haiku".to_string(), "sonnet".to_string()],
+                exempt: Vec::new(),
             }
         );
     }
@@ -785,6 +796,7 @@ mod tests {
         let check = Check::Requires {
             when: "git commit".to_string(),
             required: vec!["issue:".to_string(), "no-issue".to_string()],
+            exempt: Vec::new(),
         };
         let json = serde_json::to_string(&check).unwrap();
         assert_eq!(json, r#"{"requires":{"when":"git commit","required":["issue:","no-issue"]}}"#);
@@ -811,7 +823,7 @@ mod tests {
             falsifier: Some("the release checklist moves out of RELEASE.md".to_string()),
             check: None,
         };
-        item.check = Some(Check::Requires { when: "git commit".to_string(), required: vec!["issue:".to_string()] });
+        item.check = Some(Check::Requires { when: "git commit".to_string(), required: vec!["issue:".to_string()], exempt: Vec::new() });
         let json = serde_json::to_string(&item).unwrap();
         let golden = r#"{"id":"golden-lookup-1","kind":"lookup","text":"the release checklist lives in RELEASE.md","bindings":[{"target":{"kind":"path","value":"RELEASE.md"}}],"severity":"house_style","project":"thor2","tags":["release","process"],"expires":null,"key":"release-checklist","falsifier":"the release checklist moves out of RELEASE.md","check":{"requires":{"when":"git commit","required":["issue:"]}}}"#;
         assert_eq!(json, golden, "the canonical body for an item carrying Requires drifted from the golden literal: {json}");
@@ -955,6 +967,38 @@ mod tests {
             assert_eq!(TargetKind::from_str(name).unwrap(), kind);
         }
         assert!(TargetKind::from_str("bogus").is_err());
+    }
+
+    /// The exemption of a `requires` check is stored only when it exists, and a
+    /// build from before it (kept here as `Before`, the variant as it stood)
+    /// reads a body that carries it: unknown keys are ignored, so the rule
+    /// still loads there and is judged with no exemption (stricter, never looser).
+    #[test]
+    fn an_exemption_is_written_only_when_it_exists_and_an_older_build_still_reads_it() {
+        #[derive(Debug, PartialEq, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Before {
+            Requires {
+                when: String,
+                #[serde(deserialize_with = "one_or_many")]
+                required: Vec<String>,
+            },
+        }
+        let plain = Check::Requires { when: "Agent".to_string(), required: vec!["haiku".to_string()], exempt: Vec::new() };
+        assert_eq!(serde_json::to_string(&plain).unwrap(), r#"{"requires":{"when":"Agent","required":["haiku"]}}"#);
+
+        let with = Check::Requires {
+            when: "Agent".to_string(),
+            required: vec!["haiku".to_string()],
+            exempt: vec!["to=me@example.test".to_string()],
+        };
+        let json = serde_json::to_string(&with).unwrap();
+        assert_eq!(json, r#"{"requires":{"when":"Agent","required":["haiku"],"exempt":["to=me@example.test"]}}"#);
+        assert_eq!(serde_json::from_str::<Check>(&json).unwrap(), with);
+        assert_eq!(
+            serde_json::from_str::<Before>(&json).expect("an older build must still parse the body"),
+            Before::Requires { when: "Agent".to_string(), required: vec!["haiku".to_string()] }
+        );
     }
 }
 

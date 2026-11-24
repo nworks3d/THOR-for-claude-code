@@ -45,7 +45,7 @@ fn deploy_needs_dry_run() -> Item {
     rule(
         "acme-deploy-needs-dry-run",
         "acme-deploy",
-        Check::Requires { when: "acme-deploy".to_string(), required: vec!["--dry-run".to_string()] },
+        Check::Requires { when: "acme-deploy".to_string(), required: vec!["--dry-run".to_string()], exempt: Vec::new() },
         &[],
     )
 }
@@ -54,7 +54,7 @@ fn publish_needs_the_owner() -> Item {
     rule(
         "acme-publish-needs-the-owner",
         "acme-publish",
-        Check::Requires { when: "acme-publish".to_string(), required: vec!["go-owner".to_string()] },
+        Check::Requires { when: "acme-publish".to_string(), required: vec!["go-owner".to_string()], exempt: Vec::new() },
         &[model::store::OWNER_APPROVAL_TAG],
     )
 }

@@ -1017,7 +1017,7 @@ mod tests {
         let item = rule(
             "a deploy names its target",
             vec![cmd("deploy")],
-            Some(Check::Requires { when: "deploy".to_string(), required: vec!["--staging".to_string(), "--production".to_string()] }),
+            Some(Check::Requires { when: "deploy".to_string(), required: vec!["--staging".to_string(), "--production".to_string()], exempt: Vec::new() }),
         );
         match prove("r1", &item, None) {
             Proof::Fires(attempt) => assert_eq!(attempt, "deploy"),
@@ -1034,7 +1034,7 @@ mod tests {
         let item = rule(
             "a deploy names its target",
             vec![Binding::Always],
-            Some(Check::Requires { when: "deploy".to_string(), required: vec!["--staging".to_string()] }),
+            Some(Check::Requires { when: "deploy".to_string(), required: vec!["--staging".to_string()], exempt: Vec::new() }),
         );
         assert!(matches!(prove("r1", &item, None), Proof::NotProvable(_)));
     }
@@ -1212,7 +1212,7 @@ mod tests {
         let item = rule(
             "a deploy names its target",
             vec![cmd("deploy")],
-            Some(Check::Requires { when: "deploy".to_string(), required: vec!["--staging".to_string(), "--production".to_string()] }),
+            Some(Check::Requires { when: "deploy".to_string(), required: vec!["--staging".to_string(), "--production".to_string()], exempt: Vec::new() }),
         );
         match teeth_box("r1", &item, None, &Reality::default()) {
             TeethBox::Wired { forbidden_tried, clean_tried, .. } => {
@@ -1231,7 +1231,7 @@ mod tests {
         let item = rule(
             "a dev compose over ssh names its compose file",
             vec![cmd("ssh")],
-            Some(Check::Requires { when: "-p acme-dev".to_string(), required: vec!["-f docker-compose.dev.yml".to_string()] }),
+            Some(Check::Requires { when: "-p acme-dev".to_string(), required: vec!["-f docker-compose.dev.yml".to_string()], exempt: Vec::new() }),
         );
         match teeth_box("r1", &item, None, &Reality::default()) {
             TeethBox::Wired { forbidden_tried, clean_tried, .. } => {
@@ -1439,7 +1439,7 @@ mod tests {
         let item = rule(
             "a deploy names its target",
             vec![cmd("deploy")],
-            Some(Check::Requires { when: "deploy".to_string(), required: vec!["--staging".to_string()] }),
+            Some(Check::Requires { when: "deploy".to_string(), required: vec!["--staging".to_string()], exempt: Vec::new() }),
         );
         assert!(matches!(teeth_box("r1", &item, None, &on_record(&[(9, "deploy now")], i64::MAX)), TeethBox::ProvenGuard { .. }));
     }

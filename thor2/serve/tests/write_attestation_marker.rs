@@ -74,7 +74,7 @@ fn store(dir: &Path) -> std::path::PathBuf {
         expires: None,
         key: None,
         falsifier: Some("A remember call without alpha-ok turns out to be fine here.".to_string()),
-        check: Some(Check::Requires { when: "mcp__thor__remember".to_string(), required: vec!["alpha-ok".to_string()] }),
+        check: Some(Check::Requires { when: "mcp__thor__remember".to_string(), required: vec!["alpha-ok".to_string()], exempt: Vec::new() }),
     };
     model::store::declare(&mut store, "s", "l", "a", &rule).unwrap();
     db

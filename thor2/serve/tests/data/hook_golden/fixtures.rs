@@ -80,7 +80,7 @@ fn forbidden(literals: &[&str]) -> Check {
 }
 
 fn requires(when: &str, required: &[&str]) -> Check {
-    Check::Requires { when: when.to_string(), required: required.iter().map(|r| r.to_string()).collect() }
+    Check::Requires { when: when.to_string(), required: required.iter().map(|r| r.to_string()).collect(), exempt: Vec::new() }
 }
 
 /// A working folder of project `project`: a `.thor-project` marker (so no git

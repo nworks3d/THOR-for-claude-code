@@ -480,7 +480,10 @@ Words used once, in plain language:
   not count; if the transcript cannot be read, it refuses (fail closed).
 - Why: so a command like "send the e-mail" or "touch the live server" cannot be self-approved.
 - You notice: the assistant stops and asks you to say the go word.
-- Refuse or change: you say it; nothing else works.
+- Refuse or change: you say it; nothing else works. You can also change or lift such a rule from any
+  session: ask for it in your own message, the assistant revises or retracts the rule with your whole
+  message quoted, and THOR checks the quote against what you typed. Without it, anything that loosens
+  the rule is refused; narrowing it needs no quote.
 
 ### B17. Reports, open points and the first-session note are protected
 - What: an evaluation report can only be filed through THOR's own tool in the session that ran the
@@ -736,6 +739,10 @@ remembers per session how far it has looked, so a long conversation does not mak
   call names a cheap model). A trigger may be a literal inside the command; end it with * for a family.
   On a tool call with no command (Agent, an MCP tool) an answer or a forbidden literal written as
   `model=fable` addresses that one top-level input field, not the word in a brief.
+  A requires check on a tool can carry an exemption (`check_exempt`, `field=value` entries): a call
+  holding only the listed values for the fields named passes without the answer (for example a mail
+  only to the owner's own address); any other value, a missing field or a shell command is judged as
+  before. Every exempt value must be named in the rule's text.
 - Why: forgetting leaves no text to look for, so "forbidden" cannot see it.
 - You notice: the call is refused naming what is missing.
 - Refuse or change: same as D1.

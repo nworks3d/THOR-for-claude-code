@@ -28,7 +28,7 @@ fn health_rule(binding: &str) -> Item {
         expires: None,
         key: None,
         falsifier: Some("the health version only flips once the container really restarted".to_string()),
-        check: Some(Check::Requires { when: "/health".to_string(), required: vec!["docker inspect".to_string()] }),
+        check: Some(Check::Requires { when: "/health".to_string(), required: vec!["docker inspect".to_string()], exempt: Vec::new() }),
     }
 }
 

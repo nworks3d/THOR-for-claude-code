@@ -1477,6 +1477,7 @@ pub fn workflow_starter_pack_for(windows: bool) -> Vec<model::item::Item> {
                 ]
                 .map(String::from)
                 .to_vec(),
+                exempt: Vec::new(),
             },
         ),
         with_check(

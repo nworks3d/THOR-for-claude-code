@@ -116,7 +116,7 @@ fn a_requires_rule_from_another_project_never_refuses_an_ordinary_call_here() {
             "fork-install-needs-no-deps",
             Some("printer-project"),
             vec![command("pip")],
-            Check::Requires { when: "pip".to_string(), required: vec!["--no-deps".to_string()] },
+            Check::Requires { when: "pip".to_string(), required: vec!["--no-deps".to_string()], exempt: Vec::new() },
         )],
     );
     let elsewhere = checkout(tmp.path(), "memory-project");
@@ -134,7 +134,7 @@ fn a_requires_rule_still_refuses_inside_its_own_project_and_the_refusal_is_recor
             "fork-install-needs-no-deps",
             Some("printer-project"),
             vec![command("pip")],
-            Check::Requires { when: "pip".to_string(), required: vec!["--no-deps".to_string()] },
+            Check::Requires { when: "pip".to_string(), required: vec!["--no-deps".to_string()], exempt: Vec::new() },
         )],
     );
     let home = checkout(tmp.path(), "printer-project");
@@ -414,7 +414,7 @@ fn the_pip_no_deps_case_still_holds_per_segment() {
             "fork-install-needs-no-deps",
             Some("printer-project"),
             vec![command("pip")],
-            Check::Requires { when: "pip".to_string(), required: vec!["--no-deps".to_string()] },
+            Check::Requires { when: "pip".to_string(), required: vec!["--no-deps".to_string()], exempt: Vec::new() },
         )],
     );
     let elsewhere = checkout(tmp.path(), "memory-project");

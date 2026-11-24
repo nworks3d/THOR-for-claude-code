@@ -461,7 +461,7 @@ fn forms(item: &Item, root: &Path) -> Result<Forms, String> {
             }
             none("a forbidden check reaches a call only through a command anchor, and a written file only through an always binding - this rule has neither")
         }
-        Some(Check::Requires { when, required }) => {
+        Some(Check::Requires { when, required, exempt }) => {
             let Some(anchor) = command_anchor(&item.bindings) else {
                 return none("a requires check reaches a call only through a command anchor, and this rule has none");
             };
@@ -494,6 +494,13 @@ fn forms(item: &Item, root: &Path) -> Result<Forms, String> {
                 forbidden.extend(with_field("2"));
                 if inner {
                     clean.push(tool_call("trial".to_string()));
+                }
+                // An exemption is tried too: a call holding only what it lists
+                // must pass, and the same call with one foreign value more in
+                // the first listed field must still be refused.
+                if let Some((passes, refused)) = exempt_forms(anchor, &trigger, exempt) {
+                    clean.push(passes);
+                    forbidden.push(refused);
                 }
                 return Ok(Forms { forbidden, clean, collapsed: false, file: None });
             }
@@ -551,6 +558,44 @@ fn forms(item: &Item, root: &Path) -> Result<Forms, String> {
             Ok(Forms { forbidden, clean, collapsed: false, file: Some(file) })
         }
     }
+}
+
+/// The two calls that try a `requires` exemption: one holding exactly the
+/// listed values (it passes) and the same one with a foreign value added to
+/// the first listed field (it is still refused). `None` without an exemption.
+fn exempt_forms(anchor: &str, trigger: &str, exempt: &[String]) -> Option<(Call, Call)> {
+    let mut fields: Vec<(&str, Vec<&str>)> = Vec::new();
+    for (field, value) in exempt.iter().filter_map(|t| shell::exempt_token(t)) {
+        if value.is_empty() {
+            continue;
+        }
+        match fields.iter_mut().find(|(f, _)| *f == field) {
+            Some((_, values)) => values.push(value),
+            None => fields.push((field, vec![value])),
+        }
+    }
+    let first = fields.first()?.0.to_string();
+    let build = |foreign: bool| {
+        let mut input = serde_json::Map::new();
+        input.insert("prompt".to_string(), json!(trigger));
+        for (field, values) in &fields {
+            let mut held: Vec<String> = values.iter().map(|v| v.to_string()).collect();
+            if foreign && *field == first {
+                held.push("thor-trial-foreign.example.test".to_string());
+            }
+            input.insert(field.to_string(), json!(held));
+        }
+        Call {
+            shown: format!(
+                "{anchor} with {}",
+                fields.iter().map(|(f, v)| format!("{f}={}", v.join(","))).collect::<Vec<_>>().join(" ")
+                    + if foreign { " plus a foreign value (the exemption must not cover it)" } else { " (the exemption)" }
+            ),
+            tool: anchor.to_string(),
+            input: serde_json::Value::Object(input),
+        }
+    };
+    Some((build(false), build(true)))
 }
 
 fn absent_forms(root: &Path, path: &str, literals: &[String]) -> Result<Forms, String> {
@@ -768,7 +813,7 @@ fn teeth_of_span(words: &[&str], anchor_len: usize, anchor: &str, proposed: Opti
     }
     if let Some(flag) = words[anchor_len..].iter().find_map(|w| leading_flag(w)) {
         out.push(Derived {
-            check: Check::Requires { when: anchor.to_string(), required: vec![flag.to_string()] },
+            check: Check::Requires { when: anchor.to_string(), required: vec![flag.to_string()], exempt: Vec::new() },
             proposed,
             origin,
         });
@@ -1128,7 +1173,7 @@ fn derive_all(item: &Item, root: Option<&Path>) -> Vec<Derived> {
             {
                 let origin = Origin::Text(format!("the flag '{flag}' after '{anchor}' in the text"));
                 out.push(Derived { check: Check::Forbidden { literals: vec![flag.to_string()] }, proposed: None, origin: origin.clone() });
-                out.push(Derived { check: Check::Requires { when: anchor.clone(), required: vec![flag.to_string()] }, proposed: None, origin });
+                out.push(Derived { check: Check::Requires { when: anchor.clone(), required: vec![flag.to_string()], exempt: Vec::new() }, proposed: None, origin });
             }
         }
     }
@@ -1466,7 +1511,7 @@ fn describe(check: &Check, bindings: &[Binding]) -> String {
     let list = |ls: &[String]| ls.iter().map(|l| format!("'{}'", gate::shown_literal(l))).collect::<Vec<_>>().join(", ");
     match check {
         Check::Forbidden { literals } => format!("forbidden {}{anchor}", list(literals)),
-        Check::Requires { when, required } => format!("requires {} after '{}'{anchor}", list(required), gate::shown_literal(when)),
+        Check::Requires { when, required, .. } => format!("requires {} after '{}'{anchor}", list(required), gate::shown_literal(when)),
         Check::Contains { path, literal } => format!("contains '{}' in {path}", gate::shown_literal(literal)),
         Check::Absent { path, literal } => format!("absent '{}' in {path}", gate::shown_literal(literal)),
         Check::AbsentAll { path, literals } => format!("absent {} in {path}", list(literals)),
@@ -1481,7 +1526,7 @@ fn hang_it(check: &Check) -> String {
         Check::Forbidden { literals } => format!("check_kind forbidden, check_literals {}", list(literals)),
         // The remember/revise door takes a requires check as check_literals
         // with the trigger first, never a check_path.
-        Check::Requires { when, required } => {
+        Check::Requires { when, required, .. } => {
             let mut literals = vec![when.clone()];
             literals.extend(required.iter().cloned());
             format!("check_kind requires, check_literals {}", list(&literals))

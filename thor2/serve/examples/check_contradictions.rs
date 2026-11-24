@@ -148,7 +148,7 @@ fn describe_check(check: &Check) -> String {
             let quoted: Vec<String> = literals.iter().map(|l| format!("\"{}\"", one_line(l))).collect();
             format!("forbidden([{}])", quoted.join(", "))
         }
-        Check::Requires { when, required } => {
+        Check::Requires { when, required, .. } => {
             let quoted: Vec<String> = required.iter().map(|r| format!("\"{}\"", one_line(r))).collect();
             format!("requires(\"{}\" -> [{}])", one_line(when), quoted.join(", "))
         }
@@ -475,7 +475,7 @@ mod tests {
         // check with a path can ever land in a same-file group at all.
         assert_eq!(named_path(&Check::Forbidden { literals: vec!["x".to_string()] }), None);
         assert_eq!(
-            named_path(&Check::Requires { when: "git commit".to_string(), required: vec!["x".to_string()] }),
+            named_path(&Check::Requires { when: "git commit".to_string(), required: vec!["x".to_string()], exempt: Vec::new() }),
             None
         );
     }

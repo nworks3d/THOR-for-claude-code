@@ -449,7 +449,7 @@ fn a_field_literal_on_a_tool_matches_that_field_and_nothing_else() {
 #[test]
 fn a_field_answer_on_a_tool_is_satisfied_by_that_field_only() {
     let mut fx = Fx::new();
-    let check = Some(Check::Requires { when: "Agent".to_string(), required: vec!["model=sonnet".to_string(), "model=haiku".to_string()] });
+    let check = Some(Check::Requires { when: "Agent".to_string(), required: vec!["model=sonnet".to_string(), "model=haiku".to_string()], exempt: Vec::new() });
     let item = rule("name-a-model", "Every Agent call names `model=sonnet` or `model=haiku`.", vec![cmd("Agent")], check, None);
     let t = fx.write(&item);
     assert_eq!(t.outcome, Outcome::Rule { proven: false }, "{}", receipt(&t));
@@ -472,7 +472,7 @@ fn a_field_answer_on_a_tool_is_satisfied_by_that_field_only() {
 #[test]
 fn a_field_name_never_answers_a_plain_requires_answer_or_trips_a_plain_literal() {
     let mut fx = Fx::new();
-    let ask = Some(Check::Requires { when: "Agent".to_string(), required: vec!["subagent".to_string()] });
+    let ask = Some(Check::Requires { when: "Agent".to_string(), required: vec!["subagent".to_string()], exempt: Vec::new() });
     let ban = forbidden(&["model"]);
     fx.legacy(&rule("forbid-subagents", "Every Agent brief says the word subagent.", vec![cmd("Agent")], ask, None));
     fx.legacy(&rule("no-model-word", "Never write the word model in an Agent call: `model`.", vec![cmd("Agent")], ban, None));
@@ -686,7 +686,7 @@ fn listing_forms_drop_a_check_and_whole_hits_never_do() {
         "tag",
         "Tag every release annotated with -a.",
         vec![cmd("git tag")],
-        Some(Check::Requires { when: "git tag".to_string(), required: vec!["-a".to_string()] }),
+        Some(Check::Requires { when: "git tag".to_string(), required: vec!["-a".to_string()], exempt: Vec::new() }),
         None,
     );
     let t = fx.write(&item);
@@ -714,7 +714,7 @@ fn a_requires_trial_tries_multi_statement_powershell_calls() {
         "install-db",
         "install.exe needs --db, or it picks an empty store.",
         vec![cmd("install.exe")],
-        Some(Check::Requires { when: "install.exe".to_string(), required: vec!["--db".to_string()] }),
+        Some(Check::Requires { when: "install.exe".to_string(), required: vec!["--db".to_string()], exempt: Vec::new() }),
         None,
     );
     let t = fx.write(&item);
@@ -1426,7 +1426,7 @@ fn apply_writes_a_note_and_clears_the_check() {
         "tag",
         "Tag every release annotated with -a.",
         vec![cmd("git tag")],
-        Some(Check::Requires { when: "git tag".to_string(), required: vec!["-a".to_string()] }),
+        Some(Check::Requires { when: "git tag".to_string(), required: vec!["-a".to_string()], exempt: Vec::new() }),
         None,
     );
     fx.legacy(&item);
@@ -1526,7 +1526,7 @@ fn a_blind_inner_trigger_is_named() {
         "mk",
         "A mkdir under /thor must carry -p.",
         vec![cmd("mkdir")],
-        Some(Check::Requires { when: "/thor".to_string(), required: vec!["-p".to_string()] }),
+        Some(Check::Requires { when: "/thor".to_string(), required: vec!["-p".to_string()], exempt: Vec::new() }),
         None,
     );
     let t = fx.write(&item);
@@ -1736,7 +1736,7 @@ fn a_forcing_refusal_names_the_writers_dropped_check_first() {
         "tags",
         "Tag every release annotated: `git tag -a v1 -m msg`.",
         vec![cmd("git tag")],
-        Some(Check::Requires { when: "git tag".to_string(), required: vec!["-a".to_string()] }),
+        Some(Check::Requires { when: "git tag".to_string(), required: vec!["-a".to_string()], exempt: Vec::new() }),
         None,
     );
     let (code, message) = refusal(&fx.write(&item));
@@ -1752,7 +1752,7 @@ fn a_forcing_refusal_names_the_writers_dropped_check_first() {
 /// (the door refuses a check_path on requires, so that advice was a dead end).
 #[test]
 fn hang_it_names_a_requires_check_the_way_the_door_takes_it() {
-    let check = Check::Requires { when: "git tag".to_string(), required: vec!["-a".to_string(), "-s".to_string()] };
+    let check = Check::Requires { when: "git tag".to_string(), required: vec!["-a".to_string(), "-s".to_string()], exempt: Vec::new() };
     assert_eq!(hang_it(&check), "check_kind requires, check_literals ['git tag', '-a', '-s']");
 }
 
@@ -2328,7 +2328,7 @@ fn a_requires_trial_accepts_the_absolute_path_answer() {
         "agent-names-a-folder",
         "An Agent brief must name the absolute path of the folder the helper works in.",
         vec![cmd("Agent")],
-        Some(Check::Requires { when: "Agent".to_string(), required: vec![token.clone()] }),
+        Some(Check::Requires { when: "Agent".to_string(), required: vec![token.clone()], exempt: Vec::new() }),
         None,
     );
     let t = fx.write(&item);
@@ -2337,7 +2337,7 @@ fn a_requires_trial_accepts_the_absolute_path_answer() {
         "tar-names-a-folder",
         "tar must be told an absolute path to extract into.",
         vec![cmd("tar")],
-        Some(Check::Requires { when: "tar".to_string(), required: vec![token] }),
+        Some(Check::Requires { when: "tar".to_string(), required: vec![token], exempt: Vec::new() }),
         None,
     );
     let t = fx.write(&shell_item);

@@ -261,7 +261,7 @@ fn real_call_corpus_names_git_tag_l() {
         "tag",
         "Tag every release annotated with -a.",
         vec![cmd("git tag")],
-        Some(Check::Requires { when: "git tag".to_string(), required: vec!["-a".to_string()] }),
+        Some(Check::Requires { when: "git tag".to_string(), required: vec!["-a".to_string()], exempt: Vec::new() }),
         Some("beta"),
     );
     fx.legacy(&item);

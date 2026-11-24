@@ -76,7 +76,7 @@ fn describe_check(check: &Check) -> String {
         Check::Absent { path, literal } => format!("absent({path}, \"{}\")", one_line(literal)),
         // The conditional form prints as what it is: a trigger and what the
         // call must then also carry. No path, like Forbidden.
-        Check::Requires { when, required } => {
+        Check::Requires { when, required, .. } => {
             let quoted: Vec<String> = required.iter().map(|r| format!("\"{}\"", one_line(r))).collect();
             format!("requires(\"{}\" -> [{}])", one_line(when), quoted.join(", "))
         }

@@ -28,6 +28,7 @@ fn fixture(dir: &Path) -> PathBuf {
         check: Some(model::item::Check::Requires {
             when: "node --test".to_string(),
             required: vec!["--test-reporter".to_string(), "--test-timeout".to_string(), ".test.js".to_string()],
+            exempt: Vec::new(),
         }),
     };
     model::store::declare(&mut store, "s", "l", "a", &item).expect("the write gate must accept the rule");

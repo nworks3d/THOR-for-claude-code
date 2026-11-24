@@ -6274,6 +6274,7 @@ mod tests {
             reaches.check = Some(model::item::Check::Requires {
                 when: "Agent".to_string(),
                 required: vec!["haiku".to_string(), "sonnet".to_string()],
+                exempt: Vec::new(),
             });
             legacy_declare(&mut s, &reaches);
 
@@ -6285,7 +6286,7 @@ mod tests {
                 value: "server/lib/mail.js".to_string(),
             }];
             cannot.check =
-                Some(model::item::Check::Requires { when: "Agent".to_string(), required: vec!["haiku".to_string()] });
+                Some(model::item::Check::Requires { when: "Agent".to_string(), required: vec!["haiku".to_string()], exempt: Vec::new() });
             legacy_declare(&mut s, &cannot);
         }
         let line = proof_line(&db, false);
@@ -6949,7 +6950,7 @@ mod tests {
             let mut asks = rule("requires-quiet");
             asks.text = "pack-zz must carry --zz-asked".to_string();
             on(&mut asks, "pack-zz");
-            asks.check = Some(model::item::Check::Requires { when: "pack-zz".to_string(), required: vec!["--zz-asked".to_string()] });
+            asks.check = Some(model::item::Check::Requires { when: "pack-zz".to_string(), required: vec!["--zz-asked".to_string()], exempt: Vec::new() });
             for item in [&quiet, &bitten, &asks] {
                 legacy_declare(&mut s, item);
                 serve::teeth::fixture::decide(&mut s, &item.id);

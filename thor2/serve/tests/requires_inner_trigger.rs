@@ -30,6 +30,7 @@ fn fixture(dir: &Path) -> PathBuf {
         check: Some(model::item::Check::Requires {
             when: "-p acme-dev".to_string(),
             required: vec!["-f docker-compose.dev.yml".to_string()],
+            exempt: Vec::new(),
         }),
     };
     model::store::declare(&mut store, "s", "l", "a", &named(&item)).expect("the write gate must accept an inner trigger");

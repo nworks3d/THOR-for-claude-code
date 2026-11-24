@@ -202,7 +202,7 @@ fn a_refusal_is_never_hidden_by_the_repeat_limit() {
             "ssh-needs-a-key",
             "ssh calls name the key with -i",
             vec![command_binding("ssh")],
-            Some(Check::Requires { when: "ssh".to_string(), required: vec!["-i".to_string()] }),
+            Some(Check::Requires { when: "ssh".to_string(), required: vec!["-i".to_string()], exempt: Vec::new() }),
         ),
     );
     for round in 0..8 {
@@ -311,7 +311,7 @@ fn one_refusal_names_every_requires_rule_the_call_trips() {
                 id,
                 &format!("An Agent brief must say {answer}"),
                 vec![command_binding("Agent")],
-                Some(Check::Requires { when: "Agent".to_string(), required: vec![answer.to_string()] }),
+                Some(Check::Requires { when: "Agent".to_string(), required: vec![answer.to_string()], exempt: Vec::new() }),
             ),
         );
     }

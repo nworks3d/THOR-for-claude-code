@@ -13,6 +13,8 @@ What changed: The weekly check is quieter and more reliable, and a pin can no lo
 - **Clearer edits.** Changing a note now says which bindings were removed and which were kept.
 - **A short weekly check is short.** When only a few notes have to be judged or re-read, the assistant gets the steps right in the request and no longer reads the whole routine file first.
 - **The check after each answer stays fast in a long conversation.** It used to get slower with every note you saved, and could take minutes when the computer was busy. It now only looks at what is new, stops after a few seconds, and catches up at the next answer; `doctor` says if that happened.
+- **A rule that asks for a go-word can let harmless calls through.** For example, a mail rule can now pass a mail that goes only to your own address and still ask for the word on every other mail. Anything else in the call (a second address, a copy, a saved draft) brings the rule back.
+- **You can change a rule that needs your go from any conversation.** The refusal now says how: you ask for it in your own message and the assistant repeats the change with your whole message quoted. THOR checks the quote against what you typed and refuses a loosening without it.
 - **Notes now arrive when a script holds the host or tool they are about.** A command that runs a script file used to miss a note tied to a host or an MCP tool the script uses, because the command line named neither. THOR now reads that script, offers the note marked as reached through the script (after the ones the command itself reaches, at most two), and the weekly check also lists a host that too many notes are tied to.
 
 ## 2.6.13 (2026-11-21)
