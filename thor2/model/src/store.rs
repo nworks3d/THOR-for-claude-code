@@ -9127,9 +9127,12 @@ fn machine_section(store: &EventStore, start: &EvaluationStart, filed_seq: i64) 
         match verdicts.get(&event.seq) {
             Some(verdict) if verdict.attested => {}
             Some(verdict) => side_doors.push(line(&plain(&verdict.why))),
-            None => match write_door(event, &verdicts, &event.session_id) {
+            // Judged against THIS session: another session's write that waits
+            // for its check is that session's to attest at its own Stop.
+            None => match write_door(event, &verdicts, session) {
                 WriteDoor::Outside(door) => side_doors.push(line(&plain(&door))),
-                _ => unverified.push(line("a THOR call not verified yet")),
+                WriteDoor::Pending => unverified.push(line("a THOR call not verified yet")),
+                _ => {}
             },
         }
     }
@@ -13364,6 +13367,34 @@ mod tests {
         attest(&mut store, "tn-session", "tn-marked", mark.seq);
         attest(&mut store, "tn-session", "tn-folded", fold.seq);
         file_in(&mut store, &eval_report("eval-tn-1", "tn"), &start).expect("verified, so the report files");
+    }
+
+    /// A write of ANOTHER session in the window, still waiting for its own
+    /// session's check, is not listed as "checked at the end of this turn" in
+    /// this session's machine section: that session's Stop attests it.
+    #[test]
+    fn another_sessions_pending_write_is_not_listed_as_checked_at_the_end_of_this_turn() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare_noted(&mut store, &light_command_rule("ow-rule", "ow"));
+        serve_in(&mut store, "ow-session", "ow-rule", JUDGEMENT_DEBT_AFTER);
+        let start = record_start(&mut store, "ow-session", "ow");
+        let stamp = |session: &str, tool_use_id: &str| Att {
+            tool_use_id: Some(tool_use_id.to_string()),
+            args_sha256: "fixture".to_string(),
+            session_hint: Some(session.to_string()),
+            inflight: Some(INFLIGHT_UNSEEN.to_string()),
+            side_door: None,
+            unpin: None,
+        };
+        let theirs = with_att(serde_json::json!({"id": "ow-rule"}).to_string(), Some(&stamp("other-session", "toolu_theirs"))).unwrap();
+        store.append_event("other-session", "other-session", "mcp", EventKind::ItemMarkedNoise, "ow-rule", None, &theirs).unwrap();
+        let ours = with_att(serde_json::json!({"id": "ow-rule"}).to_string(), Some(&stamp("ow-session", "toolu_ours"))).unwrap();
+        let mine = store.append_event("ow-session", "ow-session", "mcp", EventKind::ItemMarkedUseful, "ow-rule", None, &ours).unwrap();
+        let filed_seq = store.get_next_seq().unwrap() - 1;
+        let section = render_machine_section(&store, &start, filed_seq);
+        assert!(section.contains("checked at the end of this turn: 1 write(s)."), "{section}");
+        assert!(section.contains(&format!("at log seq {}: a THOR call not verified yet", mine.seq)), "{section}");
+        assert!(!section.contains("toolu_theirs") && section.matches("a THOR call not verified yet").count() == 1, "{section}");
     }
 
     /// R15.6 at the store: a verdict on an item that is NOT on the frozen
