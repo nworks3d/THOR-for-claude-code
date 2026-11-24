@@ -2,6 +2,16 @@
 
 What changed in each release, newest first. The release workflow copies the section for the tag being released to the top of the release notes and refuses to publish without one.
 
+## 2.6.14 (2026-11-24)
+
+What changed: The weekly check is quieter and more reliable, and a pin can no longer crowd out the start of a conversation. Restart Claude Code once after the update, because the part that saves and looks up notes changed.
+
+- **Fewer false alarms in the weekly check.** Notes that fired somewhere without a recorded place, and another conversation's unfinished writes, are no longer listed against you. When nothing is left to judge, THOR closes the check itself.
+- **Clearer reports.** A refused call now keeps more of its text, `doctor` shows a short evaluation summary by default (use `--full` for everything), and a background test run is read correctly.
+- **Better warnings after an update.** A resumed conversation is only told to restart when its tool server really is older than the installed one.
+- **Pins are checked more strictly.** A pin on a note tied to one place needs a reason why it holds in every conversation. When the start block is full, THOR stops and asks you, and a note you approve is delivered whole at your first message. `doctor` shows how full the start block is per project.
+- **Clearer edits.** Changing a note now says which bindings were removed and which were kept.
+
 ## 2.6.13 (2026-11-21)
 
 What changed: The weekly check works again with the newest Claude Code.
