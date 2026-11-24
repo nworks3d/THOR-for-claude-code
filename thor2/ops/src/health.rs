@@ -3291,6 +3291,37 @@ pub fn pinned_line(db: &Path) -> String {
     )
 }
 
+/// How many of the largest pinned notes `pinned_block_lines` names per project.
+const PINNED_BLOCK_LARGEST: usize = 3;
+
+/// THE PINNED START BLOCK PER PROJECT: how many bytes the pinned notes take of the room a
+/// session start gives them (`model::item::standing_limit_for`), and the largest three, so a
+/// session that wants to pin an owner rule can see what takes the room before the write gate
+/// refuses it. One line per project that owns a pinned note, plus one for the block of the
+/// global pinned notes alone. Shows only; silent when nothing is pinned.
+pub fn pinned_block_lines(db: &Path) -> Vec<String> {
+    let Ok(store) = EventStore::open_existing(db) else { return Vec::new() };
+    let mut projects: Vec<String> = serve::live::live_items(&store)
+        .iter()
+        .filter(|li| li.item.kind.can_fire() && li.item.bindings.iter().any(|b| matches!(b, model::item::Binding::Always)))
+        .filter_map(|li| li.item.project.clone())
+        .collect();
+    projects.sort();
+    projects.dedup();
+    model::store::standing_block_use(&store, &projects, true, PINNED_BLOCK_LARGEST)
+        .into_iter()
+        .map(|block| {
+            let whose = block.project.as_deref().map_or("global notes only".to_string(), |p| format!("project '{p}'"));
+            let largest = block.largest.iter().map(|(id, bytes)| format!("{id} ({bytes} bytes)")).collect::<Vec<_>>().join(", ");
+            let state = if block.used > block.limit { "OVER the limit - a session start cuts the rest" } else { "fits" };
+            format!(
+                "pinned: start block of {whose}: {} of {} bytes used by {} pinned note(s), {state}; largest: {largest}",
+                block.used, block.limit, block.count
+            )
+        })
+        .collect()
+}
+
 /// The one definition of "this check can refuse something", shared by
 /// `proof_line` and `teeth_line` so the two can never disagree about it.
 fn can_refuse(item: &model::item::Item) -> bool {
@@ -4134,6 +4165,7 @@ pub fn report(
     lines.extend(working_copy_lines(db));
     // Silent unless standing rules do not fit at a session start somewhere.
     lines.extend(standing_rules_overflow_lines(db, full));
+    lines.extend(pinned_block_lines(db));
     // Silent unless two project names differ only in case, spaces or hyphens.
     lines.extend(split_scope_lines(db));
     // Silent unless a real refusal is on the log.
@@ -4178,7 +4210,7 @@ pub fn test_signal_line(db: &Path, checkout_project: Option<&str>) -> Option<Str
 
 /// The last line of `doctor --eval`: what it printed and what it left out, so a
 /// reader who needs another line knows it is one command away and not missing.
-pub const EVAL_FOOTER: &str = "doctor --eval: only the lines the evaluation routine asks for (tool server and installed programs, when one is wrong; ship, provable rules, gate, teeth, pinned, decay, crowding, false-block sweep, judgement debt, test signal, contradictions; THOR bug candidates, while one is waiting); a line the store has nothing to say about is silent, as in the full report. For anything else - the store and chain line, command anchors, hook launch failures, refusal outcomes, open points, the evaluation clock - run doctor without --eval; that takes longer, so wait for it to end and do not quote it before it has finished";
+pub const EVAL_FOOTER: &str = "doctor --eval: only the lines the evaluation routine asks for (tool server and installed programs, when one is wrong; ship, provable rules, gate, teeth, pinned, decay, crowding, false-block sweep, judgement debt, test signal, contradictions; THOR bug candidates, while one is waiting), with the named items a few per kind - add --full to list every one; a line the store has nothing to say about is silent, as in the full report. For anything else - the store and chain line, command anchors, hook launch failures, refusal outcomes, open points, the evaluation clock - run doctor without --eval; that takes longer, so wait for it to end and do not quote it before it has finished";
 
 /// The lines of `report` that the evaluation routine (`eval-command.example.md`)
 /// asks a reader to quote - `provable rules`, `gate`, `teeth`, `pinned`, `decay`,
@@ -4205,15 +4237,62 @@ pub fn eval_report(
         gate_line(db),
         teeth_line(db, full),
         pinned_line(db),
-        decay_line(db, checkouts, full),
-        crowding_line(db, checkouts, full),
     ]);
+    lines.extend(pinned_block_lines(db));
+    lines.extend([decay_line(db, checkouts, full), crowding_line(db, checkouts, full)]);
     lines.extend(false_block_sweep_lines(db));
     lines.extend(judgement_debt_line(db, checkout_project, full));
     lines.extend(test_signal_line(db, checkout_project));
     lines.extend(contradiction_line(db, checkouts));
     lines.extend(serve::thor_bugs::open_line(db));
     lines
+}
+
+/// How many named lines of one kind the short form of `doctor --eval` keeps under a
+/// headline; the headline itself always carries the count.
+pub const EVAL_SHORT_PER_KIND: usize = 3;
+
+/// The short form of `doctor --eval` (what it prints without `--full`): every headline line
+/// (a line that starts at the left edge) stays whole, so the summary and every number an
+/// evaluation quotes is there; under a headline, the indented lines that name single items
+/// are kept `per_kind` at a time per kind (the text before the first colon or quote) and the
+/// rest is replaced by one line that says how many were left out and how to get them.
+/// A measured store printed about 32 KB of such lines, which sessions then redirected to a
+/// file and searched; with `--full` nothing is left out.
+pub fn compact_eval_lines(lines: &[String], per_kind: usize) -> Vec<String> {
+    // The kind of a named line: its words up to the first colon or quote, without a leading count.
+    fn kind_of(line: &str) -> String {
+        let text = line.trim_start().trim_start_matches(|c: char| c.is_ascii_digit() || c == ' ');
+        text.chars().take_while(|c| *c != ':' && *c != '\'').take(32).collect::<String>().trim().to_string()
+    }
+    // One headline with the named lines under it, in order.
+    let mut blocks: Vec<(String, Vec<String>)> = Vec::new();
+    for physical in lines.iter().flat_map(|l| l.lines()) {
+        match blocks.last_mut() {
+            Some((_, named)) if physical.starts_with(char::is_whitespace) => named.push(physical.to_string()),
+            _ => blocks.push((physical.to_string(), Vec::new())),
+        }
+    }
+    let mut out = Vec::new();
+    for (headline, named) in blocks {
+        out.push(headline);
+        let mut seen: Vec<(String, usize)> = Vec::new();
+        for line in &named {
+            let kind = kind_of(line);
+            let at = seen.iter().position(|(k, _)| *k == kind).unwrap_or_else(|| {
+                seen.push((kind, 0));
+                seen.len() - 1
+            });
+            seen[at].1 += 1;
+            if seen[at].1 <= per_kind {
+                out.push(line.clone());
+            }
+        }
+        for (kind, count) in seen.into_iter().filter(|(_, count)| *count > per_kind) {
+            out.push(format!("  and {} more '{kind}' line(s), not shown here (doctor --eval --full lists every one)", count - per_kind));
+        }
+    }
+    out
 }
 
 /// THOR checks its own doctor against its own routine: every labelled line
@@ -7154,6 +7233,46 @@ mod tests {
         assert!(line.contains("1 item(s)"), "{line}");
         assert!(line.contains("1 never examined"), "{line}");
         assert!(line.contains("75%"), "three of four servings came from the pin: {line}");
+    }
+
+    #[test]
+    fn the_pinned_block_line_shows_bytes_used_and_the_largest_three_per_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        assert!(pinned_block_lines(&db).is_empty(), "no store, nothing to say");
+        {
+            let mut s = EventStore::new(&db).unwrap();
+            for (id, extra) in [("pin-a", 10usize), ("pin-b", 250), ("pin-c", 100), ("pin-d", 200)] {
+                let mut item = rule(id);
+                item.text = format!("a pinned note that is {}", "x".repeat(extra));
+                item.project = Some("fixture-project".to_string());
+                store::declare(&mut s, "s", "l", "a", &item).unwrap();
+            }
+        }
+        let lines = pinned_block_lines(&db);
+        let line = lines.iter().find(|l| l.contains("'fixture-project'")).expect("one line for the project");
+        assert!(line.starts_with("pinned: start block of project 'fixture-project': "), "{line}");
+        assert!(line.contains("by 4 pinned note(s)") && line.contains(&format!("of {} bytes", model::item::STANDING_BLOCK_LIMIT_BYTES)), "{line}");
+        let at = |id: &str| line.find(id).unwrap_or(usize::MAX);
+        assert!(at("pin-b") < at("pin-d") && at("pin-d") < at("pin-c"), "biggest first: {line}");
+        assert!(!line.contains("pin-a"), "only the three largest: {line}");
+    }
+
+    #[test]
+    fn the_short_eval_form_keeps_every_headline_and_a_few_named_lines_per_kind() {
+        let mut lines = vec!["gate: 40 refusals".to_string()];
+        lines.extend((0..10).map(|n| format!("  refused by: rule-{n} (3x)")));
+        lines.extend((0..2).map(|n| format!("  written by: hook-{n}")));
+        lines.push("pinned: 5 item(s)".to_string());
+        lines.push("crowding: 2 of 9\n  outranked: a at x\n  outranked: b at y".to_string());
+        let short = compact_eval_lines(&lines, 3);
+        let text = short.join("\n");
+        assert!(text.contains("gate: 40 refusals") && text.contains("pinned: 5 item(s)") && text.contains("crowding: 2 of 9"), "{text}");
+        assert_eq!(short.iter().filter(|l| l.contains("refused by: rule-")).count(), 3, "{text}");
+        assert!(text.contains("and 7 more 'refused by' line(s)") && text.contains("--full"), "{text}");
+        assert_eq!(short.iter().filter(|l| l.contains("written by:")).count(), 2, "a kind within the limit stays whole: {text}");
+        assert_eq!(short.iter().filter(|l| l.contains("outranked:")).count(), 2, "{text}");
+        assert!(!text.contains("rule-9"), "{text}");
     }
 
     #[test]

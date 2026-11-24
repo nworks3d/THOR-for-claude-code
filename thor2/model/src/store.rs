@@ -3012,6 +3012,52 @@ fn standing_overflow_refusal(candidates: &[(String, Item)], item: &Item) -> Opti
     })
 }
 
+/// What the pinned (standing) notes take of one session start block: the overview a session
+/// needs before it pins another owner rule. Shows only; no write decision hangs on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StandingBlockUse {
+    /// The project of the block; `None` is the block with the global pinned notes only.
+    pub project: Option<String>,
+    /// Bytes the pinned notes take, head lines included (as the write gate counts them).
+    pub used: usize,
+    /// Bytes the standing rules of this block may take.
+    pub limit: usize,
+    /// How many pinned notes stand in the block.
+    pub count: usize,
+    /// The largest pinned notes of the block, biggest first (id, bytes), at most `largest`.
+    pub largest: Vec<(String, usize)>,
+}
+
+/// The pinned-block use of each project in `projects` (and, when `with_global`, of the
+/// global-only block), from the live log; a block with no pinned note is left out.
+pub fn standing_block_use(store: &EventStore, projects: &[String], with_global: bool, largest: usize) -> Vec<StandingBlockUse> {
+    let candidates = all_live_items(store);
+    let mut blocks: Vec<Option<&str>> = projects.iter().map(|p| Some(p.as_str())).collect();
+    if with_global {
+        blocks.push(None);
+    }
+    blocks
+        .into_iter()
+        .filter_map(|project| {
+            let block = standing_in_block(&candidates, project, None);
+            if block.is_empty() {
+                return None;
+            }
+            let mut sizes: Vec<(String, usize)> =
+                block.iter().map(|(id, item)| (id.to_string(), crate::item::standing_line(id, &item.text).len() + 1)).collect();
+            sizes.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            sizes.truncate(largest);
+            Some(StandingBlockUse {
+                project: project.map(str::to_string),
+                used: standing_block_bytes(&block),
+                limit: crate::item::standing_limit_for(project),
+                count: block.len(),
+                largest: sizes,
+            })
+        })
+        .collect()
+}
+
 /// The pinned facts of `project`'s block that do NOT fit `HOOK_OUTPUT_LIMIT_BYTES`
 /// right now, as a crowded place; `None` while the block fits. Order and fitting
 /// follow `serve::session_start::render_within_ranked` without its recency
