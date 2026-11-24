@@ -945,6 +945,26 @@ fn an_older_build_with_the_same_report_formats_is_information_and_a_different_fo
     assert_eq!(tool_server_build(&db, S1), Some((model::gate::MACHINE_RENDERER_REV + 1, model::gate::FILING_FORMAT_REV)));
 }
 
+/// A resumed session is judged by the build its tool server actually runs: the server records
+/// its own start at every resume, so a transcript that still shows only the original start does
+/// not make a resumed session "older than the installed one".
+#[test]
+fn a_resumed_session_is_judged_by_the_start_its_tool_server_reports() {
+    let fx = Fx::new();
+    let root = fx.root();
+    let now = crate::time::now_unix();
+    let mcp = mcp_installed_at(fx.dir.path(), now - 3600);
+    let db = fx.dir.path().join("thor.db");
+    main_transcript(&root, S1).raw(&session_start_line("startup", now - 7200, S1)).write();
+    note_tool_server_build(&db, S1, now - 7200, model::gate::MACHINE_RENDERER_REV, model::gate::FILING_FORMAT_REV);
+    assert!(tool_server_stale(S1, Some(&root), Some(&mcp), Some(&db)).is_some(), "still the old server");
+
+    // The resume restarted the tool server after the install; the transcript shows no resume record.
+    note_tool_server_build(&db, S1, now - 600, model::gate::MACHINE_RENDERER_REV, model::gate::FILING_FORMAT_REV);
+    assert_eq!(tool_server_started(&db, S1), Some(now - 600));
+    assert_eq!(tool_server_stale(S1, Some(&root), Some(&mcp), Some(&db)), None);
+}
+
 /// The skew refusal of a filing looks at the two numbers only: another build id or version
 /// is no reason to refuse, a different renderer or filing format is.
 #[test]

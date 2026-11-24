@@ -1242,7 +1242,7 @@ and in a Bash tool:
 
 The lines you need: `provable rules` (how many can refuse anything at all),
 `gate` (how often it did), `teeth` (how many heavy rules have teeth),
-`pinned` (how much of the memory is never re-read), `decay`, `crowding`,
+`pinned` (how much of the memory is never re-read; its per-project lines say how many bytes of the start block the pinned notes take and which three are the largest, and name the overflow pins), `pinned exceptions` (pins kept with a reason although they name a place, and overflow pins written on the owner's go; silent when there are none), `decay`, `crowding`,
 `ship` (how long ago the copy on another machine last succeeded; this line
 stays silent when there is no copy, and speaks up when one has gone stale),
 `false-block sweep` (rules that would refuse real calls of the last 30 days

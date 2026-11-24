@@ -793,9 +793,19 @@ The assistant should say in one sentence what it is doing (AGENTS.md:633-640).
   (remember or revise adding Always, or pin), or a pinned note made longer, is refused when the block of
   that project (its own pinned notes plus the global ones; a global note is judged in every project)
   would no longer fit in 9,291 bytes (the 9,800 a start can carry, less 509 kept for two lines that must always be shown; the global-only block of a folder of no project gets 8,689, because it also keeps 602 for the no-project line), and nothing is stored. The refusal names the largest pinned notes
-  and three exits: fold two that say the same, bind one to the command, file, tool or moment it is
-  about and unpin it, or retract a stale one with a reason. An unpin, a retract or a shorter note is never
-  refused. A memory that already overflows lists its cut notes first under the evaluation's crowded
+  and the steps in this order: fold pinned notes that say the same, unpin or retract those that no longer
+  carry anything, and if none can go, ask the owner. An unpin, a retract or a shorter note is never
+  refused.
+  The block is only for rules that hold in every conversation. A write that adds Always to a rule that also
+  names a place (a path, directory, command, symbol, route or host) is refused: a rule about one place binds
+  to that place and arrives when it is needed. The way out is a reason in `because` (at least 20 characters)
+  saying why it must hold in every conversation; the pin is then written, the reason stays in its history and
+  doctor lists it under "pinned exceptions". Pins that already stand are not touched.
+  The way out of a full block is the owner's own go: his whole message between double quotes in `because`,
+  checked in the hook against what he typed in this session (the same check as an unpin on his words). The note
+  is then an overflow pin: not in the start block, delivered whole at the first prompt of each conversation,
+  once, within a second budget of the same size; a pin that would not fit there either is refused with the
+  same text. Doctor names the overflow pins per project. A memory that already overflows lists its cut notes first under the evaluation's crowded
   places, and the report is held until the block fits. A fresh install's own notes fit with room left
   (a test checks it). The pinned notes take their room first. The other lines of a start get what is
   left, in this order when room is short: the compaction reminder and the no-project line (always shown;

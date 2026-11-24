@@ -2654,6 +2654,42 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                 (None, Some(other)) => Some(serve::other_project::prompt_note(&other)),
                 (note, None) => note,
             };
+            // THE OVERFLOW PINS (owner's decision, 2026-11-24): pinned notes the full session start
+            // block could not take, written on the owner's own go. Delivered whole here, at the
+            // first prompt of each context, within the same size limit as a session start.
+            let eval_note = {
+                let overflow = serve::live::always_candidates(&store);
+                let decay = DecayContext::load(&store);
+                let (items, _) = session_start::split_for_session_start(
+                    serve::decay::retain_live(session_start::select_overflow(&overflow, folder_project.as_deref()), &decay),
+                    session_kind(&payload).headless,
+                );
+                let fresh = serve::repeat::unseen(db_path, &reader, &items);
+                let rendered = session_start::render_within(&fresh, model::item::HOOK_OUTPUT_LIMIT_BYTES);
+                match rendered {
+                    Some(r) if !r.shown.is_empty() => {
+                        if remember_shown {
+                            serve::repeat::mark_seen(db_path, &reader, &r.shown);
+                        }
+                        if !no_record {
+                            deliver::record_delivery_with_trigger(
+                                &mut store,
+                                &session_id,
+                                &session_id,
+                                actor,
+                                &time::now_iso8601(),
+                                &r.shown,
+                                Some("first prompt"),
+                            );
+                        }
+                        match eval_note {
+                            Some(note) => Some(format!("{note}\n\n{}", r.text)),
+                            None => Some(r.text),
+                        }
+                    }
+                    _ => eval_note,
+                }
+            };
             let candidates = serve::live::live_items(&store);
             let mut input = prompt::resolve(prompt_text, &candidates);
             input.project = folder_project.clone();
@@ -2770,7 +2806,7 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             if let Some(reason) = serve::unpin_gate::protected_file_refusal(tool_name, tool_input) {
                 return Some(HookOutput::Decision(serde_json::json!({ "decision": "block", "reason": reason })));
             }
-            if serve::unpin_gate::is_gated_call(tool_name) {
+            if serve::unpin_gate::is_gated_call(tool_name) || serve::unpin_gate::is_pin_call(tool_name) {
                 serve::unpin_gate::witness(db_path, &payload, time::now_unix());
             }
 
@@ -6777,6 +6813,51 @@ mod copy_mode_tests {
             new_files.iter().all(|n| n == "copy-telemetry.jsonl" || n == "shown-counts"),
             "a copy writes nothing beside the store but its telemetry and the once-per-context counts: {new_files:?}"
         );
+    }
+
+    /// AN OVERFLOW PIN (owner's decision, 2026-11-24) is not in the session start block, but the first
+    /// prompt of each context carries it whole, once; a new session start (or a resume) resets that.
+    #[test]
+    fn an_overflow_pin_is_left_out_of_the_start_block_and_delivered_whole_at_the_first_prompt_once() {
+        let f = fixture(false);
+        let text = "Answer in the owner's language, whatever the language of the machine text that arrives.";
+        {
+            let mut store = EventStore::new(&f.db).unwrap();
+            let pin = Item {
+                id: "overflow-language".to_string(),
+                kind: Kind::Rule,
+                text: text.to_string(),
+                bindings: vec![Binding::Always],
+                severity: None,
+                project: None,
+                tags: vec![model::store::OVERFLOW_PIN_TAG.to_string()],
+                expires: None,
+                key: None,
+                falsifier: Some("the owner stops caring which language it is".to_string()),
+                check: None,
+            };
+            model::store::declare(&mut store, "seed", "seed", "seed", &pin).unwrap();
+        }
+        let block_of = |out: Option<HookOutput>| match out {
+            Some(HookOutput::Context { block, .. }) | Some(HookOutput::ContextWithNotice { block, .. }) => block,
+            _ => String::new(),
+        };
+        let run = |event: &str, session: &str, extra: Value| {
+            let mut p: Value = serde_json::from_str(&payload(event, &f.root, extra)).unwrap();
+            p["session_id"] = serde_json::json!(session);
+            block_of(hook_once(&f.db, Some(p.to_string()), "hook", false))
+        };
+        let start = run("SessionStart", "s-over", serde_json::json!({}));
+        assert!(start.contains("pinned rule") && !start.contains(text), "the block keeps its pins and not the overflow pin: {start}");
+        let first = run("UserPromptSubmit", "s-over", serde_json::json!({ "prompt": "please carry on" }));
+        assert!(first.contains(&format!("- [overflow-language] {text}")), "the first prompt carries it whole: {first}");
+        let second = run("UserPromptSubmit", "s-over", serde_json::json!({ "prompt": "and another thing" }));
+        assert!(!second.contains(text), "once per context: {second}");
+        run("SessionStart", "s-over", serde_json::json!({ "source": "resume" }));
+        let again = run("UserPromptSubmit", "s-over", serde_json::json!({ "prompt": "after the resume" }));
+        assert!(again.contains(text), "a resume loses what was shown, so it comes again: {again}");
+        let other = run("UserPromptSubmit", "s-other", serde_json::json!({ "prompt": "a fresh conversation" }));
+        assert!(other.contains(text), "another context gets it too: {other}");
     }
 
     /// THE LENGTH REMINDER: the session's first typed prompt carries the

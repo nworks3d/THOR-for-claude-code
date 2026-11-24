@@ -63,6 +63,12 @@ pub fn is_gated_call(tool_name: &str) -> bool {
     ["unpin", "revise", "retract"].iter().any(|t| tool_name == *t || tool_name.ends_with(&format!("__{t}")))
 }
 
+/// Is this tool name one that can ADD a pin (remember, revise or pin)? Its `because` may quote the
+/// owner's own go for an overflow pin, which the hook witnesses the same way (`witness`).
+pub fn is_pin_call(tool_name: &str) -> bool {
+    ["remember", "revise", "pin"].iter().any(|t| tool_name == *t || tool_name.ends_with(&format!("__{t}")))
+}
+
 /// Does this binding list carry `Always`?
 pub fn is_pinned(bindings: &[Binding]) -> bool {
     bindings.iter().any(|b| matches!(b, Binding::Always))

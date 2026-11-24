@@ -166,7 +166,9 @@ fn main() -> ExitCode {
         // below, so the judgement debt line counts the same checkout.
         let checkout_project = serve::project::resolve_project(cli.repo.as_deref().unwrap_or(&cwd));
         let printed = ops::health::eval_report(&cli.db, checkouts, cli.full, checkout_project.as_deref());
-        for line in &printed {
+        // Short by default: every headline whole, the named items a few per kind. `--full` prints all.
+        let shown = if cli.full { printed.clone() } else { ops::health::compact_eval_lines(&printed, ops::health::EVAL_SHORT_PER_KIND) };
+        for line in &shown {
             say!("{line}");
         }
         // THOR checks its own doctor against its own routine.
