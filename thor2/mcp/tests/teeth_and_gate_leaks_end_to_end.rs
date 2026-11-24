@@ -142,7 +142,7 @@ fn served_in(store: &mut EventStore, session: &str, id: &str, n: usize) {
     // One firing per session (step 28): `session` first, then "<session>-1" ...
     for i in 0..n {
         let this = serve::deliver::nth_session(session, i);
-        store.append_event(&this, "l", "hook", EventKind::ItemServed, id, None, "{}").unwrap();
+        store.append_event(&this, "l", "hook", EventKind::ItemServed, id, None, r#"{"served_at":"2026-11-17T10:00:00Z","trigger":"git push origin main"}"#).unwrap();
     }
 }
 
