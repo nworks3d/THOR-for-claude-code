@@ -2776,6 +2776,32 @@ mod write_tests {
         assert!(matches!(why, InFlight::SideDoor(_)), "{why:?}");
     }
 
+    /// The real shape of a noise mark with a place: Claude Code keeps the call
+    /// once as typed and once as an api-request copy with the scalars as text.
+    /// Both are one call, so the mark is attested, and the retry of the same
+    /// mark (a new tool call) is attested too - never a side door.
+    #[test]
+    fn a_noise_mark_with_a_place_and_its_api_request_copy_attests_and_so_does_the_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = EventStore::in_memory().unwrap();
+        let tool = "mcp__thor__mark";
+        let sent = json!({"id": "b-1", "noise": true, "place": "command: git push"});
+        let copy = json!({"id": "b-1", "noise": "true", "place": "command: git push"});
+        let mut t = main_transcript(root.path(), S);
+        for tool_use in ["toolu_N1", "toolu_N2"] {
+            t.call(tool_use, tool, &sent).call(tool_use, tool, &copy);
+        }
+        t.write();
+        for tool_use in ["toolu_N1", "toolu_N2"] {
+            let att = att_for_call(&meta(tool_use), Some(S), &sent, "mark", Some(root.path()));
+            assert_eq!(att.inflight.as_deref(), Some(model::store::INFLIGHT_SEEN), "{tool_use}: {att:?}");
+            let event = crate::mark::record_noise(&mut store, S, "mcp", "mcp", "2026-09-28T00:00:02Z", "b-1", Some(&att)).unwrap();
+            let marker = write_marker(tool, Some(tool_use), Some(&sent)).unwrap();
+            t.hook_context(tool_use, tool, &marker).result(tool_use, &format!("marked: b-1 (event seq {})", event.seq)).write();
+            assert!(matches!(verify_write(&event, Some(root.path())), Some(WriteAttestation::Attested { .. })), "{tool_use}");
+        }
+    }
+
     /// The result must name THIS write's seq, exactly: a replayed real id
     /// names another one, and a longer number is not this one.
     #[test]
