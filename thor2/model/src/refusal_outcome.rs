@@ -103,6 +103,7 @@ pub fn fates(
             continue;
         }
         let mut noise: Option<i64> = None;
+        let then_item = item.clone();
         let mut fate = RefusalFate { rule: rule.to_string(), refusal_seq: refusal.seq, fate: Fate::Unchanged, fate_seq: None, then: item.clone() };
         for (j, later) in events.iter().enumerate().skip(i + 1).filter(|(_, l)| follows(refusal, l)) {
             let by_thor = RESERVED_ACTORS.contains(&later.actor.as_str());
@@ -115,7 +116,10 @@ pub fn fates(
                 EventKind::FactRevised if !by_thor => {
                     let (Some(before), Ok(after)) = (&snapshots[stood[j - 1]].0, parse_body(&later.body)) else { continue };
                     let weakened = before.kind.can_fire().then(|| crate::gate::weakenings_widened(before, &after)).unwrap_or_default();
-                    if !weakened.is_empty() {
+                    // A weakening that only undoes a strengthening made after the
+                    // refusal leaves the rule as it was when it refused: no outcome.
+                    let below_then = then_item.kind.can_fire().then(|| crate::gate::weakenings_widened(&then_item, &after)).unwrap_or_default();
+                    if !weakened.is_empty() && !below_then.is_empty() {
                         let labels = weakened.iter().map(|w| w.label).collect::<Vec<_>>().join(", ");
                         fate.fate = Fate::Weakened(labels);
                         fate.fate_seq = Some(later.seq);
@@ -324,6 +328,25 @@ mod tests {
             write(3, "retest", EventKind::FactRevised, &rule(None, None)),
         ];
         assert_eq!(fate_of(&events)[0].fate, Fate::Unchanged);
+    }
+
+    #[test]
+    fn a_weakening_that_only_undoes_a_later_strengthening_is_not_an_outcome() {
+        let base = rule(forbid("--force"), None);
+        let mut stronger = base.clone();
+        stronger.bindings.push(Binding::Target { kind: TargetKind::Command, value: "Workflow".to_string() });
+        let events = [
+            write(1, "mcp", EventKind::FactCreated, &base),
+            refusal(2),
+            write(3, "mcp", EventKind::FactRevised, &stronger),
+            write(4, "mcp", EventKind::FactRevised, &base),
+        ];
+        let got = fate_of(&events);
+        assert_eq!(got[0].fate, Fate::Unchanged);
+        assert!(!got[0].probable_false_block());
+        let mut events = events.to_vec();
+        events.push(write(5, "mcp", EventKind::FactRevised, &rule(None, None)));
+        assert!(fate_of(&events)[0].probable_false_block(), "a real weakening afterwards still counts");
     }
 
     #[test]
