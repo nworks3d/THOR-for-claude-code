@@ -78,6 +78,72 @@ fn runner_in(command: &str) -> Option<&'static str> {
     EVAL_TEST_RUNNER_COMMANDS.iter().copied().find(|runner| command.contains(runner))
 }
 
+/// The file a command's output was sent to (`> out.txt`, `>> out.txt`, `2> out.txt`, `&> out.txt`,
+/// `| tee out.txt`), when there is one other than a null device or a stream (`2>&1`).
+fn output_file_of(command: &str) -> Option<String> {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let clean = |raw: &str| raw.trim_matches(|c| c == '"' || c == '\'').to_string();
+    let mut found = None;
+    for (at, token) in tokens.iter().enumerate() {
+        let target = if *token == "tee" {
+            tokens.get(at + 1).filter(|next| !next.starts_with('-')).map(|next| clean(next))
+        } else if let Some(start) = token.find('>') {
+            let after = token[start..].trim_start_matches('>');
+            if after.starts_with('&') {
+                continue;
+            }
+            if after.is_empty() { tokens.get(at + 1).map(|next| clean(next)) } else { Some(clean(after)) }
+        } else {
+            None
+        };
+        if let Some(target) = target.filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case("nul") && !t.starts_with("/dev/") && !t.starts_with('&')) {
+            found = Some(target);
+        }
+    }
+    found
+}
+
+/// How long an output file must have been left alone before its result is believed: a run
+/// that is still writing shows the first crate's "ok" long before its last one fails.
+const OUTPUT_SETTLED_SECS: u64 = 10;
+
+/// The result of a test or build run whose output went to a file that exists now, read from
+/// that file: `Some(false)` when it shows a failure, `Some(true)` when it shows a pass and no
+/// failure, `None` when there is no such file, it is older than the run's start (an earlier
+/// run's output), still being written, or says neither. Generic across the runners in
+/// `EVAL_TEST_RUNNER_COMMANDS`.
+fn result_from_output_file(row: &CallRow, command: &str) -> Option<bool> {
+    let path = std::path::PathBuf::from(output_file_of(command)?);
+    let path = if path.is_absolute() || row.cwd.is_empty() { path } else { Path::new(&row.cwd).join(path) };
+    let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
+    let modified_unix = modified.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64;
+    if modified_unix + 60 < row.t || modified.elapsed().map_or(true, |age| age.as_secs() < OUTPUT_SETTLED_SECS) {
+        return None;
+    }
+    let bytes = std::fs::read(&path).ok()?;
+    let tail = String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(200_000)..]).into_owned();
+    let failed = tail.contains("test result: FAILED")
+        || tail.contains("error: could not compile")
+        || tail.contains("error: test failed")
+        || tail.lines().any(|l| {
+            let l = l.trim_start();
+            l.starts_with("error[E") || l.starts_with("FAIL") || l.starts_with("FAILED") || l.starts_with("--- FAIL")
+                || l.strip_prefix("# fail ").is_some_and(|n| n.trim() != "0")
+                || (l.contains(" failed") && l.contains(" passed") && !l.contains("0 failed") && !l.starts_with("test result"))
+        });
+    if failed {
+        return Some(false);
+    }
+    // A build prints "Finished" only at its very end; a test run prints it before the tests start.
+    let is_build = command.contains("cargo build");
+    let passed = tail.contains("test result: ok")
+        || tail.lines().any(|l| {
+            let l = l.trim();
+            l == "OK" || l == "# fail 0" || l.starts_with("ok  \t") || (is_build && l.starts_with("Finished ")) || (l.contains(" passed") && !l.contains("failed"))
+        });
+    passed.then_some(true)
+}
+
 /// Whether `row` changed code.
 fn is_change(row: &CallRow) -> bool {
     if let Some(command) = command_of(row) {
@@ -103,7 +169,10 @@ pub fn signal_of<'a>(rows: impl Iterator<Item = &'a CallRow>) -> TestSignal {
     let mut changes_since = 0usize;
     for row in rows {
         if let Some(runner) = command_of(row).and_then(runner_in) {
-            last_run = Some(LastRun { at: row.t, runner: runner.to_string(), ok: row.ok, background: corpus::started_in_background(&row.input) });
+            // A run started in the background answers only that it started; when its output went
+            // to a file that is there now, the result is read from that file.
+            let ok = row.ok.or_else(|| command_of(row).and_then(|command| result_from_output_file(row, command)));
+            last_run = Some(LastRun { at: row.t, runner: runner.to_string(), ok, background: corpus::started_in_background(&row.input) });
             changes_since = 0;
         } else if is_change(row) {
             changes_since += 1;
@@ -261,6 +330,48 @@ mod tests {
         let text = line(&signal, NOW);
         assert!(!text.contains("passed"), "{text}");
         assert!(text.contains("started in the background, result unknown") && text.contains("run it again"), "{text}");
+    }
+
+    /// A background run whose output went to a file is read from that file once it is settled:
+    /// a pass is a pass, a failure is a failure, and a file that is missing, older than the run,
+    /// still being written or silent leaves the result unknown.
+    #[test]
+    fn a_background_run_with_its_output_in_a_file_is_read_from_that_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.txt");
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        let settle = |path: &std::path::Path, text: &str| {
+            std::fs::write(path, text).unwrap();
+            let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+            file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(120)).unwrap();
+        };
+        let run = |command: String| {
+            let mut started = row("1", now - 600, "Bash", json!({ "command": command, "run_in_background": true }), None);
+            started.cwd = dir.path().display().to_string();
+            of(&[started])
+        };
+        let command = format!("cargo test > {} 2>&1", out.display());
+
+        assert_eq!(run(command.clone()).last_run.unwrap().ok, None, "no output file yet");
+        settle(&out, "running 3 tests\ntest result: ok. 3 passed; 0 failed\n");
+        let passed = run(command.clone());
+        assert_eq!(passed.last_run.as_ref().unwrap().ok, Some(true));
+        assert!(line(&passed, now).contains("passed"), "{}", line(&passed, now));
+        settle(&out, "test result: ok. 2 passed\ntest result: FAILED. 1 passed; 1 failed\n");
+        assert_eq!(run(command.clone()).last_run.unwrap().ok, Some(false), "one failing crate fails the run");
+        settle(&out, "Compiling thing\n");
+        assert_eq!(run(command.clone()).last_run.unwrap().ok, None, "neither a pass nor a failure in it");
+        // A relative target is found from the call's working folder, `tee` and `2>` work too.
+        settle(&out, "test result: ok. 1 passed\n");
+        assert_eq!(run("cargo test 2>&1 | tee out.txt".to_string()).last_run.unwrap().ok, Some(true));
+        // Output from before the run started, or still being written, is not this run's result.
+        let file = std::fs::OpenOptions::new().write(true).open(&out).unwrap();
+        file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7200)).unwrap();
+        assert_eq!(run(command.clone()).last_run.unwrap().ok, None, "an earlier run's file");
+        std::fs::write(&out, "test result: ok. 1 passed\n").unwrap();
+        assert_eq!(run(command).last_run.unwrap().ok, None, "still being written");
+        assert_eq!(output_file_of("cargo test > /dev/null 2>&1"), None);
+        assert_eq!(output_file_of("cargo test 2>&1"), None);
     }
 
     /// Field case: a Python project ran `python -m unittest` and was told to run
