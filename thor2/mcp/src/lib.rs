@@ -1572,6 +1572,35 @@ fn refuse_a_worktree_only_check(
     Ok(())
 }
 
+/// One binding in the words a revise reply uses.
+fn binding_words(binding: &Binding) -> String {
+    match binding {
+        Binding::Always => "always".to_string(),
+        Binding::Moment(moment) => format!("moment {}", moment.as_str()),
+        Binding::Target { kind, value } => format!("target {kind:?} {value}"),
+    }
+}
+
+/// What a revise did to the binding list, for its reply: a call that gave `moments`, `targets`
+/// or `always` replaces the whole list (`moments: []` removes every moment and, with no
+/// `targets` given, every target too), and the reply used to say only "revised". `None` when
+/// no binding field was given and nothing changed.
+fn bindings_change_note(before: &[Binding], after: &[Binding], given: bool) -> Option<String> {
+    let removed: Vec<String> = before.iter().filter(|b| !after.contains(b)).map(binding_words).collect();
+    let added: Vec<String> = after.iter().filter(|b| !before.contains(b)).map(binding_words).collect();
+    if !given && removed.is_empty() && added.is_empty() {
+        return None;
+    }
+    let list = |words: Vec<String>| if words.is_empty() { "none".to_string() } else { words.join(", ") };
+    let kept: Vec<String> = after.iter().filter(|b| before.contains(b)).map(binding_words).collect();
+    let mut note = format!(" - bindings: kept [{}], removed [{}]", list(kept), list(removed));
+    if !added.is_empty() {
+        note.push_str(&format!(", added [{}]", list(added)));
+    }
+    note.push_str(" (a revise that gives moments, targets or always replaces the whole binding list)");
+    Some(note)
+}
+
 fn build_bindings(moments: &[String], targets: &[TargetArg], always: bool) -> Result<Vec<Binding>, String> {
     let mut bindings = Vec::new();
     for name in moments {
@@ -3332,6 +3361,11 @@ impl ThorMcpServer {
                         success.push_str(&format!(
                             " - dropped the tag '{reason}': the check you hung says the opposite, and the two cannot stand together"
                         ));
+                    }
+                    // A revise that gave moments, targets or always replaces the whole
+                    // binding list ([] too): say what it removed and what it kept.
+                    if let Some(note) = bindings_change_note(&existing.bindings, &written.bindings, args.moments.is_some() || args.targets.is_some() || args.always.is_some()) {
+                        success.push_str(&note);
                     }
                     // No trial ran: the one line that says so, and why the
                     // verdict it had still stands (or that it has none).
@@ -5482,6 +5516,45 @@ mod tests {
         assert!(item.check.is_none(), "a pending check is never on the item");
         assert!(item.tags.iter().any(|t| t == model::store::TEETH_NOTE_TAG), "{:?}", item.tags);
     }
+    /// A revise that gives `moments` replaces the whole binding list, targets included, and
+    /// its reply says which bindings it removed and which it kept (it said only "revised").
+    #[tokio::test]
+    async fn a_revise_that_gives_moments_says_which_bindings_it_removed_and_kept() {
+        let srv = server();
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(remembered_on_command("rebind-1", "ship-it"))).await;
+        assert!(reply.starts_with("stored "), "{reply}");
+        let reply = srv
+            .revise(Meta::new(), RawArgs::default(), Parameters(ReviseArgs {
+                id: "rebind-1".to_string(),
+                moments: Some(vec!["commit".to_string()]),
+                because: Some("the rule now fires at the commit moment instead of one command".to_string()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(reply.starts_with("revised "), "{reply}");
+        assert!(reply.contains("bindings: kept [always], removed [target Command ship-it], added [moment commit]"), "{reply}");
+        // An empty list removes every moment: the reply names what went and what stayed.
+        let reply = srv
+            .revise(Meta::new(), RawArgs::default(), Parameters(ReviseArgs {
+                id: "rebind-1".to_string(),
+                moments: Some(vec![]),
+                because: Some("the rule goes back to the command it was bound to before".to_string()),
+                targets: Some(vec![TargetArg { kind: "command".to_string(), value: "ship-it".to_string() }]),
+                ..Default::default()
+            }))
+            .await;
+        assert!(reply.contains("kept [always], removed [moment commit], added [target Command ship-it]"), "{reply}");
+        // A revise that touches no binding says nothing about them.
+        let reply = srv
+            .revise(Meta::new(), RawArgs::default(), Parameters(ReviseArgs {
+                id: "rebind-1".to_string(),
+                append: Some("and more".to_string()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(reply.starts_with("revised ") && !reply.contains("bindings:"), "{reply}");
+    }
+
     // ----------------------------------------- unreachable command anchors (step 40)
 
     fn remembered_on_command(id: &str, anchor: &str) -> RememberArgs {
