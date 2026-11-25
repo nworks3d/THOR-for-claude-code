@@ -189,12 +189,29 @@ pub fn folderless_named_in_prompt(store: &EventStore, prompt: &str, session_proj
 /// The one plain line for the assistant about a subject that has notes and no folder.
 pub fn folderless_line(project: &str, notes: usize) -> String {
     let (count, verb) = match notes {
-        1 => ("1 note".to_string(), "it never comes"),
-        n => (format!("{n} notes"), "they never come"),
+        1 => ("1 note".to_string(), "it never comes up by itself"),
+        n => (format!("{n} notes"), "they never come up by themselves"),
     };
     format!(
-        "[THOR] '{project}' has {count} but no folder of its own, so {verb} up by themselves. Tell the person so in one plain sentence and offer to give it a folder; they only answer yes or no. On yes: make a folder named after it and run the installer with --topic from inside it."
+        "[THOR] '{project}' has {count} but no folder of its own, so {verb}. Tell the person so in one plain sentence and offer to give it a folder; they only answer yes or no. On yes: make a folder named '{project}' inside the person's Documents folder and run the installer with --topic from inside it."
     )
+}
+
+#[cfg(test)]
+mod folderless_line_tests {
+    use super::folderless_line;
+
+    #[test]
+    fn the_line_agrees_with_its_count_and_names_where_the_folder_goes() {
+        let one = folderless_line("Tuinhuis", 1);
+        assert!(one.contains("has 1 note but") && one.contains("it never comes up by itself"), "{one}");
+        let many = folderless_line("Tuinhuis", 3);
+        assert!(many.contains("has 3 notes but") && many.contains("they never come up by themselves"), "{many}");
+        for line in [one, many] {
+            assert!(line.contains("make a folder named 'Tuinhuis' inside the person's Documents folder"), "{line}");
+            assert!(!line.contains("it never comes up by themselves"), "{line}");
+        }
+    }
 }
 
 /// How every no-project line begins: `session_start::fit_extras` never drops a

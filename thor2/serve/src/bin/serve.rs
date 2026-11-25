@@ -7834,7 +7834,7 @@ fn cmd_inventory(db_path: &Path, json: bool, projects_dir: Option<PathBuf>, home
     // for the tidy step (`model::store::order_settled`). Never for a folder
     // named by hand: an empty one proves nothing. The folder is recorded so
     // that a changed home folder in the environment cannot pass for the real one.
-    if real_folders && inv.folders.iter().all(|f| f.ordered || f.nothing_to_move) && inv.loose_files.is_empty() && inv.vanished.is_empty() && db_path.is_file() {
+    if real_folders && inv.nothing_to_order() && db_path.is_file() {
         if let Ok(mut store) = EventStore::open_existing(db_path) {
             if model::store::show(&store, model::store::ORDER_NOTE_ID).is_ok() {
                 let body = serde_json::json!({

@@ -98,6 +98,24 @@ fn a_refusal_sets_is_error_and_a_stored_note_does_not() {
     assert_eq!(retract["isError"], json!(text.starts_with("refused")), "{retract}");
 }
 
+/// A folder with no code to search says so plainly, without naming flags the
+/// installed tool server is not started with.
+#[test]
+fn the_code_tools_say_a_folder_has_no_code_to_search() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = store(dir.path(), &["demo"]);
+    let mut mcp = Mcp::start(&db, dir.path());
+    for (tool, args) in [
+        ("search_code", json!({"query": "main"})),
+        ("where_used", json!({"name": "main"})),
+        ("outline", json!({"path": "src/main.rs"})),
+    ] {
+        let reply = mcp.call(tool, args);
+        assert!(reply.contains("this folder has no code to search") && reply.contains("Nothing is wrong"), "{tool}: {reply}");
+        assert!(!reply.contains("--code-index-db") && !reply.contains("--repo"), "{tool}: {reply}");
+    }
+}
+
 /// A file in the project's own top folder can be anchored by its bare name, and
 /// the note then comes back on an Edit however the call spells the path.
 #[test]

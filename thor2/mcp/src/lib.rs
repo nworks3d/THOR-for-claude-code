@@ -2911,10 +2911,10 @@ pub struct SearchCodeArgs {
 /// The one answer when a code tool is called on a server that has no index.
 /// Said plainly, because an empty result would read as "your code does not
 /// contain that" - the silent-does-less failure this whole rebuild is against.
-const NO_CODE_INDEX: &str = "no code index is configured for this server - start it with \
---code-index-db and --repo, or build one first with the codeindex command. Code search only exists for a \
-programming project (a git repository that install has read); a plain topic folder has none, so read its \
-files directly and use lookup for what the memory holds";
+const NO_CODE_INDEX: &str = "this folder has no code to search. Code search only exists for a programming \
+project (a git repository that THOR's install has read); a plain folder for a subject has none, so read its files \
+directly and use lookup for what the memory holds. Nothing is wrong. If this is a programming project, run THOR's \
+install from inside it, then ask the person to restart Claude Code";
 
 /// How stale this answer is, in one sentence. Defined once and shared by every
 /// code tool: provenance is prose, not a boolean, and "the checkout could not
@@ -4496,7 +4496,9 @@ impl ThorMcpServer {
         let Some(code) = self.code.clone() else {
             return NO_CODE_INDEX.to_string();
         };
-        match serve::lookup::outline(&code.index_db, &args.path) {
+        // Claude Code's Edit gives an absolute path; the index holds repository-relative ones.
+        let wanted = serve::lookup::repo_relative(&code.repo, &args.path);
+        match serve::lookup::outline(&code.index_db, &wanted) {
             Err(e) => format!("outline failed: {e}"),
             Ok(None) => format!(
                 "'{}' is not in the code index - check the path is repository-relative, or the \

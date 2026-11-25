@@ -144,6 +144,26 @@ pub fn cap(ranked: Vec<RankedItem>) -> Selection {
     Selection { shown, withheld: withheld_ids.len(), withheld_ids, withheld_routed }
 }
 
+/// The name of a moment in a block's header. One moment (`commit`) also stands for
+/// a tag, a merge and a rebase, so a call that is only one of those is named as
+/// what it really is; every other moment keeps its own name.
+fn moment_label(action: intent::Action, command: Option<&str>) -> &'static str {
+    if action != intent::Action::Commit {
+        return action.as_str();
+    }
+    let words: Vec<String> = command.unwrap_or("").to_lowercase().split_whitespace().map(str::to_string).collect();
+    let git = |what: &str| words.windows(2).any(|w| w[0] == "git" && w[1] == what);
+    if git("commit") {
+        return action.as_str();
+    }
+    for what in ["tag", "merge", "rebase"] {
+        if git(what) {
+            return what;
+        }
+    }
+    action.as_str()
+}
+
 /// The block text, or None when nothing was shown - the serve path's "or
 /// nothing" half of its own contract. Never slices an item's `text`: every
 /// character an item carries is either shown whole or not shown at all (see
@@ -170,7 +190,7 @@ pub fn render_text(selection: &Selection, input: &ServeInput) -> Option<String> 
     let head = if input.moments.is_empty() {
         "Before you do this:".to_string()
     } else {
-        let names = input.moments.iter().map(|a| a.as_str()).collect::<Vec<_>>().join(", ");
+        let names = input.moments.iter().map(|a| moment_label(*a, input.command.as_deref())).collect::<Vec<_>>().join(", ");
         format!("Before you do this - {names}:")
     };
     let mut lines: Vec<String> = vec![FRAMING_LINE.to_string(), head];
@@ -381,6 +401,20 @@ mod tests {
         let text = render_text(&sel, &input).unwrap();
         let second_line = text.lines().nth(1).unwrap_or("");
         assert_eq!(second_line, "Before you do this - push:", "{text}");
+    }
+
+    #[test]
+    fn a_tag_merge_or_rebase_is_named_as_itself_not_as_a_commit() {
+        let sel = cap(vec![ranked("i0", 10)]);
+        let header = |command: &str| {
+            let input = ServeInput { moments: vec![intent::Action::Commit], command: Some(command.to_string()), ..Default::default() };
+            render_text(&sel, &input).unwrap().lines().nth(1).unwrap_or("").to_string()
+        };
+        assert_eq!(header("git tag -a v1.2.0 -m release"), "Before you do this - tag:");
+        assert_eq!(header("git merge feature"), "Before you do this - merge:");
+        assert_eq!(header("git rebase main"), "Before you do this - rebase:");
+        assert_eq!(header("git commit -m x"), "Before you do this - commit:");
+        assert_eq!(header("git commit -m x && git tag v1"), "Before you do this - commit:");
     }
 
     // ------------------------------------------------------------- framing
