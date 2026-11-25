@@ -460,7 +460,7 @@ fn without_known_paths_the_text_describes_each_one_instead_of_leaving_a_hole() {
     let paths = &text[text.find("PATHS ON THIS MACHINE").unwrap()..];
     assert!(paths.contains("install program in the thor2 folder") && paths.contains("~/.claude/settings.json") && paths.contains("~/.claude.json"), "{paths}");
     assert!(!text.contains("<as detected>"), "no placeholder is left in the page for any user");
-    assert!(text.contains("Plan: the one the installer printed on its plan line"), "the page for any user points at the installer's plan line");
+    assert!(text.contains("Plan: the one the installer recorded from Claude Code's settings"), "the page for any user says where the plan was recorded");
 }
 
 #[test]

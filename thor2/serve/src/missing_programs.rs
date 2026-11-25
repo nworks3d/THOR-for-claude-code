@@ -318,7 +318,7 @@ pub fn words_for(missing: &[PathBuf], detected: &[String], windows: bool) -> Opt
     );
     if windows {
         out.push_str(
-            " Most likely cause: an antivirus (usually Windows Defender) quarantined it as a false positive. To check and get it back: open Windows Security > Virus & threat protection > Protection history, look for an entry naming the file, open it and choose Actions > Restore. If there is no such entry, ask the assistant to run THOR's one-line download command from the install page again (the install program on its own cannot, it refuses while a program is missing): it unpacks all the programs again and so puts this one back.",
+            " Most likely cause: an antivirus (usually Windows Defender) quarantined it as a false positive. To check and get it back: open Windows Security > Virus & threat protection > Protection history, look for an entry naming the file, open it and choose Actions > Restore. If there is no such entry, ask the assistant to run THOR's one-line download command from the install page again (the install program on its own does not bring a missing program back): it unpacks all the programs again and so puts this one back.",
         );
         if !detected.is_empty() {
             out.push_str(&format!(" Windows Defender's own history names: {}.", detected.join(", ")));
@@ -328,7 +328,7 @@ pub fn words_for(missing: &[PathBuf], detected: &[String], windows: bool) -> Opt
         ));
     } else {
         out.push_str(
-            " Most likely cause: an antivirus or a cleanup removed it. Ask the assistant to run THOR's one-line download command from the install page again (the install program on its own cannot, it refuses while a program is missing): it unpacks all the programs again and so puts this one back.",
+            " Most likely cause: an antivirus or a cleanup removed it. Ask the assistant to run THOR's one-line download command from the install page again (the install program on its own does not bring a missing program back): it unpacks all the programs again and so puts this one back.",
         );
     }
     Some(out)

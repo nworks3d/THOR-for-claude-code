@@ -180,6 +180,19 @@ pub fn item_settled(kinds_since_recorded: &[EventKind]) -> bool {
 /// the rule itself changes.
 pub const MAX_HOLD_SESSIONS: usize = 2;
 
+/// The rule's own version: the log position of its last creation or revision. Serving it and
+/// every other event about it leave this alone, so a rule that only keeps being shown is the
+/// same rule; a rule that was rewritten is a new one and starts its holds again.
+pub fn rule_version(store: &thor_core::event_store::EventStore, id: &str) -> i64 {
+    store
+        .get_events_by_entity(id)
+        .ok()
+        .and_then(|events| {
+            events.iter().filter(|e| matches!(e.kind, EventKind::FactCreated | EventKind::FactRevised)).map(|e| e.seq).max()
+        })
+        .unwrap_or(0)
+}
+
 /// Where the per-rule record of which conversations were held for it lives.
 pub fn default_held_path(db: &Path) -> PathBuf {
     db.parent().unwrap_or_else(|| Path::new(".")).join("stale-guard-held.json")
@@ -259,7 +272,7 @@ pub fn left_alone_ids(db: &Path) -> Vec<String> {
         .filter(|(id, h)| {
             h.sessions.len() >= MAX_HOLD_SESSIONS
                 && stale.contains_key(id.as_str())
-                && store.get_events_by_entity(id).ok().and_then(|e| e.iter().map(|e| e.seq).max()).unwrap_or(0) == h.rule_seq
+                && rule_version(&store, id) == h.rule_seq
         })
         .map(|(id, _)| id.clone())
         .collect();

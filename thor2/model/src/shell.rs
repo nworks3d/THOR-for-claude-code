@@ -2835,9 +2835,16 @@ fn is_slash_flag(literal: &str) -> bool {
 /// means a different thing in the other case.
 pub const CASE_BLIND_MIN_CHARS: usize = 4;
 
-/// Whether a literal is looked for without regard to case.
+/// Whether a literal is looked for without regard to case. A literal that holds a short switch
+/// (a single dash and one to two letters: `git branch -D`, `tar -X`, `ssh -L`) stays exact,
+/// because the case of such a switch changes what it does (`-D` forces, `-d` is the safe one).
 pub fn fold_case_for(literal: &str) -> bool {
-    literal.chars().count() >= CASE_BLIND_MIN_CHARS
+    literal.chars().count() >= CASE_BLIND_MIN_CHARS && !literal.split_whitespace().any(is_short_switch)
+}
+
+fn is_short_switch(word: &str) -> bool {
+    let Some(rest) = word.strip_prefix('-') else { return false };
+    (1..=2).contains(&rest.len()) && rest.chars().all(|c| c.is_ascii_alphabetic())
 }
 
 /// The byte offset of the first occurrence of `literal` in `text`, with no regard to case when

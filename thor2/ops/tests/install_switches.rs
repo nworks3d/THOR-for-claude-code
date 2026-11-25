@@ -10,11 +10,24 @@ use std::process::{Command, Output};
 
 struct Sandbox {
     home: tempfile::TempDir,
+    /// A folder of programs the installer is pointed at instead of the build folder.
+    bin: Option<tempfile::TempDir>,
 }
 
 impl Sandbox {
     fn new() -> Self {
-        Self { home: tempfile::tempdir().unwrap() }
+        Self { home: tempfile::tempdir().unwrap(), bin: None }
+    }
+    /// A program folder that holds the real `serve` and a stand-in for the code reader, so the
+    /// git helpers can be wired whether or not the code reader was built before this test ran.
+    fn with_programs(mut self) -> Self {
+        let install = PathBuf::from(env!("CARGO_BIN_EXE_install"));
+        let ext = if cfg!(windows) { ".exe" } else { "" };
+        let bin = tempfile::tempdir().unwrap();
+        std::fs::copy(install.with_file_name(format!("serve{ext}")), bin.path().join(format!("serve{ext}"))).unwrap();
+        std::fs::copy(&install, bin.path().join(format!("codeindex{ext}"))).unwrap();
+        self.bin = Some(bin);
+        self
     }
     fn db_named(&self, name: &str) -> PathBuf {
         self.home.path().join("localappdata").join(name).join("thor.db")
@@ -40,6 +53,10 @@ impl Sandbox {
         }
         if !is_switch {
             cmd.arg("--no-mcp");
+        }
+        if let Some(bin) = &self.bin {
+            let ext = if cfg!(windows) { ".exe" } else { "" };
+            cmd.arg("--serve-exe").arg(bin.path().join(format!("serve{ext}")));
         }
         cmd.env("HOME", self.home.path())
             .env("USERPROFILE", self.home.path())
@@ -132,7 +149,7 @@ fn a_no_to_the_reply_rules_sets_the_file_aside_and_a_plain_install_leaves_it_off
 
 #[test]
 fn a_no_to_the_git_hooks_is_recorded_and_a_plain_install_wires_nothing() {
-    let sb = Sandbox::new();
+    let sb = Sandbox::new().with_programs();
     assert!(sb.install(&[]).status.success());
     let config = std::fs::read_to_string(sb.gitconfig()).unwrap_or_default();
     assert!(config.contains("hooksPath"), "the install did not wire the git helpers: {config}");
@@ -202,4 +219,35 @@ fn uninstall_removes_every_thor_connection_whatever_memory_it_names() {
     let removed = ops::uninstall::remove_thor_hooks(&sb.settings()).unwrap();
     assert_eq!(removed, 8);
     assert_eq!(ops::uninstall::thor_hooks_in(&sb.settings()).unwrap(), 0);
+}
+
+#[test]
+fn a_no_to_the_connections_keeps_the_daily_safety_copy_and_leaves_no_empty_lists() {
+    let sb = Sandbox::new();
+    assert!(sb.install(&[]).status.success());
+    let backup = sb.install(&["--set-backup", "local"]);
+    assert!(backup.status.success(), "{}", said(&backup));
+    let with_backup = sb.settings_text();
+    assert!(with_backup.contains("backup"), "{with_backup}");
+
+    let off = sb.install(&["--set-connections", "off"]);
+    assert!(off.status.success(), "{}", said(&off));
+    let after = sb.settings_text();
+    assert_eq!(hook_entries(&after), 0, "{after}");
+    assert!(after.contains("backup"), "the safety copy's entry went with the connections:\n{after}");
+    for event in ["SessionStart", "PreToolUse", "UserPromptSubmit"] {
+        assert!(!after.contains(&format!("\"{event}\": []")), "an empty list for {event} was left:\n{after}");
+    }
+    let on = sb.install(&["--set-connections", "on"]);
+    assert!(on.status.success(), "{}", said(&on));
+    assert!(sb.settings_text().contains("backup"));
+    let doctor = Command::new(env!("CARGO_BIN_EXE_doctor"))
+        .arg("--db")
+        .arg(sb.db())
+        .env("HOME", sb.home.path())
+        .env("USERPROFILE", sb.home.path())
+        .env("LOCALAPPDATA", sb.home.path().join("localappdata"))
+        .output()
+        .unwrap();
+    assert!(said(&doctor).contains("backup:"), "{}", said(&doctor));
 }

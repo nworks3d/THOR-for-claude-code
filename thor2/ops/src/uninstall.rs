@@ -194,17 +194,36 @@ pub fn connected_memories(settings: &Path) -> anyhow::Result<Vec<String>> {
 /// parse before and after, and is not rewritten at all when there is nothing
 /// to remove. Returns how many entries went.
 pub fn remove_thor_hooks(settings: &Path) -> anyhow::Result<usize> {
+    remove_hooks(settings, false)
+}
+
+/// Remove only the four entries that connect THOR to Claude Code (`serve ... hook`), whatever
+/// memory each names. The daily safety copy's entry (`backup`) is a separate choice and stays.
+pub fn remove_thor_connections(settings: &Path) -> anyhow::Result<usize> {
+    remove_hooks(settings, true)
+}
+
+/// Whether a hook entry of THOR's is one of the four connections (the `serve` program).
+fn is_connection_entry(hook: &Value) -> bool {
+    let Some(line) = hook_command_line(hook) else { return false };
+    let words = command_words(&line);
+    words.first().is_some_and(|p| Path::new(p).file_stem().and_then(|s| s.to_str()).unwrap_or_default().eq_ignore_ascii_case("serve"))
+}
+
+fn remove_hooks(settings: &Path, connections_only: bool) -> anyhow::Result<usize> {
     let Some((raw, mut root)) = read_json_object(settings)? else { return Ok(0) };
     let mut removed = 0;
     if let Some(events) = root.get_mut("hooks").and_then(Value::as_object_mut) {
-        for groups in events.values_mut() {
+        let mut emptied_events: Vec<String> = Vec::new();
+        for (event, groups) in events.iter_mut() {
             let Some(groups) = groups.as_array_mut() else { continue };
+            let removed_before = removed;
             // Only a group THOR emptied goes; a group somebody left empty stays.
             let mut emptied_by_us = Vec::new();
             for (i, group) in groups.iter_mut().enumerate() {
                 if let Some(hooks) = group.get_mut("hooks").and_then(Value::as_array_mut) {
                     let before = hooks.len();
-                    hooks.retain(|h| !is_thors_hook(h, None));
+                    hooks.retain(|h| !(is_thors_hook(h, None) && (!connections_only || is_connection_entry(h))));
                     removed += before - hooks.len();
                     if before > hooks.len() && hooks.is_empty() {
                         emptied_by_us.push(i);
@@ -217,6 +236,13 @@ pub fn remove_thor_hooks(settings: &Path) -> anyhow::Result<usize> {
                 index += 1;
                 keep
             });
+            // Switching the connections off leaves no empty list behind for an event that held only THOR's.
+            if connections_only && removed > removed_before && groups.is_empty() {
+                emptied_events.push(event.clone());
+            }
+        }
+        for event in emptied_events {
+            events.remove(&event);
         }
     }
     if removed == 0 {

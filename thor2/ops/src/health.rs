@@ -171,6 +171,20 @@ pub fn plain_summary(db: &Path, cwd: &Path, settings: Option<&Path>, mcp_json: O
         lines.push(format!("  PROBLEM: {words}"));
     }
 
+    let too_broad = model::checkout::is_too_broad_folder(cwd) && !cwd.join(".git").exists();
+    if too_broad {
+        // Never advise setting this very folder up: the installer refuses it. Say what works.
+        lines.push(
+            "  NOTE: this folder is too broad to be one subject, so everything kept in it would share one memory. A folder inside it can have its own memory: ask your assistant to set up the folder of one subject."
+                .to_string(),
+        );
+        if cwd.join(model::checkout::MARKER_FILE_NAME).exists() {
+            lines.push(format!(
+                "  NOTE: an older setup left a hidden file named {} in this folder. It is no longer used for the folders inside it. Removing it ends this memory for the folder itself; ask your assistant if you want that.",
+                model::checkout::MARKER_FILE_NAME
+            ));
+        }
+    } else {
     match serve::project::resolve_project(cwd) {
         Some(key) => {
             let usable = EventStore::open_existing(db)
@@ -193,6 +207,7 @@ pub fn plain_summary(db: &Path, cwd: &Path, settings: Option<&Path>, mcp_json: O
             "  NOTE: this folder has no memory of its own, so what you tell your assistant here is shared with every other folder. To give one subject its own memory, ask your assistant to do it (it runs THOR's install inside that folder with --topic added)."
                 .to_string(),
         ),
+    }
     }
 
     // Silent unless two project names differ only in case, spaces or hyphens.
@@ -905,6 +920,18 @@ pub fn ship_never_recorded_line(db: &Path, task_called: &[std::path::PathBuf]) -
     ))
 }
 
+/// Whether a program a scheduled task calls belongs to THIS memory: it lies in the memory's
+/// folder or in THOR's program folder, or it is a script that names the memory's folder.
+/// Both folders come in comparison form (lower case, forward slashes).
+pub fn task_is_this_memorys(program: &Path, store_folder: &str, programs_folder: &str) -> bool {
+    let spelled = program.display().to_string().replace('\\', "/").to_lowercase();
+    let under = |dir: &str| !dir.is_empty() && spelled.starts_with(&format!("{dir}/"));
+    under(store_folder)
+        || under(programs_folder)
+        || (!store_folder.is_empty()
+            && std::fs::read_to_string(program).is_ok_and(|text| text.replace('\\', "/").to_lowercase().contains(store_folder)))
+}
+
 /// The lines about THOR programs that something calls and that are not on
 /// disk (hooks, the tool server, the sidecars' programs and the scheduled
 /// tasks), plus the ship that left no record. Empty when all is in place.
@@ -917,12 +944,10 @@ pub fn program_lines(db: &Path, settings: Option<&Path>, mcp_json: Option<&Path>
     // store's folder (the program lies in it, or the script names it) is this
     // memory's, never another install's.
     let folder = db.parent().map(|d| d.display().to_string().replace('\\', "/").to_lowercase()).unwrap_or_default();
-    task_called.retain(|program| {
-        let spelled = program.display().to_string().replace('\\', "/").to_lowercase();
-        !folder.is_empty()
-            && (spelled.starts_with(&format!("{folder}/"))
-                || std::fs::read_to_string(program).is_ok_and(|text| text.replace('\\', "/").to_lowercase().contains(&folder)))
-    });
+    // THOR's programs usually sit in another folder than the memory (the download folder against
+    // the data folder), so a program in that folder is this install's too.
+    let programs = bin_dir.map(|d| d.display().to_string().replace('\\', "/").to_lowercase()).unwrap_or_default();
+    task_called.retain(|program| task_is_this_memorys(program, &folder, &programs));
     let gone = serve::missing_programs::find(db, settings, mcp_json, bin_dir, Some(&xml));
     let detected = if gone.is_empty() || !cfg!(windows) { Vec::new() } else { serve::missing_programs::defender_names() };
     serve::missing_programs::words_for(&gone, &detected, cfg!(windows))

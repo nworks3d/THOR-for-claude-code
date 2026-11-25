@@ -212,6 +212,16 @@ fn a_broad_memory_from_an_earlier_install_is_reported_and_its_subfolders_get_the
     assert!(text(&out).contains("an earlier install gave it a memory of its own"), "{}", text(&out));
     assert!(text(&out).contains("It was not taken over"), "{}", text(&out));
 
+    // Doctor, run in that folder, says the same plainly and never points at --topic.
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_doctor"));
+    cmd.current_dir(&documents).arg("--db").arg(sandbox.db());
+    sandbox.apply(&mut cmd);
+    let doctor = text(&cmd.output().unwrap());
+    assert!(doctor.contains("this folder is too broad to be one subject"), "{doctor}");
+    assert!(doctor.contains("an older setup left a hidden file named .thor-project"), "{doctor}");
+    assert!(!doctor.contains("OK: this folder has its own memory, under the name 'Documents'"), "{doctor}");
+    assert!(!doctor.contains("is not set up yet. Next step"), "{doctor}");
+
     let topic = sandbox.topic("Kitchen renovation");
     let out = install(&topic, &sandbox, &["--topic"]);
     assert!(out.status.success(), "{}", text(&out));

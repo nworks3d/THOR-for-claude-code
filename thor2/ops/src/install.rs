@@ -1732,8 +1732,8 @@ pub enum HelperChange {
 pub const HELPERS_OFF_REASON: &str = "The owner switched helper-agent mode off (install --set-helpers off); install --set-helpers on stores it again.";
 
 /// `install --set-helpers on|off`: switch helper-agent mode (first-session
-/// item 6) by storing or retracting its two notes, `helper_mode_notes`, and
-/// nothing else. Both directions are idempotent: a second `on` or `off` writes
+/// item 6) by storing or retracting its five notes (`helper_mode_notes` and
+/// `helper_contract_notes`) and nothing else. Both directions are idempotent: a second `on` or `off` writes
 /// nothing.
 ///
 /// `on` goes through the same gate as any other write (`model::store::declare`),

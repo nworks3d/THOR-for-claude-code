@@ -140,6 +140,10 @@ pub fn run(req: &Request) -> Result<Vec<String>, String> {
                     "The copy could not be made, so nothing was set up. Reason: {reason}. Git refuses to open the backup folder because it belongs to another user account. If you trust that folder, tell git so by running this one line, then run the same command again: {fix}"
                 ));
             }
+            // A reason that already ends in its own next step is not given a second one.
+            if reason.contains("Next step:") {
+                return Err(format!("The copy could not be made, so nothing was set up. {}", reason[..1].to_uppercase() + &reason[1..]));
+            }
             return Err(format!(
                 "The copy could not be made, so nothing was set up. Reason: {reason}. Check that the backup is reachable from this machine (see \"What you need first\" in the README section \"Use THOR on a second machine\"), then run the same command again; it is safe to repeat."
             ));

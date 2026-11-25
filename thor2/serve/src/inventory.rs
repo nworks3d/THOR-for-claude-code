@@ -718,7 +718,7 @@ pub fn render_text(inv: &Inventory) -> String {
         out.push_str(NOTHING_TO_ORDER_LINE);
         out.push('\n');
     }
-    let file_line =|w: &WrittenFile| {
+    let file_line = |w: &WrittenFile| {
         format!("{}{} {}", if w.exists { "exists" } else { "gone  " }, if w.at_risk { " AT RISK" } else { "" }, w.path)
     };
     if inv.folders.iter().any(|f| f.without_folder) {

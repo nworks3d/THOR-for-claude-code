@@ -2145,7 +2145,7 @@ fn owner_pin_refusal(id: &str, quoted: &str) -> String {
 ///   20 characters) says why it must hold in every conversation; the pin is then written with
 ///   `PIN_PLACE_REASON_TAG`, the reason is in the item's history and doctor lists it;
 /// - a pin that would not fit the full block is refused unless `because` quotes, between double
-///   quotes, one whole message the owner typed in this session about this note (the hook leaves its
+///   quotes, one whole message the owner typed in one of his last two messages about this note (the hook leaves its
 ///   witness record, `serve::unpin_gate`, the same check an unpin by the owner's go uses); the pin
 ///   is then written as an overflow pin (`OVERFLOW_PIN_TAG`), delivered at the first prompt of each
 ///   context instead of in the block, as far as that second budget goes.
@@ -3696,7 +3696,7 @@ impl ThorMcpServer {
         .await
     }
 
-    #[tool(description = "Code lane: removes the Always binding from an existing item; every other binding and field stays untouched. THE OWNER'S RULE: a pinned note is the owner's standing choice and comes down only when it is proven out of date, has no use any more and cannot be replaced by a corrected text. `because` is required (one sentence, at least 20 characters, kept in the note's history). The unpin is REFUSED, with nothing written, while the note carries a check that holds right now, got a useful mark in the last 90 days, or was revised in the last 30 days; revise its text instead. When the owner himself asked for it, put his whole message in `because` between double quotes: THOR checks it against what he typed in this session (the note's id must appear in that message or in the assistant message right before it), and then the unpin goes through. A revise that removes the pin and a retract of a pinned note pass the same gate. EVERY pinned note taken down through a tool call is listed for the owner, saying how it was let through. Use revise instead when anything besides the binding needs to change. Idempotent - unpinning an item with no Always binding changes nothing and is not an error. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refused, loudly, when removing Always would leave the item with no binding left to ever fire on - give it a Moment or Target binding first, or leave it pinned. Replies 'unpinned' with the event sequence, 'already unpinned', or the refusal text.", annotations(title = "Unpin an item", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
+    #[tool(description = "Code lane: removes the Always binding from an existing item; every other binding and field stays untouched. THE OWNER'S RULE: a pinned note is the owner's standing choice and comes down only when it is proven out of date, has no use any more and cannot be replaced by a corrected text. `because` is required (one sentence, at least 20 characters, kept in the note's history). The unpin is REFUSED, with nothing written, while the note carries a check that holds right now, got a useful mark in the last 90 days, or was revised in the last 30 days; revise its text instead. When the owner himself asked for it, put his whole message in `because` between double quotes: THOR checks it against what he typed in his last two messages (the note's id must appear in that message or in the assistant message right before it), and then the unpin goes through. A revise that removes the pin and a retract of a pinned note pass the same gate. EVERY pinned note taken down through a tool call is listed for the owner, saying how it was let through. Use revise instead when anything besides the binding needs to change. Idempotent - unpinning an item with no Always binding changes nothing and is not an error. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refused, loudly, when removing Always would leave the item with no binding left to ever fire on - give it a Moment or Target binding first, or leave it pinned. Replies 'unpinned' with the event sequence, 'already unpinned', or the refusal text.", annotations(title = "Unpin an item", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn unpin(&self, meta: Meta, raw: RawArgs, Parameters(args): Parameters<UnpinArgs>) -> String {
         if let Some(queued) = self.capture("unpin", &args) {
             return format!("{queued} {REPLICA_TAKEDOWN_NOTE}");
@@ -12199,6 +12199,32 @@ mod tests {
         let unpin = try_unpin(&srv, "fold-b", Some(STALE_BECAUSE)).await;
         assert!(unpin.starts_with("REFUSED") && unpin.contains("revised in the last 30 days"), "{unpin}");
         assert!(still_pinned(&srv, "fold-b"));
+    }
+
+    /// A filler sentence in an old pinned note, with a reason naming the victim, is no fold: the
+    /// new text must carry the retracted note's own points.
+    #[tokio::test]
+    async fn a_filler_sentence_is_no_fold() {
+        let (_dir, _db, srv) = unpin_fixture();
+        pinned_note(&srv, "keep-pin", "2026-01-01T00:00:00Z").await;
+        pinned_note_revised_now(&srv, "fold-a").await;
+        dated_serving(&srv, &serve::time::now_iso8601());
+        let filler = srv
+            .revise(
+                Meta::new(),
+                RawArgs::default(),
+                Parameters(ReviseArgs {
+                    id: "keep-pin".to_string(),
+                    text: Some("Receipts for the accountant are scanned on the first of each month. The weather is mild this week.".to_string()),
+                    because: Some("now also carries the point of fold-a, so that one can be folded".to_string()),
+                    ..Default::default()
+                }),
+            )
+            .await;
+        assert!(filler.starts_with("revised"), "{filler}");
+        let refused = try_retract(&srv, "fold-a", "folded into keep-pin, which now carries the point about dinner.").await;
+        assert!(refused.starts_with("REFUSED") && refused.contains("say what 'fold-a' says"), "{refused}");
+        assert!(!is_retracted(&srv, "fold-a"));
     }
 
     /// ITEM 2: the creation is no maintenance. A pinned note made by mistake five days ago,

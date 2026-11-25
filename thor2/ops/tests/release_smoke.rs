@@ -835,11 +835,38 @@ impl Smoke {
     /// another one.
     fn step_topic_memory_is_its_own(&self, token: &str) -> StepResult {
         self.remember_in(&self.topic(), "smoke-topic-note", token, Some("Kitchen renovation"))?;
-        // Another folder must not be shown the topic's note.
-        match self.session_start_in(&self.elsewhere(), token) {
+        // A note bound to a subject is not part of the start of every conversation: it comes
+        // with a message in that subject's folder that shares a word with it.
+        let prompt = "Which note did the release smoke test store?";
+        self.prompt_in(&self.topic(), prompt, token)
+            .map_err(|why| format!("the topic's note was not brought back in the topic's own folder: {why}"))?;
+        // The same message in another folder must not bring it.
+        match self.prompt_in(&self.elsewhere(), prompt, token) {
             Ok(_) => Err("the topic's note was served in an unrelated folder".to_string()),
-            Err(_) => Ok("filed under the topic's own name (project binding), read back through lookup, not served elsewhere".to_string()),
+            Err(_) => Ok("filed under the topic's own name, read back through lookup, brought back by a message in that folder and not in another".to_string()),
         }
+    }
+
+    /// A typed message sent from `cwd`, expecting the stored note in what the hook adds.
+    fn prompt_in(&self, cwd: &Path, prompt: &str, token: &str) -> StepResult {
+        let stdout = self.run_hook(
+            "UserPromptSubmit",
+            cwd,
+            json!({
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "release-smoke-prompt",
+                "cwd": cwd.display().to_string(),
+                "prompt": prompt
+            }),
+        )?;
+        let context = serde_json::from_str::<Value>(stdout.trim())
+            .ok()
+            .and_then(|v| v["hookSpecificOutput"]["additionalContext"].as_str().map(str::to_string))
+            .unwrap_or_default();
+        if !context.contains(token) {
+            return Err(format!("the message did not bring the stored note back. The hook added:\n{context}"));
+        }
+        Ok(format!("brought back by a message, {} characters of context", context.len()))
     }
 
     /// What the person sees when the first-session hold stops the turn: the

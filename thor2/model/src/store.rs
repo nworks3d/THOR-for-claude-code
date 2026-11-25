@@ -3203,7 +3203,7 @@ rewrite an OLD pinned fact (created over 24 hours ago) so it carries another's p
 naming the survivor's id as a whole word (a fold is not a loss). (2) UNPIN OR RETRACT pinned notes that no longer carry anything (the largest \
 are named above): only when a note is proven out of date and unused; shortening the text of a pinned fact always works too. (3) If none can go, \
 ASK THE OWNER. When he says yes, repeat this write with `because` holding his whole message between double quotes (the note's id must stand in \
-that message or in your message right before it; THOR checks it against what he typed in this session). The note is then written as an overflow \
+that message or in your message right before it; THOR checks it against what he typed in his last two messages). The note is then written as an overflow \
 pin: not in the session start block, but delivered whole at the first prompt of each conversation, within a budget of its own. Do NOT store the \
 fact as an unbound Report to get past this: a Report never fires, so it would be saved and never come back.";
 

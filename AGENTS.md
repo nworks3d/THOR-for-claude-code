@@ -637,7 +637,7 @@ announce themselves.
   while the note's own check holds, it got a useful mark in the last 90 days or
   it was revised in the last 30 days (revise its text instead). When the owner
   himself asked for it, put his whole message in `because` between double
-  quotes: THOR checks it against what he typed in this session, and the note's
+  quotes: THOR checks it against what he typed in his last two messages, and the note's
   id must appear in that message or in the assistant message right before it.
   A `revise` keeps the pin unless it says `always: false`, and that, like a
   `retract` of a pinned note, passes the very same gate (a retract whose reason
@@ -955,7 +955,7 @@ FOR THE ASSISTANT (do not read this part out)
 - NEVER mention in the first reply: the plan, git, hooks, helper assistants, the weekly check, the work rules, the record of real calls, bug reports, topic markers or scopes, and no changelog except the one line of proposal 4 when the welcome carries it. They are on the full numbered list and come up only when he asks.
 - The full numbered list (THE FULL LIST below) is shown ONLY when he asks what is switched on (for example "what is switched on?"), never in the first reply. Show him the short list only: the intro, one line per item and the way to answer; never paste the detail per item (the last part of this text) at him. Its numbers 1 to 12 are stable and in order.
 - The detail per item is yours: state an item's Why once, only when he asks about a number ("why 7") or refuses it, in one or two plain sentences, then do what he decided. If he asks and has not refused, add how to say no.
-- Anything he does not mention keeps the default. Item 6 (helper assistants) is on by default (a new memory stores its two notes) and is never mentioned in the first reply: when he says "helpers off" run install --set-helpers off --db <store> and tell him it is off.
+- Anything he does not mention keeps the default. Item 6 (helper assistants) is on by default (a new memory stores its five notes) and is never mentioned in the first reply: when he says "helpers off" run install --set-helpers off --db <store> and tell him it is off.
 - Item 10 (backups) is off until he accepts proposal 1 of the welcome; a place he names (a folder or an address) is install --set-backup <place> --db <store>.
 - Item 12 (changelog and version numbers) is a yes or no, never a default you apply. In the FIRST session of a git project it is proposal 4 of the welcome (see Proposal 4): the installer does not print the question then, it only says that the welcome carries it. For a project that gets its memory LATER the installer prints one question (and THOR hands it again at the first commit of a project with no answer, once per session): ask it ONCE, in his language, with its two reasons, as the printed block words it. On yes run install --set-changelog-flow on --db <store> from inside the project; its notes then know what to do at a commit, a tag and a release. If the project has no CHANGELOG.md create it ('# Changelog' heading with an 'Unreleased' section, nothing invented); if it has no version number propose 0.1.0. On no run install --set-changelog-flow off --db <store>: it is off for that project and never raised there again. Never a hard stop. In a folder that is not a git repository create no CHANGELOG.md and never mention one, and never ask.
 - When he answers, apply each number where it belongs, then REVISE 'owner-setup-answers' (never store a second copy): 1 install --set-plan; 2 install --set-connections off --db <store> (it removes only THOR's four hook entries from the settings file and records his no beside the memory, so a later plain install wires nothing again and the health check calls it his choice; never edit the settings file by hand; item 2 below says what stays), then tell him it takes effect after he restarts Claude Code (to switch them back on: install --set-connections on --db <store>, and a restart of Claude Code is needed again); 3 install --set-git-hooks off --db <store> (turns off all of it and records the no; install --set-git-hooks on wires it again), or only the video and size check: git config --global thor.mediagate.enabled false; 4 install --set-weekly-check off|on; 5 retract the named notes (a retracted note stops arriving; a note whose refusing check bites, such as windowless-processes-on-windows or scheduled-task-not-interactive once THOR has tried it, is refused at the retract, so first clear its check with mcp__thor__revise(id, clear_check: true, because: <why, 20+ characters>) and then retract it); 6 install --set-helpers on|off --db <store> (on stores the two helper notes, off retracts them; running it again changes nothing); 7 install --set-mode off (or release); 8 the language: install --set-language <code>|off --db <store> (nl, en, de, fr or es; an unknown code is refused with the list), and for the reply rules as a whole install --set-reply-rules off|on --db <store> (one rule only: edit the reply file beside the store, guard-response-rulebook.json); 9 install --topic, run from inside the folder; 10 install --set-backup local|<folder or address>|off --db <store> (it makes the git folder, adds a named place as the remote 'nas', connects one session-start backup and makes a first copy to prove it works: tell him that result in plain words, and if it failed say so and why); 11 install --set-recording on|off --db <store>; 12 CHANGELOG.md as above.
@@ -987,7 +987,7 @@ THE TWO CALLS (make them in this order, in your first reply, whatever he answers
 remember(
   id:   "owner-setup-answers",
   kind: "report",
-  text: "Setup finished with the defaults, nothing asked first. Plan: the one the installer printed on its plan line (small when it printed none). The defaults on the numbered list apply (helper assistants are on), except backup, which stays off until the owner chooses, and the changelog, which is asked as proposal 4 of the welcome in a git project and stays unanswered until then. Backup, language, work folder and changelog follow the owner's answer to the welcome (a plain yes accepts the proposals). Replies: short and plain, in the owner's own language. Lane: work only. Projects: named after their folder. Any of these changes when the owner says so."
+  text: "Setup finished with the defaults, nothing asked first. Plan: the one the installer recorded from Claude Code's settings (small when they did not say; the weekly-check line of doctor shows it). The defaults on the numbered list apply (helper assistants are on), except backup, which stays off until the owner chooses, and the changelog, which is asked as proposal 4 of the welcome in a git project and stays unanswered until then. Backup, language, work folder and changelog follow the owner's answer to the welcome (a plain yes accepts the proposals). Replies: short and plain, in the owner's own language. Lane: work only. Projects: named after their folder. Any of these changes when the owner says so."
 )
 retract(id: "walk-through-the-answer-guard-once", reason: "Setup finished: the owner's answers are on record as owner-setup-answers.")
 Give the report NO project: a store this fresh has not named a scope yet, so do not invent one and do not ask him to name one. The retract is refused until the remember call has landed, so make them in this order. When he later answers the two questions or by number, apply each answer where it belongs (the rules above), then revise 'owner-setup-answers' with what he chose; a second copy is worse than none. "He is not interested" is also a valid answer to record.
@@ -1182,9 +1182,9 @@ the Claude desktop app you have tools for it (`mcp__ccd_directory__request_direc
 next turn's first tool call. Otherwise give plain click steps.
 
 Helper-agent mode is NOT in this set, but it is ON in a new memory (first-session item 6;
-the two notes below are stored with the others, and never into an existing store). A helper starts with a fixed context cost, cannot be steered halfway and knows
-nothing of the conversation beyond its brief. Two more notes carry it, and
-`install --set-helpers off --db "<their store>"` retracts exactly these two (`install
+the five notes below are stored with the others, and never into an existing store). A helper starts with a fixed context cost, cannot be steered halfway and knows
+nothing of the conversation beyond its brief. Five notes carry it, and
+`install --set-helpers off --db "<their store>"` retracts exactly these five (`install
 --set-helpers on --db "<their store>"` stores them again; running either twice
 changes nothing). Only run it when the person asks for it (for example "helpers off"):
 
@@ -1200,6 +1200,12 @@ changes nothing). Only run it when the person asks for it (for example "helpers 
   by the helper itself with a time limit and a log, without stopping midway; waiting is
   a check every 20 to 30 minutes, at most three times, then the job is judged dead by
   its last real activity, never by its status.
+- `name-a-model-on-every-agent` - independent work is split across helpers, each with an
+  explicit, cheapest fitting model named, never inherited from the session.
+- `mechanical-brief-forbids-subagents-and-review` - a brief for mechanical work says so and
+  forbids helpers of their own and a self-review pass.
+- `mid-task-message-does-not-redirect-an-agent` - a message to a helper that is already
+  working does not redirect it; a changed scope gets a new helper with a new brief.
 
 Besides these, the install also seeded twenty-one pinned notes (a twenty-second, the setup note, is retracted once the first session is done; the list is `working_contract` in thor2/ops/src/install.rs:923-1145) about writing a note
 that comes back and about honesty, agent-spawning and memory hygiene; those are
@@ -1523,7 +1529,7 @@ every pin kept this way. Pins that already stand are not touched.
 
 The way out of a full block is the owner's own go. Put his whole message,
 between double quotes, in `because` (his message, or yours right before it,
-must name the note's id; THOR checks it against what he typed in this session,
+must name the note's id; THOR checks it against what he typed in his last two messages,
 the same check an unpin on his words uses). The note is then written as an
 OVERFLOW pin: it is not in the session start block, which keeps its byte limit,
 but is delivered whole at the first prompt of each conversation, once, within a
@@ -1539,7 +1545,7 @@ change or lift such a rule himself, from any session: when he asks for that in
 his own message, revise (or retract) the rule and put his whole message, between
 double quotes, in `because` (`reason` for a retract); the rule's id must stand in
 his message or in your message right before it. THOR checks the quote against
-what he typed in this session and refuses the change otherwise. This holds for
+what he typed in his last two messages and refuses the change otherwise. This holds for
 anything that loosens the rule (taking off the tag, a lower severity, a removed
 binding, a cleared or wider check, a new or wider exemption, a retract);
 narrowing it needs no quote.

@@ -27,3 +27,11 @@ fn boundaries_still_hold_in_any_case() {
     assert!(trigger_in("Run /THOR-probe now", "/thor*"));
     assert!(!trigger_in("build/THOROUGH", "/thor*") || trigger_in("build/thorough", "/thor*"));
 }
+
+#[test]
+fn a_literal_with_a_short_switch_inside_stays_exact() {
+    assert!(literal_at_boundary("git branch -D old", "git branch -D"));
+    assert!(!literal_at_boundary("git branch -d old", "git branch -D"), "-d is the safe delete");
+    assert!(!literal_at_boundary("tar -x file", "tar -X"));
+    assert!(literal_at_boundary("GIT PUSH --FORCE origin", "git push --force"), "long options still fold");
+}

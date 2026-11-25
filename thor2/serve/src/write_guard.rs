@@ -59,6 +59,14 @@ impl Protected {
                 vars.push((name.to_ascii_lowercase(), fold(&value.to_string_lossy())));
             }
         }
+        // A hook may start with only one of the two home variables set: each stands for the other.
+        for (from, to) in [("userprofile", "home"), ("home", "userprofile")] {
+            if !vars.iter().any(|(n, _)| n == to) {
+                if let Some(value) = vars.iter().find(|(n, _)| n == from).map(|(_, v)| v.clone()) {
+                    vars.push((to.to_string(), value));
+                }
+            }
+        }
         let keep = |p: &Path| non_empty(fold(&p.to_string_lossy()));
         Protected {
             store_dir: store_dir.and_then(keep),
@@ -68,9 +76,55 @@ impl Protected {
         }
     }
 
-    /// Whether a path as written in a call is one of the protected files.
-    fn protects(&self, written: &str) -> bool {
+    /// The folders where saved conversations are kept.
+    fn projects_dirs(&self) -> Vec<String> {
+        self.claude_dirs.iter().map(|d| format!("{d}/projects")).collect()
+    }
+
+    /// The protected folders themselves.
+    fn protected_dirs(&self) -> Vec<String> {
+        let mut dirs: Vec<String> = Vec::new();
+        dirs.extend(self.store_dir.clone());
+        dirs.extend(self.programs_dir.clone());
+        dirs.extend(self.projects_dirs());
+        dirs
+    }
+
+    /// A path as written in a call, in comparison form. A relative path is read against the
+    /// folder the command works in (`cwd`) when that is known.
+    fn resolve(&self, written: &str, cwd: Option<&str>) -> String {
         let path = self.expand(written);
+        if path.is_empty() || is_absolute(&path) {
+            return path;
+        }
+        match cwd {
+            Some(dir) if !path.starts_with('$') && !path.starts_with('%') => fold(&format!("{dir}/{path}")),
+            _ => path,
+        }
+    }
+
+    /// Whether a removal or move of this path takes a protected folder with it: the folder
+    /// itself, or a folder that holds it.
+    fn removal_protects(&self, written: &str, cwd: Option<&str>) -> bool {
+        if self.protects(written, cwd) {
+            return true;
+        }
+        let path = self.resolve(written, cwd);
+        if path.is_empty() || !is_absolute(&path) || path.ends_with(':') {
+            return false;
+        }
+        self.protected_dirs().iter().any(|dir| *dir == path || dir.starts_with(&format!("{path}/")))
+    }
+
+    /// Whether a path is a protected folder, or inside one (a link to it would open it up).
+    fn touches_dir(&self, written: &str, cwd: Option<&str>) -> bool {
+        let path = self.resolve(written, cwd);
+        !path.is_empty() && self.protected_dirs().iter().any(|dir| path == *dir || path.starts_with(&format!("{dir}/")))
+    }
+
+    /// Whether a path as written in a call is one of the protected files.
+    fn protects(&self, written: &str, cwd: Option<&str>) -> bool {
+        let path = self.resolve(written, cwd);
         if path.is_empty() {
             return false;
         }
@@ -119,6 +173,12 @@ impl Protected {
 
     /// Whether anything in a whole command text names a protected path (used for the one-line
     /// .NET and `New-Item` style writes, where the target is not a plain argument).
+    /// Whether a text mentions a protected folder or file at all, with a trailing slash or not.
+    fn mentions_any(&self, text: &str) -> bool {
+        let folded = self.expand(text);
+        self.protected_dirs().iter().any(|d| folded.contains(d.as_str()))
+    }
+
     fn names_any(&self, text: &str) -> bool {
         let folded = self.expand(text);
         let mut dirs: Vec<&str> = Vec::new();
@@ -130,14 +190,22 @@ impl Protected {
 }
 
 /// Files in THOR's folder that the owner (or his assistant, on his word) edits by hand.
-const EDITED_BY_HAND: [&str; 6] = [
+const EDITED_BY_HAND: [&str; 9] = [
     "guard-response-rulebook.json",
     "guard-capture-rulebook",
     "guard-capture-trigger",
+    "guard-capture-mode",
     "guard-judge-config",
     "work-folders.json",
     "stale-guard-mode.json",
+    "no-project-ask-mode.json",
+    "thor-mode.json",
 ];
+
+/// Whether a comparison-form path starts at a root.
+fn is_absolute(path: &str) -> bool {
+    path.starts_with('/') || path.as_bytes().get(1) == Some(&b':')
+}
 
 fn non_empty(s: String) -> Option<String> {
     (!s.is_empty()).then_some(s)
@@ -147,6 +215,13 @@ fn non_empty(s: String) -> Option<String> {
 /// segments, no repeated slashes, no trailing slash.
 fn fold(path: &str) -> String {
     let mut p = path.replace('\\', "/").to_ascii_lowercase();
+    // The long-path forms `\\?\C:\x` and `\\.\C:\x` name the same file as `C:\x`.
+    for prefix in ["//?/unc/", "//?/", "//./"] {
+        if let Some(rest) = p.strip_prefix(prefix) {
+            p = if prefix.ends_with("unc/") { format!("//{rest}") } else { rest.to_string() };
+            break;
+        }
+    }
     let bytes = p.as_bytes();
     if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b'/' {
         p = format!("{}:{}", bytes[1] as char, &p[2..]);
@@ -173,21 +248,34 @@ fn fold(path: &str) -> String {
 /// The one plain refusal.
 fn refusal_text() -> String {
     "[THOR] That would change a file that only Claude Code and THOR write (a saved conversation, THOR's memory or its \
-     own files, or THOR's programs). These files are not edited by hand or by a command, and nothing was done. \
-     Reading them, or copying them somewhere else, is fine."
+     own files, or THOR's programs), so nothing was done. Do not look for another way to write it. Reading these files, \
+     or copying them somewhere else, is fine. To change one of THOR's settings use the matching option of the install \
+     program (its --help lists them). If the change is really needed, tell the person in one plain sentence what and \
+     why, and let them do it themselves."
         .to_string()
 }
 
 /// The hook's refusal of a call that writes to a protected file, or `None`.
-pub fn refusal(protected: &Protected, tool_name: &str, tool_input: Option<&serde_json::Value>) -> Option<String> {
+///
+/// `cwd` is the folder the call works in: a relative path is read against it, and a `cd` inside a
+/// command moves it.
+pub fn refusal(
+    protected: &Protected,
+    tool_name: &str,
+    tool_input: Option<&serde_json::Value>,
+    cwd: Option<&str>,
+) -> Option<String> {
     let input = tool_input?;
+    let cwd = cwd.map(fold).filter(|c| is_absolute(c));
+    let cwd = cwd.as_deref();
     let hit = match tool_name {
         "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => ["file_path", "notebook_path", "path"]
             .iter()
-            .any(|k| input.get(k).and_then(|v| v.as_str()).is_some_and(|p| protected.protects(p))),
-        "Bash" | "PowerShell" => {
-            input.get("command").and_then(|v| v.as_str()).is_some_and(|c| command_writes_protected(protected, c, 0))
-        }
+            .any(|k| input.get(k).and_then(|v| v.as_str()).is_some_and(|p| protected.protects(p, cwd))),
+        "Bash" | "PowerShell" => input
+            .get("command")
+            .and_then(|v| v.as_str())
+            .is_some_and(|c| command_writes_protected(protected, c, cwd, 0)),
         _ => false,
     };
     hit.then(refusal_text)
@@ -287,7 +375,20 @@ const SHELLS: [&str; 8] = ["bash", "sh", "zsh", "powershell", "pwsh", "cmd", "da
 const DOTNET_WRITES: [&str; 8] =
     ["io.file]::write", "io.file]::append", "io.file]::delete", "io.file]::move", "io.file]::create", "io.file]::open", "streamwriter", "filestream"];
 
-fn command_writes_protected(p: &Protected, command: &str, depth: usize) -> bool {
+const MOVERS_OF_THE_WORKING_FOLDER: [&str; 5] = ["cd", "chdir", "pushd", "set-location", "sl"];
+const INTERPRETERS: &[&str] =
+    &["python", "python3", "py", "pythonw", "node", "nodejs", "deno", "bun", "perl", "ruby", "php", "awk", "gawk", "lua"];
+/// Words in a one-line program that write, rename, copy over or delete a file.
+const WRITE_LOOKING: &[&str] = &[
+    "write", "append", "unlink", "rename", "copyfile", "copy(", "copy2", "rmtree", "remove", "truncate", "createwritestream",
+    "'w'", "\"w\"", "'wb'", "\"wb\"", "'a'", "\"a\"", "'ab'", "\"ab\"", "'r+'", "\"r+\"", "'w+'", "\"w+\"", "-pi", "-i.", " -i ", ">>",
+];
+const SQL_WRITES: &[&str] =
+    &["insert ", "update ", "delete ", "drop ", "alter ", "create ", "vacuum", "replace ", ".restore", ".import", ".clone", "pragma "];
+/// Flags of the installer: a word `install` that carries one is THOR's program, not the Unix copy command.
+const INSTALLER_FLAGS: &[&str] = &["--db", "--set-", "--topic", "--uninstall", "--register-root", "--tidy", "--copy-from", "--project"];
+
+fn command_writes_protected(p: &Protected, command: &str, cwd: Option<&str>, depth: usize) -> bool {
     let mut segment: Vec<String> = Vec::new();
     let mut redirected = false;
     let mut segments: Vec<(Vec<String>, Vec<String>)> = Vec::new();
@@ -310,18 +411,33 @@ fn command_writes_protected(p: &Protected, command: &str, depth: usize) -> bool 
         }
     }
     segments.push((segment, targets));
+    // The folder the command works in moves with every `cd`, so a relative path after it is read
+    // against the right folder.
+    let mut here: Option<String> = cwd.map(str::to_string);
     for (words, redirects) in &segments {
-        if redirects.iter().any(|t| p.protects(t)) {
+        if redirects.iter().any(|t| p.protects(t, here.as_deref())) {
             return true;
         }
-        if segment_writes_protected(p, words, depth) {
+        if segment_writes_protected(p, words, here.as_deref(), depth) {
             return true;
+        }
+        if let Some((name, rest)) = leader_of(words) {
+            if MOVERS_OF_THE_WORKING_FOLDER.contains(&name.as_str()) {
+                let target = rest.iter().find(|w| !w.starts_with('-') && !(w.starts_with('/') && w.len() <= 3));
+                if let Some(target) = target {
+                    let moved = p.resolve(target, here.as_deref());
+                    if is_absolute(&moved) {
+                        here = Some(moved);
+                    }
+                }
+            }
         }
     }
     false
 }
 
-fn segment_writes_protected(p: &Protected, words: &[String], depth: usize) -> bool {
+/// The command word of a segment (after `sudo`, `env`, assignments and the like) and what follows it.
+fn leader_of(words: &[String]) -> Option<(String, &[String])> {
     let mut at = 0;
     while at < words.len() {
         let name = command_name(&words[at]);
@@ -332,19 +448,67 @@ fn segment_writes_protected(p: &Protected, words: &[String], depth: usize) -> bo
             break;
         }
     }
-    let Some(leader) = words.get(at) else { return false };
-    let name = command_name(leader);
-    let rest = &words[at + 1..];
+    let leader = words.get(at)?;
+    Some((command_name(leader), &words[at + 1..]))
+}
+
+fn base_name(path: &str) -> String {
+    let path = path.replace('\\', "/");
+    path.trim_end_matches('/').rsplit('/').next().unwrap_or("").to_string()
+}
+
+/// Whether copying or moving `sources` to `dest` writes a protected file: either `dest` is one, or
+/// it is a folder that would receive a file with the name of one.
+fn dest_receives(p: &Protected, dest: &str, sources: &[&String], cwd: Option<&str>) -> bool {
+    if p.protects(dest, cwd) {
+        return true;
+    }
+    let folder = dest.trim_end_matches(|c| c == '/' || c == '\\');
+    sources.iter().any(|s| p.protects(&format!("{folder}/{}", base_name(s)), cwd))
+}
+
+fn segment_writes_protected(p: &Protected, words: &[String], cwd: Option<&str>, depth: usize) -> bool {
+    let Some((name, rest)) = leader_of(words) else { return false };
+    let at = words.len() - rest.len() - 1;
     let flag = |w: &String| w.starts_with('-') || (w.starts_with('/') && w.len() <= 3 && !w.contains('.'));
     let positionals: Vec<&String> = rest.iter().filter(|w| !flag(w)).collect();
-    let any = |items: &[&String]| items.iter().any(|w| p.protects(w));
+    let any = |items: &[&String]| items.iter().any(|w| p.protects(w, cwd));
+    let after_flag = |names: &[&str]| -> Vec<&String> {
+        let mut found = Vec::new();
+        for (i, w) in rest.iter().enumerate() {
+            let lower = w.to_ascii_lowercase();
+            if names.contains(&lower.as_str()) {
+                if let Some(next) = rest.get(i + 1) {
+                    found.push(next);
+                }
+            }
+        }
+        found
+    };
     match name.as_str() {
         n if SHELLS.contains(&n) => {
             // `bash -c '...'`, `powershell -Command "..."`: read the quoted program too.
-            depth < 3 && rest.iter().any(|w| w.contains(' ') && command_writes_protected(p, w, depth + 1))
+            // `cmd /c mklink ...` and `bash -c cp ...` carry the command as plain words.
+            let inline = rest
+                .iter()
+                .position(|w| matches!(w.to_ascii_lowercase().as_str(), "/c" | "/k" | "-c" | "-lc" | "-command" | "-c:"))
+                .is_some_and(|i| segment_writes_protected(p, &rest[i + 1..], cwd, depth + 1));
+            depth < 3 && (inline || rest.iter().any(|w| w.contains(' ') && command_writes_protected(p, w, cwd, depth + 1)))
         }
-        "rm" | "del" | "erase" | "rmdir" | "rd" | "remove-item" | "ri" | "tee" | "truncate" | "unlink" | "shred" | "mv"
-        | "move" | "move-item" | "mi" | "rename-item" | "ren" | "rni" => any(&positionals),
+        "rm" | "del" | "erase" | "rmdir" | "rd" | "remove-item" | "ri" | "unlink" | "shred" => {
+            positionals.iter().any(|w| p.removal_protects(w, cwd))
+        }
+        "tee" | "truncate" => any(&positionals),
+        "mv" | "move" | "move-item" | "mi" | "rename-item" | "ren" | "rni" => {
+            // The source is removed and the destination is written.
+            let named = after_flag(&["-destination"]);
+            let (sources, dest): (Vec<&String>, Option<&String>) = match (named.first(), positionals.split_last()) {
+                (Some(d), _) => (positionals.iter().copied().filter(|w| w != d).collect(), Some(*d)),
+                (None, Some((last, init))) => (init.to_vec(), Some(*last)),
+                (None, None) => (Vec::new(), None),
+            };
+            positionals.iter().any(|w| p.removal_protects(w, cwd)) || dest.is_some_and(|d| dest_receives(p, d, &sources, cwd))
+        }
         "set-content" | "sc" | "add-content" | "ac" | "clear-content" | "clc" | "out-file" => {
             // The text being written (`-Value`) is data, not a target.
             let mut targets = Vec::new();
@@ -361,32 +525,79 @@ fn segment_writes_protected(p: &Protected, words: &[String], depth: usize) -> bo
             any(&targets)
         }
         "cp" | "copy" | "copy-item" | "cpi" | "xcopy" | "robocopy" => {
-            // Only the DESTINATION is written: the one named by -Destination or -t, else the last.
-            let named = rest.iter().position(|w| matches!(w.to_ascii_lowercase().as_str(), "-destination" | "-t" | "--target-directory"));
-            match named {
-                Some(i) => rest.get(i + 1).is_some_and(|w| p.protects(w)),
-                None => positionals.last().is_some_and(|w| p.protects(w)),
-            }
+            // Only the DESTINATION is written: the one named by -Destination or -t, else the last
+            // (the second for xcopy and robocopy). A folder that receives a file named like a
+            // protected one counts.
+            let named = after_flag(&["-destination", "-t", "--target-directory"]);
+            let (sources, dest): (Vec<&String>, Option<&String>) = match named.first() {
+                Some(d) => (positionals.iter().copied().filter(|w| w != d).collect(), Some(*d)),
+                None if matches!(name.as_str(), "xcopy" | "robocopy") => (positionals.iter().take(1).copied().collect(), positionals.get(1).copied()),
+                None => match positionals.split_last() {
+                    Some((last, init)) => (init.to_vec(), Some(*last)),
+                    None => (Vec::new(), None),
+                },
+            };
+            dest.is_some_and(|d| dest_receives(p, d, &sources, cwd))
+        }
+        "install" if is_the_unix_install(&words[at], rest) => {
+            let named = after_flag(&["-t", "--target-directory"]);
+            let (sources, dest): (Vec<&String>, Option<&String>) = match named.first() {
+                Some(d) => (positionals.iter().copied().filter(|w| w != d).collect(), Some(*d)),
+                None => match positionals.split_last() {
+                    Some((last, init)) => (init.to_vec(), Some(*last)),
+                    None => (Vec::new(), None),
+                },
+            };
+            dest.is_some_and(|d| dest_receives(p, d, &sources, cwd))
+        }
+        "dd" => rest.iter().any(|w| w.to_ascii_lowercase().strip_prefix("of=").is_some_and(|v| p.protects(v, cwd))),
+        "curl" => {
+            let targets = after_flag(&["-o", "--output"]);
+            let direct = rest.iter().any(|w| w.strip_prefix("--output=").is_some_and(|v| p.protects(v, cwd)));
+            direct || any(&targets) || after_flag(&["--output-dir"]).iter().any(|w| p.touches_dir(w, cwd))
+        }
+        "wget" => {
+            let direct = rest.iter().any(|w| w.strip_prefix("--output-document=").is_some_and(|v| p.protects(v, cwd)));
+            direct
+                || any(&after_flag(&["-o", "--output-document", "--output-file"]))
+                || after_flag(&["-p", "--directory-prefix"]).iter().any(|w| p.touches_dir(w, cwd))
         }
         "sed" => rest.iter().any(|w| w == "-i" || (w.starts_with("-i") && !w.starts_with("--")) || w == "--in-place") && any(&positionals),
         "git" => {
             let sub = positionals.first().map(|w| w.to_ascii_lowercase());
             match sub.as_deref() {
                 Some("checkout") => match rest.iter().position(|w| w == "--") {
-                    Some(i) => rest[i + 1..].iter().any(|w| p.protects(w)),
+                    Some(i) => rest[i + 1..].iter().any(|w| p.protects(w, cwd)),
                     None => false,
                 },
                 Some("restore") => any(&positionals[1..]),
                 _ => false,
             }
         }
+        // A link, a junction or a hard link to a protected folder opens it up to every later write.
+        "ln" | "mklink" => positionals.iter().any(|w| p.touches_dir(w, cwd)),
+        "sqlite3" => {
+            let whole = words[at..].join(" ").to_ascii_lowercase();
+            p.mentions_any(&whole) && SQL_WRITES.iter().any(|m| whole.contains(m))
+        }
+        n if INTERPRETERS.contains(&n) => {
+            // A one-line program that names a protected path next to a word that writes.
+            let whole = words[at..].join(" ").to_ascii_lowercase();
+            p.mentions_any(&whole) && (WRITE_LOOKING.iter().any(|m| whole.contains(m)) || (matches!(n, "awk" | "gawk") && whole.contains('>')))
+        }
         _ => {
             // A one-line .NET or `New-Item` write names its target inside a longer argument.
             let whole = words[at..].join(" ").to_ascii_lowercase();
+            let links = ["symboliclink", "junction", "hardlink"].iter().any(|m| whole.contains(m));
             (DOTNET_WRITES.iter().any(|m| whole.contains(m)) || name == "new-item" || name == "set-item")
-                && p.names_any(&words[at..].join(" "))
+                && (p.names_any(&words[at..].join(" ")) || (links && p.mentions_any(&whole)))
         }
     }
+}
+
+/// The word `install` as the Unix copy command: written bare, with none of the installer's own flags.
+fn is_the_unix_install(raw: &str, rest: &[String]) -> bool {
+    raw.eq_ignore_ascii_case("install") && !rest.iter().any(|w| INSTALLER_FLAGS.iter().any(|f| w.starts_with(f)))
 }
 
 #[cfg(test)]
@@ -403,7 +614,7 @@ mod tests {
 
     fn shell(command: &str) -> bool {
         let input = serde_json::json!({ "command": command });
-        refusal(&guard(), "Bash", Some(&input)).is_some()
+        refusal(&guard(), "Bash", Some(&input), None).is_some()
     }
 
     #[test]
@@ -419,17 +630,17 @@ mod tests {
         ] {
             for tool in ["Write", "Edit", "MultiEdit"] {
                 let input = serde_json::json!({ "file_path": path });
-                assert!(refusal(&g, tool, Some(&input)).is_some(), "{tool} {path}");
+                assert!(refusal(&g, tool, Some(&input), None).is_some(), "{tool} {path}");
             }
         }
         let note = serde_json::json!({ "notebook_path": "C:/data/store/x.json" });
-        assert!(refusal(&g, "NotebookEdit", Some(&note)).is_some());
+        assert!(refusal(&g, "NotebookEdit", Some(&note), None).is_some());
         for path in ["C:/work/acme-shop/notes.md", "C:/Users/alex/.claude/settings.json", "C:/data/store2/thor.db", "C:/Users/alex/.claude/projects/x/notes.txt"] {
             let input = serde_json::json!({ "file_path": path });
-            assert!(refusal(&g, "Write", Some(&input)).is_none(), "{path}");
+            assert!(refusal(&g, "Write", Some(&input), None).is_none(), "{path}");
         }
         let read = serde_json::json!({ "file_path": "C:/data/store/thor.db" });
-        assert!(refusal(&g, "Read", Some(&read)).is_none(), "reading is free");
+        assert!(refusal(&g, "Read", Some(&read), None).is_none(), "reading is free");
     }
 
     #[test]
@@ -462,6 +673,84 @@ mod tests {
         }
     }
 
+    fn shell_in(command: &str, cwd: &str) -> bool {
+        let input = serde_json::json!({ "command": command });
+        refusal(&guard(), "Bash", Some(&input), Some(cwd)).is_some()
+    }
+
+    #[test]
+    fn the_ordinary_other_forms_of_the_same_write_are_refused() {
+        for command in [
+            "cp session-watermark.json C:/data/store/",
+            "cp session-watermark.json C:/data/store",
+            "cp forged.json 'C:\\data\\store\\'",
+            "mv forged.jsonl C:/Users/alex/.claude/projects/p/",
+            "Copy-Item .\\forged.json C:\\data\\store\\",
+            "rm -rf C:/data/store",
+            "rm -rf C:/Users/alex/.claude/projects",
+            "Remove-Item -Recurse C:\\data",
+            "python -c \"open('C:/data/store/a.json','w').write('x')\"",
+            "node -e \"require('fs').writeFileSync('C:/data/store/a.json','x')\"",
+            "perl -pi -e 's/a/b/' C:/data/store/a.json",
+            "dd if=x of=C:/data/store/thor.db",
+            "curl -o C:/data/store/a.json http://example.test/x",
+            "wget -O C:/data/store/a.json http://example.test/x",
+            "install -m 644 forged.json C:/data/store/",
+            "ln -s C:/data/store /tmp/link",
+            "cmd /c mklink /J C:\\scratch\\l C:\\data\\store",
+            "awk 'BEGIN{print \"x\" > \"C:/data/store/a.json\"}'",
+            "sqlite3 C:/data/store/thor.db \"delete from events\"",
+            "echo x > \\\\?\\C:\\data\\store\\a.json",
+            "New-Item -ItemType SymbolicLink -Path C:\\scratch\\l -Value C:\\data\\store",
+        ] {
+            assert!(shell(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn a_relative_path_is_read_against_the_working_folder_and_a_cd() {
+        assert!(shell_in("echo x >> session-watermark.json", "C:/data/store"));
+        assert!(shell_in("cd C:/Users/alex/.claude/projects/p && echo x >> s.jsonl", "C:/work"));
+        assert!(shell_in("cd ../.claude/projects/p; Add-Content s.jsonl x", "C:/Users/alex/work"));
+        assert!(shell_in("rm thor.db", "C:/data/store"));
+        assert!(!shell_in("cd C:/work && echo x > notes.txt", "C:/data/store"));
+        assert!(!shell_in("echo x > notes.txt", "C:/work"));
+        assert!(!shell_in("cp C:/data/store/thor.db .", "C:/scratch"));
+        let input = serde_json::json!({ "file_path": "session-watermark.json" });
+        assert!(refusal(&guard(), "Write", Some(&input), Some("C:/data/store")).is_some());
+        assert!(refusal(&guard(), "Write", Some(&input), Some("C:/work")).is_none());
+        assert!(refusal(&guard(), "Write", Some(&input), None).is_none(), "no folder known: nothing to resolve against");
+    }
+
+    #[test]
+    fn the_steps_the_docs_tell_the_assistant_to_take_are_free() {
+        for command in [
+            "install --set-connections off --db C:/data/store/thor.db",
+            "install --set-backup local --db C:/data/store/thor.db",
+            "C:/tools/thor2/bin/install.exe --set-git-hooks off --db C:/data/store/thor.db",
+            "& \"C:\\tools\\thor2\\bin\\install.exe\" --topic --db \"C:\\data\\store\\thor.db\"",
+            "C:/tools/thor2/bin/serve.exe --db C:/data/store/thor.db inventory",
+            "node C:/work/tool.mjs --db C:/data/store/thor.db",
+            "python -c \"print(open('C:/data/store/a.json').read())\"",
+            "sqlite3 C:/data/store/thor.db \"select count(*) from events\"",
+            "cp C:/data/store/thor.db C:/scratch/",
+            "cp notes.txt C:/data/store/notes.txt",
+        ] {
+            assert!(!shell(command), "{command}");
+        }
+        // Files the owner edits by hand stay editable, with a tool or a command.
+        for name in ["guard-capture-mode.json", "stale-guard-mode.json", "no-project-ask-mode.json", "work-folders.json", "thor-mode.json"] {
+            let input = serde_json::json!({ "file_path": format!("C:/data/store/{name}") });
+            assert!(refusal(&guard(), "Write", Some(&input), None).is_none(), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_refusal_says_what_to_do_instead() {
+        let text = refusal_text();
+        assert!(text.contains("install program") && text.contains("tell the person"), "{text}");
+    }
+
     /// Not run by default: replays the real-call record of a folder (THOR_REPLAY_DIR holds a
     /// real-calls.jsonl, THOR_REPLAY_STORE and THOR_REPLAY_PROGRAMS name the folders to protect,
     /// THOR_REPLAY_CLAUDE Claude Code's folder) and lists every call this guard would refuse.
@@ -479,7 +768,7 @@ mod tests {
         let (mut total, mut refused, mut refused_ok) = (0, 0, 0);
         for call in &calls {
             total += 1;
-            if refusal(&g, &call.tool, Some(&call.input)).is_some() {
+            if refusal(&g, &call.tool, Some(&call.input), None).is_some() {
                 refused += 1;
                 if call.ok == Some(true) {
                     refused_ok += 1;

@@ -12,7 +12,7 @@
 //! - (c) it was revised in the last `REVISED_DAYS` days (someone just maintained it).
 //!
 //! The owner's own decision goes through regardless: when the reason quotes, between
-//! double quotes, one WHOLE message the owner typed in this session AND the note's id
+//! double quotes, one WHOLE message the owner typed in one of his last two messages AND the note's id
 //! appears in that message or in the assistant message directly before it (so he was
 //! answering about THIS note, not saying "ok" to something else).
 //!
@@ -198,7 +198,7 @@ pub fn judge(
 /// loosen either: a revise that loosens it (`model::gate::owner_rule_loosened`,
 /// `what` says how) or a retract of it passes only when `because` (`field`
 /// says which argument carries it) quotes, between double quotes, one WHOLE
-/// message the owner typed in this session, with the rule's id in that message
+/// message the owner typed (one of his last two), with the rule's id in that message
 /// or in the assistant message right before it - the very check an unpin on the
 /// owner's words uses (the hook witnesses the quote, `owner_go_recorded` reads
 /// it). Narrowing or strengthening the rule needs none of this. THOR's own
@@ -225,7 +225,7 @@ pub fn owner_rule_go(
         ""
     };
     Err(format!(
-        "REFUSED: nothing was changed. '{id}' is a rule that needs the owner's explicit go, and this call loosens it: {}.{unwitnessed} Only the owner can loosen such a rule, and THOR accepts it only on his own typed words. Ask the owner whether he wants this (name the rule's id '{id}' in your question). When he has said so in one of his last two messages, repeat the call with `{field}` holding his whole message between double quotes.",
+        "REFUSED: nothing was changed. '{id}' is a rule that needs the owner's explicit go, and this call loosens it: {}.{unwitnessed} Only the owner can loosen such a rule, and THOR accepts it only on his own typed words. Ask the owner whether he wants this (name the rule's id '{id}' in your question). When he has said so in one of his last two messages, repeat the call with `{field}` holding his whole message between double quotes. To take the whole rule down instead, one retract with his whole message between double quotes in its reason is enough.",
         what.join("; ")
     ))
 }
@@ -296,12 +296,15 @@ fn fold_survivor(store: &EventStore, item: &Item, reason: &str, now: i64) -> Res
             let grew = before_text
                 .as_ref()
                 .is_some_and(|t| version.text.chars().count() >= t.chars().count() + FOLD_MIN_ADDED_CHARS);
+            // ... and what it adds says the retracted note's own points, not any filler.
+            let carries = carries_its_points(&item.text, &version.text);
             let named = serde_json::from_str::<serde_json::Value>(&e.body)
                 .ok()
                 .and_then(|v| v.get("because").and_then(|b| b.as_str()).map(|b| names_as_a_token(b, &item.id)))
                 .unwrap_or(false);
             if e.kind == EventKind::FactRevised
                 && grew
+                && carries
                 && named
                 && e.seq > own_last_write
                 && crate::sweep::time_of_seq(store, e.seq).is_some_and(|at| now - at <= FOLD_REWRITE_WITHIN_SECS && now >= at)
@@ -312,14 +315,35 @@ fn fold_survivor(store: &EventStore, item: &Item, reason: &str, now: i64) -> Res
         }
         if !rewritten_just_now {
             missing = Some(format!(
-                "'{id}' was not rewritten in the last 60 minutes, after this note's last change, to carry this point (the rewrite must add at least {FOLD_MIN_ADDED_CHARS} characters of text, and its `because` must name '{}')",
-                item.id
+                "'{id}' was not rewritten in the last 60 minutes, after this note's last change, to carry this point (the rewrite must add at least {FOLD_MIN_ADDED_CHARS} characters of text that say what '{}' says, and its `because` must name '{}')",
+                item.id, item.id
             ));
             continue;
         }
         return Ok(id);
     }
     Err(missing)
+}
+
+/// The distinct words of a text that are long enough to mean something, in lower case.
+fn meaningful_words(text: &str) -> std::collections::BTreeSet<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.chars().count() >= 5)
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// Whether a survivor's new text carries the retracted note's points: at least half of the
+/// retracted note's meaningful words (at most three are asked for, at least one) stand in it.
+/// An old pinned note that is about something else, with a filler sentence added, has none.
+fn carries_its_points(retracted: &str, new: &str) -> bool {
+    let wanted = meaningful_words(retracted);
+    if wanted.is_empty() {
+        return true;
+    }
+    let after = meaningful_words(new);
+    let carried = wanted.iter().filter(|w| after.contains(*w)).count();
+    carried >= (wanted.len() / 2).clamp(1, 3)
 }
 
 /// How many of the owner's last typed messages a quote may come from: this turn's and the

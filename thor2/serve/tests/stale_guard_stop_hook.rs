@@ -443,3 +443,27 @@ fn a_rule_left_alone_holds_two_conversations_and_then_none_until_it_changes() {
     let out = run_hook(&db, &stop_payload("s4"));
     assert!(out.contains("\"block\""), "a changed rule holds again: {out}");
 }
+
+/// Showing a rule to a conversation records an event about it. That must not make the rule a
+/// new one: the hold cap counts conversations of the SAME rule, however often it was shown.
+#[test]
+fn the_cap_holds_although_the_rule_is_shown_between_conversations() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let mut store = thor_core::event_store::EventStore::new(&db).unwrap();
+    declare_test_item(&mut store, "r1");
+    let now_seq = store.contiguous_tip().unwrap().0;
+    write_stale_sidecar(dir.path(), "r1", "failed", "Absent { path: \"NOTES.md\", literal: \"forbidden\" }", "NOTES.md", now_seq, 1);
+    for session in ["s1", "s2"] {
+        let out = run_hook(&db, &stop_payload(session));
+        assert!(out.contains("\"block\""), "{session}: {out}");
+        // The rule is shown in that conversation, as it is whenever its file is touched.
+        let body = r#"{"served_at":"2026-11-17T10:00:00Z","trigger":"Write NOTES.md"}"#;
+        store
+            .append_event(session, session, model::store::ASSISTANT_DELIVERY_ACTOR, thor_core::event_store::EventKind::ItemServed, "r1", None, body)
+            .unwrap();
+    }
+    let out = run_hook(&db, &stop_payload("s3"));
+    assert!(!out.contains("\"block\""), "the third conversation is not held: {out}");
+    assert_eq!(serve::stale_guard::left_alone_ids(&db), vec!["r1".to_string()]);
+}

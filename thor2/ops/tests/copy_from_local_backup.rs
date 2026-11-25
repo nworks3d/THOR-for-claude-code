@@ -76,4 +76,6 @@ fn a_backup_that_cannot_be_reached_is_a_plain_sentence_with_the_next_step() {
     assert!(!made.status.success(), "{text}");
     assert!(text.contains("could not be reached") && text.contains("Next step"), "{text}");
     assert!(!text.contains("fatal:") && !text.contains("git ls-remote"), "raw git text leaked: {text}");
+    assert_eq!(text.matches("run the same command again").count(), 1, "the next step is given twice: {text}");
+    assert!(!text.contains("README"), "a beginner has no README to open: {text}");
 }

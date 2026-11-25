@@ -563,8 +563,8 @@ fn set_connections_only(db: Option<PathBuf>, settings: Option<PathBuf>, serve_ex
         return ExitCode::FAILURE;
     };
     if !on {
-        match ops::uninstall::remove_thor_hooks(&settings) {
-            Ok(n) => println!("+ removed {n} of THOR's connection(s) from Claude Code's settings (nothing else there was touched)"),
+        match ops::uninstall::remove_thor_connections(&settings) {
+            Ok(n) => println!("+ removed {n} of THOR's connection(s) from Claude Code's settings (nothing else there was touched, and the daily safety copy keeps running)"),
             Err(e) => {
                 eprintln!("NOTHING WAS CHANGED: {e}");
                 return ExitCode::FAILURE;
@@ -591,7 +591,7 @@ fn set_connections_only(db: Option<PathBuf>, settings: Option<PathBuf>, serve_ex
         return ExitCode::FAILURE;
     }
     if move_here {
-        if let Err(e) = ops::uninstall::remove_thor_hooks(&settings) {
+        if let Err(e) = ops::uninstall::remove_thor_connections(&settings) {
             eprintln!("NOTHING WAS CHANGED: {e}");
             return ExitCode::FAILURE;
         }
@@ -1296,11 +1296,16 @@ fn build_project_index(index_root: &Path, key: &str, repo: &Path) -> anyhow::Res
 /// and its tool server only when it starts (and the tool server reads the code
 /// index once, then), so a restart is asked for only when this run changed one
 /// of those, or on the very first install; any other run says none is needed.
-fn restart_lines(because: &[&str]) -> Vec<String> {
+fn restart_lines(because: &[&str], code_read_now: bool) -> Vec<String> {
     if because.is_empty() {
-        return vec![
+        let mut lines = vec![
             "Done. Nothing is left for you to do: nothing that Claude Code loads when it starts was changed, so you do not need to restart it.".to_string(),
         ];
+        if code_read_now {
+            // The tool server looks up the code index once, when it starts.
+            lines.push("Notes work at once. Searching this project's code starts the next time Claude Code is opened in this folder.".to_string());
+        }
+        return lines;
     }
     vec![
         "Done. ONE THING LEFT FOR YOU: close Claude Code completely and open it again.".to_string(),
@@ -1766,6 +1771,7 @@ fn main() -> ExitCode {
     // picks its code index once at its start. A run that changed none of
     // those, on a machine that was set up before, needs no restart.
     let mut restart_because: Vec<&str> = Vec::new();
+    let mut code_read_now = false;
     match ensure_store(&db) {
         Ok(StoreOutcome::Created) => {
             restart_because.push("this is the first install");
@@ -2102,6 +2108,7 @@ fn main() -> ExitCode {
                 // the next time Claude Code is opened in it.
                 println!("+ read this project's code, {files} file(s), so it can be searched and kept fresh after a commit, a merge or pull, a rebase and a branch switch");
                 println!("  searching this project's code starts working the next time Claude Code is opened in this folder");
+                code_read_now = true;
                 // Immediately after the read succeeds: opens the project in
                 // the memory itself, so the very first `remember` filed under
                 // it is never refused as an unknown collection (see
@@ -2142,7 +2149,7 @@ fn main() -> ExitCode {
     }
 
     println!();
-    for line in restart_lines(&restart_because) {
+    for line in restart_lines(&restart_because, code_read_now) {
         println!("{line}");
     }
     // For the assistant, not for the person: they never run anything themselves.
@@ -2157,10 +2164,12 @@ mod restart_tests {
 
     #[test]
     fn a_restart_is_asked_for_only_when_something_a_restart_loads_changed() {
-        let none = restart_lines(&[]).join("\n");
+        let none = restart_lines(&[], false).join("\n");
         assert!(none.contains("do not need to restart"), "{none}");
-        assert!(!none.contains("ONE THING LEFT"), "{none}");
-        let some = restart_lines(&["THOR's connections in Claude Code's settings changed"]).join("\n");
+        assert!(!none.contains("ONE THING LEFT") && !none.contains("Searching this project's code"), "{none}");
+        let read = restart_lines(&[], true).join("\n");
+        assert!(read.contains("do not need to restart") && read.contains("Searching this project's code starts the next time"), "{read}");
+        let some = restart_lines(&["THOR's connections in Claude Code's settings changed"], true).join("\n");
         assert!(some.contains("ONE THING LEFT FOR YOU: close Claude Code completely"), "{some}");
         assert!(some.contains("connections in Claude Code's settings changed"), "{some}");
     }

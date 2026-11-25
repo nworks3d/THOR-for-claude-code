@@ -95,3 +95,17 @@ fn a_task_that_calls_the_ship_but_left_no_record_is_the_third_case() {
     let other = tempfile::tempdir().unwrap();
     assert_eq!(ops::health::ship_never_recorded_line(&other.path().join("t.db"), &[PathBuf::from("C:\\x\\notes.ps1")]), None);
 }
+
+/// The programs usually sit in one folder and the memory in another: a task that calls a program
+/// from the program folder is this memory's, and a task from a third place is not.
+#[test]
+fn a_task_calling_a_program_from_the_program_folder_is_this_memorys() {
+    use std::path::Path;
+    let store = "c:/users/someone/appdata/local/thor2";
+    let programs = "c:/users/someone/thor2";
+    assert!(ops::health::task_is_this_memorys(Path::new("C:/Users/Someone/thor2/sync.exe"), store, programs));
+    assert!(ops::health::task_is_this_memorys(Path::new("C:/Users/Someone/AppData/Local/thor2/ship.ps1"), store, programs));
+    assert!(!ops::health::task_is_this_memorys(Path::new("C:/Other/thor2/sync.exe"), store, programs));
+    assert!(!ops::health::task_is_this_memorys(Path::new("C:/Users/Someone/thor2-old/sync.exe"), store, programs));
+    assert!(!ops::health::task_is_this_memorys(Path::new("C:/Users/Someone/thor2/sync.exe"), "", ""), "no folders known: nothing is this memory's");
+}

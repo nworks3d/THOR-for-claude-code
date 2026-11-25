@@ -549,7 +549,7 @@ fn anchor_staleness(check_path: &str, root: &Path) -> Option<StaleOutcome> {
 /// Falls back to `literal` alone in the should-be-unreachable case that it
 /// cannot be found at all - never panics either way.
 fn quote_with_context(content: &str, literal: &str) -> String {
-    let Some(byte_pos) = crate::shell::find_literal(content, literal) else {
+    let Some(byte_pos) = content.find(literal) else {
         return literal.to_string();
     };
     let match_char_idx = content[..byte_pos].chars().count();
@@ -667,7 +667,7 @@ fn quote_with_context_at(content: &str, at: usize, literal: &str) -> String {
 /// reported reason quotes the one that matched, not an arbitrary member of
 /// the set.
 fn first_present_literal<'a>(literals: &'a [String], content: &str) -> Option<&'a str> {
-    literals.iter().find(|literal| crate::shell::find_literal(content, literal).is_some()).map(String::as_str)
+    literals.iter().find(|literal| content.contains(literal.as_str())).map(String::as_str)
 }
 
 /// The first live, ranked candidate (worst-first, exactly as `rank::select`
@@ -993,7 +993,7 @@ pub fn find_requires_violation_in(
 /// can change or lift the rule himself, in any session (`unpin_gate`).
 pub const OWNER_CAN_CHANGE_IT: &str = "The owner can also change or lift this rule himself, in any session: when he asks \
      for that in his own message, revise the rule (mcp__thor__revise) and put his whole message, between double \
-     quotes, in `because` - THOR checks the quote against what he typed in this session.";
+     quotes, in `because` - THOR checks the quote against what he typed in his last two messages.";
 
 /// Where a live hook reads the owner's own words from: his last messages of
 /// this session (`attest::owner_messages`), or why they cannot be read.

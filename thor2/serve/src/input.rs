@@ -22,22 +22,75 @@ pub use model::normalize::{hosts_in_command, paths_in_command};
 pub const MAX_CWD_CHARS: usize = 4096;
 /// A prompt is read up to this many characters for matching.
 pub const MAX_PROMPT_CHARS: usize = 200_000;
-/// A text in a tool's input is matched on its first this many bytes.
+/// A text in a tool's input longer than this is shrunk before it is matched.
 pub const MAX_TOOL_TEXT_BYTES: usize = 2 * 1024 * 1024;
+/// A single unbroken run of characters (no space, no new line) longer than this is padding: it
+/// keeps its first and last `LONG_RUN_KEEP_BYTES` bytes.
+const LONG_RUN_BYTES: usize = 8192;
+const LONG_RUN_KEEP_BYTES: usize = 4096;
 
-fn cut_to_bytes(text: &mut String, max: usize) {
-    if text.len() > max {
-        let mut at = max;
-        while !text.is_char_boundary(at) {
-            at -= 1;
-        }
-        text.truncate(at);
+fn floor_boundary(text: &str, mut at: usize) -> usize {
+    while !text.is_char_boundary(at) {
+        at -= 1;
     }
+    at
+}
+
+fn ceil_boundary(text: &str, mut at: usize) -> usize {
+    while !text.is_char_boundary(at) {
+        at += 1;
+    }
+    at
+}
+
+/// Shrinks one text. First a very long unbroken run is cut down to its two ends, so padding
+/// put between two parts of a command cannot push the second part out of sight. If the text is
+/// still beyond the limit it keeps its first and its last half of the limit.
+fn shrink_text(text: &mut String) {
+    if text.len() <= MAX_TOOL_TEXT_BYTES {
+        return;
+    }
+    let mut out = String::with_capacity(MAX_TOOL_TEXT_BYTES);
+    let mut run_start: Option<usize> = None;
+    let flush = |out: &mut String, from: usize, to: usize, text: &str| {
+        let run = &text[from..to];
+        if run.len() > LONG_RUN_BYTES {
+            let head = floor_boundary(run, LONG_RUN_KEEP_BYTES);
+            let tail = ceil_boundary(run, run.len() - LONG_RUN_KEEP_BYTES);
+            out.push_str(&run[..head]);
+            out.push_str("...");
+            out.push_str(&run[tail..]);
+        } else {
+            out.push_str(run);
+        }
+    };
+    let mut last = 0;
+    for (i, c) in text.char_indices() {
+        if c.is_whitespace() {
+            if let Some(start) = run_start.take() {
+                flush(&mut out, start, i, text);
+            }
+            out.push(c);
+        } else if run_start.is_none() {
+            run_start = Some(i);
+        }
+        last = i + c.len_utf8();
+    }
+    if let Some(start) = run_start {
+        flush(&mut out, start, last, text);
+    }
+    if out.len() > MAX_TOOL_TEXT_BYTES {
+        let half = MAX_TOOL_TEXT_BYTES / 2;
+        let head = floor_boundary(&out, half);
+        let tail = ceil_boundary(&out, out.len() - half);
+        out = format!("{}\n{}", &out[..head], &out[tail..]);
+    }
+    *text = out;
 }
 
 fn clamp_texts(value: &mut serde_json::Value) {
     match value {
-        serde_json::Value::String(s) => cut_to_bytes(s, MAX_TOOL_TEXT_BYTES),
+        serde_json::Value::String(s) => shrink_text(s),
         serde_json::Value::Array(items) => items.iter_mut().for_each(clamp_texts),
         serde_json::Value::Object(map) => map.values_mut().for_each(clamp_texts),
         _ => {}
@@ -46,7 +99,7 @@ fn clamp_texts(value: &mut serde_json::Value) {
 
 /// Cuts the parts of a hook payload that are beyond the limits above, in place: a too long
 /// `cwd` is removed (no working folder), the `prompt` keeps its first `MAX_PROMPT_CHARS`
-/// characters and each text of `tool_input` its first `MAX_TOOL_TEXT_BYTES` bytes.
+/// characters and each text of `tool_input` that is beyond `MAX_TOOL_TEXT_BYTES` is shrunk by `shrink_text`: its ends stay.
 pub fn clamp_payload(payload: &mut serde_json::Value) {
     let Some(map) = payload.as_object_mut() else { return };
     if map.get("cwd").and_then(|v| v.as_str()).is_some_and(|c| c.len() > MAX_CWD_CHARS && c.chars().count() > MAX_CWD_CHARS) {
@@ -79,7 +132,7 @@ mod extreme_input_tests {
         clamp_payload(&mut payload);
         assert!(payload.get("cwd").is_none(), "a cwd of 32,000 characters is no cwd");
         assert_eq!(payload["prompt"].as_str().unwrap().chars().count(), MAX_PROMPT_CHARS);
-        assert_eq!(payload["tool_input"]["command"].as_str().unwrap().len(), MAX_TOOL_TEXT_BYTES);
+        assert!(payload["tool_input"]["command"].as_str().unwrap().len() <= MAX_TOOL_TEXT_BYTES);
         assert_eq!(payload["tool_input"]["file_path"], "C:/work/a.txt");
         assert_eq!(payload["session_id"], "s1");
         let mut normal = serde_json::json!({ "cwd": "C:/work/acme-shop", "prompt": "hello", "tool_input": { "command": "ls" } });
@@ -89,11 +142,26 @@ mod extreme_input_tests {
     }
 
     #[test]
+    fn padding_in_the_middle_cannot_hide_the_end_of_a_command() {
+        let command = format!("echo {} ; git branch -D old", "x".repeat(MAX_TOOL_TEXT_BYTES + 10));
+        let mut payload = serde_json::json!({ "tool_input": { "command": command } });
+        clamp_payload(&mut payload);
+        let kept = payload["tool_input"]["command"].as_str().unwrap();
+        assert!(kept.ends_with("git branch -D old") && kept.starts_with("echo "));
+        // Padding made of many short words keeps both ends as well.
+        let spaced = format!("rm a.txt {} git branch -D old", "x ".repeat(MAX_TOOL_TEXT_BYTES));
+        let mut payload = serde_json::json!({ "tool_input": { "command": spaced } });
+        clamp_payload(&mut payload);
+        let kept = payload["tool_input"]["command"].as_str().unwrap();
+        assert!(kept.starts_with("rm a.txt") && kept.ends_with("git branch -D old") && kept.len() <= MAX_TOOL_TEXT_BYTES + 1);
+    }
+
+    #[test]
     fn a_cut_never_splits_a_character() {
         let mut payload = serde_json::json!({ "tool_input": { "command": "\u{e9}".repeat(MAX_TOOL_TEXT_BYTES) } });
         clamp_payload(&mut payload);
         let kept = payload["tool_input"]["command"].as_str().unwrap();
-        assert!(kept.len() <= MAX_TOOL_TEXT_BYTES && kept.chars().all(|c| c == '\u{e9}'));
+        assert!(kept.len() <= MAX_TOOL_TEXT_BYTES && kept.chars().all(|c| c == '\u{e9}' || c == '.'));
     }
 }
 

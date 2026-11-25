@@ -2831,7 +2831,12 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             }
             // The files only Claude Code and THOR write (saved conversations, the memory's folder,
             // THOR's programs): no call may write to them (`serve::write_guard`).
-            if let Some(reason) = serve::write_guard::refusal(&serve::write_guard::Protected::current(db_path), tool_name, tool_input) {
+            if let Some(reason) = serve::write_guard::refusal(
+                &serve::write_guard::Protected::current(db_path),
+                tool_name,
+                tool_input,
+                payload.get("cwd").and_then(|c| c.as_str()),
+            ) {
                 return Some(HookOutput::Decision(serde_json::json!({ "decision": "block", "reason": reason })));
             }
             if serve::unpin_gate::is_gated_call(tool_name) || serve::unpin_gate::is_pin_call(tool_name) {
@@ -5025,8 +5030,7 @@ fn stale_guard_stop_check(
     let rule_seqs: std::collections::HashMap<String, i64> = remaining
         .iter()
         .map(|e| {
-            let last = store.get_events_by_entity(&e.id).ok().and_then(|events| events.iter().map(|ev| ev.seq).max()).unwrap_or(0);
-            (e.id.clone(), last)
+            (e.id.clone(), stale_guard::rule_version(&store, &e.id))
         })
         .collect();
     let (remaining, _left_alone) = stale_guard::split_by_holds(remaining, &held, &rule_seqs, session_id);

@@ -63,8 +63,14 @@ Words used once, in plain language:
 - You notice: "connected THOR to Claude Code". settings.json is first copied to settings.json.bak (only once: an existing .bak is never replaced, so it keeps your file as it was before THOR), nothing
   that is not THOR's is ever removed, a second run changes nothing, and a hook that points at a program
   that no longer exists is repointed (reported) instead of duplicated.
-- Refuse or change: --settings writes to another file. Removing the four entries from settings.json
-  switches THOR off completely (my reading of what the install writes; no doc says so in one place).
+- Refuse or change: --settings writes to another file. `install --set-connections off --db <memory>`
+  removes only THOR's own four entries (the daily safety copy's entry stays), remembers the no in
+  install-choices.json beside the memory, and a later plain install says so in one line and wires nothing;
+  `--set-connections on` puts them back, and `doctor` then says "OK: you chose ..." instead of a PROBLEM.
+  One THOR per computer account: installing another memory while Claude Code is connected to a different one is
+  refused before anything is written, naming that memory; `--move-to-this-store` moves the four entries (and
+  the note-saving connection) to the new memory and leaves the other memory as it is. Uninstalling removes
+  every THOR entry whatever memory it names.
 
 ### A5. It refuses to install hooks that cannot work
 - What: before writing hooks it checks that the "serve" program exists and actually starts
@@ -95,7 +101,9 @@ Words used once, in plain language:
 - You notice: two lines ("told git to use them", "your own git hooks keep working"). If git is not
   installed this step is skipped with a friendly line.
 - Refuse or change: if you already had a global core.hooksPath, THOR leaves it alone and says code
-  search will not auto-refresh until you sort it out.
+  search will not auto-refresh until you sort it out. `install --set-git-hooks off --db <memory>` unsets
+  it when it is THOR's, remembers the no, and a later plain install wires nothing (`on` wires it again);
+  `doctor` then shows a NOTE, not a PROBLEM.
 
 ### A7b. The pre-commit one of those hooks stops video files and very large files (the media gate)
 - What: before it hands control to the repository's own pre-commit hook, the dispatcher looks at what is
@@ -201,8 +209,9 @@ Words used once, in plain language:
   prompt you type in a session your assistant also gets one short line with the length limit of the
   length rule (once per session, read from the rulebook itself, nothing when the rule is not in your
   file), so the first answer is already short instead of being written twice.
-- Refuse or change: edit a rule's reminder line, delete an entry or the file to switch it off. Never
-  overwritten once present. One more field is available but no rule uses it in the file:
+- Refuse or change: `install --set-reply-rules off --db <memory>` sets the whole file aside (your own
+  edits are kept and come back with `on`) and remembers the no, so a later plain install does not write it
+  again; to change one rule, edit its reminder line or delete its entry. Never overwritten once present. One more field is available but no rule uses it in the file:
   `expected_language` (nl, de, fr or es) makes a rule fire on a reply that clearly reads as English when your last prompt
   was in that language (see thor2/README.md for the exact reading; off unless you add such a rule).
 
@@ -814,7 +823,7 @@ remembers per session how far it has looked, so a long conversation does not mak
   refused.
   The start block is the owner's. An assistant cannot pin a note by itself: every write that adds Always
   (remember, revise or pin) is refused, with nothing written, unless `because` holds the owner's whole message
-  between double quotes, checked in the hook against what he typed in this session (the note's id must stand in
+  between double quotes, checked in the hook against what he typed in his last two messages (the note's id must stand in
   that message or in the assistant message right before it). A note that is already pinned is revised as
   before. One quote also answers the two rules below. A subject's notes reach the conversation another way: a
   note bound to its own project (a target of kind project) comes up at a prompt typed in that subject's own
@@ -830,7 +839,7 @@ remembers per session how far it has looked, so a long conversation does not mak
   saying why it must hold in every conversation; the pin is then written, the reason stays in its history and
   doctor lists it under "pinned exceptions". Pins that already stand are not touched.
   The way out of a full block is the owner's own go: his whole message between double quotes in `because`,
-  checked in the hook against what he typed in this session (the same check as an unpin on his words). The note
+  checked in the hook against what he typed in his last two messages (the same check as an unpin on his words). The note
   is then an overflow pin: not in the start block, delivered whole at the first prompt of each conversation,
   once, within a second budget of the same size; a pin that would not fit there either is refused with the
   same text. Doctor names the overflow pins per project. A memory that already overflows lists its cut notes first under the evaluation's crowded
