@@ -311,6 +311,20 @@ fn every_install_flag_the_list_names_exists_in_the_installer() {
     assert!(named >= 6, "the list names its commands: {named}");
 }
 
+/// A lookup cuts the first-session text after about a third, so every note and
+/// page that sends the assistant to it says `get`, and the text itself says so first.
+#[test]
+fn everything_sends_the_assistant_to_get_the_whole_first_session_text() {
+    let rules = questionnaire::lookup_text(None);
+    let head: String = rules.chars().take(1200).collect();
+    assert!(head.contains("read it whole with the get tool") && head.contains("never with a lookup"), "{head}");
+    for note in ops::install::working_contract().into_iter().chain([ops::install::order_earlier_note()]) {
+        assert!(!note.text.contains("lookup with key first-session-questions"), "{}: {}", note.id, note.text);
+    }
+    let agents = agents_md();
+    assert!(!agents.contains("`lookup first-session-questions`") && !agents.contains("(`lookup` with that key)"), "AGENTS.md still points at lookup");
+}
+
 /// A person who refuses every work rule has one switch for all of them (item 5),
 /// and the list says exactly which notes it touches and which it leaves.
 #[test]
@@ -501,7 +515,7 @@ fn the_seeded_store_carries_the_installs_real_paths_and_the_setup_note_names_the
     let item = model::store::show(&store, questionnaire::LOOKUP_ID).unwrap();
     assert!(item.text.contains("\"C:/Users/x/thor2/install.exe\"") && item.text.contains("\"C:/Users/x/.claude/settings.json\""), "{}", item.text);
     let note = model::store::show(&store, model::store::SETUP_NOTE_ID).unwrap();
-    assert!(note.text.contains("`lookup with key first-session-questions`") && note.text.contains("one place to read"), "{}", note.text);
+    assert!(note.text.contains("`get first-session-questions`") && note.text.contains("one place to read"), "{}", note.text);
 }
 
 /// Blind test 2026-10-10: Pro and any plan below Max are "small", Max is "max",

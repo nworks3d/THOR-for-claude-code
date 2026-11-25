@@ -143,12 +143,16 @@ fn a_plain_install_rewrites_an_old_backup_connection_in_place_and_adds_none() {
         .find(|h| h["command"].as_str().is_some_and(|c| c.contains("backup")))
         .unwrap();
     if cfg!(windows) {
-        assert_eq!(entry["command"], serde_json::json!("C:\\thor\\backup.exe"), "{entry}");
+        // A reinstall also moves the backup's connection to this install's backup program.
+        let command = entry["command"].as_str().unwrap();
+        assert!(command.ends_with("backup.exe") && !command.contains("C:\\thor\\"), "{entry}");
         assert_eq!(entry["args"][2], serde_json::json!("--repo"), "{entry}");
+        assert_eq!(entry["args"][3], serde_json::json!("C:\\copies"), "the backup folder is kept: {entry}");
         assert_eq!(entry["onFailure"], serde_json::json!("continue"), "{entry}");
-        assert!(said(&out).contains("rewrote the backup's connection"), "{}", said(&out));
+        assert!(said(&out).contains("moved the backup's connection"), "{}", said(&out));
     } else {
-        assert_eq!(entry["command"], serde_json::json!(old), "other systems keep the one-line form");
+        let line = entry["command"].as_str().unwrap();
+        assert!(line.contains("--repo \"C:\\copies\"") && !line.contains("C:\\thor\\backup"), "moved, folder kept: {line}");
     }
 
     let before = std::fs::read_to_string(fx.settings()).unwrap();

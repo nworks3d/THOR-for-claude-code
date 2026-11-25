@@ -79,6 +79,8 @@ pub struct PhaseOneReport {
     pub hooks_removed: usize,
     pub tool_server_removed: bool,
     pub eval_command_removed: bool,
+    /// The commands folder the routine sat in was empty afterwards and was removed too.
+    pub commands_folder_removed: bool,
     /// `Some(path)` when git's hooks folder was THOR's and was cleared.
     pub git_hooks_path_cleared: Option<String>,
     /// `Some(path)` when git's hooks folder is somebody else's and was left.
@@ -104,6 +106,9 @@ impl PhaseOneReport {
         }
         if self.eval_command_removed {
             lines.push("+ removed the /thor-eval command".to_string());
+        }
+        if self.commands_folder_removed {
+            lines.push("+ removed the empty commands folder it sat in".to_string());
         }
         if let Some(path) = &self.git_hooks_path_cleared {
             lines.push(format!("+ told git to stop using THOR's helper folder ({path}); git itself stays installed"));
@@ -318,6 +323,13 @@ pub fn phase_one(targets: &Targets, git: &dyn GitHooksPath) -> anyhow::Result<Ph
         let ours = std::fs::read_to_string(path).map(|t| t.to_lowercase().contains("thor")).unwrap_or(false);
         if ours && std::fs::remove_file(path).is_ok() {
             report.eval_command_removed = true;
+            // The folder THOR's routine sat in goes too, but only when nothing else is in it
+            // (somebody else's command, or a folder that was never ours, stays).
+            if let Some(folder) = path.parent() {
+                if std::fs::read_dir(folder).is_ok_and(|mut entries| entries.next().is_none()) && std::fs::remove_dir(folder).is_ok() {
+                    report.commands_folder_removed = true;
+                }
+            }
         }
     }
 
@@ -869,6 +881,31 @@ mod tests {
         // A folder that has one THOR dispatcher but not all is not trusted.
         std::fs::remove_file(other.join("pre-push")).unwrap();
         assert!(!hooks_path_is_thors(Some(&other.display().to_string()), &db));
+    }
+
+    /// The commands folder goes with THOR's routine only when nothing else is in it.
+    #[test]
+    fn the_commands_folder_goes_only_when_thors_routine_was_all_it_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = FakeGit { current: None, unset_called: Cell::new(false) };
+        let mut t = targets(dir.path());
+        std::fs::write(&t.settings, "{}").unwrap();
+        let alone = dir.path().join("commands-alone");
+        std::fs::create_dir_all(&alone).unwrap();
+        std::fs::write(alone.join("thor-eval.md"), "# THOR evaluation\n").unwrap();
+        t.eval_command = Some(alone.join("thor-eval.md"));
+        let report = phase_one(&t, &git).unwrap();
+        assert!(report.eval_command_removed && report.commands_folder_removed && !alone.exists(), "{report:?}");
+        assert!(report.plain_lines().iter().any(|l| l.contains("empty commands folder")));
+
+        let shared = dir.path().join("commands-shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(shared.join("thor-eval.md"), "# THOR evaluation\n").unwrap();
+        std::fs::write(shared.join("mine.md"), "my own command").unwrap();
+        t.eval_command = Some(shared.join("thor-eval.md"));
+        let report = phase_one(&t, &git).unwrap();
+        assert!(report.eval_command_removed && !report.commands_folder_removed, "{report:?}");
+        assert!(shared.join("mine.md").exists(), "somebody else's command stays with its folder");
     }
 
     /// The other memory is named as it was written, never in lower case.

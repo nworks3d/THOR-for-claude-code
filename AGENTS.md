@@ -685,7 +685,12 @@ THOR accepts it only with his own whole message quoted in `because`. A rule
 or orientation bound to nothing is refused, and so is a costly or irreversible
 one bound only to a project name (that reaches only a prompt, never a tool
 call): bind it to the file, command or moment it is about, or ask the owner
-whether it must come along in every conversation. Never put a real secret token (an API key, a GitHub token,
+whether it must come along in every conversation. A project binding is the way a note
+comes back only in a plain subject folder (no git). In a code project (a git folder) it is
+read only when a message names the project, so a note bound only to its project rarely
+comes back there: bind it to a real file the fact is about (the README, or the file it
+concerns), a command or a moment, and the reply to the write says so when you do not.
+Never put a real secret token (an API key, a GitHub token,
 a private key) into a note: it is refused, and a stored one can never be
 removed from the log or its backup. Write where it lives instead. A
 moment binding also has to be to one something actually produces - `answer`
@@ -855,7 +860,7 @@ Once install has run and they have restarted, a seeded note -
 until it is retracted. It exists to make sure this conversation happens once,
 before any other work, and that it covers everything the install arranged, not
 only the answer guard. The full list is in the memory as the lookup item
-`first-session-questions` (`lookup` with that key) and below on this page: they
+`first-session-questions` (read it whole with the `get` tool, never with a lookup, which cuts it) and below on this page: they
 are the same text, rendered from one catalogue in the code.
 
 **What the person sees in your first reply is a short welcome, not a list.** It
@@ -947,7 +952,7 @@ the same way a full set of preferences would. When answers come later, REVISE
 that report; a second copy is worse than none.
 
 Everything the assistant needs for this conversation is in the block below,
-which is also what the memory itself serves under `lookup first-session-questions`:
+which is also what the memory itself serves under `get first-session-questions`:
 what to say first, the two calls (store `owner-setup-answers`, retract the setup
 note), the real paths of the install, what each answer does, and three more
 facts. The person's own project does not hold this page, so the served text
@@ -955,7 +960,7 @@ carries all of it; it is rendered from one catalogue in the code, here and there
 
 <!-- questionnaire:begin -->
 FOR THE ASSISTANT (do not read this part out)
-- This text is the whole job; you need nothing else. In your first reply, in this order: say the welcome of SAY FIRST (in the person's own language, warm and plain, every point kept, nothing technical added), make THE TWO CALLS, and apply the defaults. Every call, command and path you need is written out below (see PATHS ON THIS MACHINE), so never ask him for a path or a command. If the THOR tools remember and retract are not loaded in this session yet, load them first (in Claude Code: ToolSearch with select:mcp__thor__remember,mcp__thor__retract).
+- This text is the whole job; you need nothing else. It is very long (tens of thousands of characters): read it whole with the get tool on 'first-session-questions', never with a lookup, which cuts it after about a third and leaves out what applying numbers 3 to 12 and --set-starter-rules needs. In your first reply, in this order: say the welcome of SAY FIRST (in the person's own language, warm and plain, every point kept, nothing technical added), make THE TWO CALLS, and apply the defaults. Every call, command and path you need is written out below (see PATHS ON THIS MACHINE), so never ask him for a path or a command. If the THOR tools remember and retract are not loaded in this session yet, load them first (in Claude Code: ToolSearch with select:mcp__thor__remember,mcp__thor__retract).
 - Apply the defaults NOW, in this same turn, without waiting for an answer, so nothing waits: store the Report 'owner-setup-answers' with them and retract the setup note. Never ask the same question twice and never hold up his work for an answer.
 - The welcome is ONE question over three numbered proposals, and a fourth one (a changelog, see Proposal 4) only when the project this session runs in is a git repository. Apply nothing of proposals 1 to 3 before he answers, except that meanwhile you speak the language he writes in. His answer is ONE reply: a plain "yes" (or any plain agreement) applies all the proposals he was shown; a number with a new value (for example "2 English" or "3 figure it out yourself") changes only that item; "4 no" refuses the changelog; a number he leaves out keeps its proposal. Then revise 'owner-setup-answers' with what was applied.
 - Proposal 4 (a changelog and version numbers, ONLY when the project this session runs in is a git repository; otherwise it is not shown and never mentioned): put its line in the welcome as the text under SAY FIRST says. When applied (a plain yes, or he names 4 without a no), run install --set-changelog-flow on --db <store> from inside the project; its notes then know what to do at a commit, a tag and a release. If the project has no CHANGELOG.md create it ('# Changelog' heading with an 'Unreleased' section, nothing invented); if it has no version number propose 0.1.0. On "4 no" run install --set-changelog-flow off --db <store>: it is off for that project and never raised there again. A project that gets its memory LATER is asked once on its own, as one yes or no (see item 12). Every other default is applied at once, in this same turn, and never mentioned.
@@ -976,7 +981,7 @@ FOR THE ASSISTANT (do not read this part out)
 - When THOR holds or refuses (a held end of a turn, a refused call, a reply sent back), tell the person in one short plain sentence what you are doing and that nothing is needed from them; never the jargon words (rule, falsifier, evaluation, scope, teeth, hook, MCP, collection, store).
 - A bad answer is one that works against him (for example switching off the connections and then expecting the memory to speak). Say ONCE, in one or two plain sentences, why the item exists (its 'Why' in the detail), then do what he decided. He has the final word, you never block and never nag.
 - A THOR line that says a THOR program is missing (an antivirus may have quarantined it): tell him in one plain sentence what it found and the Windows Security steps it names. You may OFFER, once and never unasked, to add a Windows Defender exclusion for the THOR program folder: say what it does and its risk (Defender stops scanning every file in that folder), that Windows shows one administrator prompt, and that saying no is fine. Only after his clear yes run the exact command the line gives (Start-Process powershell -Verb RunAs -WindowStyle Hidden, running Add-MpPreference -ExclusionPath on the folder) and check it with (Get-MpPreference).ExclusionPath. Never change any other Windows security setting.
-- A fact he tells you whose anchor you do not know (for example "staging needs the VPN" and he has not named the host): never invent a hostname, and never leave the fact unstored or ask him first. Store it with the best real anchor you do have (a file or a command it is about); when there is none, store it bound to its project (a target of kind project whose value is the project's name), with its falsifier. Never pin it yourself: with no project at all, ask him the one question whether it must come along in every conversation (name the note's id in your question), and only on his yes store it with always true and his whole answer between double quotes in because. Then offer once, in one sentence, to attach it to the hostname if he gives it, and when he does, revise that note with the target (kind host, value the hostname).
+- A fact he tells you whose anchor you do not know (for example "staging needs the VPN" and he has not named the host): never invent a hostname, and never leave the fact unstored or ask him first. Store it with the best real anchor you do have (a file or a command it is about); when there is none, in a plain subject folder (no git) store it bound to its project (a target of kind project whose value is the project's name), with its falsifier; in a code project (a git folder) a project binding alone is read only when a message names the project, so bind it to a real file the fact is about (the README, or the file it concerns) instead. Never pin it yourself: with no project at all, ask him the one question whether it must come along in every conversation (name the note's id in your question), and only on his yes store it with always true and his whole answer between double quotes in because. Then offer once, in one sentence, to attach it to the hostname if he gives it, and when he does, revise that note with the target (kind host, value the hostname).
 - "He does not want any of this" is itself a valid answer: record it as the answers and apply nothing.
 
 SAY FIRST (before anything else, in his own language, warm and plain, every point kept and nothing added; put the language he writes in where <language> stands and your proposed folder (see question 3) where <folder> stands (the proposals of THE WELCOME rules below)):

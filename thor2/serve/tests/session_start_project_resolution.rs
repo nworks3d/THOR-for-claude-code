@@ -130,7 +130,7 @@ fn a_different_projects_always_item_never_leaks_through_the_hook_channel() {
 
     let (status, stdout, _stderr) = run_hook(&db_path, workdir.path(), &payload);
     assert_eq!(status.code(), Some(0));
-    assert!(stdout.is_empty(), "repo-b's rule must never appear while resolved into repo-a's session, got: {:?}", stdout);
+    assert!(!String::from_utf8_lossy(&stdout).contains("rule-b"), "repo-b's rule must never appear while resolved into repo-a's session, got: {:?}", stdout);
 }
 
 #[test]

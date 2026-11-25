@@ -2035,11 +2035,31 @@ fn main() -> ExitCode {
     // program, memory and folder; it is only rewritten in place in the form
     // Windows can always start (on Windows without Git Bash a shell-form line
     // never runs, so the daily copy would silently stop). Nothing is added.
+    //
+    // A reinstall from another program folder also MOVES the backup's connection
+    // to this folder's backup program (same memory, same backup folder): left
+    // pointing at the old folder it would fail silently, and the copies stop.
     if let Ok(existing) = ops::backup_setup::backup_hooks_for(&settings, &db) {
-        let specs: Vec<HookSpec> =
-            existing.into_iter().map(|command| HookSpec { event: "SessionStart", matcher: None, command }).collect();
+        let here = sibling("backup").filter(|p| p.exists());
+        let specs: Vec<HookSpec> = existing
+            .into_iter()
+            .take(1)
+            .map(|command| {
+                let command = match (&here, ops::backup_setup::repo_of_command(&command)) {
+                    (Some(exe), Some(repo)) => {
+                        ops::backup_setup::hook_spec(&exe.display().to_string(), &db.display().to_string(), &repo).command
+                    }
+                    _ => command,
+                };
+                HookSpec { event: "SessionStart", matcher: None, command }
+            })
+            .collect();
         if !specs.is_empty() {
             match install_hooks(&settings, &specs) {
+                Ok(report) if report.results.iter().any(|(_, o)| *o == HookOutcome::Replaced) => {
+                    restart_because.push("the backup's connection in Claude Code's settings changed");
+                    println!("+ moved the backup's connection to this folder's backup program, so the daily copy keeps running");
+                }
                 Ok(report) if report.results.iter().any(|(_, o)| *o == HookOutcome::Upgraded) => {
                     restart_because.push("the backup's connection in Claude Code's settings changed");
                     println!("  rewrote the backup's connection in the form Windows can always start; close Claude Code completely and open it again for that to take effect");

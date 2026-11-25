@@ -2506,6 +2506,13 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                     refresh_copy: true,
                 },
             );
+            // A git folder THOR has no memory for yet says so, with the one command that fixes it.
+            if !kind.headless && !payload_is_from_a_subagent(&payload) && !copy {
+                if let Some(cwd) = session_cwd.as_deref() {
+                    let install = serve::changelog_flow::install_command();
+                    extras.extend(session_start::unregistered_repo_line(&store, cwd, folder_project.as_deref(), &install, db_path));
+                }
+            }
             // A session in a folder that belongs to no project is told to propose
             // a folder for this work and to move there (`other_project`). Not for a
             // headless session, a subagent or a read-only copy.
@@ -3289,7 +3296,7 @@ fn setup_debt(store: &EventStore) -> Option<String> {
     Some(format!(
         "[THOR] This memory was just installed and its owner has not been walked through setup \
          yet. Do this before anything else, in this same turn, so nothing waits for him: (1) read \
-         the item with lookup key 'first-session-questions' (what to say first, and a full \
+         the item 'first-session-questions' with the get tool (the whole text in one call; a lookup cuts it) (what to say first, and a full \
          numbered list that you show him ONLY if he asks what is switched on, with under it the \
          detail per item for you - what it is, why it exists, \
          what was chosen and how to say no - to use only when he asks about a number or refuses \
@@ -3404,7 +3411,7 @@ fn order_debt(db_path: &Path, payload: &Value, session_id: &str, no_record: bool
             match serve::order_earlier::claim_or_defer(&store, db_path, session_id, now, !no_record, rank) {
                 serve::order_earlier::Owns::Other { session, .. } => Some(OrderStop::Say { owner: session }),
                 serve::order_earlier::Owns::Me => Some(OrderStop::Hold(format!(
-                    "[THOR] order-earlier-work: one last setup step is still owed. The first-session text (lookup key \
+                    "[THOR] order-earlier-work: one last setup step is still owed. The first-session text (get tool, \
                      'first-session-questions', under THE TIDY STEP) says that right after the welcome the person is offered to \
                      put their earlier work with Claude in order. {what}. Only what THOR checks itself settles this: \
                      `serve inventory` finding nothing to order; `install --tidy` run after the person answered the proposal; or, \
