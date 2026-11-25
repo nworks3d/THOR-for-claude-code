@@ -49,3 +49,38 @@ fn a_folder_for_a_subject_never_warns_that_a_note_may_never_be_shown() {
         assert!(!reply.contains("never be shown"), "a subject folder is not crowded: {reply}");
     }
 }
+
+/// A memory file that cannot be written (read-only file, full disk) answers in
+/// plain words with what to tell the person, never a bare "store error".
+#[test]
+fn a_memory_file_that_cannot_be_written_says_so_plainly() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = store(dir.path(), &["demo"]);
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(work.join(".thor-project"), "demo\n").unwrap();
+    let mut mcp = Mcp::start(&db, &work);
+    let ok = mcp.call("remember", orientation("first", "demo"));
+    assert!(ok.starts_with("stored"), "fixture: {ok}");
+    drop(mcp);
+    set_read_only(&db, true);
+    let mut mcp = Mcp::start(&db, &work);
+    let reply = mcp.call("remember", orientation("second", "demo"));
+    let retract = mcp.call("retract", json!({"id": "first", "reason": "this note is wrong and was written by mistake"}));
+    let revise = mcp.call("revise", json!({"id": "first", "text": "Fact first about the garden shed, corrected."}));
+    set_read_only(&db, false);
+    for other in [&retract, &revise] {
+        assert!(other.contains("memory file cannot be written right now"), "every write says it: {other}");
+    }
+    assert!(reply.starts_with("REFUSED"), "{reply}");
+    assert!(reply.contains("memory file cannot be written right now"), "{reply}");
+    assert!(reply.contains("Tell the person in one sentence") && reply.contains("nothing was saved"), "{reply}");
+    assert!(!reply.contains("store error"), "{reply}");
+}
+
+fn set_read_only(path: &std::path::Path, on: bool) {
+    let mut perms = std::fs::metadata(path).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(on);
+    std::fs::set_permissions(path, perms).unwrap();
+}

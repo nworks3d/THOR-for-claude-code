@@ -98,6 +98,24 @@ pub fn is_held(path: &Path) -> bool {
         .any(|(d, copy)| *d == dir && !(*copy && name == thor_core::copy_mode::TELEMETRY))
 }
 
+/// Whether the memory file at `db_path` cannot be written right now: the file
+/// is marked read-only, or a one-byte test file cannot be made and removed in
+/// its folder (a read-only folder, a full disk). Never true while the folder is
+/// held read-only on purpose (a measurement run or a copy): that is not a fault.
+/// Every hold that can only be settled by a write is released while this is true.
+pub fn cannot_be_written(db_path: &Path) -> bool {
+    if is_held(db_path) || is_copy(db_path) || !db_path.exists() {
+        return false;
+    }
+    if std::fs::metadata(db_path).is_ok_and(|m| m.permissions().readonly()) {
+        return true;
+    }
+    let probe = dir_of(db_path).join(format!(".thor-write-probe-{}.tmp", std::process::id()));
+    let made = std::fs::write(&probe, b"x");
+    let _ = std::fs::remove_file(&probe);
+    made.is_err()
+}
+
 /// Write a state file beside the store - skipped, successfully, while that
 /// directory is held. ATOMIC: the text goes to a temporary file in the same
 /// folder and is then renamed over the target, so a reader (or a writer that

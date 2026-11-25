@@ -34,12 +34,30 @@ impl std::fmt::Display for WriteError {
         match self {
             WriteError::Refused(r) => write!(f, "{r}"),
             WriteError::Serialize(e) => write!(f, "could not serialize item: {e}"),
+            WriteError::Store(e) if store_cannot_be_written(e) => write!(f, "{}", UNWRITABLE_STORE_TEXT),
             WriteError::Store(e) => write!(f, "store error: {e}"),
         }
     }
 }
 
 impl std::error::Error for WriteError {}
+
+/// What a tool answers when the memory file cannot be written: plain, with what
+/// to tell the person. The first words are matched by `serve::person_line`.
+pub const UNWRITABLE_STORE_TEXT: &str = "the memory file cannot be written right now, so nothing was saved. Tell the person in one sentence: THOR's memory file or the folder it is in is read-only, or the disk is full, so nothing was saved, and THOR carries on by itself once the file can be written again. Do not retry the write until then, and do not store the note anywhere else.";
+
+/// Whether a failed append is the memory file being read-only or the disk being
+/// full (SQLite's own wording, anywhere in the error chain).
+pub fn store_cannot_be_written(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let text = cause.to_string().to_lowercase();
+        text.contains("readonly database")
+            || text.contains("read-only")
+            || text.contains("disk is full")
+            || text.contains("disk full")
+            || text.contains("no space left")
+    })
+}
 
 /// Everything that can go wrong reading an item back.
 #[derive(Debug)]

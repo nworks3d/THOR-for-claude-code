@@ -1967,6 +1967,19 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             return Some(HookOutput::Decision(serde_json::json!({ "decision": "block", "reason": reason })));
         }
 
+        // A MEMORY FILE THAT CANNOT BE WRITTEN (read-only file or folder, full disk)
+        // releases every hold below: each of them can only be settled by a write, so
+        // holding the turn would never end. One plain line says why; the holds come
+        // back by themselves once the file can be written again.
+        if !is_subagent && !copy && !no_record && serve::store_dir::cannot_be_written(db_path) {
+            let line = serve::person_line::line(serve::person_line::Hold::StoreUnwritable, serve::plan::reply_language(db_path).as_deref());
+            let text = match warn_text {
+                Some(warning) => format!("{line}\n\n{warning}"),
+                None => line.to_string(),
+            };
+            return Some(HookOutput::Warn { text });
+        }
+
         // Lane C, C2 (SPEC-ENFORCEMENT.md 2.2) - the Response Guard above had
         // no BLOCK to return (a WARN, if any, is only pending in `warn_text`
         // so far, not yet returned), so this is still the one Stop path that
