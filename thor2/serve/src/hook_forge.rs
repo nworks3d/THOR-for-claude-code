@@ -30,13 +30,24 @@ use crate::write_guard::{command_name, command_segments, SHELLS};
 
 /// A word with the spellings that hide it taken out: no quote, backtick or backslash, lower case.
 fn bare(word: &str) -> String {
-    word.chars().filter(|c| !matches!(c, '\\' | '`' | '\'' | '"')).collect::<String>().to_ascii_lowercase()
+    trim_group(&word.chars().filter(|c| !matches!(c, '\\' | '`' | '\'' | '"')).collect::<String>()).to_ascii_lowercase()
+}
+
+/// A word without the subshell and grouping punctuation around it: `(serve.exe`, `--no-record)`,
+/// `hook;`, `$(serve`, `{serve`, `hook}`. A word that is only such punctuation is empty.
+fn trim_group(word: &str) -> &str {
+    word.trim_matches(|c: char| matches!(c, '(' | ')' | '{' | '}' | ';' | ',' | '$'))
+}
+
+/// The word with its quotes taken out and the grouping punctuation trimmed, case and path kept.
+fn plain_word(word: &str) -> String {
+    let unquoted: String = word.chars().filter(|c| !matches!(c, '`' | '\'' | '"')).collect();
+    trim_group(&unquoted).to_string()
 }
 
 /// Is this word the program `serve` (a path in front and `.exe` behind are fine)?
 fn is_serve(word: &str) -> bool {
-    let unquoted: String = word.chars().filter(|c| !matches!(c, '`' | '\'' | '"')).collect();
-    command_name(&unquoted) == "serve" || command_name(&bare(word)) == "serve"
+    command_name(&plain_word(word)) == "serve" || command_name(&bare(word)) == "serve"
 }
 
 /// The subcommand of `serve` in these words: the first word that is no flag, skipping the value of
@@ -46,6 +57,9 @@ fn subcommand_of(words: &[String]) -> Option<String> {
     let mut it = flat.iter();
     while let Some(w) = it.next() {
         let w = bare(w);
+        if w.is_empty() {
+            continue;
+        }
         if w == "--db" {
             it.next();
         } else if w == "--" || w.starts_with('-') {
@@ -71,7 +85,7 @@ const PROBE_FLAGS: [&str; 6] = ["--no-record", "--diagnose", "--help", "-h", "--
 
 /// A word without the quotes, backticks and backslashes that hide it, case kept.
 fn unhidden(word: &str) -> String {
-    word.chars().filter(|c| !matches!(c, '\\' | '`' | '\'' | '"')).collect()
+    trim_group(&word.chars().filter(|c| !matches!(c, '\\' | '`' | '\'' | '"')).collect::<String>()).to_string()
 }
 
 /// Does a word among these carry one of the probe flags (the words may hold several arguments)?
@@ -119,13 +133,22 @@ fn segment_runs_the_hook(words: &[String], depth: usize) -> bool {
             return true;
         }
     }
+    // `echo "$(serve hook)"`: a command substitution inside an argument runs, whatever the program.
+    if depth < 3
+        && words.iter().filter_map(|w| w.find("$(").map(|at| &w[at + 2..])).any(|inner| command_text_runs_the_hook(inner, depth + 1))
+    {
+        return true;
+    }
     let mut via_xargs = false;
     let mut wrapped = false;
     let mut after_flag = false;
     for (i, word) in words.iter().enumerate() {
-        let unquoted: String = word.chars().filter(|c| !matches!(c, '`' | '\'' | '"')).collect();
-        let name = command_name(&unquoted);
+        let name = command_name(&plain_word(word));
         let rest = &words[i + 1..];
+        // A lone `(` or `{` that opens a group is no program.
+        if plain_word(word).is_empty() {
+            continue;
+        }
         if is_serve(word) {
             // The program that runs is THOR's own `serve`. Through `xargs` the subcommand may come
             // from standard input, so a missing or unreadable one counts.
@@ -235,6 +258,16 @@ mod tests {
             "cargo run --bin serve -- hook",
             "serve.exe --db x hook --actor probe",
             "serve.exe hook < payload.json",
+            // The same forms inside a subshell or a group, without a probe flag.
+            "( serve.exe --db x hook) > out.txt",
+            "(serve.exe --db x hook)",
+            "(echo p | serve.exe --db x hook)",
+            "(cd d && serve.exe --db x hook)",
+            "x=$(echo p | serve.exe --db x hook)",
+            "{ serve.exe --db x hook; }",
+            "( timeout 5 serve.exe --db x hook; echo done )",
+            "(echo hook | xargs serve.exe --db x)",
+            "echo \"$(serve hook)\"",
             "cargo run -p serve --release -- --db x hook",
             "timeout 5 serve.exe --db x hook",
             "timeout -s KILL 5s serve --db x hook",
@@ -282,6 +315,18 @@ mod tests {
             "serve.exe --db x hook --no-record",
             "echo {} | serve.exe --db x hook --diagnose",
             "serve.exe --db x hook --no-record --actor probe",
+            // A probe flag with subshell and grouping punctuation around it, and the commands after a
+            // pipe or `&&` inside the group, read as they are outside it.
+            "( serve.exe --db x hook --no-record) > $f",
+            "(echo p | serve.exe --db x hook --no-record)",
+            "(cd d && serve.exe --db x hook --no-record)",
+            "(serve.exe --db x hook --diagnose)",
+            "{ serve.exe --db x hook --no-record; }",
+            "x=$(echo p | serve.exe --db x hook --no-record)",
+            "( timeout 5 serve.exe --db x hook --no-record; echo done )",
+            "(serve.exe hook --help)",
+            "(serve.exe --version)",
+            "(grep serve hook)",
             "timeout 5 serve.exe --db x hook --no-record",
             "find . -exec serve.exe --db x hook --diagnose {} \\;",
             "cargo run --bin serve -- hook --no-record",
