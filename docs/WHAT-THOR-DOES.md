@@ -1046,7 +1046,13 @@ remembers per session how far it has looked, so a long conversation does not mak
   the file and what changed in it (the changed part and where it starts, secrets blanked), and the
   assistant is told to tell the owner in one sentence unless he asked for it. Every Stop looks too, so a
   change made and put back inside one session is still named at the next session start
-  (`mode-files-pending.json`). The first start only records. Not seen: a file the list does not
+  (`mode-files-pending.json`). A change made with THOR's own installer (`install --set-language`,
+  `--set-mode`, `--set-reply-rules`, `--set-helpers`, any other switch, or a plain install) is recorded
+  by the installer with the hash it wrote (`mode-files-installer.json`) and gets one neutral line
+  instead of the warning: "THOR's setting thor-mode.json was changed with install --set-language (now:
+  ...)". A later hand edit differs from that hash and gets the warning. The line names the switch and
+  does not claim the owner ran it, because an assistant can run the installer too; and a hand edit that
+  writes exactly the bytes the installer wrote reads as the installer's. The first start only records. Not seen: a file the list does not
   name, a judge command that is only a program on the search path.
 - Why: so a guard cannot be switched off by one small edit nobody sees.
 - You notice: a line at the start of a session, or a NOTE in doctor's short summary.

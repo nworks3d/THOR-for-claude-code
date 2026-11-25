@@ -276,6 +276,28 @@ fn the_reply_language_can_be_chosen_changed_and_removed_and_a_bad_code_is_refuse
 }
 
 #[test]
+fn a_switch_of_the_installer_is_named_neutrally_at_the_next_session_start_and_a_hand_edit_is_not() {
+    let fx = Fx::new();
+    let db = fx.db();
+    let mode = db.parent().unwrap().join("thor-mode.json");
+    // The first session start records what the files say.
+    assert!(serve::mode_files::session_start_lines(&db, true).is_empty());
+    // The assistant runs the installer on the owner's word.
+    let set = fx.install(&["--set-language", "en"]);
+    assert!(set.status.success(), "{}", said(&set));
+    let said_at_start = serve::mode_files::session_start_lines(&db, true);
+    assert_eq!(said_at_start.len(), 1, "{said_at_start:?}");
+    assert!(said_at_start[0].starts_with("[THOR] THOR's setting thor-mode.json was changed with install --set-language (now: "), "{said_at_start:?}");
+    assert!(!said_at_start[0].contains("did not ask"), "{said_at_start:?}");
+    assert!(serve::mode_files::session_start_lines(&db, true).is_empty(), "once");
+    // A hand edit afterwards is a warning again.
+    let text = std::fs::read_to_string(&mode).unwrap();
+    std::fs::write(&mode, text.replace("\"en\"", "\"nl\"")).unwrap();
+    let warned = serve::mode_files::changed_lines(&db).join("\n");
+    assert!(warned.contains("The setting file thor-mode.json changed") && warned.contains("did not ask for these changes"), "{warned}");
+}
+
+#[test]
 fn the_backup_hook_is_the_same_hook_in_any_path_spelling() {
     let a = ops::backup_setup::hook_spec("C:\\thor\\backup.exe", "C:\\thor\\thor.db", "C:\\thor\\backup-repo");
     let dir = tempfile::tempdir().unwrap();

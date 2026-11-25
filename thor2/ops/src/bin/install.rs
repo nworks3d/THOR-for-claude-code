@@ -1614,8 +1614,44 @@ fn uninstall_main(cli: &Cli) -> ExitCode {
     }
 }
 
+/// The switch a run of the installer is, for the one neutral line a changed setting file gets
+/// (`serve::mode_files`): `install --set-language` and its kin, else plain `install`.
+fn switch_of(cli: &Cli) -> String {
+    let switches: [(&str, bool); 15] = [
+        ("--set-mode", cli.set_mode.is_some()),
+        ("--set-plan", cli.set_plan.is_some()),
+        ("--set-weekly-check", cli.set_weekly_check.is_some()),
+        ("--set-recording", cli.set_recording.is_some()),
+        ("--set-language", cli.set_language.is_some()),
+        ("--set-helpers", cli.set_helpers.is_some()),
+        ("--set-starter-rules", cli.set_starter_rules.is_some()),
+        ("--set-changelog-flow", cli.set_changelog_flow.is_some()),
+        ("--set-connections", cli.set_connections.is_some()),
+        ("--set-git-hooks", cli.set_git_hooks.is_some()),
+        ("--set-reply-rules", cli.set_reply_rules.is_some()),
+        ("--set-temp-folder", cli.set_temp_folder.is_some()),
+        ("--set-tools-folder", cli.set_tools_folder.is_some()),
+        ("--set-backup", cli.set_backup.is_some()),
+        ("--uninstall", cli.uninstall),
+    ];
+    switches.iter().find(|(_, on)| *on).map(|(name, _)| format!("install {name}")).unwrap_or_else(|| "install".to_string())
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    // Every setting file this run writes is recorded as the installer's, so the next session start names
+    // it neutrally instead of warning about a change nobody asked for (`serve::mode_files`).
+    let switch = switch_of(&cli);
+    let db = cli.db.clone().or_else(|| default_data_dir().map(|d| thor_core::app_data::resolve(&d.join("thor.db"))));
+    let before = db.as_deref().map(serve::mode_files::snapshot);
+    let code = run(cli);
+    if let (Some(db), Some(before)) = (db.as_deref(), before.as_ref()) {
+        serve::mode_files::record_installer_change(db, &switch, before);
+    }
+    code
+}
+
+fn run(cli: Cli) -> ExitCode {
     if cli.uninstall {
         return uninstall_main(&cli);
     }
