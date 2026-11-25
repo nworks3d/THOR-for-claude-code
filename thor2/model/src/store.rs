@@ -6785,15 +6785,23 @@ pub fn evaluation_judgement_candidates(
             let item = live_by_id.get(id)?;
             let pinned = item.bindings.iter().any(|b| matches!(b, Binding::Always));
             let skipped = skipped_at.get(*id).copied().filter(|skip| *skip > last_verdict.get(id).copied().unwrap_or(0));
+            // A counting report skipped it as not judgeable and it has not fired
+            // since: nothing new to judge it by, so it waits until it fires again
+            // (otherwise the same unjudgeable item came back at every evaluation).
+            let fired_since_skip = |skip: i64| servings.get(id).is_some_and(|l| l.iter().any(|(s, _)| *s > skip));
+            if skipped.is_some_and(|skip| !fired_since_skip(skip)) {
+                return None;
+            }
             (!pinned && project_applies_to(item.project.as_deref(), project))
                 .then(|| (fired_here.contains(id), skipped, sessions.len(), id.to_string()))
         })
         .collect();
     // THE CAP: what this session saw fire first; then what no counting report
     // skipped since the item's last verdict, the most-served first; then the
-    // skipped ones, the one skipped longest ago first (a skip settles an item
-    // for one filing only, so without this the same most-served items came
-    // back at every evaluation and the rest were never reached). Ties by id so
+    // skipped ones that fired again since their skip, the one skipped longest
+    // ago first (a skipped one that did not fire since is left out above, so
+    // the same unjudgeable items do not come back at every evaluation and the
+    // rest are reached). Ties by id so
     // the list is the same on every read of the same log. The rest stay owed
     // store-wide.
     owed.sort_by(|a, b| {

@@ -308,8 +308,8 @@ most-served first, a quarter of what could be listed (at least 5 and at most 15
 per evaluation: a backlog of 20 or fewer lists 5, one of 100 lists 15), the ones
 this session saw fire ahead of the others (the start note says how many more wait;
 the next evaluation lists the next ones; a note skipped as
-not-judgeable in an earlier counting report waits behind the others until each has
-had its turn, the one skipped longest ago first). Judge only those. A pinned
+not-judgeable in an earlier counting report waits until it fires again, since
+only a new firing gives something new to judge it by). Judge only those. A pinned
 item is never on it: the owner already answered whether it belongs there by
 pinning it (it gets a re-read instead, below). Never `mark` an item that is not on your frozen list, even if it
 fired in the wrong place: a wrong-place firing off the list goes to step 7 as

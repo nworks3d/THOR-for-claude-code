@@ -1012,15 +1012,19 @@ fn counting_report_skipping_the_list(fx: &mut Fx, session: &str, id: &str) {
 
 /// FIELD TEST 2026-11-18: a not-judgeable skip settled an item for one filing
 /// only, so the same five most-served items came back at every evaluation and
-/// the rest were never reached. An item a counting report skipped since its
-/// last verdict now waits behind every owed item that was not skipped.
+/// the rest were never reached. FIELD TEST 2026-11-25: an item whose firings
+/// carry no place was skipped by every evaluation of every project and came
+/// back each time. An item a counting report skipped since its last verdict
+/// now waits until it fires again: only then is there something new to judge.
 #[test]
-fn an_item_skipped_in_a_counting_report_drops_behind_an_unskipped_one_with_fewer_sessions() {
+fn an_item_skipped_in_a_counting_report_waits_until_it_fires_again() {
     let mut fx = Fx::new();
     six_owed_rules(&mut fx);
     assert_eq!(list_for(&fx, S2), OWED[..5], "fixture sanity: the cap leaves owed-5 out");
     counting_report_skipping_the_list(&mut fx, S1, "eval-fxp-1");
-    assert_eq!(list_for(&fx, S2), [OWED[5], OWED[0], OWED[1], OWED[2], OWED[3]], "owed-5 has its turn, the skipped ones follow");
+    assert_eq!(list_for(&fx, S2), [OWED[5]], "owed-5 has its turn; the skipped ones did not fire since");
+    serve_in_sessions(&mut fx, OWED[2], "later", 1);
+    assert_eq!(list_for(&fx, S2), [OWED[5], OWED[2]], "owed-2 fired again after the skip: it is back");
 }
 
 #[test]
@@ -1041,20 +1045,19 @@ fn an_item_the_evaluating_session_saw_fire_is_still_listed_first_even_if_skipped
     counting_report_skipping_the_list(&mut fx, S1, "eval-fxp-1");
     // S2 itself is served owed-4 (skipped earlier): it has its own context now.
     fx.store.append_event(S2, S2, model::store::ASSISTANT_DELIVERY_ACTOR, EventKind::ItemServed, OWED[4], None, "{}").unwrap();
-    assert_eq!(list_for(&fx, S2)[..3], [OWED[4], OWED[5], OWED[0]]);
+    assert_eq!(list_for(&fx, S2), [OWED[4], OWED[5]], "owed-4 fired here after its skip; the other skipped ones did not fire since");
 }
 
 #[test]
-fn with_every_owed_item_skipped_the_one_skipped_longest_ago_comes_first() {
+fn with_every_owed_item_skipped_and_none_fired_since_the_list_is_empty_until_one_fires() {
     let mut fx = Fx::new();
     six_owed_rules(&mut fx);
     counting_report_skipping_the_list(&mut fx, S1, "eval-fxp-1"); // skips 0..=4
-    counting_report_skipping_the_list(&mut fx, S2, "eval-fxp-2"); // skips 5, 0, 1, 2, 3
-    assert_eq!(
-        list_for(&fx, S3),
-        [OWED[4], OWED[0], OWED[1], OWED[2], OWED[3]],
-        "owed-4 was skipped longest ago; the rest were all skipped in the second report, most-served first"
-    );
+    counting_report_skipping_the_list(&mut fx, S2, "eval-fxp-2"); // skips 5
+    assert!(list_for(&fx, S3).is_empty(), "nothing fired since its skip: nothing new to judge");
+    serve_in_sessions(&mut fx, OWED[3], "later", 1);
+    serve_in_sessions(&mut fx, OWED[1], "later", 1);
+    assert_eq!(list_for(&fx, S3), [OWED[1], OWED[3]], "the ones that fired again, most-served first");
 }
 
 // ------------------------------------------- the empty evaluation, settled by THOR

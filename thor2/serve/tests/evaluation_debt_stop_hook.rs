@@ -1950,6 +1950,12 @@ fn zeroed_project_clock_meets_the_weekly_floor() {
             for (i, days) in activity_days.iter().enumerate() {
                 served_in(&mut store, "fxp", &uuid(40 + i as u32), *days);
             }
+            // The fixture report skipped the listed item; it fires again after
+            // it (on the newest activity day, so the days of activity stay the
+            // case's own), so the evaluation still has something to judge.
+            let newest = activity_days.iter().copied().min().unwrap_or(0);
+            let at = serve::time::iso8601_from_unix(now - newest * 86_400);
+            serve::deliver::record_delivery(&mut store, &uuid(60), &uuid(60), serve::usefulness::ASSISTANT_DELIVERY_ACTOR, &at, &["owed-fxp-00".to_string()]);
         }
         seed_project_clock(&db, "fxp", 0);
         seed_own_work(&db, "fxp", &s2, 12, 0);

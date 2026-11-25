@@ -6,6 +6,7 @@ What changed in each release, newest first. The release workflow copies the sect
 
 What changed: The weekly check is quieter and more reliable, and a pin can no longer crowd out the start of a conversation. Restart Claude Code once after the update, because the part that saves and looks up notes changed.
 
+- **A note the weekly check could not judge stops coming back.** When an evaluation skips a note as not judgeable, it is not listed again until it fires somewhere new.
 - **Fewer false alarms in the weekly check.** Notes that fired somewhere without a recorded place, and another conversation's unfinished writes, are no longer listed against you. When nothing is left to judge, THOR closes the check itself.
 - **Clearer reports.** A refused call now keeps more of its text, `doctor` shows a short evaluation summary by default (use `--full` for everything), and a background test run is read correctly.
 - **Better warnings after an update.** A resumed conversation is only told to restart when its tool server really is older than the installed one.

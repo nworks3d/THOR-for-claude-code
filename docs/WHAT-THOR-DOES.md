@@ -652,7 +652,7 @@ remembers per session how far it has looked, so a long conversation does not mak
 ### C6. What happens inside an evaluation
 - What: THOR writes a start record in its log and freezes three lists: verdicts (notes that fired in this
   session, or in another session of the project, and went 10 sessions
-  without a verdict, the most-served first, a quarter of what could be listed (at least 5 and at most 15 per evaluation, and the start note says how many more wait), this session's ahead of the rest, then notes not skipped before, a note skipped as not judgeable waiting behind the others until each has had its turn; a note that
+  without a verdict, the most-served first, a quarter of what could be listed (at least 5 and at most 15 per evaluation, and the start note says how many more wait), this session's ahead of the rest, then notes not skipped before, a note skipped as not judgeable waiting until it fires again; a note that
   fired only in another session shows where and when, and can be skipped with a not-judgeable tag), a
   batch (at most 8 rules only an agent can fix) and an A4 list (at most 16 that only need to name
   their literal), plus disputes to verify (at most 8), the false-block sweep and the crowded places
