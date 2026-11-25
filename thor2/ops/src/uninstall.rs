@@ -130,10 +130,11 @@ fn read_json_object(path: &Path) -> anyhow::Result<Option<(String, Value)>> {
     Ok(Some((raw, root)))
 }
 
-/// Whether one hook entry is THOR's own, for the memory at `db`: the program
-/// is `serve` (its last word `hook`) or `backup`, and its `--db` is this
-/// memory, in any spelling of the path, in shell form or in exec form.
-fn is_thors_hook(hook: &Value, db: &str) -> bool {
+/// Whether one hook entry is THOR's own: the program is `serve` (its last
+/// word `hook`) or `backup`, in shell form or in exec form. With a `db` it
+/// must also name that memory (in any spelling of the path); with `None` it
+/// is THOR's whatever memory it names, which is what an uninstall removes.
+fn is_thors_hook(hook: &Value, db: Option<&str>) -> bool {
     if hook.get("type").and_then(Value::as_str) != Some("command") {
         return false;
     }
@@ -141,8 +142,8 @@ fn is_thors_hook(hook: &Value, db: &str) -> bool {
     let words = command_words(&line);
     let Some(program) = words.first() else { return false };
     let stem = Path::new(program).file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_lowercase();
-    let wanted = flatten_word(db);
-    let names_db = words.windows(2).any(|pair| pair[0] == "--db" && pair[1] == wanted);
+    let wanted = db.map(flatten_word);
+    let names_db = words.windows(2).any(|pair| pair[0] == "--db" && wanted.as_ref().is_none_or(|w| pair[1] == *w));
     match stem.as_str() {
         "serve" => names_db && words.last().is_some_and(|w| w == "hook"),
         "backup" => names_db,
@@ -150,27 +151,50 @@ fn is_thors_hook(hook: &Value, db: &str) -> bool {
     }
 }
 
-/// How many of THOR's hook entries for `db` the settings file holds.
-pub fn thor_hooks_in(settings: &Path, db: &Path) -> anyhow::Result<usize> {
+/// How many of THOR's hook entries the settings file holds, whatever memory
+/// each one names.
+pub fn thor_hooks_in(settings: &Path) -> anyhow::Result<usize> {
     let Some((_, root)) = read_json_object(settings)? else { return Ok(0) };
-    let db = db.display().to_string();
     let mut count = 0;
     for groups in root.get("hooks").and_then(Value::as_object).into_iter().flat_map(|h| h.values()) {
         for group in groups.as_array().into_iter().flatten() {
-            count += group.get("hooks").and_then(Value::as_array).into_iter().flatten().filter(|h| is_thors_hook(h, &db)).count();
+            count += group.get("hooks").and_then(Value::as_array).into_iter().flatten().filter(|h| is_thors_hook(h, None)).count();
         }
     }
     Ok(count)
 }
 
-/// Remove THOR's hook entries (every event) and nothing else. A group that
+/// The memories THOR's `serve ... hook` entries in the settings file name
+/// (each path as written, without repeats). One THOR per machine account: a
+/// second memory would add a second set of hooks, so the installer looks here
+/// first.
+pub fn connected_memories(settings: &Path) -> anyhow::Result<Vec<String>> {
+    let Some((_, root)) = read_json_object(settings)? else { return Ok(Vec::new()) };
+    let mut found: Vec<String> = Vec::new();
+    for groups in root.get("hooks").and_then(Value::as_object).into_iter().flat_map(|h| h.values()) {
+        for group in groups.as_array().into_iter().flatten() {
+            for hook in group.get("hooks").and_then(Value::as_array).into_iter().flatten().filter(|h| is_thors_hook(h, None)) {
+                let Some(line) = hook_command_line(hook) else { continue };
+                let words = command_words(&line);
+                if let Some(db) = words.windows(2).find(|pair| pair[0] == "--db").map(|pair| pair[1].clone()) {
+                    if !found.iter().any(|f| flatten_word(f) == flatten_word(&db)) {
+                        found.push(db);
+                    }
+                }
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// Remove THOR's hook entries (every event, whatever memory each one names)
+/// and nothing else. A group that
 /// held only THOR's entries goes; a group with anything else keeps it. The
 /// file is saved as `<name>.bak` first (only when no backup exists yet), must
 /// parse before and after, and is not rewritten at all when there is nothing
 /// to remove. Returns how many entries went.
-pub fn remove_thor_hooks(settings: &Path, db: &Path) -> anyhow::Result<usize> {
+pub fn remove_thor_hooks(settings: &Path) -> anyhow::Result<usize> {
     let Some((raw, mut root)) = read_json_object(settings)? else { return Ok(0) };
-    let db = db.display().to_string();
     let mut removed = 0;
     if let Some(events) = root.get_mut("hooks").and_then(Value::as_object_mut) {
         for groups in events.values_mut() {
@@ -180,7 +204,7 @@ pub fn remove_thor_hooks(settings: &Path, db: &Path) -> anyhow::Result<usize> {
             for (i, group) in groups.iter_mut().enumerate() {
                 if let Some(hooks) = group.get_mut("hooks").and_then(Value::as_array_mut) {
                     let before = hooks.len();
-                    hooks.retain(|h| !is_thors_hook(h, &db));
+                    hooks.retain(|h| !is_thors_hook(h, None));
                     removed += before - hooks.len();
                     if before > hooks.len() && hooks.is_empty() {
                         emptied_by_us.push(i);
@@ -249,7 +273,7 @@ pub fn phase_one(targets: &Targets, git: &dyn GitHooksPath) -> anyhow::Result<Ph
     read_json_object(&targets.settings)?;
     read_json_object(&targets.claude_json)?;
 
-    let mut report = PhaseOneReport { hooks_removed: remove_thor_hooks(&targets.settings, &targets.db)?, ..Default::default() };
+    let mut report = PhaseOneReport { hooks_removed: remove_thor_hooks(&targets.settings)?, ..Default::default() };
     report.tool_server_removed = remove_thor_tool_server(&targets.claude_json)?;
 
     if let Some(path) = targets.eval_command.as_ref().filter(|p| p.exists()) {
@@ -344,7 +368,11 @@ impl PhaseTwoReport {
             lines.push(format!("+ removed THOR's saved copy of a Claude Code settings file ({})", path.display()));
         }
         if !self.memory_deleted.is_empty() {
-            lines.push(format!("+ deleted your memory ({} item(s), as you asked)", self.memory_deleted.len()));
+            // These are files and folders, not notes: say so, never a count of notes.
+            lines.push(format!(
+                "+ deleted your memory, as you asked: the memory file and the {} other file(s) and folder(s) THOR kept beside it",
+                self.memory_deleted.len().saturating_sub(1)
+            ));
             lines.push("= kept, if you have them: THOR's safety copies (backup-repo) and your personal library (library.db)".to_string());
         }
         if let Some(path) = &self.memory_kept {
@@ -404,7 +432,7 @@ pub fn phase_two(
         running.join(", ")
     );
     anyhow::ensure!(
-        thor_hooks_in(&targets.settings, &targets.db)? == 0,
+        thor_hooks_in(&targets.settings)? == 0,
         "NOTHING WAS CHANGED: THOR is still connected to Claude Code. Run the first removal step (install --uninstall --db <memory>) before this one."
     );
 

@@ -127,8 +127,21 @@ pub fn plain_summary(db: &Path, cwd: &Path, settings: Option<&Path>, mcp_json: O
         }
     }
 
+    // What the person said no to is their choice, never a problem.
+    for choice in [crate::choices::Choice::GitHooks, crate::choices::Choice::ReplyRules] {
+        if crate::choices::is_off(db, choice) {
+            lines.push(format!(
+                "  NOTE: you chose no for {}, so it is off. Nothing is wrong; to switch it on again, ask your assistant.",
+                choice.words()
+            ));
+        }
+    }
     match settings.map(|s| hooks_name_this_memory(s, db)) {
         Some(true) => lines.push("  OK: THOR is connected to Claude Code.".to_string()),
+        _ if crate::choices::is_off(db, crate::choices::Choice::Connections) => lines.push(
+            "  OK: you chose not to connect THOR to Claude Code, so the memory does not speak up by itself. That is your choice, not a problem; to change it, ask your assistant to switch the connection on."
+                .to_string(),
+        ),
         _ => lines.push(format!(
             "  PROBLEM: Claude Code does not know about THOR yet, so the memory will not speak up. Next step: {ask}."
         )),
@@ -896,7 +909,17 @@ pub fn ship_never_recorded_line(db: &Path, task_called: &[std::path::PathBuf]) -
 /// as far as Windows lets this user read it.
 pub fn program_lines(db: &Path, settings: Option<&Path>, mcp_json: Option<&Path>, bin_dir: Option<&Path>) -> Vec<String> {
     let xml = serve::missing_programs::scheduled_tasks_xml();
-    let task_called = serve::missing_programs::task_programs(&xml, &|p| std::fs::read_to_string(p).ok());
+    let mut task_called = serve::missing_programs::task_programs(&xml, &|p| std::fs::read_to_string(p).ok());
+    // The Task Scheduler is machine-wide: only a task that points at THIS
+    // store's folder (the program lies in it, or the script names it) is this
+    // memory's, never another install's.
+    let folder = db.parent().map(|d| d.display().to_string().replace('\\', "/").to_lowercase()).unwrap_or_default();
+    task_called.retain(|program| {
+        let spelled = program.display().to_string().replace('\\', "/").to_lowercase();
+        !folder.is_empty()
+            && (spelled.starts_with(&format!("{folder}/"))
+                || std::fs::read_to_string(program).is_ok_and(|text| text.replace('\\', "/").to_lowercase().contains(&folder)))
+    });
     let gone = serve::missing_programs::find(db, settings, mcp_json, bin_dir, Some(&xml));
     let detected = if gone.is_empty() || !cfg!(windows) { Vec::new() } else { serve::missing_programs::defender_names() };
     serve::missing_programs::words_for(&gone, &detected, cfg!(windows))

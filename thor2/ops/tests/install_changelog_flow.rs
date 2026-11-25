@@ -66,11 +66,31 @@ fn git_repo(parent: &Path, name: &str) -> PathBuf {
     dir
 }
 
+/// During the very first install the welcome carries the question (proposal 4),
+/// so the installer does not tell the assistant to ask it now; no answer is
+/// recorded, so the safety net at the first commit still applies.
 #[test]
-fn the_first_registration_of_a_git_project_asks_and_a_second_run_does_not() {
+fn during_the_first_install_the_welcome_carries_the_question_and_the_installer_asks_nothing() {
     let sandbox = Sandbox::new();
     let base = tempfile::tempdir().unwrap();
     let repo = git_repo(base.path(), "demo-shop");
+
+    let first = sandbox.run(&repo, &["--no-mcp"]);
+    assert!(first.status.success(), "{}", said(&first));
+    let text = said(&first);
+    assert!(!text.contains("ONE QUESTION FOR THE PERSON") && !text.contains(QUESTION_START), "{text}");
+    assert!(text.contains("part of the welcome in the first session (proposal 4)"), "{text}");
+    assert_eq!(serve::changelog_flow::answer(&sandbox.db(), "demo-shop"), None, "no answer is made up");
+}
+
+#[test]
+fn the_first_registration_of_a_later_git_project_asks_and_a_second_run_does_not() {
+    let sandbox = Sandbox::new();
+    let base = tempfile::tempdir().unwrap();
+    let repo = git_repo(base.path(), "demo-shop");
+    // A memory whose first session is long over: no setup note waits in it.
+    std::fs::create_dir_all(sandbox.db().parent().unwrap()).unwrap();
+    ops::install::ensure_store(&sandbox.db()).unwrap();
 
     let first = sandbox.run(&repo, &["--no-mcp"]);
     assert!(first.status.success(), "{}", said(&first));

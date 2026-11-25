@@ -8,6 +8,7 @@
 
 pub mod backup_setup;
 pub mod backup_state;
+pub mod choices;
 pub mod copy_filter;
 pub mod copy_health;
 pub mod copy_setup;

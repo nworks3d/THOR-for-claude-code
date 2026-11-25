@@ -313,6 +313,49 @@ async fn the_topic_proof_note_from_agents_md_is_accepted() {
     assert_eq!(item.project.as_deref(), Some("Kitchen renovation"));
 }
 
+/// The other calls AGENTS.md shows an assistant (the host rule of the round trip,
+/// the setup answers, the bug-outcome report) go through the write gate as
+/// written, in a store that has been through the install.
+#[tokio::test]
+async fn the_other_example_calls_in_agents_md_are_accepted() {
+    let sandbox = Sandbox::new();
+    let topic = sandbox.topic("Kitchen renovation");
+    assert!(install(&topic, &sandbox, &["--topic"]).status.success());
+    let server = mcp::ThorMcpServer::new(EventStore::open_existing(&sandbox.db()).unwrap()).with_root(topic.clone());
+
+    // The text of the second call of "THE TWO CALLS", exactly as the page shows it.
+    let calls = ops::questionnaire::two_calls(None);
+    let from = calls.find("text: \"").unwrap() + "text: \"".len();
+    let setup_text = &calls[from..from + calls[from..].find("\"\n)").unwrap()];
+    let examples = [
+        serde_json::json!({
+            "id": "dev-server-needs-the-vpn",
+            "kind": "rule",
+            "text": "The staging server only answers over the VPN; without it every request just times out.",
+            "targets": [{"kind": "host", "value": "staging.example.internal"}],
+            "falsifier": "A request to staging succeeds with the VPN off."
+        }),
+        serde_json::json!({
+            "id": "owner-setup-answers",
+            "kind": "report",
+            "text": setup_text
+        }),
+        serde_json::json!({
+            "id": "thor-bug-0123456789ab",
+            "kind": "report",
+            "text": "OUTCOME for 0123456789ab (a program would not start): owner declined",
+            "tags": ["thor-bug:0123456789ab"]
+        }),
+    ];
+    for args in examples {
+        let id = args["id"].as_str().unwrap().to_string();
+        match server.apply_captured(&thor_core::inbox::InboxOp::new("remember", args)).await {
+            mcp::CapturedOutcome::Applied(said) => assert!(said.starts_with("stored "), "{id}: {said}"),
+            mcp::CapturedOutcome::NotApplied(said) => panic!("the AGENTS.md example {id} was refused: {said}"),
+        }
+    }
+}
+
 /// Doctor, run from inside the topic folder, lists its working copy as usable.
 #[test]
 fn doctor_calls_a_topic_folders_working_copy_usable() {

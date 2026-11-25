@@ -1039,7 +1039,7 @@ pub fn working_contract() -> Vec<model::item::Item> {
             "a-new-project-is-one-command",
             "Giving a folder its own memory is ONE command: run the install program from inside it, \
              naming the store and, for code, the project, or, for a plain folder, the topic \
-             option. It marks and registers the folder. Options: lookup first-session-questions. \
+             option. It marks and registers the folder. Options: lookup with key first-session-questions. \
              The owner names a project, never you.",
             "A folder set up with that one command turns out to be missing its marker, its \
              registration, its code reading or its refresh on commit.",
@@ -1220,7 +1220,7 @@ pub fn working_contract() -> Vec<model::item::Item> {
         // way for good.
         rule(
             model::store::SETUP_NOTE_ID,
-            "Setup is not finished. In your first reply, `lookup first-session-questions` is the \
+            "Setup is not finished. In your first reply, `lookup with key first-session-questions` is the \
              one place to read: the exact calls, paths and what to say. Apply the defaults at once \
              (store 'owner-setup-answers', retract this note, say the welcome). Nothing waits.",
             "This note is still being served at session start after the owner has already \
@@ -1239,7 +1239,7 @@ pub fn order_earlier_note() -> model::item::Item {
     model::item::Item {
         id: model::store::ORDER_NOTE_ID.to_string(),
         kind: model::item::Kind::Orientation,
-        text: "Last setup step: once the welcome is answered, run THE TIDY STEP of `lookup first-session-questions` (serve \
+        text: "Last setup step: once the welcome is answered, run THE TIDY STEP of `lookup with key first-session-questions` (serve \
                inventory, then a numbered proposal to order earlier work). The session is held until THOR itself finds it settled. \
                Never retract this note yourself."
             .to_string(),
@@ -1278,9 +1278,10 @@ pub fn order_earlier_note() -> model::item::Item {
 /// is about, once per context.
 ///
 /// HELPER-AGENT MODE IS NOT IN THE PACK. Its two notes (`helper_mode_notes`)
-/// are off in a new memory (the owner's decision, 2026-10-09: a helper costs a
-/// fixed start-up context and the user cannot steer it halfway, so it is not
-/// for everyone) and `install --set-helpers on` stores them.
+/// are seeded into a new memory beside the pack (it is ON since 2026-11-18;
+/// a helper costs a fixed start-up context and the user cannot steer it
+/// halfway, so `install --set-helpers off` retracts them, with the three
+/// helper notes of the starting set).
 ///
 /// SEVERITY. None carries one, like the notes in `working_contract`. A note
 /// called costly or irreversible with no check is listed by doctor as
@@ -1661,8 +1662,8 @@ pub fn set_changelog_flow(db: &Path, project: &str, on: bool) -> anyhow::Result<
 }
 
 /// The two notes that make up helper-agent mode (first-session item 6). They
-/// are NOT in `workflow_starter_pack`: the mode is off in a new memory and the
-/// user switches it on with `install --set-helpers on`, which stores exactly
+/// are NOT in `workflow_starter_pack`: the mode is on in a new memory and the
+/// user switches it off with `install --set-helpers off`; `on` stores exactly
 /// these (`set_helpers`). Bound to the Agent tool, so they arrive right before
 /// a helper is spawned. A command place holds four notes at most, so these stay
 /// two and leave room for the owner's own. The ids are listed in
@@ -1688,7 +1689,14 @@ pub fn helper_mode_notes() -> Vec<model::item::Item> {
     ]
 }
 
-/// What `set_helpers` did to one of the two helper-mode notes.
+/// The three notes of the starting set that are also about helper assistants
+/// (`questionnaire::HELPER_CONTRACT_NOTES`). They are seeded with the rest of
+/// the set; `set_helpers` switches them together with the two above.
+pub fn helper_contract_notes() -> Vec<model::item::Item> {
+    working_contract().into_iter().filter(|n| crate::questionnaire::HELPER_CONTRACT_NOTES.contains(&n.id.as_str())).collect()
+}
+
+/// What `set_helpers` did to one of the five helper notes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HelperChange {
     /// Stored for the first time.
@@ -1729,7 +1737,7 @@ pub fn set_helpers(db: &Path, on: bool) -> anyhow::Result<Vec<(String, HelperCha
     use model::store::{declare, resolve, retract, show, ReadError};
     let mut store = EventStore::open_existing(db)?;
     let mut out = Vec::new();
-    for item in helper_mode_notes() {
+    for item in helper_mode_notes().into_iter().chain(helper_contract_notes()) {
         let id = item.id.clone();
         let state = show(&store, &id);
         let change = match (on, state) {
@@ -3550,7 +3558,8 @@ mod tests {
         let on = set_helpers(&db, true).unwrap();
         assert!(on.iter().all(|(_, change)| matches!(change, HelperChange::Stored)), "{on:?}");
         let off = set_helpers(&db, false).unwrap();
-        assert_eq!(off.len(), 2);
+        // Every note about helper assistants: the two of helper-agent mode and three of the starting set.
+        assert_eq!(off.len(), 5);
         assert!(off.iter().all(|(_, change)| matches!(change, HelperChange::Retracted)), "{off:?}");
     }
 
