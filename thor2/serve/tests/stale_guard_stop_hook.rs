@@ -408,3 +408,38 @@ fn the_capture_guards_own_behavior_at_stop_is_unchanged() {
     assert_eq!(v["decision"], "block", "{out}");
     assert!(v["reason"].as_str().unwrap().contains("durable decision"), "the capture guard's own reason must still win: {out}");
 }
+
+/// A rule the assistant deliberately leaves alone holds the end of a turn in two
+/// conversations only; the third is not held, and the rule is named for doctor and
+/// the weekly check instead, until the rule changes (a revise) and holds again.
+#[test]
+fn a_rule_left_alone_holds_two_conversations_and_then_none_until_it_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let mut store = thor_core::event_store::EventStore::new(&db).unwrap();
+    declare_test_item(&mut store, "r1");
+    let now_seq = store.contiguous_tip().unwrap().0;
+    write_stale_sidecar(dir.path(), "r1", "failed", "Absent { path: \"NOTES.md\", literal: \"forbidden\" }", "NOTES.md", now_seq, 1);
+
+    for session in ["s1", "s2"] {
+        let out = run_hook(&db, &stop_payload(session));
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("{session}: expected a decision: {e}: {out}"));
+        assert_eq!(v["decision"], "block", "{session}: {out}");
+        let reason = v["reason"].as_str().unwrap();
+        assert!(reason.contains("the file NOTES.md must not contain 'forbidden'") && !reason.contains("Absent {"), "{reason}");
+    }
+    let out = run_hook(&db, &stop_payload("s3"));
+    assert!(!out.contains("\"block\"") && !out.contains("r1"), "the third conversation is not held: {out}");
+    assert_eq!(serve::stale_guard::left_alone_ids(&db), vec!["r1".to_string()], "it is listed instead");
+
+    // The rule changes; the sidecar names it stale again at the new position.
+    let existing = model::store::show(&store, "r1").unwrap();
+    let mut updated = existing.clone();
+    updated.text = "a rule that will go stale, reworded after the owner looked".to_string();
+    model::store::revise(&mut store, "s", "l", "a", &existing, &updated).unwrap();
+    let after = store.contiguous_tip().unwrap().0;
+    write_stale_sidecar(dir.path(), "r1", "failed", "Absent { path: \"NOTES.md\", literal: \"forbidden\" }", "NOTES.md", after, 2);
+    assert!(serve::stale_guard::left_alone_ids(&db).is_empty(), "a changed rule is not listed any more");
+    let out = run_hook(&db, &stop_payload("s4"));
+    assert!(out.contains("\"block\""), "a changed rule holds again: {out}");
+}

@@ -5000,6 +5000,23 @@ fn stale_guard_stop_check(
     if remaining.is_empty() {
         return None;
     }
+    // A rule that already held the turn in two other conversations, unchanged since,
+    // is left alone (listed in doctor and for the weekly check); it holds again only
+    // once the rule changes.
+    let held_path = stale_guard::default_held_path(db_path);
+    let held_text = std::fs::read_to_string(&held_path).ok();
+    let held = held_text.as_deref().map(stale_guard::read_held).unwrap_or_default();
+    let rule_seqs: std::collections::HashMap<String, i64> = remaining
+        .iter()
+        .map(|e| {
+            let last = store.get_events_by_entity(&e.id).ok().and_then(|events| events.iter().map(|ev| ev.seq).max()).unwrap_or(0);
+            (e.id.clone(), last)
+        })
+        .collect();
+    let (remaining, _left_alone) = stale_guard::split_by_holds(remaining, &held, &rule_seqs, session_id);
+    if remaining.is_empty() {
+        return None;
+    }
 
     // NOW it is true: there is outstanding rot, and this session has already
     // been told once. This is the one place left in the binary that has
@@ -5016,6 +5033,10 @@ fn stale_guard_stop_check(
     let reason = stale_guard::block_message(&remaining);
     if let Some(text) = stale_guard::mark_blocked_text(marker_text.as_deref(), session_id) {
         let _ = serve::store_dir::write(&marker_path, text);
+    }
+    let still_stale: std::collections::HashSet<String> = stale.keys().cloned().collect();
+    if let Some(text) = stale_guard::record_holds(held_text.as_deref(), &remaining, &rule_seqs, &still_stale, session_id) {
+        let _ = serve::store_dir::write(&held_path, text);
     }
 
     Some(HookOutput::Decision(serde_json::json!({

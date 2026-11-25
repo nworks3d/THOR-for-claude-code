@@ -118,6 +118,9 @@ pub fn plain_summary(db: &Path, cwd: &Path, settings: Option<&Path>, mcp_json: O
         let recent: Vec<_> = model::store::tool_unpins(&store, 0, i64::MAX)
             .into_iter()
             .filter(|u| model::store::time_near_seq(&store, u.seq).is_some_and(|at| now - at < 30 * 86_400))
+            // THOR's own setup notes are taken down by the very steps the first-session text asks for,
+            // so listing them would only show a person a warning about doing what they were told.
+            .filter(|u| u.id != model::store::SETUP_NOTE_ID && u.id != model::store::ORDER_NOTE_ID)
             .collect();
         for u in recent.iter().take(5) {
             lines.push(format!("  NOTE: {}", model::store::unpin_line(u)));
@@ -921,6 +924,22 @@ pub fn drain_refusals_line(db: &Path) -> Option<String> {
              never landed - the replica session was only told 'queued'. Each is kept in {}: read it, and write the \
              ones that still matter again from a session on this machine",
             path.display()
+        )
+    })
+}
+
+/// Rules that went stale, held the end of a turn in two conversations and were
+/// then left alone: named here, and for the weekly check to settle with a revise
+/// (the rule or its anchor moved) or a retract (it went with what it was about).
+/// Silent while there are none; a rule that changed since is not listed.
+pub fn stale_left_alone_line(db: &Path) -> Option<String> {
+    let ids = serve::stale_guard::left_alone_ids(db);
+    (!ids.is_empty()).then(|| {
+        format!(
+            "stale rules left alone: {} rule(s) could not prove themselves, were held in {} conversations and are not held again until they change: {}. Settle each in the weekly check with a revise or a retract",
+            ids.len(),
+            serve::stale_guard::MAX_HOLD_SESSIONS,
+            ids.join(", ")
         )
     })
 }
@@ -4286,6 +4305,7 @@ pub fn report(
     // Silent unless a temp-until-live or tools folder is named.
     lines.extend(work_folders_report(db).detail);
     lines.extend(drain_refusals_line(db));
+    lines.extend(stale_left_alone_line(db));
     lines.extend([
         falsifier_line(db),
         proof_line(db, full),
@@ -4385,6 +4405,7 @@ pub fn eval_report(
     lines.extend(test_signal_line(db, checkout_project));
     lines.extend(contradiction_line(db, checkouts));
     lines.extend(serve::thor_bugs::open_line(db));
+    lines.extend(stale_left_alone_line(db));
     lines
 }
 
