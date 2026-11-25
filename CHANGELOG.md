@@ -26,6 +26,7 @@ What changed: The weekly check is quieter and more reliable, and a pin can no lo
 - **A note you silenced no longer owes a verdict for ever.** A note that was marked as not belonging at every place it fired is no longer counted in the list of notes to judge, and no longer keeps the weekly check daily. If it fires somewhere new, it counts again.
 - **`doctor` names notes that exist in two versions.** Such a note is skipped everywhere, so a rule among them does nothing; doctor now lists them and says how to settle them.
 - **The weekly check says why it is daily.** The request and `doctor` now name the reason a project is on the daily rhythm.
+- **A code project is asked once about a changelog and version numbers.** When a project gets its own memory, your assistant asks one question with its two reasons: a fault is found much faster, and it saves effort and cost. On yes, THOR's notes already know the flow: a changelog line with every visible change, a changelog section before a release, small version steps, and the version read from git. On no, it is off for that project and never raised there again. It never blocks anything.
 
 ## 2.6.13 (2026-11-21)
 

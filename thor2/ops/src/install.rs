@@ -1343,15 +1343,7 @@ pub fn workflow_starter_pack_for(windows: bool) -> Vec<model::item::Item> {
         // never reach a block, so each moment is kept at four. The wording of
         // the "only when asked" note still covers committing: it is shown at
         // the push, and the agent's own defaults already ask before a commit.
-        note(
-            "changelog-with-every-user-visible-change",
-            "If the project keeps a CHANGELOG, add a line for every user-visible change in the same \
-             commit, and bump the version when releases are versioned. Create a changelog only if the owner said yes \
-             to first-session item 12; else keep what exists. Re-read the README for claims made untrue.",
-            "A user-visible change lands with no changelog line in a project that keeps one, and the \
-             next release notes still come out complete.",
-            vec![moment(Action::Commit)],
-        ),
+        changelog_commit_note(),
         note(
             "run-the-tests-before-saying-done",
             "Before you call work done, or commit or push it, run the project's own tests or build and \
@@ -1548,6 +1540,126 @@ fn starter_note(id: &str, text: &str, falsifier: &str, bindings: Vec<model::item
     }
 }
 
+/// The text the commit note carried before the changelog flow was asked per
+/// project. `set_changelog_flow` rewrites a stored note only when it still
+/// reads exactly like this: a note the owner changed is left alone.
+const OLD_CHANGELOG_COMMIT_TEXT: &str = "If the project keeps a CHANGELOG, add a line for every user-visible change in the same commit, and bump the version when releases are versioned. Create a changelog only if the owner said yes to first-session item 12; else keep what exists. Re-read the README for claims made untrue.";
+
+/// A flow note: a starter note that also carries the `changelog-flow` tag, so
+/// the notes of the flow can be told apart (and hidden in a project that said
+/// no, see `serve::changelog_flow`).
+fn flow_note(id: &str, text: &str, falsifier: &str, bindings: Vec<model::item::Binding>) -> model::item::Item {
+    let mut item = starter_note(id, text, falsifier, bindings);
+    item.tags.push(serve::changelog_flow::TAG.to_string());
+    item
+}
+
+/// The commit note of the changelog flow (point 1 of the flow, and what a
+/// project with no changelog or version yet does). It keeps the id the starter
+/// pack always had, so a store that holds the old text can be refreshed.
+pub fn changelog_commit_note() -> model::item::Item {
+    flow_note(
+        "changelog-with-every-user-visible-change",
+        "If the owner said yes to a changelog here, or the project keeps one: add a line for every change a user can see, in the same commit. No CHANGELOG.md yet: create it ('# Changelog', an 'Unreleased' section, nothing invented). No version yet: propose 0.1.0. Re-read the README for claims made untrue.",
+        "A user-visible change lands with no changelog line in a project that keeps one, and the next release notes still come out complete.",
+        vec![model::item::Binding::Moment(intent::Action::Commit)],
+    )
+}
+
+/// The three release notes of the changelog flow: what a release opens with,
+/// how versions move, and where the current version is read from. They are
+/// bound to the moments a release is made (`gh release create` is a publish)
+/// and to `git tag`, never pinned, never with a check: a place holds four
+/// notes at most and the commit and push moments are full, so they wait for
+/// the release itself. A tag or release only on the person's ask is the
+/// existing note `commit-push-deploy-only-when-asked`. Seeded in a new memory;
+/// `install --set-changelog-flow on` stores them in an older one.
+pub fn changelog_flow_notes() -> Vec<model::item::Item> {
+    use model::item::{Binding, TargetKind};
+    let release = || vec![Binding::Moment(intent::Action::Publish), Binding::Target { kind: TargetKind::Command, value: "git tag".to_string() }];
+    vec![
+        flow_note(
+            "changelog-flow-release-opens-with-what-changed",
+            "A release opens with what changed: the changelog gets a section for the new version BEFORE the version number goes up. Plain words for a user, what changed for them. Short. No internal ids, test counts or mechanism detail.",
+            "A release made with no changelog section written first is found just as easy to follow for a user.",
+            release(),
+        ),
+        flow_note(
+            "changelog-flow-versions-move-in-small-steps",
+            "Versions move in small steps: a round of work is one step in the last digit. The middle or first digit moves only on the person's own word. A new project with no version number starts at 0.1.0.",
+            "Jumping the middle or first digit on your own initiative is found as welcome as waiting for the person's word.",
+            release(),
+        ),
+        flow_note(
+            "changelog-flow-read-the-version-from-git",
+            "Before you name or raise a version number, look at what git really holds: fetch, then read the current version from the main branch, never from memory. Tag or release only when the person asks, each time.",
+            "A version number named from memory turns out right as often as one read from the main branch after a fetch.",
+            release(),
+        ),
+    ]
+}
+
+/// What `set_changelog_flow` did to one flow note.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FlowNoteChange {
+    /// Stored for the first time.
+    Stored,
+    /// Rewritten from the old starter text to the flow text.
+    Refreshed,
+    /// Already as it should be: nothing written.
+    AlreadyThere,
+    /// Left as the owner has it (changed by hand, or retracted on purpose).
+    LeftAlone(String),
+    /// The gate or the store said no.
+    Refused(String),
+}
+
+/// `install --set-changelog-flow on|off`, run from inside a project: record the
+/// answer of `project` beside the store (`serve::changelog_flow`). On `on` the
+/// flow notes are also made sure of in an existing memory: a missing one is
+/// stored, and the commit note is rewritten only when it still carries the old
+/// starter text. Every write goes through the same gate as any other note, and
+/// a second run changes nothing. `off` writes the answer only: the notes stay in
+/// the memory and are hidden in that project.
+pub fn set_changelog_flow(db: &Path, project: &str, on: bool) -> anyhow::Result<(serve::changelog_flow::Change, Vec<(String, FlowNoteChange)>)> {
+    use model::store::{declare, revise, show, ReadError};
+    let change = serve::changelog_flow::set(db, project, on).map_err(|e| anyhow::anyhow!(e))?;
+    let mut out = Vec::new();
+    if !on {
+        return Ok((change, out));
+    }
+    let mut store = EventStore::open_existing(db)?;
+    for item in std::iter::once(changelog_commit_note()).chain(changelog_flow_notes()) {
+        let id = item.id.clone();
+        let outcome = match show(&store, &id) {
+            Ok(live) if live.text == item.text => FlowNoteChange::AlreadyThere,
+            Ok(live) if live.text == OLD_CHANGELOG_COMMIT_TEXT => {
+                let mut updated = live.clone();
+                updated.text = item.text.clone();
+                updated.falsifier = item.falsifier.clone();
+                for tag in &item.tags {
+                    if !updated.tags.contains(tag) {
+                        updated.tags.push(tag.clone());
+                    }
+                }
+                match revise(&mut store, "install", "install", installer(), &live, &updated) {
+                    Ok(_) => FlowNoteChange::Refreshed,
+                    Err(e) => FlowNoteChange::Refused(e.to_string()),
+                }
+            }
+            Ok(_) => FlowNoteChange::LeftAlone("its text was changed by hand".to_string()),
+            Err(ReadError::NotFound(_)) => match declare(&mut store, "install", "install", installer(), &item) {
+                Ok(_) => FlowNoteChange::Stored,
+                Err(e) => FlowNoteChange::Refused(e.to_string()),
+            },
+            Err(ReadError::Retracted(_)) => FlowNoteChange::LeftAlone("it was retracted on purpose".to_string()),
+            Err(e) => FlowNoteChange::Refused(e.to_string()),
+        };
+        out.push((id, outcome));
+    }
+    Ok((change, out))
+}
+
 /// The two notes that make up helper-agent mode (first-session item 6). They
 /// are NOT in `workflow_starter_pack`: the mode is off in a new memory and the
 /// user switches it on with `install --set-helpers on`, which stores exactly
@@ -1691,7 +1803,7 @@ pub fn seed_working_contract_at(
     // rendered from the same catalogue as the page in AGENTS.md.
     let detected = claude_json.map(serve::plan::detect_in);
     let questions = crate::questionnaire::lookup_item_with(detected, paths);
-    for item in working_contract().into_iter().chain(workflow_starter_pack()).chain(helper_mode_notes()).chain(std::iter::once(order_earlier_note())).chain(std::iter::once(questions)) {
+    for item in working_contract().into_iter().chain(workflow_starter_pack()).chain(changelog_flow_notes()).chain(helper_mode_notes()).chain(std::iter::once(order_earlier_note())).chain(std::iter::once(questions)) {
         let id = item.id.clone();
         match model::store::declare(&mut store, "install", "install", installer(), &item) {
             Ok(_) => out.push(SeededItem { id, stored: true, refusal: None }),
@@ -3001,7 +3113,7 @@ mod tests {
 
         let seeded = seed_working_contract(&db).unwrap();
         // The notes, the starter pack and the first-session list (a lookup item).
-        assert_eq!(seeded.len(), working_contract().len() + workflow_starter_pack().len() + helper_mode_notes().len() + 2);
+        assert_eq!(seeded.len(), working_contract().len() + workflow_starter_pack().len() + changelog_flow_notes().len() + helper_mode_notes().len() + 2);
         for s in &seeded {
             assert!(s.stored, "the gate refused its own starting note {}: {:?}", s.id, s.refusal);
         }
@@ -3083,7 +3195,7 @@ mod tests {
         assert_eq!(report.store, StoreOutcome::Created);
         assert_eq!(working_contract().len(), 22, "this test's own claim of 22 starting notes is now stale");
         // 22 working-contract notes, the starter pack, and the first-session list.
-        let want = 22 + workflow_starter_pack().len() + helper_mode_notes().len() + 2;
+        let want = 22 + workflow_starter_pack().len() + changelog_flow_notes().len() + helper_mode_notes().len() + 2;
         let stored = report.seeded.iter().filter(|s| s.stored).count();
         assert_eq!(stored, want, "expected all {want} starting notes to be stored, got {stored}");
         assert_eq!(report.rulebook.outcome, RulebookOutcome::Written);
@@ -3181,7 +3293,11 @@ mod tests {
             let kind = if off_topic { model::item::Kind::Orientation } else { model::item::Kind::Rule };
             assert_eq!(item.kind, kind, "{}", item.id);
             assert!(item.project.is_none(), "{} is scoped to a project, a new user has none", item.id);
-            assert_eq!(item.tags, vec!["workflow-starter".to_string()], "{}", item.id);
+            let mut tags = vec!["workflow-starter".to_string()];
+            if serve::changelog_flow::is_flow_note(&item.id) {
+                tags.push(serve::changelog_flow::TAG.to_string());
+            }
+            assert_eq!(item.tags, tags, "{}", item.id);
             assert!(item.falsifier.is_some(), "{} names nothing that would prove it wrong", item.id);
             assert!(
                 item.text.chars().count() <= 300,
@@ -3280,7 +3396,7 @@ mod tests {
             .into_iter()
             .find(|i| i.id == "changelog-with-every-user-visible-change")
             .expect("the changelog note is part of the starter pack");
-        assert!(note.text.to_lowercase().contains("if the project keeps a changelog"), "{}", note.text);
+        assert!(note.text.to_lowercase().contains("or the project keeps one"), "{}", note.text);
         assert!(note.check.is_none(), "a project convention is never a refusal");
         assert!(note.bindings.contains(&model::item::Binding::Moment(intent::Action::Commit)));
     }

@@ -127,6 +127,9 @@ fn reaches_a_threshold(tally: &NoiseTally) -> bool {
 pub struct DecayContext {
     ever_marked_useful: HashSet<String>,
     noise: HashMap<String, NoiseTally>,
+    /// The projects that said no to the changelog flow (`changelog_flow`): its
+    /// notes are hidden there, and only there.
+    flow_off: HashSet<String>,
 }
 
 impl DecayContext {
@@ -147,7 +150,8 @@ impl DecayContext {
             }
             *tally = crate::usefulness::tally_since_last_change(store, id);
         }
-        DecayContext { ever_marked_useful, noise }
+        let flow_off = store.path().map(|db| crate::changelog_flow::off_keys(&db)).unwrap_or_default();
+        DecayContext { ever_marked_useful, noise, flow_off }
     }
 
     /// Was this item ever marked useful? Exposed so `status` can report the
@@ -161,7 +165,7 @@ impl DecayContext {
     /// default for any caller (and this module's own tests) that has no
     /// event log to fold at all yet.
     pub fn empty() -> Self {
-        DecayContext { ever_marked_useful: HashSet::new(), noise: HashMap::new() }
+        DecayContext { ever_marked_useful: HashSet::new(), noise: HashMap::new(), flow_off: HashSet::new() }
     }
 
     /// Whether this item is NEVER hidden, whatever was said about it: pinned,
@@ -224,6 +228,13 @@ impl DecayContext {
     /// other place it is still served.
     pub fn is_stale_at(&self, item: &Item, input: &ServeInput) -> bool {
         if self.is_stale(item) {
+            return true;
+        }
+        // A project that said no to the changelog flow never sees its notes.
+        if !self.flow_off.is_empty()
+            && crate::changelog_flow::is_flow_note(&item.id)
+            && input.project.as_deref().is_some_and(|p| self.flow_off.contains(&crate::changelog_flow::key_of(p)))
+        {
             return true;
         }
         if Self::is_exempt(item) {
@@ -336,7 +347,7 @@ mod tests {
     fn called_noise(id: &str, n: usize) -> DecayContext {
         let mut noise = HashMap::new();
         noise.insert(id.to_string(), NoiseTally::placeless(n));
-        DecayContext { ever_marked_useful: HashSet::new(), noise }
+        DecayContext { ever_marked_useful: HashSet::new(), noise, flow_off: HashSet::new() }
     }
 
     #[test]
@@ -360,7 +371,7 @@ mod tests {
     /// looks like. A serving count must never retire anything again.
     #[test]
     fn a_serving_count_alone_never_retires_anything() {
-        let decay = DecayContext { ever_marked_useful: HashSet::new(), noise: HashMap::new() };
+        let decay = DecayContext { ever_marked_useful: HashSet::new(), noise: HashMap::new(), flow_off: HashSet::new() };
         assert!(
             !decay.is_stale(&bound("hot-1")),
             "served constantly, never marked either way - that says nothing bad about it"
@@ -637,7 +648,7 @@ mod tests {
     fn retain_live_drops_only_the_retired_item_and_keeps_order() {
         let mut noise = HashMap::new();
         noise.insert("noisy-1".to_string(), NoiseTally::placeless(NOISE_MARKS_BEFORE_STALE));
-        let decay = DecayContext { ever_marked_useful: HashSet::new(), noise };
+        let decay = DecayContext { ever_marked_useful: HashSet::new(), noise, flow_off: HashSet::new() };
         let items = vec![ranked_from(bound("first")), ranked_from(bound("noisy-1")), ranked_from(bound("last"))];
         let ids: Vec<String> = retain_live(items, &decay).iter().map(|r| r.id.clone()).collect();
         assert_eq!(ids, vec!["first".to_string(), "last".to_string()]);

@@ -686,7 +686,8 @@ memory is never seeded, so upgrading never pushes anything into your own notes.
 
 It also gets a starter set of general work rules for coding with an assistant,
 the habits the author learnt the hard way: a changelog line with every
-user-visible change (when the project keeps one), run the tests and quote the
+user-visible change (when you said yes to the one question THOR asks a code
+project about a changelog and version numbers, with its reasons), run the tests and quote the
 real result before saying "done", never commit a secret, no force-push of a
 shared branch, check where you push, scan before anything goes public, rehearse
 a destructive step on a copy, and a few more (13 in all). Each one arrives right

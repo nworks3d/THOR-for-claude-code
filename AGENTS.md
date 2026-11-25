@@ -338,6 +338,20 @@ inside that folder, naming the memory (`--db`, the path the install printed on i
 Add `--project "<project-name>"` only when the folder is not called what they call
 the project, and only when they told you the name: you may not invent one.
 
+**A git project that gets its memory is asked one question, once.** When this run
+registers a git project for the first time, the install prints a block that starts
+`+ ONE QUESTION FOR THE PERSON`. Ask them exactly that, in their language, in your
+next reply: whether you should keep a changelog and version numbers for this project,
+with its two reasons (a fault is found much faster because you can see in which
+version it came in, and it saves effort and cost because you read the changelog
+instead of digging through the whole history). On yes, run from inside the project
+`"<the folder the install unpacked into>/install" --set-changelog-flow on --db "<their store>"`,
+create CHANGELOG.md if there is none (a `# Changelog` heading and an `Unreleased`
+section, nothing invented) and propose 0.1.0 if there is no version number. On no, run
+the same command with `off`: nothing is shown or asked there again. It is never a hard
+stop, and a folder that is not a code project (`--topic`) is never asked. A git project
+that never answered is asked again by one line at its first commit of a session.
+
 **A name that differs only in case, spaces or hyphens is the same project.** The
 installer, the hooks and the tool server resolve a folder to the spelling the
 memory already has ("Acme tool tracking" and "Acme-tool-tracking" are one
@@ -926,7 +940,7 @@ FOR THE ASSISTANT (do not read this part out)
 - The detail per item is yours: state an item's Why once, only when he asks about a number ("why 7") or refuses it, in one or two plain sentences, then do what he decided. If he asks and has not refused, add how to say no.
 - Anything he does not mention keeps the default. Item 6 (helper assistants) is on by default (a new memory stores its two notes) and is never mentioned in the first reply: when he says "helpers off" run install --set-helpers off --db <store> and tell him it is off.
 - Item 10 (backups) is off until he accepts proposal 1 of the welcome; a place he names (a folder or an address) is install --set-backup <place> --db <store>.
-- Item 12 (changelog): only in a project that is a git repository and has no CHANGELOG.md, create CHANGELOG.md in the project this session runs in (a '# Changelog' heading with an 'Unreleased' section, nothing invented) and keep a version number only if the project already has one or he asks for one; do not mention it in the first reply. In a folder that is not a git repository create no CHANGELOG.md and never mention one. If he says no, create nothing and do not ask again.
+- Item 12 (changelog and version numbers): not in the first reply, and not a default you apply. When a git project gets its own memory, the installer prints one question (and THOR hands it again at the first commit of a project with no answer, once per session): ask it ONCE, in his language, with its two reasons, as the printed block words it. On yes run install --set-changelog-flow on --db <store> from inside the project; its notes then know what to do at a commit, a tag and a release. If the project has no CHANGELOG.md create it ('# Changelog' heading with an 'Unreleased' section, nothing invented); if it has no version number propose 0.1.0. On no run install --set-changelog-flow off --db <store>: it is off for that project and never raised there again. Never a hard stop. In a folder that is not a git repository create no CHANGELOG.md and never mention one, and never ask.
 - When he answers, apply each number where it belongs, then REVISE 'owner-setup-answers' (never store a second copy): 1 install --set-plan; 2 remove only THOR's four hook entries from the settings file (item 2 below says which and what stays), then tell him it takes effect after he restarts Claude Code (to switch them back on, run the installer again with `install --db <store>`: it wires the four entries again, a second run changes nothing, and a restart of Claude Code is needed again); 3 git config --global --unset core.hooksPath (turns off all of it), or only the video and size check: git config --global thor.mediagate.enabled false; 4 install --set-weekly-check off|on; 5 retract the named notes (a retracted note stops arriving; a note whose refusing check bites, such as windowless-processes-on-windows or scheduled-task-not-interactive once THOR has tried it, is refused at the retract, so first clear its check with mcp__thor__revise(id, clear_check: true, because: <why, 20+ characters>) and then retract it); 6 install --set-helpers on|off --db <store> (on stores the two helper notes, off retracts them; running it again changes nothing); 7 install --set-mode off (or release); 8 the language: install --set-language <code>|off --db <store> (nl, en, de, fr or es; an unknown code is refused with the list), and for the reply rules the reply file beside the store (guard-response-rulebook.json); 9 install --topic, run from inside the folder; 10 install --set-backup local|<folder or address>|off --db <store> (it makes the git folder, adds a named place as the remote 'nas', connects one session-start backup and makes a first copy to prove it works: tell him that result in plain words, and if it failed say so and why); 11 install --set-recording on|off --db <store>; 12 CHANGELOG.md as above.
 - Off-topic work gets its own session: the starter note off-topic-work-gets-its-own-session says when to propose one, and a line from THOR saying that a message is about another project, or that this session runs in a folder of no project, means the same. Propose it in one plain sentence; on a yes, make the folder (inside Documents, named after the subject), run install --topic --db <store> from inside it, and then, when you have these tools (Claude desktop app), move the conversation there exactly as described under proposal 3 (request_directory, change_directory, set_session_title, and the check at the first tool call of the next turn). Move and rename this session when it has no work of its own yet; otherwise prepare a new one with mcp__ccd_session__spawn_task (cwd and title) and tell the person in one plain sentence to click the card. When you do not have these tools, give plain click steps. The person types nothing. A conversation in the app's temporary place (no folder chosen) belongs to no project, so nothing said there is kept under a project: THOR then names the project folders it knows in a line at the start and at the first message of a resumed conversation, and holds the end of its first turn once. Pick the folder this conversation's work belongs to from that list (or propose a new subject folder inside Documents), ask the person only yes or no in one plain sentence, and on yes move or prepare the conversation as above.
 - When THOR holds or refuses (a held end of a turn, a refused call, a reply sent back), tell the person in one short plain sentence what you are doing and that nothing is needed from them; never the jargon words (rule, falsifier, evaluation, scope, teeth, hook, MCP, collection, store).
@@ -984,7 +998,7 @@ Nothing here waits for you: ask me about any number and I explain it, say no to 
 9. Folders for a subject: an ordinary folder without code, such as recipes or travel plans, can get a memory of its own. Just tell me which folder. Now: none yet.
 10. Safety copy: NOTHING is backed up until you choose. You can choose a copy on this machine. Or a place you name: a network drive (a NAS), another computer or a private online storage place. Or none. Now: none yet.
 11. Record of my work: for 30 days, only on this machine, THOR keeps the instructions I carried out and my answers. Passwords and secret codes are hidden. This helps to find its own rules that wrongly stop normal work. Now: on.
-12. Change log: in a software project that has none, I create CHANGELOG.md, a file that lists each change, and keep it up to date. If you say no, I do not create it. Now: yes, in such projects.
+12. Change log: for a new code project I ask you once if I keep a CHANGELOG.md and version numbers, and why. Never a hard stop. Now: asked once per code project.
 
 Answer by number (for example "1 yes, 3 no, 10 local"), ask "why 7" about any number, or say "defaults" to accept all of it; you can change any of it later just by asking.
 
@@ -1057,10 +1071,10 @@ DETAIL PER ITEM (for the assistant: state an item's Why once, only when he asks 
    To say no: I switch it off (install --set-recording off): nothing new is recorded and the check for wrongly blocking rules then says it has no data; what was already recorded disappears by itself after 30 days.
 
 12. A changelog and version number
-   What it is: A changelog is a file, CHANGELOG.md, with one line for every change you can see, and a version number says which state of the project is running. Only in a project that is a git repository and has none do I create the file and add a line with each change from then on; a project that already keeps one is left as it is, and a folder that is not a git repository gets none.
-   Why it exists: Every later session, and you, know exactly what changed and which version runs, without digging through history.
-   What I chose: Yes, in a git project that has none.
-   To say no: Then I create no file and do not ask again; the starter work rule about changelogs (item 5) stays, and it only applies to a project that keeps one.
+   What it is: A changelog is a file, CHANGELOG.md, with one line for every change you can see, and a version number says which state of the project is running. When a code project (a git folder) gets its own memory I ask the person this ONE question, once, with its two reasons: "Shall I keep a changelog and version numbers for this project? Two reasons: a fault is found much faster, because you can see in which version it came in, and it saves effort and cost, because I read the changelog instead of digging through the whole history. Just say yes or no." The installer prints the question when it registers the project, and THOR hands it once per session at the first commit of a project with no answer yet. The answer is kept per project with install --set-changelog-flow on|off --db <store>, run from inside the project. On yes, the notes that know the flow are already there (changelog-with-every-user-visible-change, changelog-flow-release-opens-with-what-changed, changelog-flow-versions-move-in-small-steps, changelog-flow-read-the-version-from-git): a changelog line with every visible change in the same commit, a release opens with a changelog section before the version number goes up, versions move in small steps, the current version is read from git, and a tag or release only when asked. If the project has no CHANGELOG.md I create it ('# Changelog' and an 'Unreleased' section, nothing invented), and if it has no version number I propose 0.1.0. A folder that is not a code project is never asked.
+   Why it exists: Two reasons: a fault is found much faster when you can see in which version it came in, and it saves effort and cost, because I read the changelog instead of digging through the whole history.
+   What I chose: Asked once per code project; nothing is switched on or off until you answer.
+   To say no: Say no and I run install --set-changelog-flow off --db <store> from inside that project: the flow notes are not shown there and the question is never raised there again. It is never a hard stop, and no other project is affected; to switch it on later, install --set-changelog-flow on --db <store>.
 <!-- questionnaire:end -->
 
 ## The starter set of work rules
@@ -1077,10 +1091,10 @@ remove any of them on request; to remove one, `retract` it with a reason (a note
 
 Before a commit or a push:
 
-- `changelog-with-every-user-visible-change` - if the project keeps a CHANGELOG, a
-  line for every user-visible change in the same commit, and a version bump when it
-  versions releases. A changelog is created only when the owner said yes to first-session
-  item 12; otherwise any changelog the project already has is kept.
+- `changelog-with-every-user-visible-change` - when the owner said yes to the changelog
+  flow for this project (or it already keeps a CHANGELOG), a line for every change a user
+  can see, in the same commit; no changelog yet: create it; no version yet: propose 0.1.0.
+  The changelog flow is asked ONCE per code project, see "The changelog flow" below.
 - `run-the-tests-before-saying-done` - run the project's own tests or build and
   quote the real result line; never skip a hook with `--no-verify`.
 - `never-commit-a-secret` - real values in a gitignored file, a tracked template
@@ -1093,6 +1107,19 @@ Before a commit or a push:
   release state comes from git, never from memory.
 - `scan-before-it-goes-public` - zero hits for secrets, usernames, local paths and
   private hostnames on every push to a public repository.
+
+The changelog flow (three more notes, tagged `changelog-flow` like the commit note
+above; they are stored in a new memory, and in an older one when the person says yes;
+none is pinned and none refuses anything). They arrive at a release, a tag or a publish:
+
+- `changelog-flow-release-opens-with-what-changed` - the changelog gets a section for the
+  new version BEFORE the version number goes up, in plain words for a user.
+- `changelog-flow-versions-move-in-small-steps` - a round of work is one step in the last
+  digit; the middle or first digit only on the person's own word; a new project starts at 0.1.0.
+- `changelog-flow-read-the-version-from-git` - fetch, then read the current version from
+  the main branch, never from memory; tag or release only when the person asks.
+
+A project that said no to the question does not see any of these four notes.
 
 Around a risky step or a tool:
 
