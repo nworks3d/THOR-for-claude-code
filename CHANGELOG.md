@@ -17,6 +17,10 @@ What changed: The weekly check is quieter and more reliable, and a pin can no lo
 - **You can change a rule that needs your go from any conversation.** The refusal now says how: you ask for it in your own message and the assistant repeats the change with your whole message quoted. THOR checks the quote against what you typed and refuses a loosening without it.
 - **Notes now arrive when a script holds the host or tool they are about.** A command that runs a script file used to miss a note tied to a host or an MCP tool the script uses, because the command line named neither. THOR now reads that script, offers the note marked as reached through the script (after the ones the command itself reaches, at most two), and the weekly check also lists a host that too many notes are tied to.
 - **The weekly check goes back to once a week when nothing is left open.** On Max it used to stay daily for ever, because it counted what the last check started with. It now counts only what that check left undone, and the owner's own open points no longer keep it daily.
+- **A note can no longer be stored under the name of an existing rule.** Before, that split the rule in two, and the new half could let through a call the rule had refused. Now the write is refused and says to change the existing note instead.
+- **A few calls that only looked harmless no longer slip past a rule.** A word like `-n` or `-WhatIf` handed to a program as a value, for example `git push -o -n`, used to make the whole call count as "does nothing".
+- **Rules on files also guard a multi-part edit.** A change that a rule refused as one edit was let through when it came as several edits in one call. A path written with `..` in it, and a protected file name in capitals, are now recognised as well.
+- **The notes beside the memory stay whole when many conversations end at once.** They are written in one piece and no longer lose an update or end up with extra text behind them, and a file that cannot be read is kept as it is instead of being emptied.
 
 ## 2.6.13 (2026-11-21)
 

@@ -952,8 +952,21 @@ fn declare_gated(
         body = body_with_root_machine(&body, root, at, machine).map_err(WriteError::Serialize)?;
     }
     store
-        .append_event(session_id, lineage_id, actor, EventKind::FactCreated, &item.id, None, &body)
-        .map_err(WriteError::Store)
+        .append_created_unless_live(session_id, lineage_id, actor, &item.id, &body)
+        .map_err(|e| match e.downcast::<thor_core::event_store::MutateConflict>() {
+            Ok(_) => WriteError::Refused(id_in_use_refusal(&item.id)),
+            Err(e) => WriteError::Store(e),
+        })
+}
+
+/// The refusal for a remember whose id already carries a live item: storing it
+/// would be a second head, which diverges the item and sidesteps every gate a
+/// revise passes.
+fn id_in_use_refusal(id: &str) -> Refusal {
+    Refusal {
+        problem: format!("the id '{id}' is already in use by a live item, and a second item under it would split it in two"),
+        fix: format!("use revise to change '{id}', or pick another id for this new note"),
+    }
 }
 
 /// Validate a revise (everything `declare` requires, plus no field the
@@ -10751,6 +10764,67 @@ mod tests {
         let err = declare(&mut store, "s1", "l1", "test", &item).unwrap_err();
         assert!(matches!(err, WriteError::Refused(_)));
         assert!(store.get_all_events().unwrap().is_empty(), "a refused declare must write nothing");
+    }
+
+    /// A remember under the id of a live item would be stored as a second head
+    /// of it: the item diverges, and every gate a revise passes is sidestepped.
+    #[test]
+    fn declare_under_the_id_of_a_live_item_is_refused_and_writes_nothing() {
+        let mut store = EventStore::in_memory().unwrap();
+        let item = sample();
+        declare(&mut store, "s1", "l1", "test", &item).unwrap();
+        let before = store.get_all_events().unwrap().len();
+
+        let other = sample_with(&item.id, "a completely different statement about the build output folder");
+        let err = declare(&mut store, "s1", "l1", "test", &other).unwrap_err();
+        match err {
+            WriteError::Refused(refusal) => {
+                assert!(refusal.problem.contains("already in use"), "{}", refusal.problem);
+                assert!(refusal.fix.contains("revise"), "{}", refusal.fix);
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert_eq!(store.get_all_events().unwrap().len(), before, "a refused declare must write nothing");
+        assert_eq!(show(&store, &item.id).unwrap(), item, "the live item is untouched and still readable");
+    }
+
+    #[test]
+    fn declare_under_a_retracted_id_still_works() {
+        let mut store = EventStore::in_memory().unwrap();
+        let item = sample();
+        declare(&mut store, "s1", "l1", "test", &item).unwrap();
+        retract(&mut store, "s1", "l1", "test", &item.id, "config/app.toml is gone, the fixture note is obsolete", None).unwrap();
+        assert!(matches!(show(&store, &item.id), Err(ReadError::Retracted(_))));
+
+        let again = sample_with(&item.id, "a completely different statement about the build output folder");
+        declare(&mut store, "s1", "l1", "test", &again).expect("a retracted id may be stored again");
+    }
+
+    #[test]
+    fn two_writers_declaring_one_new_id_at_once_give_one_item() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("race.db");
+        drop(EventStore::new(&db).unwrap());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = ["the first statement about the cache folder", "the second statement about the log folder"]
+            .into_iter()
+            .map(|text| {
+                let db = db.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let mut store = EventStore::new(&db).unwrap();
+                    let item = sample_with("raced-id", text);
+                    barrier.wait();
+                    declare(&mut store, "s1", "l1", "test", &item).is_ok()
+                })
+            })
+            .collect();
+        let wins = handles.into_iter().map(|h| h.join().unwrap()).filter(|won| *won).count();
+        assert_eq!(wins, 1, "exactly one writer may create the id");
+        let store = EventStore::new(&db).unwrap();
+        let heads = compute_head_sets(&store.get_events_by_entity("raced-id").unwrap());
+        assert_eq!(heads["raced-id"].heads.len(), 1, "one item, not two heads");
+        assert!(show(&store, "raced-id").is_ok());
     }
 
     #[test]

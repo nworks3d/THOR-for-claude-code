@@ -401,6 +401,12 @@ pub fn owner_go_recorded(db: &Path, id: &str, because: &str, session: Option<&st
     })
 }
 
+/// Whether `text` (a path, or a whole command) names the record file, with no
+/// regard to case: on Windows `UNPIN-OWNER-GO.JSON` is the same file.
+fn names_protected_file(text: &str) -> bool {
+    text.to_ascii_lowercase().contains(&PROTECTED_FILE.to_ascii_lowercase())
+}
+
 /// The hook's refusal of any Edit, Write or shell call that names the record file
 /// (the same style as the other files THOR protects: a plain sentence, nothing
 /// written). `None` for every other call. Not airtight (a name can be built up in a
@@ -410,8 +416,8 @@ pub fn protected_file_refusal(tool_name: &str, tool_input: Option<&serde_json::V
     let names_it = match tool_name {
         "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => ["file_path", "notebook_path", "path"]
             .iter()
-            .any(|k| input.get(k).and_then(|v| v.as_str()).is_some_and(|p| p.contains(PROTECTED_FILE))),
-        "Bash" | "PowerShell" => input.get("command").and_then(|v| v.as_str()).is_some_and(|c| c.contains(PROTECTED_FILE)),
+            .any(|k| input.get(k).and_then(|v| v.as_str()).is_some_and(names_protected_file)),
+        "Bash" | "PowerShell" => input.get("command").and_then(|v| v.as_str()).is_some_and(names_protected_file),
         _ => false,
     };
     names_it.then(|| {
@@ -434,6 +440,20 @@ mod tests {
             ("ok".to_string(), "Zal ik de notitie pinned-n2 loskoppelen?".to_string()),
             ("ok".to_string(), "Zal ik de tests nu draaien?".to_string()),
         ]
+    }
+
+    #[test]
+    fn the_protected_file_is_protected_whatever_its_case() {
+        for name in ["unpin-owner-go.json", "UNPIN-OWNER-GO.JSON", "Unpin-Owner-Go.Json"] {
+            for tool in ["Write", "Edit", "MultiEdit", "NotebookEdit"] {
+                let input = serde_json::json!({ "file_path": format!("C:/data/store/{name}") });
+                assert!(protected_file_refusal(tool, Some(&input)).is_some(), "{tool} on {name}");
+            }
+            let command = serde_json::json!({ "command": format!("echo [] > store/{name}") });
+            assert!(protected_file_refusal("Bash", Some(&command)).is_some(), "Bash on {name}");
+        }
+        let other = serde_json::json!({ "file_path": "C:/data/store/notes.json" });
+        assert!(protected_file_refusal("Write", Some(&other)).is_none());
     }
 
     #[test]

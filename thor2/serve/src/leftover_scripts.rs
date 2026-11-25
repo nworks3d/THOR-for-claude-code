@@ -106,45 +106,10 @@ fn write_book(db: &Path, book: &Book) {
 
 /// The lock file beside the note file.
 const LOCK_FILE: &str = "leftover-scripts.lock";
-/// How long a change waits for the lock before it goes on without.
-const LOCK_WAIT: Duration = Duration::from_secs(1);
-/// A lock older than this was left by a hook that died.
-const LOCK_STALE: Duration = Duration::from_secs(10);
 
-/// The lock, released (the file removed) when dropped. `None` inside means
-/// none was taken: a copy of the memory, or a lock that stayed taken.
-struct BookLock(Option<PathBuf>);
-
-impl Drop for BookLock {
-    fn drop(&mut self) {
-        if let Some(path) = &self.0 {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-}
-
-/// Wait for the lock for up to `LOCK_WAIT`, then go on without it: a hook that
-/// is slow or a lock that is stuck must never hold a tool call or a turn end.
-fn lock_book(db: &Path) -> BookLock {
-    let path = db.parent().unwrap_or_else(|| Path::new(".")).join(LOCK_FILE);
-    if store_dir::is_held(&path) {
-        return BookLock(None);
-    }
-    let started = std::time::Instant::now();
-    loop {
-        if std::fs::OpenOptions::new().write(true).create_new(true).open(&path).is_ok() {
-            return BookLock(Some(path));
-        }
-        let stale = std::fs::metadata(&path).and_then(|m| m.modified()).ok().and_then(|at| at.elapsed().ok()).is_some_and(|age| age > LOCK_STALE);
-        if stale {
-            let _ = std::fs::remove_file(&path);
-            continue;
-        }
-        if started.elapsed() > LOCK_WAIT {
-            return BookLock(None);
-        }
-        std::thread::sleep(Duration::from_millis(15));
-    }
+/// The note file's lock (`store_dir::lock`).
+fn lock_book(db: &Path) -> store_dir::FileLock {
+    store_dir::lock(&db.parent().unwrap_or_else(|| Path::new(".")).join(LOCK_FILE))
 }
 
 // ------------------------------------------------------------ comparing paths

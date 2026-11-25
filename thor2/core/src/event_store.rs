@@ -1808,6 +1808,47 @@ impl EventStore {
         Ok(event)
     }
 
+    /// Append a fact_created for an entity that has NO live head yet, under the
+    /// same immediate write lock that reads the heads: a second `remember` of an
+    /// id that already carries a live (not retracted) head would otherwise be
+    /// stored as a SECOND head and diverge the item. An entity that is unknown,
+    /// or whose every head is a retraction, is accepted as before (the
+    /// installer stores a retracted note again and then resolves it). On
+    /// conflict nothing is written and a typed MutateConflict names the heads.
+    pub fn append_created_unless_live(
+        &mut self,
+        session_id: &str,
+        lineage_id: &str,
+        actor: &str,
+        entity_id: &str,
+        body: &str,
+    ) -> anyhow::Result<Event> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let events = query_events_by_entity(&tx, entity_id)?;
+        let head_sets = crate::cas::compute_head_sets(&events);
+        if let Some(head_set) = head_sets.get(entity_id) {
+            let live = events
+                .iter()
+                .any(|e| head_set.heads.contains(&e.this_hash) && !matches!(e.kind, EventKind::FactRetracted));
+            if live {
+                let mut heads: Vec<String> = head_set.heads.iter().cloned().collect();
+                heads.sort();
+                return Err(MutateConflict {
+                    entity_id: entity_id.to_string(),
+                    reason: "id already in use by a live item".to_string(),
+                    current_heads: heads,
+                }
+                .into());
+            }
+        }
+        let event =
+            insert_event(&tx, session_id, lineage_id, actor, EventKind::FactCreated, entity_id, None, body)?;
+        tx.commit()?;
+        Ok(event)
+    }
+
     pub fn get_event_by_uuid(&self, event_uuid: &str) -> SqlResult<Option<Event>> {
         let mut stmt = self
             .conn

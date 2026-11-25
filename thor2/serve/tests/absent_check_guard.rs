@@ -619,3 +619,52 @@ fn a_contains_refusal_says_how_to_go_on_when_the_removal_is_wanted() {
     assert!(reason.contains("retract it"), "{reason}");
     assert!(reason.contains("never keep the text in a comment"), "{reason}");
 }
+
+fn multi_edit_payload(session_id: &str, cwd: &Path, file_path: &str, edits: serde_json::Value) -> String {
+    serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": session_id,
+        "cwd": cwd.to_string_lossy(),
+        "tool_name": "MultiEdit",
+        "tool_input": { "file_path": file_path, "edits": edits },
+    })
+    .to_string()
+}
+
+/// Attack of 2026-11-25: the Edit a rule refused went through as a MultiEdit.
+#[test]
+fn a_multi_edit_introducing_an_em_dash_is_blocked_like_the_same_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fixture_with_em_dash_rule(dir.path());
+    let notes = dir.path().join("NOTES.md");
+
+    let edit = run_hook(&db, &edit_payload("s1", dir.path(), &notes, "# notes", "# notes \u{2014} here"));
+    assert!(edit.contains("\"block\""), "the plain Edit is refused: {edit}");
+
+    let edits = serde_json::json!([
+        { "old_string": "# notes", "new_string": "# my notes" },
+        { "old_string": "my", "new_string": "my \u{2014}" },
+    ]);
+    let multi = run_hook(&db, &multi_edit_payload("s2", dir.path(), &notes.to_string_lossy(), edits));
+    let v: serde_json::Value = serde_json::from_str(&multi).unwrap_or_else(|e| panic!("expected a decision JSON: {e}: {multi}"));
+    assert_eq!(v["decision"], "block", "{multi}");
+    assert!(v["reason"].as_str().unwrap().contains("no-em-dash-in-notes"), "{multi}");
+
+    let fine = serde_json::json!([{ "old_string": "# notes", "new_string": "# my notes" }]);
+    assert_not_blocked(&run_hook(&db, &multi_edit_payload("s3", dir.path(), &notes.to_string_lossy(), fine)));
+}
+
+/// A path that goes round the houses (`sub/../NOTES.md`) is the same file.
+#[test]
+fn a_path_with_dot_dot_segments_reaches_the_same_rule() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fixture_with_em_dash_rule(dir.path());
+    std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+    let detour = format!("{}/sub/../NOTES.md", dir.path().to_string_lossy().replace('\\', "/"));
+
+    let out = run_hook(&db, &write_payload("s1", dir.path(), Path::new(&detour), "a line with an em dash \u{2014} right here"));
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("expected a decision JSON: {e}: {out}"));
+    assert_eq!(v["decision"], "block", "{out}");
+    let relative = run_hook(&db, &write_payload("s2", dir.path(), Path::new("sub/../NOTES.md"), "an em dash \u{2014} too"));
+    assert!(relative.contains("\"block\""), "relative detour: {relative}");
+}

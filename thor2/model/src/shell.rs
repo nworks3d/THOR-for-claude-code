@@ -2633,8 +2633,10 @@ fn asks_for_help_first(anchor: &str, seg: &Segment) -> bool {
 /// before a bare `--`), is a pure
 /// help or version call (`is_pure_help_call`), is a `git push` that is a
 /// dry run (`--dry-run`, or `-n`, which means the same for push and only for
-/// push - `git commit -n` skips hooks), or carries PowerShell's `-WhatIf`
-/// (not `-WhatIf:$false`, which forces the action). A forbidden, requires
+/// push - `git commit -n` skips hooks, and never right after an option that
+/// takes a value, as in `git push -o -n`), or is a PowerShell cmdlet call that
+/// carries `-WhatIf` (not `-WhatIf:$false`, which forces the action; and not
+/// for `git`, `gh` or any other program, where it is only a word). A forbidden, requires
 /// or owner-approval rule never refuses such a segment: nothing it forbids
 /// or demands an answer for happens. A flat segment (a call too large to be
 /// read in full) is never inert.
@@ -2647,16 +2649,58 @@ pub fn is_inert_call(anchor: &str, seg: &Segment) -> bool {
     }
     let before_end = |words: &[String]| -> Vec<String> { words.iter().take_while(|w| *w != "--").cloned().collect() };
     let words = before_end(&seg.words);
-    if words.iter().any(|w| w.eq_ignore_ascii_case("-whatif") || w.eq_ignore_ascii_case("-whatif:$true")) {
+    let head = before_end(&seg.head);
+    if head.first().is_some_and(|w| is_cmdlet_name(w)) && has_what_if_flag(&words) {
         return true;
     }
     if asks_for_help_first(anchor, seg) {
         return true;
     }
-    let head = before_end(&seg.head);
     head.first().is_some_and(|w| w.eq_ignore_ascii_case("git"))
         && head.get(1).map(String::as_str) == Some("push")
-        && head[2..].iter().any(|w| w == "--dry-run" || w == "-n")
+        && has_push_dry_run_flag(&head[2..])
+}
+
+/// Whether `word` is spelled as a PowerShell cmdlet (Verb-Noun, such as
+/// `Remove-Item`): the only kind of command whose `-WhatIf` is a dry run. A
+/// program like `git` or `gh` has no such flag, so there it is just a word.
+fn is_cmdlet_name(word: &str) -> bool {
+    let mut parts = word.split('-');
+    let (Some(verb), Some(noun), None) = (parts.next(), parts.next(), parts.next()) else { return false };
+    let plain = |p: &str| p.len() >= 2 && p.chars().all(|c| c.is_ascii_alphabetic());
+    plain(verb) && plain(noun)
+}
+
+/// PowerShell parameters whose value may be any word, `-WhatIf` included.
+const WHAT_IF_VALUE_PARAMS: &[&str] = &["-argumentlist", "-args", "-value", "-message", "-command", "-inputobject"];
+
+/// A word that is `-WhatIf` as a flag of its own (not `-WhatIf:$false`), and
+/// not the value of a parameter that takes a free-form value.
+fn has_what_if_flag(words: &[String]) -> bool {
+    words.iter().enumerate().any(|(i, w)| {
+        let is_flag = w.eq_ignore_ascii_case("-whatif") || w.eq_ignore_ascii_case("-whatif:$true");
+        let is_value = i > 0 && WHAT_IF_VALUE_PARAMS.contains(&words[i - 1].to_ascii_lowercase().as_str());
+        is_flag && !is_value
+    })
+}
+
+/// `git push` options that take the next word as their value, so that word is
+/// never a flag of the push itself (`-o -n` hands `-n` to the server).
+const PUSH_VALUE_OPTIONS: &[&str] = &["-o", "--push-option", "--receive-pack", "--exec", "--repo", "-c", "--upload-pack"];
+
+/// `--dry-run` or `-n` as a flag of the push itself, not as the value of an
+/// option that takes one. `after_push` holds the words after `git push`.
+fn has_push_dry_run_flag(after_push: &[String]) -> bool {
+    let mut words = after_push.iter();
+    while let Some(w) = words.next() {
+        if w == "--dry-run" || w == "-n" {
+            return true;
+        }
+        if PUSH_VALUE_OPTIONS.contains(&w.as_str()) {
+            words.next();
+        }
+    }
+    false
 }
 
 /// The environment variables the segments before segment `before` set for

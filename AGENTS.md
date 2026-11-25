@@ -706,8 +706,11 @@ a family of names, end it with one `*`: `/thor*` catches `/thor-probe` and
 or owner-approval rule: one that only asks for `--help` or `--version`, a call
 with `--help` as the first word after the command (or after one subcommand word,
 as in `docker compose up --help`; a `--help` further along does not count), a
-`git push --dry-run` (or `-n`), or a PowerShell call with
-`-WhatIf`. The flag has to be on the same command as the rule's, not on a later
+`git push --dry-run` (or `-n`), or a PowerShell cmdlet call (a Verb-Noun name
+such as `Remove-Item`) with `-WhatIf`. `-n` and `--dry-run` count only as a flag
+of `git push` itself, never as the value of an option such as `-o` or
+`--receive-pack`, and `-WhatIf` means nothing to `git`, `gh` or any other
+program. The flag has to be on the same command as the rule's, not on a later
 one joined by `&&` or `;`.
 
 **A `requires` answer can be matched a little more loosely, and one answer is

@@ -316,8 +316,33 @@ pub fn attempt_text(tool_name: &str, tool_input: Option<&Value>) -> Option<Strin
             // A NUL separator, so ("ab", "c") and ("a", "bc") never collide.
             Some(format!("{old}\u{0}{new}"))
         }
+        "MultiEdit" => {
+            let edits = multi_edit_pairs(tool_input?)?;
+            let parts: Vec<String> = edits.iter().map(|(old, new, _)| format!("{old}\u{0}{new}")).collect();
+            Some(parts.join("\u{1}"))
+        }
         _ => None,
     }
+}
+
+/// The `(old_string, new_string, replace_all)` of every edit a `MultiEdit`
+/// call carries, in order. `None` when the `edits` list is missing, empty or
+/// holds a malformed entry: the guard then declines to decide, as for an
+/// `Edit` with a missing field.
+fn multi_edit_pairs(input: &Value) -> Option<Vec<(&str, &str, bool)>> {
+    let edits = input.get("edits")?.as_array()?;
+    if edits.is_empty() {
+        return None;
+    }
+    edits
+        .iter()
+        .map(|edit| {
+            let old = edit.get("old_string")?.as_str()?;
+            let new = edit.get("new_string")?.as_str()?;
+            let all = edit.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
+            Some((old, new, all))
+        })
+        .collect()
 }
 
 pub fn attempt_key(target: &str, carried: Option<&str>) -> String {
@@ -391,13 +416,19 @@ pub fn mark_blocked_text(existing_text: Option<&str>, session_id: &str, file_pat
 /// one arm that asks whether a required literal REMAINS, it is the wrong
 /// thing entirely - see [`content_after_write`], which exists because this
 /// function's doc comment used to claim it answered both.
-pub fn proposed_content<'a>(tool_name: &str, tool_input: Option<&'a Value>) -> Option<&'a str> {
+pub fn proposed_content<'a>(tool_name: &str, tool_input: Option<&'a Value>) -> Option<std::borrow::Cow<'a, str>> {
     let field = match tool_name {
         "Write" => "content",
         "Edit" => "new_string",
+        // A `MultiEdit` carries several replacement fragments: all of them,
+        // one per line, so a literal in any one is found.
+        "MultiEdit" => {
+            let news: Vec<&str> = multi_edit_pairs(tool_input?)?.into_iter().map(|(_, new, _)| new).collect();
+            return Some(std::borrow::Cow::Owned(news.join("\n")));
+        }
         _ => return None,
     };
-    tool_input?.get(field)?.as_str()
+    tool_input?.get(field)?.as_str().map(std::borrow::Cow::Borrowed)
 }
 
 /// What the file will actually HOLD after this call, as opposed to the
@@ -442,6 +473,19 @@ pub fn content_after_write(
             }
             let replace_all = input.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
             Some(if replace_all { on_disk.replace(old, new) } else { on_disk.replacen(old, new, 1) })
+        }
+        "MultiEdit" => {
+            // The edits apply one after the other, each to the result of the
+            // one before; one that would not apply means nothing here
+            // describes the file that will exist.
+            let mut text = std::fs::read_to_string(root?.join(file_path)).ok()?;
+            for (old, new, all) in multi_edit_pairs(input)? {
+                if !text.contains(old) {
+                    return None;
+                }
+                text = if all { text.replace(old, new) } else { text.replacen(old, new, 1) };
+            }
+            Some(text)
         }
         _ => None,
     }
@@ -3404,10 +3448,10 @@ sonnet").is_none(),
     #[test]
     fn write_reads_content_and_edit_reads_new_string() {
         let write_input = serde_json::json!({ "file_path": "a.md", "content": "hello" });
-        assert_eq!(proposed_content("Write", Some(&write_input)), Some("hello"));
+        assert_eq!(proposed_content("Write", Some(&write_input)).as_deref(), Some("hello"));
 
         let edit_input = serde_json::json!({ "file_path": "a.md", "old_string": "x", "new_string": "y" });
-        assert_eq!(proposed_content("Edit", Some(&edit_input)), Some("y"));
+        assert_eq!(proposed_content("Edit", Some(&edit_input)).as_deref(), Some("y"));
     }
 
     // ------------------------------------------------ content_after_write

@@ -260,6 +260,7 @@ fn file_write_in(
 ) -> Judgement {
     let Some(file_path) = file_path else { return Judgement::default() };
     let Some(content) = absent_guard::proposed_content(tool_name, tool_input) else { return Judgement::default() };
+    let content: &str = &content;
     let judged = judged_path(file_path, root, cwd);
     let file_path = judged.as_str();
 
@@ -924,17 +925,42 @@ fn in_session_project(items: Vec<LiveItem>, session_project: Option<&str>) -> Ve
 /// standing at the top of its checkout judges every plain relative path as it
 /// always did.
 fn judged_path(path: &str, root: Option<&Path>, cwd: Option<&Path>) -> String {
-    let (Some(root), Some(cwd)) = (root, cwd) else { return path.to_string() };
     let relative = Path::new(path);
-    if relative.has_root() {
-        return path.to_string();
-    }
     let dotted = relative.components().any(|c| matches!(c, Component::CurDir | Component::ParentDir));
+    let (Some(root), Some(cwd)) = (root, cwd) else {
+        return if dotted { fold_dots(relative) } else { path.to_string() };
+    };
+    if relative.has_root() {
+        return if dotted { fold_dots(relative) } else { path.to_string() };
+    }
     let joined = if dotted { without_dots(&cwd.join(relative)) } else { cwd.join(relative) };
     match joined.strip_prefix(root) {
         Ok(inside) => inside.to_string_lossy().to_string(),
         Err(_) => joined.to_string_lossy().to_string(),
     }
+}
+
+/// `path` with `.` dropped and every `..` that has a folder before it taking
+/// that folder back (`firmware/../.gitignore` is `.gitignore`). A `..` with
+/// nothing before it stays, so a path that leaves its start is not changed
+/// into another one.
+fn fold_dots(path: &Path) -> String {
+    let mut parts: Vec<Component> = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match parts.last() {
+                Some(Component::Normal(_)) => {
+                    parts.pop();
+                }
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => parts.push(component),
+            },
+            other => parts.push(other),
+        }
+    }
+    let out: PathBuf = parts.iter().map(|c| c.as_os_str()).collect();
+    out.to_string_lossy().to_string()
 }
 
 /// `path` with every `.` dropped and every `..` taking back the folder before

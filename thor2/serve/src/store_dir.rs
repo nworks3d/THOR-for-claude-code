@@ -98,13 +98,98 @@ pub fn is_held(path: &Path) -> bool {
         .any(|(d, copy)| *d == dir && !(*copy && name == thor_core::copy_mode::TELEMETRY))
 }
 
-/// `std::fs::write` for a state file beside the store - skipped, successfully,
-/// while that directory is held.
+/// Write a state file beside the store - skipped, successfully, while that
+/// directory is held. ATOMIC: the text goes to a temporary file in the same
+/// folder and is then renamed over the target, so a reader (or a writer that
+/// loses the race) never sees half a file or one with extra text behind it.
+/// The rename is retried for a moment when the target is held open.
 pub fn write(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
     if is_held(path) {
         return Ok(());
     }
-    std::fs::write(path, contents)
+    write_atomic(path, contents.as_ref())
+}
+
+fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("state");
+    let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp = path.with_file_name(format!(".{name}.{}.{unique}.tmp", std::process::id()));
+    std::fs::write(&temp, contents)?;
+    let mut last = Ok(());
+    for _ in 0..40 {
+        match std::fs::rename(&temp, path) {
+            Ok(()) => return Ok(()),
+            Err(e) => last = Err(e),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let _ = std::fs::remove_file(&temp);
+    last
+}
+
+/// How long a change waits for a state file's lock before it goes on without.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+/// A lock older than this was left by a hook that died.
+const LOCK_STALE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A lock file, removed when dropped. `None` inside means none was taken: the
+/// directory is held, or the lock stayed taken past the wait.
+pub struct FileLock(Option<PathBuf>);
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// The lock that guards a read-modify-write of one state file: `lock_path` is
+/// a file beside it (`lock_path_of`). Waits up to a second for it, then goes
+/// on without: a hook that is slow or a lock that is stuck must never hold a
+/// tool call or a turn end.
+pub fn lock(lock_path: &Path) -> FileLock {
+    if is_held(lock_path) {
+        return FileLock(None);
+    }
+    let started = std::time::Instant::now();
+    loop {
+        if std::fs::OpenOptions::new().write(true).create_new(true).open(lock_path).is_ok() {
+            return FileLock(Some(lock_path.to_path_buf()));
+        }
+        let stale = std::fs::metadata(lock_path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|at| at.elapsed().ok())
+            .is_some_and(|age| age > LOCK_STALE);
+        if stale {
+            let _ = std::fs::remove_file(lock_path);
+            continue;
+        }
+        if started.elapsed() > LOCK_WAIT {
+            return FileLock(None);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// The lock file of the state file `state`: the same name with `.lock` added.
+pub fn lock_path_of(state: &Path) -> PathBuf {
+    let name = state.file_name().and_then(|n| n.to_str()).unwrap_or("state");
+    state.with_file_name(format!("{name}.lock"))
+}
+
+/// Read a state file that holds JSON for a read-modify-write. A file that is
+/// not there is `Some(None)` (start from nothing); a file that is there but
+/// cannot be read or parsed is `None`: the caller keeps the file and skips its
+/// update, never writing an empty state over it.
+pub fn read_json_for_update<T: serde::de::DeserializeOwned>(path: &Path) -> Option<Option<T>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(text.trim_start_matches('\u{feff}')).ok().map(Some),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(None),
+        Err(_) => None,
+    }
 }
 
 /// `EventStore::open_existing`, or a read-only open while the directory is held.
@@ -128,6 +213,41 @@ pub fn open_for_hook(db_path: &Path) -> Option<EventStore> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn many_threads_writing_one_state_file_always_leave_one_whole_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state.json");
+        let handles: Vec<_> = (0..10)
+            .map(|n| {
+                let state = state.clone();
+                std::thread::spawn(move || {
+                    for round in 0..20 {
+                        write(&state, format!("[\"{n}-{round}\"]{}", " ".repeat(n * 700))).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let text = std::fs::read_to_string(&state).unwrap();
+        let parsed: Vec<String> = serde_json::from_str(&text).expect("whole JSON, nothing left over from a longer write");
+        assert_eq!(parsed.len(), 1);
+        let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(names.len(), 1, "no temporary file is left behind: {names:?}");
+    }
+
+    #[test]
+    fn a_state_file_that_cannot_be_parsed_is_told_apart_from_one_that_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state.json");
+        assert_eq!(read_json_for_update::<Vec<String>>(&state), Some(None));
+        std::fs::write(&state, "[\"a\"] and more").unwrap();
+        assert_eq!(read_json_for_update::<Vec<String>>(&state), None);
+        std::fs::write(&state, "[\"a\"]").unwrap();
+        assert_eq!(read_json_for_update::<Vec<String>>(&state), Some(Some(vec!["a".to_string()])));
+    }
 
     #[test]
     fn a_held_directory_skips_writes_and_a_released_one_takes_them_again() {

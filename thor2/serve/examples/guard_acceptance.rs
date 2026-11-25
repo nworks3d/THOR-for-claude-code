@@ -331,7 +331,7 @@ fn case(
 /// module doc comment for why that is deliberately out of scope here).
 fn decide(store: &EventStore, root: &Path, tool_name: &str, tool_input: &serde_json::Value) -> Option<String> {
     let file_path = tool_input.get("file_path").and_then(|v| v.as_str())?;
-    let content = absent_guard::proposed_content(tool_name, Some(tool_input))?;
+    let content = absent_guard::proposed_content(tool_name, Some(tool_input))?.into_owned();
 
     let mut location_input = ServeInput::default();
     location_input.add_target(TargetKind::Path, file_path);
@@ -343,7 +343,7 @@ fn decide(store: &EventStore, root: &Path, tool_name: &str, tool_input: &serde_j
         input.add_file(file_path);
         let candidates = live::candidates_for(store, &input);
         let ranked = rank::select(&candidates, &input);
-        absent_guard::find_violation(&ranked, file_path, content, Some(root))
+        absent_guard::find_violation(&ranked, file_path, &content, Some(root))
     })
 }
 
@@ -849,6 +849,11 @@ fn push_should_block_content(cases: &mut Vec<Case>, root: &Path) {
         "blk-c-notes-fence", "should-block/content/fence", "Edit",
         ed(root, "NOTES.md", "TBD", &fenced("Pasted straight from the incident channel:", "status: ", lit, "Needs cleanup before this goes out.")),
         true, "new_string carries 'forbidden' inside a fenced code block, anchored via rule-notes-forbidden",
+    ));
+    cases.push(case(
+        "blk-c-notes-multiedit", "should-block/content/multiedit", "MultiEdit",
+        serde_json::json!({ "file_path": abs(root, "NOTES.md"), "edits": [{ "old_string": "x", "new_string": "forbidden" }] }),
+        true, "a MultiEdit carries 'forbidden' in one of its new_strings, guarded like the same Edit",
     ));
     cases.push(case(
         "blk-c-notes-longdoc", "should-block/content/longdoc", "Write",
@@ -1432,11 +1437,6 @@ fn push_should_pass_unrelated_tool(cases: &mut Vec<Case>, root: &Path) {
         "pss-tool-notebookedit", "should-pass/near-miss/unrelated-tool", "NotebookEdit",
         serde_json::json!({ "notebook_path": abs(root, "NOTES.md"), "new_source": "forbidden" }),
         false, "a NotebookEdit payload keys its target as notebook_path, not file_path, so decide short-circuits",
-    ));
-    cases.push(case(
-        "pss-tool-multiedit-notes", "should-pass/near-miss/unrelated-tool", "MultiEdit",
-        serde_json::json!({ "file_path": abs(root, "NOTES.md"), "edits": [{ "old_string": "x", "new_string": "forbidden" }] }),
-        false, "tool_name 'MultiEdit' has a real file_path but is not Write/Edit, so proposed_content is None",
     ));
     cases.push(case(
         "pss-tool-read-frozen-file", "should-pass/near-miss/unrelated-tool", "Read",

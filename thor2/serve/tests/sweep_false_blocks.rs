@@ -388,3 +388,44 @@ fn only_an_assignment_that_certainly_ran_in_this_shell_answers() {
     assert!(fx.bash("install.exe; export USERPROFILE=/tmp/h"), "an export after the call answers nothing");
     assert!(fx.bash("echo USERPROFILE=x; install.exe"), "text that mentions it is no assignment");
 }
+
+
+// ------------------------------------------------ inert calls that are not inert
+
+/// Attack of 2026-11-25: a word that looks like a dry-run flag, handed to a
+/// program as a VALUE, made the whole call inert and so slipped past every
+/// lock. Each case here must still be refused; the documented inert calls
+/// stay inert.
+#[test]
+fn a_dry_run_look_alike_that_is_a_value_does_not_make_a_call_inert() {
+    let fx = Fx::new(&push_rules());
+    assert!(fx.bash("git push -o -n origin main"), "-n is the value of -o");
+    assert!(fx.bash("git push -o -WhatIf origin main"));
+    assert!(fx.bash("git push --receive-pack -n origin main"), "-n is the value of --receive-pack");
+    assert!(fx.bash("git push --push-option -n origin main"));
+    assert!(fx.bash("git push --exec -n origin main"));
+    assert!(fx.bash("git push --repo -n main"));
+    assert!(fx.bash("git push origin main -WhatIf"), "-WhatIf means nothing to git");
+    // the documented inert calls
+    assert!(!fx.bash("git push -n origin main"));
+    assert!(!fx.bash("git push --dry-run origin main"));
+    assert!(!fx.bash("git push -o x -n origin main"), "-n after an option that has its own value is still the flag");
+    assert!(!fx.bash("git push --push-option=x --dry-run origin main"));
+}
+
+#[test]
+fn what_if_counts_for_a_cmdlet_only() {
+    let fx = Fx::new(&[
+        rule("no-release-without-go", None, &["gh release create"], requires("gh release create", &["go-owner"]), &[]),
+        rule("no-public-repo", None, &["gh repo edit"], forbidden(&["--visibility public"]), &[]),
+        rule("no-commit-without-go", None, &["git commit"], requires("git commit", &["go-owner"]), &[]),
+        rule("no-remove-without-go", None, &["Remove-Item", "Start-Process"], requires("Remove-Item", &["go-owner"]), &[]),
+    ]);
+    assert!(fx.bash("gh release create v1 --notes -WhatIf"));
+    assert!(fx.bash("gh repo edit --visibility public --description -WhatIf"));
+    assert!(fx.bash("git commit -m \"x\" -m -WhatIf"));
+    assert!(fx.powershell("Remove-Item x"));
+    assert!(!fx.powershell("Remove-Item x -WhatIf"), "a cmdlet with -WhatIf does nothing");
+    assert!(fx.powershell("Remove-Item x -WhatIf:$false"));
+    assert!(fx.powershell("Remove-Item -Value -WhatIf"), "-WhatIf as the value of another parameter is not the switch");
+}

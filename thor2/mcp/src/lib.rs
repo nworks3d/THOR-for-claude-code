@@ -1471,6 +1471,49 @@ fn lost_check_warning(store: &EventStore, item: &model::item::Item) -> Option<St
     }
 }
 
+/// A resolve discards heads. Discarding the head of a pinned note or of a rule
+/// that needs the owner's go, in favour of one that loosens it (no pin, a
+/// weaker check, no owner-approval, or a retraction), is a loosening like any
+/// revise or retract of it, and passes the same gates: the owner's own quoted
+/// words (`serve::unpin_gate::owner_rule_go`, `serve::unpin_gate::judge`).
+fn refuse_a_resolve_that_loosens(
+    s: &EventStore,
+    args: &ResolveArgs,
+    root: Option<&std::path::Path>,
+    session: Option<&str>,
+) -> Result<(), String> {
+    let events = s.get_events_by_entity(&args.id).map_err(|e| format!("could not resolve: {e}"))?;
+    let kept = events.iter().find(|e| e.this_hash == args.keep);
+    let kept_item = kept.filter(|e| e.kind != thor_core::event_store::EventKind::FactRetracted).and_then(|e| model::store::parse_body(&e.body).ok());
+    for rev in &args.discard {
+        let Some(event) = events.iter().find(|e| e.this_hash == *rev) else { continue };
+        if event.kind == thor_core::event_store::EventKind::FactRetracted {
+            continue;
+        }
+        let Ok(old) = model::store::parse_body(&event.body) else { continue };
+        let pinned = serve::unpin_gate::is_pinned(&old.bindings);
+        let owner = model::store::is_owner_approval(&normalized_item(&old));
+        if !pinned && !owner {
+            continue;
+        }
+        let (what, unpinned) = match &kept_item {
+            Some(new) => (
+                model::gate::owner_rule_loosened(&normalized_item(&old), &normalized_item(new)),
+                pinned && !serve::unpin_gate::is_pinned(&new.bindings),
+            ),
+            None => (vec!["the head you keep is a retraction, or cannot be read as a note".to_string()], pinned),
+        };
+        if owner && !what.is_empty() {
+            serve::unpin_gate::owner_rule_go(s, &args.id, args.because.as_deref(), session, serve::time::now_unix(), &what, "because")?;
+        }
+        if unpinned {
+            let root = root.map(std::path::Path::to_path_buf).or_else(|| std::env::current_dir().ok()).unwrap_or_default();
+            serve::unpin_gate::judge(s, &old, args.because.as_deref(), &root, session, serve::time::now_unix(), serve::unpin_gate::Takedown::Revise)?;
+        }
+    }
+    Ok(())
+}
+
 fn refuse_a_side_door_on_a_frozen_item(store: &EventStore, id: &str, att: &model::store::Att) -> Result<(), String> {
     if att.inflight.as_deref() != Some(model::store::INFLIGHT_SIDE_DOOR) {
         return Ok(());
@@ -2791,6 +2834,11 @@ pub struct ResolveArgs {
     /// Every other current head, in full. Leaving one out fails rather than
     /// silently discarding it.
     pub discard: Vec<String>,
+    /// Only when the head you discard is a pinned note or a rule that needs the
+    /// owner's go and the head you keep loosens it: the owner's whole message
+    /// between double quotes, the same as a revise that loosens it.
+    #[serde(default)]
+    pub because: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -4339,9 +4387,12 @@ impl ThorMcpServer {
             return queued;
         }
         let stamp = self.stamp("resolve", meta, raw);
+        let resolve_root = self.root.clone();
+        let session = self.session.clone();
         self.blocking(move |s| {
             let att = stamp.att();
             refuse_a_side_door_on_a_frozen_item(s, &args.id, &att)?;
+            refuse_a_resolve_that_loosens(s, &args, resolve_root.as_deref().map(PathBuf::as_path), session.session_id.as_deref())?;
             match model::store::resolve(
                 s,
                 stamp.column(),

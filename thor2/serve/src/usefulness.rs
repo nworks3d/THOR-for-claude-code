@@ -1652,7 +1652,7 @@ pub fn classify_hook_event(event_name: &str, tool_name: &str, file_path: Option<
             return HookEventKind::TestRun;
         }
     }
-    if matches!(tool_name, "Edit" | "Write" | "NotebookEdit") {
+    if matches!(tool_name, "Edit" | "Write" | "MultiEdit" | "NotebookEdit") {
         if let Some(file_path) = file_path {
             if !EVAL_UNTESTED_EDIT_EXEMPT_EXTENSIONS.iter().any(|ext| file_path.ends_with(ext)) {
                 return HookEventKind::UntestedEdit;
@@ -1998,6 +1998,17 @@ pub fn read_eval_debt_state(db: &Path) -> EvalDebtState {
     std::fs::read_to_string(eval_debt_state_path(db)).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
 }
 
+/// The sidecar for a read-modify-write, under its lock (hold the returned lock
+/// until the write is done). `None` when the file is there but cannot be
+/// parsed: the caller then keeps the file and skips its update, so a broken
+/// sidecar is never replaced by an empty state.
+fn lock_and_read_eval_debt_state(db: &Path) -> (crate::store_dir::FileLock, Option<EvalDebtState>) {
+    let path = eval_debt_state_path(db);
+    let lock = crate::store_dir::lock(&crate::store_dir::lock_path_of(&path));
+    let state = crate::store_dir::read_json_for_update::<EvalDebtState>(&path).map(Option::unwrap_or_default);
+    (lock, state)
+}
+
 /// This project's own two facts, or the all-default "nothing known yet"
 /// state when the sidecar - or just this project's own entry in it - does
 /// not exist. READ-ONLY: `doctor` (`ops::health::judgement_debt_line`) calls
@@ -2083,7 +2094,14 @@ fn evaluation_report_ids(store: &EventStore, project: Option<&str>) -> Vec<Strin
 /// reads this same state through [`project_eval_state`] but must stay
 /// read-only - see that function's own doc comment.
 pub fn update_eval_debt_state(store: &EventStore, db: &Path, project: Option<&str>, now_unix: i64) -> ProjectEvalState {
-    let mut all = read_eval_debt_state(db);
+    // What the LOG says is worked out before the sidecar's lock is taken: it
+    // reads the store and may take a while, and nothing in it depends on the
+    // sidecar.
+    let valid = crate::eval_filing::newest_valid_evaluation(store, project);
+    let known_ids = evaluation_report_ids(store, project);
+    let (_lock, state) = lock_and_read_eval_debt_state(db);
+    let readable = state.is_some();
+    let mut all = state.unwrap_or_default();
     let key = project_key(project).to_string();
     let before = all.get(&key).cloned().unwrap_or_default();
     let mut entry = before.clone();
@@ -2112,7 +2130,6 @@ pub fn update_eval_debt_state(store: &EventStore, db: &Path, project: Option<&st
     // (2026-09-16, fourth rewrite): it answers every unanswered ask since the
     // last one, so `asked_count`/`first_asked_since_report` reset with it
     // (see `record_eval_debt_asked` below for the other half).
-    let valid = crate::eval_filing::newest_valid_evaluation(store, project);
     let seen = valid.as_ref().and_then(|v| v.filed_at.as_deref()).and_then(crate::eval_filing::unix_of_timestamp);
     let report_id = valid.as_ref().filter(|_| seen.is_some()).map(|v| v.report.clone());
     if report_id.is_some() && report_id != before.last_evaluation_report_id {
@@ -2121,7 +2138,7 @@ pub fn update_eval_debt_state(store: &EventStore, db: &Path, project: Option<&st
     }
     entry.last_evaluation_seen = seen;
     entry.last_evaluation_report_id = report_id;
-    entry.known_report_ids.extend(evaluation_report_ids(store, project));
+    entry.known_report_ids.extend(known_ids);
     // THE ONE RESET (step 17): a valid evaluation filed after an accrual
     // began ends it - the project clock's and every session's of the
     // project. Read from the log here, never from the sidecar's own copy
@@ -2145,7 +2162,7 @@ pub fn update_eval_debt_state(store: &EventStore, db: &Path, project: Option<&st
         }
     }
 
-    if entry == before {
+    if entry == before || !readable {
         return entry;
     }
     all.insert(key, entry.clone());
@@ -2175,7 +2192,8 @@ pub fn update_eval_debt_state(store: &EventStore, db: &Path, project: Option<&st
 /// Best effort, like every sidecar here: a write that fails leaves the next
 /// ask to try again, never breaks a turn.
 pub fn record_eval_debt_asked(db: &Path, project: Option<&str>, now_unix: i64) {
-    let mut all = read_eval_debt_state(db);
+    let (_lock, state) = lock_and_read_eval_debt_state(db);
+    let Some(mut all) = state else { return };
     let key = project_key(project).to_string();
     let mut entry = all.get(&key).cloned().unwrap_or_default();
     entry.asked_count += 1;
@@ -2287,7 +2305,9 @@ fn record_event(
     event: HookEventKind,
 ) -> Option<SessionWorkState> {
     project?;
-    let mut all = read_eval_debt_state(db);
+    let (_lock, state) = lock_and_read_eval_debt_state(db);
+    let readable = state.is_some();
+    let mut all = state.unwrap_or_default();
     let key = project_key(project).to_string();
     let mut entry = all.get(&key).cloned().unwrap_or_default();
     let before = entry.sessions.get(session_id).cloned().unwrap_or_default();
@@ -2318,7 +2338,7 @@ fn record_event(
     // would silently understate the very risk the repeat is gated on.
     let counter_changed = after.edits_since_test != before.edits_since_test || after.compacted_since_anchor != before.compacted_since_anchor;
     let switched_here = newest_project_of_session(&all, session_id) != Some(key.as_str());
-    if !is_stop && !reset_happened && !write_gap_elapsed && !counter_changed && !switched_here {
+    if !readable || (!is_stop && !reset_happened && !write_gap_elapsed && !counter_changed && !switched_here) {
         return Some(after);
     }
     entry.sessions.insert(session_id.to_string(), after.clone());
@@ -3037,6 +3057,43 @@ mod eval_debt_state_tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
         assert_eq!(project_eval_state(&db, Some("thor")), ProjectEvalState::default());
+    }
+
+    #[test]
+    fn ten_hooks_updating_the_sidecar_at_once_lose_no_update_and_leave_valid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(10));
+        let handles: Vec<_> = (0..10)
+            .map(|n| {
+                let (db, barrier) = (db.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    record_eval_debt_asked(&db, Some("thor"), 1_800_000_000 + n);
+                    record_main_stop(&db, Some("thor"), &format!("session-{n}"), 1_800_000_000 + n);
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let text = std::fs::read_to_string(eval_debt_state_path(&db)).unwrap();
+        let all: EvalDebtState = serde_json::from_str(&text).expect("the sidecar is whole JSON");
+        let entry = &all["thor"];
+        assert_eq!(entry.asked_count, 10, "every ask is counted");
+        assert_eq!(entry.sessions.len(), 10, "every session is there");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap().flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
+        assert!(!leftovers.iter().any(|n| n.ends_with(".tmp") || n.ends_with(".lock")), "{leftovers:?}");
+    }
+
+    #[test]
+    fn a_sidecar_that_cannot_be_parsed_is_kept_not_replaced_by_an_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        std::fs::write(eval_debt_state_path(&db), "{ this is not json").unwrap();
+        record_eval_debt_asked(&db, Some("thor"), 1_800_000_000);
+        record_main_stop(&db, Some("thor"), "s1", 1_800_000_000);
+        assert_eq!(std::fs::read_to_string(eval_debt_state_path(&db)).unwrap(), "{ this is not json");
     }
 
     #[test]

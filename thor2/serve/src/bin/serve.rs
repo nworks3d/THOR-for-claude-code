@@ -2992,7 +2992,7 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                 // rather than reused from `ids` directly, because `check_rows`
                 // wants `&str` borrows and `ids` is already-owned `String`s.
                 let shown_ids: std::collections::HashSet<&str> = arranged.displayed_ids().into_iter().collect();
-                let verdicts = check_rows(&served.all, &shown_ids, input.command.as_deref().unwrap_or(""), absent_guard::proposed_content(tool_name, tool_input));
+                let verdicts = check_rows(&served.all, &shown_ids, input.command.as_deref().unwrap_or(""), absent_guard::proposed_content(tool_name, tool_input).as_deref());
                 // The command as typed wins over the file, never the tool-name
                 // fallback `input.add_command` used above when there was no real
                 // command (`absent_guard::proposed_command` returns `None` for
@@ -3860,7 +3860,13 @@ fn read_turn_marks(db: &Path) -> std::collections::BTreeMap<String, TurnMark> {
 }
 
 fn write_turn_mark(db: &Path, session_id: &str, mark: TurnMark) {
-    let mut all = read_turn_marks(db);
+    let path = turn_marks_path(db);
+    let _lock = serve::store_dir::lock(&serve::store_dir::lock_path_of(&path));
+    // A file that is there but cannot be parsed is kept as it is.
+    let Some(existing) = serve::store_dir::read_json_for_update::<std::collections::BTreeMap<String, TurnMark>>(&path) else {
+        return;
+    };
+    let mut all = existing.unwrap_or_default();
     all.insert(session_id.to_string(), mark);
     if let Ok(text) = serde_json::to_string(&all) {
         let _ = serve::store_dir::write(&turn_marks_path(db), text);
@@ -4763,10 +4769,13 @@ fn owner_words_of(payload: &Value, session_id: &str) -> Result<Vec<String>, Stri
 /// is now refused like the first; its text differs only so a caller that
 /// reads it learns to stop resending the same thing.
 fn with_repeat_wording(marker_path: &Path, session_id: &str, attempt: &str, reason: String) -> String {
+    let _lock = serve::store_dir::lock(&serve::store_dir::lock_path_of(marker_path));
     let marker_text = std::fs::read_to_string(marker_path).ok();
     let markers = marker_text.as_deref().map(absent_guard::read_blocked).unwrap_or_default();
     let repeat = absent_guard::already_blocked(&markers, session_id, attempt);
-    if !repeat {
+    // A marker file that is there but cannot be parsed is kept, not replaced.
+    let readable = marker_text.as_deref().is_none_or(|t| serde_json::from_str::<serde_json::Value>(t).is_ok());
+    if !repeat && readable {
         if let Some(text) = absent_guard::mark_blocked_text(marker_text.as_deref(), session_id, attempt) {
             let _ = serve::store_dir::write(marker_path, text);
         }
