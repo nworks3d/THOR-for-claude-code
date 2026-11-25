@@ -1921,11 +1921,25 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool
                     }
                     None => "not asked yet".to_string(),
                 };
-                out[0].push_str(&format!(
-                    "; no evaluation in the last {} day(s) - {ask_clause}; the Stop hook blocks every turn once a session \
-                     has accrued an hour of work here, until the report is filed",
-                    window_hours / 24
-                ));
+                let never_evaluated = valid.is_none();
+                let waits = never_evaluated
+                    && checkout_project.is_some_and(|p| serve::usefulness::first_ask_waits(&store, p, "doctor", now));
+                if waits {
+                    out[0].push_str(&format!(
+                        "; this project has not had an evaluation yet, and it is new with nothing to judge, so none is asked \
+                         until something needs judging or it is {} days old",
+                        serve::usefulness::EVAL_FLOOR_DAYS
+                    ));
+                } else {
+                    let lead = match never_evaluated {
+                        true => "this project has not had an evaluation yet".to_string(),
+                        false => format!("no evaluation in the last {} day(s)", window_hours / 24),
+                    };
+                    out[0].push_str(&format!(
+                        "; {lead} - {ask_clause}; the Stop hook blocks every turn once a session \
+                         has accrued an hour of work here, until the report is filed"
+                    ));
+                }
             }
             // THE MOST RECENTLY ACTIVE SESSION'S OWN ACCRUAL, since the fifth
             // rewrite (2026-09-17, `serve::usefulness`'s own "evaluation
@@ -5511,7 +5525,7 @@ mod tests {
         // Nothing was ever filed, so the line must not say that "none on file passed".
         assert!(line.contains("no evaluation report of this project is on file yet"), "{line}");
         assert!(!line.contains("none on file passed"), "{line}");
-        assert!(line.contains("no evaluation in the last 7 day(s)"), "{line}");
+        assert!(line.contains("this project has not had an evaluation yet"), "{line}");
         assert!(line.contains("not asked yet"), "{line}");
         assert!(
             line.contains("the Stop hook blocks every turn once a session has accrued an hour of work here"),
@@ -5538,7 +5552,7 @@ mod tests {
         );
         let line = judgement_debt_line(&db, Some("thor"), false).expect("a real backlog, the line must speak");
         assert!(line.contains("no evaluation report of this project is on file yet"), "{line}");
-        assert!(line.contains("no evaluation in the last 7 day(s)"), "{line}");
+        assert!(line.contains("this project has not had an evaluation yet"), "{line}");
         assert!(line.contains("asked 4 time(s), the first 2 days ago"), "{line}");
         assert!(
             line.contains("the Stop hook blocks every turn once a session has accrued an hour of work here"),
@@ -5638,7 +5652,7 @@ mod tests {
             declare_owed_for_eval_debt(&mut store, 1, "thor");
         }
         let line = judgement_debt_line(&db, Some("thor"), false).expect("one item is still owed, the line must speak");
-        assert!(line.contains("no evaluation in the last 7 day(s)"), "{line}");
+        assert!(line.contains("this project has not had an evaluation yet"), "{line}");
         assert!(
             line.contains("the Stop hook blocks every turn once a session has accrued an hour of work here"),
             "{line}"

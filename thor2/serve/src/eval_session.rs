@@ -2487,6 +2487,42 @@ pub fn ask_with_note(ask: &str, start: &EvaluationStart) -> String {
     }
 }
 
+/// The ask of a turn held AGAIN for an evaluation that is already open, in under about 1.2 kB:
+/// how many times it was asked and since when, what is still owed in one line each, and the exact
+/// call that prints the whole ask and the lists once more. The full text is for the first hold;
+/// repeating its 5 to 6 kB at every turn only taught the assistant to skim it.
+pub fn short_ask(store: &EventStore, start: &EvaluationStart, asked: u32, since: &str, command: &str) -> String {
+    let judgement = model::store::evaluation_judgement_owed(store, start, &[]).owed;
+    let reread = model::store::evaluation_reread_owed(store, start).owed;
+    let batch = model::store::evaluation_frozen_batch_owed(store, start);
+    let disputes = model::store::evaluation_frozen_disputes_owed(store, start);
+    let mut owed: Vec<String> = Vec::new();
+    if let Some(id) = judgement.first() {
+        owed.push(format!("{} item(s) without a verdict, for example '{id}' (mark it, or skip it with a not-judgeable tag)", judgement.len()));
+    }
+    if let Some(id) = reread.first() {
+        owed.push(format!("{} pinned note(s) not re-read, for example '{id}' (get it, then mark it or revise its text)", reread.len()));
+    }
+    if let Some((id, _)) = batch.first() {
+        owed.push(format!("{} rule(s) of the batch still undecided, for example '{id}'", batch.len()));
+    }
+    if let Some((id, _)) = disputes.first() {
+        owed.push(format!("{} dispute(s) not verified, for example '{id}'", disputes.len()));
+    }
+    let owed = match owed.is_empty() {
+        true => "- nothing on the lists is left: file the report".to_string(),
+        false => owed.iter().map(|line| format!("- {line}")).collect::<Vec<_>>().join("\n"),
+    };
+    format!(
+        "[THOR] The evaluation of '{}' is still open (started {}) and its report is not filed: asked {asked} time(s), the first {since}. \
+         A turn cannot end until the report counts.\nStill owed:\n{owed}\n\
+         The whole ask and the lists again: call the Skill tool with skill \"{command}\" (the owner can type /{command}); \
+         the evaluation is open, so it starts nothing new.",
+        start.frozen.project,
+        crate::time::iso8601_from_unix(start.frozen.started_unix),
+    )
+}
+
 /// What the session is told when it opens the routine while an evaluation
 /// of `project` is already open: where, since when, and - when it is this
 /// session's own - the start note again.

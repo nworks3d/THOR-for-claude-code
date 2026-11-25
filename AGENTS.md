@@ -1327,7 +1327,14 @@ when all of this holds:
 - this session has put in at least 10 minutes of its own work in that project
   since then - a session that only looked in for a moment is never held;
 - it is not this session's first turn-end in that project - the first one is
-  never held.
+  never held;
+- it is not the first ask of a new memory with nothing to judge: a project that
+  began in this memory less than 7 days ago and never had an evaluation that
+  counts is not asked until something can be judged (an item owed a verdict, a
+  pinned note to re-read, a dispute to verify, a rule the trial has not decided,
+  a rule the false-block sweep flags, or a crowded place - the owner's own
+  messages alone are not something) or until it is 7 days old. Until then the
+  ask says "has not had an evaluation yet" instead of counting days.
 
 A NEW ask also waits while the session is still in its first turn and has only
 read files (one typed prompt from the owner, then nothing but Read, Grep or Glob),
@@ -1344,7 +1351,8 @@ the old one is closed as superseded, and its verdicts stay. The questions
 about the project's upkeep - the notes that fired in many sessions without a
 verdict, and the old rules without a decision - are asked inside that
 evaluation and nowhere else. A verdict counts for everyone. A project
-worked in during the last 7 days with no evaluation that counts in 7 days is
+worked in during the last 7 days, that began in this memory more than 7 days
+ago and has no evaluation that counts in 7 days, is
 asked about whatever the clock says - the weekly floor, so that an edited clock
 file can delay the question but never cancel it. A folder that belongs to no
 project is never asked about on its own, since there would be nowhere to file the
@@ -1352,7 +1360,12 @@ report.
 
 THIS ONE DOES NOT GO QUIET AFTER ONE ASK: it holds the end of every turn,
 naming how many times it has already asked and since when, until a report that
-counts is on file.
+counts is on file. The whole ask comes with the first hold; from the second hold
+of the same open evaluation on, the hold is a short text (under about 1.2 kB):
+how many times it was asked and since when, what is still owed in one line each,
+and the exact call that prints the whole ask again - the Skill tool with skill
+"thor-eval", which the owner can also type as /thor-eval. It starts nothing new
+while the evaluation is open. The plain sentence beside the hold is the same.
 
 THE RHYTHM IS ONE EVALUATION PER WEEK PER PROJECT, tied to the plan the owner
 pays for, and the ask says which mode applies in one plain line. A report covers

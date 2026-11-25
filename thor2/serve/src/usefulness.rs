@@ -1366,6 +1366,11 @@ pub fn project_activity(store: &EventStore, project: &str, since_unix: i64, firs
 /// many days. Zeroing the work-clock sidecar can delay the ask by at most
 /// this much. Applies in both cadences.
 pub fn weekly_floor_due(store: &EventStore, project: &str, now_unix: i64) -> bool {
+    // The floor counts from the project's first activity in this memory: a project younger than
+    // the floor has not been without an evaluation for a week.
+    if project_is_young(store, project, now_unix) {
+        return false;
+    }
     let since = now_unix - EVAL_FLOOR_DAYS * 86400;
     let valid = crate::eval_filing::newest_valid_evaluation(store, Some(project));
     let filed = valid.as_ref().and_then(|v| v.filed_at.as_deref()).and_then(crate::eval_filing::unix_of_timestamp);
@@ -1373,6 +1378,53 @@ pub fn weekly_floor_due(store: &EventStore, project: &str, now_unix: i64) -> boo
         return false;
     }
     project_activity(store, project, since, true).0
+}
+
+/// When `project` began in this memory: the time near the log position of its opened record
+/// (written by the installer when the project got its memory). `None` for a project with no such
+/// record (an older memory): it is then taken as old, never as young.
+pub fn project_first_seen(store: &EventStore, project: &str) -> Option<i64> {
+    let first = store.get_events_by_entity(&model::store::project_opened_id(project)).ok()?.into_iter().next()?;
+    model::store::time_near_seq(store, first.seq).or_else(|| model::store::time_after_seq(store, first.seq))
+}
+
+/// Whether `project` began in this memory less than `EVAL_FLOOR_DAYS` ago.
+pub fn project_is_young(store: &EventStore, project: &str, now_unix: i64) -> bool {
+    project_first_seen(store, project).is_some_and(|at| now_unix - at < EVAL_FLOOR_DAYS * 86400)
+}
+
+/// Whether an evaluation of `project` would have something to judge, from the lists it freezes
+/// (never from the owner's own messages): an item owed a verdict, a pinned note to re-read, a
+/// dispute to verify, a rule of the project the trial has not decided, a rule the false-block
+/// sweep flags, or a place that is too crowded. `session` is the session that would be asked.
+pub fn something_to_judge(store: &EventStore, project: &str, session: &str, now_unix: i64) -> bool {
+    let Some(frozen) = model::store::frozen_now(store, session, project, "check", now_unix) else { return true };
+    if !frozen.judgement.is_empty() || !frozen.reread.is_empty() || !frozen.outranked.is_empty() {
+        return true;
+    }
+    if !model::store::unverified_disputes(store, project, frozen.prev_report_seq, &[]).is_empty() {
+        return true;
+    }
+    if crate::live::live_items(store)
+        .into_iter()
+        .any(|li| li.item.project.as_deref() == Some(project) && li.item.kind.can_fire() && model::store::settlement(store, &li.id, None).is_owed())
+    {
+        return true;
+    }
+    store.path().is_some_and(|db| {
+        let ids = items_of_project(store, project);
+        crate::sweep::flagged_rule_ids(&db, store).iter().any(|id| ids.contains(id))
+    })
+}
+
+/// THE FIRST ASK OF A NEW MEMORY WAITS: a project younger than `EVAL_FLOOR_DAYS` that never had a
+/// valid evaluation is not asked until there is something to judge (`something_to_judge`), or
+/// until it is that old. A memory minutes old has nothing on any list, and holding the turn for
+/// an evaluation of nothing was the first thing a new user met.
+pub fn first_ask_waits(store: &EventStore, project: &str, session: &str, now_unix: i64) -> bool {
+    project_is_young(store, project, now_unix)
+        && crate::eval_filing::newest_valid_evaluation(store, Some(project)).is_none()
+        && !something_to_judge(store, project, session, now_unix)
 }
 
 /// THE RUNNING EVALUATION ELSEWHERE (D12, step 24), from the log only:
@@ -1524,6 +1576,9 @@ pub fn stop_decision(
     if own_minutes < EVAL_OWN_WORK_MINUTES {
         return StopDecision::Quiet(SHORT_SESSION);
     }
+    if cadence != EvalCadence::Off && first_ask_waits(store, project, session, now_unix) {
+        return StopDecision::Quiet(NEW_MEMORY);
+    }
     let Some(by_floor) = project_due(store, state, project, &work, now_unix, cadence) else {
         return StopDecision::Quiet("the project is not due");
     };
@@ -1538,6 +1593,7 @@ pub fn stop_decision(
 
 const SHORT_SESSION: &str = "this session has less than ten minutes of its own work here";
 const FIRST_STOP: &str = "this is the session's first Stop here";
+const NEW_MEMORY: &str = "the project is new and there is nothing to judge yet";
 
 /// This session's own minutes of work in `project` since the project's newest
 /// valid evaluation: the larger of the sidecar's number and its transcript's
