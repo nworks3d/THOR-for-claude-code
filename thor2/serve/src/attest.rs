@@ -1096,11 +1096,17 @@ pub fn record_hook_faults_until(store: &mut EventStore, session: &str, root: Opt
 /// exactly as before. The cheap byte search comes first; only a line that holds
 /// the needle is turned into a `String`.
 fn lines_containing(file: &Path, needle: &[u8]) -> Option<Vec<String>> {
+    lines_containing_at(file, needle).map(|found| found.into_iter().map(|(_, line)| line).collect())
+}
+
+/// `lines_containing`, each line with the byte position it starts at.
+fn lines_containing_at(file: &Path, needle: &[u8]) -> Option<Vec<(u64, String)>> {
     let handle = std::fs::File::open(file).ok()?;
     let finder = memchr::memmem::Finder::new(needle);
     let mut reader = BufReader::with_capacity(256 * 1024, handle);
     let mut raw = Vec::new();
     let mut found = Vec::new();
+    let mut at = 0u64;
     loop {
         raw.clear();
         if reader.read_until(b'\n', &mut raw).ok()? == 0 {
@@ -1110,7 +1116,49 @@ fn lines_containing(file: &Path, needle: &[u8]) -> Option<Vec<String>> {
         let line = text.strip_suffix('\n').unwrap_or(text);
         let line = line.strip_suffix('\r').unwrap_or(line);
         if finder.find(line.as_bytes()).is_some() {
-            found.push(line.to_string());
+            found.push((at, line.to_string()));
+        }
+        at += raw.len() as u64;
+    }
+}
+
+/// How far after a call's own line its result is looked for: Claude Code writes the result
+/// right behind the call (the hook's two attachment lines lie between), so a few megabytes are
+/// far more than enough and a long transcript is never read twice over for one `get`.
+const RESULT_WINDOW_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The results (is_error, text) the transcript `file` holds for the call `tool_use_id`, looked
+/// for in the `RESULT_WINDOW_BYTES` after byte position `from`. Empty while the call has no result
+/// on disk yet.
+fn results_after(file: &Path, from: u64, tool_use_id: &str) -> Vec<(bool, String)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut handle) = std::fs::File::open(file) else { return Vec::new() };
+    if handle.seek(SeekFrom::Start(from)).is_err() {
+        return Vec::new();
+    }
+    let finder = memchr::memmem::Finder::new(tool_use_id.as_bytes());
+    let mut reader = BufReader::with_capacity(256 * 1024, handle.take(RESULT_WINDOW_BYTES));
+    let mut raw = Vec::new();
+    loop {
+        raw.clear();
+        if !matches!(reader.read_until(b'\n', &mut raw), Ok(n) if n > 0) {
+            return Vec::new();
+        }
+        if finder.find(&raw).is_none() {
+            continue;
+        }
+        let Ok(line) = serde_json::from_slice::<Value>(&raw) else { continue };
+        let found: Vec<(bool, String)> = line
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_array())
+            .into_iter()
+            .flatten()
+            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result") && b.get("tool_use_id").and_then(|t| t.as_str()) == Some(tool_use_id))
+            .map(|b| (b.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false), result_text(b.get("content"))))
+            .collect();
+        if !found.is_empty() {
+            return found;
         }
     }
 }
@@ -1139,8 +1187,13 @@ pub fn record_note_reads_until(store: &mut EventStore, session: &str, root: Opti
         if !more() {
             break;
         }
-        let Some(candidates) = lines_containing(&file, b"__get") else { continue };
-        for raw in candidates.iter().map(String::as_str) {
+        let Some(candidates) = lines_containing_at(&file, b"__get") else { continue };
+        let already: HashSet<String> = store
+            .get_events_by_entity(&model::store::note_read_entity(session))
+            .map(|events| model::store::note_reads_in(&events).into_iter().map(|r| r.tool_use_id).collect())
+            .unwrap_or_default();
+        let mut fresh: Vec<(u64, model::store::NoteRead)> = Vec::new();
+        for (line_at, raw) in candidates.iter().map(|(at, line)| (*at, line.as_str())) {
             let Ok(line) = serde_json::from_str::<Value>(raw) else { continue };
             let main_assistant = line.get("type").and_then(|t| t.as_str()) == Some("assistant")
                 && line.get("isSidechain").and_then(|b| b.as_bool()) != Some(true);
@@ -1150,7 +1203,7 @@ pub fn record_note_reads_until(store: &mut EventStore, session: &str, root: Opti
             let at = line.get("timestamp").and_then(|t| t.as_str()).and_then(crate::eval_filing::unix_of_timestamp).unwrap_or(0);
             for block in line.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_array()).into_iter().flatten() {
                 let is_get = block.get("type").and_then(|t| t.as_str()) == Some("tool_use")
-                    && block.get("name").and_then(|n| n.as_str()).is_some_and(|n| n.ends_with("__get"));
+                    && block.get("name").and_then(|n| n.as_str()).is_some_and(|n| n.starts_with("mcp__") && n.ends_with("__get"));
                 let (Some(id), Some(tool_use_id)) = (
                     block.get("input").and_then(|i| i.get("id")).and_then(|v| v.as_str()),
                     block.get("id").and_then(|v| v.as_str()),
@@ -1160,14 +1213,37 @@ pub fn record_note_reads_until(store: &mut EventStore, session: &str, root: Opti
                 if !is_get {
                     continue;
                 }
-                let read = model::store::NoteRead { id: id.to_string(), tool_use_id: tool_use_id.to_string(), at };
-                if matches!(model::store::record_note_read(store, session, SystemActor::new(ATTESTER_ACTOR), &read), Ok(Some(_))) {
-                    recorded += 1;
+                if !already.contains(tool_use_id) {
+                    fresh.push((line_at, model::store::NoteRead { id: id.to_string(), tool_use_id: tool_use_id.to_string(), at }));
                 }
+            }
+        }
+        if fresh.is_empty() {
+            continue;
+        }
+        // A `get` counts as a read only when its own result is THOR's answer: a note with that
+        // very id. A `get` of another connector (any server may name a tool `get`), one that
+        // failed, and one still running (its result is not on disk yet; the next Stop looks
+        // again) read nothing.
+        for (line_at, read) in &fresh {
+            if !results_after(&file, *line_at, &read.tool_use_id).iter().any(|(is_error, text)| !is_error && is_thor_note(text, &read.id)) {
+                continue;
+            }
+            if matches!(model::store::record_note_read(store, session, SystemActor::new(ATTESTER_ACTOR), &read), Ok(Some(_))) {
+                recorded += 1;
             }
         }
     }
     recorded
+}
+
+/// Whether `text` is what THOR's `get` answers for note `id`: a JSON object whose `id` is the
+/// note and that carries the note's `kind` and `text` (the answer may be followed by more text).
+fn is_thor_note(text: &str, id: &str) -> bool {
+    let Some(Ok(Value::Object(note))) = serde_json::Deserializer::from_str(text.trim_start()).into_iter::<Value>().next() else {
+        return false;
+    };
+    note.get("id").and_then(|v| v.as_str()) == Some(id) && note.contains_key("kind") && note.contains_key("text")
 }
 
 /// The tool call ids of the hook failures recorded between log seq
@@ -2397,11 +2473,69 @@ mod tests {
             "type": "assistant", "timestamp": "2026-11-01T10:00:00.000Z",
             "message": {"content": [{"type": "tool_use", "id": "toolu_1", "name": "mcp__thor__get", "input": {"id": "some-note"}}]}
         });
-        std::fs::write(project.join(format!("{S1}.jsonl")), format!("{line}\n")).unwrap();
+        let answer = json!({
+            "type": "user",
+            "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_1",
+                "content": [{"type": "text", "text": "{\"id\": \"some-note\", \"kind\": \"orientation\", \"text\": \"x\"}"}]}]}
+        });
+        std::fs::write(project.join(format!("{S1}.jsonl")), format!("{line}\n{answer}\n")).unwrap();
         let mut store = EventStore::in_memory().unwrap();
         assert_eq!(record_note_reads_until(&mut store, S1, Some(dir.path()), &|| false), 0);
         assert_eq!(record_note_reads_in(&mut store, S1, Some(dir.path())), 1, "the next Stop records the read");
         assert_eq!(record_note_reads_in(&mut store, S1, Some(dir.path())), 0, "and only once");
+    }
+
+    /// One `get` call as a transcript holds it, with the answer when `answer` is given.
+    fn get_call(file: &Path, tool: &str, tool_use_id: &str, note: &str, answer: Option<(&str, bool)>) {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(file).unwrap();
+        let line = json!({
+            "type": "assistant", "timestamp": "2026-11-01T10:00:00.000Z",
+            "message": {"content": [{"type": "tool_use", "id": tool_use_id, "name": tool, "input": {"id": note}}]}
+        });
+        writeln!(f, "{line}").unwrap();
+        if let Some((text, is_error)) = answer {
+            let result = json!({
+                "type": "user",
+                "message": {"content": [{"type": "tool_result", "tool_use_id": tool_use_id, "is_error": is_error,
+                    "content": [{"type": "text", "text": text}]}]}
+            });
+            writeln!(f, "{result}").unwrap();
+        }
+    }
+
+    /// REAL TRANSCRIPTS NAME ANOTHER CONNECTOR'S `get` TOO (a memory connector that has its own
+    /// `get`, seen as `mcp__<uuid>__get` in real sessions of the owner): only a `get` whose
+    /// answer is THOR's note counts as a read of the note, whatever the server is called.
+    #[test]
+    fn only_a_get_answered_with_the_note_counts_as_a_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("C--Users-someone-dev-demo").join(format!("{S1}.jsonl"));
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let note = r#"{"id": "the-note", "kind": "rule", "text": "x", "falsifier": "y"}"#;
+        // Another connector's `get`, asked with an `id`, that answers something else.
+        get_call(&file, "mcp__47d4a877-5022-48ae-b05f-dfbe635261fc__get", "toolu_other", "the-note", Some(("{\"entity_id\": \"mem-1\"}", false)));
+        // THOR's own `get` that failed, one that answered another note, and one still running.
+        get_call(&file, "mcp__thor__get", "toolu_failed", "the-note", Some(("no item 'the-note'", true)));
+        get_call(&file, "mcp__thor__get", "toolu_wrong", "the-note", Some((r#"{"id": "another", "kind": "rule", "text": "x"}"#, false)));
+        get_call(&file, "mcp__thor__get", "toolu_running", "the-note", None);
+        let mut store = EventStore::in_memory().unwrap();
+        assert_eq!(record_note_reads_in(&mut store, S1, Some(dir.path())), 0, "none of those read the note");
+        // The running call gets its answer: the next Stop records it. And the same server under
+        // another name (a connector that carries THOR's tools) counts the same way.
+        let answer = json!({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_running",
+            "content": [{"type": "text", "text": format!("{note}\n\nrecent firings: none")}]}]}});
+        get_call(&file, "mcp__0c9b3c1e-aaaa-bbbb-cccc-111122223333__get", "toolu_renamed", "the-note", Some((note, false)));
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&file).unwrap();
+            writeln!(f, "{answer}").unwrap();
+        }
+        assert_eq!(record_note_reads_in(&mut store, S1, Some(dir.path())), 2);
+        let reads = model::store::note_reads_in(&store.get_events_by_entity(&model::store::note_read_entity(S1)).unwrap());
+        let mut ids: Vec<&str> = reads.iter().map(|r| r.tool_use_id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["toolu_renamed", "toolu_running"]);
     }
 
     fn absent_rule() -> Item {
