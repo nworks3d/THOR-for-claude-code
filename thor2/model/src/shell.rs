@@ -258,6 +258,22 @@ pub struct Segment {
     /// the first command of its and-or list, outside any group, not part of a
     /// pipeline and not sent to the background. See `env_before`.
     pub certain: bool,
+    /// Set only when a read-only search (`grep`, `rg`, `findstr`, `Select-String`,
+    /// `git log --grep`) sits in this segment's unit: the same unit, words and head with the
+    /// search PATTERN left out. A forbidden literal is looked for here instead, because a
+    /// pattern only names what to look for (`grep -ci 'co-authored'`) and writes nothing. See
+    /// `literal_site`.
+    pub masked: Option<Box<Masked>>,
+}
+
+/// A segment's unit, unit words and head with the search patterns of its read-only searches
+/// left out (`Segment::masked`).
+#[derive(Debug, Clone)]
+pub struct Masked {
+    pub unit: String,
+    pub command_len: usize,
+    pub unit_words: String,
+    pub head: Vec<String>,
 }
 
 impl Segment {
@@ -331,6 +347,7 @@ fn flat_segment(command: &str) -> Segment {
         tool: false,
         bounded: false,
         certain: false,
+        masked: None,
     }
 }
 
@@ -362,6 +379,7 @@ pub fn tool_segment_with_fields(tool: &str, content: &str, fields: &str) -> Segm
         tool: true,
         bounded: false,
         certain: false,
+        masked: None,
     }
 }
 
@@ -1046,7 +1064,8 @@ fn collect(command: &str, d: Dialect, depth: usize, start: Place, remote: bool, 
                 + if cd_part.is_empty() { 0 } else { cd_part.len() + 1 }
                 + (word_bytes[wt + 1] - word_bytes[wf]);
             let own = command.get(raw.start..raw.end.max(raw.start)).unwrap_or("").trim().to_string();
-            let (unit, command_len, unit_words) = if size <= reading.budget {
+            let in_budget = size <= reading.budget;
+            let (unit, command_len, unit_words) = if in_budget {
                 reading.budget -= size;
                 let mut unit = text.to_string();
                 let command_len = unit.len();
@@ -1096,6 +1115,7 @@ fn collect(command: &str, d: Dialect, depth: usize, start: Place, remote: bool, 
                 .iter()
                 .map(|(target, append)| Redirect { target: target.clone(), append: *append, producer })
                 .collect();
+            let masked = masked_reading(command, &raws, if in_budget { wf..=wt } else { k..=k }, d, &unit, command_len, k, &head);
             reading.out.push(Segment {
                 words: raw.words.clone(),
                 head: head.clone(),
@@ -1115,6 +1135,7 @@ fn collect(command: &str, d: Dialect, depth: usize, start: Place, remote: bool, 
                 tool: false,
                 bounded: false,
                 certain: first_in_list && groups.open.is_empty() && first == last && raw.ended_by != Sep::Background,
+                masked,
             });
             // A `cd` moves the folder of what follows - when the shell does
             // not refuse it, and when it can take effect here at all: in sh a
@@ -1387,6 +1408,278 @@ fn head_and_program(words: &[String], d: Dialect, text: &str) -> (Vec<String>, S
         }
     }
     (out, program)
+}
+
+// ------------------------------------------------------- read-only searches
+
+/// Programs that only look for text: what they are given to look FOR names a thing to find, it
+/// never writes anything (`grep -ci 'co-authored'`).
+const SEARCH_PROGRAMS: &[&str] = &["grep", "egrep", "fgrep", "zgrep", "rg", "ag", "ack", "findstr", "select-string", "sls"];
+
+/// The git subcommands whose `--grep`, `-S` and `-G` look for text in history.
+const GIT_SEARCH_SUBCOMMANDS: &[&str] = &["log", "rev-list", "shortlog", "whatchanged", "reflog"];
+
+/// Long options of the grep family that take a value of their own (never a pattern).
+const GREP_LONG_VALUES: &[&str] = &[
+    "max-count", "after-context", "before-context", "context", "include", "exclude", "exclude-dir", "include-dir", "color",
+    "colour", "binary-files", "devices", "directories", "label", "glob", "iglob", "type", "type-not", "max-depth", "threads",
+    "replace", "encoding", "sort", "sortr", "max-columns", "pre", "pre-glob", "path-separator", "ignore-file",
+];
+
+/// The words of one simple command that are the search PATTERN of a read-only search, each with
+/// what stays of the word (the flag that carries it, or nothing). `None` when the command is no
+/// such search.
+fn search_patterns(words: &[String], d: Dialect, text: &str) -> Option<Vec<(usize, String)>> {
+    let git_search = |w: &String| {
+        w.starts_with("--grep") || w == "grep" || (w.starts_with("-S") || w.starts_with("-G")) && !w.starts_with("--")
+    };
+    let relevant = words.iter().any(|w| {
+        let base = base_lower(w);
+        SEARCH_PROGRAMS.contains(&base.as_str()) || (base == "git" && words.iter().any(git_search))
+    });
+    if !relevant {
+        return None;
+    }
+    let (head, program) = head_and_program(words, d, text);
+    let skip = words.len().checked_sub(head.len().max(1))?;
+    let program = program.strip_suffix(".exe").unwrap_or(&program).to_string();
+    // The head must be the words from the program on (git's own options aside): else read nothing.
+    if program != "git" && words.get(skip + 1..) != head.get(1..) {
+        return None;
+    }
+    if SEARCH_PROGRAMS.contains(&program.as_str()) {
+        return Some(match program.as_str() {
+            "findstr" => findstr_patterns(words, skip + 1),
+            "select-string" | "sls" => select_string_patterns(words, skip + 1),
+            "grep" | "egrep" | "fgrep" | "zgrep" => grep_patterns(words, skip + 1, "mABCdD"),
+            _ => grep_patterns(words, skip + 1, "mABCgtTjMdr"),
+        });
+    }
+    if program != "git" {
+        return None;
+    }
+    let sub = head.get(1).map(|w| w.to_ascii_lowercase()).unwrap_or_default();
+    if sub == "grep" {
+        let at = words.iter().skip(skip + 1).position(|w| w == "grep")? + skip + 1;
+        Some(grep_patterns(words, at + 1, "mABCdD"))
+    } else if GIT_SEARCH_SUBCOMMANDS.contains(&sub.as_str()) {
+        Some(git_log_patterns(words, skip + 1))
+    } else {
+        None
+    }
+}
+
+fn grep_patterns(words: &[String], from: usize, short_values: &str) -> Vec<(usize, String)> {
+    let mut explicit: Vec<(usize, String)> = Vec::new();
+    let (mut from_file, mut first_positional) = (false, None);
+    let mut i = from;
+    while i < words.len() {
+        let w = words[i].as_str();
+        if w == "--" {
+            if first_positional.is_none() && i + 1 < words.len() {
+                first_positional = Some(i + 1);
+            }
+            break;
+        }
+        if let Some(long) = w.strip_prefix("--") {
+            let (name, has_value) = match long.split_once('=') {
+                Some((n, _)) => (n, true),
+                None => (long, false),
+            };
+            if name == "regexp" {
+                if has_value {
+                    explicit.push((i, "--regexp=".to_string()));
+                } else if i + 1 < words.len() {
+                    explicit.push((i + 1, String::new()));
+                    i += 1;
+                }
+            } else if name == "file" {
+                from_file = true;
+                i += usize::from(!has_value);
+            } else if GREP_LONG_VALUES.contains(&name) && !has_value {
+                i += 1;
+            }
+        } else if w.starts_with('-') && w.len() > 1 {
+            let letters: Vec<char> = w.chars().skip(1).collect();
+            for (j, c) in letters.iter().enumerate() {
+                let last = j + 1 == letters.len();
+                if *c == 'e' {
+                    if !last {
+                        explicit.push((i, format!("-{}e", letters[..j].iter().collect::<String>())));
+                    } else if i + 1 < words.len() {
+                        explicit.push((i + 1, String::new()));
+                        i += 1;
+                    }
+                    break;
+                }
+                if *c == 'f' {
+                    from_file = true;
+                    i += usize::from(last);
+                    break;
+                }
+                if short_values.contains(*c) {
+                    i += usize::from(last);
+                    break;
+                }
+            }
+        } else if first_positional.is_none() {
+            first_positional = Some(i);
+        }
+        i += 1;
+    }
+    if !explicit.is_empty() {
+        explicit
+    } else if from_file {
+        Vec::new()
+    } else {
+        first_positional.map(|p| vec![(p, String::new())]).unwrap_or_default()
+    }
+}
+
+fn findstr_patterns(words: &[String], from: usize) -> Vec<(usize, String)> {
+    let mut explicit = Vec::new();
+    let (mut from_file, mut first_positional) = (false, None);
+    for (i, w) in words.iter().enumerate().skip(from) {
+        let lower = w.to_ascii_lowercase();
+        if lower.starts_with("/c:") {
+            explicit.push((i, w[..3].to_string()));
+        } else if lower.starts_with("/g:") {
+            from_file = true;
+        } else if (lower.len() == 2 && lower.starts_with('/')) || ["/f:", "/d:", "/a:", "/off"].iter().any(|s| lower.starts_with(s)) {
+            // a switch
+        } else if first_positional.is_none() {
+            first_positional = Some(i);
+        }
+    }
+    if !explicit.is_empty() {
+        explicit
+    } else if from_file {
+        Vec::new()
+    } else {
+        first_positional.map(|p| vec![(p, String::new())]).unwrap_or_default()
+    }
+}
+
+fn select_string_patterns(words: &[String], from: usize) -> Vec<(usize, String)> {
+    const VALUE_PARAMS: &[&str] = &["path", "literalpath", "include", "exclude", "encoding", "context", "inputobject", "culture"];
+    let mut explicit = Vec::new();
+    let mut first_positional = None;
+    let mut i = from;
+    while i < words.len() {
+        let w = words[i].as_str();
+        if let Some(param) = w.strip_prefix('-').filter(|p| p.chars().next().is_some_and(|c| c.is_ascii_alphabetic())) {
+            let (name, colon) = match param.split_once(':') {
+                Some((n, _)) => (n.to_ascii_lowercase(), true),
+                None => (param.to_ascii_lowercase(), false),
+            };
+            if name == "pattern" {
+                if colon {
+                    explicit.push((i, w[..w.find(':').unwrap_or(w.len()) + 1].to_string()));
+                } else if i + 1 < words.len() {
+                    explicit.push((i + 1, String::new()));
+                    i += 1;
+                }
+            } else if VALUE_PARAMS.contains(&name.as_str()) && !colon {
+                i += 1;
+            }
+        } else if first_positional.is_none() {
+            first_positional = Some(i);
+        }
+        i += 1;
+    }
+    if !explicit.is_empty() {
+        explicit
+    } else {
+        first_positional.map(|p| vec![(p, String::new())]).unwrap_or_default()
+    }
+}
+
+fn git_log_patterns(words: &[String], from: usize) -> Vec<(usize, String)> {
+    let mut found = Vec::new();
+    let mut i = from;
+    while i < words.len() {
+        let w = words[i].as_str();
+        if w.starts_with("--grep=") {
+            found.push((i, "--grep=".to_string()));
+        } else if matches!(w, "--grep" | "-S" | "-G") {
+            if i + 1 < words.len() {
+                found.push((i + 1, String::new()));
+                i += 1;
+            }
+        } else if !w.starts_with("--") && (w.starts_with("-S") || w.starts_with("-G")) && w.len() > 2 {
+            found.push((i, w[..2].to_string()));
+        }
+        i += 1;
+    }
+    found
+}
+
+/// The unit, unit words and head of the segment at `k` with the patterns of every read-only
+/// search in `range` left out - `None` when none of them has a pattern, so nothing differs.
+fn masked_reading(
+    command: &str,
+    raws: &[Raw],
+    range: std::ops::RangeInclusive<usize>,
+    d: Dialect,
+    unit: &str,
+    command_len: usize,
+    k: usize,
+    head: &[String],
+) -> Option<Box<Masked>> {
+    let mut any = false;
+    let mut pieces: Vec<String> = Vec::new();
+    let mut words: Vec<String> = Vec::new();
+    let mut own_head: Option<Vec<String>> = None;
+    for i in range {
+        let raw = &raws[i];
+        let text = command.get(raw.start..raw.end.max(raw.start)).unwrap_or("").trim();
+        let masks = if raw.subs.is_empty() { search_patterns(&raw.words, d, text) } else { None };
+        match masks {
+            Some(masks) if !masks.is_empty() => {
+                any = true;
+                let kept: Vec<String> = raw
+                    .words
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(j, w)| match masks.iter().find(|(m, _)| *m == j) {
+                        Some((_, keep)) => (!keep.is_empty()).then(|| keep.clone()),
+                        None => Some(w.clone()),
+                    })
+                    .collect();
+                if i == k {
+                    let mut h = head.to_vec();
+                    for (m, keep) in &masks {
+                        if let Some(at) = h.iter().skip(1).position(|w| *w == raw.words[*m]) {
+                            if keep.is_empty() {
+                                h.remove(at + 1);
+                            } else {
+                                h[at + 1] = keep.clone();
+                            }
+                        }
+                    }
+                    own_head = Some(h);
+                }
+                pieces.push(kept.join(" "));
+                words.extend(kept);
+            }
+            _ => {
+                pieces.push(text.to_string());
+                words.extend(raw.words.iter().cloned());
+            }
+        }
+    }
+    if !any {
+        return None;
+    }
+    let mut masked_unit = pieces.join("\n");
+    let masked_len = masked_unit.len();
+    masked_unit.push_str(unit.get(command_len..).unwrap_or(""));
+    Some(Box::new(Masked {
+        unit: masked_unit,
+        command_len: masked_len,
+        unit_words: words.join(" "),
+        head: own_head.unwrap_or_else(|| head.to_vec()),
+    }))
 }
 
 /// Command strings a segment runs by way of a wrapper, with their dialect and
@@ -2860,6 +3153,78 @@ pub fn find_literal(text: &str, literal: &str) -> Option<usize> {
 /// whitespace it stands for. An empty literal is found at the start, as a
 /// plain substring search finds it (the write gate never stores one).
 pub fn find_at_boundary(text: &str, literal: &str) -> Option<usize> {
+    find_exact_at_boundary(text, literal)
+        .or_else(|| flag_value_spelling(literal).and_then(|alt| find_exact_at_boundary(text, &alt)))
+        .or_else(|| find_in_flag_cluster(text, literal))
+}
+
+/// `--visibility public` and `--visibility=public` are the same flag: the other spelling of the
+/// first long flag of a literal that names a value, or `None`. A value that starts with a dash is
+/// another flag, not a value (two flags in a row stay as they are).
+fn flag_value_spelling(literal: &str) -> Option<String> {
+    let words: Vec<&str> = literal.split(' ').collect();
+    for (i, w) in words.iter().enumerate() {
+        if !w.starts_with("--") || w.len() < 3 {
+            continue;
+        }
+        if let Some((name, value)) = w.split_once('=') {
+            if name.len() > 2 && !value.is_empty() {
+                let mut out: Vec<String> = words.iter().map(|w| w.to_string()).collect();
+                out[i] = format!("{name} {value}");
+                return Some(out.join(" "));
+            }
+            continue;
+        }
+        if let Some(next) = words.get(i + 1).filter(|n| !n.is_empty() && !n.starts_with('-')) {
+            let mut out: Vec<String> = words[..i].iter().map(|w| w.to_string()).collect();
+            out.push(format!("{w}={next}"));
+            out.extend(words[i + 2..].iter().map(|w| w.to_string()));
+            return Some(out.join(" "));
+        }
+    }
+    None
+}
+
+/// A literal that is one single-letter short flag (`-D`, or a command ending in one) is also
+/// found inside a cluster of letters after one dash (`-Df`, `-fD`): every flag of a cluster is
+/// in force. Only a cluster of two or three letters that stands alone as a word counts - not
+/// `-D=x`, `-n5`, `--Df`, `-Dfoo.bar`, nor a longer single-dash word such as `-eval` or `-name`.
+fn find_in_flag_cluster(text: &str, literal: &str) -> Option<usize> {
+    let (prefix, flag) = match literal.rsplit_once(' ') {
+        Some((p, f)) => (Some(p.trim_end()), f),
+        None => (None, literal),
+    };
+    let letter = flag.strip_prefix('-').filter(|l| l.len() == 1 && l.chars().all(|c| c.is_ascii_alphabetic()))?;
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let starts_word = bytes[i] == b'-'
+            && text[..i].chars().next_back().is_none_or(|b| b.is_whitespace() || matches!(b, '"' | '\'' | ';' | '|' | '&' | '('));
+        if !starts_word {
+            i += 1;
+            continue;
+        }
+        let run = text[i + 1..].bytes().take_while(u8::is_ascii_alphabetic).count();
+        let end = i + 1 + run;
+        let closes = text[end..].chars().next().is_none_or(|c| c.is_whitespace() || matches!(c, '"' | '\'' | ';' | '|' | '&' | ')'));
+        if (2..=3).contains(&run) && closes && text[i + 1..end].contains(letter) {
+            let before_ok = match prefix {
+                None => true,
+                Some(p) => {
+                    let head = text[..i].trim_end();
+                    head.ends_with(p) && text[..head.len() - p.len()].chars().next_back().is_none_or(is_boundary_char)
+                }
+            };
+            if before_ok {
+                return Some(i);
+            }
+        }
+        i = end.max(i + 1);
+    }
+    None
+}
+
+fn find_exact_at_boundary(text: &str, literal: &str) -> Option<usize> {
     let (Some(first), Some(last)) = (literal.chars().next(), literal.chars().next_back()) else {
         return Some(0);
     };
@@ -3073,21 +3438,29 @@ pub fn literal_site(seg: &Segment, literal: &str) -> Option<(String, String)> {
     if seg.tool && field_token(literal).is_some() {
         return literal_at_boundary(&seg.fields, literal).then(|| (seg.fields.clone(), literal.to_string()));
     }
-    if let Some(at) = find_at_boundary(&seg.unit, literal) {
+    // What a read-only search looks FOR (its pattern) is not looked at: it writes nothing.
+    let (unit, command_len, unit_words) = match &seg.masked {
+        Some(m) => (m.unit.as_str(), m.command_len, m.unit_words.as_str()),
+        None => (seg.unit.as_str(), seg.command_len, seg.unit_words.as_str()),
+    };
+    if let Some(at) = find_at_boundary(unit, literal) {
         // Quote the part it sits in: the command text, or what follows it.
-        let cut = seg.command_len.min(seg.unit.len());
-        let part = if at < cut { seg.unit.get(..cut) } else { seg.unit.get(cut..) };
-        let part = part.map(str::trim).filter(|p| literal_at_boundary(p, literal)).unwrap_or(&seg.unit);
+        let cut = command_len.min(unit.len());
+        let part = if at < cut { unit.get(..cut) } else { unit.get(cut..) };
+        let part = part.map(str::trim).filter(|p| literal_at_boundary(p, literal)).unwrap_or(unit);
         return Some((part.to_string(), literal.to_string()));
     }
     let short = collapsed(literal);
     if short.is_empty() {
         return None;
     }
-    if literal_at_boundary(&seg.unit_words, &short) {
-        return Some((seg.unit_words.clone(), short));
+    if literal_at_boundary(unit_words, &short) {
+        return Some((unit_words.to_string(), short));
     }
-    let head = seg.head_text();
+    let head = match &seg.masked {
+        Some(m) => m.head.join(" "),
+        None => seg.head_text(),
+    };
     literal_at_boundary(&head, &short).then(|| (head, short))
 }
 

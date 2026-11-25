@@ -742,6 +742,15 @@ remembers per session how far it has looked, so a long conversation does not mak
 - You notice: the tool call is refused with "[THOR]", the rule id and the fragment.
 - Refuse or change: remove or revise the rule (with a reason). A part of a call that runs in another project's folder
   (`cd ../other && git push`) is judged by that project's rules.
+- Spellings: `--flag value` and `--flag=value` are one flag (a rule written `--visibility public` also
+  catches `--visibility=public`; two flags in a row such as `--delete --force` are not one flag with a value).
+  A single-letter flag in a rule (`-D`) is also found in a cluster of two or three letters after one dash
+  (`-Df`, `-fD`), not in `-D=x`, `--Df` or a longer word such as `-eval`.
+- What a search looks for is not looked at: the pattern of grep, rg, findstr, Select-String and
+  `git log --grep` / `-S` / `-G` is left out, so `git log | grep -ci "co-authored"` is not a commit message
+  with that word. The same word in any other part of the call (a message, a file name) still counts. Not
+  covered: a search through another program (awk, sed, a one-line script), and `requires` triggers, which
+  are still read in the pattern.
 
 ### D2. A forgotten required part (requires)
 - What: a rule can demand that a call also contains one of a set of answers (for example every Agent
@@ -795,6 +804,40 @@ remembers per session how far it has looked, so a long conversation does not mak
   whose check runs and holds right now may block.
 - You notice: silence; doctor names what rotted.
 - Refuse or change: built in.
+
+### D7b. Files only Claude Code and THOR write
+- What: always on, no rule needed. A call that writes to a saved conversation (a `.jsonl` file under the
+  `projects` folder of Claude Code's folder or `CLAUDE_CONFIG_DIR`), to THOR's memory and its state files
+  (the folder the memory lives in; the files you edit by hand stay open), or to THOR's programs is
+  refused with nothing done. Covered: the Write, Edit, MultiEdit and NotebookEdit tools (also a `filePath`
+  key); redirects, tee, cp, mv, rm, Set-Content, Add-Content, Out-File, Tee-Object, Export-Csv, touch,
+  New-Item, sed -i and sed `w`, truncate, dd, curl and wget (also `-sSLo f`, `-of`, `-qO f`), Invoke-WebRequest
+  `-OutFile`, certutil `-urlcache`, bitsadmin, `git checkout --`, `git restore`, `git archive -o`,
+  `git diff --output`, links; a whole tree copied or extracted into the memory's folder, THOR's programs or
+  a folder of saved conversations (cp -r, robocopy, xcopy, rsync, Copy-Item -Recurse, tar -x -C, unzip -d,
+  7z x, Expand-Archive, git clone, git checkout-index); a wildcard delete (`rm -rf <folder>/*`,
+  `del <folder>\*.json`), a delete of a project folder under `projects`, `Get-ChildItem <folder> |
+  Remove-Item`, `ls <folder> | xargs rm`, `find <folder> -delete`; a git command that rewrites the working
+  tree there (`git -C <folder> reset --hard`, `clean`, `checkout`); a one-line program (python -c, node -e,
+  perl -e, ruby -e, php -r, awk) only when its write is aimed at such a path (open for writing, write_text,
+  unlink, remove, rmtree, rename, a copy onto it, writeFileSync, an awk redirect, perl -pi, a sqlite write
+  on the memory, a shell command in a string); `powershell -EncodedCommand` (decoded and read), `iex`.
+  Paths are compared without case, with either slash, with `~`, `%VAR%`, `$VAR`, `$env:VAR`, `${env:VAR}`,
+  HOMEDRIVE and HOMEPATH and CLAUDE_CONFIG_DIR written out, `..` resolved, a trailing dot or space and
+  `::$DATA` dropped, `\\?\`, `\\.\` and `\\localhost\c$` forms read as the drive path, and an 8.3 short
+  name looked up when the folder exists. Reading, and copying a file away, stay free, and so does writing a
+  file in the memory's folder that is not a state file (notes.txt).
+- Why: the owner's words are read from the saved conversation, and the guard that watches the assistant
+  lives in these folders; if the assistant could write there it could forge what the owner said.
+- You notice: the call is refused with "[THOR] That would change a file that only Claude Code and THOR write".
+- What it cannot see (stated, not hidden): a script file that writes (`python script.py`, `.ps1`, `.bat`),
+  a path built at run time (a variable, `sys.argv`, a command substitution, string pieces joined by the
+  program), `eval`, a link or junction made in an earlier step and written through later, a hard link, a
+  program started by another program, `Start-Process -ArgumentList`, a 8.3 name of a file that does not exist
+  yet, and a pipe delete that filters in between (`gci <folder> | Where-Object ... | Remove-Item` is let
+  through, because the filter may rule out the state files). It is a guard against a wrong turn, not a
+  security boundary against someone who is set on getting past it.
+- Refuse or change: built in. To change a THOR setting use the matching option of the install program.
 
 ### D8. Starter notes never refuse
 - What: the 14 workflow notes that are not about Windows console windows, the two helper-mode notes and the 22 pinned notes carry no check.
