@@ -98,7 +98,9 @@ fn every_write_reply_names_its_event_seq() {
     assert_eq!(named_seq(&reply), last_of(&s.db, id, EventKind::FactCreated).seq, "remember: {reply}");
     let reply = s.call(&mut mcp, "revise", json!({"id": id, "text": "Keep commit subjects under 50 characters."}), "toolu_q2");
     assert_eq!(named_seq(&reply), last_of(&s.db, id, EventKind::FactRevised).seq, "revise: {reply}");
-    let reply = s.call(&mut mcp, "pin", json!({"id": id}), "toolu_q3");
+    let mut pin_args = json!({"id": id});
+    owners_go_in(&s.db, tmp.path(), WRITING_SESSION, &mut pin_args);
+    let reply = s.call(&mut mcp, "pin", pin_args, "toolu_q3");
     assert_eq!(named_seq(&reply), last_of(&s.db, id, EventKind::FactRevised).seq, "pin: {reply}");
     let reply = s.call(&mut mcp, "unpin", json!({"id": id, "because": "proven out of date: nothing of it is left and nothing replaces it"}), "toolu_q4");
     assert_eq!(named_seq(&reply), last_of(&s.db, id, EventKind::FactRevised).seq, "unpin: {reply}");

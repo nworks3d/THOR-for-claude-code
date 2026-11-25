@@ -184,6 +184,11 @@ pub fn plain_summary(db: &Path, cwd: &Path, settings: Option<&Path>, mcp_json: O
         lines.push(format!("  NOTE: {line}"));
     }
 
+    // Silent unless a subject holds notes and has no folder of its own.
+    if let Some(line) = folderless_note(db) {
+        lines.push(format!("  NOTE: {line}"));
+    }
+
     // Silent unless the owner named a temp-until-live or tools folder AND it
     // needs a look (or cannot be reached).
     for note in work_folders_report(db).notes {
@@ -197,6 +202,29 @@ pub fn plain_summary(db: &Path, cwd: &Path, settings: Option<&Path>, mcp_json: O
 
     lines.push("Everything below is the detailed report, written for your assistant. You do not need to read it.".to_string());
     lines
+}
+
+/// The most project names the short summary spells out.
+const FOLDERLESS_NAMES_SHOWN: usize = 5;
+
+/// The one NOTE of the short summary about subjects that hold notes but have no
+/// folder of their own (`serve::other_project::folderless_projects`): their notes
+/// never come up by themselves. At most five names, then "and N more".
+pub fn folderless_note(db: &Path) -> Option<String> {
+    let store = EventStore::open_existing(db).ok()?;
+    let found = serve::other_project::folderless_projects(&store);
+    if found.is_empty() {
+        return None;
+    }
+    let shown: Vec<String> = found.iter().take(FOLDERLESS_NAMES_SHOWN).map(|f| format!("'{}' ({})", f.project, f.notes)).collect();
+    let more = match found.len().saturating_sub(FOLDERLESS_NAMES_SHOWN) {
+        0 => String::new(),
+        n => format!(" and {n} more"),
+    };
+    Some(format!(
+        "these subjects have notes but no folder of their own, so the notes never come up by themselves: {}{more}. Next step: ask your assistant to give each a folder (it runs THOR's install inside a new folder with --topic added), or to retire the notes you no longer need.",
+        shown.join(", ")
+    ))
 }
 
 /// The one NOTE of the short summary about the end-of-session routine
@@ -4621,6 +4649,32 @@ mod tests {
         store
             .append_event("legacy", &item.id, "migration", thor_core::event_store::EventKind::FactCreated, &item.id, None, &body)
             .unwrap();
+    }
+
+    /// A subject that holds notes and has no folder is named in the short summary (at most five
+    /// names, then "and N more"); a memory with every subject in a folder, or none, stays silent.
+    #[test]
+    fn the_short_summary_names_subjects_with_notes_and_no_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut s = EventStore::new(&db).unwrap();
+            for (n, project) in ["Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot", "Golf"].iter().enumerate() {
+                let mut r = rule(&format!("f{n}"));
+                r.project = Some(project.to_string());
+                legacy_declare(&mut s, &r);
+            }
+        }
+        let note = folderless_note(&db).expect("seven subjects have no folder");
+        assert!(note.contains("have notes but no folder of their own"), "{note}");
+        assert_eq!(note.matches('\'').count() / 2, 5, "five names are spelled out: {note}");
+        assert!(note.contains("and 2 more") && note.contains("give each a folder") && note.contains("retire the notes"), "{note}");
+        let summary = plain_summary(&db, dir.path(), None, None);
+        assert!(summary.iter().any(|l| l.starts_with("  NOTE: these subjects have notes but no folder")), "{summary:?}");
+
+        let empty = dir.path().join("empty.db");
+        EventStore::new(&empty).unwrap();
+        assert!(folderless_note(&empty).is_none());
     }
 
     /// Two project names that are one name written two ways get one line each

@@ -427,6 +427,7 @@ fn note_carries_check_says_write_it_through_revise_and_that_lands() {
     let mut mcp = fx.mcp();
     let mut args = rule("n1", "Never run `sshpass` here; use keys.", Some("demo"));
     args["always"] = json!(true);
+    owners_go(&fx.db, fx.dir(), &mut args);
     assert!(mcp.call("remember", args).contains("teeth: note"));
     // A bin writing past the trial: the store refuses the note label beside a check.
     let mut store = EventStore::open_existing(&fx.db).unwrap();
@@ -464,6 +465,7 @@ fn weakening_widened_says_give_because_and_giving_it_lands() {
     let mut args = rule("sev", "A fixture rule about a costly thing.", Some("demo"));
     args["severity"] = json!("costly");
     args["always"] = json!(true);
+    owners_go(&fx.db, fx.dir(), &mut args);
     assert!(landed(&mcp.call("remember", args)));
     let reply = mcp.call("revise", json!({"id": "sev", "severity": "house_style"}));
     assert!(reply.starts_with("REFUSED:") && reply.contains("give `because`"), "{reply}");

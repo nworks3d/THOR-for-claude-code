@@ -371,7 +371,7 @@ Words used once, in plain language:
 - Why: a rule that cannot fire is invisible from every surface. Measured: 1794 of 2369 fireable items had
   never fired, 1067 anchored to a symbol only; 13 weighted project-only items, 6 never served.
 - You notice: a refusal that says exactly what to change.
-- Refuse or change: no override; bind it elsewhere or pin it (pinned notes cost tokens each session).
+- Refuse or change: no override; bind it elsewhere, or ask the owner whether it must come along in every conversation (pinning is his call alone and pinned notes cost tokens each session).
 
 ### B5. A rule needs a falsifier
 - What: one sentence naming what would prove the rule wrong. Without it the write is refused.
@@ -812,6 +812,18 @@ remembers per session how far it has looked, so a long conversation does not mak
   and the steps in this order: fold pinned notes that say the same, unpin or retract those that no longer
   carry anything, and if none can go, ask the owner. An unpin, a retract or a shorter note is never
   refused.
+  The start block is the owner's. An assistant cannot pin a note by itself: every write that adds Always
+  (remember, revise or pin) is refused, with nothing written, unless `because` holds the owner's whole message
+  between double quotes, checked in the hook against what he typed in this session (the note's id must stand in
+  that message or in the assistant message right before it). A note that is already pinned is revised as
+  before. One quote also answers the two rules below. A subject's notes reach the conversation another way: a
+  note bound to its own project (a target of kind project) comes up at a prompt typed in that subject's own
+  folder when the message shares a word with it, four at most, once per conversation. That is read only in
+  topic folders (plain folders without a code repository): measured on a copy of a real store, with every note
+  of a big code project bound this way 72 to 88 percent of its prompts would have got notes.
+  A subject that holds notes but has no folder of its own is reported: the prompt hook tells the assistant once
+  per session when the message names it, a write under it says so in its reply, and the short summary of doctor
+  names up to five of them.
   The block is only for rules that hold in every conversation. A write that adds Always to a rule that also
   names a place (a path, directory, command, symbol, route or host) is refused: a rule about one place binds
   to that place and arrives when it is needed. The way out is a reason in `because` (at least 20 characters)

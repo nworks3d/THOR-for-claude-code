@@ -451,7 +451,7 @@ fn without_known_paths_the_text_describes_each_one_instead_of_leaving_a_hole() {
 fn an_unknown_anchor_is_stored_pinned_and_offered_once() {
     let rules = questionnaire::ASSISTANT_RULES;
     assert!(rules.contains("whose anchor you do not know") && rules.contains("never invent a hostname"), "{rules}");
-    assert!(rules.contains("kind orientation with always true") && rules.contains("offer once"), "{rules}");
+    assert!(rules.contains("bound to its project") && rules.contains("Never pin it yourself") && rules.contains("offer once"), "{rules}");
     assert!(rules.contains("revise that note with the target"), "{rules}");
 }
 

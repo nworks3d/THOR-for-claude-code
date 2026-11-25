@@ -26,6 +26,9 @@ What changed: The weekly check is quieter and more reliable, and a pin can no lo
 - **A note you silenced no longer owes a verdict for ever.** A note that was marked as not belonging at every place it fired is no longer counted in the list of notes to judge, and no longer keeps the weekly check daily. If it fires somewhere new, it counts again.
 - **`doctor` names notes that exist in two versions.** Such a note is skipped everywhere, so a rule among them does nothing; doctor now lists them and says how to settle them.
 - **The weekly check says why it is daily.** The request and `doctor` now name the reason a project is on the daily rhythm.
+- **A subject with notes but no folder is reported.** When your message names a subject that has notes and no folder of its own, your assistant is told once per conversation, offers to give it a folder, and you only answer yes or no. A note saved under such a subject says so in its reply, and the short summary of `doctor` lists these subjects.
+- **The start of every conversation is yours alone.** Your assistant can no longer pin a note by itself: it has to ask you whether the note must come along in every conversation, and THOR accepts the pin only with your own message quoted. A note that is already pinned can still be maintained.
+- **A subject's folder brings its notes without pinning.** In a folder made for one subject, a note tied to that subject comes up when your message shares a word with it. The setup texts no longer tell your assistant to pin.
 
 ## 2.6.13 (2026-11-21)
 

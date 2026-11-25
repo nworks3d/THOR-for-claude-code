@@ -32,11 +32,15 @@ fn pinned_note(id: &str) -> Item {
 fn a_remember_under_the_id_of_a_live_note_is_refused_and_the_note_stays_whole() {
     let tmp = tempfile::tempdir().unwrap();
     let db = store(tmp.path(), &["demo"]);
+    {
+        // A pin is the owner's to add, so the first note is written the way the installer writes one.
+        let mut raw = EventStore::new(&db).unwrap();
+        let mut first = pinned_note("one-rule");
+        first.text = "Never run the deploy script without a dry run first.".to_string();
+        first.project = Some("demo".to_string());
+        model::store::declare(&mut raw, "s", "l", "owner", &first).unwrap();
+    }
     let mut mcp = Mcp::start(&db, tmp.path());
-    let mut args = rule("one-rule", "Never run the deploy script without a dry run first.", Some("demo"));
-    args["always"] = json!(true);
-    let first = mcp.call("remember", args);
-    assert!(first.starts_with("stored 'one-rule'"), "{first}");
 
     let mut args = rule("one-rule", "A completely different statement about log rotation settings.", Some("demo"));
     args["always"] = json!(true);

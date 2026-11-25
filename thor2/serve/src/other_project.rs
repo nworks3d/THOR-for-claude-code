@@ -76,6 +76,127 @@ pub fn prompt_note(other: &OtherProject) -> String {
     )
 }
 
+/// Is `item` a rule or note of `project` whose only binding is the project itself (a
+/// target of kind project naming it)? This is how a subject's folder brings its notes
+/// without pinning them: they come up at the prompts of that project that share a word
+/// with them (`narrow_to_prompt`).
+pub fn is_project_bound(item: &model::item::Item, project: &str) -> bool {
+    use model::item::{Binding, TargetKind};
+    item.kind.can_fire()
+        && item.project.as_deref().is_some_and(|p| model::checkout::same_project_name(p, project))
+        && !item.bindings.is_empty()
+        && item.bindings.iter().all(|b| {
+            matches!(b, Binding::Target { kind: TargetKind::Project, value } if model::checkout::same_project_name(value, project))
+        })
+}
+
+/// Is the folder a session runs in a topic folder (a plain folder with its own marker, no git
+/// repository)? Measured on a copy of a real store (2026-11-25): with every unpinned rule and
+/// note of a big code project bound to it, 72% to 88% of its prompts shared a word with at
+/// least one, so the project binding is read at a prompt only in topic folders.
+pub fn is_topic_folder(cwd: &std::path::Path) -> bool {
+    model::checkout::plain_root(cwd).is_some()
+}
+
+/// The project-bound notes of `project` that this prompt reaches: a candidate stays only when
+/// the prompt shares at least one distinctive word with it (`lookup::shares_a_word`), and when
+/// one stays the project target is added to `input`, so the ordinary ranking shows it (four at
+/// most, once per conversation like every other note). When the prompt already typed the
+/// project's name, `resolve` has added that target itself and nothing is narrowed.
+pub fn narrow_to_prompt(
+    candidates: Vec<crate::live::LiveItem>,
+    project: &str,
+    prompt: &str,
+    input: &mut crate::input::ServeInput,
+) -> Vec<crate::live::LiveItem> {
+    use model::item::{Binding, TargetKind};
+    let named = input.targets.iter().any(|(kind, value)| *kind == TargetKind::Project && model::checkout::same_project_name(value, project));
+    if named || !candidates.iter().any(|c| is_project_bound(&c.item, project)) {
+        return candidates;
+    }
+    let words = crate::lookup::distinctive_words(prompt);
+    let mut kept = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        if is_project_bound(&candidate.item, project) {
+            if !crate::lookup::shares_a_word(&candidate.item, &words) {
+                continue;
+            }
+            for binding in &candidate.item.bindings {
+                if let Binding::Target { kind: TargetKind::Project, value } = binding {
+                    let entry = (TargetKind::Project, value.clone());
+                    if !input.targets.contains(&entry) {
+                        input.targets.push(entry);
+                    }
+                }
+            }
+        }
+        kept.push(candidate);
+    }
+    kept
+}
+
+/// A project that holds live rules or notes but has no registered folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Folderless {
+    pub project: String,
+    pub notes: usize,
+}
+
+/// Every project with at least one live rule or note (a kind that can fire) and no
+/// registered folder that still resolves to it, most notes first, then by name.
+/// The spellings of one name (case, spaces, hyphens) are counted as one project.
+pub fn folderless_projects(store: &EventStore) -> Vec<Folderless> {
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for live in crate::live::live_items(store) {
+        let (true, Some(project)) = (live.item.kind.can_fire(), live.item.project.as_deref()) else { continue };
+        match counts.iter_mut().find(|(name, _)| model::checkout::same_project_name(name, project)) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((project.to_string(), 1)),
+        }
+    }
+    let mut out: Vec<Folderless> = counts
+        .into_iter()
+        .filter(|(name, _)| model::checkout::registered_checkout(store, Some(name)).is_err())
+        .map(|(project, notes)| Folderless { project, notes })
+        .collect();
+    out.sort_by(|a, b| b.notes.cmp(&a.notes).then_with(|| a.project.cmp(&b.project)));
+    out
+}
+
+/// The folderless project the prompt names (the same whole-word matching as
+/// `named_in_prompt`; never this session's own project; the longest name wins).
+pub fn folderless_named_in_prompt(store: &EventStore, prompt: &str, session_project: Option<&str>) -> Option<Folderless> {
+    let words: Vec<String> = prompt.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(fold).collect();
+    let mut spans: Vec<String> = Vec::new();
+    for start in 0..words.len() {
+        let mut joined = String::new();
+        for word in words.iter().skip(start).take(MAX_NAME_WORDS) {
+            joined.push_str(word);
+            spans.push(joined.clone());
+        }
+    }
+    folderless_projects(store)
+        .into_iter()
+        .filter(|f| {
+            let key = fold(&f.project);
+            key.chars().count() >= 4
+                && spans.contains(&key)
+                && !session_project.is_some_and(|own| model::checkout::same_project_name(own, &f.project))
+        })
+        .max_by_key(|f| fold(&f.project).len())
+}
+
+/// The one plain line for the assistant about a subject that has notes and no folder.
+pub fn folderless_line(project: &str, notes: usize) -> String {
+    let (count, verb) = match notes {
+        1 => ("1 note".to_string(), "it never comes"),
+        n => (format!("{n} notes"), "they never come"),
+    };
+    format!(
+        "[THOR] '{project}' has {count} but no folder of its own, so {verb} up by themselves. Tell the person so in one plain sentence and offer to give it a folder; they only answer yes or no. On yes: make a folder named after it and run the installer with --topic from inside it."
+    )
+}
+
 /// How every no-project line begins: `session_start::fit_extras` never drops a
 /// line that starts with it.
 pub const NO_PROJECT_PREFIX: &str = "[THOR] This session runs in a folder that belongs to no project";

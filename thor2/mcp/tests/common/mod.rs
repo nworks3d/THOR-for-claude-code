@@ -129,6 +129,29 @@ impl Drop for Mcp {
     }
 }
 
+/// THE OWNER'S GO FOR A PIN, the way the hook leaves it: the owner typed one whole message
+/// naming the note, and the call's `because` quotes it. `args` is the call's input (it names the
+/// note by `id`); its `because` is set.
+pub fn owners_go(db: &Path, dir: &Path, args: &mut serde_json::Value) {
+    owners_go_in(db, dir, "", args)
+}
+
+/// `owners_go` for a server that knows its session (the hook's record names it).
+pub fn owners_go_in(db: &Path, dir: &Path, session: &str, args: &mut serde_json::Value) {
+    let id = args["id"].as_str().expect("the call names its note").to_string();
+    let message = format!("Yes, {id} has to come along in every conversation, I decided that.");
+    let transcript = dir.join(format!("owner-go-{id}.jsonl"));
+    let line = serde_json::json!({"type": "user", "message": {"role": "user", "content": message}});
+    std::fs::write(&transcript, format!("{line}\n")).unwrap();
+    let quote = format!("the owner said: \"{message}\"");
+    serve::unpin_gate::witness(
+        db,
+        &serde_json::json!({"tool_input": {"id": id, "because": quote}, "transcript_path": transcript.to_string_lossy(), "session_id": session}),
+        serve::time::now_unix(),
+    );
+    args["because"] = serde_json::json!(quote);
+}
+
 /// A fresh store at `dir/thor.db`, with a collection named for each of
 /// `scopes` (a report filed under it), so writes into them are not refused
 /// as a new collection.
