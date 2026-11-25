@@ -2627,7 +2627,7 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                         Err(serve::eval_session::StartRefused::RunningElsewhere { start, idle_minutes }) => {
                             Some(serve::eval_session::running_elsewhere_note(&start, idle_minutes))
                         }
-                        Err(serve::eval_session::StartRefused::Store) => None,
+                        Err(serve::eval_session::StartRefused::Store | serve::eval_session::StartRefused::SaidPending) => None,
                     }
                 })
             } else {
@@ -3695,7 +3695,7 @@ fn skill_call_answer(
             Err(serve::eval_session::StartRefused::RunningElsewhere { start, idle_minutes }) => {
                 return serve::eval_session::running_elsewhere_note(&start, idle_minutes);
             }
-            Err(serve::eval_session::StartRefused::Store) => {}
+            Err(serve::eval_session::StartRefused::Store | serve::eval_session::StartRefused::SaidPending) => {}
         }
     }
     let now = time::now_unix();
@@ -4334,6 +4334,17 @@ fn eval_stop_ask(
                         // this start (step 24): one line, no hold.
                         Err(serve::eval_session::StartRefused::RunningElsewhere { start, idle_minutes }) => {
                             elsewhere.get_or_insert_with(|| serve::eval_session::running_elsewhere_note(&start, idle_minutes));
+                            continue;
+                        }
+                        // Reading what the owner said is not finished: no
+                        // start and no hold at this Stop; the next goes on.
+                        Err(serve::eval_session::StartRefused::SaidPending) => {
+                            elsewhere.get_or_insert_with(|| {
+                                format!(
+                                    "[THOR] The evaluation of '{project}' is still reading what you typed; it goes on at the next \
+                                     turn end and then starts. Nothing is needed from you."
+                                )
+                            });
                             continue;
                         }
                         Err(serve::eval_session::StartRefused::Store) => None,

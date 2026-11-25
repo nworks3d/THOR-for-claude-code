@@ -34,8 +34,11 @@
 //! and counted, never an error.
 
 use model::store::{EvaluationStart, SaidFrozen};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use thor_core::event_store::EventStore;
 
 /// A message shorter than this many characters (after white space is folded
@@ -55,7 +58,7 @@ pub const MESSAGE_CLIP_CHARS: usize = 2_000;
 const PRINT_RESERVE_CHARS: usize = 400;
 
 /// One message the owner typed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Said {
     pub at_ms: i64,
     pub text: String,
@@ -138,11 +141,16 @@ fn main_transcripts(root: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// THE REFERENCE READER, kept only so a test or the comparison example can prove
+/// that `collect_in` gives the same list: it reads every file whole. Never
+/// called by THOR itself.
+///
 /// Every message the owner typed in the main sessions of `project` after
 /// `since_ms` and at or before `until_ms`: 20 characters or longer, identical
 /// texts once (the oldest), secrets blanked, oldest first. A session belongs to
 /// the project its first working folder resolves to.
-pub fn collect_in(root: &Path, project: &str, since_ms: i64, until_ms: i64) -> Collected {
+#[doc(hidden)]
+pub fn collect_in_full(root: &Path, project: &str, since_ms: i64, until_ms: i64) -> Collected {
     let mut found: Vec<Said> = Vec::new();
     let mut unreadable = 0;
     let mut belongs: HashMap<String, bool> = HashMap::new();
@@ -196,6 +204,254 @@ pub fn collect_in(root: &Path, project: &str, since_ms: i64, until_ms: i64) -> C
     let mut seen = std::collections::HashSet::new();
     found.retain(|s| seen.insert(s.text.clone()));
     Collected { list: found, unreadable }
+}
+
+// ------------------------------------------------- the fast, bounded reader
+//
+// WHAT IS DIFFERENT FROM `collect_in_full`, AND WHY THE LIST IS THE SAME.
+// 1. A file is streamed line by line instead of being read whole and turned
+//    into one big string. Lines are cut at the same `\n` (a trailing `\r` goes,
+//    as `str::lines` does) and converted with the same lossy rule, so every line
+//    is the same text.
+// 2. A raw-byte test comes before any JSON parsing: `owner_text` only accepts a
+//    line whose `type` is the string "user", and such a line holds the bytes
+//    `"user"` (the writer, JSON.stringify, never escapes an ASCII letter). A line
+//    without those bytes is skipped unparsed. This is the one assumption.
+// 3. The window's upper end is applied when the list is assembled, not per
+//    line, so what a file gave can be kept and reused (see 4); the assembly
+//    filters, sorts and de-duplicates exactly as `collect_in_full` does, and
+//    that result does not depend on the order files or lines were met in.
+// 4. A time box. Every Stop that starts an evaluation reads under a deadline.
+//    When it runs out, the progress (per file: the byte offset up to the last
+//    whole line read, a hash of the first and of the last bytes before it, and
+//    the messages found so far) goes to a sidecar file and the evaluation is not
+//    started; the next Stop goes on from there. A file that shrank, or whose
+//    guarded bytes changed, is read again from its start. The sidecar is only
+//    ever used for the same window start and is removed when the list is whole,
+//    so no partial list is ever frozen.
+
+/// How long one Stop may spend reading transcripts for the list.
+pub const TIME_BOX: Duration = Duration::from_secs(10);
+
+/// How many bytes at the start of a file, and right before the saved offset,
+/// are hashed to notice a file that was rewritten instead of appended to.
+const GUARD_BYTES: u64 = 4096;
+
+const USER_NEEDLE: &[u8] = b"\"user\"";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileProgress {
+    /// Bytes read, up to the end of the last whole line.
+    pub offset: u64,
+    head: u64,
+    tail: u64,
+    /// Messages of the whole lines read: after the window start, any end, not
+    /// yet de-duplicated.
+    pub items: Vec<Said>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Progress {
+    pub since_ms: i64,
+    pub files: BTreeMap<String, FileProgress>,
+}
+
+fn fnv(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3))
+}
+
+/// The hashes of the first and of the last `GUARD_BYTES` bytes before `offset`.
+fn guard(file: &Path, offset: u64) -> Option<(u64, u64)> {
+    let mut handle = std::fs::File::open(file).ok()?;
+    let span = offset.min(GUARD_BYTES) as usize;
+    let mut head = vec![0u8; span];
+    handle.read_exact(&mut head).ok()?;
+    let mut tail = vec![0u8; span];
+    handle.seek(SeekFrom::Start(offset - span as u64)).ok()?;
+    handle.read_exact(&mut tail).ok()?;
+    Some((fnv(&head), fnv(&tail)))
+}
+
+/// One line as a message, when it is one inside the window start. The same
+/// steps as `collect_in_full` takes per line, minus the window's end.
+fn said_of_line(line: &str, since_ms: i64) -> Option<Said> {
+    let text = owner_prompt(line)?;
+    let at_ms = serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|v| v.get("timestamp").and_then(|t| t.as_str()).and_then(ms_of_timestamp))?;
+    if at_ms <= since_ms {
+        return None;
+    }
+    let said = tidy(&text);
+    (said.chars().count() >= MIN_CHARS).then_some(Said { at_ms, text: said })
+}
+
+enum FileRead {
+    /// All of it read: the progress up to the last whole line, and what a last
+    /// line without a line end holds (never kept: the file may still be writing it).
+    Done { state: FileProgress, open_line: Vec<Said> },
+    /// The deadline came first: the progress so far.
+    TimedOut(FileProgress),
+    Unreadable,
+}
+
+fn read_file(file: &Path, prior: Option<&FileProgress>, since_ms: i64, deadline: Option<Instant>) -> FileRead {
+    let Ok(mut handle) = std::fs::File::open(file) else { return FileRead::Unreadable };
+    let Ok(len) = handle.metadata().map(|m| m.len()) else { return FileRead::Unreadable };
+    let mut state = match prior {
+        Some(p) if p.offset <= len && guard(file, p.offset) == Some((p.head, p.tail)) => p.clone(),
+        _ => FileProgress::default(),
+    };
+    if handle.seek(SeekFrom::Start(state.offset)).is_err() {
+        return FileRead::Unreadable;
+    }
+    let finder = memchr::memmem::Finder::new(USER_NEEDLE);
+    let mut reader = std::io::BufReader::with_capacity(256 * 1024, handle.take(len - state.offset));
+    let mut raw = Vec::new();
+    let mut open_line = Vec::new();
+    loop {
+        raw.clear();
+        match reader.read_until(b'\n', &mut raw) {
+            Ok(0) => return FileRead::Done { state, open_line },
+            Ok(_) => {}
+            Err(_) => return FileRead::Unreadable,
+        }
+        let whole = raw.ends_with(b"\n");
+        let mut body: &[u8] = &raw;
+        if whole {
+            body = &body[..body.len() - 1];
+        }
+        if let Some(rest) = body.strip_suffix(b"\r") {
+            body = rest;
+        }
+        let found = if finder.find(body).is_some() { said_of_line(&String::from_utf8_lossy(body), since_ms) } else { None };
+        if whole {
+            state.offset += raw.len() as u64;
+            state.items.extend(found);
+        } else {
+            open_line.extend(found);
+        }
+        // Checked after a line was taken, so every call moves on by at least one.
+        if whole && deadline.is_some_and(|d| Instant::now() >= d) {
+            return FileRead::TimedOut(state);
+        }
+    }
+}
+
+/// The main transcripts of `project` that can hold a message after `since_ms`
+/// (a file nobody wrote to since the window opened holds nothing in it: the
+/// window is by message time, and a line is written no later than the file's
+/// last modification), and how many files could not be read for their folder.
+#[doc(hidden)]
+pub fn files_of(root: &Path, project: &str, since_ms: i64) -> (Vec<PathBuf>, usize) {
+    let mut out = Vec::new();
+    let mut unreadable = 0;
+    let mut belongs: HashMap<String, bool> = HashMap::new();
+    for file in main_transcripts(root) {
+        let modified = std::fs::metadata(&file)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64);
+        if modified.is_some_and(|m| m < since_ms) {
+            continue;
+        }
+        let cwd = match cwd_of(&file) {
+            Ok(Some(cwd)) => cwd,
+            Ok(None) => continue,
+            Err(_) => {
+                unreadable += 1;
+                continue;
+            }
+        };
+        let ours = *belongs.entry(cwd.clone()).or_insert_with(|| {
+            crate::project::resolve_project(Path::new(&cwd)).is_some_and(|p| crate::project::same_project_name(&p, project))
+        });
+        if ours {
+            out.push(file);
+        }
+    }
+    (out, unreadable)
+}
+
+/// Every message the owner typed in the main sessions of `project` after
+/// `since_ms` and at or before `until_ms`: 20 characters or longer, identical
+/// texts once (the oldest), secrets blanked, oldest first. A session belongs to
+/// the project its first working folder resolves to. Reads under `deadline`
+/// and goes on from `progress`; `None` when the deadline came first (the
+/// progress then holds what was read, and nothing of the list may be used).
+pub fn collect_resumable(root: &Path, project: &str, since_ms: i64, until_ms: i64, deadline: Option<Instant>, progress: &mut Progress) -> Option<Collected> {
+    if progress.since_ms != since_ms {
+        *progress = Progress { since_ms, files: BTreeMap::new() };
+    }
+    let mut found: Vec<Said> = Vec::new();
+    let (files, mut unreadable) = files_of(root, project, since_ms);
+    let mut read: BTreeMap<String, FileProgress> = BTreeMap::new();
+    let mut timed_out: Option<(String, FileProgress)> = None;
+    for file in files {
+        let key = file.to_string_lossy().to_string();
+        match read_file(&file, progress.files.get(&key), since_ms, deadline) {
+            FileRead::Unreadable => unreadable += 1,
+            FileRead::Done { state, open_line } => {
+                found.extend(state.items.iter().cloned());
+                found.extend(open_line);
+                read.insert(key, state);
+            }
+            FileRead::TimedOut(state) => {
+                timed_out = Some((key, state));
+                break;
+            }
+        }
+    }
+    if let Some((key, state)) = timed_out {
+        // Keep what is known: files read in full, the file the deadline came
+        // in, and the earlier progress of files not reached yet.
+        let mut next = std::mem::take(&mut progress.files);
+        for (key, mut state) in read.into_iter().chain(std::iter::once((key, state))) {
+            match guard(Path::new(&key), state.offset) {
+                Some((head, tail)) => {
+                    state.head = head;
+                    state.tail = tail;
+                    next.insert(key, state);
+                }
+                None => {
+                    next.remove(&key);
+                }
+            }
+        }
+        progress.files = next;
+        return None;
+    }
+    found.retain(|s| s.at_ms <= until_ms);
+    found.sort_by(|a, b| a.at_ms.cmp(&b.at_ms).then_with(|| a.text.cmp(&b.text)));
+    let mut seen = std::collections::HashSet::new();
+    found.retain(|s| seen.insert(s.text.clone()));
+    Some(Collected { list: found, unreadable })
+}
+
+/// `collect_resumable` without a deadline and without earlier progress: the
+/// whole list at once.
+pub fn collect_in(root: &Path, project: &str, since_ms: i64, until_ms: i64) -> Collected {
+    collect_resumable(root, project, since_ms, until_ms, None, &mut Progress::default()).expect("no deadline, so it finishes")
+}
+
+/// Where a started but unfinished read keeps its progress, beside the store.
+pub fn progress_path(db: &Path, project: &str) -> PathBuf {
+    let key: String = cursor_key(project).chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+    db.parent().unwrap_or_else(|| Path::new(".")).join(format!("evaluation-said-progress-{key}.json"))
+}
+
+#[cfg(test)]
+thread_local! {
+    pub static TIME_BOX_OVERRIDE: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+}
+
+fn time_box() -> Duration {
+    #[cfg(test)]
+    if let Some(d) = TIME_BOX_OVERRIDE.with(|c| c.get()) {
+        return d;
+    }
+    TIME_BOX
 }
 
 // ------------------------------------------------------------ printing
@@ -299,18 +555,20 @@ pub fn advance_for_valid(store: &EventStore, record: &model::store::EvaluationVa
 /// What the evaluation of `project` starting at `now` (unix seconds) freezes:
 /// the window and the counts. `None` when the list is empty and every
 /// transcript could be read: such an evaluation asks nothing about it.
-pub fn freeze(db: &Path, root: Option<&Path>, project: &str, now: i64) -> Option<SaidFrozen> {
+/// `Err(Pending)` when reading took longer than the time box: the progress is
+/// saved, nothing is frozen and the next call goes on from there.
+pub fn freeze(db: &Path, root: Option<&Path>, project: &str, now: i64) -> Result<Option<SaidFrozen>, Pending> {
     let until_ms = now * 1000;
     let since_ms = cursor_of(db, project).unwrap_or(until_ms - FIRST_WINDOW_DAYS * 86_400_000);
     let collected = match root {
-        Some(root) => collect_in(root, project, since_ms, until_ms),
+        Some(root) => collect_boxed(db, root, project, since_ms, until_ms, Some(time_box()))?,
         None => Collected::default(),
     };
     if collected.list.is_empty() && collected.unreadable == 0 {
-        return None;
+        return Ok(None);
     }
     let (shown, through_ms) = plan(&collected.list);
-    Some(SaidFrozen {
+    Ok(Some(SaidFrozen {
         since_ms,
         until_ms,
         total: collected.list.len(),
@@ -318,7 +576,35 @@ pub fn freeze(db: &Path, root: Option<&Path>, project: &str, now: i64) -> Option
         through_ms,
         unreadable: collected.unreadable,
         command: model::store::said_command_for(Some(db), project),
-    })
+    }))
+}
+
+/// Reading the owner's messages is not finished; the next Stop goes on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pending;
+
+/// `collect_resumable` under `box_` (none: no limit), with the progress kept in
+/// the sidecar beside the store between calls. A sidecar that cannot be read or
+/// written never stops the list: the read then runs to the end.
+fn collect_boxed(db: &Path, root: &Path, project: &str, since_ms: i64, until_ms: i64, box_: Option<Duration>) -> Result<Collected, Pending> {
+    let path = progress_path(db, project);
+    let mut progress = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Progress>(&text).ok())
+        .unwrap_or_default();
+    let deadline = box_.map(|b| Instant::now() + b);
+    if let Some(collected) = collect_resumable(root, project, since_ms, until_ms, deadline, &mut progress) {
+        let _ = std::fs::remove_file(&path);
+        return Ok(collected);
+    }
+    let saved = serde_json::to_string(&progress).ok().is_some_and(|text| {
+        !crate::store_dir::is_held(&path) && crate::store_dir::write(&path, text).is_ok()
+    });
+    if saved {
+        return Err(Pending);
+    }
+    let collected = collect_resumable(root, project, since_ms, until_ms, None, &mut progress).expect("no deadline, so it finishes");
+    Ok(collected)
 }
 
 /// What `serve said --project <project>` prints: the list of the newest open
@@ -645,5 +931,214 @@ mod tests {
             assert!(runs_said(&format!("& {printed}"), "Trade bot"), "& {printed}");
             assert!(!runs_said(&printed, "Other bot"), "{printed}");
         }
+    }
+
+    // ------------------------------------------------ the fast reader
+
+    /// Reads under an expired deadline round after round (each round moves on by
+    /// at least one line, like a Stop whose time box ran out), through the JSON
+    /// of the sidecar, and returns the list once it is whole.
+    fn boxed_rounds(root: &Path, project: &str, since: i64, until: i64, between: &mut dyn FnMut(usize)) -> (Collected, usize) {
+        let mut progress = Progress::default();
+        let mut rounds = 0;
+        loop {
+            between(rounds);
+            rounds += 1;
+            if let Some(done) = collect_resumable(root, project, since, until, Some(Instant::now()), &mut progress) {
+                return (done, rounds);
+            }
+            progress = serde_json::from_str(&serde_json::to_string(&progress).unwrap()).unwrap();
+            assert!(rounds < 10_000, "no progress");
+        }
+    }
+
+    fn texts(c: &Collected) -> Vec<String> {
+        c.list.iter().map(|s| format!("{} {}", s.at_ms, s.text)).collect()
+    }
+
+    fn many(n: i64) -> Vec<String> {
+        (0..n).map(|i| user(&at(i), &format!("message number {i} that is long enough to count"), "")).collect()
+    }
+
+    #[test]
+    fn the_fast_reader_and_the_continued_reader_give_the_list_of_the_full_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("projects");
+        let mine = project_folder(dir.path(), "demo");
+        let mut lines = many(30);
+        // Lines the byte test and the parser must treat as the full read does.
+        lines.push(r#"{"type":"assistant","timestamp":"2026-03-02T10:00:00Z","cwd":"CWD","message":{"content":"the word \"user\" in a reply that is long"}}"#.to_string());
+        lines.push(r#"{"type": "user", "timestamp": "2026-03-02T10:00:01Z", "cwd": "CWD", "message": {"role": "user", "content": "spaces after the colons in this long line"}}"#.to_string());
+        lines.push("not json at all but it says \"user\" and is long enough".to_string());
+        lines.push(String::new());
+        lines.push(user(&at(40), "last line with a crlf ending that is long enough", "") + "\r");
+        session(&root, "a", "s1", &mine, &lines);
+        session(&root, "b", "s2", &mine, &many(12));
+        let (since, until) = (T0 + 3_500, T0 + 100_000);
+        let full = collect_in_full(&root, "demo", since, until);
+        assert!(full.list.len() > 20, "{}", full.list.len());
+        assert_eq!(collect_in(&root, "demo", since, until), full);
+        let (boxed, rounds) = boxed_rounds(&root, "demo", since, until, &mut |_| {});
+        assert!(rounds > 5, "the deadline was expired every time: {rounds}");
+        assert_eq!(boxed, full);
+        assert_eq!(render("demo", &boxed.list), render("demo", &full.list));
+    }
+
+    #[test]
+    fn a_file_that_grows_between_two_reads_gives_the_full_read_of_the_final_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("projects");
+        let mine = project_folder(dir.path(), "demo");
+        session(&root, "a", "s1", &mine, &many(10));
+        let file = root.join("a").join("s1.jsonl");
+        let cwd = mine.to_string_lossy().replace('\\', "\\\\");
+        let mut grown = false;
+        let (got, _) = boxed_rounds(&root, "demo", T0 - 1, T0 + 1_000_000, &mut |round| {
+            if round == 4 && !grown {
+                grown = true;
+                use std::io::Write;
+                let mut f = std::fs::OpenOptions::new().append(true).open(&file).unwrap();
+                // A line cut in the middle first (the writer is not done), then its rest.
+                let more = user(&at(50), "appended while the first read was going", "").replace("CWD", &cwd);
+                let (a, b) = more.split_at(more.len() / 2);
+                write!(f, "\n{a}").unwrap();
+                f.flush().unwrap();
+                write!(f, "{b}\n{}", user(&at(51), "and a second appended line that is long", "").replace("CWD", &cwd)).unwrap();
+            }
+        });
+        assert!(grown);
+        assert_eq!(got, collect_in_full(&root, "demo", T0 - 1, T0 + 1_000_000));
+        assert!(got.list.iter().any(|s| s.text.contains("appended while")) && got.list.iter().any(|s| s.text.contains("second appended")));
+    }
+
+    #[test]
+    fn a_file_replaced_by_a_shorter_or_other_one_is_read_again_from_its_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("projects");
+        let mine = project_folder(dir.path(), "demo");
+        session(&root, "a", "s1", &mine, &many(40));
+        let mut progress = Progress::default();
+        for _ in 0..10 {
+            assert!(collect_resumable(&root, "demo", T0 - 1, T0 + 1_000_000, Some(Instant::now()), &mut progress).is_none());
+        }
+        let key = root.join("a").join("s1.jsonl").to_string_lossy().to_string();
+        assert!(progress.files[&key].offset > 0 && !progress.files[&key].items.is_empty());
+        // Shorter.
+        let lines: Vec<String> = (0..5).map(|i| user(&at(i), &format!("a different short file, message {i} long enough"), "")).collect();
+        session(&root, "a", "s1", &mine, &lines);
+        let got = loop {
+            if let Some(done) = collect_resumable(&root, "demo", T0 - 1, T0 + 1_000_000, Some(Instant::now()), &mut progress) {
+                break done;
+            }
+        };
+        assert_eq!(got, collect_in_full(&root, "demo", T0 - 1, T0 + 1_000_000));
+        assert_eq!(got.list.len(), 5);
+        // The same length with other bytes at the start: the guard sees it.
+        let mut progress = Progress::default();
+        for _ in 0..3 {
+            let _ = collect_resumable(&root, "demo", T0 - 1, T0 + 1_000_000, Some(Instant::now()), &mut progress);
+        }
+        let lines: Vec<String> = (0..5).map(|i| user(&at(i), &format!("another short file of equal length {i} long enough"), "")).collect();
+        let before = std::fs::metadata(&key).unwrap().len();
+        session(&root, "a", "s1", &mine, &lines);
+        assert!(std::fs::metadata(&key).unwrap().len() >= before);
+        let got = loop {
+            if let Some(done) = collect_resumable(&root, "demo", T0 - 1, T0 + 1_000_000, Some(Instant::now()), &mut progress) {
+                break done;
+            }
+        };
+        assert_eq!(got, collect_in_full(&root, "demo", T0 - 1, T0 + 1_000_000));
+        assert!(got.list.iter().all(|s| s.text.starts_with("another short file")), "{:?}", texts(&got));
+    }
+
+    #[test]
+    fn a_file_last_modified_before_the_window_is_not_read_and_the_list_is_the_same() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("projects");
+        let mine = project_folder(dir.path(), "demo");
+        session(&root, "a", "s1", &mine, &many(5));
+        session(&root, "b", "s2", &mine, &[user(&at(60), "a newer session that is long enough to count", "")]);
+        let old = std::fs::File::options().write(true).open(root.join("a").join("s1.jsonl")).unwrap();
+        old.set_modified(std::time::UNIX_EPOCH + Duration::from_millis(T0 as u64 - 1_000_000)).unwrap();
+        drop(old);
+        // The window opens after the old file's last change and before its message times:
+        // the file is skipped by both readers, and nothing newer is lost.
+        let since = T0 - 1;
+        let (files, _) = files_of(&root, "demo", since);
+        assert_eq!(files.len(), 1);
+        let got = collect_in(&root, "demo", since, T0 + 1_000_000);
+        assert_eq!(got, collect_in_full(&root, "demo", since, T0 + 1_000_000));
+        assert_eq!(got.list.len(), 1);
+    }
+
+    #[test]
+    fn identical_messages_in_two_sessions_count_once_at_the_oldest_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("projects");
+        let mine = project_folder(dir.path(), "demo");
+        session(&root, "a", "s1", &mine, &[user(&at(30), "keep every answer short and plain please", "")]);
+        session(&root, "b", "s2", &mine, &[user(&at(10), "keep every answer short and plain please", ""), user(&at(20), "a second wish that is long enough here", "")]);
+        let (got, _) = boxed_rounds(&root, "demo", T0, T0 + 1_000_000, &mut |_| {});
+        assert_eq!(got.list.len(), 2);
+        assert_eq!(got.list[0].at_ms, T0 + 10_000);
+        assert_eq!(got, collect_in_full(&root, "demo", T0, T0 + 1_000_000));
+        assert_eq!(collect_in(&root, "demo", T0, T0 + 1_000_000), got);
+        // Identical text on both sides of the window's end: the older one that is inside stays.
+        assert_eq!(collect_in(&root, "demo", T0, T0 + 15_000).list.len(), 1);
+        assert_eq!(collect_in(&root, "demo", T0, T0 + 15_000), collect_in_full(&root, "demo", T0, T0 + 15_000));
+    }
+
+    #[test]
+    fn a_message_of_nineteen_characters_is_left_out_and_one_of_twenty_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("projects");
+        let mine = project_folder(dir.path(), "demo");
+        let nineteen = "a".repeat(19);
+        let twenty = "b".repeat(20);
+        let spaced = format!("c d  e\n{}", "f".repeat(14));
+        session(&root, "a", "s1", &mine, &[user(&at(1), &nineteen, ""), user(&at(2), &twenty, ""), user(&at(3), &spaced, "")]);
+        let got = collect_in(&root, "demo", T0, T0 + 1_000_000);
+        let t: Vec<&str> = got.list.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(t, vec![twenty.as_str(), "c d e ffffffffffffff"]);
+        assert_eq!(got, collect_in_full(&root, "demo", T0, T0 + 1_000_000));
+    }
+
+    #[test]
+    fn a_time_box_that_runs_out_freezes_nothing_and_the_next_call_finishes_the_same_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("projects");
+        let db = dir.path().join("store").join("thor.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let mine = project_folder(dir.path(), "demo");
+        session(&root, "a", "s1", &mine, &many(25));
+        session(&root, "b", "s2", &mine, &many(25).iter().map(|l| l.replace("number", "digit")).collect::<Vec<_>>());
+        let now = T0 / 1000 + 10_000;
+        let whole = freeze(&db, Some(&root), "demo", now).unwrap().expect("a list");
+        assert!(!progress_path(&db, "demo").exists(), "a finished read leaves no progress behind");
+        assert_eq!(whole.total, 50);
+        TIME_BOX_OVERRIDE.with(|c| c.set(Some(Duration::ZERO)));
+        let mut pending = 0;
+        let got = loop {
+            match freeze(&db, Some(&root), "demo", now) {
+                Err(Pending) => {
+                    pending += 1;
+                    assert!(progress_path(&db, "demo").is_file(), "the progress is saved");
+                    assert!(pending < 1000);
+                }
+                Ok(frozen) => break frozen.expect("a list"),
+            }
+        };
+        TIME_BOX_OVERRIDE.with(|c| c.set(None));
+        assert!(pending > 1, "{pending}");
+        assert_eq!(got, whole);
+        assert!(!progress_path(&db, "demo").exists(), "progress is removed once the list is whole");
+        // Progress that belongs to another window start is not used.
+        let mut stale = Progress { since_ms: 1, files: BTreeMap::new() };
+        stale.files.insert("nowhere".to_string(), FileProgress::default());
+        std::fs::write(progress_path(&db, "demo"), serde_json::to_string(&stale).unwrap()).unwrap();
+        assert_eq!(freeze(&db, Some(&root), "demo", now).unwrap().expect("a list"), whole);
+        // A damaged progress file is ignored too.
+        std::fs::write(progress_path(&db, "demo"), "{ not json").unwrap();
+        assert_eq!(freeze(&db, Some(&root), "demo", now).unwrap().expect("a list"), whole);
     }
 }

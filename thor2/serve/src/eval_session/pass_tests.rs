@@ -2098,6 +2098,32 @@ impl SaidFx {
     }
 }
 
+/// Reading what the owner said ran out of time: nothing is started, nothing is
+/// written on the log, and the next start finishes the same list.
+#[test]
+fn a_start_whose_reading_runs_out_of_time_writes_nothing_and_the_next_start_goes_on() {
+    let mut fx = Fx::new();
+    let said = SaidFx::new(&fx, "demo", &[("please always answer me in short sentences", 30), ("keep every commit message plain and short", 20)]);
+    fx.quiet_others(S1, "demo");
+    let events_before = fx.store.get_next_seq().unwrap();
+    crate::said::TIME_BOX_OVERRIDE.with(|c| c.set(Some(std::time::Duration::ZERO)));
+    let mut pending = 0;
+    let began = loop {
+        match try_begin_in(&fx.db, &mut fx.store, S1, "demo", "command", Some(&said.root)) {
+            Err(StartRefused::SaidPending) => {
+                pending += 1;
+                assert_eq!(fx.store.get_next_seq().unwrap(), events_before, "a pending start writes nothing");
+                assert!(pending < 100);
+            }
+            other => break other.unwrap(),
+        }
+    };
+    crate::said::TIME_BOX_OVERRIDE.with(|c| c.set(None));
+    assert!(pending >= 1);
+    assert!(began.fresh);
+    assert_eq!(began.start.frozen.said.as_ref().unwrap().total, 2);
+}
+
 /// The list holds only what the owner typed in this project and window, as a
 /// window and counts on the log: his words are never written there.
 #[test]
