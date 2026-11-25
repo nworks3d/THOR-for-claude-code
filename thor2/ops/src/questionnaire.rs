@@ -170,7 +170,7 @@ pub fn questions() -> Vec<Question> {
             ),
             why: "They are the habits that were marked useful again and again in a memory built over months of real work, so a new memory starts with that experience instead of learning it the hard way.",
             default: "All on.",
-            say_no: format!("Name the ones you do not want, or say none: I remove just those notes ({ids}), and a removed note simply stops arriving. If a note refuses to be retracted because its check bites (the two Windows notes about hidden console windows can), I first clear its check with a revise that says why, then retract it."),
+            say_no: format!("Name the ones you do not want, or say none: I remove just those notes ({ids}), and a removed note simply stops arriving. The two Windows notes about hidden console windows retract at once in a new memory (the reply only warns that their refusing check goes with them); only after THOR has tried their check and it bites is the retract refused, and then I first clear its check with a revise that says why, then retract it."),
         },
         Question {
             n: 6,

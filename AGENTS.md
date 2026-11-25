@@ -1107,7 +1107,7 @@ flashing); every other one only informs, because a refusing check could block a
 legitimate call from a project the author never saw. Each arrives right before the step
 it is about, once per conversation, and any can be removed, rewritten or unpinned like
 any other note. Tell the person, in one sentence, that they exist and that you can
-remove any of them on request; to remove one, `retract` it with a reason (a note whose refusing check bites is refused at the retract: clear its check first with a revise that says why, then retract it).
+remove any of them on request; to remove one, `retract` it with a reason (the two Windows notes retract at once in a new memory, with a warning that their refusing check goes with them; only a note whose refusing check has been tried and bites is refused at the retract: clear its check first with a revise that says why, then retract it).
 
 Before a commit or a push:
 

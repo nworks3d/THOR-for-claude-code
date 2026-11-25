@@ -266,9 +266,38 @@ pub fn prove(backup_exe: &Path, db: &Path, repo: &Path) -> Result<String, String
     }
 }
 
+/// What the first proof copy said, in words a person knows. The backup
+/// program's own line ("committed thor2 local backup (46 events); no remote,
+/// ...") is for a log, not for them.
+pub fn plain_proof(line: &str, repo: &Path) -> String {
+    if line.contains("pushed") {
+        format!("your memory is saved in the folder {} and sent to the place you named", repo.display())
+    } else if line.contains("no change since") {
+        format!("the folder {} already holds your latest memory", repo.display())
+    } else {
+        format!("your memory is saved in the folder {}; it stays on this computer", repo.display())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_proof_copy_is_told_without_the_backup_programs_own_words() {
+        let repo = Path::new("C:/x/backup-repo");
+        for (line, want) in [
+            ("reply rulebook: carried in the backup | committed thor2 local backup (46 events); no remote, so nothing left this machine", "stays on this computer"),
+            ("pushed thor2 backup (46 events)", "sent to the place you named"),
+            ("no change since last backup (46 events) - nothing to commit", "already holds your latest memory"),
+        ] {
+            let said = plain_proof(line, repo);
+            assert!(said.contains(want), "{said}");
+            for jargon in ["events", "rulebook", "remote", "thor2", "commit"] {
+                assert!(!said.contains(jargon), "{said}");
+            }
+        }
+    }
 
     #[test]
     fn the_word_is_read_as_a_choice() {

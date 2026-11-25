@@ -283,14 +283,24 @@ fn open_source(db: &Path, repo: &Path, subdir: &str, opts: &PullOptions, marker:
     let is_clone = repo.join(".git").exists();
     if is_clone || repo.join(subdir).is_dir() {
         if is_clone && !opts.no_fetch {
+            // A backup folder made with `--set-backup local` has no remote: it
+            // is the source as it is, there is nothing to fetch from.
+            let has_remote = git(repo, &["remote"]).map(|names| !names.trim().is_empty()).unwrap_or(false);
+            let plain = |_why: anyhow::Error| {
+                anyhow::anyhow!(
+                    "the backup folder {} could not be brought up to date. Next step: check that the place it copies from is reachable (a drive or network folder that is switched on, and you may read it), then run the same command again; it is safe to repeat",
+                    repo.display()
+                )
+            };
             match opts.remote.clone().or_else(|| marker.remote.clone()) {
                 Some(remote) => {
-                    let branch = git(repo, &["rev-parse", "--abbrev-ref", "HEAD"])?;
-                    git(repo, &["pull", "--ff-only", "--quiet", &remote, &branch])?;
+                    let branch = git(repo, &["rev-parse", "--abbrev-ref", "HEAD"]).map_err(plain)?;
+                    git(repo, &["pull", "--ff-only", "--quiet", &remote, &branch]).map_err(plain)?;
                 }
-                None => {
-                    git(repo, &["pull", "--ff-only", "--quiet"])?;
+                None if has_remote => {
+                    git(repo, &["pull", "--ff-only", "--quiet"]).map_err(plain)?;
                 }
+                None => {}
             }
         }
         return Ok(Some(Source { root: repo.to_path_buf(), commit: String::new(), scratch: None }));
@@ -301,8 +311,11 @@ fn open_source(db: &Path, repo: &Path, subdir: &str, opts: &PullOptions, marker:
     let address = repo.display().to_string();
     let home = std::path::absolute(db).unwrap_or_else(|_| db.to_path_buf());
     let home = home.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
-    let remote_head =
-        git(&home, &["ls-remote", &address, "HEAD"]).with_context(|| format!("the backup at {address} could not be reached"))?;
+    let remote_head = git(&home, &["ls-remote", &address, "HEAD"]).map_err(|_why| {
+        anyhow::anyhow!(
+            "the backup at {address} could not be reached. Next step: check the address or folder, that it is switched on and that you may read it (a sign-in may be needed), then run the same command again; it is safe to repeat"
+        )
+    })?;
     let commit = remote_head.split_whitespace().next().unwrap_or_default().to_string();
     if !commit.is_empty()
         && !opts.rebuild
@@ -316,7 +329,11 @@ fn open_source(db: &Path, repo: &Path, subdir: &str, opts: &PullOptions, marker:
     remove_tree(&scratch);
     // From here on the guard deletes the scratch folder, however the pull ends.
     let source = Source { root: scratch.clone(), commit, scratch: Some(scratch.clone()) };
-    git(&home, &["clone", "--quiet", "--depth", "1", &address, &scratch.display().to_string()])?;
+    git(&home, &["clone", "--quiet", "--depth", "1", &address, &scratch.display().to_string()]).map_err(|_why| {
+        anyhow::anyhow!(
+            "the backup at {address} could not be copied. Next step: check that there is room on this computer and that you may read the backup, then run the same command again; it is safe to repeat"
+        )
+    })?;
     Ok(Some(source))
 }
 

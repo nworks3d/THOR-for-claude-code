@@ -1142,7 +1142,7 @@ fn set_backup_only(db: Option<PathBuf>, settings: Option<PathBuf>, word: &str) -
     }
     match prove(&backup_exe, &db, &repo) {
         Ok(line) => {
-            println!("+ first copy made now, to prove it works: {line}");
+            println!("+ first copy made now, to prove it works: {}", ops::backup_setup::plain_proof(&line, &repo));
             ExitCode::SUCCESS
         }
         Err(reason) => {
@@ -2145,9 +2145,9 @@ fn main() -> ExitCode {
     for line in restart_lines(&restart_because) {
         println!("{line}");
     }
-    println!("To check that THOR is healthy afterwards, ask your assistant to run THOR's doctor:");
+    // For the assistant, not for the person: they never run anything themselves.
     let bin_dir = serve_exe.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
-    println!("  {}", ops::install::doctor_invocation(&bin_dir, &db, cfg!(windows)));
+    println!("FOR THE ASSISTANT (not for the person to read out or run): afterwards, check the setup yourself with THOR's health check, the program doctor in {} with --db {} added. Read its first lines to the person in your own words.", bin_dir.display(), db.display());
     ExitCode::SUCCESS
 }
 
