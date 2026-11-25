@@ -1880,7 +1880,12 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool
             let valid = serve::eval_filing::newest_valid_evaluation(&store, checkout_project);
             let filed = valid.as_ref().and_then(|v| v.filed_at.as_deref()).and_then(serve::eval_filing::unix_of_timestamp);
             let report_clause = match &valid {
-                None => "no evaluation report of this project counts (none on file passed THOR's check)".to_string(),
+                // "none on file passed" is only true when something is on file: a project that
+                // never filed one (every new one) has no report at all.
+                None => match checkout_project.is_none_or(|p| serve::eval_filing::reports_of_project(&store, p).is_empty()) {
+                    true => "no evaluation report of this project is on file yet".to_string(),
+                    false => "no evaluation report of this project counts (none on file passed THOR's check)".to_string(),
+                },
                 Some(valid) => format!(
                     "{}, filed {} day(s) ago",
                     valid_report_words(valid),
@@ -5497,7 +5502,9 @@ mod tests {
             declare_owed_for_eval_debt(&mut store, 12, "thor");
         }
         let line = judgement_debt_line(&db, Some("thor"), false).expect("a real backlog, the line must speak");
-        assert!(line.contains("no evaluation report of this project counts (none on file passed THOR's check)"), "{line}");
+        // Nothing was ever filed, so the line must not say that "none on file passed".
+        assert!(line.contains("no evaluation report of this project is on file yet"), "{line}");
+        assert!(!line.contains("none on file passed"), "{line}");
         assert!(line.contains("no evaluation in the last 7 day(s)"), "{line}");
         assert!(line.contains("not asked yet"), "{line}");
         assert!(
@@ -5524,7 +5531,7 @@ mod tests {
             serve::usefulness::ProjectEvalState { asked_count: 4, first_asked_since_report: Some(two_days_ago), ..Default::default() },
         );
         let line = judgement_debt_line(&db, Some("thor"), false).expect("a real backlog, the line must speak");
-        assert!(line.contains("no evaluation report of this project counts (none on file passed THOR's check)"), "{line}");
+        assert!(line.contains("no evaluation report of this project is on file yet"), "{line}");
         assert!(line.contains("no evaluation in the last 7 day(s)"), "{line}");
         assert!(line.contains("asked 4 time(s), the first 2 day(s) ago"), "{line}");
         assert!(
