@@ -34,12 +34,30 @@ impl std::fmt::Display for WriteError {
         match self {
             WriteError::Refused(r) => write!(f, "{r}"),
             WriteError::Serialize(e) => write!(f, "could not serialize item: {e}"),
+            WriteError::Store(e) if store_cannot_be_written(e) => write!(f, "{}", UNWRITABLE_STORE_TEXT),
             WriteError::Store(e) => write!(f, "store error: {e}"),
         }
     }
 }
 
 impl std::error::Error for WriteError {}
+
+/// What a tool answers when the memory file cannot be written: plain, with what
+/// to tell the person. The first words are matched by `serve::person_line`.
+pub const UNWRITABLE_STORE_TEXT: &str = "the memory file cannot be written right now, so nothing was saved. Tell the person in one sentence: THOR's memory file or the folder it is in is read-only, or the disk is full, so nothing was saved, and THOR carries on by itself once the file can be written again. Do not retry the write until then, and do not store the note anywhere else.";
+
+/// Whether a failed append is the memory file being read-only or the disk being
+/// full (SQLite's own wording, anywhere in the error chain).
+pub fn store_cannot_be_written(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let text = cause.to_string().to_lowercase();
+        text.contains("readonly database")
+            || text.contains("read-only")
+            || text.contains("disk is full")
+            || text.contains("disk full")
+            || text.contains("no space left")
+    })
+}
 
 /// Everything that can go wrong reading an item back.
 #[derive(Debug)]
@@ -875,7 +893,7 @@ fn declare_gated(
 ) -> Result<Event, WriteError> {
     let actor = fence(store, actor, &item.id)?;
     let item = normalized(item);
-    gate::declare(&item).map_err(WriteError::Refused)?;
+    gate::with_project_root(project_root_for(store, item.project.as_deref()), || gate::declare(&item)).map_err(WriteError::Refused)?;
     old_stock_ground(None, trial).map_err(WriteError::Refused)?;
     teeth_tag_ground(None, &item, trial).map_err(WriteError::Refused)?;
     if let Some((existing_id, why)) = find_near_duplicate(store, &item).map_err(WriteError::Store)? {
@@ -991,7 +1009,7 @@ pub fn revise<'a>(
     // refuse exactly the repair that fixes the store.
     let existing = normalized(existing);
     let updated = normalized(updated);
-    gate::revise(&existing, &updated).map_err(WriteError::Refused)?;
+    gate::with_project_root(project_root_for(store, updated.project.as_deref()), || gate::revise(&existing, &updated)).map_err(WriteError::Refused)?;
     gate::a4_ground(Some(&existing), &updated, None).map_err(WriteError::Refused)?;
     teeth_tag_ground(Some(&existing), &updated, None).map_err(WriteError::Refused)?;
     // The same capacity refusal `declare` makes. Without this the gate was
@@ -1116,7 +1134,7 @@ pub fn revise_tried_scoped<'a>(
     let existing = normalized(existing);
     let updated = normalized(updated);
     let before = normalized(before);
-    gate::revise(&existing, &updated).map_err(WriteError::Refused)?;
+    gate::with_project_root(project_root_for(store, updated.project.as_deref()), || gate::revise(&existing, &updated)).map_err(WriteError::Refused)?;
     gate::revise_weakening(&before, &updated, because).map_err(WriteError::Refused)?;
     gate::a4_ground(Some(&before), &updated, None).map_err(WriteError::Refused)?;
     old_stock_ground(Some(actor), trial).map_err(WriteError::Refused)?;
@@ -2667,8 +2685,15 @@ fn busiest_narrower_call<'a>(
 /// enumerate before that happens, and refusing on a guess is how a gate
 /// teaches people to route around it.
 pub fn capacity(store: &EventStore, item: &Item) -> anyhow::Result<Capacity> {
-    let bindings: Vec<&Binding> =
+    let mut bindings: Vec<&Binding> =
         item.bindings.iter().filter(|b| !matches!(b, Binding::Always)).collect();
+    // In a folder for a subject (a plain folder with its own marker and no git) a note
+    // bound to its own project is not shown by place: it is found by matching the
+    // person's prompt (`serve::other_project::narrow_to_prompt`), so there is no
+    // block to be crowded out of, however many such notes there are.
+    if is_topic_project(store, item.project.as_deref()) {
+        bindings.retain(|b| !is_own_project_binding(b, item.project.as_deref()));
+    }
     if (bindings.is_empty() && !is_standing(item)) || !item.kind.can_fire() {
         return Ok(Capacity::Fine);
     }
@@ -2778,6 +2803,55 @@ pub fn capacity(store: &EventStore, item: &Item) -> anyhow::Result<Capacity> {
     })
 }
 
+/// Whether `project` is registered at a folder for a subject: a plain folder with its
+/// own `.thor-project` marker and no git repository above it. Read from the
+/// registration alone, like every other registered-folder question.
+pub fn is_topic_project(store: &EventStore, project: Option<&str>) -> bool {
+    let Some(project) = project else { return false };
+    let Some((root, _)) = registered_root_raw(store, project) else { return false };
+    crate::checkout::plain_root(&root).as_deref() == Some(root.as_path())
+}
+
+/// The folder `project` is registered at, when there is one (what the write gate
+/// resolves a bare file name against).
+pub fn project_root_for(store: &EventStore, project: Option<&str>) -> Option<PathBuf> {
+    registered_root_raw(store, project?).map(|(root, _)| root)
+}
+
+/// A project binding that names the item's own project.
+fn is_own_project_binding(binding: &Binding, project: Option<&str>) -> bool {
+    matches!(
+        binding,
+        Binding::Target { kind: crate::item::TargetKind::Project, value }
+            if project.is_some_and(|p| crate::checkout::same_project_name(value, p))
+    )
+}
+
+/// The place a crowded note stands on and the notes that already hold it (up to
+/// three ids, the same ones `capacity`'s warning names), or `None` when the note
+/// is not crowded. For the hold at the end of a turn.
+pub fn crowded_place(store: &EventStore, item: &Item) -> Option<(String, Vec<String>)> {
+    let bindings: Vec<&Binding> = item.bindings.iter().filter(|b| !matches!(b, Binding::Always)).collect();
+    let candidates = if store.heads_projection_current() {
+        live_items_from_projection(store).ok()?
+    } else {
+        live_items_from_fold(store).ok()?
+    };
+    let (_, binding, _) = crowded_binding_note(&candidates, item, &bindings)?;
+    Some((describe(binding), crowding_names(&candidates, item, binding)))
+}
+
+/// Up to three ids of the notes already on `binding`'s place, heaviest first.
+fn crowding_names(candidates: &[(String, Item)], item: &Item, binding: &Binding) -> Vec<String> {
+    let mine = crate::item::severity_rank(item.severity);
+    let mut rivals: Vec<&(String, Item)> = pool_rivals(candidates, item, binding)
+        .into_iter()
+        .filter(|(_, o)| crate::item::severity_rank(o.severity) <= mine)
+        .collect();
+    rivals.sort_by_key(|(id, o)| (crate::item::severity_rank(o.severity), id.clone()));
+    rivals.iter().take(3).map(|(id, _)| id.clone()).collect()
+}
+
 /// Every binding this item carries (besides `Always`, already dropped by
 /// `capacity`'s own caller) is a DIRECTORY - the one case `capacity` reports
 /// unconditionally, before it ever asks `pool_rivals` a single question. A
@@ -2810,15 +2884,12 @@ fn crowded_binding_note<'a>(
         let rivals = pool_rivals(candidates, item, binding);
         let at_least_equal = rivals.iter().filter(|(_, o)| crate::item::severity_rank(o.severity) <= mine).count();
         if at_least_equal >= crate::item::MAX_ITEMS {
+            let names = crowding_names(candidates, item, binding);
             let note = format!(
-                "{} already holds AT LEAST {at_least_equal} item(s) of the same weight or heavier, \
-                 for {} place(s) in a block - this one may well never be shown there. At least, \
-                 because this count sees only the rivals sharing this one binding; the real crowd \
-                 also includes everything reaching that place through a moment or a command, which \
-                 only doctor's crowding line can count, per file and per command anchor in a \
-                 checkout. Bind it to the exact file or command it is about instead \
-                 of the broad moment, or fold it into whichever item already carries that ground.",
+                "{} already holds {at_least_equal} note(s) of the same weight or heavier ({}), and a block shows only {} - \
+                 this one may well never be shown there. Move it to the exact file or command it is about, or fold it into one of those notes.",
                 describe(binding),
+                names.join(", "),
                 crate::item::MAX_ITEMS
             );
             return Some((note, binding, at_least_equal));
@@ -10189,6 +10260,36 @@ pub fn retract<'a>(
     reason: &str,
     att: Option<&Att>,
 ) -> Result<Event, WriteError> {
+    retract_gated(store, session_id, lineage_id, actor, entity_id, reason, att, false)
+}
+
+/// `retract` for a rule that needs the owner's go, taken down on his own quoted
+/// words (the caller has already checked them: `serve::unpin_gate::owner_rule_go`).
+/// His word is the decision, so the check that bites is not asked for a survivor:
+/// one call is enough.
+pub fn retract_on_owner_words<'a>(
+    store: &mut EventStore,
+    session_id: &str,
+    lineage_id: &str,
+    actor: impl Into<WriteActor<'a>>,
+    entity_id: &str,
+    reason: &str,
+    att: Option<&Att>,
+) -> Result<Event, WriteError> {
+    retract_gated(store, session_id, lineage_id, actor, entity_id, reason, att, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn retract_gated<'a>(
+    store: &mut EventStore,
+    session_id: &str,
+    lineage_id: &str,
+    actor: impl Into<WriteActor<'a>>,
+    entity_id: &str,
+    reason: &str,
+    att: Option<&Att>,
+    owner_words: bool,
+) -> Result<Event, WriteError> {
     let actor = fence(store, actor.into(), entity_id)?;
     guard_order_note(store, actor, entity_id)?;
     let reason = reason.trim();
@@ -10246,7 +10347,7 @@ pub fn retract<'a>(
     // measured, three refusing checks and a contains check were lost that way.
     // Only a check that runs now and holds can block this; a rule with no
     // check, a note, or a check whose file is gone retracts as before.
-    if let Ok(item) = show(store, entity_id) {
+    if let Some(item) = show(store, entity_id).ok().filter(|_| !owner_words) {
         if let Some(refusal) = retract_would_lose_a_check(store, entity_id, &item, reason) {
             return Err(WriteError::Refused(refusal));
         }
@@ -10353,7 +10454,8 @@ fn retract_would_lose_a_check(store: &EventStore, id: &str, item: &Item, reason:
             "carry the check onto the item that survives, then retract naming that item's id in the reason: \
              mcp__thor__revise(id: \"<the survivor's id>\", {}, because: \"<it now carries the check of '{id}', at least 20 \
              characters>\"), then retract '{id}' with a reason that quotes the survivor's id. If the rule is simply \
-             wrong, clear its check first with a revise that says why",
+             wrong, clear its check first with a revise that says why. If it is a rule that needs the owner's go and he \
+             has said to take it down, one retract is enough: put his whole message between double quotes in the reason",
             check_arguments(check)
         ),
     })
@@ -15989,6 +16091,24 @@ mod tests {
         survivor.bindings = proven.bindings.clone();
         declare_tried(&mut store, &survivor, &sealed(&survivor, RecordedVerdict::RuleWired));
         retract(&mut store, "s", "l", "a", "n4-proven", "folded into 'n4-survivor'", None).expect("a covering survivor");
+    }
+
+    /// P15: a rule the owner takes down in his own words is retracted in ONE call,
+    /// although its check bites and no survivor carries it; the refusal for anyone
+    /// else names that one call.
+    #[test]
+    fn a_retract_on_the_owners_words_needs_no_survivor_for_the_check() {
+        let mut store = EventStore::in_memory().unwrap();
+        let mut proven = wired_forbidden("p15-proven", "p", "--force");
+        proven.severity = None;
+        proven.text = "Never push with --force.".to_string();
+        proven.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "git push".to_string() }];
+        declare_tried(&mut store, &proven, &sealed(&proven, RecordedVerdict::RuleWired));
+        let err = retract(&mut store, "s", "l", "a", "p15-proven", "the owner said to remove it", None).unwrap_err().to_string();
+        assert!(err.contains("one retract is enough") && err.contains("whole message"), "{err}");
+        assert!(show(&store, "p15-proven").is_ok(), "nothing was retracted");
+        retract_on_owner_words(&mut store, "s", "l", "a", "p15-proven", "the owner said: \"remove it\"", None).expect("his words are the decision");
+        assert!(show(&store, "p15-proven").is_err(), "retracted in one call");
     }
 
     /// N4, file checks: a rule with a biting `contains` check on a file in a

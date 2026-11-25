@@ -1197,6 +1197,23 @@ it. DONE WHEN: the line is quoted under THOR health. EXAMPLE: THOR health in the
 report: "THOR bug candidates: 1 new (a hook launch failure); the owner's other
 session was offered it".
 
+`stale rules left alone:` (for example "stale rules left alone: 1 rule(s) could not
+prove themselves, were held in 2 conversations and are not held again until they
+change: notes-forbid-draft. Settle each in the weekly check with a revise or a
+retract") - WHAT IT MEANS: a rule whose check could not prove itself while work
+was going on (its file moved or its text changed) held the end of a turn in two
+conversations and was left as it was both times. THOR stops holding turns for it
+so a person is not interrupted again and again, and lists it here instead. The
+line is printed only while such a rule is waiting; a rule that was revised or
+retracted since is not listed. WHAT TO DO: for each id, read it with `get` and
+look at the file its check names; if the file moved or the text changed on
+purpose, correct the rule with `revise` (new anchor or check); if the rule went
+with what it was about, `retract` it with a reason that says so; if it is still
+true as it stands, say so in the report. DONE WHEN: each id is revised,
+retracted or named in the report with why it stays. EXAMPLE: THOR health in the
+report: "stale rules left alone: notes-forbid-draft was retracted, the notes file
+it guarded was deleted".
+
 `route probe:` (only `serve sweep` prints it, never `doctor`, so you meet it
 only when you ran the sweep; for example "route probe: rule 'no-new-bodies' is
 bound to 127.0.0.1:27182, and 12 real call(s) of the last 30 days run a script

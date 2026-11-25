@@ -62,6 +62,33 @@ fn is_bare_role_name(normalized_value: &str) -> bool {
     BARE_ROLE_NAMES.contains(&stem)
 }
 
+thread_local! {
+    /// The registered folder of the project the item being judged belongs to, set by
+    /// `with_project_root` around a gate call that has a store to ask.
+    static PROJECT_ROOT: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` (a call into this gate) knowing the folder the item's project is
+/// registered at: a bare file name that exists at the top of that folder is then
+/// a precise anchor, not a name "every project has".
+pub fn with_project_root<R>(root: Option<std::path::PathBuf>, f: impl FnOnce() -> R) -> R {
+    let before = PROJECT_ROOT.with(|cell| cell.replace(root));
+    let out = f();
+    PROJECT_ROOT.with(|cell| cell.replace(before));
+    out
+}
+
+/// Whether `value` (no folder part) names a file at the top of the project's
+/// registered folder, when this gate call knows one.
+fn exists_at_project_root(value: &str) -> bool {
+    let name = value.trim().replace('\\', "/");
+    let name = name.trim_start_matches("./");
+    if name.is_empty() || name.contains('/') {
+        return false;
+    }
+    PROJECT_ROOT.with(|cell| cell.borrow().as_ref().is_some_and(|root| root.join(name).is_file()))
+}
+
 /// The `Host` counterpart to `BARE_ROLE_NAMES`: every machine resolves
 /// "localhost" to itself, and "0.0.0.0" is the networking convention for
 /// "every interface" - both name no machine in particular, so a binding on
@@ -112,12 +139,12 @@ fn check_target_binding(kind: TargetKind, value: &str) -> Result<(), Refusal> {
         ));
     }
     let normalized_value = normalize_target(trimmed);
-    if kind == TargetKind::Path && is_bare_role_name(&normalized_value) {
+    if kind == TargetKind::Path && is_bare_role_name(&normalized_value) && !exists_at_project_root(trimmed) {
         return Err(Refusal::new(
             format!(
-                "'{trimmed}' is a bare role name (main, mod, lib, index, test, util) - every project has one, so it matches everything"
+                "'{trimmed}' is a bare role name (main, mod, lib, index, test, util) - every project has one, so it matches everything, and it is not a file at the top of this project's own folder"
             ),
-            "qualify it with the directory that makes this file distinct from every other project's main/index/lib",
+            "name the file with the folder it sits in (for example src/main.py). For a file at the top of the project's folder, write just its name once the project's folder is registered and the file is there: it is then read as that one file",
         ));
     }
     // GROUND 11 (CONTINUED): the same rot ground 11 refuses in an item's
@@ -1341,7 +1368,7 @@ fn teeth_answer_contradictions(existing: Option<&Item>, updated: &Item) -> Resul
                 "the tag '{}' marks a requires check whose answer only the owner gives, and this item carries no requires check",
                 crate::store::OWNER_APPROVAL_TAG
             ),
-            "give the rule a requires check (check_kind requires, the trigger as check_path or its command binding, the marker the owner says as check_literal), or drop the tag",
+            "give the rule a requires check (check_kind requires, the trigger as check_path or its command binding, the marker the owner says as check_literal), or drop the tag. To take the whole rule down on the owner's own words, one call is enough: retract it with his whole message between double quotes in the reason; clearing its check first is not needed",
         ));
     }
     if updated.kind.can_fire() && guards(updated.check.as_ref()) {

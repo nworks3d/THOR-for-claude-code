@@ -173,6 +173,100 @@ pub fn item_settled(kinds_since_recorded: &[EventKind]) -> bool {
     kinds_since_recorded.iter().any(|k| matches!(k, EventKind::FactRevised | EventKind::FactRetracted))
 }
 
+// ------------------------------------------------- held at most twice
+
+/// How many conversations a rule that went stale may hold the end of a turn in.
+/// After that it is left alone - listed for the weekly check and in doctor - until
+/// the rule itself changes.
+pub const MAX_HOLD_SESSIONS: usize = 2;
+
+/// Where the per-rule record of which conversations were held for it lives.
+pub fn default_held_path(db: &Path) -> PathBuf {
+    db.parent().unwrap_or_else(|| Path::new(".")).join("stale-guard-held.json")
+}
+
+/// The conversations one rule held, and the rule's own last log position when it
+/// last held one: a rule that changed since is a different case and starts again.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Held {
+    pub rule_seq: i64,
+    pub sessions: Vec<String>,
+}
+
+/// Parse the record (item id -> `Held`). Malformed or missing reads as empty.
+pub fn read_held(text: &str) -> HashMap<String, Held> {
+    serde_json::from_str(text).unwrap_or_default()
+}
+
+/// Whether `id` was already held in `MAX_HOLD_SESSIONS` conversations other than
+/// `session_id`, with the rule unchanged since (`rule_seq`).
+fn left_alone(held: &HashMap<String, Held>, id: &str, rule_seq: i64, session_id: &str) -> bool {
+    held.get(id).is_some_and(|h| h.rule_seq == rule_seq && h.sessions.len() >= MAX_HOLD_SESSIONS && !h.sessions.iter().any(|s| s == session_id))
+}
+
+/// Split the outstanding entries into the ones that may hold this turn and the
+/// ones that have used up their holds. `rule_seqs` maps an item id to its last log
+/// position.
+pub fn split_by_holds(
+    entries: Vec<Outstanding>,
+    held: &HashMap<String, Held>,
+    rule_seqs: &HashMap<String, i64>,
+    session_id: &str,
+) -> (Vec<Outstanding>, Vec<Outstanding>) {
+    entries
+        .into_iter()
+        .partition(|e| !left_alone(held, &e.id, rule_seqs.get(&e.id).copied().unwrap_or(0), session_id))
+}
+
+/// The record after `entries` held the turn of `session_id`: each entry gains this
+/// conversation, an entry whose rule changed starts again, and ids that are no
+/// longer outstanding anywhere (`still_stale`) are forgotten. `None` only when it
+/// cannot be written out.
+pub fn record_holds(
+    existing_text: Option<&str>,
+    entries: &[Outstanding],
+    rule_seqs: &HashMap<String, i64>,
+    still_stale: &HashSet<String>,
+    session_id: &str,
+) -> Option<String> {
+    let mut held = existing_text.map(read_held).unwrap_or_default();
+    held.retain(|id, _| still_stale.contains(id));
+    for entry in entries {
+        let seq = rule_seqs.get(&entry.id).copied().unwrap_or(0);
+        let record = held.entry(entry.id.clone()).or_default();
+        if record.rule_seq != seq {
+            *record = Held { rule_seq: seq, sessions: Vec::new() };
+        }
+        if !record.sessions.iter().any(|s| s == session_id) {
+            record.sessions.push(session_id.to_string());
+        }
+    }
+    serde_json::to_string(&held).ok()
+}
+
+/// The ids of rules that went stale, were held in `MAX_HOLD_SESSIONS`
+/// conversations and are now left alone, for doctor and the weekly check. A rule
+/// that changed since is not on it.
+pub fn left_alone_ids(db: &Path) -> Vec<String> {
+    let held = std::fs::read_to_string(default_held_path(db)).ok().map(|t| read_held(&t)).unwrap_or_default();
+    let stale = std::fs::read_to_string(crate::absent_guard::default_stale_path(db))
+        .ok()
+        .map(|t| crate::absent_guard::read_stale(&t))
+        .unwrap_or_default();
+    let Ok(store) = crate::store_dir::open_existing(db) else { return Vec::new() };
+    let mut out: Vec<String> = held
+        .iter()
+        .filter(|(id, h)| {
+            h.sessions.len() >= MAX_HOLD_SESSIONS
+                && stale.contains_key(id.as_str())
+                && store.get_events_by_entity(id).ok().and_then(|e| e.iter().map(|e| e.seq).max()).unwrap_or(0) == h.rule_seq
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    out.sort();
+    out
+}
+
 // ------------------------------------------------------------ outstanding
 
 /// One outstanding entry, ready to render: a stale record that is still
@@ -212,6 +306,47 @@ fn outcome_label(outcome: StaleOutcome) -> &'static str {
     }
 }
 
+/// The quoted string after `key: ` in a check's debug form, with the debug
+/// escapes undone.
+fn quoted_after(text: &str, key: &str) -> Option<String> {
+    let at = text.find(&format!("{key}: \""))? + key.len() + 3;
+    let mut out = String::new();
+    let mut chars = text[at..].chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Some(out),
+            '\\' => out.push(chars.next()?),
+            other => out.push(other),
+        }
+    }
+    None
+}
+
+/// A check recorded in Rust's debug form (`Absent { path: "NOTES.md", literal: "x" }`)
+/// in plain words: which file, and which text it expects or forbids. Anything it
+/// does not recognise is shown as it was recorded.
+pub fn plain_check(recorded: &str) -> String {
+    let name = recorded.split(" {").next().unwrap_or("").trim();
+    let path = quoted_after(recorded, "path");
+    let literal = quoted_after(recorded, "literal");
+    let literals = || -> Vec<String> {
+        let Some(at) = recorded.find("literals: [").map(|at| at + "literals: [".len()) else { return Vec::new() };
+        let inner = recorded[at..].split(']').next().unwrap_or("");
+        inner.split("\", \"").map(|l| l.trim().trim_matches('"').to_string()).filter(|l| !l.is_empty()).collect()
+    };
+    match (name, path, literal) {
+        ("Absent", Some(path), Some(text)) => format!("the file {path} must not contain '{text}'"),
+        ("Contains", Some(path), Some(text)) => format!("the file {path} must contain '{text}'"),
+        ("AbsentAll", Some(path), _) => {
+            let all: Vec<String> = literals().iter().map(|l| format!("'{l}'")).collect();
+            format!("the file {path} must contain none of {}", all.join(", "))
+        }
+        ("PathExists", Some(path), _) => format!("the file {path} must exist"),
+        ("Absent" | "Contains", Some(path), None) => format!("a check on the file {path}"),
+        _ => recorded.to_string(),
+    }
+}
+
 /// The block message, in the exact required shape: the THOR marker; a plain
 /// statement that these rules could not prove themselves while work was
 /// going on, so they are either wrong now or their anchor moved; one line
@@ -229,10 +364,10 @@ pub fn block_message(entries: &[Outstanding]) -> String {
     );
     for entry in shown {
         out.push_str(&format!(
-            "- {}: {} - check: {} - file: {}\n",
+            "- {}: {} - {} (checked while writing {})\n",
             entry.id,
             outcome_label(entry.record.outcome),
-            entry.record.check,
+            plain_check(&entry.record.check),
             entry.record.file,
         ));
     }
@@ -240,7 +375,9 @@ pub fn block_message(entries: &[Outstanding]) -> String {
     if remaining > 0 {
         out.push_str(&format!("...and {remaining} more not shown.\n"));
     }
-    out.push_str("Correct the rule, retract it, or leave it as is - it will come back next session.");
+    out.push_str(
+        "Correct the rule (revise), retract it, or leave it as is. If you leave it, THOR asks again in at most one more conversation; after that it is not held again and is listed for the weekly check and in doctor until the rule changes.",
+    );
     out
 }
 
@@ -317,6 +454,50 @@ mod tests {
         assert!(!already_blocked(&read_blocked(""), "s1"));
     }
 
+    // ------------------------------------------- plain words, held at most twice
+
+    #[test]
+    fn a_recorded_check_is_shown_in_plain_words() {
+        assert_eq!(
+            plain_check("Absent { path: \"NOTES.md\", literal: \"forbidden\" }"),
+            "the file NOTES.md must not contain 'forbidden'"
+        );
+        assert_eq!(plain_check("Contains { path: \"a/b.md\", literal: \"x \\\"y\\\"\" }"), "the file a/b.md must contain 'x \"y\"'");
+        assert_eq!(plain_check("AbsentAll { path: \"N.md\", literals: [\"one\", \"two\"] }"), "the file N.md must contain none of 'one', 'two'");
+        assert_eq!(plain_check("PathExists { path: \"src/x.rs\" }"), "the file src/x.rs must exist");
+        assert_eq!(plain_check("Absent { path: \"N.md\" }"), "a check on the file N.md");
+        assert_eq!(plain_check("something else"), "something else", "an unknown form is shown as recorded");
+        let message = block_message(&[Outstanding { id: "r1".to_string(), record: sample_record(StaleOutcome::Failed, 0) }]);
+        assert!(message.contains("the file NOTES.md must not contain 'forbidden'") && !message.contains("Absent {"), "{message}");
+    }
+
+    fn outstanding_one(id: &str) -> Vec<Outstanding> {
+        vec![Outstanding { id: id.to_string(), record: sample_record(StaleOutcome::Failed, 0) }]
+    }
+
+    #[test]
+    fn a_rule_holds_the_turn_in_two_conversations_then_is_left_alone_until_it_changes() {
+        let seqs: HashMap<String, i64> = [("r1".to_string(), 10)].into_iter().collect();
+        let stale: HashSet<String> = ["r1".to_string()].into_iter().collect();
+        let mut text: Option<String> = None;
+        for session in ["s1", "s2"] {
+            let held = text.as_deref().map(read_held).unwrap_or_default();
+            let (hold, left) = split_by_holds(outstanding_one("r1"), &held, &seqs, session);
+            assert_eq!((hold.len(), left.len()), (1, 0), "{session} may still hold");
+            text = record_holds(text.as_deref(), &hold, &seqs, &stale, session);
+        }
+        let held = read_held(text.as_deref().unwrap());
+        let (hold, left) = split_by_holds(outstanding_one("r1"), &held, &seqs, "s3");
+        assert_eq!((hold.len(), left.len()), (0, 1), "the third conversation is not held");
+        // The rule changed: it starts again.
+        let changed: HashMap<String, i64> = [("r1".to_string(), 11)].into_iter().collect();
+        let (hold, _) = split_by_holds(outstanding_one("r1"), &held, &changed, "s3");
+        assert_eq!(hold.len(), 1, "a changed rule is held again");
+        // A rule that is no longer stale is forgotten.
+        let text = record_holds(text.as_deref(), &[], &seqs, &HashSet::new(), "s4").unwrap();
+        assert!(read_held(&text).is_empty());
+    }
+
     // ------------------------------------------------------- settlement
 
     #[test]
@@ -387,14 +568,14 @@ mod tests {
         assert!(msg.starts_with("[THOR]"), "{msg}");
         assert!(msg.contains("r1"), "must name the id: {msg}");
         assert!(msg.contains("FAILED"), "must name the outcome: {msg}");
-        assert!(msg.contains("Absent"), "must carry the check itself: {msg}");
+        assert!(msg.contains("must not contain 'forbidden'"), "must carry the check itself in plain words: {msg}");
         assert!(msg.contains("NOTES.md"), "must name the file: {msg}");
         let lower = msg.to_ascii_lowercase();
         assert!(lower.contains("could not prove themselves"), "{msg}");
         assert!(lower.contains("wrong now") && lower.contains("anchor moved"), "{msg}");
         assert!(lower.contains("correct"), "must name the first way out: {msg}");
         assert!(lower.contains("retract"), "must name the second way out: {msg}");
-        assert!(lower.contains("next session"), "must name the third way out: {msg}");
+        assert!(lower.contains("at most one more conversation"), "must name the third way out and its limit: {msg}");
     }
 
     /// The two outcomes must read distinctly - a reader triaging the list

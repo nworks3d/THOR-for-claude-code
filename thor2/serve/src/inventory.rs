@@ -683,6 +683,19 @@ pub fn apply_snapshot(inv: &mut Inventory, db: &Path) {
     }
 }
 
+impl Inventory {
+    /// Whether there is nothing to put in order: every folder is a project or a
+    /// subject folder already (or left no file behind that still exists), no file
+    /// lies loose, and none that was loose has vanished.
+    pub fn nothing_to_order(&self) -> bool {
+        self.folders.iter().all(|f| f.ordered || f.nothing_to_move) && self.loose_files.is_empty() && self.vanished.is_empty()
+    }
+}
+
+/// The plain line that says there is nothing to order. The first-session text
+/// tells the assistant to stay silent about the whole step when it reads it.
+pub const NOTHING_TO_ORDER_LINE: &str = "Nothing to order: every earlier session ran in a folder that is already in order, and no file lies loose.";
+
 pub fn render_text(inv: &Inventory) -> String {
     let mut out = String::new();
     let not_ordered = inv.folders.iter().filter(|f| !f.ordered && !f.nothing_to_move).count();
@@ -701,7 +714,11 @@ pub fn render_text(inv: &Inventory) -> String {
         out.push_str("Nothing to order: no earlier sessions found.\n");
         return out;
     }
-    let file_line = |w: &WrittenFile| {
+    if inv.nothing_to_order() {
+        out.push_str(NOTHING_TO_ORDER_LINE);
+        out.push('\n');
+    }
+    let file_line =|w: &WrittenFile| {
         format!("{}{} {}", if w.exists { "exists" } else { "gone  " }, if w.at_risk { " AT RISK" } else { "" }, w.path)
     };
     if inv.folders.iter().any(|f| f.without_folder) {
@@ -819,6 +836,45 @@ pub fn digest(file: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn folder(ordered: bool) -> FolderInfo {
+        FolderInfo {
+            folder: "C:/Users/ann/Documents/Tuinhuis".to_string(),
+            folder_exists: true,
+            ordered,
+            why_not_ordered: (!ordered).then(|| "no project".to_string()),
+            without_folder: false,
+            nothing_to_move: false,
+            sessions: vec![],
+        }
+    }
+
+    fn inventory_of(folders: Vec<FolderInfo>) -> Inventory {
+        Inventory {
+            sessions_found: folders.len(),
+            sessions_left_out: 0,
+            sessions_left_out_unordered: 0,
+            sessions_left_out_ordered: 0,
+            folders,
+            loose_files: vec![],
+            loose_files_left_out: 0,
+            vanished: vec![],
+        }
+    }
+
+    /// The first-session text tells the assistant to stay silent when the listing says
+    /// there is nothing to order, so the listing must say it in so many words.
+    #[test]
+    fn a_listing_with_every_folder_in_order_says_nothing_to_order() {
+        let text = render_text(&inventory_of(vec![folder(true)]));
+        assert!(text.contains(NOTHING_TO_ORDER_LINE), "{text}");
+        let text = render_text(&inventory_of(vec![folder(true), folder(false)]));
+        assert!(!text.contains("Nothing to order"), "a folder that is not in order is something to order: {text}");
+        let mut loose = inventory_of(vec![folder(true)]);
+        loose.vanished.push("C:/Users/ann/Desktop/cv.md".to_string());
+        assert!(!render_text(&loose).contains("Nothing to order"));
+        assert!(render_text(&inventory_of(vec![])).contains("Nothing to order: no earlier sessions found."));
+    }
 
     #[test]
     fn a_claude_scratchpad_under_temp_is_at_risk_and_other_temp_files_are_not() {

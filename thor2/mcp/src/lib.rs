@@ -2093,7 +2093,8 @@ fn replica_refusal_for_remember(store: &EventStore, args: &RememberArgs) -> Resu
     if item.kind == Kind::Report && item.tags.iter().any(|t| t == serve::copy_eval::ATTESTATION_TAG) {
         serve::copy_eval::check_attestation_note(&item.id, item.project.as_deref(), &item.text)?;
     }
-    model::gate::declare(&normalized_item(&item)).map_err(|r| gate_refusal(r, store))
+    let root = model::store::project_root_for(store, item.project.as_deref());
+    model::gate::with_project_root(root, || model::gate::declare(&normalized_item(&item))).map_err(|r| gate_refusal(r, store))
 }
 
 /// `replica_refusal_for_remember`, for a revise: judged against the
@@ -2225,7 +2226,8 @@ fn write_binding_change(
     let mut att = stamp.att();
     att.unpin = unpin;
     refuse_a_side_door_on_a_frozen_item(store, &existing.id, &att)?;
-    model::gate::revise(&normalized_item(existing), &normalized_item(updated))
+    let root = model::store::project_root_for(store, updated.project.as_deref());
+    model::gate::with_project_root(root, || model::gate::revise(&normalized_item(existing), &normalized_item(updated)))
         .map_err(|r| format!("REFUSED: {}", model::store::WriteError::Refused(r)))?;
     let (written, record, notes, trial_because) = match run_trial(
         store,
@@ -2910,10 +2912,10 @@ pub struct SearchCodeArgs {
 /// The one answer when a code tool is called on a server that has no index.
 /// Said plainly, because an empty result would read as "your code does not
 /// contain that" - the silent-does-less failure this whole rebuild is against.
-const NO_CODE_INDEX: &str = "no code index is configured for this server - start it with \
---code-index-db and --repo, or build one first with the codeindex command. Code search only exists for a \
-programming project (a git repository that install has read); a plain topic folder has none, so read its \
-files directly and use lookup for what the memory holds";
+const NO_CODE_INDEX: &str = "this folder has no code to search. Code search only exists for a programming \
+project (a git repository that THOR's install has read); a plain folder for a subject has none, so read its files \
+directly and use lookup for what the memory holds. Nothing is wrong. If this is a programming project, run THOR's \
+install from inside it, then ask the person to restart Claude Code";
 
 /// How stale this answer is, in one sentence. Defined once and shared by every
 /// code tool: provenance is prose, not a boolean, and "the checkout could not
@@ -3353,7 +3355,8 @@ impl ThorMcpServer {
             // The gate's own grounds before the trial, so a write the gate
             // refuses anyway is never tried, and never recorded as a refused
             // trial.
-            model::gate::declare(&normalized_item(&item)).map_err(|r| gate_refusal(r, s))?;
+            let project_root = model::store::project_root_for(s, item.project.as_deref());
+            model::gate::with_project_root(project_root, || model::gate::declare(&normalized_item(&item))).map_err(|r| gate_refusal(r, s))?;
             // THOR'S TRIAL (step 8): every Rule/Orientation, whatever its
             // severity. It decides the check it is stored with and its label,
             // or refuses it naming the one fix (recorded, never written on the
@@ -4382,7 +4385,8 @@ impl ThorMcpServer {
             let mut att = stamp.att();
             refuse_a_side_door_on_a_frozen_item(s, &args.id, &att)?;
             // A rule that needs the owner's go is retracted only on his own words.
-            if model::store::show(s, &args.id).ok().is_some_and(|existing| model::store::is_owner_approval(&existing)) {
+            let owner_rule = model::store::show(s, &args.id).ok().is_some_and(|existing| model::store::is_owner_approval(&existing));
+            if owner_rule {
                 serve::unpin_gate::owner_rule_go(
                     s,
                     &args.id,
@@ -4411,7 +4415,13 @@ impl ThorMcpServer {
                 }
             }
             let lost = model::store::show(s, &args.id).ok().and_then(|item| lost_check_warning(s, &item));
-            match model::store::retract(s, stamp.column(), LINEAGE_ID, ACTOR, &args.id, &args.reason, Some(&att)) {
+            // His quoted words are the decision: one call takes the rule down, whatever its check says.
+            let retracted = if owner_rule {
+                model::store::retract_on_owner_words(s, stamp.column(), LINEAGE_ID, ACTOR, &args.id, &args.reason, Some(&att))
+            } else {
+                model::store::retract(s, stamp.column(), LINEAGE_ID, ACTOR, &args.id, &args.reason, Some(&att))
+            };
+            match retracted {
                 Ok(event) => Ok(format!(
                     "retracted {} ({}) (event seq {}){}",
                     args.id,
@@ -4489,7 +4499,9 @@ impl ThorMcpServer {
         let Some(code) = self.code.clone() else {
             return NO_CODE_INDEX.to_string();
         };
-        match serve::lookup::outline(&code.index_db, &args.path) {
+        // Claude Code's Edit gives an absolute path; the index holds repository-relative ones.
+        let wanted = serve::lookup::repo_relative(&code.repo, &args.path);
+        match serve::lookup::outline(&code.index_db, &wanted) {
             Err(e) => format!("outline failed: {e}"),
             Ok(None) => format!(
                 "'{}' is not in the code index - check the path is repository-relative, or the \
@@ -4681,8 +4693,37 @@ impl ThorMcpServer {
     }
 }
 
+/// Whether a tool's answer is a refusal: the write gate's `REFUSED: ...` and the
+/// retract tool's `refused: ...`. Such an answer is a failed call, and the client
+/// is told so (`isError`), so one that looks only at that flag never reads a
+/// refusal as a success. Nothing in THOR reads that flag back as a reason to
+/// doubt a write: `serve::attest` and the copy attestation look for a result that
+/// is NOT an error and names `event seq N` (or a queued capture), and a refusal
+/// holds neither.
+pub fn is_refusal_text(text: &str) -> bool {
+    text.starts_with("REFUSED") || text.starts_with("refused:")
+}
+
+/// `result` with `isError` set when its first text is a refusal.
+fn flag_a_refusal(mut result: rmcp::model::CallToolResult) -> rmcp::model::CallToolResult {
+    let refused = result.content.first().and_then(|c| c.as_text()).is_some_and(|t| is_refusal_text(&t.text));
+    if refused {
+        result.is_error = Some(true);
+    }
+    result
+}
+
 #[tool_handler]
 impl ServerHandler for ThorMcpServer {
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await.map(flag_a_refusal)
+    }
+
     /// THE GAP THIS CLOSES: `ServerInfo::new` alone leaves `server_info` at
     /// rmcp's own `Implementation::from_build_env()` default, which expands
     /// `env!("CARGO_PKG_VERSION")` (and `CARGO_CRATE_NAME`) INSIDE RMCP'S OWN

@@ -1741,6 +1741,22 @@ pub fn where_used(
 /// What one file defines, in line order. `Ok(None)` means the index has never
 /// seen that path at all, which a caller must report as "not indexed" - a
 /// different answer from "this file defines nothing".
+/// `path` as the code index spells it: relative to the repository, with forward
+/// slashes. An absolute path inside `repo` (what an Edit call carries), written with
+/// either slash and in any case on a system that does not tell them apart, loses
+/// the repository's folder; a leading `./` goes too. Anything else is returned as
+/// written, with its slashes unified.
+pub fn repo_relative(repo: &std::path::Path, path: &str) -> String {
+    let flat = path.trim().replace('\\', "/");
+    let root = repo.to_string_lossy().replace('\\', "/");
+    let root = root.trim_end_matches('/');
+    let folds = cfg!(windows) || flat.chars().nth(1) == Some(':');
+    let (a, b) = if folds { (flat.to_lowercase(), root.to_lowercase()) } else { (flat.clone(), root.to_string()) };
+    let inside = !root.is_empty() && a.len() > b.len() && a.starts_with(&b) && a.as_bytes()[b.len()] == b'/';
+    let relative = if inside { flat[root.len() + 1..].to_string() } else { flat };
+    relative.trim_start_matches("./").to_string()
+}
+
 pub fn outline(
     index_db_path: &std::path::Path,
     path: &str,
@@ -1759,6 +1775,25 @@ pub fn code_index_status(index_db_path: &std::path::Path, repo_path: &std::path:
     let store = codeindex::Store::open(index_db_path).map_err(|e| e.to_string())?;
     let provenance = codeindex::provenance(&store, repo_path).map_err(|e| e.to_string())?;
     Ok(owned_provenance(provenance))
+}
+
+#[cfg(test)]
+mod repo_relative_tests {
+    use super::repo_relative;
+    use std::path::Path;
+
+    #[test]
+    fn an_absolute_path_inside_the_repository_becomes_the_relative_one_the_index_holds() {
+        let repo = Path::new("C:/work/shop");
+        assert_eq!(repo_relative(repo, "C:\\work\\shop\\src\\main.rs"), "src/main.rs");
+        assert_eq!(repo_relative(repo, "C:/work/shop/src/main.rs"), "src/main.rs");
+        assert_eq!(repo_relative(repo, "c:/WORK/shop/src/main.rs"), "src/main.rs");
+        assert_eq!(repo_relative(repo, "src/main.rs"), "src/main.rs");
+        assert_eq!(repo_relative(repo, "./src/main.rs"), "src/main.rs");
+        assert_eq!(repo_relative(repo, "src\\main.rs"), "src/main.rs");
+        assert_eq!(repo_relative(repo, "C:/work/shop-old/src/main.rs"), "C:/work/shop-old/src/main.rs", "a folder that only starts the same is not inside");
+        assert_eq!(repo_relative(repo, "C:/work/shop"), "C:/work/shop");
+    }
 }
 
 #[cfg(test)]

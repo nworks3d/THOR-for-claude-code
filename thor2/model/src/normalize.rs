@@ -11,7 +11,16 @@
 /// unify path separators to `/`, and lowercase. Idempotent - normalising an
 /// already-normalised value returns it unchanged.
 pub fn normalize_target(value: &str) -> String {
-    value.trim().replace('\\', "/").to_lowercase()
+    let mut flat = value.trim().replace('\\', "/").to_lowercase();
+    // "./main.py" and "main.py" are the same file, however a call spells it.
+    while let Some(rest) = flat.strip_prefix("./") {
+        flat = rest.to_string();
+    }
+    // The same inside a path: "work/./main.py" is "work/main.py".
+    while flat.contains("/./") {
+        flat = flat.replace("/./", "/");
+    }
+    flat
 }
 
 /// Words that NAME the absence of a project rather than naming a project. An
@@ -248,6 +257,15 @@ mod dir_anchor_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_dot_slash_in_front_or_inside_a_path_is_the_same_file() {
+        assert_eq!(normalize_target("./main.py"), "main.py");
+        assert_eq!(normalize_target(".\\.\\main.py"), "main.py");
+        assert_eq!(normalize_target("C:\\work\\.\\main.py"), "c:/work/main.py");
+        assert_eq!(normalize_target("../main.py"), "../main.py", "a parent folder is a different place");
+        assert_eq!(normalize_target(&normalize_target("./a/./b")), "a/b", "idempotent");
+    }
 
     #[test]
     fn unifies_separators_and_case() {
