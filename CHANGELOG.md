@@ -60,6 +60,9 @@ What changed: The weekly check is quieter and more reliable, and a pin can no lo
 - **Old session records are cleaned up.** The small files beside the memory that hold one entry per conversation drop the entries of conversations unused for 90 days.
 - **Shorter replies after a change to a rule.** At most three real calls that do not count are named, followed by how many more there are.
 - **The check at the start of the weekly check is quicker** when a rule was refused many times.
+- **A read-only search for the forbidden words is no longer refused.** A rule that forbids `Co-Authored-By` or `Generated with` in a git command used to refuse an audit such as `git log | grep -ci "co-authored|generated with"`. What a `grep`, `rg`, `findstr`, `Select-String` or `git log --grep` looks FOR is no longer read as part of the call; the same words anywhere else in the call (a commit message, a file name to search) still count.
+- **`--flag value` and `--flag=value` are one flag, and a letter flag is found in a cluster.** A rule written `--visibility public` now also catches `--visibility=public`, and one written `-D` also catches `-Df` or `-fD`. A cluster counts only when it is letters after one dash; a longer word, `-D=x` and `--Df` do not.
+- **The guard for the files only Claude Code and THOR write no longer refuses harmless one-line programs.** `python -I` (Python's isolated flag) was read as `sed -i`, and a word such as `append`, `remove` or `write` anywhere in a `python -c` or `node -e` line counted as a write. Now a one-line program is refused only when the write is aimed at a protected path: `open(<protected>, 'w')`, `write_text`, `unlink`, `os.remove`, `rmtree`, `rename`, a copy onto it, `fs.writeFileSync`, an awk redirect, `perl -pi`, a sqlite write on the memory, or a shell command in a string that writes there. Reading a transcript and writing the result elsewhere is free.
 
 ## 2.6.13 (2026-11-21)
 

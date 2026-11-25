@@ -23,6 +23,8 @@
 
 use std::path::{Path, PathBuf};
 
+mod interp;
+
 /// The folders and files this guard keeps, already normalised for comparison.
 #[derive(Debug, Clone, Default)]
 pub struct Protected {
@@ -378,11 +380,6 @@ const DOTNET_WRITES: [&str; 8] =
 const MOVERS_OF_THE_WORKING_FOLDER: [&str; 5] = ["cd", "chdir", "pushd", "set-location", "sl"];
 const INTERPRETERS: &[&str] =
     &["python", "python3", "py", "pythonw", "node", "nodejs", "deno", "bun", "perl", "ruby", "php", "awk", "gawk", "lua"];
-/// Words in a one-line program that write, rename, copy over or delete a file.
-const WRITE_LOOKING: &[&str] = &[
-    "write", "append", "unlink", "rename", "copyfile", "copy(", "copy2", "rmtree", "remove", "truncate", "createwritestream",
-    "'w'", "\"w\"", "'wb'", "\"wb\"", "'a'", "\"a\"", "'ab'", "\"ab\"", "'r+'", "\"r+\"", "'w+'", "\"w+\"", "-pi", "-i.", " -i ", ">>",
-];
 const SQL_WRITES: &[&str] =
     &["insert ", "update ", "delete ", "drop ", "alter ", "create ", "vacuum", "replace ", ".restore", ".import", ".clone", "pragma "];
 /// Flags of the installer: a word `install` that carries one is THOR's program, not the Unix copy command.
@@ -418,7 +415,7 @@ fn command_writes_protected(p: &Protected, command: &str, cwd: Option<&str>, dep
         if redirects.iter().any(|t| p.protects(t, here.as_deref())) {
             return true;
         }
-        if segment_writes_protected(p, words, here.as_deref(), depth) {
+        if segment_writes_protected(p, words, here.as_deref(), depth, command) {
             return true;
         }
         if let Some((name, rest)) = leader_of(words) {
@@ -467,7 +464,7 @@ fn dest_receives(p: &Protected, dest: &str, sources: &[&String], cwd: Option<&st
     sources.iter().any(|s| p.protects(&format!("{folder}/{}", base_name(s)), cwd))
 }
 
-fn segment_writes_protected(p: &Protected, words: &[String], cwd: Option<&str>, depth: usize) -> bool {
+fn segment_writes_protected(p: &Protected, words: &[String], cwd: Option<&str>, depth: usize, source: &str) -> bool {
     let Some((name, rest)) = leader_of(words) else { return false };
     let at = words.len() - rest.len() - 1;
     let flag = |w: &String| w.starts_with('-') || (w.starts_with('/') && w.len() <= 3 && !w.contains('.'));
@@ -492,7 +489,7 @@ fn segment_writes_protected(p: &Protected, words: &[String], cwd: Option<&str>, 
             let inline = rest
                 .iter()
                 .position(|w| matches!(w.to_ascii_lowercase().as_str(), "/c" | "/k" | "-c" | "-lc" | "-command" | "-c:"))
-                .is_some_and(|i| segment_writes_protected(p, &rest[i + 1..], cwd, depth + 1));
+                .is_some_and(|i| segment_writes_protected(p, &rest[i + 1..], cwd, depth + 1, source));
             depth < 3 && (inline || rest.iter().any(|w| w.contains(' ') && command_writes_protected(p, w, cwd, depth + 1)))
         }
         "rm" | "del" | "erase" | "rmdir" | "rd" | "remove-item" | "ri" | "unlink" | "shred" => {
@@ -581,9 +578,11 @@ fn segment_writes_protected(p: &Protected, words: &[String], cwd: Option<&str>, 
             p.mentions_any(&whole) && SQL_WRITES.iter().any(|m| whole.contains(m))
         }
         n if INTERPRETERS.contains(&n) => {
-            // A one-line program that names a protected path next to a word that writes.
-            let whole = words[at..].join(" ").to_ascii_lowercase();
-            p.mentions_any(&whole) && (WRITE_LOOKING.iter().any(|m| whole.contains(m)) || (matches!(n, "awk" | "gawk") && whole.contains('>')))
+            // `perl -pi -e ... <protected>` edits the file in place.
+            let in_place = matches!(n, "perl" | "ruby")
+                && rest.iter().any(|w| w.starts_with('-') && !w.starts_with("--") && w.contains('i'))
+                && positionals.iter().any(|w| p.protects(w, cwd));
+            in_place || interp::writes_protected(p, n, source, cwd, depth)
         }
         _ => {
             // A one-line .NET or `New-Item` write names its target inside a longer argument.
@@ -777,6 +776,67 @@ mod tests {
             }
         }
         println!("calls {total}, refused {refused}, of which ran fine {refused_ok}");
+    }
+
+    #[test]
+    fn a_one_line_program_is_refused_only_when_its_write_is_aimed_at_a_protected_path() {
+        for command in [
+            "python -c \"open(r'C:/Users/alex/.claude/projects/x/s.jsonl','w')\"",
+            "python -c \"open('C:/data/store/a.json', mode='a').write('x')\"",
+            "py -3 -I -c \"open(r'C:\\Users\\alex\\.claude\\projects\\x\\s.jsonl','a')\"",
+            "python -I -c \"from pathlib import Path; Path('C:/data/store/a.json').write_text('x')\"",
+            "python -c \"import os; os.remove('C:/data/store/thor.db-wal')\"",
+            "python -c \"import os; os.unlink(r'C:\\Users\\alex\\.claude\\projects\\x\\s.jsonl')\"",
+            "python -c \"import shutil; shutil.rmtree('C:/data/store')\"",
+            "python -c \"import shutil; shutil.copy('f.json', 'C:/data/store/a.json')\"",
+            "python -c \"import os; os.rename('C:/data/store/thor.db', 'C:/scratch/x')\"",
+            "python -c \"p = 'C:/data/store/a.json'; open(p, 'w').write('x')\"",
+            "python -c \"from pathlib import Path; p = Path('C:/data/store/a.json'); p.unlink()\"",
+            "python -c \"import os; open(os.path.join('C:/data/store', 'a.json'), 'wb')\"",
+            "python -c \"import sqlite3; sqlite3.connect('C:/data/store/thor.db').execute('delete from event')\"",
+            "python -c \"import os; os.system('echo x > C:/data/store/a.json')\"",
+            "python -c \"import subprocess; subprocess.run(['rm', '-f', 'C:/data/store/thor.db'])\"",
+            "node -e \"require('fs').writeFileSync('C:/data/store/a.json','x')\"",
+            "node -e \"require('fs').appendFileSync(String.raw`C:/Users/alex/.claude/projects/x/s.jsonl`, 'x')\"",
+            "node -e \"require('fs').unlinkSync('C:/data/store/a.json')\"",
+            "node -e \"fs.createWriteStream('C:/data/store/a.json')\"",
+            "perl -e 'open(F, \">\", \"C:/data/store/a.json\"); print F 1'",
+            "perl -e 'unlink(\"C:/data/store/a.json\")'",
+            "perl -i.bak -pe 's/a/b/' C:/data/store/a.json",
+            "ruby -e \"File.write('C:/data/store/a.json', 'x')\"",
+            "php -r \"file_put_contents('C:/data/store/a.json', 'x');\"",
+            "awk 'BEGIN{printf \"x\" >> \"C:/data/store/a.json\"}'",
+        ] {
+            assert!(shell(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn a_one_line_program_that_writes_elsewhere_or_only_reads_is_free() {
+        for command in [
+            // -I is Python's isolated flag, not sed -i
+            "python -I -c \"print(open('C:/data/store/a.json').read())\"",
+            "py -3 -I -W ignore -c \"import fitz; d = fitz.open(r'C:\\Users\\alex\\.claude\\projects\\x\\a.pdf'); print(d.page_count)\"",
+            // a word that writes, aimed at something else
+            "python -c \"x = []; x.append(open('C:/data/store/a.json').read()); print(x)\"",
+            "python -c \"import os; os.remove('C:/scratch/old.txt'); print(open('C:/data/store/a.json').read())\"",
+            "python -I -c \"import sqlite3; c = sqlite3.connect('file:C:/data/store/thor.db?mode=ro', uri=True); print(c.execute('select count(*) from event').fetchone()); open(r'C:/scratch/out.txt','w').write('x')\"",
+            "python -c \"import sqlite3; print(sqlite3.connect('C:/data/store/thor.db').execute('select 1').fetchone())\"",
+            "python -c \"open('C:/scratch/copy.txt','w').write(open('C:/Users/alex/.claude/projects/x/s.jsonl').read())\"",
+            "python -c \"import shutil; shutil.copy('C:/data/store/thor.db', 'C:/scratch/thor.db')\"",
+            "python -c \"import json; [print(json.loads(l)['type']) for l in open(r'C:/Users/alex/.claude/projects/x/s.jsonl')]\"",
+            "python -c \"from pathlib import Path; Path('C:/scratch/a.txt').write_text(Path('C:/data/store/a.json').read_text())\"",
+            "python -c \"p = 'C:/data/store/a.json'; open('C:/scratch/n.txt','w').write(open(p).read())\"",
+            "node -e \"require('fs').writeFileSync('C:/scratch/out.txt', require('fs').readFileSync('C:/data/store/a.json'))\"",
+            "node -e \"console.log(require('fs').readFileSync('C:/data/store/a.json','utf8'))\"",
+            "perl -ne 'print if /x/' C:/data/store/a.json",
+            "perl -e 'open(F, \">\", \"C:/scratch/o.txt\"); print F 1'",
+            "awk '$1 > 5' C:/data/store/a.json",
+            "awk 'BEGIN{print \"x\" > \"C:/scratch/o.txt\"}'",
+            "python -c \"print('append this and remove that')\"",
+        ] {
+            assert!(!shell(command), "{command}");
+        }
     }
 
     #[test]
