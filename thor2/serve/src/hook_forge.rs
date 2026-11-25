@@ -187,7 +187,8 @@ pub fn refusal(tool_name: &str, tool_input: Option<&serde_json::Value>) -> Optio
     command_runs_the_hook(command).then(|| {
         "[THOR] That command runs THOR's own hook program by hand. The hook writes THOR's record of what the owner typed, and \
          that record is only good when the owner really typed it, so nothing was done. THOR's hooks are run by Claude Code, \
-         never by a command. Reading with `serve` (status, doctor, lookup) is fine."
+         never by a command. Reading with `serve` (status, doctor, lookup) is fine. To test THOR itself by hand, add \
+         `--no-record`, which writes nothing."
             .to_string()
     })
 }
