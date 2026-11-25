@@ -93,34 +93,70 @@ fn long_form(path: &str) -> String {
     path.to_string()
 }
 
-/// Whether `text` matches a shell wildcard (`*` any run, `?` one character), both in folded form.
+/// Whether `text` matches a shell wildcard (`*` any run, `?` one character, `[abc]` or `[a-z]` or
+/// `[!x]` one of a set), both in folded form.
 pub(super) fn wildcard_matches(pattern: &str, text: &str) -> bool {
-    let (p, t): (Vec<char>, Vec<char>) = (pattern.chars().collect(), text.chars().collect());
-    let (mut pi, mut ti, mut star, mut mark) = (0, 0, None::<usize>, 0);
-    while ti < t.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
-            pi += 1;
-            ti += 1;
-        } else if pi < p.len() && p[pi] == '*' {
-            star = Some(pi);
-            mark = ti;
-            pi += 1;
-        } else if let Some(s) = star {
-            pi = s + 1;
-            mark += 1;
-            ti = mark;
-        } else {
-            return false;
+    fn go(p: &[char], t: &[char]) -> bool {
+        match p.first() {
+            None => t.is_empty(),
+            Some('*') => (0..=t.len()).any(|k| go(&p[1..], &t[k..])),
+            Some('?') => !t.is_empty() && go(&p[1..], &t[1..]),
+            Some('[') => {
+                let Some(close) = p.iter().skip(2).position(|c| *c == ']').map(|i| i + 2) else {
+                    return !t.is_empty() && t[0] == '[' && go(&p[1..], &t[1..]);
+                };
+                let Some(&c) = t.first() else { return false };
+                let set = &p[1..close];
+                let (negated, set) = match set.first() {
+                    Some('!') | Some('^') => (true, &set[1..]),
+                    _ => (false, set),
+                };
+                let mut hit = false;
+                let mut i = 0;
+                while i < set.len() {
+                    if i + 2 < set.len() && set[i + 1] == '-' {
+                        hit |= set[i] <= c && c <= set[i + 2];
+                        i += 3;
+                    } else {
+                        hit |= set[i] == c;
+                        i += 1;
+                    }
+                }
+                hit != negated && go(&p[close + 1..], &t[1..])
+            }
+            Some(&c) => t.first() == Some(&c) && go(&p[1..], &t[1..]),
         }
     }
-    while pi < p.len() && p[pi] == '*' {
-        pi += 1;
+    let (p, t): (Vec<char>, Vec<char>) = (pattern.chars().collect(), text.chars().collect());
+    go(&p, &t)
+}
+
+/// Whether a wildcard could match some name that ends in `ext` (`abc.js*` can be `abc.jsonl`).
+pub(super) fn wildcard_could_end_with(pattern: &str, ext: &str) -> bool {
+    if !has_wildcard(pattern) {
+        return pattern.ends_with(ext);
     }
-    pi == p.len()
+    let stars: Vec<usize> = pattern.match_indices('*').map(|(i, _)| i).collect();
+    let fill = |star: Option<usize>, any: char| -> String {
+        let mut out = String::new();
+        for (i, c) in pattern.char_indices() {
+            match c {
+                '*' if Some(i) == star => out.push_str(ext),
+                '*' => {}
+                '?' => out.push(any),
+                c => out.push(c),
+            }
+        }
+        out
+    };
+    let mut candidates: Vec<String> = stars.iter().map(|s| fill(Some(*s), 'a')).collect();
+    candidates.push(fill(None, ext.chars().last().unwrap_or('a')));
+    candidates.push(fill(None, 'a'));
+    candidates.iter().any(|c| c.ends_with(ext) && wildcard_matches(pattern, c))
 }
 
 pub(super) fn has_wildcard(text: &str) -> bool {
-    text.contains('*') || text.contains('?')
+    text.contains('*') || text.contains('?') || (text.contains('[') && text.contains(']'))
 }
 
 /// PowerShell's `-Name:value` as the two words `-Name` and `value` (`-Path:C:\x`). A word that
@@ -128,6 +164,14 @@ pub(super) fn has_wildcard(text: &str) -> bool {
 pub(super) fn split_colon_params(words: &[String]) -> Vec<String> {
     let mut out = Vec::with_capacity(words.len());
     for w in words {
+        // `--target-directory=dir` is `--target-directory dir`.
+        if let Some((name, value)) = w.split_once('=') {
+            if ["--target-directory", "--destination", "--output-dir", "--directory-prefix"].contains(&name) && !value.is_empty() {
+                out.push(name.to_string());
+                out.push(value.to_string());
+                continue;
+            }
+        }
         let named = w.strip_prefix('-').filter(|r| !r.starts_with('-'));
         match named.and_then(|r| r.split_once(':')) {
             // `-oC:/x` (7z, curl) is a flag with a drive path; `-Path:C:/x` is a parameter with a value.

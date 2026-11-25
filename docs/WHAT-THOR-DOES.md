@@ -827,7 +827,16 @@ remembers per session how far it has looked, so a long conversation does not mak
   a folder of saved conversations (cp -r, robocopy, xcopy, rsync, Copy-Item -Recurse, tar -x -C, unzip -d,
   7z x, Expand-Archive, git clone, git checkout-index); a wildcard delete (`rm -rf <folder>/*`,
   `del <folder>\*.json`), a delete of a project folder under `projects`, `Get-ChildItem <folder> |
-  Remove-Item`, `ls <folder> | xargs rm`, `find <folder> -delete`; a git command that rewrites the working
+  Remove-Item`, `ls <folder> | xargs rm`, `find <folder> -delete`; a glob in a write or delete target that could match a
+  protected file (`<folder>/owner-p*`, `<home>/.claude/proj*/p/x.js*`, `owner-prompts.json?`), judged against
+  the protected folders and names and not against the disk; a PowerShell scriptblock or shell group
+  (`& { Add-Content <file> x }`, `Start-Job {...}`, `ForEach-Object {...}`, `{ cmd; }`) read as commands, an
+  `Add-Type -TypeDefinition` text checked for a .NET write (File.WriteAllText, StreamWriter, FileStream);
+  `printf '<command>' | sh` read as that command; `(cd <folder> && echo x > f)`; `echo x >&file`; `iwr -o`;
+  plain output flags and writers (sort -o, tar -cf, zip, 7z a, find -fprint, sqlite3 `.output`, sponge,
+  busybox, xargs <writer>, patch, openssl -out, pandoc -o, gpg -o, Start-Transcript, fsutil hardlink,
+  git rm and mv, git bundle create, git config --file, cp -l and -s of a protected file, uniq, script,
+  ssh -E); a git command that rewrites the working
   tree there (`git -C <folder> reset --hard`, `clean`, `checkout`); a one-line program (python -c, node -e,
   perl -e, ruby -e, php -r, awk) only when its write is aimed at such a path (open for writing, write_text,
   unlink, remove, rmtree, rename, a copy onto it, writeFileSync, an awk redirect, perl -pi, a sqlite write
@@ -835,16 +844,22 @@ remembers per session how far it has looked, so a long conversation does not mak
   Paths are compared without case, with either slash, with `~`, `%VAR%`, `$VAR`, `$env:VAR`, `${env:VAR}`,
   HOMEDRIVE and HOMEPATH and CLAUDE_CONFIG_DIR written out, `..` resolved, a trailing dot or space and
   `::$DATA` dropped, `\\?\`, `\\.\` and `\\localhost\c$` forms read as the drive path, and an 8.3 short
-  name looked up when the folder exists. Reading, and copying a file away, stay free, and so does writing a
-  file in the memory's folder that is not a state file (notes.txt).
+  name looked up when the folder exists, `/cygdrive/c/x` and `/mnt/c/x` read as `c:/x`. Reading, and copying
+  a file away, stay free, and so does writing a file in the memory's folder that is not a state file
+  (notes.txt).
+- The two record files THOR keeps for the owner's words (the unpin go file and the owner prompts file) are
+  kept by name, in the memory's folder only: an absolute path inside it, or a bare name while the command's
+  `cd` or the working folder is that folder. A file of that name anywhere else (a test fixture) is free.
 - Why: the owner's words are read from the saved conversation, and the guard that watches the assistant
   lives in these folders; if the assistant could write there it could forge what the owner said.
 - You notice: the call is refused with "[THOR] That would change a file that only Claude Code and THOR write".
 - What it cannot see (stated, not hidden): a script file that writes (`python script.py`, `.ps1`, `.bat`),
   a path built at run time (a variable, `sys.argv`, a command substitution, string pieces joined by the
-  program), `eval`, a link or junction made in an earlier step and written through later, a hard link, a
+  program), a drive made with `subst` or `New-PSDrive`, a drive-relative path (`C:name`), `wsl` and `ssh`
+  commands (another machine), `schtasks /tr`, `eval`, a link or junction made in an earlier step and written through later, a hard link, a
   program started by another program, `Start-Process -ArgumentList`, a 8.3 name of a file that does not exist
-  yet, and a pipe delete that filters in between (`gci <folder> | Where-Object ... | Remove-Item` is let
+  yet, a glob whose directory part is built at run time, a scriptblock written in a here-string and run
+  later, and a pipe delete that filters in between (`gci <folder> | Where-Object ... | Remove-Item` is let
   through, because the filter may rule out the state files). It is a guard against a wrong turn, not a
   security boundary against someone who is set on getting past it.
 - Refuse or change: built in. To change a THOR setting use the matching option of the install program.

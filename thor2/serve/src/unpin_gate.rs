@@ -532,9 +532,15 @@ pub fn owner_go_recorded(db: &Path, id: &str, because: &str, session: Option<&st
 /// is not refused. `None` for every other call. Not airtight (a name can be built up in a shell
 /// variable, and a script file is not read); transparency is the real protection - see the module's
 /// own comment.
-pub fn protected_file_refusal(tool_name: &str, tool_input: Option<&serde_json::Value>) -> Option<String> {
-    let guard = crate::write_guard::Protected::with_name_lock(&[PROTECTED_FILE, crate::prompt_record::FILE]);
-    let writes_it = crate::write_guard::writes_protected(&guard, tool_name, tool_input, None);
+pub fn protected_file_refusal(
+    tool_name: &str,
+    tool_input: Option<&serde_json::Value>,
+    db: Option<&Path>,
+    cwd: Option<&str>,
+) -> Option<String> {
+    // The names are kept in the memory's folder only: a test file of that name elsewhere is free.
+    let guard = crate::write_guard::Protected::with_name_lock_in(db.and_then(Path::parent), &[PROTECTED_FILE, crate::prompt_record::FILE]);
+    let writes_it = crate::write_guard::writes_protected(&guard, tool_name, tool_input, cwd);
     writes_it.then(|| {
         format!(
             "[THOR] {PROTECTED_FILE} and {} are THOR's own records of what the owner typed and said about taking a pinned \
@@ -564,13 +570,13 @@ mod tests {
         for name in ["unpin-owner-go.json", "UNPIN-OWNER-GO.JSON", "Unpin-Owner-Go.Json"] {
             for tool in ["Write", "Edit", "MultiEdit", "NotebookEdit"] {
                 let input = serde_json::json!({ "file_path": format!("C:/data/store/{name}") });
-                assert!(protected_file_refusal(tool, Some(&input)).is_some(), "{tool} on {name}");
+                assert!(protected_file_refusal(tool, Some(&input), None, None).is_some(), "{tool} on {name}");
             }
             let command = serde_json::json!({ "command": format!("echo [] > store/{name}") });
-            assert!(protected_file_refusal("Bash", Some(&command)).is_some(), "Bash on {name}");
+            assert!(protected_file_refusal("Bash", Some(&command), None, None).is_some(), "Bash on {name}");
         }
         let other = serde_json::json!({ "file_path": "C:/data/store/notes.json" });
-        assert!(protected_file_refusal("Write", Some(&other)).is_none());
+        assert!(protected_file_refusal("Write", Some(&other), None, None).is_none());
     }
 
     #[test]
@@ -712,8 +718,8 @@ mod tests {
 
     #[test]
     fn the_name_lock_refuses_every_spelling_of_a_write_and_not_a_mere_mention() {
-        let bash = |c: &str| protected_file_refusal("Bash", Some(&serde_json::json!({ "command": c }))).is_some();
-        let ps = |c: &str| protected_file_refusal("PowerShell", Some(&serde_json::json!({ "command": c }))).is_some();
+        let bash = |c: &str| protected_file_refusal("Bash", Some(&serde_json::json!({ "command": c })), None, None).is_some();
+        let ps = |c: &str| protected_file_refusal("PowerShell", Some(&serde_json::json!({ "command": c })), None, None).is_some();
         for write in [
             "echo [] > unpin-owner-go.json",
             "echo [] >> C:/s/store/UNPIN-OWNER-GO.JSON",
@@ -765,11 +771,33 @@ mod tests {
         for tool in ["Write", "Edit", "MultiEdit"] {
             for path in ["store/unpin-owner-go.json", "C:\\s\\Unpin-Owner-Go.json", "store/unpin-owner-go.json:stream", "store/owner-prompts.jsonl"] {
                 let input = serde_json::json!({ "file_path": path });
-                assert!(protected_file_refusal(tool, Some(&input)).is_some(), "{tool} {path}");
+                assert!(protected_file_refusal(tool, Some(&input), None, None).is_some(), "{tool} {path}");
             }
         }
         let src = serde_json::json!({ "file_path": "thor2/serve/src/unpin_gate.rs", "new_string": "const F: &str = \"unpin-owner-go.json\";" });
-        assert!(protected_file_refusal("Edit", Some(&src)).is_none(), "editing the source that names it is fine");
+        assert!(protected_file_refusal("Edit", Some(&src), None, None).is_none(), "editing the source that names it is fine");
+    }
+
+    #[test]
+    fn the_name_lock_holds_in_the_memory_folder_only() {
+        let db = Path::new("C:/data/store/thor.db");
+        let refused = |tool: &str, input: serde_json::Value, cwd: Option<&str>| protected_file_refusal(tool, Some(&input), Some(db), cwd).is_some();
+        let cmd = |c: &str| serde_json::json!({ "command": c });
+        // In the folder: by path, or by a bare name while the working folder is the memory's.
+        assert!(refused("Write", serde_json::json!({ "file_path": "C:/data/store/owner-prompts.jsonl" }), Some("C:/work")));
+        assert!(refused("Bash", cmd("echo x >> C:/data/store/owner-prompts.jsonl"), Some("C:/work")));
+        assert!(refused("Bash", cmd("echo x >> owner-prompts.jsonl"), Some("C:/data/store")));
+        assert!(refused("Bash", cmd("cd C:/data/store && echo x >> unpin-owner-go.json"), Some("C:/work")));
+        assert!(refused("Bash", cmd("(cd C:/data/store && echo x > owner-prompts.jsonl)"), Some("C:/work")));
+        assert!(refused("Bash", cmd("echo x >> C:/data/store/owner-p*"), Some("C:/work")));
+        // A file of that name elsewhere (a test fixture) is free.
+        assert!(!refused("Write", serde_json::json!({ "file_path": "C:/work/fixtures/owner-prompts.jsonl" }), Some("C:/work")));
+        assert!(!refused("Write", serde_json::json!({ "file_path": "fixtures/unpin-owner-go.json" }), Some("C:/work")));
+        assert!(!refused("Bash", cmd("echo x > owner-prompts.jsonl"), Some("C:/work/fixtures")));
+        assert!(!refused("Bash", cmd("cd C:/work && echo x > unpin-owner-go.json"), Some("C:/data/store")));
+        assert!(!refused("Bash", cmd("echo x > C:/work/fixtures/unpin-owner-go.json"), Some("C:/data/store")));
+        assert!(!refused("PowerShell", cmd("Set-Content C:\\work\\owner-prompts.jsonl x"), Some("C:/work")));
+        assert!(!refused("PowerShell", cmd("[IO.File]::WriteAllText('C:/work/owner-prompts.jsonl','x')"), Some("C:/work")));
     }
 
     #[test]
@@ -831,13 +859,13 @@ mod tests {
     #[test]
     fn the_hook_refuses_a_call_that_names_the_record_file() {
         let edit = serde_json::json!({ "file_path": format!("C:/memory/{PROTECTED_FILE}"), "content": "[]" });
-        assert!(protected_file_refusal("Write", Some(&edit)).unwrap().contains("Nothing was changed"));
+        assert!(protected_file_refusal("Write", Some(&edit), None, None).unwrap().contains("Nothing was changed"));
         let shell = serde_json::json!({ "command": format!("echo '[]' > /m/{PROTECTED_FILE}") });
-        assert!(protected_file_refusal("Bash", Some(&shell)).is_some() && protected_file_refusal("PowerShell", Some(&shell)).is_some());
+        assert!(protected_file_refusal("Bash", Some(&shell), None, None).is_some() && protected_file_refusal("PowerShell", Some(&shell), None, None).is_some());
         // Another file, and a mention in what is written, are not refused.
         let other = serde_json::json!({ "file_path": "C:/work/notes.md", "content": format!("see {PROTECTED_FILE}") });
-        assert!(protected_file_refusal("Write", Some(&other)).is_none());
-        assert!(protected_file_refusal("Read", Some(&edit)).is_none());
+        assert!(protected_file_refusal("Write", Some(&other), None, None).is_none());
+        assert!(protected_file_refusal("Read", Some(&edit), None, None).is_none());
     }
 
     #[test]

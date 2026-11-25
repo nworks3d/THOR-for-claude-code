@@ -2831,7 +2831,7 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             // message the owner typed about that note is checked against this session's
             // transcript here, because only the hook can see it; the tool server accepts such a
             // quote only when this left its record. The hook never blocks a take-down itself.
-            if let Some(reason) = serve::unpin_gate::protected_file_refusal(tool_name, tool_input) {
+            if let Some(reason) = serve::unpin_gate::protected_file_refusal(tool_name, tool_input, Some(db_path), payload.get("cwd").and_then(|c| c.as_str())) {
                 return Some(HookOutput::Decision(serde_json::json!({ "decision": "block", "reason": reason })));
             }
             // No shell command runs THOR's own hook by hand: that would write a line into the record
