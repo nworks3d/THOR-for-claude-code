@@ -263,7 +263,7 @@ fn stop_ask_writes_one_start_record() {
 
     // The next turn's ask finds it open: same start, nothing written.
     let again = run_hook(&db, stop("s1", &cwd), &sandbox);
-    assert!(again.contains(&format!("started at log position {before}")), "{again}");
+    assert!(again.contains("is still open (started"), "the second hold is the short form of the same open evaluation: {again}");
     assert_eq!(only_start(&db, "s1"), start);
 }
 

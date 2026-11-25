@@ -255,6 +255,37 @@ fn the_weekly_floor_reads_the_log_only() {
     assert!(weekly_floor_due(&store, "fxp", now), "a valid evaluation eight days old, activity yesterday");
 }
 
+/// The floor counts from the project's first activity in this memory: a project that began two
+/// days ago has not gone a week without an evaluation, whatever it did since; one that began nine
+/// days ago has.
+#[test]
+fn the_weekly_floor_does_not_ask_a_project_younger_than_a_week() {
+    let now = crate::time::now_unix();
+    for (began_days_ago, due) in [(2, false), (9, true)] {
+        let mut store = EventStore::in_memory().unwrap();
+        model::store::declare(&mut store, "fixture", "fixture", "fixture", &rule("fx-rule", "fxp")).unwrap();
+        let at = |days: i64| crate::time::iso8601_from_unix(now - days * DAY);
+        crate::deliver::record_delivery(&mut store, "fixture", "fixture", ASSISTANT_DELIVERY_ACTOR, &at(began_days_ago), &["seed".to_string()]);
+        let opened = Item {
+            id: model::store::project_opened_id("fxp"),
+            kind: model::item::Kind::Report,
+            text: "Project fxp: a fixture record.".to_string(),
+            bindings: vec![],
+            severity: None,
+            project: Some("fxp".to_string()),
+            tags: vec!["project-record".to_string()],
+            expires: None,
+            key: None,
+            falsifier: None,
+            check: None,
+        };
+        model::store::declare(&mut store, "install", "install", "installer", &opened).unwrap();
+        crate::deliver::record_delivery(&mut store, S1, S1, ASSISTANT_DELIVERY_ACTOR, &at(1), &["fx-rule".to_string()]);
+        assert_eq!(project_is_young(&store, "fxp", now), began_days_ago < 7);
+        assert_eq!(weekly_floor_due(&store, "fxp", now), due, "began {began_days_ago} days ago");
+    }
+}
+
 /// A write carries no time of its own: it is dated by the newest dated event
 /// before it - a lower bound, so an undated write never reads as recent.
 #[test]

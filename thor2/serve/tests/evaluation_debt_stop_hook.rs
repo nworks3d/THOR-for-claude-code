@@ -563,7 +563,7 @@ fn fires_for_a_main_session_and_names_the_real_eval_path_when_it_exists() {
     assert_eq!(v["decision"], "block", "{out}");
     let reason = v["reason"].as_str().unwrap();
     assert!(reason.contains("[THOR]"), "{reason}");
-    assert!(reason.contains("This project has had no evaluation in the last 7 day(s)"), "{reason}");
+    assert!(reason.contains("This project has not had an evaluation yet"), "{reason}");
     assert!(reason.contains("This session has worked here for"), "{reason}");
     let listed = model::store::EVALUATION_JUDGEMENT_LIST_MIN;
     assert!(reason.contains(&format!("{listed} item(s) will be on this evaluation's verdict list")), "{reason}");
@@ -662,7 +662,9 @@ fn blocks_on_the_stop_of_a_new_turn_again_and_again_while_no_report_exists() {
             serde_json::from_str(&out).unwrap_or_else(|e| panic!("turn {turn}: expected a decision JSON: {e}: {out}"));
         assert_eq!(v["decision"], "block", "turn {turn} must still block: {out}");
         let reason = v["reason"].as_str().unwrap();
-        assert!(reason.contains(&format!("It has been asked {turn} time(s)")), "turn {turn}: {reason}");
+        // The first hold carries the whole ask; the holds after it the short form.
+        let counted = if turn == 1 { format!("It has been asked {turn} time(s)") } else { format!("asked {turn} time(s)") };
+        assert!(reason.contains(&counted), "turn {turn}: {reason}");
     }
 }
 
@@ -1835,8 +1837,8 @@ fn the_ask_follows_the_work_not_the_folder() {
     assert!(out.contains("This session worked in project 'fxp' since its last evaluation; this folder belongs to 'gamma'"), "{out}");
     assert!(out.contains("(project 'fxp')") && out.contains("The evaluation of 'fxp' started"), "{out}");
     let elsewhere = run_hook(&db, &stop_payload(&s2, &sandbox.global_cwd()), &sandbox);
-    assert!(is_block(&elsewhere) && elsewhere.contains("(project 'fxp')"), "{elsewhere}");
-    assert!(elsewhere.contains("this folder belongs to no project"), "{elsewhere}");
+    // The second hold of the same open evaluation is the short form: it still names the project.
+    assert!(is_block(&elsewhere) && elsewhere.contains("evaluation of 'fxp' is still open"), "{elsewhere}");
 }
 
 /// G17.5 (D11): a session that worked only in its folder's own project is

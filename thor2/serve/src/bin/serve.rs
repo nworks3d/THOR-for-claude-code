@@ -4446,6 +4446,14 @@ fn eval_stop_ask(
                 if !no_record {
                     serve::holder::claim(db_path, &project, session_id, now);
                 }
+                // FROM THE SECOND HOLD OF THE SAME OPEN EVALUATION ON, a short form: the whole ask
+                // (5 to 6 kB) was repeated at every turn until a report counted. The turn is held
+                // all the same; the short text says what is still owed and how to print the rest.
+                if let Some(open) = started.as_ref().filter(|s| !s.fresh && state.asked_count >= 1) {
+                    let command = serve::eval_session::EVAL_COMMAND_NAME;
+                    let since = usefulness::days_ago_words(now, state.first_asked_since_report.unwrap_or(now));
+                    return EvalStop::Ask(serve::eval_session::short_ask(store, &open.start, state.asked_count + 1, &since, command));
+                }
                 let build_info = build_info.map(|line| format!("{line}\n\n")).unwrap_or_default();
                 let reason = format!("{build_info}{}{reason}", routine_changed_lines(session_id));
                 return EvalStop::Ask(match started {
@@ -4619,6 +4627,7 @@ fn evaluation_ask(
             "The last evaluation report ('{report_id}') was filed {}.",
             usefulness::days_ago_words(now, state.last_evaluation_seen.unwrap_or(now))
         ),
+        _ if state.last_evaluation_seen.is_none() => format!("This project has not had an evaluation yet (project '{project}')."),
         _ => format!("This project has had no evaluation in the last {quiet_days} day(s) (project '{project}')."),
     };
     format!(
@@ -6428,7 +6437,7 @@ mod evaluation_debt_tests {
         let asked =
             evaluation_debt(&store, &db, Some("thor"), &work_minutes(90)).expect("no report ever seen, enough time worked");
         assert!(asked.starts_with("[THOR]"), "{asked}");
-        assert!(asked.contains("This project has had no evaluation in the last 7 day(s)"), "{asked}");
+        assert!(asked.contains("This project has not had an evaluation yet"), "{asked}");
         assert!(asked.contains("This session has worked here for"), "{asked}");
         assert!(asked.contains("minute(s)"), "{asked}");
         assert!(asked.contains("5 item(s) will be on this evaluation's verdict list"), "{asked}");
