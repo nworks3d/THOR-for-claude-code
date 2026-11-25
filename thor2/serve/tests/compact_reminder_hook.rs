@@ -129,15 +129,16 @@ fn a_subagent_payload_never_includes_the_reminder_even_with_source_compact() {
 fn the_sessionstart_output_for_a_compact_payload_is_otherwise_unchanged() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("store.db");
+    std::fs::write(dir.path().join(".thor-project"), "compact-test\n").unwrap();
     seed_store(&db_path, "g4");
 
-    let plain_payload = session_start_payload(serde_json::json!({}));
+    let plain_payload = session_start_payload(serde_json::json!({"cwd": dir.path().to_string_lossy()}));
     let (plain_status, plain_stdout, _) = run_hook(&db_path, &plain_payload);
     assert_eq!(plain_status.code(), Some(0));
     let plain_json: serde_json::Value = serde_json::from_slice(&plain_stdout).unwrap();
     let plain_block = plain_json["hookSpecificOutput"]["additionalContext"].as_str().unwrap().to_string();
 
-    let compact_payload = session_start_payload(serde_json::json!({"source": "compact"}));
+    let compact_payload = session_start_payload(serde_json::json!({"source": "compact", "cwd": dir.path().to_string_lossy()}));
     let (compact_status, compact_stdout, _) = run_hook(&db_path, &compact_payload);
     assert_eq!(compact_status.code(), Some(0));
     let compact_json: serde_json::Value = serde_json::from_slice(&compact_stdout).unwrap();
