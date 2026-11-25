@@ -2126,10 +2126,10 @@ fn owner_pin_refusal(id: &str, quoted: &str) -> String {
     let unwitnessed = if serve::order_earlier::quote_candidates(quoted).is_empty() {
         ""
     } else {
-        " The words you quoted are not one whole message the owner typed in this session that names this note (a piece of it, a message about something else, a helper's text and your own text do not count)."
+        " The words you quoted are not one whole message of the last two the owner typed (this turn's or the one before) that names this note (a piece of it, a message about something else, a helper's text and your own text do not count)."
     };
     format!(
-        "REFUSED: nothing was changed. '{id}' would be pinned, which brings it into every conversation, and that start block is the owner's: only he decides what goes in it.{unwitnessed} Ask the owner in one plain sentence whether this has to come along in every conversation (name the note's id '{id}' in your question). When he has said yes in his own message in this session, repeat the call with `because` holding his whole message between double quotes. If it only matters for one subject, leave Always out and bind the note to its project (a binding of kind project) instead."
+        "REFUSED: nothing was changed. '{id}' would be pinned, which brings it into every conversation, and that start block is the owner's: only he decides what goes in it.{unwitnessed} Ask the owner in one plain sentence whether this has to come along in every conversation (name the note's id '{id}' in your question). When he has said yes in one of his last two messages, repeat the call with `because` holding his whole message between double quotes. If it only matters for one subject, leave Always out and bind the note to its project (a binding of kind project) instead."
     )
 }
 
@@ -2789,7 +2789,8 @@ fn mark_reply(store: &EventStore, id: &str, noise: bool, place: Option<&str>, pi
     if noise && can_refuse {
         let at = place.map(|p| format!(" at {p}")).unwrap_or_default();
         return format!(
-            "marked noise: {id}{at} - recorded, but this rule's check can refuse, so it is never silenced, at any place; it stays shown"
+            "marked noise: {id}{at} - recorded, but it changes nothing: this rule keeps coming, here and everywhere, because its check can refuse a call, and such a rule is never silenced by noise marks. \
+             If it fires where it does not belong, narrow it with mcp__thor__revise on '{id}' (a narrower check literal or a more specific file, command or tool binding, with `because` saying why, at least 20 characters)"
         );
     }
     if noise {
@@ -3722,7 +3723,9 @@ impl ThorMcpServer {
     async fn get(&self, Parameters(args): Parameters<GetArgs>) -> String {
         let session = self.session.session_id.clone();
         self.blocking(move |s| match model::store::show(s, &args.id) {
-            Ok(item) => {
+            Ok(mut item) => {
+                // The stored teeth label can be older than the refusals on record.
+                serve::prove::with_current_teeth_label(s, &args.id, &mut item);
                 let shown = serde_json::to_string_pretty(&item).map_err(|e| format!("could not render item: {e}"))?;
                 match args.fired {
                     Some(true) => Ok(format!("{shown}\n\n{}", recent_firings(s, &item.id, session.as_deref()))),
@@ -6379,6 +6382,9 @@ mod tests {
                 "git push --force origin main",
             );
         }
+        // Read BEFORE any rewrite: the stored label still says wired, `get` says what the log holds now.
+        let shown = srv.get(Parameters(GetArgs { id: "real-1".to_string(), fired: None })).await;
+        assert!(shown.contains("teeth:proven-guard") && !shown.contains("teeth:wired-not-proven"), "{shown}");
         let mut args = bare_revise("real-1");
         args.text = Some("never force-push with --force, on any branch".to_string());
         let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(args)).await;
@@ -9125,7 +9131,7 @@ mod tests {
 
         // Unchecked: the hook never saw it.
         let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(plain_pin("overflow-1", &text, Some(&quote)))).await;
-        assert!(reply.starts_with("REFUSED") && reply.contains("not one whole message the owner typed"), "an unwitnessed quote is only text: {reply}");
+        assert!(reply.starts_with("REFUSED") && reply.contains("not one whole message of the last two the owner typed"), "an unwitnessed quote is only text: {reply}");
         // A piece of his message is not his message.
         let piece = "the owner said yes: \"Ja, zet overflow-1 maar vast\"";
         witness(piece);
@@ -12058,7 +12064,38 @@ mod tests {
 
         // The survivor is rewritten just now to carry the point; a token that is only a substring of a longer id does not count.
         dated_serving(&srv, &serve::time::now_iso8601());
-        assert!(shorten(&srv, "fold-b", "Sunday dinners start at six, the ferry leaves at nine.").await.starts_with("revised"));
+        // A trivial edit of the survivor (no real text added, no reason naming the note) is no fold.
+        assert!(shorten(&srv, "fold-b", "Sunday dinners start at six!").await.starts_with("revised"));
+        let trivial = try_retract(&srv, "fold-a", "folded into fold-b, which now carries the point about dinner.").await;
+        assert!(trivial.starts_with("REFUSED") && trivial.contains("must add at least 20 characters"), "{trivial}");
+        // Adds text but its reason does not name the retracted note: no fold either.
+        let unnamed = srv
+            .revise(
+                Meta::new(),
+                RawArgs::default(),
+                Parameters(ReviseArgs {
+                    id: "fold-b".to_string(),
+                    text: Some("Sunday dinners start at six, the ferry leaves at nine, bring a coat.".to_string()),
+                    because: Some("adds the ferry time and the coat".to_string()),
+                    ..Default::default()
+                }),
+            )
+            .await;
+        assert!(unnamed.starts_with("revised"), "{unnamed}");
+        assert!(try_retract(&srv, "fold-a", "folded into fold-b, which now carries the point about dinner.").await.starts_with("REFUSED"));
+        let named = srv
+            .revise(
+                Meta::new(),
+                RawArgs::default(),
+                Parameters(ReviseArgs {
+                    id: "fold-b".to_string(),
+                    text: Some("Sunday dinners start at six, the ferry leaves at nine, bring a coat and a torch and a spare key.".to_string()),
+                    because: Some("now also carries the point of fold-a, so that one can be folded".to_string()),
+                    ..Default::default()
+                }),
+            )
+            .await;
+        assert!(named.starts_with("revised"), "{named}");
         let substring = try_retract(&srv, "fold-a", "folded into fold-bb, which now carries the point about dinner").await;
         assert!(substring.starts_with("REFUSED"), "fold-b only as a substring of fold-bb is no token: {substring}");
         // The honest fold.

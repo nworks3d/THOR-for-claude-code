@@ -247,6 +247,9 @@ fn read_marker(dir: &Path) -> Option<String> {
 /// subprocess. Anything unexpected in the file falls back to the directory
 /// itself, which is the old behaviour and never worse than it.
 pub fn git_root(start_dir: &Path) -> Option<PathBuf> {
+    if too_long_to_walk(start_dir) {
+        return None;
+    }
     let mut dir: Option<&Path> = Some(start_dir);
     while let Some(d) = dir {
         let dot_git = d.join(".git");
@@ -259,6 +262,16 @@ pub fn git_root(start_dir: &Path) -> Option<PathBuf> {
         dir = d.parent();
     }
     None
+}
+
+/// A folder path longer than this many characters is never walked upward: every parent costs
+/// a few file system calls, and a path of 32,000 characters once cost 26 to 47 seconds per hook.
+/// It is treated as no folder at all.
+pub const MAX_WALK_PATH_CHARS: usize = 4096;
+
+fn too_long_to_walk(dir: &Path) -> bool {
+    let os = dir.as_os_str();
+    os.len() > MAX_WALK_PATH_CHARS && os.to_string_lossy().chars().count() > MAX_WALK_PATH_CHARS
 }
 
 /// The top of a PLAIN TOPIC FOLDER: the nearest folder at or above `start_dir`
@@ -274,7 +287,7 @@ pub fn git_root(start_dir: &Path) -> Option<PathBuf> {
 /// name counts above `start_dir`: the old `.thor` name is still honoured in
 /// the folder itself, but never inherited by every folder below it.
 pub fn plain_root(start_dir: &Path) -> Option<PathBuf> {
-    if git_root(start_dir).is_some() {
+    if too_long_to_walk(start_dir) || git_root(start_dir).is_some() {
         return None;
     }
     let mut dir: Option<&Path> = Some(start_dir);
@@ -304,6 +317,9 @@ pub fn plain_root(start_dir: &Path) -> Option<PathBuf> {
 /// minutes. A caller that knows the worktree can refuse that before it is
 /// written (the tool server's `remember`/`revise`).
 pub fn linked_worktree_root(start_dir: &Path) -> Option<PathBuf> {
+    if too_long_to_walk(start_dir) {
+        return None;
+    }
     let mut dir: Option<&Path> = Some(start_dir);
     while let Some(d) = dir {
         let dot_git = d.join(".git");

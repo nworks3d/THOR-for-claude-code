@@ -2829,6 +2829,24 @@ fn is_slash_flag(literal: &str) -> bool {
     literal.strip_prefix('/').is_some_and(|rest| (1..=2).contains(&rest.len()) && rest.chars().all(|c| c.is_ascii_alphanumeric()))
 }
 
+/// A forbidden literal or a `requires` trigger of at least this many characters is matched
+/// without regard to case (`--visibility PUBLIC` is `--visibility public`, `co-authored-by` is
+/// `Co-Authored-By`); a shorter one (`-n` against `-N`) stays exact, since a short switch often
+/// means a different thing in the other case.
+pub const CASE_BLIND_MIN_CHARS: usize = 4;
+
+/// Whether a literal is looked for without regard to case.
+pub fn fold_case_for(literal: &str) -> bool {
+    literal.chars().count() >= CASE_BLIND_MIN_CHARS
+}
+
+/// The byte offset of the first occurrence of `literal` in `text`, with no regard to case when
+/// the literal is `CASE_BLIND_MIN_CHARS` characters or longer (ASCII case only, so offsets stay
+/// the same). No token boundaries: for a plain content search.
+pub fn find_literal(text: &str, literal: &str) -> Option<usize> {
+    if fold_case_for(literal) { text.to_ascii_lowercase().find(&literal.to_ascii_lowercase()) } else { text.find(literal) }
+}
+
 /// The byte offset of the first occurrence of `literal` in `text` that sits on
 /// token boundaries (see this module's doc comment, "TOKEN BOUNDARIES"). An
 /// escaped whitespace (`\n`, `` `n ``) next to the literal counts as the
@@ -2839,7 +2857,12 @@ pub fn find_at_boundary(text: &str, literal: &str) -> Option<usize> {
         return Some(0);
     };
     let mut from = 0;
-    while let Some(off) = text.get(from..).and_then(|t| t.find(literal)) {
+    let folded = fold_case_for(literal).then(|| (text.to_ascii_lowercase(), literal.to_ascii_lowercase()));
+    let (hay, needle): (&str, &str) = match &folded {
+        Some((h, n)) => (h, n),
+        None => (text, literal),
+    };
+    while let Some(off) = hay.get(from..).and_then(|t| t.find(needle)) {
         let at = from + off;
         let before = text[..at].chars().next_back();
         let rest = &text[at + literal.len()..];
@@ -3088,7 +3111,12 @@ pub fn star_stem(when: &str) -> Option<&str> {
 fn prefix_at_boundary(text: &str, stem: &str) -> bool {
     let Some(first) = stem.chars().next() else { return false };
     let mut from = 0;
-    while let Some(off) = text.get(from..).and_then(|t| t.find(stem)) {
+    let folded = fold_case_for(stem).then(|| (text.to_ascii_lowercase(), stem.to_ascii_lowercase()));
+    let (hay, needle): (&str, &str) = match &folded {
+        Some((h, n)) => (h, n),
+        None => (text, stem),
+    };
+    while let Some(off) = hay.get(from..).and_then(|t| t.find(needle)) {
         let at = from + off;
         let before = text[..at].chars().next_back();
         if !is_word_char(first) || before.is_none_or(is_boundary_char) {

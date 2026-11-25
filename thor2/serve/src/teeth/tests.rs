@@ -1257,6 +1257,20 @@ fn r7b_8_a_call_by_the_writing_session_never_stops_forcing() {
     assert!(receipt(&t).contains("was made by the writing session and does not count"), "{}", receipt(&t));
 }
 
+/// A reply names at most three of the real calls that do not count, then says how many more.
+#[test]
+fn a_receipt_names_three_calls_that_do_not_count_and_then_how_many_more() {
+    let mut fx = Fx::new();
+    for branch in ["a", "b", "c", "d", "e", "f"] {
+        fx.served(S1, &format!("git push --force origin {branch}"));
+    }
+    let item = rule("fp", "Never run `git push --force` on main.", vec![cmd("git push")], None, None);
+    let t = fx.run(&item, None, &session_in("alpha", None, S1), &Disputes::default());
+    let text = receipt(&t);
+    assert_eq!(text.matches("does not count").count(), 3,"{text}");
+    assert!(text.contains("and 3 more real call(s) that do not count either"), "{text}");
+}
+
 // --------------------------------------------------------- history, D7
 
 /// R7b.5 (Z5, D7): an earlier biting check replaced by a raw revise with no

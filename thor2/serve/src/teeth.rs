@@ -1986,6 +1986,7 @@ impl<'a> Work<'a> {
             }
             trials.push(dt);
         }
+        let mut not_counting_named = 0usize;
         for dt in &trials {
             // One line per tooth, never one per call: measured on a copy of a
             // real store, a rule about `git push` got 58 such lines, one per
@@ -2001,12 +2002,23 @@ impl<'a> Work<'a> {
                     s.seq
                 ));
             }
+            // At most three of the calls that do not count are named, over all the teeth; a reply
+            // once listed dozens of them.
             for n in &dt.not_counting {
-                self.receipt.push(n.clone());
+                if not_counting_named < MAX_NOT_COUNTING_NAMED {
+                    self.receipt.push(n.clone());
+                }
+                not_counting_named += 1;
             }
             if let (true, Some(why)) = (dt.tried.bites(), &dt.blocked) {
                 self.receipt.push(format!("{} does not force: {why}", describe(&dt.d.check, &dt.bindings(base))));
             }
+        }
+        if not_counting_named > MAX_NOT_COUNTING_NAMED {
+            self.receipt.push(format!(
+                "and {} more real call(s) that do not count either",
+                not_counting_named - MAX_NOT_COUNTING_NAMED
+            ));
         }
         let mut forcing: Vec<DerivedTrial> = trials.into_iter().filter(DerivedTrial::forces).collect();
         if forcing.is_empty() {
@@ -2899,6 +2911,9 @@ fn finish(work: Work<'_>, decision: Decision) -> Trial {
         },
     }
 }
+
+/// How many real calls that "do not count" a reply names before it says "and N more".
+const MAX_NOT_COUNTING_NAMED: usize = 3;
 
 /// The item as a trial stores it: its check as the trial decided, and its
 /// `teeth:` tags replaced by the one the verdict implies. `None` for a

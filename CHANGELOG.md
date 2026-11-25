@@ -32,6 +32,17 @@ What changed: The weekly check is quieter and more reliable, and a pin can no lo
 - **A subject's folder brings its notes without pinning.** In a folder made for one subject, a note tied to that subject comes up when your message shares a word with it. The setup texts no longer tell your assistant to pin.
 - **A code project is asked once about a changelog and version numbers.** When a project gets its own memory, your assistant asks one question with its two reasons: a fault is found much faster, and it saves effort and cost. On yes, THOR's notes already know the flow: a changelog line with every visible change, a changelog section before a release, small version steps, and the version read from git. On no, it is off for that project and never raised there again. It never blocks anything.
 - **Starting the weekly check can no longer hold you for a minute.** The whole start now stops after 15 seconds. What did not fit is finished at the next step, and the note says THOR is still deciding. Checking a rule against its earlier refusals also got much faster.
+- **Only your own recent words unlock a protected step.** When you say yes to taking down a pinned note, to a pin or to loosening a rule, THOR now accepts your message only when it is one of your last two, and only when the note's name is in it or in the assistant message just before it. A yes from earlier in the conversation no longer counts, and a yes that came before a very long stretch of work is still found.
+- **Saved conversations and THOR's own files are off limits to commands.** The assistant can no longer write into a saved conversation, into THOR's memory or its state files, or into THOR's programs, whether by an edit or by a command. Reading them or copying them somewhere else is still fine.
+- **Folding a pinned note needs a real fold.** A pinned note can only be folded into another one when that one just gained at least 20 characters of text and its change names the note being folded.
+- **Your words are read correctly.** A code span written with three backticks on one line is read as your text, and a stray unclosed code block no longer hides the rest of your message.
+- **A forbidden word or a required trigger ignores capital letters.** `--visibility PUBLIC` is caught like `--visibility public`. Short switches such as `-n` stay exact.
+- **Huge input no longer slows a hook.** A working folder path of more than 4096 characters counts as no folder, a prompt is read up to 200,000 characters and a long text in a tool call up to 2 MB. Nothing is refused because of its size.
+- **A rule that really refused something is shown as proven.** The label was set when the rule was written and never updated.
+- **Marking a rule as noise says what happens.** A rule that can refuse a call keeps coming whatever the marks say; the reply now says so and names the change that narrows it.
+- **Old session records are cleaned up.** The small files beside the memory that hold one entry per conversation drop the entries of conversations unused for 90 days.
+- **Shorter replies after a change to a rule.** At most three real calls that do not count are named, followed by how many more there are.
+- **The check at the start of the weekly check is quicker** when a rule was refused many times.
 
 ## 2.6.13 (2026-11-21)
 

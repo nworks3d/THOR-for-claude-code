@@ -1471,13 +1471,70 @@ pub fn owner_messages(transcript: &Path, last: usize) -> Result<Vec<String>, Str
     if !transcript.is_file() {
         return Err(format!("no transcript at {}", transcript.display()));
     }
-    let lines = tail_lines(transcript);
+    let lines = lines_with_owner_messages(transcript, last);
     if lines.is_empty() {
         return Err(format!("the transcript at {} could not be read", transcript.display()));
     }
     let mut out: Vec<String> = lines.iter().filter_map(|line| owner_text(line)).collect();
     let skip = out.len().saturating_sub(last);
     Ok(out.split_off(skip))
+}
+
+/// The most of a transcript read backwards to find the owner's last messages.
+pub const OWNER_READ_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+/// The longest the backwards read may take.
+const OWNER_READ_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whole lines from the END of `file`, read backwards in growing steps until they hold at least
+/// `owners` messages the owner typed, the file starts, `OWNER_READ_MAX_BYTES` is read or the time
+/// box is spent. A go typed before a turn full of tool results is found however long that turn was.
+/// Oldest first. Empty when the file cannot be read.
+pub fn lines_with_owner_messages(file: &Path, owners: usize) -> Vec<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut handle) = std::fs::File::open(file) else { return Vec::new() };
+    let len = handle.metadata().map(|m| m.len()).unwrap_or(0);
+    let began = std::time::Instant::now();
+    let mut end = len;
+    let mut step: u64 = TRANSCRIPT_TAIL_BYTES;
+    let mut carry: Vec<u8> = Vec::new();
+    let mut blocks: Vec<Vec<String>> = Vec::new();
+    let mut found = 0usize;
+    while end > 0 {
+        let size = step.min(end);
+        let start = end - size;
+        if handle.seek(SeekFrom::Start(start)).is_err() {
+            break;
+        }
+        let mut buf = Vec::with_capacity(size as usize + carry.len());
+        if (&mut handle).take(size).read_to_end(&mut buf).is_err() {
+            break;
+        }
+        buf.extend_from_slice(&carry);
+        carry.clear();
+        let body: Vec<u8> = if start > 0 {
+            match buf.iter().position(|b| *b == b'\n') {
+                Some(nl) => {
+                    carry = buf[..nl].to_vec();
+                    buf[nl + 1..].to_vec()
+                }
+                None => {
+                    carry = buf;
+                    Vec::new()
+                }
+            }
+        } else {
+            buf
+        };
+        let lines: Vec<String> = String::from_utf8_lossy(&body).lines().map(str::to_string).collect();
+        found += lines.iter().filter(|l| l.contains("\"user\"") && owner_text(l).is_some()).count();
+        blocks.push(lines);
+        end = start;
+        if found >= owners || len - end >= OWNER_READ_MAX_BYTES || began.elapsed() > OWNER_READ_BUDGET {
+            break;
+        }
+        step = (step * 2).min(64 * 1024 * 1024);
+    }
+    blocks.into_iter().rev().flatten().collect()
 }
 
 /// The owner's own words on one transcript line, or `None` when the line is
@@ -1524,20 +1581,42 @@ pub fn owner_text(line: &str) -> Option<String> {
     if start.is_empty() || injected.iter().any(|p| start.starts_with(p)) {
         return None;
     }
+    let mut plain: Vec<usize> = Vec::new();
+    loop {
+        match own_lines(&text, &plain) {
+            Ok(own) => return Some(own),
+            Err(opening) => plain.push(opening),
+        }
+    }
+}
+
+/// The lines of one message that are the owner's own: not quoted (`>`), not inside a fenced
+/// block. A fence line that closes on the same line (a code span written with three backticks)
+/// is ordinary text. A fence that is never closed is not a block: `Err(its line)`, and the caller
+/// reads the message again with that line treated as plain text, so one stray fence does not
+/// swallow the rest of what he wrote.
+fn own_lines(text: &str, plain_fences: &[usize]) -> Result<String, usize> {
     let mut own = Vec::new();
-    let mut fenced = false;
-    for line in text.lines() {
+    let mut fenced: Option<usize> = None;
+    for (n, line) in text.lines().enumerate() {
         let trimmed = line.trim_start();
-        if trimmed.starts_with("```") {
-            fenced = !fenced;
+        if let Some(after) = trimmed.strip_prefix("```") {
+            if fenced.is_none() && (after.contains("```") || plain_fences.contains(&n)) {
+                own.push(line);
+                continue;
+            }
+            fenced = if fenced.is_some() { None } else { Some(n) };
             continue;
         }
-        if fenced || trimmed.starts_with('>') {
+        if fenced.is_some() || trimmed.starts_with('>') {
             continue;
         }
         own.push(line);
     }
-    Some(own.join("\n"))
+    match fenced {
+        Some(opening) => Err(opening),
+        None => Ok(own.join("\n")),
+    }
 }
 
 /// Whether `text` says `marker` as a word of its own: case ignored, with no
@@ -3339,6 +3418,44 @@ mod step_26_tests {
         assert!(says_marker(&all[0], "go-owner"), "{all:?}");
         assert!(owner_messages(&dir.path().join("missing.jsonl"), 2).is_err());
         assert!(says_marker("ok, Go-Owner.", "go-owner") && !says_marker("go-owners", "go-owner") && !says_marker("nogo-owner", "go-owner"));
+    }
+
+    #[test]
+    fn a_one_line_fence_and_an_unclosed_fence_do_not_hide_his_words() {
+        assert!(says_marker(&owner_text(&line(serde_json::json!({"type": "user", "message": {"content": "```go-owner``` please"}}))).unwrap(), "go-owner"));
+        let unclosed = line(serde_json::json!({"type": "user", "message": {"content": "start\n```\ngo-owner\nand more"}}));
+        assert!(says_marker(&owner_text(&unclosed).unwrap(), "go-owner"), "an unclosed fence is not a block");
+        let closed = line(serde_json::json!({"type": "user", "message": {"content": "start\n```\ngo-owner\n```\nend"}}));
+        assert!(!says_marker(&owner_text(&closed).unwrap(), "go-owner"), "a real block still hides its text");
+    }
+
+    /// Not run by default: times the backwards read on real transcripts
+    /// (THOR_MEASURE_TRANSCRIPTS, paths separated by `;`).
+    #[test]
+    #[ignore]
+    fn measure_the_backwards_read_on_real_transcripts() {
+        for path in std::env::var("THOR_MEASURE_TRANSCRIPTS").unwrap_or_default().split(';').filter(|p| !p.is_empty()) {
+            let began = std::time::Instant::now();
+            let lines = lines_with_owner_messages(Path::new(path), 3);
+            let owners = lines.iter().filter(|l| owner_text(l).is_some()).count();
+            let bytes: usize = lines.iter().map(|l| l.len() + 1).sum();
+            println!("{path}: {} lines, {owners} owner messages, {bytes} bytes read, {:?}", lines.len(), began.elapsed());
+        }
+    }
+
+    #[test]
+    fn the_owners_words_are_found_behind_a_huge_stretch_of_tool_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("s.jsonl");
+        let big = "y".repeat(1024 * 1024);
+        let mut text = line(serde_json::json!({"type": "user", "message": {"content": "go-owner now"}}));
+        for _ in 0..(TRANSCRIPT_TAIL_BYTES / (1024 * 1024) + 4) {
+            text.push_str(&line(serde_json::json!({"type": "user", "message": {"content": [{"type": "tool_result", "content": big}]}})));
+        }
+        std::fs::write(&transcript, text).unwrap();
+        let words = owner_messages(&transcript, 2).unwrap();
+        assert_eq!(words.len(), 1);
+        assert!(says_marker(&words[0], "go-owner"));
     }
 
     /// STEP 27 (D10): a write THOR makes itself - here the installer's owner-

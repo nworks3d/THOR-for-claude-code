@@ -1612,7 +1612,9 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             raw
         }
     };
-    let payload: Value = serde_json::from_str(&raw).ok()?;
+    let mut payload: Value = serde_json::from_str(&raw).ok()?;
+    // Extreme input is cut before anything reads it (`serve::input::clamp_payload`).
+    serve::input::clamp_payload(&mut payload);
 
     let event_name = payload
         .get("hook_event_name")
@@ -1621,6 +1623,15 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
         .to_string();
 
     let session_id = resolve_session_id(&payload);
+    // The per-session state files stay small: note that this session is in use, and once a day
+    // drop the entries of sessions unused for 90 days (`serve::session_upkeep`).
+    if !no_record {
+        let now = time::now_unix();
+        serve::session_upkeep::touch(db_path, &session_id, now);
+        if event_name == "SessionStart" {
+            serve::session_upkeep::prune_if_due(db_path, now);
+        }
+    }
 
     // Surface 5, the Response Guard - handled FIRST and without opening the
     // store, because it watches the assistant's reply, not the memory. See
@@ -2834,6 +2845,11 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             // transcript here, because only the hook can see it; the tool server accepts such a
             // quote only when this left its record. The hook never blocks a take-down itself.
             if let Some(reason) = serve::unpin_gate::protected_file_refusal(tool_name, tool_input) {
+                return Some(HookOutput::Decision(serde_json::json!({ "decision": "block", "reason": reason })));
+            }
+            // The files only Claude Code and THOR write (saved conversations, the memory's folder,
+            // THOR's programs): no call may write to them (`serve::write_guard`).
+            if let Some(reason) = serve::write_guard::refusal(&serve::write_guard::Protected::current(db_path), tool_name, tool_input) {
                 return Some(HookOutput::Decision(serde_json::json!({ "decision": "block", "reason": reason })));
             }
             if serve::unpin_gate::is_gated_call(tool_name) || serve::unpin_gate::is_pin_call(tool_name) {

@@ -10,6 +10,93 @@ use std::path::PathBuf;
 
 pub use model::normalize::{hosts_in_command, paths_in_command};
 
+// ------------------------------------------------------------- extreme input
+//
+// A hook runs on every tool call and every prompt. A working folder of 32,000 characters made
+// the walk up its parents cost 26 to 47 seconds, and a prompt of 5 to 20 MB cost 10 to 60
+// seconds and up to 2.5 GB. Real input is far below these limits, so the hook cuts what is
+// beyond them before anything reads it, and carries on: it never fails or refuses because of
+// the size alone.
+
+/// A working folder longer than this many characters is treated as no working folder.
+pub const MAX_CWD_CHARS: usize = 4096;
+/// A prompt is read up to this many characters for matching.
+pub const MAX_PROMPT_CHARS: usize = 200_000;
+/// A text in a tool's input is matched on its first this many bytes.
+pub const MAX_TOOL_TEXT_BYTES: usize = 2 * 1024 * 1024;
+
+fn cut_to_bytes(text: &mut String, max: usize) {
+    if text.len() > max {
+        let mut at = max;
+        while !text.is_char_boundary(at) {
+            at -= 1;
+        }
+        text.truncate(at);
+    }
+}
+
+fn clamp_texts(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(s) => cut_to_bytes(s, MAX_TOOL_TEXT_BYTES),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(clamp_texts),
+        serde_json::Value::Object(map) => map.values_mut().for_each(clamp_texts),
+        _ => {}
+    }
+}
+
+/// Cuts the parts of a hook payload that are beyond the limits above, in place: a too long
+/// `cwd` is removed (no working folder), the `prompt` keeps its first `MAX_PROMPT_CHARS`
+/// characters and each text of `tool_input` its first `MAX_TOOL_TEXT_BYTES` bytes.
+pub fn clamp_payload(payload: &mut serde_json::Value) {
+    let Some(map) = payload.as_object_mut() else { return };
+    if map.get("cwd").and_then(|v| v.as_str()).is_some_and(|c| c.len() > MAX_CWD_CHARS && c.chars().count() > MAX_CWD_CHARS) {
+        map.remove("cwd");
+    }
+    if let Some(serde_json::Value::String(prompt)) = map.get_mut("prompt") {
+        if prompt.len() > MAX_PROMPT_CHARS {
+            if let Some((at, _)) = prompt.char_indices().nth(MAX_PROMPT_CHARS) {
+                prompt.truncate(at);
+            }
+        }
+    }
+    if let Some(input) = map.get_mut("tool_input") {
+        clamp_texts(input);
+    }
+}
+
+#[cfg(test)]
+mod extreme_input_tests {
+    use super::*;
+
+    #[test]
+    fn a_huge_cwd_prompt_and_tool_input_are_cut_and_nothing_else_changes() {
+        let mut payload = serde_json::json!({
+            "cwd": "C:/".to_string() + &"a/".repeat(16_000),
+            "prompt": "p".repeat(5_000_000),
+            "tool_input": { "command": "x".repeat(MAX_TOOL_TEXT_BYTES + 100), "file_path": "C:/work/a.txt" },
+            "session_id": "s1",
+        });
+        clamp_payload(&mut payload);
+        assert!(payload.get("cwd").is_none(), "a cwd of 32,000 characters is no cwd");
+        assert_eq!(payload["prompt"].as_str().unwrap().chars().count(), MAX_PROMPT_CHARS);
+        assert_eq!(payload["tool_input"]["command"].as_str().unwrap().len(), MAX_TOOL_TEXT_BYTES);
+        assert_eq!(payload["tool_input"]["file_path"], "C:/work/a.txt");
+        assert_eq!(payload["session_id"], "s1");
+        let mut normal = serde_json::json!({ "cwd": "C:/work/acme-shop", "prompt": "hello", "tool_input": { "command": "ls" } });
+        let before = normal.clone();
+        clamp_payload(&mut normal);
+        assert_eq!(normal, before);
+    }
+
+    #[test]
+    fn a_cut_never_splits_a_character() {
+        let mut payload = serde_json::json!({ "tool_input": { "command": "\u{e9}".repeat(MAX_TOOL_TEXT_BYTES) } });
+        clamp_payload(&mut payload);
+        let kept = payload["tool_input"]["command"].as_str().unwrap();
+        assert!(kept.len() <= MAX_TOOL_TEXT_BYTES && kept.chars().all(|c| c == '\u{e9}'));
+    }
+}
+
 // ------------------------------------------------------- the shell write hole
 //
 // MEASURED: a rule anchored at a file with a `contains` or `absent` check
