@@ -638,10 +638,17 @@ announce themselves.
   it was revised in the last 30 days (revise its text instead). When the owner
   himself asked for it, put his whole message in `because` between double
   quotes: THOR checks it against what he typed in his last two messages, and the note's
-  id must appear in that message or in the assistant message right before it.
+  id must appear in that message as a whole word (`a-1` is not inside `a-12`), or the assistant message
+  right before it must be a question that names exactly that one note (a plain mention, or a list of
+  several ids, does not count). His message counts only when THOR's own record of his prompts holds it
+  too: the UserPromptSubmit hook writes each prompt he types into `owner-prompts.jsonl` beside the
+  memory, and a line found only in Claude Code's saved conversation counts for nothing. When that record
+  holds nothing, the refusal says the owner's message must arrive through a normal prompt. A shell
+  command that runs THOR's `serve` with the `hook` subcommand is refused (it would forge a record); a
+  script file that does it is not seen.
   A `revise` keeps the pin unless it says `always: false`, and that, like a
   `retract` of a pinned note, passes the very same gate (a retract whose reason
-  names, as a whole word, an OLD live pinned note (created over 24 hours ago) that was rewritten in the last hour to carry the point is a fold into it and passes: shorten first, then fold; the rewritten survivor is then protected itself). EVERY pinned note taken
+  names, as a whole word, an OLD live pinned note (created over 24 hours ago) that was rewritten in the last hour to carry the point is a fold into it and passes: shorten first, then fold; the rewrite must add at least 20 characters that carry two thirds (at least three) of the retracted note's distinct content words and half of those must be new in the rewrite, and it is judged on the survivor's CURRENT text, so a rewrite that was reverted afterwards is no fold; the rewritten survivor is then protected itself). The record file `unpin-owner-go.json` and `owner-prompts.jsonl` are refused to any WRITE (a redirect, Set-Content, Out-File, a copy or move onto it, a one-line program that opens it for writing), also in brace, backslash-escape and split-quote spellings; a command that only names the file is not refused. A name built in a shell variable is not seen. EVERY pinned note taken
   down through a tool call is listed for the owner, whatever its reason, in
   doctor and in the next evaluation, saying how it was let through.
 - `search_code`, `where_used`, `outline` - the three code questions: find text,

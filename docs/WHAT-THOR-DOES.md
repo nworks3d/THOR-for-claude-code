@@ -489,6 +489,16 @@ Words used once, in plain language:
   not count; if the transcript cannot be read, it refuses (fail closed).
 - Why: so a command like "send the e-mail" or "touch the live server" cannot be self-approved.
 - You notice: the assistant stops and asks you to say the go word.
+- Where his words come from: THOR's UserPromptSubmit hook writes every prompt he types, with secrets
+  blanked, into its own file beside the memory (`owner-prompts.jsonl`). Every check that accepts his
+  quoted message (an unpin, a pin on his word, loosening a rule that needs his go, a pin that does not fit
+  the full start block, the answer to the earlier-work step) needs the quote in that record AND in Claude
+  Code's saved conversation, with the last messages of both in the same order. A line only in the saved
+  conversation counts for nothing, and when the record holds nothing the refusal says his message must
+  arrive through a normal prompt. A shell command that runs THOR's `serve ... hook` is refused, because
+  it would forge a record; a script file that does it is not seen. An answer that does not name the note
+  counts only after an assistant question that names exactly that one note, and a note id matches as a
+  whole word. The go-word of a requires rule is still read from the saved conversation.
 - Refuse or change: you say it; nothing else works. You can also change or lift such a rule from any
   session: ask for it in your own message, the assistant revises or retracts the rule with your whole
   message quoted, and THOR checks the quote against what you typed. Without it, anything that loosens
@@ -950,6 +960,18 @@ remembers per session how far it has looked, so a long conversation does not mak
 - Why: so the owner sees what a first-come registration did.
 - You notice: a line or two.
 - Refuse or change: not for headless or subagent sessions.
+
+### E12b. A silent change to a setting file is named
+- What: a few files beside the memory stay editable by hand on purpose: `thor-mode.json`,
+  `stale-guard-mode.json`, `no-project-ask-mode.json`, `work-folders.json` and every `guard-*` file. Each
+  session start the owner reads records a hash of each (`mode-files-seen.json`). When one differs from
+  the last session start, the next session start and `doctor` print one plain line naming the file and
+  what it now says (secrets blanked), and the assistant is told to tell the owner in one sentence unless
+  he asked for it. The first start only records.
+- Why: so a guard cannot be switched off by one small edit nobody sees.
+- You notice: a line at the start of a session, or a NOTE in doctor's short summary.
+- Refuse or change: nothing is blocked or undone; a headless or subagent session neither prints nor
+  moves the record.
 
 ### E13. The personal library
 - What: recipes, books, a training log: filed with shelve into a library file kept apart, never injected or

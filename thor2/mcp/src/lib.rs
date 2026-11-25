@@ -2127,12 +2127,13 @@ fn replica_refusal_for_revise(store: &EventStore, args: &ReviseArgs) -> Result<(
 }
 
 /// The refusal for a pin the owner did not ask for in his own words (nothing was written).
-fn owner_pin_refusal(id: &str, quoted: &str) -> String {
+fn owner_pin_refusal(id: &str, quoted: &str, record_hint: &str) -> String {
     let unwitnessed = if serve::order_earlier::quote_candidates(quoted).is_empty() {
         ""
     } else {
         " The words you quoted are not one whole message of the last two the owner typed (this turn's or the one before) that names this note (a piece of it, a message about something else, a helper's text and your own text do not count)."
     };
+    let unwitnessed = format!("{unwitnessed}{record_hint}");
     format!(
         "REFUSED: nothing was changed. '{id}' would be pinned, which brings it into every conversation, and that start block is the owner's: only he decides what goes in it.{unwitnessed} Ask the owner in one plain sentence whether this has to come along in every conversation (name the note's id '{id}' in your question). When he has said yes in one of his last two messages, repeat the call with `because` holding his whole message between double quotes. If it only matters for one subject, leave Always out and bind the note to its project (a binding of kind project) instead."
     )
@@ -2190,7 +2191,8 @@ fn settle_pin_exceptions(
     #[cfg(test)]
     let owner_go = owner_go || reason.starts_with("fixture:");
     if !owner_go {
-        return Err(owner_pin_refusal(&updated.id, reason));
+        let hint = serve::prompt_record::empty_record_hint(store.path().as_deref(), session);
+        return Err(owner_pin_refusal(&updated.id, reason, &hint));
     }
     for _ in 0..3 {
         match model::store::pin_block(store, updated) {
@@ -9208,6 +9210,7 @@ mod tests {
         let line = serde_json::json!({"type": "user", "message": {"role": "user", "content": message}});
         std::fs::write(&transcript, format!("{line}\n")).unwrap();
         let quote = format!("the owner said yes: \"{message}\"");
+        serve::prompt_record::record(&db, "", message, serve::time::now_unix());
         let witness = |because: &str| {
             serve::unpin_gate::witness(
                 &db,
@@ -9270,6 +9273,7 @@ mod tests {
         let line = serde_json::json!({"type": "user", "message": {"role": "user", "content": message}});
         std::fs::write(&transcript, format!("{line}\n")).unwrap();
         let quote = format!("the owner said: \"{message}\"");
+        serve::prompt_record::record(&db, "", message, serve::time::now_unix());
         serve::unpin_gate::witness(
             &db,
             &serde_json::json!({ "tool_input": { "id": "own-2", "because": quote }, "transcript_path": transcript.to_string_lossy() }),
@@ -11765,6 +11769,7 @@ mod tests {
         let transcript = dir.path().join("session.jsonl");
         let line = serde_json::json!({"type": "user", "message": {"role": "user", "content": message}});
         std::fs::write(&transcript, format!("{line}\n")).unwrap();
+        serve::prompt_record::record(&db, "", message, serve::time::now_unix());
         let hook = |because: &str| {
             serve::unpin_gate::witness(
                 &db,
@@ -11848,6 +11853,7 @@ mod tests {
         std::fs::write(&transcript, format!("{line}\n")).unwrap();
         let quote = format!("the owner asked for it: \"{message}\"");
         let key = if field_is_reason { "reason" } else { "because" };
+        serve::prompt_record::record(db, "", message, serve::time::now_unix());
         serve::unpin_gate::witness(
             db,
             &serde_json::json!({ "tool_input": { "id": MAIL_RULE, key: quote }, "transcript_path": transcript.to_string_lossy() }),
@@ -12029,6 +12035,7 @@ mod tests {
         let transcript = dir.path().join("session.jsonl");
         std::fs::write(&transcript, format!("{}\n", serde_json::json!({"type": "user", "message": {"role": "user", "content": message}}))).unwrap();
         let because = format!("the owner asked for it: \"{message}\"");
+        serve::prompt_record::record(&db, "", message, serve::time::now_unix());
         serve::unpin_gate::witness(
             &db,
             &serde_json::json!({ "tool_input": { "id": "gate-new", "reason": because }, "transcript_path": transcript.to_string_lossy() }),
@@ -12052,6 +12059,7 @@ mod tests {
         ];
         std::fs::write(&transcript, lines.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
         let because = "he said \"ok, that is fine\"";
+        serve::prompt_record::record(&db, "", "ok, that is fine", serve::time::now_unix());
         for id in ["ask-b", "ask-a"] {
             serve::unpin_gate::witness(
                 &db,
@@ -12152,7 +12160,7 @@ mod tests {
         // The survivor is rewritten just now to carry the point; a token that is only a substring of a longer id does not count.
         dated_serving(&srv, &serve::time::now_iso8601());
         // A trivial edit of the survivor (no real text added, no reason naming the note) is no fold.
-        assert!(shorten(&srv, "fold-b", "Sunday dinners start at six!").await.starts_with("revised"));
+        assert!(shorten(&srv, "fold-b", "The ferry to the island leaves at nine!").await.starts_with("revised"));
         let trivial = try_retract(&srv, "fold-a", "folded into fold-b, which now carries the point about dinner.").await;
         assert!(trivial.starts_with("REFUSED") && trivial.contains("must add at least 20 characters"), "{trivial}");
         // Adds text but its reason does not name the retracted note: no fold either.
@@ -12162,7 +12170,7 @@ mod tests {
                 RawArgs::default(),
                 Parameters(ReviseArgs {
                     id: "fold-b".to_string(),
-                    text: Some("Sunday dinners start at six, the ferry leaves at nine, bring a coat.".to_string()),
+                    text: Some("The ferry leaves at nine, bring a coat, a scarf and wear good boots.".to_string()),
                     because: Some("adds the ferry time and the coat".to_string()),
                     ..Default::default()
                 }),
@@ -12225,6 +12233,86 @@ mod tests {
         let refused = try_retract(&srv, "fold-a", "folded into keep-pin, which now carries the point about dinner.").await;
         assert!(refused.starts_with("REFUSED") && refused.contains("say what 'fold-a' says"), "{refused}");
         assert!(!is_retracted(&srv, "fold-a"));
+    }
+
+    /// A WORD SALAD IS NO FOLD: the survivor's added text must carry a real share of the retracted
+    /// note's own words (two thirds, at least three), not a handful picked out of a long note. A
+    /// survivor that already said the words, with a filler sentence added, is none either.
+    #[tokio::test]
+    async fn a_word_salad_is_no_fold_and_an_honest_restatement_is() {
+        let (_dir, _db, srv) = unpin_fixture();
+        pinned_note(&srv, "fold-b", "2026-01-01T00:00:00Z").await;
+        pinned_note_revised_now(&srv, "fold-a").await;
+        let long = "Sunday dinners start early, family brings dessert, grandmother cooks chicken, cousins wash dishes afterwards.";
+        assert!(shorten(&srv, "fold-a", long).await.starts_with("revised"));
+        dated_serving(&srv, &serve::time::now_iso8601());
+        let rewrite = |text: &'static str| {
+            srv.revise(
+                Meta::new(),
+                RawArgs::default(),
+                Parameters(ReviseArgs {
+                    id: "fold-b".to_string(),
+                    text: Some(text.to_string()),
+                    because: Some("now also carries the point of fold-a, so that one can be folded".to_string()),
+                    ..Default::default()
+                }),
+            )
+        };
+        let reason = "folded into fold-b, which now carries the point about dinner.";
+        // Four words of thirteen, padded: a salad.
+        let salad = rewrite("The ferry to the island leaves at nine and returns before dusk. Sunday dinners start early dessert.").await;
+        assert!(salad.starts_with("revised"), "{salad}");
+        let refused = try_retract(&srv, "fold-a", reason).await;
+        assert!(refused.starts_with("REFUSED") && refused.contains("say what 'fold-a' says"), "{refused}");
+        assert!(!is_retracted(&srv, "fold-a"));
+        // The same salad, said once more with the words already in place and a filler sentence: still none.
+        let again = rewrite("The ferry to the island leaves at nine and returns before dusk. Sunday dinners start early dessert. The weather is mild.").await;
+        assert!(again.starts_with("revised"), "{again}");
+        assert!(try_retract(&srv, "fold-a", reason).await.starts_with("REFUSED"));
+        // An honest restatement of the whole point passes.
+        let honest = rewrite("The ferry to the island leaves at nine and returns before dusk. Sunday dinners start early: family brings dessert, grandmother cooks chicken, cousins wash dishes afterwards.").await;
+        assert!(honest.starts_with("revised"), "{honest}");
+        let folded = try_retract(&srv, "fold-a", reason).await;
+        assert!(folded.starts_with("retracted"), "{folded}");
+        assert!(is_retracted(&srv, "fold-a"));
+    }
+
+    /// REWRITE, REVERT, RETRACT passes nothing: the survivor's CURRENT text is what is judged.
+    #[tokio::test]
+    async fn a_rewrite_that_was_reverted_is_no_fold() {
+        let (_dir, _db, srv) = unpin_fixture();
+        pinned_note(&srv, "fold-b", "2026-01-01T00:00:00Z").await;
+        pinned_note_revised_now(&srv, "fold-a").await;
+        assert!(shorten(&srv, "fold-a", "Sunday dinners start at six.").await.starts_with("revised"));
+        dated_serving(&srv, &serve::time::now_iso8601());
+        let original = "The ferry to the island leaves at nine and returns before dusk.";
+        let rewrite = |text: &str, because: &str| {
+            srv.revise(
+                Meta::new(),
+                RawArgs::default(),
+                Parameters(ReviseArgs { id: "fold-b".to_string(), text: Some(text.to_string()), because: Some(because.to_string()), ..Default::default() }),
+            )
+        };
+        let carried = rewrite(
+            "The ferry to the island leaves at nine and returns before dusk. Sunday dinners start at six, the table is set for eight.",
+            "now also carries the point of fold-a, so that one can be folded",
+        )
+        .await;
+        assert!(carried.starts_with("revised"), "{carried}");
+        // Reverted to the old text.
+        let reverted = rewrite(original, "putting the old text back after all, for now").await;
+        assert!(reverted.starts_with("revised"), "{reverted}");
+        let refused = try_retract(&srv, "fold-a", "folded into fold-b, which now carries the point about dinner.").await;
+        assert!(refused.starts_with("REFUSED") && refused.contains("say what 'fold-a' says"), "{refused}");
+        assert!(!is_retracted(&srv, "fold-a"));
+        // Written again, it is a fold again.
+        let again = rewrite(
+            "The ferry to the island leaves at nine and returns before dusk. Sunday dinners start at six, the table is set for eight.",
+            "now carries the point of fold-a again, so that one can be folded",
+        )
+        .await;
+        assert!(again.starts_with("revised"), "{again}");
+        assert!(try_retract(&srv, "fold-a", "folded into fold-b, which now carries the point about dinner.").await.starts_with("retracted"));
     }
 
     /// ITEM 2: the creation is no maintenance. A pinned note made by mistake five days ago,

@@ -60,6 +60,11 @@ What changed: The weekly check is quieter and more reliable, and a pin can no lo
 - **Old session records are cleaned up.** The small files beside the memory that hold one entry per conversation drop the entries of conversations unused for 90 days.
 - **Shorter replies after a change to a rule.** At most three real calls that do not count are named, followed by how many more there are.
 - **The check at the start of the weekly check is quicker** when a rule was refused many times.
+- **Your words can no longer be invented in the saved conversation.** THOR now writes down every message you type in a file of its own, and every check that accepts your quoted message (taking down a pinned note, a pin, loosening a rule that needs your go, the answer to the earlier-work step) needs it there as well as in Claude Code's saved conversation. A line that is only in the saved conversation counts for nothing, and a command that runs THOR's own hook by hand is refused. The first message after the update has to be typed normally before it can unlock anything.
+- **A note id is matched as a whole word, and a bare "ok" needs a clear question.** `a-1` no longer matches inside `a-12`, and an "ok" counts for a note only when the assistant's message right before it is a question that names exactly that one note.
+- **The record of your answers is locked by name.** A write to it is refused however the name is spelled (braces, escapes, quotes split inside it), and a command that only mentions the file name, such as a script editing THOR's own source, is no longer refused.
+- **Folding a pinned note into another is stricter.** The rewrite must carry two thirds of the folded note's own words, and it is judged on the note as it is now, so rewriting, reverting and then folding no longer passes.
+- **A silent change to a setting file is named.** If a file you edit by hand (the mode switches, the work folders or a guard file) differs from the last session start, the next session start and `doctor` say which file and what it now says.
 
 ## 2.6.13 (2026-11-21)
 

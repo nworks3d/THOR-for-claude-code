@@ -385,6 +385,8 @@ pub struct SharedExtras {
     missing_program: Option<String>,
     work_folders: Vec<String>,
     replica_down: Option<String>,
+    /// The setting files edited by hand that differ from the last session start (`serve::mode_files`).
+    mode_changes: Vec<String>,
 }
 
 /// Build the lines that do not depend on the project.
@@ -415,6 +417,11 @@ pub fn shared_extras(db: &std::path::Path, f: &ExtrasFor) -> SharedExtras {
         missing_program: (!f.subagent).then(|| crate::missing_programs::session_line(db)).flatten(),
         work_folders,
         replica_down: (!f.subagent).then(|| crate::replica_reach::down_line(db)).flatten(),
+        // Only a session the owner reads moves the record (`f.record`, never headless).
+        mode_changes: match f.subagent {
+            true => Vec::new(),
+            false => crate::mode_files::session_start_lines(db, f.record && !f.headless),
+        },
     }
 }
 
@@ -458,6 +465,7 @@ fn assemble_extras(shared: SharedExtras, registration: Option<String>, open_poin
         .into_iter()
         .flatten()
         .chain(shared.work_folders)
+        .chain(shared.mode_changes)
         .collect()
 }
 
