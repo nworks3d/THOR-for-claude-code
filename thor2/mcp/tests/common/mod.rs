@@ -150,6 +150,7 @@ pub fn owners_go_in(db: &Path, dir: &Path, session: &str, args: &mut serde_json:
     let line = serde_json::json!({"type": "user", "message": {"role": "user", "content": message}});
     std::fs::write(&transcript, format!("{line}\n")).unwrap();
     let quote = format!("the owner said: \"{message}\"");
+    serve::prompt_record::record(db, session, &message, serve::time::now_unix());
     serve::unpin_gate::witness(
         db,
         &serde_json::json!({"tool_input": {"id": id, "because": quote}, "transcript_path": transcript.to_string_lossy(), "session_id": session}),

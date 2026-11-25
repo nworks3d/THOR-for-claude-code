@@ -19,16 +19,17 @@ memchr = "2"
 # Optional semantic-recall layer for surface 4 (OPZOEKEN) only - never the
 # three injection surfaces, see serve/src/lookup.rs's own doc comment. OFF by
 # default: a plain build stays pure text-match and never pulls the ONNX
-# runtime. fastembed brings ort/onnxruntime (download-binaries); rusqlite and
-# sha2 back the vector sidecar and its staleness check. We load our own local
+# runtime. fastembed brings ort/onnxruntime (download-binaries); rusqlite
+# backs the vector sidecar (sha2 also serves its staleness check, and the
+# mode-file hashes). We load our own local
 # model file (read-only, never fetched) so this stays independent of any
 # external cache - see embed.rs / vectors.rs.
 fastembed = { version = "5.17", optional = true }
 rusqlite = { version = "0.31", features = ["bundled"], optional = true }
-sha2 = { version = "0.10", optional = true }
+sha2 = "0.10"
 
 [features]
-semantic = ["dep:fastembed", "dep:rusqlite", "dep:sha2"]
+semantic = ["dep:fastembed", "dep:rusqlite"]
 
 [[bin]]
 name = "serve"

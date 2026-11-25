@@ -346,10 +346,10 @@ fn shell_strings_write_protected(p: &Protected, calls: &[Call], cwd: Option<&str
         let args = call.args.join(" ");
         let lits = literals(&args);
         let joined = lits.join(" ");
-        if lits.len() > 1 && p.mentions_any(&joined) && command_writes_protected(p, &joined, cwd, depth + 1) {
+        if lits.len() > 1 && (p.mentions_any(&joined) || p.mentions_a_locked_file(&joined)) && command_writes_protected(p, &joined, cwd, depth + 1) {
             return true;
         }
-        if lits.iter().any(|l| l.contains(' ') && p.mentions_any(l) && command_writes_protected(p, l, cwd, depth + 1)) {
+        if lits.iter().any(|l| l.contains(' ') && (p.mentions_any(l) || p.mentions_a_locked_file(l)) && command_writes_protected(p, l, cwd, depth + 1)) {
             return true;
         }
     }

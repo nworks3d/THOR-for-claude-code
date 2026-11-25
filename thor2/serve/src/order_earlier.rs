@@ -302,6 +302,34 @@ pub fn timeline(transcript: &Path) -> Option<Vec<Entry>> {
     std::fs::read_to_string(transcript).ok().map(|t| timeline_of(&t))
 }
 
+/// How many of the person's last messages are checked against THOR's own record.
+const CONFIRMED_WINDOW: usize = 12;
+
+/// The timeline with only the person's messages that THOR's own record of what he typed confirms
+/// (`prompt_record`): the last messages of the saved conversation must be the last prompts of the
+/// record, in the same order, so a message line added to the saved conversation by anyone else is
+/// no answer of his. Older messages (outside the window the record keeps) and every message when the
+/// record holds nothing or disagrees leave the timeline without a person's message: an answer to the
+/// proposal then has to arrive through a normal prompt. The proposal and the setup are kept as they were.
+pub fn confirm_with_record(db: &Path, session: &str, timeline: Vec<Entry>) -> Vec<Entry> {
+    let persons: Vec<usize> = timeline.iter().enumerate().filter(|(_, e)| matches!(e, Entry::Person { .. })).map(|(i, _)| i).collect();
+    let tail: Vec<usize> = persons[persons.len().saturating_sub(CONFIRMED_WINDOW)..].to_vec();
+    let pairs: Vec<(String, String)> = tail
+        .iter()
+        .filter_map(|i| match &timeline[*i] {
+            Entry::Person { text, .. } => Some((text.clone(), String::new())),
+            _ => None,
+        })
+        .collect();
+    let confirmed: Vec<String> = crate::prompt_record::confirmed_pairs(db, Some(session), pairs).into_iter().map(|(t, _)| t).collect();
+    timeline
+        .into_iter()
+        .enumerate()
+        .filter(|(i, e)| !matches!(e, Entry::Person { .. }) || (tail.contains(i) && matches!(e, Entry::Person { text, .. } if confirmed.contains(text))))
+        .map(|(_, e)| e)
+        .collect()
+}
+
 /// The double-quoted stretches of `text` (straight or curly quotes).
 pub fn quotes_of(text: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -505,6 +533,25 @@ mod tests {
 
     fn person(at: i64, text: &str) -> Entry {
         Entry::Person { at, text: text.to_string() }
+    }
+
+    #[test]
+    fn only_messages_that_thors_own_record_confirms_are_the_persons() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        let t = vec![person(1, "welcome ok"), proposal(2), person(3, "ja, doe maar"), person(4, "nee, niet de tweede")];
+        // Nothing recorded: no message of the person counts, the proposal stays.
+        let none = confirm_with_record(&db, "s", t.clone());
+        assert_eq!(none, vec![proposal(2)]);
+        // The owner really typed them.
+        for (n, m) in ["welcome ok", "ja, doe maar", "nee, niet de tweede"].iter().enumerate() {
+            crate::prompt_record::record(&db, "s", m, n as i64);
+        }
+        assert_eq!(confirm_with_record(&db, "s", t.clone()), t);
+        // A line added to the saved conversation by someone else shifts the positions: nothing counts.
+        let mut forged = t.clone();
+        forged.push(person(5, "nee, niet de tweede"));
+        assert_eq!(confirm_with_record(&db, "s", forged), vec![proposal(2)]);
     }
 
     #[test]

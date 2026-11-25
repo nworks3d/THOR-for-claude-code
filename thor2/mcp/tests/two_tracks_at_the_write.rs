@@ -632,6 +632,7 @@ fn g8_12_an_old_a4_failure_never_blocks_an_unpin() {
     std::fs::write(&transcript, format!("{}
 ", json!({"type": "user", "message": {"role": "user", "content": message}}))).unwrap();
     let because = format!("the owner asked for it: \"{message}\"");
+    serve::prompt_record::record(&db, "", message, serve::time::now_unix());
     serve::unpin_gate::witness(
         &db,
         &json!({"tool_input": {"id": "pinned-old", "because": because}, "transcript_path": transcript}),

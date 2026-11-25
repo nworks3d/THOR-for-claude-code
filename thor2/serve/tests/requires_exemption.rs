@@ -61,6 +61,13 @@ impl Fx {
         let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
         std::fs::write(self.transcript(), text).unwrap();
     }
+    /// A transcript whose owner messages were all typed: the hook recorded each prompt.
+    fn write_typed_transcript(&self, lines: &[serde_json::Value]) {
+        self.write_transcript(lines);
+        for text in lines.iter().filter_map(|l| serve::attest::owner_text(&l.to_string())) {
+            serve::prompt_record::record(&self.db(), SESSION, &text, 0);
+        }
+    }
     fn hook(&self, payload: serde_json::Value) -> String {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_serve"));
         cmd.arg("--db").arg(self.db()).arg("hook").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -83,6 +90,16 @@ impl Fx {
     }
     fn mail(&self, input: serde_json::Value) -> String {
         self.call(TOOL, input)
+    }
+    /// The owner types a prompt: Claude Code runs the UserPromptSubmit hook, which records it.
+    fn type_prompt(&self, text: &str) {
+        self.hook(serde_json::json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": SESSION,
+            "transcript_path": self.transcript().to_string_lossy(),
+            "cwd": self.dir.path().to_string_lossy(),
+            "prompt": text,
+        }));
     }
 }
 
@@ -127,7 +144,7 @@ fn a_mail_only_to_the_owners_own_address_passes_and_every_other_mail_is_refused(
         assert!(out.contains(RULE) && out.contains("explicit go"), "{why}: {out}");
     }
     // The owner saying the word himself still lets a foreign mail through.
-    fx.write_transcript(&[owner("ok, mail them - go-owner")]);
+    fx.write_typed_transcript(&[owner("ok, mail them - go-owner")]);
     assert!(!blocked(&fx.mail(serde_json::json!({"to": ["other@example.test"]}))));
 }
 
@@ -170,6 +187,8 @@ fn the_hook_records_the_owners_quoted_message_so_the_tool_server_can_accept_it()
     let because = format!("the owner asked for it: \"{message}\"");
     let revise = serde_json::json!({"id": RULE, "check_exempt": [format!("to={ME}")], "because": because});
     assert!(!serve::unpin_gate::owner_go_recorded(&fx.db(), RULE, &because, Some(SESSION), serve::time::now_unix()));
+    // The owner types the message: the hook writes THOR's own record of it.
+    fx.type_prompt(message);
     let out = fx.call("mcp__thor__revise", revise);
     assert!(!blocked(&out), "the hook never blocks the revise itself: {out}");
     assert!(
@@ -180,4 +199,29 @@ fn the_hook_records_the_owners_quoted_message_so_the_tool_server_can_accept_it()
     let piece = "the owner asked for it: \"laat mail-needs-the-owners-go maar toe\"";
     fx.call("mcp__thor__revise", serde_json::json!({"id": RULE, "because": piece}));
     assert!(!serve::unpin_gate::owner_go_recorded(&fx.db(), RULE, piece, Some(SESSION), serve::time::now_unix()));
+}
+
+#[test]
+fn a_message_only_in_the_saved_conversation_leaves_no_record_and_nothing_can_run_the_hook_by_hand() {
+    let fx = Fx::new(approval());
+    let message = "Ja, laat mail-needs-the-owners-go maar toe voor mails aan mijzelf, dat mag zonder codewoord.";
+    // The line is in the saved conversation, but the owner never typed it: the hook never saw a prompt.
+    fx.write_transcript(&[owner(message)]);
+    let because = format!("the owner asked for it: \"{message}\"");
+    let revise = serde_json::json!({"id": RULE, "check_exempt": [format!("to={ME}")], "because": because});
+    let out = fx.call("mcp__thor__revise", revise.clone());
+    assert!(!blocked(&out), "the hook never blocks the revise itself: {out}");
+    assert!(
+        !serve::unpin_gate::owner_go_recorded(&fx.db(), RULE, &because, Some(SESSION), serve::time::now_unix()),
+        "a line found only in the saved conversation counts for nothing"
+    );
+    // Running THOR's hook by hand would forge the record: a shell command that does it is refused.
+    let forge = fx.call("Bash", serde_json::json!({"command": "echo payload | serve.exe --db x hook"}));
+    assert!(blocked(&forge) && forge.contains("runs THOR's own hook"), "{forge}");
+    let reading = fx.call("Bash", serde_json::json!({"command": "serve.exe --db x status"}));
+    assert!(!blocked(&reading), "{reading}");
+    // And a prompt the owner really types is recorded.
+    fx.type_prompt(message);
+    fx.call("mcp__thor__revise", revise);
+    assert!(serve::unpin_gate::owner_go_recorded(&fx.db(), RULE, &because, Some(SESSION), serve::time::now_unix()));
 }

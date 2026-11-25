@@ -40,6 +40,10 @@ pub struct Protected {
     pub claude_dirs: Vec<String>,
     /// (variable name in lower case, value) pairs used to expand a path.
     vars: Vec<(String, String)>,
+    /// File names kept wherever they live, in lower case (`with_name_lock`): a write aimed at a path
+    /// ending in one of them is refused, whatever folder it is spelled into and however the name is
+    /// spelled (brace forms, backslash escapes, quotes split inside it).
+    names: Vec<String>,
 }
 
 impl Protected {
@@ -79,7 +83,29 @@ impl Protected {
             programs_dir: programs_dir.and_then(keep),
             claude_dirs: claude_dirs.iter().filter_map(|p| keep(p)).collect(),
             vars,
+            names: Vec::new(),
         }
+    }
+
+    /// A guard that keeps nothing but files with these names (see `names`).
+    pub fn with_name_lock(names: &[&str]) -> Self {
+        Protected { names: names.iter().map(|n| n.to_ascii_lowercase()).collect(), ..Protected::default() }
+    }
+
+    /// The same guard that also keeps files with these names.
+    pub fn and_name_lock(mut self, names: &[&str]) -> Self {
+        self.names.extend(names.iter().map(|n| n.to_ascii_lowercase()));
+        self
+    }
+
+    /// Whether a path as written in a call ends in a locked file name, in any of its spellings.
+    fn names_a_locked_file(&self, written: &str) -> bool {
+        self.names.iter().any(|name| spells_name(written, name))
+    }
+
+    /// Whether a text holds a locked file name in any of its spellings (a one-line program).
+    fn mentions_a_locked_file(&self, text: &str) -> bool {
+        self.names.iter().any(|name| brace_forms(text).iter().any(|f| plain_spelling(f).contains(name.as_str())))
     }
 
     /// The folders where saved conversations are kept.
@@ -178,6 +204,11 @@ impl Protected {
 
     /// Whether a path as written in a call is one of the protected files.
     fn protects(&self, written: &str, cwd: Option<&str>) -> bool {
+        self.names_a_locked_file(written) || self.protects_by_place(written, cwd)
+    }
+
+    /// Whether a path as written in a call is a protected file because of the folder it is in.
+    fn protects_by_place(&self, written: &str, cwd: Option<&str>) -> bool {
         let path = self.resolve(written, cwd);
         if path.is_empty() {
             return false;
@@ -256,7 +287,7 @@ const ANY_SAMPLES: [&str; 3] = ["serve.exe", "install.exe", "data"];
 const PROJECT_SAMPLES: [&str; 2] = ["session.jsonl", "project"];
 
 /// Files in THOR's folder that the owner (or his assistant, on his word) edits by hand.
-const EDITED_BY_HAND: [&str; 9] = [
+pub(crate) const EDITED_BY_HAND: [&str; 9] = [
     "guard-response-rulebook.json",
     "guard-capture-rulebook",
     "guard-capture-trigger",
@@ -267,6 +298,49 @@ const EDITED_BY_HAND: [&str; 9] = [
     "no-project-ask-mode.json",
     "thor-mode.json",
 ];
+
+/// A text with the spellings that hide a file name taken out: lower case, no backslash, no
+/// backtick, no quote. (A backslash is both a path separator and a shell escape; for a name check
+/// only the characters matter, so both readings reduce to the same text.)
+fn plain_spelling(text: &str) -> String {
+    text.chars().filter(|c| !matches!(c, '\\' | '`' | '\'' | '"')).collect::<String>().to_ascii_lowercase()
+}
+
+/// The strings a shell brace expression stands for, at most 64: `a{b,c}d` is `abd` and `acd`, and
+/// `a{b}d` (which a shell leaves alone) is both `a{b}d` and `abd`. The text itself comes first.
+fn brace_forms(text: &str) -> Vec<String> {
+    let mut forms = vec![text.to_string()];
+    let mut at = 0;
+    while at < forms.len() && forms.len() < 64 {
+        let form = forms[at].clone();
+        at += 1;
+        let Some(open) = form.find('{') else { continue };
+        let Some(close) = form[open..].find('}').map(|c| c + open) else { continue };
+        let inner = &form[open + 1..close];
+        let (head, tail) = (&form[..open], &form[close + 1..]);
+        let alternatives: Vec<&str> = inner.split(',').collect();
+        if alternatives.len() == 1 {
+            forms.push(format!("{head}{inner}{tail}"));
+            continue;
+        }
+        for alt in alternatives {
+            forms.push(format!("{head}{alt}{tail}"));
+        }
+    }
+    forms
+}
+
+/// Whether `written` (a path, a redirect target, an argument) is a file called `name` (lower case),
+/// however it is spelled: with brace forms, backslash escapes, quotes split inside the name, a
+/// folder in front, or a Windows trailing dot or stream (`name:stream`) behind it.
+fn spells_name(written: &str, name: &str) -> bool {
+    brace_forms(written).iter().any(|form| {
+        let plain = plain_spelling(form);
+        let before_stream = plain.split(':').next().unwrap_or("");
+        let trimmed = |t: &str| t.trim_end_matches(|c| c == '.' || c == ' ').ends_with(name);
+        trimmed(&plain) || trimmed(before_stream)
+    })
+}
 
 /// Whether a comparison-form path starts at a root.
 fn is_absolute(path: &str) -> bool {
@@ -352,10 +426,20 @@ pub fn refusal(
     tool_input: Option<&serde_json::Value>,
     cwd: Option<&str>,
 ) -> Option<String> {
-    let input = tool_input?;
+    writes_protected(protected, tool_name, tool_input, cwd).then(refusal_text)
+}
+
+/// Whether the call writes to a protected file (the test `refusal` is built on).
+pub fn writes_protected(
+    protected: &Protected,
+    tool_name: &str,
+    tool_input: Option<&serde_json::Value>,
+    cwd: Option<&str>,
+) -> bool {
+    let Some(input) = tool_input else { return false };
     let cwd = cwd.map(fold).filter(|c| is_absolute(c));
     let cwd = cwd.as_deref();
-    let hit = match tool_name.to_ascii_lowercase().as_str() {
+    match tool_name.to_ascii_lowercase().as_str() {
         "edit" | "write" | "multiedit" | "notebookedit" => ["file_path", "filePath", "notebook_path", "notebookPath", "path"]
             .iter()
             .any(|k| input.get(k).and_then(|v| v.as_str()).is_some_and(|p| protected.protects(p, cwd))),
@@ -364,8 +448,33 @@ pub fn refusal(
             .and_then(|v| v.as_str())
             .is_some_and(|c| command_writes_protected(protected, c, cwd, 0)),
         _ => false,
-    };
-    hit.then(refusal_text)
+    }
+}
+
+/// The words of every segment of a shell command (a segment ends at `;`, `&&`, `||`, `|`, `&` or a
+/// new line), quotes taken out. Redirect targets are left out.
+pub(crate) fn command_segments(command: &str) -> Vec<Vec<String>> {
+    let mut segments = Vec::new();
+    let mut segment: Vec<String> = Vec::new();
+    let mut redirected = false;
+    for tok in tokenize(command) {
+        match tok {
+            Tok::Word(w) => {
+                if redirected {
+                    redirected = false;
+                } else {
+                    segment.push(w);
+                }
+            }
+            Tok::Redirect => redirected = true,
+            Tok::Border => {
+                segments.push(std::mem::take(&mut segment));
+                redirected = false;
+            }
+        }
+    }
+    segments.push(segment);
+    segments
 }
 
 /// One word of a command, or the marker of a redirect.
@@ -453,14 +562,14 @@ fn tokenize(command: &str) -> Vec<Tok> {
 }
 
 /// The command word as compared: the file name, lower case, with no `.exe`.
-fn command_name(word: &str) -> String {
+pub(crate) fn command_name(word: &str) -> String {
     let name = word.replace('\\', "/");
     let name = name.rsplit('/').next().unwrap_or(&name).to_ascii_lowercase();
     name.strip_suffix(".exe").map(str::to_string).unwrap_or(name)
 }
 
 const SKIPPED_LEADERS: [&str; 10] = ["sudo", "env", "nohup", "command", "builtin", "exec", "time", "call", "start", "&"];
-const SHELLS: [&str; 8] = ["bash", "sh", "zsh", "powershell", "pwsh", "cmd", "dash", "ksh"];
+pub(crate) const SHELLS: [&str; 8] = ["bash", "sh", "zsh", "powershell", "pwsh", "cmd", "dash", "ksh"];
 const DOTNET_WRITES: [&str; 8] =
     ["io.file]::write", "io.file]::append", "io.file]::delete", "io.file]::move", "io.file]::create", "io.file]::open", "streamwriter", "filestream"];
 
@@ -585,7 +694,7 @@ fn lister_reaches_protected(p: &Protected, words: &[String], cwd: Option<&str>) 
 }
 
 /// The command word of a segment (after `sudo`, `env`, assignments and the like) and what follows it.
-fn leader_of(words: &[String]) -> Option<(String, &[String])> {
+pub(crate) fn leader_of(words: &[String]) -> Option<(String, &[String])> {
     let mut at = 0;
     while at < words.len() {
         let name = command_name(&words[at]);
@@ -612,7 +721,9 @@ fn dest_receives(p: &Protected, dest: &str, sources: &[&String], cwd: Option<&st
         return true;
     }
     let folder = dest.trim_end_matches(|c| c == '/' || c == '\\');
-    sources.iter().any(|s| p.protects(&format!("{folder}/{}", base_name(s)), cwd))
+    // A file copied INTO a folder takes the name of its source; only the folder's place matters here,
+    // a locked file name does not (copying the record file somewhere else is a read).
+    sources.iter().any(|s| p.protects_by_place(&format!("{folder}/{}", base_name(s)), cwd))
 }
 
 fn segment_writes_protected(p: &Protected, words: &[String], cwd: Option<&str>, depth: usize, source: &str) -> bool {
@@ -799,7 +910,7 @@ fn segment_writes_protected(p: &Protected, words: &[String], cwd: Option<&str>, 
             let whole = words[at..].join(" ").to_ascii_lowercase();
             let links = ["symboliclink", "junction", "hardlink"].iter().any(|m| whole.contains(m));
             (DOTNET_WRITES.iter().any(|m| whole.contains(m)) || matches!(name.as_str(), "new-item" | "ni" | "set-item" | "si"))
-                && (p.names_any(&words[at..].join(" ")) || (links && p.mentions_any(&whole)))
+                && (p.names_any(&words[at..].join(" ")) || p.mentions_a_locked_file(&whole) || (links && p.mentions_any(&whole)))
         }
     }
 }

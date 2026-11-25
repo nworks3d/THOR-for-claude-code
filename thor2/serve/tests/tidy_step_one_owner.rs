@@ -58,6 +58,10 @@ impl Fx {
     }
     fn write(&self, session: &str, lines: &[String]) {
         std::fs::write(self.transcript(session), lines.join("\n") + "\n").unwrap();
+        // The owner typed each of his messages: the hook recorded each prompt (`serve::prompt_record`).
+        for text in lines.iter().filter_map(|l| serve::attest::owner_text(l)) {
+            serve::prompt_record::record(&self.db(), session, &text, 0);
+        }
     }
     fn stop(&self, session: &str) -> serde_json::Value {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_serve"));

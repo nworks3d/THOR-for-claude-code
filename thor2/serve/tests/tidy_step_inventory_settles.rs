@@ -58,6 +58,10 @@ fn stuck_memory(scratch_keeps_a_file: bool) -> (tempfile::TempDir, PathBuf, Path
     let held: PathBuf = projects.join("enc").join(format!("{SESSION}.jsonl"));
     std::fs::create_dir_all(held.parent().unwrap()).unwrap();
     std::fs::write(&held, lines.join("\n") + "\n").unwrap();
+    // The owner typed each of his messages: the hook recorded each prompt (`serve::prompt_record`).
+    for text in lines.iter().filter_map(|l| serve::attest::owner_text(l)) {
+        serve::prompt_record::record(&db, SESSION, &text, 0);
+    }
 
     // An earlier conversation of the desktop app with no folder, and no file written.
     let scratch = home.join("AppData").join("Roaming").join("Claude").join("local-agent-mode-sessions").join("scratch-workspaces").join("abc123");

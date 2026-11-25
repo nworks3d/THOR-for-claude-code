@@ -1568,6 +1568,13 @@ pub fn owner_text(line: &str) -> Option<String> {
         }
         _ => return None,
     };
+    owner_own_text(&text)
+}
+
+/// The owner's own lines of a message text, or `None` when the text is a harness injection (a Stop
+/// hook's feedback, an interruption marker, a task notification ...) or empty. The transcript line
+/// and the prompt THOR's own hook receives are both read through this, so the two compare equal.
+pub fn owner_own_text(text: &str) -> Option<String> {
     let start = text.trim_start();
     let injected = [
         "Stop hook feedback",
@@ -1583,7 +1590,7 @@ pub fn owner_text(line: &str) -> Option<String> {
     }
     let mut plain: Vec<usize> = Vec::new();
     loop {
-        match own_lines(&text, &plain) {
+        match own_lines(text, &plain) {
             Ok(own) => return Some(own),
             Err(opening) => plain.push(opening),
         }

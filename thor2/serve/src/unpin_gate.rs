@@ -175,6 +175,7 @@ pub fn judge(
     if !reasons.is_empty() && !witnessed {
         let quoted = !crate::order_earlier::quote_candidates(&because).is_empty();
         let mut refusal = in_use_refusal(&item.id, &reasons, quoted, how);
+        refusal.push_str(&crate::prompt_record::empty_record_hint(db.as_deref(), session));
         if let Some(missing) = fold_missing {
             refusal.push_str(&format!(
                 " It is not a fold either: {missing}. To fold, rewrite the surviving pinned note so it carries this point, \
@@ -224,6 +225,7 @@ pub fn owner_rule_go(
     } else {
         ""
     };
+    let unwitnessed = format!("{unwitnessed}{}", crate::prompt_record::empty_record_hint(store.path().as_deref(), session));
     Err(format!(
         "REFUSED: nothing was changed. '{id}' is a rule that needs the owner's explicit go, and this call loosens it: {}.{unwitnessed} Only the owner can loosen such a rule, and THOR accepts it only on his own typed words. Ask the owner whether he wants this (name the rule's id '{id}' in your question). When he has said so in one of his last two messages, repeat the call with `{field}` holding his whole message between double quotes. To take the whole rule down instead, one retract with his whole message between double quotes in its reason is enough.",
         what.join("; ")
@@ -288,7 +290,9 @@ fn fold_survivor(store: &EventStore, item: &Item, reason: &str, now: i64) -> Res
             continue;
         }
         let mut before_text: Option<String> = None;
-        let mut rewritten_just_now = false;
+        // The length the survivor had just before the rewrite that counts as the fold.
+        let mut fold_grew_from: Option<usize> = None;
+        let mut current_text = String::new();
         for e in events.iter().filter(|e| matches!(e.kind, EventKind::FactCreated | EventKind::FactRevised)) {
             let Ok(version) = model::store::parse_body(&e.body) else { continue };
             // A real fold ADDS the point: the text grows by a real margin, and the revise said
@@ -296,8 +300,8 @@ fn fold_survivor(store: &EventStore, item: &Item, reason: &str, now: i64) -> Res
             let grew = before_text
                 .as_ref()
                 .is_some_and(|t| version.text.chars().count() >= t.chars().count() + FOLD_MIN_ADDED_CHARS);
-            // ... and what it adds says the retracted note's own points, not any filler.
-            let carries = carries_its_points(&item.text, &version.text);
+            // ... and what it ADDS says a real share of the retracted note's own points, not any filler.
+            let carries = carries_its_points(&item.text, before_text.as_deref().unwrap_or(""), &version.text);
             let named = serde_json::from_str::<serde_json::Value>(&e.body)
                 .ok()
                 .and_then(|v| v.get("because").and_then(|b| b.as_str()).map(|b| names_as_a_token(b, &item.id)))
@@ -309,10 +313,16 @@ fn fold_survivor(store: &EventStore, item: &Item, reason: &str, now: i64) -> Res
                 && e.seq > own_last_write
                 && crate::sweep::time_of_seq(store, e.seq).is_some_and(|at| now - at <= FOLD_REWRITE_WITHIN_SECS && now >= at)
             {
-                rewritten_just_now = true;
+                fold_grew_from = before_text.as_ref().map(|t| t.chars().count());
             }
+            current_text = version.text.clone();
             before_text = Some(version.text);
         }
+        // The survivor's CURRENT text must still be the fold: a rewrite that was reverted (or cut
+        // back down) afterwards is no fold any more, whatever it once was.
+        let rewritten_just_now = fold_grew_from.is_some_and(|from| {
+            current_text.chars().count() >= from + FOLD_MIN_ADDED_CHARS && carries_its_points(&item.text, "", &current_text)
+        });
         if !rewritten_just_now {
             missing = Some(format!(
                 "'{id}' was not rewritten in the last 60 minutes, after this note's last change, to carry this point (the rewrite must add at least {FOLD_MIN_ADDED_CHARS} characters of text that say what '{}' says, and its `because` must name '{}')",
@@ -333,17 +343,24 @@ fn meaningful_words(text: &str) -> std::collections::BTreeSet<String> {
         .collect()
 }
 
-/// Whether a survivor's new text carries the retracted note's points: at least half of the
-/// retracted note's meaningful words (at most three are asked for, at least one) stand in it.
+/// Whether a survivor's new text carries the retracted note's points: a real share of the
+/// retracted note's distinct meaningful words stand in it, at least two thirds of them and at least
+/// three (all of them when it has fewer). A handful of words picked out of a long note is a word
+/// salad, no fold. And at least half of that share must be ADDED by the rewrite (`before` is the
+/// survivor's text before it; empty when only the survivor's current text is judged), so a survivor
+/// that already used the words and got a filler sentence is no fold either.
 /// An old pinned note that is about something else, with a filler sentence added, has none.
-fn carries_its_points(retracted: &str, new: &str) -> bool {
+fn carries_its_points(retracted: &str, before: &str, new: &str) -> bool {
     let wanted = meaningful_words(retracted);
     if wanted.is_empty() {
         return true;
     }
     let after = meaningful_words(new);
+    let old = meaningful_words(before);
     let carried = wanted.iter().filter(|w| after.contains(*w)).count();
-    carried >= (wanted.len() / 2).clamp(1, 3)
+    let added = wanted.iter().filter(|w| after.contains(*w) && !old.contains(*w)).count();
+    let need = (wanted.len() * 2).div_ceil(3).max(wanted.len().min(3));
+    carried >= need && (before.is_empty() || added >= need.div_ceil(2))
 }
 
 /// How many of the owner's last typed messages a quote may come from: this turn's and the
@@ -403,11 +420,43 @@ pub fn owner_pairs(transcript: &Path) -> Vec<(String, String)> {
 /// helper's, a hook's or the assistant's text. No word list: the id is the link
 /// between his answer and this note.
 pub fn owner_quote_matches(because: &str, id: &str, pairs: &[(String, String)]) -> bool {
+    owner_quote_matches_among(because, id, pairs, &[])
+}
+
+/// `owner_quote_matches` that also knows the ids of the live notes (`live_ids`), so a question that
+/// names a second real note does not count as a question about this one.
+pub fn owner_quote_matches_among(because: &str, id: &str, pairs: &[(String, String)], live_ids: &[String]) -> bool {
     let quotes = crate::order_earlier::quote_candidates(because);
     pairs.iter().any(|(message, before)| {
-        let about_this_note = message.contains(id) || before.contains(id);
+        let about_this_note = names_as_a_token(message, id) || asks_only_about(before, id, live_ids);
         about_this_note && quotes.iter().any(|q| crate::order_earlier::plain(message) == *q)
     })
+}
+
+/// Is `before` (the assistant message directly before the owner's answer) a QUESTION that names
+/// exactly this one note? Only then does an owner's answer that does not name the note itself ("ok")
+/// count as an answer about it. The id must stand in it as a whole token, in a sentence that ends in
+/// a question mark, and the id of no other LIVE note may stand anywhere in the message (an ordinary
+/// word with a hyphen in it is not an id, so it blocks nothing). A message that merely mentions the
+/// id, or lists several notes, is no question to answer yes to.
+fn asks_only_about(before: &str, id: &str, live_ids: &[String]) -> bool {
+    let id_char = |c: char| c.is_alphanumeric() || c == '-' || c == '_';
+    let others = before.split(|c: char| !id_char(c)).any(|w| w != id && live_ids.iter().any(|l| l == w));
+    if others || !names_as_a_token(before, id) {
+        return false;
+    }
+    let mut sentence = String::new();
+    for c in before.chars() {
+        if matches!(c, '.' | '!' | '?' | '\n') {
+            if c == '?' && names_as_a_token(&sentence, id) {
+                return true;
+            }
+            sentence.clear();
+        } else {
+            sentence.push(c);
+        }
+    }
+    false
 }
 
 fn go_path(db: &Path) -> PathBuf {
@@ -431,10 +480,16 @@ pub fn witness(db: &Path, payload: &serde_json::Value, now: i64) {
     let Some(input) = payload.get("tool_input") else { return };
     let (Some(id), Some(because)) = (input.get("id").and_then(|v| v.as_str()), reason_of(input)) else { return };
     let Some(transcript) = payload.get("transcript_path").and_then(|v| v.as_str()) else { return };
-    if !owner_quote_matches(because, id, &owner_pairs(Path::new(transcript))) {
+    let session = payload.get("session_id").and_then(|v| v.as_str()).unwrap_or_default();
+    // Only what THOR's own record of the owner's prompts confirms counts (`prompt_record`).
+    let pairs = crate::prompt_record::confirmed_pairs(db, Some(session), owner_pairs(Path::new(transcript)));
+    // The ids of the live notes: a question that names a second one is no question about this one.
+    let live_ids: Vec<String> = thor_core::event_store::EventStore::open_existing(db)
+        .map(|store| crate::live::live_items(&store).into_iter().map(|l| l.id).collect())
+        .unwrap_or_default();
+    if !owner_quote_matches_among(because, id, &pairs, &live_ids) {
         return;
     }
-    let session = payload.get("session_id").and_then(|v| v.as_str()).unwrap_or_default();
     let path = go_path(db);
     let mut kept: Vec<serde_json::Value> = std::fs::read_to_string(&path)
         .ok()
@@ -451,6 +506,13 @@ pub fn witness(db: &Path, payload: &serde_json::Value, now: i64) {
 /// in this very session a moment ago? A server that does not know its session
 /// (none in a plain test) checks the note, the text and the time only.
 pub fn owner_go_recorded(db: &Path, id: &str, because: &str, session: Option<&str>, now: i64) -> bool {
+    // The quoted message must also stand in THOR's own record of what the owner typed.
+    let in_record = crate::order_earlier::quote_candidates(because)
+        .iter()
+        .any(|q| crate::prompt_record::holds_quote(db, session, q, OWNER_WINDOW));
+    if !in_record {
+        return false;
+    }
     let Ok(text) = std::fs::read_to_string(go_path(db)) else { return false };
     let Ok(entries) = serde_json::from_str::<Vec<serde_json::Value>>(&text) else { return false };
     let key = go_key(because);
@@ -462,31 +524,25 @@ pub fn owner_go_recorded(db: &Path, id: &str, because: &str, session: Option<&st
     })
 }
 
-/// Whether `text` (a path, or a whole command) names the record file, with no
-/// regard to case: on Windows `UNPIN-OWNER-GO.JSON` is the same file.
-fn names_protected_file(text: &str) -> bool {
-    text.to_ascii_lowercase().contains(&PROTECTED_FILE.to_ascii_lowercase())
-}
-
-/// The hook's refusal of any Edit, Write or shell call that names the record file
-/// (the same style as the other files THOR protects: a plain sentence, nothing
-/// written). `None` for every other call. Not airtight (a name can be built up in a
-/// shell); transparency is the real protection - see the module's own comment.
+/// The hook's refusal of any Edit, Write or shell call that WRITES to the record file: a redirect,
+/// Set-Content, Add-Content, Out-File, Tee-Object, a copy or move onto it (or out of it), a delete,
+/// or a one-line program that opens it for writing. The name is recognised in its brace forms, with
+/// backslash escapes and with quotes split inside it, in any folder. A call that only NAMES the file
+/// (a script that edits this source file and has the name in a comment, a read, a commit message)
+/// is not refused. `None` for every other call. Not airtight (a name can be built up in a shell
+/// variable, and a script file is not read); transparency is the real protection - see the module's
+/// own comment.
 pub fn protected_file_refusal(tool_name: &str, tool_input: Option<&serde_json::Value>) -> Option<String> {
-    let input = tool_input?;
-    let names_it = match tool_name {
-        "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => ["file_path", "notebook_path", "path"]
-            .iter()
-            .any(|k| input.get(k).and_then(|v| v.as_str()).is_some_and(names_protected_file)),
-        "Bash" | "PowerShell" => input.get("command").and_then(|v| v.as_str()).is_some_and(names_protected_file),
-        _ => false,
-    };
-    names_it.then(|| {
+    let guard = crate::write_guard::Protected::with_name_lock(&[PROTECTED_FILE, crate::prompt_record::FILE]);
+    let writes_it = crate::write_guard::writes_protected(&guard, tool_name, tool_input, None);
+    writes_it.then(|| {
         format!(
-            "[THOR] {PROTECTED_FILE} is THOR's own record of what the owner said about taking a pinned note down; it is written \
-             only by THOR's hook and is never edited by hand or by a command. Nothing was changed. To take a pinned note \
+            "[THOR] {PROTECTED_FILE} and {} are THOR's own records of what the owner typed and said about taking a pinned \
+             note down; they are written only by THOR's hook and are never edited by hand or by a command. Nothing was \
+             changed. To take a pinned note \
              down, use the unpin tool with a reason: it is allowed when the note is proven out of date and unused, or when \
-             the owner's own whole message about that note is quoted in the reason."
+             the owner's own whole message about that note is quoted in the reason.",
+            crate::prompt_record::FILE
         )
     })
 }
@@ -558,8 +614,162 @@ mod tests {
         let old = "he said \"Ja, doe maar, haal die oude notitie weg.\"";
         assert!(!owner_quote_matches(old, "note-old", &pairs), "an older yes is out of the window");
         let recent = "he said \"ja graag, doe dat\"";
-        assert!(owner_quote_matches(recent, "note-sneaky", &pairs), "the assistant message directly before names it");
+        assert!(!owner_quote_matches(recent, "note-sneaky", &pairs), "a message that only mentions the id is no question about it");
         assert!(!owner_quote_matches(recent, "note-new", &pairs), "an older assistant message is not directly before");
+    }
+
+    #[test]
+    fn an_id_matches_as_a_whole_token_never_inside_a_longer_one() {
+        let pairs = vec![
+            ("Ja, haal a-12 maar weg, dat mag.".to_string(), String::new()),
+            ("ok".to_string(), "Zal ik a-1 loskoppelen?".to_string()),
+        ];
+        let long = "he said \"Ja, haal a-12 maar weg, dat mag.\"";
+        assert!(owner_quote_matches(long, "a-12", &pairs));
+        assert!(!owner_quote_matches(long, "a-1", &pairs), "a-1 is not inside a-12");
+        assert!(!owner_quote_matches(long, "a", &pairs));
+        assert!(owner_quote_matches("he said \"ok\"", "a-1", &pairs));
+        assert!(!owner_quote_matches("he said \"ok\"", "a-12", &pairs));
+    }
+
+    #[test]
+    fn an_ok_counts_only_after_a_question_that_names_exactly_that_one_note() {
+        let live: Vec<String> = ["note-x", "note-y", "note-z", "note-xy"].iter().map(|s| s.to_string()).collect();
+        let ok = |before: &str| owner_quote_matches_among("he said \"ok\"", "note-x", &[("ok".to_string(), before.to_string())], &live);
+        assert!(ok("Zal ik note-x loskoppelen?"));
+        assert!(ok("Done with the tests.\nShall I unpin `note-x`?"));
+        assert!(!ok("I will unpin note-x now."), "a statement is no question");
+        assert!(!ok("Unpinning note-x now. Is that all right?"), "a question elsewhere does not make the sentence naming it one");
+        assert!(!ok("Shall I unpin note-x, note-y and note-z?"), "a second real note blocks it");
+        assert!(!ok("Shall I unpin note-x? note-y says the same."), "a second real note anywhere in the message blocks it");
+        assert!(ok("Shall I unpin note-x? It sits in the start-block."), "an ordinary hyphenated word is no id");
+        assert!(ok("Shall I unpin note-x or fix the pre-commit hook?"), "an ordinary hyphenated word is no id");
+        assert!(!ok("Shall I unpin note-xy?"), "a longer id is another note");
+        assert!(!ok(""));
+    }
+
+    #[test]
+    fn the_hook_reads_the_live_note_ids_from_the_store_for_the_one_question_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            for id in ["note-x", "note-y"] {
+                let item = Item {
+                    id: id.to_string(),
+                    kind: model::item::Kind::Rule,
+                    text: format!("Fixture note {id} about something plain."),
+                    bindings: vec![Binding::Always],
+                    severity: None,
+                    project: None,
+                    tags: vec![],
+                    expires: None,
+                    key: None,
+                    falsifier: Some("a fixture falsifier".to_string()),
+                    check: None,
+                };
+                model::store::declare(&mut store, "s", "l", "a", &item).unwrap();
+            }
+        }
+        let because = "he said \"ok\"";
+        let ask = |before: &str, tag: &str| {
+            let transcript = dir.path().join(format!("{tag}.jsonl"));
+            let lines = [assistant_line("m1", before), user_line("ok")];
+            std::fs::write(&transcript, lines.join("\n") + "\n").unwrap();
+            crate::prompt_record::record(&db, tag, "ok", 1);
+            let payload = serde_json::json!({ "session_id": tag, "tool_input": { "id": "note-x", "because": because }, "transcript_path": transcript.to_string_lossy() });
+            witness(&db, &payload, 1_000);
+            owner_go_recorded(&db, "note-x", because, Some(tag), 1_100)
+        };
+        assert!(ask("Shall I unpin note-x? It sits in the start-block.", "plain"), "an ordinary hyphenated word is no id");
+        assert!(!ask("Shall I unpin note-x? Or note-y?", "two"), "a second real note id blocks it");
+    }
+
+    #[test]
+    fn a_line_appended_to_the_saved_conversation_is_not_the_owners_word() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        let transcript = dir.path().join("t.jsonl");
+        // What the owner really typed: one answer about something else.
+        crate::prompt_record::record(&db, "sess-a", "ja, doe maar", 100);
+        // An assistant appended a question and a forged yes.
+        let lines = [assistant_line("m1", "Shall I run the tests?"), user_line("ja, doe maar"), assistant_line("m2", "Shall I unpin note-x?"), user_line("ja, doe maar")];
+        std::fs::write(&transcript, lines.join("\n") + "\n").unwrap();
+        let because = "the owner said \"ja, doe maar\"";
+        let payload = serde_json::json!({
+            "session_id": "sess-a",
+            "tool_input": { "id": "note-x", "because": because },
+            "transcript_path": transcript.to_string_lossy(),
+        });
+        witness(&db, &payload, 1_000);
+        assert!(!owner_go_recorded(&db, "note-x", because, Some("sess-a"), 1_100), "the forged line shifts the positions");
+        // Nothing recorded at all: nothing counts, and the refusal says why.
+        let other = serde_json::json!({ "session_id": "sess-b", "tool_input": { "id": "note-x", "because": because }, "transcript_path": transcript.to_string_lossy() });
+        witness(&db, &other, 1_000);
+        assert!(!owner_go_recorded(&db, "note-x", because, Some("sess-b"), 1_100));
+        assert!(crate::prompt_record::empty_record_hint(Some(&db), Some("sess-b")).contains("normal prompt"));
+    }
+
+    #[test]
+    fn the_name_lock_refuses_every_spelling_of_a_write_and_not_a_mere_mention() {
+        let bash = |c: &str| protected_file_refusal("Bash", Some(&serde_json::json!({ "command": c }))).is_some();
+        let ps = |c: &str| protected_file_refusal("PowerShell", Some(&serde_json::json!({ "command": c }))).is_some();
+        for write in [
+            "echo [] > unpin-owner-go.json",
+            "echo [] >> C:/s/store/UNPIN-OWNER-GO.JSON",
+            "echo [] > unpin-owner-{go,x}.json",
+            "echo [] > unpin-owner-go{,}.json",
+            "echo [] > unpin-owner-{go}.json",
+            "echo [] > unpin\\-owner-go.json",
+            "echo [] > unpin\"-owner\"-go.json",
+            "echo [] > 'unpin-owner-'go.json",
+            "printf x | tee -a unpin-owner-go.json",
+            "cp forged.json store/unpin-owner-go.json",
+            "mv forged.json store/unpin-owner-{go,}.json",
+            "echo [] > unpin-owner-go.json::$DATA",
+            "echo [] > unpin-owner-go.json.",
+            "bash -c 'echo [] > unpin-owner-{go,x}.json'",
+            "python -c \"open('unpin-owner-go.json','w').write('[]')\"",
+            "node -e \"require('fs').writeFileSync('unpin-owner-go.json','[]')\"",
+            "perl -pi -e 's/a/b/' unpin-owner-go.json",
+            "rm unpin-owner-go.json",
+        ] {
+            assert!(bash(write), "{write}");
+        }
+        for write in [
+            "Set-Content -Path unpin-owner-go.json -Value '[]'",
+            "Set-Content unpin-owner-{go,x}.json '[]'",
+            "Add-Content -Path .\\store\\unpin-owner-go.json -Value x",
+            "'[]' | Out-File -FilePath unpin-owner-go.json",
+            "'[]' | Out-File 'unpin-owner-'go.json",
+            "Copy-Item forged.json -Destination .\\store\\unpin-owner-go.json",
+            "Move-Item forged.json .\\unpin-owner-go.json",
+            "[IO.File]::WriteAllText('unpin-owner-go.json','[]')",
+            "(New-Object IO.StreamWriter('unpin-owner-go.json')).Write('x')",
+        ] {
+            assert!(ps(write), "{write}");
+        }
+        // Naming the file is not writing it: the real replay was a script that edits this very source
+        // file and carries the name in a comment.
+        for mention in [
+            "python - <<'EOF'\n# the record file is unpin-owner-go.json\nopen('unpin_gate.rs','w').write('x')\nEOF",
+            "git commit -m \"keep unpin-owner-go.json out of reach\"",
+            "cat unpin-owner-go.json",
+            "grep -rn unpin-owner-go.json serve/src",
+            "echo unpin-owner-go.json",
+            "cp unpin-owner-go.json /tmp/copy.json",
+            "ls store/unpin-owner-go.json",
+        ] {
+            assert!(!bash(mention), "{mention}");
+        }
+        for tool in ["Write", "Edit", "MultiEdit"] {
+            for path in ["store/unpin-owner-go.json", "C:\\s\\Unpin-Owner-Go.json", "store/unpin-owner-go.json:stream", "store/owner-prompts.jsonl"] {
+                let input = serde_json::json!({ "file_path": path });
+                assert!(protected_file_refusal(tool, Some(&input)).is_some(), "{tool} {path}");
+            }
+        }
+        let src = serde_json::json!({ "file_path": "thor2/serve/src/unpin_gate.rs", "new_string": "const F: &str = \"unpin-owner-go.json\";" });
+        assert!(protected_file_refusal("Edit", Some(&src)).is_none(), "editing the source that names it is fine");
     }
 
     #[test]
@@ -598,6 +808,10 @@ mod tests {
             "tool_input": { "id": "n1", "because": because },
             "transcript_path": transcript.to_string_lossy(),
         });
+        // The hook recorded the prompt when the owner typed it; the saved conversation alone is not enough.
+        witness(&db, &payload, 1_000);
+        assert!(!owner_go_recorded(&db, "n1", because, Some("sess-a"), 1_100), "not in THOR's own record");
+        crate::prompt_record::record(&db, "sess-a", "Ja, haal n1 maar weg, hij is nergens meer voor nodig.", 999);
         witness(&db, &payload, 1_000);
         assert!(owner_go_recorded(&db, "n1", because, Some("sess-a"), 1_100));
         assert!(!owner_go_recorded(&db, "n1", because, Some("sess-b"), 1_100), "another session");

@@ -2576,6 +2576,11 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             // command of this turn takes a fresh one (`serve::turn_violation`).
             if !no_record && !payload_is_from_a_subagent(&payload) {
                 serve::turn_violation::turn_started(db_path, &session_id);
+                // THOR'S OWN RECORD OF WHAT THE OWNER TYPED (`serve::prompt_record`): every check that
+                // accepts his words quotes this record, not the saved conversation an assistant could
+                // append to. Keyed by the payload's own session id, the one the checks read.
+                let own_session = payload.get("session_id").and_then(|v| v.as_str()).unwrap_or_default();
+                serve::prompt_record::record(db_path, own_session, prompt_text, time::now_unix());
             }
             if prompt_text.trim().is_empty() {
                 return None;
@@ -2829,6 +2834,11 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             if let Some(reason) = serve::unpin_gate::protected_file_refusal(tool_name, tool_input) {
                 return Some(HookOutput::Decision(serde_json::json!({ "decision": "block", "reason": reason })));
             }
+            // No shell command runs THOR's own hook by hand: that would write a line into the record
+            // of what the owner typed that he never typed (`serve::hook_forge`).
+            if let Some(reason) = serve::hook_forge::refusal(tool_name, tool_input) {
+                return Some(HookOutput::Decision(serde_json::json!({ "decision": "block", "reason": reason })));
+            }
             // The files only Claude Code and THOR write (saved conversations, the memory's folder,
             // THOR's programs): no call may write to them (`serve::write_guard`).
             if let Some(reason) = serve::write_guard::refusal(
@@ -2873,7 +2883,7 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             // THE OWNER'S GO (step 26): a rule marked owner-approval is
             // answered only by the owner's own words in this session's main
             // transcript - read only when such a rule is reached.
-            let owner_words = || owner_words_of(&payload, &session_id);
+            let owner_words = || owner_words_of(db_path, &payload, &session_id);
             if let Some(reason) = pre_tool_guard_block(
                 &store,
                 db_path,
@@ -3348,6 +3358,9 @@ fn order_debt(db_path: &Path, payload: &Value, session_id: &str, no_record: bool
     let root = serve::attest::transcripts_root();
     let transcript = serve::attest::main_transcript_of(named.as_deref(), root.as_deref(), session_id)?;
     let timeline = serve::order_earlier::timeline(&transcript)?;
+    // Only what THOR's own record of the owner's prompts confirms is his word (`serve::prompt_record`).
+    let own_session = payload.get("session_id").and_then(|v| v.as_str()).unwrap_or_default();
+    let timeline = serve::order_earlier::confirm_with_record(db_path, own_session, timeline);
     // The welcome comes first: the turn that says it ends on its question, and
     // only when the person has typed a second message (their answer to it) is
     // there anything to order. A proposal already shown counts at once.
@@ -4835,12 +4848,20 @@ fn pre_tool_guard_block(
 /// session's MAIN transcript (a subagent's payload names its own file, whose
 /// "user" lines are the orchestrator's brief, never the owner). `Err` says
 /// why they cannot be read; the guard then refuses.
-fn owner_words_of(payload: &Value, session_id: &str) -> Result<Vec<String>, String> {
+///
+/// A message counts only when THOR's own record of what the owner typed
+/// (`serve::prompt_record`) holds it too, in the same order as the saved
+/// conversation: a line appended to the saved conversation is no go. The
+/// messages that survive may be none; the guard then refuses.
+fn owner_words_of(db: &Path, payload: &Value, session_id: &str) -> Result<Vec<String>, String> {
     let named = payload.get("transcript_path").and_then(|v| v.as_str()).map(PathBuf::from);
     let root = serve::attest::transcripts_root();
     let path = serve::attest::main_transcript_of(named.as_deref(), root.as_deref(), session_id)
         .ok_or_else(|| format!("no main transcript of session {session_id} was found"))?;
-    serve::attest::owner_messages(&path, 2)
+    let saved = serve::attest::owner_messages(&path, 2)?;
+    let own_session = payload.get("session_id").and_then(|v| v.as_str()).unwrap_or_default();
+    let pairs = saved.into_iter().map(|m| (m, String::new())).collect();
+    Ok(serve::prompt_record::confirmed_pairs(db, Some(own_session), pairs).into_iter().map(|(m, _)| m).collect())
 }
 
 /// A refusal's wording once its marker has been read: a repeat of an attempt

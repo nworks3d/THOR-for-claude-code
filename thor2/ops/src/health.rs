@@ -226,6 +226,12 @@ pub fn plain_summary(db: &Path, cwd: &Path, settings: Option<&Path>, mcp_json: O
         lines.push(format!("  NOTE: {note}"));
     }
 
+    // Silent unless a setting file the owner edits by hand differs from what the last session
+    // start saw (`serve::mode_files`): a guard cannot be switched off without a line saying so.
+    for line in serve::mode_files::changed_lines(db) {
+        lines.push(format!("  NOTE: {}", line.trim_start_matches("[THOR] ")));
+    }
+
     // Silent unless the installed evaluation routine is not the one these programs ship.
     if let Some(routine) = crate::install::default_eval_command_path() {
         lines.extend(eval_routine_note(db, &routine));
@@ -9141,6 +9147,24 @@ mod plain_summary_tests {
         let detail: Vec<String> = report(&db, None, None, None, None, None, false, None).into_iter().filter(|l| l.starts_with("work folders:")).collect();
         assert_eq!(detail.len(), 2, "{detail:?}");
         assert!(detail[0].contains("temp-until-live") && detail[1].contains("tools"), "{detail:?}");
+    }
+
+    #[test]
+    fn the_short_summary_names_a_setting_file_that_changed_since_the_last_session_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, settings, mcp) = wired(dir.path());
+        std::fs::write(dir.path().join("stale-guard-mode.json"), r#"{"mode": "on"}"#).unwrap();
+        // The session start records what the files say.
+        assert!(serve::mode_files::session_start_lines(&db, true).is_empty());
+        let quiet = plain_summary(&db, dir.path(), Some(&settings), Some(&mcp));
+        assert!(quiet.iter().all(|l| !l.contains("setting file")), "{quiet:?}");
+
+        // One small edit switches the guard off; the next doctor says so, in plain words.
+        std::fs::write(dir.path().join("stale-guard-mode.json"), r#"{"mode": "off"}"#).unwrap();
+        let lines = plain_summary(&db, dir.path(), Some(&settings), Some(&mcp));
+        let note = lines.iter().find(|l| l.contains("setting file stale-guard-mode.json changed")).expect("the change is named");
+        assert!(note.starts_with("  NOTE: ") && note.contains(r#"{"mode": "off"}"#), "{note}");
+        assert!(lines.last().unwrap().starts_with("Everything below is the detailed report"), "{lines:?}");
     }
 
     #[test]

@@ -69,6 +69,11 @@ impl Fixture {
 
     fn write_transcript(&self, lines: &[String]) {
         std::fs::write(self.transcript(), lines.join("\n") + "\n").unwrap();
+        // The owner typed each of his messages: the hook recorded each prompt (`serve::prompt_record`).
+        let _ = std::fs::remove_file(self.db().with_file_name(serve::prompt_record::FILE));
+        for text in lines.iter().filter_map(|l| serve::attest::owner_text(l)) {
+            serve::prompt_record::record(&self.db(), SESSION, &text, 0);
+        }
     }
 
     fn hook(&self, payload: &serde_json::Value) -> serde_json::Value {
