@@ -6487,19 +6487,33 @@ struct SessionEvaluationIndex {
     reports: Vec<(i64, String, String)>,
 }
 
-type IndexKey = (usize, (i64, i64), String);
+/// The store (by address) and the log position an index was built for.
+type IndexKey = (usize, i64);
+
+/// How many sessions' indexes one thread keeps at a time: refusals of one rule come from
+/// several sessions in the order they happened, and each session must be scanned once, not once
+/// per switch from one session to another.
+const SESSION_INDEXES_KEPT: usize = 16;
+
+type KeptIndexes = Option<(IndexKey, HashMap<String, std::rc::Rc<SessionEvaluationIndex>>)>;
 
 thread_local! {
-    /// The last session index built on this thread, valid while the log is unchanged.
-    static SESSION_EVALUATION_INDEX: std::cell::RefCell<Option<(IndexKey, std::rc::Rc<SessionEvaluationIndex>)>> =
-        const { std::cell::RefCell::new(None) };
+    /// The session indexes built on this thread, valid while the log is unchanged.
+    static SESSION_EVALUATION_INDEX: std::cell::RefCell<KeptIndexes> = const { std::cell::RefCell::new(None) };
 }
 
+/// How many times a session's index was built (not found kept) in this process. For the test
+/// that proves the scan of one session's writes runs once, however many refusals are asked.
+#[doc(hidden)]
+pub static SESSION_EVALUATION_INDEX_BUILDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 fn session_evaluation_index(store: &EventStore, session: &str) -> Option<std::rc::Rc<SessionEvaluationIndex>> {
-    let key: IndexKey = (store as *const EventStore as usize, store.cache_fingerprint().ok()?, session.to_string());
-    if let Some(hit) = SESSION_EVALUATION_INDEX.with(|c| c.borrow().as_ref().filter(|(k, _)| *k == key).map(|(_, v)| v.clone())) {
+    let key: IndexKey = (store as *const EventStore as usize, store.cache_fingerprint().ok()?);
+    let kept = SESSION_EVALUATION_INDEX.with(|c| c.borrow().as_ref().filter(|(k, _)| *k == key).and_then(|(_, by_session)| by_session.get(session).cloned()));
+    if let Some(hit) = kept {
         return Some(hit);
     }
+    SESSION_EVALUATION_INDEX_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let events = store.events_of_kinds_in_session(&[EventKind::FactCreated, EventKind::FactRevised], session).ok()?;
     let starts: Vec<EvaluationStart> = starts_in(&events).into_iter().filter(|s| s.frozen.session == session).collect();
     let reports = events
@@ -6511,7 +6525,18 @@ fn session_evaluation_index(store: &EventStore, session: &str) -> Option<std::rc
         })
         .collect();
     let index = std::rc::Rc::new(SessionEvaluationIndex { events, starts, reports });
-    SESSION_EVALUATION_INDEX.with(|c| *c.borrow_mut() = Some((key, index.clone())));
+    SESSION_EVALUATION_INDEX.with(|c| {
+        let mut kept = c.borrow_mut();
+        match kept.as_mut() {
+            Some((k, by_session)) if *k == key => {
+                if by_session.len() >= SESSION_INDEXES_KEPT {
+                    by_session.clear();
+                }
+                by_session.insert(session.to_string(), index.clone());
+            }
+            _ => *kept = Some((key, HashMap::from([(session.to_string(), index.clone())]))),
+        }
+    });
     Some(index)
 }
 

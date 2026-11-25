@@ -2091,28 +2091,21 @@ impl EventStore {
         contiguous_tip_conn(&self.conn)
     }
 
-    /// A cheap key that changes whenever the log changes: (row count, max seq).
+    /// A cheap key that changes whenever the log changes: the highest seq.
     ///
     /// EXACT for this table by construction: every statement that touches
     /// `event` is a plain `INSERT` (`append_event`, `ingest_batch`, restore) -
-    /// there is no UPDATE, no DELETE and no INSERT OR REPLACE anywhere, so a row
-    /// can never change under a fixed count. Any append moves the count; `max
-    /// seq` rides along as a second witness and costs nothing.
+    /// there is no UPDATE, no DELETE and no INSERT OR REPLACE anywhere, and
+    /// `seq` is the table's rowid and only ever grows, so any append moves it
+    /// and a row can never change under a fixed maximum.
     ///
-    /// Deliberately NOT `contiguous_tip()`: that one is hole-proof (it scans for
-    /// the first gap) and measures ~30ms on a 16k-event log - a third of the
-    /// 81ms fold it is supposed to guard, which would eat the entire point of a
-    /// resident cache. It is not needed here anyway: `ingest_batch` only accepts
-    /// tip+1, so a replica cannot punch a hole below `MAX(seq)`. This pair costs
-    /// ~0.02ms (both index-only), i.e. ~4000x cheaper than the fold - and that
-    /// asymmetry is exactly what makes a resident cache worth holding.
-    /// Used by `recall::ResidentCache` to decide reuse-or-rebuild.
-    pub fn cache_fingerprint(&self) -> SqlResult<(i64, i64)> {
-        self.conn.query_row(
-            "SELECT COUNT(*), COALESCE(MAX(seq), 0) FROM event",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
+    /// Deliberately NOT a row count: `COUNT(*)` walks every row (about 25 ms on
+    /// a 340,000 event log) and the weekly check asks this a few hundred times.
+    /// `MAX(seq)` on the rowid is a single b-tree step. Not `contiguous_tip()`
+    /// either: that one is hole-proof (it scans for the first gap), which is
+    /// not needed here because `ingest_batch` only accepts tip+1.
+    pub fn cache_fingerprint(&self) -> SqlResult<i64> {
+        self.conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM event", [], |r| r.get(0))
     }
 
     /// Every event of one of `kinds` with seq > `since_seq`, in log order,
@@ -2675,6 +2668,28 @@ mod tests {
         let after = store.projected_heads_fingerprint().unwrap();
         assert_eq!(before.0, after.0, "the newest head seq did not move");
         assert_ne!(before, after, "the fingerprint must");
+    }
+
+    /// The cache key is asked a few hundred times by the weekly check: it must move with every
+    /// append and must never walk the table (a row count did, 25 ms on a 340,000 event log).
+    #[test]
+    fn the_cache_fingerprint_moves_with_each_append_and_reads_no_rows() {
+        let mut store = EventStore::in_memory().unwrap();
+        assert_eq!(store.cache_fingerprint().unwrap(), 0);
+        store.append_event("s", "l", "t", EventKind::FactCreated, "P:a", None, "a").unwrap();
+        let one = store.cache_fingerprint().unwrap();
+        store.append_event("s", "l", "t", EventKind::FactCreated, "P:b", None, "b").unwrap();
+        let two = store.cache_fingerprint().unwrap();
+        assert!(one > 0 && two > one, "{one} then {two}");
+        let plan: Vec<String> = store
+            .conn
+            .prepare("EXPLAIN QUERY PLAN SELECT COALESCE(MAX(seq), 0) FROM event")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(plan.iter().all(|step| !step.starts_with("SCAN")), "the key must not scan the table: {plan:?}");
     }
 
     /// Both file-backed constructors must cap how large the WAL is allowed

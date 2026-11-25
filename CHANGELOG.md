@@ -70,6 +70,12 @@ What changed: The weekly check is quieter and more reliable, and a pin can no lo
 - **The record of your answers is locked by name.** A write to it is refused however the name is spelled (braces, escapes, quotes split inside it), and a command that only mentions the file name, such as a script editing THOR's own source, is no longer refused.
 - **Folding a pinned note into another is stricter.** The rewrite must carry two thirds of the folded note's own words, and it is judged on the note as it is now, so rewriting, reverting and then folding no longer passes.
 - **A silent change to a setting file is named.** If a file you edit by hand (the mode switches, the work folders or a guard file) differs from the last session start, the next session start and `doctor` say which file and what it now says.
+- **`doctor` is about twice as fast again on a large memory.** The weekly check part (`doctor --eval`) went from about 30 to 15 seconds and the full report from about 65 to 42 seconds.
+- **A held turn that asks for the weekly check again no longer waits for it again.** The second and later asks of the same turn answered in about 7 seconds on a large memory; they now take about 2.
+- **A long message in a language that is not plain English text is no longer slow.** A message of 200,000 characters of accented letters, symbols or emoji took 10 to 14 seconds before THOR answered; it takes under a second now.
+- **A note counts as read only when THOR itself answered the read.** Another program's tool with the same name, a read that failed and a read still running no longer count.
+- **The second look at a broken rule really comes.** When a script put forbidden text in a file, the hold said it would check again at the end of the next turn, but a next turn that ran no command was never checked. It now is, and the second hold says it is the last.
+- **The `doctor` line about the weekly check no longer says a report failed when none was ever filed.** A new project now reads "no evaluation report of this project is on file yet".
 
 ## 2.6.13 (2026-11-21)
 

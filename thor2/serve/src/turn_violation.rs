@@ -237,6 +237,14 @@ pub fn has_snapshot(db: &Path, session_id: &str) -> bool {
     read(&default_path(db)).get(session_id).is_some_and(|r| r.current)
 }
 
+/// Does the session still owe a hold for a violation found at an earlier Stop? True while an
+/// open violation has holds left or its one closing line is still unsaid. Such a violation is
+/// checked at the end of the NEXT turn too, even one that made no change-capable tool call and
+/// so has no snapshot: that is what the hold text promises.
+pub fn has_open_violation(db: &Path, session_id: &str) -> bool {
+    read(&default_path(db)).get(session_id).is_some_and(|r| r.open.values().any(|o| o.holds < MAX_HOLDS || !o.told))
+}
+
 /// A new prompt arrived: the snapshot of the previous turn no longer belongs
 /// to the turn in progress, so the first change-capable tool call takes a fresh one. No
 /// write at all for a session with no snapshot.
@@ -347,6 +355,8 @@ struct Broken {
     detail: String,
     /// Already failing when this turn began (an earlier, interrupted or held turn).
     earlier: bool,
+    /// This is the last hold THOR makes for it (the cap `MAX_HOLDS`).
+    last: bool,
 }
 
 fn short(text: &str) -> String {
@@ -386,8 +396,14 @@ fn hold_message(broken: &[Broken]) -> String {
         "What to do: if this turn made that change, undo it so the file no longer contains that text. If this turn did \
          not make it, tell the owner what you found and do not change the file yourself. If the owner asked for it on \
          purpose, ask the owner before revising the rule, and revise it only with a reason (because). Never weaken or \
-         retract the rule on your own to get past this. THOR checks again at the end of the next turn.",
+         retract the rule on your own to get past this. ",
     );
+    // THOR holds a violation at most `MAX_HOLDS` times, one per turn end: say which one this is.
+    if broken.iter().take(MAX_LISTED).all(|b| b.last) {
+        out.push_str("THOR holds a turn for this no more after this one; if it is still broken it says so once and leaves it to the owner.");
+    } else {
+        out.push_str("THOR checks again at the end of the next turn, also when that turn runs no command.");
+    }
     out
 }
 
@@ -403,10 +419,13 @@ fn say_message(ids: &[String]) -> String {
 pub fn stop_check(db: &Path, session_id: &str, items: &[LiveItem], project: Option<&str>, root: &Path) -> Found {
     let path = default_path(db);
     let mut all = read(&path);
-    let Some(record) = all.get_mut(session_id).filter(|r| r.current) else { return Found::default() };
+    let Some(record) = all.get_mut(session_id).filter(|r| r.current || !r.open.is_empty()) else { return Found::default() };
     if record.root != root.display().to_string() {
         return Found::default(); // another checkout than the one the turn started in
     }
+    // A turn with no snapshot of its own (it made no change-capable call) only re-asks about
+    // the violations still open from an earlier Stop: its `start` belongs to an older turn.
+    let own_turn = record.current;
     if checkout_changed(root, &record.head, record.reflog) {
         // A checkout, pull, rebase, merge or reset moved HEAD (a plain commit
         // does not count): the files changed under the session. Judge nothing
@@ -421,12 +440,14 @@ pub fn stop_check(db: &Path, session_id: &str, items: &[LiveItem], project: Opti
     let mut found = Found::default();
     let mut to_hold: Vec<Broken> = Vec::new();
     let mut standing: Vec<String> = Vec::new();
-    let ids: Vec<String> = record.start.keys().chain(record.open.keys()).cloned().collect::<HashSet<_>>().into_iter().collect();
-    let mut ids = ids;
+    let mut ids: Vec<String> = match own_turn {
+        true => record.start.keys().chain(record.open.keys()).cloned().collect::<HashSet<_>>().into_iter().collect(),
+        false => record.open.keys().cloned().collect(),
+    };
     ids.sort();
     for id in ids {
         let Some((li, check_now)) = watched.get(id.as_str()) else { continue };
-        let started_ok = record.start.get(&id).is_some_and(|w| w.check == *check_now && !w.start_fails);
+        let started_ok = own_turn && record.start.get(&id).is_some_and(|w| w.check == *check_now && !w.start_fails);
         let was_open = record.open.get(&id).is_some_and(|o| o.check == *check_now);
         let outcome = run(li, root);
         if outcome != Some(Outcome::Fails) {
@@ -443,7 +464,7 @@ pub fn stop_check(db: &Path, session_id: &str, items: &[LiveItem], project: Opti
         if open.holds < MAX_HOLDS {
             open.holds += 1;
             let (file, detail) = li.item.check.as_ref().map(|c| describe(c, root)).unwrap_or_default();
-            to_hold.push(Broken { id: id.clone(), text: short(&li.item.text), file, detail, earlier: !started_ok });
+            to_hold.push(Broken { id: id.clone(), text: short(&li.item.text), file, detail, earlier: !started_ok, last: open.holds >= MAX_HOLDS });
         } else if !open.told {
             open.told = true;
             standing.push(id.clone());
@@ -472,6 +493,7 @@ mod tests {
             file: "site/materialen.html".to_string(),
             detail: "the text \"PA6\", which is not allowed there, is now in it".to_string(),
             earlier: false,
+            last: false,
         }]);
         assert!(msg.contains("no-pa6") && msg.contains("site/materialen.html") && msg.contains("\"PA6\""), "{msg}");
         assert!(msg.contains("undo it so the file no longer contains that text"), "{msg}");
