@@ -134,6 +134,7 @@ pub mod missing_programs;
 pub mod other_project;
 pub mod next_turn;
 pub mod notices;
+pub mod person_line;
 pub mod pins;
 pub mod plan;
 pub mod project;

@@ -2667,8 +2667,15 @@ fn busiest_narrower_call<'a>(
 /// enumerate before that happens, and refusing on a guess is how a gate
 /// teaches people to route around it.
 pub fn capacity(store: &EventStore, item: &Item) -> anyhow::Result<Capacity> {
-    let bindings: Vec<&Binding> =
+    let mut bindings: Vec<&Binding> =
         item.bindings.iter().filter(|b| !matches!(b, Binding::Always)).collect();
+    // In a folder for a subject (a plain folder with its own marker and no git) a note
+    // bound to its own project is not shown by place: it is found by matching the
+    // person's prompt (`serve::other_project::narrow_to_prompt`), so there is no
+    // block to be crowded out of, however many such notes there are.
+    if is_topic_project(store, item.project.as_deref()) {
+        bindings.retain(|b| !is_own_project_binding(b, item.project.as_deref()));
+    }
     if (bindings.is_empty() && !is_standing(item)) || !item.kind.can_fire() {
         return Ok(Capacity::Fine);
     }
@@ -2778,6 +2785,49 @@ pub fn capacity(store: &EventStore, item: &Item) -> anyhow::Result<Capacity> {
     })
 }
 
+/// Whether `project` is registered at a folder for a subject: a plain folder with its
+/// own `.thor-project` marker and no git repository above it. Read from the
+/// registration alone, like every other registered-folder question.
+pub fn is_topic_project(store: &EventStore, project: Option<&str>) -> bool {
+    let Some(project) = project else { return false };
+    let Some((root, _)) = registered_root_raw(store, project) else { return false };
+    crate::checkout::plain_root(&root).as_deref() == Some(root.as_path())
+}
+
+/// A project binding that names the item's own project.
+fn is_own_project_binding(binding: &Binding, project: Option<&str>) -> bool {
+    matches!(
+        binding,
+        Binding::Target { kind: crate::item::TargetKind::Project, value }
+            if project.is_some_and(|p| crate::checkout::same_project_name(value, p))
+    )
+}
+
+/// The place a crowded note stands on and the notes that already hold it (up to
+/// three ids, the same ones `capacity`'s warning names), or `None` when the note
+/// is not crowded. For the hold at the end of a turn.
+pub fn crowded_place(store: &EventStore, item: &Item) -> Option<(String, Vec<String>)> {
+    let bindings: Vec<&Binding> = item.bindings.iter().filter(|b| !matches!(b, Binding::Always)).collect();
+    let candidates = if store.heads_projection_current() {
+        live_items_from_projection(store).ok()?
+    } else {
+        live_items_from_fold(store).ok()?
+    };
+    let (_, binding, _) = crowded_binding_note(&candidates, item, &bindings)?;
+    Some((describe(binding), crowding_names(&candidates, item, binding)))
+}
+
+/// Up to three ids of the notes already on `binding`'s place, heaviest first.
+fn crowding_names(candidates: &[(String, Item)], item: &Item, binding: &Binding) -> Vec<String> {
+    let mine = crate::item::severity_rank(item.severity);
+    let mut rivals: Vec<&(String, Item)> = pool_rivals(candidates, item, binding)
+        .into_iter()
+        .filter(|(_, o)| crate::item::severity_rank(o.severity) <= mine)
+        .collect();
+    rivals.sort_by_key(|(id, o)| (crate::item::severity_rank(o.severity), id.clone()));
+    rivals.iter().take(3).map(|(id, _)| id.clone()).collect()
+}
+
 /// Every binding this item carries (besides `Always`, already dropped by
 /// `capacity`'s own caller) is a DIRECTORY - the one case `capacity` reports
 /// unconditionally, before it ever asks `pool_rivals` a single question. A
@@ -2810,15 +2860,12 @@ fn crowded_binding_note<'a>(
         let rivals = pool_rivals(candidates, item, binding);
         let at_least_equal = rivals.iter().filter(|(_, o)| crate::item::severity_rank(o.severity) <= mine).count();
         if at_least_equal >= crate::item::MAX_ITEMS {
+            let names = crowding_names(candidates, item, binding);
             let note = format!(
-                "{} already holds AT LEAST {at_least_equal} item(s) of the same weight or heavier, \
-                 for {} place(s) in a block - this one may well never be shown there. At least, \
-                 because this count sees only the rivals sharing this one binding; the real crowd \
-                 also includes everything reaching that place through a moment or a command, which \
-                 only doctor's crowding line can count, per file and per command anchor in a \
-                 checkout. Bind it to the exact file or command it is about instead \
-                 of the broad moment, or fold it into whichever item already carries that ground.",
+                "{} already holds {at_least_equal} note(s) of the same weight or heavier ({}), and a block shows only {} - \
+                 this one may well never be shown there. Move it to the exact file or command it is about, or fold it into one of those notes.",
                 describe(binding),
+                names.join(", "),
                 crate::item::MAX_ITEMS
             );
             return Some((note, binding, at_least_equal));

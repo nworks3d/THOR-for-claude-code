@@ -1257,72 +1257,11 @@ mod resolve_session_id_tests {
     }
 }
 
-/// The one plain sentence for the PERSON that goes beside a hook's block.
-///
-/// A block's `reason` is written for the assistant, in THOR's own words, and
-/// Claude Code shows it on the person's screen as well. Someone who has never
-/// heard of any of this reads "rule", "falsifier" and "evaluation" and has no
-/// idea whether something broke. So every block also carries a top-level
-/// `systemMessage` - Claude Code's channel for the person - saying in ordinary
-/// words what is going on and what, if anything, is asked of them. The reason
-/// itself is left exactly as it was: the assistant reads that.
-///
-/// Chosen from the event and a few phrases of the reason; anything not
-/// recognised gets the general sentence, which is true of every block.
-fn plain_line_for_block(event: &str, reason: &str) -> &'static str {
-    let lower = reason.to_lowercase();
-    match event {
-        "Stop" if lower.contains(&serve::other_project::HOLD_MARKER.to_lowercase()) => LINE_NO_PROJECT,
-        "Stop" if lower.contains("walked through setup") => LINE_SETUP,
-        "Stop" if lower.contains("[thor] order-earlier-work") => LINE_ORDER,
-        // Before the evaluation arm: an evaluation ask can ride along with this hold.
-        "Stop" if lower.contains(&serve::leftover_scripts::HOLD_MARKER.to_lowercase()) => LINE_SCRIPTS,
-        "Stop" if lower.contains("copy-attestation") => LINE_COPY_PROOF,
-        "Stop" if lower.contains("evaluation") => LINE_TIDY_UP,
-        "Stop" if lower.contains("durable decision") => LINE_DECISION,
-        "Stop" if lower.contains("could not prove themselves") => LINE_NOTES_OUT_OF_DATE,
-        "PreToolUse" if lower.contains("needs the owner's explicit go") => LINE_NEEDS_YOUR_OK,
-        "PreToolUse" => LINE_ACTION_STOPPED,
-        _ => LINE_ONE_MORE_THING,
-    }
-}
-
-// THE SENTENCES A PERSON SEES. Every hold and every refusal of a tool call
-// carries one of these as `systemMessage`; a test walks them all and fails on
-// THOR's own vocabulary (rule, falsifier, evaluation, scope, teeth, hook, MCP,
-// collection, store). Each says what happened and that nothing is needed.
-const LINE_SETUP: &str = "THOR (the memory your assistant uses) is finishing its setup. Your assistant welcomes you and asks one short question with a few choices: you can simply answer \"yes\". Nothing else is needed from you.";
-const LINE_ORDER: &str = "THOR asks your assistant to finish one last setup step: a proposal to put your earlier work in order. It asks you one short question. Nothing else is needed from you.";
-const LINE_SCRIPTS: &str = "Your assistant left a few small helper files outside your projects. THOR asks it to tidy them up: useful ones are kept in your tools folder, leftovers are deleted, and it asks you first about anything unclear. You do not need to do anything unless it asks you.";
-const LINE_NO_PROJECT: &str = "This conversation has no project folder, so what is said here cannot be kept under a project. Your assistant proposes a folder and asks you one question: just answer yes or no. Nothing else is needed from you.";
-const LINE_COPY_PROOF: &str = "THOR is sending proof of this week's memory check from this computer's copy of your memory to your main computer. Your assistant does one more small step. You do not need to do anything.";
-const LINE_TIDY_UP: &str = "THOR asks your assistant to tidy up the memory now, before it finishes its answer. This can take a few minutes. You do not need to do anything.";
-const LINE_DECISION: &str = "Your assistant is saving something you just decided, so it is remembered next time. You do not need to do anything.";
-const LINE_NOTES_OUT_OF_DATE: &str = "THOR noticed that some saved notes may be out of date, and asks your assistant to check them before it finishes its answer. You do not need to do anything.";
-const LINE_NEEDS_YOUR_OK: &str = "THOR paused one step of your assistant's work because it needs your OK first. Your assistant will ask you in plain words: just answer it. Nothing else is needed from you.";
-const LINE_ACTION_STOPPED: &str = "THOR stopped one step your assistant was about to take, because it went against something saved in the memory earlier. Your assistant will try another way. You do not need to do anything.";
-const LINE_ONE_MORE_THING: &str = "THOR asked your assistant to do one more small thing before it finishes its answer. For example, it may rewrite an answer that is too long. You do not need to do anything.";
-
-/// Every sentence above, for the test that walks them.
-#[cfg(test)]
-const PERSON_LINES: [&str; 11] = [
-    LINE_NO_PROJECT,
-    LINE_ORDER,
-    LINE_SETUP,
-    LINE_SCRIPTS,
-    LINE_COPY_PROOF,
-    LINE_TIDY_UP,
-    LINE_DECISION,
-    LINE_NOTES_OUT_OF_DATE,
-    LINE_NEEDS_YOUR_OK,
-    LINE_ACTION_STOPPED,
-    LINE_ONE_MORE_THING,
-];
-
-/// `plain_line_for_block` applied to a block, once, as `systemMessage`: at STOP
+/// `serve::person_line` applied to a block, once, as `systemMessage`: at STOP
 /// (the turn that will not end) and at PRE-TOOL-USE (an action that was
-/// refused). Anything else is returned unchanged.
-fn with_line_for_the_person(event: &str, out: Option<HookOutput>) -> Option<HookOutput> {
+/// refused), in the language recorded with `install --set-language` (English
+/// when none is set). Anything else is returned unchanged.
+fn with_line_for_the_person(event: &str, out: Option<HookOutput>, language: Option<&str>) -> Option<HookOutput> {
     if event != "Stop" && event != "PreToolUse" {
         return out;
     }
@@ -1331,7 +1270,7 @@ fn with_line_for_the_person(event: &str, out: Option<HookOutput>) -> Option<Hook
             let is_block = verdict.get("decision").and_then(Value::as_str) == Some("block");
             if is_block && verdict.get("systemMessage").is_none() {
                 let reason = verdict.get("reason").and_then(Value::as_str).unwrap_or("");
-                let line = plain_line_for_block(event, reason);
+                let line = serve::person_line::line(serve::person_line::classify(event, reason), language);
                 verdict["systemMessage"] = Value::String(line.to_string());
             }
             Some(HookOutput::Decision(verdict))
@@ -1364,12 +1303,12 @@ mod line_for_the_person_tests {
             ("Stop", "[THOR] Script file(s) were written outside any git repository during this session\n\nThe evaluation of 'x' is still open"),
         ];
         for (event, reason) in cases {
-            let out = with_line_for_the_person(event, block(reason));
+            let out = with_line_for_the_person(event, block(reason), None);
             let Some(HookOutput::Decision(v)) = &out else { panic!("{event}: lost the block") };
             assert_eq!(v["reason"], reason, "the assistant's own text is untouched");
             assert_eq!(v["decision"], "block");
             let line = line_of(out);
-            assert!(line.contains("You do not need to do anything") || line.contains("Nothing else is needed from you"), "{event}: {line}");
+            assert!(line.contains("You do not need to do anything") || line.contains("is needed from you"), "{event}: {line}");
             for jargon in ["falsifier", "scope", "hook", "retract", "teeth", "evaluation", "A4"] {
                 assert!(!line.contains(jargon), "{event}: the plain line must not use {jargon:?}: {line}");
             }
@@ -1381,6 +1320,7 @@ mod line_for_the_person_tests {
         let out = with_line_for_the_person(
             "Stop",
             block("[THOR] Script file(s) were written outside any git repository during this session\n\nThe evaluation of 'x' is still open"),
+            None,
         );
         let line = line_of(out);
         assert!(line.contains("small helper files"), "{line}");
@@ -1390,43 +1330,71 @@ mod line_for_the_person_tests {
     #[test]
     fn a_tool_call_refusal_gets_a_plain_line_and_keeps_its_reason() {
         let reason = "[THOR] rule r1 forbids this text";
-        let out = with_line_for_the_person("PreToolUse", block(reason));
+        let out = with_line_for_the_person("PreToolUse", block(reason), None);
         let Some(HookOutput::Decision(v)) = &out else { panic!("lost the block") };
         assert_eq!(v["reason"], reason, "the assistant's own text is untouched");
         let line = line_of(out);
         assert!(line.contains("stopped one step") && line.contains("You do not need to do anything"), "{line}");
-        let approval = line_of(with_line_for_the_person("PreToolUse", block("[THOR] rule r2 applies here: this call needs the owner's explicit go")));
+        let approval = line_of(with_line_for_the_person("PreToolUse", block("[THOR] rule r2 applies here: this call needs the owner's explicit go"), None));
         assert!(approval.contains("needs your OK first"), "{approval}");
-    }
-
-    /// Walk every sentence a person can see on a hold or a refusal: each says
-    /// that nothing (more) is needed, is plain ASCII, and uses none of THOR's
-    /// own words.
-    #[test]
-    fn every_sentence_a_person_sees_is_plain_and_uses_no_thor_vocabulary() {
-        for line in PERSON_LINES {
-            assert!(line.contains("You do not need to do anything") || line.contains("Nothing else is needed from you"), "{line}");
-            assert!(line.is_ascii(), "{line}");
-            let words: Vec<String> = line.to_lowercase().split(|c: char| !c.is_alphanumeric()).map(str::to_string).collect();
-            for jargon in ["rule", "rules", "falsifier", "evaluation", "scope", "teeth", "hook", "hooks", "mcp", "collection", "store", "retract", "lookup", "pinned"] {
-                assert!(!words.iter().any(|w| w == jargon), "the sentence uses the word {jargon:?}: {line}");
-            }
-        }
     }
 
     #[test]
     fn the_setup_and_notes_out_of_date_holds_get_their_own_sentence() {
-        assert_eq!(line_of(with_line_for_the_person("Stop", block("[THOR] ... has not been walked through setup yet"))), LINE_SETUP);
-        assert!(line_of(with_line_for_the_person("Stop", block("[THOR] These rules could not prove themselves while work was going on"))).contains("out of date"));
+        let setup = line_of(with_line_for_the_person("Stop", block("[THOR] ... has not been walked through setup yet"), None));
+        assert_eq!(setup, serve::person_line::line(serve::person_line::Hold::Setup, None));
+        assert!(line_of(with_line_for_the_person("Stop", block("[THOR] These rules could not prove themselves while work was going on"), None)).contains("out of date"));
+    }
+
+    /// The line follows the language recorded with `install --set-language`, and
+    /// a hold that matches no kind gets a sentence that is true for any hold,
+    /// never the old "rewrite an answer that is too long".
+    #[test]
+    fn the_line_follows_the_chosen_language_and_the_fall_through_is_neutral() {
+        let order = "[THOR] order-earlier-work: one last setup step is still owed";
+        let nl = line_of(with_line_for_the_person("Stop", block(order), Some("nl")));
+        assert!(nl.contains("laatste stap"), "{nl}");
+        let en = line_of(with_line_for_the_person("Stop", block(order), None));
+        assert!(en.contains("last setup step"), "{en}");
+        let unknown = line_of(with_line_for_the_person("Stop", block("[THOR] something new"), Some("de")));
+        assert!(unknown.contains("Kleinigkeit") && !unknown.contains("too long"), "{unknown}");
+        let neutral = line_of(with_line_for_the_person("Stop", block("[THOR] something new"), None));
+        assert_eq!(neutral, "THOR asks your assistant to finish one small thing first. Nothing is needed from you.");
+    }
+
+    /// The hold for a note on a full place: short, three steps with their exact
+    /// calls, the names of the notes on the place, and no leftover jargon.
+    #[test]
+    fn the_crowded_place_hold_is_short_and_names_the_calls() {
+        let names: Vec<String> = ["run-tests-before-commit", "commit-hygiene", "never-commit-a-secret"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let text = crowded_hold_text("my-first-rule", "the moment 'commit'", &names);
+        assert!(text.chars().count() <= 700, "{} chars: {text}", text.chars().count());
+        for call in ["revise(id: 'my-first-rule', targets:", "retract(id: 'my-first-rule'", "crowded-on-purpose"] {
+            assert!(text.contains(call), "{call}: {text}");
+        }
+        assert!(text.contains("commit-hygiene") && text.contains("(1)") && text.contains("(2)") && text.contains("(3)"), "{text}");
+        for old in ["FOLD", "RE-ANCHOR", "LEAVE IT", "DESCRIPTIONS"] {
+            assert!(!text.contains(old), "{old}");
+        }
+        assert_eq!(serve::person_line::classify("Stop", &text), serve::person_line::Hold::Crowded);
+    }
+
+    #[test]
+    fn a_clause_that_starts_a_sentence_gets_a_capital() {
+        assert_eq!(capitalised("the person answered: if they accepted"), "The person answered: if they accepted");
+        assert_eq!(capitalised(""), "");
     }
 
     #[test]
     fn only_a_block_gets_a_line() {
-        let warn = with_line_for_the_person("Stop", Some(HookOutput::Warn { text: "x".to_string() }));
+        let warn = with_line_for_the_person("Stop", Some(HookOutput::Warn { text: "x".to_string() }), None);
         assert!(matches!(warn, Some(HookOutput::Warn { .. })));
-        assert!(with_line_for_the_person("Stop", None).is_none());
+        assert!(with_line_for_the_person("Stop", None, None).is_none());
         let already = Some(HookOutput::Decision(serde_json::json!({ "decision": "block", "reason": "r", "systemMessage": "mine" })));
-        assert_eq!(line_of(with_line_for_the_person("Stop", already)), "mine");
+        assert_eq!(line_of(with_line_for_the_person("Stop", already, None)), "mine");
     }
 }
 
@@ -1486,7 +1454,8 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
     let payload: Option<Value> = serde_json::from_str(&raw).ok();
     let event_name: String =
         payload.as_ref().and_then(|p| p.get("hook_event_name")).and_then(|v| v.as_str()).unwrap_or("PreToolUse").to_string();
-    let out = with_line_for_the_person(&event_name, hook_inner(db_path, Some(raw), actor, no_record));
+    let language = serve::plan::reply_language(db_path);
+    let out = with_line_for_the_person(&event_name, hook_inner(db_path, Some(raw), actor, no_record), language.as_deref());
     // Every Stop and whether it held the turn, for doctor's volume line
     // (`serve::volume`, step 28).
     if let (true, "Stop", Some(p)) = (!no_record, event_name.as_str(), payload.as_ref()) {
@@ -3292,6 +3261,15 @@ fn setup_debt(store: &EventStore) -> Option<String> {
     ))
 }
 
+/// `text` with its first letter in capitals, for a clause that starts a sentence.
+fn capitalised(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
 /// What `order_debt` says: a hold for the owner of the step, or one plain line
 /// (never a hold) for any other conversation, which names the owner only to
 /// key the once-per-conversation memory of having said it.
@@ -3365,6 +3343,7 @@ fn order_debt(db_path: &Path, payload: &Value, session_id: &str, no_record: bool
             None
         }
         serve::order_earlier::Verdict::Owed(what) => {
+            let what = capitalised(&what);
             match serve::order_earlier::claim_or_defer(&store, db_path, session_id, now, !no_record, rank) {
                 serve::order_earlier::Owns::Other { session, .. } => Some(OrderStop::Say { owner: session }),
                 serve::order_earlier::Owns::Me => Some(OrderStop::Hold(format!(
@@ -3667,10 +3646,8 @@ fn crowding_debt_within(
         if reaches_a_block(store, &id, &item) {
             continue;
         }
-        let text = format!(
-            "[THOR] '{id}' was stored this session onto a place that is already full, so it will probably never be read there. The memory said so when you wrote it. Deal with it before ending the turn, in this order: (1) FOLD it - if an existing item almost says the same thing, revise that one to carry your point and retract yours; (2) RE-ANCHOR it - if it is really about a narrower file or command than the one it hangs on, move it there with revise; (3) LEAVE IT - and this exit is narrower than it sounds, so read the condition before taking it. It is honest ONLY when the seats are held by rules that can each REFUSE a write: archiving one of those is refused by the gate anyway, and folding it would spend a check. If the seats are held by DESCRIPTIONS instead, this is the wrong answer - archive a description to free its seat, since it stays fully findable and the rule that can actually block takes its place. When the condition really holds: say in your reply which items hold it, and add '{}' to its tags with revise - BARE, exactly as written here: this tag is matched whole, so appending a reason to it is silently ignored and this will keep asking every turn (that is the opposite of 'no-literal:<why>', which requires one). mark is a verdict on where an item fired and cannot tag anything. Recorded that way it is a decision rather than an oversight. Saying it only in prose settles nothing and this will ask again next turn. What you never do is raise its severity to make it visible: that pushes a heavier warning out to show a lighter one. The note said: {note} The item says: {}",
- model::store::CROWDED_ON_PURPOSE_TAG, item.text
-        );
+        let (place, names) = model::store::crowded_place(store, &item).unwrap_or_else(|| (note.clone(), Vec::new()));
+        let text = crowded_hold_text(&id, &place, &names);
         owed.push(id);
         if message.is_none() {
             message = Some(text);
@@ -3678,6 +3655,21 @@ fn crowding_debt_within(
     }
     serve::crowding_seen::save(db_path, session_id, serve::crowding_seen::Seen { seq: top, pending: owed, at: 0 }, time::now_unix());
     message
+}
+
+/// The hold for a note stored onto a place that is already full: short, three
+/// steps, the exact call for each, and the notes that hold the place.
+fn crowded_hold_text(id: &str, place: &str, names: &[String]) -> String {
+    let held_by = if names.is_empty() { String::new() } else { format!(", held by {}", names.join(", ")) };
+    format!(
+        "[THOR] '{id}' was stored this session onto a place that is already full ({place}{held_by}), so it will probably never be shown. \
+         Before ending the turn do one of: \
+         (1) move it: revise(id: '{id}', targets: [the exact file or command it is about]); \
+         (2) fold it: revise one of those notes to say this too, then retract(id: '{id}', reason: 'folded into <id>'); \
+         (3) keep it, only if all of them are rules that can refuse a call: revise(id: '{id}', tags: [its tags plus '{tag}'], because: 'why'). \
+         Nothing is needed from the person.",
+        tag = model::store::CROWDED_ON_PURPOSE_TAG
+    )
 }
 
 /// What a `Skill` (or `SlashCommand`) call opening the evaluation routine
