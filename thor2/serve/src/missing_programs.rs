@@ -94,7 +94,7 @@ pub fn hook_command_line(hook: &serde_json::Value) -> Option<String> {
 /// hooks are never read as ours.
 pub fn programs_called(settings_text: Option<&str>, mcp_text: Option<&str>) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    if let Some(root) = settings_text.and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok()) {
+    if let Some(root) = settings_text.and_then(|t| serde_json::from_str::<serde_json::Value>(thor_core::json_config::strip_bom(t)).ok()) {
         if let Some(events) = root.get("hooks").and_then(|h| h.as_object()) {
             let commands = events
                 .values()
@@ -113,7 +113,7 @@ pub fn programs_called(settings_text: Option<&str>, mcp_text: Option<&str>) -> V
         }
     }
     if let Some(text) = mcp_text.filter(|t| t.contains("thor")) {
-        let server = serde_json::from_str::<serde_json::Value>(text)
+        let server = serde_json::from_str::<serde_json::Value>(thor_core::json_config::strip_bom(text))
             .ok()
             .and_then(|root| root.get("mcpServers")?.get("thor")?.get("command")?.as_str().map(PathBuf::from));
         if let Some(program) = server.filter(|p| is_thor_program(p)) {

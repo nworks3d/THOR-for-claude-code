@@ -432,6 +432,19 @@ pub fn wire_hooks_path(dir: &Path) -> std::io::Result<HooksPathOutcome> {
     Ok(outcome)
 }
 
+/// Whether `dir` is a hooks folder THOR made: every dispatcher in it starts with
+/// THOR's own header line. Used to recognise THOR's folder whichever memory it
+/// was made for; a folder that is missing, empty or anyone else's is not.
+pub fn is_thor_made_hooks_dir(dir: &str) -> bool {
+    let dir = Path::new(dir.trim());
+    DISPATCHED_EVENTS.iter().all(|event| {
+        fs::read_to_string(dir.join(event)).is_ok_and(|text| text.lines().take(3).any(|l| l.trim() == THOR_HOOKS_MARK))
+    })
+}
+
+/// The line every THOR dispatcher carries near its top.
+const THOR_HOOKS_MARK: &str = "# Installed by THOR. This directory is git's machine-wide core.hooksPath, which";
+
 /// Git stores this path as written. The same directory can arrive with either
 /// slash on Windows, and a false "someone else owns this" would stop the
 /// installer for no reason.

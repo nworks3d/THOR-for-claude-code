@@ -55,7 +55,7 @@ fn hooks_name_this_memory_in(settings: &Path, db: &Path, app_data: &Path) -> boo
 
 fn hooks_name_memory_spelled(settings: &Path, spellings: &[std::path::PathBuf]) -> bool {
     let Ok(text) = std::fs::read_to_string(settings) else { return false };
-    let Ok(root) = serde_json::from_str::<serde_json::Value>(&text) else { return false };
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(thor_core::json_config::strip_bom(&text)) else { return false };
     let wanted: Vec<String> = spellings.iter().map(|s| folded(&s.display().to_string())).collect();
     let Some(events) = root.get("hooks").and_then(|h| h.as_object()) else { return false };
     events.values().filter_map(|groups| groups.as_array()).flatten().any(|group| {
@@ -73,7 +73,7 @@ fn hooks_name_memory_spelled(settings: &Path, spellings: &[std::path::PathBuf]) 
 /// program for this memory.
 fn tool_server_names_this_memory(mcp_json: &Path, db: &Path) -> bool {
     let Ok(text) = std::fs::read_to_string(mcp_json) else { return false };
-    let Ok(root) = serde_json::from_str::<serde_json::Value>(&text) else { return false };
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(thor_core::json_config::strip_bom(&text)) else { return false };
     let wanted: Vec<String> = thor_core::app_data::spellings(db).iter().map(|s| folded(&s.display().to_string())).collect();
     root.get("mcpServers")
         .and_then(|servers| servers.get("thor"))
@@ -1893,9 +1893,9 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool
                     false => "no evaluation report of this project counts (none on file passed THOR's check)".to_string(),
                 },
                 Some(valid) => format!(
-                    "{}, filed {} day(s) ago",
+                    "{}, filed {}",
                     valid_report_words(valid),
-                    serve::usefulness::days_ago(now, filed.unwrap_or(now))
+                    serve::usefulness::days_ago_words(now, filed.unwrap_or(now))
                 ),
             };
             out[0].push_str(&format!(" - {report_clause}"));
@@ -1917,7 +1917,7 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool
             } else {
                 let ask_clause = match state.first_asked_since_report {
                     Some(first) => {
-                        format!("asked {} time(s), the first {} day(s) ago", state.asked_count, serve::usefulness::days_ago(now, first))
+                        format!("asked {} time(s), the first {}", state.asked_count, serve::usefulness::days_ago_words(now, first))
                     }
                     None => "not asked yet".to_string(),
                 };
@@ -5539,7 +5539,7 @@ mod tests {
         let line = judgement_debt_line(&db, Some("thor"), false).expect("a real backlog, the line must speak");
         assert!(line.contains("no evaluation report of this project is on file yet"), "{line}");
         assert!(line.contains("no evaluation in the last 7 day(s)"), "{line}");
-        assert!(line.contains("asked 4 time(s), the first 2 day(s) ago"), "{line}");
+        assert!(line.contains("asked 4 time(s), the first 2 days ago"), "{line}");
         assert!(
             line.contains("the Stop hook blocks every turn once a session has accrued an hour of work here"),
             "{line}"
@@ -5614,7 +5614,7 @@ mod tests {
         let line = judgement_debt_line(&db, Some("thor"), false).expect("a real backlog, the line must speak");
         assert!(
             line.contains(&format!(
-                "newest evaluation report 'eval-thor-2026-09-14' (valid, filed by session {DOCTOR_EVALUATOR}), filed 0 day(s) ago"
+                "newest evaluation report 'eval-thor-2026-09-14' (valid, filed by session {DOCTOR_EVALUATOR}), filed today"
             )),
             "{line}"
         );

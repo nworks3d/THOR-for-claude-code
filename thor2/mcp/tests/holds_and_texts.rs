@@ -158,6 +158,48 @@ fn a_file_in_the_project_root_is_anchored_by_its_name_and_fires_however_the_path
     }
 }
 
+/// `revise` makes the same project-root test `remember` does: a text-only
+/// change of a note anchored to a file in the project's top folder, and a
+/// change that names that file as the new anchor, are both accepted; a name
+/// that is not a file there stays refused.
+#[test]
+fn revise_accepts_a_file_in_the_project_root_exactly_as_remember_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = store(dir.path(), &["demo"]);
+    let session = Session::with_store(dir.path(), db.clone(), WRITING_SESSION);
+    std::fs::write(session.cwd.join("main.py"), "print('hi')\n").unwrap();
+    register(&db, "demo", &session.cwd);
+    let mut mcp = session.mcp();
+    let stored = mcp.call(
+        "remember",
+        json!({
+            "id": "calc-root", "kind": "orientation", "project": "demo",
+            "targets": [{"kind": "path", "value": "main.py"}],
+            "text": "main.py holds the calculator functions; division is the next one to add.",
+            "falsifier": "main.py no longer holds the calculator functions.",
+        }),
+    );
+    assert!(stored.starts_with("stored"), "{stored}");
+    // A text-only change.
+    let text_only = mcp.call(
+        "revise",
+        json!({"id": "calc-root", "text": "main.py holds the calculator functions; division and modulo are the next ones to add."}),
+    );
+    assert!(!text_only.starts_with("REFUSED"), "a text-only revise must not trip over the anchor: {text_only}");
+    // A change that names the same file as its anchor again.
+    let rebound = mcp.call(
+        "revise",
+        json!({"id": "calc-root", "project": "demo", "targets": [{"kind": "path", "value": "./main.py"}], "because": "the anchor is spelled with a dot-slash now, still the same file"}),
+    );
+    assert!(!rebound.starts_with("REFUSED"), "the same file as the anchor: {rebound}");
+    // A bare name that is not a file there is still refused.
+    let missing = mcp.call(
+        "revise",
+        json!({"id": "calc-root", "project": "demo", "targets": [{"kind": "path", "value": "lib.py"}], "because": "this binding names a file that is not in the project folder"}),
+    );
+    assert!(missing.starts_with("REFUSED") && missing.contains("bare role name"), "{missing}");
+}
+
 fn set_read_only(path: &std::path::Path, on: bool) {
     let mut perms = std::fs::metadata(path).unwrap().permissions();
     #[allow(clippy::permissions_set_readonly_false)]

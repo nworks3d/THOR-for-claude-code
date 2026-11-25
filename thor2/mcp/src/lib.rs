@@ -2122,8 +2122,13 @@ fn replica_refusal_for_revise(store: &EventStore, args: &ReviseArgs) -> Result<(
         out
     };
     let (before, updated) = (normalized_item(&existing), unlabelled(&plan.updated));
-    model::gate::revise_refusals(&unlabelled(&plan.gate_existing), &before, &updated, args.because.as_deref(), true)
-        .map_err(|r| gate_refusal(r, store))
+    // The same project-root test `remember` makes, so a file at the top of the
+    // project's folder is as good an anchor here as there.
+    let root = model::store::project_root_for(store, updated.project.as_deref());
+    model::gate::with_project_root(root, || {
+        model::gate::revise_refusals(&unlabelled(&plan.gate_existing), &before, &updated, args.because.as_deref(), true)
+    })
+    .map_err(|r| gate_refusal(r, store))
 }
 
 /// The refusal for a pin the owner did not ask for in his own words (nothing was written).
@@ -3563,13 +3568,18 @@ impl ThorMcpServer {
             // clear must still read as the change it is.
             // ALL of them in one answer (step 27): the length, the weakening
             // and, once something else refuses, A4 too.
-            model::gate::revise_refusals(
-                &normalized_item(&gate_existing),
-                &normalized_item(&existing),
-                &normalized_item(&updated),
-                args.because.as_deref(),
-                false,
-            )
+            // The same project-root test `remember` makes (a file at the top of
+            // the project's folder is a precise anchor, not a bare role name).
+            let revise_root = model::store::project_root_for(s, updated.project.as_deref());
+            model::gate::with_project_root(revise_root, || {
+                model::gate::revise_refusals(
+                    &normalized_item(&gate_existing),
+                    &normalized_item(&existing),
+                    &normalized_item(&updated),
+                    args.because.as_deref(),
+                    false,
+                )
+            })
             .map_err(|r| gate_refusal(r, s))?;
             let mut disputes = disputes_of(&args.legitimate_calls, &args.may_change, &args.accept_refusing);
             // A reason of its own on a revise that names no dispute confirms

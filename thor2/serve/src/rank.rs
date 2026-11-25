@@ -386,7 +386,33 @@ pub fn select(candidates: &[LiveItem], input: &ServeInput) -> Vec<RankedItem> {
             })
             .then_with(|| a.id.cmp(&b.id)) // deterministic, never length
     });
+    // NO PLACE HOLDS MORE THAN THREE STARTER NOTES. A block shows four, so the
+    // owner's own first rule at a place always fits only if THOR's own starter
+    // notes leave one free. `git tag` is the case that found it: it is a commit
+    // moment AND the command the changelog-flow notes are bound to, so three
+    // flow notes and three commit notes met there and the fourth slot went to
+    // the commit notes. The first three (the ones anchored at the command come
+    // first) stay; the owner's own notes are never counted or cut.
+    let mut starters = 0;
+    hits.retain(|h| {
+        if !is_starter_note(&h.item) {
+            return true;
+        }
+        starters += 1;
+        starters <= MAX_STARTER_NOTES_PER_PLACE
+    });
     hits
+}
+
+/// The tag every starter note of the install carries (`ops::install`).
+pub const STARTER_TAG: &str = "workflow-starter";
+
+/// The most starter notes one place shows (`select`).
+pub const MAX_STARTER_NOTES_PER_PLACE: usize = 3;
+
+/// A starter note the install stored (not pinned to every conversation).
+fn is_starter_note(item: &Item) -> bool {
+    item.tags.iter().any(|t| t == STARTER_TAG) && !item.bindings.iter().any(|b| matches!(b, Binding::Always))
 }
 
 /// A warning about something that cannot be undone. Its own key in the
@@ -465,6 +491,30 @@ mod tests {
             dialect: Default::default(),
             routes: vec![],
         }
+    }
+
+    // ------------------------------------------------------ starter cap
+
+    /// Five starter notes and one of the owner's own meet at one moment: three
+    /// starter notes stay, the owner's note is never cut.
+    #[test]
+    fn a_place_shows_at_most_three_starter_notes_and_never_cuts_the_owners_own() {
+        let mut items: Vec<LiveItem> = (0..5)
+            .map(|n| {
+                let mut c = base(&format!("starter-{n}"), Kind::Rule);
+                c.item.tags = vec![STARTER_TAG.to_string()];
+                c
+            })
+            .collect();
+        items.push(base("owners-own", Kind::Rule));
+        let ids: Vec<String> = select(&items, &input_matching_base()).into_iter().map(|h| h.id).collect();
+        assert_eq!(ids.iter().filter(|id| id.starts_with("starter-")).count(), MAX_STARTER_NOTES_PER_PLACE, "{ids:?}");
+        assert!(ids.contains(&"owners-own".to_string()), "{ids:?}");
+        // A pinned starter note is session-start material and never counts here.
+        let mut pinned = base("starter-pinned", Kind::Rule);
+        pinned.item.tags = vec![STARTER_TAG.to_string()];
+        pinned.item.bindings = vec![Binding::Always];
+        assert!(!is_starter_note(&pinned.item));
     }
 
     // ------------------------------------------------------ project scope

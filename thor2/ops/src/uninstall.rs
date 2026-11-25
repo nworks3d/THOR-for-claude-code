@@ -124,7 +124,7 @@ fn read_json_object(path: &Path) -> anyhow::Result<Option<(String, Value)>> {
         return Ok(None);
     }
     let raw = std::fs::read_to_string(path)?;
-    let root: Value = serde_json::from_str(&raw)
+    let root: Value = serde_json::from_str(thor_core::json_config::strip_bom(&raw))
         .map_err(|e| anyhow::anyhow!("{} is not valid JSON ({e}) - refusing to touch it", path.display()))?;
     anyhow::ensure!(root.is_object(), "{} does not hold a JSON object at the top level - refusing to touch it", path.display());
     Ok(Some((raw, root)))
@@ -175,7 +175,8 @@ pub fn connected_memories(settings: &Path) -> anyhow::Result<Vec<String>> {
         for group in groups.as_array().into_iter().flatten() {
             for hook in group.get("hooks").and_then(Value::as_array).into_iter().flatten().filter(|h| is_thors_hook(h, None)) {
                 let Some(line) = hook_command_line(hook) else { continue };
-                let words = command_words(&line);
+                // The path as written, never the flattened (lowercased) spelling used to compare.
+                let words = crate::install::raw_command_words(&line);
                 if let Some(db) = words.windows(2).find(|pair| pair[0] == "--db").map(|pair| pair[1].clone()) {
                     if !found.iter().any(|f| flatten_word(f) == flatten_word(&db)) {
                         found.push(db);
@@ -248,13 +249,17 @@ fn remove_hooks(settings: &Path, connections_only: bool) -> anyhow::Result<usize
     if removed == 0 {
         return Ok(0);
     }
-    let text = serde_json::to_string_pretty(&root)? + "\n";
+    let text = thor_core::json_config::with_bom(
+        serde_json::to_string_pretty(&root)? + "\n",
+        raw.starts_with(thor_core::json_config::BOM),
+    );
     // The result must parse again before it replaces anything.
-    serde_json::from_str::<Value>(&text).map_err(|e| anyhow::anyhow!("the rewritten settings would not parse ({e}); nothing was changed"))?;
+    serde_json::from_str::<Value>(thor_core::json_config::strip_bom(&text))
+        .map_err(|e| anyhow::anyhow!("the rewritten settings would not parse ({e}); nothing was changed"))?;
     backup_once(settings, &raw)?;
     std::fs::write(settings, text)?;
     let after = std::fs::read_to_string(settings)?;
-    if serde_json::from_str::<Value>(&after).is_err() {
+    if serde_json::from_str::<Value>(thor_core::json_config::strip_bom(&after)).is_err() {
         std::fs::write(settings, raw)?;
         anyhow::bail!("the settings file did not parse after the change; the original was put back");
     }
@@ -278,8 +283,11 @@ pub fn remove_thor_tool_server(claude_json: &Path) -> anyhow::Result<bool> {
         return Ok(false);
     }
     root["mcpServers"].as_object_mut().expect("checked above").remove("thor");
-    let text = serde_json::to_string_pretty(&root)? + "\n";
-    serde_json::from_str::<Value>(&text)?;
+    let text = thor_core::json_config::with_bom(
+        serde_json::to_string_pretty(&root)? + "\n",
+        raw.starts_with(thor_core::json_config::BOM),
+    );
+    serde_json::from_str::<Value>(thor_core::json_config::strip_bom(&text))?;
     backup_once(claude_json, &raw)?;
     std::fs::write(claude_json, text)?;
     Ok(true)
@@ -289,7 +297,11 @@ pub fn remove_thor_tool_server(claude_json: &Path) -> anyhow::Result<bool> {
 pub fn hooks_path_is_thors(current: Option<&str>, db: &Path) -> bool {
     let Some(dir) = db.parent().map(|d| d.join("githooks")) else { return false };
     let ours = dir.to_string_lossy().replace('\\', "/");
-    decide_hooks_path(current, &ours) == HooksPathOutcome::AlreadyOurs
+    if decide_hooks_path(current, &ours) == HooksPathOutcome::AlreadyOurs {
+        return true;
+    }
+    // A hooks folder THOR made for another memory is THOR's too: it carries THOR's own header in every dispatcher.
+    current.map(str::trim).filter(|c| !c.is_empty()).is_some_and(crate::githooks::is_thor_made_hooks_dir)
 }
 
 /// Phase 1. Everything it removes is THOR's own; see the module comment.
@@ -417,11 +429,89 @@ impl PhaseTwoReport {
 /// person's safety copies, and the personal library (`library.db` and its
 /// sidecars), which is the person's own everyday knowledge and not part of the
 /// work memory; any other folder only loses the files named after the memory
-/// file.
+/// file, THOR's tidy-step files and THOR's own state files and folders
+/// (`THOR_SIDECAR_FILES`), never another file of the person's.
 /// THOR's own files of the tidy step beside the memory: who owns the step, the
 /// snapshot of loose files taken at the install, and the undo logs of tidy runs.
 fn is_tidy_sidecar(name: &str) -> bool {
     name == "order-owner.json" || name == "loose-snapshot.json" || crate::tidy::is_undo_log_name(name)
+}
+
+/// The state files THOR writes beside the memory, by name. In THOR's own data
+/// folder (`thor2`) everything goes with the memory anyway; in a folder the
+/// person named themselves, exactly these go and nothing else, so an
+/// uninstall removes what THOR made and never another file of theirs.
+const THOR_SIDECAR_FILES: &[&str] = &[
+    ".copy-evals.json",
+    ".stranded-captures.jsonl",
+    "absent-guard-blocked.json",
+    "absent-guard-command-blocked.json",
+    "absent-guard-stale.json",
+    "backup-state.json",
+    "capture-owed.json",
+    "changelog-flow-asked.json",
+    "changelog-flow.json",
+    "copy-eval.json",
+    "copy-telemetry.jsonl",
+    "crowding-debt-state.json",
+    "debt-holders.json",
+    "decay-notice.stamp",
+    "eval-command-names.txt",
+    "eval-debt-state.json",
+    "eval-routine-written.json",
+    "eval-turn-marks.json",
+    "evaluation-said-cursors.json",
+    "evaluation-sessions.json",
+    "guard-capture-mode.json",
+    "guard-capture-rulebook.json",
+    "guard-judge-config.json",
+    "guard-response-rulebook.json",
+    "guard-response-rulebook.json.off",
+    "hook-panics.json",
+    "info-notice-log.json",
+    "install-choices.json",
+    "leftover-scripts.json",
+    "leftover-scripts.lock",
+    "length-reminder-sessions.json",
+    "matcher-tried.json",
+    "next-turn-notes.json",
+    "no-project-ask-mode.json",
+    "order-waiting.json",
+    "real-calls-cursor.json",
+    "real-calls.jsonl",
+    "real-replies.jsonl",
+    "session-last-seen.json",
+    "session-watermark.json",
+    "stale-guard-blocked.json",
+    "stale-guard-held.json",
+    "stale-guard-mode.json",
+    "stop-budget-skips.json",
+    "sweep-state.json",
+    "sync-ship-state.json",
+    "sync-ship-target.json",
+    "thor-bug-candidates.json",
+    "thor-copy.json",
+    "thor-mode.json",
+    "tool-server-builds.json",
+    "tools-overview-cache.json",
+    "turn-violations.json",
+    "unpin-owner-go.json",
+    "volume-log.jsonl",
+    "work-folders.json",
+];
+
+/// THOR's own sub-folders beside the memory: the code index, the saved copies
+/// of the /thor-eval command, and the git helper folder (only when it really is
+/// THOR's).
+fn is_thor_sidecar(path: &Path, name: &str) -> bool {
+    if THOR_SIDECAR_FILES.iter().any(|f| f.eq_ignore_ascii_case(name)) {
+        return path.is_file();
+    }
+    match name {
+        "codeindex" | "eval-routine-backups" => path.is_dir(),
+        "githooks" => path.is_dir() && crate::githooks::is_thor_made_hooks_dir(&path.display().to_string()),
+        _ => false,
+    }
 }
 
 fn memory_entries(db: &Path) -> Vec<PathBuf> {
@@ -437,7 +527,7 @@ fn memory_entries(db: &Path) -> Vec<PathBuf> {
             if own_folder {
                 name != "backup-repo" && !name.starts_with("library.db")
             } else {
-                name.starts_with(&stem) || is_tidy_sidecar(&name)
+                name.starts_with(&stem) || is_tidy_sidecar(&name) || is_thor_sidecar(p, &name)
             }
         })
         .collect()
@@ -732,6 +822,82 @@ mod tests {
         assert!(data.join("tidy-plan-for-friday.json").exists(), "only THOR's exact undo log name goes, not any tidy-*.json");
         assert!(crate::tidy::is_undo_log_name("tidy-2026-11-19-12.json") && crate::tidy::is_undo_log_name("tidy-2026-11-19-1.undone.json"));
         assert!(!crate::tidy::is_undo_log_name("tidy-plan.json") && !crate::tidy::is_undo_log_name("tidy-2026-11-19-x.json") && !crate::tidy::is_undo_log_name("tidy-26-11-19-1.json"));
+    }
+
+    /// A memory in a folder the person named leaves nothing of THOR's behind:
+    /// its state files and folders go with it (they did not, and seven stayed),
+    /// while another file of theirs, or a folder that only has THOR's name, stays.
+    #[test]
+    fn phase_two_deletes_thors_state_files_in_a_folder_not_named_thor2_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("elsewhere");
+        std::fs::create_dir_all(data.join("codeindex")).unwrap();
+        std::fs::create_dir_all(data.join("eval-routine-backups")).unwrap();
+        std::fs::create_dir_all(data.join("githooks")).unwrap();
+        std::fs::create_dir_all(data.join("mine")).unwrap();
+        std::fs::write(data.join("githooks").join("post-commit"), "#!/bin/sh\necho theirs\n").unwrap();
+        std::fs::write(data.join("new.db"), b"memory").unwrap();
+        for file in ["eval-routine-written.json", "guard-response-rulebook.json", "thor-bug-candidates.json", "thor-mode.json", "work-folders.json"] {
+            std::fs::write(data.join(file), b"{}").unwrap();
+        }
+        std::fs::write(data.join("notes.txt"), b"mine").unwrap();
+        std::fs::write(dir.path().join("settings.json"), "{}").unwrap();
+        let t = Targets { settings: dir.path().join("settings.json"), claude_json: dir.path().join(".claude.json"), eval_command: None, db: data.join("new.db") };
+        let none = FakeProcesses(RefCell::new(vec![]));
+        phase_two(&t, dir.path(), true, &none).unwrap();
+        for gone in ["new.db", "codeindex", "eval-routine-backups", "eval-routine-written.json", "guard-response-rulebook.json", "thor-bug-candidates.json", "thor-mode.json", "work-folders.json"] {
+            assert!(!data.join(gone).exists(), "{gone} is THOR's and goes");
+        }
+        assert!(data.join("notes.txt").exists() && data.join("mine").exists(), "what is not THOR's stays");
+        assert!(data.join("githooks").exists(), "a githooks folder that is not THOR's (no THOR header) stays");
+    }
+
+    /// git's hooks folder that THOR made for ANOTHER memory is THOR's too and is
+    /// cleared; one somebody else made, or a missing one, never is.
+    #[test]
+    fn a_hooks_folder_thor_made_for_another_memory_is_recognised_and_nothing_else_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = dir.path().join("other").join("githooks");
+        crate::githooks::install_git_hooks(&other, "codeindex", "index").unwrap();
+        let theirs = dir.path().join("theirs");
+        std::fs::create_dir_all(&theirs).unwrap();
+        std::fs::write(theirs.join("pre-commit"), "#!/bin/sh\necho theirs\n").unwrap();
+        let db = dir.path().join("mine").join("thor.db");
+        assert!(hooks_path_is_thors(Some(&other.display().to_string()), &db), "another memory's THOR folder");
+        assert!(!hooks_path_is_thors(Some(&theirs.display().to_string()), &db), "somebody else's folder");
+        assert!(!hooks_path_is_thors(Some(&dir.path().join("gone").display().to_string()), &db), "a folder that is not there");
+        // A folder that has one THOR dispatcher but not all is not trusted.
+        std::fs::remove_file(other.join("pre-push")).unwrap();
+        assert!(!hooks_path_is_thors(Some(&other.display().to_string()), &db));
+    }
+
+    /// The other memory is named as it was written, never in lower case.
+    #[test]
+    fn the_connected_memory_is_shown_as_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("settings.json");
+        let written = "C:\\Users\\Someone\\AppData\\Local\\Thor2\\Thor.db";
+        let hook = json!({"type": "command", "command": "C:\\thor2\\serve.exe", "args": ["--db", written, "hook"]});
+        std::fs::write(&settings, json!({"hooks": {"Stop": [{"hooks": [hook]}]}}).to_string()).unwrap();
+        assert_eq!(connected_memories(&settings).unwrap(), vec![written.to_string()]);
+    }
+
+    /// A settings file that starts with a byte order mark is read, the hooks are
+    /// removed, and the mark is still there.
+    #[test]
+    fn a_byte_order_mark_is_read_and_kept_when_the_hooks_are_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = targets(dir.path());
+        let settings = json!({"theme": "dark", "hooks": {"Stop": [shell_thor(), foreign_exec()]}});
+        std::fs::write(&t.settings, format!("\u{feff}{}", serde_json::to_string_pretty(&settings).unwrap())).unwrap();
+        let git = FakeGit { current: None, unset_called: Cell::new(false) };
+        let report = phase_one(&t, &git).unwrap();
+        assert_eq!(report.hooks_removed, 1);
+        let bytes = std::fs::read(&t.settings).unwrap();
+        assert_eq!(&bytes[..3], &[0xEF, 0xBB, 0xBF]);
+        let now: Value = serde_json::from_str(String::from_utf8(bytes).unwrap().trim_start_matches('\u{feff}')).unwrap();
+        assert_eq!(now["hooks"]["Stop"], json!([foreign_exec()]));
+        assert_eq!(now["theme"], json!("dark"));
     }
 
     #[test]

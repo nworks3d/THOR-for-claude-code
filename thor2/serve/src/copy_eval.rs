@@ -281,7 +281,7 @@ pub fn connector_configured(db: &Path) -> bool {
 
 /// `connector_configured`, for one Claude Code config file.
 pub fn connector_in(claude_json: &Path) -> bool {
-    let Some(root) = std::fs::read_to_string(claude_json).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()) else { return false };
+    let Some(root) = std::fs::read_to_string(claude_json).ok().and_then(|t| serde_json::from_str::<Value>(thor_core::json_config::strip_bom(&t)).ok()) else { return false };
     root.get("mcpServers")
         .and_then(|servers| servers.get("thor"))
         .and_then(|server| server.get("url"))

@@ -676,6 +676,68 @@ fn stale_thor_command(group: &Value, exe: &str) -> Option<String> {
     None
 }
 
+/// Whether command words are THOR's serve program ending in `hook`.
+fn words_are_serve_hook(words: &[String]) -> bool {
+    let stem = words.first().and_then(|w| Path::new(w).file_stem()).and_then(|s| s.to_str()).unwrap_or_default();
+    stem.eq_ignore_ascii_case("serve") && words.last().is_some_and(|w| w == "hook")
+}
+
+/// Whether one hook entry is THOR's own serve hook, wherever it points.
+fn is_serve_hook_entry(hook: &Value) -> bool {
+    hook_words(hook).is_some_and(|words| words_are_serve_hook(&words))
+}
+
+/// The command line of a hook entry, for the report of what was replaced.
+fn hook_line(hook: &Value) -> String {
+    let command = hook.get("command").and_then(Value::as_str).unwrap_or_default();
+    match hook.get("args").and_then(Value::as_array) {
+        Some(args) => std::iter::once(command).chain(args.iter().filter_map(Value::as_str)).collect::<Vec<_>>().join(" "),
+        None => command.to_string(),
+    }
+}
+
+/// Write `spec` into the first of THOR's serve hooks in `array` (keeping its
+/// group and matcher) and take every other serve hook of THOR's out. Returns the
+/// command line that was replaced, or `None` when there was none.
+fn repoint_serve_hook(array: &mut Vec<Value>, spec: &HookSpec, exec: bool) -> Option<String> {
+    let mut old = None;
+    for group in array.iter_mut() {
+        let Some(hooks) = group.get_mut("hooks").and_then(Value::as_array_mut) else { continue };
+        if let Some(hook) = hooks.iter_mut().find(|h| is_serve_hook_entry(h)) {
+            old = Some(hook_line(hook));
+            write_spec(hook, spec, exec);
+            break;
+        }
+    }
+    let old = old?;
+    remove_other_serve_hooks(array, &command_words(&spec.command));
+    Some(old)
+}
+
+/// Remove THOR's serve hooks whose words differ from `keep`, and a group that
+/// held only those. A group with anything else keeps it. Returns the command
+/// lines that went.
+fn remove_other_serve_hooks(array: &mut Vec<Value>, keep: &[String]) -> Vec<String> {
+    let mut removed = Vec::new();
+    for group in array.iter_mut() {
+        let Some(hooks) = group.get_mut("hooks").and_then(Value::as_array_mut) else { continue };
+        let before = hooks.len();
+        hooks.retain(|h| {
+            let other = is_serve_hook_entry(h) && hook_words(h).is_some_and(|words| words != keep);
+            if other {
+                removed.push(hook_line(h));
+            }
+            !other
+        });
+        // Only a group this removal emptied goes; a group somebody left empty stays.
+        if hooks.len() < before && hooks.is_empty() {
+            group["hooks"] = Value::Null;
+        }
+    }
+    array.retain(|g| !g.get("hooks").is_some_and(Value::is_null));
+    removed
+}
+
 #[derive(Debug, Clone)]
 pub struct InstallReport {
     pub results: Vec<(String, HookOutcome)>,
@@ -726,7 +788,7 @@ pub(crate) fn command_words(command: &str) -> Vec<String> {
 
 /// `command_words` without the path flattening: the words exactly as written,
 /// quotes removed. Exec form needs them this way (a program and its arguments).
-fn raw_command_words(command: &str) -> Vec<String> {
+pub(crate) fn raw_command_words(command: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut current = String::new();
     let mut in_word = false;
@@ -867,7 +929,9 @@ pub fn install_hooks(path: &Path, specs: &[HookSpec]) -> anyhow::Result<InstallR
 /// is true (outcome `Upgraded`); a hook that is not ours is never touched.
 pub fn install_hooks_as(path: &Path, specs: &[HookSpec], exec: bool) -> anyhow::Result<InstallReport> {
     let existed = path.exists();
-    let raw = if existed { fs::read_to_string(path)? } else { "{}".to_string() };
+    let original = if existed { fs::read_to_string(path)? } else { "{}".to_string() };
+    let had_bom = original.starts_with(thor_core::json_config::BOM);
+    let raw = thor_core::json_config::strip_bom(&original).to_string();
 
     let mut root: Value = serde_json::from_str(&raw).map_err(|e| {
         anyhow::anyhow!(
@@ -903,7 +967,7 @@ pub fn install_hooks_as(path: &Path, specs: &[HookSpec], exec: bool) -> anyhow::
     }
 
     let backup_path = if existed {
-        Some(backup_once(path, &raw)?)
+        Some(backup_once(path, &original)?)
     } else {
         None
     };
@@ -933,9 +997,31 @@ pub fn install_hooks_as(path: &Path, specs: &[HookSpec], exec: bool) -> anyhow::
                     }
                 }
             }
-            let outcome = if upgraded { HookOutcome::Upgraded } else { HookOutcome::AlreadyPresent };
+            // Another set of THOR's own serve hooks (another program folder or
+            // another memory) beside this one is taken out: one THOR per account.
+            let removed = if words_are_serve_hook(&wanted) { remove_other_serve_hooks(array, &wanted) } else { Vec::new() };
+            let outcome = if !removed.is_empty() {
+                replaced.extend(removed);
+                HookOutcome::Replaced
+            } else if upgraded {
+                HookOutcome::Upgraded
+            } else {
+                HookOutcome::AlreadyPresent
+            };
             results.push((spec.event.to_string(), outcome));
             continue;
+        }
+
+        // One of THOR's own serve hooks that points somewhere else (another
+        // program folder, another memory, a program that is gone) is repointed
+        // here, never left beside a second one. Recognised by the serve program
+        // and `hook` as its last word, wherever it points.
+        if words_are_serve_hook(&command_words(&spec.command)) {
+            if let Some(old) = repoint_serve_hook(array, spec, exec) {
+                replaced.push(old);
+                results.push((spec.event.to_string(), HookOutcome::Replaced));
+                continue;
+            }
         }
 
         // Before appending, look for one of OURS that has gone stale: same
@@ -970,7 +1056,7 @@ pub fn install_hooks_as(path: &Path, specs: &[HookSpec], exec: bool) -> anyhow::
     }
 
     let pretty = serde_json::to_string_pretty(&root)?;
-    fs::write(path, pretty + "\n")?;
+    fs::write(path, thor_core::json_config::with_bom(pretty + "\n", had_bom))?;
 
     Ok(InstallReport { results, backup_path, replaced })
 }
@@ -1749,10 +1835,72 @@ pub const HELPERS_OFF_REASON: &str = "The owner switched helper-agent mode off (
 /// story (created, retracted, created, resolved) and `history` walks it; the id
 /// is live again with ONE head, and a later `off` retracts it as before.
 pub fn set_helpers(db: &Path, on: bool) -> anyhow::Result<Vec<(String, HelperChange)>> {
-    use model::store::{declare, resolve, retract, show, ReadError};
+    let items: Vec<_> = helper_mode_notes().into_iter().chain(helper_contract_notes()).collect();
+    switch_notes(db, &items, on, HELPERS_OFF_REASON, false)
+}
+
+/// The retraction reason `set_starter_rules(off)` records.
+pub const STARTER_RULES_OFF_REASON: &str = "The owner switched the starter work rules off (install --set-starter-rules off); install --set-starter-rules on stores them again.";
+
+/// The notes of the starting set that are plain work and honesty habits, not
+/// something THOR needs to work: they are pinned at every session start, so
+/// they are the weight a person who refuses all work rules would still carry.
+/// `install --set-starter-rules off` retracts them with the moment-bound pack.
+pub const STARTER_HABIT_CONTRACT_NOTES: &[&str] = &[
+    "say-what-actually-happened",
+    "never-fabricate-a-measured-value",
+    "count-coverage-never-claim-it",
+    "verify-against-the-real-source",
+    "never-verify-with-the-changed-mechanism",
+    "never-block-a-turn-on-a-notification",
+    "reason-every-fix-for-a-new-user",
+];
+
+/// What `install --set-starter-rules` switches: the work-habit notes of the
+/// workflow pack, and the seven pinned habit notes of the starting set
+/// (`STARTER_HABIT_CONTRACT_NOTES`).
+///
+/// NEVER SWITCHED: the notes THOR itself needs (the rest of the starting set:
+/// how to write a note that comes back, the two memories, the refusal and the
+/// proof notes, how to treat a served fact; and the setup notes), the helper
+/// notes (their own switch, `--set-helpers`), the changelog notes (their own
+/// switch, `--set-changelog-flow`), and the two notes that carry the
+/// subject-folder offer (`files-go-in-the-folder-of-their-subject` and
+/// `off-topic-work-gets-its-own-session`), which are how a new person gets a
+/// folder of their own.
+pub fn starter_rule_notes() -> Vec<model::item::Item> {
+    let pack = workflow_starter_pack().into_iter().filter(|n| {
+        n.id != FILES_IN_SUBJECT_FOLDER_NOTE_ID
+            && n.id != OFF_TOPIC_NOTE_ID
+            && !n.tags.iter().any(|t| t == serve::changelog_flow::TAG)
+    });
+    let habits = working_contract().into_iter().filter(|n| STARTER_HABIT_CONTRACT_NOTES.contains(&n.id.as_str()));
+    pack.chain(habits).collect()
+}
+
+/// `install --set-starter-rules on|off`: store or retract the starter work
+/// rules (`starter_rule_notes`) and nothing else. Both directions are
+/// idempotent. `off` is the owner's own switch, so a note whose refusing check
+/// bites (the two Windows notes about hidden console windows) goes with it in
+/// one call, as on the owner's own words.
+pub fn set_starter_rules(db: &Path, on: bool) -> anyhow::Result<Vec<(String, HelperChange)>> {
+    switch_notes(db, &starter_rule_notes(), on, STARTER_RULES_OFF_REASON, true)
+}
+
+/// Store (`on`) or retract (`off`) `items` by id, in the installer's own name,
+/// and report what happened to each. Shared by the helper switch and the
+/// starter-rules switch; see `set_helpers` for how a retracted id comes back.
+fn switch_notes(
+    db: &Path,
+    items: &[model::item::Item],
+    on: bool,
+    off_reason: &str,
+    owner_words: bool,
+) -> anyhow::Result<Vec<(String, HelperChange)>> {
+    use model::store::{declare, resolve, retract, retract_on_owner_words, show, ReadError};
     let mut store = EventStore::open_existing(db)?;
     let mut out = Vec::new();
-    for item in helper_mode_notes().into_iter().chain(helper_contract_notes()) {
+    for item in items {
         let id = item.id.clone();
         let state = show(&store, &id);
         let change = match (on, state) {
@@ -1777,10 +1925,17 @@ pub fn set_helpers(db: &Path, on: bool) -> anyhow::Result<Vec<(String, HelperCha
                 Err(e) => HelperChange::Refused(e.to_string()),
             },
             (true, Err(e)) => HelperChange::Refused(e.to_string()),
-            (false, Ok(_)) => match retract(&mut store, "install", "install", installer(), &id, HELPERS_OFF_REASON, None) {
-                Ok(_) => HelperChange::Retracted,
-                Err(e) => HelperChange::Refused(e.to_string()),
-            },
+            (false, Ok(_)) => {
+                let done = if owner_words {
+                    retract_on_owner_words(&mut store, "install", "install", installer(), &id, off_reason, None)
+                } else {
+                    retract(&mut store, "install", "install", installer(), &id, off_reason, None)
+                };
+                match done {
+                    Ok(_) => HelperChange::Retracted,
+                    Err(e) => HelperChange::Refused(e.to_string()),
+                }
+            }
             (false, Err(ReadError::NotFound(_) | ReadError::Retracted(_))) => HelperChange::AlreadyOff,
             (false, Err(e)) => HelperChange::Refused(e.to_string()),
         };
@@ -1912,7 +2067,9 @@ pub fn install_tool_server(
     args: &[String],
 ) -> anyhow::Result<ServerReport> {
     let existed = path.exists();
-    let raw = if existed { fs::read_to_string(path)? } else { "{}".to_string() };
+    let original = if existed { fs::read_to_string(path)? } else { "{}".to_string() };
+    let had_bom = original.starts_with(thor_core::json_config::BOM);
+    let raw = thor_core::json_config::strip_bom(&original).to_string();
 
     let mut root: Value = serde_json::from_str(&raw).map_err(|e| {
         anyhow::anyhow!(
@@ -1956,7 +2113,7 @@ pub fn install_tool_server(
     }
 
     let backup_path = if existed {
-        Some(backup_once(path, &raw)?)
+        Some(backup_once(path, &original)?)
     } else {
         None
     };
@@ -1967,7 +2124,7 @@ pub fn install_tool_server(
         .insert(name.to_string(), entry);
 
     let pretty = serde_json::to_string_pretty(&root)?;
-    fs::write(path, pretty + "\n")?;
+    fs::write(path, thor_core::json_config::with_bom(pretty + "\n", had_bom))?;
 
     let replaced = previous
         .as_ref()
@@ -2724,29 +2881,113 @@ mod tests {
         }
     }
 
-    /// The other side of the same rule: the comparison flattens spelling and
-    /// nothing else. Another store, another program, another flag is a
-    /// different hook and still gets its own entry.
+    /// THOR's own serve hooks are recognised by the serve program and `hook`,
+    /// wherever they point: a reinstall from another program folder, or for
+    /// another memory, REPLACES them, never adds a second set. Another
+    /// program (not serve) or another flag is somebody else's and is left.
     #[test]
-    fn a_genuinely_different_store_or_program_is_still_a_different_hook() {
+    fn a_reinstall_from_another_program_folder_or_store_replaces_thors_own_hooks() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
-        // A real serve.exe on disk, so the installer's "binary is gone" repair
-        // (stale_thor_command) stays out of this question.
-        let exe = dir.path().join("serve.exe");
-        fs::write(&exe, b"x").unwrap();
-        let exe = exe.display().to_string();
-        let exe_slashes = exe.replace('\\', "/");
-        install_hooks(&path, &standard_hooks(&exe, "C:\\thor2\\thor.db")).unwrap();
+        // Real programs on disk, so the "binary is gone" repair stays out of this question.
+        let first = dir.path().join("one");
+        let second = dir.path().join("two");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        for folder in [&first, &second] {
+            fs::write(folder.join("serve.exe"), b"x").unwrap();
+        }
+        let foreign = json!({"hooks": [{"type": "command", "command": "node", "args": ["guard.js", "hook"]}]});
+        fs::write(&path, serde_json::to_string_pretty(&json!({"hooks": {"Stop": [foreign.clone()]}})).unwrap()).unwrap();
+        let exe_one = first.join("serve.exe").display().to_string();
+        let exe_two = second.join("serve.exe").display().to_string();
+        install_hooks_as(&path, &standard_hooks(&exe_one, "C:\\thor2\\thor.db"), true).unwrap();
 
-        let other_store = install_hooks(&path, &standard_hooks(&exe_slashes, "C:/other/thor.db")).unwrap();
-        assert!(other_store.results.iter().all(|(_, o)| *o == HookOutcome::Added), "{:?}", other_store.results);
+        // Another program folder, same memory.
+        let moved = install_hooks_as(&path, &standard_hooks(&exe_two, "C:\\thor2\\thor.db"), true).unwrap();
+        assert!(moved.results.iter().all(|(_, o)| *o == HookOutcome::Replaced), "{:?}", moved.results);
+        assert_eq!(moved.replaced.len(), 4, "each replaced entry is reported: {:?}", moved.replaced);
+        // And another memory from yet the first folder again.
+        let other_store = install_hooks_as(&path, &standard_hooks(&exe_one, "C:/other/thor.db"), true).unwrap();
+        assert!(other_store.results.iter().all(|(_, o)| *o == HookOutcome::Replaced), "{:?}", other_store.results);
 
-        let other_exe = install_hooks(&path, &standard_hooks("C:/thor2/bin/other.exe", "C:/thor2/thor.db")).unwrap();
-        assert!(other_exe.results.iter().all(|(_, o)| *o == HookOutcome::Added), "{:?}", other_exe.results);
+        let now: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        for event in ["SessionStart", "PreToolUse", "UserPromptSubmit", "Stop"] {
+            let serve_hooks = now["hooks"][event]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|g| g["hooks"].as_array().unwrap().iter())
+                .filter(|h| is_serve_hook_entry(h))
+                .count();
+            assert_eq!(serve_hooks, 1, "{event} holds exactly one set of THOR's serve hooks: {now}");
+        }
+        assert_eq!(now["hooks"]["Stop"][0], foreign, "somebody else's hook is untouched");
+        assert_eq!(now["hooks"]["SessionStart"][0]["hooks"][0]["args"][1], json!("C:/other/thor.db"));
+
+        // Running the same install again changes nothing.
+        let again = install_hooks_as(&path, &standard_hooks(&exe_one, "C:/other/thor.db"), true).unwrap();
+        assert!(again.results.iter().all(|(_, o)| *o == HookOutcome::AlreadyPresent), "{:?}", again.results);
+
+        // Two copies of THOR's own hook that were already there (an older
+        // install) collapse into the one this install writes.
+        let mut twice: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let extra = twice["hooks"]["Stop"][1].clone();
+        twice["hooks"]["Stop"].as_array_mut().unwrap().push(json!({"hooks": [{"type": "command", "command": exe_two, "args": ["--db", "C:/old/thor.db", "hook"]}]}));
+        assert_ne!(extra, Value::Null);
+        fs::write(&path, serde_json::to_string_pretty(&twice).unwrap()).unwrap();
+        let collapsed = install_hooks_as(&path, &standard_hooks(&exe_one, "C:/other/thor.db"), true).unwrap();
+        assert!(collapsed.results.iter().any(|(e, o)| e == "Stop" && *o == HookOutcome::Replaced), "{:?}", collapsed.results);
+        let after: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(after["hooks"]["Stop"].as_array().unwrap().len(), 2, "the foreign hook and one of ours: {after}");
 
         assert!(!same_spelling("\"a.exe\" --db \"b.db\" hook", "\"a.exe\" --db \"b.db\" hook --extra"));
         assert!(!same_spelling("\"C:\\a b\\x.exe\" hook", "\"C:\\a\" \"b\\x.exe\" hook"));
+        // Another program is not THOR's serve hook.
+        assert!(!is_serve_hook_entry(&json!({"type": "command", "command": "C:/thor2/bin/other.exe", "args": ["--db", "x", "hook"]})));
+    }
+
+    /// A settings file that starts with a UTF-8 byte order mark (an editor, or
+    /// Windows PowerShell 5.1's Set-Content -Encoding UTF8, writes one) is read,
+    /// and written back WITH it, the foreign content unchanged.
+    #[test]
+    fn a_settings_file_with_a_byte_order_mark_is_read_and_keeps_its_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let start = serde_json::to_string_pretty(&json!({"theme": "dark", "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "other"}]}]}})).unwrap();
+        fs::write(&path, format!("\u{feff}{start}\n")).unwrap();
+        install_hooks(&path, &specs()).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(&bytes[..3], &[0xEF, 0xBB, 0xBF], "the byte order mark is kept");
+        let text = String::from_utf8(bytes).unwrap();
+        let now: Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).unwrap();
+        assert_eq!(now["theme"], json!("dark"));
+        assert_eq!(now["hooks"]["Stop"][0]["hooks"][0]["command"], json!("other"));
+        assert_eq!(now["hooks"]["Stop"].as_array().unwrap().len(), 2);
+        // The saved copy is the file exactly as it was, mark included.
+        assert!(fs::read(dir.path().join("settings.json.bak")).unwrap().starts_with(&[0xEF, 0xBB, 0xBF]));
+        // A second run changes nothing, byte for byte.
+        let before = fs::read(&path).unwrap();
+        install_hooks(&path, &specs()).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), before);
+        // A file without a mark gets none.
+        let plain = dir.path().join("plain.json");
+        fs::write(&plain, "{}").unwrap();
+        install_hooks(&plain, &specs()).unwrap();
+        assert!(!fs::read(&plain).unwrap().starts_with(&[0xEF, 0xBB, 0xBF]));
+    }
+
+    #[test]
+    fn a_tool_server_file_with_a_byte_order_mark_keeps_its_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".claude.json");
+        fs::write(&path, "\u{feff}{\"userID\": \"u\"}").unwrap();
+        install_tool_server(&path, "thor", "C:/thor2/bin/mcp.exe", &server_args("C:/thor2/thor.db")).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(&bytes[..3], &[0xEF, 0xBB, 0xBF]);
+        let now: Value = serde_json::from_str(String::from_utf8(bytes).unwrap().trim_start_matches('\u{feff}')).unwrap();
+        assert_eq!(now["userID"], json!("u"));
+        assert!(now["mcpServers"]["thor"].is_object());
     }
 
     /// The tool server entry in the user's `.claude.json` gets the same
@@ -2927,11 +3168,11 @@ mod tests {
         assert!(!format!("{groups:?}").contains("gone"), "the dead path must be gone: {groups:?}");
     }
 
-    /// The other half, and the reason this is narrow: somebody running two
-    /// stores on purpose must not silently lose one. A hook whose binary is
-    /// still THERE is left exactly as it is.
+    /// One THOR per account: a hook of ours whose binary still EXISTS but
+    /// points at another memory is replaced too, never left beside a second
+    /// set. Recognised by the serve program and `hook`, wherever it points.
     #[test]
-    fn a_hook_whose_binary_still_exists_is_left_alone() {
+    fn a_hook_of_ours_whose_binary_still_exists_is_replaced_not_duplicated() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         let other_exe = dir.path().join("serve.exe");
@@ -2949,13 +3190,13 @@ mod tests {
         let specs = standard_hooks(&other_exe.display().to_string(), "C:\\mine\\thor.db");
         let report = install_hooks(&path, &specs).unwrap();
 
-        assert_eq!(report.results.iter().find(|(e, _)| e == "SessionStart").unwrap().1, HookOutcome::Added);
-        assert!(report.replaced.is_empty(), "nothing was dead, so nothing may be replaced");
+        assert_eq!(report.results.iter().find(|(e, _)| e == "SessionStart").unwrap().1, HookOutcome::Replaced);
+        assert_eq!(report.replaced.len(), 1, "the older hook is reported: {:?}", report.replaced);
         let written: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
             written["hooks"]["SessionStart"].as_array().unwrap().len(),
-            2,
-            "both stores keep their own hook"
+            1,
+            "one set only, pointing at this memory"
         );
     }
 
@@ -3576,6 +3817,52 @@ mod tests {
         // Every note about helper assistants: the two of helper-agent mode and three of the starting set.
         assert_eq!(off.len(), 5);
         assert!(off.iter().all(|(_, change)| matches!(change, HelperChange::Retracted)), "{off:?}");
+    }
+
+    /// `install --set-starter-rules off` retracts the work-habit notes and
+    /// only those: the notes THOR needs, the helper notes, the changelog notes
+    /// and the two notes that offer a folder for a subject all stay. `on`
+    /// stores them again and a second run of either changes nothing.
+    #[test]
+    fn set_starter_rules_switches_the_work_habits_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        ensure_and_seed_store(&db).unwrap();
+        let live = |id: &str| model::store::show(&EventStore::open_read_only(&db).unwrap(), id).is_ok();
+        let habits = starter_rule_notes();
+        assert!(habits.len() >= 20, "about twenty notes are switched: {}", habits.len());
+        assert!(habits.iter().all(|n| live(&n.id)), "all of them are live in a new memory");
+
+        let off = set_starter_rules(&db, false).unwrap();
+        assert_eq!(off.len(), habits.len());
+        assert!(off.iter().all(|(_, c)| matches!(c, HelperChange::Retracted)), "{off:?}");
+        assert!(habits.iter().all(|n| !live(&n.id)));
+        // What stays.
+        let kept: Vec<String> = working_contract()
+            .into_iter()
+            .map(|n| n.id)
+            .filter(|id| !STARTER_HABIT_CONTRACT_NOTES.contains(&id.as_str()) && !crate::questionnaire::HELPER_CONTRACT_NOTES.contains(&id.as_str()))
+            .chain(helper_mode_notes().into_iter().map(|n| n.id))
+            .chain(crate::questionnaire::HELPER_CONTRACT_NOTES.iter().map(|s| s.to_string()))
+            .chain(changelog_flow_notes().into_iter().map(|n| n.id))
+            .chain([OFF_TOPIC_NOTE_ID.to_string(), FILES_IN_SUBJECT_FOLDER_NOTE_ID.to_string(), changelog_commit_note().id])
+            .collect();
+        for id in &kept {
+            assert!(live(id), "{id} is not a work habit and stays");
+        }
+        for id in ["anchor-what-the-fact-is-about", "words-inform-a-proof-forbids", model::store::SETUP_NOTE_ID] {
+            assert!(live(id), "{id} is something THOR needs and stays");
+        }
+
+        // A second run changes nothing.
+        let again = set_starter_rules(&db, false).unwrap();
+        assert!(again.iter().all(|(_, c)| matches!(c, HelperChange::AlreadyOff)), "{again:?}");
+        // On stores them again, once.
+        let on = set_starter_rules(&db, true).unwrap();
+        assert!(on.iter().all(|(_, c)| matches!(c, HelperChange::Restored)), "{on:?}");
+        assert!(habits.iter().all(|n| live(&n.id)));
+        let twice = set_starter_rules(&db, true).unwrap();
+        assert!(twice.iter().all(|(_, c)| matches!(c, HelperChange::AlreadyOn)), "{twice:?}");
     }
 
     /// A starter note that carries a refusing check is removed in two steps,

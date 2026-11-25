@@ -8,6 +8,7 @@ pub mod backup;
 pub mod ledger;
 pub mod app_data;
 pub mod copy_mode;
+pub mod json_config;
 
 /// True when `arg` is either spelling of the version flag. THE GAP THIS
 /// CLOSES: verified 2026-09-08 by grepping every binary in the workspace for

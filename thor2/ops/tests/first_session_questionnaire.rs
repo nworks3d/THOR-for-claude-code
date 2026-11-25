@@ -311,6 +311,24 @@ fn every_install_flag_the_list_names_exists_in_the_installer() {
     assert!(named >= 6, "the list names its commands: {named}");
 }
 
+/// A person who refuses every work rule has one switch for all of them (item 5),
+/// and the list says exactly which notes it touches and which it leaves.
+#[test]
+fn item_five_has_one_switch_for_all_the_work_rules() {
+    let q = questionnaire::questions().into_iter().find(|q| q.n == 5).unwrap();
+    assert!(q.say_no.contains("install --set-starter-rules off --db <store>"), "{}", q.say_no);
+    assert!(q.say_no.contains("install --set-starter-rules on --db <store>"), "{}", q.say_no);
+    for id in ops::install::STARTER_HABIT_CONTRACT_NOTES {
+        assert!(q.say_no.contains(id), "item 5 must name the habit note {id}");
+    }
+    assert!(q.say_no.contains("the notes THOR itself needs") && q.say_no.contains("the helper notes"), "{}", q.say_no);
+    assert!(questionnaire::ASSISTANT_RULES.contains("install --set-starter-rules off --db <store>"));
+    // Every note the switch touches exists, and none of them is a note of another switch.
+    for note in ops::install::starter_rule_notes() {
+        assert!(!questionnaire::HELPER_MODE_NOTES.contains(&note.id.as_str()) && !questionnaire::HELPER_CONTRACT_NOTES.contains(&note.id.as_str()), "{}", note.id);
+    }
+}
+
 #[test]
 fn helper_agent_mode_is_off_by_default_and_states_the_measurement_the_free_chat_and_the_costs() {
     let q = questions().into_iter().find(|q| q.id == "helper-agents").unwrap();

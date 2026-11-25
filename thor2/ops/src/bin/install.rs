@@ -264,6 +264,20 @@ struct Cli {
     )]
     set_helpers: Option<String>,
 
+    /// Set ONLY the starter work rules, `on` or `off`, and nothing else. They
+    /// are on in a new memory. `off` retracts the work-habit notes of the
+    /// starting set (the reminders to run tests before saying done, never commit
+    /// a secret, check your work, and so on) so your assistant is no longer
+    /// reminded of them; `on` stores them again. The notes THOR itself needs,
+    /// the helper notes and the changelog notes are not touched. Running it
+    /// twice changes nothing the second time. Needs --db.
+    #[arg(
+        long = "set-starter-rules",
+        value_name = "on|off",
+        conflicts_with_all = ["project", "settings", "mcp_json", "no_mcp", "serve_exe", "mcp_exe", "code_index_root", "register_root", "set_mode", "set_plan", "set_weekly_check", "set_backup", "set_recording", "set_language", "set_helpers", "set_changelog_flow", "set_connections", "set_git_hooks", "set_reply_rules", "set_temp_folder", "set_tools_folder", "topic", "copy_from"]
+    )]
+    set_starter_rules: Option<String>,
+
     /// Set ONLY the answer to "shall I keep a changelog and version numbers for
     /// this project?", `on` or `off`, and nothing else. Run it from inside the
     /// project: the answer is kept for that project alone, beside the memory.
@@ -789,6 +803,49 @@ fn set_helpers_only(db: Option<PathBuf>, word: &str) -> ExitCode {
         println!("helper-agent mode is on for {}: your assistant is reminded of it right before it starts a helper agent. Switch it off again with: install --set-helpers off --db \"{}\"", db.display(), db.display());
     } else {
         println!("helper-agent mode is off for {}", db.display());
+    }
+    ExitCode::SUCCESS
+}
+
+/// `install --set-starter-rules on|off`: store or retract the starter work
+/// rules (`ops::install::starter_rule_notes`) and nothing else.
+fn set_starter_rules_only(db: Option<PathBuf>, word: &str) -> ExitCode {
+    use ops::install::{set_starter_rules, HelperChange};
+    let on = match on_off(word, "the starter work rules", "--set-starter-rules") {
+        Ok(on) => on,
+        Err(code) => return code,
+    };
+    let db = match switch_db(db, "--set-starter-rules", word) {
+        Ok(db) => db,
+        Err(code) => return code,
+    };
+    let changes = match set_starter_rules(&db, on) {
+        Ok(changes) => changes,
+        Err(e) => {
+            eprintln!("could not change the starter work rules: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut refused = false;
+    let (mut stored, mut retracted, mut unchanged) = (0, 0, 0);
+    for (id, change) in &changes {
+        match change {
+            HelperChange::Stored | HelperChange::Restored => stored += 1,
+            HelperChange::Retracted => retracted += 1,
+            HelperChange::AlreadyOn | HelperChange::AlreadyOff => unchanged += 1,
+            HelperChange::Refused(why) => {
+                refused = true;
+                eprintln!("! could not change the note '{id}': {why}");
+            }
+        }
+    }
+    if refused {
+        return ExitCode::FAILURE;
+    }
+    if on {
+        println!("+ the starter work rules are on for {}: {stored} note(s) stored, {unchanged} were already there. Switch them off again with: install --set-starter-rules off --db \"{}\"", db.display(), db.display());
+    } else {
+        println!("+ the starter work rules are off for {}: {retracted} note(s) retracted (history still shows them), {unchanged} were already off. The notes THOR needs, the helper notes and the changelog notes stay. Switch them on again with: install --set-starter-rules on --db \"{}\"", db.display(), db.display());
     }
     ExitCode::SUCCESS
 }
@@ -1589,6 +1646,9 @@ fn main() -> ExitCode {
     if let Some(word) = cli.set_helpers.as_deref() {
         return set_helpers_only(cli.db, word);
     }
+    if let Some(word) = cli.set_starter_rules.as_deref() {
+        return set_starter_rules_only(cli.db, word);
+    }
     if let Some(word) = cli.set_changelog_flow.as_deref() {
         return set_changelog_flow_only(cli.db, word);
     }
@@ -1958,7 +2018,7 @@ fn main() -> ExitCode {
                 println!("  rewrote {upgraded} older connection(s) in the form Windows can always start, with no shell in between; close Claude Code completely and open it again for that to take effect");
             }
             for old in &report.replaced {
-                println!("  fixed an old connection that pointed at a program that no longer exists: {old}");
+                println!("  replaced an older connection of THOR's that pointed somewhere else, so there is only one set: {old}");
             }
             if let Some(p) = report.backup_path.as_ref().filter(|_| changed > 0) {
                 println!("  your previous Claude Code settings were saved as {}", p.display());

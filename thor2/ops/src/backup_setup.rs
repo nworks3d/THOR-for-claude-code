@@ -83,7 +83,7 @@ pub fn backup_hooks_for(settings: &Path, db: &Path) -> anyhow::Result<Vec<String
     if !settings.exists() {
         return Ok(Vec::new());
     }
-    let root: Value = serde_json::from_str(&std::fs::read_to_string(settings)?)
+    let root: Value = serde_json::from_str(&thor_core::json_config::read_json_text_only(settings)?)
         .map_err(|e| anyhow::anyhow!("{} is not valid JSON ({e}) - refusing to touch it", settings.display()))?;
     let db = db.display().to_string();
     let mut found = Vec::new();
@@ -105,8 +105,9 @@ pub fn remove_backup_hook(settings: &Path, db: &Path) -> anyhow::Result<usize> {
     if backup_hooks_for(settings, db)?.is_empty() {
         return Ok(0);
     }
-    let raw = std::fs::read_to_string(settings)?;
-    let mut root: Value = serde_json::from_str(&raw)?;
+    let original = std::fs::read_to_string(settings)?;
+    let had_bom = original.starts_with(thor_core::json_config::BOM);
+    let mut root: Value = serde_json::from_str(thor_core::json_config::strip_bom(&original))?;
     let db = db.display().to_string();
     let mut removed = 0;
     if let Some(groups) = root["hooks"]["SessionStart"].as_array_mut() {
@@ -119,8 +120,8 @@ pub fn remove_backup_hook(settings: &Path, db: &Path) -> anyhow::Result<usize> {
         }
         groups.retain(|g| g["hooks"].as_array().is_none_or(|h| !h.is_empty()));
     }
-    crate::install::backup_once(settings, &raw)?;
-    std::fs::write(settings, serde_json::to_string_pretty(&root)? + "\n")?;
+    crate::install::backup_once(settings, &original)?;
+    std::fs::write(settings, thor_core::json_config::with_bom(serde_json::to_string_pretty(&root)? + "\n", had_bom))?;
     Ok(removed)
 }
 
