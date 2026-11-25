@@ -467,7 +467,7 @@ pub(crate) fn command_segments(command: &str) -> Vec<Vec<String>> {
                 }
             }
             Tok::Redirect => redirected = true,
-            Tok::Border => {
+            Tok::Border(_) => {
                 segments.push(std::mem::take(&mut segment));
                 redirected = false;
             }

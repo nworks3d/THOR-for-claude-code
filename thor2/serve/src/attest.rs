@@ -1095,6 +1095,7 @@ pub fn record_hook_faults_until(store: &mut EventStore, session: &str, root: Opt
 /// UTF-8 anywhere (as `read_to_string` then fails), so a caller skips the file
 /// exactly as before. The cheap byte search comes first; only a line that holds
 /// the needle is turned into a `String`.
+#[cfg(test)]
 fn lines_containing(file: &Path, needle: &[u8]) -> Option<Vec<String>> {
     lines_containing_at(file, needle).map(|found| found.into_iter().map(|(_, line)| line).collect())
 }
