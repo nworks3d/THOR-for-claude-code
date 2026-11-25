@@ -396,3 +396,67 @@ fn after_the_setup_is_finished_a_new_conversation_with_no_folder_is_held_once() 
     assert!(held(&stop(&f, &f.nowhere, "later-1", &log, serde_json::json!({}))));
     assert!(!held(&stop(&f, &f.nowhere, "later-1", &log, serde_json::json!({}))));
 }
+
+#[test]
+fn a_subject_with_notes_and_no_folder_is_offered_a_folder_once_per_session() {
+    let f = fixture();
+    let first = prompt(&f, &f.kitchen, "can you check what we know about the garden?");
+    assert!(first.contains("'Garden' has 1 note but no folder of its own"), "{first}");
+    assert!(first.contains("offer to give it a folder") && first.contains("only answer yes or no"), "{first}");
+    assert!(first.contains("run the installer with --topic from inside it"), "{first}");
+    let again = prompt(&f, &f.kitchen, "and the garden again, please");
+    assert!(!again.contains("no folder of its own"), "once per session: {again}");
+}
+
+/// A note bound to its own project (not pinned) of the kitchen folder.
+fn kitchen_note(f: &Fixture, id: &str, text: &str) {
+    let mut store = EventStore::open_existing(&f.db).unwrap();
+    let note = Item {
+        id: id.to_string(),
+        kind: Kind::Orientation,
+        text: text.to_string(),
+        bindings: vec![Binding::Target { kind: model::item::TargetKind::Project, value: "Kitchen-renovation".to_string() }],
+        severity: None,
+        project: Some("Kitchen-renovation".to_string()),
+        tags: vec![],
+        expires: None,
+        key: None,
+        falsifier: Some("the tiles come from another shop".to_string()),
+        check: None,
+    };
+    model::store::declare(&mut store, "s", "l", "a", &note).unwrap();
+}
+
+#[test]
+fn a_project_bound_note_comes_up_at_a_prompt_that_shares_a_word_with_it_in_its_own_project_only() {
+    let f = fixture();
+    // The kitchen is a plain folder of its own (a topic folder), not a code repository.
+    std::fs::remove_dir_all(f.kitchen.join(".git")).unwrap();
+    std::fs::write(f.kitchen.join(".thor-project"), "Kitchen-renovation\n").unwrap();
+    kitchen_note(&f, "kitchen-tiles", "The kitchen tiles come from Tilehouse and arrive on Tuesday.");
+    let matching = prompt(&f, &f.kitchen, "when do the tiles arrive, do you know?");
+    assert!(matching.contains("kitchen-tiles"), "{matching}");
+    let unrelated = prompt(&f, &f.kitchen, "please water the tomatoes in the workshop");
+    assert!(!unrelated.contains("kitchen-tiles"), "{unrelated}");
+    // Another project's session never sees it, whatever the prompt says.
+    let elsewhere = prompt(&f, &f.garden, "when do the tiles arrive, do you know?");
+    assert!(!elsewhere.contains("kitchen-tiles"), "{elsewhere}");
+}
+
+#[test]
+fn in_a_code_repository_the_project_binding_is_not_read_at_a_prompt() {
+    let f = fixture();
+    kitchen_note(&f, "kitchen-tiles", "The kitchen tiles come from Tilehouse and arrive on Tuesday.");
+    let matching = prompt(&f, &f.kitchen, "when do the tiles arrive, do you know?");
+    assert!(!matching.contains("kitchen-tiles"), "{matching}");
+}
+
+#[test]
+fn a_subject_with_a_folder_is_never_called_folderless() {
+    let f = fixture();
+    let context = prompt(&f, &f.garden, "what did we decide about the kitchen renovation budget?");
+    assert!(context.contains("This message is about Kitchen-renovation"), "{context}");
+    assert!(!context.contains("no folder of its own"), "{context}");
+    let none = prompt(&f, &f.kitchen, "please water the tomatoes in the workshop");
+    assert!(!none.contains("no folder of its own"), "{none}");
+}

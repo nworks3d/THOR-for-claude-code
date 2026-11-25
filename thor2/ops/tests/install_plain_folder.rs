@@ -235,7 +235,7 @@ async fn a_file_check_in_a_plain_topic_folder_is_tried() {
 
 /// The proof note AGENTS.md (5b) tells an assistant to store for a topic goes
 /// through the write gate as written: filed under the topic by the folder's
-/// name, pinned to every session start, with no collection question.
+/// name, bound to its own project, with no collection question.
 #[tokio::test]
 async fn the_topic_proof_note_from_agents_md_is_accepted() {
     let sandbox = Sandbox::new();
@@ -249,7 +249,7 @@ async fn the_topic_proof_note_from_agents_md_is_accepted() {
             "id": "tiles-from-tilehouse",
             "kind": "orientation",
             "project": "Kitchen renovation",
-            "always": true,
+            "targets": [{"kind": "project", "value": "Kitchen renovation"}],
             "text": "The kitchen tiles are ordered at Tilehouse.",
             "falsifier": "A later note says the tiles come from somewhere else."
         }),

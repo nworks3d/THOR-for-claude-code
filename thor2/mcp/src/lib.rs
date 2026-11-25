@@ -117,6 +117,10 @@ const NO_SESSION: &str = "mcp";
 const REPLICA_TAKEDOWN_NOTE: &str = "A pinned note comes down on the main machine only: the owner's own words cannot be \
      witnessed from a copy, so this is judged there, by the same rule (proven out of date and unused).";
 
+/// What a copy (replica) says when a pin is queued: the owner's own words cannot be witnessed from a
+/// copy either, so the main machine judges it by the same rule.
+const REPLICA_PIN_NOTE: &str = "A pin is added on the main machine only, and only with the owner's whole message quoted in `because`: his own words cannot be witnessed from a copy, so it is judged there.";
+
 /// What a copy (replica) says when a change that loosens a rule needing the
 /// owner's go is queued: his own words cannot be witnessed from a copy either.
 const REPLICA_LOOSEN_NOTE: &str = "A rule that needs the owner's go is changed on the main machine only: the owner's own words cannot be witnessed from a copy, so this is judged there, by the same rule (his whole message quoted in the reason).";
@@ -345,6 +349,13 @@ fn with_warnings(
         // place it lands on is already full in a registered project.
         notes.extend(model::store::global_write_crowded_in_projects(store, item, existing));
         notes.extend(unreachable_anchor_notes(store, corpus, item, existing));
+        // A subject that has notes but no folder of its own: the same plain line the prompt hook gives.
+        if let Some(project) = item.project.as_deref().filter(|_| item.kind.can_fire()) {
+            let folderless = serve::other_project::folderless_projects(store);
+            if let Some(found) = folderless.iter().find(|f| model::checkout::same_project_name(&f.project, project)) {
+                notes.push(serve::other_project::folderless_line(&found.project, found.notes));
+            }
+        }
         // What the rule would have done to the calls of the last 30 days
         // (`serve::sweep`): informs, never refuses.
         notes.extend(serve::sweep::would_refuse_note(store, item, std::time::Duration::from_millis(1_500)));
@@ -2110,6 +2121,18 @@ fn replica_refusal_for_revise(store: &EventStore, args: &ReviseArgs) -> Result<(
         .map_err(|r| gate_refusal(r, store))
 }
 
+/// The refusal for a pin the owner did not ask for in his own words (nothing was written).
+fn owner_pin_refusal(id: &str, quoted: &str) -> String {
+    let unwitnessed = if serve::order_earlier::quote_candidates(quoted).is_empty() {
+        ""
+    } else {
+        " The words you quoted are not one whole message the owner typed in this session that names this note (a piece of it, a message about something else, a helper's text and your own text do not count)."
+    };
+    format!(
+        "REFUSED: nothing was changed. '{id}' would be pinned, which brings it into every conversation, and that start block is the owner's: only he decides what goes in it.{unwitnessed} Ask the owner in one plain sentence whether this has to come along in every conversation (name the note's id '{id}' in your question). When he has said yes in his own message in this session, repeat the call with `because` holding his whole message between double quotes. If it only matters for one subject, leave Always out and bind the note to its project (a binding of kind project) instead."
+    )
+}
+
 /// THE TWO PIN RULES' WAYS OUT (owner's decision, 2026-11-24), settled before anything is tried or
 /// written. The start block is for rules that hold in every conversation:
 ///
@@ -2143,8 +2166,27 @@ fn settle_pin_exceptions(
         updated.tags.extend(existing.tags.iter().filter(|t| markers.contains(&t.as_str())).cloned());
         return Ok(());
     }
+    // A remember under the id of a live note is refused by the write itself, with its own words.
+    if existing.is_none() && model::store::show(store, &updated.id).is_ok() {
+        return Ok(());
+    }
     let reason = because.map(str::trim).unwrap_or_default();
     let refused = |refusal| format!("REFUSED: {}", model::store::WriteError::Refused(refusal));
+    // THE START BLOCK IS THE OWNER'S (2026-11-25): a pin is added only on his own go, the very
+    // check an unpin on his words uses. His quoted message is also the reason the place rule asks.
+    let owner_go = store
+        .path()
+        .as_deref()
+        .is_some_and(|db| serve::unpin_gate::owner_go_recorded(db, &updated.id, reason, session, serve::time::now_unix()));
+    // Test fixtures only (never compiled into the program): a reason that starts with this word
+    // stands for an owner's go that was witnessed.
+    // The overflow pin below still asks for a real one.
+    let real_go = owner_go;
+    #[cfg(test)]
+    let owner_go = owner_go || reason.starts_with("fixture:");
+    if !owner_go {
+        return Err(owner_pin_refusal(&updated.id, reason));
+    }
     for _ in 0..3 {
         match model::store::pin_block(store, updated) {
             None => return Ok(()),
@@ -2155,11 +2197,7 @@ fn settle_pin_exceptions(
                 updated.tags.push(PIN_PLACE_REASON_TAG.to_string());
             }
             Some(PinBlock::Full { refusal, overflow: false }) => {
-                let db = store.path();
-                let go = db
-                    .as_deref()
-                    .is_some_and(|db| serve::unpin_gate::owner_go_recorded(db, &updated.id, reason, session, serve::time::now_unix()));
-                if !go {
+                if !real_go {
                     return Err(refused(refusal));
                 }
                 updated.tags.push(OVERFLOW_PIN_TAG.to_string());
@@ -2347,7 +2385,10 @@ pub struct RememberArgs {
     #[serde(default, deserialize_with = "targets_list")]
     pub targets: Vec<TargetArg>,
     /// Bind this item to the pinned Always layer (served in full at every
-    /// session start). Only a Rule/Orientation may set this.
+    /// session start). Only a Rule/Orientation may set this, and only on the
+    /// owner's own go: `because` must quote his whole message between double
+    /// quotes (ask him first; name this note's id in your question). A subject's
+    /// note is bound to its project instead (a target of kind project).
     #[serde(default, deserialize_with = "always_flag")]
     pub always: bool,
     /// THE OWNER JUST NAMED A NEW COLLECTION - repeat that name here exactly as he gave it, and it
@@ -3612,10 +3653,10 @@ impl ThorMcpServer {
     /// any binding at all is refused there, exactly as it is for `remember`),
     /// and both are tried like any revise: the binding is the rule's reach
     /// (`write_binding_change`).
-    #[tool(description = "Code lane: adds the Always binding to an existing item, so it is served in full at every session start; every other binding and field stays untouched. A pinned item owes no verdict from that point on: it is never called noise (mark refuses that) and the weekly evaluation only has it re-read - confirmed with a useful mark or rewritten with revise - never unpinned; unpinning is the owner's call. Use revise instead when anything besides the binding needs to change. THE START BLOCK IS FOR RULES THAT HOLD IN EVERY CONVERSATION: pinning a rule that names a place (a file, directory, command, symbol, route or host) is refused unless `because` (at least 20 characters) says why it must hold in every conversation, and a pin that would not fit the full block is refused unless `because` quotes the OWNER'S whole message (an overflow pin, delivered at the first prompt instead). Remember and revise follow the same two rules whenever they add Always. Idempotent - pinning an already-pinned item changes nothing and is not an error. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refused, loudly, when the item's kind may carry no binding at all (a Report or Chunk). Replies 'pinned' with the event sequence, 'already pinned', or the refusal text.", annotations(title = "Pin an item", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
+    #[tool(description = "Code lane: adds the Always binding to an existing item, so it is served in full at every session start; every other binding and field stays untouched. A pinned item owes no verdict from that point on: it is never called noise (mark refuses that) and the weekly evaluation only has it re-read - confirmed with a useful mark or rewritten with revise - never unpinned; unpinning is the owner's call. Use revise instead when anything besides the binding needs to change. THE START BLOCK IS THE OWNER'S: a pin is refused, nothing written, unless `because` quotes the OWNER'S whole message between double quotes (ask him first, naming the note's id in your question). THE START BLOCK IS FOR RULES THAT HOLD IN EVERY CONVERSATION: pinning a rule that names a place (a file, directory, command, symbol, route or host) is refused unless `because` (at least 20 characters) says why it must hold in every conversation, and a pin that would not fit the full block is refused unless `because` quotes the OWNER'S whole message (an overflow pin, delivered at the first prompt instead). Remember and revise follow the same two rules whenever they add Always. Idempotent - pinning an already-pinned item changes nothing and is not an error. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refused, loudly, when the item's kind may carry no binding at all (a Report or Chunk). Replies 'pinned' with the event sequence, 'already pinned', or the refusal text.", annotations(title = "Pin an item", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn pin(&self, meta: Meta, raw: RawArgs, Parameters(args): Parameters<PinArgs>) -> String {
         if let Some(queued) = self.capture("pin", &args) {
-            return queued;
+            return format!("{queued} {REPLICA_PIN_NOTE}");
         }
         let stamp = self.stamp("pin", meta, raw);
         let corpus = self.corpus.clone();
@@ -7782,7 +7823,7 @@ mod tests {
         assert!(stored.starts_with("stored") && stored.contains("teeth: wired, not proven"), "{stored}");
 
         let revise_args = ReviseArgs {
-            because: Some("the rule no longer depends on one file, so it drops the path-carrying form".to_string()),
+            because: Some("fixture: the rule no longer depends on one file, so it drops the path-carrying form".to_string()),
             new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
@@ -8931,7 +8972,7 @@ mod tests {
         args.targets = vec![TargetArg { kind: "path".to_string(), value: "src/pin_test.rs".to_string() }];
         assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await.starts_with("stored"));
 
-        let reason = Some("this rule must hold in every conversation, not only at one file".to_string());
+        let reason = Some("fixture: this rule must hold in every conversation, not only at one file".to_string());
         let reply = srv.pin(Meta::new(), RawArgs::default(), Parameters(PinArgs { id: "pin-1".to_string(), because: reason })).await;
         assert!(reply.starts_with("pinned"), "{reply}");
 
@@ -8998,7 +9039,7 @@ mod tests {
         args.targets = vec![TargetArg { kind: "path".to_string(), value: "src/place_1.rs".to_string() }];
         assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await.starts_with("stored"));
 
-        for because in [None, Some("too short".to_string())] {
+        for because in [Some("fixture: short".to_string())] {
             let reply = srv.pin(Meta::new(), RawArgs::default(), Parameters(PinArgs { id: "place-1".to_string(), because })).await;
             assert!(reply.starts_with("REFUSED"), "{reply}");
             assert!(reply.contains("arrives when it is needed") && reply.contains("hold in every conversation"), "{reply}");
@@ -9007,18 +9048,18 @@ mod tests {
         }
         // The same through remember and through revise.
         let mut pinned = base_remember("place-2");
-        pinned.because = None;
+        pinned.because = Some("fixture: short".to_string());
         pinned.project = Some("some-project".to_string());
         pinned.targets = vec![TargetArg { kind: "command".to_string(), value: "git push".to_string() }];
         let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(pinned)).await;
         assert!(reply.starts_with("REFUSED") && reply.contains("arrives when it is needed"), "{reply}");
         assert!(model::store::show(&srv.store.lock().unwrap(), "place-2").is_err(), "nothing was stored");
         let reply = srv
-            .revise(Meta::new(), RawArgs::default(), Parameters(ReviseArgs { id: "place-1".to_string(), always: Some(true), targets: Some(vec![TargetArg { kind: "path".to_string(), value: "src/place_1.rs".to_string() }]), ..Default::default() }))
+            .revise(Meta::new(), RawArgs::default(), Parameters(ReviseArgs { id: "place-1".to_string(), because: Some("fixture: short".to_string()), always: Some(true), targets: Some(vec![TargetArg { kind: "path".to_string(), value: "src/place_1.rs".to_string() }]), ..Default::default() }))
             .await;
         assert!(reply.starts_with("REFUSED") && reply.contains("arrives when it is needed"), "{reply}");
         // A pin with no place binding is not affected.
-        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(plain_pin("plain-1", "Keep every answer short and plain.", None))).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(plain_pin("plain-1", "Keep every answer short and plain.", Some("fixture: ok")))).await;
         assert!(reply.starts_with("stored"), "{reply}");
     }
 
@@ -9033,7 +9074,7 @@ mod tests {
         args.project = Some("some-project".to_string());
         args.targets = vec![TargetArg { kind: "path".to_string(), value: "src/place_3.rs".to_string() }];
         assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await.starts_with("stored"));
-        let reason = "every session touches this file, so it must hold in every conversation";
+        let reason = "fixture: every session touches this file, so it must hold in every conversation";
         let reply = srv.pin(Meta::new(), RawArgs::default(), Parameters(PinArgs { id: "place-3".to_string(), because: Some(reason.to_string()) })).await;
         assert!(reply.starts_with("pinned"), "{reply}");
         let store = srv.store.lock().unwrap();
@@ -9052,14 +9093,14 @@ mod tests {
         let (_dir, _db, srv) = unpin_fixture();
         fill_pinned_block(&srv, 300);
         let text = format!("Hold the line on this: {}", "v".repeat(270));
-        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(plain_pin("too-many", &text, None))).await;
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(plain_pin("too-many", &text, Some("fixture: no room")))).await;
         assert!(reply.starts_with("REFUSED") && reply.contains("session start block of project 'some-project'"), "{reply}");
         let (fold, down, owner) = (reply.find("(1) FOLD"), reply.find("(2) UNPIN OR RETRACT"), reply.find("(3) If none can go, ASK THE OWNER"));
         assert!(fold.is_some() && down > fold && owner > down, "{reply}");
         assert!(model::store::show(&srv.store.lock().unwrap(), "too-many").is_err(), "nothing was stored");
         // A reason that is not the owner's quoted message does not lift it.
         let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(plain_pin("too-many", &text, Some("there is plenty of room for this one, really")))).await;
-        assert!(reply.starts_with("REFUSED") && reply.contains("(3) If none can go"), "{reply}");
+        assert!(reply.starts_with("REFUSED") && reply.contains("the owner's"), "{reply}");
     }
 
     /// The owner's own go, checked by the hook, writes the pin as an overflow pin: out of the
@@ -9084,7 +9125,7 @@ mod tests {
 
         // Unchecked: the hook never saw it.
         let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(plain_pin("overflow-1", &text, Some(&quote)))).await;
-        assert!(reply.starts_with("REFUSED") && reply.contains("(3) If none can go"), "an unwitnessed quote is only text: {reply}");
+        assert!(reply.starts_with("REFUSED") && reply.contains("not one whole message the owner typed"), "an unwitnessed quote is only text: {reply}");
         // A piece of his message is not his message.
         let piece = "the owner said yes: \"Ja, zet overflow-1 maar vast\"";
         witness(piece);
@@ -9109,13 +9150,69 @@ mod tests {
         assert_eq!(overflow.len(), 1);
     }
 
+    /// THE START BLOCK IS THE OWNER'S: no pin without his own whole message, through any of the
+    /// three tools; with it the pin is written (also when the block has room); an already pinned
+    /// note can still be revised.
+    #[tokio::test]
+    async fn a_pin_needs_the_owners_own_message_and_a_pinned_note_can_still_be_revised() {
+        let (dir, db, srv) = unpin_fixture();
+        // Without his words, through remember, pin and revise: refused, nothing written.
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(plain_pin("own-1", "Keep every answer short.", None))).await;
+        assert!(reply.starts_with("REFUSED") && reply.contains("start block is the owner's") && reply.contains("repeat the call"), "{reply}");
+        assert!(model::store::show(&srv.store.lock().unwrap(), "own-1").is_err(), "nothing was stored");
+        let mut unpinned = plain_pin("own-2", "Keep every answer plain.", None);
+        unpinned.always = false;
+        unpinned.targets = vec![TargetArg { kind: "path".to_string(), value: "src/own_2.rs".to_string() }];
+        assert!(srv.remember(Meta::new(), RawArgs::default(), Parameters(unpinned)).await.starts_with("stored"));
+        let reply = srv.pin(Meta::new(), RawArgs::default(), Parameters(PinArgs { id: "own-2".to_string(), because: Some("I think it should come along in every conversation".to_string()) })).await;
+        assert!(reply.starts_with("REFUSED") && reply.contains("start block is the owner's"), "{reply}");
+        let revise = ReviseArgs { id: "own-2".to_string(), always: Some(true), ..Default::default() };
+        let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise)).await;
+        assert!(reply.starts_with("REFUSED") && reply.contains("start block is the owner's"), "{reply}");
+        assert!(!still_pinned(&srv, "own-2"), "nothing was written");
+
+        // With his whole message, witnessed by the hook: written.
+        let message = "Ja, laat own-2 maar in elk gesprek meekomen.";
+        let transcript = dir.path().join("session.jsonl");
+        let line = serde_json::json!({"type": "user", "message": {"role": "user", "content": message}});
+        std::fs::write(&transcript, format!("{line}\n")).unwrap();
+        let quote = format!("the owner said: \"{message}\"");
+        serve::unpin_gate::witness(
+            &db,
+            &serde_json::json!({ "tool_input": { "id": "own-2", "because": quote }, "transcript_path": transcript.to_string_lossy() }),
+            serve::time::now_unix(),
+        );
+        let reply = srv.pin(Meta::new(), RawArgs::default(), Parameters(PinArgs { id: "own-2".to_string(), because: Some(quote) })).await;
+        assert!(reply.starts_with("pinned"), "{reply}");
+        assert!(still_pinned(&srv, "own-2"));
+
+        // An already pinned note keeps being maintained without asking him again.
+        let revise = ReviseArgs { id: "own-2".to_string(), text: Some("Keep every answer plain and short.".to_string()), ..Default::default() };
+        let reply = srv.revise(Meta::new(), RawArgs::default(), Parameters(revise)).await;
+        assert!(reply.starts_with("revised"), "{reply}");
+        assert!(still_pinned(&srv, "own-2"));
+    }
+
+    /// A rule filed under a subject that has no folder says so in its reply.
+    #[tokio::test]
+    async fn a_note_filed_under_a_project_with_no_folder_says_so() {
+        let (_dir, _db, srv) = unpin_fixture();
+        let mut args = plain_pin("sub-1", "The tiles come from the shop on the corner.", None);
+        args.always = false;
+        args.targets = vec![TargetArg { kind: "project".to_string(), value: "some-project".to_string() }];
+        let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
+        assert!(reply.starts_with("stored"), "{reply}");
+        assert!(reply.contains("'some-project' has 1 note but no folder of its own"), "{reply}");
+        assert!(reply.contains("run the installer with --topic from inside it"), "{reply}");
+    }
+
     /// A caller cannot write the exception tags itself: a copy of them is dropped.
     #[tokio::test]
     async fn the_exception_tags_cannot_be_written_by_the_caller() {
         let (_dir, _db, srv) = unpin_fixture();
         fill_pinned_block(&srv, 300);
         let text = format!("Hold the line on this: {}", "v".repeat(270));
-        let mut args = plain_pin("forged-1", &text, None);
+        let mut args = plain_pin("forged-1", &text, Some("fixture: x"));
         args.tags = vec![model::store::OVERFLOW_PIN_TAG.to_string()];
         let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.starts_with("REFUSED") && reply.contains("(3) If none can go"), "{reply}");

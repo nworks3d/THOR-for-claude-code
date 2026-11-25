@@ -2662,6 +2662,21 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                 (None, Some(other)) => Some(serve::other_project::prompt_note(&other)),
                 (note, None) => note,
             };
+            // The prompt names a subject that has notes but no folder: the assistant is told
+            // to offer one, once per session per name (`other_project::folderless_line`).
+            let folderless = if no_record || session_kind(&payload).headless || payload_is_from_a_subagent(&payload) {
+                None
+            } else {
+                serve::other_project::folderless_named_in_prompt(&store, prompt_text, session_project.as_deref()).and_then(|f| {
+                    let key = format!("folderless:{}", model::checkout::project_match_key(&f.project));
+                    said_once_keyed(db_path, &session_id, &key, serve::other_project::folderless_line(&f.project, f.notes))
+                })
+            };
+            let eval_note = match (eval_note, folderless) {
+                (Some(note), Some(line)) => Some(format!("{note}\n\n{line}")),
+                (None, Some(line)) => Some(line),
+                (note, None) => note,
+            };
             // THE OVERFLOW PINS (owner's decision, 2026-11-24): pinned notes the full session start
             // block could not take, written on the owner's own go. Delivered whole here, at the
             // first prompt of each context, within the same size limit as a session start.
@@ -2701,6 +2716,13 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             let candidates = serve::live::live_items(&store);
             let mut input = prompt::resolve(prompt_text, &candidates);
             input.project = folder_project.clone();
+            // A subject's own notes (bound to its project, not pinned) come up at the prompts
+            // that share a word with them (`other_project::narrow_to_prompt`).
+            let in_topic_folder = session_cwd.as_deref().is_some_and(serve::other_project::is_topic_folder);
+            let candidates = match folder_project.as_deref() {
+                Some(project) if in_topic_folder => serve::other_project::narrow_to_prompt(candidates, project, prompt_text, &mut input),
+                _ => candidates,
+            };
             if input.is_empty() {
                 return eval_note.map(|block| HookOutput::Context { event_name, block, verdicts: Vec::new() });
             }

@@ -848,6 +848,28 @@ fn haystack_contains(hit: &LookupHit, needle: &str) -> bool {
         || hit.item.tags.iter().any(|t| t.to_lowercase().contains(needle))
 }
 
+/// The fewest letters a prompt word needs to count as a distinctive word of its own.
+const MIN_DISTINCTIVE_WORD_CHARS: usize = 5;
+
+/// The words of a prompt that can point at a note: lowercase, at least
+/// `MIN_DISTINCTIVE_WORD_CHARS` characters, each once.
+pub fn distinctive_words(prompt: &str) -> Vec<String> {
+    let mut words: Vec<String> = Vec::new();
+    for word in prompt.split(|c: char| !c.is_alphanumeric()).map(str::to_lowercase) {
+        if word.chars().count() >= MIN_DISTINCTIVE_WORD_CHARS && !words.contains(&word) {
+            words.push(word);
+        }
+    }
+    words
+}
+
+/// Does the item's text or any tag hold one of `words` (lookup's own haystack and
+/// word test: the whole word, or for a long all-letters word its first letters)?
+pub fn shares_a_word(item: &Item, words: &[String]) -> bool {
+    let hit = LookupHit { id: item.id.clone(), item: item.clone() };
+    words.iter().any(|w| haystack_contains(&hit, w) || word_stem(w).is_some_and(|stem| haystack_contains(&hit, &stem)))
+}
+
 /// The other door: an explicit request for exactly one `Lookup`'s key, from
 /// any project - never found by `search` above, only by naming the key
 /// exactly (see `model::item::Kind`'s own doc comment and

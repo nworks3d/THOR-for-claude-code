@@ -230,6 +230,7 @@ fn g8_3_and_g8_6_a_biting_check_is_wired_and_a_check_that_reaches_nothing_become
 
     let mut reach = rule("readme-marker", "Keep the readme free of the marker-x1 line.", Some("demo"));
     reach["always"] = json!(true);
+    owners_go(&db, tmp.path(), &mut reach);
     reach["check_kind"] = json!("absent");
     reach["check_path"] = json!("README.md");
     reach["check_literal"] = json!("marker-x1");
@@ -292,6 +293,7 @@ fn r8_6_and_g8_4_a_literal_must_be_named_in_the_rules_own_text() {
 
     let mut dash = rule("no-em-dash", "Never write an em dash (U+2014) into any file.", Some("demo"));
     dash["always"] = json!(true);
+    owners_go(&db, tmp.path(), &mut dash);
     dash["check_kind"] = json!("forbidden");
     dash["check_literals"] = json!(["\u{2014}"]);
     let reply = mcp.call("remember", dash);
@@ -544,6 +546,7 @@ fn r8_16_and_g8_9_a_note_moves_to_the_rule_track_only_through_the_trial() {
     let mut args = rule("n1", "Never run `sshpass` here; use keys.", Some("demo"));
     args["severity"] = json!("costly");
     args["always"] = json!(true);
+    owners_go(&db, tmp.path(), &mut args);
     let reply = mcp.call("remember", args);
     println!("G8.9 first: {reply}");
     let reply = mcp.call("revise", json!({"id": "n1", "tags": ["teeth:proven-guard"]}));
