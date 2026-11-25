@@ -93,13 +93,20 @@ pub fn plain_summary(db: &Path, cwd: &Path, settings: Option<&Path>, mcp_json: O
     let ask = "ask your assistant to run THOR's install again, then restart Claude Code";
     let mut lines = vec!["THOR check - the short version".to_string()];
 
-    match open_and_read(db) {
+    let read = open_and_read(db);
+    match &read {
         Err(why) => lines.push(format!("  PROBLEM: your memory file cannot be used ({why}). Do not delete anything; {ask}.")),
-        Ok(events) if !chain_intact(&events) => lines.push(
+        Ok(events) if !chain_intact(events) => lines.push(
             "  PROBLEM: your memory file looks damaged. Do not delete it: it is kept in full and can be repaired. Show your assistant the detailed report below."
                 .to_string(),
         ),
         Ok(_) => lines.push("  OK: your memory file is there and in good shape.".to_string()),
+    }
+    if let Ok(events) = &read {
+        let split = split_item_ids(events);
+        if !split.is_empty() {
+            lines.push(format!("  PROBLEM: {}", split_items_words(&split)));
+        }
     }
 
     // EVERY pinned note taken down through a tool call (unpin, a revise that removes the
@@ -261,6 +268,34 @@ pub fn store_line(db: &Path) -> String {
             .unwrap_or_else(|| "unknown".to_string());
         format!("memory store: {} events, CHAIN BROKEN ({reason})", events.len())
     }
+}
+
+/// The ids of the items that have more than one current version (a split item).
+/// Every live read skips such an item, so a split rule fires nowhere, and an
+/// older memory can hold some.
+pub fn split_item_ids(events: &[Event]) -> Vec<String> {
+    let mut ids: Vec<String> =
+        thor_core::cas::compute_head_sets(events).into_iter().filter(|(_, set)| set.heads.len() > 1).map(|(id, _)| id).collect();
+    ids.sort();
+    ids
+}
+
+/// What a split item means and the one next step, naming at most ten ids.
+fn split_items_words(ids: &[String]) -> String {
+    let shown: Vec<String> = ids.iter().take(10).map(|id| format!("'{id}'")).collect();
+    let more = if ids.len() > 10 { format!(" and {} more", ids.len() - 10) } else { String::new() };
+    format!(
+        "{} note(s) exist in two versions at once, so THOR skips them and a rule among them does not fire: {}{more}. Next step: ask your assistant to settle them (read each one's `history`, then `resolve` keeping the right version).",
+        ids.len(),
+        shown.join(", ")
+    )
+}
+
+/// The long report's line for split items; silent when there are none.
+pub fn split_items_line(db: &Path) -> Option<String> {
+    let events = open_and_read(db).ok()?;
+    let ids = split_item_ids(&events);
+    (!ids.is_empty()).then(|| format!("split items: {}", split_items_words(&ids)))
 }
 
 /// Component 3: is a code index configured, and if so, at which commit
@@ -1969,6 +2004,25 @@ pub fn cadence_line(db: &Path) -> String {
         None => (serve::usefulness::cadence_for(serve::plan::Plan::Small), "no plan on record, so the cheap weekly rhythm".to_string()),
     };
     format!("{} - {how}", serve::usefulness::cadence_clause(cadence))
+}
+
+/// `cadence_line`, and for the checkout's project the reason it is on the daily
+/// rhythm when it is (`serve::usefulness::rot_clause`).
+pub fn cadence_line_for(db: &Path, project: Option<&str>) -> String {
+    let line = cadence_line(db);
+    let Ok(store) = EventStore::open_existing(db) else { return line };
+    let cadence = if serve::plan::weekly_check_on(db) {
+        match serve::plan::read(db) {
+            Some((plan, _)) => serve::usefulness::cadence_for(plan),
+            None => serve::usefulness::cadence_for(serve::plan::Plan::Small),
+        }
+    } else {
+        serve::usefulness::EvalCadence::Off
+    };
+    match serve::usefulness::rot_clause(&store, cadence, project) {
+        Some(clause) => format!("{line}{clause}"),
+        None => line,
+    }
 }
 
 /// How many minutes the work-clock sidecar and the transcripts may disagree
@@ -4186,6 +4240,7 @@ pub fn report(
     // `wal_line_from_size`'s own doc comment for why that is the right
     // default rather than a "wal: fine" line on every ordinary run.
     lines.extend(wal_line_from_size(wal_size, db));
+    lines.extend(split_items_line(db));
     lines.push(dead_moment_bindings_line(db));
     // Silent at zero: a store with no secret in a note has nothing to say.
     lines.extend(secrets_in_notes_line(db));
@@ -4236,7 +4291,7 @@ pub fn report(
     lines.extend(test_signal_line(db, checkout_project));
     lines.extend(volume_lines(db));
     lines.extend(evaluations_line(db, checkout_project));
-    lines.push(cadence_line(db));
+    lines.push(cadence_line_for(db, checkout_project));
     lines.extend(work_clock_line(db, checkout_project));
     lines.extend(evaluation_batch_line(db, checkout_project, full));
     // Silent unless the store holds an open point / a rule names a
@@ -4957,6 +5012,29 @@ mod tests {
     /// Silent at zero, the same convention `ship_line` already uses above: a
     /// clean backlog is not a finding - `--full` must not change that.
     #[test]
+    fn items_with_two_current_versions_are_named_with_the_next_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        let mut store = EventStore::new(&db).unwrap();
+        for id in ["split-one", "fine-one"] {
+            let body = format!(r#"{{"id":"{id}","kind":"orientation","text":"note {id} about the cache folder","bindings":[],"severity":null,"project":null,"tags":[],"expires":null,"key":null,"falsifier":"x","check":null}}"#);
+            store.append_event("s", "l", "a", thor_core::event_store::EventKind::FactCreated, id, None, &body).unwrap();
+        }
+        let body = r#"{"id":"split-one","kind":"orientation","text":"a second version of the note","bindings":[],"severity":null,"project":null,"tags":[],"expires":null,"key":null,"falsifier":"x","check":null}"#;
+        store.append_event("s", "l", "a", thor_core::event_store::EventKind::FactCreated, "split-one", None, body).unwrap();
+        drop(store);
+        let line = split_items_line(&db).expect("one split item");
+        assert!(line.contains("1 note(s)") && line.contains("'split-one'") && !line.contains("fine-one"), "{line}");
+        assert!(line.contains("resolve") && line.contains("history"), "{line}");
+        let events = open_and_read(&db).unwrap();
+        assert_eq!(split_item_ids(&events), vec!["split-one".to_string()]);
+        let summary = plain_summary(&db, dir.path(), None, None);
+        assert!(summary.iter().any(|l| l.starts_with("  PROBLEM: 1 note(s) exist in two versions")), "{summary:?}");
+        let many: Vec<String> = (0..13).map(|i| format!("id-{i}")).collect();
+        assert!(split_items_words(&many).contains("and 3 more"));
+    }
+
+    #[test]
     fn judgement_debt_line_is_silent_when_nothing_is_owed() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
@@ -5457,7 +5535,10 @@ mod tests {
             "evaluation cadence: once a week per project, daily while rot is found (Max plan) - plan max (confirmed)"
         );
         let lines = report(&db, None, None, None, None, None, false, Some("thor"));
-        assert!(lines.iter().any(|l| l == &cadence_line(&db)), "{lines:?}");
+        let for_project = cadence_line_for(&db, Some("thor"));
+        assert!(for_project.starts_with(&cadence_line(&db)), "{for_project}");
+        assert!(for_project.contains("daily rhythm now: no evaluation of it counts"), "{for_project}");
+        assert!(lines.iter().any(|l| l == &for_project), "{lines:?}");
     }
 
     /// Step 17 (N3): a work-clock sidecar that disagrees with the project's

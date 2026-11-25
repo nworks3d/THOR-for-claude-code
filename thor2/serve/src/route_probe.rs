@@ -700,12 +700,26 @@ pub fn lines_listing(gaps: &[RouteGap], listed: usize) -> Vec<String> {
     out
 }
 
-/// A case-insensitive search for any of `words`, which are searched as plain
-/// text. Reads a line without copying it, which keeps a pass over the whole
-/// record cheap.
-fn any_of(words: &[String]) -> regex::Regex {
-    let escaped: Vec<String> = words.iter().map(|w| regex::escape(w)).collect();
-    regex::Regex::new(&format!("(?i)(?:{})", escaped.join("|"))).expect("escaped words make a valid pattern")
+/// A search for any of `words`, which are searched as plain text, in a line
+/// that is lowercased first (`LowerSearch::is_match`). A plain literal
+/// alternation is what the regex crate runs with its fast literal search; the
+/// case-insensitive form of it ran in the slow engine and took minutes over the
+/// whole record.
+struct LowerSearch(regex::Regex);
+
+impl LowerSearch {
+    fn is_match(&self, line: &str) -> bool {
+        if line.is_ascii() {
+            self.0.is_match(&line.to_ascii_lowercase())
+        } else {
+            self.0.is_match(&line.to_lowercase())
+        }
+    }
+}
+
+fn any_of(words: &[String]) -> LowerSearch {
+    let escaped: Vec<String> = words.iter().map(|w| regex::escape(&w.to_lowercase())).collect();
+    LowerSearch(regex::Regex::new(&escaped.join("|")).expect("escaped words make a valid pattern"))
 }
 
 /// How many calls the probe keeps in memory at most (the newest).
@@ -727,7 +741,7 @@ pub fn lines_for(db: &Path, store: &EventStore, now: i64, budget: Duration, in_s
         return Vec::new();
     }
     let names_a_host = any_of(&needles);
-    let (mut calls, _, mut cut) = corpus::select_calls(db, now, CALLS_KEPT, &|line| names_a_host.is_match(line));
+    let (mut calls, _, mut cut, mut ran_out) = corpus::select_calls_until(db, now, CALLS_KEPT, &|line| names_a_host.is_match(line), Some(deadline));
     let mut hot_names: Vec<String> = Vec::new();
     for row in calls.iter().filter(|r| is_writer(&r.tool)) {
         let name = row.input.get("file_path").and_then(|p| p.as_str()).map(file_name_of).unwrap_or_default();
@@ -738,20 +752,35 @@ pub fn lines_for(db: &Path, store: &EventStore, now: i64, budget: Duration, in_s
     // The second pass: the shell calls that name a file written with a host,
     // and every shell call that runs a script at all (the script is read from
     // the disk, and may hold a host the record never saw written).
-    let runs_a_script = regex::Regex::new(&format!(r"(?i)(?:{})", SCRIPT_EXTENSIONS.iter().map(|e| regex::escape(e)).collect::<Vec<_>>().join("|")))
-        .expect("escaped extensions make a valid pattern");
+    let runs_a_script = any_of(&SCRIPT_EXTENSIONS.iter().map(|e| e.to_string()).collect::<Vec<_>>());
     let names_a_file = (!hot_names.is_empty()).then(|| any_of(&hot_names));
-    let (more, _, more_cut) = corpus::select_calls(db, now, CALLS_KEPT, &|line| {
-        names_a_file.as_ref().is_some_and(|re| re.is_match(line)) || runs_a_script.is_match(line)
-    });
+    let (more, _, more_cut, more_ran_out) = if ran_out.is_some() {
+        (Vec::new(), 0, false, None)
+    } else {
+        corpus::select_calls_until(
+            db,
+            now,
+            CALLS_KEPT,
+            &|line| names_a_file.as_ref().is_some_and(|re| re.is_match(line)) || runs_a_script.is_match(line),
+            Some(deadline),
+        )
+    };
     cut |= more_cut;
+    ran_out = ran_out.or(more_ran_out);
     let known: std::collections::HashSet<String> = calls.iter().map(|r| r.id.clone()).collect();
     calls.extend(more.into_iter().filter(|r| is_shell(&r.tool) && !known.contains(&r.id)));
     calls.sort_by_key(|r| r.t);
     let disk = disk_scripts(&calls, &needles, Some(deadline));
     let (gaps, stopped_at) = probe_with(store, &calls, Some(deadline), &disk);
     let mut out = lines_listing(&gaps, if in_sweep { usize::MAX } else { MAX_RULES_LISTED });
-    if stopped_at.is_some() {
+    if let Some(stop) = ran_out {
+        out.push(format!(
+            "route probe: the route check ran out of time after {} of about {} calls, so the list may be incomplete{}",
+            stop.calls_seen,
+            stop.calls_in_all(),
+            if in_sweep { "" } else { " (run serve sweep for a longer look)" }
+        ));
+    } else if stopped_at.is_some() {
         out.push(format!(
             "route probe: stopped after {} second(s) before every real call of the last 30 days was checked, so the list may be incomplete{}",
             budget.as_secs(),
@@ -770,6 +799,15 @@ pub fn lines_for(db: &Path, store: &EventStore, now: i64, budget: Duration, in_s
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn the_host_search_ignores_case_in_the_line_and_in_the_words() {
+        let search = any_of(&["Staging.Example.Test".to_string(), "deploy.PS1".to_string()]);
+        assert!(search.is_match("ssh STAGING.example.test uptime"));
+        assert!(search.is_match("run Deploy.ps1 now"));
+        assert!(search.is_match("caf\u{e9} STAGING.example.test"), "a line with other letters is lowercased whole");
+        assert!(!search.is_match("ssh production.example.test"));
+    }
 
     fn rule(id: &str, text: &str, bindings: Vec<Binding>) -> Item {
         Item {

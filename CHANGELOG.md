@@ -2,7 +2,7 @@
 
 What changed in each release, newest first. The release workflow copies the section for the tag being released to the top of the release notes and refuses to publish without one.
 
-## 2.6.14 (2026-11-24)
+## 2.6.14 (2026-11-25)
 
 What changed: The weekly check is quieter and more reliable, and a pin can no longer crowd out the start of a conversation. Restart Claude Code once after the update, because the part that saves and looks up notes changed.
 
@@ -21,6 +21,11 @@ What changed: The weekly check is quieter and more reliable, and a pin can no lo
 - **A few calls that only looked harmless no longer slip past a rule.** A word like `-n` or `-WhatIf` handed to a program as a value, for example `git push -o -n`, used to make the whole call count as "does nothing".
 - **Rules on files also guard a multi-part edit.** A change that a rule refused as one edit was let through when it came as several edits in one call. A path written with `..` in it, and a protected file name in capitals, are now recognised as well.
 - **The notes beside the memory stay whole when many conversations end at once.** They are written in one piece and no longer lose an update or end up with extra text behind them, and a file that cannot be read is kept as it is instead of being emptied.
+- **The end-of-turn upkeep no longer starves.** When one step was slow, the steps behind it, such as the weekly check and the report check, could be skipped turn after turn. The steps one turn did not reach now go first at the next one.
+- **`serve sweep` no longer hangs on the route check.** It now stops at its time limit and says how far it got, and it searches the record of calls much faster.
+- **A note you silenced no longer owes a verdict for ever.** A note that was marked as not belonging at every place it fired is no longer counted in the list of notes to judge, and no longer keeps the weekly check daily. If it fires somewhere new, it counts again.
+- **`doctor` names notes that exist in two versions.** Such a note is skipped everywhere, so a rule among them does nothing; doctor now lists them and says how to settle them.
+- **The weekly check says why it is daily.** The request and `doctor` now name the reason a project is on the daily rhythm.
 
 ## 2.6.13 (2026-11-21)
 

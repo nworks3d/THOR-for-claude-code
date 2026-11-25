@@ -419,7 +419,7 @@ fn owed_items(store: &EventStore) -> Vec<Owed> {
     let served = served_since_last_verdict(store);
     let live = crate::live::live_items(store);
     let live_by_id: HashMap<&str, &crate::live::LiveItem> = live.iter().map(|li| (li.id.as_str(), li)).collect();
-    served
+    let candidates: Vec<Owed> = served
         .into_iter()
         .filter(|(_, count)| *count >= JUDGEMENT_DEBT_AFTER)
         .filter_map(|(id, count)| {
@@ -427,7 +427,45 @@ fn owed_items(store: &EventStore) -> Vec<Owed> {
             Some(Owed { id, count, project: li.item.project.clone(), kind: li.item.kind, bindings: li.item.bindings.clone() })
         })
         .filter(|o| !is_pinned(&o.bindings))
+        .collect();
+    if candidates.is_empty() {
+        return candidates;
+    }
+    // An item silenced at every place it fired since its last verdict can never
+    // fire again there, so no evaluation can list it: it owes nothing.
+    let decay = crate::decay::DecayContext::load(store);
+    let attested = model::store::attested_write_seqs(store);
+    candidates
+        .into_iter()
+        .filter(|o| !live_by_id.get(o.id.as_str()).is_some_and(|li| silenced_wherever_it_fired(store, &decay, &attested, &li.item)))
         .collect()
+}
+
+/// Whether `item` is silenced (`DecayContext::is_stale_at_place`) at every place
+/// it has fired since its last attested verdict. A serving that recorded no
+/// place, or one this item has no place for, is not silenced: it can fire there
+/// again, and then it is owed as usual.
+fn silenced_wherever_it_fired(store: &EventStore, decay: &crate::decay::DecayContext, attested: &HashSet<i64>, item: &model::item::Item) -> bool {
+    if decay.is_stale(item) {
+        return true;
+    }
+    let events = store.get_events_by_entity(&item.id).unwrap_or_default();
+    let last_verdict = events
+        .iter()
+        .filter(|e| matches!(e.kind, EventKind::ItemMarkedUseful | EventKind::ItemMarkedNoise) && attested.contains(&e.seq))
+        .map(|e| e.seq)
+        .max()
+        .unwrap_or(0);
+    let mut fired = false;
+    for event in events.iter().filter(|e| e.seq > last_verdict && e.kind == EventKind::ItemServed && e.actor == ASSISTANT_DELIVERY_ACTOR) {
+        fired = true;
+        let trigger = serde_json::from_str::<model::served::ItemServed>(&event.body).ok().and_then(|b| b.trigger).unwrap_or_default();
+        let places = crate::rank::places_of_trigger(item, &trigger);
+        if places.is_empty() || !places.iter().all(|place| decay.is_stale_at_place(item, place)) {
+            return false;
+        }
+    }
+    fired
 }
 
 /// (store-wide count of items in judgement debt, how many of those this
@@ -1193,6 +1231,16 @@ pub fn cadence_for(plan: crate::plan::Plan) -> EvalCadence {
     }
 }
 
+/// What doctor adds to the cadence line for a project that is on the daily
+/// rhythm: the reason, in words. `None` when it is not.
+pub fn rot_clause(store: &EventStore, cadence: EvalCadence, project: Option<&str>) -> Option<String> {
+    if cadence != EvalCadence::WeeklyUnlessRot {
+        return None;
+    }
+    let reason = crate::eval_filing::project_rot(store, project?)?;
+    Some(format!("; project '{}' is on the daily rhythm now: {reason}", project?))
+}
+
 /// The one sentence doctor prints about the cadence.
 pub fn cadence_clause(cadence: EvalCadence) -> &'static str {
     match cadence {
@@ -1205,6 +1253,13 @@ pub fn cadence_clause(cadence: EvalCadence) -> &'static str {
 /// The one plain line an evaluation ask carries about which rhythm applies and
 /// why. `rot` is whether the project shows rot right now.
 pub fn mode_line(cadence: EvalCadence, rot: bool) -> String {
+    mode_line_why(cadence, rot.then_some(""))
+}
+
+/// `mode_line` with the reason the project shows rot (`eval_filing::project_rot`):
+/// a daily rhythm says why it is daily. An empty reason says nothing more.
+pub fn mode_line_why(cadence: EvalCadence, rot_reason: Option<&str>) -> String {
+    let rot = rot_reason.is_some();
     match (cadence, rot) {
         (EvalCadence::Weekly, _) => format!(
             "Rhythm: your plan is a smaller one, so this check runs once a week at most ({EVAL_WEEKLY_DAYS} days), never daily, to leave your limit for your own work."
@@ -1213,10 +1268,13 @@ pub fn mode_line(cadence: EvalCadence, rot: bool) -> String {
             "Rhythm: your plan is Max, and the project looks clean, so this check runs once a week ({EVAL_WEEKLY_DAYS} days)."
         ),
         (EvalCadence::Off, _) => "Rhythm: the weekly check is switched off.".to_string(),
-        (EvalCadence::WeeklyUnlessRot, true) => {
-            "Rhythm: your plan is Max and something is wrong in this project, so the check runs daily until a counting evaluation finds nothing; then it goes back to once a week."
-                .to_string()
-        }
+        (EvalCadence::WeeklyUnlessRot, true) => match rot_reason.filter(|r| !r.trim().is_empty()) {
+            Some(reason) => format!(
+                "Rhythm: your plan is Max and something is wrong in this project, so the check runs daily until a counting evaluation finds nothing; the reason now: {reason}. Then it goes back to once a week."
+            ),
+            None => "Rhythm: your plan is Max and something is wrong in this project, so the check runs daily until a counting evaluation finds nothing; then it goes back to once a week."
+                .to_string(),
+        },
     }
 }
 
@@ -2529,7 +2587,11 @@ mod eval_debt_predicate_tests {
         assert!(clean.contains("Max") && clean.contains("once a week"), "{clean}");
         let rot = mode_line(EvalCadence::WeeklyUnlessRot, true);
         assert!(rot.contains("Max") && rot.contains("daily") && rot.contains("something is wrong"), "{rot}");
-        for line in [small, clean, rot] {
+        let why = mode_line_why(EvalCadence::WeeklyUnlessRot, Some("3 item(s) owe a verdict"));
+        assert!(why.contains("daily until a counting evaluation finds nothing; the reason now: 3 item(s) owe a verdict."), "{why}");
+        assert_eq!(mode_line_why(EvalCadence::WeeklyUnlessRot, None), clean);
+        assert_eq!(mode_line_why(EvalCadence::Weekly, Some("anything")), small, "a small plan is never daily, so no reason");
+        for line in [small, clean, rot, why] {
             assert!(!line.contains('\n'), "one line: {line}");
         }
     }

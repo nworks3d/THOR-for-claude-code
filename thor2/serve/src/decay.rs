@@ -233,7 +233,21 @@ impl DecayContext {
         if !tally.places.values().any(|n| enough_marks(*n)) {
             return false;
         }
-        crate::rank::matched_places(item, input).iter().any(|place| enough_marks(tally.at(place)))
+        crate::rank::matched_places(item, input).iter().any(|place| self.is_stale_at_place(item, place))
+    }
+
+    /// Whether this item is silenced at one place (a label of `rank::
+    /// matched_places`): stale everywhere, or called noise often enough at
+    /// that very place. THE one definition of "silenced at this place": the
+    /// serving paths and the judgement debt both ask it.
+    pub fn is_stale_at_place(&self, item: &Item, place: &str) -> bool {
+        if self.is_stale(item) {
+            return true;
+        }
+        if Self::is_exempt(item) {
+            return false;
+        }
+        self.noise.get(&item.id).is_some_and(|tally| enough_marks(tally.at(place)))
     }
 
     /// Where the noise marks of `id` stand, for the mark tool's reply.

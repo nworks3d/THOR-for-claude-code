@@ -413,15 +413,59 @@ pub fn for_each_call_after(db: &Path, now: i64, after: Option<&str>, visit: impl
 /// are kept (the third answer says whether older ones were dropped), so a rule
 /// that can reach any call cannot hold the whole corpus in memory.
 pub fn select_calls(db: &Path, now: i64, limit: usize, wanted: &dyn Fn(&str) -> bool) -> (Vec<CallRow>, u64, bool) {
+    let (picked, total, dropped, _) = select_calls_until(db, now, limit, wanted, None);
+    (picked, total, dropped)
+}
+
+/// Where a scan with a deadline stopped: the bytes of the file it read, and
+/// the size of the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanStopped {
+    pub read_bytes: u64,
+    pub file_bytes: u64,
+    /// The calls it had looked at when it stopped.
+    pub calls_seen: u64,
+}
+
+impl ScanStopped {
+    /// About how many calls the whole file holds, from the part that was read.
+    pub fn calls_in_all(&self) -> u64 {
+        if self.read_bytes == 0 {
+            return self.calls_seen;
+        }
+        (self.calls_seen as u128 * self.file_bytes as u128 / self.read_bytes as u128) as u64
+    }
+}
+
+/// `select_calls` that gives up at `deadline`: the fourth answer says where it
+/// stopped, and the rows picked so far are still returned.
+pub fn select_calls_until(
+    db: &Path,
+    now: i64,
+    limit: usize,
+    wanted: &dyn Fn(&str) -> bool,
+    deadline: Option<Instant>,
+) -> (Vec<CallRow>, u64, bool, Option<ScanStopped>) {
     let from = now - KEEP_DAYS * 86_400;
-    let Ok(file) = std::fs::File::open(calls_path(db)) else { return (Vec::new(), 0, false) };
+    let Ok(file) = std::fs::File::open(calls_path(db)) else { return (Vec::new(), 0, false, None) };
+    let file_bytes = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut read_bytes = 0u64;
+    let mut calls_seen = 0u64;
+    let mut stopped: Option<ScanStopped> = None;
     let mut total = 0u64;
     let mut dropped = false;
     let mut picked: std::collections::VecDeque<CallRow> = std::collections::VecDeque::new();
     let mut patches: HashMap<String, CallRow> = HashMap::new();
     let mut seen: HashSet<String> = HashSet::new();
+    let mut lines_read = 0u64;
     for line in std::io::BufReader::new(file).lines() {
         let Ok(line) = line else { break };
+        read_bytes += line.len() as u64 + 1;
+        lines_read += 1;
+        if lines_read % 512 == 0 && deadline.is_some_and(|d| Instant::now() >= d) {
+            stopped = Some(ScanStopped { read_bytes, file_bytes, calls_seen });
+            break;
+        }
         if line.starts_with("{\"k\":\"r\"") {
             if let Ok(row) = serde_json::from_str::<CallRow>(&line) {
                 match patches.get_mut(&row.id) {
@@ -436,6 +480,7 @@ pub fn select_calls(db: &Path, now: i64, limit: usize, wanted: &dyn Fn(&str) -> 
         if !line.starts_with("{\"k\":\"c\"") {
             continue;
         }
+        calls_seen += 1;
         if time_of_line(&line).is_none_or(|t| t >= from) {
             total += 1;
         }
@@ -457,7 +502,7 @@ pub fn select_calls(db: &Path, now: i64, limit: usize, wanted: &dyn Fn(&str) -> 
             apply(row, patch);
         }
     }
-    (picked, total, dropped)
+    (picked, total, dropped, stopped)
 }
 
 /// The `t` of a call line, read off its start without parsing the line.
@@ -1236,6 +1281,29 @@ mod tests {
         assert_eq!(refusal_of("Exit code 1\nboom"), (Vec::new(), false));
         let other = "PreToolUse:Bash hook error: precommit gate says no";
         assert_eq!(refusal_of(other), (Vec::new(), true));
+    }
+
+    fn corpus_with_calls(n: usize) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        let mut text = String::new();
+        for i in 0..n {
+            text.push_str(&format!("{{\"k\":\"c\",\"id\":\"c{i}\",\"t\":1800000000,\"tool\":\"Bash\"}}\n"));
+        }
+        std::fs::write(calls_path(&db), text).unwrap();
+        (dir, db)
+    }
+
+    #[test]
+    fn a_scan_past_its_deadline_stops_and_says_where() {
+        let (_dir, db) = corpus_with_calls(5000);
+        let now = 1_800_000_100;
+        let (rows, _, _, stopped) = select_calls_until(&db, now, 100_000, &|_| true, Some(Instant::now()));
+        let stop = stopped.expect("the deadline had passed");
+        assert!(rows.len() < 5000 && stop.calls_seen < 5000, "{} rows, {stop:?}", rows.len());
+        assert!(stop.calls_in_all() >= stop.calls_seen);
+        let (rows, total, _, stopped) = select_calls_until(&db, now, 100_000, &|_| true, None);
+        assert_eq!((rows.len(), total, stopped), (5000, 5000, None), "no deadline reads it all");
     }
 
     #[test]

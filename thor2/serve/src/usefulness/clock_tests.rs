@@ -362,3 +362,61 @@ fn debt_nobody_can_be_handed_is_not_rot() {
     // doctor's own count is untouched by the narrower rot test
     assert_eq!(judgement_debt_counts(&store, Some("fxp")).1, 1);
 }
+
+// ------------------------------------------------- a silenced note owes no verdict
+
+fn serve_at(store: &mut EventStore, session: &str, id: &str, trigger: &str) {
+    let at = crate::time::iso8601_from_unix(crate::time::now_unix());
+    crate::deliver::record_delivery_with_trigger(store, session, session, ASSISTANT_DELIVERY_ACTOR, &at, &[id.to_string()], Some(trigger));
+}
+
+fn noise(store: &mut EventStore, id: &str, place: Option<&str>) {
+    let at = crate::time::iso8601_from_unix(crate::time::now_unix());
+    crate::mark::record_noise_at(store, "mark-session", "l", "a", &at, id, None, place).unwrap();
+}
+
+fn declared(store: &mut EventStore, id: &str) {
+    let mut item = rule(id, "fxp");
+    item.bindings = vec![
+        Binding::Target { kind: TargetKind::Command, value: "fixture-alpha".to_string() },
+        Binding::Target { kind: TargetKind::Command, value: "fixture-beta".to_string() },
+    ];
+    item.falsifier = Some("the fixture note is wrong".to_string());
+    model::store::declare(store, "fixture", "fixture", "fixture", &item).unwrap();
+}
+
+/// Two unattested noise marks (from before attested marks existed) silence a
+/// note everywhere, so it never fires again and no evaluation can list it.
+#[test]
+fn a_note_silenced_everywhere_owes_no_verdict() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = EventStore::new(&dir.path().join("thor.db")).unwrap();
+    declared(&mut store, "fx-quiet");
+    for i in 0..model::store::JUDGEMENT_DEBT_AFTER {
+        serve_at(&mut store, &format!("s-{i}"), "fx-quiet", "fixture-alpha run");
+    }
+    assert_eq!(judgement_debt_counts(&store, Some("fxp")), (1, 1), "fixture sanity: owed before it was silenced");
+    noise(&mut store, "fx-quiet", None);
+    noise(&mut store, "fx-quiet", None);
+    assert_eq!(judgement_debt_counts(&store, Some("fxp")), (0, 0));
+    assert!(judgement_debt_named(&store, Some("fxp")).is_empty());
+}
+
+/// Silenced at the place it fired: owes nothing; fired at a new place: owed again.
+#[test]
+fn a_note_silenced_at_every_place_it_fired_owes_nothing_until_it_fires_somewhere_new() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = EventStore::new(&dir.path().join("thor.db")).unwrap();
+    declared(&mut store, "fx-place");
+    for i in 0..model::store::JUDGEMENT_DEBT_AFTER {
+        serve_at(&mut store, &format!("s-{i}"), "fx-place", "fixture-alpha run");
+    }
+    noise(&mut store, "fx-place", Some("command:fixture-alpha"));
+    noise(&mut store, "fx-place", Some("command:fixture-alpha"));
+    assert_eq!(judgement_debt_counts(&store, Some("fxp")), (0, 0), "silenced at its only place");
+    serve_at(&mut store, "s-new", "fx-place", "fixture-beta run");
+    for i in 0..model::store::JUDGEMENT_DEBT_AFTER {
+        serve_at(&mut store, &format!("t-{i}"), "fx-place", "fixture-beta run");
+    }
+    assert_eq!(judgement_debt_counts(&store, Some("fxp")), (1, 1), "it fired at a place that is not silenced");
+}

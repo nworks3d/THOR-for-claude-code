@@ -1197,8 +1197,10 @@ something it names - the verdicts and repairs are yours.
 
 **The end of a turn is quick, and has a time limit.** The upkeep THOR does at a Stop (checking earlier
 writes against the conversation, filing reports, the crowding check, the evaluation ask) stops after 5
-seconds of its own time and finishes at the next Stop. The checks that refuse or protect are not part of
-that and always run. `doctor` shows how often it happened; nothing is needed from the person.
+seconds of its own time and finishes at the next Stop. The steps one Stop did not get to are the first to
+run at the next Stop of that conversation, so a slow step cannot keep the others waiting for ever. The
+checks that refuse or protect are not part of that and always run. `doctor` shows how often it happened;
+nothing is needed from the person.
 
 **At the end of a turn it may hold you, but only for what you did yourself.**
 THOR asks for one small thing at a time and will not let the turn close until
@@ -1342,7 +1344,8 @@ half an hour or more never counts.
      with `revise` (a narrower check, a better anchor, and a `because` of 20+
      characters); if the rule was right, say so in the report with the id. It is
      done when each one has one of those outcomes in your report. `doctor` shows
-     the same rules in one line; `serve --db "<their store>" sweep` shows all of it.
+     the same rules in one line; `serve --db "<their store>" sweep` shows all of it (its
+     route check stops at the time given with `--budget-secs` and says how far it got).
      The probable false blocks (a refusal followed by a weakening of the rule) are
      listed worst first, the rules that refused the most real calls on top, at most
      8; when more exist the line says so and names the command that lists every

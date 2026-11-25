@@ -1671,7 +1671,7 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
         // catch the log up with things already done each ask it before they
         // start, and once it is spent they wait for the next Stop. The checks
         // that refuse or protect never ask.
-        let budget = serve::stop_budget::StopBudget::new();
+        let budget = serve::stop_budget::StopBudget::for_session(db_path, &session_id);
         if !no_record {
             if let Ok(mut store) = serve::store_dir::open_existing(db_path) {
                 if budget.allow(db_path, "refusal verifications", true) {
@@ -4487,8 +4487,9 @@ fn evaluation_ask(
     // THE RHYTHM (part G): one evaluation per week per project, daily on Max
     // while rot is found. The ask says which applies, in one plain line.
     let cadence = usefulness::cadence_in(db_path);
-    let rot = cadence == usefulness::EvalCadence::WeeklyUnlessRot && serve::eval_filing::project_rot(store, project).is_some();
-    let mode = usefulness::mode_line(cadence, rot);
+    let rot_reason = (cadence == usefulness::EvalCadence::WeeklyUnlessRot).then(|| serve::eval_filing::project_rot(store, project)).flatten();
+    let rot = rot_reason.is_some();
+    let mode = usefulness::mode_line_why(cadence, rot_reason.as_deref());
     let quiet_days = usefulness::covers_hours(cadence, rot) / 24;
     // How many times this project has already been asked since its last
     // report, and since when - the count and clock this very ask is about to
