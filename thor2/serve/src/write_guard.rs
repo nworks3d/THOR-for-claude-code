@@ -127,6 +127,10 @@ impl Protected {
         let Some(dir) = &self.name_dir else { return true };
         let inside = |p: &str| p == dir || p.starts_with(&format!("{dir}/"));
         brace_forms(written).iter().any(|form| {
+            // A folder given by a variable that is not known (`$STOREDIR/x`) may be this one.
+            if form.trim_matches(|c| c == '"' || c == '\'').starts_with(['$', '%']) {
+                return true;
+            }
             let place = match form.rfind(['/', '\\']) {
                 Some(i) => self.resolve(&form[..=i], cwd),
                 None => match cwd {
@@ -210,8 +214,12 @@ impl Protected {
             return forms::clean_path(&path);
         }
         match cwd {
-            Some(dir) if !path.starts_with('$') && !path.starts_with('%') => forms::clean_path(&fold(&format!("{dir}/{path}"))),
-            _ => path,
+            // A target led by a variable (`$n.new.exe`) is not known; it is read inside the working
+            // folder, which only matters when that folder is a protected one.
+            // A variable followed by a folder separator (`$S/out`) is most likely an absolute folder.
+            Some(_) if path.starts_with(['$', '%']) && path.contains('/') => path,
+            Some(dir) => forms::clean_path(&fold(&format!("{dir}/{path}"))),
+            None => path,
         }
     }
 
@@ -732,6 +740,9 @@ const SQL_WRITES: &[&str] =
 const INSTALLER_FLAGS: &[&str] = &["--db", "--set-", "--topic", "--uninstall", "--register-root", "--tidy", "--copy-from", "--project"];
 
 fn command_writes_protected(p: &Protected, command: &str, cwd: Option<&str>, depth: usize) -> bool {
+    // A line continuation (backslash or backtick, then a new line) is nothing: `echo x >\<new line>file`.
+    let joined = command.replace("\\\r\n", "").replace("\\\n", "").replace("`\r\n", "").replace("`\n", "");
+    let command = joined.as_str();
     let mut segment: Vec<String> = Vec::new();
     let mut redirected = false;
     // Each command: its words, the files it redirects into, and whether it pipes into the next.
@@ -827,7 +838,13 @@ fn command_writes_protected(p: &Protected, command: &str, cwd: Option<&str>, dep
             };
             if MOVERS_OF_THE_WORKING_FOLDER.contains(&name.as_str()) {
                 let target = rest.iter().find(|w| !w.starts_with('-') && !(w.starts_with('/') && w.len() <= 3));
-                if let Some(target) = target {
+                // A bare `cd` and `cd ~` go to the home folder.
+                let home_move = matches!(name.as_str(), "cd" | "chdir" | "set-location" | "sl") && target.is_none_or(|t| t == "~");
+                if home_move {
+                    if let Some((_, home)) = p.vars.iter().find(|(n, _)| n == "userprofile" || n == "home") {
+                        here = Some(home.clone());
+                    }
+                } else if let Some(target) = target.filter(|t| !t.starts_with('$') && !t.starts_with('%')) {
                     let moved = p.resolve(target, here.as_deref());
                     if is_absolute(&moved) {
                         here = Some(moved);
@@ -1154,7 +1171,9 @@ fn segment_writes_protected(p: &Protected, words: &[String], cwd: Option<&str>, 
                 let l = w.to_ascii_lowercase();
                 l == "-o" || l == "-destination" || (l.len() >= 3 && "-outfile".starts_with(l.as_str()))
             });
-            named.filter_map(|(i, _)| rest.get(i + 1)).any(|w| p.protects(w, cwd))
+            // `Start-BitsTransfer <source> <destination>`: the second position is the destination.
+            let by_position = name == "start-bitstransfer" && positionals.get(1).is_some_and(|d| p.protects(d, cwd));
+            by_position || named.filter_map(|(i, _)| rest.get(i + 1)).any(|w| p.protects(w, cwd))
         }
         "start-transcript" => any(&after_flag(&["-path", "-literalpath", "-outputdirectory"])),
         "sponge" | "script" => any(&positionals),
@@ -1168,7 +1187,7 @@ fn segment_writes_protected(p: &Protected, words: &[String], cwd: Option<&str>, 
         "zip" => positionals.first().is_some_and(|a| p.protects(a, cwd)),
         "ed" | "red" | "ex" => any(&positionals),
         "vi" | "vim" | "nvim" | "view" => has_flag(&["-es", "-s", "-e"]) && any(&positionals),
-        "expand" => positionals.len() >= 2 && positionals.last().is_some_and(|d| p.protects(d, cwd)),
+        "expand" => positionals.len() >= 2 && positionals.last().is_some_and(|d| p.protects(d, cwd) || p.receives_tree(d, cwd)),
         "makecab" => positionals.get(1).is_some_and(|d| p.protects(d, cwd)),
         // `forfiles /p <folder> /c "cmd /c del @file"`: a command run on every file of the folder.
         "forfiles" => {
@@ -2350,6 +2369,60 @@ mod tests {
         assert!(refused_in(&g, "PowerShell", "gci C:\\data\\store -Filter owner* | Remove-Item", Some("C:/work")));
         assert!(refused_in(&g, "Bash", "echo x >> C:/data/store/owner-p*", Some("C:/work")));
         assert!(!refused_in(&g, "Bash", "echo x >> C:/work/owner-p*", Some("C:/work")));
+    }
+
+    #[test]
+    fn a_home_cd_a_line_continuation_and_a_relative_target_in_a_protected_folder_are_seen() {
+        let mut g = guard_with_variables();
+        g.programs_dir = Some("c:/users/alex/thor2/bin".to_string());
+        let sh = |c: &str, cwd: &str| refused_in(&g, "Bash", c, Some(cwd));
+        // 3. A bare cd goes home; relative targets then read from there.
+        assert!(sh("cd; echo x > .claude/projects/p/s.jsonl", "C:/work"));
+        assert!(sh("cd ~; echo x >> .claude/projects/p/s.jsonl", "C:/work"));
+        assert!(refused_in(&g, "PowerShell", "Set-Location ~; Add-Content .claude\\projects\\p\\s.jsonl x", Some("C:/work")));
+        assert!(!sh("cd; echo x > notes.txt", "C:/work"));
+        // A folder given by an unknown variable may be the memory's: the name lock holds.
+        let lock = locked();
+        assert!(refused_in(&lock, "Bash", "echo x > $STOREDIR/owner-prompts.jsonl", Some("C:/work")));
+        assert!(!refused_in(&lock, "Bash", "echo x > $WORK/notes.txt", Some("C:/work")));
+        assert!(!sh("cd ~; echo x > .claude/settings.json", "C:/work"));
+        // 4. A continuation between a redirect and its target.
+        assert!(sh("echo x >\\\nC:/data/store/a.json", "C:/work"));
+        assert!(refused_in(&g, "PowerShell", "'x' | Out-File -FilePath `\nC:\\data\\store\\a.json", Some("C:/work")));
+        assert!(!sh("echo x >\\\nC:/scratch/a.json", "C:/work"));
+        // 5. After a cd into a protected folder a writer with a relative or variable-built target writes inside.
+        assert!(sh("cd C:/Users/alex/thor2/bin || exit 1; for n in serve mcp; do cp \"$src\" \"$n.new.exe\"; mv \"$n.new.exe\" \"$n.exe\"; done", "C:/work"));
+        assert!(sh("cd C:/Users/alex/thor2/bin && cp x serve.exe", "C:/work"));
+        assert!(sh("cd C:/data/store && echo x > session-watermark.json", "C:/work"));
+        assert!(sh("cd C:/data/store && cp \"$f\" \"$n.json\"", "C:/work"));
+        assert!(sh("cd C:/Users/alex/thor2/bin && rm old.exe && tee x.exe < y", "C:/work"));
+        assert!(refused_in(&g, "PowerShell", "cd C:\\Users\\alex\\thor2\\bin; Copy-Item a b.exe; Set-Content c.exe x", Some("C:/work")));
+        // Reading programs after such a cd, and an absolute target elsewhere, stay free.
+        for command in [
+            "cd C:/Users/alex/thor2/bin && ./serve.exe --version",
+            "cd C:/Users/alex/thor2/bin && ls",
+            "cd C:/Users/alex/thor2/bin && cat serve.log",
+            "cd C:/Users/alex/thor2/bin && sha256sum *",
+            "cd C:/Users/alex/thor2/bin && cp serve.exe C:/scratch/serve.exe",
+            "cd C:/Users/alex/thor2/bin && echo x > C:/scratch/out.txt",
+            "cd C:/data/store && echo x > notes.txt",
+            "cd C:/data/store && ls && cat thor.db > C:/scratch/copy.db",
+            "cd C:/work && cp a \"$n.new.exe\"",
+            "cd C:/Users/alex/thor2/bin && ./serve.exe doctor > \"$S/out.txt\"",
+            "cd C:/Users/alex/thor2/bin; cp \"$SRC/serve.exe\" $DEST/serve.copy",
+        ] {
+            assert!(!sh(command, "C:/work"), "{command}");
+        }
+    }
+
+    #[test]
+    fn a_second_positional_destination_and_an_expand_folder_are_refused() {
+        let g = guard();
+        assert!(refused_in(&g, "PowerShell", "Start-BitsTransfer http://example.test/x C:\\data\\store\\a.json", None));
+        assert!(refused_in(&g, "PowerShell", "expand -F:* a.cab C:\\data\\store", None));
+        assert!(refused_in(&g, "Bash", "expand -F:* a.cab C:/data/store", None));
+        assert!(!refused_in(&g, "PowerShell", "Start-BitsTransfer http://example.test/x C:\\scratch\\a.json", None));
+        assert!(!refused_in(&g, "PowerShell", "expand -F:* a.cab C:\\scratch\\out", None));
     }
 
     /// Not run by default: like `replay_the_real_calls`, but over the real-calls file itself

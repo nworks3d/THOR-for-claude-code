@@ -504,7 +504,7 @@ Words used once, in plain language:
   `[Diagnostics.Process]::Start`, because it would forge a record, unless the run carries `--no-record`,
   `--diagnose`, `--help`/`-h` or `--version`/`-V` (exactly the flags `serve` honours; a probe: it writes no owner record, starts no evaluation and
   moves no setting-file record); `cargo test -p serve hook`, `grep serve hook`
-  and `npx serve` are not refused (`serve` is not THOR's program there). A script file, a variable that
+  and `npx serve` are not refused (`serve` is not THOR's program there). A bare `serve hook` (any program on the search path called `serve` with the word `hook`) is refused all the same, because THOR's program cannot be told from it by name. A script file, a variable that
   holds the program, and a copy under another name are not seen. An answer that does not name the note
   counts only after an assistant question about exactly that one note: the sentence with the question
   mark (or the sentence right before a short question such as "Mag dat?") must name the note and what
@@ -880,6 +880,13 @@ remembers per session how far it has looked, so a long conversation does not mak
   `find -exec sh -c '...'` (the string is not read), `python -m json.tool` style modules that write, a name
   spelled with `$'...'` or split by a backslash, and a program that runs another through a wrapper this guard
   does not know (it knows `sudo`, `env`, `time`, `command`, `exec`, `nohup`, `busybox`, `xargs`).
+  After a `cd` into the memory's folder, THOR's programs or a folder of saved conversations (also a bare
+  `cd` or `cd ~` into the home folder and a relative path from there), a writer (cp, mv, rm, tee, a
+  redirect, Copy-Item, Set-Content...) whose target is relative, or led by a variable such as `$n.new.exe`,
+  is read as writing inside that folder; reading programs there (`./serve.exe --version`, `ls`, `cat`,
+  `sha256sum *`) and a writer with an absolute target elsewhere are free. A line continuation between a
+  redirect and its target is joined first. `Start-BitsTransfer <source> <destination>` and
+  `expand <cab> <folder>` are read by position.
   A delete pipeline that starts at a protected folder is refused whatever filter stands between
   (`gci <folder> -Filter *.log | Remove-Item`, `Where-Object`, `-Include`): the filter is not read, so a
   harmless delete of the memory folder's own log files by pipeline is refused too (name the files instead).
