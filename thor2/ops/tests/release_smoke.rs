@@ -681,7 +681,7 @@ impl Smoke {
         let parsed: Value =
             serde_json::from_str(out.stdout.trim()).map_err(|e| format!("hook output is not JSON ({e}): {}", out.stdout))?;
         let context = parsed["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or("");
-        for needed in ["never-commit-a-secret", "run-the-tests-before-saying-done"] {
+        for needed in ["never-commit-a-secret", "commit-hygiene"] {
             if !context.contains(needed) {
                 return Err(format!("a git commit was not answered with {needed}. It was answered with:\n{context}"));
             }

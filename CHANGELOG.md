@@ -31,6 +31,15 @@ What changed: The weekly check is quieter and more reliable, and a pin can no lo
 - **The start of every conversation is yours alone.** Your assistant can no longer pin a note by itself: it has to ask you whether the note must come along in every conversation, and THOR accepts the pin only with your own message quoted. A note that is already pinned can still be maintained.
 - **A subject's folder brings its notes without pinning.** In a folder made for one subject, a note tied to that subject comes up when your message shares a word with it. The setup texts no longer tell your assistant to pin.
 - **A code project is asked once about a changelog and version numbers.** When a project gets its own memory, your assistant asks one question with its two reasons: a fault is found much faster, and it saves effort and cost. On yes, THOR's notes already know the flow: a changelog line with every visible change, a changelog section before a release, small version steps, and the version read from git. On no, it is off for that project and never raised there again. It never blocks anything.
+- **A no to the connections, the git helpers or the reply rules now stays a no.** Three switches (`--set-connections`, `--set-git-hooks`, `--set-reply-rules`) remove only THOR's own entries and remember your choice, so a later install does not wire them again, and `doctor` calls it your choice, not a problem.
+- **One THOR per computer account.** Installing a second memory while Claude Code is connected to another one is refused with a plain sentence and the switch that moves the connection (`--move-to-this-store`). Uninstalling removes every THOR connection, whatever memory it names.
+- **The changelog question is part of the welcome.** In a code project it is a fourth proposal, accepted by the plain yes and refused by "4 no". A project that gets its memory later is still asked on its own.
+- **Documents, Desktop and Downloads are no longer taken as one topic.** A folder inside them gets its own memory, and an old memory on one of those folders is reported, not taken over.
+- **"Helpers off" covers every note about helper assistants,** not only two of five.
+- **A second computer can copy from the local backup folder,** and a backup that cannot be reached is a plain sentence with the next step. A read-only copy no longer takes writes through its tool server.
+- **Installing a second project no longer asks for a restart** when nothing Claude Code loads at its start changed.
+- **A commit, a push and a publish keep room for your own first rule.** The starting notes now fill each of those places with at most three.
+- **Plainer texts:** the first proof copy of a local backup, the missing-program advice, the closing lines of the installer, and the count after deleting a memory.
 - **Starting the weekly check can no longer hold you for a minute.** The whole start now stops after 15 seconds. What did not fit is finished at the next step, and the note says THOR is still deciding. Checking a rule against its earlier refusals also got much faster.
 
 ## 2.6.13 (2026-11-21)

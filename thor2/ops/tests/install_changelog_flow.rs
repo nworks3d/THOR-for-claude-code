@@ -195,8 +195,36 @@ fn a_new_memory_has_the_flow_notes_and_off_leaves_them_selected_elsewhere_only()
     let shop = at_commit("demo-shop");
     let blog = at_commit("demo-blog");
     assert!(!shop.iter().any(|id| id == "changelog-with-every-user-visible-change"), "not selected where the answer is no: {shop:?}");
-    assert!(shop.iter().any(|id| id == "run-the-tests-before-saying-done"), "every other commit note stays: {shop:?}");
+    assert!(shop.iter().any(|id| id == "commit-hygiene"), "every other commit note stays: {shop:?}");
     assert!(blog.iter().any(|id| id == "changelog-with-every-user-visible-change"), "selected in another project: {blog:?}");
+}
+
+/// The release notes are bound to the commands a release is made with, so the
+/// commit, push and publish places keep room for the owner's own rule.
+#[test]
+fn the_release_notes_arrive_at_a_tag_and_a_release_and_no_place_holds_more_than_three_starters() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    ops::install::ensure_store(&db).unwrap();
+    let seeded = ops::install::seed_working_contract(&db).unwrap();
+    assert!(seeded.iter().all(|s| s.stored), "{:?}", seeded.iter().filter(|s| !s.stored).collect::<Vec<_>>());
+    let store = EventStore::open_read_only(&db).unwrap();
+    let candidates = serve::live::live_items(&store);
+    let decay = serve::decay::DecayContext::load(&store);
+    let at = |command: &str| {
+        let mut input = serve::input::ServeInput::default();
+        input.add_command(command);
+        let selected = serve::decay::retain_live_at(serve::rank::select(&candidates, &input), &decay, &input);
+        selected.into_iter().map(|r| r.id).collect::<Vec<_>>()
+    };
+    for command in ["gh release create v0.1.0 --notes x", "git tag v0.1.0"] {
+        let ids = at(command);
+        for id in &serve::changelog_flow::NOTE_IDS[1..] {
+            assert!(ids.iter().any(|i| i == id), "{id} is not served at '{command}': {ids:?}");
+        }
+    }
+    let starters_at_commit = at("git commit -m x").into_iter().filter(|id| serve::changelog_flow::NOTE_IDS.contains(&id.as_str()) || id.starts_with("commit-") || id.starts_with("never-commit")).count();
+    assert!(starters_at_commit <= 3, "a commit holds {starters_at_commit} starter notes");
 }
 
 #[test]

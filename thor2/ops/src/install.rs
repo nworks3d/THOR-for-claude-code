@@ -1352,7 +1352,10 @@ pub fn workflow_starter_pack_for(windows: bool) -> Vec<model::item::Item> {
              hooks with --no-verify: fix what the hook found. No red tests or stray TODO left at a push.",
             "A change pushed without a test or build run turns out to be as safe as one pushed after \
              a run.",
-            vec![moment(Action::Commit), moment(Action::Push)],
+            // The commit-time half of this note (run the tests or build first)
+            // lives in `commit-hygiene`, so a commit holds three starter notes
+            // with the changelog flow on, and a beginner's own rule still fits.
+            vec![moment(Action::Push)],
         ),
         note(
             "never-commit-a-secret",
@@ -1374,18 +1377,20 @@ pub fn workflow_starter_pack_for(windows: bool) -> Vec<model::item::Item> {
         ),
         note(
             "commit-hygiene",
-            "Commit message: one short plain line saying what changed and why, no marketing tone. \
-             Several lines: write the message to a file and use git commit -F. Stage only the files \
-             you mean. Keep each file's line endings: no CRLF flips, new files LF, a small diff.",
+            "Before a commit run the project's own tests or build and quote the real result; never skip \
+             hooks with --no-verify. Message: one short plain line, what and why, no marketing tone; \
+             several lines via git commit -F. Stage only what you mean. Keep each file's line \
+             endings: no CRLF flips, a small diff.",
             "A long marketing-style message, or a commit that flips a file's line endings, is found \
              as easy to read and review as a short plain one.",
             vec![moment(Action::Commit)],
         ),
         note(
             "check-where-you-push-and-what-is-on-main",
-            "Before a push, or a claim about what is on main or released, confirm folder, branch and \
-             remote (pwd, git status, git remote -v) and git fetch. A local origin/main can be stale: \
-             a version or release state comes from git, never from memory.",
+            "Before a push, or a claim about what is on main, confirm folder, branch, remote (pwd, git \
+             status, git remote -v) and git fetch; release state comes from git, never memory. To a \
+             public repository: scan for secrets, usernames, local paths, private hostnames, customer \
+             data; zero hits on every push.",
             "A claim about the remote's state made from a local ref or from memory turns out right as \
              often as one made after a fetch.",
             vec![moment(Action::Push)],
@@ -1397,7 +1402,9 @@ pub fn workflow_starter_pack_for(windows: bool) -> Vec<model::item::Item> {
              require zero hits on every push, not once. Public is irreversible: caches copy it in \
              minutes.",
             "A push to a public repository without a fresh scan turns out never to leak anything.",
-            vec![moment(Action::Publish), moment(Action::Push)],
+            // The push half is carried by `check-where-you-push-and-what-is-on-main`,
+            // so a push holds three starter notes and a publish holds this one.
+            vec![moment(Action::Publish)],
         ),
         note(
             "rehearse-destructive-steps-on-a-copy",
@@ -1577,7 +1584,15 @@ pub fn changelog_commit_note() -> model::item::Item {
 /// `install --set-changelog-flow on` stores them in an older one.
 pub fn changelog_flow_notes() -> Vec<model::item::Item> {
     use model::item::{Binding, TargetKind};
-    let release = || vec![Binding::Moment(intent::Action::Publish), Binding::Target { kind: TargetKind::Command, value: "git tag".to_string() }];
+    // The commands a release is made with, not the Publish moment: the
+    // scan-before-public note holds that place, so a publish never carries more
+    // than three starter notes with the flow on.
+    let release = || {
+        vec![
+            Binding::Target { kind: TargetKind::Command, value: "gh release create".to_string() },
+            Binding::Target { kind: TargetKind::Command, value: "git tag".to_string() },
+        ]
+    };
     vec![
         flow_note(
             "changelog-flow-release-opens-with-what-changed",
@@ -3597,13 +3612,17 @@ mod tests {
     fn the_starter_pack_does_not_crowd_a_place() {
         use std::collections::HashMap;
         let mut per_place: HashMap<String, usize> = HashMap::new();
-        for item in workflow_starter_pack() {
+        // The pack and the changelog flow together (a project that said yes):
+        // no place holds more than three starter notes, so the owner's own
+        // first rule on a commit, a push or a publish always fits in the block.
+        let flow: Vec<_> = changelog_flow_notes().into_iter().filter(|n| n.id != changelog_commit_note().id).collect();
+        for item in workflow_starter_pack().into_iter().chain(flow) {
             for b in &item.bindings {
                 *per_place.entry(format!("{b:?}")).or_default() += 1;
             }
         }
         for (place, n) in &per_place {
-            let cap = if place.starts_with("Target") { 2 } else { model::item::MAX_ITEMS };
+            let cap = if place.starts_with("Target") && !place.contains("git tag") && !place.contains("gh release create") { 2 } else { 3 };
             assert!(*n <= cap, "{place} holds {n} starter notes, over {cap}");
         }
     }

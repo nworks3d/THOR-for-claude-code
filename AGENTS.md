@@ -1052,7 +1052,7 @@ DETAIL PER ITEM (for the assistant: state an item's Why once, only when he asks 
    What it is: A set of 16 general work habits, stored as notes that arrive right before the step they are about, once per session: changelog with every user visible change; run the tests before saying done; never commit a secret; commit push deploy only when asked; commit hygiene; check where you push and what is on main; scan before it goes public; rehearse destructive steps on a copy; pin a dependency with its reason; absolute paths not the shell working directory; script file not shell quoting; keep only what is needed; windowless processes on windows; scheduled task not interactive; off topic work gets its own session; files go in the folder of their subject. 21 more notes teach your assistant how to write notes that come back and how to work with THOR. None of them blocks a normal step; on Windows two of them, about hidden console windows, refuse the one call that would flash a window. Three more notes of the same set are about helper assistants (name-a-model-on-every-agent, mechanical-brief-forbids-subagents-and-review, mid-task-message-does-not-redirect-an-agent): they are not in this list, they go with item 6 and stay until you say "helpers off".
    Why it exists: They are the habits that were marked useful again and again in a memory built over months of real work, so a new memory starts with that experience instead of learning it the hard way.
    What I chose: All on.
-   To say no: Name the ones you do not want, or say none: I remove just those notes (changelog-with-every-user-visible-change, run-the-tests-before-saying-done, never-commit-a-secret, commit-push-deploy-only-when-asked, commit-hygiene, check-where-you-push-and-what-is-on-main, scan-before-it-goes-public, rehearse-destructive-steps-on-a-copy, pin-a-dependency-with-its-reason, absolute-paths-not-the-shell-working-directory, script-file-not-shell-quoting, keep-only-what-is-needed, windowless-processes-on-windows, scheduled-task-not-interactive, off-topic-work-gets-its-own-session, files-go-in-the-folder-of-their-subject), and a removed note simply stops arriving. If a note refuses to be retracted because its check bites (the two Windows notes about hidden console windows can), I first clear its check with a revise that says why, then retract it.
+   To say no: Name the ones you do not want, or say none: I remove just those notes (changelog-with-every-user-visible-change, run-the-tests-before-saying-done, never-commit-a-secret, commit-push-deploy-only-when-asked, commit-hygiene, check-where-you-push-and-what-is-on-main, scan-before-it-goes-public, rehearse-destructive-steps-on-a-copy, pin-a-dependency-with-its-reason, absolute-paths-not-the-shell-working-directory, script-file-not-shell-quoting, keep-only-what-is-needed, windowless-processes-on-windows, scheduled-task-not-interactive, off-topic-work-gets-its-own-session, files-go-in-the-folder-of-their-subject), and a removed note simply stops arriving. The two Windows notes about hidden console windows retract at once in a new memory (the reply only warns that their refusing check goes with them); only after THOR has tried their check and it bites is the retract refused, and then I first clear its check with a revise that says why, then retract it.
 
 6. Helper assistants
    What it is: When it is on, your main assistant (the strongest model) answers, judges and checks, while cheaper models do the real work in helper assistants, one helper per task. No helper is used for a question or an answer, a trivial one-step job, work that needs this conversation's context or quick back-and-forth with you, or a check of a helper's own result: the main assistant does those itself. Tests are run narrowly while working and in full once at the end, and a helper that goes quiet is judged dead after about three checks. Why you may not want it: you do not see the work happen and cannot steer a helper halfway; each helper starts with a fixed context cost, so small tasks cost more, not less; a helper knows nothing of the conversation beyond its brief; parallel helpers can collide in the same files; and checking the result costs an extra turn. It is on in a new memory: five notes carry it. Two are about the mode itself (orchestrator-mode-saves-quota and an-agent-brief-stands-alone) and three are about how helpers are started (name-a-model-on-every-agent, mechanical-brief-forbids-subagents-and-review and mid-task-message-does-not-redirect-an-agent). To switch it off, say "helpers off" and I run: install --set-helpers off --db <store>; to switch it on again, install --set-helpers on --db <store>.
@@ -1115,22 +1115,27 @@ Before a commit or a push:
   flow for this project (or it already keeps a CHANGELOG), a line for every change a user
   can see, in the same commit; no changelog yet: create it; no version yet: propose 0.1.0.
   The changelog flow is asked ONCE per code project, see "The changelog flow" below.
-- `run-the-tests-before-saying-done` - run the project's own tests or build and
+- `run-the-tests-before-saying-done` - at a push: run the project's own tests or build and
   quote the real result line; never skip a hook with `--no-verify`.
 - `never-commit-a-secret` - real values in a gitignored file, a tracked template
   beside it, a look at what is staged, rotate anything that was committed.
-- `commit-hygiene` - a short plain message, `git commit -F` for several lines, stage
-  only what you mean, keep each file's line endings.
+- `commit-hygiene` - tests or build first at a commit, a short plain message,
+  `git commit -F` for several lines, stage only what you mean, keep each file's line endings.
 - `commit-push-deploy-only-when-asked` - only on the user's word in this session; no
   force-push of a shared branch.
 - `check-where-you-push-and-what-is-on-main` - folder, branch and remote, then fetch;
-  release state comes from git, never from memory.
-- `scan-before-it-goes-public` - zero hits for secrets, usernames, local paths and
-  private hostnames on every push to a public repository.
+  release state comes from git, never from memory; a push to a public repository also
+  gets a scan with zero hits.
+- `scan-before-it-goes-public` - at a publish: zero hits for secrets, usernames, local
+  paths and private hostnames before a repository is made public.
+
+No place (a commit, a push, a publish, a tag) holds more than three starter notes with
+the changelog flow on, so the owner's own first rule there always fits. An existing
+memory keeps the notes it has; only a new memory gets the arrangement above.
 
 The changelog flow (three more notes, tagged `changelog-flow` like the commit note
 above; they are stored in a new memory, and in an older one when the person says yes;
-none is pinned and none refuses anything). They arrive at a release, a tag or a publish:
+none is pinned and none refuses anything). They arrive at `git tag` and `gh release create`:
 
 - `changelog-flow-release-opens-with-what-changed` - the changelog gets a section for the
   new version BEFORE the version number goes up, in plain words for a user.
