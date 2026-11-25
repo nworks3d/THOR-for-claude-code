@@ -845,12 +845,12 @@ remembers per session how far it has looked, so a long conversation does not mak
   the protected folders and names and not against the disk; a PowerShell scriptblock or shell group
   (`& { Add-Content <file> x }`, `Start-Job {...}`, `ForEach-Object {...}`, `{ cmd; }`) read as commands, an
   `Add-Type -TypeDefinition` text checked for a .NET write (File.WriteAllText, StreamWriter, FileStream);
-  `printf '<command>' | sh` read as that command; `(cd <folder> && echo x > f)`; `echo x >&file`; `iwr -o`;
+  `printf '<command>' | sh` and `echo <file> | xargs rm` read as that command; `Push-Location <folder>` and `cmd /c cd /d <folder> & ...` as a cd; `Remove-Item (Get-ChildItem <folder>)` and `Get-Item <file> | Set-Content`; a program given with a path (`/usr/bin/install`, `C:\Windows\System32\robocopy.exe`); `robocopy <folder> x /MOVE`; `ed`, `ex`, `vim -es`, `expand`, `makecab`, `forfiles ... /c "cmd /c del"`, cmd `rename`, `for ... do copy`, `WebClient.DownloadFile`; `(cd <folder> && echo x > f)`; `echo x >&file`; `iwr -o`;
   plain output flags and writers (sort -o, tar -cf, zip, 7z a, find -fprint, sqlite3 `.output`, sponge,
   busybox, xargs <writer>, patch, openssl -out, pandoc -o, gpg -o, Start-Transcript, fsutil hardlink,
   git rm and mv, git bundle create, git config --file, cp -l and -s of a protected file, uniq, script,
   ssh -E); a git command that rewrites the working
-  tree there (`git -C <folder> reset --hard`, `clean`, `checkout`); a one-line program (python -c, node -e,
+  tree there (`git -C <folder> reset --hard`, `clean`, `checkout`, `git checkout <rev> <file>`, `checkout-index`, a clone into the folder or a subfolder); a one-line program (python -c, node -e,
   perl -e, ruby -e, php -r, awk) only when its write is aimed at such a path (open for writing, write_text,
   unlink, remove, rmtree, rename, a copy onto it, writeFileSync, an awk redirect, perl -pi, a sqlite write
   on the memory, a shell command in a string); `powershell -EncodedCommand` (decoded and read), `iex`.
@@ -872,9 +872,15 @@ remembers per session how far it has looked, so a long conversation does not mak
   commands (another machine), `schtasks /tr`, `eval`, a link or junction made in an earlier step and written through later, a hard link, a
   program started by another program, `Start-Process -ArgumentList`, a 8.3 name of a file that does not exist
   yet, a glob whose directory part is built at run time, a scriptblock written in a here-string and run
-  later, and a pipe delete that filters in between (`gci <folder> | Where-Object ... | Remove-Item` is let
-  through, because the filter may rule out the state files). It is a guard against a wrong turn, not a
-  security boundary against someone who is set on getting past it.
+  later, `deno`, `bun` and `tclsh` one-liners, chmod, icacls, attrib, Clear-Item, Set-ItemProperty, compact,
+  `git apply` and `git am` with the file named only inside the patch, `git worktree`, `git submodule`,
+  `find -exec sh -c '...'` (the string is not read), `python -m json.tool` style modules that write, a name
+  spelled with `$'...'` or split by a backslash, and a program that runs another through a wrapper this guard
+  does not know (it knows `sudo`, `env`, `time`, `command`, `exec`, `nohup`, `busybox`, `xargs`).
+  A delete pipeline that starts at a protected folder is refused whatever filter stands between
+  (`gci <folder> -Filter *.log | Remove-Item`, `Where-Object`, `-Include`): the filter is not read, so a
+  harmless delete of the memory folder's own log files by pipeline is refused too (name the files instead).
+  It is a guard against a wrong turn, not a security boundary against someone who is set on getting past it.
 - Refuse or change: built in. To change a THOR setting use the matching option of the install program.
 
 ### D8. Starter notes never refuse

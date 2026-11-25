@@ -2859,7 +2859,8 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             // The files only Claude Code and THOR write (saved conversations, the memory's folder,
             // THOR's programs): no call may write to them (`serve::write_guard`).
             if let Some(reason) = serve::write_guard::refusal(
-                &serve::write_guard::Protected::current(db_path),
+                &serve::write_guard::Protected::current(db_path)
+                    .and_name_lock_in_store(&[serve::unpin_gate::PROTECTED_FILE, serve::prompt_record::FILE]),
                 tool_name,
                 tool_input,
                 payload.get("cwd").and_then(|c| c.as_str()),

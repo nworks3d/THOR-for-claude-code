@@ -317,6 +317,8 @@ fn call_writes_protected(p: &Protected, call: &Call, vars: &[(String, Vec<String
         "writealltext" | "writeallbytes" | "writealllines" | "appendalltext" | "appendalllines" | "appendtext" | "createtext" | "openwrite"
         | "streamwriter" => hits(p, &first, cwd, false),
         "create" if module => hits(p, &first, cwd, false),
+        // `(New-Object Net.WebClient).DownloadFile(url, file)`
+        "downloadfile" if n >= 2 => hits(p, &all[1], cwd, false),
         "filestream" if writes_a_stream => hits(p, &first, cwd, false),
         "remove" | "delete" | "rm" if module => hits(p, &first, cwd, true),
         "write" | "binwrite" if matches!(call.name.as_str(), "file.write" | "io.write" | "file.binwrite" | "io.binwrite") => hits(p, &first, cwd, false),
