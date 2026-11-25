@@ -1368,7 +1368,7 @@ fn teeth_answer_contradictions(existing: Option<&Item>, updated: &Item) -> Resul
                 "the tag '{}' marks a requires check whose answer only the owner gives, and this item carries no requires check",
                 crate::store::OWNER_APPROVAL_TAG
             ),
-            "give the rule a requires check (check_kind requires, the trigger as check_path or its command binding, the marker the owner says as check_literal), or drop the tag",
+            "give the rule a requires check (check_kind requires, the trigger as check_path or its command binding, the marker the owner says as check_literal), or drop the tag. To take the whole rule down on the owner's own words, one call is enough: retract it with his whole message between double quotes in the reason; clearing its check first is not needed",
         ));
     }
     if updated.kind.can_fire() && guards(updated.check.as_ref()) {

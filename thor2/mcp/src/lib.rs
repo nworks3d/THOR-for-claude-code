@@ -4382,7 +4382,8 @@ impl ThorMcpServer {
             let mut att = stamp.att();
             refuse_a_side_door_on_a_frozen_item(s, &args.id, &att)?;
             // A rule that needs the owner's go is retracted only on his own words.
-            if model::store::show(s, &args.id).ok().is_some_and(|existing| model::store::is_owner_approval(&existing)) {
+            let owner_rule = model::store::show(s, &args.id).ok().is_some_and(|existing| model::store::is_owner_approval(&existing));
+            if owner_rule {
                 serve::unpin_gate::owner_rule_go(
                     s,
                     &args.id,
@@ -4411,7 +4412,13 @@ impl ThorMcpServer {
                 }
             }
             let lost = model::store::show(s, &args.id).ok().and_then(|item| lost_check_warning(s, &item));
-            match model::store::retract(s, stamp.column(), LINEAGE_ID, ACTOR, &args.id, &args.reason, Some(&att)) {
+            // His quoted words are the decision: one call takes the rule down, whatever its check says.
+            let retracted = if owner_rule {
+                model::store::retract_on_owner_words(s, stamp.column(), LINEAGE_ID, ACTOR, &args.id, &args.reason, Some(&att))
+            } else {
+                model::store::retract(s, stamp.column(), LINEAGE_ID, ACTOR, &args.id, &args.reason, Some(&att))
+            };
+            match retracted {
                 Ok(event) => Ok(format!(
                     "retracted {} ({}) (event seq {}){}",
                     args.id,

@@ -10221,6 +10221,36 @@ pub fn retract<'a>(
     reason: &str,
     att: Option<&Att>,
 ) -> Result<Event, WriteError> {
+    retract_gated(store, session_id, lineage_id, actor, entity_id, reason, att, false)
+}
+
+/// `retract` for a rule that needs the owner's go, taken down on his own quoted
+/// words (the caller has already checked them: `serve::unpin_gate::owner_rule_go`).
+/// His word is the decision, so the check that bites is not asked for a survivor:
+/// one call is enough.
+pub fn retract_on_owner_words<'a>(
+    store: &mut EventStore,
+    session_id: &str,
+    lineage_id: &str,
+    actor: impl Into<WriteActor<'a>>,
+    entity_id: &str,
+    reason: &str,
+    att: Option<&Att>,
+) -> Result<Event, WriteError> {
+    retract_gated(store, session_id, lineage_id, actor, entity_id, reason, att, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn retract_gated<'a>(
+    store: &mut EventStore,
+    session_id: &str,
+    lineage_id: &str,
+    actor: impl Into<WriteActor<'a>>,
+    entity_id: &str,
+    reason: &str,
+    att: Option<&Att>,
+    owner_words: bool,
+) -> Result<Event, WriteError> {
     let actor = fence(store, actor.into(), entity_id)?;
     guard_order_note(store, actor, entity_id)?;
     let reason = reason.trim();
@@ -10278,7 +10308,7 @@ pub fn retract<'a>(
     // measured, three refusing checks and a contains check were lost that way.
     // Only a check that runs now and holds can block this; a rule with no
     // check, a note, or a check whose file is gone retracts as before.
-    if let Ok(item) = show(store, entity_id) {
+    if let Some(item) = show(store, entity_id).ok().filter(|_| !owner_words) {
         if let Some(refusal) = retract_would_lose_a_check(store, entity_id, &item, reason) {
             return Err(WriteError::Refused(refusal));
         }
@@ -10385,7 +10415,8 @@ fn retract_would_lose_a_check(store: &EventStore, id: &str, item: &Item, reason:
             "carry the check onto the item that survives, then retract naming that item's id in the reason: \
              mcp__thor__revise(id: \"<the survivor's id>\", {}, because: \"<it now carries the check of '{id}', at least 20 \
              characters>\"), then retract '{id}' with a reason that quotes the survivor's id. If the rule is simply \
-             wrong, clear its check first with a revise that says why",
+             wrong, clear its check first with a revise that says why. If it is a rule that needs the owner's go and he \
+             has said to take it down, one retract is enough: put his whole message between double quotes in the reason",
             check_arguments(check)
         ),
     })
@@ -16021,6 +16052,24 @@ mod tests {
         survivor.bindings = proven.bindings.clone();
         declare_tried(&mut store, &survivor, &sealed(&survivor, RecordedVerdict::RuleWired));
         retract(&mut store, "s", "l", "a", "n4-proven", "folded into 'n4-survivor'", None).expect("a covering survivor");
+    }
+
+    /// P15: a rule the owner takes down in his own words is retracted in ONE call,
+    /// although its check bites and no survivor carries it; the refusal for anyone
+    /// else names that one call.
+    #[test]
+    fn a_retract_on_the_owners_words_needs_no_survivor_for_the_check() {
+        let mut store = EventStore::in_memory().unwrap();
+        let mut proven = wired_forbidden("p15-proven", "p", "--force");
+        proven.severity = None;
+        proven.text = "Never push with --force.".to_string();
+        proven.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "git push".to_string() }];
+        declare_tried(&mut store, &proven, &sealed(&proven, RecordedVerdict::RuleWired));
+        let err = retract(&mut store, "s", "l", "a", "p15-proven", "the owner said to remove it", None).unwrap_err().to_string();
+        assert!(err.contains("one retract is enough") && err.contains("whole message"), "{err}");
+        assert!(show(&store, "p15-proven").is_ok(), "nothing was retracted");
+        retract_on_owner_words(&mut store, "s", "l", "a", "p15-proven", "the owner said: \"remove it\"", None).expect("his words are the decision");
+        assert!(show(&store, "p15-proven").is_err(), "retracted in one call");
     }
 
     /// N4, file checks: a rule with a biting `contains` check on a file in a
