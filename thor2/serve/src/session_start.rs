@@ -364,6 +364,8 @@ pub struct ExtrasFor<'a> {
     /// The payload's `source` ("startup", "resume", "compact", ...).
     pub source: Option<&'a str>,
     pub headless: bool,
+    /// A person reads this session (`is_attended`): only then does the record of the setting files move.
+    pub attended: bool,
     pub subagent: bool,
     /// Whether a notice shown now is recorded as shown (`serve::notices`).
     pub record: bool,
@@ -420,7 +422,7 @@ pub fn shared_extras(db: &std::path::Path, f: &ExtrasFor) -> SharedExtras {
         // Only a session the owner reads moves the record (`f.record`, never headless).
         mode_changes: match f.subagent {
             true => Vec::new(),
-            false => crate::mode_files::session_start_lines(db, f.record && !f.headless),
+            false => crate::mode_files::session_start_lines(db, f.record && f.attended),
         },
     }
 }
@@ -515,6 +517,19 @@ pub const INTERACTIVE_ONLY_TAG: &str = "interactive-only";
 /// `sdk-cli`, the SDKs `sdk-ts` and `sdk-py`. Every `sdk...` one is headless.
 pub fn entrypoint_is_headless(entrypoint: &str) -> bool {
     entrypoint.trim().to_ascii_lowercase().starts_with("sdk")
+}
+
+/// The environment variable Claude Code sets to `1` in a session a person reads (checked live in the
+/// desktop app: `CLAUDE_CODE_ENTRYPOINT=claude-desktop` and `CLAUDE_CODE_SESSION_ATTENDED=1`).
+pub const ATTENDED_ENV: &str = "CLAUDE_CODE_SESSION_ATTENDED";
+
+/// THE ONE TEST FOR "A PERSON IS TYPING HERE": what a prompt may count as the owner's word, and what
+/// moves the record of the setting files. A session is attended when it is not headless (the desktop
+/// app, the terminal `claude` and the IDE extensions), or when Claude Code says so with `1` in
+/// `CLAUDE_CODE_SESSION_ATTENDED`. `claude -p`, `sdk-cli`, `sdk-ts` and `sdk-py` without that marker
+/// are not. A child process an assistant starts with a forged environment is not seen.
+pub fn is_attended(entrypoint: &str, attended_marker: Option<&str>) -> bool {
+    !entrypoint_is_headless(entrypoint) || attended_marker.is_some_and(|v| v.trim() == "1")
 }
 
 /// The entrypoint a transcript names, read from the head of its text.

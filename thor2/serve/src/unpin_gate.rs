@@ -428,10 +428,45 @@ pub fn owner_quote_matches(because: &str, id: &str, pairs: &[(String, String)]) 
 pub fn owner_quote_matches_among(because: &str, id: &str, pairs: &[(String, String)], live_ids: &[String]) -> bool {
     let quotes = crate::order_earlier::quote_candidates(because);
     pairs.iter().any(|(message, before)| {
-        let about_this_note = names_as_a_token(message, id) || asks_only_about(before, id, live_ids);
+        // An answer that does not name the note counts as a go only when it is no refusal.
+        let about_this_note = names_as_a_token(message, id) || (is_a_go(message) && asks_only_about(before, id, live_ids));
         about_this_note && quotes.iter().any(|q| crate::order_earlier::plain(message) == *q)
     })
 }
+
+/// Words that make an answer something other than a plain yes, in nl, en, de, fr and es: a no, a
+/// "not", a "never", or "first / wait" (he wants something else done before). Kept simple on
+/// purpose: when in doubt the answer is no go, and the owner says the note's id in his own words.
+const NOT_A_YES: [&str; 26] = [
+    "no", "nee", "neen", "nein", "non", "nope", "nah", "niet", "not", "don't", "dont", "nicht", "kein", "nunca", "never", "nooit",
+    "first", "eerst", "zuerst", "wait", "wacht", "warte", "stop", "hold", "attends", "espera",
+];
+
+/// Is this owner answer a go (no refusal, no "not", no "first")?
+fn is_a_go(answer: &str) -> bool {
+    let lower = hidden_chars_out(answer).to_lowercase();
+    !lower
+        .split(|c: char| !(c.is_alphanumeric() || c == '\'' || c == '\u{2019}'))
+        .map(|w| w.replace('\u{2019}', "'"))
+        .any(|w| NOT_A_YES.contains(&w.as_str()))
+}
+
+/// A text with the characters that are not seen removed and in lower case, so an id written in
+/// capitals or with a zero-width space inside it is still that id.
+fn hidden_chars_out(text: &str) -> String {
+    text.chars().filter(|c| !matches!(c, '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{2060}' | '\u{FEFF}' | '\u{00AD}')).collect()
+}
+
+fn normalised(text: &str) -> String {
+    hidden_chars_out(text).to_lowercase()
+}
+
+/// Stems of the verbs that take a note down or loosen it, in nl, en, de, fr and es.
+const TAKE_DOWN_STEMS: [&str; 34] = [
+    "unpin", "retract", "remov", "delet", "drop", "loosen", "take down", "taking down", "lift", "detach", "relax", "loskoppel",
+    "losmaken", "weghalen", "haal", "verwijder", "intrek", "schrap", "entfern", "l\u{f6}sch", "losch", "zur\u{fc}ckzieh", "aufheb",
+    "retir", "supprim", "d\u{e9}tach", "annul", "d\u{e9}s\u{e9}pingl", "quitar", "elimin", "desanclar", "borr", "ontkoppel", "weg",
+];
 
 /// Is `before` (the assistant message directly before the owner's answer) a QUESTION that names
 /// exactly this one note? Only then does an owner's answer that does not name the note itself ("ok")
@@ -440,23 +475,34 @@ pub fn owner_quote_matches_among(because: &str, id: &str, pairs: &[(String, Stri
 /// word with a hyphen in it is not an id, so it blocks nothing). A message that merely mentions the
 /// id, or lists several notes, is no question to answer yes to.
 fn asks_only_about(before: &str, id: &str, live_ids: &[String]) -> bool {
+    let (before, id) = (normalised(before), normalised(id));
     let id_char = |c: char| c.is_alphanumeric() || c == '-' || c == '_';
-    let others = before.split(|c: char| !id_char(c)).any(|w| w != id && live_ids.iter().any(|l| l == w));
-    if others || !names_as_a_token(before, id) {
+    let others = before.split(|c: char| !id_char(c)).any(|w| w != id && live_ids.iter().any(|l| normalised(l) == w));
+    if others || !names_as_a_token(&before, &id) {
         return false;
     }
-    let mut sentence = String::new();
+    // The id must be the SUBJECT of the question: the sentence that names it also says what is to be
+    // done to it (unpin, retract, remove, loosen). A passing mention ("Shall I run the build (<id>)?")
+    // is not a question about the note. A short question that names nothing ("Mag dat?") counts when
+    // the sentence right before it, in the same message, is the one that names the note and the verb.
+    let about = |sentence: &str| names_as_a_token(sentence, &id) && TAKE_DOWN_STEMS.iter().any(|v| sentence.contains(v));
+    let mut sentences: Vec<(String, char)> = Vec::new();
+    let mut current = String::new();
     for c in before.chars() {
         if matches!(c, '.' | '!' | '?' | '\n') {
-            if c == '?' && names_as_a_token(&sentence, id) {
-                return true;
-            }
-            sentence.clear();
+            sentences.push((std::mem::take(&mut current), c));
         } else {
-            sentence.push(c);
+            current.push(c);
         }
     }
-    false
+    (0..sentences.len()).any(|i| {
+        let (question, end) = &sentences[i];
+        if *end != '?' {
+            return false;
+        }
+        about(question)
+            || (question.split_whitespace().count() <= 8 && !names_as_a_token(question, &id) && i > 0 && about(&sentences[i - 1].0))
+    })
 }
 
 fn go_path(db: &Path) -> PathBuf {
@@ -645,13 +691,51 @@ mod tests {
         assert!(ok("Zal ik note-x loskoppelen?"));
         assert!(ok("Done with the tests.\nShall I unpin `note-x`?"));
         assert!(!ok("I will unpin note-x now."), "a statement is no question");
-        assert!(!ok("Unpinning note-x now. Is that all right?"), "a question elsewhere does not make the sentence naming it one");
+        assert!(ok("Ik haal note-x weg. Mag dat?"), "the sentence before a short question names the note and what is done to it");
+        assert!(ok("Unpinning note-x now. Is that all right?"));
+        assert!(!ok("I ran the build for note-x. Is that all right?"), "the sentence before names it but no take-down");
+        assert!(!ok("Shall I run the build (note-x)?"), "a mention in passing is no question about the note");
+        assert!(!ok("Unpinning note-x now. Shall I also rebuild the whole index, run the tests and push the result to the remote?"), "a long question about something else");
+        assert!(!ok("Shall I unpin NOTE-Y and NOTE-X?"), "a second real id in capitals counts");
+        assert!(!ok("Shall I unpin note-x? Also note\u{200b}-y."), "a second real id with a zero-width space counts");
+        assert!(!ok("Shall I unpin note\u{200b}-y or note-x?"), "a second real id with a zero-width space in the question counts");
+        assert!(ok("Shall I unpin NOTE-X?"), "capitals do not hide the note itself");
+        assert!(ok("Soll ich note-x entfernen?") && ok("Dois-je retirer note-x ?") && ok("Debo quitar note-x?"), "de, fr, es");
         assert!(!ok("Shall I unpin note-x, note-y and note-z?"), "a second real note blocks it");
         assert!(!ok("Shall I unpin note-x? note-y says the same."), "a second real note anywhere in the message blocks it");
         assert!(ok("Shall I unpin note-x? It sits in the start-block."), "an ordinary hyphenated word is no id");
         assert!(ok("Shall I unpin note-x or fix the pre-commit hook?"), "an ordinary hyphenated word is no id");
         assert!(!ok("Shall I unpin note-xy?"), "a longer id is another note");
         assert!(!ok(""));
+    }
+
+    #[test]
+    fn an_answer_that_is_a_refusal_or_a_first_is_no_go_after_a_question() {
+        let live: Vec<String> = vec!["note-x".to_string()];
+        let answer = |said: &str| {
+            owner_quote_matches_among(&format!("he said \"{said}\""), "note-x", &[(said.to_string(), "Shall I unpin note-x?".to_string())], &live)
+        };
+        for yes in ["ok", "ja", "ja, doe maar", "yes please", "oui", "si, adelante", "go ahead", "Ja gerne"] {
+            assert!(answer(yes), "{yes}");
+        }
+        for no in [
+            "nee, niet doen",
+            "no",
+            "No, leave it",
+            "nein",
+            "non merci",
+            "ok, but first something else",
+            "ok, eerst iets anders",
+            "ja maar niet nu, wacht",
+            "don't",
+            "do not do that, not now",
+            "ok, wait",
+            "n\u{200b}o",
+        ] {
+            assert!(!answer(no), "{no}");
+        }
+        // Naming the note himself is judged by the quote rule, as before.
+        assert!(owner_quote_matches_among("he said \"nee, laat note-x staan\"", "note-x", &[("nee, laat note-x staan".to_string(), String::new())], &live));
     }
 
     #[test]

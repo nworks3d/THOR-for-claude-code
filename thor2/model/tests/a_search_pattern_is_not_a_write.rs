@@ -90,6 +90,8 @@ fn a_single_letter_flag_is_found_inside_a_cluster_of_letters() {
     assert!(literal_at_boundary("git branch -Df x", "-D"));
     assert!(literal_at_boundary("git branch -fD x", "-D"));
     assert!(literal_at_boundary("git branch -Df x", "git branch -D"));
+    assert!(literal_at_boundary("git branch -D=x", "-D"), "`-D=x` is `-D` with a value, found as the flag itself");
+    assert!(literal_at_boundary("git branch -D=x", "git branch -D"));
     assert!(!literal_at_boundary("git branch -d x", "-D"), "the other case is another flag");
     assert!(!literal_at_boundary("git branch -Dx=1", "-D"));
     assert!(!literal_at_boundary("git branch --Df x", "-D"));

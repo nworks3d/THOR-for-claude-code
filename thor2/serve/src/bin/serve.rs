@@ -1462,6 +1462,11 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
         serve::volume::record_stop(db_path, &resolve_session_id(p), matches!(out, Some(HookOutput::Decision(_))));
     }
     let Some(payload) = payload.filter(|p| !no_record && !payload_is_from_a_subagent(p)) else { return out };
+    // Every Stop looks at the setting files the owner edits by hand (a few small files): a change put
+    // back before the next session start is still named there (`serve::mode_files`).
+    if event_name == "Stop" {
+        serve::mode_files::note_at_stop(db_path);
+    }
     let session_id = resolve_session_id(&payload);
     match (event_name.as_str(), out) {
         ("Stop", Some(HookOutput::Warn { text })) => {
@@ -2494,6 +2499,7 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                 &session_start::ExtrasFor {
                     source,
                     headless: kind.headless,
+                    attended: kind_is_attended(&kind),
                     subagent: payload_is_from_a_subagent(&payload),
                     record: !no_record,
                     copy,
@@ -2579,8 +2585,12 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                 // THOR'S OWN RECORD OF WHAT THE OWNER TYPED (`serve::prompt_record`): every check that
                 // accepts his words quotes this record, not the saved conversation an assistant could
                 // append to. Keyed by the payload's own session id, the one the checks read.
-                let own_session = payload.get("session_id").and_then(|v| v.as_str()).unwrap_or_default();
-                serve::prompt_record::record(db_path, own_session, prompt_text, time::now_unix());
+                // Only a session a person reads: a headless run (`claude -p`, the SDKs) has no owner
+                // typing, whatever its prompt says.
+                if kind_is_attended(&session_kind(&payload)) {
+                    let own_session = payload.get("session_id").and_then(|v| v.as_str()).unwrap_or_default();
+                    serve::prompt_record::record(db_path, own_session, prompt_text, time::now_unix());
+                }
             }
             if prompt_text.trim().is_empty() {
                 return None;
@@ -2609,7 +2619,7 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             // never in a prompt a subagent receives: no owner typed that.
             let typed = !payload_is_from_a_subagent(&payload)
                 && serve::eval_session::prompt_starts_evaluation(prompt_text, &serve::eval_session::command_names(db_path));
-            let eval_note = if typed && !no_record {
+            let eval_note = if typed && !no_record && !diagnose_run() {
                 session_project.as_deref().and_then(|p| {
                     // No evaluation starts in a session whose tool server is
                     // older than the installed one: its report could not count.
@@ -4641,6 +4651,22 @@ struct SessionKind {
     entrypoint: String,
     from: &'static str,
     headless: bool,
+}
+
+/// Whether a person reads this session (`session_start::is_attended`), from the environment Claude
+/// Code gave this process.
+fn kind_is_attended(kind: &SessionKind) -> bool {
+    !diagnose_run() && session_start::is_attended(&kind.entrypoint, std::env::var(session_start::ATTENDED_ENV).ok().as_deref())
+}
+
+/// Set when this process is a `hook --diagnose` run: a probe by design (a caller that is not an
+/// assistant harness asks whether the hook could look). Such a run writes nothing that counts as
+/// evidence of what the owner typed or did: no owner prompt record, no evaluation start, no move of
+/// the setting-file record. (`--no-record` writes nothing at all.)
+static DIAGNOSE_RUN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn diagnose_run() -> bool {
+    DIAGNOSE_RUN.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 fn session_kind(payload: &Value) -> SessionKind {
@@ -7527,6 +7553,7 @@ fn cmd_hook(db_path: &Path, diagnose: bool, actor: Option<String>, no_record: bo
  }
  // `--no-record` holds the store's directory for the whole call, the
  // diagnosing open below included - see `serve::store_dir`.
+ DIAGNOSE_RUN.store(diagnose, std::sync::atomic::Ordering::Relaxed);
  let no_record = no_record || serve::store_dir::is_copy(db_path);
  let _hold = serve::store_dir::hold_for(db_path, no_record);
  // Read stdin HERE only for the diagnosing path, which has to inspect the

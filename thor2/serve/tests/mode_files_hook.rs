@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 
 fn start(db: &Path, cwd: &Path, session: &str, entrypoint: Option<&str>) -> String {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_serve"));
-    cmd.arg("--db").arg(db).arg("hook").current_dir(cwd).env_remove("CLAUDE_CODE_ENTRYPOINT");
+    cmd.arg("--db").arg(db).arg("hook").current_dir(cwd).env_remove("CLAUDE_CODE_ENTRYPOINT").env_remove("CLAUDE_CODE_SESSION_ATTENDED");
     if let Some(e) = entrypoint {
         cmd.env("CLAUDE_CODE_ENTRYPOINT", e);
     }
@@ -59,4 +59,42 @@ fn a_guard_switched_off_by_hand_is_named_at_the_next_session_start_once() {
     assert!(said.contains("guard-response-rulebook.json appeared"), "{said}");
     // And once.
     assert!(!start(&db, &work, "s5", None).contains("setting file"));
+}
+
+#[test]
+fn a_guard_switched_off_and_on_again_inside_one_session_is_still_named() {
+    let (dir, db, work) = fixture();
+    let file = dir.path().join("store").join("stale-guard-mode.json");
+    std::fs::write(&file, r#"{"mode": "on"}"#).unwrap();
+    assert!(!start(&db, &work, "s1", None).contains("setting file"));
+    // Off, a turn ends (a Stop looks), on again.
+    std::fs::write(&file, r#"{"mode": "off"}"#).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_serve"));
+    cmd.arg("--db").arg(&db).arg("hook").current_dir(&work).env_remove("CLAUDE_CODE_ENTRYPOINT").env_remove("CLAUDE_CODE_SESSION_ATTENDED");
+    let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().expect("spawn serve");
+    let payload = serde_json::json!({ "hook_event_name": "Stop", "session_id": "s1", "cwd": work.to_string_lossy(), "stop_hook_active": false, "last_assistant_message": "" });
+    let _ = child.stdin.take().unwrap().write_all(payload.to_string().as_bytes());
+    assert!(child.wait_with_output().expect("wait serve").status.success());
+    std::fs::write(&file, r#"{"mode": "on"}"#).unwrap();
+    let said = start(&db, &work, "s2", None);
+    assert!(said.contains("stale-guard-mode.json was changed during the last session and put back"), "{said}");
+    assert!(!start(&db, &work, "s3", None).contains("setting file"), "said once");
+}
+
+#[test]
+fn an_attended_sdk_session_moves_the_record_like_any_session_a_person_reads() {
+    let (dir, db, work) = fixture();
+    let file = dir.path().join("store").join("thor-mode.json");
+    std::fs::write(&file, r#"{"mode": "release"}"#).unwrap();
+    start(&db, &work, "s1", None);
+    std::fs::write(&file, r#"{"mode": "off"}"#).unwrap();
+    // Marked attended by Claude Code: it says it and moves the record.
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_serve"));
+    cmd.arg("--db").arg(&db).arg("hook").current_dir(&work).env("CLAUDE_CODE_ENTRYPOINT", "sdk-cli").env("CLAUDE_CODE_SESSION_ATTENDED", "1");
+    let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().expect("spawn serve");
+    let payload = serde_json::json!({ "hook_event_name": "SessionStart", "source": "startup", "session_id": "s2", "cwd": work.to_string_lossy() });
+    let _ = child.stdin.take().unwrap().write_all(payload.to_string().as_bytes());
+    let out = String::from_utf8(child.wait_with_output().expect("wait serve").stdout).unwrap();
+    assert!(out.contains("thor-mode.json changed"), "{out}");
+    assert!(!start(&db, &work, "s3", None).contains("setting file"), "the attended start moved the record");
 }

@@ -3188,7 +3188,8 @@ fn flag_value_spelling(literal: &str) -> Option<String> {
 /// A literal that is one single-letter short flag (`-D`, or a command ending in one) is also
 /// found inside a cluster of letters after one dash (`-Df`, `-fD`): every flag of a cluster is
 /// in force. Only a cluster of two or three letters that stands alone as a word counts - not
-/// `-D=x`, `-n5`, `--Df`, `-Dfoo.bar`, nor a longer single-dash word such as `-eval` or `-name`.
+/// `-n5`, `--Df`, `-Dfoo.bar`, nor a longer single-dash word such as `-eval` or `-name`. (`-D=x` is
+/// not a cluster, but the flag `-D` itself with a value: the plain literal match finds it.)
 fn find_in_flag_cluster(text: &str, literal: &str) -> Option<usize> {
     let (prefix, flag) = match literal.rsplit_once(' ') {
         Some((p, f)) => (Some(p.trim_end()), f),

@@ -495,10 +495,22 @@ Words used once, in plain language:
   the full start block, the answer to the earlier-work step) needs the quote in that record AND in Claude
   Code's saved conversation, with the last messages of both in the same order. A line only in the saved
   conversation counts for nothing, and when the record holds nothing the refusal says his message must
-  arrive through a normal prompt. A shell command that runs THOR's `serve ... hook` is refused, because
-  it would forge a record; a script file that does it is not seen. An answer that does not name the note
-  counts only after an assistant question that names exactly that one note, and a note id matches as a
-  whole word. The go-word of a requires rule is checked against the same record: it counts only when the message is in THOR's record and the saved conversation agrees. Only the ids of live notes count as "another note" in that question.
+  arrive through a normal prompt. A prompt is recorded only in a session a person reads: the desktop
+  app, the terminal `claude` and the IDE extensions are; `claude -p` and the SDKs (`sdk-cli`, `sdk-ts`,
+  `sdk-py`) are not, unless Claude Code marks the session with `CLAUDE_CODE_SESSION_ATTENDED=1`. A child
+  process an assistant starts with a forged environment is not seen. A shell command that runs THOR's
+  `serve ... hook` is refused, also behind `timeout`, `env`, `nice`, `stdbuf`, `time`, `sudo`, `doas`,
+  `xargs`, `find -exec`, `bash -c`, `cmd /c`, `Start-Process`, `cargo run -- hook` and
+  `[Diagnostics.Process]::Start`, because it would forge a record, unless the run carries `--no-record`,
+  `--diagnose`, `--help` or `--version` (a probe: it writes no owner record, starts no evaluation and
+  moves no setting-file record); `cargo test -p serve hook`, `grep serve hook`
+  and `npx serve` are not refused (`serve` is not THOR's program there). A script file, a variable that
+  holds the program, and a copy under another name are not seen. An answer that does not name the note
+  counts only after an assistant question about exactly that one note: the sentence with the question
+  mark (or the sentence right before a short question such as "Mag dat?") must name the note and what
+  is done to it (unpin, retract, remove, loosen, in nl, en, de, fr or es), and the answer must be no
+  refusal ("nee", "no", "niet", "not", "first", "wait" and the like). A note id matches as a whole
+  word, in any case and with zero-width characters taken out. The go-word of a requires rule is checked against the same record: it counts only when the message is in THOR's record and the saved conversation agrees. Only the ids of live notes count as "another note" in that question.
 - Refuse or change: you say it; nothing else works. You can also change or lift such a rule from any
   session: ask for it in your own message, the assistant revises or retracts the rule with your whole
   message quoted, and THOR checks the quote against what you typed. Without it, anything that loosens
@@ -755,7 +767,8 @@ remembers per session how far it has looked, so a long conversation does not mak
 - Spellings: `--flag value` and `--flag=value` are one flag (a rule written `--visibility public` also
   catches `--visibility=public`; two flags in a row such as `--delete --force` are not one flag with a value).
   A single-letter flag in a rule (`-D`) is also found in a cluster of two or three letters after one dash
-  (`-Df`, `-fD`), not in `-D=x`, `--Df` or a longer word such as `-eval`.
+  (`-Df`, `-fD`) and with a value (`-D=x`, as in `git branch -D=x`), but not in `--Df` or a longer word
+  such as `-eval`.
 - What a search looks for is not looked at: the pattern of grep, rg, findstr, Select-String and
   `git log --grep` / `-S` / `-G` is left out, so `git log | grep -ci "co-authored"` is not a commit message
   with that word. The same word in any other part of the call (a message, a file name) still counts. Not
@@ -1021,11 +1034,17 @@ remembers per session how far it has looked, so a long conversation does not mak
 
 ### E12b. A silent change to a setting file is named
 - What: a few files beside the memory stay editable by hand on purpose: `thor-mode.json`,
-  `stale-guard-mode.json`, `no-project-ask-mode.json`, `work-folders.json` and every `guard-*` file. Each
-  session start the owner reads records a hash of each (`mode-files-seen.json`). When one differs from
-  the last session start, the next session start and `doctor` print one plain line naming the file and
-  what it now says (secrets blanked), and the assistant is told to tell the owner in one sentence unless
-  he asked for it. The first start only records.
+  `stale-guard-mode.json`, `no-project-ask-mode.json`, `work-folders.json` and every file whose name
+  starts with `guard-` (the reply rules, the capture rules, the judge settings and the judge's wrapper
+  script). The watch also holds every file the judge settings run (the `command` and any argument
+  that names a file that exists) and every file of the `githooks` folder beside the memory. Each
+  session start a person reads records a hash and the text of each (`mode-files-seen.json`). When one
+  differs from the last session start, the next session start and `doctor` print one plain line naming
+  the file and what changed in it (the changed part and where it starts, secrets blanked), and the
+  assistant is told to tell the owner in one sentence unless he asked for it. Every Stop looks too, so a
+  change made and put back inside one session is still named at the next session start
+  (`mode-files-pending.json`). The first start only records. Not seen: a file the list does not
+  name, a judge command that is only a program on the search path.
 - Why: so a guard cannot be switched off by one small edit nobody sees.
 - You notice: a line at the start of a session, or a NOTE in doctor's short summary.
 - Refuse or change: nothing is blocked or undone; a headless or subagent session neither prints nor
