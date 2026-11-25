@@ -16,13 +16,17 @@
 //! Remove-Item, Set-Content, Add-Content, Out-File, Clear-Content, sed -i, truncate, and
 //! `git checkout --` or `git restore` of it. Reading these files, and copying them elsewhere,
 //! stays free. Paths compare without regard to case and with either slash, `~` and the usual
-//! home variables are expanded, and `..` is resolved. A shell can build a path at run time
-//! (a variable, a command substitution, a script that writes it): that cannot be seen here, and
-//! this guard does not claim to see it. THOR's own programs and the installer are not hooked,
+//! home variables are expanded, `..` is resolved, a trailing dot or `::$DATA` is dropped, and a
+//! `\\localhost\c$` share or an 8.3 short name is read as the path it stands for. Trees copied or
+//! extracted into these folders, wildcard and piped deletes and `-EncodedCommand` are read too
+//! (`docs/WHAT-THOR-DOES.md`, D7b). A shell can build a path at run time (a variable, a command
+//! substitution, a script file that writes it, `eval`, a link made in an earlier step): that
+//! cannot be seen here, and this guard does not claim to see it. THOR's own programs and the installer are not hooked,
 //! so they are not affected.
 
 use std::path::{Path, PathBuf};
 
+mod forms;
 mod interp;
 
 /// The folders and files this guard keeps, already normalised for comparison.
@@ -56,7 +60,7 @@ impl Protected {
     /// Explicit folders (tests, and `current`).
     pub fn new(store_dir: Option<&Path>, programs_dir: Option<&Path>, claude_dirs: &[PathBuf]) -> Self {
         let mut vars = Vec::new();
-        for name in ["LOCALAPPDATA", "USERPROFILE", "HOME", "APPDATA"] {
+        for name in ["LOCALAPPDATA", "USERPROFILE", "HOME", "APPDATA", "HOMEDRIVE", "HOMEPATH", "CLAUDE_CONFIG_DIR", "PROGRAMDATA"] {
             if let Some(value) = std::env::var_os(name).filter(|v| !v.is_empty()) {
                 vars.push((name.to_ascii_lowercase(), fold(&value.to_string_lossy())));
             }
@@ -69,7 +73,7 @@ impl Protected {
                 }
             }
         }
-        let keep = |p: &Path| non_empty(fold(&p.to_string_lossy()));
+        let keep = |p: &Path| non_empty(forms::clean_path(&fold(&p.to_string_lossy())));
         Protected {
             store_dir: store_dir.and_then(keep),
             programs_dir: programs_dir.and_then(keep),
@@ -96,11 +100,14 @@ impl Protected {
     /// folder the command works in (`cwd`) when that is known.
     fn resolve(&self, written: &str, cwd: Option<&str>) -> String {
         let path = self.expand(written);
-        if path.is_empty() || is_absolute(&path) {
+        if path.is_empty() {
             return path;
         }
+        if is_absolute(&path) {
+            return forms::clean_path(&path);
+        }
         match cwd {
-            Some(dir) if !path.starts_with('$') && !path.starts_with('%') => fold(&format!("{dir}/{path}")),
+            Some(dir) if !path.starts_with('$') && !path.starts_with('%') => forms::clean_path(&fold(&format!("{dir}/{path}"))),
             _ => path,
         }
     }
@@ -115,7 +122,52 @@ impl Protected {
         if path.is_empty() || !is_absolute(&path) || path.ends_with(':') {
             return false;
         }
-        self.protected_dirs().iter().any(|dir| *dir == path || dir.starts_with(&format!("{path}/")))
+        if self.protected_dirs().iter().any(|dir| *dir == path || dir.starts_with(&format!("{path}/"))) {
+            return true;
+        }
+        // A folder of a saved conversation (`projects/<project>`, `projects/<project>/<session>`).
+        let last = path.rsplit('/').next().unwrap_or("");
+        if !last.contains('.') && self.projects_dirs().iter().any(|d| path.starts_with(&format!("{d}/"))) {
+            return true;
+        }
+        self.wildcard_removes_protected(&path)
+    }
+
+    /// Whether a wildcard path (`<store>/*`, `<store>/thor.db*`, `projects/*/*.jsonl`, `C:/data/*`)
+    /// takes a protected file, or a protected folder, with it. A pattern that cannot match a state
+    /// file (`<store>/*.txt`) is free.
+    fn wildcard_removes_protected(&self, path: &str) -> bool {
+        if !forms::has_wildcard(path) {
+            return false;
+        }
+        let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        let mut kinds: Vec<(String, &[&str])> = Vec::new();
+        kinds.extend(self.store_dir.clone().map(|d| (d, &STATE_SAMPLES[..])));
+        kinds.extend(self.programs_dir.clone().map(|d| (d, &ANY_SAMPLES[..])));
+        kinds.extend(self.projects_dirs().into_iter().map(|d| (d, &PROJECT_SAMPLES[..])));
+        kinds.iter().any(|(dir, samples)| {
+            let dir_segs: Vec<&str> = dir.split('/').filter(|s| !s.is_empty()).collect();
+            let shared = segs.len().min(dir_segs.len());
+            if !(0..shared).all(|i| forms::wildcard_matches(segs[i], dir_segs[i])) {
+                return false;
+            }
+            // The pattern names the folder or one above it, or reaches a file inside it.
+            segs.len() <= dir_segs.len() || samples.iter().any(|s| forms::wildcard_matches(segs[segs.len() - 1], s))
+        })
+    }
+
+    /// Whether copying or extracting a whole tree into this folder fills a protected place: the
+    /// memory's folder itself, THOR's programs, a folder of saved conversations.
+    fn receives_tree(&self, written: &str, cwd: Option<&str>) -> bool {
+        let path = self.resolve(written, cwd);
+        if path.is_empty() || !is_absolute(&path) {
+            return false;
+        }
+        let last = path.rsplit('/').next().unwrap_or("");
+        let projects = self.projects_dirs();
+        self.store_dir.as_deref() == Some(path.as_str())
+            || self.programs_dir.as_deref().is_some_and(|d| path == d || path.starts_with(&format!("{d}/")))
+            || projects.iter().any(|d| path == *d || (path.starts_with(&format!("{d}/")) && !last.contains('.')))
     }
 
     /// Whether a path is a protected folder, or inside one (a link to it would open it up).
@@ -163,11 +215,17 @@ impl Protected {
             }
         }
         let mut out = fold(&text);
-        for (name, value) in &self.vars {
-            for form in [format!("%{name}%"), format!("$env:{name}"), format!("${{{name}}}"), format!("${name}")] {
+        // The longest names first, so `$homedrive` is not read as `$home` and `drive`.
+        let mut vars: Vec<&(String, String)> = self.vars.iter().collect();
+        vars.sort_by_key(|(n, _)| std::cmp::Reverse(n.len()));
+        for (name, value) in vars {
+            for form in [format!("%{name}%"), format!("${{env:{name}}}"), format!("${{{name}}}")] {
                 if out.contains(&form) {
                     out = out.replace(&form, value);
                 }
+            }
+            for form in [format!("$env:{name}"), format!("${name}")] {
+                out = replace_word(&out, &form, value);
             }
         }
         fold(&out)
@@ -191,6 +249,12 @@ impl Protected {
     }
 }
 
+/// Names a wildcard is tried against: a state file of the memory's folder, any file of THOR's
+/// programs, a saved conversation or a folder of one.
+const STATE_SAMPLES: [&str; 5] = ["thor.db", "thor.db-wal", "state.json", "session.jsonl", "mark.stamp"];
+const ANY_SAMPLES: [&str; 3] = ["serve.exe", "install.exe", "data"];
+const PROJECT_SAMPLES: [&str; 2] = ["session.jsonl", "project"];
+
 /// Files in THOR's folder that the owner (or his assistant, on his word) edits by hand.
 const EDITED_BY_HAND: [&str; 9] = [
     "guard-response-rulebook.json",
@@ -213,6 +277,25 @@ fn non_empty(s: String) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
+/// `form` replaced by `value` where no letter, digit or `_` follows it (`$home` in `$home/x`, not
+/// in `$homedrive`).
+fn replace_word(text: &str, form: &str, value: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(form) {
+        let after = &rest[at + form.len()..];
+        out.push_str(&rest[..at]);
+        if after.chars().next().is_some_and(|c| c.is_alphanumeric() || c == '_') {
+            out.push_str(form);
+        } else {
+            out.push_str(value);
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
 /// A path in comparison form: lower case, forward slashes, `/c/x` as `c:/x`, no `.` or `..`
 /// segments, no repeated slashes, no trailing slash.
 fn fold(path: &str) -> String {
@@ -224,6 +307,8 @@ fn fold(path: &str) -> String {
             break;
         }
     }
+    // The administrative share of this computer's own drive (`//localhost/c$/x`) is `c:/x`.
+    p = forms::unshare(&p);
     let bytes = p.as_bytes();
     if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b'/' {
         p = format!("{}:{}", bytes[1] as char, &p[2..]);
@@ -270,11 +355,11 @@ pub fn refusal(
     let input = tool_input?;
     let cwd = cwd.map(fold).filter(|c| is_absolute(c));
     let cwd = cwd.as_deref();
-    let hit = match tool_name {
-        "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => ["file_path", "notebook_path", "path"]
+    let hit = match tool_name.to_ascii_lowercase().as_str() {
+        "edit" | "write" | "multiedit" | "notebookedit" => ["file_path", "filePath", "notebook_path", "notebookPath", "path"]
             .iter()
             .any(|k| input.get(k).and_then(|v| v.as_str()).is_some_and(|p| protected.protects(p, cwd))),
-        "Bash" | "PowerShell" => input
+        "bash" | "powershell" => input
             .get("command")
             .and_then(|v| v.as_str())
             .is_some_and(|c| command_writes_protected(protected, c, cwd, 0)),
@@ -290,7 +375,8 @@ enum Tok {
     /// `>`, `>>` or `>|`: the next word is written to.
     Redirect,
     /// A segment border: `;`, `&&`, `||`, `|`, `&` or a new line.
-    Border,
+    /// `true` for a pipe (`|`, not `||`): the next command reads what this one prints.
+    Border(bool),
 }
 
 fn tokenize(command: &str) -> Vec<Tok> {
@@ -325,10 +411,11 @@ fn tokenize(command: &str) -> Vec<Tok> {
             '\n' | ';' | '|' | '&' => {
                 // `>&` and `2>&1` are handled at the `>`; a lone `&` or `&&` is a border.
                 flush(&mut word, &mut in_word, &mut out);
+                let pipe = c == '|' && chars.get(i + 1) != Some(&'|');
                 while i + 1 < chars.len() && matches!(chars[i + 1], '|' | '&') && c != '\n' && c != ';' {
                     i += 1;
                 }
-                out.push(Tok::Border);
+                out.push(Tok::Border(pipe));
             }
             '>' => {
                 // A file descriptor number right before it (`2>`) is not a word.
@@ -388,7 +475,8 @@ const INSTALLER_FLAGS: &[&str] = &["--db", "--set-", "--topic", "--uninstall", "
 fn command_writes_protected(p: &Protected, command: &str, cwd: Option<&str>, depth: usize) -> bool {
     let mut segment: Vec<String> = Vec::new();
     let mut redirected = false;
-    let mut segments: Vec<(Vec<String>, Vec<String>)> = Vec::new();
+    // Each command: its words, the files it redirects into, and whether it pipes into the next.
+    let mut segments: Vec<(Vec<String>, Vec<String>, bool)> = Vec::new();
     let mut targets: Vec<String> = Vec::new();
     for tok in tokenize(command) {
         match tok {
@@ -401,21 +489,24 @@ fn command_writes_protected(p: &Protected, command: &str, cwd: Option<&str>, dep
                 }
             }
             Tok::Redirect => redirected = true,
-            Tok::Border => {
-                segments.push((std::mem::take(&mut segment), std::mem::take(&mut targets)));
+            Tok::Border(pipe) => {
+                segments.push((std::mem::take(&mut segment), std::mem::take(&mut targets), pipe));
                 redirected = false;
             }
         }
     }
-    segments.push((segment, targets));
+    segments.push((segment, targets, false));
     // The folder the command works in moves with every `cd`, so a relative path after it is read
     // against the right folder.
     let mut here: Option<String> = cwd.map(str::to_string);
-    for (words, redirects) in &segments {
+    for (at, (words, redirects, _)) in segments.iter().enumerate() {
         if redirects.iter().any(|t| p.protects(t, here.as_deref())) {
             return true;
         }
         if segment_writes_protected(p, words, here.as_deref(), depth, command) {
+            return true;
+        }
+        if at > 0 && segments[at - 1].2 && removes_what_it_is_fed(words) && lists_protected(p, &segments, at, here.as_deref()) {
             return true;
         }
         if let Some((name, rest)) = leader_of(words) {
@@ -431,6 +522,66 @@ fn command_writes_protected(p: &Protected, command: &str, cwd: Option<&str>, dep
         }
     }
     false
+}
+
+const REMOVERS: [&str; 9] = ["rm", "del", "erase", "rmdir", "rd", "remove-item", "ri", "unlink", "shred"];
+/// Commands that list files and print their names, so what follows the pipe can act on them.
+const LISTERS: [&str; 8] = ["gci", "dir", "ls", "get-childitem", "get-item", "gi", "find", "fd"];
+/// Commands that pass a listing on, renamed or in another order, without choosing from it.
+const PASS_THROUGH: [&str; 6] = ["select-object", "select", "sort-object", "sort", "tee-object", "out-string"];
+
+/// Whether a command in a pipeline removes the files whose names it is fed: `Remove-Item` or `rm`
+/// with no path of its own, `xargs rm`, `ForEach-Object { Remove-Item $_ }`.
+fn removes_what_it_is_fed(words: &[String]) -> bool {
+    let Some((name, rest)) = leader_of(words) else { return false };
+    if REMOVERS.contains(&name.as_str()) {
+        return !rest.iter().any(|w| !w.starts_with('-') && !(w.starts_with('/') && w.len() <= 3));
+    }
+    matches!(name.as_str(), "xargs" | "foreach-object" | "foreach" | "%") && rest.iter().any(|w| REMOVERS.contains(&command_name(w).as_str()))
+}
+
+/// Whether the command that feeds the removal at `at` lists a protected folder (and chooses
+/// nothing from it that a state file could not match).
+fn lists_protected(p: &Protected, segments: &[(Vec<String>, Vec<String>, bool)], at: usize, cwd: Option<&str>) -> bool {
+    let mut j = at;
+    while j > 0 && segments[j - 1].2 {
+        j -= 1;
+        let words = &segments[j].0;
+        let Some((name, _)) = leader_of(words) else { return false };
+        if LISTERS.contains(&name.as_str()) {
+            return lister_reaches_protected(p, words, cwd);
+        }
+        if !PASS_THROUGH.contains(&name.as_str()) {
+            return false;
+        }
+    }
+    false
+}
+
+/// A `Get-ChildItem <store>`, `ls <store>/*`, `find <store>`: the folder (or a wildcard that could
+/// cover its state files) named, with no `-Filter`, `-Include` or `-name` that rules them out.
+fn lister_reaches_protected(p: &Protected, words: &[String], cwd: Option<&str>) -> bool {
+    let words = forms::split_colon_params(words);
+    let Some((name, rest)) = leader_of(&words) else { return false };
+    let filters: Vec<String> = rest
+        .iter()
+        .enumerate()
+        .filter(|(_, w)| matches!(w.to_ascii_lowercase().as_str(), "-filter" | "-include" | "-name" | "-iname"))
+        .filter_map(|(i, _)| rest.get(i + 1).cloned())
+        .collect();
+    let lower: Vec<String> = filters.iter().map(|f| f.to_ascii_lowercase()).collect();
+    let could_match_state = |f: &String| STATE_SAMPLES.iter().chain(PROJECT_SAMPLES.iter()).chain(ANY_SAMPLES.iter()).any(|s| forms::wildcard_matches(f, s));
+    if !lower.is_empty() && !lower.iter().any(could_match_state) {
+        return false;
+    }
+    let _ = name;
+    rest.iter().any(|w| {
+        if w.starts_with('-') {
+            return false;
+        }
+        let path = p.resolve(w, cwd);
+        !path.is_empty() && (p.touches_dir(w, cwd) || p.wildcard_removes_protected(&path))
+    })
 }
 
 /// The command word of a segment (after `sudo`, `env`, assignments and the like) and what follows it.
@@ -465,9 +616,17 @@ fn dest_receives(p: &Protected, dest: &str, sources: &[&String], cwd: Option<&st
 }
 
 fn segment_writes_protected(p: &Protected, words: &[String], cwd: Option<&str>, depth: usize, source: &str) -> bool {
+    // PowerShell's `-Path:C:\x` is the two words `-Path` and `C:\x`.
+    let normalized = forms::split_colon_params(words);
+    let words: &[String] = &normalized;
     let Some((name, rest)) = leader_of(words) else { return false };
     let at = words.len() - rest.len() - 1;
-    let flag = |w: &String| w.starts_with('-') || (w.starts_with('/') && w.len() <= 3 && !w.contains('.'));
+    let is_windows_copier = matches!(name.as_str(), "xcopy" | "robocopy");
+    let flag = |w: &String| {
+        w.starts_with('-')
+            || (w.starts_with('/') && w.len() <= 3 && !w.contains('.'))
+            || (is_windows_copier && w.starts_with('/') && !w[1..].contains(['/', '\\', '.']))
+    };
     let positionals: Vec<&String> = rest.iter().filter(|w| !flag(w)).collect();
     let any = |items: &[&String]| items.iter().any(|w| p.protects(w, cwd));
     let after_flag = |names: &[&str]| -> Vec<&String> {
@@ -482,6 +641,7 @@ fn segment_writes_protected(p: &Protected, words: &[String], cwd: Option<&str>, 
         }
         found
     };
+    let has_flag = |names: &[&str]| rest.iter().any(|w| names.contains(&w.to_ascii_lowercase().as_str()));
     match name.as_str() {
         n if SHELLS.contains(&n) => {
             // `bash -c '...'`, `powershell -Command "..."`: read the quoted program too.
@@ -490,12 +650,19 @@ fn segment_writes_protected(p: &Protected, words: &[String], cwd: Option<&str>, 
                 .iter()
                 .position(|w| matches!(w.to_ascii_lowercase().as_str(), "/c" | "/k" | "-c" | "-lc" | "-command" | "-c:"))
                 .is_some_and(|i| segment_writes_protected(p, &rest[i + 1..], cwd, depth + 1, source));
-            depth < 3 && (inline || rest.iter().any(|w| w.contains(' ') && command_writes_protected(p, w, cwd, depth + 1)))
+            // `powershell -EncodedCommand <base64>`: the program is hidden in the text.
+            let encoded = matches!(n, "powershell" | "pwsh")
+                && rest.iter().enumerate().any(|(i, w)| {
+                    forms::is_encoded_command_flag(w)
+                        && rest.get(i + 1).and_then(|payload| forms::decode_encoded_command(payload)).is_some_and(|program| command_writes_protected(p, &program, cwd, depth + 1))
+                });
+            depth < 3 && (inline || encoded || rest.iter().any(|w| w.contains(' ') && command_writes_protected(p, w, cwd, depth + 1)))
         }
+        "iex" | "invoke-expression" => depth < 3 && command_writes_protected(p, &rest.join(" "), cwd, depth + 1),
         "rm" | "del" | "erase" | "rmdir" | "rd" | "remove-item" | "ri" | "unlink" | "shred" => {
             positionals.iter().any(|w| p.removal_protects(w, cwd))
         }
-        "tee" | "truncate" => any(&positionals),
+        "tee" | "truncate" | "touch" | "tee-object" | "export-csv" | "export-clixml" | "export-alias" => any(&positionals),
         "mv" | "move" | "move-item" | "mi" | "rename-item" | "ren" | "rni" => {
             // The source is removed and the destination is written.
             let named = after_flag(&["-destination"]);
@@ -521,20 +688,26 @@ fn segment_writes_protected(p: &Protected, words: &[String], cwd: Option<&str>, 
             }
             any(&targets)
         }
-        "cp" | "copy" | "copy-item" | "cpi" | "xcopy" | "robocopy" => {
+        "cp" | "copy" | "copy-item" | "cpi" | "xcopy" | "robocopy" | "rsync" => {
             // Only the DESTINATION is written: the one named by -Destination or -t, else the last
             // (the second for xcopy and robocopy). A folder that receives a file named like a
-            // protected one counts.
+            // protected one counts; so does a whole tree copied into a protected folder.
             let named = after_flag(&["-destination", "-t", "--target-directory"]);
             let (sources, dest): (Vec<&String>, Option<&String>) = match named.first() {
                 Some(d) => (positionals.iter().copied().filter(|w| w != d).collect(), Some(*d)),
-                None if matches!(name.as_str(), "xcopy" | "robocopy") => (positionals.iter().take(1).copied().collect(), positionals.get(1).copied()),
+                None if is_windows_copier => (positionals.iter().take(1).copied().collect(), positionals.get(1).copied()),
                 None => match positionals.split_last() {
                     Some((last, init)) => (init.to_vec(), Some(*last)),
                     None => (Vec::new(), None),
                 },
             };
-            dest.is_some_and(|d| dest_receives(p, d, &sources, cwd))
+            let whole_tree = is_windows_copier
+                || name == "rsync"
+                || rest.iter().any(|w| {
+                    let l = w.to_ascii_lowercase();
+                    matches!(l.as_str(), "-r" | "--recursive" | "-a" | "--archive") || l.starts_with("-rec") || (l.starts_with('-') && !l.starts_with("--") && l[1..].contains(['r', 'a']) && l.len() <= 4 && name == "cp")
+                });
+            dest.is_some_and(|d| dest_receives(p, d, &sources, cwd) || (whole_tree && p.receives_tree(d, cwd)))
         }
         "install" if is_the_unix_install(&words[at], rest) => {
             let named = after_flag(&["-t", "--target-directory"]);
@@ -549,28 +722,65 @@ fn segment_writes_protected(p: &Protected, words: &[String], cwd: Option<&str>, 
         }
         "dd" => rest.iter().any(|w| w.to_ascii_lowercase().strip_prefix("of=").is_some_and(|v| p.protects(v, cwd))),
         "curl" => {
-            let targets = after_flag(&["-o", "--output"]);
+            // `-o f`, `-sSLo f`, `-of`, `--output f`, `--output=f`, PowerShell's `-OutFile f`.
+            let targets = after_flag(&["-o", "--output", "-outfile"]);
             let direct = rest.iter().any(|w| w.strip_prefix("--output=").is_some_and(|v| p.protects(v, cwd)));
-            direct || any(&targets) || after_flag(&["--output-dir"]).iter().any(|w| p.touches_dir(w, cwd))
+            let clustered = forms::cluster_values(rest, &['o']).iter().any(|(_, v)| p.protects(v, cwd));
+            direct || clustered || any(&targets) || after_flag(&["--output-dir"]).iter().any(|w| p.touches_dir(w, cwd))
         }
         "wget" => {
             let direct = rest.iter().any(|w| w.strip_prefix("--output-document=").is_some_and(|v| p.protects(v, cwd)));
+            let clustered = forms::cluster_values(rest, &['O', 'o']).iter().any(|(_, v)| p.protects(v, cwd));
+            let folders = forms::cluster_values(rest, &['P']).iter().any(|(_, v)| p.touches_dir(v, cwd));
             direct
-                || any(&after_flag(&["-o", "--output-document", "--output-file"]))
+                || clustered
+                || folders
+                || any(&after_flag(&["-o", "--output-document", "--output-file", "-outfile"]))
                 || after_flag(&["-p", "--directory-prefix"]).iter().any(|w| p.touches_dir(w, cwd))
         }
-        "sed" => rest.iter().any(|w| w == "-i" || (w.starts_with("-i") && !w.starts_with("--")) || w == "--in-place") && any(&positionals),
-        "git" => {
-            let sub = positionals.first().map(|w| w.to_ascii_lowercase());
-            match sub.as_deref() {
-                Some("checkout") => match rest.iter().position(|w| w == "--") {
-                    Some(i) => rest[i + 1..].iter().any(|w| p.protects(w, cwd)),
-                    None => false,
-                },
-                Some("restore") => any(&positionals[1..]),
-                _ => false,
-            }
+        "invoke-webrequest" | "iwr" | "invoke-restmethod" | "irm" | "start-bitstransfer" => any(&after_flag(&["-outfile", "-destination"])),
+        // Only the forms that write a file: `-hashfile` and `-dump` only read.
+        "certutil" => {
+            let writes = ["-urlcache", "-decode", "-decodehex", "-encode", "-encodehex", "-split", "-verifyctl"].iter().any(|f| has_flag(&[f]));
+            writes && rest.iter().any(|w| p.protects(w, cwd))
         }
+        "bitsadmin" => has_flag(&["/transfer", "/addfile"]) && rest.iter().any(|w| p.protects(w, cwd)),
+        "sed" => {
+            let in_place = rest.iter().any(|w| w == "-i" || (w.starts_with("-i") && !w.starts_with("--")) || w.starts_with("--in-place"));
+            (in_place && any(&positionals)) || rest.iter().any(|w| sed_script_writes_protected(p, w, cwd))
+        }
+        "find" => {
+            // `find <store> -delete` and `find <store> -exec rm {} ;`, unless `-name` rules out state files.
+            let paths: Vec<&String> = rest.iter().take_while(|w| !w.starts_with('-') && !matches!(w.as_str(), "(" | "!")).collect();
+            let deletes = rest.iter().enumerate().any(|(i, w)| {
+                w == "-delete"
+                    || (matches!(w.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir")
+                        && rest.get(i + 1).is_some_and(|c| REMOVERS.contains(&command_name(c).as_str()) || matches!(command_name(c).as_str(), "mv" | "truncate")))
+            });
+            let names: Vec<String> = after_flag(&["-name", "-iname"]).iter().map(|n| n.to_ascii_lowercase()).collect();
+            let could_match = |f: &String| STATE_SAMPLES.iter().chain(PROJECT_SAMPLES.iter()).chain(ANY_SAMPLES.iter()).any(|s| forms::wildcard_matches(f, s));
+            let ruled_out = !names.is_empty() && !names.iter().any(could_match);
+            deletes && !ruled_out && paths.iter().any(|w| p.touches_dir(w, cwd) || p.removal_protects(w, cwd))
+        }
+        "tar" => {
+            let letters_x = rest.first().is_some_and(|w| !w.starts_with('-') && w.chars().all(|c| c.is_ascii_alphabetic()) && w.contains('x'));
+            let extracts = letters_x
+                || rest.iter().any(|w| w == "--extract" || w == "--get" || (w.starts_with('-') && !w.starts_with("--") && w.contains('x')));
+            let dirs = forms::cluster_values(rest, &['C']);
+            let long = rest.iter().filter_map(|w| w.strip_prefix("--directory=")).chain(after_flag(&["--directory"]).into_iter().map(String::as_str));
+            extracts && (dirs.iter().any(|(_, d)| p.receives_tree(d, cwd)) || long.into_iter().any(|d| p.receives_tree(d, cwd)))
+        }
+        "unzip" => forms::cluster_values(rest, &['d']).iter().any(|(_, d)| p.receives_tree(d, cwd)),
+        "7z" | "7za" | "7zr" => {
+            rest.first().is_some_and(|c| matches!(c.as_str(), "x" | "e")) && rest.iter().any(|w| w.strip_prefix("-o").is_some_and(|d| !d.is_empty() && p.receives_tree(d, cwd)))
+        }
+        "expand-archive" => {
+            let dest = after_flag(&["-destinationpath"]);
+            let dest: Vec<&String> = if dest.is_empty() { positionals.iter().skip(1).copied().collect() } else { dest };
+            dest.iter().any(|d| p.receives_tree(d, cwd))
+        }
+        "compress-archive" => any(&after_flag(&["-destinationpath"])),
+        "git" => git_writes_protected(p, rest, &positionals, cwd),
         // A link, a junction or a hard link to a protected folder opens it up to every later write.
         "ln" | "mklink" => positionals.iter().any(|w| p.touches_dir(w, cwd)),
         "sqlite3" => {
@@ -588,10 +798,115 @@ fn segment_writes_protected(p: &Protected, words: &[String], cwd: Option<&str>, 
             // A one-line .NET or `New-Item` write names its target inside a longer argument.
             let whole = words[at..].join(" ").to_ascii_lowercase();
             let links = ["symboliclink", "junction", "hardlink"].iter().any(|m| whole.contains(m));
-            (DOTNET_WRITES.iter().any(|m| whole.contains(m)) || name == "new-item" || name == "set-item")
+            (DOTNET_WRITES.iter().any(|m| whole.contains(m)) || matches!(name.as_str(), "new-item" | "ni" | "set-item" | "si"))
                 && (p.names_any(&words[at..].join(" ")) || (links && p.mentions_any(&whole)))
         }
     }
+}
+
+/// The `w` command of a `sed` script, which writes a file: `sed -n 'w <protected>'`,
+/// `sed 's/a/b/w <protected>'`, `sed '1w <protected>'`.
+fn sed_script_writes_protected(p: &Protected, script: &str, cwd: Option<&str>) -> bool {
+    let chars: Vec<char> = script.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        if !matches!(c, 'w' | 'W') {
+            continue;
+        }
+        let before_ok = i == 0 || matches!(chars[i - 1], '/' | ';' | '{' | '}' | ' ' | '\n' | '$' | '!' | ',') || chars[i - 1].is_ascii_digit();
+        if !before_ok {
+            continue;
+        }
+        let target: String = chars[i + 1..].iter().collect::<String>().lines().next().unwrap_or("").trim().to_string();
+        if !target.is_empty() && p.protects(&target, cwd) {
+            return true;
+        }
+    }
+    false
+}
+
+/// A `git` command that writes a protected file: the older `checkout --` and `restore` forms, an
+/// output file (`git archive -o`, `git diff --output`), a clone or a checkout-index into a
+/// protected folder, and a command that rewrites the working tree of a protected folder
+/// (`git -C <store> reset --hard`, `git -C <store> clean -fd`).
+fn git_writes_protected(p: &Protected, rest: &[String], positionals: &[&String], cwd: Option<&str>) -> bool {
+    // The subcommand is the first word that is not a global option or the value of one.
+    let mut sub: Option<(usize, String)> = None;
+    let mut dirs: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < rest.len() {
+        let w = rest[i].as_str();
+        match w {
+            "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--exec-path" => {
+                if matches!(w, "-C" | "--git-dir" | "--work-tree") {
+                    if let Some(v) = rest.get(i + 1) {
+                        dirs.push(v.clone());
+                    }
+                }
+                i += 2;
+            }
+            _ if w.starts_with("--git-dir=") || w.starts_with("--work-tree=") => {
+                dirs.push(w.split_once('=').map(|(_, v)| v.to_string()).unwrap_or_default());
+                i += 1;
+            }
+            _ if w.starts_with('-') => i += 1,
+            _ => {
+                sub = Some((i, w.to_ascii_lowercase()));
+                break;
+            }
+        }
+    }
+    let Some((at, sub)) = sub else { return false };
+    let args = &rest[at + 1..];
+    let value_of = |names: &[&str]| -> Vec<String> {
+        let mut found = Vec::new();
+        for (j, w) in args.iter().enumerate() {
+            for n in names {
+                if let Some(v) = w.strip_prefix(&format!("{n}=")) {
+                    found.push(v.to_string());
+                } else if w == n {
+                    if let Some(next) = args.get(j + 1) {
+                        found.push(next.clone());
+                    }
+                }
+            }
+        }
+        found
+    };
+    match sub.as_str() {
+        "checkout" => match args.iter().position(|w| w == "--") {
+            Some(j) if args[j + 1..].iter().any(|w| p.protects(w, cwd)) => return true,
+            _ => {}
+        },
+        "restore" => {
+            if positionals.iter().skip(1).any(|w| p.protects(w, cwd)) {
+                return true;
+            }
+        }
+        "archive" | "diff" | "log" | "show" | "format-patch" | "bundle" => {
+            if value_of(&["--output", "-o"]).iter().any(|v| p.protects(v, cwd) || p.receives_tree(v, cwd)) {
+                return true;
+            }
+        }
+        "clone" => {
+            let operands: Vec<&String> = args.iter().filter(|w| !w.starts_with('-')).collect();
+            if operands.len() >= 2 && operands.last().is_some_and(|d| p.receives_tree(d, cwd)) {
+                return true;
+            }
+        }
+        "checkout-index" => {
+            if value_of(&["--prefix"]).iter().any(|v| p.receives_tree(v, cwd)) {
+                return true;
+            }
+        }
+        _ => {}
+    }
+    const REWRITES_THE_TREE: [&str; 15] =
+        ["reset", "clean", "checkout", "restore", "switch", "stash", "merge", "rebase", "pull", "apply", "am", "cherry-pick", "revert", "rm", "mv"];
+    if REWRITES_THE_TREE.contains(&sub.as_str()) {
+        let targets: Vec<String> = if dirs.is_empty() { cwd.map(str::to_string).into_iter().collect() } else { dirs };
+        return targets.iter().any(|d| p.touches_dir(d, cwd));
+    }
+    false
 }
 
 /// The word `install` as the Unix copy command: written bare, with none of the installer's own flags.
@@ -837,6 +1152,392 @@ mod tests {
         ] {
             assert!(!shell(command), "{command}");
         }
+    }
+
+    /// A guard whose home variables are fixed, so the spelling tests read the same everywhere.
+    fn guard_with_variables() -> Protected {
+        let mut g = Protected::new(
+            Some(Path::new("C:/data/store")),
+            Some(Path::new("C:/tools/thor2/bin")),
+            &[PathBuf::from("C:/Users/alex/.claude"), PathBuf::from("C:/alt/claude")],
+        );
+        g.vars = [
+            ("userprofile", "c:/users/alex"),
+            ("home", "c:/users/alex"),
+            ("homedrive", "c:"),
+            ("homepath", "/users/alex"),
+            ("localappdata", "c:/users/alex/appdata/local"),
+            ("claude_config_dir", "c:/alt/claude"),
+        ]
+        .iter()
+        .map(|(n, v)| (n.to_string(), v.to_string()))
+        .collect();
+        g
+    }
+
+    fn shell_as(g: &Protected, tool: &str, command: &str) -> bool {
+        let input = serde_json::json!({ "command": command });
+        refusal(g, tool, Some(&input), None).is_some()
+    }
+
+    #[test]
+    fn other_spellings_of_a_protected_path_are_refused() {
+        let g = guard_with_variables();
+        for command in [
+            "echo x > C:/data/store/thor.db.",
+            "echo x > 'C:\\data\\store\\unpin-owner-go.json::$DATA'",
+            "echo x > C:/Users/alex/.claude/projects/p/s.jsonl::$DATA",
+            "echo x > C:/Users/alex/.claude/projects/p/s.jsonl.",
+            "echo x > \"C:/Users/alex/.claude/projects/p/s.jsonl \"",
+            "echo x > \\\\localhost\\c$\\data\\store\\a.json",
+            "echo x > //127.0.0.1/c$/data/store/a.json",
+            "echo x > \\\\?\\UNC\\localhost\\c$\\data\\store\\a.json",
+            "echo x > \\\\.\\C:\\data\\store\\a.json",
+            "echo x > ${HOME}/.claude/projects/p/s.jsonl",
+            "echo x > %HOMEDRIVE%%HOMEPATH%\\.claude\\projects\\p\\s.jsonl",
+            "echo x > $CLAUDE_CONFIG_DIR/projects/p/s.jsonl",
+            "echo x > ${CLAUDE_CONFIG_DIR}/projects/p/s.jsonl",
+        ] {
+            assert!(shell_as(&g, "Bash", command), "{command}");
+        }
+        for command in [
+            "Set-Content -Path ${env:USERPROFILE}\\.claude\\projects\\p\\s.jsonl -Value x",
+            "Add-Content $env:HOMEDRIVE$env:HOMEPATH\\.claude\\projects\\p\\s.jsonl x",
+            "Set-Content $env:CLAUDE_CONFIG_DIR\\projects\\p\\s.jsonl x",
+            "Set-Content ${env:CLAUDE_CONFIG_DIR}\\projects\\p\\s.jsonl x",
+            "Set-Content -Path:C:\\data\\store\\a.json -Value x",
+            "Remove-Item -Path:C:\\data\\store\\thor.db",
+            "Remove-Item -LiteralPath:\\\\localhost\\c$\\data\\store\\thor.db",
+        ] {
+            assert!(shell_as(&g, "PowerShell", command), "{command}");
+        }
+        // The same names a protected file only by these spellings; a look-alike is another file.
+        for command in [
+            "echo x > C:/data/store/notes.txt.",
+            "echo x > $HOMEDRIVE/other/s.jsonl",
+            "echo x > $HOMEPATHX/.claude/projects/p/s.jsonl",
+            "echo x > \\\\otherhost\\c$\\data\\store\\a.json",
+            "echo x > C:/data/store2/a.json::$DATA",
+            "echo x > C:/Users/alex/.claude/projects/p/notes.txt::$DATA",
+        ] {
+            assert!(!shell_as(&g, "Bash", command), "{command}");
+        }
+    }
+
+    #[test]
+    fn a_short_8_3_name_is_read_as_the_folder_it_stands_for() {
+        let tmp = std::env::temp_dir().join("thor-guard-8dot3-folder-with-a-long-name");
+        let _ = std::fs::create_dir_all(&tmp);
+        let listing = std::process::Command::new("cmd").args(["/c", &format!("for %I in (\"{}\") do @echo %~sI", tmp.display())]).output();
+        let short = listing.ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+        if cfg!(windows) && short.contains('~') {
+            let g = Protected::new(Some(&tmp), None, &[]);
+            let input = serde_json::json!({ "command": format!("echo x > {short}\\thor.db") });
+            assert!(refusal(&g, "Bash", Some(&input), None).is_some(), "{short}");
+            let other = serde_json::json!({ "command": format!("echo x > {short}\\notes.txt") });
+            assert!(refusal(&g, "Bash", Some(&other), None).is_none());
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn copying_or_extracting_a_whole_tree_into_a_protected_folder_is_refused() {
+        for command in [
+            "cp -r src C:/data/store",
+            "cp -a src/. C:/data/store/",
+            "cp -rf src C:/data/store",
+            "cp -r src C:/Users/alex/.claude/projects/p",
+            "robocopy C:\\scratch\\x C:\\data\\store /E",
+            "robocopy C:\\scratch\\empty C:\\data\\store /MIR",
+            "robocopy /MIR C:\\scratch\\empty C:\\data\\store",
+            "robocopy C:\\scratch\\empty C:\\data\\store /PURGE",
+            "xcopy C:\\s C:\\data\\store /E /Y",
+            "rsync -a src/ C:/data/store/",
+            "tar -xf a.tar -C C:/data/store",
+            "tar -C C:/data/store -xzf a.tgz",
+            "tar xf a.tar --directory=C:/data/store",
+            "tar -xf a.tar --directory C:/data/store",
+            "unzip a.zip -d C:/data/store",
+            "unzip -o -d C:/data/store a.zip",
+            "7z x a.zip -oC:/data/store",
+            "git clone https://example.test/r.git C:/data/store",
+            "git clone --depth 1 https://example.test/r.git C:/tools/thor2/bin",
+            "git -C C:/scratch checkout-index -a --prefix=C:/data/store/",
+        ] {
+            assert!(shell(command), "{command}");
+        }
+        for command in [
+            "Copy-Item C:\\s\\* C:\\data\\store -Recurse -Force",
+            "Copy-Item -Path C:\\s -Destination C:\\data\\store -Recurse",
+            "Expand-Archive -Path a.zip -DestinationPath C:\\data\\store -Force",
+            "Expand-Archive a.zip C:\\data\\store",
+            "Expand-Archive -Path a.zip -DestinationPath:C:\\data\\store",
+        ] {
+            assert!(shell_as(&guard(), "PowerShell", command), "{command}");
+        }
+        for command in [
+            "cp -r C:/data/store C:/scratch/copy",
+            "cp -r src C:/scratch/out",
+            "cp -r src C:/data/store/sub",
+            "cp notes.txt C:/data/store",
+            "robocopy C:\\data\\store C:\\scratch /E",
+            "robocopy C:\\a C:\\b /MIR",
+            "tar -czf C:/scratch/a.tgz -C C:/data/store .",
+            "tar -xf a.tar -C C:/scratch/out",
+            "tar -tf a.tar",
+            "unzip a.zip -d C:/scratch/out",
+            "unzip -l a.zip",
+            "git clone https://example.test/r.git C:/scratch/r",
+            "git clone https://example.test/r.git",
+            "rsync -a C:/data/store/ C:/scratch/copy/",
+        ] {
+            assert!(!shell(command), "{command}");
+        }
+        assert!(!shell_as(&guard(), "PowerShell", "Expand-Archive -Path a.zip -DestinationPath C:\\scratch\\out"));
+        assert!(!shell_as(&guard(), "PowerShell", "Copy-Item C:\\data\\store -Destination C:\\scratch -Recurse"));
+    }
+
+    #[test]
+    fn a_wildcard_or_piped_delete_of_a_protected_folder_is_refused() {
+        for command in [
+            "rm -rf C:/data/store/*",
+            "rm -f C:/data/store/thor.db*",
+            "rm C:/data/store/*.json",
+            "rm -rf C:/data/*",
+            "rm -rf C:/Users/alex/.claude/projects/p",
+            "rm -rf C:/Users/alex/.claude/projects/p/some-session-id",
+            "rm -rf C:/Users/alex/.claude/projects/*",
+            "rm C:/Users/alex/.claude/projects/p/*.jsonl",
+            "rm C:/Users/alex/.claude/projects/*/*.jsonl",
+            "rm C:/tools/thor2/bin/*.exe",
+            "ls C:/data/store | xargs rm",
+            "ls C:/data/store/ | xargs -I{} rm {}",
+            "find C:/data/store -delete",
+            "find C:/data/store -type f -delete",
+            "find C:/data/store -type f -exec rm {} \\;",
+            "find C:/Users/alex/.claude/projects -name '*.jsonl' -delete",
+            "find C:/data/store -name 'thor.db*' -delete",
+        ] {
+            assert!(shell(command), "{command}");
+        }
+        for command in [
+            "Remove-Item C:\\data\\store\\* -Recurse -Force",
+            "del C:\\data\\store\\*.*",
+            "gci C:\\data\\store | Remove-Item",
+            "Get-ChildItem C:\\data\\store -Recurse | Remove-Item -Force",
+            "Get-ChildItem -Path:C:\\data\\store | Remove-Item",
+            "Get-ChildItem C:\\data\\store | ForEach-Object { Remove-Item $_.FullName }",
+            "gci C:\\data\\store | % { rm $_ }",
+            "gci C:\\data\\store | select -expand FullName | rm",
+            "Get-ChildItem C:\\Users\\alex\\.claude\\projects -Recurse | Remove-Item",
+            "Remove-Item C:\\Users\\alex\\.claude\\projects\\p -Recurse",
+            "gci C:\\data\\store\\* | Remove-Item",
+        ] {
+            assert!(shell_as(&guard(), "PowerShell", command), "{command}");
+        }
+        for command in [
+            "rm -rf C:/scratch/*",
+            "rm C:/data/store/*.txt",
+            "rm C:/data/store/notes.txt",
+            "rm -rf C:/data/store2/*",
+            "rm -rf C:/data/other/*",
+            "rm C:/Users/alex/.claude/projects/p/notes.txt",
+            "rm C:/Users/alex/.claude/projects/p/*.txt",
+            "rm C:/Users/alex/.claude/settings.json",
+            "rm -rf C:/Users/alex/.claude/cache",
+            "ls C:/data/store | wc -l",
+            "ls C:/data/store | grep thor | head",
+            "ls C:/scratch | xargs rm",
+            "find C:/data/store -name '*.txt' -delete",
+            "find C:/scratch -delete",
+            "find C:/data/store -type f -print",
+            "find C:/data/store -name 'thor.db*' | xargs ls",
+        ] {
+            assert!(!shell(command), "{command}");
+        }
+        for command in [
+            "gci C:\\data\\store | Where-Object { $_.Length -gt 5 } | Remove-Item",
+            "gci C:\\data\\store -Filter *.txt | Remove-Item",
+            "gci C:\\scratch | Remove-Item",
+            "Get-ChildItem C:\\data\\store | Measure-Object",
+            "Remove-Item C:\\scratch\\* -Recurse",
+            "Get-ChildItem C:\\data\\store | Select-Object Name",
+        ] {
+            assert!(!shell_as(&guard(), "PowerShell", command), "{command}");
+        }
+    }
+
+    #[test]
+    fn more_commands_that_write_a_file_are_refused() {
+        for command in [
+            "sed -n 'w C:/data/store/a.json' f",
+            "sed 's/a/b/w C:/data/store/a.json' f",
+            "sed -n '1w C:/Users/alex/.claude/projects/p/s.jsonl' f",
+            "sed --in-place=.bak s/a/b/ C:/data/store/a.json",
+            "touch C:/data/store/session-watermark.json",
+            "touch C:/Users/alex/.claude/projects/p/s.jsonl",
+            "certutil -urlcache -split -f http://example.test/x C:\\data\\store\\a.json",
+            "certutil -decode in.b64 C:\\data\\store\\a.json",
+            "bitsadmin /transfer j http://example.test/x C:\\data\\store\\a.json",
+            "git archive -o C:/data/store/a.json HEAD",
+            "git archive --output=C:/data/store/a.json HEAD",
+            "git -C src diff --output=C:/data/store/a.json",
+            "git -C C:/data/store reset --hard",
+            "git -C C:/data/store clean -fdx",
+            "git -C C:/data/store checkout .",
+            "git -C C:/data/store stash",
+            "git --git-dir=C:/data/store/.git --work-tree=C:/data/store checkout -f",
+            "git -C C:/tools/thor2/bin pull",
+            "curl -sSLo C:/data/store/a.json http://example.test/x",
+            "curl -sSL -o C:/data/store/a.json http://example.test/x",
+            "curl -oC:/data/store/a.json http://example.test/x",
+            "curl http://example.test/x -fsSo C:/data/store/a.json",
+            "wget -qO C:/data/store/a.json http://example.test/x",
+            "wget -O C:/data/store/a.json -q http://example.test/x",
+            "wget -qOC:/data/store/a.json http://example.test/x",
+            "wget -q -P C:/data/store http://example.test/x",
+            "wget -qP C:/data/store http://example.test/x",
+        ] {
+            assert!(shell(command), "{command}");
+        }
+        for command in [
+            "iwr http://example.test/x -OutFile C:\\data\\store\\a.json",
+            "Invoke-WebRequest -Uri http://example.test/x -OutFile:C:\\data\\store\\a.json",
+            "Invoke-RestMethod http://example.test/x -OutFile C:\\data\\store\\a.json",
+            "ni C:\\data\\store\\a.json -Force",
+            "New-Item -Force -Path:C:\\data\\store\\a.json",
+            "New-Item C:\\data\\store\\a.json -ItemType File -Force",
+            "'x' | Tee-Object -FilePath C:\\data\\store\\a.json",
+            "Get-Process | Export-Csv -Path:C:\\data\\store\\a.json",
+            "Get-Process | Export-Clixml C:\\data\\store\\a.json",
+            "Invoke-Expression \"Set-Content C:\\data\\store\\a.json x\"",
+            "iex 'Remove-Item C:\\data\\store\\thor.db'",
+        ] {
+            assert!(shell_as(&guard(), "PowerShell", command), "{command}");
+        }
+        for command in [
+            "sed -n 'w C:/scratch/out.txt' f",
+            "sed -n 's/a/b/w C:/scratch/out.txt' f",
+            "sed -n '1,5p' C:/data/store/a.json",
+            "sed -n 's/new/w x/p' C:/data/store/a.json",
+            "touch C:/data/store/notes.txt",
+            "touch C:/scratch/x",
+            "certutil -hashfile C:\\data\\store\\thor.db SHA256",
+            "git archive -o C:/scratch/a.zip HEAD",
+            "git diff --output=C:/scratch/a.patch",
+            "git -C C:/data/store log --oneline",
+            "git -C C:/data/store status",
+            "git -C C:/data/store diff",
+            "git -C C:/work reset --hard",
+            "git push -o ci.skip origin main",
+            "curl -sSLo C:/scratch/a.json http://example.test/x",
+            "curl -sSL http://example.test/x -o C:/scratch/a.json",
+            "curl -s http://example.test/x -H 'Accept: x'",
+            "curl -s -X POST http://localhost:3000/e -d '{\"name\":\"t\"}'",
+            "wget -qO- http://example.test/x",
+            "wget -qO C:/scratch/x http://example.test/x",
+            "wget -q -P C:/scratch http://example.test/x",
+        ] {
+            assert!(!shell(command), "{command}");
+        }
+        for command in [
+            "iwr http://example.test/x -OutFile C:\\scratch\\a.json",
+            "ni C:\\scratch\\a.json -Force",
+            "New-Item -Path:C:\\scratch\\a.json -Force",
+            "Get-Process | Export-Csv -Path C:\\scratch\\a.csv",
+            "'x' | Tee-Object -FilePath C:\\scratch\\a.txt",
+            "Invoke-Expression \"Set-Content C:\\scratch\\a.txt x\"",
+            "Set-Content -Path:C:\\scratch\\a.txt -Value x",
+        ] {
+            assert!(!shell_as(&guard(), "PowerShell", command), "{command}");
+        }
+    }
+
+    /// `text` as the base64 of its UTF-16 little-endian bytes, as `-EncodedCommand` wants it.
+    fn encoded(text: &str) -> String {
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let bytes: Vec<u8> = text.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let n = chunk.iter().enumerate().fold(0u32, |acc, (i, b)| acc | (u32::from(*b) << (16 - 8 * i)));
+            for k in 0..4 {
+                if k <= chunk.len() {
+                    out.push(ALPHABET[((n >> (18 - 6 * k)) & 63) as usize] as char);
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn an_encoded_powershell_command_is_read_before_it_is_judged() {
+        let bad = encoded("Set-Content C:\\data\\store\\unpin-owner-go.json '[]'");
+        let good = encoded("Set-Content C:\\scratch\\notes.txt 'x'");
+        for flag in ["-EncodedCommand", "-enc", "-e", "-ec", "-ENCODEDCOMMAND"] {
+            assert!(shell_as(&guard(), "PowerShell", &format!("powershell -NoProfile {flag} {bad}")), "{flag}");
+            assert!(shell_as(&guard(), "Bash", &format!("pwsh {flag} {bad}")), "{flag}");
+            assert!(!shell_as(&guard(), "PowerShell", &format!("powershell -NoProfile {flag} {good}")), "{flag}");
+        }
+        assert!(shell_as(&guard(), "Bash", &format!("powershell.exe -NonInteractive -EncodedCommand {bad}")));
+        assert!(!shell_as(&guard(), "PowerShell", "powershell -EncodedCommand not-base64!"));
+        assert_eq!(forms::decode_encoded_command(&encoded("Add-Content a b")).as_deref(), Some("Add-Content a b"));
+    }
+
+    #[test]
+    fn the_file_tools_read_a_filepath_key_and_any_case_of_the_tool_name() {
+        let g = guard();
+        for (tool, key) in [("Write", "filePath"), ("Edit", "filePath"), ("write", "file_path"), ("edit", "filePath"), ("NotebookEdit", "notebookPath"), ("MultiEdit", "filePath")] {
+            let input = serde_json::json!({ key: "C:/data/store/unpin-owner-go.json" });
+            assert!(refusal(&g, tool, Some(&input), None).is_some(), "{tool} {key}");
+            let fine = serde_json::json!({ key: "C:/work/notes.md" });
+            assert!(refusal(&g, tool, Some(&fine), None).is_none(), "{tool} {key}");
+        }
+        let read = serde_json::json!({ "filePath": "C:/data/store/thor.db" });
+        assert!(refusal(&g, "Read", Some(&read), None).is_none());
+    }
+
+    #[test]
+    fn the_path_helpers_read_the_names_the_file_system_reads() {
+        assert_eq!(forms::clean_path("c:/data/store/thor.db."), "c:/data/store/thor.db");
+        assert_eq!(forms::clean_path("c:/data/store./thor.db "), "c:/data/store/thor.db");
+        assert_eq!(forms::clean_path("c:/data/store/thor.db::$data"), "c:/data/store/thor.db");
+        assert_eq!(forms::clean_path("c:/data/store/thor.db:stream:$data"), "c:/data/store/thor.db");
+        assert_eq!(forms::unshare("//localhost/c$/data/store/x"), "c:/data/store/x");
+        assert_eq!(forms::unshare("echo //127.0.0.1/d$/x"), "echo d:/x");
+        assert_eq!(forms::unshare("//otherhost/c$/x"), "//otherhost/c$/x");
+        assert!(forms::wildcard_matches("*.json", "a.json") && forms::wildcard_matches("thor.db*", "thor.db-wal") && forms::wildcard_matches("*", "x"));
+        assert!(!forms::wildcard_matches("*.txt", "thor.db") && !forms::wildcard_matches("thor.d?", "thor.db-wal"));
+        assert_eq!(forms::split_colon_params(&["-Path:C:\\x".to_string(), "-c:".to_string(), "--a:b".to_string()]), ["-Path", "C:\\x", "-c:", "--a:b"]);
+        assert_eq!(forms::cluster_values(&["-sSLo".to_string(), "f".to_string()], &['o']), [('o', "f".to_string())]);
+        assert_eq!(forms::cluster_values(&["-oPATH".to_string()], &['o']), [('o', "PATH".to_string())]);
+    }
+
+    /// Not run by default: like `replay_the_real_calls`, but over the real-calls file itself
+    /// (THOR_REPLAY_FILE, one JSON row per call: `k`, `tool`, `in`, `cwd`, `ok`).
+    #[test]
+    #[ignore]
+    fn replay_the_real_calls_file() {
+        let var = |n: &str| std::env::var(n).unwrap_or_default();
+        let g = Protected::new(
+            Some(Path::new(&var("THOR_REPLAY_STORE"))),
+            Some(Path::new(&var("THOR_REPLAY_PROGRAMS"))),
+            &[PathBuf::from(var("THOR_REPLAY_CLAUDE"))],
+        );
+        let text = std::fs::read_to_string(var("THOR_REPLAY_FILE")).unwrap_or_default();
+        let (mut total, mut refused) = (0, 0);
+        for line in text.lines().filter(|l| l.contains("\"k\":\"c\"")) {
+            let Ok(row) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            let tool = row["tool"].as_str().unwrap_or("");
+            total += 1;
+            let cwd = row["cwd"].as_str();
+            if refusal(&g, tool, row.get("in"), cwd).is_some() {
+                refused += 1;
+                println!("REFUSED ok={} {} {}", row["ok"], tool, row["in"].to_string().chars().take(400).collect::<String>());
+            }
+        }
+        println!("calls {total}, refused {refused}");
     }
 
     #[test]
