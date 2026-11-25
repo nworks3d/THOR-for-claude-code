@@ -269,14 +269,19 @@ fn the_recording_item_says_what_is_kept_where_why_and_how_to_switch_it_off() {
 }
 
 #[test]
-fn the_changelog_item_is_the_owners_decision_with_a_default_of_yes() {
+fn the_changelog_item_is_asked_once_per_code_project_with_its_reasons_and_never_blocks() {
     let q = questions().into_iter().find(|q| q.id == "changelog").unwrap();
     // The user's line is a statement of what happens, never a question.
     assert!(!q.line.contains('?'), "item 12 is a statement, not a question: {}", q.line);
-    assert!(q.line.contains("I create CHANGELOG.md") && q.line.contains("If you say no, I do not create it"), "{}", q.line);
-    assert_eq!(q.why, "Every later session, and you, know exactly what changed and which version runs, without digging through history.");
-    assert!(q.default.starts_with("Yes") && q.default.contains("has none"), "{}", q.default);
-    assert!(questionnaire::ASSISTANT_RULES.contains("CHANGELOG.md"), "on yes the assistant creates the file");
+    assert!(q.line.contains("once") && q.line.contains("Never a hard stop"), "{}", q.line);
+    assert!(q.what.contains("a fault is found much faster") && q.what.contains("saves effort and cost"), "{}", q.what);
+    assert!(q.why.contains("a fault is found much faster") && q.why.contains("saves effort and cost"), "{}", q.why.to_lowercase());
+    assert!(q.say_no.contains("install --set-changelog-flow off --db <store>") && q.say_no.contains("never a hard stop"), "{}", q.say_no);
+    assert!(q.what.contains("A folder that is not a code project is never asked"), "{}", q.what);
+    let rules = questionnaire::ASSISTANT_RULES;
+    for must in ["--set-changelog-flow on --db <store>", "--set-changelog-flow off --db <store>", "CHANGELOG.md", "0.1.0", "ask it ONCE", "Never a hard stop"] {
+        assert!(rules.contains(must), "the assistant rules lack '{must}'");
+    }
 }
 
 /// Every command the list tells the assistant to run must exist in the

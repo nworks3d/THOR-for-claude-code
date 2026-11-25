@@ -220,6 +220,19 @@ struct Cli {
     )]
     set_helpers: Option<String>,
 
+    /// Set ONLY the answer to "shall I keep a changelog and version numbers for
+    /// this project?", `on` or `off`, and nothing else. Run it from inside the
+    /// project: the answer is kept for that project alone, beside the memory.
+    /// `on` also makes sure the notes that know the flow are in the memory;
+    /// `off` hides them in this project and the question is never raised there
+    /// again. Running it twice changes nothing the second time. Needs --db.
+    #[arg(
+        long = "set-changelog-flow",
+        value_name = "on|off",
+        conflicts_with_all = ["project", "settings", "mcp_json", "no_mcp", "serve_exe", "mcp_exe", "code_index_root", "register_root", "set_mode", "set_plan", "set_weekly_check", "set_backup", "set_recording", "set_language", "set_helpers", "set_temp_folder", "set_tools_folder", "topic", "copy_from"]
+    )]
+    set_changelog_flow: Option<String>,
+
     /// Set ONLY the temp-until-live folder, and nothing else: the folder that
     /// holds one sub-folder per production, named <YYYY-MM-DD>_<repo>_<subject>,
     /// each with a STATUS.txt whose first line starts with "STATUS:" (a
@@ -442,6 +455,86 @@ fn set_helpers_only(db: Option<PathBuf>, word: &str) -> ExitCode {
         println!("helper-agent mode is on for {}: your assistant is reminded of it right before it starts a helper agent. Switch it off again with: install --set-helpers off --db \"{}\"", db.display(), db.display());
     } else {
         println!("helper-agent mode is off for {}", db.display());
+    }
+    ExitCode::SUCCESS
+}
+
+/// The question about a changelog and version numbers, printed for the
+/// assistant when a git project gets its memory for the first time and has no
+/// answer on record. Never at a folder that is not a code project.
+fn print_changelog_question(db: &Path, key: &str, here: &Path) {
+    if serve::project::git_root(here).is_none() || serve::changelog_flow::answer(db, key).is_some() {
+        return;
+    }
+    let intro = format!("+ ONE QUESTION FOR THE PERSON about '{key}' (asked once for this project):");
+    println!("{}", serve::changelog_flow::ask_block(&intro, &serve::changelog_flow::install_command(), db));
+}
+
+/// `install --set-changelog-flow on|off`, from inside a code project: record
+/// the answer for that project, and on `on` make sure its notes are in the memory.
+fn set_changelog_flow_only(db: Option<PathBuf>, word: &str) -> ExitCode {
+    use ops::install::{set_changelog_flow, FlowNoteChange};
+    use serve::changelog_flow::Change;
+    let on = match word {
+        "on" => true,
+        "off" => false,
+        other => {
+            eprintln!("the changelog flow is 'on' or 'off', not '{other}'. Example: install --set-changelog-flow on --db <your memory>");
+            return ExitCode::from(2);
+        }
+    };
+    let Some(db) = db else {
+        eprintln!("name the memory to set this for: install --set-changelog-flow {word} --db <your memory>");
+        return ExitCode::from(2);
+    };
+    if !db.is_file() {
+        eprintln!(
+            "REFUSED: there is no memory at {} - check the path given with --db (the one your assistant's hooks name). Nothing was changed.",
+            db.display()
+        );
+        return ExitCode::FAILURE;
+    }
+    let here = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    serve::project::load_known_scopes(&db);
+    let Some(top) = serve::project::git_root(&here) else {
+        eprintln!("REFUSED: run this from inside the code project (a git folder) it is about. A folder that is not a code project is never asked. Nothing was changed.");
+        return ExitCode::FAILURE;
+    };
+    let Some(key) = serve::project::resolve_project(&top) else {
+        eprintln!("REFUSED: this folder has no project name to record the answer under. Nothing was changed.");
+        return ExitCode::FAILURE;
+    };
+    let (change, notes) = match set_changelog_flow(&db, &key, on) {
+        Ok(done) => done,
+        Err(e) => {
+            eprintln!("could not record the answer: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut refused = false;
+    for (id, note) in &notes {
+        match note {
+            FlowNoteChange::Stored => println!("+ stored the note '{id}'"),
+            FlowNoteChange::Refreshed => println!("+ rewrote the note '{id}' to the changelog flow (it still had the old starter text)"),
+            FlowNoteChange::AlreadyThere => println!("= the note '{id}' was already there"),
+            FlowNoteChange::LeftAlone(why) => println!("= left the note '{id}' as it is: {why}"),
+            FlowNoteChange::Refused(why) => {
+                refused = true;
+                eprintln!("! could not store the note '{id}': {why}");
+            }
+        }
+    }
+    if refused {
+        return ExitCode::FAILURE;
+    }
+    let again = match change {
+        Change::Unchanged => " (this was already the answer; nothing changed)",
+        _ => "",
+    };
+    if on {
+        println!("changelog and version numbers are ON for '{key}'{again}: your assistant is reminded of the flow at a commit, a tag and a release. If the project has no CHANGELOG.md, create one ('# Changelog' and an 'Unreleased' section, nothing invented); if it has no version number, propose 0.1.0 to the person. Switch it off with: install --set-changelog-flow off --db \"{}\"", db.display());
+    } else {
+        println!("changelog and version numbers are OFF for '{key}'{again}: the flow notes are not shown in this project and it is never asked about again. Other projects are not affected. Switch it on later with: install --set-changelog-flow on --db \"{}\"", db.display());
     }
     ExitCode::SUCCESS
 }
@@ -966,7 +1059,10 @@ fn register_only(db: Option<PathBuf>, per_machine: bool, ask_main: bool) -> Exit
             RegisterOutcome::Created { root }
             | RegisterOutcome::Registered { root }
             | RegisterOutcome::CreatedUnderRootRecord { root },
-        ) => println!("registered '{key}' -> {root}"),
+        ) => {
+            println!("registered '{key}' -> {root}");
+            print_changelog_question(&db, &key, &here);
+        }
         Ok(RegisterOutcome::AlreadyHere { root }) => {
             println!("= '{key}' is already registered here ({root}) - nothing to do")
         }
@@ -1015,14 +1111,16 @@ fn register_machine_only(db: Option<PathBuf>, key: &str, root: &str, machine: &s
 
 /// The line the per-project install prints for what registering this
 /// checkout did.
-fn print_record_outcome(key: &str, outcome: Result<RegisterOutcome, RegisterRefusal>) {
+fn print_record_outcome(db: &Path, here: &Path, key: &str, outcome: Result<RegisterOutcome, RegisterRefusal>) {
     match outcome {
         Ok(RegisterOutcome::Created { root }) => {
             println!("+ recorded this project, '{key}', in the memory: notes about it can now be saved without any extra question");
             println!("+ registered its working copy: {root}");
+            print_changelog_question(db, key, here);
         }
         Ok(RegisterOutcome::CreatedUnderRootRecord { root }) | Ok(RegisterOutcome::Registered { root }) => {
-            println!("+ registered the working copy of '{key}': {root}")
+            println!("+ registered the working copy of '{key}': {root}");
+            print_changelog_question(db, key, here);
         }
         Ok(RegisterOutcome::AlreadyHere { .. }) => println!("= project record already names this checkout"),
         Ok(RegisterOutcome::Moved { from, to }) => {
@@ -1140,6 +1238,9 @@ fn main() -> ExitCode {
     }
     if let Some(word) = cli.set_helpers.as_deref() {
         return set_helpers_only(cli.db, word);
+    }
+    if let Some(word) = cli.set_changelog_flow.as_deref() {
+        return set_changelog_flow_only(cli.db, word);
     }
     if cli.set_temp_folder.is_some() || cli.set_tools_folder.is_some() {
         return set_work_folders_only(cli.db, cli.set_temp_folder.as_deref(), cli.set_tools_folder.as_deref());
@@ -1676,7 +1777,7 @@ fn main() -> ExitCode {
                 // this closes). Idempotent - a rerun that hits this same
                 // branch (the code index was rebuilt, but the record already
                 // exists) writes nothing more.
-                print_record_outcome(&key, record_project_opened(&db, &here, &key, files));
+                print_record_outcome(&db, &here, &key, record_project_opened(&db, &here, &key, files));
             }
             Ok(Some(None)) => {
                 println!("= this project's code was already read; a commit, a merge or pull, a rebase and a branch switch each keep it fresh");
@@ -1693,7 +1794,7 @@ fn main() -> ExitCode {
                 // more (see `record_project_opened`'s own doc comment).
                 if let Some(root) = code_index_root.as_deref() {
                     match existing_index_file_count(root, &index_key) {
-                        Ok(files) => print_record_outcome(&key, record_project_opened(&db, &here, &key, files)),
+                        Ok(files) => print_record_outcome(&db, &here, &key, record_project_opened(&db, &here, &key, files)),
                         Err(e) => println!("  ! could not read the existing code index to record this project: {e}"),
                     }
                 }

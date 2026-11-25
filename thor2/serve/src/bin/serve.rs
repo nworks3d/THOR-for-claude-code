@@ -2990,6 +2990,17 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
                     (None, Some(rendered)) => Some(rendered),
                     (None, None) => None,
                 };
+                // THE CHANGELOG QUESTION, safety net: a git project with no answer on record is
+                // asked at its first commit moment of a session (`serve::changelog_flow`).
+                let flow_line = if input.moments.contains(&Action::Commit) && !copy && !payload_is_from_a_subagent(&payload) {
+                    changelog_flow_line(db_path, &session_id, folder_project.as_deref(), session_cwd.as_deref(), no_record)
+                } else {
+                    None
+                };
+                let block = match (block, flow_line) {
+                    (Some(block), Some(line)) => Some(format!("{block}\n\n{line}")),
+                    (block, line) => block.or(line),
+                };
                 let Some(block) = block else { break 'served None };
                 // Only a fact shown IN FULL is a serving (and so can owe a
                 // judgement): a repeat that was left out is not one - the
@@ -3074,6 +3085,21 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             })
         }
     }
+}
+
+/// The one line that asks a git project, at its first commit moment of a session, whether to keep a
+/// changelog and version numbers: only while no answer is on record, and never at a folder that is
+/// not a code project (`serve::changelog_flow`).
+fn changelog_flow_line(db_path: &Path, session_id: &str, project: Option<&str>, cwd: Option<&Path>, no_record: bool) -> Option<String> {
+    let project = project?;
+    project::git_root(cwd?)?;
+    if serve::changelog_flow::answer(db_path, project).is_some() {
+        return None;
+    }
+    if !serve::changelog_flow::ask_once_this_session(db_path, session_id, project, !no_record) {
+        return None;
+    }
+    Some(serve::changelog_flow::commit_line(project, &serve::changelog_flow::install_command(), db_path))
 }
 
 // ------------------------------------------------------- Lane C: the capture

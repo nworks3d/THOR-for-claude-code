@@ -30,6 +30,7 @@ What changed: The weekly check is quieter and more reliable, and a pin can no lo
 - **A subject with notes but no folder is reported.** When your message names a subject that has notes and no folder of its own, your assistant is told once per conversation, offers to give it a folder, and you only answer yes or no. A note saved under such a subject says so in its reply, and the short summary of `doctor` lists these subjects.
 - **The start of every conversation is yours alone.** Your assistant can no longer pin a note by itself: it has to ask you whether the note must come along in every conversation, and THOR accepts the pin only with your own message quoted. A note that is already pinned can still be maintained.
 - **A subject's folder brings its notes without pinning.** In a folder made for one subject, a note tied to that subject comes up when your message shares a word with it. The setup texts no longer tell your assistant to pin.
+- **A code project is asked once about a changelog and version numbers.** When a project gets its own memory, your assistant asks one question with its two reasons: a fault is found much faster, and it saves effort and cost. On yes, THOR's notes already know the flow: a changelog line with every visible change, a changelog section before a release, small version steps, and the version read from git. On no, it is off for that project and never raised there again. It never blocks anything.
 
 ## 2.6.13 (2026-11-21)
 

@@ -181,7 +181,7 @@ Words used once, in plain language:
   write (ops/src/install.rs, the TEETH paragraph of workflow_starter_pack).
 - You notice: each arrives right before its step (commit, push, delete...), once per
   conversation. Apart from the two Windows teeth they can never refuse anything. A changelog is only
-  created when you said yes to first-session item 12. Commit/push/deploy/install/delete moments are covered.
+  created when you said yes to the changelog question (first-session item 12, F13). Commit/push/deploy/install/delete moments are covered.
 - Refuse or change: tell the assistant to remove any; it retracts them with a reason.
 
 ### A11. It writes a reply rulebook with six rules
@@ -1093,14 +1093,25 @@ remembers per session how far it has looked, so a long conversation does not mak
 - You notice: with it off, the sweep reports no data instead of rules.
 - Refuse or change: yes, with the command above.
 
-### F13. A changelog and version number (first-session item 12)
-- What: the default is yes when the project has none: the assistant creates CHANGELOG.md in the project
-  it runs in (a "Changelog" heading with an "Unreleased" section, nothing invented) and keeps a version
-  number only if the project has one or you ask for one. A project that already keeps one is left alone.
-  The starter note changelog-with-every-user-visible-change then adds a line with each change.
-- Why: every later session knows what changed and which version runs.
-- You notice: one new file, once.
-- Refuse or change: say no to item 12: nothing is created and it is not asked again.
+### F13. A changelog and version numbers, asked once per code project (first-session item 12)
+- What: when a code project (a git folder) gets its own memory, the assistant asks you ONE question,
+  with its two reasons: shall it keep a changelog and version numbers for this project? A fault is found
+  much faster because you can see in which version it came in, and it saves effort and cost because it
+  reads the changelog instead of digging through the whole history. On yes the notes that know the flow
+  hold in that project: a changelog line for every change a user can see, in the same commit
+  (changelog-with-every-user-visible-change); a release opens with a changelog section written before the
+  version number goes up (changelog-flow-release-opens-with-what-changed); versions move in small steps, a
+  round of work is one step in the last digit and the middle or first digit moves only on your word
+  (changelog-flow-versions-move-in-small-steps); the current version is read from git after a fetch, and a
+  tag or release happens only when you ask (changelog-flow-read-the-version-from-git). With no CHANGELOG.md
+  the assistant creates one (a "Changelog" heading with an "Unreleased" section, nothing invented); with
+  no version number it proposes 0.1.0. The answer is kept per project (install --set-changelog-flow on|off,
+  run from inside the project; a file beside the memory). A folder that is not a code project is never asked.
+- Why: every later session knows what changed and which version runs, and finds a fault by version.
+- You notice: one question, once per project; a project that has not answered is asked again by one line
+  at its first commit of a session, until it does. It never blocks anything.
+- Refuse or change: say no: the four notes are not shown in that project and the question is never raised
+  there again; other projects are not affected. Say yes later with install --set-changelog-flow on.
 
 ### F14. Fixed on purpose (cannot be changed by setting)
 - What: the 300-character limit, the four-per-place cap, the secret scan, the evaluation cadence, the
