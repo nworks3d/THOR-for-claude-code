@@ -40,7 +40,7 @@ fn a_hook_that_calls_a_missing_program_is_named_with_the_cause_and_the_steps() {
     let stdout = run_doctor(&db, dir.path());
     let line = stdout.lines().find(|l| l.starts_with("PROBLEM: THOR program missing")).unwrap_or_else(|| panic!("no missing-program line:\n{stdout}"));
     assert!(line.contains("serve.exe"), "{line}");
-    assert!(line.contains("install again"), "{line}");
+    assert!(line.contains("one-line download command"), "{line}");
     if cfg!(windows) {
         assert!(line.contains("quarantined") && line.contains("Protection history"), "{line}");
         assert!(line.contains("OFFER, never do it unasked") && line.contains("saying no is fine"), "{line}");

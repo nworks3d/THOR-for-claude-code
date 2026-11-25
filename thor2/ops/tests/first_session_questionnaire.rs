@@ -234,7 +234,7 @@ fn the_git_hooks_item_names_the_media_gate_and_both_ways_to_switch_things_off() 
     assert!(q.what.contains("whole machine or for one repository"), "{}", q.what);
     assert!(q.why.contains("26.7 MB 4K video") && q.why.contains("2026-10-20") && q.why.contains("typed commands"), "{}", q.why);
     assert!(q.why.contains("83 percent"), "the original reason stays: {}", q.why);
-    assert!(q.say_no.contains("git config --global --unset core.hooksPath"), "{}", q.say_no);
+    assert!(q.say_no.contains("install --set-git-hooks off --db <store>") && q.say_no.contains("install --set-git-hooks on --db <store>"), "{}", q.say_no);
     assert!(q.say_no.contains("git config --global thor.mediagate.enabled false"), "{}", q.say_no);
     assert!(
         questionnaire::ASSISTANT_RULES.contains("thor.mediagate.enabled false"),
@@ -273,7 +273,17 @@ fn the_changelog_item_is_asked_once_per_code_project_with_its_reasons_and_never_
     let q = questions().into_iter().find(|q| q.id == "changelog").unwrap();
     // The user's line is a statement of what happens, never a question.
     assert!(!q.line.contains('?'), "item 12 is a statement, not a question: {}", q.line);
-    assert!(q.line.contains("once") && q.line.contains("Never a hard stop"), "{}", q.line);
+    assert!(q.line.contains("a yes or no") && q.line.contains("each code project"), "{}", q.line);
+    // First session: proposal 4 of the welcome, accepted by the plain yes, refused by "4 no".
+    assert!(q.what.contains("proposal 4 of the welcome") && q.what.contains("\"4 no\""), "{}", q.what);
+    let rules_text = questionnaire::ASSISTANT_RULES;
+    assert!(rules_text.contains("Proposal 4 (a changelog and version numbers, ONLY when the project this session runs in is a git repository"), "{rules_text}");
+    let first = questionnaire::lookup_text(None);
+    assert!(
+        first.contains("4. I keep a changelog and version numbers for this project, so a fault is found faster and I read less to find it."),
+        "the welcome text carries proposal 4"
+    );
+    assert!(!questionnaire::render_welcome().contains("changelog"), "the plain welcome stays free of it; proposal 4 is added only in a git project");
     assert!(q.what.contains("a fault is found much faster") && q.what.contains("saves effort and cost"), "{}", q.what);
     assert!(q.why.contains("a fault is found much faster") && q.why.contains("saves effort and cost"), "{}", q.why.to_lowercase());
     assert!(q.say_no.contains("install --set-changelog-flow off --db <store>") && q.say_no.contains("never a hard stop"), "{}", q.say_no);
@@ -449,7 +459,8 @@ fn without_known_paths_the_text_describes_each_one_instead_of_leaving_a_hole() {
     let text = questionnaire::lookup_text(None);
     let paths = &text[text.find("PATHS ON THIS MACHINE").unwrap()..];
     assert!(paths.contains("install program in the thor2 folder") && paths.contains("~/.claude/settings.json") && paths.contains("~/.claude.json"), "{paths}");
-    assert!(text.contains("Plan: <as detected>"), "the page for any user keeps the plan open");
+    assert!(!text.contains("<as detected>"), "no placeholder is left in the page for any user");
+    assert!(text.contains("Plan: the one the installer printed on its plan line"), "the page for any user points at the installer's plan line");
 }
 
 #[test]
@@ -472,7 +483,7 @@ fn the_seeded_store_carries_the_installs_real_paths_and_the_setup_note_names_the
     let item = model::store::show(&store, questionnaire::LOOKUP_ID).unwrap();
     assert!(item.text.contains("\"C:/Users/x/thor2/install.exe\"") && item.text.contains("\"C:/Users/x/.claude/settings.json\""), "{}", item.text);
     let note = model::store::show(&store, model::store::SETUP_NOTE_ID).unwrap();
-    assert!(note.text.contains("`lookup first-session-questions`") && note.text.contains("one place to read"), "{}", note.text);
+    assert!(note.text.contains("`lookup with key first-session-questions`") && note.text.contains("one place to read"), "{}", note.text);
 }
 
 /// Blind test 2026-10-10: Pro and any plan below Max are "small", Max is "max",
@@ -493,14 +504,16 @@ fn the_plan_item_says_plainly_what_counts_as_small_and_what_is_the_default() {
 #[test]
 fn the_assistant_rules_say_how_to_put_the_connections_back_on() {
     let text = questionnaire::lookup_text_with(None, &real_paths());
-    let on = "to switch them back on, run the installer again with `install --db \"C:/Users/x/AppData/Local/thor2/thor.db\"`";
+    let off = "2 install --set-connections off --db \"C:/Users/x/AppData/Local/thor2/thor.db\"";
+    assert!(text.contains(off), "{text}");
+    let on = "to switch them back on: install --set-connections on --db \"C:/Users/x/AppData/Local/thor2/thor.db\"";
     assert!(text.contains(on), "{text}");
     let rules = questionnaire::ASSISTANT_RULES;
-    assert!(rules.contains("a second run changes nothing") && rules.contains("a restart of Claude Code is needed again"), "{rules}");
+    assert!(rules.contains("never edit the settings file by hand") && rules.contains("a restart of Claude Code is needed again"), "{rules}");
     // It sits beside the "no" instruction for item 2.
-    let at_no = rules.find("2 remove only THOR's four hook entries").unwrap();
+    let at_no = rules.find("2 install --set-connections off").unwrap();
     let at_on = rules.find("to switch them back on").unwrap();
-    assert!(at_on > at_no && at_on - at_no < 400, "the way back on is beside the way off");
+    assert!(at_on > at_no && at_on - at_no < 700, "the way back on is beside the way off");
 }
 
 /// Items 4 and 7 run through the connections of item 2.

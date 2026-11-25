@@ -89,6 +89,50 @@ struct Cli {
     #[arg(long, conflicts_with = "project")]
     topic: bool,
 
+    /// Set ONLY the connection between THOR and Claude Code, `on` or `off`, and
+    /// nothing else. `off` removes THOR's own entries from Claude Code's
+    /// settings file (nothing else there is touched) and records your no
+    /// beside the memory, so a later plain install does not wire them again
+    /// and the health check calls it your choice, not a problem. `on` wires
+    /// them again. Claude Code must be closed completely and opened again for
+    /// either to take effect. Needs --db.
+    #[arg(
+        long = "set-connections",
+        value_name = "on|off",
+        conflicts_with_all = ["project", "topic", "register_root", "mcp_json", "no_mcp", "set_mode", "set_plan", "set_weekly_check", "set_backup", "set_recording", "set_language", "set_helpers", "set_changelog_flow", "set_git_hooks", "set_reply_rules", "copy_from"]
+    )]
+    set_connections: Option<String>,
+
+    /// Set ONLY THOR's helpers in git, `on` or `off`, and nothing else. `off`
+    /// tells git to stop using THOR's helper folder (only when it is THOR's;
+    /// another tool's setting is left alone) and records your no beside the
+    /// memory. The code of a project then stops being refreshed after a
+    /// commit, and the check against video and very large files stops too.
+    /// `on` wires them again. Needs --db.
+    #[arg(
+        long = "set-git-hooks",
+        value_name = "on|off",
+        conflicts_with_all = ["project", "topic", "register_root", "settings", "mcp_json", "no_mcp", "set_mode", "set_plan", "set_weekly_check", "set_backup", "set_recording", "set_language", "set_helpers", "set_changelog_flow", "set_connections", "set_reply_rules", "copy_from"]
+    )]
+    set_git_hooks: Option<String>,
+
+    /// Set ONLY the reply rules (the small file next to the memory that keeps
+    /// your assistant's replies short and tidy), `on` or `off`, and nothing
+    /// else. `off` sets the whole file aside (your changes in it are kept) and
+    /// records your no beside the memory; `on` puts it back. Needs --db.
+    #[arg(
+        long = "set-reply-rules",
+        value_name = "on|off",
+        conflicts_with_all = ["project", "topic", "register_root", "settings", "mcp_json", "no_mcp", "set_mode", "set_plan", "set_weekly_check", "set_backup", "set_recording", "set_language", "set_helpers", "set_changelog_flow", "set_connections", "set_git_hooks", "copy_from"]
+    )]
+    set_reply_rules: Option<String>,
+
+    /// One THOR per computer account: when Claude Code is already connected to
+    /// another memory, a plain install refuses. This moves the connection
+    /// (its four entries) to the memory named with --db.
+    #[arg(long = "move-to-this-store")]
+    move_to_this_store: bool,
+
     /// Register ONLY: record the folder this is run from as its project's
     /// working copy, and nothing else - no settings, no hooks, no tool server,
     /// no code index. Run it from inside the checkout (or, for a plain topic
@@ -208,11 +252,11 @@ struct Cli {
     )]
     set_language: Option<String>,
 
-    /// Set ONLY helper-agent mode, `on` or `off`, and nothing else. It is OFF in
-    /// a new memory. `on` stores the two notes that carry it (your assistant
-    /// then hands work to cheaper helper agents and keeps the chat free); `off`
-    /// retracts them again. Running it twice changes nothing the second time.
-    /// Needs --db.
+    /// Set ONLY helper-agent mode, `on` or `off`, and nothing else. It is ON in
+    /// a new memory. `off` retracts the five notes about helper agents (your
+    /// assistant then does the work itself in the chat); `on` stores them again
+    /// (your assistant hands work to cheaper helper agents and keeps the chat
+    /// free). Running it twice changes nothing the second time. Needs --db.
     #[arg(
         long = "set-helpers",
         value_name = "on|off",
@@ -404,8 +448,298 @@ fn copy_install(cli: &Cli, source: String) -> ExitCode {
     }
 }
 
-/// `install --set-helpers on|off`: store or retract the two helper-mode notes
-/// and nothing else.
+/// The git helpers: write them beside the memory and tell git to use them
+/// (step 3 of a plain install, and `install --set-git-hooks on`). Only when we
+/// know where the indexes live - without an index root there is nothing for a
+/// refresh to update, and wiring a machine-wide git setting for nothing is
+/// exactly the kind of surprise this installer must not spring. Someone who
+/// only keeps notes about a topic may never have installed git, and does not
+/// need it: say so, instead of reporting a failed git command.
+fn wire_git_hooks(db: &Path, serve_exe: &Path, code_index_root: Option<&Path>) {
+    if !githooks::git_available() {
+        println!("= git is not installed on this computer. That is fine: it is only needed to keep programming projects searchable, not for topic folders.");
+    } else if let Some(root) = code_index_root {
+        let hooks_dir = db.parent().map(|d| d.join("githooks"));
+        let codeindex_exe = serve_exe.with_file_name(if cfg!(windows) {
+            "codeindex.exe"
+        } else {
+            "codeindex"
+        });
+
+        match (hooks_dir, codeindex_exe.exists()) {
+            (Some(hooks_dir), true) => {
+                let exe = codeindex_exe.display().to_string().replace('\\', "/");
+                let index_root = root.display().to_string().replace('\\', "/");
+                match githooks::install_git_hooks(&hooks_dir, &exe, &index_root) {
+                    Ok(results) => {
+                        let added = results.iter().filter(|(_, o)| *o != HookOutcome::AlreadyPresent).count();
+                        // The media gate lives in the pre-commit helper: say so
+                        // whenever that one was written or changed.
+                        let gate_is_new = results
+                            .iter()
+                            .any(|(event, outcome)| event == "pre-commit" && *outcome != HookOutcome::AlreadyPresent);
+                        let say_gate = || {
+                            println!("+ git now also stops a commit that adds a video file or a file above 25 MB, in every repository");
+                            println!("  its message says what to do instead; the README section \"The media gate\" tells how to allow one file or change the limit");
+                        };
+                        if added == 0 {
+                            println!("= the helpers for programming projects were already in {}", hooks_dir.display());
+                        } else {
+                            println!("+ wrote {added} small helper(s) for programming projects (git) to {}", hooks_dir.display());
+                        }
+                        match githooks::wire_hooks_path(&hooks_dir) {
+                            Ok(githooks::HooksPathOutcome::Set) => {
+                                println!("+ told git to use them, so THOR can keep a programming project searchable after a commit, a merge or pull, a rebase and a branch switch");
+                                println!("  your own git hooks keep working: each helper hands control back to them");
+                                say_gate();
+                            }
+                            Ok(githooks::HooksPathOutcome::AlreadyOurs) => {
+                                println!("= git was already told to use them");
+                                if gate_is_new {
+                                    say_gate();
+                                }
+                            }
+                            Ok(githooks::HooksPathOutcome::Foreign(theirs)) => {
+                                println!("! git is already set up to use {theirs}, so that was left alone.");
+                                println!("  Searching the code of a programming project will not update by itself until that is sorted out. Topic folders are not affected.");
+                            }
+                            Err(e) => println!("! could not tell git about the helpers: {e}"),
+                        }
+                    }
+                    Err(e) => println!("! could not write the git helpers: {e}"),
+                }
+            }
+            (_, false) => println!(
+                "! the program that reads code (codeindex) is not next to {} - skipped the git helpers",
+                serve_exe.display()
+            ),
+            (None, _) => println!("! could not work out where to keep the git helpers - skipped"),
+        }
+    }
+}
+
+/// Read `on` or `off` for a switch, or say plainly what is allowed (exit 2).
+fn on_off(word: &str, what: &str, flag: &str) -> Result<bool, ExitCode> {
+    match word {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        other => {
+            eprintln!("{what} is 'on' or 'off', not '{other}'. Example: install {flag} off --db <your memory>. Nothing was changed.");
+            Err(ExitCode::from(2))
+        }
+    }
+}
+
+/// The memory a switch changes: named with --db and really there.
+fn switch_db(db: Option<PathBuf>, flag: &str, word: &str) -> Result<PathBuf, ExitCode> {
+    let Some(db) = db else {
+        eprintln!("name the memory to set this for: install {flag} {word} --db <your memory>");
+        return Err(ExitCode::from(2));
+    };
+    if !db.is_file() {
+        eprintln!(
+            "REFUSED: there is no memory at {} - check the path given with --db (the one your assistant's hooks name). Nothing was changed.",
+            db.display()
+        );
+        return Err(ExitCode::FAILURE);
+    }
+    Ok(db)
+}
+
+/// `install --set-connections on|off`: THOR's four entries in Claude Code's
+/// settings file, and the recorded choice, and nothing else.
+fn set_connections_only(db: Option<PathBuf>, settings: Option<PathBuf>, serve_exe: Option<PathBuf>, move_here: bool, word: &str) -> ExitCode {
+    use ops::choices::{set, Choice};
+    let on = match on_off(word, "the connection with Claude Code", "--set-connections") {
+        Ok(on) => on,
+        Err(code) => return code,
+    };
+    let db = match switch_db(db, "--set-connections", word) {
+        Ok(db) => db,
+        Err(code) => return code,
+    };
+    let Some(settings) = settings.or_else(default_settings_path) else {
+        eprintln!("could not find your home folder to place Claude Code's settings - name the file with --settings. Nothing was changed.");
+        return ExitCode::FAILURE;
+    };
+    if !on {
+        match ops::uninstall::remove_thor_hooks(&settings) {
+            Ok(n) => println!("+ removed {n} of THOR's connection(s) from Claude Code's settings (nothing else there was touched)"),
+            Err(e) => {
+                eprintln!("NOTHING WAS CHANGED: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+        if let Err(e) = set(&db, Choice::Connections, false) {
+            eprintln!("the connections were removed, but your no could not be recorded: {e}");
+            return ExitCode::FAILURE;
+        }
+        println!("+ recorded your no: a later install leaves the connections off. To switch them on again the assistant runs install --set-connections on");
+        println!("Close Claude Code completely and open it again for this to take effect.");
+        return ExitCode::SUCCESS;
+    }
+    let Some(serve_exe) = serve_exe.or_else(|| sibling("serve")).filter(|p| p.exists()) else {
+        eprintln!("NOTHING WAS CHANGED: the program `serve` is not next to the installer. Unpack the whole download into one folder and run install from there.");
+        return ExitCode::FAILURE;
+    };
+    if let Some(problem) = ops::install::launch_problem(&serve_exe) {
+        eprintln!("NOTHING WAS CHANGED: {problem}");
+        return ExitCode::FAILURE;
+    }
+    if let Some(refusal) = other_memory_refusal(&settings, &db, move_here) {
+        eprintln!("{refusal}");
+        return ExitCode::FAILURE;
+    }
+    if move_here {
+        if let Err(e) = ops::uninstall::remove_thor_hooks(&settings) {
+            eprintln!("NOTHING WAS CHANGED: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    let specs = standard_hooks(&serve_exe.display().to_string(), &db.display().to_string());
+    match install_hooks(&settings, &specs) {
+        Ok(report) => {
+            let changed = report.results.iter().filter(|(_, o)| *o != HookOutcome::AlreadyPresent).count();
+            if changed == 0 {
+                println!("= THOR was already connected to Claude Code");
+            } else {
+                println!("+ connected THOR to Claude Code ({changed} of {} connections)", report.results.len());
+            }
+        }
+        Err(e) => {
+            eprintln!("NOTHING WAS CONNECTED to Claude Code: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    if let Err(e) = set(&db, Choice::Connections, true) {
+        eprintln!("the connections are on, but the record of your earlier no could not be cleared: {e}");
+        return ExitCode::FAILURE;
+    }
+    println!("Close Claude Code completely and open it again for this to take effect.");
+    ExitCode::SUCCESS
+}
+
+/// One THOR per computer account: when Claude Code is already connected to
+/// ANOTHER memory that still exists, say so plainly (and the switch that moves
+/// the connection), unless the person asked to move. `None` when the way is free.
+fn other_memory_refusal(settings: &Path, db: &Path, move_here: bool) -> Option<String> {
+    if move_here {
+        return None;
+    }
+    let mine = db.display().to_string().replace('\\', "/").to_lowercase();
+    let other = ops::uninstall::connected_memories(settings)
+        .ok()?
+        .into_iter()
+        .find(|m| m.replace('\\', "/").to_lowercase() != mine && Path::new(m).exists())?;
+    Some(format!(
+        "REFUSED: Claude Code is already connected to another THOR memory ({other}), and one computer account has one. A second set of connections would make both speak at once. To use the memory {} instead, run this again with --move-to-this-store added: it moves the four connections here and the other memory is left as it is. Nothing was changed.",
+        db.display()
+    ))
+}
+
+/// `install --set-git-hooks on|off`.
+fn set_git_hooks_only(db: Option<PathBuf>, serve_exe: Option<PathBuf>, code_index_root: Option<PathBuf>, word: &str) -> ExitCode {
+    use ops::choices::{set, Choice};
+    let on = match on_off(word, "THOR's helpers in git", "--set-git-hooks") {
+        Ok(on) => on,
+        Err(code) => return code,
+    };
+    let db = match switch_db(db, "--set-git-hooks", word) {
+        Ok(db) => db,
+        Err(code) => return code,
+    };
+    if on {
+        let Some(serve_exe) = serve_exe.or_else(|| sibling("serve")).filter(|p| p.exists()) else {
+            eprintln!("NOTHING WAS CHANGED: the program `serve` is not next to the installer. Unpack the whole download into one folder and run install from there.");
+            return ExitCode::FAILURE;
+        };
+        let root = code_index_root.or_else(|| db.parent().map(|d| d.join("codeindex")));
+        if let Err(e) = set(&db, Choice::GitHooks, true) {
+            eprintln!("the record of your earlier no could not be cleared: {e}. Nothing was changed.");
+            return ExitCode::FAILURE;
+        }
+        wire_git_hooks(&db, &serve_exe, root.as_deref());
+        return ExitCode::SUCCESS;
+    }
+    let git = ops::uninstall::RealGit;
+    let current = <ops::uninstall::RealGit as ops::uninstall::GitHooksPath>::current(&git);
+    match current {
+        Some(path) if ops::uninstall::hooks_path_is_thors(Some(&path), &db) => {
+            if <ops::uninstall::RealGit as ops::uninstall::GitHooksPath>::unset(&git) {
+                println!("+ told git to stop using THOR's helper folder ({path}); git itself stays as it was");
+            } else {
+                eprintln!("NOTHING WAS CHANGED: git would not let go of THOR's helper folder ({path}).");
+                return ExitCode::FAILURE;
+            }
+        }
+        Some(path) => println!("= git's helper folder ({path}) is not THOR's, so it was left alone"),
+        None => println!("= git was not using THOR's helpers"),
+    }
+    if let Err(e) = set(&db, Choice::GitHooks, false) {
+        eprintln!("git was changed, but your no could not be recorded: {e}");
+        return ExitCode::FAILURE;
+    }
+    println!("+ recorded your no: a later install leaves them off. The code of a project is no longer refreshed after a commit, and git no longer stops video files or files above 25 MB. To switch them on again the assistant runs install --set-git-hooks on");
+    ExitCode::SUCCESS
+}
+
+/// `install --set-reply-rules on|off`: the reply rulebook as a whole.
+fn set_reply_rules_only(db: Option<PathBuf>, word: &str) -> ExitCode {
+    use ops::choices::{set, Choice};
+    let on = match on_off(word, "the reply rules", "--set-reply-rules") {
+        Ok(on) => on,
+        Err(code) => return code,
+    };
+    let db = match switch_db(db, "--set-reply-rules", word) {
+        Ok(db) => db,
+        Err(code) => return code,
+    };
+    let rulebook = serve::respond::default_rulebook_path(&db);
+    let aside = rulebook.with_file_name("guard-response-rulebook.json.off");
+    if on {
+        if let Err(e) = set(&db, Choice::ReplyRules, true) {
+            eprintln!("the record of your earlier no could not be cleared: {e}. Nothing was changed.");
+            return ExitCode::FAILURE;
+        }
+        if !rulebook.exists() && aside.exists() {
+            if let Err(e) = std::fs::rename(&aside, &rulebook) {
+                eprintln!("could not put the reply rules back: {e}");
+                return ExitCode::FAILURE;
+            }
+            println!("+ put your reply rules back as you had them");
+        } else {
+            match seed_response_rulebook(&db) {
+                Ok(report) if report.outcome == RulebookOutcome::Written => println!("+ added the reply rules: {}", report.path.display()),
+                Ok(_) => println!("= the reply rules were already there"),
+                Err(e) => {
+                    eprintln!("could not add the reply rules: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
+    if rulebook.exists() {
+        let _ = std::fs::remove_file(&aside);
+        if let Err(e) = std::fs::rename(&rulebook, &aside) {
+            eprintln!("NOTHING WAS CHANGED: could not set the reply rules aside: {e}");
+            return ExitCode::FAILURE;
+        }
+        println!("+ set the reply rules aside (your changes in them are kept in {})", aside.display());
+    } else {
+        println!("= there was no reply rules file");
+    }
+    if let Err(e) = set(&db, Choice::ReplyRules, false) {
+        eprintln!("the rules were set aside, but your no could not be recorded: {e}");
+        return ExitCode::FAILURE;
+    }
+    println!("+ recorded your no: a later install leaves the reply rules off. To switch them on again the assistant runs install --set-reply-rules on");
+    ExitCode::SUCCESS
+}
+
+/// `install --set-helpers on|off`: store or retract the five notes about helper
+/// assistants (the two of helper-agent mode and the three of the starting set
+/// that are about helpers) and nothing else.
 fn set_helpers_only(db: Option<PathBuf>, word: &str) -> ExitCode {
     use ops::install::{set_helpers, HelperChange};
     let on = match word {
@@ -464,6 +798,16 @@ fn set_helpers_only(db: Option<PathBuf>, word: &str) -> ExitCode {
 /// answer on record. Never at a folder that is not a code project.
 fn print_changelog_question(db: &Path, key: &str, here: &Path) {
     if serve::project::git_root(here).is_none() || serve::changelog_flow::answer(db, key).is_some() {
+        return;
+    }
+    // During the FIRST install the welcome carries the question (proposal 4),
+    // so the assistant is not told to ask it now: the question stays pending
+    // (no answer on record), and the safety net at the first commit stays.
+    let first_session_pending = thor_core::event_store::EventStore::open_existing(db)
+        .ok()
+        .is_some_and(|store| model::store::show(&store, model::store::SETUP_NOTE_ID).is_ok());
+    if first_session_pending {
+        println!("+ the question about a changelog and version numbers for '{key}' is part of the welcome in the first session (proposal 4); nothing to ask now");
         return;
     }
     let intro = format!("+ ONE QUESTION FOR THE PERSON about '{key}' (asked once for this project):");
@@ -798,7 +1142,7 @@ fn set_backup_only(db: Option<PathBuf>, settings: Option<PathBuf>, word: &str) -
     }
     match prove(&backup_exe, &db, &repo) {
         Ok(line) => {
-            println!("+ first copy made now, to prove it works: {line}");
+            println!("+ first copy made now, to prove it works: {}", ops::backup_setup::plain_proof(&line, &repo));
             ExitCode::SUCCESS
         }
         Err(reason) => {
@@ -998,7 +1342,8 @@ fn register_only(db: Option<PathBuf>, per_machine: bool, ask_main: bool) -> Exit
     let here = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     serve::project::load_known_scopes(&db);
     let existing = serve::project::git_root(&here)
-        .or_else(|| serve::project::plain_root(&here))
+        // A broad folder an earlier install marked is not adopted: topic_of reports it.
+        .or_else(|| serve::project::plain_root(&here).filter(|top| !model::checkout::is_too_broad_folder(top)))
         .and_then(|top| serve::project::resolve_project(&top));
     let key = match existing {
         Some(key) => key,
@@ -1242,6 +1587,15 @@ fn main() -> ExitCode {
     if let Some(word) = cli.set_changelog_flow.as_deref() {
         return set_changelog_flow_only(cli.db, word);
     }
+    if let Some(word) = cli.set_connections.as_deref() {
+        return set_connections_only(cli.db.clone(), cli.settings.clone(), cli.serve_exe.clone(), cli.move_to_this_store, word);
+    }
+    if let Some(word) = cli.set_git_hooks.as_deref() {
+        return set_git_hooks_only(cli.db.clone(), cli.serve_exe.clone(), cli.code_index_root.clone(), word);
+    }
+    if let Some(word) = cli.set_reply_rules.as_deref() {
+        return set_reply_rules_only(cli.db.clone(), word);
+    }
     if cli.set_temp_folder.is_some() || cli.set_tools_folder.is_some() {
         return set_work_folders_only(cli.db, cli.set_temp_folder.as_deref(), cli.set_tools_folder.as_deref());
     }
@@ -1385,6 +1739,15 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // One THOR per computer account, refused BEFORE anything is written, so
+    // "Nothing was changed" is literally true.
+    if !ops::choices::is_off(&db, ops::choices::Choice::Connections) {
+        if let Some(refusal) = other_memory_refusal(&settings, &db, cli.move_to_this_store) {
+            eprintln!("{refusal}");
+            return ExitCode::FAILURE;
+        }
+    }
+
     println!("Setting THOR up. It only changes the places listed here.");
     println!();
     println!("memory:       {}  (everything THOR remembers is kept in this one file)", db.display());
@@ -1504,16 +1867,20 @@ fn main() -> ExitCode {
     // whether the store above was just created or was already there - a
     // store from before this rulebook existed has exactly the same missing
     // file, and deserves the same fix. Never overwrites one already there.
-    match seed_response_rulebook(&db) {
-        Ok(report) => match report.outcome {
-            RulebookOutcome::Written => {
-                println!("+ added a small file that keeps your assistant's replies tidy: {}", report.path.display())
-            }
-            RulebookOutcome::AlreadyThere => {
-                println!("= the reply-tidying file was already there ({}); left alone", report.path.display())
-            }
-        },
-        Err(e) => println!("  ! could not write the reply-tidying file: {e}"),
+    if ops::choices::is_off(&db, ops::choices::Choice::ReplyRules) {
+        println!("{}", ops::choices::respected_line(ops::choices::Choice::ReplyRules));
+    } else {
+        match seed_response_rulebook(&db) {
+            Ok(report) => match report.outcome {
+                RulebookOutcome::Written => {
+                    println!("+ added a small file that keeps your assistant's replies tidy: {}", report.path.display())
+                }
+                RulebookOutcome::AlreadyThere => {
+                    println!("= the reply-tidying file was already there ({}); left alone", report.path.display())
+                }
+            },
+            Err(e) => println!("  ! could not write the reply-tidying file: {e}"),
+        }
     }
 
     // 1c. The end-of-session evaluation command. THOR holds a turn open for a
@@ -1551,10 +1918,26 @@ fn main() -> ExitCode {
         None => println!("  ! could not find your home folder to place the /thor-eval command"),
     }
 
-    // 2. The hooks: what lets the memory speak at all.
+    // 2. The hooks: what lets the memory speak at all. Not when the person
+    // said no to them (`install --set-connections off`), and not beside the
+    // hooks of ANOTHER memory (one THOR per computer account).
+    let connections_off = ops::choices::is_off(&db, ops::choices::Choice::Connections);
+    if connections_off {
+        println!("{}", ops::choices::respected_line(ops::choices::Choice::Connections));
+    } else if cli.move_to_this_store {
+        match ops::uninstall::remove_thor_hooks(&settings) {
+            Ok(n) if n > 0 => println!("+ took THOR's {n} old connection(s) out of Claude Code's settings, so they can point at this memory"),
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("NOTHING WAS CHANGED: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
     let specs = standard_hooks(&serve_exe.display().to_string(), &db.display().to_string());
-    match install_hooks(&settings, &specs) {
-        Ok(report) => {
+    match if connections_off { None } else { Some(install_hooks(&settings, &specs)) } {
+        None => {}
+        Some(Ok(report)) => {
             let changed = report.results.iter().filter(|(_, o)| *o != HookOutcome::AlreadyPresent).count();
             if changed > 0 {
                 restart_because.push("THOR's connections in Claude Code's settings changed");
@@ -1575,7 +1958,7 @@ fn main() -> ExitCode {
                 println!("  your previous Claude Code settings were saved as {}", p.display());
             }
         }
-        Err(e) => {
+        Some(Err(e)) => {
             eprintln!("NOTHING WAS CONNECTED to Claude Code: {e}");
             eprintln!("Your memory file was created. Fix the problem named above, then run install again.");
             return ExitCode::FAILURE;
@@ -1607,65 +1990,10 @@ fn main() -> ExitCode {
     // exactly the kind of surprise this installer must not spring.
     // Someone who only keeps notes about a topic may never have installed git,
     // and does not need it: say so, instead of reporting a failed git command.
-    if !githooks::git_available() {
-        println!("= git is not installed on this computer. That is fine: it is only needed to keep programming projects searchable, not for topic folders.");
-    } else if let Some(root) = &code_index_root {
-        let hooks_dir = db.parent().map(|d| d.join("githooks"));
-        let codeindex_exe = serve_exe.with_file_name(if cfg!(windows) {
-            "codeindex.exe"
-        } else {
-            "codeindex"
-        });
-
-        match (hooks_dir, codeindex_exe.exists()) {
-            (Some(hooks_dir), true) => {
-                let exe = codeindex_exe.display().to_string().replace('\\', "/");
-                let index_root = root.display().to_string().replace('\\', "/");
-                match githooks::install_git_hooks(&hooks_dir, &exe, &index_root) {
-                    Ok(results) => {
-                        let added = results.iter().filter(|(_, o)| *o != HookOutcome::AlreadyPresent).count();
-                        // The media gate lives in the pre-commit helper: say so
-                        // whenever that one was written or changed.
-                        let gate_is_new = results
-                            .iter()
-                            .any(|(event, outcome)| event == "pre-commit" && *outcome != HookOutcome::AlreadyPresent);
-                        let say_gate = || {
-                            println!("+ git now also stops a commit that adds a video file or a file above 25 MB, in every repository");
-                            println!("  its message says what to do instead; the README section \"The media gate\" tells how to allow one file or change the limit");
-                        };
-                        if added == 0 {
-                            println!("= the helpers for programming projects were already in {}", hooks_dir.display());
-                        } else {
-                            println!("+ wrote {added} small helper(s) for programming projects (git) to {}", hooks_dir.display());
-                        }
-                        match githooks::wire_hooks_path(&hooks_dir) {
-                            Ok(githooks::HooksPathOutcome::Set) => {
-                                println!("+ told git to use them, so THOR can keep a programming project searchable after a commit, a merge or pull, a rebase and a branch switch");
-                                println!("  your own git hooks keep working: each helper hands control back to them");
-                                say_gate();
-                            }
-                            Ok(githooks::HooksPathOutcome::AlreadyOurs) => {
-                                println!("= git was already told to use them");
-                                if gate_is_new {
-                                    say_gate();
-                                }
-                            }
-                            Ok(githooks::HooksPathOutcome::Foreign(theirs)) => {
-                                println!("! git is already set up to use {theirs}, so that was left alone.");
-                                println!("  Searching the code of a programming project will not update by itself until that is sorted out. Topic folders are not affected.");
-                            }
-                            Err(e) => println!("! could not tell git about the helpers: {e}"),
-                        }
-                    }
-                    Err(e) => println!("! could not write the git helpers: {e}"),
-                }
-            }
-            (_, false) => println!(
-                "! the program that reads code (codeindex) is not next to {} - skipped the git helpers",
-                serve_exe.display()
-            ),
-            (None, _) => println!("! could not work out where to keep the git helpers - skipped"),
-        }
+    if ops::choices::is_off(&db, ops::choices::Choice::GitHooks) {
+        println!("{}", ops::choices::respected_line(ops::choices::Choice::GitHooks));
+    } else {
+        wire_git_hooks(&db, &serve_exe, code_index_root.as_deref());
     }
 
     // 4. The tool server: what lets the agent write back.
@@ -1768,8 +2096,12 @@ fn main() -> ExitCode {
         },
         Some(key) => match code_index_root.as_deref().map(|r| build_project_index(r, &index_key, &here)).transpose() {
             Ok(Some(Some(files))) => {
-                restart_because.push("this project's code was read for the first time");
+                // Not a reason to restart Claude Code: only its connections, the
+                // note-saving program and the programs themselves are loaded at
+                // its start. Searching the code of THIS folder starts answering
+                // the next time Claude Code is opened in it.
                 println!("+ read this project's code, {files} file(s), so it can be searched and kept fresh after a commit, a merge or pull, a rebase and a branch switch");
+                println!("  searching this project's code starts working the next time Claude Code is opened in this folder");
                 // Immediately after the read succeeds: opens the project in
                 // the memory itself, so the very first `remember` filed under
                 // it is never refused as an unknown collection (see
@@ -1813,9 +2145,9 @@ fn main() -> ExitCode {
     for line in restart_lines(&restart_because) {
         println!("{line}");
     }
-    println!("To check that THOR is healthy afterwards, ask your assistant to run THOR's doctor:");
+    // For the assistant, not for the person: they never run anything themselves.
     let bin_dir = serve_exe.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
-    println!("  {}", ops::install::doctor_invocation(&bin_dir, &db, cfg!(windows)));
+    println!("FOR THE ASSISTANT (not for the person to read out or run): afterwards, check the setup yourself with THOR's health check, the program doctor in {} with --db {} added. Read its first lines to the person in your own words.", bin_dir.display(), db.display());
     ExitCode::SUCCESS
 }
 

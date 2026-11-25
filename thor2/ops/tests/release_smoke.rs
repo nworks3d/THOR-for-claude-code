@@ -63,6 +63,10 @@ const SETUP_TOOLS: &[&str] = &[
     "outline",
 ];
 
+/// The command the smoke note is bound to: the note comes back right before a
+/// call that runs it.
+const SMOKE_COMMAND: &str = "marmalade-tool";
+
 /// A semantic `serve` or `mcp` is over 20 MB (README: "Build it").
 const SEMANTIC_SIZE_FLOOR: u64 = 20 * 1024 * 1024;
 
@@ -593,12 +597,17 @@ impl Smoke {
             return Err(format!("mcp does not offer {missing:?}; it offers {names:?}"));
         }
 
+        // The way a new user's assistant is told to store a note: bound to a
+        // real target (or to the project's own name), never pinned.
         let mut arguments = json!({
             "id": id,
-            "kind": "rule",
+            "kind": "orientation",
             "text": format!("The release smoke test stored this note: {token}."),
             "falsifier": "The smoke test finds this note gone from a fresh store.",
-            "always": true
+            "targets": [match project {
+                Some(project) => json!({"kind": "project", "value": project}),
+                None => json!({"kind": "command", "value": SMOKE_COMMAND}),
+            }]
         });
         if let Some(project) = project {
             arguments["project"] = json!(project);
@@ -610,6 +619,19 @@ impl Smoke {
         let text = stored["result"]["content"][0]["text"].as_str().unwrap_or("").to_string();
         if stored["error"].is_object() || stored["result"]["isError"] == json!(true) {
             return Err(format!("remember was refused: {stored}"));
+        }
+        // A refusal does not set isError: read the words.
+        if !text.starts_with("stored") {
+            return Err(format!("remember did not answer 'stored': {text}"));
+        }
+        // Read it back through the same tool server.
+        send(json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {
+            "name": "lookup",
+            "arguments": {"query": token}}}))?;
+        let found = reply(4)?;
+        let found_text = found["result"]["content"][0]["text"].as_str().unwrap_or("");
+        if !found_text.contains(id) {
+            return Err(format!("lookup never found the stored note {id}: {found_text}"));
         }
         Ok(format!("{} tools offered, remember answered: {}", names.len(), text.lines().next().unwrap_or("")))
     }
@@ -659,7 +681,7 @@ impl Smoke {
         let parsed: Value =
             serde_json::from_str(out.stdout.trim()).map_err(|e| format!("hook output is not JSON ({e}): {}", out.stdout))?;
         let context = parsed["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or("");
-        for needed in ["never-commit-a-secret", "run-the-tests-before-saying-done"] {
+        for needed in ["never-commit-a-secret", "commit-hygiene"] {
             if !context.contains(needed) {
                 return Err(format!("a git commit was not answered with {needed}. It was answered with:\n{context}"));
             }
@@ -673,7 +695,24 @@ impl Smoke {
     /// Run the SessionStart hook exactly as the settings.json line names it,
     /// against the new store, and expect the stored note back.
     fn step_session_start_serves_it(&self, token: &str) -> StepResult {
-        self.session_start_in(&self.elsewhere(), token)
+        let stdout = self.run_hook(
+            "PreToolUse",
+            &self.elsewhere(),
+            json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "release-smoke-note",
+                "cwd": self.elsewhere().display().to_string().replace('\\', "/"),
+                "tool_name": "Bash",
+                "tool_input": {"command": format!("{SMOKE_COMMAND} --run")}
+            }),
+        )?;
+        let parsed: Value =
+            serde_json::from_str(stdout.trim()).map_err(|e| format!("hook output is not JSON ({e}): {stdout}"))?;
+        let context = parsed["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or("");
+        if !context.contains(token) {
+            return Err(format!("the PreToolUse hook did not bring the stored note back. It answered:\n{context}"));
+        }
+        Ok(format!("brought back {} characters, including the stored note", context.len()))
     }
 
     /// Run a hook event exactly as the settings.json line names it, from
@@ -796,11 +835,10 @@ impl Smoke {
     /// another one.
     fn step_topic_memory_is_its_own(&self, token: &str) -> StepResult {
         self.remember_in(&self.topic(), "smoke-topic-note", token, Some("Kitchen renovation"))?;
-        let served = self.session_start_in(&self.topic(), token)?;
         // Another folder must not be shown the topic's note.
         match self.session_start_in(&self.elsewhere(), token) {
             Ok(_) => Err("the topic's note was served in an unrelated folder".to_string()),
-            Err(_) => Ok(format!("{served}; not served elsewhere")),
+            Err(_) => Ok("filed under the topic's own name (project binding), read back through lookup, not served elsewhere".to_string()),
         }
     }
 
@@ -867,7 +905,7 @@ fn a_new_user_can_install_and_use_the_shipped_programs() {
     step("second install changes nothing", smoke.step_install_is_idempotent());
     step("install inside a project (step 5)", smoke.step_project_install());
     step("remember through mcp over stdio (step 6)", smoke.step_remember_through_mcp(token));
-    step("SessionStart hook serves the note back", smoke.step_session_start_serves_it(token));
+    step("PreToolUse hook brings the note back", smoke.step_session_start_serves_it(token));
     // A person who wants THOR for a subject, not for code (AGENTS.md 5b).
     step("topic folder: install --topic, no git (5b)", smoke.step_topic_install());
     step("topic folder: doctor opens with a plain summary", smoke.step_topic_doctor());

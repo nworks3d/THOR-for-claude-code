@@ -1039,7 +1039,7 @@ pub fn working_contract() -> Vec<model::item::Item> {
             "a-new-project-is-one-command",
             "Giving a folder its own memory is ONE command: run the install program from inside it, \
              naming the store and, for code, the project, or, for a plain folder, the topic \
-             option. It marks and registers the folder. Options: lookup first-session-questions. \
+             option. It marks and registers the folder. Options: lookup with key first-session-questions. \
              The owner names a project, never you.",
             "A folder set up with that one command turns out to be missing its marker, its \
              registration, its code reading or its refresh on commit.",
@@ -1220,7 +1220,7 @@ pub fn working_contract() -> Vec<model::item::Item> {
         // way for good.
         rule(
             model::store::SETUP_NOTE_ID,
-            "Setup is not finished. In your first reply, `lookup first-session-questions` is the \
+            "Setup is not finished. In your first reply, `lookup with key first-session-questions` is the \
              one place to read: the exact calls, paths and what to say. Apply the defaults at once \
              (store 'owner-setup-answers', retract this note, say the welcome). Nothing waits.",
             "This note is still being served at session start after the owner has already \
@@ -1239,7 +1239,7 @@ pub fn order_earlier_note() -> model::item::Item {
     model::item::Item {
         id: model::store::ORDER_NOTE_ID.to_string(),
         kind: model::item::Kind::Orientation,
-        text: "Last setup step: once the welcome is answered, run THE TIDY STEP of `lookup first-session-questions` (serve \
+        text: "Last setup step: once the welcome is answered, run THE TIDY STEP of `lookup with key first-session-questions` (serve \
                inventory, then a numbered proposal to order earlier work). The session is held until THOR itself finds it settled. \
                Never retract this note yourself."
             .to_string(),
@@ -1278,9 +1278,10 @@ pub fn order_earlier_note() -> model::item::Item {
 /// is about, once per context.
 ///
 /// HELPER-AGENT MODE IS NOT IN THE PACK. Its two notes (`helper_mode_notes`)
-/// are off in a new memory (the owner's decision, 2026-10-09: a helper costs a
-/// fixed start-up context and the user cannot steer it halfway, so it is not
-/// for everyone) and `install --set-helpers on` stores them.
+/// are seeded into a new memory beside the pack (it is ON since 2026-11-18;
+/// a helper costs a fixed start-up context and the user cannot steer it
+/// halfway, so `install --set-helpers off` retracts them, with the three
+/// helper notes of the starting set).
 ///
 /// SEVERITY. None carries one, like the notes in `working_contract`. A note
 /// called costly or irreversible with no check is listed by doctor as
@@ -1351,7 +1352,10 @@ pub fn workflow_starter_pack_for(windows: bool) -> Vec<model::item::Item> {
              hooks with --no-verify: fix what the hook found. No red tests or stray TODO left at a push.",
             "A change pushed without a test or build run turns out to be as safe as one pushed after \
              a run.",
-            vec![moment(Action::Commit), moment(Action::Push)],
+            // The commit-time half of this note (run the tests or build first)
+            // lives in `commit-hygiene`, so a commit holds three starter notes
+            // with the changelog flow on, and a beginner's own rule still fits.
+            vec![moment(Action::Push)],
         ),
         note(
             "never-commit-a-secret",
@@ -1373,18 +1377,20 @@ pub fn workflow_starter_pack_for(windows: bool) -> Vec<model::item::Item> {
         ),
         note(
             "commit-hygiene",
-            "Commit message: one short plain line saying what changed and why, no marketing tone. \
-             Several lines: write the message to a file and use git commit -F. Stage only the files \
-             you mean. Keep each file's line endings: no CRLF flips, new files LF, a small diff.",
+            "Before a commit run the project's own tests or build and quote the real result; never skip \
+             hooks with --no-verify. Message: one short plain line, what and why, no marketing tone; \
+             several lines via git commit -F. Stage only what you mean. Keep each file's line \
+             endings: no CRLF flips, a small diff.",
             "A long marketing-style message, or a commit that flips a file's line endings, is found \
              as easy to read and review as a short plain one.",
             vec![moment(Action::Commit)],
         ),
         note(
             "check-where-you-push-and-what-is-on-main",
-            "Before a push, or a claim about what is on main or released, confirm folder, branch and \
-             remote (pwd, git status, git remote -v) and git fetch. A local origin/main can be stale: \
-             a version or release state comes from git, never from memory.",
+            "Before a push, or a claim about what is on main, confirm folder, branch, remote (pwd, git \
+             status, git remote -v) and git fetch; release state comes from git, never memory. To a \
+             public repository: scan for secrets, usernames, local paths, private hostnames, customer \
+             data; zero hits on every push.",
             "A claim about the remote's state made from a local ref or from memory turns out right as \
              often as one made after a fetch.",
             vec![moment(Action::Push)],
@@ -1396,7 +1402,9 @@ pub fn workflow_starter_pack_for(windows: bool) -> Vec<model::item::Item> {
              require zero hits on every push, not once. Public is irreversible: caches copy it in \
              minutes.",
             "A push to a public repository without a fresh scan turns out never to leak anything.",
-            vec![moment(Action::Publish), moment(Action::Push)],
+            // The push half is carried by `check-where-you-push-and-what-is-on-main`,
+            // so a push holds three starter notes and a publish holds this one.
+            vec![moment(Action::Publish)],
         ),
         note(
             "rehearse-destructive-steps-on-a-copy",
@@ -1576,7 +1584,15 @@ pub fn changelog_commit_note() -> model::item::Item {
 /// `install --set-changelog-flow on` stores them in an older one.
 pub fn changelog_flow_notes() -> Vec<model::item::Item> {
     use model::item::{Binding, TargetKind};
-    let release = || vec![Binding::Moment(intent::Action::Publish), Binding::Target { kind: TargetKind::Command, value: "git tag".to_string() }];
+    // The commands a release is made with, not the Publish moment: the
+    // scan-before-public note holds that place, so a publish never carries more
+    // than three starter notes with the flow on.
+    let release = || {
+        vec![
+            Binding::Target { kind: TargetKind::Command, value: "gh release create".to_string() },
+            Binding::Target { kind: TargetKind::Command, value: "git tag".to_string() },
+        ]
+    };
     vec![
         flow_note(
             "changelog-flow-release-opens-with-what-changed",
@@ -1661,8 +1677,8 @@ pub fn set_changelog_flow(db: &Path, project: &str, on: bool) -> anyhow::Result<
 }
 
 /// The two notes that make up helper-agent mode (first-session item 6). They
-/// are NOT in `workflow_starter_pack`: the mode is off in a new memory and the
-/// user switches it on with `install --set-helpers on`, which stores exactly
+/// are NOT in `workflow_starter_pack`: the mode is on in a new memory and the
+/// user switches it off with `install --set-helpers off`; `on` stores exactly
 /// these (`set_helpers`). Bound to the Agent tool, so they arrive right before
 /// a helper is spawned. A command place holds four notes at most, so these stay
 /// two and leave room for the owner's own. The ids are listed in
@@ -1688,7 +1704,14 @@ pub fn helper_mode_notes() -> Vec<model::item::Item> {
     ]
 }
 
-/// What `set_helpers` did to one of the two helper-mode notes.
+/// The three notes of the starting set that are also about helper assistants
+/// (`questionnaire::HELPER_CONTRACT_NOTES`). They are seeded with the rest of
+/// the set; `set_helpers` switches them together with the two above.
+pub fn helper_contract_notes() -> Vec<model::item::Item> {
+    working_contract().into_iter().filter(|n| crate::questionnaire::HELPER_CONTRACT_NOTES.contains(&n.id.as_str())).collect()
+}
+
+/// What `set_helpers` did to one of the five helper notes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HelperChange {
     /// Stored for the first time.
@@ -1729,7 +1752,7 @@ pub fn set_helpers(db: &Path, on: bool) -> anyhow::Result<Vec<(String, HelperCha
     use model::store::{declare, resolve, retract, show, ReadError};
     let mut store = EventStore::open_existing(db)?;
     let mut out = Vec::new();
-    for item in helper_mode_notes() {
+    for item in helper_mode_notes().into_iter().chain(helper_contract_notes()) {
         let id = item.id.clone();
         let state = show(&store, &id);
         let change = match (on, state) {
@@ -2111,10 +2134,11 @@ pub enum RegisterOutcome {
 pub enum RegisterRefusal {
     /// The folder is neither inside a git checkout nor a marked topic folder.
     NotACheckout { cwd: String },
-    /// The folder is far too broad to be one topic: the home folder or a
-    /// whole drive. Everything a person ever does there would land in one
-    /// memory.
-    TooBroad { cwd: String },
+    /// The folder is far too broad to be one topic: the home folder, Desktop,
+    /// Documents, Downloads or a whole drive (`what` names which, for the
+    /// person). Everything a person ever does there would land in one memory.
+    /// `has_memory` is true when an earlier install already put a memory there.
+    TooBroad { cwd: String, what: String, has_memory: bool },
     /// The registered folder still exists and is still a checkout of this
     /// project: a second copy.
     StillACheckout { key: String, old: String },
@@ -2135,11 +2159,19 @@ impl std::fmt::Display for RegisterRefusal {
                 "REFUSED: {cwd} is not set up as a topic folder yet. The assistant runs the installer from INSIDE the folder for the topic \
                  with --topic added (no git or code needed). Nothing was changed."
             ),
-            RegisterRefusal::TooBroad { cwd } => write!(
+            RegisterRefusal::TooBroad { cwd, what, has_memory: false } => write!(
                 f,
-                "REFUSED: {cwd} is your whole home folder or a whole drive, which is too broad to be one topic. Make a \
+                "REFUSED: {cwd} is your {what}, which is too broad to be one topic. Make a \
                  folder for just one subject (for example 'Kitchen renovation') and the assistant runs this again \
                  from inside it. Nothing was changed."
+            ),
+            RegisterRefusal::TooBroad { cwd, what, has_memory: true } => write!(
+                f,
+                "REFUSED: {cwd} is your {what}, which is too broad to be one topic, yet an earlier install gave it a \
+                 memory of its own (the hidden file .thor-project in it). It was not taken over. Folders inside it \
+                 can have their own memory: make a folder for just one subject (for example 'Kitchen renovation') \
+                 and the assistant runs this again from inside it. To end the broad memory, remove that hidden file; \
+                 the notes already filed under it stay. Nothing was changed."
             ),
             RegisterRefusal::StillACheckout { key, old } => write!(
                 f,
@@ -2205,11 +2237,19 @@ fn registration_top(cwd: &Path) -> Option<PathBuf> {
 /// the home folder and for a drive root, which are far too broad to be one
 /// topic (everything a person ever does there would share one memory).
 pub fn topic_folder_name(dir: &Path) -> Result<String, RegisterRefusal> {
-    let too_broad = || RegisterRefusal::TooBroad { cwd: root_string(dir) };
-    if home_dir().is_some_and(|home| same_root(&root_string(&home), &root_string(dir))) {
-        return Err(too_broad());
+    let too_broad = |has_memory: bool| {
+        let what = match home_dir().and_then(|home| serve::inventory::broad_place(&home, dir)) {
+            Some(what) if what == "drive root" => "whole drive".to_string(),
+            Some(what) if what == "home folder" => "whole home folder".to_string(),
+            Some(what) => format!("{what} folder"),
+            None => "whole home folder or a whole drive".to_string(),
+        };
+        RegisterRefusal::TooBroad { cwd: root_string(dir), what, has_memory }
+    };
+    if home_dir().is_some_and(|home| serve::inventory::broad_place(&home, dir).is_some()) {
+        return Err(too_broad(dir.join(".thor-project").is_file()));
     }
-    dir.file_name().and_then(|n| n.to_str()).map(str::trim).filter(|n| !n.is_empty()).map(str::to_string).ok_or_else(too_broad)
+    dir.file_name().and_then(|n| n.to_str()).map(str::trim).filter(|n| !n.is_empty()).map(str::to_string).ok_or_else(|| too_broad(false))
 }
 
 /// The topic a plain folder is, or would become: the folder that carries (or
@@ -2219,6 +2259,10 @@ pub fn topic_folder_name(dir: &Path) -> Result<String, RegisterRefusal> {
 /// which are far too broad (`ops::install::topic_folder_name`).
 pub fn topic_of(here: &Path) -> Result<(PathBuf, String), RegisterRefusal> {
     let dir = serve::project::plain_root(here).unwrap_or_else(|| here.to_path_buf());
+    // A broad folder that an earlier install marked is reported, never adopted.
+    if model::checkout::is_too_broad_folder(&dir) {
+        topic_folder_name(&dir)?;
+    }
     let key = match serve::project::resolve_project(&dir) {
         Some(key) => key,
         None => topic_folder_name(&dir)?,
@@ -3529,7 +3573,8 @@ mod tests {
         let on = set_helpers(&db, true).unwrap();
         assert!(on.iter().all(|(_, change)| matches!(change, HelperChange::Stored)), "{on:?}");
         let off = set_helpers(&db, false).unwrap();
-        assert_eq!(off.len(), 2);
+        // Every note about helper assistants: the two of helper-agent mode and three of the starting set.
+        assert_eq!(off.len(), 5);
         assert!(off.iter().all(|(_, change)| matches!(change, HelperChange::Retracted)), "{off:?}");
     }
 
@@ -3567,13 +3612,17 @@ mod tests {
     fn the_starter_pack_does_not_crowd_a_place() {
         use std::collections::HashMap;
         let mut per_place: HashMap<String, usize> = HashMap::new();
-        for item in workflow_starter_pack() {
+        // The pack and the changelog flow together (a project that said yes):
+        // no place holds more than three starter notes, so the owner's own
+        // first rule on a commit, a push or a publish always fits in the block.
+        let flow: Vec<_> = changelog_flow_notes().into_iter().filter(|n| n.id != changelog_commit_note().id).collect();
+        for item in workflow_starter_pack().into_iter().chain(flow) {
             for b in &item.bindings {
                 *per_place.entry(format!("{b:?}")).or_default() += 1;
             }
         }
         for (place, n) in &per_place {
-            let cap = if place.starts_with("Target") { 2 } else { model::item::MAX_ITEMS };
+            let cap = if place.starts_with("Target") && !place.contains("git tag") && !place.contains("gh release create") { 2 } else { 3 };
             assert!(*n <= cap, "{place} holds {n} starter notes, over {cap}");
         }
     }

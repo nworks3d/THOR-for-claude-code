@@ -106,7 +106,7 @@ fn local_makes_a_git_folder_wires_one_session_start_hook_and_proves_it_with_a_fi
     let out = fx.install(&["--set-backup", "local"]);
     assert!(out.status.success(), "{}", said(&out));
     let text = said(&out);
-    assert!(text.contains("first copy") && text.contains("committed"), "a plain proof result is printed: {text}");
+    assert!(text.contains("first copy") && text.contains("stays on this computer") && !text.contains("committed thor2"), "a plain proof result is printed: {text}");
 
     let repo = fx.local_repo();
     assert!(repo.join(".git").exists(), "the local default is a git folder beside the memory");

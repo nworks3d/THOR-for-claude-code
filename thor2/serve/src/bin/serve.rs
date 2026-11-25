@@ -3275,7 +3275,7 @@ fn setup_debt(store: &EventStore) -> Option<String> {
          name a collection for it); (3) retract '{note}'; (4) say the short welcome from that item \
          in his own language (never the numbered list, and never mention the plan, git, hooks, \
          helper agents or the weekly check), speak the language he writes \
-         in, and ask only the one question in it (a plain yes accepts its three proposals: safety copy, language, folder). If he asks what is switched on, show the \
+         in, and ask only the one question in it (a plain yes accepts its proposals: safety copy, language, folder, and in a git project a changelog). If he asks what is switched on, show the \
          list and say that every default on it is already on, except backup, which stays \
          off until he chooses, and that he can answer by number (for \
          example \"1 yes, 3 no, the rest as you like\"). Whatever he does not mention keeps its \

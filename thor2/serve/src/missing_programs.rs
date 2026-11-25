@@ -318,7 +318,7 @@ pub fn words_for(missing: &[PathBuf], detected: &[String], windows: bool) -> Opt
     );
     if windows {
         out.push_str(
-            " Most likely cause: an antivirus (usually Windows Defender) quarantined it as a false positive. To check and get it back: open Windows Security > Virus & threat protection > Protection history, look for an entry naming the file, open it and choose Actions > Restore. If there is no such entry, run THOR's install again (the same command that installed it) and it puts the program back.",
+            " Most likely cause: an antivirus (usually Windows Defender) quarantined it as a false positive. To check and get it back: open Windows Security > Virus & threat protection > Protection history, look for an entry naming the file, open it and choose Actions > Restore. If there is no such entry, ask the assistant to run THOR's one-line download command from the install page again (the install program on its own cannot, it refuses while a program is missing): it unpacks all the programs again and so puts this one back.",
         );
         if !detected.is_empty() {
             out.push_str(&format!(" Windows Defender's own history names: {}.", detected.join(", ")));
@@ -328,7 +328,7 @@ pub fn words_for(missing: &[PathBuf], detected: &[String], windows: bool) -> Opt
         ));
     } else {
         out.push_str(
-            " Most likely cause: an antivirus or a cleanup removed it. Run THOR's install again (the same command that installed it) and it puts the program back.",
+            " Most likely cause: an antivirus or a cleanup removed it. Ask the assistant to run THOR's one-line download command from the install page again (the install program on its own cannot, it refuses while a program is missing): it unpacks all the programs again and so puts this one back.",
         );
     }
     Some(out)
@@ -407,7 +407,7 @@ mod tests {
             "THOR program missing: C:\\Users\\a\\thor2\\sync.exe",
             "quarantined",
             "Windows Security > Virus & threat protection > Protection history",
-            "install again",
+            "one-line download command",
             "history names: sync.exe",
             "OFFER, never do it unasked",
             "stop scanning every file in that folder",
@@ -426,7 +426,7 @@ mod tests {
     fn off_windows_there_is_no_defender_advice_and_nothing_missing_is_silent() {
         let line = words_for(&[PathBuf::from("/opt/thor2/sync")], &[], false).unwrap();
         assert!(!line.contains("Defender") && !line.contains("Add-MpPreference"), "{line}");
-        assert!(line.contains("install again"));
+        assert!(line.contains("one-line download command"));
         assert_eq!(words_for(&[], &[], true), None);
     }
 }

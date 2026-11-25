@@ -2069,6 +2069,10 @@ evaluation-report), in the session that ran the check - a revise cannot turn an 
 Nothing was queued.";
 
 /// What a replica adds to the 'queued' reply of a weekly-check report.
+/// What every writing tool answers when the memory it serves is a read-only
+/// copy (a laptop's): nothing is written there.
+const READ_ONLY_COPY_LINE: &str = "This memory is a read-only copy of another computer's memory, so nothing was saved here. Notes are saved on the main computer: say it again in a session there, and it shows up here after the next refresh.";
+
 const REPLICA_EVALUATION_HINT: &str = " This is a weekly-check report: it counts once the main machine has its proof. When \
 this turn ends, THOR checks the filing against the session's own transcript and hands you one more call to make (a note \
 tagged copy-attestation, with the text copied exactly); the report is then applied on the next drain.";
@@ -3254,6 +3258,13 @@ impl ThorMcpServer {
     /// lost, and a caller told "queued" for a line that never reached disk
     /// would have no reason to say it again.
     fn capture(&self, tool: &str, args: &impl Serialize) -> Option<String> {
+        // A read-only copy has one writer, the main machine: every writing
+        // tool (all of them pass through here first) answers with one plain
+        // line instead of appending to the copy's log, which would fork the
+        // chain a later pull cannot repair.
+        if self.inbox.is_none() && self.is_read_only_copy() {
+            return Some(READ_ONLY_COPY_LINE.to_string());
+        }
         let path = self.inbox.as_ref()?;
         let value = match serde_json::to_value(args) {
             Ok(v) => v,
@@ -3279,6 +3290,13 @@ impl ThorMcpServer {
                  assume it landed."
             )),
         }
+    }
+
+    /// Whether the memory this server serves is a read-only copy of another
+    /// machine's (the copy marker sits beside it, or `THOR_COPY=1`).
+    fn is_read_only_copy(&self) -> bool {
+        let path = self.store.lock().unwrap_or_else(|p| p.into_inner()).path();
+        path.is_some_and(|db| thor_core::copy_mode::is_copy(&db))
     }
 
     /// Run a sync store closure off the async runtime so a slow store call
@@ -5366,6 +5384,34 @@ mod tests {
         let reply = srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await;
         assert!(reply.contains("REFUSED") && reply.contains("Orientation with no binding"), "{reply}");
         assert!(srv.store.lock().unwrap().get_all_events().unwrap().is_empty(), "nothing is written on a refusal");
+    }
+
+    /// A tool server pointed at a read-only copy writes nothing, whichever
+    /// writing tool is called, and says so in one plain line.
+    #[tokio::test]
+    async fn every_writing_tool_on_a_read_only_copy_answers_with_one_plain_line_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("copy.db");
+        let before = {
+            let store = EventStore::new(&db).unwrap();
+            store.get_all_events().unwrap().len()
+        };
+        thor_core::copy_mode::write_marker(&db, &thor_core::copy_mode::Marker::default()).unwrap();
+        let srv = ThorMcpServer::new(EventStore::new(&db).unwrap());
+
+        let mut args = base_remember("copy-note");
+        args.project = None;
+        args.always = false;
+        let replies = vec![
+            srv.remember(Meta::new(), RawArgs::default(), Parameters(args)).await,
+            srv.retract(Meta::new(), RawArgs::default(), Parameters(RetractArgs { id: "x".to_string(), reason: "no longer true here".to_string() })).await,
+            srv.mark(Meta::new(), RawArgs::default(), Parameters(MarkArgs { id: "x".to_string(), noise: false, place: None })).await,
+        ];
+        for reply in replies {
+            assert_eq!(reply, READ_ONLY_COPY_LINE);
+            assert!(reply.contains("read-only copy") && reply.contains("main computer"), "{reply}");
+        }
+        assert_eq!(srv.store.lock().unwrap().get_all_events().unwrap().len(), before, "a copy's log is never appended to");
     }
 
     /// A costly rule bound only to a project name reaches no tool call.

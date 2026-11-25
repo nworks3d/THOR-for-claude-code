@@ -295,12 +295,39 @@ pub fn plain_root(start_dir: &Path) -> Option<PathBuf> {
         let named = std::fs::read_to_string(d.join(MARKER_FILE_NAME))
             .ok()
             .is_some_and(|content| content.lines().next().is_some_and(|line| !line.trim().is_empty()));
-        if named {
+        // A marker an earlier install left on a far too broad folder (Documents,
+        // Desktop, Downloads) is not inherited by the folders below it: each of
+        // those can have a memory of its own. In the broad folder itself it is
+        // still found, so the earlier memory is reported and not forgotten.
+        if named && (d == start_dir || !is_too_broad_folder(d)) {
             return Some(d.to_path_buf());
         }
         dir = d.parent();
     }
     None
+}
+
+/// Whether `dir` is far too broad to be one project: the home folder, a drive
+/// root, or Desktop, Documents or Downloads directly in the home folder (also
+/// inside a OneDrive folder there). Twin of `serve::inventory::broad_place`,
+/// which names the folder for a person; this one only answers yes or no and
+/// lives here because `plain_root` needs it.
+pub fn is_too_broad_folder(dir: &Path) -> bool {
+    let form = |p: &Path| p.display().to_string().replace('\\', "/").trim_end_matches('/').to_lowercase();
+    let d = form(dir);
+    if d.is_empty() || d.ends_with(':') || dir.parent().is_none_or(|p| p.as_os_str().is_empty()) {
+        return true;
+    }
+    let Some(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).ok() else { return false };
+    let h = form(Path::new(&home));
+    if d == h {
+        return true;
+    }
+    let name = dir.file_name().and_then(|n| n.to_str()).map(str::to_lowercase).unwrap_or_default();
+    let parent = dir.parent().map(form).unwrap_or_default();
+    let in_home = parent == h
+        || parent.strip_prefix(&format!("{h}/")).is_some_and(|rest| !rest.contains('/') && rest.starts_with("onedrive"));
+    in_home && ["desktop", "bureaublad", "documents", "documenten", "downloads", "download"].contains(&name.as_str())
 }
 
 /// The root of the LINKED WORKTREE `start_dir` sits in - the directory that

@@ -10,7 +10,16 @@ use model::store::{self, ReadError};
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
-const NOTES: [&str; 2] = ["orchestrator-mode-saves-quota", "an-agent-brief-stands-alone"];
+/// The two notes of helper-agent mode (bound to the Agent tool).
+const MODE: [&str; 2] = ["orchestrator-mode-saves-quota", "an-agent-brief-stands-alone"];
+/// Every note about helper assistants: the two above and three of the starting set.
+const NOTES: [&str; 5] = [
+    "orchestrator-mode-saves-quota",
+    "an-agent-brief-stands-alone",
+    "name-a-model-on-every-agent",
+    "mechanical-brief-forbids-subagents-and-review",
+    "mid-task-message-does-not-redirect-an-agent",
+];
 
 struct Fx {
     home: tempfile::TempDir,
@@ -87,11 +96,14 @@ fn an_old_memory_without_them_is_not_touched_by_seeding_or_by_off() {
 }
 
 #[test]
-fn on_stores_exactly_the_two_notes_and_is_idempotent() {
+fn on_stores_exactly_the_five_notes_and_is_idempotent() {
     let fx = Fx::empty();
     let out = fx.install(&["--set-helpers", "on"]);
     assert!(out.status.success(), "{}", said(&out));
     for id in NOTES {
+        fx.read(id).unwrap_or_else(|e| panic!("{id} not stored: {e}"));
+    }
+    for id in MODE {
         let item = fx.read(id).unwrap_or_else(|e| panic!("{id} not stored: {e}"));
         assert!(item.bindings.iter().any(|b| matches!(b, model::item::Binding::Target { value, .. } if value == "Agent")), "{id} lost its Agent binding");
     }

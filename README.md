@@ -504,7 +504,7 @@ defaults you can change just by saying so.
 
 That first conversation is a short welcome, not a list of settings. It says THOR
 is set up and remembers what you tell it, gives three examples of what to say,
-and asks one question over three proposals: a daily safety copy of your memory
+and asks one question over three proposals (a fourth, about keeping a changelog, only in a programming project): a daily safety copy of your memory
 on your computer, the language it talks to you in, and the folder where
 everything for this work is kept and where you work from. Say "yes" to accept
 them all, or tell it by number what you want different ("2 English", "3 figure it
