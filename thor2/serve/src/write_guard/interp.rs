@@ -19,7 +19,8 @@ use super::{command_writes_protected, Protected};
 pub(super) fn writes_protected(p: &Protected, program: &str, source: &str, cwd: Option<&str>, depth: usize) -> bool {
     let text = source.replace("\\\"", "\"");
     let vars = path_variables(&text);
-    let calls = calls_of(&text);
+    let mut calls = calls_of(&text);
+    calls.extend(bare_calls_of(&text));
     for call in &calls {
         if call_writes_protected(p, call, &vars, cwd) {
             return true;
@@ -30,6 +31,13 @@ pub(super) fn writes_protected(p: &Protected, program: &str, source: &str, cwd: 
     }
     if matches!(program, "awk" | "gawk") && awk_redirects_into_protected(p, &text, cwd) {
         return true;
+    }
+    // `print "x" | "tee <file>"`: a command in a string of an awk program.
+    if depth < 3 && matches!(program, "awk" | "gawk") {
+        let reads_a_command = |l: &String| l.contains(' ') && (p.mentions_any(l) || p.mentions_a_locked_file(l));
+        if nested_literals(&text, 3).iter().any(|l| reads_a_command(l) && command_writes_protected(p, l, cwd, depth + 1)) {
+            return true;
+        }
     }
     if is_sql_write_on_protected(p, &calls, &text, &vars, cwd) {
         return true;
@@ -72,6 +80,34 @@ fn calls_of(text: &str) -> Vec<Call> {
             stmt -= 1;
         }
         calls.push(Call { name, args: split_args(&chars, i + 1), before: chars[stmt..start].iter().collect() });
+    }
+    calls
+}
+
+/// Perl's calls without parentheses: `unlink "file"`, `open F, ">file"`, `rename "a", "b"`. The
+/// arguments run to the end of the statement.
+fn bare_calls_of(text: &str) -> Vec<Call> {
+    let mut calls = Vec::new();
+    for name in ["unlink", "open", "rename", "rmdir", "truncate"] {
+        let mut from = 0;
+        while let Some(at) = text[from..].find(name) {
+            let start = from + at;
+            let end = start + name.len();
+            from = end;
+            let before_ok = text[..start].chars().next_back().is_none_or(|c| !is_name_char(c));
+            let rest = &text[end..];
+            // The argument opens with a quote, a variable, or a bareword handle (`open F, ">file"`).
+            let after = rest.trim_start();
+            let handle: String = after.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            let spaced = rest.starts_with(' ')
+                && (after.starts_with(['"', '\'', '$']) || (!handle.is_empty() && after[handle.len()..].trim_start().starts_with(',')));
+            if !before_ok || !spaced {
+                continue;
+            }
+            let statement = rest.split([';', '\n']).next().unwrap_or("");
+            let chars: Vec<char> = format!("{statement})").chars().collect();
+            calls.push(Call { name: name.to_string(), args: split_args(&chars, 0), before: String::new() });
+        }
     }
     calls
 }
@@ -119,6 +155,17 @@ fn split_args(chars: &[char], from: usize) -> Vec<String> {
         args.push(current);
     }
     args
+}
+
+/// The string literals of a text and, inside them, the literals of those (an awk program in
+/// single quotes holds the double-quoted command it pipes to).
+fn nested_literals(text: &str, levels: usize) -> Vec<String> {
+    let mut out = literals(text);
+    if levels > 0 {
+        let inner: Vec<String> = out.iter().filter(|l| l.contains('"') || l.contains('\'')).flat_map(|l| nested_literals(l, levels - 1)).collect();
+        out.extend(inner);
+    }
+    out
 }
 
 /// The string literals in a text, without their quotes.
@@ -208,6 +255,8 @@ fn path_variables(text: &str) -> Vec<(String, Vec<String>)> {
 fn arg_paths(arg: &str, vars: &[(String, Vec<String>)]) -> Vec<String> {
     let own = literals(arg);
     let mut out = own.clone();
+    // Perl's two-argument open carries the mode in front of the path: `">>file"`.
+    out.extend(own.iter().map(|l| l.trim_start_matches(['>', '<', '+', '&', ' ']).to_string()).filter(|l| !own.contains(l)));
     if own.len() > 1 {
         out.push(own.join("/"));
     }
@@ -246,7 +295,12 @@ fn is_write_mode(arg: &str) -> bool {
 fn call_writes_protected(p: &Protected, call: &Call, vars: &[(String, Vec<String>)], cwd: Option<&str>) -> bool {
     let last = call.name.rsplit(['.', ':']).next().unwrap_or(&call.name);
     let prefix = call.name.strip_suffix(last).unwrap_or("").trim_end_matches(['.', ':']);
-    let module = matches!(prefix, "os" | "fs" | "fs.promises" | "shutil" | "file" | "fileutils" | "io" | "pathlib" | "fs_extra" | "fse" | "fsp");
+    let module = matches!(prefix, "os" | "fs" | "fs.promises" | "shutil" | "file" | "fileutils" | "io" | "pathlib" | "fs_extra" | "fse" | "fsp")
+        || [".file", ".directory"].iter().any(|s| prefix.ends_with(s));
+    let writes_a_stream = call.args.iter().any(|a| {
+        let l = a.to_lowercase();
+        ["filemode.create", "filemode.append", "filemode.truncate", "filemode.openorcreate", "fileaccess.write", "fileaccess.readwrite"].iter().any(|m| l.contains(m))
+    });
     let first = call.args.first().map(|a| arg_paths(a, vars)).unwrap_or_default();
     let named = |key: &str| call.args.iter().find_map(|a| a.trim_start().strip_prefix(key).map(|r| r.trim_start().trim_start_matches('=').to_string()));
     let first = if first.is_empty() { named("file").or_else(|| named("path")).map(|a| arg_paths(&a, vars)).unwrap_or_default() } else { first };
@@ -259,6 +313,11 @@ fn call_writes_protected(p: &Protected, call: &Call, vars: &[(String, Vec<String
         }
         "unlink" | "unlinksync" | "rmtree" | "rmsync" | "rmdirsync" | "removedirs" | "rm_rf" | "rm_r" | "rm_f" => hits(p, &first, cwd, true),
         "rmdir" => hits(p, &first, cwd, true),
+        // .NET: File.WriteAllText, File.Create, new StreamWriter(path), new FileStream(path, FileMode.Create)
+        "writealltext" | "writeallbytes" | "writealllines" | "appendalltext" | "appendalllines" | "appendtext" | "createtext" | "openwrite"
+        | "streamwriter" => hits(p, &first, cwd, false),
+        "create" if module => hits(p, &first, cwd, false),
+        "filestream" if writes_a_stream => hits(p, &first, cwd, false),
         "remove" | "delete" | "rm" if module => hits(p, &first, cwd, true),
         "write" | "binwrite" if matches!(call.name.as_str(), "file.write" | "io.write" | "file.binwrite" | "io.binwrite") => hits(p, &first, cwd, false),
         "rename" | "renamesync" | "move" | "mv" if n >= 2 => all.iter().take(2).any(|paths| hits(p, paths, cwd, true)),
@@ -270,8 +329,8 @@ fn call_writes_protected(p: &Protected, call: &Call, vars: &[(String, Vec<String
                 return false;
             }
             let flags = ["o_wronly", "o_rdwr", "o_append", "o_creat", "o_trunc"];
-            let writes = call.args.iter().skip(1).any(|a| is_write_mode(a) || flags.iter().any(|f| a.to_lowercase().contains(f)));
             let perl_style = call.args.iter().skip(1).any(|a| a.trim().trim_matches(|c| c == '\'' || c == '"').starts_with(['>', '+']));
+            let writes = perl_style || call.args.iter().skip(1).any(|a| is_write_mode(a) || flags.iter().any(|f| a.to_lowercase().contains(f)));
             writes && (hits(p, &first, cwd, false) || (perl_style && all.iter().skip(1).any(|paths| hits(p, paths, cwd, false))))
         }
         _ => false,

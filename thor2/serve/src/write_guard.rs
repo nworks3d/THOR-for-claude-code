@@ -44,6 +44,9 @@ pub struct Protected {
     /// ending in one of them is refused, whatever folder it is spelled into and however the name is
     /// spelled (brace forms, backslash escapes, quotes split inside it).
     names: Vec<String>,
+    /// When set, a locked name counts only inside this folder (an absolute path in it, or a relative
+    /// name while the working folder is in it); a file of that name elsewhere is free.
+    name_dir: Option<String>,
 }
 
 impl Protected {
@@ -84,6 +87,7 @@ impl Protected {
             claude_dirs: claude_dirs.iter().filter_map(|p| keep(p)).collect(),
             vars,
             names: Vec::new(),
+            name_dir: None,
         }
     }
 
@@ -98,9 +102,82 @@ impl Protected {
         self
     }
 
-    /// Whether a path as written in a call ends in a locked file name, in any of its spellings.
-    fn names_a_locked_file(&self, written: &str) -> bool {
-        self.names.iter().any(|name| spells_name(written, name))
+    /// The same lock, kept only inside one folder (the memory's folder).
+    pub fn with_name_lock_in(dir: Option<&Path>, names: &[&str]) -> Self {
+        let name_dir = dir.and_then(|d| non_empty(forms::clean_path(&fold(&d.to_string_lossy()))));
+        Protected { name_dir, ..Protected::with_name_lock(names) }
+    }
+
+    /// The same guard that also keeps files with these names, but only inside the memory's folder.
+    pub fn and_name_lock_in_store(mut self, names: &[&str]) -> Self {
+        self.names.extend(names.iter().map(|n| n.to_ascii_lowercase()));
+        self.name_dir = self.store_dir.clone();
+        self
+    }
+
+    /// Whether a path as written in a call ends in a locked file name, in any of its spellings, and
+    /// sits where the lock holds.
+    fn names_a_locked_file(&self, written: &str, cwd: Option<&str>) -> bool {
+        self.names.iter().any(|name| spells_name(written, name)) && self.in_lock_folder(written, cwd)
+    }
+
+    /// Whether a path (as written) is inside the folder the name lock is limited to. Without a
+    /// folder, or when the place cannot be worked out, it is.
+    fn in_lock_folder(&self, written: &str, cwd: Option<&str>) -> bool {
+        let Some(dir) = &self.name_dir else { return true };
+        let inside = |p: &str| p == dir || p.starts_with(&format!("{dir}/"));
+        brace_forms(written).iter().any(|form| {
+            let place = match form.rfind(['/', '\\']) {
+                Some(i) => self.resolve(&form[..=i], cwd),
+                None => match cwd {
+                    Some(c) => fold(c),
+                    None => return true,
+                },
+            };
+            !is_absolute(&place) || inside(&place)
+        })
+    }
+
+    /// Whether the text names a locked file where the lock holds (a one-line .NET write).
+    fn mention_in_lock_folder(&self, text: &str, cwd: Option<&str>) -> bool {
+        match &self.name_dir {
+            None => true,
+            Some(dir) => self.expand(text).contains(dir.as_str()) || cwd.is_some_and(|c| fold(c).starts_with(dir.as_str())),
+        }
+    }
+
+    /// The names a wildcard is tried against in the memory's folder: state files and locked names.
+    fn store_samples(&self) -> Vec<String> {
+        STATE_SAMPLES.iter().map(|s| s.to_string()).chain(self.names.iter().cloned()).collect()
+    }
+
+    /// Whether a name pattern (`-name`, `-Filter`) could match a state file, a locked name, a saved
+    /// conversation or one of THOR's programs.
+    fn pattern_could_match_state(&self, pattern: &str) -> bool {
+        self.store_samples().iter().map(String::as_str).chain(PROJECT_SAMPLES).chain(ANY_SAMPLES).any(|s| forms::wildcard_matches(pattern, s))
+    }
+
+    /// Whether a glob in a write target could match a protected file: its folder is a protected
+    /// folder (or the lock's) and its name pattern could match a state file, a locked name, a saved
+    /// conversation or one of THOR's programs.
+    fn glob_names_protected_file(&self, written: &str, cwd: Option<&str>) -> bool {
+        let path = self.resolve(written, cwd);
+        if !forms::has_wildcard(&path) {
+            return false;
+        }
+        let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        let Some(last) = segs.last() else { return false };
+        let in_dir = |dir: &str| {
+            let dir_segs: Vec<&str> = dir.split('/').filter(|s| !s.is_empty()).collect();
+            segs.len() > dir_segs.len() && (0..dir_segs.len()).all(|i| forms::wildcard_matches(segs[i], dir_segs[i]))
+        };
+        let samples = self.store_samples();
+        let lock_dir = self.name_dir.as_ref().or(self.store_dir.as_ref());
+        (self.store_dir.as_deref().is_some_and(in_dir) && samples.iter().any(|s| forms::wildcard_matches(last, s)))
+            || (self.name_dir.as_deref().is_some_and(in_dir) && self.names.iter().any(|s| forms::wildcard_matches(last, s)))
+            || (lock_dir.is_none() && self.names.iter().any(|s| forms::wildcard_matches(last, s)))
+            || (self.programs_dir.as_deref().is_some_and(in_dir) && ANY_SAMPLES.iter().any(|s| forms::wildcard_matches(last, s)))
+            || (self.projects_dirs().iter().any(|d| in_dir(d)) && (PROJECT_SAMPLES.iter().any(|s| forms::wildcard_matches(last, s)) || forms::wildcard_could_end_with(last, ".jsonl")))
     }
 
     /// Whether a text holds a locked file name in any of its spellings (a one-line program).
@@ -168,7 +245,9 @@ impl Protected {
         }
         let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
         let mut kinds: Vec<(String, &[&str])> = Vec::new();
-        kinds.extend(self.store_dir.clone().map(|d| (d, &STATE_SAMPLES[..])));
+        let store_samples: Vec<String> = self.store_samples();
+        let store_samples: Vec<&str> = store_samples.iter().map(String::as_str).collect();
+        kinds.extend(self.store_dir.clone().map(|d| (d, &store_samples[..])));
         kinds.extend(self.programs_dir.clone().map(|d| (d, &ANY_SAMPLES[..])));
         kinds.extend(self.projects_dirs().into_iter().map(|d| (d, &PROJECT_SAMPLES[..])));
         kinds.iter().any(|(dir, samples)| {
@@ -204,7 +283,15 @@ impl Protected {
 
     /// Whether a path as written in a call is one of the protected files.
     fn protects(&self, written: &str, cwd: Option<&str>) -> bool {
-        self.names_a_locked_file(written) || self.protects_by_place(written, cwd)
+        // A shell brace expression (`owner-{p,x}.jsonl`) is every spelling it stands for.
+        if written.contains('{') {
+            return brace_forms(written).iter().any(|f| self.protects_one(f, cwd));
+        }
+        self.protects_one(written, cwd)
+    }
+
+    fn protects_one(&self, written: &str, cwd: Option<&str>) -> bool {
+        self.names_a_locked_file(written, cwd) || self.protects_by_place(written, cwd) || self.glob_names_protected_file(written, cwd)
     }
 
     /// Whether a path as written in a call is a protected file because of the folder it is in.
@@ -282,7 +369,17 @@ impl Protected {
 
 /// Names a wildcard is tried against: a state file of the memory's folder, any file of THOR's
 /// programs, a saved conversation or a folder of one.
-const STATE_SAMPLES: [&str; 5] = ["thor.db", "thor.db-wal", "state.json", "session.jsonl", "mark.stamp"];
+const STATE_SAMPLES: [&str; 9] = [
+    "thor.db",
+    "thor.db-wal",
+    "thor.db-shm",
+    "state.json",
+    "session.jsonl",
+    "mark.stamp",
+    "real-calls.jsonl",
+    "real-replies.jsonl",
+    "session-watermark.json",
+];
 const ANY_SAMPLES: [&str; 3] = ["serve.exe", "install.exe", "data"];
 const PROJECT_SAMPLES: [&str; 2] = ["session.jsonl", "project"];
 
@@ -383,6 +480,14 @@ fn fold(path: &str) -> String {
     }
     // The administrative share of this computer's own drive (`//localhost/c$/x`) is `c:/x`.
     p = forms::unshare(&p);
+    // Cygwin and WSL spell a drive `/cygdrive/c/x` and `/mnt/c/x`.
+    for prefix in ["/cygdrive", "/mnt"] {
+        let drive = p.strip_prefix(prefix).filter(|r| r.as_bytes().first() == Some(&b'/') && r.as_bytes().get(1).is_some_and(u8::is_ascii_alphabetic) && r.as_bytes().get(2) == Some(&b'/'));
+        if let Some(rest) = drive {
+            p = rest.to_string();
+            break;
+        }
+    }
     let bytes = p.as_bytes();
     if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b'/' {
         p = format!("{}:{}", bytes[1] as char, &p[2..]);
@@ -489,6 +594,13 @@ enum Tok {
 }
 
 fn tokenize(command: &str) -> Vec<Tok> {
+    tokenize_with(command, false)
+}
+
+/// `deep` also cuts at a `(` that starts a word and at its `)` (a subshell, a grouped expression)
+/// and reads `>&file` as a redirect into `file`.
+fn tokenize_with(command: &str, deep: bool) -> Vec<Tok> {
+    let mut parens = 0usize;
     let chars: Vec<char> = command.chars().collect();
     let mut out = Vec::new();
     let mut word = String::new();
@@ -517,6 +629,15 @@ fn tokenize(command: &str) -> Vec<Tok> {
                 word.push(chars[i]);
             }
             c if c.is_whitespace() && c != '\n' => flush(&mut word, &mut in_word, &mut out),
+            '(' if deep && !in_word => {
+                parens += 1;
+                out.push(Tok::Border(false));
+            }
+            ')' if deep && parens > 0 => {
+                parens -= 1;
+                flush(&mut word, &mut in_word, &mut out);
+                out.push(Tok::Border(false));
+            }
             '\n' | ';' | '|' | '&' => {
                 // `>&` and `2>&1` are handled at the `>`; a lone `&` or `&&` is a border.
                 flush(&mut word, &mut in_word, &mut out);
@@ -537,12 +658,23 @@ fn tokenize(command: &str) -> Vec<Tok> {
                 while i + 1 < chars.len() && chars[i + 1] == '>' {
                     i += 1;
                 }
-                if i + 1 < chars.len() && chars[i + 1] == '&' {
-                    // `>&2`, `>&1`: a copy of a descriptor, no file.
+                // `>&2`, `>&1`, `>&-` copy a descriptor; `>&file` writes the file (in `deep` reading).
+                let names_a_file = deep && chars.get(i + 1) == Some(&'&') && {
+                    let mut j = i + 2;
+                    while j < chars.len() && chars[j] == ' ' {
+                        j += 1;
+                    }
+                    let first = chars.get(j).copied();
+                    !matches!(first, None | Some('0'..='9') | Some('-') | Some('&') | Some('|') | Some(';') | Some('\n'))
+                };
+                if i + 1 < chars.len() && chars[i + 1] == '&' && !names_a_file {
                     i += 1;
                     while i + 1 < chars.len() && (chars[i + 1].is_ascii_digit() || chars[i + 1] == '-') {
                         i += 1;
                     }
+                } else if names_a_file {
+                    i += 1;
+                    out.push(Tok::Redirect);
                 } else {
                     if i + 1 < chars.len() && chars[i + 1] == '|' {
                         i += 1;
@@ -570,8 +702,18 @@ pub(crate) fn command_name(word: &str) -> String {
 
 const SKIPPED_LEADERS: [&str; 10] = ["sudo", "env", "nohup", "command", "builtin", "exec", "time", "call", "start", "&"];
 pub(crate) const SHELLS: [&str; 8] = ["bash", "sh", "zsh", "powershell", "pwsh", "cmd", "dash", "ksh"];
-const DOTNET_WRITES: [&str; 8] =
-    ["io.file]::write", "io.file]::append", "io.file]::delete", "io.file]::move", "io.file]::create", "io.file]::open", "streamwriter", "filestream"];
+const DOTNET_WRITES: [&str; 10] = [
+    "io.file]::write",
+    "io.file]::append",
+    "io.file]::delete",
+    "io.file]::move",
+    "io.file]::create",
+    "io.file]::open",
+    "io.file]::replace",
+    "io.file]::copy",
+    "streamwriter",
+    "filestream",
+];
 
 const MOVERS_OF_THE_WORKING_FOLDER: [&str; 5] = ["cd", "chdir", "pushd", "set-location", "sl"];
 const INTERPRETERS: &[&str] =
@@ -587,7 +729,15 @@ fn command_writes_protected(p: &Protected, command: &str, cwd: Option<&str>, dep
     // Each command: its words, the files it redirects into, and whether it pipes into the next.
     let mut segments: Vec<(Vec<String>, Vec<String>, bool)> = Vec::new();
     let mut targets: Vec<String> = Vec::new();
-    for tok in tokenize(command) {
+    // A PowerShell scriptblock or a shell group is commands too: `& { Add-Content <file> x }`.
+    if depth < 4 && command.contains('{') && script_blocks(command).iter().any(|b| command_writes_protected(p, b, cwd, depth + 1)) {
+        return true;
+    }
+    // `Add-Type -TypeDefinition '<C#>'`: the type's text is a program that may write a file.
+    if depth < 4 && command.to_ascii_lowercase().contains("add-type") && interp::writes_protected(p, "add-type", command, cwd, depth) {
+        return true;
+    }
+    for tok in tokenize_with(command, true) {
         match tok {
             Tok::Word(w) => {
                 if redirected {
@@ -615,6 +765,14 @@ fn command_writes_protected(p: &Protected, command: &str, cwd: Option<&str>, dep
         if segment_writes_protected(p, words, here.as_deref(), depth, command) {
             return true;
         }
+        if segments[at].2 && depth < 4 && feeds_a_shell(words, segments.get(at + 1).map(|s| &s.0[..])) {
+            // `printf 'rm <file>' | sh`: what is printed is a command the shell then runs.
+            let text = if words.len() == 1 { words[0].clone() } else { leader_of(words).map(|(_, rest)| rest.join(" ")).unwrap_or_default() };
+            let text = text.replace("\\n", "\n");
+            if command_writes_protected(p, &text, here.as_deref(), depth + 1) {
+                return true;
+            }
+        }
         if at > 0 && segments[at - 1].2 && removes_what_it_is_fed(words) && lists_protected(p, &segments, at, here.as_deref()) {
             return true;
         }
@@ -631,6 +789,73 @@ fn command_writes_protected(p: &Protected, command: &str, cwd: Option<&str>, dep
         }
     }
     false
+}
+
+/// The bodies of the unquoted `{ ... }` blocks of a command that hold a space: a PowerShell
+/// scriptblock, a shell group. A brace expression (`{a,b}`), `${x}` and `@{ }` are not blocks.
+fn script_blocks(command: &str) -> Vec<String> {
+    let chars: Vec<char> = command.chars().collect();
+    let mut blocks = Vec::new();
+    let mut quote: Option<char> = None;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                }
+            }
+            None if c == '\'' || c == '"' => quote = Some(c),
+            None if c == '`' => i += 1,
+            None if c == '{' && (i == 0 || matches!(chars[i - 1], ' ' | '\t' | '\n' | '&' | '(' | ';' | '|')) => {
+                let (mut depth, mut j) = (0usize, i);
+                let mut inner: Option<char> = None;
+                while j < chars.len() {
+                    match inner {
+                        Some(q) => {
+                            if chars[j] == q {
+                                inner = None;
+                            }
+                        }
+                        None if chars[j] == '\'' || chars[j] == '"' => inner = Some(chars[j]),
+                        None if chars[j] == '{' => depth += 1,
+                        None if chars[j] == '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        None => {}
+                    }
+                    j += 1;
+                }
+                let body: String = chars[i + 1..j.min(chars.len())].iter().collect();
+                if body.contains(char::is_whitespace) {
+                    blocks.push(body);
+                }
+            }
+            None => {}
+        }
+        i += 1;
+    }
+    blocks
+}
+
+/// Whether a command that prints text is piped into a shell that reads it as a script: `printf
+/// 'rm x' | sh`, `echo ... | bash`, `Write-Output ... | iex`.
+fn feeds_a_shell(words: &[String], next: Option<&[String]>) -> bool {
+    let (Some((printer, _)), Some(next)) = (leader_of(words), next) else { return false };
+    // A string in a pipeline (`'Remove-Item x' | powershell`) prints itself.
+    let a_string = words.len() == 1 && words[0].contains(' ');
+    if !a_string && !matches!(printer.as_str(), "printf" | "echo" | "write-output" | "write-host" | "cat") {
+        return false;
+    }
+    let Some((reader, rest)) = leader_of(next) else { return false };
+    if matches!(reader.as_str(), "iex" | "invoke-expression") {
+        return rest.is_empty();
+    }
+    SHELLS.contains(&reader.as_str()) && !rest.iter().any(|w| matches!(w.to_ascii_lowercase().as_str(), "-c" | "-command" | "/c" | "-file"))
 }
 
 const REMOVERS: [&str; 9] = ["rm", "del", "erase", "rmdir", "rd", "remove-item", "ri", "unlink", "shred"];
@@ -679,7 +904,7 @@ fn lister_reaches_protected(p: &Protected, words: &[String], cwd: Option<&str>) 
         .filter_map(|(i, _)| rest.get(i + 1).cloned())
         .collect();
     let lower: Vec<String> = filters.iter().map(|f| f.to_ascii_lowercase()).collect();
-    let could_match_state = |f: &String| STATE_SAMPLES.iter().chain(PROJECT_SAMPLES.iter()).chain(ANY_SAMPLES.iter()).any(|s| forms::wildcard_matches(f, s));
+    let could_match_state = |f: &String| p.pattern_could_match_state(f);
     if !lower.is_empty() && !lower.iter().any(could_match_state) {
         return false;
     }
@@ -752,6 +977,18 @@ fn segment_writes_protected(p: &Protected, words: &[String], cwd: Option<&str>, 
         }
         found
     };
+    // Like `after_flag`, but a flag in `exact` is compared with its case (`cp -t dir` is not `cp -T`).
+    let after_exact = |exact: &[&str], insensitive: &[&str]| -> Vec<&String> {
+        let mut found = Vec::new();
+        for (i, w) in rest.iter().enumerate() {
+            if exact.contains(&w.as_str()) || insensitive.contains(&w.to_ascii_lowercase().as_str()) {
+                if let Some(next) = rest.get(i + 1) {
+                    found.push(next);
+                }
+            }
+        }
+        found
+    };
     let has_flag = |names: &[&str]| rest.iter().any(|w| names.contains(&w.to_ascii_lowercase().as_str()));
     match name.as_str() {
         n if SHELLS.contains(&n) => {
@@ -803,7 +1040,7 @@ fn segment_writes_protected(p: &Protected, words: &[String], cwd: Option<&str>, 
             // Only the DESTINATION is written: the one named by -Destination or -t, else the last
             // (the second for xcopy and robocopy). A folder that receives a file named like a
             // protected one counts; so does a whole tree copied into a protected folder.
-            let named = after_flag(&["-destination", "-t", "--target-directory"]);
+            let named = after_exact(&["-t", "--target-directory"], &["-destination"]);
             let (sources, dest): (Vec<&String>, Option<&String>) = match named.first() {
                 Some(d) => (positionals.iter().copied().filter(|w| w != d).collect(), Some(*d)),
                 None if is_windows_copier => (positionals.iter().take(1).copied().collect(), positionals.get(1).copied()),
@@ -818,10 +1055,14 @@ fn segment_writes_protected(p: &Protected, words: &[String], cwd: Option<&str>, 
                     let l = w.to_ascii_lowercase();
                     matches!(l.as_str(), "-r" | "--recursive" | "-a" | "--archive") || l.starts_with("-rec") || (l.starts_with('-') && !l.starts_with("--") && l[1..].contains(['r', 'a']) && l.len() <= 4 && name == "cp")
                 });
-            dest.is_some_and(|d| dest_receives(p, d, &sources, cwd) || (whole_tree && p.receives_tree(d, cwd)))
+            // `cp -l` and `cp -s` make a hard or symbolic link to the source: a way in later.
+            let linking = name == "cp"
+                && rest.iter().any(|w| matches!(w.as_str(), "--link" | "--symbolic-link") || (w.starts_with('-') && !w.starts_with("--") && w[1..].contains(['l', 's'])));
+            (linking && sources.iter().any(|s| p.protects(s, cwd) || p.touches_dir(s, cwd)))
+                || dest.is_some_and(|d| dest_receives(p, d, &sources, cwd) || (whole_tree && p.receives_tree(d, cwd)))
         }
         "install" if is_the_unix_install(&words[at], rest) => {
-            let named = after_flag(&["-t", "--target-directory"]);
+            let named = after_exact(&["-t", "--target-directory"], &[]);
             let (sources, dest): (Vec<&String>, Option<&String>) = match named.first() {
                 Some(d) => (positionals.iter().copied().filter(|w| w != d).collect(), Some(*d)),
                 None => match positionals.split_last() {
@@ -849,7 +1090,34 @@ fn segment_writes_protected(p: &Protected, words: &[String], cwd: Option<&str>, 
                 || any(&after_flag(&["-o", "--output-document", "--output-file", "-outfile"]))
                 || after_flag(&["-p", "--directory-prefix"]).iter().any(|w| p.touches_dir(w, cwd))
         }
-        "invoke-webrequest" | "iwr" | "invoke-restmethod" | "irm" | "start-bitstransfer" => any(&after_flag(&["-outfile", "-destination"])),
+        // `-OutFile` and its short forms (`-o`, `-out`, `-outf`...).
+        "invoke-webrequest" | "iwr" | "invoke-restmethod" | "irm" | "start-bitstransfer" => {
+            let named = rest.iter().enumerate().filter(|(_, w)| {
+                let l = w.to_ascii_lowercase();
+                l == "-o" || l == "-destination" || (l.len() >= 3 && "-outfile".starts_with(l.as_str()))
+            });
+            named.filter_map(|(i, _)| rest.get(i + 1)).any(|w| p.protects(w, cwd))
+        }
+        "start-transcript" => any(&after_flag(&["-path", "-literalpath", "-outputdirectory"])),
+        "sponge" | "script" => any(&positionals),
+        "uniq" | "split" => positionals.get(1).is_some_and(|a| p.protects(a, cwd)),
+        "ssh" => any(&after_exact(&["-E"], &[])),
+        "fsutil" => positionals.iter().any(|w| p.protects(w, cwd) || p.touches_dir(w, cwd)),
+        "patch" => any(&positionals) || any(&after_flag(&["-o", "--output"])) || rest.iter().any(|w| w.strip_prefix("--output=").is_some_and(|v| p.protects(v, cwd))),
+        "sort" => any(&after_flag(&["-o", "--output"])) || rest.iter().any(|w| w.strip_prefix("--output=").is_some_and(|v| p.protects(v, cwd))),
+        "pandoc" | "gpg" | "gpg2" => any(&after_flag(&["-o", "--output"])) || rest.iter().any(|w| w.strip_prefix("--output=").is_some_and(|v| p.protects(v, cwd))),
+        "openssl" => any(&after_flag(&["-out"])),
+        "zip" => positionals.first().is_some_and(|a| p.protects(a, cwd)),
+        "busybox" => depth < 3 && segment_writes_protected(p, rest, cwd, depth + 1, source),
+        "xargs" => {
+            // The command xargs runs: skip its own options (and their values).
+            let mut i = 0;
+            while i < rest.len() && rest[i].starts_with('-') {
+                let takes_value = matches!(rest[i].as_str(), "-I" | "-n" | "-P" | "-d" | "-E" | "-L" | "-s" | "-a" | "-J" | "--max-args" | "--max-procs" | "--delimiter" | "--arg-file" | "--replace");
+                i += if takes_value { 2 } else { 1 };
+            }
+            depth < 3 && i < rest.len() && segment_writes_protected(p, &rest[i..], cwd, depth + 1, source)
+        }
         // Only the forms that write a file: `-hashfile` and `-dump` only read.
         "certutil" => {
             let writes = ["-urlcache", "-decode", "-decodehex", "-encode", "-encodehex", "-split", "-verifyctl"].iter().any(|f| has_flag(&[f]));
@@ -857,7 +1125,9 @@ fn segment_writes_protected(p: &Protected, words: &[String], cwd: Option<&str>, 
         }
         "bitsadmin" => has_flag(&["/transfer", "/addfile"]) && rest.iter().any(|w| p.protects(w, cwd)),
         "sed" => {
-            let in_place = rest.iter().any(|w| w == "-i" || (w.starts_with("-i") && !w.starts_with("--")) || w.starts_with("--in-place"));
+            let in_place = rest.iter().any(|w| {
+                w.starts_with("--in-place") || (w.starts_with('-') && !w.starts_with("--") && w.len() > 1 && w[1..].chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_') && w[1..].contains('i'))
+            });
             (in_place && any(&positionals)) || rest.iter().any(|w| sed_script_writes_protected(p, w, cwd))
         }
         "find" => {
@@ -869,22 +1139,38 @@ fn segment_writes_protected(p: &Protected, words: &[String], cwd: Option<&str>, 
                         && rest.get(i + 1).is_some_and(|c| REMOVERS.contains(&command_name(c).as_str()) || matches!(command_name(c).as_str(), "mv" | "truncate")))
             });
             let names: Vec<String> = after_flag(&["-name", "-iname"]).iter().map(|n| n.to_ascii_lowercase()).collect();
-            let could_match = |f: &String| STATE_SAMPLES.iter().chain(PROJECT_SAMPLES.iter()).chain(ANY_SAMPLES.iter()).any(|s| forms::wildcard_matches(f, s));
+            let could_match = |f: &String| p.pattern_could_match_state(f);
             let ruled_out = !names.is_empty() && !names.iter().any(could_match);
-            deletes && !ruled_out && paths.iter().any(|w| p.touches_dir(w, cwd) || p.removal_protects(w, cwd))
+            let prints_to = rest.iter().enumerate().any(|(i, w)| {
+                matches!(w.as_str(), "-fprint" | "-fprint0" | "-fprintf" | "-fls") && rest.get(i + 1).is_some_and(|f| p.protects(f, cwd))
+            });
+            prints_to || (deletes && !ruled_out && paths.iter().any(|w| p.touches_dir(w, cwd) || p.removal_protects(w, cwd)))
         }
         "tar" => {
+            let letters_c = rest.first().is_some_and(|w| !w.starts_with('-') && w.chars().all(|c| c.is_ascii_alphabetic()) && w.contains(['c', 'r', 'u']) && !w.contains('x'));
             let letters_x = rest.first().is_some_and(|w| !w.starts_with('-') && w.chars().all(|c| c.is_ascii_alphabetic()) && w.contains('x'));
             let extracts = letters_x
                 || rest.iter().any(|w| w == "--extract" || w == "--get" || (w.starts_with('-') && !w.starts_with("--") && w.contains('x')));
             let dirs = forms::cluster_values(rest, &['C']);
             let long = rest.iter().filter_map(|w| w.strip_prefix("--directory=")).chain(after_flag(&["--directory"]).into_iter().map(String::as_str));
+            let creates = letters_c || rest.iter().any(|w| matches!(w.as_str(), "--create" | "--append" | "--update") || (w.starts_with('-') && !w.starts_with("--") && w[1..].contains(['c', 'r', 'u']) && !w[1..].contains('x')));
+            let old_style = if letters_c && rest[0].contains('f') { rest.get(1).cloned() } else { None };
+            if creates && !extracts && old_style.is_some_and(|a| p.protects(&a, cwd)) {
+                return true;
+            }
+            let archive = forms::cluster_values(rest, &['f']).into_iter().map(|(_, v)| v).chain(rest.iter().filter_map(|w| w.strip_prefix("--file=")).map(str::to_string)).chain(after_flag(&["--file"]).into_iter().cloned());
+            if creates && !extracts && archive.into_iter().any(|a| p.protects(&a, cwd)) {
+                return true;
+            }
             extracts && (dirs.iter().any(|(_, d)| p.receives_tree(d, cwd)) || long.into_iter().any(|d| p.receives_tree(d, cwd)))
         }
         "unzip" => forms::cluster_values(rest, &['d']).iter().any(|(_, d)| p.receives_tree(d, cwd)),
-        "7z" | "7za" | "7zr" => {
-            rest.first().is_some_and(|c| matches!(c.as_str(), "x" | "e")) && rest.iter().any(|w| w.strip_prefix("-o").is_some_and(|d| !d.is_empty() && p.receives_tree(d, cwd)))
-        }
+        "7z" | "7za" | "7zr" => match rest.first().map(String::as_str) {
+            Some("x") | Some("e") => rest.iter().any(|w| w.strip_prefix("-o").is_some_and(|d| !d.is_empty() && p.receives_tree(d, cwd))),
+            // `7z a <archive> files`: the archive is written.
+            Some("a") | Some("u") | Some("d") => positionals.get(1).is_some_and(|a| p.protects(a, cwd)),
+            _ => false,
+        },
         "expand-archive" => {
             let dest = after_flag(&["-destinationpath"]);
             let dest: Vec<&String> = if dest.is_empty() { positionals.iter().skip(1).copied().collect() } else { dest };
@@ -896,21 +1182,27 @@ fn segment_writes_protected(p: &Protected, words: &[String], cwd: Option<&str>, 
         "ln" | "mklink" => positionals.iter().any(|w| p.touches_dir(w, cwd)),
         "sqlite3" => {
             let whole = words[at..].join(" ").to_ascii_lowercase();
-            p.mentions_any(&whole) && SQL_WRITES.iter().any(|m| whole.contains(m))
+            let dot_writes = [".output", ".once", ".backup", ".save", ".log", ".excel", ".recover"].iter().any(|m| whole.contains(m));
+            (p.mentions_any(&whole) || p.mentions_a_locked_file(&whole)) && (SQL_WRITES.iter().any(|m| whole.contains(m)) || dot_writes)
         }
         n if INTERPRETERS.contains(&n) => {
             // `perl -pi -e ... <protected>` edits the file in place.
             let in_place = matches!(n, "perl" | "ruby")
                 && rest.iter().any(|w| w.starts_with('-') && !w.starts_with("--") && w.contains('i'))
                 && positionals.iter().any(|w| p.protects(w, cwd));
-            in_place || interp::writes_protected(p, n, source, cwd, depth)
+            // `gawk -i inplace '...' <protected>` and `awk '{print > FILENAME}' <protected>`.
+            let awk_in_place = matches!(n, "awk" | "gawk")
+                && rest.windows(2).any(|w| w[0] == "-i" && w[1].eq_ignore_ascii_case("inplace") || w[0].eq_ignore_ascii_case("-iinplace"))
+                && positionals.iter().any(|w| p.protects(w, cwd));
+            let awk_to_its_input = matches!(n, "awk" | "gawk") && source.contains("FILENAME") && positionals.iter().any(|w| p.protects(w, cwd));
+            in_place || awk_in_place || awk_to_its_input || interp::writes_protected(p, n, source, cwd, depth)
         }
         _ => {
             // A one-line .NET or `New-Item` write names its target inside a longer argument.
             let whole = words[at..].join(" ").to_ascii_lowercase();
             let links = ["symboliclink", "junction", "hardlink"].iter().any(|m| whole.contains(m));
             (DOTNET_WRITES.iter().any(|m| whole.contains(m)) || matches!(name.as_str(), "new-item" | "ni" | "set-item" | "si"))
-                && (p.names_any(&words[at..].join(" ")) || p.mentions_a_locked_file(&whole) || (links && p.mentions_any(&whole)))
+                && (p.names_any(&words[at..].join(" ")) || (p.mentions_a_locked_file(&whole) && p.mention_in_lock_folder(&whole, cwd)) || (links && p.mentions_any(&whole)))
         }
     }
 }
@@ -993,7 +1285,7 @@ fn git_writes_protected(p: &Protected, rest: &[String], positionals: &[&String],
                 return true;
             }
         }
-        "archive" | "diff" | "log" | "show" | "format-patch" | "bundle" => {
+        "archive" | "diff" | "log" | "show" | "format-patch" => {
             if value_of(&["--output", "-o"]).iter().any(|v| p.protects(v, cwd) || p.receives_tree(v, cwd)) {
                 return true;
             }
@@ -1001,6 +1293,22 @@ fn git_writes_protected(p: &Protected, rest: &[String], positionals: &[&String],
         "clone" => {
             let operands: Vec<&String> = args.iter().filter(|w| !w.starts_with('-')).collect();
             if operands.len() >= 2 && operands.last().is_some_and(|d| p.receives_tree(d, cwd)) {
+                return true;
+            }
+        }
+        "rm" | "mv" => {
+            if args.iter().filter(|w| !w.starts_with('-')).any(|w| p.removal_protects(w, cwd)) {
+                return true;
+            }
+        }
+        "bundle" if args.first().is_some_and(|w| w == "create") => {
+            if args.iter().skip(1).find(|w| !w.starts_with('-')).is_some_and(|f| p.protects(f, cwd)) {
+                return true;
+            }
+        }
+        "config" => {
+            let reads = args.iter().any(|w| matches!(w.as_str(), "--get" | "--get-all" | "--get-regexp" | "-l" | "--list" | "--get-urlmatch" | "--show-origin"));
+            if !reads && value_of(&["--file", "-f"]).iter().any(|v| p.protects(v, cwd)) {
                 return true;
             }
         }
@@ -1623,6 +1931,228 @@ mod tests {
         assert_eq!(forms::split_colon_params(&["-Path:C:\\x".to_string(), "-c:".to_string(), "--a:b".to_string()]), ["-Path", "C:\\x", "-c:", "--a:b"]);
         assert_eq!(forms::cluster_values(&["-sSLo".to_string(), "f".to_string()], &['o']), [('o', "f".to_string())]);
         assert_eq!(forms::cluster_values(&["-oPATH".to_string()], &['o']), [('o', "PATH".to_string())]);
+    }
+
+    fn locked() -> Protected {
+        guard().and_name_lock_in_store(&["owner-prompts.jsonl", "unpin-owner-go.json"])
+    }
+
+    fn refused_in(g: &Protected, tool: &str, command: &str, cwd: Option<&str>) -> bool {
+        refusal(g, tool, Some(&serde_json::json!({ "command": command })), cwd).is_some()
+    }
+
+    #[test]
+    fn a_glob_that_could_match_a_protected_file_is_refused_as_a_write_target() {
+        let g = locked();
+        for command in [
+            "printf x >> C:/data/store/owner-p*",
+            "echo x > C:/data/store/owner-prompts.json?",
+            "echo x >> C:/data/store/unpin-owner-g*",
+            "echo x >> C:/Users/alex/.claude/proj*/p/abc.js*",
+            "echo x > C:/data/store/thor.d[a-c]",
+            "echo x > C:/data/s*/thor.db",
+            "cd C:/data/store && echo x >> owner-p*",
+            "printf x | tee -a C:/data/store/owner-p*",
+            "cp x C:/data/store/owner-p*",
+            "rm C:/data/store/owner-p*",
+            "find C:/data/store -name \"owner-*\" -delete",
+            "echo x > C:/data/store/owner-{p,q}*",
+        ] {
+            assert!(refused_in(&g, "Bash", command, Some("C:/work")), "{command}");
+        }
+        for command in [
+            "Set-Content C:\\data\\store\\owner-p* x",
+            "Add-Content C:\\data\\store\\unpin-owner-g* x",
+            "del C:\\data\\store\\*owner*",
+            "gci C:\\data\\store -Filter owner* | Remove-Item",
+        ] {
+            assert!(refused_in(&g, "PowerShell", command, Some("C:/work")), "{command}");
+        }
+        for command in [
+            "echo x > C:/data/store/notes*",
+            "echo x > C:/data/store/n*.log",
+            "echo x > C:/scratch/owner-p*",
+            "rm C:/data/store/*.txt",
+            "find C:/data/store -name \"notes-*\" -delete",
+            "echo x > C:/Users/alex/.claude/proj*/p/x.txt",
+            "ls C:/data/store/owner-p*",
+            "cat C:/data/store/thor.d* > C:/scratch/all",
+        ] {
+            assert!(!refused_in(&g, "Bash", command, Some("C:/work")), "{command}");
+        }
+        assert!(!refused_in(&g, "PowerShell", "gci C:\\data\\store -Filter notes* | Remove-Item", Some("C:/work")));
+    }
+
+    #[test]
+    fn a_powershell_scriptblock_and_an_add_type_text_are_read_as_commands() {
+        let g = locked();
+        for command in [
+            "& { Add-Content C:\\data\\store\\owner-prompts.jsonl x }",
+            "Start-Job { Set-Content C:\\data\\store\\thor.db x }",
+            "1 | ForEach-Object { Add-Content C:\\data\\store\\unpin-owner-go.json x }",
+            "Invoke-Command { Remove-Item C:\\data\\store\\thor.db }",
+            "Invoke-Command -ScriptBlock { if ($true) { Add-Content C:\\data\\store\\thor.db x } }",
+            "Add-Type -TypeDefinition 'public class A { public static void W() { System.IO.File.WriteAllText(@\"C:\\data\\store\\thor.db\",\"x\"); } }'",
+            "Add-Type -TypeDefinition @\"\npublic class A { public static void W() { System.IO.File.AppendAllText(@\"C:\\data\\store\\thor.db\", \"x\"); } }\n\"@",
+            "Add-Type -TypeDefinition 'public class A { public static void W() { new System.IO.StreamWriter(@\"C:\\data\\store\\thor.db\").Write(1); } }'",
+        ] {
+            assert!(refused_in(&g, "PowerShell", command, None), "{command}");
+        }
+        assert!(refused_in(&g, "Bash", "{ echo x > C:/data/store/thor.db; }", None));
+        for command in [
+            "& { Get-Content C:\\data\\store\\thor.db }",
+            "& { Add-Content C:\\scratch\\a.txt x }",
+            "1 | ForEach-Object { $_ * 2 }",
+            "Get-Process | ForEach-Object { $_.Name } | Out-File C:\\scratch\\p.txt",
+            "Add-Type -TypeDefinition 'public class B { public static void W() { System.IO.File.WriteAllText(@\"C:\\scratch\\x.txt\",\"x\"); } }'",
+            "Add-Type -AssemblyName System.Windows.Forms",
+            "$h = @{ a = 1; b = 2 }; $h.a",
+        ] {
+            assert!(!refused_in(&g, "PowerShell", command, None), "{command}");
+        }
+        for command in ["echo {a,b}", "echo ${HOME}/x", "{ echo hi; } > C:/scratch/x", "cp a.txt{,.bak}"] {
+            assert!(!refused_in(&g, "Bash", command, None), "{command}");
+        }
+    }
+
+    #[test]
+    fn perl_awk_sed_redirect_and_pipe_forms_that_write_are_refused() {
+        let g = locked();
+        for command in [
+            "perl -e 'open(F,\">C:/data/store/a.json\")'",
+            "perl -e 'open(F, \">>C:/data/store/a.json\"); print F 1'",
+            "perl -e 'unlink \"C:/data/store/a.json\"'",
+            "perl -e 'open F, \">C:/data/store/a.json\"'",
+            "sed -ni 's/a/b/p' C:/data/store/a.json",
+            "sed -i.bak s/a/b/ C:/data/store/a.json",
+            "awk -i inplace '{print}' C:/data/store/a.json",
+            "gawk -i inplace '{print}' C:/data/store/a.json",
+            "awk '{print > FILENAME}' C:/data/store/a.json",
+            "awk 'BEGIN{print \"x\" | \"tee C:/data/store/a.json\"}'",
+            "echo x >&C:/data/store/a.json",
+            "ls nonexist >& C:/data/store/a.json",
+            "(cd C:/data/store && echo x > thor.db)",
+            "(cd C:/data/store; echo x > owner-prompts.jsonl)",
+            "printf 'echo x > C:/data/store/a.json' | sh",
+            "echo 'rm C:/data/store/thor.db' | bash",
+            "printf 'echo x > C:/data/store/a.json\\n' | sh",
+        ] {
+            assert!(refused_in(&g, "Bash", command, Some("C:/work")), "{command}");
+        }
+        for command in [
+            "iwr http://example.test/x -o C:\\data\\store\\a.json",
+            "iwr http://example.test/x -Out C:\\data\\store\\a.json",
+            "iwr http://example.test/x -outf C:\\data\\store\\a.json",
+            "Write-Output 'Remove-Item C:\\data\\store\\thor.db' | iex",
+            "'Set-Content C:\\data\\store\\a.json x' | powershell",
+        ] {
+            assert!(refused_in(&g, "PowerShell", command, Some("C:/work")), "{command}");
+        }
+        for command in [
+            "echo x 2>&1",
+            "echo x >&2",
+            "ls nonexist >& C:/scratch/o",
+            "ls nonexist 2>&1 | head",
+            "(cd C:/scratch && echo x > a.txt)",
+            "(cd C:/data/store && ls)",
+            "printf 'echo hi' | sh",
+            "echo x | sh",
+            "printf 'echo x > C:/scratch/a.json' | sh",
+            "perl -e 'open(F,\">C:/scratch/o.txt\")'",
+            "perl -e 'unlink \"C:/scratch/o.txt\"'",
+            "sed -ni 's/a/b/p' C:/scratch/x",
+            "awk '{print > \"C:/scratch/o\"}' f",
+            "awk '{print > FILENAME}' C:/scratch/x",
+            "awk 'BEGIN{print \"x\" | \"tee C:/scratch/o\"}'",
+            "echo \"(a)\" > C:/scratch/x",
+            "echo $(date) > C:/scratch/x",
+        ] {
+            assert!(!refused_in(&g, "Bash", command, Some("C:/work")), "{command}");
+        }
+        assert!(!refused_in(&g, "PowerShell", "iwr http://example.test/x -o C:\\scratch\\a.json", None));
+        assert!(!refused_in(&g, "PowerShell", "Write-Output 'Get-Date' | iex", None));
+        assert!(!refused_in(&g, "PowerShell", "Get-Item (Join-Path C:\\scratch a) | Out-Null", None));
+    }
+
+    #[test]
+    fn plain_output_flags_and_write_commands_are_refused_on_a_protected_path() {
+        let g = locked();
+        for command in [
+            "cp -T a C:/data/store/a.json",
+            "install a C:/data/store/a.json",
+            "echo x | sponge C:/data/store/a.json",
+            "busybox tee C:/data/store/a.json",
+            "busybox cp a C:/data/store/a.json",
+            "echo a | xargs touch C:/data/store/a.json",
+            "ls | xargs -I{} cp {} C:/data/store/a.json",
+            "echo a | xargs tee C:/data/store/a.json",
+            "sort -o C:/data/store/a.json f",
+            "sort f --output=C:/data/store/a.json",
+            "tar -cf C:/data/store/a.json x",
+            "tar czf C:/data/store/a.json x",
+            "tar --create --file=C:/data/store/a.json x",
+            "zip C:/data/store/a.json x",
+            "7z a C:/data/store/a.json x",
+            "find . -fprint C:/data/store/a.json",
+            "sqlite3 x.db \".output C:/data/store/a.json\"",
+            "sqlite3 C:/data/store/thor.db \".backup C:/scratch/b\"",
+            "git rm C:/data/store/thor.db",
+            "git mv a C:/data/store/thor.db",
+            "git bundle create C:/data/store/a.json HEAD",
+            "git config --file C:/data/store/a.json x y",
+            "patch -o C:/data/store/a.json f",
+            "openssl rand -out C:/data/store/a.json 8",
+            "pandoc x -o C:/data/store/a.json",
+            "cp --target-directory=C:/data/store /tmp/owner-prompts.jsonl",
+            "cp -l C:/data/store/thor.db C:/scratch/h",
+            "cp -s C:/data/store/thor.db C:/scratch/h",
+            "uniq x C:/data/store/a.json",
+            "ssh -E C:/data/store/a.json host",
+            "echo x >> /cygdrive/c/data/store/a.json",
+            "echo x >> /mnt/c/data/store/a.json",
+        ] {
+            assert!(refused_in(&g, "Bash", command, Some("C:/work")), "{command}");
+        }
+        for command in ["cp -r a b", "cp -v a C:/scratch/b", "cp -s a b", "uniq x", "ssh -E C:/scratch/log host", "echo x >> /mnt/d/scratch/a.json"] {
+            assert!(!refused_in(&g, "Bash", command, Some("C:/work")), "{command}");
+        }
+        for command in [
+            "Start-Transcript -Path C:\\data\\store\\a.json",
+            "fsutil hardlink create C:\\data\\store\\a.json C:\\x",
+        ] {
+            assert!(refused_in(&g, "PowerShell", command, Some("C:/work")), "{command}");
+        }
+        for command in [
+            "cp -T a C:/scratch/x",
+            "install a C:/scratch/x",
+            "echo x | sponge C:/scratch/x",
+            "busybox ls",
+            "echo a | xargs -I{} touch C:/scratch/{}",
+            "ls | xargs rm",
+            "xargs echo",
+            "sort -o C:/scratch/x f",
+            "sort f",
+            "tar -cf C:/scratch/a.tar x",
+            "tar -tf C:/data/store/a.tar",
+            "tar -xf C:/data/store/b.tar -C C:/scratch",
+            "zip C:/scratch/a.zip x",
+            "7z a C:/scratch/a.7z x",
+            "find . -fprint C:/scratch/o",
+            "sqlite3 x.db \".output C:/scratch/o\"",
+            "sqlite3 C:/data/store/thor.db \".tables\"",
+            "git config --file C:/data/store/a.json --get x",
+            "git rm C:/scratch/x",
+            "git mv a b",
+            "git bundle create C:/scratch/a.bundle HEAD",
+            "patch -o C:/scratch/x f",
+            "openssl rand -out C:/scratch/x 8",
+            "pandoc x -o C:/scratch/x",
+        ] {
+            assert!(!refused_in(&g, "Bash", command, Some("C:/work")), "{command}");
+        }
+        for command in ["Start-Transcript -Path C:\\scratch\\a.txt", "fsutil volume diskfree C:"] {
+            assert!(!refused_in(&g, "PowerShell", command, Some("C:/work")), "{command}");
+        }
     }
 
     /// Not run by default: like `replay_the_real_calls`, but over the real-calls file itself
