@@ -65,6 +65,13 @@ pub fn hook_spec(backup_exe: &str, db: &str, repo: &str) -> HookSpec {
     }
 }
 
+/// The backup folder a backup hook command line names (the word after `--repo`),
+/// as written.
+pub fn repo_of_command(command: &str) -> Option<String> {
+    let words = crate::install::raw_command_words(command);
+    words.windows(2).find(|pair| pair[0] == "--repo").map(|pair| pair[1].clone())
+}
+
 /// Whether `command` is a backup hook for the memory at `db`: the program is
 /// called `backup` and its `--db` is this memory, in any path spelling.
 fn is_backup_command_for(command: &str, db: &str) -> bool {

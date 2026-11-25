@@ -200,6 +200,40 @@ fn revise_accepts_a_file_in_the_project_root_exactly_as_remember_does() {
     assert!(missing.starts_with("REFUSED") && missing.contains("bare role name"), "{missing}");
 }
 
+/// A note bound only to its project, in a code project (a git folder), is told
+/// plainly that it rarely comes back; in a topic folder it is not, and a note
+/// that is also bound to a file is not.
+#[test]
+fn a_note_bound_only_to_its_project_in_a_code_project_says_it_rarely_comes_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = store(dir.path(), &["demo", "garden"]);
+    let session = Session::with_store(dir.path(), db.clone(), WRITING_SESSION);
+    std::fs::create_dir_all(session.cwd.join(".git")).unwrap();
+    register(&db, "demo", &session.cwd);
+    let topic = dir.path().join("garden-folder");
+    std::fs::create_dir_all(&topic).unwrap();
+    std::fs::write(topic.join(".thor-project"), "garden\n").unwrap();
+    register(&db, "garden", &topic);
+    let mut mcp = session.mcp();
+    let note = |id: &str, project: &str| {
+        json!({
+            "id": id, "kind": "orientation", "project": project,
+            "targets": [{"kind": "project", "value": project}],
+            "text": format!("The {project} tiles come from the Tilehouse shop."),
+            "falsifier": "The tiles come from another shop.",
+        })
+    };
+    let code = mcp.call("remember", note("tiles-code", "demo"));
+    assert!(code.starts_with("stored") && code.contains("bound only to the project 'demo'") && code.contains("only when a message names the project"), "{code}");
+    assert!(code.contains("Bind it to the file, command or moment it is about"), "{code}");
+    // A revise of the same note says it too.
+    let revised = mcp.call("revise", json!({"id": "tiles-code", "text": "The demo tiles come from the Tilehouse shop, ordered in May."}));
+    assert!(revised.contains("bound only to the project 'demo'"), "{revised}");
+    // A topic folder: the project binding is how the note comes back.
+    let topic_reply = mcp.call("remember", note("tiles-topic", "garden"));
+    assert!(topic_reply.starts_with("stored") && !topic_reply.contains("bound only to the project"), "{topic_reply}");
+}
+
 fn set_read_only(path: &std::path::Path, on: bool) {
     let mut perms = std::fs::metadata(path).unwrap().permissions();
     #[allow(clippy::permissions_set_readonly_false)]

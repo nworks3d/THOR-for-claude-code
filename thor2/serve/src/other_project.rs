@@ -90,6 +90,25 @@ pub fn is_project_bound(item: &model::item::Item, project: &str) -> bool {
         })
 }
 
+/// The plain sentence a `remember` or `revise` reply carries when a note's only binding is
+/// its project and the project is a code project (its registered folder is a git
+/// repository): there that binding is read only when a message names the project, so the
+/// note rarely comes back by itself. `None` for any other note, and for a topic folder,
+/// where the project binding is the way a note comes back.
+pub fn project_only_note(store: &thor_core::event_store::EventStore, item: &model::item::Item) -> Option<String> {
+    let project = item.project.as_deref()?;
+    if !is_project_bound(item, project) {
+        return None;
+    }
+    let root = model::store::project_root_for(store, Some(project))?;
+    if is_topic_folder(&root) || crate::project::git_root(&root).is_none() {
+        return None;
+    }
+    Some(format!(
+        "this note is bound only to the project '{project}', and in a code project that binding is read only when a message names the project, so the note will rarely come back by itself. Bind it to the file, command or moment it is about (for example the README or the file it concerns, or the moment commit or push); it then arrives right before that step."
+    ))
+}
+
 /// Is the folder a session runs in a topic folder (a plain folder with its own marker, no git
 /// repository)? Measured on a copy of a real store (2026-11-25): with every unpinned rule and
 /// note of a big code project bound to it, 72% to 88% of its prompts shared a word with at

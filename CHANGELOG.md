@@ -52,6 +52,11 @@ What changed: The weekly check is quieter and more reliable, and a pin can no lo
 - **A new note can be anchored to a file in the project's top folder, and a text-only edit never trips over it.** Changing only the words of a note no longer refuses because of an anchor the note already had.
 - **The first weekly check no longer asks you to re-read brand new notes.** A pinned note written or changed in the last 30 days is not listed for a re-read.
 - **A tag keeps the room for your own rules.** At `git tag` with the changelog notes on, no more than three of THOR's own starter notes are shown, so your own first rule always fits.
+- **A note tied only to a code project now says it will rarely come back.** In a code project that tie is read only when a message names the project, so when you save such a note the reply says so and suggests tying it to the file, command or step it is about. In a plain subject folder nothing changes.
+- **Your assistant reads the whole first-session text.** A lookup cut it after about a third; every note and page now sends the assistant to read it whole with `get`.
+- **A reinstall from another folder also moves the daily safety copy.** The backup's connection used to keep pointing at the old folder and stop silently; it now moves with the other connections, and another memory's backup is left alone.
+- **A git folder THOR has no memory for says so at the start of a conversation.** One plain line, with the one command that sets it up. A set-up project and a subject folder show nothing.
+- **Uninstall also removes the empty commands folder** that the evaluation command was the only thing in.
 - **A second computer can copy from the local backup folder,** and a backup that cannot be reached is a plain sentence with the next step. A read-only copy no longer accepts new notes.
 - **Installing a second project no longer asks for a restart** when nothing Claude Code loads at its start changed.
 - **A commit, a push and a publish keep room for your own first rule.** The starting notes now fill each of those places with at most three.

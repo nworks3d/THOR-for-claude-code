@@ -356,6 +356,8 @@ fn with_warnings(
                 notes.push(serve::other_project::folderless_line(&found.project, found.notes));
             }
         }
+        // A note bound only to its project, in a code project, rarely comes back.
+        notes.extend(serve::other_project::project_only_note(store, item));
         // What the rule would have done to the calls of the last 30 days
         // (`serve::sweep`): informs, never refuses.
         notes.extend(serve::sweep::would_refuse_note(store, item, std::time::Duration::from_millis(1_500)));

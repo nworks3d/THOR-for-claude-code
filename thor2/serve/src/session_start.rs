@@ -359,6 +359,30 @@ impl DoctorStart {
     }
 }
 
+/// The one plain line a session start shows when the folder it runs in is a git
+/// repository THOR has no memory for yet (no registered working copy for its
+/// project), naming the one command that gives it one. `None` for a folder that
+/// is not a git repository, a topic folder, and a project whose working copy is
+/// registered.
+pub fn unregistered_repo_line(
+    store: &thor_core::event_store::EventStore,
+    cwd: &std::path::Path,
+    project: Option<&str>,
+    install: &str,
+    db: &std::path::Path,
+) -> Option<String> {
+    let project = project?;
+    let top = crate::project::git_root(cwd)?;
+    if crate::other_project::is_topic_folder(cwd) || model::store::project_root_for(store, Some(project)).is_some() {
+        return None;
+    }
+    let db = db.display().to_string().replace('\\', "/");
+    Some(format!(
+        "[THOR] This folder ({}) is a git project that THOR has no memory for yet, so notes about it cannot come back here and its code cannot be searched. Tell the person in one plain sentence and offer to set it up; they only answer yes or no. On yes, run from inside this folder:  \"{install}\" --db \"{db}\"",
+        top.display().to_string().replace('\\', "/")
+    ))
+}
+
 /// What decides which extra lines a session start carries.
 pub struct ExtrasFor<'a> {
     /// The payload's `source` ("startup", "resume", "compact", ...).

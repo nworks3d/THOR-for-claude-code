@@ -683,8 +683,39 @@ fn words_are_serve_hook(words: &[String]) -> bool {
 }
 
 /// Whether one hook entry is THOR's own serve hook, wherever it points.
+#[cfg(test)]
 fn is_serve_hook_entry(hook: &Value) -> bool {
     hook_words(hook).is_some_and(|words| words_are_serve_hook(&words))
+}
+
+/// The memory a backup hook names (the word after `--db`), flattened.
+fn backup_db(words: &[String]) -> Option<&str> {
+    words.windows(2).find(|p| p[0] == "--db").map(|p| p[1].as_str())
+}
+
+/// Whether command words are THOR's backup program (the daily safety copy).
+fn words_are_backup_hook(words: &[String]) -> bool {
+    let stem = words.first().and_then(|w| Path::new(w).file_stem()).and_then(|s| s.to_str()).unwrap_or_default();
+    stem.eq_ignore_ascii_case("backup") && backup_db(words).is_some()
+}
+
+/// Whether `spec` words are one of THOR's own hooks, which a reinstall moves
+/// instead of adding beside: the serve program, or the backup of one memory.
+fn is_thor_spec(spec: &[String]) -> bool {
+    words_are_serve_hook(spec) || words_are_backup_hook(spec)
+}
+
+/// Whether `hook` is the same kind of THOR hook as `spec`, wherever it points:
+/// a serve hook beside a serve spec, a backup of the same memory beside a backup spec.
+fn same_thor_kind(hook: &Value, spec: &[String]) -> bool {
+    let Some(words) = hook_words(hook) else { return false };
+    if words_are_serve_hook(spec) {
+        words_are_serve_hook(&words)
+    } else if words_are_backup_hook(spec) {
+        words_are_backup_hook(&words) && backup_db(&words) == backup_db(spec)
+    } else {
+        false
+    }
 }
 
 /// The command line of a hook entry, for the report of what was replaced.
@@ -700,17 +731,18 @@ fn hook_line(hook: &Value) -> String {
 /// group and matcher) and take every other serve hook of THOR's out. Returns the
 /// command line that was replaced, or `None` when there was none.
 fn repoint_serve_hook(array: &mut Vec<Value>, spec: &HookSpec, exec: bool) -> Option<String> {
+    let spec_words = command_words(&spec.command);
     let mut old = None;
     for group in array.iter_mut() {
         let Some(hooks) = group.get_mut("hooks").and_then(Value::as_array_mut) else { continue };
-        if let Some(hook) = hooks.iter_mut().find(|h| is_serve_hook_entry(h)) {
+        if let Some(hook) = hooks.iter_mut().find(|h| same_thor_kind(h, &spec_words)) {
             old = Some(hook_line(hook));
             write_spec(hook, spec, exec);
             break;
         }
     }
     let old = old?;
-    remove_other_serve_hooks(array, &command_words(&spec.command));
+    remove_other_serve_hooks(array, &spec_words);
     Some(old)
 }
 
@@ -723,7 +755,7 @@ fn remove_other_serve_hooks(array: &mut Vec<Value>, keep: &[String]) -> Vec<Stri
         let Some(hooks) = group.get_mut("hooks").and_then(Value::as_array_mut) else { continue };
         let before = hooks.len();
         hooks.retain(|h| {
-            let other = is_serve_hook_entry(h) && hook_words(h).is_some_and(|words| words != keep);
+            let other = same_thor_kind(h, keep) && hook_words(h).is_some_and(|words| words != keep);
             if other {
                 removed.push(hook_line(h));
             }
@@ -999,7 +1031,7 @@ pub fn install_hooks_as(path: &Path, specs: &[HookSpec], exec: bool) -> anyhow::
             }
             // Another set of THOR's own serve hooks (another program folder or
             // another memory) beside this one is taken out: one THOR per account.
-            let removed = if words_are_serve_hook(&wanted) { remove_other_serve_hooks(array, &wanted) } else { Vec::new() };
+            let removed = if is_thor_spec(&wanted) { remove_other_serve_hooks(array, &wanted) } else { Vec::new() };
             let outcome = if !removed.is_empty() {
                 replaced.extend(removed);
                 HookOutcome::Replaced
@@ -1016,7 +1048,7 @@ pub fn install_hooks_as(path: &Path, specs: &[HookSpec], exec: bool) -> anyhow::
         // program folder, another memory, a program that is gone) is repointed
         // here, never left beside a second one. Recognised by the serve program
         // and `hook` as its last word, wherever it points.
-        if words_are_serve_hook(&command_words(&spec.command)) {
+        if is_thor_spec(&command_words(&spec.command)) {
             if let Some(old) = repoint_serve_hook(array, spec, exec) {
                 replaced.push(old);
                 results.push((spec.event.to_string(), HookOutcome::Replaced));
@@ -1125,7 +1157,7 @@ pub fn working_contract() -> Vec<model::item::Item> {
             "a-new-project-is-one-command",
             "Giving a folder its own memory is ONE command: run the install program from inside it, \
              naming the store and, for code, the project, or, for a plain folder, the topic \
-             option. It marks and registers the folder. Options: lookup with key first-session-questions. \
+             option. It marks and registers the folder. Options: get first-session-questions. \
              The owner names a project, never you.",
             "A folder set up with that one command turns out to be missing its marker, its \
              registration, its code reading or its refresh on commit.",
@@ -1306,7 +1338,7 @@ pub fn working_contract() -> Vec<model::item::Item> {
         // way for good.
         rule(
             model::store::SETUP_NOTE_ID,
-            "Setup is not finished. In your first reply, `lookup with key first-session-questions` is the \
+            "Setup is not finished. In your first reply, `get first-session-questions` (the whole text in one call, never a lookup) is the \
              one place to read: the exact calls, paths and what to say. Apply the defaults at once \
              (store 'owner-setup-answers', retract this note, say the welcome). Nothing waits.",
             "This note is still being served at session start after the owner has already \
@@ -1325,7 +1357,7 @@ pub fn order_earlier_note() -> model::item::Item {
     model::item::Item {
         id: model::store::ORDER_NOTE_ID.to_string(),
         kind: model::item::Kind::Orientation,
-        text: "Last setup step: once the welcome is answered, run THE TIDY STEP of `lookup with key first-session-questions` (serve \
+        text: "Last setup step: once the welcome is answered, run THE TIDY STEP of `get first-session-questions` (serve \
                inventory, then a numbered proposal to order earlier work). The session is held until THOR itself finds it settled. \
                Never retract this note yourself."
             .to_string(),
@@ -2945,6 +2977,39 @@ mod tests {
         assert!(!same_spelling("\"C:\\a b\\x.exe\" hook", "\"C:\\a\" \"b\\x.exe\" hook"));
         // Another program is not THOR's serve hook.
         assert!(!is_serve_hook_entry(&json!({"type": "command", "command": "C:/thor2/bin/other.exe", "args": ["--db", "x", "hook"]})));
+    }
+
+    /// The daily backup's connection moves with a reinstall from another program
+    /// folder (same memory), and the backup of ANOTHER memory is left alone.
+    #[test]
+    fn a_reinstall_moves_the_backup_hook_of_the_same_memory_and_not_another_memorys() {
+        use crate::backup_setup::hook_spec;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        // Real programs on disk, so the "binary is gone" repair stays out of this question.
+        let old_exe = dir.path().join("old").join("backup.exe");
+        let new_exe = dir.path().join("new").join("backup.exe");
+        for exe in [&old_exe, &new_exe] {
+            fs::create_dir_all(exe.parent().unwrap()).unwrap();
+            fs::write(exe, b"x").unwrap();
+        }
+        let (old_exe, new_exe) = (old_exe.display().to_string(), new_exe.display().to_string());
+        let old = hook_spec(&old_exe, "C:/thor2/thor.db", "C:/thor2/backup-repo");
+        let other = hook_spec(&old_exe, "C:/elsewhere/thor.db", "C:/elsewhere/backup-repo");
+        install_hooks_as(&path, &[old, other], true).unwrap();
+        let new = hook_spec(&new_exe, "C:/thor2/thor.db", "C:/thor2/backup-repo");
+        let report = install_hooks_as(&path, &[new.clone()], true).unwrap();
+        assert_eq!(report.results[0].1, HookOutcome::Replaced, "{:?}", report.results);
+        let now: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let groups: Vec<&Value> = now["hooks"]["SessionStart"].as_array().unwrap().iter().flat_map(|g| g["hooks"].as_array().unwrap().iter()).collect();
+        assert_eq!(groups.len(), 2, "one backup per memory: {now}");
+        let mine = groups.iter().find(|h| h["args"][1] == json!("C:/thor2/thor.db")).unwrap();
+        assert_eq!(mine["command"], json!(new_exe), "this memory's backup moved: {now}");
+        let theirs = groups.iter().find(|h| h["args"][1] == json!("C:/elsewhere/thor.db")).unwrap();
+        assert_eq!(theirs["command"], json!(old_exe), "the other memory's backup stays: {now}");
+        // The same install again changes nothing.
+        let again = install_hooks_as(&path, &[new], true).unwrap();
+        assert_eq!(again.results[0].1, HookOutcome::AlreadyPresent);
     }
 
     /// A settings file that starts with a UTF-8 byte order mark (an editor, or
