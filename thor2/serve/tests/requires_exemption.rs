@@ -61,6 +61,13 @@ impl Fx {
         let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
         std::fs::write(self.transcript(), text).unwrap();
     }
+    /// A transcript whose owner messages were all typed: the hook recorded each prompt.
+    fn write_typed_transcript(&self, lines: &[serde_json::Value]) {
+        self.write_transcript(lines);
+        for text in lines.iter().filter_map(|l| serve::attest::owner_text(&l.to_string())) {
+            serve::prompt_record::record(&self.db(), SESSION, &text, 0);
+        }
+    }
     fn hook(&self, payload: serde_json::Value) -> String {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_serve"));
         cmd.arg("--db").arg(self.db()).arg("hook").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -137,7 +144,7 @@ fn a_mail_only_to_the_owners_own_address_passes_and_every_other_mail_is_refused(
         assert!(out.contains(RULE) && out.contains("explicit go"), "{why}: {out}");
     }
     // The owner saying the word himself still lets a foreign mail through.
-    fx.write_transcript(&[owner("ok, mail them - go-owner")]);
+    fx.write_typed_transcript(&[owner("ok, mail them - go-owner")]);
     assert!(!blocked(&fx.mail(serde_json::json!({"to": ["other@example.test"]}))));
 }
 

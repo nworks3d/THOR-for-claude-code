@@ -2883,7 +2883,7 @@ fn hook_inner(db_path: &Path, payload_text: Option<String>, actor: &str, no_reco
             // THE OWNER'S GO (step 26): a rule marked owner-approval is
             // answered only by the owner's own words in this session's main
             // transcript - read only when such a rule is reached.
-            let owner_words = || owner_words_of(&payload, &session_id);
+            let owner_words = || owner_words_of(db_path, &payload, &session_id);
             if let Some(reason) = pre_tool_guard_block(
                 &store,
                 db_path,
@@ -4848,12 +4848,20 @@ fn pre_tool_guard_block(
 /// session's MAIN transcript (a subagent's payload names its own file, whose
 /// "user" lines are the orchestrator's brief, never the owner). `Err` says
 /// why they cannot be read; the guard then refuses.
-fn owner_words_of(payload: &Value, session_id: &str) -> Result<Vec<String>, String> {
+///
+/// A message counts only when THOR's own record of what the owner typed
+/// (`serve::prompt_record`) holds it too, in the same order as the saved
+/// conversation: a line appended to the saved conversation is no go. The
+/// messages that survive may be none; the guard then refuses.
+fn owner_words_of(db: &Path, payload: &Value, session_id: &str) -> Result<Vec<String>, String> {
     let named = payload.get("transcript_path").and_then(|v| v.as_str()).map(PathBuf::from);
     let root = serve::attest::transcripts_root();
     let path = serve::attest::main_transcript_of(named.as_deref(), root.as_deref(), session_id)
         .ok_or_else(|| format!("no main transcript of session {session_id} was found"))?;
-    serve::attest::owner_messages(&path, 2)
+    let saved = serve::attest::owner_messages(&path, 2)?;
+    let own_session = payload.get("session_id").and_then(|v| v.as_str()).unwrap_or_default();
+    let pairs = saved.into_iter().map(|m| (m, String::new())).collect();
+    Ok(serve::prompt_record::confirmed_pairs(db, Some(own_session), pairs).into_iter().map(|(m, _)| m).collect())
 }
 
 /// A refusal's wording once its marker has been read: a repeat of an attempt

@@ -498,7 +498,7 @@ Words used once, in plain language:
   arrive through a normal prompt. A shell command that runs THOR's `serve ... hook` is refused, because
   it would forge a record; a script file that does it is not seen. An answer that does not name the note
   counts only after an assistant question that names exactly that one note, and a note id matches as a
-  whole word. The go-word of a requires rule is still read from the saved conversation.
+  whole word. The go-word of a requires rule is checked against the same record: it counts only when the message is in THOR's record and the saved conversation agrees. Only the ids of live notes count as "another note" in that question.
 - Refuse or change: you say it; nothing else works. You can also change or lift such a rule from any
   session: ask for it in your own message, the assistant revises or retracts the rule with your whole
   message quoted, and THOR checks the quote against what you typed. Without it, anything that loosens

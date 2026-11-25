@@ -420,9 +420,15 @@ pub fn owner_pairs(transcript: &Path) -> Vec<(String, String)> {
 /// helper's, a hook's or the assistant's text. No word list: the id is the link
 /// between his answer and this note.
 pub fn owner_quote_matches(because: &str, id: &str, pairs: &[(String, String)]) -> bool {
+    owner_quote_matches_among(because, id, pairs, &[])
+}
+
+/// `owner_quote_matches` that also knows the ids of the live notes (`live_ids`), so a question that
+/// names a second real note does not count as a question about this one.
+pub fn owner_quote_matches_among(because: &str, id: &str, pairs: &[(String, String)], live_ids: &[String]) -> bool {
     let quotes = crate::order_earlier::quote_candidates(because);
     pairs.iter().any(|(message, before)| {
-        let about_this_note = names_as_a_token(message, id) || asks_only_about(before, id);
+        let about_this_note = names_as_a_token(message, id) || asks_only_about(before, id, live_ids);
         about_this_note && quotes.iter().any(|q| crate::order_earlier::plain(message) == *q)
     })
 }
@@ -430,15 +436,12 @@ pub fn owner_quote_matches(because: &str, id: &str, pairs: &[(String, String)]) 
 /// Is `before` (the assistant message directly before the owner's answer) a QUESTION that names
 /// exactly this one note? Only then does an owner's answer that does not name the note itself ("ok")
 /// count as an answer about it. The id must stand in it as a whole token, in a sentence that ends in
-/// a question mark, and no other note id may stand anywhere in the message: an id-like word is one
-/// with a hyphen or an underscore in it. A message that merely mentions the id, or lists several,
-/// is no question to answer yes to.
-fn asks_only_about(before: &str, id: &str) -> bool {
+/// a question mark, and the id of no other LIVE note may stand anywhere in the message (an ordinary
+/// word with a hyphen in it is not an id, so it blocks nothing). A message that merely mentions the
+/// id, or lists several notes, is no question to answer yes to.
+fn asks_only_about(before: &str, id: &str, live_ids: &[String]) -> bool {
     let id_char = |c: char| c.is_alphanumeric() || c == '-' || c == '_';
-    let others = before
-        .split(|c: char| !id_char(c))
-        .filter(|w| w.chars().count() >= 3 && (w.contains('-') || w.contains('_')) && w.chars().any(|c| c.is_alphabetic()))
-        .any(|w| w != id);
+    let others = before.split(|c: char| !id_char(c)).any(|w| w != id && live_ids.iter().any(|l| l == w));
     if others || !names_as_a_token(before, id) {
         return false;
     }
@@ -480,7 +483,11 @@ pub fn witness(db: &Path, payload: &serde_json::Value, now: i64) {
     let session = payload.get("session_id").and_then(|v| v.as_str()).unwrap_or_default();
     // Only what THOR's own record of the owner's prompts confirms counts (`prompt_record`).
     let pairs = crate::prompt_record::confirmed_pairs(db, Some(session), owner_pairs(Path::new(transcript)));
-    if !owner_quote_matches(because, id, &pairs) {
+    // The ids of the live notes: a question that names a second one is no question about this one.
+    let live_ids: Vec<String> = thor_core::event_store::EventStore::open_existing(db)
+        .map(|store| crate::live::live_items(&store).into_iter().map(|l| l.id).collect())
+        .unwrap_or_default();
+    if !owner_quote_matches_among(because, id, &pairs, &live_ids) {
         return;
     }
     let path = go_path(db);
@@ -627,15 +634,55 @@ mod tests {
 
     #[test]
     fn an_ok_counts_only_after_a_question_that_names_exactly_that_one_note() {
-        let ok = |before: &str| owner_quote_matches("he said \"ok\"", "note-x", &[("ok".to_string(), before.to_string())]);
+        let live: Vec<String> = ["note-x", "note-y", "note-z", "note-xy"].iter().map(|s| s.to_string()).collect();
+        let ok = |before: &str| owner_quote_matches_among("he said \"ok\"", "note-x", &[("ok".to_string(), before.to_string())], &live);
         assert!(ok("Zal ik note-x loskoppelen?"));
         assert!(ok("Done with the tests.\nShall I unpin `note-x`?"));
         assert!(!ok("I will unpin note-x now."), "a statement is no question");
         assert!(!ok("Unpinning note-x now. Is that all right?"), "a question elsewhere does not make the sentence naming it one");
-        assert!(!ok("Shall I unpin note-x, note-y and note-z?"), "it must name exactly one note");
-        assert!(!ok("Shall I unpin note-x or fix the pre-commit hook?"), "an id-like word besides it blocks");
+        assert!(!ok("Shall I unpin note-x, note-y and note-z?"), "a second real note blocks it");
+        assert!(!ok("Shall I unpin note-x? note-y says the same."), "a second real note anywhere in the message blocks it");
+        assert!(ok("Shall I unpin note-x? It sits in the start-block."), "an ordinary hyphenated word is no id");
+        assert!(ok("Shall I unpin note-x or fix the pre-commit hook?"), "an ordinary hyphenated word is no id");
         assert!(!ok("Shall I unpin note-xy?"), "a longer id is another note");
         assert!(!ok(""));
+    }
+
+    #[test]
+    fn the_hook_reads_the_live_note_ids_from_the_store_for_the_one_question_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            for id in ["note-x", "note-y"] {
+                let item = Item {
+                    id: id.to_string(),
+                    kind: model::item::Kind::Rule,
+                    text: format!("Fixture note {id} about something plain."),
+                    bindings: vec![Binding::Always],
+                    severity: None,
+                    project: None,
+                    tags: vec![],
+                    expires: None,
+                    key: None,
+                    falsifier: Some("a fixture falsifier".to_string()),
+                    check: None,
+                };
+                model::store::declare(&mut store, "s", "l", "a", &item).unwrap();
+            }
+        }
+        let because = "he said \"ok\"";
+        let ask = |before: &str, tag: &str| {
+            let transcript = dir.path().join(format!("{tag}.jsonl"));
+            let lines = [assistant_line("m1", before), user_line("ok")];
+            std::fs::write(&transcript, lines.join("\n") + "\n").unwrap();
+            crate::prompt_record::record(&db, tag, "ok", 1);
+            let payload = serde_json::json!({ "session_id": tag, "tool_input": { "id": "note-x", "because": because }, "transcript_path": transcript.to_string_lossy() });
+            witness(&db, &payload, 1_000);
+            owner_go_recorded(&db, "note-x", because, Some(tag), 1_100)
+        };
+        assert!(ask("Shall I unpin note-x? It sits in the start-block.", "plain"), "an ordinary hyphenated word is no id");
+        assert!(!ask("Shall I unpin note-x? Or note-y?", "two"), "a second real note id blocks it");
     }
 
     #[test]

@@ -639,8 +639,8 @@ announce themselves.
   himself asked for it, put his whole message in `because` between double
   quotes: THOR checks it against what he typed in his last two messages, and the note's
   id must appear in that message as a whole word (`a-1` is not inside `a-12`), or the assistant message
-  right before it must be a question that names exactly that one note (a plain mention, or a list of
-  several ids, does not count). His message counts only when THOR's own record of his prompts holds it
+  right before it must be a question that names exactly that one note (a plain mention, or a second
+  id of a live note, does not count; an ordinary hyphenated word is no id). A go-word for a rule that needs the owner's go is checked against the same record. His message counts only when THOR's own record of his prompts holds it
   too: the UserPromptSubmit hook writes each prompt he types into `owner-prompts.jsonl` beside the
   memory, and a line found only in Claude Code's saved conversation counts for nothing. When that record
   holds nothing, the refusal says the owner's message must arrive through a normal prompt. A shell
