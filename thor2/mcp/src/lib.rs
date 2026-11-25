@@ -2093,7 +2093,8 @@ fn replica_refusal_for_remember(store: &EventStore, args: &RememberArgs) -> Resu
     if item.kind == Kind::Report && item.tags.iter().any(|t| t == serve::copy_eval::ATTESTATION_TAG) {
         serve::copy_eval::check_attestation_note(&item.id, item.project.as_deref(), &item.text)?;
     }
-    model::gate::declare(&normalized_item(&item)).map_err(|r| gate_refusal(r, store))
+    let root = model::store::project_root_for(store, item.project.as_deref());
+    model::gate::with_project_root(root, || model::gate::declare(&normalized_item(&item))).map_err(|r| gate_refusal(r, store))
 }
 
 /// `replica_refusal_for_remember`, for a revise: judged against the
@@ -2225,7 +2226,8 @@ fn write_binding_change(
     let mut att = stamp.att();
     att.unpin = unpin;
     refuse_a_side_door_on_a_frozen_item(store, &existing.id, &att)?;
-    model::gate::revise(&normalized_item(existing), &normalized_item(updated))
+    let root = model::store::project_root_for(store, updated.project.as_deref());
+    model::gate::with_project_root(root, || model::gate::revise(&normalized_item(existing), &normalized_item(updated)))
         .map_err(|r| format!("REFUSED: {}", model::store::WriteError::Refused(r)))?;
     let (written, record, notes, trial_because) = match run_trial(
         store,
@@ -3352,7 +3354,8 @@ impl ThorMcpServer {
             // The gate's own grounds before the trial, so a write the gate
             // refuses anyway is never tried, and never recorded as a refused
             // trial.
-            model::gate::declare(&normalized_item(&item)).map_err(|r| gate_refusal(r, s))?;
+            let project_root = model::store::project_root_for(s, item.project.as_deref());
+            model::gate::with_project_root(project_root, || model::gate::declare(&normalized_item(&item))).map_err(|r| gate_refusal(r, s))?;
             // THOR'S TRIAL (step 8): every Rule/Orientation, whatever its
             // severity. It decides the check it is stored with and its label,
             // or refuses it naming the one fix (recorded, never written on the

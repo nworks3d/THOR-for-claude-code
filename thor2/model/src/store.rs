@@ -893,7 +893,7 @@ fn declare_gated(
 ) -> Result<Event, WriteError> {
     let actor = fence(store, actor, &item.id)?;
     let item = normalized(item);
-    gate::declare(&item).map_err(WriteError::Refused)?;
+    gate::with_project_root(project_root_for(store, item.project.as_deref()), || gate::declare(&item)).map_err(WriteError::Refused)?;
     old_stock_ground(None, trial).map_err(WriteError::Refused)?;
     teeth_tag_ground(None, &item, trial).map_err(WriteError::Refused)?;
     if let Some((existing_id, why)) = find_near_duplicate(store, &item).map_err(WriteError::Store)? {
@@ -1009,7 +1009,7 @@ pub fn revise<'a>(
     // refuse exactly the repair that fixes the store.
     let existing = normalized(existing);
     let updated = normalized(updated);
-    gate::revise(&existing, &updated).map_err(WriteError::Refused)?;
+    gate::with_project_root(project_root_for(store, updated.project.as_deref()), || gate::revise(&existing, &updated)).map_err(WriteError::Refused)?;
     gate::a4_ground(Some(&existing), &updated, None).map_err(WriteError::Refused)?;
     teeth_tag_ground(Some(&existing), &updated, None).map_err(WriteError::Refused)?;
     // The same capacity refusal `declare` makes. Without this the gate was
@@ -1134,7 +1134,7 @@ pub fn revise_tried_scoped<'a>(
     let existing = normalized(existing);
     let updated = normalized(updated);
     let before = normalized(before);
-    gate::revise(&existing, &updated).map_err(WriteError::Refused)?;
+    gate::with_project_root(project_root_for(store, updated.project.as_deref()), || gate::revise(&existing, &updated)).map_err(WriteError::Refused)?;
     gate::revise_weakening(&before, &updated, because).map_err(WriteError::Refused)?;
     gate::a4_ground(Some(&before), &updated, None).map_err(WriteError::Refused)?;
     old_stock_ground(Some(actor), trial).map_err(WriteError::Refused)?;
@@ -2810,6 +2810,12 @@ pub fn is_topic_project(store: &EventStore, project: Option<&str>) -> bool {
     let Some(project) = project else { return false };
     let Some((root, _)) = registered_root_raw(store, project) else { return false };
     crate::checkout::plain_root(&root).as_deref() == Some(root.as_path())
+}
+
+/// The folder `project` is registered at, when there is one (what the write gate
+/// resolves a bare file name against).
+pub fn project_root_for(store: &EventStore, project: Option<&str>) -> Option<PathBuf> {
+    registered_root_raw(store, project?).map(|(root, _)| root)
 }
 
 /// A project binding that names the item's own project.

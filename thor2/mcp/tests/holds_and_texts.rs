@@ -78,6 +78,48 @@ fn a_memory_file_that_cannot_be_written_says_so_plainly() {
     assert!(!reply.contains("store error"), "{reply}");
 }
 
+/// A file in the project's own top folder can be anchored by its bare name, and
+/// the note then comes back on an Edit however the call spells the path.
+#[test]
+fn a_file_in_the_project_root_is_anchored_by_its_name_and_fires_however_the_path_is_spelled() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = store(dir.path(), &["demo"]);
+    let session = Session::with_store(dir.path(), db.clone(), WRITING_SESSION);
+    std::fs::write(session.cwd.join("main.py"), "print('hi')\n").unwrap();
+    register(&db, "demo", &session.cwd);
+    let mut mcp = session.mcp();
+    let note = |id: &str, name: &str| {
+        json!({
+            "id": id, "kind": "orientation", "project": "demo",
+            "targets": [{"kind": "path", "value": name}],
+            "text": if id == "calc-1" { "Keep the pytest suite green before you touch this module again." } else { "main.py holds the calculator functions; division is the next one to add." },
+            "falsifier": "main.py no longer holds the calculator functions.",
+        })
+    };
+    // A name that is not a file there stays refused, and the refusal names the form that works.
+    let missing = mcp.call("remember", note("calc-missing", "lib.py"));
+    assert!(missing.starts_with("REFUSED") && missing.contains("bare role name") && missing.contains("src/main.py"), "{missing}");
+    for (n, spelled) in ["main.py", "./main.py"].iter().enumerate() {
+        let reply = mcp.call("remember", note(&format!("calc-{n}"), spelled));
+        assert!(reply.starts_with("stored"), "{spelled}: {reply}");
+    }
+    let root = session.cwd.to_string_lossy().to_string();
+    let spellings = [
+        format!("{root}\\main.py"),
+        format!("{}/main.py", root.replace('\\', "/")),
+        "main.py".to_string(),
+        "./main.py".to_string(),
+    ];
+    for (n, spelled) in spellings.into_iter().enumerate() {
+        let out = session.hook(json!({
+            "hook_event_name": "PreToolUse", "session_id": format!("0de7dc52-1b97-4b66-948f-61e4438043b{n}"), "cwd": session.cwd,
+            "transcript_path": session.transcript, "tool_name": "Edit",
+            "tool_input": {"file_path": spelled, "old_string": "a", "new_string": "b"}, "tool_use_id": "toolu_1"
+        }));
+        assert!(out.contains("calculator functions"), "an Edit of {spelled} must bring the note: {out}");
+    }
+}
+
 fn set_read_only(path: &std::path::Path, on: bool) {
     let mut perms = std::fs::metadata(path).unwrap().permissions();
     #[allow(clippy::permissions_set_readonly_false)]
