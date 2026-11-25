@@ -4584,8 +4584,8 @@ fn evaluation_ask(
     let asked_count = state.asked_count + 1;
     let since = match state.last_evaluation_report_id.as_deref() {
         Some(report_id) if state.last_evaluation_seen.is_some() => format!(
-            "The last evaluation report ('{report_id}') is {} day(s) old.",
-            usefulness::days_ago(now, state.last_evaluation_seen.unwrap_or(now))
+            "The last evaluation report ('{report_id}') was filed {}.",
+            usefulness::days_ago_words(now, state.last_evaluation_seen.unwrap_or(now))
         ),
         _ => format!("This project has had no evaluation in the last {quiet_days} day(s) (project '{project}')."),
     };
@@ -4593,10 +4593,10 @@ fn evaluation_ask(
         "{elsewhere}{not_counted}[THOR] {since} {mode}{floor} \
          This session has worked here for {own_minutes} minute(s){together}; \
          {owed_words} It has been asked {asked_count} time(s) - the first \
-         {} day(s) ago - with no report filed yet. \
+         {} - with no report filed yet. \
          Run the THOR evaluation before you finish: {ask} \
          A turn cannot end until the evaluation report for this project is filed. After that it is quiet for {quiet_days} day(s).",
-        usefulness::days_ago(now, first_asked)
+        usefulness::days_ago_words(now, first_asked)
     )
 }
 
@@ -6662,7 +6662,7 @@ mod evaluation_debt_tests {
             ..Default::default()
         });
         let asked = evaluation_debt(&store, &db, Some("thor"), &work_minutes(90)).expect("a week-old report on a small plan is due");
-        assert!(asked.contains("The last evaluation report ('eval-thor-2026-09-17') is 7 day(s) old"), "{asked}");
+        assert!(asked.contains("The last evaluation report ('eval-thor-2026-09-17') was filed 7 days ago"), "{asked}");
         assert!(asked.contains("your plan is a smaller one, so this check runs once a week at most"), "{asked}");
         assert!(asked.contains("After that it is quiet for 7 day(s)"), "{asked}");
     }

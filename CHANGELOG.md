@@ -44,6 +44,14 @@ What changed: The weekly check is quieter and more reliable, and a pin can no lo
 - **The changelog question is part of the welcome.** In a code project it is a fourth proposal, accepted by the plain yes and refused by "4 no". A project that gets its memory later is still asked on its own.
 - **Documents, Desktop and Downloads are no longer taken as one topic.** A folder inside them gets its own memory, and an old memory on one of those folders is reported, not taken over.
 - **"Helpers off" covers every note about helper assistants,** not only two of five.
+- **One switch for all the work rules.** If you want none of the starter work habits, `install --set-starter-rules off` takes about twenty of them away, including the ones that were shown at the start of every conversation. `on` brings them back. The notes THOR itself needs, the helper notes and the changelog notes stay.
+- **A settings file that starts with an invisible mark is accepted.** Some editors and Windows PowerShell put a byte order mark at the start of `settings.json`; the install used to refuse it as "not valid JSON". It is now read, and written back with the mark kept.
+- **A reinstall from another folder replaces THOR's connections.** Unpacking a new download somewhere else and installing used to add a second set of connections to Claude Code; now the old ones are replaced and only one set stays. The other memory is named exactly as it was written.
+- **Uninstall leaves nothing of THOR's behind.** A memory kept in a folder you chose now loses its helper folders and state files too (seven stayed behind), and git's helper folder that THOR made for another memory is cleared. A folder that is not THOR's is still never touched.
+- **Ages read like a person would say them.** "Filed 0 day(s) ago" is now "filed today", and "yesterday" or "3 days ago" after that.
+- **A new note can be anchored to a file in the project's top folder, and a text-only edit never trips over it.** Changing only the words of a note no longer refuses because of an anchor the note already had.
+- **The first weekly check no longer asks you to re-read brand new notes.** A pinned note written or changed in the last 30 days is not listed for a re-read.
+- **A tag keeps the room for your own rules.** At `git tag` with the changelog notes on, no more than three of THOR's own starter notes are shown, so your own first rule always fits.
 - **A second computer can copy from the local backup folder,** and a backup that cannot be reached is a plain sentence with the next step. A read-only copy no longer accepts new notes.
 - **Installing a second project no longer asks for a restart** when nothing Claude Code loads at its start changed.
 - **A commit, a push and a publish keep room for your own first rule.** The starting notes now fill each of those places with at most three.

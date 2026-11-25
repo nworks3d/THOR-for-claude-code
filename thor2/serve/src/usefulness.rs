@@ -1590,6 +1590,31 @@ pub fn days_ago(now_unix: i64, then_unix: i64) -> i64 {
     (now_unix - then_unix).max(0) / 86400
 }
 
+/// `days_ago` in plain words: "today", "yesterday" or "N days ago" - never
+/// "0 day(s) ago".
+pub fn days_ago_words(now_unix: i64, then_unix: i64) -> String {
+    match days_ago(now_unix, then_unix) {
+        0 => "today".to_string(),
+        1 => "yesterday".to_string(),
+        n => format!("{n} days ago"),
+    }
+}
+
+#[cfg(test)]
+mod days_ago_words_tests {
+    use super::days_ago_words;
+
+    #[test]
+    fn says_today_yesterday_and_days_never_zero_days() {
+        let now = 10 * 86400;
+        assert_eq!(days_ago_words(now, now), "today");
+        assert_eq!(days_ago_words(now, now - 3600), "today");
+        assert_eq!(days_ago_words(now, now - 86400), "yesterday");
+        assert_eq!(days_ago_words(now, now - 3 * 86400), "3 days ago");
+        assert_eq!(days_ago_words(now, now + 500), "today", "a clock slip never reads as a negative age");
+    }
+}
+
 /// Whole minutes between `then_unix` and `now_unix`, floored, never
 /// negative - `days_ago`'s own rule in a different unit. Used to be the
 /// evaluation debt's own "how long has this session worked here" clock;

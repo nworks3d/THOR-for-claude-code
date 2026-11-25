@@ -6820,6 +6820,27 @@ pub fn time_near_seq(store: &EventStore, seq: i64) -> Option<i64> {
     None
 }
 
+/// The unix time near a log position when nothing earlier carries one: the
+/// `served_at` of the nearest LATER serving. A write has no time of its own and
+/// a fresh install writes its notes before anything is served, so there is no
+/// earlier time to lean on; the first serving after it is the closest honest
+/// stand-in (the first session starts right after the install).
+pub fn time_after_seq(store: &EventStore, seq: i64) -> Option<i64> {
+    for s in seq + 1..=seq + 400 {
+        let Ok(Some(event)) = store.get_event_by_seq(s) else { break };
+        if event.kind != EventKind::ItemServed {
+            continue;
+        }
+        if let Some(at) = serde_json::from_str::<crate::served::ItemServed>(&event.body)
+            .ok()
+            .and_then(|b| crate::served::unix_from_iso8601(&b.served_at))
+        {
+            return Some(at);
+        }
+    }
+    None
+}
+
 /// The pinned notes an evaluation of `project` starting at `started_unix` (log
 /// position `started_seq`) lists for a re-read: at most
 /// `EVALUATION_REREAD_LIST`, the ones reviewed longest ago first (never reviewed
@@ -6893,8 +6914,8 @@ pub fn evaluation_reread_list(store: &EventStore, project: Option<&str>, started
             .get_events_by_entity(id)
             .ok()
             .and_then(|events| events.iter().filter(|e| e.seq <= started_seq && writes_the_item(e.kind)).map(|e| e.seq).max())
-            .and_then(|seq| time_near_seq(store, seq));
-        let last = [reviewed.get(id.as_str()).copied(), written].into_iter().flatten().max();
+            .and_then(|seq| time_near_seq(store, seq).or_else(|| time_after_seq(store, seq)));
+        let last =[reviewed.get(id.as_str()).copied(), written].into_iter().flatten().max();
         if last.is_some_and(|at| started_unix.saturating_sub(at) < min_gap) {
             continue;
         }
@@ -18498,6 +18519,24 @@ mod tests {
         }
         let list = evaluation_reread_list(&store, Some("mk"), now, i64::MAX);
         assert_eq!(list, vec!["mk-never".to_string(), "mk-old".to_string()], "never reviewed first, then the oldest; the recent one waits");
+    }
+
+    /// A FRESH INSTALL writes its pinned notes before anything is served, so no
+    /// earlier serving dates the write. The first serving after it stands in: a
+    /// note first served 3 days ago is not asked to be re-read yet, one first
+    /// served 40 days ago is.
+    #[test]
+    fn a_pinned_note_written_just_before_its_first_serving_is_new_and_not_re_read() {
+        let now = crate::served::unix_from_iso8601("2026-11-25T12:00:00Z").unwrap();
+        let listed_after_first_serving_at = |served_at: &str| {
+            let mut store = EventStore::in_memory().unwrap();
+            declare_noted(&mut store, &pinned_rule("fresh-note", "fresh"));
+            let body = format!("{{\"served_at\":\"{served_at}\"}}");
+            store.append_event("seen", "seen", ASSISTANT_DELIVERY_ACTOR, EventKind::ItemServed, "fresh-note", None, &body).unwrap();
+            evaluation_reread_list(&store, Some("fresh"), now, i64::MAX)
+        };
+        assert!(listed_after_first_serving_at("2026-11-22T12:00:00Z").is_empty(), "first served 3 days ago: new, it waits");
+        assert_eq!(listed_after_first_serving_at("2026-10-16T12:00:00Z"), vec!["fresh-note".to_string()], "first served 40 days ago: due");
     }
 
     // ------------------------------------------------ the dynamic cap (2026-11-20)

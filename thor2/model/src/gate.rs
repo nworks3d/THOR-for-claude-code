@@ -1744,6 +1744,13 @@ fn declare_inner(
         ));
     }
     for binding in &item.bindings {
+        // A binding the item already carried is not judged again: a revise that
+        // leaves the bindings alone (a text-only change) must never refuse over
+        // the shape of an anchor that was accepted when it was written, for
+        // example a file at the top of the project folder.
+        if carried_bindings.is_some_and(|carried| carried.contains(binding)) {
+            continue;
+        }
         if let Binding::Target { kind, value } = binding {
             check_target_binding(*kind, value)?;
         }
@@ -4682,6 +4689,21 @@ mod tests {
         item.text = "main.rs wires the cli".to_string();
         item.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "main.rs".to_string() }];
         assert!(declare(&item).is_err());
+    }
+
+    #[test]
+    fn a_revise_keeps_a_carried_bare_role_anchor_and_refuses_a_new_one() {
+        let mut existing = base(Kind::Orientation);
+        existing.text = "main.py wires the cli".to_string();
+        existing.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "main.py".to_string() }];
+        // A text-only change: the carried anchor is not judged again.
+        let mut updated = existing.clone();
+        updated.text = "main.py wires the cli and reads the config".to_string();
+        assert!(revise(&existing, &updated).is_ok());
+        // A newly added bare anchor is still refused.
+        let mut added = updated.clone();
+        added.bindings.push(Binding::Target { kind: TargetKind::Path, value: "lib.py".to_string() });
+        assert!(revise(&existing, &added).is_err());
     }
 
     #[test]

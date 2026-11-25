@@ -201,3 +201,35 @@ fn the_brief_note_is_pinned_so_it_arrives_before_the_first_agent_call() {
     let orchestrator = fx.read("orchestrator-mode-saves-quota").unwrap();
     assert!(!orchestrator.bindings.contains(&model::item::Binding::Always), "only the brief note is pinned");
 }
+
+/// `install --set-starter-rules off|on`: one switch for the work habits, the
+/// real program run against a real new memory. The notes THOR needs and the
+/// helper notes stay, a second run changes nothing, and a refused word names
+/// the two it accepts.
+#[test]
+fn set_starter_rules_off_and_on_run_through_the_real_installer() {
+    let fx = Fx::new();
+    let habits = ops::install::starter_rule_notes();
+    assert!(habits.iter().all(|n| fx.read(&n.id).is_ok()));
+
+    let off = fx.install(&["--set-starter-rules", "off"]);
+    assert!(off.status.success(), "{}", said(&off));
+    assert!(said(&off).contains("starter work rules are off"), "{}", said(&off));
+    assert!(habits.iter().all(|n| matches!(fx.read(&n.id), Err(ReadError::Retracted(_)))), "every work habit is retracted");
+    for id in NOTES.iter().chain(["anchor-what-the-fact-is-about", "correct-instead-of-duplicating", "changelog-flow-read-the-version-from-git"].iter()) {
+        assert!(fx.read(id).is_ok(), "{id} stays");
+    }
+
+    let events = fx.event_count();
+    let again = fx.install(&["--set-starter-rules", "off"]);
+    assert!(again.status.success(), "{}", said(&again));
+    assert_eq!(fx.event_count(), events, "a second off writes nothing");
+
+    let on = fx.install(&["--set-starter-rules", "on"]);
+    assert!(on.status.success(), "{}", said(&on));
+    assert!(habits.iter().all(|n| fx.read(&n.id).is_ok()), "every work habit is back");
+
+    let bad = fx.install(&["--set-starter-rules", "maybe"]);
+    assert_eq!(bad.status.code(), Some(2), "{}", said(&bad));
+    assert!(said(&bad).contains("'on' or 'off'"), "{}", said(&bad));
+}

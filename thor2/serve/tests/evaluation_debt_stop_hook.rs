@@ -1139,7 +1139,7 @@ fn a_week_after_a_report_the_ask_comes_and_names_the_rhythm() {
     let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("a week-old report must be asked about again: {e}: {out}"));
     assert_eq!(v["decision"], "block", "{out}");
     let reason = v["reason"].as_str().unwrap();
-    assert!(reason.contains("The last evaluation report ('eval-thor-fixture-covering') is 7 day(s) old"), "{reason}");
+    assert!(reason.contains("The last evaluation report ('eval-thor-fixture-covering') was filed 7 days ago"), "{reason}");
     assert!(reason.contains("your plan is a smaller one, so this check runs once a week at most"), "{reason}");
 }
 

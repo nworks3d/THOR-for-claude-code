@@ -202,6 +202,60 @@ fn a_second_memory_is_refused_while_the_first_is_connected_and_can_take_over_on_
     assert!(after.contains("thor-b") && !after.contains("thor-a"), "{after}");
 }
 
+/// A reinstall from another program folder (a new download unpacked elsewhere)
+/// must REPLACE THOR's connections, not add a second set beside the first.
+#[test]
+fn a_reinstall_from_another_program_folder_replaces_the_connections_instead_of_adding_a_second_set() {
+    let mut sb = Sandbox::new().with_programs();
+    let first = sb.bin.as_ref().unwrap().path().to_path_buf();
+    assert!(sb.install(&[]).status.success());
+    assert_eq!(hook_entries(&sb.settings_text()), 4);
+
+    let install = PathBuf::from(env!("CARGO_BIN_EXE_install"));
+    let ext = if cfg!(windows) { ".exe" } else { "" };
+    let second = tempfile::tempdir().unwrap();
+    std::fs::copy(install.with_file_name(format!("serve{ext}")), second.path().join(format!("serve{ext}"))).unwrap();
+    std::fs::copy(&install, second.path().join(format!("codeindex{ext}"))).unwrap();
+    let second_path = second.path().to_path_buf();
+    sb.bin = Some(second);
+
+    let out = sb.install(&[]);
+    assert!(out.status.success(), "{}", said(&out));
+    let text = sb.settings_text();
+    assert_eq!(hook_entries(&text), 4, "one set of four, not eight:\n{text}");
+    let flat = text.replace("\\\\", "/").replace('\\', "/").to_lowercase();
+    assert!(flat.contains(&second_path.display().to_string().replace('\\', "/").to_lowercase()), "points at the new folder:\n{text}");
+    assert!(!flat.contains(&first.display().to_string().replace('\\', "/").to_lowercase()), "no longer points at the old folder:\n{text}");
+    assert!(said(&out).contains("replaced an older connection"), "{}", said(&out));
+}
+
+/// The refusal names the other memory as it was written, not in lower case.
+#[test]
+fn the_other_memory_is_named_as_written_in_the_refusal() {
+    let sb = Sandbox::new();
+    let first = sb.db_named("Thor-Mixed-Case");
+    let second = sb.db_named("thor-b");
+    assert!(sb.run(&[], &first).status.success());
+    let text = said(&sb.run(&[], &second));
+    assert!(text.contains(&first.display().to_string()), "the path as written ({}) is in: {text}", first.display());
+}
+
+/// A git helper folder THOR made for one memory is cleared by an uninstall that
+/// names another; one that is not THOR's never is.
+#[test]
+fn uninstall_for_another_memory_still_recognises_the_git_helper_folder_thor_made() {
+    let sb = Sandbox::new().with_programs();
+    assert!(sb.run(&[], &sb.db_named("thor-a")).status.success());
+    let theirs = sb.db_named("thor-a").parent().unwrap().join("githooks");
+    assert!(theirs.is_dir(), "the install made the helper folder");
+    let other = sb.db_named("thor-b");
+    assert!(ops::uninstall::hooks_path_is_thors(Some(&theirs.display().to_string()), &other));
+    let foreign = sb.home.path().join("their-hooks");
+    std::fs::create_dir_all(&foreign).unwrap();
+    std::fs::write(foreign.join("pre-commit"), "#!/bin/sh\n").unwrap();
+    assert!(!ops::uninstall::hooks_path_is_thors(Some(&foreign.display().to_string()), &other));
+}
+
 #[test]
 fn uninstall_removes_every_thor_connection_whatever_memory_it_names() {
     let sb = Sandbox::new();
