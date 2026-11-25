@@ -167,6 +167,34 @@ pub struct Started {
 /// reach for the next start.
 pub const MACHINE_PASS_BOX_SECS: u64 = 20;
 
+/// THE HARD LIMIT of one evaluation start, in seconds: from the call to its answer, the said window,
+/// the start record, the machine pass and the sweep together. A Stop or a tool call that starts an
+/// evaluation must not hold the reply longer than this. What did not fit is left for the next Stop
+/// or call: the start record stays on the log with no batch (`resume` goes on from there), and the
+/// note says THOR is still deciding.
+pub const START_BOX_SECS: u64 = 15;
+
+/// The environment variable that sets `START_BOX_SECS`, in whole seconds between 1 and 100.
+pub const START_BOX_ENV: &str = "THOR_START_BOX_SECS";
+
+/// What the sweep may keep of the start box: the rule pass stops this many seconds before the
+/// hard limit, so the sweep has a share (it only ever continues where an earlier one stopped).
+const SWEEP_RESERVE_SECS: u64 = 3;
+
+/// The hard limit of one start.
+pub fn start_box() -> Duration {
+    let secs = std::env::var(START_BOX_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(START_BOX_SECS, |s| s.clamp(1, 100));
+    Duration::from_secs(secs)
+}
+
+thread_local! {
+    /// Where the start this thread runs must be finished, when it has a hard limit.
+    static HARD_END: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
 /// The most the time box can be set to: one third of the measured hook
 /// timeout (600 s).
 pub const MACHINE_PASS_BOX_MAX_SECS: u64 = 200;
@@ -228,8 +256,9 @@ pub enum StartRefused {
 
 /// `start`, saying why it started nothing (`StartRefused`).
 pub fn try_start(db: &Path, store: &mut EventStore, session_id: &str, project: &str, started_by: &str) -> Result<Started, StartRefused> {
-    let began = try_begin(db, store, session_id, project, started_by)?;
-    let decided = decide(store, began.start, pass_box());
+    let end = Instant::now() + start_box();
+    let began = try_begin_until(db, store, session_id, project, started_by, crate::attest::transcripts_root().as_deref(), Some(end))?;
+    let decided = decide_by(store, began.start, end);
     Ok(Started { start: with_fired(store, decided), fresh: began.fresh })
 }
 
@@ -275,6 +304,20 @@ pub fn try_begin_in(
     started_by: &str,
     transcripts: Option<&Path>,
 ) -> Result<Started, StartRefused> {
+    try_begin_until(db, store, session_id, project, started_by, transcripts, None)
+}
+
+/// `try_begin_in`, finished by `end` when one is given: the owner's messages are read for no
+/// longer than what is left of it.
+pub fn try_begin_until(
+    db: &Path,
+    store: &mut EventStore,
+    session_id: &str,
+    project: &str,
+    started_by: &str,
+    transcripts: Option<&Path>,
+    end: Option<Instant>,
+) -> Result<Started, StartRefused> {
     retire_handover_sidecar(db);
     // The start record is filed under the spelling the memory already has for
     // this project (case, spaces and hyphens do not make a second one), the
@@ -303,7 +346,11 @@ pub fn try_begin_in(
     // The owner's messages are read before anything is written, under a time
     // box: when it runs out nothing is superseded or started, and the next
     // start goes on from the saved progress.
-    let said = crate::said::freeze(db, transcripts, project, now).map_err(|_| StartRefused::SaidPending)?;
+    let said = match end {
+        Some(end) => crate::said::freeze_within(db, transcripts, project, now, end.saturating_duration_since(Instant::now())),
+        None => crate::said::freeze(db, transcripts, project, now),
+    }
+    .map_err(|_| StartRefused::SaidPending)?;
     for other in &others {
         let idle_minutes = crate::usefulness::session_idle_minutes(
             store,
@@ -356,6 +403,48 @@ pub fn try_begin_in(
 pub fn decide(store: &mut EventStore, start: EvaluationStart, time_box: Duration) -> EvaluationStart {
     let deadline = Instant::now() + time_box;
     decide_until(store, start, time_box.as_secs(), &mut |_| Instant::now() >= deadline)
+}
+
+/// `decide`, finished by `end` whatever a single rule costs. The rules are tried until
+/// `SWEEP_RESERVE_SECS` before `end` (and never past the pass's own time box), the sweep gets what
+/// is left, and the whole pass runs on a thread of its own with a connection of its own: when `end`
+/// comes first the start comes back as it was (no batch), the thread is left to the end of the
+/// process, and the next Stop or call goes on from the saved verdicts (`resume`). Every verdict is
+/// one write, so nothing is half done.
+pub fn decide_by(store: &mut EventStore, start: EvaluationStart, end: Instant) -> EvaluationStart {
+    let Some(db) = store.path().filter(|_| !start.frozen.decided()) else { return start };
+    let (session, project) = (start.frozen.session.clone(), start.frozen.project.clone());
+    let kept = start.clone();
+    match run_bounded(&db, start, end, move |own, start| decide_until_end(own, start, end)) {
+        // The thread wrote through its own connection: read the record back on this one.
+        Some(decided) => open_evaluation(store, &session, &project).filter(|s| s.frozen.decided()).unwrap_or(decided),
+        None => kept,
+    }
+}
+
+/// `decide`, with the rule loop and the sweep held to `end`.
+fn decide_until_end(store: &mut EventStore, start: EvaluationStart, end: Instant) -> EvaluationStart {
+    HARD_END.with(|c| c.set(Some(end)));
+    let loop_end = end.checked_sub(Duration::from_secs(SWEEP_RESERVE_SECS)).unwrap_or(end);
+    let pass_end = loop_end.min(Instant::now() + pass_box());
+    let decided = decide_until(store, start, pass_box().as_secs(), &mut |_| Instant::now() >= pass_end);
+    HARD_END.with(|c| c.set(None));
+    decided
+}
+
+/// Run `work` on a thread of its own with a connection of its own to `db`, waiting until `end`.
+/// `None` when it did not answer in time, or the connection could not be opened.
+fn run_bounded<F>(db: &Path, start: EvaluationStart, end: Instant, work: F) -> Option<EvaluationStart>
+where
+    F: FnOnce(&mut EventStore, EvaluationStart) -> EvaluationStart + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path = db.to_path_buf();
+    std::thread::spawn(move || {
+        let Ok(mut own) = EventStore::open_existing(&path) else { return };
+        let _ = tx.send(work(&mut own, start));
+    });
+    rx.recv_timeout(end.saturating_duration_since(Instant::now())).ok()
 }
 
 /// `decide`, with the point where the pass stops given as a question: `stop`
@@ -415,7 +504,7 @@ pub fn resume(store: &mut EventStore, session_id: &str) -> Vec<EvaluationStart> 
         .collect();
     pending.sort_by_key(|s| s.seq);
     let decided: Vec<EvaluationStart> =
-        pending.into_iter().map(|start| decide(store, start, pass_box())).filter(|s| s.frozen.decided()).collect();
+        pending.into_iter().map(|start| decide_by(store, start, Instant::now() + start_box())).filter(|s| s.frozen.decided()).collect();
     decided.into_iter().map(|s| with_fired(store, s)).collect()
 }
 
@@ -1146,7 +1235,7 @@ fn machine_pass_until(
     // proxy above cannot see a false block that was walked around without
     // weakening the rule, so its line says where this one is.
     if let Some(signals) = machine.signals.as_mut() {
-        let (hits, more, covered) = crate::sweep::for_evaluation(store, Duration::from_secs(SWEEP_BOX_SECS));
+        let (hits, more, covered) = crate::sweep::for_evaluation(store, sweep_budget());
         signals.sweep = hits;
         signals.sweep_more = more;
         signals.sweep_partial = !covered.complete;
@@ -1351,6 +1440,15 @@ fn quoted(ids: &[String]) -> String {
 /// is for the cut's own line; what rides in front of the note (the Stop ask,
 /// the continue line) is taken off the budget (`start_note_after`).
 pub const START_NOTE_BUDGET: usize = 9_300;
+
+/// The sweep's share: `SWEEP_BOX_SECS`, or what is left of the hard limit when that is less.
+fn sweep_budget() -> Duration {
+    let own = Duration::from_secs(SWEEP_BOX_SECS);
+    match HARD_END.with(|c| c.get()) {
+        Some(end) => own.min(end.saturating_duration_since(Instant::now())),
+        None => own,
+    }
+}
 
 /// The most seconds an evaluation start spends on the false-block sweep, on
 /// top of the machine pass's own time box.
@@ -2573,6 +2671,41 @@ mod tests {
         // is a minute old), so another session starts none beside it.
         assert_eq!(start(&db, &mut store, "other-sess", "p", "skill"), None, "another session starts none beside it");
         assert_eq!(start_records(&store).len(), 2, "nothing written for the refused start");
+    }
+
+    /// THE HARD LIMIT: work that runs past the end of the start is not waited for,
+    /// and work that finishes before it is returned as it is.
+    #[test]
+    fn a_pass_that_runs_past_the_end_is_not_waited_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, mut store) = store_with_events(dir.path(), 3);
+        let began = try_begin_until(&db, &mut store, "sess", "p", "skill", None, None).unwrap();
+        assert!(!began.start.frozen.decided(), "a begun start has no batch yet");
+
+        let slow = Instant::now();
+        let none = run_bounded(&db, began.start.clone(), Instant::now() + Duration::from_millis(300), |_, start| {
+            std::thread::sleep(Duration::from_secs(5));
+            start
+        });
+        assert!(none.is_none(), "the limit came first: nothing comes back");
+        assert!(slow.elapsed() < Duration::from_secs(3), "it did not wait for the slow pass: {:?}", slow.elapsed());
+
+        let quick = run_bounded(&db, began.start.clone(), Instant::now() + Duration::from_secs(30), |_, start| start);
+        assert_eq!(quick, Some(began.start), "an answer in time comes back");
+    }
+
+    /// The bounded pass writes through a connection of its own and the caller reads the record
+    /// back: the start is decided, exactly as `decide` leaves it.
+    #[test]
+    fn a_pass_inside_its_limit_leaves_the_start_decided() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, mut store) = store_with_events(dir.path(), 3);
+        let began = try_begin_until(&db, &mut store, "sess", "p", "skill", None, Some(Instant::now() + Duration::from_secs(60))).unwrap();
+        let decided = decide_by(&mut store, began.start, Instant::now() + Duration::from_secs(60));
+        assert!(decided.frozen.decided());
+        let read_back = open_evaluation(&store, "sess", "p").unwrap();
+        assert!(read_back.frozen.decided(), "the batch record is on the log");
+        assert_eq!(start_records(&store).len(), 2, "the start and its batch record, nothing more");
     }
 
     /// A project's served item, fired `n` times in `session` at `at` (unix),

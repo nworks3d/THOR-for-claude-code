@@ -558,10 +558,15 @@ pub fn advance_for_valid(store: &EventStore, record: &model::store::EvaluationVa
 /// `Err(Pending)` when reading took longer than the time box: the progress is
 /// saved, nothing is frozen and the next call goes on from there.
 pub fn freeze(db: &Path, root: Option<&Path>, project: &str, now: i64) -> Result<Option<SaidFrozen>, Pending> {
+    freeze_within(db, root, project, now, time_box())
+}
+
+/// `freeze`, reading for at most `box_` (never more than the usual time box).
+pub fn freeze_within(db: &Path, root: Option<&Path>, project: &str, now: i64, box_: Duration) -> Result<Option<SaidFrozen>, Pending> {
     let until_ms = now * 1000;
     let since_ms = cursor_of(db, project).unwrap_or(until_ms - FIRST_WINDOW_DAYS * 86_400_000);
     let collected = match root {
-        Some(root) => collect_boxed(db, root, project, since_ms, until_ms, Some(time_box()))?,
+        Some(root) => collect_boxed(db, root, project, since_ms, until_ms, Some(box_.min(time_box())))?,
         None => Collected::default(),
     };
     if collected.list.is_empty() && collected.unreadable == 0 {
@@ -1101,6 +1106,22 @@ mod tests {
         let t: Vec<&str> = got.list.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(t, vec![twenty.as_str(), "c d e ffffffffffffff"]);
         assert_eq!(got, collect_in_full(&root, "demo", T0, T0 + 1_000_000));
+    }
+
+    /// What is left of a start's hard limit is the box: none left reads nothing, plenty reads it all.
+    #[test]
+    fn what_is_left_of_the_start_limit_is_the_box() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("projects");
+        let db = dir.path().join("store").join("thor.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let mine = project_folder(dir.path(), "demo");
+        session(&root, "a", "s1", &mine, &many(25));
+        let now = T0 / 1000 + 10_000;
+        assert!(freeze_within(&db, Some(&root), "demo", now, Duration::ZERO).is_err(), "no time left: pending, progress saved");
+        let whole = freeze_within(&db, Some(&root), "demo", now, Duration::from_secs(600)).unwrap().expect("a list");
+        assert_eq!(whole.total, 25);
+        assert_eq!(freeze(&db, Some(&root), "demo", now).unwrap().expect("a list"), whole, "the same list as the plain call");
     }
 
     #[test]

@@ -649,7 +649,29 @@ pub fn is_field_refusal_known(
     verdicts: &HashMap<i64, (bool, String)>,
     known: &dyn Fn() -> Vec<String>,
 ) -> bool {
-    if event.entity_id != id || item.check.is_none() || !is_attested_refusal(store, event, since, verdicts) {
+    field_refusal_with(store, event, id, item, since, verdicts, known, &|session| session_was_served(store, session))
+}
+
+/// Whether the log shows an item served in `session`: a full pass over the log
+/// per question, so a reader asking it of many refusals memoizes it.
+fn session_was_served(store: &EventStore, session: &str) -> bool {
+    store.served_ids_in_session(session).is_ok_and(|v| !v.is_empty())
+}
+
+/// `is_field_refusal_known`, with the "the session was served something"
+/// question given as a function.
+#[allow(clippy::too_many_arguments)]
+fn field_refusal_with(
+    store: &EventStore,
+    event: &Event,
+    id: &str,
+    item: &Item,
+    since: i64,
+    verdicts: &HashMap<i64, (bool, String)>,
+    known: &dyn Fn() -> Vec<String>,
+    served: &dyn Fn(&str) -> bool,
+) -> bool {
+    if event.entity_id != id || item.check.is_none() || !attested_refusal_with(store, event, since, verdicts, served) {
         return false;
     }
     if reads_a_command(item) {
@@ -667,6 +689,16 @@ pub fn is_field_refusal_known(
 /// refused call against a check of its own (`prove::bitten`) adds the last
 /// part itself.
 pub fn is_attested_refusal(store: &EventStore, event: &Event, since: i64, verdicts: &HashMap<i64, (bool, String)>) -> bool {
+    attested_refusal_with(store, event, since, verdicts, &|session| session_was_served(store, session))
+}
+
+fn attested_refusal_with(
+    store: &EventStore,
+    event: &Event,
+    since: i64,
+    verdicts: &HashMap<i64, (bool, String)>,
+    served: &dyn Fn(&str) -> bool,
+) -> bool {
     if event.kind != EventKind::GateRefused || event.actor != ASSISTANT_DELIVERY_ACTOR {
         return false;
     }
@@ -686,7 +718,7 @@ pub fn is_attested_refusal(store: &EventStore, event: &Event, since: i64, verdic
         return false;
     }
     // Last, being the one query of the log: the session has other activity.
-    store.served_ids_in_session(&event.session_id).is_ok_and(|v| !v.is_empty())
+    served(&event.session_id)
 }
 
 /// The field refusals of `id` under `item`'s current check, oldest first:
@@ -704,9 +736,22 @@ pub fn field_refusals_known(store: &EventStore, id: &str, item: &Item, known: &d
     let Ok(events) = store.get_events_by_entity(id) else { return Vec::new() };
     let verdicts = model::store::recorded_refusal_verdicts(&events);
     let since = check_since(&events, item.check.as_ref());
+    // Two questions cost a pass over the log or a fold of the live set each, and
+    // have the same answer for every refusal of this rule: ask each once.
+    let once: std::cell::OnceCell<Vec<String>> = std::cell::OnceCell::new();
+    let known_once = || once.get_or_init(known).clone();
+    let seen: std::cell::RefCell<HashMap<String, bool>> = std::cell::RefCell::new(HashMap::new());
+    let served_once = |session: &str| {
+        if let Some(answer) = seen.borrow().get(session) {
+            return *answer;
+        }
+        let answer = session_was_served(store, session);
+        seen.borrow_mut().insert(session.to_string(), answer);
+        answer
+    };
     events
         .iter()
-        .filter(|e| is_field_refusal_known(store, e, id, item, since, &verdicts, known))
+        .filter(|e| field_refusal_with(store, e, id, item, since, &verdicts, &known_once, &served_once))
         .map(|e| {
             let body = serde_json::from_str::<Value>(&e.body).unwrap_or(Value::Null);
             (e.seq, body.get("target").and_then(|t| t.as_str()).unwrap_or_default().to_string())
